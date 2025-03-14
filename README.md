@@ -26,6 +26,10 @@ The server is a bridge between the Telegram API and the AI assistants and is bas
 > Ensure that you have read and understood the [Telegram API Terms of Service](https://core.telegram.org/api/terms) before using this server.
 > Any misuse of the Telegram API may result in the suspension of your account.
 
+<a href="https://glama.ai/mcp/servers/484jega1au">
+  <img width="380" height="200" src="https://glama.ai/mcp/servers/484jega1au/badge" alt="Telegram Server MCP server" />
+</a>
+
 ## What is MCP?
 
 The Model Context Protocol (MCP) is a system that lets AI apps, like Claude Desktop, connect to external tools and data sources. It gives a clear and safe way for AI assistants to work with local services and APIs while keeping the user in control.
