@@ -133,11 +133,6 @@ async def list_messages(
         if not isinstance(result, types.messages.PeerDialogs):
             raise TypeError(f"Unexpected result: {type(result)}")
 
-        for dialog in result.dialogs:
-            logger.debug("dialog: %s", dialog)
-        for message in result.messages:
-            logger.debug("message: %s", message)
-
         iter_messages_args: dict[str, t.Any] = {
             "entity": args.dialog_id,
             "reverse": False,
@@ -147,11 +142,8 @@ async def list_messages(
         else:
             iter_messages_args["limit"] = args.limit
 
-        logger.debug("iter_messages_args: %s", iter_messages_args)
         async for message in client.iter_messages(**iter_messages_args):
-            logger.debug("message: %s", type(message))
             if isinstance(message, custom.Message) and message.text:
-                logger.debug("message: %s", message.text)
                 response.append(TextContent(type="text", text=message.text))
 
     return response

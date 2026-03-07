@@ -20,7 +20,6 @@ from mcp.types import (
 
 from . import tools
 
-logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 app = Server("mcp-telegram")
 
@@ -82,7 +81,7 @@ async def call_tool(name: str, arguments: t.Any) -> Sequence[TextContent | Image
         return await tools.tool_runner(args)
     except Exception as e:
         logger.exception("Error running tool: %s", name)
-        raise RuntimeError(f"Caught Exception. Error: {e}") from e
+        raise RuntimeError(f"Tool {name} failed") from None
 
 
 async def run_mcp_server() -> None:
