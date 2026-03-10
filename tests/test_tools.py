@@ -90,9 +90,9 @@ async def test_search_messages_no_next_offset(mock_cache, mock_client, make_mock
 
 def test_get_dialog_removed():
     """GetDialog class does not exist in tools module."""
-    pytest.fail("not implemented")
+    assert not hasattr(tools_module, "GetDialog"), "GetDialog should be removed from tools.py"
 
 
 def test_get_message_removed():
     """GetMessage class does not exist in tools module."""
-    pytest.fail("not implemented")
+    assert not hasattr(tools_module, "GetMessage"), "GetMessage should be removed from tools.py"
