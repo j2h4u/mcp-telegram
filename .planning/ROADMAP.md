@@ -37,7 +37,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 Plans:
 - [x] 01-01-PLAN.md — Test scaffold: install rapidfuzz + pytest deps, create stub test files and conftest
 - [x] 01-02-PLAN.md — Resolver (TDD): implement resolve() with WRatio thresholds, tagged-union result types (RES-01, RES-02)
-- [ ] 01-03-PLAN.md — Formatter (TDD): implement format_messages() pure function with date headers and session breaks (FMT-01)
+- [x] 01-03-PLAN.md — Formatter (TDD): implement format_messages() pure function with date headers and session breaks (FMT-01)
 - [ ] 01-04-PLAN.md — Cache + Pagination (TDD): implement EntityCache (SQLite) and cursor encode/decode (CACH-01, CACH-02)
 
 ### Phase 2: Tool Updates
@@ -68,6 +68,6 @@ Phases execute in numeric order: 1 → 2 → 3
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Support Modules | 2/4 | In Progress|  |
+| 1. Support Modules | 3/4 | In Progress|  |
 | 2. Tool Updates | 0/? | Not started | - |
 | 3. New Tools | 0/? | Not started | - |

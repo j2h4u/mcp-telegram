@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: planning
-stopped_at: Completed 01-support-modules-02-PLAN.md
-last_updated: "2026-03-10T22:29:58.635Z"
+stopped_at: Completed 01-support-modules-03-PLAN.md
+last_updated: "2026-03-10T22:34:27.561Z"
 last_activity: 2026-03-11 — Roadmap created
 progress:
   total_phases: 3
   completed_phases: 0
   total_plans: 4
-  completed_plans: 2
+  completed_plans: 3
   percent: 25
 ---
 
@@ -48,6 +48,7 @@ Progress: [███░░░░░░░] 25%
 *Updated after each plan completion*
 | Phase 01-support-modules P01 | 2 | 2 tasks | 9 files |
 | Phase 01-support-modules P02 | 2min | 3 tasks | 2 files |
+| Phase 01-support-modules P03 | 2min | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -64,6 +65,8 @@ Recent decisions affecting current work:
 - [Phase 01-support-modules]: asyncio_mode=auto in pytest: forward-compatible for future async tests, no noise on current sync stubs
 - [Phase 01-support-modules]: Pass name_to_id.keys() not dict to process.extract: rapidfuzz dict dispatch expects string values, not int entity_ids
 - [Phase 01-support-modules]: Ambiguity check via above_auto list len>=2 after extract: handles 2-way and N-way ties without separate logic
+- [Phase 01-support-modules]: Lazy Telethon import in _describe_media(): formatter has zero hard Telethon dependency at module level
+- [Phase 01-support-modules]: MockMessage/MockSender defined in test_formatter.py (not conftest): formatter-specific mocks not shared
 
 ### Pending Todos
 
@@ -76,6 +79,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-03-10T22:29:58.632Z
-Stopped at: Completed 01-support-modules-02-PLAN.md
+Last session: 2026-03-10T22:34:27.559Z
+Stopped at: Completed 01-support-modules-03-PLAN.md
 Resume file: None
