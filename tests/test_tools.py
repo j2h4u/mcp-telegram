@@ -103,30 +103,68 @@ async def test_list_messages_ambiguous(mock_cache, mock_client, monkeypatch, tmp
 # --- TOOL-03: ListMessages cursor pagination ---
 
 
-async def test_list_messages_cursor_present(mock_cache, mock_client, make_mock_message):
+async def test_list_messages_cursor_present(mock_cache, mock_client, monkeypatch, make_mock_message):
     """ListMessages with full page returns next_cursor token in output."""
-    pytest.fail("not implemented")
+    from mcp_telegram.tools import ListMessages, list_messages
+    # Return exactly limit=2 messages so cursor should be present
+    msgs = [make_mock_message(id=20, text="B"), make_mock_message(id=10, text="A")]
+    mock_client.iter_messages = MagicMock(return_value=_async_iter(msgs))
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    result = await list_messages(ListMessages(dialog="Иван Петров", limit=2))
+    assert len(result) == 1
+    assert "next_cursor:" in result[0].text
 
 
-async def test_list_messages_no_cursor_last_page(mock_cache, mock_client, make_mock_message):
+async def test_list_messages_no_cursor_last_page(mock_cache, mock_client, monkeypatch, make_mock_message):
     """ListMessages with partial page (fewer than limit) has no next_cursor in output."""
-    pytest.fail("not implemented")
+    from mcp_telegram.tools import ListMessages, list_messages
+    # Return 1 message but limit=5 — partial page, no cursor
+    msgs = [make_mock_message(id=10, text="Only")]
+    mock_client.iter_messages = MagicMock(return_value=_async_iter(msgs))
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    result = await list_messages(ListMessages(dialog="Иван Петров", limit=5))
+    assert "next_cursor" not in result[0].text
 
 
 # --- TOOL-04: ListMessages sender filter ---
 
 
-async def test_list_messages_sender_filter(mock_cache, mock_client):
+async def test_list_messages_sender_filter(mock_cache, mock_client, monkeypatch):
     """ListMessages with sender param passes from_user=entity_id to iter_messages."""
-    pytest.fail("not implemented")
+    from mcp_telegram.tools import ListMessages, list_messages
+    mock_client.iter_messages = MagicMock(return_value=_async_iter([]))
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    # mock_cache has entity 101 = "Иван Петров"
+    await list_messages(ListMessages(dialog="Иван Петров", sender="Иван Петров"))
+    # Verify iter_messages was called with from_user=101
+    call_kwargs = mock_client.iter_messages.call_args.kwargs
+    assert call_kwargs.get("from_user") == 101
 
 
 # --- TOOL-05: ListMessages unread filter ---
 
 
-async def test_list_messages_unread_filter(mock_cache, mock_client):
+async def test_list_messages_unread_filter(mock_cache, mock_client, monkeypatch):
     """ListMessages with unread=True passes min_id=read_inbox_max_id to iter_messages."""
-    pytest.fail("not implemented")
+    from mcp_telegram.tools import ListMessages, list_messages
+    # Mock get_input_entity and GetPeerDialogsRequest response
+    mock_client.get_input_entity = AsyncMock(return_value=MagicMock())
+    tl_dialog = MagicMock()
+    tl_dialog.read_inbox_max_id = 50
+    tl_dialog.unread_count = 3
+    peer_result = MagicMock()
+    peer_result.dialogs = [tl_dialog]
+    mock_client.return_value = peer_result
+    mock_client.iter_messages = MagicMock(return_value=_async_iter([]))
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    await list_messages(ListMessages(dialog="Иван Петров", unread=True))
+    call_kwargs = mock_client.iter_messages.call_args.kwargs
+    assert call_kwargs.get("min_id") == 50
+    assert call_kwargs.get("limit") == 3
 
 
 # --- TOOL-06: SearchMessages context window ---
