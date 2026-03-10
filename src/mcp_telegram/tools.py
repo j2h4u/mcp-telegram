@@ -14,7 +14,7 @@ from mcp.types import (
 )
 from pydantic import BaseModel, ConfigDict
 from telethon import TelegramClient, custom, functions, types  # type: ignore[import-untyped]
-from telethon.tl.functions.messages import GetPeerDialogsRequest
+from telethon.tl.functions.messages import GetCommonChatsRequest, GetPeerDialogsRequest
 from xdg_base_dirs import xdg_state_home
 
 from .cache import EntityCache
@@ -281,3 +281,80 @@ async def search_messages(
     return [TextContent(type="text", text=result_text)]
 
 
+### GetMe ###
+
+
+class GetMe(ToolArgs):
+    """Return own account info: numeric id, display name, and username. No arguments required."""
+
+    pass
+
+
+@tool_runner.register
+async def get_me(args: GetMe) -> t.Sequence[TextContent | ImageContent | EmbeddedResource]:
+    logger.info("method[GetMe] args[%s]", args)
+    async with create_client() as client:
+        me = await client.get_me()
+    if me is None:
+        return [TextContent(type="text", text="Not authenticated")]
+    name = " ".join(filter(None, [
+        getattr(me, "first_name", None),
+        getattr(me, "last_name", None),
+    ]))
+    username = getattr(me, "username", None) or "none"
+    text = f"id={me.id} name='{name}' username=@{username}"
+    return [TextContent(type="text", text=text)]
+
+
+### GetUserInfo ###
+
+
+class GetUserInfo(ToolArgs):
+    """
+    Look up a Telegram user by name. Returns their profile (id, name, username) and
+    the list of chats shared with this account. Resolves the name via fuzzy match.
+    """
+
+    user: str
+
+
+@tool_runner.register
+async def get_user_info(args: GetUserInfo) -> t.Sequence[TextContent | ImageContent | EmbeddedResource]:
+    logger.info("method[GetUserInfo] args[%s]", args)
+    cache = get_entity_cache()
+    result = resolve(args.user, cache.all_names())
+    if isinstance(result, NotFound):
+        return [TextContent(type="text", text=f'User not found: "{args.user}"')]
+    if isinstance(result, Candidates):
+        names = ", ".join(f'"{m[0]}"' for m in result.matches[:5])
+        return [TextContent(type="text", text=f'Ambiguous user "{args.user}". Matches: {names}')]
+    entity_id: int = result.entity_id
+    display_name: str = result.display_name
+
+    async with create_client() as client:
+        try:
+            user = await client.get_entity(entity_id)
+            common_result = await client(GetCommonChatsRequest(
+                user_id=entity_id,
+                max_id=0,
+                limit=100,
+            ))
+        except Exception as exc:
+            return [TextContent(type="text", text=f"Error fetching user info: {exc}")]
+
+    name = " ".join(filter(None, [
+        getattr(user, "first_name", None),
+        getattr(user, "last_name", None),
+    ]))
+    username = getattr(user, "username", None) or "none"
+    chat_lines = []
+    for chat in common_result.chats:
+        chat_name = getattr(chat, "title", None) or getattr(chat, "first_name", str(chat.id))
+        chat_lines.append(f"  id={chat.id} name='{chat_name}'")
+    chats_text = "\n".join(chat_lines) if chat_lines else "  (none)"
+    text = (
+        f'[resolved: "{display_name}"]\n'
+        f"id={entity_id} name='{name}' username=@{username}\n"
+        f"Common chats ({len(common_result.chats)}):\n{chats_text}"
+    )
+    return [TextContent(type="text", text=text)]
