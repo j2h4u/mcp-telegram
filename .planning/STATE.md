@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: planning
-stopped_at: Completed 01-support-modules-01-PLAN.md
-last_updated: "2026-03-10T22:25:05.531Z"
+stopped_at: Completed 01-support-modules-02-PLAN.md
+last_updated: "2026-03-10T22:29:58.635Z"
 last_activity: 2026-03-11 — Roadmap created
 progress:
   total_phases: 3
   completed_phases: 0
   total_plans: 4
-  completed_plans: 1
+  completed_plans: 2
   percent: 25
 ---
 
@@ -47,6 +47,7 @@ Progress: [███░░░░░░░] 25%
 
 *Updated after each plan completion*
 | Phase 01-support-modules P01 | 2 | 2 tasks | 9 files |
+| Phase 01-support-modules P02 | 2min | 3 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -61,6 +62,8 @@ Recent decisions affecting current work:
 - Remove GetDialog + GetMessage: no BC obligations; tools require IDs unavailable in new format
 - [Phase 01-support-modules]: Pin Python 3.13: pydantic-core PyO3 0.22.6 cannot build against Python 3.14 (system default)
 - [Phase 01-support-modules]: asyncio_mode=auto in pytest: forward-compatible for future async tests, no noise on current sync stubs
+- [Phase 01-support-modules]: Pass name_to_id.keys() not dict to process.extract: rapidfuzz dict dispatch expects string values, not int entity_ids
+- [Phase 01-support-modules]: Ambiguity check via above_auto list len>=2 after extract: handles 2-way and N-way ties without separate logic
 
 ### Pending Todos
 
@@ -73,6 +76,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-03-10T22:25:05.528Z
-Stopped at: Completed 01-support-modules-01-PLAN.md
+Last session: 2026-03-10T22:29:58.632Z
+Stopped at: Completed 01-support-modules-02-PLAN.md
 Resume file: None
