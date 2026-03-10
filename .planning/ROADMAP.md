@@ -49,8 +49,14 @@ Plans:
   2. `ListMessages` called with a dialog name (not a numeric ID) returns messages in `HH:mm FirstName: text` format with cursor-based next-page token
   3. `ListMessages` with a `sender` name filter returns only messages from the matched sender; with `unread: true` returns only unread messages
   4. `SearchMessages` called with a dialog name returns each match surrounded by ±3 context messages, with an `offset`-based next-page value that is absent on the last page
-  5. Calling `GetDialog` or `GetMessage` produces a clear deprecation error (not an unhandled exception)
-**Plans**: TBD
+  5. `GetDialog` and `GetMessage` are removed from the codebase (no stubs, no deprecation shims)
+**Plans**: 4 plans
+
+Plans:
+- [ ] 02-01-PLAN.md — Test scaffold (TDD Wave 0): 14 failing stub tests in test_tools.py + mock fixtures in conftest.py
+- [ ] 02-02-PLAN.md — Cleanup + ListDialogs: remove GetDialog/GetMessage, add type/last_message_at, add EntityCache singleton (TOOL-01, CLNP-01, CLNP-02)
+- [ ] 02-03-PLAN.md — ListMessages rewrite: name resolution, cursor pagination, sender/unread filters (TOOL-02, TOOL-03, TOOL-04, TOOL-05)
+- [ ] 02-04-PLAN.md — SearchMessages rewrite: name resolution, ±3 context window, offset pagination (TOOL-06, TOOL-07)
 
 ### Phase 3: New Tools
 **Goal**: LLM can query own account info and look up any user's profile and shared chats
@@ -69,5 +75,5 @@ Phases execute in numeric order: 1 → 2 → 3
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Support Modules | 4/4 | Complete   | 2026-03-10 |
-| 2. Tool Updates | 0/? | Not started | - |
+| 2. Tool Updates | 0/4 | Not started | - |
 | 3. New Tools | 0/? | Not started | - |
