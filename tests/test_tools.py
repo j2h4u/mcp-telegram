@@ -63,19 +63,41 @@ async def test_list_dialogs_null_date(mock_cache, mock_client, monkeypatch):
 # --- TOOL-02: ListMessages name resolution ---
 
 
-async def test_list_messages_by_name(mock_cache, mock_client, make_mock_message):
+async def test_list_messages_by_name(mock_cache, mock_client, monkeypatch, make_mock_message):
     """ListMessages called with a name returns format_messages() output."""
-    pytest.fail("not implemented")
+    from mcp_telegram.tools import ListMessages, list_messages
+    msg = make_mock_message(id=10, text="Hello")
+    mock_client.iter_messages = MagicMock(return_value=_async_iter([msg]))
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    result = await list_messages(ListMessages(dialog="Иван Петров"))
+    assert len(result) == 1
+    assert "10:00" in result[0].text  # formatted output includes time
 
 
-async def test_list_messages_not_found(mock_cache, mock_client):
+async def test_list_messages_not_found(mock_cache, mock_client, monkeypatch):
     """ListMessages with unresolved name returns TextContent with 'not found'."""
-    pytest.fail("not implemented")
+    from mcp_telegram.tools import ListMessages, list_messages
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    result = await list_messages(ListMessages(dialog="nobody_xyz"))
+    assert len(result) == 1
+    assert "not found" in result[0].text.lower()
 
 
-async def test_list_messages_ambiguous(mock_cache, mock_client):
+async def test_list_messages_ambiguous(mock_cache, mock_client, monkeypatch, tmp_db_path):
     """ListMessages with ambiguous name returns TextContent with candidates list."""
-    pytest.fail("not implemented")
+    from mcp_telegram.cache import EntityCache
+    from mcp_telegram.tools import ListMessages, list_messages
+    # Seed cache with two similar names to trigger Candidates result
+    ambig_cache = EntityCache(tmp_db_path)
+    ambig_cache.upsert(201, "user", "Иван Петров", None)
+    ambig_cache.upsert(202, "user", "Иван Сидоров", None)
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: ambig_cache)
+    result = await list_messages(ListMessages(dialog="Иван"))
+    assert len(result) == 1
+    assert "Ambiguous" in result[0].text or "ambiguous" in result[0].text.lower()
 
 
 # --- TOOL-03: ListMessages cursor pagination ---
