@@ -18,7 +18,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 - [x] **Phase 1: Support Modules** - Build resolver, formatter, pagination, and entity cache — the tested foundation everything else depends on (completed 2026-03-10)
 - [x] **Phase 2: Tool Updates** - Wire support modules into existing tools; retire deprecated GetDialog and GetMessage (completed 2026-03-10)
-- [ ] **Phase 3: New Tools** - Add GetMe and GetUserInfo using the now battle-tested resolver
+- [x] **Phase 3: New Tools** - Add GetMe and GetUserInfo using the now battle-tested resolver (completed 2026-03-10)
 
 ## Phase Details
 
@@ -69,7 +69,7 @@ Plans:
 
 Plans:
 - [x] 03-01-PLAN.md — Test stubs (TDD Wave 0): 6 failing tests for GetMe and GetUserInfo (TOOL-08, TOOL-09)
-- [ ] 03-02-PLAN.md — Implement GetMe and GetUserInfo in tools.py (TOOL-08, TOOL-09)
+- [x] 03-02-PLAN.md — Implement GetMe and GetUserInfo in tools.py (TOOL-08, TOOL-09)
 
 ## Progress
 
@@ -80,4 +80,4 @@ Phases execute in numeric order: 1 → 2 → 3
 |-------|----------------|--------|-----------|
 | 1. Support Modules | 4/4 | Complete   | 2026-03-10 |
 | 2. Tool Updates | 4/4 | Complete   | 2026-03-10 |
-| 3. New Tools | 1/2 | In Progress|  |
+| 3. New Tools | 2/2 | Complete   | 2026-03-10 |
