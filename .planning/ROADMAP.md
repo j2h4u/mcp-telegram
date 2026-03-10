@@ -17,7 +17,7 @@ fit the existing singledispatch pattern without touching anything else.
 Decimal phases appear between their surrounding integers in numeric order.
 
 - [x] **Phase 1: Support Modules** - Build resolver, formatter, pagination, and entity cache — the tested foundation everything else depends on (completed 2026-03-10)
-- [ ] **Phase 2: Tool Updates** - Wire support modules into existing tools; retire deprecated GetDialog and GetMessage
+- [x] **Phase 2: Tool Updates** - Wire support modules into existing tools; retire deprecated GetDialog and GetMessage (completed 2026-03-10)
 - [ ] **Phase 3: New Tools** - Add GetMe and GetUserInfo using the now battle-tested resolver
 
 ## Phase Details
@@ -56,7 +56,7 @@ Plans:
 - [x] 02-01-PLAN.md — Test scaffold (TDD Wave 0): 14 failing stub tests in test_tools.py + mock fixtures in conftest.py
 - [x] 02-02-PLAN.md — Cleanup + ListDialogs: remove GetDialog/GetMessage, add type/last_message_at, add EntityCache singleton (TOOL-01, CLNP-01, CLNP-02)
 - [x] 02-03-PLAN.md — ListMessages rewrite: name resolution, cursor pagination, sender/unread filters (TOOL-02, TOOL-03, TOOL-04, TOOL-05)
-- [ ] 02-04-PLAN.md — SearchMessages rewrite: name resolution, ±3 context window, offset pagination (TOOL-06, TOOL-07)
+- [x] 02-04-PLAN.md — SearchMessages rewrite: name resolution, ±3 context window, offset pagination (TOOL-06, TOOL-07)
 
 ### Phase 3: New Tools
 **Goal**: LLM can query own account info and look up any user's profile and shared chats
@@ -75,5 +75,5 @@ Phases execute in numeric order: 1 → 2 → 3
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Support Modules | 4/4 | Complete   | 2026-03-10 |
-| 2. Tool Updates | 3/4 | In Progress|  |
+| 2. Tool Updates | 4/4 | Complete   | 2026-03-10 |
 | 3. New Tools | 0/? | Not started | - |

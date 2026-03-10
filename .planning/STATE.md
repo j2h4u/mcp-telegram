@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: planning
-stopped_at: Completed 02-tool-updates-03-PLAN.md
-last_updated: "2026-03-10T23:16:21.805Z"
+stopped_at: Completed 02-tool-updates-04-PLAN.md
+last_updated: "2026-03-10T23:20:26.677Z"
 last_activity: 2026-03-10
 progress:
   total_phases: 3
-  completed_phases: 1
+  completed_phases: 2
   total_plans: 8
-  completed_plans: 7
+  completed_plans: 8
   percent: 25
 ---
 
@@ -53,6 +53,7 @@ Progress: [███░░░░░░░] 25%
 | Phase 02-tool-updates P01 | 5 | 2 tasks | 2 files |
 | Phase 02-tool-updates P02 | 2 | 2 tasks | 2 files |
 | Phase 02-tool-updates P03 | 10 | 2 tasks | 2 files |
+| Phase 02-tool-updates P04 | 2 | 2 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -81,6 +82,9 @@ Recent decisions affecting current work:
 - [Phase 02-tool-updates]: Use mock_client.return_value (not __call__ override) for AsyncMock call stubbing in unread filter test
 - [Phase 02-tool-updates]: Resolve dialog and sender names before entering async client context to fail fast
 - [Phase 02-tool-updates]: next_cursor appended as plain text suffix to formatted output (single TextContent item)
+- [Phase 02-tool-updates]: SearchMessages uses dialog: str (not dialog_id: int) consistent with ListMessages pattern
+- [Phase 02-tool-updates]: offset-based pagination for SearchMessages: Telegram Search uses add_offset; cursor pagination incompatible
+- [Phase 02-tool-updates]: make_mock_message fixture sets msg.message=text: formatter reads .message (Telethon attr), not .text
 
 ### Pending Todos
 
@@ -93,6 +97,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-03-10T23:16:21.802Z
-Stopped at: Completed 02-tool-updates-03-PLAN.md
+Last session: 2026-03-10T23:20:26.673Z
+Stopped at: Completed 02-tool-updates-04-PLAN.md
 Resume file: None
