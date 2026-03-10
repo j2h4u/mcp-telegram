@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: planning
-stopped_at: Completed 02-tool-updates-01-PLAN.md
-last_updated: "2026-03-10T23:06:28.047Z"
+stopped_at: Completed 02-tool-updates-02-PLAN.md
+last_updated: "2026-03-10T23:11:19.529Z"
 last_activity: 2026-03-10
 progress:
   total_phases: 3
   completed_phases: 1
   total_plans: 8
-  completed_plans: 5
+  completed_plans: 6
   percent: 25
 ---
 
@@ -51,6 +51,7 @@ Progress: [███░░░░░░░] 25%
 | Phase 01-support-modules P03 | 2min | 2 tasks | 2 files |
 | Phase 01-support-modules P04 | 5 | 3 tasks | 4 files |
 | Phase 02-tool-updates P01 | 5 | 2 tasks | 2 files |
+| Phase 02-tool-updates P02 | 2 | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -73,6 +74,9 @@ Recent decisions affecting current work:
 - [Phase 01-support-modules]: Test monkeypatches mcp_telegram.cache.time (module attribute) not time.time directly — required for Python monkeypatching to work with module-level imports
 - [Phase 02-tool-updates]: async_iter defined at module level in conftest so it can be passed directly to mock_client.iter_dialogs/iter_messages
 - [Phase 02-tool-updates]: CLNP tests are sync (no async fixtures) — they verify module-level class absence, not runtime behavior
+- [Phase 02-tool-updates]: get_entity_cache() creates state directory with mkdir before opening SQLite — required for first-run correctness
+- [Phase 02-tool-updates]: ListDialogs drops unread field — filter moves to ListMessages where it belongs semantically
+- [Phase 02-tool-updates]: _async_iter defined at module level in test_tools.py (underscore prefix) to distinguish from conftest async_iter
 
 ### Pending Todos
 
@@ -85,6 +89,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-03-10T23:06:23.517Z
-Stopped at: Completed 02-tool-updates-01-PLAN.md
+Last session: 2026-03-10T23:11:19.525Z
+Stopped at: Completed 02-tool-updates-02-PLAN.md
 Resume file: None
