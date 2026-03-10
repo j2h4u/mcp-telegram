@@ -16,7 +16,7 @@ fit the existing singledispatch pattern without touching anything else.
 
 Decimal phases appear between their surrounding integers in numeric order.
 
-- [ ] **Phase 1: Support Modules** - Build resolver, formatter, pagination, and entity cache — the tested foundation everything else depends on
+- [x] **Phase 1: Support Modules** - Build resolver, formatter, pagination, and entity cache — the tested foundation everything else depends on (completed 2026-03-10)
 - [ ] **Phase 2: Tool Updates** - Wire support modules into existing tools; retire deprecated GetDialog and GetMessage
 - [ ] **Phase 3: New Tools** - Add GetMe and GetUserInfo using the now battle-tested resolver
 
@@ -38,7 +38,7 @@ Plans:
 - [x] 01-01-PLAN.md — Test scaffold: install rapidfuzz + pytest deps, create stub test files and conftest
 - [x] 01-02-PLAN.md — Resolver (TDD): implement resolve() with WRatio thresholds, tagged-union result types (RES-01, RES-02)
 - [x] 01-03-PLAN.md — Formatter (TDD): implement format_messages() pure function with date headers and session breaks (FMT-01)
-- [ ] 01-04-PLAN.md — Cache + Pagination (TDD): implement EntityCache (SQLite) and cursor encode/decode (CACH-01, CACH-02)
+- [x] 01-04-PLAN.md — Cache + Pagination (TDD): implement EntityCache (SQLite) and cursor encode/decode (CACH-01, CACH-02)
 
 ### Phase 2: Tool Updates
 **Goal**: All existing tools accept names instead of IDs and return human-readable output; deprecated tools are gone
@@ -68,6 +68,6 @@ Phases execute in numeric order: 1 → 2 → 3
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Support Modules | 3/4 | In Progress|  |
+| 1. Support Modules | 4/4 | Complete   | 2026-03-10 |
 | 2. Tool Updates | 0/? | Not started | - |
 | 3. New Tools | 0/? | Not started | - |
