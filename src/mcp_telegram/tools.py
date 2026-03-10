@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import sys
 import typing as t
+from functools import cache as functools_cache
 from functools import singledispatch
 
 from mcp.types import (
@@ -13,7 +14,9 @@ from mcp.types import (
 )
 from pydantic import BaseModel, ConfigDict
 from telethon import TelegramClient, custom, functions, types  # type: ignore[import-untyped]
+from xdg_base_dirs import xdg_state_home
 
+from .cache import EntityCache
 from .telegram import create_client
 
 logger = logging.getLogger(__name__)
@@ -63,6 +66,15 @@ def tool_description(args: type[ToolArgs]) -> Tool:
 
 def tool_args(tool: Tool, *args, **kwargs) -> ToolArgs:  # noqa: ANN002, ANN003
     return sys.modules[__name__].__dict__[tool.name](*args, **kwargs)
+
+
+@functools_cache
+def get_entity_cache() -> EntityCache:
+    """Return the shared EntityCache instance (opened once per process)."""
+    db_dir = xdg_state_home() / "mcp-telegram"
+    db_dir.mkdir(parents=True, exist_ok=True)
+    db_path = db_dir / "entity_cache.db"
+    return EntityCache(db_path)
 
 
 ### ListDialogs ###
@@ -156,32 +168,6 @@ async def list_messages(
     return response
 
 
-### GetMessage ###
-
-
-class GetMessage(ToolArgs):
-    """Get a single message by its ID. Use this to fetch a specific message when you know its ID."""
-
-    dialog_id: int
-    message_id: int
-
-
-@tool_runner.register
-async def get_message(
-    args: GetMessage,
-) -> t.Sequence[TextContent | ImageContent | EmbeddedResource]:
-    client: TelegramClient
-    logger.info("method[GetMessage] args[%s]", args)
-
-    async with create_client() as client:
-        message = await client.get_messages(args.dialog_id, ids=args.message_id)
-        if message is None:
-            raise ValueError(f"Message {args.message_id} not found in dialog {args.dialog_id}")
-        text = message.text or "(no text)"
-        date = message.date.isoformat() if message.date else "unknown"
-        return [TextContent(type="text", text=f"[id={message.id}] [{date}] {text}")]
-
-
 ### SearchMessages ###
 
 
@@ -215,52 +201,3 @@ async def search_messages(
     return response
 
 
-### GetDialog ###
-
-
-class GetDialog(ToolArgs):
-    """
-    Get metadata for a dialog: name, type (private/group/channel), and date of the first message.
-    Use this to understand the context of a conversation without reading its messages.
-    """
-
-    dialog_id: int
-
-
-@tool_runner.register
-async def get_dialog(
-    args: GetDialog,
-) -> t.Sequence[TextContent | ImageContent | EmbeddedResource]:
-    client: TelegramClient
-    logger.info("method[GetDialog] args[%s]", args)
-
-    async with create_client() as client:
-        entity = await client.get_entity(args.dialog_id)
-
-        if isinstance(entity, types.User):
-            name = " ".join(filter(None, [entity.first_name, entity.last_name]))
-            dialog_type = "private"
-        elif isinstance(entity, types.Chat):
-            name = entity.title
-            dialog_type = "group"
-        elif isinstance(entity, types.Channel):
-            name = entity.title
-            dialog_type = "channel" if entity.broadcast else "supergroup"
-        else:
-            name = str(args.dialog_id)
-            dialog_type = "unknown"
-
-        first_messages = await client.get_messages(args.dialog_id, limit=1, reverse=True)
-        if first_messages:
-            first = first_messages[0]
-            first_date = first.date.isoformat() if first.date else "unknown"
-            first_id = first.id
-        else:
-            first_date = "unknown"
-            first_id = None
-
-        info = (
-            f"id={args.dialog_id} name='{name}' type={dialog_type} "
-            f"first_message_id={first_id} first_message_date={first_date}"
-        )
-        return [TextContent(type="text", text=info)]
