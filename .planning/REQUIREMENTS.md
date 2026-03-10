@@ -17,13 +17,13 @@
 
 ### Tools
 
-- [ ] **TOOL-01**: `ListDialogs` returns `type` (user/group/channel) and `last_message_at` for each dialog
-- [ ] **TOOL-02**: `ListMessages` accepts dialog by name, returns messages in unified format
-- [ ] **TOOL-03**: `ListMessages` uses cursor-based pagination (opaque tokens, stable under concurrent message arrival)
-- [ ] **TOOL-04**: `ListMessages` accepts optional `sender` name filter
-- [ ] **TOOL-05**: `ListMessages` accepts optional `unread` filter
-- [ ] **TOOL-06**: `SearchMessages` accepts dialog by name, returns each result with ±3 messages of surrounding context
-- [ ] **TOOL-07**: `SearchMessages` uses offset-based pagination (`next_offset` absent when exhausted)
+- [x] **TOOL-01**: `ListDialogs` returns `type` (user/group/channel) and `last_message_at` for each dialog
+- [x] **TOOL-02**: `ListMessages` accepts dialog by name, returns messages in unified format
+- [x] **TOOL-03**: `ListMessages` uses cursor-based pagination (opaque tokens, stable under concurrent message arrival)
+- [x] **TOOL-04**: `ListMessages` accepts optional `sender` name filter
+- [x] **TOOL-05**: `ListMessages` accepts optional `unread` filter
+- [x] **TOOL-06**: `SearchMessages` accepts dialog by name, returns each result with ±3 messages of surrounding context
+- [x] **TOOL-07**: `SearchMessages` uses offset-based pagination (`next_offset` absent when exhausted)
 - [ ] **TOOL-08**: `GetMe` returns own name, id, and username
 - [ ] **TOOL-09**: `GetUserInfo` returns target user's profile and list of common chats
 
@@ -34,8 +34,8 @@
 
 ### Cleanup
 
-- [ ] **CLNP-01**: `GetDialog` tool removed (no stubs, no BC obligations)
-- [ ] **CLNP-02**: `GetMessage` tool removed (no stubs, no BC obligations)
+- [x] **CLNP-01**: `GetDialog` tool removed (no stubs, no BC obligations)
+- [x] **CLNP-02**: `GetMessage` tool removed (no stubs, no BC obligations)
 
 ## Future Requirements
 
@@ -63,15 +63,15 @@
 | FMT-01 | Phase 1 | Complete |
 | CACH-01 | Phase 1 | Complete |
 | CACH-02 | Phase 1 | Complete |
-| TOOL-01 | Phase 2 | Pending |
-| TOOL-02 | Phase 2 | Pending |
-| TOOL-03 | Phase 2 | Pending |
-| TOOL-04 | Phase 2 | Pending |
-| TOOL-05 | Phase 2 | Pending |
-| TOOL-06 | Phase 2 | Pending |
-| TOOL-07 | Phase 2 | Pending |
-| CLNP-01 | Phase 2 | Pending |
-| CLNP-02 | Phase 2 | Pending |
+| TOOL-01 | Phase 2 | Complete |
+| TOOL-02 | Phase 2 | Complete |
+| TOOL-03 | Phase 2 | Complete |
+| TOOL-04 | Phase 2 | Complete |
+| TOOL-05 | Phase 2 | Complete |
+| TOOL-06 | Phase 2 | Complete |
+| TOOL-07 | Phase 2 | Complete |
+| CLNP-01 | Phase 2 | Complete |
+| CLNP-02 | Phase 2 | Complete |
 | TOOL-08 | Phase 3 | Pending |
 | TOOL-09 | Phase 3 | Pending |
 

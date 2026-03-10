@@ -53,7 +53,7 @@ Plans:
 **Plans**: 4 plans
 
 Plans:
-- [ ] 02-01-PLAN.md — Test scaffold (TDD Wave 0): 14 failing stub tests in test_tools.py + mock fixtures in conftest.py
+- [x] 02-01-PLAN.md — Test scaffold (TDD Wave 0): 14 failing stub tests in test_tools.py + mock fixtures in conftest.py
 - [ ] 02-02-PLAN.md — Cleanup + ListDialogs: remove GetDialog/GetMessage, add type/last_message_at, add EntityCache singleton (TOOL-01, CLNP-01, CLNP-02)
 - [ ] 02-03-PLAN.md — ListMessages rewrite: name resolution, cursor pagination, sender/unread filters (TOOL-02, TOOL-03, TOOL-04, TOOL-05)
 - [ ] 02-04-PLAN.md — SearchMessages rewrite: name resolution, ±3 context window, offset pagination (TOOL-06, TOOL-07)
@@ -75,5 +75,5 @@ Phases execute in numeric order: 1 → 2 → 3
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Support Modules | 4/4 | Complete   | 2026-03-10 |
-| 2. Tool Updates | 0/4 | Not started | - |
+| 2. Tool Updates | 1/4 | In Progress|  |
 | 3. New Tools | 0/? | Not started | - |
