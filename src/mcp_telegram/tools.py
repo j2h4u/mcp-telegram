@@ -221,31 +221,63 @@ async def list_messages(
 
 class SearchMessages(ToolArgs):
     """
-    Search messages in a dialog by text query. Returns messages containing the query string,
-    ordered from newest to oldest. Useful for finding when a topic was first discussed or
-    locating a specific decision in chat history.
+    Search messages in a dialog by text query. Returns each matching message with up to
+    3 messages of surrounding context (before and after). Ordered newest to oldest.
+
+    Use offset= with the next_offset value from a previous response to get the next page.
     """
 
-    dialog_id: int
+    dialog: str
     query: str
-    limit: int = 50
+    limit: int = 20
+    offset: int | None = None
 
 
 @tool_runner.register
 async def search_messages(
     args: SearchMessages,
 ) -> t.Sequence[TextContent | ImageContent | EmbeddedResource]:
-    client: TelegramClient
     logger.info("method[SearchMessages] args[%s]", args)
 
-    response: list[TextContent] = []
-    async with create_client() as client:
-        async for message in client.iter_messages(args.dialog_id, search=args.query, limit=args.limit):
-            if isinstance(message, custom.Message):
-                text = message.text or "(no text)"
-                date = message.date.isoformat() if message.date else "unknown"
-                response.append(TextContent(type="text", text=f"[id={message.id}] [{date}] {text}"))
+    # Step 1: Resolve dialog name
+    cache = get_entity_cache()
+    result = resolve(args.dialog, cache.all_names())
+    if isinstance(result, NotFound):
+        return [TextContent(type="text", text=f'Dialog not found: "{args.dialog}"')]
+    if isinstance(result, Candidates):
+        names = ", ".join(f'"{m[0]}"' for m in result.matches[:5])
+        return [TextContent(type="text", text=f'Ambiguous dialog "{args.dialog}". Matches: {names}')]
+    entity_id: int = result.entity_id
 
-    return response
+    page_offset = args.offset or 0
+
+    async with create_client() as client:
+        # Step 2: Fetch search results page
+        hits = [
+            msg async for msg in client.iter_messages(
+                entity_id,
+                search=args.query,
+                limit=args.limit,
+                add_offset=page_offset,
+            )
+        ]
+
+        # Step 3: For each hit, fetch ±3 context messages
+        blocks: list[str] = []
+        for hit in hits:
+            before = list(reversed([
+                m async for m in client.iter_messages(entity_id, limit=3, max_id=hit.id)
+            ]))
+            after = [
+                m async for m in client.iter_messages(entity_id, limit=3, min_id=hit.id)
+            ]
+            window = before + [hit] + after
+            blocks.append(format_messages(window, reply_map={}))
+
+    # Step 4: Build output
+    result_text = "\n\n---\n\n".join(blocks)
+    if len(hits) == args.limit:
+        result_text += f"\n\nnext_offset: {page_offset + args.limit}"
+    return [TextContent(type="text", text=result_text)]
 
 
