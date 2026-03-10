@@ -81,9 +81,8 @@ def get_entity_cache() -> EntityCache:
 
 
 class ListDialogs(ToolArgs):
-    """List available dialogs, chats and channels."""
+    """List available dialogs, chats and channels with type and last message timestamp."""
 
-    unread: bool = False
     archived: bool = False
     ignore_pinned: bool = False
 
@@ -92,21 +91,31 @@ class ListDialogs(ToolArgs):
 async def list_dialogs(
     args: ListDialogs,
 ) -> t.Sequence[TextContent | ImageContent | EmbeddedResource]:
-    client: TelegramClient
     logger.info("method[ListDialogs] args[%s]", args)
-
+    cache = get_entity_cache()
     response: list[TextContent] = []
     async with create_client() as client:
-        dialog: custom.dialog.Dialog
-        async for dialog in client.iter_dialogs(archived=args.archived, ignore_pinned=args.ignore_pinned):
-            if args.unread and dialog.unread_count == 0:
-                continue
+        async for dialog in client.iter_dialogs(
+            archived=args.archived, ignore_pinned=args.ignore_pinned
+        ):
+            if dialog.is_user:
+                dtype = "user"
+            elif dialog.is_group:
+                dtype = "group"
+            elif dialog.is_channel:
+                dtype = "channel"
+            else:
+                dtype = "unknown"
+            last_at = dialog.date.isoformat() if dialog.date else "unknown"
+            # Lazy cache warm-up: upsert entity metadata on every ListDialogs call
+            entity = dialog.entity
+            username: str | None = getattr(entity, "username", None)
+            cache.upsert(dialog.id, dtype, dialog.name, username)
             msg = (
-                f"name='{dialog.name}' id={dialog.id} "
-                f"unread={dialog.unread_count} mentions={dialog.unread_mentions_count}"
+                f"name='{dialog.name}' id={dialog.id} type={dtype} "
+                f"last_message_at={last_at} unread={dialog.unread_count}"
             )
             response.append(TextContent(type="text", text=msg))
-
     return response
 
 
