@@ -14,9 +14,13 @@ from mcp.types import (
 )
 from pydantic import BaseModel, ConfigDict
 from telethon import TelegramClient, custom, functions, types  # type: ignore[import-untyped]
+from telethon.tl.functions.messages import GetPeerDialogsRequest
 from xdg_base_dirs import xdg_state_home
 
 from .cache import EntityCache
+from .formatter import format_messages
+from .pagination import decode_cursor, encode_cursor
+from .resolver import Candidates, NotFound, resolve
 from .telegram import create_client
 
 logger = logging.getLogger(__name__)
@@ -124,57 +128,92 @@ async def list_dialogs(
 
 class ListMessages(ToolArgs):
     """
-    List messages in a given dialog, chat or channel. The messages are listed in order from newest to oldest.
+    List messages in a dialog by name. Returns messages newest-first in human-readable format
+    (HH:mm FirstName: text) with date headers and session breaks.
 
-    If `unread` is set to `True`, only unread messages will be listed. Once a message is read, it will not be
-    listed again.
-
-    If `limit` is set, only the last `limit` messages will be listed. If `unread` is set, the limit will be
-    the minimum between the unread messages and the limit.
-
-    If `before_id` is set, only messages older than the given message ID will be listed. Use this for
-    pagination: pass the ID of the oldest message from the previous page to get the next page.
+    Use cursor= with the next_cursor token from a previous response to page back in time.
+    Use sender= to filter messages from a specific person (name string, resolved via fuzzy match).
+    Use unread=True to show only messages you haven't read yet.
     """
 
-    dialog_id: int
-    unread: bool = False
+    dialog: str
     limit: int = 100
-    before_id: int | None = None
+    cursor: str | None = None
+    sender: str | None = None
+    unread: bool = False
 
 
 @tool_runner.register
 async def list_messages(
     args: ListMessages,
 ) -> t.Sequence[TextContent | ImageContent | EmbeddedResource]:
-    client: TelegramClient
     logger.info("method[ListMessages] args[%s]", args)
 
-    response: list[TextContent] = []
+    # Step 1 — Resolve dialog name
+    cache = get_entity_cache()
+    result = resolve(args.dialog, cache.all_names())
+    if isinstance(result, NotFound):
+        return [TextContent(type="text", text=f'Dialog not found: "{args.dialog}"')]
+    if isinstance(result, Candidates):
+        names = ", ".join(f'"{m[0]}"' for m in result.matches[:5])
+        return [TextContent(type="text", text=f'Ambiguous dialog "{args.dialog}". Matches: {names}')]
+    entity_id: int = result.entity_id
+
+    # Step 2 — Build iter_messages kwargs
+    iter_kwargs: dict[str, t.Any] = {
+        "entity": entity_id,
+        "limit": args.limit,
+        "reverse": False,
+    }
+    if args.cursor:
+        iter_kwargs["max_id"] = decode_cursor(args.cursor, entity_id)
+
+    # Step 3 — Sender filter (resolve before opening client)
+    if args.sender:
+        sender_result = resolve(args.sender, cache.all_names())
+        if isinstance(sender_result, NotFound):
+            return [TextContent(type="text", text=f'Sender not found: "{args.sender}"')]
+        if isinstance(sender_result, Candidates):
+            names = ", ".join(f'"{m[0]}"' for m in sender_result.matches[:5])
+            return [TextContent(type="text", text=f'Ambiguous sender "{args.sender}". Matches: {names}')]
+        iter_kwargs["from_user"] = sender_result.entity_id
+
+    # Step 4 — Unread filter + message fetch + format + cursor
     async with create_client() as client:
-        result = await client(functions.messages.GetPeerDialogsRequest(peers=[args.dialog_id]))
-        if not result:
-            raise ValueError(f"Channel not found: {args.dialog_id}")
-
-        if not isinstance(result, types.messages.PeerDialogs):
-            raise TypeError(f"Unexpected result: {type(result)}")
-
-        iter_messages_args: dict[str, t.Any] = {
-            "entity": args.dialog_id,
-            "reverse": False,
-        }
         if args.unread:
-            iter_messages_args["limit"] = min(dialog.unread_count, args.limit)
-        else:
-            iter_messages_args["limit"] = args.limit
+            input_peer = await client.get_input_entity(entity_id)
+            peer_result = await client(GetPeerDialogsRequest(peers=[input_peer]))
+            tl_dialog = peer_result.dialogs[0]
+            iter_kwargs["min_id"] = tl_dialog.read_inbox_max_id
+            iter_kwargs["limit"] = min(tl_dialog.unread_count, args.limit)
 
-        if args.before_id is not None:
-            iter_messages_args["max_id"] = args.before_id
+        messages = [msg async for msg in client.iter_messages(**iter_kwargs)]
 
-        async for message in client.iter_messages(**iter_messages_args):
-            if isinstance(message, custom.Message) and message.text:
-                response.append(TextContent(type="text", text=f"[id={message.id}] {message.text}"))
+        # Lazy cache population: upsert sender entities
+        for msg in messages:
+            sender = getattr(msg, "sender", None)
+            if sender is not None:
+                sender_name = " ".join(
+                    filter(None, [
+                        getattr(sender, "first_name", None),
+                        getattr(sender, "last_name", None),
+                    ])
+                ) or getattr(sender, "title", "") or str(msg.sender_id)
+                sender_type = "user" if getattr(sender, "first_name", None) else "group"
+                cache.upsert(
+                    msg.sender_id, sender_type, sender_name,
+                    getattr(sender, "username", None)
+                )
 
-    return response
+    text = format_messages(messages, reply_map={})
+    next_cursor: str | None = None
+    if len(messages) == args.limit and messages:
+        next_cursor = encode_cursor(messages[-1].id, entity_id)
+
+    result_text = text
+    if next_cursor:
+        result_text += f"\n\nnext_cursor: {next_cursor}"
+    return [TextContent(type="text", text=result_text)]
 
 
 ### SearchMessages ###
