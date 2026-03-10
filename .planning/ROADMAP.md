@@ -32,7 +32,13 @@ Decimal phases appear between their surrounding integers in numeric order.
   3. A message object fed to the formatter produces `HH:mm FirstName: text` output with date headers on day change and session-break lines at >60-min gaps
   4. Entity metadata (users, groups, channels) is persisted to SQLite and survives process restart; a re-fetched entity reads from cache within TTL
   5. Cursor tokens encode and decode round-trip correctly; a cross-dialog decode raises an error
-**Plans**: TBD
+**Plans**: 4 plans
+
+Plans:
+- [ ] 01-01-PLAN.md — Test scaffold: install rapidfuzz + pytest deps, create stub test files and conftest
+- [ ] 01-02-PLAN.md — Resolver (TDD): implement resolve() with WRatio thresholds, tagged-union result types (RES-01, RES-02)
+- [ ] 01-03-PLAN.md — Formatter (TDD): implement format_messages() pure function with date headers and session breaks (FMT-01)
+- [ ] 01-04-PLAN.md — Cache + Pagination (TDD): implement EntityCache (SQLite) and cursor encode/decode (CACH-01, CACH-02)
 
 ### Phase 2: Tool Updates
 **Goal**: All existing tools accept names instead of IDs and return human-readable output; deprecated tools are gone
@@ -62,6 +68,6 @@ Phases execute in numeric order: 1 → 2 → 3
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Support Modules | 0/? | Not started | - |
+| 1. Support Modules | 0/4 | Not started | - |
 | 2. Tool Updates | 0/? | Not started | - |
 | 3. New Tools | 0/? | Not started | - |
