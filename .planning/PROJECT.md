@@ -11,6 +11,18 @@ entity IDs. Built on Telethon (MTProto) with stdio transport, deployable via Doc
 LLM can work with Telegram using natural names — zero cold-start friction, no ID lookup
 boilerplate before every real task.
 
+## Current Milestone: v1.0 Core API
+
+**Goal:** Ship the complete read-only Telegram API — name resolution, unified message format, all tool improvements, entity cache, and cleanup.
+
+**Target features:**
+- Name-based dialog/sender resolution (fuzzy WRatio)
+- Unified message format (sender, reactions, replies, media)
+- `ListDialogs` / `ListMessages` / `SearchMessages` improvements
+- `GetMe`, `GetUserInfo` tools
+- Entity metadata cache (L2 SQLite)
+- Remove `GetDialog`, `GetMessage` tools; defer `transliterate`
+
 ## Requirements
 
 ### Validated
@@ -124,4 +136,4 @@ server layer in `src/mcp_telegram/server.py`.
 | mcp-proxy stays for HTTP | Native HTTP/SSE deferred — proxy works, not worth disruption | — Pending |
 
 ---
-*Last updated: 2026-03-11 after expert panel review (architecture, UX, cache, pagination)*
+*Last updated: 2026-03-11 after milestone v1.0 started*
