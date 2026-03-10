@@ -170,22 +170,86 @@ async def test_list_messages_unread_filter(mock_cache, mock_client, monkeypatch)
 # --- TOOL-06: SearchMessages context window ---
 
 
-async def test_search_messages_context(mock_cache, mock_client, make_mock_message):
+async def test_search_messages_context(mock_cache, mock_client, monkeypatch, make_mock_message):
     """SearchMessages output contains context messages before and after each hit."""
-    pytest.fail("not implemented")
+    from mcp_telegram.tools import SearchMessages, search_messages
+    hit = make_mock_message(id=50, text="the hit")
+    before_msg = make_mock_message(id=49, text="before msg")
+    after_msg = make_mock_message(id=51, text="after msg")
+
+    call_count = 0
+
+    async def _fake_iter_messages(entity, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:   # first call: search hits
+            yield hit
+        elif call_count == 2:  # second call: before context (max_id=50)
+            yield before_msg
+        elif call_count == 3:  # third call: after context (min_id=50)
+            yield after_msg
+
+    mock_client.iter_messages = _fake_iter_messages
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+
+    result = await search_messages(SearchMessages(dialog="Иван Петров", query="hit"))
+    assert len(result) == 1
+    text = result[0].text
+    # All three messages appear in the output block
+    assert "the hit" in text
+    assert "before msg" in text
+    assert "after msg" in text
 
 
 # --- TOOL-07: SearchMessages offset pagination ---
 
 
-async def test_search_messages_next_offset(mock_cache, mock_client, make_mock_message):
+async def test_search_messages_next_offset(mock_cache, mock_client, monkeypatch, make_mock_message):
     """SearchMessages full page returns next_offset in output."""
-    pytest.fail("not implemented")
+    from mcp_telegram.tools import SearchMessages, search_messages
+
+    # Return exactly limit=2 hits, no context
+    hits = [make_mock_message(id=i, text=f"msg{i}") for i in range(1, 3)]
+    call_count = 0
+
+    async def _fake_iter(entity, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:  # search hits
+            for h in hits:
+                yield h
+        # context calls return empty
+
+    mock_client.iter_messages = _fake_iter
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+
+    result = await search_messages(SearchMessages(dialog="Иван Петров", query="msg", limit=2))
+    assert "next_offset: 2" in result[0].text
 
 
-async def test_search_messages_no_next_offset(mock_cache, mock_client, make_mock_message):
+async def test_search_messages_no_next_offset(mock_cache, mock_client, monkeypatch, make_mock_message):
     """SearchMessages last page (fewer than limit) has no next_offset in output."""
-    pytest.fail("not implemented")
+    from mcp_telegram.tools import SearchMessages, search_messages
+
+    # Return 1 hit with limit=5 (partial page)
+    hit = make_mock_message(id=10, text="only one")
+    call_count = 0
+
+    async def _fake_iter(entity, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            yield hit
+        # context calls return empty
+
+    mock_client.iter_messages = _fake_iter
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+
+    result = await search_messages(SearchMessages(dialog="Иван Петров", query="only", limit=5))
+    assert "next_offset" not in result[0].text
 
 
 # --- CLNP-01, CLNP-02: Removed tools ---

@@ -53,6 +53,7 @@ def make_mock_message():
         msg = MagicMock()
         msg.id = id
         msg.text = text
+        msg.message = text  # Telethon exposes message text via .message; formatter reads this
         msg.sender_id = sender_id
         msg.sender = MagicMock(first_name=sender_name, last_name=None, username=None)
         msg.date = date or datetime(2024, 1, 15, 10, 0, 0, tzinfo=timezone.utc)
