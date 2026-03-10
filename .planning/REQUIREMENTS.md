@@ -58,28 +58,28 @@
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| RES-01 | — | Pending |
-| RES-02 | — | Pending |
-| FMT-01 | — | Pending |
-| TOOL-01 | — | Pending |
-| TOOL-02 | — | Pending |
-| TOOL-03 | — | Pending |
-| TOOL-04 | — | Pending |
-| TOOL-05 | — | Pending |
-| TOOL-06 | — | Pending |
-| TOOL-07 | — | Pending |
-| TOOL-08 | — | Pending |
-| TOOL-09 | — | Pending |
-| CACH-01 | — | Pending |
-| CACH-02 | — | Pending |
-| CLNP-01 | — | Pending |
-| CLNP-02 | — | Pending |
+| RES-01 | Phase 1 | Pending |
+| RES-02 | Phase 1 | Pending |
+| FMT-01 | Phase 1 | Pending |
+| CACH-01 | Phase 1 | Pending |
+| CACH-02 | Phase 1 | Pending |
+| TOOL-01 | Phase 2 | Pending |
+| TOOL-02 | Phase 2 | Pending |
+| TOOL-03 | Phase 2 | Pending |
+| TOOL-04 | Phase 2 | Pending |
+| TOOL-05 | Phase 2 | Pending |
+| TOOL-06 | Phase 2 | Pending |
+| TOOL-07 | Phase 2 | Pending |
+| CLNP-01 | Phase 2 | Pending |
+| CLNP-02 | Phase 2 | Pending |
+| TOOL-08 | Phase 3 | Pending |
+| TOOL-09 | Phase 3 | Pending |
 
 **Coverage:**
 - v1.0 requirements: 16 total
-- Mapped to phases: 0 (pending roadmap)
-- Unmapped: 16 ⚠️
+- Mapped to phases: 16
+- Unmapped: 0
 
 ---
 *Requirements defined: 2026-03-11*
-*Last updated: 2026-03-11 after initial definition*
+*Last updated: 2026-03-11 — traceability filled after roadmap creation*
