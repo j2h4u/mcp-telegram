@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: planning
-stopped_at: Completed 02-tool-updates-02-PLAN.md
-last_updated: "2026-03-10T23:11:19.529Z"
+stopped_at: Completed 02-tool-updates-03-PLAN.md
+last_updated: "2026-03-10T23:16:21.805Z"
 last_activity: 2026-03-10
 progress:
   total_phases: 3
   completed_phases: 1
   total_plans: 8
-  completed_plans: 6
+  completed_plans: 7
   percent: 25
 ---
 
@@ -52,6 +52,7 @@ Progress: [███░░░░░░░] 25%
 | Phase 01-support-modules P04 | 5 | 3 tasks | 4 files |
 | Phase 02-tool-updates P01 | 5 | 2 tasks | 2 files |
 | Phase 02-tool-updates P02 | 2 | 2 tasks | 2 files |
+| Phase 02-tool-updates P03 | 10 | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -77,6 +78,9 @@ Recent decisions affecting current work:
 - [Phase 02-tool-updates]: get_entity_cache() creates state directory with mkdir before opening SQLite — required for first-run correctness
 - [Phase 02-tool-updates]: ListDialogs drops unread field — filter moves to ListMessages where it belongs semantically
 - [Phase 02-tool-updates]: _async_iter defined at module level in test_tools.py (underscore prefix) to distinguish from conftest async_iter
+- [Phase 02-tool-updates]: Use mock_client.return_value (not __call__ override) for AsyncMock call stubbing in unread filter test
+- [Phase 02-tool-updates]: Resolve dialog and sender names before entering async client context to fail fast
+- [Phase 02-tool-updates]: next_cursor appended as plain text suffix to formatted output (single TextContent item)
 
 ### Pending Todos
 
@@ -89,6 +93,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-03-10T23:11:19.525Z
-Stopped at: Completed 02-tool-updates-02-PLAN.md
+Last session: 2026-03-10T23:16:21.802Z
+Stopped at: Completed 02-tool-updates-03-PLAN.md
 Resume file: None
