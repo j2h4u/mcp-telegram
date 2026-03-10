@@ -65,7 +65,11 @@ Plans:
 **Success Criteria** (what must be TRUE):
   1. `GetMe` returns own display name, numeric id, and username without any arguments
   2. `GetUserInfo` called with a name string returns the matched user's profile and a list of chats shared with the account; resolver annotation prefix appears in the response
-**Plans**: TBD
+**Plans**: 2 plans
+
+Plans:
+- [ ] 03-01-PLAN.md — Test stubs (TDD Wave 0): 6 failing tests for GetMe and GetUserInfo (TOOL-08, TOOL-09)
+- [ ] 03-02-PLAN.md — Implement GetMe and GetUserInfo in tools.py (TOOL-08, TOOL-09)
 
 ## Progress
 
@@ -76,4 +80,4 @@ Phases execute in numeric order: 1 → 2 → 3
 |-------|----------------|--------|-----------|
 | 1. Support Modules | 4/4 | Complete   | 2026-03-10 |
 | 2. Tool Updates | 4/4 | Complete   | 2026-03-10 |
-| 3. New Tools | 0/? | Not started | - |
+| 3. New Tools | 0/2 | Not started | - |
