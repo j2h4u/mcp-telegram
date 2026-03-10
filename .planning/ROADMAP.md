@@ -68,7 +68,7 @@ Plans:
 **Plans**: 2 plans
 
 Plans:
-- [ ] 03-01-PLAN.md — Test stubs (TDD Wave 0): 6 failing tests for GetMe and GetUserInfo (TOOL-08, TOOL-09)
+- [x] 03-01-PLAN.md — Test stubs (TDD Wave 0): 6 failing tests for GetMe and GetUserInfo (TOOL-08, TOOL-09)
 - [ ] 03-02-PLAN.md — Implement GetMe and GetUserInfo in tools.py (TOOL-08, TOOL-09)
 
 ## Progress
@@ -80,4 +80,4 @@ Phases execute in numeric order: 1 → 2 → 3
 |-------|----------------|--------|-----------|
 | 1. Support Modules | 4/4 | Complete   | 2026-03-10 |
 | 2. Tool Updates | 4/4 | Complete   | 2026-03-10 |
-| 3. New Tools | 0/2 | Not started | - |
+| 3. New Tools | 1/2 | In Progress|  |

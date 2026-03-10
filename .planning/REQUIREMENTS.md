@@ -24,8 +24,8 @@
 - [x] **TOOL-05**: `ListMessages` accepts optional `unread` filter
 - [x] **TOOL-06**: `SearchMessages` accepts dialog by name, returns each result with ±3 messages of surrounding context
 - [x] **TOOL-07**: `SearchMessages` uses offset-based pagination (`next_offset` absent when exhausted)
-- [ ] **TOOL-08**: `GetMe` returns own name, id, and username
-- [ ] **TOOL-09**: `GetUserInfo` returns target user's profile and list of common chats
+- [x] **TOOL-08**: `GetMe` returns own name, id, and username
+- [x] **TOOL-09**: `GetUserInfo` returns target user's profile and list of common chats
 
 ### Cache
 
@@ -72,8 +72,8 @@
 | TOOL-07 | Phase 2 | Complete |
 | CLNP-01 | Phase 2 | Complete |
 | CLNP-02 | Phase 2 | Complete |
-| TOOL-08 | Phase 3 | Pending |
-| TOOL-09 | Phase 3 | Pending |
+| TOOL-08 | Phase 3 | Complete |
+| TOOL-09 | Phase 3 | Complete |
 
 **Coverage:**
 - v1.0 requirements: 16 total
