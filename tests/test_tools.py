@@ -3,18 +3,61 @@ import pytest
 import mcp_telegram.tools as tools_module
 from mcp_telegram.tools import ListDialogs, ListMessages, SearchMessages
 from unittest.mock import AsyncMock, MagicMock, patch
+from datetime import datetime, timezone
+
+
+async def _async_iter(items):
+    """Async generator yielding items from a list — local helper for test_tools.py."""
+    for item in items:
+        yield item
+
 
 # --- TOOL-01: ListDialogs ---
 
 
-async def test_list_dialogs_type_field(mock_cache, mock_client, make_mock_message):
+async def test_list_dialogs_type_field(mock_cache, mock_client, monkeypatch):
     """ListDialogs output line contains type=user/group/channel and last_message_at=."""
-    pytest.fail("not implemented")
+    fake_dialog = MagicMock()
+    fake_dialog.is_user = True
+    fake_dialog.is_group = False
+    fake_dialog.is_channel = False
+    fake_dialog.date = datetime(2024, 1, 15, 10, 0, 0, tzinfo=timezone.utc)
+    fake_dialog.id = 101
+    fake_dialog.name = "Иван Петров"
+    fake_dialog.unread_count = 0
+    fake_dialog.entity = MagicMock(username="ivan")
+
+    mock_client.iter_dialogs = MagicMock(return_value=_async_iter([fake_dialog]))
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+
+    from mcp_telegram.tools import list_dialogs
+    result = await list_dialogs(ListDialogs())
+    assert len(result) == 1
+    text = result[0].text
+    assert "type=user" in text
+    assert "last_message_at=2024-" in text
 
 
-async def test_list_dialogs_null_date(mock_cache, mock_client):
+async def test_list_dialogs_null_date(mock_cache, mock_client, monkeypatch):
     """ListDialogs handles dialog.date = None gracefully (outputs 'unknown')."""
-    pytest.fail("not implemented")
+    fake_dialog = MagicMock()
+    fake_dialog.is_user = False
+    fake_dialog.is_group = True
+    fake_dialog.is_channel = False
+    fake_dialog.date = None
+    fake_dialog.id = 200
+    fake_dialog.name = "Empty Group"
+    fake_dialog.unread_count = 0
+    fake_dialog.entity = MagicMock(username=None)
+
+    mock_client.iter_dialogs = MagicMock(return_value=_async_iter([fake_dialog]))
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+
+    from mcp_telegram.tools import list_dialogs
+    result = await list_dialogs(ListDialogs())
+    assert "last_message_at=unknown" in result[0].text
 
 
 # --- TOOL-02: ListMessages name resolution ---
