@@ -8,12 +8,12 @@
 
 ### Resolution
 
-- [ ] **RES-01**: LLM can refer to a dialog by name string; server resolves to entity ID via fuzzy match (WRatio ≥90 auto, 60–89 candidates, <60 not found)
-- [ ] **RES-02**: LLM can refer to a message sender by name string; same resolution algorithm and thresholds as dialog resolution
+- [x] **RES-01**: LLM can refer to a dialog by name string; server resolves to entity ID via fuzzy match (WRatio ≥90 auto, 60–89 candidates, <60 not found)
+- [x] **RES-02**: LLM can refer to a message sender by name string; same resolution algorithm and thresholds as dialog resolution
 
 ### Format
 
-- [ ] **FMT-01**: Messages returned in unified human-readable format: `HH:mm FirstName: text [reactions]` with date headers, session breaks (>60 min gaps), reply annotations, and inline media descriptions
+- [x] **FMT-01**: Messages returned in unified human-readable format: `HH:mm FirstName: text [reactions]` with date headers, session breaks (>60 min gaps), reply annotations, and inline media descriptions
 
 ### Tools
 
@@ -29,8 +29,8 @@
 
 ### Cache
 
-- [ ] **CACH-01**: Entity metadata (users, groups, channels) persisted in SQLite (`entity_cache.db`); TTL 30d users, 7d groups/channels
-- [ ] **CACH-02**: Cache populated lazily from API responses (upsert on every entity-bearing response)
+- [x] **CACH-01**: Entity metadata (users, groups, channels) persisted in SQLite (`entity_cache.db`); TTL 30d users, 7d groups/channels
+- [x] **CACH-02**: Cache populated lazily from API responses (upsert on every entity-bearing response)
 
 ### Cleanup
 
@@ -58,11 +58,11 @@
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| RES-01 | Phase 1 | Pending |
-| RES-02 | Phase 1 | Pending |
-| FMT-01 | Phase 1 | Pending |
-| CACH-01 | Phase 1 | Pending |
-| CACH-02 | Phase 1 | Pending |
+| RES-01 | Phase 1 | Complete |
+| RES-02 | Phase 1 | Complete |
+| FMT-01 | Phase 1 | Complete |
+| CACH-01 | Phase 1 | Complete |
+| CACH-02 | Phase 1 | Complete |
 | TOOL-01 | Phase 2 | Pending |
 | TOOL-02 | Phase 2 | Pending |
 | TOOL-03 | Phase 2 | Pending |
