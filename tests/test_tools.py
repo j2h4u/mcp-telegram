@@ -263,3 +263,95 @@ def test_get_dialog_removed():
 def test_get_message_removed():
     """GetMessage class does not exist in tools module."""
     assert not hasattr(tools_module, "GetMessage"), "GetMessage should be removed from tools.py"
+
+
+# --- TOOL-08: GetMe ---
+
+
+async def test_get_me(mock_client, monkeypatch):
+    """GetMe returns text containing id, first_name, and @username of current account."""
+    from mcp_telegram.tools import GetMe, get_me
+    mock_client.get_me = AsyncMock(
+        return_value=MagicMock(id=999, first_name="Test", last_name=None, username="testuser")
+    )
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    result = await get_me(GetMe())
+    assert len(result) == 1
+    text = result[0].text
+    assert "id=999" in text
+    assert "Test" in text
+    assert "@testuser" in text
+
+
+async def test_get_me_unauthenticated(mock_client, monkeypatch):
+    """GetMe returns 'not authenticated' message when client.get_me() returns None."""
+    from mcp_telegram.tools import GetMe, get_me
+    mock_client.get_me = AsyncMock(return_value=None)
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    result = await get_me(GetMe())
+    assert len(result) == 1
+    text = result[0].text.lower()
+    assert "not authenticated" in text or "not logged in" in text
+
+
+# --- TOOL-09: GetUserInfo ---
+
+
+async def test_get_user_info(mock_cache, mock_client, monkeypatch):
+    """GetUserInfo resolves by name, fetches entity and common chats, returns formatted info."""
+    from mcp_telegram.tools import GetUserInfo, get_user_info
+    mock_client.get_entity = AsyncMock(
+        return_value=MagicMock(id=101, first_name="Иван", last_name="Петров", username="ivan")
+    )
+    fake_chat = MagicMock(id=500, title="Shared Group")
+    fake_result = MagicMock(chats=[fake_chat])
+    mock_client.return_value = fake_result
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    result = await get_user_info(GetUserInfo(user="Иван Петров"))
+    assert len(result) == 1
+    text = result[0].text
+    assert "id=101" in text
+    assert "Иван Петров" in text
+    assert "Shared Group" in text
+
+
+async def test_get_user_info_not_found(mock_cache, mock_client, monkeypatch):
+    """GetUserInfo returns 'not found' when user name does not match any cache entry."""
+    from mcp_telegram.tools import GetUserInfo, get_user_info
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    result = await get_user_info(GetUserInfo(user="nobody_xyz"))
+    assert len(result) == 1
+    assert "not found" in result[0].text.lower()
+
+
+async def test_get_user_info_ambiguous(mock_client, monkeypatch, tmp_db_path):
+    """GetUserInfo returns 'ambiguous' when multiple cache entries match the query."""
+    from mcp_telegram.cache import EntityCache
+    from mcp_telegram.tools import GetUserInfo, get_user_info
+    ambig_cache = EntityCache(tmp_db_path)
+    ambig_cache.upsert(201, "user", "Иван Петров", None)
+    ambig_cache.upsert(202, "user", "Иван Сидоров", None)
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: ambig_cache)
+    result = await get_user_info(GetUserInfo(user="Иван"))
+    assert len(result) == 1
+    assert "Ambiguous" in result[0].text or "ambiguous" in result[0].text.lower()
+
+
+async def test_get_user_info_resolver_prefix(mock_cache, mock_client, monkeypatch):
+    """GetUserInfo output first line starts with '[resolved: "Иван Петров"]'."""
+    from mcp_telegram.tools import GetUserInfo, get_user_info
+    mock_client.get_entity = AsyncMock(
+        return_value=MagicMock(id=101, first_name="Иван", last_name="Петров", username="ivan")
+    )
+    fake_chat = MagicMock(id=500, title="Shared Group")
+    fake_result = MagicMock(chats=[fake_chat])
+    mock_client.return_value = fake_result
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    result = await get_user_info(GetUserInfo(user="Иван Петров"))
+    assert len(result) == 1
+    first_line = result[0].text.splitlines()[0]
+    assert first_line.startswith('[resolved: "Иван Петров"]')
