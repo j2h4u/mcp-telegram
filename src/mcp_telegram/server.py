@@ -88,7 +88,7 @@ async def call_tool(name: str, arguments: t.Any) -> Sequence[TextContent | Image
     except Exception as e:
         elapsed = time.monotonic() - t0
         logger.exception("call_tool[%s] failed after %.3fs", name, elapsed)
-        raise RuntimeError(f"Tool {name} failed") from None
+        raise RuntimeError(f"Tool {name} failed") from e
 
 
 async def run_mcp_server() -> None:
