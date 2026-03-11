@@ -171,13 +171,13 @@ def test_unknown_sender() -> None:
 
 
 def test_media_fallback() -> None:
-    """Message with non-None media and no text shows '[медиа]'."""
+    """Message with unknown media type shows '[медиа: ClassName]'."""
     from mcp_telegram.formatter import format_messages
 
     dt = datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
     msg = _make_msg(1, dt, text="", first_name="Carol", media=object())
     result = format_messages([msg], {})
-    assert "[медиа]" in result, f"Expected '[медиа]' for media message, got: {result!r}"
+    assert "[медиа:" in result, f"Expected '[медиа: ...]' for unknown media, got: {result!r}"
 
 
 def test_reply_annotation() -> None:
