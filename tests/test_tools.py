@@ -511,3 +511,213 @@ async def test_list_messages_invalid_cursor_returns_error(mock_cache, mock_clien
     result = await list_messages(ListMessages(dialog="Иван Петров", cursor="BADINVALID==garbage"))
     assert len(result) == 1
     assert result[0].text.startswith("Invalid cursor:")
+
+
+# --- TELEMETRY TESTS ---
+
+
+@pytest.fixture
+def mock_analytics_collector(monkeypatch):
+    """Mock TelemetryCollector to capture events without writing to DB."""
+    events = []
+
+    def record_event(event):
+        events.append(event)
+
+    mock_collector = MagicMock()
+    mock_collector.record_event = record_event
+
+    monkeypatch.setattr(
+        "mcp_telegram.tools._get_analytics_collector",
+        lambda: mock_collector
+    )
+    return events
+
+
+async def test_list_dialogs_records_telemetry(mock_cache, mock_client, monkeypatch, mock_analytics_collector):
+    """ListDialogs records telemetry event with correct metrics."""
+    from mcp_telegram.tools import ListDialogs, list_dialogs
+
+    def _make_dialog(name, id_):
+        d = MagicMock()
+        d.is_user = True
+        d.is_group = False
+        d.is_channel = False
+        d.date = datetime(2024, 1, 15, 10, 0, 0, tzinfo=timezone.utc)
+        d.id = id_
+        d.name = name
+        d.unread_count = 0
+        d.entity = MagicMock(username=None)
+        return d
+
+    dialogs = [_make_dialog("Alice", 1), _make_dialog("Bob", 2)]
+    mock_client.iter_dialogs = MagicMock(return_value=_async_iter(dialogs))
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+
+    await list_dialogs(ListDialogs())
+
+    assert len(mock_analytics_collector) == 1
+    event = mock_analytics_collector[0]
+    assert event.tool_name == "ListDialogs"
+    assert event.result_count == 2
+    assert event.has_cursor is False
+    assert event.page_depth == 1
+    assert event.has_filter is False
+    assert event.error_type is None
+
+
+async def test_list_messages_records_telemetry(mock_cache, mock_client, monkeypatch, mock_analytics_collector, make_mock_message):
+    """ListMessages records telemetry event with cursor and filter info."""
+    from mcp_telegram.tools import ListMessages, list_messages
+
+    msg = make_mock_message(id=10, text="Hello")
+    mock_client.iter_messages = MagicMock(return_value=_async_iter([msg]))
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+
+    await list_messages(ListMessages(dialog="Иван Петров"))
+
+    assert len(mock_analytics_collector) == 1
+    event = mock_analytics_collector[0]
+    assert event.tool_name == "ListMessages"
+    assert event.result_count == 1
+    assert event.has_cursor is False
+    assert event.page_depth >= 1
+    assert event.has_filter is False
+
+
+async def test_list_messages_records_cursor(mock_cache, mock_client, monkeypatch, mock_analytics_collector, make_mock_message):
+    """ListMessages records has_cursor=True when cursor provided."""
+    from mcp_telegram.tools import ListMessages, list_messages
+    from mcp_telegram.pagination import encode_cursor
+
+    msg = make_mock_message(id=10, text="Hello")
+    mock_client.iter_messages = MagicMock(return_value=_async_iter([msg]))
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+
+    cursor = encode_cursor(50, 101)
+    await list_messages(ListMessages(dialog="Иван Петров", cursor=cursor))
+
+    assert len(mock_analytics_collector) == 1
+    event = mock_analytics_collector[0]
+    assert event.has_cursor is True
+
+
+async def test_list_messages_records_filter(mock_cache, mock_client, monkeypatch, mock_analytics_collector, make_mock_message):
+    """ListMessages records has_filter=True when query_sender provided."""
+    from mcp_telegram.tools import ListMessages, list_messages
+
+    msg = make_mock_message(id=10, text="Hello")
+    mock_client.iter_messages = MagicMock(return_value=_async_iter([msg]))
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+
+    await list_messages(ListMessages(dialog="Иван Петров", sender="Иван Петров"))
+
+    assert len(mock_analytics_collector) == 1
+    event = mock_analytics_collector[0]
+    assert event.has_filter is True
+
+
+async def test_search_messages_records_telemetry(mock_cache, mock_client, monkeypatch, mock_analytics_collector, make_mock_message):
+    """SearchMessages records telemetry with has_filter=True."""
+    from mcp_telegram.tools import SearchMessages, search_messages
+
+    hit = make_mock_message(id=50, text="the hit")
+    mock_client.iter_messages = hit.__class__.iter_messages = MagicMock(return_value=_async_iter([hit]))
+    mock_client.get_messages = AsyncMock(return_value=[])
+
+    async def _fake_iter_messages(entity, **kwargs):
+        yield hit
+
+    mock_client.iter_messages = _fake_iter_messages
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+
+    await search_messages(SearchMessages(dialog="Иван Петров", query="hit"))
+
+    assert len(mock_analytics_collector) == 1
+    event = mock_analytics_collector[0]
+    assert event.tool_name == "SearchMessages"
+    assert event.has_filter is True
+
+
+async def test_get_my_account_records_telemetry(mock_cache, mock_client, monkeypatch, mock_analytics_collector):
+    """GetMyAccount records telemetry with result_count=1."""
+    from mcp_telegram.tools import GetMyAccount, get_my_account
+
+    me = MagicMock()
+    me.id = 999
+    me.first_name = "Test"
+    me.last_name = "User"
+    me.username = "testuser"
+    mock_client.get_me = AsyncMock(return_value=me)
+
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+
+    await get_my_account(GetMyAccount())
+
+    assert len(mock_analytics_collector) == 1
+    event = mock_analytics_collector[0]
+    assert event.tool_name == "GetMyAccount"
+    assert event.result_count == 1
+    assert event.has_cursor is False
+    assert event.page_depth == 1
+
+
+async def test_get_user_info_records_telemetry(mock_cache, mock_client, monkeypatch, mock_analytics_collector):
+    """GetUserInfo records telemetry with result_count=1."""
+    from mcp_telegram.tools import GetUserInfo, get_user_info
+    from telethon.tl.types import Channel
+
+    user = MagicMock()
+    user.id = 101
+    user.first_name = "Иван"
+    user.last_name = "Петров"
+    user.username = "ivan"
+
+    mock_client.get_entity = AsyncMock(return_value=user)
+    mock_client.return_value = MagicMock(chats=[])
+
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+
+    await get_user_info(GetUserInfo(user="Иван Петров"))
+
+    assert len(mock_analytics_collector) == 1
+    event = mock_analytics_collector[0]
+    assert event.tool_name == "GetUserInfo"
+    assert event.result_count == 1
+
+
+async def test_tool_records_telemetry_on_error(mock_cache, mock_client, monkeypatch, mock_analytics_collector):
+    """Tool records telemetry even when exception raised, with error_type set."""
+    from mcp_telegram.tools import ListDialogs, list_dialogs
+
+    mock_client.iter_dialogs = MagicMock(side_effect=Exception("ConnectionError"))
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+
+    with pytest.raises(Exception):
+        await list_dialogs(ListDialogs())
+
+    assert len(mock_analytics_collector) == 1
+    event = mock_analytics_collector[0]
+    assert event.tool_name == "ListDialogs"
+    assert event.error_type is not None
+
+
+async def test_get_usage_stats_not_recorded(mock_cache, mock_client, monkeypatch, mock_analytics_collector):
+    """GetUsageStats does NOT record telemetry (to avoid noise)."""
+    from mcp_telegram.tools import GetUsageStats, get_usage_stats
+
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+
+    await get_usage_stats(GetUsageStats())
+
+    # No telemetry event should be recorded
+    assert len(mock_analytics_collector) == 0
