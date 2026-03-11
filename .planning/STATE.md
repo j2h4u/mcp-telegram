@@ -25,18 +25,18 @@ See: .planning/PROJECT.md (updated 2026-03-12)
 ## Current Position
 
 Phase: 8
-Plan: 1 (completed)
-Status: In Progress (1/3 plans complete)
+Plan: 2 (completed)
+Status: In Progress (2/3 plans complete)
 Last activity: 2026-03-12
 
-Progress: [████████░░░░░░░░░░░░░░░░░░░░░░░░] 33%
+Progress: [██████████░░░░░░░░░░░░░░░░░░░░░░] 67%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 8
-- Average duration: 16.4 minutes (18min + 25min + 18min + 18min + 12min + 14min + 3min + 11min) / 8
-- Total execution time: 119 minutes
+- Total plans completed: 9
+- Average duration: 14.8 minutes (18min + 25min + 18min + 18min + 12min + 14min + 3min + 11min + 1.9min) / 9
+- Total execution time: 133 minutes (2h 13m)
 
 **By Phase:**
 
@@ -44,7 +44,7 @@ Progress: [████████░░░░░░░░░░░░░░░
 |-------|-------|-----------|----------|
 | 6 | 4 | 4 | 20.3 min |
 | 7 | 3 | 3 | 11.7 min |
-| 8 | 3 | 1 | 11.0 min |
+| 8 | 3 | 2 | 6.5 min |
 
 *Updated after each plan completion*
 
@@ -95,5 +95,5 @@ Roadmap created: 2026-03-12
 
 ## Session Continuity
 
-Last activity: 2026-03-12 02:53 UTC - Plan 08-01 (Reverse Message Iteration) completed
-Phase 8 Plan 1 complete. From_beginning parameter added to ListMessages, bidirectional cursor pagination implemented, 3 new tests passing. Ready for Plan 02 (Forum Topics).
+Last activity: 2026-03-12 02:59 UTC - Plan 08-02 (Archived Dialog Filtering) completed
+Phase 8 Plan 2 complete. Renamed archived parameter to exclude_archived with inverted semantics. Default behavior now shows both archived and non-archived dialogs. Entity cache populated from all dialogs. 2 new tests passing. Ready for Plan 03 (Forum Topics Support).
