@@ -26,7 +26,7 @@ from telethon.tl.types import Channel, Chat
 from telethon.utils import get_peer_id
 from xdg_base_dirs import xdg_state_home
 
-from .cache import EntityCache, GROUP_TTL, USER_TTL
+from .cache import EntityCache, GROUP_TTL, USER_TTL, ReactionMetadataCache
 from .formatter import format_messages
 from .pagination import decode_cursor, encode_cursor
 from .resolver import Candidates, NotFound, resolve
@@ -339,6 +339,7 @@ async def list_messages(
 
             # Build reaction_names_map: fetch reactor names for messages with few reactions
             reaction_names_map: dict[int, dict[str, list[str]]] = {}
+            reaction_cache = ReactionMetadataCache(cache._conn)
             for msg in messages:
                 rxns = getattr(msg, "reactions", None)
                 if not rxns:
@@ -347,6 +348,13 @@ async def list_messages(
                 total = sum(getattr(r, "count", 0) for r in results)
                 if total == 0 or total > REACTION_NAMES_THRESHOLD:
                     continue
+
+                # Check reaction cache first (10-minute TTL)
+                cached_reactions = reaction_cache.get(msg.id, entity_id, ttl_seconds=600)
+                if cached_reactions:
+                    reaction_names_map[msg.id] = cached_reactions
+                    continue
+
                 try:
                     rl = await client(GetMessageReactionsListRequest(
                         peer=entity_id,
@@ -368,6 +376,8 @@ async def list_messages(
                             by_emoji.setdefault(emoji, []).append(name)
                     if by_emoji:
                         reaction_names_map[msg.id] = by_emoji
+                        # Cache the reaction names for future requests
+                        reaction_cache.upsert(msg.id, entity_id, by_emoji)
                 except Exception:
                     pass  # fallback to count-only
 
