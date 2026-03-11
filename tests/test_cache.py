@@ -85,3 +85,50 @@ def test_expired_returns_none(tmp_db_path: Path, monkeypatch: pytest.MonkeyPatch
     assert cache.get(300, ttl_seconds=50) is None
     assert cache.get(300, ttl_seconds=200) is not None
     cache.close()
+
+
+def test_all_names_with_ttl_excludes_stale(tmp_db_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """all_names_with_ttl excludes user entity whose TTL has expired."""
+    import mcp_telegram.cache as cache_module
+
+    cache = EntityCache(tmp_db_path)
+    cache.upsert(10, "user", "OldUser", None)
+
+    original_time = time.time
+    monkeypatch.setattr(
+        cache_module, "time",
+        type("_T", (), {"time": staticmethod(lambda: original_time() + 1000)})()
+    )
+
+    # user_ttl=500: 1000s have passed, so OldUser is stale
+    result = cache.all_names_with_ttl(user_ttl=500, group_ttl=604800)
+    assert result == {}
+
+    # Upsert a fresh entity AFTER the time-advance
+    cache.upsert(11, "user", "FreshUser", None)
+    result2 = cache.all_names_with_ttl(user_ttl=500, group_ttl=604800)
+    assert 11 in result2
+
+    cache.close()
+
+
+def test_all_names_with_ttl_user_vs_group_different_ttl(tmp_db_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """all_names_with_ttl returns group but not user when user TTL < elapsed < group TTL."""
+    import mcp_telegram.cache as cache_module
+
+    cache = EntityCache(tmp_db_path)
+    cache.upsert(1, "user", "UserAlice", None)
+    cache.upsert(2, "group", "GroupBeta", None)
+
+    original_time = time.time
+    monkeypatch.setattr(
+        cache_module, "time",
+        type("_T", (), {"time": staticmethod(lambda: original_time() + 200)})()
+    )
+
+    # user_ttl=100: user expired (200 > 100). group_ttl=9999: group still fresh (200 < 9999).
+    result = cache.all_names_with_ttl(user_ttl=100, group_ttl=9999)
+    assert 1 not in result
+    assert 2 in result
+
+    cache.close()
