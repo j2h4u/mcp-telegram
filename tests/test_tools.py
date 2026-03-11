@@ -207,12 +207,95 @@ async def test_search_messages_context(mock_cache, mock_client, monkeypatch, mak
         yield hit
 
     mock_client.iter_messages = _fake_iter_messages
+    mock_client.get_messages = AsyncMock(return_value=[])
     monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
     monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
 
     result = await search_messages(SearchMessages(dialog="Иван Петров", query="hit"))
     assert len(result) == 1
     assert "the hit" in result[0].text
+
+
+async def test_search_messages_context_window(mock_cache, mock_client, monkeypatch, make_mock_message):
+    """SearchMessages includes context messages before the hit in output."""
+    from mcp_telegram.tools import SearchMessages, search_messages
+    hit = make_mock_message(id=50, text="the hit")
+    ctx_before = make_mock_message(id=47, text="before msg")
+    ctx_after = make_mock_message(id=53, text="after msg")
+
+    async def _fake_iter_messages(entity, **kwargs):
+        yield hit
+
+    mock_client.iter_messages = _fake_iter_messages
+    mock_client.get_messages = AsyncMock(return_value=[ctx_before, ctx_after])
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+
+    result = await search_messages(SearchMessages(dialog="Иван Петров", query="hit"))
+    assert len(result) == 1
+    assert "before msg" in result[0].text
+
+
+async def test_search_messages_context_after_hit(mock_cache, mock_client, monkeypatch, make_mock_message):
+    """SearchMessages includes context messages after the hit in output."""
+    from mcp_telegram.tools import SearchMessages, search_messages
+    hit = make_mock_message(id=50, text="the hit")
+    ctx_before = make_mock_message(id=47, text="before msg")
+    ctx_after = make_mock_message(id=53, text="after msg")
+
+    async def _fake_iter_messages(entity, **kwargs):
+        yield hit
+
+    mock_client.iter_messages = _fake_iter_messages
+    mock_client.get_messages = AsyncMock(return_value=[ctx_before, ctx_after])
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+
+    result = await search_messages(SearchMessages(dialog="Иван Петров", query="hit"))
+    assert len(result) == 1
+    assert "after msg" in result[0].text
+
+
+async def test_search_messages_hit_marker(mock_cache, mock_client, monkeypatch, make_mock_message):
+    """SearchMessages visually distinguishes hit messages from context messages."""
+    from mcp_telegram.tools import SearchMessages, search_messages
+    hit = make_mock_message(id=50, text="the hit")
+
+    async def _fake_iter_messages(entity, **kwargs):
+        yield hit
+
+    mock_client.iter_messages = _fake_iter_messages
+    mock_client.get_messages = AsyncMock(return_value=[])
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+
+    result = await search_messages(SearchMessages(dialog="Иван Петров", query="hit"))
+    assert len(result) == 1
+    text = result[0].text
+    # Hit group must have a dedicated hit marker line (not just the date separator).
+    # Acceptable forms: "=== HIT ===" or "[HIT]" prefix on the message line or ">>>" prefix.
+    assert "[HIT]" in text or ">>>" in text or "=== HIT ===" in text
+
+
+async def test_search_messages_reaction_names_fetched(mock_cache, mock_client, monkeypatch, make_mock_message):
+    """SearchMessages fetches reaction names for hit messages with low reaction counts."""
+    from mcp_telegram.tools import SearchMessages, search_messages
+    hit = make_mock_message(id=50, text="reacted msg")
+    hit.reactions = MagicMock()
+    hit.reactions.results = [MagicMock(count=2, reaction=MagicMock(emoticon="👍"))]
+
+    async def _fake_iter_messages(entity, **kwargs):
+        yield hit
+
+    mock_client.iter_messages = _fake_iter_messages
+    mock_client.get_messages = AsyncMock(return_value=[])
+    mock_client.return_value = MagicMock(reactions=[], users=[])
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+
+    await search_messages(SearchMessages(dialog="Иван Петров", query="reacted"))
+    # GetMessageReactionsListRequest was invoked via client(...)
+    mock_client.__call__.assert_called()
 
 
 # --- TOOL-07: SearchMessages offset pagination ---
