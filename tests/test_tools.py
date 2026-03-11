@@ -920,3 +920,25 @@ async def test_list_messages_reverse_pagination_cursor(mock_cache, mock_client, 
         call_kwargs = mock_client.iter_messages.call_args[1]
         assert "min_id" in call_kwargs  # Should use min_id for reverse
         assert call_kwargs["reverse"] is True
+
+
+# --- Wave 0 Test Stubs: Archived Dialog Filtering (NAV-02) ---
+
+
+async def test_list_dialogs_archived_default(mock_cache, mock_client, monkeypatch):
+    """ListDialogs() returns both archived and non-archived dialogs by default.
+
+    Tests that default behavior shows all dialogs regardless of archive status,
+    and that both archived and non-archived dialogs are added to the entity cache
+    for name resolution.
+    """
+    pytest.skip("Wave 1")
+
+
+async def test_list_dialogs_exclude_archived(mock_cache, mock_client, monkeypatch):
+    """ListDialogs(exclude_archived=True) shows only non-archived dialogs.
+
+    Tests that when exclude_archived=True, the handler filters to show only
+    non-archived dialogs, equivalent to the old archived=False behavior.
+    """
+    pytest.skip("Wave 1")
