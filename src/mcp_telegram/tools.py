@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import sqlite3
 import sys
 import time
 import typing as t
@@ -749,6 +750,64 @@ async def get_user_info(args: GetUserInfo) -> t.Sequence[TextContent | ImageCont
 ### GetUsageStats ###
 
 
+def format_usage_summary(stats: dict) -> str:
+    """Generate <100 token natural-language summary of usage patterns.
+
+    Input dict keys:
+    - tool_distribution: dict[str, int] — {tool_name: count}
+    - error_distribution: dict[str, int] — {error_type: count}
+    - max_page_depth: int
+    - dialogs_with_deep_scroll: int (estimated)
+    - total_calls: int
+    - filter_count: int
+    - latency_median_ms: float
+    - latency_p95_ms: float
+
+    Output: natural-language string, target 60-80 tokens, < 100 hard limit.
+    """
+    parts = []
+
+    # Tool frequency (top 2)
+    if stats.get("tool_distribution"):
+        sorted_tools = sorted(stats["tool_distribution"].items(), key=lambda x: x[1], reverse=True)
+        top_tools = sorted_tools[:2]
+        if top_tools:
+            top_tool, top_count = top_tools[0]
+            top_pct = int(top_count * 100 / stats["total_calls"]) if stats["total_calls"] > 0 else 0
+            parts.append(f"Most active: {top_tool} ({top_pct}% of calls)")
+
+    # Deep scroll detection
+    if stats.get("max_page_depth", 0) >= 5:
+        parts.append(f"Deep scrolling detected: max page depth {stats['max_page_depth']}")
+
+    # Error patterns
+    if stats.get("error_distribution"):
+        errors_str = ", ".join(
+            [f"{err} ({cnt})" for err, cnt in sorted(stats["error_distribution"].items(), key=lambda x: x[1], reverse=True)[:3]]
+        )
+        parts.append(f"Errors: {errors_str}")
+
+    # Filter usage
+    if stats.get("total_calls", 0) > 0 and stats.get("filter_count", 0) > 0:
+        filter_pct = int(stats["filter_count"] * 100 / stats["total_calls"])
+        parts.append(f"Filtered queries: {filter_pct}%")
+
+    # Latency
+    median = stats.get("latency_median_ms", 0)
+    p95 = stats.get("latency_p95_ms", 0)
+    if median or p95:
+        parts.append(f"Response time: {median:.0f}ms median, {p95:.0f}ms p95")
+
+    summary = " ".join(parts)
+
+    # Safety: if summary exceeds 100 tokens, truncate gracefully
+    tokens = summary.split()
+    if len(tokens) > 100:
+        summary = " ".join(tokens[:100]) + "..."
+
+    return summary
+
+
 class GetUsageStats(ToolArgs):
     """Get actionable usage statistics from telemetry (last 30 days)."""
 
@@ -762,7 +821,90 @@ async def get_usage_stats(args: GetUsageStats) -> t.Sequence[TextContent | Image
     NOTE: This tool does NOT record telemetry (to avoid noise in analytics).
     """
     logger.info("method[GetUsageStats] args[%s]", args)
-    # Implementation will be added in Plan 03 (GetUsageStats formatting)
-    # For now, return placeholder response
-    return [TextContent(type="text", text="Usage stats coming in next phase.")]
+
+    # Get analytics DB path
+    db_dir = xdg_state_home() / "mcp-telegram"
+    db_path = db_dir / "analytics.db"
+
+    # Query analytics DB (30-day window)
+    try:
+        conn = sqlite3.connect(str(db_path))
+        cursor = conn.cursor()
+        since = int(time.time()) - 30 * 86400
+
+        # Tool distribution
+        tool_dist = dict(
+            cursor.execute(
+                "SELECT tool_name, COUNT(*) FROM telemetry_events WHERE timestamp >= ? GROUP BY tool_name ORDER BY COUNT(*) DESC",
+                (since,),
+            ).fetchall()
+        )
+
+        # Error distribution
+        error_dist = dict(
+            cursor.execute(
+                "SELECT error_type, COUNT(*) FROM telemetry_events WHERE timestamp >= ? AND error_type IS NOT NULL GROUP BY error_type ORDER BY COUNT(*) DESC",
+                (since,),
+            ).fetchall()
+        )
+
+        # Page depth stats
+        max_depth_result = cursor.execute(
+            "SELECT MAX(page_depth) FROM telemetry_events WHERE timestamp >= ?",
+            (since,),
+        ).fetchone()
+        max_depth = max_depth_result[0] if max_depth_result and max_depth_result[0] is not None else 0
+
+        # Filter usage
+        filter_count_result = cursor.execute(
+            "SELECT COUNT(*) FROM telemetry_events WHERE timestamp >= ? AND has_filter = 1",
+            (since,),
+        ).fetchone()
+        filter_count = filter_count_result[0] if filter_count_result else 0
+
+        # Total calls
+        total_calls_result = cursor.execute(
+            "SELECT COUNT(*) FROM telemetry_events WHERE timestamp >= ?",
+            (since,),
+        ).fetchone()
+        total_calls = total_calls_result[0] if total_calls_result else 0
+
+        # Latency percentiles
+        latencies = cursor.execute(
+            "SELECT duration_ms FROM telemetry_events WHERE timestamp >= ? ORDER BY duration_ms",
+            (since,),
+        ).fetchall()
+
+        conn.close()
+
+        # Compute percentiles
+        latency_median_ms = 0
+        latency_p95_ms = 0
+        if latencies:
+            sorted_latencies = [lat[0] for lat in latencies]
+            latency_median_ms = sorted_latencies[len(sorted_latencies) // 2]
+            p95_idx = int(len(sorted_latencies) * 0.95)
+            latency_p95_ms = sorted_latencies[p95_idx] if p95_idx < len(sorted_latencies) else sorted_latencies[-1]
+
+        # Format summary
+        summary = format_usage_summary(
+            {
+                "tool_distribution": tool_dist,
+                "error_distribution": error_dist,
+                "max_page_depth": max_depth,
+                "dialogs_with_deep_scroll": 0,  # Estimated (not tracked in this DB schema)
+                "total_calls": total_calls,
+                "filter_count": filter_count,
+                "latency_median_ms": latency_median_ms,
+                "latency_p95_ms": latency_p95_ms,
+            }
+        )
+
+        return [TextContent(type="text", text=summary if summary else "No usage data in past 30 days.")]
+
+    except FileNotFoundError:
+        return [TextContent(type="text", text="Analytics database not yet created. Use other tools first to generate telemetry.")]
+    except Exception as exc:
+        logger.error("GetUsageStats query failed: %s", exc)
+        return [TextContent(type="text", text=f"Error querying usage stats: {type(exc).__name__}")]
 
