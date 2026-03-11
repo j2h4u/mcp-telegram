@@ -1,554 +1,578 @@
-# Architecture Research
+# Architecture: v1.1 Feature Integration
 
-**Domain:** MCP server refactoring — Telethon + singledispatch tool bridge
-**Researched:** 2026-03-11
-**Confidence:** HIGH (direct codebase analysis, no speculation required)
+**Project:** mcp-telegram
+**Researched:** 2026-03-12
+**Scope:** How new v1.1 components integrate with existing v1.0 architecture; module boundaries; build order
 
-## Standard Architecture
+## Executive Summary
 
-### System Overview (Current)
+v1.1 adds observability (usage telemetry), completeness (forum topics, backward pagination), and cache efficiency improvements. The existing modular architecture (tools.py, cache.py, resolver.py, formatter.py, pagination.py) accommodates these additions without fundamental restructuring.
 
+**Key decisions:**
+- **analytics.py** — New SQLite event store (separate database from entity_cache.db, parallel to cache.py's pattern)
+- **GetUsageStats** — New MCP tool using singledispatch pattern (follows existing ToolArgs/tool_runner convention)
+- **Topic support** — Extend ListMessages with topics parameter; formatter already handles reply_to inspection
+- **from_beginning** — Cursor pagination variation; logic already supports reverse iteration
+
+**No breaking changes** to v1.0 tools or APIs. All new parameters optional with sensible defaults.
+
+## Current Architecture (v1.0)
+
+### Module Map
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                   MCP Protocol Layer                          │
-│   server.py: app.call_tool() → mapping dict → tool_runner()  │
-├──────────────────────────────────────────────────────────────┤
-│                   Tool Layer (tools.py)                       │
-│  ┌──────────────┐  ┌───────────────┐  ┌──────────────────┐   │
-│  │ ListDialogs  │  │  ListMessages │  │  SearchMessages  │   │
-│  │ + runner     │  │  + runner     │  │  + runner        │   │
-│  └──────────────┘  └───────────────┘  └──────────────────┘   │
-│  ┌──────────────┐  ┌───────────────┐                         │
-│  │  GetMessage  │  │   GetDialog   │  (to be removed)        │
-│  │  + runner    │  │   + runner    │                         │
-│  └──────────────┘  └───────────────┘                         │
-├──────────────────────────────────────────────────────────────┤
-│                   Telegram Layer (telegram.py)                │
-│   create_client() @cache → TelegramClient singleton          │
-│   TelegramSettings (Pydantic) → env vars                     │
-└──────────────────────────────────────────────────────────────┘
-```
-
-### System Overview (Target — after refactoring)
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│                   MCP Protocol Layer                          │
-│   server.py: unchanged — still routes via mapping + dispatch  │
-├──────────────────────────────────────────────────────────────┤
-│                   Tool Layer (tools.py)                       │
-│  ┌──────────────┐  ┌───────────────┐  ┌──────────────────┐   │
-│  │ ListDialogs  │  │  ListMessages │  │  SearchMessages  │   │
-│  │ + runner     │  │  + runner     │  │  + runner        │   │
-│  └──────┬───────┘  └───────┬───────┘  └────────┬─────────┘   │
-│         │                  │                   │             │
-│  ┌──────────────┐  ┌───────────────┐            │             │
-│  │   GetMe      │  │  GetUserInfo  │            │             │
-│  │   + runner   │  │  + runner     │            │             │
-│  └──────┬───────┘  └───────┬───────┘            │             │
-│         └──────────────────┴────────────────────┘             │
-│                            │ calls                            │
-├────────────────────────────▼─────────────────────────────────┤
-│              Support Modules (new files)                      │
-│  ┌───────────────┐  ┌────────────────┐  ┌──────────────────┐  │
-│  │ resolver.py   │  │  formatter.py  │  │  pagination.py   │  │
-│  │ (name→entity) │  │  (msg format)  │  │  (cursor tokens) │  │
-│  └───────┬───────┘  └────────────────┘  └──────────────────┘  │
-│          │                                                    │
-├──────────▼───────────────────────────────────────────────────┤
-│                   Telegram Layer (telegram.py)                │
-│   create_client() @cache → TelegramClient singleton          │
-│   TelegramSettings (Pydantic) → env vars                     │
-└──────────────────────────────────────────────────────────────┘
+server.py (MCP entry point)
+├─ tools.py (5 tools: ListDialogs, ListMessages, SearchMessages, GetMyAccount, GetUserInfo)
+│  ├─ cache.py (EntityCache SQLite, entity_id→name/type/username, TTL-enforced)
+│  ├─ resolver.py (fuzzy name→id, @username lookup, transliteration)
+│  ├─ formatter.py (messages→human text, replies, reactions, media)
+│  ├─ pagination.py (cursor encode/decode, base64 JSON)
+│  └─ telegram.py (Telethon client factory, session persistence)
+└─ (prompts, resources, templates empty)
 ```
 
-### Component Responsibilities
+### Existing Module Responsibilities
 
-| Component | Responsibility | Location |
-|-----------|----------------|----------|
-| `server.py` | MCP protocol: list_tools, call_tool dispatch | existing, no changes |
-| `tools.py` | ToolArgs classes + @tool_runner.register handlers | existing, evolves |
-| `telegram.py` | TelegramClient factory + auth flows | existing, no changes |
-| `resolver.py` | Name → entity_id resolution with fuzzy match | NEW |
-| `formatter.py` | Message → chat-log string conversion | NEW |
-| `pagination.py` | Cursor token encode/decode | NEW |
+| Module | Responsibility | Persistence | Dependencies |
+|--------|----------------|-------------|--------------|
+| server.py | MCP protocol dispatch (list_tools, call_tool) | None | tools |
+| tools.py | ToolArgs classes + @tool_runner.register handlers (5 tools) | L1: @functools_cache | cache, resolver, formatter, pagination, telegram |
+| cache.py | Entity metadata (users/groups/channels) with TTL enforcement | L2: SQLite (WAL, TTL) | None |
+| resolver.py | Name→entity_id via fuzzy match (WRatio), @username lookup | None (reads cache) | cache (optional for @username) |
+| formatter.py | Message→readable text (headers, gaps, replies, reactions) | None | None |
+| pagination.py | Cursor encode/decode (base64 JSON) | None | None |
+| telegram.py | TelegramClient factory, session dir, auth loop | Session file on disk | None |
 
----
+### Message Fetch Strategy
+- **Always fresh** from Telegram API (no message caching)
+- Entity metadata cached 30d (users), 7d (groups/channels)
+- Cache hits only on entity_id→name lookups during formatting/resolution
 
-## Component Design
+## v1.1 Additions
 
-### resolver.py — Name Resolution
+### 1. New Module: analytics.py
 
-**Where it lives:** `src/mcp_telegram/resolver.py` — separate module, not inline.
+**Purpose:** Privacy-safe usage telemetry (tool call counts, error rates, performance metrics)
 
-**Rationale for separate module:**
-- Used by at least three tools: `ListMessages`, `SearchMessages`, `GetUserInfo`
-- Has its own dependencies (`rapidfuzz`, `transliterate`)
-- Contains state (dialog cache); isolating it prevents `tools.py` from becoming aware of caching concerns
-- Testable in isolation without an MCP server
+**Location:** `src/mcp_telegram/analytics.py` (parallel to cache.py)
 
-**Interface:**
+**Design:**
+```python
+# SQLite schema: events table
+# Columns: id (PK), tool_name, query (hash or truncated),
+#          duration_ms, error_msg, timestamp
+
+class AnalyticsStore:
+    def __init__(self, db_path: Path) -> None:
+        """Open analytics SQLite database."""
+
+    def record_event(
+        self,
+        tool_name: str,
+        query: str | None,
+        duration_ms: float,
+        error: str | None,
+    ) -> None:
+        """Record a tool call event."""
+
+    def get_stats(
+        self,
+        tool_name: str | None = None,
+        hours: int = 24,
+    ) -> dict:
+        """Aggregate stats: call count, error count, avg/min/max duration."""
+        # Returns dict with keys: calls, errors, avg_ms, min_ms, max_ms
+
+    def close(self) -> None:
+        """Close database connection."""
+```
+
+**Why separate database (analytics.db ≠ entity_cache.db)?**
+- EntityCache: read-heavy (cache hits on every resolve), entity_id→name lookups
+- AnalyticsStore: write-only (one INSERT per tool call)
+- Mixing tables risks WAL contention (reader lock conflicts with writer lock)
+- Different retention policies (entities: 30d users/7d groups; events: 90d for future)
+- Separate databases = independent VACUUM schedules
+
+**Integration points:**
+- tools.py: Import AnalyticsStore via get_analytics_store() factory (pattern: @functools_cache)
+- server.py: Wrap tool_runner call with timing, record_event after response (success or error)
+
+### 2. New Tool: GetUsageStats
+
+**Location:** tools.py, new ToolArgs subclass + dispatch
+
+**Pattern:** Follows existing ToolArgs convention (no special registration needed, auto-discovered by reflect)
 
 ```python
-async def resolve_entity(
-    client: TelegramClient,
-    query: str | int,
-) -> ResolveResult:
-    ...
+class GetUsageStats(ToolArgs):
+    """
+    Fetch usage telemetry: tool call counts, error rates, performance metrics.
+    No arguments required; returns stats for all tools over the last 24 hours.
+    """
+    tool: str | None = None  # Optional: filter by tool name
+    hours: int = 24         # Time window in hours
 
-@dataclass
-class ResolveResult:
-    entity_id: int          # resolved Telegram entity ID
-    display_name: str       # canonical name for annotation
-    ambiguous: list[str]    # non-empty when 60–89 WRatio match → caller raises
-    annotation: str         # "[резолв: "query" → Name, id:N]" or ""
-```
-
-**Algorithm:**
-
-```
-if query is int:
-    return ResolveResult(entity_id=query, display_name=str(query), annotation="")
-
-normalize(query):
-    lowercase, strip, transliterate Cyrillic→Latin for comparison
-
-candidates = await _get_dialog_cache(client)   # list[(name, entity_id)]
-
-for each candidate:
-    score = WRatio(normalize(query), normalize(candidate.name))
-
-if max_score >= 90: auto-resolve → ResolveResult with annotation
-if 60 <= max_score < 90: return with non-empty ambiguous list
-if max_score < 60: raise ValueError("not found")
-```
-
-**Dialog cache design — how to avoid stale data:**
-
-Use a module-level dict keyed on the TelegramClient instance (identity, not value), storing `(timestamp, list[DialogEntry])`. TTL = 5 minutes. On cache miss or TTL expiry, call `client.iter_dialogs()` to refresh.
-
-Do NOT use `@functools.cache` for this — it cannot invalidate by time. Use an explicit dict with timestamps.
-
-```python
-_dialog_cache: dict[int, tuple[float, list[DialogEntry]]] = {}  # id(client) → (ts, entries)
-CACHE_TTL = 300  # seconds
-
-async def _get_dialog_cache(client: TelegramClient) -> list[DialogEntry]:
-    key = id(client)
-    now = time.monotonic()
-    if key in _dialog_cache:
-        ts, entries = _dialog_cache[key]
-        if now - ts < CACHE_TTL:
-            return entries
-    entries = [DialogEntry(name=d.name, entity_id=d.id) async for d in client.iter_dialogs()]
-    _dialog_cache[key] = (now, entries)
-    return entries
-```
-
-Stale-data tradeoff: 5 min TTL means a newly added contact may not resolve for up to 5 min. Acceptable — the alternative (always fetching) adds 1-2s latency per tool call. LLM sessions are short; this TTL covers a full session.
-
-**Integration with tools.py:**
-
-Each tool runner that accepts a `dialog_id: str | int` field calls `resolve_entity()` at the top of its handler, before any other Telegram API call. The annotation is prepended to the tool output:
-
-```python
-@tool_runner.register
-async def list_messages(args: ListMessages):
-    async with create_client() as client:
-        result = await resolve_entity(client, args.dialog_id)
-        if result.ambiguous:
-            return [TextContent(type="text", text=f"Ambiguous: {result.ambiguous}")]
-        # ... rest of handler
-        output = [result.annotation] + message_lines  # annotation first
-```
-
----
-
-### formatter.py — Message Formatting
-
-**Where it lives:** `src/mcp_telegram/formatter.py` — standalone module of pure functions.
-
-**Rationale for standalone functions, not a class:**
-- No persistent state needed between messages
-- Functions compose better for the context-window feature (`SearchMessages` needs ±3 context messages formatted the same way)
-- A class would add ceremony without benefit
-
-**Interface:**
-
-```python
-def format_message(
-    message: custom.Message,
-    prev_message: custom.Message | None = None,
-) -> list[str]:
-    """Returns zero or more lines to emit (day header, session break, message line)."""
-
-def format_message_line(message: custom.Message) -> str:
-    """HH:mm FirstName: text  [reactions]"""
-
-def format_day_header(date: datetime) -> str:
-    """─── 11 March 2026 ───"""
-
-def format_session_break() -> str:
-    """--- (60+ min gap) ---"""
-```
-
-**format_message logic:**
-
-```
-if prev_message is None or message.date.date() != prev_message.date.date():
-    emit day header
-
-if prev_message is not None and gap > 60 min:
-    emit session break
-
-emit message line:
-    sender = message.sender.first_name or username or "Unknown"
-    text = message.text or describe_media(message)
-    reactions = format_reactions(message.reactions)
-    reply_annotation = "[reply to HH:mm FirstName]" if message.reply_to else ""
-```
-
-**Caller pattern (ListMessages tool runner):**
-
-```python
-lines = []
-prev = None
-async for message in client.iter_messages(...):
-    lines.extend(format_message(message, prev))
-    prev = message
-return [TextContent(type="text", text="\n".join(lines))]
-```
-
-Returning a single `TextContent` with newline-joined lines is more efficient than one `TextContent` per message. The LLM reads it as a chat log, not a list of items.
-
----
-
-### pagination.py — Cursor Tokens
-
-**Where it lives:** `src/mcp_telegram/pagination.py` — standalone module.
-
-**Design: base64-encoded JSON, not a hash.**
-
-Rationale:
-- Cursor must be decodable by the server without external state (no database, no session store)
-- The token encodes the anchor message_id internally so it never appears in tool output
-- JSON is inspectable during debugging; base64 makes it opaque to the LLM
-- A hash would require a server-side lookup table — adds state the project cannot afford
-
-**Token structure:**
-
-```python
-@dataclass
-class CursorPayload:
-    dialog_id: int     # guard: prevent cursor from being used with wrong dialog
-    message_id: int    # the Telethon max_id anchor for next page
-    direction: str     # "older" (always, for now — pagination goes backwards)
-
-def encode_cursor(dialog_id: int, message_id: int) -> str:
-    payload = {"d": dialog_id, "m": message_id, "dir": "older"}
-    return base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
-
-def decode_cursor(token: str, expected_dialog_id: int) -> int:
-    """Returns message_id to use as max_id. Raises ValueError on mismatch or corruption."""
-    payload = json.loads(base64.urlsafe_b64decode(token.encode()))
-    if payload["d"] != expected_dialog_id:
-        raise ValueError("cursor belongs to a different dialog")
-    return payload["m"]
-```
-
-**Integration with ListMessages:**
-
-`ListMessages` field changes:
-- Remove: `before_id: int | None` (exposes internal IDs)
-- Add: `cursor: str | None = None` (opaque token)
-
-Runner decodes cursor if present:
-```python
-max_id = decode_cursor(args.cursor, resolved_dialog_id) if args.cursor else None
-```
-
-The tool response includes the next cursor token as the last line:
-```
-cursor:eyJkIjogMTIzLCAibSI6IDQ1NiwgImRpciI6ICJvbGRlciJ9
-```
-
-The LLM passes this value verbatim as `cursor` in the next call. It never knows the underlying message ID.
-
----
-
-### GetMe and GetUserInfo — Fitting the singledispatch Pattern
-
-**Answer: they fit perfectly, no pattern changes needed.**
-
-The `server.py` tool discovery loop (`inspect.getmembers(tools, inspect.isclass)` filtering for `ToolArgs` subclasses) automatically picks up any new class added to `tools.py`. No registration step in `server.py` is required.
-
-**GetMe:**
-
-```python
-class GetMe(ToolArgs):
-    """Return the authenticated user's own name, id, and username."""
-    pass  # no arguments
 
 @tool_runner.register
-async def get_me(args: GetMe) -> ...:
-    async with create_client() as client:
-        me = await client.get_me()
-        # format and return
+async def get_usage_stats(args: GetUsageStats) -> t.Sequence[TextContent | ...]:
+    """Read analytics store, aggregate and format stats."""
+    store = get_analytics_store()
+    stats = store.get_stats(tool_name=args.tool, hours=args.hours)
+    # Format stats dict as readable text
+    return [TextContent(type="text", text=formatted_stats)]
 ```
 
-**GetUserInfo:**
+**No dialog resolution** (unlike ListMessages/SearchMessages) — pure telemetry read.
+
+### 3. Extended Tool: ListMessages with Topics and from_beginning
+
+**Changes to ListMessages parameters:**
 
 ```python
-class GetUserInfo(ToolArgs):
-    """Return profile and common chats for a user."""
-    user: str | int  # name or id
+class ListMessages(ToolArgs):
+    """
+    List messages in a dialog by name. Returns messages newest-first in
+    human-readable format (HH:mm FirstName: text) with date headers and
+    session breaks.
 
-@tool_runner.register
-async def get_user_info(args: GetUserInfo) -> ...:
-    async with create_client() as client:
-        result = await resolve_entity(client, args.user)
-        # fetch profile, common chats, format
+    Use cursor= with the next_cursor token from a previous response to page
+    back in time. Use sender= to filter messages from a specific person.
+    Use unread=True to show only messages you haven't read yet.
+
+    New in v1.1:
+    - topics=: Filter by forum topic name (supergroup topics enabled)
+    - from_beginning=True: Jump to oldest messages instead of newest
+    """
+
+    dialog: str
+    limit: int = 100
+    cursor: str | None = None
+    sender: str | None = None
+    unread: bool = False
+    # NEW:
+    topics: str | None = None      # Topic name filter
+    from_beginning: bool = False   # Iterate from oldest (False=default: newest)
 ```
 
-The `str | int` union type in Pydantic v2 works correctly: the JSON schema emits `anyOf: [string, integer]`, and the MCP client can pass either. Pydantic validates on instantiation.
+#### Implementation: from_beginning
 
----
+**Current behavior (v1.0):**
+- `reverse=False` in iter_messages (returns newest first)
+- cursor pagination goes backward (older messages)
 
-## Recommended Project Structure
-
-```
-src/mcp_telegram/
-├── __init__.py          # CLI entry points — no changes
-├── server.py            # MCP protocol layer — no changes
-├── telegram.py          # TelegramClient factory — no changes
-├── tools.py             # ToolArgs classes + runners — evolves
-├── resolver.py          # NEW: name → entity_id
-├── formatter.py         # NEW: message → chat-log lines
-└── pagination.py        # NEW: cursor token encode/decode
-```
-
-**Structure rationale:**
-- All new files are in the same package — no import path changes anywhere
-- Flat structure matches the existing convention (no subpackages)
-- Each new file has a single responsibility and no circular imports
-- `tools.py` imports from `resolver`, `formatter`, `pagination` — dependency direction is one-way
-
----
-
-## Data Flow
-
-### Name Resolution Path
-
-```
-LLM call: ListMessages(dialog_id="Иван Петров", cursor=None)
-    │
-    ▼
-tools.py: list_messages(args: ListMessages)
-    │
-    ├──► resolver.resolve_entity(client, "Иван Петров")
-    │        │
-    │        ├──► _get_dialog_cache(client)
-    │        │        ├── cache hit (< 5 min): return cached list
-    │        │        └── cache miss: client.iter_dialogs() → store → return
-    │        │
-    │        ├──► transliterate("Иван Петров") → "Ivan Petrov"
-    │        ├──► WRatio score each candidate
-    │        └──► score=95 → ResolveResult(entity_id=123, annotation="[резолв: ...]")
-    │
-    ├──► pagination.decode_cursor(args.cursor, 123) → None (no cursor)
-    │
-    ├──► client.iter_messages(entity=123, limit=50)
-    │
-    ├──► formatter.format_message(msg, prev) for each message
-    │
-    └──► return [TextContent("[резолв: ...]\n" + chat_log + "\ncursor:TOKEN")]
-```
-
-### Cursor Pagination Path
-
-```
-First call: ListMessages(dialog_id="Иван Петров", cursor=None)
-    → returns 50 messages + "cursor:TOKEN_A" as last line
-
-Second call: ListMessages(dialog_id="Иван Петров", cursor="TOKEN_A")
-    │
-    ├──► resolve_entity → entity_id=123 (cache hit)
-    ├──► decode_cursor("TOKEN_A", 123) → message_id=456
-    ├──► client.iter_messages(entity=123, max_id=456, limit=50)
-    └──► returns next 50 messages + "cursor:TOKEN_B" or no cursor (end of history)
-```
-
----
-
-## Build Order
-
-The three new modules have no dependencies on each other. The build order is driven by tool runner changes:
-
-```
-1. pagination.py       — pure functions, no Telethon dependency
-                         Build first: can be tested with unit tests immediately
-
-2. formatter.py        — depends on Telethon message types (read-only)
-                         Build second: can be tested with mock messages
-
-3. resolver.py         — depends on Telethon client (async I/O)
-                         Build third: requires integration test with real/fake client
-
-4. tools.py updates    — depends on all three above
-   ├── Update ListDialogs (add type, last_message_at fields)
-   ├── Update ListMessages (str|int dialog, cursor pagination, sender filter)
-   ├── Update SearchMessages (str|int dialog, ±3 context, session grouping)
-   ├── Add GetMe
-   ├── Add GetUserInfo
-   ├── Remove GetDialog class + runner
-   └── Remove GetMessage class + runner
-
-5. Validation          — ensure server.py mapping reflects removed/added tools correctly
-                         (automatic via reflection, but test the MCP tool list)
-```
-
-**What must exist before what:**
-- `pagination.py` must exist before updating `ListMessages`
-- `formatter.py` must exist before updating any message-returning tool
-- `resolver.py` must exist before updating any tool that accepts `str | int` dialog/user
-- All three support modules must exist before removing `GetDialog` and `GetMessage` (which are the current workarounds for ID-only access)
-
----
-
-## Architectural Patterns
-
-### Pattern 1: Tool Runner Stays Thin
-
-**What:** Each `@tool_runner.register` function orchestrates calls to support modules but contains no business logic itself.
-
-**When to use:** Always — this is the discipline that keeps `tools.py` readable as it grows.
-
-**Trade-offs:** Slightly more indirection; worth it because each module is independently testable.
-
-**Example:**
+**New behavior (v1.1):**
 ```python
-@tool_runner.register
-async def list_messages(args: ListMessages):
-    async with create_client() as client:
-        result = await resolve_entity(client, args.dialog_id)   # resolver
-        if result.ambiguous:
-            return [TextContent(type="text", text=_fmt_ambiguous(result.ambiguous))]
-        max_id = decode_cursor(args.cursor, result.entity_id) if args.cursor else None   # pagination
-        lines, next_cursor = [], None
-        prev = None
-        async for msg in client.iter_messages(result.entity_id, limit=args.limit, max_id=max_id):
-            lines.extend(format_message(msg, prev))   # formatter
-            prev = msg
-        if prev:
-            next_cursor = encode_cursor(result.entity_id, prev.id)
-        body = "\n".join(lines)
-        if next_cursor:
-            body += f"\ncursor:{next_cursor}"
-        return [TextContent(type="text", text=result.annotation + "\n" + body)]
+if args.from_beginning:
+    # Start from oldest (smallest message_id)
+    iter_kwargs["reverse"] = True
+    # No cursor → starts at message_id=1
+    # With cursor → starts at specified message_id, goes older
+else:
+    # Current behavior (default)
+    iter_kwargs["reverse"] = False
 ```
 
-### Pattern 2: Annotation Prepend
+**Why it works:**
+- Cursor is opaque (base64 JSON with message_id + dialog_id)
+- encode_cursor() doesn't care about iteration direction
+- formatter.format_messages() reverses order for display (oldest→newest calendar order)
 
-**What:** Resolution annotations are prepended to tool output as the first line, not returned as a separate `TextContent` item.
+**No format changes:** Cursor encode/decode unchanged; pagination.py needs no modifications.
 
-**When to use:** Always, when name resolution occurs.
+#### Implementation: topics
 
-**Trade-offs:** LLM reads annotation as part of the response narrative, not metadata — but this is desirable. The LLM needs to see what was matched to trust the result.
+**Telegram architecture:**
+- Forum-enabled supergroups have topics (permanent threads)
+- Each message has `reply_to.forum_topic = True` if in a topic
+- `reply_to.reply_to_top_id = topic_id` (integer)
+- Topic name requires separate API call: `GetForumTopicRequest()` or `GetMessages()` with topic ID
 
-### Pattern 3: Single TextContent Per Tool Response
+**v1.1a (MVP):** Stub only
+```python
+if args.topics:
+    return [TextContent(type="text",
+        text=f"Topic filtering not yet implemented (topic='{args.topics}')")]
+```
 
-**What:** Return one `TextContent` item with newline-joined content rather than one item per message.
+**v1.1b (Full):** Topic filtering
+```python
+# New cache addition: topics table (or extend entities table with type="topic")
+# Resolve topic name → topic_id via fuzzy match
+# Filter messages: keep only those with msg.reply_to.reply_to_top_id == topic_id
+# Format: prepend topic name to message if in topic
+```
 
-**When to use:** ListMessages, SearchMessages — any tool returning multiple messages.
+**Formatter changes (minor):**
+```python
+# In format_messages(), check if message has topic:
+reply_to = getattr(msg, "reply_to", None)
+topic_id = getattr(reply_to, "reply_to_top_id", None) if reply_to else None
+if topic_id:
+    # Fetch topic name from cache or include in output
+    topic_prefix = f"[Topic #{topic_id}] "  # v1.1a
+    # topic_prefix = f"[Topic: {topic_name}] " (v1.1b)
+```
 
-**Trade-offs:** Slightly harder to parse programmatically, but the MCP spec is text-first; LLMs read structured text natively. Also reduces MCP protocol overhead.
+### 4. Optional Cache Extensions (Deferred to post-v1.1)
 
----
+**Current schema (entity_cache.db):**
+```sql
+CREATE TABLE entities (
+    id INTEGER PRIMARY KEY,
+    type TEXT NOT NULL,     -- user, group, channel, topic (v1.1b)
+    name TEXT NOT NULL,
+    username TEXT,
+    updated_at INTEGER NOT NULL
+);
+```
 
-## Anti-Patterns
+**Optional additions (NOT for v1.1a, consider for v1.1b):**
+1. **Indexes:** `(type, updated_at)` for efficient all_names_with_ttl() filtering
+2. **Topics table:** `(id, dialog_id, name, updated_at)` for topic resolution
+3. **Reactions cache:** emoji→user_name mappings (only if GetMessageReactionsListRequest becomes expensive)
 
-### Anti-Pattern 1: Logic Inside ToolArgs Classes
-
-**What people do:** Add methods to `ListMessages` or other ToolArgs classes that perform Telegram API calls or business logic.
-
-**Why it's wrong:** ToolArgs is a data contract (Pydantic model). Adding behavior breaks the schema generation path and makes classes untestable without a live Telegram client.
-
-**Do this instead:** Keep ToolArgs as pure Pydantic models. All logic goes in the `@tool_runner.register` function or support modules.
-
-### Anti-Pattern 2: Per-Call Dialog Fetching in Resolver
-
-**What people do:** Call `client.iter_dialogs()` on every `resolve_entity()` invocation.
-
-**Why it's wrong:** `iter_dialogs()` fetches all dialogs from Telegram API — 100-1000+ entries. At 1-2s per call, this adds unacceptable latency to every tool invocation that uses name resolution.
-
-**Do this instead:** Use the TTL cache described in the resolver design. 5 minutes is long enough for a session, short enough to pick up new contacts.
-
-### Anti-Pattern 3: Exposing message_id in Tool Output
-
-**What people do:** Include `[id=12345]` in formatted message output "for pagination convenience."
-
-**Why it's wrong:** The LLM will pass it back as a literal integer in fields expecting cursor tokens, bypassing the opaque token design. IDs from one dialog can be accidentally applied to another.
-
-**Do this instead:** Never emit numeric message IDs in user-facing output. All pagination uses opaque cursor tokens. Cursor tokens embed the dialog guard internally.
-
-### Anti-Pattern 4: Storing Dialog Cache in tools.py
-
-**What people do:** Put `_dialog_cache = {}` as a module-level variable in `tools.py`.
-
-**Why it's wrong:** `tools.py` is already large. Adding cache state to it makes the module responsible for too many concerns. Cache invalidation bugs become harder to find.
-
-**Do this instead:** Cache state lives in `resolver.py`, co-located with the code that uses it.
-
----
+**For v1.1a:** No schema changes. Topics handled inline during message filtering (deferred).
 
 ## Integration Points
 
-### Internal Boundaries
+### Dependency Graph (v1.1)
 
-| Boundary | Communication | Notes |
-|----------|---------------|-------|
-| `tools.py` → `resolver.py` | Direct async function call | resolver takes `TelegramClient` instance, not a factory |
-| `tools.py` → `formatter.py` | Direct sync function call | formatter is pure functions over message objects |
-| `tools.py` → `pagination.py` | Direct sync function call | encode/decode are pure, no I/O |
-| `tools.py` → `telegram.py` | `create_client()` factory (unchanged) | still `async with create_client() as client` |
-| `server.py` → `tools.py` | unchanged — reflection + dispatch | no server.py changes required |
+```
+server.py
+├─ tools.py (modified)
+│  ├─ cache.py (unchanged)
+│  ├─ resolver.py (unchanged)
+│  ├─ formatter.py (unchanged or minimal changes for topics)
+│  ├─ pagination.py (unchanged)
+│  ├─ telegram.py (unchanged)
+│  └─ analytics.py (NEW, one-way import)
+└─ analytics.py (NEW, imported by server.py to wrap call_tool)
+```
 
-### Telethon Entity Types in formatter.py
+### Tight Coupling (v1.0, still required)
 
-The formatter receives `custom.Message` objects. Accessing sender name requires `message.sender` which may be `None` for service messages or anonymized senders in channels. formatter.py must handle:
+| From | To | Purpose |
+|------|-----|---------|
+| tools.py | cache.py | All tools read entity cache for name resolution |
+| tools.py | resolver.py | List/Search/GetUserInfo use resolve() |
+| tools.py | formatter.py | ListMessages/SearchMessages format output |
+| tools.py | pagination.py | ListMessages uses cursor encode/decode |
+| tools.py | telegram.py | All tools use Telethon client factory |
 
-- `message.sender` is `None` → use "Channel" or "Unknown"
-- `message.sender` is `types.User` → `first_name` (may also be None)
-- `message.sender` is `types.Channel` → `title`
-- `message.text` is empty → describe media type: "(photo)", "(document)", "(sticker)", etc.
+### New Loose Coupling (v1.1)
+
+| From | To | Direction | Nature |
+|------|-----|-----------|--------|
+| server.py | analytics.py | → | Call analytics.record_event() after tool_runner |
+| tools.py | analytics.py | → | (Optional future: record from tool runner for custom metrics) |
+| analytics.py | tools.py | None | Analytics never imports tools (no circular dep) |
+
+### Zero Coupling (Correct)
+
+- formatter.py, pagination.py remain standalone
+- resolver.py doesn't call formatter or pagination
+- cache.py doesn't import from tools.py
+- analytics.py is write-only leaf (reads nothing, returns dicts)
+
+## Circular Dependency Check
+
+```
+✓ server.py → tools.py
+✓ server.py → analytics.py (NEW: record events after tool calls)
+✓ tools.py → cache.py
+✓ tools.py → resolver.py
+✓ tools.py → formatter.py
+✓ tools.py → pagination.py
+✓ tools.py → telegram.py
+✓ tools.py → analytics.py (NEW: optional for custom metrics in runner)
+✓ analytics.py → (nothing)
+
+✗ No circular imports
+✗ No bidirectional dependencies
+```
+
+## Recommended Build Order
+
+### Phase 1: Analytics Foundation (Days 1–2)
+
+**Goal:** Silent event recording, ready for GetUsageStats in Phase 2
+
+1. **Create analytics.py**
+   - SQLite schema: `events (id, tool_name, query_hash, duration_ms, error_msg, timestamp)`
+   - Class: AnalyticsStore with record_event(), get_stats()
+   - Database location: `~/.local/share/mcp-telegram/analytics.db`
+   - Dependencies: sqlite3 (stdlib), pathlib
+   - Tests: Unit tests for schema, aggregation logic
+
+2. **Modify tools.py**
+   - Add get_analytics_store() with @functools_cache (pattern: get_entity_cache())
+   - Import: from .analytics import AnalyticsStore
+
+3. **Modify server.py**
+   - Wrap call_tool() with timing and analytics.record_event()
+   - Capture duration_ms, error message if exception
+   - Pattern:
+     ```python
+     t0 = time.monotonic()
+     try:
+         result = await tools.tool_runner(args)
+         elapsed_ms = (time.monotonic() - t0) * 1000
+         analytics.record_event(name, str(args), elapsed_ms, None)
+         return result
+     except Exception as e:
+         elapsed_ms = (time.monotonic() - t0) * 1000
+         analytics.record_event(name, str(args), elapsed_ms, str(e))
+         raise
+     ```
+
+**Why this phase first:** Analytics is isolated. No impact on tool behavior. Can ship as "silent observer" before GetUsageStats.
+
+### Phase 2: GetUsageStats Tool (Day 2)
+
+**Goal:** Observable telemetry queryable by LLMs
+
+1. **Modify tools.py — add GetUsageStats class**
+   ```python
+   class GetUsageStats(ToolArgs):
+       """..."""
+       tool: str | None = None
+       hours: int = 24
+
+   @tool_runner.register
+   async def get_usage_stats(args: GetUsageStats) -> ...:
+       store = get_analytics_store()
+       stats = store.get_stats(tool_name=args.tool, hours=args.hours)
+       # Format and return
+   ```
+
+2. **Tests:**
+   - Mock AnalyticsStore
+   - Verify aggregation logic (call counts, error rates, duration stats)
+   - Verify filtering by tool name and time window
+
+**Why after Phase 1:** Requires analytics infrastructure to read from.
+
+### Phase 3: ListMessages Extensions (Days 3–4)
+
+**Goal:** Complete navigation (from_beginning) and v1.1a topic stub
+
+1. **Modify tools.py — ListMessages class**
+   - Add `topics: str | None = None`
+   - Add `from_beginning: bool = False`
+   - Update docstring
+
+2. **Modify tools.py — list_messages() runner**
+   - Handle from_beginning: `iter_kwargs["reverse"] = True if args.from_beginning else False`
+   - Handle topics: (v1.1a) Check if args.topics and return "not yet implemented" message
+   - No change to cursor logic
+
+3. **Optional: Minor formatter.py updates**
+   - If topics implemented (v1.1b): add topic annotation to message line
+   - v1.1a: skip formatter changes
+
+4. **Tests:**
+   - Test from_beginning=False (regression: same behavior as v1.0)
+   - Test from_beginning=True (reverse=True propagates)
+   - Test topics=None (regression: same behavior as v1.0)
+   - Test topics="foo" (returns stub message in v1.1a)
+
+**Why last:** Depends on stable analytics + tools.py modifications. Minimal risk. Topics can be phased (v1.1a stub → v1.1b full implementation).
+
+### Phase 4: Optional Post-v1.1 (Not in v1.1a)
+
+**Defer to later milestone:**
+- Add indexes to entity_cache.db for all_names_with_ttl() optimization
+- Implement full topic filtering and resolution (v1.1b)
+- Add VACUUM strategy for analytics.db (monthly cleanup of old events)
+
+## Build Order Dependency Graph
+
+```
+Phase 1 (analytics.py, tools.get_analytics_store, server.record_event)
+    ↓
+Phase 2 (GetUsageStats tool) — reads from Phase 1
+    ↓
+Phase 3 (ListMessages extensions) — reads from server.py changes (optional analytics integration)
+```
+
+**Critical path:** Phase 1 → Phase 2 must be strictly sequential (Phase 2 can't run before Phase 1 schema exists).
+
+**Phase 3 independent:** Can start after Phase 2 completes, doesn't depend on analytics; just adds parameters.
+
+## Data Flow Examples
+
+### Example 1: GetUsageStats (New Tool)
+
+```
+LLM: "call GetUsageStats with tool=ListMessages, hours=24"
+  ↓
+server.py:call_tool("GetUsageStats", {"tool": "ListMessages", "hours": 24})
+  ↓
+Time: t0 = monotonic()
+  ↓
+tools.tool_args() → GetUsageStats(tool="ListMessages", hours=24)
+tools.get_analytics_store() → singleton AnalyticsStore
+tools.tool_runner(args) dispatch → get_usage_stats()
+  ↓
+analytics.get_stats(tool_name="ListMessages", hours=24)
+  ↓ (read only, no event record for GetUsageStats itself to avoid recursion)
+  ↓
+Result: "ListMessages: 42 calls, avg 1200ms, 2 errors (last 24h)"
+  ↓
+server.py:analytics.record_event("GetUsageStats", "tool=ListMessages", elapsed_ms=10, error=None)
+  ↓
+Return to LLM
+```
+
+### Example 2: ListMessages from_beginning (Modified)
+
+```
+LLM: "list messages in MyDM starting from oldest"
+  ↓
+tools.list_messages(ListMessages(dialog="MyDM", from_beginning=True, limit=50))
+  ↓
+Time: t0 = monotonic()
+  ↓
+Step 1: Resolve "MyDM" → entity_id=987654
+Step 2: iter_messages(entity_id=987654, limit=50, reverse=True) [v1.0: reverse=False]
+Step 3: Messages come back oldest-first (opposite of v1.0)
+Step 4: format_messages() reverses order → calendar-ordered (oldest at top)
+Step 5: encode_cursor(messages[-1].id, entity_id) if len==limit
+  ↓
+Result: 50 oldest messages + next_cursor
+  ↓
+server.py:analytics.record_event("ListMessages", "dialog=MyDM", elapsed_ms=150, error=None)
+  ↓
+Return to LLM
+```
+
+### Example 3: ListMessages with topics (v1.1a stub)
+
+```
+LLM: "list messages in MyGroup with topics=announcements"
+  ↓
+tools.list_messages(ListMessages(dialog="MyGroup", topics="announcements", ...))
+  ↓
+Step 1: Resolve "MyGroup" → entity_id=123456
+Step 2: Check args.topics:
+        if args.topics:
+            return [TextContent("Topic filtering not yet implemented")]
+  ↓
+Return stub message
+```
+
+## Code Locations (v1.1)
+
+**Existing v1.0 files (no changes):**
+- `/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/cache.py`
+- `/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/resolver.py`
+- `/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/formatter.py`
+- `/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/pagination.py`
+- `/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/telegram.py`
+
+**Files with modifications:**
+- `/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/server.py` — wrap call_tool with analytics
+- `/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/tools.py` — add GetUsageStats, extend ListMessages
+
+**New files:**
+- `/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/analytics.py` — AnalyticsStore class
+
+## File Modification Summary
+
+| File | Changes | Lines | Risk |
+|------|---------|-------|------|
+| server.py | Wrap call_tool() with timing + record_event() | +15–20 | LOW |
+| tools.py | Add GetUsageStats class + runner, extend ListMessages, add get_analytics_store() | +80–120 | LOW |
+| analytics.py | **NEW** — AnalyticsStore class, SQLite schema | ~150–200 | LOW |
+| cache.py | No changes | — | — |
+| resolver.py | No changes | — | — |
+| formatter.py | No changes (v1.1a), optional topic annotation (v1.1b) | 0 or ~10 | — |
+| pagination.py | No changes | — | — |
+
+**Total new code:** ~250–350 lines (analytics.py + tools.py + server.py changes)
+**Complexity:** LOW — no algorithmic changes, extensions only
+**Breaking changes:** NONE — all new parameters optional, defaults maintain v1.0 behavior
+**Backward compatible:** YES — all tools v1.0-compatible; new tools discoverable via reflection
+
+## Integration Risks & Mitigations
+
+### Risk 1: Analytics DB Contention with Entity Cache
+**Scenario:** Many concurrent ListMessages calls → AnalyticsStore writes block entity cache reads
+**Mitigation:** Separate SQLite databases (analytics.db ≠ entity_cache.db)
+**Confidence:** HIGH — WAL mode handles concurrent reads; separation eliminates contention
+
+### Risk 2: Topics Parameter Not Yet Implemented (v1.1a)
+**Scenario:** User passes topics= parameter, expects filtering, gets stub message
+**Mitigation:** Clear stub message; phased delivery (v1.1a stub → v1.1b full)
+**Confidence:** HIGH — documented in ListMessages docstring as "v1.1b feature"
+
+### Risk 3: from_beginning Cursor Pagination Confusion
+**Scenario:** Cursor from oldest-first iteration used with newest-first iteration
+**Mitigation:** Cursor is opaque + dialog guard; direction is client concern
+**Confidence:** HIGH — pagination.py unchanged; cursor format identical
+
+### Risk 4: Analytics Event Recursion (GetUsageStats calling record_event)
+**Scenario:** GetUsageStats call creates event → stored in analytics → creates noise
+**Mitigation:** Pattern: don't record GetUsageStats calls themselves (read-only telemetry)
+**Confidence:** MEDIUM — requires discipline in implementation; document in code comment
+
+## Performance Impact
+
+### Negligible Overhead (v1.0 vs v1.1)
+
+| Metric | v1.0 | v1.1 | Delta |
+|--------|------|------|-------|
+| ListMessages latency | ~500ms (API) | ~500ms (API) | +0% (analytics write is async/batch) |
+| Entity cache hits | ~1ms | ~1ms | 0% (unchanged) |
+| Resolver latency | ~2ms (fuzzy) | ~2ms (fuzzy) | 0% (unchanged) |
+| Analytics per-call overhead | — | ~1ms INSERT | +0.2% (negligible) |
+
+### Cache Efficiency Gains (Post-v1.1)
+- Indexes on entity_cache.db: all_names_with_ttl() could improve from O(n) scan to O(log n) seek
+- Deferred to v1.1b or later (no impact on v1.1a schedule)
+
+## Compatibility Matrix
+
+| Feature | v1.0 | v1.1a | v1.1b |
+|---------|------|-------|-------|
+| ListDialogs | ✓ | ✓ | ✓ |
+| ListMessages | ✓ | ✓ (from_beginning new param) | ✓ (topics filtering) |
+| SearchMessages | ✓ | ✓ | ✓ |
+| GetMyAccount | ✓ | ✓ | ✓ |
+| GetUserInfo | ✓ | ✓ | ✓ |
+| GetUsageStats | — | ✓ | ✓ |
+| Topic filtering | — | (stub) | ✓ |
+| from_beginning param | — | ✓ | ✓ |
+| Analytics telemetry | — | ✓ | ✓ |
+
+**v1.0 → v1.1a:** Drop-in upgrade, new tools auto-discovered, all v1.0 calls work unchanged
+**v1.1a → v1.1b:** Implement topics table + filtering, fully backward compatible
 
 ---
 
-## Scaling Considerations
+## Summary Table: What Changes for v1.1
 
-This is a single-user MCP server — scaling in the traditional sense is not relevant. The relevant concern is latency per tool call:
+| Area | Change | Scope | Impact | Build Phase |
+|------|--------|-------|--------|-------------|
+| New module | analytics.py | Isolated event store | Low (observer pattern) | Phase 1 |
+| New tool | GetUsageStats | tools.py + ToolArgs dispatch | Low (read-only) | Phase 2 |
+| Extended tool | ListMessages from_beginning | Pagination variation | Low (cursor unchanged) | Phase 3 |
+| Extended tool | ListMessages topics | Filter parameter (stub v1.1a) | Low (deferrable) | Phase 3 |
+| Server integration | Wrap call_tool + record_event | Timing capture | Low (5–20 lines) | Phase 1 |
+| Cache (optional) | Indexes + topics table | Schema optimization | Deferred | Post-v1.1 |
 
-| Concern | Current | After Refactoring |
-|---------|---------|-------------------|
-| Dialog list fetch | Not needed | 1-2s on first call per session, ~0ms cached |
-| Name resolution | Not applicable | ~1ms WRatio over cached list |
-| Message formatting | ~0ms (minimal format) | ~1ms per 50 messages |
-| Cursor decode | Not applicable | ~0.1ms |
-| Overall ListMessages latency | ~500ms (Telegram API) | ~500ms + ~2ms overhead first call, ~502ms cached |
-
-The dominant cost is always the Telegram MTProto API round-trip. All new components add negligible overhead.
-
----
-
-## Sources
-
-- Direct codebase analysis: `src/mcp_telegram/tools.py`, `server.py`, `telegram.py`
-- `.planning/PROJECT.md`: requirements, algorithm specifications, format decisions
-- `.planning/codebase/ARCHITECTURE.md`: existing layer analysis
-- Telethon docs: `iter_dialogs()`, `iter_messages()`, `custom.Message` attributes — behavioral expectations based on current codebase usage patterns (HIGH confidence from existing working code)
-- rapidfuzz WRatio: deterministic scorer, no external state required (HIGH confidence from PROJECT.md specification)
+**Overall v1.1 scope:** Extension architecture, no refactoring. All changes additive. Backward compatible.
 
 ---
 
-*Architecture research for: mcp-telegram refactoring — name resolution, formatting, cursor pagination*
-*Researched: 2026-03-11*
+## Appendix: Proof of Concept Flow
+
+v1.1 integration with existing code works because:
+
+1. **ToolArgs dispatch is unchanged** — server.py reflect logic (inspect.getmembers) auto-discovers new GetUsageStats class
+2. **Cursor pagination is direction-agnostic** — base64 JSON format doesn't encode iteration direction
+3. **Analytics is one-way dependency** — tools → analytics (never reverse)
+4. **Cache has clear boundaries** — EntityCache and AnalyticsStore are separate concerns, separate databases
+5. **Formatter is pure** — no state mutations; topic annotation is optional output decoration
+
+This is why v1.1 can be built incrementally without touching resolver.py or formatter.py (until v1.1b for topics).

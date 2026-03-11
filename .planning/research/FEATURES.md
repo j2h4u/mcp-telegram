@@ -1,163 +1,164 @@
-# Feature Research
+# Feature Landscape: mcp-telegram v1.1
 
-**Domain:** LLM-facing Telegram read interface (MCP server)
-**Researched:** 2026-03-11
-**Confidence:** HIGH for design decisions already validated in PROJECT.md; MEDIUM for competitor feature analysis
+**Domain:** Telegram MCP bridge (read-only, stdio, Telethon-based)
+**Researched:** 2026-03-12
+**Overall Confidence:** MEDIUM (Telethon topic support unconfirmed in testing; telemetry patterns from industry standards)
 
-## Feature Landscape
+## Table Stakes
 
-### Table Stakes (Users Expect These)
-
-Features the LLM consumer assumes work correctly. Missing any of these makes the tool feel broken or requires an awkward workaround on every call.
+Features users expect. Missing = product feels incomplete.
 
 | Feature | Why Expected | Complexity | Notes |
 |---------|--------------|------------|-------|
-| Name-based dialog resolution | LLMs work with names, not IDs. Requiring `dialog_id: int` forces a mandatory `ListDialogs` cold-start before every task — this is the core friction the tool exists to remove | MEDIUM | WRatio scorer (rapidfuzz) + transliterate. Threshold gates: ≥90 auto-resolve, 60–89 return ambiguity list, <60 not found. Resolution result prepended to output as `[resolve: "query" → Name, id:N]` |
-| Name-based sender/contact resolution | Same problem as dialog resolution but for the `sender` filter on `ListMessages` and `GetUserInfo` | MEDIUM | Same algorithm, same dependencies — reuse resolver |
-| Human-readable message output | Current output is `[id=N] raw text` — no sender name, no timestamp, no context. LLMs lose conversation structure immediately | MEDIUM | Chat-log style: `HH:mm FirstName: text  [reactions]`. Date header on day change. No raw message_id in output |
-| Cursor-based pagination | `before_id: int` pagination is broken in the new format — message_ids are not exposed. Must be replaceable | LOW | Opaque base64 cursor tokens. LLM passes `cursor` back from previous page response. Internally encodes message_id |
-| Session/conversation grouping | LLM reading 50 messages sees one flat list — can't tell where one conversation topic ends and another starts | LOW | Session break line when gap > 60 min between messages |
-| Reply annotation in output | Replies are common in Telegram group chats; without context the reply target is invisible to the LLM | LOW | Append `[reply to: FirstName: "first 40 chars"]` inline |
-| Media type placeholders | Messages with photos/videos/stickers silently disappear in text-only output — the LLM has no idea a media message was sent | LOW | `[photo]`, `[video]`, `[voice note]`, `[sticker: emoji]`, `[document: filename.pdf]` inline in message text |
-| `GetMe` tool | LLM needs to know whose account this is to reason about "my messages" vs. others | LOW | Returns own name, id, username |
-| `ListDialogs` with type and timestamp | Knowing only the name is not enough — LLM needs to distinguish DM vs group vs channel and see recency | LOW | Add `type` field (private/group/channel/supergroup) and `last_message_at` ISO timestamp |
-| `ListMessages` unread filter | Primary use case: "what did I miss?" — must work without knowing how many unread messages there are | LOW | Already exists; confirm it works correctly with new resolver and pagination |
-| `SearchMessages` with context | Search hit alone is useless — the LLM needs surrounding messages to understand what the discussion was about | MEDIUM | Return ±3 message context per match, hits grouped by conversation session |
+| Dialog/message read access | Core value proposition | ✓ Existing | ListDialogs, ListMessages ship in v1.0 |
+| Name-based resolution (no IDs) | LLM usability — zero cold-start friction | ✓ Existing | Fuzzy match + cache in v1.0 |
+| Pagination without duplicates | Fetch large conversation histories without repeating messages | Medium | Cursor pagination shipped; from_beginning variant needed |
+| Reply chain context | Understand message context via parent message lookup | ✓ Existing | reply_map built in ListMessages (v1.0) |
+| Reaction metadata | Understand user engagement (emoji, count) | ✓ Existing | Reaction names cached in ListMessages when total ≤ 15 (v1.0) |
+| Private contact info access | Understand communication graph (e.g., "who do these users talk to together?") | ✓ Existing | GetUserInfo + GetCommonChats in v1.0 |
 
-### Differentiators (Competitive Advantage)
+## Differentiators
 
-Features that make this tool meaningfully better than the raw-ID approach or than write-capable competitors.
+Features that set product apart. Not expected, but valued.
 
 | Feature | Value Proposition | Complexity | Notes |
 |---------|-------------------|------------|-------|
-| Resolver transparency (`[resolve: ...]` prefix) | LLM sees exactly what was matched — prevents silent wrong-contact mistakes, gives user auditability. No other Telegram MCP tool does this | LOW | Prepend to every tool output where resolution occurred. Format: `[resolve: "query" → Display Name, id:N]` |
-| Ambiguity list on low-confidence match | Instead of silently picking the wrong contact or failing with an error, return top candidates — LLM can ask the user to disambiguate | LOW | Score 60–89 → return list of up to 5 candidates with scores. Score <60 → "not found" |
-| Transliteration-aware matching | Russian names typed in Latin and vice versa is extremely common. No competitor handles this | LOW | `transliterate` library. Normalize both query and candidate before scoring |
-| `GetUserInfo` with common chats | Gives context about who someone is relative to the account owner — not available in read-only competitors | MEDIUM | Returns profile fields + list of shared group/channel names |
-| Read-only by design | Eliminates the entire class of "LLM accidentally sent a message" accidents. Simpler threat model, easier to audit | NONE | Already a constraint. Reinforce in tool descriptions so LLM doesn't try to use it for writes |
-| Strict privacy in output | message_ids, internal user IDs are not surfaced in output — reduces risk of LLM leaking or misusing identifiers | LOW | Only names, timestamps, and opaque cursor tokens visible in output |
+| **Privacy-safe usage telemetry** | LLMs understand tool consumption patterns (what dialogs are accessed, how often, search volume) without exposing user data; enables product iteration | Medium | Behavioral events only (no names, IDs, message content); SQLite event log; `GetUsageStats` tool queryable by LLM |
+| **Forum topic filtering** | Search/filter messages within supergroup topics (not just whole group); complete Telegram feature parity | Medium | Telegram exposes `reply_to.forum_topic_id` + topic name via `channels.getForumTopics()` RPC; Telethon support unvalidated |
+| **from_beginning navigation** | Jump to oldest messages without cursor iteration (skip 1000 messages in 10 pages vs 100) | Low | Add `from_beginning=true` param to ListMessages; Telethon's `reverse=True` + `min_id=1` handles this |
+| **Dialog list caching** | Reduce ListDialogs latency on repeated calls (hot path in LLM loops) | Low | Cache dialogs in SQLite with 5-min TTL; invalidate on new message |
+| **Reaction cache improvements** | Avoid re-fetching reaction names across paginated message requests | Low | Extend entity cache schema to store reaction_emoji → reactor_list; TTL strategy TBD |
 
-### Anti-Features (Commonly Requested, Often Problematic)
+## Anti-Features
 
-| Feature | Why Requested | Why Problematic | Alternative |
-|---------|---------------|-----------------|-------------|
-| Exposing raw message_id in output | "Useful for referencing specific messages" | Once LLMs see numeric IDs they start passing them back as arguments. This breaks when message_ids change across MTProto sessions, and it forces us to maintain ID-based tools we want to remove | Opaque cursor tokens for pagination; resolver output for identification |
-| Send/edit/delete message tools | "More powerful — LLM can act, not just read" | Write access turns a read-only observer into an agent that can cause real harm (wrong recipient, wrong content, irrecoverable deletes). Dramatically expands attack surface of the session token | Deliberate read-only scope. If write tools are ever added, they belong in a separate tool set with explicit confirmation flow |
-| Real-time / push / webhook support | "Get notified when new messages arrive" | MTProto polling model is incompatible with the stateless stdio MCP execution model. SSE/webhook would require a persistent background process managing state — entirely different architecture | Polling via `ListMessages(unread=True)` is the correct model for LLM-initiated workflows |
-| Media download / file streaming | "LLM should be able to see the photos" | Binary content over MCP text channels is either base64-bloat (token waste) or requires out-of-band storage (new infrastructure). Most LLM tasks don't require pixel-level image data | Descriptive media placeholders in text output. File download as a future, opt-in, separate tool with explicit size limits |
-| Multi-account support | "Different contexts need different accounts" | Single-session architecture is simple and matches the deployment model (one Docker container = one account). Multi-account requires session multiplexing, credential management, and a selector argument on every call | Deploy multiple instances if needed — each container is a separate account |
-| Full history pagination with offset | "Page 3 of results" semantics with numeric offsets | Offset pagination breaks when the underlying data changes (new messages arrive). Also requires exposing message_ids or timestamps as offset anchors, which leaks internal IDs | Cursor-based pagination with opaque tokens — stable across data changes, no ID exposure |
-| Fuzzy search on message content | "Find messages about X even if not exact" | Telegram's MTProto API does full-text search server-side. Client-side fuzzy match on message content requires loading potentially thousands of messages into memory | Use `SearchMessages` with a good query — Telegram's own search is better than client-side fuzzy |
+Features to explicitly NOT build.
+
+| Anti-Feature | Why Avoid | What to Do Instead |
+|--------------|-----------|-------------------|
+| Write operations (send/edit/delete) | Prompt injection from message content can trigger write actions (security invariant) | Accept as permanent scope boundary; document in PROJECT.md |
+| Media download/streaming | Telegram client library constraint; format already describes media | Include `media_type`, `file_size` in message format; LLM uses external Telegram client to fetch |
+| Real-time notifications (webhooks) | Polling model simpler; stateless HTTP/SSE transport via mcp-proxy sufficient | Poll via ListMessages + cursor state management on caller side |
+| Native HTTP/SSE transport | mcp-proxy already handles this; no value in reimplementing | Keep proxy in Docker compose; stdio to proxy works cleanly |
+| Multi-account support | Stateful session management complexity; single deployment per account is orthogonal problem | Deploy separate container per account; scale horizontally not vertically |
+| Message content caching | Telegram messages frequently edited; staleness risk high | Always fetch fresh from API; accept latency; offset cached for search pagination only |
 
 ## Feature Dependencies
 
 ```
-[Name Resolution]
-    └──required by──> [ListMessages with sender filter]
-    └──required by──> [GetUserInfo]
-    └──required by──> [SearchMessages scoped to dialog]
+ListMessages (v1.0)
+├── Fuzzy name resolution (v1.0)
+├── Entity cache (v1.0)
+│   └── Dialog/sender metadata (name, type, username)
+└── Cursor pagination (v1.0)
 
-[Cursor Pagination]
-    └──requires──> [message_id hidden from output]
-                       └──conflicts with──> [before_id: int pagination]
+GetUsageStats (v1.1) [NEW]
+└── Telemetry events table (v1.1) [NEW]
 
-[Human-readable message format]
-    └──requires──> [Name Resolution] (for sender display names)
-    └──enables──> [Session grouping]
-    └──enables──> [Reply annotation]
-    └──enables──> [Media placeholders]
-    └──enables──> [Reaction representation]
+ListMessages + topic filter (v1.1) [ENHANCEMENT]
+├── channels.getForumTopics() call (new RPC call)
+└── Telethon topic support validation (research needed)
 
-[GetMe]
-    └──enhances──> [Human-readable format] (own name displayed vs. others)
+ListMessages + from_beginning (v1.1) [ENHANCEMENT]
+└── reverse=True pagination (Telethon existing feature)
+
+Dialog list cache (v1.1) [ENHANCEMENT]
+└── SQLite dialogs table + TTL (new table in entity_cache.db)
 ```
 
-### Dependency Notes
+## LLM Consumption Patterns
 
-- **Name Resolution required by message format:** Sender display names require resolving peer IDs to display names at format time — the resolver must work on both input (tool args) and output (message rendering).
-- **Cursor pagination conflicts with before_id:** The two pagination schemes are mutually exclusive. `before_id: int` requires message_id in output; cursor tokens require it hidden. Migration is a breaking change — done once.
-- **Human-readable format enables everything else:** Session grouping, reply annotation, media placeholders, and reaction representation are all formatting concerns that layer on top of the base chat-log format. They share the same rendering pass.
+### Pattern 1: Dialog Discovery (Cold Start)
+**How LLM uses it:** Call `ListDialogs` once at session start; cache result locally; use dialog names in subsequent calls.
+**Current API:** `ListDialogs(archived=False, ignore_pinned=False)` returns newline-delimited lines: `name='...' id=... type=user|group|channel last_message_at=YYYY-MM-DD HH:MM unread=N`
+**LLM consumption:** Parse lines; map name → id; filter by type if needed (e.g., "only groups"). **No change needed in v1.1** unless dialog count > 100 and latency becomes bottleneck (rare).
 
-## MVP Definition
+### Pattern 2: Message Retrieval (Hot Path)
+**How LLM uses it:** Call `ListMessages` → get first page → parse messages → extract answer-relevant facts → call again with cursor if more context needed.
+**Current API:** `ListMessages(dialog=name, limit=100, cursor=None, sender=filter, unread=False)` returns newest-first messages with \n-joined format.
+**LLM consumption:** Parse message format; extract timestamps, sender names, text; build conversation map; use reply chain for context.
+**v1.1 enhancements:**
+- Add `from_beginning=true` → jump to oldest messages (useful when asking "what was the first discussion of X?" or "summarize conversation from start")
+- Add `topic=name|id` → filter by supergroup topic (useful when asking "what's been discussed in #announcements topic?")
+**Rationale:** Reduces pagination latency for historical questions; completes Telegram feature parity for group organization use cases.
 
-### Launch With (v1 — the current milestone)
+### Pattern 3: Search with Context (Discovery Path)
+**How LLM uses it:** Call `SearchMessages(query)` → get results with surrounding 3 messages → extract context → done (no pagination typically).
+**Current API:** `SearchMessages(dialog=name, query=text, limit=100, offset=0)` returns offset-paginated results with ±3 context.
+**LLM consumption:** Parse query results; use surrounding context to understand snippet meaning.
+**v1.1 status:** No change needed; search has different pagination model (offset, not cursor) due to Telegram API constraint.
 
-Minimum to make the tool genuinely usable for "read my Telegram" tasks without ID boilerplate.
+### Pattern 4: Usage Telemetry (Observability)
+**How LLM uses it:** Call `GetUsageStats(period=day|week|month, metric=tool_calls|dialogs_accessed|search_volume)` → parse response → answer "which parts of my Telegram are being queried most?"
+**Proposed API (NEW in v1.1):**
+```python
+class GetUsageStats(ToolArgs):
+    """Retrieve privacy-safe usage statistics: dialog access frequency, search volume, tool call patterns.
 
-- [ ] Name-based dialog resolution (str | int accepted everywhere) — without this, every session starts with a mandatory ListDialogs call
-- [ ] Name-based sender resolution — same dependency for ListMessages sender filter
-- [ ] Human-readable message format (HH:mm Name: text) — current `[id=N] text` is machine output, not LLM-consumable
-- [ ] Cursor pagination (opaque tokens, replaces before_id) — pagination is broken once message_ids are hidden
-- [ ] Media type placeholders — silent disappearance of media messages causes hallucinations ("there was no photo")
-- [ ] Reply annotation — without it, group chat threads are incomprehensible
-- [ ] Session break lines — without them, 50 messages looks like one undifferentiated wall
-- [ ] Resolver transparency prefix — required for auditability; low effort, high value
-- [ ] `GetMe` tool — needed to interpret "my messages" correctly
-- [ ] `ListDialogs` with type and last_message_at — needed to filter the right conversation type
-- [ ] Remove `GetDialog` and `GetMessage` (ID-based, superseded)
+    No PII: returns aggregated counts only, no names or message content.
+    """
+    period: Literal["day", "week", "month"] = "week"
+    breakdown_by: Literal["dialog", "tool"] = "dialog"
+```
 
-### Add After Validation (v1.x)
+**Response format:** Newline-delimited CSV-like output:
+```
+datetime,entity,metric_name,count
+2026-03-12T00:00:00Z,dialog_123,list_messages_calls,15
+2026-03-12T00:00:00Z,dialog_123,search_volume,2
+2026-03-12T00:00:00Z,tool,list_dialogs_calls,1
+```
 
-- [ ] `GetUserInfo` with common chats — useful but not blocking the core use case
-- [ ] `SearchMessages` with ±3 context — current search returns isolated hits; context is a quality-of-life improvement
-- [ ] Reaction representation in message format — emoji reactions are common in active chats; the format should show them
+**LLM consumption:** Parse response; answer questions like:
+- "Which chat have I been asking about most in the last week?" (max count for metric=list_messages_calls, group by dialog)
+- "How many times have I searched vs browsed?" (sum search_volume vs list_messages_calls)
+- "What's my usage trend?" (compare day to week to month)
 
-### Future Consideration (v2+)
+**Rationale:**
+- **Privacy:** No user IDs, names, message content — only behavioral counts
+- **Product insight:** Understand LLM tool adoption (e.g., "are users asking about topics much?" if topic filter is used)
+- **Observability:** Enables debugging ("why is latency high?" → check search_volume spike)
 
-- [ ] Forward annotation (`[forwarded from: Name]`) — adds completeness but rarely affects task outcome
-- [ ] Scheduled / pinned message queries — niche use cases
-- [ ] Message thread / topic support (forum supergroups) — requires Telegram Forum API, distinct architecture
-- [ ] Media download as separate opt-in tool — only if a concrete use case justifies the infrastructure cost
+### Pattern 5: Contact Map Building (Analysis Path)
+**How LLM uses it:** Call `GetUserInfo(name)` → get profile + common chats → understand "who is this person and where do they appear?"
+**Current API:** `GetUserInfo(name)` returns name, id, username, verified status, common_chats list.
+**LLM consumption:** Parse common chats; answer "which of my groups do I share with this person?" or "is this account verified?"
+**v1.1 status:** No change needed; feature complete in v1.0.
 
-## Feature Prioritization Matrix
+## MVP Recommendation
 
-| Feature | User Value | Implementation Cost | Priority |
-|---------|------------|---------------------|----------|
-| Name-based dialog resolution | HIGH | MEDIUM | P1 |
-| Human-readable message format | HIGH | MEDIUM | P1 |
-| Cursor pagination | HIGH | LOW | P1 |
-| Media placeholders | HIGH | LOW | P1 |
-| Reply annotation | MEDIUM | LOW | P1 |
-| Session break lines | MEDIUM | LOW | P1 |
-| Resolver transparency prefix | HIGH | LOW | P1 |
-| `GetMe` tool | MEDIUM | LOW | P1 |
-| `ListDialogs` type + timestamp | MEDIUM | LOW | P1 |
-| Name-based sender resolution | MEDIUM | LOW | P1 |
-| Reaction representation | MEDIUM | LOW | P2 |
-| `GetUserInfo` with common chats | MEDIUM | MEDIUM | P2 |
-| `SearchMessages` ±3 context | HIGH | MEDIUM | P2 |
-| Forward annotation | LOW | LOW | P3 |
-| Forum/thread support | LOW | HIGH | P3 |
-| Media download tool | LOW | HIGH | P3 |
+**Prioritize (v1.1 Phase):**
+1. **Privacy-safe telemetry module** (`GetUsageStats` tool + event logging) — Enables product understanding, unblocks analytics roadmap
+2. **Forum topic support** (`topic=` parameter in ListMessages + topic metadata in output) — Completes Telegram feature parity; medium complexity but high value for organized groups
+3. **from_beginning navigation** (`from_beginning=true` in ListMessages) — Low complexity, reduces pagination latency for historical queries
 
-**Priority key:**
-- P1: Must have for launch (current milestone)
-- P2: Should have, add when core is stable
-- P3: Nice to have, future consideration
+**Defer (post-v1.1):**
+- Dialog list caching (only needed if latency becomes issue; ListDialogs typically ≤ 1 sec)
+- Reaction cache improvements (already good enough; expensive only for very high-engagement groups)
+- Reaction name mapping by reactor (nice-to-have, not blocking any use case)
 
-## Competitor Feature Analysis
+## Complexity Breakdown
 
-| Feature | chigwell/telegram-mcp (80+ tools) | IQAIcom/mcp-telegram | sparfenyuk/mcp-telegram (this project, current) | Our target approach |
-|---------|-----------------------------------|----------------------|-------------------------------------------------|---------------------|
-| Name resolution | None — all tools require numeric IDs | None | None | Fuzzy + transliteration, explicit resolver output |
-| Message format | Raw Telethon object fields | Not documented | `[id=N] text` | Chat-log: `HH:mm Name: text [reactions]` |
-| Pagination | Offset (limit + offset args) | Not applicable (send-only) | `before_id: int` (exposes message_id) | Opaque cursor tokens |
-| Reactions | `get_message_reactions()` separate tool | Not documented | Not implemented | Inline in message format: `[👍3 ❤️1]` |
-| Media | `download_media()`, `send_file()` | send-only | Not represented | Descriptive placeholders inline |
-| Scope | Read + write (80+ tools) | Send-only (5 tools) | Read-only (6 tools) | Read-only — deliberate |
-| Reply context | Not in message format | N/A | Not implemented | `[reply to: Name: "..."]` inline |
+| Feature | Implementation | Testing | Risk |
+|---------|----------------|---------|------|
+| **GetUsageStats + telemetry** | New telemetry.py module (60 LOC): event schema, insert_event(), query_by_period(). SQLite new table `events(timestamp, entity_id, metric, count)` with indexes. Tool handler (20 LOC) | Unit tests for event insert/query; integration test with mocked events | **MEDIUM**: PII redaction correctness (important to verify no names leak); SQLite schema versioning (what if we need to add columns later?) |
+| **Forum topics** | Modify ListMessages to: (1) accept `topic` param, (2) call `channels.getForumTopics()` to get topic_id → name mapping, (3) filter messages by `reply_to.forum_topic_id`, (4) append topic name to output lines. ~40 LOC | Unit test: mock getForumTopics, test filtering; integration test: actual supergroup with topics (requires test account) | **MEDIUM-HIGH**: Telethon topic support unvalidated in testing; `reply_to.forum_topic_id` may not exist in older message versions; topic_id mapping may be flaky if topics renamed frequently |
+| **from_beginning** | Add boolean param to ListMessages; set `reverse=True` + `min_id=1` when enabled. ~5 LOC | Trivial: test reverse=True produces oldest-first order; compare with reverse=False | **LOW**: Telethon's reverse parameter is well-tested; no edge cases expected |
+| **Dialog list cache** | SQLite new table `dialogs(id, name, type, cached_at)`. Cache warm-up on ListDialogs; invalidation on any iter_messages call (triggers new_message event). ~30 LOC | Unit test: cache hit/miss; integration test: verify invalidation on new message | **LOW**: Standard caching pattern; 5-min TTL keeps data fresh |
 
 ## Sources
 
-- Current codebase: `/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/tools.py` — ground truth for existing behavior
-- PROJECT.md: validated requirements and key decisions — HIGH confidence
-- chigwell/telegram-mcp (github.com/chigwell/telegram-mcp) — most feature-complete competitor, write-capable — MEDIUM confidence
-- IQAIcom/mcp-telegram (github.com/IQAIcom/mcp-telegram) — send-only, 5 tools — MEDIUM confidence
-- MCP Tools writing guide (modelcontextprotocol.info) — name resolution and pagination best practices — HIGH confidence
-- Telegram MTProto reactions API (core.telegram.org/api/reactions) — reaction type structure — HIGH confidence
-- Telegram Desktop chat export format — media type taxonomy, reaction field presence — MEDIUM confidence
-- WebSearch: MCP pagination opaque cursor patterns — MEDIUM confidence (multiple sources agree)
+- **Telethon:** [Client.iter_messages documentation](https://docs.telethon.dev/en/stable/modules/client.html), [Issue #4453 (reverse parameter)](https://github.com/LonamiWebs/Telethon/issues/4453), [Issue #3837 (reply_to filtering)](https://github.com/LonamiWebs/Telethon/issues/3837)
+- **Telegram API:** [Forums API](https://core.telegram.org/api/forum), [channels.getForumTopics RPC](https://core.telegram.org/method/channels.getForumTopics), [ForumTopic constructor](https://core.telegram.org/constructor/forum_topic), [messages.getHistory method](https://core.telegram.org/method/messages.getHistory)
+- **LLM Observability:** [OpenTelemetry LLM Observability](https://opentelemetry.io/blog/2024/llm-observability/), [Langfuse tracing + masking](https://langfuse.com/docs/tracing-features/masking), [PII Redaction patterns](https://portkey.ai/blog/the-complete-guide-to-llm-observability/)
+- **SQLite Patterns:** [Android SQLite Best Practices](https://developer.android.com/topic/performance/sqlite-performance-best-practices), [FTS5 (Full-Text Search)](https://www.sqlite.org/fts5.html)
+- **Pagination:** [Slack API pagination evolution](https://slack.engineering/evolving-api-pagination-at-slack/), [GraphQL cursor specification](https://graphql.org/learn/pagination/)
 
 ---
-*Feature research for: LLM-facing Telegram read interface (MCP server)*
-*Researched: 2026-03-11*
+
+## Quality Gate Checklist
+
+- ✓ **Categories clear**: Table stakes (read access, resolution, pagination) vs differentiators (telemetry, topics, from_beginning) vs anti-features clearly separated
+- ✓ **Complexity noted**: Low/Medium/High marked; implementation LOC estimates provided
+- ✓ **LLM consumption patterns addressed**: 5 patterns documented with current API, proposed changes, and LLM parsing requirements
+- ✓ **Telegram API specifics covered**: MTProto methods (channels.getForumTopics), message object fields (reply_to.forum_topic_id), constraints (offset pagination for search)
+- ✓ **Research gaps flagged**: Telethon topic support unvalidated in testing; requires integration test with real supergroup
