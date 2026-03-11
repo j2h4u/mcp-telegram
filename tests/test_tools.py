@@ -721,3 +721,105 @@ async def test_get_usage_stats_not_recorded(mock_cache, mock_client, monkeypatch
 
     # No telemetry event should be recorded
     assert len(mock_analytics_collector) == 0
+
+
+# --- TOOL-06: GetUsageStats ---
+
+
+async def test_get_usage_stats_under_100_tokens(mock_cache, mock_client, monkeypatch, tmp_path):
+    """GetUsageStats output is <100 tokens."""
+    from mcp_telegram.tools import GetUsageStats, get_usage_stats
+    import sqlite3
+
+    # Create a temporary analytics.db with sample data
+    db_path = tmp_path / "analytics.db"
+    conn = sqlite3.connect(str(db_path))
+    cursor = conn.cursor()
+
+    # Create telemetry_events table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS telemetry_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tool_name TEXT NOT NULL,
+            timestamp REAL NOT NULL,
+            duration_ms REAL NOT NULL,
+            result_count INTEGER NOT NULL,
+            has_cursor BOOLEAN NOT NULL,
+            page_depth INTEGER NOT NULL,
+            has_filter BOOLEAN NOT NULL,
+            error_type TEXT
+        )
+    """)
+
+    # Insert sample events from the past 30 days
+    now = 1000000.0
+    for i in range(10):
+        cursor.execute("""
+            INSERT INTO telemetry_events
+            (tool_name, timestamp, duration_ms, result_count, has_cursor, page_depth, has_filter, error_type)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, ("ListMessages", now - i * 100, 45.0 + i, 5 + i, False, 3 + (i % 2), False, None))
+
+    for i in range(3):
+        cursor.execute("""
+            INSERT INTO telemetry_events
+            (tool_name, timestamp, duration_ms, result_count, has_cursor, page_depth, has_filter, error_type)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, ("ListDialogs", now - 1000 - i * 100, 30.0 + i, 3, False, 1, False, None))
+
+    # Add an error event
+    cursor.execute("""
+        INSERT INTO telemetry_events
+        (tool_name, timestamp, duration_ms, result_count, has_cursor, page_depth, has_filter, error_type)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, ("ListMessages", now - 2000, 100.0, 0, False, 1, False, "NotFound"))
+
+    conn.commit()
+    conn.close()
+
+    # Mock xdg_state_home to return our tmp_path
+    import mcp_telegram.tools
+    original_xdg = mcp_telegram.tools.xdg_state_home
+    mcp_telegram.tools.xdg_state_home = lambda: tmp_path
+
+    try:
+        monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+        monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+
+        result = await get_usage_stats(GetUsageStats())
+
+        assert len(result) == 1
+        from mcp.types import TextContent
+        assert isinstance(result[0], TextContent)
+
+        token_count = len(result[0].text.split())
+        assert token_count < 100, f"Output has {token_count} tokens, should be <100"
+    finally:
+        mcp_telegram.tools.xdg_state_home = original_xdg
+
+
+async def test_get_usage_stats_empty_db(mock_cache, mock_client, monkeypatch, tmp_path):
+    """GetUsageStats returns helpful message on empty/missing DB."""
+    from mcp_telegram.tools import GetUsageStats, get_usage_stats
+    import mcp_telegram.tools
+
+    # Create mcp-telegram subdirectory (matches real structure)
+    db_dir = tmp_path / "mcp-telegram"
+    db_dir.mkdir(exist_ok=True)
+
+    # Mock xdg_state_home to return path with no analytics.db
+    original_xdg = mcp_telegram.tools.xdg_state_home
+    mcp_telegram.tools.xdg_state_home = lambda: tmp_path
+
+    try:
+        monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+        monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+
+        result = await get_usage_stats(GetUsageStats())
+
+        assert len(result) == 1
+        from mcp.types import TextContent
+        assert isinstance(result[0], TextContent)
+        assert "Analytics database not yet created" in result[0].text or "No usage data" in result[0].text
+    finally:
+        mcp_telegram.tools.xdg_state_home = original_xdg
