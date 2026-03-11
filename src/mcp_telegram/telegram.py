@@ -1,6 +1,8 @@
 # ruff: noqa: T201
 from __future__ import annotations
 
+import logging
+import time
 from functools import cache
 from getpass import getpass
 
@@ -9,6 +11,8 @@ from telethon import TelegramClient  # type: ignore[import-untyped]
 from telethon.errors.rpcerrorlist import SessionPasswordNeededError  # type: ignore[import-untyped]
 from telethon.tl.types import User  # type: ignore[import-untyped]
 from xdg_base_dirs import xdg_state_home  # type: ignore[import-error]
+
+logger = logging.getLogger(__name__)
 
 
 class TelegramSettings(BaseSettings):

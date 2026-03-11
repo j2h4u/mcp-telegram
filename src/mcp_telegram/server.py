@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import sys
+import time
 import typing as t
 from collections.abc import Sequence
 from functools import cache
@@ -76,17 +78,29 @@ async def call_tool(name: str, arguments: t.Any) -> Sequence[TextContent | Image
     if not tool:
         raise ValueError(f"Unknown tool: {name}")
 
+    t0 = time.monotonic()
     try:
         args = tools.tool_args(tool, **arguments)
-        return await tools.tool_runner(args)
+        result = await tools.tool_runner(args)
+        elapsed = time.monotonic() - t0
+        logger.info("call_tool[%s] completed in %.3fs", name, elapsed)
+        return result
     except Exception as e:
-        logger.exception("Error running tool: %s", name)
+        elapsed = time.monotonic() - t0
+        logger.exception("call_tool[%s] failed after %.3fs", name, elapsed)
         raise RuntimeError(f"Tool {name} failed") from None
 
 
 async def run_mcp_server() -> None:
     # Import here to avoid issues with event loops
     from mcp.server.stdio import stdio_server
+
+    logging.basicConfig(
+        level=logging.INFO,
+        stream=sys.stderr,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+        force=True,
+    )
 
     async with stdio_server() as (read_stream, write_stream):
         await app.run(read_stream, write_stream, app.create_initialization_options())
