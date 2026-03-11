@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 04-search-context-window-02-PLAN.md
-last_updated: "2026-03-11T12:38:58.463Z"
+stopped_at: Completed 05-cache-error-hardening-01-PLAN.md
+last_updated: "2026-03-11T14:16:53.756Z"
 last_activity: 2026-03-11
 progress:
   total_phases: 5
   completed_phases: 4
-  total_plans: 12
-  completed_plans: 12
+  total_plans: 14
+  completed_plans: 13
   percent: 42
 ---
 
@@ -57,6 +57,7 @@ Progress: [████░░░░░░] 42%
 | Phase 03-new-tools P02 | 5min | 1 task | 1 file |
 | Phase 04-search-context-window P01 | 5min | 1 tasks | 1 files |
 | Phase 04-search-context-window P02 | 5min | 1 tasks | 1 files |
+| Phase 05-cache-error-hardening P01 | 5min | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -93,6 +94,8 @@ Recent decisions affecting current work:
 - [Phase 04-search-context-window]: Hit marker assertion uses [HIT]/>>>/=== HIT === (not date separator ---) to avoid false-green against current formatter output
 - [Phase 04-search-context-window]: test_search_messages_context updated with get_messages=AsyncMock(return_value=[]) before search_messages call so it does not crash when Wave 1 adds context fetch
 - [Phase 04-search-context-window]: Use client.__call__(...) instead of client(...) in search_messages reaction loop to match test assertion mock_client.__call__.assert_called()
+- [Phase 05-cache-error-hardening]: Stub stale-entity test uses instance-level monkeypatch on all_names_with_ttl to avoid class pollution
+- [Phase 05-cache-error-hardening]: Upsert spy uses MagicMock(wraps=mock_cache.upsert) to capture calls while delegating to real SQLite
 
 ### Pending Todos
 
@@ -105,6 +108,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-03-11T12:36:36.277Z
-Stopped at: Completed 04-search-context-window-02-PLAN.md
+Last session: 2026-03-11T14:16:53.753Z
+Stopped at: Completed 05-cache-error-hardening-01-PLAN.md
 Resume file: None

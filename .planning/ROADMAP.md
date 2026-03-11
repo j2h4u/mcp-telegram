@@ -105,7 +105,7 @@ Plans:
 **Plans**: 2 plans
 
 Plans:
-- [ ] 05-01-PLAN.md — Test stubs (TDD Wave 0): 5 failing tests for TTL eviction, search upsert, cursor error message (CACH-01, CACH-02, TOOL-03)
+- [x] 05-01-PLAN.md — Test stubs (TDD Wave 0): 5 failing tests for TTL eviction, search upsert, cursor error message (CACH-01, CACH-02, TOOL-03)
 - [ ] 05-02-PLAN.md — Implement TTL enforcement, search entity upsert, cursor error handling (CACH-01, CACH-02, TOOL-03)
 
 ## Progress
@@ -119,4 +119,4 @@ Phases execute in numeric order: 1 → 2 → 3
 | 2. Tool Updates | 4/4 | Complete   | 2026-03-10 |
 | 3. New Tools | 2/2 | Complete   | 2026-03-10 |
 | 4. SearchMessages Context Window | 2/2 | Complete   | 2026-03-11 |
-| 5. Cache & Error Hardening | 0/2 | Not started | - |
+| 5. Cache & Error Hardening | 1/2 | In Progress|  |
