@@ -23,7 +23,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 1: Support Modules** - Build resolver, formatter, pagination, and entity cache — the tested foundation everything else depends on (completed 2026-03-10)
 - [x] **Phase 2: Tool Updates** - Wire support modules into existing tools; retire deprecated GetDialog and GetMessage (completed 2026-03-10)
 - [x] **Phase 3: New Tools** - Add GetMe and GetUserInfo using the now battle-tested resolver (completed 2026-03-10)
-- [ ] **Phase 4: SearchMessages Context Window** - Implement ±3 context messages per search hit (closes TOOL-06 audit gap)
+- [x] **Phase 4: SearchMessages Context Window** - Implement ±3 context messages per search hit (closes TOOL-06 audit gap) (completed 2026-03-11)
 - [ ] **Phase 5: Cache & Error Hardening** - Enforce entity cache TTL, add search entity upsert, harden cursor error handling (tech debt)
 
 ## Phase Details
@@ -105,7 +105,7 @@ Plans:
 **Plans**: 2 plans
 
 Plans:
-- [ ] 05-01-PLAN.md — Test stubs (TDD Wave 0): failing tests for TTL eviction, search upsert, cursor error message (CACH-01, CACH-02, TOOL-03)
+- [ ] 05-01-PLAN.md — Test stubs (TDD Wave 0): 5 failing tests for TTL eviction, search upsert, cursor error message (CACH-01, CACH-02, TOOL-03)
 - [ ] 05-02-PLAN.md — Implement TTL enforcement, search entity upsert, cursor error handling (CACH-01, CACH-02, TOOL-03)
 
 ## Progress
@@ -118,5 +118,5 @@ Phases execute in numeric order: 1 → 2 → 3
 | 1. Support Modules | 4/4 | Complete   | 2026-03-10 |
 | 2. Tool Updates | 4/4 | Complete   | 2026-03-10 |
 | 3. New Tools | 2/2 | Complete   | 2026-03-10 |
-| 4. SearchMessages Context Window | 0/2 | Not started | - |
+| 4. SearchMessages Context Window | 2/2 | Complete   | 2026-03-11 |
 | 5. Cache & Error Hardening | 0/2 | Not started | - |
