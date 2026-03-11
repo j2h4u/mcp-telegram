@@ -337,6 +337,7 @@ async def search_messages(
     page_offset = args.offset or 0
 
     async with connected_client() as client:
+        # Step 1: Fetch hits
         hits = [
             msg async for msg in client.iter_messages(
                 entity_id,
@@ -346,7 +347,87 @@ async def search_messages(
             )
         ]
 
-    result_text = resolve_prefix + format_messages(hits, reply_map={})
+        # Step 2: Fetch context messages (±3 around each hit, excluding hit IDs)
+        hit_ids = {h.id for h in hits}
+        context_ids_needed: set[int] = set()
+        for hit in hits:
+            for offset in range(-3, 4):
+                if offset != 0:
+                    context_ids_needed.add(hit.id + offset)
+        context_ids_needed -= hit_ids
+
+        context_msgs: dict[int, object] = {}
+        if context_ids_needed:
+            fetched = await client.get_messages(entity_id, ids=list(context_ids_needed))
+            fetched_list = fetched if isinstance(fetched, list) else [fetched]
+            context_msgs = {m.id: m for m in fetched_list if m is not None and isinstance(m.id, int)}
+
+        # Step 3: Build reaction_names_map for hits
+        reaction_names_map: dict[int, dict[str, list[str]]] = {}
+        for msg in hits:
+            rxns = getattr(msg, "reactions", None)
+            if not rxns:
+                continue
+            results = getattr(rxns, "results", None) or []
+            total = sum(getattr(r, "count", 0) for r in results)
+            if total == 0 or total > REACTION_NAMES_THRESHOLD:
+                continue
+            try:
+                rl = await client.__call__(GetMessageReactionsListRequest(
+                    peer=entity_id,
+                    id=msg.id,
+                    limit=100,
+                ))
+                user_by_id = {u.id: u for u in (getattr(rl, "users", None) or [])}
+                by_emoji: dict[str, list[str]] = {}
+                for entry in (getattr(rl, "reactions", None) or []):
+                    emoji = getattr(getattr(entry, "reaction", None), "emoticon", None) or "?"
+                    uid = getattr(getattr(entry, "peer_id", None), "user_id", None)
+                    if uid and uid in user_by_id:
+                        u = user_by_id[uid]
+                        name = " ".join(filter(None, [
+                            getattr(u, "first_name", None),
+                            getattr(u, "last_name", None),
+                        ])) or str(uid)
+                        cache.upsert(u.id, "user", name, getattr(u, "username", None))
+                        by_emoji.setdefault(emoji, []).append(name)
+                if by_emoji:
+                    reaction_names_map[msg.id] = by_emoji
+            except Exception:
+                pass  # fallback to count-only
+
+        # Step 4 & 5: Build per-hit groups and format each
+        parts: list[str] = []
+        for i, hit in enumerate(hits):
+            before = [
+                context_msgs[hit.id - j]
+                for j in range(3, 0, -1)
+                if (hit.id - j) in context_msgs
+            ]
+            after = [
+                context_msgs[hit.id + j]
+                for j in range(1, 4)
+                if (hit.id + j) in context_msgs
+            ]
+            group_msgs = sorted([*before, hit, *after], key=lambda m: m.id, reverse=True)
+            group_text = format_messages(
+                group_msgs, reply_map={}, reaction_names_map=reaction_names_map
+            )
+
+            # Mark the hit line with [HIT] prefix using time prefix as locator
+            from zoneinfo import ZoneInfo
+            hit_dt = hit.date.astimezone(ZoneInfo("UTC"))
+            hit_time_prefix = hit_dt.strftime("%H:%M")
+            hit_lines = group_text.splitlines()
+            for idx, line in enumerate(hit_lines):
+                if line.startswith(hit_time_prefix) and "[HIT]" not in line:
+                    hit_lines[idx] = f"[HIT] {line}"
+                    break
+            group_text = "\n".join(hit_lines)
+
+            parts.append(f"--- hit {i + 1}/{len(hits)} ---\n{group_text}")
+
+    result_text = resolve_prefix + "\n\n".join(parts) if parts else resolve_prefix
     if len(hits) == args.limit:
         result_text += f"\n\nnext_offset: {page_offset + args.limit}"
     return [TextContent(type="text", text=result_text)]
