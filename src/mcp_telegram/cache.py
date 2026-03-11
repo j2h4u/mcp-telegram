@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 from pathlib import Path
@@ -27,6 +28,27 @@ class EntityCache:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.isolation_level = ""  # back to transactional
         self._conn.execute(_DDL)
+        self._conn.commit()
+
+        # Create indexes for performance optimization
+        # idx_entities_type_updated: for TTL filtering in all_names_with_ttl()
+        # Allows efficient seeks by (type, updated_at) instead of full table scan
+        self._conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_entities_type_updated
+            ON entities(type, updated_at)
+        """)
+
+        # idx_entities_username: for username lookups in get_by_username()
+        # Allows efficient seeks by username instead of full table scan
+        self._conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_entities_username
+            ON entities(username)
+        """)
+
+        self._conn.commit()
+
+        # Rebuild statistics so query planner uses the new indexes
+        self._conn.execute("PRAGMA optimize")
         self._conn.commit()
 
     def upsert(
@@ -95,3 +117,77 @@ class EntityCache:
     def close(self) -> None:
         """Close the database connection."""
         self._conn.close()
+
+
+class ReactionMetadataCache:
+    """SQLite-backed cache for reaction metadata (reactor names) per message with TTL support."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        """Initialize the reaction_metadata table and index on the given connection.
+
+        Args:
+            conn: Shared SQLite connection (from EntityCache._conn).
+        """
+        self._conn = conn
+        self._init_table()
+
+    def _init_table(self) -> None:
+        """Create reaction_metadata table and index if they don't exist."""
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS reaction_metadata (
+                message_id INTEGER NOT NULL,
+                dialog_id INTEGER NOT NULL,
+                emoji TEXT NOT NULL,
+                reactor_names TEXT NOT NULL,
+                fetched_at INTEGER NOT NULL,
+                PRIMARY KEY (message_id, dialog_id, emoji)
+            )
+        """)
+        self._conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_reactions_dialog_message
+            ON reaction_metadata(dialog_id, message_id)
+        """)
+        self._conn.commit()
+
+    def get(self, message_id: int, dialog_id: int, ttl_seconds: int = 600) -> dict[str, list[str]] | None:
+        """Return cached reactions {emoji: [names]} if fresh, else None.
+
+        Args:
+            message_id: Telegram message ID.
+            dialog_id: Telegram dialog/chat ID.
+            ttl_seconds: Time-to-live in seconds (default 600 = 10 min).
+
+        Returns:
+            {emoji: [reactor_names]} dict if cache hit and fresh, else None.
+        """
+        now = int(time.time())
+        rows = self._conn.execute(
+            """SELECT emoji, reactor_names FROM reaction_metadata
+               WHERE message_id = ? AND dialog_id = ? AND fetched_at >= ?""",
+            (message_id, dialog_id, now - ttl_seconds),
+        ).fetchall()
+        if not rows:
+            return None
+        return {emoji: json.loads(names) for emoji, names in rows}
+
+    def upsert(
+        self, message_id: int, dialog_id: int, reactions_by_emoji: dict[str, list[str]]
+    ) -> None:
+        """Cache reaction names for a message.
+
+        Args:
+            message_id: Telegram message ID.
+            dialog_id: Telegram dialog/chat ID.
+            reactions_by_emoji: {emoji: [reactor_names, ...], ...} dict to cache.
+        """
+        now = int(time.time())
+        self._conn.executemany(
+            """INSERT OR REPLACE INTO reaction_metadata
+               (message_id, dialog_id, emoji, reactor_names, fetched_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            [
+                (message_id, dialog_id, emoji, json.dumps(names), now)
+                for emoji, names in reactions_by_emoji.items()
+            ],
+        )
+        self._conn.commit()
