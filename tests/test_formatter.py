@@ -178,3 +178,51 @@ def test_media_fallback() -> None:
     msg = _make_msg(1, dt, text="", first_name="Carol", media=object())
     result = format_messages([msg], {})
     assert "[медиа]" in result, f"Expected '[медиа]' for media message, got: {result!r}"
+
+
+def test_reply_annotation() -> None:
+    """Message with reply_to shows '[↑ SenderName HH:mm]' prefix."""
+    from mcp_telegram.formatter import format_messages
+
+    dt_orig = datetime(2024, 6, 15, 9, 0, 0, tzinfo=timezone.utc)
+    dt_reply = datetime(2024, 6, 15, 9, 5, 0, tzinfo=timezone.utc)
+    orig = _make_msg(1, dt_orig, text="original", first_name="Alice")
+    reply_msg = _make_msg(2, dt_reply, text="reply text", first_name="Bob")
+
+    @dataclass
+    class FakeReplyTo:
+        reply_to_msg_id: int
+
+    reply_msg.reply_to = FakeReplyTo(reply_to_msg_id=1)
+
+    result = format_messages([reply_msg, orig], reply_map={1: orig})
+    assert "[↑ Alice 09:00]" in result, f"Expected reply annotation, got: {result!r}"
+    assert "reply text" in result
+
+
+def test_reactions_display() -> None:
+    """Message with reactions shows '[emoji×count]' appended to text."""
+    from mcp_telegram.formatter import format_messages
+
+    dt = datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+
+    @dataclass
+    class FakeReaction:
+        emoticon: str
+
+    @dataclass
+    class FakeReactionCount:
+        reaction: FakeReaction
+        count: int
+
+    @dataclass
+    class FakeReactions:
+        results: list
+
+    reactions = FakeReactions(results=[
+        FakeReactionCount(reaction=FakeReaction(emoticon="👍"), count=3),
+        FakeReactionCount(reaction=FakeReaction(emoticon="❤️"), count=1),
+    ])
+    msg = _make_msg(1, dt, text="hello", first_name="Alice", reactions=reactions)
+    result = format_messages([msg], {})
+    assert "[👍×3 ❤️]" in result, f"Expected reactions, got: {result!r}"

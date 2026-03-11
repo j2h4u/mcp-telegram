@@ -52,3 +52,18 @@ def test_below_candidate_threshold(sample_entities: dict) -> None:
     result = resolve("qqqqzzzz", sample_entities)
     assert isinstance(result, NotFound)
     assert result.query == "qqqqzzzz"
+
+
+def test_single_low_score_match_auto_resolves() -> None:
+    """Single candidate in 60-89 range → auto-resolved, not Ambiguous."""
+    choices = {101: "Sergei Khabarov"}
+    result = resolve("сергей", choices)
+    assert isinstance(result, Resolved)
+    assert result.entity_id == 101
+
+
+def test_multiple_low_score_matches_are_candidates() -> None:
+    """Multiple candidates in 60-89 range → Candidates (ambiguous)."""
+    choices = {101: "Sergei Khabarov", 102: "Sergei Ivanov"}
+    result = resolve("сергей", choices)
+    assert isinstance(result, Candidates)

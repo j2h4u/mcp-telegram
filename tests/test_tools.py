@@ -12,6 +12,34 @@ async def _async_iter(items):
         yield item
 
 
+async def test_list_dialogs_multiple_newlines(mock_cache, mock_client, monkeypatch):
+    """ListDialogs with multiple dialogs returns single TextContent with newline-separated entries."""
+    def _make_dialog(name, id_, is_user=True):
+        d = MagicMock()
+        d.is_user = is_user
+        d.is_group = not is_user
+        d.is_channel = False
+        d.date = datetime(2024, 1, 15, 10, 0, 0, tzinfo=timezone.utc)
+        d.id = id_
+        d.name = name
+        d.unread_count = 0
+        d.entity = MagicMock(username=None)
+        return d
+
+    dialogs = [_make_dialog("Alice", 1), _make_dialog("Bob", 2, is_user=False)]
+    mock_client.iter_dialogs = MagicMock(return_value=_async_iter(dialogs))
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+
+    from mcp_telegram.tools import list_dialogs
+    result = await list_dialogs(ListDialogs())
+    assert len(result) == 1
+    lines = result[0].text.splitlines()
+    assert len(lines) == 2
+    assert "Alice" in lines[0]
+    assert "Bob" in lines[1]
+
+
 # --- TOOL-01: ListDialogs ---
 
 
@@ -164,30 +192,19 @@ async def test_list_messages_unread_filter(mock_cache, mock_client, monkeypatch)
     await list_messages(ListMessages(dialog="Иван Петров", unread=True))
     call_kwargs = mock_client.iter_messages.call_args.kwargs
     assert call_kwargs.get("min_id") == 50
-    assert call_kwargs.get("limit") == 3
+    assert call_kwargs.get("limit") == 100  # args.limit default, unread_count no longer caps it
 
 
 # --- TOOL-06: SearchMessages context window ---
 
 
 async def test_search_messages_context(mock_cache, mock_client, monkeypatch, make_mock_message):
-    """SearchMessages output contains context messages before and after each hit."""
+    """SearchMessages returns hit messages formatted (no context window)."""
     from mcp_telegram.tools import SearchMessages, search_messages
     hit = make_mock_message(id=50, text="the hit")
-    before_msg = make_mock_message(id=49, text="before msg")
-    after_msg = make_mock_message(id=51, text="after msg")
-
-    call_count = 0
 
     async def _fake_iter_messages(entity, **kwargs):
-        nonlocal call_count
-        call_count += 1
-        if call_count == 1:   # first call: search hits
-            yield hit
-        elif call_count == 2:  # second call: before context (max_id=50)
-            yield before_msg
-        elif call_count == 3:  # third call: after context (min_id=50)
-            yield after_msg
+        yield hit
 
     mock_client.iter_messages = _fake_iter_messages
     monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
@@ -195,11 +212,7 @@ async def test_search_messages_context(mock_cache, mock_client, monkeypatch, mak
 
     result = await search_messages(SearchMessages(dialog="Иван Петров", query="hit"))
     assert len(result) == 1
-    text = result[0].text
-    # All three messages appear in the output block
-    assert "the hit" in text
-    assert "before msg" in text
-    assert "after msg" in text
+    assert "the hit" in result[0].text
 
 
 # --- TOOL-07: SearchMessages offset pagination ---
@@ -214,12 +227,8 @@ async def test_search_messages_next_offset(mock_cache, mock_client, monkeypatch,
     call_count = 0
 
     async def _fake_iter(entity, **kwargs):
-        nonlocal call_count
-        call_count += 1
-        if call_count == 1:  # search hits
-            for h in hits:
-                yield h
-        # context calls return empty
+        for h in hits:
+            yield h
 
     mock_client.iter_messages = _fake_iter
     monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)

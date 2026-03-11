@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import logging
 import sys
+import time
 import typing as t
+from contextlib import asynccontextmanager
 from functools import cache as functools_cache
 from functools import singledispatch
 
@@ -24,6 +26,26 @@ from .resolver import Candidates, NotFound, resolve
 from .telegram import create_client
 
 logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def connected_client():
+    """Wraps create_client() with connect/disconnect and timing logs.
+
+    Defined here (not in telegram.py) so tests can patch create_client in this module.
+    """
+    client = create_client()
+    already_connected = client.is_connected()
+    t0 = time.monotonic()
+    await client.connect()
+    connect_ms = (time.monotonic() - t0) * 1000
+    logger.info("tg_connect: %.1fms (reused=%s)", connect_ms, already_connected)
+    try:
+        yield client
+    finally:
+        t0 = time.monotonic()
+        await client.disconnect()
+        logger.info("tg_disconnect: %.1fms", (time.monotonic() - t0) * 1000)
 
 
 # How to add a new tool:
@@ -97,8 +119,8 @@ async def list_dialogs(
 ) -> t.Sequence[TextContent | ImageContent | EmbeddedResource]:
     logger.info("method[ListDialogs] args[%s]", args)
     cache = get_entity_cache()
-    response: list[TextContent] = []
-    async with create_client() as client:
+    lines: list[str] = []
+    async with connected_client() as client:
         async for dialog in client.iter_dialogs(
             archived=args.archived, ignore_pinned=args.ignore_pinned
         ):
@@ -110,17 +132,16 @@ async def list_dialogs(
                 dtype = "channel"
             else:
                 dtype = "unknown"
-            last_at = dialog.date.isoformat() if dialog.date else "unknown"
+            last_at = dialog.date.strftime("%Y-%m-%d %H:%M") if dialog.date else "unknown"
             # Lazy cache warm-up: upsert entity metadata on every ListDialogs call
             entity = dialog.entity
             username: str | None = getattr(entity, "username", None)
             cache.upsert(dialog.id, dtype, dialog.name, username)
-            msg = (
+            lines.append(
                 f"name='{dialog.name}' id={dialog.id} type={dtype} "
                 f"last_message_at={last_at} unread={dialog.unread_count}"
             )
-            response.append(TextContent(type="text", text=msg))
-    return response
+    return [TextContent(type="text", text="\n".join(lines))]
 
 
 ### ListMessages ###
@@ -158,6 +179,11 @@ async def list_messages(
         names = ", ".join(f'"{m[0]}"' for m in result.matches[:5])
         return [TextContent(type="text", text=f'Ambiguous dialog "{args.dialog}". Matches: {names}')]
     entity_id: int = result.entity_id
+    resolve_prefix = (
+        f'[resolved: "{args.dialog}" → {result.display_name}]\n'
+        if args.dialog.strip().lower() != result.display_name.strip().lower()
+        else ""
+    )
 
     # Step 2 — Build iter_messages kwargs
     iter_kwargs: dict[str, t.Any] = {
@@ -179,13 +205,12 @@ async def list_messages(
         iter_kwargs["from_user"] = sender_result.entity_id
 
     # Step 4 — Unread filter + message fetch + format + cursor
-    async with create_client() as client:
+    async with connected_client() as client:
         if args.unread:
             input_peer = await client.get_input_entity(entity_id)
             peer_result = await client(GetPeerDialogsRequest(peers=[input_peer]))
             tl_dialog = peer_result.dialogs[0]
             iter_kwargs["min_id"] = tl_dialog.read_inbox_max_id
-            iter_kwargs["limit"] = min(tl_dialog.unread_count, args.limit)
 
         messages = [msg async for msg in client.iter_messages(**iter_kwargs)]
 
@@ -205,12 +230,24 @@ async def list_messages(
                     getattr(sender, "username", None)
                 )
 
-    text = format_messages(messages, reply_map={})
+        # Build reply_map for reply annotations
+        reply_ids = list({
+            msg.reply_to.reply_to_msg_id
+            for msg in messages
+            if getattr(msg, "reply_to", None) and getattr(msg.reply_to, "reply_to_msg_id", None)
+        })
+        reply_map: dict[int, object] = {}
+        if reply_ids:
+            replied = await client.get_messages(entity_id, ids=reply_ids)
+            replied_list = replied if isinstance(replied, list) else [replied]
+            reply_map = {m.id: m for m in replied_list if m}
+
+    text = format_messages(messages, reply_map=reply_map)
     next_cursor: str | None = None
     if len(messages) == args.limit and messages:
         next_cursor = encode_cursor(messages[-1].id, entity_id)
 
-    result_text = text
+    result_text = resolve_prefix + text
     if next_cursor:
         result_text += f"\n\nnext_cursor: {next_cursor}"
     return [TextContent(type="text", text=result_text)]
@@ -221,8 +258,7 @@ async def list_messages(
 
 class SearchMessages(ToolArgs):
     """
-    Search messages in a dialog by text query. Returns each matching message with up to
-    3 messages of surrounding context (before and after). Ordered newest to oldest.
+    Search messages in a dialog by text query. Returns matching messages newest to oldest.
 
     Use offset= with the next_offset value from a previous response to get the next page.
     """
@@ -248,11 +284,15 @@ async def search_messages(
         names = ", ".join(f'"{m[0]}"' for m in result.matches[:5])
         return [TextContent(type="text", text=f'Ambiguous dialog "{args.dialog}". Matches: {names}')]
     entity_id: int = result.entity_id
+    resolve_prefix = (
+        f'[resolved: "{args.dialog}" → {result.display_name}]\n'
+        if args.dialog.strip().lower() != result.display_name.strip().lower()
+        else ""
+    )
 
     page_offset = args.offset or 0
 
-    async with create_client() as client:
-        # Step 2: Fetch search results page
+    async with connected_client() as client:
         hits = [
             msg async for msg in client.iter_messages(
                 entity_id,
@@ -262,20 +302,7 @@ async def search_messages(
             )
         ]
 
-        # Step 3: For each hit, fetch ±3 context messages
-        blocks: list[str] = []
-        for hit in hits:
-            before = list(reversed([
-                m async for m in client.iter_messages(entity_id, limit=3, max_id=hit.id)
-            ]))
-            after = [
-                m async for m in client.iter_messages(entity_id, limit=3, min_id=hit.id)
-            ]
-            window = before + [hit] + after
-            blocks.append(format_messages(window, reply_map={}))
-
-    # Step 4: Build output
-    result_text = "\n\n---\n\n".join(blocks)
+    result_text = resolve_prefix + format_messages(hits, reply_map={})
     if len(hits) == args.limit:
         result_text += f"\n\nnext_offset: {page_offset + args.limit}"
     return [TextContent(type="text", text=result_text)]
@@ -293,7 +320,7 @@ class GetMe(ToolArgs):
 @tool_runner.register
 async def get_me(args: GetMe) -> t.Sequence[TextContent | ImageContent | EmbeddedResource]:
     logger.info("method[GetMe] args[%s]", args)
-    async with create_client() as client:
+    async with connected_client() as client:
         me = await client.get_me()
     if me is None:
         return [TextContent(type="text", text="Not authenticated")]
@@ -331,7 +358,7 @@ async def get_user_info(args: GetUserInfo) -> t.Sequence[TextContent | ImageCont
     entity_id: int = result.entity_id
     display_name: str = result.display_name
 
-    async with create_client() as client:
+    async with connected_client() as client:
         try:
             user = await client.get_entity(entity_id)
             common_result = await client(GetCommonChatsRequest(
