@@ -8,6 +8,7 @@ SESSION_BREAK_MINUTES = 60
 def format_messages(
     messages: list,
     reply_map: dict[int, object],
+    reaction_names_map: dict[int, dict[str, list[str]]] | None = None,
     tz: ZoneInfo | None = None,
 ) -> str:
     """Format a list of messages into human-readable text.
@@ -55,7 +56,8 @@ def format_messages(
 
         sender_name = _resolve_sender_name(msg)
         text = _render_text(msg)
-        reactions_str = _format_reactions(msg)
+        reaction_names = reaction_names_map.get(msg.id) if reaction_names_map else None
+        reactions_str = _format_reactions(msg, reaction_names)
         if reactions_str:
             text = f"{text} {reactions_str}" if text else reactions_str
 
@@ -98,8 +100,8 @@ def _render_text(msg: object) -> str:
     return ""
 
 
-def _format_reactions(msg: object) -> str:
-    """Return formatted reactions string like '[👍×3 ❤️]', or empty string if none."""
+def _format_reactions(msg: object, reaction_names: dict[str, list[str]] | None = None) -> str:
+    """Return formatted reactions string like '[👍×3: Alice, Bob ❤️: Carol]', or empty string."""
     reactions = getattr(msg, "reactions", None)
     if reactions is None:
         return ""
@@ -109,7 +111,19 @@ def _format_reactions(msg: object) -> str:
         reaction = getattr(r, "reaction", None)
         count = getattr(r, "count", 0)
         emoji = getattr(reaction, "emoticon", None) or str(reaction)
-        parts.append(f"{emoji}×{count}" if count > 1 else emoji)
+        names = reaction_names.get(emoji) if reaction_names else None
+        if names:
+            names_str = ", ".join(names)
+            if count > len(names):
+                parts.append(f"{emoji}×{count}: {names_str}…")
+            elif count > 1:
+                parts.append(f"{emoji}×{count}: {names_str}")
+            else:
+                parts.append(f"{emoji}: {names_str}")
+        elif count > 1:
+            parts.append(f"{emoji}×{count}")
+        else:
+            parts.append(emoji)
     return f"[{' '.join(parts)}]" if parts else ""
 
 
