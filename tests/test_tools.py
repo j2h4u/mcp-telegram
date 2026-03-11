@@ -932,7 +932,47 @@ async def test_list_dialogs_archived_default(mock_cache, mock_client, monkeypatc
     and that both archived and non-archived dialogs are added to the entity cache
     for name resolution.
     """
-    pytest.skip("Wave 1")
+    def _make_dialog(name, id_, is_user=True, archived=False):
+        d = MagicMock()
+        d.is_user = is_user
+        d.is_group = not is_user
+        d.is_channel = False
+        d.date = datetime(2024, 1, 15, 10, 0, 0, tzinfo=timezone.utc)
+        d.id = id_
+        d.name = name
+        d.unread_count = 0
+        d.entity = MagicMock(username=None)
+        d.folder_id = 1 if archived else None  # Telegram marks archived dialogs via folder_id
+        return d
+
+    # Create one non-archived dialog and one archived dialog
+    dialogs = [
+        _make_dialog("Alice", 1, is_user=True, archived=False),
+        _make_dialog("Archived Chat", 2, is_user=True, archived=True),
+    ]
+    mock_client.iter_dialogs = MagicMock(return_value=_async_iter(dialogs))
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+
+    from mcp_telegram.tools import ListDialogs, list_dialogs
+    result = await list_dialogs(ListDialogs())
+
+    # Verify iter_dialogs was called with archived=None (show all)
+    call_kwargs = mock_client.iter_dialogs.call_args[1]
+    assert call_kwargs["archived"] is None
+
+    # Verify output contains both dialogs
+    text = result[0].text
+    assert "Alice" in text
+    assert "Archived Chat" in text
+
+    # Verify both were cached
+    all_names = mock_cache.all_names()
+    assert 1 in all_names  # Non-archived
+    assert 2 in all_names  # Archived
+    assert all_names[1] == "Alice"
+    assert all_names[2] == "Archived Chat"
+
 
 
 async def test_list_dialogs_exclude_archived(mock_cache, mock_client, monkeypatch):
@@ -941,4 +981,35 @@ async def test_list_dialogs_exclude_archived(mock_cache, mock_client, monkeypatc
     Tests that when exclude_archived=True, the handler filters to show only
     non-archived dialogs, equivalent to the old archived=False behavior.
     """
-    pytest.skip("Wave 1")
+    def _make_dialog(name, id_, is_user=True, archived=False):
+        d = MagicMock()
+        d.is_user = is_user
+        d.is_group = not is_user
+        d.is_channel = False
+        d.date = datetime(2024, 1, 15, 10, 0, 0, tzinfo=timezone.utc)
+        d.id = id_
+        d.name = name
+        d.unread_count = 0
+        d.entity = MagicMock(username=None)
+        d.folder_id = 1 if archived else None
+        return d
+
+    # Create one non-archived dialog and one archived dialog
+    dialogs = [
+        _make_dialog("Alice", 1, is_user=True, archived=False),
+        # Note: when exclude_archived=True, iter_dialogs(archived=False) only yields non-archived
+    ]
+    mock_client.iter_dialogs = MagicMock(return_value=_async_iter(dialogs))
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+
+    from mcp_telegram.tools import ListDialogs, list_dialogs
+    result = await list_dialogs(ListDialogs(exclude_archived=True))
+
+    # Verify iter_dialogs was called with archived=False (show non-archived only)
+    call_kwargs = mock_client.iter_dialogs.call_args[1]
+    assert call_kwargs["archived"] is False
+
+    # Verify output contains only non-archived dialog
+    text = result[0].text
+    assert "Alice" in text
