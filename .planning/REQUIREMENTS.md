@@ -19,7 +19,7 @@
 
 - [ ] **CACHE-01** — SQLite indexes added to `entity_cache.db`: `idx_entities_type_updated` on `(type, updated_at)`, `idx_entities_username` on `(username)` — improves `all_names_with_ttl()` from O(N) to O(log N)
 - [ ] **CACHE-02** — Reaction cache: store reaction data per message in `entity_cache.db` with short TTL (10 min); avoid re-fetching reaction names on every `ListMessages` call for same messages
-- [ ] **CACHE-03** — VACUUM / cleanup strategy: stale entity records deleted on startup or timer; DB file size bounded; `PRAGMA optimize` called after bulk writes
+- [x] **CACHE-03** — VACUUM / cleanup strategy: stale entity records deleted on startup or timer; DB file size bounded; `PRAGMA optimize` called after bulk writes
 
 ### Navigation
 
@@ -68,9 +68,9 @@
 | TEL-02 | 6 | Pending |
 | TEL-03 | 6 | Pending |
 | TEL-04 | 6 | Pending |
-| CACHE-01 | 7 | Pending |
-| CACHE-02 | 7 | Pending |
-| CACHE-03 | 7 | Pending |
+| CACHE-01 | 7 | Complete |
+| CACHE-02 | 7 | Complete |
+| CACHE-03 | 7 | Complete |
 | NAV-01 | 8 | Pending |
 | NAV-02 | 8 | Pending |
 | TOPIC-01 | 9 | Pending |
