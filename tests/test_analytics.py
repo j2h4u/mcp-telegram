@@ -333,3 +333,141 @@ class TestIntegration:
             assert error_type is None
         finally:
             conn.close()
+
+
+class TestUsageSummaryFormatting:
+    """Tests for format_usage_summary function."""
+
+    def test_usage_summary_metrics(self):
+        """format_usage_summary includes tool frequency, error rates, latency."""
+        from mcp_telegram.tools import format_usage_summary
+
+        stats = {
+            "tool_distribution": {"ListMessages": 10, "ListDialogs": 3},
+            "error_distribution": {"NotFound": 2, "Ambiguous": 1},
+            "max_page_depth": 8,
+            "dialogs_with_deep_scroll": 2,
+            "total_calls": 13,
+            "filter_count": 5,
+            "latency_median_ms": 45.0,
+            "latency_p95_ms": 120.0,
+        }
+
+        summary = format_usage_summary(stats)
+
+        # Verify metrics present
+        assert "ListMessages" in summary
+        assert ("76%" in summary or "77%" in summary or "10" in summary)  # top tool frequency (10/13 = 76.9%)
+        assert "Deep scrolling" in summary  # page_depth >= 5
+        assert "NotFound" in summary or "Errors" in summary  # error distribution
+        assert "Filtered" in summary or "ms" in summary  # filter or latency
+
+        # Verify token count
+        token_count = len(summary.split())
+        assert token_count < 100
+
+    def test_usage_summary_empty_distribution(self):
+        """format_usage_summary handles empty tool/error distributions."""
+        from mcp_telegram.tools import format_usage_summary
+
+        stats = {
+            "tool_distribution": {},
+            "error_distribution": {},
+            "max_page_depth": 2,
+            "dialogs_with_deep_scroll": 0,
+            "total_calls": 0,
+            "filter_count": 0,
+            "latency_median_ms": 0,
+            "latency_p95_ms": 0,
+        }
+
+        summary = format_usage_summary(stats)
+
+        # Should return something (even if empty or minimal)
+        assert isinstance(summary, str)
+        assert len(summary.split()) < 100
+
+    def test_usage_summary_no_deep_scroll(self):
+        """format_usage_summary omits deep scroll message when max_page_depth < 5."""
+        from mcp_telegram.tools import format_usage_summary
+
+        stats = {
+            "tool_distribution": {"ListMessages": 5},
+            "error_distribution": {},
+            "max_page_depth": 3,  # Below threshold
+            "dialogs_with_deep_scroll": 0,
+            "total_calls": 5,
+            "filter_count": 0,
+            "latency_median_ms": 30.0,
+            "latency_p95_ms": 50.0,
+        }
+
+        summary = format_usage_summary(stats)
+
+        assert "Deep scrolling" not in summary
+        assert "ListMessages" in summary  # Top tool still present
+
+    def test_usage_summary_with_deep_scroll(self):
+        """format_usage_summary includes deep scroll message when max_page_depth >= 5."""
+        from mcp_telegram.tools import format_usage_summary
+
+        stats = {
+            "tool_distribution": {"ListMessages": 5},
+            "error_distribution": {},
+            "max_page_depth": 8,  # Above threshold
+            "dialogs_with_deep_scroll": 1,
+            "total_calls": 5,
+            "filter_count": 0,
+            "latency_median_ms": 30.0,
+            "latency_p95_ms": 50.0,
+        }
+
+        summary = format_usage_summary(stats)
+
+        assert "Deep scrolling" in summary
+        assert "8" in summary  # max depth value
+
+    def test_usage_summary_truncation(self):
+        """format_usage_summary truncates if exceeding 100 tokens."""
+        from mcp_telegram.tools import format_usage_summary
+
+        # Create stats with many error types to stress test
+        error_dist = {f"Error{i}": i + 1 for i in range(50)}
+        stats = {
+            "tool_distribution": {f"Tool{i}": i + 1 for i in range(30)},
+            "error_distribution": error_dist,
+            "max_page_depth": 10,
+            "dialogs_with_deep_scroll": 5,
+            "total_calls": 1000,
+            "filter_count": 500,
+            "latency_median_ms": 45.5,
+            "latency_p95_ms": 120.5,
+        }
+
+        summary = format_usage_summary(stats)
+
+        # Verify hard limit is enforced
+        token_count = len(summary.split())
+        assert token_count <= 101, f"Should be at most 100 tokens + ellipsis, got {token_count}"
+
+    def test_usage_summary_latency_formatting(self):
+        """format_usage_summary formats latency with 0 decimal places."""
+        from mcp_telegram.tools import format_usage_summary
+
+        stats = {
+            "tool_distribution": {"ListMessages": 10},
+            "error_distribution": {},
+            "max_page_depth": 1,
+            "dialogs_with_deep_scroll": 0,
+            "total_calls": 10,
+            "filter_count": 0,
+            "latency_median_ms": 45.7,
+            "latency_p95_ms": 120.3,
+        }
+
+        summary = format_usage_summary(stats)
+
+        # Should have formatted latencies (no decimal places)
+        assert "46ms" in summary or "45ms" in summary  # rounded median
+        assert "120ms" in summary or "121ms" in summary  # rounded p95
+
