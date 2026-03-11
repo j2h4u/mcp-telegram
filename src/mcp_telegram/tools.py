@@ -218,6 +218,8 @@ class ListMessages(ToolArgs):
     Use cursor= with the next_cursor token from a previous response to page back in time.
     Use sender= to filter messages from a specific person (name string, resolved via fuzzy match).
     Use unread=True to show only messages you haven't read yet.
+    Use from_beginning=True to fetch messages oldest-first (starts from message ID 1). When true,
+    pagination reads forward through time rather than backward.
 
     If response is ambiguous (multiple matches), use the numeric id= parameter with the ID from the matches list.
     For @username lookups, prepend @ to the name: dialog="@username".
@@ -228,6 +230,7 @@ class ListMessages(ToolArgs):
     cursor: str | None = None
     sender: str | None = None
     unread: bool = False
+    from_beginning: bool = False
 
 
 @tool_runner.register
@@ -269,13 +272,26 @@ async def list_messages(
         iter_kwargs: dict[str, t.Any] = {
             "entity": entity_id,
             "limit": args.limit,
-            "reverse": False,
+            "reverse": args.from_beginning,  # Toggle iteration direction based on parameter
         }
-        if args.cursor:
-            try:
-                iter_kwargs["max_id"] = decode_cursor(args.cursor, entity_id)
-            except Exception as exc:
-                return [TextContent(type="text", text=f"Invalid cursor: {exc}")]
+
+        # Handle cursor based on iteration direction
+        if args.from_beginning:
+            # Reverse iteration: use min_id (page forward from oldest)
+            if args.cursor:
+                try:
+                    iter_kwargs["min_id"] = decode_cursor(args.cursor, entity_id)
+                except Exception as exc:
+                    return [TextContent(type="text", text=f"Invalid cursor: {exc}")]
+            else:
+                iter_kwargs["min_id"] = 1  # Start from oldest message
+        else:
+            # Forward iteration: use max_id (page backward from newest)
+            if args.cursor:
+                try:
+                    iter_kwargs["max_id"] = decode_cursor(args.cursor, entity_id)
+                except Exception as exc:
+                    return [TextContent(type="text", text=f"Invalid cursor: {exc}")]
 
         # Step 3 — Sender filter (resolve before opening client)
         if args.sender:
