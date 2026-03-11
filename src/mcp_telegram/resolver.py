@@ -96,7 +96,7 @@ def _fuzzy_resolve(query: str, choices: dict[int, str], cache: EntityCache | Non
         # Fetch metadata from cache if available
         if cache:
             try:
-                cached = cache.get(entity_id, ttl_seconds=0)  # ttl_seconds=0 to get any cached entry
+                cached = cache.get(entity_id, ttl_seconds=300)  # 5-min TTL for metadata
                 if cached:
                     entity_info["username"] = cached.get("username")
                     entity_info["entity_type"] = cached.get("type")
@@ -137,12 +137,9 @@ def resolve(query: str, choices: dict[int, str], cache: EntityCache | None = Non
         username_query = query[1:]  # Strip @
         try:
             # Search cache for entity with matching username
-            rows = cache._conn.execute(
-                "SELECT id, name FROM entities WHERE username = ?",
-                (username_query,)
-            ).fetchone()
-            if rows:
-                entity_id, name = rows
+            result = cache.get_by_username(username_query)
+            if result:
+                entity_id, name = result
                 return Resolved(entity_id=entity_id, display_name=name)
         except Exception:
             pass  # Ignore cache errors

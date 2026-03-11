@@ -84,6 +84,14 @@ class EntityCache:
         ).fetchall()
         return {row[0]: row[1] for row in rows}
 
+    def get_by_username(self, username: str) -> tuple[int, str] | None:
+        """Return (entity_id, name) for entity with matching username, or None."""
+        row = self._conn.execute(
+            "SELECT id, name FROM entities WHERE username = ?",
+            (username,)
+        ).fetchone()
+        return row if row else None
+
     def close(self) -> None:
         """Close the database connection."""
         self._conn.close()
