@@ -904,6 +904,12 @@ async def get_usage_stats(args: GetUsageStats) -> t.Sequence[TextContent | Image
 
     except FileNotFoundError:
         return [TextContent(type="text", text="Analytics database not yet created. Use other tools first to generate telemetry.")]
+    except sqlite3.OperationalError as exc:
+        # Table doesn't exist or DB not initialized yet
+        if "no such table" in str(exc):
+            return [TextContent(type="text", text="Analytics database not yet created. Use other tools first to generate telemetry.")]
+        logger.error("GetUsageStats query failed: %s", exc)
+        return [TextContent(type="text", text=f"Error querying usage stats: {type(exc).__name__}")]
     except Exception as exc:
         logger.error("GetUsageStats query failed: %s", exc)
         return [TextContent(type="text", text=f"Error querying usage stats: {type(exc).__name__}")]
