@@ -123,6 +123,10 @@ None - no external service configuration required.
 - All stub test names match VALIDATION.md exactly; implementation plans know what to implement
 - Concern: `transliterate` library coverage (Ukrainian/Belarusian names) — flagged in STATE.md, needs test coverage in plan 02 before resolver is considered complete
 
+## Self-Check: PASSED
+
+All 7 created files confirmed present on disk. Both task commits (3f752a3, 1da188d) confirmed in git log.
+
 ---
 *Phase: 01-support-modules*
 *Completed: 2026-03-11*

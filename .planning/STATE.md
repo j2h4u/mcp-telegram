@@ -1,17 +1,17 @@
 ---
 gsd_state_version: 1.0
 milestone: v1.0
-milestone_name: milestone
-status: executing
-stopped_at: Completed 05-cache-error-hardening-02-PLAN.md
-last_updated: "2026-03-11T14:23:22.828Z"
+milestone_name: Core API
+status: complete
+stopped_at: v1.0 shipped 2026-03-11
+last_updated: "2026-03-11T14:33:53.724Z"
 last_activity: 2026-03-11
 progress:
   total_phases: 5
   completed_phases: 5
   total_plans: 14
   completed_plans: 14
-  percent: 42
+  percent: 100
 ---
 
 # Project State
@@ -21,7 +21,7 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-11)
 
 **Core value:** LLM can work with Telegram using natural names — zero cold-start friction, no ID lookup boilerplate before every real task
-**Current focus:** Phase 1 — Support Modules
+**Current focus:** Planning next milestone — run `/gsd:new-milestone`
 
 ## Current Position
 
