@@ -110,25 +110,26 @@ class TelemetryCollector:
             with self._batch_lock:
                 self._batch.append(event)
                 if len(self._batch) >= 100:
-                    self._flush_async()
+                    self._flush_async_unlocked()
         except Exception as e:
             logger.error("Failed to record telemetry event: %s", e)
             # Never raise — telemetry must not block tool execution
 
 
-    def _flush_async(self) -> None:
-        """Spawn background task to flush batch to DB (without awaiting).
+    def _flush_async_unlocked(self) -> None:
+        """Internal: spawn background task to flush batch (caller must hold _batch_lock).
 
         Swaps batch and spawns async flush task. Strong reference (_background_task)
         prevents task from being garbage collected while running.
+
+        IMPORTANT: Must be called while holding self._batch_lock to avoid races.
         """
         try:
-            with self._batch_lock:
-                if not self._batch:
-                    return
+            if not self._batch:
+                return
 
-                batch_to_flush = self._batch[:]
-                self._batch = []
+            batch_to_flush = self._batch[:]
+            self._batch = []
 
             try:
                 loop = asyncio.get_running_loop()
@@ -137,6 +138,17 @@ class TelemetryCollector:
             except RuntimeError:
                 # No event loop running, fallback to sync write
                 self._write_batch(batch_to_flush)
+        except Exception as e:
+            logger.error("Failed to trigger async flush: %s", e)
+
+    def _flush_async(self) -> None:
+        """Public: spawn background task to flush batch to DB (thread-safe).
+
+        Acquires lock and delegates to _flush_async_unlocked.
+        """
+        try:
+            with self._batch_lock:
+                self._flush_async_unlocked()
         except Exception as e:
             logger.error("Failed to trigger async flush: %s", e)
 
