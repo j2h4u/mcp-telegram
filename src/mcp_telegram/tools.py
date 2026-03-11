@@ -141,9 +141,14 @@ def _get_sender_type(sender: t.Any) -> str:
 
 
 class ListDialogs(ToolArgs):
-    """List available dialogs, chats and channels with type and last message timestamp."""
+    """List available dialogs, chats and channels with type and last message timestamp.
 
-    archived: bool = False
+    Returns both archived and non-archived dialogs by default (Telegram uses archiving as a UI
+    organization tool, not data archival). Set exclude_archived=True to show only non-archived
+    dialogs (equivalent to old archived=False behavior).
+    """
+
+    exclude_archived: bool = False  # Changed: renamed from archived, inverted default
     ignore_pinned: bool = False
 
 
@@ -161,8 +166,14 @@ async def list_dialogs(
         cache = get_entity_cache()
         lines: list[str] = []
         async with connected_client() as client:
+            # Map parameter to Telethon's archived parameter
+            # None = mixed (current folder + archives), False = main folder, True = archive folder
+            # Since we want default behavior to show all (both archived and non-archived),
+            # we use None when exclude_archived=False, and False when exclude_archived=True
+            telethon_archived_param = None if not args.exclude_archived else False
+
             async for dialog in client.iter_dialogs(
-                archived=args.archived, ignore_pinned=args.ignore_pinned
+                archived=telethon_archived_param, ignore_pinned=args.ignore_pinned
             ):
                 if dialog.is_user:
                     dtype = "user"
