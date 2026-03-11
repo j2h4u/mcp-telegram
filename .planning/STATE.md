@@ -109,8 +109,14 @@ None yet.
 - Research flag (Phase 1): `transliterate` with Ukrainian/Belarusian names — test coverage needed before resolver is complete
 - Research flag (Phase 2): Pydantic v2 `str | int` union schema — verify MCP client handles `anyOf` before tool signature changes land
 
+### Quick Tasks Completed
+
+| # | Description | Date | Commit | Directory |
+|---|-------------|------|--------|-----------|
+| 1 | Resolver redesign | 2026-03-11 | 9221641 | [1-resolver-redesign](./quick/1-resolver-redesign/) |
+
 ## Session Continuity
 
-Last session: 2026-03-11T14:20:01.321Z
-Stopped at: Completed 05-cache-error-hardening-02-PLAN.md
+Last session: 2026-03-11T14:59:30.133Z
+Stopped at: Completed quick task 1: Resolver redesign
 Resume file: None
