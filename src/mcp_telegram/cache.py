@@ -4,6 +4,9 @@ import sqlite3
 import time
 from pathlib import Path
 
+USER_TTL: int = 2_592_000   # 30 days
+GROUP_TTL: int = 604_800    # 7 days
+
 _DDL = """
 CREATE TABLE IF NOT EXISTS entities (
     id         INTEGER PRIMARY KEY,
@@ -64,6 +67,21 @@ class EntityCache:
     def all_names(self) -> dict[int, str]:
         """Return {entity_id: name} for all records (no TTL filtering — caller decides)."""
         rows = self._conn.execute("SELECT id, name FROM entities").fetchall()
+        return {row[0]: row[1] for row in rows}
+
+    def all_names_with_ttl(self, user_ttl: int, group_ttl: int) -> dict[int, str]:
+        """Return {entity_id: name} filtered by type-specific TTL.
+
+        Users: excluded if updated_at < now - user_ttl.
+        Groups/channels: excluded if updated_at < now - group_ttl.
+        """
+        now = int(time.time())
+        rows = self._conn.execute(
+            """SELECT id, name FROM entities
+               WHERE (type = 'user' AND updated_at >= ?)
+                  OR (type != 'user' AND updated_at >= ?)""",
+            (now - user_ttl, now - group_ttl),
+        ).fetchall()
         return {row[0]: row[1] for row in rows}
 
     def close(self) -> None:
