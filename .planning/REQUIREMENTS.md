@@ -23,7 +23,7 @@
 
 ### Navigation
 
-- [ ] **NAV-01** — `ListMessages` gains `from_beginning: bool` parameter (default `false`): when true, fetches oldest messages first (`reverse=True, min_id=1` in Telethon), ignores any cursor — enables LLM to read chat history from the start without iterating through all pages
+- [x] **NAV-01** — `ListMessages` gains `from_beginning: bool` parameter (default `false`): when true, fetches oldest messages first (`reverse=True, min_id=1` in Telethon), ignores any cursor — enables LLM to read chat history from the start without iterating through all pages
 - [ ] **NAV-02** — `ListDialogs` returns archived and non-archived dialogs by default (`exclude_archived: bool = False`); archived chats in Telegram are a UI organization tool, not true archival — LLM must see all dialogs to avoid false-negative "contact not found" responses; entity cache populated from both
 
 ### Forum Topics
@@ -71,7 +71,7 @@
 | CACHE-01 | 7 | Complete |
 | CACHE-02 | 7 | Complete |
 | CACHE-03 | 7 | Complete |
-| NAV-01 | 8 | Pending |
+| NAV-01 | 8 | Complete |
 | NAV-02 | 8 | Pending |
 | TOPIC-01 | 9 | Pending |
 | TOPIC-02 | 9 | Pending |

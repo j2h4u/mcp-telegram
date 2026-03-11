@@ -24,8 +24,8 @@ Full details: `.planning/milestones/v1.0-ROADMAP.md`
 <summary>🔄 v1.1 Observability & Completeness (Phases 6–10) — IN PROGRESS</summary>
 
 - 🔄 Phase 6: Telemetry Foundation (3/4 plans) — in progress
-- ▶️ Phase 7: Cache Improvements & Optimization (3/3 plans planned)
-- ▶️ Phase 8: Navigation Features (2/2 plans planned)
+- ✅ Phase 7: Cache Improvements & Optimization (3/3 plans) — completed 2026-03-12
+- 🔄 Phase 8: Navigation Features (1/2 plans) — in progress
 - [ ] Phase 9: Forum Topics Support (TBD plans)
 - [ ] Phase 10: Tech Debt Cleanup (TBD plans)
 
@@ -41,8 +41,8 @@ Full details: `.planning/milestones/v1.0-ROADMAP.md`
 | 4. SearchMessages Context Window | v1.0 | 2/2 | Complete | 2026-03-11 |
 | 5. Cache & Error Hardening | v1.0 | 2/2 | Complete | 2026-03-11 |
 | 6. Telemetry Foundation | v1.1 | 3/4 | In progress | 2026-03-12 (06-03) |
-| 7. Cache Improvements & Optimization | v1.1 | 2/3 | In progress | 2026-03-12 (07-02) |
-| 8. Navigation Features | v1.1 | 2/2 | Not started | — |
+| 7. Cache Improvements & Optimization | v1.1 | 3/3 | Complete | 2026-03-12 (07-03) |
+| 8. Navigation Features | v1.1 | 1/2 | In progress | 2026-03-12 (08-01) |
 | 9. Forum Topics Support | v1.1 | 0/TBD | Not started | — |
 | 10. Tech Debt Cleanup | v1.1 | 0/TBD | Not started | — |
 
@@ -111,7 +111,7 @@ Full details: `.planning/milestones/v1.0-ROADMAP.md`
 5. All existing tests remain green; new pagination boundary cases (first page, last page, cursor at mid-list) pass
 
 **Plans:**
-- [ ] 08-01-PLAN.md — Reverse message iteration with from_beginning parameter (Wave 1)
+- [x] 08-01-PLAN.md — Reverse message iteration with from_beginning parameter (Wave 1) — completed 2026-03-12
 - [ ] 08-02-PLAN.md — Archived dialog support with exclude_archived parameter (Wave 1)
 
 ---
