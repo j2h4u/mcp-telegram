@@ -128,36 +128,144 @@ def _format_reactions(msg: object, reaction_names: dict[str, list[str]] | None =
 
 
 def _describe_media(media: object) -> str:
-    """Return a human-readable description of a media attachment.
+    """Return a human-readable placeholder for a media attachment.
 
-    Phase 1: basic type detection via isinstance against Telethon types when
-    available; falls back to '[медиа]' for unknown types. Telethon is duck-typed
-    here — no import at module level.
+    Covers all common Telegram media types explicitly; falls back to
+    '[медиа: ClassName]' for unknown types so they are still distinguishable.
     """
     try:
-        # Lazy import so formatter has no hard dependency on Telethon at import time
         import telethon.tl.types as tl  # noqa: PLC0415
+
+        if isinstance(media, tl.MessageMediaEmpty):
+            return ""
 
         if isinstance(media, tl.MessageMediaPhoto):
             return "[фото]"
+
         if isinstance(media, tl.MessageMediaDocument):
-            doc = getattr(media, "document", None)
-            if doc is not None:
-                attrs = getattr(doc, "attributes", [])
-                for attr in attrs:
-                    # MessageMediaVoice / MessageMediaAudio
-                    if hasattr(attr, "duration"):
-                        dur = attr.duration
-                        minutes, seconds = divmod(int(dur), 60)
-                        return f"[голосовое: {minutes}:{seconds:02d}]"
-                # Generic document — try to find filename
-                for attr in attrs:
-                    if hasattr(attr, "file_name") and attr.file_name:
-                        size = getattr(doc, "size", None)
-                        size_str = f", {size // 1024}KB" if size else ""
-                        return f"[документ: {attr.file_name}{size_str}]"
-            return "[документ]"
+            return _describe_document(media)
+
+        if isinstance(media, tl.MessageMediaPoll):
+            poll = getattr(media, "poll", None)
+            question = getattr(poll, "question", None) if poll else None
+            q_text = (
+                getattr(question, "text", None) or str(question)
+                if question is not None else None
+            )
+            return f"[опрос: «{q_text}»]" if q_text else "[опрос]"
+
+        if isinstance(media, tl.MessageMediaGeoLive):
+            return "[геолокация live]"
+
+        if isinstance(media, tl.MessageMediaGeo):
+            geo = getattr(media, "geo", None)
+            lat = getattr(geo, "lat", None)
+            lon = getattr(geo, "long", None)
+            if lat is not None and lon is not None:
+                return f"[геолокация: {lat:.4f}, {lon:.4f}]"
+            return "[геолокация]"
+
+        if isinstance(media, tl.MessageMediaVenue):
+            title = getattr(media, "title", None)
+            address = getattr(media, "address", None)
+            info = ", ".join(filter(None, [title, address]))
+            return f"[место: {info}]" if info else "[место]"
+
+        if isinstance(media, tl.MessageMediaContact):
+            first = getattr(media, "first_name", "") or ""
+            last = getattr(media, "last_name", "") or ""
+            name = " ".join(filter(None, [first, last]))
+            phone = getattr(media, "phone_number", "") or ""
+            info = ", ".join(filter(None, [name, phone]))
+            return f"[контакт: {info}]" if info else "[контакт]"
+
+        if isinstance(media, tl.MessageMediaDice):
+            emoticon = getattr(media, "emoticon", "🎲") or "🎲"
+            value = getattr(media, "value", None)
+            return f"[{emoticon} {value}]" if value is not None else f"[{emoticon}]"
+
+        if isinstance(media, tl.MessageMediaGame):
+            game = getattr(media, "game", None)
+            title = getattr(game, "title", None) if game else None
+            return f"[игра: {title}]" if title else "[игра]"
+
+        if isinstance(media, tl.MessageMediaStory):
+            return "[история]"
+
+        if isinstance(media, tl.MessageMediaInvoice):
+            title = getattr(media, "title", None)
+            return f"[счёт: {title}]" if title else "[счёт]"
+
+        if isinstance(media, tl.MessageMediaWebPage):
+            webpage = getattr(media, "webpage", None)
+            url = getattr(webpage, "url", None) if webpage else None
+            return f"[ссылка: {url}]" if url else "[ссылка]"
+
+        if isinstance(media, tl.MessageMediaUnsupported):
+            return "[неподдерживаемый тип]"
+
     except ImportError:
         pass
 
-    return "[медиа]"
+    return f"[медиа: {type(media).__name__}]"
+
+
+def _describe_document(media: object) -> str:
+    """Describe a MessageMediaDocument by inspecting its attributes."""
+    try:
+        import telethon.tl.types as tl  # noqa: PLC0415
+
+        doc = getattr(media, "document", None)
+        if doc is None:
+            return "[документ]"
+        attrs = getattr(doc, "attributes", []) or []
+
+        # Sticker (check before video/audio — sticker packs can have duration)
+        for attr in attrs:
+            if isinstance(attr, tl.DocumentAttributeSticker):
+                alt = getattr(attr, "alt", "") or ""
+                return f"[стикер: {alt}]" if alt else "[стикер]"
+
+        # Round video (video note / circle message)
+        for attr in attrs:
+            if isinstance(attr, tl.DocumentAttributeVideo):
+                if getattr(attr, "round_message", False):
+                    dur = getattr(attr, "duration", 0) or 0
+                    m, s = divmod(int(dur), 60)
+                    return f"[кружок: {m}:{s:02d}]"
+
+        # GIF / animation
+        for attr in attrs:
+            if isinstance(attr, tl.DocumentAttributeAnimated):
+                return "[анимация]"
+
+        # Voice message
+        for attr in attrs:
+            if isinstance(attr, tl.DocumentAttributeAudio):
+                dur = getattr(attr, "duration", 0) or 0
+                m, s = divmod(int(dur), 60)
+                if getattr(attr, "voice", False):
+                    return f"[голосовое: {m}:{s:02d}]"
+                title = getattr(attr, "title", None)
+                performer = getattr(attr, "performer", None)
+                info = " — ".join(filter(None, [performer, title]))
+                return f"[аудио: {info}, {m}:{s:02d}]" if info else f"[аудио: {m}:{s:02d}]"
+
+        # Regular video
+        for attr in attrs:
+            if isinstance(attr, tl.DocumentAttributeVideo):
+                dur = getattr(attr, "duration", 0) or 0
+                m, s = divmod(int(dur), 60)
+                return f"[видео: {m}:{s:02d}]"
+
+        # Named file
+        for attr in attrs:
+            if isinstance(attr, tl.DocumentAttributeFilename):
+                size = getattr(doc, "size", None)
+                size_str = f", {size // 1024}KB" if size else ""
+                return f"[документ: {attr.file_name}{size_str}]"
+
+    except ImportError:
+        pass
+
+    return "[документ]"
