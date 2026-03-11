@@ -10,7 +10,7 @@
 
 ### Telemetry
 
-- [ ] **TEL-01** — `analytics.py` module: SQLite event store (`analytics.db`, separate from `entity_cache.db`), `record_event()` with async background queue, zero PII in schema (tool name, timestamp, duration_ms, result_count, has_cursor, page_depth, has_filter, error_type — no IDs, names, content)
+- [x] **TEL-01** — `analytics.py` module: SQLite event store (`analytics.db`, separate from `entity_cache.db`), `record_event()` with async background queue, zero PII in schema (tool name, timestamp, duration_ms, result_count, has_cursor, page_depth, has_filter, error_type — no IDs, names, content)
 - [ ] **TEL-02** — `GetUsageStats` MCP tool: queries analytics DB, returns concise natural-language summary (<100 tokens) with actionable patterns (deep scroll detection, tool frequency, error rates) — designed for LLM consumption, not dashboards
 - [ ] **TEL-03** — Privacy audit: all event recording code reviewed to confirm zero PII leakage (no entity IDs, names, usernames, message content, dialog names — not even hashed)
 - [ ] **TEL-04** — Telemetry hook in every tool handler: `ListDialogs`, `ListMessages`, `SearchMessages`, `GetMe`, `GetUserInfo`; `GetUsageStats` calls NOT recorded (avoid noise)
@@ -64,7 +64,7 @@
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| TEL-01 | 6 | Pending |
+| TEL-01 | 6 | Complete |
 | TEL-02 | 6 | Pending |
 | TEL-03 | 6 | Pending |
 | TEL-04 | 6 | Pending |
