@@ -23,7 +23,7 @@ Full details: `.planning/milestones/v1.0-ROADMAP.md`
 <details>
 <summary>🔄 v1.1 Observability & Completeness (Phases 6–10) — IN PROGRESS</summary>
 
-- [ ] Phase 6: Telemetry Foundation (TBD plans)
+- [ ] Phase 6: Telemetry Foundation (4/4 plans)
 - [ ] Phase 7: Cache Improvements & Optimization (TBD plans)
 - [ ] Phase 8: Navigation Features (TBD plans)
 - [ ] Phase 9: Forum Topics Support (TBD plans)
@@ -40,7 +40,7 @@ Full details: `.planning/milestones/v1.0-ROADMAP.md`
 | 3. New Tools | v1.0 | 2/2 | Complete | 2026-03-10 |
 | 4. SearchMessages Context Window | v1.0 | 2/2 | Complete | 2026-03-11 |
 | 5. Cache & Error Hardening | v1.0 | 2/2 | Complete | 2026-03-11 |
-| 6. Telemetry Foundation | v1.1 | 0/TBD | Not started | — |
+| 6. Telemetry Foundation | v1.1 | 4/4 | Planning | — |
 | 7. Cache Improvements & Optimization | v1.1 | 0/TBD | Not started | — |
 | 8. Navigation Features | v1.1 | 0/TBD | Not started | — |
 | 9. Forum Topics Support | v1.1 | 0/TBD | Not started | — |
@@ -65,7 +65,11 @@ Full details: `.planning/milestones/v1.0-ROADMAP.md`
 4. Privacy audit confirms zero PII in telemetry module (no entity IDs, dialog IDs, names, usernames, message content, hashes)
 5. Load test baseline confirms telemetry overhead <0.5ms per tool call (async queue has negligible impact)
 
-**Plans:** TBD
+**Plans:**
+- [ ] 06-01-PLAN.md — TelemetryCollector singleton with in-memory queue and async flush (Wave 0)
+- [ ] 06-02-PLAN.md — Telemetry hooks in 5 tool handlers + GetUsageStats stub (Wave 1)
+- [ ] 06-03-PLAN.md — GetUsageStats tool with natural-language summary formatting (Wave 1)
+- [ ] 06-04-PLAN.md — Privacy audit script + load test baseline (Wave 2)
 
 ---
 
