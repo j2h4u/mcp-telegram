@@ -165,6 +165,9 @@ class ListMessages(ToolArgs):
     Use cursor= with the next_cursor token from a previous response to page back in time.
     Use sender= to filter messages from a specific person (name string, resolved via fuzzy match).
     Use unread=True to show only messages you haven't read yet.
+
+    If response is ambiguous (multiple matches), use the numeric id= parameter with the ID from the matches list.
+    For @username lookups, prepend @ to the name: dialog="@username".
     """
 
     dialog: str
@@ -182,12 +185,19 @@ async def list_messages(
 
     # Step 1 — Resolve dialog name
     cache = get_entity_cache()
-    result = resolve(args.dialog, cache.all_names_with_ttl(USER_TTL, GROUP_TTL))
+    result = resolve(args.dialog, cache.all_names_with_ttl(USER_TTL, GROUP_TTL), cache)
     if isinstance(result, NotFound):
         return [TextContent(type="text", text=f'Dialog not found: "{args.dialog}"')]
     if isinstance(result, Candidates):
-        names = ", ".join(f'"{m[0]}"' for m in result.matches[:5])
-        return [TextContent(type="text", text=f'Ambiguous dialog "{args.dialog}". Matches: {names}')]
+        match_lines = []
+        for match in result.matches:
+            line = f'id={match["entity_id"]} name="{match["display_name"]}" score={match["score"]}'
+            if match.get("username"):
+                line += f' @{match["username"]}'
+            if match.get("entity_type"):
+                line += f' [{match["entity_type"]}]'
+            match_lines.append(line)
+        return [TextContent(type="text", text=f'Ambiguous "{args.dialog}". Matches:\n' + "\n".join(match_lines))]
     entity_id: int = result.entity_id
     resolve_prefix = (
         f'[resolved: "{args.dialog}" → {result.display_name}]\n'
@@ -209,12 +219,19 @@ async def list_messages(
 
     # Step 3 — Sender filter (resolve before opening client)
     if args.sender:
-        sender_result = resolve(args.sender, cache.all_names_with_ttl(USER_TTL, GROUP_TTL))
+        sender_result = resolve(args.sender, cache.all_names_with_ttl(USER_TTL, GROUP_TTL), cache)
         if isinstance(sender_result, NotFound):
             return [TextContent(type="text", text=f'Sender not found: "{args.sender}"')]
         if isinstance(sender_result, Candidates):
-            names = ", ".join(f'"{m[0]}"' for m in sender_result.matches[:5])
-            return [TextContent(type="text", text=f'Ambiguous sender "{args.sender}". Matches: {names}')]
+            match_lines = []
+            for match in sender_result.matches:
+                line = f'id={match["entity_id"]} name="{match["display_name"]}" score={match["score"]}'
+                if match.get("username"):
+                    line += f' @{match["username"]}'
+                if match.get("entity_type"):
+                    line += f' [{match["entity_type"]}]'
+                match_lines.append(line)
+            return [TextContent(type="text", text=f'Ambiguous sender "{args.sender}". Matches:\n' + "\n".join(match_lines))]
         iter_kwargs["from_user"] = sender_result.entity_id
 
     # Step 4 — Unread filter + message fetch + format + cursor
@@ -308,6 +325,9 @@ class SearchMessages(ToolArgs):
     Search messages in a dialog by text query. Returns matching messages newest to oldest.
 
     Use offset= with the next_offset value from a previous response to get the next page.
+
+    If response is ambiguous, use the numeric ID from the matches list to disambiguate.
+    For @username lookups, prepend @ to the dialog name: dialog="@channel_name".
     """
 
     dialog: str
@@ -324,12 +344,19 @@ async def search_messages(
 
     # Step 1: Resolve dialog name
     cache = get_entity_cache()
-    result = resolve(args.dialog, cache.all_names_with_ttl(USER_TTL, GROUP_TTL))
+    result = resolve(args.dialog, cache.all_names_with_ttl(USER_TTL, GROUP_TTL), cache)
     if isinstance(result, NotFound):
         return [TextContent(type="text", text=f'Dialog not found: "{args.dialog}"')]
     if isinstance(result, Candidates):
-        names = ", ".join(f'"{m[0]}"' for m in result.matches[:5])
-        return [TextContent(type="text", text=f'Ambiguous dialog "{args.dialog}". Matches: {names}')]
+        match_lines = []
+        for match in result.matches:
+            line = f'id={match["entity_id"]} name="{match["display_name"]}" score={match["score"]}'
+            if match.get("username"):
+                line += f' @{match["username"]}'
+            if match.get("entity_type"):
+                line += f' [{match["entity_type"]}]'
+            match_lines.append(line)
+        return [TextContent(type="text", text=f'Ambiguous "{args.dialog}". Matches:\n' + "\n".join(match_lines))]
     entity_id: int = result.entity_id
     resolve_prefix = (
         f'[resolved: "{args.dialog}" → {result.display_name}]\n'
@@ -493,12 +520,19 @@ class GetUserInfo(ToolArgs):
 async def get_user_info(args: GetUserInfo) -> t.Sequence[TextContent | ImageContent | EmbeddedResource]:
     logger.info("method[GetUserInfo] args[%s]", args)
     cache = get_entity_cache()
-    result = resolve(args.user, cache.all_names_with_ttl(USER_TTL, GROUP_TTL))
+    result = resolve(args.user, cache.all_names_with_ttl(USER_TTL, GROUP_TTL), cache)
     if isinstance(result, NotFound):
         return [TextContent(type="text", text=f'User not found: "{args.user}"')]
     if isinstance(result, Candidates):
-        names = ", ".join(f'"{m[0]}"' for m in result.matches[:5])
-        return [TextContent(type="text", text=f'Ambiguous user "{args.user}". Matches: {names}')]
+        match_lines = []
+        for match in result.matches:
+            line = f'id={match["entity_id"]} name="{match["display_name"]}" score={match["score"]}'
+            if match.get("username"):
+                line += f' @{match["username"]}'
+            if match.get("entity_type"):
+                line += f' [{match["entity_type"]}]'
+            match_lines.append(line)
+        return [TextContent(type="text", text=f'Ambiguous user "{args.user}". Matches:\n' + "\n".join(match_lines))]
     entity_id: int = result.entity_id
     display_name: str = result.display_name
 
