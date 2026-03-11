@@ -17,6 +17,8 @@ from mcp.types import (
 from pydantic import BaseModel, ConfigDict
 from telethon import TelegramClient, custom, functions, types  # type: ignore[import-untyped]
 from telethon.tl.functions.messages import GetCommonChatsRequest, GetPeerDialogsRequest
+from telethon.tl.types import Channel, Chat
+from telethon.utils import get_peer_id
 from xdg_base_dirs import xdg_state_home
 
 from .cache import EntityCache
@@ -311,15 +313,15 @@ async def search_messages(
 ### GetMe ###
 
 
-class GetMe(ToolArgs):
+class GetMyAccount(ToolArgs):
     """Return own account info: numeric id, display name, and username. No arguments required."""
 
     pass
 
 
 @tool_runner.register
-async def get_me(args: GetMe) -> t.Sequence[TextContent | ImageContent | EmbeddedResource]:
-    logger.info("method[GetMe] args[%s]", args)
+async def get_my_account(args: GetMyAccount) -> t.Sequence[TextContent | ImageContent | EmbeddedResource]:
+    logger.info("method[GetMyAccount] args[%s]", args)
     async with connected_client() as client:
         me = await client.get_me()
     if me is None:
@@ -377,7 +379,14 @@ async def get_user_info(args: GetUserInfo) -> t.Sequence[TextContent | ImageCont
     chat_lines = []
     for chat in common_result.chats:
         chat_name = getattr(chat, "title", None) or getattr(chat, "first_name", str(chat.id))
-        chat_lines.append(f"  id={chat.id} name='{chat_name}'")
+        full_id = get_peer_id(chat)
+        if isinstance(chat, Channel):
+            ctype = "supergroup" if getattr(chat, "megagroup", False) else "channel"
+        elif isinstance(chat, Chat):
+            ctype = "group"
+        else:
+            ctype = "user"
+        chat_lines.append(f"  id={full_id} type={ctype} name='{chat_name}'")
     chats_text = "\n".join(chat_lines) if chat_lines else "  (none)"
     text = (
         f'[resolved: "{display_name}"]\n'

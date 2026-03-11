@@ -274,17 +274,17 @@ def test_get_message_removed():
     assert not hasattr(tools_module, "GetMessage"), "GetMessage should be removed from tools.py"
 
 
-# --- TOOL-08: GetMe ---
+# --- TOOL-08: GetMyAccount ---
 
 
 async def test_get_me(mock_client, monkeypatch):
-    """GetMe returns text containing id, first_name, and @username of current account."""
-    from mcp_telegram.tools import GetMe, get_me
+    """GetMyAccount returns text containing id, first_name, and @username of current account."""
+    from mcp_telegram.tools import GetMyAccount, get_my_account
     mock_client.get_me = AsyncMock(
         return_value=MagicMock(id=999, first_name="Test", last_name=None, username="testuser")
     )
     monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    result = await get_me(GetMe())
+    result = await get_my_account(GetMyAccount())
     assert len(result) == 1
     text = result[0].text
     assert "id=999" in text
@@ -293,11 +293,11 @@ async def test_get_me(mock_client, monkeypatch):
 
 
 async def test_get_me_unauthenticated(mock_client, monkeypatch):
-    """GetMe returns 'not authenticated' message when client.get_me() returns None."""
-    from mcp_telegram.tools import GetMe, get_me
+    """GetMyAccount returns 'not authenticated' message when client.get_me() returns None."""
+    from mcp_telegram.tools import GetMyAccount, get_my_account
     mock_client.get_me = AsyncMock(return_value=None)
     monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    result = await get_me(GetMe())
+    result = await get_my_account(GetMyAccount())
     assert len(result) == 1
     text = result[0].text.lower()
     assert "not authenticated" in text or "not logged in" in text
@@ -317,12 +317,14 @@ async def test_get_user_info(mock_cache, mock_client, monkeypatch):
     mock_client.return_value = fake_result
     monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
     monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    monkeypatch.setattr("mcp_telegram.tools.get_peer_id", lambda chat: -1000000000500)
     result = await get_user_info(GetUserInfo(user="Иван Петров"))
     assert len(result) == 1
     text = result[0].text
     assert "id=101" in text
     assert "Иван Петров" in text
     assert "Shared Group" in text
+    assert "-1000000000500" in text
 
 
 async def test_get_user_info_not_found(mock_cache, mock_client, monkeypatch):
@@ -360,6 +362,7 @@ async def test_get_user_info_resolver_prefix(mock_cache, mock_client, monkeypatc
     mock_client.return_value = fake_result
     monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
     monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    monkeypatch.setattr("mcp_telegram.tools.get_peer_id", lambda chat: -1000000000500)
     result = await get_user_info(GetUserInfo(user="Иван Петров"))
     assert len(result) == 1
     first_line = result[0].text.splitlines()[0]
