@@ -295,7 +295,7 @@ async def test_search_messages_reaction_names_fetched(mock_cache, mock_client, m
 
     await search_messages(SearchMessages(dialog="Иван Петров", query="reacted"))
     # GetMessageReactionsListRequest was invoked via client(...)
-    mock_client.__call__.assert_called()
+    mock_client.assert_called()
 
 
 # --- TOOL-07: SearchMessages offset pagination ---

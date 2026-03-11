@@ -27,12 +27,14 @@ app = Server("mcp-telegram")
 
 
 @cache
-def enumerate_available_tools() -> t.Generator[tuple[str, Tool], t.Any, None]:
+def enumerate_available_tools() -> list[tuple[str, Tool]]:
+    tools_list = []
     for _, tool_args in inspect.getmembers(tools, inspect.isclass):
         if issubclass(tool_args, tools.ToolArgs) and tool_args != tools.ToolArgs:
             logger.debug("Found tool: %s", tool_args)
             description = tools.tool_description(tool_args)
-            yield description.name, description
+            tools_list.append((description.name, description))
+    return tools_list
 
 
 mapping: dict[str, Tool] = dict(enumerate_available_tools())
@@ -63,7 +65,7 @@ async def list_resource_templates() -> list[ResourceTemplate]:
 
 
 @app.progress_notification()
-async def progress_notification(pogress: str | int, p: float, s: float | None) -> None:
+async def progress_notification(progress: str | int, p: float, s: float | None) -> None:
     """Progress notification."""
 
 

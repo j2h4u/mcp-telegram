@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import json
 
 
@@ -15,7 +16,10 @@ def decode_cursor(token: str, expected_dialog_id: int) -> int:
 
     Raises ValueError if the token's dialog_id does not match expected_dialog_id.
     """
-    data = json.loads(base64.urlsafe_b64decode(token.encode()))
+    try:
+        data = json.loads(base64.urlsafe_b64decode(token.encode()))
+    except (json.JSONDecodeError, ValueError, binascii.Error) as e:
+        raise ValueError(f"Invalid cursor token: {e}") from e
     if data["dialog_id"] != expected_dialog_id:
         msg = f"Cursor belongs to dialog {data['dialog_id']}, not {expected_dialog_id}"
         raise ValueError(msg)
