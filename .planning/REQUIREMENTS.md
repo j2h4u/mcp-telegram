@@ -22,7 +22,7 @@
 - [x] **TOOL-03**: `ListMessages` uses cursor-based pagination (opaque tokens, stable under concurrent message arrival)
 - [x] **TOOL-04**: `ListMessages` accepts optional `sender` name filter
 - [x] **TOOL-05**: `ListMessages` accepts optional `unread` filter
-- [x] **TOOL-06**: `SearchMessages` accepts dialog by name, returns each result with ±3 messages of surrounding context
+- [ ] **TOOL-06**: `SearchMessages` accepts dialog by name, returns each result with ±3 messages of surrounding context *(audit gap — Phase 4)*
 - [x] **TOOL-07**: `SearchMessages` uses offset-based pagination (`next_offset` absent when exhausted)
 - [x] **TOOL-08**: `GetMe` returns own name, id, and username
 - [x] **TOOL-09**: `GetUserInfo` returns target user's profile and list of common chats
@@ -61,14 +61,14 @@
 | RES-01 | Phase 1 | Complete |
 | RES-02 | Phase 1 | Complete |
 | FMT-01 | Phase 1 | Complete |
-| CACH-01 | Phase 1 | Complete |
-| CACH-02 | Phase 1 | Complete |
+| CACH-01 | Phase 1 / Phase 5 (TTL enforcement) | Partial |
+| CACH-02 | Phase 1 / Phase 5 (search upsert) | Partial |
 | TOOL-01 | Phase 2 | Complete |
 | TOOL-02 | Phase 2 | Complete |
-| TOOL-03 | Phase 2 | Complete |
+| TOOL-03 | Phase 2 / Phase 5 (error hardening) | Partial |
 | TOOL-04 | Phase 2 | Complete |
 | TOOL-05 | Phase 2 | Complete |
-| TOOL-06 | Phase 2 | Complete |
+| TOOL-06 | Phase 4 (gap closure) | Pending |
 | TOOL-07 | Phase 2 | Complete |
 | CLNP-01 | Phase 2 | Complete |
 | CLNP-02 | Phase 2 | Complete |
@@ -77,9 +77,9 @@
 
 **Coverage:**
 - v1.0 requirements: 16 total
-- Mapped to phases: 16
-- Unmapped: 0
+- Fully satisfied: 13
+- Pending gap closure (Phases 4–5): 3 (TOOL-06, CACH-01/02, TOOL-03)
 
 ---
 *Requirements defined: 2026-03-11*
-*Last updated: 2026-03-11 — traceability filled after roadmap creation*
+*Last updated: 2026-03-11 — TOOL-06 reset to pending; Phases 4–5 added to close audit gaps*

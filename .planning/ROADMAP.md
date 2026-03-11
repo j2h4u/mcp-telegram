@@ -8,6 +8,10 @@ cache — all testable in isolation. Phase 2 wires those modules into the existi
 retiring ID-based interfaces and deprecated endpoints. Phase 3 adds two new tools that
 fit the existing singledispatch pattern without touching anything else.
 
+Phases 4–5 close gaps identified by the v1.0 milestone audit: TOOL-06 (SearchMessages
+context window was never implemented) and tech debt in cache TTL, search entity upsert,
+and error handling.
+
 ## Phases
 
 **Phase Numbering:**
@@ -19,6 +23,8 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 1: Support Modules** - Build resolver, formatter, pagination, and entity cache — the tested foundation everything else depends on (completed 2026-03-10)
 - [x] **Phase 2: Tool Updates** - Wire support modules into existing tools; retire deprecated GetDialog and GetMessage (completed 2026-03-10)
 - [x] **Phase 3: New Tools** - Add GetMe and GetUserInfo using the now battle-tested resolver (completed 2026-03-10)
+- [ ] **Phase 4: SearchMessages Context Window** - Implement ±3 context messages per search hit (closes TOOL-06 audit gap)
+- [ ] **Phase 5: Cache & Error Hardening** - Enforce entity cache TTL, add search entity upsert, harden cursor error handling (tech debt)
 
 ## Phase Details
 
@@ -71,6 +77,37 @@ Plans:
 - [x] 03-01-PLAN.md — Test stubs (TDD Wave 0): 6 failing tests for GetMe and GetUserInfo (TOOL-08, TOOL-09)
 - [x] 03-02-PLAN.md — Implement GetMe and GetUserInfo in tools.py (TOOL-08, TOOL-09)
 
+### Phase 4: SearchMessages Context Window
+**Goal**: SearchMessages returns each hit surrounded by ±3 context messages, satisfying TOOL-06 as specified
+**Depends on**: Phase 3
+**Requirements**: TOOL-06
+**Gap Closure**: Closes TOOL-06 gap from v1.0 milestone audit — context window was never implemented despite Phase 2 SUMMARY claiming otherwise
+**Success Criteria** (what must be TRUE):
+  1. `SearchMessages` with a query returns each matched message surrounded by up to 3 messages before and after it (±3 context window)
+  2. Context messages are visually distinguishable from hit messages (e.g. hit lines prefixed or grouped)
+  3. Reaction names are passed to `format_messages` for search results (same as ListMessages)
+  4. All 42 existing tests remain green; new tests cover context window behaviour
+**Plans**: 2 plans
+
+Plans:
+- [ ] 04-01-PLAN.md — Test stubs (TDD Wave 0): failing tests asserting ±3 context in SearchMessages output (TOOL-06)
+- [ ] 04-02-PLAN.md — Implement context window fetch in search_messages; pass reaction_names_map (TOOL-06)
+
+### Phase 5: Cache & Error Hardening
+**Goal**: Entity cache respects TTL, search results populate the cache, cursor errors return friendly messages
+**Depends on**: Phase 4
+**Requirements**: CACH-01, CACH-02, TOOL-03
+**Gap Closure**: Tech debt identified in v1.0 audit — non-blocking but degrades correctness over time
+**Success Criteria** (what must be TRUE):
+  1. `EntityCache.get()` is called during resolution with correct TTL per entity type; stale entries are not returned
+  2. `search_messages` upserts sender entities into the cache after a search
+  3. `ListMessages` with an invalid cursor returns a user-readable error instead of a generic RuntimeError
+**Plans**: 2 plans
+
+Plans:
+- [ ] 05-01-PLAN.md — Test stubs (TDD Wave 0): failing tests for TTL eviction, search upsert, cursor error message (CACH-01, CACH-02, TOOL-03)
+- [ ] 05-02-PLAN.md — Implement TTL enforcement, search entity upsert, cursor error handling (CACH-01, CACH-02, TOOL-03)
+
 ## Progress
 
 **Execution Order:**
@@ -81,3 +118,5 @@ Phases execute in numeric order: 1 → 2 → 3
 | 1. Support Modules | 4/4 | Complete   | 2026-03-10 |
 | 2. Tool Updates | 4/4 | Complete   | 2026-03-10 |
 | 3. New Tools | 2/2 | Complete   | 2026-03-10 |
+| 4. SearchMessages Context Window | 0/2 | Not started | - |
+| 5. Cache & Error Hardening | 0/2 | Not started | - |
