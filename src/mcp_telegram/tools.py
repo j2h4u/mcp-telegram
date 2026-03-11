@@ -25,7 +25,7 @@ from telethon.tl.types import Channel, Chat
 from telethon.utils import get_peer_id
 from xdg_base_dirs import xdg_state_home
 
-from .cache import EntityCache
+from .cache import EntityCache, GROUP_TTL, USER_TTL
 from .formatter import format_messages
 from .pagination import decode_cursor, encode_cursor
 from .resolver import Candidates, NotFound, resolve
@@ -182,7 +182,7 @@ async def list_messages(
 
     # Step 1 — Resolve dialog name
     cache = get_entity_cache()
-    result = resolve(args.dialog, cache.all_names())
+    result = resolve(args.dialog, cache.all_names_with_ttl(USER_TTL, GROUP_TTL))
     if isinstance(result, NotFound):
         return [TextContent(type="text", text=f'Dialog not found: "{args.dialog}"')]
     if isinstance(result, Candidates):
@@ -202,11 +202,14 @@ async def list_messages(
         "reverse": False,
     }
     if args.cursor:
-        iter_kwargs["max_id"] = decode_cursor(args.cursor, entity_id)
+        try:
+            iter_kwargs["max_id"] = decode_cursor(args.cursor, entity_id)
+        except Exception as exc:
+            return [TextContent(type="text", text=f"Invalid cursor: {exc}")]
 
     # Step 3 — Sender filter (resolve before opening client)
     if args.sender:
-        sender_result = resolve(args.sender, cache.all_names())
+        sender_result = resolve(args.sender, cache.all_names_with_ttl(USER_TTL, GROUP_TTL))
         if isinstance(sender_result, NotFound):
             return [TextContent(type="text", text=f'Sender not found: "{args.sender}"')]
         if isinstance(sender_result, Candidates):
@@ -321,7 +324,7 @@ async def search_messages(
 
     # Step 1: Resolve dialog name
     cache = get_entity_cache()
-    result = resolve(args.dialog, cache.all_names())
+    result = resolve(args.dialog, cache.all_names_with_ttl(USER_TTL, GROUP_TTL))
     if isinstance(result, NotFound):
         return [TextContent(type="text", text=f'Dialog not found: "{args.dialog}"')]
     if isinstance(result, Candidates):
@@ -346,6 +349,22 @@ async def search_messages(
                 add_offset=page_offset,
             )
         ]
+
+        # Lazy cache population: upsert sender entities from hit messages
+        for msg in hits:
+            sender = getattr(msg, "sender", None)
+            if sender is not None:
+                sender_name = " ".join(
+                    filter(None, [
+                        getattr(sender, "first_name", None),
+                        getattr(sender, "last_name", None),
+                    ])
+                ) or getattr(sender, "title", "") or str(msg.sender_id)
+                sender_type = "user" if getattr(sender, "first_name", None) else "group"
+                cache.upsert(
+                    msg.sender_id, sender_type, sender_name,
+                    getattr(sender, "username", None)
+                )
 
         # Step 2: Fetch context messages (±3 around each hit, excluding hit IDs)
         hit_ids = {h.id for h in hits}
@@ -474,7 +493,7 @@ class GetUserInfo(ToolArgs):
 async def get_user_info(args: GetUserInfo) -> t.Sequence[TextContent | ImageContent | EmbeddedResource]:
     logger.info("method[GetUserInfo] args[%s]", args)
     cache = get_entity_cache()
-    result = resolve(args.user, cache.all_names())
+    result = resolve(args.user, cache.all_names_with_ttl(USER_TTL, GROUP_TTL))
     if isinstance(result, NotFound):
         return [TextContent(type="text", text=f'User not found: "{args.user}"')]
     if isinstance(result, Candidates):
