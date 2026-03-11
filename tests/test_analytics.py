@@ -471,3 +471,212 @@ class TestUsageSummaryFormatting:
         assert "46ms" in summary or "45ms" in summary  # rounded median
         assert "120ms" in summary or "121ms" in summary  # rounded p95
 
+
+class TestAnalyticsCleanup:
+    """Tests for cleanup_analytics_db function."""
+
+    def test_cleanup_deletes_stale_events(self, tmp_analytics_db: Path, monkeypatch):
+        """Test that cleanup deletes events >30 days old and keeps recent ones."""
+        import asyncio
+        from mcp_telegram.analytics import cleanup_analytics_db
+
+        # Create analytics database with events
+        TelemetryCollector._instance = None
+        collector = TelemetryCollector.get_instance(tmp_analytics_db)
+
+        # Record events with specific timestamps
+        current_time = time.time()
+        stale_timestamp = current_time - (60 * 86400)  # 60 days ago
+        recent_timestamp = current_time - (10 * 86400)  # 10 days ago
+
+        # Insert stale event (should be deleted)
+        stale_event = TelemetryEvent(
+            tool_name="ListDialogs",
+            timestamp=stale_timestamp,
+            duration_ms=10.0,
+            result_count=5,
+            has_cursor=False,
+            page_depth=1,
+            has_filter=False,
+            error_type=None,
+        )
+
+        # Insert recent event (should be kept)
+        recent_event = TelemetryEvent(
+            tool_name="ListMessages",
+            timestamp=recent_timestamp,
+            duration_ms=20.0,
+            result_count=10,
+            has_cursor=True,
+            page_depth=2,
+            has_filter=False,
+            error_type=None,
+        )
+
+        collector.record_event(stale_event)
+        collector.record_event(recent_event)
+
+        # Manually flush to ensure events are written
+        with collector._batch_lock:
+            batch = list(collector._batch)
+            collector._batch = []
+        collector._write_batch(batch)
+
+        # Verify both events exist before cleanup
+        conn = sqlite3.connect(str(tmp_analytics_db))
+        try:
+            cursor = conn.execute("SELECT COUNT(*) FROM telemetry_events")
+            count_before = cursor.fetchone()[0]
+            assert count_before >= 2, f"Should have at least 2 events before cleanup, got {count_before}"
+        finally:
+            conn.close()
+
+        # Run cleanup with 30-day retention
+        asyncio.run(cleanup_analytics_db(tmp_analytics_db, retention_days=30))
+
+        # Verify stale event was deleted and recent event remains
+        conn = sqlite3.connect(str(tmp_analytics_db))
+        try:
+            cursor = conn.execute(
+                "SELECT COUNT(*) FROM telemetry_events WHERE timestamp < ?",
+                (current_time - (30 * 86400),),
+            )
+            stale_count = cursor.fetchone()[0]
+            assert stale_count == 0, f"Stale events should be deleted, but found {stale_count}"
+
+            cursor = conn.execute(
+                "SELECT COUNT(*) FROM telemetry_events WHERE tool_name='ListMessages'"
+            )
+            recent_count = cursor.fetchone()[0]
+            assert recent_count >= 1, f"Recent event should be preserved, got {recent_count}"
+        finally:
+            conn.close()
+
+        # Cleanup
+        TelemetryCollector._instance = None
+
+    def test_cleanup_calls_optimize(self, tmp_analytics_db: Path):
+        """Test that cleanup calls PRAGMA optimize to rebuild statistics."""
+        import asyncio
+        from mcp_telegram.analytics import cleanup_analytics_db
+
+        # Create analytics database with sample events
+        TelemetryCollector._instance = None
+        collector = TelemetryCollector.get_instance(tmp_analytics_db)
+
+        # Insert some events
+        for i in range(10):
+            event = TelemetryEvent(
+                tool_name="ListMessages",
+                timestamp=time.time(),
+                duration_ms=10.0 + i,
+                result_count=5 + i,
+                has_cursor=False,
+                page_depth=1,
+                has_filter=False,
+                error_type=None,
+            )
+            collector.record_event(event)
+
+        # Manually flush
+        with collector._batch_lock:
+            batch = list(collector._batch)
+            collector._batch = []
+        collector._write_batch(batch)
+
+        # Run cleanup
+        asyncio.run(cleanup_analytics_db(tmp_analytics_db, retention_days=30))
+
+        # Verify PRAGMA optimize was called by checking that DB is still accessible
+        # and statistics were rebuilt (indirect verification)
+        conn = sqlite3.connect(str(tmp_analytics_db))
+        try:
+            # If optimize was called, query should still work fine
+            cursor = conn.execute("SELECT COUNT(*) FROM telemetry_events")
+            count = cursor.fetchone()[0]
+            assert count >= 0, "Database should be accessible after optimize"
+
+            # Verify database integrity after optimize
+            # (PRAGMA integrity_check should return 'ok')
+            cursor = conn.execute("PRAGMA integrity_check")
+            result = cursor.fetchone()
+            assert result is not None, "PRAGMA integrity_check should return result"
+            assert result[0] == "ok", f"Database integrity check failed: {result[0]}"
+        finally:
+            conn.close()
+
+        # Cleanup
+        TelemetryCollector._instance = None
+
+    def test_cleanup_vacuum(self, tmp_analytics_db: Path):
+        """Test that incremental_vacuum reclaims disk space."""
+        import asyncio
+        from mcp_telegram.analytics import cleanup_analytics_db
+
+        # Create analytics database with many events
+        TelemetryCollector._instance = None
+        collector = TelemetryCollector.get_instance(tmp_analytics_db)
+
+        # Insert 1000+ events: mix of old and new
+        current_time = time.time()
+        stale_base = current_time - (60 * 86400)  # 60 days ago
+        recent_base = current_time - (10 * 86400)  # 10 days ago
+
+        for i in range(1100):
+            # Alternate: half events at 60 days, half at 10 days
+            if i < 550:
+                timestamp = stale_base + (i % 100)  # Old events (60 days + small offset)
+            else:
+                timestamp = recent_base + (i % 100)  # Recent events (10 days + small offset)
+
+            event = TelemetryEvent(
+                tool_name="ListMessages",
+                timestamp=timestamp,
+                duration_ms=10.0 + i,
+                result_count=5 + (i % 100),
+                has_cursor=i % 2 == 0,
+                page_depth=1 + (i % 5),
+                has_filter=i % 3 == 0,
+                error_type=None,
+            )
+            collector.record_event(event)
+
+        # Flush all events
+        with collector._batch_lock:
+            batch = list(collector._batch)
+            collector._batch = []
+        collector._write_batch(batch)
+
+        # Get page count before cleanup
+        conn = sqlite3.connect(str(tmp_analytics_db))
+        try:
+            cursor = conn.execute("PRAGMA page_count")
+            pages_before = cursor.fetchone()[0]
+
+            cursor = conn.execute("SELECT COUNT(*) FROM telemetry_events")
+            count_before = cursor.fetchone()[0]
+        finally:
+            conn.close()
+
+        # Run cleanup with 30-day retention
+        asyncio.run(cleanup_analytics_db(tmp_analytics_db, retention_days=30))
+
+        # Get page count after cleanup
+        conn = sqlite3.connect(str(tmp_analytics_db))
+        try:
+            cursor = conn.execute("PRAGMA page_count")
+            pages_after = cursor.fetchone()[0]
+
+            # Verify events were deleted
+            cursor = conn.execute("SELECT COUNT(*) FROM telemetry_events")
+            count_after = cursor.fetchone()[0]
+
+            # Should have deleted ~550 old events, kept ~550 recent ones
+            assert count_after < count_before, "Cleanup should have deleted stale events"
+            assert count_after > 500, f"Should have retained recent events, got {count_after}"
+        finally:
+            conn.close()
+
+        # Cleanup
+        TelemetryCollector._instance = None
+

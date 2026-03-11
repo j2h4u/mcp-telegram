@@ -221,3 +221,73 @@ class TelemetryCollector:
                 if cls._instance is None:
                     cls._instance = cls(db_path)
         return cls._instance
+
+
+# Cleanup Strategy:
+# Daily cleanup via systemd timer (mcp-telegram-cleanup.timer) runs at 07:15 AM:
+# - Deletes telemetry events >30 days old
+# - Calls PRAGMA optimize to rebuild statistics
+# - Calls PRAGMA incremental_vacuum to reclaim disk space
+# See: /home/j2h4u/repos/j2h4u/mcp-telegram/systemd/mcp-telegram-cleanup.timer
+#
+# Async cleanup_analytics_db() ensures main service is not blocked during maintenance.
+# Incremental VACUUM is non-blocking; readers can access DB during cleanup.
+
+
+async def cleanup_analytics_db(db_path: Path, retention_days: int = 30) -> None:
+    """Delete stale telemetry events and optimize database (non-blocking).
+
+    Async wrapper that delegates to _sync_cleanup() on thread pool to avoid
+    blocking the event loop during database maintenance operations.
+
+    Args:
+        db_path: Path to analytics.db
+        retention_days: Delete events older than this many days (default 30)
+    """
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, _sync_cleanup, db_path, retention_days)
+
+
+def _sync_cleanup(db_path: Path, retention_days: int) -> None:
+    """Synchronous database cleanup (runs on thread pool).
+
+    Deletes telemetry events older than retention_days, rebuilds statistics
+    with PRAGMA optimize, and reclaims disk space with PRAGMA incremental_vacuum.
+
+    Args:
+        db_path: Path to analytics.db
+        retention_days: Delete events older than this many days
+    """
+    try:
+        # Calculate cutoff timestamp (seconds)
+        cutoff_timestamp = time.time() - (retention_days * 86400)
+
+        # Open connection to analytics.db
+        conn = sqlite3.connect(str(db_path))
+        try:
+            # Delete telemetry events older than retention period
+            cursor = conn.execute(
+                "DELETE FROM telemetry_events WHERE timestamp < ?",
+                (cutoff_timestamp,),
+            )
+            deleted_count = cursor.rowcount
+            conn.commit()
+
+            # Rebuild statistics for query planner (non-blocking on WAL)
+            conn.execute("PRAGMA optimize")
+            conn.commit()
+
+            # Reclaim disk space without blocking (incremental VACUUM)
+            conn.execute("PRAGMA incremental_vacuum(1000)")
+            conn.commit()
+
+            logger.info(
+                "Analytics cleanup: deleted %d events (>%d days), optimized, vacuumed",
+                deleted_count,
+                retention_days,
+            )
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.error("Failed to cleanup analytics.db: %s", e)
+        # Never raise — cleanup must not crash service
