@@ -823,3 +823,34 @@ async def test_get_usage_stats_empty_db(mock_cache, mock_client, monkeypatch, tm
         assert "Analytics database not yet created" in result[0].text or "No usage data" in result[0].text
     finally:
         mcp_telegram.tools.xdg_state_home = original_xdg
+
+
+# --- Wave 0 Test Stubs: Reverse Pagination (NAV-01) ---
+
+
+async def test_list_messages_from_beginning(mock_cache, mock_client, monkeypatch, make_mock_message):
+    """ListMessages accepts from_beginning=True parameter and uses reverse iteration.
+
+    Validates that the from_beginning parameter is recognized by ListMessages and
+    properly routed to iter_messages as reverse=True.
+    """
+    pytest.skip("Wave 1")
+
+
+async def test_list_messages_from_beginning_oldest_first(mock_cache, mock_client, monkeypatch, make_mock_message):
+    """from_beginning=True with multiple messages displays oldest first.
+
+    Verifies that when from_beginning=True, the output shows messages in chronological
+    order (oldest first) rather than reverse chronological order.
+    """
+    pytest.skip("Wave 1")
+
+
+async def test_list_messages_reverse_pagination_cursor(mock_cache, mock_client, monkeypatch, make_mock_message):
+    """Cursor pagination works correctly with from_beginning=True (reverse iteration).
+
+    Confirms that cursor-based pagination functions bidirectionally: when using
+    from_beginning=True, the next_cursor from page 1 can be used with from_beginning=True
+    on page 2 to continue iteration using min_id instead of max_id.
+    """
+    pytest.skip("Wave 1")
