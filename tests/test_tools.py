@@ -450,3 +450,64 @@ async def test_get_user_info_resolver_prefix(mock_cache, mock_client, monkeypatc
     assert len(result) == 1
     first_line = result[0].text.splitlines()[0]
     assert first_line.startswith('[resolved: "Иван Петров"]')
+
+
+# --- Phase 5 stubs: CACH-01, CACH-02, TOOL-03 ---
+
+
+async def test_list_messages_stale_entity_excluded(mock_cache, mock_client, monkeypatch):
+    """tools.py uses all_names_with_ttl (TTL-filtered) instead of all_names for resolver."""
+    from mcp_telegram.tools import ListMessages, list_messages
+
+    all_names_ttl_mock = MagicMock(return_value={})
+    monkeypatch.setattr(mock_cache, "all_names_with_ttl", all_names_ttl_mock)
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+
+    result = await list_messages(ListMessages(dialog="Unknown"))
+    assert all_names_ttl_mock.called, "tools.py must call all_names_with_ttl for name resolution"
+    assert len(result) == 1
+    assert "not found" in result[0].text.lower()
+
+
+async def test_search_messages_upserts_sender(mock_cache, mock_client, monkeypatch, make_mock_message):
+    """search_messages calls cache.upsert for sender of each hit message."""
+    from mcp_telegram.tools import SearchMessages, search_messages
+
+    hit_msg = MagicMock()
+    hit_msg.id = 50
+    hit_msg.sender_id = 999
+    hit_msg.sender = MagicMock(first_name="Alice", last_name=None, username=None)
+    hit_msg.message = "hi"
+    hit_msg.reactions = None
+    hit_msg.media = None
+    hit_msg.reply_to = None
+    hit_msg.date = datetime(2024, 1, 15, 10, 0, 0, tzinfo=timezone.utc)
+
+    async def _fake_iter_messages(entity, **kwargs):
+        yield hit_msg
+
+    mock_client.iter_messages = _fake_iter_messages
+    mock_client.get_messages = AsyncMock(return_value=[])
+
+    upsert_spy = MagicMock(wraps=mock_cache.upsert)
+    monkeypatch.setattr(mock_cache, "upsert", upsert_spy)
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+
+    await search_messages(SearchMessages(dialog="Иван Петров", query="hi"))
+
+    sender_calls = [c for c in upsert_spy.call_args_list if c.args[0] == 999]
+    assert sender_calls, "cache.upsert must be called with sender_id=999 for the hit message"
+
+
+async def test_list_messages_invalid_cursor_returns_error(mock_cache, mock_client, monkeypatch):
+    """list_messages with a malformed cursor returns a single TextContent starting with 'Invalid cursor:'."""
+    from mcp_telegram.tools import ListMessages, list_messages
+
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+
+    result = await list_messages(ListMessages(dialog="Иван Петров", cursor="BADINVALID==garbage"))
+    assert len(result) == 1
+    assert result[0].text.startswith("Invalid cursor:")
