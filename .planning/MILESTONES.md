@@ -22,3 +22,22 @@
 
 ---
 
+## v1.1 Observability & Completeness (Planning: 2026-03-12)
+
+**Target:** 5 phases, TBD plans
+
+**Planned phases:**
+- Phase 6: Telemetry Foundation — privacy-safe event logging with async queue, analytics.db, GetUsageStats tool
+- Phase 7: Cache Improvements & Optimization — SQLite indexes, cache invalidation policy, retention/cleanup
+- Phase 8: Navigation Features — ListMessages from_beginning parameter, archived dialog support in ListDialogs
+- Phase 9: Forum Topics Support — ListMessages topic filtering with edge-case handling
+- Phase 10: Tech Debt Cleanup — remove orphaned code, dead imports, fix timezone handling
+
+**Research confidence:** HIGH across all dimensions (stack validated, features well-scoped, architecture patterns established, pitfalls enumerable)
+
+**Critical constraints:**
+- analytics.db MUST be separate from entity_cache.db (write contention mitigation)
+- Telemetry must use async queue (fire-and-forget, never blocks tool execution)
+- Privacy-first design required (zero PII, bounds-based metrics, hourly batching, side-channel prevention)
+- Dialog list never cached (fetch fresh on every ListDialogs call)
+- Entity metadata cached with long TTL (30d for users, 7d for groups/channels)
