@@ -35,9 +35,20 @@ boilerplate before every real task.
 - ✓ Remove `GetDialog` tool (no stubs) — v1.0
 - ✓ Remove `GetMessage` tool (no stubs) — v1.0
 
+## Current Milestone: v1.1 Observability & Completeness
+
+**Goal:** Add privacy-safe usage telemetry queryable by LLMs, improve cache efficiency, and complete missing navigation/topic features.
+
+**Target features:**
+- Usage telemetry module (SQLite, behavioral events only, zero PII) + `GetUsageStats` tool
+- Cache improvements: SQLite indexes, dialog list cache, reaction cache, VACUUM strategy
+- `ListMessages` navigation: `from_beginning=true` parameter (jump to oldest messages)
+- Forum topics support in `ListMessages` (filter by topic, show topic name)
+- Resolve open research flags: Pydantic str|int union compatibility, transliteration need
+
 ### Active
 
-*(None — v1.0 shipped complete. Next milestone requirements TBD via `/gsd:new-milestone`.)*
+*(v1.1 requirements — see REQUIREMENTS.md)*
 
 ### Out of Scope
 
@@ -87,4 +98,4 @@ Tech stack: Python 3.13, Telethon, MCP SDK, Pydantic v2, rapidfuzz, SQLite (WAL)
 - **Read-only**: Permanent constraint — write tools expand prompt injection blast radius dramatically
 
 ---
-*Last updated: 2026-03-11 after v1.0 milestone*
+*Last updated: 2026-03-12 after v1.1 milestone started*
