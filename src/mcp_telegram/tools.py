@@ -113,6 +113,16 @@ def get_entity_cache() -> EntityCache:
     return EntityCache(db_path)
 
 
+def _get_sender_type(sender: t.Any) -> str:
+    """Determine sender type from Telethon entity instance."""
+    if isinstance(sender, Channel):
+        return "channel"
+    elif isinstance(sender, Chat):
+        return "group"
+    else:
+        return "user"
+
+
 ### ListDialogs ###
 
 
@@ -254,7 +264,7 @@ async def list_messages(
                         getattr(sender, "last_name", None),
                     ])
                 ) or getattr(sender, "title", "") or str(msg.sender_id)
-                sender_type = "user" if getattr(sender, "first_name", None) else "group"
+                sender_type = _get_sender_type(sender)
                 cache.upsert(
                     msg.sender_id, sender_type, sender_name,
                     getattr(sender, "username", None)
@@ -387,7 +397,7 @@ async def search_messages(
                         getattr(sender, "last_name", None),
                     ])
                 ) or getattr(sender, "title", "") or str(msg.sender_id)
-                sender_type = "user" if getattr(sender, "first_name", None) else "group"
+                sender_type = _get_sender_type(sender)
                 cache.upsert(
                     msg.sender_id, sender_type, sender_name,
                     getattr(sender, "username", None)
@@ -419,7 +429,7 @@ async def search_messages(
             if total == 0 or total > REACTION_NAMES_THRESHOLD:
                 continue
             try:
-                rl = await client.__call__(GetMessageReactionsListRequest(
+                rl = await client(GetMessageReactionsListRequest(
                     peer=entity_id,
                     id=msg.id,
                     limit=100,

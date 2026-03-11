@@ -54,11 +54,11 @@ class EntityCache:
         ).fetchone()
         if row is None:
             return None
-        entity_id_db, entity_type, name, username, updated_at = row
+        _, entity_type, name, username, updated_at = row
         if int(time.time()) - updated_at > ttl_seconds:
             return None
         return {
-            "id": entity_id_db,
+            "id": entity_id,
             "type": entity_type,
             "name": name,
             "username": username,
