@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 03-new-tools-02-PLAN.md
-last_updated: "2026-03-10T23:44:31.934Z"
+stopped_at: Completed 04-search-context-window-01-PLAN.md
+last_updated: "2026-03-11T12:31:45.704Z"
 last_activity: 2026-03-10
 progress:
-  total_phases: 3
+  total_phases: 5
   completed_phases: 3
-  total_plans: 10
-  completed_plans: 10
+  total_plans: 12
+  completed_plans: 11
   percent: 42
 ---
 
@@ -55,6 +55,7 @@ Progress: [████░░░░░░] 42%
 | Phase 02-tool-updates P03 | 10 | 2 tasks | 2 files |
 | Phase 02-tool-updates P04 | 2 | 2 tasks | 3 files |
 | Phase 03-new-tools P02 | 5min | 1 task | 1 file |
+| Phase 04-search-context-window P01 | 5min | 1 tasks | 1 files |
 
 ## Accumulated Context
 
@@ -88,6 +89,8 @@ Recent decisions affecting current work:
 - [Phase 02-tool-updates]: make_mock_message fixture sets msg.message=text: formatter reads .message (Telethon attr), not .text
 - [Phase 03-new-tools]: Per-test assignment of mock_client.get_me and get_entity (not in conftest) to avoid coupling GetMe/GetUserInfo tests
 - [Phase 03-new-tools]: mock_client.return_value used for GetCommonChatsRequest stub — consistent with Phase 02 unread-filter pattern
+- [Phase 04-search-context-window]: Hit marker assertion uses [HIT]/>>>/=== HIT === (not date separator ---) to avoid false-green against current formatter output
+- [Phase 04-search-context-window]: test_search_messages_context updated with get_messages=AsyncMock(return_value=[]) before search_messages call so it does not crash when Wave 1 adds context fetch
 
 ### Pending Todos
 
@@ -100,6 +103,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-03-11T00:00:00Z
-Stopped at: Completed 03-new-tools-02-PLAN.md
+Last session: 2026-03-11T12:31:45.701Z
+Stopped at: Completed 04-search-context-window-01-PLAN.md
 Resume file: None

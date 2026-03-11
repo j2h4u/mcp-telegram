@@ -22,7 +22,7 @@
 - [x] **TOOL-03**: `ListMessages` uses cursor-based pagination (opaque tokens, stable under concurrent message arrival)
 - [x] **TOOL-04**: `ListMessages` accepts optional `sender` name filter
 - [x] **TOOL-05**: `ListMessages` accepts optional `unread` filter
-- [ ] **TOOL-06**: `SearchMessages` accepts dialog by name, returns each result with ±3 messages of surrounding context *(audit gap — Phase 4)*
+- [x] **TOOL-06**: `SearchMessages` accepts dialog by name, returns each result with ±3 messages of surrounding context *(audit gap — Phase 4)*
 - [x] **TOOL-07**: `SearchMessages` uses offset-based pagination (`next_offset` absent when exhausted)
 - [x] **TOOL-08**: `GetMe` returns own name, id, and username
 - [x] **TOOL-09**: `GetUserInfo` returns target user's profile and list of common chats
@@ -68,7 +68,7 @@
 | TOOL-03 | Phase 2 / Phase 5 (error hardening) | Partial |
 | TOOL-04 | Phase 2 | Complete |
 | TOOL-05 | Phase 2 | Complete |
-| TOOL-06 | Phase 4 (gap closure) | Pending |
+| TOOL-06 | Phase 4 (gap closure) | Complete |
 | TOOL-07 | Phase 2 | Complete |
 | CLNP-01 | Phase 2 | Complete |
 | CLNP-02 | Phase 2 | Complete |

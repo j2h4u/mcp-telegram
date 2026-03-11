@@ -90,7 +90,7 @@ Plans:
 **Plans**: 2 plans
 
 Plans:
-- [ ] 04-01-PLAN.md — Test stubs (TDD Wave 0): failing tests asserting ±3 context in SearchMessages output (TOOL-06)
+- [x] 04-01-PLAN.md — Test stubs (TDD Wave 0): failing tests asserting ±3 context in SearchMessages output (TOOL-06)
 - [ ] 04-02-PLAN.md — Implement context window fetch in search_messages; pass reaction_names_map (TOOL-06)
 
 ### Phase 5: Cache & Error Hardening
