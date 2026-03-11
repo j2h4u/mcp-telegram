@@ -211,3 +211,72 @@ def test_username_index_used(tmp_db_path: Path) -> None:
     assert "idx_entities_username" in explain_output or "SEARCH TABLE entities USING INDEX" in explain_output, (
         f"Expected index usage in username query plan, got:\n{explain_output}"
     )
+
+
+def test_reaction_metadata_cache(tmp_db_path: Path) -> None:
+    """Test basic reaction cache: upsert and get with correct data structure."""
+    cache = EntityCache(tmp_db_path)
+    reaction_cache = ReactionMetadataCache(cache._conn)
+
+    # Upsert reactions for message 100 in dialog 50
+    reactions = {
+        "👍": ["Alice", "Bob"],
+        "❤️": ["Charlie"],
+    }
+    reaction_cache.upsert(message_id=100, dialog_id=50, reactions_by_emoji=reactions)
+
+    # Retrieve and verify
+    result = reaction_cache.get(message_id=100, dialog_id=50, ttl_seconds=600)
+    assert result is not None
+    assert result == reactions
+    cache.close()
+
+
+def test_reaction_ttl_expiry(tmp_db_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test TTL expiry: stale cache returns None, fresh cache with longer TTL returns data."""
+    import mcp_telegram.cache as cache_module
+
+    cache = EntityCache(tmp_db_path)
+    reaction_cache = ReactionMetadataCache(cache._conn)
+
+    # Upsert reactions
+    reactions = {"👍": ["Alice", "Bob"]}
+    reaction_cache.upsert(message_id=100, dialog_id=50, reactions_by_emoji=reactions)
+
+    # Advance time by 700 seconds (beyond default 600s TTL)
+    original_time = time.time
+    monkeypatch.setattr(cache_module, "time", type("_T", (), {"time": staticmethod(lambda: original_time() + 700)})())
+
+    # Cache miss with 600s TTL (700s elapsed > 600s)
+    result = reaction_cache.get(message_id=100, dialog_id=50, ttl_seconds=600)
+    assert result is None
+
+    # Cache hit with 1000s TTL (700s elapsed < 1000s)
+    result = reaction_cache.get(message_id=100, dialog_id=50, ttl_seconds=1000)
+    assert result == reactions
+
+    cache.close()
+
+
+def test_reaction_cache_hit(tmp_db_path: Path) -> None:
+    """Test cache hit: multiple get() calls on same message return consistent data."""
+    cache = EntityCache(tmp_db_path)
+    reaction_cache = ReactionMetadataCache(cache._conn)
+
+    # Upsert reactions for two messages
+    reactions_100 = {"👍": ["Alice"]}
+    reactions_101 = {"❤️": ["Bob", "Charlie"]}
+
+    reaction_cache.upsert(message_id=100, dialog_id=50, reactions_by_emoji=reactions_100)
+    reaction_cache.upsert(message_id=101, dialog_id=50, reactions_by_emoji=reactions_101)
+
+    # Multiple gets on same messages should return same data (cache hits)
+    result_100_a = reaction_cache.get(message_id=100, dialog_id=50, ttl_seconds=600)
+    result_100_b = reaction_cache.get(message_id=100, dialog_id=50, ttl_seconds=600)
+    assert result_100_a == result_100_b == reactions_100
+
+    result_101_a = reaction_cache.get(message_id=101, dialog_id=50, ttl_seconds=600)
+    result_101_b = reaction_cache.get(message_id=101, dialog_id=50, ttl_seconds=600)
+    assert result_101_a == result_101_b == reactions_101
+
+    cache.close()
