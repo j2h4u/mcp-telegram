@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 05-cache-error-hardening-01-PLAN.md
-last_updated: "2026-03-11T14:16:53.756Z"
+stopped_at: Completed 05-cache-error-hardening-02-PLAN.md
+last_updated: "2026-03-11T14:20:01.325Z"
 last_activity: 2026-03-11
 progress:
   total_phases: 5
-  completed_phases: 4
+  completed_phases: 5
   total_plans: 14
-  completed_plans: 13
+  completed_plans: 14
   percent: 42
 ---
 
@@ -58,6 +58,7 @@ Progress: [████░░░░░░] 42%
 | Phase 04-search-context-window P01 | 5min | 1 tasks | 1 files |
 | Phase 04-search-context-window P02 | 5min | 1 tasks | 1 files |
 | Phase 05-cache-error-hardening P01 | 5min | 2 tasks | 2 files |
+| Phase 05-cache-error-hardening P02 | 5min | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -96,6 +97,8 @@ Recent decisions affecting current work:
 - [Phase 04-search-context-window]: Use client.__call__(...) instead of client(...) in search_messages reaction loop to match test assertion mock_client.__call__.assert_called()
 - [Phase 05-cache-error-hardening]: Stub stale-entity test uses instance-level monkeypatch on all_names_with_ttl to avoid class pollution
 - [Phase 05-cache-error-hardening]: Upsert spy uses MagicMock(wraps=mock_cache.upsert) to capture calls while delegating to real SQLite
+- [Phase 05-cache-error-hardening]: USER_TTL=2_592_000 and GROUP_TTL=604_800 exported as module-level constants — tools.py uses all_names_with_ttl instead of all_names for TTL-filtered resolution
+- [Phase 05-cache-error-hardening]: Cursor error handler uses bare Exception in list_messages to uniformly catch binascii.Error, json.JSONDecodeError and ValueError from decode_cursor
 
 ### Pending Todos
 
@@ -108,6 +111,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-03-11T14:16:53.753Z
-Stopped at: Completed 05-cache-error-hardening-01-PLAN.md
+Last session: 2026-03-11T14:20:01.321Z
+Stopped at: Completed 05-cache-error-hardening-02-PLAN.md
 Resume file: None
