@@ -55,7 +55,21 @@ def format_messages(
 
         sender_name = _resolve_sender_name(msg)
         text = _render_text(msg)
-        lines.append(f"{dt.strftime('%H:%M')} {sender_name}: {text}")
+        reactions_str = _format_reactions(msg)
+        if reactions_str:
+            text = f"{text} {reactions_str}" if text else reactions_str
+
+        reply_prefix = ""
+        reply_to = getattr(msg, "reply_to", None)
+        if reply_to:
+            reply_id = getattr(reply_to, "reply_to_msg_id", None)
+            if reply_id and reply_id in reply_map:
+                orig = reply_map[reply_id]
+                orig_sender = _resolve_sender_name(orig)
+                orig_dt = orig.date.astimezone(effective_tz)
+                reply_prefix = f"[↑ {orig_sender} {orig_dt.strftime('%H:%M')}] "
+
+        lines.append(f"{dt.strftime('%H:%M')} {sender_name}: {reply_prefix}{text}")
 
         prev_dt = dt
 
@@ -82,6 +96,21 @@ def _render_text(msg: object) -> str:
     if media is not None:
         return _describe_media(media)
     return ""
+
+
+def _format_reactions(msg: object) -> str:
+    """Return formatted reactions string like '[👍×3 ❤️]', or empty string if none."""
+    reactions = getattr(msg, "reactions", None)
+    if reactions is None:
+        return ""
+    results = getattr(reactions, "results", None) or []
+    parts: list[str] = []
+    for r in results:
+        reaction = getattr(r, "reaction", None)
+        count = getattr(r, "count", 0)
+        emoji = getattr(reaction, "emoticon", None) or str(reaction)
+        parts.append(f"{emoji}×{count}" if count > 1 else emoji)
+    return f"[{' '.join(parts)}]" if parts else ""
 
 
 def _describe_media(media: object) -> str:
