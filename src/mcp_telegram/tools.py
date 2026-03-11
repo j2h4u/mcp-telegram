@@ -16,7 +16,11 @@ from mcp.types import (
 )
 from pydantic import BaseModel, ConfigDict
 from telethon import TelegramClient, custom, functions, types  # type: ignore[import-untyped]
-from telethon.tl.functions.messages import GetCommonChatsRequest, GetPeerDialogsRequest
+from telethon.tl.functions.messages import (
+    GetCommonChatsRequest,
+    GetMessageReactionsListRequest,
+    GetPeerDialogsRequest,
+)
 from telethon.tl.types import Channel, Chat
 from telethon.utils import get_peer_id
 from xdg_base_dirs import xdg_state_home
@@ -26,6 +30,10 @@ from .formatter import format_messages
 from .pagination import decode_cursor, encode_cursor
 from .resolver import Candidates, NotFound, resolve
 from .telegram import create_client
+
+# Fetch reactor names only when total reactions per message are at or below this limit.
+# Covers personal chats (always ≤ a few) while skipping expensive lookups on busy groups.
+REACTION_NAMES_THRESHOLD = 15
 
 logger = logging.getLogger(__name__)
 
@@ -244,7 +252,41 @@ async def list_messages(
             replied_list = replied if isinstance(replied, list) else [replied]
             reply_map = {m.id: m for m in replied_list if m}
 
-    text = format_messages(messages, reply_map=reply_map)
+        # Build reaction_names_map: fetch reactor names for messages with few reactions
+        reaction_names_map: dict[int, dict[str, list[str]]] = {}
+        for msg in messages:
+            rxns = getattr(msg, "reactions", None)
+            if not rxns:
+                continue
+            results = getattr(rxns, "results", None) or []
+            total = sum(getattr(r, "count", 0) for r in results)
+            if total == 0 or total > REACTION_NAMES_THRESHOLD:
+                continue
+            try:
+                rl = await client(GetMessageReactionsListRequest(
+                    peer=entity_id,
+                    id=msg.id,
+                    limit=100,
+                ))
+                user_by_id = {u.id: u for u in (getattr(rl, "users", None) or [])}
+                by_emoji: dict[str, list[str]] = {}
+                for entry in (getattr(rl, "reactions", None) or []):
+                    emoji = getattr(getattr(entry, "reaction", None), "emoticon", None) or "?"
+                    uid = getattr(getattr(entry, "peer_id", None), "user_id", None)
+                    if uid and uid in user_by_id:
+                        u = user_by_id[uid]
+                        name = " ".join(filter(None, [
+                            getattr(u, "first_name", None),
+                            getattr(u, "last_name", None),
+                        ])) or str(uid)
+                        cache.upsert(u.id, "user", name, getattr(u, "username", None))
+                        by_emoji.setdefault(emoji, []).append(name)
+                if by_emoji:
+                    reaction_names_map[msg.id] = by_emoji
+            except Exception:
+                pass  # fallback to count-only
+
+    text = format_messages(messages, reply_map=reply_map, reaction_names_map=reaction_names_map)
     next_cursor: str | None = None
     if len(messages) == args.limit and messages:
         next_cursor = encode_cursor(messages[-1].id, entity_id)

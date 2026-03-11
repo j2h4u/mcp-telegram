@@ -201,7 +201,7 @@ def test_reply_annotation() -> None:
 
 
 def test_reactions_display() -> None:
-    """Message with reactions shows '[emoji×count]' appended to text."""
+    """Message with reactions shows '[emoji×count: name]' when names provided."""
     from mcp_telegram.formatter import format_messages
 
     dt = datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
@@ -220,9 +220,37 @@ def test_reactions_display() -> None:
         results: list
 
     reactions = FakeReactions(results=[
-        FakeReactionCount(reaction=FakeReaction(emoticon="👍"), count=3),
+        FakeReactionCount(reaction=FakeReaction(emoticon="👍"), count=2),
         FakeReactionCount(reaction=FakeReaction(emoticon="❤️"), count=1),
     ])
     msg = _make_msg(1, dt, text="hello", first_name="Alice", reactions=reactions)
+    reaction_names_map = {1: {"👍": ["Bob", "Carol"], "❤️": ["Dave"]}}
+    result = format_messages([msg], {}, reaction_names_map=reaction_names_map)
+    assert "[👍×2: Bob, Carol ❤️: Dave]" in result, f"Expected reactions with names, got: {result!r}"
+
+
+def test_reactions_count_only() -> None:
+    """Message with reactions shows count-only '[emoji×N]' when no names provided."""
+    from mcp_telegram.formatter import format_messages
+
+    dt = datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+
+    @dataclass
+    class FakeReaction:
+        emoticon: str
+
+    @dataclass
+    class FakeReactionCount:
+        reaction: FakeReaction
+        count: int
+
+    @dataclass
+    class FakeReactions:
+        results: list
+
+    reactions = FakeReactions(results=[
+        FakeReactionCount(reaction=FakeReaction(emoticon="🔥"), count=42),
+    ])
+    msg = _make_msg(1, dt, text="hot", first_name="Alice", reactions=reactions)
     result = format_messages([msg], {})
-    assert "[👍×3 ❤️]" in result, f"Expected reactions, got: {result!r}"
+    assert "[🔥×42]" in result, f"Expected count-only reactions, got: {result!r}"
