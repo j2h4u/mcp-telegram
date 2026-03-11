@@ -24,7 +24,7 @@ Full details: `.planning/milestones/v1.0-ROADMAP.md`
 <summary>🔄 v1.1 Observability & Completeness (Phases 6–10) — IN PROGRESS</summary>
 
 - 🔄 Phase 6: Telemetry Foundation (3/4 plans) — in progress
-- [ ] Phase 7: Cache Improvements & Optimization (TBD plans)
+- ▶️ Phase 7: Cache Improvements & Optimization (3/3 plans planned)
 - [ ] Phase 8: Navigation Features (TBD plans)
 - [ ] Phase 9: Forum Topics Support (TBD plans)
 - [ ] Phase 10: Tech Debt Cleanup (TBD plans)
@@ -41,7 +41,7 @@ Full details: `.planning/milestones/v1.0-ROADMAP.md`
 | 4. SearchMessages Context Window | v1.0 | 2/2 | Complete | 2026-03-11 |
 | 5. Cache & Error Hardening | v1.0 | 2/2 | Complete | 2026-03-11 |
 | 6. Telemetry Foundation | v1.1 | 3/4 | In progress | 2026-03-12 (06-03) |
-| 7. Cache Improvements & Optimization | v1.1 | 0/TBD | Not started | — |
+| 7. Cache Improvements & Optimization | v1.1 | 0/3 | Planned | — |
 | 8. Navigation Features | v1.1 | 0/TBD | Not started | — |
 | 9. Forum Topics Support | v1.1 | 0/TBD | Not started | — |
 | 10. Tech Debt Cleanup | v1.1 | 0/TBD | Not started | — |
@@ -88,7 +88,10 @@ Full details: `.planning/milestones/v1.0-ROADMAP.md`
 4. Daily cleanup timer configured: deletes telemetry >30d old, runs incremental VACUUM on analytics.db
 5. Load test with 100 concurrent ListMessages calls confirms p95 latency <250ms (separating analytics.db from entity_cache.db prevents write contention)
 
-**Plans:** TBD
+**Plans:**
+- [ ] 07-01-PLAN.md — SQLite indexes on entity_cache.db (Wave 1)
+- [ ] 07-02-PLAN.md — Reaction metadata cache with 10-min TTL (Wave 1)
+- [ ] 07-03-PLAN.md — Cleanup strategy: retention/VACUUM/PRAGMA optimize + load test (Wave 2)
 
 ---
 
