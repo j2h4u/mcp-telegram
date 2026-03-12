@@ -1,0 +1,19 @@
+{
+  "steps": [
+    {
+      "action": "list_tools"
+    },
+    {
+      "action": "call_tool",
+      "name": "ListDialogs",
+      "arguments": {}
+    },
+    {
+      "action": "call_tool",
+      "name": "ListTopics",
+      "arguments": {
+        "dialog": "Studio Robots and Inbox"
+      }
+    }
+  ]
+}
