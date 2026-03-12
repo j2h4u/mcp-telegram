@@ -263,7 +263,7 @@ async def test_list_messages_unread_filter(mock_cache, mock_client, monkeypatch)
     await list_messages(ListMessages(dialog="Иван Петров", unread=True))
     call_kwargs = mock_client.iter_messages.call_args.kwargs
     assert call_kwargs.get("min_id") == 50
-    assert call_kwargs.get("limit") == 100  # args.limit default, unread_count no longer caps it
+    assert call_kwargs.get("limit") == 50  # args.limit default, unread_count no longer caps it
 
 
 async def test_list_messages_topic_resolves_within_dialog(tmp_db_path, mock_client, monkeypatch):
