@@ -440,6 +440,125 @@ async def test_list_messages_topic_from_beginning(
     assert "Oldest in topic" in result[0].text
 
 
+async def test_list_messages_topic_sender_behavior(
+    tmp_db_path,
+    mock_client,
+    monkeypatch,
+    make_mock_message,
+    make_mock_topic,
+    make_mock_forum_reply,
+):
+    """Topic+sender filters locally after thread retrieval instead of combining server filters."""
+    from mcp_telegram.cache import EntityCache
+    from mcp_telegram.tools import ListMessages, list_messages
+
+    cache = EntityCache(tmp_db_path)
+    cache.upsert(701, "group", "Backend Forum", None)
+    cache.upsert(9001, "user", "Alice", None)
+    cache.upsert(9002, "user", "Bob", None)
+    cache.upsert(9003, "user", "Carol", None)
+    topic = make_mock_topic(topic_id=11, title="Release Notes", top_message_id=5011)
+
+    alice_reply = make_mock_forum_reply(reply_to_msg_id=5011, reply_to_top_id=5011)
+    bob_reply = make_mock_forum_reply(reply_to_msg_id=5011, reply_to_top_id=5011)
+    alice_message = make_mock_message(id=30, text="Alice update", sender_id=9001, sender_name="Alice")
+    bob_message = make_mock_message(id=20, text="Bob update", sender_id=9002, sender_name="Bob")
+    alice_message.reply_to = alice_reply
+    bob_message.reply_to = bob_reply
+
+    mock_client.iter_messages = MagicMock(side_effect=[
+        _async_iter([alice_message, bob_message]),
+        _async_iter([alice_message, bob_message]),
+    ])
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr(
+        "mcp_telegram.tools._load_dialog_topics",
+        AsyncMock(return_value={
+            "choices": {11: "Release Notes"},
+            "metadata_by_id": {11: topic},
+            "deleted_topics": {},
+        }),
+    )
+
+    result = await list_messages(
+        ListMessages(dialog="Backend Forum", topic="Release Notes", sender="Alice", limit=5)
+    )
+
+    first_call_kwargs = mock_client.iter_messages.call_args_list[0].kwargs
+    assert first_call_kwargs["reply_to"] == 5011
+    assert "from_user" not in first_call_kwargs
+    assert "Alice update" in result[0].text
+    assert "Bob update" not in result[0].text
+
+    empty_result = await list_messages(
+        ListMessages(dialog="Backend Forum", topic="Release Notes", sender="Carol", limit=5)
+    )
+
+    second_call_kwargs = mock_client.iter_messages.call_args_list[1].kwargs
+    assert second_call_kwargs["reply_to"] == 5011
+    assert "from_user" not in second_call_kwargs
+    assert empty_result[0].text == "[topic: Release Notes]\n"
+
+
+async def test_list_messages_topic_unread_behavior(
+    tmp_db_path,
+    mock_client,
+    monkeypatch,
+    make_mock_message,
+    make_mock_topic,
+    make_mock_forum_reply,
+):
+    """Topic+unread keeps reply_to scoping and unread min_id behavior together."""
+    from mcp_telegram.cache import EntityCache
+    from mcp_telegram.tools import ListMessages, list_messages
+
+    cache = EntityCache(tmp_db_path)
+    cache.upsert(701, "group", "Backend Forum", None)
+    topic = make_mock_topic(topic_id=11, title="Release Notes", top_message_id=5011)
+
+    unread_message = make_mock_message(id=60, text="Unread topic update")
+    unread_message.reply_to = make_mock_forum_reply(reply_to_msg_id=5011, reply_to_top_id=5011)
+
+    peer_result_one = MagicMock()
+    peer_result_one.dialogs = [MagicMock(read_inbox_max_id=50, unread_count=2)]
+    peer_result_two = MagicMock()
+    peer_result_two.dialogs = [MagicMock(read_inbox_max_id=70, unread_count=0)]
+
+    mock_client.get_input_entity = AsyncMock(return_value=MagicMock())
+    mock_client.side_effect = [peer_result_one, peer_result_two]
+    mock_client.iter_messages = MagicMock(side_effect=[
+        _async_iter([unread_message]),
+        _async_iter([]),
+    ])
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr(
+        "mcp_telegram.tools._load_dialog_topics",
+        AsyncMock(return_value={
+            "choices": {11: "Release Notes"},
+            "metadata_by_id": {11: topic},
+            "deleted_topics": {},
+        }),
+    )
+
+    result = await list_messages(ListMessages(dialog="Backend Forum", topic="Release Notes", unread=True))
+
+    first_call_kwargs = mock_client.iter_messages.call_args_list[0].kwargs
+    assert first_call_kwargs["reply_to"] == 5011
+    assert first_call_kwargs["min_id"] == 50
+    assert "Unread topic update" in result[0].text
+
+    empty_result = await list_messages(
+        ListMessages(dialog="Backend Forum", topic="Release Notes", unread=True)
+    )
+
+    second_call_kwargs = mock_client.iter_messages.call_args_list[1].kwargs
+    assert second_call_kwargs["reply_to"] == 5011
+    assert second_call_kwargs["min_id"] == 70
+    assert empty_result[0].text == "[topic: Release Notes]\n"
+
+
 async def test_fetch_forum_topics_paginates() -> None:
     """Raw topic pagination advances offsets and de-duplicates topics across pages."""
     from mcp_telegram.tools import _fetch_all_forum_topics
