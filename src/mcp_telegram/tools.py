@@ -434,6 +434,7 @@ class ListMessages(ToolArgs):
 
     Use cursor= with the next_cursor token from a previous response to page back in time.
     Use sender= to filter messages from a specific person (name string, resolved via fuzzy match).
+    Use topic= to filter messages to one forum topic after the dialog has been resolved.
     Use unread=True to show only messages you haven't read yet.
     Use from_beginning=True to fetch messages oldest-first (starts from message ID 1). When true,
     pagination reads forward through time rather than backward.
@@ -446,6 +447,7 @@ class ListMessages(ToolArgs):
     limit: int = 100
     cursor: str | None = None
     sender: str | None = None
+    topic: str | None = None
     unread: bool = False
     from_beginning: bool = False
 
@@ -484,6 +486,7 @@ async def list_messages(
             if args.dialog.strip().lower() != result.display_name.strip().lower()
             else ""
         )
+        topic_metadata: dict[str, int | str | bool | None] | None = None
 
         # Step 2 — Build iter_messages kwargs
         iter_kwargs: dict[str, t.Any] = {
@@ -532,8 +535,34 @@ async def list_messages(
         if args.unread:
             has_filter = True
 
-        # Step 4 — Unread filter + message fetch + format + cursor
+        # Step 4 — Topic resolution + unread filter + message fetch + format + cursor
         async with connected_client() as client:
+            if args.topic:
+                has_filter = True
+                topic_cache = TopicMetadataCache(cache._conn)
+                topic_catalog = await _load_dialog_topics(
+                    client,
+                    entity=entity_id,
+                    dialog_id=entity_id,
+                    topic_cache=topic_cache,
+                )
+                topic_result = resolve(args.topic, topic_catalog["choices"])
+                if isinstance(topic_result, NotFound):
+                    return [TextContent(type="text", text=f'Topic not found: "{args.topic}"')]
+                if isinstance(topic_result, Candidates):
+                    match_lines = []
+                    for match in topic_result.matches:
+                        match_lines.append(
+                            f'id={match["entity_id"]} name="{match["display_name"]}" score={match["score"]}'
+                        )
+                    return [
+                        TextContent(
+                            type="text",
+                            text=f'Ambiguous topic "{args.topic}". Matches:\n' + "\n".join(match_lines),
+                        )
+                    ]
+                topic_metadata = topic_catalog["metadata_by_id"].get(topic_result.entity_id)
+
             if args.unread:
                 input_peer = await client.get_input_entity(entity_id)
                 peer_result = await client(GetPeerDialogsRequest(peers=[input_peer]))
