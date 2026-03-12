@@ -159,6 +159,22 @@ async def test_list_topics_catalog_unavailable(tmp_db_path, mock_client, monkeyp
     assert result[0].text == 'Dialog "Backend Forum" does not expose a readable forum-topic catalog (CHAT_NOT_FORUM).'
 
 
+def test_tool_description_strips_nullable_unions_from_exported_schema():
+    """Exported MCP tool schemas should not expose explicit null unions."""
+    list_messages_schema = tools_module.tool_description(ListMessages).inputSchema
+    search_messages_schema = tools_module.tool_description(SearchMessages).inputSchema
+
+    cursor_schema = list_messages_schema["properties"]["cursor"]
+    sender_schema = list_messages_schema["properties"]["sender"]
+    topic_schema = list_messages_schema["properties"]["topic"]
+    offset_schema = search_messages_schema["properties"]["offset"]
+
+    assert cursor_schema == {"title": "Cursor", "type": "string"}
+    assert sender_schema == {"title": "Sender", "type": "string"}
+    assert topic_schema == {"title": "Topic", "type": "string"}
+    assert offset_schema == {"title": "Offset", "type": "integer"}
+
+
 # --- TOOL-02: ListMessages name resolution ---
 
 

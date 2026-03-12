@@ -145,11 +145,47 @@ async def tool_runner(
 
 
 def tool_description(args: type[ToolArgs]) -> Tool:
+    schema = _sanitize_tool_schema(args.model_json_schema())
     return Tool(
         name=args.__name__,
         description=args.__doc__,
-        inputSchema=args.model_json_schema(),
+        inputSchema=schema,
     )
+
+
+def _sanitize_tool_schema(value: t.Any) -> t.Any:
+    """Return MCP-friendly JSON schema without explicit null unions."""
+    if isinstance(value, dict):
+        sanitized = {key: _sanitize_tool_schema(item) for key, item in value.items()}
+
+        any_of = sanitized.get("anyOf")
+        if isinstance(any_of, list):
+            non_null_variants = [
+                item for item in any_of if not (isinstance(item, dict) and item.get("type") == "null")
+            ]
+            has_null_variant = len(non_null_variants) != len(any_of)
+            if has_null_variant and len(non_null_variants) == 1:
+                replacement = non_null_variants[0]
+                if not isinstance(replacement, dict):
+                    return replacement
+
+                merged = {
+                    key: item
+                    for key, item in sanitized.items()
+                    if key not in {"anyOf", "default"}
+                }
+                return {**replacement, **merged}
+
+        schema_type = sanitized.get("type")
+        if sanitized.get("default") is None and schema_type != "null":
+            sanitized.pop("default", None)
+
+        return sanitized
+
+    if isinstance(value, list):
+        return [_sanitize_tool_schema(item) for item in value]
+
+    return value
 
 
 def tool_args(tool: Tool, *args, **kwargs) -> ToolArgs:  # noqa: ANN002, ANN003
