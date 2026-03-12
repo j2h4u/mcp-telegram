@@ -734,6 +734,52 @@ async def test_list_messages_topic_unread_filters_dialog_leaks(
     assert f"next_cursor: {encode_cursor(67, 701)}" in result[0].text
 
 
+async def test_list_messages_topic_unread_empty_page_has_no_cursor(
+    tmp_db_path,
+    mock_client,
+    monkeypatch,
+    make_general_topic_message,
+    make_mock_message,
+    make_mock_topic,
+    make_mock_forum_reply,
+):
+    """Unread topic pages stay empty when the raw unread slice has no matching topic messages."""
+    from mcp_telegram.cache import EntityCache
+    from mcp_telegram.tools import ListMessages, list_messages
+
+    cache = EntityCache(tmp_db_path)
+    cache.upsert(701, "group", "Backend Forum", None)
+    topic = make_mock_topic(topic_id=11, title="Release Notes", top_message_id=5011)
+    adjacent_reply = make_mock_forum_reply(reply_to_msg_id=7001, reply_to_top_id=7001)
+
+    leaked_general = make_general_topic_message(id=66, text="General unread leak")
+    leaked_adjacent = make_mock_message(id=65, text="Adjacent unread leak")
+    leaked_adjacent.reply_to = adjacent_reply
+
+    mock_client.get_input_entity = AsyncMock(return_value=MagicMock())
+    mock_client.side_effect = [MagicMock(dialogs=[MagicMock(read_inbox_max_id=50, unread_count=2)])]
+    mock_client.iter_messages = MagicMock(return_value=_async_iter([leaked_general, leaked_adjacent]))
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr(
+        "mcp_telegram.tools._load_dialog_topics",
+        AsyncMock(
+            return_value={
+                "choices": {11: "Release Notes"},
+                "metadata_by_id": {11: topic},
+                "deleted_topics": {},
+            }
+        ),
+    )
+
+    result = await list_messages(
+        ListMessages(dialog="Backend Forum", topic="Release Notes", unread=True, limit=2)
+    )
+
+    assert result[0].text == "[topic: Release Notes]\n"
+    assert "next_cursor" not in result[0].text
+
+
 async def test_list_messages_general_topic_normalization(
     tmp_db_path,
     mock_client,
