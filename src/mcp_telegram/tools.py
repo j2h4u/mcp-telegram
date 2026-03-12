@@ -50,6 +50,46 @@ GENERAL_TOPIC_TITLE = "General"
 logger = logging.getLogger(__name__)
 
 
+def _build_get_forum_topics_request(
+    *,
+    entity: t.Any,
+    offset_date: object | None,
+    offset_id: int,
+    offset_topic: int,
+    limit: int,
+) -> object:
+    """Build a forum-topics page request across Telethon API variants."""
+    request_cls = getattr(functions.messages, "GetForumTopicsRequest", None)
+    if request_cls is not None:
+        return request_cls(
+            peer=entity,
+            offset_date=offset_date,
+            offset_id=offset_id,
+            offset_topic=offset_topic,
+            limit=limit,
+        )
+
+    return functions.channels.GetForumTopicsRequest(
+        channel=entity,
+        offset_date=offset_date,
+        offset_id=offset_id,
+        offset_topic=offset_topic,
+        limit=limit,
+    )
+
+
+def _build_get_forum_topics_by_id_request(*, entity: t.Any, topic_ids: list[int]) -> object:
+    """Build a by-ID forum-topics request across Telethon API variants."""
+    request_cls = getattr(functions.messages, "GetForumTopicsByIDRequest", None)
+    if request_cls is not None:
+        return request_cls(peer=entity, topics=topic_ids)
+
+    return functions.channels.GetForumTopicsByIDRequest(
+        channel=entity,
+        topics=topic_ids,
+    )
+
+
 @asynccontextmanager
 async def connected_client():
     """Wraps create_client() with connect/disconnect and timing logs.
@@ -209,13 +249,15 @@ async def _fetch_forum_topics_page(
     limit: int = FORUM_TOPICS_PAGE_SIZE,
 ) -> tuple[list[object], int]:
     """Fetch one raw page of forum topics using Telegram's channels.getForumTopics RPC."""
-    response = await client(functions.channels.GetForumTopicsRequest(
-        channel=entity,
-        offset_date=offset_date,
-        offset_id=offset_id,
-        offset_topic=offset_topic,
-        limit=limit,
-    ))
+    response = await client(
+        _build_get_forum_topics_request(
+            entity=entity,
+            offset_date=offset_date,
+            offset_id=offset_id,
+            offset_topic=offset_topic,
+            limit=limit,
+        )
+    )
     topics = list(getattr(response, "topics", []))
     total_count = int(getattr(response, "count", len(topics)))
     return topics, total_count
@@ -289,10 +331,9 @@ async def _refresh_topic_by_id(
 ) -> dict[str, int | str | bool | None] | None:
     """Refresh one topic by ID and persist tombstones when Telegram reports deletion."""
     existing_topic = topic_cache.get_topic(dialog_id, topic_id, ttl_seconds)
-    response = await client(functions.channels.GetForumTopicsByIDRequest(
-        channel=entity,
-        topics=[topic_id],
-    ))
+    response = await client(
+        _build_get_forum_topics_by_id_request(entity=entity, topic_ids=[topic_id])
+    )
     response_topics = list(getattr(response, "topics", []))
     if not response_topics:
         return None
@@ -474,6 +515,18 @@ async def _fetch_messages_for_topic(
     active_iter_kwargs = dict(iter_kwargs)
     active_topic_metadata = topic_metadata
 
+    async def _scan_dialog_history_for_topic() -> tuple[list[object], dict[str, t.Any]]:
+        """Fallback to dialog-wide history scanning when thread fetch rejects a valid topic anchor."""
+        history_iter_kwargs = dict(active_iter_kwargs)
+        history_iter_kwargs.pop("reply_to", None)
+        messages = await _fetch_topic_messages(
+            client,
+            iter_kwargs=history_iter_kwargs,
+            topic_metadata=active_topic_metadata,
+            allow_headerless_messages=False,
+        )
+        return messages, history_iter_kwargs
+
     try:
         messages = await _fetch_topic_messages(
             client,
@@ -506,16 +559,28 @@ async def _fetch_messages_for_topic(
 
         refreshed_reply_to = int(refreshed_top_message_id)
         if active_iter_kwargs.get("reply_to") == refreshed_reply_to:
+            dialog_messages, dialog_iter_kwargs = await _scan_dialog_history_for_topic()
+            if dialog_messages:
+                return dialog_messages, active_topic_metadata, dialog_iter_kwargs
             raise exc
 
         active_iter_kwargs["reply_to"] = refreshed_reply_to
-        messages = await _fetch_topic_messages(
-            client,
-            iter_kwargs=active_iter_kwargs,
-            topic_metadata=active_topic_metadata,
-            allow_headerless_messages=allow_headerless_messages,
-        )
-        return messages, active_topic_metadata, active_iter_kwargs
+        try:
+            messages = await _fetch_topic_messages(
+                client,
+                iter_kwargs=active_iter_kwargs,
+                topic_metadata=active_topic_metadata,
+                allow_headerless_messages=allow_headerless_messages,
+            )
+            return messages, active_topic_metadata, active_iter_kwargs
+        except RPCError as retry_exc:
+            if not _is_topic_id_invalid_error(retry_exc):
+                raise
+
+            dialog_messages, dialog_iter_kwargs = await _scan_dialog_history_for_topic()
+            if dialog_messages:
+                return dialog_messages, active_topic_metadata, dialog_iter_kwargs
+            raise retry_exc
 
 
 ### ListDialogs ###

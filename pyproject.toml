@@ -5,7 +5,7 @@ description = "MCP server to work with Telegram through MTProto"
 requires-python = ">=3.11"
 dependencies = [
   "mcp>=1.1.0",
-  "telethon>=1.23.0",
+  "telethon>=1.42.0",
   "pydantic>=2.0.0",
   "pydantic-settings>=2.6.0",
   "typer>=0.15.0",

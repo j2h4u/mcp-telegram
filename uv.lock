@@ -175,7 +175,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.0.0" },
     { name = "pydantic-settings", specifier = ">=2.6.0" },
     { name = "rapidfuzz", specifier = ">=3.14.3" },
-    { name = "telethon", specifier = ">=1.23.0" },
+    { name = "telethon", specifier = ">=1.42.0" },
     { name = "typer", specifier = ">=0.15.0" },
     { name = "xdg-base-dirs", specifier = ">=6.0.0" },
 ]
@@ -543,15 +543,15 @@ wheels = [
 
 [[package]]
 name = "telethon"
-version = "1.38.1"
+version = "1.42.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "pyaes" },
     { name = "rsa" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/5d/91/e76edf7747af0b8c2e79e626f7bce8f90f7e8d3a06bd0c25e8885cc79f23/Telethon-1.38.1.tar.gz", hash = "sha256:f9866c1e37197a0894e0c02aa56a6359bffb14a585e88e18e3e819df4fda399a", size = 627615, upload-time = "2024-11-18T16:05:11.077Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/8c/10/8c8c9476bfce767a856d8aaf9eae8ea1869df4e970da16f1c5b638fd1b0c/telethon-1.42.0.tar.gz", hash = "sha256:032e95511261d5ead719f75494c6c85ece2ce71816b54f3c65d6ccc371d6994d", size = 672734, upload-time = "2025-11-05T19:15:19.849Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/fa/13/01745f9c0dd1dea51028959dc881ceb960b950dae9093d84c3f2ec891527/Telethon-1.38.1-py3-none-any.whl", hash = "sha256:30c187017501bfb982b8af5659f864dda4108f77ea49cfce61e8f6fdb8a18d6e", size = 702175, upload-time = "2024-11-18T16:05:08.837Z" },
+    { url = "https://files.pythonhosted.org/packages/e4/e4/8ce0ff55251381966a7c3f88bd5b34abda79b225a8e7fb51ddef3b849c94/telethon-1.42.0-py3-none-any.whl", hash = "sha256:cf361c94586bcacd6d0fc8959a2bce509d1bb37007fe6476a80c4fb4a2decc29", size = 748466, upload-time = "2025-11-05T19:15:18.241Z" },
 ]
 
 [[package]]
