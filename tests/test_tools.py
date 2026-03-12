@@ -1003,6 +1003,7 @@ async def test_list_messages_topic_inaccessible_after_refresh(
     mock_client.iter_messages = MagicMock(side_effect=[
         tools_module.RPCError(request=None, message="TOPIC_ID_INVALID", code=400),
         tools_module.RPCError(request=None, message="TOPIC_ID_INVALID", code=400),
+        _async_iter([]),
     ])
     refresh_topic = AsyncMock(return_value=refreshed_topic)
 
@@ -1022,7 +1023,66 @@ async def test_list_messages_topic_inaccessible_after_refresh(
 
     assert result[0].text == 'Topic "Release Notes" is inaccessible: TOPIC_ID_INVALID'
     assert refresh_topic.await_count == 1
-    assert mock_client.iter_messages.call_count == 2
+    assert mock_client.iter_messages.call_count == 3
+    assert "reply_to" not in mock_client.iter_messages.call_args_list[2].kwargs
+
+
+async def test_list_messages_topic_falls_back_to_dialog_scan_after_thread_fetch_failure(
+    tmp_db_path,
+    mock_client,
+    monkeypatch,
+    make_general_topic_message,
+    make_mock_message,
+    make_mock_topic,
+    make_mock_forum_reply,
+):
+    """An active topic can still be read from dialog history when reply_to thread fetch stays invalid."""
+    from mcp_telegram.cache import EntityCache
+    from mcp_telegram.tools import ListMessages, list_messages
+
+    cache = EntityCache(tmp_db_path)
+    cache.upsert(701, "group", "Backend Forum", None)
+    active_topic = make_mock_topic(topic_id=40, title="Inbox", top_message_id=249)
+    topic_reply = make_mock_forum_reply(reply_to_msg_id=249, reply_to_top_id=249)
+    adjacent_reply = make_mock_forum_reply(reply_to_msg_id=7001, reply_to_top_id=7001)
+
+    inbox_newest = make_mock_message(id=260, text="Inbox newest")
+    inbox_newest.reply_to = topic_reply
+    leaked_general = make_general_topic_message(id=259, text="General leak")
+    leaked_adjacent = make_mock_message(id=258, text="Adjacent topic leak")
+    leaked_adjacent.reply_to = adjacent_reply
+    inbox_older = make_mock_message(id=257, text="Inbox older")
+    inbox_older.reply_to = topic_reply
+
+    mock_client.iter_messages = MagicMock(side_effect=[
+        tools_module.RPCError(request=None, message="TOPIC_ID_INVALID", code=400),
+        _async_iter([inbox_newest, leaked_general, leaked_adjacent, inbox_older]),
+    ])
+    refresh_topic = AsyncMock(return_value=active_topic)
+
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr(
+        "mcp_telegram.tools._load_dialog_topics",
+        AsyncMock(return_value={
+            "choices": {40: "Inbox"},
+            "metadata_by_id": {40: active_topic},
+            "deleted_topics": {},
+        }),
+    )
+    monkeypatch.setattr("mcp_telegram.tools._refresh_topic_by_id", refresh_topic)
+
+    result = await list_messages(ListMessages(dialog="Backend Forum", topic="Inbox", limit=2))
+
+    assert result[0].text.startswith("[topic: Inbox]\n")
+    assert "Inbox newest" in result[0].text
+    assert "Inbox older" in result[0].text
+    assert "General leak" not in result[0].text
+    assert "Adjacent topic leak" not in result[0].text
+    first_call_kwargs = mock_client.iter_messages.call_args_list[0].kwargs
+    second_call_kwargs = mock_client.iter_messages.call_args_list[1].kwargs
+    assert first_call_kwargs["reply_to"] == 249
+    assert "reply_to" not in second_call_kwargs
 
 
 async def test_list_messages_topic_boundary_no_leakage(
