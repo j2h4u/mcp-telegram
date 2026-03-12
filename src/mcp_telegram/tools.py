@@ -373,6 +373,12 @@ def _inaccessible_topic_text(topic_name: str, exc: RPCError) -> str:
     return f'Topic "{topic_name}" is inaccessible: {detail}'
 
 
+def _is_topic_id_invalid_error(exc: RPCError) -> bool:
+    """Return True when Telegram reports the cached thread anchor is invalid."""
+    detail = getattr(exc, "message", None) or str(exc)
+    return "TOPIC_ID_INVALID" in detail.upper()
+
+
 def _message_matches_topic(
     message: object,
     *,
@@ -445,6 +451,60 @@ async def _fetch_topic_messages(
         batch_kwargs[boundary_key] = last_message_id
 
     return topic_messages
+
+
+async def _fetch_messages_for_topic(
+    client: t.Any,
+    *,
+    entity_id: int,
+    iter_kwargs: dict[str, t.Any],
+    topic_metadata: dict[str, int | str | bool | None],
+    topic_cache: TopicMetadataCache,
+) -> tuple[list[object] | None, dict[str, int | str | bool | None], dict[str, t.Any]]:
+    """Fetch one topic page with one bounded by-ID refresh and retry on stale anchors."""
+    active_iter_kwargs = dict(iter_kwargs)
+    active_topic_metadata = topic_metadata
+
+    try:
+        messages = await _fetch_topic_messages(
+            client,
+            iter_kwargs=active_iter_kwargs,
+            topic_metadata=active_topic_metadata,
+        )
+        return messages, active_topic_metadata, active_iter_kwargs
+    except RPCError as exc:
+        if not _is_topic_id_invalid_error(exc):
+            raise
+
+        refreshed_topic = await _refresh_topic_by_id(
+            client,
+            entity=entity_id,
+            dialog_id=entity_id,
+            topic_id=int(active_topic_metadata["topic_id"]),
+            topic_cache=topic_cache,
+        )
+        if refreshed_topic is None:
+            raise exc
+
+        active_topic_metadata = refreshed_topic
+        if bool(active_topic_metadata["is_deleted"]):
+            return None, active_topic_metadata, active_iter_kwargs
+
+        refreshed_top_message_id = active_topic_metadata["top_message_id"]
+        if refreshed_top_message_id is None:
+            raise exc
+
+        refreshed_reply_to = int(refreshed_top_message_id)
+        if active_iter_kwargs.get("reply_to") == refreshed_reply_to:
+            raise exc
+
+        active_iter_kwargs["reply_to"] = refreshed_reply_to
+        messages = await _fetch_topic_messages(
+            client,
+            iter_kwargs=active_iter_kwargs,
+            topic_metadata=active_topic_metadata,
+        )
+        return messages, active_topic_metadata, active_iter_kwargs
 
 
 ### ListDialogs ###
@@ -707,11 +767,18 @@ async def list_messages(
 
             try:
                 if topic_metadata is not None and not bool(topic_metadata["is_general"]) and "reply_to" in iter_kwargs:
-                    fetched_messages = await _fetch_topic_messages(
+                    fetched_messages, topic_metadata, iter_kwargs = await _fetch_messages_for_topic(
                         client,
+                        entity_id=entity_id,
                         iter_kwargs=iter_kwargs,
                         topic_metadata=topic_metadata,
+                        topic_cache=topic_cache,
                     )
+                    if topic_metadata is not None and bool(topic_metadata["is_deleted"]):
+                        topic_name = resolved_topic_name or args.topic or "Topic"
+                        return [TextContent(type="text", text=_deleted_topic_text(topic_name))]
+                    if fetched_messages is None:
+                        fetched_messages = []
                 else:
                     fetched_messages = [msg async for msg in client.iter_messages(**iter_kwargs)]
             except RPCError as exc:
