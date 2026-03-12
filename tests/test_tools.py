@@ -678,6 +678,132 @@ async def test_list_messages_private_or_inaccessible_topic_behavior(
     assert result[0].text == 'Topic "Release Notes" is inaccessible: TOPIC_PRIVATE'
 
 
+async def test_list_messages_topic_retries_after_stale_top_message_id(
+    tmp_db_path,
+    mock_client,
+    monkeypatch,
+    make_mock_message,
+    make_mock_topic,
+):
+    """A stale cached thread anchor is refreshed by topic ID and retried once."""
+    from mcp_telegram.cache import EntityCache
+    from mcp_telegram.tools import ListMessages, list_messages
+
+    cache = EntityCache(tmp_db_path)
+    cache.upsert(701, "group", "Backend Forum", None)
+    stale_topic = make_mock_topic(topic_id=11, title="Release Notes", top_message_id=5011)
+    refreshed_topic = make_mock_topic(topic_id=11, title="Release Notes", top_message_id=6011)
+    recovered_message = make_mock_message(id=77, text="Recovered after refresh")
+
+    mock_client.iter_messages = MagicMock(side_effect=[
+        tools_module.RPCError(request=None, message="TOPIC_ID_INVALID", code=400),
+        _async_iter([recovered_message]),
+    ])
+    refresh_topic = AsyncMock(return_value=refreshed_topic)
+
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr(
+        "mcp_telegram.tools._load_dialog_topics",
+        AsyncMock(return_value={
+            "choices": {11: "Release Notes"},
+            "metadata_by_id": {11: stale_topic},
+            "deleted_topics": {},
+        }),
+    )
+    monkeypatch.setattr("mcp_telegram.tools._refresh_topic_by_id", refresh_topic)
+
+    result = await list_messages(ListMessages(dialog="Backend Forum", topic="Release Notes"))
+
+    assert "Recovered after refresh" in result[0].text
+    assert result[0].text.startswith("[topic: Release Notes]\n")
+    assert refresh_topic.await_count == 1
+    first_call_kwargs = mock_client.iter_messages.call_args_list[0].kwargs
+    second_call_kwargs = mock_client.iter_messages.call_args_list[1].kwargs
+    assert first_call_kwargs["reply_to"] == 5011
+    assert second_call_kwargs["reply_to"] == 6011
+
+
+async def test_list_messages_topic_deleted_after_refresh(
+    tmp_db_path,
+    mock_client,
+    monkeypatch,
+    make_deleted_topic,
+    make_mock_topic,
+):
+    """A TOPIC_ID_INVALID thread fetch is reclassified as deleted when refresh returns a tombstone."""
+    from mcp_telegram.cache import EntityCache
+    from mcp_telegram.tools import ListMessages, list_messages
+
+    cache = EntityCache(tmp_db_path)
+    cache.upsert(701, "group", "Backend Forum", None)
+    stale_topic = make_mock_topic(topic_id=11, title="Release Notes", top_message_id=5011)
+    deleted_topic = make_deleted_topic(topic_id=11, title="Release Notes", top_message_id=5011)
+
+    mock_client.iter_messages = MagicMock(
+        side_effect=tools_module.RPCError(request=None, message="TOPIC_ID_INVALID", code=400)
+    )
+    refresh_topic = AsyncMock(return_value=deleted_topic)
+
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr(
+        "mcp_telegram.tools._load_dialog_topics",
+        AsyncMock(return_value={
+            "choices": {11: "Release Notes"},
+            "metadata_by_id": {11: stale_topic},
+            "deleted_topics": {},
+        }),
+    )
+    monkeypatch.setattr("mcp_telegram.tools._refresh_topic_by_id", refresh_topic)
+
+    result = await list_messages(ListMessages(dialog="Backend Forum", topic="Release Notes"))
+
+    assert result[0].text == 'Topic "Release Notes" was deleted and can no longer be fetched.'
+    assert refresh_topic.await_count == 1
+    assert mock_client.iter_messages.call_count == 1
+
+
+async def test_list_messages_topic_inaccessible_after_refresh(
+    tmp_db_path,
+    mock_client,
+    monkeypatch,
+    make_mock_topic,
+):
+    """An active topic that still fails after refresh keeps an explicit topic-scoped error."""
+    from mcp_telegram.cache import EntityCache
+    from mcp_telegram.tools import ListMessages, list_messages
+
+    cache = EntityCache(tmp_db_path)
+    cache.upsert(701, "group", "Backend Forum", None)
+    stale_topic = make_mock_topic(topic_id=11, title="Release Notes", top_message_id=5011)
+    refreshed_topic = make_mock_topic(topic_id=11, title="Release Notes", top_message_id=6011)
+
+    mock_client.iter_messages = MagicMock(side_effect=[
+        tools_module.RPCError(request=None, message="TOPIC_ID_INVALID", code=400),
+        tools_module.RPCError(request=None, message="TOPIC_ID_INVALID", code=400),
+    ])
+    refresh_topic = AsyncMock(return_value=refreshed_topic)
+
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr(
+        "mcp_telegram.tools._load_dialog_topics",
+        AsyncMock(return_value={
+            "choices": {11: "Release Notes"},
+            "metadata_by_id": {11: stale_topic},
+            "deleted_topics": {},
+        }),
+    )
+    monkeypatch.setattr("mcp_telegram.tools._refresh_topic_by_id", refresh_topic)
+
+    result = await list_messages(ListMessages(dialog="Backend Forum", topic="Release Notes"))
+
+    assert result[0].text == 'Topic "Release Notes" is inaccessible: TOPIC_ID_INVALID'
+    assert refresh_topic.await_count == 1
+    assert mock_client.iter_messages.call_count == 2
+
+
 async def test_list_messages_topic_boundary_no_leakage(
     tmp_db_path,
     mock_client,
