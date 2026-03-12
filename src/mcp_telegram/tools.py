@@ -487,6 +487,7 @@ async def list_messages(
             else ""
         )
         topic_metadata: dict[str, int | str | bool | None] | None = None
+        resolved_topic_name: str | None = None
 
         # Step 2 — Build iter_messages kwargs
         iter_kwargs: dict[str, t.Any] = {
@@ -562,6 +563,11 @@ async def list_messages(
                         )
                     ]
                 topic_metadata = topic_catalog["metadata_by_id"].get(topic_result.entity_id)
+                resolved_topic_name = topic_result.display_name
+                if topic_metadata is not None and not bool(topic_metadata["is_general"]):
+                    top_message_id = topic_metadata["top_message_id"]
+                    if top_message_id is not None:
+                        iter_kwargs["reply_to"] = int(top_message_id)
 
             if args.unread:
                 input_peer = await client.get_input_entity(entity_id)
@@ -649,7 +655,8 @@ async def list_messages(
             next_cursor = encode_cursor(messages[-1].id, entity_id)
 
         result_count = len(messages)
-        result_text = resolve_prefix + text
+        topic_prefix = f"[topic: {resolved_topic_name}]\n" if resolved_topic_name else ""
+        result_text = resolve_prefix + topic_prefix + text
         if next_cursor:
             result_text += f"\n\nnext_cursor: {next_cursor}"
         result = [TextContent(type="text", text=result_text)]
