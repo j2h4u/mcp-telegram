@@ -314,6 +314,132 @@ async def test_list_messages_topic_ambiguous_within_dialog(tmp_db_path, mock_cli
     assert 'name="Release Planning"' in result[0].text
 
 
+async def test_list_messages_topic_header(
+    tmp_db_path,
+    mock_client,
+    monkeypatch,
+    make_mock_message,
+    make_mock_topic,
+):
+    """Active topic names are shown ahead of the formatted message body."""
+    from mcp_telegram.cache import EntityCache
+    from mcp_telegram.tools import ListMessages, list_messages
+
+    cache = EntityCache(tmp_db_path)
+    cache.upsert(701, "group", "Backend Forum", None)
+    topic = make_mock_topic(topic_id=11, title="Release Notes", top_message_id=5011)
+    message = make_mock_message(id=77, text="Shipped topic update")
+
+    mock_client.iter_messages = MagicMock(return_value=_async_iter([message]))
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr(
+        "mcp_telegram.tools._load_dialog_topics",
+        AsyncMock(return_value={
+            "choices": {11: "Release Notes"},
+            "metadata_by_id": {11: topic},
+            "deleted_topics": {},
+        }),
+    )
+
+    result = await list_messages(ListMessages(dialog="Backend Forum", topic="Release Notes"))
+
+    assert result[0].text.startswith("[topic: Release Notes]\n")
+    assert "Shipped topic update" in result[0].text
+    assert mock_client.iter_messages.call_args.kwargs["reply_to"] == 5011
+
+
+async def test_list_messages_topic_cursor_round_trip(
+    tmp_db_path,
+    mock_client,
+    monkeypatch,
+    make_mock_message,
+    make_mock_topic,
+):
+    """Topic-filtered pagination keeps reply_to scoped and emits a reusable cursor."""
+    from mcp_telegram.cache import EntityCache
+    from mcp_telegram.pagination import encode_cursor
+    from mcp_telegram.tools import ListMessages, list_messages
+
+    cache = EntityCache(tmp_db_path)
+    cache.upsert(701, "group", "Backend Forum", None)
+    topic = make_mock_topic(topic_id=11, title="Release Notes", top_message_id=5011)
+    newer = make_mock_message(id=30, text="Newest in topic")
+    older = make_mock_message(id=20, text="Older in topic")
+    oldest = make_mock_message(id=10, text="Oldest in topic")
+
+    mock_client.iter_messages = MagicMock(side_effect=[
+        _async_iter([newer, older]),
+        _async_iter([oldest]),
+    ])
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr(
+        "mcp_telegram.tools._load_dialog_topics",
+        AsyncMock(return_value={
+            "choices": {11: "Release Notes"},
+            "metadata_by_id": {11: topic},
+            "deleted_topics": {},
+        }),
+    )
+
+    first_page = await list_messages(ListMessages(dialog="Backend Forum", topic="Release Notes", limit=2))
+
+    expected_cursor = encode_cursor(20, 701)
+    assert f"next_cursor: {expected_cursor}" in first_page[0].text
+    first_call_kwargs = mock_client.iter_messages.call_args_list[0].kwargs
+    assert first_call_kwargs["reply_to"] == 5011
+
+    await list_messages(
+        ListMessages(dialog="Backend Forum", topic="Release Notes", limit=2, cursor=expected_cursor)
+    )
+
+    second_call_kwargs = mock_client.iter_messages.call_args_list[1].kwargs
+    assert second_call_kwargs["reply_to"] == 5011
+    assert second_call_kwargs["max_id"] == 20
+
+
+async def test_list_messages_topic_from_beginning(
+    tmp_db_path,
+    mock_client,
+    monkeypatch,
+    make_mock_message,
+    make_mock_topic,
+):
+    """Reverse pagination keeps topic retrieval scoped to the same thread root."""
+    from mcp_telegram.cache import EntityCache
+    from mcp_telegram.tools import ListMessages, list_messages
+
+    cache = EntityCache(tmp_db_path)
+    cache.upsert(701, "group", "Backend Forum", None)
+    topic = make_mock_topic(topic_id=11, title="Release Notes", top_message_id=5011)
+    oldest = make_mock_message(id=10, text="Oldest in topic")
+    newest = make_mock_message(id=20, text="Newest in topic")
+
+    mock_client.iter_messages = MagicMock(return_value=_async_iter([oldest, newest]))
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr(
+        "mcp_telegram.tools._load_dialog_topics",
+        AsyncMock(return_value={
+            "choices": {11: "Release Notes"},
+            "metadata_by_id": {11: topic},
+            "deleted_topics": {},
+        }),
+    )
+
+    result = await list_messages(
+        ListMessages(dialog="Backend Forum", topic="Release Notes", from_beginning=True, limit=2)
+    )
+
+    call_kwargs = mock_client.iter_messages.call_args.kwargs
+    assert call_kwargs["reply_to"] == 5011
+    assert call_kwargs["reverse"] is True
+    assert call_kwargs["min_id"] == 1
+    assert "[topic: Release Notes]" in result[0].text
+    assert "Oldest in topic" in result[0].text
+
+
 async def test_fetch_forum_topics_paginates() -> None:
     """Raw topic pagination advances offsets and de-duplicates topics across pages."""
     from mcp_telegram.tools import _fetch_all_forum_topics

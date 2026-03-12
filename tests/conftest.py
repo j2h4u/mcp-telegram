@@ -4,6 +4,7 @@ import pytest
 from pathlib import Path
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
+from types import SimpleNamespace
 
 from mcp_telegram.cache import EntityCache
 
@@ -61,6 +62,48 @@ def make_mock_message():
         msg.reactions = None
         msg.media = None
         return msg
+
+    return _make
+
+
+@pytest.fixture()
+def make_mock_forum_reply():
+    """Return a factory for lightweight forum reply headers."""
+
+    def _make(
+        *,
+        reply_to_msg_id: int | None = None,
+        reply_to_top_id: int | None = None,
+        forum_topic: bool = True,
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            reply_to_msg_id=reply_to_msg_id,
+            reply_to_top_id=reply_to_top_id,
+            forum_topic=forum_topic,
+        )
+
+    return _make
+
+
+@pytest.fixture()
+def make_mock_topic():
+    """Return a factory for dialog-scoped topic metadata rows."""
+
+    def _make(
+        *,
+        topic_id: int,
+        title: str,
+        top_message_id: int | None,
+        is_general: bool = False,
+        is_deleted: bool = False,
+    ) -> dict[str, int | str | bool | None]:
+        return {
+            "topic_id": topic_id,
+            "title": title,
+            "top_message_id": top_message_id,
+            "is_general": is_general,
+            "is_deleted": is_deleted,
+        }
 
     return _make
 
