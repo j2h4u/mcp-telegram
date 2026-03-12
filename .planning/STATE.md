@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-last_updated: "2026-03-11T23:02:30.170Z"
-last_activity: 2026-03-11
+last_updated: "2026-03-12T00:41:19.175Z"
+last_activity: 2026-03-12
 progress:
   total_phases: 5
   completed_phases: 3
-  total_plans: 9
-  completed_plans: 10
-  percent: 67
+  total_plans: 12
+  completed_plans: 11
+  percent: 92
 ---
 
 # Project State
@@ -20,23 +20,23 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-12)
 
 **Core value:** LLM can work with Telegram using natural names — zero cold-start friction, no ID lookup boilerplate before every real task
-**Current focus:** Phase 6 (Telemetry Foundation) — run `/gsd:plan-phase 6`
+**Current focus:** Phase 9 (Forum Topics Support) — run `/gsd:execute-plan 09-02-PLAN.md`
 
 ## Current Position
 
 Phase: 9
-Plan: Not started
-Status: In Progress (2/3 plans complete)
-Last activity: 2026-03-11
+Plan: 2
+Status: Ready to execute (1/3 plans complete)
+Last activity: 2026-03-12
 
-Progress: [██████████░░░░░░░░░░░░░░░░░░░░░░] 67%
+Progress: [█████████░] 92%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 9
-- Average duration: 14.8 minutes (18min + 25min + 18min + 18min + 12min + 14min + 3min + 11min + 1.9min) / 9
-- Total execution time: 133 minutes (2h 13m)
+- Total plans completed: 10
+- Average duration: 14.0 minutes
+- Total execution time: 140 minutes (2h 20m)
 
 **By Phase:**
 
@@ -45,6 +45,7 @@ Progress: [██████████░░░░░░░░░░░░░
 | 6 | 4 | 4 | 20.3 min |
 | 7 | 3 | 3 | 11.7 min |
 | 8 | 3 | 2 | 6.5 min |
+| 9 | 3 | 1 | 6.7 min |
 
 *Updated after each plan completion*
 
@@ -62,6 +63,9 @@ Phase-level decisions from research phase:
 - [v1.1 Research]: Topic resolver scoped to dialog (dialog_name, topic_name) tuple to resolve ambiguity
 - [v1.1 Research]: Privacy audit mandatory before telemetry shipping (side-channel risks documented: Whisper Leak 2025)
 - [v1.1 Research]: Load test baseline required (100 concurrent ListMessages calls; verify <0.5ms telemetry overhead, no write contention)
+- [Phase 09]: Topic metadata lives in a dedicated topic_metadata table instead of entities
+- [Phase 09]: General topic is normalized explicitly as Telegram topic id=1 and synthesized when listings omit it
+- [Phase 09]: Deleted topics are preserved as tombstones and refreshed via GetForumTopicsByIDRequest
 
 ### Pending Todos
 
@@ -95,5 +99,5 @@ Roadmap created: 2026-03-12
 
 ## Session Continuity
 
-Last activity: 2026-03-12 02:59 UTC - Plan 08-02 (Archived Dialog Filtering) completed
-Phase 8 Plan 2 complete. Renamed archived parameter to exclude_archived with inverted semantics. Default behavior now shows both archived and non-archived dialogs. Entity cache populated from all dialogs. 2 new tests passing. Ready for Plan 03 (Forum Topics Support).
+Last activity: 2026-03-12 00:39 UTC - Plan 09-01 (Forum Topic Metadata Foundation) completed
+Phase 9 Plan 1 complete. Added a dialog-scoped topic metadata cache, raw forum topic pagination helpers, explicit General-topic normalization, and deleted-topic tombstones. Seven topic-focused tests pass. Ready for Plan 09-02 (`ListMessages(topic=...)` resolution and retrieval).

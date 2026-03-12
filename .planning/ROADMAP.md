@@ -26,7 +26,7 @@ Full details: `.planning/milestones/v1.0-ROADMAP.md`
 - 🔄 Phase 6: Telemetry Foundation (3/4 plans) — in progress
 - ✅ Phase 7: Cache Improvements & Optimization (3/3 plans) — completed 2026-03-12
 - 🔄 Phase 8: Navigation Features (1/2 plans) — in progress
-- [ ] Phase 9: Forum Topics Support (TBD plans)
+- 🔄 Phase 9: Forum Topics Support (1/3 plans) — in progress
 - [ ] Phase 10: Tech Debt Cleanup (TBD plans)
 
 </details>
@@ -43,7 +43,7 @@ Full details: `.planning/milestones/v1.0-ROADMAP.md`
 | 6. Telemetry Foundation | v1.1 | 3/4 | In progress | 2026-03-12 (06-03) |
 | 7. Cache Improvements & Optimization | v1.1 | 3/3 | Complete | 2026-03-12 (07-03) |
 | 8. Navigation Features | v1.1 | 1/2 | In progress | 2026-03-12 (08-01) |
-| 9. Forum Topics Support | v1.1 | 0/TBD | Not started | — |
+| 9. Forum Topics Support | v1.1 | 1/3 | In Progress | 2026-03-12 (09-01) |
 | 10. Tech Debt Cleanup | v1.1 | 0/TBD | Not started | — |
 
 ---
@@ -131,7 +131,10 @@ Full details: `.planning/milestones/v1.0-ROADMAP.md`
 4. Resolver handles (dialog_name, topic_name) tuple correctly; prevents ambiguity when multiple dialogs have identically-named topics
 5. Real forum group testing confirms filtering works with 100+ topics, some deleted, some private; pagination passes with no off-by-one errors
 
-**Plans:** TBD
+**Plans:**
+- [x] 09-01-PLAN.md — Topic metadata cache + raw forum topic pagination helpers (Wave 1) — completed 2026-03-12
+- [ ] 09-02-PLAN.md — `ListMessages(topic=...)` resolution, retrieval, and topic header output (Wave 2)
+- [ ] 09-03-PLAN.md — Edge-case hardening + live forum validation playbook (Wave 3)
 
 ---
 
