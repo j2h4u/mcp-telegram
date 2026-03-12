@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from mcp_telegram.cache import EntityCache, ReactionMetadataCache
+from mcp_telegram.cache import EntityCache, ReactionMetadataCache, TopicMetadataCache
 
 
 def test_persistence(tmp_db_path: Path) -> None:
@@ -254,6 +254,134 @@ def test_reaction_ttl_expiry(tmp_db_path: Path, monkeypatch: pytest.MonkeyPatch)
     # Cache hit with 1000s TTL (700s elapsed < 1000s)
     result = reaction_cache.get(message_id=100, dialog_id=50, ttl_seconds=1000)
     assert result == reactions
+
+    cache.close()
+
+
+def test_topic_metadata_cache_round_trip(tmp_db_path: Path) -> None:
+    """Topic metadata is scoped to a dialog and read back with forum flags intact."""
+    cache = EntityCache(tmp_db_path)
+    topic_cache = TopicMetadataCache(cache._conn)
+
+    topic_cache.upsert_topics(
+        dialog_id=777,
+        topics=[
+            {
+                "topic_id": 1,
+                "title": "General",
+                "top_message_id": 1001,
+                "is_general": True,
+                "is_deleted": False,
+            },
+            {
+                "topic_id": 42,
+                "title": "Release Notes",
+                "top_message_id": 2042,
+                "is_general": False,
+                "is_deleted": False,
+            },
+        ],
+    )
+
+    result = topic_cache.get_dialog_topics(dialog_id=777, ttl_seconds=600)
+    assert result is not None
+    assert result == [
+        {
+            "topic_id": 1,
+            "title": "General",
+            "top_message_id": 1001,
+            "is_general": True,
+            "is_deleted": False,
+        },
+        {
+            "topic_id": 42,
+            "title": "Release Notes",
+            "top_message_id": 2042,
+            "is_general": False,
+            "is_deleted": False,
+        },
+    ]
+    assert topic_cache.get_dialog_topics(dialog_id=778, ttl_seconds=600) is None
+
+    cache.close()
+
+
+def test_topic_metadata_cache_ttl(tmp_db_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Expired topic metadata returns a cache miss."""
+    import mcp_telegram.cache as cache_module
+
+    cache = EntityCache(tmp_db_path)
+    topic_cache = TopicMetadataCache(cache._conn)
+    topic_cache.upsert_topics(
+        dialog_id=777,
+        topics=[
+            {
+                "topic_id": 7,
+                "title": "Ops",
+                "top_message_id": 7007,
+                "is_general": False,
+                "is_deleted": False,
+            }
+        ],
+    )
+
+    original_time = time.time
+    monkeypatch.setattr(
+        cache_module,
+        "time",
+        type("_T", (), {"time": staticmethod(lambda: original_time() + 601)})(),
+    )
+
+    assert topic_cache.get_dialog_topics(dialog_id=777, ttl_seconds=600) is None
+    assert topic_cache.get_topic(dialog_id=777, topic_id=7, ttl_seconds=600) is None
+
+    cache.close()
+
+
+def test_topic_metadata_cache_deleted_marker(tmp_db_path: Path) -> None:
+    """Deleted topic tombstones stay addressable by ID but stay out of active listings."""
+    cache = EntityCache(tmp_db_path)
+    topic_cache = TopicMetadataCache(cache._conn)
+
+    topic_cache.upsert_topics(
+        dialog_id=777,
+        topics=[
+            {
+                "topic_id": 1,
+                "title": "General",
+                "top_message_id": 1001,
+                "is_general": True,
+                "is_deleted": False,
+            },
+            {
+                "topic_id": 9,
+                "title": "Deprecated",
+                "top_message_id": 9009,
+                "is_general": False,
+                "is_deleted": True,
+            },
+        ],
+    )
+
+    active_topics = topic_cache.get_dialog_topics(dialog_id=777, ttl_seconds=600)
+    deleted_topic = topic_cache.get_topic(dialog_id=777, topic_id=9, ttl_seconds=600)
+
+    assert active_topics == [
+        {
+            "topic_id": 1,
+            "title": "General",
+            "top_message_id": 1001,
+            "is_general": True,
+            "is_deleted": False,
+        }
+    ]
+    assert deleted_topic == {
+        "topic_id": 9,
+        "title": "Deprecated",
+        "top_message_id": 9009,
+        "is_general": False,
+        "is_deleted": True,
+    }
 
     cache.close()
 
