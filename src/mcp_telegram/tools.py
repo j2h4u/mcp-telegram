@@ -301,6 +301,48 @@ async def _refresh_topic_by_id(
     return topic
 
 
+async def _load_dialog_topics(
+    client: t.Any,
+    *,
+    entity: t.Any,
+    dialog_id: int,
+    topic_cache: TopicMetadataCache,
+    ttl_seconds: int = TOPIC_METADATA_TTL_SECONDS,
+) -> dict[str, t.Any]:
+    """Load one dialog's topic catalog from cache or Telegram and keep tombstones available."""
+    cached_topics = topic_cache.get_dialog_topics(
+        dialog_id,
+        ttl_seconds,
+        include_deleted=True,
+    )
+    if cached_topics is None:
+        cached_topics = await _fetch_all_forum_topics(client, entity=entity)
+        if cached_topics:
+            topic_cache.upsert_topics(dialog_id, cached_topics)
+    else:
+        normalized_topics = _with_general_topic(cached_topics)
+        if len(normalized_topics) != len(cached_topics):
+            topic_cache.upsert_topics(dialog_id, normalized_topics)
+        cached_topics = normalized_topics
+
+    metadata_by_id = {int(topic["topic_id"]): topic for topic in cached_topics}
+    choices = {
+        topic_id: str(topic["title"])
+        for topic_id, topic in metadata_by_id.items()
+        if not bool(topic["is_deleted"])
+    }
+    deleted_topics = {
+        topic_id: topic
+        for topic_id, topic in metadata_by_id.items()
+        if bool(topic["is_deleted"])
+    }
+    return {
+        "choices": choices,
+        "metadata_by_id": metadata_by_id,
+        "deleted_topics": deleted_topics,
+    }
+
+
 ### ListDialogs ###
 
 

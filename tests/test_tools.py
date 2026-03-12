@@ -301,6 +301,98 @@ async def test_refresh_topic_by_id_detects_deleted(tmp_db_path) -> None:
     cache.close()
 
 
+async def test_load_dialog_topics_uses_fresh_cache(tmp_db_path) -> None:
+    """Fresh cached topic metadata is returned without hitting Telegram."""
+    from mcp_telegram.tools import _load_dialog_topics
+
+    cache = EntityCache(tmp_db_path)
+    topic_cache = TopicMetadataCache(cache._conn)
+    topic_cache.upsert_topics(
+        dialog_id=777,
+        topics=[
+            {
+                "topic_id": 1,
+                "title": "General",
+                "top_message_id": None,
+                "is_general": True,
+                "is_deleted": False,
+            },
+            {
+                "topic_id": 2,
+                "title": "Releases",
+                "top_message_id": 1002,
+                "is_general": False,
+                "is_deleted": False,
+            },
+            {
+                "topic_id": 9,
+                "title": "Deprecated",
+                "top_message_id": 9009,
+                "is_general": False,
+                "is_deleted": True,
+            },
+        ],
+    )
+
+    client = AsyncMock(side_effect=AssertionError("cache hit should not fetch from Telegram"))
+
+    catalog = await _load_dialog_topics(
+        client,
+        entity=777,
+        dialog_id=777,
+        topic_cache=topic_cache,
+    )
+
+    assert catalog["choices"] == {1: "General", 2: "Releases"}
+    assert 9 in catalog["metadata_by_id"]
+    assert catalog["deleted_topics"][9]["is_deleted"] is True
+
+    cache.close()
+
+
+async def test_load_dialog_topics_fetches_and_persists_on_cache_miss(tmp_db_path) -> None:
+    """Cache miss fetches forum topics once and persists normalized metadata."""
+    from mcp_telegram.tools import _load_dialog_topics
+
+    cache = EntityCache(tmp_db_path)
+    topic_cache = TopicMetadataCache(cache._conn)
+
+    async def _call(request):
+        return SimpleNamespace(
+            topics=[
+                _make_mock_topic(topic_id=2, title="Releases", top_message_id=1002),
+            ],
+            count=1,
+        )
+
+    client = AsyncMock(side_effect=_call)
+
+    catalog = await _load_dialog_topics(
+        client,
+        entity=777,
+        dialog_id=777,
+        topic_cache=topic_cache,
+    )
+
+    assert catalog["choices"] == {1: "General", 2: "Releases"}
+    assert topic_cache.get_topic(dialog_id=777, topic_id=2, ttl_seconds=600) == {
+        "topic_id": 2,
+        "title": "Releases",
+        "top_message_id": 1002,
+        "is_general": False,
+        "is_deleted": False,
+    }
+    assert topic_cache.get_topic(dialog_id=777, topic_id=1, ttl_seconds=600) == {
+        "topic_id": 1,
+        "title": "General",
+        "top_message_id": None,
+        "is_general": True,
+        "is_deleted": False,
+    }
+
+    cache.close()
+
+
 # --- TOOL-06: SearchMessages context window ---
 
 
