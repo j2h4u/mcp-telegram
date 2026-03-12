@@ -883,14 +883,14 @@ class ListMessages(ToolArgs):
     Use unread=True to show only messages you haven't read yet.
     Use from_beginning=True to fetch messages oldest-first (starts from message ID 1). When true,
     pagination reads forward through time rather than backward.
-    Default limit=100; set limit explicitly if you want a smaller MCP response.
+    Default limit=50; set limit explicitly if you want a smaller MCP response.
 
     If response is ambiguous (multiple matches), use the numeric id= parameter with the ID from the matches list.
     For @username lookups, prepend @ to the name: dialog="@username".
     """
 
     dialog: str
-    limit: int = 100
+    limit: int = 50
     cursor: str | None = None
     sender: str | None = None
     topic: str | None = None
