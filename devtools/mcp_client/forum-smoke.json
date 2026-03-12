@@ -1,18 +1,98 @@
 {
   "steps": [
     {
-      "action": "list_tools"
-    },
-    {
-      "action": "call_tool",
-      "name": "ListDialogs",
-      "arguments": {}
+      "action": "list_tools",
+      "expect": {
+        "tool_names_include": [
+          "ListDialogs",
+          "ListMessages",
+          "SearchMessages",
+          "ListTopics"
+        ],
+        "tool_expectations": {
+          "ListMessages": {
+            "inputSchema.properties.limit.default": 50,
+            "inputSchema.properties.cursor.type": "string",
+            "inputSchema.properties.topic.type": "string"
+          },
+          "SearchMessages": {
+            "inputSchema.properties.offset.type": "integer"
+          }
+        }
+      }
     },
     {
       "action": "call_tool",
       "name": "ListTopics",
       "arguments": {
         "dialog": "Studio Robots and Inbox"
+      },
+      "expect": {
+        "is_error": false,
+        "content_text_contains": [
+          "topic_id=1 title=\"General\"",
+          "topic_id=40 title=\"Inbox\""
+        ]
+      }
+    },
+    {
+      "action": "call_tool",
+      "name": "ListTopics",
+      "arguments": {
+        "dialog": "-1003779402801"
+      },
+      "expect": {
+        "is_error": false,
+        "content_text_contains": [
+          "[resolved: \"-1003779402801\" → Studio Robots and Inbox]",
+          "topic_id=40 title=\"Inbox\""
+        ]
+      }
+    },
+    {
+      "action": "call_tool",
+      "name": "ListMessages",
+      "arguments": {
+        "dialog": "-1003779402801",
+        "topic": "Inbox",
+        "limit": 3
+      },
+      "expect": {
+        "is_error": false,
+        "content_text_contains": [
+          "[resolved: \"-1003779402801\" → Studio Robots and Inbox]",
+          "[topic: Inbox]",
+          "next_cursor:"
+        ]
+      }
+    },
+    {
+      "action": "call_tool",
+      "name": "ListMessages",
+      "arguments": {
+        "dialog": "Studio Robots and Inbox",
+        "limit": 5
+      },
+      "expect": {
+        "is_error": false,
+        "content_text_contains": [
+          "[topic: "
+        ]
+      }
+    },
+    {
+      "action": "call_tool",
+      "name": "ListMessages",
+      "arguments": {
+        "dialog": "Studio Robots and Inbox",
+        "topic": "DeletedTopic123",
+        "limit": 5
+      },
+      "expect": {
+        "is_error": false,
+        "content_text_contains": [
+          "Topic not found: \"DeletedTopic123\""
+        ]
       }
     }
   ]
