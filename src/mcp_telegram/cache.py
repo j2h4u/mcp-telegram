@@ -191,3 +191,120 @@ class ReactionMetadataCache:
             ],
         )
         self._conn.commit()
+
+
+class TopicMetadataCache:
+    """SQLite-backed cache for dialog-scoped forum topic metadata with TTL support."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        """Initialize the topic_metadata table and supporting index."""
+        self._conn = conn
+        self._init_table()
+
+    def _init_table(self) -> None:
+        """Create topic_metadata table and dialog lookup index if they don't exist."""
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS topic_metadata (
+                dialog_id      INTEGER NOT NULL,
+                topic_id       INTEGER NOT NULL,
+                title          TEXT NOT NULL,
+                top_message_id INTEGER,
+                is_general     INTEGER NOT NULL,
+                is_deleted     INTEGER NOT NULL,
+                updated_at     INTEGER NOT NULL,
+                PRIMARY KEY (dialog_id, topic_id)
+            )
+        """)
+        self._conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_topic_metadata_dialog_updated
+            ON topic_metadata(dialog_id, updated_at)
+        """)
+        self._conn.commit()
+
+    def get_dialog_topics(
+        self,
+        dialog_id: int,
+        ttl_seconds: int,
+        *,
+        include_deleted: bool = False,
+    ) -> list[dict[str, int | str | bool | None]] | None:
+        """Return fresh topic metadata for one dialog or None on cache miss."""
+        now = int(time.time())
+        rows = self._conn.execute(
+            """SELECT topic_id, title, top_message_id, is_general, is_deleted
+               FROM topic_metadata
+               WHERE dialog_id = ? AND updated_at >= ?
+               ORDER BY topic_id ASC""",
+            (dialog_id, now - ttl_seconds),
+        ).fetchall()
+        if not rows:
+            return None
+
+        topics = [self._row_to_topic(row) for row in rows]
+        if include_deleted:
+            return topics
+
+        active_topics = [topic for topic in topics if not topic["is_deleted"]]
+        return active_topics
+
+    def get_topic(
+        self,
+        dialog_id: int,
+        topic_id: int,
+        ttl_seconds: int,
+    ) -> dict[str, int | str | bool | None] | None:
+        """Return one fresh topic record or None on cache miss/expiry."""
+        row = self._conn.execute(
+            """SELECT topic_id, title, top_message_id, is_general, is_deleted, updated_at
+               FROM topic_metadata
+               WHERE dialog_id = ? AND topic_id = ?""",
+            (dialog_id, topic_id),
+        ).fetchone()
+        if row is None:
+            return None
+
+        updated_at = row[5]
+        if int(time.time()) - updated_at > ttl_seconds:
+            return None
+
+        return self._row_to_topic(row[:5])
+
+    def upsert_topics(
+        self,
+        dialog_id: int,
+        topics: list[dict[str, int | str | bool | None]],
+    ) -> None:
+        """Insert or replace topic metadata rows for a single dialog."""
+        now = int(time.time())
+        self._conn.executemany(
+            """INSERT OR REPLACE INTO topic_metadata
+               (dialog_id, topic_id, title, top_message_id, is_general, is_deleted, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            [
+                (
+                    dialog_id,
+                    int(topic["topic_id"]),
+                    str(topic["title"]),
+                    topic["top_message_id"],
+                    int(bool(topic["is_general"])),
+                    int(bool(topic["is_deleted"])),
+                    now,
+                )
+                for topic in topics
+            ],
+        )
+        self._conn.commit()
+
+    @staticmethod
+    def _row_to_topic(
+        row: tuple[int, str, int | None, int, int],
+    ) -> dict[str, int | str | bool | None]:
+        """Convert one SQLite row into the canonical topic metadata shape."""
+        topic_id, title, top_message_id, is_general, is_deleted = row
+        return {
+            "topic_id": topic_id,
+            "title": title,
+            "top_message_id": top_message_id,
+            "is_general": bool(is_general),
+            "is_deleted": bool(is_deleted),
+        }
