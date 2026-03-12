@@ -16,6 +16,7 @@ from mcp.types import (
     Tool,
 )
 from pydantic import BaseModel, ConfigDict
+from telethon.errors import RPCError
 from telethon import TelegramClient, custom, functions, types  # type: ignore[import-untyped]
 from telethon.tl.functions.messages import (
     GetCommonChatsRequest,
@@ -343,6 +344,109 @@ async def _load_dialog_topics(
     }
 
 
+def _resolve_deleted_topic(
+    requested_topic: str,
+    deleted_topics: dict[int, dict[str, int | str | bool | None]],
+) -> t.Any | None:
+    """Resolve one deleted topic by its preserved tombstone title, if any."""
+    deleted_choices = {
+        topic_id: str(topic["title"])
+        for topic_id, topic in deleted_topics.items()
+    }
+    if not deleted_choices:
+        return None
+
+    deleted_result = resolve(requested_topic, deleted_choices)
+    if isinstance(deleted_result, NotFound):
+        return None
+    return deleted_result
+
+
+def _deleted_topic_text(topic_name: str) -> str:
+    """Return the explicit user-facing message for deleted topics."""
+    return f'Topic "{topic_name}" was deleted and can no longer be fetched.'
+
+
+def _inaccessible_topic_text(topic_name: str, exc: RPCError) -> str:
+    """Return the explicit user-facing message for inaccessible topics."""
+    detail = getattr(exc, "message", None) or str(exc)
+    return f'Topic "{topic_name}" is inaccessible: {detail}'
+
+
+def _message_matches_topic(
+    message: object,
+    *,
+    topic_id: int,
+    top_message_id: int | None,
+) -> bool:
+    """Return True when one message belongs to the requested forum topic."""
+    anchor_ids = {topic_id}
+    if top_message_id is not None:
+        anchor_ids.add(top_message_id)
+
+    message_id = getattr(message, "id", None)
+    if isinstance(message_id, int) and message_id in anchor_ids:
+        return True
+
+    reply_to = getattr(message, "reply_to", None)
+    if reply_to is None:
+        return False
+
+    reply_to_top_id = getattr(reply_to, "reply_to_top_id", None)
+    if isinstance(reply_to_top_id, int) and reply_to_top_id in anchor_ids:
+        return True
+
+    reply_to_msg_id = getattr(reply_to, "reply_to_msg_id", None)
+    return isinstance(reply_to_msg_id, int) and reply_to_msg_id in anchor_ids
+
+
+async def _fetch_topic_messages(
+    client: t.Any,
+    *,
+    iter_kwargs: dict[str, t.Any],
+    topic_metadata: dict[str, int | str | bool | None],
+) -> list[object]:
+    """Fetch a topic page and strip any leaked adjacent-topic messages."""
+    requested_limit = int(iter_kwargs.get("limit", 0) or 0)
+    if requested_limit <= 0:
+        return []
+
+    topic_id = int(topic_metadata["topic_id"])
+    raw_top_message_id = topic_metadata["top_message_id"]
+    top_message_id = int(raw_top_message_id) if raw_top_message_id is not None else None
+
+    batch_kwargs = dict(iter_kwargs)
+    batch_limit = requested_limit
+    boundary_key = "min_id" if bool(batch_kwargs.get("reverse")) else "max_id"
+    topic_messages: list[object] = []
+
+    while len(topic_messages) < requested_limit:
+        raw_messages = [msg async for msg in client.iter_messages(**batch_kwargs)]
+        if not raw_messages:
+            break
+
+        for msg in raw_messages:
+            if _message_matches_topic(
+                msg,
+                topic_id=topic_id,
+                top_message_id=top_message_id,
+            ):
+                topic_messages.append(msg)
+                if len(topic_messages) == requested_limit:
+                    break
+
+        if len(topic_messages) == requested_limit or len(raw_messages) < batch_limit:
+            break
+
+        last_message_id = getattr(raw_messages[-1], "id", None)
+        previous_boundary = batch_kwargs.get(boundary_key)
+        if not isinstance(last_message_id, int) or previous_boundary == last_message_id:
+            break
+        batch_kwargs[boundary_key] = last_message_id
+
+    return topic_messages
+
+
 ### ListDialogs ###
 
 
@@ -543,14 +647,32 @@ async def list_messages(
             if args.topic:
                 has_filter = True
                 topic_cache = TopicMetadataCache(cache._conn)
-                topic_catalog = await _load_dialog_topics(
-                    client,
-                    entity=entity_id,
-                    dialog_id=entity_id,
-                    topic_cache=topic_cache,
-                )
+                try:
+                    topic_catalog = await _load_dialog_topics(
+                        client,
+                        entity=entity_id,
+                        dialog_id=entity_id,
+                        topic_cache=topic_cache,
+                    )
+                except RPCError as exc:
+                    return [TextContent(type="text", text=_inaccessible_topic_text(args.topic, exc))]
                 topic_result = resolve(args.topic, topic_catalog["choices"])
                 if isinstance(topic_result, NotFound):
+                    deleted_result = _resolve_deleted_topic(args.topic, topic_catalog["deleted_topics"])
+                    if isinstance(deleted_result, Candidates):
+                        match_lines = []
+                        for match in deleted_result.matches:
+                            match_lines.append(
+                                f'id={match["entity_id"]} name="{match["display_name"]}" score={match["score"]} [deleted]'
+                            )
+                        return [
+                            TextContent(
+                                type="text",
+                                text=f'Ambiguous deleted topic "{args.topic}". Matches:\n' + "\n".join(match_lines),
+                            )
+                        ]
+                    if deleted_result is not None:
+                        return [TextContent(type="text", text=_deleted_topic_text(deleted_result.display_name))]
                     return [TextContent(type="text", text=f'Topic not found: "{args.topic}"')]
                 if isinstance(topic_result, Candidates):
                     match_lines = []
@@ -566,6 +688,8 @@ async def list_messages(
                     ]
                 topic_metadata = topic_catalog["metadata_by_id"].get(topic_result.entity_id)
                 resolved_topic_name = topic_result.display_name
+                if topic_metadata is not None and bool(topic_metadata["is_deleted"]):
+                    return [TextContent(type="text", text=_deleted_topic_text(resolved_topic_name))]
                 if topic_metadata is not None and not bool(topic_metadata["is_general"]):
                     top_message_id = topic_metadata["top_message_id"]
                     if top_message_id is not None:
@@ -581,7 +705,20 @@ async def list_messages(
                 tl_dialog = peer_result.dialogs[0]
                 iter_kwargs["min_id"] = tl_dialog.read_inbox_max_id
 
-            fetched_messages = [msg async for msg in client.iter_messages(**iter_kwargs)]
+            try:
+                if topic_metadata is not None and not bool(topic_metadata["is_general"]) and "reply_to" in iter_kwargs:
+                    fetched_messages = await _fetch_topic_messages(
+                        client,
+                        iter_kwargs=iter_kwargs,
+                        topic_metadata=topic_metadata,
+                    )
+                else:
+                    fetched_messages = [msg async for msg in client.iter_messages(**iter_kwargs)]
+            except RPCError as exc:
+                if args.topic:
+                    topic_name = resolved_topic_name or args.topic
+                    return [TextContent(type="text", text=_inaccessible_topic_text(topic_name, exc))]
+                raise
             if filter_sender_after_fetch and sender_entity_id is not None:
                 # Telethon thread retrieval is reliable with reply_to; sender filtering is applied locally.
                 messages = [
