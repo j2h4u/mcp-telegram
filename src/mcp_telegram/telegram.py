@@ -6,7 +6,7 @@ import time
 from functools import cache
 from getpass import getpass
 
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from telethon import TelegramClient  # type: ignore[import-untyped]
 from telethon.errors.rpcerrorlist import SessionPasswordNeededError  # type: ignore[import-untyped]
 from telethon.tl.types import User  # type: ignore[import-untyped]
@@ -16,12 +16,10 @@ logger = logging.getLogger(__name__)
 
 
 class TelegramSettings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="TELEGRAM_", env_file=".env")
+
     api_id: str
     api_hash: str
-
-    class Config:
-        env_prefix = "TELEGRAM_"
-        env_file = ".env"
 
 
 async def connect_to_telegram(api_id: str, api_hash: str, phone_number: str) -> None:
