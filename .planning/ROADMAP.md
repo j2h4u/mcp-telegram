@@ -26,7 +26,7 @@ Full details: `.planning/milestones/v1.0-ROADMAP.md`
 - 🔄 Phase 6: Telemetry Foundation (3/4 plans) — in progress
 - ✅ Phase 7: Cache Improvements & Optimization (3/3 plans) — completed 2026-03-12
 - 🔄 Phase 8: Navigation Features (1/2 plans) — in progress
-- 🔄 Phase 9: Forum Topics Support (5/6 plans) — in progress
+- 🔄 Phase 9: Forum Topics Support (6/6 plans, live validation pending) — in progress
 - [ ] Phase 10: Tech Debt Cleanup (TBD plans)
 
 </details>
@@ -43,7 +43,7 @@ Full details: `.planning/milestones/v1.0-ROADMAP.md`
 | 6. Telemetry Foundation | v1.1 | 3/4 | In progress | 2026-03-12 (06-03) |
 | 7. Cache Improvements & Optimization | v1.1 | 3/3 | Complete | 2026-03-12 (07-03) |
 | 8. Navigation Features | v1.1 | 1/2 | In progress | 2026-03-12 (08-01) |
-| 9. Forum Topics Support | v1.1 | 5/6 | In Progress | 2026-03-12 (09-05) |
+| 9. Forum Topics Support | v1.1 | 6/6 | In Progress | 2026-03-12 (09-06) |
 | 10. Tech Debt Cleanup | v1.1 | 0/TBD | Not started | — |
 
 ---
@@ -137,7 +137,7 @@ Full details: `.planning/milestones/v1.0-ROADMAP.md`
 - [x] 09-03-PLAN.md — Edge-case hardening + live forum validation playbook (Wave 3)
 - [x] 09-04-PLAN.md — Revalidate stale topic anchors and differentiate deleted vs inaccessible `TOPIC_ID_INVALID` failures (Wave 4) — completed 2026-03-12
 - [x] 09-05-PLAN.md — Fix `topic + unread` scoping and topic-scoped cursor generation (Wave 5) — completed 2026-03-12
-- [ ] 09-06-PLAN.md — Add read-only topic debug CLI plus rebuilt-runtime closure checklist (Wave 6)
+- [x] 09-06-PLAN.md — Add read-only topic debug CLI plus rebuilt-runtime closure checklist (Wave 6) — completed 2026-03-12
 
 ---
 
