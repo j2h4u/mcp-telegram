@@ -133,7 +133,7 @@ Full details: `.planning/milestones/v1.0-ROADMAP.md`
 
 **Plans:**
 - [x] 09-01-PLAN.md — Topic metadata cache + raw forum topic pagination helpers (Wave 1) — completed 2026-03-12
-- [ ] 09-02-PLAN.md — `ListMessages(topic=...)` resolution, retrieval, and topic header output (Wave 2)
+- [x] 09-02-PLAN.md — `ListMessages(topic=...)` resolution, retrieval, and topic header output (Wave 2)
 - [ ] 09-03-PLAN.md — Edge-case hardening + live forum validation playbook (Wave 3)
 
 ---

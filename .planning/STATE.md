@@ -3,7 +3,7 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-last_updated: "2026-03-12T00:41:19.175Z"
+last_updated: "2026-03-12T00:51:08Z"
 last_activity: 2026-03-12
 progress:
   total_phases: 5
@@ -20,13 +20,13 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-12)
 
 **Core value:** LLM can work with Telegram using natural names — zero cold-start friction, no ID lookup boilerplate before every real task
-**Current focus:** Phase 9 (Forum Topics Support) — run `/gsd:execute-plan 09-02-PLAN.md`
+**Current focus:** Phase 9 (Forum Topics Support) — run `/gsd:execute-plan 09-03-PLAN.md`
 
 ## Current Position
 
 Phase: 9
-Plan: 2
-Status: Ready to execute (1/3 plans complete)
+Plan: 3
+Status: Ready to execute (2/3 plans complete)
 Last activity: 2026-03-12
 
 Progress: [█████████░] 92%
@@ -66,6 +66,9 @@ Phase-level decisions from research phase:
 - [Phase 09]: Topic metadata lives in a dedicated topic_metadata table instead of entities
 - [Phase 09]: General topic is normalized explicitly as Telegram topic id=1 and synthesized when listings omit it
 - [Phase 09]: Deleted topics are preserved as tombstones and refreshed via GetForumTopicsByIDRequest
+- [Phase 09]: ListMessages resolves topic names only after the dialog has been resolved, using that dialog's cached topic catalog
+- [Phase 09]: Non-General topic history uses iter_messages(reply_to=topic_root_id) and exposes the active topic name in the tool output
+- [Phase 09]: topic+sender filters locally after reply_to fetches, while topic+unread stays compatible with reply_to plus min_id
 
 ### Pending Todos
 
@@ -99,5 +102,5 @@ Roadmap created: 2026-03-12
 
 ## Session Continuity
 
-Last activity: 2026-03-12 00:39 UTC - Plan 09-01 (Forum Topic Metadata Foundation) completed
-Phase 9 Plan 1 complete. Added a dialog-scoped topic metadata cache, raw forum topic pagination helpers, explicit General-topic normalization, and deleted-topic tombstones. Seven topic-focused tests pass. Ready for Plan 09-02 (`ListMessages(topic=...)` resolution and retrieval).
+Last activity: 2026-03-12 00:51 UTC - Plan 09-02 (ListMessages topic support) completed
+Phase 9 Plan 2 complete. `ListMessages` now accepts `topic`, resolves topics inside the selected dialog, retrieves non-General topic threads with `reply_to`, prepends `[topic: ...]` in output, and defines explicit topic+sender/topic+unread behavior. Nine topic-focused tests pass. Ready for Plan 09-03 (edge-case hardening and live validation).

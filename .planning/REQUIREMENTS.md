@@ -28,9 +28,9 @@
 
 ### Forum Topics
 
-- [ ] **TOPIC-01** — `ListMessages` gains `topic: str | None` parameter: fuzzy-resolves topic name to topic ID in given supergroup, filters messages to that topic only
+- [x] **TOPIC-01** — `ListMessages` gains `topic: str | None` parameter: fuzzy-resolves topic name to topic ID in given supergroup, filters messages to that topic only
 - [x] **TOPIC-02** — Topic metadata cache: topic ID → name mapping stored with short TTL; resolved via `GetForumTopicsRequest`; handles edge cases (topic 0 = General, deleted topics → clear error, >50 topics → pagination)
-- [ ] **TOPIC-03** — Topic name shown in `ListMessages` output header when `topic` filter is active
+- [x] **TOPIC-03** — Topic name shown in `ListMessages` output header when `topic` filter is active
 
 ### Tech Debt (v1.0 carry-over)
 
@@ -73,9 +73,9 @@
 | CACHE-03 | 7 | Complete |
 | NAV-01 | 8 | Complete |
 | NAV-02 | 8 | Pending |
-| TOPIC-01 | 9 | Pending |
+| TOPIC-01 | 9 | Complete |
 | TOPIC-02 | 9 | Complete |
-| TOPIC-03 | 9 | Pending |
+| TOPIC-03 | 9 | Complete |
 | DEBT-01 | 10 | Pending |
 | DEBT-02 | 10 | Pending |
 | DEBT-03 | 10 | Pending |
