@@ -24,8 +24,13 @@ class EntityCache:
 
     def __init__(self, db_path: Path) -> None:
         """Open (or create) the SQLite database at db_path and ensure the schema exists."""
-        self._conn = sqlite3.connect(str(db_path), isolation_level=None)
-        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn = sqlite3.connect(str(db_path), isolation_level=None, timeout=30.0)
+        self._conn.execute("PRAGMA busy_timeout=30000")
+        try:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower():
+                raise
         self._conn.isolation_level = ""  # back to transactional
         self._conn.execute(_DDL)
         self._conn.commit()

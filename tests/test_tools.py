@@ -159,6 +159,41 @@ async def test_list_topics_catalog_unavailable(tmp_db_path, mock_client, monkeyp
     assert result[0].text == 'Dialog "Backend Forum" does not expose a readable forum-topic catalog (CHAT_NOT_FORUM).'
 
 
+async def test_list_topics_warms_dialog_cache_on_first_miss(tmp_db_path, mock_client, monkeypatch, make_mock_topic):
+    """ListTopics retries dialog resolution after refreshing the dialog cache."""
+    from mcp_telegram.cache import EntityCache
+    from mcp_telegram.tools import list_topics
+
+    cache = EntityCache(tmp_db_path)
+    dialog = MagicMock()
+    dialog.id = -1003779402801
+    dialog.name = "Studio Robots and Inbox"
+    dialog.is_user = False
+    dialog.is_group = True
+    dialog.is_channel = False
+    dialog.entity = MagicMock(username=None)
+
+    general_topic = make_mock_topic(topic_id=1, title="General", top_message_id=None, is_general=True)
+    inbox_topic = make_mock_topic(topic_id=40, title="Inbox", top_message_id=249)
+
+    mock_client.iter_dialogs = MagicMock(side_effect=lambda **_: _async_iter([dialog]))
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr(
+        "mcp_telegram.tools._load_dialog_topics",
+        AsyncMock(return_value={
+            "choices": {1: "General", 40: "Inbox"},
+            "metadata_by_id": {1: general_topic, 40: inbox_topic},
+            "deleted_topics": {},
+        }),
+    )
+
+    result = await list_topics(ListTopics(dialog="Studio Robots and Inbox"))
+
+    assert 'topic_id=40 title="Inbox" top_message_id=249 status=active' in result[0].text
+    assert cache.get(-1003779402801, 60) is not None
+
+
 def test_tool_description_strips_nullable_unions_from_exported_schema():
     """Exported MCP tool schemas should not expose explicit null unions."""
     list_messages_schema = tools_module.tool_description(ListMessages).inputSchema

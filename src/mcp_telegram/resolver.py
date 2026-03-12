@@ -43,6 +43,17 @@ class NotFound:
 ResolveResult = Resolved | Candidates | NotFound
 
 
+def _parse_numeric_query(query: str) -> int | None:
+    normalized = query.strip()
+    if not normalized:
+        return None
+    if normalized.isdigit():
+        return int(normalized)
+    if normalized[0] in "+-" and normalized[1:].isdigit():
+        return int(normalized)
+    return None
+
+
 def _has_cyrillic(text: str) -> bool:
     return any("\u0400" <= c <= "\u04ff" for c in text)
 
@@ -126,8 +137,8 @@ def resolve(query: str, choices: dict[int, str], cache: EntityCache | None = Non
         Resolved | Candidates | NotFound
     """
     # Case 1: Numeric ID query
-    if query.isdigit():
-        entity_id = int(query)
+    entity_id = _parse_numeric_query(query)
+    if entity_id is not None:
         if entity_id in choices:
             return Resolved(entity_id=entity_id, display_name=choices[entity_id])
         return NotFound(query=query)
