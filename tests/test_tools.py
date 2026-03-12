@@ -215,6 +215,105 @@ async def test_list_messages_unread_filter(mock_cache, mock_client, monkeypatch)
     assert call_kwargs.get("limit") == 100  # args.limit default, unread_count no longer caps it
 
 
+async def test_list_messages_topic_resolves_within_dialog(tmp_db_path, mock_client, monkeypatch):
+    """Topic names resolve inside the already-resolved dialog, not across all dialogs."""
+    from mcp_telegram.cache import EntityCache
+    from mcp_telegram.tools import ListMessages, list_messages
+
+    cache = EntityCache(tmp_db_path)
+    cache.upsert(701, "group", "Backend Forum", None)
+    cache.upsert(702, "group", "Ops Forum", None)
+
+    topic_loader = AsyncMock(side_effect=[
+        {
+            "choices": {11: "Release Notes"},
+            "metadata_by_id": {
+                11: {
+                    "topic_id": 11,
+                    "title": "Release Notes",
+                    "top_message_id": 5011,
+                    "is_general": False,
+                    "is_deleted": False,
+                },
+            },
+            "deleted_topics": {},
+        },
+    ])
+
+    msg = MagicMock()
+    msg.id = 77
+    msg.text = "Shipped"
+    msg.message = "Shipped"
+    msg.sender_id = 9001
+    msg.sender = MagicMock(first_name="Ivan", last_name=None, username=None)
+    msg.date = datetime(2024, 1, 15, 10, 0, 0, tzinfo=timezone.utc)
+    msg.reply_to = None
+    msg.reactions = None
+    msg.media = None
+
+    mock_client.iter_messages = MagicMock(return_value=_async_iter([msg]))
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr("mcp_telegram.tools._load_dialog_topics", topic_loader)
+
+    result = await list_messages(ListMessages(dialog="Backend Forum", topic="Release Notes"))
+
+    assert "Shipped" in result[0].text
+    assert topic_loader.await_args.kwargs["dialog_id"] == 701
+    assert mock_client.iter_messages.call_args.kwargs["entity"] == 701
+
+
+async def test_list_messages_topic_not_found(tmp_db_path, mock_client, monkeypatch):
+    """Missing topic names return a topic-specific not-found message."""
+    from mcp_telegram.cache import EntityCache
+    from mcp_telegram.tools import ListMessages, list_messages
+
+    cache = EntityCache(tmp_db_path)
+    cache.upsert(701, "group", "Backend Forum", None)
+
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr(
+        "mcp_telegram.tools._load_dialog_topics",
+        AsyncMock(return_value={"choices": {11: "Release Notes"}, "metadata_by_id": {}, "deleted_topics": {}}),
+    )
+
+    result = await list_messages(ListMessages(dialog="Backend Forum", topic="Incident Review"))
+
+    assert len(result) == 1
+    assert 'Topic not found: "Incident Review"' in result[0].text
+
+
+async def test_list_messages_topic_ambiguous_within_dialog(tmp_db_path, mock_client, monkeypatch):
+    """Fuzzy topic matches inside one dialog return candidates instead of auto-resolving."""
+    from mcp_telegram.cache import EntityCache
+    from mcp_telegram.tools import ListMessages, list_messages
+
+    cache = EntityCache(tmp_db_path)
+    cache.upsert(701, "group", "Backend Forum", None)
+
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr(
+        "mcp_telegram.tools._load_dialog_topics",
+        AsyncMock(return_value={
+            "choices": {
+                11: "Release Notes",
+                12: "Release Planning",
+            },
+            "metadata_by_id": {},
+            "deleted_topics": {},
+        }),
+    )
+
+    result = await list_messages(ListMessages(dialog="Backend Forum", topic="Release"))
+
+    assert len(result) == 1
+    assert 'Ambiguous topic "Release"' in result[0].text
+    assert 'name="Release Notes"' in result[0].text
+    assert 'name="Release Planning"' in result[0].text
+
+
 async def test_fetch_forum_topics_paginates() -> None:
     """Raw topic pagination advances offsets and de-duplicates topics across pages."""
     from mcp_telegram.tools import _fetch_all_forum_topics
