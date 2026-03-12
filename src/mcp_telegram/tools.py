@@ -211,13 +211,18 @@ def _normalize_topic_metadata(
 
     is_general = topic_id == GENERAL_TOPIC_ID or title.casefold() == GENERAL_TOPIC_TITLE.casefold()
     is_deleted = raw_title is None
-    return {
+    normalized_topic = {
         "topic_id": topic_id,
         "title": GENERAL_TOPIC_TITLE if is_general else title,
         "top_message_id": top_message_id,
         "is_general": is_general,
         "is_deleted": is_deleted,
     }
+    if existing_topic is not None and existing_topic.get("inaccessible_error") is not None:
+        normalized_topic["inaccessible_error"] = existing_topic["inaccessible_error"]
+    if existing_topic is not None and existing_topic.get("inaccessible_at") is not None:
+        normalized_topic["inaccessible_at"] = existing_topic["inaccessible_at"]
+    return normalized_topic
 
 
 def _with_general_topic(
@@ -435,17 +440,22 @@ def _topic_status(topic: dict[str, int | str | bool | None]) -> str:
         return "deleted"
     if bool(topic["is_general"]):
         return "general"
+    if topic.get("inaccessible_error"):
+        return "previously_inaccessible"
     return "active"
 
 
 def _topic_row_text(topic: dict[str, int | str | bool | None]) -> str:
     """Return one stable topic row for ListTopics output."""
-    return (
+    line = (
         f'topic_id={topic["topic_id"]} '
         f'title="{topic["title"]}" '
         f'top_message_id={topic["top_message_id"]} '
         f'status={_topic_status(topic)}'
     )
+    if topic.get("inaccessible_error"):
+        line += f' last_error={topic["inaccessible_error"]}'
+    return line
 
 
 def _is_topic_id_invalid_error(exc: RPCError) -> bool:
@@ -516,6 +526,8 @@ def _append_topic_match_metadata(
         line += f' status={_topic_status(topic)}'
         if topic["top_message_id"] is not None:
             line += f' top_message_id={topic["top_message_id"]}'
+        if topic.get("inaccessible_error"):
+            line += f' last_error={topic["inaccessible_error"]}'
     return line
 
 
@@ -1063,11 +1075,29 @@ async def list_messages(
                         return [TextContent(type="text", text=_deleted_topic_text(topic_name))]
                     if fetched_messages is None:
                         fetched_messages = []
+                    if (
+                        topic_cache is not None
+                        and topic_metadata is not None
+                        and not bool(topic_metadata["is_deleted"])
+                    ):
+                        topic_cache.clear_topic_inaccessible(
+                            entity_id,
+                            int(topic_metadata["topic_id"]),
+                        )
+                        topic_metadata["inaccessible_error"] = None
+                        topic_metadata["inaccessible_at"] = None
                 else:
                     fetched_messages = [msg async for msg in client.iter_messages(**iter_kwargs)]
             except RPCError as exc:
                 if args.topic:
                     topic_name = resolved_topic_name or args.topic
+                    if topic_cache is not None and topic_metadata is not None:
+                        topic_cache.mark_topic_inaccessible(
+                            entity_id,
+                            int(topic_metadata["topic_id"]),
+                            _rpc_error_detail(exc),
+                        )
+                        topic_metadata["inaccessible_error"] = _rpc_error_detail(exc)
                     return [TextContent(type="text", text=_inaccessible_topic_text(topic_name, exc, resolved=True))]
                 raise
             if filter_sender_after_fetch and sender_entity_id is not None:

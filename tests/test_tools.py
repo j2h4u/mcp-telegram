@@ -117,14 +117,17 @@ async def test_list_topics_returns_active_topics(tmp_db_path, mock_client, monke
     cache.upsert(701, "group", "Backend Forum", None)
     general_topic = make_mock_topic(topic_id=1, title="General", top_message_id=None, is_general=True)
     release_topic = make_mock_topic(topic_id=11, title="Release Notes", top_message_id=5011)
+    blocked_topic = make_mock_topic(topic_id=12, title="Inbox", top_message_id=6011)
+    blocked_topic["inaccessible_error"] = "TOPIC_ID_INVALID"
+    blocked_topic["inaccessible_at"] = 1_700_000_000
 
     monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
     monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
     monkeypatch.setattr(
         "mcp_telegram.tools._load_dialog_topics",
         AsyncMock(return_value={
-            "choices": {1: "General", 11: "Release Notes"},
-            "metadata_by_id": {1: general_topic, 11: release_topic},
+            "choices": {1: "General", 11: "Release Notes", 12: "Inbox"},
+            "metadata_by_id": {1: general_topic, 11: release_topic, 12: blocked_topic},
             "deleted_topics": {},
         }),
     )
@@ -133,6 +136,7 @@ async def test_list_topics_returns_active_topics(tmp_db_path, mock_client, monke
 
     assert 'topic_id=1 title="General" top_message_id=None status=general' in result[0].text
     assert 'topic_id=11 title="Release Notes" top_message_id=5011 status=active' in result[0].text
+    assert 'topic_id=12 title="Inbox" top_message_id=6011 status=previously_inaccessible last_error=TOPIC_ID_INVALID' in result[0].text
 
 
 async def test_list_topics_catalog_unavailable(tmp_db_path, mock_client, monkeypatch):
@@ -359,6 +363,47 @@ async def test_list_messages_topic_ambiguous_within_dialog(tmp_db_path, mock_cli
     assert 'Ambiguous topic "Release"' in result[0].text
     assert 'name="Release Notes"' in result[0].text
     assert 'name="Release Planning"' in result[0].text
+
+
+async def test_list_messages_topic_ambiguous_marks_previously_inaccessible_candidates(
+    tmp_db_path,
+    mock_client,
+    monkeypatch,
+    make_mock_topic,
+):
+    """Ambiguous topic matches surface prior inaccessibility from cached topic metadata."""
+    from mcp_telegram.cache import EntityCache
+    from mcp_telegram.tools import ListMessages, list_messages
+
+    cache = EntityCache(tmp_db_path)
+    cache.upsert(701, "group", "Backend Forum", None)
+    inaccessible_topic = make_mock_topic(topic_id=11, title="Release Notes", top_message_id=5011)
+    inaccessible_topic["inaccessible_error"] = "TOPIC_ID_INVALID"
+    inaccessible_topic["inaccessible_at"] = 1_700_000_000
+    active_topic = make_mock_topic(topic_id=12, title="Release Planning", top_message_id=6011)
+
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr(
+        "mcp_telegram.tools._load_dialog_topics",
+        AsyncMock(return_value={
+            "choices": {
+                11: "Release Notes",
+                12: "Release Planning",
+            },
+            "metadata_by_id": {
+                11: inaccessible_topic,
+                12: active_topic,
+            },
+            "deleted_topics": {},
+        }),
+    )
+
+    result = await list_messages(ListMessages(dialog="Backend Forum", topic="Release"))
+
+    assert 'name="Release Notes"' in result[0].text
+    assert "status=previously_inaccessible" in result[0].text
+    assert "last_error=TOPIC_ID_INVALID" in result[0].text
 
 
 async def test_list_messages_topic_header(
@@ -1006,6 +1051,7 @@ async def test_list_messages_topic_retries_after_stale_top_message_id(
     cache.upsert(701, "group", "Backend Forum", None)
     stale_topic = make_mock_topic(topic_id=11, title="Release Notes", top_message_id=5011)
     refreshed_topic = make_mock_topic(topic_id=11, title="Release Notes", top_message_id=6011)
+    TopicMetadataCache(cache._conn).upsert_topics(701, [stale_topic])
     recovered_message = make_mock_message(id=77, text="Recovered after refresh")
 
     mock_client.iter_messages = MagicMock(side_effect=[
@@ -1091,6 +1137,7 @@ async def test_list_messages_topic_inaccessible_after_refresh(
     cache.upsert(701, "group", "Backend Forum", None)
     stale_topic = make_mock_topic(topic_id=11, title="Release Notes", top_message_id=5011)
     refreshed_topic = make_mock_topic(topic_id=11, title="Release Notes", top_message_id=6011)
+    TopicMetadataCache(cache._conn).upsert_topics(701, [stale_topic])
 
     mock_client.iter_messages = MagicMock(side_effect=[
         tools_module.RPCError(request=None, message="TOPIC_ID_INVALID", code=400),
@@ -1117,6 +1164,10 @@ async def test_list_messages_topic_inaccessible_after_refresh(
     assert refresh_topic.await_count == 1
     assert mock_client.iter_messages.call_count == 3
     assert "reply_to" not in mock_client.iter_messages.call_args_list[2].kwargs
+    topic_cache = TopicMetadataCache(cache._conn)
+    cached_topic = topic_cache.get_topic(701, 11, ttl_seconds=600)
+    assert cached_topic is not None
+    assert cached_topic["inaccessible_error"] == "TOPIC_ID_INVALID"
 
 
 async def test_list_messages_topic_falls_back_to_dialog_scan_after_thread_fetch_failure(
