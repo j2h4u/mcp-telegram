@@ -384,6 +384,8 @@ def _message_matches_topic(
     *,
     topic_id: int,
     top_message_id: int | None,
+    is_general: bool,
+    allow_headerless_messages: bool,
 ) -> bool:
     """Return True when one message belongs to the requested forum topic."""
     anchor_ids = {topic_id}
@@ -396,7 +398,9 @@ def _message_matches_topic(
 
     reply_to = getattr(message, "reply_to", None)
     if reply_to is None:
-        return True
+        if is_general:
+            return True
+        return allow_headerless_messages
 
     reply_to_top_id = getattr(reply_to, "reply_to_top_id", None)
     if isinstance(reply_to_top_id, int) and reply_to_top_id in anchor_ids:
@@ -411,6 +415,7 @@ async def _fetch_topic_messages(
     *,
     iter_kwargs: dict[str, t.Any],
     topic_metadata: dict[str, int | str | bool | None],
+    allow_headerless_messages: bool,
 ) -> list[object]:
     """Fetch a topic page and strip any leaked adjacent-topic messages."""
     requested_limit = int(iter_kwargs.get("limit", 0) or 0)
@@ -420,6 +425,7 @@ async def _fetch_topic_messages(
     topic_id = int(topic_metadata["topic_id"])
     raw_top_message_id = topic_metadata["top_message_id"]
     top_message_id = int(raw_top_message_id) if raw_top_message_id is not None else None
+    is_general = bool(topic_metadata["is_general"])
 
     batch_kwargs = dict(iter_kwargs)
     batch_limit = requested_limit
@@ -436,6 +442,8 @@ async def _fetch_topic_messages(
                 msg,
                 topic_id=topic_id,
                 top_message_id=top_message_id,
+                is_general=is_general,
+                allow_headerless_messages=allow_headerless_messages,
             ):
                 topic_messages.append(msg)
                 if len(topic_messages) == requested_limit:
@@ -460,6 +468,7 @@ async def _fetch_messages_for_topic(
     iter_kwargs: dict[str, t.Any],
     topic_metadata: dict[str, int | str | bool | None],
     topic_cache: TopicMetadataCache,
+    allow_headerless_messages: bool,
 ) -> tuple[list[object] | None, dict[str, int | str | bool | None], dict[str, t.Any]]:
     """Fetch one topic page with one bounded by-ID refresh and retry on stale anchors."""
     active_iter_kwargs = dict(iter_kwargs)
@@ -470,6 +479,7 @@ async def _fetch_messages_for_topic(
             client,
             iter_kwargs=active_iter_kwargs,
             topic_metadata=active_topic_metadata,
+            allow_headerless_messages=allow_headerless_messages,
         )
         return messages, active_topic_metadata, active_iter_kwargs
     except RPCError as exc:
@@ -503,6 +513,7 @@ async def _fetch_messages_for_topic(
             client,
             iter_kwargs=active_iter_kwargs,
             topic_metadata=active_topic_metadata,
+            allow_headerless_messages=allow_headerless_messages,
         )
         return messages, active_topic_metadata, active_iter_kwargs
 
@@ -766,13 +777,26 @@ async def list_messages(
                 iter_kwargs["min_id"] = tl_dialog.read_inbox_max_id
 
             try:
-                if topic_metadata is not None and not bool(topic_metadata["is_general"]) and "reply_to" in iter_kwargs:
+                use_topic_scoped_fetch = (
+                    topic_metadata is not None
+                    and (
+                        args.unread
+                        or (
+                            not bool(topic_metadata["is_general"])
+                            and "reply_to" in iter_kwargs
+                        )
+                    )
+                )
+                if use_topic_scoped_fetch and topic_metadata is not None:
                     fetched_messages, topic_metadata, iter_kwargs = await _fetch_messages_for_topic(
                         client,
                         entity_id=entity_id,
                         iter_kwargs=iter_kwargs,
                         topic_metadata=topic_metadata,
                         topic_cache=topic_cache,
+                        allow_headerless_messages=(
+                            bool(topic_metadata["is_general"]) or not args.unread
+                        ),
                     )
                     if topic_metadata is not None and bool(topic_metadata["is_deleted"]):
                         topic_name = resolved_topic_name or args.topic or "Topic"
