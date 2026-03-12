@@ -559,6 +559,181 @@ async def test_list_messages_topic_unread_behavior(
     assert empty_result[0].text == "[topic: Release Notes]\n"
 
 
+async def test_list_messages_general_topic_unread_is_scoped(
+    tmp_db_path,
+    mock_client,
+    monkeypatch,
+    make_general_topic_message,
+    make_mock_message,
+    make_mock_topic,
+    make_mock_forum_reply,
+):
+    """General unread mode keeps only General messages and diverges from dialog-wide unread pages."""
+    from mcp_telegram.cache import EntityCache
+    from mcp_telegram.pagination import encode_cursor
+    from mcp_telegram.tools import ListMessages, list_messages
+
+    cache = EntityCache(tmp_db_path)
+    cache.upsert(701, "group", "Backend Forum", None)
+    general_topic = make_mock_topic(
+        topic_id=1,
+        title="General",
+        top_message_id=None,
+        is_general=True,
+    )
+
+    general_newest = make_general_topic_message(id=80, text="General unread newest")
+    leaked_adjacent = make_mock_message(id=79, text="Adjacent unread topic")
+    leaked_adjacent.reply_to = make_mock_forum_reply(reply_to_msg_id=7001, reply_to_top_id=7001)
+    general_older = make_general_topic_message(id=78, text="General unread older")
+
+    mock_client.get_input_entity = AsyncMock(return_value=MagicMock())
+    mock_client.side_effect = [
+        MagicMock(dialogs=[MagicMock(read_inbox_max_id=50, unread_count=3)]),
+        MagicMock(dialogs=[MagicMock(read_inbox_max_id=50, unread_count=3)]),
+    ]
+    mock_client.iter_messages = MagicMock(
+        side_effect=[
+            _async_iter([general_newest, leaked_adjacent]),
+            _async_iter([general_newest, leaked_adjacent, general_older]),
+        ]
+    )
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr(
+        "mcp_telegram.tools._load_dialog_topics",
+        AsyncMock(
+            return_value={
+                "choices": {1: "General"},
+                "metadata_by_id": {1: general_topic},
+                "deleted_topics": {},
+            }
+        ),
+    )
+
+    dialog_result = await list_messages(ListMessages(dialog="Backend Forum", unread=True, limit=2))
+    topic_result = await list_messages(
+        ListMessages(dialog="Backend Forum", topic="General", unread=True, limit=2)
+    )
+
+    assert "Adjacent unread topic" in dialog_result[0].text
+    assert f"next_cursor: {encode_cursor(79, 701)}" in dialog_result[0].text
+    assert "Adjacent unread topic" not in topic_result[0].text
+    assert "General unread newest" in topic_result[0].text
+    assert "General unread older" in topic_result[0].text
+    assert f"next_cursor: {encode_cursor(78, 701)}" in topic_result[0].text
+
+
+async def test_list_messages_topic_unread_cursor_is_topic_scoped(
+    tmp_db_path,
+    mock_client,
+    monkeypatch,
+    make_general_topic_message,
+    make_mock_message,
+    make_mock_topic,
+    make_mock_forum_reply,
+):
+    """Unread topic cursors use the last emitted topic message, not the last raw unread item."""
+    from mcp_telegram.cache import EntityCache
+    from mcp_telegram.pagination import encode_cursor
+    from mcp_telegram.tools import ListMessages, list_messages
+
+    cache = EntityCache(tmp_db_path)
+    cache.upsert(701, "group", "Backend Forum", None)
+    topic = make_mock_topic(topic_id=11, title="Release Notes", top_message_id=5011)
+    target_reply = make_mock_forum_reply(reply_to_msg_id=5011, reply_to_top_id=5011)
+
+    topic_newest = make_mock_message(id=90, text="Topic unread newest")
+    topic_newest.reply_to = target_reply
+    leaked_general = make_general_topic_message(id=89, text="General unread leak")
+    topic_older = make_mock_message(id=88, text="Topic unread older")
+    topic_older.reply_to = target_reply
+
+    mock_client.get_input_entity = AsyncMock(return_value=MagicMock())
+    mock_client.side_effect = [MagicMock(dialogs=[MagicMock(read_inbox_max_id=50, unread_count=3)])]
+    mock_client.iter_messages = MagicMock(
+        return_value=_async_iter([topic_newest, leaked_general, topic_older])
+    )
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr(
+        "mcp_telegram.tools._load_dialog_topics",
+        AsyncMock(
+            return_value={
+                "choices": {11: "Release Notes"},
+                "metadata_by_id": {11: topic},
+                "deleted_topics": {},
+            }
+        ),
+    )
+
+    result = await list_messages(
+        ListMessages(dialog="Backend Forum", topic="Release Notes", unread=True, limit=2)
+    )
+
+    assert "General unread leak" not in result[0].text
+    assert "Topic unread newest" in result[0].text
+    assert "Topic unread older" in result[0].text
+    assert f"next_cursor: {encode_cursor(88, 701)}" in result[0].text
+
+
+async def test_list_messages_topic_unread_filters_dialog_leaks(
+    tmp_db_path,
+    mock_client,
+    monkeypatch,
+    make_general_topic_message,
+    make_mock_message,
+    make_mock_topic,
+    make_mock_forum_reply,
+):
+    """Unread topic pages drop mixed-dialog leaks before formatting and cursor generation."""
+    from mcp_telegram.cache import EntityCache
+    from mcp_telegram.pagination import encode_cursor
+    from mcp_telegram.tools import ListMessages, list_messages
+
+    cache = EntityCache(tmp_db_path)
+    cache.upsert(701, "group", "Backend Forum", None)
+    topic = make_mock_topic(topic_id=11, title="Release Notes", top_message_id=5011)
+    target_reply = make_mock_forum_reply(reply_to_msg_id=5011, reply_to_top_id=5011)
+    adjacent_reply = make_mock_forum_reply(reply_to_msg_id=7001, reply_to_top_id=7001)
+
+    topic_newest = make_mock_message(id=70, text="Topic unread newest")
+    topic_newest.reply_to = target_reply
+    leaked_adjacent = make_mock_message(id=69, text="Adjacent unread leak")
+    leaked_adjacent.reply_to = adjacent_reply
+    leaked_general = make_general_topic_message(id=68, text="General unread leak")
+    topic_older = make_mock_message(id=67, text="Topic unread older")
+    topic_older.reply_to = target_reply
+
+    mock_client.get_input_entity = AsyncMock(return_value=MagicMock())
+    mock_client.side_effect = [MagicMock(dialogs=[MagicMock(read_inbox_max_id=50, unread_count=4)])]
+    mock_client.iter_messages = MagicMock(
+        return_value=_async_iter([topic_newest, leaked_adjacent, leaked_general, topic_older])
+    )
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr(
+        "mcp_telegram.tools._load_dialog_topics",
+        AsyncMock(
+            return_value={
+                "choices": {11: "Release Notes"},
+                "metadata_by_id": {11: topic},
+                "deleted_topics": {},
+            }
+        ),
+    )
+
+    result = await list_messages(
+        ListMessages(dialog="Backend Forum", topic="Release Notes", unread=True, limit=2)
+    )
+
+    assert "Adjacent unread leak" not in result[0].text
+    assert "General unread leak" not in result[0].text
+    assert "Topic unread newest" in result[0].text
+    assert "Topic unread older" in result[0].text
+    assert f"next_cursor: {encode_cursor(67, 701)}" in result[0].text
+
+
 async def test_list_messages_general_topic_normalization(
     tmp_db_path,
     mock_client,
