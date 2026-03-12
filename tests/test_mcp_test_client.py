@@ -41,8 +41,31 @@ async def test_mcp_test_client_surfaces_tool_errors() -> None:
 @pytest.mark.asyncio
 async def test_mcp_test_client_executes_script_steps() -> None:
     steps = [
-        {"action": "list_tools"},
-        {"action": "call_tool", "name": "Echo", "arguments": {"value": "script"}},
+        {
+            "action": "list_tools",
+            "expect": {
+                "tool_names_include": ["Echo", "Fail"],
+                "tool_expectations": {
+                    "Echo": {
+                        "inputSchema.properties.value.type": "string",
+                    }
+                },
+            },
+        },
+        {
+            "action": "call_tool",
+            "name": "Echo",
+            "arguments": {"value": "script"},
+            "expect": {
+                "is_error": False,
+                "path_equals": {
+                    "isError": False,
+                    "content.0.type": "text",
+                },
+                "content_text_contains": ['{"value": "script"}'],
+                "content_text_not_contains": ["missing"],
+            },
+        },
     ]
 
     async with StdioMcpClient(_fake_server_command()) as client:
@@ -52,3 +75,21 @@ async def test_mcp_test_client_executes_script_steps() -> None:
     assert results[0]["result"][0]["name"] == "Echo"
     assert results[1]["name"] == "Echo"
     assert results[1]["result"]["content"][0]["text"] == '{"value": "script"}'
+
+
+@pytest.mark.asyncio
+async def test_mcp_test_client_script_assertions_fail() -> None:
+    steps = [
+        {
+            "action": "call_tool",
+            "name": "Echo",
+            "arguments": {"value": "script"},
+            "expect": {
+                "content_text_contains": ["not-there"],
+            },
+        },
+    ]
+
+    async with StdioMcpClient(_fake_server_command()) as client:
+        with pytest.raises(McpClientError, match="missing expected text fragment"):
+            await execute_script_steps(client, steps)

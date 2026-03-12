@@ -38,5 +38,14 @@ Run several actions in one MCP session:
 ```bash
 uv run python -m devtools.mcp_client.cli script \
   --file devtools/mcp_client/forum-smoke.json \
-  -- docker exec mcp-telegram mcp-telegram run
+  -- docker exec -i mcp-telegram mcp-telegram run
 ```
+
+The `script` format supports assertions:
+
+- `expect.tool_names_include`
+- `expect.tool_expectations`
+- `expect.path_equals`
+- `expect.is_error`
+- `expect.content_text_contains`
+- `expect.content_text_not_contains`
