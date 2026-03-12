@@ -408,16 +408,115 @@ def _deleted_topic_text(topic_name: str) -> str:
     return f'Topic "{topic_name}" was deleted and can no longer be fetched.'
 
 
-def _inaccessible_topic_text(topic_name: str, exc: RPCError) -> str:
-    """Return the explicit user-facing message for inaccessible topics."""
+def _rpc_error_detail(exc: RPCError) -> str:
+    """Return the stable Telegram RPC detail for one exception."""
     detail = getattr(exc, "message", None) or str(exc)
-    return f'Topic "{topic_name}" is inaccessible: {detail}'
+    return str(detail)
+
+
+def _inaccessible_topic_text(topic_name: str, exc: RPCError, *, resolved: bool) -> str:
+    """Return a readable user-facing message for inaccessible topics."""
+    detail = _rpc_error_detail(exc)
+    if resolved:
+        return f'Topic "{topic_name}" resolved, but Telegram rejected thread fetch ({detail}).'
+
+    return f'Topic "{topic_name}" could not be loaded because Telegram rejected topic access ({detail}).'
+
+
+def _dialog_topics_unavailable_text(dialog_name: str, exc: RPCError) -> str:
+    """Return a readable message when one dialog cannot expose a topic catalog."""
+    detail = _rpc_error_detail(exc)
+    return f'Dialog "{dialog_name}" does not expose a readable forum-topic catalog ({detail}).'
+
+
+def _topic_status(topic: dict[str, int | str | bool | None]) -> str:
+    """Return one short topic status label for listings."""
+    if bool(topic["is_deleted"]):
+        return "deleted"
+    if bool(topic["is_general"]):
+        return "general"
+    return "active"
+
+
+def _topic_row_text(topic: dict[str, int | str | bool | None]) -> str:
+    """Return one stable topic row for ListTopics output."""
+    return (
+        f'topic_id={topic["topic_id"]} '
+        f'title="{topic["title"]}" '
+        f'top_message_id={topic["top_message_id"]} '
+        f'status={_topic_status(topic)}'
+    )
 
 
 def _is_topic_id_invalid_error(exc: RPCError) -> bool:
     """Return True when Telegram reports the cached thread anchor is invalid."""
-    detail = getattr(exc, "message", None) or str(exc)
-    return "TOPIC_ID_INVALID" in detail.upper()
+    return "TOPIC_ID_INVALID" in _rpc_error_detail(exc).upper()
+
+
+def _forum_topic_anchor_id(msg: object) -> int | None:
+    """Return the topic anchor message id for one forum message, if present."""
+    reply_to = getattr(msg, "reply_to", None)
+    if reply_to is None:
+        return None
+
+    top_id = getattr(reply_to, "reply_to_top_id", None)
+    if isinstance(top_id, int):
+        return top_id
+
+    if bool(getattr(reply_to, "forum_topic", False)):
+        reply_id = getattr(reply_to, "reply_to_msg_id", None)
+        if isinstance(reply_id, int):
+            return reply_id
+
+    return None
+
+
+def _messages_need_forum_topic_labels(messages: list[object]) -> bool:
+    """Return True when a mixed message page appears to come from a forum dialog."""
+    return any(_forum_topic_anchor_id(msg) is not None for msg in messages)
+
+
+def _build_topic_name_getter(
+    topic_catalog: dict[str, t.Any],
+) -> t.Callable[[object], str | None]:
+    """Build a formatter callback that labels cross-topic forum messages."""
+    topic_name_by_anchor: dict[int, str] = {}
+    for topic in topic_catalog["metadata_by_id"].values():
+        if bool(topic["is_deleted"]):
+            continue
+
+        topic_name_by_anchor[int(topic["topic_id"])] = str(topic["title"])
+        if topic["top_message_id"] is not None:
+            topic_name_by_anchor[int(topic["top_message_id"])] = str(topic["title"])
+
+    def _topic_name_for_message(msg: object) -> str | None:
+        anchor_id = _forum_topic_anchor_id(msg)
+        if anchor_id is None:
+            return GENERAL_TOPIC_TITLE
+        return topic_name_by_anchor.get(anchor_id)
+
+    return _topic_name_for_message
+
+
+def _topic_empty_state_text(*, unread: bool) -> str:
+    """Return the empty-state body for one ListMessages response."""
+    if unread:
+        return "no unread messages"
+    return ""
+
+
+def _append_topic_match_metadata(
+    match: dict[str, t.Any],
+    metadata_by_id: dict[int, dict[str, int | str | bool | None]],
+) -> str:
+    """Return one topic match line enriched with cached metadata."""
+    line = f'id={match["entity_id"]} name="{match["display_name"]}" score={match["score"]}'
+    topic = metadata_by_id.get(int(match["entity_id"]))
+    if topic is not None:
+        line += f' status={_topic_status(topic)}'
+        if topic["top_message_id"] is not None:
+            line += f' top_message_id={topic["top_message_id"]}'
+    return line
 
 
 def _message_matches_topic(
@@ -667,6 +766,99 @@ async def list_dialogs(
 ### ListMessages ###
 
 
+class ListTopics(ToolArgs):
+    """
+    List forum topics for one dialog.
+
+    Use this before topic= when working with forum supergroups so you can choose an exact topic
+    name or numeric topic_id instead of guessing via fuzzy match.
+    """
+
+    dialog: str
+
+
+@tool_runner.register
+async def list_topics(
+    args: ListTopics,
+) -> t.Sequence[TextContent | ImageContent | EmbeddedResource]:
+    """List dialog topics with telemetry recording."""
+    logger.info("method[ListTopics] args[%s]", args)
+    t0 = time.monotonic()
+    error_type = None
+    result_count = 0
+
+    try:
+        cache = get_entity_cache()
+        result = resolve(args.dialog, cache.all_names_with_ttl(USER_TTL, GROUP_TTL), cache)
+        if isinstance(result, NotFound):
+            return [TextContent(type="text", text=f'Dialog not found: "{args.dialog}"')]
+        if isinstance(result, Candidates):
+            match_lines = []
+            for match in result.matches:
+                line = f'id={match["entity_id"]} name="{match["display_name"]}" score={match["score"]}'
+                if match.get("username"):
+                    line += f' @{match["username"]}'
+                if match.get("entity_type"):
+                    line += f' [{match["entity_type"]}]'
+                match_lines.append(line)
+            return [TextContent(type="text", text=f'Ambiguous "{args.dialog}". Matches:\n' + "\n".join(match_lines))]
+
+        entity_id = result.entity_id
+        resolve_prefix = (
+            f'[resolved: "{args.dialog}" → {result.display_name}]\n'
+            if args.dialog.strip().lower() != result.display_name.strip().lower()
+            else ""
+        )
+
+        async with connected_client() as client:
+            topic_cache = TopicMetadataCache(cache._conn)
+            try:
+                topic_catalog = await _load_dialog_topics(
+                    client,
+                    entity=entity_id,
+                    dialog_id=entity_id,
+                    topic_cache=topic_cache,
+                )
+            except RPCError as exc:
+                return [TextContent(type="text", text=_dialog_topics_unavailable_text(result.display_name, exc))]
+
+        active_topics = [
+            topic_catalog["metadata_by_id"][topic_id]
+            for topic_id in sorted(topic_catalog["choices"])
+        ]
+        result_count = len(active_topics)
+        if not active_topics:
+            text = resolve_prefix + f'No active forum topics found for "{result.display_name}".'
+            return [TextContent(type="text", text=text)]
+
+        lines = [_topic_row_text(topic) for topic in active_topics]
+        result_text = resolve_prefix + "\n".join(lines)
+        result = [TextContent(type="text", text=result_text)]
+    except Exception as exc:
+        error_type = type(exc).__name__
+        raise
+    finally:
+        duration_ms = (time.monotonic() - t0) * 1000
+        try:
+            from .analytics import TelemetryEvent
+
+            collector = _get_analytics_collector()
+            collector.record_event(TelemetryEvent(
+                tool_name="ListTopics",
+                timestamp=time.time(),
+                duration_ms=duration_ms,
+                result_count=result_count,
+                has_cursor=False,
+                page_depth=1,
+                has_filter=True,
+                error_type=error_type,
+            ))
+        except Exception as e:
+            logger.error("Failed to record telemetry for ListTopics: %s", e)
+
+    return result
+
+
 class ListMessages(ToolArgs):
     """
     List messages in a dialog by name. Returns messages newest-first in human-readable format
@@ -675,9 +867,11 @@ class ListMessages(ToolArgs):
     Use cursor= with the next_cursor token from a previous response to page back in time.
     Use sender= to filter messages from a specific person (name string, resolved via fuzzy match).
     Use topic= to filter messages to one forum topic after the dialog has been resolved.
+    In forum dialogs, omitting topic= returns a cross-topic page and each message is labeled inline.
     Use unread=True to show only messages you haven't read yet.
     Use from_beginning=True to fetch messages oldest-first (starts from message ID 1). When true,
     pagination reads forward through time rather than backward.
+    Default limit=100; set limit explicitly if you want a smaller MCP response.
 
     If response is ambiguous (multiple matches), use the numeric id= parameter with the ID from the matches list.
     For @username lookups, prepend @ to the name: dialog="@username".
@@ -721,6 +915,7 @@ async def list_messages(
                 match_lines.append(line)
             return [TextContent(type="text", text=f'Ambiguous "{args.dialog}". Matches:\n' + "\n".join(match_lines))]
         entity_id: int = result.entity_id
+        dialog_cache_entry = cache.get(entity_id, GROUP_TTL)
         resolve_prefix = (
             f'[resolved: "{args.dialog}" → {result.display_name}]\n'
             if args.dialog.strip().lower() != result.display_name.strip().lower()
@@ -730,6 +925,8 @@ async def list_messages(
         resolved_topic_name: str | None = None
         sender_entity_id: int | None = None
         filter_sender_after_fetch = False
+        topic_cache: TopicMetadataCache | None = None
+        topic_catalog: dict[str, t.Any] | None = None
 
         # Step 2 — Build iter_messages kwargs
         iter_kwargs: dict[str, t.Any] = {
@@ -791,7 +988,7 @@ async def list_messages(
                         topic_cache=topic_cache,
                     )
                 except RPCError as exc:
-                    return [TextContent(type="text", text=_inaccessible_topic_text(args.topic, exc))]
+                    return [TextContent(type="text", text=_inaccessible_topic_text(args.topic, exc, resolved=False))]
                 topic_result = resolve(args.topic, topic_catalog["choices"])
                 if isinstance(topic_result, NotFound):
                     deleted_result = _resolve_deleted_topic(args.topic, topic_catalog["deleted_topics"])
@@ -813,9 +1010,7 @@ async def list_messages(
                 if isinstance(topic_result, Candidates):
                     match_lines = []
                     for match in topic_result.matches:
-                        match_lines.append(
-                            f'id={match["entity_id"]} name="{match["display_name"]}" score={match["score"]}'
-                        )
+                        match_lines.append(_append_topic_match_metadata(match, topic_catalog["metadata_by_id"]))
                     return [
                         TextContent(
                             type="text",
@@ -873,7 +1068,7 @@ async def list_messages(
             except RPCError as exc:
                 if args.topic:
                     topic_name = resolved_topic_name or args.topic
-                    return [TextContent(type="text", text=_inaccessible_topic_text(topic_name, exc))]
+                    return [TextContent(type="text", text=_inaccessible_topic_text(topic_name, exc, resolved=True))]
                 raise
             if filter_sender_after_fetch and sender_entity_id is not None:
                 # Telethon thread retrieval is reliable with reply_to; sender filtering is applied locally.
@@ -956,7 +1151,39 @@ async def list_messages(
                 except Exception:
                     pass  # fallback to count-only
 
-        text = format_messages(messages, reply_map=reply_map, reaction_names_map=reaction_names_map)
+            topic_name_getter: t.Callable[[object], str | None] | None = None
+            if (
+                not args.topic
+                and fetched_messages
+                and dialog_cache_entry is not None
+                and dialog_cache_entry["type"] == "group"
+            ):
+                if topic_cache is None:
+                    topic_cache = TopicMetadataCache(cache._conn)
+                try:
+                    if topic_catalog is None:
+                        topic_catalog = await _load_dialog_topics(
+                            client,
+                            entity=entity_id,
+                            dialog_id=entity_id,
+                            topic_cache=topic_cache,
+                        )
+                    if (
+                        _messages_need_forum_topic_labels(fetched_messages)
+                        or len(topic_catalog["choices"]) > 1
+                    ):
+                        topic_name_getter = _build_topic_name_getter(topic_catalog)
+                except RPCError:
+                    topic_name_getter = None
+
+        text = format_messages(
+            messages,
+            reply_map=reply_map,
+            reaction_names_map=reaction_names_map,
+            topic_name_getter=topic_name_getter,
+        )
+        if not text:
+            text = _topic_empty_state_text(unread=args.unread)
         next_cursor: str | None = None
         cursor_source_messages = fetched_messages if filter_sender_after_fetch else messages
         if len(cursor_source_messages) == args.limit and cursor_source_messages:

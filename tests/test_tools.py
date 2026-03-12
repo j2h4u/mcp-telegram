@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 import mcp_telegram.tools as tools_module
-from mcp_telegram.tools import ListDialogs, ListMessages, SearchMessages
+from mcp_telegram.tools import ListDialogs, ListMessages, ListTopics, SearchMessages
 from unittest.mock import AsyncMock, MagicMock, patch
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -106,6 +106,53 @@ async def test_list_dialogs_null_date(mock_cache, mock_client, monkeypatch):
     from mcp_telegram.tools import list_dialogs
     result = await list_dialogs(ListDialogs())
     assert "last_message_at=unknown" in result[0].text
+
+
+async def test_list_topics_returns_active_topics(tmp_db_path, mock_client, monkeypatch, make_mock_topic):
+    """ListTopics exposes stable rows for active forum topics."""
+    from mcp_telegram.cache import EntityCache
+    from mcp_telegram.tools import list_topics
+
+    cache = EntityCache(tmp_db_path)
+    cache.upsert(701, "group", "Backend Forum", None)
+    general_topic = make_mock_topic(topic_id=1, title="General", top_message_id=None, is_general=True)
+    release_topic = make_mock_topic(topic_id=11, title="Release Notes", top_message_id=5011)
+
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr(
+        "mcp_telegram.tools._load_dialog_topics",
+        AsyncMock(return_value={
+            "choices": {1: "General", 11: "Release Notes"},
+            "metadata_by_id": {1: general_topic, 11: release_topic},
+            "deleted_topics": {},
+        }),
+    )
+
+    result = await list_topics(ListTopics(dialog="Backend Forum"))
+
+    assert 'topic_id=1 title="General" top_message_id=None status=general' in result[0].text
+    assert 'topic_id=11 title="Release Notes" top_message_id=5011 status=active' in result[0].text
+
+
+async def test_list_topics_catalog_unavailable(tmp_db_path, mock_client, monkeypatch):
+    """ListTopics explains when Telegram rejects forum-topic catalog access."""
+    from mcp_telegram.cache import EntityCache
+    from mcp_telegram.tools import list_topics
+
+    cache = EntityCache(tmp_db_path)
+    cache.upsert(701, "group", "Backend Forum", None)
+
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr(
+        "mcp_telegram.tools._load_dialog_topics",
+        AsyncMock(side_effect=tools_module.RPCError(request=None, message="CHAT_NOT_FORUM", code=400)),
+    )
+
+    result = await list_topics(ListTopics(dialog="Backend Forum"))
+
+    assert result[0].text == 'Dialog "Backend Forum" does not expose a readable forum-topic catalog (CHAT_NOT_FORUM).'
 
 
 # --- TOOL-02: ListMessages name resolution ---
@@ -349,6 +396,49 @@ async def test_list_messages_topic_header(
     assert mock_client.iter_messages.call_args.kwargs["reply_to"] == 5011
 
 
+async def test_list_messages_cross_topic_pages_include_inline_topic_labels(
+    tmp_db_path,
+    mock_client,
+    monkeypatch,
+    make_general_topic_message,
+    make_mock_forum_reply,
+    make_mock_message,
+    make_mock_topic,
+):
+    """Forum dialogs without topic= label each emitted message inline with its topic name."""
+    from mcp_telegram.cache import EntityCache
+    from mcp_telegram.tools import ListMessages, list_messages
+
+    cache = EntityCache(tmp_db_path)
+    cache.upsert(701, "group", "Backend Forum", None)
+    release_topic = make_mock_topic(topic_id=11, title="Release Notes", top_message_id=5011)
+    target_reply = make_mock_forum_reply(reply_to_msg_id=11, reply_to_top_id=None)
+
+    topic_message = make_mock_message(id=77, text="Shipped topic update")
+    topic_message.reply_to = target_reply
+    general_message = make_general_topic_message(id=76, text="General fallback")
+
+    mock_client.iter_messages = MagicMock(return_value=_async_iter([topic_message, general_message]))
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr(
+        "mcp_telegram.tools._load_dialog_topics",
+        AsyncMock(return_value={
+            "choices": {1: "General", 11: "Release Notes"},
+            "metadata_by_id": {
+                1: make_mock_topic(topic_id=1, title="General", top_message_id=None, is_general=True),
+                11: release_topic,
+            },
+            "deleted_topics": {},
+        }),
+    )
+
+    result = await list_messages(ListMessages(dialog="Backend Forum", limit=5))
+
+    assert "[topic: General] 10:00 Иван: General fallback" in result[0].text
+    assert "[topic: Release Notes] 10:00 Иван: Shipped topic update" in result[0].text
+
+
 async def test_list_messages_topic_cursor_round_trip(
     tmp_db_path,
     mock_client,
@@ -556,7 +646,8 @@ async def test_list_messages_topic_unread_behavior(
     second_call_kwargs = mock_client.iter_messages.call_args_list[1].kwargs
     assert second_call_kwargs["reply_to"] == 5011
     assert second_call_kwargs["min_id"] == 70
-    assert empty_result[0].text == "[topic: Release Notes]\n"
+    assert empty_result[0].text == """[topic: Release Notes]
+no unread messages"""
 
 
 async def test_list_messages_general_topic_unread_is_scoped(
@@ -776,7 +867,8 @@ async def test_list_messages_topic_unread_empty_page_has_no_cursor(
         ListMessages(dialog="Backend Forum", topic="Release Notes", unread=True, limit=2)
     )
 
-    assert result[0].text == "[topic: Release Notes]\n"
+    assert result[0].text == """[topic: Release Notes]
+no unread messages"""
     assert "next_cursor" not in result[0].text
 
 
@@ -896,7 +988,7 @@ async def test_list_messages_private_or_inaccessible_topic_behavior(
 
     result = await list_messages(ListMessages(dialog="Backend Forum", topic="Release Notes"))
 
-    assert result[0].text == 'Topic "Release Notes" is inaccessible: TOPIC_PRIVATE'
+    assert result[0].text == 'Topic "Release Notes" resolved, but Telegram rejected thread fetch (TOPIC_PRIVATE).'
 
 
 async def test_list_messages_topic_retries_after_stale_top_message_id(
@@ -1021,7 +1113,7 @@ async def test_list_messages_topic_inaccessible_after_refresh(
 
     result = await list_messages(ListMessages(dialog="Backend Forum", topic="Release Notes"))
 
-    assert result[0].text == 'Topic "Release Notes" is inaccessible: TOPIC_ID_INVALID'
+    assert result[0].text == 'Topic "Release Notes" resolved, but Telegram rejected thread fetch (TOPIC_ID_INVALID).'
     assert refresh_topic.await_count == 1
     assert mock_client.iter_messages.call_count == 3
     assert "reply_to" not in mock_client.iter_messages.call_args_list[2].kwargs
