@@ -29,7 +29,7 @@
 ### Forum Topics
 
 - [x] **TOPIC-01** — `ListMessages` gains `topic: str | None` parameter: fuzzy-resolves topic name to topic ID in given supergroup, filters messages to that topic only
-- [x] **TOPIC-02** — Topic metadata cache: topic ID → name mapping stored with short TTL; resolved via `GetForumTopicsRequest`; handles edge cases (topic 0 = General, deleted topics → clear error, >50 topics → pagination)
+- [x] **TOPIC-02** — Topic metadata cache: topic ID → name mapping stored with short TTL; resolved via `GetForumTopicsRequest`; handles edge cases (General normalized explicitly, deleted/inaccessible topics → clear error, >50 topics → pagination)
 - [x] **TOPIC-03** — Topic name shown in `ListMessages` output header when `topic` filter is active
 
 ### Tech Debt (v1.0 carry-over)

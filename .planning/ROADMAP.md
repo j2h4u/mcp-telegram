@@ -118,7 +118,7 @@ Full details: `.planning/milestones/v1.0-ROADMAP.md`
 
 ### Phase 9: Forum Topics Support
 
-**Goal:** Enable ListMessages to filter by forum topic with comprehensive edge-case handling (topic 0, deleted topics, pagination).
+**Goal:** Enable ListMessages to filter by forum topic with comprehensive edge-case handling (General topic normalization, deleted/private topics, pagination).
 
 **Depends on:** Phase 7 (cache indexes), Phase 8 (navigation)
 
@@ -126,15 +126,15 @@ Full details: `.planning/milestones/v1.0-ROADMAP.md`
 
 **Success Criteria** (what must be TRUE):
 1. ListMessages accepts `topic: str | None` parameter; fuzzy-resolves topic name scoped to given dialog
-2. Topic metadata cached with short TTL (5-10 min); handles edge cases: topic 0 (General), deleted topics (permission_denied caught, fallback to unfiltered), >50 topics (pagination implemented)
-3. Messages filtered correctly by `reply_to.forum_topic_id == topic_id`; topic name shown in output header when filter active
+2. Topic metadata cached with short TTL (5-10 min); handles edge cases: General topic normalization, deleted topics (explicit tombstone), inaccessible topics (explicit RPC error), >50 topics (pagination implemented)
+3. Messages filtered correctly by topic thread boundaries with no adjacent-topic leakage; topic name shown in output header when filter active
 4. Resolver handles (dialog_name, topic_name) tuple correctly; prevents ambiguity when multiple dialogs have identically-named topics
 5. Real forum group testing confirms filtering works with 100+ topics, some deleted, some private; pagination passes with no off-by-one errors
 
 **Plans:**
 - [x] 09-01-PLAN.md — Topic metadata cache + raw forum topic pagination helpers (Wave 1) — completed 2026-03-12
 - [x] 09-02-PLAN.md — `ListMessages(topic=...)` resolution, retrieval, and topic header output (Wave 2)
-- [ ] 09-03-PLAN.md — Edge-case hardening + live forum validation playbook (Wave 3)
+- [x] 09-03-PLAN.md — Edge-case hardening + live forum validation playbook (Wave 3)
 
 ---
 
