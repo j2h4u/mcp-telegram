@@ -1,201 +1,206 @@
 ---
 phase: 09-forum-topics-support
-plan: 03
+plan: 06
 status: ready
 updated: 2026-03-12
 ---
 
 # Phase 9 Manual Validation
 
-Use this playbook to validate forum-topic behavior against a real Telegram forum supergroup before shipping.
+Use this checklist to close Phase 9 against the rebuilt `mcp-telegram` runtime, not just the local checkout.
 
 ## Preconditions
 
-- Export `TELEGRAM_API_ID` and `TELEGRAM_API_HASH` for the account you will test with.
-- Ensure the account already has a usable Telegram session for `uv run mcp-telegram` / `uv run cli.py`.
+- Export `TELEGRAM_API_ID` and `TELEGRAM_API_HASH`.
+- Ensure the Telegram session you will use is already valid for both `mcp-telegram` and local `cli.py` debugging.
 - Prepare one forum-enabled supergroup with:
   - 100+ topics if possible
-  - the default `General` topic still present
-  - at least one active non-General topic with 20+ messages
-  - at least two adjacent active topics with recent traffic
-  - one disposable topic that you can delete during validation
-- Optional but useful: a second Telegram account that does not have access to the target forum.
+  - the default `General` topic
+  - at least one active non-General topic with enough history for paging
+  - at least one topic that currently fails, was deleted, or is inaccessible/private
 
-## Tool Entry Points
+## 1. Rebuild And Restart The Runtime
 
-Terminal tool calls:
+Run this from the host:
 
 ```bash
-uv run cli.py list-tools
-uv run cli.py call-tool --name ListDialogs --arguments '{}'
-```
-
-Inspector:
-
-```bash
-npx @modelcontextprotocol/inspector uv run mcp-telegram
-```
-
-## 1. Confirm Dialog Discovery
-
-Find the exact forum dialog name first.
-
-```bash
-uv run cli.py call-tool --name ListDialogs --arguments '{}'
+docker compose -f /opt/docker/mcp-telegram/docker-compose.yml up -d --build mcp-telegram
 ```
 
 Expected result:
 
-- The forum supergroup is listed.
-- Use the exact dialog name from this output in all later commands.
+- The `mcp-telegram` container is recreated and started successfully.
 
-## 2. Validate General Topic Normalization
+## 2. Prove The Running Container Is Current
 
-Run the General-topic fetch explicitly.
+Verify the runtime inside the container before trusting any live results:
 
 ```bash
-uv run cli.py call-tool --name ListMessages --arguments '{"dialog":"<FORUM_NAME>","topic":"General","limit":5}'
+docker exec mcp-telegram mcp-telegram --help
+docker exec mcp-telegram /opt/venv/bin/python -c "import inspect,mcp_telegram.tools as t; src=inspect.getsource(t.list_messages); print('use_topic_scoped_fetch' in src); print('cursor_source_messages' in src); print('_fetch_topic_messages' in src)"
+docker exec mcp-telegram /opt/venv/bin/python -c "import inspect,mcp_telegram.tools as t; src=inspect.getsource(t._fetch_topic_messages); print('_message_matches_topic' in src); print('raw_messages' in src); print('topic_messages' in src)"
 ```
 
 Expected result:
 
-- Output starts with `[topic: General]`.
-- Messages are ordinary General-thread messages.
-- No topic-not-found error for `General`.
-- No evidence of a hard-coded `topic=0` assumption.
+- `mcp-telegram --help` works in the running container.
+- The first Python check prints `True` three times.
+- The second Python check prints `True` three times.
 
-Record:
+This proves the deployed runtime includes the `09-05` topic-unread scoping path before you continue to live validation.
 
-- Whether Telegram/Telethon treats General as topic id `1`.
-- Whether the returned General messages have any visible root-message quirks.
+## 3. Confirm The Local Debug CLI Surface
 
-## 3. Validate Topic Metadata Pagination Beyond the First Page
-
-Use the raw helper to enumerate all topics and confirm pagination past 100 topics.
+Run these from the repo checkout:
 
 ```bash
-uv run python - <<'PY'
-import asyncio
-
-from mcp_telegram.telegram import create_client
-from mcp_telegram.tools import _fetch_all_forum_topics
-
-FORUM_NAME = "<FORUM_NAME>"
-
-
-async def main() -> None:
-    client = create_client()
-    await client.connect()
-    try:
-        entity = await client.get_entity(FORUM_NAME)
-        topics = await _fetch_all_forum_topics(client, entity=entity)
-        print(f"total_topics={len(topics)}")
-        print("first_five=", topics[:5])
-        print("last_five=", topics[-5:])
-    finally:
-        await client.disconnect()
-
-
-asyncio.run(main())
-PY
+uv run python cli.py debug-topic-catalog --help
+uv run python cli.py debug-topic-by-id --help
 ```
 
 Expected result:
 
-- `total_topics` matches the forum’s visible topic count closely enough to explain deleted/private topics.
-- Topic count exceeds 100 without duplicates or obvious gaps.
-- `General` is present in the normalized output even if Telegram omits it from listing pages.
+- Both commands render help successfully.
 
-## 4. Validate Non-General Topic Paging
+## 4. Inspect Topic Catalog Pagination
 
-Pick one active non-General topic with enough messages to require pagination.
-
-First page:
+Use a small page size so the debug output must cross page boundaries:
 
 ```bash
-uv run cli.py call-tool --name ListMessages --arguments '{"dialog":"<FORUM_NAME>","topic":"<TOPIC_NAME>","limit":20}'
+uv run python cli.py debug-topic-catalog --dialog "<FORUM_NAME>" --page-size 10
 ```
 
-Next page:
+Capture:
 
-- Copy the `next_cursor` value from the first result.
+- `dialog_id=...`
+- at least `page=1 ...` and `page=2 ...`
+- topic rows containing:
+  - `topic_id=...`
+  - `title="..."`
+  - `top_message_id=...`
+  - `is_general=...`
+  - `is_deleted=...`
+- the final normalized summary:
+  - `normalized_catalog_count=...`
+  - `active_count=...`
+  - `deleted_count=...`
+
+Expected result:
+
+- Pagination clearly crosses the first page.
+- Topic ids and anchors look stable.
+- Deleted topics, if any, are visible as deleted.
+- General is visible in the normalized catalog.
+
+## 5. Inspect A Failing Topic By ID
+
+Pick one topic that previously failed by name or one deleted/inaccessible candidate from the catalog output.
 
 ```bash
-uv run cli.py call-tool --name ListMessages --arguments '{"dialog":"<FORUM_NAME>","topic":"<TOPIC_NAME>","limit":20,"cursor":"<NEXT_CURSOR>"}'
+uv run python cli.py debug-topic-by-id --dialog "<FORUM_NAME>" --topic-id <TOPIC_ID>
 ```
 
-From the beginning:
+Capture:
+
+- `cached=...`
+- `refreshed=...`
+
+Expected result:
+
+- You can distinguish one of these cases directly from the output:
+  - stale anchor: `top_message_id` changes after refresh
+  - deleted topic: refreshed metadata is deleted/tombstoned
+  - still inaccessible/unchanged: metadata remains active but the fetch issue is not an anchor mismatch
+
+## 6. Validate Topic Thread Fetches
+
+### First page
 
 ```bash
-uv run cli.py call-tool --name ListMessages --arguments '{"dialog":"<FORUM_NAME>","topic":"<TOPIC_NAME>","limit":20,"from_beginning":true}'
+uv run python cli.py call-tool --name ListMessages --arguments '{"dialog":"<FORUM_NAME>","topic":"<TOPIC_NAME>","limit":20}'
 ```
 
 Expected result:
 
-- Every page starts with `[topic: <TOPIC_NAME>]`.
-- First page contains only messages from the target topic.
-- Cursor page contains only messages from the target topic.
-- `from_beginning=true` returns oldest-first topic messages only.
-- No duplication between page 1 and page 2.
-- No adjacent-topic leakage at any page boundary.
+- Output starts with `[topic: <TOPIC_NAME>]`.
+- Messages belong only to the requested topic.
+- If a `next_cursor` is returned, save it.
 
-## 5. Validate Sender and Unread Combinations
-
-If the topic has a known sender and unread messages, run:
+### Next cursor page
 
 ```bash
-uv run cli.py call-tool --name ListMessages --arguments '{"dialog":"<FORUM_NAME>","topic":"<TOPIC_NAME>","sender":"<SENDER_NAME>","limit":20}'
-uv run cli.py call-tool --name ListMessages --arguments '{"dialog":"<FORUM_NAME>","topic":"<TOPIC_NAME>","unread":true,"limit":20}'
+uv run python cli.py call-tool --name ListMessages --arguments '{"dialog":"<FORUM_NAME>","topic":"<TOPIC_NAME>","limit":20,"cursor":"<NEXT_CURSOR>"}'
 ```
 
 Expected result:
 
-- Sender-filtered results stay inside the target topic.
-- Unread-filtered results stay inside the target topic.
-- Neither mode falls back to unrelated forum history.
+- Only older messages from the same topic appear.
+- No adjacent-topic leakage.
 
-## 6. Validate Deleted Topic Behavior
-
-Create a temporary topic, post at least one message, delete the topic in Telegram, then run:
+### From the beginning
 
 ```bash
-uv run cli.py call-tool --name ListMessages --arguments '{"dialog":"<FORUM_NAME>","topic":"<DELETED_TOPIC_NAME>","limit":5}'
+uv run python cli.py call-tool --name ListMessages --arguments '{"dialog":"<FORUM_NAME>","topic":"<TOPIC_NAME>","limit":20,"from_beginning":true}'
 ```
 
 Expected result:
 
-- The tool returns an explicit deleted-topic message.
-- It does not silently switch to unfiltered forum history.
+- Oldest-first topic-scoped output.
+- No unrelated messages.
 
-## 7. Validate Inaccessible / Private Behavior
-
-Use a second account that cannot access the target forum, or point the current session at a forum/topic that now returns a Telegram RPC access error.
+### Unread mode
 
 ```bash
-uv run cli.py call-tool --name ListMessages --arguments '{"dialog":"<FORUM_NAME>","topic":"<RESTRICTED_TOPIC_NAME>","limit":5}'
+uv run python cli.py call-tool --name ListMessages --arguments '{"dialog":"<FORUM_NAME>","topic":"<TOPIC_NAME>","unread":true,"limit":20}'
+uv run python cli.py call-tool --name ListMessages --arguments '{"dialog":"<FORUM_NAME>","topic":"General","unread":true,"limit":20}'
 ```
 
 Expected result:
 
-- The tool returns an explicit inaccessible-topic message with the RPC reason.
-- It does not return unrelated messages as if the topic filter worked.
+- The returned unread page stays inside the requested topic.
+- The General-topic unread result does not mirror the dialog-wide unread result.
+- Any `next_cursor` belongs to the last emitted topic message, not an unrelated unread item.
+
+## 7. Validate Deleted Or Inaccessible Behavior
+
+Run this against one deleted, private, or otherwise failing topic:
+
+```bash
+uv run python cli.py call-tool --name ListMessages --arguments '{"dialog":"<FORUM_NAME>","topic":"<FAILING_TOPIC_NAME>","limit":5}'
+```
+
+Expected result:
+
+- Deleted topics return the tombstone text.
+- Inaccessible topics return explicit RPC-driven text.
+- The tool never falls back to unrelated dialog history.
+
+If name-based probing is ambiguous, repeat with the `debug-topic-catalog` and `debug-topic-by-id` outputs to select the exact `topic_id` and refreshed anchor first.
+
+## Evidence To Capture For Roadmap Criterion 5
+
+- Forum name used and approximate topic count.
+- Proof that topic catalog pagination crossed page 1.
+- At least one topic id/title/top-message anchor from `debug-topic-catalog`.
+- One `debug-topic-by-id` before/after sample.
+- One successful non-General first page.
+- One successful cursor page.
+- One successful `from_beginning=true` sample.
+- One successful `unread=true` sample.
+- One deleted or inaccessible topic sample.
+- Explicit note that no adjacent-topic leakage was observed.
 
 ## Sign-Off Checklist
 
-- [ ] `General` resolves and reads successfully
-- [ ] Raw topic enumeration crosses 100 topics without duplicate/gap issues
-- [ ] Non-General topic page 1 is clean
-- [ ] Cursor page is clean
-- [ ] `from_beginning=true` is clean
-- [ ] Sender filter stays in-topic
-- [ ] Unread filter stays in-topic
-- [ ] Deleted topic returns explicit tombstone behavior
-- [ ] Inaccessible topic returns explicit RPC behavior
-
-## Notes to Capture
-
-- Forum name used
-- Approximate topic count
-- Topic names used for paging checks
-- Deleted topic name used
-- Any live Telegram behavior that differs from the mocked assumptions
+- [ ] Container rebuilt and restarted with `docker compose`
+- [ ] Running container proved current via in-container Python checks
+- [ ] `debug-topic-catalog` help works
+- [ ] `debug-topic-by-id` help works
+- [ ] Topic catalog pagination crosses the first page
+- [ ] By-id refresh distinguishes the failing topic state
+- [ ] First page topic fetch is correct
+- [ ] Cursor page is correct
+- [ ] `from_beginning=true` is correct
+- [ ] `unread=true` remains topic-scoped
+- [ ] Deleted/inaccessible topic behavior is explicit
+- [ ] No adjacent-topic leakage observed
