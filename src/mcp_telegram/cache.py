@@ -211,14 +211,34 @@ class TopicMetadataCache:
                 top_message_id INTEGER,
                 is_general     INTEGER NOT NULL,
                 is_deleted     INTEGER NOT NULL,
+                inaccessible_error TEXT,
+                inaccessible_at INTEGER,
                 updated_at     INTEGER NOT NULL,
                 PRIMARY KEY (dialog_id, topic_id)
             )
         """)
+        self._ensure_columns(
+            required_columns={
+                "inaccessible_error": "TEXT",
+                "inaccessible_at": "INTEGER",
+            }
+        )
         self._conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_topic_metadata_dialog_updated
             ON topic_metadata(dialog_id, updated_at)
         """)
+        self._conn.commit()
+
+    def _ensure_columns(self, required_columns: dict[str, str]) -> None:
+        """Add missing topic_metadata columns for forward-compatible cache upgrades."""
+        rows = self._conn.execute("PRAGMA table_info(topic_metadata)").fetchall()
+        existing_columns = {str(row[1]) for row in rows}
+        for column_name, column_type in required_columns.items():
+            if column_name in existing_columns:
+                continue
+            self._conn.execute(
+                f"ALTER TABLE topic_metadata ADD COLUMN {column_name} {column_type}"
+            )
         self._conn.commit()
 
     def get_dialog_topics(
@@ -231,7 +251,8 @@ class TopicMetadataCache:
         """Return fresh topic metadata for one dialog or None on cache miss."""
         now = int(time.time())
         rows = self._conn.execute(
-            """SELECT topic_id, title, top_message_id, is_general, is_deleted
+            """SELECT topic_id, title, top_message_id, is_general, is_deleted,
+                      inaccessible_error, inaccessible_at
                FROM topic_metadata
                WHERE dialog_id = ? AND updated_at >= ?
                ORDER BY topic_id ASC""",
@@ -255,7 +276,8 @@ class TopicMetadataCache:
     ) -> dict[str, int | str | bool | None] | None:
         """Return one fresh topic record or None on cache miss/expiry."""
         row = self._conn.execute(
-            """SELECT topic_id, title, top_message_id, is_general, is_deleted, updated_at
+            """SELECT topic_id, title, top_message_id, is_general, is_deleted,
+                      inaccessible_error, inaccessible_at, updated_at
                FROM topic_metadata
                WHERE dialog_id = ? AND topic_id = ?""",
             (dialog_id, topic_id),
@@ -263,11 +285,11 @@ class TopicMetadataCache:
         if row is None:
             return None
 
-        updated_at = row[5]
+        updated_at = row[7]
         if int(time.time()) - updated_at > ttl_seconds:
             return None
 
-        return self._row_to_topic(row[:5])
+        return self._row_to_topic(row[:7])
 
     def upsert_topics(
         self,
@@ -278,8 +300,9 @@ class TopicMetadataCache:
         now = int(time.time())
         self._conn.executemany(
             """INSERT OR REPLACE INTO topic_metadata
-               (dialog_id, topic_id, title, top_message_id, is_general, is_deleted, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+               (dialog_id, topic_id, title, top_message_id, is_general, is_deleted,
+                inaccessible_error, inaccessible_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             [
                 (
                     dialog_id,
@@ -288,6 +311,8 @@ class TopicMetadataCache:
                     topic["top_message_id"],
                     int(bool(topic["is_general"])),
                     int(bool(topic["is_deleted"])),
+                    topic.get("inaccessible_error"),
+                    topic.get("inaccessible_at"),
                     now,
                 )
                 for topic in topics
@@ -295,16 +320,52 @@ class TopicMetadataCache:
         )
         self._conn.commit()
 
+    def mark_topic_inaccessible(
+        self,
+        dialog_id: int,
+        topic_id: int,
+        error: str,
+    ) -> None:
+        """Persist one topic-level access failure without changing its title or anchor."""
+        now = int(time.time())
+        self._conn.execute(
+            """UPDATE topic_metadata
+               SET inaccessible_error = ?, inaccessible_at = ?, updated_at = ?
+               WHERE dialog_id = ? AND topic_id = ?""",
+            (error, now, now, dialog_id, topic_id),
+        )
+        self._conn.commit()
+
+    def clear_topic_inaccessible(
+        self,
+        dialog_id: int,
+        topic_id: int,
+    ) -> None:
+        """Clear prior access-failure state after a topic becomes readable again."""
+        now = int(time.time())
+        self._conn.execute(
+            """UPDATE topic_metadata
+               SET inaccessible_error = NULL, inaccessible_at = NULL, updated_at = ?
+               WHERE dialog_id = ? AND topic_id = ?""",
+            (now, dialog_id, topic_id),
+        )
+        self._conn.commit()
+
     @staticmethod
     def _row_to_topic(
-        row: tuple[int, str, int | None, int, int],
+        row: tuple[int, str, int | None, int, int, str | None, int | None],
     ) -> dict[str, int | str | bool | None]:
         """Convert one SQLite row into the canonical topic metadata shape."""
-        topic_id, title, top_message_id, is_general, is_deleted = row
-        return {
+        topic_id, title, top_message_id, is_general, is_deleted, inaccessible_error, inaccessible_at = row
+        topic = {
             "topic_id": topic_id,
             "title": title,
             "top_message_id": top_message_id,
             "is_general": bool(is_general),
             "is_deleted": bool(is_deleted),
         }
+        if inaccessible_error is not None:
+            topic["inaccessible_error"] = inaccessible_error
+        if inaccessible_at is not None:
+            topic["inaccessible_at"] = inaccessible_at
+        return topic
