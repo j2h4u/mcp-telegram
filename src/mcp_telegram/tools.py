@@ -390,7 +390,7 @@ def _message_matches_topic(
 
     reply_to = getattr(message, "reply_to", None)
     if reply_to is None:
-        return False
+        return True
 
     reply_to_top_id = getattr(reply_to, "reply_to_top_id", None)
     if isinstance(reply_to_top_id, int) and reply_to_top_id in anchor_ids:
