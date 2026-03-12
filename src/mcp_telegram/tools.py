@@ -488,6 +488,8 @@ async def list_messages(
         )
         topic_metadata: dict[str, int | str | bool | None] | None = None
         resolved_topic_name: str | None = None
+        sender_entity_id: int | None = None
+        filter_sender_after_fetch = False
 
         # Step 2 — Build iter_messages kwargs
         iter_kwargs: dict[str, t.Any] = {
@@ -530,7 +532,7 @@ async def list_messages(
                         line += f' [{match["entity_type"]}]'
                     match_lines.append(line)
                 return [TextContent(type="text", text=f'Ambiguous sender "{args.sender}". Matches:\n' + "\n".join(match_lines))]
-            iter_kwargs["from_user"] = sender_result.entity_id
+            sender_entity_id = sender_result.entity_id
 
         # Track unread as a filter
         if args.unread:
@@ -568,6 +570,10 @@ async def list_messages(
                     top_message_id = topic_metadata["top_message_id"]
                     if top_message_id is not None:
                         iter_kwargs["reply_to"] = int(top_message_id)
+                        filter_sender_after_fetch = sender_entity_id is not None
+
+            if sender_entity_id is not None and not filter_sender_after_fetch:
+                iter_kwargs["from_user"] = sender_entity_id
 
             if args.unread:
                 input_peer = await client.get_input_entity(entity_id)
@@ -575,10 +581,18 @@ async def list_messages(
                 tl_dialog = peer_result.dialogs[0]
                 iter_kwargs["min_id"] = tl_dialog.read_inbox_max_id
 
-            messages = [msg async for msg in client.iter_messages(**iter_kwargs)]
+            fetched_messages = [msg async for msg in client.iter_messages(**iter_kwargs)]
+            if filter_sender_after_fetch and sender_entity_id is not None:
+                # Telethon thread retrieval is reliable with reply_to; sender filtering is applied locally.
+                messages = [
+                    msg for msg in fetched_messages
+                    if getattr(msg, "sender_id", None) == sender_entity_id
+                ]
+            else:
+                messages = fetched_messages
 
             # Lazy cache population: upsert sender entities
-            for msg in messages:
+            for msg in fetched_messages:
                 sender = getattr(msg, "sender", None)
                 if sender is not None:
                     sender_name = " ".join(
@@ -651,8 +665,9 @@ async def list_messages(
 
         text = format_messages(messages, reply_map=reply_map, reaction_names_map=reaction_names_map)
         next_cursor: str | None = None
-        if len(messages) == args.limit and messages:
-            next_cursor = encode_cursor(messages[-1].id, entity_id)
+        cursor_source_messages = fetched_messages if filter_sender_after_fetch else messages
+        if len(cursor_source_messages) == args.limit and cursor_source_messages:
+            next_cursor = encode_cursor(cursor_source_messages[-1].id, entity_id)
 
         result_count = len(messages)
         topic_prefix = f"[topic: {resolved_topic_name}]\n" if resolved_topic_name else ""
