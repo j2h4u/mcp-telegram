@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 from types import SimpleNamespace
 
 from mcp_telegram.cache import EntityCache
+from telethon.errors import RPCError
 
 
 @pytest.fixture()
@@ -104,6 +105,61 @@ def make_mock_topic():
             "is_general": is_general,
             "is_deleted": is_deleted,
         }
+
+    return _make
+
+
+@pytest.fixture()
+def make_deleted_topic(make_mock_topic):
+    """Return a factory for tombstoned topic metadata rows."""
+
+    def _make(
+        *,
+        topic_id: int,
+        title: str,
+        top_message_id: int | None,
+    ) -> dict[str, int | str | bool | None]:
+        return make_mock_topic(
+            topic_id=topic_id,
+            title=title,
+            top_message_id=top_message_id,
+            is_deleted=True,
+        )
+
+    return _make
+
+
+@pytest.fixture()
+def make_general_topic_message(make_mock_message):
+    """Return a factory for General topic messages without thread reply headers."""
+
+    def _make(
+        *,
+        id: int,
+        text: str,
+        sender_id: int = 101,
+        sender_name: str = "Иван",
+        date: datetime | None = None,
+    ) -> MagicMock:
+        message = make_mock_message(
+            id=id,
+            text=text,
+            sender_id=sender_id,
+            sender_name=sender_name,
+            date=date,
+        )
+        message.reply_to = None
+        return message
+
+    return _make
+
+
+@pytest.fixture()
+def make_private_topic_error():
+    """Return a factory for Telethon RPC errors raised on inaccessible topics."""
+
+    def _make(message: str = "TOPIC_PRIVATE", code: int = 400) -> RPCError:
+        return RPCError(request=None, message=message, code=code)
 
     return _make
 

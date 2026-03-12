@@ -559,6 +559,215 @@ async def test_list_messages_topic_unread_behavior(
     assert empty_result[0].text == "[topic: Release Notes]\n"
 
 
+async def test_list_messages_general_topic_normalization(
+    tmp_db_path,
+    mock_client,
+    monkeypatch,
+    make_general_topic_message,
+    make_mock_topic,
+):
+    """General topic resolves through normalized metadata and does not use reply_to thread fetches."""
+    from mcp_telegram.cache import EntityCache
+    from mcp_telegram.tools import ListMessages, list_messages
+
+    cache = EntityCache(tmp_db_path)
+    cache.upsert(701, "group", "Backend Forum", None)
+    general_topic = make_mock_topic(
+        topic_id=1,
+        title="General",
+        top_message_id=None,
+        is_general=True,
+    )
+    message = make_general_topic_message(id=77, text="General update")
+
+    mock_client.iter_messages = MagicMock(return_value=_async_iter([message]))
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr(
+        "mcp_telegram.tools._load_dialog_topics",
+        AsyncMock(return_value={
+            "choices": {1: "General"},
+            "metadata_by_id": {1: general_topic},
+            "deleted_topics": {},
+        }),
+    )
+
+    result = await list_messages(ListMessages(dialog="Backend Forum", topic="General"))
+
+    call_kwargs = mock_client.iter_messages.call_args.kwargs
+    assert "reply_to" not in call_kwargs
+    assert result[0].text.startswith("[topic: General]\n")
+    assert "General update" in result[0].text
+
+
+async def test_list_messages_deleted_topic_behavior(
+    tmp_db_path,
+    mock_client,
+    monkeypatch,
+    make_deleted_topic,
+    make_mock_topic,
+):
+    """Deleted topic lookups return an explicit tombstone message instead of pretending the filter worked."""
+    from mcp_telegram.cache import EntityCache
+    from mcp_telegram.tools import ListMessages, list_messages
+
+    cache = EntityCache(tmp_db_path)
+    cache.upsert(701, "group", "Backend Forum", None)
+    general_topic = make_mock_topic(
+        topic_id=1,
+        title="General",
+        top_message_id=None,
+        is_general=True,
+    )
+    deleted_topic = make_deleted_topic(
+        topic_id=9,
+        title="Deprecated Topic",
+        top_message_id=5009,
+    )
+
+    mock_client.iter_messages = MagicMock(return_value=_async_iter([]))
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr(
+        "mcp_telegram.tools._load_dialog_topics",
+        AsyncMock(return_value={
+            "choices": {1: "General"},
+            "metadata_by_id": {
+                1: general_topic,
+                9: deleted_topic,
+            },
+            "deleted_topics": {9: deleted_topic},
+        }),
+    )
+
+    result = await list_messages(ListMessages(dialog="Backend Forum", topic="Deprecated Topic"))
+
+    assert result[0].text == 'Topic "Deprecated Topic" was deleted and can no longer be fetched.'
+    assert mock_client.iter_messages.call_count == 0
+
+
+async def test_list_messages_private_or_inaccessible_topic_behavior(
+    tmp_db_path,
+    mock_client,
+    monkeypatch,
+    make_mock_topic,
+    make_private_topic_error,
+):
+    """Inaccessible topics return an explicit RPC-driven message instead of falling back silently."""
+    from mcp_telegram.cache import EntityCache
+    from mcp_telegram.tools import ListMessages, list_messages
+
+    cache = EntityCache(tmp_db_path)
+    cache.upsert(701, "group", "Backend Forum", None)
+    topic = make_mock_topic(topic_id=11, title="Release Notes", top_message_id=5011)
+
+    mock_client.iter_messages = MagicMock(side_effect=make_private_topic_error())
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr(
+        "mcp_telegram.tools._load_dialog_topics",
+        AsyncMock(return_value={
+            "choices": {11: "Release Notes"},
+            "metadata_by_id": {11: topic},
+            "deleted_topics": {},
+        }),
+    )
+
+    result = await list_messages(ListMessages(dialog="Backend Forum", topic="Release Notes"))
+
+    assert result[0].text == 'Topic "Release Notes" is inaccessible: TOPIC_PRIVATE'
+
+
+async def test_list_messages_topic_boundary_no_leakage(
+    tmp_db_path,
+    mock_client,
+    monkeypatch,
+    make_mock_message,
+    make_mock_topic,
+    make_mock_forum_reply,
+):
+    """Topic pagination strips adjacent-topic leaks and keeps cursors aligned to emitted thread messages."""
+    from mcp_telegram.cache import EntityCache
+    from mcp_telegram.pagination import encode_cursor
+    from mcp_telegram.tools import ListMessages, list_messages
+
+    cache = EntityCache(tmp_db_path)
+    cache.upsert(701, "group", "Backend Forum", None)
+    topic = make_mock_topic(topic_id=11, title="Release Notes", top_message_id=5011)
+
+    target_reply = make_mock_forum_reply(reply_to_msg_id=5011, reply_to_top_id=5011)
+    leaked_reply = make_mock_forum_reply(reply_to_msg_id=7001, reply_to_top_id=7001)
+
+    newest = make_mock_message(id=50, text="Topic newest")
+    newest.reply_to = target_reply
+    leaked_newer = make_mock_message(id=49, text="Adjacent topic leak")
+    leaked_newer.reply_to = leaked_reply
+    older = make_mock_message(id=48, text="Topic older")
+    older.reply_to = target_reply
+
+    leaked_middle = make_mock_message(id=47, text="Adjacent middle leak")
+    leaked_middle.reply_to = leaked_reply
+    page_two_newest = make_mock_message(id=46, text="Topic page two newest")
+    page_two_newest.reply_to = target_reply
+    page_two_oldest = make_mock_message(id=44, text="Topic page two oldest")
+    page_two_oldest.reply_to = target_reply
+
+    reverse_leak = make_mock_message(id=9, text="Reverse adjacent leak")
+    reverse_leak.reply_to = leaked_reply
+    reverse_oldest = make_mock_message(id=10, text="Topic reverse oldest")
+    reverse_oldest.reply_to = target_reply
+    reverse_newest = make_mock_message(id=12, text="Topic reverse newest")
+    reverse_newest.reply_to = target_reply
+
+    mock_client.iter_messages = MagicMock(side_effect=[
+        _async_iter([newest, leaked_newer, older]),
+        _async_iter([leaked_middle, page_two_newest, page_two_oldest]),
+        _async_iter([reverse_oldest, reverse_leak, reverse_newest]),
+    ])
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr(
+        "mcp_telegram.tools._load_dialog_topics",
+        AsyncMock(return_value={
+            "choices": {11: "Release Notes"},
+            "metadata_by_id": {11: topic},
+            "deleted_topics": {},
+        }),
+    )
+
+    first_page = await list_messages(ListMessages(dialog="Backend Forum", topic="Release Notes", limit=2))
+
+    expected_cursor = encode_cursor(48, 701)
+    assert "Adjacent topic leak" not in first_page[0].text
+    assert "Topic newest" in first_page[0].text
+    assert "Topic older" in first_page[0].text
+    assert f"next_cursor: {expected_cursor}" in first_page[0].text
+
+    second_page = await list_messages(
+        ListMessages(dialog="Backend Forum", topic="Release Notes", limit=2, cursor=expected_cursor)
+    )
+
+    second_call_kwargs = mock_client.iter_messages.call_args_list[1].kwargs
+    assert second_call_kwargs["reply_to"] == 5011
+    assert second_call_kwargs["max_id"] == 48
+    assert "Adjacent middle leak" not in second_page[0].text
+    assert "Topic page two newest" in second_page[0].text
+    assert "Topic page two oldest" in second_page[0].text
+    assert "Topic newest" not in second_page[0].text
+
+    reverse_page = await list_messages(
+        ListMessages(dialog="Backend Forum", topic="Release Notes", from_beginning=True, limit=2)
+    )
+
+    reverse_call_kwargs = mock_client.iter_messages.call_args_list[2].kwargs
+    assert reverse_call_kwargs["reply_to"] == 5011
+    assert reverse_call_kwargs["reverse"] is True
+    assert reverse_call_kwargs["min_id"] == 1
+    assert "Reverse adjacent leak" not in reverse_page[0].text
+    assert "Topic reverse oldest" in reverse_page[0].text
+    assert "Topic reverse newest" in reverse_page[0].text
+
+
 async def test_fetch_forum_topics_paginates() -> None:
     """Raw topic pagination advances offsets and de-duplicates topics across pages."""
     from mcp_telegram.tools import _fetch_all_forum_topics
