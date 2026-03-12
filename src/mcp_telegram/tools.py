@@ -224,6 +224,61 @@ def _get_sender_type(sender: t.Any) -> str:
         return "user"
 
 
+def _cache_dialog_entry(cache: EntityCache, dialog: object) -> None:
+    """Persist one Telethon dialog in the local entity cache."""
+    dialog_id = getattr(dialog, "id", None)
+    dialog_name = getattr(dialog, "name", None)
+    if not isinstance(dialog_id, int) or not isinstance(dialog_name, str):
+        return
+
+    if getattr(dialog, "is_user", False):
+        dialog_type = "user"
+    elif getattr(dialog, "is_group", False):
+        dialog_type = "group"
+    elif getattr(dialog, "is_channel", False):
+        dialog_type = "channel"
+    else:
+        dialog_type = "unknown"
+
+    entity = getattr(dialog, "entity", None)
+    username = getattr(entity, "username", None) if entity is not None else None
+    cache.upsert(dialog_id, dialog_type, dialog_name, username)
+
+
+async def _resolve_dialog(cache: EntityCache, query: str) -> Resolved | Candidates | NotFound:
+    """Resolve one dialog, retrying once after a live cache warmup."""
+    result = resolve(query, cache.all_names_with_ttl(USER_TTL, GROUP_TTL), cache)
+    if not isinstance(result, NotFound):
+        return result
+
+    try:
+        async with connected_client() as client:
+            live_choices: dict[int, str] = {}
+            async for dialog in client.iter_dialogs(archived=None, ignore_pinned=False):
+                dialog_id = getattr(dialog, "id", None)
+                dialog_name = getattr(dialog, "name", None)
+                if isinstance(dialog_id, int) and isinstance(dialog_name, str):
+                    live_choices[dialog_id] = dialog_name
+                try:
+                    _cache_dialog_entry(cache, dialog)
+                except sqlite3.OperationalError as cache_exc:
+                    logger.warning(
+                        "dialog_cache_refresh_failed query=%r dialog_id=%r error=%s",
+                        query,
+                        dialog_id,
+                        cache_exc,
+                    )
+    except Exception as exc:
+        logger.warning("dialog_resolve_warmup_failed query=%r error=%s", query, exc)
+        return result
+
+    refreshed_result = resolve(query, cache.all_names_with_ttl(USER_TTL, GROUP_TTL), cache)
+    if not isinstance(refreshed_result, NotFound):
+        return refreshed_result
+
+    return resolve(query, live_choices, cache)
+
+
 def _normalize_topic_metadata(
     topic: object,
     *,
@@ -778,9 +833,7 @@ async def list_dialogs(
                     dtype = "unknown"
                 last_at = dialog.date.strftime("%Y-%m-%d %H:%M") if dialog.date else "unknown"
                 # Lazy cache warm-up: upsert entity metadata on every ListDialogs call
-                entity = dialog.entity
-                username: str | None = getattr(entity, "username", None)
-                cache.upsert(dialog.id, dtype, dialog.name, username)
+                _cache_dialog_entry(cache, dialog)
                 lines.append(
                     f"name='{dialog.name}' id={dialog.id} type={dtype} "
                     f"last_message_at={last_at} unread={dialog.unread_count}"
@@ -837,7 +890,7 @@ async def list_topics(
 
     try:
         cache = get_entity_cache()
-        result = resolve(args.dialog, cache.all_names_with_ttl(USER_TTL, GROUP_TTL), cache)
+        result = await _resolve_dialog(cache, args.dialog)
         if isinstance(result, NotFound):
             return [TextContent(type="text", text=f'Dialog not found: "{args.dialog}"')]
         if isinstance(result, Candidates):
@@ -949,7 +1002,7 @@ async def list_messages(
     try:
         # Step 1 — Resolve dialog name
         cache = get_entity_cache()
-        result = resolve(args.dialog, cache.all_names_with_ttl(USER_TTL, GROUP_TTL), cache)
+        result = await _resolve_dialog(cache, args.dialog)
         if isinstance(result, NotFound):
             return [TextContent(type="text", text=f'Dialog not found: "{args.dialog}"')]
         if isinstance(result, Candidates):
@@ -1318,7 +1371,7 @@ async def search_messages(
     try:
         # Step 1: Resolve dialog name
         cache = get_entity_cache()
-        result = resolve(args.dialog, cache.all_names_with_ttl(USER_TTL, GROUP_TTL), cache)
+        result = await _resolve_dialog(cache, args.dialog)
         if isinstance(result, NotFound):
             return [TextContent(type="text", text=f'Dialog not found: "{args.dialog}"')]
         if isinstance(result, Candidates):

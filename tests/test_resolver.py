@@ -25,6 +25,14 @@ def test_numeric_query(sample_entities: dict) -> None:
     assert result_missing.query == "999"
 
 
+def test_negative_numeric_query() -> None:
+    choices = {-1003779402801: "Studio Robots and Inbox"}
+    result = resolve("-1003779402801", choices)
+    assert isinstance(result, Resolved)
+    assert result.entity_id == -1003779402801
+    assert result.display_name == "Studio Robots and Inbox"
+
+
 def test_ambiguity(sample_entities: dict) -> None:
     # Both "Ivan Petrov" and "Ivan's Team Chat" start with "Ivan" — both should score >=90 with WRatio
     choices = {201: "Ivan Petrov", 202: "Ivan's Team Chat"}

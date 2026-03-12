@@ -70,6 +70,43 @@ def test_cross_process(tmp_db_path: Path) -> None:
     cache_b.close()
 
 
+def test_entity_cache_tolerates_locked_wal_setup(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """EntityCache should still initialize when journal_mode=WAL is temporarily locked."""
+    import mcp_telegram.cache as cache_module
+
+    class FakeConn:
+        def __init__(self) -> None:
+            self.isolation_level = None
+            self.seen_statements: list[str] = []
+
+        def execute(self, sql: str, params: tuple | None = None):  # noqa: ANN001
+            self.seen_statements.append(sql)
+            if sql == "PRAGMA journal_mode=WAL":
+                raise cache_module.sqlite3.OperationalError("database is locked")
+            return self
+
+        def fetchall(self):  # noqa: ANN201
+            return []
+
+        def fetchone(self):  # noqa: ANN201
+            return None
+
+        def commit(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    fake_conn = FakeConn()
+    monkeypatch.setattr(cache_module.sqlite3, "connect", lambda *args, **kwargs: fake_conn)
+
+    cache = EntityCache(tmp_path / "entity_cache.db")
+
+    assert "PRAGMA busy_timeout=30000" in fake_conn.seen_statements
+    assert cache_module._DDL.strip() in {statement.strip() for statement in fake_conn.seen_statements}
+    cache.close()
+
+
 def test_expired_returns_none(tmp_db_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Entity with updated_at 100s in past and ttl=50 returns None; ttl=200 returns entity."""
     import mcp_telegram.cache as cache_module
