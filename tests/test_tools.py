@@ -1,15 +1,35 @@
 from __future__ import annotations
+
 import pytest
 import mcp_telegram.tools as tools_module
 from mcp_telegram.tools import ListDialogs, ListMessages, SearchMessages
 from unittest.mock import AsyncMock, MagicMock, patch
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+
+from mcp_telegram.cache import EntityCache, TopicMetadataCache
 
 
 async def _async_iter(items):
     """Async generator yielding items from a list — local helper for test_tools.py."""
     for item in items:
         yield item
+
+
+def _make_mock_topic(
+    *,
+    topic_id: int,
+    title: str,
+    top_message_id: int,
+    date: datetime | None = None,
+):
+    """Create a lightweight topic-like object for raw Telethon helper tests."""
+    return SimpleNamespace(
+        id=topic_id,
+        title=title,
+        top_message=top_message_id,
+        date=date or datetime(2024, 1, 15, 10, 0, 0, tzinfo=timezone.utc),
+    )
 
 
 async def test_list_dialogs_multiple_newlines(mock_cache, mock_client, monkeypatch):
@@ -193,6 +213,94 @@ async def test_list_messages_unread_filter(mock_cache, mock_client, monkeypatch)
     call_kwargs = mock_client.iter_messages.call_args.kwargs
     assert call_kwargs.get("min_id") == 50
     assert call_kwargs.get("limit") == 100  # args.limit default, unread_count no longer caps it
+
+
+async def test_fetch_forum_topics_paginates() -> None:
+    """Raw topic pagination advances offsets and de-duplicates topics across pages."""
+    from mcp_telegram.tools import _fetch_all_forum_topics
+
+    page_one_topics = [
+        _make_mock_topic(topic_id=1, title="General", top_message_id=1001),
+        _make_mock_topic(topic_id=2, title="Releases", top_message_id=1002),
+    ]
+    page_two_topics = [
+        _make_mock_topic(
+            topic_id=2,
+            title="Releases",
+            top_message_id=1002,
+            date=datetime(2024, 1, 15, 10, 5, 0, tzinfo=timezone.utc),
+        ),
+        _make_mock_topic(
+            topic_id=3,
+            title="Ops",
+            top_message_id=1003,
+            date=datetime(2024, 1, 15, 10, 6, 0, tzinfo=timezone.utc),
+        ),
+    ]
+    requests: list[object] = []
+    responses = [
+        SimpleNamespace(topics=page_one_topics, count=3),
+        SimpleNamespace(topics=page_two_topics, count=3),
+    ]
+
+    async def _call(request):
+        requests.append(request)
+        return responses.pop(0)
+
+    client = MagicMock()
+    client.__call__ = AsyncMock(side_effect=_call)
+
+    topics = await _fetch_all_forum_topics(client, entity=777, page_size=2)
+
+    assert [topic["topic_id"] for topic in topics] == [1, 2, 3]
+    assert [topic["title"] for topic in topics] == ["General", "Releases", "Ops"]
+    assert len(requests) == 2
+    assert requests[0].offset_topic == 0
+    assert requests[1].offset_topic == 2
+    assert requests[1].offset_id == 1002
+    assert requests[1].offset_date == page_one_topics[-1].date
+
+
+async def test_refresh_topic_by_id_detects_deleted(tmp_db_path, monkeypatch) -> None:
+    """By-ID refresh turns a cached topic into a deleted tombstone."""
+    from mcp_telegram.tools import _refresh_topic_by_id
+
+    cache = EntityCache(tmp_db_path)
+    topic_cache = TopicMetadataCache(cache._conn)
+    topic_cache.upsert_topics(
+        dialog_id=777,
+        topics=[
+            {
+                "topic_id": 9,
+                "title": "Deprecated",
+                "top_message_id": 9009,
+                "is_general": False,
+                "is_deleted": False,
+            }
+        ],
+    )
+
+    async def _call(request):
+        return SimpleNamespace(topics=[SimpleNamespace(id=9)])
+
+    client = MagicMock()
+    client.__call__ = AsyncMock(side_effect=_call)
+
+    topic = await _refresh_topic_by_id(
+        client,
+        entity=777,
+        dialog_id=777,
+        topic_id=9,
+        topic_cache=topic_cache,
+    )
+
+    assert topic is not None
+    assert topic["topic_id"] == 9
+    assert topic["title"] == "Deprecated"
+    assert topic["is_deleted"] is True
+    assert topic_cache.get_topic(dialog_id=777, topic_id=9, ttl_seconds=600) == topic
+
+    cache.close()
 
 
 # --- TOOL-06: SearchMessages context window ---
