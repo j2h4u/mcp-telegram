@@ -247,8 +247,7 @@ async def test_fetch_forum_topics_paginates() -> None:
         requests.append(request)
         return responses.pop(0)
 
-    client = MagicMock()
-    client.__call__ = AsyncMock(side_effect=_call)
+    client = AsyncMock(side_effect=_call)
 
     topics = await _fetch_all_forum_topics(client, entity=777, page_size=2)
 
@@ -261,7 +260,7 @@ async def test_fetch_forum_topics_paginates() -> None:
     assert requests[1].offset_date == page_one_topics[-1].date
 
 
-async def test_refresh_topic_by_id_detects_deleted(tmp_db_path, monkeypatch) -> None:
+async def test_refresh_topic_by_id_detects_deleted(tmp_db_path) -> None:
     """By-ID refresh turns a cached topic into a deleted tombstone."""
     from mcp_telegram.tools import _refresh_topic_by_id
 
@@ -283,8 +282,7 @@ async def test_refresh_topic_by_id_detects_deleted(tmp_db_path, monkeypatch) -> 
     async def _call(request):
         return SimpleNamespace(topics=[SimpleNamespace(id=9)])
 
-    client = MagicMock()
-    client.__call__ = AsyncMock(side_effect=_call)
+    client = AsyncMock(side_effect=_call)
 
     topic = await _refresh_topic_by_id(
         client,

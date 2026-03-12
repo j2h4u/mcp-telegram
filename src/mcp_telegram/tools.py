@@ -26,7 +26,13 @@ from telethon.tl.types import Channel, Chat
 from telethon.utils import get_peer_id
 from xdg_base_dirs import xdg_state_home
 
-from .cache import EntityCache, GROUP_TTL, USER_TTL, ReactionMetadataCache
+from .cache import (
+    EntityCache,
+    GROUP_TTL,
+    USER_TTL,
+    ReactionMetadataCache,
+    TopicMetadataCache,
+)
 from .formatter import format_messages
 from .pagination import decode_cursor, encode_cursor
 from .resolver import Candidates, NotFound, resolve
@@ -35,6 +41,10 @@ from .telegram import create_client
 # Fetch reactor names only when total reactions per message are at or below this limit.
 # Covers personal chats (always ≤ a few) while skipping expensive lookups on busy groups.
 REACTION_NAMES_THRESHOLD = 15
+FORUM_TOPICS_PAGE_SIZE = 100
+TOPIC_METADATA_TTL_SECONDS = 600
+GENERAL_TOPIC_ID = 1
+GENERAL_TOPIC_TITLE = "General"
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +145,160 @@ def _get_sender_type(sender: t.Any) -> str:
         return "group"
     else:
         return "user"
+
+
+def _normalize_topic_metadata(
+    topic: object,
+    *,
+    existing_topic: dict[str, int | str | bool | None] | None = None,
+) -> dict[str, int | str | bool | None]:
+    """Normalize raw Telethon forum-topic objects into cache metadata rows."""
+    topic_id = int(getattr(topic, "id"))
+    raw_title = getattr(topic, "title", None)
+    if raw_title is None and existing_topic is not None:
+        title = str(existing_topic["title"])
+    elif raw_title is None:
+        title = f"Topic {topic_id}"
+    else:
+        title = str(raw_title)
+
+    raw_top_message_id = getattr(topic, "top_message", None)
+    if raw_top_message_id is None and existing_topic is not None:
+        top_message_id = existing_topic["top_message_id"]
+    else:
+        top_message_id = raw_top_message_id
+
+    is_general = topic_id == GENERAL_TOPIC_ID or title.casefold() == GENERAL_TOPIC_TITLE.casefold()
+    is_deleted = raw_title is None
+    return {
+        "topic_id": topic_id,
+        "title": GENERAL_TOPIC_TITLE if is_general else title,
+        "top_message_id": top_message_id,
+        "is_general": is_general,
+        "is_deleted": is_deleted,
+    }
+
+
+def _with_general_topic(
+    topics: list[dict[str, int | str | bool | None]],
+) -> list[dict[str, int | str | bool | None]]:
+    """Ensure the General topic is represented explicitly in topic metadata."""
+    if any(bool(topic["is_general"]) for topic in topics):
+        return sorted(topics, key=lambda topic: int(topic["topic_id"]))
+
+    return [
+        {
+            "topic_id": GENERAL_TOPIC_ID,
+            "title": GENERAL_TOPIC_TITLE,
+            "top_message_id": None,
+            "is_general": True,
+            "is_deleted": False,
+        },
+        *sorted(topics, key=lambda topic: int(topic["topic_id"])),
+    ]
+
+
+async def _fetch_forum_topics_page(
+    client: t.Any,
+    *,
+    entity: t.Any,
+    offset_date: object | None = None,
+    offset_id: int = 0,
+    offset_topic: int = 0,
+    limit: int = FORUM_TOPICS_PAGE_SIZE,
+) -> tuple[list[object], int]:
+    """Fetch one raw page of forum topics using Telegram's channels.getForumTopics RPC."""
+    response = await client(functions.channels.GetForumTopicsRequest(
+        channel=entity,
+        offset_date=offset_date,
+        offset_id=offset_id,
+        offset_topic=offset_topic,
+        limit=limit,
+    ))
+    topics = list(getattr(response, "topics", []))
+    total_count = int(getattr(response, "count", len(topics)))
+    return topics, total_count
+
+
+async def _fetch_all_forum_topics(
+    client: t.Any,
+    *,
+    entity: t.Any,
+    page_size: int = FORUM_TOPICS_PAGE_SIZE,
+) -> list[dict[str, int | str | bool | None]]:
+    """Fetch and normalize all forum topics for one dialog via raw paginated RPC calls."""
+    offset_date: object | None = None
+    offset_id = 0
+    offset_topic = 0
+    topics_by_id: dict[int, dict[str, int | str | bool | None]] = {}
+    seen_server_topic_ids: set[int] = set()
+    total_count: int | None = None
+
+    while True:
+        page_topics, page_count = await _fetch_forum_topics_page(
+            client,
+            entity=entity,
+            offset_date=offset_date,
+            offset_id=offset_id,
+            offset_topic=offset_topic,
+            limit=page_size,
+        )
+        if total_count is None:
+            total_count = page_count
+        if not page_topics:
+            break
+
+        for topic in page_topics:
+            normalized_topic = _normalize_topic_metadata(topic)
+            topic_id = int(normalized_topic["topic_id"])
+            topics_by_id[topic_id] = normalized_topic
+            seen_server_topic_ids.add(topic_id)
+
+        last_topic = page_topics[-1]
+        next_offset_topic = int(getattr(last_topic, "id"))
+        next_offset_id = getattr(last_topic, "top_message", 0) or 0
+        next_offset_date = getattr(last_topic, "date", None)
+        if (
+            next_offset_topic == offset_topic
+            and next_offset_id == offset_id
+            and next_offset_date == offset_date
+        ):
+            break
+
+        offset_topic = next_offset_topic
+        offset_id = next_offset_id
+        offset_date = next_offset_date
+
+        if total_count and len(seen_server_topic_ids) >= total_count:
+            break
+        if len(page_topics) < page_size:
+            break
+
+    return _with_general_topic(list(topics_by_id.values()))
+
+
+async def _refresh_topic_by_id(
+    client: t.Any,
+    *,
+    entity: t.Any,
+    dialog_id: int,
+    topic_id: int,
+    topic_cache: TopicMetadataCache,
+    ttl_seconds: int = TOPIC_METADATA_TTL_SECONDS,
+) -> dict[str, int | str | bool | None] | None:
+    """Refresh one topic by ID and persist tombstones when Telegram reports deletion."""
+    existing_topic = topic_cache.get_topic(dialog_id, topic_id, ttl_seconds)
+    response = await client(functions.channels.GetForumTopicsByIDRequest(
+        channel=entity,
+        topics=[topic_id],
+    ))
+    response_topics = list(getattr(response, "topics", []))
+    if not response_topics:
+        return None
+
+    topic = _normalize_topic_metadata(response_topics[0], existing_topic=existing_topic)
+    topic_cache.upsert_topics(dialog_id, [topic])
+    return topic
 
 
 ### ListDialogs ###
@@ -950,4 +1114,3 @@ async def get_usage_stats(args: GetUsageStats) -> t.Sequence[TextContent | Image
     except Exception as exc:
         logger.error("GetUsageStats query failed: %s", exc)
         return [TextContent(type="text", text=f"Error querying usage stats: {type(exc).__name__}")]
-
