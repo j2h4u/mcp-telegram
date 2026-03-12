@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import typing as t
 from zoneinfo import ZoneInfo
 
 SESSION_BREAK_MINUTES = 60
@@ -10,6 +11,7 @@ def format_messages(
     reply_map: dict[int, object],
     reaction_names_map: dict[int, dict[str, list[str]]] | None = None,
     tz: ZoneInfo | None = None,
+    topic_name_getter: t.Callable[[object], str | None] | None = None,
 ) -> str:
     """Format a list of messages into human-readable text.
 
@@ -71,7 +73,13 @@ def format_messages(
                 orig_dt = orig.date.astimezone(effective_tz)
                 reply_prefix = f"[↑ {orig_sender} {orig_dt.strftime('%H:%M')}] "
 
-        lines.append(f"{dt.strftime('%H:%M')} {sender_name}: {reply_prefix}{text}")
+        topic_prefix = ""
+        if topic_name_getter is not None:
+            topic_name = topic_name_getter(msg)
+            if topic_name:
+                topic_prefix = f"[topic: {topic_name}] "
+
+        lines.append(f"{topic_prefix}{dt.strftime('%H:%M')} {sender_name}: {reply_prefix}{text}")
 
         prev_dt = dt
 
