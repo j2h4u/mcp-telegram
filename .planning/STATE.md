@@ -4,17 +4,17 @@ milestone: v1.2
 milestone_name: MCP Surface Research
 current_phase: 12
 current_phase_name: redesign options & pareto recommendation
-current_plan: Not started
+current_plan: 2
 status: executing
-stopped_at: Completed 11-03-PLAN.md
-last_updated: "2026-03-13T13:45:49.426Z"
+stopped_at: Completed 12-01-PLAN.md
+last_updated: "2026-03-13T15:25:39.879Z"
 last_activity: 2026-03-13
 progress:
   total_phases: 4
   completed_phases: 2
-  total_plans: 6
-  completed_plans: 6
-  percent: 100
+  total_plans: 9
+  completed_plans: 7
+  percent: 78
 ---
 
 # Project State
@@ -24,19 +24,19 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-13)
 
 **Core value:** LLM can work with Telegram using natural names — zero cold-start friction, no ID lookup boilerplate before every real task
-**Current focus:** Phase 11 complete; ready to begin Phase 12 — Redesign Options & Pareto Recommendation
+**Current focus:** Phase 12 plan 01 complete; ready to continue redesign option population and recommendation work
 
 ## Current Position
 
 Current Phase: 12
 Current Phase Name: redesign options & pareto recommendation
 Total Phases: 4
-Current Plan: Not started
+Current Plan: 2
 Total Plans in Phase: 3
-Status: Ready to execute
+Status: Executing
 Last Activity: 2026-03-13
-Last Activity Description: Phase 11 complete, transitioned to Phase 12
-Progress: [██████████] 100%
+Last Activity Description: Completed 12-01-PLAN.md
+Progress: [████████░░] 78%
 
 ## Performance Metrics
 
@@ -47,6 +47,7 @@ Progress: [██████████] 100%
 | Phase 11 P02 | 4min | 3 tasks | 5 files |
 | Phase 11 P01 | 4min | 3 tasks | 5 files |
 | Phase 11-current-surface-comparative-audit P03 | 2min | 3 tasks | 5 files |
+| Phase 12 P01 | 1min | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -70,6 +71,8 @@ Progress: [██████████] 100%
 - [Phase 11]: End Phase 11 with one standalone comparative audit rather than a loose summary of earlier notes.
 - [Phase 11]: Use one synthesis matrix spanning tool-level and workflow-level areas so Phase 12 can compare redesign options directly.
 - [Phase 11]: Keep the Phase 12 handoff comparative rather than prescriptive; this plan names pressure but does not choose a redesign path.
+- [Phase 12]: Require future option comparisons to use shared dimensions and invariant-aware keep/reshape/merge/demote/remove/rename actions.
+- [Phase 12]: Freeze Phase 12 against the reflected seven-tool Phase 11 baseline instead of reopening discovery.
 
 ### Pending Todos
 
@@ -83,6 +86,6 @@ Progress: [██████████] 100%
 
 ## Session Continuity
 
-**Last Date:** 2026-03-13T13:41:39.943Z
-**Stopped At:** Completed 11-03-PLAN.md
+**Last Date:** 2026-03-13T15:24:57.343Z
+**Stopped At:** Completed 12-01-PLAN.md
 **Resume File:** None

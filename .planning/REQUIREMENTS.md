@@ -14,8 +14,8 @@
 
 ### Refactor Options
 
-- [ ] **OPTION-01**: Maintainer can compare minimal, medium, and maximal redesign paths for the public MCP surface, including expected impact, migration risk, and implementation scope.
-- [ ] **OPTION-02**: Maintainer can see which current tools, parameters, and interaction patterns each redesign path would likely keep, reshape, merge, demote, or remove from the public contract.
+- [x] **OPTION-01**: Maintainer can compare minimal, medium, and maximal redesign paths for the public MCP surface, including expected impact, migration risk, and implementation scope.
+- [x] **OPTION-02**: Maintainer can see which current tools, parameters, and interaction patterns each redesign path would likely keep, reshape, merge, demote, or remove from the public contract.
 
 ### Recommendation
 
@@ -50,8 +50,8 @@
 | AUDIT-01 | 11 | Complete |
 | AUDIT-02 | 11 | Complete |
 | AUDIT-03 | 11 | Complete |
-| OPTION-01 | 12 | Pending |
-| OPTION-02 | 12 | Pending |
+| OPTION-01 | 12 | Complete |
+| OPTION-02 | 12 | Complete |
 | RECO-01 | 12 | Pending |
 | RECO-02 | 13 | Pending |
 | EVID-01 | 10 | Complete |
@@ -64,4 +64,4 @@
 
 ---
 *Requirements defined: 2026-03-13*
-*Last updated: 2026-03-13 after initial definition*
+*Last updated: 2026-03-13 after Phase 12 Plan 01*
