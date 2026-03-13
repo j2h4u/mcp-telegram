@@ -118,20 +118,42 @@ top-level ergonomics with much larger migration and runtime exposure.
 
 ## Pareto Recommendation
 
-The recommendation at this stage is directional rather than fully argued: the Medium Path is the
-leading candidate for the next milestone because it is the smallest redesign tier that materially
-changes the workflow burden identified in Phase 11.
+The chosen path is the **Medium Path**. This is the Pareto recommendation for the next milestone
+because it removes a **large share of model burden** with the **smallest safe change set** that
+still changes the workflow shape identified in Phase 11.
 
-Minimal is credible as a safety baseline, but it mostly preserves the same discovery-first and
-topic-helper choreography that
-[11-COMPARATIVE-AUDIT.md](/home/j2h4u/repos/j2h4u/mcp-telegram/.planning/phases/11-current-surface-comparative-audit/11-COMPARATIVE-AUDIT.md)
-called out. Maximal offers more theoretical cleanup, but it pushes far harder against the reflected
-contract, deployment freshness, and result-shape stability described in
-[10-BROWNFIELD-BASELINE.md](/home/j2h4u/repos/j2h4u/mcp-telegram/.planning/phases/10-evidence-base-audit-frame/10-BROWNFIELD-BASELINE.md).
+The supporting evidence is stable across the retained artifacts:
 
-That leaves Medium as the most promising balance point. It is the first option that directly
-changes the model-facing workflow shape rather than just polishing it, but it still stays inside
-the current read-only and stateful runtime posture.
+- Phase 11 showed in
+  [11-COMPARATIVE-AUDIT.md](/home/j2h4u/repos/j2h4u/mcp-telegram/.planning/phases/11-current-surface-comparative-audit/11-COMPARATIVE-AUDIT.md)
+  that the surface is workflow-capable but continuation-heavy.
+- Phase 10 showed in
+  [10-BROWNFIELD-BASELINE.md](/home/j2h4u/repos/j2h4u/mcp-telegram/.planning/phases/10-evidence-base-audit-frame/10-BROWNFIELD-BASELINE.md)
+  that the runtime is reflection-based, text-first, stateful, and exposed through `list-tools`,
+  `server.py`, and `tools.py`.
+- The Phase 12 option work showed that Minimal mainly cleans metadata and continuation wording,
+  while Maximal tries to buy more burden reduction by moving many public roles at once.
+
+The Medium Path is the first tier that attacks the real burden center rather than the surface
+symptoms. It can demote discovery-first choreography, reduce repeated helper hops around forum
+reads, and move read/search continuation toward one clearer navigation model without pretending the
+system is no longer read-only or stateful.
+
+The rejected alternative on the low-risk side is the **Minimal Path**. It is safer, but it
+undershoots the actual pressure identified in Phase 11 because it mostly keeps `ListDialogs` and
+`ListTopics` in their current helper-heavy role. Minimal improves contract hygiene, but it does not
+remove enough of the discovery-first, topic-selection, and mixed-pagination burden to justify
+stopping there.
+
+The rejected alternative on the high-ambition side is the **Maximal Path**. It may reduce even
+more burden in theory, but it overshoots the acceptable risk for the next milestone because it
+pushes harder against reflected schemas, restart freshness, compatibility posture, and result-shape
+stability. Given the process-start reflection and runtime exposure documented in Phase 10 and
+Phase 11, Maximal asks for too much contract movement at once.
+
+The recommendation is therefore evidence-backed and bounded: choose the Medium Path, preserve the
+core invariants, and let Phase 13 turn that choice into sequencing and validation rather than
+reopening the redesign question.
 
 ## Recommendation Guardrails and Invariants
 
@@ -156,6 +178,8 @@ Phase 13 should treat this artifact as a decision input, not as a finished imple
 
 - Turn the leading option into an implementation-sequencing brief rather than reopening the option
   comparison.
+- Start from the chosen path and keep the rejected alternative reasoning visible so Phase 13 does
+  not drift back toward Minimal-by-default cleanup or Maximal-by-default rewrite pressure.
 - Sequence public-contract changes before deeper internal cleanup so migration risk stays visible.
 - Validate continuation unification, topic-read ergonomics, and failure-surface cleanup against the
   current `server.py` and `tools.py` anchors before any coding plan assumes they are easy.
