@@ -27,6 +27,7 @@ from telethon.tl.types import Channel, Chat
 from telethon.utils import get_peer_id
 from xdg_base_dirs import xdg_state_home
 
+from . import capabilities
 from .cache import (
     EntityCache,
     GROUP_TTL,
@@ -36,7 +37,7 @@ from .cache import (
 )
 from .formatter import format_messages
 from .pagination import decode_cursor, encode_cursor
-from .resolver import Candidates, NotFound, resolve
+from .resolver import Candidates, NotFound, Resolved, resolve
 from .telegram import create_client
 
 # Fetch reactor names only when total reactions per message are at or below this limit.
@@ -956,6 +957,40 @@ async def _fetch_messages_for_topic(
             raise retry_exc
 
 
+_resolve_dialog_target = capabilities.resolve_dialog_target
+_load_forum_topic_capability = capabilities.load_forum_topic_capability
+_build_get_forum_topics_request = capabilities.build_get_forum_topics_request
+_build_get_forum_topics_by_id_request = capabilities.build_get_forum_topics_by_id_request
+_normalize_topic_metadata = capabilities.normalize_topic_metadata
+_with_general_topic = capabilities.with_general_topic
+_fetch_forum_topics_page = capabilities.fetch_forum_topics_page
+_fetch_all_forum_topics = capabilities.fetch_all_forum_topics
+_refresh_topic_by_id = capabilities.refresh_topic_by_id
+_load_dialog_topics = capabilities.load_dialog_topics
+_resolve_deleted_topic = capabilities.resolve_deleted_topic
+_dialog_not_found_text = capabilities.dialog_not_found_text
+_ambiguous_dialog_text = capabilities.ambiguous_dialog_text
+_deleted_topic_text = capabilities.deleted_topic_text
+_rpc_error_detail = capabilities.rpc_error_detail
+_inaccessible_topic_text = capabilities.inaccessible_topic_text
+_topic_not_found_text = capabilities.topic_not_found_text
+_ambiguous_topic_text = capabilities.ambiguous_topic_text
+_ambiguous_deleted_topic_text = capabilities.ambiguous_deleted_topic_text
+_dialog_topics_unavailable_text = capabilities.dialog_topics_unavailable_text
+_no_active_topics_text = capabilities.no_active_topics_text
+_topic_status = capabilities.topic_status
+_topic_row_text = capabilities.topic_row_text
+_is_topic_id_invalid_error = capabilities.is_topic_id_invalid_error
+_forum_topic_anchor_id = capabilities.forum_topic_anchor_id
+_messages_need_forum_topic_labels = capabilities.messages_need_forum_topic_labels
+_build_topic_name_getter = capabilities.build_topic_name_getter
+_topic_empty_state_text = capabilities.topic_empty_state_text
+_append_topic_match_metadata = capabilities.append_topic_match_metadata
+_message_matches_topic = capabilities.message_matches_topic
+_fetch_topic_messages = capabilities.fetch_topic_messages
+_fetch_messages_for_topic = capabilities.fetch_messages_for_topic
+
+
 ### ListDialogs ###
 
 
@@ -1062,43 +1097,32 @@ async def list_topics(
 
     try:
         cache = get_entity_cache()
-        result = await _resolve_dialog(cache, args.dialog)
-        if isinstance(result, NotFound):
-            return [TextContent(type="text", text=_dialog_not_found_text(args.dialog, retry_tool="ListTopics"))]
-        if isinstance(result, Candidates):
-            match_lines = []
-            for match in result.matches:
-                line = f'id={match["entity_id"]} name="{match["display_name"]}" score={match["score"]}'
-                if match.get("username"):
-                    line += f' @{match["username"]}'
-                if match.get("entity_type"):
-                    line += f' [{match["entity_type"]}]'
-                match_lines.append(line)
-            return [
-                TextContent(
-                    type="text",
-                    text=_ambiguous_dialog_text(args.dialog, match_lines, retry_tool="ListTopics"),
-                )
-            ]
-
-        entity_id = result.entity_id
-        resolve_prefix = (
-            f'[resolved: "{args.dialog}" → {result.display_name}]\n'
-            if args.dialog.strip().lower() != result.display_name.strip().lower()
-            else ""
+        dialog_target = await _resolve_dialog_target(
+            cache=cache,
+            query=args.dialog,
+            retry_tool="ListTopics",
+            resolve_dialog=_resolve_dialog,
         )
+        if isinstance(dialog_target, capabilities.DialogTargetFailure):
+            return [TextContent(type="text", text=dialog_target.text)]
+
+        entity_id = dialog_target.entity_id
+        resolve_prefix = dialog_target.resolve_prefix
 
         async with connected_client() as client:
             topic_cache = TopicMetadataCache(cache._conn)
-            try:
-                topic_catalog = await _load_dialog_topics(
-                    client,
-                    entity=entity_id,
-                    dialog_id=entity_id,
-                    topic_cache=topic_cache,
-                )
-            except RPCError as exc:
-                return [TextContent(type="text", text=_dialog_topics_unavailable_text(result.display_name, exc))]
+            topic_capability = await _load_forum_topic_capability(
+                client,
+                entity=entity_id,
+                dialog_id=entity_id,
+                dialog_name=dialog_target.display_name,
+                topic_cache=topic_cache,
+                requested_topic=None,
+                retry_tool="ListTopics",
+            )
+            if isinstance(topic_capability, capabilities.ForumTopicFailure):
+                return [TextContent(type="text", text=topic_capability.text)]
+            topic_catalog = topic_capability
 
         active_topics = [
             topic_catalog["metadata_by_id"][topic_id]
@@ -1106,7 +1130,7 @@ async def list_topics(
         ]
         result_count = len(active_topics)
         if not active_topics:
-            text = resolve_prefix + _no_active_topics_text(result.display_name)
+            text = resolve_prefix + _no_active_topics_text(dialog_target.display_name)
             return [TextContent(type="text", text=text)]
 
         lines = [_topic_row_text(topic) for topic in active_topics]
@@ -1189,31 +1213,17 @@ async def list_messages(
     try:
         # Step 1 — Resolve dialog name
         cache = get_entity_cache()
-        result = await _resolve_dialog(cache, args.dialog)
-        if isinstance(result, NotFound):
-            return [TextContent(type="text", text=_dialog_not_found_text(args.dialog, retry_tool="ListMessages"))]
-        if isinstance(result, Candidates):
-            match_lines = []
-            for match in result.matches:
-                line = f'id={match["entity_id"]} name="{match["display_name"]}" score={match["score"]}'
-                if match.get("username"):
-                    line += f' @{match["username"]}'
-                if match.get("entity_type"):
-                    line += f' [{match["entity_type"]}]'
-                match_lines.append(line)
-            return [
-                TextContent(
-                    type="text",
-                    text=_ambiguous_dialog_text(args.dialog, match_lines, retry_tool="ListMessages"),
-                )
-            ]
-        entity_id: int = result.entity_id
-        dialog_cache_entry = cache.get(entity_id, GROUP_TTL)
-        resolve_prefix = (
-            f'[resolved: "{args.dialog}" → {result.display_name}]\n'
-            if args.dialog.strip().lower() != result.display_name.strip().lower()
-            else ""
+        dialog_target = await _resolve_dialog_target(
+            cache=cache,
+            query=args.dialog,
+            retry_tool="ListMessages",
+            resolve_dialog=_resolve_dialog,
         )
+        if isinstance(dialog_target, capabilities.DialogTargetFailure):
+            return [TextContent(type="text", text=dialog_target.text)]
+        entity_id: int = dialog_target.entity_id
+        dialog_cache_entry = cache.get(entity_id, GROUP_TTL)
+        resolve_prefix = dialog_target.resolve_prefix
         topic_metadata: dict[str, int | str | bool | None] | None = None
         resolved_topic_name: str | None = None
         sender_entity_id: int | None = None
@@ -1283,87 +1293,23 @@ async def list_messages(
             if args.topic:
                 has_filter = True
                 topic_cache = TopicMetadataCache(cache._conn)
-                try:
-                    topic_catalog = await _load_dialog_topics(
-                        client,
-                        entity=entity_id,
-                        dialog_id=entity_id,
-                        topic_cache=topic_cache,
-                    )
-                except RPCError as exc:
-                    return [
-                        TextContent(
-                            type="text",
-                            text=_inaccessible_topic_text(
-                                args.topic,
-                                exc,
-                                resolved=False,
-                                retry_tool="ListMessages",
-                            ),
-                        )
-                    ]
-                topic_result = resolve(args.topic, topic_catalog["choices"])
-                if isinstance(topic_result, NotFound):
-                    deleted_result = _resolve_deleted_topic(args.topic, topic_catalog["deleted_topics"])
-                    if isinstance(deleted_result, Candidates):
-                        match_lines = []
-                        for match in deleted_result.matches:
-                            match_lines.append(
-                                f'id={match["entity_id"]} name="{match["display_name"]}" score={match["score"]} [deleted]'
-                            )
-                        return [
-                            TextContent(
-                                type="text",
-                                text=_ambiguous_deleted_topic_text(
-                                    args.topic,
-                                    match_lines,
-                                    retry_tool="ListMessages",
-                                ),
-                            )
-                        ]
-                    if deleted_result is not None:
-                        return [
-                            TextContent(
-                                type="text",
-                                text=_deleted_topic_text(
-                                    deleted_result.display_name,
-                                    retry_tool="ListMessages",
-                                ),
-                            )
-                        ]
-                    return [
-                        TextContent(
-                            type="text",
-                            text=_topic_not_found_text(args.topic, retry_tool="ListMessages"),
-                        )
-                    ]
-                if isinstance(topic_result, Candidates):
-                    match_lines = []
-                    for match in topic_result.matches:
-                        match_lines.append(_append_topic_match_metadata(match, topic_catalog["metadata_by_id"]))
-                    return [
-                        TextContent(
-                            type="text",
-                            text=_ambiguous_topic_text(
-                                args.topic,
-                                match_lines,
-                                retry_tool="ListMessages",
-                            ),
-                        )
-                    ]
-                topic_metadata = topic_catalog["metadata_by_id"].get(topic_result.entity_id)
-                resolved_topic_name = topic_result.display_name
-                if topic_metadata is not None and bool(topic_metadata["is_deleted"]):
-                    return [
-                        TextContent(
-                            type="text",
-                            text=_deleted_topic_text(resolved_topic_name, retry_tool="ListMessages"),
-                        )
-                    ]
-                if topic_metadata is not None and not bool(topic_metadata["is_general"]):
-                    top_message_id = topic_metadata["top_message_id"]
-                    if top_message_id is not None:
-                        iter_kwargs["reply_to"] = int(top_message_id)
+                topic_capability = await _load_forum_topic_capability(
+                    client,
+                    entity=entity_id,
+                    dialog_id=entity_id,
+                    dialog_name=dialog_target.display_name,
+                    topic_cache=topic_cache,
+                    requested_topic=args.topic,
+                    retry_tool="ListMessages",
+                )
+                if isinstance(topic_capability, capabilities.ForumTopicFailure):
+                    return [TextContent(type="text", text=topic_capability.text)]
+                if isinstance(topic_capability, capabilities.ResolvedForumTopic):
+                    topic_catalog = topic_capability.topic_catalog
+                    topic_metadata = topic_capability.metadata
+                    resolved_topic_name = topic_capability.display_name
+                    if topic_capability.reply_to_message_id is not None:
+                        iter_kwargs["reply_to"] = topic_capability.reply_to_message_id
                         filter_sender_after_fetch = sender_entity_id is not None
 
             if sender_entity_id is not None and not filter_sender_after_fetch:
@@ -1534,13 +1480,21 @@ async def list_messages(
                     topic_cache = TopicMetadataCache(cache._conn)
                 try:
                     if topic_catalog is None:
-                        topic_catalog = await _load_dialog_topics(
+                        topic_capability = await _load_forum_topic_capability(
                             client,
                             entity=entity_id,
                             dialog_id=entity_id,
+                            dialog_name=dialog_target.display_name,
                             topic_cache=topic_cache,
+                            requested_topic=None,
+                            retry_tool="ListMessages",
                         )
-                    if (
+                        if isinstance(topic_capability, capabilities.ForumTopicFailure):
+                            topic_name_getter = None
+                            topic_catalog = None
+                        else:
+                            topic_catalog = topic_capability
+                    if topic_catalog is not None and (
                         _messages_need_forum_topic_labels(fetched_messages)
                         or len(topic_catalog["choices"]) > 1
                     ):
@@ -1624,30 +1578,16 @@ async def search_messages(
     try:
         # Step 1: Resolve dialog name
         cache = get_entity_cache()
-        result = await _resolve_dialog(cache, args.dialog)
-        if isinstance(result, NotFound):
-            return [TextContent(type="text", text=_dialog_not_found_text(args.dialog, retry_tool="SearchMessages"))]
-        if isinstance(result, Candidates):
-            match_lines = []
-            for match in result.matches:
-                line = f'id={match["entity_id"]} name="{match["display_name"]}" score={match["score"]}'
-                if match.get("username"):
-                    line += f' @{match["username"]}'
-                if match.get("entity_type"):
-                    line += f' [{match["entity_type"]}]'
-                match_lines.append(line)
-            return [
-                TextContent(
-                    type="text",
-                    text=_ambiguous_dialog_text(args.dialog, match_lines, retry_tool="SearchMessages"),
-                )
-            ]
-        entity_id: int = result.entity_id
-        resolve_prefix = (
-            f'[resolved: "{args.dialog}" → {result.display_name}]\n'
-            if args.dialog.strip().lower() != result.display_name.strip().lower()
-            else ""
+        dialog_target = await _resolve_dialog_target(
+            cache=cache,
+            query=args.dialog,
+            retry_tool="SearchMessages",
+            resolve_dialog=_resolve_dialog,
         )
+        if isinstance(dialog_target, capabilities.DialogTargetFailure):
+            return [TextContent(type="text", text=dialog_target.text)]
+        entity_id: int = dialog_target.entity_id
+        resolve_prefix = dialog_target.resolve_prefix
 
         page_offset = args.offset or 0
 
@@ -1762,7 +1702,7 @@ async def search_messages(
         if parts:
             result_text = resolve_prefix + "\n\n".join(parts)
         else:
-            result_text = resolve_prefix + _search_no_hits_text(result.display_name, args.query)
+            result_text = resolve_prefix + _search_no_hits_text(dialog_target.display_name, args.query)
         if len(hits) == args.limit:
             result_text += f"\n\nnext_offset: {page_offset + args.limit}"
         result = [TextContent(type="text", text=result_text)]
