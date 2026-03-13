@@ -75,6 +75,77 @@ recommendation is decision-ready instead of impressionistic.
 | state-model impact | How does the option interact with the system's stateful runtime, cache-backed resolution, and local persistence assumptions? |
 | operational/runtime risk | Does the option reduce or worsen deployment freshness, reflected-schema drift, and other runtime mismatch risks? |
 
+## Public Contract Delta Rules
+
+Phase 12 must compare redesign options at the public-contract level, not only as abstract workflow
+ideas. The later delta inventory must prove full coverage against the shipped baseline before any
+recommendation can claim that a change is "small" or "safe."
+
+### Coverage requirements
+
+The delta inventory must include all seven current public tools:
+
+- `GetMyAccount`
+- `GetUsageStats`
+- `GetUserInfo`
+- `ListDialogs`
+- `ListMessages`
+- `ListTopics`
+- `SearchMessages`
+
+The same inventory must also cover the shared interaction patterns that define the current model
+experience:
+
+- `discovery-first flow`
+- `disambiguation retry flow`
+- `topic-selection flow`
+- `pagination flow`
+- `text-first result parsing`
+- `generic server-boundary failure behavior`
+
+### High-signal contract elements
+
+The later inventory should call out the highest-signal parameters and continuation tokens directly
+instead of hiding them inside prose:
+
+- `dialog`
+- `topic`
+- `sender`
+- `cursor`
+- `offset`
+- `from_beginning`
+- `exclude_archived`
+- `ignore_pinned`
+- `unread`
+
+These are the main contract elements that currently shape helper-step burden, continuation state,
+or recovery behavior. If an option changes one of them, the delta row should say so explicitly.
+
+### Stable action vocabulary
+
+Every populated delta row must use one explicit action verb from this fixed vocabulary:
+
+| Action | Meaning in Phase 12 comparison |
+| --- | --- |
+| `keep` | Preserve the current surface element with no material public-contract change. |
+| `reshape` | Retain the element's job but change its public-facing schema, result contract, or workflow role. |
+| `merge` | Fold the current element into another public entry point so the user job becomes part of a broader surface. |
+| `demote` | Keep the behavior available but remove it from the primary model-facing contract or treat it as secondary. |
+| `remove` | Delete the current public surface element from the future contract. |
+| `rename` | Preserve the job while changing the public label the model sees. |
+
+### Row requirements
+
+- Each future delta row must name the current surface element it covers and its current role.
+- Each row must assign an explicit action for the minimal, medium, and maximal path.
+- Each row must include `rationale` explaining why the action improves user-task fit, continuation
+  simplicity, safety, or migration posture.
+- Each row must include `affected invariants` so later plans cannot recommend a contract change
+  without showing whether it touches read-only scope, privacy-safe telemetry, stateful runtime
+  reality, recovery-critical caches, or explicit ambiguity handling.
+- Vague wording such as "streamline", "modernize", or "simplify" is not enough on its own; the row
+  still needs one of the fixed action verbs plus rationale and affected invariants.
+
 ## Usage Rule For Later Phase 12 Plans
 
 - Plan 02 should populate options against this frame instead of inventing new criteria midstream.
