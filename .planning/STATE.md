@@ -4,17 +4,17 @@ milestone: v1.3
 milestone_name: Medium Implementation
 current_phase: 15
 current_phase_name: Capability Seams
-current_plan: 1
+current_plan: 2
 status: in_progress
-stopped_at: Completed 15-01-PLAN.md
-last_updated: "2026-03-13T23:13:27.022Z"
-last_activity: 2026-03-14 - Completed Plan 15-01 capability seam foundation and runtime proof
+stopped_at: Completed 15-02-PLAN.md
+last_updated: "2026-03-13T23:28:20.552Z"
+last_activity: 2026-03-14 - Completed Plan 15-02 read/topic adapter thinning and runtime proof
 progress:
   total_phases: 5
   completed_phases: 1
   total_plans: 17
-  completed_plans: 15
-  percent: 88
+  completed_plans: 16
+  percent: 94
 ---
 
 # Project State
@@ -28,11 +28,21 @@ See: .planning/PROJECT.md (updated 2026-03-14)
 
 ## Current Position
 
+Current Phase: 15
+Current Phase Name: Capability Seams
+Total Phases: 18
+Current Plan: 2
+Total Plans in Phase: 3
+Status: Ready to execute
+Last Activity: 2026-03-14
+Last Activity Description: Completed Plan 15-02 read/topic adapter thinning and runtime proof
+Progress: 94%
+
 Phase: 15 of 18 (`Capability Seams`)
-Plan: 1 of 3 in current phase
-Status: In progress
-Last activity: 2026-03-14 - Completed Plan 15-01 capability seam foundation and runtime proof
-Progress: [█████████░] 88%
+Plan: 2 of 3 in current phase
+Status: Ready to execute
+Last activity: 2026-03-14 - Completed Plan 15-02 read/topic adapter thinning and runtime proof
+Progress: [█████████░] 94%
 
 ## Performance Metrics
 
@@ -48,6 +58,7 @@ Progress: [█████████░] 88%
 | v1.2 | 11 | 35 min | 3.2 min |
 | Phase 14 | 2 | 14 min | 7.0 min |
 | Phase 15 P01 | 12m39s | 3 tasks | 4 files |
+| Phase 15 P02 | 2m | 3 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -64,6 +75,9 @@ Progress: [█████████░] 88%
 - [Phase 15]: Represent dialog and forum-topic seams as explicit typed outcomes without introducing a new service framework.
 - [Phase 15]: Keep topic metadata cache rows dict-backed, then wrap them in seam result objects so the extraction stays bounded and inspectable.
 - [Phase 15]: Allow tool adapters to inject topic loaders and stale-anchor refresh helpers into the seam to preserve existing brownfield tests and recovery behavior.
+- [Phase 15]: Keep ListTopics and ListMessages responsible only for MCP args, telemetry, and final text assembly.
+- [Phase 15]: Move history-read cursor handling, sender resolution, topic recovery, and enrichment hooks into capabilities.py so SearchMessages can reuse them later.
+- [Phase 15]: Prove adapter thinness explicitly with tests that patch the capability execution entrypoints instead of only asserting public behavior.
 
 ### Pending Todos
 
@@ -77,6 +91,6 @@ Progress: [█████████░] 88%
 
 ## Session Continuity
 
-Last session: 2026-03-13T23:13:27.019Z
-Stopped at: Completed 15-01-PLAN.md
+Last session: 2026-03-13T23:28:20.550Z
+Stopped at: Completed 15-02-PLAN.md
 Resume file: None
