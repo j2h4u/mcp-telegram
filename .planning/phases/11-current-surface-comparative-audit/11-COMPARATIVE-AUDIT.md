@@ -121,3 +121,17 @@ That leaves Phase 11 with a stable conclusion: the current surface should be und
 workflow-capable but continuation-heavy. It contains meaningful strengths worth preserving, but it
 also exposes enough low-level mechanics that Phase 12 should compare redesign options around burden
 reduction rather than around adding wholly new capabilities.
+
+### Decision-Friendly Comparison Matrix
+
+| area | current strength | current weakness | preserved invariant | redesign pressure |
+| --- | --- | --- | --- | --- |
+| account and operator context | `GetMyAccount` is a clear zero-argument check and keeps auth state legible. | Success still arrives as a text line that must be parsed for fields. | Keep the one-call, read-only account check. | Reduce prose parsing for basic identity state. |
+| telemetry and local observability | `GetUsageStats` preserves privacy-safe telemetry and useful empty-state messaging. | The contract hides its local-state dependency and collapses metrics into prose. | Keep privacy-safe aggregate telemetry and no message-content logging. | Compare whether lightweight structure can expose metrics without widening privacy scope. |
+| identity lookup | `GetUserInfo` frames the job around natural-name lookup and shared-chat context. | Fuzzy resolution and cache dependence can turn one query into a retry loop. | Preserve explicit ambiguity handling instead of silent auto-picks. | Reduce retry burden while keeping safe disambiguation. |
+| dialog discovery | `ListDialogs` is a strong inventory surface and cache warmup step. | Many real tasks still need this helper call before the actual read or search. | Preserve reflection-based tool discovery and natural-name dialog inventory. | Compare ways to shrink helper-step discovery burden. |
+| message reading | `ListMessages` handles the richest real task, including topic-aware reads and recovery help. | Cursor direction, helper choreography, and text-first continuation create the highest orchestration cost. | Preserve read-only access, readable transcripts, and recovery-aware topic handling. | Compare lower-burden continuation and thread selection models. |
+| topic handling | `ListTopics` makes forum-topic state explicit, including inaccessible history. | Forum reads still require a separate topic catalog step for common tasks. | Preserve deleted/inaccessible topic fidelity and cross-topic read support. | Compare whether common topic reads can become more direct without dropping state fidelity. |
+| search | `SearchMessages` aligns well with the user job and returns useful local hit context. | Search uses `next_offset`, which diverges from message reading's `next_cursor`. | Preserve local context windows around hits. | Compare a more uniform navigation contract across read and search workflows. |
+| recovery boundary | Handler-local recovery text is unusually actionable for not-found, ambiguous, and invalid-cursor cases. | Escaped failures still degrade to generic `Tool <name> failed`. | Preserve explicit retry guidance and action-oriented failures where they already exist. | Remove the boundary between rich handler recovery and generic server wrapping. |
+| runtime and state model | The surface already benefits from cached clients, caches, and durable local metadata. | Statefulness is helpful but implicit, especially for discovery freshness and cache-backed resolution. | Preserve the stateful runtime and recovery-critical caches. | Compare how to surface state assumptions more clearly without pretending the system is stateless. |
