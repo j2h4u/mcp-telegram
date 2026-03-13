@@ -53,3 +53,13 @@ what an MCP client sees today. On 2026-03-13 the reflected surface was:
 
 `ListTopics` is called out explicitly because earlier notes were already stale on the public
 inventory; later phases should trust reflection, code, and tests over inherited planning summaries.
+
+## Supporting official
+
+None retained. Official SDK references or maintainer commentary were not needed once the evidence
+set was narrowed to official MCP/Anthropic guidance plus brownfield authority.
+
+## Context only
+
+None retained. Community posts, blogs, and other secondary commentary were intentionally excluded as
+non-material because they would not directly change the Phase 11-13 conclusions.
