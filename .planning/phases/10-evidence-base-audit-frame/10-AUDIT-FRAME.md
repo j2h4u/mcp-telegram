@@ -64,3 +64,13 @@ For every major finding:
 Do not write findings that rely only on generic best-practice prose. A valid finding ties named
 evidence to a specific tool contract, workflow step, recovery path, pagination pattern, or output
 convention present in the shipped surface.
+
+## Phase Handoff Rules
+
+- Phase 11 must cite the evidence log and brownfield baseline in every major finding so the audit
+  stays grounded in retained sources and current-surface behavior.
+- Phase 12 must preserve the brownfield baseline invariants by default, or explicitly challenge a
+  specific invariant when comparing redesign options and explain why the evidence justifies that
+  move.
+- Phase 13 must treat the evidence log and audit frame as inputs to the decision memo, then reuse
+  the established rubric and baseline instead of redoing the audit methodology.
