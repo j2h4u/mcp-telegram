@@ -60,6 +60,22 @@ async def test_list_dialogs_multiple_newlines(mock_cache, mock_client, monkeypat
     assert "Bob" in lines[1]
 
 
+async def test_list_dialogs_empty_returns_action(mock_cache, mock_client, monkeypatch):
+    """ListDialogs returns an action-oriented empty-state when no dialogs are visible."""
+    from mcp_telegram.tools import ListDialogs, list_dialogs
+
+    mock_client.iter_dialogs = MagicMock(return_value=_async_iter([]))
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+
+    result = await list_dialogs(ListDialogs())
+
+    assert len(result) == 1
+    assert "No dialogs were returned." in result[0].text
+    assert "Action:" in result[0].text
+    assert "exclude_archived=False" in result[0].text
+
+
 # --- TOOL-01: ListDialogs ---
 
 
@@ -156,7 +172,44 @@ async def test_list_topics_catalog_unavailable(tmp_db_path, mock_client, monkeyp
 
     result = await list_topics(ListTopics(dialog="Backend Forum"))
 
-    assert result[0].text == 'Dialog "Backend Forum" does not expose a readable forum-topic catalog (CHAT_NOT_FORUM).'
+    assert 'Dialog "Backend Forum" does not expose a readable forum-topic catalog (CHAT_NOT_FORUM).' in result[0].text
+    assert "Action:" in result[0].text
+    assert "ListMessages without topic" in result[0].text
+
+
+async def test_list_topics_not_found_returns_action(mock_cache, mock_client, monkeypatch):
+    """ListTopics returns an action-oriented response when the dialog cannot be resolved."""
+    from mcp_telegram.tools import ListTopics, list_topics
+
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+
+    result = await list_topics(ListTopics(dialog="nobody_xyz"))
+
+    assert len(result) == 1
+    assert 'Dialog "nobody_xyz" was not found.' in result[0].text
+    assert "Action:" in result[0].text
+    assert "ListDialogs" in result[0].text
+
+
+async def test_list_topics_ambiguous_returns_action(mock_client, monkeypatch, tmp_db_path):
+    """ListTopics returns an action-oriented response when the dialog query is ambiguous."""
+    from mcp_telegram.cache import EntityCache
+    from mcp_telegram.tools import ListTopics, list_topics
+
+    ambig_cache = EntityCache(tmp_db_path)
+    ambig_cache.upsert(201, "group", "Backend Forum", None)
+    ambig_cache.upsert(202, "group", "Backend Feedback", None)
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: ambig_cache)
+
+    result = await list_topics(ListTopics(dialog="Backend"))
+
+    assert len(result) == 1
+    assert 'Dialog "Backend" matched multiple dialogs.' in result[0].text
+    assert "Action:" in result[0].text
+    assert 'id=201' in result[0].text
+    assert 'id=202' in result[0].text
 
 
 async def test_list_topics_warms_dialog_cache_on_first_miss(tmp_db_path, mock_client, monkeypatch, make_mock_topic):
@@ -199,11 +252,15 @@ def test_tool_description_strips_nullable_unions_from_exported_schema():
     list_messages_schema = tools_module.tool_description(ListMessages).inputSchema
     search_messages_schema = tools_module.tool_description(SearchMessages).inputSchema
 
+    dialog_schema = list_messages_schema["properties"]["dialog"]
     cursor_schema = list_messages_schema["properties"]["cursor"]
     sender_schema = list_messages_schema["properties"]["sender"]
     topic_schema = list_messages_schema["properties"]["topic"]
     offset_schema = search_messages_schema["properties"]["offset"]
 
+    assert "dialog" in list_messages_schema["required"]
+    assert dialog_schema["type"] == "string"
+    assert "Required." in dialog_schema["description"]
     assert cursor_schema == {"title": "Cursor", "type": "string"}
     assert sender_schema == {"title": "Sender", "type": "string"}
     assert topic_schema == {"title": "Topic", "type": "string"}
@@ -225,6 +282,41 @@ async def test_list_messages_by_name(mock_cache, mock_client, monkeypatch, make_
     assert "10:00" in result[0].text  # formatted output includes time
 
 
+async def test_search_messages_not_found_returns_action(mock_cache, mock_client, monkeypatch):
+    """SearchMessages returns an action-oriented response when the dialog cannot be resolved."""
+    from mcp_telegram.tools import SearchMessages, search_messages
+
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+
+    result = await search_messages(SearchMessages(dialog="nobody_xyz", query="hi"))
+
+    assert len(result) == 1
+    assert 'Dialog "nobody_xyz" was not found.' in result[0].text
+    assert "Action:" in result[0].text
+    assert "ListDialogs" in result[0].text
+
+
+async def test_search_messages_ambiguous_returns_action(mock_client, monkeypatch, tmp_db_path):
+    """SearchMessages returns an action-oriented response when the dialog query is ambiguous."""
+    from mcp_telegram.cache import EntityCache
+    from mcp_telegram.tools import SearchMessages, search_messages
+
+    ambig_cache = EntityCache(tmp_db_path)
+    ambig_cache.upsert(201, "group", "Backend Forum", None)
+    ambig_cache.upsert(202, "group", "Backend Feedback", None)
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: ambig_cache)
+
+    result = await search_messages(SearchMessages(dialog="Backend", query="hi"))
+
+    assert len(result) == 1
+    assert 'Dialog "Backend" matched multiple dialogs.' in result[0].text
+    assert "Action:" in result[0].text
+    assert 'id=201' in result[0].text
+    assert 'id=202' in result[0].text
+
+
 async def test_list_messages_not_found(mock_cache, mock_client, monkeypatch):
     """ListMessages with unresolved name returns TextContent with 'not found'."""
     from mcp_telegram.tools import ListMessages, list_messages
@@ -232,7 +324,9 @@ async def test_list_messages_not_found(mock_cache, mock_client, monkeypatch):
     monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
     result = await list_messages(ListMessages(dialog="nobody_xyz"))
     assert len(result) == 1
-    assert "not found" in result[0].text.lower()
+    assert 'Dialog "nobody_xyz" was not found.' in result[0].text
+    assert "Action:" in result[0].text
+    assert "ListDialogs" in result[0].text
 
 
 async def test_list_messages_ambiguous(mock_cache, mock_client, monkeypatch, tmp_db_path):
@@ -247,7 +341,8 @@ async def test_list_messages_ambiguous(mock_cache, mock_client, monkeypatch, tmp
     monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: ambig_cache)
     result = await list_messages(ListMessages(dialog="Иван"))
     assert len(result) == 1
-    assert "Ambiguous" in result[0].text or "ambiguous" in result[0].text.lower()
+    assert 'Dialog "Иван" matched multiple dialogs.' in result[0].text
+    assert "Action:" in result[0].text
 
 
 # --- TOOL-03: ListMessages cursor pagination ---
@@ -383,7 +478,9 @@ async def test_list_messages_topic_not_found(tmp_db_path, mock_client, monkeypat
     result = await list_messages(ListMessages(dialog="Backend Forum", topic="Incident Review"))
 
     assert len(result) == 1
-    assert 'Topic not found: "Incident Review"' in result[0].text
+    assert 'Topic "Incident Review" was not found.' in result[0].text
+    assert "Action:" in result[0].text
+    assert "ListTopics" in result[0].text
 
 
 async def test_list_messages_topic_ambiguous_within_dialog(tmp_db_path, mock_client, monkeypatch):
@@ -411,7 +508,8 @@ async def test_list_messages_topic_ambiguous_within_dialog(tmp_db_path, mock_cli
     result = await list_messages(ListMessages(dialog="Backend Forum", topic="Release"))
 
     assert len(result) == 1
-    assert 'Ambiguous topic "Release"' in result[0].text
+    assert 'Topic "Release" matched multiple topics.' in result[0].text
+    assert "Action:" in result[0].text
     assert 'name="Release Notes"' in result[0].text
     assert 'name="Release Planning"' in result[0].text
 
@@ -1051,7 +1149,9 @@ async def test_list_messages_deleted_topic_behavior(
 
     result = await list_messages(ListMessages(dialog="Backend Forum", topic="Deprecated Topic"))
 
-    assert result[0].text == 'Topic "Deprecated Topic" was deleted and can no longer be fetched.'
+    assert 'Topic "Deprecated Topic" was deleted and can no longer be fetched.' in result[0].text
+    assert "Action:" in result[0].text
+    assert "ListTopics" in result[0].text
     assert mock_client.iter_messages.call_count == 0
 
 
@@ -1084,7 +1184,8 @@ async def test_list_messages_private_or_inaccessible_topic_behavior(
 
     result = await list_messages(ListMessages(dialog="Backend Forum", topic="Release Notes"))
 
-    assert result[0].text == 'Topic "Release Notes" resolved, but Telegram rejected thread fetch (TOPIC_PRIVATE).'
+    assert 'Topic "Release Notes" resolved, but Telegram rejected thread fetch (TOPIC_PRIVATE).' in result[0].text
+    assert "Action:" in result[0].text
 
 
 async def test_list_messages_topic_retries_after_stale_top_message_id(
@@ -1169,7 +1270,8 @@ async def test_list_messages_topic_deleted_after_refresh(
 
     result = await list_messages(ListMessages(dialog="Backend Forum", topic="Release Notes"))
 
-    assert result[0].text == 'Topic "Release Notes" was deleted and can no longer be fetched.'
+    assert 'Topic "Release Notes" was deleted and can no longer be fetched.' in result[0].text
+    assert "Action:" in result[0].text
     assert refresh_topic.await_count == 1
     assert mock_client.iter_messages.call_count == 1
 
@@ -1211,7 +1313,8 @@ async def test_list_messages_topic_inaccessible_after_refresh(
 
     result = await list_messages(ListMessages(dialog="Backend Forum", topic="Release Notes"))
 
-    assert result[0].text == 'Topic "Release Notes" resolved, but Telegram rejected thread fetch (TOPIC_ID_INVALID).'
+    assert 'Topic "Release Notes" resolved, but Telegram rejected thread fetch (TOPIC_ID_INVALID).' in result[0].text
+    assert "Action:" in result[0].text
     assert refresh_topic.await_count == 1
     assert mock_client.iter_messages.call_count == 3
     assert "reply_to" not in mock_client.iter_messages.call_args_list[2].kwargs
@@ -1734,8 +1837,9 @@ async def test_get_me_unauthenticated(mock_client, monkeypatch):
     monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
     result = await get_my_account(GetMyAccount())
     assert len(result) == 1
-    text = result[0].text.lower()
-    assert "not authenticated" in text or "not logged in" in text
+    assert "Telegram session is not authenticated." in result[0].text
+    assert "Action:" in result[0].text
+    assert "GetMyAccount" in result[0].text
 
 
 # --- TOOL-09: GetUserInfo ---
@@ -1769,7 +1873,9 @@ async def test_get_user_info_not_found(mock_cache, mock_client, monkeypatch):
     monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
     result = await get_user_info(GetUserInfo(user="nobody_xyz"))
     assert len(result) == 1
-    assert "not found" in result[0].text.lower()
+    assert 'User "nobody_xyz" was not found.' in result[0].text
+    assert "Action:" in result[0].text
+    assert "ListDialogs" in result[0].text
 
 
 async def test_get_user_info_ambiguous(mock_client, monkeypatch, tmp_db_path):
@@ -1783,7 +1889,26 @@ async def test_get_user_info_ambiguous(mock_client, monkeypatch, tmp_db_path):
     monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: ambig_cache)
     result = await get_user_info(GetUserInfo(user="Иван"))
     assert len(result) == 1
-    assert "Ambiguous" in result[0].text or "ambiguous" in result[0].text.lower()
+    assert 'User "Иван" matched multiple users.' in result[0].text
+    assert "Action:" in result[0].text
+    assert 'id=201' in result[0].text
+    assert 'id=202' in result[0].text
+
+
+async def test_get_user_info_fetch_error_returns_action(mock_cache, mock_client, monkeypatch):
+    """GetUserInfo returns an action-oriented response when Telegram fetch fails."""
+    from mcp_telegram.tools import GetUserInfo, get_user_info
+
+    mock_client.get_entity = AsyncMock(side_effect=RuntimeError("boom"))
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+
+    result = await get_user_info(GetUserInfo(user="Иван Петров"))
+
+    assert len(result) == 1
+    assert 'Could not fetch info for user "Иван Петров" (boom).' in result[0].text
+    assert "Action:" in result[0].text
+    assert "Retry GetUserInfo later" in result[0].text
 
 
 async def test_get_user_info_resolver_prefix(mock_cache, mock_client, monkeypatch):
@@ -1853,8 +1978,24 @@ async def test_search_messages_upserts_sender(mock_cache, mock_client, monkeypat
     assert sender_calls, "cache.upsert must be called with sender_id=999 for the hit message"
 
 
+async def test_search_messages_no_hits_returns_action(mock_cache, mock_client, monkeypatch):
+    """SearchMessages returns an action-oriented empty-state when no hits match the query."""
+    from mcp_telegram.tools import SearchMessages, search_messages
+
+    mock_client.iter_messages = MagicMock(return_value=_async_iter([]))
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+
+    result = await search_messages(SearchMessages(dialog="Иван Петров", query="zzz"))
+
+    assert len(result) == 1
+    assert 'No messages matched query "zzz" in dialog "Иван Петров".' in result[0].text
+    assert "Action:" in result[0].text
+    assert "broader query" in result[0].text
+
+
 async def test_list_messages_invalid_cursor_returns_error(mock_cache, mock_client, monkeypatch):
-    """list_messages with a malformed cursor returns a single TextContent starting with 'Invalid cursor:'."""
+    """list_messages with a malformed cursor returns an action-oriented cursor error."""
     from mcp_telegram.tools import ListMessages, list_messages
 
     monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
@@ -1862,7 +2003,8 @@ async def test_list_messages_invalid_cursor_returns_error(mock_cache, mock_clien
 
     result = await list_messages(ListMessages(dialog="Иван Петров", cursor="BADINVALID==garbage"))
     assert len(result) == 1
-    assert result[0].text.startswith("Invalid cursor:")
+    assert result[0].text.startswith("Cursor is invalid:")
+    assert "Action:" in result[0].text
 
 
 # --- TELEMETRY TESTS ---
@@ -2172,7 +2314,53 @@ async def test_get_usage_stats_empty_db(mock_cache, mock_client, monkeypatch, tm
         assert len(result) == 1
         from mcp.types import TextContent
         assert isinstance(result[0], TextContent)
-        assert "Analytics database not yet created" in result[0].text or "No usage data" in result[0].text
+        assert "Analytics database not yet created." in result[0].text
+        assert "Action:" in result[0].text
+        assert "retry GetUsageStats" in result[0].text
+    finally:
+        mcp_telegram.tools.xdg_state_home = original_xdg
+
+
+async def test_get_usage_stats_no_recent_data_returns_action(mock_cache, mock_client, monkeypatch, tmp_path):
+    """GetUsageStats returns an action-oriented response when analytics DB exists but has no recent data."""
+    from mcp_telegram.tools import GetUsageStats, get_usage_stats
+    import sqlite3
+    import mcp_telegram.tools
+
+    db_dir = tmp_path / "mcp-telegram"
+    db_dir.mkdir(exist_ok=True)
+    db_path = db_dir / "analytics.db"
+    conn = sqlite3.connect(str(db_path))
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS telemetry_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tool_name TEXT NOT NULL,
+            timestamp REAL NOT NULL,
+            duration_ms REAL NOT NULL,
+            result_count INTEGER NOT NULL,
+            has_cursor BOOLEAN NOT NULL,
+            page_depth INTEGER NOT NULL,
+            has_filter BOOLEAN NOT NULL,
+            error_type TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+    original_xdg = mcp_telegram.tools.xdg_state_home
+    mcp_telegram.tools.xdg_state_home = lambda: tmp_path
+
+    try:
+        monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+        monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+
+        result = await get_usage_stats(GetUsageStats())
+
+        assert len(result) == 1
+        assert "No usage data in the past 30 days." in result[0].text
+        assert "Action:" in result[0].text
+        assert "retry GetUsageStats" in result[0].text
     finally:
         mcp_telegram.tools.xdg_state_home = original_xdg
 
