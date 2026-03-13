@@ -5,8 +5,19 @@ from typing import Awaitable, Callable, Literal, TypedDict
 
 from telethon import functions
 from telethon.errors import RPCError
+from telethon.tl.functions.messages import (
+    GetMessageReactionsListRequest,
+    GetPeerDialogsRequest,
+)
 
-from .cache import EntityCache, TopicMetadataCache
+from .cache import (
+    GROUP_TTL,
+    USER_TTL,
+    EntityCache,
+    ReactionMetadataCache,
+    TopicMetadataCache,
+)
+from .pagination import decode_cursor, encode_cursor
 from .resolver import Candidates, NotFound, Resolved, resolve
 
 FORUM_TOPICS_PAGE_SIZE = 100
@@ -91,13 +102,53 @@ class ResolvedForumTopic:
     reply_to_message_id: int | None
 
 
+@dataclass(frozen=True)
+class MessageReadFailure:
+    kind: Literal[
+        "invalid_cursor",
+        "sender_not_found",
+        "sender_ambiguous",
+        "deleted",
+        "inaccessible",
+    ]
+    text: str
+
+
+@dataclass(frozen=True)
+class ListTopicsExecution:
+    resolve_prefix: str
+    dialog_name: str
+    active_topics: tuple[TopicMetadata, ...]
+
+
+@dataclass(frozen=True)
+class HistoryReadExecution:
+    entity_id: int
+    resolve_prefix: str
+    topic_name: str | None
+    messages: tuple[object, ...]
+    fetched_messages: tuple[object, ...]
+    reply_map: dict[int, object]
+    reaction_names_map: dict[int, dict[str, list[str]]]
+    topic_name_getter: Callable[[object], str | None] | None
+    next_cursor: str | None
+
+
 DialogResolveResult = Resolved | Candidates | NotFound
 DialogTargetResult = ResolvedDialogTarget | DialogTargetFailure
 ForumTopicCapabilityResult = TopicCatalog | ResolvedForumTopic | ForumTopicFailure
+ListTopicsCapabilityResult = ListTopicsExecution | DialogTargetFailure | ForumTopicFailure
+HistoryReadCapabilityResult = (
+    HistoryReadExecution
+    | DialogTargetFailure
+    | ForumTopicFailure
+    | MessageReadFailure
+)
 DialogResolver = Callable[[EntityCache, str], Awaitable[DialogResolveResult]]
 TopicLoader = Callable[..., Awaitable[TopicCatalog]]
 TopicFetcher = Callable[..., Awaitable[list[object]]]
 TopicRefresher = Callable[..., Awaitable[TopicMetadata | None]]
+SenderTypeGetter = Callable[[object], str]
 
 
 def build_get_forum_topics_request(
@@ -234,6 +285,32 @@ def no_active_topics_text(dialog_name: str) -> str:
     return action_text(
         f'No active forum topics found for "{dialog_name}".',
         "Retry ListMessages without topic to read dialog-wide messages, or choose another forum-enabled dialog.",
+    )
+
+
+def invalid_cursor_text(detail: str, *, retry_tool: str) -> str:
+    """Return an action-oriented response for malformed cursors."""
+    return action_text(
+        f"Cursor is invalid: {detail}",
+        f"Retry {retry_tool} without cursor to start from the first page, or reuse the exact next_cursor value from the previous {retry_tool} response.",
+    )
+
+
+def sender_not_found_text(sender_name: str, *, retry_tool: str) -> str:
+    """Return an action-oriented response for missing senders."""
+    return action_text(
+        f'Sender "{sender_name}" was not found.',
+        f"Retry {retry_tool} without sender, or use an exact sender name or @username that appears in this dialog.",
+    )
+
+
+def ambiguous_sender_text(sender_name: str, match_lines: list[str], *, retry_tool: str) -> str:
+    """Return an action-oriented response for ambiguous senders."""
+    matches = "\n".join(match_lines)
+    return (
+        f'Sender "{sender_name}" matched multiple users.\n'
+        f"Action: Retry {retry_tool} with sender set to one exact match from the list below.\n"
+        f"{matches}"
     )
 
 
@@ -757,6 +834,493 @@ async def load_forum_topic_capability(
         requested_topic=requested_topic,
         topic_catalog=topic_catalog,
         retry_tool=retry_tool,
+    )
+
+
+def _sender_match_line(match: dict[str, object]) -> str:
+    line = f'id={match["entity_id"]} name="{match["display_name"]}" score={match["score"]}'
+    username = match.get("username")
+    entity_type = match.get("entity_type")
+    if username:
+        line += f" @{username}"
+    if entity_type:
+        line += f" [{entity_type}]"
+    return line
+
+
+def _build_history_iter_kwargs(
+    *,
+    entity_id: int,
+    limit: int,
+    cursor: str | None,
+    from_beginning: bool,
+    retry_tool: str,
+) -> dict[str, object] | MessageReadFailure:
+    iter_kwargs: dict[str, object] = {
+        "entity": entity_id,
+        "limit": limit,
+        "reverse": from_beginning,
+    }
+
+    if from_beginning:
+        if cursor:
+            try:
+                iter_kwargs["min_id"] = decode_cursor(cursor, entity_id)
+            except Exception as exc:
+                return MessageReadFailure(
+                    kind="invalid_cursor",
+                    text=invalid_cursor_text(str(exc), retry_tool=retry_tool),
+                )
+        else:
+            iter_kwargs["min_id"] = 1
+        return iter_kwargs
+
+    if cursor:
+        try:
+            iter_kwargs["max_id"] = decode_cursor(cursor, entity_id)
+        except Exception as exc:
+            return MessageReadFailure(
+                kind="invalid_cursor",
+                text=invalid_cursor_text(str(exc), retry_tool=retry_tool),
+            )
+
+    return iter_kwargs
+
+
+def _resolve_sender_entity(
+    *,
+    cache: EntityCache,
+    sender_query: str | None,
+    retry_tool: str,
+) -> int | MessageReadFailure | None:
+    if sender_query is None:
+        return None
+
+    sender_result = resolve(sender_query, cache.all_names_with_ttl(USER_TTL, GROUP_TTL), cache)
+    if isinstance(sender_result, NotFound):
+        return MessageReadFailure(
+            kind="sender_not_found",
+            text=sender_not_found_text(sender_query, retry_tool=retry_tool),
+        )
+    if isinstance(sender_result, Candidates):
+        match_lines = [_sender_match_line(match) for match in sender_result.matches]
+        return MessageReadFailure(
+            kind="sender_ambiguous",
+            text=ambiguous_sender_text(sender_query, match_lines, retry_tool=retry_tool),
+        )
+    return sender_result.entity_id
+
+
+def _cache_message_senders(
+    *,
+    cache: EntityCache,
+    messages: list[object],
+    get_sender_type: SenderTypeGetter,
+) -> None:
+    for msg in messages:
+        sender = getattr(msg, "sender", None)
+        sender_id = getattr(msg, "sender_id", None)
+        if sender is None or not isinstance(sender_id, int):
+            continue
+        sender_name = " ".join(
+            filter(
+                None,
+                [
+                    getattr(sender, "first_name", None),
+                    getattr(sender, "last_name", None),
+                ],
+            )
+        ) or getattr(sender, "title", "") or str(sender_id)
+        cache.upsert(
+            sender_id,
+            get_sender_type(sender),
+            sender_name,
+            getattr(sender, "username", None),
+        )
+
+
+async def _build_reply_map(
+    client: object,
+    *,
+    entity_id: int,
+    messages: list[object],
+) -> dict[int, object]:
+    reply_ids = list(
+        {
+            reply_to_msg_id
+            for msg in messages
+            for reply_to_msg_id in [getattr(getattr(msg, "reply_to", None), "reply_to_msg_id", None)]
+            if isinstance(reply_to_msg_id, int)
+        }
+    )
+    if not reply_ids:
+        return {}
+
+    replied = await client.get_messages(entity_id, ids=reply_ids)
+    replied_list = replied if isinstance(replied, list) else [replied]
+    return {
+        getattr(message, "id"): message
+        for message in replied_list
+        if message is not None and isinstance(getattr(message, "id", None), int)
+    }
+
+
+async def _build_reaction_names_map(
+    client: object,
+    *,
+    cache: EntityCache,
+    entity_id: int,
+    messages: list[object],
+    reaction_names_threshold: int,
+) -> dict[int, dict[str, list[str]]]:
+    reaction_names_map: dict[int, dict[str, list[str]]] = {}
+    reaction_cache = ReactionMetadataCache(cache._conn)
+
+    for msg in messages:
+        message_id = getattr(msg, "id", None)
+        if not isinstance(message_id, int):
+            continue
+        rxns = getattr(msg, "reactions", None)
+        if not rxns:
+            continue
+
+        results = getattr(rxns, "results", None) or []
+        total = sum(getattr(result, "count", 0) for result in results)
+        if total == 0 or total > reaction_names_threshold:
+            continue
+
+        cached_reactions = reaction_cache.get(message_id, entity_id, ttl_seconds=600)
+        if cached_reactions:
+            reaction_names_map[message_id] = cached_reactions
+            continue
+
+        try:
+            reaction_list = await client(
+                GetMessageReactionsListRequest(
+                    peer=entity_id,
+                    id=message_id,
+                    limit=100,
+                )
+            )
+        except Exception:
+            continue
+
+        user_by_id = {
+            getattr(user, "id"): user
+            for user in (getattr(reaction_list, "users", None) or [])
+            if isinstance(getattr(user, "id", None), int)
+        }
+        names_by_emoji: dict[str, list[str]] = {}
+        for entry in (getattr(reaction_list, "reactions", None) or []):
+            emoji = getattr(getattr(entry, "reaction", None), "emoticon", None) or "?"
+            user_id = getattr(getattr(entry, "peer_id", None), "user_id", None)
+            if not isinstance(user_id, int) or user_id not in user_by_id:
+                continue
+            user = user_by_id[user_id]
+            name = " ".join(
+                filter(
+                    None,
+                    [
+                        getattr(user, "first_name", None),
+                        getattr(user, "last_name", None),
+                    ],
+                )
+            ) or str(user_id)
+            cache.upsert(user_id, "user", name, getattr(user, "username", None))
+            names_by_emoji.setdefault(str(emoji), []).append(name)
+
+        if names_by_emoji:
+            reaction_names_map[message_id] = names_by_emoji
+            reaction_cache.upsert(message_id, entity_id, names_by_emoji)
+
+    return reaction_names_map
+
+
+async def _build_cross_topic_name_getter(
+    client: object,
+    *,
+    cache: EntityCache,
+    entity_id: int,
+    dialog_name: str,
+    fetched_messages: list[object],
+    topic_catalog: TopicCatalog | None,
+    topic_cache: TopicMetadataCache | None,
+    load_topics: TopicLoader | None,
+) -> Callable[[object], str | None] | None:
+    dialog_cache_entry = cache.get(entity_id, GROUP_TTL)
+    if (
+        not fetched_messages
+        or dialog_cache_entry is None
+        or dialog_cache_entry.get("type") != "group"
+    ):
+        return None
+
+    active_topic_cache = topic_cache if topic_cache is not None else TopicMetadataCache(cache._conn)
+    active_topic_catalog = topic_catalog
+    if active_topic_catalog is None:
+        topic_capability = await load_forum_topic_capability(
+            client,
+            entity=entity_id,
+            dialog_id=entity_id,
+            dialog_name=dialog_name,
+            topic_cache=active_topic_cache,
+            requested_topic=None,
+            retry_tool="ListMessages",
+            load_topics=load_topics,
+        )
+        if isinstance(topic_capability, ForumTopicFailure):
+            return None
+        active_topic_catalog = topic_capability
+
+    if active_topic_catalog is None:
+        return None
+    if not (
+        messages_need_forum_topic_labels(fetched_messages)
+        or len(active_topic_catalog["choices"]) > 1
+    ):
+        return None
+    return build_topic_name_getter(active_topic_catalog)
+
+
+async def execute_list_topics_capability(
+    client: object,
+    *,
+    cache: EntityCache,
+    dialog_query: str,
+    retry_tool: str,
+    resolve_dialog: DialogResolver,
+    load_topics: TopicLoader | None = None,
+) -> ListTopicsCapabilityResult:
+    dialog_target = await resolve_dialog_target(
+        cache=cache,
+        query=dialog_query,
+        retry_tool=retry_tool,
+        resolve_dialog=resolve_dialog,
+    )
+    if isinstance(dialog_target, DialogTargetFailure):
+        return dialog_target
+
+    topic_capability = await load_forum_topic_capability(
+        client,
+        entity=dialog_target.entity_id,
+        dialog_id=dialog_target.entity_id,
+        dialog_name=dialog_target.display_name,
+        topic_cache=TopicMetadataCache(cache._conn),
+        requested_topic=None,
+        retry_tool=retry_tool,
+        load_topics=load_topics,
+    )
+    if isinstance(topic_capability, ForumTopicFailure):
+        return topic_capability
+
+    active_topics = tuple(
+        topic_capability["metadata_by_id"][topic_id]
+        for topic_id in sorted(topic_capability["choices"])
+    )
+    return ListTopicsExecution(
+        resolve_prefix=dialog_target.resolve_prefix,
+        dialog_name=dialog_target.display_name,
+        active_topics=active_topics,
+    )
+
+
+async def execute_history_read_capability(
+    client: object,
+    *,
+    cache: EntityCache,
+    dialog_query: str,
+    limit: int,
+    cursor: str | None,
+    sender_query: str | None,
+    topic_query: str | None,
+    unread: bool,
+    from_beginning: bool,
+    retry_tool: str,
+    resolve_dialog: DialogResolver,
+    get_sender_type: SenderTypeGetter,
+    reaction_names_threshold: int,
+    load_topics: TopicLoader | None = None,
+    fetch_topic_messages_fn: TopicFetcher | None = None,
+    refresh_topic_by_id_fn: TopicRefresher | None = None,
+) -> HistoryReadCapabilityResult:
+    dialog_target = await resolve_dialog_target(
+        cache=cache,
+        query=dialog_query,
+        retry_tool=retry_tool,
+        resolve_dialog=resolve_dialog,
+    )
+    if isinstance(dialog_target, DialogTargetFailure):
+        return dialog_target
+
+    iter_kwargs = _build_history_iter_kwargs(
+        entity_id=dialog_target.entity_id,
+        limit=limit,
+        cursor=cursor,
+        from_beginning=from_beginning,
+        retry_tool=retry_tool,
+    )
+    if isinstance(iter_kwargs, MessageReadFailure):
+        return iter_kwargs
+
+    sender_entity_id = _resolve_sender_entity(
+        cache=cache,
+        sender_query=sender_query,
+        retry_tool=retry_tool,
+    )
+    if isinstance(sender_entity_id, MessageReadFailure):
+        return sender_entity_id
+
+    topic_metadata: TopicMetadata | None = None
+    topic_cache: TopicMetadataCache | None = None
+    topic_catalog: TopicCatalog | None = None
+    topic_name: str | None = None
+    filter_sender_after_fetch = False
+    entity_id = dialog_target.entity_id
+
+    if topic_query:
+        topic_cache = TopicMetadataCache(cache._conn)
+        topic_capability = await load_forum_topic_capability(
+            client,
+            entity=entity_id,
+            dialog_id=entity_id,
+            dialog_name=dialog_target.display_name,
+            topic_cache=topic_cache,
+            requested_topic=topic_query,
+            retry_tool=retry_tool,
+            load_topics=load_topics,
+        )
+        if isinstance(topic_capability, ForumTopicFailure):
+            return topic_capability
+        if isinstance(topic_capability, ResolvedForumTopic):
+            topic_catalog = topic_capability.topic_catalog
+            topic_metadata = topic_capability.metadata
+            topic_name = topic_capability.display_name
+            if topic_capability.reply_to_message_id is not None:
+                iter_kwargs["reply_to"] = topic_capability.reply_to_message_id
+                filter_sender_after_fetch = isinstance(sender_entity_id, int)
+
+    if isinstance(sender_entity_id, int) and not filter_sender_after_fetch:
+        iter_kwargs["from_user"] = sender_entity_id
+
+    if unread:
+        input_peer = await client.get_input_entity(entity_id)
+        peer_result = await client(GetPeerDialogsRequest(peers=[input_peer]))
+        iter_kwargs["min_id"] = peer_result.dialogs[0].read_inbox_max_id
+
+    try:
+        use_topic_scoped_fetch = (
+            topic_metadata is not None
+            and (
+                unread
+                or (
+                    not bool(topic_metadata["is_general"])
+                    and "reply_to" in iter_kwargs
+                )
+            )
+        )
+        if use_topic_scoped_fetch and topic_metadata is not None and topic_cache is not None:
+            fetched_messages, topic_metadata, iter_kwargs = await fetch_messages_for_topic(
+                client,
+                entity_id=entity_id,
+                iter_kwargs=iter_kwargs,
+                topic_metadata=topic_metadata,
+                topic_cache=topic_cache,
+                allow_headerless_messages=bool(topic_metadata["is_general"]) or not unread,
+                fetch_topic_messages_fn=fetch_topic_messages_fn,
+                refresh_topic_by_id_fn=refresh_topic_by_id_fn,
+            )
+            if bool(topic_metadata["is_deleted"]):
+                deleted_name = topic_name or topic_query or "Topic"
+                return MessageReadFailure(
+                    kind="deleted",
+                    text=deleted_topic_text(deleted_name, retry_tool=retry_tool),
+                )
+            raw_messages = [] if fetched_messages is None else fetched_messages
+            topic_cache.clear_topic_inaccessible(entity_id, int(topic_metadata["topic_id"]))
+            topic_metadata["inaccessible_error"] = None
+            topic_metadata["inaccessible_at"] = None
+        else:
+            raw_messages = [msg async for msg in client.iter_messages(**iter_kwargs)]
+    except RPCError as exc:
+        if topic_query and topic_metadata is not None and topic_cache is not None:
+            detail = rpc_error_detail(exc)
+            topic_cache.mark_topic_inaccessible(
+                entity_id,
+                int(topic_metadata["topic_id"]),
+                detail,
+            )
+            topic_metadata["inaccessible_error"] = detail
+            return MessageReadFailure(
+                kind="inaccessible",
+                text=inaccessible_topic_text(
+                    topic_name or topic_query,
+                    exc,
+                    resolved=True,
+                    retry_tool=retry_tool,
+                ),
+            )
+        raise
+
+    if filter_sender_after_fetch and isinstance(sender_entity_id, int):
+        messages = [
+            msg
+            for msg in raw_messages
+            if getattr(msg, "sender_id", None) == sender_entity_id
+        ]
+    else:
+        messages = raw_messages
+
+    _cache_message_senders(
+        cache=cache,
+        messages=raw_messages,
+        get_sender_type=get_sender_type,
+    )
+    reply_map = await _build_reply_map(
+        client,
+        entity_id=entity_id,
+        messages=messages,
+    )
+    reaction_names_map = await _build_reaction_names_map(
+        client,
+        cache=cache,
+        entity_id=entity_id,
+        messages=messages,
+        reaction_names_threshold=reaction_names_threshold,
+    )
+
+    topic_name_getter: Callable[[object], str | None] | None = None
+    if topic_query is None:
+        try:
+            topic_name_getter = await _build_cross_topic_name_getter(
+                client,
+                cache=cache,
+                entity_id=entity_id,
+                dialog_name=dialog_target.display_name,
+                fetched_messages=raw_messages,
+                topic_catalog=topic_catalog,
+                topic_cache=topic_cache,
+                load_topics=load_topics,
+            )
+        except RPCError:
+            topic_name_getter = None
+
+    cursor_source_messages = raw_messages if filter_sender_after_fetch else messages
+    next_cursor: str | None = None
+    if len(cursor_source_messages) == limit and cursor_source_messages:
+        last_message_id = getattr(cursor_source_messages[-1], "id", None)
+        if isinstance(last_message_id, int):
+            next_cursor = encode_cursor(last_message_id, entity_id)
+
+    return HistoryReadExecution(
+        entity_id=entity_id,
+        resolve_prefix=dialog_target.resolve_prefix,
+        topic_name=topic_name,
+        messages=tuple(messages),
+        fetched_messages=tuple(raw_messages),
+        reply_map=reply_map,
+        reaction_names_map=reaction_names_map,
+        topic_name_getter=topic_name_getter,
+        next_cursor=next_cursor,
     )
 
 

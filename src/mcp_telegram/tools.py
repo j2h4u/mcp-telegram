@@ -989,6 +989,8 @@ _append_topic_match_metadata = capabilities.append_topic_match_metadata
 _message_matches_topic = capabilities.message_matches_topic
 _fetch_topic_messages = capabilities.fetch_topic_messages
 _fetch_messages_for_topic = capabilities.fetch_messages_for_topic
+_execute_list_topics_capability = capabilities.execute_list_topics_capability
+_execute_history_read_capability = capabilities.execute_history_read_capability
 
 
 ### ListDialogs ###
@@ -1097,45 +1099,30 @@ async def list_topics(
 
     try:
         cache = get_entity_cache()
-        dialog_target = await _resolve_dialog_target(
-            cache=cache,
-            query=args.dialog,
-            retry_tool="ListTopics",
-            resolve_dialog=_resolve_dialog,
-        )
-        if isinstance(dialog_target, capabilities.DialogTargetFailure):
-            return [TextContent(type="text", text=dialog_target.text)]
-
-        entity_id = dialog_target.entity_id
-        resolve_prefix = dialog_target.resolve_prefix
-
         async with connected_client() as client:
-            topic_cache = TopicMetadataCache(cache._conn)
-            topic_capability = await _load_forum_topic_capability(
+            topic_execution = await _execute_list_topics_capability(
                 client,
-                entity=entity_id,
-                dialog_id=entity_id,
-                dialog_name=dialog_target.display_name,
-                topic_cache=topic_cache,
-                requested_topic=None,
+                cache=cache,
+                dialog_query=args.dialog,
                 retry_tool="ListTopics",
+                resolve_dialog=_resolve_dialog,
                 load_topics=_load_dialog_topics,
             )
-            if isinstance(topic_capability, capabilities.ForumTopicFailure):
-                return [TextContent(type="text", text=topic_capability.text)]
-            topic_catalog = topic_capability
+        if isinstance(
+            topic_execution,
+            (capabilities.DialogTargetFailure, capabilities.ForumTopicFailure),
+        ):
+            return [TextContent(type="text", text=topic_execution.text)]
 
-        active_topics = [
-            topic_catalog["metadata_by_id"][topic_id]
-            for topic_id in sorted(topic_catalog["choices"])
-        ]
-        result_count = len(active_topics)
-        if not active_topics:
-            text = resolve_prefix + _no_active_topics_text(dialog_target.display_name)
+        result_count = len(topic_execution.active_topics)
+        if not topic_execution.active_topics:
+            text = topic_execution.resolve_prefix + _no_active_topics_text(
+                topic_execution.dialog_name
+            )
             return [TextContent(type="text", text=text)]
 
-        lines = [_topic_row_text(topic) for topic in active_topics]
-        result_text = resolve_prefix + "\n".join(lines)
+        lines = [_topic_row_text(topic) for topic in topic_execution.active_topics]
+        result_text = topic_execution.resolve_prefix + "\n".join(lines)
         result = [TextContent(type="text", text=result_text)]
     except Exception as exc:
         error_type = type(exc).__name__
@@ -1208,323 +1195,59 @@ async def list_messages(
     t0 = time.monotonic()
     error_type = None
     result_count = 0
-    has_filter = False
+    has_filter = bool(args.sender or args.topic or args.unread)
     page_depth = 1
 
     try:
-        # Step 1 — Resolve dialog name
         cache = get_entity_cache()
-        dialog_target = await _resolve_dialog_target(
-            cache=cache,
-            query=args.dialog,
-            retry_tool="ListMessages",
-            resolve_dialog=_resolve_dialog,
-        )
-        if isinstance(dialog_target, capabilities.DialogTargetFailure):
-            return [TextContent(type="text", text=dialog_target.text)]
-        entity_id: int = dialog_target.entity_id
-        dialog_cache_entry = cache.get(entity_id, GROUP_TTL)
-        resolve_prefix = dialog_target.resolve_prefix
-        topic_metadata: dict[str, int | str | bool | None] | None = None
-        resolved_topic_name: str | None = None
-        sender_entity_id: int | None = None
-        filter_sender_after_fetch = False
-        topic_cache: TopicMetadataCache | None = None
-        topic_catalog: dict[str, t.Any] | None = None
-
-        # Step 2 — Build iter_messages kwargs
-        iter_kwargs: dict[str, t.Any] = {
-            "entity": entity_id,
-            "limit": args.limit,
-            "reverse": args.from_beginning,  # Toggle iteration direction based on parameter
-        }
-
-        # Handle cursor based on iteration direction
-        if args.from_beginning:
-            # Reverse iteration: use min_id (page forward from oldest)
-            if args.cursor:
-                try:
-                    iter_kwargs["min_id"] = decode_cursor(args.cursor, entity_id)
-                except Exception as exc:
-                    return [TextContent(type="text", text=_invalid_cursor_text(str(exc), retry_tool="ListMessages"))]
-            else:
-                iter_kwargs["min_id"] = 1  # Start from oldest message
-        else:
-            # Forward iteration: use max_id (page backward from newest)
-            if args.cursor:
-                try:
-                    iter_kwargs["max_id"] = decode_cursor(args.cursor, entity_id)
-                except Exception as exc:
-                    return [TextContent(type="text", text=_invalid_cursor_text(str(exc), retry_tool="ListMessages"))]
-
-        # Step 3 — Sender filter (resolve before opening client)
-        if args.sender:
-            has_filter = True
-            sender_result = resolve(args.sender, cache.all_names_with_ttl(USER_TTL, GROUP_TTL), cache)
-            if isinstance(sender_result, NotFound):
-                return [
-                    TextContent(
-                        type="text",
-                        text=_sender_not_found_text(args.sender, retry_tool="ListMessages"),
-                    )
-                ]
-            if isinstance(sender_result, Candidates):
-                match_lines = []
-                for match in sender_result.matches:
-                    line = f'id={match["entity_id"]} name="{match["display_name"]}" score={match["score"]}'
-                    if match.get("username"):
-                        line += f' @{match["username"]}'
-                    if match.get("entity_type"):
-                        line += f' [{match["entity_type"]}]'
-                    match_lines.append(line)
-                return [
-                    TextContent(
-                        type="text",
-                        text=_ambiguous_sender_text(args.sender, match_lines, retry_tool="ListMessages"),
-                    )
-                ]
-            sender_entity_id = sender_result.entity_id
-
-        # Track unread as a filter
-        if args.unread:
-            has_filter = True
-
-        # Step 4 — Topic resolution + unread filter + message fetch + format + cursor
         async with connected_client() as client:
-            if args.topic:
-                has_filter = True
-                topic_cache = TopicMetadataCache(cache._conn)
-                topic_capability = await _load_forum_topic_capability(
-                    client,
-                    entity=entity_id,
-                    dialog_id=entity_id,
-                    dialog_name=dialog_target.display_name,
-                    topic_cache=topic_cache,
-                    requested_topic=args.topic,
-                    retry_tool="ListMessages",
-                    load_topics=_load_dialog_topics,
-                )
-                if isinstance(topic_capability, capabilities.ForumTopicFailure):
-                    return [TextContent(type="text", text=topic_capability.text)]
-                if isinstance(topic_capability, capabilities.ResolvedForumTopic):
-                    topic_catalog = topic_capability.topic_catalog
-                    topic_metadata = topic_capability.metadata
-                    resolved_topic_name = topic_capability.display_name
-                    if topic_capability.reply_to_message_id is not None:
-                        iter_kwargs["reply_to"] = topic_capability.reply_to_message_id
-                        filter_sender_after_fetch = sender_entity_id is not None
+            history_execution = await _execute_history_read_capability(
+                client,
+                cache=cache,
+                dialog_query=args.dialog,
+                limit=args.limit,
+                cursor=args.cursor,
+                sender_query=args.sender,
+                topic_query=args.topic,
+                unread=args.unread,
+                from_beginning=args.from_beginning,
+                retry_tool="ListMessages",
+                resolve_dialog=_resolve_dialog,
+                get_sender_type=_get_sender_type,
+                reaction_names_threshold=REACTION_NAMES_THRESHOLD,
+                load_topics=_load_dialog_topics,
+                fetch_topic_messages_fn=_fetch_topic_messages,
+                refresh_topic_by_id_fn=_refresh_topic_by_id,
+            )
+        if isinstance(
+            history_execution,
+            (
+                capabilities.DialogTargetFailure,
+                capabilities.ForumTopicFailure,
+                capabilities.MessageReadFailure,
+            ),
+        ):
+            return [TextContent(type="text", text=history_execution.text)]
 
-            if sender_entity_id is not None and not filter_sender_after_fetch:
-                iter_kwargs["from_user"] = sender_entity_id
-
-            if args.unread:
-                input_peer = await client.get_input_entity(entity_id)
-                peer_result = await client(GetPeerDialogsRequest(peers=[input_peer]))
-                tl_dialog = peer_result.dialogs[0]
-                iter_kwargs["min_id"] = tl_dialog.read_inbox_max_id
-
-            try:
-                use_topic_scoped_fetch = (
-                    topic_metadata is not None
-                    and (
-                        args.unread
-                        or (
-                            not bool(topic_metadata["is_general"])
-                            and "reply_to" in iter_kwargs
-                        )
-                    )
-                )
-                if use_topic_scoped_fetch and topic_metadata is not None:
-                    fetched_messages, topic_metadata, iter_kwargs = await _fetch_messages_for_topic(
-                        client,
-                        entity_id=entity_id,
-                        iter_kwargs=iter_kwargs,
-                        topic_metadata=topic_metadata,
-                        topic_cache=topic_cache,
-                        allow_headerless_messages=(
-                            bool(topic_metadata["is_general"]) or not args.unread
-                        ),
-                        fetch_topic_messages_fn=_fetch_topic_messages,
-                        refresh_topic_by_id_fn=_refresh_topic_by_id,
-                    )
-                    if topic_metadata is not None and bool(topic_metadata["is_deleted"]):
-                        topic_name = resolved_topic_name or args.topic or "Topic"
-                        return [
-                            TextContent(
-                                type="text",
-                                text=_deleted_topic_text(topic_name, retry_tool="ListMessages"),
-                            )
-                        ]
-                    if fetched_messages is None:
-                        fetched_messages = []
-                    if (
-                        topic_cache is not None
-                        and topic_metadata is not None
-                        and not bool(topic_metadata["is_deleted"])
-                    ):
-                        topic_cache.clear_topic_inaccessible(
-                            entity_id,
-                            int(topic_metadata["topic_id"]),
-                        )
-                        topic_metadata["inaccessible_error"] = None
-                        topic_metadata["inaccessible_at"] = None
-                else:
-                    fetched_messages = [msg async for msg in client.iter_messages(**iter_kwargs)]
-            except RPCError as exc:
-                if args.topic:
-                    topic_name = resolved_topic_name or args.topic
-                    if topic_cache is not None and topic_metadata is not None:
-                        topic_cache.mark_topic_inaccessible(
-                            entity_id,
-                            int(topic_metadata["topic_id"]),
-                            _rpc_error_detail(exc),
-                        )
-                        topic_metadata["inaccessible_error"] = _rpc_error_detail(exc)
-                    return [
-                        TextContent(
-                            type="text",
-                            text=_inaccessible_topic_text(
-                                topic_name,
-                                exc,
-                                resolved=True,
-                                retry_tool="ListMessages",
-                            ),
-                        )
-                    ]
-                raise
-            if filter_sender_after_fetch and sender_entity_id is not None:
-                # Telethon thread retrieval is reliable with reply_to; sender filtering is applied locally.
-                messages = [
-                    msg for msg in fetched_messages
-                    if getattr(msg, "sender_id", None) == sender_entity_id
-                ]
-            else:
-                messages = fetched_messages
-
-            # Lazy cache population: upsert sender entities
-            for msg in fetched_messages:
-                sender = getattr(msg, "sender", None)
-                if sender is not None:
-                    sender_name = " ".join(
-                        filter(None, [
-                            getattr(sender, "first_name", None),
-                            getattr(sender, "last_name", None),
-                        ])
-                    ) or getattr(sender, "title", "") or str(msg.sender_id)
-                    sender_type = _get_sender_type(sender)
-                    cache.upsert(
-                        msg.sender_id, sender_type, sender_name,
-                        getattr(sender, "username", None)
-                    )
-
-            # Build reply_map for reply annotations
-            reply_ids = list({
-                msg.reply_to.reply_to_msg_id
-                for msg in messages
-                if getattr(msg, "reply_to", None) and getattr(msg.reply_to, "reply_to_msg_id", None)
-            })
-            reply_map: dict[int, object] = {}
-            if reply_ids:
-                replied = await client.get_messages(entity_id, ids=reply_ids)
-                replied_list = replied if isinstance(replied, list) else [replied]
-                reply_map = {m.id: m for m in replied_list if m}
-
-            # Build reaction_names_map: fetch reactor names for messages with few reactions
-            reaction_names_map: dict[int, dict[str, list[str]]] = {}
-            reaction_cache = ReactionMetadataCache(cache._conn)
-            for msg in messages:
-                rxns = getattr(msg, "reactions", None)
-                if not rxns:
-                    continue
-                results = getattr(rxns, "results", None) or []
-                total = sum(getattr(r, "count", 0) for r in results)
-                if total == 0 or total > REACTION_NAMES_THRESHOLD:
-                    continue
-
-                # Check reaction cache first (10-minute TTL)
-                cached_reactions = reaction_cache.get(msg.id, entity_id, ttl_seconds=600)
-                if cached_reactions:
-                    reaction_names_map[msg.id] = cached_reactions
-                    continue
-
-                try:
-                    rl = await client(GetMessageReactionsListRequest(
-                        peer=entity_id,
-                        id=msg.id,
-                        limit=100,
-                    ))
-                    user_by_id = {u.id: u for u in (getattr(rl, "users", None) or [])}
-                    by_emoji: dict[str, list[str]] = {}
-                    for entry in (getattr(rl, "reactions", None) or []):
-                        emoji = getattr(getattr(entry, "reaction", None), "emoticon", None) or "?"
-                        uid = getattr(getattr(entry, "peer_id", None), "user_id", None)
-                        if uid and uid in user_by_id:
-                            u = user_by_id[uid]
-                            name = " ".join(filter(None, [
-                                getattr(u, "first_name", None),
-                                getattr(u, "last_name", None),
-                            ])) or str(uid)
-                            cache.upsert(u.id, "user", name, getattr(u, "username", None))
-                            by_emoji.setdefault(emoji, []).append(name)
-                    if by_emoji:
-                        reaction_names_map[msg.id] = by_emoji
-                        # Cache the reaction names for future requests
-                        reaction_cache.upsert(msg.id, entity_id, by_emoji)
-                except Exception:
-                    pass  # fallback to count-only
-
-            topic_name_getter: t.Callable[[object], str | None] | None = None
-            if (
-                not args.topic
-                and fetched_messages
-                and dialog_cache_entry is not None
-                and dialog_cache_entry["type"] == "group"
-            ):
-                if topic_cache is None:
-                    topic_cache = TopicMetadataCache(cache._conn)
-                try:
-                    if topic_catalog is None:
-                        topic_capability = await _load_forum_topic_capability(
-                            client,
-                            entity=entity_id,
-                            dialog_id=entity_id,
-                            dialog_name=dialog_target.display_name,
-                            topic_cache=topic_cache,
-                            requested_topic=None,
-                            retry_tool="ListMessages",
-                            load_topics=_load_dialog_topics,
-                        )
-                        if isinstance(topic_capability, capabilities.ForumTopicFailure):
-                            topic_name_getter = None
-                            topic_catalog = None
-                        else:
-                            topic_catalog = topic_capability
-                    if topic_catalog is not None and (
-                        _messages_need_forum_topic_labels(fetched_messages)
-                        or len(topic_catalog["choices"]) > 1
-                    ):
-                        topic_name_getter = _build_topic_name_getter(topic_catalog)
-                except RPCError:
-                    topic_name_getter = None
-
+        messages = list(history_execution.messages)
         text = format_messages(
             messages,
-            reply_map=reply_map,
-            reaction_names_map=reaction_names_map,
-            topic_name_getter=topic_name_getter,
+            reply_map=history_execution.reply_map,
+            reaction_names_map=history_execution.reaction_names_map,
+            topic_name_getter=history_execution.topic_name_getter,
         )
         if not text:
             text = _topic_empty_state_text(unread=args.unread)
-        next_cursor: str | None = None
-        cursor_source_messages = fetched_messages if filter_sender_after_fetch else messages
-        if len(cursor_source_messages) == args.limit and cursor_source_messages:
-            next_cursor = encode_cursor(cursor_source_messages[-1].id, entity_id)
 
         result_count = len(messages)
-        topic_prefix = f"[topic: {resolved_topic_name}]\n" if resolved_topic_name else ""
-        result_text = resolve_prefix + topic_prefix + text
-        if next_cursor:
-            result_text += f"\n\nnext_cursor: {next_cursor}"
+        topic_prefix = (
+            f"[topic: {history_execution.topic_name}]\n"
+            if history_execution.topic_name
+            else ""
+        )
+        result_text = history_execution.resolve_prefix + topic_prefix + text
+        if history_execution.next_cursor:
+            result_text += f"\n\nnext_cursor: {history_execution.next_cursor}"
         result = [TextContent(type="text", text=result_text)]
     except Exception as exc:
         error_type = type(exc).__name__
