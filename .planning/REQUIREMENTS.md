@@ -19,7 +19,7 @@
 
 ### Recommendation
 
-- [ ] **RECO-01**: Maintainer can review one Pareto-style recommendation that targets the highest likely model-usage impact with the smallest safe change set.
+- [x] **RECO-01**: Maintainer can review one Pareto-style recommendation that targets the highest likely model-usage impact with the smallest safe change set.
 - [ ] **RECO-02**: Maintainer can review a recommended next implementation path, including sequencing, validation concerns, and open questions that should be resolved before coding.
 
 ### Research Quality
@@ -52,7 +52,7 @@
 | AUDIT-03 | 11 | Complete |
 | OPTION-01 | 12 | Complete |
 | OPTION-02 | 12 | Complete |
-| RECO-01 | 12 | Pending |
+| RECO-01 | 12 | Complete |
 | RECO-02 | 13 | Pending |
 | EVID-01 | 10 | Complete |
 | EVID-02 | 13 | Pending |
@@ -64,4 +64,4 @@
 
 ---
 *Requirements defined: 2026-03-13*
-*Last updated: 2026-03-13 after Phase 12 Plan 01*
+*Last updated: 2026-03-13 after Phase 12 Plan 03*
