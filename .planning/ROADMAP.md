@@ -36,7 +36,7 @@ material to landing the Medium path safely.
   1. Maintainer can trigger an unexpected tool failure and observe actionable recovery detail instead of only generic `Tool <name> failed` collapse.
   2. Escaped tool failures identify the failing operation clearly enough that maintainers can choose a next recovery step without reading raw stack traces first.
   3. Brownfield tests make the boundary behavior explicit enough that later contract work can change schemas without reintroducing generic failure collapse.
-**Plans**: TBD
+**Plans**: 01 complete; 02 planned
 
 ### Phase 15: Capability Seams
 **Goal**: Maintainers can evolve read, search, and topic behavior through capability-oriented internals rather than tool-name-shaped implementation seams.
@@ -87,7 +87,7 @@ Phases execute in numeric order: 14 -> 15 -> 16 -> 17 -> 18
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 14. Boundary Recovery | 0/TBD | Not started | - |
+| 14. Boundary Recovery | 1/2 | In Progress | - |
 | 15. Capability Seams | 0/TBD | Not started | - |
 | 16. Unified Navigation Contract | 0/TBD | Not started | - |
 | 17. Direct Read/Search Workflows | 0/TBD | Not started | - |
