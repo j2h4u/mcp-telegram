@@ -20,6 +20,16 @@ Latest shipped milestone: `v1.1 Observability & Completeness` on 2026-03-13.
 There is no active milestone at the moment. The next planning cycle should start from the backlog
 todos in `.planning/todos/pending/`.
 
+## Current Milestone: v1.2 MCP Surface Research
+
+**Goal:** Research MCP and Anthropic tool-design best practices, audit the current Telegram MCP surface against them, and produce grounded recommendations for a future refactor milestone.
+
+**Target features:**
+- Comparative audit of the current model-facing MCP surface against external best practices and primary-source guidance
+- Refactor option set covering minimal, medium, and maximum redesign paths
+- Pareto-style recommendation for the smallest change set likely to deliver most of the model-usage impact
+- Migration guidance and decision criteria for the follow-up implementation milestone
+
 ## Requirements
 
 ### Validated
@@ -49,7 +59,10 @@ todos in `.planning/todos/pending/`.
 
 ### Active
 
-- No active milestone. Start the next one with `$gsd-new-milestone`.
+- [ ] Grounded audit of the current MCP tool surface from the LLM-facing perspective
+- [ ] Option matrix for future refactor paths: minimal, medium, and maximum change
+- [ ] Recommended Pareto path for highest impact with the smallest safe redesign
+- [ ] Future implementation guidance for tool contracts, descriptions, and migration sequencing
 
 ### Backlog Candidates
 
@@ -106,4 +119,4 @@ Deployment remains Docker-based with stdio MCP transport and `mcp-proxy` for HTT
 - **Read-only**: Permanent constraint — write tools expand prompt injection blast radius dramatically
 
 ---
-*Last updated: 2026-03-13 after v1.1 milestone was archived*
+*Last updated: 2026-03-13 after v1.2 milestone started*

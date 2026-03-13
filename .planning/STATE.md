@@ -1,13 +1,13 @@
 ---
 gsd_state_version: 1.0
-milestone: none
-milestone_name: none
+milestone: v1.2
+milestone_name: MCP Surface Research
 current_phase: null
 current_phase_name: null
 current_plan: null
-status: between_milestones
-stopped_at: Archived v1.1 milestone
-last_updated: "2026-03-13T09:43:30Z"
+status: defining_requirements
+stopped_at: Milestone v1.2 started
+last_updated: "2026-03-13T09:44:30Z"
 last_activity: 2026-03-13
 progress:
   total_phases: 0
@@ -24,7 +24,7 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-13)
 
 **Core value:** LLM can work with Telegram using natural names — zero cold-start friction, no ID lookup boilerplate before every real task
-**Current focus:** No active milestone. Choose a backlog item or start `$gsd-new-milestone`.
+**Current focus:** Define requirements for v1.2 MCP Surface Research and decide the research-first plan.
 
 ## Current Position
 
@@ -33,9 +33,9 @@ Current Phase Name: —
 Total Phases: 0
 Current Plan: —
 Total Plans in Phase: 0
-Status: Between milestones
+Status: Defining requirements
 Last Activity: 2026-03-13
-Last Activity Description: Archived v1.1 and captured deferred work as backlog todos
+Last Activity Description: Started milestone v1.2 MCP Surface Research
 Progress: —
 
 ## Pending Todos
@@ -46,10 +46,10 @@ Progress: —
 
 ## Blockers
 
-- None. Remaining work is backlog, not active milestone scope.
+- None.
 
 ## Session
 
-**Last Date:** 2026-03-13T09:43:30Z
-**Stopped At:** Archived v1.1 milestone
+**Last Date:** 2026-03-13T09:44:30Z
+**Stopped At:** Milestone v1.2 started
 **Resume File:** None
