@@ -104,3 +104,24 @@ Additional behavior worth preserving in the audit:
 - Topic metadata can record a `previously_inaccessible` state after Telegram rejects access, which
   is later surfaced in topic listings. [src/mcp_telegram/tools.py](/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/tools.py#L699)
   [tests/test_tools.py](/home/j2h4u/repos/j2h4u/mcp-telegram/tests/test_tools.py#L1279)
+
+## Preserved Invariants and Stateful Constraints
+
+These are the default-preserve invariants for later redesign work unless stronger evidence justifies
+breaking them.
+
+| Invariant | Why it matters | Evidence |
+|-----------|----------------|----------|
+| Read-only Telegram access | Read-only Telegram scope is a shipped invariant. The public surface is entirely read-oriented: list, search, lookup, and telemetry-only observation. No mutating tool is reflected. | `UV_CACHE_DIR=/tmp/.uv-cache uv run cli.py list-tools`; [src/mcp_telegram/tools.py](/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/tools.py#L962) |
+| Stateful runtime | The system is not stateless. Telegram client creation is cached, and XDG-backed cache and analytics DBs persist across calls. | [src/mcp_telegram/telegram.py](/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/telegram.py#L56), [src/mcp_telegram/tools.py](/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/tools.py#L195), [src/mcp_telegram/tools.py](/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/tools.py#L204) |
+| Recovery-critical cached metadata | Entity, reaction, and topic caches materially reduce agent burden and preserve recovery context such as deleted topics and prior topic access failures. | [src/mcp_telegram/cache.py](/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/cache.py#L14), [src/mcp_telegram/cache.py](/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/cache.py#L109), [src/mcp_telegram/cache.py](/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/cache.py#L188) |
+| Privacy-safe telemetry | Telemetry is aggregate and intentionally avoids message-content logging or user-identifying event fields. The `privacy_audit` shell check backs that invariant. | [src/mcp_telegram/analytics.py](/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/analytics.py#L30), [tests/privacy_audit.sh](/home/j2h4u/repos/j2h4u/mcp-telegram/tests/privacy_audit.sh#L1), [tests/test_analytics.py](/home/j2h4u/repos/j2h4u/mcp-telegram/tests/test_analytics.py) |
+| Tests are contract evidence | Formatter, resolver, analytics, `privacy_audit`, and tool tests are evidence for shipped behavior, not optional implementation detail. | [tests/test_formatter.py](/home/j2h4u/repos/j2h4u/mcp-telegram/tests/test_formatter.py), [tests/test_resolver.py](/home/j2h4u/repos/j2h4u/mcp-telegram/tests/test_resolver.py), [tests/test_analytics.py](/home/j2h4u/repos/j2h4u/mcp-telegram/tests/test_analytics.py), [tests/privacy_audit.sh](/home/j2h4u/repos/j2h4u/mcp-telegram/tests/privacy_audit.sh), [tests/test_tools.py](/home/j2h4u/repos/j2h4u/mcp-telegram/tests/test_tools.py) |
+
+## Mismatches Between Stale Notes and Runtime Reality
+
+- Older notes that described a six-tool public surface are stale. Live reflection on 2026-03-13
+  exposes seven tools, including `ListTopics`.
+- The brownfield contract is broader than a plain tool inventory. The current surface already bakes
+  in workflow burden, action-oriented recovery, topic-state semantics, and mixed pagination
+  conventions that later phases must audit explicitly.
