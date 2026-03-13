@@ -56,7 +56,7 @@ Full details: `.planning/milestones/v1.1-ROADMAP.md`
 ### 📋 v1.2 MCP Surface Research (Planned)
 
 - [x] **Phase 10: Evidence Base & Audit Frame** - Establish the source hierarchy, audit rubric, and brownfield constraints for the current MCP surface. (completed 2026-03-13)
-- [ ] **Phase 11: Current Surface Comparative Audit** - Produce a grounded audit of the current tools and workflows against named best-practice sources and code reality.
+- [x] **Phase 11: Current Surface Comparative Audit** - Produce a grounded audit of the current tools and workflows against named best-practice sources and code reality. (completed 2026-03-13)
 - [ ] **Phase 12: Redesign Options & Pareto Recommendation** - Compare minimal, medium, and maximal redesign paths and select the highest-leverage safe direction.
 - [ ] **Phase 13: Implementation Sequencing & Decision Memo** - Turn the research into sequencing, validation, and open-question guidance for the future implementation milestone.
 
@@ -74,7 +74,7 @@ Full details: `.planning/milestones/v1.1-ROADMAP.md`
 | 8. Navigation Features | v1.1 | 2/2 | Complete | 2026-03-12 |
 | 9. Forum Topics Support | v1.1 | 6/6 | Complete | 2026-03-12 |
 | 10. Evidence Base & Audit Frame | v1.2 | 3/3 | Complete    | 2026-03-13 |
-| 11. Current Surface Comparative Audit | v1.2 | 2/3 | In Progress|  |
+| 11. Current Surface Comparative Audit | v1.2 | 3/3 | Complete   | 2026-03-13 |
 | 12. Redesign Options & Pareto Recommendation | v1.2 | 0/TBD | Not started | - |
 | 13. Implementation Sequencing & Decision Memo | v1.2 | 0/TBD | Not started | - |
 
@@ -100,7 +100,7 @@ Full details: `.planning/milestones/v1.1-ROADMAP.md`
 2. Findings tie each major strength or weakness to named evidence and to specific current-surface behaviors in `tools.py` and `server.py`.
 3. The audit explicitly identifies where the public contract leaks low-level mechanics or helper-step burden to the model, including pagination, disambiguation, and tool choreography.
 4. The deliverable summarizes current-state strengths, gaps, and preserved invariants in a decision-friendly comparison matrix or equivalent format.
-**Plans**: TBD
+**Plans**: 01-03 complete
 
 ### Phase 12: Redesign Options & Pareto Recommendation
 **Goal**: Maintainer can compare redesign paths and review one evidence-backed Pareto recommendation for the next milestone.
