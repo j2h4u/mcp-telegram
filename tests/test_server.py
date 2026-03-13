@@ -52,3 +52,31 @@ async def test_call_tool_runtime_failure_escaped_error_includes_actionable_guida
     assert "timed out" in message.lower() or "timeout" in message.lower()
     assert "action:" in message.lower() or "retry" in message.lower() or "check" in message.lower()
     assert message != "Tool ListDialogs failed"
+
+
+@pytest.mark.asyncio
+async def test_call_tool_passthrough_action_text_contract(monkeypatch) -> None:
+    monkeypatch.setitem(server.mapping, "GetUserInfo", _tool("GetUserInfo"))
+
+    expected = [
+        TextContent(
+            type="text",
+            text='Could not fetch info for user "Iris" (boom).\nAction: Retry GetUserInfo later.',
+        )
+    ]
+
+    monkeypatch.setattr("mcp_telegram.server.tools.tool_args", lambda tool, **kwargs: object())
+    monkeypatch.setattr("mcp_telegram.server.tools.tool_runner", AsyncMock(return_value=expected))
+
+    result = await server.call_tool("GetUserInfo", {"user": "Iris"})
+
+    assert result == expected
+    assert result[0].text == expected[0].text
+    assert "Action:" in result[0].text
+    assert "failed" not in result[0].text
+
+
+@pytest.mark.asyncio
+async def test_call_tool_unknown_tool_control_contract() -> None:
+    with pytest.raises(ValueError, match="Unknown tool: MissingTool"):
+        await server.call_tool("MissingTool", {})
