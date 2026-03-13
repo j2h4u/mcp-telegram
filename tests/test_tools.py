@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from mcp_telegram.cache import EntityCache, TopicMetadataCache
+from mcp_telegram.capabilities import HistoryReadExecution, ListTopicsExecution
 
 
 async def _async_iter(items):
@@ -272,6 +273,75 @@ def test_capability_extraction_preserves_public_tool_names() -> None:
     assert tools_module.tool_description(ListTopics).name == "ListTopics"
     assert tools_module.tool_description(ListMessages).name == "ListMessages"
     assert tools_module.tool_description(SearchMessages).name == "SearchMessages"
+
+
+async def test_list_topics_adapter_delegates_to_capability_execution(
+    tmp_db_path,
+    mock_client,
+    monkeypatch,
+    make_mock_topic,
+):
+    """ListTopics renders rows from the shared capability execution result."""
+    from mcp_telegram.tools import list_topics
+
+    cache = EntityCache(tmp_db_path)
+    capability = AsyncMock(
+        return_value=ListTopicsExecution(
+            resolve_prefix='[resolved: "Backend" → Backend Forum]\n',
+            dialog_name="Backend Forum",
+            active_topics=(
+                make_mock_topic(topic_id=1, title="General", top_message_id=None, is_general=True),
+                make_mock_topic(topic_id=11, title="Release Notes", top_message_id=5011),
+            ),
+        )
+    )
+
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr("mcp_telegram.tools._execute_list_topics_capability", capability)
+
+    result = await list_topics(ListTopics(dialog="Backend"))
+
+    assert result[0].text.startswith('[resolved: "Backend" → Backend Forum]\n')
+    assert 'topic_id=11 title="Release Notes" top_message_id=5011 status=active' in result[0].text
+    assert capability.await_args.kwargs["dialog_query"] == "Backend"
+
+
+async def test_list_messages_adapter_delegates_to_history_capability(
+    tmp_db_path,
+    mock_client,
+    monkeypatch,
+    make_mock_message,
+):
+    """ListMessages formats the shared history execution result instead of rebuilding it locally."""
+    from mcp_telegram.tools import list_messages
+
+    cache = EntityCache(tmp_db_path)
+    message = make_mock_message(id=30, text="Delegated topic update")
+    capability = AsyncMock(
+        return_value=HistoryReadExecution(
+            entity_id=701,
+            resolve_prefix='[resolved: "Backend" → Backend Forum]\n',
+            topic_name="Release Notes",
+            messages=(message,),
+            fetched_messages=(message,),
+            reply_map={},
+            reaction_names_map={},
+            topic_name_getter=None,
+            next_cursor="cursor-token",
+        )
+    )
+
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr("mcp_telegram.tools._execute_history_read_capability", capability)
+
+    result = await list_messages(ListMessages(dialog="Backend", topic="Release Notes", limit=1))
+
+    assert result[0].text.startswith('[resolved: "Backend" → Backend Forum]\n[topic: Release Notes]\n')
+    assert "Delegated topic update" in result[0].text
+    assert "next_cursor: cursor-token" in result[0].text
+    assert capability.await_args.kwargs["topic_query"] == "Release Notes"
 
 
 # --- TOOL-02: ListMessages name resolution ---

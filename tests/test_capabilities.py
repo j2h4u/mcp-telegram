@@ -11,8 +11,13 @@ from mcp_telegram.cache import EntityCache, TopicMetadataCache
 from mcp_telegram.capabilities import (
     DialogTargetFailure,
     ForumTopicFailure,
+    HistoryReadExecution,
+    ListTopicsExecution,
+    MessageReadFailure,
     ResolvedDialogTarget,
     ResolvedForumTopic,
+    execute_history_read_capability,
+    execute_list_topics_capability,
     fetch_messages_for_topic,
     load_forum_topic_capability,
     resolve_dialog_target,
@@ -213,3 +218,111 @@ async def test_fetch_messages_for_topic_refreshes_stale_anchor(
     assert returned_iter_kwargs["reply_to"] == 6011
     assert refresh_topic.await_count == 1
     assert fetch_topic_messages.await_count == 2
+
+
+async def test_execute_list_topics_capability_returns_active_topics(
+    tmp_db_path,
+    mock_client,
+    make_mock_topic,
+) -> None:
+    cache = EntityCache(tmp_db_path)
+    resolver = AsyncMock(return_value=Resolved(entity_id=701, display_name="Backend Forum"))
+    load_topics = AsyncMock(
+        return_value={
+            "choices": {1: "General", 11: "Release Notes"},
+            "metadata_by_id": {
+                1: make_mock_topic(topic_id=1, title="General", top_message_id=None, is_general=True),
+                11: make_mock_topic(topic_id=11, title="Release Notes", top_message_id=5011),
+            },
+            "deleted_topics": {},
+        }
+    )
+
+    result = await execute_list_topics_capability(
+        mock_client,
+        cache=cache,
+        dialog_query="Backend",
+        retry_tool="ListTopics",
+        resolve_dialog=resolver,
+        load_topics=load_topics,
+    )
+
+    assert isinstance(result, ListTopicsExecution)
+    assert result.resolve_prefix == '[resolved: "Backend" → Backend Forum]\n'
+    assert result.dialog_name == "Backend Forum"
+    assert [topic["title"] for topic in result.active_topics] == ["General", "Release Notes"]
+
+
+async def test_execute_history_read_capability_filters_topic_sender_locally_and_keeps_cursor(
+    tmp_db_path,
+    mock_client,
+    make_mock_message,
+    make_mock_topic,
+) -> None:
+    cache = EntityCache(tmp_db_path)
+    cache.upsert(9001, "user", "Alice", None)
+    resolver = AsyncMock(return_value=Resolved(entity_id=701, display_name="Backend Forum"))
+    load_topics = AsyncMock(
+        return_value={
+            "choices": {11: "Release Notes"},
+            "metadata_by_id": {
+                11: make_mock_topic(topic_id=11, title="Release Notes", top_message_id=5011),
+            },
+            "deleted_topics": {},
+        }
+    )
+
+    alice_message = make_mock_message(id=30, text="Alice topic update", sender_id=9001, sender_name="Alice")
+    bob_message = make_mock_message(id=20, text="Bob topic update", sender_id=9002, sender_name="Bob")
+    fetch_topic_messages = AsyncMock(return_value=[alice_message, bob_message])
+    mock_client.get_messages = AsyncMock(return_value=[])
+
+    result = await execute_history_read_capability(
+        mock_client,
+        cache=cache,
+        dialog_query="Backend Forum",
+        limit=2,
+        cursor=None,
+        sender_query="Alice",
+        topic_query="Release Notes",
+        unread=False,
+        from_beginning=False,
+        retry_tool="ListMessages",
+        resolve_dialog=resolver,
+        get_sender_type=lambda _sender: "user",
+        reaction_names_threshold=15,
+        load_topics=load_topics,
+        fetch_topic_messages_fn=fetch_topic_messages,
+        refresh_topic_by_id_fn=AsyncMock(),
+    )
+
+    assert isinstance(result, HistoryReadExecution)
+    assert result.topic_name == "Release Notes"
+    assert list(result.messages) == [alice_message]
+    assert list(result.fetched_messages) == [alice_message, bob_message]
+    assert result.next_cursor is not None
+
+
+async def test_execute_history_read_capability_returns_cursor_failure(tmp_db_path, mock_client) -> None:
+    cache = EntityCache(tmp_db_path)
+    resolver = AsyncMock(return_value=Resolved(entity_id=701, display_name="Backend Forum"))
+
+    result = await execute_history_read_capability(
+        mock_client,
+        cache=cache,
+        dialog_query="Backend Forum",
+        limit=2,
+        cursor="BADINVALID==garbage",
+        sender_query=None,
+        topic_query=None,
+        unread=False,
+        from_beginning=False,
+        retry_tool="ListMessages",
+        resolve_dialog=resolver,
+        get_sender_type=lambda _sender: "user",
+        reaction_names_threshold=15,
+    )
+
+    assert isinstance(result, MessageReadFailure)
+    assert result.kind == "invalid_cursor"
+    assert "Cursor is invalid:" in result.text
