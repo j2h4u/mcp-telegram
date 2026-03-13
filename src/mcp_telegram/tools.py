@@ -15,7 +15,7 @@ from mcp.types import (
     TextContent,
     Tool,
 )
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from telethon.errors import RPCError
 from telethon import TelegramClient, custom, functions, types  # type: ignore[import-untyped]
 from telethon.tl.functions.messages import (
@@ -499,9 +499,53 @@ def _resolve_deleted_topic(
     return deleted_result
 
 
-def _deleted_topic_text(topic_name: str) -> str:
+def _action_text(summary: str, action: str) -> str:
+    """Return a short action-oriented response body."""
+    return f"{summary}\nAction: {action}"
+
+
+def _dialog_not_found_text(dialog_name: str, *, retry_tool: str) -> str:
+    """Return an action-oriented response for missing dialogs."""
+    return _action_text(
+        f'Dialog "{dialog_name}" was not found.',
+        f"Call ListDialogs, then retry {retry_tool} with dialog set to an exact dialog id, @username, or full dialog name.",
+    )
+
+
+def _ambiguous_dialog_text(dialog_name: str, match_lines: list[str], *, retry_tool: str) -> str:
+    """Return an action-oriented response for ambiguous dialogs."""
+    matches = "\n".join(match_lines)
+    return (
+        f'Dialog "{dialog_name}" matched multiple dialogs.\n'
+        f"Action: Retry {retry_tool} with dialog set to one of the numeric ids from the matches below.\n"
+        f"{matches}"
+    )
+
+
+def _sender_not_found_text(sender_name: str, *, retry_tool: str) -> str:
+    """Return an action-oriented response for missing senders."""
+    return _action_text(
+        f'Sender "{sender_name}" was not found.',
+        f"Retry {retry_tool} without sender, or use an exact sender name or @username that appears in this dialog.",
+    )
+
+
+def _ambiguous_sender_text(sender_name: str, match_lines: list[str], *, retry_tool: str) -> str:
+    """Return an action-oriented response for ambiguous senders."""
+    matches = "\n".join(match_lines)
+    return (
+        f'Sender "{sender_name}" matched multiple users.\n'
+        f"Action: Retry {retry_tool} with sender set to one exact match from the list below.\n"
+        f"{matches}"
+    )
+
+
+def _deleted_topic_text(topic_name: str, *, retry_tool: str) -> str:
     """Return the explicit user-facing message for deleted topics."""
-    return f'Topic "{topic_name}" was deleted and can no longer be fetched.'
+    return _action_text(
+        f'Topic "{topic_name}" was deleted and can no longer be fetched.',
+        f"Call ListTopics for this dialog, then retry {retry_tool} with an active topic title, or omit topic to read across all topics.",
+    )
 
 
 def _rpc_error_detail(exc: RPCError) -> str:
@@ -510,19 +554,146 @@ def _rpc_error_detail(exc: RPCError) -> str:
     return str(detail)
 
 
-def _inaccessible_topic_text(topic_name: str, exc: RPCError, *, resolved: bool) -> str:
+def _inaccessible_topic_text(topic_name: str, exc: RPCError, *, resolved: bool, retry_tool: str) -> str:
     """Return a readable user-facing message for inaccessible topics."""
     detail = _rpc_error_detail(exc)
     if resolved:
-        return f'Topic "{topic_name}" resolved, but Telegram rejected thread fetch ({detail}).'
+        return _action_text(
+            f'Topic "{topic_name}" resolved, but Telegram rejected thread fetch ({detail}).',
+            f"Retry {retry_tool} without topic to read dialog-wide messages, or call ListTopics and choose another active topic.",
+        )
 
-    return f'Topic "{topic_name}" could not be loaded because Telegram rejected topic access ({detail}).'
+    return _action_text(
+        f'Topic "{topic_name}" could not be loaded because Telegram rejected topic access ({detail}).',
+        f"Call ListTopics for this dialog, then retry {retry_tool} with an exact active topic title, or omit topic.",
+    )
+
+
+def _topic_not_found_text(topic_name: str, *, retry_tool: str) -> str:
+    """Return an action-oriented response for missing topics."""
+    return _action_text(
+        f'Topic "{topic_name}" was not found.',
+        f"Call ListTopics for this dialog, then retry {retry_tool} with an exact topic title.",
+    )
+
+
+def _ambiguous_topic_text(topic_name: str, match_lines: list[str], *, retry_tool: str) -> str:
+    """Return an action-oriented response for ambiguous topics."""
+    matches = "\n".join(match_lines)
+    return (
+        f'Topic "{topic_name}" matched multiple topics.\n'
+        f"Action: Retry {retry_tool} with topic set to one exact topic title from the matches below.\n"
+        f"{matches}"
+    )
+
+
+def _ambiguous_deleted_topic_text(topic_name: str, match_lines: list[str], *, retry_tool: str) -> str:
+    """Return an action-oriented response for ambiguous deleted topics."""
+    matches = "\n".join(match_lines)
+    return (
+        f'Deleted topic query "{topic_name}" matched multiple deleted topics.\n'
+        f"Action: Call ListTopics for this dialog, then retry {retry_tool} with an active topic title instead of a deleted one.\n"
+        f"{matches}"
+    )
+
+
+def _invalid_cursor_text(detail: str, *, retry_tool: str) -> str:
+    """Return an action-oriented response for malformed cursors."""
+    return _action_text(
+        f"Cursor is invalid: {detail}",
+        f"Retry {retry_tool} without cursor to start from the first page, or reuse the exact next_cursor value from the previous {retry_tool} response.",
+    )
 
 
 def _dialog_topics_unavailable_text(dialog_name: str, exc: RPCError) -> str:
     """Return a readable message when one dialog cannot expose a topic catalog."""
     detail = _rpc_error_detail(exc)
-    return f'Dialog "{dialog_name}" does not expose a readable forum-topic catalog ({detail}).'
+    return _action_text(
+        f'Dialog "{dialog_name}" does not expose a readable forum-topic catalog ({detail}).',
+        "Do not use ListTopics for this dialog. Retry ListMessages without topic if you want dialog messages, or choose another forum-enabled dialog.",
+    )
+
+
+def _no_active_topics_text(dialog_name: str) -> str:
+    """Return an action-oriented response for dialogs without active topics."""
+    return _action_text(
+        f'No active forum topics found for "{dialog_name}".',
+        "Retry ListMessages without topic to read dialog-wide messages, or choose another forum-enabled dialog.",
+    )
+
+
+def _user_not_found_text(user_name: str, *, retry_tool: str) -> str:
+    """Return an action-oriented response for missing users."""
+    return _action_text(
+        f'User "{user_name}" was not found.',
+        f"Call ListDialogs, then retry {retry_tool} with an exact user name or @username.",
+    )
+
+
+def _ambiguous_user_text(user_name: str, match_lines: list[str], *, retry_tool: str) -> str:
+    """Return an action-oriented response for ambiguous users."""
+    matches = "\n".join(match_lines)
+    return (
+        f'User "{user_name}" matched multiple users.\n'
+        f"Action: Retry {retry_tool} with one exact user match from the list below.\n"
+        f"{matches}"
+    )
+
+
+def _fetch_user_info_error_text(user_name: str, detail: str) -> str:
+    """Return an action-oriented response for user-info fetch failures."""
+    return _action_text(
+        f'Could not fetch info for user "{user_name}" ({detail}).',
+        "Retry GetUserInfo later. If this persists, verify that the Telegram session still has access to this user and shared chats.",
+    )
+
+
+def _not_authenticated_text(retry_tool: str) -> str:
+    """Return an action-oriented response for missing Telegram auth."""
+    return _action_text(
+        "Telegram session is not authenticated.",
+        f"Authenticate the Telegram session, then retry {retry_tool}.",
+    )
+
+
+def _no_usage_data_text() -> str:
+    """Return an action-oriented response when telemetry exists but has no recent rows."""
+    return _action_text(
+        "No usage data in the past 30 days.",
+        "Use any Telegram tools to generate telemetry, then retry GetUsageStats.",
+    )
+
+
+def _usage_stats_db_missing_text() -> str:
+    """Return an action-oriented response when telemetry DB is missing."""
+    return _action_text(
+        "Analytics database not yet created.",
+        "Use other tools first to generate telemetry, then retry GetUsageStats.",
+    )
+
+
+def _usage_stats_query_error_text(error_type: str) -> str:
+    """Return an action-oriented response for usage-stats query failures."""
+    return _action_text(
+        f"Could not query usage stats ({error_type}).",
+        "Retry GetUsageStats later. If the error persists, inspect analytics.db initialization and schema.",
+    )
+
+
+def _no_dialogs_text() -> str:
+    """Return an action-oriented response when no dialogs are visible."""
+    return _action_text(
+        "No dialogs were returned.",
+        "Retry ListDialogs with exclude_archived=False and ignore_pinned=False, or verify that the Telegram session is authenticated and has visible dialogs.",
+    )
+
+
+def _search_no_hits_text(dialog_name: str, query: str) -> str:
+    """Return an action-oriented response when search finds no hits."""
+    return _action_text(
+        f'No messages matched query "{query}" in dialog "{dialog_name}".',
+        "Retry SearchMessages with a broader query, a smaller offset, or a different dialog.",
+    )
 
 
 def _topic_status(topic: dict[str, int | str | bool | None]) -> str:
@@ -839,7 +1010,8 @@ async def list_dialogs(
                     f"last_message_at={last_at} unread={dialog.unread_count}"
                 )
         result_count = len(lines)
-        result = [TextContent(type="text", text="\n".join(lines))]
+        result_text = "\n".join(lines) if lines else _no_dialogs_text()
+        result = [TextContent(type="text", text=result_text)]
     except Exception as exc:
         error_type = type(exc).__name__
         raise
@@ -892,7 +1064,7 @@ async def list_topics(
         cache = get_entity_cache()
         result = await _resolve_dialog(cache, args.dialog)
         if isinstance(result, NotFound):
-            return [TextContent(type="text", text=f'Dialog not found: "{args.dialog}"')]
+            return [TextContent(type="text", text=_dialog_not_found_text(args.dialog, retry_tool="ListTopics"))]
         if isinstance(result, Candidates):
             match_lines = []
             for match in result.matches:
@@ -902,7 +1074,12 @@ async def list_topics(
                 if match.get("entity_type"):
                     line += f' [{match["entity_type"]}]'
                 match_lines.append(line)
-            return [TextContent(type="text", text=f'Ambiguous "{args.dialog}". Matches:\n' + "\n".join(match_lines))]
+            return [
+                TextContent(
+                    type="text",
+                    text=_ambiguous_dialog_text(args.dialog, match_lines, retry_tool="ListTopics"),
+                )
+            ]
 
         entity_id = result.entity_id
         resolve_prefix = (
@@ -929,7 +1106,7 @@ async def list_topics(
         ]
         result_count = len(active_topics)
         if not active_topics:
-            text = resolve_prefix + f'No active forum topics found for "{result.display_name}".'
+            text = resolve_prefix + _no_active_topics_text(result.display_name)
             return [TextContent(type="text", text=text)]
 
         lines = [_topic_row_text(topic) for topic in active_topics]
@@ -962,7 +1139,12 @@ async def list_topics(
 
 class ListMessages(ToolArgs):
     """
-    List messages in a dialog by name. Returns messages newest-first in human-readable format
+    List messages in one dialog.
+
+    REQUIRED: dialog must be provided. This tool does not support a global
+    "latest messages across all dialogs" mode.
+
+    Returns messages newest-first in human-readable format
     (HH:mm FirstName: text) with date headers and session breaks.
 
     Use cursor= with the next_cursor token from a previous response to page back in time.
@@ -978,7 +1160,12 @@ class ListMessages(ToolArgs):
     For @username lookups, prepend @ to the name: dialog="@username".
     """
 
-    dialog: str
+    dialog: str = Field(
+        description=(
+            "Required. Dialog identifier to read from: numeric id, @username, or fuzzy dialog name. "
+            "No default is applied, and this tool cannot list messages across all dialogs."
+        )
+    )
     limit: int = 50
     cursor: str | None = None
     sender: str | None = None
@@ -1004,7 +1191,7 @@ async def list_messages(
         cache = get_entity_cache()
         result = await _resolve_dialog(cache, args.dialog)
         if isinstance(result, NotFound):
-            return [TextContent(type="text", text=f'Dialog not found: "{args.dialog}"')]
+            return [TextContent(type="text", text=_dialog_not_found_text(args.dialog, retry_tool="ListMessages"))]
         if isinstance(result, Candidates):
             match_lines = []
             for match in result.matches:
@@ -1014,7 +1201,12 @@ async def list_messages(
                 if match.get("entity_type"):
                     line += f' [{match["entity_type"]}]'
                 match_lines.append(line)
-            return [TextContent(type="text", text=f'Ambiguous "{args.dialog}". Matches:\n' + "\n".join(match_lines))]
+            return [
+                TextContent(
+                    type="text",
+                    text=_ambiguous_dialog_text(args.dialog, match_lines, retry_tool="ListMessages"),
+                )
+            ]
         entity_id: int = result.entity_id
         dialog_cache_entry = cache.get(entity_id, GROUP_TTL)
         resolve_prefix = (
@@ -1043,7 +1235,7 @@ async def list_messages(
                 try:
                     iter_kwargs["min_id"] = decode_cursor(args.cursor, entity_id)
                 except Exception as exc:
-                    return [TextContent(type="text", text=f"Invalid cursor: {exc}")]
+                    return [TextContent(type="text", text=_invalid_cursor_text(str(exc), retry_tool="ListMessages"))]
             else:
                 iter_kwargs["min_id"] = 1  # Start from oldest message
         else:
@@ -1052,14 +1244,19 @@ async def list_messages(
                 try:
                     iter_kwargs["max_id"] = decode_cursor(args.cursor, entity_id)
                 except Exception as exc:
-                    return [TextContent(type="text", text=f"Invalid cursor: {exc}")]
+                    return [TextContent(type="text", text=_invalid_cursor_text(str(exc), retry_tool="ListMessages"))]
 
         # Step 3 — Sender filter (resolve before opening client)
         if args.sender:
             has_filter = True
             sender_result = resolve(args.sender, cache.all_names_with_ttl(USER_TTL, GROUP_TTL), cache)
             if isinstance(sender_result, NotFound):
-                return [TextContent(type="text", text=f'Sender not found: "{args.sender}"')]
+                return [
+                    TextContent(
+                        type="text",
+                        text=_sender_not_found_text(args.sender, retry_tool="ListMessages"),
+                    )
+                ]
             if isinstance(sender_result, Candidates):
                 match_lines = []
                 for match in sender_result.matches:
@@ -1069,7 +1266,12 @@ async def list_messages(
                     if match.get("entity_type"):
                         line += f' [{match["entity_type"]}]'
                     match_lines.append(line)
-                return [TextContent(type="text", text=f'Ambiguous sender "{args.sender}". Matches:\n' + "\n".join(match_lines))]
+                return [
+                    TextContent(
+                        type="text",
+                        text=_ambiguous_sender_text(args.sender, match_lines, retry_tool="ListMessages"),
+                    )
+                ]
             sender_entity_id = sender_result.entity_id
 
         # Track unread as a filter
@@ -1089,7 +1291,17 @@ async def list_messages(
                         topic_cache=topic_cache,
                     )
                 except RPCError as exc:
-                    return [TextContent(type="text", text=_inaccessible_topic_text(args.topic, exc, resolved=False))]
+                    return [
+                        TextContent(
+                            type="text",
+                            text=_inaccessible_topic_text(
+                                args.topic,
+                                exc,
+                                resolved=False,
+                                retry_tool="ListMessages",
+                            ),
+                        )
+                    ]
                 topic_result = resolve(args.topic, topic_catalog["choices"])
                 if isinstance(topic_result, NotFound):
                     deleted_result = _resolve_deleted_topic(args.topic, topic_catalog["deleted_topics"])
@@ -1102,12 +1314,29 @@ async def list_messages(
                         return [
                             TextContent(
                                 type="text",
-                                text=f'Ambiguous deleted topic "{args.topic}". Matches:\n' + "\n".join(match_lines),
+                                text=_ambiguous_deleted_topic_text(
+                                    args.topic,
+                                    match_lines,
+                                    retry_tool="ListMessages",
+                                ),
                             )
                         ]
                     if deleted_result is not None:
-                        return [TextContent(type="text", text=_deleted_topic_text(deleted_result.display_name))]
-                    return [TextContent(type="text", text=f'Topic not found: "{args.topic}"')]
+                        return [
+                            TextContent(
+                                type="text",
+                                text=_deleted_topic_text(
+                                    deleted_result.display_name,
+                                    retry_tool="ListMessages",
+                                ),
+                            )
+                        ]
+                    return [
+                        TextContent(
+                            type="text",
+                            text=_topic_not_found_text(args.topic, retry_tool="ListMessages"),
+                        )
+                    ]
                 if isinstance(topic_result, Candidates):
                     match_lines = []
                     for match in topic_result.matches:
@@ -1115,13 +1344,22 @@ async def list_messages(
                     return [
                         TextContent(
                             type="text",
-                            text=f'Ambiguous topic "{args.topic}". Matches:\n' + "\n".join(match_lines),
+                            text=_ambiguous_topic_text(
+                                args.topic,
+                                match_lines,
+                                retry_tool="ListMessages",
+                            ),
                         )
                     ]
                 topic_metadata = topic_catalog["metadata_by_id"].get(topic_result.entity_id)
                 resolved_topic_name = topic_result.display_name
                 if topic_metadata is not None and bool(topic_metadata["is_deleted"]):
-                    return [TextContent(type="text", text=_deleted_topic_text(resolved_topic_name))]
+                    return [
+                        TextContent(
+                            type="text",
+                            text=_deleted_topic_text(resolved_topic_name, retry_tool="ListMessages"),
+                        )
+                    ]
                 if topic_metadata is not None and not bool(topic_metadata["is_general"]):
                     top_message_id = topic_metadata["top_message_id"]
                     if top_message_id is not None:
@@ -1161,7 +1399,12 @@ async def list_messages(
                     )
                     if topic_metadata is not None and bool(topic_metadata["is_deleted"]):
                         topic_name = resolved_topic_name or args.topic or "Topic"
-                        return [TextContent(type="text", text=_deleted_topic_text(topic_name))]
+                        return [
+                            TextContent(
+                                type="text",
+                                text=_deleted_topic_text(topic_name, retry_tool="ListMessages"),
+                            )
+                        ]
                     if fetched_messages is None:
                         fetched_messages = []
                     if (
@@ -1187,7 +1430,17 @@ async def list_messages(
                             _rpc_error_detail(exc),
                         )
                         topic_metadata["inaccessible_error"] = _rpc_error_detail(exc)
-                    return [TextContent(type="text", text=_inaccessible_topic_text(topic_name, exc, resolved=True))]
+                    return [
+                        TextContent(
+                            type="text",
+                            text=_inaccessible_topic_text(
+                                topic_name,
+                                exc,
+                                resolved=True,
+                                retry_tool="ListMessages",
+                            ),
+                        )
+                    ]
                 raise
             if filter_sender_after_fetch and sender_entity_id is not None:
                 # Telethon thread retrieval is reliable with reply_to; sender filtering is applied locally.
@@ -1373,7 +1626,7 @@ async def search_messages(
         cache = get_entity_cache()
         result = await _resolve_dialog(cache, args.dialog)
         if isinstance(result, NotFound):
-            return [TextContent(type="text", text=f'Dialog not found: "{args.dialog}"')]
+            return [TextContent(type="text", text=_dialog_not_found_text(args.dialog, retry_tool="SearchMessages"))]
         if isinstance(result, Candidates):
             match_lines = []
             for match in result.matches:
@@ -1383,7 +1636,12 @@ async def search_messages(
                 if match.get("entity_type"):
                     line += f' [{match["entity_type"]}]'
                 match_lines.append(line)
-            return [TextContent(type="text", text=f'Ambiguous "{args.dialog}". Matches:\n' + "\n".join(match_lines))]
+            return [
+                TextContent(
+                    type="text",
+                    text=_ambiguous_dialog_text(args.dialog, match_lines, retry_tool="SearchMessages"),
+                )
+            ]
         entity_id: int = result.entity_id
         resolve_prefix = (
             f'[resolved: "{args.dialog}" → {result.display_name}]\n'
@@ -1501,7 +1759,10 @@ async def search_messages(
                 parts.append(f"--- hit {i + 1}/{len(hits)} ---\n{group_text}")
 
         result_count = len(hits)
-        result_text = resolve_prefix + "\n\n".join(parts) if parts else resolve_prefix
+        if parts:
+            result_text = resolve_prefix + "\n\n".join(parts)
+        else:
+            result_text = resolve_prefix + _search_no_hits_text(result.display_name, args.query)
         if len(hits) == args.limit:
             result_text += f"\n\nnext_offset: {page_offset + args.limit}"
         result = [TextContent(type="text", text=result_text)]
@@ -1550,7 +1811,7 @@ async def get_my_account(args: GetMyAccount) -> t.Sequence[TextContent | ImageCo
         async with connected_client() as client:
             me = await client.get_me()
         if me is None:
-            return [TextContent(type="text", text="Not authenticated")]
+            return [TextContent(type="text", text=_not_authenticated_text("GetMyAccount"))]
         name = " ".join(filter(None, [
             getattr(me, "first_name", None),
             getattr(me, "last_name", None),
@@ -1607,7 +1868,7 @@ async def get_user_info(args: GetUserInfo) -> t.Sequence[TextContent | ImageCont
         cache = get_entity_cache()
         result = resolve(args.user, cache.all_names_with_ttl(USER_TTL, GROUP_TTL), cache)
         if isinstance(result, NotFound):
-            return [TextContent(type="text", text=f'User not found: "{args.user}"')]
+            return [TextContent(type="text", text=_user_not_found_text(args.user, retry_tool="GetUserInfo"))]
         if isinstance(result, Candidates):
             match_lines = []
             for match in result.matches:
@@ -1617,7 +1878,12 @@ async def get_user_info(args: GetUserInfo) -> t.Sequence[TextContent | ImageCont
                 if match.get("entity_type"):
                     line += f' [{match["entity_type"]}]'
                 match_lines.append(line)
-            return [TextContent(type="text", text=f'Ambiguous user "{args.user}". Matches:\n' + "\n".join(match_lines))]
+            return [
+                TextContent(
+                    type="text",
+                    text=_ambiguous_user_text(args.user, match_lines, retry_tool="GetUserInfo"),
+                )
+            ]
         entity_id: int = result.entity_id
         display_name: str = result.display_name
 
@@ -1630,7 +1896,7 @@ async def get_user_info(args: GetUserInfo) -> t.Sequence[TextContent | ImageCont
                     limit=100,
                 ))
             except Exception as exc:
-                return [TextContent(type="text", text=f"Error fetching user info: {exc}")]
+                return [TextContent(type="text", text=_fetch_user_info_error_text(args.user, str(exc)))]
 
         name = " ".join(filter(None, [
             getattr(user, "first_name", None),
@@ -1833,16 +2099,16 @@ async def get_usage_stats(args: GetUsageStats) -> t.Sequence[TextContent | Image
             }
         )
 
-        return [TextContent(type="text", text=summary if summary else "No usage data in past 30 days.")]
+        return [TextContent(type="text", text=summary if summary else _no_usage_data_text())]
 
     except FileNotFoundError:
-        return [TextContent(type="text", text="Analytics database not yet created. Use other tools first to generate telemetry.")]
+        return [TextContent(type="text", text=_usage_stats_db_missing_text())]
     except sqlite3.OperationalError as exc:
         # Table doesn't exist or DB not initialized yet
         if "no such table" in str(exc):
-            return [TextContent(type="text", text="Analytics database not yet created. Use other tools first to generate telemetry.")]
+            return [TextContent(type="text", text=_usage_stats_db_missing_text())]
         logger.error("GetUsageStats query failed: %s", exc)
-        return [TextContent(type="text", text=f"Error querying usage stats: {type(exc).__name__}")]
+        return [TextContent(type="text", text=_usage_stats_query_error_text(type(exc).__name__))]
     except Exception as exc:
         logger.error("GetUsageStats query failed: %s", exc)
-        return [TextContent(type="text", text=f"Error querying usage stats: {type(exc).__name__}")]
+        return [TextContent(type="text", text=_usage_stats_query_error_text(type(exc).__name__))]
