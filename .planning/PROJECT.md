@@ -13,6 +13,13 @@ entity cache, and a complete read-only tool surface.
 LLM can work with Telegram using natural names — zero cold-start friction, no ID lookup
 boilerplate before every real task.
 
+## Current State
+
+Latest shipped milestone: `v1.1 Observability & Completeness` on 2026-03-13.
+
+There is no active milestone at the moment. The next planning cycle should start from the backlog
+todos in `.planning/todos/pending/`.
+
 ## Requirements
 
 ### Validated
@@ -34,21 +41,20 @@ boilerplate before every real task.
 - ✓ Entity metadata cache (L2 SQLite, TTL-enforced) — users 30d, groups/channels 7d — v1.0
 - ✓ Remove `GetDialog` tool (no stubs) — v1.0
 - ✓ Remove `GetMessage` tool (no stubs) — v1.0
-
-## Current Milestone: v1.1 Observability & Completeness
-
-**Goal:** Add privacy-safe usage telemetry queryable by LLMs, improve cache efficiency, and complete missing navigation/topic features.
-
-**Target features:**
-- Usage telemetry module (SQLite, behavioral events only, zero PII) + `GetUsageStats` tool
-- Cache improvements: SQLite indexes, dialog list cache, reaction cache, VACUUM strategy
-- `ListMessages` navigation: `from_beginning=true` parameter (jump to oldest messages)
-- Forum topics support in `ListMessages` (filter by topic, show topic name)
-- Resolve open research flags: Pydantic str|int union compatibility, transliteration need
+- ✓ `GetUsageStats` tool and privacy-safe `analytics.db` telemetry — v1.1
+- ✓ Cache indexes, reaction metadata cache, and bounded cleanup strategy — v1.1
+- ✓ `ListDialogs` archived-dialog discovery via `exclude_archived` semantics — v1.1
+- ✓ `ListMessages` bidirectional navigation via `from_beginning` — v1.1
+- ✓ Forum-topic support in `ListMessages` plus `ListTopics` dialog topic discovery — v1.1
 
 ### Active
 
-*(v1.1 requirements — see REQUIREMENTS.md)*
+- No active milestone. Start the next one with `$gsd-new-milestone`.
+
+### Backlog Candidates
+
+- Capability-oriented MCP tool-surface redesign based on MCP and Anthropic tool best practices.
+- Deferred v1.1 cleanup and large-forum topic validation follow-up.
 
 ### Out of Scope
 
@@ -63,14 +69,16 @@ boilerplate before every real task.
 
 ## Context
 
-Shipped v1.0 with 1,246 LOC Python (src/).
+Shipped v1.1 with 7 MCP tools and 169 passing tests.
 Tech stack: Python 3.13, Telethon, MCP SDK, Pydantic v2, rapidfuzz, SQLite (WAL).
-57 tests green. TDD throughout: RED → GREEN → REFACTOR on every plan.
+Deployment remains Docker-based with stdio MCP transport and `mcp-proxy` for HTTP/SSE access.
 
-**Known tech debt (from v1.0 audit):**
+**Known deferred follow-ups:**
+- Large-forum live validation using `.planning/phases/09-forum-topics-support/09-MANUAL-VALIDATION.md`
 - `tz` param accepted by `format_messages()` but never passed at call sites — defaults to UTC
 - Dead imports in `tools.py:18` (TelegramClient, custom, functions, types)
 - `EntityCache.all_names()` orphaned by `all_names_with_ttl()` — safe to remove
+- Capability-oriented MCP tool-surface redesign remains future planning work, not v1.1 scope.
 
 ## Key Decisions
 
@@ -98,4 +106,4 @@ Tech stack: Python 3.13, Telethon, MCP SDK, Pydantic v2, rapidfuzz, SQLite (WAL)
 - **Read-only**: Permanent constraint — write tools expand prompt injection blast radius dramatically
 
 ---
-*Last updated: 2026-03-12 after v1.1 milestone started*
+*Last updated: 2026-03-13 after v1.1 milestone was archived*
