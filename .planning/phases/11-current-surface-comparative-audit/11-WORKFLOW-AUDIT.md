@@ -167,3 +167,28 @@ model has to distinguish between recoverable handler text and opaque server-boun
 **Why this matters for later redesign:** this project already invests in recovery guidance, so the
 real redesign question is how to preserve that strength while reducing the remaining generic-failure
 cliff and helper-step burden.
+
+## Recovery and Failure Boundaries
+
+This section treats recovery as a first-class audit object rather than a side effect of individual
+tool handlers.
+
+| Recovery case | Current public behavior | Strength or gap | Direct anchors | Public-contract judgment |
+| --- | --- | --- | --- | --- |
+| `not found` dialog/user/topic cases | Handlers usually return action-oriented `not found` text that names the missing object and tells the model which tool to call next. | Strength | [tools.py](/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/tools.py#L507), [tools.py](/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/tools.py#L575), [tools.py](/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/tools.py#L628), [tests/test_tools.py](/home/j2h4u/repos/j2h4u/mcp-telegram/tests/test_tools.py#L181), [tests/test_tools.py](/home/j2h4u/repos/j2h4u/mcp-telegram/tests/test_tools.py#L286) | The surface usually preserves next-step clarity when resolution simply fails. |
+| `ambiguous` dialog/user/topic cases | Resolver-driven ambiguity returns candidate lists and asks for an exact retry instead of silently auto-picking. | Strength | [tools.py](/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/tools.py#L515), [tools.py](/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/tools.py#L580), [tools.py](/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/tools.py#L633), [tests/test_resolver.py](/home/j2h4u/repos/j2h4u/mcp-telegram/tests/test_resolver.py#L82), [tests/test_tools.py](/home/j2h4u/repos/j2h4u/mcp-telegram/tests/test_tools.py#L300) | Ambiguity recovery is deliberate and model-actionable, which is stronger than many generic “no match” flows. |
+| `invalid cursor` handling | `ListMessages` catches decode failures and explains how to restart without cursor or reuse the exact `next_cursor` value. | Strength | [tools.py](/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/tools.py#L604), [tools.py](/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/tools.py#L1238), [tools.py](/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/tools.py#L1247), [tests/test_tools.py](/home/j2h4u/repos/j2h4u/mcp-telegram/tests/test_tools.py#L2004), [tests/test_pagination.py](/home/j2h4u/repos/j2h4u/mcp-telegram/tests/test_pagination.py#L1) | Cursor recovery is unusually explicit, but it still exposes low-level pagination machinery to the model. |
+| deleted topic and inaccessible topic recovery | Deleted topics return explicit tombstone guidance; inaccessible topics explain that Telegram rejected access and suggest a dialog-wide fallback or another active topic. `previously_inaccessible` is preserved in later topic listings. | Strength with residual burden | [tools.py](/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/tools.py#L539), [tools.py](/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/tools.py#L556), [tools.py](/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/tools.py#L699), [tests/test_tools.py](/home/j2h4u/repos/j2h4u/mcp-telegram/tests/test_tools.py#L155), [tests/test_tools.py](/home/j2h4u/repos/j2h4u/mcp-telegram/tests/test_tools.py#L1154) | This is one of the surface’s strongest recovery areas because it preserves state instead of pretending the topic was never real, but the model still has to absorb Telegram-specific forum semantics. |
+| Generic server-boundary failure wrapping | If an exception escapes the handler boundary, the server logs the original error but the model only sees `Tool <name> failed`. | Gap | [server.py](/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/server.py#L72) | Recovery quality collapses at the boundary where rich handler-local explanations stop and generic wrapping begins. |
+
+### Recovery Takeaways
+
+- Recovery is a project strength when the failure stays inside tool handlers. `not found`,
+  `ambiguous`, `invalid cursor`, and deleted/inaccessible topic cases all try to preserve an
+  action-oriented next step instead of returning opaque exceptions.
+- Recovery loses clarity when failures cross the server boundary. The public contract then degrades
+  to `Tool <name> failed`, which removes the context that the rest of the tool surface usually
+  preserves.
+- The preserved `previously_inaccessible` topic state is especially important. It shows that the
+  project already treats recovery history as part of the contract rather than a disposable internal
+  detail.
