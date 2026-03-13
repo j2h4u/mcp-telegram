@@ -54,12 +54,21 @@
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
+| ERR-01 | Phase 14 | Pending |
+| CAP-01 | Phase 15 | Pending |
+| NAV-01 | Phase 16 | Pending |
+| NAV-02 | Phase 16 | Pending |
+| FLOW-01 | Phase 17 | Pending |
+| FLOW-02 | Phase 17 | Pending |
+| SURF-01 | Phase 18 | Pending |
+| ROLL-01 | Phase 18 | Pending |
+| ROLL-02 | Phase 18 | Pending |
 
 **Coverage:**
 - v1.3 requirements: 9 total
-- Mapped to phases: 0
-- Unmapped: 9 ⚠️
+- Mapped to phases: 9
+- Unmapped: 0
 
 ---
 *Requirements defined: 2026-03-14*
-*Last updated: 2026-03-14 after milestone initialization*
+*Last updated: 2026-03-14 after roadmap creation*
