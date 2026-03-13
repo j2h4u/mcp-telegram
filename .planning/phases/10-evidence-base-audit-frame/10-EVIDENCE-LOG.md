@@ -43,3 +43,13 @@ for `mcp-telegram`; it is an audit input, not a general MCP literature review.
 | `tests/test_analytics.py` | Brownfield authority | Telemetry guarantees | Applies because it verifies the analytics schema, singleton behavior, and privacy-safe event model that constrain redesign options. | 11, 12, 13 |
 | `tests/privacy_audit.sh` | Brownfield authority | Repo-level privacy guardrail | Applies because it enforces that telemetry fields stay aggregate and do not capture message content, names, usernames, or IDs. | 11, 12, 13 |
 | `tests/test_tools.py` | Brownfield authority | Locked tool behavior and workflow burden | Applies because it captures forum-topic paths, `from_beginning` pagination, `next_offset` search pagination, action-oriented errors, and `[HIT]` search formatting. | 11, 12, 13 |
+
+## Brownfield runtime note
+
+The live reflected tool list is retained as brownfield authority because it is the closest view of
+what an MCP client sees today. On 2026-03-13 the reflected surface was:
+`GetMyAccount`, `GetUsageStats`, `GetUserInfo`, `ListDialogs`, `ListMessages`, `ListTopics`, and
+`SearchMessages`.
+
+`ListTopics` is called out explicitly because earlier notes were already stale on the public
+inventory; later phases should trust reflection, code, and tests over inherited planning summaries.
