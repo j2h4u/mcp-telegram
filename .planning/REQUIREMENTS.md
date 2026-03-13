@@ -24,7 +24,7 @@
 
 ### Research Quality
 
-- [ ] **EVID-01**: The milestone distinguishes authoritative guidance from supporting secondary/community guidance and records which sources materially shaped the conclusions.
+- [x] **EVID-01**: The milestone distinguishes authoritative guidance from supporting secondary/community guidance and records which sources materially shaped the conclusions.
 - [ ] **EVID-02**: The final deliverable is actionable for a future implementation milestone and does not stop at abstract best-practice summaries.
 
 ## v2 Requirements
@@ -54,7 +54,7 @@
 | OPTION-02 | 12 | Pending |
 | RECO-01 | 12 | Pending |
 | RECO-02 | 13 | Pending |
-| EVID-01 | 10 | Pending |
+| EVID-01 | 10 | Complete |
 | EVID-02 | 13 | Pending |
 
 **Coverage:**

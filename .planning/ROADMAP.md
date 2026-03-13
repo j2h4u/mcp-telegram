@@ -73,7 +73,7 @@ Full details: `.planning/milestones/v1.1-ROADMAP.md`
 | 7. Cache Improvements & Optimization | v1.1 | 3/3 | Complete | 2026-03-12 |
 | 8. Navigation Features | v1.1 | 2/2 | Complete | 2026-03-12 |
 | 9. Forum Topics Support | v1.1 | 6/6 | Complete | 2026-03-12 |
-| 10. Evidence Base & Audit Frame | v1.2 | 0/TBD | Not started | - |
+| 10. Evidence Base & Audit Frame | v1.2 | 2/3 | In Progress|  |
 | 11. Current Surface Comparative Audit | v1.2 | 0/TBD | Not started | - |
 | 12. Redesign Options & Pareto Recommendation | v1.2 | 0/TBD | Not started | - |
 | 13. Implementation Sequencing & Decision Memo | v1.2 | 0/TBD | Not started | - |
