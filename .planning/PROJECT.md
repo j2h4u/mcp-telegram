@@ -24,14 +24,19 @@ before the research milestone began.
 `v1.2` added no runtime behavior. It produced the evidence hierarchy, comparative audit, option
 matrix, Pareto recommendation, and implementation memo that now define the next coding milestone.
 
-There is no active milestone at the moment. The next planning cycle should start from the backlog
-todos in `.planning/todos/pending/` and the `v1.2` implementation memo.
+The active milestone is `v1.3 Medium Implementation`. It turns the `v1.2` Medium-path
+recommendation into a bounded coding milestone that starts at Phase 14 and ships through explicit
+reflection, restarted-runtime, and privacy-safe telemetry gates.
 
-## Next Milestone Goals
+## Current Milestone: v1.3 Medium Implementation
 
-- Implement the chosen Medium-path MCP tool-surface refactor in code.
-- Run reflected-schema, restarted-runtime, and realistic LLM-workflow validation after the public contract changes.
-- Carry forward deferred v1.1 cleanup and large-forum validation only where it materially affects the redesign.
+**Goal:** Implement the Medium-path MCP surface refactor in small verified steps, keeping the
+migration bounded and observable instead of turning it into a speculative Maximal rewrite.
+
+**Target features:**
+- Clean up server-boundary failures so escaped tool errors keep actionable recovery direction.
+- Introduce capability-oriented internal seams behind the public tool adapters.
+- Unify continuation and reshape primary read/search workflows with restarted-runtime verification.
 
 ## Requirements
 
@@ -66,12 +71,13 @@ todos in `.planning/todos/pending/` and the `v1.2` implementation memo.
 
 ### Active
 
-- [ ] Implement the Medium-path MCP tool-surface refactor.
-- [ ] Run post-refactor evals against realistic LLM workflows and confirm lower agent burden.
-- [ ] Close deferred v1.1 cleanup and large-forum validation where they materially affect the redesign.
+- [ ] Ship the bounded Medium-path implementation milestone from the `v1.2` memo.
+- [ ] Reduce helper-step burden in primary read/search workflows without losing topic fidelity.
+- [ ] Prove every public-contract move through tests, reflected schemas, restarted runtime, and privacy-safe telemetry checks.
 
 ### Backlog Candidates
 
+- Deferred `v1.1` cleanup and large-forum validation if they do not block the Medium implementation path.
 - Broader Maximal-path tool-surface redesign after the Medium migration lands cleanly.
 - Native eval or benchmark harnesses for measuring model burden reduction over time.
 
@@ -85,6 +91,8 @@ todos in `.planning/todos/pending/` and the `v1.2` implementation memo.
 - Message content caching — messages always fetched fresh from API
 - Group membership table in entity cache — high staleness risk, no v1 tool depends on it
 - `transliterate` dependency — rapidfuzz WRatio proved sufficient for Latin+Cyrillic; add only if validated against real contacts
+- Backward-compatibility shims by default — cleaner Medium contract wins unless a concrete client constraint forces compatibility work
+- Maximal surface compression or large structured-output redesign — explicitly deferred until after the Medium migration proves the new seams
 
 ## Context
 
@@ -151,4 +159,4 @@ surface against them, and produce grounded recommendations for a future refactor
 </details>
 
 ---
-*Last updated: 2026-03-14 after v1.2 milestone completion*
+*Last updated: 2026-03-14 after starting milestone v1.3*
