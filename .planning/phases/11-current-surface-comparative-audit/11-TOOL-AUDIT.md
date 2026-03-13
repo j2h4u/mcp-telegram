@@ -10,6 +10,10 @@ This artifact reuses the Phase 10 evidence set and the non-numeric `strong` / `m
 rubric rather than inventing a new method. Each major finding below pairs named Phase 10 evidence
 with direct current-surface anchors in reflection, source, or tests.
 
+Leak labels are explicit so later phases can reuse them directly: metadata ambiguity,
+text-first parsing burden, helper-step burden, pagination burden, disambiguation burden, and
+workflow dependency on other tools.
+
 ## Tool Audit Rows
 
 ### `GetMyAccount`
@@ -20,7 +24,7 @@ with direct current-surface anchors in reflection, source, or tests.
   or an action-oriented authentication message when no Telegram session is available. There is no
   pagination token or follow-up parameter contract.
 - Judgment band: `strong`
-- Strengths: Direct one-call task-shape fit, no input ambiguity, and an auth-gate response that
+- Preserved strengths: Direct one-call task-shape fit, no input ambiguity, and an auth-gate response that
   keeps the next step legible instead of collapsing into opaque failure text.
 - Gaps / burdens: The result is still a plain text line, so downstream agents must parse fields
   from prose-like output rather than consume a structured object.
@@ -40,7 +44,7 @@ with direct current-surface anchors in reflection, source, or tests.
   language `TextContent`, and otherwise returns action-oriented empty or missing-database text.
   There is no continuation token, drill-down mode, or structured metric object.
 - Judgment band: `mixed`
-- Strengths: Zero-argument invocation is legible, the response stays privacy-safe and aggregate,
+- Preserved strengths: Zero-argument invocation is legible, the response stays privacy-safe and aggregate,
   and the empty-state paths tell the model whether telemetry is missing or simply absent for the
   last 30 days.
 - Gaps / burdens: The metadata does not expose how dependent the tool is on hidden local state, and
@@ -61,7 +65,7 @@ with direct current-surface anchors in reflection, source, or tests.
   `username=@...`, and a `Common chats (...)` block, or emits action-oriented not-found,
   ambiguous, or fetch-failure text. Continuation usually means retrying with an exact candidate.
 - Judgment band: `mixed`
-- Strengths: The job is user-centered rather than low-level, the handler preserves useful shared
+- Preserved strengths: The job is user-centered rather than low-level, the handler preserves useful shared
   chat context, and ambiguity/error paths tell the model how to retry instead of hiding the cause.
 - Gaps / burdens: Success depends on the entity cache already knowing the user, fuzzy resolution can
   force retries, and the profile plus common-chat list is text-first rather than a stable object the
@@ -82,7 +86,7 @@ with direct current-surface anchors in reflection, source, or tests.
   `name='...' id=... type=... last_message_at=... unread=...`, with an action-oriented empty state
   when nothing is visible. There is no continuation token, so the contract assumes one full scan.
 - Judgment band: `strong`
-- Strengths: The tool maps directly to the discovery job, its metadata explains the archived-scope
+- Preserved strengths: The tool maps directly to the discovery job, its metadata explains the archived-scope
   switch clearly, and each call also warms the cache that later name-based tools depend on.
 - Gaps / burdens: Discovery results are only text rows, so agents must parse names and ids from
   rendered lines, and large inventories still rely on the model to decide what to carry forward.
@@ -102,7 +106,7 @@ with direct current-surface anchors in reflection, source, or tests.
   when another page exists. Continuation depends on reusing `next_cursor`, remembering that
   `from_beginning=True` reverses pagination direction, and often resolving the dialog or topic first.
 - Judgment band: `mixed`
-- Strengths: This is the richest current tool. It preserves action-oriented recovery for ambiguous
+- Preserved strengths: This is the richest current tool. It preserves action-oriented recovery for ambiguous
   dialogs, senders, topics, deleted topics, inaccessible topics, and invalid cursors; supports both
   backward and forward-in-time pagination; and can expose cross-topic forum history with inline
   labels.
@@ -125,7 +129,7 @@ with direct current-surface anchors in reflection, source, or tests.
   `status=...`, and `last_error=...` when relevant. Continuation expectation is explicit: use the
   chosen exact topic name or numeric topic id in later message-reading calls.
 - Judgment band: `strong`
-- Strengths: The model-facing purpose is unusually clear, and the result preserves topic-state
+- Preserved strengths: The model-facing purpose is unusually clear, and the result preserves topic-state
   visibility that would be easy to lose in a simplification pass, including `general`, `active`,
   and `previously_inaccessible` states.
 - Gaps / burdens: The result is still a text table rather than a structured topic catalog, and the
@@ -145,7 +149,7 @@ with direct current-surface anchors in reflection, source, or tests.
   with `[HIT]`, and appends `next_offset` when another page exists. Continuation is explicit but
   separate from `ListMessages`: reuse `next_offset` rather than a cursor token.
 - Judgment band: `strong`
-- Strengths: The result shape is well aligned with the actual search job, the hit-window formatting
+- Preserved strengths: The result shape is well aligned with the actual search job, the hit-window formatting
   is deliberate rather than accidental, and ambiguity or no-hit paths stay action-oriented.
 - Gaps / burdens: The tool still assumes the dialog is already discoverable, the grouped search
   result is text-first, and its pagination contract diverges from `ListMessages` even though both
