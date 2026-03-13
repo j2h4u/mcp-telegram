@@ -8,7 +8,7 @@
 
 ### Error Surface
 
-- [ ] **ERR-01**: Maintainer can observe actionable recovery detail from unexpected tool failures instead of generic `Tool <name> failed` collapse at the server boundary.
+- [x] **ERR-01**: Maintainer can observe actionable recovery detail from unexpected tool failures instead of generic `Tool <name> failed` collapse at the server boundary.
 
 ### Capability Layer
 
@@ -54,7 +54,7 @@
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| ERR-01 | Phase 14 | Pending |
+| ERR-01 | Phase 14 | Complete |
 | CAP-01 | Phase 15 | Pending |
 | NAV-01 | Phase 16 | Pending |
 | NAV-02 | Phase 16 | Pending |

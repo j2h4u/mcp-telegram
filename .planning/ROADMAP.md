@@ -20,7 +20,7 @@ material to landing the Medium path safely.
 - Integer phases (1, 2, 3): Planned milestone work
 - Decimal phases (2.1, 2.2): Urgent insertions between integers
 
-- [ ] **Phase 14: Boundary Recovery** - Preserve actionable server-boundary failure detail for escaped tool errors.
+- [x] **Phase 14: Boundary Recovery** - Preserve actionable server-boundary failure detail for escaped tool errors. (completed 2026-03-13)
 - [ ] **Phase 15: Capability Seams** - Introduce capability-oriented internal seams behind the public tool adapters.
 - [ ] **Phase 16: Unified Navigation Contract** - Replace split read/search continuation concepts with one coherent contract.
 - [ ] **Phase 17: Direct Read/Search Workflows** - Reduce helper-first choreography while preserving topic and hit-local fidelity.
@@ -36,7 +36,7 @@ material to landing the Medium path safely.
   1. Maintainer can trigger an unexpected tool failure and observe actionable recovery detail instead of only generic `Tool <name> failed` collapse.
   2. Escaped tool failures identify the failing operation clearly enough that maintainers can choose a next recovery step without reading raw stack traces first.
   3. Brownfield tests make the boundary behavior explicit enough that later contract work can change schemas without reintroducing generic failure collapse.
-**Plans**: 01 complete; 02 planned
+**Plans**: 01 complete; 02 complete
 
 ### Phase 15: Capability Seams
 **Goal**: Maintainers can evolve read, search, and topic behavior through capability-oriented internals rather than tool-name-shaped implementation seams.
@@ -87,7 +87,7 @@ Phases execute in numeric order: 14 -> 15 -> 16 -> 17 -> 18
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 14. Boundary Recovery | 1/2 | In Progress | - |
+| 14. Boundary Recovery | 2/2 | Complete   | 2026-03-13 |
 | 15. Capability Seams | 0/TBD | Not started | - |
 | 16. Unified Navigation Contract | 0/TBD | Not started | - |
 | 17. Direct Read/Search Workflows | 0/TBD | Not started | - |
