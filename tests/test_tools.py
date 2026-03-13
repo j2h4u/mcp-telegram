@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from mcp_telegram.cache import EntityCache, TopicMetadataCache
-from mcp_telegram.capabilities import HistoryReadExecution, ListTopicsExecution
+from mcp_telegram.capabilities import HistoryReadExecution, ListTopicsExecution, SearchExecution
 
 
 async def _async_iter(items):
@@ -342,6 +342,42 @@ async def test_list_messages_adapter_delegates_to_history_capability(
     assert "Delegated topic update" in result[0].text
     assert "next_cursor: cursor-token" in result[0].text
     assert capability.await_args.kwargs["topic_query"] == "Release Notes"
+
+
+async def test_search_messages_adapter_delegates_to_capability_execution(
+    tmp_db_path,
+    mock_client,
+    monkeypatch,
+    make_mock_message,
+):
+    """SearchMessages renders shared search execution results instead of rebuilding them locally."""
+    from mcp_telegram.tools import SearchMessages, search_messages
+
+    cache = EntityCache(tmp_db_path)
+    hit = make_mock_message(id=30, text="Delegated search hit")
+    capability = AsyncMock(
+        return_value=SearchExecution(
+            entity_id=701,
+            dialog_name="Backend Forum",
+            resolve_prefix='[resolved: "Backend" → Backend Forum]\n',
+            hits=(hit,),
+            context_messages_by_id={},
+            reaction_names_map={},
+            next_offset=20,
+        )
+    )
+
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr("mcp_telegram.tools._execute_search_messages_capability", capability)
+
+    result = await search_messages(SearchMessages(dialog="Backend", query="ship", limit=20))
+
+    assert result[0].text.startswith('[resolved: "Backend" → Backend Forum]\n--- hit 1/1 ---\n')
+    assert "[HIT]" in result[0].text
+    assert "Delegated search hit" in result[0].text
+    assert "next_offset: 20" in result[0].text
+    assert capability.await_args.kwargs["query"] == "ship"
 
 
 # --- TOOL-02: ListMessages name resolution ---

@@ -18,9 +18,11 @@ from mcp_telegram.capabilities import (
     ResolvedForumTopic,
     execute_history_read_capability,
     execute_list_topics_capability,
+    execute_search_messages_capability,
     fetch_messages_for_topic,
     load_forum_topic_capability,
     resolve_dialog_target,
+    SearchExecution,
 )
 from mcp_telegram.resolver import Candidates, NotFound, Resolved
 
@@ -326,3 +328,48 @@ async def test_execute_history_read_capability_returns_cursor_failure(tmp_db_pat
     assert isinstance(result, MessageReadFailure)
     assert result.kind == "invalid_cursor"
     assert "Cursor is invalid:" in result.text
+
+
+async def test_execute_search_messages_capability_reuses_shared_enrichment(
+    tmp_db_path,
+    mock_client,
+    monkeypatch,
+    make_mock_message,
+) -> None:
+    cache = EntityCache(tmp_db_path)
+    resolver = AsyncMock(return_value=Resolved(entity_id=701, display_name="Backend Forum"))
+    hit = make_mock_message(id=50, text="the hit", sender_id=9001, sender_name="Alice")
+    context = make_mock_message(id=49, text="context", sender_id=9002, sender_name="Bob")
+
+    async def _fake_iter_messages(*_args, **_kwargs):
+        yield hit
+
+    reaction_builder = AsyncMock(return_value={50: {"👍": ["Alice"]}})
+    upsert_spy = MagicMock(wraps=cache.upsert)
+    monkeypatch.setattr(cache, "upsert", upsert_spy)
+    monkeypatch.setattr("mcp_telegram.capabilities._build_reaction_names_map", reaction_builder)
+    mock_client.iter_messages = _fake_iter_messages
+    mock_client.get_messages = AsyncMock(return_value=[context])
+
+    result = await execute_search_messages_capability(
+        mock_client,
+        cache=cache,
+        dialog_query="Backend Forum",
+        query="hit",
+        limit=1,
+        offset=None,
+        retry_tool="SearchMessages",
+        resolve_dialog=resolver,
+        get_sender_type=lambda _sender: "user",
+        reaction_names_threshold=15,
+    )
+
+    assert isinstance(result, SearchExecution)
+    assert list(result.hits) == [hit]
+    assert result.context_messages_by_id == {49: context}
+    assert result.reaction_names_map == {50: {"👍": ["Alice"]}}
+    assert result.next_offset == 1
+    sender_ids = {call.args[0] for call in upsert_spy.call_args_list}
+    assert sender_ids.issuperset({9001, 9002})
+    assert reaction_builder.await_args.kwargs["entity_id"] == 701
+    assert reaction_builder.await_args.kwargs["messages"] == [hit]
