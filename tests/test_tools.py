@@ -267,6 +267,13 @@ def test_tool_description_strips_nullable_unions_from_exported_schema():
     assert offset_schema == {"title": "Offset", "type": "integer"}
 
 
+def test_capability_extraction_preserves_public_tool_names() -> None:
+    """Capability seams stay internal; reflected public tool names remain unchanged."""
+    assert tools_module.tool_description(ListTopics).name == "ListTopics"
+    assert tools_module.tool_description(ListMessages).name == "ListMessages"
+    assert tools_module.tool_description(SearchMessages).name == "SearchMessages"
+
+
 # --- TOOL-02: ListMessages name resolution ---
 
 
