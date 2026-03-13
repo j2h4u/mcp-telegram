@@ -26,6 +26,17 @@ should treat as default-preserve constraints.
   part of the public contract, and separate preserved invariants from redesign pressure rather than
   treating all critique as a recommendation to rebuild.
 
+Named evidence carried forward into this audit:
+
+- MCP Tools specification: comparison point for discovery shape, tool metadata, and invocation
+  contract.
+- Anthropic implement-tool-use guidance: comparison point for descriptions, input-schema clarity,
+  and how well the current surface teaches correct tool choice before invocation.
+- Anthropic tool-use overview: comparison point for structured-output expectations and whether the
+  current text-first contract creates downstream reasoning burden.
+- Brownfield authority: runtime reflection plus concrete anchors in `server.py`, `tools.py`,
+  `resolver.py`, `formatter.py`, `pagination.py`, `analytics.py`, and the contract tests.
+
 ## Tool-by-Tool Audit Summary
 
 | Tool | Primary user job | Current assessment | Current strengths | Current burden |
@@ -113,9 +124,13 @@ The main weakness is different. The surface is capable, but it often makes the m
 contract machinery needed to finish the job. The model has to discover dialogs before reading them,
 pick exact retry candidates after fuzzy resolution, remember whether the current path pages by
 `next_cursor` or `next_offset`, and parse readable but still prose-shaped outputs for the state
-needed to continue. That burden is strongest in message-reading and topic-handling workflows, where
-the model can succeed but must spend attention on orchestration as well as the underlying Telegram
-content.
+needed to continue. [tools.py](/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/tools.py),
+[resolver.py](/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/resolver.py),
+[formatter.py](/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/formatter.py),
+[pagination.py](/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/pagination.py), and
+[tests/test_tools.py](/home/j2h4u/repos/j2h4u/mcp-telegram/tests/test_tools.py) together show that
+this burden is strongest in message-reading and topic-handling workflows, where the model can
+succeed but must spend attention on orchestration as well as the underlying Telegram content.
 
 That leaves Phase 11 with a stable conclusion: the current surface should be understood as
 workflow-capable but continuation-heavy. It contains meaningful strengths worth preserving, but it
@@ -135,3 +150,25 @@ reduction rather than around adding wholly new capabilities.
 | search | `SearchMessages` aligns well with the user job and returns useful local hit context. | Search uses `next_offset`, which diverges from message reading's `next_cursor`. | Preserve local context windows around hits. | Compare a more uniform navigation contract across read and search workflows. |
 | recovery boundary | Handler-local recovery text is unusually actionable for not-found, ambiguous, and invalid-cursor cases. | Escaped failures still degrade to generic `Tool <name> failed`. | Preserve explicit retry guidance and action-oriented failures where they already exist. | Remove the boundary between rich handler recovery and generic server wrapping. |
 | runtime and state model | The surface already benefits from cached clients, caches, and durable local metadata. | Statefulness is helpful but implicit, especially for discovery freshness and cache-backed resolution. | Preserve the stateful runtime and recovery-critical caches. | Compare how to surface state assumptions more clearly without pretending the system is stateless. |
+
+### Phase 12 Handoff
+
+Phase 12 should compare redesign options against this exact current-state baseline rather than
+re-running discovery:
+
+- Compare how much helper-step burden can be removed from discovery, reading, search, and topic
+  handling without breaking the read-only boundary or the stateful runtime model.
+- Compare continuation-shape options for adjacent navigation jobs, especially `next_cursor`,
+  `next_offset`, and `from_beginning=True`, using [pagination.py](/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/pagination.py)
+  and [tests/test_tools.py](/home/j2h4u/repos/j2h4u/mcp-telegram/tests/test_tools.py) as the
+  shipped contract anchors.
+- Compare whether more direct result structure can reduce parsing burden while preserving readable
+  transcript output from [formatter.py](/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/formatter.py).
+- Compare how to preserve explicit ambiguity and topic-state recovery from
+  [resolver.py](/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/resolver.py) and
+  [tools.py](/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/tools.py) while removing generic
+  boundary failure collapse in [server.py](/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/server.py).
+
+This handoff is intentionally comparative rather than prescriptive. Phase 11 names what must be
+preserved and what creates redesign pressure; Phase 12 should evaluate options against those facts
+instead of selecting a path here.
