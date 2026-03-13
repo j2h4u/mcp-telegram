@@ -9,8 +9,8 @@
 ### Comparative Audit
 
 - [ ] **AUDIT-01**: Maintainer can review a grounded comparison of the current MCP tool surface against MCP and Anthropic best practices, with findings tied to named sources.
-- [ ] **AUDIT-02**: Maintainer can review the current tool surface both tool-by-tool and workflow-by-workflow, including discovery, reading, search, topic handling, and recovery/error flows.
-- [ ] **AUDIT-03**: Maintainer can identify where the current public surface leaks low-level mechanics to the model unnecessarily, including pagination, disambiguation, and helper-step burden.
+- [x] **AUDIT-02**: Maintainer can review the current tool surface both tool-by-tool and workflow-by-workflow, including discovery, reading, search, topic handling, and recovery/error flows.
+- [x] **AUDIT-03**: Maintainer can identify where the current public surface leaks low-level mechanics to the model unnecessarily, including pagination, disambiguation, and helper-step burden.
 
 ### Refactor Options
 
@@ -48,8 +48,8 @@
 | Requirement | Phase | Status |
 |-------------|-------|--------|
 | AUDIT-01 | 11 | Pending |
-| AUDIT-02 | 11 | Pending |
-| AUDIT-03 | 11 | Pending |
+| AUDIT-02 | 11 | Complete |
+| AUDIT-03 | 11 | Complete |
 | OPTION-01 | 12 | Pending |
 | OPTION-02 | 12 | Pending |
 | RECO-01 | 12 | Pending |
