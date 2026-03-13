@@ -3,10 +3,10 @@
 ## What This Is
 
 MCP server that exposes Telegram as a set of tools for LLMs. Lets Claude read conversation
-history, search messages with surrounding context, and look up contact info — without the LLM
-needing to know Telegram entity IDs. Built on Telethon (MTProto) with stdio transport, deployable
-via Docker. Ships with fuzzy name resolution (WRatio), unified readable message format, SQLite
-entity cache, and a complete read-only tool surface.
+history, search messages with surrounding context, and look up contact info without the LLM
+needing to know Telegram entity IDs. Built on Telethon (MTProto) with stdio transport,
+deployable via Docker. Ships with fuzzy name resolution (WRatio), unified readable message
+format, SQLite entity cache, and a complete read-only tool surface.
 
 ## Core Value
 
@@ -15,20 +15,23 @@ boilerplate before every real task.
 
 ## Current State
 
-Latest shipped milestone: `v1.1 Observability & Completeness` on 2026-03-13.
+Latest shipped milestone: `v1.2 MCP Surface Research` on 2026-03-13.
+
+The live product surface is still the shipped `v1.1` runtime: 7 read-only MCP tools on Python 3.13,
+Telethon, the MCP SDK, SQLite caches, and Docker + `mcp-proxy`, with 169 passing tests captured
+before the research milestone began.
+
+`v1.2` added no runtime behavior. It produced the evidence hierarchy, comparative audit, option
+matrix, Pareto recommendation, and implementation memo that now define the next coding milestone.
 
 There is no active milestone at the moment. The next planning cycle should start from the backlog
-todos in `.planning/todos/pending/`.
+todos in `.planning/todos/pending/` and the `v1.2` implementation memo.
 
-## Current Milestone: v1.2 MCP Surface Research
+## Next Milestone Goals
 
-**Goal:** Research MCP and Anthropic tool-design best practices, audit the current Telegram MCP surface against them, and produce grounded recommendations for a future refactor milestone.
-
-**Target features:**
-- Comparative audit of the current model-facing MCP surface against external best practices and primary-source guidance
-- Refactor option set covering minimal, medium, and maximum redesign paths
-- Pareto-style recommendation for the smallest change set likely to deliver most of the model-usage impact
-- Migration guidance and decision criteria for the follow-up implementation milestone
+- Implement the chosen Medium-path MCP tool-surface refactor in code.
+- Run reflected-schema, restarted-runtime, and realistic LLM-workflow validation after the public contract changes.
+- Carry forward deferred v1.1 cleanup and large-forum validation only where it materially affects the redesign.
 
 ## Requirements
 
@@ -46,7 +49,7 @@ todos in `.planning/todos/pending/`.
 - ✓ `ListDialogs` — `type` and `last_message_at` fields — v1.0
 - ✓ `ListMessages` — readable format, cursor pagination, `sender` filter, `unread` filter — v1.0
 - ✓ `SearchMessages` — offset-based pagination, results with ±3 message context — v1.0
-- ✓ `GetMe` tool — returns own name, id, username — v1.0
+- ✓ `GetMyAccount` tool — returns own name, id, username — v1.0
 - ✓ `GetUserInfo` tool — returns profile + common chats list — v1.0
 - ✓ Entity metadata cache (L2 SQLite, TTL-enforced) — users 30d, groups/channels 7d — v1.0
 - ✓ Remove `GetDialog` tool (no stubs) — v1.0
@@ -56,18 +59,21 @@ todos in `.planning/todos/pending/`.
 - ✓ `ListDialogs` archived-dialog discovery via `exclude_archived` semantics — v1.1
 - ✓ `ListMessages` bidirectional navigation via `from_beginning` — v1.1
 - ✓ Forum-topic support in `ListMessages` plus `ListTopics` dialog topic discovery — v1.1
+- ✓ Grounded audit of the current MCP tool surface against MCP and Anthropic guidance — v1.2
+- ✓ Option matrix for minimal, medium, and maximal redesign paths — v1.2
+- ✓ Medium-path Pareto recommendation for the next implementation milestone — v1.2
+- ✓ Implementation-ready sequencing memo with runtime validation gates and open questions — v1.2
 
 ### Active
 
-- [ ] Grounded audit of the current MCP tool surface from the LLM-facing perspective
-- [ ] Option matrix for future refactor paths: minimal, medium, and maximum change
-- [ ] Recommended Pareto path for highest impact with the smallest safe redesign
-- [ ] Future implementation guidance for tool contracts, descriptions, and migration sequencing
+- [ ] Implement the Medium-path MCP tool-surface refactor.
+- [ ] Run post-refactor evals against realistic LLM workflows and confirm lower agent burden.
+- [ ] Close deferred v1.1 cleanup and large-forum validation where they materially affect the redesign.
 
 ### Backlog Candidates
 
-- Capability-oriented MCP tool-surface redesign based on MCP and Anthropic tool best practices.
-- Deferred v1.1 cleanup and large-forum topic validation follow-up.
+- Broader Maximal-path tool-surface redesign after the Medium migration lands cleanly.
+- Native eval or benchmark harnesses for measuring model burden reduction over time.
 
 ### Out of Scope
 
@@ -82,16 +88,23 @@ todos in `.planning/todos/pending/`.
 
 ## Context
 
-Shipped v1.1 with 7 MCP tools and 169 passing tests.
+Shipped runtime remains `v1.1`: 7 MCP tools and 169 passing tests.
 Tech stack: Python 3.13, Telethon, MCP SDK, Pydantic v2, rapidfuzz, SQLite (WAL).
 Deployment remains Docker-based with stdio MCP transport and `mcp-proxy` for HTTP/SSE access.
+
+**v1.2 outcomes now available for planning:**
+- Retained-source evidence hierarchy and brownfield baseline for future tool-surface work.
+- Comparative audit of the seven-tool MCP surface across tool-level and workflow-level pressure points.
+- Medium-path recommendation with explicit rejected alternatives and bounded Maximal prep.
+- Implementation memo defining sequencing, open questions, and runtime freshness gates.
 
 **Known deferred follow-ups:**
 - Large-forum live validation using `.planning/phases/09-forum-topics-support/09-MANUAL-VALIDATION.md`
 - `tz` param accepted by `format_messages()` but never passed at call sites — defaults to UTC
 - Dead imports in `tools.py:18` (TelegramClient, custom, functions, types)
 - `EntityCache.all_names()` orphaned by `all_names_with_ttl()` — safe to remove
-- Capability-oriented MCP tool-surface redesign remains future planning work, not v1.1 scope.
+- Reflected tool-schema freshness remains an operational risk until the follow-on implementation milestone executes rebuild/restart verification.
+- Phase VALIDATION artifacts for 10-13 remain partial even though the milestone audit passed with `tech_debt` status.
 
 ## Key Decisions
 
@@ -99,7 +112,7 @@ Deployment remains Docker-based with stdio MCP transport and `mcp-proxy` for HTT
 |----------|-----------|---------|
 | Names as strings (not str\|int union type) | LLM always sends strings; Pydantic union type has MCP client compatibility risk | ✓ Good — no issues; str-only API works cleanly |
 | WRatio scorer, thresholds 90/60 as named constants | Deterministic, handles partial matches; named constants allow tuning during test phase | ✓ Good — shipped, all test cases pass; thresholds not yet stress-tested against real contacts |
-| Cursor pagination for ListMessages | message_id hidden → before_id unusable; cursor stable under real-time inserts | ✓ Good — base64+JSON opaque token works; cursor error handling added in Phase 5 |
+| Cursor pagination for ListMessages | message_id hidden -> before_id unusable; cursor stable under real-time inserts | ✓ Good — base64+JSON opaque token works; cursor error handling added in Phase 5 |
 | Offset pagination for SearchMessages | Telegram search RPC uses add_offset, incompatible with max_id/cursor | ✓ Good — confirmed correct; offset pagination shipped |
 | Channel sender = channel/group name | Anonymous posting has no user identity available | ✓ Good — correct fallback; no edge cases surfaced in testing |
 | Two cache layers (L1 in-memory, L2 SQLite) | No message cache — messages always fresh; entity metadata safe to cache 30d | ✓ Good — shipped as designed; TTL enforcement added in Phase 5 |
@@ -110,6 +123,11 @@ Deployment remains Docker-based with stdio MCP transport and `mcp-proxy` for HTT
 | mcp-proxy stays for HTTP | Native HTTP/SSE deferred — proxy works, not worth disruption | ✓ Good — working in production |
 | Pin Python 3.13 | pydantic-core (PyO3 0.22.6) cannot build against Python 3.14 (system default) | ✓ Good — .python-version pinned, reproducible builds |
 | asyncio_mode=auto in pytest | Forward-compatible for future async tests | ✓ Good — no noise on sync tests, clean async test support |
+| Use MCP/Anthropic docs as normative external guidance and reflection/code/tests as brownfield authority | Keeps research anchored to primary sources and live runtime reality | ✓ Good — produced a grounded audit instead of a literature review |
+| Freeze the redesign baseline against the reflected seven-tool runtime | Stale planning notes were already drifting from the real surface | ✓ Good — all v1.2 artifacts share one authoritative baseline |
+| Choose the Medium path as the next milestone | Removes a large share of model burden with the smallest safe change set | ✓ Good — adopted as the implementation direction |
+| Require reflected-schema checks plus restarted-runtime freshness once public schemas move | Prevents stale container/runtime contracts after MCP-surface changes | ✓ Good — mandatory acceptance gate for the next coding milestone |
+| Do not preserve backward compatibility by default for the Medium path | Cleaner contract is more valuable than shims unless a concrete client forces them | — Pending — validate against implementation constraints during the next milestone |
 
 ## Constraints
 
@@ -118,5 +136,19 @@ Deployment remains Docker-based with stdio MCP transport and `mcp-proxy` for HTT
 - **Privacy**: No real user IDs, names, or usernames in planning docs or code comments
 - **Read-only**: Permanent constraint — write tools expand prompt injection blast radius dramatically
 
+<details>
+<summary>Archived v1.2 milestone notes</summary>
+
+**Goal:** Research MCP and Anthropic tool-design best practices, audit the current Telegram MCP
+surface against them, and produce grounded recommendations for a future refactor milestone.
+
+**Delivered:**
+- Comparative audit of the current model-facing MCP surface against external best practices and primary-source guidance
+- Refactor option set covering minimal, medium, and maximal redesign paths
+- Pareto-style recommendation for the smallest safe change set likely to deliver most of the model-usage impact
+- Migration guidance and decision criteria for the follow-up implementation milestone
+
+</details>
+
 ---
-*Last updated: 2026-03-13 after v1.2 milestone started*
+*Last updated: 2026-03-14 after v1.2 milestone completion*

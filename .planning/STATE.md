@@ -2,13 +2,13 @@
 gsd_state_version: 1.0
 milestone: v1.2
 milestone_name: MCP Surface Research
-current_phase: 13
-current_phase_name: implementation sequencing & decision memo
-current_plan: 3
-status: complete
-stopped_at: Completed 13-03-PLAN.md
-last_updated: "2026-03-13T17:13:06.952Z"
-last_activity: 2026-03-13
+current_phase: null
+current_phase_name: planning next milestone
+current_plan: null
+status: archived
+stopped_at: Archived v1.2 milestone
+last_updated: "2026-03-13T19:31:05Z"
+last_activity: 2026-03-14
 progress:
   total_phases: 4
   completed_phases: 4
@@ -21,21 +21,21 @@ progress:
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-03-13)
+See: .planning/PROJECT.md (updated 2026-03-14)
 
 **Core value:** LLM can work with Telegram using natural names — zero cold-start friction, no ID lookup boilerplate before every real task
-**Current focus:** Phase 13 complete; v1.2 decision memo delivered and ready for follow-on implementation planning
+**Current focus:** Planning the next milestone from the `v1.2` implementation memo and pending backlog todos
 
 ## Current Position
 
-Current Phase: 13
-Current Phase Name: implementation sequencing & decision memo
+Current Phase: None
+Current Phase Name: planning next milestone
 Total Phases: 4
-Current Plan: 3
-Total Plans in Phase: 3
-Status: Complete
-Last Activity: 2026-03-13
-Last Activity Description: Completed 13-03-PLAN.md; Phase 13 and milestone v1.2 are complete
+Current Plan: None
+Total Plans in Phase: 0
+Status: Archived
+Last Activity: 2026-03-14
+Last Activity Description: Archived `v1.2` and prepared the next planning cycle
 Progress: [██████████] 100%
 
 ## Performance Metrics
@@ -107,6 +107,6 @@ Progress: [██████████] 100%
 
 ## Session Continuity
 
-**Last Date:** 2026-03-13T17:13:06.949Z
-**Stopped At:** Completed 13-03-PLAN.md
+**Last Date:** 2026-03-13T19:31:05Z
+**Stopped At:** Archived v1.2 milestone
 **Resume File:** None

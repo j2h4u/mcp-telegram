@@ -1,5 +1,20 @@
 # Milestones
 
+## v1.2 MCP Surface Research (Shipped: 2026-03-13)
+
+**Phases completed:** 4 phases, 12 plans, 32 tasks
+
+**Audit:** `tech_debt` — no blocking gaps; validation and runtime-freshness follow-ups remain
+
+**Key accomplishments:**
+- Established the retained-source evidence hierarchy and froze the reflected seven-tool brownfield baseline for all later analysis.
+- Produced a comparative audit of the current MCP surface across both tool-level and workflow-level model burden.
+- Compared minimal, medium, and maximal redesign paths across the current public contract.
+- Selected the Medium path as the Pareto recommendation for the next implementation milestone.
+- Delivered an implementation-ready memo with sequencing, open questions, and restarted-runtime validation gates.
+
+---
+
 ## v1.1 Observability & Completeness (Shipped: 2026-03-13)
 
 **Phases completed:** 4 phases, 15 plans, 37 tasks
