@@ -192,3 +192,27 @@ tool handlers.
 - The preserved `previously_inaccessible` topic state is especially important. It shows that the
   project already treats recovery history as part of the contract rather than a disposable internal
   detail.
+
+## Contract-Leak Inventory
+
+This matrix captures low-level mechanics that currently leak into the model-facing contract across
+multiple workflows.
+
+| Leak category | Where it appears | Model burden | Preserve, reduce, or remove | Evidence and anchors |
+| --- | --- | --- | --- | --- |
+| pagination conventions | Reading uses `next_cursor` and directional cursor semantics, while search uses `next_offset`; `from_beginning=True` adds a second reading mode. | The model must remember different continuation tokens and paging rules for adjacent jobs that both feel like “keep going.” | Reduce | Anthropic tool-use overview; [tools.py](/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/tools.py#L1150), [tools.py](/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/tools.py#L1155), [tools.py](/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/tools.py#L1567), [tools.py](/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/tools.py#L1767), [tests/test_tools.py](/home/j2h4u/repos/j2h4u/mcp-telegram/tests/test_tools.py#L2443), [tests/test_tools.py](/home/j2h4u/repos/j2h4u/mcp-telegram/tests/test_tools.py#L1759) |
+| disambiguation / retry burden | Dialog, sender, topic, and user resolution often returns candidates and requires a second exact retry. | The model has to carry transient candidate state, choose a retry value, and reissue the original intent instead of completing in one call. | Reduce, but preserve explicitness | Anthropic implement-tool-use doc; [tools.py](/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/tools.py#L515), [tools.py](/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/tools.py#L533), [tools.py](/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/tools.py#L580), [tools.py](/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/tools.py#L633), [tests/test_resolver.py](/home/j2h4u/repos/j2h4u/mcp-telegram/tests/test_resolver.py#L82) |
+| tool choreography / helper-step burden | Discovery and forum reading frequently require `ListDialogs` and `ListTopics` before the model can do the actual read/search job. | The contract teaches the model to do setup choreography that feels adjacent to the user task rather than integral to it. | Reduce | MCP Tools specification; [tools.py](/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/tools.py#L1042), [tools.py](/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/tools.py#L1140), [tests/test_tools.py](/home/j2h4u/repos/j2h4u/mcp-telegram/tests/test_tools.py#L128), [tests/test_tools.py](/home/j2h4u/repos/j2h4u/mcp-telegram/tests/test_tools.py#L588) |
+| discovery freshness and reflection snapshot behavior | Tool discovery is reflection-based, but the public mapping is frozen from a reflection snapshot at process start. | The model can trust `tools/list` for the current process, but not as a guarantee that runtime exposure is fresh after code or deployment changes. | Preserve reflection, reduce snapshot staleness | MCP Tools specification; Live reflected tool list; [server.py](/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/server.py#L29), [server.py](/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/server.py#L35), [server.py](/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/server.py#L54) |
+| text-first output parsing burden | `ListMessages`, `ListTopics`, and `SearchMessages` all emit text-first bodies with embedded labels, separators, and continuation markers. | The model must parse prose formatting to recover next-step state, hit markers, topic labels, and continuation tokens. | Reduce, but preserve readable transcripts | Anthropic tool-use overview; [server.py](/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/server.py#L65), [tools.py](/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/tools.py#L1565), [tools.py](/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/tools.py#L1767), [tests/test_formatter.py](/home/j2h4u/repos/j2h4u/mcp-telegram/tests/test_formatter.py#L1), [tests/test_tools.py](/home/j2h4u/repos/j2h4u/mcp-telegram/tests/test_tools.py#L1715) |
+| generic server-boundary failure wrapping | The server catches escaped exceptions and replaces them with `Tool <name> failed`. | The model loses the most valuable part of the recovery contract exactly when something unexpected happens. | Remove | [server.py](/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/server.py#L72), [10-AUDIT-FRAME.md](/home/j2h4u/repos/j2h4u/mcp-telegram/.planning/phases/10-evidence-base-audit-frame/10-AUDIT-FRAME.md#L9) |
+
+## Leak Synthesis for Phase 12
+
+- Preserve: reflection-based discovery, readable transcript rendering, and explicit ambiguity
+  handling all carry real value today.
+- Reduce: pagination conventions, disambiguation retries, helper-step tool choreography, reflection
+  snapshot staleness, and text-first parsing burden are all redesign pressure because they consume
+  model attention that could be spent on the user task.
+- Remove: generic server-boundary failure wrapping is the clearest leak that should not survive a
+  better public contract.
