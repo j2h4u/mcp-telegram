@@ -24,6 +24,7 @@ from . import tools
 
 logger = logging.getLogger(__name__)
 app = Server("mcp-telegram")
+_MAX_ERROR_DETAIL_LENGTH = 160
 
 
 @cache
@@ -38,6 +39,23 @@ def enumerate_available_tools() -> list[tuple[str, Tool]]:
 
 
 mapping: dict[str, Tool] = dict(enumerate_available_tools())
+
+
+def _safe_boundary_error_text(*, tool_name: str, stage: str, exc: Exception) -> str:
+    detail = str(exc).strip()
+    if detail:
+        detail = " ".join(detail.split())
+    if not detail or "traceback" in detail.lower():
+        detail = type(exc).__name__
+    if len(detail) > _MAX_ERROR_DETAIL_LENGTH:
+        detail = f"{detail[:_MAX_ERROR_DETAIL_LENGTH - 3]}..."
+
+    if stage == "validation":
+        action = "Check the tool arguments against the exported schema and retry."
+        return f"Tool {tool_name} argument validation failed: {detail}. Action: {action}"
+
+    action = "Retry the tool. If this persists, inspect the server logs for the underlying exception type."
+    return f"Tool {tool_name} runtime execution failed: {detail}. Action: {action}"
 
 
 @app.list_prompts()
@@ -83,14 +101,21 @@ async def call_tool(name: str, arguments: t.Any) -> Sequence[TextContent | Image
     t0 = time.monotonic()
     try:
         args = tools.tool_args(tool, **arguments)
+    except Exception as exc:
+        elapsed = time.monotonic() - t0
+        logger.exception("call_tool[%s] validation failed after %.3fs", name, elapsed)
+        raise RuntimeError(_safe_boundary_error_text(tool_name=name, stage="validation", exc=exc)) from exc
+
+    try:
         result = await tools.tool_runner(args)
+    except Exception as exc:
         elapsed = time.monotonic() - t0
-        logger.info("call_tool[%s] completed in %.3fs", name, elapsed)
-        return result
-    except Exception as e:
-        elapsed = time.monotonic() - t0
-        logger.exception("call_tool[%s] failed after %.3fs", name, elapsed)
-        raise RuntimeError(f"Tool {name} failed") from e
+        logger.exception("call_tool[%s] runtime failed after %.3fs", name, elapsed)
+        raise RuntimeError(_safe_boundary_error_text(tool_name=name, stage="runtime", exc=exc)) from exc
+
+    elapsed = time.monotonic() - t0
+    logger.info("call_tool[%s] completed in %.3fs", name, elapsed)
+    return result
 
 
 async def run_mcp_server() -> None:
