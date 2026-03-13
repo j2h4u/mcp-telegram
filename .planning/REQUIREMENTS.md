@@ -12,7 +12,7 @@
 
 ### Capability Layer
 
-- [ ] **CAP-01**: Maintainer can evolve read, search, and topic behavior through capability-oriented internals instead of binding implementation seams directly to current public tool names.
+- [x] **CAP-01**: Maintainer can evolve read, search, and topic behavior through capability-oriented internals instead of binding implementation seams directly to current public tool names.
 
 ### Navigation
 
@@ -55,7 +55,7 @@
 | Requirement | Phase | Status |
 |-------------|-------|--------|
 | ERR-01 | Phase 14 | Complete |
-| CAP-01 | Phase 15 | Pending |
+| CAP-01 | Phase 15 | Complete |
 | NAV-01 | Phase 16 | Pending |
 | NAV-02 | Phase 16 | Pending |
 | FLOW-01 | Phase 17 | Pending |
