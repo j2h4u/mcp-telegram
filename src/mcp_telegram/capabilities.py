@@ -134,6 +134,17 @@ class HistoryReadExecution:
     next_cursor: str | None
 
 
+@dataclass(frozen=True)
+class SearchExecution:
+    entity_id: int
+    dialog_name: str
+    resolve_prefix: str
+    hits: tuple[object, ...]
+    context_messages_by_id: dict[int, object]
+    reaction_names_map: dict[int, dict[str, list[str]]]
+    next_offset: int | None
+
+
 DialogResolveResult = Resolved | Candidates | NotFound
 DialogTargetResult = ResolvedDialogTarget | DialogTargetFailure
 ForumTopicCapabilityResult = TopicCatalog | ResolvedForumTopic | ForumTopicFailure
@@ -144,6 +155,7 @@ HistoryReadCapabilityResult = (
     | ForumTopicFailure
     | MessageReadFailure
 )
+SearchCapabilityResult = SearchExecution | DialogTargetFailure
 DialogResolver = Callable[[EntityCache, str], Awaitable[DialogResolveResult]]
 TopicLoader = Callable[..., Awaitable[TopicCatalog]]
 TopicFetcher = Callable[..., Awaitable[list[object]]]
@@ -1036,6 +1048,38 @@ async def _build_reaction_names_map(
     return reaction_names_map
 
 
+async def _build_context_message_map(
+    client: object,
+    *,
+    entity_id: int,
+    hits: list[object],
+    context_radius: int,
+) -> dict[int, object]:
+    context_ids_needed: set[int] = set()
+    hit_ids = {
+        message_id
+        for hit in hits
+        for message_id in [getattr(hit, "id", None)]
+        if isinstance(message_id, int)
+    }
+    for hit_id in hit_ids:
+        for offset in range(-context_radius, context_radius + 1):
+            if offset != 0:
+                context_ids_needed.add(hit_id + offset)
+    context_ids_needed -= hit_ids
+    if not context_ids_needed:
+        return {}
+
+    fetched = await client.get_messages(entity_id, ids=list(context_ids_needed))
+    fetched_list = fetched if isinstance(fetched, list) else [fetched]
+    return {
+        message_id: message
+        for message in fetched_list
+        for message_id in [getattr(message, "id", None)]
+        if message is not None and isinstance(message_id, int)
+    }
+
+
 async def _build_cross_topic_name_getter(
     client: object,
     *,
@@ -1321,6 +1365,81 @@ async def execute_history_read_capability(
         reaction_names_map=reaction_names_map,
         topic_name_getter=topic_name_getter,
         next_cursor=next_cursor,
+    )
+
+
+async def execute_search_messages_capability(
+    client: object,
+    *,
+    cache: EntityCache,
+    dialog_query: str,
+    query: str,
+    limit: int,
+    offset: int | None,
+    retry_tool: str,
+    resolve_dialog: DialogResolver,
+    get_sender_type: SenderTypeGetter,
+    reaction_names_threshold: int,
+    context_radius: int = 3,
+) -> SearchCapabilityResult:
+    dialog_target = await resolve_dialog_target(
+        cache=cache,
+        query=dialog_query,
+        retry_tool=retry_tool,
+        resolve_dialog=resolve_dialog,
+    )
+    if isinstance(dialog_target, DialogTargetFailure):
+        return dialog_target
+
+    entity_id = dialog_target.entity_id
+    page_offset = 0 if offset is None else offset
+    hits = [
+        message
+        async for message in client.iter_messages(
+            entity_id,
+            search=query,
+            limit=limit,
+            add_offset=page_offset,
+        )
+    ]
+    _cache_message_senders(
+        cache=cache,
+        messages=hits,
+        get_sender_type=get_sender_type,
+    )
+
+    context_messages_by_id = await _build_context_message_map(
+        client,
+        entity_id=entity_id,
+        hits=hits,
+        context_radius=context_radius,
+    )
+    _cache_message_senders(
+        cache=cache,
+        messages=list(context_messages_by_id.values()),
+        get_sender_type=get_sender_type,
+    )
+
+    reaction_names_map = await _build_reaction_names_map(
+        client,
+        cache=cache,
+        entity_id=entity_id,
+        messages=hits,
+        reaction_names_threshold=reaction_names_threshold,
+    )
+
+    next_offset = None
+    if len(hits) == limit:
+        next_offset = page_offset + limit
+
+    return SearchExecution(
+        entity_id=entity_id,
+        dialog_name=dialog_target.display_name,
+        resolve_prefix=dialog_target.resolve_prefix,
+        hits=tuple(hits),
+        context_messages_by_id=context_messages_by_id,
+        reaction_names_map=reaction_names_map,
+        next_offset=next_offset,
     )
 
 
