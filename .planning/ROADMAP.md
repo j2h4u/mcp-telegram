@@ -75,7 +75,7 @@ Full details: `.planning/milestones/v1.1-ROADMAP.md`
 | 9. Forum Topics Support | v1.1 | 6/6 | Complete | 2026-03-12 |
 | 10. Evidence Base & Audit Frame | v1.2 | 3/3 | Complete    | 2026-03-13 |
 | 11. Current Surface Comparative Audit | v1.2 | 3/3 | Complete    | 2026-03-13 |
-| 12. Redesign Options & Pareto Recommendation | v1.2 | 1/3 | In Progress|  |
+| 12. Redesign Options & Pareto Recommendation | v1.2 | 2/3 | In Progress|  |
 | 13. Implementation Sequencing & Decision Memo | v1.2 | 0/TBD | Not started | - |
 
 ## Phase Details
@@ -111,7 +111,7 @@ Full details: `.planning/milestones/v1.1-ROADMAP.md`
 2. Each option makes clear which current tools, parameters, and interaction patterns it would keep, reshape, merge, demote, or remove from the public contract.
 3. One Pareto recommendation is named explicitly, with rationale for why its smaller safe change set should deliver outsized model-usage impact.
 4. The recommendation calls out the invariants that should not be casually broken, including read-only scope, privacy-safe telemetry, and recovery-critical state.
-**Plans**: 01-03 planned
+**Plans**: 01-02 complete; 03 planned
 
 ### Phase 13: Implementation Sequencing & Decision Memo
 **Goal**: Maintainer has a decision-ready memo that turns the research into a sequenced, validate-able implementation brief for the follow-up milestone.

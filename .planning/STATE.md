@@ -4,17 +4,17 @@ milestone: v1.2
 milestone_name: MCP Surface Research
 current_phase: 12
 current_phase_name: redesign options & pareto recommendation
-current_plan: 2
+current_plan: 3
 status: executing
-stopped_at: Completed 12-01-PLAN.md
-last_updated: "2026-03-13T15:25:39.879Z"
+stopped_at: Completed 12-02-PLAN.md
+last_updated: "2026-03-13T15:35:35.786Z"
 last_activity: 2026-03-13
 progress:
   total_phases: 4
   completed_phases: 2
   total_plans: 9
-  completed_plans: 7
-  percent: 78
+  completed_plans: 8
+  percent: 89
 ---
 
 # Project State
@@ -24,19 +24,19 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-13)
 
 **Core value:** LLM can work with Telegram using natural names — zero cold-start friction, no ID lookup boilerplate before every real task
-**Current focus:** Phase 12 plan 01 complete; ready to continue redesign option population and recommendation work
+**Current focus:** Phase 12 plan 02 complete; ready to continue Pareto recommendation synthesis
 
 ## Current Position
 
 Current Phase: 12
 Current Phase Name: redesign options & pareto recommendation
 Total Phases: 4
-Current Plan: 2
+Current Plan: 3
 Total Plans in Phase: 3
 Status: Executing
 Last Activity: 2026-03-13
-Last Activity Description: Completed 12-01-PLAN.md
-Progress: [████████░░] 78%
+Last Activity Description: Completed 12-02-PLAN.md
+Progress: [█████████░] 89%
 
 ## Performance Metrics
 
@@ -48,6 +48,7 @@ Progress: [████████░░] 78%
 | Phase 11 P01 | 4min | 3 tasks | 5 files |
 | Phase 11-current-surface-comparative-audit P03 | 2min | 3 tasks | 5 files |
 | Phase 12 P01 | 1min | 2 tasks | 2 files |
+| Phase 12 P02 | 6min | 3 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -73,6 +74,9 @@ Progress: [████████░░] 78%
 - [Phase 11]: Keep the Phase 12 handoff comparative rather than prescriptive; this plan names pressure but does not choose a redesign path.
 - [Phase 12]: Require future option comparisons to use shared dimensions and invariant-aware keep/reshape/merge/demote/remove/rename actions.
 - [Phase 12]: Freeze Phase 12 against the reflected seven-tool Phase 11 baseline instead of reopening discovery.
+- [Phase 12]: Treat the minimal path as contract cleanup of the existing seven-tool topology rather than a hidden no-op.
+- [Phase 12]: Treat the medium path as the capability-oriented Pareto-candidate range that reduces helper-step burden without a full surface rewrite.
+- [Phase 12]: Treat the maximal path as the upper-bound stress test for tool-merging, role changes, and result-shape changes rather than the default recommendation.
 
 ### Pending Todos
 
@@ -86,6 +90,6 @@ Progress: [████████░░] 78%
 
 ## Session Continuity
 
-**Last Date:** 2026-03-13T15:24:57.343Z
-**Stopped At:** Completed 12-01-PLAN.md
+**Last Date:** 2026-03-13T15:35:35.783Z
+**Stopped At:** Completed 12-02-PLAN.md
 **Resume File:** None
