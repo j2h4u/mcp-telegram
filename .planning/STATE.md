@@ -81,6 +81,8 @@ Progress: [██████████] 100%
 - [Phase 12]: Choose the Medium Path as the Pareto recommendation because it removes a large share of model burden with the smallest safe change set.
 - [Phase 12]: Reject the Minimal Path as too low-impact because it leaves helper-step choreography mostly intact.
 - [Phase 12]: Reject the Maximal Path for the next milestone because it overshoots acceptable reflected-contract and runtime risk.
+- [Phase 13 prep]: Treat the Medium Path as a migration stage toward a later Maximal redesign, not as the final contract shape.
+- [Phase 13 prep]: Do not preserve backward compatibility by default; prefer cleaner contract and sequencing choices over compatibility shims unless a later phase explicitly reintroduces them.
 
 ### Pending Todos
 
