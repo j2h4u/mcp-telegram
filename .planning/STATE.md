@@ -2,19 +2,19 @@
 gsd_state_version: 1.0
 milestone: v1.2
 milestone_name: MCP Surface Research
-current_phase: 10
-current_phase_name: Evidence Base & Audit Frame
-current_plan: 3
-status: executing
-stopped_at: Completed 10-02-PLAN.md
-last_updated: "2026-03-13T11:46:39.421Z"
+current_phase: 11
+current_phase_name: Current Surface Comparative Audit
+current_plan: 0
+status: ready_to_plan
+stopped_at: Completed 10-03-PLAN.md
+last_updated: "2026-03-13T11:55:55.760Z"
 last_activity: 2026-03-13
 progress:
   total_phases: 4
-  completed_phases: 0
-  total_plans: 3
-  completed_plans: 2
-  percent: 0
+  completed_phases: 1
+  total_plans: 0
+  completed_plans: 0
+  percent: 25
 ---
 
 # Project State
@@ -24,35 +24,40 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-13)
 
 **Core value:** LLM can work with Telegram using natural names — zero cold-start friction, no ID lookup boilerplate before every real task
-**Current focus:** Phase 10 — Evidence Base & Audit Frame
+**Current focus:** Phase 11 — Current Surface Comparative Audit
 
 ## Current Position
 
-Current Phase: 10
-Current Phase Name: Evidence Base & Audit Frame
+Current Phase: 11
+Current Phase Name: Current Surface Comparative Audit
 Total Phases: 4
-Current Plan: 3
-Total Plans in Phase: 3
-Status: Ready to execute
+Current Plan: Not planned yet
+Total Plans in Phase: TBD
+Status: Ready to plan
 Last Activity: 2026-03-13
-Last Activity Description: Created the v1.2 research roadmap with Phases 10–13 and full requirement traceability
-Progress: [░░░░░░░░░░] 0%
+Last Activity Description: Completed Plan 10-03 and closed Phase 10 with the reusable audit frame for Phases 11-13.
+Progress: [██░░░░░░░░] 25%
 
 ## Performance Metrics
 
 | Plan | Duration | Tasks | Files |
 | --- | --- | --- | --- |
+| Phase 10 P01 | 3min | 4 tasks | 2 files |
+| Phase 10 P03 | 3min | 3 tasks | 4 files |
 
 ## Accumulated Context
-| Phase 10 P02 | 149 | 3 tasks | 2 files |
 
 ### Decisions
 
 - v1.2 is research-only; this roadmap intentionally contains no implementation phases.
 - Every v1.2 requirement maps to exactly one phase, starting at Phase 10 after shipped Phase 9.
 - The milestone must end in a decision-ready memo grounded in both external best practices and the current codebase reality.
-- [Phase 10]: Freeze the current surface from reflected runtime, source, and tests rather than stale planning notes.
-- [Phase 10]: Treat workflow burden, recovery guidance, and pagination divergence as part of the public contract, not incidental implementation detail.
+- [Phase 10]: Keep the evidence base narrow and retain only sources that later phases will cite directly.
+- [Phase 10]: Treat official MCP and Anthropic docs as normative external guidance, and reflection/code/tests as brownfield authority.
+- [Phase 10]: Represent Supporting official and Context only tiers explicitly even when no sources are retained.
+- [Phase 10]: Keep the audit frame non-numeric and use strong/mixed/weak bands with named evidence.
+- [Phase 10]: Require Phase 11 to audit both individual tools and end-to-end workflows.
+- [Phase 10]: Treat the evidence log and brownfield baseline as mandatory inputs for Phases 11-13 rather than methodology to be rebuilt.
 
 ### Pending Todos
 
@@ -66,6 +71,6 @@ Progress: [░░░░░░░░░░] 0%
 
 ## Session Continuity
 
-**Last Date:** 2026-03-13T11:46:38.138Z
-**Stopped At:** Completed 10-02-PLAN.md
+**Last Date:** 2026-03-13T11:55:55.757Z
+**Stopped At:** Completed 10-03-PLAN.md
 **Resume File:** None

@@ -55,7 +55,7 @@ Full details: `.planning/milestones/v1.1-ROADMAP.md`
 
 ### 📋 v1.2 MCP Surface Research (Planned)
 
-- [ ] **Phase 10: Evidence Base & Audit Frame** - Establish the source hierarchy, audit rubric, and brownfield constraints for the current MCP surface.
+- [x] **Phase 10: Evidence Base & Audit Frame** - Establish the source hierarchy, audit rubric, and brownfield constraints for the current MCP surface. (completed 2026-03-13)
 - [ ] **Phase 11: Current Surface Comparative Audit** - Produce a grounded audit of the current tools and workflows against named best-practice sources and code reality.
 - [ ] **Phase 12: Redesign Options & Pareto Recommendation** - Compare minimal, medium, and maximal redesign paths and select the highest-leverage safe direction.
 - [ ] **Phase 13: Implementation Sequencing & Decision Memo** - Turn the research into sequencing, validation, and open-question guidance for the future implementation milestone.
@@ -73,7 +73,7 @@ Full details: `.planning/milestones/v1.1-ROADMAP.md`
 | 7. Cache Improvements & Optimization | v1.1 | 3/3 | Complete | 2026-03-12 |
 | 8. Navigation Features | v1.1 | 2/2 | Complete | 2026-03-12 |
 | 9. Forum Topics Support | v1.1 | 6/6 | Complete | 2026-03-12 |
-| 10. Evidence Base & Audit Frame | v1.2 | 2/3 | In Progress|  |
+| 10. Evidence Base & Audit Frame | v1.2 | 3/3 | Complete   | 2026-03-13 |
 | 11. Current Surface Comparative Audit | v1.2 | 0/TBD | Not started | - |
 | 12. Redesign Options & Pareto Recommendation | v1.2 | 0/TBD | Not started | - |
 | 13. Implementation Sequencing & Decision Memo | v1.2 | 0/TBD | Not started | - |
@@ -89,7 +89,7 @@ Full details: `.planning/milestones/v1.1-ROADMAP.md`
 2. The evidence log records which named sources materially shape the later conclusions and why they apply to `mcp-telegram`.
 3. An audit rubric exists for judging each current tool and workflow on task-shape, metadata quality, continuation burden, ambiguity recovery, and structured-output expectations.
 4. Brownfield constraints from the live codebase are captured up front, including read-only scope, reflection-based tool exposure, and text-first result conventions.
-**Plans**: TBD
+**Plans**: 01-03 complete
 
 ### Phase 11: Current Surface Comparative Audit
 **Goal**: Maintainer can review a grounded comparative audit of the current MCP surface from the LLM-facing perspective.
