@@ -65,6 +65,17 @@ The milestone should pursue five concrete outcomes:
 5. keep privacy-safe telemetry, entity/topic cache usage, and explicit disambiguation visible as
    preserved strengths rather than accidental leftovers.
 
+For milestone planning, the implementation path should be read through three explicit boundaries:
+
+- `must land for Medium`: error-surface cleanup, capability-layer preparation, continuation-model
+  unification, workflow reshaping around `ListMessages`, `SearchMessages`, and `ListTopics`, and
+  rollout verification tied to reflected runtime behavior;
+- `prepare now to make Maximal cheaper`: keep public adapters separate from capability-oriented
+  internals, normalize navigation/result framing, and document which surfaces are primary,
+  secondary, merge, or future-removal candidates;
+- `defer to later Maximal`: full role merging, aggressive surface compression, and larger result
+  structure redesigns that would overshoot the Medium migration budget.
+
 ## Sequencing
 
 The recommended sequence for the future coding milestone is:
@@ -113,6 +124,20 @@ Required checkpoints:
 
 Because tool discovery is reflection-based and snapshotted at process start, runtime freshness is a
 mandatory acceptance concern whenever public schemas move.
+
+The minimum reflection workflow is:
+
+1. run `uv run cli.py list-tools` before the contract change to capture the local baseline;
+2. land the code and test changes;
+3. run `uv run cli.py list-tools` again and inspect the reflected schema for the changed tools;
+4. restart the long-lived runtime, and rebuild it first when the deployed image packages source at
+   build time;
+5. run `list-tools` against the restarted process and confirm the live surface matches the local
+   expectation.
+
+If a changed runtime still exposes stale schemas after restart, the work is not complete even if
+tests pass. This check is especially important around `ListMessages`, `SearchMessages`, `ListTopics`,
+and any effort to reduce `Tool <name> failed` boundary collapse.
 
 ## Open Questions Before Coding
 
