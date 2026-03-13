@@ -4,16 +4,16 @@ milestone: v1.2
 milestone_name: MCP Surface Research
 current_phase: 13
 current_phase_name: implementation sequencing & decision memo
-current_plan: 2
+current_plan: 3
 status: executing
-stopped_at: Completed 13-01-PLAN.md
-last_updated: "2026-03-13T16:59:40.736Z"
+stopped_at: Completed 13-02-PLAN.md
+last_updated: "2026-03-13T17:05:59.786Z"
 last_activity: 2026-03-13
 progress:
   total_phases: 4
   completed_phases: 3
   total_plans: 12
-  completed_plans: 10
+  completed_plans: 11
   percent: 83
 ---
 
@@ -31,7 +31,7 @@ See: .planning/PROJECT.md (updated 2026-03-13)
 Current Phase: 13
 Current Phase Name: implementation sequencing & decision memo
 Total Phases: 4
-Current Plan: 2
+Current Plan: 3
 Total Plans in Phase: 3
 Status: Ready to execute
 Last Activity: 2026-03-13
@@ -51,6 +51,7 @@ Progress: [████████░░] 83%
 | Phase 12 P02 | 6min | 3 tasks | 2 files |
 | Phase 12 P03 | 4min | 2 tasks | 5 files |
 | Phase 13 P01 | 2min | 2 tasks | 2 files |
+| Phase 13 P02 | 5min | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -87,6 +88,8 @@ Progress: [████████░░] 83%
 - [Phase 13]: Treat the Medium Path as a locked migration stage toward a later Maximal redesign.
 - [Phase 13]: Do not treat backward compatibility as a default constraint for the next implementation milestone.
 - [Phase 13]: Use the reflected seven-tool runtime surface and role inventory as the sequencing baseline.
+- [Phase 13]: Sequence Medium work from boundary cleanup to capability seams, then continuation unification and workflow reshaping.
+- [Phase 13]: Treat reflected-schema checks plus restarted-runtime freshness as mandatory acceptance gates once public schemas move.
 
 ### Pending Todos
 
@@ -100,6 +103,6 @@ Progress: [████████░░] 83%
 
 ## Session Continuity
 
-**Last Date:** 2026-03-13T16:58:24.068Z
-**Stopped At:** Completed 13-01-PLAN.md
+**Last Date:** 2026-03-13T17:05:59.783Z
+**Stopped At:** Completed 13-02-PLAN.md
 **Resume File:** None
