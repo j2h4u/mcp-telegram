@@ -15,7 +15,7 @@ and the locked comparison vocabulary in
 | Path | Public-contract shape | Burden reduction focus | Expected impact | Migration risk | Implementation scope | Preserved invariants |
 | --- | --- | --- | --- | --- | --- | --- |
 | Minimal Path | Preserve the seven-tool topology and current role split between account, discovery, reading, topic, search, and telemetry tools. | Metadata cleanup, continuation normalization, and error-surface cleanup with only small schema edits. | Moderate improvement on repeated read/search flows because the model spends less effort parsing tool docs and continuation tokens. | Low, because existing tool names and most call shapes remain intact. | Small-to-medium follow-on work in `tools.py`, `server.py`, formatter text, and contract tests. | Read-only scope, privacy-safe telemetry, stateful runtime reality, recovery-critical caches, and explicit ambiguity handling remain default-preserve. |
-| Medium Path | Pending population in Task 2. | Pending population in Task 2. | Pending population in Task 2. | Pending population in Task 2. | Pending population in Task 2. | Pending population in Task 2. |
+| Medium Path | Reshape the model-facing contract around capability-oriented workflows, with helper tools selectively consolidated or demoted rather than kept as first-class starting points. | Reduce helper-step burden through selective consolidation, shared continuation language, and more direct read/search entry points. | High improvement on common tasks because the model can ask for the job more directly instead of assembling the workflow from helper calls. | Medium, because primary tool roles change even though the read-only and stateful runtime baseline is preserved. | Medium-to-large follow-on work across tool schemas, compatibility shims, result framing, and tests. | Read-only scope, privacy-safe telemetry, stateful runtime reality, recovery-critical caches, and explicit ambiguity handling stay preserved even as the public workflow surface is reframed. |
 | Maximal Path | Pending population in Task 3. | Pending population in Task 3. | Pending population in Task 3. | Pending population in Task 3. | Pending population in Task 3. | Pending population in Task 3. |
 
 ## Minimal Path
@@ -89,29 +89,103 @@ The Minimal Path explicitly preserves the invariants Phase 10 and Phase 11 marke
 - recovery-critical topic and entity metadata, including deleted and previously inaccessible topic state
 - explicit ambiguity handling instead of silent auto-resolution
 
+## Medium Path
+
+The Medium Path is the likely Pareto-candidate range because it keeps the read-only and stateful
+runtime baseline, but materially reshapes the model-facing surface around capability-oriented
+workflows instead of around the current helper tool boundaries. This path assumes the public
+contract should optimize for jobs like "read a conversation", "search a conversation", and
+"inspect account or user context" first, while still preserving the runtime facts that make the
+current implementation reliable.
+
+This is meaningfully different from the Minimal Path. The goal here is not only metadata cleanup or
+continuation normalization. The goal is to reduce helper-step burden through selective
+consolidation or re-framing of the public contract:
+
+- discovery remains available, but it is no longer the assumed starting point for many reads
+- topic selection remains real state, but common forum reads should not require a separate public
+  tool hop every time
+- search and read continuation should feel like variations of one navigation model instead of two
+  adjacent but different contracts
+- handler-level recovery remains explicit, but the surface should teach the main workflow before the
+  model needs to learn the helper choreography
+
+### Expected impact
+
+Expected impact is high on the workflows that Phase 11 flagged as continuation-heavy. A medium path
+should let the model express the user-visible job first and only surface helper mechanics when the
+job truly needs them. That especially improves:
+
+- forum-thread reading, where `ListTopics` becomes a secondary support surface rather than a common
+  mandatory prerequisite
+- message reading and replay flows, where continuation and oldest-first reading become one coherent
+  navigation model
+- search continuation, where the public contract stops forcing the model to remember a separate
+  paging vocabulary for a closely related task
+
+### Migration risk
+
+Migration risk moves from low to medium because this path starts changing the primary workflow
+shape. Tool compatibility can still be preserved, but agent expectations would shift:
+
+- helper tools such as `ListDialogs` and `ListTopics` may become demoted compatibility surfaces
+  instead of the primary contract
+- `ListMessages` and `SearchMessages` likely absorb more of the discovery and continuation burden
+- result framing may add lightweight structure or stronger sectioning so recovery and continuation
+  state are easier to consume
+
+This is still not a full rewrite. It does not require abandoning reflection-based discovery,
+read-only scope, or cache-backed recovery behavior.
+
+### Implementation scope
+
+Implementation scope is medium-to-large because the public contract becomes more workflow-shaped,
+not just better worded. The likely code and test impact includes:
+
+- reshaping `ToolArgs` docstrings and schemas in
+  [src/mcp_telegram/tools.py](/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/tools.py)
+- teaching compatibility behavior or secondary-tool posture in
+  [src/mcp_telegram/server.py](/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/server.py)
+  and tool descriptions
+- aligning continuation logic currently split across
+  [src/mcp_telegram/pagination.py](/home/j2h4u/repos/j2h4u/mcp-telegram/src/mcp_telegram/pagination.py)
+  and tool-specific response text
+- updating the high-signal contract tests in
+  [tests/test_tools.py](/home/j2h4u/repos/j2h4u/mcp-telegram/tests/test_tools.py)
+
+### Preserved invariants
+
+The Medium Path still preserves the same non-negotiable baseline:
+
+- read-only Telegram access
+- privacy-safe telemetry
+- stateful runtime and cache-backed resolution
+- recovery-critical topic and entity metadata
+- explicit ambiguity handling, even if the retry points are surfaced later in the workflow
+
 ## Public Contract Delta Inventory
 
 | Current surface element | Current role | Minimal Path | Medium Path | Maximal Path | Rationale | Affected invariants |
 | --- | --- | --- | --- | --- | --- | --- |
-| `GetMyAccount` | Confirm which Telegram account is active. | `reshape` | pending | pending | Keep the one-call job, but expose cleaner success/failure metadata so account-state checks require less prose parsing. | read-only scope; stateful runtime reality |
-| `GetUsageStats` | Summarize local privacy-safe telemetry. | `reshape` | pending | pending | Preserve the telemetry tool, but tighten its output contract so key metrics are easier to read without widening telemetry scope. | privacy-safe telemetry; stateful runtime reality |
-| `GetUserInfo` | Resolve a natural-name user and show profile context. | `reshape` | pending | pending | Keep user lookup separate, but improve metadata and retry guidance so ambiguity recovery stays explicit with less prompt friction. | explicit ambiguity handling; recovery-critical caches |
-| `ListDialogs` | Discover reachable chats and warm caches. | `keep` | pending | pending | Discovery remains a first-class tool because it still teaches real reachable names and archived scope. | stateful runtime reality; recovery-critical caches |
-| `ListMessages` | Read one dialog or topic with pagination and recovery. | `reshape` | pending | pending | This is the heaviest current burden, so minimal cleanup should normalize continuation language and reduce prose-only state leakage without changing the tool boundary. | read-only scope; stateful runtime reality; recovery-critical caches |
-| `ListTopics` | Discover forum topics before topic-scoped reads. | `keep` | pending | pending | Keep topic discovery as a distinct tool because topic-state fidelity is a current strength worth preserving in the low-risk path. | recovery-critical caches; explicit ambiguity handling |
-| `SearchMessages` | Search one dialog with local hit context. | `reshape` | pending | pending | Preserve the dedicated search entry point, but align continuation cues and result framing more closely with reading flows. | read-only scope; stateful runtime reality |
-| `discovery-first flow` | Often `ListDialogs` before the actual read or search. | `keep` | pending | pending | Minimal change accepts discovery-first choreography as real, but can reduce burden by improving descriptions and follow-up hints. | stateful runtime reality; recovery-critical caches |
-| `disambiguation retry flow` | Retry with exact dialog, topic, sender, or user after candidate output. | `reshape` | pending | pending | The safe behavior is worth keeping, but the retry instructions can be more consistent across tools. | explicit ambiguity handling; recovery-critical caches |
-| `topic-selection flow` | Forum reads commonly require `ListTopics` before `ListMessages(topic=...)`. | `keep` | pending | pending | Minimal change keeps topic lookup distinct because it preserves current topic-state semantics and lowers risk. | recovery-critical caches; explicit ambiguity handling |
-| `pagination flow` | Reading and search use different continuation mechanics. | `reshape` | pending | pending | This is one of the clearest low-risk burden reducers: normalize continuation naming and guidance while keeping paging behavior intact. | stateful runtime reality; read-only scope |
-| `text-first result parsing` | Continuation state and recovery cues are embedded in readable text. | `reshape` | pending | pending | Preserve readable text, but make high-signal cues more explicit and consistently placed. | privacy-safe telemetry; read-only scope |
-| `generic server-boundary failure behavior` | Escaped failures collapse to `Tool <name> failed`. | `reshape` | pending | pending | Remove needless loss of context while preserving safe failure behavior and not leaking sensitive internals. | privacy-safe telemetry; stateful runtime reality |
-| `dialog` | Natural-name chat selector used by several tools. | `keep` | pending | pending | The natural-name selector is core to the product value and does not need structural change in the low-risk path. | recovery-critical caches; explicit ambiguity handling |
-| `topic` | Natural-name thread selector for forum reads. | `keep` | pending | pending | Keep the explicit topic selector because it carries important thread-state and deleted-topic semantics. | recovery-critical caches; explicit ambiguity handling |
-| `sender` | Optional read filter within `ListMessages`. | `reshape` | pending | pending | Clarify filter semantics and retry guidance without moving the filter to a new workflow model. | explicit ambiguity handling |
-| `cursor` | Backward or replay-style continuation token for reads. | `reshape` | pending | pending | Normalize naming and explanation so cursor reuse is less tool-specific. | stateful runtime reality |
-| `offset` | Search continuation token. | `rename` | pending | pending | The minimal path can rename or alias this toward the normalized continuation model without merging search into reading. | stateful runtime reality |
-| `from_beginning` | Oldest-first read mode for replay-style reading. | `reshape` | pending | pending | Keep the capability, but teach it more clearly as a read mode rather than an extra pagination quirk. | read-only scope; stateful runtime reality |
-| `exclude_archived` | Scope control for archived dialogs. | `keep` | pending | pending | Archived-scope control is useful and already evidence-backed in tests, so minimal change should preserve it. | stateful runtime reality |
-| `ignore_pinned` | Discovery ordering/scope control for pinned dialogs. | `keep` | pending | pending | Keep as-is because it is a low-cost knob with limited burden compared with larger workflow issues. | stateful runtime reality |
-| `unread` | Filter for unread-only message reads. | `keep` | pending | pending | Preserve unread filtering because tests show topic-scoped unread behavior is subtle and already valuable. | read-only scope; recovery-critical caches |
+| `GetMyAccount` | Confirm which Telegram account is active. | `reshape` | `reshape` | pending | Keep the one-call job, but expose cleaner success/failure metadata so account-state checks require less prose parsing. | read-only scope; stateful runtime reality |
+| `GetUsageStats` | Summarize local privacy-safe telemetry. | `reshape` | `reshape` | pending | Preserve the telemetry tool, but tighten its output contract so key metrics are easier to read without widening telemetry scope. | privacy-safe telemetry; stateful runtime reality |
+| `GetUserInfo` | Resolve a natural-name user and show profile context. | `reshape` | `reshape` | pending | Keep user lookup separate, but improve metadata and retry guidance so ambiguity recovery stays explicit with less prompt friction. | explicit ambiguity handling; recovery-critical caches |
+| `ListDialogs` | Discover reachable chats and warm caches. | `keep` | `demote` | pending | Discovery remains important, but the medium path stops treating it as the default first move for common read/search jobs. | stateful runtime reality; recovery-critical caches |
+| `ListMessages` | Read one dialog or topic with pagination and recovery. | `reshape` | `reshape` | pending | Reading remains core, but the medium path refocuses it on the user-visible job and absorbs more workflow guidance directly. | read-only scope; stateful runtime reality; recovery-critical caches |
+| `ListTopics` | Discover forum topics before topic-scoped reads. | `keep` | `demote` | pending | Topic fidelity stays preserved, but topic lookup becomes a secondary support surface instead of a routine prerequisite. | recovery-critical caches; explicit ambiguity handling |
+| `SearchMessages` | Search one dialog with local hit context. | `reshape` | `reshape` | pending | Preserve the search capability, but align its continuation and entry shape more closely with read workflows. | read-only scope; stateful runtime reality |
+| `discovery-first flow` | Often `ListDialogs` before the actual read or search. | `keep` | `reshape` | pending | The medium path reduces helper-step burden by letting main workflows attempt the job first and fall back to discovery when needed. | stateful runtime reality; recovery-critical caches |
+| `disambiguation retry flow` | Retry with exact dialog, topic, sender, or user after candidate output. | `reshape` | `reshape` | pending | The safe behavior is worth keeping, but the retry instructions can be more consistent across tools and later in the workflow. | explicit ambiguity handling; recovery-critical caches |
+| `topic-selection flow` | Forum reads commonly require `ListTopics` before `ListMessages(topic=...)`. | `keep` | `reshape` | pending | Common topic reads should become more direct while still preserving deleted/inaccessible-topic fidelity. | recovery-critical caches; explicit ambiguity handling |
+| `pagination flow` | Reading and search use different continuation mechanics. | `reshape` | `reshape` | pending | This is one of the clearest burden reducers: align navigation language so read and search feel capability-oriented instead of tool-specific. | stateful runtime reality; read-only scope |
+| `text-first result parsing` | Continuation state and recovery cues are embedded in readable text. | `reshape` | `reshape` | pending | Preserve readable text, but make high-signal cues more explicit and consistently placed, potentially with light structure. | privacy-safe telemetry; read-only scope |
+| `generic server-boundary failure behavior` | Escaped failures collapse to `Tool <name> failed`. | `reshape` | `reshape` | pending | Remove needless loss of context while preserving safe failure behavior and not leaking sensitive internals. | privacy-safe telemetry; stateful runtime reality |
+| `dialog` | Natural-name chat selector used by several tools. | `keep` | `keep` | pending | The natural-name selector is core to the product value and should survive even if workflow entry points change. | recovery-critical caches; explicit ambiguity handling |
+| `topic` | Natural-name thread selector for forum reads. | `keep` | `keep` | pending | Keep the explicit topic concept because it carries important thread-state and deleted-topic semantics, even if selection becomes more embedded in read flows. | recovery-critical caches; explicit ambiguity handling |
+| `sender` | Optional read filter within `ListMessages`. | `reshape` | `reshape` | pending | Clarify filter semantics and retry guidance without losing sender-scoped reads. | explicit ambiguity handling |
+| `cursor` | Backward or replay-style continuation token for reads. | `reshape` | `rename` | pending | Normalize navigation so the primary continuation cue is shared across workflow-shaped read and search jobs. | stateful runtime reality |
+| `offset` | Search continuation token. | `rename` | `rename` | pending | Move search away from a separate continuation vocabulary without deleting paged search capability. | stateful runtime reality |
+| `from_beginning` | Oldest-first read mode for replay-style reading. | `reshape` | `reshape` | pending | Keep the capability, but teach it as part of a coherent read mode instead of an extra pagination quirk. | read-only scope; stateful runtime reality |
+| `exclude_archived` | Scope control for archived dialogs. | `keep` | `reshape` | pending | Preserve archived-scope control, but possibly fold it into a broader conversation-selection story instead of exposing it only as discovery jargon. | stateful runtime reality |
+| `ignore_pinned` | Discovery ordering/scope control for pinned dialogs. | `keep` | `demote` | pending | Keep available, but treat it as secondary because it matters less than the main workflow burden. | stateful runtime reality |
+| `unread` | Filter for unread-only message reads. | `keep` | `keep` | pending | Preserve unread filtering because tests show topic-scoped unread behavior is subtle and already valuable. | read-only scope; recovery-critical caches |
