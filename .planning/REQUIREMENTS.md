@@ -20,12 +20,12 @@
 ### Recommendation
 
 - [x] **RECO-01**: Maintainer can review one Pareto-style recommendation that targets the highest likely model-usage impact with the smallest safe change set.
-- [ ] **RECO-02**: Maintainer can review a recommended next implementation path, including sequencing, validation concerns, and open questions that should be resolved before coding.
+- [x] **RECO-02**: Maintainer can review a recommended next implementation path, including sequencing, validation concerns, and open questions that should be resolved before coding.
 
 ### Research Quality
 
 - [x] **EVID-01**: The milestone distinguishes authoritative guidance from supporting secondary/community guidance and records which sources materially shaped the conclusions.
-- [ ] **EVID-02**: The final deliverable is actionable for a future implementation milestone and does not stop at abstract best-practice summaries.
+- [x] **EVID-02**: The final deliverable is actionable for a future implementation milestone and does not stop at abstract best-practice summaries.
 
 ## v2 Requirements
 
@@ -53,9 +53,9 @@
 | OPTION-01 | 12 | Complete |
 | OPTION-02 | 12 | Complete |
 | RECO-01 | 12 | Complete |
-| RECO-02 | 13 | Pending |
+| RECO-02 | 13 | Complete |
 | EVID-01 | 10 | Complete |
-| EVID-02 | 13 | Pending |
+| EVID-02 | 13 | Complete |
 
 **Coverage:**
 - v1.2 requirements: 9 total

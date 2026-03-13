@@ -76,7 +76,7 @@ Full details: `.planning/milestones/v1.1-ROADMAP.md`
 | 10. Evidence Base & Audit Frame | v1.2 | 3/3 | Complete    | 2026-03-13 |
 | 11. Current Surface Comparative Audit | v1.2 | 3/3 | Complete    | 2026-03-13 |
 | 12. Redesign Options & Pareto Recommendation | v1.2 | 3/3 | Complete    | 2026-03-13 |
-| 13. Implementation Sequencing & Decision Memo | v1.2 | 0/TBD | Not started | - |
+| 13. Implementation Sequencing & Decision Memo | v1.2 | 1/3 | In Progress|  |
 
 ## Phase Details
 
