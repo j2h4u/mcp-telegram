@@ -1119,6 +1119,7 @@ async def list_topics(
                 topic_cache=topic_cache,
                 requested_topic=None,
                 retry_tool="ListTopics",
+                load_topics=_load_dialog_topics,
             )
             if isinstance(topic_capability, capabilities.ForumTopicFailure):
                 return [TextContent(type="text", text=topic_capability.text)]
@@ -1301,6 +1302,7 @@ async def list_messages(
                     topic_cache=topic_cache,
                     requested_topic=args.topic,
                     retry_tool="ListMessages",
+                    load_topics=_load_dialog_topics,
                 )
                 if isinstance(topic_capability, capabilities.ForumTopicFailure):
                     return [TextContent(type="text", text=topic_capability.text)]
@@ -1342,6 +1344,8 @@ async def list_messages(
                         allow_headerless_messages=(
                             bool(topic_metadata["is_general"]) or not args.unread
                         ),
+                        fetch_topic_messages_fn=_fetch_topic_messages,
+                        refresh_topic_by_id_fn=_refresh_topic_by_id,
                     )
                     if topic_metadata is not None and bool(topic_metadata["is_deleted"]):
                         topic_name = resolved_topic_name or args.topic or "Topic"
@@ -1488,6 +1492,7 @@ async def list_messages(
                             topic_cache=topic_cache,
                             requested_topic=None,
                             retry_tool="ListMessages",
+                            load_topics=_load_dialog_topics,
                         )
                         if isinstance(topic_capability, capabilities.ForumTopicFailure):
                             topic_name_getter = None

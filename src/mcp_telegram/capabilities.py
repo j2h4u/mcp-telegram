@@ -95,6 +95,9 @@ DialogResolveResult = Resolved | Candidates | NotFound
 DialogTargetResult = ResolvedDialogTarget | DialogTargetFailure
 ForumTopicCapabilityResult = TopicCatalog | ResolvedForumTopic | ForumTopicFailure
 DialogResolver = Callable[[EntityCache, str], Awaitable[DialogResolveResult]]
+TopicLoader = Callable[..., Awaitable[TopicCatalog]]
+TopicFetcher = Callable[..., Awaitable[list[object]]]
+TopicRefresher = Callable[..., Awaitable[TopicMetadata | None]]
 
 
 def build_get_forum_topics_request(
@@ -718,10 +721,12 @@ async def load_forum_topic_capability(
     requested_topic: str | None,
     retry_tool: str,
     ttl_seconds: int = TOPIC_METADATA_TTL_SECONDS,
+    load_topics: TopicLoader | None = None,
 ) -> ForumTopicCapabilityResult:
     """Load one dialog's topic capability result for listing or topic-scoped reads."""
+    active_loader = load_topics if load_topics is not None else load_dialog_topics
     try:
-        topic_catalog = await load_dialog_topics(
+        topic_catalog = await active_loader(
             client,
             entity=entity,
             dialog_id=dialog_id,
@@ -850,18 +855,22 @@ async def fetch_messages_for_topic(
     topic_metadata: TopicMetadata,
     topic_cache: TopicMetadataCache,
     allow_headerless_messages: bool,
+    fetch_topic_messages_fn: TopicFetcher | None = None,
+    refresh_topic_by_id_fn: TopicRefresher | None = None,
 ) -> tuple[list[object] | None, TopicMetadata, dict[str, object]]:
     """Fetch one topic page with one bounded by-ID refresh and retry on stale anchors."""
     active_iter_kwargs = dict(iter_kwargs)
     active_topic_metadata = topic_metadata
     original_exc: RPCError | None = None
     retry_invalid_exc: RPCError | None = None
+    active_fetch_topic_messages = fetch_topic_messages_fn if fetch_topic_messages_fn is not None else fetch_topic_messages
+    active_refresh_topic_by_id = refresh_topic_by_id_fn if refresh_topic_by_id_fn is not None else refresh_topic_by_id
 
     async def scan_dialog_history_for_topic() -> tuple[list[object], dict[str, object]]:
         """Fallback to dialog-wide history scanning when thread fetch rejects a valid topic anchor."""
         history_iter_kwargs = dict(active_iter_kwargs)
         history_iter_kwargs.pop("reply_to", None)
-        messages = await fetch_topic_messages(
+        messages = await active_fetch_topic_messages(
             client,
             iter_kwargs=history_iter_kwargs,
             topic_metadata=active_topic_metadata,
@@ -870,7 +879,7 @@ async def fetch_messages_for_topic(
         return messages, history_iter_kwargs
 
     try:
-        messages = await fetch_topic_messages(
+        messages = await active_fetch_topic_messages(
             client,
             iter_kwargs=active_iter_kwargs,
             topic_metadata=active_topic_metadata,
@@ -882,7 +891,7 @@ async def fetch_messages_for_topic(
             raise
         original_exc = exc
 
-    refreshed_topic = await refresh_topic_by_id(
+    refreshed_topic = await active_refresh_topic_by_id(
         client,
         entity=entity_id,
         dialog_id=entity_id,
@@ -915,7 +924,7 @@ async def fetch_messages_for_topic(
 
     active_iter_kwargs["reply_to"] = refreshed_reply_to
     try:
-        messages = await fetch_topic_messages(
+        messages = await active_fetch_topic_messages(
             client,
             iter_kwargs=active_iter_kwargs,
             topic_metadata=active_topic_metadata,
