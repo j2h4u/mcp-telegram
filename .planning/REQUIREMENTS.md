@@ -47,20 +47,20 @@
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| AUDIT-01 | Pending | Pending |
-| AUDIT-02 | Pending | Pending |
-| AUDIT-03 | Pending | Pending |
-| OPTION-01 | Pending | Pending |
-| OPTION-02 | Pending | Pending |
-| RECO-01 | Pending | Pending |
-| RECO-02 | Pending | Pending |
-| EVID-01 | Pending | Pending |
-| EVID-02 | Pending | Pending |
+| AUDIT-01 | 11 | Pending |
+| AUDIT-02 | 11 | Pending |
+| AUDIT-03 | 11 | Pending |
+| OPTION-01 | 12 | Pending |
+| OPTION-02 | 12 | Pending |
+| RECO-01 | 12 | Pending |
+| RECO-02 | 13 | Pending |
+| EVID-01 | 10 | Pending |
+| EVID-02 | 13 | Pending |
 
 **Coverage:**
 - v1.2 requirements: 9 total
-- Mapped to phases: 0
-- Unmapped: 9 ⚠️
+- Mapped to phases: 9
+- Unmapped: 0 ✓
 
 ---
 *Requirements defined: 2026-03-13*
