@@ -2,19 +2,19 @@
 gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: Medium Implementation
-current_phase: 15
-current_phase_name: Capability Seams
-current_plan: 2
-status: in_progress
-stopped_at: Completed 15-02-PLAN.md
-last_updated: "2026-03-13T23:28:20.552Z"
-last_activity: 2026-03-14 - Completed Plan 15-02 read/topic adapter thinning and runtime proof
+current_phase: 16
+current_phase_name: Unified Navigation Contract
+current_plan: 0
+status: ready_to_plan
+stopped_at: Completed 15-03-PLAN.md
+last_updated: "2026-03-13T23:37:33.250Z"
+last_activity: 2026-03-13 - Completed Phase 15 Capability Seams
 progress:
   total_phases: 5
-  completed_phases: 1
-  total_plans: 17
-  completed_plans: 16
-  percent: 94
+  completed_phases: 2
+  total_plans: 5
+  completed_plans: 5
+  percent: 100
 ---
 
 # Project State
@@ -24,32 +24,32 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-14)
 
 **Core value:** LLM can work with Telegram using natural names - zero cold-start friction, no ID lookup boilerplate before every real task
-**Current focus:** Phase 15 `Capability Seams` for milestone `v1.3 Medium Implementation`
+**Current focus:** Phase 16 `Unified Navigation Contract` for milestone `v1.3 Medium Implementation`
 
 ## Current Position
 
-Current Phase: 15
-Current Phase Name: Capability Seams
+Current Phase: 16
+Current Phase Name: Unified Navigation Contract
 Total Phases: 18
-Current Plan: 2
-Total Plans in Phase: 3
-Status: Ready to execute
-Last Activity: 2026-03-14
-Last Activity Description: Completed Plan 15-02 read/topic adapter thinning and runtime proof
-Progress: 94%
+Current Plan: 0
+Total Plans in Phase: TBD
+Status: Ready to plan
+Last Activity: 2026-03-13
+Last Activity Description: Completed Plan 15-03 search seam migration, CAP-01 proof, and runtime verification
+Progress: 100%
 
-Phase: 15 of 18 (`Capability Seams`)
-Plan: 2 of 3 in current phase
-Status: Ready to execute
-Last activity: 2026-03-14 - Completed Plan 15-02 read/topic adapter thinning and runtime proof
-Progress: [█████████░] 94%
+Phase: 16 of 18 (`Unified Navigation Contract`)
+Plan: 0 planned in current phase
+Status: Ready to plan
+Last activity: 2026-03-13 - Completed Phase 15 Capability Seams with final search seam and live runtime proof
+Progress: [██████████] 100%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 14
-- Average duration: 3.9 min
-- Total execution time: 55 min
+- Total plans completed: 15
+- Average duration: 3.8 min
+- Total execution time: 57 min
 
 **By Milestone:**
 
@@ -59,6 +59,7 @@ Progress: [█████████░] 94%
 | Phase 14 | 2 | 14 min | 7.0 min |
 | Phase 15 P01 | 12m39s | 3 tasks | 4 files |
 | Phase 15 P02 | 2m | 3 tasks | 4 files |
+| Phase 15 P03 | 2m28s | 3 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -78,6 +79,9 @@ Progress: [█████████░] 94%
 - [Phase 15]: Keep ListTopics and ListMessages responsible only for MCP args, telemetry, and final text assembly.
 - [Phase 15]: Move history-read cursor handling, sender resolution, topic recovery, and enrichment hooks into capabilities.py so SearchMessages can reuse them later.
 - [Phase 15]: Prove adapter thinness explicitly with tests that patch the capability execution entrypoints instead of only asserting public behavior.
+- [Phase 15]: Keep SearchMessages output shaping local while moving shared resolution, enrichment, and offset handling into capabilities.py.
+- [Phase 15]: Prove CAP-01 with capability-level and adapter-level tests instead of brittle tool-body heuristics.
+- [Phase 15]: Require rebuilt-container verification to confirm the live image exposes the final shared search seam.
 
 ### Pending Todos
 
@@ -87,10 +91,10 @@ Progress: [█████████░] 94%
 
 ### Blockers/Concerns
 
-- No blockers. Phase 15 is in progress with Plans 15-02 and 15-03 remaining.
+- No blockers. Phase 15 is complete and Phase 16 planning can begin.
 
 ## Session Continuity
 
-Last session: 2026-03-13T23:28:20.550Z
-Stopped at: Completed 15-02-PLAN.md
+Last session: 2026-03-13T23:37:33.246Z
+Stopped at: Completed 15-03-PLAN.md
 Resume file: None

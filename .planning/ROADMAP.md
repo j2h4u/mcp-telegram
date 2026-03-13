@@ -21,7 +21,7 @@ material to landing the Medium path safely.
 - Decimal phases (2.1, 2.2): Urgent insertions between integers
 
 - [x] **Phase 14: Boundary Recovery** - Preserve actionable server-boundary failure detail for escaped tool errors. (completed 2026-03-13)
-- [ ] **Phase 15: Capability Seams** - Introduce capability-oriented internal seams behind the public tool adapters.
+- [x] **Phase 15: Capability Seams** - Introduce capability-oriented internal seams behind the public tool adapters. (completed 2026-03-13)
 - [ ] **Phase 16: Unified Navigation Contract** - Replace split read/search continuation concepts with one coherent contract.
 - [ ] **Phase 17: Direct Read/Search Workflows** - Reduce helper-first choreography while preserving topic and hit-local fidelity.
 - [ ] **Phase 18: Surface Posture & Rollout Proof** - Classify primary vs secondary surfaces and prove the new contract in tests, reflection, and the restarted runtime.
@@ -88,7 +88,7 @@ Phases execute in numeric order: 14 -> 15 -> 16 -> 17 -> 18
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 14. Boundary Recovery | 2/2 | Complete   | 2026-03-13 |
-| 15. Capability Seams | 2/3 | In Progress|  |
+| 15. Capability Seams | 3/3 | Complete   | 2026-03-13 |
 | 16. Unified Navigation Contract | 0/TBD | Not started | - |
 | 17. Direct Read/Search Workflows | 0/TBD | Not started | - |
 | 18. Surface Posture & Rollout Proof | 0/TBD | Not started | - |
