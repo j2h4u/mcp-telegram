@@ -58,7 +58,7 @@ Full details: `.planning/milestones/v1.1-ROADMAP.md`
 - [x] **Phase 10: Evidence Base & Audit Frame** - Establish the source hierarchy, audit rubric, and brownfield constraints for the current MCP surface. (completed 2026-03-13)
 - [x] **Phase 11: Current Surface Comparative Audit** - Produce a grounded audit of the current tools and workflows against named best-practice sources and code reality. (completed 2026-03-13)
 - [x] **Phase 12: Redesign Options & Pareto Recommendation** - Compare minimal, medium, and maximal redesign paths and select the highest-leverage safe direction. (completed 2026-03-13)
-- [ ] **Phase 13: Implementation Sequencing & Decision Memo** - Turn the research into sequencing, validation, and open-question guidance for the future implementation milestone.
+- [x] **Phase 13: Implementation Sequencing & Decision Memo** - Turn the research into sequencing, validation, and open-question guidance for the future implementation milestone. (completed 2026-03-13)
 
 ## Progress
 
@@ -76,7 +76,7 @@ Full details: `.planning/milestones/v1.1-ROADMAP.md`
 | 10. Evidence Base & Audit Frame | v1.2 | 3/3 | Complete    | 2026-03-13 |
 | 11. Current Surface Comparative Audit | v1.2 | 3/3 | Complete    | 2026-03-13 |
 | 12. Redesign Options & Pareto Recommendation | v1.2 | 3/3 | Complete    | 2026-03-13 |
-| 13. Implementation Sequencing & Decision Memo | v1.2 | 2/3 | In Progress|  |
+| 13. Implementation Sequencing & Decision Memo | v1.2 | 3/3 | Complete   | 2026-03-13 |
 
 ## Phase Details
 
