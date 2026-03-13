@@ -42,3 +42,25 @@ evaluation method from scratch.
   scores.
 - The audit should describe redesign pressure without assuming the current read-only, privacy-safe,
   stateful baseline is disposable.
+
+## Phase 11 Audit Instructions
+
+Phase 11 must audit both `mcp-telegram` units of analysis:
+
+- each current public tool
+- the main user workflows for discovery, reading, search, topic handling, and recovery/error flows
+
+Use the current reflected seven-tool surface as the tool-level checklist:
+`GetMyAccount`, `GetUsageStats`, `GetUserInfo`, `ListDialogs`, `ListMessages`, `ListTopics`, and
+`SearchMessages`.
+
+For every major finding:
+
+- pair named evidence from `10-EVIDENCE-LOG.md` with the concrete `mcp-telegram` behavior being
+  judged
+- cite the brownfield baseline or direct code/test anchors that show where the behavior appears
+- describe the model burden or benefit in the actual workflow, not only in handler-local terms
+
+Do not write findings that rely only on generic best-practice prose. A valid finding ties named
+evidence to a specific tool contract, workflow step, recovery path, pagination pattern, or output
+convention present in the shipped surface.
