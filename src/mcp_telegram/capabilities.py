@@ -17,7 +17,14 @@ from .cache import (
     ReactionMetadataCache,
     TopicMetadataCache,
 )
-from .pagination import decode_cursor, encode_cursor
+from .pagination import (
+    decode_cursor,
+    decode_history_navigation,
+    decode_search_navigation,
+    encode_cursor,
+    encode_history_navigation,
+    encode_search_navigation,
+)
 from .resolver import Candidates, NotFound, Resolved, resolve
 
 FORUM_TOPICS_PAGE_SIZE = 100
@@ -115,6 +122,18 @@ class MessageReadFailure:
 
 
 @dataclass(frozen=True)
+class NavigationFailure:
+    kind: Literal["invalid_navigation"]
+    text: str
+
+
+@dataclass(frozen=True)
+class CapabilityNavigation:
+    kind: Literal["history", "search"]
+    token: str
+
+
+@dataclass(frozen=True)
 class ListTopicsExecution:
     resolve_prefix: str
     dialog_name: str
@@ -132,6 +151,7 @@ class HistoryReadExecution:
     reaction_names_map: dict[int, dict[str, list[str]]]
     topic_name_getter: Callable[[object], str | None] | None
     next_cursor: str | None
+    navigation: CapabilityNavigation | None = None
 
 
 @dataclass(frozen=True)
@@ -143,6 +163,7 @@ class SearchExecution:
     context_messages_by_id: dict[int, object]
     reaction_names_map: dict[int, dict[str, list[str]]]
     next_offset: int | None
+    navigation: CapabilityNavigation | None = None
 
 
 DialogResolveResult = Resolved | Candidates | NotFound
@@ -154,8 +175,9 @@ HistoryReadCapabilityResult = (
     | DialogTargetFailure
     | ForumTopicFailure
     | MessageReadFailure
+    | NavigationFailure
 )
-SearchCapabilityResult = SearchExecution | DialogTargetFailure
+SearchCapabilityResult = SearchExecution | DialogTargetFailure | NavigationFailure
 DialogResolver = Callable[[EntityCache, str], Awaitable[DialogResolveResult]]
 TopicLoader = Callable[..., Awaitable[TopicCatalog]]
 TopicFetcher = Callable[..., Awaitable[list[object]]]
@@ -305,6 +327,14 @@ def invalid_cursor_text(detail: str, *, retry_tool: str) -> str:
     return action_text(
         f"Cursor is invalid: {detail}",
         f"Retry {retry_tool} without cursor to start from the first page, or reuse the exact next_cursor value from the previous {retry_tool} response.",
+    )
+
+
+def invalid_navigation_text(detail: str, *, retry_tool: str) -> str:
+    """Return an action-oriented response for malformed shared navigation tokens."""
+    return action_text(
+        f"Navigation token is invalid: {detail}",
+        f"Retry {retry_tool} without navigation to start from the first page, or reuse the exact next_navigation value from the previous {retry_tool} response.",
     )
 
 
@@ -865,17 +895,35 @@ def _build_history_iter_kwargs(
     entity_id: int,
     limit: int,
     cursor: str | None,
+    navigation_token: str | None,
+    topic_id: int | None,
     from_beginning: bool,
     retry_tool: str,
-) -> dict[str, object] | MessageReadFailure:
+) -> dict[str, object] | MessageReadFailure | NavigationFailure:
     iter_kwargs: dict[str, object] = {
         "entity": entity_id,
         "limit": limit,
         "reverse": from_beginning,
     }
 
+    shared_cursor_id: int | None = None
+    if navigation_token is not None:
+        try:
+            shared_cursor_id = decode_history_navigation(
+                navigation_token,
+                expected_dialog_id=entity_id,
+                expected_topic_id=topic_id,
+            )
+        except ValueError as exc:
+            return NavigationFailure(
+                kind="invalid_navigation",
+                text=invalid_navigation_text(str(exc), retry_tool=retry_tool),
+            )
+
     if from_beginning:
-        if cursor:
+        if shared_cursor_id is not None:
+            iter_kwargs["min_id"] = shared_cursor_id
+        elif cursor:
             try:
                 iter_kwargs["min_id"] = decode_cursor(cursor, entity_id)
             except Exception as exc:
@@ -885,6 +933,10 @@ def _build_history_iter_kwargs(
                 )
         else:
             iter_kwargs["min_id"] = 1
+        return iter_kwargs
+
+    if shared_cursor_id is not None:
+        iter_kwargs["max_id"] = shared_cursor_id
         return iter_kwargs
 
     if cursor:
@@ -1186,6 +1238,7 @@ async def execute_history_read_capability(
     load_topics: TopicLoader | None = None,
     fetch_topic_messages_fn: TopicFetcher | None = None,
     refresh_topic_by_id_fn: TopicRefresher | None = None,
+    navigation_token: str | None = None,
 ) -> HistoryReadCapabilityResult:
     dialog_target = await resolve_dialog_target(
         cache=cache,
@@ -1195,16 +1248,6 @@ async def execute_history_read_capability(
     )
     if isinstance(dialog_target, DialogTargetFailure):
         return dialog_target
-
-    iter_kwargs = _build_history_iter_kwargs(
-        entity_id=dialog_target.entity_id,
-        limit=limit,
-        cursor=cursor,
-        from_beginning=from_beginning,
-        retry_tool=retry_tool,
-    )
-    if isinstance(iter_kwargs, MessageReadFailure):
-        return iter_kwargs
 
     sender_entity_id = _resolve_sender_entity(
         cache=cache,
@@ -1218,6 +1261,7 @@ async def execute_history_read_capability(
     topic_cache: TopicMetadataCache | None = None
     topic_catalog: TopicCatalog | None = None
     topic_name: str | None = None
+    topic_reply_to_message_id: int | None = None
     filter_sender_after_fetch = False
     entity_id = dialog_target.entity_id
 
@@ -1239,9 +1283,26 @@ async def execute_history_read_capability(
             topic_catalog = topic_capability.topic_catalog
             topic_metadata = topic_capability.metadata
             topic_name = topic_capability.display_name
-            if topic_capability.reply_to_message_id is not None:
-                iter_kwargs["reply_to"] = topic_capability.reply_to_message_id
-                filter_sender_after_fetch = isinstance(sender_entity_id, int)
+            topic_reply_to_message_id = topic_capability.reply_to_message_id
+            filter_sender_after_fetch = (
+                topic_reply_to_message_id is not None
+                and isinstance(sender_entity_id, int)
+            )
+
+    iter_kwargs = _build_history_iter_kwargs(
+        entity_id=dialog_target.entity_id,
+        limit=limit,
+        cursor=cursor,
+        navigation_token=navigation_token,
+        topic_id=int(topic_metadata["topic_id"]) if topic_metadata is not None else None,
+        from_beginning=from_beginning,
+        retry_tool=retry_tool,
+    )
+    if isinstance(iter_kwargs, (MessageReadFailure, NavigationFailure)):
+        return iter_kwargs
+
+    if topic_metadata is not None and topic_reply_to_message_id is not None:
+        iter_kwargs["reply_to"] = topic_reply_to_message_id
 
     if isinstance(sender_entity_id, int) and not filter_sender_after_fetch:
         iter_kwargs["from_user"] = sender_entity_id
@@ -1350,10 +1411,19 @@ async def execute_history_read_capability(
 
     cursor_source_messages = raw_messages if filter_sender_after_fetch else messages
     next_cursor: str | None = None
+    navigation: CapabilityNavigation | None = None
     if len(cursor_source_messages) == limit and cursor_source_messages:
         last_message_id = getattr(cursor_source_messages[-1], "id", None)
         if isinstance(last_message_id, int):
             next_cursor = encode_cursor(last_message_id, entity_id)
+            navigation = CapabilityNavigation(
+                kind="history",
+                token=encode_history_navigation(
+                    last_message_id,
+                    entity_id,
+                    topic_id=int(topic_metadata["topic_id"]) if topic_metadata is not None else None,
+                ),
+            )
 
     return HistoryReadExecution(
         entity_id=entity_id,
@@ -1365,6 +1435,7 @@ async def execute_history_read_capability(
         reaction_names_map=reaction_names_map,
         topic_name_getter=topic_name_getter,
         next_cursor=next_cursor,
+        navigation=navigation,
     )
 
 
@@ -1381,6 +1452,7 @@ async def execute_search_messages_capability(
     get_sender_type: SenderTypeGetter,
     reaction_names_threshold: int,
     context_radius: int = 3,
+    navigation_token: str | None = None,
 ) -> SearchCapabilityResult:
     dialog_target = await resolve_dialog_target(
         cache=cache,
@@ -1393,6 +1465,18 @@ async def execute_search_messages_capability(
 
     entity_id = dialog_target.entity_id
     page_offset = 0 if offset is None else offset
+    if navigation_token is not None:
+        try:
+            page_offset = decode_search_navigation(
+                navigation_token,
+                expected_dialog_id=entity_id,
+                expected_query=query,
+            )
+        except ValueError as exc:
+            return NavigationFailure(
+                kind="invalid_navigation",
+                text=invalid_navigation_text(str(exc), retry_tool=retry_tool),
+            )
     hits = [
         message
         async for message in client.iter_messages(
@@ -1429,8 +1513,13 @@ async def execute_search_messages_capability(
     )
 
     next_offset = None
+    navigation = None
     if len(hits) == limit:
         next_offset = page_offset + limit
+        navigation = CapabilityNavigation(
+            kind="search",
+            token=encode_search_navigation(next_offset, entity_id, query),
+        )
 
     return SearchExecution(
         entity_id=entity_id,
@@ -1440,6 +1529,7 @@ async def execute_search_messages_capability(
         context_messages_by_id=context_messages_by_id,
         reaction_names_map=reaction_names_map,
         next_offset=next_offset,
+        navigation=navigation,
     )
 
 
