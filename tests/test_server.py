@@ -149,3 +149,57 @@ def test_posture_covers_all_registered_tools() -> None:
     for name in server.mapping:
         assert name in TOOL_POSTURE, f"{name} not in TOOL_POSTURE"
 
+
+def test_posture_get_user_info_classified_as_primary() -> None:
+    """GetUserInfo must be classified as primary, not helper."""
+    from mcp_telegram.tools import TOOL_POSTURE
+    assert TOOL_POSTURE["GetUserInfo"] == "primary", "GetUserInfo should be a primary user-task tool"
+    tool = server.mapping["GetUserInfo"]
+    assert tool.description.startswith("[primary]"), "GetUserInfo missing [primary] prefix"
+
+
+def test_primary_tools_have_core_read_search_schema() -> None:
+    """Primary read and search tools expose the direct-access schema patterns from Phase 17."""
+    # ListMessages: must have exact_dialog_id for direct reads
+    list_messages = server.mapping["ListMessages"]
+    lm_props = list_messages.inputSchema["properties"]
+    assert "exact_dialog_id" in lm_props, "ListMessages missing exact_dialog_id for direct dialog access"
+    assert "exact_topic_id" in lm_props, "ListMessages missing exact_topic_id for direct topic access"
+    assert "navigation" in lm_props, "ListMessages missing shared navigation field"
+
+    # SearchMessages: must keep dialog + query shape for direct scoping
+    search_messages = server.mapping["SearchMessages"]
+    sm_props = search_messages.inputSchema["properties"]
+    assert "dialog" in sm_props, "SearchMessages missing dialog for exact numeric ID pattern"
+    assert "query" in sm_props, "SearchMessages missing query"
+    assert "navigation" in sm_props, "SearchMessages missing shared navigation field"
+
+    # GetUserInfo: must have user field for direct user lookup
+    get_user_info = server.mapping["GetUserInfo"]
+    gui_props = get_user_info.inputSchema["properties"]
+    assert "user" in gui_props, "GetUserInfo missing user field for direct lookup"
+
+
+def test_helper_tools_remain_available_not_hidden() -> None:
+    """Secondary/helper tools remain accessible in the tool surface; they are not removed or marked unavailable."""
+    from mcp_telegram.tools import TOOL_POSTURE
+
+    helper_tools = [
+        ("ListDialogs", "secondary/helper"),
+        ("ListTopics", "secondary/helper"),
+        ("GetMyAccount", "secondary/helper"),
+        ("GetUsageStats", "secondary/helper"),
+    ]
+
+    for tool_name, expected_posture in helper_tools:
+        # Must exist in TOOL_POSTURE mapping
+        assert tool_name in TOOL_POSTURE, f"{tool_name} missing from TOOL_POSTURE"
+        assert TOOL_POSTURE[tool_name] == expected_posture, f"{tool_name} has wrong posture classification"
+
+        # Must be registered in server mapping (not hidden/unavailable)
+        assert tool_name in server.mapping, f"{tool_name} not registered in server"
+        tool = server.mapping[tool_name]
+
+        # Must be marked as secondary in description
+        assert tool.description.startswith("[secondary/helper]"), f"{tool_name} description missing [secondary/helper] prefix"
+

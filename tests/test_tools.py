@@ -3109,3 +3109,110 @@ def test_tool_posture_covers_all_tool_args_subclasses() -> None:
         f"Mismatch: subclasses={subclasses}, TOOL_POSTURE keys={set(TOOL_POSTURE.keys())}"
     )
 
+
+def test_primary_tools_require_no_helper_first_choreography() -> None:
+    """ListMessages and SearchMessages support direct access without requiring ListDialogs first."""
+    # ListMessages can be called with exact_dialog_id alone (Phase 17 direct read)
+    list_messages_schema = tools_module.tool_description(ListMessages).inputSchema
+    properties = list_messages_schema["properties"]
+
+    # Both fuzzy and exact selectors present
+    assert "dialog" in properties, "ListMessages must support fuzzy dialog selection"
+    assert "exact_dialog_id" in properties, "ListMessages must support exact direct access"
+
+    # Exact selectors are optional (not in required list), allowing direct access
+    required = list_messages_schema.get("required", [])
+    assert "exact_dialog_id" not in required, "exact_dialog_id should be optional for direct reads"
+    assert "dialog" not in required, "dialog should be optional for direct reads"
+
+    # SearchMessages keeps its dialog field but supports numeric form (Phase 17 direct search)
+    search_messages_schema = tools_module.tool_description(SearchMessages).inputSchema
+    search_properties = search_messages_schema["properties"]
+    assert "dialog" in search_properties, "SearchMessages must support direct numeric dialog form"
+    assert "query" in search_properties, "SearchMessages must have query field"
+
+
+async def test_list_messages_direct_dialog_read_no_helper_required(tmp_db_path, mock_client, monkeypatch, make_mock_message) -> None:
+    """ListMessages direct read via exact_dialog_id succeeds without calling ListDialogs."""
+    from mcp_telegram.tools import list_messages
+    from mcp_telegram.cache import EntityCache
+
+    cache = EntityCache(tmp_db_path)
+    cache.upsert(701, "group", "Backend", None)
+
+    message = make_mock_message(id=10, text="Direct backend read")
+    capability = AsyncMock(
+        return_value=HistoryReadExecution(
+            entity_id=701,
+            resolve_prefix="",
+            topic_name=None,
+            messages=(message,),
+            fetched_messages=(message,),
+            reply_map={},
+            reaction_names_map={},
+            topic_name_getter=None,
+            next_cursor=None,
+            navigation=None,
+        )
+    )
+
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr("mcp_telegram.tools._execute_history_read_capability", capability)
+
+    # Call ListMessages with ONLY exact_dialog_id, no fuzzy dialog name
+    result = await list_messages(ListMessages(exact_dialog_id=701))
+
+    assert len(result) == 1
+    assert "Direct backend read" in result[0].text
+    # Verify the capability was called with exact_dialog_id, not dialog_query
+    assert capability.await_args.kwargs["exact_dialog_id"] == 701
+
+
+async def test_search_messages_numeric_dialog_direct_search_no_helper_required(tmp_db_path, mock_client, monkeypatch) -> None:
+    """SearchMessages direct search via numeric dialog ID succeeds without requiring ListDialogs first."""
+    from mcp_telegram.tools import SearchMessages, search_messages
+    from mcp_telegram.cache import EntityCache
+
+    cache = EntityCache(tmp_db_path)
+    cache.upsert(701, "group", "Backend", None)
+
+    capability = AsyncMock(
+        return_value=SearchExecution(
+            entity_id=701,
+            dialog_name="Backend",
+            resolve_prefix="",
+            hits=(),
+            context_messages_by_id={},
+            reaction_names_map={},
+            next_offset=None,
+            navigation=None,
+            rendered_text="",
+        )
+    )
+
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr("mcp_telegram.tools._execute_search_messages_capability", capability)
+
+    # Call SearchMessages with numeric dialog ID (no fuzzy lookup required)
+    result = await search_messages(SearchMessages(dialog="701", query="test"))
+
+    assert len(result) == 1
+    # Verify numeric dialog was treated as exact path
+    assert capability.await_args.kwargs["exact_dialog_id"] == 701
+
+
+def test_get_user_info_primary_tool_direct_user_lookup() -> None:
+    """GetUserInfo is a primary tool supporting direct user lookup by name/ID."""
+    from mcp_telegram.tools import TOOL_POSTURE
+
+    # Must be classified as primary
+    assert TOOL_POSTURE["GetUserInfo"] == "primary", "GetUserInfo should be primary for user-task workflows"
+
+    # Schema must expose user field for direct lookup
+    get_user_info_schema = tools_module.tool_description(tools_module.GetUserInfo).inputSchema
+    properties = get_user_info_schema["properties"]
+    assert "user" in properties, "GetUserInfo must have user field"
+    assert properties["user"]["type"] == "string", "user field should be string type"
+
