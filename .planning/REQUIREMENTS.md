@@ -30,8 +30,8 @@
 
 ### Rollout Safety
 
-- [ ] **ROLL-01**: Maintainer can prove contract-affecting changes through brownfield tests, reflected local schemas, and restarted-runtime verification against the live container.
-- [ ] **ROLL-02**: Maintainer can prove telemetry remains privacy-safe after the surface changes.
+- [x] **ROLL-01**: Maintainer can prove contract-affecting changes through brownfield tests, reflected local schemas, and restarted-runtime verification against the live container.
+- [x] **ROLL-02**: Maintainer can prove telemetry remains privacy-safe after the surface changes.
 
 ## v2 Requirements
 
@@ -61,8 +61,8 @@
 | FLOW-01 | Phase 17 | Complete |
 | FLOW-02 | Phase 17 | Complete |
 | SURF-01 | Phase 18 | Complete |
-| ROLL-01 | Phase 18 | Pending |
-| ROLL-02 | Phase 18 | Pending |
+| ROLL-01 | Phase 18 | Complete |
+| ROLL-02 | Phase 18 | Complete |
 
 **Coverage:**
 - v1.3 requirements: 9 total

@@ -24,7 +24,7 @@ material to landing the Medium path safely.
 - [x] **Phase 15: Capability Seams** - Introduce capability-oriented internal seams behind the public tool adapters. (completed 2026-03-13)
 - [x] **Phase 16: Unified Navigation Contract** - Replace split read/search continuation concepts with one coherent contract. (completed 2026-03-14)
 - [x] **Phase 17: Direct Read/Search Workflows** - Reduce helper-first choreography while preserving topic and hit-local fidelity. (completed 2026-03-14, gap closed by Plan 17-04)
-- [ ] **Phase 18: Surface Posture & Rollout Proof** - Classify primary vs secondary surfaces and prove the new contract in tests, reflection, and the restarted runtime.
+- [x] **Phase 18: Surface Posture & Rollout Proof** - Classify primary vs secondary surfaces and prove the new contract in tests, reflection, and the restarted runtime. (completed 2026-03-14)
 
 ## Phase Details
 
@@ -91,7 +91,7 @@ Phases execute in numeric order: 14 -> 15 -> 16 -> 17 -> 18
 | 15. Capability Seams | 3/3 | Complete   | 2026-03-13 |
 | 16. Unified Navigation Contract | 3/3 | Complete   | 2026-03-14 |
 | 17. Direct Read/Search Workflows | 4/4 | Complete   | 2026-03-14 |
-| 18. Surface Posture & Rollout Proof | 1/3 | In Progress|  |
+| 18. Surface Posture & Rollout Proof | 3/3 | Complete   | 2026-03-14 |
 
 ## Shipped Milestones
 
