@@ -3095,3 +3095,17 @@ async def test_list_dialogs_exclude_archived(mock_cache, mock_client, monkeypatc
     # Verify output contains only non-archived dialog
     text = result[0].text
     assert "Alice" in text
+
+
+def test_tool_posture_covers_all_tool_args_subclasses() -> None:
+    """TOOL_POSTURE must classify every ToolArgs subclass."""
+    import inspect
+    from mcp_telegram.tools import TOOL_POSTURE, ToolArgs
+    subclasses = {
+        name for name, cls in inspect.getmembers(tools_module, inspect.isclass)
+        if issubclass(cls, ToolArgs) and cls is not ToolArgs
+    }
+    assert subclasses == set(TOOL_POSTURE.keys()), (
+        f"Mismatch: subclasses={subclasses}, TOOL_POSTURE keys={set(TOOL_POSTURE.keys())}"
+    )
+
