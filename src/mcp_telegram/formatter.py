@@ -1,18 +1,48 @@
 from __future__ import annotations
 
 import typing as t
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
+
+class SenderLike(t.Protocol):
+    first_name: str | None
+
+
+class ReplyHeaderLike(t.Protocol):
+    reply_to_msg_id: int | None
+
+
+class ReactionsLike(t.Protocol):
+    results: list  # list of reaction result objects
+
+
+class MessageLike(t.Protocol):
+    id: int
+    date: datetime
+    message: str | None
+    sender: SenderLike | None
+    reply_to: ReplyHeaderLike | None
+    reactions: ReactionsLike | None
+    media: object
+
+
+TopicNameGetter = t.Callable[[MessageLike], str | None]
+LinePrefixGetter = t.Callable[[MessageLike], str | None]
+
+# Messages separated by more than this gap get a visual session break marker.
+# 60 min balances readability (avoids clutter in active chats) with context
+# (flags meaningful pauses in conversation flow).
 SESSION_BREAK_MINUTES = 60
 
 
 def format_messages(
-    messages: list,
-    reply_map: dict[int, object],
+    messages: list[MessageLike],
+    reply_map: dict[int, MessageLike],
     reaction_names_map: dict[int, dict[str, list[str]]] | None = None,
     tz: ZoneInfo | None = None,
-    topic_name_getter: t.Callable[[object], str | None] | None = None,
-    line_prefix_getter: t.Callable[[object], str | None] | None = None,
+    topic_name_getter: TopicNameGetter | None = None,
+    line_prefix_getter: LinePrefixGetter | None = None,
 ) -> str:
     """Format a list of messages into human-readable text.
 
@@ -96,11 +126,11 @@ def format_messages(
 
 
 def build_search_hit_window(
-    hit: object,
+    hit: MessageLike,
     *,
-    context_messages_by_id: dict[int, object],
+    context_messages_by_id: dict[int, MessageLike],
     context_radius: int = 3,
-) -> list[object]:
+) -> list[MessageLike]:
     """Return one hit-local message window ordered for format_messages()."""
     hit_id = getattr(hit, "id", None)
     if not isinstance(hit_id, int):
@@ -120,9 +150,9 @@ def build_search_hit_window(
 
 
 def format_search_message_groups(
-    hits: list[object],
+    hits: list[MessageLike],
     *,
-    context_messages_by_id: dict[int, object],
+    context_messages_by_id: dict[int, MessageLike],
     reaction_names_map: dict[int, dict[str, list[str]]] | None = None,
     context_radius: int = 3,
 ) -> str:
@@ -154,7 +184,7 @@ def format_search_message_groups(
     return "\n\n".join(parts)
 
 
-def _resolve_sender_name(msg: object) -> str:
+def _resolve_sender_name(msg: MessageLike) -> str:
     """Return the sender's first name, or 'Unknown' if not available."""
     sender = getattr(msg, "sender", None)
     if sender is None:
@@ -165,7 +195,7 @@ def _resolve_sender_name(msg: object) -> str:
     return first_name
 
 
-def _render_text(msg: object) -> str:
+def _render_text(msg: MessageLike) -> str:
     """Return message text, or a media placeholder for media-only messages."""
     media = getattr(msg, "media", None)
     text = getattr(msg, "message", "") or ""
@@ -176,7 +206,7 @@ def _render_text(msg: object) -> str:
     return ""
 
 
-def _format_reactions(msg: object, reaction_names: dict[str, list[str]] | None = None) -> str:
+def _format_reactions(msg: MessageLike, reaction_names: dict[str, list[str]] | None = None) -> str:
     """Return formatted reactions string like '[👍×3: Alice, Bob ❤️: Carol]', or empty string."""
     reactions = getattr(msg, "reactions", None)
     if reactions is None:

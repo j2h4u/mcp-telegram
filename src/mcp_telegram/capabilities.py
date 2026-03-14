@@ -54,6 +54,16 @@ class TopicCatalog(TypedDict):
 
 
 @dataclass(frozen=True)
+class ExactTargetHints:
+    """Bundle of pre-resolved identifiers that bypass fuzzy resolution."""
+    dialog_id: int | None = None
+    dialog_name: str | None = None
+    topic_id: int | None = None
+    topic_name: str | None = None
+    topic_metadata: TopicMetadata | None = None
+
+
+@dataclass(frozen=True)
 class DialogMatch:
     entity_id: int
     display_name: str
@@ -1118,7 +1128,9 @@ def _resolve_sender_entity(
     if sender_query is None:
         return None
 
-    sender_result = resolve(sender_query, cache.all_names_with_ttl(USER_TTL, GROUP_TTL), cache)
+    choices = cache.all_names_with_ttl(USER_TTL, GROUP_TTL)
+    normalized = cache.all_names_normalized_with_ttl(USER_TTL, GROUP_TTL)
+    sender_result = resolve(sender_query, choices, cache, normalized_choices=normalized)
     if isinstance(sender_result, NotFound):
         return MessageReadFailure(
             kind="sender_not_found",
@@ -1395,12 +1407,14 @@ async def execute_history_read_capability(
     load_topics: TopicLoader | None = None,
     fetch_topic_messages_fn: TopicFetcher | None = None,
     refresh_topic_by_id_fn: TopicRefresher | None = None,
-    exact_dialog_id: int | None = None,
-    exact_dialog_name: str | None = None,
-    exact_topic_id: int | None = None,
-    exact_topic_name: str | None = None,
-    exact_topic_metadata: TopicMetadata | None = None,
+    exact: ExactTargetHints | None = None,
 ) -> HistoryReadCapabilityResult:
+    exact_dialog_id = exact.dialog_id if exact else None
+    exact_dialog_name = exact.dialog_name if exact else None
+    exact_topic_id = exact.topic_id if exact else None
+    exact_topic_name = exact.topic_name if exact else None
+    exact_topic_metadata = exact.topic_metadata if exact else None
+
     dialog_target = await resolve_dialog_target(
         cache=cache,
         query=dialog_query,
@@ -1624,9 +1638,11 @@ async def execute_search_messages_capability(
     get_sender_type: SenderTypeGetter,
     reaction_names_threshold: int,
     context_radius: int = 3,
-    exact_dialog_id: int | None = None,
-    exact_dialog_name: str | None = None,
+    exact: ExactTargetHints | None = None,
 ) -> SearchCapabilityResult:
+    exact_dialog_id = exact.dialog_id if exact else None
+    exact_dialog_name = exact.dialog_name if exact else None
+
     dialog_target = await resolve_dialog_target(
         cache=cache,
         query=dialog_query,

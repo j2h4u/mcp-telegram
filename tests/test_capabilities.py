@@ -10,6 +10,7 @@ from telethon.errors import RPCError
 from mcp_telegram.cache import EntityCache, TopicMetadataCache
 from mcp_telegram.capabilities import (
     DialogTargetFailure,
+    ExactTargetHints,
     ForumTopicFailure,
     HistoryReadExecution,
     ListTopicsExecution,
@@ -505,9 +506,7 @@ async def test_execute_history_read_capability_uses_exact_targets_without_resolu
         load_topics=load_topics,
         fetch_topic_messages_fn=fetch_topic_messages,
         refresh_topic_by_id_fn=AsyncMock(),
-        exact_dialog_id=701,
-        exact_dialog_name="Backend Forum",
-        exact_topic_id=11,
+        exact=ExactTargetHints(dialog_id=701, dialog_name="Backend Forum", topic_id=11),
     )
 
     assert isinstance(result, HistoryReadExecution)
@@ -681,8 +680,7 @@ async def test_execute_search_messages_capability_uses_exact_dialog_id_without_r
         resolve_dialog=resolver,
         get_sender_type=lambda _sender: "user",
         reaction_names_threshold=15,
-        exact_dialog_id=701,
-        exact_dialog_name="Backend Forum",
+        exact=ExactTargetHints(dialog_id=701, dialog_name="Backend Forum"),
     )
 
     assert isinstance(result, SearchExecution)
