@@ -417,9 +417,13 @@ def format_unread_messages_grouped(
         budget_for_chat = chat.get("budget_for_chat", 0)
         total_in_chat = chat.get("total_in_chat", unread_count)
         is_channel = chat.get("is_channel", False)
+        is_bot = chat.get("is_bot", False)
 
         # Build header: "--- Name (N непрочитанных{, M упоминания}{, id=X}) ---"
-        header_parts = [f"{unread_count} непрочитанных"]
+        header_parts = []
+        if is_bot:
+            header_parts.append("бот")
+        header_parts.append(f"{unread_count} непрочитанных")
         if unread_mentions_count > 0:
             mention_word = "упоминание" if unread_mentions_count == 1 else "упоминания" if unread_mentions_count % 10 in [2, 3, 4] else "упоминаний"
             header_parts.append(f"{unread_mentions_count} {mention_word}")

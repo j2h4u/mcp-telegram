@@ -1585,6 +1585,7 @@ async def list_unread_messages(args: ListUnreadMessages) -> ToolResult:
             read_inbox_max_id = getattr(raw_dialog, "read_inbox_max_id", 0) if raw_dialog else 0
 
             entity = getattr(dialog, "entity", None)
+            is_bot = bool(getattr(entity, "bot", False)) if entity is not None else False
             participants_count = getattr(entity, "participants_count", None) if entity is not None else None
 
             # Apply scope filter
@@ -1606,6 +1607,7 @@ async def list_unread_messages(args: ListUnreadMessages) -> ToolResult:
                 "unread_count": unread_count,
                 "unread_mentions_count": unread_mentions_count,
                 "is_user": is_user,
+                "is_bot": is_bot,
                 "is_group": is_group,
                 "is_channel": is_channel,
                 "date": date,
@@ -1619,11 +1621,12 @@ async def list_unread_messages(args: ListUnreadMessages) -> ToolResult:
                 empty_msg = "Нет непрочитанных сообщений."
             return ToolResult(content=_text_response(empty_msg))
 
-        # Sort by: unread_mentions_count DESC, is_user DESC, date DESC
+        # Sort by: mentions first → human DMs → bot DMs → groups → recency
         unread_chats.sort(
             key=lambda c: (
                 -(c["unread_mentions_count"] > 0),  # Mentions first
-                -int(c["is_user"]),  # DMs before groups
+                -int(c["is_user"] and not c["is_bot"]),  # Human DMs before bots
+                -int(c["is_user"] and c["is_bot"]),  # Bot DMs before groups
                 -(c["date"].timestamp() if c["date"] else 0),  # Newest first
             )
         )
@@ -1650,6 +1653,7 @@ async def list_unread_messages(args: ListUnreadMessages) -> ToolResult:
                     "budget_for_chat": 0,
                     "total_in_chat": chat_info["unread_count"],
                     "is_channel": True,
+                    "is_bot": False,
                 })
                 continue
 
@@ -1678,6 +1682,7 @@ async def list_unread_messages(args: ListUnreadMessages) -> ToolResult:
                     "budget_for_chat": messages_shown,
                     "total_in_chat": chat_info["unread_count"],
                     "is_channel": chat_info["is_channel"],
+                    "is_bot": chat_info["is_bot"],
                 })
 
             except Exception as exc:
@@ -1690,6 +1695,7 @@ async def list_unread_messages(args: ListUnreadMessages) -> ToolResult:
                     "messages": [],
                     "budget_for_chat": 0,
                     "total_in_chat": chat_info["unread_count"],
+                    "is_bot": chat_info["is_bot"],
                     "is_channel": chat_info["is_channel"],
                 })
 
