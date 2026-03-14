@@ -1510,7 +1510,7 @@ async def execute_history_read_capability(
         else:
             raw_messages = [msg async for msg in client.iter_messages(**iter_kwargs)]
     except RPCError as exc:
-        if topic_query and topic_metadata is not None and topic_cache is not None:
+        if topic_metadata is not None and topic_cache is not None:
             detail = rpc_error_detail(exc)
             topic_cache.mark_topic_inaccessible(
                 entity_id,
@@ -1518,10 +1518,11 @@ async def execute_history_read_capability(
                 detail,
             )
             topic_metadata["inaccessible_error"] = detail
+            topic_label = topic_name or topic_query or f'Topic {int(topic_metadata["topic_id"])}'
             return MessageReadFailure(
                 kind="inaccessible",
                 text=inaccessible_topic_text(
-                    topic_name or topic_query,
+                    topic_label,
                     exc,
                     resolved=True,
                     retry_tool=retry_tool,
@@ -1557,7 +1558,7 @@ async def execute_history_read_capability(
     )
 
     topic_name_getter: Callable[[object], str | None] | None = None
-    if topic_query is None:
+    if topic_metadata is None:
         try:
             topic_name_getter = await _build_cross_topic_name_getter(
                 client,

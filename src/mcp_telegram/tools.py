@@ -15,7 +15,7 @@ from mcp.types import (
     TextContent,
     Tool,
 )
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from telethon.errors import RPCError
 from telethon import TelegramClient, custom, functions, types  # type: ignore[import-untyped]
 from telethon.tl.functions.messages import GetCommonChatsRequest
@@ -1149,8 +1149,9 @@ class ListMessages(ToolArgs):
     """
     List messages in one dialog.
 
-    REQUIRED: dialog must be provided. This tool does not support a global
-    "latest messages across all dialogs" mode.
+    Provide either dialog= for the ambiguity-safe natural-name flow or exact_dialog_id= when the
+    target dialog is already known. This tool does not support a global "latest messages across all
+    dialogs" mode.
 
     Returns messages in human-readable format (HH:mm FirstName: text) with date headers and
     session breaks.
@@ -1160,19 +1161,30 @@ class ListMessages(ToolArgs):
     Use navigation= with the next_navigation token from a previous response to continue.
     Use sender= to filter messages from a specific person (name string, resolved via fuzzy match).
     Use topic= to filter messages to one forum topic after the dialog has been resolved.
+    Use exact_topic_id= when the forum topic is already known and you want the direct-read path
+    without defaulting to full topic discovery first.
     In forum dialogs, omitting topic= returns a cross-topic page and each message is labeled inline.
     Use unread=True to show only messages you haven't read yet.
     Default limit=50; set limit explicitly if you want a smaller MCP response.
 
-    If response is ambiguous (multiple matches), use the numeric id= parameter with the ID from the matches list.
+    If response is ambiguous (multiple matches), retry with one exact selector instead of leaving
+    both fuzzy and exact selectors in the same request.
     For @username lookups, prepend @ to the name: dialog="@username".
     """
 
-    dialog: str = Field(
+    dialog: str | None = Field(
+        default=None,
         description=(
-            "Required. Dialog identifier to read from: numeric id, @username, or fuzzy dialog name. "
-            "No default is applied, and this tool cannot list messages across all dialogs."
+            "Optional natural dialog selector: numeric id, @username, or fuzzy dialog name. "
+            "Use this for exploratory or ambiguity-safe reads. Mutually exclusive with exact_dialog_id."
         )
+    )
+    exact_dialog_id: int | None = Field(
+        default=None,
+        description=(
+            "Optional exact dialog id for direct reads when the target dialog is already known. "
+            "Bypasses fuzzy dialog resolution. Mutually exclusive with dialog."
+        ),
     )
     limit: int = 50
     navigation: str | None = Field(
@@ -1184,8 +1196,33 @@ class ListMessages(ToolArgs):
         ),
     )
     sender: str | None = None
-    topic: str | None = None
+    topic: str | None = Field(
+        default=None,
+        description=(
+            "Optional natural topic title resolved within the selected dialog. "
+            "Mutually exclusive with exact_topic_id."
+        ),
+    )
+    exact_topic_id: int | None = Field(
+        default=None,
+        description=(
+            "Optional exact forum topic id for direct reads when the topic is already known. "
+            "Reuses cached or by-id topic metadata instead of loading the full topic catalog by "
+            "default. Mutually exclusive with topic."
+        ),
+    )
     unread: bool = False
+
+    @model_validator(mode="after")
+    def validate_direct_read_selectors(self) -> ListMessages:
+        """Reject missing or conflicting selector combinations."""
+        if self.dialog is None and self.exact_dialog_id is None:
+            raise ValueError("Provide either dialog or exact_dialog_id.")
+        if self.dialog is not None and self.exact_dialog_id is not None:
+            raise ValueError("dialog and exact_dialog_id are mutually exclusive.")
+        if self.topic is not None and self.exact_topic_id is not None:
+            raise ValueError("topic and exact_topic_id are mutually exclusive.")
+        return self
 
 
 @tool_runner.register
@@ -1197,7 +1234,7 @@ async def list_messages(
     t0 = time.monotonic()
     error_type = None
     result_count = 0
-    has_filter = bool(args.sender or args.topic or args.unread)
+    has_filter = bool(args.sender or args.topic or args.exact_topic_id is not None or args.unread)
     page_depth = 1
 
     try:
@@ -1219,6 +1256,8 @@ async def list_messages(
                 load_topics=_load_dialog_topics,
                 fetch_topic_messages_fn=_fetch_topic_messages,
                 refresh_topic_by_id_fn=_refresh_topic_by_id,
+                exact_dialog_id=args.exact_dialog_id,
+                exact_topic_id=args.exact_topic_id,
             )
         if isinstance(
             history_execution,
