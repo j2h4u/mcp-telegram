@@ -1662,12 +1662,10 @@ async def list_unread_messages(args: ListUnreadMessages) -> ToolResult:
             try:
                 read_max_id = chat_info.get("read_inbox_max_id", 0)
                 messages: list = []
-                async for msg in client.iter_messages(chat_id, min_id=read_max_id, limit=max(budget_for_chat * 2, 50)):
+                async for msg in client.iter_messages(chat_id, min_id=read_max_id, limit=budget_for_chat):
                     messages.append(msg)
-                    if len(messages) >= budget_for_chat * 2:
-                        break
 
-                base.messages = messages[:budget_for_chat]
+                base.messages = messages
                 total_messages_shown += len(base.messages)
 
             except Exception as exc:
