@@ -3224,3 +3224,161 @@ def test_get_user_info_primary_tool_direct_user_lookup() -> None:
     assert "user" in properties, "GetUserInfo must have user field"
     assert properties["user"]["type"] == "string", "user field should be string type"
 
+
+# --- ListUnreadMessages tests ---
+
+
+async def test_list_unread_messages_empty_returns_action(mock_cache, mock_client, monkeypatch):
+    """ListUnreadMessages returns helpful empty message when no unread."""
+    from mcp_telegram.tools import ListUnreadMessages, list_unread_messages
+
+    mock_client.iter_dialogs = MagicMock(return_value=_async_iter([]))
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+
+    result = await list_unread_messages(ListUnreadMessages())
+
+    assert len(result) == 1
+    text = result[0].text
+    assert "Нет непрочитанных сообщений" in text
+
+
+async def test_list_unread_messages_personal_scope_filters_groups(mock_cache, mock_client, monkeypatch):
+    """ListUnreadMessages personal scope hides large groups."""
+    from mcp_telegram.tools import ListUnreadMessages, list_unread_messages
+
+    def _make_dialog(name, id_, is_user=True, participants_count=None, unread=5):
+        d = MagicMock()
+        d.is_user = is_user
+        d.is_group = not is_user and participants_count is not None
+        d.is_channel = False
+        d.date = datetime(2024, 1, 15, 10, 0, 0, tzinfo=timezone.utc)
+        d.id = id_
+        d.name = name
+        d.unread_count = unread
+        d.unread_mentions_count = 0
+        entity = MagicMock()
+        entity.username = None
+        entity.participants_count = participants_count
+        d.entity = entity
+        return d
+
+    # Small group (≤100) and DM
+    dialogs = [
+        _make_dialog("Alice", 1, is_user=True, unread=2),
+        _make_dialog("Small Group", 10, is_user=False, participants_count=50, unread=3),
+        _make_dialog("Big Group", 20, is_user=False, participants_count=200, unread=4),
+    ]
+
+    mock_client.iter_dialogs = MagicMock(return_value=_async_iter(dialogs))
+    mock_client.iter_messages = MagicMock(return_value=_async_iter([]))
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+
+    result = await list_unread_messages(ListUnreadMessages(scope="personal"))
+
+    text = result[0].text
+    assert "Alice" in text
+    assert "Small Group" in text
+    # Big group should be filtered out
+    assert "Big Group" not in text
+
+
+async def test_list_unread_messages_mentions_surface_top(mock_cache, mock_client, monkeypatch):
+    """ListUnreadMessages surfaces mentions first."""
+    from mcp_telegram.tools import ListUnreadMessages, list_unread_messages
+
+    def _make_dialog(name, id_, unread=5, mentions=0):
+        d = MagicMock()
+        d.is_user = True
+        d.is_group = False
+        d.is_channel = False
+        d.date = datetime(2024, 1, 15, 10, 0, 0, tzinfo=timezone.utc)
+        d.id = id_
+        d.name = name
+        d.unread_count = unread
+        d.unread_mentions_count = mentions
+        d.entity = MagicMock(username=None, participants_count=None)
+        return d
+
+    dialogs = [
+        _make_dialog("No Mentions", 1, unread=5, mentions=0),
+        _make_dialog("Has Mentions", 2, unread=3, mentions=2),
+    ]
+
+    mock_client.iter_dialogs = MagicMock(return_value=_async_iter(dialogs))
+    mock_client.iter_messages = MagicMock(return_value=_async_iter([]))
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+
+    result = await list_unread_messages(ListUnreadMessages())
+
+    text = result[0].text
+    # Mentions should come before no-mentions in the output
+    mentions_idx = text.find("Has Mentions")
+    no_mentions_idx = text.find("No Mentions")
+    assert mentions_idx < no_mentions_idx
+
+
+async def test_list_unread_messages_budget_allocation(mock_cache, mock_client, monkeypatch):
+    """ListUnreadMessages respects message budget and shows '[и ещё N]' marker."""
+    from mcp_telegram.tools import ListUnreadMessages, list_unread_messages
+    from tests.test_formatter import MockMessage, MockSender
+
+    def _make_dialog(name, id_, unread=50):
+        d = MagicMock()
+        d.is_user = True
+        d.is_group = False
+        d.is_channel = False
+        d.date = datetime(2024, 1, 15, 10, 0, 0, tzinfo=timezone.utc)
+        d.id = id_
+        d.name = name
+        d.unread_count = unread
+        d.unread_mentions_count = 0
+        d.entity = MagicMock(username=None, participants_count=None)
+        return d
+
+    # Create mock messages
+    def _mock_message(i):
+        return MockMessage(
+            id=i,
+            date=datetime(2024, 1, 15, 10, i % 60, 0, tzinfo=timezone.utc),
+            message=f"msg {i}",
+            sender=MockSender("Alice")
+        )
+
+    dialogs = [_make_dialog("Alice", 1, unread=100)]
+
+    async def _iter_messages(entity, unread=True, limit=None):
+        for i in range(min(limit or 100, 100)):
+            yield _mock_message(i)
+
+    mock_client.iter_dialogs = MagicMock(return_value=_async_iter(dialogs))
+    mock_client.iter_messages = MagicMock(side_effect=_iter_messages)
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+
+    result = await list_unread_messages(ListUnreadMessages(limit=50))
+
+    text = result[0].text
+    # Should show budget-trimmed output
+    assert "Alice" in text
+    # Since limit is 50 and unread is 100, should show "[и ещё" marker
+    assert "[и ещё" in text
+
+
+def test_list_unread_messages_registered_in_tool_posture() -> None:
+    """ListUnreadMessages is registered as primary tool."""
+    from mcp_telegram.tools import TOOL_POSTURE
+
+    assert "ListUnreadMessages" in TOOL_POSTURE
+    assert TOOL_POSTURE["ListUnreadMessages"] == "primary"
+
+
+def test_list_unread_messages_registered_in_tool_registry() -> None:
+    """ListUnreadMessages is registered in TOOL_REGISTRY."""
+    from mcp_telegram.tools import TOOL_REGISTRY, ListUnreadMessages
+
+    assert "ListUnreadMessages" in TOOL_REGISTRY
+    assert TOOL_REGISTRY["ListUnreadMessages"] == ListUnreadMessages
+
