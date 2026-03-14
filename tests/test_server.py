@@ -19,13 +19,33 @@ def _tool(name: str) -> Tool:
 def test_list_messages_reflection_exposes_shared_navigation_schema() -> None:
     tool = server.mapping["ListMessages"]
     properties = tool.inputSchema["properties"]
+    required = tool.inputSchema.get("required", [])
 
     assert "navigation" in properties
+    assert "exact_dialog_id" in properties
+    assert "exact_topic_id" in properties
     assert "cursor" not in properties
     assert "from_beginning" not in properties
     assert properties["navigation"]["type"] == "string"
+    assert properties["exact_dialog_id"]["type"] == "integer"
+    assert properties["exact_topic_id"]["type"] == "integer"
     assert '"newest"' in properties["navigation"]["description"]
     assert '"oldest"' in properties["navigation"]["description"]
+    assert "already known" in properties["exact_dialog_id"]["description"]
+    assert "Mutually exclusive with dialog" in properties["exact_dialog_id"]["description"]
+    assert "full topic catalog" in properties["exact_topic_id"]["description"]
+    assert "dialog" not in required
+
+
+@pytest.mark.asyncio
+async def test_call_tool_validation_rejects_conflicting_list_messages_selectors() -> None:
+    with pytest.raises(RuntimeError, match="ListMessages") as exc_info:
+        await server.call_tool("ListMessages", {"dialog": "Backend", "exact_dialog_id": 701})
+
+    message = str(exc_info.value)
+    assert "validation" in message.lower()
+    assert "mutually exclusive" in message.lower()
+    assert "exact_dialog_id" in message
 
 
 def test_search_messages_reflection_exposes_shared_navigation_schema() -> None:
