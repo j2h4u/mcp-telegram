@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import typing as t
+from dataclasses import dataclass, field
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -378,74 +379,61 @@ def _describe_document(media: object) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Format unread messages grouped by chat
+# Unread messages grouped by chat
 # ---------------------------------------------------------------------------
 
 
+@dataclass
+class UnreadChatData:
+    """One chat's unread data for format_unread_messages_grouped()."""
+
+    chat_id: int
+    display_name: str
+    unread_count: int
+    unread_mentions_count: int = 0
+    messages: list = field(default_factory=list)
+    total_in_chat: int = 0
+    is_channel: bool = False
+    is_bot: bool = False
+
+
 def format_unread_messages_grouped(
-    chats_data: list[dict],
+    chats: list[UnreadChatData],
     tz: ZoneInfo | None = None,
 ) -> str:
-    """Format unread messages grouped by chat with budget allocation applied.
+    """Format unread messages grouped by chat.
 
-    Args:
-        chats_data: List of dicts, each containing:
-            - chat_id: int
-            - display_name: str
-            - unread_count: int (total unread in chat)
-            - unread_mentions_count: int
-            - messages: list[MessageLike] (already sorted by time)
-            - budget_for_chat: int (allocated budget)
-            - total_in_chat: int (real total unread, may be > budget_for_chat)
-            - is_channel: bool (if True, show count only, skip messages)
-        tz: Timezone for formatting (defaults to UTC)
-
-    Returns:
-        Formatted string with grouped chats and "[и ещё N]" markers where trimmed
+    Messages in each chat are already trimmed to budget by the caller.
+    Adds "[и ещё N]" when total_in_chat > len(messages).
     """
-    if not chats_data:
+    if not chats:
         return ""
 
     parts: list[str] = []
 
-    for chat in chats_data:
-        chat_id = chat.get("chat_id")
-        display_name = chat.get("display_name", f"Chat {chat_id}")
-        unread_count = chat.get("unread_count", 0)
-        unread_mentions_count = chat.get("unread_mentions_count", 0)
-        messages = chat.get("messages", [])
-        budget_for_chat = chat.get("budget_for_chat", 0)
-        total_in_chat = chat.get("total_in_chat", unread_count)
-        is_channel = chat.get("is_channel", False)
-        is_bot = chat.get("is_bot", False)
-
-        # Build header: "--- Name (N непрочитанных{, M упоминания}{, id=X}) ---"
-        header_parts = []
-        if is_bot:
+    for chat in chats:
+        # Build header: "--- Name ({бот, }N непрочитанных{, M упоминаний}, id=X) ---"
+        header_parts: list[str] = []
+        if chat.is_bot:
             header_parts.append("бот")
-        header_parts.append(f"{unread_count} непрочитанных")
-        if unread_mentions_count > 0:
-            mention_word = "упоминание" if unread_mentions_count == 1 else "упоминания" if unread_mentions_count % 10 in [2, 3, 4] else "упоминаний"
-            header_parts.append(f"{unread_mentions_count} {mention_word}")
-        header_parts.append(f"id={chat_id}")
-        header_text = ", ".join(header_parts)
-        header = f"--- {display_name} ({header_text}) ---"
-        parts.append(header)
+        header_parts.append(f"{chat.unread_count} непрочитанных")
+        if chat.unread_mentions_count > 0:
+            n = chat.unread_mentions_count
+            word = "упоминание" if n == 1 else "упоминания" if n % 10 in (2, 3, 4) else "упоминаний"
+            header_parts.append(f"{n} {word}")
+        header_parts.append(f"id={chat.chat_id}")
+        parts.append(f"--- {chat.display_name} ({', '.join(header_parts)}) ---")
 
-        # For channels, just show header (no messages)
-        if is_channel:
+        if chat.is_channel:
             continue
 
-        # Format messages (trim to budget)
-        if messages:
-            messages_to_show = messages[:budget_for_chat]
-            formatted = format_messages(messages_to_show, {}, tz=tz)
+        if chat.messages:
+            formatted = format_messages(chat.messages, {}, tz=tz)
             if formatted:
                 parts.append(formatted)
 
-        # Add "[и ещё N]" marker if trimmed
-        if budget_for_chat < total_in_chat:
-            remaining = total_in_chat - budget_for_chat
-            parts.append(f"[и ещё {remaining}]")
+        shown = len(chat.messages)
+        if shown < chat.total_in_chat:
+            parts.append(f"[и ещё {chat.total_in_chat - shown}]")
 
     return "\n".join(parts)

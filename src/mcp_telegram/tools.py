@@ -38,7 +38,7 @@ from .cache import (
     ReactionMetadataCache,
     TopicMetadataCache,
 )
-from .formatter import format_messages, format_unread_messages_grouped
+from .formatter import UnreadChatData, format_messages, format_unread_messages_grouped
 from .resolver import Candidates, NotFound, Resolved, resolve
 from .telegram import create_client
 
@@ -1635,69 +1635,45 @@ async def list_unread_messages(args: ListUnreadMessages) -> ToolResult:
         allocation = allocate_message_budget_proportional(unread_counts, args.limit)
 
         # Fetch messages for each chat
-        chats_data = []
+        chats_data: list[UnreadChatData] = []
         total_messages_shown = 0
 
         for chat_info in unread_chats:
             chat_id = chat_info["chat_id"]
             budget_for_chat = allocation.get(chat_id, 0)
 
-            if budget_for_chat == 0 and chat_info["is_channel"]:
-                # Still show channel count even if no message budget
-                chats_data.append({
-                    "chat_id": chat_id,
-                    "display_name": chat_info["display_name"],
-                    "unread_count": chat_info["unread_count"],
-                    "unread_mentions_count": chat_info["unread_mentions_count"],
-                    "messages": [],
-                    "budget_for_chat": 0,
-                    "total_in_chat": chat_info["unread_count"],
-                    "is_channel": True,
-                    "is_bot": False,
-                })
-                continue
+            # Base fields shared by all paths
+            base = UnreadChatData(
+                chat_id=chat_id,
+                display_name=chat_info["display_name"],
+                unread_count=chat_info["unread_count"],
+                unread_mentions_count=chat_info["unread_mentions_count"],
+                total_in_chat=chat_info["unread_count"],
+                is_channel=chat_info["is_channel"],
+                is_bot=chat_info["is_bot"],
+            )
 
             if budget_for_chat == 0:
+                if chat_info["is_channel"]:
+                    chats_data.append(base)
                 continue
 
-            # Fetch unread messages for this dialog (min_id = read_inbox_max_id)
+            # Fetch unread messages (min_id = read_inbox_max_id)
             try:
                 read_max_id = chat_info.get("read_inbox_max_id", 0)
-                messages = []
+                messages: list = []
                 async for msg in client.iter_messages(chat_id, min_id=read_max_id, limit=max(budget_for_chat * 2, 50)):
                     messages.append(msg)
                     if len(messages) >= budget_for_chat * 2:
                         break
 
-                # Messages are newest-first from iter_messages; keep them that way
-                messages_shown = min(budget_for_chat, len(messages))
-                total_messages_shown += messages_shown
-
-                chats_data.append({
-                    "chat_id": chat_id,
-                    "display_name": chat_info["display_name"],
-                    "unread_count": chat_info["unread_count"],
-                    "unread_mentions_count": chat_info["unread_mentions_count"],
-                    "messages": messages[:budget_for_chat],
-                    "budget_for_chat": messages_shown,
-                    "total_in_chat": chat_info["unread_count"],
-                    "is_channel": chat_info["is_channel"],
-                    "is_bot": chat_info["is_bot"],
-                })
+                base.messages = messages[:budget_for_chat]
+                total_messages_shown += len(base.messages)
 
             except Exception as exc:
                 logger.warning("Failed to fetch unread messages for chat %r: %s", chat_id, exc)
-                chats_data.append({
-                    "chat_id": chat_id,
-                    "display_name": chat_info["display_name"],
-                    "unread_count": chat_info["unread_count"],
-                    "unread_mentions_count": chat_info["unread_mentions_count"],
-                    "messages": [],
-                    "budget_for_chat": 0,
-                    "total_in_chat": chat_info["unread_count"],
-                    "is_bot": chat_info["is_bot"],
-                    "is_channel": chat_info["is_channel"],
-                })
+
+            chats_data.append(base)
 
     # Format output
     result_text = format_unread_messages_grouped(chats_data)
