@@ -281,7 +281,7 @@ def test_tool_description_strips_nullable_unions_from_exported_schema():
     assert '"newest"' in navigation_schema["description"]
     assert '"oldest"' in navigation_schema["description"]
     assert "next_navigation" in navigation_schema["description"]
-    assert sender_schema == {"title": "Sender", "type": "string"}
+    assert sender_schema == {"title": "Sender", "type": "string", "maxLength": 500}
     assert topic_schema["title"] == "Topic"
     assert topic_schema["type"] == "string"
     assert "exact_topic_id" in topic_schema["description"]
@@ -368,8 +368,7 @@ async def test_list_messages_adapter_delegates_to_history_capability(
     assert "Delegated topic update" in result[0].text
     assert "next_navigation: nav-token" in result[0].text
     assert capability.await_args.kwargs["topic_query"] == "Release Notes"
-    assert capability.await_args.kwargs["exact_dialog_id"] is None
-    assert capability.await_args.kwargs["exact_topic_id"] is None
+    assert capability.await_args.kwargs["exact"] is None
 
 
 async def test_list_messages_adapter_routes_exact_selectors_to_history_capability(
@@ -408,8 +407,9 @@ async def test_list_messages_adapter_routes_exact_selectors_to_history_capabilit
     assert "Direct topic update" in result[0].text
     assert capability.await_args.kwargs["dialog_query"] is None
     assert capability.await_args.kwargs["topic_query"] is None
-    assert capability.await_args.kwargs["exact_dialog_id"] == 701
-    assert capability.await_args.kwargs["exact_topic_id"] == 11
+    exact = capability.await_args.kwargs["exact"]
+    assert exact.dialog_id == 701
+    assert exact.topic_id == 11
 
 
 async def test_search_messages_adapter_delegates_to_capability_execution(
@@ -450,7 +450,7 @@ async def test_search_messages_adapter_delegates_to_capability_execution(
     assert "next_offset" not in result[0].text
     assert capability.await_args.kwargs["query"] == "ship"
     assert capability.await_args.kwargs["navigation"] is None
-    assert capability.await_args.kwargs["exact_dialog_id"] is None
+    assert capability.await_args.kwargs["exact"] is None
     assert capability.await_args.kwargs["dialog_query"] == "Backend"
 
 
@@ -485,8 +485,9 @@ async def test_search_messages_adapter_routes_numeric_dialog_to_exact_capability
     await search_messages(SearchMessages(dialog="701", query="ship", limit=20))
 
     assert capability.await_args.kwargs["dialog_query"] is None
-    assert capability.await_args.kwargs["exact_dialog_id"] == 701
-    assert capability.await_args.kwargs["exact_dialog_name"] == "Backend Forum"
+    exact = capability.await_args.kwargs["exact"]
+    assert exact.dialog_id == 701
+    assert exact.dialog_name == "Backend Forum"
 
 
 async def test_search_messages_numeric_dialog_direct_path_preserves_hit_context_and_navigation(
@@ -774,6 +775,13 @@ async def test_list_messages_topic_ambiguous_within_dialog(tmp_db_path, mock_cli
     assert "Action:" in result[0].text
     assert 'name="Release Notes"' in result[0].text
     assert 'name="Release Planning"' in result[0].text
+
+
+def test_tool_registry_complete():
+    """Registry covers all tools and verify_tool_registry() passes."""
+    from mcp_telegram.tools import verify_tool_registry
+
+    verify_tool_registry()
 
 
 async def test_list_messages_topic_ambiguous_marks_previously_inaccessible_candidates(
@@ -3049,7 +3057,7 @@ async def test_list_dialogs_archived_default(mock_cache, mock_client, monkeypatc
     assert "Archived Chat" in text
 
     # Verify both were cached
-    all_names = mock_cache.all_names()
+    all_names = mock_cache.all_names_with_ttl(2_592_000, 604_800)
     assert 1 in all_names  # Non-archived
     assert 2 in all_names  # Archived
     assert all_names[1] == "Alice"
@@ -3165,8 +3173,8 @@ async def test_list_messages_direct_dialog_read_no_helper_required(tmp_db_path, 
 
     assert len(result) == 1
     assert "Direct backend read" in result[0].text
-    # Verify the capability was called with exact_dialog_id, not dialog_query
-    assert capability.await_args.kwargs["exact_dialog_id"] == 701
+    # Verify the capability was called with exact hints, not dialog_query
+    assert capability.await_args.kwargs["exact"].dialog_id == 701
 
 
 async def test_search_messages_numeric_dialog_direct_search_no_helper_required(tmp_db_path, mock_client, monkeypatch) -> None:
@@ -3200,7 +3208,7 @@ async def test_search_messages_numeric_dialog_direct_search_no_helper_required(t
 
     assert len(result) == 1
     # Verify numeric dialog was treated as exact path
-    assert capability.await_args.kwargs["exact_dialog_id"] == 701
+    assert capability.await_args.kwargs["exact"].dialog_id == 701
 
 
 def test_get_user_info_primary_tool_direct_user_lookup() -> None:

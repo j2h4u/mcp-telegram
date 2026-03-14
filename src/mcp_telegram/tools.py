@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-import sys
 import time
 import typing as t
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from functools import cache as functools_cache
 from functools import singledispatch
 
@@ -17,13 +17,19 @@ from mcp.types import (
 )
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from telethon.errors import RPCError
-from telethon import TelegramClient, custom, functions, types  # type: ignore[import-untyped]
 from telethon.tl.functions.messages import GetCommonChatsRequest
 from telethon.tl.types import Channel, Chat
 from telethon.utils import get_peer_id
 from xdg_base_dirs import xdg_state_home
 
 from . import capabilities
+from .capabilities import (
+    ExactTargetHints,
+    FORUM_TOPICS_PAGE_SIZE,
+    GENERAL_TOPIC_ID,
+    GENERAL_TOPIC_TITLE,
+    TOPIC_METADATA_TTL_SECONDS,
+)
 from .cache import (
     EntityCache,
     GROUP_TTL,
@@ -38,10 +44,6 @@ from .telegram import create_client
 # Fetch reactor names only when total reactions per message are at or below this limit.
 # Covers personal chats (always ≤ a few) while skipping expensive lookups on busy groups.
 REACTION_NAMES_THRESHOLD = 15
-FORUM_TOPICS_PAGE_SIZE = 100
-TOPIC_METADATA_TTL_SECONDS = 600
-GENERAL_TOPIC_ID = 1
-GENERAL_TOPIC_TITLE = "General"
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +148,63 @@ class ToolArgs(BaseModel):
     model_config = ConfigDict()
 
 
+def _text_response(text: str) -> list[TextContent]:
+    """Wrap a plain string in the MCP TextContent envelope."""
+    return [TextContent(type="text", text=text)]
+
+
+@dataclass
+class ToolResult:
+    """Internal wrapper carrying MCP content plus telemetry metadata."""
+    content: t.Sequence[TextContent | ImageContent | EmbeddedResource]
+    result_count: int = 0
+    has_cursor: bool = False
+    page_depth: int = 1
+    has_filter: bool = False
+
+
+def _track_tool_telemetry(tool_name: str):
+    """Decorator that wraps an async tool runner with timing + telemetry recording.
+
+    Must be applied BETWEEN @tool_runner.register (outer) and the function def (inner)
+    so singledispatch sees the original type annotation via __wrapped__.
+    """
+    def decorator(fn):
+        import functools
+
+        @functools.wraps(fn)
+        async def wrapper(args):
+            logger.info("method[%s] args[%s]", tool_name, args)
+            t0 = time.monotonic()
+            error_type = None
+            tool_result: ToolResult | None = None
+            try:
+                tool_result = await fn(args)
+                return tool_result.content
+            except Exception as exc:
+                error_type = type(exc).__name__
+                raise
+            finally:
+                duration_ms = (time.monotonic() - t0) * 1000
+                try:
+                    from .analytics import TelemetryEvent
+                    collector = _get_analytics_collector()
+                    collector.record_event(TelemetryEvent(
+                        tool_name=tool_name,
+                        timestamp=time.time(),
+                        duration_ms=duration_ms,
+                        result_count=tool_result.result_count if tool_result else 0,
+                        has_cursor=tool_result.has_cursor if tool_result else False,
+                        page_depth=tool_result.page_depth if tool_result else 1,
+                        has_filter=tool_result.has_filter if tool_result else False,
+                        error_type=error_type,
+                    ))
+                except Exception as e:
+                    logger.error("Failed to record telemetry for %s: %s", tool_name, e)
+        return wrapper
+    return decorator
+
+
 @singledispatch
 async def tool_runner(
     args,  # noqa: ANN001
@@ -200,7 +259,10 @@ def _sanitize_tool_schema(value: t.Any) -> t.Any:
 
 
 def tool_args(tool: Tool, *args, **kwargs) -> ToolArgs:  # noqa: ANN002, ANN003
-    return sys.modules[__name__].__dict__[tool.name](*args, **kwargs)
+    cls = TOOL_REGISTRY.get(tool.name)
+    if cls is None:
+        raise ValueError(f"Unknown tool: {tool.name}")
+    return cls(*args, **kwargs)
 
 
 @functools_cache
@@ -258,7 +320,9 @@ def _cache_dialog_entry(cache: EntityCache, dialog: object) -> None:
 
 async def _resolve_dialog(cache: EntityCache, query: str) -> Resolved | Candidates | NotFound:
     """Resolve one dialog, retrying once after a live cache warmup."""
-    result = resolve(query, cache.all_names_with_ttl(USER_TTL, GROUP_TTL), cache)
+    choices = cache.all_names_with_ttl(USER_TTL, GROUP_TTL)
+    normalized = cache.all_names_normalized_with_ttl(USER_TTL, GROUP_TTL)
+    result = resolve(query, choices, cache, normalized_choices=normalized)
     if not isinstance(result, NotFound):
         return result
 
@@ -283,7 +347,9 @@ async def _resolve_dialog(cache: EntityCache, query: str) -> Resolved | Candidat
         logger.warning("dialog_resolve_warmup_failed query=%r error=%s", query, exc)
         return result
 
-    refreshed_result = resolve(query, cache.all_names_with_ttl(USER_TTL, GROUP_TTL), cache)
+    choices = cache.all_names_with_ttl(USER_TTL, GROUP_TTL)
+    normalized = cache.all_names_normalized_with_ttl(USER_TTL, GROUP_TTL)
+    refreshed_result = resolve(query, choices, cache, normalized_choices=normalized)
     if not isinstance(refreshed_result, NotFound):
         return refreshed_result
 
@@ -1032,68 +1098,41 @@ class ListDialogs(ToolArgs):
 
 
 @tool_runner.register
-async def list_dialogs(
-    args: ListDialogs,
-) -> t.Sequence[TextContent | ImageContent | EmbeddedResource]:
-    """List dialogs with telemetry recording."""
-    logger.info("method[ListDialogs] args[%s]", args)
-    t0 = time.monotonic()
-    error_type = None
-    result_count = 0
+@_track_tool_telemetry("ListDialogs")
+async def list_dialogs(args: ListDialogs) -> ToolResult:
+    cache = get_entity_cache()
+    lines: list[str] = []
+    batch_entities: list[tuple[int, str, str, str | None]] = []
+    async with connected_client() as client:
+        telethon_archived_param = None if not args.exclude_archived else False
 
-    try:
-        cache = get_entity_cache()
-        lines: list[str] = []
-        async with connected_client() as client:
-            # Map parameter to Telethon's archived parameter
-            # None = mixed (current folder + archives), False = main folder, True = archive folder
-            # Since we want default behavior to show all (both archived and non-archived),
-            # we use None when exclude_archived=False, and False when exclude_archived=True
-            telethon_archived_param = None if not args.exclude_archived else False
-
-            async for dialog in client.iter_dialogs(
-                archived=telethon_archived_param, ignore_pinned=args.ignore_pinned
-            ):
-                if dialog.is_user:
-                    dtype = "user"
-                elif dialog.is_group:
-                    dtype = "group"
-                elif dialog.is_channel:
-                    dtype = "channel"
-                else:
-                    dtype = "unknown"
-                last_at = dialog.date.strftime("%Y-%m-%d %H:%M") if dialog.date else "unknown"
-                # Lazy cache warm-up: upsert entity metadata on every ListDialogs call
-                _cache_dialog_entry(cache, dialog)
-                lines.append(
-                    f"name='{dialog.name}' id={dialog.id} type={dtype} "
-                    f"last_message_at={last_at} unread={dialog.unread_count}"
-                )
-        result_count = len(lines)
-        result_text = "\n".join(lines) if lines else _no_dialogs_text()
-        result = [TextContent(type="text", text=result_text)]
-    except Exception as exc:
-        error_type = type(exc).__name__
-        raise
-    finally:
-        duration_ms = (time.monotonic() - t0) * 1000
-        try:
-            from .analytics import TelemetryEvent
-            collector = _get_analytics_collector()
-            collector.record_event(TelemetryEvent(
-                tool_name="ListDialogs",
-                timestamp=time.time(),
-                duration_ms=duration_ms,
-                result_count=result_count,
-                has_cursor=False,
-                page_depth=1,
-                has_filter=False,
-                error_type=error_type,
-            ))
-        except Exception as e:
-            logger.error("Failed to record telemetry for ListDialogs: %s", e)
-
-    return result
+        async for dialog in client.iter_dialogs(
+            archived=telethon_archived_param, ignore_pinned=args.ignore_pinned
+        ):
+            if dialog.is_user:
+                dtype = "user"
+            elif dialog.is_group:
+                dtype = "group"
+            elif dialog.is_channel:
+                dtype = "channel"
+            else:
+                dtype = "unknown"
+            last_at = dialog.date.strftime("%Y-%m-%d %H:%M") if dialog.date else "unknown"
+            # Collect for batch cache upsert
+            dialog_id = getattr(dialog, "id", None)
+            dialog_name = getattr(dialog, "name", None)
+            if isinstance(dialog_id, int) and isinstance(dialog_name, str):
+                entity = getattr(dialog, "entity", None)
+                username = getattr(entity, "username", None) if entity is not None else None
+                batch_entities.append((dialog_id, dtype, dialog_name, username))
+            lines.append(
+                f"name='{dialog.name}' id={dialog.id} type={dtype} "
+                f"last_message_at={last_at} unread={dialog.unread_count}"
+            )
+    if batch_entities:
+        cache.upsert_batch(batch_entities)
+    result_text = "\n".join(lines) if lines else _no_dialogs_text()
+    return ToolResult(content=_text_response(result_text), result_count=len(lines))
 
 
 ### ListMessages ###
@@ -1107,69 +1146,38 @@ class ListTopics(ToolArgs):
     name or numeric topic_id instead of guessing via fuzzy match.
     """
 
-    dialog: str
+    dialog: str = Field(max_length=500)
 
 
 @tool_runner.register
-async def list_topics(
-    args: ListTopics,
-) -> t.Sequence[TextContent | ImageContent | EmbeddedResource]:
-    """List dialog topics with telemetry recording."""
-    logger.info("method[ListTopics] args[%s]", args)
-    t0 = time.monotonic()
-    error_type = None
-    result_count = 0
+@_track_tool_telemetry("ListTopics")
+async def list_topics(args: ListTopics) -> ToolResult:
+    cache = get_entity_cache()
+    async with connected_client() as client:
+        topic_execution = await _execute_list_topics_capability(
+            client,
+            cache=cache,
+            dialog_query=args.dialog,
+            retry_tool="ListTopics",
+            resolve_dialog=_resolve_dialog,
+            load_topics=_load_dialog_topics,
+        )
+    if isinstance(
+        topic_execution,
+        (capabilities.DialogTargetFailure, capabilities.ForumTopicFailure),
+    ):
+        return ToolResult(content=_text_response(topic_execution.text), has_filter=True)
 
-    try:
-        cache = get_entity_cache()
-        async with connected_client() as client:
-            topic_execution = await _execute_list_topics_capability(
-                client,
-                cache=cache,
-                dialog_query=args.dialog,
-                retry_tool="ListTopics",
-                resolve_dialog=_resolve_dialog,
-                load_topics=_load_dialog_topics,
-            )
-        if isinstance(
-            topic_execution,
-            (capabilities.DialogTargetFailure, capabilities.ForumTopicFailure),
-        ):
-            return [TextContent(type="text", text=topic_execution.text)]
+    result_count = len(topic_execution.active_topics)
+    if not topic_execution.active_topics:
+        text = topic_execution.resolve_prefix + _no_active_topics_text(
+            topic_execution.dialog_name
+        )
+        return ToolResult(content=_text_response(text), has_filter=True)
 
-        result_count = len(topic_execution.active_topics)
-        if not topic_execution.active_topics:
-            text = topic_execution.resolve_prefix + _no_active_topics_text(
-                topic_execution.dialog_name
-            )
-            return [TextContent(type="text", text=text)]
-
-        lines = [_topic_row_text(topic) for topic in topic_execution.active_topics]
-        result_text = topic_execution.resolve_prefix + "\n".join(lines)
-        result = [TextContent(type="text", text=result_text)]
-    except Exception as exc:
-        error_type = type(exc).__name__
-        raise
-    finally:
-        duration_ms = (time.monotonic() - t0) * 1000
-        try:
-            from .analytics import TelemetryEvent
-
-            collector = _get_analytics_collector()
-            collector.record_event(TelemetryEvent(
-                tool_name="ListTopics",
-                timestamp=time.time(),
-                duration_ms=duration_ms,
-                result_count=result_count,
-                has_cursor=False,
-                page_depth=1,
-                has_filter=True,
-                error_type=error_type,
-            ))
-        except Exception as e:
-            logger.error("Failed to record telemetry for ListTopics: %s", e)
-
-    return result
+    lines = [_topic_row_text(topic) for topic in topic_execution.active_topics]
+    result_text = topic_execution.resolve_prefix + "\n".join(lines)
+    return ToolResult(content=_text_response(result_text), result_count=result_count, has_filter=True)
 
 
 class ListMessages(ToolArgs):
@@ -1201,6 +1209,7 @@ class ListMessages(ToolArgs):
 
     dialog: str | None = Field(
         default=None,
+        max_length=500,
         description=(
             "Optional natural dialog selector: numeric id, @username, or fuzzy dialog name. "
             "Use this for exploratory or ambiguity-safe reads. Mutually exclusive with exact_dialog_id."
@@ -1216,15 +1225,17 @@ class ListMessages(ToolArgs):
     limit: int = 50
     navigation: str | None = Field(
         default=None,
+        max_length=2000,
         description=(
             'Optional shared navigation state. Omit or set to "newest" to start from the latest '
             'messages. Set to "oldest" to start from the oldest messages. Reuse the exact '
             "next_navigation token from the previous ListMessages response to continue."
         ),
     )
-    sender: str | None = None
+    sender: str | None = Field(default=None, max_length=500)
     topic: str | None = Field(
         default=None,
+        max_length=500,
         description=(
             "Optional natural topic title resolved within the selected dialog. "
             "Mutually exclusive with exact_topic_id."
@@ -1253,95 +1264,71 @@ class ListMessages(ToolArgs):
 
 
 @tool_runner.register
-async def list_messages(
-    args: ListMessages,
-) -> t.Sequence[TextContent | ImageContent | EmbeddedResource]:
-    """List messages with telemetry recording."""
-    logger.info("method[ListMessages] args[%s]", args)
-    t0 = time.monotonic()
-    error_type = None
-    result_count = 0
+@_track_tool_telemetry("ListMessages")
+async def list_messages(args: ListMessages) -> ToolResult:
     has_filter = bool(args.sender or args.topic or args.exact_topic_id is not None or args.unread)
-    page_depth = 1
+    has_cursor = args.navigation is not None and args.navigation not in {"newest", "oldest"}
 
-    try:
-        cache = get_entity_cache()
-        async with connected_client() as client:
-            history_execution = await _execute_history_read_capability(
-                client,
-                cache=cache,
-                dialog_query=args.dialog,
-                limit=args.limit,
-                navigation=args.navigation,
-                sender_query=args.sender,
-                topic_query=args.topic,
-                unread=args.unread,
-                retry_tool="ListMessages",
-                resolve_dialog=_resolve_dialog,
-                get_sender_type=_get_sender_type,
-                reaction_names_threshold=REACTION_NAMES_THRESHOLD,
-                load_topics=_load_dialog_topics,
-                fetch_topic_messages_fn=_fetch_topic_messages,
-                refresh_topic_by_id_fn=_refresh_topic_by_id,
-                exact_dialog_id=args.exact_dialog_id,
-                exact_topic_id=args.exact_topic_id,
-            )
-        if isinstance(
-            history_execution,
-            (
-                capabilities.DialogTargetFailure,
-                capabilities.ForumTopicFailure,
-                capabilities.MessageReadFailure,
-                capabilities.NavigationFailure,
-            ),
-        ):
-            return [TextContent(type="text", text=history_execution.text)]
+    cache = get_entity_cache()
+    exact = ExactTargetHints(
+        dialog_id=args.exact_dialog_id,
+        topic_id=args.exact_topic_id,
+    ) if args.exact_dialog_id is not None or args.exact_topic_id is not None else None
 
-        messages = list(history_execution.messages)
-        text = format_messages(
-            messages,
-            reply_map=history_execution.reply_map,
-            reaction_names_map=history_execution.reaction_names_map,
-            topic_name_getter=history_execution.topic_name_getter,
+    async with connected_client() as client:
+        history_execution = await _execute_history_read_capability(
+            client,
+            cache=cache,
+            dialog_query=args.dialog,
+            limit=args.limit,
+            navigation=args.navigation,
+            sender_query=args.sender,
+            topic_query=args.topic,
+            unread=args.unread,
+            retry_tool="ListMessages",
+            resolve_dialog=_resolve_dialog,
+            get_sender_type=_get_sender_type,
+            reaction_names_threshold=REACTION_NAMES_THRESHOLD,
+            load_topics=_load_dialog_topics,
+            fetch_topic_messages_fn=_fetch_topic_messages,
+            refresh_topic_by_id_fn=_refresh_topic_by_id,
+            exact=exact,
         )
-        if not text:
-            text = _topic_empty_state_text(unread=args.unread)
+    if isinstance(
+        history_execution,
+        (
+            capabilities.DialogTargetFailure,
+            capabilities.ForumTopicFailure,
+            capabilities.MessageReadFailure,
+            capabilities.NavigationFailure,
+        ),
+    ):
+        return ToolResult(content=_text_response(history_execution.text), has_filter=has_filter, has_cursor=has_cursor)
 
-        result_count = len(messages)
-        topic_prefix = (
-            f"[topic: {history_execution.topic_name}]\n"
-            if history_execution.topic_name
-            else ""
-        )
-        result_text = history_execution.resolve_prefix + topic_prefix + text
-        if history_execution.navigation is not None:
-            result_text += f"\n\nnext_navigation: {history_execution.navigation.token}"
-        result = [TextContent(type="text", text=result_text)]
-    except Exception as exc:
-        error_type = type(exc).__name__
-        raise
-    finally:
-        duration_ms = (time.monotonic() - t0) * 1000
-        try:
-            from .analytics import TelemetryEvent
-            collector = _get_analytics_collector()
-            collector.record_event(TelemetryEvent(
-                tool_name="ListMessages",
-                timestamp=time.time(),
-                duration_ms=duration_ms,
-                result_count=result_count,
-                has_cursor=(
-                    args.navigation is not None
-                    and args.navigation not in {"newest", "oldest"}
-                ),
-                page_depth=page_depth,
-                has_filter=has_filter,
-                error_type=error_type,
-            ))
-        except Exception as e:
-            logger.error("Failed to record telemetry for ListMessages: %s", e)
+    messages = list(history_execution.messages)
+    text = format_messages(
+        messages,
+        reply_map=history_execution.reply_map,
+        reaction_names_map=history_execution.reaction_names_map,
+        topic_name_getter=history_execution.topic_name_getter,
+    )
+    if not text:
+        text = _topic_empty_state_text(unread=args.unread)
 
-    return result
+    topic_prefix = (
+        f"[topic: {history_execution.topic_name}]\n"
+        if history_execution.topic_name
+        else ""
+    )
+    result_text = history_execution.resolve_prefix + topic_prefix + text
+    if history_execution.navigation is not None:
+        result_text += f"\n\nnext_navigation: {history_execution.navigation.token}"
+    return ToolResult(
+        content=_text_response(result_text),
+        result_count=len(messages),
+        has_filter=has_filter,
+        has_cursor=has_cursor,
+    )
 
 
 ### SearchMessages ###
@@ -1359,15 +1346,17 @@ class SearchMessages(ToolArgs):
     """
 
     dialog: str = Field(
+        max_length=500,
         description=(
             "Dialog selector for one scoped search. Accepts an exact numeric dialog id for the "
             "direct path, or @username / fuzzy dialog name for the ambiguity-safe path."
         )
     )
-    query: str
+    query: str = Field(max_length=500)
     limit: int = 20
     navigation: str | None = Field(
         default=None,
+        max_length=2000,
         description=(
             "Optional shared navigation state. Omit navigation to start from the first search "
             "page. Reuse the exact next_navigation token from the previous SearchMessages "
@@ -1377,84 +1366,62 @@ class SearchMessages(ToolArgs):
 
 
 @tool_runner.register
-async def search_messages(
-    args: SearchMessages,
-) -> t.Sequence[TextContent | ImageContent | EmbeddedResource]:
-    """Search messages with telemetry recording."""
-    logger.info("method[SearchMessages] args[%s]", args)
-    t0 = time.monotonic()
-    error_type = None
-    result_count = 0
-    page_depth = 1
+@_track_tool_telemetry("SearchMessages")
+async def search_messages(args: SearchMessages) -> ToolResult:
+    cache = get_entity_cache()
+    exact_dialog_id = _extract_exact_dialog_id(args.dialog)
+    dialog_query = None if exact_dialog_id is not None else args.dialog
+    exact_dialog_name = None
+    if exact_dialog_id is not None:
+        cached_entity = cache.get(exact_dialog_id, GROUP_TTL)
+        if cached_entity is None:
+            cached_entity = cache.get(exact_dialog_id, USER_TTL)
+        if cached_entity is not None:
+            cached_name = cached_entity.get("name")
+            if isinstance(cached_name, str) and cached_name:
+                exact_dialog_name = cached_name
 
-    try:
-        cache = get_entity_cache()
-        exact_dialog_id = _extract_exact_dialog_id(args.dialog)
-        dialog_query = None if exact_dialog_id is not None else args.dialog
-        exact_dialog_name = None
-        if exact_dialog_id is not None:
-            cached_entity = cache.get(exact_dialog_id, GROUP_TTL)
-            if cached_entity is None:
-                cached_entity = cache.get(exact_dialog_id, USER_TTL)
-            if cached_entity is not None:
-                cached_name = cached_entity.get("name")
-                if isinstance(cached_name, str) and cached_name:
-                    exact_dialog_name = cached_name
-        async with connected_client() as client:
-            search_execution = await _execute_search_messages_capability(
-                client,
-                cache=cache,
-                dialog_query=dialog_query,
-                query=args.query,
-                limit=args.limit,
-                navigation=args.navigation,
-                retry_tool="SearchMessages",
-                resolve_dialog=_resolve_dialog,
-                get_sender_type=_get_sender_type,
-                reaction_names_threshold=REACTION_NAMES_THRESHOLD,
-                exact_dialog_id=exact_dialog_id,
-                exact_dialog_name=exact_dialog_name,
-            )
-        if isinstance(
-            search_execution,
-            capabilities.DialogTargetFailure | capabilities.NavigationFailure,
-        ):
-            return [TextContent(type="text", text=search_execution.text)]
+    exact = ExactTargetHints(
+        dialog_id=exact_dialog_id,
+        dialog_name=exact_dialog_name,
+    ) if exact_dialog_id is not None else None
 
-        hits = list(search_execution.hits)
-        result_count = len(hits)
-        if hits:
-            result_text = search_execution.resolve_prefix + search_execution.rendered_text
-        else:
-            result_text = search_execution.resolve_prefix + _search_no_hits_text(
-                search_execution.dialog_name,
-                args.query,
-            )
-        if search_execution.navigation is not None:
-            result_text += f"\n\nnext_navigation: {search_execution.navigation.token}"
-        result = [TextContent(type="text", text=result_text)]
-    except Exception as exc:
-        error_type = type(exc).__name__
-        raise
-    finally:
-        duration_ms = (time.monotonic() - t0) * 1000
-        try:
-            from .analytics import TelemetryEvent
-            collector = _get_analytics_collector()
-            collector.record_event(TelemetryEvent(
-                tool_name="SearchMessages",
-                timestamp=time.time(),
-                duration_ms=duration_ms,
-                result_count=result_count,
-                has_cursor=args.navigation is not None,
-                page_depth=page_depth,
-                has_filter=True,  # search is inherently filtered
-                error_type=error_type,
-            ))
-        except Exception as e:
-            logger.error("Failed to record telemetry for SearchMessages: %s", e)
+    async with connected_client() as client:
+        search_execution = await _execute_search_messages_capability(
+            client,
+            cache=cache,
+            dialog_query=dialog_query,
+            query=args.query,
+            limit=args.limit,
+            navigation=args.navigation,
+            retry_tool="SearchMessages",
+            resolve_dialog=_resolve_dialog,
+            get_sender_type=_get_sender_type,
+            reaction_names_threshold=REACTION_NAMES_THRESHOLD,
+            exact=exact,
+        )
+    if isinstance(
+        search_execution,
+        capabilities.DialogTargetFailure | capabilities.NavigationFailure,
+    ):
+        return ToolResult(content=_text_response(search_execution.text), has_filter=True, has_cursor=args.navigation is not None)
 
-    return result
+    hits = list(search_execution.hits)
+    if hits:
+        result_text = search_execution.resolve_prefix + search_execution.rendered_text
+    else:
+        result_text = search_execution.resolve_prefix + _search_no_hits_text(
+            search_execution.dialog_name,
+            args.query,
+        )
+    if search_execution.navigation is not None:
+        result_text += f"\n\nnext_navigation: {search_execution.navigation.token}"
+    return ToolResult(
+        content=_text_response(result_text),
+        result_count=len(hits),
+        has_filter=True,
+        has_cursor=args.navigation is not None,
+    )
 
 
 ### GetMe ###
@@ -1467,48 +1434,19 @@ class GetMyAccount(ToolArgs):
 
 
 @tool_runner.register
-async def get_my_account(args: GetMyAccount) -> t.Sequence[TextContent | ImageContent | EmbeddedResource]:
-    """Return own account info with telemetry recording."""
-    logger.info("method[GetMyAccount] args[%s]", args)
-    t0 = time.monotonic()
-    error_type = None
-    result_count = 0
-
-    try:
-        async with connected_client() as client:
-            me = await client.get_me()
-        if me is None:
-            return [TextContent(type="text", text=_not_authenticated_text("GetMyAccount"))]
-        name = " ".join(filter(None, [
-            getattr(me, "first_name", None),
-            getattr(me, "last_name", None),
-        ]))
-        username = getattr(me, "username", None) or "none"
-        text = f"id={me.id} name='{name}' username=@{username}"
-        result_count = 1
-        result = [TextContent(type="text", text=text)]
-    except Exception as exc:
-        error_type = type(exc).__name__
-        raise
-    finally:
-        duration_ms = (time.monotonic() - t0) * 1000
-        try:
-            from .analytics import TelemetryEvent
-            collector = _get_analytics_collector()
-            collector.record_event(TelemetryEvent(
-                tool_name="GetMyAccount",
-                timestamp=time.time(),
-                duration_ms=duration_ms,
-                result_count=result_count,
-                has_cursor=False,
-                page_depth=1,
-                has_filter=False,
-                error_type=error_type,
-            ))
-        except Exception as e:
-            logger.error("Failed to record telemetry for GetMyAccount: %s", e)
-
-    return result
+@_track_tool_telemetry("GetMyAccount")
+async def get_my_account(args: GetMyAccount) -> ToolResult:
+    async with connected_client() as client:
+        me = await client.get_me()
+    if me is None:
+        return ToolResult(content=_text_response(_not_authenticated_text("GetMyAccount")))
+    name = " ".join(filter(None, [
+        getattr(me, "first_name", None),
+        getattr(me, "last_name", None),
+    ]))
+    username = getattr(me, "username", None) or "none"
+    text = f"id={me.id} name='{name}' username=@{username}"
+    return ToolResult(content=_text_response(text), result_count=1)
 
 
 ### GetUserInfo ###
@@ -1520,97 +1458,67 @@ class GetUserInfo(ToolArgs):
     the list of chats shared with this account. Resolves the name via fuzzy match.
     """
 
-    user: str
+    user: str = Field(max_length=500)
 
 
 @tool_runner.register
-async def get_user_info(args: GetUserInfo) -> t.Sequence[TextContent | ImageContent | EmbeddedResource]:
-    """Look up user info with telemetry recording."""
-    logger.info("method[GetUserInfo] args[%s]", args)
-    t0 = time.monotonic()
-    error_type = None
-    result_count = 0
+@_track_tool_telemetry("GetUserInfo")
+async def get_user_info(args: GetUserInfo) -> ToolResult:
+    cache = get_entity_cache()
+    choices = cache.all_names_with_ttl(USER_TTL, GROUP_TTL)
+    normalized = cache.all_names_normalized_with_ttl(USER_TTL, GROUP_TTL)
+    resolve_result = resolve(args.user, choices, cache, normalized_choices=normalized)
+    if isinstance(resolve_result, NotFound):
+        return ToolResult(content=_text_response(_user_not_found_text(args.user, retry_tool="GetUserInfo")))
+    if isinstance(resolve_result, Candidates):
+        match_lines = []
+        for match in resolve_result.matches:
+            line = f'id={match["entity_id"]} name="{match["display_name"]}" score={match["score"]}'
+            if match.get("username"):
+                line += f' @{match["username"]}'
+            if match.get("entity_type"):
+                line += f' [{match["entity_type"]}]'
+            match_lines.append(line)
+        return ToolResult(content=_text_response(
+            _ambiguous_user_text(args.user, match_lines, retry_tool="GetUserInfo"),
+        ))
+    entity_id: int = resolve_result.entity_id
+    display_name: str = resolve_result.display_name
 
-    try:
-        cache = get_entity_cache()
-        result = resolve(args.user, cache.all_names_with_ttl(USER_TTL, GROUP_TTL), cache)
-        if isinstance(result, NotFound):
-            return [TextContent(type="text", text=_user_not_found_text(args.user, retry_tool="GetUserInfo"))]
-        if isinstance(result, Candidates):
-            match_lines = []
-            for match in result.matches:
-                line = f'id={match["entity_id"]} name="{match["display_name"]}" score={match["score"]}'
-                if match.get("username"):
-                    line += f' @{match["username"]}'
-                if match.get("entity_type"):
-                    line += f' [{match["entity_type"]}]'
-                match_lines.append(line)
-            return [
-                TextContent(
-                    type="text",
-                    text=_ambiguous_user_text(args.user, match_lines, retry_tool="GetUserInfo"),
-                )
-            ]
-        entity_id: int = result.entity_id
-        display_name: str = result.display_name
-
-        async with connected_client() as client:
-            try:
-                user = await client.get_entity(entity_id)
-                common_result = await client(GetCommonChatsRequest(
-                    user_id=entity_id,
-                    max_id=0,
-                    limit=100,
-                ))
-            except Exception as exc:
-                return [TextContent(type="text", text=_fetch_user_info_error_text(args.user, str(exc)))]
-
-        name = " ".join(filter(None, [
-            getattr(user, "first_name", None),
-            getattr(user, "last_name", None),
-        ]))
-        username = getattr(user, "username", None) or "none"
-        chat_lines = []
-        for chat in common_result.chats:
-            chat_name = getattr(chat, "title", None) or getattr(chat, "first_name", str(chat.id))
-            full_id = get_peer_id(chat)
-            if isinstance(chat, Channel):
-                ctype = "supergroup" if getattr(chat, "megagroup", False) else "channel"
-            elif isinstance(chat, Chat):
-                ctype = "group"
-            else:
-                ctype = "user"
-            chat_lines.append(f"  id={full_id} type={ctype} name='{chat_name}'")
-        chats_text = "\n".join(chat_lines) if chat_lines else "  (none)"
-        text = (
-            f'[resolved: "{display_name}"]\n'
-            f"id={entity_id} name='{name}' username=@{username}\n"
-            f"Common chats ({len(common_result.chats)}):\n{chats_text}"
-        )
-        result_count = 1
-        result = [TextContent(type="text", text=text)]
-    except Exception as exc:
-        error_type = type(exc).__name__
-        raise
-    finally:
-        duration_ms = (time.monotonic() - t0) * 1000
+    async with connected_client() as client:
         try:
-            from .analytics import TelemetryEvent
-            collector = _get_analytics_collector()
-            collector.record_event(TelemetryEvent(
-                tool_name="GetUserInfo",
-                timestamp=time.time(),
-                duration_ms=duration_ms,
-                result_count=result_count,
-                has_cursor=False,
-                page_depth=1,
-                has_filter=False,
-                error_type=error_type,
+            user = await client.get_entity(entity_id)
+            common_result = await client(GetCommonChatsRequest(
+                user_id=entity_id,
+                max_id=0,
+                limit=100,
             ))
-        except Exception as e:
-            logger.error("Failed to record telemetry for GetUserInfo: %s", e)
+        except Exception as exc:
+            return ToolResult(content=_text_response(_fetch_user_info_error_text(args.user, str(exc))))
 
-    return result
+    name = " ".join(filter(None, [
+        getattr(user, "first_name", None),
+        getattr(user, "last_name", None),
+    ]))
+    username = getattr(user, "username", None) or "none"
+    chat_lines = []
+    for chat in common_result.chats:
+        chat_name = getattr(chat, "title", None) or getattr(chat, "first_name", str(chat.id))
+        full_id = get_peer_id(chat)
+        if isinstance(chat, Channel):
+            ctype = "supergroup" if getattr(chat, "megagroup", False) else "channel"
+        elif isinstance(chat, Chat):
+            ctype = "group"
+        else:
+            ctype = "user"
+        chat_lines.append(f"  id={full_id} type={ctype} name='{chat_name}'")
+    chats_text = "\n".join(chat_lines) if chat_lines else "  (none)"
+    text = (
+        f'[resolved: "{display_name}"]\n'
+        f"id={entity_id} name='{name}' username=@{username}\n"
+        f"Common chats ({len(common_result.chats)}):\n{chats_text}"
+    )
+    return ToolResult(content=_text_response(text), result_count=1)
 
 
 ### GetUsageStats ###
@@ -1766,16 +1674,38 @@ async def get_usage_stats(args: GetUsageStats) -> t.Sequence[TextContent | Image
             }
         )
 
-        return [TextContent(type="text", text=summary if summary else _no_usage_data_text())]
+        return _text_response(summary if summary else _no_usage_data_text())
 
     except FileNotFoundError:
-        return [TextContent(type="text", text=_usage_stats_db_missing_text())]
+        return _text_response(_usage_stats_db_missing_text())
     except sqlite3.OperationalError as exc:
         # Table doesn't exist or DB not initialized yet
         if "no such table" in str(exc):
-            return [TextContent(type="text", text=_usage_stats_db_missing_text())]
+            return _text_response(_usage_stats_db_missing_text())
         logger.error("GetUsageStats query failed: %s", exc)
-        return [TextContent(type="text", text=_usage_stats_query_error_text(type(exc).__name__))]
+        return _text_response(_usage_stats_query_error_text(type(exc).__name__))
     except Exception as exc:
         logger.error("GetUsageStats query failed: %s", exc)
-        return [TextContent(type="text", text=_usage_stats_query_error_text(type(exc).__name__))]
+        return _text_response(_usage_stats_query_error_text(type(exc).__name__))
+
+
+# ---------------------------------------------------------------------------
+# Explicit tool registry — replaces class introspection + sys.modules lookup
+# ---------------------------------------------------------------------------
+
+TOOL_REGISTRY: dict[str, type[ToolArgs]] = {
+    "ListDialogs": ListDialogs,
+    "ListTopics": ListTopics,
+    "ListMessages": ListMessages,
+    "SearchMessages": SearchMessages,
+    "GetMyAccount": GetMyAccount,
+    "GetUserInfo": GetUserInfo,
+    "GetUsageStats": GetUsageStats,
+}
+
+
+def verify_tool_registry() -> None:
+    """Startup check: every registry entry has a matching class name and runner."""
+    for name, cls in TOOL_REGISTRY.items():
+        assert cls.__name__ == name, f"Registry key {name!r} != class {cls.__name__!r}"
+        assert tool_runner.dispatch(cls) is not tool_runner, f"No runner for {name}"
