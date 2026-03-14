@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import json
 import sqlite3
 import time
@@ -8,7 +9,7 @@ from pathlib import Path
 USER_TTL: int = 2_592_000   # 30 days
 GROUP_TTL: int = 604_800    # 7 days
 
-_DDL = """
+_ENTITY_TABLE_DDL = """
 CREATE TABLE IF NOT EXISTS entities (
     id         INTEGER PRIMARY KEY,
     type       TEXT NOT NULL,
@@ -18,43 +19,200 @@ CREATE TABLE IF NOT EXISTS entities (
 );
 """
 
+_DDL = _ENTITY_TABLE_DDL
+
+_ENTITY_UPDATED_INDEX_DDL = """
+CREATE INDEX IF NOT EXISTS idx_entities_type_updated
+ON entities(type, updated_at)
+"""
+
+_ENTITY_USERNAME_INDEX_DDL = """
+CREATE INDEX IF NOT EXISTS idx_entities_username
+ON entities(username)
+"""
+
+_REACTION_TABLE_DDL = """
+CREATE TABLE IF NOT EXISTS reaction_metadata (
+    message_id INTEGER NOT NULL,
+    dialog_id INTEGER NOT NULL,
+    emoji TEXT NOT NULL,
+    reactor_names TEXT NOT NULL,
+    fetched_at INTEGER NOT NULL,
+    PRIMARY KEY (message_id, dialog_id, emoji)
+)
+"""
+
+_REACTION_INDEX_DDL = """
+CREATE INDEX IF NOT EXISTS idx_reactions_dialog_message
+ON reaction_metadata(dialog_id, message_id)
+"""
+
+_TOPIC_TABLE_DDL = """
+CREATE TABLE IF NOT EXISTS topic_metadata (
+    dialog_id      INTEGER NOT NULL,
+    topic_id       INTEGER NOT NULL,
+    title          TEXT NOT NULL,
+    top_message_id INTEGER,
+    is_general     INTEGER NOT NULL,
+    is_deleted     INTEGER NOT NULL,
+    inaccessible_error TEXT,
+    inaccessible_at INTEGER,
+    updated_at     INTEGER NOT NULL,
+    PRIMARY KEY (dialog_id, topic_id)
+)
+"""
+
+_TOPIC_INDEX_DDL = """
+CREATE INDEX IF NOT EXISTS idx_topic_metadata_dialog_updated
+ON topic_metadata(dialog_id, updated_at)
+"""
+
+_TOPIC_REQUIRED_COLUMNS = {
+    "inaccessible_error": "TEXT",
+    "inaccessible_at": "INTEGER",
+}
+
+
+def _open_connection(db_path: Path) -> sqlite3.Connection:
+    """Open a SQLite connection with the shared busy-timeout policy."""
+    conn = sqlite3.connect(str(db_path), timeout=30.0)
+    conn.execute("PRAGMA busy_timeout=30000")
+    return conn
+
+
+def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table_name,),
+    ).fetchone()
+    return row is not None
+
+
+def _index_exists(conn: sqlite3.Connection, index_name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
+        (index_name,),
+    ).fetchone()
+    return row is not None
+
+
+def _topic_columns_ready(conn: sqlite3.Connection) -> bool:
+    if not _table_exists(conn, "topic_metadata"):
+        return False
+
+    rows = conn.execute("PRAGMA table_info(topic_metadata)").fetchall()
+    existing_columns = {str(row[1]) for row in rows}
+    return set(_TOPIC_REQUIRED_COLUMNS).issubset(existing_columns)
+
+
+def _database_bootstrap_required(conn: sqlite3.Connection) -> bool:
+    journal_mode_row = conn.execute("PRAGMA journal_mode").fetchone()
+    if journal_mode_row is None or str(journal_mode_row[0]).lower() != "wal":
+        return True
+
+    if not _table_exists(conn, "entities"):
+        return True
+    if not _index_exists(conn, "idx_entities_type_updated"):
+        return True
+    if not _index_exists(conn, "idx_entities_username"):
+        return True
+    if not _table_exists(conn, "reaction_metadata"):
+        return True
+    if not _index_exists(conn, "idx_reactions_dialog_message"):
+        return True
+    if not _topic_columns_ready(conn):
+        return True
+    if not _index_exists(conn, "idx_topic_metadata_dialog_updated"):
+        return True
+    return False
+
+
+def _apply_topic_column_upgrades(conn: sqlite3.Connection) -> None:
+    rows = conn.execute("PRAGMA table_info(topic_metadata)").fetchall()
+    existing_columns = {str(row[1]) for row in rows}
+    for column_name, column_type in _TOPIC_REQUIRED_COLUMNS.items():
+        if column_name in existing_columns:
+            continue
+        conn.execute(
+            f"ALTER TABLE topic_metadata ADD COLUMN {column_name} {column_type}"
+        )
+
+
+def _bootstrap_cache_schema(conn: sqlite3.Connection) -> None:
+    """Apply one-time schema and journal-mode setup on a dedicated connection."""
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.OperationalError as exc:
+        if "locked" not in str(exc).lower():
+            raise
+
+    conn.execute(_ENTITY_TABLE_DDL)
+    conn.execute(_ENTITY_UPDATED_INDEX_DDL)
+    conn.execute(_ENTITY_USERNAME_INDEX_DDL)
+    conn.execute(_REACTION_TABLE_DDL)
+    conn.execute(_REACTION_INDEX_DDL)
+    conn.execute(_TOPIC_TABLE_DDL)
+    _apply_topic_column_upgrades(conn)
+    conn.execute(_TOPIC_INDEX_DDL)
+    conn.commit()
+
+
+def _ensure_cache_schema(db_path: Path) -> None:
+    """Serialize one-time cache bootstrap so normal opens stay read-safe."""
+    probe_conn = _open_connection(db_path)
+    try:
+        if not _database_bootstrap_required(probe_conn):
+            return
+    finally:
+        probe_conn.close()
+
+    lock_path = db_path.with_suffix(f"{db_path.suffix}.bootstrap.lock")
+    with lock_path.open("a", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        bootstrap_conn = _open_connection(db_path)
+        try:
+            if _database_bootstrap_required(bootstrap_conn):
+                _bootstrap_cache_schema(bootstrap_conn)
+        finally:
+            bootstrap_conn.close()
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _get_connection_db_path(conn: sqlite3.Connection) -> Path | None:
+    rows = conn.execute("PRAGMA database_list").fetchall()
+    for row in rows:
+        if len(row) < 3:
+            continue
+        database_name = str(row[1])
+        if database_name != "main":
+            continue
+        filename = str(row[2])
+        if not filename:
+            return None
+        return Path(filename)
+    return None
+
+
+def _ensure_connection_schema(conn: sqlite3.Connection) -> None:
+    """Ensure supporting cache tables exist for a shared or standalone connection."""
+    if not _database_bootstrap_required(conn):
+        return
+
+    db_path = _get_connection_db_path(conn)
+    if db_path is None:
+        _bootstrap_cache_schema(conn)
+        return
+
+    _ensure_cache_schema(db_path)
+
 
 class EntityCache:
     """SQLite-backed cache for Telegram entity metadata with TTL support."""
 
     def __init__(self, db_path: Path) -> None:
-        """Open (or create) the SQLite database at db_path and ensure the schema exists."""
-        self._conn = sqlite3.connect(str(db_path), isolation_level=None, timeout=30.0)
-        self._conn.execute("PRAGMA busy_timeout=30000")
-        try:
-            self._conn.execute("PRAGMA journal_mode=WAL")
-        except sqlite3.OperationalError as exc:
-            if "locked" not in str(exc).lower():
-                raise
-        self._conn.isolation_level = ""  # back to transactional
-        self._conn.execute(_DDL)
-        self._conn.commit()
-
-        # Create indexes for performance optimization
-        # idx_entities_type_updated: for TTL filtering in all_names_with_ttl()
-        # Allows efficient seeks by (type, updated_at) instead of full table scan
-        self._conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_entities_type_updated
-            ON entities(type, updated_at)
-        """)
-
-        # idx_entities_username: for username lookups in get_by_username()
-        # Allows efficient seeks by username instead of full table scan
-        self._conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_entities_username
-            ON entities(username)
-        """)
-
-        self._conn.commit()
-
-        # Rebuild statistics so query planner uses the new indexes
-        self._conn.execute("PRAGMA optimize")
-        self._conn.commit()
+        """Open (or create) the SQLite database at db_path after shared bootstrap checks."""
+        _ensure_cache_schema(db_path)
+        self._conn = _open_connection(db_path)
 
     def upsert(
         self,
@@ -137,22 +295,8 @@ class ReactionMetadataCache:
         self._init_table()
 
     def _init_table(self) -> None:
-        """Create reaction_metadata table and index if they don't exist."""
-        self._conn.execute("""
-            CREATE TABLE IF NOT EXISTS reaction_metadata (
-                message_id INTEGER NOT NULL,
-                dialog_id INTEGER NOT NULL,
-                emoji TEXT NOT NULL,
-                reactor_names TEXT NOT NULL,
-                fetched_at INTEGER NOT NULL,
-                PRIMARY KEY (message_id, dialog_id, emoji)
-            )
-        """)
-        self._conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_reactions_dialog_message
-            ON reaction_metadata(dialog_id, message_id)
-        """)
-        self._conn.commit()
+        """Ensure reaction cache schema exists without rerunning hot-path bootstrap work."""
+        _ensure_connection_schema(self._conn)
 
     def get(self, message_id: int, dialog_id: int, ttl_seconds: int = 600) -> dict[str, list[str]] | None:
         """Return cached reactions {emoji: [names]} if fresh, else None.
@@ -207,32 +351,8 @@ class TopicMetadataCache:
         self._init_table()
 
     def _init_table(self) -> None:
-        """Create topic_metadata table and dialog lookup index if they don't exist."""
-        self._conn.execute("""
-            CREATE TABLE IF NOT EXISTS topic_metadata (
-                dialog_id      INTEGER NOT NULL,
-                topic_id       INTEGER NOT NULL,
-                title          TEXT NOT NULL,
-                top_message_id INTEGER,
-                is_general     INTEGER NOT NULL,
-                is_deleted     INTEGER NOT NULL,
-                inaccessible_error TEXT,
-                inaccessible_at INTEGER,
-                updated_at     INTEGER NOT NULL,
-                PRIMARY KEY (dialog_id, topic_id)
-            )
-        """)
-        self._ensure_columns(
-            required_columns={
-                "inaccessible_error": "TEXT",
-                "inaccessible_at": "INTEGER",
-            }
-        )
-        self._conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_topic_metadata_dialog_updated
-            ON topic_metadata(dialog_id, updated_at)
-        """)
-        self._conn.commit()
+        """Ensure topic cache schema exists without rerunning hot-path bootstrap work."""
+        _ensure_connection_schema(self._conn)
 
     def _ensure_columns(self, required_columns: dict[str, str]) -> None:
         """Add missing topic_metadata columns for forward-compatible cache upgrades."""
