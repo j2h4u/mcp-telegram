@@ -363,8 +363,48 @@ async def test_list_messages_adapter_delegates_to_history_capability(
     assert "Delegated topic update" in result[0].text
     assert "next_navigation: nav-token" in result[0].text
     assert capability.await_args.kwargs["topic_query"] == "Release Notes"
-    assert "exact_dialog_id" not in capability.await_args.kwargs
-    assert "exact_topic_id" not in capability.await_args.kwargs
+    assert capability.await_args.kwargs["exact_dialog_id"] is None
+    assert capability.await_args.kwargs["exact_topic_id"] is None
+
+
+async def test_list_messages_adapter_routes_exact_selectors_to_history_capability(
+    tmp_db_path,
+    mock_client,
+    monkeypatch,
+    make_mock_message,
+):
+    """ListMessages forwards exact direct-read selectors into the shared history capability."""
+    from mcp_telegram.tools import list_messages
+
+    cache = EntityCache(tmp_db_path)
+    message = make_mock_message(id=30, text="Direct topic update")
+    capability = AsyncMock(
+        return_value=HistoryReadExecution(
+            entity_id=701,
+            resolve_prefix="",
+            topic_name="Release Notes",
+            messages=(message,),
+            fetched_messages=(message,),
+            reply_map={},
+            reaction_names_map={},
+            topic_name_getter=None,
+            next_cursor=None,
+            navigation=None,
+        )
+    )
+
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr("mcp_telegram.tools._execute_history_read_capability", capability)
+
+    result = await list_messages(ListMessages(exact_dialog_id=701, exact_topic_id=11, limit=1))
+
+    assert result[0].text.startswith("[topic: Release Notes]\n")
+    assert "Direct topic update" in result[0].text
+    assert capability.await_args.kwargs["dialog_query"] is None
+    assert capability.await_args.kwargs["topic_query"] is None
+    assert capability.await_args.kwargs["exact_dialog_id"] == 701
+    assert capability.await_args.kwargs["exact_topic_id"] == 11
 
 
 async def test_search_messages_adapter_delegates_to_capability_execution(
@@ -773,6 +813,77 @@ async def test_list_messages_cross_topic_pages_include_inline_topic_labels(
     assert "[topic: Release Notes] 10:00 Иван: Shipped topic update" in result[0].text
 
 
+async def test_list_messages_exact_topic_direct_read_skips_resolution_and_catalog(
+    tmp_db_path,
+    mock_client,
+    monkeypatch,
+    make_mock_message,
+    make_mock_topic,
+):
+    """Known dialog/topic ids use the direct read path instead of discovery-oriented setup."""
+    from mcp_telegram.tools import list_messages
+
+    cache = EntityCache(tmp_db_path)
+    cache.upsert(701, "group", "Backend Forum", None)
+    topic = make_mock_topic(topic_id=11, title="Release Notes", top_message_id=5011)
+    TopicMetadataCache(cache._conn).upsert_topics(701, [topic])
+    message = make_mock_message(id=77, text="Direct exact topic read")
+    resolve_dialog = AsyncMock()
+    load_dialog_topics = AsyncMock()
+
+    mock_client.iter_messages = MagicMock(return_value=_async_iter([message]))
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr("mcp_telegram.tools._resolve_dialog", resolve_dialog)
+    monkeypatch.setattr("mcp_telegram.tools._load_dialog_topics", load_dialog_topics)
+
+    result = await list_messages(ListMessages(exact_dialog_id=701, exact_topic_id=11))
+
+    assert result[0].text.startswith("[topic: Release Notes]\n")
+    assert "Direct exact topic read" in result[0].text
+    assert mock_client.iter_messages.call_args.kwargs["reply_to"] == 5011
+    assert resolve_dialog.await_count == 0
+    assert load_dialog_topics.await_count == 0
+
+
+async def test_list_messages_exact_general_topic_direct_read_avoids_reply_to(
+    tmp_db_path,
+    mock_client,
+    monkeypatch,
+    make_general_topic_message,
+    make_mock_topic,
+):
+    """Known General topic ids keep the direct path without switching into thread fetch mode."""
+    from mcp_telegram.tools import list_messages
+
+    cache = EntityCache(tmp_db_path)
+    cache.upsert(701, "group", "Backend Forum", None)
+    general_topic = make_mock_topic(
+        topic_id=1,
+        title="General",
+        top_message_id=None,
+        is_general=True,
+    )
+    TopicMetadataCache(cache._conn).upsert_topics(701, [general_topic])
+    message = make_general_topic_message(id=77, text="General update")
+    resolve_dialog = AsyncMock()
+    load_dialog_topics = AsyncMock()
+
+    mock_client.iter_messages = MagicMock(return_value=_async_iter([message]))
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr("mcp_telegram.tools._resolve_dialog", resolve_dialog)
+    monkeypatch.setattr("mcp_telegram.tools._load_dialog_topics", load_dialog_topics)
+
+    result = await list_messages(ListMessages(exact_dialog_id=701, exact_topic_id=1))
+
+    assert result[0].text.startswith("[topic: General]\n")
+    assert "General update" in result[0].text
+    assert "reply_to" not in mock_client.iter_messages.call_args.kwargs
+    assert resolve_dialog.await_count == 0
+    assert load_dialog_topics.await_count == 0
+
+
 async def test_list_messages_topic_cursor_round_trip(
     tmp_db_path,
     mock_client,
@@ -1105,6 +1216,58 @@ async def test_list_messages_topic_unread_cursor_is_topic_scoped(
     )
 
 
+async def test_list_messages_exact_topic_unread_cursor_is_topic_scoped(
+    tmp_db_path,
+    mock_client,
+    monkeypatch,
+    make_general_topic_message,
+    make_mock_message,
+    make_mock_topic,
+    make_mock_forum_reply,
+):
+    """Direct exact topic reads keep unread continuation anchored to emitted topic messages."""
+    from mcp_telegram.pagination import encode_history_navigation
+    from mcp_telegram.tools import list_messages
+
+    cache = EntityCache(tmp_db_path)
+    cache.upsert(701, "group", "Backend Forum", None)
+    topic = make_mock_topic(topic_id=11, title="Release Notes", top_message_id=5011)
+    TopicMetadataCache(cache._conn).upsert_topics(701, [topic])
+    target_reply = make_mock_forum_reply(reply_to_msg_id=5011, reply_to_top_id=5011)
+
+    topic_newest = make_mock_message(id=90, text="Topic unread newest")
+    topic_newest.reply_to = target_reply
+    leaked_general = make_general_topic_message(id=89, text="General unread leak")
+    topic_older = make_mock_message(id=88, text="Topic unread older")
+    topic_older.reply_to = target_reply
+    resolve_dialog = AsyncMock()
+    load_dialog_topics = AsyncMock()
+
+    mock_client.get_input_entity = AsyncMock(return_value=MagicMock())
+    mock_client.side_effect = [MagicMock(dialogs=[MagicMock(read_inbox_max_id=50, unread_count=3)])]
+    mock_client.iter_messages = MagicMock(
+        return_value=_async_iter([topic_newest, leaked_general, topic_older])
+    )
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr("mcp_telegram.tools._resolve_dialog", resolve_dialog)
+    monkeypatch.setattr("mcp_telegram.tools._load_dialog_topics", load_dialog_topics)
+
+    result = await list_messages(
+        ListMessages(exact_dialog_id=701, exact_topic_id=11, unread=True, limit=2)
+    )
+
+    assert "General unread leak" not in result[0].text
+    assert "Topic unread newest" in result[0].text
+    assert "Topic unread older" in result[0].text
+    assert (
+        f"next_navigation: {encode_history_navigation(88, 701, topic_id=11, direction='newest')}"
+        in result[0].text
+    )
+    assert resolve_dialog.await_count == 0
+    assert load_dialog_topics.await_count == 0
+
+
 async def test_list_messages_topic_unread_filters_dialog_leaks(
     tmp_db_path,
     mock_client,
@@ -1301,6 +1464,41 @@ async def test_list_messages_deleted_topic_behavior(
     assert mock_client.iter_messages.call_count == 0
 
 
+async def test_list_messages_exact_deleted_topic_behavior(
+    tmp_db_path,
+    mock_client,
+    monkeypatch,
+    make_deleted_topic,
+):
+    """Known deleted topic ids return the cached tombstone instead of attempting a fetch."""
+    from mcp_telegram.tools import list_messages
+
+    cache = EntityCache(tmp_db_path)
+    cache.upsert(701, "group", "Backend Forum", None)
+    deleted_topic = make_deleted_topic(
+        topic_id=9,
+        title="Deprecated Topic",
+        top_message_id=5009,
+    )
+    TopicMetadataCache(cache._conn).upsert_topics(701, [deleted_topic])
+    resolve_dialog = AsyncMock()
+    load_dialog_topics = AsyncMock()
+
+    mock_client.iter_messages = MagicMock(return_value=_async_iter([]))
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr("mcp_telegram.tools._resolve_dialog", resolve_dialog)
+    monkeypatch.setattr("mcp_telegram.tools._load_dialog_topics", load_dialog_topics)
+
+    result = await list_messages(ListMessages(exact_dialog_id=701, exact_topic_id=9))
+
+    assert 'Topic "Deprecated Topic" was deleted and can no longer be fetched.' in result[0].text
+    assert "Action:" in result[0].text
+    assert mock_client.iter_messages.call_count == 0
+    assert resolve_dialog.await_count == 0
+    assert load_dialog_topics.await_count == 0
+
+
 async def test_list_messages_private_or_inaccessible_topic_behavior(
     tmp_db_path,
     mock_client,
@@ -1332,6 +1530,37 @@ async def test_list_messages_private_or_inaccessible_topic_behavior(
 
     assert 'Topic "Release Notes" resolved, but Telegram rejected thread fetch (TOPIC_PRIVATE).' in result[0].text
     assert "Action:" in result[0].text
+
+
+async def test_list_messages_exact_topic_inaccessible_behavior(
+    tmp_db_path,
+    mock_client,
+    monkeypatch,
+    make_mock_topic,
+    make_private_topic_error,
+):
+    """Known topic ids keep the explicit inaccessible-topic contract on the direct-read path."""
+    from mcp_telegram.tools import list_messages
+
+    cache = EntityCache(tmp_db_path)
+    cache.upsert(701, "group", "Backend Forum", None)
+    topic = make_mock_topic(topic_id=11, title="Release Notes", top_message_id=5011)
+    TopicMetadataCache(cache._conn).upsert_topics(701, [topic])
+    resolve_dialog = AsyncMock()
+    load_dialog_topics = AsyncMock()
+
+    mock_client.iter_messages = MagicMock(side_effect=make_private_topic_error())
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr("mcp_telegram.tools._resolve_dialog", resolve_dialog)
+    monkeypatch.setattr("mcp_telegram.tools._load_dialog_topics", load_dialog_topics)
+
+    result = await list_messages(ListMessages(exact_dialog_id=701, exact_topic_id=11))
+
+    assert 'Topic "Release Notes" resolved, but Telegram rejected thread fetch (TOPIC_PRIVATE).' in result[0].text
+    assert "Action:" in result[0].text
+    assert resolve_dialog.await_count == 0
+    assert load_dialog_topics.await_count == 0
 
 
 async def test_list_messages_topic_retries_after_stale_top_message_id(
