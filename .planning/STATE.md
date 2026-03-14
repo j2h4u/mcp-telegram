@@ -103,10 +103,9 @@ Progress: [██████████] 100%
 
 ### Pending Todos
 
-- 3 pending in `.planning/todos/pending`
+- 2 pending in `.planning/todos/pending`
 - `2026-03-13-refactor-mcp-tool-surface-around-capability-oriented-best-practices.md`
 - `2026-03-13-carry-deferred-v1-1-cleanup-and-forum-validation.md`
-- `2026-03-14-harden-sqlite-cache-against-parallel-mcp-sessions.md`
 
 ### Blockers/Concerns
 
