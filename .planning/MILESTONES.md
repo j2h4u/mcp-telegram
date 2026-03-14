@@ -1,5 +1,28 @@
 # Milestones
 
+## v1.3 Medium Implementation (Shipped: 2026-03-14)
+
+**Phases completed:** 5 phases, 15 plans, 39 tasks
+
+**Key accomplishments:**
+- Dedicated `server.call_tool()` tests now distinguish escaped validation/runtime failures from handler-local action-text recovery.
+- `server.call_tool()` now returns stage-aware actionable escaped-error text and the restarted container proves the live boundary matches the repo contract.
+- Dialog-target and forum-topic capability seams with typed outcomes, stale-anchor recovery, and direct seam tests behind unchanged public MCP tool names
+- Shared capability execution now owns topic listing, history-read setup, topic recovery, and message enrichment while `ListTopics` and `ListMessages` stay thin MCP adapters
+- Shared SearchMessages execution seam with centralized dialog resolution, enrichment, seam-proof tests, and restarted runtime validation
+- Shared opaque history/search navigation tokens with capability-level continuation metadata and mismatch-safe reuse guards
+- ListMessages shared navigation surface with newest/oldest entry modes, topic-safe continuation tokens, and reflected MCP schema proof
+- SearchMessages shared navigation surface, bounded telemetry proof, and restarted-runtime schema verification
+- Exact dialog-id and topic-id capability entrypoints with cache-backed topic recovery and contract tests that keep ambiguity and topic-fidelity guarantees intact
+- `ListMessages` now exposes exact dialog and topic selectors, keeps forum-topic fidelity intact, and proves the changed contract through brownfield tests and local reflection
+- SearchMessages now accepts direct numeric dialog selectors through the existing contract, renders hit-local groups from the shared seam, and is proven in both local reflection and the rebuilt runtime.
+- Shared SQLite cache bootstrap is now serialized and read-safe across parallel MCP session startup, with regression tests and rebuilt-runtime proof that direct read/search workflows still hold.
+- Status:
+- One-liner:
+- Posture-aware contract runtime parity proved and privacy gates reconfirmed at rollout close.
+
+---
+
 ## v1.2 MCP Surface Research (Shipped: 2026-03-13)
 
 **Phases completed:** 4 phases, 12 plans, 32 tasks

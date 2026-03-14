@@ -82,6 +82,48 @@
 
 ---
 
+## Milestone: v1.3 — Medium Implementation
+
+**Shipped:** 2026-03-14
+**Phases:** 5 | **Plans:** 15 | **Sessions:** ~3
+
+### What Was Built
+- Actionable server-boundary error recovery replacing generic `Tool <name> failed` collapse
+- Capability-oriented internal seams (`capabilities.py`) for dialog, topic, read, and search behavior
+- Unified navigation contract (`navigation`/`next_navigation`) replacing cursor/offset/from_beginning
+- Direct read/search workflows with exact dialog_id/topic_id selectors
+- Surface posture classification (TOOL_POSTURE dict + description prefix tags)
+- Parallel-session-safe SQLite cache bootstrap with lock file serialization
+
+### What Worked
+- **Restarted-runtime verification at every phase**: catching drift between repo and container early prevented accumulation of stale-contract bugs.
+- **Capability extraction before surface changes**: Phase 15 seams made Phases 16-17 navigation and workflow changes surgical instead of requiring tool-body rewrites.
+- **Gap-closure plan pattern**: Plan 17-04 was inserted after Phase 17 verification found a real production race condition, and the fix stayed bounded to `cache.py` with no scope creep.
+- **Brownfield test anchoring**: existing tests survived all 15 plans without requiring rewrites, proving the refactor was truly non-breaking.
+
+### What Was Inefficient
+- **Phase 18 SUMMARY one-liners**: Plans 18-01 and 18-02 had malformed SUMMARY frontmatter, causing blank one-liners in the MILESTONES.md entry. SUMMARY extraction should be validated before archival.
+- **STATE.md body drift**: the human-readable body of STATE.md often lagged the frontmatter after `state advance-plan` failures, requiring manual normalization.
+- **v1.2 audit skipped for v1.3**: no formal milestone audit was run. Phase 18's inline verification was sufficient in practice, but the pattern is less systematic.
+
+### Patterns Established
+- **Capability-first refactoring**: extract shared behavior into typed seams, then thin the public adapters — keeps brownfield tests stable throughout.
+- **Navigation as opaque tokens**: encode continuation state (direction, scope, position) in base64 tokens so the public API has one field instead of many.
+- **Direct selectors as opt-in shortcuts**: exact-target parameters coexist with fuzzy name resolution without breaking the default path.
+
+### Key Lessons
+1. **Extract seams before changing surfaces.** Phase 15 made Phases 16-18 dramatically simpler because shared behavior already lived in one place.
+2. **Rebuilt-runtime verification catches real bugs.** Plan 17-04's cache race condition was invisible in tests but broke the live container under parallel sessions.
+3. **SUMMARY frontmatter must be validated.** Malformed one-liners in 18-01/18-02 propagated to MILESTONES.md — add a check before archival.
+4. **Inline verification can substitute for formal audit when the milestone has built-in acceptance gates.** Phase 18 effectively was the audit for v1.3.
+
+### Cost Observations
+- Model mix: ~60% sonnet (execution), ~30% opus (planning/research), ~10% haiku
+- Sessions: ~3 sessions across 2 days (2026-03-13 to 2026-03-14)
+- Notable: 15 plans in 2 days — capability extraction in Phase 15 (3 plans, ~17 min total) was the fastest phase and unlocked the most downstream value
+
+---
+
 ## Cross-Milestone Trends
 
 ### Process Evolution
@@ -90,16 +132,20 @@
 |-----------|----------|--------|------------|
 | v1.0 | ~5 | 5 | Established TDD stub->implement pattern; audit before archive |
 | v1.2 | ~1 | 4 | Established evidence->audit->options->memo pattern for research-only milestones |
+| v1.3 | ~3 | 5 | Established capability-first refactoring and rebuilt-runtime verification gates |
 
 ### Cumulative Quality
 
-| Milestone | Tests | Zero-Dep Additions |
-|-----------|-------|--------------------|
+| Milestone | Tests | Key Addition |
+|-----------|-------|--------------|
 | v1.0 | 57 | format_messages() (no Telethon at import) |
-| v1.2 | 169 | decision memo, audit frame, and reflected-runtime acceptance-gate pattern |
+| v1.2 | 169 | decision memo, audit frame, reflected-runtime acceptance-gate pattern |
+| v1.3 | 200+ | capabilities.py (shared seams), unified navigation, direct selectors |
 
 ### Top Lessons (Verified Across Milestones)
 
 1. Audit before archive — milestone audit catches SUMMARY/reality gaps before they become known gaps
 2. Stub -> implement in 2-plan pairs — consistent, parallelizable, zero regressions
 3. Freeze live runtime reality early when planning docs and shipped surface might drift
+4. Extract seams before changing surfaces — capability-first refactoring keeps brownfield tests stable
+5. Rebuilt-runtime verification catches real bugs that tests miss (parallel session races, stale schemas)

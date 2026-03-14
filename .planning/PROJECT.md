@@ -15,28 +15,16 @@ boilerplate before every real task.
 
 ## Current State
 
-Latest shipped milestone: `v1.2 MCP Surface Research` on 2026-03-13.
+Latest shipped milestone: `v1.3 Medium Implementation` on 2026-03-14.
 
-The live product surface is still the shipped `v1.1` runtime: 7 read-only MCP tools on Python 3.13,
-Telethon, the MCP SDK, SQLite caches, and Docker + `mcp-proxy`, with 169 passing tests captured
-before the research milestone began.
+The live runtime now has capability-oriented internal seams, unified navigation contract, direct
+read/search workflows, and surface posture classification. 7 read-only MCP tools on Python 3.13,
+Telethon, the MCP SDK, SQLite caches (with parallel-session-safe bootstrap), and Docker + `mcp-proxy`.
+~12,800 LOC Python, 200+ passing tests.
 
-`v1.2` added no runtime behavior. It produced the evidence hierarchy, comparative audit, option
-matrix, Pareto recommendation, and implementation memo that now define the next coding milestone.
-
-The active milestone is `v1.3 Medium Implementation`. It turns the `v1.2` Medium-path
-recommendation into a bounded coding milestone that starts at Phase 14 and ships through explicit
-reflection, restarted-runtime, and privacy-safe telemetry gates.
-
-## Current Milestone: v1.3 Medium Implementation
-
-**Goal:** Implement the Medium-path MCP surface refactor in small verified steps, keeping the
-migration bounded and observable instead of turning it into a speculative Maximal rewrite.
-
-**Target features:**
-- Clean up server-boundary failures so escaped tool errors keep actionable recovery direction.
-- Introduce capability-oriented internal seams behind the public tool adapters.
-- Unify continuation and reshape primary read/search workflows with restarted-runtime verification.
+The Medium-path refactor from the `v1.2` research is complete: server boundary failures are
+actionable, public tools delegate to capability seams, continuation uses one shared vocabulary,
+and primary workflows skip unnecessary helper steps.
 
 ## Requirements
 
@@ -69,16 +57,22 @@ migration bounded and observable instead of turning it into a speculative Maxima
 - ✓ Medium-path Pareto recommendation for the next implementation milestone — v1.2
 - ✓ Implementation-ready sequencing memo with runtime validation gates and open questions — v1.2
 
+- ✓ Actionable server-boundary error recovery with stage-aware detail — v1.3
+- ✓ Capability-oriented internal seams for read, search, and topic behavior — v1.3
+- ✓ Unified navigation contract replacing split cursor/offset/from_beginning — v1.3
+- ✓ Direct read/search workflows reducing helper-first choreography — v1.3
+- ✓ Surface posture classification (primary vs secondary) with runtime proof — v1.3
+- ✓ Parallel-session-safe SQLite cache bootstrap — v1.3
+- ✓ Privacy-safe telemetry verified after surface changes — v1.3
+
 ### Active
 
-- [ ] Ship the bounded Medium-path implementation milestone from the `v1.2` memo.
-- [ ] Reduce helper-step burden in primary read/search workflows without losing topic fidelity.
-- [ ] Prove every public-contract move through tests, reflected schemas, restarted runtime, and privacy-safe telemetry checks.
+(None — next milestone requirements TBD via `/gsd:new-milestone`)
 
 ### Backlog Candidates
 
-- Deferred `v1.1` cleanup and large-forum validation if they do not block the Medium implementation path.
-- Broader Maximal-path tool-surface redesign after the Medium migration lands cleanly.
+- Deferred `v1.1` cleanup and large-forum validation.
+- Broader Maximal-path tool-surface redesign after Medium migration has proven stable.
 - Native eval or benchmark harnesses for measuring model burden reduction over time.
 
 ### Out of Scope
@@ -91,28 +85,20 @@ migration bounded and observable instead of turning it into a speculative Maxima
 - Message content caching — messages always fetched fresh from API
 - Group membership table in entity cache — high staleness risk, no v1 tool depends on it
 - `transliterate` dependency — rapidfuzz WRatio proved sufficient for Latin+Cyrillic; add only if validated against real contacts
-- Backward-compatibility shims by default — cleaner Medium contract wins unless a concrete client constraint forces compatibility work
-- Maximal surface compression or large structured-output redesign — explicitly deferred until after the Medium migration proves the new seams
+- Maximal surface compression or large structured-output redesign — deferred until Medium migration has proven stable in production
 
 ## Context
 
-Shipped runtime remains `v1.1`: 7 MCP tools and 169 passing tests.
+Shipped runtime: `v1.3` — 7 MCP tools, ~12,800 LOC Python, 200+ passing tests.
 Tech stack: Python 3.13, Telethon, MCP SDK, Pydantic v2, rapidfuzz, SQLite (WAL).
-Deployment remains Docker-based with stdio MCP transport and `mcp-proxy` for HTTP/SSE access.
-
-**v1.2 outcomes now available for planning:**
-- Retained-source evidence hierarchy and brownfield baseline for future tool-surface work.
-- Comparative audit of the seven-tool MCP surface across tool-level and workflow-level pressure points.
-- Medium-path recommendation with explicit rejected alternatives and bounded Maximal prep.
-- Implementation memo defining sequencing, open questions, and runtime freshness gates.
+Deployment: Docker-based with stdio MCP transport and `mcp-proxy` for HTTP/SSE access.
 
 **Known deferred follow-ups:**
 - Large-forum live validation using `.planning/phases/09-forum-topics-support/09-MANUAL-VALIDATION.md`
 - `tz` param accepted by `format_messages()` but never passed at call sites — defaults to UTC
-- Dead imports in `tools.py:18` (TelegramClient, custom, functions, types)
+- Dead imports in `tools.py` (TelegramClient, custom, functions, types)
 - `EntityCache.all_names()` orphaned by `all_names_with_ttl()` — safe to remove
-- Reflected tool-schema freshness remains an operational risk until the follow-on implementation milestone executes rebuild/restart verification.
-- Phase VALIDATION artifacts for 10-13 remain partial even though the milestone audit passed with `tech_debt` status.
+- Phase VALIDATION artifacts for 10-13 remain partial (v1.2 audit passed with `tech_debt` status)
 
 ## Key Decisions
 
@@ -135,7 +121,12 @@ Deployment remains Docker-based with stdio MCP transport and `mcp-proxy` for HTT
 | Freeze the redesign baseline against the reflected seven-tool runtime | Stale planning notes were already drifting from the real surface | ✓ Good — all v1.2 artifacts share one authoritative baseline |
 | Choose the Medium path as the next milestone | Removes a large share of model burden with the smallest safe change set | ✓ Good — adopted as the implementation direction |
 | Require reflected-schema checks plus restarted-runtime freshness once public schemas move | Prevents stale container/runtime contracts after MCP-surface changes | ✓ Good — mandatory acceptance gate for the next coding milestone |
-| Do not preserve backward compatibility by default for the Medium path | Cleaner contract is more valuable than shims unless a concrete client forces them | — Pending — validate against implementation constraints during the next milestone |
+| Do not preserve backward compatibility by default for the Medium path | Cleaner contract is more valuable than shims unless a concrete client forces them | ✓ Good — shipped without shims; no client breakage observed |
+| Capability-oriented seams behind public tools | Shared read/search/topic behavior evolves through one internal path | ✓ Good — tools are thin adapters, capability layer owns orchestration |
+| Unified navigation contract (navigation/next_navigation) | One continuation vocabulary instead of cursor/offset/from_beginning | ✓ Good — both read and search use the same model |
+| Direct selectors (dialog_id, topic_id) on public tools | Skip helper choreography when target is known | ✓ Good — reduces LLM steps for common workflows |
+| Surface posture as code-level constant (TOOL_POSTURE) | Single source of truth for primary/secondary classification | ✓ Good — reflected in code, tests, and tool descriptions |
+| Lock file for parallel cache bootstrap | Prevents SQLite contention across concurrent MCP sessions | ✓ Good — fixed production race condition |
 
 ## Constraints
 
@@ -143,6 +134,21 @@ Deployment remains Docker-based with stdio MCP transport and `mcp-proxy` for HTT
 - **Fuzzy matching**: rapidfuzz only (transliterate still deferred)
 - **Privacy**: No real user IDs, names, or usernames in planning docs or code comments
 - **Read-only**: Permanent constraint — write tools expand prompt injection blast radius dramatically
+
+<details>
+<summary>Archived v1.3 milestone notes</summary>
+
+**Goal:** Implement the Medium-path MCP surface refactor in small verified steps, keeping the
+migration bounded and observable instead of turning it into a speculative Maximal rewrite.
+
+**Delivered:**
+- Actionable server-boundary error recovery replacing generic failure collapse
+- Capability-oriented internal seams for read, search, and topic behavior
+- Unified navigation contract across read and search workflows
+- Direct read/search workflows reducing helper-first choreography
+- Surface posture classification with runtime proof and privacy verification
+
+</details>
 
 <details>
 <summary>Archived v1.2 milestone notes</summary>
@@ -159,4 +165,4 @@ surface against them, and produce grounded recommendations for a future refactor
 </details>
 
 ---
-*Last updated: 2026-03-14 after starting milestone v1.3*
+*Last updated: 2026-03-14 after v1.3 milestone*
