@@ -1621,15 +1621,20 @@ async def list_unread_messages(args: ListUnreadMessages) -> ToolResult:
                 empty_msg = "Нет непрочитанных сообщений."
             return ToolResult(content=_text_response(empty_msg))
 
-        # Sort by: mentions first → human DMs → bot DMs → groups → recency
-        unread_chats.sort(
-            key=lambda c: (
-                -(c["unread_mentions_count"] > 0),  # Mentions first
-                -int(c["is_user"] and not c["is_bot"]),  # Human DMs before bots
-                -int(c["is_user"] and c["is_bot"]),  # Bot DMs before groups
-                -(c["date"].timestamp() if c["date"] else 0),  # Newest first
-            )
-        )
+        # Priority tiers (highest first):
+        #   1. Any chat with unread @mentions — someone directly addressing the user
+        #   2. Human DMs (1-on-1 with real people)
+        #   3. Bot DMs (notifications, digests — useful but not urgent)
+        #   4. Groups (small groups included by scope filter)
+        #   Within each tier: newest message first.
+        def _sort_priority(c: dict) -> tuple:
+            has_mentions = c["unread_mentions_count"] > 0
+            is_human_dm = c["is_user"] and not c["is_bot"]
+            is_bot_dm = c["is_user"] and c["is_bot"]
+            recency = c["date"].timestamp() if c["date"] else 0
+            return (-has_mentions, -is_human_dm, -is_bot_dm, -recency)
+
+        unread_chats.sort(key=_sort_priority)
 
         # Allocate budget
         allocation = allocate_message_budget_proportional(unread_counts, args.limit)
