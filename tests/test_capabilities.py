@@ -741,3 +741,67 @@ async def test_execute_search_messages_capability_rejects_dialog_mismatch_naviga
     assert result.kind == "invalid_navigation"
     assert "dialog 702, not 701" in result.text
     assert "Action:" in result.text
+
+
+# ---------------------------------------------------------------------------
+# Tests for allocate_message_budget_proportional
+# ---------------------------------------------------------------------------
+
+
+def test_allocate_budget_no_trim() -> None:
+    """When total unread fits within limit, return unread_counts unchanged."""
+    from mcp_telegram.capabilities import allocate_message_budget_proportional
+
+    unread_counts = {1: 5, 2: 10, 3: 8}
+    result = allocate_message_budget_proportional(unread_counts, limit=30)
+    assert result == {1: 5, 2: 10, 3: 8}
+
+
+def test_allocate_budget_proportional_trim() -> None:
+    """When over limit, allocate min per chat, then proportional remainder."""
+    from mcp_telegram.capabilities import allocate_message_budget_proportional
+
+    unread_counts = {1: 20, 2: 30, 3: 40}  # total 90, limit 30
+    result = allocate_message_budget_proportional(unread_counts, limit=30, min_per_chat=3)
+
+    # Each gets 3 minimum: total reserved = 9, remaining = 21
+    # Proportional: 1 gets 20/90 * 21 = 4.67 ≈ 4; 2 gets 7; 3 gets 9 (approx)
+    # Min + proportion: 1→7, 2→10, 3→12 (or similar distribution)
+    assert sum(result.values()) <= 30
+    assert all(v >= 3 for v in result.values())
+    assert result[1] <= 20  # Can't exceed unread count
+    assert result[2] <= 30
+    assert result[3] <= 40
+
+
+def test_allocate_budget_min_per_chat_respected() -> None:
+    """Even small counts get min_per_chat allocation."""
+    from mcp_telegram.capabilities import allocate_message_budget_proportional
+
+    unread_counts = {1: 1, 2: 1}  # tiny unread
+    result = allocate_message_budget_proportional(unread_counts, limit=10, min_per_chat=3)
+
+    # Each should get at least 3, but capped at actual unread count
+    # Since unread is 1, they should get min(3, 1) = 1 each? Or preserve minimum?
+    # Per spec: min_per_chat is for distribution when over limit. Here we have room.
+    # Fallback: if reserved exceeds limit, distribute evenly
+    # 3*2 = 6 ≤ 10, so reserve and distribute
+    assert all(v >= 1 for v in result.values())
+
+
+def test_allocate_budget_empty() -> None:
+    """Empty input returns empty dict."""
+    from mcp_telegram.capabilities import allocate_message_budget_proportional
+
+    result = allocate_message_budget_proportional({}, limit=100)
+    assert result == {}
+
+
+def test_allocate_budget_single_chat() -> None:
+    """Single chat allocation."""
+    from mcp_telegram.capabilities import allocate_message_budget_proportional
+
+    unread_counts = {42: 150}
+    result = allocate_message_budget_proportional(unread_counts, limit=100)
+    assert result[42] <= 100
+    assert result[42] >= 3

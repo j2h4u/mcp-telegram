@@ -375,3 +375,73 @@ def _describe_document(media: object) -> str:
         pass
 
     return "[документ]"
+
+
+# ---------------------------------------------------------------------------
+# Format unread messages grouped by chat
+# ---------------------------------------------------------------------------
+
+
+def format_unread_messages_grouped(
+    chats_data: list[dict],
+    tz: ZoneInfo | None = None,
+) -> str:
+    """Format unread messages grouped by chat with budget allocation applied.
+
+    Args:
+        chats_data: List of dicts, each containing:
+            - chat_id: int
+            - display_name: str
+            - unread_count: int (total unread in chat)
+            - unread_mentions_count: int
+            - messages: list[MessageLike] (already sorted by time)
+            - budget_for_chat: int (allocated budget)
+            - total_in_chat: int (real total unread, may be > budget_for_chat)
+            - is_channel: bool (if True, show count only, skip messages)
+        tz: Timezone for formatting (defaults to UTC)
+
+    Returns:
+        Formatted string with grouped chats and "[и ещё N]" markers where trimmed
+    """
+    if not chats_data:
+        return ""
+
+    parts: list[str] = []
+
+    for chat in chats_data:
+        chat_id = chat.get("chat_id")
+        display_name = chat.get("display_name", f"Chat {chat_id}")
+        unread_count = chat.get("unread_count", 0)
+        unread_mentions_count = chat.get("unread_mentions_count", 0)
+        messages = chat.get("messages", [])
+        budget_for_chat = chat.get("budget_for_chat", 0)
+        total_in_chat = chat.get("total_in_chat", unread_count)
+        is_channel = chat.get("is_channel", False)
+
+        # Build header: "--- Name (N непрочитанных{, M упоминания}{, id=X}) ---"
+        header_parts = [f"{unread_count} непрочитанных"]
+        if unread_mentions_count > 0:
+            mention_word = "упоминание" if unread_mentions_count == 1 else "упоминания" if unread_mentions_count % 10 in [2, 3, 4] else "упоминаний"
+            header_parts.append(f"{unread_mentions_count} {mention_word}")
+        header_parts.append(f"id={chat_id}")
+        header_text = ", ".join(header_parts)
+        header = f"--- {display_name} ({header_text}) ---"
+        parts.append(header)
+
+        # For channels, just show header (no messages)
+        if is_channel:
+            continue
+
+        # Format messages (trim to budget)
+        if messages:
+            messages_to_show = messages[:budget_for_chat]
+            formatted = format_messages(messages_to_show, {}, tz=tz)
+            if formatted:
+                parts.append(formatted)
+
+        # Add "[и ещё N]" marker if trimmed
+        if budget_for_chat < total_in_chat:
+            remaining = total_in_chat - budget_for_chat
+            parts.append(f"[и ещё {remaining}]")
+
+    return "\n".join(parts)
