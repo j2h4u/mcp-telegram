@@ -45,6 +45,19 @@ GENERAL_TOPIC_TITLE = "General"
 
 logger = logging.getLogger(__name__)
 
+# Canonical tool-surface posture for the current Medium-era contract.
+# Primary tools satisfy user tasks directly; secondary/helper tools support
+# navigation, discovery, or operator inspection.
+TOOL_POSTURE: dict[str, str] = {
+    "ListMessages": "primary",
+    "SearchMessages": "primary",
+    "GetUserInfo": "primary",
+    "ListDialogs": "secondary/helper",
+    "ListTopics": "secondary/helper",
+    "GetMyAccount": "secondary/helper",
+    "GetUsageStats": "secondary/helper",
+}
+
 
 def _build_get_forum_topics_request(
     *,
@@ -142,9 +155,11 @@ async def tool_runner(
 
 def tool_description(args: type[ToolArgs]) -> Tool:
     schema = _sanitize_tool_schema(args.model_json_schema())
+    posture = TOOL_POSTURE.get(args.__name__, "")
+    prefix = f"[{posture}] " if posture else ""
     return Tool(
         name=args.__name__,
-        description=args.__doc__,
+        description=f"{prefix}{args.__doc__}",
         inputSchema=schema,
     )
 
