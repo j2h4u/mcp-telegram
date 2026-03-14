@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import logging
+import re
+import sqlite3
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from anyascii import anyascii
 from rapidfuzz import fuzz, process, utils
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from .cache import EntityCache
@@ -11,16 +17,10 @@ if TYPE_CHECKING:
 AUTO_THRESHOLD = 90
 CANDIDATE_THRESHOLD = 60
 
-# Cyrillic → Latin transliteration table (multi-char mappings first)
-_CYR_TO_LAT: list[tuple[str, str]] = [
-    ("ж", "zh"), ("ё", "yo"), ("х", "kh"), ("ц", "ts"), ("ч", "ch"),
-    ("ш", "sh"), ("щ", "sch"), ("ю", "yu"), ("я", "ya"),
-    ("а", "a"), ("б", "b"), ("в", "v"), ("г", "g"), ("д", "d"),
-    ("е", "e"), ("з", "z"), ("и", "i"), ("й", "y"), ("к", "k"),
-    ("л", "l"), ("м", "m"), ("н", "n"), ("о", "o"), ("п", "p"),
-    ("р", "r"), ("с", "s"), ("т", "t"), ("у", "u"), ("ф", "f"),
-    ("ъ", ""), ("ы", "y"), ("ь", ""), ("э", "e"),
-]
+
+def latinize(text: str) -> str:
+    """Normalize any-script text to lowercase Latin for fuzzy matching."""
+    return re.sub(r"[^a-z0-9 ]+", "", anyascii(text).lower()).strip()
 
 
 @dataclass(frozen=True)
@@ -54,29 +54,43 @@ def _parse_numeric_query(query: str) -> int | None:
     return None
 
 
-def _has_cyrillic(text: str) -> bool:
-    return any("\u0400" <= c <= "\u04ff" for c in text)
+def _fuzzy_resolve(
+    query: str,
+    choices: dict[int, str],
+    cache: EntityCache | None = None,
+    *,
+    normalized_choices: dict[int, str] | None = None,
+) -> ResolveResult:
+    """Fuzzy match query against choices in normalized (Latin) space.
 
-
-def _transliterate(text: str) -> str:
-    result = text.lower()
-    for cyr, lat in _CYR_TO_LAT:
-        result = result.replace(cyr, lat)
-    return result
-
-
-def _fuzzy_resolve(query: str, choices: dict[int, str], cache: EntityCache | None = None) -> ResolveResult:
-    """Fuzzy match query against choices.
-
-    - All hits >=60 extracted into matches list
-    - Apply exact case-insensitive filter → if match found, return Resolved
-    - Otherwise → always return Candidates (even single fuzzy hit >=90)
+    - Normalizes both query and choices via latinize()
+    - Exact normalized match with multi-word query → Resolved
+    - Single-word query with ≥2 hits → always Candidates (even if exact)
+    - Otherwise exact normalized match → Resolved
+    - No exact → all hits ≥60 as Candidates
     """
-    name_to_id: dict[str, int] = {name: eid for eid, name in choices.items()}
+    # Build normalized lookup: norm_name → (entity_id, original_name)
+    if normalized_choices is not None:
+        norm_map: dict[str, list[tuple[int, str]]] = {}
+        for eid, norm_name in normalized_choices.items():
+            original_name = choices.get(eid, norm_name)
+            norm_map.setdefault(norm_name, []).append((eid, original_name))
+    else:
+        norm_map = {}
+        for eid, name in choices.items():
+            norm_name = latinize(name)
+            norm_map.setdefault(norm_name, []).append((eid, name))
+
+    # Flatten to {norm_name: first_eid} for rapidfuzz (it needs unique keys)
+    norm_name_to_id: dict[str, int] = {}
+    for norm_name, entries in norm_map.items():
+        norm_name_to_id[norm_name] = entries[0][0]
+
+    norm_query = latinize(query)
 
     hits = process.extract(
-        query,
-        name_to_id.keys(),
+        norm_query,
+        norm_name_to_id.keys(),
         scorer=fuzz.WRatio,
         processor=utils.default_process,
         score_cutoff=CANDIDATE_THRESHOLD,
@@ -86,52 +100,100 @@ def _fuzzy_resolve(query: str, choices: dict[int, str], cache: EntityCache | Non
     if not hits:
         return NotFound(query=query)
 
-    # Check for exact case-insensitive match among all hits
-    query_lower = query.lower().strip()
-    for name, score, _idx in hits:
-        if name.lower().strip() == query_lower:
-            entity_id = name_to_id[name]
-            return Resolved(entity_id=entity_id, display_name=name)
+    is_single_word = " " not in query.strip()
 
-    # No exact match → return all hits as Candidates with metadata
-    matches = []
-    for name, score, _idx in hits:
-        entity_id = name_to_id[name]
-        entity_info = {
-            "entity_id": entity_id,
-            "display_name": name,
-            "score": int(score),
-            "username": None,
-            "entity_type": None,
-        }
-        # Fetch metadata from cache if available
-        if cache:
-            try:
-                cached = cache.get(entity_id, ttl_seconds=300)  # 5-min TTL for metadata
-                if cached:
-                    entity_info["username"] = cached.get("username")
-                    entity_info["entity_type"] = cached.get("type")
-            except Exception:
-                pass  # Ignore cache errors, use None values
-        matches.append(entity_info)
+    # Check for exact normalized match
+    exact_entity_id: int | None = None
+    exact_display_name: str | None = None
+    for norm_name, _score, _idx in hits:
+        if norm_name == norm_query:
+            entries = norm_map[norm_name]
+            exact_entity_id = entries[0][0]
+            exact_display_name = entries[0][1]
+            break
 
+    # Single-word caution: if ≥2 total hits and single word → always Candidates
+    if is_single_word and len(hits) >= 2:
+        # Build matches, putting exact first if found
+        matches = _build_matches(hits, norm_map, cache, exact_first_id=exact_entity_id)
+        return Candidates(query=query, matches=matches)
+
+    # Multi-word or single hit: exact match → Resolved
+    if exact_entity_id is not None:
+        return Resolved(entity_id=exact_entity_id, display_name=exact_display_name)  # type: ignore[arg-type]
+
+    # No exact match → Candidates
+    matches = _build_matches(hits, norm_map, cache)
     return Candidates(query=query, matches=matches)
 
 
-def resolve(query: str, choices: dict[int, str], cache: EntityCache | None = None) -> ResolveResult:
-    """Resolve query to entity using 5-case logic.
+def _build_matches(
+    hits: list[tuple[str, float, int]],
+    norm_map: dict[str, list[tuple[int, str]]],
+    cache: EntityCache | None,
+    exact_first_id: int | None = None,
+) -> list[dict]:
+    """Build match dicts from rapidfuzz hits, optionally putting exact_first_id first."""
+    matches: list[dict] = []
+    seen_ids: set[int] = set()
+
+    # Put exact match first if requested
+    if exact_first_id is not None:
+        for norm_name, score, _idx in hits:
+            for eid, original_name in norm_map.get(norm_name, []):
+                if eid == exact_first_id and eid not in seen_ids:
+                    seen_ids.add(eid)
+                    matches.append(_make_match_info(eid, original_name, int(score), cache))
+
+    for norm_name, score, _idx in hits:
+        for eid, original_name in norm_map.get(norm_name, []):
+            if eid in seen_ids:
+                continue
+            seen_ids.add(eid)
+            matches.append(_make_match_info(eid, original_name, int(score), cache))
+
+    return matches
+
+
+def _make_match_info(entity_id: int, display_name: str, score: int, cache: EntityCache | None) -> dict:
+    entity_info: dict = {
+        "entity_id": entity_id,
+        "display_name": display_name,
+        "score": score,
+        "username": None,
+        "entity_type": None,
+    }
+    if cache:
+        try:
+            cached = cache.get(entity_id, ttl_seconds=300)
+            if cached:
+                entity_info["username"] = cached.get("username")
+                entity_info["entity_type"] = cached.get("type")
+        except (sqlite3.OperationalError, sqlite3.DatabaseError, OSError):
+            pass
+        except Exception:
+            logger.warning("unexpected cache error in fuzzy resolve for entity_id=%r", entity_id, exc_info=True)
+    return entity_info
+
+
+def resolve(
+    query: str,
+    choices: dict[int, str],
+    cache: EntityCache | None = None,
+    *,
+    normalized_choices: dict[int, str] | None = None,
+) -> ResolveResult:
+    """Resolve query to entity using normalized matching.
 
     Case 1: Numeric ID query → Resolved/NotFound by id
     Case 2: @username query → lookup in cache, Resolved/NotFound (requires cache)
-    Case 3: Exact case-insensitive string match → Resolved
-    Case 4: All fuzzy matches >=60 → Candidates (don't auto-resolve single fuzzy hit >=90)
-    Case 5: No matches >=60 → NotFound
-    Bonus: Cyrillic query → retry with transliteration if initial attempt fails
+    Case 3-5: Fuzzy matching in latinized space with single-word caution
 
     Args:
         query: User input (numeric ID, @username, or name string)
         choices: {entity_id: name} mapping
         cache: Optional EntityCache for @username lookup and metadata fetch
+        normalized_choices: Optional pre-computed {entity_id: latinized_name} for perf
 
     Returns:
         Resolved | Candidates | NotFound
@@ -145,22 +207,17 @@ def resolve(query: str, choices: dict[int, str], cache: EntityCache | None = Non
 
     # Case 2: @username query
     if query.startswith("@") and cache:
-        username_query = query[1:]  # Strip @
+        username_query = query[1:]
         try:
-            # Search cache for entity with matching username
             result = cache.get_by_username(username_query)
             if result:
                 entity_id, name = result
                 return Resolved(entity_id=entity_id, display_name=name)
+        except (sqlite3.OperationalError, sqlite3.DatabaseError, OSError):
+            pass
         except Exception:
-            pass  # Ignore cache errors
+            logger.warning("unexpected cache error in @username resolve for query=%r", query, exc_info=True)
         return NotFound(query=query)
 
-    # Cases 3-5: Fuzzy matching with exact match priority
-    result = _fuzzy_resolve(query, choices, cache)
-
-    # Retry with transliteration if Cyrillic query didn't resolve
-    if isinstance(result, NotFound) and _has_cyrillic(query):
-        result = _fuzzy_resolve(_transliterate(query), choices, cache)
-
-    return result
+    # Cases 3-5: Fuzzy matching in normalized space
+    return _fuzzy_resolve(query, choices, cache, normalized_choices=normalized_choices)

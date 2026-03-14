@@ -3,8 +3,20 @@ from __future__ import annotations
 import pytest
 from unittest.mock import MagicMock
 
-from mcp_telegram.resolver import Candidates, NotFound, Resolved, resolve
+from mcp_telegram.resolver import Candidates, NotFound, Resolved, latinize, resolve
 from mcp_telegram.cache import EntityCache
+
+
+def test_latinize_cyrillic() -> None:
+    assert latinize("Ольга Петрова") == "olga petrova"
+
+
+def test_latinize_latin() -> None:
+    assert latinize("Olga Petrova") == "olga petrova"
+
+
+def test_latinize_mixed() -> None:
+    assert latinize("Café résumé") == "cafe resume"
 
 
 def test_resolve_exact_match(sample_entities: dict) -> None:
@@ -34,7 +46,6 @@ def test_negative_numeric_query() -> None:
 
 
 def test_ambiguity(sample_entities: dict) -> None:
-    # Both "Ivan Petrov" and "Ivan's Team Chat" start with "Ivan" — both should score >=90 with WRatio
     choices = {201: "Ivan Petrov", 202: "Ivan's Team Chat"}
     result = resolve("Ivan", choices)
     assert isinstance(result, Candidates)
@@ -43,7 +54,6 @@ def test_ambiguity(sample_entities: dict) -> None:
 
 
 def test_sender_resolution(sample_entities: dict) -> None:
-    # Sender resolution uses the same resolve() with {sender_id: name} dict — no separate code path
     sender_map = {501: "Иван Петров", 502: "Анна Иванова"}
     result = resolve("Анна Иванова", sender_map)
     assert isinstance(result, Resolved)
@@ -58,22 +68,49 @@ def test_not_found(sample_entities: dict) -> None:
 
 
 def test_below_candidate_threshold(sample_entities: dict) -> None:
-    # A query that should score < 60 against all choices
     result = resolve("qqqqzzzz", sample_entities)
     assert isinstance(result, NotFound)
     assert result.query == "qqqqzzzz"
 
 
-def test_single_low_score_match_returns_candidates() -> None:
-    """Single candidate in 60-89 range → now returns Candidates (NEW behavior).
+def test_cross_script_resolves_via_normalization() -> None:
+    """Cyrillic 'Ольга Петрова' resolves to Latin 'Olga Petrova' via anyascii normalization."""
+    choices = {1: "Olga Petrova", 2: "Ольга", 3: "Olga"}
+    result = resolve("Ольга Петрова", choices)
+    assert isinstance(result, Resolved)
+    assert result.entity_id == 1
+    assert result.display_name == "Olga Petrova"
 
-    This was previously auto-resolved, but with the redesign, all fuzzy matches
-    return Candidates to ensure agent disambiguation.
-    """
-    choices = {101: "Sergei Khabarov"}
-    result = resolve("сергей", choices)  # Cyrillic, transliterates to "sergey", scores ~81
+
+def test_single_word_multiple_candidates_returns_candidates() -> None:
+    """Single-word query 'Ольга' with 2+ matches → always Candidates."""
+    choices = {1: "Olga Petrova", 2: "Ольга", 3: "Olga"}
+    result = resolve("Ольга", choices)
     assert isinstance(result, Candidates)
-    assert result.query == "sergey"  # After transliteration, the query is transliterated
+    assert len(result.matches) >= 2
+
+
+def test_single_word_single_candidate_resolves() -> None:
+    """Single-word query 'Ольга' with only 1 match → Resolved via exact normalized."""
+    choices = {2: "Ольга"}
+    result = resolve("Ольга", choices)
+    assert isinstance(result, Resolved)
+    assert result.entity_id == 2
+
+
+def test_multi_word_exact_resolves() -> None:
+    """Multi-word 'Ольга Петрова' exact normalized match → Resolved."""
+    choices = {1: "Olga Petrova", 2: "Ольга Петрова"}
+    result = resolve("Ольга Петрова", choices)
+    # Both normalize to "olga petrova", one should resolve
+    assert isinstance(result, Resolved)
+
+
+def test_single_low_score_match_returns_candidates() -> None:
+    """Single candidate in 60-89 range → Candidates (no auto-resolve for fuzzy)."""
+    choices = {101: "Sergei Khabarov"}
+    result = resolve("сергей", choices)  # Cyrillic, normalizes to "sergei"
+    assert isinstance(result, Candidates)
     assert len(result.matches) >= 1
     assert result.matches[0]["entity_id"] == 101
 
@@ -97,7 +134,6 @@ def test_exact_match_wins_over_ambiguity() -> None:
 ### NEW TESTS FOR REDESIGNED RESOLVER ###
 
 def test_numeric_id_in_cache_resolves() -> None:
-    """Test case 1: Numeric ID query exists in cache → Resolved."""
     choices = {12345: "Alice", 67890: "Bob"}
     result = resolve("12345", choices)
     assert isinstance(result, Resolved)
@@ -106,7 +142,6 @@ def test_numeric_id_in_cache_resolves() -> None:
 
 
 def test_numeric_id_not_found() -> None:
-    """Test case 2: Numeric ID query not in cache → NotFound."""
     choices = {12345: "Alice"}
     result = resolve("99999", choices)
     assert isinstance(result, NotFound)
@@ -114,9 +149,7 @@ def test_numeric_id_not_found() -> None:
 
 
 def test_username_query_resolves_via_cache(mock_cache: EntityCache) -> None:
-    """Test case 3: @username query exists in cache → Resolved."""
     choices = {101: "Иван Петров", 102: "Anna"}
-    # Cache already has entity 101 with username "ivan" from fixture
     result = resolve("@ivan", choices, cache=mock_cache)
     assert isinstance(result, Resolved)
     assert result.entity_id == 101
@@ -124,7 +157,6 @@ def test_username_query_resolves_via_cache(mock_cache: EntityCache) -> None:
 
 
 def test_username_query_not_found(mock_cache: EntityCache) -> None:
-    """Test case 4: @username query not in cache → NotFound."""
     choices = {101: "Иван Петров"}
     result = resolve("@notfound", choices, cache=mock_cache)
     assert isinstance(result, NotFound)
@@ -132,26 +164,20 @@ def test_username_query_not_found(mock_cache: EntityCache) -> None:
 
 
 def test_exact_match_case_insensitive() -> None:
-    """Test case 5: Exact case-insensitive match → Resolved."""
+    """Single-word 'bob' with 2 hits → Candidates (single-word caution), exact first."""
     choices = {101: "Bob", 102: "Bobby"}
-    result = resolve("bob", choices)  # Lowercase input
-    assert isinstance(result, Resolved)
-    assert result.entity_id == 101
-    assert result.display_name == "Bob"
+    result = resolve("bob", choices)
+    assert isinstance(result, Candidates)
+    assert result.matches[0]["entity_id"] == 101  # exact match first
 
 
 def test_single_fuzzy_match_returns_candidates() -> None:
-    """Test case 6: Single fuzzy match score=92 → Candidates (NOT Resolved).
-
-    Even a single good match (>=90 score) should return Candidates for disambiguation.
-    """
+    """Single fuzzy match score=92 → Candidates (NOT Resolved)."""
     choices = {101: "Sergei Khabarov"}
-    result = resolve("Sergei Khabar", choices)  # Latin typo, scores ~92
+    result = resolve("Sergei Khabar", choices)
     assert isinstance(result, Candidates)
-    # Query is preserved as provided
     assert result.query == "Sergei Khabar"
     assert len(result.matches) >= 1
-    # Verify match structure
     match = result.matches[0]
     assert isinstance(match, dict)
     assert "entity_id" in match
@@ -163,13 +189,11 @@ def test_single_fuzzy_match_returns_candidates() -> None:
 
 
 def test_multiple_fuzzy_matches_returns_candidates() -> None:
-    """Test case 7: Multiple fuzzy matches all >=60 → Candidates."""
     choices = {101: "Alice Smith", 102: "Alicia Jones", 103: "Alien"}
-    result = resolve("Ali", choices)  # Ambiguous
+    result = resolve("Ali", choices)
     assert isinstance(result, Candidates)
     assert result.query == "Ali"
     assert len(result.matches) >= 2
-    # All matches should be dicts with metadata
     for match in result.matches:
         assert isinstance(match, dict)
         assert "entity_id" in match
@@ -178,18 +202,16 @@ def test_multiple_fuzzy_matches_returns_candidates() -> None:
 
 
 def test_no_fuzzy_matches_returns_not_found() -> None:
-    """Test case 8: No matches >=60 → NotFound."""
     choices = {101: "Alice", 102: "Bob"}
-    result = resolve("xyzzz", choices)  # No match
+    result = resolve("xyzzz", choices)
     assert isinstance(result, NotFound)
     assert result.query == "xyzzz"
 
 
-def test_cyrillic_transliteration_still_works() -> None:
-    """Test case 9: Cyrillic query with transliteration fallback (existing behavior preserved)."""
+def test_cyrillic_cross_script_still_works() -> None:
+    """Cyrillic query matches Latin name via normalization."""
     choices = {101: "Sergei Khabarov"}
     result = resolve("сергей хабаров", choices)
-    # Should work due to transliteration
     assert isinstance(result, (Resolved, Candidates))
     if isinstance(result, Resolved):
         assert result.entity_id == 101
@@ -198,12 +220,27 @@ def test_cyrillic_transliteration_still_works() -> None:
         assert result.matches[0]["entity_id"] == 101
 
 
+def test_cyrillic_query_resolves_latin_name_over_partial_cyrillic_match() -> None:
+    """Cyrillic 'Ольга Петрова' should resolve to Latin 'Olga Petrova' via normalization."""
+    choices = {1: "Olga Petrova", 2: "Ольга", 3: "Olga"}
+    result = resolve("Ольга Петрова", choices)
+    assert isinstance(result, Resolved)
+    assert result.entity_id == 1
+    assert result.display_name == "Olga Petrova"
+
+
+def test_cyrillic_normalization_prefers_exact_over_fuzzy_candidates() -> None:
+    """When normalization yields exact match, prefer exact."""
+    choices = {10: "Ivan Petrov", 20: "Иван"}
+    result = resolve("Иван Петров", choices)
+    assert isinstance(result, Resolved)
+    assert result.entity_id == 10
+
+
 def test_candidates_include_metadata_from_cache(mock_cache: EntityCache) -> None:
-    """Verify Candidates include username and entity_type from cache."""
     choices = {101: "Иван Петров", 102: "Another User"}
     result = resolve("иван", choices, cache=mock_cache)
     assert isinstance(result, Candidates)
-    # Entity 101 is in cache with username="ivan"
     match_101 = next((m for m in result.matches if m["entity_id"] == 101), None)
     assert match_101 is not None
     assert match_101["username"] == "ivan"
@@ -211,7 +248,6 @@ def test_candidates_include_metadata_from_cache(mock_cache: EntityCache) -> None
 
 
 def test_candidates_without_cache_have_none_metadata() -> None:
-    """Verify Candidates have None for username/entity_type when cache not provided."""
     choices = {101: "Sergei Khabarov", 102: "Sergei Ivanov"}
     result = resolve("сергей", choices, cache=None)
     assert isinstance(result, Candidates)
@@ -220,25 +256,30 @@ def test_candidates_without_cache_have_none_metadata() -> None:
         assert match["entity_type"] is None
 
 
-def test_exact_match_among_fuzzy_returns_resolved() -> None:
-    """Exact match among multiple fuzzy candidates → Resolved (exact priority)."""
+def test_exact_match_among_fuzzy_returns_candidates_single_word() -> None:
+    """Single-word 'Alice' with ≥2 hits → Candidates (single-word caution), exact first."""
     choices = {101: "Alice", 102: "Alicia", 103: "Alien"}
-    result = resolve("Alice", choices)  # Exact case-insensitive match
-    assert isinstance(result, Resolved)
-    assert result.entity_id == 101
+    result = resolve("Alice", choices)
+    assert isinstance(result, Candidates)
+    assert result.matches[0]["entity_id"] == 101  # exact match first
 
 
 def test_resolve_without_cache_still_works() -> None:
-    """Resolve should work without cache (cache=None)."""
     choices = {101: "Иван Петров", 102: "Anna"}
-    # Numeric ID should work
     result = resolve("101", choices, cache=None)
     assert isinstance(result, Resolved)
 
-    # Exact match should work
     result = resolve("Иван Петров", choices, cache=None)
     assert isinstance(result, Resolved)
 
-    # Fuzzy should return Candidates without metadata
     result = resolve("иван", choices, cache=None)
     assert isinstance(result, Candidates)
+
+
+def test_normalized_choices_param() -> None:
+    """Pre-computed normalized_choices are used instead of on-the-fly computation."""
+    choices = {1: "Olga Petrova", 2: "Ольга"}
+    normalized = {1: "olga petrova", 2: "olga"}
+    result = resolve("Ольга Петрова", choices, normalized_choices=normalized)
+    assert isinstance(result, Resolved)
+    assert result.entity_id == 1
