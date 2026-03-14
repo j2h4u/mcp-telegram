@@ -29,7 +29,7 @@ See: .planning/PROJECT.md (updated 2026-03-14)
 ## Current Position
 
 Status: Idle — v1.3 archived, no active milestone
-Last Activity: 2026-03-14 — v1.3 Medium Implementation shipped and archived
+Last activity: 2026-03-14 - Completed quick task 3: Implement ListUnreadMessages tool
 Progress: All milestones through v1.3 complete
 
 ## Accumulated Context
@@ -47,6 +47,12 @@ Progress: All milestones through v1.3 complete
 ### Blockers/Concerns
 
 None
+
+### Quick Tasks Completed
+
+| # | Description | Date | Commit | Directory |
+|---|-------------|------|--------|-----------|
+| 3 | Implement ListUnreadMessages tool | 2026-03-14 | 78a7b60 | [3-implement-listunreadmessages-tool](./quick/3-implement-listunreadmessages-tool/) |
 
 ## Session Continuity
 
