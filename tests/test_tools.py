@@ -8,7 +8,12 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from mcp_telegram.cache import EntityCache, TopicMetadataCache
-from mcp_telegram.capabilities import HistoryReadExecution, ListTopicsExecution, SearchExecution
+from mcp_telegram.capabilities import (
+    CapabilityNavigation,
+    HistoryReadExecution,
+    ListTopicsExecution,
+    SearchExecution,
+)
 
 
 async def _async_iter(items):
@@ -329,6 +334,7 @@ async def test_list_messages_adapter_delegates_to_history_capability(
             reaction_names_map={},
             topic_name_getter=None,
             next_cursor="cursor-token",
+            navigation=CapabilityNavigation(kind="history", token="nav-token"),
         )
     )
 
@@ -341,6 +347,7 @@ async def test_list_messages_adapter_delegates_to_history_capability(
     assert result[0].text.startswith('[resolved: "Backend" → Backend Forum]\n[topic: Release Notes]\n')
     assert "Delegated topic update" in result[0].text
     assert "next_cursor: cursor-token" in result[0].text
+    assert "next_navigation" not in result[0].text
     assert capability.await_args.kwargs["topic_query"] == "Release Notes"
 
 
@@ -364,6 +371,7 @@ async def test_search_messages_adapter_delegates_to_capability_execution(
             context_messages_by_id={},
             reaction_names_map={},
             next_offset=20,
+            navigation=CapabilityNavigation(kind="search", token="nav-token"),
         )
     )
 
@@ -377,6 +385,7 @@ async def test_search_messages_adapter_delegates_to_capability_execution(
     assert "[HIT]" in result[0].text
     assert "Delegated search hit" in result[0].text
     assert "next_offset: 20" in result[0].text
+    assert "next_navigation" not in result[0].text
     assert capability.await_args.kwargs["query"] == "ship"
 
 

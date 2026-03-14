@@ -14,16 +14,18 @@ from mcp_telegram.capabilities import (
     HistoryReadExecution,
     ListTopicsExecution,
     MessageReadFailure,
+    NavigationFailure,
     ResolvedDialogTarget,
     ResolvedForumTopic,
+    SearchExecution,
     execute_history_read_capability,
     execute_list_topics_capability,
     execute_search_messages_capability,
     fetch_messages_for_topic,
     load_forum_topic_capability,
     resolve_dialog_target,
-    SearchExecution,
 )
+from mcp_telegram.pagination import decode_history_navigation, decode_search_navigation, encode_search_navigation
 from mcp_telegram.resolver import Candidates, NotFound, Resolved
 
 
@@ -305,6 +307,57 @@ async def test_execute_history_read_capability_filters_topic_sender_locally_and_
     assert result.next_cursor is not None
 
 
+async def test_execute_history_read_capability_exposes_shared_navigation_for_topic_pages(
+    tmp_db_path,
+    mock_client,
+    make_mock_message,
+    make_mock_topic,
+) -> None:
+    cache = EntityCache(tmp_db_path)
+    resolver = AsyncMock(return_value=Resolved(entity_id=701, display_name="Backend Forum"))
+    load_topics = AsyncMock(
+        return_value={
+            "choices": {11: "Release Notes"},
+            "metadata_by_id": {
+                11: make_mock_topic(topic_id=11, title="Release Notes", top_message_id=5011),
+            },
+            "deleted_topics": {},
+        }
+    )
+    newer = make_mock_message(id=30, text="Newest topic update")
+    older = make_mock_message(id=20, text="Older topic update")
+    fetch_topic_messages = AsyncMock(return_value=[newer, older])
+    mock_client.get_messages = AsyncMock(return_value=[])
+
+    result = await execute_history_read_capability(
+        mock_client,
+        cache=cache,
+        dialog_query="Backend Forum",
+        limit=2,
+        cursor=None,
+        sender_query=None,
+        topic_query="Release Notes",
+        unread=False,
+        from_beginning=False,
+        retry_tool="ListMessages",
+        resolve_dialog=resolver,
+        get_sender_type=lambda _sender: "user",
+        reaction_names_threshold=15,
+        load_topics=load_topics,
+        fetch_topic_messages_fn=fetch_topic_messages,
+        refresh_topic_by_id_fn=AsyncMock(),
+    )
+
+    assert isinstance(result, HistoryReadExecution)
+    assert result.navigation is not None
+    assert result.navigation.kind == "history"
+    assert decode_history_navigation(
+        result.navigation.token,
+        expected_dialog_id=701,
+        expected_topic_id=11,
+    ) == 20
+
+
 async def test_execute_history_read_capability_returns_cursor_failure(tmp_db_path, mock_client) -> None:
     cache = EntityCache(tmp_db_path)
     resolver = AsyncMock(return_value=Resolved(entity_id=701, display_name="Backend Forum"))
@@ -328,6 +381,37 @@ async def test_execute_history_read_capability_returns_cursor_failure(tmp_db_pat
     assert isinstance(result, MessageReadFailure)
     assert result.kind == "invalid_cursor"
     assert "Cursor is invalid:" in result.text
+
+
+async def test_execute_history_read_capability_rejects_search_navigation_token(
+    tmp_db_path,
+    mock_client,
+) -> None:
+    cache = EntityCache(tmp_db_path)
+    resolver = AsyncMock(return_value=Resolved(entity_id=701, display_name="Backend Forum"))
+
+    result = await execute_history_read_capability(
+        mock_client,
+        cache=cache,
+        dialog_query="Backend Forum",
+        limit=2,
+        cursor=None,
+        sender_query=None,
+        topic_query=None,
+        unread=False,
+        from_beginning=False,
+        retry_tool="ListMessages",
+        resolve_dialog=resolver,
+        get_sender_type=lambda _sender: "user",
+        reaction_names_threshold=15,
+        navigation_token=encode_search_navigation(20, 701, "ship"),
+    )
+
+    assert isinstance(result, NavigationFailure)
+    assert result.kind == "invalid_navigation"
+    assert "Navigation token is invalid:" in result.text
+    assert "not history" in result.text
+    assert "Action:" in result.text
 
 
 async def test_execute_search_messages_capability_reuses_shared_enrichment(
@@ -373,3 +457,94 @@ async def test_execute_search_messages_capability_reuses_shared_enrichment(
     assert sender_ids.issuperset({9001, 9002})
     assert reaction_builder.await_args.kwargs["entity_id"] == 701
     assert reaction_builder.await_args.kwargs["messages"] == [hit]
+
+
+async def test_execute_search_messages_capability_exposes_shared_navigation(
+    tmp_db_path,
+    mock_client,
+    make_mock_message,
+) -> None:
+    cache = EntityCache(tmp_db_path)
+    resolver = AsyncMock(return_value=Resolved(entity_id=701, display_name="Backend Forum"))
+    hit = make_mock_message(id=50, text="the hit", sender_id=9001, sender_name="Alice")
+
+    async def _fake_iter_messages(*_args, **_kwargs):
+        yield hit
+
+    mock_client.iter_messages = _fake_iter_messages
+    mock_client.get_messages = AsyncMock(return_value=[])
+
+    result = await execute_search_messages_capability(
+        mock_client,
+        cache=cache,
+        dialog_query="Backend Forum",
+        query="ship",
+        limit=1,
+        offset=None,
+        retry_tool="SearchMessages",
+        resolve_dialog=resolver,
+        get_sender_type=lambda _sender: "user",
+        reaction_names_threshold=15,
+    )
+
+    assert isinstance(result, SearchExecution)
+    assert result.navigation is not None
+    assert decode_search_navigation(
+        result.navigation.token,
+        expected_dialog_id=701,
+        expected_query="ship",
+    ) == 1
+
+
+async def test_execute_search_messages_capability_rejects_query_mismatch_navigation_token(
+    tmp_db_path,
+    mock_client,
+) -> None:
+    cache = EntityCache(tmp_db_path)
+    resolver = AsyncMock(return_value=Resolved(entity_id=701, display_name="Backend Forum"))
+
+    result = await execute_search_messages_capability(
+        mock_client,
+        cache=cache,
+        dialog_query="Backend Forum",
+        query="ship",
+        limit=1,
+        offset=None,
+        retry_tool="SearchMessages",
+        resolve_dialog=resolver,
+        get_sender_type=lambda _sender: "user",
+        reaction_names_threshold=15,
+        navigation_token=encode_search_navigation(5, 701, "deploy"),
+    )
+
+    assert isinstance(result, NavigationFailure)
+    assert result.kind == "invalid_navigation"
+    assert 'query "deploy", not "ship"' in result.text
+    assert "Action:" in result.text
+
+
+async def test_execute_search_messages_capability_rejects_dialog_mismatch_navigation_token(
+    tmp_db_path,
+    mock_client,
+) -> None:
+    cache = EntityCache(tmp_db_path)
+    resolver = AsyncMock(return_value=Resolved(entity_id=701, display_name="Backend Forum"))
+
+    result = await execute_search_messages_capability(
+        mock_client,
+        cache=cache,
+        dialog_query="Backend Forum",
+        query="ship",
+        limit=1,
+        offset=None,
+        retry_tool="SearchMessages",
+        resolve_dialog=resolver,
+        get_sender_type=lambda _sender: "user",
+        reaction_names_threshold=15,
+        navigation_token=encode_search_navigation(5, 702, "ship"),
+    )
+
+    assert isinstance(result, NavigationFailure)
+    assert result.kind == "invalid_navigation"
+    assert "dialog 702, not 701" in result.text
+    assert "Action:" in result.text
