@@ -436,7 +436,7 @@ async def test_execute_search_messages_capability_reuses_shared_enrichment(
         dialog_query="Backend Forum",
         query="hit",
         limit=1,
-        offset=None,
+        navigation=None,
         retry_tool="SearchMessages",
         resolve_dialog=resolver,
         get_sender_type=lambda _sender: "user",
@@ -475,7 +475,7 @@ async def test_execute_search_messages_capability_exposes_shared_navigation(
         dialog_query="Backend Forum",
         query="ship",
         limit=1,
-        offset=None,
+        navigation=None,
         retry_tool="SearchMessages",
         resolve_dialog=resolver,
         get_sender_type=lambda _sender: "user",
@@ -504,12 +504,11 @@ async def test_execute_search_messages_capability_rejects_query_mismatch_navigat
         dialog_query="Backend Forum",
         query="ship",
         limit=1,
-        offset=None,
         retry_tool="SearchMessages",
         resolve_dialog=resolver,
         get_sender_type=lambda _sender: "user",
         reaction_names_threshold=15,
-        navigation_token=encode_search_navigation(5, 701, "deploy"),
+        navigation=encode_search_navigation(5, 701, "deploy"),
     )
 
     assert isinstance(result, NavigationFailure)
@@ -531,12 +530,11 @@ async def test_execute_search_messages_capability_rejects_dialog_mismatch_naviga
         dialog_query="Backend Forum",
         query="ship",
         limit=1,
-        offset=None,
         retry_tool="SearchMessages",
         resolve_dialog=resolver,
         get_sender_type=lambda _sender: "user",
         reaction_names_threshold=15,
-        navigation_token=encode_search_navigation(5, 702, "ship"),
+        navigation=encode_search_navigation(5, 702, "ship"),
     )
 
     assert isinstance(result, NavigationFailure)

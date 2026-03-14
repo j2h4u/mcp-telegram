@@ -688,7 +688,7 @@ def _search_no_hits_text(dialog_name: str, query: str) -> str:
     """Return an action-oriented response when search finds no hits."""
     return _action_text(
         f'No messages matched query "{query}" in dialog "{dialog_name}".',
-        "Retry SearchMessages with a broader query, a smaller offset, or a different dialog.",
+        "Retry SearchMessages with a broader query, without navigation, or in a different dialog.",
     )
 
 
@@ -1285,7 +1285,8 @@ class SearchMessages(ToolArgs):
     """
     Search messages in a dialog by text query. Returns matching messages newest to oldest.
 
-    Use offset= with the next_offset value from a previous response to get the next page.
+    Omit navigation to start from the first search page.
+    Use navigation= with the next_navigation token from a previous response to continue.
 
     If response is ambiguous, use the numeric ID from the matches list to disambiguate.
     For @username lookups, prepend @ to the dialog name: dialog="@channel_name".
@@ -1294,7 +1295,14 @@ class SearchMessages(ToolArgs):
     dialog: str
     query: str
     limit: int = 20
-    offset: int | None = None
+    navigation: str | None = Field(
+        default=None,
+        description=(
+            "Optional shared navigation state. Omit navigation to start from the first search "
+            "page. Reuse the exact next_navigation token from the previous SearchMessages "
+            "response to continue."
+        ),
+    )
 
 
 @tool_runner.register
@@ -1317,13 +1325,16 @@ async def search_messages(
                 dialog_query=args.dialog,
                 query=args.query,
                 limit=args.limit,
-                offset=args.offset,
+                navigation=args.navigation,
                 retry_tool="SearchMessages",
                 resolve_dialog=_resolve_dialog,
                 get_sender_type=_get_sender_type,
                 reaction_names_threshold=REACTION_NAMES_THRESHOLD,
             )
-        if isinstance(search_execution, capabilities.DialogTargetFailure):
+        if isinstance(
+            search_execution,
+            capabilities.DialogTargetFailure | capabilities.NavigationFailure,
+        ):
             return [TextContent(type="text", text=search_execution.text)]
 
         hits = list(search_execution.hits)
@@ -1366,8 +1377,8 @@ async def search_messages(
                 search_execution.dialog_name,
                 args.query,
             )
-        if search_execution.next_offset is not None:
-            result_text += f"\n\nnext_offset: {search_execution.next_offset}"
+        if search_execution.navigation is not None:
+            result_text += f"\n\nnext_navigation: {search_execution.navigation.token}"
         result = [TextContent(type="text", text=result_text)]
     except Exception as exc:
         error_type = type(exc).__name__

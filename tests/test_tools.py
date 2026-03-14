@@ -268,9 +268,9 @@ def test_tool_description_strips_nullable_unions_from_exported_schema():
 
     dialog_schema = list_messages_schema["properties"]["dialog"]
     navigation_schema = list_messages_schema["properties"]["navigation"]
+    search_navigation_schema = search_messages_schema["properties"]["navigation"]
     sender_schema = list_messages_schema["properties"]["sender"]
     topic_schema = list_messages_schema["properties"]["topic"]
-    offset_schema = search_messages_schema["properties"]["offset"]
 
     assert "dialog" in list_messages_schema["required"]
     assert dialog_schema["type"] == "string"
@@ -282,7 +282,10 @@ def test_tool_description_strips_nullable_unions_from_exported_schema():
     assert "next_navigation" in navigation_schema["description"]
     assert sender_schema == {"title": "Sender", "type": "string"}
     assert topic_schema == {"title": "Topic", "type": "string"}
-    assert offset_schema == {"title": "Offset", "type": "integer"}
+    assert search_navigation_schema["title"] == "Navigation"
+    assert search_navigation_schema["type"] == "string"
+    assert "first search page" in search_navigation_schema["description"]
+    assert "next_navigation" in search_navigation_schema["description"]
 
 
 def test_capability_extraction_preserves_public_tool_names() -> None:
@@ -395,8 +398,8 @@ async def test_search_messages_adapter_delegates_to_capability_execution(
     assert result[0].text.startswith('[resolved: "Backend" → Backend Forum]\n--- hit 1/1 ---\n')
     assert "[HIT]" in result[0].text
     assert "Delegated search hit" in result[0].text
-    assert "next_offset: 20" in result[0].text
-    assert "next_navigation" not in result[0].text
+    assert "next_navigation: nav-token" in result[0].text
+    assert "next_offset" not in result[0].text
     assert capability.await_args.kwargs["query"] == "ship"
 
 
@@ -1892,16 +1895,16 @@ async def test_search_messages_reaction_names_fetched(mock_cache, mock_client, m
     mock_client.assert_called()
 
 
-# --- TOOL-07: SearchMessages offset pagination ---
+# --- TOOL-07: SearchMessages navigation pagination ---
 
 
-async def test_search_messages_next_offset(mock_cache, mock_client, monkeypatch, make_mock_message):
-    """SearchMessages full page returns next_offset in output."""
+async def test_search_messages_next_navigation(mock_cache, mock_client, monkeypatch, make_mock_message):
+    """SearchMessages full page returns next_navigation in output."""
     from mcp_telegram.tools import SearchMessages, search_messages
+    from mcp_telegram.pagination import decode_search_navigation
 
     # Return exactly limit=2 hits, no context
     hits = [make_mock_message(id=i, text=f"msg{i}") for i in range(1, 3)]
-    call_count = 0
 
     async def _fake_iter(entity, **kwargs):
         for h in hits:
@@ -1912,11 +1915,17 @@ async def test_search_messages_next_offset(mock_cache, mock_client, monkeypatch,
     monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
 
     result = await search_messages(SearchMessages(dialog="Иван Петров", query="msg", limit=2))
-    assert "next_offset: 2" in result[0].text
+    next_navigation = _extract_footer_token(result[0].text, "next_navigation")
+    assert next_navigation is not None
+    assert decode_search_navigation(
+        next_navigation,
+        expected_dialog_id=101,
+        expected_query="msg",
+    ) == 2
 
 
-async def test_search_messages_no_next_offset(mock_cache, mock_client, monkeypatch, make_mock_message):
-    """SearchMessages last page (fewer than limit) has no next_offset in output."""
+async def test_search_messages_no_next_navigation(mock_cache, mock_client, monkeypatch, make_mock_message):
+    """SearchMessages last page (fewer than limit) has no next_navigation in output."""
     from mcp_telegram.tools import SearchMessages, search_messages
 
     # Return 1 hit with limit=5 (partial page)
@@ -1935,7 +1944,23 @@ async def test_search_messages_no_next_offset(mock_cache, mock_client, monkeypat
     monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
 
     result = await search_messages(SearchMessages(dialog="Иван Петров", query="only", limit=5))
-    assert "next_offset" not in result[0].text
+    assert "next_navigation" not in result[0].text
+
+
+async def test_search_messages_invalid_navigation_returns_error(mock_cache, mock_client, monkeypatch):
+    """SearchMessages returns an action-oriented error for malformed navigation tokens."""
+    from mcp_telegram.tools import SearchMessages, search_messages
+
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+
+    result = await search_messages(
+        SearchMessages(dialog="Иван Петров", query="ship", navigation="BADINVALID==garbage")
+    )
+
+    assert len(result) == 1
+    assert result[0].text.startswith("Navigation token is invalid:")
+    assert "Action:" in result[0].text
 
 
 # --- CLNP-01, CLNP-02: Removed tools ---
