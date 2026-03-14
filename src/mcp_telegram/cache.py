@@ -67,6 +67,10 @@ CREATE INDEX IF NOT EXISTS idx_topic_metadata_dialog_updated
 ON topic_metadata(dialog_id, updated_at)
 """
 
+_ENTITY_REQUIRED_COLUMNS = {
+    "name_normalized": "TEXT",
+}
+
 _TOPIC_REQUIRED_COLUMNS = {
     "inaccessible_error": "TEXT",
     "inaccessible_at": "INTEGER",
@@ -96,6 +100,29 @@ def _index_exists(conn: sqlite3.Connection, index_name: str) -> bool:
     return row is not None
 
 
+def _entity_columns_ready(conn: sqlite3.Connection) -> bool:
+    if not _table_exists(conn, "entities"):
+        return False
+    rows = conn.execute("PRAGMA table_info(entities)").fetchall()
+    existing_columns = {str(row[1]) for row in rows}
+    return set(_ENTITY_REQUIRED_COLUMNS).issubset(existing_columns)
+
+
+def _apply_entity_column_upgrades(conn: sqlite3.Connection) -> None:
+    rows = conn.execute("PRAGMA table_info(entities)").fetchall()
+    existing_columns = {str(row[1]) for row in rows}
+    for column_name, column_type in _ENTITY_REQUIRED_COLUMNS.items():
+        if column_name in existing_columns:
+            continue
+        assert (
+            column_name in _ENTITY_REQUIRED_COLUMNS
+            and _ENTITY_REQUIRED_COLUMNS[column_name] == column_type
+        ), f"Unexpected column: {column_name} {column_type}"
+        conn.execute(
+            f"ALTER TABLE entities ADD COLUMN {column_name} {column_type}"
+        )
+
+
 def _topic_columns_ready(conn: sqlite3.Connection) -> bool:
     if not _table_exists(conn, "topic_metadata"):
         return False
@@ -116,6 +143,8 @@ def _database_bootstrap_required(conn: sqlite3.Connection) -> bool:
         return True
     if not _index_exists(conn, "idx_entities_username"):
         return True
+    if not _entity_columns_ready(conn):
+        return True
     if not _table_exists(conn, "reaction_metadata"):
         return True
     if not _index_exists(conn, "idx_reactions_dialog_message"):
@@ -133,6 +162,10 @@ def _apply_topic_column_upgrades(conn: sqlite3.Connection) -> None:
     for column_name, column_type in _TOPIC_REQUIRED_COLUMNS.items():
         if column_name in existing_columns:
             continue
+        assert (
+            column_name in _TOPIC_REQUIRED_COLUMNS
+            and _TOPIC_REQUIRED_COLUMNS[column_name] == column_type
+        ), f"Unexpected column: {column_name} {column_type}"
         conn.execute(
             f"ALTER TABLE topic_metadata ADD COLUMN {column_name} {column_type}"
         )
@@ -147,6 +180,7 @@ def _bootstrap_cache_schema(conn: sqlite3.Connection) -> None:
             raise
 
     conn.execute(_ENTITY_TABLE_DDL)
+    _apply_entity_column_upgrades(conn)
     conn.execute(_ENTITY_UPDATED_INDEX_DDL)
     conn.execute(_ENTITY_USERNAME_INDEX_DDL)
     conn.execute(_REACTION_TABLE_DDL)
@@ -222,9 +256,25 @@ class EntityCache:
         username: str | None,
     ) -> None:
         """Insert or replace entity metadata, updating updated_at to now."""
+        from .resolver import latinize
+
         self._conn.execute(
-            "INSERT OR REPLACE INTO entities (id, type, name, username, updated_at) VALUES (?, ?, ?, ?, ?)",
-            (entity_id, entity_type, name, username, int(time.time())),
+            "INSERT OR REPLACE INTO entities (id, type, name, username, name_normalized, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (entity_id, entity_type, name, username, latinize(name), int(time.time())),
+        )
+        self._conn.commit()
+
+    def upsert_batch(
+        self,
+        entities: list[tuple[int, str, str, str | None]],
+    ) -> None:
+        """Batch insert or replace entity metadata rows in a single transaction."""
+        from .resolver import latinize
+
+        now = int(time.time())
+        self._conn.executemany(
+            "INSERT OR REPLACE INTO entities (id, type, name, username, name_normalized, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+            [(eid, etype, name, username, latinize(name), now) for eid, etype, name, username in entities],
         )
         self._conn.commit()
 
@@ -249,11 +299,6 @@ class EntityCache:
             "username": username,
         }
 
-    def all_names(self) -> dict[int, str]:
-        """Return {entity_id: name} for all records (no TTL filtering — caller decides)."""
-        rows = self._conn.execute("SELECT id, name FROM entities").fetchall()
-        return {row[0]: row[1] for row in rows}
-
     def all_names_with_ttl(self, user_ttl: int, group_ttl: int) -> dict[int, str]:
         """Return {entity_id: name} filtered by type-specific TTL.
 
@@ -265,6 +310,18 @@ class EntityCache:
             """SELECT id, name FROM entities
                WHERE (type = 'user' AND updated_at >= ?)
                   OR (type != 'user' AND updated_at >= ?)""",
+            (now - user_ttl, now - group_ttl),
+        ).fetchall()
+        return {row[0]: row[1] for row in rows}
+
+    def all_names_normalized_with_ttl(self, user_ttl: int, group_ttl: int) -> dict[int, str]:
+        """Return {entity_id: name_normalized} filtered by type-specific TTL."""
+        now = int(time.time())
+        rows = self._conn.execute(
+            """SELECT id, name_normalized FROM entities
+               WHERE name_normalized IS NOT NULL
+                 AND ((type = 'user' AND updated_at >= ?)
+                   OR (type != 'user' AND updated_at >= ?))""",
             (now - user_ttl, now - group_ttl),
         ).fetchall()
         return {row[0]: row[1] for row in rows}
@@ -361,6 +418,10 @@ class TopicMetadataCache:
         for column_name, column_type in required_columns.items():
             if column_name in existing_columns:
                 continue
+            assert (
+                column_name in _TOPIC_REQUIRED_COLUMNS
+                and _TOPIC_REQUIRED_COLUMNS[column_name] == column_type
+            ), f"Unexpected column: {column_name} {column_type}"
             self._conn.execute(
                 f"ALTER TABLE topic_metadata ADD COLUMN {column_name} {column_type}"
             )
