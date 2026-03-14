@@ -127,3 +127,25 @@ async def test_call_tool_passthrough_action_text_contract(monkeypatch) -> None:
 async def test_call_tool_unknown_tool_control_contract() -> None:
     with pytest.raises(ValueError, match="Unknown tool: MissingTool"):
         await server.call_tool("MissingTool", {})
+
+
+def test_posture_primary_tools_reflected_in_descriptions() -> None:
+    """Primary tools should have [primary] tag in their reflected descriptions."""
+    for name in ("ListMessages", "SearchMessages", "GetUserInfo"):
+        tool = server.mapping[name]
+        assert tool.description.startswith("[primary]"), f"{name} missing [primary] prefix"
+
+
+def test_posture_secondary_tools_reflected_in_descriptions() -> None:
+    """Secondary/helper tools should have [secondary/helper] tag in descriptions."""
+    for name in ("ListDialogs", "ListTopics", "GetMyAccount", "GetUsageStats"):
+        tool = server.mapping[name]
+        assert tool.description.startswith("[secondary/helper]"), f"{name} missing [secondary/helper] prefix"
+
+
+def test_posture_covers_all_registered_tools() -> None:
+    """Every registered tool must have a posture classification."""
+    from mcp_telegram.tools import TOOL_POSTURE
+    for name in server.mapping:
+        assert name in TOOL_POSTURE, f"{name} not in TOOL_POSTURE"
+
