@@ -1473,13 +1473,12 @@ async def execute_search_messages_capability(
     dialog_query: str,
     query: str,
     limit: int,
-    offset: int | None,
+    navigation: str | None,
     retry_tool: str,
     resolve_dialog: DialogResolver,
     get_sender_type: SenderTypeGetter,
     reaction_names_threshold: int,
     context_radius: int = 3,
-    navigation_token: str | None = None,
 ) -> SearchCapabilityResult:
     dialog_target = await resolve_dialog_target(
         cache=cache,
@@ -1491,11 +1490,11 @@ async def execute_search_messages_capability(
         return dialog_target
 
     entity_id = dialog_target.entity_id
-    page_offset = 0 if offset is None else offset
-    if navigation_token is not None:
+    page_offset = 0
+    if navigation is not None:
         try:
             page_offset = decode_search_navigation(
-                navigation_token,
+                navigation,
                 expected_dialog_id=entity_id,
                 expected_query=query,
             )
