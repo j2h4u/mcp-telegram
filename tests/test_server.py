@@ -16,6 +16,18 @@ def _tool(name: str) -> Tool:
     )
 
 
+def test_list_messages_reflection_exposes_shared_navigation_schema() -> None:
+    tool = server.mapping["ListMessages"]
+    properties = tool.inputSchema["properties"]
+
+    assert "navigation" in properties
+    assert "cursor" not in properties
+    assert "from_beginning" not in properties
+    assert properties["navigation"]["type"] == "string"
+    assert '"newest"' in properties["navigation"]["description"]
+    assert '"oldest"' in properties["navigation"]["description"]
+
+
 @pytest.mark.asyncio
 async def test_call_tool_validation_failure_escaped_error_includes_actionable_guidance(monkeypatch) -> None:
     monkeypatch.setitem(server.mapping, "ListDialogs", _tool("ListDialogs"))
