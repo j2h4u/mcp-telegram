@@ -17,6 +17,7 @@ from .cache import (
     ReactionMetadataCache,
     TopicMetadataCache,
 )
+from .formatter import format_search_message_groups
 from .pagination import (
     decode_history_navigation,
     decode_navigation_token,
@@ -167,6 +168,7 @@ class SearchExecution:
     reaction_names_map: dict[int, dict[str, list[str]]]
     next_offset: int | None
     navigation: CapabilityNavigation | None = None
+    rendered_text: str = ""
 
 
 DialogResolveResult = Resolved | Candidates | NotFound
@@ -1684,6 +1686,12 @@ async def execute_search_messages_capability(
         messages=hits,
         reaction_names_threshold=reaction_names_threshold,
     )
+    rendered_text = format_search_message_groups(
+        hits,
+        context_messages_by_id=context_messages_by_id,
+        reaction_names_map=reaction_names_map,
+        context_radius=context_radius,
+    )
 
     next_offset = None
     navigation = None
@@ -1703,6 +1711,7 @@ async def execute_search_messages_capability(
         reaction_names_map=reaction_names_map,
         next_offset=next_offset,
         navigation=navigation,
+        rendered_text=rendered_text,
     )
 
 

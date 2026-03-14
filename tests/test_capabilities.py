@@ -646,6 +646,8 @@ async def test_execute_search_messages_capability_exposes_shared_navigation(
 
     assert isinstance(result, SearchExecution)
     assert result.navigation is not None
+    assert result.rendered_text.startswith("--- hit 1/1 ---\n")
+    assert "[HIT]" in result.rendered_text
     assert decode_search_navigation(
         result.navigation.token,
         expected_dialog_id=701,
@@ -686,6 +688,8 @@ async def test_execute_search_messages_capability_uses_exact_dialog_id_without_r
     assert isinstance(result, SearchExecution)
     assert result.dialog_name == "Backend Forum"
     assert list(result.hits) == [hit]
+    assert "[HIT]" in result.rendered_text
+    assert "the hit" in result.rendered_text
     assert resolver.await_count == 0
 
 
