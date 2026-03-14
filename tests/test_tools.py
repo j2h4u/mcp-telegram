@@ -273,16 +273,18 @@ def test_tool_description_strips_nullable_unions_from_exported_schema():
     sender_schema = list_messages_schema["properties"]["sender"]
     topic_schema = list_messages_schema["properties"]["topic"]
 
-    assert "dialog" in list_messages_schema["required"]
+    assert "required" not in list_messages_schema
     assert dialog_schema["type"] == "string"
-    assert "Required." in dialog_schema["description"]
+    assert "exact_dialog_id" in dialog_schema["description"]
     assert navigation_schema["title"] == "Navigation"
     assert navigation_schema["type"] == "string"
     assert '"newest"' in navigation_schema["description"]
     assert '"oldest"' in navigation_schema["description"]
     assert "next_navigation" in navigation_schema["description"]
     assert sender_schema == {"title": "Sender", "type": "string"}
-    assert topic_schema == {"title": "Topic", "type": "string"}
+    assert topic_schema["title"] == "Topic"
+    assert topic_schema["type"] == "string"
+    assert "exact_topic_id" in topic_schema["description"]
     assert search_navigation_schema["title"] == "Navigation"
     assert search_navigation_schema["type"] == "string"
     assert "first search page" in search_navigation_schema["description"]
