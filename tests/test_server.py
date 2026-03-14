@@ -28,6 +28,17 @@ def test_list_messages_reflection_exposes_shared_navigation_schema() -> None:
     assert '"oldest"' in properties["navigation"]["description"]
 
 
+def test_search_messages_reflection_exposes_shared_navigation_schema() -> None:
+    tool = server.mapping["SearchMessages"]
+    properties = tool.inputSchema["properties"]
+
+    assert "navigation" in properties
+    assert "offset" not in properties
+    assert properties["navigation"]["type"] == "string"
+    assert "first search page" in properties["navigation"]["description"]
+    assert "next_navigation" in properties["navigation"]["description"]
+
+
 @pytest.mark.asyncio
 async def test_call_tool_validation_failure_escaped_error_includes_actionable_guidance(monkeypatch) -> None:
     monkeypatch.setitem(server.mapping, "ListDialogs", _tool("ListDialogs"))
