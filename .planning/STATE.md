@@ -2,19 +2,19 @@
 gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: Medium Implementation
-current_phase: 16
-current_phase_name: Unified Navigation Contract
-current_plan: 3
-status: ready_for_verification
-stopped_at: Completed 16-03-PLAN.md
-last_updated: "2026-03-14T00:47:21.143Z"
+current_phase: 17
+current_phase_name: Direct Read/Search Workflows
+current_plan: 2
+status: executing
+stopped_at: Completed 17-01-PLAN.md
+last_updated: "2026-03-14T10:16:13.646Z"
 last_activity: 2026-03-14
 progress:
   total_phases: 5
   completed_phases: 3
-  total_plans: 8
-  completed_plans: 8
-  percent: 100
+  total_plans: 11
+  completed_plans: 9
+  percent: 91
 ---
 
 # Project State
@@ -24,25 +24,25 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-14)
 
 **Core value:** LLM can work with Telegram using natural names - zero cold-start friction, no ID lookup boilerplate before every real task
-**Current focus:** Phase 16 `Unified Navigation Contract` for milestone `v1.3 Medium Implementation`
+**Current focus:** Phase 17 `Direct Read/Search Workflows` for milestone `v1.3 Medium Implementation`
 
 ## Current Position
 
-Current Phase: 16
-Current Phase Name: Unified Navigation Contract
+Current Phase: 17
+Current Phase Name: Direct Read/Search Workflows
 Total Phases: 18
-Current Plan: 3
+Current Plan: 2
 Total Plans in Phase: 3
-Status: Ready for verification
+Status: Ready to execute
 Last Activity: 2026-03-14
-Last Activity Description: Completed Plan 16-03 SearchMessages navigation migration, telemetry proof, and runtime verification
-Progress: 100%
+Last Activity Description: Completed Plan 17-01 exact-target capability foundations and contract tests
+Progress: [█████████░] 91%
 
-Phase: 16 of 18 (`Unified Navigation Contract`)
-Plan: 3 of 3 in current phase
-Status: Ready for verification
-Last activity: 2026-03-14 - Completed Plan 16-03 SearchMessages navigation migration, telemetry proof, and runtime verification
-Progress: [██████████] 100%
+Phase: 17 of 18 (`Direct Read/Search Workflows`)
+Plan: 2 of 3 in current phase
+Status: Ready to execute
+Last activity: 2026-03-14 - Completed Plan 17-01 exact-target capability foundations and contract tests
+Progress: [█████████░] 91%
 
 ## Performance Metrics
 
@@ -63,6 +63,7 @@ Progress: [██████████] 100%
 | Phase 16 P01 | 14m | 2 tasks | 4 files |
 | Phase 16 P02 | 10m | 2 tasks | 6 files |
 | Phase 16 P3 | 26 min | 3 tasks | 7 files |
+| Phase 17 P01 | 8 min | 2 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -91,6 +92,8 @@ Progress: [██████████] 100%
 - [Phase 16]: Encode history direction into shared navigation tokens so oldest-first pagination can continue through the same public field without reintroducing from_beginning.
 - [Phase 16]: SearchMessages now uses the same navigation and next_navigation vocabulary as ListMessages instead of offset and next_offset. — Closes NAV-01 with one shared public continuation contract across read and search flows.
 - [Phase 16]: Live runtime proof remains mandatory for reflected schema changes, so Phase 16 closes only after the long-lived container is rebuilt and checked in-container. — Repo-local reflection can drift from the serving container; rebuilt-runtime verification is the release gate for schema work.
+- [Phase 17]: Exact dialog and topic selectors stay internal and opt-in so name-based ambiguity handling remains unchanged until later Phase 17 plans expose public fields.
+- [Phase 17]: Exact topic resolution prefers cached metadata and falls back to one topic-by-id refresh, preserving deleted-topic tombstones and the existing fetch/recovery path once a target is known.
 
 ### Pending Todos
 
@@ -100,10 +103,10 @@ Progress: [██████████] 100%
 
 ### Blockers/Concerns
 
-- No blockers. Phase 16 is complete and ready for verification or routing into Phase 17 planning.
+- No blockers. Phase 17 is in progress with Plan 02 next.
 
 ## Session Continuity
 
-Last session: 2026-03-14T00:47:21.134Z
-Stopped at: Completed 16-03-PLAN.md
+Last session: 2026-03-14T10:16:13.643Z
+Stopped at: Completed 17-01-PLAN.md
 Resume file: None

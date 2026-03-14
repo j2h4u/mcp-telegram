@@ -21,8 +21,8 @@
 
 ### Workflow Shape
 
-- [ ] **FLOW-01**: LLM can complete common message-reading jobs with fewer helper-first steps than the current `ListDialogs -> ListTopics -> ListMessages` choreography.
-- [ ] **FLOW-02**: LLM can complete common search workflows with lower orchestration burden while preserving hit-local context and dialog scoping.
+- [x] **FLOW-01**: LLM can complete common message-reading jobs with fewer helper-first steps than the current `ListDialogs -> ListTopics -> ListMessages` choreography.
+- [x] **FLOW-02**: LLM can complete common search workflows with lower orchestration burden while preserving hit-local context and dialog scoping.
 
 ### Surface Posture
 
@@ -58,8 +58,8 @@
 | CAP-01 | Phase 15 | Complete |
 | NAV-01 | Phase 16 | Complete |
 | NAV-02 | Phase 16 | Complete |
-| FLOW-01 | Phase 17 | Pending |
-| FLOW-02 | Phase 17 | Pending |
+| FLOW-01 | Phase 17 | Complete |
+| FLOW-02 | Phase 17 | Complete |
 | SURF-01 | Phase 18 | Pending |
 | ROLL-01 | Phase 18 | Pending |
 | ROLL-02 | Phase 18 | Pending |
