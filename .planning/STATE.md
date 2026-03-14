@@ -4,16 +4,16 @@ milestone: v1.3
 milestone_name: Medium Implementation
 current_phase: 16
 current_phase_name: Unified Navigation Contract
-current_plan: 1
+current_plan: 2
 status: planning
-stopped_at: Completed 16-01-PLAN.md
-last_updated: "2026-03-14T00:06:10.416Z"
+stopped_at: Completed 16-02-PLAN.md
+last_updated: "2026-03-14T00:19:30.127Z"
 last_activity: 2026-03-14
 progress:
   total_phases: 5
   completed_phases: 2
   total_plans: 8
-  completed_plans: 6
+  completed_plans: 7
   percent: 100
 ---
 
@@ -31,18 +31,18 @@ See: .planning/PROJECT.md (updated 2026-03-14)
 Current Phase: 16
 Current Phase Name: Unified Navigation Contract
 Total Phases: 18
-Current Plan: 1
+Current Plan: 2
 Total Plans in Phase: 3
-Status: Ready to plan
+Status: In progress
 Last Activity: 2026-03-14
-Last Activity Description: Completed Plan 15-03 search seam migration, CAP-01 proof, and runtime verification
-Progress: 100%
+Last Activity Description: Completed Plan 16-02 ListMessages navigation migration and local reflection proof
+Progress: 95%
 
 Phase: 16 of 18 (`Unified Navigation Contract`)
-Plan: 0 planned in current phase
-Status: Ready to plan
-Last activity: 2026-03-13 - Completed Phase 15 Capability Seams with final search seam and live runtime proof
-Progress: [██████████] 100%
+Plan: 2 of 3 in current phase
+Status: In progress
+Last activity: 2026-03-14 - Completed Plan 16-02 ListMessages navigation migration and local reflection proof
+Progress: [█████████░] 95%
 
 ## Performance Metrics
 
@@ -61,6 +61,7 @@ Progress: [██████████] 100%
 | Phase 15 P02 | 2m | 3 tasks | 4 files |
 | Phase 15 P03 | 2m28s | 3 tasks | 4 files |
 | Phase 16 P01 | 14m | 2 tasks | 4 files |
+| Phase 16 P02 | 10m | 2 tasks | 6 files |
 
 ## Accumulated Context
 
@@ -85,6 +86,8 @@ Progress: [██████████] 100%
 - [Phase 15]: Require rebuilt-container verification to confirm the live image exposes the final shared search seam.
 - [Phase 16]: Plan 16-01 keeps the unified navigation contract internal to capabilities while ListMessages and SearchMessages retain legacy cursor/offset adapters.
 - [Phase 16]: Plan 16-01 scopes shared history tokens by dialog/topic and shared search tokens by dialog/query so mismatched reuse fails before Telegram paging runs.
+- [Phase 16]: Use one string navigation field for ListMessages, with newest/oldest first-page keywords and opaque next_navigation continuation tokens.
+- [Phase 16]: Encode history direction into shared navigation tokens so oldest-first pagination can continue through the same public field without reintroducing from_beginning.
 
 ### Pending Todos
 
@@ -94,10 +97,10 @@ Progress: [██████████] 100%
 
 ### Blockers/Concerns
 
-- No blockers. Phase 15 is complete and Phase 16 planning can begin.
+- No blockers. Plan 16-03 remains to finish the shared navigation migration with SearchMessages and runtime verification.
 
 ## Session Continuity
 
-Last session: 2026-03-14T00:06:10.412Z
-Stopped at: Completed 16-01-PLAN.md
+Last session: 2026-03-14T00:19:30.127Z
+Stopped at: Completed 16-02-PLAN.md
 Resume file: None
