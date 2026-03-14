@@ -13,7 +13,6 @@ from mcp_telegram.capabilities import (
     ForumTopicFailure,
     HistoryReadExecution,
     ListTopicsExecution,
-    MessageReadFailure,
     NavigationFailure,
     ResolvedDialogTarget,
     ResolvedForumTopic,
@@ -286,11 +285,10 @@ async def test_execute_history_read_capability_filters_topic_sender_locally_and_
         cache=cache,
         dialog_query="Backend Forum",
         limit=2,
-        cursor=None,
+        navigation=None,
         sender_query="Alice",
         topic_query="Release Notes",
         unread=False,
-        from_beginning=False,
         retry_tool="ListMessages",
         resolve_dialog=resolver,
         get_sender_type=lambda _sender: "user",
@@ -304,7 +302,7 @@ async def test_execute_history_read_capability_filters_topic_sender_locally_and_
     assert result.topic_name == "Release Notes"
     assert list(result.messages) == [alice_message]
     assert list(result.fetched_messages) == [alice_message, bob_message]
-    assert result.next_cursor is not None
+    assert result.navigation is not None
 
 
 async def test_execute_history_read_capability_exposes_shared_navigation_for_topic_pages(
@@ -334,11 +332,10 @@ async def test_execute_history_read_capability_exposes_shared_navigation_for_top
         cache=cache,
         dialog_query="Backend Forum",
         limit=2,
-        cursor=None,
+        navigation=None,
         sender_query=None,
         topic_query="Release Notes",
         unread=False,
-        from_beginning=False,
         retry_tool="ListMessages",
         resolve_dialog=resolver,
         get_sender_type=lambda _sender: "user",
@@ -355,10 +352,11 @@ async def test_execute_history_read_capability_exposes_shared_navigation_for_top
         result.navigation.token,
         expected_dialog_id=701,
         expected_topic_id=11,
+        expected_direction="newest",
     ) == 20
 
 
-async def test_execute_history_read_capability_returns_cursor_failure(tmp_db_path, mock_client) -> None:
+async def test_execute_history_read_capability_returns_navigation_failure(tmp_db_path, mock_client) -> None:
     cache = EntityCache(tmp_db_path)
     resolver = AsyncMock(return_value=Resolved(entity_id=701, display_name="Backend Forum"))
 
@@ -367,20 +365,19 @@ async def test_execute_history_read_capability_returns_cursor_failure(tmp_db_pat
         cache=cache,
         dialog_query="Backend Forum",
         limit=2,
-        cursor="BADINVALID==garbage",
+        navigation="BADINVALID==garbage",
         sender_query=None,
         topic_query=None,
         unread=False,
-        from_beginning=False,
         retry_tool="ListMessages",
         resolve_dialog=resolver,
         get_sender_type=lambda _sender: "user",
         reaction_names_threshold=15,
     )
 
-    assert isinstance(result, MessageReadFailure)
-    assert result.kind == "invalid_cursor"
-    assert "Cursor is invalid:" in result.text
+    assert isinstance(result, NavigationFailure)
+    assert result.kind == "invalid_navigation"
+    assert "Navigation token is invalid:" in result.text
 
 
 async def test_execute_history_read_capability_rejects_search_navigation_token(
@@ -395,16 +392,14 @@ async def test_execute_history_read_capability_rejects_search_navigation_token(
         cache=cache,
         dialog_query="Backend Forum",
         limit=2,
-        cursor=None,
+        navigation=encode_search_navigation(20, 701, "ship"),
         sender_query=None,
         topic_query=None,
         unread=False,
-        from_beginning=False,
         retry_tool="ListMessages",
         resolve_dialog=resolver,
         get_sender_type=lambda _sender: "user",
         reaction_names_threshold=15,
-        navigation_token=encode_search_navigation(20, 701, "ship"),
     )
 
     assert isinstance(result, NavigationFailure)

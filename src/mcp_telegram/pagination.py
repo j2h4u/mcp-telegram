@@ -8,6 +8,7 @@ from typing import Literal
 
 
 NavigationKind = Literal["history", "search"]
+HistoryDirection = Literal["newest", "oldest"]
 
 
 @dataclass(frozen=True)
@@ -17,6 +18,7 @@ class NavigationToken:
     dialog_id: int
     topic_id: int | None = None
     query: str | None = None
+    direction: HistoryDirection | None = None
 
 
 def _encode_payload(payload: dict[str, object]) -> str:
@@ -44,6 +46,8 @@ def encode_navigation_token(navigation: NavigationToken) -> str:
         payload["topic_id"] = navigation.topic_id
     if navigation.query is not None:
         payload["query"] = navigation.query
+    if navigation.direction is not None:
+        payload["direction"] = navigation.direction
     return _encode_payload(payload)
 
 
@@ -70,22 +74,34 @@ def decode_navigation_token(token: str) -> NavigationToken:
     if query is not None and not isinstance(query, str):
         raise ValueError("Invalid navigation token: query must be a string when present")
 
+    direction = data.get("direction")
+    if direction is not None and direction not in {"newest", "oldest"}:
+        raise ValueError("Invalid navigation token: direction must be newest or oldest when present")
+
     return NavigationToken(
         kind=kind,
         value=value,
         dialog_id=dialog_id,
         topic_id=topic_id,
         query=query,
+        direction=direction,
     )
 
 
-def encode_history_navigation(message_id: int, dialog_id: int, *, topic_id: int | None = None) -> str:
+def encode_history_navigation(
+    message_id: int,
+    dialog_id: int,
+    *,
+    topic_id: int | None = None,
+    direction: HistoryDirection = "newest",
+) -> str:
     return encode_navigation_token(
         NavigationToken(
             kind="history",
             value=message_id,
             dialog_id=dialog_id,
             topic_id=topic_id,
+            direction=direction,
         )
     )
 
@@ -95,6 +111,7 @@ def decode_history_navigation(
     *,
     expected_dialog_id: int,
     expected_topic_id: int | None = None,
+    expected_direction: HistoryDirection | None = None,
 ) -> int:
     navigation = decode_navigation_token(token)
     if navigation.kind != "history":
@@ -104,6 +121,10 @@ def decode_history_navigation(
         raise ValueError(msg)
     if navigation.topic_id != expected_topic_id:
         msg = f"Navigation token belongs to topic {navigation.topic_id}, not {expected_topic_id}"
+        raise ValueError(msg)
+    direction = navigation.direction or "newest"
+    if expected_direction is not None and direction != expected_direction:
+        msg = f"Navigation token belongs to {direction} history, not {expected_direction}"
         raise ValueError(msg)
     return navigation.value
 
