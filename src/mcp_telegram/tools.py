@@ -29,6 +29,7 @@ from .capabilities import (
     GENERAL_TOPIC_ID,
     GENERAL_TOPIC_TITLE,
     TOPIC_METADATA_TTL_SECONDS,
+    allocate_message_budget_proportional,
 )
 from .cache import (
     EntityCache,
@@ -37,7 +38,7 @@ from .cache import (
     ReactionMetadataCache,
     TopicMetadataCache,
 )
-from .formatter import format_messages
+from .formatter import format_messages, format_unread_messages_grouped
 from .resolver import Candidates, NotFound, Resolved, resolve
 from .telegram import create_client
 
@@ -54,6 +55,7 @@ TOOL_POSTURE: dict[str, str] = {
     "ListMessages": "primary",
     "SearchMessages": "primary",
     "GetUserInfo": "primary",
+    "ListUnreadMessages": "primary",
     "ListDialogs": "secondary/helper",
     "ListTopics": "secondary/helper",
     "GetMyAccount": "secondary/helper",
@@ -1521,6 +1523,175 @@ async def get_user_info(args: GetUserInfo) -> ToolResult:
     return ToolResult(content=_text_response(text), result_count=1)
 
 
+### ListUnreadMessages ###
+
+
+class ListUnreadMessages(ToolArgs):
+    """Fetch unread messages from personal chats and small groups, sorted by mentions then recency.
+
+    Surfaces @mentions at the top, groups DMs above group chats, and intelligently allocates
+    a per-chat message budget to prevent flooding when many chats have unread messages.
+
+    Use scope="personal" (default) to see only DMs and small groups (≤ group_size_threshold members).
+    Use scope="all" to include large groups and channels (shows counts only, no messages).
+    Use limit to control total messages (default 100, minimum across all chats).
+    """
+
+    scope: t.Literal["personal", "all"] = Field(
+        default="personal",
+        description="'personal' (DMs + small groups) or 'all' (everything)"
+    )
+    limit: int = Field(
+        default=100,
+        ge=50,
+        le=500,
+        description="Total message budget across all chats (50-500)"
+    )
+    group_size_threshold: int = Field(
+        default=100,
+        ge=10,
+        description="Group member count above which to hide messages (scope=personal only)"
+    )
+
+
+@tool_runner.register
+@_track_tool_telemetry("ListUnreadMessages")
+async def list_unread_messages(args: ListUnreadMessages) -> ToolResult:
+    cache = get_entity_cache()
+
+    async with connected_client() as client:
+        # Iterate dialogs and collect unread chats
+        unread_chats: list[dict] = []
+        unread_counts: dict[int, int] = {}
+
+        async for dialog in client.iter_dialogs(archived=None, ignore_pinned=False):
+            unread_count = getattr(dialog, "unread_count", 0)
+            if unread_count == 0:
+                continue
+
+            chat_id = getattr(dialog, "id", None)
+            if not isinstance(chat_id, int):
+                continue
+
+            display_name = getattr(dialog, "name", f"Chat {chat_id}")
+            is_user = getattr(dialog, "is_user", False)
+            is_group = getattr(dialog, "is_group", False)
+            is_channel = getattr(dialog, "is_channel", False)
+            unread_mentions_count = getattr(dialog, "unread_mentions_count", 0)
+            date = getattr(dialog, "date", None)
+
+            entity = getattr(dialog, "entity", None)
+            participants_count = getattr(entity, "participants_count", None) if entity is not None else None
+
+            # Apply scope filter
+            if args.scope == "personal":
+                # Skip large groups and channels
+                if is_channel or (is_group and participants_count is not None and participants_count > args.group_size_threshold):
+                    continue
+
+            # Cache the dialog
+            try:
+                _cache_dialog_entry(cache, dialog)
+            except sqlite3.OperationalError as cache_exc:
+                logger.warning("dialog_cache_update_failed dialog_id=%r error=%s", chat_id, cache_exc)
+
+            # Collect unread chat info
+            unread_chats.append({
+                "chat_id": chat_id,
+                "display_name": display_name,
+                "unread_count": unread_count,
+                "unread_mentions_count": unread_mentions_count,
+                "is_user": is_user,
+                "is_group": is_group,
+                "is_channel": is_channel,
+                "date": date,
+            })
+            unread_counts[chat_id] = unread_count
+
+        if not unread_chats:
+            empty_msg = "Нет непрочитанных сообщений (scope=personal).\nПопробуй scope=\"all\" для полного обзора."
+            if args.scope == "all":
+                empty_msg = "Нет непрочитанных сообщений."
+            return ToolResult(content=_text_response(empty_msg))
+
+        # Sort by: unread_mentions_count DESC, is_user DESC, date DESC
+        unread_chats.sort(
+            key=lambda c: (
+                -(c["unread_mentions_count"] > 0),  # Mentions first
+                -int(c["is_user"]),  # DMs before groups
+                -(c["date"].timestamp() if c["date"] else 0),  # Newest first
+            )
+        )
+
+        # Allocate budget
+        allocation = allocate_message_budget_proportional(unread_counts, args.limit)
+
+        # Fetch messages for each chat
+        chats_data = []
+        total_messages_shown = 0
+
+        for chat_info in unread_chats:
+            chat_id = chat_info["chat_id"]
+            budget_for_chat = allocation.get(chat_id, 0)
+
+            if budget_for_chat == 0 and chat_info["is_channel"]:
+                # Still show channel count even if no message budget
+                chats_data.append({
+                    "chat_id": chat_id,
+                    "display_name": chat_info["display_name"],
+                    "unread_count": chat_info["unread_count"],
+                    "unread_mentions_count": chat_info["unread_mentions_count"],
+                    "messages": [],
+                    "budget_for_chat": 0,
+                    "total_in_chat": chat_info["unread_count"],
+                    "is_channel": True,
+                })
+                continue
+
+            if budget_for_chat == 0:
+                continue
+
+            # Fetch unread messages for this dialog
+            try:
+                messages = []
+                async for msg in client.iter_messages(chat_id, unread=True, limit=max(budget_for_chat * 2, 50)):
+                    messages.append(msg)
+                    if len(messages) >= budget_for_chat * 2:
+                        break
+
+                # Messages are newest-first from iter_messages; keep them that way
+                messages_shown = min(budget_for_chat, len(messages))
+                total_messages_shown += messages_shown
+
+                chats_data.append({
+                    "chat_id": chat_id,
+                    "display_name": chat_info["display_name"],
+                    "unread_count": chat_info["unread_count"],
+                    "unread_mentions_count": chat_info["unread_mentions_count"],
+                    "messages": messages[:budget_for_chat],
+                    "budget_for_chat": messages_shown,
+                    "total_in_chat": chat_info["unread_count"],
+                    "is_channel": chat_info["is_channel"],
+                })
+
+            except Exception as exc:
+                logger.warning("Failed to fetch unread messages for chat %r: %s", chat_id, exc)
+                chats_data.append({
+                    "chat_id": chat_id,
+                    "display_name": chat_info["display_name"],
+                    "unread_count": chat_info["unread_count"],
+                    "unread_mentions_count": chat_info["unread_mentions_count"],
+                    "messages": [],
+                    "budget_for_chat": 0,
+                    "total_in_chat": chat_info["unread_count"],
+                    "is_channel": chat_info["is_channel"],
+                })
+
+    # Format output
+    result_text = format_unread_messages_grouped(chats_data)
+    return ToolResult(content=_text_response(result_text), result_count=total_messages_shown)
+
+
 ### GetUsageStats ###
 
 
@@ -1698,6 +1869,7 @@ TOOL_REGISTRY: dict[str, type[ToolArgs]] = {
     "ListTopics": ListTopics,
     "ListMessages": ListMessages,
     "SearchMessages": SearchMessages,
+    "ListUnreadMessages": ListUnreadMessages,
     "GetMyAccount": GetMyAccount,
     "GetUserInfo": GetUserInfo,
     "GetUsageStats": GetUsageStats,
