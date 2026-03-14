@@ -4,16 +4,16 @@ milestone: v1.3
 milestone_name: Medium Implementation
 current_phase: 17
 current_phase_name: Direct Read/Search Workflows
-current_plan: 2
-status: executing
-stopped_at: Completed 17-01-PLAN.md
-last_updated: "2026-03-14T10:16:13.646Z"
+current_plan: 3
+status: ready_to_execute
+stopped_at: Completed 17-02-PLAN.md
+last_updated: "2026-03-14T10:28:27Z"
 last_activity: 2026-03-14
 progress:
   total_phases: 5
   completed_phases: 3
   total_plans: 11
-  completed_plans: 9
+  completed_plans: 10
   percent: 91
 ---
 
@@ -31,25 +31,25 @@ See: .planning/PROJECT.md (updated 2026-03-14)
 Current Phase: 17
 Current Phase Name: Direct Read/Search Workflows
 Total Phases: 18
-Current Plan: 2
+Current Plan: 3
 Total Plans in Phase: 3
 Status: Ready to execute
 Last Activity: 2026-03-14
-Last Activity Description: Completed Plan 17-01 exact-target capability foundations and contract tests
+Last Activity Description: Completed Plan 17-02 direct ListMessages workflow, schema reflection proof, and forum-fidelity regressions
 Progress: [█████████░] 91%
 
 Phase: 17 of 18 (`Direct Read/Search Workflows`)
-Plan: 2 of 3 in current phase
+Plan: 3 of 3 in current phase
 Status: Ready to execute
-Last activity: 2026-03-14 - Completed Plan 17-01 exact-target capability foundations and contract tests
+Last activity: 2026-03-14 - Completed Plan 17-02 direct ListMessages workflow, schema reflection proof, and forum-fidelity regressions
 Progress: [█████████░] 91%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 15
-- Average duration: 3.8 min
-- Total execution time: 57 min
+- Total plans completed: 16
+- Average duration: 4.3 min
+- Total execution time: 68 min
 
 **By Milestone:**
 
@@ -64,6 +64,7 @@ Progress: [█████████░] 91%
 | Phase 16 P02 | 10m | 2 tasks | 6 files |
 | Phase 16 P3 | 26 min | 3 tasks | 7 files |
 | Phase 17 P01 | 8 min | 2 tasks | 4 files |
+| Phase 17 P02 | 11 min | 2 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -94,6 +95,8 @@ Progress: [█████████░] 91%
 - [Phase 16]: Live runtime proof remains mandatory for reflected schema changes, so Phase 16 closes only after the long-lived container is rebuilt and checked in-container. — Repo-local reflection can drift from the serving container; rebuilt-runtime verification is the release gate for schema work.
 - [Phase 17]: Exact dialog and topic selectors stay internal and opt-in so name-based ambiguity handling remains unchanged until later Phase 17 plans expose public fields.
 - [Phase 17]: Exact topic resolution prefers cached metadata and falls back to one topic-by-id refresh, preserving deleted-topic tombstones and the existing fetch/recovery path once a target is known.
+- [Phase 17]: ListMessages should expose exact dialog/topic selectors directly, but mixed fuzzy and exact selector inputs must fail validation instead of silently choosing one path.
+- [Phase 17]: Direct forum reads must stay on the shared capability seam so deleted-topic, inaccessible-topic, General, unread, and navigation behavior remain aligned with the brownfield path.
 
 ### Pending Todos
 
@@ -103,10 +106,10 @@ Progress: [█████████░] 91%
 
 ### Blockers/Concerns
 
-- No blockers. Phase 17 is in progress with Plan 02 next.
+- No blockers. Phase 17 is in progress with Plan 03 next.
 
 ## Session Continuity
 
-Last session: 2026-03-14T10:16:13.643Z
-Stopped at: Completed 17-01-PLAN.md
+Last session: 2026-03-14T10:28:27Z
+Stopped at: Completed 17-02-PLAN.md
 Resume file: None

@@ -90,7 +90,7 @@ Phases execute in numeric order: 14 -> 15 -> 16 -> 17 -> 18
 | 14. Boundary Recovery | 2/2 | Complete   | 2026-03-13 |
 | 15. Capability Seams | 3/3 | Complete   | 2026-03-13 |
 | 16. Unified Navigation Contract | 3/3 | Complete   | 2026-03-14 |
-| 17. Direct Read/Search Workflows | 1/3 | In Progress|  |
+| 17. Direct Read/Search Workflows | 2/3 | In Progress|  |
 | 18. Surface Posture & Rollout Proof | 0/TBD | Not started | - |
 
 ## Shipped Milestones
