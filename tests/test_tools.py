@@ -489,6 +489,46 @@ async def test_search_messages_adapter_routes_numeric_dialog_to_exact_capability
     assert capability.await_args.kwargs["exact_dialog_name"] == "Backend Forum"
 
 
+async def test_search_messages_numeric_dialog_direct_path_preserves_hit_context_and_navigation(
+    tmp_db_path,
+    mock_client,
+    monkeypatch,
+    make_mock_message,
+):
+    """Numeric dialog searches should keep hit-local context and shared navigation."""
+    from mcp_telegram.pagination import decode_search_navigation
+    from mcp_telegram.tools import SearchMessages, search_messages
+
+    cache = EntityCache(tmp_db_path)
+    cache.upsert(701, "group", "Backend Forum", None)
+    hit = make_mock_message(id=50, text="ship the cache fix")
+    ctx_before = make_mock_message(id=47, text="before ship")
+    ctx_after = make_mock_message(id=53, text="after ship")
+
+    async def _fake_iter_messages(entity, **kwargs):
+        yield hit
+
+    mock_client.iter_messages = _fake_iter_messages
+    mock_client.get_messages = AsyncMock(return_value=[ctx_before, ctx_after])
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+
+    result = await search_messages(SearchMessages(dialog="701", query="ship", limit=1))
+
+    text = result[0].text
+    next_navigation = _extract_footer_token(text, "next_navigation")
+    assert next_navigation is not None
+    assert "before ship" in text
+    assert "ship the cache fix" in text
+    assert "after ship" in text
+    assert "[HIT]" in text or ">>>" in text or "=== HIT ===" in text
+    assert decode_search_navigation(
+        next_navigation,
+        expected_dialog_id=701,
+        expected_query="ship",
+    ) == 1
+
+
 # --- TOOL-02: ListMessages name resolution ---
 
 
@@ -886,6 +926,41 @@ async def test_list_messages_exact_topic_direct_read_skips_resolution_and_catalo
     assert mock_client.iter_messages.call_args.kwargs["reply_to"] == 5011
     assert resolve_dialog.await_count == 0
     assert load_dialog_topics.await_count == 0
+
+
+async def test_list_messages_exact_topic_direct_read_preserves_navigation(
+    tmp_db_path,
+    mock_client,
+    monkeypatch,
+    make_mock_message,
+    make_mock_topic,
+):
+    """Direct exact-topic reads should keep the shared navigation footer intact."""
+    from mcp_telegram.pagination import encode_history_navigation
+    from mcp_telegram.tools import ListMessages, list_messages
+
+    cache = EntityCache(tmp_db_path)
+    cache.upsert(701, "group", "Backend Forum", None)
+    topic = make_mock_topic(topic_id=11, title="Release Notes", top_message_id=5011)
+    TopicMetadataCache(cache._conn).upsert_topics(701, [topic])
+    messages = [
+        make_mock_message(id=90, text="Newest topic update"),
+        make_mock_message(id=80, text="Older topic update"),
+    ]
+
+    async def _fake_iter_messages(entity, **kwargs):
+        for message in messages:
+            yield message
+
+    mock_client.iter_messages = _fake_iter_messages
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+
+    result = await list_messages(ListMessages(exact_dialog_id=701, exact_topic_id=11, limit=2))
+
+    expected_navigation = encode_history_navigation(80, 701, topic_id=11, direction="newest")
+    assert "Newest topic update" in result[0].text
+    assert f"next_navigation: {expected_navigation}" in result[0].text
 
 
 async def test_list_messages_exact_general_topic_direct_read_avoids_reply_to(

@@ -70,6 +70,43 @@ def test_cross_process(tmp_db_path: Path) -> None:
     cache_b.close()
 
 
+def test_entity_cache_concurrent_open_stays_read_safe_under_locked_writer(tmp_db_path: Path) -> None:
+    """A second cache open should stay read-safe while another connection holds a write lock."""
+    import sqlite3
+
+    cache = EntityCache(tmp_db_path)
+    cache.upsert(200, "group", "Team Alpha", None)
+    TopicMetadataCache(cache._conn).upsert_topics(
+        200,
+        [{
+            "topic_id": 11,
+            "title": "Release Notes",
+            "top_message_id": 5011,
+            "is_general": False,
+            "is_deleted": False,
+        }],
+    )
+    cache.close()
+
+    writer = sqlite3.connect(str(tmp_db_path), timeout=0.1)
+    writer.execute("PRAGMA busy_timeout=100")
+    writer.execute("BEGIN IMMEDIATE")
+    writer.execute(
+        "UPDATE topic_metadata SET updated_at = updated_at WHERE dialog_id = ? AND topic_id = ?",
+        (200, 11),
+    )
+
+    cache_b = EntityCache(tmp_db_path)
+    result = cache_b.get(200, ttl_seconds=604_800)
+    cache_b.close()
+
+    writer.rollback()
+    writer.close()
+
+    assert result is not None
+    assert result["name"] == "Team Alpha"
+
+
 def test_entity_cache_tolerates_locked_wal_setup(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """EntityCache should still initialize when journal_mode=WAL is temporarily locked."""
     import mcp_telegram.cache as cache_module
