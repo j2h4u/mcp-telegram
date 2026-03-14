@@ -100,6 +100,26 @@ async def test_resolve_dialog_target_returns_ambiguous_failure(tmp_db_path) -> N
     assert 'id=701 name="Backend Forum" score=97 [group]' in result.text
 
 
+async def test_resolve_dialog_target_accepts_exact_dialog_id_without_resolution(tmp_db_path) -> None:
+    cache = EntityCache(tmp_db_path)
+    cache.upsert(701, "group", "Backend Forum", None)
+    resolver = AsyncMock()
+
+    result = await resolve_dialog_target(
+        cache=cache,
+        query=None,
+        retry_tool="ListMessages",
+        resolve_dialog=resolver,
+        exact_dialog_id=701,
+    )
+
+    assert isinstance(result, ResolvedDialogTarget)
+    assert result.entity_id == 701
+    assert result.display_name == "Backend Forum"
+    assert result.resolve_prefix == ""
+    assert resolver.await_count == 0
+
+
 async def test_load_forum_topic_capability_returns_resolved_topic(tmp_db_path, mock_client, make_mock_topic) -> None:
     cache = EntityCache(tmp_db_path)
     topic_cache = TopicMetadataCache(cache._conn)
@@ -125,6 +145,71 @@ async def test_load_forum_topic_capability_returns_resolved_topic(tmp_db_path, m
     assert result.display_name == "Release Notes"
     assert result.reply_to_message_id == 5011
     assert result.topic_catalog["choices"] == {1: "General", 11: "Release Notes"}
+
+
+async def test_load_forum_topic_capability_uses_cached_exact_topic_id_without_catalog_load(
+    tmp_db_path,
+    mock_client,
+    make_mock_topic,
+) -> None:
+    cache = EntityCache(tmp_db_path)
+    topic_cache = TopicMetadataCache(cache._conn)
+    topic_cache.upsert_topics(
+        701,
+        [make_mock_topic(topic_id=11, title="Release Notes", top_message_id=5011)],
+    )
+    load_topics = AsyncMock()
+    refresh_topic = AsyncMock()
+
+    result = await load_forum_topic_capability(
+        mock_client,
+        entity=701,
+        dialog_id=701,
+        dialog_name="Backend Forum",
+        topic_cache=topic_cache,
+        requested_topic=None,
+        retry_tool="ListMessages",
+        load_topics=load_topics,
+        exact_topic_id=11,
+        refresh_topic_by_id_fn=refresh_topic,
+    )
+
+    assert isinstance(result, ResolvedForumTopic)
+    assert result.display_name == "Release Notes"
+    assert result.reply_to_message_id == 5011
+    assert load_topics.await_count == 0
+    assert refresh_topic.await_count == 0
+
+
+async def test_load_forum_topic_capability_returns_deleted_exact_topic_from_cache_tombstone(
+    tmp_db_path,
+    mock_client,
+    make_deleted_topic,
+) -> None:
+    cache = EntityCache(tmp_db_path)
+    topic_cache = TopicMetadataCache(cache._conn)
+    topic_cache.upsert_topics(
+        701,
+        [make_deleted_topic(topic_id=9, title="Deprecated Topic", top_message_id=5009)],
+    )
+    load_topics = AsyncMock()
+
+    result = await load_forum_topic_capability(
+        mock_client,
+        entity=701,
+        dialog_id=701,
+        dialog_name="Backend Forum",
+        topic_cache=topic_cache,
+        requested_topic=None,
+        retry_tool="ListMessages",
+        load_topics=load_topics,
+        exact_topic_id=9,
+    )
+
+    assert isinstance(result, ForumTopicFailure)
+    assert result.kind == "deleted"
+    assert 'Topic "Deprecated Topic" was deleted and can no longer be fetched.' in result.text
+    assert load_topics.await_count == 0
 
 
 async def test_load_forum_topic_capability_returns_deleted_failure(
@@ -177,6 +262,37 @@ async def test_load_forum_topic_capability_returns_inaccessible_failure(
     assert isinstance(result, ForumTopicFailure)
     assert result.kind == "inaccessible"
     assert 'Topic "Release Notes" could not be loaded because Telegram rejected topic access (CHAT_NOT_FORUM).' in result.text
+
+
+async def test_load_forum_topic_capability_refreshes_exact_topic_id_on_cache_miss(
+    tmp_db_path,
+    mock_client,
+    make_mock_topic,
+) -> None:
+    cache = EntityCache(tmp_db_path)
+    topic_cache = TopicMetadataCache(cache._conn)
+    refreshed_topic = make_mock_topic(topic_id=11, title="Release Notes", top_message_id=6011)
+    load_topics = AsyncMock()
+    refresh_topic = AsyncMock(return_value=refreshed_topic)
+
+    result = await load_forum_topic_capability(
+        mock_client,
+        entity=701,
+        dialog_id=701,
+        dialog_name="Backend Forum",
+        topic_cache=topic_cache,
+        requested_topic=None,
+        retry_tool="ListMessages",
+        load_topics=load_topics,
+        exact_topic_id=11,
+        refresh_topic_by_id_fn=refresh_topic,
+    )
+
+    assert isinstance(result, ResolvedForumTopic)
+    assert result.display_name == "Release Notes"
+    assert result.reply_to_message_id == 6011
+    assert refresh_topic.await_count == 1
+    assert load_topics.await_count == 0
 
 
 async def test_fetch_messages_for_topic_refreshes_stale_anchor(
@@ -356,6 +472,52 @@ async def test_execute_history_read_capability_exposes_shared_navigation_for_top
     ) == 20
 
 
+async def test_execute_history_read_capability_uses_exact_targets_without_resolution_or_catalog_load(
+    tmp_db_path,
+    mock_client,
+    make_mock_message,
+    make_mock_topic,
+) -> None:
+    cache = EntityCache(tmp_db_path)
+    TopicMetadataCache(cache._conn).upsert_topics(
+        701,
+        [make_mock_topic(topic_id=11, title="Release Notes", top_message_id=5011)],
+    )
+    resolver = AsyncMock()
+    load_topics = AsyncMock()
+    message = make_mock_message(id=30, text="Direct topic update")
+    fetch_topic_messages = AsyncMock(return_value=[message])
+    mock_client.get_messages = AsyncMock(return_value=[])
+
+    result = await execute_history_read_capability(
+        mock_client,
+        cache=cache,
+        dialog_query=None,
+        limit=1,
+        navigation=None,
+        sender_query=None,
+        topic_query=None,
+        unread=False,
+        retry_tool="ListMessages",
+        resolve_dialog=resolver,
+        get_sender_type=lambda _sender: "user",
+        reaction_names_threshold=15,
+        load_topics=load_topics,
+        fetch_topic_messages_fn=fetch_topic_messages,
+        refresh_topic_by_id_fn=AsyncMock(),
+        exact_dialog_id=701,
+        exact_dialog_name="Backend Forum",
+        exact_topic_id=11,
+    )
+
+    assert isinstance(result, HistoryReadExecution)
+    assert result.topic_name == "Release Notes"
+    assert list(result.messages) == [message]
+    assert resolver.await_count == 0
+    assert load_topics.await_count == 0
+    assert fetch_topic_messages.await_args.kwargs["iter_kwargs"]["reply_to"] == 5011
+
+
 async def test_execute_history_read_capability_returns_navigation_failure(tmp_db_path, mock_client) -> None:
     cache = EntityCache(tmp_db_path)
     resolver = AsyncMock(return_value=Resolved(entity_id=701, display_name="Backend Forum"))
@@ -489,6 +651,42 @@ async def test_execute_search_messages_capability_exposes_shared_navigation(
         expected_dialog_id=701,
         expected_query="ship",
     ) == 1
+
+
+async def test_execute_search_messages_capability_uses_exact_dialog_id_without_resolution(
+    tmp_db_path,
+    mock_client,
+    make_mock_message,
+) -> None:
+    cache = EntityCache(tmp_db_path)
+    resolver = AsyncMock()
+    hit = make_mock_message(id=50, text="the hit", sender_id=9001, sender_name="Alice")
+
+    async def _fake_iter_messages(*_args, **_kwargs):
+        yield hit
+
+    mock_client.iter_messages = _fake_iter_messages
+    mock_client.get_messages = AsyncMock(return_value=[])
+
+    result = await execute_search_messages_capability(
+        mock_client,
+        cache=cache,
+        dialog_query=None,
+        query="ship",
+        limit=1,
+        navigation=None,
+        retry_tool="SearchMessages",
+        resolve_dialog=resolver,
+        get_sender_type=lambda _sender: "user",
+        reaction_names_threshold=15,
+        exact_dialog_id=701,
+        exact_dialog_name="Backend Forum",
+    )
+
+    assert isinstance(result, SearchExecution)
+    assert result.dialog_name == "Backend Forum"
+    assert list(result.hits) == [hit]
+    assert resolver.await_count == 0
 
 
 async def test_execute_search_messages_capability_rejects_query_mismatch_navigation_token(

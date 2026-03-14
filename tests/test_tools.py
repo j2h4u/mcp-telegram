@@ -363,6 +363,8 @@ async def test_list_messages_adapter_delegates_to_history_capability(
     assert "Delegated topic update" in result[0].text
     assert "next_navigation: nav-token" in result[0].text
     assert capability.await_args.kwargs["topic_query"] == "Release Notes"
+    assert "exact_dialog_id" not in capability.await_args.kwargs
+    assert "exact_topic_id" not in capability.await_args.kwargs
 
 
 async def test_search_messages_adapter_delegates_to_capability_execution(
@@ -402,6 +404,7 @@ async def test_search_messages_adapter_delegates_to_capability_execution(
     assert "next_offset" not in result[0].text
     assert capability.await_args.kwargs["query"] == "ship"
     assert capability.await_args.kwargs["navigation"] is None
+    assert "exact_dialog_id" not in capability.await_args.kwargs
 
 
 # --- TOOL-02: ListMessages name resolution ---
