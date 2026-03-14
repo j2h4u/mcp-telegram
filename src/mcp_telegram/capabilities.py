@@ -18,8 +18,8 @@ from .cache import (
     TopicMetadataCache,
 )
 from .pagination import (
-    decode_cursor,
     decode_history_navigation,
+    decode_navigation_token,
     decode_search_navigation,
     encode_cursor,
     encode_history_navigation,
@@ -31,6 +31,9 @@ FORUM_TOPICS_PAGE_SIZE = 100
 TOPIC_METADATA_TTL_SECONDS = 600
 GENERAL_TOPIC_ID = 1
 GENERAL_TOPIC_TITLE = "General"
+HISTORY_NAVIGATION_NEWEST = "newest"
+HISTORY_NAVIGATION_OLDEST = "oldest"
+HistoryNavigationMode = Literal["newest", "oldest"]
 
 
 class TopicMetadata(TypedDict, total=False):
@@ -336,6 +339,37 @@ def invalid_navigation_text(detail: str, *, retry_tool: str) -> str:
         f"Navigation token is invalid: {detail}",
         f"Retry {retry_tool} without navigation to start from the first page, or reuse the exact next_navigation value from the previous {retry_tool} response.",
     )
+
+
+def parse_history_navigation_input(
+    navigation: str | None,
+    *,
+    retry_tool: str,
+) -> tuple[str | None, HistoryNavigationMode] | NavigationFailure:
+    """Parse one public ListMessages navigation value into token and direction."""
+    if navigation is None or navigation == HISTORY_NAVIGATION_NEWEST:
+        return None, HISTORY_NAVIGATION_NEWEST
+    if navigation == HISTORY_NAVIGATION_OLDEST:
+        return None, HISTORY_NAVIGATION_OLDEST
+
+    try:
+        token = decode_navigation_token(navigation)
+    except ValueError as exc:
+        return NavigationFailure(
+            kind="invalid_navigation",
+            text=invalid_navigation_text(str(exc), retry_tool=retry_tool),
+        )
+
+    if token.kind != "history":
+        return NavigationFailure(
+            kind="invalid_navigation",
+            text=invalid_navigation_text(
+                f"Navigation token is for {token.kind}, not history",
+                retry_tool=retry_tool,
+            ),
+        )
+
+    return navigation, token.direction or HISTORY_NAVIGATION_NEWEST
 
 
 def sender_not_found_text(sender_name: str, *, retry_tool: str) -> str:
@@ -894,12 +928,19 @@ def _build_history_iter_kwargs(
     *,
     entity_id: int,
     limit: int,
-    cursor: str | None,
-    navigation_token: str | None,
+    navigation: str | None,
     topic_id: int | None,
-    from_beginning: bool,
     retry_tool: str,
 ) -> dict[str, object] | MessageReadFailure | NavigationFailure:
+    navigation_result = parse_history_navigation_input(
+        navigation,
+        retry_tool=retry_tool,
+    )
+    if isinstance(navigation_result, NavigationFailure):
+        return navigation_result
+
+    navigation_token, direction = navigation_result
+    from_beginning = direction == HISTORY_NAVIGATION_OLDEST
     iter_kwargs: dict[str, object] = {
         "entity": entity_id,
         "limit": limit,
@@ -913,6 +954,7 @@ def _build_history_iter_kwargs(
                 navigation_token,
                 expected_dialog_id=entity_id,
                 expected_topic_id=topic_id,
+                expected_direction=direction,
             )
         except ValueError as exc:
             return NavigationFailure(
@@ -923,14 +965,6 @@ def _build_history_iter_kwargs(
     if from_beginning:
         if shared_cursor_id is not None:
             iter_kwargs["min_id"] = shared_cursor_id
-        elif cursor:
-            try:
-                iter_kwargs["min_id"] = decode_cursor(cursor, entity_id)
-            except Exception as exc:
-                return MessageReadFailure(
-                    kind="invalid_cursor",
-                    text=invalid_cursor_text(str(exc), retry_tool=retry_tool),
-                )
         else:
             iter_kwargs["min_id"] = 1
         return iter_kwargs
@@ -938,15 +972,6 @@ def _build_history_iter_kwargs(
     if shared_cursor_id is not None:
         iter_kwargs["max_id"] = shared_cursor_id
         return iter_kwargs
-
-    if cursor:
-        try:
-            iter_kwargs["max_id"] = decode_cursor(cursor, entity_id)
-        except Exception as exc:
-            return MessageReadFailure(
-                kind="invalid_cursor",
-                text=invalid_cursor_text(str(exc), retry_tool=retry_tool),
-            )
 
     return iter_kwargs
 
@@ -1226,11 +1251,10 @@ async def execute_history_read_capability(
     cache: EntityCache,
     dialog_query: str,
     limit: int,
-    cursor: str | None,
+    navigation: str | None,
     sender_query: str | None,
     topic_query: str | None,
     unread: bool,
-    from_beginning: bool,
     retry_tool: str,
     resolve_dialog: DialogResolver,
     get_sender_type: SenderTypeGetter,
@@ -1238,7 +1262,6 @@ async def execute_history_read_capability(
     load_topics: TopicLoader | None = None,
     fetch_topic_messages_fn: TopicFetcher | None = None,
     refresh_topic_by_id_fn: TopicRefresher | None = None,
-    navigation_token: str | None = None,
 ) -> HistoryReadCapabilityResult:
     dialog_target = await resolve_dialog_target(
         cache=cache,
@@ -1292,10 +1315,8 @@ async def execute_history_read_capability(
     iter_kwargs = _build_history_iter_kwargs(
         entity_id=dialog_target.entity_id,
         limit=limit,
-        cursor=cursor,
-        navigation_token=navigation_token,
+        navigation=navigation,
         topic_id=int(topic_metadata["topic_id"]) if topic_metadata is not None else None,
-        from_beginning=from_beginning,
         retry_tool=retry_tool,
     )
     if isinstance(iter_kwargs, (MessageReadFailure, NavigationFailure)):
@@ -1415,6 +1436,11 @@ async def execute_history_read_capability(
     if len(cursor_source_messages) == limit and cursor_source_messages:
         last_message_id = getattr(cursor_source_messages[-1], "id", None)
         if isinstance(last_message_id, int):
+            history_direction: HistoryNavigationMode = (
+                HISTORY_NAVIGATION_OLDEST
+                if bool(iter_kwargs["reverse"])
+                else HISTORY_NAVIGATION_NEWEST
+            )
             next_cursor = encode_cursor(last_message_id, entity_id)
             navigation = CapabilityNavigation(
                 kind="history",
@@ -1422,6 +1448,7 @@ async def execute_history_read_capability(
                     last_message_id,
                     entity_id,
                     topic_id=int(topic_metadata["topic_id"]) if topic_metadata is not None else None,
+                    direction=history_direction,
                 ),
             )
 

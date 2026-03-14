@@ -32,7 +32,6 @@ from .cache import (
     TopicMetadataCache,
 )
 from .formatter import format_messages
-from .pagination import decode_cursor, encode_cursor
 from .resolver import Candidates, NotFound, Resolved, resolve
 from .telegram import create_client
 
@@ -1153,16 +1152,16 @@ class ListMessages(ToolArgs):
     REQUIRED: dialog must be provided. This tool does not support a global
     "latest messages across all dialogs" mode.
 
-    Returns messages newest-first in human-readable format
-    (HH:mm FirstName: text) with date headers and session breaks.
+    Returns messages in human-readable format (HH:mm FirstName: text) with date headers and
+    session breaks.
 
-    Use cursor= with the next_cursor token from a previous response to page back in time.
+    Use navigation="newest" (or omit navigation) to start from the latest messages.
+    Use navigation="oldest" to start from the oldest messages in the dialog.
+    Use navigation= with the next_navigation token from a previous response to continue.
     Use sender= to filter messages from a specific person (name string, resolved via fuzzy match).
     Use topic= to filter messages to one forum topic after the dialog has been resolved.
     In forum dialogs, omitting topic= returns a cross-topic page and each message is labeled inline.
     Use unread=True to show only messages you haven't read yet.
-    Use from_beginning=True to fetch messages oldest-first (starts from message ID 1). When true,
-    pagination reads forward through time rather than backward.
     Default limit=50; set limit explicitly if you want a smaller MCP response.
 
     If response is ambiguous (multiple matches), use the numeric id= parameter with the ID from the matches list.
@@ -1176,11 +1175,17 @@ class ListMessages(ToolArgs):
         )
     )
     limit: int = 50
-    cursor: str | None = None
+    navigation: str | None = Field(
+        default=None,
+        description=(
+            'Optional shared navigation state. Omit or set to "newest" to start from the latest '
+            'messages. Set to "oldest" to start from the oldest messages. Reuse the exact '
+            "next_navigation token from the previous ListMessages response to continue."
+        ),
+    )
     sender: str | None = None
     topic: str | None = None
     unread: bool = False
-    from_beginning: bool = False
 
 
 @tool_runner.register
@@ -1203,11 +1208,10 @@ async def list_messages(
                 cache=cache,
                 dialog_query=args.dialog,
                 limit=args.limit,
-                cursor=args.cursor,
+                navigation=args.navigation,
                 sender_query=args.sender,
                 topic_query=args.topic,
                 unread=args.unread,
-                from_beginning=args.from_beginning,
                 retry_tool="ListMessages",
                 resolve_dialog=_resolve_dialog,
                 get_sender_type=_get_sender_type,
@@ -1222,6 +1226,7 @@ async def list_messages(
                 capabilities.DialogTargetFailure,
                 capabilities.ForumTopicFailure,
                 capabilities.MessageReadFailure,
+                capabilities.NavigationFailure,
             ),
         ):
             return [TextContent(type="text", text=history_execution.text)]
@@ -1243,8 +1248,8 @@ async def list_messages(
             else ""
         )
         result_text = history_execution.resolve_prefix + topic_prefix + text
-        if history_execution.next_cursor:
-            result_text += f"\n\nnext_cursor: {history_execution.next_cursor}"
+        if history_execution.navigation is not None:
+            result_text += f"\n\nnext_navigation: {history_execution.navigation.token}"
         result = [TextContent(type="text", text=result_text)]
     except Exception as exc:
         error_type = type(exc).__name__
@@ -1259,7 +1264,10 @@ async def list_messages(
                 timestamp=time.time(),
                 duration_ms=duration_ms,
                 result_count=result_count,
-                has_cursor=args.cursor is not None,
+                has_cursor=(
+                    args.navigation is not None
+                    and args.navigation not in {"newest", "oldest"}
+                ),
                 page_depth=page_depth,
                 has_filter=has_filter,
                 error_type=error_type,

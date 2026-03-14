@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+import re
 import mcp_telegram.tools as tools_module
 from mcp_telegram.tools import ListDialogs, ListMessages, ListTopics, SearchMessages
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -20,6 +21,13 @@ async def _async_iter(items):
     """Async generator yielding items from a list — local helper for test_tools.py."""
     for item in items:
         yield item
+
+
+def _extract_footer_token(text: str, label: str) -> str | None:
+    match = re.search(rf"{label}:\s*(\S+)", text)
+    if match is None:
+        return None
+    return match.group(1)
 
 
 def _make_mock_topic(
@@ -259,7 +267,7 @@ def test_tool_description_strips_nullable_unions_from_exported_schema():
     search_messages_schema = tools_module.tool_description(SearchMessages).inputSchema
 
     dialog_schema = list_messages_schema["properties"]["dialog"]
-    cursor_schema = list_messages_schema["properties"]["cursor"]
+    navigation_schema = list_messages_schema["properties"]["navigation"]
     sender_schema = list_messages_schema["properties"]["sender"]
     topic_schema = list_messages_schema["properties"]["topic"]
     offset_schema = search_messages_schema["properties"]["offset"]
@@ -267,7 +275,11 @@ def test_tool_description_strips_nullable_unions_from_exported_schema():
     assert "dialog" in list_messages_schema["required"]
     assert dialog_schema["type"] == "string"
     assert "Required." in dialog_schema["description"]
-    assert cursor_schema == {"title": "Cursor", "type": "string"}
+    assert navigation_schema["title"] == "Navigation"
+    assert navigation_schema["type"] == "string"
+    assert '"newest"' in navigation_schema["description"]
+    assert '"oldest"' in navigation_schema["description"]
+    assert "next_navigation" in navigation_schema["description"]
     assert sender_schema == {"title": "Sender", "type": "string"}
     assert topic_schema == {"title": "Topic", "type": "string"}
     assert offset_schema == {"title": "Offset", "type": "integer"}
@@ -333,7 +345,7 @@ async def test_list_messages_adapter_delegates_to_history_capability(
             reply_map={},
             reaction_names_map={},
             topic_name_getter=None,
-            next_cursor="cursor-token",
+            next_cursor=None,
             navigation=CapabilityNavigation(kind="history", token="nav-token"),
         )
     )
@@ -346,8 +358,7 @@ async def test_list_messages_adapter_delegates_to_history_capability(
 
     assert result[0].text.startswith('[resolved: "Backend" → Backend Forum]\n[topic: Release Notes]\n')
     assert "Delegated topic update" in result[0].text
-    assert "next_cursor: cursor-token" in result[0].text
-    assert "next_navigation" not in result[0].text
+    assert "next_navigation: nav-token" in result[0].text
     assert capability.await_args.kwargs["topic_query"] == "Release Notes"
 
 
@@ -467,32 +478,32 @@ async def test_list_messages_ambiguous(mock_cache, mock_client, monkeypatch, tmp
     assert "Action:" in result[0].text
 
 
-# --- TOOL-03: ListMessages cursor pagination ---
+# --- TOOL-03: ListMessages navigation pagination ---
 
 
-async def test_list_messages_cursor_present(mock_cache, mock_client, monkeypatch, make_mock_message):
-    """ListMessages with full page returns next_cursor token in output."""
+async def test_list_messages_navigation_present(mock_cache, mock_client, monkeypatch, make_mock_message):
+    """ListMessages with a full page returns next_navigation in output."""
     from mcp_telegram.tools import ListMessages, list_messages
-    # Return exactly limit=2 messages so cursor should be present
+
     msgs = [make_mock_message(id=20, text="B"), make_mock_message(id=10, text="A")]
     mock_client.iter_messages = MagicMock(return_value=_async_iter(msgs))
     monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
     monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
     result = await list_messages(ListMessages(dialog="Иван Петров", limit=2))
     assert len(result) == 1
-    assert "next_cursor:" in result[0].text
+    assert "next_navigation:" in result[0].text
 
 
-async def test_list_messages_no_cursor_last_page(mock_cache, mock_client, monkeypatch, make_mock_message):
-    """ListMessages with partial page (fewer than limit) has no next_cursor in output."""
+async def test_list_messages_no_navigation_last_page(mock_cache, mock_client, monkeypatch, make_mock_message):
+    """ListMessages with a partial page has no next_navigation in output."""
     from mcp_telegram.tools import ListMessages, list_messages
-    # Return 1 message but limit=5 — partial page, no cursor
+
     msgs = [make_mock_message(id=10, text="Only")]
     mock_client.iter_messages = MagicMock(return_value=_async_iter(msgs))
     monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
     monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
     result = await list_messages(ListMessages(dialog="Иван Петров", limit=5))
-    assert "next_cursor" not in result[0].text
+    assert "next_navigation" not in result[0].text
 
 
 # --- TOOL-04: ListMessages sender filter ---
@@ -762,9 +773,9 @@ async def test_list_messages_topic_cursor_round_trip(
     make_mock_message,
     make_mock_topic,
 ):
-    """Topic-filtered pagination keeps reply_to scoped and emits a reusable cursor."""
+    """Topic-filtered pagination keeps reply_to scoped and emits reusable navigation."""
     from mcp_telegram.cache import EntityCache
-    from mcp_telegram.pagination import encode_cursor
+    from mcp_telegram.pagination import encode_history_navigation
     from mcp_telegram.tools import ListMessages, list_messages
 
     cache = EntityCache(tmp_db_path)
@@ -791,13 +802,13 @@ async def test_list_messages_topic_cursor_round_trip(
 
     first_page = await list_messages(ListMessages(dialog="Backend Forum", topic="Release Notes", limit=2))
 
-    expected_cursor = encode_cursor(20, 701)
-    assert f"next_cursor: {expected_cursor}" in first_page[0].text
+    expected_navigation = encode_history_navigation(20, 701, topic_id=11, direction="newest")
+    assert f"next_navigation: {expected_navigation}" in first_page[0].text
     first_call_kwargs = mock_client.iter_messages.call_args_list[0].kwargs
     assert first_call_kwargs["reply_to"] == 5011
 
     await list_messages(
-        ListMessages(dialog="Backend Forum", topic="Release Notes", limit=2, cursor=expected_cursor)
+        ListMessages(dialog="Backend Forum", topic="Release Notes", limit=2, navigation=expected_navigation)
     )
 
     second_call_kwargs = mock_client.iter_messages.call_args_list[1].kwargs
@@ -835,7 +846,7 @@ async def test_list_messages_topic_from_beginning(
     )
 
     result = await list_messages(
-        ListMessages(dialog="Backend Forum", topic="Release Notes", from_beginning=True, limit=2)
+        ListMessages(dialog="Backend Forum", topic="Release Notes", navigation="oldest", limit=2)
     )
 
     call_kwargs = mock_client.iter_messages.call_args.kwargs
@@ -977,7 +988,7 @@ async def test_list_messages_general_topic_unread_is_scoped(
 ):
     """General unread mode keeps only General messages and diverges from dialog-wide unread pages."""
     from mcp_telegram.cache import EntityCache
-    from mcp_telegram.pagination import encode_cursor
+    from mcp_telegram.pagination import encode_history_navigation
     from mcp_telegram.tools import ListMessages, list_messages
 
     cache = EntityCache(tmp_db_path)
@@ -1024,11 +1035,11 @@ async def test_list_messages_general_topic_unread_is_scoped(
     )
 
     assert "Adjacent unread topic" in dialog_result[0].text
-    assert f"next_cursor: {encode_cursor(79, 701)}" in dialog_result[0].text
+    assert f"next_navigation: {encode_history_navigation(79, 701, direction='newest')}" in dialog_result[0].text
     assert "Adjacent unread topic" not in topic_result[0].text
     assert "General unread newest" in topic_result[0].text
     assert "General unread older" in topic_result[0].text
-    assert f"next_cursor: {encode_cursor(78, 701)}" in topic_result[0].text
+    assert f"next_navigation: {encode_history_navigation(78, 701, topic_id=1, direction='newest')}" in topic_result[0].text
 
 
 async def test_list_messages_topic_unread_cursor_is_topic_scoped(
@@ -1042,7 +1053,7 @@ async def test_list_messages_topic_unread_cursor_is_topic_scoped(
 ):
     """Unread topic cursors use the last emitted topic message, not the last raw unread item."""
     from mcp_telegram.cache import EntityCache
-    from mcp_telegram.pagination import encode_cursor
+    from mcp_telegram.pagination import encode_history_navigation
     from mcp_telegram.tools import ListMessages, list_messages
 
     cache = EntityCache(tmp_db_path)
@@ -1081,7 +1092,10 @@ async def test_list_messages_topic_unread_cursor_is_topic_scoped(
     assert "General unread leak" not in result[0].text
     assert "Topic unread newest" in result[0].text
     assert "Topic unread older" in result[0].text
-    assert f"next_cursor: {encode_cursor(88, 701)}" in result[0].text
+    assert (
+        f"next_navigation: {encode_history_navigation(88, 701, topic_id=11, direction='newest')}"
+        in result[0].text
+    )
 
 
 async def test_list_messages_topic_unread_filters_dialog_leaks(
@@ -1093,9 +1107,9 @@ async def test_list_messages_topic_unread_filters_dialog_leaks(
     make_mock_topic,
     make_mock_forum_reply,
 ):
-    """Unread topic pages drop mixed-dialog leaks before formatting and cursor generation."""
+    """Unread topic pages drop mixed-dialog leaks before formatting and navigation generation."""
     from mcp_telegram.cache import EntityCache
-    from mcp_telegram.pagination import encode_cursor
+    from mcp_telegram.pagination import encode_history_navigation
     from mcp_telegram.tools import ListMessages, list_messages
 
     cache = EntityCache(tmp_db_path)
@@ -1138,10 +1152,13 @@ async def test_list_messages_topic_unread_filters_dialog_leaks(
     assert "General unread leak" not in result[0].text
     assert "Topic unread newest" in result[0].text
     assert "Topic unread older" in result[0].text
-    assert f"next_cursor: {encode_cursor(67, 701)}" in result[0].text
+    assert (
+        f"next_navigation: {encode_history_navigation(67, 701, topic_id=11, direction='newest')}"
+        in result[0].text
+    )
 
 
-async def test_list_messages_topic_unread_empty_page_has_no_cursor(
+async def test_list_messages_topic_unread_empty_page_has_no_navigation(
     tmp_db_path,
     mock_client,
     monkeypatch,
@@ -1185,7 +1202,7 @@ async def test_list_messages_topic_unread_empty_page_has_no_cursor(
 
     assert result[0].text == """[topic: Release Notes]
 no unread messages"""
-    assert "next_cursor" not in result[0].text
+    assert "next_navigation" not in result[0].text
 
 
 async def test_list_messages_general_topic_normalization(
@@ -1512,9 +1529,9 @@ async def test_list_messages_topic_boundary_no_leakage(
     make_mock_topic,
     make_mock_forum_reply,
 ):
-    """Topic pagination strips adjacent-topic leaks and keeps cursors aligned to emitted thread messages."""
+    """Topic pagination strips adjacent-topic leaks and keeps navigation aligned to emitted thread messages."""
     from mcp_telegram.cache import EntityCache
-    from mcp_telegram.pagination import encode_cursor
+    from mcp_telegram.pagination import encode_history_navigation
     from mcp_telegram.tools import ListMessages, list_messages
 
     cache = EntityCache(tmp_db_path)
@@ -1563,14 +1580,14 @@ async def test_list_messages_topic_boundary_no_leakage(
 
     first_page = await list_messages(ListMessages(dialog="Backend Forum", topic="Release Notes", limit=2))
 
-    expected_cursor = encode_cursor(48, 701)
+    expected_navigation = encode_history_navigation(48, 701, topic_id=11, direction="newest")
     assert "Adjacent topic leak" not in first_page[0].text
     assert "Topic newest" in first_page[0].text
     assert "Topic older" in first_page[0].text
-    assert f"next_cursor: {expected_cursor}" in first_page[0].text
+    assert f"next_navigation: {expected_navigation}" in first_page[0].text
 
     second_page = await list_messages(
-        ListMessages(dialog="Backend Forum", topic="Release Notes", limit=2, cursor=expected_cursor)
+        ListMessages(dialog="Backend Forum", topic="Release Notes", limit=2, navigation=expected_navigation)
     )
 
     second_call_kwargs = mock_client.iter_messages.call_args_list[1].kwargs
@@ -1582,7 +1599,7 @@ async def test_list_messages_topic_boundary_no_leakage(
     assert "Topic newest" not in second_page[0].text
 
     reverse_page = await list_messages(
-        ListMessages(dialog="Backend Forum", topic="Release Notes", from_beginning=True, limit=2)
+        ListMessages(dialog="Backend Forum", topic="Release Notes", navigation="oldest", limit=2)
     )
 
     reverse_call_kwargs = mock_client.iter_messages.call_args_list[2].kwargs
@@ -2116,16 +2133,16 @@ async def test_search_messages_no_hits_returns_action(mock_cache, mock_client, m
     assert "broader query" in result[0].text
 
 
-async def test_list_messages_invalid_cursor_returns_error(mock_cache, mock_client, monkeypatch):
-    """list_messages with a malformed cursor returns an action-oriented cursor error."""
+async def test_list_messages_invalid_navigation_returns_error(mock_cache, mock_client, monkeypatch):
+    """list_messages with malformed navigation returns an action-oriented navigation error."""
     from mcp_telegram.tools import ListMessages, list_messages
 
     monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
     monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
 
-    result = await list_messages(ListMessages(dialog="Иван Петров", cursor="BADINVALID==garbage"))
+    result = await list_messages(ListMessages(dialog="Иван Петров", navigation="BADINVALID==garbage"))
     assert len(result) == 1
-    assert result[0].text.startswith("Cursor is invalid:")
+    assert result[0].text.startswith("Navigation token is invalid:")
     assert "Action:" in result[0].text
 
 
@@ -2203,18 +2220,24 @@ async def test_list_messages_records_telemetry(mock_cache, mock_client, monkeypa
     assert event.has_filter is False
 
 
-async def test_list_messages_records_cursor(mock_cache, mock_client, monkeypatch, mock_analytics_collector, make_mock_message):
-    """ListMessages records has_cursor=True when cursor provided."""
+async def test_list_messages_records_navigation_token(
+    mock_cache,
+    mock_client,
+    monkeypatch,
+    mock_analytics_collector,
+    make_mock_message,
+):
+    """ListMessages records has_cursor=True when a continuation token is provided."""
     from mcp_telegram.tools import ListMessages, list_messages
-    from mcp_telegram.pagination import encode_cursor
+    from mcp_telegram.pagination import encode_history_navigation
 
     msg = make_mock_message(id=10, text="Hello")
     mock_client.iter_messages = MagicMock(return_value=_async_iter([msg]))
     monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
     monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
 
-    cursor = encode_cursor(50, 101)
-    await list_messages(ListMessages(dialog="Иван Петров", cursor=cursor))
+    navigation = encode_history_navigation(50, 101, direction="newest")
+    await list_messages(ListMessages(dialog="Иван Петров", navigation=navigation))
 
     assert len(mock_analytics_collector) == 1
     event = mock_analytics_collector[0]
@@ -2490,12 +2513,8 @@ async def test_get_usage_stats_no_recent_data_returns_action(mock_cache, mock_cl
 # --- Wave 0 Test Stubs: Reverse Pagination (NAV-01) ---
 
 
-async def test_list_messages_from_beginning(mock_cache, mock_client, monkeypatch, make_mock_message):
-    """ListMessages accepts from_beginning=True parameter and uses reverse iteration.
-
-    Validates that the from_beginning parameter is recognized by ListMessages and
-    properly routed to iter_messages as reverse=True.
-    """
+async def test_list_messages_navigation_oldest(mock_cache, mock_client, monkeypatch, make_mock_message):
+    """ListMessages accepts navigation=\"oldest\" and uses reverse iteration."""
     msg1 = make_mock_message(id=1, text="First message")
     msg2 = make_mock_message(id=2, text="Second message")
     mock_client.iter_messages = MagicMock(return_value=_async_iter([msg1, msg2]))
@@ -2503,25 +2522,23 @@ async def test_list_messages_from_beginning(mock_cache, mock_client, monkeypatch
     monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
 
     from mcp_telegram.tools import ListMessages, list_messages
-    result = await list_messages(ListMessages(dialog="Иван Петров", from_beginning=True))
+    result = await list_messages(ListMessages(dialog="Иван Петров", navigation="oldest"))
 
-    # Verify iter_messages was called with reverse=True
     call_kwargs = mock_client.iter_messages.call_args[1]
     assert call_kwargs["reverse"] is True
-    assert call_kwargs["min_id"] == 1  # Start from oldest
+    assert call_kwargs["min_id"] == 1
 
-    # Verify output shows messages (no error)
     assert len(result) == 1
     assert "First message" in result[0].text or "Second message" in result[0].text
 
 
-async def test_list_messages_from_beginning_oldest_first(mock_cache, mock_client, monkeypatch, make_mock_message):
-    """from_beginning=True with multiple messages displays oldest first.
-
-    Verifies that when from_beginning=True, the output shows messages in chronological
-    order (oldest first) rather than reverse chronological order.
-    """
-    # Create messages in reverse ID order (like Telethon returns when reverse=True)
+async def test_list_messages_navigation_oldest_displays_messages(
+    mock_cache,
+    mock_client,
+    monkeypatch,
+    make_mock_message,
+):
+    """navigation=\"oldest\" keeps the oldest-first fetch path readable."""
     msg1 = make_mock_message(id=1, text="Oldest", date=datetime(2024, 1, 1, 10, 0, tzinfo=timezone.utc))
     msg2 = make_mock_message(id=2, text="Middle", date=datetime(2024, 1, 2, 10, 0, tzinfo=timezone.utc))
     msg3 = make_mock_message(id=3, text="Newest", date=datetime(2024, 1, 3, 10, 0, tzinfo=timezone.utc))
@@ -2531,57 +2548,54 @@ async def test_list_messages_from_beginning_oldest_first(mock_cache, mock_client
     monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
 
     from mcp_telegram.tools import ListMessages, list_messages
-    result = await list_messages(ListMessages(dialog="Иван Петров", from_beginning=True))
+    result = await list_messages(ListMessages(dialog="Иван Петров", navigation="oldest"))
 
     text = result[0].text
-    lines = text.split('\n')
-
-    # formatter.py reverses unconditionally, so output should be newest-first visually (that's correct for display)
-    # But verify all messages are present
     assert "Oldest" in text
     assert "Middle" in text
     assert "Newest" in text
 
 
-async def test_list_messages_reverse_pagination_cursor(mock_cache, mock_client, monkeypatch, make_mock_message):
-    """Cursor pagination works correctly with from_beginning=True (reverse iteration).
-
-    Confirms that cursor-based pagination functions bidirectionally: when using
-    from_beginning=True, the next_cursor from page 1 can be used with from_beginning=True
-    on page 2 to continue iteration using min_id instead of max_id.
-    """
+async def test_list_messages_oldest_navigation_round_trip(
+    mock_cache,
+    mock_client,
+    monkeypatch,
+    make_mock_message,
+):
+    """Oldest-first pagination reuses next_navigation to continue with min_id."""
     msg1 = make_mock_message(id=1, text="Message 1")
     msg2 = make_mock_message(id=2, text="Message 2")
 
-    # Return exactly 2 messages with limit=2 to trigger cursor generation
     mock_client.iter_messages = MagicMock(return_value=_async_iter([msg1, msg2]))
     monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
     monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
 
     from mcp_telegram.tools import ListMessages, list_messages
-    from mcp_telegram.pagination import encode_cursor, decode_cursor
+    from mcp_telegram.pagination import decode_history_navigation
 
-    # Page 1: fetch from beginning with limit=2 to trigger full-page cursor
-    result = await list_messages(ListMessages(dialog="Иван Петров", from_beginning=True, limit=2))
-    assert "next_cursor" in result[0].text  # Output should include cursor for page 2
+    result = await list_messages(ListMessages(dialog="Иван Петров", navigation="oldest", limit=2))
+    next_navigation = _extract_footer_token(result[0].text, "next_navigation")
+    assert next_navigation is not None
+    assert (
+        decode_history_navigation(
+            next_navigation,
+            expected_dialog_id=101,
+            expected_direction="oldest",
+        )
+        == 2
+    )
 
-    # Extract cursor from result (format_messages includes it in footer)
-    # Cursor is in format: "next_cursor: {cursor_token}"
-    import re
-    match = re.search(r"next_cursor:\s*(\S+)", result[0].text)
-    if match:
-        next_cursor = match.group(1)
-        # Page 2: use cursor with from_beginning=True
-        result2 = await list_messages(ListMessages(
+    await list_messages(
+        ListMessages(
             dialog="Иван Петров",
-            from_beginning=True,
-            cursor=next_cursor,
-            limit=2
-        ))
-        # Verify second call used min_id with decoded cursor
-        call_kwargs = mock_client.iter_messages.call_args[1]
-        assert "min_id" in call_kwargs  # Should use min_id for reverse
-        assert call_kwargs["reverse"] is True
+            navigation=next_navigation,
+            limit=2,
+        )
+    )
+
+    call_kwargs = mock_client.iter_messages.call_args[1]
+    assert "min_id" in call_kwargs
+    assert call_kwargs["reverse"] is True
 
 
 # --- Wave 0 Test Stubs: Archived Dialog Filtering (NAV-02) ---
