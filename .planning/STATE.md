@@ -4,16 +4,16 @@ milestone: v1.3
 milestone_name: Medium Implementation
 current_phase: 17
 current_phase_name: Direct Read/Search Workflows
-current_plan: 3
+current_plan: 4
 status: ready_for_verification
-stopped_at: Completed 17-03-PLAN.md
-last_updated: "2026-03-14T10:45:14.847Z"
+stopped_at: Completed 17-04-PLAN.md
+last_updated: "2026-03-14T12:55:01Z"
 last_activity: 2026-03-14
 progress:
   total_phases: 5
   completed_phases: 4
-  total_plans: 11
-  completed_plans: 11
+  total_plans: 12
+  completed_plans: 12
   percent: 100
 ---
 
@@ -24,30 +24,30 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-14)
 
 **Core value:** LLM can work with Telegram using natural names - zero cold-start friction, no ID lookup boilerplate before every real task
-**Current focus:** Phase 17 `Direct Read/Search Workflows` completed for milestone `v1.3 Medium Implementation`; next work can move to Phase 18 rollout posture once verification/closeout is consumed.
+**Current focus:** Phase 17 `Direct Read/Search Workflows` is complete including runtime gap-closure Plan 17-04; next work can move to Phase 18 rollout posture once verification/closeout is consumed.
 
 ## Current Position
 
 Current Phase: 17
 Current Phase Name: Direct Read/Search Workflows
 Total Phases: 18
-Current Plan: 3
-Total Plans in Phase: 3
+Current Plan: 4
+Total Plans in Phase: 4
 Status: Ready for verification
 Last Activity: 2026-03-14
-Last Activity Description: Completed Plan 17-03 direct SearchMessages workflow, schema/telemetry proof, and rebuilt-runtime verification
+Last Activity Description: Completed Plan 17-04 shared cache concurrency hardening, regression proof, and restarted-runtime parallel-session verification
 Progress: [██████████] 100%
 
 Phase: 17 of 18 (`Direct Read/Search Workflows`)
-Plan: 3 of 3 in current phase
+Plan: 4 of 4 in current phase
 Status: Ready for verification
-Last activity: 2026-03-14 - Completed Plan 17-03 direct SearchMessages workflow, schema/telemetry proof, and rebuilt-runtime verification
+Last activity: 2026-03-14 - Completed Plan 17-04 shared cache concurrency hardening, regression proof, and restarted-runtime parallel-session verification
 Progress: [██████████] 100%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 17
+- Total plans completed: 18
 - Average duration: 4.5 min
 - Total execution time: 77 min
 
@@ -66,6 +66,7 @@ Progress: [██████████] 100%
 | Phase 17 P01 | 8 min | 2 tasks | 4 files |
 | Phase 17 P02 | 11 min | 2 tasks | 4 files |
 | Phase 17 P03 | 9m | 3 tasks | 7 files |
+| Phase 17 P04 | 46 min | 3 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -100,6 +101,8 @@ Progress: [██████████] 100%
 - [Phase 17]: Direct forum reads must stay on the shared capability seam so deleted-topic, inaccessible-topic, General, unread, and navigation behavior remain aligned with the brownfield path.
 - [Phase 17]: Kept SearchMessages on the existing dialog/query contract and treated signed numeric dialog strings as the exact-target fast path.
 - [Phase 17]: Moved hit-window grouping and hit markers into formatter/capability helpers so the adapter only handles MCP framing and telemetry.
+- [Phase 17]: Serialize shared cache bootstrap with a lock file and dedicated connection so parallel MCP sessions do not contend on constructor-time schema or journal setup.
+- [Phase 17]: Keep the cache lock fix bounded to `cache.py`; direct read/search contract and tool adapters stay unchanged while closing the runtime gap.
 
 ### Pending Todos
 
@@ -113,6 +116,6 @@ Progress: [██████████] 100%
 
 ## Session Continuity
 
-Last session: 2026-03-14T10:45:14.845Z
-Stopped at: Completed 17-03-PLAN.md
+Last session: 2026-03-14T12:55:01Z
+Stopped at: Completed 17-04-PLAN.md
 Resume file: None

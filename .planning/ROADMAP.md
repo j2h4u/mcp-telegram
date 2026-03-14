@@ -23,7 +23,7 @@ material to landing the Medium path safely.
 - [x] **Phase 14: Boundary Recovery** - Preserve actionable server-boundary failure detail for escaped tool errors. (completed 2026-03-13)
 - [x] **Phase 15: Capability Seams** - Introduce capability-oriented internal seams behind the public tool adapters. (completed 2026-03-13)
 - [x] **Phase 16: Unified Navigation Contract** - Replace split read/search continuation concepts with one coherent contract. (completed 2026-03-14)
-- [x] **Phase 17: Direct Read/Search Workflows** - Reduce helper-first choreography while preserving topic and hit-local fidelity. (completed 2026-03-14)
+- [x] **Phase 17: Direct Read/Search Workflows** - Reduce helper-first choreography while preserving topic and hit-local fidelity. (completed 2026-03-14, gap closed by Plan 17-04)
 - [ ] **Phase 18: Surface Posture & Rollout Proof** - Classify primary vs secondary surfaces and prove the new contract in tests, reflection, and the restarted runtime.
 
 ## Phase Details
@@ -67,7 +67,7 @@ material to landing the Medium path safely.
   2. Forum reads become more direct while still preserving explicit topic choice and clear recovery when a topic is ambiguous, inaccessible, or deleted.
   3. LLM can complete common searches with lower orchestration burden while still receiving hit-local context and dialog scoping.
   4. Any remaining helper-step choreography is explicit exception handling rather than the default path for ordinary reads and searches.
-**Plans**: TBD
+**Plans**: 01 complete; 02 complete; 03 complete; 04 complete
 
 ### Phase 18: Surface Posture & Rollout Proof
 **Goal**: Maintainers can state which tools are primary versus secondary/helper surfaces and prove the changed contract in both repository and live runtime validation.
@@ -90,7 +90,7 @@ Phases execute in numeric order: 14 -> 15 -> 16 -> 17 -> 18
 | 14. Boundary Recovery | 2/2 | Complete   | 2026-03-13 |
 | 15. Capability Seams | 3/3 | Complete   | 2026-03-13 |
 | 16. Unified Navigation Contract | 3/3 | Complete   | 2026-03-14 |
-| 17. Direct Read/Search Workflows | 3/3 | Complete   | 2026-03-14 |
+| 17. Direct Read/Search Workflows | 4/4 | Complete   | 2026-03-14 |
 | 18. Surface Posture & Rollout Proof | 0/TBD | Not started | - |
 
 ## Shipped Milestones
