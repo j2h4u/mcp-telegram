@@ -1580,6 +1580,10 @@ async def list_unread_messages(args: ListUnreadMessages) -> ToolResult:
             unread_mentions_count = getattr(dialog, "unread_mentions_count", 0)
             date = getattr(dialog, "date", None)
 
+            # read_inbox_max_id from raw TL dialog — needed for min_id fetch
+            raw_dialog = getattr(dialog, "dialog", None)
+            read_inbox_max_id = getattr(raw_dialog, "read_inbox_max_id", 0) if raw_dialog else 0
+
             entity = getattr(dialog, "entity", None)
             participants_count = getattr(entity, "participants_count", None) if entity is not None else None
 
@@ -1605,6 +1609,7 @@ async def list_unread_messages(args: ListUnreadMessages) -> ToolResult:
                 "is_group": is_group,
                 "is_channel": is_channel,
                 "date": date,
+                "read_inbox_max_id": read_inbox_max_id,
             })
             unread_counts[chat_id] = unread_count
 
@@ -1651,10 +1656,11 @@ async def list_unread_messages(args: ListUnreadMessages) -> ToolResult:
             if budget_for_chat == 0:
                 continue
 
-            # Fetch unread messages for this dialog
+            # Fetch unread messages for this dialog (min_id = read_inbox_max_id)
             try:
+                read_max_id = chat_info.get("read_inbox_max_id", 0)
                 messages = []
-                async for msg in client.iter_messages(chat_id, unread=True, limit=max(budget_for_chat * 2, 50)):
+                async for msg in client.iter_messages(chat_id, min_id=read_max_id, limit=max(budget_for_chat * 2, 50)):
                     messages.append(msg)
                     if len(messages) >= budget_for_chat * 2:
                         break
