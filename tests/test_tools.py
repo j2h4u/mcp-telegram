@@ -401,6 +401,7 @@ async def test_search_messages_adapter_delegates_to_capability_execution(
     assert "next_navigation: nav-token" in result[0].text
     assert "next_offset" not in result[0].text
     assert capability.await_args.kwargs["query"] == "ship"
+    assert capability.await_args.kwargs["navigation"] is None
 
 
 # --- TOOL-02: ListMessages name resolution ---
@@ -2306,6 +2307,37 @@ async def test_search_messages_records_telemetry(mock_cache, mock_client, monkey
     event = mock_analytics_collector[0]
     assert event.tool_name == "SearchMessages"
     assert event.has_filter is True
+    assert event.has_cursor is False
+
+
+async def test_search_messages_records_navigation_token(
+    mock_cache,
+    mock_client,
+    monkeypatch,
+    mock_analytics_collector,
+    make_mock_message,
+):
+    """SearchMessages records has_cursor=True when a continuation token is provided."""
+    from mcp_telegram.pagination import encode_search_navigation
+    from mcp_telegram.tools import SearchMessages, search_messages
+
+    hit = make_mock_message(id=50, text="the hit")
+    mock_client.get_messages = AsyncMock(return_value=[])
+
+    async def _fake_iter_messages(entity, **kwargs):
+        yield hit
+
+    mock_client.iter_messages = _fake_iter_messages
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+
+    navigation = encode_search_navigation(20, 101, "hit")
+    await search_messages(SearchMessages(dialog="Иван Петров", query="hit", navigation=navigation))
+
+    assert len(mock_analytics_collector) == 1
+    event = mock_analytics_collector[0]
+    assert event.tool_name == "SearchMessages"
+    assert event.has_cursor is True
 
 
 async def test_get_my_account_records_telemetry(mock_cache, mock_client, monkeypatch, mock_analytics_collector):

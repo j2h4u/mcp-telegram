@@ -1393,7 +1393,7 @@ async def search_messages(
                 timestamp=time.time(),
                 duration_ms=duration_ms,
                 result_count=result_count,
-                has_cursor=False,
+                has_cursor=args.navigation is not None,
                 page_depth=page_depth,
                 has_filter=True,  # search is inherently filtered
                 error_type=error_type,

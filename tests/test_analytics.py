@@ -92,7 +92,20 @@ class TestTelemetryEventSchema:
 
         # Verify no PII fields exist
         event_dict = event.__dict__
-        pii_fields = {"entity_id", "dialog_id", "sender_id", "message_id", "username", "name", "content"}
+        pii_fields = {
+            "content",
+            "cursor",
+            "dialog",
+            "dialog_id",
+            "entity_id",
+            "message_id",
+            "name",
+            "navigation",
+            "next_navigation",
+            "query",
+            "sender_id",
+            "username",
+        }
         for pii_field in pii_fields:
             assert pii_field not in event_dict, f"PII field '{pii_field}' should not be in schema"
 
@@ -679,4 +692,3 @@ class TestAnalyticsCleanup:
 
         # Cleanup
         TelemetryCollector._instance = None
-

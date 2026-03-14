@@ -41,7 +41,7 @@ class TelemetryEvent:
     - timestamp: UNIX epoch time (seconds), float
     - duration_ms: Execution duration in milliseconds, float
     - result_count: Number of results returned, int (0+)
-    - has_cursor: Whether pagination cursor was used, bool
+    - has_cursor: Whether continuation state from a previous page was reused, bool
     - page_depth: Pagination depth (pages fetched), int (1+)
     - has_filter: Whether any filter was applied, bool
     - error_type: Error category if failed (nullable), str or None
