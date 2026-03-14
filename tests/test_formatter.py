@@ -254,3 +254,148 @@ def test_reactions_count_only() -> None:
     msg = _make_msg(1, dt, text="hot", first_name="Alice", reactions=reactions)
     result = format_messages([msg], {})
     assert "[🔥×42]" in result, f"Expected count-only reactions, got: {result!r}"
+
+
+# ---------------------------------------------------------------------------
+# Tests for format_unread_messages_grouped
+# ---------------------------------------------------------------------------
+
+
+def test_format_unread_grouped_single_chat() -> None:
+    """Single chat formatted with header and messages."""
+    from mcp_telegram.formatter import format_unread_messages_grouped
+
+    dt = datetime(2024, 6, 15, 14, 30, 0, tzinfo=timezone.utc)
+    msg = _make_msg(1, dt, text="hello", first_name="Alice")
+
+    chats_data = [{
+        "chat_id": 123,
+        "display_name": "Alice",
+        "unread_count": 1,
+        "unread_mentions_count": 0,
+        "messages": [msg],
+        "budget_for_chat": 1,
+        "total_in_chat": 1,
+        "is_channel": False,
+    }]
+
+    result = format_unread_messages_grouped(chats_data)
+    assert "--- Alice (1 непрочитанных, id=123) ---" in result
+    assert "hello" in result
+
+
+def test_format_unread_grouped_with_mentions() -> None:
+    """Chat with mentions shows mention count in header."""
+    from mcp_telegram.formatter import format_unread_messages_grouped
+
+    dt = datetime(2024, 6, 15, 14, 30, 0, tzinfo=timezone.utc)
+    msg = _make_msg(1, dt, text="@User hello", first_name="Bob")
+
+    chats_data = [{
+        "chat_id": 456,
+        "display_name": "Рабочий чат",
+        "unread_count": 3,
+        "unread_mentions_count": 2,
+        "messages": [msg],
+        "budget_for_chat": 1,
+        "total_in_chat": 3,
+        "is_channel": False,
+    }]
+
+    result = format_unread_messages_grouped(chats_data)
+    assert "2 упоминания" in result or "2 упоминаний" in result
+    assert "id=456" in result
+
+
+def test_format_unread_grouped_trim_marker() -> None:
+    """When budget < total, shows '[и ещё N]' marker."""
+    from mcp_telegram.formatter import format_unread_messages_grouped
+
+    dt = datetime(2024, 6, 15, 14, 30, 0, tzinfo=timezone.utc)
+    msg = _make_msg(1, dt, text="msg1", first_name="Alice")
+
+    chats_data = [{
+        "chat_id": 789,
+        "display_name": "Big Chat",
+        "unread_count": 10,
+        "unread_mentions_count": 0,
+        "messages": [msg],
+        "budget_for_chat": 1,  # Only 1 message shown
+        "total_in_chat": 10,   # But 10 total unread
+        "is_channel": False,
+    }]
+
+    result = format_unread_messages_grouped(chats_data)
+    assert "[и ещё 9]" in result
+
+
+def test_format_unread_grouped_channel_no_messages() -> None:
+    """Channel shows count only, no messages."""
+    from mcp_telegram.formatter import format_unread_messages_grouped
+
+    dt = datetime(2024, 6, 15, 14, 30, 0, tzinfo=timezone.utc)
+    msg = _make_msg(1, dt, text="news", first_name="NewsBot")
+
+    chats_data = [{
+        "chat_id": -1001234567890,
+        "display_name": "TechNews",
+        "unread_count": 47,
+        "unread_mentions_count": 0,
+        "messages": [msg],
+        "budget_for_chat": 47,
+        "total_in_chat": 47,
+        "is_channel": True,
+    }]
+
+    result = format_unread_messages_grouped(chats_data)
+    assert "TechNews (47 непрочитанных" in result
+    # Channel should not show messages
+    assert "news" not in result
+
+
+def test_format_unread_grouped_empty() -> None:
+    """Empty input returns empty string."""
+    from mcp_telegram.formatter import format_unread_messages_grouped
+
+    result = format_unread_messages_grouped([])
+    assert result == ""
+
+
+def test_format_unread_grouped_multiple_chats() -> None:
+    """Multiple chats formatted separately."""
+    from mcp_telegram.formatter import format_unread_messages_grouped
+
+    dt1 = datetime(2024, 6, 15, 14, 30, 0, tzinfo=timezone.utc)
+    dt2 = datetime(2024, 6, 15, 14, 40, 0, tzinfo=timezone.utc)
+    msg1 = _make_msg(1, dt1, text="hi from alice", first_name="Alice")
+    msg2 = _make_msg(2, dt2, text="hi from bob", first_name="Bob")
+
+    chats_data = [
+        {
+            "chat_id": 111,
+            "display_name": "Alice",
+            "unread_count": 2,
+            "unread_mentions_count": 0,
+            "messages": [msg1],
+            "budget_for_chat": 1,
+            "total_in_chat": 2,
+            "is_channel": False,
+        },
+        {
+            "chat_id": 222,
+            "display_name": "Bob",
+            "unread_count": 1,
+            "unread_mentions_count": 0,
+            "messages": [msg2],
+            "budget_for_chat": 1,
+            "total_in_chat": 1,
+            "is_channel": False,
+        },
+    ]
+
+    result = format_unread_messages_grouped(chats_data)
+    assert "Alice" in result
+    assert "Bob" in result
+    assert "id=111" in result
+    assert "id=222" in result
+    assert "[и ещё 1]" in result  # Alice's remaining

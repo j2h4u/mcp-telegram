@@ -1913,3 +1913,73 @@ async def fetch_messages_for_topic(
     if retry_invalid_exc is not None:
         raise retry_invalid_exc
     raise RuntimeError("Missing retry TOPIC_ID_INVALID exception during dialog-scan fallback")
+
+
+# ---------------------------------------------------------------------------
+# Budget allocation for unread message distribution
+# ---------------------------------------------------------------------------
+
+
+def allocate_message_budget_proportional(
+    unread_counts: dict[int, int],
+    limit: int,
+    min_per_chat: int = 3,
+) -> dict[int, int]:
+    """Distribute a message budget across chats with proportional allocation.
+
+    If total unread messages fit within limit, returns unread_counts unchanged.
+    If over limit, allocates at least min_per_chat per chat, then distributes
+    remaining budget proportionally by unread count.
+
+    Args:
+        unread_counts: {chat_id: unread_count} mapping
+        limit: Total message budget across all chats
+        min_per_chat: Minimum messages per chat (default 3)
+
+    Returns:
+        {chat_id: budget_for_chat} allocation
+    """
+    if not unread_counts:
+        return {}
+
+    total_unread = sum(unread_counts.values())
+    if total_unread <= limit:
+        return unread_counts.copy()
+
+    # Over limit — proportional allocation with minimum guarantee
+    allocation = {}
+    num_chats = len(unread_counts)
+    reserved = min_per_chat * num_chats
+
+    if reserved >= limit:
+        # Limit is so small that min_per_chat exhausts it; distribute evenly
+        per_chat = limit // num_chats
+        remainder = limit % num_chats
+        for i, chat_id in enumerate(sorted(unread_counts.keys())):
+            allocation[chat_id] = per_chat + (1 if i < remainder else 0)
+        return allocation
+
+    # Allocate minimum first, distribute remainder proportionally
+    remaining_budget = limit - reserved
+    for chat_id, unread_count in unread_counts.items():
+        allocation[chat_id] = min_per_chat
+
+    # Proportional distribution of remaining budget
+    for chat_id, unread_count in unread_counts.items():
+        if total_unread > 0:
+            proportion = unread_count / total_unread
+            extra = int(proportion * remaining_budget)
+            allocation[chat_id] += min(extra, unread_count - min_per_chat)
+
+    # Ensure total doesn't exceed limit (handle rounding)
+    total_allocated = sum(allocation.values())
+    if total_allocated > limit:
+        overage = total_allocated - limit
+        for chat_id in sorted(allocation.keys(), key=lambda cid: allocation[cid], reverse=True):
+            if overage <= 0:
+                break
+            reduction = min(overage, allocation[chat_id] - min_per_chat)
+            allocation[chat_id] -= reduction
+            overage -= reduction
+
+    return allocation
