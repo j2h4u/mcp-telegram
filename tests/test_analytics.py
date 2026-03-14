@@ -98,6 +98,8 @@ class TestTelemetryEventSchema:
             "dialog",
             "dialog_id",
             "entity_id",
+            "exact_dialog_id",
+            "exact_topic_id",
             "message_id",
             "name",
             "navigation",

@@ -52,8 +52,12 @@ def test_search_messages_reflection_exposes_shared_navigation_schema() -> None:
     tool = server.mapping["SearchMessages"]
     properties = tool.inputSchema["properties"]
 
+    assert "dialog" in properties
     assert "navigation" in properties
     assert "offset" not in properties
+    assert "exact_dialog_id" not in properties
+    assert properties["dialog"]["type"] == "string"
+    assert "exact numeric dialog id" in properties["dialog"]["description"]
     assert properties["navigation"]["type"] == "string"
     assert "first search page" in properties["navigation"]["description"]
     assert "next_navigation" in properties["navigation"]["description"]
