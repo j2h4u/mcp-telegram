@@ -16,8 +16,8 @@
 
 ### Navigation
 
-- [ ] **NAV-01**: LLM can continue both read and search workflows through one coherent continuation vocabulary instead of separate `next_cursor`, `next_offset`, and `from_beginning` concepts.
-- [ ] **NAV-02**: Topic fidelity, ambiguity handling, and readable transcript behavior remain preserved while the continuation contract changes.
+- [x] **NAV-01**: LLM can continue both read and search workflows through one coherent continuation vocabulary instead of separate `next_cursor`, `next_offset`, and `from_beginning` concepts.
+- [x] **NAV-02**: Topic fidelity, ambiguity handling, and readable transcript behavior remain preserved while the continuation contract changes.
 
 ### Workflow Shape
 
@@ -56,8 +56,8 @@
 |-------------|-------|--------|
 | ERR-01 | Phase 14 | Complete |
 | CAP-01 | Phase 15 | Complete |
-| NAV-01 | Phase 16 | Pending |
-| NAV-02 | Phase 16 | Pending |
+| NAV-01 | Phase 16 | Complete |
+| NAV-02 | Phase 16 | Complete |
 | FLOW-01 | Phase 17 | Pending |
 | FLOW-02 | Phase 17 | Pending |
 | SURF-01 | Phase 18 | Pending |

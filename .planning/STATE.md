@@ -4,16 +4,16 @@ milestone: v1.3
 milestone_name: Medium Implementation
 current_phase: 16
 current_phase_name: Unified Navigation Contract
-current_plan: 0
-status: ready_to_plan
-stopped_at: Completed 15-03-PLAN.md
-last_updated: "2026-03-13T23:37:33.250Z"
-last_activity: 2026-03-13 - Completed Phase 15 Capability Seams
+current_plan: 1
+status: planning
+stopped_at: Completed 16-01-PLAN.md
+last_updated: "2026-03-14T00:06:10.416Z"
+last_activity: 2026-03-14
 progress:
   total_phases: 5
   completed_phases: 2
-  total_plans: 5
-  completed_plans: 5
+  total_plans: 8
+  completed_plans: 6
   percent: 100
 ---
 
@@ -31,10 +31,10 @@ See: .planning/PROJECT.md (updated 2026-03-14)
 Current Phase: 16
 Current Phase Name: Unified Navigation Contract
 Total Phases: 18
-Current Plan: 0
-Total Plans in Phase: TBD
+Current Plan: 1
+Total Plans in Phase: 3
 Status: Ready to plan
-Last Activity: 2026-03-13
+Last Activity: 2026-03-14
 Last Activity Description: Completed Plan 15-03 search seam migration, CAP-01 proof, and runtime verification
 Progress: 100%
 
@@ -60,6 +60,7 @@ Progress: [██████████] 100%
 | Phase 15 P01 | 12m39s | 3 tasks | 4 files |
 | Phase 15 P02 | 2m | 3 tasks | 4 files |
 | Phase 15 P03 | 2m28s | 3 tasks | 4 files |
+| Phase 16 P01 | 14m | 2 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -82,6 +83,8 @@ Progress: [██████████] 100%
 - [Phase 15]: Keep SearchMessages output shaping local while moving shared resolution, enrichment, and offset handling into capabilities.py.
 - [Phase 15]: Prove CAP-01 with capability-level and adapter-level tests instead of brittle tool-body heuristics.
 - [Phase 15]: Require rebuilt-container verification to confirm the live image exposes the final shared search seam.
+- [Phase 16]: Plan 16-01 keeps the unified navigation contract internal to capabilities while ListMessages and SearchMessages retain legacy cursor/offset adapters.
+- [Phase 16]: Plan 16-01 scopes shared history tokens by dialog/topic and shared search tokens by dialog/query so mismatched reuse fails before Telegram paging runs.
 
 ### Pending Todos
 
@@ -95,6 +98,6 @@ Progress: [██████████] 100%
 
 ## Session Continuity
 
-Last session: 2026-03-13T23:37:33.246Z
-Stopped at: Completed 15-03-PLAN.md
+Last session: 2026-03-14T00:06:10.412Z
+Stopped at: Completed 16-01-PLAN.md
 Resume file: None
