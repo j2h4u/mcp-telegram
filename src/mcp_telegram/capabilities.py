@@ -539,6 +539,26 @@ def with_general_topic(topics: list[TopicMetadata]) -> list[TopicMetadata]:
     ]
 
 
+def build_topic_catalog(topics: list[TopicMetadata]) -> TopicCatalog:
+    """Return one topic catalog payload from normalized metadata rows."""
+    metadata_by_id = {int(topic["topic_id"]): topic for topic in with_general_topic(topics)}
+    choices = {
+        topic_id: str(topic["title"])
+        for topic_id, topic in metadata_by_id.items()
+        if not bool(topic["is_deleted"])
+    }
+    deleted_topics = {
+        topic_id: topic
+        for topic_id, topic in metadata_by_id.items()
+        if bool(topic["is_deleted"])
+    }
+    return {
+        "choices": choices,
+        "metadata_by_id": metadata_by_id,
+        "deleted_topics": deleted_topics,
+    }
+
+
 async def fetch_forum_topics_page(
     client: object,
     *,
@@ -630,7 +650,12 @@ async def refresh_topic_by_id(
     ttl_seconds: int = TOPIC_METADATA_TTL_SECONDS,
 ) -> TopicMetadata | None:
     """Refresh one topic by ID and persist tombstones when Telegram reports deletion."""
-    existing_topic = topic_cache.get_topic(dialog_id, topic_id, ttl_seconds)
+    existing_topic = topic_cache.get_topic(
+        dialog_id,
+        topic_id,
+        ttl_seconds,
+        allow_stale=True,
+    )
     response = await client(
         build_get_forum_topics_by_id_request(entity=entity, topic_ids=[topic_id])
     )
@@ -667,22 +692,7 @@ async def load_dialog_topics(
             topic_cache.upsert_topics(dialog_id, normalized_topics)
         cached_topics = normalized_topics
 
-    metadata_by_id = {int(topic["topic_id"]): topic for topic in cached_topics}
-    choices = {
-        topic_id: str(topic["title"])
-        for topic_id, topic in metadata_by_id.items()
-        if not bool(topic["is_deleted"])
-    }
-    deleted_topics = {
-        topic_id: topic
-        for topic_id, topic in metadata_by_id.items()
-        if bool(topic["is_deleted"])
-    }
-    return {
-        "choices": choices,
-        "metadata_by_id": metadata_by_id,
-        "deleted_topics": deleted_topics,
-    }
+    return build_topic_catalog(cached_topics)
 
 
 def resolve_deleted_topic(
@@ -725,11 +735,36 @@ def _dialog_match_line(match: DialogMatch) -> str:
 async def resolve_dialog_target(
     *,
     cache: EntityCache,
-    query: str,
+    query: str | None,
     retry_tool: str,
     resolve_dialog: DialogResolver,
+    exact_dialog_id: int | None = None,
+    exact_dialog_name: str | None = None,
 ) -> DialogTargetResult:
     """Resolve one dialog query into an inspectable target or actionable failure."""
+    if exact_dialog_id is not None:
+        cached_dialog = cache.get(
+            exact_dialog_id,
+            ttl_seconds=max(USER_TTL, GROUP_TTL),
+        )
+        display_name = exact_dialog_name
+        if display_name is None and cached_dialog is not None:
+            cached_name = cached_dialog.get("name")
+            if isinstance(cached_name, str) and cached_name:
+                display_name = cached_name
+        if display_name is None:
+            display_name = str(exact_dialog_id)
+
+        return ResolvedDialogTarget(
+            entity_id=exact_dialog_id,
+            query=str(exact_dialog_id),
+            display_name=display_name,
+            resolve_prefix="",
+        )
+
+    if query is None:
+        raise ValueError("query is required when exact_dialog_id is not provided")
+
     result = await resolve_dialog(cache, query)
     if isinstance(result, NotFound):
         return DialogTargetFailure(
@@ -757,6 +792,84 @@ async def resolve_dialog_target(
         query=query,
         display_name=result.display_name,
         resolve_prefix=resolve_prefix,
+    )
+
+
+async def resolve_exact_topic_target(
+    client: object,
+    *,
+    entity: object,
+    dialog_id: int,
+    topic_cache: TopicMetadataCache,
+    retry_tool: str,
+    exact_topic_id: int | None = None,
+    exact_topic_name: str | None = None,
+    exact_topic_metadata: TopicMetadata | None = None,
+    ttl_seconds: int = TOPIC_METADATA_TTL_SECONDS,
+    refresh_topic_by_id_fn: TopicRefresher | None = None,
+) -> ResolvedForumTopic | ForumTopicFailure:
+    """Resolve one exact topic target from metadata, cache, or one by-ID refresh."""
+    topic_metadata = exact_topic_metadata
+    topic_id = exact_topic_id
+    if topic_id is None and topic_metadata is not None:
+        topic_id = int(topic_metadata["topic_id"])
+    if topic_id is None:
+        raise ValueError("exact_topic_id or exact_topic_metadata is required")
+
+    if topic_metadata is None:
+        cached_topic = topic_cache.get_topic(dialog_id, topic_id, ttl_seconds)
+        if cached_topic is not None:
+            topic_metadata = cached_topic
+        else:
+            active_refresh_topic_by_id = (
+                refresh_topic_by_id_fn
+                if refresh_topic_by_id_fn is not None
+                else refresh_topic_by_id
+            )
+            topic_metadata = await active_refresh_topic_by_id(
+                client,
+                entity=entity,
+                dialog_id=dialog_id,
+                topic_id=topic_id,
+                topic_cache=topic_cache,
+                ttl_seconds=ttl_seconds,
+            )
+
+    if topic_metadata is None:
+        topic_label = exact_topic_name or f"Topic {topic_id}"
+        return ForumTopicFailure(
+            kind="not_found",
+            query=str(topic_id),
+            text=topic_not_found_text(topic_label, retry_tool=retry_tool),
+            topic_catalog={
+                "choices": {},
+                "metadata_by_id": {},
+                "deleted_topics": {},
+            },
+        )
+
+    display_name = exact_topic_name or str(topic_metadata["title"])
+    topic_catalog = build_topic_catalog([topic_metadata])
+    if bool(topic_metadata["is_deleted"]):
+        return ForumTopicFailure(
+            kind="deleted",
+            query=str(topic_id),
+            text=deleted_topic_text(display_name, retry_tool=retry_tool),
+            topic_catalog=topic_catalog,
+        )
+
+    reply_to_message_id: int | None = None
+    if not bool(topic_metadata["is_general"]):
+        top_message_id = topic_metadata["top_message_id"]
+        if top_message_id is not None:
+            reply_to_message_id = int(top_message_id)
+
+    return ResolvedForumTopic(
+        query=str(topic_id),
+        display_name=display_name,
+        metadata=topic_metadata,
+        topic_catalog=topic_catalog,
+        reply_to_message_id=reply_to_message_id,
     )
 
 
@@ -875,8 +988,26 @@ async def load_forum_topic_capability(
     retry_tool: str,
     ttl_seconds: int = TOPIC_METADATA_TTL_SECONDS,
     load_topics: TopicLoader | None = None,
+    exact_topic_id: int | None = None,
+    exact_topic_name: str | None = None,
+    exact_topic_metadata: TopicMetadata | None = None,
+    refresh_topic_by_id_fn: TopicRefresher | None = None,
 ) -> ForumTopicCapabilityResult:
     """Load one dialog's topic capability result for listing or topic-scoped reads."""
+    if exact_topic_id is not None or exact_topic_metadata is not None:
+        return await resolve_exact_topic_target(
+            client,
+            entity=entity,
+            dialog_id=dialog_id,
+            topic_cache=topic_cache,
+            retry_tool=retry_tool,
+            exact_topic_id=exact_topic_id,
+            exact_topic_name=exact_topic_name or requested_topic,
+            exact_topic_metadata=exact_topic_metadata,
+            ttl_seconds=ttl_seconds,
+            refresh_topic_by_id_fn=refresh_topic_by_id_fn,
+        )
+
     active_loader = load_topics if load_topics is not None else load_dialog_topics
     try:
         topic_catalog = await active_loader(
@@ -1249,7 +1380,7 @@ async def execute_history_read_capability(
     client: object,
     *,
     cache: EntityCache,
-    dialog_query: str,
+    dialog_query: str | None,
     limit: int,
     navigation: str | None,
     sender_query: str | None,
@@ -1262,12 +1393,19 @@ async def execute_history_read_capability(
     load_topics: TopicLoader | None = None,
     fetch_topic_messages_fn: TopicFetcher | None = None,
     refresh_topic_by_id_fn: TopicRefresher | None = None,
+    exact_dialog_id: int | None = None,
+    exact_dialog_name: str | None = None,
+    exact_topic_id: int | None = None,
+    exact_topic_name: str | None = None,
+    exact_topic_metadata: TopicMetadata | None = None,
 ) -> HistoryReadCapabilityResult:
     dialog_target = await resolve_dialog_target(
         cache=cache,
         query=dialog_query,
         retry_tool=retry_tool,
         resolve_dialog=resolve_dialog,
+        exact_dialog_id=exact_dialog_id,
+        exact_dialog_name=exact_dialog_name,
     )
     if isinstance(dialog_target, DialogTargetFailure):
         return dialog_target
@@ -1288,7 +1426,7 @@ async def execute_history_read_capability(
     filter_sender_after_fetch = False
     entity_id = dialog_target.entity_id
 
-    if topic_query:
+    if topic_query or exact_topic_id is not None or exact_topic_metadata is not None:
         topic_cache = TopicMetadataCache(cache._conn)
         topic_capability = await load_forum_topic_capability(
             client,
@@ -1299,6 +1437,10 @@ async def execute_history_read_capability(
             requested_topic=topic_query,
             retry_tool=retry_tool,
             load_topics=load_topics,
+            exact_topic_id=exact_topic_id,
+            exact_topic_name=exact_topic_name,
+            exact_topic_metadata=exact_topic_metadata,
+            refresh_topic_by_id_fn=refresh_topic_by_id_fn,
         )
         if isinstance(topic_capability, ForumTopicFailure):
             return topic_capability
@@ -1470,7 +1612,7 @@ async def execute_search_messages_capability(
     client: object,
     *,
     cache: EntityCache,
-    dialog_query: str,
+    dialog_query: str | None,
     query: str,
     limit: int,
     navigation: str | None,
@@ -1479,12 +1621,16 @@ async def execute_search_messages_capability(
     get_sender_type: SenderTypeGetter,
     reaction_names_threshold: int,
     context_radius: int = 3,
+    exact_dialog_id: int | None = None,
+    exact_dialog_name: str | None = None,
 ) -> SearchCapabilityResult:
     dialog_target = await resolve_dialog_target(
         cache=cache,
         query=dialog_query,
         retry_tool=retry_tool,
         resolve_dialog=resolve_dialog,
+        exact_dialog_id=exact_dialog_id,
+        exact_dialog_name=exact_dialog_name,
     )
     if isinstance(dialog_target, DialogTargetFailure):
         return dialog_target

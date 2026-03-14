@@ -278,6 +278,8 @@ class TopicMetadataCache:
         dialog_id: int,
         topic_id: int,
         ttl_seconds: int,
+        *,
+        allow_stale: bool = False,
     ) -> dict[str, int | str | bool | None] | None:
         """Return one fresh topic record or None on cache miss/expiry."""
         row = self._conn.execute(
@@ -291,7 +293,7 @@ class TopicMetadataCache:
             return None
 
         updated_at = row[7]
-        if int(time.time()) - updated_at > ttl_seconds:
+        if not allow_stale and int(time.time()) - updated_at > ttl_seconds:
             return None
 
         return self._row_to_topic(row[:7])
