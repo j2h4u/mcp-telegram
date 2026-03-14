@@ -267,6 +267,7 @@ def test_tool_description_strips_nullable_unions_from_exported_schema():
     search_messages_schema = tools_module.tool_description(SearchMessages).inputSchema
 
     dialog_schema = list_messages_schema["properties"]["dialog"]
+    search_dialog_schema = search_messages_schema["properties"]["dialog"]
     navigation_schema = list_messages_schema["properties"]["navigation"]
     search_navigation_schema = search_messages_schema["properties"]["navigation"]
     sender_schema = list_messages_schema["properties"]["sender"]
@@ -286,6 +287,8 @@ def test_tool_description_strips_nullable_unions_from_exported_schema():
     assert search_navigation_schema["type"] == "string"
     assert "first search page" in search_navigation_schema["description"]
     assert "next_navigation" in search_navigation_schema["description"]
+    assert search_dialog_schema["type"] == "string"
+    assert "exact numeric dialog id" in search_dialog_schema["description"]
 
 
 def test_capability_extraction_preserves_public_tool_names() -> None:
@@ -428,6 +431,7 @@ async def test_search_messages_adapter_delegates_to_capability_execution(
             reaction_names_map={},
             next_offset=20,
             navigation=CapabilityNavigation(kind="search", token="nav-token"),
+            rendered_text="--- hit 1/1 ---\n[HIT] 10:00 Alice: Delegated search hit",
         )
     )
 
@@ -444,7 +448,43 @@ async def test_search_messages_adapter_delegates_to_capability_execution(
     assert "next_offset" not in result[0].text
     assert capability.await_args.kwargs["query"] == "ship"
     assert capability.await_args.kwargs["navigation"] is None
-    assert "exact_dialog_id" not in capability.await_args.kwargs
+    assert capability.await_args.kwargs["exact_dialog_id"] is None
+    assert capability.await_args.kwargs["dialog_query"] == "Backend"
+
+
+async def test_search_messages_adapter_routes_numeric_dialog_to_exact_capability(
+    tmp_db_path,
+    mock_client,
+    monkeypatch,
+):
+    """SearchMessages treats a numeric dialog selector as an exact-id direct path."""
+    from mcp_telegram.tools import SearchMessages, search_messages
+
+    cache = EntityCache(tmp_db_path)
+    cache.upsert(701, "group", "Backend Forum", None)
+    capability = AsyncMock(
+        return_value=SearchExecution(
+            entity_id=701,
+            dialog_name="Backend Forum",
+            resolve_prefix="",
+            hits=(),
+            context_messages_by_id={},
+            reaction_names_map={},
+            next_offset=None,
+            navigation=None,
+            rendered_text="",
+        )
+    )
+
+    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr("mcp_telegram.tools._execute_search_messages_capability", capability)
+
+    await search_messages(SearchMessages(dialog="701", query="ship", limit=20))
+
+    assert capability.await_args.kwargs["dialog_query"] is None
+    assert capability.await_args.kwargs["exact_dialog_id"] == 701
+    assert capability.await_args.kwargs["exact_dialog_name"] == "Backend Forum"
 
 
 # --- TOOL-02: ListMessages name resolution ---

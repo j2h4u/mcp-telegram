@@ -692,6 +692,18 @@ def _search_no_hits_text(dialog_name: str, query: str) -> str:
     )
 
 
+def _extract_exact_dialog_id(dialog: str) -> int | None:
+    """Return an exact dialog id for one signed numeric selector string."""
+    selector = dialog.strip()
+    if not selector or selector.startswith("@"):
+        return None
+
+    try:
+        return int(selector)
+    except ValueError:
+        return None
+
+
 def _topic_status(topic: dict[str, int | str | bool | None]) -> str:
     """Return one short topic status label for listings."""
     if bool(topic["is_deleted"]):
@@ -1331,7 +1343,12 @@ class SearchMessages(ToolArgs):
     For @username lookups, prepend @ to the dialog name: dialog="@channel_name".
     """
 
-    dialog: str
+    dialog: str = Field(
+        description=(
+            "Dialog selector for one scoped search. Accepts an exact numeric dialog id for the "
+            "direct path, or @username / fuzzy dialog name for the ambiguity-safe path."
+        )
+    )
     query: str
     limit: int = 20
     navigation: str | None = Field(
@@ -1357,11 +1374,22 @@ async def search_messages(
 
     try:
         cache = get_entity_cache()
+        exact_dialog_id = _extract_exact_dialog_id(args.dialog)
+        dialog_query = None if exact_dialog_id is not None else args.dialog
+        exact_dialog_name = None
+        if exact_dialog_id is not None:
+            cached_entity = cache.get(exact_dialog_id, GROUP_TTL)
+            if cached_entity is None:
+                cached_entity = cache.get(exact_dialog_id, USER_TTL)
+            if cached_entity is not None:
+                cached_name = cached_entity.get("name")
+                if isinstance(cached_name, str) and cached_name:
+                    exact_dialog_name = cached_name
         async with connected_client() as client:
             search_execution = await _execute_search_messages_capability(
                 client,
                 cache=cache,
-                dialog_query=args.dialog,
+                dialog_query=dialog_query,
                 query=args.query,
                 limit=args.limit,
                 navigation=args.navigation,
@@ -1369,6 +1397,8 @@ async def search_messages(
                 resolve_dialog=_resolve_dialog,
                 get_sender_type=_get_sender_type,
                 reaction_names_threshold=REACTION_NAMES_THRESHOLD,
+                exact_dialog_id=exact_dialog_id,
+                exact_dialog_name=exact_dialog_name,
             )
         if isinstance(
             search_execution,
@@ -1379,38 +1409,7 @@ async def search_messages(
         hits = list(search_execution.hits)
         result_count = len(hits)
         if hits:
-            parts: list[str] = []
-            for i, hit in enumerate(hits):
-                before = [
-                    search_execution.context_messages_by_id[hit.id - j]
-                    for j in range(3, 0, -1)
-                    if (hit.id - j) in search_execution.context_messages_by_id
-                ]
-                after = [
-                    search_execution.context_messages_by_id[hit.id + j]
-                    for j in range(1, 4)
-                    if (hit.id + j) in search_execution.context_messages_by_id
-                ]
-                group_msgs = sorted([*before, hit, *after], key=lambda m: m.id, reverse=True)
-                group_text = format_messages(
-                    group_msgs,
-                    reply_map={},
-                    reaction_names_map=search_execution.reaction_names_map,
-                )
-
-                # Mark the hit line with [HIT] prefix using time prefix as locator
-                from zoneinfo import ZoneInfo
-                hit_dt = hit.date.astimezone(ZoneInfo("UTC"))
-                hit_time_prefix = hit_dt.strftime("%H:%M")
-                hit_lines = group_text.splitlines()
-                for idx, line in enumerate(hit_lines):
-                    if line.startswith(hit_time_prefix) and "[HIT]" not in line:
-                        hit_lines[idx] = f"[HIT] {line}"
-                        break
-                group_text = "\n".join(hit_lines)
-
-                parts.append(f"--- hit {i + 1}/{len(hits)} ---\n{group_text}")
-            result_text = search_execution.resolve_prefix + "\n\n".join(parts)
+            result_text = search_execution.resolve_prefix + search_execution.rendered_text
         else:
             result_text = search_execution.resolve_prefix + _search_no_hits_text(
                 search_execution.dialog_name,

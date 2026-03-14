@@ -12,6 +12,7 @@ def format_messages(
     reaction_names_map: dict[int, dict[str, list[str]]] | None = None,
     tz: ZoneInfo | None = None,
     topic_name_getter: t.Callable[[object], str | None] | None = None,
+    line_prefix_getter: t.Callable[[object], str | None] | None = None,
 ) -> str:
     """Format a list of messages into human-readable text.
 
@@ -79,11 +80,78 @@ def format_messages(
             if topic_name:
                 topic_prefix = f"[topic: {topic_name}] "
 
-        lines.append(f"{topic_prefix}{dt.strftime('%H:%M')} {sender_name}: {reply_prefix}{text}")
+        line_prefix = ""
+        if line_prefix_getter is not None:
+            resolved_prefix = line_prefix_getter(msg)
+            if resolved_prefix:
+                line_prefix = f"{resolved_prefix} "
+
+        lines.append(
+            f"{line_prefix}{topic_prefix}{dt.strftime('%H:%M')} {sender_name}: {reply_prefix}{text}"
+        )
 
         prev_dt = dt
 
     return "\n".join(lines)
+
+
+def build_search_hit_window(
+    hit: object,
+    *,
+    context_messages_by_id: dict[int, object],
+    context_radius: int = 3,
+) -> list[object]:
+    """Return one hit-local message window ordered for format_messages()."""
+    hit_id = getattr(hit, "id", None)
+    if not isinstance(hit_id, int):
+        return [hit]
+
+    before = [
+        context_messages_by_id[hit_id - offset]
+        for offset in range(context_radius, 0, -1)
+        if (hit_id - offset) in context_messages_by_id
+    ]
+    after = [
+        context_messages_by_id[hit_id + offset]
+        for offset in range(1, context_radius + 1)
+        if (hit_id + offset) in context_messages_by_id
+    ]
+    return sorted([*before, hit, *after], key=lambda message: message.id, reverse=True)
+
+
+def format_search_message_groups(
+    hits: list[object],
+    *,
+    context_messages_by_id: dict[int, object],
+    reaction_names_map: dict[int, dict[str, list[str]]] | None = None,
+    context_radius: int = 3,
+) -> str:
+    """Return grouped search output with hit-local context and hit markers."""
+    if not hits:
+        return ""
+
+    parts: list[str] = []
+    total_hits = len(hits)
+
+    for index, hit in enumerate(hits, start=1):
+        hit_id = getattr(hit, "id", None)
+        group_text = format_messages(
+            build_search_hit_window(
+                hit,
+                context_messages_by_id=context_messages_by_id,
+                context_radius=context_radius,
+            ),
+            reply_map={},
+            reaction_names_map=reaction_names_map,
+            line_prefix_getter=(
+                (lambda message, expected_hit_id=hit_id: "[HIT]" if getattr(message, "id", None) == expected_hit_id else None)
+                if isinstance(hit_id, int)
+                else None
+            ),
+        )
+        parts.append(f"--- hit {index}/{total_hits} ---\n{group_text}")
+
+    return "\n\n".join(parts)
 
 
 def _resolve_sender_name(msg: object) -> str:
