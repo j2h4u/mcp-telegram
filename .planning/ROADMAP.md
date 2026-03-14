@@ -91,7 +91,7 @@ Phases execute in numeric order: 14 -> 15 -> 16 -> 17 -> 18
 | 15. Capability Seams | 3/3 | Complete   | 2026-03-13 |
 | 16. Unified Navigation Contract | 3/3 | Complete   | 2026-03-14 |
 | 17. Direct Read/Search Workflows | 4/4 | Complete   | 2026-03-14 |
-| 18. Surface Posture & Rollout Proof | 0/TBD | Not started | - |
+| 18. Surface Posture & Rollout Proof | 1/3 | In Progress|  |
 
 ## Shipped Milestones
 

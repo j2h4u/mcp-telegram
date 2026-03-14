@@ -26,7 +26,7 @@
 
 ### Surface Posture
 
-- [ ] **SURF-01**: Maintainer can classify current tools as primary or secondary/helper surfaces in code, tests, and planning artifacts after the primary workflows are reshaped.
+- [x] **SURF-01**: Maintainer can classify current tools as primary or secondary/helper surfaces in code, tests, and planning artifacts after the primary workflows are reshaped.
 
 ### Rollout Safety
 
@@ -60,7 +60,7 @@
 | NAV-02 | Phase 16 | Complete |
 | FLOW-01 | Phase 17 | Complete |
 | FLOW-02 | Phase 17 | Complete |
-| SURF-01 | Phase 18 | Pending |
+| SURF-01 | Phase 18 | Complete |
 | ROLL-01 | Phase 18 | Pending |
 | ROLL-02 | Phase 18 | Pending |
 

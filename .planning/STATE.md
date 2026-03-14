@@ -5,15 +5,15 @@ milestone_name: Medium Implementation
 current_phase: 17
 current_phase_name: Direct Read/Search Workflows
 current_plan: 4
-status: ready_for_verification
-stopped_at: Completed 17-04-PLAN.md
-last_updated: "2026-03-14T12:55:01Z"
+status: verifying
+stopped_at: "Completed 18-01-PLAN.md (Phase 18, Plan 01: Surface Posture Rollout)"
+last_updated: "2026-03-14T16:09:53.405Z"
 last_activity: 2026-03-14
 progress:
   total_phases: 5
   completed_phases: 4
-  total_plans: 12
-  completed_plans: 12
+  total_plans: 15
+  completed_plans: 13
   percent: 100
 ---
 
@@ -67,6 +67,7 @@ Progress: [██████████] 100%
 | Phase 17 P02 | 11 min | 2 tasks | 4 files |
 | Phase 17 P03 | 9m | 3 tasks | 7 files |
 | Phase 17 P04 | 46 min | 3 tasks | 3 files |
+| Phase 18 P01 | 15 | 3 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -103,6 +104,7 @@ Progress: [██████████] 100%
 - [Phase 17]: Moved hit-window grouping and hit markers into formatter/capability helpers so the adapter only handles MCP framing and telemetry.
 - [Phase 17]: Serialize shared cache bootstrap with a lock file and dedicated connection so parallel MCP sessions do not contend on constructor-time schema or journal setup.
 - [Phase 17]: Keep the cache lock fix bounded to `cache.py`; direct read/search contract and tool adapters stay unchanged while closing the runtime gap.
+- [Phase 18]: Posture as code-level constant (TOOL_POSTURE dict) + reflected teaching via prefix tags = single unified source across planning/code/tests
 
 ### Pending Todos
 
@@ -116,6 +118,6 @@ Progress: [██████████] 100%
 
 ## Session Continuity
 
-Last session: 2026-03-14T12:55:01Z
-Stopped at: Completed 17-04-PLAN.md
+Last session: 2026-03-14T16:09:53.402Z
+Stopped at: Completed 18-01-PLAN.md (Phase 18, Plan 01: Surface Posture Rollout)
 Resume file: None
