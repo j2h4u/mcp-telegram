@@ -5,16 +5,16 @@ milestone_name: Medium Implementation
 current_phase: 17
 current_phase_name: Direct Read/Search Workflows
 current_plan: 3
-status: ready_to_execute
-stopped_at: Completed 17-02-PLAN.md
-last_updated: "2026-03-14T10:28:27Z"
+status: ready_for_verification
+stopped_at: Completed 17-03-PLAN.md
+last_updated: "2026-03-14T10:45:14.847Z"
 last_activity: 2026-03-14
 progress:
   total_phases: 5
-  completed_phases: 3
+  completed_phases: 4
   total_plans: 11
-  completed_plans: 10
-  percent: 91
+  completed_plans: 11
+  percent: 100
 ---
 
 # Project State
@@ -24,7 +24,7 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-14)
 
 **Core value:** LLM can work with Telegram using natural names - zero cold-start friction, no ID lookup boilerplate before every real task
-**Current focus:** Phase 17 `Direct Read/Search Workflows` for milestone `v1.3 Medium Implementation`
+**Current focus:** Phase 17 `Direct Read/Search Workflows` completed for milestone `v1.3 Medium Implementation`; next work can move to Phase 18 rollout posture once verification/closeout is consumed.
 
 ## Current Position
 
@@ -33,23 +33,23 @@ Current Phase Name: Direct Read/Search Workflows
 Total Phases: 18
 Current Plan: 3
 Total Plans in Phase: 3
-Status: Ready to execute
+Status: Ready for verification
 Last Activity: 2026-03-14
-Last Activity Description: Completed Plan 17-02 direct ListMessages workflow, schema reflection proof, and forum-fidelity regressions
-Progress: [█████████░] 91%
+Last Activity Description: Completed Plan 17-03 direct SearchMessages workflow, schema/telemetry proof, and rebuilt-runtime verification
+Progress: [██████████] 100%
 
 Phase: 17 of 18 (`Direct Read/Search Workflows`)
 Plan: 3 of 3 in current phase
-Status: Ready to execute
-Last activity: 2026-03-14 - Completed Plan 17-02 direct ListMessages workflow, schema reflection proof, and forum-fidelity regressions
-Progress: [█████████░] 91%
+Status: Ready for verification
+Last activity: 2026-03-14 - Completed Plan 17-03 direct SearchMessages workflow, schema/telemetry proof, and rebuilt-runtime verification
+Progress: [██████████] 100%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 16
-- Average duration: 4.3 min
-- Total execution time: 68 min
+- Total plans completed: 17
+- Average duration: 4.5 min
+- Total execution time: 77 min
 
 **By Milestone:**
 
@@ -65,6 +65,7 @@ Progress: [█████████░] 91%
 | Phase 16 P3 | 26 min | 3 tasks | 7 files |
 | Phase 17 P01 | 8 min | 2 tasks | 4 files |
 | Phase 17 P02 | 11 min | 2 tasks | 4 files |
+| Phase 17 P03 | 9m | 3 tasks | 7 files |
 
 ## Accumulated Context
 
@@ -97,6 +98,8 @@ Progress: [█████████░] 91%
 - [Phase 17]: Exact topic resolution prefers cached metadata and falls back to one topic-by-id refresh, preserving deleted-topic tombstones and the existing fetch/recovery path once a target is known.
 - [Phase 17]: ListMessages should expose exact dialog/topic selectors directly, but mixed fuzzy and exact selector inputs must fail validation instead of silently choosing one path.
 - [Phase 17]: Direct forum reads must stay on the shared capability seam so deleted-topic, inaccessible-topic, General, unread, and navigation behavior remain aligned with the brownfield path.
+- [Phase 17]: Kept SearchMessages on the existing dialog/query contract and treated signed numeric dialog strings as the exact-target fast path.
+- [Phase 17]: Moved hit-window grouping and hit markers into formatter/capability helpers so the adapter only handles MCP framing and telemetry.
 
 ### Pending Todos
 
@@ -106,10 +109,10 @@ Progress: [█████████░] 91%
 
 ### Blockers/Concerns
 
-- No blockers. Phase 17 is in progress with Plan 03 next.
+- No blockers. Phase 17 is complete; next planned work is Phase 18.
 
 ## Session Continuity
 
-Last session: 2026-03-14T10:28:27Z
-Stopped at: Completed 17-02-PLAN.md
+Last session: 2026-03-14T10:45:14.845Z
+Stopped at: Completed 17-03-PLAN.md
 Resume file: None
