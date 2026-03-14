@@ -482,3 +482,39 @@ def test_reaction_cache_hit(tmp_db_path: Path) -> None:
     assert result_101_a == result_101_b == reactions_101
 
     cache.close()
+
+
+def test_upsert_stores_name_normalized(tmp_db_path: Path) -> None:
+    """upsert() computes and stores name_normalized via latinize()."""
+    cache = EntityCache(tmp_db_path)
+    cache.upsert(101, "user", "Ольга Петрова", None)
+
+    normalized = cache.all_names_normalized_with_ttl(user_ttl=2_592_000, group_ttl=604_800)
+    assert normalized == {101: "olga petrova"}
+    cache.close()
+
+
+def test_all_names_normalized_with_ttl(tmp_db_path: Path) -> None:
+    """all_names_normalized_with_ttl returns latinized names filtered by TTL."""
+    cache = EntityCache(tmp_db_path)
+    cache.upsert(1, "user", "Иван Петров", None)
+    cache.upsert(2, "group", "Рабочая группа", None)
+
+    result = cache.all_names_normalized_with_ttl(user_ttl=2_592_000, group_ttl=604_800)
+    assert result[1] == "ivan petrov"
+    assert result[2] == "rabochaya gruppa"
+    cache.close()
+
+
+def test_upsert_batch_stores_name_normalized(tmp_db_path: Path) -> None:
+    """upsert_batch() computes and stores name_normalized for each entity."""
+    cache = EntityCache(tmp_db_path)
+    cache.upsert_batch([
+        (1, "user", "Ольга Петрова", "olga"),
+        (2, "group", "Telegram News", None),
+    ])
+
+    normalized = cache.all_names_normalized_with_ttl(user_ttl=2_592_000, group_ttl=604_800)
+    assert normalized[1] == "olga petrova"
+    assert normalized[2] == "telegram news"
+    cache.close()

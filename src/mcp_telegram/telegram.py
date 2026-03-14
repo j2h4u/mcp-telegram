@@ -64,5 +64,5 @@ def create_client(
     else:
         config = TelegramSettings()
     state_home = xdg_state_home() / "mcp-telegram"
-    state_home.mkdir(parents=True, exist_ok=True)
+    state_home.mkdir(parents=True, exist_ok=True, mode=0o700)
     return TelegramClient(state_home / session_name, config.api_id, config.api_hash, base_logger="telethon")
