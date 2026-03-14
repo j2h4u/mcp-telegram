@@ -111,6 +111,45 @@ class TestTelemetryEventSchema:
         for pii_field in pii_fields:
             assert pii_field not in event_dict, f"PII field '{pii_field}' should not be in schema"
 
+    def test_telemetry_posture_aware_tool_names_remain_unchanged(self):
+        """Telemetry remains agnostic to tool posture classification; tool_name field unchanged."""
+        from mcp_telegram.tools import TOOL_POSTURE
+
+        # Events for primary tools should use the same field name as secondary tools
+        primary_event = TelemetryEvent(
+            tool_name="ListMessages",  # primary tool
+            timestamp=1003.0,
+            duration_ms=10.0,
+            result_count=5,
+            has_cursor=False,
+            page_depth=1,
+            has_filter=False,
+            error_type=None,
+        )
+
+        secondary_event = TelemetryEvent(
+            tool_name="ListDialogs",  # secondary tool
+            timestamp=1004.0,
+            duration_ms=15.0,
+            result_count=10,
+            has_cursor=True,
+            page_depth=2,
+            has_filter=False,
+            error_type=None,
+        )
+
+        # Both events have the same tool_name field; posture is not encoded in telemetry
+        assert hasattr(primary_event, "tool_name")
+        assert hasattr(secondary_event, "tool_name")
+        assert primary_event.tool_name == "ListMessages"
+        assert secondary_event.tool_name == "ListDialogs"
+
+        # Verify tool names exist in TOOL_POSTURE but telemetry schema is invariant
+        assert "ListMessages" in TOOL_POSTURE
+        assert "ListDialogs" in TOOL_POSTURE
+        assert TOOL_POSTURE["ListMessages"] == "primary"
+        assert TOOL_POSTURE["ListDialogs"] == "secondary/helper"
+
 
 class TestTelemetryCollectorInitialization:
     """Tests for TelemetryCollector database initialization."""
