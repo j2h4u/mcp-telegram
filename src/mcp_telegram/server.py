@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import logging
 import sys
 import time
@@ -29,13 +28,8 @@ _MAX_ERROR_DETAIL_LENGTH = 160
 
 @cache
 def enumerate_available_tools() -> list[tuple[str, Tool]]:
-    tools_list = []
-    for _, tool_args in inspect.getmembers(tools, inspect.isclass):
-        if issubclass(tool_args, tools.ToolArgs) and tool_args != tools.ToolArgs:
-            logger.debug("Found tool: %s", tool_args)
-            description = tools.tool_description(tool_args)
-            tools_list.append((description.name, description))
-    return tools_list
+    tools.verify_tool_registry()
+    return [(name, tools.tool_description(cls)) for name, cls in tools.TOOL_REGISTRY.items()]
 
 
 mapping: dict[str, Tool] = dict(enumerate_available_tools())
