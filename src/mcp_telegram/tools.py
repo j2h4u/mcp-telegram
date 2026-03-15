@@ -1525,6 +1525,31 @@ async def get_user_info(args: GetUserInfo) -> ToolResult:
 
 ### ListUnreadMessages ###
 
+# Priority tiers for unread chat sorting (lower = higher priority).
+# Gaps between values allow inserting new tiers without renumbering.
+_UNREAD_TIER_MENTION_DM = 10       # DM with unread @mention
+_UNREAD_TIER_MENTION_GROUP = 20    # Group with unread @mention
+_UNREAD_TIER_HUMAN_DM = 30        # 1-on-1 with a real person
+_UNREAD_TIER_BOT_DM = 40          # 1-on-1 with a bot
+_UNREAD_TIER_SMALL_GROUP = 50     # Group within size threshold
+_UNREAD_TIER_LARGE_GROUP = 60     # Group above size threshold
+_UNREAD_TIER_CHANNEL = 70         # Channel / broadcast
+
+
+def _unread_chat_tier(c: dict) -> int:
+    """Classify an unread chat into a priority tier."""
+    has_mentions = c["unread_mentions_count"] > 0
+    is_user = c["is_user"]
+    is_bot = c["is_bot"]
+
+    if has_mentions:
+        return _UNREAD_TIER_MENTION_DM if is_user else _UNREAD_TIER_MENTION_GROUP
+    if is_user:
+        return _UNREAD_TIER_BOT_DM if is_bot else _UNREAD_TIER_HUMAN_DM
+    if c["is_channel"]:
+        return _UNREAD_TIER_CHANNEL
+    return _UNREAD_TIER_SMALL_GROUP
+
 
 class ListUnreadMessages(ToolArgs):
     """Fetch unread messages from personal chats and small groups, sorted by mentions then recency.
@@ -1621,20 +1646,12 @@ async def list_unread_messages(args: ListUnreadMessages) -> ToolResult:
                 empty_msg = "Нет непрочитанных сообщений."
             return ToolResult(content=_text_response(empty_msg))
 
-        # Priority tiers (highest first):
-        #   1. Any chat with unread @mentions — someone directly addressing the user
-        #   2. Human DMs (1-on-1 with real people)
-        #   3. Bot DMs (notifications, digests — useful but not urgent)
-        #   4. Groups (small groups included by scope filter)
-        #   Within each tier: newest message first.
-        def _sort_priority(c: dict) -> tuple:
-            has_mentions = c["unread_mentions_count"] > 0
-            is_human_dm = c["is_user"] and not c["is_bot"]
-            is_bot_dm = c["is_user"] and c["is_bot"]
-            recency = c["date"].timestamp() if c["date"] else 0
-            return (-has_mentions, -is_human_dm, -is_bot_dm, -recency)
+        # Assign priority tier, sort by (tier ASC, recency DESC).
+        # Lower tier = higher priority. Add new tiers between existing values.
+        for c in unread_chats:
+            c["_tier"] = _unread_chat_tier(c)
 
-        unread_chats.sort(key=_sort_priority)
+        unread_chats.sort(key=lambda c: (c["_tier"], -(c["date"].timestamp() if c["date"] else 0)))
 
         # Allocate budget
         allocation = allocate_message_budget_proportional(unread_counts, args.limit)
