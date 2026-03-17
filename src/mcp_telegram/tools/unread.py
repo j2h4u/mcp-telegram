@@ -10,6 +10,7 @@ from pydantic import Field
 
 from .. import capabilities
 from ..capabilities import allocate_message_budget_proportional
+from ..cache import EntityCache
 from ..dialog_target import classify_dialog
 from ..errors import no_unread_all_text, no_unread_personal_text
 from ..formatter import UnreadChatData, format_unread_messages_grouped
@@ -63,62 +64,76 @@ class ListUnreadMessages(ToolArgs):
     )
 
 
+async def _collect_unread_dialogs(
+    client,  # noqa: ANN001
+    args: ListUnreadMessages,
+    cache: EntityCache,
+) -> tuple[list[_UnreadDialogEntry], dict[int, int]]:
+    """Iterate Telegram dialogs and collect those with unread messages.
+
+    Returns (unread_chats, unread_counts) after applying scope filters and
+    caching each dialog entry.
+    """
+    unread_chats: list[_UnreadDialogEntry] = []
+    unread_counts: dict[int, int] = {}
+
+    async for dialog in client.iter_dialogs(archived=None, ignore_pinned=False):
+        unread_count = getattr(dialog, "unread_count", 0)
+        if unread_count == 0:
+            continue
+
+        chat_id = getattr(dialog, "id", None)
+        if not isinstance(chat_id, int):
+            continue
+
+        display_name = getattr(dialog, "name", f"Chat {chat_id}")
+        category = classify_dialog(dialog)
+        unread_mentions_count = getattr(dialog, "unread_mentions_count", 0)
+        date = getattr(dialog, "date", None)
+
+        # read_inbox_max_id from raw TL dialog — needed for min_id fetch
+        raw_dialog = getattr(dialog, "dialog", None)
+        read_inbox_max_id = getattr(raw_dialog, "read_inbox_max_id", 0) if raw_dialog else 0
+
+        entity = getattr(dialog, "entity", None)
+        participants_count = getattr(entity, "participants_count", None) if entity is not None else None
+
+        # Apply scope filter
+        if args.scope == "personal":
+            if category == "channel" or (
+                category == "group"
+                and participants_count is not None
+                and participants_count > args.group_size_threshold
+            ):
+                continue
+
+        # Cache the dialog
+        try:
+            cache_dialog_entry(cache, dialog)
+        except sqlite3.Error as cache_exc:
+            logger.warning("dialog_cache_update_failed dialog_id=%r error=%s", chat_id, cache_exc)
+
+        # Collect unread chat info
+        unread_chats.append(_UnreadDialogEntry(
+            chat_id=chat_id,
+            display_name=display_name,
+            unread_count=unread_count,
+            unread_mentions_count=unread_mentions_count,
+            category=category,
+            date=date,
+            read_inbox_max_id=read_inbox_max_id,
+        ))
+        unread_counts[chat_id] = unread_count
+
+    return unread_chats, unread_counts
+
+
 @mcp_tool("primary")
 async def list_unread_messages(args: ListUnreadMessages) -> ToolResult:
     cache = get_entity_cache()
 
     async with connected_client() as client:
-        # Iterate dialogs and collect unread chats
-        unread_chats: list[_UnreadDialogEntry] = []
-        unread_counts: dict[int, int] = {}
-
-        async for dialog in client.iter_dialogs(archived=None, ignore_pinned=False):
-            unread_count = getattr(dialog, "unread_count", 0)
-            if unread_count == 0:
-                continue
-
-            chat_id = getattr(dialog, "id", None)
-            if not isinstance(chat_id, int):
-                continue
-
-            display_name = getattr(dialog, "name", f"Chat {chat_id}")
-            category = classify_dialog(dialog)
-            unread_mentions_count = getattr(dialog, "unread_mentions_count", 0)
-            date = getattr(dialog, "date", None)
-
-            # read_inbox_max_id from raw TL dialog — needed for min_id fetch
-            raw_dialog = getattr(dialog, "dialog", None)
-            read_inbox_max_id = getattr(raw_dialog, "read_inbox_max_id", 0) if raw_dialog else 0
-
-            entity = getattr(dialog, "entity", None)
-            participants_count = getattr(entity, "participants_count", None) if entity is not None else None
-
-            # Apply scope filter
-            if args.scope == "personal":
-                if category == "channel" or (
-                    category == "group"
-                    and participants_count is not None
-                    and participants_count > args.group_size_threshold
-                ):
-                    continue
-
-            # Cache the dialog
-            try:
-                cache_dialog_entry(cache, dialog)
-            except sqlite3.Error as cache_exc:
-                logger.warning("dialog_cache_update_failed dialog_id=%r error=%s", chat_id, cache_exc)
-
-            # Collect unread chat info
-            unread_chats.append(_UnreadDialogEntry(
-                chat_id=chat_id,
-                display_name=display_name,
-                unread_count=unread_count,
-                unread_mentions_count=unread_mentions_count,
-                category=category,
-                date=date,
-                read_inbox_max_id=read_inbox_max_id,
-            ))
-            unread_counts[chat_id] = unread_count
+        unread_chats, unread_counts = await _collect_unread_dialogs(client, args, cache)
 
         if not unread_chats:
             empty_msg = no_unread_all_text() if args.scope == "all" else no_unread_personal_text()
