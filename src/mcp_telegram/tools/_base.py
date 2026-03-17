@@ -224,11 +224,7 @@ def get_entity_cache() -> EntityCache:
 
 
 def _get_analytics_collector():
-    """Lazy-load analytics collector (same pattern as get_entity_cache).
-
-    Returns:
-        TelemetryCollector singleton for telemetry recording
-    """
+    """Lazy-init analytics collector — creates state dir + DB on first call."""
     from ..analytics import TelemetryCollector
     db_dir = xdg_state_home() / "mcp-telegram"
     db_dir.mkdir(parents=True, exist_ok=True)

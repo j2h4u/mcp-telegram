@@ -7,6 +7,7 @@ from mcp_telegram.tools import ListDialogs, ListMessages, ListTopics, SearchMess
 from unittest.mock import AsyncMock, MagicMock, patch
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from telethon.errors import RPCError
 
 from mcp_telegram.cache import EntityCache, TopicMetadataCache
 from mcp_telegram.capabilities import (
@@ -46,6 +47,55 @@ def _make_mock_topic(
     )
 
 
+async def test_connected_client_is_reentrant(mock_client, monkeypatch):
+    """Nested connected_client() must not disconnect the outer caller's connection.
+
+    Regression test: before the fix, the inner context manager disconnected
+    the shared Telethon client on exit, causing the outer block to fail with
+    'Cannot send requests while disconnected' on the next API call.
+    """
+    from mcp_telegram.tools import connected_client
+
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+
+    # Simulate real Telethon: is_connected reflects connect/disconnect state
+    _connected = False
+
+    def _is_connected():
+        return _connected
+
+    async def _connect():
+        nonlocal _connected
+        _connected = True
+
+    async def _disconnect():
+        nonlocal _connected
+        _connected = False
+
+    mock_client.is_connected = _is_connected
+    mock_client.connect = AsyncMock(side_effect=_connect)
+    mock_client.disconnect = AsyncMock(side_effect=_disconnect)
+
+    async with connected_client() as outer_client:
+        assert outer_client.is_connected(), "outer should be connected"
+
+        # Nested call — must NOT disconnect on exit
+        async with connected_client() as inner_client:
+            assert inner_client is outer_client
+            assert inner_client.is_connected()
+
+        # After inner exits, outer must still be connected
+        assert outer_client.is_connected(), (
+            "outer must stay connected after nested connected_client() exits"
+        )
+
+    # After outer exits, should be disconnected
+    assert not mock_client.is_connected(), "should disconnect after outermost exits"
+    # connect called once (outer), disconnect called once (outer)
+    assert mock_client.connect.await_count == 1
+    assert mock_client.disconnect.await_count == 1
+
+
 async def test_list_dialogs_multiple_newlines(mock_cache, mock_client, monkeypatch):
     """ListDialogs with multiple dialogs returns single TextContent with newline-separated entries."""
     def _make_dialog(name, id_, is_user=True):
@@ -62,8 +112,8 @@ async def test_list_dialogs_multiple_newlines(mock_cache, mock_client, monkeypat
 
     dialogs = [_make_dialog("Alice", 1), _make_dialog("Bob", 2, is_user=False)]
     mock_client.iter_dialogs = MagicMock(return_value=_async_iter(dialogs))
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.discovery.get_entity_cache", lambda: mock_cache)
 
     from mcp_telegram.tools import list_dialogs
     result = await list_dialogs(ListDialogs())
@@ -79,8 +129,8 @@ async def test_list_dialogs_empty_returns_action(mock_cache, mock_client, monkey
     from mcp_telegram.tools import ListDialogs, list_dialogs
 
     mock_client.iter_dialogs = MagicMock(return_value=_async_iter([]))
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.discovery.get_entity_cache", lambda: mock_cache)
 
     result = await list_dialogs(ListDialogs())
 
@@ -103,11 +153,11 @@ async def test_list_dialogs_type_field(mock_cache, mock_client, monkeypatch):
     fake_dialog.id = 101
     fake_dialog.name = "Иван Петров"
     fake_dialog.unread_count = 0
-    fake_dialog.entity = MagicMock(username="ivan")
+    fake_dialog.entity = MagicMock(username="ivan", bot=False)
 
     mock_client.iter_dialogs = MagicMock(return_value=_async_iter([fake_dialog]))
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.discovery.get_entity_cache", lambda: mock_cache)
 
     from mcp_telegram.tools import list_dialogs
     result = await list_dialogs(ListDialogs())
@@ -130,8 +180,8 @@ async def test_list_dialogs_null_date(mock_cache, mock_client, monkeypatch):
     fake_dialog.entity = MagicMock(username=None)
 
     mock_client.iter_dialogs = MagicMock(return_value=_async_iter([fake_dialog]))
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.discovery.get_entity_cache", lambda: mock_cache)
 
     from mcp_telegram.tools import list_dialogs
     result = await list_dialogs(ListDialogs())
@@ -151,10 +201,10 @@ async def test_list_topics_returns_active_topics(tmp_db_path, mock_client, monke
     blocked_topic["inaccessible_error"] = "TOPIC_ID_INVALID"
     blocked_topic["inaccessible_at"] = 1_700_000_000
 
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.discovery.get_entity_cache", lambda: cache)
     monkeypatch.setattr(
-        "mcp_telegram.tools._load_dialog_topics",
+        "mcp_telegram.capabilities.load_dialog_topics",
         AsyncMock(return_value={
             "choices": {1: "General", 11: "Release Notes", 12: "Inbox"},
             "metadata_by_id": {1: general_topic, 11: release_topic, 12: blocked_topic},
@@ -177,11 +227,11 @@ async def test_list_topics_catalog_unavailable(tmp_db_path, mock_client, monkeyp
     cache = EntityCache(tmp_db_path)
     cache.upsert(701, "group", "Backend Forum", None)
 
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.discovery.get_entity_cache", lambda: cache)
     monkeypatch.setattr(
-        "mcp_telegram.tools._load_dialog_topics",
-        AsyncMock(side_effect=tools_module.RPCError(request=None, message="CHAT_NOT_FORUM", code=400)),
+        "mcp_telegram.capabilities.load_dialog_topics",
+        AsyncMock(side_effect=RPCError(request=None, message="CHAT_NOT_FORUM", code=400)),
     )
 
     result = await list_topics(ListTopics(dialog="Backend Forum"))
@@ -195,8 +245,8 @@ async def test_list_topics_not_found_returns_action(mock_cache, mock_client, mon
     """ListTopics returns an action-oriented response when the dialog cannot be resolved."""
     from mcp_telegram.tools import ListTopics, list_topics
 
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.discovery.get_entity_cache", lambda: mock_cache)
 
     result = await list_topics(ListTopics(dialog="nobody_xyz"))
 
@@ -214,8 +264,8 @@ async def test_list_topics_ambiguous_returns_action(mock_client, monkeypatch, tm
     ambig_cache = EntityCache(tmp_db_path)
     ambig_cache.upsert(201, "group", "Backend Forum", None)
     ambig_cache.upsert(202, "group", "Backend Feedback", None)
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: ambig_cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.discovery.get_entity_cache", lambda: ambig_cache)
 
     result = await list_topics(ListTopics(dialog="Backend"))
 
@@ -244,10 +294,10 @@ async def test_list_topics_warms_dialog_cache_on_first_miss(tmp_db_path, mock_cl
     inbox_topic = make_mock_topic(topic_id=40, title="Inbox", top_message_id=249)
 
     mock_client.iter_dialogs = MagicMock(side_effect=lambda **_: _async_iter([dialog]))
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.discovery.get_entity_cache", lambda: cache)
     monkeypatch.setattr(
-        "mcp_telegram.tools._load_dialog_topics",
+        "mcp_telegram.capabilities.load_dialog_topics",
         AsyncMock(return_value={
             "choices": {1: "General", 40: "Inbox"},
             "metadata_by_id": {1: general_topic, 40: inbox_topic},
@@ -321,9 +371,9 @@ async def test_list_topics_adapter_delegates_to_capability_execution(
         )
     )
 
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
-    monkeypatch.setattr("mcp_telegram.tools._execute_list_topics_capability", capability)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.discovery.get_entity_cache", lambda: cache)
+    monkeypatch.setattr("mcp_telegram.capabilities.execute_list_topics_capability", capability)
 
     result = await list_topics(ListTopics(dialog="Backend"))
 
@@ -353,14 +403,14 @@ async def test_list_messages_adapter_delegates_to_history_capability(
             reply_map={},
             reaction_names_map={},
             topic_name_getter=None,
-            next_cursor=None,
+
             navigation=CapabilityNavigation(kind="history", token="nav-token"),
         )
     )
 
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
-    monkeypatch.setattr("mcp_telegram.tools._execute_history_read_capability", capability)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: cache)
+    monkeypatch.setattr("mcp_telegram.capabilities.execute_history_read_capability", capability)
 
     result = await list_messages(ListMessages(dialog="Backend", topic="Release Notes", limit=1))
 
@@ -392,14 +442,14 @@ async def test_list_messages_adapter_routes_exact_selectors_to_history_capabilit
             reply_map={},
             reaction_names_map={},
             topic_name_getter=None,
-            next_cursor=None,
+
             navigation=None,
         )
     )
 
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
-    monkeypatch.setattr("mcp_telegram.tools._execute_history_read_capability", capability)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: cache)
+    monkeypatch.setattr("mcp_telegram.capabilities.execute_history_read_capability", capability)
 
     result = await list_messages(ListMessages(exact_dialog_id=701, exact_topic_id=11, limit=1))
 
@@ -437,9 +487,9 @@ async def test_search_messages_adapter_delegates_to_capability_execution(
         )
     )
 
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
-    monkeypatch.setattr("mcp_telegram.tools._execute_search_messages_capability", capability)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: cache)
+    monkeypatch.setattr("mcp_telegram.capabilities.execute_search_messages_capability", capability)
 
     result = await search_messages(SearchMessages(dialog="Backend", query="ship", limit=20))
 
@@ -478,9 +528,9 @@ async def test_search_messages_adapter_routes_numeric_dialog_to_exact_capability
         )
     )
 
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
-    monkeypatch.setattr("mcp_telegram.tools._execute_search_messages_capability", capability)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: cache)
+    monkeypatch.setattr("mcp_telegram.capabilities.execute_search_messages_capability", capability)
 
     await search_messages(SearchMessages(dialog="701", query="ship", limit=20))
 
@@ -511,8 +561,8 @@ async def test_search_messages_numeric_dialog_direct_path_preserves_hit_context_
 
     mock_client.iter_messages = _fake_iter_messages
     mock_client.get_messages = AsyncMock(return_value=[ctx_before, ctx_after])
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: cache)
 
     result = await search_messages(SearchMessages(dialog="701", query="ship", limit=1))
 
@@ -538,8 +588,8 @@ async def test_list_messages_by_name(mock_cache, mock_client, monkeypatch, make_
     from mcp_telegram.tools import ListMessages, list_messages
     msg = make_mock_message(id=10, text="Hello")
     mock_client.iter_messages = MagicMock(return_value=_async_iter([msg]))
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: mock_cache)
     result = await list_messages(ListMessages(dialog="Иван Петров"))
     assert len(result) == 1
     assert "10:00" in result[0].text  # formatted output includes time
@@ -549,8 +599,8 @@ async def test_search_messages_not_found_returns_action(mock_cache, mock_client,
     """SearchMessages returns an action-oriented response when the dialog cannot be resolved."""
     from mcp_telegram.tools import SearchMessages, search_messages
 
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: mock_cache)
 
     result = await search_messages(SearchMessages(dialog="nobody_xyz", query="hi"))
 
@@ -568,8 +618,8 @@ async def test_search_messages_ambiguous_returns_action(mock_client, monkeypatch
     ambig_cache = EntityCache(tmp_db_path)
     ambig_cache.upsert(201, "group", "Backend Forum", None)
     ambig_cache.upsert(202, "group", "Backend Feedback", None)
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: ambig_cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: ambig_cache)
 
     result = await search_messages(SearchMessages(dialog="Backend", query="hi"))
 
@@ -583,8 +633,8 @@ async def test_search_messages_ambiguous_returns_action(mock_client, monkeypatch
 async def test_list_messages_not_found(mock_cache, mock_client, monkeypatch):
     """ListMessages with unresolved name returns TextContent with 'not found'."""
     from mcp_telegram.tools import ListMessages, list_messages
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: mock_cache)
     result = await list_messages(ListMessages(dialog="nobody_xyz"))
     assert len(result) == 1
     assert 'Dialog "nobody_xyz" was not found.' in result[0].text
@@ -600,8 +650,8 @@ async def test_list_messages_ambiguous(mock_cache, mock_client, monkeypatch, tmp
     ambig_cache = EntityCache(tmp_db_path)
     ambig_cache.upsert(201, "user", "Иван Петров", None)
     ambig_cache.upsert(202, "user", "Иван Сидоров", None)
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: ambig_cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: ambig_cache)
     result = await list_messages(ListMessages(dialog="Иван"))
     assert len(result) == 1
     assert 'Dialog "Иван" matched multiple dialogs.' in result[0].text
@@ -617,8 +667,8 @@ async def test_list_messages_navigation_present(mock_cache, mock_client, monkeyp
 
     msgs = [make_mock_message(id=20, text="B"), make_mock_message(id=10, text="A")]
     mock_client.iter_messages = MagicMock(return_value=_async_iter(msgs))
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: mock_cache)
     result = await list_messages(ListMessages(dialog="Иван Петров", limit=2))
     assert len(result) == 1
     assert "next_navigation:" in result[0].text
@@ -630,8 +680,8 @@ async def test_list_messages_no_navigation_last_page(mock_cache, mock_client, mo
 
     msgs = [make_mock_message(id=10, text="Only")]
     mock_client.iter_messages = MagicMock(return_value=_async_iter(msgs))
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: mock_cache)
     result = await list_messages(ListMessages(dialog="Иван Петров", limit=5))
     assert "next_navigation" not in result[0].text
 
@@ -643,8 +693,8 @@ async def test_list_messages_sender_filter(mock_cache, mock_client, monkeypatch)
     """ListMessages with sender param passes from_user=entity_id to iter_messages."""
     from mcp_telegram.tools import ListMessages, list_messages
     mock_client.iter_messages = MagicMock(return_value=_async_iter([]))
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: mock_cache)
     # mock_cache has entity 101 = "Иван Петров"
     await list_messages(ListMessages(dialog="Иван Петров", sender="Иван Петров"))
     # Verify iter_messages was called with from_user=101
@@ -667,8 +717,8 @@ async def test_list_messages_unread_filter(mock_cache, mock_client, monkeypatch)
     peer_result.dialogs = [tl_dialog]
     mock_client.return_value = peer_result
     mock_client.iter_messages = MagicMock(return_value=_async_iter([]))
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: mock_cache)
     await list_messages(ListMessages(dialog="Иван Петров", unread=True))
     call_kwargs = mock_client.iter_messages.call_args.kwargs
     assert call_kwargs.get("min_id") == 50
@@ -712,9 +762,9 @@ async def test_list_messages_topic_resolves_within_dialog(tmp_db_path, mock_clie
     msg.media = None
 
     mock_client.iter_messages = MagicMock(return_value=_async_iter([msg]))
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
-    monkeypatch.setattr("mcp_telegram.tools._load_dialog_topics", topic_loader)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: cache)
+    monkeypatch.setattr("mcp_telegram.capabilities.load_dialog_topics", topic_loader)
 
     result = await list_messages(ListMessages(dialog="Backend Forum", topic="Release Notes"))
 
@@ -731,10 +781,10 @@ async def test_list_messages_topic_not_found(tmp_db_path, mock_client, monkeypat
     cache = EntityCache(tmp_db_path)
     cache.upsert(701, "group", "Backend Forum", None)
 
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: cache)
     monkeypatch.setattr(
-        "mcp_telegram.tools._load_dialog_topics",
+        "mcp_telegram.capabilities.load_dialog_topics",
         AsyncMock(return_value={"choices": {11: "Release Notes"}, "metadata_by_id": {}, "deleted_topics": {}}),
     )
 
@@ -754,10 +804,10 @@ async def test_list_messages_topic_ambiguous_within_dialog(tmp_db_path, mock_cli
     cache = EntityCache(tmp_db_path)
     cache.upsert(701, "group", "Backend Forum", None)
 
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: cache)
     monkeypatch.setattr(
-        "mcp_telegram.tools._load_dialog_topics",
+        "mcp_telegram.capabilities.load_dialog_topics",
         AsyncMock(return_value={
             "choices": {
                 11: "Release Notes",
@@ -801,10 +851,10 @@ async def test_list_messages_topic_ambiguous_marks_previously_inaccessible_candi
     inaccessible_topic["inaccessible_at"] = 1_700_000_000
     active_topic = make_mock_topic(topic_id=12, title="Release Planning", top_message_id=6011)
 
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: cache)
     monkeypatch.setattr(
-        "mcp_telegram.tools._load_dialog_topics",
+        "mcp_telegram.capabilities.load_dialog_topics",
         AsyncMock(return_value={
             "choices": {
                 11: "Release Notes",
@@ -842,10 +892,10 @@ async def test_list_messages_topic_header(
     message = make_mock_message(id=77, text="Shipped topic update")
 
     mock_client.iter_messages = MagicMock(return_value=_async_iter([message]))
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: cache)
     monkeypatch.setattr(
-        "mcp_telegram.tools._load_dialog_topics",
+        "mcp_telegram.capabilities.load_dialog_topics",
         AsyncMock(return_value={
             "choices": {11: "Release Notes"},
             "metadata_by_id": {11: topic},
@@ -883,10 +933,10 @@ async def test_list_messages_cross_topic_pages_include_inline_topic_labels(
     general_message = make_general_topic_message(id=76, text="General fallback")
 
     mock_client.iter_messages = MagicMock(return_value=_async_iter([topic_message, general_message]))
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: cache)
     monkeypatch.setattr(
-        "mcp_telegram.tools._load_dialog_topics",
+        "mcp_telegram.capabilities.load_dialog_topics",
         AsyncMock(return_value={
             "choices": {1: "General", 11: "Release Notes"},
             "metadata_by_id": {
@@ -922,10 +972,10 @@ async def test_list_messages_exact_topic_direct_read_skips_resolution_and_catalo
     load_dialog_topics = AsyncMock()
 
     mock_client.iter_messages = MagicMock(return_value=_async_iter([message]))
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
-    monkeypatch.setattr("mcp_telegram.tools._resolve_dialog", resolve_dialog)
-    monkeypatch.setattr("mcp_telegram.tools._load_dialog_topics", load_dialog_topics)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: cache)
+    monkeypatch.setattr("mcp_telegram.tools.reading._resolve_dialog", resolve_dialog)
+    monkeypatch.setattr("mcp_telegram.capabilities.load_dialog_topics", load_dialog_topics)
 
     result = await list_messages(ListMessages(exact_dialog_id=701, exact_topic_id=11))
 
@@ -961,8 +1011,8 @@ async def test_list_messages_exact_topic_direct_read_preserves_navigation(
             yield message
 
     mock_client.iter_messages = _fake_iter_messages
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: cache)
 
     result = await list_messages(ListMessages(exact_dialog_id=701, exact_topic_id=11, limit=2))
 
@@ -995,10 +1045,10 @@ async def test_list_messages_exact_general_topic_direct_read_avoids_reply_to(
     load_dialog_topics = AsyncMock()
 
     mock_client.iter_messages = MagicMock(return_value=_async_iter([message]))
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
-    monkeypatch.setattr("mcp_telegram.tools._resolve_dialog", resolve_dialog)
-    monkeypatch.setattr("mcp_telegram.tools._load_dialog_topics", load_dialog_topics)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: cache)
+    monkeypatch.setattr("mcp_telegram.tools.reading._resolve_dialog", resolve_dialog)
+    monkeypatch.setattr("mcp_telegram.capabilities.load_dialog_topics", load_dialog_topics)
 
     result = await list_messages(ListMessages(exact_dialog_id=701, exact_topic_id=1))
 
@@ -1032,10 +1082,10 @@ async def test_list_messages_topic_cursor_round_trip(
         _async_iter([newer, older]),
         _async_iter([oldest]),
     ])
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: cache)
     monkeypatch.setattr(
-        "mcp_telegram.tools._load_dialog_topics",
+        "mcp_telegram.capabilities.load_dialog_topics",
         AsyncMock(return_value={
             "choices": {11: "Release Notes"},
             "metadata_by_id": {11: topic},
@@ -1077,10 +1127,10 @@ async def test_list_messages_topic_from_beginning(
     newest = make_mock_message(id=20, text="Newest in topic")
 
     mock_client.iter_messages = MagicMock(return_value=_async_iter([oldest, newest]))
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: cache)
     monkeypatch.setattr(
-        "mcp_telegram.tools._load_dialog_topics",
+        "mcp_telegram.capabilities.load_dialog_topics",
         AsyncMock(return_value={
             "choices": {11: "Release Notes"},
             "metadata_by_id": {11: topic},
@@ -1130,10 +1180,10 @@ async def test_list_messages_topic_sender_behavior(
         _async_iter([alice_message, bob_message]),
         _async_iter([alice_message, bob_message]),
     ])
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: cache)
     monkeypatch.setattr(
-        "mcp_telegram.tools._load_dialog_topics",
+        "mcp_telegram.capabilities.load_dialog_topics",
         AsyncMock(return_value={
             "choices": {11: "Release Notes"},
             "metadata_by_id": {11: topic},
@@ -1191,10 +1241,10 @@ async def test_list_messages_topic_unread_behavior(
         _async_iter([unread_message]),
         _async_iter([]),
     ])
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: cache)
     monkeypatch.setattr(
-        "mcp_telegram.tools._load_dialog_topics",
+        "mcp_telegram.capabilities.load_dialog_topics",
         AsyncMock(return_value={
             "choices": {11: "Release Notes"},
             "metadata_by_id": {11: topic},
@@ -1259,10 +1309,10 @@ async def test_list_messages_general_topic_unread_is_scoped(
             _async_iter([general_newest, leaked_adjacent, general_older]),
         ]
     )
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: cache)
     monkeypatch.setattr(
-        "mcp_telegram.tools._load_dialog_topics",
+        "mcp_telegram.capabilities.load_dialog_topics",
         AsyncMock(
             return_value={
                 "choices": {1: "General"},
@@ -1315,10 +1365,10 @@ async def test_list_messages_topic_unread_cursor_is_topic_scoped(
     mock_client.iter_messages = MagicMock(
         return_value=_async_iter([topic_newest, leaked_general, topic_older])
     )
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: cache)
     monkeypatch.setattr(
-        "mcp_telegram.tools._load_dialog_topics",
+        "mcp_telegram.capabilities.load_dialog_topics",
         AsyncMock(
             return_value={
                 "choices": {11: "Release Notes"},
@@ -1373,10 +1423,10 @@ async def test_list_messages_exact_topic_unread_cursor_is_topic_scoped(
     mock_client.iter_messages = MagicMock(
         return_value=_async_iter([topic_newest, leaked_general, topic_older])
     )
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
-    monkeypatch.setattr("mcp_telegram.tools._resolve_dialog", resolve_dialog)
-    monkeypatch.setattr("mcp_telegram.tools._load_dialog_topics", load_dialog_topics)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: cache)
+    monkeypatch.setattr("mcp_telegram.tools.reading._resolve_dialog", resolve_dialog)
+    monkeypatch.setattr("mcp_telegram.capabilities.load_dialog_topics", load_dialog_topics)
 
     result = await list_messages(
         ListMessages(exact_dialog_id=701, exact_topic_id=11, unread=True, limit=2)
@@ -1426,10 +1476,10 @@ async def test_list_messages_topic_unread_filters_dialog_leaks(
     mock_client.iter_messages = MagicMock(
         return_value=_async_iter([topic_newest, leaked_adjacent, leaked_general, topic_older])
     )
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: cache)
     monkeypatch.setattr(
-        "mcp_telegram.tools._load_dialog_topics",
+        "mcp_telegram.capabilities.load_dialog_topics",
         AsyncMock(
             return_value={
                 "choices": {11: "Release Notes"},
@@ -1478,10 +1528,10 @@ async def test_list_messages_topic_unread_empty_page_has_no_navigation(
     mock_client.get_input_entity = AsyncMock(return_value=MagicMock())
     mock_client.side_effect = [MagicMock(dialogs=[MagicMock(read_inbox_max_id=50, unread_count=2)])]
     mock_client.iter_messages = MagicMock(return_value=_async_iter([leaked_general, leaked_adjacent]))
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: cache)
     monkeypatch.setattr(
-        "mcp_telegram.tools._load_dialog_topics",
+        "mcp_telegram.capabilities.load_dialog_topics",
         AsyncMock(
             return_value={
                 "choices": {11: "Release Notes"},
@@ -1522,10 +1572,10 @@ async def test_list_messages_general_topic_normalization(
     message = make_general_topic_message(id=77, text="General update")
 
     mock_client.iter_messages = MagicMock(return_value=_async_iter([message]))
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: cache)
     monkeypatch.setattr(
-        "mcp_telegram.tools._load_dialog_topics",
+        "mcp_telegram.capabilities.load_dialog_topics",
         AsyncMock(return_value={
             "choices": {1: "General"},
             "metadata_by_id": {1: general_topic},
@@ -1567,10 +1617,10 @@ async def test_list_messages_deleted_topic_behavior(
     )
 
     mock_client.iter_messages = MagicMock(return_value=_async_iter([]))
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: cache)
     monkeypatch.setattr(
-        "mcp_telegram.tools._load_dialog_topics",
+        "mcp_telegram.capabilities.load_dialog_topics",
         AsyncMock(return_value={
             "choices": {1: "General"},
             "metadata_by_id": {
@@ -1610,10 +1660,10 @@ async def test_list_messages_exact_deleted_topic_behavior(
     load_dialog_topics = AsyncMock()
 
     mock_client.iter_messages = MagicMock(return_value=_async_iter([]))
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
-    monkeypatch.setattr("mcp_telegram.tools._resolve_dialog", resolve_dialog)
-    monkeypatch.setattr("mcp_telegram.tools._load_dialog_topics", load_dialog_topics)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: cache)
+    monkeypatch.setattr("mcp_telegram.tools.reading._resolve_dialog", resolve_dialog)
+    monkeypatch.setattr("mcp_telegram.capabilities.load_dialog_topics", load_dialog_topics)
 
     result = await list_messages(ListMessages(exact_dialog_id=701, exact_topic_id=9))
 
@@ -1640,10 +1690,10 @@ async def test_list_messages_private_or_inaccessible_topic_behavior(
     topic = make_mock_topic(topic_id=11, title="Release Notes", top_message_id=5011)
 
     mock_client.iter_messages = MagicMock(side_effect=make_private_topic_error())
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: cache)
     monkeypatch.setattr(
-        "mcp_telegram.tools._load_dialog_topics",
+        "mcp_telegram.capabilities.load_dialog_topics",
         AsyncMock(return_value={
             "choices": {11: "Release Notes"},
             "metadata_by_id": {11: topic},
@@ -1675,10 +1725,10 @@ async def test_list_messages_exact_topic_inaccessible_behavior(
     load_dialog_topics = AsyncMock()
 
     mock_client.iter_messages = MagicMock(side_effect=make_private_topic_error())
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
-    monkeypatch.setattr("mcp_telegram.tools._resolve_dialog", resolve_dialog)
-    monkeypatch.setattr("mcp_telegram.tools._load_dialog_topics", load_dialog_topics)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: cache)
+    monkeypatch.setattr("mcp_telegram.tools.reading._resolve_dialog", resolve_dialog)
+    monkeypatch.setattr("mcp_telegram.capabilities.load_dialog_topics", load_dialog_topics)
 
     result = await list_messages(ListMessages(exact_dialog_id=701, exact_topic_id=11))
 
@@ -1707,22 +1757,22 @@ async def test_list_messages_topic_retries_after_stale_top_message_id(
     recovered_message = make_mock_message(id=77, text="Recovered after refresh")
 
     mock_client.iter_messages = MagicMock(side_effect=[
-        tools_module.RPCError(request=None, message="TOPIC_ID_INVALID", code=400),
+        RPCError(request=None, message="TOPIC_ID_INVALID", code=400),
         _async_iter([recovered_message]),
     ])
     refresh_topic = AsyncMock(return_value=refreshed_topic)
 
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: cache)
     monkeypatch.setattr(
-        "mcp_telegram.tools._load_dialog_topics",
+        "mcp_telegram.capabilities.load_dialog_topics",
         AsyncMock(return_value={
             "choices": {11: "Release Notes"},
             "metadata_by_id": {11: stale_topic},
             "deleted_topics": {},
         }),
     )
-    monkeypatch.setattr("mcp_telegram.tools._refresh_topic_by_id", refresh_topic)
+    monkeypatch.setattr("mcp_telegram.capabilities.refresh_topic_by_id", refresh_topic)
 
     result = await list_messages(ListMessages(dialog="Backend Forum", topic="Release Notes"))
 
@@ -1752,21 +1802,21 @@ async def test_list_messages_topic_deleted_after_refresh(
     deleted_topic = make_deleted_topic(topic_id=11, title="Release Notes", top_message_id=5011)
 
     mock_client.iter_messages = MagicMock(
-        side_effect=tools_module.RPCError(request=None, message="TOPIC_ID_INVALID", code=400)
+        side_effect=RPCError(request=None, message="TOPIC_ID_INVALID", code=400)
     )
     refresh_topic = AsyncMock(return_value=deleted_topic)
 
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: cache)
     monkeypatch.setattr(
-        "mcp_telegram.tools._load_dialog_topics",
+        "mcp_telegram.capabilities.load_dialog_topics",
         AsyncMock(return_value={
             "choices": {11: "Release Notes"},
             "metadata_by_id": {11: stale_topic},
             "deleted_topics": {},
         }),
     )
-    monkeypatch.setattr("mcp_telegram.tools._refresh_topic_by_id", refresh_topic)
+    monkeypatch.setattr("mcp_telegram.capabilities.refresh_topic_by_id", refresh_topic)
 
     result = await list_messages(ListMessages(dialog="Backend Forum", topic="Release Notes"))
 
@@ -1793,23 +1843,23 @@ async def test_list_messages_topic_inaccessible_after_refresh(
     TopicMetadataCache(cache._conn).upsert_topics(701, [stale_topic])
 
     mock_client.iter_messages = MagicMock(side_effect=[
-        tools_module.RPCError(request=None, message="TOPIC_ID_INVALID", code=400),
-        tools_module.RPCError(request=None, message="TOPIC_ID_INVALID", code=400),
+        RPCError(request=None, message="TOPIC_ID_INVALID", code=400),
+        RPCError(request=None, message="TOPIC_ID_INVALID", code=400),
         _async_iter([]),
     ])
     refresh_topic = AsyncMock(return_value=refreshed_topic)
 
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: cache)
     monkeypatch.setattr(
-        "mcp_telegram.tools._load_dialog_topics",
+        "mcp_telegram.capabilities.load_dialog_topics",
         AsyncMock(return_value={
             "choices": {11: "Release Notes"},
             "metadata_by_id": {11: stale_topic},
             "deleted_topics": {},
         }),
     )
-    monkeypatch.setattr("mcp_telegram.tools._refresh_topic_by_id", refresh_topic)
+    monkeypatch.setattr("mcp_telegram.capabilities.refresh_topic_by_id", refresh_topic)
 
     result = await list_messages(ListMessages(dialog="Backend Forum", topic="Release Notes"))
 
@@ -1852,22 +1902,22 @@ async def test_list_messages_topic_falls_back_to_dialog_scan_after_thread_fetch_
     inbox_older.reply_to = topic_reply
 
     mock_client.iter_messages = MagicMock(side_effect=[
-        tools_module.RPCError(request=None, message="TOPIC_ID_INVALID", code=400),
+        RPCError(request=None, message="TOPIC_ID_INVALID", code=400),
         _async_iter([inbox_newest, leaked_general, leaked_adjacent, inbox_older]),
     ])
     refresh_topic = AsyncMock(return_value=active_topic)
 
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: cache)
     monkeypatch.setattr(
-        "mcp_telegram.tools._load_dialog_topics",
+        "mcp_telegram.capabilities.load_dialog_topics",
         AsyncMock(return_value={
             "choices": {40: "Inbox"},
             "metadata_by_id": {40: active_topic},
             "deleted_topics": {},
         }),
     )
-    monkeypatch.setattr("mcp_telegram.tools._refresh_topic_by_id", refresh_topic)
+    monkeypatch.setattr("mcp_telegram.capabilities.refresh_topic_by_id", refresh_topic)
 
     result = await list_messages(ListMessages(dialog="Backend Forum", topic="Inbox", limit=2))
 
@@ -1928,10 +1978,10 @@ async def test_list_messages_topic_boundary_no_leakage(
         _async_iter([leaked_middle, page_two_newest, page_two_oldest]),
         _async_iter([reverse_oldest, reverse_leak, reverse_newest]),
     ])
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: cache)
     monkeypatch.setattr(
-        "mcp_telegram.tools._load_dialog_topics",
+        "mcp_telegram.capabilities.load_dialog_topics",
         AsyncMock(return_value={
             "choices": {11: "Release Notes"},
             "metadata_by_id": {11: topic},
@@ -1974,7 +2024,7 @@ async def test_list_messages_topic_boundary_no_leakage(
 
 async def test_fetch_forum_topics_paginates() -> None:
     """Raw topic pagination advances offsets and de-duplicates topics across pages."""
-    from mcp_telegram.tools import _fetch_all_forum_topics
+    from mcp_telegram.capabilities import fetch_all_forum_topics as _fetch_all_forum_topics
 
     page_one_topics = [
         _make_mock_topic(topic_id=1, title="General", top_message_id=1001),
@@ -2019,7 +2069,7 @@ async def test_fetch_forum_topics_paginates() -> None:
 
 async def test_refresh_topic_by_id_detects_deleted(tmp_db_path) -> None:
     """By-ID refresh turns a cached topic into a deleted tombstone."""
-    from mcp_telegram.tools import _refresh_topic_by_id
+    from mcp_telegram.capabilities import refresh_topic_by_id as _refresh_topic_by_id
 
     cache = EntityCache(tmp_db_path)
     topic_cache = TopicMetadataCache(cache._conn)
@@ -2060,7 +2110,7 @@ async def test_refresh_topic_by_id_detects_deleted(tmp_db_path) -> None:
 
 async def test_load_dialog_topics_uses_fresh_cache(tmp_db_path) -> None:
     """Fresh cached topic metadata is returned without hitting Telegram."""
-    from mcp_telegram.tools import _load_dialog_topics
+    from mcp_telegram.capabilities import load_dialog_topics as _load_dialog_topics
 
     cache = EntityCache(tmp_db_path)
     topic_cache = TopicMetadataCache(cache._conn)
@@ -2109,7 +2159,7 @@ async def test_load_dialog_topics_uses_fresh_cache(tmp_db_path) -> None:
 
 async def test_load_dialog_topics_fetches_and_persists_on_cache_miss(tmp_db_path) -> None:
     """Cache miss fetches forum topics once and persists normalized metadata."""
-    from mcp_telegram.tools import _load_dialog_topics
+    from mcp_telegram.capabilities import load_dialog_topics as _load_dialog_topics
 
     cache = EntityCache(tmp_db_path)
     topic_cache = TopicMetadataCache(cache._conn)
@@ -2163,8 +2213,8 @@ async def test_search_messages_context(mock_cache, mock_client, monkeypatch, mak
 
     mock_client.iter_messages = _fake_iter_messages
     mock_client.get_messages = AsyncMock(return_value=[])
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: mock_cache)
 
     result = await search_messages(SearchMessages(dialog="Иван Петров", query="hit"))
     assert len(result) == 1
@@ -2183,8 +2233,8 @@ async def test_search_messages_context_window(mock_cache, mock_client, monkeypat
 
     mock_client.iter_messages = _fake_iter_messages
     mock_client.get_messages = AsyncMock(return_value=[ctx_before, ctx_after])
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: mock_cache)
 
     result = await search_messages(SearchMessages(dialog="Иван Петров", query="hit"))
     assert len(result) == 1
@@ -2203,8 +2253,8 @@ async def test_search_messages_context_after_hit(mock_cache, mock_client, monkey
 
     mock_client.iter_messages = _fake_iter_messages
     mock_client.get_messages = AsyncMock(return_value=[ctx_before, ctx_after])
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: mock_cache)
 
     result = await search_messages(SearchMessages(dialog="Иван Петров", query="hit"))
     assert len(result) == 1
@@ -2221,8 +2271,8 @@ async def test_search_messages_hit_marker(mock_cache, mock_client, monkeypatch, 
 
     mock_client.iter_messages = _fake_iter_messages
     mock_client.get_messages = AsyncMock(return_value=[])
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: mock_cache)
 
     result = await search_messages(SearchMessages(dialog="Иван Петров", query="hit"))
     assert len(result) == 1
@@ -2245,8 +2295,8 @@ async def test_search_messages_reaction_names_fetched(mock_cache, mock_client, m
     mock_client.iter_messages = _fake_iter_messages
     mock_client.get_messages = AsyncMock(return_value=[])
     mock_client.return_value = MagicMock(reactions=[], users=[])
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: mock_cache)
 
     await search_messages(SearchMessages(dialog="Иван Петров", query="reacted"))
     # GetMessageReactionsListRequest was invoked via client(...)
@@ -2269,8 +2319,8 @@ async def test_search_messages_next_navigation(mock_cache, mock_client, monkeypa
             yield h
 
     mock_client.iter_messages = _fake_iter
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: mock_cache)
 
     result = await search_messages(SearchMessages(dialog="Иван Петров", query="msg", limit=2))
     next_navigation = _extract_footer_token(result[0].text, "next_navigation")
@@ -2298,8 +2348,8 @@ async def test_search_messages_no_next_navigation(mock_cache, mock_client, monke
         # context calls return empty
 
     mock_client.iter_messages = _fake_iter
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: mock_cache)
 
     result = await search_messages(SearchMessages(dialog="Иван Петров", query="only", limit=5))
     assert "next_navigation" not in result[0].text
@@ -2309,8 +2359,8 @@ async def test_search_messages_invalid_navigation_returns_error(mock_cache, mock
     """SearchMessages returns an action-oriented error for malformed navigation tokens."""
     from mcp_telegram.tools import SearchMessages, search_messages
 
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: mock_cache)
 
     result = await search_messages(
         SearchMessages(dialog="Иван Петров", query="ship", navigation="BADINVALID==garbage")
@@ -2343,7 +2393,7 @@ async def test_get_me(mock_client, monkeypatch):
     mock_client.get_me = AsyncMock(
         return_value=MagicMock(id=999, first_name="Test", last_name=None, username="testuser")
     )
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
     result = await get_my_account(GetMyAccount())
     assert len(result) == 1
     text = result[0].text
@@ -2356,7 +2406,7 @@ async def test_get_me_unauthenticated(mock_client, monkeypatch):
     """GetMyAccount returns 'not authenticated' message when client.get_me() returns None."""
     from mcp_telegram.tools import GetMyAccount, get_my_account
     mock_client.get_me = AsyncMock(return_value=None)
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
     result = await get_my_account(GetMyAccount())
     assert len(result) == 1
     assert "Telegram session is not authenticated." in result[0].text
@@ -2376,9 +2426,9 @@ async def test_get_user_info(mock_cache, mock_client, monkeypatch):
     fake_chat = MagicMock(id=500, title="Shared Group")
     fake_result = MagicMock(chats=[fake_chat])
     mock_client.return_value = fake_result
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
-    monkeypatch.setattr("mcp_telegram.tools.get_peer_id", lambda chat: -1000000000500)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.user_info.get_entity_cache", lambda: mock_cache)
+    monkeypatch.setattr("mcp_telegram.tools.user_info.get_peer_id", lambda chat: -1000000000500)
     result = await get_user_info(GetUserInfo(user="Иван Петров"))
     assert len(result) == 1
     text = result[0].text
@@ -2391,8 +2441,8 @@ async def test_get_user_info(mock_cache, mock_client, monkeypatch):
 async def test_get_user_info_not_found(mock_cache, mock_client, monkeypatch):
     """GetUserInfo returns 'not found' when user name does not match any cache entry."""
     from mcp_telegram.tools import GetUserInfo, get_user_info
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.user_info.get_entity_cache", lambda: mock_cache)
     result = await get_user_info(GetUserInfo(user="nobody_xyz"))
     assert len(result) == 1
     assert 'User "nobody_xyz" was not found.' in result[0].text
@@ -2407,8 +2457,8 @@ async def test_get_user_info_ambiguous(mock_client, monkeypatch, tmp_db_path):
     ambig_cache = EntityCache(tmp_db_path)
     ambig_cache.upsert(201, "user", "Иван Петров", None)
     ambig_cache.upsert(202, "user", "Иван Сидоров", None)
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: ambig_cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.user_info.get_entity_cache", lambda: ambig_cache)
     result = await get_user_info(GetUserInfo(user="Иван"))
     assert len(result) == 1
     assert 'User "Иван" matched multiple users.' in result[0].text
@@ -2422,8 +2472,8 @@ async def test_get_user_info_fetch_error_returns_action(mock_cache, mock_client,
     from mcp_telegram.tools import GetUserInfo, get_user_info
 
     mock_client.get_entity = AsyncMock(side_effect=RuntimeError("boom"))
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.user_info.get_entity_cache", lambda: mock_cache)
 
     result = await get_user_info(GetUserInfo(user="Иван Петров"))
 
@@ -2442,9 +2492,9 @@ async def test_get_user_info_resolver_prefix(mock_cache, mock_client, monkeypatc
     fake_chat = MagicMock(id=500, title="Shared Group")
     fake_result = MagicMock(chats=[fake_chat])
     mock_client.return_value = fake_result
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
-    monkeypatch.setattr("mcp_telegram.tools.get_peer_id", lambda chat: -1000000000500)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.user_info.get_entity_cache", lambda: mock_cache)
+    monkeypatch.setattr("mcp_telegram.tools.user_info.get_peer_id", lambda chat: -1000000000500)
     result = await get_user_info(GetUserInfo(user="Иван Петров"))
     assert len(result) == 1
     first_line = result[0].text.splitlines()[0]
@@ -2460,8 +2510,8 @@ async def test_list_messages_stale_entity_excluded(mock_cache, mock_client, monk
 
     all_names_ttl_mock = MagicMock(return_value={})
     monkeypatch.setattr(mock_cache, "all_names_with_ttl", all_names_ttl_mock)
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: mock_cache)
 
     result = await list_messages(ListMessages(dialog="Unknown"))
     assert all_names_ttl_mock.called, "tools.py must call all_names_with_ttl for name resolution"
@@ -2491,8 +2541,8 @@ async def test_search_messages_upserts_sender(mock_cache, mock_client, monkeypat
 
     upsert_spy = MagicMock(wraps=mock_cache.upsert)
     monkeypatch.setattr(mock_cache, "upsert", upsert_spy)
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: mock_cache)
 
     await search_messages(SearchMessages(dialog="Иван Петров", query="hi"))
 
@@ -2505,8 +2555,8 @@ async def test_search_messages_no_hits_returns_action(mock_cache, mock_client, m
     from mcp_telegram.tools import SearchMessages, search_messages
 
     mock_client.iter_messages = MagicMock(return_value=_async_iter([]))
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: mock_cache)
 
     result = await search_messages(SearchMessages(dialog="Иван Петров", query="zzz"))
 
@@ -2520,8 +2570,8 @@ async def test_list_messages_invalid_navigation_returns_error(mock_cache, mock_c
     """list_messages with malformed navigation returns an action-oriented navigation error."""
     from mcp_telegram.tools import ListMessages, list_messages
 
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: mock_cache)
 
     result = await list_messages(ListMessages(dialog="Иван Петров", navigation="BADINVALID==garbage"))
     assert len(result) == 1
@@ -2543,8 +2593,10 @@ def mock_analytics_collector(monkeypatch):
     mock_collector = MagicMock()
     mock_collector.record_event = record_event
 
+    # Patch on _base (not on individual modules) because the telemetry
+    # decorator in _base.py imports _get_analytics_collector from its own module.
     monkeypatch.setattr(
-        "mcp_telegram.tools._get_analytics_collector",
+        "mcp_telegram.tools._base._get_analytics_collector",
         lambda: mock_collector
     )
     return events
@@ -2568,8 +2620,8 @@ async def test_list_dialogs_records_telemetry(mock_cache, mock_client, monkeypat
 
     dialogs = [_make_dialog("Alice", 1), _make_dialog("Bob", 2)]
     mock_client.iter_dialogs = MagicMock(return_value=_async_iter(dialogs))
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.discovery.get_entity_cache", lambda: mock_cache)
 
     await list_dialogs(ListDialogs())
 
@@ -2589,8 +2641,8 @@ async def test_list_messages_records_telemetry(mock_cache, mock_client, monkeypa
 
     msg = make_mock_message(id=10, text="Hello")
     mock_client.iter_messages = MagicMock(return_value=_async_iter([msg]))
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: mock_cache)
 
     await list_messages(ListMessages(dialog="Иван Петров"))
 
@@ -2616,8 +2668,8 @@ async def test_list_messages_records_navigation_token(
 
     msg = make_mock_message(id=10, text="Hello")
     mock_client.iter_messages = MagicMock(return_value=_async_iter([msg]))
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: mock_cache)
 
     navigation = encode_history_navigation(50, 101, direction="newest")
     await list_messages(ListMessages(dialog="Иван Петров", navigation=navigation))
@@ -2633,8 +2685,8 @@ async def test_list_messages_records_filter(mock_cache, mock_client, monkeypatch
 
     msg = make_mock_message(id=10, text="Hello")
     mock_client.iter_messages = MagicMock(return_value=_async_iter([msg]))
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: mock_cache)
 
     await list_messages(ListMessages(dialog="Иван Петров", sender="Иван Петров"))
 
@@ -2655,8 +2707,8 @@ async def test_search_messages_records_telemetry(mock_cache, mock_client, monkey
         yield hit
 
     mock_client.iter_messages = _fake_iter_messages
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: mock_cache)
 
     await search_messages(SearchMessages(dialog="Иван Петров", query="hit"))
 
@@ -2685,8 +2737,8 @@ async def test_search_messages_records_navigation_token(
         yield hit
 
     mock_client.iter_messages = _fake_iter_messages
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: mock_cache)
 
     navigation = encode_search_navigation(20, 101, "hit")
     await search_messages(SearchMessages(dialog="Иван Петров", query="hit", navigation=navigation))
@@ -2708,8 +2760,8 @@ async def test_get_my_account_records_telemetry(mock_cache, mock_client, monkeyp
     me.username = "testuser"
     mock_client.get_me = AsyncMock(return_value=me)
 
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.discovery.get_entity_cache", lambda: mock_cache)
 
     await get_my_account(GetMyAccount())
 
@@ -2735,8 +2787,8 @@ async def test_get_user_info_records_telemetry(mock_cache, mock_client, monkeypa
     mock_client.get_entity = AsyncMock(return_value=user)
     mock_client.return_value = MagicMock(chats=[])
 
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.user_info.get_entity_cache", lambda: mock_cache)
 
     await get_user_info(GetUserInfo(user="Иван Петров"))
 
@@ -2751,8 +2803,8 @@ async def test_tool_records_telemetry_on_error(mock_cache, mock_client, monkeypa
     from mcp_telegram.tools import ListDialogs, list_dialogs
 
     mock_client.iter_dialogs = MagicMock(side_effect=Exception("ConnectionError"))
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.discovery.get_entity_cache", lambda: mock_cache)
 
     with pytest.raises(Exception):
         await list_dialogs(ListDialogs())
@@ -2763,17 +2815,17 @@ async def test_tool_records_telemetry_on_error(mock_cache, mock_client, monkeypa
     assert event.error_type is not None
 
 
-async def test_get_usage_stats_not_recorded(mock_cache, mock_client, monkeypatch, mock_analytics_collector):
-    """GetUsageStats does NOT record telemetry (to avoid noise)."""
+async def test_get_usage_stats_records_telemetry(mock_cache, mock_client, monkeypatch, mock_analytics_collector):
+    """GetUsageStats records telemetry like other tools."""
     from mcp_telegram.tools import GetUsageStats, get_usage_stats
 
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.discovery.get_entity_cache", lambda: mock_cache)
 
     await get_usage_stats(GetUsageStats())
 
-    # No telemetry event should be recorded
-    assert len(mock_analytics_collector) == 0
+    assert len(mock_analytics_collector) == 1
+    assert mock_analytics_collector[0].tool_name == "GetUsageStats"
 
 
 # --- TOOL-06: GetUsageStats ---
@@ -2832,12 +2884,12 @@ async def test_get_usage_stats_under_100_tokens(mock_cache, mock_client, monkeyp
 
     # Mock xdg_state_home to return our tmp_path
     import mcp_telegram.tools
-    original_xdg = mcp_telegram.tools.xdg_state_home
-    mcp_telegram.tools.xdg_state_home = lambda: tmp_path
+    original_xdg = mcp_telegram.tools.stats.xdg_state_home
+    mcp_telegram.tools.stats.xdg_state_home = lambda: tmp_path
 
     try:
-        monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-        monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+        monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+        monkeypatch.setattr("mcp_telegram.tools.discovery.get_entity_cache", lambda: mock_cache)
 
         result = await get_usage_stats(GetUsageStats())
 
@@ -2848,7 +2900,7 @@ async def test_get_usage_stats_under_100_tokens(mock_cache, mock_client, monkeyp
         token_count = len(result[0].text.split())
         assert token_count < 100, f"Output has {token_count} tokens, should be <100"
     finally:
-        mcp_telegram.tools.xdg_state_home = original_xdg
+        mcp_telegram.tools.stats.xdg_state_home = original_xdg
 
 
 async def test_get_usage_stats_empty_db(mock_cache, mock_client, monkeypatch, tmp_path):
@@ -2861,12 +2913,12 @@ async def test_get_usage_stats_empty_db(mock_cache, mock_client, monkeypatch, tm
     db_dir.mkdir(exist_ok=True)
 
     # Mock xdg_state_home to return path with no analytics.db
-    original_xdg = mcp_telegram.tools.xdg_state_home
-    mcp_telegram.tools.xdg_state_home = lambda: tmp_path
+    original_xdg = mcp_telegram.tools.stats.xdg_state_home
+    mcp_telegram.tools.stats.xdg_state_home = lambda: tmp_path
 
     try:
-        monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-        monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+        monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+        monkeypatch.setattr("mcp_telegram.tools.discovery.get_entity_cache", lambda: mock_cache)
 
         result = await get_usage_stats(GetUsageStats())
 
@@ -2877,7 +2929,7 @@ async def test_get_usage_stats_empty_db(mock_cache, mock_client, monkeypatch, tm
         assert "Action:" in result[0].text
         assert "retry GetUsageStats" in result[0].text
     finally:
-        mcp_telegram.tools.xdg_state_home = original_xdg
+        mcp_telegram.tools.stats.xdg_state_home = original_xdg
 
 
 async def test_get_usage_stats_no_recent_data_returns_action(mock_cache, mock_client, monkeypatch, tmp_path):
@@ -2907,12 +2959,12 @@ async def test_get_usage_stats_no_recent_data_returns_action(mock_cache, mock_cl
     conn.commit()
     conn.close()
 
-    original_xdg = mcp_telegram.tools.xdg_state_home
-    mcp_telegram.tools.xdg_state_home = lambda: tmp_path
+    original_xdg = mcp_telegram.tools.stats.xdg_state_home
+    mcp_telegram.tools.stats.xdg_state_home = lambda: tmp_path
 
     try:
-        monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-        monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+        monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+        monkeypatch.setattr("mcp_telegram.tools.discovery.get_entity_cache", lambda: mock_cache)
 
         result = await get_usage_stats(GetUsageStats())
 
@@ -2921,7 +2973,7 @@ async def test_get_usage_stats_no_recent_data_returns_action(mock_cache, mock_cl
         assert "Action:" in result[0].text
         assert "retry GetUsageStats" in result[0].text
     finally:
-        mcp_telegram.tools.xdg_state_home = original_xdg
+        mcp_telegram.tools.stats.xdg_state_home = original_xdg
 
 
 # --- Wave 0 Test Stubs: Reverse Pagination (NAV-01) ---
@@ -2932,8 +2984,8 @@ async def test_list_messages_navigation_oldest(mock_cache, mock_client, monkeypa
     msg1 = make_mock_message(id=1, text="First message")
     msg2 = make_mock_message(id=2, text="Second message")
     mock_client.iter_messages = MagicMock(return_value=_async_iter([msg1, msg2]))
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: mock_cache)
 
     from mcp_telegram.tools import ListMessages, list_messages
     result = await list_messages(ListMessages(dialog="Иван Петров", navigation="oldest"))
@@ -2958,8 +3010,8 @@ async def test_list_messages_navigation_oldest_displays_messages(
     msg3 = make_mock_message(id=3, text="Newest", date=datetime(2024, 1, 3, 10, 0, tzinfo=timezone.utc))
 
     mock_client.iter_messages = MagicMock(return_value=_async_iter([msg1, msg2, msg3]))
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: mock_cache)
 
     from mcp_telegram.tools import ListMessages, list_messages
     result = await list_messages(ListMessages(dialog="Иван Петров", navigation="oldest"))
@@ -2981,8 +3033,8 @@ async def test_list_messages_oldest_navigation_round_trip(
     msg2 = make_mock_message(id=2, text="Message 2")
 
     mock_client.iter_messages = MagicMock(return_value=_async_iter([msg1, msg2]))
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: mock_cache)
 
     from mcp_telegram.tools import ListMessages, list_messages
     from mcp_telegram.pagination import decode_history_navigation
@@ -3041,8 +3093,8 @@ async def test_list_dialogs_archived_default(mock_cache, mock_client, monkeypatc
         _make_dialog("Archived Chat", 2, is_user=True, archived=True),
     ]
     mock_client.iter_dialogs = MagicMock(return_value=_async_iter(dialogs))
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.discovery.get_entity_cache", lambda: mock_cache)
 
     from mcp_telegram.tools import ListDialogs, list_dialogs
     result = await list_dialogs(ListDialogs())
@@ -3090,8 +3142,8 @@ async def test_list_dialogs_exclude_archived(mock_cache, mock_client, monkeypatc
         # Note: when exclude_archived=True, iter_dialogs(archived=False) only yields non-archived
     ]
     mock_client.iter_dialogs = MagicMock(return_value=_async_iter(dialogs))
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.discovery.get_entity_cache", lambda: mock_cache)
 
     from mcp_telegram.tools import ListDialogs, list_dialogs
     result = await list_dialogs(ListDialogs(exclude_archived=True))
@@ -3106,15 +3158,15 @@ async def test_list_dialogs_exclude_archived(mock_cache, mock_client, monkeypatc
 
 
 def test_tool_posture_covers_all_tool_args_subclasses() -> None:
-    """TOOL_POSTURE must classify every ToolArgs subclass."""
+    """TOOL_REGISTRY must classify every ToolArgs subclass."""
     import inspect
-    from mcp_telegram.tools import TOOL_POSTURE, ToolArgs
+    from mcp_telegram.tools import TOOL_REGISTRY, ToolArgs
     subclasses = {
         name for name, cls in inspect.getmembers(tools_module, inspect.isclass)
         if issubclass(cls, ToolArgs) and cls is not ToolArgs
     }
-    assert subclasses == set(TOOL_POSTURE.keys()), (
-        f"Mismatch: subclasses={subclasses}, TOOL_POSTURE keys={set(TOOL_POSTURE.keys())}"
+    assert subclasses == set(TOOL_REGISTRY.keys()), (
+        f"Mismatch: subclasses={subclasses}, TOOL_REGISTRY keys={set(TOOL_REGISTRY.keys())}"
     )
 
 
@@ -3159,14 +3211,14 @@ async def test_list_messages_direct_dialog_read_no_helper_required(tmp_db_path, 
             reply_map={},
             reaction_names_map={},
             topic_name_getter=None,
-            next_cursor=None,
+
             navigation=None,
         )
     )
 
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
-    monkeypatch.setattr("mcp_telegram.tools._execute_history_read_capability", capability)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: cache)
+    monkeypatch.setattr("mcp_telegram.capabilities.execute_history_read_capability", capability)
 
     # Call ListMessages with ONLY exact_dialog_id, no fuzzy dialog name
     result = await list_messages(ListMessages(exact_dialog_id=701))
@@ -3199,9 +3251,9 @@ async def test_search_messages_numeric_dialog_direct_search_no_helper_required(t
         )
     )
 
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: cache)
-    monkeypatch.setattr("mcp_telegram.tools._execute_search_messages_capability", capability)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: cache)
+    monkeypatch.setattr("mcp_telegram.capabilities.execute_search_messages_capability", capability)
 
     # Call SearchMessages with numeric dialog ID (no fuzzy lookup required)
     result = await search_messages(SearchMessages(dialog="701", query="test"))
@@ -3213,10 +3265,10 @@ async def test_search_messages_numeric_dialog_direct_search_no_helper_required(t
 
 def test_get_user_info_primary_tool_direct_user_lookup() -> None:
     """GetUserInfo is a primary tool supporting direct user lookup by name/ID."""
-    from mcp_telegram.tools import TOOL_POSTURE
+    from mcp_telegram.tools import TOOL_REGISTRY
 
     # Must be classified as primary
-    assert TOOL_POSTURE["GetUserInfo"] == "primary", "GetUserInfo should be primary for user-task workflows"
+    assert TOOL_REGISTRY["GetUserInfo"][1] == "primary", "GetUserInfo should be primary for user-task workflows"
 
     # Schema must expose user field for direct lookup
     get_user_info_schema = tools_module.tool_description(tools_module.GetUserInfo).inputSchema
@@ -3233,8 +3285,8 @@ async def test_list_unread_messages_empty_returns_action(mock_cache, mock_client
     from mcp_telegram.tools import ListUnreadMessages, list_unread_messages
 
     mock_client.iter_dialogs = MagicMock(return_value=_async_iter([]))
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.unread.get_entity_cache", lambda: mock_cache)
 
     result = await list_unread_messages(ListUnreadMessages())
 
@@ -3272,8 +3324,8 @@ async def test_list_unread_messages_personal_scope_filters_groups(mock_cache, mo
 
     mock_client.iter_dialogs = MagicMock(return_value=_async_iter(dialogs))
     mock_client.iter_messages = MagicMock(return_value=_async_iter([]))
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.unread.get_entity_cache", lambda: mock_cache)
 
     result = await list_unread_messages(ListUnreadMessages(scope="personal"))
 
@@ -3308,8 +3360,8 @@ async def test_list_unread_messages_mentions_surface_top(mock_cache, mock_client
 
     mock_client.iter_dialogs = MagicMock(return_value=_async_iter(dialogs))
     mock_client.iter_messages = MagicMock(return_value=_async_iter([]))
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.unread.get_entity_cache", lambda: mock_cache)
 
     result = await list_unread_messages(ListUnreadMessages())
 
@@ -3355,8 +3407,8 @@ async def test_list_unread_messages_budget_allocation(mock_cache, mock_client, m
 
     mock_client.iter_dialogs = MagicMock(return_value=_async_iter(dialogs))
     mock_client.iter_messages = MagicMock(side_effect=_iter_messages)
-    monkeypatch.setattr("mcp_telegram.tools.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.get_entity_cache", lambda: mock_cache)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.unread.get_entity_cache", lambda: mock_cache)
 
     result = await list_unread_messages(ListUnreadMessages(limit=50))
 
@@ -3367,18 +3419,67 @@ async def test_list_unread_messages_budget_allocation(mock_cache, mock_client, m
     assert "[и ещё" in text
 
 
-def test_list_unread_messages_registered_in_tool_posture() -> None:
-    """ListUnreadMessages is registered as primary tool."""
-    from mcp_telegram.tools import TOOL_POSTURE
+async def test_list_unread_messages_supergroup_shows_message_bodies(mock_cache, mock_client, monkeypatch):
+    """Supergroups (megagroups) with is_group=True AND is_channel=True must show message bodies.
 
-    assert "ListUnreadMessages" in TOOL_POSTURE
-    assert TOOL_POSTURE["ListUnreadMessages"] == "primary"
+    Regression test for beads-o13: Telethon reports is_channel=True for supergroups (megagroups),
+    causing them to be treated as broadcast channels (counts-only). Small supergroups should
+    show message bodies like regular groups.
+    """
+    from mcp_telegram.tools import ListUnreadMessages, list_unread_messages
+    from tests.test_formatter import MockMessage, MockSender
+
+    # Supergroup: is_group=True AND is_channel=True (Telethon megagroup behavior)
+    supergroup = MagicMock()
+    supergroup.is_user = False
+    supergroup.is_group = True
+    supergroup.is_channel = True  # Telethon sets this True for megagroups!
+    supergroup.date = datetime(2024, 1, 15, 10, 0, 0, tzinfo=timezone.utc)
+    supergroup.id = -1002234637650
+    supergroup.name = "Studio Humans"
+    supergroup.unread_count = 5
+    supergroup.unread_mentions_count = 1
+    supergroup.entity = MagicMock(
+        username=None,
+        bot=False,
+        participants_count=3,  # Small group
+    )
+    supergroup.dialog = MagicMock(read_inbox_max_id=100)
+
+    mock_client.iter_dialogs = MagicMock(return_value=_async_iter([supergroup]))
+
+    msg = MockMessage(
+        id=101,
+        date=datetime(2024, 1, 15, 10, 30, 0, tzinfo=timezone.utc),
+        message="Hello from supergroup",
+        sender=MockSender("Alice"),
+    )
+    mock_client.iter_messages = MagicMock(return_value=_async_iter([msg]))
+
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.unread.get_entity_cache", lambda: mock_cache)
+
+    result = await list_unread_messages(ListUnreadMessages(scope="all", limit=50))
+
+    from mcp.types import TextContent
+    assert len(result) == 1
+    assert isinstance(result[0], TextContent)
+    text = result[0].text
+
+    # Header must be present
+    assert "Studio Humans" in text
+    # Message body MUST be present (not counts-only)
+    assert "Hello from supergroup" in text, (
+        f"Supergroup message bodies missing — treated as broadcast channel.\nOutput:\n{text}"
+    )
 
 
 def test_list_unread_messages_registered_in_tool_registry() -> None:
-    """ListUnreadMessages is registered in TOOL_REGISTRY."""
+    """ListUnreadMessages is registered as primary in TOOL_REGISTRY."""
     from mcp_telegram.tools import TOOL_REGISTRY, ListUnreadMessages
 
     assert "ListUnreadMessages" in TOOL_REGISTRY
-    assert TOOL_REGISTRY["ListUnreadMessages"] == ListUnreadMessages
+    cls, posture = TOOL_REGISTRY["ListUnreadMessages"]
+    assert cls == ListUnreadMessages
+    assert posture == "primary"
 
