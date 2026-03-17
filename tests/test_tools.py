@@ -2299,8 +2299,12 @@ async def test_search_messages_reaction_names_fetched(mock_cache, mock_client, m
     monkeypatch.setattr("mcp_telegram.tools.reading.get_entity_cache", lambda: mock_cache)
 
     await search_messages(SearchMessages(dialog="Иван Петров", query="reacted"))
-    # GetMessageReactionsListRequest was invoked via client(...)
-    mock_client.assert_called()
+    # Verify GetMessageReactionsListRequest was invoked via client(...)
+    from telethon.tl.functions.messages import GetMessageReactionsListRequest
+    assert any(
+        isinstance(call.args[0], GetMessageReactionsListRequest)
+        for call in mock_client.call_args_list
+    ), "Expected client(...) to be called with GetMessageReactionsListRequest"
 
 
 # --- TOOL-07: SearchMessages navigation pagination ---
@@ -2761,7 +2765,6 @@ async def test_get_my_account_records_telemetry(mock_cache, mock_client, monkeyp
     mock_client.get_me = AsyncMock(return_value=me)
 
     monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.discovery.get_entity_cache", lambda: mock_cache)
 
     await get_my_account(GetMyAccount())
 
@@ -2820,7 +2823,6 @@ async def test_get_usage_stats_records_telemetry(mock_cache, mock_client, monkey
     from mcp_telegram.tools import GetUsageStats, get_usage_stats
 
     monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
-    monkeypatch.setattr("mcp_telegram.tools.discovery.get_entity_cache", lambda: mock_cache)
 
     await get_usage_stats(GetUsageStats())
 
@@ -2882,61 +2884,44 @@ async def test_get_usage_stats_under_100_tokens(mock_cache, mock_client, monkeyp
     conn.commit()
     conn.close()
 
-    # Mock xdg_state_home to return our tmp_path
-    import mcp_telegram.tools
-    original_xdg = mcp_telegram.tools.stats.xdg_state_home
-    mcp_telegram.tools.stats.xdg_state_home = lambda: tmp_path
+    monkeypatch.setattr("mcp_telegram.tools.stats.xdg_state_home", lambda: tmp_path)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
 
-    try:
-        monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
-        monkeypatch.setattr("mcp_telegram.tools.discovery.get_entity_cache", lambda: mock_cache)
+    result = await get_usage_stats(GetUsageStats())
 
-        result = await get_usage_stats(GetUsageStats())
+    assert len(result) == 1
+    from mcp.types import TextContent
+    assert isinstance(result[0], TextContent)
 
-        assert len(result) == 1
-        from mcp.types import TextContent
-        assert isinstance(result[0], TextContent)
-
-        token_count = len(result[0].text.split())
-        assert token_count < 100, f"Output has {token_count} tokens, should be <100"
-    finally:
-        mcp_telegram.tools.stats.xdg_state_home = original_xdg
+    token_count = len(result[0].text.split())
+    assert token_count < 100, f"Output has {token_count} tokens, should be <100"
 
 
 async def test_get_usage_stats_empty_db(mock_cache, mock_client, monkeypatch, tmp_path):
     """GetUsageStats returns helpful message on empty/missing DB."""
     from mcp_telegram.tools import GetUsageStats, get_usage_stats
-    import mcp_telegram.tools
 
     # Create mcp-telegram subdirectory (matches real structure)
     db_dir = tmp_path / "mcp-telegram"
     db_dir.mkdir(exist_ok=True)
 
-    # Mock xdg_state_home to return path with no analytics.db
-    original_xdg = mcp_telegram.tools.stats.xdg_state_home
-    mcp_telegram.tools.stats.xdg_state_home = lambda: tmp_path
+    monkeypatch.setattr("mcp_telegram.tools.stats.xdg_state_home", lambda: tmp_path)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
 
-    try:
-        monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
-        monkeypatch.setattr("mcp_telegram.tools.discovery.get_entity_cache", lambda: mock_cache)
+    result = await get_usage_stats(GetUsageStats())
 
-        result = await get_usage_stats(GetUsageStats())
-
-        assert len(result) == 1
-        from mcp.types import TextContent
-        assert isinstance(result[0], TextContent)
-        assert "Analytics database not yet created." in result[0].text
-        assert "Action:" in result[0].text
-        assert "retry GetUsageStats" in result[0].text
-    finally:
-        mcp_telegram.tools.stats.xdg_state_home = original_xdg
+    assert len(result) == 1
+    from mcp.types import TextContent
+    assert isinstance(result[0], TextContent)
+    assert "Analytics database not yet created." in result[0].text
+    assert "Action:" in result[0].text
+    assert "retry GetUsageStats" in result[0].text
 
 
 async def test_get_usage_stats_no_recent_data_returns_action(mock_cache, mock_client, monkeypatch, tmp_path):
     """GetUsageStats returns an action-oriented response when analytics DB exists but has no recent data."""
     from mcp_telegram.tools import GetUsageStats, get_usage_stats
     import sqlite3
-    import mcp_telegram.tools
 
     db_dir = tmp_path / "mcp-telegram"
     db_dir.mkdir(exist_ok=True)
@@ -2959,21 +2944,15 @@ async def test_get_usage_stats_no_recent_data_returns_action(mock_cache, mock_cl
     conn.commit()
     conn.close()
 
-    original_xdg = mcp_telegram.tools.stats.xdg_state_home
-    mcp_telegram.tools.stats.xdg_state_home = lambda: tmp_path
+    monkeypatch.setattr("mcp_telegram.tools.stats.xdg_state_home", lambda: tmp_path)
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
 
-    try:
-        monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
-        monkeypatch.setattr("mcp_telegram.tools.discovery.get_entity_cache", lambda: mock_cache)
+    result = await get_usage_stats(GetUsageStats())
 
-        result = await get_usage_stats(GetUsageStats())
-
-        assert len(result) == 1
-        assert "No usage data in the past 30 days." in result[0].text
-        assert "Action:" in result[0].text
-        assert "retry GetUsageStats" in result[0].text
-    finally:
-        mcp_telegram.tools.stats.xdg_state_home = original_xdg
+    assert len(result) == 1
+    assert "No usage data in the past 30 days." in result[0].text
+    assert "Action:" in result[0].text
+    assert "retry GetUsageStats" in result[0].text
 
 
 # --- Wave 0 Test Stubs: Reverse Pagination (NAV-01) ---
