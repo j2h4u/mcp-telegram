@@ -140,7 +140,7 @@ def test_entity_cache_tolerates_locked_wal_setup(monkeypatch: pytest.MonkeyPatch
     cache = EntityCache(tmp_path / "entity_cache.db")
 
     assert "PRAGMA busy_timeout=30000" in fake_conn.seen_statements
-    assert cache_module._DDL.strip() in {statement.strip() for statement in fake_conn.seen_statements}
+    assert cache_module._ENTITY_TABLE_DDL.strip() in {statement.strip() for statement in fake_conn.seen_statements}
     cache.close()
 
 
@@ -481,6 +481,44 @@ def test_reaction_cache_hit(tmp_db_path: Path) -> None:
     result_101_b = reaction_cache.get(message_id=101, dialog_id=50, ttl_seconds=600)
     assert result_101_a == result_101_b == reactions_101
 
+    cache.close()
+
+
+def test_get_name_group_then_user_ttl(tmp_db_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """get_name() tries GROUP_TTL first, falls back to USER_TTL."""
+    import mcp_telegram.cache as cache_module
+
+    cache = EntityCache(tmp_db_path)
+    cache.upsert(10, "user", "Alice", None)
+
+    # Advance time past GROUP_TTL (7 days) but within USER_TTL (30 days)
+    original_time = time.time
+    monkeypatch.setattr(
+        cache_module, "time",
+        type("_T", (), {"time": staticmethod(lambda: original_time() + 700_000)})(),
+    )
+
+    # GROUP_TTL miss, USER_TTL hit → returns name
+    assert cache.get_name(10) == "Alice"
+
+    # Advance past USER_TTL too
+    monkeypatch.setattr(
+        cache_module, "time",
+        type("_T", (), {"time": staticmethod(lambda: original_time() + 3_000_000)})(),
+    )
+    assert cache.get_name(10) is None
+
+    # Non-existent entity
+    assert cache.get_name(999) is None
+
+    cache.close()
+
+
+def test_get_name_empty_string_returns_none(tmp_db_path: Path) -> None:
+    """get_name() returns None for entities with empty name."""
+    cache = EntityCache(tmp_db_path)
+    cache.upsert(10, "user", "", None)
+    assert cache.get_name(10) is None
     cache.close()
 
 
