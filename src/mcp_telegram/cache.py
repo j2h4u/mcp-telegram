@@ -19,8 +19,6 @@ CREATE TABLE IF NOT EXISTS entities (
 );
 """
 
-_DDL = _ENTITY_TABLE_DDL
-
 _ENTITY_UPDATED_INDEX_DDL = """
 CREATE INDEX IF NOT EXISTS idx_entities_type_updated
 ON entities(type, updated_at)
@@ -325,6 +323,16 @@ class EntityCache:
             (now - user_ttl, now - group_ttl),
         ).fetchall()
         return {row[0]: row[1] for row in rows}
+
+    def get_name(self, entity_id: int) -> str | None:
+        """Return cached display name, trying group then user TTL."""
+        entity = self.get(entity_id, GROUP_TTL)
+        if entity is None:
+            entity = self.get(entity_id, USER_TTL)
+        if entity is None:
+            return None
+        name = entity.get("name")
+        return name if isinstance(name, str) and name else None
 
     def get_by_username(self, username: str) -> tuple[int, str] | None:
         """Return (entity_id, name) for entity with matching username, or None."""
