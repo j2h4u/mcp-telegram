@@ -12,15 +12,16 @@ from rich.table import Table
 
 from mcp_telegram import server
 from mcp_telegram.cache import TopicMetadataCache
-from mcp_telegram.tools import (
-    TOPIC_METADATA_TTL_SECONDS,
-    _fetch_forum_topics_page,
-    _load_dialog_topics,
-    _normalize_topic_metadata,
-    _refresh_topic_by_id,
-    create_client,
-    get_entity_cache,
+from mcp_telegram.forum_topics import (
+    fetch_forum_topics_page,
+    load_dialog_topics,
+    normalize_topic_metadata,
+    refresh_topic_by_id,
+    topic_row_text,
 )
+from mcp_telegram.models import TOPIC_METADATA_TTL_SECONDS
+from mcp_telegram.telegram import create_client
+from mcp_telegram.tools import get_entity_cache
 
 logging.basicConfig(level=logging.DEBUG)
 app = typer.Typer()
@@ -45,17 +46,6 @@ def _require_dialog_id(entity: object) -> int:
 def _topic_metadata_json(topic: dict[str, object] | None) -> str:
     """Return stable JSON for one topic metadata record."""
     return json.dumps(topic, ensure_ascii=False, sort_keys=True)
-
-
-def _topic_row_text(topic: dict[str, object]) -> str:
-    """Return one stable, greppable topic row for debug output."""
-    return (
-        f'topic_id={topic["topic_id"]} '
-        f'title="{topic["title"]}" '
-        f'top_message_id={topic["top_message_id"]} '
-        f'is_general={topic["is_general"]} '
-        f'is_deleted={topic["is_deleted"]}'
-    )
 
 
 async def _connect_debug_client() -> tuple[object, bool]:
@@ -108,7 +98,7 @@ async def debug_topic_catalog(
 ) -> None:
     """Inspect forum-topic catalog pages and the normalized cached view."""
     try:
-        client, connected_here = await _connect_debug_client()
+        client, owns_connection = await _connect_debug_client()
         try:
             entity = await client.get_entity(dialog)
             dialog_id = _require_dialog_id(entity)
@@ -123,7 +113,7 @@ async def debug_topic_catalog(
             page_number = 1
 
             while True:
-                page_topics, total_count = await _fetch_forum_topics_page(
+                page_topics, total_count = await fetch_forum_topics_page(
                     client,
                     entity=entity,
                     offset_date=offset_date,
@@ -148,7 +138,7 @@ async def debug_topic_catalog(
                     )
                 )
                 for raw_topic in page_topics:
-                    typer.echo(_topic_row_text(_normalize_topic_metadata(raw_topic)))
+                    typer.echo(topic_row_text(normalize_topic_metadata(raw_topic)))
 
                 last_topic = page_topics[-1]
                 next_offset_topic = getattr(last_topic, "id", None)
@@ -171,7 +161,7 @@ async def debug_topic_catalog(
                 if len(page_topics) < page_size:
                     break
 
-            topic_catalog = await _load_dialog_topics(
+            topic_catalog = await load_dialog_topics(
                 client,
                 entity=entity,
                 dialog_id=dialog_id,
@@ -188,7 +178,7 @@ async def debug_topic_catalog(
                 )
             )
         finally:
-            if connected_here:
+            if owns_connection:
                 await client.disconnect()
     except Exception as exc:
         typer.echo(f"Error: {exc}", err=True)
@@ -203,13 +193,13 @@ async def debug_topic_by_id(
 ) -> None:
     """Inspect cached topic metadata and one by-id refresh result."""
     try:
-        client, connected_here = await _connect_debug_client()
+        client, owns_connection = await _connect_debug_client()
         try:
             entity = await client.get_entity(dialog)
             dialog_id = _require_dialog_id(entity)
             cache = get_entity_cache()
             topic_cache = TopicMetadataCache(cache._conn)
-            topic_catalog = await _load_dialog_topics(
+            topic_catalog = await load_dialog_topics(
                 client,
                 entity=entity,
                 dialog_id=dialog_id,
@@ -217,7 +207,7 @@ async def debug_topic_by_id(
                 ttl_seconds=TOPIC_METADATA_TTL_SECONDS,
             )
             cached_topic = topic_catalog["metadata_by_id"].get(topic_id)
-            refreshed_topic = await _refresh_topic_by_id(
+            refreshed_topic = await refresh_topic_by_id(
                 client,
                 entity=entity,
                 dialog_id=dialog_id,
@@ -230,7 +220,7 @@ async def debug_topic_by_id(
             typer.echo(f"cached={_topic_metadata_json(cached_topic)}")
             typer.echo(f"refreshed={_topic_metadata_json(refreshed_topic)}")
         finally:
-            if connected_here:
+            if owns_connection:
                 await client.disconnect()
     except Exception as exc:
         typer.echo(f"Error: {exc}", err=True)
