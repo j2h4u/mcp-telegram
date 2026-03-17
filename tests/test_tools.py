@@ -2482,7 +2482,7 @@ async def test_get_user_info_fetch_error_returns_action(mock_cache, mock_client,
     result = await get_user_info(GetUserInfo(user="Иван Петров"))
 
     assert len(result) == 1
-    assert 'Could not fetch info for user "Иван Петров" (boom).' in result[0].text
+    assert 'Could not fetch info for user "Иван Петров" (RuntimeError).' in result[0].text
     assert "Action:" in result[0].text
     assert "Retry GetUserInfo later" in result[0].text
 

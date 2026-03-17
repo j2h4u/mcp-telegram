@@ -64,7 +64,8 @@ def _track_tool_telemetry(tool_name: str):
         @functools.wraps(fn)
         async def wrapper(args):
             logger.info("method[%s]", tool_name)
-            logger.debug("method[%s] args[%s]", tool_name, args)
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("method[%s] args[%s]", tool_name, args)
             t0 = time.monotonic()
             error_type = None
             tool_result: ToolResult | None = None

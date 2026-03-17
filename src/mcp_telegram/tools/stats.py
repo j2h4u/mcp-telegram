@@ -104,8 +104,6 @@ async def get_usage_stats(args: GetUsageStats) -> ToolResult:
 
         return ToolResult(content=_text_response(summary if summary else no_usage_data_text()))
 
-    except FileNotFoundError:
-        return ToolResult(content=_text_response(usage_stats_db_missing_text()))
     except sqlite3.OperationalError as exc:
         # Table doesn't exist or DB not initialized yet
         if "no such table" in str(exc):

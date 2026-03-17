@@ -65,7 +65,7 @@ async def get_user_info(args: GetUserInfo) -> ToolResult:
             ))
         except Exception as exc:
             logger.warning("get_user_info entity_id=%r failed: %s", entity_id, exc)
-            return ToolResult(content=_text_response(fetch_user_info_error_text(args.user, str(exc))))
+            return ToolResult(content=_text_response(fetch_user_info_error_text(args.user, type(exc).__name__)))
 
     name = " ".join(filter(None, [
         getattr(user, "first_name", None),
