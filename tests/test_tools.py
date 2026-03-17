@@ -2858,8 +2858,9 @@ async def test_get_usage_stats_under_100_tokens(mock_cache, mock_client, monkeyp
         )
     """)
 
-    # Insert sample events from the past 30 days
-    now = 1000000.0
+    # Insert sample events with recent timestamps (within the 30-day query window)
+    import time as _time
+    now = _time.time()
     for i in range(10):
         cursor.execute("""
             INSERT INTO telemetry_events
@@ -3288,6 +3289,7 @@ async def test_list_unread_messages_personal_scope_filters_groups(mock_cache, mo
         d.name = name
         d.unread_count = unread
         d.unread_mentions_count = 0
+        d.dialog = MagicMock(read_inbox_max_id=0)
         entity = MagicMock()
         entity.username = None
         entity.participants_count = participants_count
@@ -3329,6 +3331,7 @@ async def test_list_unread_messages_mentions_surface_top(mock_cache, mock_client
         d.name = name
         d.unread_count = unread
         d.unread_mentions_count = mentions
+        d.dialog = MagicMock(read_inbox_max_id=0)
         d.entity = MagicMock(username=None, participants_count=None)
         return d
 
@@ -3366,6 +3369,7 @@ async def test_list_unread_messages_budget_allocation(mock_cache, mock_client, m
         d.name = name
         d.unread_count = unread
         d.unread_mentions_count = 0
+        d.dialog = MagicMock(read_inbox_max_id=0)
         d.entity = MagicMock(username=None, participants_count=None)
         return d
 
@@ -3461,4 +3465,83 @@ def test_list_unread_messages_registered_in_tool_registry() -> None:
     cls, posture = TOOL_REGISTRY["ListUnreadMessages"]
     assert cls == ListUnreadMessages
     assert posture == "primary"
+
+
+# --- unread_chat_tier unit tests (M10) ---
+
+
+@pytest.mark.parametrize("mentions,category,expected_tier", [
+    (1, "user", 10),    # UNREAD_TIER_MENTION_DM
+    (1, "bot", 10),     # UNREAD_TIER_MENTION_DM
+    (1, "group", 20),   # UNREAD_TIER_MENTION_GROUP
+    (1, "channel", 20), # UNREAD_TIER_MENTION_GROUP
+    (0, "user", 30),    # UNREAD_TIER_HUMAN_DM
+    (0, "bot", 40),     # UNREAD_TIER_BOT_DM
+    (0, "channel", 70), # UNREAD_TIER_CHANNEL
+    (0, "group", 50),   # UNREAD_TIER_SMALL_GROUP
+])
+def test_unread_chat_tier(mentions, category, expected_tier):
+    """unread_chat_tier classifies all 7 priority tiers correctly."""
+    from mcp_telegram.budget import unread_chat_tier
+    assert unread_chat_tier({"unread_mentions_count": mentions, "category": category}) == expected_tier
+
+
+# --- GetUserInfo Channel/Chat classification (M11) ---
+
+
+async def test_get_user_info_classifies_common_chat_types(mock_cache, mock_client, monkeypatch):
+    """GetUserInfo correctly classifies Channel (supergroup) and Chat (group) in common chats."""
+    from mcp_telegram.tools import GetUserInfo, get_user_info
+    from telethon.tl.types import Channel, Chat
+
+    mock_client.get_entity = AsyncMock(
+        return_value=MagicMock(id=101, first_name="Иван", last_name="Петров", username="ivan")
+    )
+
+    supergroup = MagicMock(spec=Channel)
+    supergroup.megagroup = True
+    supergroup.title = "Dev Group"
+    supergroup.id = 500
+
+    basic_group = MagicMock(spec=Chat)
+    basic_group.title = "Old Group"
+    basic_group.id = 600
+
+    fake_result = MagicMock(chats=[supergroup, basic_group])
+    mock_client.return_value = fake_result
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.user_info.get_entity_cache", lambda: mock_cache)
+    monkeypatch.setattr("mcp_telegram.tools.user_info.get_peer_id", lambda chat: chat.id)
+
+    result = await get_user_info(GetUserInfo(user="Иван Петров"))
+
+    text = result[0].text
+    assert "type=supergroup" in text
+    assert "type=group" in text
+
+
+# --- Limit bounds validation (L1) ---
+
+
+@pytest.mark.parametrize("limit,cls_name", [
+    (0, "ListMessages"),
+    (501, "ListMessages"),
+    (-1, "ListMessages"),
+    (0, "SearchMessages"),
+    (201, "SearchMessages"),
+    (-1, "SearchMessages"),
+])
+def test_limit_out_of_bounds_rejected(limit, cls_name):
+    """ListMessages and SearchMessages reject out-of-bounds limit values."""
+    from mcp_telegram.tools import ListMessages, SearchMessages
+    from pydantic import ValidationError
+    cls = {"ListMessages": ListMessages, "SearchMessages": SearchMessages}[cls_name]
+    kwargs = {"limit": limit}
+    if cls_name == "ListMessages":
+        kwargs["dialog"] = "test"
+    else:
+        kwargs["dialog"] = "test"
+        kwargs["query"] = "test"
+    with pytest.raises(ValidationError):
+        cls(**kwargs)
 

@@ -52,7 +52,7 @@ class ListMessages(ToolArgs):
             "Bypasses fuzzy dialog resolution. Mutually exclusive with dialog."
         ),
     )
-    limit: int = 50
+    limit: int = Field(default=50, ge=1, le=500)
     navigation: str | None = Field(
         default=None,
         max_length=2000,
@@ -179,7 +179,7 @@ class SearchMessages(ToolArgs):
         )
     )
     query: str = Field(max_length=500)
-    limit: int = 20
+    limit: int = Field(default=20, ge=1, le=200)
     navigation: str | None = Field(
         default=None,
         max_length=2000,

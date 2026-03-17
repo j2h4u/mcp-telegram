@@ -484,8 +484,8 @@ def test_reaction_cache_hit(tmp_db_path: Path) -> None:
     cache.close()
 
 
-def test_get_name_group_then_user_ttl(tmp_db_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """get_name() tries GROUP_TTL first, falls back to USER_TTL."""
+def test_get_name_falls_back_to_user_ttl(tmp_db_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """get_name() falls back from GROUP_TTL to USER_TTL when the short TTL expires."""
     import mcp_telegram.cache as cache_module
 
     cache = EntityCache(tmp_db_path)
@@ -498,19 +498,31 @@ def test_get_name_group_then_user_ttl(tmp_db_path: Path, monkeypatch: pytest.Mon
         type("_T", (), {"time": staticmethod(lambda: original_time() + 700_000)})(),
     )
 
-    # GROUP_TTL miss, USER_TTL hit → returns name
     assert cache.get_name(10) == "Alice"
+    cache.close()
 
-    # Advance past USER_TTL too
+
+def test_get_name_returns_none_when_both_ttls_expired(tmp_db_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """get_name() returns None when both GROUP_TTL and USER_TTL have expired."""
+    import mcp_telegram.cache as cache_module
+
+    cache = EntityCache(tmp_db_path)
+    cache.upsert(10, "user", "Alice", None)
+
+    original_time = time.time
     monkeypatch.setattr(
         cache_module, "time",
         type("_T", (), {"time": staticmethod(lambda: original_time() + 3_000_000)})(),
     )
+
     assert cache.get_name(10) is None
+    cache.close()
 
-    # Non-existent entity
+
+def test_get_name_returns_none_for_missing_entity(tmp_db_path: Path) -> None:
+    """get_name() returns None for an entity that was never cached."""
+    cache = EntityCache(tmp_db_path)
     assert cache.get_name(999) is None
-
     cache.close()
 
 
