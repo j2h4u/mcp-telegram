@@ -106,19 +106,20 @@ def _entity_columns_ready(conn: sqlite3.Connection) -> bool:
     return set(_ENTITY_REQUIRED_COLUMNS).issubset(existing_columns)
 
 
-def _apply_entity_column_upgrades(conn: sqlite3.Connection) -> None:
-    rows = conn.execute("PRAGMA table_info(entities)").fetchall()
-    existing_columns = {str(row[1]) for row in rows}
-    for column_name, column_type in _ENTITY_REQUIRED_COLUMNS.items():
-        if column_name in existing_columns:
+def _apply_column_upgrades(
+    conn: sqlite3.Connection,
+    table_name: str,
+    required_columns: dict[str, str],
+) -> None:
+    """Add missing columns to an existing table. Raises ValueError on unexpected column."""
+    rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    existing = {str(row[1]) for row in rows}
+    for col_name, col_type in required_columns.items():
+        if col_name in existing:
             continue
-        assert (
-            column_name in _ENTITY_REQUIRED_COLUMNS
-            and _ENTITY_REQUIRED_COLUMNS[column_name] == column_type
-        ), f"Unexpected column: {column_name} {column_type}"
-        conn.execute(
-            f"ALTER TABLE entities ADD COLUMN {column_name} {column_type}"
-        )
+        if col_name not in required_columns or required_columns[col_name] != col_type:
+            raise ValueError(f"Unexpected column: {col_name} {col_type}")
+        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_type}")
 
 
 def _topic_columns_ready(conn: sqlite3.Connection) -> bool:
@@ -155,18 +156,7 @@ def _database_bootstrap_required(conn: sqlite3.Connection) -> bool:
 
 
 def _apply_topic_column_upgrades(conn: sqlite3.Connection) -> None:
-    rows = conn.execute("PRAGMA table_info(topic_metadata)").fetchall()
-    existing_columns = {str(row[1]) for row in rows}
-    for column_name, column_type in _TOPIC_REQUIRED_COLUMNS.items():
-        if column_name in existing_columns:
-            continue
-        assert (
-            column_name in _TOPIC_REQUIRED_COLUMNS
-            and _TOPIC_REQUIRED_COLUMNS[column_name] == column_type
-        ), f"Unexpected column: {column_name} {column_type}"
-        conn.execute(
-            f"ALTER TABLE topic_metadata ADD COLUMN {column_name} {column_type}"
-        )
+    _apply_column_upgrades(conn, "topic_metadata", _TOPIC_REQUIRED_COLUMNS)
 
 
 def _bootstrap_cache_schema(conn: sqlite3.Connection) -> None:
@@ -178,7 +168,7 @@ def _bootstrap_cache_schema(conn: sqlite3.Connection) -> None:
             raise
 
     conn.execute(_ENTITY_TABLE_DDL)
-    _apply_entity_column_upgrades(conn)
+    _apply_column_upgrades(conn, "entities", _ENTITY_REQUIRED_COLUMNS)
     conn.execute(_ENTITY_UPDATED_INDEX_DDL)
     conn.execute(_ENTITY_USERNAME_INDEX_DDL)
     conn.execute(_REACTION_TABLE_DDL)
@@ -421,18 +411,7 @@ class TopicMetadataCache:
 
     def _ensure_columns(self, required_columns: dict[str, str]) -> None:
         """Add missing topic_metadata columns for forward-compatible cache upgrades."""
-        rows = self._conn.execute("PRAGMA table_info(topic_metadata)").fetchall()
-        existing_columns = {str(row[1]) for row in rows}
-        for column_name, column_type in required_columns.items():
-            if column_name in existing_columns:
-                continue
-            assert (
-                column_name in _TOPIC_REQUIRED_COLUMNS
-                and _TOPIC_REQUIRED_COLUMNS[column_name] == column_type
-            ), f"Unexpected column: {column_name} {column_type}"
-            self._conn.execute(
-                f"ALTER TABLE topic_metadata ADD COLUMN {column_name} {column_type}"
-            )
+        _apply_column_upgrades(self._conn, "topic_metadata", required_columns)
         self._conn.commit()
 
     def get_dialog_topics(
