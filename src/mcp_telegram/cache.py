@@ -315,7 +315,12 @@ class EntityCache:
         return {row[0]: row[1] for row in rows}
 
     def get_name(self, entity_id: int) -> str | None:
-        """Return cached display name, trying group then user TTL."""
+        """Return cached display name, trying GROUP_TTL (7d) then USER_TTL (30d).
+
+        Groups change names more often so the short TTL is tried first.
+        Falls back to the longer user TTL, which keeps user entries fresh longer.
+        Returns None if both TTLs expired or entity not found, or if name is empty.
+        """
         entity = self.get(entity_id, GROUP_TTL)
         if entity is None:
             entity = self.get(entity_id, USER_TTL)

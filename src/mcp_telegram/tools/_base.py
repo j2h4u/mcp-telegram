@@ -100,6 +100,7 @@ def _track_tool_telemetry(tool_name: str):
 async def tool_runner(
     args,  # noqa: ANN001
 ) -> t.Sequence[TextContent | ImageContent | EmbeddedResource]:
+    """Dispatch a ToolArgs instance to its registered async handler."""
     raise NotImplementedError(f"Unsupported type: {type(args)}")
 
 
@@ -112,6 +113,12 @@ TOOL_REGISTRY: dict[str, tuple[type[ToolArgs], str]] = {}
 
 def mcp_tool(posture: str = "primary"):
     """Register runner with singledispatch + telemetry + tool registry.
+
+    ``posture`` is a free-form label prepended to the tool description so the
+    LLM can gauge how central the tool is.  Current values used in the codebase:
+
+    * ``"primary"`` — core tools the LLM should reach for first.
+    * ``"secondary/helper"`` — supporting tools (e.g. analytics, diagnostics).
 
     Replaces the 3-step manual registration:
       1. @tool_runner.register
@@ -139,6 +146,7 @@ def mcp_tool(posture: str = "primary"):
 
 
 def tool_description(args: type[ToolArgs]) -> Tool:
+    """Build an MCP Tool descriptor from a ToolArgs subclass."""
     schema = _sanitize_tool_schema(args.model_json_schema())
     entry = TOOL_REGISTRY.get(args.__name__)
     posture = entry[1] if entry else ""
@@ -186,6 +194,7 @@ def _sanitize_tool_schema(value: t.Any) -> t.Any:
 
 
 def tool_args(tool: Tool, *args, **kwargs) -> ToolArgs:  # noqa: ANN002, ANN003
+    """Instantiate the ToolArgs subclass registered for *tool*."""
     entry = TOOL_REGISTRY.get(tool.name)
     if entry is None:
         raise ValueError(f"Unknown tool: {tool.name}")

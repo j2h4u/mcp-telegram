@@ -34,10 +34,12 @@ class _UnreadDialogEntry:
 
 
 class ListUnreadMessages(ToolArgs):
-    """Fetch unread messages from personal chats and small groups, sorted by mentions then recency.
+    """Fetch unread messages from personal chats and small groups, prioritized by tier.
 
-    Surfaces @mentions at the top, groups DMs above group chats, and intelligently allocates
-    a per-chat message budget to prevent flooding when many chats have unread messages.
+    Priority tiers (lower = higher priority): @mentions in DMs, @mentions in groups,
+    human DMs, bot DMs, small groups, large groups, channels.
+    Within each tier, chats are sorted by recency (newest first).
+    Per-chat message budget is allocated proportionally to prevent flooding.
 
     Use scope="personal" (default) to see only DMs and small groups (≤ group_size_threshold members).
     Use scope="all" to include large groups and channels (shows counts only, no messages).
