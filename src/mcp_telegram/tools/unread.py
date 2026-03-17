@@ -103,7 +103,7 @@ async def list_unread_messages(args: ListUnreadMessages) -> ToolResult:
             # Cache the dialog
             try:
                 cache_dialog_entry(cache, dialog)
-            except sqlite3.OperationalError as cache_exc:
+            except sqlite3.Error as cache_exc:
                 logger.warning("dialog_cache_update_failed dialog_id=%r error=%s", chat_id, cache_exc)
 
             # Collect unread chat info
@@ -168,7 +168,7 @@ async def list_unread_messages(args: ListUnreadMessages) -> ToolResult:
                 total_messages_shown += len(chat_data.messages)
 
             except Exception as exc:
-                logger.warning("Failed to fetch unread messages for chat %r: %s(%s)", entry.chat_id, type(exc).__name__, exc)
+                logger.warning("Failed to fetch unread messages for chat %r: %s(%s)", entry.chat_id, type(exc).__name__, exc, exc_info=True)
 
             chats_data.append(chat_data)
 
