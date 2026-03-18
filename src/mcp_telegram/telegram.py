@@ -59,6 +59,12 @@ def create_client(
     api_hash: str | None = None,
     session_name: str = "mcp_telegram_session",
 ) -> TelegramClient:
+    """Return a cached TelegramClient singleton for the given credentials.
+
+    ``@cache`` means the same instance is returned for identical
+    ``(api_id, api_hash, session_name)`` arguments within the process lifetime.
+    Callers should use ``connected_client()`` for connection lifecycle management.
+    """
     if api_id is not None and api_hash is not None:
         config = TelegramSettings(api_id=api_id, api_hash=api_hash)
     else:

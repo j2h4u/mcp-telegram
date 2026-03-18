@@ -13,6 +13,8 @@ HistoryDirection = Literal["newest", "oldest"]
 
 @dataclass(frozen=True)
 class NavigationToken:
+    """Base64-encoded JSON cursor shared by history and search navigation."""
+
     kind: NavigationKind
     value: int
     dialog_id: int
@@ -95,6 +97,7 @@ def encode_history_navigation(
     topic_id: int | None = None,
     direction: HistoryDirection = "newest",
 ) -> str:
+    """Encode a history continuation cursor as a base64 token."""
     return encode_navigation_token(
         NavigationToken(
             kind="history",
@@ -113,6 +116,7 @@ def decode_history_navigation(
     expected_topic_id: int | None = None,
     expected_direction: HistoryDirection | None = None,
 ) -> int:
+    """Decode a history cursor, raising ``ValueError`` on dialog/topic/direction mismatch."""
     navigation = decode_navigation_token(token)
     if navigation.kind != "history":
         raise ValueError(f"Navigation token is for {navigation.kind}, not history")
@@ -130,6 +134,7 @@ def decode_history_navigation(
 
 
 def encode_search_navigation(offset: int, dialog_id: int, query: str) -> str:
+    """Encode a search continuation cursor as a base64 token."""
     return encode_navigation_token(
         NavigationToken(
             kind="search",
@@ -141,6 +146,7 @@ def encode_search_navigation(offset: int, dialog_id: int, query: str) -> str:
 
 
 def decode_search_navigation(token: str, *, expected_dialog_id: int, expected_query: str) -> int:
+    """Decode a search cursor, raising ``ValueError`` on dialog/query mismatch."""
     navigation = decode_navigation_token(token)
     if navigation.kind != "search":
         raise ValueError(f"Navigation token is for {navigation.kind}, not search")
@@ -153,32 +159,3 @@ def decode_search_navigation(token: str, *, expected_dialog_id: int, expected_qu
     return navigation.value
 
 
-def encode_cursor(message_id: int, dialog_id: int) -> str:
-    """Encode a message_id and dialog_id into an opaque cursor token."""
-    return _encode_payload({"id": message_id, "dialog_id": dialog_id})
-
-
-def decode_cursor(token: str, expected_dialog_id: int) -> int:
-    """Decode a cursor token and return the message_id.
-
-    Raises ValueError if the token's dialog_id does not match expected_dialog_id.
-    """
-    data = _decode_payload(token)
-    if "kind" in data:
-        return decode_history_navigation(
-            token,
-            expected_dialog_id=expected_dialog_id,
-            expected_topic_id=None,
-        )
-
-    message_id = data.get("id")
-    if not isinstance(message_id, int):
-        raise ValueError("Invalid cursor token: id must be an integer")
-
-    dialog_id = data.get("dialog_id")
-    if not isinstance(dialog_id, int):
-        raise ValueError("Invalid cursor token: dialog_id must be an integer")
-    if dialog_id != expected_dialog_id:
-        msg = f"Cursor belongs to dialog {dialog_id}, not {expected_dialog_id}"
-        raise ValueError(msg)
-    return message_id

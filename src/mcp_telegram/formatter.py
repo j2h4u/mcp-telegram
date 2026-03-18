@@ -57,9 +57,15 @@ def format_messages(
     messages:
         Telethon Message objects, newest-first (as returned by iter_messages).
     reply_map:
-        message_id -> Message mapping for reply annotation (unused in Phase 1).
+        message_id → Message mapping for reply annotation lines.
+    reaction_names_map:
+        message_id → {emoji: [reactor_names]} for inline reaction display.
     tz:
         Timezone for display. Defaults to UTC.
+    topic_name_getter:
+        Callable(msg) → topic title or None; labels cross-topic forum pages.
+    line_prefix_getter:
+        Callable(msg) → prefix string or None; prepended to each message line.
 
     Returns empty string for empty input.
     """
