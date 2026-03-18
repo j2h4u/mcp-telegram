@@ -36,22 +36,24 @@ The Model Context Protocol (MCP) is a system that lets AI apps, like Claude Desk
 
 ## What does this server do?
 
-As of not, the server provides read-only access to the Telegram API.
+The server provides read-only access to the Telegram API:
 
-- [x] Get the list of dialogs (chats, channels, groups)
-- [x] Get the list of (unread) messages in the given dialog
-- [ ] Mark chanel as read
-- [ ] Retrieve messages by date and time
+- [x] List dialogs (chats, channels, groups) with unread counts
+- [x] Read messages in a dialog (with pagination, sender filter, unread filter)
+- [x] Search messages by text query
+- [x] List and navigate forum topics
+- [x] Fetch unread messages across chats, prioritized by tier
+- [x] Look up users by name (fuzzy match + common chats)
+- [x] Get account info and usage statistics
+- [ ] Mark channel as read
 - [ ] Download media files
-- [ ] Get the list of contacts
 - [ ] Draft a message
-- ...
 
 ## Practical use cases
 
 - [x] Create a summary of the unread messages
+- [x] Find discussions on a given topic, summarize them and provide a list of links
 - [ ] Find contacts with upcoming birthdays and schedule a greeting
-- [ ] Find discussions on a given topic, summarize them and provide a list of links
 
 ## Prerequisites
 
@@ -91,7 +93,7 @@ Before you can use the server, you need to connect to the Telegram API.
 
 ### Claude Desktop Configuration
 
-Configure Claude Desktop to recognize the Exa MCP server.
+Configure Claude Desktop to recognize the Telegram MCP server.
 
 1. Open the Claude Desktop configuration file:
    - in MacOS, the configuration file is located at `~/Library/Application Support/Claude/claude_desktop_config.json`
@@ -106,11 +108,10 @@ Configure Claude Desktop to recognize the Exa MCP server.
     {
       "mcpServers": {
         "mcp-telegram": {
-            "command": "mcp-server",
-            "env": {
-              "TELEGRAM_API_ID": "<your-api-id>",
-              "TELEGRAM_API_HASH": "<your-api-hash>",
-            },
+          "command": "mcp-telegram",
+          "env": {
+            "TELEGRAM_API_ID": "<your-api-id>",
+            "TELEGRAM_API_HASH": "<your-api-hash>"
           }
         }
       }
@@ -143,31 +144,28 @@ Before working with Telegram’s API, you need to get your own API ID and hash:
    uv run mcp-telegram --help
    ```
 
-Tools can be added to the `src/mcp_telegram/tools.py` file.
+Tools live in the `src/mcp_telegram/tools/` package, split by domain.
 
 How to add a new tool:
 
-1. Create a new class that inherits from ToolArgs
+1. Create a ToolArgs subclass and a runner in the appropriate domain module (or create a new one):
 
    ```python
+   from ._base import ToolArgs, ToolResult, _text_response, mcp_tool
+
    class NewTool(ToolArgs):
        """Description of the new tool."""
-       pass
+       field: str
+
+   @mcp_tool("primary")
+   async def new_tool(args: NewTool) -> ToolResult:
+       return ToolResult(content=_text_response("result"))
    ```
 
-   Attributes of the class will be used as arguments for the tool.
-   The class docstring will be used as the tool description.
+   The class docstring becomes the tool description. `@mcp_tool` handles registration,
+   telemetry, and tool registry in one decorator.
 
-2. Implement the tool_runner function for the new class
-
-   ```python
-   @tool_runner.register
-   async def new_tool(args: NewTool) -> t.Sequence[TextContent | ImageContent | EmbeddedResource]:
-       pass
-   ```
-
-   The function should return a sequence of TextContent, ImageContent or EmbeddedResource.
-   The function should be async and accept a single argument of the new class.
+2. Import the module in `src/mcp_telegram/tools/__init__.py` so it registers at import time.
 
 3. Done! Restart the client and the new tool should be available.
 
