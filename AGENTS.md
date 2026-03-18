@@ -2,36 +2,49 @@
 
 ## Canon
 
-- Trust source, tests, and live runtime over `.planning/*`. Some planning notes are stale.
+- Trust source, tests, and live runtime over `.planning/*`.
 
 ## Brownfield Map
 
-- `src/mcp_telegram/tools.py`: main surface; most behavior lives here.
-- `src/mcp_telegram/server.py`: MCP stdio server; reflects `ToolArgs` subclasses.
+- `src/mcp_telegram/tools/`: tool package — `_base.py` (ToolArgs, ToolResult, mcp_tool, TOOL_REGISTRY, singledispatch, telemetry), `discovery.py`, `reading.py`, `unread.py`, `user_info.py`, `stats.py`.
+- `src/mcp_telegram/server.py`: MCP stdio server; iterates `TOOL_REGISTRY` for tool listing.
 - `src/mcp_telegram/telegram.py`: Telethon client factory and auth flows.
 - `src/mcp_telegram/cache.py`: SQLite caches for entities, reactions, topics.
-- `src/mcp_telegram/analytics.py`: local telemetry into `analytics.db`.
-- `src/mcp_telegram/resolver.py`: fuzzy resolution.
+- `src/mcp_telegram/capabilities.py`: re-export shim for split capability modules.
+- `src/mcp_telegram/capability_history.py`: history read orchestration.
+- `src/mcp_telegram/capability_search.py`: search orchestration.
+- `src/mcp_telegram/capability_topics.py`: topic listing orchestration.
+- `src/mcp_telegram/models.py`: shared dataclasses, TypedDicts, type aliases.
+- `src/mcp_telegram/budget.py`: unread tier classification, budget allocation.
+- `src/mcp_telegram/dialog_target.py`: dialog resolution orchestration.
+- `src/mcp_telegram/forum_topics.py`: topic catalog loading, topic resolution.
+- `src/mcp_telegram/message_ops.py`: message fetch helpers, reply/reaction maps.
+- `src/mcp_telegram/errors.py`: action-oriented error text functions.
+- `src/mcp_telegram/resolver.py`: fuzzy resolution (Cyrillic + transliteration).
 - `src/mcp_telegram/formatter.py`: message formatting.
 - `src/mcp_telegram/pagination.py`: cursor encode/decode.
+- `src/mcp_telegram/analytics.py`: local telemetry into `analytics.db`.
 - `cli.py`: local debug entrypoint.
 
 ## Current Tools
 
-- `ListDialogs`
-- `ListMessages`
-- `SearchMessages`
-- `GetMyAccount`
-- `GetUserInfo`
-- `GetUsageStats`
+- `ListDialogs` — list dialogs (chats, channels, groups)
+- `ListMessages` — read messages in one dialog (with pagination, topic, sender, unread filters)
+- `SearchMessages` — search messages in a dialog by text query
+- `ListTopics` — list forum topics in a dialog
+- `ListUnreadMessages` — fetch unread messages across chats, prioritized by tier
+- `GetMyAccount` — get current authenticated user info
+- `GetUserInfo` — look up a user by name (fuzzy match + common chats)
+- `GetUsageStats` — get usage statistics from telemetry (last 30 days)
 
 ## Tool Pattern
 
-- Add tools in `src/mcp_telegram/tools.py`.
+- Add tools in `src/mcp_telegram/tools/` (pick the appropriate domain module, or create a new one).
 - Normal pattern:
   - `class NewTool(ToolArgs): ...`
-  - `@tool_runner.register async def new_tool(args: NewTool): ...`
-- Do not wire new tools in `server.py`; discovery is reflection-based.
+  - `@mcp_tool("primary") async def new_tool(args: NewTool) -> ToolResult: ...`
+- Import the module in `src/mcp_telegram/tools/__init__.py` so it registers at import time.
+- Do not wire new tools in `server.py`; discovery iterates `TOOL_REGISTRY`.
 
 ## State
 
