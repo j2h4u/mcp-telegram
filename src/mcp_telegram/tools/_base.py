@@ -250,6 +250,10 @@ async def _resolve_dialog(cache: EntityCache, query: str) -> Resolved | Resolved
 def verify_tool_registry() -> None:
     """Startup check: every registry entry has a matching class name, runner, and telemetry decorator.
 
+    Raises ``AssertionError`` on mismatch — called at module load time in
+    ``server.py`` without a catch, so failures crash the process immediately.
+    Note: silently skipped under ``python -O`` (assertions disabled).
+
     The expected decorator stack is @tool_runner.register (outer) then @_track_tool_telemetry (inner).
     singledispatch sees the original type annotation via __wrapped__ on the telemetry wrapper.
     """

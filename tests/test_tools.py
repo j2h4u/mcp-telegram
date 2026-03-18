@@ -3272,7 +3272,7 @@ async def test_list_unread_messages_empty_returns_action(mock_cache, mock_client
 
     assert len(result) == 1
     text = result[0].text
-    assert "Нет непрочитанных сообщений" in text
+    assert "No unread messages" in text
 
 
 async def test_list_unread_messages_personal_scope_filters_groups(mock_cache, mock_client, monkeypatch):
