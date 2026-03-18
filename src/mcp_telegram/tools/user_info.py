@@ -3,9 +3,9 @@ from __future__ import annotations
 import logging
 
 from pydantic import Field
-from telethon.tl.functions.messages import GetCommonChatsRequest
-from telethon.tl.types import Channel, Chat
-from telethon.utils import get_peer_id
+from telethon.tl.functions.messages import GetCommonChatsRequest  # type: ignore[import-untyped]
+from telethon.tl.types import Channel, Chat  # type: ignore[import-untyped]
+from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
 from ..cache import GROUP_TTL, USER_TTL
 from ..errors import (

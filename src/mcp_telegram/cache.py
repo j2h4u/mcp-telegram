@@ -5,6 +5,10 @@ import json
 import sqlite3
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING, cast
+
+if TYPE_CHECKING:
+    from .models import TopicMetadata
 
 USER_TTL: int = 2_592_000   # 30 days
 GROUP_TTL: int = 604_800    # 7 days
@@ -449,7 +453,7 @@ class TopicMetadataCache:
         ttl_seconds: int,
         *,
         include_deleted: bool = False,
-    ) -> list[dict[str, int | str | bool | None]] | None:
+    ) -> list[TopicMetadata] | None:
         """Return fresh topic metadata for one dialog or None on cache miss."""
         now = int(time.time())
         rows = self._conn.execute(
@@ -477,7 +481,7 @@ class TopicMetadataCache:
         ttl_seconds: int,
         *,
         allow_stale: bool = False,
-    ) -> dict[str, int | str | bool | None] | None:
+    ) -> TopicMetadata | None:
         """Return one fresh topic record or None on cache miss/expiry."""
         row = self._conn.execute(
             """SELECT topic_id, title, top_message_id, is_general, is_deleted,
@@ -498,7 +502,7 @@ class TopicMetadataCache:
     def upsert_topics(
         self,
         dialog_id: int,
-        topics: list[dict[str, int | str | bool | None]],
+        topics: list[TopicMetadata],
     ) -> None:
         """Insert or replace topic metadata rows for a single dialog."""
         now = int(time.time())
@@ -558,10 +562,10 @@ class TopicMetadataCache:
     @staticmethod
     def _row_to_topic(
         row: tuple[int, str, int | None, int, int, str | None, int | None],
-    ) -> dict[str, int | str | bool | None]:
+    ) -> TopicMetadata:
         """Convert one SQLite row into the canonical topic metadata shape."""
         topic_id, title, top_message_id, is_general, is_deleted, inaccessible_error, inaccessible_at = row
-        topic = {
+        topic: dict[str, object] = {
             "topic_id": topic_id,
             "title": title,
             "top_message_id": top_message_id,
@@ -572,4 +576,4 @@ class TopicMetadataCache:
             topic["inaccessible_error"] = inaccessible_error
         if inaccessible_at is not None:
             topic["inaccessible_at"] = inaccessible_at
-        return topic
+        return cast("TopicMetadata", topic)

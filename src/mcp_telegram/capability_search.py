@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from telethon import TelegramClient  # type: ignore[import-untyped]
+
 from .cache import EntityCache
 from .dialog_target import resolve_dialog_target
 from .errors import invalid_navigation_text
@@ -22,7 +27,7 @@ from .pagination import decode_search_navigation, encode_search_navigation
 
 
 async def execute_search_messages_capability(
-    client: object,
+    client: TelegramClient,
     *,
     cache: EntityCache,
     dialog_query: str | None,

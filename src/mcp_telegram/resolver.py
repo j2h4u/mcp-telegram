@@ -287,7 +287,7 @@ async def _resolve_by_username(
     try:
         async with client_factory() as client:
             entity = await client.get_entity(f"@{username}")
-            entity_id = getattr(entity, "id", None)
+            entity_id = getattr(entity, "id", None)  # type: ignore[assignment]
             if entity_id is None:
                 return NotFound(query=f"@{username}")
 
@@ -296,7 +296,7 @@ async def _resolve_by_username(
             title = getattr(entity, "title", None) or ""
             display_name = title or f"{first} {last}".strip() or username
 
-            from telethon.tl.types import Channel, Chat
+            from telethon.tl.types import Channel, Chat  # type: ignore[import-untyped]
             if isinstance(entity, Channel):
                 entity_type = "channel"
             elif isinstance(entity, Chat):
@@ -370,7 +370,7 @@ async def resolve_dialog(
     # 4. Numeric ID or fuzzy name — try cache first
     choices = cache.all_names_with_ttl(USER_TTL, GROUP_TTL)
     normalized = cache.all_names_normalized_with_ttl(USER_TTL, GROUP_TTL)
-    result = resolve(query, choices, cache, normalized_choices=normalized)
+    result = resolve(query, choices, cache, normalized_choices=normalized)  # type: ignore[assignment]
     if not isinstance(result, NotFound):
         return result
 

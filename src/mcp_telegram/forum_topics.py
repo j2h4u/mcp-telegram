@@ -1,9 +1,12 @@
 from __future__ import annotations
 
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
-from telethon import functions
-from telethon.errors import RPCError
+from telethon import functions  # type: ignore[import-untyped]
+from telethon.errors import RPCError  # type: ignore[import-untyped]
+
+if TYPE_CHECKING:
+    from telethon import TelegramClient  # type: ignore[import-untyped]
 
 from .cache import TopicMetadataCache
 from .errors import (
@@ -16,6 +19,7 @@ from .errors import (
     topic_not_found_text,
 )
 from .models import (
+    MessageLike,
     FORUM_TOPICS_PAGE_SIZE,
     GENERAL_TOPIC_ID,
     GENERAL_TOPIC_TITLE,
@@ -102,7 +106,7 @@ def append_topic_match_metadata(
 ) -> str:
     """Return one topic match line enriched with cached metadata."""
     line = f'id={match["entity_id"]} name="{match["display_name"]}" score={match["score"]}'
-    entity_id = int(match["entity_id"])
+    entity_id = int(match["entity_id"])  # type: ignore[call-overload]
     topic = metadata_by_id.get(entity_id)
     if topic is None:
         return line
@@ -196,7 +200,7 @@ def build_topic_catalog(topics: list[TopicMetadata]) -> TopicCatalog:
 
 
 async def fetch_forum_topics_page(
-    client: object,
+    client: TelegramClient,
     *,
     entity: object,
     offset_date: object | None = None,
@@ -220,7 +224,7 @@ async def fetch_forum_topics_page(
 
 
 async def fetch_all_forum_topics(
-    client: object,
+    client: TelegramClient,
     *,
     entity: object,
     page_size: int = FORUM_TOPICS_PAGE_SIZE,
@@ -277,7 +281,7 @@ async def fetch_all_forum_topics(
 
 
 async def refresh_topic_by_id(
-    client: object,
+    client: TelegramClient,
     *,
     entity: object,
     dialog_id: int,
@@ -305,7 +309,7 @@ async def refresh_topic_by_id(
 
 
 async def load_dialog_topics(
-    client: object,
+    client: TelegramClient,
     *,
     entity: object,
     dialog_id: int,
@@ -399,10 +403,10 @@ def resolve_forum_topic(
         )
 
     if isinstance(topic_result, Candidates):
-        matches = []
+        candidate_matches: list[TopicMatch] = []
         match_lines = []
         for match in topic_result.matches:
-            entity_id = int(match["entity_id"])
+            entity_id = int(match["entity_id"])  # type: ignore[call-overload]
             topic = topic_catalog["metadata_by_id"].get(entity_id)
             topic_match = TopicMatch(
                 entity_id=entity_id,
@@ -412,13 +416,13 @@ def resolve_forum_topic(
                 top_message_id=int(topic["top_message_id"]) if topic is not None and topic["top_message_id"] is not None else None,
                 last_error=str(topic["inaccessible_error"]) if topic is not None and topic.get("inaccessible_error") else None,
             )
-            matches.append(topic_match)
+            candidate_matches.append(topic_match)
             match_lines.append(append_topic_match_metadata(match, topic_catalog["metadata_by_id"]))
         return ForumTopicFailure(
             kind="ambiguous",
             query=requested_topic,
             text=ambiguous_topic_text(requested_topic, match_lines, retry_tool=retry_tool),
-            matches=tuple(matches),
+            matches=tuple(candidate_matches),
             topic_catalog=topic_catalog,
         )
 
@@ -454,7 +458,7 @@ def resolve_forum_topic(
 
 
 async def resolve_exact_topic_target(
-    client: object,
+    client: TelegramClient,
     *,
     entity: object,
     dialog_id: int,
@@ -532,7 +536,7 @@ async def resolve_exact_topic_target(
 
 
 async def load_forum_topic_capability(
-    client: object,
+    client: TelegramClient,
     *,
     entity: object,
     dialog_id: int,
@@ -616,7 +620,7 @@ def forum_topic_anchor_id(msg: object) -> int | None:
     return None
 
 
-def messages_need_forum_topic_labels(messages: list[object]) -> bool:
+def messages_need_forum_topic_labels(messages: list[MessageLike]) -> bool:
     """Return True when a mixed message page appears to come from a forum dialog."""
     return any(forum_topic_anchor_id(msg) is not None for msg in messages)
 
@@ -681,14 +685,14 @@ def message_matches_topic(
 
 
 async def fetch_topic_messages(
-    client: object,
+    client: TelegramClient,
     *,
     iter_kwargs: dict[str, object],
     topic_metadata: TopicMetadata,
     allow_headerless_messages: bool,
-) -> list[object]:
+) -> list[MessageLike]:
     """Fetch a topic page and strip any leaked adjacent-topic messages."""
-    requested_limit = int(iter_kwargs.get("limit", 0) or 0)
+    requested_limit = int(iter_kwargs.get("limit", 0) or 0)  # type: ignore[call-overload]
     if requested_limit <= 0:
         return []
 
@@ -700,7 +704,7 @@ async def fetch_topic_messages(
     batch_kwargs = dict(iter_kwargs)
     batch_limit = requested_limit
     boundary_key = "min_id" if bool(batch_kwargs.get("reverse")) else "max_id"
-    topic_messages: list[object] = []
+    topic_messages: list[MessageLike] = []
 
     while len(topic_messages) < requested_limit:
         raw_messages = [msg async for msg in client.iter_messages(**batch_kwargs)]
