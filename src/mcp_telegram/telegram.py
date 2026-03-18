@@ -65,6 +65,10 @@ def create_client(
     ``@cache`` means the same instance is returned for identical
     ``(api_id, api_hash, session_name)`` arguments within the process lifetime.
     Callers should use ``connected_client()`` for connection lifecycle management.
+
+    Single-session by design: all tool calls within one process share the same
+    authenticated Telegram session. This is intentional for the single-user
+    Docker deployment model — there is no per-request session isolation.
     """
     if api_id is not None and api_hash is not None:
         config = TelegramSettings(api_id=api_id, api_hash=api_hash)

@@ -1,10 +1,16 @@
 from __future__ import annotations
 
-from telethon.errors import RPCError
-from telethon.tl.functions.messages import GetPeerDialogsRequest
+from typing import TYPE_CHECKING
+
+from telethon.errors import RPCError  # type: ignore[import-untyped]
+from telethon.tl.functions.messages import GetPeerDialogsRequest  # type: ignore[import-untyped]
+
+if TYPE_CHECKING:
+    from telethon import TelegramClient  # type: ignore[import-untyped]
 
 from .cache import EntityCache, TopicMetadataCache
 from .dialog_target import resolve_dialog_target
+from .pagination import HistoryDirection
 from .errors import deleted_topic_text, inaccessible_topic_text, rpc_error_detail
 from .forum_topics import load_forum_topic_capability, topic_empty_state_text
 from .message_ops import (
@@ -17,14 +23,11 @@ from .message_ops import (
     fetch_messages_for_topic,
 )
 from .models import (
-    HISTORY_NAVIGATION_NEWEST,
-    HISTORY_NAVIGATION_OLDEST,
     CapabilityNavigation,
     DialogResolver,
     DialogTargetFailure,
     ExactTargetHints,
     ForumTopicFailure,
-    HistoryNavigationMode,
     HistoryReadCapabilityResult,
     HistoryReadExecution,
     MessageReadFailure,
@@ -40,7 +43,7 @@ from .pagination import encode_history_navigation
 
 
 async def execute_history_read_capability(
-    client: object,
+    client: TelegramClient,
     *,
     cache: EntityCache,
     dialog_query: str | None,
@@ -254,10 +257,10 @@ async def execute_history_read_capability(
     if len(cursor_source_messages) == limit and cursor_source_messages:
         last_message_id = getattr(cursor_source_messages[-1], "id", None)
         if isinstance(last_message_id, int):
-            history_direction: HistoryNavigationMode = (
-                HISTORY_NAVIGATION_OLDEST
+            history_direction: HistoryDirection = (
+                HistoryDirection.OLDEST
                 if bool(iter_kwargs.get("reverse", False))
-                else HISTORY_NAVIGATION_NEWEST
+                else HistoryDirection.NEWEST
             )
             navigation_result = CapabilityNavigation(
                 kind="history",

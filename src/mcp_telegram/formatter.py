@@ -1,35 +1,9 @@
 from __future__ import annotations
 
-import typing as t
 from dataclasses import dataclass, field
-from datetime import datetime
 from zoneinfo import ZoneInfo
 
-
-class SenderLike(t.Protocol):
-    first_name: str | None
-
-
-class ReplyHeaderLike(t.Protocol):
-    reply_to_msg_id: int | None
-
-
-class ReactionsLike(t.Protocol):
-    results: list  # list of reaction result objects
-
-
-class MessageLike(t.Protocol):
-    id: int
-    date: datetime
-    message: str | None
-    sender: SenderLike | None
-    reply_to: ReplyHeaderLike | None
-    reactions: ReactionsLike | None
-    media: object
-
-
-TopicNameGetter = t.Callable[[MessageLike], str | None]
-LinePrefixGetter = t.Callable[[MessageLike], str | None]
+from .models import LinePrefixGetter, MessageLike, TopicNameGetter
 
 # Messages separated by more than this gap get a visual session break marker.
 # 60 min balances readability (avoids clutter in active chats) with context
@@ -179,7 +153,7 @@ def format_search_message_groups(
             reply_map={},
             reaction_names_map=reaction_names_map,
             line_prefix_getter=(
-                (lambda message, expected_hit_id=hit_id: "[HIT]" if getattr(message, "id", None) == expected_hit_id else None)
+                (lambda message: "[HIT]" if getattr(message, "id", None) == hit_id else None)
                 if isinstance(hit_id, int)
                 else None
             ),
@@ -238,6 +212,15 @@ def _format_reactions(msg: MessageLike, reaction_names: dict[str, list[str]] | N
     return f"[{' '.join(parts)}]" if parts else ""
 
 
+def _safe_attr_chain(obj: object, *attrs: str) -> object | None:
+    """Traverse a chain of getattr calls, returning None if any link is missing."""
+    for attr in attrs:
+        if obj is None:
+            return None
+        obj = getattr(obj, attr, None)
+    return obj
+
+
 def _describe_media(media: object) -> str:
     """Return a human-readable placeholder for a media attachment.
 
@@ -245,7 +228,7 @@ def _describe_media(media: object) -> str:
     '[медиа: ClassName]' for unknown types so they are still distinguishable.
     """
     try:
-        import telethon.tl.types as tl  # noqa: PLC0415
+        import telethon.tl.types as tl  # type: ignore[import-untyped]  # noqa: PLC0415
 
         if isinstance(media, tl.MessageMediaEmpty):
             return ""
@@ -257,8 +240,7 @@ def _describe_media(media: object) -> str:
             return _describe_document(media)
 
         if isinstance(media, tl.MessageMediaPoll):
-            poll = getattr(media, "poll", None)
-            question = getattr(poll, "question", None) if poll else None
+            question = _safe_attr_chain(media, "poll", "question")
             q_text = (
                 getattr(question, "text", None) or str(question)
                 if question is not None else None
@@ -269,9 +251,8 @@ def _describe_media(media: object) -> str:
             return "[геолокация live]"
 
         if isinstance(media, tl.MessageMediaGeo):
-            geo = getattr(media, "geo", None)
-            lat = getattr(geo, "lat", None)
-            lon = getattr(geo, "long", None)
+            lat = _safe_attr_chain(media, "geo", "lat")
+            lon = _safe_attr_chain(media, "geo", "long")
             if lat is not None and lon is not None:
                 return f"[геолокация: {lat:.4f}, {lon:.4f}]"
             return "[геолокация]"
@@ -296,8 +277,7 @@ def _describe_media(media: object) -> str:
             return f"[{emoticon} {value}]" if value is not None else f"[{emoticon}]"
 
         if isinstance(media, tl.MessageMediaGame):
-            game = getattr(media, "game", None)
-            title = getattr(game, "title", None) if game else None
+            title = _safe_attr_chain(media, "game", "title")
             return f"[игра: {title}]" if title else "[игра]"
 
         if isinstance(media, tl.MessageMediaStory):
@@ -308,8 +288,7 @@ def _describe_media(media: object) -> str:
             return f"[счёт: {title}]" if title else "[счёт]"
 
         if isinstance(media, tl.MessageMediaWebPage):
-            webpage = getattr(media, "webpage", None)
-            url = getattr(webpage, "url", None) if webpage else None
+            url = _safe_attr_chain(media, "webpage", "url")
             return f"[ссылка: {url}]" if url else "[ссылка]"
 
         if isinstance(media, tl.MessageMediaUnsupported):
@@ -324,7 +303,7 @@ def _describe_media(media: object) -> str:
 def _describe_document(media: object) -> str:
     """Describe a MessageMediaDocument by inspecting its attributes."""
     try:
-        import telethon.tl.types as tl  # noqa: PLC0415
+        import telethon.tl.types as tl  # type: ignore[import-untyped]  # noqa: PLC0415
 
         doc = getattr(media, "document", None)
         if doc is None:

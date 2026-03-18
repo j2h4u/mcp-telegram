@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import logging
-from typing import Callable, NoReturn
+from typing import TYPE_CHECKING, Callable, NoReturn
 
-from telethon.errors import RPCError
-from telethon.tl.functions.messages import GetMessageReactionsListRequest
+from telethon.errors import RPCError  # type: ignore[import-untyped]
+
+if TYPE_CHECKING:
+    from telethon import TelegramClient  # type: ignore[import-untyped]
+
+from telethon.tl.functions.messages import GetMessageReactionsListRequest  # type: ignore[import-untyped]
 
 from .cache import EntityCache, GROUP_TTL, USER_TTL, ReactionMetadataCache, TopicMetadataCache
 from .dialog_target import get_sender_type
@@ -24,9 +28,7 @@ from .forum_topics import (
     refresh_topic_by_id,
 )
 from .models import (
-    HISTORY_NAVIGATION_NEWEST,
-    HISTORY_NAVIGATION_OLDEST,
-    HistoryNavigationMode,
+    MessageLike,
     ForumTopicFailure,
     MessageReadFailure,
     NavigationFailure,
@@ -34,7 +36,7 @@ from .models import (
     TopicMetadata,
     TopicLoader,
 )
-from .pagination import decode_history_navigation, decode_navigation_token
+from .pagination import HistoryDirection, decode_history_navigation, decode_navigation_token
 from .resolver import Candidates, NotFound, resolve
 
 logger = logging.getLogger(__name__)
@@ -44,12 +46,12 @@ def parse_history_navigation_input(
     navigation: str | None,
     *,
     retry_tool: str,
-) -> tuple[str | None, HistoryNavigationMode] | NavigationFailure:
+) -> tuple[str | None, HistoryDirection] | NavigationFailure:
     """Parse one public ListMessages navigation value into token and direction."""
-    if navigation is None or navigation == HISTORY_NAVIGATION_NEWEST:
-        return None, HISTORY_NAVIGATION_NEWEST
-    if navigation == HISTORY_NAVIGATION_OLDEST:
-        return None, HISTORY_NAVIGATION_OLDEST
+    if navigation is None or navigation == HistoryDirection.NEWEST:
+        return None, HistoryDirection.NEWEST
+    if navigation == HistoryDirection.OLDEST:
+        return None, HistoryDirection.OLDEST
 
     try:
         token = decode_navigation_token(navigation)
@@ -68,7 +70,7 @@ def parse_history_navigation_input(
             ),
         )
 
-    return navigation, token.direction or HISTORY_NAVIGATION_NEWEST
+    return navigation, token.direction or HistoryDirection.NEWEST
 
 
 def _sender_match_line(match: dict[str, object]) -> str:
@@ -105,7 +107,7 @@ def _build_history_iter_kwargs(
         return navigation_result
 
     navigation_token, direction = navigation_result
-    from_beginning = direction == HISTORY_NAVIGATION_OLDEST
+    from_beginning = direction == HistoryDirection.OLDEST
     iter_kwargs: dict[str, object] = {
         "entity": entity_id,
         "limit": limit,
@@ -171,7 +173,7 @@ def _resolve_sender_entity(
 def _cache_message_senders(
     *,
     cache: EntityCache,
-    messages: list[object],
+    messages: list[MessageLike],
 ) -> None:
     for msg in messages:
         sender = getattr(msg, "sender", None)
@@ -209,11 +211,11 @@ def _get_message_id(msg: object) -> int | None:
 
 
 async def _build_reply_map(
-    client: object,
+    client: TelegramClient,
     *,
     entity_id: int,
-    messages: list[object],
-) -> dict[int, object]:
+    messages: list[MessageLike],
+) -> dict[int, MessageLike]:
     """Fetch original messages for all reply references in the message list."""
     reply_ids = list({rid for msg in messages if (rid := _get_reply_to_id(msg)) is not None})
     if not reply_ids:
@@ -229,11 +231,11 @@ async def _build_reply_map(
 
 
 async def _build_reaction_names_map(
-    client: object,
+    client: TelegramClient,
     *,
     cache: EntityCache,
     entity_id: int,
-    messages: list[object],
+    messages: list[MessageLike],
     reaction_names_threshold: int,
 ) -> dict[int, dict[str, list[str]]]:
     """Fetch reactor names for messages with total reactions ≤ threshold.
@@ -309,12 +311,12 @@ async def _build_reaction_names_map(
 
 
 async def _build_context_message_map(
-    client: object,
+    client: TelegramClient,
     *,
     entity_id: int,
-    hits: list[object],
+    hits: list[MessageLike],
     context_radius: int,
-) -> dict[int, object]:
+) -> dict[int, MessageLike]:
     """Fetch surrounding context messages for search hits."""
     context_ids_needed: set[int] = set()
     hit_ids = {mid for hit in hits if (mid := _get_message_id(hit)) is not None}
@@ -336,12 +338,12 @@ async def _build_context_message_map(
 
 
 async def _build_cross_topic_name_getter(
-    client: object,
+    client: TelegramClient,
     *,
     cache: EntityCache,
     entity_id: int,
     dialog_name: str,
-    fetched_messages: list[object],
+    fetched_messages: list[MessageLike],
     topic_catalog: TopicCatalog | None,
     topic_cache: TopicMetadataCache | None,
     load_topics: TopicLoader | None,
@@ -370,7 +372,8 @@ async def _build_cross_topic_name_getter(
         )
         if isinstance(topic_capability, ForumTopicFailure):
             return None
-        active_topic_catalog = topic_capability
+        # requested_topic=None → always TopicCatalog, never ResolvedForumTopic
+        active_topic_catalog = topic_capability  # type: ignore[assignment]
 
     if active_topic_catalog is None:
         return None
@@ -390,7 +393,7 @@ def _reraise_topic_invalid(exc: RPCError | None, context: str) -> NoReturn:
 
 
 async def fetch_messages_for_topic(
-    client: object,
+    client: TelegramClient,
     *,
     entity_id: int,
     iter_kwargs: dict[str, object],
@@ -399,7 +402,7 @@ async def fetch_messages_for_topic(
     allow_headerless_messages: bool,
     fetch_topic_messages_fn: Callable | None = None,
     refresh_topic_by_id_fn: Callable | None = None,
-) -> tuple[list[object] | None, TopicMetadata, dict[str, object]]:
+) -> tuple[list[MessageLike] | None, TopicMetadata, dict[str, object]]:
     """Fetch one topic page with one bounded by-ID refresh and retry on stale anchors."""
     current_iter_kwargs = dict(iter_kwargs)
     current_topic_metadata = topic_metadata
@@ -408,7 +411,7 @@ async def fetch_messages_for_topic(
     fetch_fn = fetch_topic_messages_fn if fetch_topic_messages_fn is not None else fetch_topic_messages
     refresh_fn = refresh_topic_by_id_fn if refresh_topic_by_id_fn is not None else refresh_topic_by_id
 
-    async def scan_dialog_history_for_topic() -> tuple[list[object], dict[str, object]]:
+    async def scan_dialog_history_for_topic() -> tuple[list[MessageLike], dict[str, object]]:
         """Fallback to dialog-wide history scanning when thread fetch rejects a valid topic anchor."""
         history_iter_kwargs = dict(current_iter_kwargs)
         history_iter_kwargs.pop("reply_to", None)

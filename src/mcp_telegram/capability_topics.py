@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import cast
+
 from .cache import EntityCache, TopicMetadataCache
 from .dialog_target import resolve_dialog_target
 from .forum_topics import load_forum_topic_capability
@@ -9,6 +11,7 @@ from .models import (
     ForumTopicFailure,
     ListTopicsCapabilityResult,
     ListTopicsExecution,
+    TopicCatalog,
     TopicLoader,
 )
 
@@ -50,9 +53,11 @@ async def execute_list_topics_capability(
     if isinstance(topic_capability, ForumTopicFailure):
         return topic_capability
 
+    # requested_topic=None → always TopicCatalog, never ResolvedForumTopic
+    topic_catalog = cast("TopicCatalog", topic_capability)
     active_topics = tuple(
-        topic_capability["metadata_by_id"][topic_id]
-        for topic_id in sorted(topic_capability["choices"])
+        topic_catalog["metadata_by_id"][topic_id]
+        for topic_id in sorted(topic_catalog["choices"])
     )
     return ListTopicsExecution(
         resolve_prefix=dialog_target.resolve_prefix,

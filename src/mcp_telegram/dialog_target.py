@@ -13,7 +13,7 @@ from .resolver import Candidates, NotFound
 
 from typing import Literal
 
-from telethon.tl.types import Channel, Chat
+from telethon.tl.types import Channel, Chat  # type: ignore[import-untyped]
 
 # Our internal taxonomy — independent of Telegram's group/supergroup/channel evolution.
 # Behavior is driven by participant count, not by Telegram entity type.
@@ -55,9 +55,9 @@ def get_sender_type(sender: object) -> str:
 
 def _dialog_match_from_dict(match: dict[str, object]) -> DialogMatch:
     return DialogMatch(
-        entity_id=int(match["entity_id"]),
+        entity_id=int(match["entity_id"]),  # type: ignore[call-overload]
         display_name=str(match["display_name"]),
-        score=int(match["score"]),
+        score=int(match["score"]),  # type: ignore[call-overload]
         username=str(match["username"]) if match.get("username") else None,
         entity_type=str(match["entity_type"]) if match.get("entity_type") else None,
     )

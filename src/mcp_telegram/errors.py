@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from telethon.errors import RPCError
+from telethon.errors import RPCError  # type: ignore[import-untyped]
 
 
 def action_text(summary: str, action: str) -> str:

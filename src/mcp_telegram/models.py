@@ -1,18 +1,50 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Awaitable, Callable, Literal, TypedDict
+from typing import TYPE_CHECKING, Awaitable, Callable, Literal, Protocol, TypedDict
 
 from .cache import EntityCache
+from .pagination import HistoryDirection
 from .resolver import Candidates, NotFound, Resolved, ResolvedWithMessage
+
+if TYPE_CHECKING:
+    from datetime import datetime
 
 FORUM_TOPICS_PAGE_SIZE = 100
 TOPIC_METADATA_TTL_SECONDS = 600
 GENERAL_TOPIC_ID = 1
 GENERAL_TOPIC_TITLE = "General"
-HISTORY_NAVIGATION_NEWEST = "newest"
-HISTORY_NAVIGATION_OLDEST = "oldest"
-HistoryNavigationMode = Literal["newest", "oldest"]
+
+
+# ---------------------------------------------------------------------------
+# Protocol types for Telethon message objects
+# ---------------------------------------------------------------------------
+
+
+class SenderLike(Protocol):
+    first_name: str | None
+
+
+class ReplyHeaderLike(Protocol):
+    reply_to_msg_id: int | None
+
+
+class ReactionsLike(Protocol):
+    results: list  # list of reaction result objects
+
+
+class MessageLike(Protocol):
+    id: int
+    date: datetime
+    message: str | None
+    sender: SenderLike | None
+    reply_to: ReplyHeaderLike | None
+    reactions: ReactionsLike | None
+    media: object
+
+
+TopicNameGetter = Callable[[MessageLike], str | None]
+LinePrefixGetter = Callable[[MessageLike], str | None]
 
 
 class TopicMetadata(TypedDict, total=False):
@@ -171,11 +203,11 @@ class HistoryReadExecution:
     entity_id: int
     resolve_prefix: str
     topic_name: str | None
-    messages: tuple[object, ...]
-    fetched_messages: tuple[object, ...]
-    reply_map: dict[int, object]
+    messages: tuple[MessageLike, ...]
+    fetched_messages: tuple[MessageLike, ...]
+    reply_map: dict[int, MessageLike]
     reaction_names_map: dict[int, dict[str, list[str]]]
-    topic_name_getter: Callable[[object], str | None] | None
+    topic_name_getter: TopicNameGetter | None
     navigation: CapabilityNavigation | None = None
 
 
@@ -186,8 +218,8 @@ class SearchExecution:
     entity_id: int
     dialog_name: str
     resolve_prefix: str
-    hits: tuple[object, ...]
-    context_messages_by_id: dict[int, object]
+    hits: tuple[MessageLike, ...]
+    context_messages_by_id: dict[int, MessageLike]
     reaction_names_map: dict[int, dict[str, list[str]]]
     next_offset: int | None
     navigation: CapabilityNavigation | None = None
@@ -209,5 +241,5 @@ HistoryReadCapabilityResult = (
 SearchCapabilityResult = SearchExecution | DialogTargetFailure | NavigationFailure
 DialogResolver = Callable[[EntityCache, str], Awaitable[DialogResolveResult]]
 TopicLoader = Callable[..., Awaitable[TopicCatalog]]
-TopicFetcher = Callable[..., Awaitable[list[object]]]
+TopicFetcher = Callable[..., Awaitable[list[MessageLike]]]
 TopicRefresher = Callable[..., Awaitable[TopicMetadata | None]]

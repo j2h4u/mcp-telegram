@@ -4,11 +4,17 @@ import base64
 import binascii
 import json
 from dataclasses import dataclass
-from typing import Literal
+from enum import StrEnum
+from typing import Literal, cast
 
 
 NavigationKind = Literal["history", "search"]
-HistoryDirection = Literal["newest", "oldest"]
+
+
+class HistoryDirection(StrEnum):
+    """Direction for history navigation — newest-first (default) or oldest-first."""
+    NEWEST = "newest"
+    OLDEST = "oldest"
 
 
 @dataclass(frozen=True)
@@ -81,12 +87,12 @@ def decode_navigation_token(token: str) -> NavigationToken:
         raise ValueError("Invalid navigation token: direction must be newest or oldest when present")
 
     return NavigationToken(
-        kind=kind,
+        kind=cast("NavigationKind", kind),
         value=value,
         dialog_id=dialog_id,
         topic_id=topic_id,
         query=query,
-        direction=direction,
+        direction=cast("HistoryDirection | None", direction),
     )
 
 
@@ -95,7 +101,7 @@ def encode_history_navigation(
     dialog_id: int,
     *,
     topic_id: int | None = None,
-    direction: HistoryDirection = "newest",
+    direction: HistoryDirection = HistoryDirection.NEWEST,
 ) -> str:
     """Encode a history continuation cursor as a base64 token."""
     return encode_navigation_token(

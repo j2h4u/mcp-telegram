@@ -36,5 +36,10 @@ asyncio_mode = "auto"
 [tool.mypy]
 plugins = ["pydantic.mypy"]
 
+[[tool.mypy.overrides]]
+module = "telethon.*"
+ignore_missing_imports = true
+follow_imports = "skip"
+
 [tool.setuptools.package-data]
 "*" = ["py.typed"]

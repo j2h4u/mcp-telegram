@@ -13,8 +13,6 @@ from .models import (
     FORUM_TOPICS_PAGE_SIZE,
     GENERAL_TOPIC_ID,
     GENERAL_TOPIC_TITLE,
-    HISTORY_NAVIGATION_NEWEST,
-    HISTORY_NAVIGATION_OLDEST,
     TOPIC_METADATA_TTL_SECONDS,
     CapabilityNavigation,
     DialogMatch,
@@ -25,7 +23,7 @@ from .models import (
     ExactTargetHints,
     ForumTopicCapabilityResult,
     ForumTopicFailure,
-    HistoryNavigationMode,
+    HistoryDirection,
     HistoryReadCapabilityResult,
     HistoryReadExecution,
     ListTopicsCapabilityResult,
@@ -93,4 +91,5 @@ from .message_ops import (
 from .capability_topics import execute_list_topics_capability
 from .capability_search import execute_search_messages_capability
 from .capability_history import execute_history_read_capability
+from .capability_unread import execute_unread_messages_capability
 
