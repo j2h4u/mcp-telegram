@@ -2,6 +2,54 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## v1.3 — Medium Implementation — 2026-03-14
+#### Features
+- Tool posture system: `@mcp_tool("primary")` / `@mcp_tool("secondary/helper")` with LLM-visible prefix
+- Exact-target direct workflows: `exact_dialog_id` and `exact_topic_id` bypass fuzzy resolution
+- Unified navigation primitives: shared `NavigationToken` for history and search cursors
+- Capability seams: split orchestration into `capability_history.py`, `capability_search.py`, `capability_topics.py`
+- Tool adapter thinning: tools are thin wrappers over shared capability functions
+#### Bug Fixes
+- Harden SQLite cache bootstrap with file lock for parallel MCP sessions
+- Stage-aware server boundary recovery for escaped exceptions
+
+- - -
+## v1.2 — MCP Surface Research — 2026-03-12
+#### Documentation
+- Research-only milestone: tool audit, workflow audit, comparative analysis
+- Medium-path implementation recommendations for v1.3
+
+- - -
+## v1.1 — Observability & Completeness — 2026-03-10
+#### Features
+- Telemetry foundation: `TelemetryCollector` (async queue, SQLite), `GetUsageStats` tool
+- Forum topics: topic metadata cache, topic resolution, topic thread fetching, inaccessible topic handling
+- Resolver redesign: `@username` support, extended Candidates metadata
+- `ReactionMetadataCache` with per-message TTL
+- Reverse pagination (`navigation="oldest"`)
+- Archived dialog filtering (`exclude_archived` parameter)
+- Action-oriented tool guidance (error text with "Action:" suggestions)
+- Standalone MCP test client for regression scripts
+#### Bug Fixes
+- Structured logging and `call_tool` timing
+- Critical error handling and API encapsulation fixes
+
+- - -
+## v1.0 — Core API — 2026-03-07
+#### Features
+- Fuzzy name resolver (Cyrillic + transliteration)
+- Message formatter with date headers, session breaks, reply annotations
+- `EntityCache` (SQLite + TTL) and cursor-based pagination
+- `ListMessages` rewrite: name resolution, formatting, sender/unread filters
+- `SearchMessages` rewrite: context window, reaction names, pagination
+- `GetMyAccount` and `GetUserInfo` tools
+- Reaction names via `GetMessageReactionsListRequest` with threshold
+- Full media type coverage in formatter
+#### Bug Fixes
+- Store session in XDG state home
+- Stop leaking message content in logs
+
+- - -
 ## [v0.1.1](https://github.com/sparfenyuk/mcp-telegram/compare/3f5b014751a09914b3dd2f47a9908a4de73af0ac..v0.1.1) - 2024-12-13
 #### Bug Fixes
 - improve interaction with the server - ([d9005ef](https://github.com/sparfenyuk/mcp-telegram/commit/d9005ef0f100164a642cb966703155e5a3f84f9f)) - [@sparfenyuk](https://github.com/sparfenyuk)
