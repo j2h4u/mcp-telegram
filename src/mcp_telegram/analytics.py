@@ -9,11 +9,9 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# SQL DDL for telemetry_events table
 _ANALYTICS_DDL = """
 CREATE TABLE IF NOT EXISTS telemetry_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -37,7 +35,7 @@ class TelemetryEvent:
     """Immutable telemetry event with zero PII fields.
 
     Fields (privacy-safe, no entity IDs, dialog IDs, names, usernames, or content):
-    - tool_name: Tool that was called (e.g., ListDialogs, ListMessages, SearchMessages, GetMe, GetUserInfo)
+    - tool_name: Tool that was called (e.g., ListDialogs, ListMessages, SearchMessages, GetMyAccount, GetUserInfo)
     - timestamp: UNIX epoch time (seconds), float
     - duration_ms: Execution duration in milliseconds, float
     - result_count: Number of results returned, int (0+)
@@ -55,7 +53,7 @@ class TelemetryEvent:
     has_cursor: bool
     page_depth: int
     has_filter: bool
-    error_type: Optional[str] = None
+    error_type: str | None = None
 
 
 class TelemetryCollector:
@@ -65,7 +63,7 @@ class TelemetryCollector:
     Batch flushes asynchronously every 60s or when 100 events accumulated.
     """
 
-    _instance: Optional[TelemetryCollector] = None
+    _instance: TelemetryCollector | None = None
     _lock = threading.Lock()
 
     def __init__(self, db_path: Path) -> None:
@@ -77,7 +75,7 @@ class TelemetryCollector:
         self._db_path = Path(db_path)
         self._batch: list[TelemetryEvent] = []
         self._batch_lock = threading.Lock()
-        self._background_task: Optional[asyncio.Task] = None
+        self._background_task: asyncio.Task | None = None
         self._init_db()
 
     def _init_db(self) -> None:
@@ -85,17 +83,16 @@ class TelemetryCollector:
         try:
             conn = sqlite3.connect(str(self._db_path))
             try:
-                # Enable WAL mode for safe concurrent access
+                # WAL mode for safe concurrent access
                 conn.execute("PRAGMA journal_mode=WAL")
-                # Execute DDL
                 conn.executescript(_ANALYTICS_DDL)
                 conn.commit()
                 logger.info("analytics.db initialized at %s", self._db_path)
             finally:
                 conn.close()
         except Exception as e:
-            logger.error("Failed to initialize analytics.db: %s", e)
-            # Never raise — telemetry must be fire-and-forget
+            # Telemetry is fire-and-forget — never raise
+            logger.error("Failed to initialize analytics.db: %s", e, exc_info=True)
 
     def record_event(self, event: TelemetryEvent) -> None:
         """Record telemetry event (fire-and-forget, non-blocking).
@@ -112,8 +109,7 @@ class TelemetryCollector:
                 if len(self._batch) >= 100:
                     self._flush_async_unlocked()
         except Exception as e:
-            logger.error("Failed to record telemetry event: %s", e)
-            # Never raise — telemetry must not block tool execution
+            logger.error("Failed to record telemetry event: %s", e, exc_info=True)
 
 
     def _flush_async_unlocked(self) -> None:
@@ -129,17 +125,29 @@ class TelemetryCollector:
                 return
 
             batch_to_flush = self._batch[:]
-            self._batch = []
 
             try:
                 loop = asyncio.get_running_loop()
                 task = loop.create_task(self._async_flush(batch_to_flush))
-                self._background_task = task  # Strong reference prevents GC
+                task.add_done_callback(self._on_flush_done)
+                self._background_task = task
+                self._batch = []
             except RuntimeError:
-                # No event loop running, fallback to sync write
+                # No event loop — synchronous fallback (blocks while holding lock)
+                logger.debug("telemetry_flush_sync_fallback: no running event loop")
                 self._write_batch(batch_to_flush)
+                self._batch = []
         except Exception as e:
-            logger.error("Failed to trigger async flush: %s", e)
+            logger.error("Failed to trigger async flush: %s", e, exc_info=True)
+
+    @staticmethod
+    def _on_flush_done(task: asyncio.Task) -> None:
+        """Log unhandled exceptions from background flush tasks."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error("Background flush task failed: %s", exc)
 
     def _flush_async(self) -> None:
         """Public: spawn background task to flush batch to DB (thread-safe).
@@ -150,7 +158,7 @@ class TelemetryCollector:
             with self._batch_lock:
                 self._flush_async_unlocked()
         except Exception as e:
-            logger.error("Failed to trigger async flush: %s", e)
+            logger.error("Failed to trigger async flush: %s", e, exc_info=True)
 
     async def _async_flush(self, batch: list[TelemetryEvent]) -> None:
         """Background task: flush batch to DB on background thread.
@@ -161,10 +169,10 @@ class TelemetryCollector:
             batch: List of events to write
         """
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, self._write_batch, batch)
         except Exception as e:
-            logger.error("Async flush failed: %s", e)
+            logger.error("Async flush failed: %s", e, exc_info=True)
 
     def _write_batch(self, batch: list[TelemetryEvent]) -> None:
         """Synchronous DB write (runs on thread pool via executor).
@@ -186,16 +194,16 @@ class TelemetryCollector:
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                     [
                         (
-                            e.tool_name,
-                            e.timestamp,
-                            e.duration_ms,
-                            e.result_count,
-                            e.has_cursor,
-                            e.page_depth,
-                            e.has_filter,
-                            e.error_type,
+                            event.tool_name,
+                            event.timestamp,
+                            event.duration_ms,
+                            event.result_count,
+                            event.has_cursor,
+                            event.page_depth,
+                            event.has_filter,
+                            event.error_type,
                         )
-                        for e in batch
+                        for event in batch
                     ],
                 )
                 conn.commit()
@@ -203,8 +211,7 @@ class TelemetryCollector:
             finally:
                 conn.close()
         except Exception as e:
-            logger.error("Failed to write telemetry batch to DB: %s", e)
-            # Never raise — telemetry writes must not fail tool execution
+            logger.error("Failed to write telemetry batch to DB: %s", e, exc_info=True)
 
     @classmethod
     def get_instance(cls, db_path: Path) -> TelemetryCollector:
@@ -223,17 +230,6 @@ class TelemetryCollector:
         return cls._instance
 
 
-# Cleanup Strategy:
-# Daily cleanup via systemd timer (mcp-telegram-cleanup.timer) runs at 07:15 AM:
-# - Deletes telemetry events >30 days old
-# - Calls PRAGMA optimize to rebuild statistics
-# - Calls PRAGMA incremental_vacuum to reclaim disk space
-# See: /home/j2h4u/repos/j2h4u/mcp-telegram/systemd/mcp-telegram-cleanup.timer
-#
-# Async cleanup_analytics_db() ensures main service is not blocked during maintenance.
-# Incremental VACUUM is non-blocking; readers can access DB during cleanup.
-
-
 async def cleanup_analytics_db(db_path: Path, retention_days: int = 30) -> None:
     """Delete stale telemetry events and optimize database (non-blocking).
 
@@ -244,7 +240,7 @@ async def cleanup_analytics_db(db_path: Path, retention_days: int = 30) -> None:
         db_path: Path to analytics.db
         retention_days: Delete events older than this many days (default 30)
     """
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _sync_cleanup, db_path, retention_days)
 
 
@@ -259,13 +255,9 @@ def _sync_cleanup(db_path: Path, retention_days: int) -> None:
         retention_days: Delete events older than this many days
     """
     try:
-        # Calculate cutoff timestamp (seconds)
         cutoff_timestamp = time.time() - (retention_days * 86400)
-
-        # Open connection to analytics.db
         conn = sqlite3.connect(str(db_path))
         try:
-            # Delete telemetry events older than retention period
             cursor = conn.execute(
                 "DELETE FROM telemetry_events WHERE timestamp < ?",
                 (cutoff_timestamp,),
@@ -273,11 +265,10 @@ def _sync_cleanup(db_path: Path, retention_days: int) -> None:
             deleted_count = cursor.rowcount
             conn.commit()
 
-            # Rebuild statistics for query planner (non-blocking on WAL)
             conn.execute("PRAGMA optimize")
             conn.commit()
 
-            # Reclaim disk space without blocking (incremental VACUUM)
+            # Incremental VACUUM is non-blocking on WAL
             conn.execute("PRAGMA incremental_vacuum(1000)")
             conn.commit()
 
@@ -289,5 +280,56 @@ def _sync_cleanup(db_path: Path, retention_days: int) -> None:
         finally:
             conn.close()
     except Exception as e:
-        logger.error("Failed to cleanup analytics.db: %s", e)
-        # Never raise — cleanup must not crash service
+        logger.error("Failed to cleanup analytics.db: %s", e, exc_info=True)
+
+
+def format_usage_summary(stats: dict) -> str:
+    """Generate <100 token natural-language summary of usage patterns.
+
+    Input dict keys:
+    - tool_distribution: dict[str, int] — {tool_name: count}
+    - error_distribution: dict[str, int] — {error_type: count}
+    - max_page_depth: int
+    - dialogs_with_deep_scroll: int (estimated)
+    - total_calls: int
+    - filter_count: int
+    - latency_median_ms: float
+    - latency_p95_ms: float
+
+    Output: natural-language string, target 60-80 tokens, < 100 hard limit.
+    """
+    parts = []
+
+    if stats.get("tool_distribution"):
+        top_tools = sorted(stats["tool_distribution"].items(), key=lambda x: x[1], reverse=True)[:2]
+        if top_tools:
+            top_tool, top_count = top_tools[0]
+            top_pct = int(top_count * 100 / stats["total_calls"]) if stats["total_calls"] > 0 else 0
+            parts.append(f"Most active: {top_tool} ({top_pct}% of calls)")
+
+    if stats.get("max_page_depth", 0) >= 5:
+        parts.append(f"Deep scrolling detected: max page depth {stats['max_page_depth']}")
+
+    if stats.get("error_distribution"):
+        errors_str = ", ".join(
+            [f"{err} ({cnt})" for err, cnt in sorted(stats["error_distribution"].items(), key=lambda x: x[1], reverse=True)[:3]]
+        )
+        parts.append(f"Errors: {errors_str}")
+
+    if stats.get("total_calls", 0) > 0 and stats.get("filter_count", 0) > 0:
+        filter_pct = int(stats["filter_count"] * 100 / stats["total_calls"])
+        parts.append(f"Filtered queries: {filter_pct}%")
+
+    median = stats.get("latency_median_ms", 0)
+    p95 = stats.get("latency_p95_ms", 0)
+    if median or p95:
+        parts.append(f"Response time: {median:.0f}ms median, {p95:.0f}ms p95")
+
+    summary = " ".join(parts)
+
+    # Safety: if summary exceeds 100 tokens, truncate gracefully
+    tokens = summary.split()
+    if len(tokens) > 100:
+        summary = " ".join(tokens[:100]) + "..."
+
+    return summary

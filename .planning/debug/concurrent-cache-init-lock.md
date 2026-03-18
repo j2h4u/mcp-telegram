@@ -1,5 +1,5 @@
 ---
-status: diagnosed
+status: resolved
 trigger: "Investigate one UAT gap and find root cause only.\n\nTruth: Concurrent MCP sessions can execute read-oriented tools without SQLite lock failures during shared cache initialization.\nExpected: Run two independent MCP client sessions against the live `mcp-telegram` container and call read-oriented tools concurrently. Shared SQLite-backed cache setup should stay available under concurrent access instead of failing during connection or cache initialization.\nActual: Parallel runtime verification hit `sqlite3.OperationalError: database is locked` from `EntityCache.__init__()` while another MCP session was active.\nErrors: `sqlite3.OperationalError: database is locked`\nReproduction: Test 6 in UAT using two independent MCP stdio client sessions against the live container; one `ListMessages` call failed while another session was active.\nTimeline: Discovered during UAT for phase 17 on 2026-03-14.\nGoal: find_root_cause_only"
 created: 2026-03-14T00:00:00Z
 updated: 2026-03-14T00:20:00Z
@@ -63,6 +63,6 @@ started: Discovered during UAT for phase 17 on 2026-03-14.
 ## Resolution
 
 root_cause: New MCP stdio sessions do not open the shared entity cache in a read-safe way. `EntityCache.__init__()` unconditionally performs mutating startup work (`PRAGMA journal_mode=WAL`, schema/index DDL, and especially `PRAGMA optimize`) on the shared `entity_cache.db` every time a process starts. Meanwhile active `ListMessages` paths can hold write/schema locks through `TopicMetadataCache` and `ReactionMetadataCache` initialization on the same file. That makes cache startup itself lock-prone across processes. The most likely steady-state exact lock point is `PRAGMA optimize`; cold-start/schema windows can also lock earlier at `PRAGMA journal_mode=WAL` or entity-table/index DDL.
-fix:
-verification:
-files_changed: []
+fix: Removed PRAGMA optimize from EntityCache.__init__(), added busy_timeout=30000, serialized bootstrap with fcntl.flock file lock, added fast-path _database_bootstrap_required() check to skip mutating work when schema is ready. ReactionMetadataCache and TopicMetadataCache now delegate to _ensure_connection_schema() instead of running their own DDL.
+verification: Code review confirms all mutating startup work is behind file lock, PRAGMA optimize removed from cache.py entirely, busy_timeout prevents transient lock errors.
+files_changed: [src/mcp_telegram/cache.py]

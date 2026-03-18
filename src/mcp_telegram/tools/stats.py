@@ -103,10 +103,10 @@ async def get_usage_stats(args: GetUsageStats) -> ToolResult:
     except sqlite3.OperationalError as exc:
         if "no such table" in str(exc):
             return ToolResult(content=_text_response(usage_stats_db_missing_text()))
-        logger.error("GetUsageStats query failed: %s", exc)
+        logger.error("GetUsageStats query failed: %s", exc, exc_info=True)
         return ToolResult(content=_text_response(usage_stats_query_error_text(type(exc).__name__)))
     except Exception as exc:
-        logger.error("GetUsageStats query failed: %s", exc)
+        logger.error("GetUsageStats query failed: %s", exc, exc_info=True)
         return ToolResult(content=_text_response(usage_stats_query_error_text(type(exc).__name__)))
     finally:
         if conn is not None:

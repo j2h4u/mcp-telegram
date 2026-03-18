@@ -47,7 +47,7 @@ def test_cli_debug_topic_catalog(tmp_db_path, monkeypatch) -> None:
     monkeypatch.setattr(cli_module, "get_entity_cache", lambda: cache)
     monkeypatch.setattr(
         cli_module,
-        "_fetch_forum_topics_page",
+        "fetch_forum_topics_page",
         AsyncMock(side_effect=[
             (first_page, 3),
             (second_page, 3),
@@ -56,7 +56,7 @@ def test_cli_debug_topic_catalog(tmp_db_path, monkeypatch) -> None:
     )
     monkeypatch.setattr(
         cli_module,
-        "_load_dialog_topics",
+        "load_dialog_topics",
         AsyncMock(
             return_value={
                 "choices": {1: "General", 11: "Release Notes"},
@@ -104,10 +104,10 @@ def test_cli_debug_topic_catalog(tmp_db_path, monkeypatch) -> None:
     assert result.exit_code == 0
     assert "dialog_id=701" in result.stdout
     assert "page=1 offset_topic=0 offset_id=0 fetched=2 total_count=3" in result.stdout
-    assert 'topic_id=1 title="General" top_message_id=None is_general=True is_deleted=False' in result.stdout
-    assert 'topic_id=11 title="Release Notes" top_message_id=5011 is_general=False is_deleted=False' in result.stdout
+    assert 'topic_id=1 title="General" top_message_id=None status=general' in result.stdout
+    assert 'topic_id=11 title="Release Notes" top_message_id=5011 status=active' in result.stdout
     assert "page=2 offset_topic=11 offset_id=5011 fetched=1 total_count=3" in result.stdout
-    assert 'topic_id=12 title="Topic 12" top_message_id=6012 is_general=False is_deleted=True' in result.stdout
+    assert 'topic_id=12 title="Topic 12" top_message_id=6012 status=deleted' in result.stdout
     assert "normalized_catalog_count=3 active_count=2 deleted_count=1" in result.stdout
 
 
@@ -139,7 +139,7 @@ def test_cli_debug_topic_by_id(tmp_db_path, monkeypatch) -> None:
     monkeypatch.setattr(cli_module, "get_entity_cache", lambda: cache)
     monkeypatch.setattr(
         cli_module,
-        "_load_dialog_topics",
+        "load_dialog_topics",
         AsyncMock(
             return_value={
                 "choices": {11: "Release Notes"},
@@ -148,7 +148,7 @@ def test_cli_debug_topic_by_id(tmp_db_path, monkeypatch) -> None:
             }
         ),
     )
-    monkeypatch.setattr(cli_module, "_refresh_topic_by_id", refresh_topic)
+    monkeypatch.setattr(cli_module, "refresh_topic_by_id", refresh_topic)
 
     result = runner.invoke(
         cli_module.app,

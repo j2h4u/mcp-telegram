@@ -110,10 +110,10 @@ async def execute_search_messages_capability(
     )
 
     next_offset = None
-    navigation = None
+    next_navigation = None
     if len(hits) == limit:
         next_offset = page_offset + limit
-        navigation = CapabilityNavigation(
+        next_navigation = CapabilityNavigation(
             kind="search",
             token=encode_search_navigation(next_offset, entity_id, query),
         )
@@ -126,6 +126,6 @@ async def execute_search_messages_capability(
         context_messages_by_id=context_messages_by_id,
         reaction_names_map=reaction_names_map,
         next_offset=next_offset,
-        navigation=navigation,
+        navigation=next_navigation,
         rendered_text=rendered_text,
     )
