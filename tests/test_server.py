@@ -17,7 +17,7 @@ def _tool(name: str) -> Tool:
 
 
 def test_list_messages_reflection_exposes_shared_navigation_schema() -> None:
-    tool = server.mapping["ListMessages"]
+    tool = server.tool_by_name["ListMessages"]
     properties = tool.inputSchema["properties"]
     required = tool.inputSchema.get("required", [])
 
@@ -49,7 +49,7 @@ async def test_call_tool_validation_rejects_conflicting_list_messages_selectors(
 
 
 def test_search_messages_reflection_exposes_shared_navigation_schema() -> None:
-    tool = server.mapping["SearchMessages"]
+    tool = server.tool_by_name["SearchMessages"]
     properties = tool.inputSchema["properties"]
 
     assert "dialog" in properties
@@ -65,7 +65,7 @@ def test_search_messages_reflection_exposes_shared_navigation_schema() -> None:
 
 @pytest.mark.asyncio
 async def test_call_tool_validation_failure_escaped_error_includes_actionable_guidance(monkeypatch) -> None:
-    monkeypatch.setitem(server.mapping, "ListDialogs", _tool("ListDialogs"))
+    monkeypatch.setitem(server.tool_by_name, "ListDialogs", _tool("ListDialogs"))
 
     def _raise_validation_error(tool: Tool, **kwargs) -> object:
         raise ValueError("dialog must be a string")
@@ -84,7 +84,7 @@ async def test_call_tool_validation_failure_escaped_error_includes_actionable_gu
 
 @pytest.mark.asyncio
 async def test_call_tool_runtime_failure_escaped_error_includes_actionable_guidance(monkeypatch) -> None:
-    monkeypatch.setitem(server.mapping, "ListDialogs", _tool("ListDialogs"))
+    monkeypatch.setitem(server.tool_by_name, "ListDialogs", _tool("ListDialogs"))
     monkeypatch.setattr("mcp_telegram.server.tools.tool_args", lambda tool, **kwargs: object())
     monkeypatch.setattr(
         "mcp_telegram.server.tools.tool_runner",
@@ -103,7 +103,7 @@ async def test_call_tool_runtime_failure_escaped_error_includes_actionable_guida
 
 @pytest.mark.asyncio
 async def test_call_tool_passthrough_action_text_contract(monkeypatch) -> None:
-    monkeypatch.setitem(server.mapping, "GetUserInfo", _tool("GetUserInfo"))
+    monkeypatch.setitem(server.tool_by_name, "GetUserInfo", _tool("GetUserInfo"))
 
     expected = [
         TextContent(
@@ -132,57 +132,59 @@ async def test_call_tool_unknown_tool_control_contract() -> None:
 def test_posture_primary_tools_reflected_in_descriptions() -> None:
     """Primary tools should have [primary] tag in their reflected descriptions."""
     for name in ("ListMessages", "SearchMessages", "GetUserInfo"):
-        tool = server.mapping[name]
+        tool = server.tool_by_name[name]
         assert tool.description.startswith("[primary]"), f"{name} missing [primary] prefix"
 
 
 def test_posture_secondary_tools_reflected_in_descriptions() -> None:
     """Secondary/helper tools should have [secondary/helper] tag in descriptions."""
     for name in ("ListDialogs", "ListTopics", "GetMyAccount", "GetUsageStats"):
-        tool = server.mapping[name]
+        tool = server.tool_by_name[name]
         assert tool.description.startswith("[secondary/helper]"), f"{name} missing [secondary/helper] prefix"
 
 
 def test_posture_covers_all_registered_tools() -> None:
     """Every registered tool must have a posture classification."""
-    from mcp_telegram.tools import TOOL_POSTURE
-    for name in server.mapping:
-        assert name in TOOL_POSTURE, f"{name} not in TOOL_POSTURE"
+    from mcp_telegram.tools import TOOL_REGISTRY
+    for name in server.tool_by_name:
+        assert name in TOOL_REGISTRY, f"{name} not in TOOL_REGISTRY"
+        _cls, posture = TOOL_REGISTRY[name]
+        assert posture, f"{name} has empty posture"
 
 
 def test_posture_get_user_info_classified_as_primary() -> None:
     """GetUserInfo must be classified as primary, not helper."""
-    from mcp_telegram.tools import TOOL_POSTURE
-    assert TOOL_POSTURE["GetUserInfo"] == "primary", "GetUserInfo should be a primary user-task tool"
-    tool = server.mapping["GetUserInfo"]
+    from mcp_telegram.tools import TOOL_REGISTRY
+    assert TOOL_REGISTRY["GetUserInfo"][1] == "primary", "GetUserInfo should be a primary user-task tool"
+    tool = server.tool_by_name["GetUserInfo"]
     assert tool.description.startswith("[primary]"), "GetUserInfo missing [primary] prefix"
 
 
 def test_primary_tools_have_core_read_search_schema() -> None:
     """Primary read and search tools expose the direct-access schema patterns from Phase 17."""
     # ListMessages: must have exact_dialog_id for direct reads
-    list_messages = server.mapping["ListMessages"]
+    list_messages = server.tool_by_name["ListMessages"]
     lm_props = list_messages.inputSchema["properties"]
     assert "exact_dialog_id" in lm_props, "ListMessages missing exact_dialog_id for direct dialog access"
     assert "exact_topic_id" in lm_props, "ListMessages missing exact_topic_id for direct topic access"
     assert "navigation" in lm_props, "ListMessages missing shared navigation field"
 
     # SearchMessages: must keep dialog + query shape for direct scoping
-    search_messages = server.mapping["SearchMessages"]
+    search_messages = server.tool_by_name["SearchMessages"]
     sm_props = search_messages.inputSchema["properties"]
     assert "dialog" in sm_props, "SearchMessages missing dialog for exact numeric ID pattern"
     assert "query" in sm_props, "SearchMessages missing query"
     assert "navigation" in sm_props, "SearchMessages missing shared navigation field"
 
     # GetUserInfo: must have user field for direct user lookup
-    get_user_info = server.mapping["GetUserInfo"]
+    get_user_info = server.tool_by_name["GetUserInfo"]
     gui_props = get_user_info.inputSchema["properties"]
     assert "user" in gui_props, "GetUserInfo missing user field for direct lookup"
 
 
 def test_helper_tools_remain_available_not_hidden() -> None:
     """Secondary/helper tools remain accessible in the tool surface; they are not removed or marked unavailable."""
-    from mcp_telegram.tools import TOOL_POSTURE
+    from mcp_telegram.tools import TOOL_REGISTRY
 
     helper_tools = [
         ("ListDialogs", "secondary/helper"),
@@ -192,13 +194,13 @@ def test_helper_tools_remain_available_not_hidden() -> None:
     ]
 
     for tool_name, expected_posture in helper_tools:
-        # Must exist in TOOL_POSTURE mapping
-        assert tool_name in TOOL_POSTURE, f"{tool_name} missing from TOOL_POSTURE"
-        assert TOOL_POSTURE[tool_name] == expected_posture, f"{tool_name} has wrong posture classification"
+        # Must exist in TOOL_REGISTRY mapping
+        assert tool_name in TOOL_REGISTRY, f"{tool_name} missing from TOOL_REGISTRY"
+        assert TOOL_REGISTRY[tool_name][1] == expected_posture, f"{tool_name} has wrong posture classification"
 
         # Must be registered in server mapping (not hidden/unavailable)
-        assert tool_name in server.mapping, f"{tool_name} not registered in server"
-        tool = server.mapping[tool_name]
+        assert tool_name in server.tool_by_name, f"{tool_name} not registered in server"
+        tool = server.tool_by_name[tool_name]
 
         # Must be marked as secondary in description
         assert tool.description.startswith("[secondary/helper]"), f"{tool_name} description missing [secondary/helper] prefix"

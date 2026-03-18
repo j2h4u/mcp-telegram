@@ -63,9 +63,7 @@ def _track_tool_telemetry(tool_name: str):
     def decorator(fn):
         @functools.wraps(fn)
         async def wrapper(args):
-            logger.info("method[%s]", tool_name)
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug("method[%s] args[%s]", tool_name, args)
+            logger.debug("method[%s]", tool_name)
             t0 = time.monotonic()
             error_type = None
             tool_result: ToolResult | None = None
@@ -159,7 +157,12 @@ def tool_description(args: type[ToolArgs]) -> Tool:
 
 
 def _sanitize_tool_schema(value: t.Any) -> t.Any:
-    """Return MCP-friendly JSON schema without explicit null unions."""
+    """Return MCP-friendly JSON schema without explicit null unions.
+
+    Transforms: single-item ``anyOf`` with null variant → merged into parent dict;
+    strips ``default: None`` from non-null typed fields so MCP clients see optional
+    params as truly optional rather than defaulting to null.
+    """
     if isinstance(value, dict):
         sanitized = {key: _sanitize_tool_schema(item) for key, item in value.items()}
 
@@ -219,9 +222,12 @@ async def connected_client():
         yield client
     finally:
         if owns_connection:
-            t0 = time.monotonic()
-            await client.disconnect()
-            logger.debug("tg_disconnect: %.1fms", (time.monotonic() - t0) * 1000)
+            try:
+                t0 = time.monotonic()
+                await client.disconnect()
+                logger.debug("tg_disconnect: %.1fms", (time.monotonic() - t0) * 1000)
+            except Exception:
+                logger.warning("tg_disconnect failed", exc_info=True)
 
 
 @functools_cache

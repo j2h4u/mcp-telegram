@@ -91,14 +91,13 @@ async def _collect_unread_dialogs(
         unread_mentions_count = getattr(dialog, "unread_mentions_count", 0)
         date = getattr(dialog, "date", None)
 
-        # read_inbox_max_id from raw TL dialog — needed for min_id fetch
+        # Raw TL dialog carries read_inbox_max_id — used as min_id for fetch
         raw_dialog = getattr(dialog, "dialog", None)
         read_inbox_max_id = getattr(raw_dialog, "read_inbox_max_id", 0) if raw_dialog else 0
 
         entity = getattr(dialog, "entity", None)
         participants_count = getattr(entity, "participants_count", None) if entity is not None else None
 
-        # Apply scope filter
         if args.scope == "personal":
             if category == "channel" or (
                 category == "group"
@@ -107,13 +106,11 @@ async def _collect_unread_dialogs(
             ):
                 continue
 
-        # Cache the dialog
         try:
             cache_dialog_entry(cache, dialog)
         except sqlite3.Error as cache_exc:
             logger.warning("dialog_cache_update_failed dialog_id=%r error=%s", chat_id, cache_exc)
 
-        # Collect unread chat info
         unread_chats.append(_UnreadDialogEntry(
             chat_id=chat_id,
             display_name=display_name,
@@ -139,8 +136,6 @@ async def list_unread_messages(args: ListUnreadMessages) -> ToolResult:
             empty_msg = no_unread_all_text() if args.scope == "all" else no_unread_personal_text()
             return ToolResult(content=_text_response(empty_msg))
 
-        # Assign priority tier, sort by (tier ASC, recency DESC).
-        # Lower tier = higher priority. Add new tiers between existing values.
         for entry in unread_chats:
             entry.tier = capabilities.unread_chat_tier({
                 "unread_mentions_count": entry.unread_mentions_count,
@@ -148,11 +143,8 @@ async def list_unread_messages(args: ListUnreadMessages) -> ToolResult:
             })
 
         unread_chats.sort(key=lambda e: (e.tier, -(e.date.timestamp() if e.date else 0)))
-
-        # Allocate budget
         allocation = allocate_message_budget_proportional(unread_counts, args.limit)
 
-        # Fetch messages for each chat
         chats_data: list[UnreadChatData] = []
         total_messages_shown = 0
 
@@ -175,7 +167,6 @@ async def list_unread_messages(args: ListUnreadMessages) -> ToolResult:
                     chats_data.append(chat_data)
                 continue
 
-            # Fetch unread messages (min_id = read_inbox_max_id)
             try:
                 messages: list = []
                 async for msg in client.iter_messages(entry.chat_id, min_id=entry.read_inbox_max_id, limit=budget_for_chat):
@@ -185,10 +176,9 @@ async def list_unread_messages(args: ListUnreadMessages) -> ToolResult:
                 total_messages_shown += len(chat_data.messages)
 
             except Exception as exc:
-                logger.warning("Failed to fetch unread messages for chat %r: %s(%s)", entry.chat_id, type(exc).__name__, exc, exc_info=True)
+                logger.warning("unread_fetch_failed chat_id=%r error_type=%s error=%s", entry.chat_id, type(exc).__name__, exc, exc_info=True)
 
             chats_data.append(chat_data)
 
-    # Format output
     result_text = format_unread_messages_grouped(chats_data)
     return ToolResult(content=_text_response(result_text), result_count=total_messages_shown)

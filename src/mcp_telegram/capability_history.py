@@ -180,8 +180,6 @@ async def execute_history_read_capability(
                 )
             raw_messages = [] if fetched_messages is None else fetched_messages
             topic_cache.clear_topic_inaccessible(entity_id, int(topic_metadata["topic_id"]))
-            topic_metadata["inaccessible_error"] = None
-            topic_metadata["inaccessible_at"] = None
         else:
             raw_messages = [msg async for msg in client.iter_messages(**iter_kwargs)]
     except RPCError as exc:
@@ -245,6 +243,10 @@ async def execute_history_read_capability(
                 load_topics=load_topics,
             )
         except RPCError:
+            import logging
+            logging.getLogger(__name__).debug(
+                "cross_topic_label_build_failed entity_id=%r", entity_id, exc_info=True,
+            )
             topic_name_getter = None
 
     cursor_source_messages = raw_messages if filter_sender_after_fetch else messages
@@ -254,7 +256,7 @@ async def execute_history_read_capability(
         if isinstance(last_message_id, int):
             history_direction: HistoryNavigationMode = (
                 HISTORY_NAVIGATION_OLDEST
-                if bool(iter_kwargs["reverse"])
+                if bool(iter_kwargs.get("reverse", False))
                 else HISTORY_NAVIGATION_NEWEST
             )
             navigation_result = CapabilityNavigation(

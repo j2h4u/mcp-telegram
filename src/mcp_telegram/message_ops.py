@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Callable
+from typing import Callable, NoReturn
 
 from telethon.errors import RPCError
 from telethon.tl.functions.messages import GetMessageReactionsListRequest
@@ -90,6 +90,13 @@ def _build_history_iter_kwargs(
     topic_id: int | None,
     retry_tool: str,
 ) -> dict[str, object] | MessageReadFailure | NavigationFailure:
+    """Build kwargs dict for ``client.iter_messages()`` from navigation input.
+
+    On success returns a dict suitable for ``**kwargs`` expansion into
+    ``iter_messages``.  Keys always include ``entity``, ``limit``, ``reverse``;
+    may include ``min_id`` or ``max_id`` depending on direction and cursor.
+    Returns ``NavigationFailure`` on invalid cursor tokens.
+    """
     navigation_result = parse_history_navigation_input(
         navigation,
         retry_tool=retry_tool,
@@ -140,6 +147,7 @@ def _resolve_sender_entity(
     sender_query: str | None,
     retry_tool: str,
 ) -> int | MessageReadFailure | None:
+    """Resolve sender filter: None → no filter, int → entity_id, failure → not found/ambiguous."""
     if sender_query is None:
         return None
 
@@ -187,29 +195,36 @@ def _cache_message_senders(
         )
 
 
+def _get_reply_to_id(msg: object) -> int | None:
+    """Extract reply_to_msg_id from a Telethon message, or None."""
+    reply_to = getattr(msg, "reply_to", None)
+    reply_id = getattr(reply_to, "reply_to_msg_id", None) if reply_to else None
+    return reply_id if isinstance(reply_id, int) else None
+
+
+def _get_message_id(msg: object) -> int | None:
+    """Extract message id from a Telethon message, or None."""
+    msg_id = getattr(msg, "id", None)
+    return msg_id if isinstance(msg_id, int) else None
+
+
 async def _build_reply_map(
     client: object,
     *,
     entity_id: int,
     messages: list[object],
 ) -> dict[int, object]:
-    reply_ids = list(
-        {
-            reply_to_msg_id
-            for msg in messages
-            for reply_to_msg_id in [getattr(getattr(msg, "reply_to", None), "reply_to_msg_id", None)]
-            if isinstance(reply_to_msg_id, int)
-        }
-    )
+    """Fetch original messages for all reply references in the message list."""
+    reply_ids = list({rid for msg in messages if (rid := _get_reply_to_id(msg)) is not None})
     if not reply_ids:
         return {}
 
     replied = await client.get_messages(entity_id, ids=reply_ids)
     replied_list = replied if isinstance(replied, list) else [replied]
     return {
-        getattr(message, "id"): message
+        mid: message
         for message in replied_list
-        if message is not None and isinstance(getattr(message, "id", None), int)
+        if message is not None and (mid := _get_message_id(message)) is not None
     }
 
 
@@ -221,6 +236,11 @@ async def _build_reaction_names_map(
     messages: list[object],
     reaction_names_threshold: int,
 ) -> dict[int, dict[str, list[str]]]:
+    """Fetch reactor names for messages with total reactions ≤ threshold.
+
+    Skips messages above threshold (busy groups). Caches results in
+    ReactionMetadataCache. Side effect: upserts reactor users into EntityCache.
+    """
     reaction_names_map: dict[int, dict[str, list[str]]] = {}
     reaction_cache = ReactionMetadataCache(cache._conn)
 
@@ -251,6 +271,10 @@ async def _build_reaction_names_map(
                 )
             )
         except Exception:
+            logger.debug(
+                "reaction_names_fetch_failed msg_id=%d dialog_id=%d",
+                message_id, entity_id, exc_info=True,
+            )
             continue
 
         user_by_id = {
@@ -291,13 +315,9 @@ async def _build_context_message_map(
     hits: list[object],
     context_radius: int,
 ) -> dict[int, object]:
+    """Fetch surrounding context messages for search hits."""
     context_ids_needed: set[int] = set()
-    hit_ids = {
-        message_id
-        for hit in hits
-        for message_id in [getattr(hit, "id", None)]
-        if isinstance(message_id, int)
-    }
+    hit_ids = {mid for hit in hits if (mid := _get_message_id(hit)) is not None}
     for hit_id in hit_ids:
         for offset in range(-context_radius, context_radius + 1):
             if offset != 0:
@@ -309,10 +329,9 @@ async def _build_context_message_map(
     fetched = await client.get_messages(entity_id, ids=list(context_ids_needed))
     fetched_list = fetched if isinstance(fetched, list) else [fetched]
     return {
-        message_id: message
+        mid: message
         for message in fetched_list
-        for message_id in [getattr(message, "id", None)]
-        if message is not None and isinstance(message_id, int)
+        if message is not None and (mid := _get_message_id(message)) is not None
     }
 
 
@@ -327,11 +346,12 @@ async def _build_cross_topic_name_getter(
     topic_cache: TopicMetadataCache | None,
     load_topics: TopicLoader | None,
 ) -> Callable[[object], str | None] | None:
-    dialog_cache_entry = cache.get(entity_id, GROUP_TTL)
+    """Return a topic-label getter for groups, or None for non-group dialogs."""
+    cached_entity = cache.get(entity_id, GROUP_TTL)
     if (
         not fetched_messages
-        or dialog_cache_entry is None
-        or dialog_cache_entry.get("type") != "group"
+        or cached_entity is None
+        or cached_entity.get("type") != "group"
     ):
         return None
 
@@ -362,6 +382,13 @@ async def _build_cross_topic_name_getter(
     return build_topic_name_getter(active_topic_catalog)
 
 
+def _reraise_topic_invalid(exc: RPCError | None, context: str) -> NoReturn:
+    """Re-raise captured TOPIC_ID_INVALID or raise RuntimeError if unexpectedly absent."""
+    if exc is not None:
+        raise exc
+    raise RuntimeError(f"Missing {context} TOPIC_ID_INVALID exception — this is a bug")
+
+
 async def fetch_messages_for_topic(
     client: object,
     *,
@@ -374,78 +401,72 @@ async def fetch_messages_for_topic(
     refresh_topic_by_id_fn: Callable | None = None,
 ) -> tuple[list[object] | None, TopicMetadata, dict[str, object]]:
     """Fetch one topic page with one bounded by-ID refresh and retry on stale anchors."""
-    active_iter_kwargs = dict(iter_kwargs)
-    active_topic_metadata = topic_metadata
+    current_iter_kwargs = dict(iter_kwargs)
+    current_topic_metadata = topic_metadata
     original_exc: RPCError | None = None
     retry_invalid_exc: RPCError | None = None
-    active_fetch_topic_messages = fetch_topic_messages_fn if fetch_topic_messages_fn is not None else fetch_topic_messages
-    active_refresh_topic_by_id = refresh_topic_by_id_fn if refresh_topic_by_id_fn is not None else refresh_topic_by_id
+    fetch_fn = fetch_topic_messages_fn if fetch_topic_messages_fn is not None else fetch_topic_messages
+    refresh_fn = refresh_topic_by_id_fn if refresh_topic_by_id_fn is not None else refresh_topic_by_id
 
     async def scan_dialog_history_for_topic() -> tuple[list[object], dict[str, object]]:
         """Fallback to dialog-wide history scanning when thread fetch rejects a valid topic anchor."""
-        history_iter_kwargs = dict(active_iter_kwargs)
+        history_iter_kwargs = dict(current_iter_kwargs)
         history_iter_kwargs.pop("reply_to", None)
-        messages = await active_fetch_topic_messages(
+        messages = await fetch_fn(
             client,
             iter_kwargs=history_iter_kwargs,
-            topic_metadata=active_topic_metadata,
+            topic_metadata=current_topic_metadata,
             allow_headerless_messages=False,
         )
         return messages, history_iter_kwargs
 
     try:
-        messages = await active_fetch_topic_messages(
+        messages = await fetch_fn(
             client,
-            iter_kwargs=active_iter_kwargs,
-            topic_metadata=active_topic_metadata,
+            iter_kwargs=current_iter_kwargs,
+            topic_metadata=current_topic_metadata,
             allow_headerless_messages=allow_headerless_messages,
         )
-        return messages, active_topic_metadata, active_iter_kwargs
+        return messages, current_topic_metadata, current_iter_kwargs
     except RPCError as exc:
         if not is_topic_id_invalid_error(exc):
             raise
         original_exc = exc
 
-    refreshed_topic = await active_refresh_topic_by_id(
+    refreshed_topic = await refresh_fn(
         client,
         entity=entity_id,
         dialog_id=entity_id,
-        topic_id=int(active_topic_metadata["topic_id"]),
+        topic_id=int(current_topic_metadata["topic_id"]),
         topic_cache=topic_cache,
     )
     if refreshed_topic is None:
-        if original_exc is not None:
-            raise original_exc
-        raise RuntimeError("Missing original TOPIC_ID_INVALID exception during refresh path")
+        _reraise_topic_invalid(original_exc, "original")
 
-    active_topic_metadata = refreshed_topic
-    if bool(active_topic_metadata["is_deleted"]):
-        return None, active_topic_metadata, active_iter_kwargs
+    current_topic_metadata = refreshed_topic
+    if bool(current_topic_metadata["is_deleted"]):
+        return None, current_topic_metadata, current_iter_kwargs
 
-    refreshed_top_message_id = active_topic_metadata["top_message_id"]
+    refreshed_top_message_id = current_topic_metadata["top_message_id"]
     if refreshed_top_message_id is None:
-        if original_exc is not None:
-            raise original_exc
-        raise RuntimeError("Missing original TOPIC_ID_INVALID exception during refresh path")
+        _reraise_topic_invalid(original_exc, "original")
 
     refreshed_reply_to = int(refreshed_top_message_id)
-    if active_iter_kwargs.get("reply_to") == refreshed_reply_to:
+    if current_iter_kwargs.get("reply_to") == refreshed_reply_to:
         dialog_messages, dialog_iter_kwargs = await scan_dialog_history_for_topic()
         if dialog_messages:
-            return dialog_messages, active_topic_metadata, dialog_iter_kwargs
-        if original_exc is not None:
-            raise original_exc
-        raise RuntimeError("Missing original TOPIC_ID_INVALID exception during refresh path")
+            return dialog_messages, current_topic_metadata, dialog_iter_kwargs
+        _reraise_topic_invalid(original_exc, "original")
 
-    active_iter_kwargs["reply_to"] = refreshed_reply_to
+    current_iter_kwargs["reply_to"] = refreshed_reply_to
     try:
-        messages = await active_fetch_topic_messages(
+        messages = await fetch_fn(
             client,
-            iter_kwargs=active_iter_kwargs,
-            topic_metadata=active_topic_metadata,
+            iter_kwargs=current_iter_kwargs,
+            topic_metadata=current_topic_metadata,
             allow_headerless_messages=allow_headerless_messages,
         )
-        return messages, active_topic_metadata, active_iter_kwargs
+        return messages, current_topic_metadata, current_iter_kwargs
     except RPCError as retry_exc:
         if not is_topic_id_invalid_error(retry_exc):
             raise
@@ -453,7 +474,5 @@ async def fetch_messages_for_topic(
 
     dialog_messages, dialog_iter_kwargs = await scan_dialog_history_for_topic()
     if dialog_messages:
-        return dialog_messages, active_topic_metadata, dialog_iter_kwargs
-    if retry_invalid_exc is not None:
-        raise retry_invalid_exc
-    raise RuntimeError("Missing retry TOPIC_ID_INVALID exception during dialog-scan fallback")
+        return dialog_messages, current_topic_metadata, dialog_iter_kwargs
+    _reraise_topic_invalid(retry_invalid_exc, "retry")

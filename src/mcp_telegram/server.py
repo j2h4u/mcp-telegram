@@ -29,10 +29,10 @@ _MAX_ERROR_DETAIL_LENGTH = 160
 @cache
 def enumerate_available_tools() -> list[tuple[str, Tool]]:
     tools.verify_tool_registry()
-    return [(name, tools.tool_description(cls)) for name, cls in tools.TOOL_REGISTRY.items()]
+    return [(name, tools.tool_description(cls)) for name, (cls, _posture) in tools.TOOL_REGISTRY.items()]
 
 
-mapping: dict[str, Tool] = dict(enumerate_available_tools())
+tool_by_name: dict[str, Tool] = dict(enumerate_available_tools())
 
 
 def _safe_boundary_error_text(*, tool_name: str, stage: str, exc: Exception) -> str:
@@ -54,31 +54,31 @@ def _safe_boundary_error_text(*, tool_name: str, stage: str, exc: Exception) -> 
 
 @app.list_prompts()
 async def list_prompts() -> list[Prompt]:
-    """List available prompts."""
+    """Return empty list — prompts not implemented."""
     return []
 
 
 @app.list_resources()
 async def list_resources() -> list[Resource]:
-    """List available resources."""
+    """Return empty list — resources not implemented."""
     return []
 
 
 @app.list_tools()
 async def list_tools() -> list[Tool]:
     """List available tools."""
-    return list(mapping.values())
+    return list(tool_by_name.values())
 
 
 @app.list_resource_templates()
 async def list_resource_templates() -> list[ResourceTemplate]:
-    """List available resource templates."""
+    """Return empty list — resource templates not implemented."""
     return []
 
 
 @app.progress_notification()
 async def progress_notification(progress: str | int, p: float, s: float | None) -> None:
-    """Progress notification."""
+    """No-op handler required by MCP protocol."""
 
 
 @app.call_tool()
@@ -88,7 +88,7 @@ async def call_tool(name: str, arguments: t.Any) -> Sequence[TextContent | Image
     if not isinstance(arguments, dict):
         raise TypeError("arguments must be dictionary")
 
-    tool = mapping.get(name)
+    tool = tool_by_name.get(name)
     if not tool:
         raise ValueError(f"Unknown tool: {name}")
 

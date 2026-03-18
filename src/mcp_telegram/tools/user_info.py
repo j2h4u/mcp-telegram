@@ -64,7 +64,7 @@ async def get_user_info(args: GetUserInfo) -> ToolResult:
                 limit=100,
             ))
         except Exception as exc:
-            logger.warning("get_user_info entity_id=%r failed: %s", entity_id, exc)
+            logger.warning("get_user_info entity_id=%r failed: %s", entity_id, exc, exc_info=True)
             return ToolResult(content=_text_response(fetch_user_info_error_text(args.user, type(exc).__name__)))
 
     name = " ".join(filter(None, [
@@ -77,12 +77,12 @@ async def get_user_info(args: GetUserInfo) -> ToolResult:
         chat_name = getattr(chat, "title", None) or getattr(chat, "first_name", str(chat.id))
         full_id = get_peer_id(chat)
         if isinstance(chat, Channel):
-            ctype = "supergroup" if getattr(chat, "megagroup", False) else "channel"
+            chat_type = "supergroup" if getattr(chat, "megagroup", False) else "channel"
         elif isinstance(chat, Chat):
-            ctype = "group"
+            chat_type = "group"
         else:
-            ctype = "user"
-        chat_lines.append(f"  id={full_id} type={ctype} name='{chat_name}'")
+            chat_type = "user"
+        chat_lines.append(f"  id={full_id} type={chat_type} name='{chat_name}'")
     chats_text = "\n".join(chat_lines) if chat_lines else "  (none)"
     text = (
         f'[resolved: "{display_name}"]\n'

@@ -7,16 +7,20 @@
           "ListDialogs",
           "ListMessages",
           "SearchMessages",
-          "ListTopics"
+          "ListTopics",
+          "ListUnreadMessages",
+          "GetMyAccount",
+          "GetUserInfo",
+          "GetUsageStats"
         ],
         "tool_expectations": {
           "ListMessages": {
             "inputSchema.properties.limit.default": 50,
-            "inputSchema.properties.cursor.type": "string",
+            "inputSchema.properties.navigation.type": "string",
             "inputSchema.properties.topic.type": "string"
           },
           "SearchMessages": {
-            "inputSchema.properties.offset.type": "integer"
+            "inputSchema.properties.navigation.type": "string"
           }
         }
       }
@@ -62,7 +66,7 @@
         "content_text_contains": [
           "[resolved: \"-1003779402801\" → Studio Robots and Inbox]",
           "[topic: Inbox]",
-          "next_cursor:"
+          "next_navigation:"
         ]
       }
     },
@@ -91,7 +95,7 @@
       "expect": {
         "is_error": false,
         "content_text_contains": [
-          "Topic not found: \"DeletedTopic123\""
+          "was not found"
         ]
       }
     }

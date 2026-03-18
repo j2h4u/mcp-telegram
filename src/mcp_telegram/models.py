@@ -68,6 +68,7 @@ class DialogMatch:
 
 @dataclass(frozen=True)
 class DialogTargetFailure:
+    """Dialog resolution failure: ``not_found`` or ``ambiguous`` (with candidate matches)."""
     kind: Literal["not_found", "ambiguous"]
     query: str
     text: str
@@ -91,6 +92,7 @@ class ResolvedDialogTarget:
 
 @dataclass(frozen=True)
 class TopicMatch:
+    """One candidate from fuzzy topic resolution (used in ambiguous responses)."""
     entity_id: int
     display_name: str
     score: int
@@ -117,6 +119,7 @@ class ForumTopicFailure:
 
 @dataclass(frozen=True)
 class ResolvedForumTopic:
+    """Successfully resolved forum topic. ``reply_to_message_id`` is None for General topic."""
     query: str
     display_name: str
     metadata: TopicMetadata
@@ -150,6 +153,7 @@ class CapabilityNavigation:
 
 @dataclass(frozen=True)
 class ListTopicsExecution:
+    """Successful topic listing — ``active_topics`` excludes deleted topics."""
     resolve_prefix: str
     dialog_name: str
     active_topics: tuple[TopicMetadata, ...]

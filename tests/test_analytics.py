@@ -113,7 +113,7 @@ class TestTelemetryEventSchema:
 
     def test_telemetry_posture_aware_tool_names_remain_unchanged(self):
         """Telemetry remains agnostic to tool posture classification; tool_name field unchanged."""
-        from mcp_telegram.tools import TOOL_POSTURE
+        from mcp_telegram.tools import TOOL_REGISTRY
 
         # Events for primary tools should use the same field name as secondary tools
         primary_event = TelemetryEvent(
@@ -138,17 +138,11 @@ class TestTelemetryEventSchema:
             error_type=None,
         )
 
-        # Both events have the same tool_name field; posture is not encoded in telemetry
-        assert hasattr(primary_event, "tool_name")
-        assert hasattr(secondary_event, "tool_name")
-        assert primary_event.tool_name == "ListMessages"
-        assert secondary_event.tool_name == "ListDialogs"
-
-        # Verify tool names exist in TOOL_POSTURE but telemetry schema is invariant
-        assert "ListMessages" in TOOL_POSTURE
-        assert "ListDialogs" in TOOL_POSTURE
-        assert TOOL_POSTURE["ListMessages"] == "primary"
-        assert TOOL_POSTURE["ListDialogs"] == "secondary/helper"
+        # Verify tool registry classifies tools by posture but telemetry is agnostic
+        assert "ListMessages" in TOOL_REGISTRY
+        assert "ListDialogs" in TOOL_REGISTRY
+        assert TOOL_REGISTRY["ListMessages"][1] == "primary"
+        assert TOOL_REGISTRY["ListDialogs"][1] == "secondary/helper"
 
 
 class TestTelemetryCollectorInitialization:
@@ -394,7 +388,7 @@ class TestUsageSummaryFormatting:
 
     def test_usage_summary_metrics(self):
         """format_usage_summary includes tool frequency, error rates, latency."""
-        from mcp_telegram.tools import format_usage_summary
+        from mcp_telegram.analytics import format_usage_summary
 
         stats = {
             "tool_distribution": {"ListMessages": 10, "ListDialogs": 3},
@@ -410,11 +404,10 @@ class TestUsageSummaryFormatting:
         summary = format_usage_summary(stats)
 
         # Verify metrics present
-        assert "ListMessages" in summary
-        assert ("76%" in summary or "77%" in summary or "10" in summary)  # top tool frequency (10/13 = 76.9%)
-        assert "Deep scrolling" in summary  # page_depth >= 5
-        assert "NotFound" in summary or "Errors" in summary  # error distribution
-        assert "Filtered" in summary or "ms" in summary  # filter or latency
+        assert "Most active: ListMessages (76% of calls)" in summary
+        assert "Deep scrolling detected: max page depth 8" in summary
+        assert "NotFound" in summary
+        assert "Filtered queries: 38%" in summary
 
         # Verify token count
         token_count = len(summary.split())
@@ -422,7 +415,7 @@ class TestUsageSummaryFormatting:
 
     def test_usage_summary_empty_distribution(self):
         """format_usage_summary handles empty tool/error distributions."""
-        from mcp_telegram.tools import format_usage_summary
+        from mcp_telegram.analytics import format_usage_summary
 
         stats = {
             "tool_distribution": {},
@@ -443,7 +436,7 @@ class TestUsageSummaryFormatting:
 
     def test_usage_summary_no_deep_scroll(self):
         """format_usage_summary omits deep scroll message when max_page_depth < 5."""
-        from mcp_telegram.tools import format_usage_summary
+        from mcp_telegram.analytics import format_usage_summary
 
         stats = {
             "tool_distribution": {"ListMessages": 5},
@@ -463,7 +456,7 @@ class TestUsageSummaryFormatting:
 
     def test_usage_summary_with_deep_scroll(self):
         """format_usage_summary includes deep scroll message when max_page_depth >= 5."""
-        from mcp_telegram.tools import format_usage_summary
+        from mcp_telegram.analytics import format_usage_summary
 
         stats = {
             "tool_distribution": {"ListMessages": 5},
@@ -483,7 +476,7 @@ class TestUsageSummaryFormatting:
 
     def test_usage_summary_truncation(self):
         """format_usage_summary truncates if exceeding 100 tokens."""
-        from mcp_telegram.tools import format_usage_summary
+        from mcp_telegram.analytics import format_usage_summary
 
         # Create stats with many error types to stress test
         error_dist = {f"Error{i}": i + 1 for i in range(50)}
@@ -506,7 +499,7 @@ class TestUsageSummaryFormatting:
 
     def test_usage_summary_latency_formatting(self):
         """format_usage_summary formats latency with 0 decimal places."""
-        from mcp_telegram.tools import format_usage_summary
+        from mcp_telegram.analytics import format_usage_summary
 
         stats = {
             "tool_distribution": {"ListMessages": 10},
@@ -646,12 +639,6 @@ class TestAnalyticsCleanup:
         conn = sqlite3.connect(str(tmp_analytics_db))
         try:
             # If optimize was called, query should still work fine
-            cursor = conn.execute("SELECT COUNT(*) FROM telemetry_events")
-            count = cursor.fetchone()[0]
-            assert count >= 0, "Database should be accessible after optimize"
-
-            # Verify database integrity after optimize
-            # (PRAGMA integrity_check should return 'ok')
             cursor = conn.execute("PRAGMA integrity_check")
             result = cursor.fetchone()
             assert result is not None, "PRAGMA integrity_check should return result"

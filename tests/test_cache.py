@@ -47,7 +47,6 @@ def test_upsert_update(tmp_db_path: Path) -> None:
     first_ts = cache.get(101, ttl_seconds=2_592_000)
     assert first_ts is not None
 
-    time.sleep(0.01)
     cache.upsert(101, "user", "Ivan Updated", "ivan_new")
     second = cache.get(101, ttl_seconds=2_592_000)
     assert second is not None

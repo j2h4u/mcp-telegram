@@ -248,7 +248,7 @@ async def test_load_forum_topic_capability_returns_inaccessible_failure(
     cache = EntityCache(tmp_db_path)
     topic_cache = TopicMetadataCache(cache._conn)
     load_topics = AsyncMock(side_effect=RPCError(request=None, message="CHAT_NOT_FORUM", code=400))
-    monkeypatch.setattr("mcp_telegram.capabilities.load_dialog_topics", load_topics)
+    monkeypatch.setattr("mcp_telegram.forum_topics.load_dialog_topics", load_topics)
 
     result = await load_forum_topic_capability(
         mock_client,
@@ -321,8 +321,8 @@ async def test_fetch_messages_for_topic_refreshes_stale_anchor(
     )
 
     refresh_topic = AsyncMock(return_value=refreshed_topic)
-    monkeypatch.setattr("mcp_telegram.capabilities.refresh_topic_by_id", refresh_topic)
-    monkeypatch.setattr("mcp_telegram.capabilities.fetch_topic_messages", fetch_topic_messages)
+    monkeypatch.setattr("mcp_telegram.message_ops.refresh_topic_by_id", refresh_topic)
+    monkeypatch.setattr("mcp_telegram.message_ops.fetch_topic_messages", fetch_topic_messages)
 
     fetched_messages, returned_topic, returned_iter_kwargs = await fetch_messages_for_topic(
         mock_client,
@@ -408,7 +408,7 @@ async def test_execute_history_read_capability_filters_topic_sender_locally_and_
         unread=False,
         retry_tool="ListMessages",
         resolve_dialog=resolver,
-        get_sender_type=lambda _sender: "user",
+
         reaction_names_threshold=15,
         load_topics=load_topics,
         fetch_topic_messages_fn=fetch_topic_messages,
@@ -455,7 +455,7 @@ async def test_execute_history_read_capability_exposes_shared_navigation_for_top
         unread=False,
         retry_tool="ListMessages",
         resolve_dialog=resolver,
-        get_sender_type=lambda _sender: "user",
+
         reaction_names_threshold=15,
         load_topics=load_topics,
         fetch_topic_messages_fn=fetch_topic_messages,
@@ -501,7 +501,7 @@ async def test_execute_history_read_capability_uses_exact_targets_without_resolu
         unread=False,
         retry_tool="ListMessages",
         resolve_dialog=resolver,
-        get_sender_type=lambda _sender: "user",
+
         reaction_names_threshold=15,
         load_topics=load_topics,
         fetch_topic_messages_fn=fetch_topic_messages,
@@ -532,7 +532,7 @@ async def test_execute_history_read_capability_returns_navigation_failure(tmp_db
         unread=False,
         retry_tool="ListMessages",
         resolve_dialog=resolver,
-        get_sender_type=lambda _sender: "user",
+
         reaction_names_threshold=15,
     )
 
@@ -559,7 +559,7 @@ async def test_execute_history_read_capability_rejects_search_navigation_token(
         unread=False,
         retry_tool="ListMessages",
         resolve_dialog=resolver,
-        get_sender_type=lambda _sender: "user",
+
         reaction_names_threshold=15,
     )
 
@@ -587,7 +587,7 @@ async def test_execute_search_messages_capability_reuses_shared_enrichment(
     reaction_builder = AsyncMock(return_value={50: {"👍": ["Alice"]}})
     upsert_spy = MagicMock(wraps=cache.upsert)
     monkeypatch.setattr(cache, "upsert", upsert_spy)
-    monkeypatch.setattr("mcp_telegram.capabilities._build_reaction_names_map", reaction_builder)
+    monkeypatch.setattr("mcp_telegram.capability_search._build_reaction_names_map", reaction_builder)
     mock_client.iter_messages = _fake_iter_messages
     mock_client.get_messages = AsyncMock(return_value=[context])
 
@@ -600,7 +600,7 @@ async def test_execute_search_messages_capability_reuses_shared_enrichment(
         navigation=None,
         retry_tool="SearchMessages",
         resolve_dialog=resolver,
-        get_sender_type=lambda _sender: "user",
+
         reaction_names_threshold=15,
     )
 
@@ -639,7 +639,7 @@ async def test_execute_search_messages_capability_exposes_shared_navigation(
         navigation=None,
         retry_tool="SearchMessages",
         resolve_dialog=resolver,
-        get_sender_type=lambda _sender: "user",
+
         reaction_names_threshold=15,
     )
 
@@ -678,7 +678,7 @@ async def test_execute_search_messages_capability_uses_exact_dialog_id_without_r
         navigation=None,
         retry_tool="SearchMessages",
         resolve_dialog=resolver,
-        get_sender_type=lambda _sender: "user",
+
         reaction_names_threshold=15,
         exact=ExactTargetHints(dialog_id=701, dialog_name="Backend Forum"),
     )
@@ -706,7 +706,7 @@ async def test_execute_search_messages_capability_rejects_query_mismatch_navigat
         limit=1,
         retry_tool="SearchMessages",
         resolve_dialog=resolver,
-        get_sender_type=lambda _sender: "user",
+
         reaction_names_threshold=15,
         navigation=encode_search_navigation(5, 701, "deploy"),
     )
@@ -732,7 +732,7 @@ async def test_execute_search_messages_capability_rejects_dialog_mismatch_naviga
         limit=1,
         retry_tool="SearchMessages",
         resolve_dialog=resolver,
-        get_sender_type=lambda _sender: "user",
+
         reaction_names_threshold=15,
         navigation=encode_search_navigation(5, 702, "ship"),
     )
@@ -775,18 +775,16 @@ def test_allocate_budget_proportional_trim() -> None:
 
 
 def test_allocate_budget_min_per_chat_respected() -> None:
-    """Even small counts get min_per_chat allocation."""
+    """When over limit, every chat gets at least min_per_chat messages."""
     from mcp_telegram.capabilities import allocate_message_budget_proportional
 
-    unread_counts = {1: 1, 2: 1}  # tiny unread
-    result = allocate_message_budget_proportional(unread_counts, limit=10, min_per_chat=3)
+    # Total unread (300) > limit (30) → proportional allocation path
+    unread_counts = {1: 200, 2: 50, 3: 50}
+    result = allocate_message_budget_proportional(unread_counts, limit=30, min_per_chat=3)
 
-    # Each should get at least 3, but capped at actual unread count
-    # Since unread is 1, they should get min(3, 1) = 1 each? Or preserve minimum?
-    # Per spec: min_per_chat is for distribution when over limit. Here we have room.
-    # Fallback: if reserved exceeds limit, distribute evenly
-    # 3*2 = 6 ≤ 10, so reserve and distribute
-    assert all(v >= 1 for v in result.values())
+    assert sum(result.values()) <= 30
+    for chat_id in unread_counts:
+        assert result[chat_id] >= 3, f"chat {chat_id} got {result[chat_id]}, expected >= 3"
 
 
 def test_allocate_budget_empty() -> None:

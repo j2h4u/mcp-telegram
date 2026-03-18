@@ -1,9 +1,19 @@
 from __future__ import annotations
 
 import pytest
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
-from mcp_telegram.resolver import Candidates, NotFound, Resolved, latinize, resolve
+from mcp_telegram.resolver import (
+    Candidates,
+    NotFound,
+    Resolved,
+    ResolvedWithMessage,
+    _parse_tme_link,
+    latinize,
+    resolve,
+    resolve_dialog,
+)
 from mcp_telegram.cache import EntityCache
 
 
@@ -131,8 +141,6 @@ def test_exact_match_wins_over_ambiguity() -> None:
     assert result.display_name == "Sergei Khabarov"
 
 
-### NEW TESTS FOR REDESIGNED RESOLVER ###
-
 def test_numeric_id_in_cache_resolves() -> None:
     choices = {12345: "Alice", 67890: "Bob"}
     result = resolve("12345", choices)
@@ -209,15 +217,12 @@ def test_no_fuzzy_matches_returns_not_found() -> None:
 
 
 def test_cyrillic_cross_script_still_works() -> None:
-    """Cyrillic query matches Latin name via normalization."""
+    """Cyrillic multi-word query matches Latin name via normalization → Candidates with top match."""
     choices = {101: "Sergei Khabarov"}
     result = resolve("сергей хабаров", choices)
-    assert isinstance(result, (Resolved, Candidates))
-    if isinstance(result, Resolved):
-        assert result.entity_id == 101
-    elif isinstance(result, Candidates):
-        assert len(result.matches) >= 1
-        assert result.matches[0]["entity_id"] == 101
+    assert isinstance(result, Candidates)
+    assert len(result.matches) >= 1
+    assert result.matches[0]["entity_id"] == 101
 
 
 def test_cyrillic_query_resolves_latin_name_over_partial_cyrillic_match() -> None:
@@ -283,3 +288,118 @@ def test_normalized_choices_param() -> None:
     result = resolve("Ольга Петрова", choices, normalized_choices=normalized)
     assert isinstance(result, Resolved)
     assert result.entity_id == 1
+
+
+def test_parse_tme_link_full_url_with_message() -> None:
+    result = _parse_tme_link("https://t.me/vlbecode/355")
+    assert result == ("vlbecode", 355)
+
+
+def test_parse_tme_link_full_url_without_message() -> None:
+    result = _parse_tme_link("https://t.me/vlbecode")
+    assert result == ("vlbecode", None)
+
+
+def test_parse_tme_link_no_scheme() -> None:
+    result = _parse_tme_link("t.me/vlbecode/355")
+    assert result == ("vlbecode", 355)
+
+
+def test_parse_tme_link_http() -> None:
+    result = _parse_tme_link("http://t.me/vlbecode")
+    assert result == ("vlbecode", None)
+
+
+def test_parse_tme_link_not_a_link() -> None:
+    assert _parse_tme_link("@vlbecode") is None
+    assert _parse_tme_link("some random text") is None
+    assert _parse_tme_link("101") is None
+
+
+def test_parse_tme_link_short_username_rejected() -> None:
+    """Telegram usernames must be ≥5 chars (4 after prefix), reject 3-char."""
+    assert _parse_tme_link("t.me/abc") is None
+
+
+@pytest.fixture()
+def mock_client_factory(mock_client: AsyncMock):
+    """Return a client factory that yields the mock_client."""
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def factory():
+        yield mock_client
+
+    return factory
+
+
+@pytest.mark.asyncio
+async def test_resolve_dialog_tme_link_via_api(mock_cache: EntityCache, mock_client_factory) -> None:
+    """t.me link resolves via get_entity API call when not in cache."""
+    mock_client = mock_client_factory
+    # We need the actual client mock from the factory
+    entity = SimpleNamespace(
+        id=12345,
+        first_name="vlbe",
+        last_name=None,
+        title="vlbe code",
+        username="vlbecode",
+    )
+
+    # Patch the factory to set up get_entity
+    from contextlib import asynccontextmanager
+
+    client_mock = AsyncMock()
+    client_mock.get_entity = AsyncMock(return_value=entity)
+
+    @asynccontextmanager
+    async def factory():
+        yield client_mock
+
+    result = await resolve_dialog("https://t.me/vlbecode/355", mock_cache, factory)
+    assert isinstance(result, ResolvedWithMessage)
+    assert result.entity_id == 12345
+    assert result.message_id == 355
+    assert result.display_name == "vlbe code"
+
+
+@pytest.mark.asyncio
+async def test_resolve_dialog_username_cache_hit(mock_cache: EntityCache, mock_client_factory) -> None:
+    """@username resolves from cache without API call."""
+    result = await resolve_dialog("@ivan", mock_cache, mock_client_factory)
+    assert isinstance(result, Resolved)
+    assert result.entity_id == 101
+    assert result.display_name == "Иван Петров"
+
+
+@pytest.mark.asyncio
+async def test_resolve_dialog_username_api_fallback(mock_cache: EntityCache) -> None:
+    """@username not in cache falls back to API."""
+    from contextlib import asynccontextmanager
+
+    entity = SimpleNamespace(
+        id=999,
+        first_name="New",
+        last_name="User",
+        title=None,
+        username="newuser",
+    )
+    client_mock = AsyncMock()
+    client_mock.get_entity = AsyncMock(return_value=entity)
+
+    @asynccontextmanager
+    async def factory():
+        yield client_mock
+
+    result = await resolve_dialog("@newuser", mock_cache, factory)
+    assert isinstance(result, Resolved)
+    assert result.entity_id == 999
+    assert result.display_name == "New User"
+
+
+@pytest.mark.asyncio
+async def test_resolve_dialog_fuzzy_from_cache(mock_cache: EntityCache, mock_client_factory) -> None:
+    """Fuzzy name resolves from cache without warmup."""
+    result = await resolve_dialog("Иван Петров", mock_cache, mock_client_factory)
+    assert isinstance(result, Resolved)
+    assert result.entity_id == 101

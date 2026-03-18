@@ -3481,7 +3481,7 @@ def test_list_unread_messages_registered_in_tool_registry() -> None:
     (0, "group", 50),   # UNREAD_TIER_SMALL_GROUP
 ])
 def test_unread_chat_tier(mentions, category, expected_tier):
-    """unread_chat_tier classifies all 7 priority tiers correctly."""
+    """unread_chat_tier classifies all 6 priority tiers correctly."""
     from mcp_telegram.budget import unread_chat_tier
     assert unread_chat_tier({"unread_mentions_count": mentions, "category": category}) == expected_tier
 

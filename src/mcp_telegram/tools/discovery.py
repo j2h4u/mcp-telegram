@@ -30,12 +30,12 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
     lines: list[str] = []
     batch_entities: list[tuple[int, str, str, str | None]] = []
     async with connected_client() as client:
-        telethon_archived_param = None if not args.exclude_archived else False
+        archived_filter = None if not args.exclude_archived else False
 
         async for dialog in client.iter_dialogs(
-            archived=telethon_archived_param, ignore_pinned=args.ignore_pinned
+            archived=archived_filter, ignore_pinned=args.ignore_pinned
         ):
-            dtype = classify_dialog(dialog)
+            dialog_type = classify_dialog(dialog)
             last_at = dialog.date.strftime("%Y-%m-%d %H:%M") if dialog.date else "unknown"
             # Collect for batch cache upsert
             dialog_id = getattr(dialog, "id", None)
@@ -43,9 +43,9 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
             if isinstance(dialog_id, int) and isinstance(dialog_name, str):
                 entity = getattr(dialog, "entity", None)
                 username = getattr(entity, "username", None) if entity is not None else None
-                batch_entities.append((dialog_id, dtype, dialog_name, username))
+                batch_entities.append((dialog_id, dialog_type, dialog_name, username))
             lines.append(
-                f"name='{dialog.name}' id={dialog.id} type={dtype} "
+                f"name='{dialog.name}' id={dialog.id} type={dialog_type} "
                 f"last_message_at={last_at} unread={dialog.unread_count}"
             )
     if batch_entities:

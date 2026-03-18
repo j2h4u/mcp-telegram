@@ -82,12 +82,10 @@ def format_messages(
         dt = msg.date.astimezone(effective_tz)
         date_str = dt.strftime("%Y-%m-%d")
 
-        # Date header on day change
         if date_str != prev_date_str:
             lines.append(f"--- {date_str} ---")
             prev_date_str = date_str
 
-        # Session-break line when gap exceeds threshold
         if prev_dt is not None:
             gap_seconds = (dt - prev_dt).total_seconds()
             gap_minutes = int(gap_seconds // 60)
@@ -333,13 +331,12 @@ def _describe_document(media: object) -> str:
             return "[документ]"
         attrs = getattr(doc, "attributes", []) or []
 
-        # Sticker (check before video/audio — sticker packs can have duration)
+        # Check sticker before video/audio — sticker packs can have duration attr
         for attr in attrs:
             if isinstance(attr, tl.DocumentAttributeSticker):
                 alt = getattr(attr, "alt", "") or ""
                 return f"[стикер: {alt}]" if alt else "[стикер]"
 
-        # Round video (video note / circle message)
         for attr in attrs:
             if isinstance(attr, tl.DocumentAttributeVideo):
                 if getattr(attr, "round_message", False):
@@ -347,12 +344,10 @@ def _describe_document(media: object) -> str:
                     m, s = divmod(int(dur), 60)
                     return f"[кружок: {m}:{s:02d}]"
 
-        # GIF / animation
         for attr in attrs:
             if isinstance(attr, tl.DocumentAttributeAnimated):
                 return "[анимация]"
 
-        # Voice message
         for attr in attrs:
             if isinstance(attr, tl.DocumentAttributeAudio):
                 dur = getattr(attr, "duration", 0) or 0
@@ -364,14 +359,12 @@ def _describe_document(media: object) -> str:
                 info = " — ".join(filter(None, [performer, title]))
                 return f"[аудио: {info}, {m}:{s:02d}]" if info else f"[аудио: {m}:{s:02d}]"
 
-        # Regular video
         for attr in attrs:
             if isinstance(attr, tl.DocumentAttributeVideo):
                 dur = getattr(attr, "duration", 0) or 0
                 m, s = divmod(int(dur), 60)
                 return f"[видео: {m}:{s:02d}]"
 
-        # Named file
         for attr in attrs:
             if isinstance(attr, tl.DocumentAttributeFilename):
                 size = getattr(doc, "size", None)
@@ -418,7 +411,6 @@ def format_unread_messages_grouped(
     parts: list[str] = []
 
     for chat in chats:
-        # Build header: "--- Name ({бот, }N непрочитанных{, M упоминаний}, id=X) ---"
         header_parts: list[str] = []
         if chat.is_bot:
             header_parts.append("бот")

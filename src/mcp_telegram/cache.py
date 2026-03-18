@@ -74,6 +74,9 @@ _TOPIC_REQUIRED_COLUMNS = {
     "inaccessible_at": "INTEGER",
 }
 
+_ALLOWED_TABLE_NAMES = frozenset({"entities", "topic_metadata"})
+_ALLOWED_DDL_TYPES = frozenset({"TEXT", "INTEGER", "REAL", "BLOB"})
+
 
 def _open_connection(db_path: Path) -> sqlite3.Connection:
     """Open a SQLite connection with the shared busy-timeout policy."""
@@ -111,14 +114,16 @@ def _apply_column_upgrades(
     table_name: str,
     required_columns: dict[str, str],
 ) -> None:
-    """Add missing columns to an existing table. Raises ValueError on unexpected column."""
+    """Add missing columns to an existing table."""
+    if table_name not in _ALLOWED_TABLE_NAMES:
+        raise ValueError(f"Table not in allow-list: {table_name}")
     rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
     existing = {str(row[1]) for row in rows}
     for col_name, col_type in required_columns.items():
         if col_name in existing:
             continue
-        if col_name not in required_columns or required_columns[col_name] != col_type:
-            raise ValueError(f"Unexpected column: {col_name} {col_type}")
+        if not col_name.isidentifier() or col_type not in _ALLOWED_DDL_TYPES:
+            raise ValueError(f"Invalid column spec: {col_name} {col_type}")
         conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_type}")
 
 
@@ -161,11 +166,15 @@ def _apply_topic_column_upgrades(conn: sqlite3.Connection) -> None:
 
 def _bootstrap_cache_schema(conn: sqlite3.Connection) -> None:
     """Apply one-time schema and journal-mode setup on a dedicated connection."""
+    import logging
+    _logger = logging.getLogger(__name__)
+
     try:
         conn.execute("PRAGMA journal_mode=WAL")
     except sqlite3.OperationalError as exc:
         if "locked" not in str(exc).lower():
             raise
+        _logger.debug("cache_bootstrap WAL pragma skipped (DB locked), will retry next open")
 
     conn.execute(_ENTITY_TABLE_DDL)
     _apply_column_upgrades(conn, "entities", _ENTITY_REQUIRED_COLUMNS)
@@ -177,6 +186,7 @@ def _bootstrap_cache_schema(conn: sqlite3.Connection) -> None:
     _apply_topic_column_upgrades(conn)
     conn.execute(_TOPIC_INDEX_DDL)
     conn.commit()
+    _logger.info("cache schema bootstrapped: %s", _get_connection_db_path(conn) or "in-memory")
 
 
 def _ensure_cache_schema(db_path: Path) -> None:
@@ -191,13 +201,14 @@ def _ensure_cache_schema(db_path: Path) -> None:
     lock_path = db_path.with_suffix(f"{db_path.suffix}.bootstrap.lock")
     with lock_path.open("a", encoding="utf-8") as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        bootstrap_conn = _open_connection(db_path)
+        bootstrap_conn = None
         try:
+            bootstrap_conn = _open_connection(db_path)
             if _database_bootstrap_required(bootstrap_conn):
                 _bootstrap_cache_schema(bootstrap_conn)
         finally:
-            bootstrap_conn.close()
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            if bootstrap_conn is not None:
+                bootstrap_conn.close()
 
 
 def _get_connection_db_path(conn: sqlite3.Connection) -> Path | None:
@@ -205,8 +216,8 @@ def _get_connection_db_path(conn: sqlite3.Connection) -> Path | None:
     for row in rows:
         if len(row) < 3:
             continue
-        database_name = str(row[1])
-        if database_name != "main":
+        schema_name = str(row[1])
+        if schema_name != "main":
             continue
         filename = str(row[2])
         if not filename:
@@ -256,7 +267,10 @@ class EntityCache:
         self,
         entities: list[tuple[int, str, str, str | None]],
     ) -> None:
-        """Batch insert or replace entity metadata rows in a single transaction."""
+        """Batch insert or replace entity metadata rows in a single transaction.
+
+        Each tuple: (entity_id, entity_type, name, username).
+        """
         from .resolver import latinize
 
         now = int(time.time())
@@ -292,6 +306,7 @@ class EntityCache:
 
         Users: excluded if updated_at < now - user_ttl.
         Groups/channels: excluded if updated_at < now - group_ttl.
+        Returns empty dict when cache has no fresh entries (callers may treat this as a miss).
         """
         now = int(time.time())
         rows = self._conn.execute(
@@ -315,18 +330,23 @@ class EntityCache:
         return {row[0]: row[1] for row in rows}
 
     def get_name(self, entity_id: int) -> str | None:
-        """Return cached display name, trying GROUP_TTL (7d) then USER_TTL (30d).
+        """Return cached display name if within GROUP_TTL (7d) or USER_TTL (30d).
 
-        Groups change names more often so the short TTL is tried first.
-        Falls back to the longer user TTL, which keeps user entries fresh longer.
-        Returns None if both TTLs expired or entity not found, or if name is empty.
+        Single query — returns the row regardless of type, then checks the
+        appropriate TTL threshold in Python.
+        Returns None if both TTLs expired, entity not found, or name is empty.
         """
-        entity = self.get(entity_id, GROUP_TTL)
-        if entity is None:
-            entity = self.get(entity_id, USER_TTL)
-        if entity is None:
+        row = self._conn.execute(
+            "SELECT type, name, updated_at FROM entities WHERE id = ?",
+            (entity_id,),
+        ).fetchone()
+        if row is None:
             return None
-        name = entity.get("name")
+        entity_type, name, updated_at = row
+        age = int(time.time()) - updated_at
+        ttl = GROUP_TTL if entity_type != "user" else USER_TTL
+        if age > ttl:
+            return None
         return name if isinstance(name, str) and name else None
 
     def get_by_username(self, username: str) -> tuple[int, str] | None:
@@ -337,8 +357,12 @@ class EntityCache:
         ).fetchone()
         return row if row else None
 
+    @property
+    def connection(self) -> sqlite3.Connection:
+        """Shared SQLite connection for sibling caches (ReactionMetadataCache, TopicMetadataCache)."""
+        return self._conn
+
     def close(self) -> None:
-        """Close the database connection."""
         self._conn.close()
 
 
