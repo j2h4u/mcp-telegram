@@ -83,7 +83,10 @@ Plans:
   4. Prefetch results land in MessageCache via the same write path as regular fetches
   5. Duplicate prefetch tasks for the same (dialog_id, direction, anchor_id) are suppressed — in-memory dedup set prevents redundant API calls
   6. On a cache hit for paginated pages, a background delta fetch pulls messages newer than the last cached ID — response is not blocked
-**Plans**: TBD
+**Plans**: 2 plans
+Plans:
+- [ ] 23-01-PLAN.md — PrefetchCoordinator class + background task coroutines (TDD)
+- [ ] 23-02-PLAN.md — Wire prefetch into capability_history and tools layer (TDD)
 
 ## Progress
 
@@ -111,7 +114,7 @@ Plans:
 | 20. Cache Foundation | v1.4 | 2/2 | Complete    | 2026-03-19 |
 | 21. Cache-First Reads & Bypass Rules | v1.4 | 2/2 | Complete    | 2026-03-19 |
 | 22. Edit Detection | v1.4 | 1/1 | Complete    | 2026-03-19 |
-| 23. Prefetch & Lazy Refresh | v1.4 | 0/TBD | Not started | - |
+| 23. Prefetch & Lazy Refresh | v1.4 | 0/2 | Not started | - |
 
 ## Shipped Milestones
 
