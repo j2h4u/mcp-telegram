@@ -87,36 +87,36 @@ Requirements for Message Cache milestone. Primary goal: speed (weight 1.0), seco
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| CACHE-01 | TBD | Pending |
-| CACHE-02 | TBD | Pending |
-| CACHE-03 | TBD | Pending |
-| CACHE-04 | TBD | Pending |
-| CACHE-05 | TBD | Pending |
-| CACHE-06 | TBD | Pending |
-| CACHE-07 | TBD | Pending |
-| EDIT-01 | TBD | Pending |
-| EDIT-02 | TBD | Pending |
-| EDIT-03 | TBD | Pending |
-| PRE-01 | TBD | Pending |
-| PRE-02 | TBD | Pending |
-| PRE-03 | TBD | Pending |
-| PRE-04 | TBD | Pending |
-| PRE-05 | TBD | Pending |
-| REF-01 | TBD | Pending |
-| REF-02 | TBD | Pending |
-| REF-03 | TBD | Pending |
-| BYP-01 | TBD | Pending |
-| BYP-02 | TBD | Pending |
-| BYP-03 | TBD | Pending |
-| BYP-04 | TBD | Pending |
-| META-01 | TBD | Pending |
-| META-02 | TBD | Pending |
+| CACHE-01 | Phase 20 | Pending |
+| CACHE-02 | Phase 20 | Pending |
+| CACHE-03 | Phase 21 | Pending |
+| CACHE-04 | Phase 21 | Pending |
+| CACHE-05 | Phase 21 | Pending |
+| CACHE-06 | Phase 21 | Pending |
+| CACHE-07 | Phase 20 | Pending |
+| EDIT-01 | Phase 22 | Pending |
+| EDIT-02 | Phase 22 | Pending |
+| EDIT-03 | Phase 22 | Pending |
+| PRE-01 | Phase 23 | Pending |
+| PRE-02 | Phase 23 | Pending |
+| PRE-03 | Phase 23 | Pending |
+| PRE-04 | Phase 23 | Pending |
+| PRE-05 | Phase 23 | Pending |
+| REF-01 | Phase 23 | Pending |
+| REF-02 | Phase 23 | Pending |
+| REF-03 | Phase 23 | Pending |
+| BYP-01 | Phase 21 | Pending |
+| BYP-02 | Phase 21 | Pending |
+| BYP-03 | Phase 21 | Pending |
+| BYP-04 | Phase 21 | Pending |
+| META-01 | Phase 19 | Pending |
+| META-02 | Phase 19 | Pending |
 
 **Coverage:**
 - v1.4 requirements: 24 total
-- Mapped to phases: 0
-- Unmapped: 24
+- Mapped to phases: 24
+- Unmapped: 0
 
 ---
 *Requirements defined: 2026-03-20*
-*Last updated: 2026-03-20 after gap analysis from 3 review agents*
+*Last updated: 2026-03-20 after roadmap creation*

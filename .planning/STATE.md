@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.4
 milestone_name: Message Cache
-current_phase: none
-current_phase_name: none
+current_phase: 19
+current_phase_name: Dialog Metadata Enrichment
 current_plan: 0
-status: defining_requirements
-stopped_at: "Defining requirements for v1.4"
-last_updated: "2026-03-19T16:00:00.000Z"
-last_activity: 2026-03-19
+status: ready_to_plan
+stopped_at: "Roadmap created for v1.4 — ready to plan Phase 19"
+last_updated: "2026-03-20T00:00:00.000Z"
+last_activity: 2026-03-20
 progress:
-  total_phases: 0
+  total_phases: 5
   completed_phases: 0
   total_plans: 0
   completed_plans: 0
@@ -21,28 +21,30 @@ progress:
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-03-19)
+See: .planning/PROJECT.md (updated 2026-03-20)
 
 **Core value:** LLM can work with Telegram using natural names — zero cold-start friction, no ID lookup boilerplate before every real task
-**Current focus:** v1.4 Message Cache — persistent SQLite message cache with prefetch
+**Current focus:** v1.4 Message Cache — Phase 19: Dialog Metadata Enrichment
 
 ## Current Position
 
-Phase: Not started (defining requirements)
-Plan: —
-Status: Defining requirements
-Last activity: 2026-03-19 — Milestone v1.4 started
+Phase: 19 of 23 (Dialog Metadata Enrichment)
+Plan: — of TBD
+Status: Ready to plan
+Last activity: 2026-03-20 — Roadmap created, phases 19-23 defined
+
+Progress: [░░░░░░░░░░] 0%
 
 ## Accumulated Context
 
 ### Decisions
 
 - Approach 1 (Structured Field Cache + CachedMessage Proxy) selected over JSON Blob and Page-Level cache
-- Messages are near-immutable — 30-day TTL is safe
+- Messages are near-immutable — no TTL expiration, cache grows indefinitely
 - Prefetch triggers on first ListMessages per dialog (not on ListDialogs)
-- Dual prefetch: next page + oldest page
-- Structured fields stored in SQLite columns, not JSON blob
-- "Message content caching" moved from Out of Scope to Active
+- Dual prefetch: next page + oldest page on first access
+- Same SQLite DB as entity_cache.db — no separate connection
+- META-01/META-02 already implemented — Phase 19 is commit + test coverage
 
 ### Pending Todos
 
@@ -54,14 +56,8 @@ Last activity: 2026-03-19 — Milestone v1.4 started
 
 None
 
-### Quick Tasks Completed
-
-| # | Description | Date | Commit | Directory |
-|---|-------------|------|--------|-----------|
-| 3 | Implement ListUnreadMessages tool | 2026-03-14 | 78a7b60 | [3-implement-listunreadmessages-tool](./quick/3-implement-listunreadmessages-tool/) |
-
 ## Session Continuity
 
-Last session: 2026-03-19
-Stopped at: Defining requirements for v1.4
+Last session: 2026-03-20
+Stopped at: Roadmap created for v1.4 — ready to plan Phase 19
 Resume file: None
