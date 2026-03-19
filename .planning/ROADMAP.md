@@ -68,7 +68,9 @@ Plans:
   1. When a message is re-fetched with changed text, the old text is recorded in `message_versions` before the cache row is updated
   2. Messages with `edit_date IS NOT NULL` show `[edited HH:mm]` in formatted output
   3. Messages without `edit_date` show no edited marker (no false positives)
-**Plans**: TBD
+**Plans**: 1 plan
+Plans:
+- [ ] 22-01-PLAN.md — Edit versioning in store_messages() and [edited HH:mm] marker in formatter (TDD)
 
 #### Phase 23: Prefetch & Lazy Refresh
 **Goal**: Background prefetch fills the cache ahead of navigation; lazy refresh pulls new messages into cache on access
@@ -108,7 +110,7 @@ Plans:
 | 19. Dialog Metadata Enrichment | v1.4 | 1/1 | Complete    | 2026-03-19 |
 | 20. Cache Foundation | v1.4 | 2/2 | Complete    | 2026-03-19 |
 | 21. Cache-First Reads & Bypass Rules | v1.4 | 2/2 | Complete    | 2026-03-19 |
-| 22. Edit Detection | v1.4 | 0/TBD | Not started | - |
+| 22. Edit Detection | v1.4 | 0/1 | Not started | - |
 | 23. Prefetch & Lazy Refresh | v1.4 | 0/TBD | Not started | - |
 
 ## Shipped Milestones
