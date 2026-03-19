@@ -39,7 +39,10 @@ Plans:
   2. CachedMessage proxy exposes `.sender.first_name`, `.reply_to.reply_to_msg_id` and satisfies MessageLike Protocol — formatter accepts it without changes
   3. Cache bootstrap remains parallel-session-safe (existing lock file covers new table creation)
   4. `message_versions` table exists in same DB for edit tracking (schema only, not yet populated)
-**Plans**: TBD
+**Plans**: 2 plans
+Plans:
+- [ ] 20-01-PLAN.md — Schema DDL + bootstrap extension for message_cache and message_versions tables (TDD)
+- [ ] 20-02-PLAN.md — CachedMessage proxy dataclass satisfying MessageLike Protocol (TDD)
 
 #### Phase 21: Cache-First Reads & Bypass Rules
 **Goal**: History reads serve pages 2+ from cache when available; bypass rules ensure live data where required
@@ -100,7 +103,7 @@ Plans:
 | 17. Direct Read/Search Workflows | v1.3 | 4/4 | Complete | 2026-03-14 |
 | 18. Surface Posture & Rollout Proof | v1.3 | 3/3 | Complete | 2026-03-14 |
 | 19. Dialog Metadata Enrichment | v1.4 | 1/1 | Complete    | 2026-03-19 |
-| 20. Cache Foundation | v1.4 | 0/TBD | Not started | - |
+| 20. Cache Foundation | v1.4 | 0/2 | In progress | - |
 | 21. Cache-First Reads & Bypass Rules | v1.4 | 0/TBD | Not started | - |
 | 22. Edit Detection | v1.4 | 0/TBD | Not started | - |
 | 23. Prefetch & Lazy Refresh | v1.4 | 0/TBD | Not started | - |
