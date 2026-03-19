@@ -567,3 +567,183 @@ def test_upsert_batch_stores_name_normalized(tmp_db_path: Path) -> None:
     assert normalized[1] == "olga petrova"
     assert normalized[2] == "telegram news"
     cache.close()
+
+
+# ---------------------------------------------------------------------------
+# message_cache and message_versions schema tests (Phase 20)
+# ---------------------------------------------------------------------------
+
+def test_message_cache_table_exists(tmp_db_path: Path) -> None:
+    """message_cache table exists in entity_cache.db after EntityCache init."""
+    import sqlite3
+
+    cache = EntityCache(tmp_db_path)
+    cache.close()
+
+    conn = sqlite3.connect(str(tmp_db_path))
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'message_cache'"
+    ).fetchone()
+    conn.close()
+
+    assert row is not None, "message_cache table not found in sqlite_master"
+
+
+def test_message_cache_schema(tmp_db_path: Path) -> None:
+    """message_cache has correct schema: all 11 structured fields."""
+    import sqlite3
+
+    cache = EntityCache(tmp_db_path)
+    cache.close()
+
+    conn = sqlite3.connect(str(tmp_db_path))
+    rows = conn.execute("PRAGMA table_info(message_cache)").fetchall()
+    conn.close()
+
+    col_map = {str(row[1]): str(row[2]) for row in rows}
+    expected = {
+        "dialog_id": "INTEGER",
+        "message_id": "INTEGER",
+        "sent_at": "INTEGER",
+        "text": "TEXT",
+        "sender_id": "INTEGER",
+        "sender_first_name": "TEXT",
+        "media_description": "TEXT",
+        "reply_to_msg_id": "INTEGER",
+        "forum_topic_id": "INTEGER",
+        "edit_date": "INTEGER",
+        "fetched_at": "INTEGER",
+    }
+    assert col_map == expected, f"Schema mismatch. Got: {col_map}"
+
+
+def test_message_cache_pk_constraint(tmp_db_path: Path) -> None:
+    """INSERT OR REPLACE on same (dialog_id, message_id) leaves exactly one row."""
+    import sqlite3
+
+    cache = EntityCache(tmp_db_path)
+    cache.close()
+
+    conn = sqlite3.connect(str(tmp_db_path))
+    conn.execute(
+        "INSERT OR REPLACE INTO message_cache (dialog_id, message_id, sent_at, fetched_at, text) VALUES (?, ?, ?, ?, ?)",
+        (1, 1, 1000, 2000, "first"),
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO message_cache (dialog_id, message_id, sent_at, fetched_at, text) VALUES (?, ?, ?, ?, ?)",
+        (1, 1, 1000, 2001, "second"),
+    )
+    conn.commit()
+
+    count = conn.execute(
+        "SELECT COUNT(*) FROM message_cache WHERE dialog_id = 1 AND message_id = 1"
+    ).fetchone()[0]
+    text = conn.execute(
+        "SELECT text FROM message_cache WHERE dialog_id = 1 AND message_id = 1"
+    ).fetchone()[0]
+    conn.close()
+
+    assert count == 1, f"Expected 1 row, got {count}"
+    assert text == "second", f"Expected 'second', got {text!r}"
+
+
+def test_message_cache_without_rowid(tmp_db_path: Path) -> None:
+    """WITHOUT ROWID enforces NOT NULL on PK columns — NULL dialog_id raises IntegrityError."""
+    import sqlite3
+
+    cache = EntityCache(tmp_db_path)
+    cache.close()
+
+    conn = sqlite3.connect(str(tmp_db_path))
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO message_cache (dialog_id, message_id, sent_at, fetched_at) VALUES (?, ?, ?, ?)",
+            (None, 1, 1000, 2000),
+        )
+    conn.close()
+
+
+def test_message_cache_index_exists(tmp_db_path: Path) -> None:
+    """idx_message_cache_dialog_sent index exists on message_cache after EntityCache init."""
+    import sqlite3
+
+    cache = EntityCache(tmp_db_path)
+    cache.close()
+
+    conn = sqlite3.connect(str(tmp_db_path))
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_message_cache_dialog_sent'"
+    ).fetchone()
+    conn.close()
+
+    assert row is not None, "idx_message_cache_dialog_sent index not found in sqlite_master"
+
+
+def test_message_versions_table_exists(tmp_db_path: Path) -> None:
+    """message_versions table exists in entity_cache.db after EntityCache init."""
+    import sqlite3
+
+    cache = EntityCache(tmp_db_path)
+    cache.close()
+
+    conn = sqlite3.connect(str(tmp_db_path))
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'message_versions'"
+    ).fetchone()
+    conn.close()
+
+    assert row is not None, "message_versions table not found in sqlite_master"
+
+
+def test_message_versions_schema(tmp_db_path: Path) -> None:
+    """message_versions has correct schema: 5 columns."""
+    import sqlite3
+
+    cache = EntityCache(tmp_db_path)
+    cache.close()
+
+    conn = sqlite3.connect(str(tmp_db_path))
+    rows = conn.execute("PRAGMA table_info(message_versions)").fetchall()
+    conn.close()
+
+    col_map = {str(row[1]): str(row[2]) for row in rows}
+    expected = {
+        "dialog_id": "INTEGER",
+        "message_id": "INTEGER",
+        "version": "INTEGER",
+        "old_text": "TEXT",
+        "edit_date": "INTEGER",
+    }
+    assert col_map == expected, f"Schema mismatch. Got: {col_map}"
+
+
+def test_message_cache_same_db_as_entities(tmp_db_path: Path) -> None:
+    """entities, message_cache, and message_versions all live in the same DB file."""
+    import sqlite3
+
+    cache = EntityCache(tmp_db_path)
+    cache.close()
+
+    conn = sqlite3.connect(str(tmp_db_path))
+    table_names = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    conn.close()
+
+    assert "entities" in table_names, f"entities not found in tables: {table_names}"
+    assert "message_cache" in table_names, f"message_cache not found in tables: {table_names}"
+    assert "message_versions" in table_names, f"message_versions not found in tables: {table_names}"
+
+
+def test_existing_entity_cache_still_works_after_bootstrap(tmp_db_path: Path) -> None:
+    """Existing EntityCache upsert/get functionality unbroken after bootstrap extension."""
+    cache = EntityCache(tmp_db_path)
+    cache.upsert(101, "user", "Ivan", "ivan")
+    result = cache.get(101, ttl_seconds=2_592_000)
+    cache.close()
+
+    assert result is not None
+    assert result["name"] == "Ivan"
