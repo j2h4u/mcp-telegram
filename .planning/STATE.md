@@ -3,13 +3,13 @@ gsd_state_version: 1.0
 milestone: v1.4
 milestone_name: Message Cache
 status: unknown
-stopped_at: Completed 21-01-PLAN.md
-last_updated: "2026-03-19T20:50:14.186Z"
+stopped_at: Completed 21-02-PLAN.md
+last_updated: "2026-03-19T21:01:47.151Z"
 progress:
   total_phases: 5
-  completed_phases: 2
+  completed_phases: 3
   total_plans: 5
-  completed_plans: 4
+  completed_plans: 5
 ---
 
 # Project State
@@ -43,6 +43,8 @@ Plan: 2 of 2
 - [Phase 21]: HistoryDirection imported via TYPE_CHECKING + runtime import in try_read_page to avoid circular import
 - [Phase 21]: try_read_page returns None when len(rows) < limit — strict partial coverage detection
 - [Phase 21]: forum_topic_id=1 sentinel for General topic (reply_to_top_id=None but forum_topic=True)
+- [Phase 21]: min_id=1 sentinel (OLDEST first page) treated as cache anchor_id=None to include message ID 1 in coverage
+- [Phase 21]: cast('MessageLike', CachedMessage) in reply map — frozen dataclass conflicts with Protocol settable-attribute assumption in mypy
 
 ### Pending Todos
 
@@ -56,6 +58,6 @@ None
 
 ## Session Continuity
 
-Last session: 2026-03-19T20:50:14.183Z
-Stopped at: Completed 21-01-PLAN.md
+Last session: 2026-03-19T21:01:47.147Z
+Stopped at: Completed 21-02-PLAN.md
 Resume file: None
