@@ -3,13 +3,13 @@ gsd_state_version: 1.0
 milestone: v1.4
 milestone_name: Message Cache
 status: unknown
-stopped_at: Completed 20-02-PLAN.md
-last_updated: "2026-03-19T20:18:44.720Z"
+stopped_at: Completed 21-01-PLAN.md
+last_updated: "2026-03-19T20:50:14.186Z"
 progress:
   total_phases: 5
   completed_phases: 2
-  total_plans: 3
-  completed_plans: 3
+  total_plans: 5
+  completed_plans: 4
 ---
 
 # Project State
@@ -19,12 +19,12 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-20)
 
 **Core value:** LLM can work with Telegram using natural names — zero cold-start friction, no ID lookup boilerplate before every real task
-**Current focus:** Phase 20 — cache-foundation
+**Current focus:** Phase 21 — cache-first-reads-bypass-rules
 
 ## Current Position
 
-Phase: 21
-Plan: Not started
+Phase: 21 (cache-first-reads-bypass-rules) — EXECUTING
+Plan: 2 of 2
 
 ## Accumulated Context
 
@@ -40,6 +40,9 @@ Plan: Not started
 - [Phase 20-cache-foundation]: message_versions schema-only in Plan 01 — Phase 22 populates; schema-first keeps bootstrap idempotent
 - [Phase 20-cache-foundation]: tuple[object, ...] + cast() for from_row() parameter type — SQLite rows are mixed-type, cast() at use sites satisfies mypy
 - [Phase 20-cache-foundation]: CachedMessage.reactions/media always None — media_description folds into .message; reactions not stored in cache
+- [Phase 21]: HistoryDirection imported via TYPE_CHECKING + runtime import in try_read_page to avoid circular import
+- [Phase 21]: try_read_page returns None when len(rows) < limit — strict partial coverage detection
+- [Phase 21]: forum_topic_id=1 sentinel for General topic (reply_to_top_id=None but forum_topic=True)
 
 ### Pending Todos
 
@@ -53,6 +56,6 @@ None
 
 ## Session Continuity
 
-Last session: 2026-03-19T20:15:01.901Z
-Stopped at: Completed 20-02-PLAN.md
+Last session: 2026-03-19T20:50:14.183Z
+Stopped at: Completed 21-01-PLAN.md
 Resume file: None

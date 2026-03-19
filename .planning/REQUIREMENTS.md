@@ -16,9 +16,9 @@ Requirements for Message Cache milestone. Primary goal: speed (weight 1.0), seco
 - [x] **CACHE-01**: MessageCache SQLite table with structured fields (dialog_id, message_id, sent_at, text, sender_id, sender_first_name, media_description, reply_to_msg_id, forum_topic_id, edit_date, fetched_at). WITHOUT ROWID, PK (dialog_id, message_id).
 - [x] **CACHE-02**: CachedMessage proxy class with nested attribute objects (.sender.first_name, .reply_to.reply_to_msg_id) satisfying MessageLike Protocol — transparent to formatter
 - [ ] **CACHE-03**: Cache-first reads in capability_history for paginated pages (page 2+). navigation="newest" always goes to Telegram API (never served stale)
-- [ ] **CACHE-04**: Cache coverage tracking per (dialog_id, topic_id) — knows which message_id ranges are cached. Topic-aware because messages from different topics interleave by ID
-- [ ] **CACHE-05**: Cache population — every Telegram API fetch writes results to MessageCache before returning. Reply map also served from cache when possible
-- [ ] **CACHE-06**: No TTL expiration — messages are near-immutable, cache grows indefinitely. PRAGMA optimize on bootstrap
+- [x] **CACHE-04**: Cache coverage tracking per (dialog_id, topic_id) — knows which message_id ranges are cached. Topic-aware because messages from different topics interleave by ID
+- [x] **CACHE-05**: Cache population — every Telegram API fetch writes results to MessageCache before returning. Reply map also served from cache when possible
+- [x] **CACHE-06**: No TTL expiration — messages are near-immutable, cache grows indefinitely. PRAGMA optimize on bootstrap
 - [x] **CACHE-07**: Same SQLite DB file as entity_cache.db — extend existing bootstrap, no separate connection
 
 ### Edit Detection
@@ -43,8 +43,8 @@ Requirements for Message Cache milestone. Primary goal: speed (weight 1.0), seco
 
 ### Cache Bypasses
 
-- [ ] **BYP-01**: navigation="newest" (first page) always fetches from Telegram API — never served stale from cache
-- [ ] **BYP-02**: unread=True in ListMessages always fetches live (read state changes in real time)
+- [x] **BYP-01**: navigation="newest" (first page) always fetches from Telegram API — never served stale from cache
+- [x] **BYP-02**: unread=True in ListMessages always fetches live (read state changes in real time)
 - [ ] **BYP-03**: ListUnreadMessages always fetches live (entire tool is real-time unread state)
 - [ ] **BYP-04**: SearchMessages always fetches live (server-side text search, not cacheable). Results written to cache for future ListMessages hits
 
@@ -90,9 +90,9 @@ Requirements for Message Cache milestone. Primary goal: speed (weight 1.0), seco
 | CACHE-01 | Phase 20 | Complete |
 | CACHE-02 | Phase 20 | Complete |
 | CACHE-03 | Phase 21 | Pending |
-| CACHE-04 | Phase 21 | Pending |
-| CACHE-05 | Phase 21 | Pending |
-| CACHE-06 | Phase 21 | Pending |
+| CACHE-04 | Phase 21 | Complete |
+| CACHE-05 | Phase 21 | Complete |
+| CACHE-06 | Phase 21 | Complete |
 | CACHE-07 | Phase 20 | Complete |
 | EDIT-01 | Phase 22 | Pending |
 | EDIT-02 | Phase 22 | Pending |
@@ -105,8 +105,8 @@ Requirements for Message Cache milestone. Primary goal: speed (weight 1.0), seco
 | REF-01 | Phase 23 | Pending |
 | REF-02 | Phase 23 | Pending |
 | REF-03 | Phase 23 | Pending |
-| BYP-01 | Phase 21 | Pending |
-| BYP-02 | Phase 21 | Pending |
+| BYP-01 | Phase 21 | Complete |
+| BYP-02 | Phase 21 | Complete |
 | BYP-03 | Phase 21 | Pending |
 | BYP-04 | Phase 21 | Pending |
 | META-01 | Phase 19 | Pending |
