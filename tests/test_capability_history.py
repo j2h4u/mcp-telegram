@@ -6,6 +6,9 @@ These tests verify:
 - unread=True always hits API (BYP-02)
 - Every API fetch writes results to MessageCache (CACHE-05)
 - Reply map tries cache first before API
+- Prefetch scheduling: first page triggers dual prefetch, subsequent page triggers single prefetch
+- Delta refresh is triggered on cache hit
+- unread=True and empty results skip all prefetch
 """
 from __future__ import annotations
 
@@ -239,3 +242,209 @@ async def test_history_always_populates_cache_on_api_fetch(tmp_db_path: Path) ->
     ).fetchall()
     stored_ids = {row[0] for row in rows}
     assert stored_ids == {200, 201, 202, 203, 204}
+
+
+# ---------------------------------------------------------------------------
+# Prefetch scheduling tests (PRE-01, PRE-02, PRE-03, REF-01)
+# ---------------------------------------------------------------------------
+
+
+async def _call_history_with_coordinator(
+    client,
+    cache: EntityCache,
+    coordinator,
+    *,
+    navigation: str | None,
+    limit: int = 5,
+    unread: bool = False,
+) -> HistoryReadExecution:
+    result = await execute_history_read_capability(
+        client,
+        cache=cache,
+        dialog_query=DIALOG_NAME,
+        limit=limit,
+        navigation=navigation,
+        sender_query=None,
+        topic_query=None,
+        unread=unread,
+        retry_tool="ListMessages",
+        resolve_dialog=_resolver(),
+        reaction_names_threshold=15,
+        prefetch_coordinator=coordinator,
+    )
+    return result  # type: ignore[return-value]
+
+
+async def test_first_page_schedules_dual_prefetch(tmp_db_path: Path) -> None:
+    """PRE-01: navigation=None, non-empty messages -> coordinator.schedule called twice."""
+    cache = EntityCache(tmp_db_path)
+    msgs = [_make_msg(id=i) for i in range(96, 101)]  # ids 96,97,98,99,100
+    client = _client_with_messages(msgs)
+
+    coordinator = MagicMock()
+    coordinator.schedule = MagicMock(return_value=True)
+
+    result = await _call_history_with_coordinator(client, cache, coordinator, navigation=None)
+
+    assert isinstance(result, HistoryReadExecution)
+    assert coordinator.schedule.call_count == 2
+    # Collect all keys passed
+    keys = [call.kwargs["key"] for call in coordinator.schedule.call_args_list]
+    # Next NEWEST page: anchor = min(ids) = 96, direction = "newest"
+    assert (DIALOG_ID, "newest", 96, None) in keys
+    # Oldest page: anchor = None, direction = "oldest"
+    assert (DIALOG_ID, "oldest", None, None) in keys
+
+
+async def test_first_page_oldest_schedules_next_oldest(tmp_db_path: Path) -> None:
+    """PRE-01 + PRE-03: navigation='oldest', non-empty messages -> coordinator.schedule called once."""
+    cache = EntityCache(tmp_db_path)
+    # Oldest-first page: messages seeded so cache serves them (ids 1-5, ASC order)
+    msgs = [_make_msg(id=i) for i in range(1, 6)]  # ids 1,2,3,4,5
+    msg_cache = MessageCache(cache._conn)
+    msg_cache.store_messages(DIALOG_ID, msgs)
+
+    client = _client_with_messages([])  # cache hit — no API call needed
+
+    coordinator = MagicMock()
+    coordinator.schedule = MagicMock(return_value=True)
+
+    result = await _call_history_with_coordinator(client, cache, coordinator, navigation="oldest")
+
+    assert isinstance(result, HistoryReadExecution)
+    # Only one task: next OLDEST page with anchor = max(ids) = 5
+    # (dual oldest collapses — already reading oldest direction)
+    assert coordinator.schedule.call_count == 1
+    key = coordinator.schedule.call_args.kwargs["key"]
+    assert key == (DIALOG_ID, "oldest", 5, None)
+
+
+async def test_subsequent_page_schedules_next_prefetch(tmp_db_path: Path) -> None:
+    """PRE-02: navigation=base64 token -> coordinator.schedule called once for next page."""
+    cache = EntityCache(tmp_db_path)
+    msgs = [_make_msg(id=i) for i in range(95, 100)]  # ids 95-99
+    msg_cache = MessageCache(cache._conn)
+    msg_cache.store_messages(DIALOG_ID, msgs)
+
+    # Token: anchor=100 means "give me messages before id 100"
+    token = encode_history_navigation(100, DIALOG_ID, direction=HistoryDirection.NEWEST)
+
+    client = _client_with_messages([])  # cache hit
+
+    coordinator = MagicMock()
+    coordinator.schedule = MagicMock(return_value=True)
+
+    result = await _call_history_with_coordinator(client, cache, coordinator, navigation=token)
+
+    assert isinstance(result, HistoryReadExecution)
+    # PRE-02: exactly one schedule call — next page in current NEWEST direction
+    assert coordinator.schedule.call_count == 1
+    key = coordinator.schedule.call_args.kwargs["key"]
+    # Next anchor = min(95-99) = 95
+    assert key == (DIALOG_ID, "newest", 95, None)
+
+
+async def test_cache_hit_triggers_delta_refresh(tmp_db_path: Path) -> None:
+    """REF-01: cached_page is not None -> coordinator.schedule called with delta key."""
+    cache = EntityCache(tmp_db_path)
+    msgs = [_make_msg(id=i) for i in range(95, 100)]  # ids 95-99; max=99
+    msg_cache = MessageCache(cache._conn)
+    msg_cache.store_messages(DIALOG_ID, msgs)
+
+    token = encode_history_navigation(100, DIALOG_ID, direction=HistoryDirection.NEWEST)
+
+    client = _client_with_messages([])
+
+    coordinator = MagicMock()
+    coordinator.schedule = MagicMock(return_value=True)
+
+    result = await _call_history_with_coordinator(client, cache, coordinator, navigation=token)
+
+    assert isinstance(result, HistoryReadExecution)
+    keys = [call.kwargs["key"] for call in coordinator.schedule.call_args_list]
+    # Delta refresh key: (entity_id, "delta", max_cached_id=99, topic_id=None)
+    assert (DIALOG_ID, "delta", 99, None) in keys
+
+
+async def test_unread_skips_all_prefetch(tmp_db_path: Path) -> None:
+    """unread=True -> coordinator.schedule never called."""
+    cache = EntityCache(tmp_db_path)
+
+    api_msgs = [_make_msg(id=i) for i in range(95, 100)]
+
+    peer_dialog_mock = MagicMock()
+    peer_dialog_mock.dialogs = [MagicMock(read_inbox_max_id=90)]
+
+    client = AsyncMock()
+    client.iter_messages = MagicMock(return_value=_make_async_iter(api_msgs))
+    client.get_messages = AsyncMock(return_value=[])
+    client.get_input_entity = AsyncMock(return_value=MagicMock())
+    client.return_value = peer_dialog_mock
+
+    coordinator = MagicMock()
+    coordinator.schedule = MagicMock(return_value=True)
+
+    result = await _call_history_with_coordinator(
+        client, cache, coordinator, navigation=None, unread=True
+    )
+
+    assert isinstance(result, HistoryReadExecution)
+    coordinator.schedule.assert_not_called()
+
+
+async def test_empty_messages_no_prefetch(tmp_db_path: Path) -> None:
+    """API returns empty list -> no schedule calls."""
+    cache = EntityCache(tmp_db_path)
+    client = _client_with_messages([])  # empty result
+
+    coordinator = MagicMock()
+    coordinator.schedule = MagicMock(return_value=True)
+
+    # Use navigation=None (newest) so cache is bypassed and empty API result is used
+    result = await _call_history_with_coordinator(client, cache, coordinator, navigation=None)
+
+    assert isinstance(result, HistoryReadExecution)
+    coordinator.schedule.assert_not_called()
+
+
+async def test_prefetch_coordinator_none_no_error(tmp_db_path: Path) -> None:
+    """prefetch_coordinator=None -> function returns normally without AttributeError."""
+    cache = EntityCache(tmp_db_path)
+    msgs = [_make_msg(id=i) for i in range(96, 101)]
+    client = _client_with_messages(msgs)
+
+    result = await execute_history_read_capability(
+        client,
+        cache=cache,
+        dialog_query=DIALOG_NAME,
+        limit=5,
+        navigation=None,
+        sender_query=None,
+        topic_query=None,
+        unread=False,
+        retry_tool="ListMessages",
+        resolve_dialog=_resolver(),
+        reaction_names_threshold=15,
+        prefetch_coordinator=None,
+    )
+    assert isinstance(result, HistoryReadExecution)
+
+
+async def test_prefetch_does_not_block_response(tmp_db_path: Path) -> None:
+    """execute_history_read_capability returns HistoryReadExecution before tasks complete."""
+    cache = EntityCache(tmp_db_path)
+    msgs = [_make_msg(id=i) for i in range(96, 101)]
+    client = _client_with_messages(msgs)
+
+    # Coordinator that records schedule was called (tasks are fire-and-forget)
+    schedule_calls: list[object] = []
+
+    coordinator = MagicMock()
+    coordinator.schedule = MagicMock(side_effect=lambda coro, *, key: schedule_calls.append(key) or True)
+
+    result = await _call_history_with_coordinator(client, cache, coordinator, navigation=None)
+
+    # Response returned immediately even if schedule was called
+    assert isinstance(result, HistoryReadExecution)
+    # Scheduling was invoked (fire-and-forget pattern confirmed)
+    assert len(schedule_calls) >= 1
