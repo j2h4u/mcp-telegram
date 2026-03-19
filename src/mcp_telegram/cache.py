@@ -69,6 +69,39 @@ CREATE INDEX IF NOT EXISTS idx_topic_metadata_dialog_updated
 ON topic_metadata(dialog_id, updated_at)
 """
 
+_MESSAGE_CACHE_TABLE_DDL = """
+CREATE TABLE IF NOT EXISTS message_cache (
+    dialog_id          INTEGER NOT NULL,
+    message_id         INTEGER NOT NULL,
+    sent_at            INTEGER NOT NULL,
+    text               TEXT,
+    sender_id          INTEGER,
+    sender_first_name  TEXT,
+    media_description  TEXT,
+    reply_to_msg_id    INTEGER,
+    forum_topic_id     INTEGER,
+    edit_date          INTEGER,
+    fetched_at         INTEGER NOT NULL,
+    PRIMARY KEY (dialog_id, message_id)
+) WITHOUT ROWID
+"""
+
+_MESSAGE_CACHE_INDEX_DDL = """
+CREATE INDEX IF NOT EXISTS idx_message_cache_dialog_sent
+ON message_cache(dialog_id, sent_at DESC)
+"""
+
+_MESSAGE_VERSIONS_TABLE_DDL = """
+CREATE TABLE IF NOT EXISTS message_versions (
+    dialog_id   INTEGER NOT NULL,
+    message_id  INTEGER NOT NULL,
+    version     INTEGER NOT NULL,
+    old_text    TEXT,
+    edit_date   INTEGER,
+    PRIMARY KEY (dialog_id, message_id, version)
+) WITHOUT ROWID
+"""
+
 _ENTITY_REQUIRED_COLUMNS = {
     "name_normalized": "TEXT",
 }
@@ -78,7 +111,7 @@ _TOPIC_REQUIRED_COLUMNS = {
     "inaccessible_at": "INTEGER",
 }
 
-_ALLOWED_TABLE_NAMES = frozenset({"entities", "topic_metadata"})
+_ALLOWED_TABLE_NAMES = frozenset({"entities", "topic_metadata", "message_cache", "message_versions"})
 _ALLOWED_DDL_TYPES = frozenset({"TEXT", "INTEGER", "REAL", "BLOB"})
 
 
@@ -161,6 +194,12 @@ def _database_bootstrap_required(conn: sqlite3.Connection) -> bool:
         return True
     if not _index_exists(conn, "idx_topic_metadata_dialog_updated"):
         return True
+    if not _table_exists(conn, "message_cache"):
+        return True
+    if not _index_exists(conn, "idx_message_cache_dialog_sent"):
+        return True
+    if not _table_exists(conn, "message_versions"):
+        return True
     return False
 
 
@@ -189,6 +228,9 @@ def _bootstrap_cache_schema(conn: sqlite3.Connection) -> None:
     conn.execute(_TOPIC_TABLE_DDL)
     _apply_topic_column_upgrades(conn)
     conn.execute(_TOPIC_INDEX_DDL)
+    conn.execute(_MESSAGE_CACHE_TABLE_DDL)
+    conn.execute(_MESSAGE_CACHE_INDEX_DDL)
+    conn.execute(_MESSAGE_VERSIONS_TABLE_DDL)
     conn.commit()
     _logger.info("cache schema bootstrapped: %s", _get_connection_db_path(conn) or "in-memory")
 
