@@ -832,3 +832,331 @@ def test_cached_message_frozen() -> None:
     msg = CachedMessage.from_row(row)
     with pytest.raises(dataclasses.FrozenInstanceError):
         msg.id = 999  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# MessageCache data-access tests (Phase 21, Plan 01)
+# ---------------------------------------------------------------------------
+
+from datetime import datetime, timezone
+from unittest.mock import MagicMock
+
+from mcp_telegram.cache import CachedMessage, EntityCache, MessageCache  # type: ignore[attr-defined]
+from mcp_telegram.pagination import HistoryDirection, encode_history_navigation
+
+
+def _make_msg(
+    msg_id: int,
+    text: str = "hello",
+    sender_id: int = 101,
+    sender_first_name: str = "Alice",
+    reply_to_msg_id: int | None = None,
+    forum_topic_id: int | None = None,
+    edit_date: datetime | None = None,
+) -> MagicMock:
+    """Build a mock Telethon-like message for store_messages tests."""
+    msg = MagicMock()
+    msg.id = msg_id
+    msg.date = datetime(2024, 1, 15, 10, 0, tzinfo=timezone.utc)
+    msg.message = text
+    msg.sender_id = sender_id
+    msg.sender = MagicMock()
+    msg.sender.first_name = sender_first_name
+    msg.media = None
+    msg.edit_date = edit_date
+    # reply_to setup
+    if reply_to_msg_id is not None or forum_topic_id is not None:
+        msg.reply_to = MagicMock()
+        msg.reply_to.reply_to_msg_id = reply_to_msg_id
+        if forum_topic_id is not None:
+            msg.reply_to.forum_topic = True
+            msg.reply_to.reply_to_top_id = None if forum_topic_id == 1 else forum_topic_id
+        else:
+            msg.reply_to.forum_topic = False
+            msg.reply_to.reply_to_top_id = None
+    else:
+        msg.reply_to = None
+    return msg
+
+
+def test_message_cache_store_messages_round_trip(tmp_db_path: Path) -> None:
+    """Store 5 messages, read back via try_read_page — expect 5 CachedMessages with correct fields."""
+    cache = EntityCache(tmp_db_path)
+    mc = MessageCache(cache._conn)
+
+    msgs = [_make_msg(i, text=f"msg{i}", sender_first_name="Bob") for i in range(10, 15)]
+    mc.store_messages(dialog_id=1, messages=msgs)
+
+    result = mc.try_read_page(
+        dialog_id=1,
+        topic_id=None,
+        anchor_id=15,
+        limit=5,
+        direction=HistoryDirection.NEWEST,
+    )
+    assert result is not None
+    assert len(result) == 5
+    assert all(isinstance(m, CachedMessage) for m in result)
+    assert {m.id for m in result} == {10, 11, 12, 13, 14}
+    assert all(m.sender is not None and m.sender.first_name == "Bob" for m in result)
+    cache.close()
+
+
+def test_message_cache_store_messages_extracts_fields(tmp_db_path: Path) -> None:
+    """Store one message and verify all 11 columns extracted correctly via raw SELECT."""
+    import sqlite3
+
+    utc = timezone.utc
+    sent = datetime(2024, 1, 15, 10, 0, tzinfo=utc)
+
+    msg = MagicMock()
+    msg.id = 42
+    msg.date = sent
+    msg.message = "hello"
+    msg.sender_id = 101
+    msg.sender = MagicMock()
+    msg.sender.first_name = "Alice"
+    msg.media = None
+    msg.edit_date = None
+    msg.reply_to = MagicMock()
+    msg.reply_to.reply_to_msg_id = 10
+    msg.reply_to.forum_topic = False
+    msg.reply_to.reply_to_top_id = None
+
+    cache = EntityCache(tmp_db_path)
+    mc = MessageCache(cache._conn)
+    mc.store_messages(dialog_id=5, messages=[msg])
+
+    conn = sqlite3.connect(str(tmp_db_path))
+    row = conn.execute(
+        "SELECT dialog_id, message_id, sent_at, text, sender_id, sender_first_name, "
+        "media_description, reply_to_msg_id, forum_topic_id, edit_date, fetched_at "
+        "FROM message_cache WHERE dialog_id=5 AND message_id=42"
+    ).fetchone()
+    conn.close()
+    cache.close()
+
+    assert row is not None
+    assert row[0] == 5           # dialog_id
+    assert row[1] == 42          # message_id
+    assert row[2] == int(sent.timestamp())  # sent_at
+    assert row[3] == "hello"     # text
+    assert row[4] == 101         # sender_id
+    assert row[5] == "Alice"     # sender_first_name
+    assert row[6] is None        # media_description
+    assert row[7] == 10          # reply_to_msg_id
+    assert row[8] is None        # forum_topic_id (not a forum message)
+    assert row[9] is None        # edit_date
+    assert row[10] is not None   # fetched_at
+
+
+def test_message_cache_try_read_page_returns_none_on_empty(tmp_db_path: Path) -> None:
+    """try_read_page on empty cache returns None."""
+    cache = EntityCache(tmp_db_path)
+    mc = MessageCache(cache._conn)
+    result = mc.try_read_page(
+        dialog_id=1,
+        topic_id=None,
+        anchor_id=None,
+        limit=5,
+        direction=HistoryDirection.NEWEST,
+    )
+    assert result is None
+    cache.close()
+
+
+def test_message_cache_try_read_page_returns_none_on_partial(tmp_db_path: Path) -> None:
+    """Store 3 messages, request limit=5 — expect None (partial coverage)."""
+    cache = EntityCache(tmp_db_path)
+    mc = MessageCache(cache._conn)
+
+    msgs = [_make_msg(i) for i in range(1, 4)]
+    mc.store_messages(dialog_id=1, messages=msgs)
+
+    result = mc.try_read_page(
+        dialog_id=1,
+        topic_id=None,
+        anchor_id=None,
+        limit=5,
+        direction=HistoryDirection.NEWEST,
+    )
+    assert result is None
+    cache.close()
+
+
+def test_message_cache_try_read_page_newest_direction(tmp_db_path: Path) -> None:
+    """Store messages with ids [10..6], try_read_page NEWEST returns them ordered DESC."""
+    cache = EntityCache(tmp_db_path)
+    mc = MessageCache(cache._conn)
+
+    msgs = [_make_msg(i) for i in range(6, 11)]
+    mc.store_messages(dialog_id=1, messages=msgs)
+
+    result = mc.try_read_page(
+        dialog_id=1,
+        topic_id=None,
+        anchor_id=11,
+        limit=5,
+        direction=HistoryDirection.NEWEST,
+    )
+    assert result is not None
+    assert [m.id for m in result] == [10, 9, 8, 7, 6]
+    cache.close()
+
+
+def test_message_cache_try_read_page_oldest_direction(tmp_db_path: Path) -> None:
+    """Store messages with ids [1..5], try_read_page OLDEST returns them ordered ASC."""
+    cache = EntityCache(tmp_db_path)
+    mc = MessageCache(cache._conn)
+
+    msgs = [_make_msg(i) for i in range(1, 6)]
+    mc.store_messages(dialog_id=1, messages=msgs)
+
+    result = mc.try_read_page(
+        dialog_id=1,
+        topic_id=None,
+        anchor_id=0,
+        limit=5,
+        direction=HistoryDirection.OLDEST,
+    )
+    assert result is not None
+    assert [m.id for m in result] == [1, 2, 3, 4, 5]
+    cache.close()
+
+
+def test_message_cache_topic_isolation(tmp_db_path: Path) -> None:
+    """Messages from topic 10 do not satisfy query for topic 20 and vice versa."""
+    cache = EntityCache(tmp_db_path)
+    mc = MessageCache(cache._conn)
+
+    msgs_t10 = [_make_msg(i, forum_topic_id=10) for i in range(1, 4)]
+    msgs_t20 = [_make_msg(i + 10, forum_topic_id=20) for i in range(1, 4)]
+    mc.store_messages(dialog_id=1, messages=msgs_t10)
+    mc.store_messages(dialog_id=1, messages=msgs_t20)
+
+    result_t10 = mc.try_read_page(
+        dialog_id=1,
+        topic_id=10,
+        anchor_id=None,
+        limit=3,
+        direction=HistoryDirection.NEWEST,
+    )
+    result_t20 = mc.try_read_page(
+        dialog_id=1,
+        topic_id=20,
+        anchor_id=None,
+        limit=3,
+        direction=HistoryDirection.NEWEST,
+    )
+
+    assert result_t10 is not None
+    assert {m.id for m in result_t10} == {1, 2, 3}
+
+    assert result_t20 is not None
+    assert {m.id for m in result_t20} == {11, 12, 13}
+    cache.close()
+
+
+def test_message_cache_topic_null_isolation(tmp_db_path: Path) -> None:
+    """Messages with forum_topic_id=None are not returned for topic_id=5 and vice versa."""
+    cache = EntityCache(tmp_db_path)
+    mc = MessageCache(cache._conn)
+
+    msgs_null = [_make_msg(i) for i in range(1, 4)]  # no topic
+    msgs_t5 = [_make_msg(i + 10, forum_topic_id=5) for i in range(1, 4)]
+    mc.store_messages(dialog_id=1, messages=msgs_null)
+    mc.store_messages(dialog_id=1, messages=msgs_t5)
+
+    result_null = mc.try_read_page(
+        dialog_id=1,
+        topic_id=None,
+        anchor_id=None,
+        limit=3,
+        direction=HistoryDirection.NEWEST,
+    )
+    result_t5 = mc.try_read_page(
+        dialog_id=1,
+        topic_id=5,
+        anchor_id=None,
+        limit=3,
+        direction=HistoryDirection.NEWEST,
+    )
+
+    assert result_null is not None
+    assert {m.id for m in result_null} == {1, 2, 3}
+
+    assert result_t5 is not None
+    assert {m.id for m in result_t5} == {11, 12, 13}
+    cache.close()
+
+
+def test_message_cache_store_messages_insert_or_replace(tmp_db_path: Path) -> None:
+    """Storing same message_id twice: second write wins, exactly 1 row remains."""
+    cache = EntityCache(tmp_db_path)
+    mc = MessageCache(cache._conn)
+
+    msg_v1 = _make_msg(42, text="v1")
+    msg_v2 = _make_msg(42, text="v2")
+    mc.store_messages(dialog_id=1, messages=[msg_v1])
+    mc.store_messages(dialog_id=1, messages=[msg_v2])
+
+    result = mc.try_read_page(
+        dialog_id=1,
+        topic_id=None,
+        anchor_id=43,
+        limit=1,
+        direction=HistoryDirection.NEWEST,
+    )
+    assert result is not None
+    assert len(result) == 1
+    assert result[0].id == 42
+    assert result[0].message == "v2"
+    cache.close()
+
+
+def test_should_try_cache_newest_returns_false(tmp_db_path: Path) -> None:
+    """_should_try_cache returns False for navigation=None and navigation='newest'."""
+    from mcp_telegram.cache import _should_try_cache  # type: ignore[attr-defined]
+
+    assert _should_try_cache(None, unread=False) is False
+    assert _should_try_cache("newest", unread=False) is False
+
+
+def test_should_try_cache_unread_returns_false(tmp_db_path: Path) -> None:
+    """_should_try_cache returns False whenever unread=True."""
+    from mcp_telegram.cache import _should_try_cache  # type: ignore[attr-defined]
+
+    token = encode_history_navigation(message_id=100, dialog_id=1)
+    assert _should_try_cache(token, unread=True) is False
+    assert _should_try_cache("oldest", unread=True) is False
+    assert _should_try_cache(None, unread=True) is False
+
+
+def test_should_try_cache_page2_token_returns_true(tmp_db_path: Path) -> None:
+    """_should_try_cache returns True for a valid base64 history token (page 2+)."""
+    from mcp_telegram.cache import _should_try_cache  # type: ignore[attr-defined]
+
+    token = encode_history_navigation(message_id=50, dialog_id=1)
+    assert _should_try_cache(token, unread=False) is True
+
+
+def test_should_try_cache_oldest_no_token_returns_true(tmp_db_path: Path) -> None:
+    """_should_try_cache returns True for navigation='oldest'."""
+    from mcp_telegram.cache import _should_try_cache  # type: ignore[attr-defined]
+
+    assert _should_try_cache("oldest", unread=False) is True
+
+
+def test_pragma_optimize_in_bootstrap(tmp_db_path: Path) -> None:
+    """PRAGMA optimize is callable after EntityCache init without error."""
+    import sqlite3
+
+    cache = EntityCache(tmp_db_path)
+    # Calling PRAGMA optimize explicitly must not raise
+    cache._conn.execute("PRAGMA optimize")
+    cache.close()
+
+    # Also verify it doesn't raise on a fresh connection
+    conn = sqlite3.connect(str(tmp_db_path))
+    conn.execute("PRAGMA optimize")
+    conn.close()
