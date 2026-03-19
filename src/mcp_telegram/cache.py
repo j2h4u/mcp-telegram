@@ -4,6 +4,7 @@ import fcntl
 import json
 import sqlite3
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,6 +12,7 @@ from typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
     from .models import TopicMetadata
+    from .pagination import HistoryDirection
 
 USER_TTL: int = 2_592_000   # 30 days
 GROUP_TTL: int = 604_800    # 7 days
@@ -233,6 +235,7 @@ def _bootstrap_cache_schema(conn: sqlite3.Connection) -> None:
     conn.execute(_MESSAGE_CACHE_TABLE_DDL)
     conn.execute(_MESSAGE_CACHE_INDEX_DDL)
     conn.execute(_MESSAGE_VERSIONS_TABLE_DDL)
+    conn.execute("PRAGMA optimize")
     conn.commit()
     _logger.info("cache schema bootstrapped: %s", _get_connection_db_path(conn) or "in-memory")
 
@@ -358,6 +361,149 @@ class CachedMessage:
             reply_to=_CachedReplyHeader(reply_to_msg_id=cast("int | None", reply_to_msg_id)) if reply_to_msg_id else None,
             edit_date=cast("int | None", edit_date),
         )
+
+
+class MessageCache:
+    """Read/write access to the message_cache table for cache-first history reads."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def store_messages(self, dialog_id: int, messages: Iterable[object]) -> None:
+        """INSERT OR REPLACE messages into message_cache.
+
+        Extracts all 11 structured fields from Telethon message objects.
+        Safe to call with CachedMessage objects too (fields gracefully degrade to None).
+        """
+        now = int(time.time())
+        rows: list[tuple[object, ...]] = []
+        for msg in messages:
+            message_id = int(getattr(msg, "id", 0))
+            date = getattr(msg, "date", None)
+            sent_at = int(date.timestamp()) if isinstance(date, datetime) else 0
+
+            text = getattr(msg, "message", None)
+
+            sender_id = getattr(msg, "sender_id", None)
+            sender = getattr(msg, "sender", None)
+            sender_first_name = getattr(sender, "first_name", None) if sender is not None else None
+
+            media = getattr(msg, "media", None)
+            if media is None:
+                media_description: str | None = None
+            elif hasattr(media, "to_dict"):
+                media_description = type(media).__name__
+            else:
+                media_description = type(media).__name__
+
+            reply_to = getattr(msg, "reply_to", None)
+            reply_to_msg_id: int | None = None
+            forum_topic_id: int | None = None
+            if reply_to is not None:
+                raw_rtmi = getattr(reply_to, "reply_to_msg_id", None)
+                reply_to_msg_id = int(raw_rtmi) if raw_rtmi is not None else None
+                if getattr(reply_to, "forum_topic", False):
+                    top_id = getattr(reply_to, "reply_to_top_id", None)
+                    forum_topic_id = int(top_id) if top_id is not None else 1
+
+            ed = getattr(msg, "edit_date", None)
+            if ed is None:
+                edit_date: int | None = None
+            elif isinstance(ed, datetime):
+                edit_date = int(ed.timestamp())
+            else:
+                edit_date = int(ed)
+
+            rows.append((
+                dialog_id,
+                message_id,
+                sent_at,
+                text,
+                sender_id,
+                sender_first_name,
+                media_description,
+                reply_to_msg_id,
+                forum_topic_id,
+                edit_date,
+                now,
+            ))
+
+        self._conn.executemany(
+            "INSERT OR REPLACE INTO message_cache "
+            "(dialog_id, message_id, sent_at, text, sender_id, sender_first_name, "
+            "media_description, reply_to_msg_id, forum_topic_id, edit_date, fetched_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+        self._conn.commit()
+
+    def try_read_page(
+        self,
+        dialog_id: int,
+        *,
+        topic_id: int | None,
+        anchor_id: int | None,
+        limit: int,
+        direction: HistoryDirection,
+    ) -> list[CachedMessage] | None:
+        """Return a cached page or None on miss (partial coverage).
+
+        Returns None when fewer than `limit` rows match — caller must fetch live.
+        """
+        from .pagination import HistoryDirection as _HD
+
+        params: list[object] = [dialog_id]
+        topic_clause = "forum_topic_id IS NULL" if topic_id is None else "forum_topic_id = ?"
+        if topic_id is not None:
+            params.append(topic_id)
+
+        if direction == _HD.OLDEST:
+            anchor_clause = ""
+            if anchor_id is not None:
+                anchor_clause = "AND message_id > ?"
+                params.append(anchor_id)
+            order = "ASC"
+        else:
+            anchor_clause = ""
+            if anchor_id is not None:
+                anchor_clause = "AND message_id < ?"
+                params.append(anchor_id)
+            order = "DESC"
+
+        params.append(limit)
+
+        sql = (
+            "SELECT dialog_id, message_id, sent_at, text, sender_id, sender_first_name, "
+            "media_description, reply_to_msg_id, forum_topic_id, edit_date, fetched_at "
+            f"FROM message_cache "
+            f"WHERE dialog_id = ? AND ({topic_clause}) "
+            f"{anchor_clause} "
+            f"ORDER BY message_id {order} "
+            f"LIMIT ?"
+        )
+
+        rows = self._conn.execute(sql, params).fetchall()
+        if len(rows) < limit:
+            return None
+        return [CachedMessage.from_row(row) for row in rows]
+
+
+def _should_try_cache(navigation: str | None, *, unread: bool) -> bool:
+    """Decide whether to attempt a cache read before hitting the Telegram API.
+
+    Returns False (always live) for:
+    - navigation=None or "newest"  (BYP-01: first page must be fresh)
+    - unread=True                  (BYP-02: read state changes in real time)
+
+    Returns True (try cache) for:
+    - navigation="oldest"          (historical data, immutable)
+    - navigation=<base64 token>    (page 2+, cacheable continuation)
+    """
+    if unread:
+        return False
+    if navigation is None or navigation == "newest":
+        return False
+    return True
 
 
 class EntityCache:
