@@ -16,11 +16,10 @@ boilerplate before every real task.
 ## Current State
 
 Latest shipped milestone: `v1.3 Medium Implementation` on 2026-03-14.
+Post-v1.3: expert panel cleanup (StrEnum, Protocol types, mypy zero errors), capability_unread extraction, ListDialogs metadata (members/created).
 
-The live runtime now has capability-oriented internal seams, unified navigation contract, direct
-read/search workflows, and surface posture classification. 7 read-only MCP tools on Python 3.13,
-Telethon, the MCP SDK, SQLite caches (with parallel-session-safe bootstrap), and Docker + `mcp-proxy`.
-~12,800 LOC Python, 200+ passing tests.
+8 read-only MCP tools on Python 3.13, Telethon, MCP SDK, SQLite caches, Docker stdio transport.
+~5,400 LOC Python (post-refactor), 284 passing tests, zero mypy errors.
 
 The Medium-path refactor from the `v1.2` research is complete: server boundary failures are
 actionable, public tools delegate to capability seams, continuation uses one shared vocabulary,
@@ -67,7 +66,17 @@ and primary workflows skip unnecessary helper steps.
 
 ### Active
 
-(None — next milestone requirements TBD via `/gsd:new-milestone`)
+## Current Milestone: v1.4 Message Cache
+
+**Goal:** Persistent SQLite message cache with background prefetch to reduce Telegram API calls and speed up repeated reads.
+
+**Target features:**
+- Structured message cache in SQLite (dialog_id, message_id, structured fields)
+- CachedMessage proxy satisfying MessageLike Protocol
+- Cache-first history reads with range-based coverage detection
+- Dual prefetch: next page + oldest page on first ListMessages per dialog
+- 30-day TTL for cached messages
+- Dialog metadata enrichment (members, created date)
 
 ### Backlog Candidates
 
@@ -82,7 +91,7 @@ and primary workflows skip unnecessary helper steps.
 - Real-time notifications / webhooks — polling model only
 - Native HTTP/SSE transport — mcp-proxy covers this; deferred
 - Multi-account support — single session per deployment
-- Message content caching — messages always fetched fresh from API
+- ~~Message content caching~~ — moved to Active (v1.4): persistent cache reduces API calls, messages are near-immutable
 - Group membership table in entity cache — high staleness risk, no v1 tool depends on it
 - `transliterate` dependency — rapidfuzz WRatio proved sufficient for Latin+Cyrillic; add only if validated against real contacts
 - Maximal surface compression or large structured-output redesign — deferred until Medium migration has proven stable in production
@@ -165,4 +174,4 @@ surface against them, and produce grounded recommendations for a future refactor
 </details>
 
 ---
-*Last updated: 2026-03-14 after v1.3 milestone*
+*Last updated: 2026-03-19 after v1.4 milestone start*
