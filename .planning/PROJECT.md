@@ -17,9 +17,10 @@ boilerplate before every real task.
 
 Latest shipped milestone: `v1.3 Medium Implementation` on 2026-03-14.
 Post-v1.3: expert panel cleanup (StrEnum, Protocol types, mypy zero errors), capability_unread extraction, ListDialogs metadata (members/created).
+Phase 19 (Dialog Metadata Enrichment) complete — ListDialogs now surfaces members count and creation date for groups/channels.
 
 8 read-only MCP tools on Python 3.13, Telethon, MCP SDK, SQLite caches, Docker stdio transport.
-~5,400 LOC Python (post-refactor), 284 passing tests, zero mypy errors.
+~5,400 LOC Python (post-refactor), 290 passing tests, zero mypy errors.
 
 The Medium-path refactor from the `v1.2` research is complete: server boundary failures are
 actionable, public tools delegate to capability seams, continuation uses one shared vocabulary,
@@ -63,6 +64,9 @@ and primary workflows skip unnecessary helper steps.
 - ✓ Surface posture classification (primary vs secondary) with runtime proof — v1.3
 - ✓ Parallel-session-safe SQLite cache bootstrap — v1.3
 - ✓ Privacy-safe telemetry verified after surface changes — v1.3
+
+- ✓ `ListDialogs` members=N (participant count) for groups/channels — v1.4 (META-01)
+- ✓ `ListDialogs` created=YYYY-MM-DD (creation date) for groups/channels — v1.4 (META-02)
 
 ### Active
 
@@ -174,4 +178,4 @@ surface against them, and produce grounded recommendations for a future refactor
 </details>
 
 ---
-*Last updated: 2026-03-19 after v1.4 milestone start*
+*Last updated: 2026-03-20 after Phase 19 completion*
