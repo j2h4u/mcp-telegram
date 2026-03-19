@@ -3,13 +3,13 @@ gsd_state_version: 1.0
 milestone: v1.4
 milestone_name: Message Cache
 status: unknown
-stopped_at: Completed 20-01-PLAN.md
-last_updated: "2026-03-19T20:09:51.311Z"
+stopped_at: Completed 20-02-PLAN.md
+last_updated: "2026-03-19T20:15:01.905Z"
 progress:
   total_phases: 5
-  completed_phases: 1
+  completed_phases: 2
   total_plans: 3
-  completed_plans: 2
+  completed_plans: 3
 ---
 
 # Project State
@@ -38,6 +38,8 @@ Plan: 2 of 2
 - META-01/META-02 already implemented — Phase 19 is commit + test coverage
 - [Phase 20-cache-foundation]: WITHOUT ROWID for message_cache and message_versions — composite PK always known, eliminates secondary B-tree
 - [Phase 20-cache-foundation]: message_versions schema-only in Plan 01 — Phase 22 populates; schema-first keeps bootstrap idempotent
+- [Phase 20-cache-foundation]: tuple[object, ...] + cast() for from_row() parameter type — SQLite rows are mixed-type, cast() at use sites satisfies mypy
+- [Phase 20-cache-foundation]: CachedMessage.reactions/media always None — media_description folds into .message; reactions not stored in cache
 
 ### Pending Todos
 
@@ -51,6 +53,6 @@ None
 
 ## Session Continuity
 
-Last session: 2026-03-19T20:09:51.307Z
-Stopped at: Completed 20-01-PLAN.md
+Last session: 2026-03-19T20:15:01.901Z
+Stopped at: Completed 20-02-PLAN.md
 Resume file: None
