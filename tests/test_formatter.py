@@ -372,14 +372,14 @@ def test_edited_marker_shown_when_edit_date_is_int() -> None:
     """[edited HH:mm] appears when edit_date is an integer Unix timestamp (CachedMessage style)."""
     from mcp_telegram.formatter import format_messages
 
-    # 1718462400 = 2024-06-15 15:20:00 UTC
+    # 1718464800 = 2024-06-15 15:20:00 UTC
     dt = datetime(2024, 6, 15, 14, 30, 0, tzinfo=timezone.utc)
     msg = MockMessage(
         id=1,
         date=dt,
         message="edited text",
         sender=MockSender(first_name="Alice"),
-        edit_date=1718462400,
+        edit_date=1718464800,
     )
     result = format_messages([msg], {})
     assert "[edited 15:20]" in result, f"Expected '[edited 15:20]' in output, got: {result!r}"

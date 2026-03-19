@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from .models import LinePrefixGetter, MessageLike, TopicNameGetter
@@ -68,6 +69,13 @@ def format_messages(
 
         sender_name = _resolve_sender_name(msg)
         text = _render_text(msg)
+        edit_date_raw = getattr(msg, "edit_date", None)
+        if edit_date_raw is not None:
+            if isinstance(edit_date_raw, datetime):
+                ed_dt = edit_date_raw.astimezone(effective_tz)
+            else:
+                ed_dt = datetime.fromtimestamp(int(edit_date_raw), tz=timezone.utc).astimezone(effective_tz)
+            text = f"{text} [edited {ed_dt.strftime('%H:%M')}]"
         reaction_names = reaction_names_map.get(msg.id) if reaction_names_map else None
         reactions_str = _format_reactions(msg, reaction_names)
         if reactions_str:
