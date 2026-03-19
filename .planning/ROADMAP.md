@@ -85,7 +85,7 @@ Plans:
   6. On a cache hit for paginated pages, a background delta fetch pulls messages newer than the last cached ID — response is not blocked
 **Plans**: 2 plans
 Plans:
-- [ ] 23-01-PLAN.md — PrefetchCoordinator class + background task coroutines (TDD)
+- [x] 23-01-PLAN.md — PrefetchCoordinator class + background task coroutines (TDD)
 - [ ] 23-02-PLAN.md — Wire prefetch into capability_history and tools layer (TDD)
 
 ## Progress
@@ -114,7 +114,7 @@ Plans:
 | 20. Cache Foundation | v1.4 | 2/2 | Complete    | 2026-03-19 |
 | 21. Cache-First Reads & Bypass Rules | v1.4 | 2/2 | Complete    | 2026-03-19 |
 | 22. Edit Detection | v1.4 | 1/1 | Complete    | 2026-03-19 |
-| 23. Prefetch & Lazy Refresh | v1.4 | 0/2 | Not started | - |
+| 23. Prefetch & Lazy Refresh | v1.4 | 1/2 | In Progress|  |
 
 ## Shipped Milestones
 

@@ -32,14 +32,14 @@ Requirements for Message Cache milestone. Primary goal: speed (weight 1.0), seco
 - [ ] **PRE-01**: On first ListMessages for a dialog: prefetch next page (current direction) + oldest page in background via asyncio.create_task
 - [ ] **PRE-02**: On any subsequent page read: prefetch next page in current direction
 - [ ] **PRE-03**: When reading oldest page: prefetch next page forward (old→new direction)
-- [ ] **PRE-04**: Prefetch results stored in MessageCache (same path as regular cache population)
-- [ ] **PRE-05**: Prefetch deduplication — in-memory set of (dialog_id, direction, anchor_id) prevents duplicate API calls for same page
+- [x] **PRE-04**: Prefetch results stored in MessageCache (same path as regular cache population)
+- [x] **PRE-05**: Prefetch deduplication — in-memory set of (dialog_id, direction, anchor_id) prevents duplicate API calls for same page
 
 ### Lazy Refresh
 
 - [ ] **REF-01**: On cache hit for paginated pages, background delta refresh via asyncio.create_task — fetch new messages since last_cached_message_id
-- [ ] **REF-02**: Delta fetch uses iter_messages(min_id=last_cached_id) to pull only new messages
-- [ ] **REF-03**: No timer-based refresh — refresh only on access (zero API calls for inactive dialogs)
+- [x] **REF-02**: Delta fetch uses iter_messages(min_id=last_cached_id) to pull only new messages
+- [x] **REF-03**: No timer-based refresh — refresh only on access (zero API calls for inactive dialogs)
 
 ### Cache Bypasses
 
@@ -100,11 +100,11 @@ Requirements for Message Cache milestone. Primary goal: speed (weight 1.0), seco
 | PRE-01 | Phase 23 | Pending |
 | PRE-02 | Phase 23 | Pending |
 | PRE-03 | Phase 23 | Pending |
-| PRE-04 | Phase 23 | Pending |
-| PRE-05 | Phase 23 | Pending |
+| PRE-04 | Phase 23 | Complete |
+| PRE-05 | Phase 23 | Complete |
 | REF-01 | Phase 23 | Pending |
-| REF-02 | Phase 23 | Pending |
-| REF-03 | Phase 23 | Pending |
+| REF-02 | Phase 23 | Complete |
+| REF-03 | Phase 23 | Complete |
 | BYP-01 | Phase 21 | Complete |
 | BYP-02 | Phase 21 | Complete |
 | BYP-03 | Phase 21 | Complete |

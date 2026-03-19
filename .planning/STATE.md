@@ -3,13 +3,13 @@ gsd_state_version: 1.0
 milestone: v1.4
 milestone_name: Message Cache
 status: unknown
-stopped_at: Phase 23 context gathered
-last_updated: "2026-03-19T21:42:43.108Z"
+stopped_at: Completed 23-01-PLAN.md — PrefetchCoordinator + task coroutines
+last_updated: "2026-03-19T23:19:52.497Z"
 progress:
   total_phases: 5
   completed_phases: 4
-  total_plans: 6
-  completed_plans: 6
+  total_plans: 8
+  completed_plans: 7
 ---
 
 # Project State
@@ -19,12 +19,12 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-20)
 
 **Core value:** LLM can work with Telegram using natural names — zero cold-start friction, no ID lookup boilerplate before every real task
-**Current focus:** Phase 22 — edit-detection
+**Current focus:** Phase 23 — prefetch-lazy-refresh
 
 ## Current Position
 
-Phase: 23
-Plan: Not started
+Phase: 23 (prefetch-lazy-refresh) — EXECUTING
+Plan: 2 of 2
 
 ## Accumulated Context
 
@@ -48,6 +48,8 @@ Plan: Not started
 - [Phase 22-edit-detection]: Version write and cache INSERT OR REPLACE share a single transaction in store_messages()
 - [Phase 22-edit-detection]: Only text change triggers versioning — edit_date-only changes do not produce version rows
 - [Phase 22-edit-detection]: Batch SELECT IN for version detection — O(1) round trips per store_messages call
+- [Phase 23-prefetch-lazy-refresh]: coro.close() on rejected duplicate coroutine to prevent ResourceWarning when dedup fires
+- [Phase 23-prefetch-lazy-refresh]: [Phase 23-01]: type: ignore[attr-defined] on client.iter_messages — client typed as object to avoid coupling to TelegramClient
 
 ### Pending Todos
 
@@ -61,6 +63,6 @@ None
 
 ## Session Continuity
 
-Last session: 2026-03-19T21:42:43.104Z
-Stopped at: Phase 23 context gathered
-Resume file: .planning/phases/23-prefetch-lazy-refresh/23-CONTEXT.md
+Last session: 2026-03-19T23:19:52.493Z
+Stopped at: Completed 23-01-PLAN.md — PrefetchCoordinator + task coroutines
+Resume file: None
