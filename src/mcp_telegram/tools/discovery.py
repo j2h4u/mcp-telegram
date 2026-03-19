@@ -18,6 +18,9 @@ class ListDialogs(ToolArgs):
     Returns both archived and non-archived dialogs by default (Telegram uses archiving as a UI
     organization tool, not data archival). Set exclude_archived=True to show only non-archived
     dialogs (equivalent to old archived=False behavior).
+
+    Groups and channels include members=N (participant count) and created=YYYY-MM-DD
+    (creation date) when available. Private chats omit both fields.
     """
 
     exclude_archived: bool = False
@@ -40,14 +43,21 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
             # Collect for batch cache upsert
             dialog_id = getattr(dialog, "id", None)
             dialog_name = getattr(dialog, "name", None)
+            entity = getattr(dialog, "entity", None)
             if isinstance(dialog_id, int) and isinstance(dialog_name, str):
-                entity = getattr(dialog, "entity", None)
                 username = getattr(entity, "username", None) if entity is not None else None
                 batch_entities.append((dialog_id, dialog_type, dialog_name, username))
-            lines.append(
+            line = (
                 f"name='{dialog.name}' id={dialog.id} type={dialog_type} "
                 f"last_message_at={last_at} unread={dialog.unread_count}"
             )
+            members = getattr(entity, "participants_count", None) if entity is not None else None
+            if members is not None:
+                line += f" members={members}"
+            created = getattr(entity, "date", None) if entity is not None else None
+            if created is not None:
+                line += f" created={created.strftime('%Y-%m-%d')}"
+            lines.append(line)
     if batch_entities:
         cache.upsert_batch(batch_entities)
     result_text = "\n".join(lines) if lines else no_dialogs_text()
