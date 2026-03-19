@@ -108,3 +108,11 @@ None — no external service configuration required.
 ---
 *Phase: 20-cache-foundation*
 *Completed: 2026-03-19*
+
+## Self-Check: PASSED
+
+- FOUND: src/mcp_telegram/cache.py
+- FOUND: tests/test_cache.py
+- FOUND: .planning/phases/20-cache-foundation/20-01-SUMMARY.md
+- FOUND commit: 65ecb46 (test RED)
+- FOUND commit: 19c5ff2 (feat GREEN)
