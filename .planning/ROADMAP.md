@@ -28,7 +28,7 @@
   3. Private chats omit both fields (no participants_count or creation date available)
 **Plans**: 1 plan
 Plans:
-- [ ] 19-01-PLAN.md — Test coverage + docstring for members/created metadata fields
+- [x] 19-01-PLAN.md — Test coverage + docstring for members/created metadata fields
 
 #### Phase 20: Cache Foundation
 **Goal**: MessageCache SQLite table and CachedMessage proxy class exist and are wired into the shared database bootstrap
@@ -99,7 +99,7 @@ Plans:
 | 16. Unified Navigation Contract | v1.3 | 3/3 | Complete | 2026-03-14 |
 | 17. Direct Read/Search Workflows | v1.3 | 4/4 | Complete | 2026-03-14 |
 | 18. Surface Posture & Rollout Proof | v1.3 | 3/3 | Complete | 2026-03-14 |
-| 19. Dialog Metadata Enrichment | v1.4 | 0/1 | In progress | - |
+| 19. Dialog Metadata Enrichment | v1.4 | 1/1 | Complete   | 2026-03-19 |
 | 20. Cache Foundation | v1.4 | 0/TBD | Not started | - |
 | 21. Cache-First Reads & Bypass Rules | v1.4 | 0/TBD | Not started | - |
 | 22. Edit Detection | v1.4 | 0/TBD | Not started | - |
