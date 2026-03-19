@@ -114,7 +114,7 @@ Plans:
 | 20. Cache Foundation | v1.4 | 2/2 | Complete    | 2026-03-19 |
 | 21. Cache-First Reads & Bypass Rules | v1.4 | 2/2 | Complete    | 2026-03-19 |
 | 22. Edit Detection | v1.4 | 1/1 | Complete    | 2026-03-19 |
-| 23. Prefetch & Lazy Refresh | v1.4 | 2/2 | Complete   | 2026-03-19 |
+| 23. Prefetch & Lazy Refresh | v1.4 | 2/2 | Complete    | 2026-03-19 |
 
 ## Shipped Milestones
 
