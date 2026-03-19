@@ -3,13 +3,13 @@ gsd_state_version: 1.0
 milestone: v1.4
 milestone_name: Message Cache
 status: unknown
-stopped_at: Phase 19 context gathered
-last_updated: "2026-03-19T19:43:55.755Z"
+stopped_at: Completed 20-01-PLAN.md
+last_updated: "2026-03-19T20:09:51.311Z"
 progress:
   total_phases: 5
   completed_phases: 1
-  total_plans: 1
-  completed_plans: 1
+  total_plans: 3
+  completed_plans: 2
 ---
 
 # Project State
@@ -19,12 +19,12 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-20)
 
 **Core value:** LLM can work with Telegram using natural names — zero cold-start friction, no ID lookup boilerplate before every real task
-**Current focus:** Phase 19 — dialog-metadata-enrichment
+**Current focus:** Phase 20 — cache-foundation
 
 ## Current Position
 
-Phase: 20
-Plan: Not started
+Phase: 20 (cache-foundation) — EXECUTING
+Plan: 2 of 2
 
 ## Accumulated Context
 
@@ -36,6 +36,8 @@ Plan: Not started
 - Dual prefetch: next page + oldest page on first access
 - Same SQLite DB as entity_cache.db — no separate connection
 - META-01/META-02 already implemented — Phase 19 is commit + test coverage
+- [Phase 20-cache-foundation]: WITHOUT ROWID for message_cache and message_versions — composite PK always known, eliminates secondary B-tree
+- [Phase 20-cache-foundation]: message_versions schema-only in Plan 01 — Phase 22 populates; schema-first keeps bootstrap idempotent
 
 ### Pending Todos
 
@@ -49,6 +51,6 @@ None
 
 ## Session Continuity
 
-Last session: 2026-03-19T19:28:05.032Z
-Stopped at: Phase 19 context gathered
-Resume file: .planning/phases/19-dialog-metadata-enrichment/19-CONTEXT.md
+Last session: 2026-03-19T20:09:51.307Z
+Stopped at: Completed 20-01-PLAN.md
+Resume file: None
