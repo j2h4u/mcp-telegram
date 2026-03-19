@@ -55,7 +55,10 @@ Plans:
   4. ListUnreadMessages always fetches live (entire tool bypasses cache)
   5. SearchMessages always fetches live; results are written to MessageCache for future ListMessages hits
   6. Cache coverage tracking is topic-aware — interleaved message IDs across topics do not produce false coverage hits
-**Plans**: TBD
+**Plans**: 2 plans
+Plans:
+- [ ] 21-01-PLAN.md — MessageCache data-access class, bypass rules, PRAGMA optimize (TDD)
+- [ ] 21-02-PLAN.md — Wire cache into capability_history, capability_search, and reply map (TDD)
 
 #### Phase 22: Edit Detection
 **Goal**: Edited messages are detected at write time and marked visually in the formatter
@@ -104,7 +107,7 @@ Plans:
 | 18. Surface Posture & Rollout Proof | v1.3 | 3/3 | Complete | 2026-03-14 |
 | 19. Dialog Metadata Enrichment | v1.4 | 1/1 | Complete    | 2026-03-19 |
 | 20. Cache Foundation | v1.4 | 2/2 | Complete    | 2026-03-19 |
-| 21. Cache-First Reads & Bypass Rules | v1.4 | 0/TBD | Not started | - |
+| 21. Cache-First Reads & Bypass Rules | v1.4 | 0/2 | Not started | - |
 | 22. Edit Detection | v1.4 | 0/TBD | Not started | - |
 | 23. Prefetch & Lazy Refresh | v1.4 | 0/TBD | Not started | - |
 
