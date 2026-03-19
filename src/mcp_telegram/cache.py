@@ -4,6 +4,8 @@ import fcntl
 import json
 import sqlite3
 import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
@@ -283,6 +285,79 @@ def _ensure_connection_schema(conn: sqlite3.Connection) -> None:
         return
 
     _ensure_cache_schema(db_path)
+
+
+@dataclass(frozen=True)
+class _CachedSender:
+    """Stub satisfying SenderLike Protocol for cached messages."""
+    first_name: str | None
+
+
+@dataclass(frozen=True)
+class _CachedReplyHeader:
+    """Stub satisfying ReplyHeaderLike Protocol for cached messages."""
+    reply_to_msg_id: int | None
+
+
+@dataclass(frozen=True)
+class CachedMessage:
+    """MessageLike proxy backed by a message_cache row.
+
+    Satisfies formatter.MessageLike Protocol: .id, .date, .message,
+    .sender, .reply_to, .reactions, .media all present via structural
+    subtyping.
+
+    The edit_date field is stored for Phase 22 (formatter [edited] marker)
+    but is not part of MessageLike.
+    """
+
+    id: int
+    date: datetime
+    message: str | None
+    sender: _CachedSender | None
+    reply_to: _CachedReplyHeader | None
+    media: object = None
+    reactions: object = None
+    edit_date: int | None = None
+
+    @classmethod
+    def from_row(cls, row: tuple[object, ...]) -> CachedMessage:
+        """Construct from a message_cache SELECT * row.
+
+        Row column order (must match _MESSAGE_CACHE_TABLE_DDL):
+            0: dialog_id         — not stored (available from query context)
+            1: message_id        → .id
+            2: sent_at           → .date (UTC datetime from Unix timestamp)
+            3: text              → .message (with media_description fallback)
+            4: sender_id         — not stored (not needed by formatter)
+            5: sender_first_name → .sender (_CachedSender)
+            6: media_description → fallback for .message when text is None
+            7: reply_to_msg_id   → .reply_to (_CachedReplyHeader)
+            8: forum_topic_id    — not stored (available from query context)
+            9: edit_date         → .edit_date (for Phase 22)
+           10: fetched_at        — not stored (cache bookkeeping only)
+        """
+        (
+            _dialog_id,
+            message_id,
+            sent_at,
+            text,
+            _sender_id,
+            sender_first_name,
+            media_description,
+            reply_to_msg_id,
+            _forum_topic_id,
+            edit_date,
+            _fetched_at,
+        ) = row
+        return cls(
+            id=int(cast(int, message_id)),
+            date=datetime.fromtimestamp(int(cast(int, sent_at)), tz=timezone.utc),
+            message=cast("str | None", text) or cast("str | None", media_description),
+            sender=_CachedSender(first_name=cast("str | None", sender_first_name)) if sender_first_name else None,
+            reply_to=_CachedReplyHeader(reply_to_msg_id=cast("int | None", reply_to_msg_id)) if reply_to_msg_id else None,
+            edit_date=cast("int | None", edit_date),
+        )
 
 
 class EntityCache:
