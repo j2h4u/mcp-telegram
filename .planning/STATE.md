@@ -4,7 +4,7 @@ milestone: v1.4
 milestone_name: Message Cache
 status: unknown
 stopped_at: Completed 21-02-PLAN.md
-last_updated: "2026-03-19T21:01:47.151Z"
+last_updated: "2026-03-19T21:07:54.572Z"
 progress:
   total_phases: 5
   completed_phases: 3
@@ -23,8 +23,8 @@ See: .planning/PROJECT.md (updated 2026-03-20)
 
 ## Current Position
 
-Phase: 21 (cache-first-reads-bypass-rules) — EXECUTING
-Plan: 2 of 2
+Phase: 22
+Plan: Not started
 
 ## Accumulated Context
 
