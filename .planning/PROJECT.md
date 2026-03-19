@@ -18,9 +18,10 @@ boilerplate before every real task.
 Latest shipped milestone: `v1.3 Medium Implementation` on 2026-03-14.
 Post-v1.3: expert panel cleanup (StrEnum, Protocol types, mypy zero errors), capability_unread extraction, ListDialogs metadata (members/created).
 Phase 19 (Dialog Metadata Enrichment) complete — ListDialogs now surfaces members count and creation date for groups/channels.
+Phase 20 (Cache Foundation) complete — SQLite message_cache + message_versions tables, CachedMessage proxy satisfying MessageLike Protocol.
 
 8 read-only MCP tools on Python 3.13, Telethon, MCP SDK, SQLite caches, Docker stdio transport.
-~5,400 LOC Python (post-refactor), 290 passing tests, zero mypy errors.
+~5,400 LOC Python (post-refactor), 307 passing tests, zero mypy errors.
 
 The Medium-path refactor from the `v1.2` research is complete: server boundary failures are
 actionable, public tools delegate to capability seams, continuation uses one shared vocabulary,
