@@ -239,6 +239,13 @@ def get_entity_cache() -> EntityCache:
     return EntityCache(db_path)
 
 
+@functools_cache
+def get_prefetch_coordinator():
+    """Return the shared PrefetchCoordinator instance (created once per process)."""
+    from ..prefetch import PrefetchCoordinator
+    return PrefetchCoordinator()
+
+
 def _get_analytics_collector():
     """Lazy-init analytics collector — creates state dir + DB on first call."""
     from ..analytics import TelemetryCollector
