@@ -29,15 +29,15 @@ Requirements for Message Cache milestone. Primary goal: speed (weight 1.0), seco
 
 ### Prefetch
 
-- [ ] **PRE-01**: On first ListMessages for a dialog: prefetch next page (current direction) + oldest page in background via asyncio.create_task
-- [ ] **PRE-02**: On any subsequent page read: prefetch next page in current direction
-- [ ] **PRE-03**: When reading oldest page: prefetch next page forward (old→new direction)
+- [x] **PRE-01**: On first ListMessages for a dialog: prefetch next page (current direction) + oldest page in background via asyncio.create_task
+- [x] **PRE-02**: On any subsequent page read: prefetch next page in current direction
+- [x] **PRE-03**: When reading oldest page: prefetch next page forward (old→new direction)
 - [x] **PRE-04**: Prefetch results stored in MessageCache (same path as regular cache population)
 - [x] **PRE-05**: Prefetch deduplication — in-memory set of (dialog_id, direction, anchor_id) prevents duplicate API calls for same page
 
 ### Lazy Refresh
 
-- [ ] **REF-01**: On cache hit for paginated pages, background delta refresh via asyncio.create_task — fetch new messages since last_cached_message_id
+- [x] **REF-01**: On cache hit for paginated pages, background delta refresh via asyncio.create_task — fetch new messages since last_cached_message_id
 - [x] **REF-02**: Delta fetch uses iter_messages(min_id=last_cached_id) to pull only new messages
 - [x] **REF-03**: No timer-based refresh — refresh only on access (zero API calls for inactive dialogs)
 
@@ -97,12 +97,12 @@ Requirements for Message Cache milestone. Primary goal: speed (weight 1.0), seco
 | EDIT-01 | Phase 22 | Complete |
 | EDIT-02 | Phase 22 | Complete |
 | EDIT-03 | Phase 22 | Complete |
-| PRE-01 | Phase 23 | Pending |
-| PRE-02 | Phase 23 | Pending |
-| PRE-03 | Phase 23 | Pending |
+| PRE-01 | Phase 23 | Complete |
+| PRE-02 | Phase 23 | Complete |
+| PRE-03 | Phase 23 | Complete |
 | PRE-04 | Phase 23 | Complete |
 | PRE-05 | Phase 23 | Complete |
-| REF-01 | Phase 23 | Pending |
+| REF-01 | Phase 23 | Complete |
 | REF-02 | Phase 23 | Complete |
 | REF-03 | Phase 23 | Complete |
 | BYP-01 | Phase 21 | Complete |

@@ -3,13 +3,13 @@ gsd_state_version: 1.0
 milestone: v1.4
 milestone_name: Message Cache
 status: unknown
-stopped_at: Completed 23-01-PLAN.md — PrefetchCoordinator + task coroutines
-last_updated: "2026-03-19T23:19:52.497Z"
+stopped_at: Completed 23-02-PLAN.md — prefetch integration wiring
+last_updated: "2026-03-19T23:26:48.939Z"
 progress:
   total_phases: 5
-  completed_phases: 4
+  completed_phases: 5
   total_plans: 8
-  completed_plans: 7
+  completed_plans: 8
 ---
 
 # Project State
@@ -50,6 +50,7 @@ Plan: 2 of 2
 - [Phase 22-edit-detection]: Batch SELECT IN for version detection — O(1) round trips per store_messages call
 - [Phase 23-prefetch-lazy-refresh]: coro.close() on rejected duplicate coroutine to prevent ResourceWarning when dedup fires
 - [Phase 23-prefetch-lazy-refresh]: [Phase 23-01]: type: ignore[attr-defined] on client.iter_messages — client typed as object to avoid coupling to TelegramClient
+- [Phase 23-prefetch-lazy-refresh]: list[MessageLike] cast to list[object] for _next_prefetch_anchor — list invariance in mypy; Sequence would be covariant but signature uses list[object]
 
 ### Pending Todos
 
@@ -63,6 +64,6 @@ None
 
 ## Session Continuity
 
-Last session: 2026-03-19T23:19:52.493Z
-Stopped at: Completed 23-01-PLAN.md — PrefetchCoordinator + task coroutines
+Last session: 2026-03-19T23:26:48.935Z
+Stopped at: Completed 23-02-PLAN.md — prefetch integration wiring
 Resume file: None
