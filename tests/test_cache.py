@@ -747,3 +747,88 @@ def test_existing_entity_cache_still_works_after_bootstrap(tmp_db_path: Path) ->
 
     assert result is not None
     assert result["name"] == "Ivan"
+
+
+# ---------------------------------------------------------------------------
+# CachedMessage proxy tests (Phase 20, Plan 02)
+# ---------------------------------------------------------------------------
+
+
+def test_cached_message_from_row_basic() -> None:
+    """CachedMessage.from_row() maps a full cache row to correct attributes."""
+    from datetime import datetime, timezone
+
+    from mcp_telegram.cache import CachedMessage
+
+    row = (100, 42, 1718451000, "hello", 101, "Alice", None, None, None, None, 1718451100)
+    msg = CachedMessage.from_row(row)
+    assert msg.id == 42
+    assert msg.message == "hello"
+    assert msg.sender is not None
+    assert msg.sender.first_name == "Alice"
+    assert msg.reply_to is None
+    assert msg.reactions is None
+    assert msg.media is None
+
+
+def test_cached_message_from_row_with_reply() -> None:
+    """CachedMessage.from_row() with reply_to_msg_id creates reply header."""
+    from mcp_telegram.cache import CachedMessage
+
+    row = (100, 43, 1718451000, "reply text", 101, "Bob", None, 10, None, None, 1718451100)
+    msg = CachedMessage.from_row(row)
+    assert msg.reply_to is not None
+    assert msg.reply_to.reply_to_msg_id == 10
+
+
+def test_cached_message_from_row_media_description() -> None:
+    """CachedMessage.from_row() uses media_description as message when text is None."""
+    from mcp_telegram.cache import CachedMessage
+
+    row = (100, 44, 1718451000, None, 101, "Carol", "[фото]", None, None, None, 1718451100)
+    msg = CachedMessage.from_row(row)
+    assert msg.message == "[фото]"
+
+
+def test_cached_message_from_row_no_sender() -> None:
+    """CachedMessage.from_row() with sender_first_name=None yields sender=None."""
+    from mcp_telegram.cache import CachedMessage
+
+    row = (100, 45, 1718451000, "channel post", None, None, None, None, None, None, 1718451100)
+    msg = CachedMessage.from_row(row)
+    assert msg.sender is None
+
+
+def test_cached_message_from_row_date_timezone() -> None:
+    """CachedMessage.from_row() produces timezone-aware UTC datetime from Unix timestamp."""
+    from datetime import datetime, timezone
+
+    from mcp_telegram.cache import CachedMessage
+
+    ts = 1718451000
+    row = (100, 46, ts, "hello", 101, "Dave", None, None, None, None, 1718451100)
+    msg = CachedMessage.from_row(row)
+    expected = datetime.fromtimestamp(ts, tz=timezone.utc)
+    assert msg.date == expected
+    assert msg.date.tzinfo is not None
+
+
+def test_cached_message_from_row_edit_date_preserved() -> None:
+    """CachedMessage stores edit_date for Phase 22 formatter use."""
+    from mcp_telegram.cache import CachedMessage
+
+    row = (100, 47, 1718451000, "edited text", 101, "Eve", None, None, None, 1718460000, 1718461000)
+    msg = CachedMessage.from_row(row)
+    assert msg.edit_date == 1718460000
+
+
+def test_cached_message_frozen() -> None:
+    """CachedMessage is frozen — attribute assignment raises FrozenInstanceError."""
+    import dataclasses
+
+    from mcp_telegram.cache import CachedMessage
+
+    row = (100, 48, 1718451000, "immutable", 101, "Frank", None, None, None, None, 1718451100)
+    msg = CachedMessage.from_row(row)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        msg.id = 999  # type: ignore[misc]
