@@ -1160,3 +1160,96 @@ def test_pragma_optimize_in_bootstrap(tmp_db_path: Path) -> None:
     conn = sqlite3.connect(str(tmp_db_path))
     conn.execute("PRAGMA optimize")
     conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Edit detection versioning tests (Phase 22)
+# ---------------------------------------------------------------------------
+
+
+def test_store_messages_records_version_on_text_change(tmp_db_path: Path) -> None:
+    """Re-storing a message with changed text writes one row to message_versions."""
+    cache = EntityCache(tmp_db_path)
+    mc = MessageCache(cache._conn)
+
+    mc.store_messages(dialog_id=1, messages=[_make_msg(42, text="v1")])
+    mc.store_messages(dialog_id=1, messages=[_make_msg(42, text="v2")])
+
+    rows = cache._conn.execute(
+        "SELECT dialog_id, message_id, version, old_text FROM message_versions "
+        "WHERE dialog_id=1 AND message_id=42"
+    ).fetchall()
+
+    assert len(rows) == 1
+    assert rows[0] == (1, 42, 1, "v1")
+    cache.close()
+
+
+def test_store_messages_no_version_on_unchanged_text(tmp_db_path: Path) -> None:
+    """Re-storing a message with identical text writes no version rows."""
+    cache = EntityCache(tmp_db_path)
+    mc = MessageCache(cache._conn)
+
+    mc.store_messages(dialog_id=1, messages=[_make_msg(42, text="same")])
+    mc.store_messages(dialog_id=1, messages=[_make_msg(42, text="same")])
+
+    count = cache._conn.execute(
+        "SELECT COUNT(*) FROM message_versions WHERE dialog_id=1 AND message_id=42"
+    ).fetchone()[0]
+
+    assert count == 0
+    cache.close()
+
+
+def test_store_messages_no_version_on_first_store(tmp_db_path: Path) -> None:
+    """Storing a message for the first time writes no version rows."""
+    cache = EntityCache(tmp_db_path)
+    mc = MessageCache(cache._conn)
+
+    mc.store_messages(dialog_id=1, messages=[_make_msg(42, text="hello")])
+
+    count = cache._conn.execute(
+        "SELECT COUNT(*) FROM message_versions WHERE dialog_id=1 AND message_id=42"
+    ).fetchone()[0]
+
+    assert count == 0
+    cache.close()
+
+
+def test_store_messages_records_multiple_versions(tmp_db_path: Path) -> None:
+    """Three successive text changes produce two version rows in order."""
+    cache = EntityCache(tmp_db_path)
+    mc = MessageCache(cache._conn)
+
+    mc.store_messages(dialog_id=1, messages=[_make_msg(42, text="v1")])
+    mc.store_messages(dialog_id=1, messages=[_make_msg(42, text="v2")])
+    mc.store_messages(dialog_id=1, messages=[_make_msg(42, text="v3")])
+
+    rows = cache._conn.execute(
+        "SELECT version, old_text FROM message_versions "
+        "WHERE dialog_id=1 AND message_id=42 ORDER BY version"
+    ).fetchall()
+
+    assert rows == [(1, "v1"), (2, "v2")]
+    cache.close()
+
+
+def test_store_messages_version_stores_old_edit_date(tmp_db_path: Path) -> None:
+    """Version row captures the OLD edit_date at time of change, not the new one."""
+    old_ed = datetime(2024, 1, 15, 11, 0, tzinfo=timezone.utc)
+    new_ed = datetime(2024, 1, 15, 12, 0, tzinfo=timezone.utc)
+
+    cache = EntityCache(tmp_db_path)
+    mc = MessageCache(cache._conn)
+
+    mc.store_messages(dialog_id=1, messages=[_make_msg(42, text="v1", edit_date=old_ed)])
+    mc.store_messages(dialog_id=1, messages=[_make_msg(42, text="v2", edit_date=new_ed)])
+
+    row = cache._conn.execute(
+        "SELECT edit_date FROM message_versions WHERE dialog_id=1 AND message_id=42"
+    ).fetchone()
+
+    assert row is not None
+    expected_ts = int(old_ed.timestamp())
+    assert row[0] == expected_ts
+    cache.close()
