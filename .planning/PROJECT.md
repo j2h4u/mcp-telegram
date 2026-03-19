@@ -21,9 +21,10 @@ Phase 19 (Dialog Metadata Enrichment) complete — ListDialogs now surfaces memb
 Phase 20 (Cache Foundation) complete — SQLite message_cache + message_versions tables, CachedMessage proxy satisfying MessageLike Protocol.
 Phase 21 (Cache-First Reads & Bypass Rules) complete — MessageCache data-access class, cache-first history reads, bypass rules for newest/unread/search, topic-aware coverage.
 Phase 22 (Edit Detection) complete — edit versioning in message_versions table, [edited HH:mm] marker in formatter output.
+Phase 23 (Prefetch & Lazy Refresh) complete — PrefetchCoordinator with background cache warming, delta refresh on cache hits, wired into history reads.
 
 8 read-only MCP tools on Python 3.13, Telethon, MCP SDK, SQLite caches, Docker stdio transport.
-~5,600 LOC Python (post-refactor), 339 passing tests, zero mypy errors.
+~5,800 LOC Python (post-refactor), 371 passing tests, zero mypy errors.
 
 The Medium-path refactor from the `v1.2` research is complete: server boundary failures are
 actionable, public tools delegate to capability seams, continuation uses one shared vocabulary,
@@ -181,4 +182,4 @@ surface against them, and produce grounded recommendations for a future refactor
 </details>
 
 ---
-*Last updated: 2026-03-20 after Phase 22 completion*
+*Last updated: 2026-03-20 after Phase 23 completion*
