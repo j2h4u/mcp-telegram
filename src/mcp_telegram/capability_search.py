@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from telethon import TelegramClient  # type: ignore[import-untyped]
 
-from .cache import EntityCache
+from .cache import EntityCache, MessageCache
 from .dialog_target import resolve_dialog_target
 from .errors import invalid_navigation_text
 from .formatter import format_search_message_groups
@@ -88,6 +88,11 @@ async def execute_search_messages_capability(
         cache=cache,
         messages=hits,
     )
+
+    # BYP-04: Search always hits API (no cache read), but results populate cache
+    # for future ListMessages page 2+ hits (CACHE-05)
+    msg_cache = MessageCache(cache._conn)
+    msg_cache.store_messages(entity_id, hits)
 
     context_messages_by_id = await _build_context_message_map(
         client,

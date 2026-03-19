@@ -8,7 +8,7 @@ from telethon.tl.functions.messages import GetPeerDialogsRequest  # type: ignore
 if TYPE_CHECKING:
     from telethon import TelegramClient  # type: ignore[import-untyped]
 
-from .cache import EntityCache, TopicMetadataCache
+from .cache import EntityCache, MessageCache, TopicMetadataCache, _should_try_cache
 from .dialog_target import resolve_dialog_target
 from .pagination import HistoryDirection
 from .errors import deleted_topic_text, inaccessible_topic_text, rpc_error_detail
@@ -30,6 +30,7 @@ from .models import (
     ForumTopicFailure,
     HistoryReadCapabilityResult,
     HistoryReadExecution,
+    MessageLike,
     MessageReadFailure,
     NavigationFailure,
     ResolvedForumTopic,
@@ -153,58 +154,92 @@ async def execute_history_read_capability(
         peer_result = await client(GetPeerDialogsRequest(peers=[input_peer]))
         iter_kwargs["min_id"] = peer_result.dialogs[0].read_inbox_max_id
 
-    try:
-        use_topic_scoped_fetch = (
-            topic_metadata is not None
-            and (
-                unread
-                or (
-                    not bool(topic_metadata["is_general"])
-                    and "reply_to" in iter_kwargs
-                )
-            )
-        )
-        if use_topic_scoped_fetch and topic_metadata is not None and topic_cache is not None:
-            fetched_messages, topic_metadata, iter_kwargs = await fetch_messages_for_topic(
-                client,
-                entity_id=entity_id,
-                iter_kwargs=iter_kwargs,
-                topic_metadata=topic_metadata,
-                topic_cache=topic_cache,
-                allow_headerless_messages=bool(topic_metadata["is_general"]) or not unread,
-                fetch_topic_messages_fn=fetch_topic_messages_fn,
-                refresh_topic_by_id_fn=refresh_topic_by_id_fn,
-            )
-            if bool(topic_metadata["is_deleted"]):
-                deleted_name = topic_name or topic_query or "Topic"
-                return MessageReadFailure(
-                    kind="deleted",
-                    text=deleted_topic_text(deleted_name, retry_tool=retry_tool),
-                )
-            raw_messages = [] if fetched_messages is None else fetched_messages
-            topic_cache.clear_topic_inaccessible(entity_id, int(topic_metadata["topic_id"]))
+    # Cache-first read (CACHE-03, CACHE-05, BYP-01, BYP-02)
+    msg_cache = MessageCache(cache._conn)
+    topic_id_for_cache = int(topic_metadata["topic_id"]) if topic_metadata is not None else None
+
+    cache_direction = HistoryDirection.OLDEST if iter_kwargs.get("reverse") else HistoryDirection.NEWEST
+    cache_anchor_id: int | None = None
+    if cache_direction == HistoryDirection.NEWEST:
+        max_id = iter_kwargs.get("max_id")
+        cache_anchor_id = int(max_id) if isinstance(max_id, int) else None
+    else:
+        min_id = iter_kwargs.get("min_id")
+        # min_id=1 is the "from beginning" sentinel set by _build_history_iter_kwargs
+        # when no cursor is provided — treat as no anchor so the query starts at ID 1
+        if isinstance(min_id, int) and min_id > 1:
+            cache_anchor_id = int(min_id)
         else:
-            raw_messages = [msg async for msg in client.iter_messages(**iter_kwargs)]
-    except RPCError as exc:
-        if topic_metadata is not None and topic_cache is not None:
-            detail = rpc_error_detail(exc)
-            topic_cache.mark_topic_inaccessible(
-                entity_id,
-                int(topic_metadata["topic_id"]),
-                detail,
+            cache_anchor_id = None
+
+    cached_page: list[MessageLike] | None = None
+    if _should_try_cache(navigation, unread=unread):
+        cached_page = msg_cache.try_read_page(  # type: ignore[assignment]
+            entity_id,
+            topic_id=topic_id_for_cache,
+            anchor_id=cache_anchor_id,
+            limit=limit,
+            direction=cache_direction,
+        )
+
+    if cached_page is not None:
+        raw_messages: list[MessageLike] = cached_page
+    else:
+        try:
+            use_topic_scoped_fetch = (
+                topic_metadata is not None
+                and (
+                    unread
+                    or (
+                        not bool(topic_metadata["is_general"])
+                        and "reply_to" in iter_kwargs
+                    )
+                )
             )
-            topic_metadata["inaccessible_error"] = detail
-            topic_label = topic_name or topic_query or f'Topic {int(topic_metadata["topic_id"])}'
-            return MessageReadFailure(
-                kind="inaccessible",
-                text=inaccessible_topic_text(
-                    topic_label,
-                    exc,
-                    resolved=True,
-                    retry_tool=retry_tool,
-                ),
-            )
-        raise
+            if use_topic_scoped_fetch and topic_metadata is not None and topic_cache is not None:
+                fetched_messages, topic_metadata, iter_kwargs = await fetch_messages_for_topic(
+                    client,
+                    entity_id=entity_id,
+                    iter_kwargs=iter_kwargs,
+                    topic_metadata=topic_metadata,
+                    topic_cache=topic_cache,
+                    allow_headerless_messages=bool(topic_metadata["is_general"]) or not unread,
+                    fetch_topic_messages_fn=fetch_topic_messages_fn,
+                    refresh_topic_by_id_fn=refresh_topic_by_id_fn,
+                )
+                if bool(topic_metadata["is_deleted"]):
+                    deleted_name = topic_name or topic_query or "Topic"
+                    return MessageReadFailure(
+                        kind="deleted",
+                        text=deleted_topic_text(deleted_name, retry_tool=retry_tool),
+                    )
+                raw_messages = [] if fetched_messages is None else fetched_messages
+                topic_cache.clear_topic_inaccessible(entity_id, int(topic_metadata["topic_id"]))
+            else:
+                raw_messages = [msg async for msg in client.iter_messages(**iter_kwargs)]
+        except RPCError as exc:
+            if topic_metadata is not None and topic_cache is not None:
+                detail = rpc_error_detail(exc)
+                topic_cache.mark_topic_inaccessible(
+                    entity_id,
+                    int(topic_metadata["topic_id"]),
+                    detail,
+                )
+                topic_metadata["inaccessible_error"] = detail
+                topic_label = topic_name or topic_query or f'Topic {int(topic_metadata["topic_id"])}'
+                return MessageReadFailure(
+                    kind="inaccessible",
+                    text=inaccessible_topic_text(
+                        topic_label,
+                        exc,
+                        resolved=True,
+                        retry_tool=retry_tool,
+                    ),
+                )
+            raise
+
+        # Cache population: store every API fetch result (CACHE-05)
+        msg_cache.store_messages(entity_id, raw_messages)
 
     if filter_sender_after_fetch and isinstance(sender_entity_id, int):
         messages = [
@@ -223,6 +258,7 @@ async def execute_history_read_capability(
         client,
         entity_id=entity_id,
         messages=messages,
+        msg_cache=msg_cache,
     )
     reaction_names_map = await _build_reaction_names_map(
         client,
