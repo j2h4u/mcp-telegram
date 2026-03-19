@@ -7,7 +7,7 @@ from ..capabilities import ExactTargetHints
 from ..errors import search_no_hits_text
 from ..formatter import format_messages
 from ..resolver import parse_exact_dialog_id
-from ._base import REACTION_NAMES_THRESHOLD, ToolArgs, ToolResult, _resolve_dialog, _text_response, connected_client, get_entity_cache, mcp_tool
+from ._base import REACTION_NAMES_THRESHOLD, ToolArgs, ToolResult, _resolve_dialog, _text_response, connected_client, get_entity_cache, get_prefetch_coordinator, mcp_tool
 
 
 class ListMessages(ToolArgs):
@@ -122,6 +122,7 @@ async def list_messages(args: ListMessages) -> ToolResult:
             fetch_topic_messages_fn=capabilities.fetch_topic_messages,
             refresh_topic_by_id_fn=capabilities.refresh_topic_by_id,
             exact=exact,
+            prefetch_coordinator=get_prefetch_coordinator(),
         )
     if isinstance(
         history_execution,

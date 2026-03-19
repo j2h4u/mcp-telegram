@@ -374,9 +374,11 @@ def _schedule_prefetch_tasks(
 
     is_first_page = navigation is None or navigation in ("newest", "oldest")
 
+    messages_as_objects: list[object] = list(messages)  # list is invariant; cast for _next_prefetch_anchor
+
     if is_first_page:
         # PRE-01 / PRE-03: next page in current direction
-        next_anchor = _next_prefetch_anchor(messages, cache_direction)
+        next_anchor = _next_prefetch_anchor(messages_as_objects, cache_direction)
         if next_anchor is not None:
             key = (entity_id, str(cache_direction), next_anchor, topic_id)
             coordinator.schedule(
@@ -392,7 +394,7 @@ def _schedule_prefetch_tasks(
             )
     else:
         # PRE-02: subsequent page — next page only
-        next_anchor = _next_prefetch_anchor(messages, cache_direction)
+        next_anchor = _next_prefetch_anchor(messages_as_objects, cache_direction)
         if next_anchor is not None:
             key = (entity_id, str(cache_direction), next_anchor, topic_id)
             coordinator.schedule(
