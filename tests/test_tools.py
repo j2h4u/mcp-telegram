@@ -188,6 +188,145 @@ async def test_list_dialogs_null_date(mock_cache, mock_client, monkeypatch):
     assert "last_message_at=unknown" in result[0].text
 
 
+async def test_list_dialogs_members_field(mock_cache, mock_client, monkeypatch):
+    """META-01: ListDialogs includes members=N for groups with participants_count."""
+    fake_dialog = MagicMock()
+    fake_dialog.is_user = False
+    fake_dialog.is_group = True
+    fake_dialog.is_channel = False
+    fake_dialog.date = datetime(2024, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+    fake_dialog.id = 300
+    fake_dialog.name = "Dev Team"
+    fake_dialog.unread_count = 5
+    fake_dialog.entity = MagicMock(username=None, participants_count=42, date=None)
+
+    mock_client.iter_dialogs = MagicMock(return_value=_async_iter([fake_dialog]))
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.discovery.get_entity_cache", lambda: mock_cache)
+
+    from mcp_telegram.tools import list_dialogs
+    result = await list_dialogs(ListDialogs())
+    text = result[0].text
+    assert "members=42" in text
+    assert "created=" not in text
+
+
+async def test_list_dialogs_created_field(mock_cache, mock_client, monkeypatch):
+    """META-02: ListDialogs includes created=YYYY-MM-DD for channels with entity.date."""
+    fake_dialog = MagicMock()
+    fake_dialog.is_user = False
+    fake_dialog.is_group = False
+    fake_dialog.is_channel = True
+    fake_dialog.date = datetime(2024, 8, 10, 9, 0, 0, tzinfo=timezone.utc)
+    fake_dialog.id = 400
+    fake_dialog.name = "News Channel"
+    fake_dialog.unread_count = 0
+    fake_dialog.entity = MagicMock(username="newschan", participants_count=None, date=datetime(2023, 3, 15, 0, 0, 0, tzinfo=timezone.utc))
+
+    mock_client.iter_dialogs = MagicMock(return_value=_async_iter([fake_dialog]))
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.discovery.get_entity_cache", lambda: mock_cache)
+
+    from mcp_telegram.tools import list_dialogs
+    result = await list_dialogs(ListDialogs())
+    text = result[0].text
+    assert "created=2023-03-15" in text
+    assert "members=" not in text
+
+
+async def test_list_dialogs_members_and_created(mock_cache, mock_client, monkeypatch):
+    """META-01 + META-02: ListDialogs includes both members and created for groups with both."""
+    fake_dialog = MagicMock()
+    fake_dialog.is_user = False
+    fake_dialog.is_group = True
+    fake_dialog.is_channel = False
+    fake_dialog.date = datetime(2024, 5, 20, 14, 0, 0, tzinfo=timezone.utc)
+    fake_dialog.id = 500
+    fake_dialog.name = "Full Group"
+    fake_dialog.unread_count = 0
+    fake_dialog.entity = MagicMock(username=None, participants_count=128, date=datetime(2022, 11, 1, 0, 0, 0, tzinfo=timezone.utc))
+
+    mock_client.iter_dialogs = MagicMock(return_value=_async_iter([fake_dialog]))
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.discovery.get_entity_cache", lambda: mock_cache)
+
+    from mcp_telegram.tools import list_dialogs
+    result = await list_dialogs(ListDialogs())
+    text = result[0].text
+    assert "members=128" in text
+    assert "created=2022-11-01" in text
+
+
+async def test_list_dialogs_private_chat_omits_members_created(mock_cache, mock_client, monkeypatch):
+    """META-01 + META-02: Private chats omit members and created (User entities lack these)."""
+    fake_dialog = MagicMock()
+    fake_dialog.is_user = True
+    fake_dialog.is_group = False
+    fake_dialog.is_channel = False
+    fake_dialog.date = datetime(2024, 9, 1, 8, 0, 0, tzinfo=timezone.utc)
+    fake_dialog.id = 600
+    fake_dialog.name = "Alice"
+    fake_dialog.unread_count = 0
+    fake_dialog.entity = SimpleNamespace(username="alice")
+
+    mock_client.iter_dialogs = MagicMock(return_value=_async_iter([fake_dialog]))
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.discovery.get_entity_cache", lambda: mock_cache)
+
+    from mcp_telegram.tools import list_dialogs
+    result = await list_dialogs(ListDialogs())
+    text = result[0].text
+    assert "members=" not in text
+    assert "created=" not in text
+    assert "type=user" in text
+
+
+async def test_list_dialogs_null_entity_omits_members_created(mock_cache, mock_client, monkeypatch):
+    """Null entity edge case: dialog still renders without members/created."""
+    fake_dialog = MagicMock()
+    fake_dialog.is_user = False
+    fake_dialog.is_group = True
+    fake_dialog.is_channel = False
+    fake_dialog.date = datetime(2024, 7, 1, 12, 0, 0, tzinfo=timezone.utc)
+    fake_dialog.id = 700
+    fake_dialog.name = "Orphan Group"
+    fake_dialog.unread_count = 0
+    fake_dialog.entity = None
+
+    mock_client.iter_dialogs = MagicMock(return_value=_async_iter([fake_dialog]))
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.discovery.get_entity_cache", lambda: mock_cache)
+
+    from mcp_telegram.tools import list_dialogs
+    result = await list_dialogs(ListDialogs())
+    text = result[0].text
+    assert "members=" not in text
+    assert "created=" not in text
+    assert "Orphan Group" in text
+
+
+async def test_list_dialogs_members_zero(mock_cache, mock_client, monkeypatch):
+    """Edge case: participants_count=0 should still render members=0 (0 is not None)."""
+    fake_dialog = MagicMock()
+    fake_dialog.is_user = False
+    fake_dialog.is_group = True
+    fake_dialog.is_channel = False
+    fake_dialog.date = datetime(2024, 4, 1, 10, 0, 0, tzinfo=timezone.utc)
+    fake_dialog.id = 800
+    fake_dialog.name = "Empty Group"
+    fake_dialog.unread_count = 0
+    fake_dialog.entity = MagicMock(username=None, participants_count=0, date=None)
+
+    mock_client.iter_dialogs = MagicMock(return_value=_async_iter([fake_dialog]))
+    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
+    monkeypatch.setattr("mcp_telegram.tools.discovery.get_entity_cache", lambda: mock_cache)
+
+    from mcp_telegram.tools import list_dialogs
+    result = await list_dialogs(ListDialogs())
+    text = result[0].text
+    assert "members=0" in text
+
+
 async def test_list_topics_returns_active_topics(tmp_db_path, mock_client, monkeypatch, make_mock_topic):
     """ListTopics exposes stable rows for active forum topics."""
     from mcp_telegram.cache import EntityCache
