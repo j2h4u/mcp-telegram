@@ -369,6 +369,69 @@ class MessageCache:
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
 
+    def _record_versions_if_changed(
+        self,
+        dialog_id: int,
+        incoming: list[tuple[int, str | None, int | None]],
+    ) -> None:
+        """Write message_versions rows for messages whose text changed since last cache.
+
+        Args:
+            dialog_id: The dialog these messages belong to.
+            incoming: List of (message_id, new_text, new_edit_date) tuples.
+        """
+        if not incoming:
+            return
+
+        ids = [row[0] for row in incoming]
+        placeholders = ",".join("?" * len(ids))
+        existing_rows = self._conn.execute(
+            f"SELECT message_id, text, edit_date FROM message_cache "
+            f"WHERE dialog_id = ? AND message_id IN ({placeholders})",
+            [dialog_id, *ids],
+        ).fetchall()
+        existing = {int(row[0]): (row[1], row[2]) for row in existing_rows}
+
+        changed_ids: list[int] = []
+        for msg_id, new_text, _new_edit_date in incoming:
+            cached = existing.get(msg_id)
+            if cached is None:
+                continue
+            old_text, _old_edit_date = cached
+            if old_text == new_text:
+                continue
+            changed_ids.append(msg_id)
+
+        if not changed_ids:
+            return
+
+        # Batch fetch max version numbers for all changed messages
+        changed_placeholders = ",".join("?" * len(changed_ids))
+        max_version_rows = self._conn.execute(
+            f"SELECT message_id, MAX(version) FROM message_versions "
+            f"WHERE dialog_id = ? AND message_id IN ({changed_placeholders}) "
+            f"GROUP BY message_id",
+            [dialog_id, *changed_ids],
+        ).fetchall()
+        max_versions: dict[int, int] = {int(row[0]): int(row[1]) for row in max_version_rows}
+
+        version_rows: list[tuple[object, ...]] = []
+        for msg_id, _new_text, _new_edit_date in incoming:
+            if msg_id not in changed_ids:
+                continue
+            cached = existing[msg_id]
+            old_text, old_edit_date = cached
+            next_version = max_versions.get(msg_id, 0) + 1
+            version_rows.append((dialog_id, msg_id, next_version, old_text, old_edit_date))
+
+        if version_rows:
+            self._conn.executemany(
+                "INSERT INTO message_versions "
+                "(dialog_id, message_id, version, old_text, edit_date) "
+                "VALUES (?, ?, ?, ?, ?)",
+                version_rows,
+            )
+
     def store_messages(self, dialog_id: int, messages: Iterable[object]) -> None:
         """INSERT OR REPLACE messages into message_cache.
 
@@ -427,6 +490,13 @@ class MessageCache:
                 edit_date,
                 now,
             ))
+
+        # Record version history for messages whose text changed (EDIT-02)
+        incoming_for_version: list[tuple[int, str | None, int | None]] = [
+            (int(cast(int, row[1])), cast("str | None", row[3]), cast("int | None", row[9]))
+            for row in rows
+        ]
+        self._record_versions_if_changed(dialog_id, incoming_for_version)
 
         self._conn.executemany(
             "INSERT OR REPLACE INTO message_cache "
