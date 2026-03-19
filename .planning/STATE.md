@@ -3,13 +3,13 @@ gsd_state_version: 1.0
 milestone: v1.4
 milestone_name: Message Cache
 status: unknown
-stopped_at: Completed 21-02-PLAN.md
-last_updated: "2026-03-19T21:07:54.572Z"
+stopped_at: Completed 22-01-PLAN.md
+last_updated: "2026-03-19T21:32:10.870Z"
 progress:
   total_phases: 5
-  completed_phases: 3
-  total_plans: 5
-  completed_plans: 5
+  completed_phases: 4
+  total_plans: 6
+  completed_plans: 6
 ---
 
 # Project State
@@ -19,12 +19,12 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-20)
 
 **Core value:** LLM can work with Telegram using natural names — zero cold-start friction, no ID lookup boilerplate before every real task
-**Current focus:** Phase 21 — cache-first-reads-bypass-rules
+**Current focus:** Phase 22 — edit-detection
 
 ## Current Position
 
-Phase: 22
-Plan: Not started
+Phase: 22 (edit-detection) — EXECUTING
+Plan: 1 of 1
 
 ## Accumulated Context
 
@@ -45,6 +45,9 @@ Plan: Not started
 - [Phase 21]: forum_topic_id=1 sentinel for General topic (reply_to_top_id=None but forum_topic=True)
 - [Phase 21]: min_id=1 sentinel (OLDEST first page) treated as cache anchor_id=None to include message ID 1 in coverage
 - [Phase 21]: cast('MessageLike', CachedMessage) in reply map — frozen dataclass conflicts with Protocol settable-attribute assumption in mypy
+- [Phase 22-edit-detection]: Version write and cache INSERT OR REPLACE share a single transaction in store_messages()
+- [Phase 22-edit-detection]: Only text change triggers versioning — edit_date-only changes do not produce version rows
+- [Phase 22-edit-detection]: Batch SELECT IN for version detection — O(1) round trips per store_messages call
 
 ### Pending Todos
 
@@ -58,6 +61,6 @@ None
 
 ## Session Continuity
 
-Last session: 2026-03-19T21:01:47.147Z
-Stopped at: Completed 21-02-PLAN.md
+Last session: 2026-03-19T21:32:10.867Z
+Stopped at: Completed 22-01-PLAN.md
 Resume file: None

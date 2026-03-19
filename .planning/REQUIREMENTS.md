@@ -23,9 +23,9 @@ Requirements for Message Cache milestone. Primary goal: speed (weight 1.0), seco
 
 ### Edit Detection
 
-- [ ] **EDIT-01**: message_versions table (dialog_id, message_id, version, old_text, edit_date) for tracking text changes
-- [ ] **EDIT-02**: Application-level versioning in Python — before INSERT OR REPLACE, compare text with cached version, write to message_versions if changed. No SQLite trigger (INSERT OR REPLACE = DELETE + INSERT, BEFORE UPDATE trigger never fires)
-- [ ] **EDIT-03**: Formatter shows [edited HH:mm] marker on messages where edit_date IS NOT NULL. No separate is_edited column — derived from edit_date
+- [x] **EDIT-01**: message_versions table (dialog_id, message_id, version, old_text, edit_date) for tracking text changes
+- [x] **EDIT-02**: Application-level versioning in Python — before INSERT OR REPLACE, compare text with cached version, write to message_versions if changed. No SQLite trigger (INSERT OR REPLACE = DELETE + INSERT, BEFORE UPDATE trigger never fires)
+- [x] **EDIT-03**: Formatter shows [edited HH:mm] marker on messages where edit_date IS NOT NULL. No separate is_edited column — derived from edit_date
 
 ### Prefetch
 
@@ -94,9 +94,9 @@ Requirements for Message Cache milestone. Primary goal: speed (weight 1.0), seco
 | CACHE-05 | Phase 21 | Complete |
 | CACHE-06 | Phase 21 | Complete |
 | CACHE-07 | Phase 20 | Complete |
-| EDIT-01 | Phase 22 | Pending |
-| EDIT-02 | Phase 22 | Pending |
-| EDIT-03 | Phase 22 | Pending |
+| EDIT-01 | Phase 22 | Complete |
+| EDIT-02 | Phase 22 | Complete |
+| EDIT-03 | Phase 22 | Complete |
 | PRE-01 | Phase 23 | Pending |
 | PRE-02 | Phase 23 | Pending |
 | PRE-03 | Phase 23 | Pending |
