@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Callable, NoReturn
+from typing import TYPE_CHECKING, Callable, NoReturn, cast
 
 from telethon.errors import RPCError  # type: ignore[import-untyped]
 
@@ -10,7 +10,7 @@ if TYPE_CHECKING:
 
 from telethon.tl.functions.messages import GetMessageReactionsListRequest  # type: ignore[import-untyped]
 
-from .cache import EntityCache, GROUP_TTL, USER_TTL, ReactionMetadataCache, TopicMetadataCache
+from .cache import CachedMessage, EntityCache, GROUP_TTL, MessageCache, USER_TTL, ReactionMetadataCache, TopicMetadataCache
 from .dialog_target import get_sender_type
 from .errors import (
     ambiguous_sender_text,
@@ -215,19 +215,43 @@ async def _build_reply_map(
     *,
     entity_id: int,
     messages: list[MessageLike],
+    msg_cache: MessageCache | None = None,
 ) -> dict[int, MessageLike]:
-    """Fetch original messages for all reply references in the message list."""
+    """Fetch original messages for all reply references in the message list.
+
+    Tries MessageCache first for each reply ID; falls back to the Telegram API
+    only for IDs not found in cache.
+    """
     reply_ids = list({rid for msg in messages if (rid := _get_reply_to_id(msg)) is not None})
     if not reply_ids:
         return {}
 
-    replied = await client.get_messages(entity_id, ids=reply_ids)
-    replied_list = replied if isinstance(replied, list) else [replied]
-    return {
-        mid: message
-        for message in replied_list
-        if message is not None and (mid := _get_message_id(message)) is not None
-    }
+    result: dict[int, MessageLike] = {}
+    uncached_ids: list[int] = []
+
+    if msg_cache is not None:
+        for rid in reply_ids:
+            rows = msg_cache._conn.execute(
+                "SELECT dialog_id, message_id, sent_at, text, sender_id, sender_first_name, "
+                "media_description, reply_to_msg_id, forum_topic_id, edit_date, fetched_at "
+                "FROM message_cache WHERE dialog_id = ? AND message_id = ?",
+                (entity_id, rid),
+            ).fetchall()
+            if rows:
+                result[rid] = cast("MessageLike", CachedMessage.from_row(rows[0]))
+            else:
+                uncached_ids.append(rid)
+    else:
+        uncached_ids = reply_ids
+
+    if uncached_ids:
+        replied = await client.get_messages(entity_id, ids=uncached_ids)
+        replied_list = replied if isinstance(replied, list) else [replied]
+        for message in replied_list:
+            if message is not None and (mid := _get_message_id(message)) is not None:
+                result[mid] = message
+
+    return result
 
 
 async def _build_reaction_names_map(
