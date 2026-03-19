@@ -297,7 +297,12 @@ async def test_first_page_schedules_dual_prefetch(tmp_db_path: Path) -> None:
 
 
 async def test_first_page_oldest_schedules_next_oldest(tmp_db_path: Path) -> None:
-    """PRE-01 + PRE-03: navigation='oldest', non-empty messages -> coordinator.schedule called once."""
+    """PRE-01 + PRE-03: navigation='oldest', non-empty messages -> schedules next OLDEST page.
+
+    When cache serves the page, REF-01 also fires (delta refresh). The dual-oldest
+    collapse means we do NOT schedule an extra "oldest anchor=None" task (which would
+    be redundant since we're already reading the oldest direction).
+    """
     cache = EntityCache(tmp_db_path)
     # Oldest-first page: messages seeded so cache serves them (ids 1-5, ASC order)
     msgs = [_make_msg(id=i) for i in range(1, 6)]  # ids 1,2,3,4,5
@@ -312,15 +317,20 @@ async def test_first_page_oldest_schedules_next_oldest(tmp_db_path: Path) -> Non
     result = await _call_history_with_coordinator(client, cache, coordinator, navigation="oldest")
 
     assert isinstance(result, HistoryReadExecution)
-    # Only one task: next OLDEST page with anchor = max(ids) = 5
-    # (dual oldest collapses — already reading oldest direction)
-    assert coordinator.schedule.call_count == 1
-    key = coordinator.schedule.call_args.kwargs["key"]
-    assert key == (DIALOG_ID, "oldest", 5, None)
+    keys = [call.kwargs["key"] for call in coordinator.schedule.call_args_list]
+    # PRE-03: next OLDEST page with anchor = max(ids) = 5
+    assert (DIALOG_ID, "oldest", 5, None) in keys
+    # Dual collapse: no redundant "oldest anchor=None" task (direction is already OLDEST)
+    assert (DIALOG_ID, "oldest", None, None) not in keys
 
 
 async def test_subsequent_page_schedules_next_prefetch(tmp_db_path: Path) -> None:
-    """PRE-02: navigation=base64 token -> coordinator.schedule called once for next page."""
+    """PRE-02: navigation=base64 token -> next-page prefetch scheduled in NEWEST direction.
+
+    Cache hit also triggers REF-01 delta refresh, so schedule may be called more than once.
+    This test verifies the next-page key is present and no dual oldest-page task is added
+    (subsequent page must NOT schedule the extra oldest-page task that first page does).
+    """
     cache = EntityCache(tmp_db_path)
     msgs = [_make_msg(id=i) for i in range(95, 100)]  # ids 95-99
     msg_cache = MessageCache(cache._conn)
@@ -337,11 +347,11 @@ async def test_subsequent_page_schedules_next_prefetch(tmp_db_path: Path) -> Non
     result = await _call_history_with_coordinator(client, cache, coordinator, navigation=token)
 
     assert isinstance(result, HistoryReadExecution)
-    # PRE-02: exactly one schedule call — next page in current NEWEST direction
-    assert coordinator.schedule.call_count == 1
-    key = coordinator.schedule.call_args.kwargs["key"]
-    # Next anchor = min(95-99) = 95
-    assert key == (DIALOG_ID, "newest", 95, None)
+    keys = [call.kwargs["key"] for call in coordinator.schedule.call_args_list]
+    # PRE-02: next page key present — anchor = min(95-99) = 95
+    assert (DIALOG_ID, "newest", 95, None) in keys
+    # PRE-02: NO extra oldest-page task (only first page gets dual prefetch)
+    assert (DIALOG_ID, "oldest", None, None) not in keys
 
 
 async def test_cache_hit_triggers_delta_refresh(tmp_db_path: Path) -> None:

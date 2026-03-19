@@ -7,6 +7,7 @@ from telethon.tl.functions.messages import GetPeerDialogsRequest  # type: ignore
 
 if TYPE_CHECKING:
     from telethon import TelegramClient  # type: ignore[import-untyped]
+    from .prefetch import PrefetchCoordinator
 
 from .cache import EntityCache, MessageCache, TopicMetadataCache, _should_try_cache
 from .dialog_target import resolve_dialog_target
@@ -60,6 +61,7 @@ async def execute_history_read_capability(
     fetch_topic_messages_fn: TopicFetcher | None = None,
     refresh_topic_by_id_fn: TopicRefresher | None = None,
     exact: ExactTargetHints | None = None,
+    prefetch_coordinator: PrefetchCoordinator | None = None,
 ) -> HistoryReadCapabilityResult:
     """Read message history from one dialog, with optional topic/sender/unread filters.
 
@@ -308,6 +310,22 @@ async def execute_history_read_capability(
                 ),
             )
 
+    # Fire background prefetch tasks (non-blocking)
+    if prefetch_coordinator is not None:
+        _schedule_prefetch_tasks(
+            prefetch_coordinator,
+            client=client,
+            msg_cache=msg_cache,
+            entity_id=entity_id,
+            topic_id=topic_id_for_cache,
+            navigation=navigation,
+            cache_direction=cache_direction,
+            messages=list(cursor_source_messages),
+            limit=limit,
+            cached_page=cached_page,
+            unread=unread,
+        )
+
     return HistoryReadExecution(
         entity_id=entity_id,
         resolve_prefix=dialog_target.resolve_prefix,
@@ -319,3 +337,74 @@ async def execute_history_read_capability(
         topic_name_getter=topic_name_getter,
         navigation=navigation_result,
     )
+
+
+def _schedule_prefetch_tasks(
+    coordinator: PrefetchCoordinator,
+    *,
+    client: TelegramClient,
+    msg_cache: MessageCache,
+    entity_id: int,
+    topic_id: int | None,
+    navigation: str | None,
+    cache_direction: HistoryDirection,
+    messages: list[MessageLike],
+    limit: int,
+    cached_page: list[MessageLike] | None,
+    unread: bool,
+) -> None:
+    """Schedule background prefetch and delta-refresh tasks via PrefetchCoordinator.
+
+    PRE-01: First page (navigation=None/"newest") schedules next page + oldest page.
+    PRE-02: Subsequent page (navigation=base64 token) schedules next page only.
+    PRE-03: Oldest page (navigation="oldest") schedules next OLDEST page forward.
+    REF-01: Cache hit (cached_page is not None) schedules delta refresh.
+    unread=True or empty messages: no tasks scheduled.
+    """
+    from .prefetch import (
+        _delta_refresh_task,
+        _next_prefetch_anchor,
+        _prefetch_task,
+    )
+
+    if unread:
+        return
+    if not messages:
+        return
+
+    is_first_page = navigation is None or navigation in ("newest", "oldest")
+
+    if is_first_page:
+        # PRE-01 / PRE-03: next page in current direction
+        next_anchor = _next_prefetch_anchor(messages, cache_direction)
+        if next_anchor is not None:
+            key = (entity_id, str(cache_direction), next_anchor, topic_id)
+            coordinator.schedule(
+                _prefetch_task(client, msg_cache, entity_id, cache_direction, next_anchor, limit, topic_id),
+                key=key,
+            )
+        # PRE-01 dual: oldest page (skip if already reading oldest direction)
+        if cache_direction != HistoryDirection.OLDEST:
+            oldest_key = (entity_id, str(HistoryDirection.OLDEST), None, topic_id)
+            coordinator.schedule(
+                _prefetch_task(client, msg_cache, entity_id, HistoryDirection.OLDEST, None, limit, topic_id),
+                key=oldest_key,
+            )
+    else:
+        # PRE-02: subsequent page — next page only
+        next_anchor = _next_prefetch_anchor(messages, cache_direction)
+        if next_anchor is not None:
+            key = (entity_id, str(cache_direction), next_anchor, topic_id)
+            coordinator.schedule(
+                _prefetch_task(client, msg_cache, entity_id, cache_direction, next_anchor, limit, topic_id),
+                key=key,
+            )
+
+    # REF-01: delta refresh on cache hit
+    if cached_page is not None:
+        last_id = max((getattr(m, "id", 0) for m in cached_page), default=0)
+        if last_id > 0:
+            coordinator.schedule(
+                _delta_refresh_task(client, msg_cache, entity_id, last_id, limit, topic_id),
+                key=(entity_id, "delta", last_id, topic_id),
+            )
