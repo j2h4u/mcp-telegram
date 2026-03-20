@@ -1,10 +1,27 @@
 # Milestones
 
+## v1.4 Message Cache (Shipped: 2026-03-20)
+
+**Phases completed:** 5 phases, 8 plans
+**Tests:** 284 → 371 (+87 new)
+**Audit:** `tech_debt` — 24/24 requirements satisfied, doc gaps only (Nyquist validation, SUMMARY frontmatter)
+
+**Key accomplishments:**
+
+- ListDialogs enriched with `members=N` and `created=YYYY-MM-DD` for groups/channels
+- SQLite message cache — `message_cache` table (11 columns, WITHOUT ROWID) with CachedMessage proxy satisfying MessageLike Protocol transparently
+- Cache-first reads — page 2+ served from SQLite when covered, with bypass rules for newest/unread/search ensuring live data where needed
+- Edit detection — `message_versions` table tracks text changes; `[edited HH:mm]` marker shown in formatted output
+- Background prefetch — PrefetchCoordinator fires asyncio tasks for next-page and oldest-page on first read, delta refresh on cache hits — zero API calls for inactive dialogs
+
+---
+
 ## v1.3 Medium Implementation (Shipped: 2026-03-14)
 
 **Phases completed:** 5 phases, 15 plans, 39 tasks
 
 **Key accomplishments:**
+
 - Dedicated `server.call_tool()` tests now distinguish escaped validation/runtime failures from handler-local action-text recovery.
 - `server.call_tool()` now returns stage-aware actionable escaped-error text and the restarted container proves the live boundary matches the repo contract.
 - Dialog-target and forum-topic capability seams with typed outcomes, stale-anchor recovery, and direct seam tests behind unchanged public MCP tool names
@@ -30,6 +47,7 @@
 **Audit:** `tech_debt` — no blocking gaps; validation and runtime-freshness follow-ups remain
 
 **Key accomplishments:**
+
 - Established the retained-source evidence hierarchy and froze the reflected seven-tool brownfield baseline for all later analysis.
 - Produced a comparative audit of the current MCP surface across both tool-level and workflow-level model burden.
 - Compared minimal, medium, and maximal redesign paths across the current public contract.
@@ -43,6 +61,7 @@
 **Phases completed:** 4 phases, 15 plans, 37 tasks
 
 **Key accomplishments:**
+
 - Privacy-safe telemetry shipped with `analytics.db`, exception-safe instrumentation, and the `GetUsageStats` tool.
 - Cache improvements shipped: SQLite indexes, reaction metadata caching, and bounded cleanup/optimization strategy.
 - Navigation completed: `from_beginning` history reads and archived dialogs now work as part of the normal discovery flow.
@@ -56,6 +75,7 @@
 **Phases completed:** 5 phases, 14 plans, 26 tasks
 
 **Key accomplishments:**
+
 - rapidfuzz + pytest-asyncio installed via uv, 19 failing stub tests collected across 4 modules with shared conftest fixtures, unblocking parallel Wave 1 plans 02-04
 - WRatio fuzzy resolver with Resolved/Candidates/NotFound tagged union, numeric bypass, and ambiguity detection — 6 tests green via TDD RED-GREEN-REFACTOR cycle
 - Pure format_messages() function with HH:mm output, date headers on day change, and session-break lines at >60 min gaps — no Telethon dependency at import time

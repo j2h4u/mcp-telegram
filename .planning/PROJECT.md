@@ -15,20 +15,15 @@ boilerplate before every real task.
 
 ## Current State
 
-Latest shipped milestone: `v1.3 Medium Implementation` on 2026-03-14.
-Post-v1.3: expert panel cleanup (StrEnum, Protocol types, mypy zero errors), capability_unread extraction, ListDialogs metadata (members/created).
-Phase 19 (Dialog Metadata Enrichment) complete — ListDialogs now surfaces members count and creation date for groups/channels.
-Phase 20 (Cache Foundation) complete — SQLite message_cache + message_versions tables, CachedMessage proxy satisfying MessageLike Protocol.
-Phase 21 (Cache-First Reads & Bypass Rules) complete — MessageCache data-access class, cache-first history reads, bypass rules for newest/unread/search, topic-aware coverage.
-Phase 22 (Edit Detection) complete — edit versioning in message_versions table, [edited HH:mm] marker in formatter output.
-Phase 23 (Prefetch & Lazy Refresh) complete — PrefetchCoordinator with background cache warming, delta refresh on cache hits, wired into history reads.
+Latest shipped milestone: `v1.4 Message Cache` on 2026-03-20.
 
 8 read-only MCP tools on Python 3.13, Telethon, MCP SDK, SQLite caches, Docker stdio transport.
-~5,800 LOC Python (post-refactor), 371 passing tests, zero mypy errors.
+~6,400 LOC Python, 9,300 LOC tests, 371 passing tests, zero mypy errors.
 
-The Medium-path refactor from the `v1.2` research is complete: server boundary failures are
-actionable, public tools delegate to capability seams, continuation uses one shared vocabulary,
-and primary workflows skip unnecessary helper steps.
+v1.4 added persistent SQLite message cache with background prefetch. Page 2+ history reads are
+served from cache when covered, with bypass rules keeping newest/unread/search always live.
+Edited messages show `[edited HH:mm]` markers. PrefetchCoordinator fires background tasks for
+next-page and oldest-page on first access, delta refresh on cache hits.
 
 ## Requirements
 
@@ -71,20 +66,14 @@ and primary workflows skip unnecessary helper steps.
 
 - ✓ `ListDialogs` members=N (participant count) for groups/channels — v1.4 (META-01)
 - ✓ `ListDialogs` created=YYYY-MM-DD (creation date) for groups/channels — v1.4 (META-02)
+- ✓ SQLite message cache (message_cache table, CachedMessage proxy, MessageLike Protocol) — v1.4 (CACHE-01, CACHE-02)
+- ✓ Cache-first history reads for page 2+, bypass rules for newest/unread/search — v1.4 (CACHE-03–06, BYP-01–04)
+- ✓ Edit detection with message_versions table and `[edited HH:mm]` formatter marker — v1.4 (EDIT-01–03)
+- ✓ Background prefetch (next page + oldest page) and delta refresh on cache hits — v1.4 (PRE-01–05, REF-01–03)
 
 ### Active
 
-## Current Milestone: v1.4 Message Cache
-
-**Goal:** Persistent SQLite message cache with background prefetch to reduce Telegram API calls and speed up repeated reads.
-
-**Target features:**
-- Structured message cache in SQLite (dialog_id, message_id, structured fields)
-- CachedMessage proxy satisfying MessageLike Protocol
-- Cache-first history reads with range-based coverage detection
-- Dual prefetch: next page + oldest page on first ListMessages per dialog
-- 30-day TTL for cached messages
-- Dialog metadata enrichment (members, created date)
+(No active requirements — next milestone not yet defined)
 
 ### Backlog Candidates
 
@@ -99,23 +88,22 @@ and primary workflows skip unnecessary helper steps.
 - Real-time notifications / webhooks — polling model only
 - Native HTTP/SSE transport — mcp-proxy covers this; deferred
 - Multi-account support — single session per deployment
-- ~~Message content caching~~ — moved to Active (v1.4): persistent cache reduces API calls, messages are near-immutable
+- ~~Message content caching~~ — shipped in v1.4: persistent SQLite cache with background prefetch
 - Group membership table in entity cache — high staleness risk, no v1 tool depends on it
 - `transliterate` dependency — rapidfuzz WRatio proved sufficient for Latin+Cyrillic; add only if validated against real contacts
 - Maximal surface compression or large structured-output redesign — deferred until Medium migration has proven stable in production
 
 ## Context
 
-Shipped runtime: `v1.3` — 7 MCP tools, ~12,800 LOC Python, 200+ passing tests.
+Shipped runtime: `v1.4` — 8 MCP tools, ~6,400 LOC Python src + ~9,300 LOC tests, 371 passing tests.
 Tech stack: Python 3.13, Telethon, MCP SDK, Pydantic v2, rapidfuzz, SQLite (WAL).
 Deployment: Docker-based with stdio MCP transport and `mcp-proxy` for HTTP/SSE access.
 
 **Known deferred follow-ups:**
 - Large-forum live validation using `.planning/phases/09-forum-topics-support/09-MANUAL-VALIDATION.md`
 - `tz` param accepted by `format_messages()` but never passed at call sites — defaults to UTC
-- Dead imports in `tools.py` (TelegramClient, custom, functions, types)
-- `EntityCache.all_names()` orphaned by `all_names_with_ttl()` — safe to remove
-- Phase VALIDATION artifacts for 10-13 remain partial (v1.2 audit passed with `tech_debt` status)
+- Nyquist validation incomplete for v1.4 phases (19-23 all draft/missing)
+- Cache analytics (hit/miss ratio, prefetch effectiveness) not yet instrumented
 
 ## Key Decisions
 
@@ -144,6 +132,11 @@ Deployment: Docker-based with stdio MCP transport and `mcp-proxy` for HTTP/SSE a
 | Direct selectors (dialog_id, topic_id) on public tools | Skip helper choreography when target is known | ✓ Good — reduces LLM steps for common workflows |
 | Surface posture as code-level constant (TOOL_POSTURE) | Single source of truth for primary/secondary classification | ✓ Good — reflected in code, tests, and tool descriptions |
 | Lock file for parallel cache bootstrap | Prevents SQLite contention across concurrent MCP sessions | ✓ Good — fixed production race condition |
+| Structured field cache (not JSON blob) | Individual columns enable topic-aware coverage queries and range-based reads | ✓ Good — try_read_page uses WHERE clauses on structured fields |
+| No TTL on message cache | Messages are near-immutable; delta refresh on access handles new messages | ✓ Good — avoids unnecessary re-fetches of stable data |
+| Application-level edit versioning | INSERT OR REPLACE = DELETE+INSERT means SQLite BEFORE UPDATE trigger never fires | ✓ Good — Python-side diff before executemany works reliably |
+| Fire-and-forget prefetch via asyncio.create_task | Non-blocking; dedup set prevents redundant API calls | ✓ Good — response latency unaffected by background work |
+| Same SQLite DB for message cache | Reuses entity_cache.db connection — no new DB file or connection pool | ✓ Good — single bootstrap path, lock file covers both |
 
 ## Constraints
 
@@ -151,6 +144,20 @@ Deployment: Docker-based with stdio MCP transport and `mcp-proxy` for HTTP/SSE a
 - **Fuzzy matching**: rapidfuzz only (transliterate still deferred)
 - **Privacy**: No real user IDs, names, or usernames in planning docs or code comments
 - **Read-only**: Permanent constraint — write tools expand prompt injection blast radius dramatically
+
+<details>
+<summary>Archived v1.4 milestone notes</summary>
+
+**Goal:** Persistent SQLite message cache with background prefetch to reduce Telegram API calls and speed up repeated reads.
+
+**Delivered:**
+- Dialog metadata enrichment (members count, creation date for groups/channels)
+- SQLite message_cache table with CachedMessage proxy satisfying MessageLike Protocol
+- Cache-first history reads for page 2+, with bypass rules for newest/unread/search
+- Edit detection via message_versions table and [edited HH:mm] formatter marker
+- Background prefetch (next page + oldest page on first access, delta refresh on cache hits)
+
+</details>
 
 <details>
 <summary>Archived v1.3 milestone notes</summary>
@@ -182,4 +189,4 @@ surface against them, and produce grounded recommendations for a future refactor
 </details>
 
 ---
-*Last updated: 2026-03-20 after Phase 23 completion*
+*Last updated: 2026-03-20 after v1.4 milestone*

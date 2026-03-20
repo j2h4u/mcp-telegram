@@ -124,6 +124,47 @@
 
 ---
 
+## Milestone: v1.4 — Message Cache
+
+**Shipped:** 2026-03-20
+**Phases:** 5 | **Plans:** 8 | **Sessions:** ~2
+
+### What Was Built
+- ListDialogs enriched with members count and creation date for groups/channels
+- SQLite message_cache table (11 columns, WITHOUT ROWID) with CachedMessage proxy satisfying MessageLike Protocol
+- Cache-first history reads for page 2+ with bypass rules (newest/unread/search always live)
+- Edit detection via message_versions table and [edited HH:mm] formatter marker
+- Background prefetch (PrefetchCoordinator with asyncio tasks) for next-page, oldest-page, and delta refresh
+
+### What Worked
+- **TDD RED-GREEN per plan**: Every plan started with failing tests, then implementation. 87 new tests added (284→371), zero regressions.
+- **Single-day execution**: All 5 phases and 8 plans completed in one day. The structured field cache decision (vs JSON blob) kept schema work tight and made coverage queries trivial.
+- **Protocol satisfaction via structural subtyping**: CachedMessage satisfied MessageLike without touching formatter.py — zero changes to the read path's output layer.
+- **MCP client smoke test**: Running the v1.4-cache-smoke.json script against the live container caught format issues that unit tests alone wouldn't surface.
+
+### What Was Inefficient
+- **SUMMARY frontmatter inconsistency**: Plans 20-01/20-02 had rich frontmatter (requirements_completed, provides, affects) but Plan 19-01 had minimal frontmatter. The 3-source cross-reference in the milestone audit fell back to 2-source because no SUMMARY had consistent `requirements_completed`.
+- **REQUIREMENTS.md not updated for Phase 19**: META-01/META-02 remained `[ ]` Pending in REQUIREMENTS.md even though the code was implemented and verified. The phase executor didn't update the traceability table.
+- **Nyquist VALIDATION.md all draft**: All 4 existing validation files remained `nyquist_compliant: false` — created by the planning step but never populated during execution.
+
+### Patterns Established
+- **Application-level versioning**: For INSERT OR REPLACE tables, detect changes in Python before the batch write (SQLite BEFORE UPDATE trigger never fires on DELETE+INSERT).
+- **Fire-and-forget prefetch with dedup set**: `asyncio.create_task` + `_in_flight` set + `coro.close()` on rejection — clean lifecycle with no ResourceWarnings.
+- **Cache bypass as a function**: `_should_try_cache()` centralizes bypass logic — easy to audit and test.
+
+### Key Lessons
+1. **Update REQUIREMENTS.md traceability in the same commit as the code.** Phase 19 shipped META-01/META-02 but left checkboxes unchecked — the milestone audit flagged it as a discrepancy.
+2. **MCP client smoke test is non-negotiable after code changes.** Unit tests verify logic; smoke tests verify the wire format, real Telegram API interaction, and container build.
+3. **Structured field cache > JSON blob for queryable data.** Topic-aware coverage detection, range-based reads, and edit detection all depend on individual columns — a JSON blob would have required client-side parsing.
+4. **Same-DB strategy for related caches works well.** Extending entity_cache.db with message_cache avoided connection pool complexity and the lock file covered both.
+
+### Cost Observations
+- Model mix: ~70% sonnet (execution), ~30% opus (planning/audit)
+- Sessions: ~2 sessions on 2026-03-19/20
+- Notable: 8 TDD plans in one day — the fastest implementation milestone yet, enabled by prior v1.3 capability seams that made wiring surgical
+
+---
+
 ## Cross-Milestone Trends
 
 ### Process Evolution
@@ -133,6 +174,7 @@
 | v1.0 | ~5 | 5 | Established TDD stub->implement pattern; audit before archive |
 | v1.2 | ~1 | 4 | Established evidence->audit->options->memo pattern for research-only milestones |
 | v1.3 | ~3 | 5 | Established capability-first refactoring and rebuilt-runtime verification gates |
+| v1.4 | ~2 | 5 | Fastest implementation milestone; MCP smoke test as mandatory gate; application-level versioning pattern |
 
 ### Cumulative Quality
 
@@ -141,6 +183,7 @@
 | v1.0 | 57 | format_messages() (no Telethon at import) |
 | v1.2 | 169 | decision memo, audit frame, reflected-runtime acceptance-gate pattern |
 | v1.3 | 200+ | capabilities.py (shared seams), unified navigation, direct selectors |
+| v1.4 | 371 | SQLite message cache, CachedMessage proxy, PrefetchCoordinator, edit detection |
 
 ### Top Lessons (Verified Across Milestones)
 
@@ -149,3 +192,4 @@
 3. Freeze live runtime reality early when planning docs and shipped surface might drift
 4. Extract seams before changing surfaces — capability-first refactoring keeps brownfield tests stable
 5. Rebuilt-runtime verification catches real bugs that tests miss (parallel session races, stale schemas)
+6. MCP client smoke test after every code change — unit tests verify logic, smoke tests verify the wire (v1.4 confirmed)
