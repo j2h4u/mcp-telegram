@@ -193,3 +193,133 @@ def test_sync_main_survives_connection_error(
 
     error_logs = [r.message for r in caplog.records if r.levelno >= logging.ERROR]
     assert error_logs, "Expected an ERROR log for connection failure"
+
+
+# ---------------------------------------------------------------------------
+# FullSyncWorker integration tests (Plan 26-02)
+# ---------------------------------------------------------------------------
+
+
+def test_sync_main_calls_bootstrap_dms(
+    mock_client: MagicMock,
+    instant_shutdown_event: asyncio.Event,
+) -> None:
+    """After connect(), sync_main() creates FullSyncWorker and calls bootstrap_dms() before any
+    process_one_batch() call."""
+    worker_instance = MagicMock()
+    worker_instance.bootstrap_dms = AsyncMock(return_value=5)
+    worker_instance.process_one_batch = AsyncMock(return_value=True)  # immediately idle
+
+    worker_class = MagicMock(return_value=worker_instance)
+
+    with (
+        patch("mcp_telegram.daemon.create_client", return_value=mock_client),
+        patch("mcp_telegram.daemon.ensure_sync_schema"),
+        patch("mcp_telegram.daemon.register_shutdown_handler", return_value=instant_shutdown_event),
+        patch("mcp_telegram.daemon.get_sync_db_path"),
+        patch("mcp_telegram.daemon._open_sync_db"),
+        patch("mcp_telegram.daemon.FullSyncWorker", worker_class),
+    ):
+        asyncio.run(sync_main())
+
+    worker_instance.bootstrap_dms.assert_called_once()
+
+
+def test_sync_main_calls_process_one_batch(
+    mock_client: MagicMock,
+    instant_shutdown_event: asyncio.Event,
+) -> None:
+    """sync_main() calls worker.process_one_batch() at least once before shutdown."""
+    worker_instance = MagicMock()
+    worker_instance.bootstrap_dms = AsyncMock(return_value=0)
+    worker_instance.process_one_batch = AsyncMock(return_value=True)  # idle on first call
+
+    worker_class = MagicMock(return_value=worker_instance)
+
+    with (
+        patch("mcp_telegram.daemon.create_client", return_value=mock_client),
+        patch("mcp_telegram.daemon.ensure_sync_schema"),
+        patch("mcp_telegram.daemon.register_shutdown_handler", return_value=instant_shutdown_event),
+        patch("mcp_telegram.daemon.get_sync_db_path"),
+        patch("mcp_telegram.daemon._open_sync_db"),
+        patch("mcp_telegram.daemon.FullSyncWorker", worker_class),
+    ):
+        asyncio.run(sync_main())
+
+    worker_instance.process_one_batch.assert_called()
+
+
+def test_sync_main_idles_when_all_synced(
+    mock_client: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """When process_one_batch() returns True (all synced), daemon falls back to heartbeat-only
+    wait. Verify heartbeat log appears after idle starts."""
+    shutdown_event = asyncio.Event()
+
+    def mock_register_shutdown(conn, loop):  # noqa: ANN001
+        async def _set_after_delay() -> None:
+            await asyncio.sleep(0.05)
+            shutdown_event.set()
+
+        loop.create_task(_set_after_delay())
+        return shutdown_event
+
+    worker_instance = MagicMock()
+    worker_instance.bootstrap_dms = AsyncMock(return_value=0)
+    worker_instance.process_one_batch = AsyncMock(return_value=True)  # all synced immediately
+
+    worker_class = MagicMock(return_value=worker_instance)
+
+    with (
+        patch("mcp_telegram.daemon.create_client", return_value=mock_client),
+        patch("mcp_telegram.daemon.ensure_sync_schema"),
+        patch("mcp_telegram.daemon.register_shutdown_handler", side_effect=mock_register_shutdown),
+        patch("mcp_telegram.daemon.get_sync_db_path"),
+        patch("mcp_telegram.daemon._open_sync_db"),
+        patch("mcp_telegram.daemon.HEARTBEAT_INTERVAL_S", 0.01),
+        patch("mcp_telegram.daemon.FullSyncWorker", worker_class),
+        caplog.at_level(logging.INFO, logger="mcp_telegram.daemon"),
+    ):
+        asyncio.run(sync_main())
+
+    heartbeat_logs = [r.message for r in caplog.records if "heartbeat" in r.message]
+    assert heartbeat_logs, "Expected heartbeat log when daemon is in idle mode after all synced"
+
+
+def test_sync_main_logs_heartbeat_during_sync(
+    mock_client: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """While process_one_batch returns False (work in progress), daemon still emits
+    periodic heartbeat logs."""
+    shutdown_event = asyncio.Event()
+    call_count = 0
+
+    async def process_one_batch_side_effect() -> bool:
+        nonlocal call_count
+        call_count += 1
+        if call_count >= 3:
+            shutdown_event.set()
+        return False  # always more work
+
+    worker_instance = MagicMock()
+    worker_instance.bootstrap_dms = AsyncMock(return_value=0)
+    worker_instance.process_one_batch = AsyncMock(side_effect=process_one_batch_side_effect)
+
+    worker_class = MagicMock(return_value=worker_instance)
+
+    with (
+        patch("mcp_telegram.daemon.create_client", return_value=mock_client),
+        patch("mcp_telegram.daemon.ensure_sync_schema"),
+        patch("mcp_telegram.daemon.register_shutdown_handler", return_value=shutdown_event),
+        patch("mcp_telegram.daemon.get_sync_db_path"),
+        patch("mcp_telegram.daemon._open_sync_db"),
+        patch("mcp_telegram.daemon.HEARTBEAT_INTERVAL_S", 0.0),  # instant heartbeat
+        patch("mcp_telegram.daemon.FullSyncWorker", worker_class),
+        caplog.at_level(logging.INFO, logger="mcp_telegram.daemon"),
+    ):
+        asyncio.run(sync_main())
+
+    heartbeat_logs = [r.message for r in caplog.records if "heartbeat" in r.message]
+    assert heartbeat_logs, "Expected heartbeat log during active sync"
