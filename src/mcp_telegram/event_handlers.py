@@ -1,0 +1,398 @@
+"""EventHandlerManager — real-time event tracking engine for v1.5 Persistent Sync.
+
+Registers three async Telethon event handlers against a live TelegramClient:
+  - on_new_message:    INSERT OR REPLACE new messages into sync.db messages table
+  - on_message_edited: version the old text into message_versions, update messages row
+  - on_message_deleted: mark channel/supergroup messages as is_deleted=1
+
+DM deletes cannot be tracked in real-time (MTProto UpdateDeleteMessages does not
+carry peer identity for personal chats).  Use run_dm_gap_scan() on a weekly
+schedule from the daemon heartbeat loop to detect and tombstone deleted DMs.
+
+Architecture:
+- Standalone module so daemon.py stays focused on process lifecycle.
+- EventHandlerManager is instantiated once per daemon run, registered BEFORE
+  FullSyncWorker starts so no real-time events are missed during full sync.
+- All DB writes are synchronous sqlite3 (single-row ops, microsecond-fast).
+- In-memory _synced_dialog_ids set refreshed via refresh_synced_dialogs() from
+  the daemon heartbeat loop (DAEMON-07 D-08/D-09).
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import sqlite3
+import time
+from datetime import datetime
+from typing import Any
+
+from telethon import events  # type: ignore[import-untyped]
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# SQL constants
+# ---------------------------------------------------------------------------
+
+_INSERT_MESSAGE_SQL = (
+    "INSERT OR REPLACE INTO messages "
+    "(dialog_id, message_id, sent_at, text, sender_id, sender_first_name, "
+    "media_description, reply_to_msg_id, forum_topic_id, reactions, is_deleted) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)"
+)
+
+_SELECT_MESSAGE_TEXT_SQL = (
+    "SELECT text FROM messages WHERE dialog_id=? AND message_id=?"
+)
+
+_NEXT_VERSION_SQL = (
+    "SELECT COALESCE(MAX(version), 0) + 1 FROM message_versions "
+    "WHERE dialog_id=? AND message_id=?"
+)
+
+_INSERT_VERSION_SQL = (
+    "INSERT INTO message_versions "
+    "(dialog_id, message_id, version, old_text, edit_date) "
+    "VALUES (?, ?, ?, ?, ?)"
+)
+
+_UPDATE_MESSAGE_TEXT_SQL = (
+    "UPDATE messages SET text=? WHERE dialog_id=? AND message_id=?"
+)
+
+_MARK_DELETED_SQL = (
+    "UPDATE messages SET is_deleted=1, deleted_at=? "
+    "WHERE dialog_id=? AND message_id=? AND is_deleted=0"
+)
+
+_UPDATE_LAST_EVENT_SQL = (
+    "UPDATE synced_dialogs SET last_event_at=? WHERE dialog_id=?"
+)
+
+_SELECT_SYNCED_DIALOGS_SQL = "SELECT dialog_id FROM synced_dialogs"
+
+_SELECT_UNDELETED_MESSAGES_SQL = (
+    "SELECT message_id FROM messages "
+    "WHERE dialog_id=? AND is_deleted=0 AND sent_at < ?"
+)
+
+
+# ---------------------------------------------------------------------------
+# EventHandlerManager
+# ---------------------------------------------------------------------------
+
+
+class EventHandlerManager:
+    """Registers and dispatches real-time Telethon events to sync.db.
+
+    Args:
+        client: Telethon TelegramClient (daemon owns the connection).
+        conn: Open SQLite writer connection to sync.db.
+        shutdown_event: asyncio.Event set when SIGTERM is received.
+    """
+
+    def __init__(
+        self,
+        client: Any,
+        conn: sqlite3.Connection,
+        shutdown_event: asyncio.Event,
+    ) -> None:
+        self._client = client
+        self._conn = conn
+        self._shutdown_event = shutdown_event
+        self._synced_dialog_ids: set[int] = set()
+
+    # ------------------------------------------------------------------
+    # Registration
+    # ------------------------------------------------------------------
+
+    def register(self) -> None:
+        """Load synced dialogs and attach the three event handlers to the client.
+
+        Must be called BEFORE FullSyncWorker starts (CONTEXT.md D-06) to
+        ensure no real-time messages are missed during initial bulk fetch.
+        INSERT OR REPLACE handles overlap idempotently (D-07).
+        """
+        self._refresh_synced_dialogs()
+        self._client.add_event_handler(self.on_new_message, events.NewMessage)
+        self._client.add_event_handler(self.on_message_edited, events.MessageEdited)
+        self._client.add_event_handler(self.on_message_deleted, events.MessageDeleted)
+
+    def unregister(self) -> None:
+        """Remove all three handlers from the client (graceful shutdown)."""
+        self._client.remove_event_handler(self.on_new_message)
+        self._client.remove_event_handler(self.on_message_edited)
+        self._client.remove_event_handler(self.on_message_deleted)
+
+    def refresh_synced_dialogs(self) -> None:
+        """Refresh the in-memory synced-dialog set from the DB.
+
+        Called from the daemon heartbeat loop so newly enrolled dialogs
+        (e.g., via Phase 30 MarkDialogForSync) are picked up within one
+        heartbeat interval without re-registering handlers.
+        """
+        self._refresh_synced_dialogs()
+
+    def _refresh_synced_dialogs(self) -> None:
+        rows = self._conn.execute(_SELECT_SYNCED_DIALOGS_SQL).fetchall()
+        self._synced_dialog_ids = {int(row[0]) for row in rows}
+
+    # ------------------------------------------------------------------
+    # Event handlers
+    # ------------------------------------------------------------------
+
+    async def on_new_message(self, event: Any) -> None:
+        """Handle a NewMessage event: INSERT OR REPLACE into messages table.
+
+        Silently ignores events for dialogs not in synced_dialogs (D-08).
+        Updates synced_dialogs.last_event_at in the same transaction (D-15).
+        """
+        dialog_id = event.chat_id
+        if dialog_id is None or dialog_id not in self._synced_dialog_ids:
+            return
+
+        msg = event.message
+        row = self._extract_event_message_row(dialog_id, msg)
+        now = int(time.time())
+
+        with self._conn:
+            self._conn.execute(_INSERT_MESSAGE_SQL, row)
+            self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
+
+        logger.debug("new_message dialog_id=%d message_id=%d", dialog_id, msg.id)
+
+    async def on_message_edited(self, event: Any) -> None:
+        """Handle a MessageEdited event: version old text, update messages row.
+
+        Three cases:
+        1. Message not in sync.db yet: INSERT it with current text, no version history.
+        2. Text unchanged: no-op (covers service edits, reactions updates, etc.).
+        3. Text changed: insert old_text into message_versions, update messages.text.
+
+        All operations in a single transaction (D-10).
+        """
+        dialog_id = event.chat_id
+        if dialog_id is None or dialog_id not in self._synced_dialog_ids:
+            return
+
+        msg = event.message
+        message_id = int(getattr(msg, "id", 0))
+        new_text = getattr(msg, "message", None)
+        now = int(time.time())
+
+        with self._conn:
+            existing = self._conn.execute(
+                _SELECT_MESSAGE_TEXT_SQL, (dialog_id, message_id)
+            ).fetchone()
+
+            if existing is None:
+                # Message not yet in sync.db (Pitfall 2 from RESEARCH.md):
+                # insert it with current text; historical versions are lost (acceptable).
+                row = self._extract_event_message_row(dialog_id, msg)
+                self._conn.execute(_INSERT_MESSAGE_SQL, row)
+                self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
+                logger.debug(
+                    "message_edited (unknown) dialog_id=%d message_id=%d — inserted",
+                    dialog_id, message_id,
+                )
+                return
+
+            old_text = existing[0]
+            if old_text == new_text:
+                # No text change — service edit, media caption update, etc. (Pitfall 3)
+                return
+
+            # Text changed: record old version, update current text
+            edit_date_raw = getattr(msg, "edit_date", None)
+            edit_date_unix = (
+                int(edit_date_raw.timestamp()) if edit_date_raw is not None else now
+            )
+
+            next_ver = self._conn.execute(
+                _NEXT_VERSION_SQL, (dialog_id, message_id)
+            ).fetchone()[0]
+
+            self._conn.execute(
+                _INSERT_VERSION_SQL,
+                (dialog_id, message_id, next_ver, old_text, edit_date_unix),
+            )
+            self._conn.execute(
+                _UPDATE_MESSAGE_TEXT_SQL, (new_text, dialog_id, message_id)
+            )
+            self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
+
+        logger.debug(
+            "message_edited dialog_id=%d message_id=%d version=%d",
+            dialog_id, message_id, next_ver,
+        )
+
+    async def on_message_deleted(self, event: Any) -> None:
+        """Handle a MessageDeleted event: mark channel messages as is_deleted=1.
+
+        chat_id is None for DMs and small groups (MTProto limitation — see
+        RESEARCH.md Pitfall 1).  Those cases are handled by run_dm_gap_scan().
+        Preserves the last known text column (SYNC-05 requirement).
+        Only updates rows where is_deleted=0 to avoid re-stamping deleted_at (D-12).
+        """
+        dialog_id = event.chat_id
+
+        if dialog_id is None:
+            logger.debug(
+                "message_deleted: chat_id unknown — DM/group delete not trackable "
+                "in real-time (MTProto limitation); weekly gap scan handles DMs"
+            )
+            return
+
+        if dialog_id not in self._synced_dialog_ids:
+            return
+
+        now = int(time.time())
+
+        with self._conn:
+            for msg_id in event.deleted_ids:
+                self._conn.execute(_MARK_DELETED_SQL, (now, dialog_id, msg_id))
+            self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
+
+        logger.debug(
+            "message_deleted dialog_id=%d ids=%s", dialog_id, event.deleted_ids
+        )
+
+    # ------------------------------------------------------------------
+    # DM gap scan (DAEMON-10 / D-13 / D-14)
+    # ------------------------------------------------------------------
+
+    async def run_dm_gap_scan(self) -> int:
+        """Scan all synced DM dialogs for deleted messages via live Telegram lookup.
+
+        Compares synced message IDs (sent_at < scan_start) against live Telegram
+        using client.get_messages(entity, ids=[...]) in batches of 100.  Messages
+        returning None are confirmed deleted and tombstoned (is_deleted=1).
+
+        Only messages synced before scan_start are checked to avoid false positives
+        on messages that arrived during the scan itself.
+
+        Returns:
+            Total count of messages newly marked as is_deleted=1.
+        """
+        scan_start = int(time.time())
+        total_marked = 0
+
+        dialog_ids = [
+            int(row[0])
+            for row in self._conn.execute(_SELECT_SYNCED_DIALOGS_SQL).fetchall()
+        ]
+
+        for dialog_id in dialog_ids:
+            message_ids = [
+                int(row[0])
+                for row in self._conn.execute(
+                    _SELECT_UNDELETED_MESSAGES_SQL, (dialog_id, scan_start)
+                ).fetchall()
+            ]
+
+            if not message_ids:
+                continue
+
+            # Batch in groups of 100 (Telegram API limit)
+            for batch_start in range(0, len(message_ids), 100):
+                batch = message_ids[batch_start : batch_start + 100]
+                results = await self._client.get_messages(dialog_id, ids=batch)
+
+                now = int(time.time())
+                for queried_id, returned_msg in zip(batch, results):
+                    if returned_msg is None:
+                        self._conn.execute(
+                            _MARK_DELETED_SQL, (now, dialog_id, queried_id)
+                        )
+                        total_marked += 1
+
+        if total_marked:
+            self._conn.commit()
+
+        logger.info("dm_gap_scan marked_deleted=%d", total_marked)
+        return total_marked
+
+    # ------------------------------------------------------------------
+    # Field extraction helpers
+    # ------------------------------------------------------------------
+
+    def _extract_event_message_row(
+        self, dialog_id: int, msg: Any
+    ) -> tuple[object, ...]:
+        """Extract a sync.db messages row tuple from a Telethon event message.
+
+        Replicates FullSyncWorker._extract_message_row() using getattr pattern
+        for all fields.  sender_first_name is None for event-inserted messages
+        where sender entity resolution would require a network call (RESEARCH.md
+        Anti-Patterns: do NOT await get_sender()).
+
+        Returns:
+            10-element tuple matching _INSERT_MESSAGE_SQL parameter order.
+        """
+        message_id = int(getattr(msg, "id", 0))
+
+        date = getattr(msg, "date", None)
+        sent_at = int(date.timestamp()) if isinstance(date, datetime) else 0
+
+        text = getattr(msg, "message", None)
+
+        sender_id = getattr(msg, "sender_id", None)
+        sender = getattr(msg, "sender", None)
+        sender_first_name = (
+            getattr(sender, "first_name", None) if sender is not None else None
+        )
+
+        media = getattr(msg, "media", None)
+        media_description: str | None = (
+            type(media).__name__ if media is not None else None
+        )
+
+        reply_to = getattr(msg, "reply_to", None)
+        reply_to_msg_id: int | None = None
+        forum_topic_id: int | None = None
+        if reply_to is not None:
+            raw_rtmi = getattr(reply_to, "reply_to_msg_id", None)
+            reply_to_msg_id = int(raw_rtmi) if raw_rtmi is not None else None
+            if getattr(reply_to, "forum_topic", False):
+                top_id = getattr(reply_to, "reply_to_top_id", None)
+                forum_topic_id = int(top_id) if top_id is not None else 1
+
+        reactions = self._serialize_reactions(getattr(msg, "reactions", None))
+
+        return (
+            dialog_id,
+            message_id,
+            sent_at,
+            text,
+            sender_id,
+            sender_first_name,
+            media_description,
+            reply_to_msg_id,
+            forum_topic_id,
+            reactions,
+        )
+
+    @staticmethod
+    def _serialize_reactions(reactions: Any | None) -> str | None:
+        """Serialize a Telethon MessageReactions object to a JSON string.
+
+        Format: {"emoji": count, ...} or None if no reactions.
+        Consistent with FullSyncWorker._serialize_reactions() and
+        ReactionMetadataCache in cache.py.
+        """
+        if reactions is None:
+            return None
+        results = getattr(reactions, "results", None)
+        if not results:
+            return None
+        summary: dict[str, int] = {}
+        for item in results:
+            reaction = getattr(item, "reaction", None)
+            emoticon = (
+                getattr(reaction, "emoticon", None) if reaction is not None else None
+            )
+            count = getattr(item, "count", 0)
+            if emoticon is not None:
+                summary[emoticon] = int(count)
+        return json.dumps(summary) if summary else None
