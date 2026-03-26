@@ -10,6 +10,15 @@ Architecture (DAEMON-01 / DAEMON-02):
   sync.db via open_sync_db_reader(); it never calls client.connect().
 - SIGTERM triggers shutdown_event (set by register_shutdown_handler), which
   checkpoints WAL and closes the DB connection before the daemon disconnects.
+
+Phase 27 (event handlers):
+- EventHandlerManager is registered BEFORE FullSyncWorker starts (D-06) so
+  no real-time events are missed during initial bulk fetch.  INSERT OR REPLACE
+  handles any overlap between real-time and bulk paths idempotently (D-07).
+- synced_dialogs set is refreshed every heartbeat so newly enrolled dialogs
+  are picked up within one interval without re-registering handlers (D-08/D-09).
+- Weekly gap scan detects tombstoned DM messages that MTProto delete events
+  cannot report (D-14/D-15).
 """
 from __future__ import annotations
 
@@ -17,6 +26,7 @@ import asyncio
 import logging
 import time
 
+from .event_handlers import EventHandlerManager
 from .sync_db import (
     _open_sync_db,
     ensure_sync_schema,
@@ -29,6 +39,7 @@ from .telegram import create_client
 logger = logging.getLogger(__name__)
 
 HEARTBEAT_INTERVAL_S: float = 60.0
+GAP_SCAN_INTERVAL_S: float = 7 * 24 * 3600.0  # Weekly (D-14)
 
 
 async def sync_main() -> None:
@@ -39,10 +50,12 @@ async def sync_main() -> None:
     2. Open the long-lived writer connection.
     3. Register SIGTERM shutdown handler (checkpoints WAL on signal).
     4. Connect to Telegram — log error and exit cleanly on ConnectionError.
-    5. Bootstrap DM dialogs (D-06): enroll all User-type dialogs once.
-    6. Run tight sync loop: process_one_batch() + periodic heartbeat (D-10).
-    7. When all synced, enter idle heartbeat-only mode (D-11).
-    8. Disconnect TelegramClient and return.
+    5. Register event handlers (D-06): BEFORE FullSyncWorker to catch real-time events.
+    6. Bootstrap DM dialogs (D-06): enroll all User-type dialogs once.
+    7. Refresh synced_dialogs after bootstrap so newly enrolled dialogs are tracked.
+    8. Run tight sync loop: process_one_batch() + periodic heartbeat (D-10).
+    9. When all synced, enter idle heartbeat-only mode (D-11).
+    10. Unregister event handlers and disconnect TelegramClient on shutdown.
     """
     db_path = get_sync_db_path()
     ensure_sync_schema(db_path)
@@ -52,6 +65,7 @@ async def sync_main() -> None:
     shutdown_event = register_shutdown_handler(conn, loop)
 
     client = create_client()
+    handler_manager: EventHandlerManager | None = None
     try:
         try:
             await client.connect()
@@ -62,22 +76,39 @@ async def sync_main() -> None:
 
         logger.info("sync-daemon started — connected=%s", client.is_connected())
 
+        # Phase 27 (D-06): Register event handlers BEFORE FullSyncWorker
+        handler_manager = EventHandlerManager(client, conn, shutdown_event)
+        handler_manager.register()
+        logger.info("event handlers registered")
+
         # Phase 1 — Bootstrap (D-06): enroll all DM dialogs once at startup
         worker = FullSyncWorker(client, conn, shutdown_event)
         enrolled = await worker.bootstrap_dms()
         logger.info("dm_bootstrap complete — enrolled=%d", enrolled)
 
+        # Refresh synced_dialogs after bootstrap adds new dialogs
+        handler_manager.refresh_synced_dialogs()
+
         # Phase 2 — Tight sync loop with heartbeat (D-10, D-11)
         last_heartbeat = time.monotonic()
+        last_gap_scan = time.monotonic()
 
         while not shutdown_event.is_set():
             all_synced = await worker.process_one_batch()
 
-            # Periodic heartbeat logging during active sync
-            now = time.monotonic()
-            if now - last_heartbeat >= HEARTBEAT_INTERVAL_S:
+            now_mono = time.monotonic()
+
+            # Periodic heartbeat logging and synced_dialogs refresh
+            if now_mono - last_heartbeat >= HEARTBEAT_INTERVAL_S:
                 logger.info("heartbeat — connected=%s", client.is_connected())
-                last_heartbeat = now
+                handler_manager.refresh_synced_dialogs()
+                last_heartbeat = now_mono
+
+            # Weekly gap scan (D-14): detect tombstoned DM messages
+            if now_mono - last_gap_scan >= GAP_SCAN_INTERVAL_S:
+                deleted_count = await handler_manager.run_dm_gap_scan()
+                logger.info("gap_scan complete — marked_deleted=%d", deleted_count)
+                last_gap_scan = now_mono
 
             if all_synced:
                 # D-11: idle mode — wait for HEARTBEAT_INTERVAL_S or shutdown
@@ -89,8 +120,17 @@ async def sync_main() -> None:
                     break  # shutdown requested
                 except asyncio.TimeoutError:
                     logger.info("heartbeat — connected=%s", client.is_connected())
+                    handler_manager.refresh_synced_dialogs()
                     last_heartbeat = time.monotonic()
 
+                    # Check gap scan during idle too
+                    if time.monotonic() - last_gap_scan >= GAP_SCAN_INTERVAL_S:
+                        deleted_count = await handler_manager.run_dm_gap_scan()
+                        logger.info("gap_scan complete — marked_deleted=%d", deleted_count)
+                        last_gap_scan = time.monotonic()
+
     finally:
+        if handler_manager is not None:
+            handler_manager.unregister()
         await client.disconnect()
         logger.info("sync-daemon stopped")

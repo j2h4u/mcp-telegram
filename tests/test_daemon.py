@@ -427,12 +427,21 @@ def test_heartbeat_refreshes_synced_dialogs(
 
 def test_gap_scan_runs_on_weekly_schedule(
     mock_client: MagicMock,
-    instant_shutdown_event: asyncio.Event,
 ) -> None:
-    """run_dm_gap_scan() is called when enough time has elapsed (simulated 7 days)."""
+    """run_dm_gap_scan() is called when enough time has elapsed (simulated 7 days).
+
+    Uses GAP_SCAN_INTERVAL_S=0.0 so the elapsed check is always satisfied, and
+    a shutdown_event that fires after the first batch to ensure the loop body runs.
+    """
+    shutdown_event = asyncio.Event()
+
+    async def process_then_shutdown() -> bool:
+        shutdown_event.set()  # trigger shutdown after first batch
+        return True  # all synced
+
     worker_instance = MagicMock()
     worker_instance.bootstrap_dms = AsyncMock(return_value=0)
-    worker_instance.process_one_batch = AsyncMock(return_value=True)
+    worker_instance.process_one_batch = AsyncMock(side_effect=process_then_shutdown)
 
     worker_class = MagicMock(return_value=worker_instance)
 
@@ -444,14 +453,12 @@ def test_gap_scan_runs_on_weekly_schedule(
 
     handler_class = MagicMock(return_value=handler_instance)
 
-    # Simulate that enough time has passed for a gap scan by patching GAP_SCAN_INTERVAL_S to 0.0
     with (
         patch("mcp_telegram.daemon.create_client", return_value=mock_client),
         patch("mcp_telegram.daemon.ensure_sync_schema"),
-        patch("mcp_telegram.daemon.register_shutdown_handler", return_value=instant_shutdown_event),
+        patch("mcp_telegram.daemon.register_shutdown_handler", return_value=shutdown_event),
         patch("mcp_telegram.daemon.get_sync_db_path"),
         patch("mcp_telegram.daemon._open_sync_db"),
-        patch("mcp_telegram.daemon.HEARTBEAT_INTERVAL_S", 0.0),
         patch("mcp_telegram.daemon.GAP_SCAN_INTERVAL_S", 0.0),
         patch("mcp_telegram.daemon.FullSyncWorker", worker_class),
         patch("mcp_telegram.daemon.EventHandlerManager", handler_class),
