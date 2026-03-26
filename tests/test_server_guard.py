@@ -46,12 +46,13 @@ def test_connected_client_raises_when_disabled(monkeypatch: pytest.MonkeyPatch) 
 def test_connected_client_works_when_not_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
     """With _session_disabled=False (default), connected_client() proceeds normally."""
     import asyncio
+    from unittest.mock import MagicMock
     from mcp_telegram.tools._base import connected_client
 
     monkeypatch.setattr(_base_mod, "_session_disabled", False)
 
-    mock_client = AsyncMock()
-    mock_client.is_connected.return_value = False
+    mock_client = MagicMock()
+    mock_client.is_connected.return_value = False  # sync call — MagicMock, not AsyncMock
     mock_client.connect = AsyncMock()
     mock_client.disconnect = AsyncMock()
 
@@ -73,9 +74,17 @@ def test_connected_client_works_when_not_disabled(monkeypatch: pytest.MonkeyPatc
 # ---------------------------------------------------------------------------
 
 
-def test_run_mcp_server_logs_guard_message(caplog: pytest.LogCaptureFixture) -> None:
+def test_run_mcp_server_logs_guard_message(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """run_mcp_server() emits an INFO log with 'read-only mode' or 'no Telegram session' at startup."""
     import asyncio
+
+    # Pre-register the flag with monkeypatch so it is restored to False on teardown.
+    # disable_telegram_session() uses `global _session_disabled`, so we must ensure
+    # monkeypatch owns the cleanup — register it NOW before the flag changes.
+    monkeypatch.setattr(_base_mod, "_session_disabled", False)
 
     # Patch stdio_server to raise immediately after logging — avoids real I/O
     @asynccontextmanager
@@ -84,7 +93,9 @@ def test_run_mcp_server_logs_guard_message(caplog: pytest.LogCaptureFixture) -> 
         yield  # noqa: unreachable
 
     with (
-        patch("mcp_telegram.server.stdio_server", fake_stdio_server),
+        patch("mcp.server.stdio.stdio_server", fake_stdio_server),
+        # Suppress basicConfig(force=True) which would replace caplog's handler
+        patch("logging.basicConfig"),
         caplog.at_level(logging.INFO, logger="mcp_telegram.server"),
     ):
         try:

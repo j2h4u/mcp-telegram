@@ -34,6 +34,19 @@ REACTION_NAMES_THRESHOLD = 15
 
 logger = logging.getLogger(__name__)
 
+_session_disabled: bool = False
+
+
+def disable_telegram_session() -> None:
+    """Prevent connected_client() from opening a Telegram session.
+
+    Called by the MCP server at startup. When active, connected_client()
+    raises RuntimeError instead of connecting — the sync-daemon owns the
+    session exclusively (per DAEMON-02).
+    """
+    global _session_disabled  # noqa: PLW0603
+    _session_disabled = True
+
 
 class ToolArgs(BaseModel):
     model_config = ConfigDict()
@@ -211,7 +224,15 @@ async def connected_client():
 
     Safe to nest — inner calls see the client already connected and skip
     both connect and disconnect, so the outer block retains ownership.
+
+    Raises RuntimeError if disable_telegram_session() has been called — the
+    sync-daemon owns the TelegramClient in that configuration (DAEMON-02).
     """
+    if _session_disabled:
+        raise RuntimeError(
+            "Telegram session disabled — sync-daemon owns the session. "
+            "MCP server reads sync.db only."
+        )
     client = _telegram_mod.create_client()
     owns_connection = not client.is_connected()
     if owns_connection:

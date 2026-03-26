@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
 
 import pytest
 
@@ -31,10 +31,14 @@ def test_sync_command_exists() -> None:
 
 
 @pytest.fixture()
-def mock_client() -> AsyncMock:
-    """Return a mock TelegramClient with connection tracking."""
-    client = AsyncMock()
-    client.is_connected.return_value = True
+def mock_client() -> MagicMock:
+    """Return a mock TelegramClient with connection tracking.
+
+    is_connected() is a synchronous call in TelegramClient, so we use MagicMock
+    for the base object and AsyncMock only for the async methods.
+    """
+    client = MagicMock()
+    client.is_connected.return_value = True  # sync method
     client.connect = AsyncMock()
     client.disconnect = AsyncMock()
     return client
@@ -171,7 +175,8 @@ def test_sync_main_survives_connection_error(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """If client.connect() raises ConnectionError, sync_main logs error and exits without raising."""
-    mock_client = AsyncMock()
+    mock_client = MagicMock()
+    mock_client.is_connected.return_value = False
     mock_client.connect = AsyncMock(side_effect=ConnectionError("test connection failure"))
     mock_client.disconnect = AsyncMock()
 
