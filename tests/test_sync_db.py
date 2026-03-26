@@ -261,9 +261,10 @@ def test_sigterm_checkpoint(tmp_sync_db_path: Path) -> None:
         # Instead, get the handler from the loop's signal handlers:
         import signal as _signal
 
-        sigterm_handler = loop._signal_handlers.get(_signal.SIGTERM)  # type: ignore[attr-defined]
-        assert sigterm_handler is not None, "SIGTERM handler not registered"
-        sigterm_handler()
+        sigterm_handle = loop._signal_handlers.get(_signal.SIGTERM)  # type: ignore[attr-defined]
+        assert sigterm_handle is not None, "SIGTERM handler not registered"
+        # asyncio stores signal handlers as Handle objects — invoke via _run()
+        sigterm_handle._run()  # type: ignore[attr-defined]
     finally:
         loop.close()
 
