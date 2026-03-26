@@ -164,8 +164,8 @@ async def test_message_fields_extracted_correctly(
     )
     sync_db.commit()
 
-    media_obj = SimpleNamespace()
-    media_obj.__class__ = type("MessageMediaDocument", (), {})
+    MediaDocumentClass = type("MessageMediaDocument", (), {})
+    media_obj = MediaDocumentClass()
 
     msg = make_mock_message(
         id=500,
