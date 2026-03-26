@@ -329,3 +329,215 @@ def test_sync_main_logs_heartbeat_during_sync(
 
     heartbeat_logs = [r.message for r in caplog.records if "heartbeat" in r.message]
     assert heartbeat_logs, "Expected heartbeat log during active sync"
+
+
+# ---------------------------------------------------------------------------
+# EventHandlerManager integration tests (Plan 27-02)
+# ---------------------------------------------------------------------------
+
+
+def test_handlers_registered_before_worker(
+    mock_client: MagicMock,
+    instant_shutdown_event: asyncio.Event,
+) -> None:
+    """handler_manager.register() must be called BEFORE worker.bootstrap_dms() (D-06)."""
+    call_order: list[str] = []
+
+    worker_instance = MagicMock()
+    worker_instance.bootstrap_dms = AsyncMock(
+        side_effect=lambda: call_order.append("bootstrap_dms") or 0
+    )
+    worker_instance.process_one_batch = AsyncMock(return_value=True)
+
+    worker_class = MagicMock(return_value=worker_instance)
+
+    handler_instance = MagicMock()
+    handler_instance.register = MagicMock(
+        side_effect=lambda: call_order.append("register")
+    )
+    handler_instance.unregister = MagicMock()
+    handler_instance.refresh_synced_dialogs = MagicMock()
+    handler_instance.run_dm_gap_scan = AsyncMock(return_value=0)
+
+    handler_class = MagicMock(return_value=handler_instance)
+
+    with (
+        patch("mcp_telegram.daemon.create_client", return_value=mock_client),
+        patch("mcp_telegram.daemon.ensure_sync_schema"),
+        patch("mcp_telegram.daemon.register_shutdown_handler", return_value=instant_shutdown_event),
+        patch("mcp_telegram.daemon.get_sync_db_path"),
+        patch("mcp_telegram.daemon._open_sync_db"),
+        patch("mcp_telegram.daemon.FullSyncWorker", worker_class),
+        patch("mcp_telegram.daemon.EventHandlerManager", handler_class),
+    ):
+        asyncio.run(sync_main())
+
+    assert "register" in call_order, "handler_manager.register() was never called"
+    assert "bootstrap_dms" in call_order, "worker.bootstrap_dms() was never called"
+    assert call_order.index("register") < call_order.index("bootstrap_dms"), (
+        f"handler_manager.register() must be called BEFORE bootstrap_dms(); "
+        f"got order: {call_order}"
+    )
+
+
+def test_heartbeat_refreshes_synced_dialogs(
+    mock_client: MagicMock,
+) -> None:
+    """refresh_synced_dialogs() must be called at least once during heartbeat."""
+    shutdown_event = asyncio.Event()
+    call_count = 0
+
+    async def process_one_batch_side_effect() -> bool:
+        nonlocal call_count
+        call_count += 1
+        if call_count >= 3:
+            shutdown_event.set()
+        return False  # keep looping
+
+    worker_instance = MagicMock()
+    worker_instance.bootstrap_dms = AsyncMock(return_value=0)
+    worker_instance.process_one_batch = AsyncMock(side_effect=process_one_batch_side_effect)
+
+    worker_class = MagicMock(return_value=worker_instance)
+
+    handler_instance = MagicMock()
+    handler_instance.register = MagicMock()
+    handler_instance.unregister = MagicMock()
+    handler_instance.refresh_synced_dialogs = MagicMock()
+    handler_instance.run_dm_gap_scan = AsyncMock(return_value=0)
+
+    handler_class = MagicMock(return_value=handler_instance)
+
+    with (
+        patch("mcp_telegram.daemon.create_client", return_value=mock_client),
+        patch("mcp_telegram.daemon.ensure_sync_schema"),
+        patch("mcp_telegram.daemon.register_shutdown_handler", return_value=shutdown_event),
+        patch("mcp_telegram.daemon.get_sync_db_path"),
+        patch("mcp_telegram.daemon._open_sync_db"),
+        patch("mcp_telegram.daemon.HEARTBEAT_INTERVAL_S", 0.0),  # instant heartbeat
+        patch("mcp_telegram.daemon.FullSyncWorker", worker_class),
+        patch("mcp_telegram.daemon.EventHandlerManager", handler_class),
+    ):
+        asyncio.run(sync_main())
+
+    assert handler_instance.refresh_synced_dialogs.call_count >= 1, (
+        "Expected refresh_synced_dialogs() to be called at least once during heartbeat"
+    )
+
+
+def test_gap_scan_runs_on_weekly_schedule(
+    mock_client: MagicMock,
+    instant_shutdown_event: asyncio.Event,
+) -> None:
+    """run_dm_gap_scan() is called when enough time has elapsed (simulated 7 days)."""
+    worker_instance = MagicMock()
+    worker_instance.bootstrap_dms = AsyncMock(return_value=0)
+    worker_instance.process_one_batch = AsyncMock(return_value=True)
+
+    worker_class = MagicMock(return_value=worker_instance)
+
+    handler_instance = MagicMock()
+    handler_instance.register = MagicMock()
+    handler_instance.unregister = MagicMock()
+    handler_instance.refresh_synced_dialogs = MagicMock()
+    handler_instance.run_dm_gap_scan = AsyncMock(return_value=0)
+
+    handler_class = MagicMock(return_value=handler_instance)
+
+    # Simulate that enough time has passed for a gap scan by patching GAP_SCAN_INTERVAL_S to 0.0
+    with (
+        patch("mcp_telegram.daemon.create_client", return_value=mock_client),
+        patch("mcp_telegram.daemon.ensure_sync_schema"),
+        patch("mcp_telegram.daemon.register_shutdown_handler", return_value=instant_shutdown_event),
+        patch("mcp_telegram.daemon.get_sync_db_path"),
+        patch("mcp_telegram.daemon._open_sync_db"),
+        patch("mcp_telegram.daemon.HEARTBEAT_INTERVAL_S", 0.0),
+        patch("mcp_telegram.daemon.GAP_SCAN_INTERVAL_S", 0.0),
+        patch("mcp_telegram.daemon.FullSyncWorker", worker_class),
+        patch("mcp_telegram.daemon.EventHandlerManager", handler_class),
+    ):
+        asyncio.run(sync_main())
+
+    handler_instance.run_dm_gap_scan.assert_called()
+
+
+def test_gap_scan_not_called_before_interval(
+    mock_client: MagicMock,
+    instant_shutdown_event: asyncio.Event,
+) -> None:
+    """run_dm_gap_scan() is NOT called when less than GAP_SCAN_INTERVAL_S has elapsed."""
+    worker_instance = MagicMock()
+    worker_instance.bootstrap_dms = AsyncMock(return_value=0)
+    worker_instance.process_one_batch = AsyncMock(return_value=True)
+
+    worker_class = MagicMock(return_value=worker_instance)
+
+    handler_instance = MagicMock()
+    handler_instance.register = MagicMock()
+    handler_instance.unregister = MagicMock()
+    handler_instance.refresh_synced_dialogs = MagicMock()
+    handler_instance.run_dm_gap_scan = AsyncMock(return_value=0)
+
+    handler_class = MagicMock(return_value=handler_instance)
+
+    # Keep GAP_SCAN_INTERVAL_S at a large value — not enough time will have elapsed
+    with (
+        patch("mcp_telegram.daemon.create_client", return_value=mock_client),
+        patch("mcp_telegram.daemon.ensure_sync_schema"),
+        patch("mcp_telegram.daemon.register_shutdown_handler", return_value=instant_shutdown_event),
+        patch("mcp_telegram.daemon.get_sync_db_path"),
+        patch("mcp_telegram.daemon._open_sync_db"),
+        patch("mcp_telegram.daemon.HEARTBEAT_INTERVAL_S", 0.0),
+        patch("mcp_telegram.daemon.GAP_SCAN_INTERVAL_S", 9999999.0),  # far future
+        patch("mcp_telegram.daemon.FullSyncWorker", worker_class),
+        patch("mcp_telegram.daemon.EventHandlerManager", handler_class),
+    ):
+        asyncio.run(sync_main())
+
+    handler_instance.run_dm_gap_scan.assert_not_called()
+
+
+def test_handlers_unregistered_on_shutdown(
+    mock_client: MagicMock,
+    instant_shutdown_event: asyncio.Event,
+) -> None:
+    """handler_manager.unregister() must be called before client.disconnect() in finally block."""
+    call_order: list[str] = []
+
+    mock_client.disconnect = AsyncMock(
+        side_effect=lambda: call_order.append("disconnect")
+    )
+
+    worker_instance = MagicMock()
+    worker_instance.bootstrap_dms = AsyncMock(return_value=0)
+    worker_instance.process_one_batch = AsyncMock(return_value=True)
+
+    worker_class = MagicMock(return_value=worker_instance)
+
+    handler_instance = MagicMock()
+    handler_instance.register = MagicMock()
+    handler_instance.unregister = MagicMock(
+        side_effect=lambda: call_order.append("unregister")
+    )
+    handler_instance.refresh_synced_dialogs = MagicMock()
+    handler_instance.run_dm_gap_scan = AsyncMock(return_value=0)
+
+    handler_class = MagicMock(return_value=handler_instance)
+
+    with (
+        patch("mcp_telegram.daemon.create_client", return_value=mock_client),
+        patch("mcp_telegram.daemon.ensure_sync_schema"),
+        patch("mcp_telegram.daemon.register_shutdown_handler", return_value=instant_shutdown_event),
+        patch("mcp_telegram.daemon.get_sync_db_path"),
+        patch("mcp_telegram.daemon._open_sync_db"),
+        patch("mcp_telegram.daemon.FullSyncWorker", worker_class),
+        patch("mcp_telegram.daemon.EventHandlerManager", handler_class),
+    ):
+        asyncio.run(sync_main())
+
+    assert "unregister" in call_order, "handler_manager.unregister() was never called"
+    assert "disconnect" in call_order, "client.disconnect() was never called"
+    assert call_order.index("unregister") < call_order.index("disconnect"), (
+        f"handler_manager.unregister() must be called BEFORE client.disconnect(); "
+        f"got order: {call_order}"
+    )
