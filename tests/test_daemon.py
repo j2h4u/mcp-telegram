@@ -227,19 +227,25 @@ def test_sync_main_calls_bootstrap_dms(
 
 def test_sync_main_calls_process_one_batch(
     mock_client: MagicMock,
-    instant_shutdown_event: asyncio.Event,
 ) -> None:
     """sync_main() calls worker.process_one_batch() at least once before shutdown."""
+    # Use an event that fires after process_one_batch returns True (idle path triggers shutdown)
+    shutdown_event = asyncio.Event()
+
+    async def process_one_batch_then_shutdown() -> bool:
+        shutdown_event.set()  # trigger shutdown after first batch
+        return True  # all synced — enter idle mode (which respects shutdown_event)
+
     worker_instance = MagicMock()
     worker_instance.bootstrap_dms = AsyncMock(return_value=0)
-    worker_instance.process_one_batch = AsyncMock(return_value=True)  # idle on first call
+    worker_instance.process_one_batch = AsyncMock(side_effect=process_one_batch_then_shutdown)
 
     worker_class = MagicMock(return_value=worker_instance)
 
     with (
         patch("mcp_telegram.daemon.create_client", return_value=mock_client),
         patch("mcp_telegram.daemon.ensure_sync_schema"),
-        patch("mcp_telegram.daemon.register_shutdown_handler", return_value=instant_shutdown_event),
+        patch("mcp_telegram.daemon.register_shutdown_handler", return_value=shutdown_event),
         patch("mcp_telegram.daemon.get_sync_db_path"),
         patch("mcp_telegram.daemon._open_sync_db"),
         patch("mcp_telegram.daemon.FullSyncWorker", worker_class),
