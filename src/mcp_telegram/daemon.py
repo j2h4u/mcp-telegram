@@ -19,6 +19,12 @@ Phase 27 (event handlers):
   are picked up within one interval without re-registering handlers (D-08/D-09).
 - Weekly gap scan detects tombstoned DM messages that MTProto delete events
   cannot report (D-14/D-15).
+
+Phase 28 (delta catch-up):
+- connect() called with catch_up=True — Telethon replays missed updates via PTS
+  on reconnect (D-05).
+- DeltaSyncWorker.run_delta_catch_up() fills forward gaps for all 'synced'
+  dialogs before bootstrap_dms() enrolls new ones (D-08).
 """
 from __future__ import annotations
 
@@ -26,6 +32,7 @@ import asyncio
 import logging
 import time
 
+from .delta_sync import DeltaSyncWorker
 from .event_handlers import EventHandlerManager
 from .sync_db import (
     _open_sync_db,
@@ -49,13 +56,14 @@ async def sync_main() -> None:
     1. Ensure sync.db schema is at current version.
     2. Open the long-lived writer connection.
     3. Register SIGTERM shutdown handler (checkpoints WAL on signal).
-    4. Connect to Telegram — log error and exit cleanly on ConnectionError.
-    5. Register event handlers (D-06): BEFORE FullSyncWorker to catch real-time events.
-    6. Bootstrap DM dialogs (D-06): enroll all User-type dialogs once.
-    7. Refresh synced_dialogs after bootstrap so newly enrolled dialogs are tracked.
-    8. Run tight sync loop: process_one_batch() + periodic heartbeat (D-10).
-    9. When all synced, enter idle heartbeat-only mode (D-11).
-    10. Unregister event handlers and disconnect TelegramClient on shutdown.
+    4. Connect to Telegram with catch_up=True — replay missed updates via PTS.
+    5. Register event handlers (D-06): BEFORE delta catch-up and FullSyncWorker.
+    6. Run DeltaSyncWorker.run_delta_catch_up() — fill gaps for 'synced' dialogs.
+    7. Bootstrap DM dialogs (D-06): enroll all User-type dialogs once.
+    8. Refresh synced_dialogs after bootstrap adds new dialogs.
+    9. Run tight sync loop: process_one_batch() + periodic heartbeat (D-10).
+    10. When all synced, enter idle heartbeat-only mode (D-11).
+    11. Unregister event handlers and disconnect TelegramClient on shutdown.
     """
     db_path = get_sync_db_path()
     ensure_sync_schema(db_path)
@@ -64,7 +72,7 @@ async def sync_main() -> None:
     loop = asyncio.get_running_loop()
     shutdown_event = register_shutdown_handler(conn, loop)
 
-    client = create_client()
+    client = create_client(catch_up=True)
     handler_manager: EventHandlerManager | None = None
     try:
         try:
@@ -80,6 +88,11 @@ async def sync_main() -> None:
         handler_manager = EventHandlerManager(client, conn, shutdown_event)
         handler_manager.register()
         logger.info("event handlers registered")
+
+        # Phase 28 (D-08): Delta catch-up for synced dialogs before bootstrap
+        delta_worker = DeltaSyncWorker(client, conn, shutdown_event)
+        delta_new = await delta_worker.run_delta_catch_up()
+        logger.info("delta_catch_up=%d new messages from gap-fill", delta_new)
 
         # Phase 1 — Bootstrap (D-06): enroll all DM dialogs once at startup
         worker = FullSyncWorker(client, conn, shutdown_event)
