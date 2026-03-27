@@ -123,9 +123,7 @@ async def run_mcp_server() -> None:
         force=True,
     )
 
-    from .tools._base import disable_telegram_session
-    disable_telegram_session()
-    logger.info("MCP server starting in read-only mode — no Telegram session")
+    logger.info("MCP server starting — routing through daemon API")
 
     async with stdio_server() as (read_stream, write_stream):
         await app.run(read_stream, write_stream, app.create_initialization_options())

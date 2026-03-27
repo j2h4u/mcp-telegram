@@ -4,7 +4,6 @@ import functools
 import logging
 import time
 import typing as t
-from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from functools import cache as functools_cache
 from functools import singledispatch
@@ -19,33 +18,13 @@ from pydantic import BaseModel, ConfigDict
 from xdg_base_dirs import xdg_state_home
 
 from ..cache import EntityCache
-from ..resolver import (
-    Candidates,
-    NotFound,
-    Resolved,
-    ResolvedWithMessage,
-    resolve_dialog,
-)
-from .. import telegram as _telegram_mod
+from ..daemon_client import DaemonConnection, DaemonNotRunningError, daemon_connection
 
 # Fetch reactor names only when total reactions per message are at or below this limit.
 # Covers personal chats (always ≤ a few) while skipping expensive lookups on busy groups.
 REACTION_NAMES_THRESHOLD = 15
 
 logger = logging.getLogger(__name__)
-
-_session_disabled: bool = False
-
-
-def disable_telegram_session() -> None:
-    """Prevent connected_client() from opening a Telegram session.
-
-    Called by the MCP server at startup. When active, connected_client()
-    raises RuntimeError instead of connecting — the sync-daemon owns the
-    session exclusively (per DAEMON-02).
-    """
-    global _session_disabled  # noqa: PLW0603
-    _session_disabled = True
 
 
 class ToolArgs(BaseModel):
@@ -218,39 +197,6 @@ def tool_args(tool: Tool, *args, **kwargs) -> ToolArgs:  # noqa: ANN002, ANN003
     return cls(*args, **kwargs)
 
 
-@asynccontextmanager
-async def connected_client():
-    """Reentrant connection wrapper: only the outermost caller disconnects.
-
-    Safe to nest — inner calls see the client already connected and skip
-    both connect and disconnect, so the outer block retains ownership.
-
-    Raises RuntimeError if disable_telegram_session() has been called — the
-    sync-daemon owns the TelegramClient in that configuration (DAEMON-02).
-    """
-    if _session_disabled:
-        raise RuntimeError(
-            "Telegram session disabled — sync-daemon owns the session. "
-            "MCP server reads sync.db only."
-        )
-    client = _telegram_mod.create_client()
-    owns_connection = not client.is_connected()
-    if owns_connection:
-        t0 = time.monotonic()
-        await client.connect()
-        logger.debug("tg_connect: %.1fms", (time.monotonic() - t0) * 1000)
-    try:
-        yield client
-    finally:
-        if owns_connection:
-            try:
-                t0 = time.monotonic()
-                await client.disconnect()
-                logger.debug("tg_disconnect: %.1fms", (time.monotonic() - t0) * 1000)
-            except Exception:
-                logger.warning("tg_disconnect failed", exc_info=True)
-
-
 @functools_cache
 def get_entity_cache() -> EntityCache:
     """Return the shared EntityCache instance (opened once per process)."""
@@ -274,11 +220,6 @@ def _get_analytics_collector():
     db_dir.mkdir(parents=True, exist_ok=True)
     db_path = db_dir / "analytics.db"
     return TelemetryCollector.get_instance(db_path)
-
-
-async def _resolve_dialog(cache: EntityCache, query: str) -> Resolved | ResolvedWithMessage | Candidates | NotFound:
-    """Resolve one dialog via the consolidated resolver (with warmup and API fallback)."""
-    return await resolve_dialog(query, cache, connected_client)
 
 
 def verify_tool_registry() -> None:
