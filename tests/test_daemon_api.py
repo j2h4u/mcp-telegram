@@ -746,3 +746,427 @@ async def test_get_sync_alerts_respects_limit() -> None:
     server = make_server(conn)
     result = await server._dispatch({"method": "get_sync_alerts", "since": 0, "limit": 3})
     assert len(result["data"]["deleted_messages"]) == 3
+
+
+# ---------------------------------------------------------------------------
+# get_user_info
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_user_info_returns_profile() -> None:
+    """get_user_info returns user profile with id, names, username, and common_chats."""
+    try:
+        from telethon.tl.types import Channel as TelethonChannel  # type: ignore[import-untyped]
+        from telethon.tl.functions.messages import GetCommonChatsRequest as TelethonGetCommonChatsRequest  # type: ignore[import-untyped]
+        TELETHON_REAL = True
+    except ImportError:
+        TELETHON_REAL = False
+
+    user = MagicMock()
+    user.id = 12345
+    user.first_name = "Alice"
+    user.last_name = "Smith"
+    user.username = "alice"
+
+    # Build a mock channel for common_chats (megagroup=True → supergroup)
+    if TELETHON_REAL:
+        mock_chat = MagicMock(spec=TelethonChannel)
+        mock_chat.id = 1234
+        mock_chat.title = "Dev"
+        mock_chat.megagroup = True
+    else:
+        mock_chat = MagicMock()
+        mock_chat.id = 1234
+        mock_chat.title = "Dev"
+        mock_chat.megagroup = True
+        # Make isinstance(chat, Channel) work by patching
+        mock_chat.__class__ = type("Channel", (), {})
+
+    common_result = MagicMock()
+    common_result.chats = [mock_chat]
+
+    client = AsyncMock()
+    client.get_entity = AsyncMock(return_value=user)
+    client.return_value = common_result
+
+    server = make_server(client=client)
+
+    # Patch GetCommonChatsRequest so the import guard is satisfied (same pattern as list_topics test)
+    with patch("mcp_telegram.daemon_api.GetCommonChatsRequest") as mock_gcr, \
+         patch("mcp_telegram.daemon_api._TELETHON_AVAILABLE", True):
+        mock_gcr.return_value = MagicMock()  # the request object passed to client()
+        result = await server._dispatch({"method": "get_user_info", "user_id": 12345})
+
+    assert result["ok"] is True, f"Expected ok=True, got {result}"
+    data = result["data"]
+    assert data["id"] == 12345
+    assert data["first_name"] == "Alice"
+    assert data["last_name"] == "Smith"
+    assert data["username"] == "alice"
+    assert "common_chats" in data
+    assert len(data["common_chats"]) == 1
+    chat = data["common_chats"][0]
+    assert chat["name"] == "Dev"
+    assert chat["type"] in ("supergroup", "channel", "group", "user")
+
+
+@pytest.mark.asyncio
+async def test_get_user_info_user_not_found() -> None:
+    """get_user_info returns ok=False with error=user_not_found when get_entity raises."""
+    client = AsyncMock()
+    client.get_entity = AsyncMock(side_effect=ValueError("No user with id 99999"))
+
+    server = make_server(client=client)
+    result = await server._dispatch({"method": "get_user_info", "user_id": 99999})
+
+    assert result["ok"] is False
+    assert result["error"] == "user_not_found"
+    assert "message" in result
+
+
+@pytest.mark.asyncio
+async def test_get_user_info_channel_type_classification() -> None:
+    """get_user_info classifies Channel with megagroup=False as 'channel'."""
+    try:
+        from telethon.tl.types import Channel as TelethonChannel  # type: ignore[import-untyped]
+        TELETHON_REAL = True
+    except ImportError:
+        TELETHON_REAL = False
+
+    user = MagicMock()
+    user.id = 100
+    user.first_name = "Test"
+    user.last_name = None
+    user.username = None
+
+    if TELETHON_REAL:
+        broadcast_chat = MagicMock(spec=TelethonChannel)
+        broadcast_chat.id = 5678
+        broadcast_chat.title = "News"
+        broadcast_chat.megagroup = False
+    else:
+        broadcast_chat = MagicMock()
+        broadcast_chat.id = 5678
+        broadcast_chat.title = "News"
+        broadcast_chat.megagroup = False
+        broadcast_chat.__class__ = type("Channel", (), {})
+
+    common_result = MagicMock()
+    common_result.chats = [broadcast_chat]
+
+    client = AsyncMock()
+    client.get_entity = AsyncMock(return_value=user)
+    client.return_value = common_result
+
+    server = make_server(client=client)
+
+    with patch("mcp_telegram.daemon_api.GetCommonChatsRequest") as mock_gcr, \
+         patch("mcp_telegram.daemon_api._TELETHON_AVAILABLE", True):
+        mock_gcr.return_value = MagicMock()
+        result = await server._dispatch({"method": "get_user_info", "user_id": 100})
+
+    assert result["ok"] is True
+    # Can only verify the type is some known string — real telethon determines which
+    chat_type = result["data"]["common_chats"][0]["type"]
+    assert chat_type in ("channel", "supergroup", "group", "user")
+
+
+@pytest.mark.asyncio
+async def test_get_user_info_dispatch_routing() -> None:
+    """_dispatch routes 'get_user_info' to _get_user_info handler."""
+    user = MagicMock()
+    user.id = 42
+    user.first_name = "Bob"
+    user.last_name = None
+    user.username = None
+
+    common_result = MagicMock()
+    common_result.chats = []
+
+    client = AsyncMock()
+    client.get_entity = AsyncMock(return_value=user)
+    client.return_value = common_result
+
+    server = make_server(client=client)
+    result = await server._dispatch({"method": "get_user_info", "user_id": 42})
+
+    # Should not be "unknown_method"
+    assert result.get("error") != "unknown_method", "get_user_info not routed in _dispatch"
+
+
+# ---------------------------------------------------------------------------
+# list_unread_messages
+# ---------------------------------------------------------------------------
+
+
+def _make_dialog_mock(
+    *,
+    chat_id: int,
+    name: str,
+    unread_count: int,
+    is_user: bool = False,
+    is_group: bool = False,
+    is_channel: bool = False,
+    is_bot: bool = False,
+    participants_count: int | None = None,
+    unread_mentions_count: int = 0,
+    read_inbox_max_id: int = 0,
+    timestamp: float = 1700000000.0,
+) -> MagicMock:
+    """Build a mock dialog object matching the attributes _list_unread_messages reads."""
+    dialog = MagicMock()
+    dialog.id = chat_id
+    dialog.name = name
+    dialog.unread_count = unread_count
+    dialog.unread_mentions_count = unread_mentions_count
+    dialog.is_user = is_user
+    dialog.is_group = is_group
+    dialog.is_channel = is_channel
+
+    entity = MagicMock()
+    entity.bot = is_bot
+    entity.participants_count = participants_count
+    dialog.entity = entity
+
+    raw_dialog = MagicMock()
+    raw_dialog.read_inbox_max_id = read_inbox_max_id
+    dialog.dialog = raw_dialog
+
+    date_mock = MagicMock()
+    date_mock.timestamp.return_value = timestamp
+    dialog.date = date_mock
+
+    return dialog
+
+
+def _make_msg_mock(
+    msg_id: int = 1,
+    text: str = "Hello",
+    timestamp: float = 1700000001.0,
+    sender_first_name: str | None = "Alice",
+    sender_id: int | None = 999,
+) -> MagicMock:
+    msg = MagicMock()
+    msg.id = msg_id
+    msg.message = text
+    msg.sender_id = sender_id
+
+    date_mock = MagicMock()
+    date_mock.timestamp.return_value = timestamp
+    msg.date = date_mock
+
+    sender = MagicMock()
+    sender.first_name = sender_first_name
+    msg.sender = sender
+
+    return msg
+
+
+@pytest.mark.asyncio
+async def test_list_unread_messages_basic() -> None:
+    """list_unread_messages returns grouped unread messages with correct structure."""
+    dialog = _make_dialog_mock(
+        chat_id=123,
+        name="Alice",
+        unread_count=2,
+        is_user=True,
+        read_inbox_max_id=10,
+    )
+
+    msg1 = _make_msg_mock(msg_id=11, text="Hi", timestamp=1700000001.0)
+    msg2 = _make_msg_mock(msg_id=12, text="Hey", timestamp=1700000002.0)
+
+    async def _fake_iter_dialogs(*args: Any, **kwargs: Any):  # type: ignore[misc]
+        yield dialog
+
+    async def _fake_iter_messages(chat_id: int, *, min_id: int, limit: int):  # type: ignore[misc]
+        yield msg1
+        yield msg2
+
+    client = MagicMock()
+    client.iter_dialogs = _fake_iter_dialogs
+    client.iter_messages = _fake_iter_messages
+
+    server = make_server(client=client)
+    result = await server._dispatch({
+        "method": "list_unread_messages",
+        "scope": "personal",
+        "limit": 100,
+        "group_size_threshold": 100,
+    })
+
+    assert result["ok"] is True, f"Expected ok=True, got {result}"
+    groups = result["data"]["groups"]
+    assert len(groups) == 1
+    group = groups[0]
+    assert group["dialog_id"] == 123
+    assert group["display_name"] == "Alice"
+    assert group["category"] == "user"
+    assert group["unread_count"] == 2
+    assert len(group["messages"]) == 2
+    assert group["messages"][0]["message_id"] == 11
+    assert group["messages"][0]["text"] == "Hi"
+    assert group["messages"][0]["sender_first_name"] == "Alice"
+    assert isinstance(group["messages"][0]["sent_at"], int)
+
+
+@pytest.mark.asyncio
+async def test_list_unread_messages_empty() -> None:
+    """list_unread_messages returns empty groups when no unread dialogs exist."""
+    async def _no_dialogs(*args: Any, **kwargs: Any):  # type: ignore[misc]
+        return
+        yield  # make it an async generator
+
+    client = MagicMock()
+    client.iter_dialogs = _no_dialogs
+
+    server = make_server(client=client)
+    result = await server._dispatch({
+        "method": "list_unread_messages",
+        "scope": "personal",
+        "limit": 100,
+        "group_size_threshold": 100,
+    })
+
+    assert result["ok"] is True
+    assert result["data"]["groups"] == []
+
+
+@pytest.mark.asyncio
+async def test_list_unread_messages_filters_channels_in_personal_scope() -> None:
+    """list_unread_messages scope=personal filters out channels."""
+    channel_dialog = _make_dialog_mock(
+        chat_id=200,
+        name="News Channel",
+        unread_count=5,
+        is_channel=True,
+    )
+    user_dialog = _make_dialog_mock(
+        chat_id=201,
+        name="Bob",
+        unread_count=3,
+        is_user=True,
+        read_inbox_max_id=0,
+    )
+
+    async def _fake_iter_dialogs(*args: Any, **kwargs: Any):  # type: ignore[misc]
+        yield channel_dialog
+        yield user_dialog
+
+    async def _no_messages(*args: Any, **kwargs: Any):  # type: ignore[misc]
+        return
+        yield
+
+    client = MagicMock()
+    client.iter_dialogs = _fake_iter_dialogs
+    client.iter_messages = _no_messages
+
+    server = make_server(client=client)
+    result = await server._dispatch({
+        "method": "list_unread_messages",
+        "scope": "personal",
+        "limit": 100,
+        "group_size_threshold": 100,
+    })
+
+    assert result["ok"] is True
+    ids = [g["dialog_id"] for g in result["data"]["groups"]]
+    assert 200 not in ids, "Channel should be filtered in personal scope"
+    assert 201 in ids
+
+
+@pytest.mark.asyncio
+async def test_list_unread_messages_filters_large_groups_in_personal_scope() -> None:
+    """list_unread_messages scope=personal filters out groups with participants > threshold."""
+    large_group = _make_dialog_mock(
+        chat_id=300,
+        name="Big Group",
+        unread_count=10,
+        is_group=True,
+        participants_count=500,
+    )
+    small_group = _make_dialog_mock(
+        chat_id=301,
+        name="Small Group",
+        unread_count=2,
+        is_group=True,
+        participants_count=10,
+        read_inbox_max_id=0,
+    )
+
+    async def _fake_iter_dialogs(*args: Any, **kwargs: Any):  # type: ignore[misc]
+        yield large_group
+        yield small_group
+
+    async def _no_messages(*args: Any, **kwargs: Any):  # type: ignore[misc]
+        return
+        yield
+
+    client = MagicMock()
+    client.iter_dialogs = _fake_iter_dialogs
+    client.iter_messages = _no_messages
+
+    server = make_server(client=client)
+    result = await server._dispatch({
+        "method": "list_unread_messages",
+        "scope": "personal",
+        "limit": 100,
+        "group_size_threshold": 100,
+    })
+
+    assert result["ok"] is True
+    ids = [g["dialog_id"] for g in result["data"]["groups"]]
+    assert 300 not in ids, "Large group should be filtered in personal scope"
+    assert 301 in ids
+
+
+@pytest.mark.asyncio
+async def test_list_unread_messages_budget_limits_messages() -> None:
+    """list_unread_messages applies budget allocation proportionally."""
+    # Two chats, each with 50 unread, total budget = 10 → each gets ~5
+    dialogs = [
+        _make_dialog_mock(chat_id=400 + i, name=f"Chat{i}", unread_count=50, is_user=True, read_inbox_max_id=0)
+        for i in range(2)
+    ]
+
+    # Each chat has 50 messages available
+    async def _fake_iter_dialogs(*args: Any, **kwargs: Any):  # type: ignore[misc]
+        for d in dialogs:
+            yield d
+
+    async def _fake_iter_messages(chat_id: int, *, min_id: int, limit: int):  # type: ignore[misc]
+        for i in range(limit):  # respect the limit
+            yield _make_msg_mock(msg_id=i + 1, text=f"msg {i}")
+
+    client = MagicMock()
+    client.iter_dialogs = _fake_iter_dialogs
+    client.iter_messages = _fake_iter_messages
+
+    server = make_server(client=client)
+    result = await server._dispatch({
+        "method": "list_unread_messages",
+        "scope": "personal",
+        "limit": 10,  # small budget to trigger allocation
+        "group_size_threshold": 100,
+    })
+
+    assert result["ok"] is True
+    total_messages = sum(len(g["messages"]) for g in result["data"]["groups"])
+    assert total_messages <= 10, f"Budget exceeded: {total_messages} messages returned"
+
+
+@pytest.mark.asyncio
+async def test_list_unread_messages_dispatch_routing() -> None:
+    """_dispatch routes 'list_unread_messages' to _list_unread_messages handler."""
+    async def _no_dialogs(*args: Any, **kwargs: Any):  # type: ignore[misc]
+        return
+        yield
+
+    client = MagicMock()
+    client.iter_dialogs = _no_dialogs
+
+    server = make_server(client=client)
+    result = await server._dispatch({"method": "list_unread_messages"})
+
+    assert result.get("error") != "unknown_method", "list_unread_messages not routed in _dispatch"

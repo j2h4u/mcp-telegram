@@ -1,11 +1,16 @@
 """Daemon API server — Unix socket request dispatcher (Plan 29-01, Task 2).
 
-DaemonAPIServer listens on a Unix domain socket and handles five methods:
+DaemonAPIServer listens on a Unix domain socket and handles ten methods:
   - list_messages: read from sync.db (synced dialogs) or Telegram (on-demand)
   - search_messages: FTS5 stemmed full-text search against messages_fts
   - list_dialogs: live dialog list from Telegram enriched with sync_status
   - list_topics: forum topic list via Telegram API
   - get_me: current user info via Telegram API
+  - mark_dialog_for_sync: add/remove dialog from sync scope
+  - get_sync_status: sync status and message statistics for a dialog
+  - get_sync_alerts: deleted messages, edit history, access-lost dialogs
+  - get_user_info: user profile and common chats (Plan 32-01)
+  - list_unread_messages: prioritized unread messages across dialogs (Plan 32-01)
 
 Protocol: newline-delimited JSON (one request line → one response line).
 
@@ -35,13 +40,21 @@ try:
     from telethon.tl.functions.channels import (  # type: ignore[import-untyped]
         GetForumTopicsRequest,
     )
+    from telethon.tl.functions.messages import (  # type: ignore[import-untyped]
+        GetCommonChatsRequest,
+    )
+    from telethon.tl.types import Channel, Chat  # type: ignore[import-untyped]
     from telethon import utils as telethon_utils  # type: ignore[import-untyped]
     _TELETHON_AVAILABLE = True
 except ImportError:
     _TELETHON_AVAILABLE = False
     GetForumTopicsRequest = None  # type: ignore[assignment,misc]
+    GetCommonChatsRequest = None  # type: ignore[assignment,misc]
+    Channel = None  # type: ignore[assignment,misc]
+    Chat = None  # type: ignore[assignment,misc]
     telethon_utils = None  # type: ignore[assignment]
 
+from .budget import allocate_message_budget_proportional, unread_chat_tier
 from .fts import stem_query
 
 logger = logging.getLogger(__name__)
@@ -102,6 +115,28 @@ _GET_ACCESS_LOST_ALERTS_SQL = (
     "SELECT dialog_id, access_lost_at "
     "FROM synced_dialogs WHERE status = 'access_lost' AND access_lost_at > ?"
 )
+
+
+# ---------------------------------------------------------------------------
+# Dialog category helper (used by _list_unread_messages)
+# ---------------------------------------------------------------------------
+
+
+def _classify_dialog_for_unread(dialog: object) -> str:
+    """Classify a Telethon Dialog object into category string.
+
+    Returns one of: "user", "bot", "group", "channel".
+    """
+    if getattr(dialog, "is_user", False):
+        entity = getattr(dialog, "entity", None)
+        if entity is not None and getattr(entity, "bot", False):
+            return "bot"
+        return "user"
+    if getattr(dialog, "is_group", False):
+        return "group"
+    if getattr(dialog, "is_channel", False):
+        return "channel"
+    return "group"
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +222,10 @@ class DaemonAPIServer:
             return await self._get_sync_status(req)
         if method == "get_sync_alerts":
             return await self._get_sync_alerts(req)
+        if method == "get_user_info":
+            return await self._get_user_info(req)
+        if method == "list_unread_messages":
+            return await self._list_unread_messages(req)
         return {"ok": False, "error": "unknown_method"}
 
     # ------------------------------------------------------------------
@@ -601,3 +640,179 @@ class DaemonAPIServer:
                 "access_lost": access_lost,
             },
         }
+
+    # ------------------------------------------------------------------
+    # get_user_info
+    # ------------------------------------------------------------------
+
+    async def _get_user_info(self, req: dict) -> dict:
+        """Return user profile and list of common chats.
+
+        Calls client.get_entity(user_id) and GetCommonChatsRequest to build
+        a complete user profile dict with typed common_chats entries.
+        """
+        user_id: int = req.get("user_id", 0)
+        try:
+            user = await self._client.get_entity(user_id)
+        except Exception as exc:
+            return {"ok": False, "error": "user_not_found", "message": str(exc)}
+
+        # Fetch common chats (only available for user entities)
+        common_chats: list[dict] = []
+        if _TELETHON_AVAILABLE and GetCommonChatsRequest is not None:
+            try:
+                common_result = await self._client(
+                    GetCommonChatsRequest(user_id=user_id, max_id=0, limit=100)
+                )
+                for chat in getattr(common_result, "chats", []):
+                    # Determine chat type from Telethon type system
+                    if Channel is not None and isinstance(chat, Channel):
+                        chat_type = "supergroup" if getattr(chat, "megagroup", False) else "channel"
+                    elif Chat is not None and isinstance(chat, Chat):
+                        chat_type = "group"
+                    else:
+                        chat_type = "user"
+
+                    if _TELETHON_AVAILABLE and telethon_utils is not None:
+                        full_id = int(telethon_utils.get_peer_id(chat))
+                    else:
+                        full_id = int(chat.id)
+
+                    common_chats.append({
+                        "id": full_id,
+                        "name": getattr(chat, "title", None) or str(chat.id),
+                        "type": chat_type,
+                    })
+            except Exception as exc:
+                logger.warning("get_user_info common_chats_failed user_id=%r error=%s", user_id, exc)
+
+        return {
+            "ok": True,
+            "data": {
+                "id": user.id,
+                "first_name": getattr(user, "first_name", None),
+                "last_name": getattr(user, "last_name", None),
+                "username": getattr(user, "username", None),
+                "common_chats": common_chats,
+            },
+        }
+
+    # ------------------------------------------------------------------
+    # list_unread_messages
+    # ------------------------------------------------------------------
+
+    async def _list_unread_messages(self, req: dict) -> dict:
+        """Return prioritized unread messages across dialogs.
+
+        Steps:
+        1. Iterate dialogs, collect those with unread_count > 0.
+        2. Filter by scope (personal = exclude channels and large groups).
+        3. Assign priority tiers and sort.
+        4. Allocate message budget proportionally.
+        5. Fetch messages per chat up to their budget.
+        """
+        scope: str = req.get("scope", "personal")
+        limit: int = req.get("limit", 100)
+        group_size_threshold: int = req.get("group_size_threshold", 100)
+
+        # Step A — Collect unread dialogs
+        unread_entries: list[dict] = []
+        unread_counts: dict[int, int] = {}
+
+        async for dialog in self._client.iter_dialogs(archived=None, ignore_pinned=False):
+            unread_count = getattr(dialog, "unread_count", 0)
+            if unread_count == 0:
+                continue
+            chat_id = getattr(dialog, "id", None)
+            if not isinstance(chat_id, int):
+                continue
+
+            display_name = getattr(dialog, "name", f"Chat {chat_id}")
+            category = _classify_dialog_for_unread(dialog)
+            unread_mentions_count = getattr(dialog, "unread_mentions_count", 0)
+            date = getattr(dialog, "date", None)
+            raw_dialog = getattr(dialog, "dialog", None)
+            read_inbox_max_id = getattr(raw_dialog, "read_inbox_max_id", 0) if raw_dialog else 0
+            entity = getattr(dialog, "entity", None)
+            participants_count = (
+                getattr(entity, "participants_count", None) if entity is not None else None
+            )
+
+            if scope == "personal":
+                if category == "channel":
+                    continue
+                if (
+                    category == "group"
+                    and participants_count is not None
+                    and participants_count > group_size_threshold
+                ):
+                    continue
+
+            unread_entries.append({
+                "chat_id": chat_id,
+                "display_name": display_name,
+                "unread_count": unread_count,
+                "unread_mentions_count": unread_mentions_count,
+                "category": category,
+                "date": date,
+                "read_inbox_max_id": read_inbox_max_id,
+            })
+            unread_counts[chat_id] = unread_count
+
+        # Step B — Assign tiers and sort (lower tier = higher priority)
+        for entry in unread_entries:
+            entry["tier"] = unread_chat_tier({
+                "unread_mentions_count": entry["unread_mentions_count"],
+                "category": entry["category"],
+            })
+        unread_entries.sort(
+            key=lambda e: (e["tier"], -(e["date"].timestamp() if e["date"] else 0))
+        )
+        allocation = allocate_message_budget_proportional(unread_counts, limit)
+
+        # Step C — Fetch messages per chat
+        groups: list[dict] = []
+        for entry in unread_entries:
+            budget = allocation.get(entry["chat_id"], 0)
+            group: dict = {
+                "dialog_id": entry["chat_id"],
+                "display_name": entry["display_name"],
+                "tier": entry["tier"],
+                "category": entry["category"],
+                "unread_count": entry["unread_count"],
+                "unread_mentions_count": entry["unread_mentions_count"],
+                "messages": [],
+            }
+            if budget == 0:
+                if entry["category"] == "channel":
+                    groups.append(group)
+                continue
+            try:
+                async for msg in self._client.iter_messages(
+                    entry["chat_id"],
+                    min_id=entry["read_inbox_max_id"],
+                    limit=budget,
+                ):
+                    sender_first_name: str | None = None
+                    if getattr(msg, "sender", None) is not None:
+                        sender_first_name = getattr(msg.sender, "first_name", None)
+                    sent_at = 0
+                    if getattr(msg, "date", None) is not None:
+                        try:
+                            sent_at = int(msg.date.timestamp())
+                        except Exception:
+                            sent_at = 0
+                    group["messages"].append({
+                        "message_id": msg.id,
+                        "sent_at": sent_at,
+                        "text": getattr(msg, "message", None),
+                        "sender_id": getattr(msg, "sender_id", None),
+                        "sender_first_name": sender_first_name,
+                    })
+            except Exception as exc:
+                logger.warning(
+                    "unread_fetch_failed chat_id=%r error=%s", entry["chat_id"], exc, exc_info=True
+                )
+            groups.append(group)
+
+        return {"ok": True, "data": {"groups": groups}}
