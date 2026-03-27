@@ -548,3 +548,176 @@ def test_handlers_unregistered_on_shutdown(
         f"handler_manager.unregister() must be called BEFORE client.disconnect(); "
         f"got order: {call_order}"
     )
+
+
+# ---------------------------------------------------------------------------
+# DeltaSyncWorker integration tests (Plan 28-02)
+# ---------------------------------------------------------------------------
+
+
+def test_create_client_called_with_catch_up(
+    mock_client: MagicMock,
+    instant_shutdown_event: asyncio.Event,
+) -> None:
+    """sync_main() calls create_client(catch_up=True) for PTS catch-up (D-05)."""
+    worker_instance = MagicMock()
+    worker_instance.bootstrap_dms = AsyncMock(return_value=0)
+    worker_instance.process_one_batch = AsyncMock(return_value=True)
+
+    delta_instance = MagicMock()
+    delta_instance.run_delta_catch_up = AsyncMock(return_value=0)
+
+    handler_instance = MagicMock()
+    handler_instance.register = MagicMock()
+    handler_instance.unregister = MagicMock()
+    handler_instance.refresh_synced_dialogs = MagicMock()
+    handler_instance.run_dm_gap_scan = AsyncMock(return_value=0)
+
+    with (
+        patch("mcp_telegram.daemon.create_client", return_value=mock_client) as mock_create,
+        patch("mcp_telegram.daemon.ensure_sync_schema"),
+        patch("mcp_telegram.daemon.register_shutdown_handler", return_value=instant_shutdown_event),
+        patch("mcp_telegram.daemon.get_sync_db_path"),
+        patch("mcp_telegram.daemon._open_sync_db"),
+        patch("mcp_telegram.daemon.FullSyncWorker", return_value=worker_instance),
+        patch("mcp_telegram.daemon.DeltaSyncWorker", return_value=delta_instance),
+        patch("mcp_telegram.daemon.EventHandlerManager", return_value=handler_instance),
+    ):
+        asyncio.run(sync_main())
+
+    mock_create.assert_called_once_with(catch_up=True)
+
+
+def test_create_client_catch_up_default_false() -> None:
+    """create_client() signature has catch_up parameter with default False (backward compat)."""
+    import inspect
+    from mcp_telegram.telegram import create_client
+
+    sig = inspect.signature(create_client.__wrapped__)  # unwrap @cache
+    assert "catch_up" in sig.parameters
+    assert sig.parameters["catch_up"].default is False
+
+
+def test_delta_catch_up_runs_before_bootstrap(
+    mock_client: MagicMock,
+    instant_shutdown_event: asyncio.Event,
+) -> None:
+    """DeltaSyncWorker.run_delta_catch_up() runs AFTER register() but BEFORE bootstrap_dms() (D-08)."""
+    call_order: list[str] = []
+
+    worker_instance = MagicMock()
+    worker_instance.bootstrap_dms = AsyncMock(
+        side_effect=lambda: call_order.append("bootstrap_dms") or 0
+    )
+    worker_instance.process_one_batch = AsyncMock(return_value=True)
+
+    delta_instance = MagicMock()
+    delta_instance.run_delta_catch_up = AsyncMock(
+        side_effect=lambda: call_order.append("delta_catch_up") or 0
+    )
+
+    handler_instance = MagicMock()
+    handler_instance.register = MagicMock(
+        side_effect=lambda: call_order.append("register")
+    )
+    handler_instance.unregister = MagicMock()
+    handler_instance.refresh_synced_dialogs = MagicMock()
+    handler_instance.run_dm_gap_scan = AsyncMock(return_value=0)
+
+    with (
+        patch("mcp_telegram.daemon.create_client", return_value=mock_client),
+        patch("mcp_telegram.daemon.ensure_sync_schema"),
+        patch("mcp_telegram.daemon.register_shutdown_handler", return_value=instant_shutdown_event),
+        patch("mcp_telegram.daemon.get_sync_db_path"),
+        patch("mcp_telegram.daemon._open_sync_db"),
+        patch("mcp_telegram.daemon.FullSyncWorker", return_value=worker_instance),
+        patch("mcp_telegram.daemon.DeltaSyncWorker", return_value=delta_instance),
+        patch("mcp_telegram.daemon.EventHandlerManager", return_value=handler_instance),
+    ):
+        asyncio.run(sync_main())
+
+    assert "register" in call_order, "handler_manager.register() was never called"
+    assert "delta_catch_up" in call_order, "delta_worker.run_delta_catch_up() was never called"
+    assert "bootstrap_dms" in call_order, "worker.bootstrap_dms() was never called"
+    assert call_order.index("register") < call_order.index("delta_catch_up"), (
+        f"register() must be called BEFORE delta_catch_up; got order: {call_order}"
+    )
+    assert call_order.index("delta_catch_up") < call_order.index("bootstrap_dms"), (
+        f"delta_catch_up must be called BEFORE bootstrap_dms; got order: {call_order}"
+    )
+
+
+def test_delta_catch_up_logged(
+    mock_client: MagicMock,
+    instant_shutdown_event: asyncio.Event,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """sync_main() logs a 'delta_catch_up' INFO message during startup."""
+    worker_instance = MagicMock()
+    worker_instance.bootstrap_dms = AsyncMock(return_value=0)
+    worker_instance.process_one_batch = AsyncMock(return_value=True)
+
+    delta_instance = MagicMock()
+    delta_instance.run_delta_catch_up = AsyncMock(return_value=0)
+
+    handler_instance = MagicMock()
+    handler_instance.register = MagicMock()
+    handler_instance.unregister = MagicMock()
+    handler_instance.refresh_synced_dialogs = MagicMock()
+    handler_instance.run_dm_gap_scan = AsyncMock(return_value=0)
+
+    with (
+        patch("mcp_telegram.daemon.create_client", return_value=mock_client),
+        patch("mcp_telegram.daemon.ensure_sync_schema"),
+        patch("mcp_telegram.daemon.register_shutdown_handler", return_value=instant_shutdown_event),
+        patch("mcp_telegram.daemon.get_sync_db_path"),
+        patch("mcp_telegram.daemon._open_sync_db"),
+        patch("mcp_telegram.daemon.FullSyncWorker", return_value=worker_instance),
+        patch("mcp_telegram.daemon.DeltaSyncWorker", return_value=delta_instance),
+        patch("mcp_telegram.daemon.EventHandlerManager", return_value=handler_instance),
+        caplog.at_level(logging.INFO, logger="mcp_telegram.daemon"),
+    ):
+        asyncio.run(sync_main())
+
+    assert any("delta_catch_up" in record.message for record in caplog.records), (
+        "Expected 'delta_catch_up' in INFO log output during startup"
+    )
+
+
+def test_delta_catch_up_result_logged(
+    mock_client: MagicMock,
+    instant_shutdown_event: asyncio.Event,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """sync_main() logs the return value of run_delta_catch_up() in the startup message."""
+    worker_instance = MagicMock()
+    worker_instance.bootstrap_dms = AsyncMock(return_value=0)
+    worker_instance.process_one_batch = AsyncMock(return_value=True)
+
+    delta_instance = MagicMock()
+    delta_instance.run_delta_catch_up = AsyncMock(return_value=5)  # 5 new messages
+
+    handler_instance = MagicMock()
+    handler_instance.register = MagicMock()
+    handler_instance.unregister = MagicMock()
+    handler_instance.refresh_synced_dialogs = MagicMock()
+    handler_instance.run_dm_gap_scan = AsyncMock(return_value=0)
+
+    with (
+        patch("mcp_telegram.daemon.create_client", return_value=mock_client),
+        patch("mcp_telegram.daemon.ensure_sync_schema"),
+        patch("mcp_telegram.daemon.register_shutdown_handler", return_value=instant_shutdown_event),
+        patch("mcp_telegram.daemon.get_sync_db_path"),
+        patch("mcp_telegram.daemon._open_sync_db"),
+        patch("mcp_telegram.daemon.FullSyncWorker", return_value=worker_instance),
+        patch("mcp_telegram.daemon.DeltaSyncWorker", return_value=delta_instance),
+        patch("mcp_telegram.daemon.EventHandlerManager", return_value=handler_instance),
+        caplog.at_level(logging.INFO, logger="mcp_telegram.daemon"),
+    ):
+        asyncio.run(sync_main())
+
+    delta_logs = [r.message for r in caplog.records if "delta_catch_up" in r.message]
+    assert delta_logs, "Expected at least one log message containing 'delta_catch_up'"
+    assert any("5" in msg for msg in delta_logs), (
+        f"Expected log to contain return value '5'; got: {delta_logs}"
+    )
