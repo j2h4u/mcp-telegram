@@ -721,3 +721,128 @@ def test_delta_catch_up_result_logged(
     assert any("5" in msg for msg in delta_logs), (
         f"Expected log to contain return value '5'; got: {delta_logs}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 29-02: DaemonAPIServer + FTS backfill in daemon.py
+# ---------------------------------------------------------------------------
+
+
+def _make_standard_mocks(instant_shutdown_event: asyncio.Event) -> dict:
+    """Return a dict of standard mock instances for daemon integration tests."""
+    worker_instance = MagicMock()
+    worker_instance.bootstrap_dms = AsyncMock(return_value=0)
+    worker_instance.process_one_batch = AsyncMock(return_value=True)
+
+    delta_instance = MagicMock()
+    delta_instance.run_delta_catch_up = AsyncMock(return_value=0)
+
+    handler_instance = MagicMock()
+    handler_instance.register = MagicMock()
+    handler_instance.unregister = MagicMock()
+    handler_instance.refresh_synced_dialogs = MagicMock()
+    handler_instance.run_dm_gap_scan = AsyncMock(return_value=0)
+
+    return {
+        "worker": worker_instance,
+        "delta": delta_instance,
+        "handler": handler_instance,
+    }
+
+
+def test_sync_main_starts_api_server(
+    mock_client: MagicMock,
+    instant_shutdown_event: asyncio.Event,
+) -> None:
+    """sync_main() calls asyncio.start_unix_server with the correct socket path."""
+    from pathlib import Path
+    mocks = _make_standard_mocks(instant_shutdown_event)
+
+    mock_unix_server = MagicMock()
+    mock_unix_server.close = MagicMock()
+    mock_unix_server.wait_closed = AsyncMock()
+
+    captured_args: list = []
+
+    async def mock_start_unix_server(handler, path=None, **kwargs):  # noqa: ANN001, ANN202
+        captured_args.append((handler, path))
+        return mock_unix_server
+
+    with (
+        patch("mcp_telegram.daemon.create_client", return_value=mock_client),
+        patch("mcp_telegram.daemon.ensure_sync_schema"),
+        patch("mcp_telegram.daemon.register_shutdown_handler", return_value=instant_shutdown_event),
+        patch("mcp_telegram.daemon.get_sync_db_path"),
+        patch("mcp_telegram.daemon._open_sync_db"),
+        patch("mcp_telegram.daemon.backfill_fts_index", return_value=0),
+        patch("mcp_telegram.daemon.FullSyncWorker", return_value=mocks["worker"]),
+        patch("mcp_telegram.daemon.DeltaSyncWorker", return_value=mocks["delta"]),
+        patch("mcp_telegram.daemon.EventHandlerManager", return_value=mocks["handler"]),
+        patch("mcp_telegram.daemon.asyncio.start_unix_server", side_effect=mock_start_unix_server),
+    ):
+        asyncio.run(sync_main())
+
+    assert len(captured_args) == 1, "asyncio.start_unix_server must be called exactly once"
+    handler_fn, socket_path = captured_args[0]
+    assert socket_path is not None, "socket path must be provided"
+    assert callable(handler_fn), "handler must be callable"
+
+
+def test_sync_main_runs_fts_backfill(
+    mock_client: MagicMock,
+    instant_shutdown_event: asyncio.Event,
+) -> None:
+    """sync_main() calls backfill_fts_index(conn) once at startup."""
+    mocks = _make_standard_mocks(instant_shutdown_event)
+    mock_conn = MagicMock()
+
+    mock_unix_server = MagicMock()
+    mock_unix_server.close = MagicMock()
+    mock_unix_server.wait_closed = AsyncMock()
+
+    with (
+        patch("mcp_telegram.daemon.create_client", return_value=mock_client),
+        patch("mcp_telegram.daemon.ensure_sync_schema"),
+        patch("mcp_telegram.daemon.register_shutdown_handler", return_value=instant_shutdown_event),
+        patch("mcp_telegram.daemon.get_sync_db_path"),
+        patch("mcp_telegram.daemon._open_sync_db", return_value=mock_conn),
+        patch("mcp_telegram.daemon.backfill_fts_index", return_value=0) as mock_backfill,
+        patch("mcp_telegram.daemon.FullSyncWorker", return_value=mocks["worker"]),
+        patch("mcp_telegram.daemon.DeltaSyncWorker", return_value=mocks["delta"]),
+        patch("mcp_telegram.daemon.EventHandlerManager", return_value=mocks["handler"]),
+        patch("mcp_telegram.daemon.asyncio.start_unix_server", new=AsyncMock(return_value=mock_unix_server)),
+    ):
+        asyncio.run(sync_main())
+
+    mock_backfill.assert_called_once_with(mock_conn)
+
+
+def test_sync_main_cleans_socket_on_shutdown(
+    mock_client: MagicMock,
+    instant_shutdown_event: asyncio.Event,
+    tmp_path,  # noqa: ANN001
+) -> None:
+    """Socket file does not exist after sync_main() exits (cleanup in finally block)."""
+    fake_socket_path = tmp_path / "mcp_telegram.sock"
+    mocks = _make_standard_mocks(instant_shutdown_event)
+
+    mock_unix_server = MagicMock()
+    mock_unix_server.close = MagicMock()
+    mock_unix_server.wait_closed = AsyncMock()
+
+    with (
+        patch("mcp_telegram.daemon.create_client", return_value=mock_client),
+        patch("mcp_telegram.daemon.ensure_sync_schema"),
+        patch("mcp_telegram.daemon.register_shutdown_handler", return_value=instant_shutdown_event),
+        patch("mcp_telegram.daemon.get_sync_db_path"),
+        patch("mcp_telegram.daemon._open_sync_db"),
+        patch("mcp_telegram.daemon.backfill_fts_index", return_value=0),
+        patch("mcp_telegram.daemon.get_daemon_socket_path", return_value=fake_socket_path),
+        patch("mcp_telegram.daemon.FullSyncWorker", return_value=mocks["worker"]),
+        patch("mcp_telegram.daemon.DeltaSyncWorker", return_value=mocks["delta"]),
+        patch("mcp_telegram.daemon.EventHandlerManager", return_value=mocks["handler"]),
+        patch("mcp_telegram.daemon.asyncio.start_unix_server", new=AsyncMock(return_value=mock_unix_server)),
+    ):
+        asyncio.run(sync_main())
+
+    assert not fake_socket_path.exists(), "Socket file must not exist after daemon shuts down"

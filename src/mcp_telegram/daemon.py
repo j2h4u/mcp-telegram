@@ -25,6 +25,12 @@ Phase 28 (delta catch-up):
   on reconnect (D-05).
 - DeltaSyncWorker.run_delta_catch_up() fills forward gaps for all 'synced'
   dialogs before bootstrap_dms() enrolls new ones (D-08).
+
+Phase 29 (daemon API):
+- DaemonAPIServer runs on a Unix socket alongside the sync loop, serving
+  list_messages / search_messages / list_dialogs requests from MCP server.
+- FTS backfill runs once at startup for messages without FTS index entries.
+- Socket file cleaned up on shutdown (and stale file removed on startup).
 """
 from __future__ import annotations
 
@@ -32,8 +38,10 @@ import asyncio
 import logging
 import time
 
+from .daemon_api import DaemonAPIServer, get_daemon_socket_path
 from .delta_sync import DeltaSyncWorker
 from .event_handlers import EventHandlerManager
+from .fts import backfill_fts_index
 from .sync_db import (
     _open_sync_db,
     ensure_sync_schema,
@@ -69,11 +77,18 @@ async def sync_main() -> None:
     ensure_sync_schema(db_path)
 
     conn = _open_sync_db(db_path)
+
+    # Phase 29: One-time FTS backfill for messages without index entries
+    backfilled = backfill_fts_index(conn)
+    if backfilled:
+        logger.info("fts_backfill=%d messages indexed", backfilled)
+
     loop = asyncio.get_running_loop()
     shutdown_event = register_shutdown_handler(conn, loop)
 
     client = create_client(catch_up=True)
     handler_manager: EventHandlerManager | None = None
+    unix_server = None
     try:
         try:
             await client.connect()
@@ -83,6 +98,15 @@ async def sync_main() -> None:
             return
 
         logger.info("sync-daemon started — connected=%s", client.is_connected())
+
+        # Phase 29: Start daemon API server on Unix socket
+        api_server = DaemonAPIServer(conn, client, shutdown_event)
+        socket_path = get_daemon_socket_path()
+        socket_path.unlink(missing_ok=True)
+        unix_server = await asyncio.start_unix_server(
+            api_server.handle_client, path=str(socket_path)
+        )
+        logger.info("daemon API listening on %s", socket_path)
 
         # Phase 27 (D-06): Register event handlers BEFORE FullSyncWorker
         handler_manager = EventHandlerManager(client, conn, shutdown_event)
@@ -143,6 +167,10 @@ async def sync_main() -> None:
                         last_gap_scan = time.monotonic()
 
     finally:
+        if unix_server is not None:
+            unix_server.close()
+            await unix_server.wait_closed()
+        get_daemon_socket_path().unlink(missing_ok=True)
         if handler_manager is not None:
             handler_manager.unregister()
         await client.disconnect()
