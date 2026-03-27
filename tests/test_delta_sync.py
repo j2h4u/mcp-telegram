@@ -461,3 +461,53 @@ async def test_delta_respects_shutdown(
 
     # With shutdown set, no dialogs should be processed
     assert called_count == 0, f"Expected 0 calls after shutdown, got {called_count}"
+
+
+# ---------------------------------------------------------------------------
+# Phase 29-02: FTS population in DeltaSyncWorker
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_delta_catch_up_populates_fts(
+    mock_client: MagicMock,
+    sync_db: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """After run_delta_catch_up(), messages_fts has rows for each gap-fill message."""
+    dialog_id = 5001
+
+    sync_db.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')",
+        (dialog_id,),
+    )
+    sync_db.execute(
+        "INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (?, 100, 1704067200)",
+        (dialog_id,),
+    )
+    sync_db.commit()
+
+    new_msgs = [
+        make_mock_message(id=101, text="написал сообщение"),
+        make_mock_message(id=102, text="hello world"),
+    ]
+
+    async def _iter_messages(**kwargs: Any):  # noqa: ANN202
+        for m in new_msgs:
+            yield m
+
+    mock_client.iter_messages = _iter_messages
+
+    worker = make_worker(mock_client, sync_db, shutdown_event)
+    total = await worker.run_delta_catch_up()
+
+    assert total == 2
+
+    fts_rows = sync_db.execute(
+        "SELECT message_id, stemmed_text FROM messages_fts "
+        "WHERE dialog_id = ? ORDER BY message_id",
+        (dialog_id,),
+    ).fetchall()
+    assert len(fts_rows) == 2, f"Expected 2 FTS rows for gap messages, got {len(fts_rows)}"
+    for row in fts_rows:
+        assert row[1] != "", "stemmed_text must be non-empty for gap-filled messages with text"

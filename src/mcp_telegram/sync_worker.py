@@ -37,6 +37,8 @@ from telethon.errors import (  # type: ignore[import-untyped]
 )
 from telethon.tl import types  # type: ignore[import-untyped]
 
+from .fts import INSERT_FTS_SQL, stem_text
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -309,9 +311,13 @@ class FullSyncWorker:
         is_done = len(batch) < 100  # partial batch = last batch (Pitfall 3)
         new_status = "synced" if is_done else "syncing"
 
-        # Single atomic transaction: messages + progress update (D-05)
+        # Single atomic transaction: messages + FTS + progress update (D-05)
         with self._conn:
             self._conn.executemany(_INSERT_MESSAGE_SQL, rows)
+            self._conn.executemany(
+                INSERT_FTS_SQL,
+                ((row[0], row[1], stem_text(row[3])) for row in rows),  # type: ignore[arg-type]
+            )
             self._conn.execute(
                 _UPDATE_PROGRESS_SQL, (new_progress, new_status, dialog_id)
             )

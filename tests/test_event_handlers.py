@@ -827,3 +827,72 @@ async def test_gap_scan_only_synced(
     assert 9920 in scanned, "synced dialog 9920 must be scanned"
     assert 9921 not in scanned, "syncing dialog 9921 must NOT be scanned"
     assert 9922 not in scanned, "access_lost dialog 9922 must NOT be scanned"
+
+
+# ---------------------------------------------------------------------------
+# Phase 29-02: FTS population in EventHandlerManager
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_on_new_message_populates_fts(
+    mock_client: MagicMock,
+    sync_db: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """on_new_message() inserts a corresponding row into messages_fts."""
+    dialog_id = 8001
+    insert_synced_dialog(sync_db, dialog_id)
+
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+    manager.register()
+
+    msg = make_mock_message(id=500, text="написал сообщение")
+    event = make_new_message_event(chat_id=dialog_id, message=msg)
+    await manager.on_new_message(event)
+
+    fts_row = sync_db.execute(
+        "SELECT dialog_id, message_id, stemmed_text FROM messages_fts "
+        "WHERE dialog_id=? AND message_id=?",
+        (dialog_id, 500),
+    ).fetchone()
+    assert fts_row is not None, "messages_fts must have a row for the new message"
+    assert fts_row[0] == dialog_id
+    assert fts_row[1] == 500
+    assert fts_row[2] != "", "stemmed_text must be non-empty"
+
+
+@pytest.mark.asyncio
+async def test_on_message_edited_updates_fts(
+    mock_client: MagicMock,
+    sync_db: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """on_message_edited() updates the FTS entry with the new stemmed text."""
+    dialog_id = 8002
+    insert_synced_dialog(sync_db, dialog_id)
+    insert_message(sync_db, dialog_id, message_id=600, text="old text here")
+    # Pre-populate FTS with old text
+    sync_db.execute(
+        "INSERT OR REPLACE INTO messages_fts(dialog_id, message_id, stemmed_text) VALUES (?, ?, ?)",
+        (dialog_id, 600, "old text here"),
+    )
+    sync_db.commit()
+
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+    manager.register()
+
+    edit_dt = datetime(2024, 1, 1, 13, 0, 0, tzinfo=timezone.utc)
+    msg = make_mock_message(id=600, text="new edited content", edit_date=edit_dt)
+    event = make_message_edited_event(chat_id=dialog_id, message=msg)
+    await manager.on_message_edited(event)
+
+    fts_row = sync_db.execute(
+        "SELECT stemmed_text FROM messages_fts WHERE dialog_id=? AND message_id=?",
+        (dialog_id, 600),
+    ).fetchone()
+    assert fts_row is not None, "messages_fts row must exist after edit"
+    # stemmed text must differ from the original stub
+    assert fts_row[0] != "old text here", (
+        "FTS stemmed_text must be updated after message edit"
+    )

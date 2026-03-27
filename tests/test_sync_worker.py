@@ -822,3 +822,82 @@ async def test_generic_rpc_error_still_skips(
     ).fetchone()
     assert row is not None
     assert row[0] != "access_lost", f"Generic RPCError must not set access_lost, got {row[0]}"
+
+
+# ---------------------------------------------------------------------------
+# Phase 29-02: FTS population in FullSyncWorker
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_process_one_batch_populates_fts(
+    mock_client: MagicMock,
+    sync_db: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """After process_one_batch(), messages_fts has matching rows with non-empty stemmed_text."""
+    dialog_id = 7001
+    sync_db.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, sync_progress) VALUES (?, 'syncing', 0)",
+        (dialog_id,),
+    )
+    sync_db.commit()
+
+    msgs = [
+        make_mock_message(id=101, text="написал сообщение"),
+        make_mock_message(id=102, text="hello world"),
+        make_mock_message(id=103, text="third message"),
+    ]
+
+    async def _iter_messages(**kwargs: Any):  # noqa: ANN202
+        for m in msgs:
+            yield m
+
+    mock_client.iter_messages = _iter_messages
+
+    worker = make_worker(mock_client, sync_db, shutdown_event)
+    await worker.process_one_batch()
+
+    fts_rows = sync_db.execute(
+        "SELECT dialog_id, message_id, stemmed_text FROM messages_fts "
+        "WHERE dialog_id = ? ORDER BY message_id",
+        (dialog_id,),
+    ).fetchall()
+    assert len(fts_rows) == 3, f"Expected 3 FTS rows, got {len(fts_rows)}"
+    for row in fts_rows:
+        assert row[0] == dialog_id
+        assert row[2] != "", "stemmed_text must be non-empty for messages with text"
+
+
+@pytest.mark.asyncio
+async def test_process_one_batch_fts_matches_message_ids(
+    mock_client: MagicMock,
+    sync_db: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """FTS rows have message_ids matching those in the messages table."""
+    dialog_id = 7002
+    sync_db.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, sync_progress) VALUES (?, 'syncing', 0)",
+        (dialog_id,),
+    )
+    sync_db.commit()
+
+    msgs = [make_mock_message(id=200, text="test"), make_mock_message(id=201, text="data")]
+
+    async def _iter_messages(**kwargs: Any):  # noqa: ANN202
+        for m in msgs:
+            yield m
+
+    mock_client.iter_messages = _iter_messages
+
+    worker = make_worker(mock_client, sync_db, shutdown_event)
+    await worker.process_one_batch()
+
+    fts_ids = {
+        row[0]
+        for row in sync_db.execute(
+            "SELECT message_id FROM messages_fts WHERE dialog_id = ?", (dialog_id,)
+        ).fetchall()
+    }
+    assert fts_ids == {200, 201}

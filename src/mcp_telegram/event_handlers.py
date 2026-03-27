@@ -29,6 +29,8 @@ from typing import Any
 
 from telethon import events  # type: ignore[import-untyped]
 
+from .fts import DELETE_FTS_SQL, INSERT_FTS_SQL, stem_text
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -164,6 +166,10 @@ class EventHandlerManager:
 
         with self._conn:
             self._conn.execute(_INSERT_MESSAGE_SQL, row)
+            self._conn.execute(
+                INSERT_FTS_SQL,
+                (dialog_id, int(getattr(msg, "id", 0)), stem_text(getattr(msg, "message", None))),
+            )
             self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
 
         logger.debug("new_message dialog_id=%d message_id=%d", dialog_id, msg.id)
@@ -197,6 +203,9 @@ class EventHandlerManager:
                 # insert it with current text; historical versions are lost (acceptable).
                 row = self._extract_event_message_row(dialog_id, msg)
                 self._conn.execute(_INSERT_MESSAGE_SQL, row)
+                self._conn.execute(
+                    INSERT_FTS_SQL, (dialog_id, message_id, stem_text(new_text))
+                )
                 self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
                 logger.debug(
                     "message_edited (unknown) dialog_id=%d message_id=%d — inserted",
@@ -225,6 +234,12 @@ class EventHandlerManager:
             )
             self._conn.execute(
                 _UPDATE_MESSAGE_TEXT_SQL, (new_text, dialog_id, message_id)
+            )
+            # FTS5 INSERT OR REPLACE doesn't replace by content columns — must
+            # delete the old row and insert fresh to avoid duplicate FTS entries.
+            self._conn.execute(DELETE_FTS_SQL, (dialog_id, message_id))
+            self._conn.execute(
+                INSERT_FTS_SQL, (dialog_id, message_id, stem_text(new_text))
             )
             self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
 

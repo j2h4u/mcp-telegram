@@ -46,6 +46,10 @@ INSERT_FTS_SQL = (
     "VALUES (?, ?, ?)"
 )
 
+DELETE_FTS_SQL = (
+    "DELETE FROM messages_fts WHERE dialog_id=? AND message_id=?"
+)
+
 
 # ---------------------------------------------------------------------------
 # Public helpers

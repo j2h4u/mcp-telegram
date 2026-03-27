@@ -22,6 +22,7 @@ from typing import Any
 from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
 from telethon.errors import RPCError  # type: ignore[import-untyped]
 
+from .fts import INSERT_FTS_SQL, stem_text
 from .sync_worker import (
     _ACCESS_LOST_ERRORS,
     _INSERT_MESSAGE_SQL,
@@ -147,6 +148,10 @@ class DeltaSyncWorker:
         if new_msgs:
             with self._conn:
                 self._conn.executemany(_INSERT_MESSAGE_SQL, new_msgs)
+                self._conn.executemany(
+                    INSERT_FTS_SQL,
+                    ((row[0], row[1], stem_text(row[3])) for row in new_msgs),  # type: ignore[arg-type]
+                )
             logger.debug(
                 "delta dialog_id=%d new_messages=%d", dialog_id, len(new_msgs)
             )
