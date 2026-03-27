@@ -11,7 +11,7 @@ from rich.json import JSON
 from rich.table import Table
 
 from mcp_telegram import server
-from mcp_telegram.cache import TopicMetadataCache
+from mcp_telegram.cache import EntityCache, TopicMetadataCache
 from mcp_telegram.forum_topics import (
     fetch_forum_topics_page,
     load_dialog_topics,
@@ -21,7 +21,14 @@ from mcp_telegram.forum_topics import (
 )
 from mcp_telegram.models import TOPIC_METADATA_TTL_SECONDS
 from mcp_telegram.telegram import create_client
-from mcp_telegram.tools import get_entity_cache
+from xdg_base_dirs import xdg_state_home
+
+
+def get_entity_cache() -> EntityCache:
+    """Return an EntityCache instance from the local state dir (debug CLI only)."""
+    db_dir = xdg_state_home() / "mcp-telegram"
+    db_dir.mkdir(parents=True, exist_ok=True)
+    return EntityCache(db_dir / "entity_cache.db")
 
 logging.basicConfig(level=logging.DEBUG)
 app = typer.Typer()

@@ -2,16 +2,10 @@ from __future__ import annotations
 
 from pydantic import Field
 
-from ..cache import GROUP_TTL, USER_TTL
 from ..errors import (
     ambiguous_user_text,
     fetch_user_info_error_text,
     user_not_found_text,
-)
-from ..resolver import (
-    Candidates,
-    NotFound,
-    resolve,
 )
 from ._base import (
     DaemonNotRunningError,
@@ -19,7 +13,6 @@ from ._base import (
     ToolResult,
     _text_response,
     daemon_connection,
-    get_entity_cache,
     mcp_tool,
 )
 
@@ -42,15 +35,30 @@ class GetUserInfo(ToolArgs):
 
 @mcp_tool("primary")
 async def get_user_info(args: GetUserInfo) -> ToolResult:
-    cache = get_entity_cache()
-    choices = cache.all_names_with_ttl(USER_TTL, GROUP_TTL)
-    normalized = cache.all_names_normalized_with_ttl(USER_TTL, GROUP_TTL)
-    resolve_result = resolve(args.user, choices, cache, normalized_choices=normalized)
-    if isinstance(resolve_result, NotFound):
-        return ToolResult(content=_text_response(user_not_found_text(args.user, retry_tool="GetUserInfo")))
-    if isinstance(resolve_result, Candidates):
+    # Step 1: resolve entity name via daemon
+    try:
+        async with daemon_connection() as conn:
+            resolve_response = await conn.resolve_entity(query=args.user)
+    except DaemonNotRunningError:
+        return ToolResult(content=_text_response(_daemon_not_running_text()))
+
+    if not resolve_response.get("ok"):
+        return ToolResult(content=_text_response(
+            user_not_found_text(args.user, retry_tool="GetUserInfo")
+        ))
+
+    resolve_data = resolve_response.get("data", {})
+    result_type = resolve_data.get("result", "not_found")
+
+    if result_type == "not_found":
+        return ToolResult(content=_text_response(
+            user_not_found_text(args.user, retry_tool="GetUserInfo")
+        ))
+
+    if result_type == "candidates":
+        matches = resolve_data.get("matches", [])
         match_lines = []
-        for match in resolve_result.matches:
+        for match in matches:
             line = f'id={match["entity_id"]} name="{match["display_name"]}" score={match["score"]}'
             if match.get("username"):
                 line += f' @{match["username"]}'
@@ -60,9 +68,12 @@ async def get_user_info(args: GetUserInfo) -> ToolResult:
         return ToolResult(content=_text_response(
             ambiguous_user_text(args.user, match_lines, retry_tool="GetUserInfo"),
         ))
-    entity_id: int = resolve_result.entity_id
-    display_name: str = resolve_result.display_name
 
+    # result_type == "resolved"
+    entity_id: int = resolve_data["entity_id"]
+    display_name: str = resolve_data["display_name"]
+
+    # Step 2: fetch full user info via daemon
     try:
         async with daemon_connection() as conn:
             response = await conn.get_user_info(user_id=entity_id)

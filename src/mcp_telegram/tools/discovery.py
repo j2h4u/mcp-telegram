@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import logging
+
 from pydantic import Field
+
+logger = logging.getLogger(__name__)
 
 from ..errors import (
     no_active_topics_text,
@@ -13,7 +17,6 @@ from ._base import (
     ToolResult,
     _text_response,
     daemon_connection,
-    get_entity_cache,
     mcp_tool,
 )
 
@@ -59,8 +62,7 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
     if not dialogs:
         return ToolResult(content=_text_response(no_dialogs_text()))
 
-    cache = get_entity_cache()
-    batch_entities: list[tuple[int, str, str, str | None]] = []
+    entity_dicts: list[dict] = []
     lines: list[str] = []
 
     for d in dialogs:
@@ -76,12 +78,16 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
             f"last_message_at={last_at} unread={unread} sync_status={sync_status}"
         )
 
-        # Populate local entity cache for future dialog resolution
+        # Upsert entities into daemon for future name resolution
         if isinstance(dialog_id, int) and isinstance(dialog_name, str):
-            batch_entities.append((dialog_id, dialog_type, dialog_name, None))
+            entity_dicts.append({"id": dialog_id, "type": dialog_type, "name": dialog_name, "username": None})
 
-    if batch_entities:
-        cache.upsert_batch(batch_entities)
+    if entity_dicts:
+        try:
+            async with daemon_connection() as upsert_conn:
+                await upsert_conn.upsert_entities(entities=entity_dicts)
+        except Exception:
+            logger.debug("entity_upsert_skipped: daemon not available")
 
     result_text = "\n".join(lines)
     return ToolResult(content=_text_response(result_text), result_count=len(lines))

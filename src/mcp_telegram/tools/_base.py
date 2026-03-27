@@ -15,9 +15,7 @@ from mcp.types import (
     Tool,
 )
 from pydantic import BaseModel, ConfigDict
-from xdg_base_dirs import xdg_state_home
 
-from ..cache import EntityCache
 from ..daemon_client import DaemonConnection, DaemonNotRunningError, daemon_connection
 
 # Fetch reactor names only when total reactions per message are at or below this limit.
@@ -46,6 +44,15 @@ class ToolResult:
     has_filter: bool = False
 
 
+async def _send_telemetry_event(event_dict: dict) -> None:
+    """Fire-and-forget: send telemetry to daemon. Never raises."""
+    try:
+        async with daemon_connection() as conn:
+            await conn.record_telemetry(event=event_dict)
+    except Exception as exc:
+        logger.debug("telemetry_send_failed: %s", exc)
+
+
 def _track_tool_telemetry(tool_name: str):
     """Decorator that wraps an async tool runner with timing + telemetry recording.
 
@@ -55,6 +62,7 @@ def _track_tool_telemetry(tool_name: str):
     def decorator(fn):
         @functools.wraps(fn)
         async def wrapper(args):
+            import asyncio
             logger.debug("method[%s]", tool_name)
             t0 = time.monotonic()
             error_type = None
@@ -68,20 +76,20 @@ def _track_tool_telemetry(tool_name: str):
             finally:
                 duration_ms = (time.monotonic() - t0) * 1000
                 try:
-                    from ..analytics import TelemetryEvent
-                    collector = _get_analytics_collector()
-                    collector.record_event(TelemetryEvent(
-                        tool_name=tool_name,
-                        timestamp=time.time(),
-                        duration_ms=duration_ms,
-                        result_count=tool_result.result_count if tool_result else 0,
-                        has_cursor=tool_result.has_cursor if tool_result else False,
-                        page_depth=tool_result.page_depth if tool_result else 1,
-                        has_filter=tool_result.has_filter if tool_result else False,
-                        error_type=error_type,
-                    ))
+                    asyncio.create_task(
+                        _send_telemetry_event({
+                            "tool_name": tool_name,
+                            "timestamp": time.time(),
+                            "duration_ms": duration_ms,
+                            "result_count": tool_result.result_count if tool_result else 0,
+                            "has_cursor": tool_result.has_cursor if tool_result else False,
+                            "page_depth": tool_result.page_depth if tool_result else 1,
+                            "has_filter": tool_result.has_filter if tool_result else False,
+                            "error_type": error_type,
+                        })
+                    )
                 except Exception as e:
-                    logger.error("Failed to record telemetry for %s: %s", tool_name, e, exc_info=True)
+                    logger.debug("telemetry_send_skipped: %s", e)
         return wrapper
     return decorator
 
@@ -198,28 +206,10 @@ def tool_args(tool: Tool, *args, **kwargs) -> ToolArgs:  # noqa: ANN002, ANN003
 
 
 @functools_cache
-def get_entity_cache() -> EntityCache:
-    """Return the shared EntityCache instance (opened once per process)."""
-    db_dir = xdg_state_home() / "mcp-telegram"
-    db_dir.mkdir(parents=True, exist_ok=True)
-    db_path = db_dir / "entity_cache.db"
-    return EntityCache(db_path)
-
-
-@functools_cache
 def get_prefetch_coordinator():
     """Return the shared PrefetchCoordinator instance (created once per process)."""
     from ..prefetch import PrefetchCoordinator
     return PrefetchCoordinator()
-
-
-def _get_analytics_collector():
-    """Lazy-init analytics collector — creates state dir + DB on first call."""
-    from ..analytics import TelemetryCollector
-    db_dir = xdg_state_home() / "mcp-telegram"
-    db_dir.mkdir(parents=True, exist_ok=True)
-    db_path = db_dir / "analytics.db"
-    return TelemetryCollector.get_instance(db_path)
 
 
 def verify_tool_registry() -> None:

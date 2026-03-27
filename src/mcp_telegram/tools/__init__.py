@@ -8,7 +8,6 @@ from ._base import (
     ToolResult,
     daemon_connection,
     DaemonNotRunningError,
-    get_entity_cache,
     mcp_tool,
     tool_args,
     tool_description,
