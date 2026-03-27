@@ -18,14 +18,20 @@ import pytest
 
 from mcp_telegram.tools import (
     GetMyAccount,
+    GetSyncAlerts,
+    GetSyncStatus,
     ListDialogs,
     ListMessages,
     ListTopics,
+    MarkDialogForSync,
     SearchMessages,
     get_my_account,
+    get_sync_alerts,
+    get_sync_status,
     list_dialogs,
     list_messages,
     list_topics,
+    mark_dialog_for_sync,
     search_messages,
 )
 from mcp_telegram.tools._base import DaemonNotRunningError
@@ -45,6 +51,9 @@ def _make_daemon_conn(response: dict | None = None) -> MagicMock:
     conn.list_dialogs = AsyncMock(return_value=r)
     conn.list_topics = AsyncMock(return_value=r)
     conn.get_me = AsyncMock(return_value=r)
+    conn.mark_dialog_for_sync = AsyncMock(return_value=r)
+    conn.get_sync_status = AsyncMock(return_value=r)
+    conn.get_sync_alerts = AsyncMock(return_value=r)
     return conn
 
 
@@ -64,6 +73,7 @@ class _patch_daemon:
         targets = [
             "mcp_telegram.tools.discovery.daemon_connection",
             "mcp_telegram.tools.reading.daemon_connection",
+            "mcp_telegram.tools.sync.daemon_connection",
         ]
         for target in targets:
             p = patch(target, return_value=_fake_daemon_cm(self._conn))
@@ -89,6 +99,7 @@ class _patch_daemon_not_running:
         targets = [
             "mcp_telegram.tools.discovery.daemon_connection",
             "mcp_telegram.tools.reading.daemon_connection",
+            "mcp_telegram.tools.sync.daemon_connection",
         ]
         for target in targets:
             p = patch(target, return_value=_raise_not_running())
@@ -449,16 +460,134 @@ async def test_get_my_account_daemon_not_running():
 # ---------------------------------------------------------------------------
 
 
-def test_no_telethon_imports_in_discovery_or_reading():
-    """discovery.py and reading.py must not import telethon or telegram module."""
+def test_no_telethon_imports_in_tools():
+    """Tool modules (discovery, reading, sync, _base) must not import telethon."""
     tools_dir = pathlib.Path("src/mcp_telegram/tools")
-    for filename in ["discovery.py", "reading.py", "_base.py"]:
+    for filename in ["discovery.py", "reading.py", "_base.py", "sync.py"]:
         filepath = tools_dir / filename
         content = filepath.read_text()
         assert "from telethon" not in content, f"{filename} imports telethon"
         assert "import telethon" not in content, f"{filename} imports telethon"
         assert "from .. import telegram" not in content, f"{filename} imports telegram module"
         assert "from ..telegram" not in content, f"{filename} imports from telegram"
+
+
+# ---------------------------------------------------------------------------
+# MarkDialogForSync — daemon routing
+# ---------------------------------------------------------------------------
+
+
+async def test_mark_dialog_for_sync_via_daemon():
+    """MarkDialogForSync routes through daemon API."""
+    conn = _make_daemon_conn({"ok": True})
+    with _patch_daemon(conn):
+        result = await mark_dialog_for_sync(MarkDialogForSync(dialog_id=42, enable=True))
+    assert len(result) == 1
+    assert "marked for sync" in result[0].text
+    conn.mark_dialog_for_sync.assert_called_once_with(dialog_id=42, enable=True)
+
+
+async def test_mark_dialog_for_sync_disable():
+    """MarkDialogForSync with enable=False returns unmarked text."""
+    conn = _make_daemon_conn({"ok": True})
+    with _patch_daemon(conn):
+        result = await mark_dialog_for_sync(MarkDialogForSync(dialog_id=42, enable=False))
+    assert "unmarked from sync" in result[0].text
+    conn.mark_dialog_for_sync.assert_called_once_with(dialog_id=42, enable=False)
+
+
+async def test_mark_dialog_for_sync_daemon_not_running():
+    """MarkDialogForSync returns actionable error when daemon is not running."""
+    with _patch_daemon_not_running():
+        result = await mark_dialog_for_sync(MarkDialogForSync(dialog_id=42))
+    assert "not running" in result[0].text.lower() or "mcp-telegram sync" in result[0].text.lower()
+
+
+# ---------------------------------------------------------------------------
+# GetSyncStatus — daemon routing
+# ---------------------------------------------------------------------------
+
+
+async def test_get_sync_status_via_daemon():
+    """GetSyncStatus routes through daemon and formats key=value output."""
+    conn = _make_daemon_conn({
+        "ok": True,
+        "data": {
+            "dialog_id": -1001234567890,
+            "status": "synced",
+            "message_count": 100,
+            "sync_progress": 100,
+            "total_messages": 100,
+            "last_synced_at": 1700000000,
+            "last_event_at": 1700001000,
+            "delete_detection": "reliable (channel)",
+        },
+    })
+    with _patch_daemon(conn):
+        result = await get_sync_status(GetSyncStatus(dialog_id=-1001234567890))
+    text = result[0].text
+    assert "status=synced" in text
+    assert "message_count=100" in text
+    assert "delete_detection=reliable (channel)" in text
+    conn.get_sync_status.assert_called_once_with(dialog_id=-1001234567890)
+
+
+async def test_get_sync_status_daemon_not_running():
+    """GetSyncStatus returns actionable error when daemon is not running."""
+    with _patch_daemon_not_running():
+        result = await get_sync_status(GetSyncStatus(dialog_id=123))
+    assert "not running" in result[0].text.lower() or "mcp-telegram sync" in result[0].text.lower()
+
+
+# ---------------------------------------------------------------------------
+# GetSyncAlerts — daemon routing
+# ---------------------------------------------------------------------------
+
+
+async def test_get_sync_alerts_via_daemon():
+    """GetSyncAlerts routes through daemon and formats alert sections."""
+    conn = _make_daemon_conn({
+        "ok": True,
+        "data": {
+            "deleted_messages": [
+                {"dialog_id": 1, "message_id": 100, "text": "gone", "deleted_at": 1700000500},
+            ],
+            "edits": [
+                {"dialog_id": 1, "message_id": 200, "version": 1,
+                 "old_text": "before", "edit_date": 1700000600},
+            ],
+            "access_lost": [
+                {"dialog_id": 2, "access_lost_at": 1700000700},
+            ],
+        },
+    })
+    with _patch_daemon(conn):
+        result = await get_sync_alerts(GetSyncAlerts(since=0, limit=50))
+    text = result[0].text
+    assert "Deleted Messages" in text
+    assert "gone" in text
+    assert "Edits" in text
+    assert "before" in text
+    assert "Access Lost" in text
+    conn.get_sync_alerts.assert_called_once_with(since=0, limit=50)
+
+
+async def test_get_sync_alerts_empty():
+    """GetSyncAlerts returns 'no alerts' text when all lists empty."""
+    conn = _make_daemon_conn({
+        "ok": True,
+        "data": {"deleted_messages": [], "edits": [], "access_lost": []},
+    })
+    with _patch_daemon(conn):
+        result = await get_sync_alerts(GetSyncAlerts())
+    assert "No sync alerts" in result[0].text
+
+
+async def test_get_sync_alerts_daemon_not_running():
+    """GetSyncAlerts returns actionable error when daemon is not running."""
+    with _patch_daemon_not_running():
+        result = await get_sync_alerts(GetSyncAlerts())
+    assert "not running" in result[0].text.lower() or "mcp-telegram sync" in result[0].text.lower()
 
 
 def test_no_connected_client_in_tools():
