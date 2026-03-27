@@ -172,7 +172,7 @@ class EventHandlerManager:
             )
             self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
 
-        logger.debug("new_message dialog_id=%d message_id=%d", dialog_id, msg.id)
+        logger.info("event_new dialog_id=%d message_id=%d", dialog_id, msg.id)
 
     async def on_message_edited(self, event: Any) -> None:
         """Handle a MessageEdited event: version old text, update messages row.
@@ -207,8 +207,8 @@ class EventHandlerManager:
                     INSERT_FTS_SQL, (dialog_id, message_id, stem_text(new_text))
                 )
                 self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
-                logger.debug(
-                    "message_edited (unknown) dialog_id=%d message_id=%d — inserted",
+                logger.info(
+                    "event_edit_new dialog_id=%d message_id=%d (not in sync.db, inserted)",
                     dialog_id, message_id,
                 )
                 return
@@ -243,8 +243,8 @@ class EventHandlerManager:
             )
             self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
 
-        logger.debug(
-            "message_edited dialog_id=%d message_id=%d version=%d",
+        logger.info(
+            "event_edit dialog_id=%d message_id=%d version=%d",
             dialog_id, message_id, next_ver,
         )
 
@@ -275,8 +275,8 @@ class EventHandlerManager:
                 self._conn.execute(_MARK_DELETED_SQL, (now, dialog_id, msg_id))
             self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
 
-        logger.debug(
-            "message_deleted dialog_id=%d ids=%s", dialog_id, event.deleted_ids
+        logger.info(
+            "event_delete dialog_id=%d ids=%s", dialog_id, event.deleted_ids
         )
 
     # ------------------------------------------------------------------

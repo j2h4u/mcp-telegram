@@ -130,14 +130,35 @@ async def sync_main() -> None:
         last_heartbeat = time.monotonic()
         last_gap_scan = time.monotonic()
 
+        def _log_heartbeat() -> None:
+            """Log heartbeat with sync stats from sync.db."""
+            try:
+                stats = dict(
+                    conn.execute(
+                        "SELECT status, COUNT(*) FROM synced_dialogs GROUP BY status"
+                    ).fetchall()
+                )
+                msg_count = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+            except Exception:
+                stats = {}
+                msg_count = "?"
+            synced = stats.get("synced", 0)
+            syncing = stats.get("syncing", 0)
+            total = synced + syncing + stats.get("not_synced", 0)
+            logger.info(
+                "heartbeat — connected=%s dialogs=%d/%d messages=%s",
+                client.is_connected(), synced, total, msg_count,
+            )
+
         while not shutdown_event.is_set():
             all_synced = await worker.process_one_batch()
+            await asyncio.sleep(0)  # yield to event loop between batches
 
             now_mono = time.monotonic()
 
             # Periodic heartbeat logging and synced_dialogs refresh
             if now_mono - last_heartbeat >= HEARTBEAT_INTERVAL_S:
-                logger.info("heartbeat — connected=%s", client.is_connected())
+                _log_heartbeat()
                 handler_manager.refresh_synced_dialogs()
                 last_heartbeat = now_mono
 
@@ -149,6 +170,7 @@ async def sync_main() -> None:
 
             if all_synced:
                 # D-11: idle mode — wait for HEARTBEAT_INTERVAL_S or shutdown
+                logger.info("sync_idle — all dialogs synced, waiting %ds", HEARTBEAT_INTERVAL_S)
                 try:
                     await asyncio.wait_for(
                         shutdown_event.wait(),
@@ -156,7 +178,7 @@ async def sync_main() -> None:
                     )
                     break  # shutdown requested
                 except asyncio.TimeoutError:
-                    logger.info("heartbeat — connected=%s", client.is_connected())
+                    _log_heartbeat()
                     handler_manager.refresh_synced_dialogs()
                     last_heartbeat = time.monotonic()
 

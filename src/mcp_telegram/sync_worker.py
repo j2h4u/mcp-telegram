@@ -223,8 +223,8 @@ class FullSyncWorker:
         and updates sync_progress atomically.
 
         Returns:
-            True  — all dialogs are synced (idle) or current dialog done.
-            False — more work remains (batch was full, or FloodWait hit).
+            True  — all dialogs are fully synced (idle mode safe).
+            False — more work remains (same dialog or other pending dialogs).
         """
         pending = self._next_pending_dialog()
         if pending is None:
@@ -232,7 +232,10 @@ class FullSyncWorker:
 
         dialog_id, sync_progress = pending
         _, is_done = await self._fetch_batch(dialog_id, sync_progress)
-        return is_done
+        if not is_done:
+            return False  # more batches needed for this dialog
+        # Dialog done — check if more pending dialogs remain
+        return self._next_pending_dialog() is None
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -296,6 +299,10 @@ class FullSyncWorker:
             logger.error(
                 "RPC error dialog_id=%d — skipping: %s", dialog_id, exc
             )
+            with self._conn:
+                self._conn.execute(
+                    _UPDATE_PROGRESS_SQL, (sync_progress, "synced", dialog_id)
+                )
             return sync_progress, True
 
         if not batch:
@@ -304,6 +311,7 @@ class FullSyncWorker:
                 _UPDATE_PROGRESS_SQL, (sync_progress, "synced", dialog_id)
             )
             self._conn.commit()
+            logger.info("sync_done dialog_id=%d status=synced (empty batch)", dialog_id)
             return sync_progress, True
 
         rows = [self._extract_message_row(dialog_id, msg) for msg in batch]
@@ -322,8 +330,8 @@ class FullSyncWorker:
                 _UPDATE_PROGRESS_SQL, (new_progress, new_status, dialog_id)
             )
 
-        logger.debug(
-            "batch dialog_id=%d fetched=%d new_progress=%d done=%s",
+        logger.info(
+            "sync_batch dialog_id=%d fetched=%d progress=%d done=%s",
             dialog_id, len(batch), new_progress, is_done,
         )
         return new_progress, is_done

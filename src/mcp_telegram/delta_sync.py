@@ -152,7 +152,7 @@ class DeltaSyncWorker:
                     INSERT_FTS_SQL,
                     ((row[0], row[1], stem_text(row[3])) for row in new_msgs),  # type: ignore[arg-type]
                 )
-            logger.debug(
+            logger.info(
                 "delta dialog_id=%d new_messages=%d", dialog_id, len(new_msgs)
             )
         return len(new_msgs)
