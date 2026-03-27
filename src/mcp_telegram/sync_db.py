@@ -9,7 +9,7 @@ from pathlib import Path
 
 from xdg_base_dirs import xdg_state_home  # type: ignore[import-error]
 
-_CURRENT_SCHEMA_VERSION = 2
+_CURRENT_SCHEMA_VERSION = 3
 
 logger = logging.getLogger(__name__)
 
@@ -158,6 +158,13 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
         )
         conn.execute(
             "INSERT INTO schema_version VALUES (2, strftime('%s', 'now'))"
+        )
+
+    if current < 3:
+        from .fts import MESSAGES_FTS_DDL
+        conn.execute(MESSAGES_FTS_DDL)
+        conn.execute(
+            "INSERT INTO schema_version VALUES (3, strftime('%s', 'now'))"
         )
 
     conn.commit()

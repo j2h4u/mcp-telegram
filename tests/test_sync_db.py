@@ -231,15 +231,16 @@ def test_schema_v2_migration_adds_access_lost_at(tmp_sync_db_path: Path) -> None
 
 
 def test_schema_migration_idempotent_v2(tmp_sync_db_path: Path) -> None:
-    """Calling ensure_sync_schema() twice produces exactly 2 rows in schema_version (v1 and v2)."""
+    """Calling ensure_sync_schema() twice produces exactly _CURRENT_SCHEMA_VERSION rows in schema_version."""
     ensure_sync_schema(tmp_sync_db_path)
     ensure_sync_schema(tmp_sync_db_path)  # must not raise
     conn = _open_sync_db(tmp_sync_db_path)
     try:
         rows = conn.execute("SELECT * FROM schema_version ORDER BY version").fetchall()
-        assert len(rows) == 2
+        assert len(rows) == _CURRENT_SCHEMA_VERSION
         assert rows[0][0] == 1
         assert rows[1][0] == 2
+        assert rows[2][0] == 3
     finally:
         conn.close()
 
