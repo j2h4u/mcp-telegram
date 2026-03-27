@@ -70,7 +70,13 @@ _UPDATE_LAST_EVENT_SQL = (
     "UPDATE synced_dialogs SET last_event_at=? WHERE dialog_id=?"
 )
 
-_SELECT_SYNCED_DIALOGS_SQL = "SELECT dialog_id FROM synced_dialogs"
+_SELECT_SYNCED_DIALOGS_SQL = (
+    "SELECT dialog_id FROM synced_dialogs WHERE status != 'access_lost'"
+)
+
+_SELECT_SYNCED_ONLY_SQL = (
+    "SELECT dialog_id FROM synced_dialogs WHERE status = 'synced'"
+)
 
 _SELECT_UNDELETED_MESSAGES_SQL = (
     "SELECT message_id FROM messages "
@@ -280,7 +286,7 @@ class EventHandlerManager:
 
         dialog_ids = [
             int(row[0])
-            for row in self._conn.execute(_SELECT_SYNCED_DIALOGS_SQL).fetchall()
+            for row in self._conn.execute(_SELECT_SYNCED_ONLY_SQL).fetchall()
         ]
 
         for dialog_id in dialog_ids:

@@ -9,7 +9,7 @@ from pathlib import Path
 
 from xdg_base_dirs import xdg_state_home  # type: ignore[import-error]
 
-_CURRENT_SCHEMA_VERSION = 1
+_CURRENT_SCHEMA_VERSION = 2
 
 logger = logging.getLogger(__name__)
 
@@ -150,6 +150,14 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
         conn.execute(_MESSAGE_VERSIONS_DDL)
         conn.execute(
             "INSERT INTO schema_version VALUES (1, strftime('%s', 'now'))"
+        )
+
+    if current < 2:
+        conn.execute(
+            "ALTER TABLE synced_dialogs ADD COLUMN access_lost_at INTEGER"
+        )
+        conn.execute(
+            "INSERT INTO schema_version VALUES (2, strftime('%s', 'now'))"
         )
 
     conn.commit()

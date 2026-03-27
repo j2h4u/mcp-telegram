@@ -180,13 +180,20 @@ def test_is_deleted_columns(tmp_sync_db_path: Path) -> None:
 
 
 def test_migration_idempotent(tmp_sync_db_path: Path) -> None:
-    """Calling ensure_sync_schema twice raises no error and produces exactly one schema_version row."""
+    """Calling ensure_sync_schema twice raises no error — second call is a no-op.
+
+    Schema v2 produces 2 rows in schema_version (one per version).
+    Second call to ensure_sync_schema must not add more rows.
+    """
     ensure_sync_schema(tmp_sync_db_path)
     ensure_sync_schema(tmp_sync_db_path)  # second call must be a no-op
     conn = _open_sync_db(tmp_sync_db_path)
     try:
-        rows = conn.execute("SELECT * FROM schema_version").fetchall()
-        assert len(rows) == 1, f"Expected exactly 1 schema_version row, got {len(rows)}"
+        rows = conn.execute("SELECT * FROM schema_version ORDER BY version").fetchall()
+        # Schema v2 has 2 version rows (v1 + v2); second ensure_sync_schema adds 0
+        assert len(rows) == _CURRENT_SCHEMA_VERSION, (
+            f"Expected {_CURRENT_SCHEMA_VERSION} schema_version rows, got {len(rows)}"
+        )
     finally:
         conn.close()
 

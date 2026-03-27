@@ -21,11 +21,20 @@ import asyncio
 import json
 import logging
 import sqlite3
+import time
 from datetime import datetime
 from typing import Any
 
 from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
 from telethon.errors import RPCError  # type: ignore[import-untyped]
+from telethon.errors import (  # type: ignore[import-untyped]
+    ChannelBannedError,
+    ChannelPrivateError,
+    ChatForbiddenError,
+    ChatWriteForbiddenError,
+    UserBannedInChannelError,
+    UserKickedError,
+)
 from telethon.tl import types  # type: ignore[import-untyped]
 
 logger = logging.getLogger(__name__)
@@ -54,6 +63,100 @@ _UPDATE_PROGRESS_SQL = (
 _INSERT_DIALOG_SQL = (
     "INSERT OR IGNORE INTO synced_dialogs (dialog_id, status) VALUES (?, 'syncing')"
 )
+
+_ACCESS_LOST_ERRORS = (
+    ChannelPrivateError,
+    ChatForbiddenError,
+    ChatWriteForbiddenError,
+    UserBannedInChannelError,
+    UserKickedError,
+    ChannelBannedError,
+)
+
+_SET_ACCESS_LOST_SQL = (
+    "UPDATE synced_dialogs "
+    "SET status = 'access_lost', access_lost_at = ? "
+    "WHERE dialog_id = ?"
+)
+
+
+# ---------------------------------------------------------------------------
+# Module-level field extraction helpers (shared with DeltaSyncWorker)
+# ---------------------------------------------------------------------------
+
+
+def serialize_reactions(reactions: Any | None) -> str | None:
+    """Serialize a Telethon MessageReactions object to a JSON string.
+
+    Format: {"emoji": count, ...} or None if no reactions.
+
+    Per RESEARCH.md Open Question 1 recommendation: store a simple
+    JSON summary dict consistent with ReactionMetadataCache in cache.py.
+    """
+    if reactions is None:
+        return None
+    results = getattr(reactions, "results", None)
+    if not results:
+        return None
+    summary: dict[str, int] = {}
+    for item in results:
+        reaction = getattr(item, "reaction", None)
+        emoticon = getattr(reaction, "emoticon", None) if reaction is not None else None
+        count = getattr(item, "count", 0)
+        if emoticon is not None:
+            summary[emoticon] = int(count)
+    return json.dumps(summary) if summary else None
+
+
+def extract_message_row(dialog_id: int, msg: Any) -> tuple[object, ...]:
+    """Extract sync.db messages row tuple from a Telethon message object.
+
+    Mirrors cache.py::MessageCache.store_messages() field extraction
+    adapted for the sync.db schema. Omits edit_date and fetched_at
+    (not in sync.db); adds reactions serialization.
+    """
+    message_id = int(getattr(msg, "id", 0))
+
+    date = getattr(msg, "date", None)
+    sent_at = int(date.timestamp()) if isinstance(date, datetime) else 0
+
+    text = getattr(msg, "message", None)
+
+    sender_id = getattr(msg, "sender_id", None)
+    sender = getattr(msg, "sender", None)
+    sender_first_name = (
+        getattr(sender, "first_name", None) if sender is not None else None
+    )
+
+    media = getattr(msg, "media", None)
+    media_description: str | None = (
+        type(media).__name__ if media is not None else None
+    )
+
+    reply_to = getattr(msg, "reply_to", None)
+    reply_to_msg_id: int | None = None
+    forum_topic_id: int | None = None
+    if reply_to is not None:
+        raw_rtmi = getattr(reply_to, "reply_to_msg_id", None)
+        reply_to_msg_id = int(raw_rtmi) if raw_rtmi is not None else None
+        if getattr(reply_to, "forum_topic", False):
+            top_id = getattr(reply_to, "reply_to_top_id", None)
+            forum_topic_id = int(top_id) if top_id is not None else 1
+
+    reactions = serialize_reactions(getattr(msg, "reactions", None))
+
+    return (
+        dialog_id,
+        message_id,
+        sent_at,
+        text,
+        sender_id,
+        sender_first_name,
+        media_description,
+        reply_to_msg_id,
+        forum_topic_id,
+        reactions,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -179,11 +282,18 @@ class FullSyncWorker:
             except asyncio.TimeoutError:
                 pass  # slept the full duration; retry same batch next call
             return sync_progress, False
+        except _ACCESS_LOST_ERRORS as exc:
+            logger.warning(
+                "access_lost dialog_id=%d — %s: %s", dialog_id, type(exc).__name__, exc
+            )
+            now = int(time.time())
+            with self._conn:
+                self._conn.execute(_SET_ACCESS_LOST_SQL, (now, dialog_id))
+            return sync_progress, True
         except RPCError as exc:
             logger.error(
                 "RPC error dialog_id=%d — skipping: %s", dialog_id, exc
             )
-            # Leave status as-is; Phase 28 handles access_lost transitions
             return sync_progress, True
 
         if not batch:
@@ -217,72 +327,15 @@ class FullSyncWorker:
     ) -> tuple[object, ...]:
         """Extract sync.db messages row tuple from a Telethon message object.
 
-        Mirrors cache.py::MessageCache.store_messages() field extraction
-        (lines 443–491) adapted for the sync.db schema.  Omits edit_date
-        and fetched_at (not in sync.db); adds reactions serialization.
+        Thin wrapper around the module-level extract_message_row() so
+        DeltaSyncWorker can import the shared implementation directly.
         """
-        message_id = int(getattr(msg, "id", 0))
-
-        date = getattr(msg, "date", None)
-        sent_at = int(date.timestamp()) if isinstance(date, datetime) else 0
-
-        text = getattr(msg, "message", None)
-
-        sender_id = getattr(msg, "sender_id", None)
-        sender = getattr(msg, "sender", None)
-        sender_first_name = (
-            getattr(sender, "first_name", None) if sender is not None else None
-        )
-
-        media = getattr(msg, "media", None)
-        media_description: str | None = (
-            type(media).__name__ if media is not None else None
-        )
-
-        reply_to = getattr(msg, "reply_to", None)
-        reply_to_msg_id: int | None = None
-        forum_topic_id: int | None = None
-        if reply_to is not None:
-            raw_rtmi = getattr(reply_to, "reply_to_msg_id", None)
-            reply_to_msg_id = int(raw_rtmi) if raw_rtmi is not None else None
-            if getattr(reply_to, "forum_topic", False):
-                top_id = getattr(reply_to, "reply_to_top_id", None)
-                forum_topic_id = int(top_id) if top_id is not None else 1
-
-        reactions = self._serialize_reactions(getattr(msg, "reactions", None))
-
-        return (
-            dialog_id,
-            message_id,
-            sent_at,
-            text,
-            sender_id,
-            sender_first_name,
-            media_description,
-            reply_to_msg_id,
-            forum_topic_id,
-            reactions,
-        )
+        return extract_message_row(dialog_id, msg)
 
     @staticmethod
     def _serialize_reactions(reactions: Any | None) -> str | None:
         """Serialize a Telethon MessageReactions object to a JSON string.
 
-        Format: {"emoji": count, ...} or None if no reactions.
-
-        Per RESEARCH.md Open Question 1 recommendation: store a simple
-        JSON summary dict consistent with ReactionMetadataCache in cache.py.
+        Thin wrapper around the module-level serialize_reactions().
         """
-        if reactions is None:
-            return None
-        results = getattr(reactions, "results", None)
-        if not results:
-            return None
-        summary: dict[str, int] = {}
-        for item in results:
-            reaction = getattr(item, "reaction", None)
-            emoticon = getattr(reaction, "emoticon", None) if reaction is not None else None
-            count = getattr(item, "count", 0)
-            if emoticon is not None:
-                summary[emoticon] = int(count)
-        return json.dumps(summary) if summary else None
+        return serialize_reactions(reactions)
