@@ -1,15 +1,7 @@
 from __future__ import annotations
 
-import logging
-import time
-from contextlib import asynccontextmanager
-
 from pydantic import Field
-from telethon.tl.functions.messages import GetCommonChatsRequest  # type: ignore[import-untyped]
-from telethon.tl.types import Channel, Chat  # type: ignore[import-untyped]
-from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
-from .. import telegram as _telegram_mod
 from ..cache import GROUP_TTL, USER_TTL
 from ..errors import (
     ambiguous_user_text,
@@ -21,30 +13,22 @@ from ..resolver import (
     NotFound,
     resolve,
 )
-from ._base import ToolArgs, ToolResult, _text_response, get_entity_cache, mcp_tool
+from ._base import (
+    DaemonNotRunningError,
+    ToolArgs,
+    ToolResult,
+    _text_response,
+    daemon_connection,
+    get_entity_cache,
+    mcp_tool,
+)
 
-logger = logging.getLogger(__name__)
 
-
-@asynccontextmanager
-async def _connected_client():
-    """Local direct Telegram connection for tools not yet routed through daemon API."""
-    client = _telegram_mod.create_client()
-    owns_connection = not client.is_connected()
-    if owns_connection:
-        t0 = time.monotonic()
-        await client.connect()
-        logger.debug("tg_connect: %.1fms", (time.monotonic() - t0) * 1000)
-    try:
-        yield client
-    finally:
-        if owns_connection:
-            try:
-                t0 = time.monotonic()
-                await client.disconnect()
-                logger.debug("tg_disconnect: %.1fms", (time.monotonic() - t0) * 1000)
-            except Exception:
-                logger.warning("tg_disconnect failed", exc_info=True)
+def _daemon_not_running_text() -> str:
+    return (
+        "Sync daemon is not running.\n"
+        "Action: Start it with: mcp-telegram sync"
+    )
 
 
 class GetUserInfo(ToolArgs):
@@ -79,38 +63,35 @@ async def get_user_info(args: GetUserInfo) -> ToolResult:
     entity_id: int = resolve_result.entity_id
     display_name: str = resolve_result.display_name
 
-    async with _connected_client() as client:
-        try:
-            user = await client.get_entity(entity_id)
-            common_result = await client(GetCommonChatsRequest(
-                user_id=entity_id,
-                max_id=0,
-                limit=100,
-            ))
-        except Exception as exc:
-            logger.warning("get_user_info entity_id=%r failed: %s", entity_id, exc, exc_info=True)
-            return ToolResult(content=_text_response(fetch_user_info_error_text(args.user, type(exc).__name__)))
+    try:
+        async with daemon_connection() as conn:
+            response = await conn.get_user_info(user_id=entity_id)
+    except DaemonNotRunningError:
+        return ToolResult(content=_text_response(_daemon_not_running_text()))
 
+    if not response.get("ok"):
+        error_code = response.get("error", "")
+        if error_code == "user_not_found":
+            return ToolResult(content=_text_response(
+                fetch_user_info_error_text(args.user, "user not found by daemon")
+            ))
+        error_msg = response.get("message", "Daemon returned an error.")
+        return ToolResult(content=_text_response(f"Error: {error_msg}"))
+
+    data = response.get("data", {})
     name = " ".join(filter(None, [
-        getattr(user, "first_name", None),
-        getattr(user, "last_name", None),
+        data.get("first_name"),
+        data.get("last_name"),
     ]))
-    username = getattr(user, "username", None) or "none"
+    username = data.get("username") or "none"
+    common_chats = data.get("common_chats", [])
     chat_lines = []
-    for chat in common_result.chats:
-        chat_name = getattr(chat, "title", None) or getattr(chat, "first_name", str(chat.id))
-        full_id = get_peer_id(chat)
-        if isinstance(chat, Channel):
-            chat_type = "supergroup" if getattr(chat, "megagroup", False) else "channel"
-        elif isinstance(chat, Chat):
-            chat_type = "group"
-        else:
-            chat_type = "user"
-        chat_lines.append(f"  id={full_id} type={chat_type} name='{chat_name}'")
+    for chat in common_chats:
+        chat_lines.append(f"  id={chat['id']} type={chat['type']} name='{chat['name']}'")
     chats_text = "\n".join(chat_lines) if chat_lines else "  (none)"
     text = (
         f'[resolved: "{display_name}"]\n'
         f"id={entity_id} name='{name}' username=@{username}\n"
-        f"Common chats ({len(common_result.chats)}):\n{chats_text}"
+        f"Common chats ({len(common_chats)}):\n{chats_text}"
     )
     return ToolResult(content=_text_response(text), result_count=1)
