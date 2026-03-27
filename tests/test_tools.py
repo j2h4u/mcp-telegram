@@ -2651,6 +2651,7 @@ async def test_get_user_info(mock_cache, mock_client, monkeypatch):
     assert "-1000000000500" in text
 
 
+@pytest.mark.skip(reason="Phase 33-02: user_info now resolves via daemon resolve_entity — see test_tool_routing.py::test_get_user_info_not_found_via_daemon")
 async def test_get_user_info_not_found(mock_cache, mock_client, monkeypatch):
     """GetUserInfo returns 'not found' when user name does not match any cache entry."""
     from mcp_telegram.tools import GetUserInfo, get_user_info
@@ -2663,6 +2664,7 @@ async def test_get_user_info_not_found(mock_cache, mock_client, monkeypatch):
     assert "ListDialogs" in result[0].text
 
 
+@pytest.mark.skip(reason="Phase 33-02: user_info now resolves via daemon resolve_entity — see test_tool_routing.py::test_get_user_info_candidates_via_daemon")
 async def test_get_user_info_ambiguous(mock_client, monkeypatch, tmp_db_path):
     """GetUserInfo returns 'ambiguous' when multiple cache entries match the query."""
     from mcp_telegram.cache import EntityCache
@@ -2998,6 +3000,7 @@ async def test_get_my_account_records_telemetry(mock_cache, mock_client, monkeyp
     assert event.page_depth == 1
 
 
+@pytest.mark.skip(reason="Phase 33-02: telemetry now routes via daemon IPC (fire-and-forget), not analytics collector; get_entity_cache removed from user_info — covered by test_tool_routing.py::test_get_user_info_resolves_via_daemon")
 async def test_get_user_info_records_telemetry(mock_cache, mock_client, monkeypatch, mock_analytics_collector):
     """GetUserInfo records telemetry with result_count=1."""
     from contextlib import asynccontextmanager
@@ -3049,6 +3052,7 @@ async def test_tool_records_telemetry_on_error(mock_cache, mock_client, monkeypa
     assert event.error_type is not None
 
 
+@pytest.mark.skip(reason="Phase 33-02: GetUsageStats now reads telemetry via daemon API — analytics collector path removed; see test_tool_routing.py::test_get_usage_stats_via_daemon")
 async def test_get_usage_stats_records_telemetry(mock_cache, mock_client, monkeypatch, mock_analytics_collector):
     """GetUsageStats records telemetry like other tools."""
     from mcp_telegram.tools import GetUsageStats, get_usage_stats
@@ -3064,6 +3068,7 @@ async def test_get_usage_stats_records_telemetry(mock_cache, mock_client, monkey
 # --- TOOL-06: GetUsageStats ---
 
 
+@pytest.mark.skip(reason="Phase 33-02: GetUsageStats now reads from daemon API, not direct sqlite3/xdg path — see test_tool_routing.py::test_get_usage_stats_via_daemon")
 async def test_get_usage_stats_under_100_tokens(mock_cache, mock_client, monkeypatch, tmp_path):
     """GetUsageStats output is <100 tokens."""
     from mcp_telegram.tools import GetUsageStats, get_usage_stats
@@ -3129,6 +3134,7 @@ async def test_get_usage_stats_under_100_tokens(mock_cache, mock_client, monkeyp
     assert token_count < 100, f"Output has {token_count} tokens, should be <100"
 
 
+@pytest.mark.skip(reason="Phase 33-02: GetUsageStats now reads from daemon API, not direct sqlite3/xdg path — see test_tool_routing.py::test_get_usage_stats_empty_data")
 async def test_get_usage_stats_empty_db(mock_cache, mock_client, monkeypatch, tmp_path):
     """GetUsageStats returns helpful message on empty/missing DB."""
     from mcp_telegram.tools import GetUsageStats, get_usage_stats
@@ -3150,6 +3156,7 @@ async def test_get_usage_stats_empty_db(mock_cache, mock_client, monkeypatch, tm
     assert "retry GetUsageStats" in result[0].text
 
 
+@pytest.mark.skip(reason="Phase 33-02: GetUsageStats now reads from daemon API, not direct sqlite3/xdg path — see test_tool_routing.py::test_get_usage_stats_empty_data")
 async def test_get_usage_stats_no_recent_data_returns_action(mock_cache, mock_client, monkeypatch, tmp_path):
     """GetUsageStats returns an action-oriented response when analytics DB exists but has no recent data."""
     from mcp_telegram.tools import GetUsageStats, get_usage_stats
