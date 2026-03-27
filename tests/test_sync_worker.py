@@ -631,3 +631,194 @@ async def test_no_pending_dialogs_returns_true(
     result = await worker.process_one_batch()
 
     assert result is True
+
+
+# ---------------------------------------------------------------------------
+# DAEMON-11: Access-loss classification in _fetch_batch
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_access_lost_channel_private(
+    mock_client: MagicMock,
+    sync_db: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """ChannelPrivateError sets status='access_lost' and access_lost_at != NULL, returns True."""
+    from telethon.errors import ChannelPrivateError  # type: ignore[import-untyped]
+
+    dialog_id = 6001
+    sync_db.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, sync_progress) VALUES (?, 'syncing', 0)",
+        (dialog_id,),
+    )
+    sync_db.commit()
+
+    err = ChannelPrivateError(request=None)
+
+    async def _iter_messages(**kwargs: Any):  # noqa: ANN202
+        raise err
+        yield  # make it an async generator
+
+    mock_client.iter_messages = _iter_messages
+
+    worker = make_worker(mock_client, sync_db, shutdown_event)
+    result = await worker.process_one_batch()
+
+    assert result is True
+    row = sync_db.execute(
+        "SELECT status, access_lost_at FROM synced_dialogs WHERE dialog_id=?",
+        (dialog_id,),
+    ).fetchone()
+    assert row is not None
+    assert row[0] == "access_lost"
+    assert row[1] is not None
+
+
+@pytest.mark.asyncio
+async def test_access_lost_chat_forbidden(
+    mock_client: MagicMock,
+    sync_db: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """ChatForbiddenError sets status='access_lost' and access_lost_at != NULL."""
+    from telethon.errors import ChatForbiddenError  # type: ignore[import-untyped]
+
+    dialog_id = 6002
+    sync_db.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, sync_progress) VALUES (?, 'syncing', 0)",
+        (dialog_id,),
+    )
+    sync_db.commit()
+
+    err = ChatForbiddenError(request=None)
+
+    async def _iter_messages(**kwargs: Any):  # noqa: ANN202
+        raise err
+        yield
+
+    mock_client.iter_messages = _iter_messages
+
+    worker = make_worker(mock_client, sync_db, shutdown_event)
+    result = await worker.process_one_batch()
+
+    assert result is True
+    row = sync_db.execute(
+        "SELECT status, access_lost_at FROM synced_dialogs WHERE dialog_id=?",
+        (dialog_id,),
+    ).fetchone()
+    assert row is not None
+    assert row[0] == "access_lost"
+    assert row[1] is not None
+
+
+@pytest.mark.asyncio
+async def test_access_lost_user_banned(
+    mock_client: MagicMock,
+    sync_db: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """UserBannedInChannelError sets status='access_lost' and access_lost_at != NULL."""
+    from telethon.errors import UserBannedInChannelError  # type: ignore[import-untyped]
+
+    dialog_id = 6003
+    sync_db.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, sync_progress) VALUES (?, 'syncing', 0)",
+        (dialog_id,),
+    )
+    sync_db.commit()
+
+    err = UserBannedInChannelError(request=None)
+
+    async def _iter_messages(**kwargs: Any):  # noqa: ANN202
+        raise err
+        yield
+
+    mock_client.iter_messages = _iter_messages
+
+    worker = make_worker(mock_client, sync_db, shutdown_event)
+    result = await worker.process_one_batch()
+
+    assert result is True
+    row = sync_db.execute(
+        "SELECT status, access_lost_at FROM synced_dialogs WHERE dialog_id=?",
+        (dialog_id,),
+    ).fetchone()
+    assert row is not None
+    assert row[0] == "access_lost"
+    assert row[1] is not None
+
+
+@pytest.mark.asyncio
+async def test_access_lost_preserves_messages(
+    mock_client: MagicMock,
+    sync_db: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """After access_lost, messages table rows for dialog still exist (not deleted)."""
+    from telethon.errors import ChannelPrivateError  # type: ignore[import-untyped]
+
+    dialog_id = 6004
+    sync_db.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, sync_progress) VALUES (?, 'syncing', 0)",
+        (dialog_id,),
+    )
+    # Pre-insert messages
+    for msg_id in [10, 20, 30]:
+        sync_db.execute(
+            "INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (?, ?, 1704067200)",
+            (dialog_id, msg_id),
+        )
+    sync_db.commit()
+
+    err = ChannelPrivateError(request=None)
+
+    async def _iter_messages(**kwargs: Any):  # noqa: ANN202
+        raise err
+        yield
+
+    mock_client.iter_messages = _iter_messages
+
+    worker = make_worker(mock_client, sync_db, shutdown_event)
+    await worker.process_one_batch()
+
+    count = sync_db.execute(
+        "SELECT COUNT(*) FROM messages WHERE dialog_id=?", (dialog_id,)
+    ).fetchone()[0]
+    assert count == 3, f"Expected 3 messages preserved, got {count}"
+
+
+@pytest.mark.asyncio
+async def test_generic_rpc_error_still_skips(
+    mock_client: MagicMock,
+    sync_db: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """Non-access-loss RPCError returns (progress, True) without setting access_lost status."""
+    from telethon.errors import RPCError  # type: ignore[import-untyped]
+
+    dialog_id = 6005
+    sync_db.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, sync_progress) VALUES (?, 'syncing', 0)",
+        (dialog_id,),
+    )
+    sync_db.commit()
+
+    err = RPCError(request=None, message="SOME_GENERIC_ERROR", code=400)
+
+    async def _iter_messages(**kwargs: Any):  # noqa: ANN202
+        raise err
+        yield
+
+    mock_client.iter_messages = _iter_messages
+
+    worker = make_worker(mock_client, sync_db, shutdown_event)
+    result = await worker.process_one_batch()
+
+    assert result is True
+    row = sync_db.execute(
+        "SELECT status FROM synced_dialogs WHERE dialog_id=?",
+        (dialog_id,),
+    ).fetchone()
+    assert row is not None
+    assert row[0] != "access_lost", f"Generic RPCError must not set access_lost, got {row[0]}"

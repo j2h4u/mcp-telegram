@@ -654,3 +654,176 @@ def test_refresh_synced_dialogs(
     # After refresh, now present
     manager.refresh_synced_dialogs()
     assert 3001 in manager._synced_dialog_ids
+
+
+# ---------------------------------------------------------------------------
+# DAEMON-11: access_lost filtering — refresh and gap scan
+# ---------------------------------------------------------------------------
+
+
+def test_refresh_excludes_access_lost(
+    mock_client: MagicMock,
+    sync_db: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """Dialog with status='access_lost' is NOT in _synced_dialog_ids after refresh."""
+    # Insert access_lost dialog
+    sync_db.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status) VALUES (9901, 'access_lost')",
+    )
+    # Insert synced dialog (should still appear)
+    sync_db.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status) VALUES (9902, 'synced')",
+    )
+    sync_db.commit()
+
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+    manager.register()
+
+    assert 9901 not in manager._synced_dialog_ids, (
+        "access_lost dialog must be excluded from _synced_dialog_ids"
+    )
+    assert 9902 in manager._synced_dialog_ids, (
+        "synced dialog must remain in _synced_dialog_ids"
+    )
+
+
+def test_refresh_includes_syncing(
+    mock_client: MagicMock,
+    sync_db: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """Dialog with status='syncing' IS in _synced_dialog_ids after refresh (only access_lost excluded)."""
+    sync_db.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status) VALUES (9903, 'syncing')",
+    )
+    sync_db.commit()
+
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+    manager.register()
+
+    assert 9903 in manager._synced_dialog_ids, (
+        "syncing dialog must be included in _synced_dialog_ids"
+    )
+
+
+@pytest.mark.asyncio
+async def test_gap_scan_excludes_syncing_dialogs(
+    mock_client: MagicMock,
+    sync_db: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """Dialog with status='syncing' is NOT scanned by run_dm_gap_scan."""
+    dialog_id = 9910
+    sync_db.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'syncing')",
+        (dialog_id,),
+    )
+    for msg_id in [1, 2, 3]:
+        sync_db.execute(
+            "INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (?, ?, 1000000000)",
+            (dialog_id, msg_id),
+        )
+    sync_db.commit()
+
+    get_messages_calls: list[Any] = []
+
+    async def _get_messages(entity: Any, ids: Any) -> list[Any]:
+        get_messages_calls.append(entity)
+        return []
+
+    mock_client.get_messages = _get_messages
+
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+    manager.register()
+
+    await manager.run_dm_gap_scan()
+
+    assert dialog_id not in get_messages_calls, (
+        f"'syncing' dialog {dialog_id} must not be scanned"
+    )
+
+
+@pytest.mark.asyncio
+async def test_gap_scan_excludes_access_lost_dialogs(
+    mock_client: MagicMock,
+    sync_db: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """Dialog with status='access_lost' is NOT scanned by run_dm_gap_scan."""
+    dialog_id = 9911
+    sync_db.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'access_lost')",
+        (dialog_id,),
+    )
+    for msg_id in [1, 2, 3]:
+        sync_db.execute(
+            "INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (?, ?, 1000000000)",
+            (dialog_id, msg_id),
+        )
+    sync_db.commit()
+
+    get_messages_calls: list[Any] = []
+
+    async def _get_messages(entity: Any, ids: Any) -> list[Any]:
+        get_messages_calls.append(entity)
+        return []
+
+    mock_client.get_messages = _get_messages
+
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+    manager.register()
+
+    await manager.run_dm_gap_scan()
+
+    assert dialog_id not in get_messages_calls, (
+        f"'access_lost' dialog {dialog_id} must not be scanned"
+    )
+
+
+@pytest.mark.asyncio
+async def test_gap_scan_only_synced(
+    mock_client: MagicMock,
+    sync_db: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """Only dialogs with status='synced' are scanned by run_dm_gap_scan."""
+    # synced dialog — should be scanned
+    sync_db.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status) VALUES (9920, 'synced')",
+    )
+    sync_db.execute(
+        "INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (9920, 1, 1000000000)",
+    )
+    # syncing dialog — must NOT be scanned
+    sync_db.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status) VALUES (9921, 'syncing')",
+    )
+    sync_db.execute(
+        "INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (9921, 2, 1000000000)",
+    )
+    # access_lost dialog — must NOT be scanned
+    sync_db.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status) VALUES (9922, 'access_lost')",
+    )
+    sync_db.execute(
+        "INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (9922, 3, 1000000000)",
+    )
+    sync_db.commit()
+
+    scanned: list[Any] = []
+
+    async def _get_messages(entity: Any, ids: Any) -> list[Any]:
+        scanned.append(entity)
+        return [None] * len(ids)  # return Nones (all "deleted") — not relevant to test
+
+    mock_client.get_messages = _get_messages
+
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+    manager.register()
+
+    await manager.run_dm_gap_scan()
+
+    assert 9920 in scanned, "synced dialog 9920 must be scanned"
+    assert 9921 not in scanned, "syncing dialog 9921 must NOT be scanned"
+    assert 9922 not in scanned, "access_lost dialog 9922 must NOT be scanned"

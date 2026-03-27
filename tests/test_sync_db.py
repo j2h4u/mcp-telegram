@@ -73,6 +73,7 @@ def test_synced_dialogs_schema(tmp_sync_db_path: Path) -> None:
             "last_event_at",
             "sync_progress",
             "total_messages",
+            "access_lost_at",
         }
         assert expected == set(columns.keys()), (
             f"Unexpected columns. Got: {set(columns.keys())}, expected: {expected}"
@@ -191,7 +192,7 @@ def test_migration_idempotent(tmp_sync_db_path: Path) -> None:
 
 
 def test_schema_version_value(tmp_sync_db_path: Path) -> None:
-    """After first migration, MAX(version) in schema_version equals _CURRENT_SCHEMA_VERSION (1)."""
+    """After first migration, MAX(version) in schema_version equals _CURRENT_SCHEMA_VERSION (2)."""
     ensure_sync_schema(tmp_sync_db_path)
     conn = _open_sync_db(tmp_sync_db_path)
     try:
@@ -200,6 +201,38 @@ def test_schema_version_value(tmp_sync_db_path: Path) -> None:
         assert int(row[0]) == _CURRENT_SCHEMA_VERSION, (
             f"Expected version {_CURRENT_SCHEMA_VERSION}, got {row[0]}"
         )
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Schema v2: access_lost_at column and migration idempotency
+# ---------------------------------------------------------------------------
+
+
+def test_schema_v2_migration_adds_access_lost_at(tmp_sync_db_path: Path) -> None:
+    """After ensure_sync_schema(), PRAGMA table_info(synced_dialogs) includes access_lost_at INTEGER."""
+    ensure_sync_schema(tmp_sync_db_path)
+    conn = _open_sync_db(tmp_sync_db_path)
+    try:
+        rows = conn.execute("PRAGMA table_info(synced_dialogs)").fetchall()
+        columns = {str(row[1]): row for row in rows}
+        assert "access_lost_at" in columns, f"access_lost_at missing. Got: {set(columns.keys())}"
+        assert columns["access_lost_at"][2] == "INTEGER"
+    finally:
+        conn.close()
+
+
+def test_schema_migration_idempotent_v2(tmp_sync_db_path: Path) -> None:
+    """Calling ensure_sync_schema() twice produces exactly 2 rows in schema_version (v1 and v2)."""
+    ensure_sync_schema(tmp_sync_db_path)
+    ensure_sync_schema(tmp_sync_db_path)  # must not raise
+    conn = _open_sync_db(tmp_sync_db_path)
+    try:
+        rows = conn.execute("SELECT * FROM schema_version ORDER BY version").fetchall()
+        assert len(rows) == 2
+        assert rows[0][0] == 1
+        assert rows[1][0] == 2
     finally:
         conn.close()
 
