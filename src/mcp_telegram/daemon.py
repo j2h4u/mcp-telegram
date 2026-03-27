@@ -46,6 +46,7 @@ from .sync_db import (
     _open_sync_db,
     ensure_sync_schema,
     get_sync_db_path,
+    migrate_legacy_databases,
     register_shutdown_handler,
 )
 from .sync_worker import FullSyncWorker
@@ -77,6 +78,7 @@ async def sync_main() -> None:
     ensure_sync_schema(db_path)
 
     conn = _open_sync_db(db_path)
+    migrate_legacy_databases(conn, db_path.parent)
 
     # Phase 29: One-time FTS backfill for messages without index entries
     backfilled = backfill_fts_index(conn)

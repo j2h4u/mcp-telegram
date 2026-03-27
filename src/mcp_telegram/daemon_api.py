@@ -1,6 +1,6 @@
 """Daemon API server — Unix socket request dispatcher (Plan 29-01, Task 2).
 
-DaemonAPIServer listens on a Unix domain socket and handles ten methods:
+DaemonAPIServer listens on a Unix domain socket and handles fourteen methods:
   - list_messages: read from sync.db (synced dialogs) or Telegram (on-demand)
   - search_messages: FTS5 stemmed full-text search against messages_fts
   - list_dialogs: live dialog list from Telegram enriched with sync_status
@@ -11,6 +11,10 @@ DaemonAPIServer listens on a Unix domain socket and handles ten methods:
   - get_sync_alerts: deleted messages, edit history, access-lost dialogs
   - get_user_info: user profile and common chats (Plan 32-01)
   - list_unread_messages: prioritized unread messages across dialogs (Plan 32-01)
+  - record_telemetry: write telemetry event to sync.db (Plan 33-01)
+  - get_usage_stats: read usage statistics from sync.db (Plan 33-01)
+  - upsert_entities: batch upsert entities into sync.db (Plan 33-01)
+  - resolve_entity: fuzzy entity resolution from sync.db (Plan 33-01)
 
 Protocol: newline-delimited JSON (one request line → one response line).
 
@@ -31,6 +35,7 @@ import asyncio
 import json
 import logging
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any
 
@@ -55,7 +60,15 @@ except ImportError:
     telethon_utils = None  # type: ignore[assignment]
 
 from .budget import allocate_message_budget_proportional, unread_chat_tier
+from .cache import GROUP_TTL, USER_TTL
 from .fts import stem_query
+from .resolver import (
+    Candidates,
+    NotFound,
+    Resolved,
+    latinize,
+    resolve as resolve_entity_sync,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +129,25 @@ _GET_ACCESS_LOST_ALERTS_SQL = (
     "FROM synced_dialogs WHERE status = 'access_lost' AND access_lost_at > ?"
 )
 
+# Entity / telemetry SQL (Plan 33-01)
+_UPSERT_ENTITY_SQL = (
+    "INSERT OR REPLACE INTO entities "
+    "(id, type, name, username, name_normalized, updated_at) "
+    "VALUES (?, ?, ?, ?, ?, ?)"
+)
+_ALL_ENTITY_NAMES_SQL = (
+    "SELECT id, name FROM entities "
+    "WHERE (type = 'user' AND updated_at >= ?) "
+    "OR (type != 'user' AND updated_at >= ?)"
+)
+_ALL_ENTITY_NAMES_NORMALIZED_SQL = (
+    "SELECT id, name_normalized FROM entities "
+    "WHERE name_normalized IS NOT NULL "
+    "AND ((type = 'user' AND updated_at >= ?) "
+    "OR (type != 'user' AND updated_at >= ?))"
+)
+_ENTITY_BY_USERNAME_SQL = "SELECT id, name FROM entities WHERE username = ?"
+
 
 # ---------------------------------------------------------------------------
 # Dialog category helper (used by _list_unread_messages)
@@ -137,6 +169,81 @@ def _classify_dialog_for_unread(dialog: object) -> str:
     if getattr(dialog, "is_channel", False):
         return "channel"
     return "group"
+
+
+# ---------------------------------------------------------------------------
+# Usage stats query (moved from tools/stats.py in Plan 33-01)
+# ---------------------------------------------------------------------------
+
+
+def _query_usage_stats(cursor: sqlite3.Cursor, since: int) -> dict:
+    """Run all analytics queries and return the raw stats dict."""
+    tool_dist = dict(
+        cursor.execute(
+            "SELECT tool_name, COUNT(*) FROM telemetry_events "
+            "WHERE timestamp >= ? GROUP BY tool_name ORDER BY COUNT(*) DESC",
+            (since,),
+        ).fetchall()
+    )
+
+    error_dist = dict(
+        cursor.execute(
+            "SELECT error_type, COUNT(*) FROM telemetry_events "
+            "WHERE timestamp >= ? AND error_type IS NOT NULL "
+            "GROUP BY error_type ORDER BY COUNT(*) DESC",
+            (since,),
+        ).fetchall()
+    )
+
+    max_depth_result = cursor.execute(
+        "SELECT MAX(page_depth) FROM telemetry_events WHERE timestamp >= ?",
+        (since,),
+    ).fetchone()
+    max_depth = (
+        max_depth_result[0]
+        if max_depth_result and max_depth_result[0] is not None
+        else 0
+    )
+
+    filter_count_result = cursor.execute(
+        "SELECT COUNT(*) FROM telemetry_events WHERE timestamp >= ? AND has_filter = 1",
+        (since,),
+    ).fetchone()
+    filter_count = filter_count_result[0] if filter_count_result else 0
+
+    total_calls_result = cursor.execute(
+        "SELECT COUNT(*) FROM telemetry_events WHERE timestamp >= ?",
+        (since,),
+    ).fetchone()
+    total_calls = total_calls_result[0] if total_calls_result else 0
+
+    latencies = cursor.execute(
+        "SELECT duration_ms FROM telemetry_events WHERE timestamp >= ? ORDER BY duration_ms",
+        (since,),
+    ).fetchall()
+
+    latency_median_ms = 0
+    latency_p95_ms = 0
+    if latencies:
+        sorted_latencies = [lat[0] for lat in latencies]
+        latency_median_ms = sorted_latencies[len(sorted_latencies) // 2]
+        p95_idx = int(len(sorted_latencies) * 0.95)
+        latency_p95_ms = (
+            sorted_latencies[p95_idx]
+            if p95_idx < len(sorted_latencies)
+            else sorted_latencies[-1]
+        )
+
+    return {
+        "tool_distribution": tool_dist,
+        "error_distribution": error_dist,
+        "max_page_depth": max_depth,
+        "dialogs_with_deep_scroll": 0,
+        "total_calls": total_calls,
+        "filter_count": filter_count,
+        "latency_median_ms": latency_median_ms,
+        "latency_p95_ms": latency_p95_ms,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -226,6 +333,14 @@ class DaemonAPIServer:
             return await self._get_user_info(req)
         if method == "list_unread_messages":
             return await self._list_unread_messages(req)
+        if method == "record_telemetry":
+            return await self._record_telemetry(req)
+        if method == "get_usage_stats":
+            return await self._get_usage_stats(req)
+        if method == "upsert_entities":
+            return await self._upsert_entities(req)
+        if method == "resolve_entity":
+            return await self._resolve_entity(req)
         return {"ok": False, "error": "unknown_method"}
 
     # ------------------------------------------------------------------
@@ -816,3 +931,137 @@ class DaemonAPIServer:
             groups.append(group)
 
         return {"ok": True, "data": {"groups": groups}}
+
+    # ------------------------------------------------------------------
+    # record_telemetry (Plan 33-01)
+    # ------------------------------------------------------------------
+
+    async def _record_telemetry(self, req: dict) -> dict:
+        """Write a telemetry event row to sync.db telemetry_events table."""
+        event = req.get("event", {})
+        try:
+            self._conn.execute(
+                "INSERT INTO telemetry_events "
+                "(tool_name, timestamp, duration_ms, result_count, "
+                "has_cursor, page_depth, has_filter, error_type) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    event.get("tool_name"),
+                    event.get("timestamp"),
+                    event.get("duration_ms"),
+                    event.get("result_count"),
+                    event.get("has_cursor"),
+                    event.get("page_depth"),
+                    event.get("has_filter"),
+                    event.get("error_type"),
+                ),
+            )
+            self._conn.commit()
+            return {"ok": True}
+        except Exception as exc:
+            logger.error("record_telemetry failed: %s", exc)
+            return {"ok": False, "error": str(exc)}
+
+    # ------------------------------------------------------------------
+    # get_usage_stats (Plan 33-01)
+    # ------------------------------------------------------------------
+
+    async def _get_usage_stats(self, req: dict) -> dict:
+        """Return usage statistics from sync.db telemetry_events."""
+        since: int = req.get("since", int(time.time()) - 30 * 86400)
+        try:
+            stats = _query_usage_stats(self._conn.cursor(), since)
+            return {"ok": True, "data": stats}
+        except Exception as exc:
+            logger.error("get_usage_stats failed: %s", exc)
+            return {"ok": False, "error": str(exc)}
+
+    # ------------------------------------------------------------------
+    # upsert_entities (Plan 33-01)
+    # ------------------------------------------------------------------
+
+    async def _upsert_entities(self, req: dict) -> dict:
+        """Batch upsert entity rows into sync.db entities table."""
+        entities = req.get("entities", [])
+        if not entities:
+            return {"ok": True, "upserted": 0}
+        now = int(time.time())
+        try:
+            self._conn.executemany(
+                _UPSERT_ENTITY_SQL,
+                [
+                    (
+                        e["id"],
+                        e["type"],
+                        e["name"],
+                        e.get("username"),
+                        latinize(e["name"]),
+                        now,
+                    )
+                    for e in entities
+                ],
+            )
+            self._conn.commit()
+            return {"ok": True, "upserted": len(entities)}
+        except Exception as exc:
+            logger.error("upsert_entities failed: %s", exc)
+            return {"ok": False, "error": str(exc)}
+
+    # ------------------------------------------------------------------
+    # resolve_entity (Plan 33-01)
+    # ------------------------------------------------------------------
+
+    async def _resolve_entity(self, req: dict) -> dict:
+        """Fuzzy entity resolution from sync.db entities table."""
+        query: str = req.get("query", "")
+        if not query:
+            return {"ok": False, "error": "missing_query"}
+
+        # @username lookup
+        if query.startswith("@"):
+            username_query = query[1:]
+            row = self._conn.execute(
+                _ENTITY_BY_USERNAME_SQL, (username_query,)
+            ).fetchone()
+            if row:
+                return {
+                    "ok": True,
+                    "data": {
+                        "result": "resolved",
+                        "entity_id": row[0],
+                        "display_name": row[1],
+                    },
+                }
+            return {"ok": True, "data": {"result": "not_found", "query": query}}
+
+        now = int(time.time())
+        choices = dict(
+            self._conn.execute(
+                _ALL_ENTITY_NAMES_SQL, (now - USER_TTL, now - GROUP_TTL)
+            ).fetchall()
+        )
+        normalized = dict(
+            self._conn.execute(
+                _ALL_ENTITY_NAMES_NORMALIZED_SQL, (now - USER_TTL, now - GROUP_TTL)
+            ).fetchall()
+        )
+
+        result = resolve_entity_sync(
+            query, choices, None, normalized_choices=normalized
+        )
+
+        if isinstance(result, Resolved):
+            return {
+                "ok": True,
+                "data": {
+                    "result": "resolved",
+                    "entity_id": result.entity_id,
+                    "display_name": result.display_name,
+                },
+            }
+        if isinstance(result, Candidates):
+            return {
+                "ok": True,
+                "data": {"result": "candidates", "matches": result.matches},
+            }
+        return {"ok": True, "data": {"result": "not_found", "query": query}}

@@ -11,10 +11,11 @@ Error handling:
 - Both raise DaemonNotRunningError with an actionable "mcp-telegram sync" message.
 - EOF on read (daemon closed connection unexpectedly): DaemonNotRunningError.
 
-DaemonConnection provides convenience methods for all ten daemon methods:
+DaemonConnection provides convenience methods for all fourteen daemon methods:
 list_messages, search_messages, list_dialogs, list_topics, get_me,
 mark_dialog_for_sync, get_sync_status, get_sync_alerts,
-get_user_info, list_unread_messages.
+get_user_info, list_unread_messages,
+record_telemetry, get_usage_stats, upsert_entities, resolve_entity.
 list_messages and search_messages accept an optional dialog: str | None
 parameter to support name-based resolution by the daemon.
 """
@@ -206,6 +207,25 @@ class DaemonConnection:
             "limit": limit,
             "group_size_threshold": group_size_threshold,
         })
+
+    async def record_telemetry(self, *, event: dict) -> dict:
+        """Send record_telemetry request (Plan 33-01)."""
+        return await self.request({"method": "record_telemetry", "event": event})
+
+    async def get_usage_stats(self, *, since: int | None = None) -> dict:
+        """Send get_usage_stats request (Plan 33-01)."""
+        payload: dict = {"method": "get_usage_stats"}
+        if since is not None:
+            payload["since"] = since
+        return await self.request(payload)
+
+    async def upsert_entities(self, *, entities: list[dict]) -> dict:
+        """Send upsert_entities request (Plan 33-01)."""
+        return await self.request({"method": "upsert_entities", "entities": entities})
+
+    async def resolve_entity(self, *, query: str) -> dict:
+        """Send resolve_entity request (Plan 33-01)."""
+        return await self.request({"method": "resolve_entity", "query": query})
 
 
 # ---------------------------------------------------------------------------

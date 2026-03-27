@@ -1170,3 +1170,537 @@ async def test_list_unread_messages_dispatch_routing() -> None:
     result = await server._dispatch({"method": "list_unread_messages"})
 
     assert result.get("error") != "unknown_method", "list_unread_messages not routed in _dispatch"
+
+
+# ---------------------------------------------------------------------------
+# Helpers for Plan 33-01 tests (entities + telemetry tables)
+# ---------------------------------------------------------------------------
+
+
+def _make_db_with_entities(*, with_fts: bool = False) -> sqlite3.Connection:
+    """Return an in-memory SQLite connection with sync.db schema + entities + telemetry."""
+    conn = _make_db(with_fts=with_fts)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS entities (
+            id              INTEGER PRIMARY KEY,
+            type            TEXT NOT NULL,
+            name            TEXT NOT NULL,
+            username        TEXT,
+            name_normalized TEXT,
+            updated_at      INTEGER NOT NULL
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_entities_type_updated ON entities(type, updated_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_entities_username ON entities(username)")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS telemetry_events (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            tool_name   TEXT NOT NULL,
+            timestamp   REAL NOT NULL,
+            duration_ms REAL NOT NULL,
+            result_count INTEGER NOT NULL,
+            has_cursor  BOOLEAN NOT NULL,
+            page_depth  INTEGER NOT NULL,
+            has_filter  BOOLEAN NOT NULL,
+            error_type  TEXT
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_telemetry_tool_timestamp ON telemetry_events(tool_name, timestamp)")
+    conn.commit()
+    return conn
+
+
+def _insert_entity(
+    conn: sqlite3.Connection,
+    entity_id: int,
+    entity_type: str = "user",
+    name: str = "Test User",
+    username: str | None = None,
+    name_normalized: str | None = None,
+    updated_at: int | None = None,
+) -> None:
+    import time as _time
+
+    if updated_at is None:
+        updated_at = int(_time.time())
+    conn.execute(
+        "INSERT OR REPLACE INTO entities (id, type, name, username, name_normalized, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (entity_id, entity_type, name, username, name_normalized, updated_at),
+    )
+    conn.commit()
+
+
+def _insert_telemetry(
+    conn: sqlite3.Connection,
+    tool_name: str = "ListDialogs",
+    timestamp: float | None = None,
+    duration_ms: float = 50.0,
+    result_count: int = 10,
+    has_cursor: bool = False,
+    page_depth: int = 1,
+    has_filter: bool = False,
+    error_type: str | None = None,
+) -> None:
+    import time as _time
+
+    if timestamp is None:
+        timestamp = _time.time()
+    conn.execute(
+        "INSERT INTO telemetry_events "
+        "(tool_name, timestamp, duration_ms, result_count, has_cursor, page_depth, has_filter, error_type) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (tool_name, timestamp, duration_ms, result_count, has_cursor, page_depth, has_filter, error_type),
+    )
+    conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# record_telemetry (Plan 33-01)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_record_telemetry_inserts_row() -> None:
+    """record_telemetry inserts a row into telemetry_events with all 8 fields."""
+    conn = _make_db_with_entities()
+    server = make_server(conn)
+    result = await server._dispatch({
+        "method": "record_telemetry",
+        "event": {
+            "tool_name": "ListDialogs",
+            "timestamp": 1700000000.0,
+            "duration_ms": 123.4,
+            "result_count": 5,
+            "has_cursor": False,
+            "page_depth": 1,
+            "has_filter": True,
+            "error_type": None,
+        },
+    })
+    assert result["ok"] is True
+    row = conn.execute("SELECT tool_name, duration_ms, has_filter FROM telemetry_events").fetchone()
+    assert row is not None
+    assert row[0] == "ListDialogs"
+    assert row[1] == 123.4
+    assert row[2] is True or row[2] == 1
+
+
+@pytest.mark.asyncio
+async def test_record_telemetry_returns_ok() -> None:
+    """record_telemetry returns ok=True on success."""
+    conn = _make_db_with_entities()
+    server = make_server(conn)
+    result = await server._record_telemetry({
+        "event": {
+            "tool_name": "SearchMessages",
+            "timestamp": 1700000000.0,
+            "duration_ms": 50.0,
+            "result_count": 0,
+            "has_cursor": False,
+            "page_depth": 1,
+            "has_filter": False,
+            "error_type": "NotFound",
+        },
+    })
+    assert result == {"ok": True}
+
+
+@pytest.mark.asyncio
+async def test_record_telemetry_db_failure() -> None:
+    """record_telemetry returns ok=False on DB failure."""
+    conn = _make_db_with_entities()
+    server = make_server(conn)
+    conn.close()  # force DB failure
+    result = await server._record_telemetry({
+        "event": {"tool_name": "X", "timestamp": 0, "duration_ms": 0, "result_count": 0, "has_cursor": False, "page_depth": 1, "has_filter": False, "error_type": None},
+    })
+    assert result["ok"] is False
+    assert "error" in result
+
+
+# ---------------------------------------------------------------------------
+# get_usage_stats (Plan 33-01)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_usage_stats_returns_stats() -> None:
+    """get_usage_stats returns tool_distribution, total_calls, and latency stats."""
+    conn = _make_db_with_entities()
+    import time as _time
+
+    now = _time.time()
+    _insert_telemetry(conn, tool_name="ListDialogs", timestamp=now, duration_ms=100.0)
+    _insert_telemetry(conn, tool_name="ListDialogs", timestamp=now, duration_ms=200.0)
+    _insert_telemetry(conn, tool_name="SearchMessages", timestamp=now, duration_ms=50.0)
+
+    server = make_server(conn)
+    result = await server._dispatch({"method": "get_usage_stats"})
+    assert result["ok"] is True
+    data = result["data"]
+    assert data["total_calls"] == 3
+    assert data["tool_distribution"]["ListDialogs"] == 2
+    assert data["tool_distribution"]["SearchMessages"] == 1
+
+
+@pytest.mark.asyncio
+async def test_get_usage_stats_empty_table() -> None:
+    """get_usage_stats with empty table returns zeroed stats (not error)."""
+    conn = _make_db_with_entities()
+    server = make_server(conn)
+    result = await server._dispatch({"method": "get_usage_stats"})
+    assert result["ok"] is True
+    data = result["data"]
+    assert data["total_calls"] == 0
+    assert data["tool_distribution"] == {}
+
+
+@pytest.mark.asyncio
+async def test_get_usage_stats_respects_since() -> None:
+    """get_usage_stats respects since parameter — only counts recent rows."""
+    conn = _make_db_with_entities()
+    import time as _time
+
+    old_ts = _time.time() - 90 * 86400  # 90 days ago
+    new_ts = _time.time() - 1  # 1 second ago
+    _insert_telemetry(conn, tool_name="Old", timestamp=old_ts)
+    _insert_telemetry(conn, tool_name="New", timestamp=new_ts)
+
+    server = make_server(conn)
+    since = int(_time.time()) - 7 * 86400  # last 7 days
+    result = await server._dispatch({"method": "get_usage_stats", "since": since})
+    assert result["ok"] is True
+    assert result["data"]["total_calls"] == 1
+    assert "New" in result["data"]["tool_distribution"]
+    assert "Old" not in result["data"]["tool_distribution"]
+
+
+# ---------------------------------------------------------------------------
+# upsert_entities (Plan 33-01)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_upsert_entities_inserts_rows() -> None:
+    """upsert_entities inserts/replaces rows in entities table."""
+    conn = _make_db_with_entities()
+    server = make_server(conn)
+    result = await server._dispatch({
+        "method": "upsert_entities",
+        "entities": [
+            {"id": 100, "type": "user", "name": "Alice", "username": "alice"},
+            {"id": 200, "type": "group", "name": "Dev Chat"},
+        ],
+    })
+    assert result["ok"] is True
+    assert result["upserted"] == 2
+    rows = conn.execute("SELECT id, name FROM entities ORDER BY id").fetchall()
+    assert len(rows) == 2
+    assert rows[0] == (100, "Alice")
+    assert rows[1] == (200, "Dev Chat")
+
+
+@pytest.mark.asyncio
+async def test_upsert_entities_computes_name_normalized() -> None:
+    """upsert_entities computes name_normalized via latinize() for each entity."""
+    conn = _make_db_with_entities()
+    server = make_server(conn)
+    await server._dispatch({
+        "method": "upsert_entities",
+        "entities": [
+            {"id": 300, "type": "user", "name": "Николай"},
+        ],
+    })
+    row = conn.execute("SELECT name_normalized FROM entities WHERE id = 300").fetchone()
+    assert row is not None
+    assert row[0] is not None
+    # latinize("Николай") should produce a Latin string
+    assert row[0] == row[0].lower()
+    assert all(c.isalnum() or c == " " for c in row[0])
+
+
+@pytest.mark.asyncio
+async def test_upsert_entities_empty_list() -> None:
+    """upsert_entities with empty list returns ok=True, upserted=0."""
+    conn = _make_db_with_entities()
+    server = make_server(conn)
+    result = await server._dispatch({"method": "upsert_entities", "entities": []})
+    assert result == {"ok": True, "upserted": 0}
+
+
+@pytest.mark.asyncio
+async def test_upsert_entities_replaces_on_conflict() -> None:
+    """upsert_entities with same id replaces existing row (INSERT OR REPLACE)."""
+    conn = _make_db_with_entities()
+    _insert_entity(conn, 100, name="Old Name")
+    server = make_server(conn)
+    await server._dispatch({
+        "method": "upsert_entities",
+        "entities": [{"id": 100, "type": "user", "name": "New Name"}],
+    })
+    row = conn.execute("SELECT name FROM entities WHERE id = 100").fetchone()
+    assert row[0] == "New Name"
+
+
+# ---------------------------------------------------------------------------
+# resolve_entity (Plan 33-01)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_resolve_entity_exact_name() -> None:
+    """resolve_entity with exact name match returns resolved result."""
+    conn = _make_db_with_entities()
+    import time as _time
+
+    now = int(_time.time())
+    _insert_entity(conn, 101, name="Alice Smith", name_normalized="alice smith", updated_at=now)
+
+    server = make_server(conn)
+    result = await server._dispatch({"method": "resolve_entity", "query": "Alice Smith"})
+    assert result["ok"] is True
+    assert result["data"]["result"] == "resolved"
+    assert result["data"]["entity_id"] == 101
+    assert result["data"]["display_name"] == "Alice Smith"
+
+
+@pytest.mark.asyncio
+async def test_resolve_entity_username_lookup() -> None:
+    """resolve_entity with @username query looks up entities by username column."""
+    conn = _make_db_with_entities()
+    import time as _time
+
+    now = int(_time.time())
+    _insert_entity(conn, 102, name="Bob", username="bobby", updated_at=now)
+
+    server = make_server(conn)
+    result = await server._dispatch({"method": "resolve_entity", "query": "@bobby"})
+    assert result["ok"] is True
+    assert result["data"]["result"] == "resolved"
+    assert result["data"]["entity_id"] == 102
+    assert result["data"]["display_name"] == "Bob"
+
+
+@pytest.mark.asyncio
+async def test_resolve_entity_not_found() -> None:
+    """resolve_entity with no match returns not_found result."""
+    conn = _make_db_with_entities()
+    server = make_server(conn)
+    result = await server._dispatch({"method": "resolve_entity", "query": "Nobody"})
+    assert result["ok"] is True
+    assert result["data"]["result"] == "not_found"
+
+
+@pytest.mark.asyncio
+async def test_resolve_entity_username_not_found() -> None:
+    """resolve_entity with @username that doesn't exist returns not_found."""
+    conn = _make_db_with_entities()
+    server = make_server(conn)
+    result = await server._dispatch({"method": "resolve_entity", "query": "@nobody"})
+    assert result["ok"] is True
+    assert result["data"]["result"] == "not_found"
+
+
+@pytest.mark.asyncio
+async def test_resolve_entity_missing_query() -> None:
+    """resolve_entity with empty query returns ok=False, error=missing_query."""
+    conn = _make_db_with_entities()
+    server = make_server(conn)
+    result = await server._dispatch({"method": "resolve_entity", "query": ""})
+    assert result["ok"] is False
+    assert result["error"] == "missing_query"
+
+
+@pytest.mark.asyncio
+async def test_resolve_entity_fuzzy_candidates() -> None:
+    """resolve_entity with fuzzy match returns candidates list."""
+    conn = _make_db_with_entities()
+    import time as _time
+
+    now = int(_time.time())
+    _insert_entity(conn, 201, name="Alex", name_normalized="alex", entity_type="user", updated_at=now)
+    _insert_entity(conn, 202, name="Alexa", name_normalized="alexa", entity_type="user", updated_at=now)
+
+    server = make_server(conn)
+    result = await server._dispatch({"method": "resolve_entity", "query": "Alex"})
+    assert result["ok"] is True
+    # With two similar single-word matches, resolver returns candidates
+    assert result["data"]["result"] in ("resolved", "candidates")
+
+
+# ---------------------------------------------------------------------------
+# dispatch routing for new methods (Plan 33-01)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dispatch_routes_record_telemetry() -> None:
+    """_dispatch routes 'record_telemetry' correctly."""
+    conn = _make_db_with_entities()
+    server = make_server(conn)
+    result = await server._dispatch({
+        "method": "record_telemetry",
+        "event": {"tool_name": "X", "timestamp": 0, "duration_ms": 0, "result_count": 0, "has_cursor": False, "page_depth": 1, "has_filter": False, "error_type": None},
+    })
+    assert result.get("error") != "unknown_method"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_routes_get_usage_stats() -> None:
+    """_dispatch routes 'get_usage_stats' correctly."""
+    conn = _make_db_with_entities()
+    server = make_server(conn)
+    result = await server._dispatch({"method": "get_usage_stats"})
+    assert result.get("error") != "unknown_method"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_routes_upsert_entities() -> None:
+    """_dispatch routes 'upsert_entities' correctly."""
+    conn = _make_db_with_entities()
+    server = make_server(conn)
+    result = await server._dispatch({"method": "upsert_entities", "entities": []})
+    assert result.get("error") != "unknown_method"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_routes_resolve_entity() -> None:
+    """_dispatch routes 'resolve_entity' correctly."""
+    conn = _make_db_with_entities()
+    server = make_server(conn)
+    result = await server._dispatch({"method": "resolve_entity", "query": "test"})
+    assert result.get("error") != "unknown_method"
+
+
+# ---------------------------------------------------------------------------
+# DaemonConnection convenience wrappers (Plan 33-01)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_daemon_connection_record_telemetry_payload() -> None:
+    """DaemonConnection.record_telemetry sends correct JSON payload."""
+    from mcp_telegram.daemon_client import DaemonConnection
+
+    reader = asyncio.StreamReader()
+    writer = MagicMock()
+
+    sent_data: list[bytes] = []
+    writer.write = lambda data: sent_data.append(data)
+    writer.drain = AsyncMock()
+
+    conn = DaemonConnection(reader, writer)
+
+    # Feed a response so request() completes
+    reader.feed_data(json.dumps({"ok": True}).encode() + b"\n")
+
+    event = {"tool_name": "X", "timestamp": 1.0}
+    await conn.record_telemetry(event=event)
+
+    payload = json.loads(sent_data[0].decode().strip())
+    assert payload["method"] == "record_telemetry"
+    assert payload["event"] == event
+
+
+@pytest.mark.asyncio
+async def test_daemon_connection_get_usage_stats_payload() -> None:
+    """DaemonConnection.get_usage_stats sends correct JSON payload."""
+    from mcp_telegram.daemon_client import DaemonConnection
+
+    reader = asyncio.StreamReader()
+    writer = MagicMock()
+
+    sent_data: list[bytes] = []
+    writer.write = lambda data: sent_data.append(data)
+    writer.drain = AsyncMock()
+
+    conn = DaemonConnection(reader, writer)
+    reader.feed_data(json.dumps({"ok": True, "data": {}}).encode() + b"\n")
+
+    await conn.get_usage_stats()
+
+    payload = json.loads(sent_data[0].decode().strip())
+    assert payload["method"] == "get_usage_stats"
+    assert "since" not in payload  # default: no since param
+
+
+@pytest.mark.asyncio
+async def test_daemon_connection_get_usage_stats_with_since() -> None:
+    """DaemonConnection.get_usage_stats with since sends the parameter."""
+    from mcp_telegram.daemon_client import DaemonConnection
+
+    reader = asyncio.StreamReader()
+    writer = MagicMock()
+
+    sent_data: list[bytes] = []
+    writer.write = lambda data: sent_data.append(data)
+    writer.drain = AsyncMock()
+
+    conn = DaemonConnection(reader, writer)
+    reader.feed_data(json.dumps({"ok": True, "data": {}}).encode() + b"\n")
+
+    await conn.get_usage_stats(since=1000)
+
+    payload = json.loads(sent_data[0].decode().strip())
+    assert payload["since"] == 1000
+
+
+@pytest.mark.asyncio
+async def test_daemon_connection_upsert_entities_payload() -> None:
+    """DaemonConnection.upsert_entities sends correct JSON payload."""
+    from mcp_telegram.daemon_client import DaemonConnection
+
+    reader = asyncio.StreamReader()
+    writer = MagicMock()
+
+    sent_data: list[bytes] = []
+    writer.write = lambda data: sent_data.append(data)
+    writer.drain = AsyncMock()
+
+    conn = DaemonConnection(reader, writer)
+    reader.feed_data(json.dumps({"ok": True, "upserted": 1}).encode() + b"\n")
+
+    entities = [{"id": 1, "type": "user", "name": "A"}]
+    await conn.upsert_entities(entities=entities)
+
+    payload = json.loads(sent_data[0].decode().strip())
+    assert payload["method"] == "upsert_entities"
+    assert payload["entities"] == entities
+
+
+@pytest.mark.asyncio
+async def test_daemon_connection_resolve_entity_payload() -> None:
+    """DaemonConnection.resolve_entity sends correct JSON payload."""
+    from mcp_telegram.daemon_client import DaemonConnection
+
+    reader = asyncio.StreamReader()
+    writer = MagicMock()
+
+    sent_data: list[bytes] = []
+    writer.write = lambda data: sent_data.append(data)
+    writer.drain = AsyncMock()
+
+    conn = DaemonConnection(reader, writer)
+    reader.feed_data(json.dumps({"ok": True, "data": {"result": "not_found"}}).encode() + b"\n")
+
+    await conn.resolve_entity(query="Alice")
+
+    payload = json.loads(sent_data[0].decode().strip())
+    assert payload["method"] == "resolve_entity"
+    assert payload["query"] == "Alice"
+
+
+# ---------------------------------------------------------------------------
+# daemon.py startup wiring (Plan 33-01)
+# ---------------------------------------------------------------------------
+
+
+def test_daemon_imports_migrate_legacy_databases() -> None:
+    """daemon.py imports migrate_legacy_databases from sync_db."""
+    from mcp_telegram import daemon
+    assert hasattr(daemon, "migrate_legacy_databases")
