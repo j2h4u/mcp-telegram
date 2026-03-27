@@ -71,16 +71,56 @@ def _make_db(*, with_fts: bool = False) -> sqlite3.Connection:
         ) WITHOUT ROWID
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS message_versions (
+            dialog_id   INTEGER NOT NULL,
+            message_id  INTEGER NOT NULL,
+            version     INTEGER NOT NULL,
+            old_text    TEXT,
+            edit_date   INTEGER,
+            PRIMARY KEY (dialog_id, message_id, version)
+        ) WITHOUT ROWID
+        """
+    )
     if with_fts:
         conn.execute(MESSAGES_FTS_DDL)
     conn.commit()
     return conn
 
 
-def _insert_synced_dialog(conn: sqlite3.Connection, dialog_id: int, status: str = "synced") -> None:
+def _insert_synced_dialog(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    status: str = "synced",
+    *,
+    last_synced_at: int | None = None,
+    last_event_at: int | None = None,
+    sync_progress: int | None = None,
+    total_messages: int | None = None,
+    access_lost_at: int | None = None,
+) -> None:
     conn.execute(
-        "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, ?)",
-        (dialog_id, status),
+        "INSERT INTO synced_dialogs "
+        "(dialog_id, status, last_synced_at, last_event_at, sync_progress, total_messages, access_lost_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (dialog_id, status, last_synced_at, last_event_at, sync_progress, total_messages, access_lost_at),
+    )
+    conn.commit()
+
+
+def _insert_message_version(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    message_id: int,
+    version: int,
+    old_text: str = "old text",
+    edit_date: int = 1700000000,
+) -> None:
+    conn.execute(
+        "INSERT INTO message_versions (dialog_id, message_id, version, old_text, edit_date) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (dialog_id, message_id, version, old_text, edit_date),
     )
     conn.commit()
 
@@ -533,3 +573,176 @@ async def test_handle_client_round_trip() -> None:
     parsed = json.loads(response_data.decode().strip())
     assert parsed["ok"] is True
     assert parsed["data"]["id"] == 42
+
+
+# ---------------------------------------------------------------------------
+# mark_dialog_for_sync
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_mark_dialog_for_sync_enable() -> None:
+    """mark_dialog_for_sync with enable=True inserts row with status='not_synced'."""
+    conn = _make_db()
+    server = make_server(conn)
+    result = await server._dispatch({"method": "mark_dialog_for_sync", "dialog_id": 42, "enable": True})
+    assert result["ok"] is True
+    row = conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id = 42").fetchone()
+    assert row is not None
+    assert row[0] == "not_synced"
+
+
+@pytest.mark.asyncio
+async def test_mark_dialog_for_sync_ignores_existing() -> None:
+    """mark_dialog_for_sync with enable=True on already-synced dialog does NOT overwrite status."""
+    conn = _make_db()
+    _insert_synced_dialog(conn, 42, status="synced")
+    server = make_server(conn)
+    result = await server._dispatch({"method": "mark_dialog_for_sync", "dialog_id": 42, "enable": True})
+    assert result["ok"] is True
+    row = conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id = 42").fetchone()
+    assert row[0] == "synced"  # NOT overwritten
+
+
+@pytest.mark.asyncio
+async def test_mark_dialog_for_sync_disable() -> None:
+    """mark_dialog_for_sync with enable=False resets status to 'not_synced'."""
+    conn = _make_db()
+    _insert_synced_dialog(conn, 42, status="synced")
+    server = make_server(conn)
+    result = await server._dispatch({"method": "mark_dialog_for_sync", "dialog_id": 42, "enable": False})
+    assert result["ok"] is True
+    row = conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id = 42").fetchone()
+    assert row[0] == "not_synced"
+
+
+# ---------------------------------------------------------------------------
+# get_sync_status
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_sync_status_synced_dialog() -> None:
+    """get_sync_status returns all required fields for a synced dialog."""
+    conn = _make_db()
+    _insert_synced_dialog(
+        conn, -1001234567890, status="synced",
+        last_synced_at=1700000000, last_event_at=1700001000,
+        sync_progress=500, total_messages=500,
+    )
+    _insert_message(conn, -1001234567890, 1, text="msg1")
+    _insert_message(conn, -1001234567890, 2, text="msg2")
+    server = make_server(conn)
+    result = await server._dispatch({"method": "get_sync_status", "dialog_id": -1001234567890})
+    assert result["ok"] is True
+    data = result["data"]
+    assert data["status"] == "synced"
+    assert data["message_count"] == 2
+    assert data["last_synced_at"] == 1700000000
+    assert data["last_event_at"] == 1700001000
+    assert data["delete_detection"] == "reliable (channel)"
+
+
+@pytest.mark.asyncio
+async def test_get_sync_status_dm_delete_detection() -> None:
+    """get_sync_status returns 'best-effort weekly (DM)' delete_detection for positive dialog_id."""
+    conn = _make_db()
+    _insert_synced_dialog(conn, 12345, status="synced")
+    server = make_server(conn)
+    result = await server._dispatch({"method": "get_sync_status", "dialog_id": 12345})
+    assert result["ok"] is True
+    assert result["data"]["delete_detection"] == "best-effort weekly (DM)"
+
+
+@pytest.mark.asyncio
+async def test_get_sync_status_non_synced() -> None:
+    """get_sync_status for non-synced dialog returns status='not_synced' and zero counts."""
+    conn = _make_db()
+    server = make_server(conn)
+    result = await server._dispatch({"method": "get_sync_status", "dialog_id": 99999})
+    assert result["ok"] is True
+    data = result["data"]
+    assert data["status"] == "not_synced"
+    assert data["message_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# get_sync_alerts
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_sync_alerts_deleted_messages() -> None:
+    """get_sync_alerts returns deleted messages with preserved text."""
+    conn = _make_db()
+    _insert_synced_dialog(conn, 1, status="synced")
+    _insert_message(conn, 1, 100, text="deleted msg")
+    conn.execute("UPDATE messages SET is_deleted = 1, deleted_at = 1700000500 WHERE message_id = 100")
+    conn.commit()
+    server = make_server(conn)
+    result = await server._dispatch({"method": "get_sync_alerts", "since": 0, "limit": 50})
+    assert result["ok"] is True
+    deleted = result["data"]["deleted_messages"]
+    assert len(deleted) == 1
+    assert deleted[0]["text"] == "deleted msg"
+    assert deleted[0]["deleted_at"] == 1700000500
+
+
+@pytest.mark.asyncio
+async def test_get_sync_alerts_edits() -> None:
+    """get_sync_alerts returns edit history entries from message_versions."""
+    conn = _make_db()
+    _insert_message_version(conn, 1, 100, version=1, old_text="before edit", edit_date=1700000600)
+    server = make_server(conn)
+    result = await server._dispatch({"method": "get_sync_alerts", "since": 0, "limit": 50})
+    assert result["ok"] is True
+    edits = result["data"]["edits"]
+    assert len(edits) == 1
+    assert edits[0]["old_text"] == "before edit"
+
+
+@pytest.mark.asyncio
+async def test_get_sync_alerts_access_lost() -> None:
+    """get_sync_alerts returns access_lost dialogs."""
+    conn = _make_db()
+    _insert_synced_dialog(conn, 1, status="access_lost", access_lost_at=1700000700)
+    server = make_server(conn)
+    result = await server._dispatch({"method": "get_sync_alerts", "since": 0, "limit": 50})
+    assert result["ok"] is True
+    lost = result["data"]["access_lost"]
+    assert len(lost) == 1
+    assert lost[0]["dialog_id"] == 1
+
+
+@pytest.mark.asyncio
+async def test_get_sync_alerts_since_filters() -> None:
+    """get_sync_alerts respects since parameter — only returns events after the timestamp."""
+    conn = _make_db()
+    _insert_synced_dialog(conn, 1, status="synced")
+    _insert_message(conn, 1, 100, text="old delete")
+    conn.execute("UPDATE messages SET is_deleted = 1, deleted_at = 1700000100 WHERE message_id = 100")
+    _insert_message(conn, 1, 200, text="new delete")
+    conn.execute("UPDATE messages SET is_deleted = 1, deleted_at = 1700000900 WHERE message_id = 200")
+    conn.commit()
+    server = make_server(conn)
+    result = await server._dispatch({"method": "get_sync_alerts", "since": 1700000500, "limit": 50})
+    deleted = result["data"]["deleted_messages"]
+    assert len(deleted) == 1
+    assert deleted[0]["message_id"] == 200
+
+
+@pytest.mark.asyncio
+async def test_get_sync_alerts_respects_limit() -> None:
+    """get_sync_alerts respects the limit parameter for deleted_messages."""
+    conn = _make_db()
+    _insert_synced_dialog(conn, 1, status="synced")
+    for i in range(10):
+        _insert_message(conn, 1, 100 + i, text=f"del {i}")
+        conn.execute(
+            f"UPDATE messages SET is_deleted = 1, deleted_at = {1700000000 + i} "
+            f"WHERE message_id = {100 + i}"
+        )
+    conn.commit()
+    server = make_server(conn)
+    result = await server._dispatch({"method": "get_sync_alerts", "since": 0, "limit": 3})
+    assert len(result["data"]["deleted_messages"]) == 3
