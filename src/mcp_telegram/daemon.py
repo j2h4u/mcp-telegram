@@ -127,11 +127,14 @@ async def sync_main() -> None:
         handler_manager.refresh_synced_dialogs()
 
         # Phase 2 — Tight sync loop with heartbeat (D-10, D-11)
-        last_heartbeat = time.monotonic()
-        last_gap_scan = time.monotonic()
+        sync_start = time.monotonic()
+        last_heartbeat = sync_start
+        last_gap_scan = sync_start
+        prev_msg_count = 0
 
         def _log_heartbeat() -> None:
-            """Log heartbeat with sync stats from sync.db."""
+            """Log heartbeat with sync stats, rate, and ETA from sync.db."""
+            nonlocal prev_msg_count
             try:
                 stats = dict(
                     conn.execute(
@@ -141,13 +144,33 @@ async def sync_main() -> None:
                 msg_count = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
             except Exception:
                 stats = {}
-                msg_count = "?"
+                msg_count = 0
             synced = stats.get("synced", 0)
             syncing = stats.get("syncing", 0)
             total = synced + syncing + stats.get("not_synced", 0)
+
+            elapsed = time.monotonic() - sync_start
+            rate = msg_count / elapsed if elapsed > 0 else 0
+
+            # ETA based on dialog completion rate
+            eta_str = ""
+            if synced > 0 and synced < total:
+                remaining = total - synced
+                secs_per_dialog = elapsed / synced
+                eta_secs = int(remaining * secs_per_dialog)
+                if eta_secs >= 3600:
+                    eta_str = f" eta={eta_secs // 3600}h{(eta_secs % 3600) // 60}m"
+                elif eta_secs >= 60:
+                    eta_str = f" eta={eta_secs // 60}m{eta_secs % 60}s"
+                else:
+                    eta_str = f" eta={eta_secs}s"
+            elif synced >= total:
+                eta_str = " eta=done"
+
+            prev_msg_count = msg_count
             logger.info(
-                "heartbeat — connected=%s dialogs=%d/%d messages=%s",
-                client.is_connected(), synced, total, msg_count,
+                "heartbeat — connected=%s dialogs=%d/%d messages=%d rate=%.0fmsg/s%s",
+                client.is_connected(), synced, total, msg_count, rate, eta_str,
             )
 
         while not shutdown_event.is_set():
