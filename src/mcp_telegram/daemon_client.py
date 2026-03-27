@@ -11,8 +11,9 @@ Error handling:
 - Both raise DaemonNotRunningError with an actionable "mcp-telegram sync" message.
 - EOF on read (daemon closed connection unexpectedly): DaemonNotRunningError.
 
-DaemonConnection provides convenience methods for all five daemon methods:
-list_messages, search_messages, list_dialogs, list_topics, get_me.
+DaemonConnection provides convenience methods for all eight daemon methods:
+list_messages, search_messages, list_dialogs, list_topics, get_me,
+mark_dialog_for_sync, get_sync_status, get_sync_alerts.
 list_messages and search_messages accept an optional dialog: str | None
 parameter to support name-based resolution by the daemon.
 """
@@ -167,6 +168,24 @@ class DaemonConnection:
     async def get_me(self) -> dict:
         """Send get_me request."""
         return await self.request({"method": "get_me"})
+
+    async def mark_dialog_for_sync(self, *, dialog_id: int, enable: bool = True) -> dict:
+        """Send mark_dialog_for_sync request."""
+        return await self.request(
+            {
+                "method": "mark_dialog_for_sync",
+                "dialog_id": dialog_id,
+                "enable": enable,
+            }
+        )
+
+    async def get_sync_status(self, *, dialog_id: int) -> dict:
+        """Send get_sync_status request."""
+        return await self.request({"method": "get_sync_status", "dialog_id": dialog_id})
+
+    async def get_sync_alerts(self, *, since: int = 0, limit: int = 50) -> dict:
+        """Send get_sync_alerts request."""
+        return await self.request({"method": "get_sync_alerts", "since": since, "limit": limit})
 
 
 # ---------------------------------------------------------------------------

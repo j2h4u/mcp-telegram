@@ -79,6 +79,30 @@ _SELECT_FTS_SQL = (
 
 _SELECT_SYNCED_STATUSES_SQL = "SELECT dialog_id, status FROM synced_dialogs"
 
+_MARK_FOR_SYNC_SQL = "INSERT OR IGNORE INTO synced_dialogs (dialog_id, status) VALUES (?, 'not_synced')"
+_UNMARK_SYNC_SQL = "UPDATE synced_dialogs SET status = 'not_synced' WHERE dialog_id = ?"
+
+_GET_SYNC_STATUS_SQL = (
+    "SELECT status, last_synced_at, last_event_at, sync_progress, total_messages, access_lost_at "
+    "FROM synced_dialogs WHERE dialog_id = ?"
+)
+_COUNT_SYNCED_MESSAGES_SQL = "SELECT COUNT(*) FROM messages WHERE dialog_id = ? AND is_deleted = 0"
+
+_GET_DELETED_ALERTS_SQL = (
+    "SELECT dialog_id, message_id, text, deleted_at "
+    "FROM messages WHERE is_deleted = 1 AND deleted_at > ? "
+    "ORDER BY deleted_at DESC LIMIT ?"
+)
+_GET_EDIT_ALERTS_SQL = (
+    "SELECT dialog_id, message_id, version, old_text, edit_date "
+    "FROM message_versions WHERE edit_date > ? "
+    "ORDER BY edit_date DESC LIMIT ?"
+)
+_GET_ACCESS_LOST_ALERTS_SQL = (
+    "SELECT dialog_id, access_lost_at "
+    "FROM synced_dialogs WHERE status = 'access_lost' AND access_lost_at > ?"
+)
+
 
 # ---------------------------------------------------------------------------
 # DaemonAPIServer
@@ -157,6 +181,12 @@ class DaemonAPIServer:
             return await self._list_topics(req)
         if method == "get_me":
             return await self._get_me(req)
+        if method == "mark_dialog_for_sync":
+            return await self._mark_dialog_for_sync(req)
+        if method == "get_sync_status":
+            return await self._get_sync_status(req)
+        if method == "get_sync_alerts":
+            return await self._get_sync_alerts(req)
         return {"ok": False, "error": "unknown_method"}
 
     # ------------------------------------------------------------------
@@ -448,5 +478,126 @@ class DaemonAPIServer:
                 "last_name": me.last_name,
                 "username": me.username,
                 "phone": me.phone,
+            },
+        }
+
+    # ------------------------------------------------------------------
+    # mark_dialog_for_sync
+    # ------------------------------------------------------------------
+
+    async def _mark_dialog_for_sync(self, req: dict) -> dict:
+        """Add or remove a dialog from sync scope in synced_dialogs.
+
+        enable=True: INSERT OR IGNORE with status='not_synced' (daemon picks
+        up the new dialog within one heartbeat interval).
+        enable=False: UPDATE status back to 'not_synced' (pauses syncing,
+        preserves history).
+        """
+        dialog_id: int = req.get("dialog_id", 0)
+        enable: bool = req.get("enable", True)
+        if enable:
+            self._conn.execute(_MARK_FOR_SYNC_SQL, (dialog_id,))
+        else:
+            self._conn.execute(_UNMARK_SYNC_SQL, (dialog_id,))
+        self._conn.commit()
+        return {"ok": True}
+
+    # ------------------------------------------------------------------
+    # get_sync_status
+    # ------------------------------------------------------------------
+
+    async def _get_sync_status(self, req: dict) -> dict:
+        """Return sync status and message statistics for a dialog.
+
+        delete_detection is derived from dialog_id sign:
+        - Negative → channel/supergroup → "reliable (channel)"
+        - Positive → DM/small group → "best-effort weekly (DM)"
+        """
+        dialog_id: int = req.get("dialog_id", 0)
+        row = self._conn.execute(_GET_SYNC_STATUS_SQL, (dialog_id,)).fetchone()
+
+        if row is not None:
+            status: str = row[0]
+            last_synced_at: int | None = row[1]
+            last_event_at: int | None = row[2]
+            sync_progress: int | None = row[3]
+            total_messages: int | None = row[4]
+        else:
+            status = "not_synced"
+            last_synced_at = None
+            last_event_at = None
+            sync_progress = None
+            total_messages = None
+
+        count_row = self._conn.execute(_COUNT_SYNCED_MESSAGES_SQL, (dialog_id,)).fetchone()
+        message_count: int = count_row[0] if count_row is not None else 0
+
+        delete_detection = "reliable (channel)" if dialog_id < 0 else "best-effort weekly (DM)"
+
+        return {
+            "ok": True,
+            "data": {
+                "dialog_id": dialog_id,
+                "status": status,
+                "message_count": message_count,
+                "last_synced_at": last_synced_at,
+                "last_event_at": last_event_at,
+                "sync_progress": sync_progress,
+                "total_messages": total_messages,
+                "delete_detection": delete_detection,
+            },
+        }
+
+    # ------------------------------------------------------------------
+    # get_sync_alerts
+    # ------------------------------------------------------------------
+
+    async def _get_sync_alerts(self, req: dict) -> dict:
+        """Return sync alerts: deleted messages, edit history, access-lost dialogs.
+
+        since: unix timestamp — only return alerts newer than this value (default 0).
+        limit: max items per category (default 50).
+        """
+        since: int = req.get("since", 0)
+        limit: int = req.get("limit", 50)
+
+        deleted_rows = self._conn.execute(_GET_DELETED_ALERTS_SQL, (since, limit)).fetchall()
+        deleted_messages = [
+            {
+                "dialog_id": r[0],
+                "message_id": r[1],
+                "text": r[2],
+                "deleted_at": r[3],
+            }
+            for r in deleted_rows
+        ]
+
+        edit_rows = self._conn.execute(_GET_EDIT_ALERTS_SQL, (since, limit)).fetchall()
+        edits = [
+            {
+                "dialog_id": r[0],
+                "message_id": r[1],
+                "version": r[2],
+                "old_text": r[3],
+                "edit_date": r[4],
+            }
+            for r in edit_rows
+        ]
+
+        access_lost_rows = self._conn.execute(_GET_ACCESS_LOST_ALERTS_SQL, (since,)).fetchall()
+        access_lost = [
+            {
+                "dialog_id": r[0],
+                "access_lost_at": r[1],
+            }
+            for r in access_lost_rows
+        ]
+
+        return {
+            "ok": True,
+            "data": {
+                "deleted_messages": deleted_messages,
+                "edits": edits,
+                "access_lost": access_lost,
             },
         }
