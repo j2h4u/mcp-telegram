@@ -20,17 +20,21 @@ from mcp_telegram.tools import (
     GetMyAccount,
     GetSyncAlerts,
     GetSyncStatus,
+    GetUserInfo,
     ListDialogs,
     ListMessages,
     ListTopics,
+    ListUnreadMessages,
     MarkDialogForSync,
     SearchMessages,
     get_my_account,
     get_sync_alerts,
     get_sync_status,
+    get_user_info,
     list_dialogs,
     list_messages,
     list_topics,
+    list_unread_messages,
     mark_dialog_for_sync,
     search_messages,
 )
@@ -54,6 +58,8 @@ def _make_daemon_conn(response: dict | None = None) -> MagicMock:
     conn.mark_dialog_for_sync = AsyncMock(return_value=r)
     conn.get_sync_status = AsyncMock(return_value=r)
     conn.get_sync_alerts = AsyncMock(return_value=r)
+    conn.get_user_info = AsyncMock(return_value=r)
+    conn.list_unread_messages = AsyncMock(return_value=r)
     return conn
 
 
@@ -74,6 +80,8 @@ class _patch_daemon:
             "mcp_telegram.tools.discovery.daemon_connection",
             "mcp_telegram.tools.reading.daemon_connection",
             "mcp_telegram.tools.sync.daemon_connection",
+            "mcp_telegram.tools.user_info.daemon_connection",
+            "mcp_telegram.tools.unread.daemon_connection",
         ]
         for target in targets:
             p = patch(target, return_value=_fake_daemon_cm(self._conn))
@@ -100,6 +108,8 @@ class _patch_daemon_not_running:
             "mcp_telegram.tools.discovery.daemon_connection",
             "mcp_telegram.tools.reading.daemon_connection",
             "mcp_telegram.tools.sync.daemon_connection",
+            "mcp_telegram.tools.user_info.daemon_connection",
+            "mcp_telegram.tools.unread.daemon_connection",
         ]
         for target in targets:
             p = patch(target, return_value=_raise_not_running())
@@ -461,9 +471,9 @@ async def test_get_my_account_daemon_not_running():
 
 
 def test_no_telethon_imports_in_tools():
-    """Tool modules (discovery, reading, sync, _base) must not import telethon."""
+    """Tool modules must not import telethon."""
     tools_dir = pathlib.Path("src/mcp_telegram/tools")
-    for filename in ["discovery.py", "reading.py", "_base.py", "sync.py"]:
+    for filename in ["discovery.py", "reading.py", "_base.py", "sync.py", "user_info.py", "unread.py"]:
         filepath = tools_dir / filename
         content = filepath.read_text()
         assert "from telethon" not in content, f"{filename} imports telethon"
@@ -591,13 +601,161 @@ async def test_get_sync_alerts_daemon_not_running():
 
 
 def test_no_connected_client_in_tools():
-    """No tools/ file references connected_client (removed in Phase 29)."""
+    """No tools/ file references _connected_client after migration."""
     tools_dir = pathlib.Path("src/mcp_telegram/tools")
     for filepath in tools_dir.glob("*.py"):
-        if filepath.name == "__pycache__":
+        if filepath.name.startswith("__"):
             continue
         content = filepath.read_text()
-        # connected_client should not appear as an import or function reference
-        # (local _connected_client in unread.py/user_info.py is the bridge — not from _base)
-        assert "from ._base import" not in content or "connected_client" not in content.split("from ._base import")[1].split("\n")[0], \
-            f"{filepath.name} imports connected_client from _base"
+        assert "_connected_client" not in content, f"{filepath.name} still references _connected_client"
+
+
+# ---------------------------------------------------------------------------
+# GetUserInfo — daemon routing
+# ---------------------------------------------------------------------------
+
+
+async def test_get_user_info_via_daemon():
+    """GetUserInfo routes through daemon API after entity resolution."""
+    conn = _make_daemon_conn({
+        "ok": True,
+        "data": {
+            "id": 12345,
+            "first_name": "Alice",
+            "last_name": "Smith",
+            "username": "alice",
+            "common_chats": [
+                {"id": -1001234, "name": "Dev Chat", "type": "supergroup"},
+            ],
+        },
+    })
+    mock_cache = MagicMock()
+    mock_cache.all_names_with_ttl.return_value = {"Alice": 12345}
+    mock_cache.all_names_normalized_with_ttl.return_value = {"alice": 12345}
+
+    with _patch_daemon(conn), \
+         patch("mcp_telegram.tools.user_info.get_entity_cache", return_value=mock_cache), \
+         patch("mcp_telegram.tools.user_info.resolve") as mock_resolve:
+        resolved = MagicMock()
+        resolved.entity_id = 12345
+        resolved.display_name = "Alice"
+        # Make isinstance checks for NotFound and Candidates return False
+        from mcp_telegram.resolver import Candidates, NotFound
+        mock_resolve.return_value = resolved
+        result = await get_user_info(GetUserInfo(user="Alice"))
+
+    text = result[0].text
+    assert "Alice" in text
+    assert "12345" in text
+    assert "Dev Chat" in text
+    conn.get_user_info.assert_called_once_with(user_id=12345)
+
+
+async def test_get_user_info_daemon_not_running():
+    """GetUserInfo returns actionable error when daemon is not running."""
+    mock_cache = MagicMock()
+    mock_cache.all_names_with_ttl.return_value = {"Alice": 12345}
+    mock_cache.all_names_normalized_with_ttl.return_value = {"alice": 12345}
+
+    with _patch_daemon_not_running(), \
+         patch("mcp_telegram.tools.user_info.get_entity_cache", return_value=mock_cache), \
+         patch("mcp_telegram.tools.user_info.resolve") as mock_resolve:
+        resolved = MagicMock()
+        resolved.entity_id = 12345
+        resolved.display_name = "Alice"
+        mock_resolve.return_value = resolved
+        result = await get_user_info(GetUserInfo(user="Alice"))
+
+    assert "not running" in result[0].text.lower() or "mcp-telegram sync" in result[0].text.lower()
+
+
+async def test_get_user_info_user_not_found_by_daemon():
+    """GetUserInfo handles user_not_found error from daemon."""
+    conn = _make_daemon_conn({
+        "ok": False,
+        "error": "user_not_found",
+        "message": "User 999 not found",
+    })
+    mock_cache = MagicMock()
+    mock_cache.all_names_with_ttl.return_value = {"Ghost": 999}
+    mock_cache.all_names_normalized_with_ttl.return_value = {"ghost": 999}
+
+    with _patch_daemon(conn), \
+         patch("mcp_telegram.tools.user_info.get_entity_cache", return_value=mock_cache), \
+         patch("mcp_telegram.tools.user_info.resolve") as mock_resolve:
+        resolved = MagicMock()
+        resolved.entity_id = 999
+        resolved.display_name = "Ghost"
+        mock_resolve.return_value = resolved
+        result = await get_user_info(GetUserInfo(user="Ghost"))
+
+    assert "could not fetch" in result[0].text.lower() or "error" in result[0].text.lower()
+
+
+# ---------------------------------------------------------------------------
+# ListUnreadMessages — daemon routing
+# ---------------------------------------------------------------------------
+
+
+async def test_list_unread_messages_via_daemon():
+    """ListUnreadMessages routes through daemon API and formats grouped output."""
+    conn = _make_daemon_conn({
+        "ok": True,
+        "data": {
+            "groups": [
+                {
+                    "dialog_id": 123,
+                    "display_name": "Alice",
+                    "tier": 30,
+                    "category": "user",
+                    "unread_count": 2,
+                    "unread_mentions_count": 0,
+                    "messages": [
+                        {
+                            "message_id": 1,
+                            "sent_at": 1700000000,
+                            "text": "Hello there",
+                            "sender_id": 123,
+                            "sender_first_name": "Alice",
+                        },
+                    ],
+                },
+            ],
+        },
+    })
+    with _patch_daemon(conn):
+        result = await list_unread_messages(ListUnreadMessages())
+
+    text = result[0].text
+    assert "Alice" in text
+    assert "Hello there" in text
+    conn.list_unread_messages.assert_called_once()
+
+
+async def test_list_unread_messages_empty():
+    """ListUnreadMessages returns empty-inbox text when no groups."""
+    conn = _make_daemon_conn({"ok": True, "data": {"groups": []}})
+    with _patch_daemon(conn):
+        result = await list_unread_messages(ListUnreadMessages())
+
+    assert "no unread" in result[0].text.lower() or "непрочитанных" in result[0].text.lower()
+
+
+async def test_list_unread_messages_daemon_not_running():
+    """ListUnreadMessages returns actionable error when daemon is not running."""
+    with _patch_daemon_not_running():
+        result = await list_unread_messages(ListUnreadMessages())
+
+    assert "not running" in result[0].text.lower() or "mcp-telegram sync" in result[0].text.lower()
+
+
+async def test_list_unread_messages_passes_params():
+    """ListUnreadMessages passes scope, limit, group_size_threshold to daemon."""
+    conn = _make_daemon_conn({"ok": True, "data": {"groups": []}})
+    with _patch_daemon(conn):
+        await list_unread_messages(ListUnreadMessages(scope="all", limit=200, group_size_threshold=50))
+
+    call_kwargs = conn.list_unread_messages.call_args[1]
+    assert call_kwargs["scope"] == "all"
+    assert call_kwargs["limit"] == 200
+    assert call_kwargs["group_size_threshold"] == 50

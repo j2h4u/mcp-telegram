@@ -2629,6 +2629,7 @@ async def test_get_me_unauthenticated(mock_client, monkeypatch):
 # --- TOOL-09: GetUserInfo ---
 
 
+@pytest.mark.skip(reason="Phase 32: GetUserInfo now routes through daemon API — see test_tool_routing.py::test_get_user_info_via_daemon")
 async def test_get_user_info(mock_cache, mock_client, monkeypatch):
     """GetUserInfo resolves by name, fetches entity and common chats, returns formatted info."""
     from mcp_telegram.tools import GetUserInfo, get_user_info
@@ -2679,6 +2680,7 @@ async def test_get_user_info_ambiguous(mock_client, monkeypatch, tmp_db_path):
     assert 'id=202' in result[0].text
 
 
+@pytest.mark.skip(reason="Phase 32: GetUserInfo now routes through daemon API — error handling tested in test_tool_routing.py::test_get_user_info_user_not_found_by_daemon")
 async def test_get_user_info_fetch_error_returns_action(mock_cache, mock_client, monkeypatch):
     """GetUserInfo returns an action-oriented response when Telegram fetch fails."""
     from mcp_telegram.tools import GetUserInfo, get_user_info
@@ -2695,6 +2697,7 @@ async def test_get_user_info_fetch_error_returns_action(mock_cache, mock_client,
     assert "Retry GetUserInfo later" in result[0].text
 
 
+@pytest.mark.skip(reason="Phase 32: GetUserInfo now routes through daemon API — see test_tool_routing.py::test_get_user_info_via_daemon")
 async def test_get_user_info_resolver_prefix(mock_cache, mock_client, monkeypatch):
     """GetUserInfo output first line starts with '[resolved: "Иван Петров"]'."""
     from mcp_telegram.tools import GetUserInfo, get_user_info
@@ -2997,22 +3000,30 @@ async def test_get_my_account_records_telemetry(mock_cache, mock_client, monkeyp
 
 async def test_get_user_info_records_telemetry(mock_cache, mock_client, monkeypatch, mock_analytics_collector):
     """GetUserInfo records telemetry with result_count=1."""
+    from contextlib import asynccontextmanager
+    from unittest.mock import AsyncMock, MagicMock, patch
     from mcp_telegram.tools import GetUserInfo, get_user_info
-    from telethon.tl.types import Channel
 
-    user = MagicMock()
-    user.id = 101
-    user.first_name = "Иван"
-    user.last_name = "Петров"
-    user.username = "ivan"
+    daemon_response = {
+        "ok": True,
+        "data": {
+            "id": 101,
+            "first_name": "Иван",
+            "last_name": "Петров",
+            "username": "ivan",
+            "common_chats": [],
+        },
+    }
+    mock_conn = MagicMock()
+    mock_conn.get_user_info = AsyncMock(return_value=daemon_response)
 
-    mock_client.get_entity = AsyncMock(return_value=user)
-    mock_client.return_value = MagicMock(chats=[])
+    @asynccontextmanager
+    async def fake_daemon_cm():
+        yield mock_conn
 
-    monkeypatch.setattr("mcp_telegram.telegram.create_client", lambda: mock_client)
     monkeypatch.setattr("mcp_telegram.tools.user_info.get_entity_cache", lambda: mock_cache)
-
-    await get_user_info(GetUserInfo(user="Иван Петров"))
+    with patch("mcp_telegram.tools.user_info.daemon_connection", return_value=fake_daemon_cm()):
+        await get_user_info(GetUserInfo(user="Иван Петров"))
 
     assert len(mock_analytics_collector) == 1
     event = mock_analytics_collector[0]
@@ -3487,6 +3498,7 @@ def test_get_user_info_primary_tool_direct_user_lookup() -> None:
 # --- ListUnreadMessages tests ---
 
 
+@pytest.mark.skip(reason="Phase 32: ListUnreadMessages now routes through daemon API — see test_tool_routing.py::test_list_unread_messages_empty")
 async def test_list_unread_messages_empty_returns_action(mock_cache, mock_client, monkeypatch):
     """ListUnreadMessages returns helpful empty message when no unread."""
     from mcp_telegram.tools import ListUnreadMessages, list_unread_messages
@@ -3502,6 +3514,7 @@ async def test_list_unread_messages_empty_returns_action(mock_cache, mock_client
     assert "No unread messages" in text
 
 
+@pytest.mark.skip(reason="Phase 32: ListUnreadMessages now routes through daemon API — scope filtering tested in test_daemon_api.py")
 async def test_list_unread_messages_personal_scope_filters_groups(mock_cache, mock_client, monkeypatch):
     """ListUnreadMessages personal scope hides large groups."""
     from mcp_telegram.tools import ListUnreadMessages, list_unread_messages
@@ -3544,6 +3557,7 @@ async def test_list_unread_messages_personal_scope_filters_groups(mock_cache, mo
     assert "Big Group" not in text
 
 
+@pytest.mark.skip(reason="Phase 32: ListUnreadMessages now routes through daemon API — tier ordering tested in test_daemon_api.py")
 async def test_list_unread_messages_mentions_surface_top(mock_cache, mock_client, monkeypatch):
     """ListUnreadMessages surfaces mentions first."""
     from mcp_telegram.tools import ListUnreadMessages, list_unread_messages
@@ -3581,6 +3595,7 @@ async def test_list_unread_messages_mentions_surface_top(mock_cache, mock_client
     assert mentions_idx < no_mentions_idx
 
 
+@pytest.mark.skip(reason="Phase 32: ListUnreadMessages now routes through daemon API — budget allocation tested in test_daemon_api.py")
 async def test_list_unread_messages_budget_allocation(mock_cache, mock_client, monkeypatch):
     """ListUnreadMessages respects message budget and shows '[и ещё N]' marker."""
     from mcp_telegram.tools import ListUnreadMessages, list_unread_messages
@@ -3629,6 +3644,7 @@ async def test_list_unread_messages_budget_allocation(mock_cache, mock_client, m
     assert "[и ещё" in text
 
 
+@pytest.mark.skip(reason="Phase 32: ListUnreadMessages now routes through daemon API — supergroup classification tested in test_daemon_api.py")
 async def test_list_unread_messages_supergroup_shows_message_bodies(mock_cache, mock_client, monkeypatch):
     """Supergroups (megagroups) with is_group=True AND is_channel=True must show message bodies.
 
@@ -3716,6 +3732,7 @@ def test_unread_chat_tier(mentions, category, expected_tier):
 # --- GetUserInfo Channel/Chat classification (M11) ---
 
 
+@pytest.mark.skip(reason="Phase 32: Chat type classification moved to daemon_api.py — see test_daemon_api.py::test_get_user_info_classifies_channel_type")
 async def test_get_user_info_classifies_common_chat_types(mock_cache, mock_client, monkeypatch):
     """GetUserInfo correctly classifies Channel (supergroup) and Chat (group) in common chats."""
     from mcp_telegram.tools import GetUserInfo, get_user_info
