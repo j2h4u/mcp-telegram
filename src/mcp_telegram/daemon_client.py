@@ -1,0 +1,206 @@
+"""DaemonClient — async context manager for MCP tool calls to the sync daemon.
+
+MCP tools use daemon_connection() to send requests over the Unix socket to
+DaemonAPIServer (Plan 29-01, Task 2) and receive JSON responses.
+
+Protocol: newline-delimited JSON.  One request line → one response line.
+
+Error handling:
+- FileNotFoundError: daemon is not running (socket file absent)
+- ConnectionRefusedError: socket file exists but daemon is not listening
+- Both raise DaemonNotRunningError with an actionable "mcp-telegram sync" message.
+- EOF on read (daemon closed connection unexpectedly): DaemonNotRunningError.
+
+DaemonConnection provides convenience methods for all five daemon methods:
+list_messages, search_messages, list_dialogs, list_topics, get_me.
+list_messages and search_messages accept an optional dialog: str | None
+parameter to support name-based resolution by the daemon.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import AsyncIterator
+
+from .daemon_api import get_daemon_socket_path
+
+logger = logging.getLogger(__name__)
+
+__all__ = [
+    "DaemonNotRunningError",
+    "DaemonConnection",
+    "daemon_connection",
+    "get_daemon_socket_path",
+]
+
+
+# ---------------------------------------------------------------------------
+# Error type
+# ---------------------------------------------------------------------------
+
+
+class DaemonNotRunningError(Exception):
+    """Raised when the sync daemon is not reachable via its Unix socket.
+
+    The message is user-facing and includes the command to start the daemon.
+    """
+
+
+# ---------------------------------------------------------------------------
+# Connection class
+# ---------------------------------------------------------------------------
+
+
+class DaemonConnection:
+    """Wraps a asyncio stream pair for JSON-line request/response exchanges."""
+
+    def __init__(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        self._reader = reader
+        self._writer = writer
+
+    async def request(self, payload: dict) -> dict:
+        """Send *payload* as a JSON line, read one JSON response line, return dict.
+
+        Raises DaemonNotRunningError if the daemon closes the connection
+        without sending a response (empty read = EOF).
+        """
+        encoded = json.dumps(payload).encode() + b"\n"
+        self._writer.write(encoded)
+        await self._writer.drain()
+
+        try:
+            line = await self._reader.readline()
+        except (ConnectionResetError, BrokenPipeError, OSError) as exc:
+            raise DaemonNotRunningError(
+                "Sync daemon closed the connection unexpectedly. "
+                "Restart it with: mcp-telegram sync"
+            ) from exc
+
+        if not line:
+            raise DaemonNotRunningError(
+                "Sync daemon closed the connection unexpectedly. "
+                "Restart it with: mcp-telegram sync"
+            )
+        return json.loads(line.decode())
+
+    # ------------------------------------------------------------------
+    # Convenience wrappers for the five daemon methods
+    # ------------------------------------------------------------------
+
+    async def list_messages(
+        self,
+        *,
+        dialog_id: int = 0,
+        dialog: str | None = None,
+        limit: int = 50,
+        navigation: str | None = None,
+    ) -> dict:
+        """Send list_messages request. Accepts dialog name or numeric id."""
+        return await self.request(
+            {
+                "method": "list_messages",
+                "dialog_id": dialog_id,
+                "dialog": dialog,
+                "limit": limit,
+                "navigation": navigation,
+            }
+        )
+
+    async def search_messages(
+        self,
+        *,
+        dialog_id: int = 0,
+        dialog: str | None = None,
+        query: str,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> dict:
+        """Send search_messages request. Accepts dialog name or numeric id."""
+        return await self.request(
+            {
+                "method": "search_messages",
+                "dialog_id": dialog_id,
+                "dialog": dialog,
+                "query": query,
+                "limit": limit,
+                "offset": offset,
+            }
+        )
+
+    async def list_dialogs(
+        self,
+        *,
+        exclude_archived: bool = False,
+        ignore_pinned: bool = False,
+    ) -> dict:
+        """Send list_dialogs request."""
+        return await self.request(
+            {
+                "method": "list_dialogs",
+                "exclude_archived": exclude_archived,
+                "ignore_pinned": ignore_pinned,
+            }
+        )
+
+    async def list_topics(
+        self,
+        *,
+        dialog_id: int = 0,
+        dialog: str | None = None,
+    ) -> dict:
+        """Send list_topics request. Accepts dialog name or numeric id."""
+        return await self.request(
+            {
+                "method": "list_topics",
+                "dialog_id": dialog_id,
+                "dialog": dialog,
+            }
+        )
+
+    async def get_me(self) -> dict:
+        """Send get_me request."""
+        return await self.request({"method": "get_me"})
+
+
+# ---------------------------------------------------------------------------
+# Context manager
+# ---------------------------------------------------------------------------
+
+
+@asynccontextmanager
+async def daemon_connection() -> AsyncIterator[DaemonConnection]:
+    """Open a Unix socket connection to the sync daemon.
+
+    Yields a DaemonConnection ready for request/response exchanges.
+
+    Raises DaemonNotRunningError with an actionable message when:
+    - The socket file is absent (daemon not started)
+    - The connection is refused (socket exists but daemon crashed)
+    """
+    socket_path = get_daemon_socket_path()
+    reader: asyncio.StreamReader | None = None
+    writer: asyncio.StreamWriter | None = None
+    try:
+        reader, writer = await asyncio.open_unix_connection(str(socket_path))
+    except (FileNotFoundError, ConnectionRefusedError) as exc:
+        raise DaemonNotRunningError(
+            "Sync daemon is not running. "
+            "Start it with: mcp-telegram sync"
+        ) from exc
+
+    try:
+        yield DaemonConnection(reader, writer)
+    finally:
+        if writer is not None:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
