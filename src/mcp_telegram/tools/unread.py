@@ -1,13 +1,40 @@
 from __future__ import annotations
 
+import logging
+import time
 import typing as t
+from contextlib import asynccontextmanager
 
 from pydantic import Field
 
+from .. import telegram as _telegram_mod
 from ..capability_unread import execute_unread_messages_capability
 from ..errors import no_unread_all_text, no_unread_personal_text
 from ..formatter import format_unread_messages_grouped
-from ._base import ToolArgs, ToolResult, _text_response, connected_client, get_entity_cache, mcp_tool
+from ._base import ToolArgs, ToolResult, _text_response, get_entity_cache, mcp_tool
+
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def _connected_client():
+    """Local direct Telegram connection for tools not yet routed through daemon API."""
+    client = _telegram_mod.create_client()
+    owns_connection = not client.is_connected()
+    if owns_connection:
+        t0 = time.monotonic()
+        await client.connect()
+        logger.debug("tg_connect: %.1fms", (time.monotonic() - t0) * 1000)
+    try:
+        yield client
+    finally:
+        if owns_connection:
+            try:
+                t0 = time.monotonic()
+                await client.disconnect()
+                logger.debug("tg_disconnect: %.1fms", (time.monotonic() - t0) * 1000)
+            except Exception:
+                logger.warning("tg_disconnect failed", exc_info=True)
 
 
 class ListUnreadMessages(ToolArgs):
@@ -44,7 +71,7 @@ class ListUnreadMessages(ToolArgs):
 async def list_unread_messages(args: ListUnreadMessages) -> ToolResult:
     cache = get_entity_cache()
 
-    async with connected_client() as client:
+    async with _connected_client() as client:
         execution = await execute_unread_messages_capability(
             client,
             cache=cache,

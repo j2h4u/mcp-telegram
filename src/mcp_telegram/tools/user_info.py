@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import logging
+import time
+from contextlib import asynccontextmanager
 
 from pydantic import Field
 from telethon.tl.functions.messages import GetCommonChatsRequest  # type: ignore[import-untyped]
 from telethon.tl.types import Channel, Chat  # type: ignore[import-untyped]
 from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
+from .. import telegram as _telegram_mod
 from ..cache import GROUP_TTL, USER_TTL
 from ..errors import (
     ambiguous_user_text,
@@ -18,9 +21,30 @@ from ..resolver import (
     NotFound,
     resolve,
 )
-from ._base import ToolArgs, ToolResult, _text_response, connected_client, get_entity_cache, mcp_tool
+from ._base import ToolArgs, ToolResult, _text_response, get_entity_cache, mcp_tool
 
 logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def _connected_client():
+    """Local direct Telegram connection for tools not yet routed through daemon API."""
+    client = _telegram_mod.create_client()
+    owns_connection = not client.is_connected()
+    if owns_connection:
+        t0 = time.monotonic()
+        await client.connect()
+        logger.debug("tg_connect: %.1fms", (time.monotonic() - t0) * 1000)
+    try:
+        yield client
+    finally:
+        if owns_connection:
+            try:
+                t0 = time.monotonic()
+                await client.disconnect()
+                logger.debug("tg_disconnect: %.1fms", (time.monotonic() - t0) * 1000)
+            except Exception:
+                logger.warning("tg_disconnect failed", exc_info=True)
 
 
 class GetUserInfo(ToolArgs):
@@ -55,7 +79,7 @@ async def get_user_info(args: GetUserInfo) -> ToolResult:
     entity_id: int = resolve_result.entity_id
     display_name: str = resolve_result.display_name
 
-    async with connected_client() as client:
+    async with _connected_client() as client:
         try:
             user = await client.get_entity(entity_id)
             common_result = await client(GetCommonChatsRequest(

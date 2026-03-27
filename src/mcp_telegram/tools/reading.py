@@ -1,13 +1,105 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from pydantic import Field, model_validator
 
-from .. import capabilities
-from ..capabilities import ExactTargetHints
-from ..errors import search_no_hits_text
-from ..formatter import format_messages
+from ..errors import dialog_not_found_text, search_no_hits_text
 from ..resolver import parse_exact_dialog_id
-from ._base import REACTION_NAMES_THRESHOLD, ToolArgs, ToolResult, _resolve_dialog, _text_response, connected_client, get_entity_cache, get_prefetch_coordinator, mcp_tool
+from ._base import (
+    DaemonNotRunningError,
+    ToolArgs,
+    ToolResult,
+    _text_response,
+    daemon_connection,
+    mcp_tool,
+)
+
+# ---------------------------------------------------------------------------
+# Thin adapter: daemon row dict → MessageLike-compatible object
+# ---------------------------------------------------------------------------
+
+
+class _DaemonMessage:
+    """Lightweight MessageLike adapter for daemon API row dicts.
+
+    format_messages() accesses: .id, .date, .message, .sender, .reply_to,
+    .reactions, .media, and optionally .edit_date.
+    """
+
+    __slots__ = (
+        "id", "date", "message", "sender", "reply_to", "reactions", "media",
+        "edit_date",
+    )
+
+    def __init__(self, row: dict) -> None:
+        self.id: int = row["message_id"]
+        sent_at = row.get("sent_at") or 0
+        self.date = datetime.fromtimestamp(int(sent_at), tz=timezone.utc)
+        self.message: str | None = row.get("text")
+        sender_name = row.get("sender_first_name")
+        self.sender = _Sender(sender_name) if sender_name else None
+        reply_id = row.get("reply_to_msg_id")
+        self.reply_to = _ReplyHeader(reply_id) if reply_id else None
+        self.reactions = None  # reactions are pre-formatted strings in sync.db
+        media_desc = row.get("media_description")
+        self.media = _MediaPlaceholder(media_desc) if media_desc else None
+        self.edit_date = None  # edit tracking not yet surfaced per-row
+
+
+class _Sender:
+    __slots__ = ("first_name",)
+
+    def __init__(self, name: str | None) -> None:
+        self.first_name = name
+
+
+class _ReplyHeader:
+    __slots__ = ("reply_to_msg_id",)
+
+    def __init__(self, msg_id: int | None) -> None:
+        self.reply_to_msg_id = msg_id
+
+
+class _MediaPlaceholder:
+    """Wraps a pre-formatted media description string from sync.db."""
+
+    __slots__ = ("_description",)
+
+    def __init__(self, description: str) -> None:
+        self._description = description
+
+    def __str__(self) -> str:
+        return self._description
+
+
+# ---------------------------------------------------------------------------
+# format_messages adapter for daemon data
+# ---------------------------------------------------------------------------
+
+
+def _format_daemon_messages(rows: list[dict]) -> str:
+    """Format daemon row dicts into human-readable message text.
+
+    Produces the same HH:mm Name: text format as format_messages(),
+    but handles pre-formatted media descriptions and skips Telethon-specific
+    protocol details that don't apply to daemon rows.
+    """
+    if not rows:
+        return ""
+
+    messages = [_DaemonMessage(r) for r in rows]
+
+    # Build reply map from rows available in this page
+    reply_map: dict[int, _DaemonMessage] = {m.id: m for m in messages}
+
+    from ..formatter import format_messages
+    return format_messages(messages, reply_map=reply_map)  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# Tool: ListMessages
+# ---------------------------------------------------------------------------
 
 
 class ListMessages(ToolArgs):
@@ -98,67 +190,70 @@ async def list_messages(args: ListMessages) -> ToolResult:
     has_filter = bool(args.sender or args.topic or args.exact_topic_id is not None or args.unread)
     has_cursor = args.navigation is not None and args.navigation not in {"newest", "oldest"}
 
-    cache = get_entity_cache()
-    exact = ExactTargetHints(
-        dialog_id=args.exact_dialog_id,
-        topic_id=args.exact_topic_id,
-    ) if args.exact_dialog_id is not None or args.exact_topic_id is not None else None
+    # Resolve dialog_id locally if possible (numeric string / @username / entity cache)
+    dialog_id: int | None = args.exact_dialog_id
+    if dialog_id is None and args.dialog is not None:
+        exact_id = parse_exact_dialog_id(args.dialog)
+        if exact_id is not None:
+            dialog_id = exact_id
+        # If still None, dialog name goes to daemon for server-side resolution
 
-    async with connected_client() as client:
-        history_execution = await capabilities.execute_history_read_capability(
-            client,
-            cache=cache,
-            dialog_query=args.dialog,
-            limit=args.limit,
-            navigation=args.navigation,
-            sender_query=args.sender,
-            topic_query=args.topic,
-            unread=args.unread,
-            retry_tool="ListMessages",
-            resolve_dialog=_resolve_dialog,
+    try:
+        async with daemon_connection() as conn:
+            if dialog_id is not None and dialog_id != 0:
+                response = await conn.list_messages(
+                    dialog_id=dialog_id,
+                    limit=args.limit,
+                    navigation=args.navigation,
+                )
+            else:
+                # Daemon resolves dialog name via Telegram
+                response = await conn.list_messages(
+                    dialog=args.dialog,
+                    limit=args.limit,
+                    navigation=args.navigation,
+                )
+    except DaemonNotRunningError as e:
+        return ToolResult(content=_text_response(str(e)))
 
-            reaction_names_threshold=REACTION_NAMES_THRESHOLD,
-            load_topics=capabilities.load_dialog_topics,
-            fetch_topic_messages_fn=capabilities.fetch_topic_messages,
-            refresh_topic_by_id_fn=capabilities.refresh_topic_by_id,
-            exact=exact,
-            prefetch_coordinator=get_prefetch_coordinator(),
+    if not response.get("ok"):
+        error = response.get("error", "unknown")
+        message = response.get("message", "")
+        if error == "dialog_not_found":
+            dialog_label = str(dialog_id) if dialog_id else (args.dialog or "")
+            return ToolResult(
+                content=_text_response(dialog_not_found_text(dialog_label, retry_tool="ListMessages")),
+                has_filter=has_filter,
+                has_cursor=has_cursor,
+            )
+        return ToolResult(
+            content=_text_response(f"Error: {error}: {message}"),
+            has_filter=has_filter,
+            has_cursor=has_cursor,
         )
-    if isinstance(
-        history_execution,
-        (
-            capabilities.DialogTargetFailure,
-            capabilities.ForumTopicFailure,
-            capabilities.MessageReadFailure,
-            capabilities.NavigationFailure,
-        ),
-    ):
-        return ToolResult(content=_text_response(history_execution.text), has_filter=has_filter, has_cursor=has_cursor)
 
-    messages = list(history_execution.messages)
-    text = format_messages(
-        messages,
-        reply_map=history_execution.reply_map,
-        reaction_names_map=history_execution.reaction_names_map,
-        topic_name_getter=history_execution.topic_name_getter,
-    )
+    data = response.get("data", {})
+    rows = data.get("messages", [])
+    source = data.get("source", "unknown")
+
+    text = _format_daemon_messages(rows)
     if not text:
-        text = capabilities.topic_empty_state_text(unread=args.unread)
+        text = "No messages found."
 
-    topic_prefix = (
-        f"[topic: {history_execution.topic_name}]\n"
-        if history_execution.topic_name
-        else ""
-    )
-    result_text = history_execution.resolve_prefix + topic_prefix + text
-    if history_execution.navigation is not None:
-        result_text += f"\n\nnext_navigation: {history_execution.navigation.token}"
+    source_note = f"[source: {source}]\n" if source else ""
+    result_text = source_note + text
+
     return ToolResult(
         content=_text_response(result_text),
-        result_count=len(messages),
+        result_count=len(rows),
         has_filter=has_filter,
         has_cursor=has_cursor,
     )
+
+
+# ---------------------------------------------------------------------------
+# Tool: SearchMessages
+# ---------------------------------------------------------------------------
 
 
 class SearchMessages(ToolArgs):
@@ -194,49 +289,79 @@ class SearchMessages(ToolArgs):
 
 @mcp_tool("primary")
 async def search_messages(args: SearchMessages) -> ToolResult:
-    cache = get_entity_cache()
-    exact_dialog_id = parse_exact_dialog_id(args.dialog)
-    dialog_query = None if exact_dialog_id is not None else args.dialog
-    exact_dialog_name = cache.get_name(exact_dialog_id) if exact_dialog_id is not None else None
+    # Resolve dialog_id locally if possible (numeric string / @username)
+    dialog_id: int | None = None
+    exact_id = parse_exact_dialog_id(args.dialog)
+    if exact_id is not None:
+        dialog_id = exact_id
+    # If still None, dialog name goes to daemon for server-side resolution
 
-    exact = ExactTargetHints(
-        dialog_id=exact_dialog_id,
-        dialog_name=exact_dialog_name,
-    ) if exact_dialog_id is not None else None
+    # Decode offset from navigation token if provided
+    offset = 0
+    if args.navigation and args.navigation not in {"newest", "oldest"}:
+        try:
+            from ..pagination import decode_navigation_token
+            nav = decode_navigation_token(args.navigation)
+            if nav.kind == "search":
+                offset = nav.value
+        except Exception:
+            pass
 
-    async with connected_client() as client:
-        search_execution = await capabilities.execute_search_messages_capability(
-            client,
-            cache=cache,
-            dialog_query=dialog_query,
-            query=args.query,
-            limit=args.limit,
-            navigation=args.navigation,
-            retry_tool="SearchMessages",
-            resolve_dialog=_resolve_dialog,
+    try:
+        async with daemon_connection() as conn:
+            if dialog_id is not None and dialog_id != 0:
+                response = await conn.search_messages(
+                    dialog_id=dialog_id,
+                    query=args.query,
+                    limit=args.limit,
+                    offset=offset,
+                )
+            else:
+                # Daemon resolves dialog name via Telegram
+                response = await conn.search_messages(
+                    dialog=args.dialog,
+                    query=args.query,
+                    limit=args.limit,
+                    offset=offset,
+                )
+    except DaemonNotRunningError as e:
+        return ToolResult(content=_text_response(str(e)))
 
-            reaction_names_threshold=REACTION_NAMES_THRESHOLD,
-            exact=exact,
+    if not response.get("ok"):
+        error = response.get("error", "unknown")
+        message = response.get("message", "")
+        if error == "dialog_not_found":
+            dialog_label = str(dialog_id) if dialog_id else args.dialog
+            return ToolResult(
+                content=_text_response(dialog_not_found_text(dialog_label, retry_tool="SearchMessages")),
+                has_filter=True,
+                has_cursor=args.navigation is not None,
+            )
+        return ToolResult(
+            content=_text_response(f"Error: {error}: {message}"),
+            has_filter=True,
+            has_cursor=args.navigation is not None,
         )
-    if isinstance(
-        search_execution,
-        capabilities.DialogTargetFailure | capabilities.NavigationFailure,
-    ):
-        return ToolResult(content=_text_response(search_execution.text), has_filter=True, has_cursor=args.navigation is not None)
 
-    hits = list(search_execution.hits)
-    if hits:
-        result_text = search_execution.resolve_prefix + search_execution.rendered_text
-    else:
-        result_text = search_execution.resolve_prefix + search_no_hits_text(
-            search_execution.dialog_name,
-            args.query,
+    data = response.get("data", {})
+    rows = data.get("messages", [])
+    dialog_label = str(dialog_id) if dialog_id else args.dialog
+
+    if not rows:
+        result_text = search_no_hits_text(dialog_label, args.query)
+        return ToolResult(
+            content=_text_response(result_text),
+            result_count=0,
+            has_filter=True,
+            has_cursor=args.navigation is not None,
         )
-    if search_execution.navigation is not None:
-        result_text += f"\n\nnext_navigation: {search_execution.navigation.token}"
+
+    text = _format_daemon_messages(rows)
+    result_text = text
+
     return ToolResult(
         content=_text_response(result_text),
-        result_count=len(hits),
+        result_count=len(rows),
         has_filter=True,
         has_cursor=args.navigation is not None,
     )
