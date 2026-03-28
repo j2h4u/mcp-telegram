@@ -392,6 +392,39 @@ class DaemonAPIServer:
         )
 
     # ------------------------------------------------------------------
+    # Shared message helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _msg_to_dict(msg: Any) -> dict:
+        """Convert a live Telethon message object to the standard message dict.
+
+        Used by the on-demand path in _list_messages and by _list_unread_messages
+        to avoid duplicating the same field-extraction logic.
+        """
+        sender_first_name: str | None = None
+        if getattr(msg, "sender", None) is not None:
+            sender_first_name = getattr(msg.sender, "first_name", None)
+        sent_at = 0
+        if getattr(msg, "date", None) is not None:
+            try:
+                sent_at = int(msg.date.timestamp())
+            except Exception:
+                sent_at = 0
+        return {
+            "message_id": msg.id,
+            "sent_at": sent_at,
+            "text": getattr(msg, "message", None),
+            "sender_id": getattr(msg, "sender_id", None),
+            "sender_first_name": sender_first_name,
+            "media_description": None,
+            "reply_to_msg_id": getattr(msg, "reply_to_msg_id", None),
+            "forum_topic_id": getattr(msg, "forum_topic_id", None),
+            "reactions": None,
+            "is_deleted": 0,
+        }
+
+    # ------------------------------------------------------------------
     # list_messages
     # ------------------------------------------------------------------
 
@@ -444,29 +477,7 @@ class DaemonAPIServer:
         # On-demand fetch from Telegram
         messages = []
         async for msg in self._client.iter_messages(dialog_id, limit=limit):
-            sender_first_name: str | None = None
-            if getattr(msg, "sender", None) is not None:
-                sender_first_name = getattr(msg.sender, "first_name", None)
-            sent_at = 0
-            if getattr(msg, "date", None) is not None:
-                try:
-                    sent_at = int(msg.date.timestamp())
-                except Exception:
-                    sent_at = 0
-            messages.append(
-                {
-                    "message_id": msg.id,
-                    "sent_at": sent_at,
-                    "text": getattr(msg, "message", None),
-                    "sender_id": getattr(msg, "sender_id", None),
-                    "sender_first_name": sender_first_name,
-                    "media_description": None,
-                    "reply_to_msg_id": getattr(msg, "reply_to_msg_id", None),
-                    "forum_topic_id": getattr(msg, "forum_topic_id", None),
-                    "reactions": None,
-                    "is_deleted": 0,
-                }
-            )
+            messages.append(self._msg_to_dict(msg))
 
         return {"ok": True, "data": {"messages": messages, "source": "telegram"}}
 
@@ -913,21 +924,13 @@ class DaemonAPIServer:
                     min_id=entry["read_inbox_max_id"],
                     limit=budget,
                 ):
-                    sender_first_name: str | None = None
-                    if getattr(msg, "sender", None) is not None:
-                        sender_first_name = getattr(msg.sender, "first_name", None)
-                    sent_at = 0
-                    if getattr(msg, "date", None) is not None:
-                        try:
-                            sent_at = int(msg.date.timestamp())
-                        except Exception:
-                            sent_at = 0
+                    d = self._msg_to_dict(msg)
                     group["messages"].append({
-                        "message_id": msg.id,
-                        "sent_at": sent_at,
-                        "text": getattr(msg, "message", None),
-                        "sender_id": getattr(msg, "sender_id", None),
-                        "sender_first_name": sender_first_name,
+                        "message_id": d["message_id"],
+                        "sent_at": d["sent_at"],
+                        "text": d["text"],
+                        "sender_id": d["sender_id"],
+                        "sender_first_name": d["sender_first_name"],
                     })
             except Exception as exc:
                 logger.warning(
