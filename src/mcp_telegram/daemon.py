@@ -145,6 +145,7 @@ async def sync_main() -> None:
                 )
                 msg_count = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
             except Exception:
+                logger.warning("heartbeat_stats_failed", exc_info=True)
                 stats = {}
                 msg_count = 0
             synced = stats.get("synced", 0)

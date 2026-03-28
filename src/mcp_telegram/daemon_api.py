@@ -392,6 +392,7 @@ class DaemonAPIServer:
             pass
 
         # Fallback: iterate dialogs and fuzzy-match by name
+        logger.debug("resolve_dialog_fallback_iter_dialogs query=%r", dialog)
         best: Any | None = None
         best_name: str = ""
         async for d in self._client.iter_dialogs():
@@ -498,6 +499,7 @@ class DaemonAPIServer:
             return {"ok": True, "data": {"messages": messages, "source": "sync_db"}}
 
         # On-demand fetch from Telegram
+        logger.debug("list_messages_fallback_telegram dialog_id=%d", dialog_id)
         messages = []
         async for msg in self._client.iter_messages(dialog_id, limit=limit):
             messages.append(self._msg_to_dict(msg))
