@@ -10,6 +10,8 @@ from collections.abc import Sequence
 from functools import cache
 
 from mcp.server import Server
+
+from .daemon_client import _request_ids
 from mcp.types import (
     EmbeddedResource,
     ImageContent,
@@ -91,23 +93,29 @@ async def call_tool(name: str, arguments: t.Any) -> Sequence[TextContent | Image
         raise ValueError(f"Unknown tool: {name}")
 
     t0 = time.monotonic()
+    rids: list[str] = []
+    token = _request_ids.set(rids)
     try:
-        args = tools.tool_args(tool, **arguments)
-    except Exception as exc:
-        elapsed = time.monotonic() - t0
-        logger.exception("call_tool[%s] validation_failed after %.3fs", name, elapsed)
-        raise RuntimeError(_safe_boundary_error_text(tool_name=name, stage="validation", exc=exc)) from exc
+        try:
+            args = tools.tool_args(tool, **arguments)
+        except Exception as exc:
+            elapsed = time.monotonic() - t0
+            logger.exception("call_tool[%s] validation_failed after %.3fs", name, elapsed)
+            raise RuntimeError(_safe_boundary_error_text(tool_name=name, stage="validation", exc=exc)) from exc
 
-    try:
-        result = await tools.tool_runner(args)
-    except Exception as exc:
-        elapsed = time.monotonic() - t0
-        logger.exception("call_tool[%s] runtime failed after %.3fs", name, elapsed)
-        raise RuntimeError(_safe_boundary_error_text(tool_name=name, stage="runtime", exc=exc)) from exc
+        try:
+            result = await tools.tool_runner(args)
+        except Exception as exc:
+            elapsed = time.monotonic() - t0
+            logger.exception("call_tool[%s] runtime failed after %.3fs", name, elapsed)
+            raise RuntimeError(_safe_boundary_error_text(tool_name=name, stage="runtime", exc=exc)) from exc
 
-    elapsed = time.monotonic() - t0
-    logger.info("call_tool[%s] completed in %.3fs", name, elapsed)
-    return result
+        elapsed = time.monotonic() - t0
+        rid_str = ",".join(rids) if rids else "-"
+        logger.info("call_tool[%s] completed in %.3fs rids=%s", name, elapsed, rid_str)
+        return result
+    finally:
+        _request_ids.reset(token)
 
 
 async def run_mcp_server() -> None:

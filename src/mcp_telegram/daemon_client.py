@@ -20,6 +20,7 @@ parameter to support name-based resolution by the daemon.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import uuid
@@ -30,6 +31,13 @@ from typing import AsyncIterator
 from .daemon_api import get_daemon_socket_path
 
 logger = logging.getLogger(__name__)
+
+# ContextVar for collecting request_ids during a tool call.
+# server.py sets a fresh list before running the tool; request() appends to it.
+# This enables cross-process log correlation without passing rid through tool signatures.
+_request_ids: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar(
+    "_request_ids", default=None
+)
 
 __all__ = [
     "DaemonNotRunningError",
@@ -77,6 +85,9 @@ class DaemonConnection:
         without sending a response (empty read = EOF).
         """
         rid = uuid.uuid4().hex[:8]
+        rids = _request_ids.get(None)
+        if rids is not None:
+            rids.append(rid)
         payload = {**payload, "request_id": rid}
         encoded = json.dumps(payload).encode() + b"\n"
         logger.debug("daemon_request method=%s request_id=%s", payload.get("method"), rid)
