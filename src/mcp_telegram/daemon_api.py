@@ -59,8 +59,10 @@ except ImportError:
     Chat = None  # type: ignore[assignment,misc]
     telethon_utils = None  # type: ignore[assignment]
 
+USER_TTL: int = 2_592_000   # 30 days
+GROUP_TTL: int = 604_800    # 7 days
+
 from .budget import allocate_message_budget_proportional, unread_chat_tier
-from .cache import GROUP_TTL, USER_TTL
 from .fts import stem_query
 from .resolver import (
     Candidates,
