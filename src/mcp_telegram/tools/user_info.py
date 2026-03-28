@@ -42,14 +42,14 @@ async def get_user_info(args: GetUserInfo) -> ToolResult:
         ))
 
     resolve_data = resolve_response.get("data", {})
-    result_type = resolve_data.get("result", "not_found")
+    resolve_status = resolve_data.get("result", "not_found")
 
-    if result_type == "not_found":
+    if resolve_status == "not_found":
         return ToolResult(content=_text_response(
             user_not_found_text(args.user, retry_tool="GetUserInfo")
         ))
 
-    if result_type == "candidates":
+    if resolve_status == "candidates":
         matches = resolve_data.get("matches", [])
         match_lines = []
         for match in matches:
@@ -63,7 +63,7 @@ async def get_user_info(args: GetUserInfo) -> ToolResult:
             ambiguous_user_text(args.user, match_lines, retry_tool="GetUserInfo"),
         ))
 
-    # result_type == "resolved"
+    # resolve_status == "resolved"
     entity_id: int = resolve_data["entity_id"]
     display_name: str = resolve_data["display_name"]
 

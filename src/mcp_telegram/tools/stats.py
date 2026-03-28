@@ -31,9 +31,9 @@ def format_usage_summary(stats: dict) -> str:
     if stats.get("tool_distribution"):
         top_tools = sorted(stats["tool_distribution"].items(), key=lambda x: x[1], reverse=True)[:2]
         if top_tools:
-            top_tool, top_count = top_tools[0]
+            top_tool_name, top_count = top_tools[0]
             top_pct = int(top_count * 100 / stats["total_calls"]) if stats["total_calls"] > 0 else 0
-            parts.append(f"Most active: {top_tool} ({top_pct}% of calls)")
+            parts.append(f"Most active: {top_tool_name} ({top_pct}% of calls)")
 
     if stats.get("max_page_depth", 0) >= 5:
         parts.append(f"Deep scrolling detected: max page depth {stats['max_page_depth']}")

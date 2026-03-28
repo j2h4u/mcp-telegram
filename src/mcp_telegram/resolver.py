@@ -120,14 +120,14 @@ def _fuzzy_resolve(
     - No exact → all hits ≥60 as Candidates
     """
     norm_map = _build_norm_map(choices, normalized_choices)
-    norm_name_to_id: dict[str, int] = {
+    fuzzy_candidates: dict[str, int] = {
         norm_name: entries[0][0] for norm_name, entries in norm_map.items()
     }
     norm_query = latinize(query)
 
     hits = process.extract(
         norm_query,
-        norm_name_to_id.keys(),
+        fuzzy_candidates.keys(),
         scorer=fuzz.WRatio,
         processor=utils.default_process,
         score_cutoff=CANDIDATE_THRESHOLD,
