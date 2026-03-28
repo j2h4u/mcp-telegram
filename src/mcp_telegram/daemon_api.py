@@ -74,6 +74,12 @@ from .resolver import (
 
 logger = logging.getLogger(__name__)
 
+
+def _clamp(value: int, low: int, high: int) -> int:
+    """Clamp *value* to the inclusive range [low, high]."""
+    return max(low, min(value, high))
+
+
 # ---------------------------------------------------------------------------
 # Path helper
 # ---------------------------------------------------------------------------
@@ -399,7 +405,7 @@ class DaemonAPIServer:
         """Return messages from sync.db (if synced) or Telegram (on-demand)."""
         dialog_id: int = req.get("dialog_id", 0) or 0
         dialog: str | None = req.get("dialog")
-        limit: int = req.get("limit", 50)
+        limit: int = _clamp(req.get("limit", 50), 1, 500)
         navigation: str | None = req.get("navigation")
 
         # Dialog resolution
@@ -479,8 +485,8 @@ class DaemonAPIServer:
         dialog_id: int = req.get("dialog_id", 0) or 0
         dialog: str | None = req.get("dialog")
         query: str = req.get("query", "")
-        limit: int = req.get("limit", 20)
-        offset: int = req.get("offset", 0)
+        limit: int = _clamp(req.get("limit", 20), 1, 200)
+        offset: int = max(0, req.get("offset", 0))
 
         # Dialog resolution
         if not dialog_id and dialog:
@@ -723,7 +729,7 @@ class DaemonAPIServer:
         limit: max items per category (default 50).
         """
         since: int = req.get("since", 0)
-        limit: int = req.get("limit", 50)
+        limit: int = _clamp(req.get("limit", 50), 1, 500)
 
         deleted_rows = self._conn.execute(_GET_DELETED_ALERTS_SQL, (since, limit)).fetchall()
         deleted_messages = [
@@ -838,7 +844,7 @@ class DaemonAPIServer:
         5. Fetch messages per chat up to their budget.
         """
         scope: str = req.get("scope", "personal")
-        limit: int = req.get("limit", 100)
+        limit: int = _clamp(req.get("limit", 100), 1, 500)
         group_size_threshold: int = req.get("group_size_threshold", 100)
 
         # Step A — Collect unread dialogs
