@@ -628,7 +628,13 @@ class DaemonAPIServer:
 
     async def _get_me(self, req: dict) -> dict:
         """Return current user info from Telegram."""
-        me = await self._client.get_me()
+        try:
+            me = await self._client.get_me()
+        except Exception as exc:
+            logger.warning("get_me_failed error=%s", exc, exc_info=True)
+            return {"ok": False, "error": "telegram_error", "message": "failed to retrieve account info"}
+        if me is None:
+            return {"ok": False, "error": "not_found", "message": "account info unavailable"}
         return {
             "ok": True,
             "data": {
