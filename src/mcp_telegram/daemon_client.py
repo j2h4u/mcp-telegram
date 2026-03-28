@@ -108,7 +108,7 @@ class DaemonConnection:
         return response
 
     # ------------------------------------------------------------------
-    # Convenience wrappers for the five daemon methods
+    # Convenience wrappers for the daemon API methods
     # ------------------------------------------------------------------
 
     async def list_messages(

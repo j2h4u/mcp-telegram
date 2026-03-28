@@ -218,6 +218,9 @@ def resolve(
     Case 1: Numeric ID query → Resolved/NotFound by id
     Case 2: @username query → lookup in cache, Resolved/NotFound (requires cache)
     Case 3-5: Fuzzy matching in latinized space with single-word caution
+
+    cache must expose .get(id, ttl_seconds=) and .get_by_username(str).
+    Pass None to skip @username resolution.
     """
     entity_id = _parse_numeric_query(query)
     if entity_id is not None:
