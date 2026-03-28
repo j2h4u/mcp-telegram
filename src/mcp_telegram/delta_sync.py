@@ -1,7 +1,7 @@
 """DeltaSyncWorker — forward gap-fill engine for v1.5 Persistent Sync.
 
 Fetches messages newer than the max known message_id per dialog on every
-daemon startup (DAEMON-12). Idempotent: dialogs with no gap complete
+daemon startup. Idempotent: dialogs with no gap complete
 instantly when iter_messages returns empty.
 
 Architecture:

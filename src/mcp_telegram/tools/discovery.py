@@ -80,7 +80,7 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
             async with daemon_connection() as upsert_conn:
                 await upsert_conn.upsert_entities(entities=entity_dicts)
         except Exception:
-            logger.debug("entity_upsert_skipped: daemon not available", exc_info=True)
+            logger.debug("entity_upsert_skipped", exc_info=True)
 
     result_text = "\n".join(lines)
     return ToolResult(content=_text_response(result_text), result_count=len(lines))

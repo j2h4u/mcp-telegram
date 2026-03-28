@@ -794,7 +794,7 @@ async def test_generic_rpc_error_still_skips(
     sync_db: sqlite3.Connection,
     shutdown_event: asyncio.Event,
 ) -> None:
-    """Non-access-loss RPCError returns (progress, True) without setting access_lost status."""
+    """Non-access-loss RPCError leaves dialog in-progress (is_done=False) without setting access_lost status."""
     from telethon.errors import RPCError  # type: ignore[import-untyped]
 
     dialog_id = 6005
@@ -815,13 +815,14 @@ async def test_generic_rpc_error_still_skips(
     worker = make_worker(mock_client, sync_db, shutdown_event)
     result = await worker.process_one_batch()
 
-    assert result is True
+    assert result is False, "Generic RPCError should leave dialog in-progress (is_done=False)"
     row = sync_db.execute(
         "SELECT status FROM synced_dialogs WHERE dialog_id=?",
         (dialog_id,),
     ).fetchone()
     assert row is not None
     assert row[0] != "access_lost", f"Generic RPCError must not set access_lost, got {row[0]}"
+    assert row[0] == "syncing", f"Generic RPCError must leave dialog as syncing for retry, got {row[0]}"
 
 
 # ---------------------------------------------------------------------------

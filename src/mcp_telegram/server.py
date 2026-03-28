@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
 import time
 import typing as t
@@ -113,8 +114,9 @@ async def run_mcp_server() -> None:
     # Import here to avoid issues with event loops
     from mcp.server.stdio import stdio_server
 
+    log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
     logging.basicConfig(
-        level=logging.INFO,
+        level=getattr(logging, log_level, logging.INFO),
         stream=sys.stderr,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
         force=True,

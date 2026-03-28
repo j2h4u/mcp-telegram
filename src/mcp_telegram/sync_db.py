@@ -63,8 +63,7 @@ CREATE TABLE IF NOT EXISTS message_versions (
 """
 
 # ---------------------------------------------------------------------------
-# DDL for v4: entity cache tables (copied verbatim from cache.py DDL pattern,
-# with name_normalized included directly in CREATE TABLE)
+# DDL for v4: entity cache tables
 # ---------------------------------------------------------------------------
 
 _ENTITY_TABLE_DDL = """
@@ -147,8 +146,7 @@ ON message_cache(dialog_id, sent_at DESC)
 """
 
 # ---------------------------------------------------------------------------
-# DDL for v5: telemetry_events table (copied from analytics.py, split into
-# table + index constants)
+# DDL for v5: telemetry_events table
 # ---------------------------------------------------------------------------
 
 _TELEMETRY_EVENTS_DDL = """
@@ -303,8 +301,8 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
 def ensure_sync_schema(db_path: Path) -> None:
     """Ensure sync.db exists and has the current schema.
 
-    Mirrors _ensure_cache_schema from cache.py — probe first, then acquire
-    fcntl lock before applying migrations to prevent parallel-process races.
+    Probes the DB first, then acquires fcntl lock before applying migrations
+    to prevent parallel-process races.
     """
     probe_conn = _open_sync_db(db_path)
     try:

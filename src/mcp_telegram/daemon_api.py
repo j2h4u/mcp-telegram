@@ -501,8 +501,17 @@ class DaemonAPIServer:
         # On-demand fetch from Telegram
         logger.debug("list_messages_fallback_telegram dialog_id=%d", dialog_id)
         messages = []
-        async for msg in self._client.iter_messages(dialog_id, limit=limit):
-            messages.append(self._msg_to_dict(msg))
+        try:
+            async for msg in self._client.iter_messages(dialog_id, limit=limit):
+                messages.append(self._msg_to_dict(msg))
+        except Exception as exc:
+            logger.warning(
+                "list_messages_telegram_error dialog_id=%d error=%s",
+                dialog_id,
+                exc,
+                exc_info=True,
+            )
+            return {"ok": False, "error": "telegram_error", "message": "failed to fetch messages"}
 
         return {"ok": True, "data": {"messages": messages, "source": "telegram"}}
 
@@ -567,28 +576,32 @@ class DaemonAPIServer:
         archived_flag = False if exclude_archived else None
 
         dialogs = []
-        async for d in self._client.iter_dialogs(
-            archived=archived_flag,
-            ignore_pinned=ignore_pinned,
-        ):
-            entity = getattr(d, "entity", None)
-            entity_type = type(entity).__name__ if entity is not None else "Unknown"
-            last_msg_at: int | None = None
-            if getattr(d, "date", None) is not None:
-                try:
-                    last_msg_at = int(d.date.timestamp())
-                except Exception:
-                    last_msg_at = None
-            dialogs.append(
-                {
-                    "id": d.id,
-                    "name": getattr(d, "name", None),
-                    "type": entity_type,
-                    "last_message_at": last_msg_at,
-                    "unread_count": getattr(d, "unread_count", 0),
-                    "sync_status": synced_statuses.get(d.id, "not_synced"),
-                }
-            )
+        try:
+            async for d in self._client.iter_dialogs(
+                archived=archived_flag,
+                ignore_pinned=ignore_pinned,
+            ):
+                entity = getattr(d, "entity", None)
+                entity_type = type(entity).__name__ if entity is not None else "Unknown"
+                last_msg_at: int | None = None
+                if getattr(d, "date", None) is not None:
+                    try:
+                        last_msg_at = int(d.date.timestamp())
+                    except Exception:
+                        last_msg_at = None
+                dialogs.append(
+                    {
+                        "id": d.id,
+                        "name": getattr(d, "name", None),
+                        "type": entity_type,
+                        "last_message_at": last_msg_at,
+                        "unread_count": getattr(d, "unread_count", 0),
+                        "sync_status": synced_statuses.get(d.id, "not_synced"),
+                    }
+                )
+        except Exception as exc:
+            logger.warning("list_dialogs_telegram_error error=%s", exc, exc_info=True)
+            return {"ok": False, "error": "telegram_error", "message": "failed to list dialogs"}
 
         return {"ok": True, "data": {"dialogs": dialogs}}
 
@@ -985,6 +998,9 @@ class DaemonAPIServer:
     async def _record_telemetry(self, req: dict) -> dict:
         """Write a telemetry event row to sync.db telemetry_events table."""
         event = req.get("event", {})
+        tool_name = event.get("tool_name", "")
+        if not isinstance(tool_name, str) or len(tool_name) > 200:
+            return {"ok": False, "error": "invalid_input", "message": "tool_name must be a string (max 200 chars)"}
         try:
             self._conn.execute(
                 "INSERT INTO telemetry_events "
@@ -1005,7 +1021,7 @@ class DaemonAPIServer:
             self._conn.commit()
             return {"ok": True}
         except Exception as exc:
-            logger.error("record_telemetry failed: %s", exc)
+            logger.error("record_telemetry failed: %s", exc, exc_info=True)
             return {"ok": False, "error": "internal", "message": "internal error"}
 
     # ------------------------------------------------------------------
@@ -1019,7 +1035,7 @@ class DaemonAPIServer:
             stats = _query_usage_stats(self._conn.cursor(), since)
             return {"ok": True, "data": stats}
         except Exception as exc:
-            logger.error("get_usage_stats failed: %s", exc)
+            logger.error("get_usage_stats failed: %s", exc, exc_info=True)
             return {"ok": False, "error": "internal", "message": "internal error"}
 
     # ------------------------------------------------------------------
@@ -1029,6 +1045,8 @@ class DaemonAPIServer:
     async def _upsert_entities(self, req: dict) -> dict:
         """Batch upsert entity rows into sync.db entities table."""
         entities = req.get("entities", [])
+        if not isinstance(entities, list) or len(entities) > 10000:
+            return {"ok": False, "error": "invalid_input", "message": "entities must be a list (max 10000)"}
         if not entities:
             return {"ok": True, "upserted": 0}
         now = int(time.time())
@@ -1050,7 +1068,7 @@ class DaemonAPIServer:
             self._conn.commit()
             return {"ok": True, "upserted": len(entities)}
         except Exception as exc:
-            logger.error("upsert_entities failed: %s", exc)
+            logger.error("upsert_entities failed: %s", exc, exc_info=True)
             return {"ok": False, "error": "internal", "message": "internal error"}
 
     # ------------------------------------------------------------------

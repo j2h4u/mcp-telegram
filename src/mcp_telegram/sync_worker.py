@@ -115,6 +115,10 @@ def extract_message_row(dialog_id: int, msg: Any) -> tuple[object, ...]:
 
     Follows sync.db message insert pattern. Omits edit_date and fetched_at
     (not in sync.db schema); adds reactions serialization.
+
+    Returns a 10-element tuple matching _INSERT_MESSAGE_SQL column order:
+    (dialog_id, message_id, sender_id, sender_name, date, text, media_type,
+     reply_to_msg_id, forum_topic_id, is_deleted)
     """
     message_id = int(getattr(msg, "id", 0))
 
@@ -262,7 +266,8 @@ class FullSyncWorker:
         message_id; a partial or empty batch marks the dialog 'synced'.
 
         On FloodWaitError: sleep interruptibly, return (same_progress, False).
-        On other RPCError: log ERROR, skip dialog by marking it done.
+        On other RPCError: log ERROR, return (same_progress, False) — dialog stays
+        in-progress for retry on the next sync cycle.
 
         Returns:
             (new_progress, is_done)
@@ -296,13 +301,12 @@ class FullSyncWorker:
             return sync_progress, True
         except RPCError as exc:
             logger.error(
-                "RPC error dialog_id=%d — skipping: %s", dialog_id, exc
+                "sync_batch_rpc_error dialog_id=%d error=%s — dialog NOT marked synced, will retry",
+                dialog_id,
+                exc,
+                exc_info=True,
             )
-            with self._conn:
-                self._conn.execute(
-                    _UPDATE_PROGRESS_SQL, (sync_progress, "synced", dialog_id)
-                )
-            return sync_progress, True
+            return sync_progress, False  # leave dialog in-progress for retry
 
         if not batch:
             # No more messages — dialog fully synced (Pitfall 3)

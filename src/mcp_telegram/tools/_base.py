@@ -61,6 +61,14 @@ async def _send_telemetry_event(event_dict: dict) -> None:
         logger.debug("telemetry_send_failed: %s", exc)
 
 
+def _telemetry_done_callback(task: asyncio.Task[None]) -> None:
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.warning("telemetry_event_failed error=%s", exc)
+
+
 def _track_tool_telemetry(tool_name: str):
     """Decorator that wraps an async tool runner with timing + telemetry recording.
 
@@ -83,7 +91,7 @@ def _track_tool_telemetry(tool_name: str):
             finally:
                 duration_ms = (time.monotonic() - t0) * 1000
                 try:
-                    asyncio.create_task(
+                    task = asyncio.create_task(
                         _send_telemetry_event({
                             "tool_name": tool_name,
                             "timestamp": time.time(),
@@ -95,6 +103,7 @@ def _track_tool_telemetry(tool_name: str):
                             "error_type": error_type,
                         })
                     )
+                    task.add_done_callback(_telemetry_done_callback)
                 except Exception as e:
                     logger.debug("telemetry_send_skipped: %s", e)
         return wrapper
@@ -129,6 +138,9 @@ def mcp_tool(posture: str = "primary"):
       1. @tool_runner.register
       2. @_track_tool_telemetry("ToolName")
       3. TOOL_REGISTRY["ToolName"] = (ToolClass, posture)
+
+    The decorated function must have a parameter annotated as ``args: YourToolArgs``
+    — the parameter name ``args`` is required (used for type hint introspection).
 
     Usage:
         class MyTool(ToolArgs): ...

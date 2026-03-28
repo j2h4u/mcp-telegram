@@ -221,22 +221,22 @@ class DaemonConnection:
         })
 
     async def record_telemetry(self, *, event: dict) -> dict:
-        """Send record_telemetry request (Plan 33-01)."""
+        """Send record_telemetry request."""
         return await self.request({"method": "record_telemetry", "event": event})
 
     async def get_usage_stats(self, *, since: int | None = None) -> dict:
-        """Send get_usage_stats request (Plan 33-01)."""
+        """Send get_usage_stats request."""
         payload: dict = {"method": "get_usage_stats"}
         if since is not None:
             payload["since"] = since
         return await self.request(payload)
 
     async def upsert_entities(self, *, entities: list[dict]) -> dict:
-        """Send upsert_entities request (Plan 33-01)."""
+        """Send upsert_entities request."""
         return await self.request({"method": "upsert_entities", "entities": entities})
 
     async def resolve_entity(self, *, query: str) -> dict:
-        """Send resolve_entity request (Plan 33-01)."""
+        """Send resolve_entity request."""
         return await self.request({"method": "resolve_entity", "query": query})
 
 
@@ -274,4 +274,4 @@ async def daemon_connection() -> AsyncIterator[DaemonConnection]:
             try:
                 await writer.wait_closed()
             except Exception:
-                pass
+                logger.debug("daemon_client wait_closed error", exc_info=True)

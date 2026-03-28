@@ -11,22 +11,22 @@ Architecture (DAEMON-01 / DAEMON-02):
 - SIGTERM triggers shutdown_event (set by register_shutdown_handler), which
   checkpoints WAL and closes the DB connection before the daemon disconnects.
 
-Phase 27 (event handlers):
-- EventHandlerManager is registered BEFORE FullSyncWorker starts (D-06) so
-  no real-time events are missed during initial bulk fetch.  INSERT OR REPLACE
-  handles any overlap between real-time and bulk paths idempotently (D-07).
+Event handlers:
+- EventHandlerManager is registered BEFORE FullSyncWorker starts so no
+  real-time events are missed during initial bulk fetch.  INSERT OR REPLACE
+  handles any overlap between real-time and bulk paths idempotently.
 - synced_dialogs set is refreshed every heartbeat so newly enrolled dialogs
-  are picked up within one interval without re-registering handlers (D-08/D-09).
+  are picked up within one interval without re-registering handlers.
 - Weekly gap scan detects tombstoned DM messages that MTProto delete events
-  cannot report (D-14/D-15).
+  cannot report.
 
-Phase 28 (delta catch-up):
+Delta catch-up:
 - connect() called with catch_up=True — Telethon replays missed updates via PTS
-  on reconnect (D-05).
+  on reconnect.
 - DeltaSyncWorker.run_delta_catch_up() fills forward gaps for all 'synced'
-  dialogs before bootstrap_dms() enrolls new ones (D-08).
+  dialogs before bootstrap_dms() enrolls new ones.
 
-Phase 29 (daemon API):
+Daemon API:
 - DaemonAPIServer runs on a Unix socket alongside the sync loop, serving
   list_messages / search_messages / list_dialogs requests from MCP server.
 - FTS backfill runs once at startup for messages without FTS index entries.
@@ -55,7 +55,7 @@ from .telegram import create_client
 logger = logging.getLogger(__name__)
 
 HEARTBEAT_INTERVAL_S: float = 60.0
-GAP_SCAN_INTERVAL_S: float = 7 * 24 * 3600.0  # Weekly (D-14)
+GAP_SCAN_INTERVAL_S: float = 7 * 24 * 3600.0
 
 
 async def sync_main() -> None:

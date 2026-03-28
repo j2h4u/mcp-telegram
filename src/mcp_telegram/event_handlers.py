@@ -15,7 +15,7 @@ Architecture:
   FullSyncWorker starts so no real-time events are missed during full sync.
 - All DB writes are synchronous sqlite3 (single-row ops, microsecond-fast).
 - In-memory _synced_dialog_ids set refreshed via refresh_synced_dialogs() from
-  the daemon heartbeat loop (DAEMON-07 D-08/D-09).
+  the daemon heartbeat loop.
 """
 from __future__ import annotations
 
@@ -136,8 +136,8 @@ class EventHandlerManager:
         """Refresh the in-memory synced-dialog set from the DB.
 
         Called from the daemon heartbeat loop so newly enrolled dialogs
-        (e.g., via Phase 30 MarkDialogForSync) are picked up within one
-        heartbeat interval without re-registering handlers.
+        are picked up within one heartbeat interval without re-registering
+        handlers.
         """
         self._refresh_synced_dialogs()
 
@@ -181,7 +181,7 @@ class EventHandlerManager:
         2. Text unchanged: no-op (covers service edits, reactions updates, etc.).
         3. Text changed: insert old_text into message_versions, update messages.text.
 
-        All operations in a single transaction (D-10).
+        All operations in a single transaction.
         """
         dialog_id = event.chat_id
         if dialog_id is None or dialog_id not in self._synced_dialog_ids:
