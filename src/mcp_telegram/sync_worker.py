@@ -313,7 +313,7 @@ class FullSyncWorker:
             logger.info("sync_done dialog_id=%d status=synced (empty batch)", dialog_id)
             return sync_progress, True
 
-        rows = [self._extract_message_row(dialog_id, msg) for msg in batch]
+        rows = [extract_message_row(dialog_id, msg) for msg in batch]
         new_progress = min(int(getattr(msg, "id", 0)) for msg in batch)
         is_done = len(batch) < 100  # partial batch = last batch (Pitfall 3)
         new_status = "synced" if is_done else "syncing"
@@ -335,20 +335,3 @@ class FullSyncWorker:
         )
         return new_progress, is_done
 
-    def _extract_message_row(
-        self, dialog_id: int, msg: Any
-    ) -> tuple[object, ...]:
-        """Extract sync.db messages row tuple from a Telethon message object.
-
-        Thin wrapper around the module-level extract_message_row() so
-        DeltaSyncWorker can import the shared implementation directly.
-        """
-        return extract_message_row(dialog_id, msg)
-
-    @staticmethod
-    def _serialize_reactions(reactions: Any | None) -> str | None:
-        """Serialize a Telethon MessageReactions object to a JSON string.
-
-        Thin wrapper around the module-level serialize_reactions().
-        """
-        return serialize_reactions(reactions)
