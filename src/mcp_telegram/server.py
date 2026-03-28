@@ -94,7 +94,7 @@ async def call_tool(name: str, arguments: t.Any) -> Sequence[TextContent | Image
         args = tools.tool_args(tool, **arguments)
     except Exception as exc:
         elapsed = time.monotonic() - t0
-        logger.exception("call_tool[%s] validation_failed args=%r after %.3fs", name, arguments, elapsed)
+        logger.exception("call_tool[%s] validation_failed after %.3fs", name, elapsed)
         raise RuntimeError(_safe_boundary_error_text(tool_name=name, stage="validation", exc=exc)) from exc
 
     try:

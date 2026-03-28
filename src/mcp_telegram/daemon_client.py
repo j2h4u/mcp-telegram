@@ -1,9 +1,11 @@
 """DaemonClient — async context manager for MCP tool calls to the sync daemon.
 
 MCP tools use daemon_connection() to send requests over the Unix socket to
-DaemonAPIServer (Plan 29-01, Task 2) and receive JSON responses.
+DaemonAPIServer and receive JSON responses.
 
-Protocol: newline-delimited JSON.  One request line → one response line.
+Protocol: newline-delimited JSON over Unix socket.  Each DaemonConnection
+opens a fresh socket, supports multiple sequential request() calls within
+the same async-with block, then closes the socket on exit.
 
 Error handling:
 - FileNotFoundError: daemon is not running (socket file absent)
@@ -11,11 +13,7 @@ Error handling:
 - Both raise DaemonNotRunningError with an actionable "mcp-telegram sync" message.
 - EOF on read (daemon closed connection unexpectedly): DaemonNotRunningError.
 
-DaemonConnection provides convenience methods for all fourteen daemon methods:
-list_messages, search_messages, list_dialogs, list_topics, get_me,
-mark_dialog_for_sync, get_sync_status, get_sync_alerts,
-get_user_info, list_unread_messages,
-record_telemetry, get_usage_stats, upsert_entities, resolve_entity.
+DaemonConnection provides convenience methods for all fourteen daemon API methods.
 list_messages and search_messages accept an optional dialog: str | None
 parameter to support name-based resolution by the daemon.
 """
