@@ -71,15 +71,21 @@ def stem_text(text: str | None) -> str:
 
 
 def stem_query(query: str) -> str:
-    """Return space-separated stemmed tokens suitable for an FTS5 MATCH clause.
+    """Return space-separated quoted stemmed tokens suitable for an FTS5 MATCH clause.
 
     Applies the same word extraction and stemming as stem_text() so that a
     query expressed in any morphological form matches stored variants.
+
+    Each token is wrapped in double quotes to prevent FTS5 from interpreting
+    bare operator keywords (NOT, OR, AND) as boolean operators.
     """
     words = _WORD_RE.findall(query)
     if not words:
         return ""
-    return " ".join(_stemmer.stemWords(words))
+    stemmed = _stemmer.stemWords(words)
+    # Quote each token to prevent FTS5 operator interpretation (NOT, OR, AND)
+    quoted = [f'"{token}"' for token in stemmed]
+    return " ".join(quoted)
 
 
 def backfill_fts_index(conn: sqlite3.Connection) -> int:
