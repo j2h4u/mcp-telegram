@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
@@ -71,10 +72,16 @@ class DaemonConnection:
     async def request(self, payload: dict) -> dict:
         """Send *payload* as a JSON line, read one JSON response line, return dict.
 
+        A request_id (8 hex chars) is added to every outgoing payload for
+        cross-process log correlation. The daemon echoes it back in the response.
+
         Raises DaemonNotRunningError if the daemon closes the connection
         without sending a response (empty read = EOF).
         """
+        rid = uuid.uuid4().hex[:8]
+        payload = {**payload, "request_id": rid}
         encoded = json.dumps(payload).encode() + b"\n"
+        logger.debug("daemon_request method=%s request_id=%s", payload.get("method"), rid)
         self._writer.write(encoded)
         await self._writer.drain()
 
@@ -91,7 +98,14 @@ class DaemonConnection:
                 "Sync daemon closed the connection unexpectedly. "
                 "Restart it with: mcp-telegram sync"
             )
-        return json.loads(line.decode())
+        response = json.loads(line.decode())
+        logger.debug(
+            "daemon_response method=%s request_id=%s ok=%s",
+            payload.get("method"),
+            response.get("request_id", rid),
+            response.get("ok"),
+        )
+        return response
 
     # ------------------------------------------------------------------
     # Convenience wrappers for the five daemon methods

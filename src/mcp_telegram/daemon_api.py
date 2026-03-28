@@ -286,7 +286,12 @@ class DaemonAPIServer:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
-        """Handle one client connection: read one request, write one response."""
+        """Handle one client connection: read one request, write one response.
+
+        One request per connection — client opens a new Unix socket connection
+        for each call. The request_id field (if present) is echoed back in the
+        response for cross-process log correlation.
+        """
         try:
             line = await reader.readline()
             if not line:
@@ -297,11 +302,23 @@ class DaemonAPIServer:
                 logger.warning("daemon_api invalid JSON: %s", exc)
                 response = {"ok": False, "error": "invalid_json", "message": "invalid JSON"}
             else:
+                request_id: str | None = req.get("request_id")
+                method: str = req.get("method", "")
+                if request_id:
+                    logger.debug(
+                        "daemon_api_request method=%s request_id=%s", method, request_id
+                    )
                 try:
                     response = await self._dispatch(req)
                 except Exception as exc:
-                    logger.exception("daemon_api dispatch error")
+                    logger.exception(
+                        "daemon_api_dispatch_error method=%s request_id=%s",
+                        method,
+                        request_id,
+                    )
                     response = {"ok": False, "error": "internal", "message": "internal error"}
+                if request_id:
+                    response = {**response, "request_id": request_id}
 
             encoded = json.dumps(response).encode() + b"\n"
             writer.write(encoded)
