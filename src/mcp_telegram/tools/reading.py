@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 
 from pydantic import Field, model_validator
 
-from ..errors import dialog_not_found_text, search_no_hits_text
+from ..errors import dialog_not_found_text, invalid_navigation_text, search_no_hits_text
 from ..resolver import parse_exact_dialog_id
 from ._base import (
     DaemonNotRunningError,
@@ -304,8 +304,13 @@ async def search_messages(args: SearchMessages) -> ToolResult:
             nav = decode_navigation_token(args.navigation)
             if nav.kind == "search":
                 offset = nav.value
-        except Exception:
-            pass
+        except Exception as exc:
+            return ToolResult(
+                content=_text_response(
+                    invalid_navigation_text(str(exc), retry_tool="SearchMessages")
+                ),
+                has_cursor=True,
+            )
 
     try:
         async with daemon_connection() as conn:
