@@ -58,21 +58,113 @@ HEARTBEAT_INTERVAL_S: float = 60.0
 GAP_SCAN_INTERVAL_S: float = 7 * 24 * 3600.0
 
 
+# ---------------------------------------------------------------------------
+# Heartbeat — standalone for testability (no nonlocal / closure)
+# ---------------------------------------------------------------------------
+
+
+def _log_heartbeat(conn: object, client: object, sync_start: float) -> None:
+    """Log heartbeat with sync stats, rate, and ETA from sync.db."""
+    try:
+        stats = dict(
+            conn.execute(  # type: ignore[union-attr]
+                "SELECT status, COUNT(*) FROM synced_dialogs GROUP BY status"
+            ).fetchall()
+        )
+        msg_count = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]  # type: ignore[union-attr]
+    except Exception:
+        logger.warning("heartbeat_stats_failed", exc_info=True)
+        stats = {}
+        msg_count = 0
+    synced = stats.get("synced", 0)
+    syncing = stats.get("syncing", 0)
+    total = synced + syncing + stats.get("not_synced", 0)
+
+    elapsed = time.monotonic() - sync_start
+    rate = msg_count / elapsed if elapsed > 0 else 0
+
+    eta_str = ""
+    if synced > 0 and synced < total:
+        remaining = total - synced
+        secs_per_dialog = elapsed / synced
+        eta_secs = int(remaining * secs_per_dialog)
+        if eta_secs >= 3600:
+            eta_str = f" eta={eta_secs // 3600}h{(eta_secs % 3600) // 60}m"
+        elif eta_secs >= 60:
+            eta_str = f" eta={eta_secs // 60}m{eta_secs % 60}s"
+        else:
+            eta_str = f" eta={eta_secs}s"
+    elif synced >= total:
+        eta_str = " eta=done"
+
+    logger.info(
+        "heartbeat — connected=%s dialogs=%d/%d messages=%d rate=%.0fmsg/s%s",
+        client.is_connected(),  # type: ignore[union-attr]
+        synced, total, msg_count, rate, eta_str,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Sync loop — batch processing + idle wait
+# ---------------------------------------------------------------------------
+
+
+async def _run_sync_loop(
+    worker: FullSyncWorker,
+    handler_manager: EventHandlerManager,
+    shutdown_event: object,
+    conn: object,
+    client: object,
+) -> None:
+    """Run the batch-sync loop with periodic heartbeat and gap scan."""
+    sync_start = time.monotonic()
+    last_heartbeat = sync_start
+    last_gap_scan = sync_start
+
+    while not shutdown_event.is_set():  # type: ignore[union-attr]
+        all_synced = await worker.process_one_batch()
+        await asyncio.sleep(0)
+
+        now_mono = time.monotonic()
+
+        if now_mono - last_heartbeat >= HEARTBEAT_INTERVAL_S:
+            _log_heartbeat(conn, client, sync_start)
+            handler_manager.refresh_synced_dialogs()
+            last_heartbeat = now_mono
+
+        if now_mono - last_gap_scan >= GAP_SCAN_INTERVAL_S:
+            deleted_count = await handler_manager.run_dm_gap_scan()
+            logger.info("gap_scan complete — marked_deleted=%d", deleted_count)
+            last_gap_scan = now_mono
+
+        if all_synced:
+            logger.info("sync_idle — all dialogs synced, waiting %ds", HEARTBEAT_INTERVAL_S)
+            try:
+                await asyncio.wait_for(
+                    shutdown_event.wait(),  # type: ignore[union-attr]
+                    timeout=HEARTBEAT_INTERVAL_S,
+                )
+                break
+            except asyncio.TimeoutError:
+                _log_heartbeat(conn, client, sync_start)
+                handler_manager.refresh_synced_dialogs()
+                last_heartbeat = time.monotonic()
+
+                if time.monotonic() - last_gap_scan >= GAP_SCAN_INTERVAL_S:
+                    deleted_count = await handler_manager.run_dm_gap_scan()
+                    logger.info("gap_scan complete — marked_deleted=%d", deleted_count)
+                    last_gap_scan = time.monotonic()
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+
 async def sync_main() -> None:
     """Main entry point for the sync daemon process.
 
-    Sequence:
-    1. Ensure sync.db schema is at current version.
-    2. Open the long-lived writer connection.
-    3. Register SIGTERM shutdown handler (checkpoints WAL on signal).
-    4. Connect to Telegram with catch_up=True — replay missed updates via PTS.
-    5. Register event handlers (D-06): BEFORE delta catch-up and FullSyncWorker.
-    6. Run DeltaSyncWorker.run_delta_catch_up() — fill gaps for 'synced' dialogs.
-    7. Bootstrap DM dialogs (D-06): enroll all User-type dialogs once.
-    8. Refresh synced_dialogs after bootstrap adds new dialogs.
-    9. Run tight sync loop: process_one_batch() + periodic heartbeat (D-10).
-    10. When all synced, enter idle heartbeat-only mode (D-11).
-    11. Unregister event handlers and disconnect TelegramClient on shutdown.
+    Orchestrates: DB init → Telegram connect → wire services → sync loop → cleanup.
     """
     db_path = get_sync_db_path()
     ensure_sync_schema(db_path)
@@ -80,7 +172,6 @@ async def sync_main() -> None:
     conn = _open_sync_db(db_path)
     migrate_legacy_databases(conn, db_path.parent)
 
-    # One-time FTS backfill for messages without index entries
     backfilled = backfill_fts_index(conn)
     if backfilled:
         logger.info("fts_backfill=%d messages indexed", backfilled)
@@ -101,7 +192,6 @@ async def sync_main() -> None:
 
         logger.info("sync-daemon started — connected=%s", client.is_connected())
 
-        # Start daemon API server on Unix socket
         api_server = DaemonAPIServer(conn, client, shutdown_event)
         socket_path = get_daemon_socket_path()
         socket_path.unlink(missing_ok=True)
@@ -110,109 +200,21 @@ async def sync_main() -> None:
         )
         logger.info("daemon API listening on %s", socket_path)
 
-        # Register event handlers BEFORE FullSyncWorker
         handler_manager = EventHandlerManager(client, conn, shutdown_event)
         handler_manager.register()
         logger.info("event handlers registered")
 
-        # Delta catch-up for synced dialogs before bootstrap
         delta_worker = DeltaSyncWorker(client, conn, shutdown_event)
         delta_new = await delta_worker.run_delta_catch_up()
         logger.info("delta_catch_up=%d new messages from gap-fill", delta_new)
 
-        # Bootstrap: enroll all DM dialogs once at startup
         worker = FullSyncWorker(client, conn, shutdown_event)
         enrolled = await worker.bootstrap_dms()
         logger.info("dm_bootstrap complete — enrolled=%d", enrolled)
 
-        # Refresh synced_dialogs after bootstrap adds new dialogs
         handler_manager.refresh_synced_dialogs()
 
-        # Tight sync loop with heartbeat
-        sync_start = time.monotonic()
-        last_heartbeat = sync_start
-        last_gap_scan = sync_start
-        prev_msg_count = 0
-
-        def _log_heartbeat() -> None:
-            """Log heartbeat with sync stats, rate, and ETA from sync.db."""
-            nonlocal prev_msg_count
-            try:
-                stats = dict(
-                    conn.execute(
-                        "SELECT status, COUNT(*) FROM synced_dialogs GROUP BY status"
-                    ).fetchall()
-                )
-                msg_count = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
-            except Exception:
-                logger.warning("heartbeat_stats_failed", exc_info=True)
-                stats = {}
-                msg_count = 0
-            synced = stats.get("synced", 0)
-            syncing = stats.get("syncing", 0)
-            total = synced + syncing + stats.get("not_synced", 0)
-
-            elapsed = time.monotonic() - sync_start
-            rate = msg_count / elapsed if elapsed > 0 else 0
-
-            # ETA based on dialog completion rate
-            eta_str = ""
-            if synced > 0 and synced < total:
-                remaining = total - synced
-                secs_per_dialog = elapsed / synced
-                eta_secs = int(remaining * secs_per_dialog)
-                if eta_secs >= 3600:
-                    eta_str = f" eta={eta_secs // 3600}h{(eta_secs % 3600) // 60}m"
-                elif eta_secs >= 60:
-                    eta_str = f" eta={eta_secs // 60}m{eta_secs % 60}s"
-                else:
-                    eta_str = f" eta={eta_secs}s"
-            elif synced >= total:
-                eta_str = " eta=done"
-
-            prev_msg_count = msg_count
-            logger.info(
-                "heartbeat — connected=%s dialogs=%d/%d messages=%d rate=%.0fmsg/s%s",
-                client.is_connected(), synced, total, msg_count, rate, eta_str,
-            )
-
-        while not shutdown_event.is_set():
-            all_synced = await worker.process_one_batch()
-            await asyncio.sleep(0)  # yield to event loop between batches
-
-            now_mono = time.monotonic()
-
-            # Periodic heartbeat logging and synced_dialogs refresh
-            if now_mono - last_heartbeat >= HEARTBEAT_INTERVAL_S:
-                _log_heartbeat()
-                handler_manager.refresh_synced_dialogs()
-                last_heartbeat = now_mono
-
-            # Weekly gap scan (D-14): detect tombstoned DM messages
-            if now_mono - last_gap_scan >= GAP_SCAN_INTERVAL_S:
-                deleted_count = await handler_manager.run_dm_gap_scan()
-                logger.info("gap_scan complete — marked_deleted=%d", deleted_count)
-                last_gap_scan = now_mono
-
-            if all_synced:
-                # D-11: idle mode — wait for HEARTBEAT_INTERVAL_S or shutdown
-                logger.info("sync_idle — all dialogs synced, waiting %ds", HEARTBEAT_INTERVAL_S)
-                try:
-                    await asyncio.wait_for(
-                        shutdown_event.wait(),
-                        timeout=HEARTBEAT_INTERVAL_S,
-                    )
-                    break  # shutdown requested
-                except asyncio.TimeoutError:
-                    _log_heartbeat()
-                    handler_manager.refresh_synced_dialogs()
-                    last_heartbeat = time.monotonic()
-
-                    # Check gap scan during idle too
-                    if time.monotonic() - last_gap_scan >= GAP_SCAN_INTERVAL_S:
-                        deleted_count = await handler_manager.run_dm_gap_scan()
-                        logger.info("gap_scan complete — marked_deleted=%d", deleted_count)
-                        last_gap_scan = time.monotonic()
+        await _run_sync_loop(worker, handler_manager, shutdown_event, conn, client)
 
     finally:
         if unix_server is not None:
