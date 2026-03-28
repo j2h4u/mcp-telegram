@@ -413,13 +413,13 @@ def register_shutdown_handler(
 
     def _on_sigterm() -> None:
         logger.info("SIGTERM received — checkpointing sync.db")
+        shutdown_event.set()  # signal coroutines to stop FIRST
         try:
             conn.rollback()
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             conn.close()
         except Exception:
             logger.exception("sync.db shutdown error")
-        shutdown_event.set()
 
     loop.add_signal_handler(signal.SIGTERM, _on_sigterm)
     return shutdown_event
