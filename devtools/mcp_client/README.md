@@ -15,6 +15,26 @@ uv run python -m devtools.mcp_client.cli call-tool \
   -- docker exec mcp-telegram mcp-telegram run
 ```
 
+## Smoke Tests
+
+Two smoke scripts cover all 11 MCP tools:
+
+**No-daemon smoke** — schema validation + graceful degradation (after every build):
+```bash
+uv run python -m devtools.mcp_client.cli script \
+  --file devtools/mcp_client/smoke-no-daemon.json \
+  -- docker exec -i mcp-telegram mcp-telegram run
+```
+
+**Integration smoke** — real Telegram data (requires running daemon):
+```bash
+uv run python -m devtools.mcp_client.cli script \
+  --file devtools/mcp_client/smoke-integration.json \
+  -- docker exec -i mcp-telegram mcp-telegram run
+```
+
+## Script Format
+
 Run several actions in one MCP session:
 
 ```json
@@ -25,11 +45,6 @@ Run several actions in one MCP session:
       "action": "call_tool",
       "name": "ListDialogs",
       "arguments": {}
-    },
-    {
-      "action": "call_tool",
-      "name": "ListTopics",
-      "arguments": {"dialog": "Studio Robots and Inbox"}
     }
   ]
 }
@@ -37,7 +52,7 @@ Run several actions in one MCP session:
 
 ```bash
 uv run python -m devtools.mcp_client.cli script \
-  --file devtools/mcp_client/forum-smoke.json \
+  --file devtools/mcp_client/your-script.json \
   -- docker exec -i mcp-telegram mcp-telegram run
 ```
 

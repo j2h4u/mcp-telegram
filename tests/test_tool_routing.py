@@ -580,11 +580,11 @@ async def test_get_sync_alerts_via_daemon():
         "ok": True,
         "data": {
             "deleted_messages": [
-                {"dialog_id": 1, "message_id": 100, "text": "gone", "deleted_at": 1700000500},
+                {"dialog_id": 1, "message_id": 100, "deleted_at": 1700000500},
             ],
             "edits": [
                 {"dialog_id": 1, "message_id": 200, "version": 1,
-                 "old_text": "before", "edit_date": 1700000600},
+                 "edit_date": 1700000600},
             ],
             "access_lost": [
                 {"dialog_id": 2, "access_lost_at": 1700000700},
@@ -595,9 +595,9 @@ async def test_get_sync_alerts_via_daemon():
         result = await get_sync_alerts(GetSyncAlerts(since=0, limit=50))
     text = result[0].text
     assert "Deleted Messages" in text
-    assert "gone" in text
+    assert "dialog=1" in text
     assert "Edits" in text
-    assert "before" in text
+    assert "edit_date=" in text
     assert "Access Lost" in text
     conn.get_sync_alerts.assert_called_once_with(since=0, limit=50)
 
