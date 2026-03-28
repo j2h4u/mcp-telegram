@@ -93,7 +93,7 @@ def serialize_reactions(reactions: Any | None) -> str | None:
     Format: {"emoji": count, ...} or None if no reactions.
 
     Per RESEARCH.md Open Question 1 recommendation: store a simple
-    JSON summary dict consistent with ReactionMetadataCache in cache.py.
+    JSON summary dict {emoji: count}.
     """
     if reactions is None:
         return None
@@ -113,9 +113,8 @@ def serialize_reactions(reactions: Any | None) -> str | None:
 def extract_message_row(dialog_id: int, msg: Any) -> tuple[object, ...]:
     """Extract sync.db messages row tuple from a Telethon message object.
 
-    Mirrors cache.py::MessageCache.store_messages() field extraction
-    adapted for the sync.db schema. Omits edit_date and fetched_at
-    (not in sync.db); adds reactions serialization.
+    Follows sync.db message insert pattern. Omits edit_date and fetched_at
+    (not in sync.db schema); adds reactions serialization.
     """
     message_id = int(getattr(msg, "id", 0))
 
