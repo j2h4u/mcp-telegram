@@ -5,7 +5,6 @@ import logging
 import time
 import typing as t
 from dataclasses import dataclass
-from functools import cache as functools_cache
 from functools import singledispatch
 
 from mcp.types import (
@@ -203,13 +202,6 @@ def tool_args(tool: Tool, *args, **kwargs) -> ToolArgs:  # noqa: ANN002, ANN003
         raise ValueError(f"Unknown tool: {tool.name}")
     cls = entry[0]
     return cls(*args, **kwargs)
-
-
-@functools_cache
-def get_prefetch_coordinator():
-    """Return the shared PrefetchCoordinator instance (created once per process)."""
-    from ..prefetch import PrefetchCoordinator
-    return PrefetchCoordinator()
 
 
 def verify_tool_registry() -> None:

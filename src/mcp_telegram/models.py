@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Awaitable, Callable, Literal, Protocol, TypedDict
 
-from .pagination import HistoryDirection
 from .resolver import Candidates, NotFound, Resolved, ResolvedWithMessage
 
 if TYPE_CHECKING:
@@ -226,7 +225,6 @@ class SearchExecution:
 
 
 # Type aliases for callable signatures
-DialogResolveResult = Resolved | ResolvedWithMessage | Candidates | NotFound
 DialogTargetResult = ResolvedDialogTarget | DialogTargetFailure
 ForumTopicCapabilityResult = TopicCatalog | ResolvedForumTopic | ForumTopicFailure
 ListTopicsCapabilityResult = ListTopicsExecution | DialogTargetFailure | ForumTopicFailure

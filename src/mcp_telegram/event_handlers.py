@@ -399,8 +399,8 @@ class EventHandlerManager:
         """Serialize a Telethon MessageReactions object to a JSON string.
 
         Format: {"emoji": count, ...} or None if no reactions.
-        Consistent with FullSyncWorker._serialize_reactions() and
-        ReactionMetadataCache in cache.py.
+        Consistent with FullSyncWorker.serialize_reactions() — same JSON dict
+        {emoji: count} format.
         """
         if reactions is None:
             return None
