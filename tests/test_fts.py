@@ -93,15 +93,27 @@ def test_stem_text_english_and_numbers() -> None:
 
 
 def test_stem_query() -> None:
-    """stem_query produces same stems as stem_text for equivalent input."""
-    # stem_query and stem_text should be functionally equivalent for word extraction
-    assert stem_query("написал сообщение") == stem_text("написал сообщение"), (
-        "stem_query and stem_text must produce same output for equivalent input"
+    """stem_query produces quoted stems suitable for FTS5 MATCH clauses."""
+    # stem_query wraps each token in double quotes to prevent FTS5 operator
+    # interpretation (NOT, OR, AND treated as search terms, not operators)
+    result = stem_query("написал сообщение")
+    stem_result = stem_text("написал сообщение")
+    # Unquoted stems must match stem_text output
+    unquoted = result.replace('"', "")
+    assert unquoted == stem_result, (
+        f"stem_query stems must match stem_text output: {unquoted!r} != {stem_result!r}"
+    )
+    # Each token must be quoted
+    assert result.startswith('"') and result.endswith('"'), (
+        f"stem_query output must use quoted tokens: {result!r}"
     )
     # stem_query on Russian verbs produces consistent output
     q1 = stem_query("написал")
     q2 = stem_query("написали")
     assert q1 == q2, f"stem_query must normalize morphology: {q1!r} != {q2!r}"
+    # FTS5 operator keywords are treated as search terms, not operators
+    not_query = stem_query("NOT")
+    assert '"' in not_query, f"operator keyword NOT must be quoted: {not_query!r}"
 
 
 # ---------------------------------------------------------------------------
