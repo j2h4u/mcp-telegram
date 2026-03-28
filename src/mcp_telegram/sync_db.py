@@ -340,15 +340,15 @@ def _migrate_from_legacy_db(
     if not legacy_path.exists():
         return 0
     conn.execute("ATTACH DATABASE ? AS legacy", (str(legacy_path),))
-    total = 0
+    rows_copied = 0
     try:
         for stmt in copy_stmts:
             cursor = conn.execute(stmt)
-            total += cursor.rowcount
+            rows_copied += cursor.rowcount
         conn.commit()
     finally:
         conn.execute("DETACH DATABASE legacy")
-    return total
+    return rows_copied
 
 
 def migrate_legacy_databases(conn: sqlite3.Connection, state_dir: Path) -> None:

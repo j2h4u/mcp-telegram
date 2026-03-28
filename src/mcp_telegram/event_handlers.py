@@ -217,7 +217,6 @@ class EventHandlerManager:
                 # No text change — service edit, media caption update, etc. (Pitfall 3)
                 return
 
-            # Text changed: record old version, update current text
             edit_date_raw = getattr(msg, "edit_date", None)
             edit_date_unix = (
                 int(edit_date_raw.timestamp()) if edit_date_raw is not None else now

@@ -100,14 +100,14 @@ def serialize_reactions(reactions: Any | None) -> str | None:
     results = getattr(reactions, "results", None)
     if not results:
         return None
-    summary: dict[str, int] = {}
+    reaction_counts: dict[str, int] = {}
     for item in results:
         reaction = getattr(item, "reaction", None)
         emoticon = getattr(reaction, "emoticon", None) if reaction is not None else None
         count = getattr(item, "count", 0)
         if emoticon is not None:
-            summary[emoticon] = int(count)
-    return json.dumps(summary) if summary else None
+            reaction_counts[emoticon] = int(count)
+    return json.dumps(reaction_counts) if reaction_counts else None
 
 
 def extract_message_row(dialog_id: int, msg: Any) -> tuple[object, ...]:

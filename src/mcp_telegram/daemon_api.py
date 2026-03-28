@@ -233,13 +233,13 @@ def _query_usage_stats(cursor: sqlite3.Cursor, since: int) -> dict:
     latency_median_ms = 0
     latency_p95_ms = 0
     if latencies:
-        sorted_latencies = [lat[0] for lat in latencies]
-        latency_median_ms = sorted_latencies[len(sorted_latencies) // 2]
-        p95_idx = int(len(sorted_latencies) * 0.95)
+        latency_values_ms = [lat[0] for lat in latencies]
+        latency_median_ms = latency_values_ms[len(latency_values_ms) // 2]
+        p95_idx = int(len(latency_values_ms) * 0.95)
         latency_p95_ms = (
-            sorted_latencies[p95_idx]
-            if p95_idx < len(sorted_latencies)
-            else sorted_latencies[-1]
+            latency_values_ms[p95_idx]
+            if p95_idx < len(latency_values_ms)
+            else latency_values_ms[-1]
         )
 
     return {
@@ -393,22 +393,22 @@ class DaemonAPIServer:
 
         # Fallback: iterate dialogs and fuzzy-match by name
         logger.debug("resolve_dialog_fallback_iter_dialogs query=%r", dialog)
-        best: Any | None = None
-        best_name: str = ""
+        matched_dialog: Any | None = None
+        matched_dialog_name: str = ""
         async for d in self._client.iter_dialogs():
             name = getattr(d, "name", "") or ""
             if name.lower() == dialog.lower():
-                best = d
-                best_name = name
+                matched_dialog = d
+                matched_dialog_name = name
                 break
-            if dialog.lower() in name.lower() and best is None:
-                best = d
-                best_name = name
+            if dialog.lower() in name.lower() and matched_dialog is None:
+                matched_dialog = d
+                matched_dialog_name = name
 
-        if best is not None:
+        if matched_dialog is not None:
             if _TELETHON_AVAILABLE and telethon_utils is not None:
-                return int(telethon_utils.get_peer_id(best.entity))
-            return int(best.id)
+                return int(telethon_utils.get_peer_id(matched_dialog.entity))
+            return int(matched_dialog.id)
 
         raise ValueError(
             f"Dialog {dialog!r} not found. "

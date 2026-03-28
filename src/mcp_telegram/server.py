@@ -54,13 +54,11 @@ def _safe_boundary_error_text(*, tool_name: str, stage: str, exc: Exception) -> 
 
 @app.list_prompts()
 async def list_prompts() -> list[Prompt]:
-    """Return empty list — prompts not implemented."""
     return []
 
 
 @app.list_resources()
 async def list_resources() -> list[Resource]:
-    """Return empty list — resources not implemented."""
     return []
 
 
@@ -72,7 +70,6 @@ async def list_tools() -> list[Tool]:
 
 @app.list_resource_templates()
 async def list_resource_templates() -> list[ResourceTemplate]:
-    """Return empty list — resource templates not implemented."""
     return []
 
 
