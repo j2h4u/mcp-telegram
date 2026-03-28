@@ -120,7 +120,7 @@ async def get_sync_alerts(args: GetSyncAlerts) -> ToolResult:
         for d in deleted:
             sections.append(
                 f"  dialog={d['dialog_id']} msg={d['message_id']} "
-                f"deleted_at={d['deleted_at']} text='{d.get('text', '')}'"
+                f"deleted_at={d['deleted_at']}"
             )
 
     if edits:
@@ -128,7 +128,7 @@ async def get_sync_alerts(args: GetSyncAlerts) -> ToolResult:
         for e in edits:
             sections.append(
                 f"  dialog={e['dialog_id']} msg={e['message_id']} "
-                f"v{e['version']} edit_date={e['edit_date']} old_text='{e.get('old_text', '')}'"
+                f"v{e['version']} edit_date={e['edit_date']}"
             )
 
     if access_lost:
