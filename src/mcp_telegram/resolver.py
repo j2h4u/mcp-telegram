@@ -4,6 +4,7 @@ import logging
 import re
 import sqlite3
 from dataclasses import dataclass
+from typing import Any
 
 from anyascii import anyascii
 from rapidfuzz import fuzz, process, utils
@@ -106,7 +107,7 @@ def _build_norm_map(
 def _fuzzy_resolve(
     query: str,
     choices: dict[int, str],
-    cache: object | None = None,
+    cache: Any | None = None,
     *,
     normalized_choices: dict[int, str] | None = None,
 ) -> ResolveResult:
@@ -160,7 +161,7 @@ def _fuzzy_resolve(
 def _build_matches(
     hits: list[tuple[str, float, int]],
     norm_map: dict[str, list[tuple[int, str]]],
-    cache: object | None,
+    cache: Any | None,
     exact_first_id: int | None = None,
 ) -> list[dict]:
     """Build match dicts from rapidfuzz hits, optionally putting exact_first_id first."""
@@ -184,7 +185,7 @@ def _build_matches(
     return matches
 
 
-def _make_match_info(entity_id: int, display_name: str, score: int, cache: object | None) -> dict:
+def _make_match_info(entity_id: int, display_name: str, score: int, cache: Any | None) -> dict:
     entity_info: dict = {
         "entity_id": entity_id,
         "display_name": display_name,
@@ -208,7 +209,7 @@ def _make_match_info(entity_id: int, display_name: str, score: int, cache: objec
 def resolve(
     query: str,
     choices: dict[int, str],
-    cache: object | None = None,
+    cache: Any | None = None,
     *,
     normalized_choices: dict[int, str] | None = None,
 ) -> ResolveResult:
