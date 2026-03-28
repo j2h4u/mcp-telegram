@@ -121,15 +121,30 @@ class DeltaSyncWorker:
                 new_msgs.append(extract_message_row(dialog_id, msg))
         except FloodWaitError as exc:
             logger.warning(
-                "FloodWait delta dialog_id=%d — %ds", dialog_id, exc.seconds
+                "FloodWait delta dialog_id=%d — %ds (preserving %d already-fetched messages)",
+                dialog_id,
+                exc.seconds,
+                len(new_msgs),
             )
+            if new_msgs:
+                with self._conn:
+                    self._conn.executemany(_INSERT_MESSAGE_SQL, new_msgs)
+                    self._conn.executemany(
+                        INSERT_FTS_SQL,
+                        ((row[0], row[1], stem_text(row[3])) for row in new_msgs),  # type: ignore[arg-type]
+                    )
+                logger.info(
+                    "delta dialog_id=%d preserved_messages=%d before FloodWait",
+                    dialog_id,
+                    len(new_msgs),
+                )
             try:
                 await asyncio.wait_for(
                     self._shutdown_event.wait(), timeout=float(exc.seconds)
                 )
             except asyncio.TimeoutError:
-                pass  # slept the full duration; return what we have so far
-            return 0
+                pass  # slept the full duration; caller will retry remaining gap
+            return len(new_msgs)
         except _ACCESS_LOST_ERRORS as exc:
             logger.warning(
                 "access_lost delta dialog_id=%d — %s",
