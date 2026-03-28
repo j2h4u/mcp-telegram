@@ -930,9 +930,16 @@ class DaemonAPIServer:
                         "sender_first_name": sender_first_name,
                     })
             except Exception as exc:
+                fetched = len(group["messages"])
                 logger.warning(
-                    "unread_fetch_failed chat_id=%r error=%s", entry["chat_id"], exc, exc_info=True
+                    "unread_fetch_failed chat_id=%r fetched=%d expected=%d error=%s",
+                    entry["chat_id"],
+                    fetched,
+                    entry["unread_count"],
+                    exc,
+                    exc_info=True,
                 )
+                group["is_truncated"] = True
             groups.append(group)
 
         return {"ok": True, "data": {"groups": groups}}
