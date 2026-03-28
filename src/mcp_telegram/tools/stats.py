@@ -6,7 +6,7 @@ from ..errors import (
     no_usage_data_text,
     usage_stats_query_error_text,
 )
-from ._base import DaemonNotRunningError, ToolArgs, ToolResult, _text_response, daemon_connection, mcp_tool
+from ._base import DaemonNotRunningError, ToolArgs, ToolResult, _daemon_not_running_text, _text_response, daemon_connection, mcp_tool
 
 logger = logging.getLogger(__name__)
 
@@ -75,9 +75,7 @@ async def get_usage_stats(args: GetUsageStats) -> ToolResult:
         async with daemon_connection() as conn:
             response = await conn.get_usage_stats()
     except DaemonNotRunningError:
-        return ToolResult(content=_text_response(
-            "Sync daemon is not running.\nAction: Start it with: mcp-telegram sync"
-        ))
+        return ToolResult(content=_text_response(_daemon_not_running_text()))
 
     if not response.get("ok"):
         error_msg = response.get("error", "Unknown error")
