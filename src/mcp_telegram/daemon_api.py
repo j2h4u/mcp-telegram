@@ -288,13 +288,14 @@ class DaemonAPIServer:
             try:
                 req = json.loads(line.decode())
             except json.JSONDecodeError as exc:
-                response = {"ok": False, "error": "invalid_json", "message": str(exc)}
+                logger.warning("daemon_api invalid JSON: %s", exc)
+                response = {"ok": False, "error": "invalid_json", "message": "invalid JSON"}
             else:
                 try:
                     response = await self._dispatch(req)
                 except Exception as exc:
                     logger.exception("daemon_api dispatch error")
-                    response = {"ok": False, "error": "internal", "message": str(exc)}
+                    response = {"ok": False, "error": "internal", "message": "internal error"}
 
             encoded = json.dumps(response).encode() + b"\n"
             writer.write(encoded)
@@ -581,10 +582,11 @@ class DaemonAPIServer:
         try:
             entity = await self._client.get_entity(dialog_id)
         except Exception as exc:
+            logger.warning("get_entity failed for dialog_id=%s: %s", dialog_id, exc)
             return {
                 "ok": False,
                 "error": "entity_not_found",
-                "message": str(exc),
+                "message": "telegram API error",
             }
 
         try:
@@ -611,10 +613,11 @@ class DaemonAPIServer:
             else:
                 topics = []
         except Exception as exc:
+            logger.warning("topics fetch failed for dialog_id=%s: %s", dialog_id, exc)
             return {
                 "ok": False,
                 "error": "topics_fetch_failed",
-                "message": str(exc),
+                "message": "telegram API error",
             }
 
         return {"ok": True, "data": {"topics": topics, "dialog_id": dialog_id}}
@@ -771,7 +774,8 @@ class DaemonAPIServer:
         try:
             user = await self._client.get_entity(user_id)
         except Exception as exc:
-            return {"ok": False, "error": "user_not_found", "message": str(exc)}
+            logger.warning("get_entity failed for user_id=%s: %s", user_id, exc)
+            return {"ok": False, "error": "user_not_found", "message": "telegram API error"}
 
         # Fetch common chats (only available for user entities)
         common_chats: list[dict] = []
@@ -961,7 +965,7 @@ class DaemonAPIServer:
             return {"ok": True}
         except Exception as exc:
             logger.error("record_telemetry failed: %s", exc)
-            return {"ok": False, "error": str(exc)}
+            return {"ok": False, "error": "internal", "message": "internal error"}
 
     # ------------------------------------------------------------------
     # get_usage_stats (Plan 33-01)
@@ -975,7 +979,7 @@ class DaemonAPIServer:
             return {"ok": True, "data": stats}
         except Exception as exc:
             logger.error("get_usage_stats failed: %s", exc)
-            return {"ok": False, "error": str(exc)}
+            return {"ok": False, "error": "internal", "message": "internal error"}
 
     # ------------------------------------------------------------------
     # upsert_entities (Plan 33-01)
@@ -1006,7 +1010,7 @@ class DaemonAPIServer:
             return {"ok": True, "upserted": len(entities)}
         except Exception as exc:
             logger.error("upsert_entities failed: %s", exc)
-            return {"ok": False, "error": str(exc)}
+            return {"ok": False, "error": "internal", "message": "internal error"}
 
     # ------------------------------------------------------------------
     # resolve_entity (Plan 33-01)
