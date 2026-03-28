@@ -346,24 +346,6 @@ def test_format_unread_grouped_multiple_chats() -> None:
 
 
 # ---------------------------------------------------------------------------
-# CachedMessage formatter transparency test (Phase 20, Plan 02 — CACHE-02)
-# ---------------------------------------------------------------------------
-
-
-def test_cached_message_format_transparency() -> None:
-    """format_messages() accepts CachedMessage without modification (CACHE-02 transparency)."""
-    from mcp_telegram.cache import CachedMessage
-    from mcp_telegram.formatter import format_messages
-
-    row = (100, 50, 1718451000, "hello from cache", 101, "Alice", None, None, None, None, 1718451100)
-    msg = CachedMessage.from_row(row)
-    result = format_messages([msg], {})
-    assert result != ""
-    assert "Alice" in result
-    assert "hello from cache" in result
-
-
-# ---------------------------------------------------------------------------
 # Edited marker tests (Phase 22)
 # ---------------------------------------------------------------------------
 

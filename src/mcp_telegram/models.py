@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Awaitable, Callable, Literal, Protocol, TypedDict
 
-from .cache import EntityCache
 from .pagination import HistoryDirection
 from .resolver import Candidates, NotFound, Resolved, ResolvedWithMessage
 
@@ -239,7 +238,6 @@ HistoryReadCapabilityResult = (
     | NavigationFailure
 )
 SearchCapabilityResult = SearchExecution | DialogTargetFailure | NavigationFailure
-DialogResolver = Callable[[EntityCache, str], Awaitable[DialogResolveResult]]
 TopicLoader = Callable[..., Awaitable[TopicCatalog]]
 TopicFetcher = Callable[..., Awaitable[list[MessageLike]]]
 TopicRefresher = Callable[..., Awaitable[TopicMetadata | None]]
