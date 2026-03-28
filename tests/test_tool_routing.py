@@ -636,13 +636,16 @@ def test_no_connected_client_in_tools():
 
 
 async def test_get_user_info_resolves_via_daemon():
-    """GetUserInfo resolves entity via daemon resolve_entity then fetches profile."""
-    call_count = 0
-    resolve_conn = _make_daemon_conn({
+    """GetUserInfo resolves entity via daemon resolve_entity then fetches profile.
+
+    Uses a single daemon connection (resolve + get_user_info in same context).
+    """
+    conn = MagicMock()
+    conn.resolve_entity = AsyncMock(return_value={
         "ok": True,
         "data": {"result": "resolved", "entity_id": 12345, "display_name": "Alice"},
     })
-    profile_conn = _make_daemon_conn({
+    conn.get_user_info = AsyncMock(return_value={
         "ok": True,
         "data": {
             "id": 12345,
@@ -654,25 +657,17 @@ async def test_get_user_info_resolves_via_daemon():
             ],
         },
     })
+    conn.record_telemetry = AsyncMock(return_value={"ok": True})
 
-    @asynccontextmanager
-    async def _multi_conn_cm():
-        nonlocal call_count
-        call_count += 1
-        if call_count == 1:
-            yield resolve_conn
-        else:
-            yield profile_conn
-
-    with patch("mcp_telegram.tools.user_info.daemon_connection", side_effect=_multi_conn_cm):
+    with _patch_daemon(conn):
         result = await get_user_info(GetUserInfo(user="Alice"))
 
     text = result[0].text
     assert '[resolved: "Alice"]' in text
     assert "12345" in text
     assert "Dev Chat" in text
-    resolve_conn.resolve_entity.assert_called_once_with(query="Alice")
-    profile_conn.get_user_info.assert_called_once_with(user_id=12345)
+    conn.resolve_entity.assert_called_once_with(query="Alice")
+    conn.get_user_info.assert_called_once_with(user_id=12345)
 
 
 async def test_get_user_info_via_daemon():
@@ -725,27 +720,19 @@ async def test_get_user_info_daemon_not_running():
 
 async def test_get_user_info_user_not_found_by_daemon():
     """GetUserInfo handles user_not_found error from daemon profile fetch."""
-    call_count = 0
-    resolve_conn = _make_daemon_conn({
+    conn = MagicMock()
+    conn.resolve_entity = AsyncMock(return_value={
         "ok": True,
         "data": {"result": "resolved", "entity_id": 999, "display_name": "Ghost"},
     })
-    profile_conn = _make_daemon_conn({
+    conn.get_user_info = AsyncMock(return_value={
         "ok": False,
         "error": "user_not_found",
         "message": "User 999 not found",
     })
+    conn.record_telemetry = AsyncMock(return_value={"ok": True})
 
-    @asynccontextmanager
-    async def _multi_conn_cm():
-        nonlocal call_count
-        call_count += 1
-        if call_count == 1:
-            yield resolve_conn
-        else:
-            yield profile_conn
-
-    with patch("mcp_telegram.tools.user_info.daemon_connection", side_effect=_multi_conn_cm):
+    with _patch_daemon(conn):
         result = await get_user_info(GetUserInfo(user="Ghost"))
 
     assert "could not fetch" in result[0].text.lower() or "error" in result[0].text.lower()

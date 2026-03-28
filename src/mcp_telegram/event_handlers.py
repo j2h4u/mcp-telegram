@@ -28,7 +28,7 @@ from typing import Any
 from telethon import events  # type: ignore[import-untyped]
 
 from .fts import DELETE_FTS_SQL, INSERT_FTS_SQL, stem_text
-from .sync_worker import extract_message_row, serialize_reactions
+from .sync_worker import INSERT_MESSAGE_SQL, extract_message_row, serialize_reactions
 
 logger = logging.getLogger(__name__)
 
@@ -36,12 +36,6 @@ logger = logging.getLogger(__name__)
 # SQL constants
 # ---------------------------------------------------------------------------
 
-_INSERT_MESSAGE_SQL = (
-    "INSERT OR REPLACE INTO messages "
-    "(dialog_id, message_id, sent_at, text, sender_id, sender_first_name, "
-    "media_description, reply_to_msg_id, forum_topic_id, reactions, is_deleted) "
-    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)"
-)
 
 _SELECT_MESSAGE_TEXT_SQL = (
     "SELECT text FROM messages WHERE dialog_id=? AND message_id=?"
@@ -164,7 +158,7 @@ class EventHandlerManager:
         now = int(time.time())
 
         with self._conn:
-            self._conn.execute(_INSERT_MESSAGE_SQL, row)
+            self._conn.execute(INSERT_MESSAGE_SQL, row)
             self._conn.execute(
                 INSERT_FTS_SQL,
                 (dialog_id, int(getattr(msg, "id", 0)), stem_text(getattr(msg, "message", None))),
@@ -201,7 +195,7 @@ class EventHandlerManager:
                 # Message not yet in sync.db (Pitfall 2 from RESEARCH.md):
                 # insert it with current text; historical versions are lost (acceptable).
                 row = extract_message_row(dialog_id, msg)
-                self._conn.execute(_INSERT_MESSAGE_SQL, row)
+                self._conn.execute(INSERT_MESSAGE_SQL, row)
                 self._conn.execute(
                     INSERT_FTS_SQL, (dialog_id, message_id, stem_text(new_text))
                 )
@@ -284,17 +278,17 @@ class EventHandlerManager:
     async def run_dm_gap_scan(self) -> int:
         """Scan all synced DM dialogs for deleted messages via live Telegram lookup.
 
-        Compares synced message IDs (sent_at < scan_start) against live Telegram
+        Compares synced message IDs (sent_at < scan_started_at) against live Telegram
         using client.get_messages(entity, ids=[...]) in batches of 100.  Messages
         returning None are confirmed deleted and tombstoned (is_deleted=1).
 
-        Only messages synced before scan_start are checked to avoid false positives
+        Only messages synced before scan_started_at are checked to avoid false positives
         on messages that arrived during the scan itself.
 
         Returns:
             Total count of messages newly marked as is_deleted=1.
         """
-        scan_start = int(time.time())
+        scan_started_at = int(time.time())
         total_marked = 0
 
         dialog_ids = [
@@ -306,7 +300,7 @@ class EventHandlerManager:
             message_ids = [
                 int(row[0])
                 for row in self._conn.execute(
-                    _SELECT_UNDELETED_MESSAGES_SQL, (dialog_id, scan_start)
+                    _SELECT_UNDELETED_MESSAGES_SQL, (dialog_id, scan_started_at)
                 ).fetchall()
             ]
 

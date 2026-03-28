@@ -103,8 +103,7 @@ async def list_unread_messages(args: ListUnreadMessages) -> ToolResult:
         empty_msg = no_unread_all_text() if args.scope == "all" else no_unread_personal_text()
         return ToolResult(content=_text_response(empty_msg))
 
-    # Convert daemon response to UnreadChatData for formatting
-    chats_data: list[UnreadChatData] = []
+    chats: list[UnreadChatData] = []
     total_messages_shown = 0
 
     for group in groups:
@@ -120,7 +119,7 @@ async def list_unread_messages(args: ListUnreadMessages) -> ToolResult:
         )
         chat_data.messages = messages
         total_messages_shown += len(messages)
-        chats_data.append(chat_data)
+        chats.append(chat_data)
 
-    result_text = format_unread_messages_grouped(chats_data)
+    result_text = format_unread_messages_grouped(chats)
     return ToolResult(content=_text_response(result_text), result_count=total_messages_shown)

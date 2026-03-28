@@ -133,6 +133,12 @@ class TopicMatch:
 
 @dataclass(frozen=True)
 class ForumTopicFailure:
+    """Topic resolution failed.
+
+    Kinds: catalog_unavailable (dialog has no topic catalog), inaccessible (TOPIC_PRIVATE RPC),
+    not_found (no match), ambiguous (multiple matches), deleted (matched but tombstoned),
+    deleted_ambiguous (all matches tombstoned).
+    """
     kind: Literal[
         "catalog_unavailable",
         "inaccessible",
@@ -159,6 +165,12 @@ class ResolvedForumTopic:
 
 @dataclass(frozen=True)
 class MessageReadFailure:
+    """Message read failed.
+
+    Kinds: invalid_cursor (malformed navigation token), sender_not_found (sender filter matched
+    nothing), sender_ambiguous (multiple sender matches), deleted (dialog tombstoned in sync.db),
+    inaccessible (Telegram RPC denied access).
+    """
     kind: Literal[
         "invalid_cursor",
         "sender_not_found",

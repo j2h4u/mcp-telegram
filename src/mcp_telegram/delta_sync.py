@@ -25,7 +25,7 @@ from telethon.errors import RPCError  # type: ignore[import-untyped]
 from .fts import INSERT_FTS_SQL, stem_text
 from .sync_worker import (
     _ACCESS_LOST_ERRORS,
-    _INSERT_MESSAGE_SQL,
+    INSERT_MESSAGE_SQL,
     _SET_ACCESS_LOST_SQL,
     extract_message_row,
 )
@@ -128,7 +128,7 @@ class DeltaSyncWorker:
             )
             if new_msgs:
                 with self._conn:
-                    self._conn.executemany(_INSERT_MESSAGE_SQL, new_msgs)
+                    self._conn.executemany(INSERT_MESSAGE_SQL, new_msgs)
                     self._conn.executemany(
                         INSERT_FTS_SQL,
                         ((row[0], row[1], stem_text(row[3])) for row in new_msgs),  # type: ignore[arg-type]
@@ -162,7 +162,7 @@ class DeltaSyncWorker:
 
         if new_msgs:
             with self._conn:
-                self._conn.executemany(_INSERT_MESSAGE_SQL, new_msgs)
+                self._conn.executemany(INSERT_MESSAGE_SQL, new_msgs)
                 self._conn.executemany(
                     INSERT_FTS_SQL,
                     ((row[0], row[1], stem_text(row[3])) for row in new_msgs),  # type: ignore[arg-type]

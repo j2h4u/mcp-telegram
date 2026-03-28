@@ -292,6 +292,8 @@ class DaemonAPIServer:
         for each call. The request_id field (if present) is echoed back in the
         response for cross-process log correlation.
         """
+        method = ""
+        request_id: str | None = None
         try:
             line = await reader.readline()
             if not line:
@@ -302,15 +304,15 @@ class DaemonAPIServer:
                 logger.warning("daemon_api invalid JSON: %s", exc)
                 response = {"ok": False, "error": "invalid_json", "message": "invalid JSON"}
             else:
-                request_id: str | None = req.get("request_id")
-                method: str = req.get("method", "")
+                request_id = req.get("request_id")
+                method = req.get("method", "")
                 if request_id:
                     logger.debug(
                         "daemon_api_request method=%s request_id=%s", method, request_id
                     )
                 try:
                     response = await self._dispatch(req)
-                except Exception as exc:
+                except Exception:
                     logger.exception(
                         "daemon_api_dispatch_error method=%s request_id=%s",
                         method,
@@ -324,7 +326,10 @@ class DaemonAPIServer:
             writer.write(encoded)
             await writer.drain()
         except Exception:
-            logger.exception("daemon_api handle_client error")
+            logger.exception(
+                "daemon_api handle_client_write_error method=%s request_id=%s",
+                method, request_id,
+            )
         finally:
             writer.close()
             try:
@@ -877,22 +882,24 @@ class DaemonAPIServer:
     # ------------------------------------------------------------------
 
     async def _list_unread_messages(self, req: dict) -> dict:
-        """Return prioritized unread messages across dialogs.
-
-        Steps:
-        1. Iterate dialogs, collect those with unread_count > 0.
-        2. Filter by scope (personal = exclude channels and large groups).
-        3. Assign priority tiers and sort.
-        4. Allocate message budget proportionally.
-        5. Fetch messages per chat up to their budget.
-        """
+        """Return prioritized unread messages across dialogs."""
         scope: str = req.get("scope", "personal")
         limit: int = _clamp(req.get("limit", 100), 1, 500)
         group_size_threshold: int = req.get("group_size_threshold", 100)
 
-        # Step A — Collect unread dialogs
-        unread_entries: list[dict] = []
-        unread_counts: dict[int, int] = {}
+        entries, counts = await self._collect_unread_dialogs(scope, group_size_threshold)
+        self._rank_unread_entries(entries)
+        allocation = allocate_message_budget_proportional(counts, limit)
+        groups = await self._fetch_unread_groups(entries, allocation)
+
+        return {"ok": True, "data": {"groups": groups}}
+
+    async def _collect_unread_dialogs(
+        self, scope: str, group_size_threshold: int
+    ) -> tuple[list[dict], dict[int, int]]:
+        """Iterate Telegram dialogs, return those with unread_count > 0."""
+        entries: list[dict] = []
+        counts: dict[int, int] = {}
 
         async for dialog in self._client.iter_dialogs(archived=None, ignore_pinned=False):
             unread_count = getattr(dialog, "unread_count", 0)
@@ -902,20 +909,15 @@ class DaemonAPIServer:
             if not isinstance(chat_id, int):
                 continue
 
-            display_name = getattr(dialog, "name", f"Chat {chat_id}")
             category = _classify_dialog_for_unread(dialog)
-            unread_mentions_count = getattr(dialog, "unread_mentions_count", 0)
-            date = getattr(dialog, "date", None)
-            raw_dialog = getattr(dialog, "dialog", None)
-            read_inbox_max_id = getattr(raw_dialog, "read_inbox_max_id", 0) if raw_dialog else 0
-            entity = getattr(dialog, "entity", None)
-            participants_count = (
-                getattr(entity, "participants_count", None) if entity is not None else None
-            )
 
             if scope == "personal":
                 if category == "channel":
                     continue
+                entity = getattr(dialog, "entity", None)
+                participants_count = (
+                    getattr(entity, "participants_count", None) if entity is not None else None
+                )
                 if (
                     category == "group"
                     and participants_count is not None
@@ -923,31 +925,38 @@ class DaemonAPIServer:
                 ):
                     continue
 
-            unread_entries.append({
+            raw_dialog = getattr(dialog, "dialog", None)
+            entries.append({
                 "chat_id": chat_id,
-                "display_name": display_name,
+                "display_name": getattr(dialog, "name", f"Chat {chat_id}"),
                 "unread_count": unread_count,
-                "unread_mentions_count": unread_mentions_count,
+                "unread_mentions_count": getattr(dialog, "unread_mentions_count", 0),
                 "category": category,
-                "date": date,
-                "read_inbox_max_id": read_inbox_max_id,
+                "date": getattr(dialog, "date", None),
+                "read_inbox_max_id": getattr(raw_dialog, "read_inbox_max_id", 0) if raw_dialog else 0,
             })
-            unread_counts[chat_id] = unread_count
+            counts[chat_id] = unread_count
 
-        # Step B — Assign tiers and sort (lower tier = higher priority)
-        for entry in unread_entries:
+        return entries, counts
+
+    @staticmethod
+    def _rank_unread_entries(entries: list[dict]) -> None:
+        """Assign priority tiers and sort in place (lower tier = higher priority)."""
+        for entry in entries:
             entry["tier"] = unread_chat_tier({
                 "unread_mentions_count": entry["unread_mentions_count"],
                 "category": entry["category"],
             })
-        unread_entries.sort(
+        entries.sort(
             key=lambda e: (e["tier"], -(e["date"].timestamp() if e["date"] else 0))
         )
-        allocation = allocate_message_budget_proportional(unread_counts, limit)
 
-        # Step C — Fetch messages per chat
+    async def _fetch_unread_groups(
+        self, entries: list[dict], allocation: dict[int, int]
+    ) -> list[dict]:
+        """Fetch messages for each unread dialog up to its budget allocation."""
         groups: list[dict] = []
-        for entry in unread_entries:
+        for entry in entries:
             budget = allocation.get(entry["chat_id"], 0)
             group: dict = {
                 "dialog_id": entry["chat_id"],
@@ -989,7 +998,7 @@ class DaemonAPIServer:
                 group["is_truncated"] = True
             groups.append(group)
 
-        return {"ok": True, "data": {"groups": groups}}
+        return groups
 
     # ------------------------------------------------------------------
     # record_telemetry (Plan 33-01)

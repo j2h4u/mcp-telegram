@@ -96,7 +96,12 @@ class DaemonConnection:
                 "Sync daemon closed the connection unexpectedly. "
                 "Restart it with: mcp-telegram sync"
             )
-        response = json.loads(line.decode())
+        try:
+            response = json.loads(line.decode())
+        except json.JSONDecodeError as exc:
+            raise DaemonNotRunningError(
+                f"Daemon returned malformed JSON: {exc}"
+            ) from exc
         logger.debug(
             "daemon_response method=%s request_id=%s ok=%s",
             payload.get("method"),

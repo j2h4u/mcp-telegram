@@ -46,6 +46,9 @@ def allocate_message_budget_proportional(
         limit: Total message budget across all chats
         min_per_chat: Minimum messages per chat (default 3)
 
+    When ``min_per_chat * len(unread_counts) >= limit``, falls back to even
+    distribution: ``limit // num_chats`` per chat, remainder to first chats.
+
     Returns:
         {chat_id: budget_for_chat} allocation
     """

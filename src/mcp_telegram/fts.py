@@ -25,7 +25,7 @@ import snowballstemmer  # type: ignore[import-untyped]
 
 # Module-level stemmer — Russian language model.
 # snowballstemmer is stateless for stemWords(), safe for concurrent reads.
-_stemmer = snowballstemmer.stemmer("russian")
+_russian_stemmer = snowballstemmer.stemmer("russian")
 
 # Matches Cyrillic (including ё/Ё), Latin, and ASCII-digit word characters.
 # Punctuation, whitespace, and emoji are intentionally excluded.
@@ -43,11 +43,11 @@ MESSAGES_FTS_DDL = (
 
 INSERT_FTS_SQL = (
     "INSERT OR REPLACE INTO messages_fts(dialog_id, message_id, stemmed_text) "
-    "VALUES (?, ?, ?)"
+    "VALUES (?, ?, ?)"  # params: (int, int, str)
 )
 
 DELETE_FTS_SQL = (
-    "DELETE FROM messages_fts WHERE dialog_id=? AND message_id=?"
+    "DELETE FROM messages_fts WHERE dialog_id=? AND message_id=?"  # params: (int, int)
 )
 
 
@@ -67,7 +67,7 @@ def stem_text(text: str | None) -> str:
     words = _WORD_RE.findall(text)
     if not words:
         return ""
-    return " ".join(_stemmer.stemWords(words))
+    return " ".join(_russian_stemmer.stemWords(words))
 
 
 def stem_query(query: str) -> str:
@@ -82,7 +82,7 @@ def stem_query(query: str) -> str:
     words = _WORD_RE.findall(query)
     if not words:
         return ""
-    stemmed = _stemmer.stemWords(words)
+    stemmed = _russian_stemmer.stemWords(words)
     # Quote each token to prevent FTS5 operator interpretation (NOT, OR, AND)
     quoted = [f'"{token}"' for token in stemmed]
     return " ".join(quoted)

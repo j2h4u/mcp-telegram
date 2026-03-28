@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 # SQL constants
 # ---------------------------------------------------------------------------
 
-_INSERT_MESSAGE_SQL = (
+INSERT_MESSAGE_SQL = (
     "INSERT OR REPLACE INTO messages "
     "(dialog_id, message_id, sent_at, text, sender_id, sender_first_name, "
     "media_description, reply_to_msg_id, forum_topic_id, reactions, is_deleted) "
@@ -116,7 +116,7 @@ def extract_message_row(dialog_id: int, msg: Any) -> tuple[object, ...]:
     Follows sync.db message insert pattern. Omits edit_date and fetched_at
     (not in sync.db schema); adds reactions serialization.
 
-    Returns a 10-element tuple matching _INSERT_MESSAGE_SQL column order:
+    Returns a 10-element tuple matching INSERT_MESSAGE_SQL column order:
     (dialog_id, message_id, sender_id, sender_name, date, text, media_type,
      reply_to_msg_id, forum_topic_id, is_deleted)
     """
@@ -324,7 +324,7 @@ class FullSyncWorker:
 
         # Single atomic transaction: messages + FTS + progress update (D-05)
         with self._conn:
-            self._conn.executemany(_INSERT_MESSAGE_SQL, rows)
+            self._conn.executemany(INSERT_MESSAGE_SQL, rows)
             self._conn.executemany(
                 INSERT_FTS_SQL,
                 ((row[0], row[1], stem_text(row[3])) for row in rows),  # type: ignore[arg-type]
@@ -333,7 +333,7 @@ class FullSyncWorker:
                 _UPDATE_PROGRESS_SQL, (new_progress, new_status, dialog_id)
             )
 
-        logger.info(
+        logger.debug(
             "sync_batch dialog_id=%d fetched=%d progress=%d done=%s",
             dialog_id, len(batch), new_progress, is_done,
         )

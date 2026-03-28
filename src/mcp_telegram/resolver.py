@@ -39,8 +39,10 @@ class ResolvedWithMessage(Resolved):
 
 @dataclass(frozen=True)
 class Candidates:
+    """Multiple matches found — caller should disambiguate."""
     query: str
-    matches: list[dict]  # [{entity_id, display_name, score, username, entity_type}]
+    matches: list[dict]
+    """Each dict: {entity_id: int, display_name: str, score: float, username: str|None, entity_type: str}."""
 
 
 @dataclass(frozen=True)
