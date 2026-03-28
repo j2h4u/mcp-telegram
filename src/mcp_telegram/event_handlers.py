@@ -20,16 +20,15 @@ Architecture:
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import sqlite3
 import time
-from datetime import datetime
 from typing import Any
 
 from telethon import events  # type: ignore[import-untyped]
 
 from .fts import DELETE_FTS_SQL, INSERT_FTS_SQL, stem_text
+from .sync_worker import extract_message_row, serialize_reactions
 
 logger = logging.getLogger(__name__)
 
@@ -161,7 +160,7 @@ class EventHandlerManager:
             return
 
         msg = event.message
-        row = self._extract_event_message_row(dialog_id, msg)
+        row = extract_message_row(dialog_id, msg)
         now = int(time.time())
 
         with self._conn:
@@ -201,7 +200,7 @@ class EventHandlerManager:
             if existing is None:
                 # Message not yet in sync.db (Pitfall 2 from RESEARCH.md):
                 # insert it with current text; historical versions are lost (acceptable).
-                row = self._extract_event_message_row(dialog_id, msg)
+                row = extract_message_row(dialog_id, msg)
                 self._conn.execute(_INSERT_MESSAGE_SQL, row)
                 self._conn.execute(
                     INSERT_FTS_SQL, (dialog_id, message_id, stem_text(new_text))
@@ -332,86 +331,3 @@ class EventHandlerManager:
         logger.info("dm_gap_scan marked_deleted=%d", total_marked)
         return total_marked
 
-    # ------------------------------------------------------------------
-    # Field extraction helpers
-    # ------------------------------------------------------------------
-
-    def _extract_event_message_row(
-        self, dialog_id: int, msg: Any
-    ) -> tuple[object, ...]:
-        """Extract a sync.db messages row tuple from a Telethon event message.
-
-        Replicates FullSyncWorker._extract_message_row() using getattr pattern
-        for all fields.  sender_first_name is None for event-inserted messages
-        where sender entity resolution would require a network call (RESEARCH.md
-        Anti-Patterns: do NOT await get_sender()).
-
-        Returns:
-            10-element tuple matching _INSERT_MESSAGE_SQL parameter order.
-        """
-        message_id = int(getattr(msg, "id", 0))
-
-        date = getattr(msg, "date", None)
-        sent_at = int(date.timestamp()) if isinstance(date, datetime) else 0
-
-        text = getattr(msg, "message", None)
-
-        sender_id = getattr(msg, "sender_id", None)
-        sender = getattr(msg, "sender", None)
-        sender_first_name = (
-            getattr(sender, "first_name", None) if sender is not None else None
-        )
-
-        media = getattr(msg, "media", None)
-        media_description: str | None = (
-            type(media).__name__ if media is not None else None
-        )
-
-        reply_to = getattr(msg, "reply_to", None)
-        reply_to_msg_id: int | None = None
-        forum_topic_id: int | None = None
-        if reply_to is not None:
-            raw_rtmi = getattr(reply_to, "reply_to_msg_id", None)
-            reply_to_msg_id = int(raw_rtmi) if raw_rtmi is not None else None
-            if getattr(reply_to, "forum_topic", False):
-                top_id = getattr(reply_to, "reply_to_top_id", None)
-                forum_topic_id = int(top_id) if top_id is not None else 1
-
-        reactions = self._serialize_reactions(getattr(msg, "reactions", None))
-
-        return (
-            dialog_id,
-            message_id,
-            sent_at,
-            text,
-            sender_id,
-            sender_first_name,
-            media_description,
-            reply_to_msg_id,
-            forum_topic_id,
-            reactions,
-        )
-
-    @staticmethod
-    def _serialize_reactions(reactions: Any | None) -> str | None:
-        """Serialize a Telethon MessageReactions object to a JSON string.
-
-        Format: {"emoji": count, ...} or None if no reactions.
-        Consistent with FullSyncWorker.serialize_reactions() — same JSON dict
-        {emoji: count} format.
-        """
-        if reactions is None:
-            return None
-        results = getattr(reactions, "results", None)
-        if not results:
-            return None
-        summary: dict[str, int] = {}
-        for item in results:
-            reaction = getattr(item, "reaction", None)
-            emoticon = (
-                getattr(reaction, "emoticon", None) if reaction is not None else None
-            )
-            count = getattr(item, "count", 0)
-            if emoticon is not None:
-                summary[emoticon] = int(count)
-        return json.dumps(summary) if summary else None

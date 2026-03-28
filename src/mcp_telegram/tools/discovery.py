@@ -15,18 +15,11 @@ from ._base import (
     DaemonNotRunningError,
     ToolArgs,
     ToolResult,
+    _daemon_not_running_text,
     _text_response,
     daemon_connection,
     mcp_tool,
 )
-
-
-def _daemon_not_running_text() -> str:
-    """Return user-facing error when daemon is not running."""
-    return (
-        "Sync daemon is not running.\n"
-        "Action: Start it with: mcp-telegram sync"
-    )
 
 
 class ListDialogs(ToolArgs):

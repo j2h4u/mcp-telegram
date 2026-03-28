@@ -33,6 +33,14 @@ def _text_response(text: str) -> list[TextContent]:
     return [TextContent(type="text", text=text)]
 
 
+def _daemon_not_running_text() -> str:
+    """Return user-facing error message when the sync daemon is not running."""
+    return (
+        "Sync daemon is not running.\n"
+        "Action: Start it with: mcp-telegram sync"
+    )
+
+
 @dataclass
 class ToolResult:
     """Internal wrapper carrying MCP content plus telemetry metadata."""
