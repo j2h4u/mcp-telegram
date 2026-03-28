@@ -41,7 +41,7 @@ class _DaemonMessage:
         self.sender = _Sender(sender_name) if sender_name else None
         reply_id = row.get("reply_to_msg_id")
         self.reply_to = _ReplyHeader(reply_id) if reply_id else None
-        self.reactions = None  # reactions are pre-formatted strings in sync.db
+        self.reactions = None  # reactions not surfaced from daemon path
         media_desc = row.get("media_description")
         self.media = _MediaPlaceholder(media_desc) if media_desc else None
         self.edit_date = None  # edit tracking not yet surfaced per-row

@@ -29,7 +29,6 @@ class GetUserInfo(ToolArgs):
 
 @mcp_tool("primary")
 async def get_user_info(args: GetUserInfo) -> ToolResult:
-    # Step 1: resolve entity name via daemon
     try:
         async with daemon_connection() as conn:
             resolve_response = await conn.resolve_entity(query=args.user)
@@ -67,7 +66,6 @@ async def get_user_info(args: GetUserInfo) -> ToolResult:
     entity_id: int = resolve_data["entity_id"]
     display_name: str = resolve_data["display_name"]
 
-    # Step 2: fetch full user info via daemon
     try:
         async with daemon_connection() as conn:
             response = await conn.get_user_info(user_id=entity_id)

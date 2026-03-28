@@ -80,7 +80,7 @@ async def sync_main() -> None:
     conn = _open_sync_db(db_path)
     migrate_legacy_databases(conn, db_path.parent)
 
-    # Phase 29: One-time FTS backfill for messages without index entries
+    # One-time FTS backfill for messages without index entries
     backfilled = backfill_fts_index(conn)
     if backfilled:
         logger.info("fts_backfill=%d messages indexed", backfilled)
@@ -101,7 +101,7 @@ async def sync_main() -> None:
 
         logger.info("sync-daemon started — connected=%s", client.is_connected())
 
-        # Phase 29: Start daemon API server on Unix socket
+        # Start daemon API server on Unix socket
         api_server = DaemonAPIServer(conn, client, shutdown_event)
         socket_path = get_daemon_socket_path()
         socket_path.unlink(missing_ok=True)
@@ -110,17 +110,17 @@ async def sync_main() -> None:
         )
         logger.info("daemon API listening on %s", socket_path)
 
-        # Phase 27 (D-06): Register event handlers BEFORE FullSyncWorker
+        # Register event handlers BEFORE FullSyncWorker
         handler_manager = EventHandlerManager(client, conn, shutdown_event)
         handler_manager.register()
         logger.info("event handlers registered")
 
-        # Phase 28 (D-08): Delta catch-up for synced dialogs before bootstrap
+        # Delta catch-up for synced dialogs before bootstrap
         delta_worker = DeltaSyncWorker(client, conn, shutdown_event)
         delta_new = await delta_worker.run_delta_catch_up()
         logger.info("delta_catch_up=%d new messages from gap-fill", delta_new)
 
-        # Phase 1 — Bootstrap (D-06): enroll all DM dialogs once at startup
+        # Bootstrap: enroll all DM dialogs once at startup
         worker = FullSyncWorker(client, conn, shutdown_event)
         enrolled = await worker.bootstrap_dms()
         logger.info("dm_bootstrap complete — enrolled=%d", enrolled)
@@ -128,7 +128,7 @@ async def sync_main() -> None:
         # Refresh synced_dialogs after bootstrap adds new dialogs
         handler_manager.refresh_synced_dialogs()
 
-        # Phase 2 — Tight sync loop with heartbeat (D-10, D-11)
+        # Tight sync loop with heartbeat
         sync_start = time.monotonic()
         last_heartbeat = sync_start
         last_gap_scan = sync_start
