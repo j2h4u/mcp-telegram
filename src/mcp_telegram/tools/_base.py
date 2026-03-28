@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import functools
 import logging
 import time
@@ -69,7 +70,6 @@ def _track_tool_telemetry(tool_name: str):
     def decorator(fn):
         @functools.wraps(fn)
         async def wrapper(args):
-            import asyncio
             logger.debug("method[%s]", tool_name)
             t0 = time.monotonic()
             error_type = None
