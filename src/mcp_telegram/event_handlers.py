@@ -321,15 +321,13 @@ class EventHandlerManager:
                 results = await self._client.get_messages(dialog_id, ids=batch)
 
                 now = int(time.time())
-                for queried_id, returned_msg in zip(batch, results):
-                    if returned_msg is None:
-                        self._conn.execute(
-                            _MARK_DELETED_SQL, (now, dialog_id, queried_id)
-                        )
-                        total_marked += 1
-
-        if total_marked:
-            self._conn.commit()
+                with self._conn:  # atomic per-dialog batch
+                    for queried_id, returned_msg in zip(batch, results):
+                        if returned_msg is None:
+                            self._conn.execute(
+                                _MARK_DELETED_SQL, (now, dialog_id, queried_id)
+                            )
+                            total_marked += 1
 
         logger.info("dm_gap_scan marked_deleted=%d", total_marked)
         return total_marked
