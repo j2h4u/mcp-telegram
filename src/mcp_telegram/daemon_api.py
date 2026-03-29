@@ -557,12 +557,13 @@ class DaemonAPIServer:
     async def _list_messages(self, req: dict) -> dict:
         """Return messages from sync.db (if synced) or Telegram (on-demand).
 
-        Supported request params (Phase 35-01):
+        Supported request params (Phase 35-01, 35-02):
           direction      "newest" (default) | "oldest"
           sender_id      int — filter by sender_id (sync.db: AND clause; on-demand: from_user=)
           sender_name    str — filter by sender name LIKE (sync.db only)
           topic_id       int — filter by forum_topic_id (sync.db: AND clause; on-demand: reply_to=)
           unread_after_id int — filter message_id > X (sync.db: AND clause; on-demand: min_id=)
+          unread         bool — resolve read_inbox_max_id via GetPeerDialogsRequest, use as unread_after_id
           navigation     opaque base64 token from next_navigation — advances the cursor
         """
         dialog_id: int = req.get("dialog_id", 0) or 0
@@ -574,6 +575,7 @@ class DaemonAPIServer:
         sender_name: str | None = req.get("sender_name")
         topic_id: int | None = req.get("topic_id")
         unread_after_id: int | None = req.get("unread_after_id")
+        unread: bool = bool(req.get("unread"))
 
         # Validate direction
         if direction not in ("newest", "oldest"):
@@ -630,6 +632,22 @@ class DaemonAPIServer:
         direction_enum = (
             HistoryDirection.OLDEST if direction == "oldest" else HistoryDirection.NEWEST
         )
+
+        # Resolve unread_after_id from Telegram read position when unread=True
+        if unread and unread_after_id is None:
+            try:
+                from telethon.tl.functions.messages import (  # type: ignore[import-untyped]
+                    GetPeerDialogsRequest,
+                )
+                peer_result = await self._client(GetPeerDialogsRequest(peers=[dialog_id]))
+                if peer_result.dialogs:
+                    read_max_id = getattr(peer_result.dialogs[0], "read_inbox_max_id", 0)
+                    unread_after_id = int(read_max_id) if read_max_id else None
+            except Exception:
+                logger.debug(
+                    "list_messages_unread_resolve_failed dialog_id=%d", dialog_id, exc_info=True
+                )
+                # fallback: no unread filter applied
 
         # Check sync status
         row = self._conn.execute(_SELECT_SYNC_STATUS_SQL, (dialog_id,)).fetchone()
