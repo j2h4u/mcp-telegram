@@ -470,8 +470,9 @@ class DaemonAPIServer:
         """Resolve a dialog name string to a numeric dialog_id.
 
         Tries client.get_entity(dialog) first (handles @username, phone,
-        invite link).  Falls back to fuzzy-matching iter_dialogs() by name
-        if get_entity raises ValueError.
+        invite link).  Falls back to case-insensitive substring matching
+        via iter_dialogs() if get_entity fails. Returns the first exact
+        match, or the first substring match if no exact match exists.
 
         Returns telethon peer id (negative for channels/groups).
         Raises ValueError with descriptive message on failure.

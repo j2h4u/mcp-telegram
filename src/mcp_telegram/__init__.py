@@ -49,8 +49,11 @@ def sync() -> None:
 
     from .daemon import sync_main
 
+    import os
+
+    log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
     logging.basicConfig(
-        level=logging.INFO,
+        level=getattr(logging, log_level, logging.INFO),
         stream=sys.stderr,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
         force=True,

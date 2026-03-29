@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from pydantic import Field
 
 from ._base import (
@@ -11,6 +13,9 @@ from ._base import (
     daemon_connection,
     mcp_tool,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 class MarkDialogForSync(ToolArgs):
@@ -39,6 +44,7 @@ async def mark_dialog_for_sync(args: MarkDialogForSync) -> ToolResult:
         return ToolResult(content=_text_response(f"Error: {error_msg}"))
 
     action = "marked for sync" if args.enable else "unmarked from sync"
+    logger.info("mark_dialog_for_sync dialog_id=%d enable=%s", args.dialog_id, args.enable)
     text = f"Dialog {args.dialog_id} {action}."
     if args.enable:
         text += " Daemon will begin fetching within the next polling cycle."

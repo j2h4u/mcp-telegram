@@ -432,7 +432,7 @@ async def test_search_messages_no_hits():
         result = await search_messages(SearchMessages(dialog="123", query="nonexistent"))
 
     assert len(result) == 1
-    # Should have helpful "no hits" text
+    assert "no messages matched" in result[0].text.lower(), f"Expected no-hits text, got: {result[0].text}"
 
 
 # ---------------------------------------------------------------------------
