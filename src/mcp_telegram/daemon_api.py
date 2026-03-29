@@ -642,12 +642,11 @@ class DaemonAPIServer:
         try:
             result = await self._client(
                 GetForumTopicsRequest(
-                    channel=entity,
-                    offset_date=0,
+                    peer=entity,
+                    offset_date=None,
                     offset_id=0,
                     offset_topic=0,
                     limit=100,
-                    q="",
                 )
             )
             topics = [
