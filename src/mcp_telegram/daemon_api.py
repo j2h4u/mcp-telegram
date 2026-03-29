@@ -32,6 +32,7 @@ Architecture:
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import sqlite3
@@ -69,6 +70,16 @@ from .resolver import (
 )
 
 logger = logging.getLogger(__name__)
+
+_current_request_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "_current_request_id", default=None,
+)
+
+
+def _rid() -> str:
+    """Return ' request_id=X' suffix for log lines, or empty string."""
+    rid = _current_request_id.get()
+    return f" request_id={rid}" if rid else ""
 
 
 def _clamp(value: int, low: int, high: int) -> int:
@@ -291,27 +302,19 @@ def _query_usage_stats(cursor: sqlite3.Cursor, since: int) -> dict:
         ).fetchall()
     )
 
-    max_depth_result = cursor.execute(
+    def _scalar(sql: str, params: tuple = (since,), default: int = 0) -> int:
+        row = cursor.execute(sql, params).fetchone()
+        return row[0] if row and row[0] is not None else default
+
+    max_depth = _scalar(
         "SELECT MAX(page_depth) FROM telemetry_events WHERE timestamp >= ?",
-        (since,),
-    ).fetchone()
-    max_depth = (
-        max_depth_result[0]
-        if max_depth_result and max_depth_result[0] is not None
-        else 0
     )
-
-    filter_count_result = cursor.execute(
+    filter_count = _scalar(
         "SELECT COUNT(*) FROM telemetry_events WHERE timestamp >= ? AND has_filter = 1",
-        (since,),
-    ).fetchone()
-    filter_count = filter_count_result[0] if filter_count_result else 0
-
-    total_calls_result = cursor.execute(
+    )
+    total_calls = _scalar(
         "SELECT COUNT(*) FROM telemetry_events WHERE timestamp >= ?",
-        (since,),
-    ).fetchone()
-    total_calls = total_calls_result[0] if total_calls_result else 0
+    )
 
     latencies = cursor.execute(
         "SELECT duration_ms FROM telemetry_events WHERE timestamp >= ? ORDER BY duration_ms",
@@ -398,6 +401,7 @@ class DaemonAPIServer:
                     logger.debug(
                         "daemon_api_request method=%s request_id=%s", method, request_id
                     )
+                token = _current_request_id.set(request_id)
                 try:
                     response = await self._dispatch(req)
                 except Exception:
@@ -407,6 +411,8 @@ class DaemonAPIServer:
                         request_id,
                     )
                     response = {"ok": False, "error": "internal", "message": "internal error"}
+                finally:
+                    _current_request_id.reset(token)
                 if request_id:
                     response = {**response, "request_id": request_id}
 
@@ -599,8 +605,8 @@ class DaemonAPIServer:
         if messages and len(messages) == limit:
             last_msg_id = messages[-1]["message_id"]
             logger.debug(
-                "list_messages_pagination anchor_msg_id=%d dialog_id=%d direction=%s",
-                last_msg_id, dialog_id, direction,
+                "list_messages_pagination anchor_msg_id=%d dialog_id=%d direction=%s%s",
+                last_msg_id, dialog_id, direction, _rid(),
             )
             return encode_history_navigation(
                 last_msg_id, dialog_id, direction=direction_enum
@@ -624,8 +630,8 @@ class DaemonAPIServer:
         except Exception:
             logger.warning(
                 "list_messages_unread_resolve_failed dialog_id=%d — "
-                "unread filter dropped, returning all messages",
-                dialog_id,
+                "unread filter dropped, returning all messages%s",
+                dialog_id, _rid(),
                 exc_info=True,
             )
         return None
@@ -694,7 +700,7 @@ class DaemonAPIServer:
         unread_after_id: int | None,
     ) -> dict:
         """Fetch messages on-demand from Telegram API."""
-        logger.debug("list_messages_fallback_telegram dialog_id=%d", dialog_id)
+        logger.debug("list_messages_fallback_telegram dialog_id=%d%s", dialog_id, _rid())
         iter_kwargs: dict = {
             k: v
             for k, v in {
@@ -714,8 +720,8 @@ class DaemonAPIServer:
                 messages.append(self._msg_to_dict(msg))
         except Exception as exc:
             logger.warning(
-                "list_messages_telegram_error dialog_id=%d error=%s",
-                dialog_id, exc, exc_info=True,
+                "list_messages_telegram_error dialog_id=%d error=%s%s",
+                dialog_id, exc, _rid(), exc_info=True,
             )
             return {"ok": False, "error": "telegram_error", "message": "failed to fetch messages"}
 
@@ -1222,6 +1228,26 @@ class DaemonAPIServer:
 
         return {"ok": True, "data": {"groups": groups}}
 
+    @staticmethod
+    def _should_include_unread_dialog(
+        category: str,
+        scope: str,
+        participants_count: int | None,
+        group_size_threshold: int,
+    ) -> bool:
+        """Decide whether a dialog should be included in unread results."""
+        if scope != "personal":
+            return True
+        if category == "channel":
+            return False
+        if (
+            category == "group"
+            and participants_count is not None
+            and participants_count > group_size_threshold
+        ):
+            return False
+        return True
+
     async def _collect_unread_dialogs(
         self, scope: str, group_size_threshold: int
     ) -> tuple[list[dict], dict[int, int]]:
@@ -1238,20 +1264,15 @@ class DaemonAPIServer:
                 continue
 
             category = _classify_dialog_for_unread(dialog)
+            entity = getattr(dialog, "entity", None)
+            participants_count = (
+                getattr(entity, "participants_count", None) if entity is not None else None
+            )
 
-            if scope == "personal":
-                if category == "channel":
-                    continue
-                entity = getattr(dialog, "entity", None)
-                participants_count = (
-                    getattr(entity, "participants_count", None) if entity is not None else None
-                )
-                if (
-                    category == "group"
-                    and participants_count is not None
-                    and participants_count > group_size_threshold
-                ):
-                    continue
+            if not self._should_include_unread_dialog(
+                category, scope, participants_count, group_size_threshold,
+            ):
+                continue
 
             raw_dialog = getattr(dialog, "dialog", None)
             entries.append({
