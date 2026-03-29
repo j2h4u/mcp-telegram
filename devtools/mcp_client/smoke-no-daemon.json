@@ -1,0 +1,154 @@
+{
+  "steps": [
+    {
+      "_comment": "All 11 tools registered with correct schemas",
+      "action": "list_tools",
+      "expect": {
+        "tool_names_include": [
+          "ListDialogs",
+          "ListMessages",
+          "SearchMessages",
+          "ListTopics",
+          "ListUnreadMessages",
+          "GetMyAccount",
+          "GetUserInfo",
+          "GetUsageStats",
+          "MarkDialogForSync",
+          "GetSyncStatus",
+          "GetSyncAlerts"
+        ],
+        "tool_expectations": {
+          "ListMessages": {
+            "inputSchema.properties.limit.default": 50,
+            "inputSchema.properties.navigation.type": "string"
+          },
+          "SearchMessages": {
+            "inputSchema.properties.navigation.type": "string"
+          },
+          "MarkDialogForSync": {
+            "inputSchema.properties.dialog_id.type": "integer",
+            "inputSchema.properties.enable.default": true
+          },
+          "GetSyncStatus": {
+            "inputSchema.properties.dialog_id.type": "integer"
+          },
+          "GetSyncAlerts": {
+            "inputSchema.properties.since.default": 0,
+            "inputSchema.properties.limit.default": 50
+          }
+        }
+      }
+    },
+
+    {
+      "_comment": "ListDialogs — daemon route",
+      "action": "call_tool",
+      "name": "ListDialogs",
+      "arguments": {},
+      "expect": {
+        "is_error": false,
+        "content_text_contains": ["not running", "mcp-telegram sync"]
+      }
+    },
+    {
+      "_comment": "ListMessages — daemon route",
+      "action": "call_tool",
+      "name": "ListMessages",
+      "arguments": {"dialog": "test", "limit": 1},
+      "expect": {
+        "is_error": false,
+        "content_text_contains": ["not running", "mcp-telegram sync"]
+      }
+    },
+    {
+      "_comment": "SearchMessages — daemon route",
+      "action": "call_tool",
+      "name": "SearchMessages",
+      "arguments": {"dialog": "test", "query": "hello", "limit": 1},
+      "expect": {
+        "is_error": false,
+        "content_text_contains": ["not running", "mcp-telegram sync"]
+      }
+    },
+    {
+      "_comment": "ListTopics — daemon route",
+      "action": "call_tool",
+      "name": "ListTopics",
+      "arguments": {"dialog": "test"},
+      "expect": {
+        "is_error": false,
+        "content_text_contains": ["not running", "mcp-telegram sync"]
+      }
+    },
+    {
+      "_comment": "GetMyAccount — daemon route",
+      "action": "call_tool",
+      "name": "GetMyAccount",
+      "arguments": {},
+      "expect": {
+        "is_error": false,
+        "content_text_contains": ["not running", "mcp-telegram sync"]
+      }
+    },
+    {
+      "_comment": "MarkDialogForSync — daemon route",
+      "action": "call_tool",
+      "name": "MarkDialogForSync",
+      "arguments": {"dialog_id": 12345, "enable": true},
+      "expect": {
+        "is_error": false,
+        "content_text_contains": ["not running", "mcp-telegram sync"]
+      }
+    },
+    {
+      "_comment": "GetSyncStatus — daemon route",
+      "action": "call_tool",
+      "name": "GetSyncStatus",
+      "arguments": {"dialog_id": 12345},
+      "expect": {
+        "is_error": false,
+        "content_text_contains": ["not running", "mcp-telegram sync"]
+      }
+    },
+    {
+      "_comment": "GetSyncAlerts — daemon route",
+      "action": "call_tool",
+      "name": "GetSyncAlerts",
+      "arguments": {"since": 0, "limit": 10},
+      "expect": {
+        "is_error": false,
+        "content_text_contains": ["not running", "mcp-telegram sync"]
+      }
+    },
+
+    {
+      "_comment": "GetUserInfo — entity_cache resolve first, 'not found' for unknown user (daemon never reached)",
+      "action": "call_tool",
+      "name": "GetUserInfo",
+      "arguments": {"user": "nonexistent_test_user_12345"},
+      "expect": {
+        "is_error": false,
+        "content_text_contains": ["not found"]
+      }
+    },
+    {
+      "_comment": "ListUnreadMessages — daemon route",
+      "action": "call_tool",
+      "name": "ListUnreadMessages",
+      "arguments": {},
+      "expect": {
+        "is_error": false,
+        "content_text_contains": ["not running", "mcp-telegram sync"]
+      }
+    },
+    {
+      "_comment": "GetUsageStats — analytics.db, works without daemon",
+      "action": "call_tool",
+      "name": "GetUsageStats",
+      "arguments": {},
+      "expect": {
+        "is_error": false
+      }
+    }
+  ]
+}

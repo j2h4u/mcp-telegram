@@ -19,7 +19,11 @@ class HistoryDirection(StrEnum):
 
 @dataclass(frozen=True)
 class NavigationToken:
-    """Base64-encoded JSON cursor shared by history and search navigation."""
+    """Base64-encoded JSON cursor shared by history and search navigation.
+
+    ``value`` carries a message_id for history navigation or a search offset
+    for search navigation — interpret based on ``kind``.
+    """
 
     kind: NavigationKind
     value: int
@@ -45,6 +49,7 @@ def _decode_payload(token: str) -> dict[str, object]:
 
 
 def encode_navigation_token(navigation: NavigationToken) -> str:
+    """Encode a NavigationToken as a URL-safe base64 JSON string."""
     payload: dict[str, object] = {
         "kind": navigation.kind,
         "value": navigation.value,
@@ -60,6 +65,10 @@ def encode_navigation_token(navigation: NavigationToken) -> str:
 
 
 def decode_navigation_token(token: str) -> NavigationToken:
+    """Decode a base64 token into a NavigationToken.
+
+    Raises ``ValueError`` on malformed input, unknown kind, or wrong field types.
+    """
     data = _decode_payload(token)
 
     kind = data.get("kind")

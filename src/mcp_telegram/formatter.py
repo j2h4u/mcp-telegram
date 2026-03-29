@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from .models import LinePrefixGetter, MessageLike, TopicNameGetter
@@ -68,6 +69,13 @@ def format_messages(
 
         sender_name = _resolve_sender_name(msg)
         text = _render_text(msg)
+        edit_date_raw = getattr(msg, "edit_date", None)
+        if edit_date_raw is not None:
+            if isinstance(edit_date_raw, datetime):
+                ed_dt = edit_date_raw.astimezone(effective_tz)
+            else:
+                ed_dt = datetime.fromtimestamp(int(edit_date_raw), tz=timezone.utc).astimezone(effective_tz)
+            text = f"{text} [edited {ed_dt.strftime('%H:%M')}]"
         reaction_names = reaction_names_map.get(msg.id) if reaction_names_map else None
         reactions_str = _format_reactions(msg, reaction_names)
         if reactions_str:
@@ -176,13 +184,16 @@ def _resolve_sender_name(msg: MessageLike) -> str:
 
 def _render_text(msg: MessageLike) -> str:
     """Return message text, or a media placeholder for media-only messages."""
-    media = getattr(msg, "media", None)
     text = getattr(msg, "message", "") or ""
     if text:
         return text
-    if media is not None:
-        return _describe_media(media)
-    return ""
+    media = getattr(msg, "media", None)
+    if media is None:
+        return ""
+    # Pre-formatted daemon description (has _description attr from _MediaPlaceholder)
+    if hasattr(media, "_description"):
+        return str(media)
+    return _describe_media(media)
 
 
 def _format_reactions(msg: MessageLike, reaction_names: dict[str, list[str]] | None = None) -> str:
@@ -301,7 +312,11 @@ def _describe_media(media: object) -> str:
 
 
 def _describe_document(media: object) -> str:
-    """Describe a MessageMediaDocument by inspecting its attributes."""
+    """Describe a MessageMediaDocument by inspecting its attributes.
+
+    Priority order: sticker > round video > animation > audio > regular video > filename.
+    Sticker checked first because sticker packs can carry a duration attribute.
+    """
     try:
         import telethon.tl.types as tl  # type: ignore[import-untyped]  # noqa: PLC0415
 
@@ -310,45 +325,50 @@ def _describe_document(media: object) -> str:
             return "[документ]"
         attrs = getattr(doc, "attributes", []) or []
 
-        # Check sticker before video/audio — sticker packs can have duration attr
+        has_animated = False
+        video_attr = None
+        audio_attr = None
+        filename_attr = None
+
         for attr in attrs:
             if isinstance(attr, tl.DocumentAttributeSticker):
                 alt = getattr(attr, "alt", "") or ""
                 return f"[стикер: {alt}]" if alt else "[стикер]"
-
-        for attr in attrs:
             if isinstance(attr, tl.DocumentAttributeVideo):
                 if getattr(attr, "round_message", False):
                     dur = getattr(attr, "duration", 0) or 0
                     m, s = divmod(int(dur), 60)
                     return f"[кружок: {m}:{s:02d}]"
+                video_attr = attr
+            elif isinstance(attr, tl.DocumentAttributeAnimated):
+                has_animated = True
+            elif isinstance(attr, tl.DocumentAttributeAudio):
+                audio_attr = attr
+            elif isinstance(attr, tl.DocumentAttributeFilename):
+                filename_attr = attr
 
-        for attr in attrs:
-            if isinstance(attr, tl.DocumentAttributeAnimated):
-                return "[анимация]"
+        if has_animated:
+            return "[анимация]"
 
-        for attr in attrs:
-            if isinstance(attr, tl.DocumentAttributeAudio):
-                dur = getattr(attr, "duration", 0) or 0
-                m, s = divmod(int(dur), 60)
-                if getattr(attr, "voice", False):
-                    return f"[голосовое: {m}:{s:02d}]"
-                title = getattr(attr, "title", None)
-                performer = getattr(attr, "performer", None)
-                info = " — ".join(filter(None, [performer, title]))
-                return f"[аудио: {info}, {m}:{s:02d}]" if info else f"[аудио: {m}:{s:02d}]"
+        if audio_attr is not None:
+            dur = getattr(audio_attr, "duration", 0) or 0
+            m, s = divmod(int(dur), 60)
+            if getattr(audio_attr, "voice", False):
+                return f"[голосовое: {m}:{s:02d}]"
+            title = getattr(audio_attr, "title", None)
+            performer = getattr(audio_attr, "performer", None)
+            info = " — ".join(filter(None, [performer, title]))
+            return f"[аудио: {info}, {m}:{s:02d}]" if info else f"[аудио: {m}:{s:02d}]"
 
-        for attr in attrs:
-            if isinstance(attr, tl.DocumentAttributeVideo):
-                dur = getattr(attr, "duration", 0) or 0
-                m, s = divmod(int(dur), 60)
-                return f"[видео: {m}:{s:02d}]"
+        if video_attr is not None:
+            dur = getattr(video_attr, "duration", 0) or 0
+            m, s = divmod(int(dur), 60)
+            return f"[видео: {m}:{s:02d}]"
 
-        for attr in attrs:
-            if isinstance(attr, tl.DocumentAttributeFilename):
-                size = getattr(doc, "size", None)
-                size_str = f", {size // 1024}KB" if size else ""
-                return f"[документ: {attr.file_name}{size_str}]"
+        if filename_attr is not None:
+            size = getattr(doc, "size", None)
+            size_str = f", {size // 1024}KB" if size else ""
+            return f"[документ: {filename_attr.file_name}{size_str}]"
 
     except ImportError:
         pass

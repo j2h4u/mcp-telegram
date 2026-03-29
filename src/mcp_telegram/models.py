@@ -3,8 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Awaitable, Callable, Literal, Protocol, TypedDict
 
-from .cache import EntityCache
-from .pagination import HistoryDirection
 from .resolver import Candidates, NotFound, Resolved, ResolvedWithMessage
 
 if TYPE_CHECKING:
@@ -135,6 +133,12 @@ class TopicMatch:
 
 @dataclass(frozen=True)
 class ForumTopicFailure:
+    """Topic resolution failed.
+
+    Kinds: catalog_unavailable (dialog has no topic catalog), inaccessible (TOPIC_PRIVATE RPC),
+    not_found (no match), ambiguous (multiple matches), deleted (matched but tombstoned),
+    deleted_ambiguous (all matches tombstoned).
+    """
     kind: Literal[
         "catalog_unavailable",
         "inaccessible",
@@ -161,6 +165,12 @@ class ResolvedForumTopic:
 
 @dataclass(frozen=True)
 class MessageReadFailure:
+    """Message read failed.
+
+    Kinds: invalid_cursor (malformed navigation token), sender_not_found (sender filter matched
+    nothing), sender_ambiguous (multiple sender matches), deleted (dialog tombstoned in sync.db),
+    inaccessible (Telegram RPC denied access).
+    """
     kind: Literal[
         "invalid_cursor",
         "sender_not_found",
@@ -227,7 +237,6 @@ class SearchExecution:
 
 
 # Type aliases for callable signatures
-DialogResolveResult = Resolved | ResolvedWithMessage | Candidates | NotFound
 DialogTargetResult = ResolvedDialogTarget | DialogTargetFailure
 ForumTopicCapabilityResult = TopicCatalog | ResolvedForumTopic | ForumTopicFailure
 ListTopicsCapabilityResult = ListTopicsExecution | DialogTargetFailure | ForumTopicFailure
@@ -239,7 +248,6 @@ HistoryReadCapabilityResult = (
     | NavigationFailure
 )
 SearchCapabilityResult = SearchExecution | DialogTargetFailure | NavigationFailure
-DialogResolver = Callable[[EntityCache, str], Awaitable[DialogResolveResult]]
 TopicLoader = Callable[..., Awaitable[TopicCatalog]]
 TopicFetcher = Callable[..., Awaitable[list[MessageLike]]]
 TopicRefresher = Callable[..., Awaitable[TopicMetadata | None]]

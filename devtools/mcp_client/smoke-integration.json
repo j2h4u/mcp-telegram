@@ -1,0 +1,89 @@
+{
+  "steps": [
+    {
+      "_comment": "ListDialogs — returns real dialogs with metadata",
+      "action": "call_tool",
+      "name": "ListDialogs",
+      "arguments": {},
+      "expect": {
+        "is_error": false,
+        "content_text_contains": ["members=", "created="]
+      }
+    },
+    {
+      "_comment": "GetMyAccount — returns account info",
+      "action": "call_tool",
+      "name": "GetMyAccount",
+      "arguments": {},
+      "expect": {
+        "is_error": false,
+        "content_text_contains": ["id="]
+      }
+    },
+    {
+      "_comment": "ListTopics — forum group returns topics",
+      "action": "call_tool",
+      "name": "ListTopics",
+      "arguments": {"dialog": "Studio Robots and Inbox"},
+      "expect": {
+        "is_error": false,
+        "content_text_contains": ["topic_id=1 title=\"General\"", "topic_id=40 title=\"Inbox\""]
+      }
+    },
+    {
+      "_comment": "ListMessages — forum with topic filter (on-demand path may lack topic header)",
+      "action": "call_tool",
+      "name": "ListMessages",
+      "arguments": {"dialog": "Studio Robots and Inbox", "topic": "Inbox", "limit": 3},
+      "expect": {
+        "is_error": false
+      }
+    },
+    {
+      "_comment": "ListMessages — Saved Messages",
+      "action": "call_tool",
+      "name": "ListMessages",
+      "arguments": {"dialog": "Saved Messages", "limit": 5},
+      "expect": {
+        "is_error": false
+      }
+    },
+    {
+      "_comment": "SearchMessages — keyword search",
+      "action": "call_tool",
+      "name": "SearchMessages",
+      "arguments": {"dialog": "Studio Robots and Inbox", "query": "test", "limit": 3},
+      "expect": {
+        "is_error": false
+      }
+    },
+    {
+      "_comment": "ListUnreadMessages — personal scope",
+      "action": "call_tool",
+      "name": "ListUnreadMessages",
+      "arguments": {},
+      "expect": {
+        "is_error": false
+      }
+    },
+    {
+      "_comment": "GetSyncStatus — returns structured status (synced or not_synced)",
+      "action": "call_tool",
+      "name": "GetSyncStatus",
+      "arguments": {"dialog_id": 12345},
+      "expect": {
+        "is_error": false,
+        "content_text_contains": ["status=", "delete_detection="]
+      }
+    },
+    {
+      "_comment": "GetSyncAlerts — returns alerts or 'No sync alerts'",
+      "action": "call_tool",
+      "name": "GetSyncAlerts",
+      "arguments": {"since": 0, "limit": 10},
+      "expect": {
+        "is_error": false
+      }
+    }
+  ]
+}

@@ -3,17 +3,13 @@ from __future__ import annotations
 import logging
 import re
 import sqlite3
-from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, AsyncContextManager, Callable
+from typing import Any
 
 from anyascii import anyascii
 from rapidfuzz import fuzz, process, utils
 
 logger = logging.getLogger(__name__)
-
-if TYPE_CHECKING:
-    from .cache import EntityCache
 
 CANDIDATE_THRESHOLD = 60
 
@@ -43,8 +39,10 @@ class ResolvedWithMessage(Resolved):
 
 @dataclass(frozen=True)
 class Candidates:
+    """Multiple matches found — caller should disambiguate."""
     query: str
-    matches: list[dict]  # [{entity_id, display_name, score, username, entity_type}]
+    matches: list[dict]
+    """Each dict: {entity_id: int, display_name: str, score: float, username: str|None, entity_type: str}."""
 
 
 @dataclass(frozen=True)
@@ -111,7 +109,7 @@ def _build_norm_map(
 def _fuzzy_resolve(
     query: str,
     choices: dict[int, str],
-    cache: EntityCache | None = None,
+    cache: Any | None = None,
     *,
     normalized_choices: dict[int, str] | None = None,
 ) -> ResolveResult:
@@ -124,14 +122,14 @@ def _fuzzy_resolve(
     - No exact → all hits ≥60 as Candidates
     """
     norm_map = _build_norm_map(choices, normalized_choices)
-    norm_name_to_id: dict[str, int] = {
+    fuzzy_candidates: dict[str, int] = {
         norm_name: entries[0][0] for norm_name, entries in norm_map.items()
     }
     norm_query = latinize(query)
 
     hits = process.extract(
         norm_query,
-        norm_name_to_id.keys(),
+        fuzzy_candidates.keys(),
         scorer=fuzz.WRatio,
         processor=utils.default_process,
         score_cutoff=CANDIDATE_THRESHOLD,
@@ -165,7 +163,7 @@ def _fuzzy_resolve(
 def _build_matches(
     hits: list[tuple[str, float, int]],
     norm_map: dict[str, list[tuple[int, str]]],
-    cache: EntityCache | None,
+    cache: Any | None,
     exact_first_id: int | None = None,
 ) -> list[dict]:
     """Build match dicts from rapidfuzz hits, optionally putting exact_first_id first."""
@@ -189,7 +187,7 @@ def _build_matches(
     return matches
 
 
-def _make_match_info(entity_id: int, display_name: str, score: int, cache: EntityCache | None) -> dict:
+def _make_match_info(entity_id: int, display_name: str, score: int, cache: Any | None) -> dict:
     entity_info: dict = {
         "entity_id": entity_id,
         "display_name": display_name,
@@ -213,7 +211,7 @@ def _make_match_info(entity_id: int, display_name: str, score: int, cache: Entit
 def resolve(
     query: str,
     choices: dict[int, str],
-    cache: EntityCache | None = None,
+    cache: Any | None = None,
     *,
     normalized_choices: dict[int, str] | None = None,
 ) -> ResolveResult:
@@ -222,6 +220,9 @@ def resolve(
     Case 1: Numeric ID query → Resolved/NotFound by id
     Case 2: @username query → lookup in cache, Resolved/NotFound (requires cache)
     Case 3-5: Fuzzy matching in latinized space with single-word caution
+
+    cache must expose .get(id, ttl_seconds=) and .get_by_username(str).
+    Pass None to skip @username resolution.
     """
     entity_id = _parse_numeric_query(query)
     if entity_id is not None:
@@ -246,145 +247,3 @@ def resolve(
         return NotFound(query=query)
 
     return _fuzzy_resolve(query, choices, cache, normalized_choices=normalized_choices)
-
-
-def cache_dialog_entry(cache: EntityCache, dialog: object) -> None:
-    """Persist one Telethon dialog in the local entity cache."""
-    dialog_id = getattr(dialog, "id", None)
-    dialog_name = getattr(dialog, "name", None)
-    if not isinstance(dialog_id, int) or not isinstance(dialog_name, str):
-        return
-
-    if getattr(dialog, "is_user", False):
-        dialog_type = "user"
-    elif getattr(dialog, "is_group", False):
-        # Supergroups (megagroups) have is_group=True — always "group" for cache
-        dialog_type = "group"
-    elif getattr(dialog, "is_channel", False):
-        dialog_type = "channel"
-    else:
-        dialog_type = "unknown"
-
-    entity = getattr(dialog, "entity", None)
-    username = getattr(entity, "username", None) if entity is not None else None
-    cache.upsert(dialog_id, dialog_type, dialog_name, username)
-
-
-async def _resolve_by_username(
-    username: str,
-    cache: EntityCache,
-    client_factory: Callable[[], AsyncContextManager],
-) -> Resolved | NotFound:
-    """Resolve @username via cache, falling back to Telegram API."""
-    try:
-        cached = cache.get_by_username(username)
-        if cached:
-            entity_id, name = cached
-            return Resolved(entity_id=entity_id, display_name=name)
-    except (sqlite3.OperationalError, sqlite3.DatabaseError, OSError):
-        pass
-
-    try:
-        async with client_factory() as client:
-            entity = await client.get_entity(f"@{username}")
-            entity_id = getattr(entity, "id", None)  # type: ignore[assignment]
-            if entity_id is None:
-                return NotFound(query=f"@{username}")
-
-            first = getattr(entity, "first_name", None) or ""
-            last = getattr(entity, "last_name", None) or ""
-            title = getattr(entity, "title", None) or ""
-            display_name = title or f"{first} {last}".strip() or username
-
-            from telethon.tl.types import Channel, Chat  # type: ignore[import-untyped]
-            if isinstance(entity, Channel):
-                entity_type = "channel"
-            elif isinstance(entity, Chat):
-                entity_type = "group"
-            else:
-                entity_type = "user"
-
-            uname = getattr(entity, "username", None)
-            cache.upsert(entity_id, entity_type, display_name, uname)
-            return Resolved(entity_id=entity_id, display_name=display_name)
-    except Exception as exc:
-        logger.warning("username_api_resolve_failed username=%r error=%s", username, exc, exc_info=True)
-        return NotFound(query=f"@{username}")
-
-
-async def _warmup_dialogs(
-    cache: EntityCache,
-    client_factory: Callable[[], AsyncContextManager],
-) -> dict[int, str]:
-    """Iterate all dialogs and refresh cache. Returns live {id: name} map."""
-    live_choices: dict[int, str] = {}
-    async with client_factory() as client:
-        async for dialog in client.iter_dialogs(archived=None, ignore_pinned=False):
-            dialog_id = getattr(dialog, "id", None)
-            dialog_name = getattr(dialog, "name", None)
-            if isinstance(dialog_id, int) and isinstance(dialog_name, str):
-                live_choices[dialog_id] = dialog_name
-            try:
-                cache_dialog_entry(cache, dialog)
-            except sqlite3.Error as cache_exc:
-                logger.warning(
-                    "dialog_cache_refresh_failed dialog_id=%r error=%s",
-                    dialog_id,
-                    cache_exc,
-                )
-    return live_choices
-
-
-async def resolve_dialog(
-    query: str,
-    cache: EntityCache,
-    client_factory: Callable[[], AsyncContextManager],
-) -> ResolveResult:
-    """Resolve any dialog query: numeric ID, @username, t.me link, or fuzzy name.
-
-    Resolution cascade:
-    1. t.me link → parse username + optional message_id, resolve via @username path
-    2. Numeric ID → cache lookup
-    3. @username → cache lookup → Telegram API fallback (get_entity)
-    4. Fuzzy name → cache → warmup (iter_dialogs) → retry
-    """
-    from .cache import USER_TTL, GROUP_TTL
-
-    # 1. t.me link
-    parsed_link = _parse_tme_link(query)
-    if parsed_link is not None:
-        username, msg_id = parsed_link
-        result = await _resolve_by_username(username, cache, client_factory)
-        if isinstance(result, Resolved):
-            return ResolvedWithMessage(
-                entity_id=result.entity_id,
-                display_name=result.display_name,
-                message_id=msg_id,
-            )
-        return result
-
-    # 2-3. @username with API fallback
-    if query.startswith("@"):
-        return await _resolve_by_username(query[1:], cache, client_factory)
-
-    # 4. Numeric ID or fuzzy name — try cache first
-    choices = cache.all_names_with_ttl(USER_TTL, GROUP_TTL)
-    normalized = cache.all_names_normalized_with_ttl(USER_TTL, GROUP_TTL)
-    result = resolve(query, choices, cache, normalized_choices=normalized)  # type: ignore[assignment]
-    if not isinstance(result, NotFound):
-        return result
-
-    logger.debug("dialog_resolve_warmup_starting query=%r", query)
-    try:
-        live_choices = await _warmup_dialogs(cache, client_factory)
-    except Exception as exc:
-        logger.warning("dialog_resolve_warmup_failed query=%r error=%s", query, exc, exc_info=True)
-        return result
-
-    choices = cache.all_names_with_ttl(USER_TTL, GROUP_TTL)
-    normalized = cache.all_names_normalized_with_ttl(USER_TTL, GROUP_TTL)
-    refreshed_result = resolve(query, choices, cache, normalized_choices=normalized)
-    if not isinstance(refreshed_result, NotFound):
-        return refreshed_result
-
-    return resolve(query, live_choices, cache)

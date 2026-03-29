@@ -1,26 +1,21 @@
 from __future__ import annotations
 
-import logging
-
 from pydantic import Field
-from telethon.tl.functions.messages import GetCommonChatsRequest  # type: ignore[import-untyped]
-from telethon.tl.types import Channel, Chat  # type: ignore[import-untyped]
-from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
-from ..cache import GROUP_TTL, USER_TTL
 from ..errors import (
     ambiguous_user_text,
     fetch_user_info_error_text,
     user_not_found_text,
 )
-from ..resolver import (
-    Candidates,
-    NotFound,
-    resolve,
+from ._base import (
+    DaemonNotRunningError,
+    ToolArgs,
+    ToolResult,
+    _daemon_not_running_text,
+    _text_response,
+    daemon_connection,
+    mcp_tool,
 )
-from ._base import ToolArgs, ToolResult, _text_response, connected_client, get_entity_cache, mcp_tool
-
-logger = logging.getLogger(__name__)
 
 
 class GetUserInfo(ToolArgs):
@@ -34,59 +29,67 @@ class GetUserInfo(ToolArgs):
 
 @mcp_tool("primary")
 async def get_user_info(args: GetUserInfo) -> ToolResult:
-    cache = get_entity_cache()
-    choices = cache.all_names_with_ttl(USER_TTL, GROUP_TTL)
-    normalized = cache.all_names_normalized_with_ttl(USER_TTL, GROUP_TTL)
-    resolve_result = resolve(args.user, choices, cache, normalized_choices=normalized)
-    if isinstance(resolve_result, NotFound):
-        return ToolResult(content=_text_response(user_not_found_text(args.user, retry_tool="GetUserInfo")))
-    if isinstance(resolve_result, Candidates):
-        match_lines = []
-        for match in resolve_result.matches:
-            line = f'id={match["entity_id"]} name="{match["display_name"]}" score={match["score"]}'
-            if match.get("username"):
-                line += f' @{match["username"]}'
-            if match.get("entity_type"):
-                line += f' [{match["entity_type"]}]'
-            match_lines.append(line)
-        return ToolResult(content=_text_response(
-            ambiguous_user_text(args.user, match_lines, retry_tool="GetUserInfo"),
-        ))
-    entity_id: int = resolve_result.entity_id
-    display_name: str = resolve_result.display_name
+    try:
+        async with daemon_connection() as conn:
+            resolve_response = await conn.resolve_entity(query=args.user)
 
-    async with connected_client() as client:
-        try:
-            user = await client.get_entity(entity_id)
-            common_result = await client(GetCommonChatsRequest(
-                user_id=entity_id,
-                max_id=0,
-                limit=100,
+            if not resolve_response.get("ok"):
+                return ToolResult(content=_text_response(
+                    user_not_found_text(args.user, retry_tool="GetUserInfo")
+                ))
+
+            resolve_data = resolve_response.get("data", {})
+            resolve_status = resolve_data.get("result", "not_found")
+
+            if resolve_status == "not_found":
+                return ToolResult(content=_text_response(
+                    user_not_found_text(args.user, retry_tool="GetUserInfo")
+                ))
+
+            if resolve_status == "candidates":
+                matches = resolve_data.get("matches", [])
+                match_lines = []
+                for match in matches:
+                    line = f'id={match["entity_id"]} name="{match["display_name"]}" score={match["score"]}'
+                    if match.get("username"):
+                        line += f' @{match["username"]}'
+                    if match.get("entity_type"):
+                        line += f' [{match["entity_type"]}]'
+                    match_lines.append(line)
+                return ToolResult(content=_text_response(
+                    ambiguous_user_text(args.user, match_lines, retry_tool="GetUserInfo"),
+                ))
+
+            entity_id: int = resolve_data["entity_id"]
+            display_name: str = resolve_data["display_name"]
+
+            response = await conn.get_user_info(user_id=entity_id)
+    except DaemonNotRunningError:
+        return ToolResult(content=_text_response(_daemon_not_running_text()))
+
+    if not response.get("ok"):
+        error_code = response.get("error", "")
+        if error_code == "user_not_found":
+            return ToolResult(content=_text_response(
+                fetch_user_info_error_text(args.user, "user not found by daemon")
             ))
-        except Exception as exc:
-            logger.warning("get_user_info entity_id=%r failed: %s", entity_id, exc, exc_info=True)
-            return ToolResult(content=_text_response(fetch_user_info_error_text(args.user, type(exc).__name__)))
+        error_msg = response.get("message", "Daemon returned an error.")
+        return ToolResult(content=_text_response(f"Error: {error_msg}"))
 
+    data = response.get("data", {})
     name = " ".join(filter(None, [
-        getattr(user, "first_name", None),
-        getattr(user, "last_name", None),
+        data.get("first_name"),
+        data.get("last_name"),
     ]))
-    username = getattr(user, "username", None) or "none"
+    username = data.get("username") or "none"
+    common_chats = data.get("common_chats", [])
     chat_lines = []
-    for chat in common_result.chats:
-        chat_name = getattr(chat, "title", None) or getattr(chat, "first_name", str(chat.id))
-        full_id = get_peer_id(chat)
-        if isinstance(chat, Channel):
-            chat_type = "supergroup" if getattr(chat, "megagroup", False) else "channel"
-        elif isinstance(chat, Chat):
-            chat_type = "group"
-        else:
-            chat_type = "user"
-        chat_lines.append(f"  id={full_id} type={chat_type} name='{chat_name}'")
+    for chat in common_chats:
+        chat_lines.append(f"  id={chat['id']} type={chat['type']} name='{chat['name']}'")
     chats_text = "\n".join(chat_lines) if chat_lines else "  (none)"
     text = (
         f'[resolved: "{display_name}"]\n'
         f"id={entity_id} name='{name}' username=@{username}\n"
-        f"Common chats ({len(common_result.chats)}):\n{chats_text}"
+        f"Common chats ({len(common_chats)}):\n{chats_text}"
     )
     return ToolResult(content=_text_response(text), result_count=1)

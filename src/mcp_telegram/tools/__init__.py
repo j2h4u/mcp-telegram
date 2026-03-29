@@ -6,8 +6,8 @@ from ._base import (
     TOOL_REGISTRY,
     ToolArgs,
     ToolResult,
-    connected_client,
-    get_entity_cache,
+    daemon_connection,
+    DaemonNotRunningError,
     mcp_tool,
     tool_args,
     tool_description,
@@ -21,3 +21,4 @@ from .reading import ListMessages, SearchMessages, list_messages, search_message
 from .stats import GetUsageStats, get_usage_stats
 from .unread import ListUnreadMessages, list_unread_messages
 from .user_info import GetUserInfo, get_user_info
+from .sync import GetSyncAlerts, GetSyncStatus, MarkDialogForSync, get_sync_alerts, get_sync_status, mark_dialog_for_sync

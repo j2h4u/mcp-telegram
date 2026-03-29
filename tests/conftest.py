@@ -1,13 +1,85 @@
 from __future__ import annotations
 
+import resource
+import sys
+
+# Hard virtual memory limit: 512 MB per test process.
+# Prevents runaway tests (e.g., infinite loops with MagicMock) from
+# consuming all RAM and pushing the system into swap.
+if sys.platform != "win32":
+    _MAX_AS_BYTES = 512 * 1024 * 1024
+    _soft, _hard = resource.getrlimit(resource.RLIMIT_AS)
+    resource.setrlimit(resource.RLIMIT_AS, (_MAX_AS_BYTES, _hard))
+
 import pytest
 from pathlib import Path
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
 from types import SimpleNamespace
 
-from mcp_telegram.cache import EntityCache
 from telethon.errors import RPCError
+
+
+class _MockEntityCache:
+    """Minimal stand-in for deleted EntityCache — used by resolver tests."""
+
+    def __init__(self, db_path: Path) -> None:
+        import sqlite3
+
+        self._conn = sqlite3.connect(str(db_path))
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS entities (
+                id INTEGER PRIMARY KEY,
+                type TEXT NOT NULL,
+                name TEXT NOT NULL,
+                username TEXT,
+                updated_at INTEGER NOT NULL
+            )
+        """)
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_entities_username ON entities(username)"
+        )
+        self._conn.commit()
+
+    def upsert(
+        self, entity_id: int, entity_type: str, name: str, username: str | None = None
+    ) -> None:
+        import time
+
+        self._conn.execute(
+            "INSERT OR REPLACE INTO entities (id, type, name, username, updated_at) VALUES (?, ?, ?, ?, ?)",
+            (entity_id, entity_type, name, username, int(time.time())),
+        )
+        self._conn.commit()
+
+    def get(self, entity_id: int, ttl_seconds: int = 300) -> dict | None:
+        row = self._conn.execute(
+            "SELECT type, name, username FROM entities WHERE id = ?", (entity_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return {"type": row[0], "name": row[1], "username": row[2]}
+
+    def get_by_username(self, username: str) -> tuple[int, str] | None:
+        row = self._conn.execute(
+            "SELECT id, name FROM entities WHERE username = ? COLLATE NOCASE",
+            (username,),
+        ).fetchone()
+        if row is None:
+            return None
+        return (row[0], row[1])
+
+    def all_names_with_ttl(self, user_ttl: int, group_ttl: int) -> dict[int, str]:
+        import time
+
+        now = int(time.time())
+        rows = self._conn.execute(
+            "SELECT id, name FROM entities WHERE "
+            "(type='user' AND updated_at > ?) OR (type!='user' AND updated_at > ?)",
+            (now - user_ttl, now - group_ttl),
+        ).fetchall()
+        return {row[0]: row[1] for row in rows}
 
 
 @pytest.fixture()
@@ -34,9 +106,9 @@ async def async_iter(items):
 
 
 @pytest.fixture()
-def mock_cache(tmp_db_path: Path) -> EntityCache:
-    """Return EntityCache seeded with entity 101 (Иван Петров)."""
-    cache = EntityCache(tmp_db_path)
+def mock_cache(tmp_db_path: Path) -> _MockEntityCache:
+    """Return _MockEntityCache seeded with entity 101 (Иван Петров)."""
+    cache = _MockEntityCache(tmp_db_path)
     cache.upsert(101, "user", "Иван Петров", "ivan")
     return cache
 

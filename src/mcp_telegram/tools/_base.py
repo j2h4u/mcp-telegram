@@ -1,12 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import functools
 import logging
 import time
 import typing as t
-from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from functools import cache as functools_cache
 from functools import singledispatch
 
 from mcp.types import (
@@ -16,17 +15,8 @@ from mcp.types import (
     Tool,
 )
 from pydantic import BaseModel, ConfigDict
-from xdg_base_dirs import xdg_state_home
 
-from ..cache import EntityCache
-from ..resolver import (
-    Candidates,
-    NotFound,
-    Resolved,
-    ResolvedWithMessage,
-    resolve_dialog,
-)
-from .. import telegram as _telegram_mod
+from ..daemon_client import DaemonConnection, DaemonNotRunningError, daemon_connection
 
 # Fetch reactor names only when total reactions per message are at or below this limit.
 # Covers personal chats (always ≤ a few) while skipping expensive lookups on busy groups.
@@ -44,6 +34,14 @@ def _text_response(text: str) -> list[TextContent]:
     return [TextContent(type="text", text=text)]
 
 
+def _daemon_not_running_text() -> str:
+    """Return user-facing error message when the sync daemon is not running."""
+    return (
+        "Sync daemon is not running.\n"
+        "Action: Start it with: mcp-telegram sync"
+    )
+
+
 @dataclass
 class ToolResult:
     """Internal wrapper carrying MCP content plus telemetry metadata."""
@@ -52,6 +50,23 @@ class ToolResult:
     has_cursor: bool = False
     page_depth: int = 1
     has_filter: bool = False
+
+
+async def _send_telemetry_event(event_dict: dict) -> None:
+    """Fire-and-forget: send telemetry to daemon. Never raises."""
+    try:
+        async with daemon_connection() as conn:
+            await conn.record_telemetry(event=event_dict)
+    except Exception as exc:
+        logger.debug("telemetry_send_failed: %s", exc)
+
+
+def _telemetry_done_callback(task: asyncio.Task[None]) -> None:
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.warning("telemetry_event_failed error=%s", exc)
 
 
 def _track_tool_telemetry(tool_name: str):
@@ -76,20 +91,21 @@ def _track_tool_telemetry(tool_name: str):
             finally:
                 duration_ms = (time.monotonic() - t0) * 1000
                 try:
-                    from ..analytics import TelemetryEvent
-                    collector = _get_analytics_collector()
-                    collector.record_event(TelemetryEvent(
-                        tool_name=tool_name,
-                        timestamp=time.time(),
-                        duration_ms=duration_ms,
-                        result_count=tool_result.result_count if tool_result else 0,
-                        has_cursor=tool_result.has_cursor if tool_result else False,
-                        page_depth=tool_result.page_depth if tool_result else 1,
-                        has_filter=tool_result.has_filter if tool_result else False,
-                        error_type=error_type,
-                    ))
+                    task = asyncio.create_task(
+                        _send_telemetry_event({
+                            "tool_name": tool_name,
+                            "timestamp": time.time(),
+                            "duration_ms": duration_ms,
+                            "result_count": tool_result.result_count if tool_result else 0,
+                            "has_cursor": tool_result.has_cursor if tool_result else False,
+                            "page_depth": tool_result.page_depth if tool_result else 1,
+                            "has_filter": tool_result.has_filter if tool_result else False,
+                            "error_type": error_type,
+                        })
+                    )
+                    task.add_done_callback(_telemetry_done_callback)
                 except Exception as e:
-                    logger.error("Failed to record telemetry for %s: %s", tool_name, e, exc_info=True)
+                    logger.debug("telemetry_send_skipped: %s", e)
         return wrapper
     return decorator
 
@@ -122,6 +138,9 @@ def mcp_tool(posture: str = "primary"):
       1. @tool_runner.register
       2. @_track_tool_telemetry("ToolName")
       3. TOOL_REGISTRY["ToolName"] = (ToolClass, posture)
+
+    The decorated function must have a parameter annotated as ``args: YourToolArgs``
+    — the parameter name ``args`` is required (used for type hint introspection).
 
     Usage:
         class MyTool(ToolArgs): ...
@@ -203,54 +222,6 @@ def tool_args(tool: Tool, *args, **kwargs) -> ToolArgs:  # noqa: ANN002, ANN003
         raise ValueError(f"Unknown tool: {tool.name}")
     cls = entry[0]
     return cls(*args, **kwargs)
-
-
-@asynccontextmanager
-async def connected_client():
-    """Reentrant connection wrapper: only the outermost caller disconnects.
-
-    Safe to nest — inner calls see the client already connected and skip
-    both connect and disconnect, so the outer block retains ownership.
-    """
-    client = _telegram_mod.create_client()
-    owns_connection = not client.is_connected()
-    if owns_connection:
-        t0 = time.monotonic()
-        await client.connect()
-        logger.debug("tg_connect: %.1fms", (time.monotonic() - t0) * 1000)
-    try:
-        yield client
-    finally:
-        if owns_connection:
-            try:
-                t0 = time.monotonic()
-                await client.disconnect()
-                logger.debug("tg_disconnect: %.1fms", (time.monotonic() - t0) * 1000)
-            except Exception:
-                logger.warning("tg_disconnect failed", exc_info=True)
-
-
-@functools_cache
-def get_entity_cache() -> EntityCache:
-    """Return the shared EntityCache instance (opened once per process)."""
-    db_dir = xdg_state_home() / "mcp-telegram"
-    db_dir.mkdir(parents=True, exist_ok=True)
-    db_path = db_dir / "entity_cache.db"
-    return EntityCache(db_path)
-
-
-def _get_analytics_collector():
-    """Lazy-init analytics collector — creates state dir + DB on first call."""
-    from ..analytics import TelemetryCollector
-    db_dir = xdg_state_home() / "mcp-telegram"
-    db_dir.mkdir(parents=True, exist_ok=True)
-    db_path = db_dir / "analytics.db"
-    return TelemetryCollector.get_instance(db_path)
-
-
-async def _resolve_dialog(cache: EntityCache, query: str) -> Resolved | ResolvedWithMessage | Candidates | NotFound:
-    """Resolve one dialog via the consolidated resolver (with warmup and API fallback)."""
-    return await resolve_dialog(query, cache, connected_client)
 
 
 def verify_tool_registry() -> None:

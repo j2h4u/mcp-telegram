@@ -19,6 +19,7 @@ class MockMessage:
     media: object = None
     reactions: object = None
     reply_to: object = None
+    edit_date: int | datetime | None = None
 
 
 def _make_msg(
@@ -342,3 +343,91 @@ def test_format_unread_grouped_multiple_chats() -> None:
     assert "id=111" in result
     assert "id=222" in result
     assert "[и ещё 1]" in result  # Alice's remaining
+
+
+# ---------------------------------------------------------------------------
+# Edited marker tests (Phase 22)
+# ---------------------------------------------------------------------------
+
+
+def test_edited_marker_shown_when_edit_date_is_int() -> None:
+    """[edited HH:mm] appears when edit_date is an integer Unix timestamp (CachedMessage style)."""
+    from mcp_telegram.formatter import format_messages
+
+    # 1718464800 = 2024-06-15 15:20:00 UTC
+    dt = datetime(2024, 6, 15, 14, 30, 0, tzinfo=timezone.utc)
+    msg = MockMessage(
+        id=1,
+        date=dt,
+        message="edited text",
+        sender=MockSender(first_name="Alice"),
+        edit_date=1718464800,
+    )
+    result = format_messages([msg], {})
+    assert "[edited 15:20]" in result, f"Expected '[edited 15:20]' in output, got: {result!r}"
+
+
+def test_edited_marker_shown_when_edit_date_is_datetime() -> None:
+    """[edited HH:mm] appears when edit_date is a datetime (Telethon style)."""
+    from mcp_telegram.formatter import format_messages
+
+    dt = datetime(2024, 6, 15, 14, 30, 0, tzinfo=timezone.utc)
+    edit_dt = datetime(2024, 6, 15, 14, 30, 0, tzinfo=timezone.utc)
+    msg = MockMessage(
+        id=1,
+        date=dt,
+        message="edited text",
+        sender=MockSender(first_name="Alice"),
+        edit_date=edit_dt,
+    )
+    result = format_messages([msg], {})
+    assert "[edited 14:30]" in result, f"Expected '[edited 14:30]' in output, got: {result!r}"
+
+
+def test_edited_marker_absent_when_edit_date_none() -> None:
+    """No [edited ...] marker when edit_date is absent or None."""
+    from mcp_telegram.formatter import format_messages
+
+    dt = datetime(2024, 6, 15, 14, 30, 0, tzinfo=timezone.utc)
+    msg = _make_msg(1, dt, text="no edit")
+    result = format_messages([msg], {})
+    assert "[edited" not in result, f"Unexpected '[edited' in output: {result!r}"
+
+
+def test_edited_marker_before_reactions() -> None:
+    """[edited HH:mm] appears before reactions bracket in the output line."""
+    from mcp_telegram.formatter import format_messages
+
+    dt = datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+
+    @dataclass
+    class FakeReaction:
+        emoticon: str
+
+    @dataclass
+    class FakeReactionCount:
+        reaction: FakeReaction
+        count: int
+
+    @dataclass
+    class FakeReactions:
+        results: list
+
+    reactions = FakeReactions(results=[
+        FakeReactionCount(reaction=FakeReaction(emoticon="👍"), count=2),
+    ])
+    msg = MockMessage(
+        id=1,
+        date=dt,
+        message="hello",
+        sender=MockSender(first_name="Alice"),
+        reactions=reactions,
+        edit_date=1718460000,
+    )
+    reaction_names_map = {1: {"👍": ["Bob", "Carol"]}}
+    result = format_messages([msg], {}, reaction_names_map=reaction_names_map)
+    assert "[edited" in result, f"Expected '[edited' in output: {result!r}"
+    assert "[👍" in result, f"Expected '[👍' in output: {result!r}"
+    assert result.index("[edited") < result.index("[👍"), (
+        f"Expected '[edited' to appear before '[👍' in: {result!r}"
+    )

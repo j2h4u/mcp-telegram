@@ -59,16 +59,22 @@ def create_client(
     api_id: str | None = None,
     api_hash: str | None = None,
     session_name: str = "mcp_telegram_session",
+    catch_up: bool = False,
 ) -> TelegramClient:
     """Return a cached TelegramClient singleton for the given credentials.
 
     ``@cache`` means the same instance is returned for identical
-    ``(api_id, api_hash, session_name)`` arguments within the process lifetime.
+    ``(api_id, api_hash, session_name, catch_up)`` arguments within the process lifetime.
     Callers should use ``connected_client()`` for connection lifecycle management.
 
     Single-session by design: all tool calls within one process share the same
     authenticated Telegram session. This is intentional for the single-user
     Docker deployment model — there is no per-request session isolation.
+
+    ``catch_up=True`` enables Telethon's PTS-based missed-update replay on connect
+    (D-05).  The sync-daemon passes ``catch_up=True``; the MCP server never calls
+    ``create_client()`` directly (session guard disables it), so there is no
+    cache-key collision in practice.
     """
     if api_id is not None and api_hash is not None:
         config = TelegramSettings(api_id=api_id, api_hash=api_hash)
@@ -76,4 +82,10 @@ def create_client(
         config = TelegramSettings()
     state_home = xdg_state_home() / "mcp-telegram"
     state_home.mkdir(parents=True, exist_ok=True, mode=0o700)
-    return TelegramClient(state_home / session_name, config.api_id, config.api_hash, base_logger="telethon")
+    return TelegramClient(
+        state_home / session_name,
+        config.api_id,
+        config.api_hash,
+        base_logger="telethon",
+        catch_up=catch_up,
+    )

@@ -1,0 +1,227 @@
+"""Sync daemon — long-running process that exclusively owns the TelegramClient.
+
+Started via ``mcp-telegram sync``. Connects to Telegram, ensures sync.db schema,
+bootstraps DM dialogs, then runs FullSyncWorker in a tight batch loop with
+periodic heartbeat logging and clean SIGTERM handling.
+
+Architecture (DAEMON-01 / DAEMON-02):
+- sync-daemon is the sole owner of TelegramClient — connects once, holds it.
+- MCP server runs separately with disable_telegram_session() active and reads
+  sync.db via open_sync_db_reader(); it never calls client.connect().
+- SIGTERM triggers shutdown_event (set by register_shutdown_handler), which
+  checkpoints WAL and closes the DB connection before the daemon disconnects.
+
+Event handlers:
+- EventHandlerManager is registered BEFORE FullSyncWorker starts so no
+  real-time events are missed during initial bulk fetch.  INSERT OR REPLACE
+  handles any overlap between real-time and bulk paths idempotently.
+- synced_dialogs set is refreshed every heartbeat so newly enrolled dialogs
+  are picked up within one interval without re-registering handlers.
+- Weekly gap scan detects tombstoned DM messages that MTProto delete events
+  cannot report.
+
+Delta catch-up:
+- connect() called with catch_up=True — Telethon replays missed updates via PTS
+  on reconnect.
+- DeltaSyncWorker.run_delta_catch_up() fills forward gaps for all 'synced'
+  dialogs before bootstrap_dms() enrolls new ones.
+
+Daemon API:
+- DaemonAPIServer runs on a Unix socket alongside the sync loop, serving
+  list_messages / search_messages / list_dialogs requests from MCP server.
+- FTS backfill runs once at startup for messages without FTS index entries.
+- Socket file cleaned up on shutdown (and stale file removed on startup).
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+
+from .daemon_api import DaemonAPIServer, get_daemon_socket_path
+from .delta_sync import DeltaSyncWorker
+from .event_handlers import EventHandlerManager
+from .fts import backfill_fts_index
+from .sync_db import (
+    _open_sync_db,
+    ensure_sync_schema,
+    get_sync_db_path,
+    migrate_legacy_databases,
+    register_shutdown_handler,
+)
+from .sync_worker import FullSyncWorker
+from .telegram import create_client
+
+logger = logging.getLogger(__name__)
+
+HEARTBEAT_INTERVAL_S: float = 60.0
+GAP_SCAN_INTERVAL_S: float = 7 * 24 * 3600.0
+
+
+# ---------------------------------------------------------------------------
+# Heartbeat — standalone for testability (no nonlocal / closure)
+# ---------------------------------------------------------------------------
+
+
+def _log_heartbeat(conn: object, client: object, sync_start: float) -> None:
+    """Log heartbeat with sync stats, rate, and ETA from sync.db."""
+    try:
+        stats = dict(
+            conn.execute(  # type: ignore[union-attr]
+                "SELECT status, COUNT(*) FROM synced_dialogs GROUP BY status"
+            ).fetchall()
+        )
+        msg_count = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]  # type: ignore[union-attr]
+    except Exception:
+        logger.warning("heartbeat_stats_failed", exc_info=True)
+        stats = {}
+        msg_count = 0
+    synced = stats.get("synced", 0)
+    syncing = stats.get("syncing", 0)
+    total = synced + syncing + stats.get("not_synced", 0)
+
+    elapsed = time.monotonic() - sync_start
+    rate = msg_count / elapsed if elapsed > 0 else 0
+
+    eta_str = ""
+    if synced > 0 and synced < total:
+        remaining = total - synced
+        secs_per_dialog = elapsed / synced
+        eta_secs = int(remaining * secs_per_dialog)
+        if eta_secs >= 3600:
+            eta_str = f" eta={eta_secs // 3600}h{(eta_secs % 3600) // 60}m"
+        elif eta_secs >= 60:
+            eta_str = f" eta={eta_secs // 60}m{eta_secs % 60}s"
+        else:
+            eta_str = f" eta={eta_secs}s"
+    elif synced >= total:
+        eta_str = " eta=done"
+
+    logger.info(
+        "heartbeat — connected=%s dialogs=%d/%d messages=%d rate=%.0fmsg/s%s",
+        client.is_connected(),  # type: ignore[union-attr]
+        synced, total, msg_count, rate, eta_str,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Sync loop — batch processing + idle wait
+# ---------------------------------------------------------------------------
+
+
+async def _run_sync_loop(
+    worker: FullSyncWorker,
+    handler_manager: EventHandlerManager,
+    shutdown_event: object,
+    conn: object,
+    client: object,
+) -> None:
+    """Run the batch-sync loop with periodic heartbeat and gap scan."""
+    sync_start = time.monotonic()
+    last_heartbeat = sync_start
+    last_gap_scan = sync_start
+
+    while not shutdown_event.is_set():  # type: ignore[union-attr]
+        all_synced = await worker.process_one_batch()
+        await asyncio.sleep(0)
+
+        now_mono = time.monotonic()
+
+        if now_mono - last_heartbeat >= HEARTBEAT_INTERVAL_S:
+            _log_heartbeat(conn, client, sync_start)
+            handler_manager.refresh_synced_dialogs()
+            last_heartbeat = now_mono
+
+        if now_mono - last_gap_scan >= GAP_SCAN_INTERVAL_S:
+            deleted_count = await handler_manager.run_dm_gap_scan()
+            logger.info("gap_scan complete — marked_deleted=%d", deleted_count)
+            last_gap_scan = now_mono
+
+        if all_synced:
+            logger.info("sync_idle — all dialogs synced, waiting %ds", HEARTBEAT_INTERVAL_S)
+            try:
+                await asyncio.wait_for(
+                    shutdown_event.wait(),  # type: ignore[union-attr]
+                    timeout=HEARTBEAT_INTERVAL_S,
+                )
+                break
+            except asyncio.TimeoutError:
+                _log_heartbeat(conn, client, sync_start)
+                handler_manager.refresh_synced_dialogs()
+                last_heartbeat = time.monotonic()
+
+                if time.monotonic() - last_gap_scan >= GAP_SCAN_INTERVAL_S:
+                    deleted_count = await handler_manager.run_dm_gap_scan()
+                    logger.info("gap_scan complete — marked_deleted=%d", deleted_count)
+                    last_gap_scan = time.monotonic()
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+
+async def sync_main() -> None:
+    """Main entry point for the sync daemon process.
+
+    Orchestrates: DB init → Telegram connect → wire services → sync loop → cleanup.
+    """
+    db_path = get_sync_db_path()
+    ensure_sync_schema(db_path)
+
+    conn = _open_sync_db(db_path)
+    migrate_legacy_databases(conn, db_path.parent)
+
+    backfilled = backfill_fts_index(conn)
+    if backfilled:
+        logger.info("fts_backfill=%d messages indexed", backfilled)
+
+    loop = asyncio.get_running_loop()
+    shutdown_event = register_shutdown_handler(conn, loop)
+
+    client = create_client(catch_up=True)
+    handler_manager: EventHandlerManager | None = None
+    unix_server = None
+    try:
+        try:
+            await client.connect()
+        except ConnectionError as exc:
+            logger.error("sync-daemon connection failed: %s", exc)
+            conn.close()
+            return
+
+        logger.info("sync-daemon started — connected=%s", client.is_connected())
+
+        api_server = DaemonAPIServer(conn, client, shutdown_event)
+        socket_path = get_daemon_socket_path()
+        socket_path.unlink(missing_ok=True)
+        unix_server = await asyncio.start_unix_server(
+            api_server.handle_client, path=str(socket_path), limit=2 * 1024 * 1024,
+        )
+        logger.info("daemon API listening on %s", socket_path)
+
+        handler_manager = EventHandlerManager(client, conn, shutdown_event)
+        handler_manager.register()
+        logger.info("event handlers registered")
+
+        delta_worker = DeltaSyncWorker(client, conn, shutdown_event)
+        delta_new = await delta_worker.run_delta_catch_up()
+        logger.info("delta_catch_up=%d new messages from gap-fill", delta_new)
+
+        worker = FullSyncWorker(client, conn, shutdown_event)
+        enrolled = await worker.bootstrap_dms()
+        logger.info("dm_bootstrap complete — enrolled=%d", enrolled)
+
+        handler_manager.refresh_synced_dialogs()
+
+        await _run_sync_loop(worker, handler_manager, shutdown_event, conn, client)
+
+    finally:
+        if unix_server is not None:
+            unix_server.close()
+            await unix_server.wait_closed()
+        get_daemon_socket_path().unlink(missing_ok=True)
+        if handler_manager is not None:
+            handler_manager.unregister()
+        await client.disconnect()
+        logger.info("sync-daemon stopped")

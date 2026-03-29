@@ -39,3 +39,20 @@ def logout() -> None:
     from .telegram import logout_from_telegram
 
     asyncio.run(logout_from_telegram())
+
+
+@app.command()
+def sync() -> None:
+    """Run the sync daemon (owns TelegramClient exclusively)."""
+    import logging
+    import sys
+
+    from .daemon import sync_main
+
+    logging.basicConfig(
+        level=logging.INFO,
+        stream=sys.stderr,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+        force=True,
+    )
+    asyncio.run(sync_main())

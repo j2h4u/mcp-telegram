@@ -1,19 +1,66 @@
 from __future__ import annotations
 
 import logging
-import sqlite3
-import time
-
-from xdg_base_dirs import xdg_state_home
 
 from ..errors import (
     no_usage_data_text,
-    usage_stats_db_missing_text,
     usage_stats_query_error_text,
 )
-from ._base import ToolArgs, ToolResult, _text_response, mcp_tool
+from ._base import DaemonNotRunningError, ToolArgs, ToolResult, _daemon_not_running_text, _text_response, daemon_connection, mcp_tool
 
 logger = logging.getLogger(__name__)
+
+
+def format_usage_summary(stats: dict) -> str:
+    """Generate <100 token natural-language summary of usage patterns.
+
+    Input dict keys:
+    - tool_distribution: dict[str, int] — {tool_name: count}
+    - error_distribution: dict[str, int] — {error_type: count}
+    - max_page_depth: int
+    - dialogs_with_deep_scroll: int (estimated)
+    - total_calls: int
+    - filter_count: int
+    - latency_median_ms: float
+    - latency_p95_ms: float
+
+    Output: natural-language string, target 60-80 tokens, < 100 hard limit.
+    """
+    parts = []
+
+    if stats.get("tool_distribution"):
+        top_tools = sorted(stats["tool_distribution"].items(), key=lambda x: x[1], reverse=True)[:2]
+        if top_tools:
+            top_tool_name, top_count = top_tools[0]
+            top_pct = int(top_count * 100 / stats["total_calls"]) if stats["total_calls"] > 0 else 0
+            parts.append(f"Most active: {top_tool_name} ({top_pct}% of calls)")
+
+    if stats.get("max_page_depth", 0) >= 5:
+        parts.append(f"Deep scrolling detected: max page depth {stats['max_page_depth']}")
+
+    if stats.get("error_distribution"):
+        errors_str = ", ".join(
+            [f"{err} ({cnt})" for err, cnt in sorted(stats["error_distribution"].items(), key=lambda x: x[1], reverse=True)[:3]]
+        )
+        parts.append(f"Errors: {errors_str}")
+
+    if stats.get("total_calls", 0) > 0 and stats.get("filter_count", 0) > 0:
+        filter_pct = int(stats["filter_count"] * 100 / stats["total_calls"])
+        parts.append(f"Filtered queries: {filter_pct}%")
+
+    median = stats.get("latency_median_ms", 0)
+    p95 = stats.get("latency_p95_ms", 0)
+    if median or p95:
+        parts.append(f"Response time: {median:.0f}ms median, {p95:.0f}ms p95")
+
+    summary = " ".join(parts)
+
+    # Safety: if summary exceeds 100 tokens, truncate gracefully
+    tokens = summary.split()
+    if len(tokens) > 100:
+        summary = " ".join(tokens[:100]) + "..."
+
+    return summary
 
 
 class GetUsageStats(ToolArgs):
@@ -22,92 +69,21 @@ class GetUsageStats(ToolArgs):
     pass
 
 
-def _query_usage_stats(cursor: sqlite3.Cursor, since: int) -> dict:
-    """Run all analytics queries and return the raw stats dict."""
-    tool_dist = dict(
-        cursor.execute(
-            "SELECT tool_name, COUNT(*) FROM telemetry_events WHERE timestamp >= ? GROUP BY tool_name ORDER BY COUNT(*) DESC",
-            (since,),
-        ).fetchall()
-    )
-
-    error_dist = dict(
-        cursor.execute(
-            "SELECT error_type, COUNT(*) FROM telemetry_events WHERE timestamp >= ? AND error_type IS NOT NULL GROUP BY error_type ORDER BY COUNT(*) DESC",
-            (since,),
-        ).fetchall()
-    )
-
-    max_depth_result = cursor.execute(
-        "SELECT MAX(page_depth) FROM telemetry_events WHERE timestamp >= ?",
-        (since,),
-    ).fetchone()
-    max_depth = max_depth_result[0] if max_depth_result and max_depth_result[0] is not None else 0
-
-    filter_count_result = cursor.execute(
-        "SELECT COUNT(*) FROM telemetry_events WHERE timestamp >= ? AND has_filter = 1",
-        (since,),
-    ).fetchone()
-    filter_count = filter_count_result[0] if filter_count_result else 0
-
-    total_calls_result = cursor.execute(
-        "SELECT COUNT(*) FROM telemetry_events WHERE timestamp >= ?",
-        (since,),
-    ).fetchone()
-    total_calls = total_calls_result[0] if total_calls_result else 0
-
-    latencies = cursor.execute(
-        "SELECT duration_ms FROM telemetry_events WHERE timestamp >= ? ORDER BY duration_ms",
-        (since,),
-    ).fetchall()
-
-    latency_median_ms = 0
-    latency_p95_ms = 0
-    if latencies:
-        sorted_latencies = [lat[0] for lat in latencies]
-        latency_median_ms = sorted_latencies[len(sorted_latencies) // 2]
-        p95_idx = int(len(sorted_latencies) * 0.95)
-        latency_p95_ms = sorted_latencies[p95_idx] if p95_idx < len(sorted_latencies) else sorted_latencies[-1]
-
-    return {
-        "tool_distribution": tool_dist,
-        "error_distribution": error_dist,
-        "max_page_depth": max_depth,
-        "dialogs_with_deep_scroll": 0,
-        "total_calls": total_calls,
-        "filter_count": filter_count,
-        "latency_median_ms": latency_median_ms,
-        "latency_p95_ms": latency_p95_ms,
-    }
-
-
 @mcp_tool("secondary/helper")
 async def get_usage_stats(args: GetUsageStats) -> ToolResult:
-
-    db_dir = xdg_state_home() / "mcp-telegram"
-    db_path = db_dir / "analytics.db"
-
-    conn = None
     try:
-        conn = sqlite3.connect(str(db_path))
-        cursor = conn.cursor()
-        since = int(time.time()) - 30 * 86400
+        async with daemon_connection() as conn:
+            response = await conn.get_usage_stats()
+    except DaemonNotRunningError:
+        return ToolResult(content=_text_response(_daemon_not_running_text()))
 
-        stats = _query_usage_stats(cursor, since)
+    if not response.get("ok"):
+        error_msg = response.get("error", "Unknown error")
+        return ToolResult(content=_text_response(usage_stats_query_error_text(error_msg)))
 
-        from ..analytics import format_usage_summary
-        summary = format_usage_summary(stats)
+    stats = response.get("data", {})
+    if not stats or stats.get("total_calls", 0) == 0:
+        return ToolResult(content=_text_response(no_usage_data_text()))
 
-        return ToolResult(content=_text_response(summary if summary else no_usage_data_text()))
-
-    except sqlite3.OperationalError as exc:
-        if "no such table" in str(exc):
-            return ToolResult(content=_text_response(usage_stats_db_missing_text()))
-        logger.error("GetUsageStats query failed: %s", exc, exc_info=True)
-        return ToolResult(content=_text_response(usage_stats_query_error_text(type(exc).__name__)))
-    except Exception as exc:
-        logger.error("GetUsageStats query failed: %s", exc, exc_info=True)
-        return ToolResult(content=_text_response(usage_stats_query_error_text(type(exc).__name__)))
-    finally:
-        if conn is not None:
-            conn.close()
+    summary = format_usage_summary(stats)
+    return ToolResult(content=_text_response(summary if summary else no_usage_data_text()))
