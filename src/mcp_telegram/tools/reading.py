@@ -7,6 +7,7 @@ from pydantic import Field, model_validator
 from ..errors import dialog_not_found_text, invalid_navigation_text, search_no_hits_text
 from ..formatter import format_messages
 from ..resolver import parse_exact_dialog_id
+from ._adapters import DaemonMessage
 from ._base import (
     DaemonNotRunningError,
     ToolArgs,
@@ -15,71 +16,6 @@ from ._base import (
     daemon_connection,
     mcp_tool,
 )
-
-# ---------------------------------------------------------------------------
-# Thin adapter: daemon row dict → MessageLike-compatible object
-# ---------------------------------------------------------------------------
-
-
-class _DaemonMessage:
-    """Lightweight MessageLike adapter for daemon API row dicts.
-
-    format_messages() accesses: .id, .date, .message, .sender, .reply_to,
-    .reactions, .media, and optionally .edit_date.
-    """
-
-    __slots__ = (
-        "id", "date", "message", "sender", "reply_to", "reactions", "media",
-        "edit_date", "topic_title",
-    )
-
-    def __init__(self, row: dict) -> None:
-        self.id: int = row["message_id"]
-        sent_at = row.get("sent_at") or 0
-        self.date = datetime.fromtimestamp(int(sent_at), tz=timezone.utc)
-        self.message: str | None = row.get("text")
-        sender_name = row.get("sender_first_name")
-        self.sender = _Sender(sender_name) if sender_name else None
-        reply_id = row.get("reply_to_msg_id")
-        self.reply_to = _ReplyHeader(reply_id) if reply_id else None
-        self.reactions = row.get("reactions")  # JSON string or None
-        media_desc = row.get("media_description")
-        self.media = _MediaPlaceholder(media_desc) if media_desc else None
-        edit_date_raw = row.get("edit_date")
-        if edit_date_raw is not None:
-            self.edit_date: datetime | None = datetime.fromtimestamp(
-                int(edit_date_raw), tz=timezone.utc
-            )
-        else:
-            self.edit_date = None
-        self.topic_title: str | None = row.get("topic_title")
-
-
-class _Sender:
-    __slots__ = ("first_name",)
-
-    def __init__(self, name: str | None) -> None:
-        self.first_name = name
-
-
-class _ReplyHeader:
-    __slots__ = ("reply_to_msg_id",)
-
-    def __init__(self, msg_id: int | None) -> None:
-        self.reply_to_msg_id = msg_id
-
-
-class _MediaPlaceholder:
-    """Wraps a pre-formatted media description string from sync.db."""
-
-    __slots__ = ("_description",)
-
-    def __init__(self, description: str) -> None:
-        self._description = description
-
-    def __str__(self) -> str:
-        return self._description
-
 
 # ---------------------------------------------------------------------------
 # format_messages adapter for daemon data
@@ -96,10 +32,10 @@ def _format_daemon_messages(rows: list[dict]) -> str:
     if not rows:
         return ""
 
-    messages = [_DaemonMessage(r) for r in rows]
+    messages = [DaemonMessage(r) for r in rows]
 
     # Build reply map from rows available in this page
-    reply_map: dict[int, _DaemonMessage] = {m.id: m for m in messages}
+    reply_map: dict[int, DaemonMessage] = {m.id: m for m in messages}
 
     # Pass topic_name_getter when any message has a topic_title
     has_topics = any(getattr(m, "topic_title", None) for m in messages)

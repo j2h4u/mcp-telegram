@@ -1065,7 +1065,7 @@ async def test_daemon_connection_list_messages_omits_none_params():
 
 def test_daemon_message_reads_edit_date_from_row():
     """_DaemonMessage reads edit_date from row dict as datetime (not hardcoded None)."""
-    from mcp_telegram.tools.reading import _DaemonMessage
+    from mcp_telegram.tools._adapters import DaemonMessage as _DaemonMessage
     from datetime import datetime, timezone
 
     row = {
@@ -1084,7 +1084,7 @@ def test_daemon_message_reads_edit_date_from_row():
 
 def test_daemon_message_edit_date_none_when_absent():
     """_DaemonMessage.edit_date is None when row has no edit_date key."""
-    from mcp_telegram.tools.reading import _DaemonMessage
+    from mcp_telegram.tools._adapters import DaemonMessage as _DaemonMessage
 
     row = {
         "message_id": 1,
@@ -1099,7 +1099,7 @@ def test_daemon_message_edit_date_none_when_absent():
 
 def test_daemon_message_reads_topic_title_from_row():
     """_DaemonMessage reads topic_title from row dict."""
-    from mcp_telegram.tools.reading import _DaemonMessage
+    from mcp_telegram.tools._adapters import DaemonMessage as _DaemonMessage
 
     row = {
         "message_id": 1,
@@ -1115,7 +1115,7 @@ def test_daemon_message_reads_topic_title_from_row():
 
 def test_daemon_message_topic_title_none_when_absent():
     """_DaemonMessage.topic_title is None when row has no topic_title key."""
-    from mcp_telegram.tools.reading import _DaemonMessage
+    from mcp_telegram.tools._adapters import DaemonMessage as _DaemonMessage
 
     row = {
         "message_id": 1,

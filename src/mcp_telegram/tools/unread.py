@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import typing as t
-from datetime import datetime, timezone
 
 from pydantic import Field
 
 from ..errors import no_unread_all_text, no_unread_personal_text
 from ..formatter import UnreadChatData, format_unread_messages_grouped
+from ._adapters import DaemonMessage
 from ._base import (
     DaemonNotRunningError,
     ToolArgs,
@@ -16,38 +16,6 @@ from ._base import (
     daemon_connection,
     mcp_tool,
 )
-
-
-class _DaemonUnreadMessage:
-    """Adapter: daemon row dict -> MessageLike for format_messages()."""
-
-    __slots__ = (
-        "id", "date", "message", "sender", "sender_id",
-        "media", "reply_to", "reactions", "edit_date", "forum_topic_id",
-    )
-
-    def __init__(self, row: dict) -> None:
-        self.id: int = row.get("message_id", 0)
-        ts = row.get("sent_at", 0)
-        self.date = datetime.fromtimestamp(ts, tz=timezone.utc) if ts else datetime.now(tz=timezone.utc)
-        self.message: str | None = row.get("text")
-        self.sender_id: int | None = row.get("sender_id")
-        self.media: None = None
-        self.reply_to: None = None
-        self.reactions: None = None
-        self.edit_date: None = None
-        self.forum_topic_id: None = None
-
-        first_name = row.get("sender_first_name")
-        self.sender: _Sender | None = _Sender(first_name) if first_name else None
-
-
-class _Sender:
-    __slots__ = ("first_name", "last_name")
-
-    def __init__(self, name: str | None) -> None:
-        self.first_name = name
-        self.last_name = None
 
 
 class ListUnreadMessages(ToolArgs):
@@ -107,7 +75,7 @@ async def list_unread_messages(args: ListUnreadMessages) -> ToolResult:
     total_messages_shown = 0
 
     for group in groups:
-        messages = [_DaemonUnreadMessage(m) for m in group.get("messages", [])]
+        messages = [DaemonMessage(m) for m in group.get("messages", [])]
         chat_data = UnreadChatData(
             chat_id=group.get("dialog_id", 0),
             display_name=group.get("display_name", ""),
