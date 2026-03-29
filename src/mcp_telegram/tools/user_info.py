@@ -29,40 +29,46 @@ class GetUserInfo(ToolArgs):
 
 @mcp_tool("primary")
 async def get_user_info(args: GetUserInfo) -> ToolResult:
+    # Two separate daemon connections: the daemon handles one request per
+    # connection, so resolve_entity and get_user_info cannot share one.
     try:
         async with daemon_connection() as conn:
             resolve_response = await conn.resolve_entity(query=args.user)
+    except DaemonNotRunningError:
+        return ToolResult(content=_text_response(_daemon_not_running_text()))
 
-            if not resolve_response.get("ok"):
-                return ToolResult(content=_text_response(
-                    user_not_found_text(args.user, retry_tool="GetUserInfo")
-                ))
+    if not resolve_response.get("ok"):
+        return ToolResult(content=_text_response(
+            user_not_found_text(args.user, retry_tool="GetUserInfo")
+        ))
 
-            resolve_data = resolve_response.get("data", {})
-            resolve_status = resolve_data.get("result", "not_found")
+    resolve_data = resolve_response.get("data", {})
+    resolve_status = resolve_data.get("result", "not_found")
 
-            if resolve_status == "not_found":
-                return ToolResult(content=_text_response(
-                    user_not_found_text(args.user, retry_tool="GetUserInfo")
-                ))
+    if resolve_status == "not_found":
+        return ToolResult(content=_text_response(
+            user_not_found_text(args.user, retry_tool="GetUserInfo")
+        ))
 
-            if resolve_status == "candidates":
-                matches = resolve_data.get("matches", [])
-                match_lines = []
-                for match in matches:
-                    line = f'id={match["entity_id"]} name="{match["display_name"]}" score={match["score"]}'
-                    if match.get("username"):
-                        line += f' @{match["username"]}'
-                    if match.get("entity_type"):
-                        line += f' [{match["entity_type"]}]'
-                    match_lines.append(line)
-                return ToolResult(content=_text_response(
-                    ambiguous_user_text(args.user, match_lines, retry_tool="GetUserInfo"),
-                ))
+    if resolve_status == "candidates":
+        matches = resolve_data.get("matches", [])
+        match_lines = []
+        for match in matches:
+            line = f'id={match["entity_id"]} name="{match["display_name"]}" score={match["score"]}'
+            if match.get("username"):
+                line += f' @{match["username"]}'
+            if match.get("entity_type"):
+                line += f' [{match["entity_type"]}]'
+            match_lines.append(line)
+        return ToolResult(content=_text_response(
+            ambiguous_user_text(args.user, match_lines, retry_tool="GetUserInfo"),
+        ))
 
-            entity_id: int = resolve_data["entity_id"]
-            display_name: str = resolve_data["display_name"]
+    entity_id: int = resolve_data["entity_id"]
+    display_name: str = resolve_data["display_name"]
 
+    try:
+        async with daemon_connection() as conn:
             response = await conn.get_user_info(user_id=entity_id)
     except DaemonNotRunningError:
         return ToolResult(content=_text_response(_daemon_not_running_text()))
