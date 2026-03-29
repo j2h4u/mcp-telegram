@@ -196,7 +196,7 @@ async def sync_main() -> None:
         socket_path = get_daemon_socket_path()
         socket_path.unlink(missing_ok=True)
         unix_server = await asyncio.start_unix_server(
-            api_server.handle_client, path=str(socket_path)
+            api_server.handle_client, path=str(socket_path), limit=2 * 1024 * 1024,
         )
         logger.info("daemon API listening on %s", socket_path)
 

@@ -275,7 +275,7 @@ async def daemon_connection() -> AsyncIterator[DaemonConnection]:
     reader: asyncio.StreamReader | None = None
     writer: asyncio.StreamWriter | None = None
     try:
-        reader, writer = await asyncio.open_unix_connection(str(socket_path))
+        reader, writer = await asyncio.open_unix_connection(str(socket_path), limit=2 * 1024 * 1024)
     except (FileNotFoundError, ConnectionRefusedError) as exc:
         raise DaemonNotRunningError(
             "Sync daemon is not running. "
