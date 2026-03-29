@@ -654,7 +654,7 @@ class DaemonAPIServer:
                     "id": t.id,
                     "title": getattr(t, "title", None),
                     "icon_emoji_id": getattr(t, "icon_emoji_id", None),
-                    "date": getattr(t, "date", None),
+                    "date": int(t.date.timestamp()) if hasattr(getattr(t, "date", None), "timestamp") else getattr(t, "date", None),
                 }
                 for t in getattr(result, "topics", [])
             ]
