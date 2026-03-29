@@ -1820,7 +1820,7 @@ def test_build_list_messages_query_cursor_newest() -> None:
     """_build_list_messages_query with cursor and direction=newest uses message_id < ?."""
     from mcp_telegram.daemon_api import _build_list_messages_query
     sql, params = _build_list_messages_query(
-        dialog_id=1, limit=10, cursor_msg_id=500, direction="newest"
+        dialog_id=1, limit=10, anchor_msg_id=500, direction="newest"
     )
     assert "<" in sql
     assert 500 in params
@@ -1830,7 +1830,7 @@ def test_build_list_messages_query_cursor_oldest() -> None:
     """_build_list_messages_query with cursor and direction=oldest uses message_id > ?."""
     from mcp_telegram.daemon_api import _build_list_messages_query
     sql, params = _build_list_messages_query(
-        dialog_id=1, limit=10, cursor_msg_id=500, direction="oldest"
+        dialog_id=1, limit=10, anchor_msg_id=500, direction="oldest"
     )
     assert ">" in sql
     assert 500 in params

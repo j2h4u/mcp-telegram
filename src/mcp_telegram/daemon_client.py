@@ -139,7 +139,22 @@ class DaemonConnection:
         unread_after_id: int | None = None,
         unread: bool | None = None,
     ) -> dict:
-        """Send list_messages request. Accepts dialog name or numeric id."""
+        """Send list_messages request to the daemon.
+
+        Args:
+            dialog_id: Numeric dialog id (preferred over dialog name).
+            dialog: Fuzzy dialog name — daemon resolves via get_entity/iter_dialogs.
+            limit: Max messages to return (daemon clamps to 1..500).
+            navigation: Opaque cursor token from a previous next_navigation response.
+            direction: "newest" (default) or "oldest" sort order.
+            sender_id: Filter messages by sender id (sync.db: AND clause, on-demand: from_user=).
+            sender_name: Filter by sender name (case-insensitive LIKE, sync.db only).
+            topic_id: Filter by forum topic id.
+            unread_after_id: Return only messages with message_id > this value.
+            unread: If True, daemon resolves read_inbox_max_id as unread_after_id.
+
+        Optional params are omitted from the payload when None (backward compat).
+        """
         payload: dict = {
             "method": "list_messages",
             "dialog_id": dialog_id,

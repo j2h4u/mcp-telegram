@@ -169,7 +169,11 @@ class ListMessages(ToolArgs):
             "next_navigation token from the previous ListMessages response to continue."
         ),
     )
-    sender: str | None = Field(default=None, max_length=500)
+    sender: str | None = Field(
+        default=None,
+        max_length=500,
+        description="Filter by sender name (fuzzy match, case-insensitive).",
+    )
     topic: str | None = Field(
         default=None,
         max_length=500,
@@ -198,6 +202,53 @@ class ListMessages(ToolArgs):
         if self.topic is not None and self.exact_topic_id is not None:
             raise ValueError("topic and exact_topic_id are mutually exclusive.")
         return self
+
+
+async def _resolve_topic_id(
+    topic_name: str,
+    *,
+    dialog_id: int,
+    dialog_name: str | None,
+) -> int | ToolResult:
+    """Resolve a fuzzy topic name to a numeric topic_id via the daemon.
+
+    Returns the resolved int topic_id on success, or a ToolResult with an
+    error message on failure (daemon error, not found, ambiguous match).
+    """
+    try:
+        async with daemon_connection() as conn:
+            response = await conn.list_topics(
+                dialog_id=dialog_id, dialog=dialog_name,
+            )
+    except DaemonNotRunningError as e:
+        return ToolResult(content=_text_response(str(e)))
+
+    if not response.get("ok"):
+        error = response.get("error", "unknown")
+        message = response.get("message", "")
+        return ToolResult(content=_text_response(f"Topic lookup failed: {error}: {message}"))
+
+    topics = response.get("data", {}).get("topics", [])
+    query = topic_name.lower()
+    fuzzy_matches = [t for t in topics if query in (t.get("title") or "").lower()]
+
+    if len(fuzzy_matches) == 1:
+        return fuzzy_matches[0]["id"]
+
+    if len(fuzzy_matches) > 1:
+        exact_matches = [t for t in fuzzy_matches if (t.get("title") or "").lower() == query]
+        if len(exact_matches) == 1:
+            return exact_matches[0]["id"]
+        names = ", ".join(t.get("title", "?") for t in fuzzy_matches[:5])
+        return ToolResult(
+            content=_text_response(
+                f"Ambiguous topic '{topic_name}'. Matches: {names}. Use exact_topic_id."
+            ),
+        )
+
+    return ToolResult(
+        content=_text_response(f"Topic '{topic_name}' not found in this dialog."),
+    )
 
 
 @mcp_tool("primary")
@@ -232,46 +283,16 @@ async def list_messages(args: ListMessages) -> ToolResult:
     # per connection — topic resolution must complete before list_messages.
     topic_id: int | None = args.exact_topic_id
     if topic_id is None and args.topic is not None:
-        try:
-            async with daemon_connection() as topic_conn:
-                topics_response = await topic_conn.list_topics(
-                    dialog_id=dialog_id if dialog_id else 0,
-                    dialog=args.dialog if not dialog_id else None,
-                )
-        except DaemonNotRunningError as e:
-            return ToolResult(content=_text_response(str(e)))
-        if topics_response.get("ok"):
-            topics_data = topics_response.get("data", {}).get("topics", [])
-            topic_lower = args.topic.lower()
-            matched = [
-                t for t in topics_data
-                if topic_lower in (t.get("title") or "").lower()
-            ]
-            if len(matched) == 1:
-                topic_id = matched[0]["id"]
-            elif len(matched) > 1:
-                exact = [
-                    t for t in matched
-                    if (t.get("title") or "").lower() == topic_lower
-                ]
-                if len(exact) == 1:
-                    topic_id = exact[0]["id"]
-                else:
-                    names = ", ".join(t.get("title", "?") for t in matched[:5])
-                    return ToolResult(
-                        content=_text_response(
-                            f"Ambiguous topic '{args.topic}'. Matches: {names}. "
-                            "Use exact_topic_id."
-                        ),
-                        has_filter=has_filter,
-                    )
-            else:
-                return ToolResult(
-                    content=_text_response(
-                        f"Topic '{args.topic}' not found in this dialog."
-                    ),
-                    has_filter=has_filter,
-                )
+        resolved = await _resolve_topic_id(
+            args.topic,
+            dialog_id=dialog_id if dialog_id else 0,
+            dialog_name=args.dialog if not dialog_id else None,
+        )
+        if isinstance(resolved, ToolResult):
+            return ToolResult(
+                content=resolved.content, has_filter=has_filter,
+            )
+        topic_id = resolved
 
     try:
         async with daemon_connection() as conn:
