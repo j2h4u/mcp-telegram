@@ -492,7 +492,7 @@ async def test_get_my_account_daemon_not_running():
 
 def test_no_telethon_imports_in_tools():
     """Tool modules must not import telethon."""
-    tools_dir = pathlib.Path("src/mcp_telegram/tools")
+    tools_dir = pathlib.Path(__file__).parent.parent / "src" / "mcp_telegram" / "tools"
     for filename in ["discovery.py", "reading.py", "_base.py", "sync.py", "user_info.py", "unread.py"]:
         filepath = tools_dir / filename
         content = filepath.read_text()
@@ -622,7 +622,7 @@ async def test_get_sync_alerts_daemon_not_running():
 
 def test_no_connected_client_in_tools():
     """No tools/ file references _connected_client after migration."""
-    tools_dir = pathlib.Path("src/mcp_telegram/tools")
+    tools_dir = pathlib.Path(__file__).parent.parent / "src" / "mcp_telegram" / "tools"
     for filepath in tools_dir.glob("*.py"):
         if filepath.name.startswith("__"):
             continue
@@ -865,7 +865,7 @@ async def test_get_usage_stats_empty_data():
 def test_no_sqlite3_or_cache_in_tools():
     """CONSOLIDATE-03: tools/ must have zero sqlite3, cache, or analytics DB imports."""
     import pathlib
-    tools_dir = pathlib.Path("src/mcp_telegram/tools")
+    tools_dir = pathlib.Path(__file__).parent.parent / "src" / "mcp_telegram" / "tools"
     forbidden = [
         "import sqlite3",
         "from ..cache import",

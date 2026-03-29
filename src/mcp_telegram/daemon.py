@@ -187,7 +187,7 @@ async def sync_main() -> None:
     try:
         try:
             await client.connect()
-        except ConnectionError as exc:
+        except (OSError, asyncio.TimeoutError) as exc:
             logger.error("sync-daemon connection failed: %s", exc)
             conn.close()
             return

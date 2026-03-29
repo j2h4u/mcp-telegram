@@ -932,8 +932,7 @@ async def test_get_user_info_dispatch_routing() -> None:
     server = make_server(client=client)
     result = await server._dispatch({"method": "get_user_info", "user_id": 42})
 
-    # Should not be "unknown_method"
-    assert result.get("error") != "unknown_method", "get_user_info not routed in _dispatch"
+    assert result["ok"] is True, f"get_user_info dispatch failed: {result}"
 
 
 # ---------------------------------------------------------------------------
@@ -1210,7 +1209,7 @@ async def test_list_unread_messages_dispatch_routing() -> None:
     server = make_server(client=client)
     result = await server._dispatch({"method": "list_unread_messages"})
 
-    assert result.get("error") != "unknown_method", "list_unread_messages not routed in _dispatch"
+    assert result["ok"] is True, f"list_unread_messages dispatch failed: {result}"
 
 
 # ---------------------------------------------------------------------------

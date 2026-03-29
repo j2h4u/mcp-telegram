@@ -52,6 +52,17 @@ INSERT_MESSAGE_SQL = (
     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)"
 )
 
+
+def insert_messages_with_fts(
+    conn: sqlite3.Connection, rows: list[tuple[object, ...]],
+) -> None:
+    """Insert message rows and their FTS index entries atomically."""
+    conn.executemany(INSERT_MESSAGE_SQL, rows)
+    conn.executemany(
+        INSERT_FTS_SQL,
+        ((row[0], row[1], stem_text(row[3])) for row in rows),  # type: ignore[arg-type]
+    )
+
 _NEXT_PENDING_SQL = (
     "SELECT dialog_id, sync_progress FROM synced_dialogs "
     "WHERE status IN ('syncing', 'not_synced') "
@@ -324,11 +335,7 @@ class FullSyncWorker:
 
         # Single atomic transaction: messages + FTS + progress update (D-05)
         with self._conn:
-            self._conn.executemany(INSERT_MESSAGE_SQL, rows)
-            self._conn.executemany(
-                INSERT_FTS_SQL,
-                ((row[0], row[1], stem_text(row[3])) for row in rows),  # type: ignore[arg-type]
-            )
+            insert_messages_with_fts(self._conn, rows)
             self._conn.execute(
                 _UPDATE_PROGRESS_SQL, (new_progress, new_status, dialog_id)
             )

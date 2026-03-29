@@ -481,6 +481,8 @@ class DaemonAPIServer:
             return int(telethon_utils.get_peer_id(entity))
         except (ValueError, KeyError):
             pass
+        except Exception:
+            logger.debug("get_entity failed for %r, falling back to iter_dialogs", dialog, exc_info=True)
 
         # Fallback: iterate dialogs and fuzzy-match by name
         logger.debug("resolve_dialog_fallback_iter_dialogs query=%r", dialog)
@@ -503,6 +505,21 @@ class DaemonAPIServer:
             f"Dialog {dialog!r} not found. "
             "Check the dialog name or use dialog_id from ListDialogs."
         )
+
+    async def _resolve_dialog_id(
+        self, dialog_id: int, dialog: str | None,
+    ) -> int | dict:
+        """Resolve dialog_id from name if needed.
+
+        Returns the resolved int dialog_id on success,
+        or an error response dict on failure.
+        """
+        if not dialog_id and dialog:
+            try:
+                return await self._resolve_dialog_name(dialog)
+            except ValueError as exc:
+                return {"ok": False, "error": "dialog_not_found", "message": str(exc)}
+        return dialog_id
 
     # ------------------------------------------------------------------
     # Shared message helpers
@@ -609,12 +626,10 @@ class DaemonAPIServer:
         if direction not in ("newest", "oldest"):
             direction = "newest"
 
-        # Dialog name resolution (single location — before nav token check)
-        if not dialog_id and dialog:
-            try:
-                dialog_id = await self._resolve_dialog_name(dialog)
-            except ValueError as exc:
-                return {"ok": False, "error": "dialog_not_found", "message": str(exc)}
+        resolved = await self._resolve_dialog_id(dialog_id, dialog)
+        if isinstance(resolved, dict):
+            return resolved
+        dialog_id = resolved
 
         if not dialog_id:
             return {
@@ -779,12 +794,10 @@ class DaemonAPIServer:
         limit: int = _clamp(req.get("limit", 20), 1, 200)
         offset: int = max(0, req.get("offset", 0))
 
-        # Dialog resolution
-        if not dialog_id and dialog:
-            try:
-                dialog_id = await self._resolve_dialog_name(dialog)
-            except ValueError as exc:
-                return {"ok": False, "error": "dialog_not_found", "message": str(exc)}
+        resolved = await self._resolve_dialog_id(dialog_id, dialog)
+        if isinstance(resolved, dict):
+            return resolved
+        dialog_id = resolved
 
         # Stem the query
         stemmed = stem_query(query)
@@ -885,12 +898,10 @@ class DaemonAPIServer:
         dialog_id: int = req.get("dialog_id", 0) or 0
         dialog: str | None = req.get("dialog")
 
-        # Dialog resolution
-        if not dialog_id and dialog:
-            try:
-                dialog_id = await self._resolve_dialog_name(dialog)
-            except ValueError as exc:
-                return {"ok": False, "error": "dialog_not_found", "message": str(exc)}
+        resolved = await self._resolve_dialog_id(dialog_id, dialog)
+        if isinstance(resolved, dict):
+            return resolved
+        dialog_id = resolved
 
         if not dialog_id:
             return {
@@ -1119,7 +1130,7 @@ class DaemonAPIServer:
                     "type": chat_type,
                 })
         except Exception as exc:
-            logger.warning("get_user_info common_chats_failed user_id=%r error=%s", user_id, exc)
+            logger.warning("get_user_info common_chats_failed user_id=%r error=%s", user_id, exc, exc_info=True)
 
         return {
             "ok": True,
