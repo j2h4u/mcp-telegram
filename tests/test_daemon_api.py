@@ -98,6 +98,22 @@ def _make_db(*, with_fts: bool = False) -> sqlite3.Connection:
         ) WITHOUT ROWID
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS topic_metadata (
+            dialog_id           INTEGER NOT NULL,
+            topic_id            INTEGER NOT NULL,
+            title               TEXT NOT NULL,
+            top_message_id      INTEGER,
+            is_general          INTEGER NOT NULL DEFAULT 0,
+            is_deleted          INTEGER NOT NULL DEFAULT 0,
+            inaccessible_error  TEXT,
+            inaccessible_at     INTEGER,
+            updated_at          INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (dialog_id, topic_id)
+        )
+        """
+    )
     if with_fts:
         conn.execute(MESSAGES_FTS_DDL)
     conn.commit()
@@ -147,11 +163,27 @@ def _insert_message(
     text: str = "test message",
     sent_at: int = 1700000000,
     sender_first_name: str = "Alice",
+    sender_id: int | None = None,
+    forum_topic_id: int | None = None,
 ) -> None:
     conn.execute(
-        "INSERT INTO messages (dialog_id, message_id, sent_at, text, sender_first_name) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (dialog_id, message_id, sent_at, text, sender_first_name),
+        "INSERT INTO messages "
+        "(dialog_id, message_id, sent_at, text, sender_first_name, sender_id, forum_topic_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (dialog_id, message_id, sent_at, text, sender_first_name, sender_id, forum_topic_id),
+    )
+    conn.commit()
+
+
+def _insert_topic_metadata(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    topic_id: int,
+    title: str,
+) -> None:
+    conn.execute(
+        "INSERT INTO topic_metadata (dialog_id, topic_id, title) VALUES (?, ?, ?)",
+        (dialog_id, topic_id, title),
     )
     conn.commit()
 
@@ -1714,3 +1746,582 @@ def test_daemon_imports_migrate_legacy_databases() -> None:
     """daemon.py imports migrate_legacy_databases from sync_db."""
     from mcp_telegram import daemon
     assert hasattr(daemon, "migrate_legacy_databases")
+
+
+# ---------------------------------------------------------------------------
+# Phase 35-01: _build_list_messages_query — dynamic SQL builder
+# ---------------------------------------------------------------------------
+
+
+def test_build_list_messages_query_exists() -> None:
+    """_build_list_messages_query is exported from daemon_api."""
+    from mcp_telegram.daemon_api import _build_list_messages_query
+    assert callable(_build_list_messages_query)
+
+
+def test_build_list_messages_query_basic_shape() -> None:
+    """_build_list_messages_query returns (sql, params) with edit_date and topic_title columns."""
+    from mcp_telegram.daemon_api import _build_list_messages_query
+    sql, params = _build_list_messages_query(dialog_id=1, limit=10)
+    assert "edit_date" in sql
+    assert "topic_title" in sql or "tm.title" in sql
+    assert "topic_metadata" in sql
+    assert "message_versions" in sql
+    assert params[-1] == 10  # LIMIT param is last
+
+
+def test_build_list_messages_query_direction_newest() -> None:
+    """_build_list_messages_query with direction=newest uses DESC order."""
+    from mcp_telegram.daemon_api import _build_list_messages_query
+    sql, _ = _build_list_messages_query(dialog_id=1, limit=10, direction="newest")
+    assert "DESC" in sql.upper()
+
+
+def test_build_list_messages_query_direction_oldest() -> None:
+    """_build_list_messages_query with direction=oldest uses ASC order."""
+    from mcp_telegram.daemon_api import _build_list_messages_query
+    sql, _ = _build_list_messages_query(dialog_id=1, limit=10, direction="oldest")
+    assert "ASC" in sql.upper()
+
+
+def test_build_list_messages_query_sender_id_filter() -> None:
+    """_build_list_messages_query with sender_id adds AND m.sender_id = ? clause."""
+    from mcp_telegram.daemon_api import _build_list_messages_query
+    sql, params = _build_list_messages_query(dialog_id=1, limit=10, sender_id=42)
+    assert "sender_id" in sql
+    assert 42 in params
+
+
+def test_build_list_messages_query_sender_name_filter() -> None:
+    """_build_list_messages_query with sender_name adds LIKE clause."""
+    from mcp_telegram.daemon_api import _build_list_messages_query
+    sql, params = _build_list_messages_query(dialog_id=1, limit=10, sender_name="Alice")
+    assert "LIKE" in sql.upper()
+    assert any("Alice" in str(p) for p in params)
+
+
+def test_build_list_messages_query_topic_filter() -> None:
+    """_build_list_messages_query with topic_id adds forum_topic_id filter."""
+    from mcp_telegram.daemon_api import _build_list_messages_query
+    sql, params = _build_list_messages_query(dialog_id=1, limit=10, topic_id=5)
+    assert "forum_topic_id" in sql
+    assert 5 in params
+
+
+def test_build_list_messages_query_unread_filter() -> None:
+    """_build_list_messages_query with unread_after_id adds message_id > ? clause."""
+    from mcp_telegram.daemon_api import _build_list_messages_query
+    sql, params = _build_list_messages_query(dialog_id=1, limit=10, unread_after_id=100)
+    assert "message_id" in sql
+    assert 100 in params
+
+
+def test_build_list_messages_query_cursor_newest() -> None:
+    """_build_list_messages_query with cursor and direction=newest uses message_id < ?."""
+    from mcp_telegram.daemon_api import _build_list_messages_query
+    sql, params = _build_list_messages_query(
+        dialog_id=1, limit=10, cursor_msg_id=500, direction="newest"
+    )
+    assert "<" in sql
+    assert 500 in params
+
+
+def test_build_list_messages_query_cursor_oldest() -> None:
+    """_build_list_messages_query with cursor and direction=oldest uses message_id > ?."""
+    from mcp_telegram.daemon_api import _build_list_messages_query
+    sql, params = _build_list_messages_query(
+        dialog_id=1, limit=10, cursor_msg_id=500, direction="oldest"
+    )
+    assert ">" in sql
+    assert 500 in params
+
+
+# ---------------------------------------------------------------------------
+# Phase 35-01: list_messages — pagination (sync.db)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_messages_pagination_sync_db() -> None:
+    """list_messages with synced dialog + limit=2 returns 2 msgs and a next_navigation token."""
+    DIALOG_ID = 9001
+    conn = _make_db()
+    _insert_synced_dialog(conn, DIALOG_ID, status="synced")
+    _insert_message(conn, DIALOG_ID, 101, text="msg 101", sent_at=1700000001)
+    _insert_message(conn, DIALOG_ID, 102, text="msg 102", sent_at=1700000002)
+    _insert_message(conn, DIALOG_ID, 103, text="msg 103", sent_at=1700000003)
+
+    server = make_server(conn)
+    result = await server._list_messages({"dialog_id": DIALOG_ID, "limit": 2})
+
+    assert result["ok"] is True, f"Unexpected error: {result}"
+    data = result["data"]
+    assert len(data["messages"]) == 2
+    assert data.get("next_navigation") is not None, "Expected next_navigation token"
+
+
+@pytest.mark.asyncio
+async def test_list_messages_pagination_cursor_continues() -> None:
+    """list_messages with navigation token continues from cursor position."""
+    from mcp_telegram.pagination import encode_history_navigation, HistoryDirection
+    DIALOG_ID = 9002
+    conn = _make_db()
+    _insert_synced_dialog(conn, DIALOG_ID, status="synced")
+    _insert_message(conn, DIALOG_ID, 101, text="msg 101", sent_at=1700000001)
+    _insert_message(conn, DIALOG_ID, 102, text="msg 102", sent_at=1700000002)
+    _insert_message(conn, DIALOG_ID, 103, text="msg 103", sent_at=1700000003)
+    _insert_message(conn, DIALOG_ID, 104, text="msg 104", sent_at=1700000004)
+
+    # Get first page, cursor at msg 103 (newest-first, so 104 and 103 returned)
+    token = encode_history_navigation(103, DIALOG_ID, direction=HistoryDirection.NEWEST)
+
+    server = make_server(conn)
+    result = await server._list_messages({
+        "dialog_id": DIALOG_ID, "limit": 2, "navigation": token
+    })
+
+    assert result["ok"] is True, f"Unexpected error: {result}"
+    messages = result["data"]["messages"]
+    # cursor=103 with direction=newest → message_id < 103 → returns 102, 101
+    assert all(m["message_id"] < 103 for m in messages), \
+        f"Expected messages before 103, got: {[m['message_id'] for m in messages]}"
+
+
+@pytest.mark.asyncio
+async def test_list_messages_pagination_wrong_dialog_error() -> None:
+    """list_messages with navigation token for wrong dialog returns error."""
+    from mcp_telegram.pagination import encode_history_navigation, HistoryDirection
+    DIALOG_ID = 9003
+    OTHER_DIALOG = 9099
+    conn = _make_db()
+    _insert_synced_dialog(conn, DIALOG_ID, status="synced")
+    _insert_message(conn, DIALOG_ID, 101, text="msg 101", sent_at=1700000001)
+
+    # Token for a different dialog
+    token = encode_history_navigation(101, OTHER_DIALOG, direction=HistoryDirection.NEWEST)
+
+    server = make_server(conn)
+    result = await server._list_messages({
+        "dialog_id": DIALOG_ID, "limit": 10, "navigation": token
+    })
+
+    assert result["ok"] is False
+    assert "error" in result
+
+
+# ---------------------------------------------------------------------------
+# Phase 35-01: list_messages — direction (sync.db)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_messages_direction_oldest() -> None:
+    """list_messages with direction=oldest returns messages ORDER BY message_id ASC."""
+    DIALOG_ID = 9010
+    conn = _make_db()
+    _insert_synced_dialog(conn, DIALOG_ID, status="synced")
+    _insert_message(conn, DIALOG_ID, 101, text="first", sent_at=1700000001)
+    _insert_message(conn, DIALOG_ID, 102, text="second", sent_at=1700000002)
+    _insert_message(conn, DIALOG_ID, 103, text="third", sent_at=1700000003)
+
+    server = make_server(conn)
+    result = await server._list_messages({
+        "dialog_id": DIALOG_ID, "limit": 10, "direction": "oldest"
+    })
+
+    assert result["ok"] is True, f"Unexpected error: {result}"
+    messages = result["data"]["messages"]
+    ids = [m["message_id"] for m in messages]
+    assert ids == sorted(ids), f"Expected ascending order, got: {ids}"
+
+
+@pytest.mark.asyncio
+async def test_list_messages_direction_newest() -> None:
+    """list_messages with direction=newest returns messages ORDER BY message_id DESC."""
+    DIALOG_ID = 9011
+    conn = _make_db()
+    _insert_synced_dialog(conn, DIALOG_ID, status="synced")
+    _insert_message(conn, DIALOG_ID, 101, text="first", sent_at=1700000001)
+    _insert_message(conn, DIALOG_ID, 102, text="second", sent_at=1700000002)
+    _insert_message(conn, DIALOG_ID, 103, text="third", sent_at=1700000003)
+
+    server = make_server(conn)
+    result = await server._list_messages({
+        "dialog_id": DIALOG_ID, "limit": 10, "direction": "newest"
+    })
+
+    assert result["ok"] is True, f"Unexpected error: {result}"
+    messages = result["data"]["messages"]
+    ids = [m["message_id"] for m in messages]
+    assert ids == sorted(ids, reverse=True), f"Expected descending order, got: {ids}"
+
+
+# ---------------------------------------------------------------------------
+# Phase 35-01: list_messages — sender filter (sync.db)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_messages_sender_filter() -> None:
+    """list_messages with sender_id=42 returns only messages from sender_id=42."""
+    DIALOG_ID = 9020
+    conn = _make_db()
+    _insert_synced_dialog(conn, DIALOG_ID, status="synced")
+    _insert_message(conn, DIALOG_ID, 101, text="from alice", sender_id=42)
+    _insert_message(conn, DIALOG_ID, 102, text="from bob", sender_id=99)
+
+    server = make_server(conn)
+    result = await server._list_messages({
+        "dialog_id": DIALOG_ID, "limit": 10, "sender_id": 42
+    })
+
+    assert result["ok"] is True, f"Unexpected error: {result}"
+    messages = result["data"]["messages"]
+    assert len(messages) == 1
+    assert messages[0]["message_id"] == 101
+    assert messages[0]["sender_id"] == 42
+
+
+@pytest.mark.asyncio
+async def test_list_messages_sender_name_filter() -> None:
+    """list_messages with sender_name='Alice' returns only Alice's messages (case-insensitive)."""
+    DIALOG_ID = 9021
+    conn = _make_db()
+    _insert_synced_dialog(conn, DIALOG_ID, status="synced")
+    _insert_message(conn, DIALOG_ID, 101, text="from alice", sender_first_name="Alice")
+    _insert_message(conn, DIALOG_ID, 102, text="from bob", sender_first_name="Bob")
+
+    server = make_server(conn)
+    result = await server._list_messages({
+        "dialog_id": DIALOG_ID, "limit": 10, "sender_name": "alice"
+    })
+
+    assert result["ok"] is True, f"Unexpected error: {result}"
+    messages = result["data"]["messages"]
+    assert len(messages) == 1
+    assert messages[0]["message_id"] == 101
+
+
+# ---------------------------------------------------------------------------
+# Phase 35-01: list_messages — topic filter (sync.db)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_messages_topic_filter() -> None:
+    """list_messages with topic_id=5 returns only messages with forum_topic_id=5."""
+    DIALOG_ID = 9030
+    conn = _make_db()
+    _insert_synced_dialog(conn, DIALOG_ID, status="synced")
+    _insert_message(conn, DIALOG_ID, 101, text="topic 5 msg", forum_topic_id=5)
+    _insert_message(conn, DIALOG_ID, 102, text="topic 7 msg", forum_topic_id=7)
+    _insert_message(conn, DIALOG_ID, 103, text="no topic msg", forum_topic_id=None)
+
+    server = make_server(conn)
+    result = await server._list_messages({
+        "dialog_id": DIALOG_ID, "limit": 10, "topic_id": 5
+    })
+
+    assert result["ok"] is True, f"Unexpected error: {result}"
+    messages = result["data"]["messages"]
+    assert len(messages) == 1
+    assert messages[0]["message_id"] == 101
+    assert messages[0]["forum_topic_id"] == 5
+
+
+# ---------------------------------------------------------------------------
+# Phase 35-01: list_messages — unread filter (sync.db)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_messages_unread_filter() -> None:
+    """list_messages with unread_after_id=100 returns only messages with message_id > 100."""
+    DIALOG_ID = 9040
+    conn = _make_db()
+    _insert_synced_dialog(conn, DIALOG_ID, status="synced")
+    _insert_message(conn, DIALOG_ID, 99, text="old msg", sent_at=1700000001)
+    _insert_message(conn, DIALOG_ID, 100, text="boundary msg", sent_at=1700000002)
+    _insert_message(conn, DIALOG_ID, 101, text="new msg", sent_at=1700000003)
+    _insert_message(conn, DIALOG_ID, 102, text="newer msg", sent_at=1700000004)
+
+    server = make_server(conn)
+    result = await server._list_messages({
+        "dialog_id": DIALOG_ID, "limit": 10, "unread_after_id": 100
+    })
+
+    assert result["ok"] is True, f"Unexpected error: {result}"
+    messages = result["data"]["messages"]
+    msg_ids = {m["message_id"] for m in messages}
+    assert 99 not in msg_ids
+    assert 100 not in msg_ids
+    assert 101 in msg_ids
+    assert 102 in msg_ids
+
+
+# ---------------------------------------------------------------------------
+# Phase 35-01: list_messages — edit_date (sync.db)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_messages_edit_date_sync_db() -> None:
+    """sync.db path returns edit_date from message_versions (MAX edit_date per message)."""
+    DIALOG_ID = 9050
+    conn = _make_db()
+    _insert_synced_dialog(conn, DIALOG_ID, status="synced")
+    _insert_message(conn, DIALOG_ID, 101, text="edited msg", sent_at=1700000001)
+    _insert_message_version(conn, DIALOG_ID, 101, version=1, edit_date=1700001000)
+    _insert_message_version(conn, DIALOG_ID, 101, version=2, edit_date=1700002000)
+    _insert_message(conn, DIALOG_ID, 102, text="unedited msg", sent_at=1700000002)
+
+    server = make_server(conn)
+    result = await server._list_messages({"dialog_id": DIALOG_ID, "limit": 10})
+
+    assert result["ok"] is True, f"Unexpected error: {result}"
+    messages = result["data"]["messages"]
+    msgs_by_id = {m["message_id"]: m for m in messages}
+
+    # Edited message should have edit_date = MAX(1700001000, 1700002000) = 1700002000
+    assert "edit_date" in msgs_by_id[101], "edit_date key must be present in message dict"
+    assert msgs_by_id[101]["edit_date"] == 1700002000
+
+    # Unedited message should have edit_date = None
+    assert msgs_by_id[102].get("edit_date") is None
+
+
+@pytest.mark.asyncio
+async def test_list_messages_no_edit_date_is_none() -> None:
+    """Messages without edits have edit_date=None in the response."""
+    DIALOG_ID = 9051
+    conn = _make_db()
+    _insert_synced_dialog(conn, DIALOG_ID, status="synced")
+    _insert_message(conn, DIALOG_ID, 101, text="never edited", sent_at=1700000001)
+
+    server = make_server(conn)
+    result = await server._list_messages({"dialog_id": DIALOG_ID, "limit": 10})
+
+    assert result["ok"] is True
+    messages = result["data"]["messages"]
+    assert messages[0]["edit_date"] is None
+
+
+# ---------------------------------------------------------------------------
+# Phase 35-01: list_messages — topic_title label (sync.db)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_messages_topic_label() -> None:
+    """sync.db path returns topic_title from LEFT JOIN topic_metadata when forum_topic_id is set."""
+    DIALOG_ID = 9060
+    conn = _make_db()
+    _insert_synced_dialog(conn, DIALOG_ID, status="synced")
+    _insert_topic_metadata(conn, DIALOG_ID, topic_id=5, title="General Discussion")
+    _insert_message(conn, DIALOG_ID, 101, text="topic msg", forum_topic_id=5)
+    _insert_message(conn, DIALOG_ID, 102, text="no topic msg", forum_topic_id=None)
+
+    server = make_server(conn)
+    result = await server._list_messages({"dialog_id": DIALOG_ID, "limit": 10})
+
+    assert result["ok"] is True, f"Unexpected error: {result}"
+    messages = result["data"]["messages"]
+    msgs_by_id = {m["message_id"]: m for m in messages}
+
+    assert "topic_title" in msgs_by_id[101], "topic_title key must be present"
+    assert msgs_by_id[101]["topic_title"] == "General Discussion"
+    assert msgs_by_id[102].get("topic_title") is None
+
+
+# ---------------------------------------------------------------------------
+# Phase 35-01: list_messages — on-demand path: navigation token
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_messages_on_demand_navigation_offset_id() -> None:
+    """list_messages with on-demand dialog + navigation token passes offset_id to iter_messages."""
+    from mcp_telegram.pagination import encode_history_navigation, HistoryDirection
+    DIALOG_ID = 9070
+
+    captured_kwargs: dict = {}
+
+    async def _fake_iter_messages(*args: Any, **kwargs: Any):  # type: ignore[misc]
+        captured_kwargs.update(kwargs)
+        return
+        yield  # make it an async generator
+
+    conn = _make_db()
+    # No synced_dialog row → on-demand path
+    client = MagicMock()
+    client.iter_messages = _fake_iter_messages
+    server = make_server(conn, client)
+
+    token = encode_history_navigation(200, DIALOG_ID, direction=HistoryDirection.NEWEST)
+    result = await server._list_messages({
+        "dialog_id": DIALOG_ID, "limit": 10, "navigation": token
+    })
+
+    assert result["ok"] is True, f"Unexpected error: {result}"
+    assert captured_kwargs.get("offset_id") == 200, \
+        f"Expected offset_id=200 in iter_messages kwargs, got: {captured_kwargs}"
+
+
+@pytest.mark.asyncio
+async def test_list_messages_on_demand_direction_oldest_reverse() -> None:
+    """list_messages with on-demand dialog + direction=oldest passes reverse=True to iter_messages."""
+    DIALOG_ID = 9071
+
+    captured_kwargs: dict = {}
+
+    async def _fake_iter_messages(*args: Any, **kwargs: Any):  # type: ignore[misc]
+        captured_kwargs.update(kwargs)
+        return
+        yield  # make it an async generator
+
+    conn = _make_db()
+    client = MagicMock()
+    client.iter_messages = _fake_iter_messages
+    server = make_server(conn, client)
+
+    result = await server._list_messages({
+        "dialog_id": DIALOG_ID, "limit": 10, "direction": "oldest"
+    })
+
+    assert result["ok"] is True, f"Unexpected error: {result}"
+    assert captured_kwargs.get("reverse") is True, \
+        f"Expected reverse=True in iter_messages kwargs, got: {captured_kwargs}"
+
+
+# ---------------------------------------------------------------------------
+# Phase 35-01: list_messages — on-demand path: sender/topic/unread filters
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_messages_on_demand_sender_id_from_user() -> None:
+    """list_messages with sender_id=42 on on-demand passes from_user=42 to iter_messages."""
+    DIALOG_ID = 9080
+
+    captured_kwargs: dict = {}
+
+    async def _fake_iter_messages(*args: Any, **kwargs: Any):  # type: ignore[misc]
+        captured_kwargs.update(kwargs)
+        return
+        yield
+
+    conn = _make_db()
+    client = MagicMock()
+    client.iter_messages = _fake_iter_messages
+    server = make_server(conn, client)
+
+    result = await server._list_messages({
+        "dialog_id": DIALOG_ID, "limit": 10, "sender_id": 42
+    })
+
+    assert result["ok"] is True, f"Unexpected error: {result}"
+    assert captured_kwargs.get("from_user") == 42, \
+        f"Expected from_user=42 in iter_messages kwargs, got: {captured_kwargs}"
+
+
+@pytest.mark.asyncio
+async def test_list_messages_on_demand_topic_id_reply_to() -> None:
+    """list_messages with topic_id=5 on on-demand passes reply_to=5 to iter_messages."""
+    DIALOG_ID = 9081
+
+    captured_kwargs: dict = {}
+
+    async def _fake_iter_messages(*args: Any, **kwargs: Any):  # type: ignore[misc]
+        captured_kwargs.update(kwargs)
+        return
+        yield
+
+    conn = _make_db()
+    client = MagicMock()
+    client.iter_messages = _fake_iter_messages
+    server = make_server(conn, client)
+
+    result = await server._list_messages({
+        "dialog_id": DIALOG_ID, "limit": 10, "topic_id": 5
+    })
+
+    assert result["ok"] is True, f"Unexpected error: {result}"
+    assert captured_kwargs.get("reply_to") == 5, \
+        f"Expected reply_to=5 in iter_messages kwargs, got: {captured_kwargs}"
+
+
+@pytest.mark.asyncio
+async def test_list_messages_on_demand_unread_after_id_min_id() -> None:
+    """list_messages with unread_after_id=100 on on-demand passes min_id=100 to iter_messages."""
+    DIALOG_ID = 9082
+
+    captured_kwargs: dict = {}
+
+    async def _fake_iter_messages(*args: Any, **kwargs: Any):  # type: ignore[misc]
+        captured_kwargs.update(kwargs)
+        return
+        yield
+
+    conn = _make_db()
+    client = MagicMock()
+    client.iter_messages = _fake_iter_messages
+    server = make_server(conn, client)
+
+    result = await server._list_messages({
+        "dialog_id": DIALOG_ID, "limit": 10, "unread_after_id": 100
+    })
+
+    assert result["ok"] is True, f"Unexpected error: {result}"
+    assert captured_kwargs.get("min_id") == 100, \
+        f"Expected min_id=100 in iter_messages kwargs, got: {captured_kwargs}"
+
+
+# ---------------------------------------------------------------------------
+# Phase 35-01: _msg_to_dict — edit_date from Telethon message
+# ---------------------------------------------------------------------------
+
+
+def test_msg_to_dict_edit_date() -> None:
+    """_msg_to_dict includes edit_date as unix timestamp from msg.edit_date."""
+    from mcp_telegram.daemon_api import DaemonAPIServer
+    from datetime import datetime, timezone
+
+    mock_msg = MagicMock()
+    mock_msg.id = 300
+    mock_msg.date = MagicMock()
+    mock_msg.date.timestamp.return_value = 1700000000.0
+    mock_msg.message = "edited message"
+    mock_msg.sender_id = 42
+    mock_msg.sender = MagicMock()
+    mock_msg.sender.first_name = "Alice"
+    mock_msg.media = None
+    mock_msg.reply_to = None
+    mock_msg.reactions = None
+    edit_dt = datetime(2023, 11, 14, 12, 0, 0, tzinfo=timezone.utc)
+    mock_msg.edit_date = edit_dt
+
+    result = DaemonAPIServer._msg_to_dict(mock_msg)
+
+    assert "edit_date" in result, "edit_date key must be present in _msg_to_dict output"
+    assert result["edit_date"] == int(edit_dt.timestamp())
+
+
+def test_msg_to_dict_no_edit_date_is_none() -> None:
+    """_msg_to_dict returns edit_date=None when msg.edit_date is None."""
+    from mcp_telegram.daemon_api import DaemonAPIServer
+
+    mock_msg = MagicMock()
+    mock_msg.id = 301
+    mock_msg.date = MagicMock()
+    mock_msg.date.timestamp.return_value = 1700000000.0
+    mock_msg.message = "unedited"
+    mock_msg.sender_id = None
+    mock_msg.sender = None
+    mock_msg.media = None
+    mock_msg.reply_to = None
+    mock_msg.reactions = None
+    mock_msg.edit_date = None
+
+    result = DaemonAPIServer._msg_to_dict(mock_msg)
+
+    assert result.get("edit_date") is None
