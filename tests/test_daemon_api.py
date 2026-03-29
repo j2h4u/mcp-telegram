@@ -909,9 +909,8 @@ async def test_get_user_info_channel_type_classification() -> None:
         result = await server._dispatch({"method": "get_user_info", "user_id": 100})
 
     assert result["ok"] is True
-    # Can only verify the type is some known string — real telethon determines which
     chat_type = result["data"]["common_chats"][0]["type"]
-    assert chat_type in ("channel", "supergroup", "group", "user")
+    assert chat_type == "channel", f"megagroup=False should classify as 'channel', got '{chat_type}'"
 
 
 @pytest.mark.asyncio

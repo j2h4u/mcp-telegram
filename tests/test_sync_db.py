@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import asyncio
 import sqlite3
 import threading
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -297,23 +297,13 @@ def test_sigterm_checkpoint(tmp_sync_db_path: Path) -> None:
     conn.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (1, 'synced')")
     conn.commit()
 
-    # Set up shutdown handler and capture the callback via a new event loop
-    loop = asyncio.new_event_loop()
-    try:
-        shutdown_event = register_shutdown_handler(conn, loop)
-        # Invoke SIGTERM callback directly (not via signal — test environment)
-        # The handler is registered with loop.add_signal_handler; we need to call _on_sigterm directly.
-        # We get the callback by calling the handler-registered function.
-        # Since we can't easily extract it from the loop, we re-implement the call:
-        # Instead, get the handler from the loop's signal handlers:
-        import signal as _signal
+    # Use a mock loop to capture the callback passed to add_signal_handler
+    mock_loop = MagicMock()
+    register_shutdown_handler(conn, mock_loop)
 
-        sigterm_handle = loop._signal_handlers.get(_signal.SIGTERM)  # type: ignore[attr-defined]
-        assert sigterm_handle is not None, "SIGTERM handler not registered"
-        # asyncio stores signal handlers as Handle objects — invoke via _run()
-        sigterm_handle._run()  # type: ignore[attr-defined]
-    finally:
-        loop.close()
+    mock_loop.add_signal_handler.assert_called_once()
+    sigterm_callback = mock_loop.add_signal_handler.call_args[0][1]
+    sigterm_callback()
 
     # Reopen DB and verify data is intact
     reopen = sqlite3.connect(str(tmp_sync_db_path), timeout=10.0)

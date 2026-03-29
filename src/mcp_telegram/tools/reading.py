@@ -105,9 +105,9 @@ def _format_daemon_messages(rows: list[dict]) -> str:
     has_topics = any(getattr(m, "topic_title", None) for m in messages)
     topic_name_getter = (lambda msg: getattr(msg, "topic_title", None)) if has_topics else None
 
-    return format_messages(  # type: ignore[arg-type]
-        messages,
-        reply_map=reply_map,
+    return format_messages(
+        messages,  # type: ignore[arg-type]
+        reply_map=reply_map,  # type: ignore[arg-type]
         topic_name_getter=topic_name_getter,
     )
 

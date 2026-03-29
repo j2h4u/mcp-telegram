@@ -423,7 +423,7 @@ class DaemonAPIServer:
             try:
                 await writer.wait_closed()
             except Exception:
-                pass
+                logger.debug("wait_closed error method=%s", method, exc_info=True)
 
     # ------------------------------------------------------------------
     # Dispatcher

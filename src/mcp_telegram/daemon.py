@@ -36,7 +36,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
 import time
+from typing import Any
 
 from .daemon_api import DaemonAPIServer, get_daemon_socket_path
 from .delta_sync import DeltaSyncWorker
@@ -63,15 +65,15 @@ GAP_SCAN_INTERVAL_S: float = 7 * 24 * 3600.0
 # ---------------------------------------------------------------------------
 
 
-def _log_heartbeat(conn: object, client: object, sync_start: float) -> None:
+def _log_heartbeat(conn: sqlite3.Connection, client: Any, sync_start: float) -> None:
     """Log heartbeat with sync stats, rate, and ETA from sync.db."""
     try:
         stats = dict(
-            conn.execute(  # type: ignore[union-attr]
+            conn.execute(
                 "SELECT status, COUNT(*) FROM synced_dialogs GROUP BY status"
             ).fetchall()
         )
-        msg_count = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]  # type: ignore[union-attr]
+        msg_count = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
     except Exception:
         logger.warning("heartbeat_stats_failed", exc_info=True)
         stats = {}
@@ -99,7 +101,7 @@ def _log_heartbeat(conn: object, client: object, sync_start: float) -> None:
 
     logger.info(
         "heartbeat — connected=%s dialogs=%d/%d messages=%d rate=%.0fmsg/s%s",
-        client.is_connected(),  # type: ignore[union-attr]
+        client.is_connected(),
         synced, total, msg_count, rate, eta_str,
     )
 
@@ -112,16 +114,16 @@ def _log_heartbeat(conn: object, client: object, sync_start: float) -> None:
 async def _run_sync_loop(
     worker: FullSyncWorker,
     handler_manager: EventHandlerManager,
-    shutdown_event: object,
-    conn: object,
-    client: object,
+    shutdown_event: asyncio.Event,
+    conn: sqlite3.Connection,
+    client: Any,
 ) -> None:
     """Run the batch-sync loop with periodic heartbeat and gap scan."""
     sync_start = time.monotonic()
     last_heartbeat = sync_start
     last_gap_scan = sync_start
 
-    while not shutdown_event.is_set():  # type: ignore[union-attr]
+    while not shutdown_event.is_set():
         all_synced = await worker.process_one_batch()
         await asyncio.sleep(0)
 
@@ -141,7 +143,7 @@ async def _run_sync_loop(
             logger.info("sync_idle — all dialogs synced, waiting %ds", HEARTBEAT_INTERVAL_S)
             try:
                 await asyncio.wait_for(
-                    shutdown_event.wait(),  # type: ignore[union-attr]
+                    shutdown_event.wait(),
                     timeout=HEARTBEAT_INTERVAL_S,
                 )
                 break

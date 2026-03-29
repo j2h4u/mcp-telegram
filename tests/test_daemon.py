@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
 
 import pytest
 
-from mcp_telegram.daemon import sync_main
+from mcp_telegram.daemon import sync_main, _log_heartbeat
 
 
 # ---------------------------------------------------------------------------
@@ -56,17 +56,15 @@ def test_sync_main_connects_and_heartbeats(
     mock_client: AsyncMock,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """sync_main() calls client.connect() and logs a heartbeat INFO line."""
+    """sync_main() calls client.connect() and invokes _log_heartbeat."""
     shutdown_event = asyncio.Event()
 
     def mock_register_shutdown(conn, loop):  # noqa: ANN001
-        # Schedule event set after a tiny delay so one heartbeat fires
-        async def _set_after_heartbeat() -> None:
-            await asyncio.sleep(0.05)
-            shutdown_event.set()
-
-        loop.create_task(_set_after_heartbeat())
         return shutdown_event
+
+    def heartbeat_then_shutdown(*args):  # noqa: ANN002
+        _log_heartbeat(*args)
+        shutdown_event.set()
 
     with (
         patch("mcp_telegram.daemon.create_client", return_value=mock_client),
@@ -74,12 +72,14 @@ def test_sync_main_connects_and_heartbeats(
         patch("mcp_telegram.daemon.register_shutdown_handler", side_effect=mock_register_shutdown),
         patch("mcp_telegram.daemon.get_sync_db_path"),
         patch("mcp_telegram.daemon._open_sync_db"),
+        patch("mcp_telegram.daemon._log_heartbeat", side_effect=heartbeat_then_shutdown) as mock_hb,
         patch("mcp_telegram.daemon.HEARTBEAT_INTERVAL_S", 0.01),
         caplog.at_level(logging.INFO, logger="mcp_telegram.daemon"),
     ):
         asyncio.run(sync_main())
 
     mock_client.connect.assert_called_once()
+    mock_hb.assert_called()
     assert any("heartbeat" in record.message for record in caplog.records)
 
 
@@ -146,12 +146,11 @@ def test_sync_main_heartbeat_logs_connection_state(
     shutdown_event = asyncio.Event()
 
     def mock_register_shutdown(conn, loop):  # noqa: ANN001
-        async def _set_after_heartbeat() -> None:
-            await asyncio.sleep(0.05)
-            shutdown_event.set()
-
-        loop.create_task(_set_after_heartbeat())
         return shutdown_event
+
+    def heartbeat_then_shutdown(*args):  # noqa: ANN002
+        _log_heartbeat(*args)
+        shutdown_event.set()
 
     with (
         patch("mcp_telegram.daemon.create_client", return_value=mock_client),
@@ -159,6 +158,7 @@ def test_sync_main_heartbeat_logs_connection_state(
         patch("mcp_telegram.daemon.register_shutdown_handler", side_effect=mock_register_shutdown),
         patch("mcp_telegram.daemon.get_sync_db_path"),
         patch("mcp_telegram.daemon._open_sync_db"),
+        patch("mcp_telegram.daemon._log_heartbeat", side_effect=heartbeat_then_shutdown),
         patch("mcp_telegram.daemon.HEARTBEAT_INTERVAL_S", 0.01),
         caplog.at_level(logging.INFO, logger="mcp_telegram.daemon"),
     ):

@@ -116,9 +116,9 @@ def extract_message_row(dialog_id: int, msg: Any) -> tuple[object, ...]:
     Follows sync.db message insert pattern. Omits edit_date and fetched_at
     (not in sync.db schema); adds reactions serialization.
 
-    Returns a 10-element tuple matching INSERT_MESSAGE_SQL column order:
-    (dialog_id, message_id, sender_id, sender_name, date, text, media_type,
-     reply_to_msg_id, forum_topic_id, is_deleted)
+    Returns a 10-element tuple matching INSERT_MESSAGE_SQL parameter order:
+    (dialog_id, message_id, sent_at, text, sender_id, sender_first_name,
+     media_description, reply_to_msg_id, forum_topic_id, reactions)
     """
     message_id = int(getattr(msg, "id", 0))
 

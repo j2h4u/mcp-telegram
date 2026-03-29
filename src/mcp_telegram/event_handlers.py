@@ -153,19 +153,22 @@ class EventHandlerManager:
         if dialog_id is None or dialog_id not in self._synced_dialog_ids:
             return
 
-        msg = event.message
-        row = extract_message_row(dialog_id, msg)
-        now = int(time.time())
+        try:
+            msg = event.message
+            row = extract_message_row(dialog_id, msg)
+            now = int(time.time())
 
-        with self._conn:
-            self._conn.execute(INSERT_MESSAGE_SQL, row)
-            self._conn.execute(
-                INSERT_FTS_SQL,
-                (dialog_id, int(getattr(msg, "id", 0)), stem_text(getattr(msg, "message", None))),
-            )
-            self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
+            with self._conn:
+                self._conn.execute(INSERT_MESSAGE_SQL, row)
+                self._conn.execute(
+                    INSERT_FTS_SQL,
+                    (dialog_id, int(getattr(msg, "id", 0)), stem_text(getattr(msg, "message", None))),
+                )
+                self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
 
-        logger.info("event_new dialog_id=%d message_id=%d", dialog_id, msg.id)
+            logger.info("event_new dialog_id=%d message_id=%d", dialog_id, msg.id)
+        except Exception:
+            logger.exception("event_new_failed dialog_id=%s", dialog_id)
 
     async def on_message_edited(self, event: Any) -> None:
         """Handle a MessageEdited event: version old text, update messages row.
@@ -181,72 +184,75 @@ class EventHandlerManager:
         if dialog_id is None or dialog_id not in self._synced_dialog_ids:
             return
 
-        msg = event.message
-        message_id = int(getattr(msg, "id", 0))
-        new_text = getattr(msg, "message", None)
-        now = int(time.time())
+        try:
+            msg = event.message
+            message_id = int(getattr(msg, "id", 0))
+            new_text = getattr(msg, "message", None)
+            now = int(time.time())
 
-        with self._conn:
-            existing = self._conn.execute(
-                _SELECT_MESSAGE_TEXT_SQL, (dialog_id, message_id)
-            ).fetchone()
+            with self._conn:
+                existing = self._conn.execute(
+                    _SELECT_MESSAGE_TEXT_SQL, (dialog_id, message_id)
+                ).fetchone()
 
-            if existing is None:
-                # Message not yet in sync.db (Pitfall 2 from RESEARCH.md):
-                # insert it with current text; historical versions are lost (acceptable).
-                row = extract_message_row(dialog_id, msg)
-                self._conn.execute(INSERT_MESSAGE_SQL, row)
+                if existing is None:
+                    # Message not yet in sync.db: insert with current text;
+                    # historical versions are lost (acceptable).
+                    row = extract_message_row(dialog_id, msg)
+                    self._conn.execute(INSERT_MESSAGE_SQL, row)
+                    self._conn.execute(
+                        INSERT_FTS_SQL, (dialog_id, message_id, stem_text(new_text))
+                    )
+                    self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
+                    logger.info(
+                        "event_edit_new dialog_id=%d message_id=%d (not in sync.db, inserted)",
+                        dialog_id, message_id,
+                    )
+                    return
+
+                old_text = existing[0]
+                if old_text == new_text:
+                    # No text change — service edit, media caption update, etc.
+                    return
+
+                edit_date_raw = getattr(msg, "edit_date", None)
+                edit_date_unix = (
+                    int(edit_date_raw.timestamp()) if edit_date_raw is not None else now
+                )
+
+                next_ver = self._conn.execute(
+                    _NEXT_VERSION_SQL, (dialog_id, message_id)
+                ).fetchone()[0]
+
+                self._conn.execute(
+                    _INSERT_VERSION_SQL,
+                    (dialog_id, message_id, next_ver, old_text, edit_date_unix),
+                )
+                self._conn.execute(
+                    _UPDATE_MESSAGE_TEXT_SQL, (new_text, dialog_id, message_id)
+                )
+                # FTS5 INSERT OR REPLACE doesn't replace by content columns — must
+                # delete the old row and insert fresh to avoid duplicate FTS entries.
+                self._conn.execute(DELETE_FTS_SQL, (dialog_id, message_id))
                 self._conn.execute(
                     INSERT_FTS_SQL, (dialog_id, message_id, stem_text(new_text))
                 )
                 self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
-                logger.info(
-                    "event_edit_new dialog_id=%d message_id=%d (not in sync.db, inserted)",
-                    dialog_id, message_id,
-                )
-                return
 
-            old_text = existing[0]
-            if old_text == new_text:
-                # No text change — service edit, media caption update, etc. (Pitfall 3)
-                return
-
-            edit_date_raw = getattr(msg, "edit_date", None)
-            edit_date_unix = (
-                int(edit_date_raw.timestamp()) if edit_date_raw is not None else now
+            logger.info(
+                "event_edit dialog_id=%d message_id=%d version=%d",
+                dialog_id, message_id, next_ver,
             )
-
-            next_ver = self._conn.execute(
-                _NEXT_VERSION_SQL, (dialog_id, message_id)
-            ).fetchone()[0]
-
-            self._conn.execute(
-                _INSERT_VERSION_SQL,
-                (dialog_id, message_id, next_ver, old_text, edit_date_unix),
-            )
-            self._conn.execute(
-                _UPDATE_MESSAGE_TEXT_SQL, (new_text, dialog_id, message_id)
-            )
-            # FTS5 INSERT OR REPLACE doesn't replace by content columns — must
-            # delete the old row and insert fresh to avoid duplicate FTS entries.
-            self._conn.execute(DELETE_FTS_SQL, (dialog_id, message_id))
-            self._conn.execute(
-                INSERT_FTS_SQL, (dialog_id, message_id, stem_text(new_text))
-            )
-            self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
-
-        logger.info(
-            "event_edit dialog_id=%d message_id=%d version=%d",
-            dialog_id, message_id, next_ver,
-        )
+        except Exception:
+            logger.exception("event_edit_failed dialog_id=%s", dialog_id)
 
     async def on_message_deleted(self, event: Any) -> None:
         """Handle a MessageDeleted event: mark channel messages as is_deleted=1.
 
-        chat_id is None for DMs and small groups (MTProto limitation — see
-        RESEARCH.md Pitfall 1).  Those cases are handled by run_dm_gap_scan().
+        chat_id is None for DMs and small groups (MTProto limitation).
+        Those cases are handled by run_dm_gap_scan().
         Preserves the last known text column (SYNC-05 requirement).
-        Only updates rows where is_deleted=0 to avoid re-stamping deleted_at (D-12).
+        Only updates rows where is_deleted=0 to avoid re-stamping deleted_at.
         """
         dialog_id = event.chat_id
 
@@ -260,16 +266,19 @@ class EventHandlerManager:
         if dialog_id not in self._synced_dialog_ids:
             return
 
-        now = int(time.time())
+        try:
+            now = int(time.time())
 
-        with self._conn:
-            for msg_id in event.deleted_ids:
-                self._conn.execute(_MARK_DELETED_SQL, (now, dialog_id, msg_id))
-            self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
+            with self._conn:
+                for msg_id in event.deleted_ids:
+                    self._conn.execute(_MARK_DELETED_SQL, (now, dialog_id, msg_id))
+                self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
 
-        logger.info(
-            "event_delete dialog_id=%d ids=%s", dialog_id, event.deleted_ids
-        )
+            logger.info(
+                "event_delete dialog_id=%d count=%d", dialog_id, len(event.deleted_ids)
+            )
+        except Exception:
+            logger.exception("event_delete_failed dialog_id=%s", dialog_id)
 
     # ------------------------------------------------------------------
     # DM gap scan (DAEMON-10 / D-13 / D-14)
