@@ -132,17 +132,34 @@ class DaemonConnection:
         dialog: str | None = None,
         limit: int = 50,
         navigation: str | None = None,
+        direction: str | None = None,
+        sender_id: int | None = None,
+        sender_name: str | None = None,
+        topic_id: int | None = None,
+        unread_after_id: int | None = None,
+        unread: bool | None = None,
     ) -> dict:
         """Send list_messages request. Accepts dialog name or numeric id."""
-        return await self.request(
-            {
-                "method": "list_messages",
-                "dialog_id": dialog_id,
-                "dialog": dialog,
-                "limit": limit,
-                "navigation": navigation,
-            }
-        )
+        payload: dict = {
+            "method": "list_messages",
+            "dialog_id": dialog_id,
+            "dialog": dialog,
+            "limit": limit,
+            "navigation": navigation,
+        }
+        if direction is not None:
+            payload["direction"] = direction
+        if sender_id is not None:
+            payload["sender_id"] = sender_id
+        if sender_name is not None:
+            payload["sender_name"] = sender_name
+        if topic_id is not None:
+            payload["topic_id"] = topic_id
+        if unread_after_id is not None:
+            payload["unread_after_id"] = unread_after_id
+        if unread is not None:
+            payload["unread"] = unread
+        return await self.request(payload)
 
     async def search_messages(
         self,

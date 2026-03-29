@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from pydantic import Field, model_validator
 
 from ..errors import dialog_not_found_text, invalid_navigation_text, search_no_hits_text
+from ..formatter import format_messages
 from ..resolver import parse_exact_dialog_id
 from ._base import (
     DaemonNotRunningError,
@@ -29,7 +30,7 @@ class _DaemonMessage:
 
     __slots__ = (
         "id", "date", "message", "sender", "reply_to", "reactions", "media",
-        "edit_date",
+        "edit_date", "topic_title",
     )
 
     def __init__(self, row: dict) -> None:
@@ -44,7 +45,14 @@ class _DaemonMessage:
         self.reactions = row.get("reactions")  # JSON string or None
         media_desc = row.get("media_description")
         self.media = _MediaPlaceholder(media_desc) if media_desc else None
-        self.edit_date = None
+        edit_date_raw = row.get("edit_date")
+        if edit_date_raw is not None:
+            self.edit_date: datetime | None = datetime.fromtimestamp(
+                int(edit_date_raw), tz=timezone.utc
+            )
+        else:
+            self.edit_date = None
+        self.topic_title: str | None = row.get("topic_title")
 
 
 class _Sender:
@@ -93,8 +101,15 @@ def _format_daemon_messages(rows: list[dict]) -> str:
     # Build reply map from rows available in this page
     reply_map: dict[int, _DaemonMessage] = {m.id: m for m in messages}
 
-    from ..formatter import format_messages
-    return format_messages(messages, reply_map=reply_map)  # type: ignore[arg-type]
+    # Pass topic_name_getter when any message has a topic_title
+    has_topics = any(getattr(m, "topic_title", None) for m in messages)
+    topic_name_getter = (lambda msg: getattr(msg, "topic_title", None)) if has_topics else None
+
+    return format_messages(  # type: ignore[arg-type]
+        messages,
+        reply_map=reply_map,
+        topic_name_getter=topic_name_getter,
+    )
 
 
 # ---------------------------------------------------------------------------
