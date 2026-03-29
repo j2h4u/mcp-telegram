@@ -184,13 +184,16 @@ def _resolve_sender_name(msg: MessageLike) -> str:
 
 def _render_text(msg: MessageLike) -> str:
     """Return message text, or a media placeholder for media-only messages."""
-    media = getattr(msg, "media", None)
     text = getattr(msg, "message", "") or ""
     if text:
         return text
-    if media is not None:
-        return _describe_media(media)
-    return ""
+    media = getattr(msg, "media", None)
+    if media is None:
+        return ""
+    # Pre-formatted daemon description (has _description attr from _MediaPlaceholder)
+    if hasattr(media, "_description"):
+        return str(media)
+    return _describe_media(media)
 
 
 def _format_reactions(msg: MessageLike, reaction_names: dict[str, list[str]] | None = None) -> str:

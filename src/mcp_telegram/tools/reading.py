@@ -41,10 +41,10 @@ class _DaemonMessage:
         self.sender = _Sender(sender_name) if sender_name else None
         reply_id = row.get("reply_to_msg_id")
         self.reply_to = _ReplyHeader(reply_id) if reply_id else None
-        self.reactions = None  # reactions not surfaced from daemon path
+        self.reactions = row.get("reactions")  # JSON string or None
         media_desc = row.get("media_description")
         self.media = _MediaPlaceholder(media_desc) if media_desc else None
-        self.edit_date = None  # edit tracking not yet surfaced per-row
+        self.edit_date = None
 
 
 class _Sender:
@@ -235,19 +235,21 @@ async def list_messages(args: ListMessages) -> ToolResult:
     data = response.get("data", {})
     rows = data.get("messages", [])
     source = data.get("source", "unknown")
+    next_nav = data.get("next_navigation")
 
     text = _format_daemon_messages(rows)
     if not text:
         text = "No messages found."
 
     source_note = f"[source: {source}]\n" if source else ""
-    result_text = source_note + text
+    nav_note = f"\nnext_navigation: {next_nav}" if next_nav else ""
+    result_text = source_note + text + nav_note
 
     return ToolResult(
         content=_text_response(result_text),
         result_count=len(rows),
         has_filter=has_filter,
-        has_cursor=has_cursor,
+        has_cursor=has_cursor or bool(next_nav),
     )
 
 
@@ -350,6 +352,7 @@ async def search_messages(args: SearchMessages) -> ToolResult:
 
     data = response.get("data", {})
     rows = data.get("messages", [])
+    next_nav = data.get("next_navigation")
     dialog_label = str(dialog_id) if dialog_id else args.dialog
 
     if not rows:
@@ -362,11 +365,12 @@ async def search_messages(args: SearchMessages) -> ToolResult:
         )
 
     text = _format_daemon_messages(rows)
-    result_text = text
+    nav_note = f"\nnext_navigation: {next_nav}" if next_nav else ""
+    result_text = text + nav_note
 
     return ToolResult(
         content=_text_response(result_text),
         result_count=len(rows),
         has_filter=True,
-        has_cursor=args.navigation is not None,
+        has_cursor=args.navigation is not None or bool(next_nav),
     )

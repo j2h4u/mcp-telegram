@@ -53,6 +53,8 @@ GROUP_TTL: int = 604_800    # 7 days
 
 from .budget import allocate_message_budget_proportional, unread_chat_tier
 from .fts import stem_query
+from .pagination import encode_history_navigation, encode_search_navigation
+from .sync_worker import serialize_reactions
 from .resolver import (
     Candidates,
     NotFound,
@@ -93,7 +95,7 @@ _SELECT_MESSAGES_SQL = (
 
 _SELECT_FTS_SQL = (
     "SELECT f.message_id, m.text, m.sender_first_name, m.sent_at, "
-    "m.media_description, m.reply_to_msg_id "
+    "m.media_description, m.reply_to_msg_id, m.sender_id, m.forum_topic_id, m.reactions "
     "FROM messages_fts f "
     "JOIN messages m ON m.dialog_id = f.dialog_id AND m.message_id = f.message_id "
     "WHERE messages_fts MATCH ? AND f.dialog_id = ? "
@@ -425,16 +427,35 @@ class DaemonAPIServer:
                 sent_at = int(msg.date.timestamp())
             except Exception:
                 sent_at = 0
+
+        media = getattr(msg, "media", None)
+        media_description: str | None = None
+        if media is not None:
+            from .formatter import _describe_media
+            media_description = _describe_media(media)
+
+        reactions = serialize_reactions(getattr(msg, "reactions", None))
+
+        reply_to = getattr(msg, "reply_to", None)
+        reply_to_msg_id: int | None = None
+        forum_topic_id: int | None = None
+        if reply_to is not None:
+            raw_rtmi = getattr(reply_to, "reply_to_msg_id", None)
+            reply_to_msg_id = int(raw_rtmi) if raw_rtmi is not None else None
+            if getattr(reply_to, "forum_topic", False):
+                top_id = getattr(reply_to, "reply_to_top_id", None)
+                forum_topic_id = int(top_id) if top_id is not None else 1
+
         return {
             "message_id": msg.id,
             "sent_at": sent_at,
             "text": getattr(msg, "message", None),
             "sender_id": getattr(msg, "sender_id", None),
             "sender_first_name": sender_first_name,
-            "media_description": None,
-            "reply_to_msg_id": getattr(msg, "reply_to_msg_id", None),
-            "forum_topic_id": getattr(msg, "forum_topic_id", None),
-            "reactions": None,
+            "media_description": media_description,
+            "reply_to_msg_id": reply_to_msg_id,
+            "forum_topic_id": forum_topic_id,
+            "reactions": reactions,
             "is_deleted": 0,
         }
 
@@ -503,7 +524,12 @@ class DaemonAPIServer:
             )
             return {"ok": False, "error": "telegram_error", "message": "failed to fetch messages"}
 
-        return {"ok": True, "data": {"messages": messages, "source": "telegram"}}
+        next_nav: str | None = None
+        if messages and len(messages) == limit:
+            last_msg_id = messages[-1]["message_id"]
+            next_nav = encode_history_navigation(last_msg_id, dialog_id)
+
+        return {"ok": True, "data": {"messages": messages, "source": "telegram", "next_navigation": next_nav}}
 
     # ------------------------------------------------------------------
     # search_messages
@@ -542,11 +568,19 @@ class DaemonAPIServer:
                 "sent_at": r[3],
                 "media_description": r[4],
                 "reply_to_msg_id": r[5],
+                "sender_id": r[6],
+                "forum_topic_id": r[7],
+                "reactions": r[8],
             }
             for r in rows
         ]
 
-        return {"ok": True, "data": {"messages": messages, "total": len(messages)}}
+        next_nav: str | None = None
+        if messages and len(messages) == limit:
+            next_offset = offset + limit
+            next_nav = encode_search_navigation(next_offset, dialog_id, query)
+
+        return {"ok": True, "data": {"messages": messages, "total": len(messages), "next_navigation": next_nav}}
 
     # ------------------------------------------------------------------
     # list_dialogs
