@@ -21,47 +21,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from helpers import build_mock_message
 from mcp_telegram.delta_sync import DeltaSyncWorker
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
-
-
-# ---------------------------------------------------------------------------
-# Helpers — same pattern as test_sync_worker.py
-# ---------------------------------------------------------------------------
-
-
-def make_mock_message(
-    id: int,  # noqa: A002
-    text: str | None = "hello",
-    sender_id: int | None = 42,
-    sender_first_name: str | None = "Alice",
-    media: object | None = None,
-    reply_to_msg_id: int | None = None,
-    forum_topic: bool = False,
-    reply_to_top_id: int | None = None,
-    reactions: object | None = None,
-) -> SimpleNamespace:
-    """Build a minimal Telethon-like message object."""
-    sender = SimpleNamespace(first_name=sender_first_name) if sender_first_name is not None else None
-
-    reply_to: SimpleNamespace | None = None
-    if reply_to_msg_id is not None or forum_topic:
-        reply_to = SimpleNamespace(
-            reply_to_msg_id=reply_to_msg_id,
-            forum_topic=forum_topic,
-            reply_to_top_id=reply_to_top_id,
-        )
-
-    return SimpleNamespace(
-        id=id,
-        date=datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
-        message=text,
-        sender_id=sender_id,
-        sender=sender,
-        media=media,
-        reply_to=reply_to,
-        reactions=reactions,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -127,9 +89,9 @@ async def test_delta_fills_gap(
     sync_db.commit()
 
     new_msgs = [
-        make_mock_message(id=101, text="msg 101"),
-        make_mock_message(id=102, text="msg 102"),
-        make_mock_message(id=103, text="msg 103"),
+        build_mock_message(id=101, text="msg 101"),
+        build_mock_message(id=102, text="msg 102"),
+        build_mock_message(id=103, text="msg 103"),
     ]
 
     async def _iter_messages(**kwargs: Any):  # noqa: ANN202
@@ -488,8 +450,8 @@ async def test_delta_catch_up_populates_fts(
     sync_db.commit()
 
     new_msgs = [
-        make_mock_message(id=101, text="написал сообщение"),
-        make_mock_message(id=102, text="hello world"),
+        build_mock_message(id=101, text="написал сообщение"),
+        build_mock_message(id=102, text="hello world"),
     ]
 
     async def _iter_messages(**kwargs: Any):  # noqa: ANN202

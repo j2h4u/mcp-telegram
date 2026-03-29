@@ -14,58 +14,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from helpers import build_mock_message, build_mock_reactions
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.sync_worker import FullSyncWorker
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def make_mock_message(
-    id: int,  # noqa: A002
-    text: str | None = "hello",
-    sender_id: int | None = 42,
-    sender_first_name: str | None = "Alice",
-    media: object | None = None,
-    reply_to_msg_id: int | None = None,
-    forum_topic: bool = False,
-    reply_to_top_id: int | None = None,
-    reactions: object | None = None,
-) -> SimpleNamespace:
-    """Build a minimal Telethon-like message object."""
-    from datetime import datetime, timezone
-
-    sender = SimpleNamespace(first_name=sender_first_name) if sender_first_name is not None else None
-
-    reply_to: SimpleNamespace | None = None
-    if reply_to_msg_id is not None or forum_topic:
-        reply_to = SimpleNamespace(
-            reply_to_msg_id=reply_to_msg_id,
-            forum_topic=forum_topic,
-            reply_to_top_id=reply_to_top_id,
-        )
-
-    return SimpleNamespace(
-        id=id,
-        date=datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
-        message=text,
-        sender_id=sender_id,
-        sender=sender,
-        media=media,
-        reply_to=reply_to,
-        reactions=reactions,
-    )
-
-
-def make_reactions(counts: dict[str, int]) -> SimpleNamespace:
-    """Build a mock MessageReactions object."""
-    results = [
-        SimpleNamespace(reaction=SimpleNamespace(emoticon=emoji), count=count)
-        for emoji, count in counts.items()
-    ]
-    return SimpleNamespace(results=results)
 
 
 # ---------------------------------------------------------------------------
@@ -126,9 +77,9 @@ async def test_full_sync_stores_all_messages(
     sync_db.commit()
 
     msgs = [
-        make_mock_message(id=300, text="msg 300", sender_id=10),
-        make_mock_message(id=200, text="msg 200", sender_id=10),
-        make_mock_message(id=100, text="msg 100", sender_id=10),
+        build_mock_message(id=300, text="msg 300", sender_id=10),
+        build_mock_message(id=200, text="msg 200", sender_id=10),
+        build_mock_message(id=100, text="msg 100", sender_id=10),
     ]
 
     async def _iter_messages(**kwargs: Any):  # noqa: ANN202
@@ -167,7 +118,7 @@ async def test_message_fields_extracted_correctly(
     MediaDocumentClass = type("MessageMediaDocument", (), {})
     media_obj = MediaDocumentClass()
 
-    msg = make_mock_message(
+    msg = build_mock_message(
         id=500,
         text="has media",
         sender_id=99,
@@ -214,8 +165,8 @@ async def test_reactions_serialized_as_json(
     )
     sync_db.commit()
 
-    reactions = make_reactions({"👍": 3, "❤": 1})
-    msg = make_mock_message(id=600, text="liked", reactions=reactions)
+    reactions = build_mock_reactions({"👍": 3, "❤": 1})
+    msg = build_mock_message(id=600, text="liked", reactions=reactions)
 
     async def _iter_messages(**kwargs: Any):  # noqa: ANN202
         yield msg
@@ -284,9 +235,9 @@ async def test_progress_atomic_commit(
     sync_db.commit()
 
     msgs = [
-        make_mock_message(id=300),
-        make_mock_message(id=200),
-        make_mock_message(id=100),
+        build_mock_message(id=300),
+        build_mock_message(id=200),
+        build_mock_message(id=100),
     ]
 
     async def _iter_messages(**kwargs: Any):  # noqa: ANN202
@@ -558,7 +509,7 @@ async def test_partial_batch_marks_synced(
     )
     sync_db.commit()
 
-    msgs = [make_mock_message(id=i) for i in range(50, 0, -1)]  # 50 messages
+    msgs = [build_mock_message(id=i) for i in range(50, 0, -1)]  # 50 messages
 
     async def _iter_messages(**kwargs: Any):  # noqa: ANN202
         for m in msgs:
@@ -593,7 +544,7 @@ async def test_full_batch_not_marked_synced(
     )
     sync_db.commit()
 
-    msgs = [make_mock_message(id=i) for i in range(100, 0, -1)]  # exactly 100
+    msgs = [build_mock_message(id=i) for i in range(100, 0, -1)]  # exactly 100
 
     async def _iter_messages(**kwargs: Any):  # noqa: ANN202
         for m in msgs:
@@ -845,9 +796,9 @@ async def test_process_one_batch_populates_fts(
     sync_db.commit()
 
     msgs = [
-        make_mock_message(id=101, text="написал сообщение"),
-        make_mock_message(id=102, text="hello world"),
-        make_mock_message(id=103, text="third message"),
+        build_mock_message(id=101, text="написал сообщение"),
+        build_mock_message(id=102, text="hello world"),
+        build_mock_message(id=103, text="third message"),
     ]
 
     async def _iter_messages(**kwargs: Any):  # noqa: ANN202
@@ -884,7 +835,7 @@ async def test_process_one_batch_fts_matches_message_ids(
     )
     sync_db.commit()
 
-    msgs = [make_mock_message(id=200, text="test"), make_mock_message(id=201, text="data")]
+    msgs = [build_mock_message(id=200, text="test"), build_mock_message(id=201, text="data")]
 
     async def _iter_messages(**kwargs: Any):  # noqa: ANN202
         for m in msgs:

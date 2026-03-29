@@ -15,62 +15,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from helpers import build_mock_message, build_mock_reactions
 from mcp_telegram.event_handlers import EventHandlerManager
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
-
-
-# ---------------------------------------------------------------------------
-# Helpers — replicated from test_sync_worker.py (local helpers, not conftest)
-# ---------------------------------------------------------------------------
-
-
-def make_mock_message(
-    id: int,  # noqa: A002
-    text: str | None = "hello",
-    sender_id: int | None = 42,
-    sender_first_name: str | None = "Alice",
-    media: object | None = None,
-    reply_to_msg_id: int | None = None,
-    forum_topic: bool = False,
-    reply_to_top_id: int | None = None,
-    reactions: object | None = None,
-    edit_date: datetime | None = None,
-) -> SimpleNamespace:
-    """Build a minimal Telethon-like message object."""
-    sender = (
-        SimpleNamespace(first_name=sender_first_name)
-        if sender_first_name is not None
-        else None
-    )
-
-    reply_to: SimpleNamespace | None = None
-    if reply_to_msg_id is not None or forum_topic:
-        reply_to = SimpleNamespace(
-            reply_to_msg_id=reply_to_msg_id,
-            forum_topic=forum_topic,
-            reply_to_top_id=reply_to_top_id,
-        )
-
-    return SimpleNamespace(
-        id=id,
-        date=datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
-        message=text,
-        sender_id=sender_id,
-        sender=sender,
-        media=media,
-        reply_to=reply_to,
-        reactions=reactions,
-        edit_date=edit_date,
-    )
-
-
-def make_reactions(counts: dict[str, int]) -> SimpleNamespace:
-    """Build a mock MessageReactions object."""
-    results = [
-        SimpleNamespace(reaction=SimpleNamespace(emoticon=emoji), count=count)
-        for emoji, count in counts.items()
-    ]
-    return SimpleNamespace(results=results)
 
 
 def make_new_message_event(
@@ -181,7 +128,7 @@ async def test_on_new_message_inserts_row(
     manager = make_manager(mock_client, sync_db, shutdown_event)
     manager.register()
 
-    msg = make_mock_message(id=500, text="hello")
+    msg = build_mock_message(id=500, text="hello")
     event = make_new_message_event(chat_id=dialog_id, message=msg)
     await manager.on_new_message(event)
 
@@ -206,7 +153,7 @@ async def test_on_new_message_ignores_unsynced(
     manager = make_manager(mock_client, sync_db, shutdown_event)
     manager.register()
 
-    msg = make_mock_message(id=100, text="ignored")
+    msg = build_mock_message(id=100, text="ignored")
     event = make_new_message_event(chat_id=9999, message=msg)
     await manager.on_new_message(event)
 
@@ -233,7 +180,7 @@ async def test_on_new_message_updates_last_event_at(
     manager = make_manager(mock_client, sync_db, shutdown_event)
     manager.register()
 
-    msg = make_mock_message(id=501)
+    msg = build_mock_message(id=501)
     event = make_new_message_event(chat_id=dialog_id, message=msg)
     await manager.on_new_message(event)
 
@@ -257,7 +204,7 @@ async def test_burst_50_messages(
     manager.register()
 
     for i in range(50):
-        msg = make_mock_message(id=1000 + i, text=f"msg {i}")
+        msg = build_mock_message(id=1000 + i, text=f"msg {i}")
         event = make_new_message_event(chat_id=dialog_id, message=msg)
         await manager.on_new_message(event)
 
@@ -287,7 +234,7 @@ async def test_on_message_edited_creates_version(
     manager.register()
 
     edit_dt = datetime(2024, 1, 1, 13, 0, 0, tzinfo=timezone.utc)
-    msg = make_mock_message(id=100, text="new text", edit_date=edit_dt)
+    msg = build_mock_message(id=100, text="new text", edit_date=edit_dt)
     event = make_message_edited_event(chat_id=dialog_id, message=msg)
     await manager.on_message_edited(event)
 
@@ -323,7 +270,7 @@ async def test_on_message_edited_no_version_if_same(
     manager.register()
 
     edit_dt = datetime(2024, 1, 1, 13, 0, 0, tzinfo=timezone.utc)
-    msg = make_mock_message(id=101, text="same", edit_date=edit_dt)
+    msg = build_mock_message(id=101, text="same", edit_date=edit_dt)
     event = make_message_edited_event(chat_id=dialog_id, message=msg)
     await manager.on_message_edited(event)
 
@@ -346,7 +293,7 @@ async def test_on_message_edited_unknown_message(
     manager.register()
 
     edit_dt = datetime(2024, 1, 1, 13, 0, 0, tzinfo=timezone.utc)
-    msg = make_mock_message(id=999, text="current text", edit_date=edit_dt)
+    msg = build_mock_message(id=999, text="current text", edit_date=edit_dt)
     event = make_message_edited_event(chat_id=dialog_id, message=msg)
     await manager.on_message_edited(event)
 
@@ -377,11 +324,11 @@ async def test_on_message_edited_increments_version(
     manager.register()
 
     edit_dt1 = datetime(2024, 1, 1, 13, 0, 0, tzinfo=timezone.utc)
-    msg1 = make_mock_message(id=200, text="v1 text", edit_date=edit_dt1)
+    msg1 = build_mock_message(id=200, text="v1 text", edit_date=edit_dt1)
     await manager.on_message_edited(make_message_edited_event(dialog_id, msg1))
 
     edit_dt2 = datetime(2024, 1, 1, 14, 0, 0, tzinfo=timezone.utc)
-    msg2 = make_mock_message(id=200, text="v2 text", edit_date=edit_dt2)
+    msg2 = build_mock_message(id=200, text="v2 text", edit_date=edit_dt2)
     await manager.on_message_edited(make_message_edited_event(dialog_id, msg2))
 
     versions = sync_db.execute(
@@ -551,8 +498,8 @@ async def test_gap_scan_marks_deleted(
     manager.register()
 
     # client.get_messages returns: msg10 present, msg20 absent (None), msg30 present
-    msg10 = make_mock_message(id=10)
-    msg30 = make_mock_message(id=30)
+    msg10 = build_mock_message(id=10)
+    msg30 = build_mock_message(id=30)
     mock_client.get_messages = AsyncMock(return_value=[msg10, None, msg30])
 
     deleted_count = await manager.run_dm_gap_scan()
@@ -847,7 +794,7 @@ async def test_on_new_message_populates_fts(
     manager = make_manager(mock_client, sync_db, shutdown_event)
     manager.register()
 
-    msg = make_mock_message(id=500, text="написал сообщение")
+    msg = build_mock_message(id=500, text="написал сообщение")
     event = make_new_message_event(chat_id=dialog_id, message=msg)
     await manager.on_new_message(event)
 
@@ -883,7 +830,7 @@ async def test_on_message_edited_updates_fts(
     manager.register()
 
     edit_dt = datetime(2024, 1, 1, 13, 0, 0, tzinfo=timezone.utc)
-    msg = make_mock_message(id=600, text="new edited content", edit_date=edit_dt)
+    msg = build_mock_message(id=600, text="new edited content", edit_date=edit_dt)
     event = make_message_edited_event(chat_id=dialog_id, message=msg)
     await manager.on_message_edited(event)
 
