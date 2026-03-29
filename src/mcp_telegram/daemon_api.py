@@ -594,6 +594,15 @@ class DaemonAPIServer:
                         last_msg_at = int(d.date.timestamp())
                     except Exception:
                         last_msg_at = None
+                members = getattr(entity, "participants_count", None) if entity is not None else None
+                created_ts: int | None = None
+                entity_date = getattr(entity, "date", None)
+                if entity_date is not None:
+                    try:
+                        created_ts = int(entity_date.timestamp())
+                    except Exception:
+                        pass
+
                 dialogs.append(
                     {
                         "id": d.id,
@@ -601,6 +610,8 @@ class DaemonAPIServer:
                         "type": entity_type,
                         "last_message_at": last_msg_at,
                         "unread_count": getattr(d, "unread_count", 0),
+                        "members": members,
+                        "created": created_ts,
                         "sync_status": synced_statuses.get(d.id, "not_synced"),
                     }
                 )

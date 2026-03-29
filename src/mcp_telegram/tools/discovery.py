@@ -66,9 +66,17 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
         unread_count = d.get("unread_count", 0)
         sync_status = d.get("sync_status", "unknown")
 
+        members = d.get("members")
+        created = d.get("created")
+        meta = ""
+        if members is not None:
+            meta += f" members={members}"
+        if created is not None:
+            meta += f" created={created}"
+
         lines.append(
             f"name='{dialog_name}' id={dialog_id} type={dialog_type} "
-            f"last_message_at={last_at} unread={unread_count} sync_status={sync_status}"
+            f"last_message_at={last_at} unread={unread_count}{meta} sync_status={sync_status}"
         )
 
         # Upsert entities into daemon for future name resolution
