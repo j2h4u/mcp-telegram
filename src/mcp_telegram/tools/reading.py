@@ -227,49 +227,54 @@ async def list_messages(args: ListMessages) -> ToolResult:
     # Unread flag
     unread_flag: bool | None = True if args.unread else None
 
-    try:
-        async with daemon_connection() as conn:
-            # Topic resolution: exact_topic_id takes priority over fuzzy topic name
-            topic_id: int | None = args.exact_topic_id
-            if topic_id is None and args.topic is not None:
-                topics_response = await conn.list_topics(
+    # Topic resolution: exact_topic_id takes priority over fuzzy topic name.
+    # Uses a separate daemon connection because the daemon handles one request
+    # per connection — topic resolution must complete before list_messages.
+    topic_id: int | None = args.exact_topic_id
+    if topic_id is None and args.topic is not None:
+        try:
+            async with daemon_connection() as topic_conn:
+                topics_response = await topic_conn.list_topics(
                     dialog_id=dialog_id if dialog_id else 0,
                     dialog=args.dialog if not dialog_id else None,
                 )
-                if topics_response.get("ok"):
-                    topics_data = topics_response.get("data", {}).get("topics", [])
-                    topic_lower = args.topic.lower()
-                    matched = [
-                        t for t in topics_data
-                        if topic_lower in (t.get("title") or "").lower()
-                    ]
-                    if len(matched) == 1:
-                        topic_id = matched[0]["id"]
-                    elif len(matched) > 1:
-                        # Exact match takes priority
-                        exact = [
-                            t for t in matched
-                            if (t.get("title") or "").lower() == topic_lower
-                        ]
-                        if len(exact) == 1:
-                            topic_id = exact[0]["id"]
-                        else:
-                            names = ", ".join(t.get("title", "?") for t in matched[:5])
-                            return ToolResult(
-                                content=_text_response(
-                                    f"Ambiguous topic '{args.topic}'. Matches: {names}. "
-                                    "Use exact_topic_id."
-                                ),
-                                has_filter=has_filter,
-                            )
-                    else:
-                        return ToolResult(
-                            content=_text_response(
-                                f"Topic '{args.topic}' not found in this dialog."
-                            ),
-                            has_filter=has_filter,
-                        )
+        except DaemonNotRunningError as e:
+            return ToolResult(content=_text_response(str(e)))
+        if topics_response.get("ok"):
+            topics_data = topics_response.get("data", {}).get("topics", [])
+            topic_lower = args.topic.lower()
+            matched = [
+                t for t in topics_data
+                if topic_lower in (t.get("title") or "").lower()
+            ]
+            if len(matched) == 1:
+                topic_id = matched[0]["id"]
+            elif len(matched) > 1:
+                exact = [
+                    t for t in matched
+                    if (t.get("title") or "").lower() == topic_lower
+                ]
+                if len(exact) == 1:
+                    topic_id = exact[0]["id"]
+                else:
+                    names = ", ".join(t.get("title", "?") for t in matched[:5])
+                    return ToolResult(
+                        content=_text_response(
+                            f"Ambiguous topic '{args.topic}'. Matches: {names}. "
+                            "Use exact_topic_id."
+                        ),
+                        has_filter=has_filter,
+                    )
+            else:
+                return ToolResult(
+                    content=_text_response(
+                        f"Topic '{args.topic}' not found in this dialog."
+                    ),
+                    has_filter=has_filter,
+                )
 
+    try:
+        async with daemon_connection() as conn:
             if dialog_id is not None and dialog_id != 0:
                 response = await conn.list_messages(
                     dialog_id=dialog_id,

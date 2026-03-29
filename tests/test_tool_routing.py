@@ -90,7 +90,7 @@ class _patch_daemon:
             "mcp_telegram.tools.stats.daemon_connection",
         ]
         for target in targets:
-            p = patch(target, return_value=_fake_daemon_cm(self._conn))
+            p = patch(target, side_effect=lambda c=self._conn: _fake_daemon_cm(c))
             p.start()
             self._patches.append(p)
         return self
