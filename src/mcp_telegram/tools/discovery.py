@@ -147,7 +147,7 @@ async def list_topics(args: ListTopics) -> ToolResult:
     for topic in topics:
         topic_id = topic.get("id")
         title = topic.get("title", "")
-        lines.append(f"id={topic_id} title='{title}'")
+        lines.append(f'topic_id={topic_id} title="{title}"')
 
     result_text = "\n".join(lines)
     return ToolResult(content=_text_response(result_text), result_count=len(lines), has_filter=True)
