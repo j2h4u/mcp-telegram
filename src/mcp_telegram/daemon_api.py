@@ -41,23 +41,12 @@ from typing import Any
 
 from xdg_base_dirs import xdg_state_home  # type: ignore[import-error]
 
-try:
-    from telethon.tl.functions.channels import (  # type: ignore[import-untyped]
-        GetForumTopicsRequest,
-    )
-    from telethon.tl.functions.messages import (  # type: ignore[import-untyped]
-        GetCommonChatsRequest,
-    )
-    from telethon.tl.types import Channel, Chat  # type: ignore[import-untyped]
-    from telethon import utils as telethon_utils  # type: ignore[import-untyped]
-    _TELETHON_AVAILABLE = True
-except ImportError:
-    _TELETHON_AVAILABLE = False
-    GetForumTopicsRequest = None  # type: ignore[assignment,misc]
-    GetCommonChatsRequest = None  # type: ignore[assignment,misc]
-    Channel = None  # type: ignore[assignment,misc]
-    Chat = None  # type: ignore[assignment,misc]
-    telethon_utils = None  # type: ignore[assignment]
+from telethon.tl.functions.messages import (  # type: ignore[import-untyped]
+    GetCommonChatsRequest,
+    GetForumTopicsRequest,
+)
+from telethon.tl.types import Channel, Chat  # type: ignore[import-untyped]
+from telethon import utils as telethon_utils  # type: ignore[import-untyped]
 
 USER_TTL: int = 2_592_000   # 30 days
 GROUP_TTL: int = 604_800    # 7 days
@@ -390,9 +379,7 @@ class DaemonAPIServer:
         """
         try:
             entity = await self._client.get_entity(dialog)
-            if _TELETHON_AVAILABLE and telethon_utils is not None:
-                return int(telethon_utils.get_peer_id(entity))
-            return int(entity.id)
+            return int(telethon_utils.get_peer_id(entity))
         except (ValueError, KeyError):
             pass
 
@@ -411,9 +398,7 @@ class DaemonAPIServer:
                 matched_dialog_name = name
 
         if matched_dialog is not None:
-            if _TELETHON_AVAILABLE and telethon_utils is not None:
-                return int(telethon_utils.get_peer_id(matched_dialog.entity))
-            return int(matched_dialog.id)
+            return int(telethon_utils.get_peer_id(matched_dialog.entity))
 
         raise ValueError(
             f"Dialog {dialog!r} not found. "
@@ -655,28 +640,25 @@ class DaemonAPIServer:
             }
 
         try:
-            if _TELETHON_AVAILABLE and GetForumTopicsRequest is not None:
-                result = await self._client(
-                    GetForumTopicsRequest(
-                        channel=entity,
-                        offset_date=0,
-                        offset_id=0,
-                        offset_topic=0,
-                        limit=100,
-                        q="",
-                    )
+            result = await self._client(
+                GetForumTopicsRequest(
+                    channel=entity,
+                    offset_date=0,
+                    offset_id=0,
+                    offset_topic=0,
+                    limit=100,
+                    q="",
                 )
-                topics = [
-                    {
-                        "id": t.id,
-                        "title": getattr(t, "title", None),
-                        "icon_emoji_id": getattr(t, "icon_emoji_id", None),
-                        "date": getattr(t, "date", None),
-                    }
-                    for t in getattr(result, "topics", [])
-                ]
-            else:
-                topics = []
+            )
+            topics = [
+                {
+                    "id": t.id,
+                    "title": getattr(t, "title", None),
+                    "icon_emoji_id": getattr(t, "icon_emoji_id", None),
+                    "date": getattr(t, "date", None),
+                }
+                for t in getattr(result, "topics", [])
+            ]
         except Exception as exc:
             logger.warning("topics fetch failed for dialog_id=%s: %s", dialog_id, exc)
             return {
@@ -850,32 +832,25 @@ class DaemonAPIServer:
 
         # Fetch common chats (only available for user entities)
         common_chats: list[dict] = []
-        if _TELETHON_AVAILABLE and GetCommonChatsRequest is not None:
-            try:
-                common_result = await self._client(
-                    GetCommonChatsRequest(user_id=user_id, max_id=0, limit=100)
-                )
-                for chat in getattr(common_result, "chats", []):
-                    # Determine chat type from Telethon type system
-                    if Channel is not None and isinstance(chat, Channel):
-                        chat_type = "supergroup" if getattr(chat, "megagroup", False) else "channel"
-                    elif Chat is not None and isinstance(chat, Chat):
-                        chat_type = "group"
-                    else:
-                        chat_type = "user"
+        try:
+            common_result = await self._client(
+                GetCommonChatsRequest(user_id=user_id, max_id=0, limit=100)
+            )
+            for chat in getattr(common_result, "chats", []):
+                if isinstance(chat, Channel):
+                    chat_type = "supergroup" if getattr(chat, "megagroup", False) else "channel"
+                elif isinstance(chat, Chat):
+                    chat_type = "group"
+                else:
+                    chat_type = "user"
 
-                    if _TELETHON_AVAILABLE and telethon_utils is not None:
-                        full_id = int(telethon_utils.get_peer_id(chat))
-                    else:
-                        full_id = int(chat.id)
-
-                    common_chats.append({
-                        "id": full_id,
-                        "name": getattr(chat, "title", None) or str(chat.id),
-                        "type": chat_type,
-                    })
-            except Exception as exc:
-                logger.warning("get_user_info common_chats_failed user_id=%r error=%s", user_id, exc)
+                common_chats.append({
+                    "id": int(telethon_utils.get_peer_id(chat)),
+                    "name": getattr(chat, "title", None) or str(chat.id),
+                    "type": chat_type,
+                })
+        except Exception as exc:
+            logger.warning("get_user_info common_chats_failed user_id=%r error=%s", user_id, exc)
 
         return {
             "ok": True,

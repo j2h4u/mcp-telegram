@@ -19,6 +19,21 @@ from mcp_telegram.fts import MESSAGES_FTS_DDL, stem_text
 
 
 # ---------------------------------------------------------------------------
+# Module-wide patch: telethon_utils.get_peer_id returns entity.id for mocks
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _patch_get_peer_id():
+    """All tests use MagicMock entities — real get_peer_id can't handle them."""
+    with patch(
+        "mcp_telegram.daemon_api.telethon_utils.get_peer_id",
+        side_effect=lambda entity: int(getattr(entity, "id", 0)),
+    ):
+        yield
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -442,9 +457,7 @@ async def test_list_topics_through_daemon() -> None:
 
     server = make_server(conn, client)
 
-    # Patch GetForumTopicsRequest so the import guard is satisfied
-    with patch("mcp_telegram.daemon_api.GetForumTopicsRequest") as _mock_req, \
-         patch("mcp_telegram.daemon_api._TELETHON_AVAILABLE", True):
+    with patch("mcp_telegram.daemon_api.GetForumTopicsRequest"):
         result = await server._list_topics({"dialog_id": 123})
 
     assert result["ok"] is True, f"Expected ok=True, got {result}"
@@ -792,10 +805,8 @@ async def test_get_user_info_returns_profile() -> None:
 
     server = make_server(client=client)
 
-    # Patch GetCommonChatsRequest so the import guard is satisfied (same pattern as list_topics test)
-    with patch("mcp_telegram.daemon_api.GetCommonChatsRequest") as mock_gcr, \
-         patch("mcp_telegram.daemon_api._TELETHON_AVAILABLE", True):
-        mock_gcr.return_value = MagicMock()  # the request object passed to client()
+    with patch("mcp_telegram.daemon_api.GetCommonChatsRequest") as mock_gcr:
+        mock_gcr.return_value = MagicMock()
         result = await server._dispatch({"method": "get_user_info", "user_id": 12345})
 
     assert result["ok"] is True, f"Expected ok=True, got {result}"
@@ -861,8 +872,7 @@ async def test_get_user_info_channel_type_classification() -> None:
 
     server = make_server(client=client)
 
-    with patch("mcp_telegram.daemon_api.GetCommonChatsRequest") as mock_gcr, \
-         patch("mcp_telegram.daemon_api._TELETHON_AVAILABLE", True):
+    with patch("mcp_telegram.daemon_api.GetCommonChatsRequest") as mock_gcr:
         mock_gcr.return_value = MagicMock()
         result = await server._dispatch({"method": "get_user_info", "user_id": 100})
 
