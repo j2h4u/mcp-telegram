@@ -885,3 +885,321 @@ def test_no_sqlite3_or_cache_in_tools():
             if "from ..analytics import" in line and allowed_analytics not in line:
                 violations.append(f"{py_file.name}: imports from analytics beyond format_usage_summary")
     assert not violations, "CONSOLIDATE-03 violations:\n" + "\n".join(violations)
+
+
+# ---------------------------------------------------------------------------
+# DaemonConnection.list_messages — extended params (Phase 35-02, Task 1)
+# ---------------------------------------------------------------------------
+
+
+async def test_daemon_connection_list_messages_passes_sender_id():
+    """DaemonConnection.list_messages passes sender_id in request payload."""
+    from mcp_telegram.daemon_client import DaemonConnection
+    import json
+
+    sent_payload = {}
+
+    class _FakeWriter:
+        def write(self, data: bytes) -> None:
+            nonlocal sent_payload
+            sent_payload = json.loads(data.strip())
+        async def drain(self) -> None:
+            pass
+
+    class _FakeReader:
+        async def readline(self) -> bytes:
+            return json.dumps({"ok": True, "data": {}}).encode() + b"\n"
+
+    conn = DaemonConnection(_FakeReader(), _FakeWriter())
+    await conn.list_messages(dialog_id=1, sender_id=42)
+    assert sent_payload.get("sender_id") == 42
+
+
+async def test_daemon_connection_list_messages_passes_sender_name():
+    """DaemonConnection.list_messages passes sender_name in request payload."""
+    from mcp_telegram.daemon_client import DaemonConnection
+    import json
+
+    sent_payload = {}
+
+    class _FakeWriter:
+        def write(self, data: bytes) -> None:
+            nonlocal sent_payload
+            sent_payload = json.loads(data.strip())
+        async def drain(self) -> None:
+            pass
+
+    class _FakeReader:
+        async def readline(self) -> bytes:
+            return json.dumps({"ok": True, "data": {}}).encode() + b"\n"
+
+    conn = DaemonConnection(_FakeReader(), _FakeWriter())
+    await conn.list_messages(dialog_id=1, sender_name="Alice")
+    assert sent_payload.get("sender_name") == "Alice"
+
+
+async def test_daemon_connection_list_messages_passes_topic_id():
+    """DaemonConnection.list_messages passes topic_id in request payload."""
+    from mcp_telegram.daemon_client import DaemonConnection
+    import json
+
+    sent_payload = {}
+
+    class _FakeWriter:
+        def write(self, data: bytes) -> None:
+            nonlocal sent_payload
+            sent_payload = json.loads(data.strip())
+        async def drain(self) -> None:
+            pass
+
+    class _FakeReader:
+        async def readline(self) -> bytes:
+            return json.dumps({"ok": True, "data": {}}).encode() + b"\n"
+
+    conn = DaemonConnection(_FakeReader(), _FakeWriter())
+    await conn.list_messages(dialog_id=1, topic_id=5)
+    assert sent_payload.get("topic_id") == 5
+
+
+async def test_daemon_connection_list_messages_passes_unread_after_id():
+    """DaemonConnection.list_messages passes unread_after_id in request payload."""
+    from mcp_telegram.daemon_client import DaemonConnection
+    import json
+
+    sent_payload = {}
+
+    class _FakeWriter:
+        def write(self, data: bytes) -> None:
+            nonlocal sent_payload
+            sent_payload = json.loads(data.strip())
+        async def drain(self) -> None:
+            pass
+
+    class _FakeReader:
+        async def readline(self) -> bytes:
+            return json.dumps({"ok": True, "data": {}}).encode() + b"\n"
+
+    conn = DaemonConnection(_FakeReader(), _FakeWriter())
+    await conn.list_messages(dialog_id=1, unread_after_id=100)
+    assert sent_payload.get("unread_after_id") == 100
+
+
+async def test_daemon_connection_list_messages_passes_direction():
+    """DaemonConnection.list_messages passes direction in request payload."""
+    from mcp_telegram.daemon_client import DaemonConnection
+    import json
+
+    sent_payload = {}
+
+    class _FakeWriter:
+        def write(self, data: bytes) -> None:
+            nonlocal sent_payload
+            sent_payload = json.loads(data.strip())
+        async def drain(self) -> None:
+            pass
+
+    class _FakeReader:
+        async def readline(self) -> bytes:
+            return json.dumps({"ok": True, "data": {}}).encode() + b"\n"
+
+    conn = DaemonConnection(_FakeReader(), _FakeWriter())
+    await conn.list_messages(dialog_id=1, direction="oldest")
+    assert sent_payload.get("direction") == "oldest"
+
+
+async def test_daemon_connection_list_messages_passes_unread_flag():
+    """DaemonConnection.list_messages passes unread=True in request payload."""
+    from mcp_telegram.daemon_client import DaemonConnection
+    import json
+
+    sent_payload = {}
+
+    class _FakeWriter:
+        def write(self, data: bytes) -> None:
+            nonlocal sent_payload
+            sent_payload = json.loads(data.strip())
+        async def drain(self) -> None:
+            pass
+
+    class _FakeReader:
+        async def readline(self) -> bytes:
+            return json.dumps({"ok": True, "data": {}}).encode() + b"\n"
+
+    conn = DaemonConnection(_FakeReader(), _FakeWriter())
+    await conn.list_messages(dialog_id=1, unread=True)
+    assert sent_payload.get("unread") is True
+
+
+async def test_daemon_connection_list_messages_omits_none_params():
+    """DaemonConnection.list_messages omits optional params when not provided (backward compat)."""
+    from mcp_telegram.daemon_client import DaemonConnection
+    import json
+
+    sent_payload = {}
+
+    class _FakeWriter:
+        def write(self, data: bytes) -> None:
+            nonlocal sent_payload
+            sent_payload = json.loads(data.strip())
+        async def drain(self) -> None:
+            pass
+
+    class _FakeReader:
+        async def readline(self) -> bytes:
+            return json.dumps({"ok": True, "data": {}}).encode() + b"\n"
+
+    conn = DaemonConnection(_FakeReader(), _FakeWriter())
+    await conn.list_messages(dialog_id=1)
+    assert "sender_id" not in sent_payload
+    assert "sender_name" not in sent_payload
+    assert "topic_id" not in sent_payload
+    assert "unread_after_id" not in sent_payload
+    assert "direction" not in sent_payload
+    assert "unread" not in sent_payload
+
+
+# ---------------------------------------------------------------------------
+# _DaemonMessage adapter — edit_date and topic_title (Phase 35-02, Task 1)
+# ---------------------------------------------------------------------------
+
+
+def test_daemon_message_reads_edit_date_from_row():
+    """_DaemonMessage reads edit_date from row dict as datetime (not hardcoded None)."""
+    from mcp_telegram.tools.reading import _DaemonMessage
+    from datetime import datetime, timezone
+
+    row = {
+        "message_id": 1,
+        "sent_at": 1700000000,
+        "text": "hi",
+        "sender_first_name": None,
+        "edit_date": 1700001000,
+        "topic_title": None,
+    }
+    msg = _DaemonMessage(row)
+    assert msg.edit_date is not None
+    assert isinstance(msg.edit_date, datetime)
+    assert msg.edit_date == datetime.fromtimestamp(1700001000, tz=timezone.utc)
+
+
+def test_daemon_message_edit_date_none_when_absent():
+    """_DaemonMessage.edit_date is None when row has no edit_date key."""
+    from mcp_telegram.tools.reading import _DaemonMessage
+
+    row = {
+        "message_id": 1,
+        "sent_at": 1700000000,
+        "text": "hi",
+        "sender_first_name": None,
+        "topic_title": None,
+    }
+    msg = _DaemonMessage(row)
+    assert msg.edit_date is None
+
+
+def test_daemon_message_reads_topic_title_from_row():
+    """_DaemonMessage reads topic_title from row dict."""
+    from mcp_telegram.tools.reading import _DaemonMessage
+
+    row = {
+        "message_id": 1,
+        "sent_at": 1700000000,
+        "text": "hi",
+        "sender_first_name": None,
+        "topic_title": "General",
+        "edit_date": None,
+    }
+    msg = _DaemonMessage(row)
+    assert msg.topic_title == "General"
+
+
+def test_daemon_message_topic_title_none_when_absent():
+    """_DaemonMessage.topic_title is None when row has no topic_title key."""
+    from mcp_telegram.tools.reading import _DaemonMessage
+
+    row = {
+        "message_id": 1,
+        "sent_at": 1700000000,
+        "text": "hi",
+        "sender_first_name": None,
+    }
+    msg = _DaemonMessage(row)
+    assert msg.topic_title is None
+
+
+def test_format_daemon_messages_passes_topic_name_getter():
+    """_format_daemon_messages passes topic_name_getter to format_messages when topic_title present."""
+    from mcp_telegram.tools.reading import _format_daemon_messages
+    from unittest.mock import patch, call
+
+    rows = [
+        {
+            "message_id": 1,
+            "sent_at": 1700000000,
+            "text": "hi",
+            "sender_first_name": "Alice",
+            "topic_title": "General",
+            "edit_date": None,
+        },
+    ]
+
+    captured_kwargs = {}
+
+    def _fake_format_messages(messages, reply_map, **kwargs):
+        captured_kwargs.update(kwargs)
+        return "formatted"
+
+    with patch("mcp_telegram.tools.reading.format_messages", _fake_format_messages):
+        # Need to ensure format_messages is called from within the module
+        import mcp_telegram.tools.reading as reading_mod
+        with patch.object(reading_mod, "_format_daemon_messages", wraps=reading_mod._format_daemon_messages):
+            result = _format_daemon_messages(rows)
+
+    assert "topic_name_getter" in captured_kwargs
+    assert captured_kwargs["topic_name_getter"] is not None
+
+
+def test_format_daemon_messages_no_topic_name_getter_when_no_topics():
+    """_format_daemon_messages does not pass topic_name_getter when no topic_title present."""
+    from mcp_telegram.tools.reading import _format_daemon_messages
+    from unittest.mock import patch
+
+    rows = [
+        {
+            "message_id": 1,
+            "sent_at": 1700000000,
+            "text": "hi",
+            "sender_first_name": "Alice",
+            "topic_title": None,
+            "edit_date": None,
+        },
+    ]
+
+    captured_kwargs = {}
+
+    def _fake_format_messages(messages, reply_map, **kwargs):
+        captured_kwargs.update(kwargs)
+        return "formatted"
+
+    with patch("mcp_telegram.tools.reading.format_messages", _fake_format_messages):
+        _format_daemon_messages(rows)
+
+    assert captured_kwargs.get("topic_name_getter") is None
+
+
+def test_format_daemon_messages_edit_date_shown():
+    """format_messages shows [edited HH:MM] when edit_date is set on _DaemonMessage."""
+    from mcp_telegram.tools.reading import _format_daemon_messages
+
+    rows = [
+        {
+            "message_id": 1,
+            "sent_at": 1700000000,
+            "text": "edited message",
+            "sender_first_name": "Alice",
+            "topic_title": None,
+            "edit_date": 1700001000,
+        },
+    ]
+    result = _format_daemon_messages(rows)
+    assert "edited" in result.lower()
