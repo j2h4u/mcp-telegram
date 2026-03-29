@@ -153,11 +153,11 @@ def extract_message_row(dialog_id: int, msg: Any) -> tuple[object, ...]:
     reply_to_msg_id: int | None = None
     forum_topic_id: int | None = None
     if reply_to is not None:
-        raw_rtmi = getattr(reply_to, "reply_to_msg_id", None)
-        reply_to_msg_id = int(raw_rtmi) if raw_rtmi is not None else None
+        raw_reply_msg_id = getattr(reply_to, "reply_to_msg_id", None)
+        reply_to_msg_id = int(raw_reply_msg_id) if raw_reply_msg_id is not None else None
         if getattr(reply_to, "forum_topic", False):
-            top_id = getattr(reply_to, "reply_to_top_id", None)
-            forum_topic_id = int(top_id) if top_id is not None else 1
+            reply_top_id = getattr(reply_to, "reply_to_reply_top_id", None)
+            forum_topic_id = int(reply_top_id) if reply_top_id is not None else 1
 
     reactions = serialize_reactions(getattr(msg, "reactions", None))
 

@@ -555,11 +555,11 @@ class DaemonAPIServer:
         reply_to_msg_id: int | None = None
         forum_topic_id: int | None = None
         if reply_to is not None:
-            raw_rtmi = getattr(reply_to, "reply_to_msg_id", None)
-            reply_to_msg_id = int(raw_rtmi) if raw_rtmi is not None else None
+            raw_reply_msg_id = getattr(reply_to, "reply_to_msg_id", None)
+            reply_to_msg_id = int(raw_reply_msg_id) if raw_reply_msg_id is not None else None
             if getattr(reply_to, "forum_topic", False):
-                top_id = getattr(reply_to, "reply_to_top_id", None)
-                forum_topic_id = int(top_id) if top_id is not None else 1
+                reply_top_id = getattr(reply_to, "reply_to_reply_top_id", None)
+                forum_topic_id = int(reply_top_id) if reply_top_id is not None else 1
 
         edit_date_raw = getattr(msg, "edit_date", None)
         edit_date: int | None = None
@@ -908,12 +908,12 @@ class DaemonAPIServer:
         exclude_archived: bool = req.get("exclude_archived", False)
         ignore_pinned: bool = req.get("ignore_pinned", False)
 
-        archived_flag = False if exclude_archived else None
+        archived_filter = False if exclude_archived else None
 
         dialogs = []
         try:
             async for d in self._client.iter_dialogs(
-                archived=archived_flag,
+                archived=archived_filter,
                 ignore_pinned=ignore_pinned,
             ):
                 entity = getattr(d, "entity", None)

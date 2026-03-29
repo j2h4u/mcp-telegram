@@ -110,28 +110,28 @@ class DeltaSyncWorker:
             # No baseline yet — FullSyncWorker handles this dialog
             return 0
 
-        new_msgs: list[tuple[object, ...]] = []
+        new_message_rows: list[tuple[object, ...]] = []
         try:
             async for msg in self._client.iter_messages(
                 entity=dialog_id, min_id=max_known_id, reverse=True, limit=None
             ):
                 if self._shutdown_event.is_set():
                     break
-                new_msgs.append(extract_message_row(dialog_id, msg))
+                new_message_rows.append(extract_message_row(dialog_id, msg))
         except FloodWaitError as exc:
             logger.warning(
                 "FloodWait delta dialog_id=%d — %ds (preserving %d already-fetched messages)",
                 dialog_id,
                 exc.seconds,
-                len(new_msgs),
+                len(new_message_rows),
             )
-            if new_msgs:
+            if new_message_rows:
                 with self._conn:
-                    insert_messages_with_fts(self._conn, new_msgs)
+                    insert_messages_with_fts(self._conn, new_message_rows)
                 logger.info(
                     "delta dialog_id=%d preserved_messages=%d before FloodWait",
                     dialog_id,
-                    len(new_msgs),
+                    len(new_message_rows),
                 )
             try:
                 await asyncio.wait_for(
@@ -139,7 +139,7 @@ class DeltaSyncWorker:
                 )
             except asyncio.TimeoutError:
                 pass  # slept the full duration; caller will retry remaining gap
-            return len(new_msgs)
+            return len(new_message_rows)
         except _ACCESS_LOST_ERRORS as exc:
             logger.warning(
                 "access_lost delta dialog_id=%d — %s",
@@ -155,10 +155,10 @@ class DeltaSyncWorker:
             )
             return 0
 
-        if new_msgs:
+        if new_message_rows:
             with self._conn:
-                insert_messages_with_fts(self._conn, new_msgs)
+                insert_messages_with_fts(self._conn, new_message_rows)
             logger.info(
-                "delta dialog_id=%d new_messages=%d", dialog_id, len(new_msgs)
+                "delta dialog_id=%d new_messages=%d", dialog_id, len(new_message_rows)
             )
-        return len(new_msgs)
+        return len(new_message_rows)

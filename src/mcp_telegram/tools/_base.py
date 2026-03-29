@@ -79,7 +79,7 @@ def _track_tool_telemetry(tool_name: str):
         @functools.wraps(fn)
         async def wrapper(args):
             logger.debug("method[%s]", tool_name)
-            t0 = time.monotonic()
+            start_time = time.monotonic()
             error_type = None
             tool_result: ToolResult | None = None
             try:
@@ -89,7 +89,7 @@ def _track_tool_telemetry(tool_name: str):
                 error_type = type(exc).__name__
                 raise
             finally:
-                duration_ms = (time.monotonic() - t0) * 1000
+                duration_ms = (time.monotonic() - start_time) * 1000
                 try:
                     task = asyncio.create_task(
                         _send_telemetry_event({

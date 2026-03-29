@@ -24,22 +24,22 @@ class TelegramSettings(BaseSettings):
 
 
 async def connect_to_telegram(api_id: str, api_hash: str, phone_number: str) -> None:
-    user_session = create_client(api_id=api_id, api_hash=api_hash)
-    await user_session.connect()
+    client = create_client(api_id=api_id, api_hash=api_hash)
+    await client.connect()
 
-    result = await user_session.send_code_request(phone_number)
+    result = await client.send_code_request(phone_number)
     code = input("Enter login code: ")
     try:
-        await user_session.sign_in(
+        await client.sign_in(
             phone=phone_number,
             code=code,
             phone_code_hash=result.phone_code_hash,
         )
     except SessionPasswordNeededError:
         password = getpass("Enter 2FA password: ")
-        await user_session.sign_in(password=password)
+        await client.sign_in(password=password)
 
-    user = await user_session.get_me()
+    user = await client.get_me()
     if isinstance(user, User):
         print(f"Hey {user.username}! You are connected!")
     else:
@@ -48,9 +48,9 @@ async def connect_to_telegram(api_id: str, api_hash: str, phone_number: str) -> 
 
 
 async def logout_from_telegram() -> None:
-    user_session = create_client()
-    await user_session.connect()
-    await user_session.log_out()
+    client = create_client()
+    await client.connect()
+    await client.log_out()
     print("You are now logged out from Telegram.")
 
 
@@ -77,15 +77,15 @@ def create_client(
     cache-key collision in practice.
     """
     if api_id is not None and api_hash is not None:
-        config = TelegramSettings(api_id=api_id, api_hash=api_hash)
+        settings = TelegramSettings(api_id=api_id, api_hash=api_hash)
     else:
-        config = TelegramSettings()
+        settings = TelegramSettings()
     state_home = xdg_state_home() / "mcp-telegram"
     state_home.mkdir(parents=True, exist_ok=True, mode=0o700)
     return TelegramClient(
         state_home / session_name,
-        config.api_id,
-        config.api_hash,
+        settings.api_id,
+        settings.api_hash,
         base_logger="telethon",
         catch_up=catch_up,
     )
