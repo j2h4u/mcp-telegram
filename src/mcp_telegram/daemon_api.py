@@ -53,7 +53,12 @@ GROUP_TTL: int = 604_800    # 7 days
 
 from .budget import allocate_message_budget_proportional, unread_chat_tier
 from .fts import stem_query
-from .pagination import encode_history_navigation, encode_search_navigation
+from .pagination import (
+    HistoryDirection,
+    decode_navigation_token,
+    encode_history_navigation,
+    encode_search_navigation,
+)
 from .sync_worker import serialize_reactions
 from .resolver import (
     Candidates,
@@ -146,6 +151,83 @@ _ALL_ENTITY_NAMES_NORMALIZED_SQL = (
     "OR (type != 'user' AND updated_at >= ?))"
 )
 _ENTITY_BY_USERNAME_SQL = "SELECT id, name FROM entities WHERE username = ?"
+
+
+# ---------------------------------------------------------------------------
+# Dynamic SQL builder for list_messages (Phase 35-01)
+# ---------------------------------------------------------------------------
+
+
+def _build_list_messages_query(
+    *,
+    dialog_id: int,
+    limit: int,
+    direction: str = "newest",
+    cursor_msg_id: int | None = None,
+    sender_id: int | None = None,
+    sender_name: str | None = None,
+    topic_id: int | None = None,
+    unread_after_id: int | None = None,
+) -> tuple[str, list]:
+    """Build a parameterized SELECT for list_messages against sync.db.
+
+    Returns (sql_string, params_list).  Columns returned (by index):
+      0  message_id        7  reactions
+      1  sent_at           8  is_deleted
+      2  text              9  deleted_at
+      3  sender_id         10 edit_date   (MAX from message_versions subquery)
+      4  sender_first_name 11 topic_title (from LEFT JOIN topic_metadata)
+      5  media_description
+      6  reply_to_msg_id
+      7  forum_topic_id  ← wait, let me recount:
+    Actually the column positions in the SELECT are in order below.
+    """
+    params: list = [dialog_id]
+
+    sql = (
+        "SELECT m.message_id, m.sent_at, m.text, m.sender_id, m.sender_first_name, "
+        "m.media_description, m.reply_to_msg_id, m.forum_topic_id, m.reactions, "
+        "m.is_deleted, m.deleted_at, "
+        "(SELECT MAX(mv.edit_date) FROM message_versions mv "
+        " WHERE mv.dialog_id = m.dialog_id AND mv.message_id = m.message_id) AS edit_date, "
+        "tm.title AS topic_title "
+        "FROM messages m "
+        "LEFT JOIN topic_metadata tm "
+        "  ON tm.dialog_id = m.dialog_id AND tm.topic_id = m.forum_topic_id "
+        "WHERE m.dialog_id = ? AND m.is_deleted = 0"
+    )
+
+    if sender_id is not None:
+        sql += " AND m.sender_id = ?"
+        params.append(sender_id)
+    elif sender_name is not None:
+        sql += " AND m.sender_first_name LIKE ? COLLATE NOCASE"
+        params.append(f"%{sender_name}%")
+
+    if topic_id is not None:
+        sql += " AND m.forum_topic_id = ?"
+        params.append(topic_id)
+
+    if unread_after_id is not None:
+        sql += " AND m.message_id > ?"
+        params.append(unread_after_id)
+
+    if cursor_msg_id is not None:
+        if direction == "oldest":
+            sql += " AND m.message_id > ?"
+        else:
+            sql += " AND m.message_id < ?"
+        params.append(cursor_msg_id)
+
+    if direction == "oldest":
+        sql += " ORDER BY m.message_id ASC"
+    else:
+        sql += " ORDER BY m.message_id DESC"
+
+    sql += " LIMIT ?"
+    params.append(limit)
+
+    return sql, params
 
 
 # ---------------------------------------------------------------------------
@@ -446,6 +528,14 @@ class DaemonAPIServer:
                 top_id = getattr(reply_to, "reply_to_top_id", None)
                 forum_topic_id = int(top_id) if top_id is not None else 1
 
+        edit_date_raw = getattr(msg, "edit_date", None)
+        edit_date: int | None = None
+        if edit_date_raw is not None:
+            try:
+                edit_date = int(edit_date_raw.timestamp())
+            except Exception:
+                edit_date = None
+
         return {
             "message_id": msg.id,
             "sent_at": sent_at,
@@ -457,6 +547,7 @@ class DaemonAPIServer:
             "forum_topic_id": forum_topic_id,
             "reactions": reactions,
             "is_deleted": 0,
+            "edit_date": edit_date,
         }
 
     # ------------------------------------------------------------------
@@ -464,13 +555,65 @@ class DaemonAPIServer:
     # ------------------------------------------------------------------
 
     async def _list_messages(self, req: dict) -> dict:
-        """Return messages from sync.db (if synced) or Telegram (on-demand)."""
+        """Return messages from sync.db (if synced) or Telegram (on-demand).
+
+        Supported request params (Phase 35-01):
+          direction      "newest" (default) | "oldest"
+          sender_id      int — filter by sender_id (sync.db: AND clause; on-demand: from_user=)
+          sender_name    str — filter by sender name LIKE (sync.db only)
+          topic_id       int — filter by forum_topic_id (sync.db: AND clause; on-demand: reply_to=)
+          unread_after_id int — filter message_id > X (sync.db: AND clause; on-demand: min_id=)
+          navigation     opaque base64 token from next_navigation — advances the cursor
+        """
         dialog_id: int = req.get("dialog_id", 0) or 0
         dialog: str | None = req.get("dialog")
         limit: int = _clamp(req.get("limit", 50), 1, 500)
         navigation: str | None = req.get("navigation")
+        direction: str = req.get("direction", "newest")
+        sender_id: int | None = req.get("sender_id")
+        sender_name: str | None = req.get("sender_name")
+        topic_id: int | None = req.get("topic_id")
+        unread_after_id: int | None = req.get("unread_after_id")
 
-        # Dialog resolution
+        # Validate direction
+        if direction not in ("newest", "oldest"):
+            direction = "newest"
+
+        # Navigation token handling — decode cursor and override direction
+        cursor_msg_id: int | None = None
+        if navigation and navigation not in ("newest", "oldest"):
+            try:
+                nav = decode_navigation_token(navigation)
+            except ValueError as exc:
+                return {"ok": False, "error": "invalid_navigation", "message": str(exc)}
+            if nav.kind != "history":
+                return {
+                    "ok": False,
+                    "error": "invalid_navigation",
+                    "message": f"Navigation token is for {nav.kind}, not history",
+                }
+            # Resolve dialog_id from request before checking nav
+            if not dialog_id and dialog:
+                try:
+                    dialog_id = await self._resolve_dialog_name(dialog)
+                except ValueError as exc:
+                    return {"ok": False, "error": "dialog_not_found", "message": str(exc)}
+            if dialog_id and nav.dialog_id != dialog_id:
+                return {
+                    "ok": False,
+                    "error": "invalid_navigation",
+                    "message": (
+                        f"Navigation token belongs to dialog {nav.dialog_id}, "
+                        f"not {dialog_id}"
+                    ),
+                }
+            cursor_msg_id = nav.value
+            if nav.direction is not None:
+                direction = str(nav.direction)
+        elif navigation == "oldest":
+            direction = "oldest"
+
+        # Dialog resolution (if not already done above)
         if not dialog_id and dialog:
             try:
                 dialog_id = await self._resolve_dialog_name(dialog)
@@ -484,13 +627,27 @@ class DaemonAPIServer:
                 "message": "Either dialog_id or dialog name is required",
             }
 
+        direction_enum = (
+            HistoryDirection.OLDEST if direction == "oldest" else HistoryDirection.NEWEST
+        )
+
         # Check sync status
         row = self._conn.execute(_SELECT_SYNC_STATUS_SQL, (dialog_id,)).fetchone()
         status = row[0] if row is not None else None
 
         if status in ("synced", "syncing"):
-            # Read from sync.db
-            rows = self._conn.execute(_SELECT_MESSAGES_SQL, (dialog_id, limit)).fetchall()
+            # Read from sync.db using dynamic query builder
+            sql, params = _build_list_messages_query(
+                dialog_id=dialog_id,
+                limit=limit,
+                direction=direction,
+                cursor_msg_id=cursor_msg_id,
+                sender_id=sender_id,
+                sender_name=sender_name,
+                topic_id=topic_id,
+                unread_after_id=unread_after_id,
+            )
+            rows = self._conn.execute(sql, params).fetchall()
             messages = [
                 {
                     "message_id": r[0],
@@ -504,16 +661,39 @@ class DaemonAPIServer:
                     "reactions": r[8],
                     "is_deleted": r[9],
                     "deleted_at": r[10],
+                    "edit_date": r[11],
+                    "topic_title": r[12],
                 }
                 for r in rows
             ]
-            return {"ok": True, "data": {"messages": messages, "source": "sync_db"}}
+            next_nav: str | None = None
+            if messages and len(messages) == limit:
+                last_msg_id = messages[-1]["message_id"]
+                next_nav = encode_history_navigation(
+                    last_msg_id, dialog_id, direction=direction_enum
+                )
+            return {
+                "ok": True,
+                "data": {"messages": messages, "source": "sync_db", "next_navigation": next_nav},
+            }
 
         # On-demand fetch from Telegram
         logger.debug("list_messages_fallback_telegram dialog_id=%d", dialog_id)
+        iter_kwargs: dict = {"limit": limit}
+        if cursor_msg_id is not None:
+            iter_kwargs["offset_id"] = cursor_msg_id
+        if sender_id is not None:
+            iter_kwargs["from_user"] = sender_id
+        if topic_id is not None:
+            iter_kwargs["reply_to"] = topic_id
+        if unread_after_id is not None:
+            iter_kwargs["min_id"] = unread_after_id
+        if direction == "oldest":
+            iter_kwargs["reverse"] = True
+
         messages = []
         try:
-            async for msg in self._client.iter_messages(dialog_id, limit=limit):
+            async for msg in self._client.iter_messages(dialog_id, **iter_kwargs):
                 messages.append(self._msg_to_dict(msg))
         except Exception as exc:
             logger.warning(
@@ -524,12 +704,17 @@ class DaemonAPIServer:
             )
             return {"ok": False, "error": "telegram_error", "message": "failed to fetch messages"}
 
-        next_nav: str | None = None
+        next_nav = None
         if messages and len(messages) == limit:
             last_msg_id = messages[-1]["message_id"]
-            next_nav = encode_history_navigation(last_msg_id, dialog_id)
+            next_nav = encode_history_navigation(
+                last_msg_id, dialog_id, direction=direction_enum
+            )
 
-        return {"ok": True, "data": {"messages": messages, "source": "telegram", "next_navigation": next_nav}}
+        return {
+            "ok": True,
+            "data": {"messages": messages, "source": "telegram", "next_navigation": next_nav},
+        }
 
     # ------------------------------------------------------------------
     # search_messages
