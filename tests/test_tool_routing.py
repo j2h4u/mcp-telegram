@@ -1203,3 +1203,132 @@ def test_format_daemon_messages_edit_date_shown():
     ]
     result = _format_daemon_messages(rows)
     assert "edited" in result.lower()
+
+
+# ---------------------------------------------------------------------------
+# MCP list_messages tool — param wiring (Phase 35-02, Task 2)
+# ---------------------------------------------------------------------------
+
+
+async def test_list_messages_sends_sender():
+    """list_messages with sender= passes sender_name= to conn.list_messages."""
+    conn = _make_daemon_conn({"ok": True, "data": {"messages": [], "source": "sync_db"}})
+    with _patch_daemon(conn):
+        await list_messages(ListMessages(exact_dialog_id=1, sender="Alice"))
+
+    call_kwargs = conn.list_messages.call_args[1]
+    assert call_kwargs.get("sender_name") == "Alice"
+
+
+async def test_list_messages_sends_topic_id():
+    """list_messages with exact_topic_id= passes topic_id= to conn.list_messages."""
+    conn = _make_daemon_conn({"ok": True, "data": {"messages": [], "source": "sync_db"}})
+    with _patch_daemon(conn):
+        await list_messages(ListMessages(exact_dialog_id=1, exact_topic_id=5))
+
+    call_kwargs = conn.list_messages.call_args[1]
+    assert call_kwargs.get("topic_id") == 5
+
+
+async def test_list_messages_sends_direction_newest():
+    """list_messages without navigation passes direction='newest' to conn.list_messages."""
+    conn = _make_daemon_conn({"ok": True, "data": {"messages": [], "source": "sync_db"}})
+    with _patch_daemon(conn):
+        await list_messages(ListMessages(exact_dialog_id=1))
+
+    call_kwargs = conn.list_messages.call_args[1]
+    assert call_kwargs.get("direction") == "newest"
+
+
+async def test_list_messages_sends_direction_oldest():
+    """list_messages with navigation='oldest' passes direction='oldest' to conn.list_messages."""
+    conn = _make_daemon_conn({"ok": True, "data": {"messages": [], "source": "sync_db"}})
+    with _patch_daemon(conn):
+        await list_messages(ListMessages(exact_dialog_id=1, navigation="oldest"))
+
+    call_kwargs = conn.list_messages.call_args[1]
+    assert call_kwargs.get("direction") == "oldest"
+
+
+async def test_list_messages_sends_unread():
+    """list_messages with unread=True passes unread=True to conn.list_messages."""
+    conn = _make_daemon_conn({"ok": True, "data": {"messages": [], "source": "sync_db"}})
+    with _patch_daemon(conn):
+        await list_messages(ListMessages(exact_dialog_id=1, unread=True))
+
+    call_kwargs = conn.list_messages.call_args[1]
+    assert call_kwargs.get("unread") is True
+
+
+async def test_list_messages_topic_fuzzy_resolves_via_list_topics():
+    """list_messages with topic= resolves topic name to id via list_topics."""
+    list_topics_response = {
+        "ok": True,
+        "data": {
+            "topics": [
+                {"id": 7, "title": "General"},
+                {"id": 8, "title": "Off-topic"},
+            ],
+            "dialog_id": 1,
+        },
+    }
+    conn = _make_daemon_conn({"ok": True, "data": {"messages": [], "source": "sync_db"}})
+    conn.list_topics = AsyncMock(return_value=list_topics_response)
+    with _patch_daemon(conn):
+        await list_messages(ListMessages(exact_dialog_id=1, topic="General"))
+
+    call_kwargs = conn.list_messages.call_args[1]
+    assert call_kwargs.get("topic_id") == 7
+
+
+async def test_list_messages_topic_fuzzy_ambiguous_returns_error():
+    """list_messages with ambiguous topic= returns error listing matches."""
+    list_topics_response = {
+        "ok": True,
+        "data": {
+            "topics": [
+                {"id": 7, "title": "General Chat"},
+                {"id": 8, "title": "General Topics"},
+            ],
+            "dialog_id": 1,
+        },
+    }
+    conn = _make_daemon_conn({"ok": True, "data": {"messages": [], "source": "sync_db"}})
+    conn.list_topics = AsyncMock(return_value=list_topics_response)
+    with _patch_daemon(conn):
+        result = await list_messages(ListMessages(exact_dialog_id=1, topic="General"))
+
+    text = result[0].text
+    assert "ambiguous" in text.lower() or "matches" in text.lower() or "exact_topic_id" in text.lower()
+
+
+async def test_list_messages_topic_not_found_returns_error():
+    """list_messages with topic= that doesn't match any topic returns error."""
+    list_topics_response = {
+        "ok": True,
+        "data": {
+            "topics": [
+                {"id": 7, "title": "General"},
+            ],
+            "dialog_id": 1,
+        },
+    }
+    conn = _make_daemon_conn({"ok": True, "data": {"messages": [], "source": "sync_db"}})
+    conn.list_topics = AsyncMock(return_value=list_topics_response)
+    with _patch_daemon(conn):
+        result = await list_messages(ListMessages(exact_dialog_id=1, topic="nonexistent"))
+
+    text = result[0].text
+    assert "not found" in text.lower() or "nonexistent" in text.lower()
+
+
+async def test_list_messages_no_optional_params_not_sent():
+    """list_messages without optional params does NOT send them (backward compat)."""
+    conn = _make_daemon_conn({"ok": True, "data": {"messages": [], "source": "sync_db"}})
+    with _patch_daemon(conn):
+        await list_messages(ListMessages(exact_dialog_id=1))
+
+    call_kwargs = conn.list_messages.call_args[1]
+    assert call_kwargs.get("sender_name") is None
+    assert call_kwargs.get("topic_id") is None
+    assert call_kwargs.get("unread") is None
