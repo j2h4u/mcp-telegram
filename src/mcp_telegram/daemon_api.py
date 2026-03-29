@@ -584,7 +584,151 @@ class DaemonAPIServer:
         }
 
     # ------------------------------------------------------------------
-    # list_messages
+    # list_messages — helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _maybe_encode_next_nav(
+        messages: list[dict],
+        limit: int,
+        dialog_id: int,
+        direction: str,
+        direction_enum: HistoryDirection,
+    ) -> str | None:
+        """Encode a next-page navigation token if the result set is full."""
+        if messages and len(messages) == limit:
+            last_msg_id = messages[-1]["message_id"]
+            logger.debug(
+                "list_messages_pagination anchor_msg_id=%d dialog_id=%d direction=%s",
+                last_msg_id, dialog_id, direction,
+            )
+            return encode_history_navigation(
+                last_msg_id, dialog_id, direction=direction_enum
+            )
+        return None
+
+    async def _resolve_unread_position(
+        self, dialog_id: int, unread_after_id: int | None,
+    ) -> int | None:
+        """Resolve read position via Telegram GetPeerDialogsRequest."""
+        if unread_after_id is not None:
+            return unread_after_id
+        try:
+            from telethon.tl.functions.messages import (  # type: ignore[import-untyped]
+                GetPeerDialogsRequest,
+            )
+            peer_result = await self._client(GetPeerDialogsRequest(peers=[dialog_id]))
+            if peer_result.dialogs:
+                read_max_id = getattr(peer_result.dialogs[0], "read_inbox_max_id", 0)
+                return int(read_max_id) if read_max_id else None
+        except Exception:
+            logger.warning(
+                "list_messages_unread_resolve_failed dialog_id=%d — "
+                "unread filter dropped, returning all messages",
+                dialog_id,
+                exc_info=True,
+            )
+        return None
+
+    def _list_messages_from_db(
+        self,
+        *,
+        dialog_id: int,
+        limit: int,
+        direction: str,
+        direction_enum: HistoryDirection,
+        anchor_msg_id: int | None,
+        sender_id: int | None,
+        sender_name: str | None,
+        topic_id: int | None,
+        unread_after_id: int | None,
+    ) -> dict:
+        """Read messages from sync.db using the dynamic query builder."""
+        sql, params = _build_list_messages_query(
+            dialog_id=dialog_id,
+            limit=limit,
+            direction=direction,
+            anchor_msg_id=anchor_msg_id,
+            sender_id=sender_id,
+            sender_name=sender_name,
+            topic_id=topic_id,
+            unread_after_id=unread_after_id,
+        )
+        rows = self._conn.execute(sql, params).fetchall()
+        messages = [
+            {
+                "message_id": r[0],
+                "sent_at": r[1],
+                "text": r[2],
+                "sender_id": r[3],
+                "sender_first_name": r[4],
+                "media_description": r[5],
+                "reply_to_msg_id": r[6],
+                "forum_topic_id": r[7],
+                "reactions": r[8],
+                "is_deleted": r[9],
+                "deleted_at": r[10],
+                "edit_date": r[11],
+                "topic_title": r[12],
+            }
+            for r in rows
+        ]
+        next_nav = self._maybe_encode_next_nav(
+            messages, limit, dialog_id, direction, direction_enum,
+        )
+        return {
+            "ok": True,
+            "data": {"messages": messages, "source": "sync_db", "next_navigation": next_nav},
+        }
+
+    async def _list_messages_from_telegram(
+        self,
+        *,
+        dialog_id: int,
+        limit: int,
+        direction: str,
+        direction_enum: HistoryDirection,
+        anchor_msg_id: int | None,
+        sender_id: int | None,
+        topic_id: int | None,
+        unread_after_id: int | None,
+    ) -> dict:
+        """Fetch messages on-demand from Telegram API."""
+        logger.debug("list_messages_fallback_telegram dialog_id=%d", dialog_id)
+        iter_kwargs: dict = {
+            k: v
+            for k, v in {
+                "limit": limit,
+                "offset_id": anchor_msg_id,
+                "from_user": sender_id,
+                "reply_to": topic_id,
+                "min_id": unread_after_id,
+                "reverse": True if direction == "oldest" else None,
+            }.items()
+            if v is not None
+        }
+
+        messages: list[dict] = []
+        try:
+            async for msg in self._client.iter_messages(dialog_id, **iter_kwargs):
+                messages.append(self._msg_to_dict(msg))
+        except Exception as exc:
+            logger.warning(
+                "list_messages_telegram_error dialog_id=%d error=%s",
+                dialog_id, exc, exc_info=True,
+            )
+            return {"ok": False, "error": "telegram_error", "message": "failed to fetch messages"}
+
+        next_nav = self._maybe_encode_next_nav(
+            messages, limit, dialog_id, direction, direction_enum,
+        )
+        return {
+            "ok": True,
+            "data": {"messages": messages, "source": "telegram", "next_navigation": next_nav},
+        }
+
+    # ------------------------------------------------------------------
+    # list_messages — main handler
     # ------------------------------------------------------------------
 
     async def _list_messages(self, req: dict) -> dict:
@@ -600,7 +744,7 @@ class DaemonAPIServer:
           topic_id        int — filter by forum_topic_id
           unread_after_id int — filter message_id > X
           unread          bool — auto-resolve read position via GetPeerDialogsRequest
-          navigation      str — opaque base64 cursor from next_navigation
+          navigation      str — opaque base64 cursor or "newest"/"oldest" sentinel
 
         Response on success:
           {"ok": True, "data": {"messages": [...], "source": "sync_db"|"telegram",
@@ -623,7 +767,6 @@ class DaemonAPIServer:
         unread_after_id: int | None = req.get("unread_after_id")
         unread: bool = bool(req.get("unread"))
 
-        # Validate direction
         if direction not in ("newest", "oldest"):
             direction = "newest"
 
@@ -639,7 +782,7 @@ class DaemonAPIServer:
                 "message": "Either dialog_id or dialog name is required",
             }
 
-        # Navigation token handling — decode cursor and override direction
+        # Decode navigation cursor and override direction
         anchor_msg_id: int | None = None
         if navigation and navigation not in ("newest", "oldest"):
             try:
@@ -671,117 +814,35 @@ class DaemonAPIServer:
             HistoryDirection.OLDEST if direction == "oldest" else HistoryDirection.NEWEST
         )
 
-        # Resolve unread_after_id from Telegram read position when unread=True
-        if unread and unread_after_id is None:
-            try:
-                from telethon.tl.functions.messages import (  # type: ignore[import-untyped]
-                    GetPeerDialogsRequest,
-                )
-                peer_result = await self._client(GetPeerDialogsRequest(peers=[dialog_id]))
-                if peer_result.dialogs:
-                    read_max_id = getattr(peer_result.dialogs[0], "read_inbox_max_id", 0)
-                    unread_after_id = int(read_max_id) if read_max_id else None
-            except Exception:
-                logger.warning(
-                    "list_messages_unread_resolve_failed dialog_id=%d — "
-                    "unread filter dropped, returning all messages",
-                    dialog_id,
-                    exc_info=True,
-                )
+        if unread:
+            unread_after_id = await self._resolve_unread_position(dialog_id, unread_after_id)
 
-        # Check sync status
         row = self._conn.execute(_SELECT_SYNC_STATUS_SQL, (dialog_id,)).fetchone()
         status = row[0] if row is not None else None
 
         if status in ("synced", "syncing"):
-            # Read from sync.db using dynamic query builder
-            sql, params = _build_list_messages_query(
+            return self._list_messages_from_db(
                 dialog_id=dialog_id,
                 limit=limit,
                 direction=direction,
+                direction_enum=direction_enum,
                 anchor_msg_id=anchor_msg_id,
                 sender_id=sender_id,
                 sender_name=sender_name,
                 topic_id=topic_id,
                 unread_after_id=unread_after_id,
             )
-            rows = self._conn.execute(sql, params).fetchall()
-            messages = [
-                {
-                    "message_id": r[0],
-                    "sent_at": r[1],
-                    "text": r[2],
-                    "sender_id": r[3],
-                    "sender_first_name": r[4],
-                    "media_description": r[5],
-                    "reply_to_msg_id": r[6],
-                    "forum_topic_id": r[7],
-                    "reactions": r[8],
-                    "is_deleted": r[9],
-                    "deleted_at": r[10],
-                    "edit_date": r[11],
-                    "topic_title": r[12],
-                }
-                for r in rows
-            ]
-            next_nav: str | None = None
-            if messages and len(messages) == limit:
-                last_msg_id = messages[-1]["message_id"]
-                next_nav = encode_history_navigation(
-                    last_msg_id, dialog_id, direction=direction_enum
-                )
-                logger.debug(
-                    "list_messages_pagination anchor_msg_id=%d dialog_id=%d direction=%s",
-                    last_msg_id, dialog_id, direction,
-                )
-            return {
-                "ok": True,
-                "data": {"messages": messages, "source": "sync_db", "next_navigation": next_nav},
-            }
 
-        # On-demand fetch from Telegram
-        logger.debug("list_messages_fallback_telegram dialog_id=%d", dialog_id)
-        iter_kwargs: dict = {
-            k: v
-            for k, v in {
-                "limit": limit,
-                "offset_id": anchor_msg_id,
-                "from_user": sender_id,
-                "reply_to": topic_id,
-                "min_id": unread_after_id,
-                "reverse": True if direction == "oldest" else None,
-            }.items()
-            if v is not None
-        }
-
-        messages = []
-        try:
-            async for msg in self._client.iter_messages(dialog_id, **iter_kwargs):
-                messages.append(self._msg_to_dict(msg))
-        except Exception as exc:
-            logger.warning(
-                "list_messages_telegram_error dialog_id=%d error=%s",
-                dialog_id,
-                exc,
-                exc_info=True,
-            )
-            return {"ok": False, "error": "telegram_error", "message": "failed to fetch messages"}
-
-        next_nav = None
-        if messages and len(messages) == limit:
-            last_msg_id = messages[-1]["message_id"]
-            next_nav = encode_history_navigation(
-                last_msg_id, dialog_id, direction=direction_enum
-            )
-            logger.debug(
-                "list_messages_pagination anchor_msg_id=%d dialog_id=%d direction=%s",
-                last_msg_id, dialog_id, direction,
-            )
-
-        return {
-            "ok": True,
-            "data": {"messages": messages, "source": "telegram", "next_navigation": next_nav},
-        }
+        return await self._list_messages_from_telegram(
+            dialog_id=dialog_id,
+            limit=limit,
+            direction=direction,
+            direction_enum=direction_enum,
+            anchor_msg_id=anchor_msg_id,
+            sender_id=sender_id,
+            topic_id=topic_id,
+            unread_after_id=unread_after_id,
+        )
 
     # ------------------------------------------------------------------
     # search_messages
