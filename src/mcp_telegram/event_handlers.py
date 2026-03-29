@@ -113,7 +113,7 @@ class EventHandlerManager:
 
         Must be called BEFORE FullSyncWorker starts (CONTEXT.md D-06) to
         ensure no real-time messages are missed during initial bulk fetch.
-        INSERT OR REPLACE handles overlap idempotently (D-07).
+        INSERT OR REPLACE handles overlap idempotently.
         """
         self._refresh_synced_dialogs()
         self._client.add_event_handler(self.on_new_message, events.NewMessage)
@@ -146,8 +146,8 @@ class EventHandlerManager:
     async def on_new_message(self, event: Any) -> None:
         """Handle a NewMessage event: INSERT OR REPLACE into messages table.
 
-        Silently ignores events for dialogs not in synced_dialogs (D-08).
-        Updates synced_dialogs.last_event_at in the same transaction (D-15).
+        Silently ignores events for dialogs not in synced_dialogs.
+        Updates synced_dialogs.last_event_at in the same transaction.
         """
         dialog_id = event.chat_id
         if dialog_id is None or dialog_id not in self._synced_dialog_ids:
@@ -251,7 +251,7 @@ class EventHandlerManager:
 
         chat_id is None for DMs and small groups (MTProto limitation).
         Those cases are handled by run_dm_gap_scan().
-        Preserves the last known text column (SYNC-05 requirement).
+        Preserves the last known text column.
         Only updates rows where is_deleted=0 to avoid re-stamping deleted_at.
         """
         dialog_id = event.chat_id
@@ -281,7 +281,7 @@ class EventHandlerManager:
             logger.exception("event_delete_failed dialog_id=%s", dialog_id)
 
     # ------------------------------------------------------------------
-    # DM gap scan (DAEMON-10 / D-13 / D-14)
+    # DM gap scan
     # ------------------------------------------------------------------
 
     async def run_dm_gap_scan(self) -> int:

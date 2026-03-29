@@ -14,7 +14,7 @@ _CURRENT_SCHEMA_VERSION = 5
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# DDL constants (mirror cache.py uppercase DDL pattern)
+# DDL constants
 # ---------------------------------------------------------------------------
 
 _SYNCED_DIALOGS_DDL = """

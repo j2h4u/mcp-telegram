@@ -1,4 +1,4 @@
-"""Daemon API server — Unix socket request dispatcher (Plan 29-01, Task 2).
+"""Daemon API server — Unix socket request dispatcher.
 
 DaemonAPIServer listens on a Unix domain socket and handles fourteen methods:
   - list_messages: read from sync.db (synced dialogs) or Telegram (on-demand)
@@ -9,12 +9,12 @@ DaemonAPIServer listens on a Unix domain socket and handles fourteen methods:
   - mark_dialog_for_sync: add/remove dialog from sync scope
   - get_sync_status: sync status and message statistics for a dialog
   - get_sync_alerts: deleted messages, edit history, access-lost dialogs
-  - get_user_info: user profile and common chats (Plan 32-01)
-  - list_unread_messages: prioritized unread messages across dialogs (Plan 32-01)
-  - record_telemetry: write telemetry event to sync.db (Plan 33-01)
-  - get_usage_stats: read usage statistics from sync.db (Plan 33-01)
-  - upsert_entities: batch upsert entities into sync.db (Plan 33-01)
-  - resolve_entity: fuzzy entity resolution from sync.db (Plan 33-01)
+  - get_user_info: user profile and common chats
+  - list_unread_messages: prioritized unread messages across dialogs
+  - record_telemetry: write telemetry event to sync.db
+  - get_usage_stats: read usage statistics from sync.db
+  - upsert_entities: batch upsert entities into sync.db
+  - resolve_entity: fuzzy entity resolution from sync.db
 
 Protocol: newline-delimited JSON (one request line → one response line).
 
@@ -133,7 +133,7 @@ _GET_ACCESS_LOST_ALERTS_SQL = (
     "FROM synced_dialogs WHERE status = 'access_lost' AND access_lost_at > ?"
 )
 
-# Entity / telemetry SQL (Plan 33-01)
+# Entity / telemetry SQL
 _UPSERT_ENTITY_SQL = (
     "INSERT OR REPLACE INTO entities "
     "(id, type, name, username, name_normalized, updated_at) "
@@ -1329,7 +1329,7 @@ class DaemonAPIServer:
         return groups
 
     # ------------------------------------------------------------------
-    # record_telemetry (Plan 33-01)
+    # record_telemetry
     # ------------------------------------------------------------------
 
     async def _record_telemetry(self, req: dict) -> dict:
@@ -1362,7 +1362,7 @@ class DaemonAPIServer:
             return {"ok": False, "error": "internal", "message": "internal error"}
 
     # ------------------------------------------------------------------
-    # get_usage_stats (Plan 33-01)
+    # get_usage_stats
     # ------------------------------------------------------------------
 
     async def _get_usage_stats(self, req: dict) -> dict:
@@ -1376,7 +1376,7 @@ class DaemonAPIServer:
             return {"ok": False, "error": "internal", "message": "internal error"}
 
     # ------------------------------------------------------------------
-    # upsert_entities (Plan 33-01)
+    # upsert_entities
     # ------------------------------------------------------------------
 
     async def _upsert_entities(self, req: dict) -> dict:
@@ -1409,7 +1409,7 @@ class DaemonAPIServer:
             return {"ok": False, "error": "internal", "message": "internal error"}
 
     # ------------------------------------------------------------------
-    # resolve_entity (Plan 33-01)
+    # resolve_entity
     # ------------------------------------------------------------------
 
     async def _resolve_entity(self, req: dict) -> dict:

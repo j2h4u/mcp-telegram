@@ -1,4 +1,4 @@
-"""FTS stemming engine for mcp-telegram (SYNC-07).
+"""FTS stemming engine for mcp-telegram.
 
 Provides Russian morphological stemming via snowballstemmer so that FTS5
 searches match words regardless of case form, number, or tense.

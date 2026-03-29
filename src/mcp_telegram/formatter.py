@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
+import telethon.tl.types as tl  # type: ignore[import-untyped]
+
 from .models import LinePrefixGetter, MessageLike, TopicNameGetter
 
 # Messages separated by more than this gap get a visual session break marker.
@@ -238,75 +240,69 @@ def _describe_media(media: object) -> str:
     Covers all common Telegram media types explicitly; falls back to
     '[медиа: ClassName]' for unknown types so they are still distinguishable.
     """
-    try:
-        import telethon.tl.types as tl  # type: ignore[import-untyped]  # noqa: PLC0415
+    if isinstance(media, tl.MessageMediaEmpty):
+        return ""
 
-        if isinstance(media, tl.MessageMediaEmpty):
-            return ""
+    if isinstance(media, tl.MessageMediaPhoto):
+        return "[фото]"
 
-        if isinstance(media, tl.MessageMediaPhoto):
-            return "[фото]"
+    if isinstance(media, tl.MessageMediaDocument):
+        return _describe_document(media)
 
-        if isinstance(media, tl.MessageMediaDocument):
-            return _describe_document(media)
+    if isinstance(media, tl.MessageMediaPoll):
+        question = _safe_attr_chain(media, "poll", "question")
+        q_text = (
+            getattr(question, "text", None) or str(question)
+            if question is not None else None
+        )
+        return f"[опрос: «{q_text}»]" if q_text else "[опрос]"
 
-        if isinstance(media, tl.MessageMediaPoll):
-            question = _safe_attr_chain(media, "poll", "question")
-            q_text = (
-                getattr(question, "text", None) or str(question)
-                if question is not None else None
-            )
-            return f"[опрос: «{q_text}»]" if q_text else "[опрос]"
+    if isinstance(media, tl.MessageMediaGeoLive):
+        return "[геолокация live]"
 
-        if isinstance(media, tl.MessageMediaGeoLive):
-            return "[геолокация live]"
+    if isinstance(media, tl.MessageMediaGeo):
+        lat = _safe_attr_chain(media, "geo", "lat")
+        lon = _safe_attr_chain(media, "geo", "long")
+        if lat is not None and lon is not None:
+            return f"[геолокация: {lat:.4f}, {lon:.4f}]"
+        return "[геолокация]"
 
-        if isinstance(media, tl.MessageMediaGeo):
-            lat = _safe_attr_chain(media, "geo", "lat")
-            lon = _safe_attr_chain(media, "geo", "long")
-            if lat is not None and lon is not None:
-                return f"[геолокация: {lat:.4f}, {lon:.4f}]"
-            return "[геолокация]"
+    if isinstance(media, tl.MessageMediaVenue):
+        title = getattr(media, "title", None)
+        address = getattr(media, "address", None)
+        info = ", ".join(filter(None, [title, address]))
+        return f"[место: {info}]" if info else "[место]"
 
-        if isinstance(media, tl.MessageMediaVenue):
-            title = getattr(media, "title", None)
-            address = getattr(media, "address", None)
-            info = ", ".join(filter(None, [title, address]))
-            return f"[место: {info}]" if info else "[место]"
+    if isinstance(media, tl.MessageMediaContact):
+        first = getattr(media, "first_name", "") or ""
+        last = getattr(media, "last_name", "") or ""
+        name = " ".join(filter(None, [first, last]))
+        phone = getattr(media, "phone_number", "") or ""
+        info = ", ".join(filter(None, [name, phone]))
+        return f"[контакт: {info}]" if info else "[контакт]"
 
-        if isinstance(media, tl.MessageMediaContact):
-            first = getattr(media, "first_name", "") or ""
-            last = getattr(media, "last_name", "") or ""
-            name = " ".join(filter(None, [first, last]))
-            phone = getattr(media, "phone_number", "") or ""
-            info = ", ".join(filter(None, [name, phone]))
-            return f"[контакт: {info}]" if info else "[контакт]"
+    if isinstance(media, tl.MessageMediaDice):
+        emoticon = getattr(media, "emoticon", "🎲") or "🎲"
+        value = getattr(media, "value", None)
+        return f"[{emoticon} {value}]" if value is not None else f"[{emoticon}]"
 
-        if isinstance(media, tl.MessageMediaDice):
-            emoticon = getattr(media, "emoticon", "🎲") or "🎲"
-            value = getattr(media, "value", None)
-            return f"[{emoticon} {value}]" if value is not None else f"[{emoticon}]"
+    if isinstance(media, tl.MessageMediaGame):
+        title = _safe_attr_chain(media, "game", "title")
+        return f"[игра: {title}]" if title else "[игра]"
 
-        if isinstance(media, tl.MessageMediaGame):
-            title = _safe_attr_chain(media, "game", "title")
-            return f"[игра: {title}]" if title else "[игра]"
+    if isinstance(media, tl.MessageMediaStory):
+        return "[история]"
 
-        if isinstance(media, tl.MessageMediaStory):
-            return "[история]"
+    if isinstance(media, tl.MessageMediaInvoice):
+        title = getattr(media, "title", None)
+        return f"[счёт: {title}]" if title else "[счёт]"
 
-        if isinstance(media, tl.MessageMediaInvoice):
-            title = getattr(media, "title", None)
-            return f"[счёт: {title}]" if title else "[счёт]"
+    if isinstance(media, tl.MessageMediaWebPage):
+        url = _safe_attr_chain(media, "webpage", "url")
+        return f"[ссылка: {url}]" if url else "[ссылка]"
 
-        if isinstance(media, tl.MessageMediaWebPage):
-            url = _safe_attr_chain(media, "webpage", "url")
-            return f"[ссылка: {url}]" if url else "[ссылка]"
-
-        if isinstance(media, tl.MessageMediaUnsupported):
-            return "[неподдерживаемый тип]"
-
-    except ImportError:
-        pass
+    if isinstance(media, tl.MessageMediaUnsupported):
+        return "[неподдерживаемый тип]"
 
     return f"[медиа: {type(media).__name__}]"
 
@@ -317,61 +313,55 @@ def _describe_document(media: object) -> str:
     Priority order: sticker > round video > animation > audio > regular video > filename.
     Sticker checked first because sticker packs can carry a duration attribute.
     """
-    try:
-        import telethon.tl.types as tl  # type: ignore[import-untyped]  # noqa: PLC0415
+    doc = getattr(media, "document", None)
+    if doc is None:
+        return "[документ]"
+    attrs = getattr(doc, "attributes", []) or []
 
-        doc = getattr(media, "document", None)
-        if doc is None:
-            return "[документ]"
-        attrs = getattr(doc, "attributes", []) or []
+    has_animated = False
+    video_attr = None
+    audio_attr = None
+    filename_attr = None
 
-        has_animated = False
-        video_attr = None
-        audio_attr = None
-        filename_attr = None
+    for attr in attrs:
+        if isinstance(attr, tl.DocumentAttributeSticker):
+            alt = getattr(attr, "alt", "") or ""
+            return f"[стикер: {alt}]" if alt else "[стикер]"
+        if isinstance(attr, tl.DocumentAttributeVideo):
+            if getattr(attr, "round_message", False):
+                dur = getattr(attr, "duration", 0) or 0
+                m, s = divmod(int(dur), 60)
+                return f"[кружок: {m}:{s:02d}]"
+            video_attr = attr
+        elif isinstance(attr, tl.DocumentAttributeAnimated):
+            has_animated = True
+        elif isinstance(attr, tl.DocumentAttributeAudio):
+            audio_attr = attr
+        elif isinstance(attr, tl.DocumentAttributeFilename):
+            filename_attr = attr
 
-        for attr in attrs:
-            if isinstance(attr, tl.DocumentAttributeSticker):
-                alt = getattr(attr, "alt", "") or ""
-                return f"[стикер: {alt}]" if alt else "[стикер]"
-            if isinstance(attr, tl.DocumentAttributeVideo):
-                if getattr(attr, "round_message", False):
-                    dur = getattr(attr, "duration", 0) or 0
-                    m, s = divmod(int(dur), 60)
-                    return f"[кружок: {m}:{s:02d}]"
-                video_attr = attr
-            elif isinstance(attr, tl.DocumentAttributeAnimated):
-                has_animated = True
-            elif isinstance(attr, tl.DocumentAttributeAudio):
-                audio_attr = attr
-            elif isinstance(attr, tl.DocumentAttributeFilename):
-                filename_attr = attr
+    if has_animated:
+        return "[анимация]"
 
-        if has_animated:
-            return "[анимация]"
+    if audio_attr is not None:
+        dur = getattr(audio_attr, "duration", 0) or 0
+        m, s = divmod(int(dur), 60)
+        if getattr(audio_attr, "voice", False):
+            return f"[голосовое: {m}:{s:02d}]"
+        title = getattr(audio_attr, "title", None)
+        performer = getattr(audio_attr, "performer", None)
+        info = " — ".join(filter(None, [performer, title]))
+        return f"[аудио: {info}, {m}:{s:02d}]" if info else f"[аудио: {m}:{s:02d}]"
 
-        if audio_attr is not None:
-            dur = getattr(audio_attr, "duration", 0) or 0
-            m, s = divmod(int(dur), 60)
-            if getattr(audio_attr, "voice", False):
-                return f"[голосовое: {m}:{s:02d}]"
-            title = getattr(audio_attr, "title", None)
-            performer = getattr(audio_attr, "performer", None)
-            info = " — ".join(filter(None, [performer, title]))
-            return f"[аудио: {info}, {m}:{s:02d}]" if info else f"[аудио: {m}:{s:02d}]"
+    if video_attr is not None:
+        dur = getattr(video_attr, "duration", 0) or 0
+        m, s = divmod(int(dur), 60)
+        return f"[видео: {m}:{s:02d}]"
 
-        if video_attr is not None:
-            dur = getattr(video_attr, "duration", 0) or 0
-            m, s = divmod(int(dur), 60)
-            return f"[видео: {m}:{s:02d}]"
-
-        if filename_attr is not None:
-            size = getattr(doc, "size", None)
-            size_str = f", {size // 1024}KB" if size else ""
-            return f"[документ: {filename_attr.file_name}{size_str}]"
-
-    except ImportError:
-        pass
+    if filename_attr is not None:
+        size = getattr(doc, "size", None)
+        size_str = f", {size // 1024}KB" if size else ""
+        return f"[документ: {filename_attr.file_name}{size_str}]"
 
     return "[документ]"
 

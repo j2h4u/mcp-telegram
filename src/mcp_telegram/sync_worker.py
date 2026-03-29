@@ -2,18 +2,17 @@
 
 Fetches all historical messages for marked dialogs in batches of 100,
 checkpointing progress after each batch so restarts resume without
-re-scanning from scratch (DAEMON-03/DAEMON-04).
+re-scanning from scratch.
 
 FloodWait causes an interruptible sleep — progress is never lost on
-rate limits (DAEMON-05).
+rate limits.
 
-DM bootstrap auto-enrolls all User-type dialogs at daemon startup
-(DAEMON-06/DAEMON-07).
+DM bootstrap auto-enrolls all User-type dialogs at daemon startup.
 
 Architecture:
 - Standalone module so daemon.py stays focused on process lifecycle.
 - FullSyncWorker is a stateful class instantiated once per daemon run.
-- Plugs into daemon.py sync_main() between heartbeat ticks (DAEMON-10).
+- Plugs into daemon.py sync_main() between heartbeat ticks.
 """
 from __future__ import annotations
 
@@ -242,7 +241,7 @@ class FullSyncWorker:
         """
         pending = self._next_pending_dialog()
         if pending is None:
-            return True  # nothing to do — all synced (D-11)
+            return True  # nothing to do — all synced
 
         dialog_id, sync_progress = pending
         _, is_done = await self._fetch_batch(dialog_id, sync_progress)
@@ -258,7 +257,7 @@ class FullSyncWorker:
     def _next_pending_dialog(self) -> tuple[int, int] | None:
         """Return (dialog_id, sync_progress) for the next pending dialog.
 
-        Selects in rowid (insertion) order — no prioritization (D-09).
+        Selects in rowid (insertion) order — no prioritization.
         Returns None when no dialogs have status in ('syncing', 'not_synced').
         """
         row = self._conn.execute(_NEXT_PENDING_SQL).fetchone()
@@ -272,7 +271,7 @@ class FullSyncWorker:
         """Fetch up to 100 messages for dialog_id older than sync_progress.
 
         Uses offset_id=sync_progress (exclusive) so each batch fetches
-        messages strictly older than the last committed checkpoint (D-04).
+        messages strictly older than the last committed checkpoint.
         After a full batch (100 msgs), sync_progress advances to the min
         message_id; a partial or empty batch marks the dialog 'synced'.
 
@@ -320,7 +319,7 @@ class FullSyncWorker:
             return sync_progress, False  # leave dialog in-progress for retry
 
         if not batch:
-            # No more messages — dialog fully synced (Pitfall 3)
+            # No more messages — dialog fully synced
             self._conn.execute(
                 _UPDATE_PROGRESS_SQL, (sync_progress, "synced", dialog_id)
             )
@@ -330,10 +329,10 @@ class FullSyncWorker:
 
         rows = [extract_message_row(dialog_id, msg) for msg in batch]
         new_progress = min(int(getattr(msg, "id", 0)) for msg in batch)
-        is_done = len(batch) < 100  # partial batch = last batch (Pitfall 3)
+        is_done = len(batch) < 100  # partial batch = last batch
         new_status = "synced" if is_done else "syncing"
 
-        # Single atomic transaction: messages + FTS + progress update (D-05)
+        # Single atomic transaction: messages + FTS + progress update
         with self._conn:
             insert_messages_with_fts(self._conn, rows)
             self._conn.execute(

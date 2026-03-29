@@ -4,7 +4,7 @@ Started via ``mcp-telegram sync``. Connects to Telegram, ensures sync.db schema,
 bootstraps DM dialogs, then runs FullSyncWorker in a tight batch loop with
 periodic heartbeat logging and clean SIGTERM handling.
 
-Architecture (DAEMON-01 / DAEMON-02):
+Architecture:
 - sync-daemon is the sole owner of TelegramClient — connects once, holds it.
 - MCP server runs separately with disable_telegram_session() active and reads
   sync.db via open_sync_db_reader(); it never calls client.connect().

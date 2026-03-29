@@ -72,7 +72,7 @@ def create_client(
     Docker deployment model — there is no per-request session isolation.
 
     ``catch_up=True`` enables Telethon's PTS-based missed-update replay on connect
-    (D-05).  The sync-daemon passes ``catch_up=True``; the MCP server never calls
+    The sync-daemon passes ``catch_up=True``; the MCP server never calls
     ``create_client()`` directly (session guard disables it), so there is no
     cache-key collision in practice.
     """
