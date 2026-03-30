@@ -77,9 +77,9 @@ async def get_user_info(args: GetUserInfo) -> ToolResult:
         error_code = response.get("error", "")
         if error_code == "user_not_found":
             return ToolResult(content=_text_response(
-                fetch_user_info_error_text(args.user, "user not found by daemon")
+                fetch_user_info_error_text(args.user, "user not found")
             ))
-        error_msg = response.get("message", "Daemon returned an error.")
+        error_msg = response.get("message", "Request failed.")
         return ToolResult(content=_text_response(f"Error: {error_msg}"))
 
     data = response.get("data", {})

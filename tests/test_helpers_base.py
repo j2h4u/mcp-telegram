@@ -28,7 +28,7 @@ def test_check_daemon_response_error_returns_tool_result():
 def test_check_daemon_response_missing_message_uses_default():
     result = _check_daemon_response({"ok": False})
     assert isinstance(result, ToolResult)
-    assert "Daemon returned an error" in result.content[0].text
+    assert "Request failed" in result.content[0].text
 
 
 def test_check_daemon_response_passes_extra_kwargs():

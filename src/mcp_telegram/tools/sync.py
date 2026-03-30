@@ -20,10 +20,9 @@ logger = logging.getLogger(__name__)
 
 
 class MarkDialogForSync(ToolArgs):
-    """Mark or unmark a dialog for persistent sync. When marked, the sync daemon begins
-    fetching all messages within its next polling cycle (up to 60 seconds). Unmarking
-    preserves existing synced history but stops further sync. Use ListDialogs to find
-    dialog IDs and current sync_status."""
+    """Mark or unmark a dialog for persistent sync. When marked, full message history
+    will be fetched shortly. Unmarking preserves existing synced history but stops
+    further sync. Use ListDialogs to find dialog IDs and current sync_status."""
 
     dialog_id: int = Field(description="Numeric dialog ID from ListDialogs")
     enable: bool = Field(default=True, description="True to start syncing, False to stop")

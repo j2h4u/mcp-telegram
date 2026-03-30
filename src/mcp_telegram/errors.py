@@ -184,7 +184,7 @@ def usage_stats_query_error_text(error_type: str) -> str:
     """Return an action-oriented response for usage-stats query failures."""
     return action_text(
         f"Could not query usage stats ({error_type}).",
-        "Retry GetUsageStats later. If the error persists, inspect analytics.db initialization and schema.",
+        "Retry GetUsageStats later.",
     )
 
 

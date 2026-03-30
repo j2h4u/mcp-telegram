@@ -37,7 +37,7 @@ def _text_response(text: str) -> list[TextContent]:
 def _daemon_not_running_text() -> str:
     """Return user-facing error message when the sync daemon is not running."""
     return (
-        "Sync daemon is not running.\n"
+        "Telegram backend is not running.\n"
         "Action: Start it with: mcp-telegram sync"
     )
 
@@ -49,7 +49,7 @@ def _check_daemon_response(response: dict, **extra_kwargs) -> "ToolResult | None
     """
     if response.get("ok"):
         return None
-    error_detail = response.get("message", "Daemon returned an error.")
+    error_detail = response.get("message", "Request failed.")
     return ToolResult(content=_text_response(f"Error: {error_detail}"), **extra_kwargs)
 
 

@@ -122,7 +122,7 @@ async def list_topics(args: ListTopics) -> ToolResult:
 
     if not response.get("ok"):
         error_code = response.get("error", "")
-        error_msg = response.get("message", "Daemon returned an error.")
+        error_msg = response.get("message", "Request failed.")
         if error_code == "dialog_not_found":
             from ..errors import dialog_not_found_text
             return ToolResult(
