@@ -160,6 +160,7 @@ class EventHandlerManager:
 
             with self._conn:
                 self._conn.execute(INSERT_MESSAGE_SQL, row)
+                self._conn.execute(DELETE_FTS_SQL, (dialog_id, int(getattr(msg, "id", 0))))
                 self._conn.execute(
                     INSERT_FTS_SQL,
                     (dialog_id, int(getattr(msg, "id", 0)), stem_text(getattr(msg, "message", None))),
@@ -200,6 +201,7 @@ class EventHandlerManager:
                     # historical versions are lost (acceptable).
                     row = extract_message_row(dialog_id, msg)
                     self._conn.execute(INSERT_MESSAGE_SQL, row)
+                    self._conn.execute(DELETE_FTS_SQL, (dialog_id, message_id))
                     self._conn.execute(
                         INSERT_FTS_SQL, (dialog_id, message_id, stem_text(new_text))
                     )

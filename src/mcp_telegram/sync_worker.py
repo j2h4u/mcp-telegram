@@ -36,7 +36,7 @@ from telethon.errors import (  # type: ignore[import-untyped]
 )
 from telethon.tl import types  # type: ignore[import-untyped]
 
-from .fts import INSERT_FTS_SQL, stem_text
+from .fts import DELETE_FTS_SQL, INSERT_FTS_SQL, stem_text
 
 logger = logging.getLogger(__name__)
 
@@ -55,8 +55,17 @@ INSERT_MESSAGE_SQL = (
 def insert_messages_with_fts(
     conn: sqlite3.Connection, rows: list[tuple[object, ...]],
 ) -> None:
-    """Insert message rows and their FTS index entries atomically."""
+    """Insert message rows and their FTS index entries atomically.
+
+    Uses DELETE-then-INSERT for FTS because FTS5 virtual tables have no
+    primary key — a plain INSERT would create duplicates if the message
+    was already indexed by the real-time event handler.
+    """
     conn.executemany(INSERT_MESSAGE_SQL, rows)
+    conn.executemany(
+        DELETE_FTS_SQL,
+        ((row[0], row[1]) for row in rows),  # type: ignore[arg-type]
+    )
     conn.executemany(
         INSERT_FTS_SQL,
         ((row[0], row[1], stem_text(row[3])) for row in rows),  # type: ignore[arg-type]

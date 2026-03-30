@@ -13,8 +13,8 @@ Design:
 - Module-level stemmer is created once (thread-safe for reads).
 - _WORD_RE extracts Cyrillic, Latin, and digit tokens; punctuation is
   silently dropped (matches FTS5 unicode61 tokenizer behaviour).
-- backfill_fts_index() is a one-shot utility called after schema v3
-  migration to populate the table from existing messages rows.
+- backfill_fts_index() runs on every daemon startup and indexes only
+  messages missing from the FTS table (idempotent, no duplicates).
 """
 from __future__ import annotations
 
@@ -42,7 +42,7 @@ MESSAGES_FTS_DDL = (
 )
 
 INSERT_FTS_SQL = (
-    "INSERT OR REPLACE INTO messages_fts(dialog_id, message_id, stemmed_text) "
+    "INSERT INTO messages_fts(dialog_id, message_id, stemmed_text) "
     "VALUES (?, ?, ?)"
 )
 
@@ -91,16 +91,24 @@ def stem_query(query: str) -> str:
 
 
 def backfill_fts_index(conn: sqlite3.Connection) -> int:
-    """Populate messages_fts from all non-deleted rows in messages.
+    """Index messages that are missing from messages_fts.
 
-    Runs in a single transaction.  Safe to call on a fresh database (no
-    messages rows) — returns 0 in that case.
+    Only inserts rows where the (dialog_id, message_id) pair has no
+    corresponding FTS entry — safe to call on every daemon startup without
+    creating duplicates.  Returns 0 when the index is fully caught up.
 
     Returns the number of rows inserted.
     """
     rows = conn.execute(
-        "SELECT dialog_id, message_id, text FROM messages WHERE is_deleted = 0"
+        "SELECT m.dialog_id, m.message_id, m.text "
+        "FROM messages m "
+        "LEFT JOIN messages_fts f "
+        "  ON f.dialog_id = m.dialog_id AND f.message_id = m.message_id "
+        "WHERE m.is_deleted = 0 AND f.message_id IS NULL"
     ).fetchall()
+
+    if not rows:
+        return 0
 
     with conn:
         conn.executemany(
