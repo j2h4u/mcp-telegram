@@ -161,8 +161,8 @@ async def _resolve_topic_id(
 
     if not response.get("ok"):
         error = response.get("error", "unknown")
-        message = response.get("message", "")
-        return ToolResult(content=_text_response(f"Topic lookup failed: {error}: {message}"))
+        error_detail = response.get("message", "")
+        return ToolResult(content=_text_response(f"Topic lookup failed: {error}: {error_detail}"))
 
     topics = response.get("data", {}).get("topics", [])
     query = topic_name.lower()
@@ -249,7 +249,7 @@ async def list_messages(args: ListMessages) -> ToolResult:
 
     if not response.get("ok"):
         error = response.get("error", "unknown")
-        message = response.get("message", "")
+        error_detail = response.get("message", "")
         if error == "dialog_not_found":
             dialog_label = str(dialog_id) if dialog_id else (args.dialog or "")
             return ToolResult(
@@ -258,7 +258,7 @@ async def list_messages(args: ListMessages) -> ToolResult:
                 has_cursor=has_cursor,
             )
         return ToolResult(
-            content=_text_response(f"Error: {error}: {message}"),
+            content=_text_response(f"Error: {error}: {error_detail}"),
             has_filter=has_filter,
             has_cursor=has_cursor,
         )
@@ -361,7 +361,7 @@ async def search_messages(args: SearchMessages) -> ToolResult:
 
     if not response.get("ok"):
         error = response.get("error", "unknown")
-        message = response.get("message", "")
+        error_detail = response.get("message", "")
         if error == "dialog_not_found":
             dialog_label = str(dialog_id) if dialog_id else args.dialog
             return ToolResult(
@@ -370,7 +370,7 @@ async def search_messages(args: SearchMessages) -> ToolResult:
                 has_cursor=args.navigation is not None,
             )
         return ToolResult(
-            content=_text_response(f"Error: {error}: {message}"),
+            content=_text_response(f"Error: {error}: {error_detail}"),
             has_filter=True,
             has_cursor=args.navigation is not None,
         )

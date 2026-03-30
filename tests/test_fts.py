@@ -258,3 +258,33 @@ def test_backfill_fts_index(tmp_sync_db_path: Path) -> None:
         assert results[0][0] == 100
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# stem_query quoting hardening (S-4)
+# ---------------------------------------------------------------------------
+
+
+def test_stem_query_strips_embedded_double_quotes():
+    """stem_query must not produce unbalanced FTS5 double-quotes."""
+    result = stem_query('test')
+    assert '"' in result, "tokens should be quoted"
+    # Each token should be properly quoted — no unbalanced quotes
+    assert result.count('"') % 2 == 0
+
+
+def test_stem_query_empty_input():
+    assert stem_query("") == ""
+
+
+def test_stem_query_punctuation_only():
+    assert stem_query("!!! ???") == ""
+
+
+def test_stem_query_mixed_languages():
+    result = stem_query("hello мир")
+    assert result, "should produce stemmed tokens for mixed input"
+    # Both tokens quoted
+    parts = result.split()
+    for part in parts:
+        assert part.startswith('"') and part.endswith('"')

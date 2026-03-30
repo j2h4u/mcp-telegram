@@ -60,7 +60,7 @@ from .pagination import (
     encode_history_navigation,
     encode_search_navigation,
 )
-from .sync_worker import serialize_reactions
+from .sync_worker import extract_reply_and_topic, serialize_reactions
 from .resolver import (
     Candidates,
     NotFound,
@@ -163,9 +163,16 @@ _ALL_ENTITY_NAMES_NORMALIZED_SQL = (
 )
 _ENTITY_BY_USERNAME_SQL = "SELECT id, name FROM entities WHERE username = ?"
 
+# Column names returned by _build_list_messages_query, in SELECT order.
+_DB_MESSAGE_COLUMNS = (
+    "message_id", "sent_at", "text", "sender_id", "sender_first_name",
+    "media_description", "reply_to_msg_id", "forum_topic_id", "reactions",
+    "is_deleted", "deleted_at", "edit_date", "topic_title",
+)
+
 
 # ---------------------------------------------------------------------------
-# Dynamic SQL builder for list_messages (Phase 35-01)
+# Dynamic SQL builder for list_messages
 # ---------------------------------------------------------------------------
 
 
@@ -182,14 +189,9 @@ def _build_list_messages_query(
 ) -> tuple[str, list]:
     """Build a parameterized SELECT for list_messages against sync.db.
 
-    Returns (sql_string, params_list).  Column indices in the SELECT:
-      0  message_id         7  forum_topic_id
-      1  sent_at            8  reactions
-      2  text               9  is_deleted
-      3  sender_id         10  deleted_at
-      4  sender_first_name 11  edit_date    (MAX from message_versions subquery)
-      5  media_description 12  topic_title  (LEFT JOIN topic_metadata)
-      6  reply_to_msg_id
+    Returns (sql_string, params_list).  Column names in the SELECT match
+    the keys used by _list_messages_from_db (use conn.row_factory = sqlite3.Row
+    or unpack via _DB_MESSAGE_COLUMNS).
     """
     params: list = [dialog_id]
 
@@ -280,7 +282,7 @@ def _classify_dialog_for_unread(dialog: object) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Usage stats query (moved from tools/stats.py in Plan 33-01)
+# Usage stats query
 # ---------------------------------------------------------------------------
 
 
@@ -338,7 +340,6 @@ def _query_usage_stats(cursor: sqlite3.Cursor, since: int) -> dict:
         "tool_distribution": tool_dist,
         "error_distribution": error_dist,
         "max_page_depth": max_depth,
-        "dialogs_with_deep_scroll": 0,  # not yet computed — placeholder
         "total_calls": total_calls,
         "filter_count": filter_count,
         "latency_median_ms": latency_median_ms,
@@ -354,9 +355,8 @@ def _query_usage_stats(cursor: sqlite3.Cursor, since: int) -> dict:
 class DaemonAPIServer:
     """Unix socket server that dispatches JSON requests to Telegram/sync.db.
 
-    Instantiated once per daemon run by sync_main() (wired in Plan 29-02).
-    handle_client() is passed to asyncio.start_unix_server() as the client
-    connected callback.
+    Instantiated once per daemon run by sync_main().  handle_client() is
+    passed to asyncio.start_unix_server() as the client connected callback.
     """
 
     def __init__(
@@ -556,15 +556,7 @@ class DaemonAPIServer:
 
         reactions = serialize_reactions(getattr(msg, "reactions", None))
 
-        reply_to = getattr(msg, "reply_to", None)
-        reply_to_msg_id: int | None = None
-        forum_topic_id: int | None = None
-        if reply_to is not None:
-            raw_reply_msg_id = getattr(reply_to, "reply_to_msg_id", None)
-            reply_to_msg_id = int(raw_reply_msg_id) if raw_reply_msg_id is not None else None
-            if getattr(reply_to, "forum_topic", False):
-                reply_top_id = getattr(reply_to, "reply_to_reply_top_id", None)
-                forum_topic_id = int(reply_top_id) if reply_top_id is not None else 1
+        reply_to_msg_id, forum_topic_id = extract_reply_and_topic(msg)
 
         edit_date_raw = getattr(msg, "edit_date", None)
         edit_date: int | None = None
@@ -661,21 +653,7 @@ class DaemonAPIServer:
         )
         rows = self._conn.execute(sql, params).fetchall()
         messages = [
-            {
-                "message_id": r[0],
-                "sent_at": r[1],
-                "text": r[2],
-                "sender_id": r[3],
-                "sender_first_name": r[4],
-                "media_description": r[5],
-                "reply_to_msg_id": r[6],
-                "forum_topic_id": r[7],
-                "reactions": r[8],
-                "is_deleted": r[9],
-                "deleted_at": r[10],
-                "edit_date": r[11],
-                "topic_title": r[12],
-            }
+            dict(zip(_DB_MESSAGE_COLUMNS, r))
             for r in rows
         ]
         next_nav = self._maybe_encode_next_nav(
@@ -698,7 +676,12 @@ class DaemonAPIServer:
         topic_id: int | None,
         unread_after_id: int | None,
     ) -> dict:
-        """Fetch messages on-demand from Telegram API."""
+        """Fetch messages on-demand from Telegram API.
+
+        Note: sender_name filtering is not supported on this path (Telegram
+        iter_messages only accepts sender_id via from_user=).  The caller
+        (_list_messages) intentionally omits sender_name from iter_kwargs.
+        """
         logger.debug("list_messages_fallback_telegram dialog_id=%d%s", dialog_id, _rid())
         iter_kwargs: dict = {
             k: v
@@ -731,6 +714,49 @@ class DaemonAPIServer:
             "ok": True,
             "data": {"messages": messages, "source": "telegram", "next_navigation": next_nav},
         }
+
+    # ------------------------------------------------------------------
+    # list_messages — navigation decoding
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _decode_history_navigation(
+        navigation: str | None,
+        dialog_id: int,
+        direction: str,
+    ) -> tuple[int | None, str] | dict:
+        """Decode a history navigation token into (anchor_msg_id, direction).
+
+        Returns a (anchor_msg_id, direction) tuple on success, or an error
+        response dict on validation failure.
+        """
+        anchor_msg_id: int | None = None
+        if navigation and navigation not in ("newest", "oldest"):
+            try:
+                nav = decode_navigation_token(navigation)
+            except ValueError as exc:
+                return {"ok": False, "error": "invalid_navigation", "message": str(exc)}
+            if nav.kind != "history":
+                return {
+                    "ok": False,
+                    "error": "invalid_navigation",
+                    "message": f"Navigation token is for {nav.kind}, not history",
+                }
+            if nav.dialog_id != dialog_id:
+                return {
+                    "ok": False,
+                    "error": "invalid_navigation",
+                    "message": (
+                        f"Navigation token belongs to dialog {nav.dialog_id}, "
+                        f"not {dialog_id}"
+                    ),
+                }
+            anchor_msg_id = nav.value
+            if nav.direction is not None:
+                direction = str(nav.direction)
+        elif navigation == "oldest":
+            direction = "oldest"
+        return anchor_msg_id, direction
 
     # ------------------------------------------------------------------
     # list_messages — main handler
@@ -787,33 +813,10 @@ class DaemonAPIServer:
                 "message": "Either dialog_id or dialog name is required",
             }
 
-        # Decode navigation cursor and override direction
-        anchor_msg_id: int | None = None
-        if navigation and navigation not in ("newest", "oldest"):
-            try:
-                nav = decode_navigation_token(navigation)
-            except ValueError as exc:
-                return {"ok": False, "error": "invalid_navigation", "message": str(exc)}
-            if nav.kind != "history":
-                return {
-                    "ok": False,
-                    "error": "invalid_navigation",
-                    "message": f"Navigation token is for {nav.kind}, not history",
-                }
-            if nav.dialog_id != dialog_id:
-                return {
-                    "ok": False,
-                    "error": "invalid_navigation",
-                    "message": (
-                        f"Navigation token belongs to dialog {nav.dialog_id}, "
-                        f"not {dialog_id}"
-                    ),
-                }
-            anchor_msg_id = nav.value
-            if nav.direction is not None:
-                direction = str(nav.direction)
-        elif navigation == "oldest":
-            direction = "oldest"
+        nav_result = self._decode_history_navigation(navigation, dialog_id, direction)
+        if isinstance(nav_result, dict):
+            return nav_result
+        anchor_msg_id, direction = nav_result
 
         direction_enum = (
             HistoryDirection.OLDEST if direction == "oldest" else HistoryDirection.NEWEST
@@ -903,7 +906,12 @@ class DaemonAPIServer:
     # ------------------------------------------------------------------
 
     async def _list_dialogs(self, req: dict) -> dict:
-        """Return live dialog list from Telegram enriched with sync_status."""
+        """Return live dialog list from Telegram enriched with sync_status.
+
+        Request: exclude_archived (bool), ignore_pinned (bool).
+        Response data: {"dialogs": [{"id", "name", "type", "last_message_at",
+        "unread_count", "members", "created", "sync_status"}, ...]}.
+        """
         # Load current sync statuses for O(1) lookup
         synced_statuses: dict[int, str] = {
             row[0]: row[1]
@@ -961,7 +969,13 @@ class DaemonAPIServer:
     # ------------------------------------------------------------------
 
     async def _list_topics(self, req: dict) -> dict:
-        """Return forum topics for a dialog via Telegram API."""
+        """Return forum topics for a dialog via Telegram API.
+
+        Request: dialog_id (int) or dialog (str).
+        Response data: {"topics": [{"id", "title", "icon_emoji_id", "date"}],
+        "dialog_id": int}.
+        Errors: entity_not_found, topics_fetch_failed, missing_dialog.
+        """
         dialog_id: int = req.get("dialog_id", 0) or 0
         dialog: str | None = req.get("dialog")
 
@@ -980,7 +994,7 @@ class DaemonAPIServer:
         try:
             entity = await self._client.get_entity(dialog_id)
         except Exception as exc:
-            logger.warning("get_entity failed for dialog_id=%s: %s", dialog_id, exc)
+            logger.warning("get_entity failed for dialog_id=%s: %s%s", dialog_id, exc, _rid())
             return {
                 "ok": False,
                 "error": "entity_not_found",
@@ -1007,7 +1021,7 @@ class DaemonAPIServer:
                 for t in getattr(result, "topics", [])
             ]
         except Exception as exc:
-            logger.warning("topics fetch failed for dialog_id=%s: %s", dialog_id, exc)
+            logger.warning("topics fetch failed for dialog_id=%s: %s%s", dialog_id, exc, _rid())
             return {
                 "ok": False,
                 "error": "topics_fetch_failed",
@@ -1021,7 +1035,12 @@ class DaemonAPIServer:
     # ------------------------------------------------------------------
 
     async def _get_me(self, req: dict) -> dict:
-        """Return current user info from Telegram."""
+        """Return current user info from Telegram.
+
+        Request: no parameters.
+        Response data: {"id", "first_name", "last_name", "username"}.
+        Errors: telegram_error, not_found.
+        """
         try:
             me = await self._client.get_me()
         except Exception as exc:
@@ -1174,7 +1193,7 @@ class DaemonAPIServer:
         try:
             user = await self._client.get_entity(user_id)
         except Exception as exc:
-            logger.warning("get_entity failed for user_id=%s: %s", user_id, exc)
+            logger.warning("get_entity failed for user_id=%s: %s%s", user_id, exc, _rid())
             return {"ok": False, "error": "user_not_found", "message": "telegram API error"}
 
         # Fetch common chats (only available for user entities)
@@ -1197,7 +1216,7 @@ class DaemonAPIServer:
                     "type": chat_type,
                 })
         except Exception as exc:
-            logger.warning("get_user_info common_chats_failed user_id=%r error=%s", user_id, exc, exc_info=True)
+            logger.warning("get_user_info common_chats_failed user_id=%r error=%s%s", user_id, exc, _rid(), exc_info=True)
 
         return {
             "ok": True,
@@ -1215,7 +1234,14 @@ class DaemonAPIServer:
     # ------------------------------------------------------------------
 
     async def _list_unread_messages(self, req: dict) -> dict:
-        """Return prioritized unread messages across dialogs."""
+        """Return prioritized unread messages across dialogs.
+
+        Request: scope ("personal"|"all"), limit (int, 1-500),
+        group_size_threshold (int).
+        Response data: {"groups": [{"dialog_id", "display_name", "tier",
+        "category", "unread_count", "unread_mentions_count",
+        "messages": [{"message_id", "sent_at", "text", ...}]}]}.
+        """
         scope: str = req.get("scope", "personal")
         limit: int = _clamp(req.get("limit", 100), 1, 500)
         group_size_threshold: int = req.get("group_size_threshold", 100)
@@ -1395,7 +1421,13 @@ class DaemonAPIServer:
     # ------------------------------------------------------------------
 
     async def _get_usage_stats(self, req: dict) -> dict:
-        """Return usage statistics from sync.db telemetry_events."""
+        """Return usage statistics from sync.db telemetry_events.
+
+        Request: since (int, unix timestamp; default 30 days ago).
+        Response data: {"tool_distribution", "error_distribution",
+        "max_page_depth", "total_calls", "filter_count",
+        "latency_median_ms", "latency_p95_ms"}.
+        """
         since: int = req.get("since", int(time.time()) - 30 * 86400)
         try:
             stats = _query_usage_stats(self._conn.cursor(), since)
@@ -1409,7 +1441,13 @@ class DaemonAPIServer:
     # ------------------------------------------------------------------
 
     async def _upsert_entities(self, req: dict) -> dict:
-        """Batch upsert entity rows into sync.db entities table."""
+        """Batch upsert entity rows into sync.db entities table.
+
+        Request: entities (list of {"id": int, "type": str, "name": str,
+        "username": str|None}, max 10000).
+        Response: {"ok": true, "upserted": int} on success.
+        Errors: invalid_input (not a list or >10000), internal.
+        """
         entities = req.get("entities", [])
         if not isinstance(entities, list) or len(entities) > 10000:
             return {"ok": False, "error": "invalid_input", "message": "entities must be a list (max 10000)"}
@@ -1442,7 +1480,14 @@ class DaemonAPIServer:
     # ------------------------------------------------------------------
 
     async def _resolve_entity(self, req: dict) -> dict:
-        """Fuzzy entity resolution from sync.db entities table."""
+        """Fuzzy entity resolution from sync.db entities table.
+
+        Request: query (str — @username or fuzzy name).
+        Response data: {"result": "resolved", "entity_id", "display_name"}
+        or {"result": "candidates", "matches": [...]}
+        or {"result": "not_found", "query"}.
+        Errors: missing_query.
+        """
         query: str = req.get("query", "")
         if not query:
             return {"ok": False, "error": "missing_query"}

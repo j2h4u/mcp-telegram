@@ -42,6 +42,17 @@ def _daemon_not_running_text() -> str:
     )
 
 
+def _check_daemon_response(response: dict, **extra_kwargs) -> "ToolResult | None":
+    """Return a ToolResult with error text if response is not ok, else None.
+
+    Callers use: ``if err := _check_daemon_response(response): return err``
+    """
+    if response.get("ok"):
+        return None
+    error_detail = response.get("message", "Daemon returned an error.")
+    return ToolResult(content=_text_response(f"Error: {error_detail}"), **extra_kwargs)
+
+
 @dataclass
 class ToolResult:
     """Internal wrapper carrying MCP content plus telemetry metadata."""
@@ -76,8 +87,7 @@ def _telemetry_done_callback(task: asyncio.Task[None]) -> None:
 def _track_tool_telemetry(tool_name: str):
     """Decorator that wraps an async tool runner with timing + telemetry recording.
 
-    Must be applied BETWEEN @tool_runner.register (outer) and the function def (inner)
-    so singledispatch sees the original type annotation via __wrapped__.
+    Applied automatically by @mcp_tool() — do not use directly.
     """
     def decorator(fn):
         @functools.wraps(fn)

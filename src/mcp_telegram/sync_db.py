@@ -249,52 +249,42 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
     current = row[0] if row is not None and row[0] is not None else 0
 
-    if current < 1:
-        conn.execute(_SYNCED_DIALOGS_DDL)
-        conn.execute(_MESSAGES_DDL)
-        conn.execute(_MESSAGES_INDEX_DDL)
-        conn.execute(_MESSAGE_VERSIONS_DDL)
-        conn.execute(
-            "INSERT INTO schema_version VALUES (1, strftime('%s', 'now'))"
-        )
+    def _migrate(version: int, stmts: list[str]) -> None:
+        """Apply one migration version atomically and record it."""
+        nonlocal current
+        if current >= version:
+            return
+        try:
+            for stmt in stmts:
+                conn.execute(stmt)
+            conn.execute(
+                "INSERT INTO schema_version VALUES (?, strftime('%s', 'now'))",
+                (version,),
+            )
+            conn.commit()
+            current = version
+        except Exception:
+            conn.rollback()
+            logger.error("sync_db migration to version %d failed", version, exc_info=True)
+            raise
 
-    if current < 2:
-        conn.execute(
-            "ALTER TABLE synced_dialogs ADD COLUMN access_lost_at INTEGER"
-        )
-        conn.execute(
-            "INSERT INTO schema_version VALUES (2, strftime('%s', 'now'))"
-        )
+    _migrate(1, [_SYNCED_DIALOGS_DDL, _MESSAGES_DDL, _MESSAGES_INDEX_DDL, _MESSAGE_VERSIONS_DDL])
+
+    _migrate(2, ["ALTER TABLE synced_dialogs ADD COLUMN access_lost_at INTEGER"])
 
     if current < 3:
         from .fts import MESSAGES_FTS_DDL
-        conn.execute(MESSAGES_FTS_DDL)
-        conn.execute(
-            "INSERT INTO schema_version VALUES (3, strftime('%s', 'now'))"
-        )
+        _migrate(3, [MESSAGES_FTS_DDL])
 
-    if current < 4:
-        conn.execute(_ENTITY_TABLE_DDL)
-        conn.execute(_ENTITY_UPDATED_INDEX_DDL)
-        conn.execute(_ENTITY_USERNAME_INDEX_DDL)
-        conn.execute(_REACTION_TABLE_DDL)
-        conn.execute(_REACTION_INDEX_DDL)
-        conn.execute(_TOPIC_TABLE_DDL)
-        conn.execute(_TOPIC_INDEX_DDL)
-        conn.execute(_MESSAGE_CACHE_TABLE_DDL)
-        conn.execute(_MESSAGE_CACHE_INDEX_DDL)
-        conn.execute(
-            "INSERT INTO schema_version VALUES (4, strftime('%s', 'now'))"
-        )
+    _migrate(4, [
+        _ENTITY_TABLE_DDL, _ENTITY_UPDATED_INDEX_DDL, _ENTITY_USERNAME_INDEX_DDL,
+        _REACTION_TABLE_DDL, _REACTION_INDEX_DDL,
+        _TOPIC_TABLE_DDL, _TOPIC_INDEX_DDL,
+        _MESSAGE_CACHE_TABLE_DDL, _MESSAGE_CACHE_INDEX_DDL,
+    ])
 
-    if current < 5:
-        conn.execute(_TELEMETRY_EVENTS_DDL)
-        conn.execute(_TELEMETRY_EVENTS_INDEX_DDL)
-        conn.execute(
-            "INSERT INTO schema_version VALUES (5, strftime('%s', 'now'))"
-        )
+    _migrate(5, [_TELEMETRY_EVENTS_DDL, _TELEMETRY_EVENTS_INDEX_DDL])
 
-    conn.commit()
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 
 

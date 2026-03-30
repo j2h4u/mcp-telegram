@@ -6,7 +6,7 @@ from ..errors import (
     no_usage_data_text,
     usage_stats_query_error_text,
 )
-from ._base import DaemonNotRunningError, ToolArgs, ToolResult, _daemon_not_running_text, _text_response, daemon_connection, mcp_tool
+from ._base import DaemonNotRunningError, ToolArgs, ToolResult, _check_daemon_response, _daemon_not_running_text, _text_response, daemon_connection, mcp_tool
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +18,6 @@ def format_usage_summary(stats: dict) -> str:
     - tool_distribution: dict[str, int] — {tool_name: count}
     - error_distribution: dict[str, int] — {error_type: count}
     - max_page_depth: int
-    - dialogs_with_deep_scroll: int (estimated)
     - total_calls: int
     - filter_count: int
     - latency_median_ms: float

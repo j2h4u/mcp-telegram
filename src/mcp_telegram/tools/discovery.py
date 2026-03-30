@@ -15,6 +15,7 @@ from ._base import (
     DaemonNotRunningError,
     ToolArgs,
     ToolResult,
+    _check_daemon_response,
     _daemon_not_running_text,
     _text_response,
     daemon_connection,
@@ -45,9 +46,8 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
     except DaemonNotRunningError:
         return ToolResult(content=_text_response(_daemon_not_running_text()))
 
-    if not response.get("ok"):
-        error_msg = response.get("message", "Daemon returned an error.")
-        return ToolResult(content=_text_response(f"Error: {error_msg}"))
+    if err := _check_daemon_response(response):
+        return err
 
     data = response.get("data", {})
     dialogs = data.get("dialogs", [])
@@ -167,9 +167,8 @@ async def get_my_account(args: GetMyAccount) -> ToolResult:
     except DaemonNotRunningError:
         return ToolResult(content=_text_response(_daemon_not_running_text()))
 
-    if not response.get("ok"):
-        error_msg = response.get("message", "Daemon returned an error.")
-        return ToolResult(content=_text_response(f"Error: {error_msg}"))
+    if err := _check_daemon_response(response):
+        return err
 
     data = response.get("data", {})
     if not data:

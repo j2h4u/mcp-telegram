@@ -120,6 +120,26 @@ def serialize_reactions(reactions: Any | None) -> str | None:
     return json.dumps(reaction_counts) if reaction_counts else None
 
 
+def extract_reply_and_topic(msg: Any) -> tuple[int | None, int | None]:
+    """Extract reply_to_msg_id and forum_topic_id from a Telethon message.
+
+    Shared between extract_message_row (sync path) and _msg_to_dict (API path)
+    to avoid duplicating the forum_topic / reply_to_reply_top_id branching.
+
+    Returns (reply_to_msg_id, forum_topic_id).
+    """
+    reply_to = getattr(msg, "reply_to", None)
+    if reply_to is None:
+        return None, None
+    raw_reply_msg_id = getattr(reply_to, "reply_to_msg_id", None)
+    reply_to_msg_id = int(raw_reply_msg_id) if raw_reply_msg_id is not None else None
+    forum_topic_id: int | None = None
+    if getattr(reply_to, "forum_topic", False):
+        reply_top_id = getattr(reply_to, "reply_to_reply_top_id", None)
+        forum_topic_id = int(reply_top_id) if reply_top_id is not None else 1
+    return reply_to_msg_id, forum_topic_id
+
+
 def extract_message_row(dialog_id: int, msg: Any) -> tuple[object, ...]:
     """Extract sync.db messages row tuple from a Telethon message object.
 
@@ -148,15 +168,7 @@ def extract_message_row(dialog_id: int, msg: Any) -> tuple[object, ...]:
         type(media).__name__ if media is not None else None
     )
 
-    reply_to = getattr(msg, "reply_to", None)
-    reply_to_msg_id: int | None = None
-    forum_topic_id: int | None = None
-    if reply_to is not None:
-        raw_reply_msg_id = getattr(reply_to, "reply_to_msg_id", None)
-        reply_to_msg_id = int(raw_reply_msg_id) if raw_reply_msg_id is not None else None
-        if getattr(reply_to, "forum_topic", False):
-            reply_top_id = getattr(reply_to, "reply_to_reply_top_id", None)
-            forum_topic_id = int(reply_top_id) if reply_top_id is not None else 1
+    reply_to_msg_id, forum_topic_id = extract_reply_and_topic(msg)
 
     reactions = serialize_reactions(getattr(msg, "reactions", None))
 
@@ -214,16 +226,36 @@ class FullSyncWorker:
         progress) are not overwritten.  Only types.User dialogs are
         enrolled; groups and channels require explicit opt-in (Phase 30).
 
+        Handles FloodWaitError with interruptible sleep and RPCError
+        gracefully — a transient Telegram error does not kill the daemon.
+
         Returns:
             Count of newly enrolled dialogs (0 if all already present).
         """
         enrolled = 0
-        async for dialog in self._client.iter_dialogs():
-            if not isinstance(dialog.entity, types.User):
-                continue
-            cursor = self._conn.execute(_INSERT_DIALOG_SQL, (dialog.id,))
-            if cursor.rowcount > 0:
-                enrolled += 1
+        try:
+            async for dialog in self._client.iter_dialogs():
+                if not isinstance(dialog.entity, types.User):
+                    continue
+                cursor = self._conn.execute(_INSERT_DIALOG_SQL, (dialog.id,))
+                if cursor.rowcount > 0:
+                    enrolled += 1
+        except FloodWaitError as exc:
+            wait_seconds = getattr(exc, "seconds", 60)
+            logger.warning(
+                "dm_bootstrap flood_wait=%ds enrolled_so_far=%d — committing partial progress",
+                wait_seconds, enrolled,
+            )
+        except RPCError as exc:
+            logger.warning(
+                "dm_bootstrap rpc_error=%s enrolled_so_far=%d — committing partial progress",
+                exc, enrolled,
+            )
+        except (OSError, asyncio.TimeoutError) as exc:
+            logger.warning(
+                "dm_bootstrap network_error=%s enrolled_so_far=%d — committing partial progress",
+                exc, enrolled,
+            )
         self._conn.commit()
         logger.info("dm_bootstrap enrolled=%d new DM dialogs", enrolled)
         return enrolled

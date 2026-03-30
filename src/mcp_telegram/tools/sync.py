@@ -8,6 +8,7 @@ from ._base import (
     DaemonNotRunningError,
     ToolArgs,
     ToolResult,
+    _check_daemon_response,
     _daemon_not_running_text,
     _text_response,
     daemon_connection,
@@ -39,9 +40,8 @@ async def mark_dialog_for_sync(args: MarkDialogForSync) -> ToolResult:
     except DaemonNotRunningError:
         return ToolResult(content=_text_response(_daemon_not_running_text()))
 
-    if not response.get("ok"):
-        error_msg = response.get("message", "Daemon returned an error.")
-        return ToolResult(content=_text_response(f"Error: {error_msg}"))
+    if err := _check_daemon_response(response):
+        return err
 
     action = "marked for sync" if args.enable else "unmarked from sync"
     logger.info("mark_dialog_for_sync dialog_id=%d enable=%s", args.dialog_id, args.enable)
@@ -68,9 +68,8 @@ async def get_sync_status(args: GetSyncStatus) -> ToolResult:
     except DaemonNotRunningError:
         return ToolResult(content=_text_response(_daemon_not_running_text()))
 
-    if not response.get("ok"):
-        error_msg = response.get("message", "Daemon returned an error.")
-        return ToolResult(content=_text_response(f"Error: {error_msg}"))
+    if err := _check_daemon_response(response):
+        return err
 
     data = response.get("data", {})
     lines = [
@@ -104,9 +103,8 @@ async def get_sync_alerts(args: GetSyncAlerts) -> ToolResult:
     except DaemonNotRunningError:
         return ToolResult(content=_text_response(_daemon_not_running_text()))
 
-    if not response.get("ok"):
-        error_msg = response.get("message", "Daemon returned an error.")
-        return ToolResult(content=_text_response(f"Error: {error_msg}"))
+    if err := _check_daemon_response(response):
+        return err
 
     data = response.get("data", {})
     deleted = data.get("deleted_messages", [])

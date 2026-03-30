@@ -687,3 +687,40 @@ def test_migrate_legacy_databases_noop_when_files_missing(tmp_path: Path) -> Non
         migrate_legacy_databases(conn, tmp_path)
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Migration atomicity (L-4)
+# ---------------------------------------------------------------------------
+
+
+def test_ensure_sync_schema_idempotent(tmp_path: Path) -> None:
+    """Calling ensure_sync_schema twice doesn't raise or corrupt schema."""
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    ensure_sync_schema(db_path)
+
+    conn = _open_sync_db(db_path)
+    try:
+        row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
+        assert row[0] >= 5, "schema should be at current version"
+    finally:
+        conn.close()
+
+
+def test_schema_version_records_all_versions(tmp_path: Path) -> None:
+    """Each migration version is recorded individually in schema_version."""
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+
+    conn = _open_sync_db(db_path)
+    try:
+        versions = [
+            row[0]
+            for row in conn.execute(
+                "SELECT version FROM schema_version ORDER BY version"
+            ).fetchall()
+        ]
+        assert versions == [1, 2, 3, 4, 5], f"expected all 5 versions, got {versions}"
+    finally:
+        conn.close()

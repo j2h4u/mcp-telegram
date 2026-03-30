@@ -111,6 +111,33 @@ def _log_heartbeat(conn: sqlite3.Connection, client: Any, sync_start: float) -> 
 # ---------------------------------------------------------------------------
 
 
+async def _maybe_heartbeat_and_gap_scan(
+    conn: sqlite3.Connection,
+    client: Any,
+    handler_manager: EventHandlerManager,
+    sync_start: float,
+    last_heartbeat: float,
+    last_gap_scan: float,
+) -> tuple[float, float]:
+    """Run heartbeat and gap scan if their intervals have elapsed.
+
+    Returns updated (last_heartbeat, last_gap_scan) timestamps.
+    """
+    now_mono = time.monotonic()
+
+    if now_mono - last_heartbeat >= HEARTBEAT_INTERVAL_S:
+        _log_heartbeat(conn, client, sync_start)
+        handler_manager.refresh_synced_dialogs()
+        last_heartbeat = now_mono
+
+    if now_mono - last_gap_scan >= GAP_SCAN_INTERVAL_S:
+        deleted_count = await handler_manager.run_dm_gap_scan()
+        logger.info("gap_scan complete — marked_deleted=%d", deleted_count)
+        last_gap_scan = now_mono
+
+    return last_heartbeat, last_gap_scan
+
+
 async def _run_sync_loop(
     worker: FullSyncWorker,
     handler_manager: EventHandlerManager,
@@ -127,17 +154,9 @@ async def _run_sync_loop(
         all_synced = await worker.process_one_batch()
         await asyncio.sleep(0)
 
-        now_mono = time.monotonic()
-
-        if now_mono - last_heartbeat >= HEARTBEAT_INTERVAL_S:
-            _log_heartbeat(conn, client, sync_start)
-            handler_manager.refresh_synced_dialogs()
-            last_heartbeat = now_mono
-
-        if now_mono - last_gap_scan >= GAP_SCAN_INTERVAL_S:
-            deleted_count = await handler_manager.run_dm_gap_scan()
-            logger.info("gap_scan complete — marked_deleted=%d", deleted_count)
-            last_gap_scan = now_mono
+        last_heartbeat, last_gap_scan = await _maybe_heartbeat_and_gap_scan(
+            conn, client, handler_manager, sync_start, last_heartbeat, last_gap_scan,
+        )
 
         if all_synced:
             logger.info("sync_idle — all dialogs synced, waiting %ds", HEARTBEAT_INTERVAL_S)
@@ -148,14 +167,9 @@ async def _run_sync_loop(
                 )
                 break
             except asyncio.TimeoutError:
-                _log_heartbeat(conn, client, sync_start)
-                handler_manager.refresh_synced_dialogs()
-                last_heartbeat = time.monotonic()
-
-                if time.monotonic() - last_gap_scan >= GAP_SCAN_INTERVAL_S:
-                    deleted_count = await handler_manager.run_dm_gap_scan()
-                    logger.info("gap_scan complete — marked_deleted=%d", deleted_count)
-                    last_gap_scan = time.monotonic()
+                last_heartbeat, last_gap_scan = await _maybe_heartbeat_and_gap_scan(
+                    conn, client, handler_manager, sync_start, last_heartbeat, last_gap_scan,
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -174,9 +188,12 @@ async def sync_main() -> None:
     conn = _open_sync_db(db_path)
     migrate_legacy_databases(conn, db_path.parent)
 
-    backfilled = backfill_fts_index(conn)
-    if backfilled:
-        logger.info("fts_backfill=%d messages indexed", backfilled)
+    try:
+        backfilled = backfill_fts_index(conn)
+        if backfilled:
+            logger.info("fts_backfill=%d messages indexed", backfilled)
+    except sqlite3.OperationalError:
+        logger.warning("fts_backfill failed — FTS search may be incomplete until next restart", exc_info=True)
 
     loop = asyncio.get_running_loop()
     shutdown_event = register_shutdown_handler(conn, loop)
@@ -188,7 +205,7 @@ async def sync_main() -> None:
         try:
             await client.connect()
         except (OSError, asyncio.TimeoutError) as exc:
-            logger.error("sync-daemon connection failed: %s", exc)
+            logger.error("sync-daemon connection failed: %s", exc, exc_info=True)
             conn.close()
             return
 

@@ -853,3 +853,131 @@ async def test_process_one_batch_fts_matches_message_ids(
         ).fetchall()
     }
     assert fts_ids == {200, 201}
+
+
+# ---------------------------------------------------------------------------
+# bootstrap_dms error handling (H-2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dm_bootstrap_handles_flood_wait(
+    mock_client: MagicMock,
+    sync_db: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """bootstrap_dms() catches FloodWaitError and commits partial progress."""
+    from telethon.tl import types  # type: ignore[import-untyped]
+    from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
+
+    user = MagicMock(spec=types.User)
+    dialog = SimpleNamespace(entity=user, id=40001)
+
+    call_count = 0
+
+    async def _iter_dialogs():
+        nonlocal call_count
+        yield dialog
+        call_count += 1
+        raise FloodWaitError(request=None, capture=42)
+
+    mock_client.iter_dialogs = _iter_dialogs
+
+    worker = make_worker(mock_client, sync_db, shutdown_event)
+    count = await worker.bootstrap_dms()
+
+    assert count == 1, "should have enrolled the dialog yielded before the error"
+    row = sync_db.execute(
+        "SELECT dialog_id FROM synced_dialogs WHERE dialog_id = ?", (40001,)
+    ).fetchone()
+    assert row is not None, "partial progress should be committed"
+
+
+@pytest.mark.asyncio
+async def test_dm_bootstrap_handles_rpc_error(
+    mock_client: MagicMock,
+    sync_db: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """bootstrap_dms() catches RPCError and commits partial progress."""
+    from telethon.errors import RPCError  # type: ignore[import-untyped]
+
+    async def _iter_dialogs():  # noqa: ANN202
+        raise RPCError(request=None, message="TEST_ERROR", code=400)
+        yield  # make it an async generator  # noqa: unreachable
+
+    mock_client.iter_dialogs = _iter_dialogs
+
+    worker = make_worker(mock_client, sync_db, shutdown_event)
+    count = await worker.bootstrap_dms()
+
+    assert count == 0, "no dialogs enrolled on immediate error"
+
+
+@pytest.mark.asyncio
+async def test_dm_bootstrap_handles_network_error(
+    mock_client: MagicMock,
+    sync_db: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """bootstrap_dms() catches OSError and doesn't crash."""
+    async def _iter_dialogs():  # noqa: ANN202
+        raise OSError("Connection reset")
+        yield  # make it an async generator  # noqa: unreachable
+
+    mock_client.iter_dialogs = _iter_dialogs
+
+    worker = make_worker(mock_client, sync_db, shutdown_event)
+    count = await worker.bootstrap_dms()
+    assert count == 0
+
+
+# ---------------------------------------------------------------------------
+# extract_reply_and_topic shared helper (M-9)
+# ---------------------------------------------------------------------------
+
+
+def test_extract_reply_and_topic_no_reply():
+    from mcp_telegram.sync_worker import extract_reply_and_topic
+
+    msg = SimpleNamespace(reply_to=None)
+    reply_id, topic_id = extract_reply_and_topic(msg)
+    assert reply_id is None
+    assert topic_id is None
+
+
+def test_extract_reply_and_topic_simple_reply():
+    from mcp_telegram.sync_worker import extract_reply_and_topic
+
+    reply_to = SimpleNamespace(
+        reply_to_msg_id=42, forum_topic=False, reply_to_reply_top_id=None,
+    )
+    msg = SimpleNamespace(reply_to=reply_to)
+    reply_id, topic_id = extract_reply_and_topic(msg)
+    assert reply_id == 42
+    assert topic_id is None
+
+
+def test_extract_reply_and_topic_forum_with_top_id():
+    from mcp_telegram.sync_worker import extract_reply_and_topic
+
+    reply_to = SimpleNamespace(
+        reply_to_msg_id=100, forum_topic=True, reply_to_reply_top_id=7,
+    )
+    msg = SimpleNamespace(reply_to=reply_to)
+    reply_id, topic_id = extract_reply_and_topic(msg)
+    assert reply_id == 100
+    assert topic_id == 7
+
+
+def test_extract_reply_and_topic_forum_general():
+    """forum_topic=True with no reply_to_reply_top_id → General topic (id=1)."""
+    from mcp_telegram.sync_worker import extract_reply_and_topic
+
+    reply_to = SimpleNamespace(
+        reply_to_msg_id=200, forum_topic=True, reply_to_reply_top_id=None,
+    )
+    msg = SimpleNamespace(reply_to=reply_to)
+    reply_id, topic_id = extract_reply_and_topic(msg)
+    assert reply_id == 200
+    assert topic_id == 1

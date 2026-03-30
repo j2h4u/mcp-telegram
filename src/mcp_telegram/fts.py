@@ -83,8 +83,10 @@ def stem_query(query: str) -> str:
     if not words:
         return ""
     stemmed = _russian_stemmer.stemWords(words)
-    # Quote each token to prevent FTS5 operator interpretation (NOT, OR, AND)
-    quoted = [f'"{token}"' for token in stemmed]
+    # Quote each token to prevent FTS5 operator interpretation (NOT, OR, AND).
+    # Escape embedded double-quotes (defense-in-depth — _WORD_RE strips most
+    # non-word chars, but stemmer output is not guaranteed to be quote-free).
+    quoted = [f'"{token.replace(chr(34), "")}"' for token in stemmed]
     return " ".join(quoted)
 
 

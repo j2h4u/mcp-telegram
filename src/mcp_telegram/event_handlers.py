@@ -111,9 +111,9 @@ class EventHandlerManager:
     def register(self) -> None:
         """Load synced dialogs and attach the three event handlers to the client.
 
-        Must be called BEFORE FullSyncWorker starts (CONTEXT.md D-06) to
-        ensure no real-time messages are missed during initial bulk fetch.
-        INSERT OR REPLACE handles overlap idempotently.
+        Must be called BEFORE FullSyncWorker starts to ensure no real-time
+        messages are missed during initial bulk fetch.  INSERT OR REPLACE
+        handles overlap idempotently.
         """
         self._refresh_synced_dialogs()
         self._client.add_event_handler(self.on_new_message, events.NewMessage)

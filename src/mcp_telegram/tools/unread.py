@@ -11,6 +11,7 @@ from ._base import (
     DaemonNotRunningError,
     ToolArgs,
     ToolResult,
+    _check_daemon_response,
     _daemon_not_running_text,
     _text_response,
     daemon_connection,
@@ -60,9 +61,8 @@ async def list_unread_messages(args: ListUnreadMessages) -> ToolResult:
     except DaemonNotRunningError:
         return ToolResult(content=_text_response(_daemon_not_running_text()))
 
-    if not response.get("ok"):
-        error_msg = response.get("message", "Daemon returned an error.")
-        return ToolResult(content=_text_response(f"Error: {error_msg}"))
+    if err := _check_daemon_response(response):
+        return err
 
     data = response.get("data", {})
     groups = data.get("groups", [])
@@ -72,7 +72,7 @@ async def list_unread_messages(args: ListUnreadMessages) -> ToolResult:
         return ToolResult(content=_text_response(empty_msg))
 
     chats: list[UnreadChatData] = []
-    total_messages_shown = 0
+    result_count = 0
 
     for group in groups:
         messages = [DaemonMessage(m) for m in group.get("messages", [])]
@@ -86,8 +86,8 @@ async def list_unread_messages(args: ListUnreadMessages) -> ToolResult:
             is_bot=group.get("category") == "bot",
         )
         chat_data.messages = messages
-        total_messages_shown += len(messages)
+        result_count += len(messages)
         chats.append(chat_data)
 
     result_text = format_unread_messages_grouped(chats)
-    return ToolResult(content=_text_response(result_text), result_count=total_messages_shown)
+    return ToolResult(content=_text_response(result_text), result_count=result_count)

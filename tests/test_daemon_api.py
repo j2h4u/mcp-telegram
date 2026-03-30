@@ -2324,3 +2324,81 @@ def test_msg_to_dict_no_edit_date_is_none() -> None:
     result = DaemonAPIServer._msg_to_dict(mock_msg)
 
     assert result.get("edit_date") is None
+
+
+# ---------------------------------------------------------------------------
+# _decode_history_navigation error paths (M-12)
+# ---------------------------------------------------------------------------
+
+
+def test_decode_nav_returns_tuple_on_no_navigation() -> None:
+    """No navigation → returns (None, direction) tuple."""
+    result = DaemonAPIServer._decode_history_navigation(None, 123, "newest")
+    assert result == (None, "newest")
+
+
+def test_decode_nav_sentinel_newest() -> None:
+    """navigation="newest" → returns (None, "newest")."""
+    result = DaemonAPIServer._decode_history_navigation("newest", 123, "oldest")
+    assert result == (None, "oldest")
+
+
+def test_decode_nav_sentinel_oldest() -> None:
+    """navigation="oldest" → overrides direction."""
+    result = DaemonAPIServer._decode_history_navigation("oldest", 123, "newest")
+    assert result == (None, "oldest")
+
+
+def test_decode_nav_invalid_token_returns_error_dict() -> None:
+    """Garbage navigation token → error dict."""
+    result = DaemonAPIServer._decode_history_navigation("not-a-valid-token", 123, "newest")
+    assert isinstance(result, dict)
+    assert result["ok"] is False
+    assert result["error"] == "invalid_navigation"
+
+
+def test_decode_nav_wrong_dialog_returns_error_dict() -> None:
+    """Navigation token for different dialog → error dict."""
+    from mcp_telegram.pagination import encode_history_navigation, HistoryDirection
+
+    token = encode_history_navigation(100, dialog_id=999, direction=HistoryDirection.NEWEST)
+    result = DaemonAPIServer._decode_history_navigation(token, 123, "newest")
+    assert isinstance(result, dict)
+    assert result["ok"] is False
+    assert "999" in result["message"]
+
+
+def test_decode_nav_valid_token_returns_anchor() -> None:
+    """Valid history token → returns (anchor_msg_id, direction)."""
+    from mcp_telegram.pagination import encode_history_navigation, HistoryDirection
+
+    token = encode_history_navigation(42, dialog_id=123, direction=HistoryDirection.NEWEST)
+    result = DaemonAPIServer._decode_history_navigation(token, 123, "oldest")
+    assert isinstance(result, tuple)
+    anchor, direction = result
+    assert anchor == 42
+    assert direction == "newest"
+
+
+def test_decode_nav_search_token_returns_error() -> None:
+    """Search navigation token used in history context → error."""
+    from mcp_telegram.pagination import encode_search_navigation
+
+    token = encode_search_navigation(20, dialog_id=123, query="test")
+    result = DaemonAPIServer._decode_history_navigation(token, 123, "newest")
+    assert isinstance(result, dict)
+    assert result["error"] == "invalid_navigation"
+    assert "search" in result["message"]
+
+
+# ---------------------------------------------------------------------------
+# _DB_MESSAGE_COLUMNS dict(zip()) unpacking (M-16)
+# ---------------------------------------------------------------------------
+
+
+def test_db_message_columns_length_matches_query() -> None:
+    """_DB_MESSAGE_COLUMNS has exactly 13 entries matching the SELECT."""
+    from mcp_telegram.daemon_api import _DB_MESSAGE_COLUMNS
+    assert len(_DB_MESSAGE_COLUMNS) == 13
+    assert _DB_MESSAGE_COLUMNS[0] == "message_id"
+    assert _DB_MESSAGE_COLUMNS[-1] == "topic_title"
