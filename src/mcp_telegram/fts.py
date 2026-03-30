@@ -43,11 +43,11 @@ MESSAGES_FTS_DDL = (
 
 INSERT_FTS_SQL = (
     "INSERT OR REPLACE INTO messages_fts(dialog_id, message_id, stemmed_text) "
-    "VALUES (?, ?, ?)"  # params: (int, int, str)
+    "VALUES (?, ?, ?)"
 )
 
 DELETE_FTS_SQL = (
-    "DELETE FROM messages_fts WHERE dialog_id=? AND message_id=?"  # params: (int, int)
+    "DELETE FROM messages_fts WHERE dialog_id=? AND message_id=?"
 )
 
 

@@ -35,6 +35,8 @@ def format_messages(
         Telethon Message objects, newest-first (as returned by iter_messages).
     reply_map:
         message_id → Message mapping for reply annotation lines.
+        Should contain only messages from the current page — replies to
+        messages outside the page produce no annotation.
     reaction_names_map:
         message_id → {emoji: [reactor_names]} for inline reaction display.
     tz:

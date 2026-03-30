@@ -52,6 +52,10 @@ class ToolResult:
     has_filter: bool = False
 
 
+# Strong references to fire-and-forget tasks prevent GC before completion.
+_background_tasks: set[asyncio.Task] = set()
+
+
 async def _send_telemetry_event(event_dict: dict) -> None:
     """Fire-and-forget: send telemetry to daemon. Never raises."""
     try:
@@ -103,6 +107,8 @@ def _track_tool_telemetry(tool_name: str):
                             "error_type": error_type,
                         })
                     )
+                    _background_tasks.add(task)
+                    task.add_done_callback(_background_tasks.discard)
                     task.add_done_callback(_telemetry_done_callback)
                 except Exception as e:
                     logger.debug("telemetry_send_skipped: %s", e)
@@ -178,9 +184,12 @@ def tool_description(args: type[ToolArgs]) -> Tool:
 def _sanitize_tool_schema(value: t.Any) -> t.Any:
     """Return MCP-friendly JSON schema without explicit null unions.
 
+    Why: Claude Desktop and other MCP clients reject or misrender ``anyOf``
+    with null variants as required fields. This strips those patterns so
+    optional params appear as truly optional.
+
     Transforms: single-item ``anyOf`` with null variant → merged into parent dict;
-    strips ``default: None`` from non-null typed fields so MCP clients see optional
-    params as truly optional rather than defaulting to null.
+    strips ``default: None`` from non-null typed fields.
     """
     if isinstance(value, dict):
         sanitized = {key: _sanitize_tool_schema(item) for key, item in value.items()}

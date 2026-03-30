@@ -338,7 +338,7 @@ def _query_usage_stats(cursor: sqlite3.Cursor, since: int) -> dict:
         "tool_distribution": tool_dist,
         "error_distribution": error_dist,
         "max_page_depth": max_depth,
-        "dialogs_with_deep_scroll": 0,
+        "dialogs_with_deep_scroll": 0,  # not yet computed — placeholder
         "total_calls": total_calls,
         "filter_count": filter_count,
         "latency_median_ms": latency_median_ms,
@@ -495,16 +495,13 @@ class DaemonAPIServer:
         # Fallback: iterate dialogs and fuzzy-match by name
         logger.debug("resolve_dialog_fallback_iter_dialogs query=%r", dialog)
         matched_dialog: Any | None = None
-        matched_dialog_name: str = ""
         async for d in self._client.iter_dialogs():
             name = getattr(d, "name", "") or ""
             if name.lower() == dialog.lower():
                 matched_dialog = d
-                matched_dialog_name = name
                 break
             if dialog.lower() in name.lower() and matched_dialog is None:
                 matched_dialog = d
-                matched_dialog_name = name
 
         if matched_dialog is not None:
             return int(telethon_utils.get_peer_id(matched_dialog.entity))
@@ -548,6 +545,7 @@ class DaemonAPIServer:
             try:
                 sent_at = int(msg.date.timestamp())
             except Exception:
+                logger.debug("msg_to_dict timestamp conversion failed msg_id=%s", getattr(msg, "id", "?"), exc_info=True)
                 sent_at = 0
 
         media = getattr(msg, "media", None)
@@ -1354,8 +1352,13 @@ class DaemonAPIServer:
     # record_telemetry
     # ------------------------------------------------------------------
 
+    _TELEMETRY_TTL_SECONDS = 30 * 86400  # 30 days
+
     async def _record_telemetry(self, req: dict) -> dict:
-        """Write a telemetry event row to sync.db telemetry_events table."""
+        """Write a telemetry event row to sync.db telemetry_events table.
+
+        Evicts rows older than 30 days on every write to prevent unbounded growth.
+        """
         event = req.get("event", {})
         tool_name = event.get("tool_name", "")
         if not isinstance(tool_name, str) or len(tool_name) > 200:
@@ -1376,6 +1379,10 @@ class DaemonAPIServer:
                     event.get("has_filter"),
                     event.get("error_type"),
                 ),
+            )
+            cutoff = time.time() - self._TELEMETRY_TTL_SECONDS
+            self._conn.execute(
+                "DELETE FROM telemetry_events WHERE timestamp < ?", (cutoff,)
             )
             self._conn.commit()
             return {"ok": True}

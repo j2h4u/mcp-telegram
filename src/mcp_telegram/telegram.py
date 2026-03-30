@@ -71,10 +71,13 @@ def create_client(
     authenticated Telegram session. This is intentional for the single-user
     Docker deployment model — there is no per-request session isolation.
 
-    ``catch_up=True`` enables Telethon's PTS-based missed-update replay on connect
+    ``catch_up=True`` enables Telethon's PTS-based missed-update replay on connect.
     The sync-daemon passes ``catch_up=True``; the MCP server never calls
     ``create_client()`` directly (session guard disables it), so there is no
     cache-key collision in practice.
+
+    Warning: different argument combinations produce distinct cached instances
+    that share the same session file path — avoid mixing arguments in one process.
     """
     if api_id is not None and api_hash is not None:
         settings = TelegramSettings(api_id=api_id, api_hash=api_hash)

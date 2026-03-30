@@ -183,12 +183,14 @@ class MessageReadFailure:
 
 @dataclass(frozen=True)
 class NavigationFailure:
+    """Invalid or mismatched navigation token — returned when decode/validation fails."""
     kind: Literal["invalid_navigation"]
     text: str
 
 
 @dataclass(frozen=True)
 class CapabilityNavigation:
+    """Opaque next-page token for history or search continuation."""
     kind: Literal["history", "search"]
     token: str
 

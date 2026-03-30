@@ -9,6 +9,7 @@ import asyncio
 import io
 import json
 import sqlite3
+import time
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1313,7 +1314,7 @@ async def test_record_telemetry_inserts_row() -> None:
         "method": "record_telemetry",
         "event": {
             "tool_name": "ListDialogs",
-            "timestamp": 1700000000.0,
+            "timestamp": time.time(),
             "duration_ms": 123.4,
             "result_count": 5,
             "has_cursor": False,

@@ -151,7 +151,7 @@ class DeltaSyncWorker:
             return 0
         except RPCError as exc:
             logger.error(
-                "RPC error delta dialog_id=%d — skipping: %s", dialog_id, exc
+                "RPC error delta dialog_id=%d — skipping: %s", dialog_id, exc, exc_info=True,
             )
             return 0
 

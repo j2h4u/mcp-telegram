@@ -1,3 +1,9 @@
+"""MCP server entrypoint — tool registration, request dispatch, stdio transport.
+
+Wires tool_runner (singledispatch) to the MCP Server, tracks per-request IDs
+via _request_ids ContextVar for cross-process log correlation, and runs the
+stdio transport loop.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -119,7 +125,7 @@ async def call_tool(name: str, arguments: t.Any) -> Sequence[TextContent | Image
 
 
 async def run_mcp_server() -> None:
-    # Import here to avoid issues with event loops
+    # Deferred: stdio_server touches the event loop at import time in some envs
     from mcp.server.stdio import stdio_server
 
     log_level = os.environ.get("LOG_LEVEL", "INFO").upper()

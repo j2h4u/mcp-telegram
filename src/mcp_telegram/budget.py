@@ -13,6 +13,7 @@ UNREAD_TIER_CHANNEL = 70         # Channel / broadcast
 def unread_chat_tier(chat: dict) -> int:
     """Classify an unread chat into a priority tier.
 
+    ``chat`` must have keys: ``unread_mentions_count`` (int), ``category`` (str).
     Uses our internal ``category`` field (user/bot/group/channel),
     not raw Telegram flags. Unknown categories fall back to SMALL_GROUP.
     """
@@ -39,7 +40,8 @@ def allocate_message_budget_proportional(
 
     If total unread messages fit within limit, returns unread_counts unchanged.
     If over limit, allocates at least min_per_chat per chat, then distributes
-    remaining budget proportionally by unread count.
+    remaining budget proportionally by unread count. Returned values are
+    budgets (may be less than actual unread count) — callers must slice.
 
     Args:
         unread_counts: {chat_id: unread_count} mapping
