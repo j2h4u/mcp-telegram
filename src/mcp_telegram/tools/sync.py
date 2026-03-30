@@ -47,7 +47,7 @@ async def mark_dialog_for_sync(args: MarkDialogForSync) -> ToolResult:
     logger.info("mark_dialog_for_sync dialog_id=%d enable=%s", args.dialog_id, args.enable)
     text = f"Dialog {args.dialog_id} {action}."
     if args.enable:
-        text += " Daemon will begin fetching within the next polling cycle."
+        text += " Full message history will be fetched shortly."
     return ToolResult(content=_text_response(text), result_count=1)
 
 
