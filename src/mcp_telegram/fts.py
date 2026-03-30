@@ -97,8 +97,19 @@ def backfill_fts_index(conn: sqlite3.Connection) -> int:
     corresponding FTS entry — safe to call on every daemon startup without
     creating duplicates.  Returns 0 when the index is fully caught up.
 
+    Uses a fast count comparison first to skip the expensive LEFT JOIN
+    when the index is already complete (common case on restart).
+
     Returns the number of rows inserted.
     """
+    msg_count = conn.execute(
+        "SELECT COUNT(*) FROM messages WHERE is_deleted = 0"
+    ).fetchone()[0]
+    fts_count = conn.execute("SELECT COUNT(*) FROM messages_fts").fetchone()[0]
+
+    if msg_count == 0 or fts_count >= msg_count:
+        return 0
+
     rows = conn.execute(
         "SELECT m.dialog_id, m.message_id, m.text "
         "FROM messages m "

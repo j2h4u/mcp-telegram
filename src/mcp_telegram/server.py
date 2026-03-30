@@ -124,6 +124,30 @@ async def call_tool(name: str, arguments: t.Any) -> Sequence[TextContent | Image
         _request_ids.reset(token)
 
 
+async def _build_server_instructions() -> str:
+    """Fetch account info from daemon and build server instructions string.
+
+    Falls back to a generic message if the daemon is unavailable — the
+    client can still use GetMyAccount explicitly.
+    """
+    from .daemon_client import daemon_connection, DaemonNotRunningError
+
+    base = "Read-only Telegram access."
+    try:
+        async with daemon_connection() as conn:
+            response = await conn.get_me()
+        if response.get("ok"):
+            data = response["data"]
+            name = " ".join(filter(None, [data.get("first_name"), data.get("last_name")]))
+            username = data.get("username") or "none"
+            base += (
+                f" Connected account: id={data['id']}, name=\"{name}\", @{username}."
+            )
+    except (DaemonNotRunningError, Exception) as exc:
+        logger.debug("server_instructions: could not fetch account info: %s", exc)
+    return base
+
+
 async def run_mcp_server() -> None:
     # Deferred: stdio_server touches the event loop at import time in some envs
     from mcp.server.stdio import stdio_server
@@ -137,6 +161,8 @@ async def run_mcp_server() -> None:
     )
 
     logger.info("MCP server starting — routing through daemon API")
+
+    app.instructions = await _build_server_instructions()
 
     async with stdio_server() as (read_stream, write_stream):
         await app.run(read_stream, write_stream, app.create_initialization_options())
