@@ -306,29 +306,34 @@ class EventHandlerManager:
         ]
 
         for dialog_id in dialog_ids:
-            message_ids = [
-                int(row[0])
-                for row in self._conn.execute(
-                    _SELECT_UNDELETED_MESSAGES_SQL, (dialog_id, scan_started_at)
-                ).fetchall()
-            ]
+            try:
+                message_ids = [
+                    int(row[0])
+                    for row in self._conn.execute(
+                        _SELECT_UNDELETED_MESSAGES_SQL, (dialog_id, scan_started_at)
+                    ).fetchall()
+                ]
 
-            if not message_ids:
-                continue
+                if not message_ids:
+                    continue
 
-            # Batch in groups of 100 (Telegram API limit)
-            for batch_start in range(0, len(message_ids), 100):
-                batch = message_ids[batch_start : batch_start + 100]
-                results = await self._client.get_messages(dialog_id, ids=batch)
+                # Batch in groups of 100 (Telegram API limit)
+                for batch_start in range(0, len(message_ids), 100):
+                    batch = message_ids[batch_start : batch_start + 100]
+                    results = await self._client.get_messages(dialog_id, ids=batch)
 
-                now = int(time.time())
-                with self._conn:  # atomic per-dialog batch
-                    for queried_id, returned_msg in zip(batch, results):
-                        if returned_msg is None:
-                            self._conn.execute(
-                                _MARK_DELETED_SQL, (now, dialog_id, queried_id)
-                            )
-                            total_marked += 1
+                    now = int(time.time())
+                    with self._conn:  # atomic per-dialog batch
+                        for queried_id, returned_msg in zip(batch, results):
+                            if returned_msg is None:
+                                self._conn.execute(
+                                    _MARK_DELETED_SQL, (now, dialog_id, queried_id)
+                                )
+                                total_marked += 1
+            except Exception:
+                logger.warning(
+                    "dm_gap_scan_dialog_failed dialog_id=%d", dialog_id, exc_info=True,
+                )
 
         logger.info("dm_gap_scan marked_deleted=%d", total_marked)
         return total_marked

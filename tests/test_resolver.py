@@ -155,7 +155,7 @@ def test_numeric_id_not_found() -> None:
 
 def test_username_query_resolves_via_cache(mock_cache) -> None:
     choices = {101: "Иван Петров", 102: "Anna"}
-    result = resolve("@ivan", choices, cache=mock_cache)
+    result = resolve("@ivan", choices, entity_cache=mock_cache)
     assert isinstance(result, Resolved)
     assert result.entity_id == 101
     assert result.display_name == "Иван Петров"
@@ -163,7 +163,7 @@ def test_username_query_resolves_via_cache(mock_cache) -> None:
 
 def test_username_query_not_found(mock_cache) -> None:
     choices = {101: "Иван Петров"}
-    result = resolve("@notfound", choices, cache=mock_cache)
+    result = resolve("@notfound", choices, entity_cache=mock_cache)
     assert isinstance(result, NotFound)
     assert result.query == "@notfound"
 
@@ -241,7 +241,7 @@ def test_cyrillic_normalization_prefers_exact_over_fuzzy_candidates() -> None:
 
 def test_candidates_include_metadata_from_cache(mock_cache) -> None:
     choices = {101: "Иван Петров", 102: "Another User"}
-    result = resolve("иван", choices, cache=mock_cache)
+    result = resolve("иван", choices, entity_cache=mock_cache)
     assert isinstance(result, Candidates)
     match_101 = next((m for m in result.matches if m["entity_id"] == 101), None)
     assert match_101 is not None
@@ -251,7 +251,7 @@ def test_candidates_include_metadata_from_cache(mock_cache) -> None:
 
 def test_candidates_without_cache_have_none_metadata() -> None:
     choices = {101: "Sergei Khabarov", 102: "Sergei Ivanov"}
-    result = resolve("сергей", choices, cache=None)
+    result = resolve("сергей", choices, entity_cache=None)
     assert isinstance(result, Candidates)
     for match in result.matches:
         assert match["username"] is None
@@ -268,21 +268,21 @@ def test_exact_match_among_fuzzy_returns_candidates_single_word() -> None:
 
 def test_resolve_without_cache_still_works() -> None:
     choices = {101: "Иван Петров", 102: "Anna"}
-    result = resolve("101", choices, cache=None)
+    result = resolve("101", choices, entity_cache=None)
     assert isinstance(result, Resolved)
 
-    result = resolve("Иван Петров", choices, cache=None)
+    result = resolve("Иван Петров", choices, entity_cache=None)
     assert isinstance(result, Resolved)
 
-    result = resolve("иван", choices, cache=None)
+    result = resolve("иван", choices, entity_cache=None)
     assert isinstance(result, Candidates)
 
 
-def test_normalized_choices_param() -> None:
-    """Pre-computed normalized_choices are used instead of on-the-fly computation."""
+def test_normalized_name_map_param() -> None:
+    """Pre-computed normalized_name_map are used instead of on-the-fly computation."""
     choices = {1: "Olga Petrova", 2: "Ольга"}
     normalized = {1: "olga petrova", 2: "olga"}
-    result = resolve("Ольга Петрова", choices, normalized_choices=normalized)
+    result = resolve("Ольга Петрова", choices, normalized_name_map=normalized)
     assert isinstance(result, Resolved)
     assert result.entity_id == 1
 

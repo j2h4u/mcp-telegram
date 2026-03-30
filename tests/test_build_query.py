@@ -72,7 +72,7 @@ def test_sender_name_filter() -> None:
     sql, params = _build_list_messages_query(
         dialog_id=100, limit=20, sender_name="Alice"
     )
-    assert "m.sender_first_name LIKE ? COLLATE NOCASE" in sql
+    assert "m.sender_first_name LIKE ? ESCAPE" in sql
     assert params == [100, "%Alice%", 20]
 
 
@@ -82,7 +82,7 @@ def test_sender_id_takes_precedence_over_name() -> None:
         dialog_id=100, limit=20, sender_id=42, sender_name="Alice"
     )
     assert "m.sender_id = ?" in sql
-    assert "LIKE" not in sql
+    assert "LIKE" not in sql and "ESCAPE" not in sql
     assert params == [100, 42, 20]
 
 
@@ -140,7 +140,7 @@ def test_topic_and_sender_name_combined() -> None:
     sql, params = _build_list_messages_query(
         dialog_id=100, limit=10, sender_name="Bob", topic_id=3
     )
-    assert "LIKE" in sql
+    assert "LIKE" in sql and "ESCAPE" in sql
     assert "forum_topic_id = ?" in sql
     assert params == [100, "%Bob%", 3, 10]
 

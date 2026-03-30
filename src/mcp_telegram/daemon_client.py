@@ -203,7 +203,7 @@ class DaemonConnection:
         exclude_archived: bool = False,
         ignore_pinned: bool = False,
     ) -> dict:
-        """Send list_dialogs request."""
+        """List dialogs with optional archive/pin filtering."""
         return await self.request(
             {
                 "method": "list_dialogs",
@@ -218,7 +218,7 @@ class DaemonConnection:
         dialog_id: int = 0,
         dialog: str | None = None,
     ) -> dict:
-        """Send list_topics request. Accepts dialog name or numeric id."""
+        """List forum topics. Accepts dialog name or numeric id."""
         return await self.request(
             {
                 "method": "list_topics",
@@ -228,11 +228,11 @@ class DaemonConnection:
         )
 
     async def get_me(self) -> dict:
-        """Send get_me request."""
+        """Return current authenticated user info."""
         return await self.request({"method": "get_me"})
 
     async def mark_dialog_for_sync(self, *, dialog_id: int, enable: bool = True) -> dict:
-        """Send mark_dialog_for_sync request."""
+        """Mark or unmark a dialog for persistent sync."""
         return await self.request(
             {
                 "method": "mark_dialog_for_sync",
@@ -242,15 +242,15 @@ class DaemonConnection:
         )
 
     async def get_sync_status(self, *, dialog_id: int) -> dict:
-        """Send get_sync_status request."""
+        """Return sync status and message stats for a dialog."""
         return await self.request({"method": "get_sync_status", "dialog_id": dialog_id})
 
     async def get_sync_alerts(self, *, since: int = 0, limit: int = 50) -> dict:
-        """Send get_sync_alerts request."""
+        """Return deleted messages, edit history, and access-lost alerts."""
         return await self.request({"method": "get_sync_alerts", "since": since, "limit": limit})
 
     async def get_user_info(self, *, user_id: int) -> dict:
-        """Send get_user_info request."""
+        """Return user profile and common chats."""
         return await self.request({"method": "get_user_info", "user_id": user_id})
 
     async def list_unread_messages(
@@ -260,7 +260,7 @@ class DaemonConnection:
         limit: int = 100,
         group_size_threshold: int = 100,
     ) -> dict:
-        """Send list_unread_messages request."""
+        """Return prioritized unread messages across dialogs."""
         return await self.request({
             "method": "list_unread_messages",
             "scope": scope,
@@ -269,22 +269,22 @@ class DaemonConnection:
         })
 
     async def record_telemetry(self, *, event: dict) -> dict:
-        """Send record_telemetry request."""
+        """Write a telemetry event to sync.db."""
         return await self.request({"method": "record_telemetry", "event": event})
 
     async def get_usage_stats(self, *, since: int | None = None) -> dict:
-        """Send get_usage_stats request."""
+        """Return usage statistics from sync.db."""
         payload: dict = {"method": "get_usage_stats"}
         if since is not None:
             payload["since"] = since
         return await self.request(payload)
 
     async def upsert_entities(self, *, entities: list[dict]) -> dict:
-        """Send upsert_entities request."""
+        """Batch upsert entities into sync.db."""
         return await self.request({"method": "upsert_entities", "entities": entities})
 
     async def resolve_entity(self, *, query: str) -> dict:
-        """Send resolve_entity request."""
+        """Fuzzy entity resolution from sync.db."""
         return await self.request({"method": "resolve_entity", "query": query})
 
 

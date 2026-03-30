@@ -210,8 +210,9 @@ def _build_list_messages_query(
         sql += " AND m.sender_id = ?"
         params.append(sender_id)
     elif sender_name is not None:
-        sql += " AND m.sender_first_name LIKE ? COLLATE NOCASE"
-        params.append(f"%{sender_name}%")
+        sql += " AND m.sender_first_name LIKE ? ESCAPE '\\' COLLATE NOCASE"
+        escaped = sender_name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        params.append(f"%{escaped}%")
 
     if topic_id is not None:
         sql += " AND m.forum_topic_id = ?"
@@ -1221,10 +1222,10 @@ class DaemonAPIServer:
         limit: int = _clamp(req.get("limit", 100), 1, 500)
         group_size_threshold: int = req.get("group_size_threshold", 100)
 
-        entries, counts = await self._collect_unread_dialogs(scope, group_size_threshold)
-        self._rank_unread_entries(entries)
-        allocation = allocate_message_budget_proportional(counts, limit)
-        groups = await self._fetch_unread_groups(entries, allocation)
+        unread_dialogs, unread_counts = await self._collect_unread_dialogs(scope, group_size_threshold)
+        self._rank_unread_entries(unread_dialogs)
+        allocation = allocate_message_budget_proportional(unread_counts, limit)
+        groups = await self._fetch_unread_groups(unread_dialogs, allocation)
 
         return {"ok": True, "data": {"groups": groups}}
 
@@ -1252,8 +1253,8 @@ class DaemonAPIServer:
         self, scope: str, group_size_threshold: int
     ) -> tuple[list[dict], dict[int, int]]:
         """Iterate Telegram dialogs, return those with unread_count > 0."""
-        entries: list[dict] = []
-        counts: dict[int, int] = {}
+        unread_dialogs: list[dict] = []
+        unread_counts: dict[int, int] = {}
 
         async for dialog in self._client.iter_dialogs(archived=None, ignore_pinned=False):
             unread_count = getattr(dialog, "unread_count", 0)
@@ -1275,7 +1276,7 @@ class DaemonAPIServer:
                 continue
 
             raw_dialog = getattr(dialog, "dialog", None)
-            entries.append({
+            unread_dialogs.append({
                 "chat_id": chat_id,
                 "display_name": getattr(dialog, "name", f"Chat {chat_id}"),
                 "unread_count": unread_count,
@@ -1284,9 +1285,9 @@ class DaemonAPIServer:
                 "date": getattr(dialog, "date", None),
                 "read_inbox_max_id": getattr(raw_dialog, "read_inbox_max_id", 0) if raw_dialog else 0,
             })
-            counts[chat_id] = unread_count
+            unread_counts[chat_id] = unread_count
 
-        return entries, counts
+        return unread_dialogs, unread_counts
 
     @staticmethod
     def _rank_unread_entries(entries: list[dict]) -> None:
@@ -1457,7 +1458,7 @@ class DaemonAPIServer:
             return {"ok": True, "data": {"result": "not_found", "query": query}}
 
         now = int(time.time())
-        choices = dict(
+        display_name_map = dict(
             self._conn.execute(
                 _ALL_ENTITY_NAMES_SQL, (now - USER_TTL, now - GROUP_TTL)
             ).fetchall()
@@ -1469,7 +1470,7 @@ class DaemonAPIServer:
         )
 
         result = resolve_entity_sync(
-            query, choices, None, normalized_choices=normalized
+            query, display_name_map, None, normalized_name_map=normalized
         )
 
         if isinstance(result, Resolved):

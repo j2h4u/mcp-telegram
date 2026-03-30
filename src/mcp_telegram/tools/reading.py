@@ -230,29 +230,20 @@ async def list_messages(args: ListMessages) -> ToolResult:
             )
         topic_id = resolved
 
+    id_kwarg: dict = (
+        {"dialog_id": dialog_id} if dialog_id else {"dialog": args.dialog}
+    )
     try:
         async with daemon_connection() as conn:
-            if dialog_id is not None and dialog_id != 0:
-                response = await conn.list_messages(
-                    dialog_id=dialog_id,
-                    limit=args.limit,
-                    navigation=args.navigation,
-                    direction=direction,
-                    sender_name=sender_name,
-                    topic_id=topic_id,
-                    unread=unread_flag,
-                )
-            else:
-                # Daemon resolves dialog name via Telegram
-                response = await conn.list_messages(
-                    dialog=args.dialog,
-                    limit=args.limit,
-                    navigation=args.navigation,
-                    direction=direction,
-                    sender_name=sender_name,
-                    topic_id=topic_id,
-                    unread=unread_flag,
-                )
+            response = await conn.list_messages(
+                **id_kwarg,
+                limit=args.limit,
+                navigation=args.navigation,
+                direction=direction,
+                sender_name=sender_name,
+                topic_id=topic_id,
+                unread=unread_flag,
+            )
     except DaemonNotRunningError as e:
         return ToolResult(content=_text_response(str(e)))
 
@@ -355,22 +346,16 @@ async def search_messages(args: SearchMessages) -> ToolResult:
             )
 
     try:
+        id_kwarg: dict = (
+            {"dialog_id": dialog_id} if dialog_id else {"dialog": args.dialog}
+        )
         async with daemon_connection() as conn:
-            if dialog_id is not None and dialog_id != 0:
-                response = await conn.search_messages(
-                    dialog_id=dialog_id,
-                    query=args.query,
-                    limit=args.limit,
-                    offset=offset,
-                )
-            else:
-                # Daemon resolves dialog name via Telegram
-                response = await conn.search_messages(
-                    dialog=args.dialog,
-                    query=args.query,
-                    limit=args.limit,
-                    offset=offset,
-                )
+            response = await conn.search_messages(
+                **id_kwarg,
+                query=args.query,
+                limit=args.limit,
+                offset=offset,
+            )
     except DaemonNotRunningError as e:
         return ToolResult(content=_text_response(str(e)))
 

@@ -227,18 +227,19 @@ def tool_args(tool: Tool, *args, **kwargs) -> ToolArgs:  # noqa: ANN002, ANN003
 def verify_tool_registry() -> None:
     """Startup check: every registry entry has a matching class name, runner, and telemetry decorator.
 
-    Raises ``AssertionError`` on mismatch — called at module load time in
+    Raises ``RuntimeError`` on mismatch — called at module load time in
     ``server.py`` without a catch, so failures crash the process immediately.
-    Note: silently skipped under ``python -O`` (assertions disabled).
 
     The expected decorator stack is @tool_runner.register (outer) then @_track_tool_telemetry (inner).
     singledispatch sees the original type annotation via __wrapped__ on the telemetry wrapper.
     """
     for name, (cls, _posture) in TOOL_REGISTRY.items():
-        assert cls.__name__ == name, f"Registry key {name!r} != class {cls.__name__!r}"
+        if cls.__name__ != name:
+            raise RuntimeError(f"Registry key {name!r} != class {cls.__name__!r}")
         dispatched = tool_runner.dispatch(cls)
-        assert dispatched is not tool_runner, f"No runner for {name}"
-        # The telemetry decorator wraps the original function; __wrapped__ must be present
-        assert hasattr(dispatched, "__wrapped__"), (
-            f"Runner for {name} is missing __wrapped__ — ensure @_track_tool_telemetry is applied"
-        )
+        if dispatched is tool_runner:
+            raise RuntimeError(f"No runner for {name}")
+        if not hasattr(dispatched, "__wrapped__"):
+            raise RuntimeError(
+                f"Runner for {name} is missing __wrapped__ — ensure @_track_tool_telemetry is applied"
+            )

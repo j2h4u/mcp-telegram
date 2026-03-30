@@ -90,17 +90,17 @@ def _parse_tme_link(query: str) -> tuple[str, int | None] | None:
 
 
 def _build_norm_map(
-    choices: dict[int, str],
-    normalized_choices: dict[int, str] | None,
+    display_name_map: dict[int, str],
+    normalized_name_map: dict[int, str] | None,
 ) -> dict[str, list[tuple[int, str]]]:
     """Build {normalized_name: [(entity_id, original_name), ...]} lookup."""
     norm_map: dict[str, list[tuple[int, str]]] = {}
-    if normalized_choices is not None:
-        for entity_id, norm_name in normalized_choices.items():
-            original_name = choices.get(entity_id, norm_name)
+    if normalized_name_map is not None:
+        for entity_id, norm_name in normalized_name_map.items():
+            original_name = display_name_map.get(entity_id, norm_name)
             norm_map.setdefault(norm_name, []).append((entity_id, original_name))
     else:
-        for entity_id, name in choices.items():
+        for entity_id, name in display_name_map.items():
             norm_name = latinize(name)
             norm_map.setdefault(norm_name, []).append((entity_id, name))
     return norm_map
@@ -108,28 +108,28 @@ def _build_norm_map(
 
 def _fuzzy_resolve(
     query: str,
-    choices: dict[int, str],
-    cache: Any | None = None,
+    display_name_map: dict[int, str],
+    entity_cache: Any | None = None,
     *,
-    normalized_choices: dict[int, str] | None = None,
+    normalized_name_map: dict[int, str] | None = None,
 ) -> ResolveResult:
-    """Fuzzy match query against choices in normalized (Latin) space.
+    """Fuzzy match query against display_name_map in normalized (Latin) space.
 
-    - Normalizes both query and choices via latinize()
+    - Normalizes both query and display_name_map via latinize()
     - Exact normalized match with multi-word query → Resolved
     - Single-word query with ≥2 hits → always Candidates (even if exact)
     - Otherwise exact normalized match → Resolved
     - No exact → all hits ≥60 as Candidates
     """
-    norm_map = _build_norm_map(choices, normalized_choices)
-    fuzzy_candidates: dict[str, int] = {
+    norm_map = _build_norm_map(display_name_map, normalized_name_map)
+    norm_name_to_id: dict[str, int] = {
         norm_name: entries[0][0] for norm_name, entries in norm_map.items()
     }
     norm_query = latinize(query)
 
     hits = process.extract(
         norm_query,
-        fuzzy_candidates.keys(),
+        norm_name_to_id.keys(),
         scorer=fuzz.WRatio,
         processor=utils.default_process,
         score_cutoff=CANDIDATE_THRESHOLD,
@@ -150,20 +150,20 @@ def _fuzzy_resolve(
             break
 
     if is_single_word and len(hits) >= 2:
-        matches = _build_matches(hits, norm_map, cache, exact_first_id=exact_entity_id)
+        matches = _build_matches(hits, norm_map, entity_cache, exact_first_id=exact_entity_id)
         return Candidates(query=query, matches=matches)
 
     if exact_entity_id is not None:
         return Resolved(entity_id=exact_entity_id, display_name=exact_display_name)  # type: ignore[arg-type]
 
-    matches = _build_matches(hits, norm_map, cache)
+    matches = _build_matches(hits, norm_map, entity_cache)
     return Candidates(query=query, matches=matches)
 
 
 def _build_matches(
     hits: list[tuple[str, float, int]],
     norm_map: dict[str, list[tuple[int, str]]],
-    cache: Any | None,
+    entity_cache: Any | None,
     exact_first_id: int | None = None,
 ) -> list[dict]:
     """Build match dicts from rapidfuzz hits, optionally putting exact_first_id first."""
@@ -175,19 +175,19 @@ def _build_matches(
             for entity_id, original_name in norm_map.get(norm_name, []):
                 if entity_id == exact_first_id and entity_id not in seen_ids:
                     seen_ids.add(entity_id)
-                    matches.append(_make_match_info(entity_id, original_name, int(score), cache))
+                    matches.append(_make_match_info(entity_id, original_name, int(score), entity_cache))
 
     for norm_name, score, _idx in hits:
         for entity_id, original_name in norm_map.get(norm_name, []):
             if entity_id in seen_ids:
                 continue
             seen_ids.add(entity_id)
-            matches.append(_make_match_info(entity_id, original_name, int(score), cache))
+            matches.append(_make_match_info(entity_id, original_name, int(score), entity_cache))
 
     return matches
 
 
-def _make_match_info(entity_id: int, display_name: str, score: int, cache: Any | None) -> dict:
+def _make_match_info(entity_id: int, display_name: str, score: int, entity_cache: Any | None) -> dict:
     entity_info: dict = {
         "entity_id": entity_id,
         "display_name": display_name,
@@ -195,55 +195,55 @@ def _make_match_info(entity_id: int, display_name: str, score: int, cache: Any |
         "username": None,
         "entity_type": None,
     }
-    if cache:
+    if entity_cache:
         try:
-            cached = cache.get(entity_id, ttl_seconds=300)
-            if cached:
-                entity_info["username"] = cached.get("username")
-                entity_info["entity_type"] = cached.get("type")
+            entity_cached = entity_cache.get(entity_id, ttl_seconds=300)
+            if entity_cached:
+                entity_info["username"] = entity_cached.get("username")
+                entity_info["entity_type"] = entity_cached.get("type")
         except (sqlite3.OperationalError, sqlite3.DatabaseError, OSError):
             pass
         except Exception:
-            logger.warning("unexpected cache error in fuzzy resolve for entity_id=%r", entity_id, exc_info=True)
+            logger.warning("unexpected entity_cache error in fuzzy resolve for entity_id=%r", entity_id, exc_info=True)
     return entity_info
 
 
 def resolve(
     query: str,
-    choices: dict[int, str],
-    cache: Any | None = None,
+    display_name_map: dict[int, str],
+    entity_cache: Any | None = None,
     *,
-    normalized_choices: dict[int, str] | None = None,
+    normalized_name_map: dict[int, str] | None = None,
 ) -> ResolveResult:
     """Resolve query to entity using normalized matching (pure/sync).
 
     Case 1: Numeric ID query → Resolved/NotFound by id
-    Case 2: @username query → lookup in cache, Resolved/NotFound (requires cache)
+    Case 2: @username query → lookup in entity_cache, Resolved/NotFound (requires entity_cache)
     Case 3-5: Fuzzy matching in latinized space with single-word caution
 
-    cache must expose .get(id, ttl_seconds=) and .get_by_username(str).
+    entity_cache must expose .get(id, ttl_seconds=) and .get_by_username(str).
     Pass None to skip @username resolution.
     """
     entity_id = _parse_numeric_query(query)
     if entity_id is not None:
-        if entity_id in choices:
-            return Resolved(entity_id=entity_id, display_name=choices[entity_id])
+        if entity_id in display_name_map:
+            return Resolved(entity_id=entity_id, display_name=display_name_map[entity_id])
         return NotFound(query=query)
 
-    if query.startswith("@") and cache:
+    if query.startswith("@") and entity_cache:
         username_query = query[1:]
         try:
-            result = cache.get_by_username(username_query)
+            result = entity_cache.get_by_username(username_query)
             if result:
                 entity_id, name = result
                 return Resolved(entity_id=entity_id, display_name=name)
         except (sqlite3.OperationalError, sqlite3.DatabaseError, OSError):
             pass
         except Exception:
-            logger.warning("unexpected cache error in @username resolve for query=%r", query, exc_info=True)
+            logger.warning("unexpected entity_cache error in @username resolve for query=%r", query, exc_info=True)
         return NotFound(query=query)
 
     if query.startswith("@"):
         return NotFound(query=query)
 
-    return _fuzzy_resolve(query, choices, cache, normalized_choices=normalized_choices)
+    return _fuzzy_resolve(query, display_name_map, entity_cache, normalized_name_map=normalized_name_map)
