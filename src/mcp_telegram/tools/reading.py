@@ -19,6 +19,47 @@ from ._base import (
 )
 
 # ---------------------------------------------------------------------------
+# Shared archived-dialog warning formatter
+# ---------------------------------------------------------------------------
+
+
+def _format_archived_warning(data: dict) -> str:
+    """Build the ⚠ archived-dialog warning string from a daemon response dict.
+
+    Returns an empty string when dialog_access != "archived".
+    Uses last_synced_at (preferred) or last_event_at for the archive date —
+    never access_lost_at, which records when access was lost, not when sync ran.
+    """
+    if data.get("dialog_access") != "archived":
+        return ""
+    last_synced_at = data.get("last_synced_at")
+    last_event_at = data.get("last_event_at")
+    sync_ts = last_synced_at or last_event_at
+    date_str = (
+        datetime.fromtimestamp(sync_ts, tz=timezone.utc).strftime("%Y-%m-%d")
+        if sync_ts
+        else "unknown date"
+    )
+    warning = (
+        "\u26a0 No current access to this dialog. "
+        f"Messages are from the local archive (last sync: {date_str}).\n"
+    )
+    sync_coverage_pct = data.get("sync_coverage_pct")
+    archived_message_count = data.get("archived_message_count")
+    if sync_coverage_pct is not None and sync_coverage_pct < 100:
+        warning += f"Archive coverage: {sync_coverage_pct}% of dialog history.\n"
+    elif sync_coverage_pct is None:
+        if archived_message_count is not None:
+            warning += (
+                f"Archive coverage: unknown "
+                f"({archived_message_count} messages archived locally).\n"
+            )
+        else:
+            warning += "Archive coverage: unknown.\n"
+    return warning
+
+
+# ---------------------------------------------------------------------------
 # format_messages adapter for daemon data
 # ---------------------------------------------------------------------------
 
@@ -365,41 +406,11 @@ async def list_messages(args: ListMessages) -> ToolResult:
     source = data.get("source", "unknown")
     next_nav = data.get("next_navigation")
 
-    # Access metadata from daemon response
-    dialog_access = data.get("dialog_access", "live")
-    last_synced_at = data.get("last_synced_at")
-    last_event_at = data.get("last_event_at")
-    sync_coverage_pct = data.get("sync_coverage_pct")
-    archived_message_count = data.get("archived_message_count")
-
     text = _format_daemon_messages(rows)
     if not text:
         text = "No messages found."
 
-    warning = ""
-    if dialog_access == "archived":
-        # Use last_synced_at or last_event_at for "last sync" date (NOT access_lost_at)
-        sync_ts = last_synced_at or last_event_at
-        if sync_ts:
-            date_str = datetime.fromtimestamp(sync_ts, tz=timezone.utc).strftime("%Y-%m-%d")
-        else:
-            date_str = "unknown date"
-        warning = (
-            "\u26a0 No current access to this dialog. "
-            f"Messages are from the local archive (last sync: {date_str}).\n"
-        )
-        if sync_coverage_pct is not None and sync_coverage_pct < 100:
-            warning += f"Archive coverage: {sync_coverage_pct}% of dialog history.\n"
-        elif sync_coverage_pct is None:
-            # Per CONTEXT.md: access_lost + total_messages=NULL -> "N messages archived, coverage unknown"
-            if archived_message_count is not None:
-                warning += (
-                    f"Archive coverage: unknown "
-                    f"({archived_message_count} messages archived locally).\n"
-                )
-            else:
-                warning += "Archive coverage: unknown.\n"
-
+    warning = _format_archived_warning(data)
     source_note = f"[source: {source}]\n" if source else ""
     nav_note = f"\nnext_navigation: {next_nav}" if next_nav else ""
     result_text = warning + source_note + text + nav_note
@@ -523,13 +534,6 @@ async def search_messages(args: SearchMessages) -> ToolResult:
     next_nav = data.get("next_navigation")
     dialog_label: str | None = str(dialog_id) if dialog_id else args.dialog
 
-    # Access metadata from daemon response (None for global search — omitted)
-    dialog_access = data.get("dialog_access")
-    last_synced_at = data.get("last_synced_at")
-    last_event_at = data.get("last_event_at")
-    sync_coverage_pct = data.get("sync_coverage_pct")
-    archived_message_count = data.get("archived_message_count")
-
     if not rows:
         result_text = search_no_hits_text(dialog_label, args.query)
         return ToolResult(
@@ -542,29 +546,7 @@ async def search_messages(args: SearchMessages) -> ToolResult:
     text = _format_search_results(rows, args.query, global_mode=global_mode)
     nav_note = f"\nnext_navigation: {next_nav}" if next_nav else ""
 
-    warning = ""
-    if dialog_access == "archived":
-        # Use last_synced_at or last_event_at for "last sync" date (NOT access_lost_at)
-        sync_ts = last_synced_at or last_event_at
-        if sync_ts:
-            date_str = datetime.fromtimestamp(sync_ts, tz=timezone.utc).strftime("%Y-%m-%d")
-        else:
-            date_str = "unknown date"
-        warning = (
-            "\u26a0 No current access to this dialog. "
-            f"Messages are from the local archive (last sync: {date_str}).\n"
-        )
-        if sync_coverage_pct is not None and sync_coverage_pct < 100:
-            warning += f"Archive coverage: {sync_coverage_pct}% of dialog history.\n"
-        elif sync_coverage_pct is None:
-            if archived_message_count is not None:
-                warning += (
-                    f"Archive coverage: unknown "
-                    f"({archived_message_count} messages archived locally).\n"
-                )
-            else:
-                warning += "Archive coverage: unknown.\n"
-
+    warning = _format_archived_warning(data)
     result_text = warning + text + nav_note
 
     return ToolResult(

@@ -801,6 +801,7 @@ def test_sync_main_starts_api_server(
         patch("mcp_telegram.daemon.DeltaSyncWorker", return_value=mocks["delta"]),
         patch("mcp_telegram.daemon.EventHandlerManager", return_value=mocks["handler"]),
         patch("mcp_telegram.daemon.asyncio.start_unix_server", side_effect=mock_start_unix_server),
+        patch("mcp_telegram.daemon.os.chmod"),
     ):
         asyncio.run(sync_main())
 
@@ -833,6 +834,7 @@ def test_sync_main_runs_fts_backfill(
         patch("mcp_telegram.daemon.DeltaSyncWorker", return_value=mocks["delta"]),
         patch("mcp_telegram.daemon.EventHandlerManager", return_value=mocks["handler"]),
         patch("mcp_telegram.daemon.asyncio.start_unix_server", new=AsyncMock(return_value=mock_unix_server)),
+        patch("mcp_telegram.daemon.os.chmod"),
     ):
         asyncio.run(sync_main())
 
@@ -864,6 +866,7 @@ def test_sync_main_cleans_socket_on_shutdown(
         patch("mcp_telegram.daemon.DeltaSyncWorker", return_value=mocks["delta"]),
         patch("mcp_telegram.daemon.EventHandlerManager", return_value=mocks["handler"]),
         patch("mcp_telegram.daemon.asyncio.start_unix_server", new=AsyncMock(return_value=mock_unix_server)),
+        patch("mcp_telegram.daemon.os.chmod"),
     ):
         asyncio.run(sync_main())
 

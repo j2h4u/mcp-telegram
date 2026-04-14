@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sqlite3
 import time
 from typing import Any
@@ -274,6 +275,7 @@ async def sync_main() -> None:
         unix_server = await asyncio.start_unix_server(
             api_server.handle_client, path=str(socket_path), limit=2 * 1024 * 1024,
         )
+        os.chmod(socket_path, 0o600)
         logger.info("daemon API listening on %s", socket_path)
 
         handler_manager = EventHandlerManager(client, conn, shutdown_event)

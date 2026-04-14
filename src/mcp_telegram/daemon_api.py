@@ -1140,12 +1140,12 @@ class DaemonAPIServer:
                     except Exception:
                         pass
 
-                _meta = synced_meta.get(d.id, ("not_synced", None, None))
-                _status = _meta[0]
-                _total = _meta[1]
-                _access_lost = _meta[2]
-                _local = local_counts.get(d.id, 0)
-                _cov = _compute_sync_coverage(_total, _local)
+                sync_meta_row = synced_meta.get(d.id, ("not_synced", None, None))
+                sync_status = sync_meta_row[0]
+                total_messages = sync_meta_row[1]
+                access_lost_at = sync_meta_row[2]
+                local_count = local_counts.get(d.id, 0)
+                coverage_pct = _compute_sync_coverage(total_messages, local_count)
                 dialogs.append(
                     {
                         "id": d.id,
@@ -1155,9 +1155,9 @@ class DaemonAPIServer:
                         "unread_count": getattr(d, "unread_count", 0),
                         "members": members,
                         "created": created_ts,
-                        "sync_status": _status,
-                        "sync_coverage_pct": _cov,
-                        "access_lost_at": _access_lost,
+                        "sync_status": sync_status,
+                        "sync_coverage_pct": coverage_pct,
+                        "access_lost_at": access_lost_at,
                     }
                 )
         except Exception as exc:
@@ -1521,7 +1521,7 @@ class DaemonAPIServer:
                 note = getattr(raw_note, "text", None) or None
 
         except Exception as exc:
-            logger.warning("get_user_info full_user_failed user_id=%r error=%s%s", user_id, exc, _rid())
+            logger.warning("get_user_info full_user_failed user_id=%r error=%s%s", user_id, exc, _rid(), exc_info=True)
 
         # Resolve folder_id → folder name
         if folder_id is not None:
@@ -1534,7 +1534,7 @@ class DaemonAPIServer:
                         folder_name = getattr(raw_title, "text", raw_title) if raw_title else None
                         break
             except Exception as exc:
-                logger.warning("get_user_info folder_resolve_failed folder_id=%r error=%s%s", folder_id, exc, _rid())
+                logger.warning("get_user_info folder_resolve_failed folder_id=%r error=%s%s", folder_id, exc, _rid(), exc_info=True)
 
         # Additional usernames (Telegram allows multiple active usernames)
         extra_usernames: list[str] = []
