@@ -1269,8 +1269,8 @@ class DaemonAPIServer:
 
         enable=True: INSERT OR IGNORE with status='not_synced' (daemon picks
         up the new dialog within one heartbeat interval).
-        enable=False: UPDATE status back to 'not_synced' (pauses syncing,
-        preserves history).
+        enable=False: UPDATE status back to 'not_synced' (re-queues dialog
+        for a full re-sync on the next daemon cycle; local messages are kept).
         """
         dialog_id: int = req.get("dialog_id", 0)
         enable: bool = req.get("enable", True)

@@ -211,70 +211,87 @@ def test_helper_tools_remain_available_not_hidden() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _make_mock_conn(list_messages_response: dict):
+    """Build a mock daemon connection that returns a preset list_messages response."""
+    mock_conn = AsyncMock()
+    mock_conn.__aenter__ = AsyncMock(return_value=mock_conn)
+    mock_conn.__aexit__ = AsyncMock(return_value=False)
+    mock_conn.list_messages = AsyncMock(return_value=list_messages_response)
+    return mock_conn
+
+
 @pytest.mark.asyncio
-async def test_list_messages_tool_archived_warning_with_coverage():
+async def test_list_messages_tool_archived_warning_with_coverage(monkeypatch):
     """ListMessages tool output includes archived warning with coverage pct."""
-    from datetime import datetime, timezone
+    mock_conn = _make_mock_conn({
+        "ok": True,
+        "data": {
+            "messages": [],
+            "source": "sync_db",
+            "next_navigation": None,
+            "dialog_access": "archived",
+            "access_lost_at": 1704067200,
+            "last_synced_at": 1699990000,   # 2023-11-14
+            "last_event_at": 1699999000,
+            "sync_coverage_pct": 80,
+        },
+    })
+    monkeypatch.setattr("mcp_telegram.tools.reading.daemon_connection", lambda: mock_conn)
 
-    # Simulate daemon response for access_lost dialog with 80% coverage
-    data = {
-        "messages": [],
-        "source": "sync_db",
-        "next_navigation": None,
-        "dialog_access": "archived",
-        "access_lost_at": 1704067200,   # 2024-01-01
-        "last_synced_at": 1699990000,   # 2023-11-14
-        "last_event_at": 1699999000,
-        "sync_coverage_pct": 80,
-    }
-
-    dialog_access = data.get("dialog_access", "live")
-    last_synced_at = data.get("last_synced_at")
-    last_event_at = data.get("last_event_at")
-    sync_ts = last_synced_at or last_event_at
-
-    assert dialog_access == "archived"
-    assert sync_ts == 1699990000
-    date_str = datetime.fromtimestamp(sync_ts, tz=timezone.utc).strftime("%Y-%m-%d")
-    assert "2023" in date_str  # 1699990000 = Nov 2023
-    assert data["sync_coverage_pct"] == 80
+    result = await server.call_tool("ListMessages", {"exact_dialog_id": 123})
+    text = result[0].text
+    assert "⚠" in text
+    assert "archive" in text.lower()
+    assert "2023-11-14" in text
+    assert "80%" in text
 
 
 @pytest.mark.asyncio
-async def test_list_messages_tool_archived_warning_unknown_coverage():
+async def test_list_messages_tool_archived_warning_unknown_coverage(monkeypatch):
     """ListMessages tool output shows 'N messages archived locally' when coverage unknown."""
-    data = {
-        "messages": [],
-        "source": "sync_db",
-        "next_navigation": None,
-        "dialog_access": "archived",
-        "access_lost_at": 1700000000,
-        "last_synced_at": None,
-        "last_event_at": 1699999000,
-        "sync_coverage_pct": None,
-        "archived_message_count": 150,
-    }
+    mock_conn = _make_mock_conn({
+        "ok": True,
+        "data": {
+            "messages": [],
+            "source": "sync_db",
+            "next_navigation": None,
+            "dialog_access": "archived",
+            "access_lost_at": 1700000000,
+            "last_synced_at": None,
+            "last_event_at": 1699999000,
+            "sync_coverage_pct": None,
+            "archived_message_count": 150,
+        },
+    })
+    monkeypatch.setattr("mcp_telegram.tools.reading.daemon_connection", lambda: mock_conn)
 
-    assert data["sync_coverage_pct"] is None
-    assert data["archived_message_count"] == 150
-    # The tool should format: "Archive coverage: unknown (150 messages archived locally)."
+    result = await server.call_tool("ListMessages", {"exact_dialog_id": 123})
+    text = result[0].text
+    assert "⚠" in text
+    assert "150 messages archived locally" in text
 
 
 @pytest.mark.asyncio
-async def test_list_messages_tool_uses_last_synced_at_not_access_lost_at():
-    """Verify tool uses last_synced_at for date, NOT access_lost_at."""
-    from datetime import datetime, timezone
+async def test_list_messages_tool_uses_last_synced_at_not_access_lost_at(monkeypatch):
+    """Verify tool uses last_synced_at for the archive date, NOT access_lost_at."""
+    mock_conn = _make_mock_conn({
+        "ok": True,
+        "data": {
+            "messages": [],
+            "source": "sync_db",
+            "next_navigation": None,
+            "dialog_access": "archived",
+            "access_lost_at": 1704067200,   # 2024-01-01
+            "last_synced_at": 1699990000,   # 2023-11-14
+            "last_event_at": 1699999000,
+            "sync_coverage_pct": None,
+        },
+    })
+    monkeypatch.setattr("mcp_telegram.tools.reading.daemon_connection", lambda: mock_conn)
 
-    # access_lost_at is 2024-01-01, last_synced_at is 2023-11-14
-    data = {
-        "dialog_access": "archived",
-        "access_lost_at": 1704067200,   # 2024-01-01
-        "last_synced_at": 1699990000,   # 2023-11-14
-        "last_event_at": 1699999000,
-    }
-
-    sync_ts = data.get("last_synced_at") or data.get("last_event_at")
-    date_str = datetime.fromtimestamp(sync_ts, tz=timezone.utc).strftime("%Y-%m-%d")
-    # Must use 2023-11-14 (last_synced_at), NOT 2024-01-01 (access_lost_at)
-    assert date_str == "2023-11-14"
+    result = await server.call_tool("ListMessages", {"exact_dialog_id": 123})
+    text = result[0].text
+    # Must show 2023-11-14 (last_synced_at), NOT 2024-01-01 (access_lost_at)
+    assert "2023-11-14" in text
+    assert "2024-01-01" not in text
 

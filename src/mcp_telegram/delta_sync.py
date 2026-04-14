@@ -224,7 +224,13 @@ async def _probe_access_lost_dialogs(
             logger.warning(
                 "probe_flood_wait dialog_id=%d seconds=%d", dialog_id, exc.seconds
             )
-            await asyncio.sleep(float(exc.seconds))
+            try:
+                await asyncio.wait_for(
+                    shutdown_event.wait(), timeout=float(exc.seconds)
+                )
+                return  # shutdown during flood wait
+            except asyncio.TimeoutError:
+                pass  # flood wait elapsed normally
         except RPCError as exc:
             logger.warning("probe_rpc_error dialog_id=%d error=%s", dialog_id, exc)
         except (OSError, asyncio.TimeoutError) as exc:
