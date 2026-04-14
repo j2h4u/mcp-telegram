@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from helpers import build_mock_message, build_mock_reactions
+from helpers import MockTotalList, build_mock_message, build_mock_reactions
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.sync_worker import FullSyncWorker
 
@@ -82,11 +82,7 @@ async def test_full_sync_stores_all_messages(
         build_mock_message(id=100, text="msg 100", sender_id=10),
     ]
 
-    async def _iter_messages(**kwargs: Any):  # noqa: ANN202
-        for m in msgs:
-            yield m
-
-    mock_client.iter_messages = _iter_messages
+    mock_client.get_messages = AsyncMock(return_value=MockTotalList(msgs, total=len(msgs)))
 
     worker = make_worker(mock_client, sync_db, shutdown_event)
     await worker.process_one_batch()
@@ -129,10 +125,7 @@ async def test_message_fields_extracted_correctly(
         reply_to_top_id=1,
     )
 
-    async def _iter_messages(**kwargs: Any):  # noqa: ANN202
-        yield msg
-
-    mock_client.iter_messages = _iter_messages
+    mock_client.get_messages = AsyncMock(return_value=MockTotalList([msg], total=1))
 
     worker = make_worker(mock_client, sync_db, shutdown_event)
     await worker.process_one_batch()
@@ -168,10 +161,7 @@ async def test_reactions_serialized_as_json(
     reactions = build_mock_reactions({"👍": 3, "❤": 1})
     msg = build_mock_message(id=600, text="liked", reactions=reactions)
 
-    async def _iter_messages(**kwargs: Any):  # noqa: ANN202
-        yield msg
-
-    mock_client.iter_messages = _iter_messages
+    mock_client.get_messages = AsyncMock(return_value=MockTotalList([msg], total=1))
 
     worker = make_worker(mock_client, sync_db, shutdown_event)
     await worker.process_one_batch()
@@ -204,20 +194,12 @@ async def test_resume_from_checkpoint(
     )
     sync_db.commit()
 
-    captured_kwargs: dict[str, Any] = {}
-
-    async def _iter_messages(**kwargs: Any):  # noqa: ANN202
-        captured_kwargs.update(kwargs)
-        # Return empty to mark complete
-        return
-        yield  # make it an async generator
-
-    mock_client.iter_messages = _iter_messages
+    mock_client.get_messages = AsyncMock(return_value=MockTotalList([], total=0))
 
     worker = make_worker(mock_client, sync_db, shutdown_event)
     await worker.process_one_batch()
 
-    assert captured_kwargs.get("offset_id") == 500
+    assert mock_client.get_messages.call_args.kwargs.get("offset_id") == 500
 
 
 @pytest.mark.asyncio
@@ -240,11 +222,7 @@ async def test_progress_atomic_commit(
         build_mock_message(id=100),
     ]
 
-    async def _iter_messages(**kwargs: Any):  # noqa: ANN202
-        for m in msgs:
-            yield m
-
-    mock_client.iter_messages = _iter_messages
+    mock_client.get_messages = AsyncMock(return_value=MockTotalList(msgs, total=len(msgs)))
 
     worker = make_worker(mock_client, sync_db, shutdown_event)
     await worker.process_one_batch()
@@ -281,11 +259,7 @@ async def test_floodwait_sleep_continues(
     err = FloodWaitError(request=None)
     err.seconds = 5
 
-    async def _iter_messages_flood(**kwargs: Any):  # noqa: ANN202
-        raise err
-        yield  # make it an async generator
-
-    mock_client.iter_messages = _iter_messages_flood
+    mock_client.get_messages = AsyncMock(side_effect=err)
 
     slept_for: list[float] = []
 
@@ -325,11 +299,7 @@ async def test_floodwait_no_progress_loss(
     err = FloodWaitError(request=None)
     err.seconds = 2
 
-    async def _iter_messages_flood(**kwargs: Any):  # noqa: ANN202
-        raise err
-        yield
-
-    mock_client.iter_messages = _iter_messages_flood
+    mock_client.get_messages = AsyncMock(side_effect=err)
 
     async def _mock_wait_for(coro: Any, timeout: float) -> None:  # noqa: ANN401
         raise asyncio.TimeoutError
@@ -538,12 +508,17 @@ async def test_dm_bootstrap_entity_backfills_existing_enrollment(
 
 
 @pytest.mark.asyncio
-async def test_dm_bootstrap_skips_entity_for_nameless_user(
+async def test_dm_bootstrap_writes_tombstone_for_nameless_user(
     mock_client: MagicMock,
     sync_db: sqlite3.Connection,
     shutdown_event: asyncio.Event,
 ) -> None:
-    """bootstrap_dms() does not crash or write entity when user has no display name."""
+    """bootstrap_dms() writes entity row with name=NULL when user has no display name.
+
+    Invariant: every enrolled dialog must have an entity row after bootstrap so
+    that absence of a row unambiguously means "never enrolled", not "enrolled
+    but nameless".
+    """
     from telethon.tl import types  # type: ignore[import-untyped]
 
     user = MagicMock(spec=types.User)
@@ -560,8 +535,48 @@ async def test_dm_bootstrap_skips_entity_for_nameless_user(
     worker = make_worker(mock_client, sync_db, shutdown_event)
     await worker.bootstrap_dms()
 
-    row = sync_db.execute("SELECT id FROM entities WHERE id=?", (40003,)).fetchone()
-    assert row is None, "no entities row must be written when name is empty"
+    row = sync_db.execute(
+        "SELECT name, username FROM entities WHERE id=?", (40003,)
+    ).fetchone()
+    assert row is not None, "entity row must exist even when display name is empty"
+    assert row[0] is None, "name must be NULL for nameless user"
+    assert row[1] == "ghost", "username must be preserved"
+
+
+@pytest.mark.asyncio
+async def test_dm_bootstrap_invariant_every_enrolled_dialog_has_entity(
+    mock_client: MagicMock,
+    sync_db: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """After bootstrap_dms(), every enrolled dialog must have an entity row — named or not."""
+    from telethon.tl import types  # type: ignore[import-untyped]
+
+    def _make_user(first: str | None, last: str | None, username: str | None, dialog_id: int) -> SimpleNamespace:
+        user = MagicMock(spec=types.User)
+        user.first_name = first
+        user.last_name = last
+        user.username = username
+        return SimpleNamespace(entity=user, id=dialog_id)
+
+    dialogs = [
+        _make_user("Ivan", "Zakazov", "ivan_z", 50001),
+        _make_user(None, None, "ghost_bot", 50002),
+        _make_user(None, None, None, 50003),
+    ]
+
+    async def _iter_dialogs():  # noqa: ANN202
+        for d in dialogs:
+            yield d
+
+    mock_client.iter_dialogs = _iter_dialogs
+
+    worker = make_worker(mock_client, sync_db, shutdown_event)
+    await worker.bootstrap_dms()
+
+    enrolled = {row[0] for row in sync_db.execute("SELECT dialog_id FROM synced_dialogs").fetchall()}
+    entities = {row[0] for row in sync_db.execute("SELECT id FROM entities").fetchall()}
+    assert enrolled == entities, f"dialogs without entity rows: {enrolled - entities}"
 
 
 # ---------------------------------------------------------------------------
@@ -583,11 +598,7 @@ async def test_empty_batch_marks_synced(
     )
     sync_db.commit()
 
-    async def _iter_messages(**kwargs: Any):  # noqa: ANN202
-        return
-        yield
-
-    mock_client.iter_messages = _iter_messages
+    mock_client.get_messages = AsyncMock(return_value=MockTotalList([], total=100))
 
     worker = make_worker(mock_client, sync_db, shutdown_event)
     result = await worker.process_one_batch()
@@ -618,11 +629,7 @@ async def test_partial_batch_marks_synced(
 
     msgs = [build_mock_message(id=i) for i in range(50, 0, -1)]  # 50 messages
 
-    async def _iter_messages(**kwargs: Any):  # noqa: ANN202
-        for m in msgs:
-            yield m
-
-    mock_client.iter_messages = _iter_messages
+    mock_client.get_messages = AsyncMock(return_value=MockTotalList(msgs, total=50))
 
     worker = make_worker(mock_client, sync_db, shutdown_event)
     result = await worker.process_one_batch()
@@ -653,11 +660,7 @@ async def test_full_batch_not_marked_synced(
 
     msgs = [build_mock_message(id=i) for i in range(100, 0, -1)]  # exactly 100
 
-    async def _iter_messages(**kwargs: Any):  # noqa: ANN202
-        for m in msgs:
-            yield m
-
-    mock_client.iter_messages = _iter_messages
+    mock_client.get_messages = AsyncMock(return_value=MockTotalList(msgs, total=1000))
 
     worker = make_worker(mock_client, sync_db, shutdown_event)
     result = await worker.process_one_batch()
@@ -714,11 +717,7 @@ async def test_access_lost_channel_private(
 
     err = ChannelPrivateError(request=None)
 
-    async def _iter_messages(**kwargs: Any):  # noqa: ANN202
-        raise err
-        yield  # make it an async generator
-
-    mock_client.iter_messages = _iter_messages
+    mock_client.get_messages = AsyncMock(side_effect=err)
 
     worker = make_worker(mock_client, sync_db, shutdown_event)
     result = await worker.process_one_batch()
@@ -751,11 +750,7 @@ async def test_access_lost_chat_forbidden(
 
     err = ChatForbiddenError(request=None)
 
-    async def _iter_messages(**kwargs: Any):  # noqa: ANN202
-        raise err
-        yield
-
-    mock_client.iter_messages = _iter_messages
+    mock_client.get_messages = AsyncMock(side_effect=err)
 
     worker = make_worker(mock_client, sync_db, shutdown_event)
     result = await worker.process_one_batch()
@@ -788,11 +783,7 @@ async def test_access_lost_user_banned(
 
     err = UserBannedInChannelError(request=None)
 
-    async def _iter_messages(**kwargs: Any):  # noqa: ANN202
-        raise err
-        yield
-
-    mock_client.iter_messages = _iter_messages
+    mock_client.get_messages = AsyncMock(side_effect=err)
 
     worker = make_worker(mock_client, sync_db, shutdown_event)
     result = await worker.process_one_batch()
@@ -831,11 +822,7 @@ async def test_access_lost_preserves_messages(
 
     err = ChannelPrivateError(request=None)
 
-    async def _iter_messages(**kwargs: Any):  # noqa: ANN202
-        raise err
-        yield
-
-    mock_client.iter_messages = _iter_messages
+    mock_client.get_messages = AsyncMock(side_effect=err)
 
     worker = make_worker(mock_client, sync_db, shutdown_event)
     await worker.process_one_batch()
@@ -864,11 +851,7 @@ async def test_generic_rpc_error_still_skips(
 
     err = RPCError(request=None, message="SOME_GENERIC_ERROR", code=400)
 
-    async def _iter_messages(**kwargs: Any):  # noqa: ANN202
-        raise err
-        yield
-
-    mock_client.iter_messages = _iter_messages
+    mock_client.get_messages = AsyncMock(side_effect=err)
 
     worker = make_worker(mock_client, sync_db, shutdown_event)
     result = await worker.process_one_batch()
@@ -908,11 +891,7 @@ async def test_process_one_batch_populates_fts(
         build_mock_message(id=103, text="third message"),
     ]
 
-    async def _iter_messages(**kwargs: Any):  # noqa: ANN202
-        for m in msgs:
-            yield m
-
-    mock_client.iter_messages = _iter_messages
+    mock_client.get_messages = AsyncMock(return_value=MockTotalList(msgs, total=len(msgs)))
 
     worker = make_worker(mock_client, sync_db, shutdown_event)
     await worker.process_one_batch()
@@ -944,11 +923,7 @@ async def test_process_one_batch_fts_matches_message_ids(
 
     msgs = [build_mock_message(id=200, text="test"), build_mock_message(id=201, text="data")]
 
-    async def _iter_messages(**kwargs: Any):  # noqa: ANN202
-        for m in msgs:
-            yield m
-
-    mock_client.iter_messages = _iter_messages
+    mock_client.get_messages = AsyncMock(return_value=MockTotalList(msgs, total=len(msgs)))
 
     worker = make_worker(mock_client, sync_db, shutdown_event)
     await worker.process_one_batch()
@@ -1088,3 +1063,100 @@ def test_extract_reply_and_topic_forum_general():
     reply_id, topic_id = extract_reply_and_topic(msg)
     assert reply_id == 200
     assert topic_id == 1
+
+
+# ---------------------------------------------------------------------------
+# Phase 36-01: total_messages and last_synced_at writes
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_total_messages_written_on_batch(
+    mock_client: MagicMock,
+    sync_db: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """_fetch_batch writes total_messages from result.total to synced_dialogs."""
+    dialog_id = 8001
+    sync_db.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, sync_progress) VALUES (?, 'syncing', 0)",
+        (dialog_id,),
+    )
+    sync_db.commit()
+    msgs = [build_mock_message(id=300), build_mock_message(id=200), build_mock_message(id=100)]
+    mock_client.get_messages = AsyncMock(return_value=MockTotalList(msgs, total=9999))
+    worker = make_worker(mock_client, sync_db, shutdown_event)
+    await worker.process_one_batch()
+    row = sync_db.execute(
+        "SELECT total_messages FROM synced_dialogs WHERE dialog_id = ?", (dialog_id,)
+    ).fetchone()
+    assert row[0] == 9999
+
+
+@pytest.mark.asyncio
+async def test_last_synced_at_set_on_empty_batch(
+    mock_client: MagicMock,
+    sync_db: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """When _fetch_batch gets empty batch (is_done=True), last_synced_at is set."""
+    dialog_id = 8002
+    sync_db.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, sync_progress) VALUES (?, 'syncing', 100)",
+        (dialog_id,),
+    )
+    sync_db.commit()
+    mock_client.get_messages = AsyncMock(return_value=MockTotalList([], total=200))
+    worker = make_worker(mock_client, sync_db, shutdown_event)
+    await worker.process_one_batch()
+    row = sync_db.execute(
+        "SELECT last_synced_at, status FROM synced_dialogs WHERE dialog_id = ?", (dialog_id,)
+    ).fetchone()
+    assert row[0] is not None  # last_synced_at is set
+    assert row[1] == "synced"
+
+
+@pytest.mark.asyncio
+async def test_last_synced_at_set_on_partial_batch(
+    mock_client: MagicMock,
+    sync_db: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """When _fetch_batch gets partial batch (< 100 msgs), last_synced_at is set."""
+    dialog_id = 8003
+    sync_db.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, sync_progress) VALUES (?, 'syncing', 0)",
+        (dialog_id,),
+    )
+    sync_db.commit()
+    msgs = [build_mock_message(id=50), build_mock_message(id=40)]  # < 100 = partial
+    mock_client.get_messages = AsyncMock(return_value=MockTotalList(msgs, total=200))
+    worker = make_worker(mock_client, sync_db, shutdown_event)
+    await worker.process_one_batch()
+    row = sync_db.execute(
+        "SELECT last_synced_at, status FROM synced_dialogs WHERE dialog_id = ?", (dialog_id,)
+    ).fetchone()
+    assert row[0] is not None  # last_synced_at is set
+    assert row[1] == "synced"
+
+
+@pytest.mark.asyncio
+async def test_total_messages_written_on_completion(
+    mock_client: MagicMock,
+    sync_db: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """total_messages is written even on the completion (empty) batch."""
+    dialog_id = 8004
+    sync_db.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, sync_progress) VALUES (?, 'syncing', 100)",
+        (dialog_id,),
+    )
+    sync_db.commit()
+    mock_client.get_messages = AsyncMock(return_value=MockTotalList([], total=5000))
+    worker = make_worker(mock_client, sync_db, shutdown_event)
+    await worker.process_one_batch()
+    row = sync_db.execute(
+        "SELECT total_messages FROM synced_dialogs WHERE dialog_id = ?", (dialog_id,)
+    ).fetchone()
+    assert row[0] == 5000

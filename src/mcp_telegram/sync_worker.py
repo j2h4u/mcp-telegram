@@ -79,8 +79,16 @@ _NEXT_PENDING_SQL = (
 )
 
 _UPDATE_PROGRESS_SQL = (
-    "UPDATE synced_dialogs SET sync_progress = ?, status = ? WHERE dialog_id = ?"
+    "UPDATE synced_dialogs SET sync_progress = ?, status = ?, total_messages = ? "
+    "WHERE dialog_id = ?"
 )
+# Params: (progress, status, total_messages, dialog_id) — 4 params
+
+_UPDATE_PROGRESS_DONE_SQL = (
+    "UPDATE synced_dialogs SET sync_progress = ?, status = ?, total_messages = ?, "
+    "last_synced_at = ? WHERE dialog_id = ?"
+)
+# Params: (progress, status, total_messages, last_synced_at, dialog_id) — 5 params
 
 INSERT_DIALOG_SQL = (
     "INSERT OR IGNORE INTO synced_dialogs (dialog_id, status) VALUES (?, 'syncing')"
@@ -260,12 +268,11 @@ class FullSyncWorker:
                 entity = dialog.entity
                 first = getattr(entity, "first_name", None) or ""
                 last = getattr(entity, "last_name", None) or ""
-                name = f"{first} {last}".strip()
-                if name:
-                    self._conn.execute(
-                        UPSERT_ENTITY_SQL,
-                        (dialog.id, "user", name, getattr(entity, "username", None), latinize(name), now),
-                    )
+                name: str | None = f"{first} {last}".strip() or None
+                self._conn.execute(
+                    UPSERT_ENTITY_SQL,
+                    (dialog.id, "user", name, getattr(entity, "username", None), latinize(name) if name else None, now),
+                )
         except FloodWaitError as exc:
             wait_seconds = getattr(exc, "seconds", 60)
             logger.warning(
@@ -340,14 +347,13 @@ class FullSyncWorker:
         Returns:
             (new_progress, is_done)
         """
-        iter_kwargs: dict[str, object] = {
-            "entity": dialog_id,
-            "limit": 100,
-            "offset_id": sync_progress,
-        }
-
         try:
-            batch = [msg async for msg in self._client.iter_messages(**iter_kwargs)]
+            result = await self._client.get_messages(
+                entity=dialog_id, limit=100, offset_id=sync_progress
+            )
+            total_messages = result.total  # Telegram-side count from TotalList
+            batch = list(result)
+            # Note: batch size 100 keeps memory bounded; get_messages needed for .total
         except FloodWaitError as exc:
             logger.warning(
                 "FloodWait dialog_id=%d — sleeping %ds", dialog_id, exc.seconds
@@ -378,8 +384,10 @@ class FullSyncWorker:
 
         if not batch:
             # No more messages — dialog fully synced
+            now = int(time.time())
             self._conn.execute(
-                _UPDATE_PROGRESS_SQL, (sync_progress, "synced", dialog_id)
+                _UPDATE_PROGRESS_DONE_SQL,
+                (sync_progress, "synced", total_messages, now, dialog_id),
             )
             self._conn.commit()
             logger.info("sync_done dialog_id=%d status=synced (empty batch)", dialog_id)
@@ -393,9 +401,17 @@ class FullSyncWorker:
         # Single atomic transaction: messages + FTS + progress update
         with self._conn:
             insert_messages_with_fts(self._conn, rows)
-            self._conn.execute(
-                _UPDATE_PROGRESS_SQL, (new_progress, new_status, dialog_id)
-            )
+            if is_done:
+                now = int(time.time())
+                self._conn.execute(
+                    _UPDATE_PROGRESS_DONE_SQL,
+                    (new_progress, new_status, total_messages, now, dialog_id),
+                )
+            else:
+                self._conn.execute(
+                    _UPDATE_PROGRESS_SQL,
+                    (new_progress, new_status, total_messages, dialog_id),
+                )
 
         logger.debug(
             "sync_batch dialog_id=%d fetched=%d progress=%d done=%s",

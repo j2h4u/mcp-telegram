@@ -52,3 +52,17 @@ def build_mock_reactions(counts: dict[str, int]) -> SimpleNamespace:
         for emoji, count in counts.items()
     ]
     return SimpleNamespace(results=results)
+
+
+class MockTotalList(list):
+    """List subclass with .total attribute, mimicking Telethon TotalList.
+
+    Use in tests that switch from iter_messages to get_messages:
+        mock_client.get_messages = AsyncMock(
+            return_value=MockTotalList([msg1, msg2], total=500)
+        )
+    """
+
+    def __init__(self, items: list, total: int | None = None) -> None:
+        super().__init__(items)
+        self.total = total if total is not None else len(items)
