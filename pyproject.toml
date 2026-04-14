@@ -13,6 +13,7 @@ dependencies = [
   "rapidfuzz>=3.14.3",
   "anyascii>=0.3.3",
   "snowballstemmer>=3.0.1",
+  "phonenumbers>=9.0.28",
 ]
 
 [build-system]

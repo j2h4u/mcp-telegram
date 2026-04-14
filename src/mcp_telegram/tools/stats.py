@@ -6,7 +6,7 @@ from ..errors import (
     no_usage_data_text,
     usage_stats_query_error_text,
 )
-from ._base import DaemonNotRunningError, ToolArgs, ToolResult, _check_daemon_response, _daemon_not_running_text, _text_response, daemon_connection, mcp_tool
+from ._base import DaemonNotRunningError, ToolAnnotations, ToolArgs, ToolResult, _check_daemon_response, _daemon_not_running_text, _text_response, daemon_connection, mcp_tool
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +68,7 @@ class GetUsageStats(ToolArgs):
     pass
 
 
-@mcp_tool("secondary/helper")
+@mcp_tool("secondary/helper", annotations=ToolAnnotations(readOnlyHint=True))
 async def get_usage_stats(args: GetUsageStats) -> ToolResult:
     try:
         async with daemon_connection() as conn:

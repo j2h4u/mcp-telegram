@@ -343,6 +343,36 @@ async def test_auto_enroll_no_entity_when_sender_unavailable(
 
 
 @pytest.mark.asyncio
+async def test_auto_enroll_writes_tombstone_for_nameless_sender(
+    mock_client: MagicMock,
+    sync_db: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """Auto-enroll writes entity row with name=NULL when sender has no display name."""
+    dialog_id = 7013
+    sender = SimpleNamespace(first_name=None, last_name=None, username="ghost_bot")
+
+    msg = build_mock_message(id=1, text="beep")
+    event = SimpleNamespace(
+        chat_id=dialog_id,
+        message=msg,
+        is_private=True,
+        get_sender=AsyncMock(return_value=sender),
+    )
+
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+    manager.register()
+    await manager.on_new_message(event)
+
+    row = sync_db.execute(
+        "SELECT name, username FROM entities WHERE id=?", (dialog_id,)
+    ).fetchone()
+    assert row is not None, "entity row must exist even when sender has no display name"
+    assert row[0] is None, "name must be NULL for nameless sender"
+    assert row[1] == "ghost_bot", "username must be preserved"
+
+
+@pytest.mark.asyncio
 async def test_on_new_message_updates_last_event_at(
     mock_client: MagicMock,
     sync_db: sqlite3.Connection,

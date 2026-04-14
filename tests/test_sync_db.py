@@ -465,27 +465,27 @@ def test_schema_v5_telemetry_index_exists(tmp_sync_db_path: Path) -> None:
         conn.close()
 
 
-def test_schema_version_is_5(tmp_sync_db_path: Path) -> None:
-    """After ensure_sync_schema(), MAX(version) in schema_version is 5."""
+def test_schema_version_is_6(tmp_sync_db_path: Path) -> None:
+    """After ensure_sync_schema(), MAX(version) in schema_version is 6."""
     ensure_sync_schema(tmp_sync_db_path)
     conn = _open_sync_db(tmp_sync_db_path)
     try:
         row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
-        assert row is not None and row[0] == 5, f"Expected version 5, got {row[0]}"
+        assert row is not None and row[0] == 6, f"Expected version 6, got {row[0]}"
     finally:
         conn.close()
 
 
-def test_ensure_sync_schema_twice_idempotent_v5(tmp_sync_db_path: Path) -> None:
-    """Running ensure_sync_schema twice is idempotent — no errors, version stays 5."""
+def test_ensure_sync_schema_twice_idempotent_v6(tmp_sync_db_path: Path) -> None:
+    """Running ensure_sync_schema twice is idempotent — no errors, version stays 6."""
     ensure_sync_schema(tmp_sync_db_path)
     ensure_sync_schema(tmp_sync_db_path)
     conn = _open_sync_db(tmp_sync_db_path)
     try:
         row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
-        assert row is not None and row[0] == 5
+        assert row is not None and row[0] == 6
         rows = conn.execute("SELECT * FROM schema_version ORDER BY version").fetchall()
-        assert len(rows) == 5, f"Expected 5 schema_version rows, got {len(rows)}"
+        assert len(rows) == 6, f"Expected 6 schema_version rows, got {len(rows)}"
     finally:
         conn.close()
 
@@ -721,6 +721,6 @@ def test_schema_version_records_all_versions(tmp_path: Path) -> None:
                 "SELECT version FROM schema_version ORDER BY version"
             ).fetchall()
         ]
-        assert versions == [1, 2, 3, 4, 5], f"expected all 5 versions, got {versions}"
+        assert versions == [1, 2, 3, 4, 5, 6], f"expected all 6 versions, got {versions}"
     finally:
         conn.close()

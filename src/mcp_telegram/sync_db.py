@@ -9,7 +9,7 @@ from pathlib import Path
 
 from xdg_base_dirs import xdg_state_home  # type: ignore[import-error]
 
-_CURRENT_SCHEMA_VERSION = 5
+_CURRENT_SCHEMA_VERSION = 6
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +70,7 @@ _ENTITY_TABLE_DDL = """
 CREATE TABLE IF NOT EXISTS entities (
     id              INTEGER PRIMARY KEY,
     type            TEXT NOT NULL,
-    name            TEXT NOT NULL,
+    name            TEXT,
     username        TEXT,
     name_normalized TEXT,
     updated_at      INTEGER NOT NULL
@@ -284,6 +284,30 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     ])
 
     _migrate(5, [_TELEMETRY_EVENTS_DDL, _TELEMETRY_EVENTS_INDEX_DDL])
+
+    _migrate(6, [
+        # SQLite cannot ALTER COLUMN to drop NOT NULL — recreate with nullable name.
+        """CREATE TABLE entities_new (
+            id              INTEGER PRIMARY KEY,
+            type            TEXT NOT NULL,
+            name            TEXT,
+            username        TEXT,
+            name_normalized TEXT,
+            updated_at      INTEGER NOT NULL
+        )""",
+        "INSERT INTO entities_new SELECT id, type, name, username, name_normalized, updated_at FROM entities",
+        "DROP TABLE entities",
+        "ALTER TABLE entities_new RENAME TO entities",
+        "CREATE INDEX IF NOT EXISTS idx_entities_type_updated ON entities(type, updated_at)",
+        "CREATE INDEX IF NOT EXISTS idx_entities_username ON entities(username)",
+        # Backfill tombstone rows for enrolled dialogs that have no entity row yet.
+        (
+            "INSERT OR IGNORE INTO entities (id, type, updated_at) "
+            "SELECT dialog_id, 'user', strftime('%s', 'now') "
+            "FROM synced_dialogs "
+            "WHERE dialog_id NOT IN (SELECT id FROM entities)"
+        ),
+    ])
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 

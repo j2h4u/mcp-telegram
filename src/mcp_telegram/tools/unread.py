@@ -9,6 +9,7 @@ from ..formatter import UnreadChatData, format_unread_messages_grouped
 from ._adapters import DaemonMessage
 from ._base import (
     DaemonNotRunningError,
+    ToolAnnotations,
     ToolArgs,
     ToolResult,
     _check_daemon_response,
@@ -49,7 +50,7 @@ class ListUnreadMessages(ToolArgs):
     )
 
 
-@mcp_tool("primary")
+@mcp_tool("primary", annotations=ToolAnnotations(readOnlyHint=True))
 async def list_unread_messages(args: ListUnreadMessages) -> ToolResult:
     try:
         async with daemon_connection() as conn:

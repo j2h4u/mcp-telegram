@@ -13,6 +13,7 @@ from mcp.types import (
     ImageContent,
     TextContent,
     Tool,
+    ToolAnnotations,
 )
 from pydantic import BaseModel, ConfigDict
 
@@ -138,10 +139,10 @@ async def tool_runner(
 # Explicit tool registry — replaces class introspection + sys.modules lookup
 # ---------------------------------------------------------------------------
 
-TOOL_REGISTRY: dict[str, tuple[type[ToolArgs], str]] = {}
+TOOL_REGISTRY: dict[str, tuple[type[ToolArgs], str, ToolAnnotations | None]] = {}
 
 
-def mcp_tool(posture: str = "primary"):
+def mcp_tool(posture: str = "primary", *, annotations: ToolAnnotations | None = None):
     """Register runner with singledispatch + telemetry + tool registry.
 
     ``posture`` is a free-form label prepended to the tool description so the
@@ -150,10 +151,14 @@ def mcp_tool(posture: str = "primary"):
     * ``"primary"`` — core tools the LLM should reach for first.
     * ``"secondary/helper"`` — supporting tools (e.g. analytics, diagnostics).
 
+    ``annotations`` is an optional ``ToolAnnotations`` instance carrying MCP
+    behavioural hints (``readOnlyHint``, ``destructiveHint``, etc.) that
+    clients and orchestrators use to gauge safety before invoking the tool.
+
     Replaces the 3-step manual registration:
       1. @tool_runner.register
       2. @_track_tool_telemetry("ToolName")
-      3. TOOL_REGISTRY["ToolName"] = (ToolClass, posture)
+      3. TOOL_REGISTRY["ToolName"] = (ToolClass, posture, annotations)
 
     The decorated function must have a parameter annotated as ``args: YourToolArgs``
     — the parameter name ``args`` is required (used for type hint introspection).
@@ -161,7 +166,7 @@ def mcp_tool(posture: str = "primary"):
     Usage:
         class MyTool(ToolArgs): ...
 
-        @mcp_tool("primary")
+        @mcp_tool("primary", annotations=ToolAnnotations(readOnlyHint=True))
         async def my_tool(args: MyTool) -> ToolResult: ...
     """
     def decorator(fn):
@@ -173,7 +178,7 @@ def mcp_tool(posture: str = "primary"):
         # Register with singledispatch
         tool_runner.register(cls, wrapped)
         # Add to registry
-        TOOL_REGISTRY[name] = (cls, posture)
+        TOOL_REGISTRY[name] = (cls, posture, annotations)
         return wrapped
     return decorator
 
@@ -183,11 +188,13 @@ def tool_description(args: type[ToolArgs]) -> Tool:
     schema = _sanitize_tool_schema(args.model_json_schema())
     entry = TOOL_REGISTRY.get(args.__name__)
     posture = entry[1] if entry else ""
+    tool_annotations = entry[2] if entry else None
     prefix = f"[{posture}] " if posture else ""
     return Tool(
         name=args.__name__,
         description=f"{prefix}{args.__doc__}",
         inputSchema=schema,
+        annotations=tool_annotations,
     )
 
 
@@ -252,7 +259,7 @@ def verify_tool_registry() -> None:
     The expected decorator stack is @tool_runner.register (outer) then @_track_tool_telemetry (inner).
     singledispatch sees the original type annotation via __wrapped__ on the telemetry wrapper.
     """
-    for name, (cls, _posture) in TOOL_REGISTRY.items():
+    for name, (cls, _posture, _annotations) in TOOL_REGISTRY.items():
         if cls.__name__ != name:
             raise RuntimeError(f"Registry key {name!r} != class {cls.__name__!r}")
         dispatched = tool_runner.dispatch(cls)

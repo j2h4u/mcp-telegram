@@ -17,7 +17,7 @@ class DaemonMessage:
 
     __slots__ = (
         "id", "date", "message", "sender", "reply_to", "reactions", "media",
-        "edit_date", "topic_title",
+        "edit_date", "topic_title", "dialog_name",
     )
 
     def __init__(self, row: dict) -> None:
@@ -40,6 +40,7 @@ class DaemonMessage:
         else:
             self.edit_date = None
         self.topic_title: str | None = row.get("topic_title")
+        self.dialog_name: str | None = row.get("dialog_name")
 
 
 class Sender:

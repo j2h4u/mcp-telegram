@@ -138,6 +138,8 @@ class DaemonConnection:
         topic_id: int | None = None,
         unread_after_id: int | None = None,
         unread: bool | None = None,
+        context_message_id: int | None = None,
+        context_size: int | None = None,
     ) -> dict:
         """Send list_messages request to the daemon.
 
@@ -174,6 +176,10 @@ class DaemonConnection:
             payload["unread_after_id"] = unread_after_id
         if unread is not None:
             payload["unread"] = unread
+        if context_message_id is not None:
+            payload["context_message_id"] = context_message_id
+        if context_size is not None:
+            payload["context_size"] = context_size
         return await self.request(payload)
 
     async def search_messages(

@@ -209,9 +209,15 @@ def no_unread_all_text() -> str:
     return "No unread messages."
 
 
-def search_no_hits_text(dialog_name: str, query: str) -> str:
-    """Return an action-oriented response when search finds no hits."""
-    return action_text(
-        f'No messages matched query "{query}" in dialog "{dialog_name}".',
-        "Retry SearchMessages with a broader query, without navigation, or in a different dialog.",
-    )
+def search_no_hits_text(dialog_name: str | None, query: str) -> str:
+    """Return an action-oriented response when search finds no hits.
+
+    Pass dialog_name=None for global (all-dialogs) searches.
+    """
+    if dialog_name is None:
+        scope = "across all synced dialogs"
+        hint = "Retry SearchMessages with a broader query or without navigation."
+    else:
+        scope = f'in dialog "{dialog_name}"'
+        hint = "Retry SearchMessages with a broader query, without navigation, or in a different dialog."
+    return action_text(f'No messages matched query "{query}" {scope}.', hint)
