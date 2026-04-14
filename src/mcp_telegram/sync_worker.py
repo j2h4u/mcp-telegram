@@ -385,11 +385,11 @@ class FullSyncWorker:
         if not batch:
             # No more messages — dialog fully synced
             now = int(time.time())
-            self._conn.execute(
-                _UPDATE_PROGRESS_DONE_SQL,
-                (sync_progress, "synced", total_messages, now, dialog_id),
-            )
-            self._conn.commit()
+            with self._conn:
+                self._conn.execute(
+                    _UPDATE_PROGRESS_DONE_SQL,
+                    (sync_progress, "synced", total_messages, now, dialog_id),
+                )
             logger.info("sync_done dialog_id=%d status=synced (empty batch)", dialog_id)
             return sync_progress, True
 

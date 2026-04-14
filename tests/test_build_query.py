@@ -76,6 +76,17 @@ def test_sender_name_filter() -> None:
     assert params == [100, "%Alice%", 20]
 
 
+def test_sender_name_like_escapes_special_chars() -> None:
+    """%, _, and \\ in sender_name are escaped so they match literally."""
+    sql, params = _build_list_messages_query(
+        dialog_id=100, limit=20, sender_name="100% real_name\\here"
+    )
+    # SQL literal uses single backslash as the ESCAPE char
+    assert "ESCAPE '\\'" in sql
+    # input: "100% real_name\here"  →  \→\\, %→\%, _→\_  →  wrapped in %
+    assert params == [100, "%100\\% real\\_name\\\\here%", 20]
+
+
 def test_sender_id_takes_precedence_over_name() -> None:
     """When both sender_id and sender_name are provided, sender_id wins."""
     sql, params = _build_list_messages_query(

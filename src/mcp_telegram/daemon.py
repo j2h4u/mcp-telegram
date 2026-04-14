@@ -76,7 +76,14 @@ def _create_tracked_task(coro: Any, *, name: str | None = None) -> asyncio.Task:
     """Create an asyncio task and track it for shutdown cancellation."""
     task = asyncio.create_task(coro, name=name)
     _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
+
+    def _on_done(t: asyncio.Task) -> None:
+        _background_tasks.discard(t)
+        exc = t.exception() if not t.cancelled() else None
+        if exc is not None:
+            logger.error("background_task_failed name=%s error=%s", t.get_name(), exc, exc_info=exc)
+
+    task.add_done_callback(_on_done)
     return task
 
 
@@ -308,8 +315,10 @@ async def sync_main() -> None:
         for task in list(_background_tasks):
             try:
                 await task
-            except (asyncio.CancelledError, Exception):
+            except asyncio.CancelledError:
                 pass
+            except Exception:
+                logger.warning("background_task_shutdown_error name=%s", task.get_name(), exc_info=True)
         _background_tasks.clear()
         await client.disconnect()
         logger.info("sync-daemon stopped")

@@ -1279,6 +1279,7 @@ class DaemonAPIServer:
         else:
             self._conn.execute(_UNMARK_SYNC_SQL, (dialog_id,))
         self._conn.commit()
+        logger.info("mark_dialog_for_sync dialog_id=%d enable=%s", dialog_id, enable)
         return {"ok": True}
 
     # ------------------------------------------------------------------
