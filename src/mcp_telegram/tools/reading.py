@@ -10,6 +10,7 @@ from ..resolver import parse_exact_dialog_id
 from ._adapters import DaemonMessage
 from ._base import (
     DaemonNotRunningError,
+    ToolAnnotations,
     ToolArgs,
     ToolResult,
     _text_response,
@@ -22,12 +23,15 @@ from ._base import (
 # ---------------------------------------------------------------------------
 
 
-def _format_daemon_messages(rows: list[dict]) -> str:
+def _format_daemon_messages(rows: list[dict], *, global_mode: bool = False) -> str:
     """Format daemon row dicts into human-readable message text.
 
     Produces the same HH:mm Name: text format as format_messages(),
     but handles pre-formatted media descriptions and skips Telethon-specific
     protocol details that don't apply to daemon rows.
+
+    When global_mode=True, prefixes each line with "[dialog_name]" so results
+    from different dialogs are distinguishable.
     """
     if not rows:
         return ""
@@ -41,11 +45,73 @@ def _format_daemon_messages(rows: list[dict]) -> str:
     has_topics = any(getattr(m, "topic_title", None) for m in messages)
     topic_name_getter = (lambda msg: getattr(msg, "topic_title", None)) if has_topics else None
 
+    line_prefix_getter = (
+        (lambda msg: f"[{getattr(msg, 'dialog_name', None) or '?'}]") if global_mode else None
+    )
+
     return format_messages(
         messages,  # type: ignore[arg-type]
         reply_map=reply_map,  # type: ignore[arg-type]
         topic_name_getter=topic_name_getter,
+        line_prefix_getter=line_prefix_getter,
     )
+
+
+# ---------------------------------------------------------------------------
+# Search result formatting — snippets + anchors
+# ---------------------------------------------------------------------------
+
+_SNIPPET_MAX_LEN = 150
+_SNIPPET_LEAD = 50  # chars to show before the matched word
+
+
+def _extract_snippet(text: str | None, query: str) -> str:
+    """Return a short excerpt from *text* centred on the first query word match.
+
+    Falls back to a simple head-truncation when no query word appears in the
+    original text (e.g. stemming produced a morphologically distant match).
+    """
+    if not text:
+        return "(no text)"
+    if len(text) <= _SNIPPET_MAX_LEN:
+        return text
+
+    for word in query.split():
+        pos = text.lower().find(word.lower())
+        if pos >= 0:
+            start = max(0, pos - _SNIPPET_LEAD)
+            end = min(len(text), start + _SNIPPET_MAX_LEN)
+            snippet = text[start:end]
+            prefix = "..." if start > 0 else ""
+            suffix = "..." if end < len(text) else ""
+            return f"{prefix}{snippet}{suffix}"
+
+    return text[:_SNIPPET_MAX_LEN] + "..."
+
+
+def _format_search_results(rows: list[dict], query: str, *, global_mode: bool = False) -> str:
+    """Format search result rows as compact snippet lines with msg_id anchors.
+
+    Each line:  [DialogName] YYYY-MM-DD HH:MM Sender (msg_id:N): "...snippet..."
+
+    dialog_name prefix is included only when global_mode=True.
+    """
+    if not rows:
+        return ""
+
+    lines: list[str] = []
+    for row in rows:
+        msg_id = row["message_id"]
+        sent_at = row.get("sent_at") or 0
+        sender = row.get("sender_first_name") or "?"
+        dt = datetime.fromtimestamp(int(sent_at), tz=timezone.utc)
+        time_str = dt.strftime("%Y-%m-%d %H:%M")
+        snippet = _extract_snippet(row.get("text"), query)
+
+        dialog_prefix = f"[{row.get('dialog_name') or '?'}] " if global_mode else ""
+        lines.append(f'{dialog_prefix}{time_str} {sender} (msg_id:{msg_id}): "{snippet}"')
+
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -66,7 +132,11 @@ class ListMessages(ToolArgs):
 
     Use navigation="newest" (or omit navigation) to start from the latest messages.
     Use navigation="oldest" to start from the oldest messages in the dialog.
-    Use navigation= with the next_navigation token from a previous response to continue.
+    Use navigation= with the next_navigation token from a previous response to continue paging.
+    To read an entire channel or chat history: call this tool repeatedly, passing the next_navigation
+    token from each response as navigation= in the next call. Stop when next_navigation is absent.
+
+    dialog= accepts: fuzzy name, @username, numeric id, or https://t.me/username links directly.
     Use sender= to filter messages from a specific person (name string, resolved via fuzzy match).
     Use topic= to filter messages to one forum topic after the dialog has been resolved.
     Use exact_topic_id= when the forum topic is already known and you want the direct-read path
@@ -74,10 +144,11 @@ class ListMessages(ToolArgs):
     In forum dialogs, omitting topic= returns a cross-topic page and each message is labeled inline.
     Use unread=True to show only messages you haven't read yet.
     Default limit=50; set limit explicitly if you want a smaller MCP response.
+    Use anchor_message_id= with a msg_id: value from SearchMessages to read context around a hit.
+    anchor_message_id requires the dialog to be synced; use exact_dialog_id= on this path.
 
     If response is ambiguous (multiple matches), retry with one exact selector instead of leaving
     both fuzzy and exact selectors in the same request.
-    For @username lookups, prepend @ to the name: dialog="@username".
     """
 
     dialog: str | None = Field(
@@ -127,6 +198,21 @@ class ListMessages(ToolArgs):
         ),
     )
     unread: bool = False
+    anchor_message_id: int | None = Field(
+        default=None,
+        description=(
+            "Optional message id to centre the response on. Returns context_size messages "
+            "around this message (half before, half after). Requires the dialog to be synced. "
+            "When set, navigation and direction are ignored. "
+            "Obtain from msg_id: values in SearchMessages results."
+        ),
+    )
+    context_size: int = Field(
+        default=10,
+        ge=2,
+        le=50,
+        description="Number of messages to return around anchor_message_id (default 10).",
+    )
 
     @model_validator(mode="after")
     def validate_direct_read_selectors(self) -> ListMessages:
@@ -187,7 +273,7 @@ async def _resolve_topic_id(
     )
 
 
-@mcp_tool("primary")
+@mcp_tool("primary", annotations=ToolAnnotations(readOnlyHint=True))
 async def list_messages(args: ListMessages) -> ToolResult:
     has_filter = bool(args.sender or args.topic or args.exact_topic_id is not None or args.unread)
     has_cursor = args.navigation is not None and args.navigation not in {"newest", "oldest"}
@@ -243,6 +329,8 @@ async def list_messages(args: ListMessages) -> ToolResult:
                 sender_name=sender_name,
                 topic_id=topic_id,
                 unread=unread_flag,
+                context_message_id=args.anchor_message_id,
+                context_size=args.context_size if args.anchor_message_id else None,
             )
     except DaemonNotRunningError as e:
         return ToolResult(content=_text_response(str(e)))
@@ -257,6 +345,15 @@ async def list_messages(args: ListMessages) -> ToolResult:
                 has_filter=has_filter,
                 has_cursor=has_cursor,
             )
+        if error == "not_synced":
+            return ToolResult(
+                content=_text_response(
+                    "Error: dialog is not synced. "
+                    "Use MarkDialogForSync to enable sync, then wait for syncing to complete."
+                ),
+                has_filter=has_filter,
+                has_cursor=has_cursor,
+            )
         return ToolResult(
             content=_text_response(f"Error: {error}: {error_detail}"),
             has_filter=has_filter,
@@ -268,13 +365,44 @@ async def list_messages(args: ListMessages) -> ToolResult:
     source = data.get("source", "unknown")
     next_nav = data.get("next_navigation")
 
+    # Access metadata from daemon response
+    dialog_access = data.get("dialog_access", "live")
+    last_synced_at = data.get("last_synced_at")
+    last_event_at = data.get("last_event_at")
+    sync_coverage_pct = data.get("sync_coverage_pct")
+    archived_message_count = data.get("archived_message_count")
+
     text = _format_daemon_messages(rows)
     if not text:
         text = "No messages found."
 
+    warning = ""
+    if dialog_access == "archived":
+        # Use last_synced_at or last_event_at for "last sync" date (NOT access_lost_at)
+        sync_ts = last_synced_at or last_event_at
+        if sync_ts:
+            date_str = datetime.fromtimestamp(sync_ts, tz=timezone.utc).strftime("%Y-%m-%d")
+        else:
+            date_str = "unknown date"
+        warning = (
+            "\u26a0 No current access to this dialog. "
+            f"Messages are from the local archive (last sync: {date_str}).\n"
+        )
+        if sync_coverage_pct is not None and sync_coverage_pct < 100:
+            warning += f"Archive coverage: {sync_coverage_pct}% of dialog history.\n"
+        elif sync_coverage_pct is None:
+            # Per CONTEXT.md: access_lost + total_messages=NULL -> "N messages archived, coverage unknown"
+            if archived_message_count is not None:
+                warning += (
+                    f"Archive coverage: unknown "
+                    f"({archived_message_count} messages archived locally).\n"
+                )
+            else:
+                warning += "Archive coverage: unknown.\n"
+
     source_note = f"[source: {source}]\n" if source else ""
     nav_note = f"\nnext_navigation: {next_nav}" if next_nav else ""
-    result_text = source_note + text + nav_note
+    result_text = warning + source_note + text + nav_note
 
     return ToolResult(
         content=_text_response(result_text),
@@ -291,21 +419,30 @@ async def list_messages(args: ListMessages) -> ToolResult:
 
 class SearchMessages(ToolArgs):
     """
-    Search messages in a dialog by text query. Returns matching messages newest to oldest.
+    Search messages by text query. Returns matching messages ranked by relevance.
 
-    Omit navigation to start from the first search page.
-    Use navigation= with the next_navigation token from a previous response to continue.
+    - Without dialog: searches across all synced dialogs. Each result includes the dialog name.
+    - With dialog: scoped to that dialog only.
 
-    If response is ambiguous, use the numeric ID from the matches list to disambiguate.
+    Each result is a compact one-liner with a msg_id: anchor:
+      [Dialog] 2024-01-15 14:32 Ivan (msg_id:42): "...snippet..."
+
+    To read context around a hit, call ListMessages with exact_dialog_id and anchor_message_id=42.
+
+    Omit navigation to start a new search.
+    Pass the next_navigation token from a previous response to continue paging.
+
     For @username lookups, prepend @ to the dialog name: dialog="@channel_name".
     """
 
-    dialog: str = Field(
+    dialog: str | None = Field(
+        default=None,
         max_length=500,
         description=(
-            "Dialog selector for one scoped search. Accepts an exact numeric dialog id for the "
-            "direct path, or @username / fuzzy dialog name for the ambiguity-safe path."
-        )
+            "Optional dialog selector. Omit to search all synced dialogs. "
+            "Provide an exact numeric dialog id, @username, or fuzzy dialog name to scope "
+            "the search to one dialog."
+        ),
     )
     query: str = Field(max_length=500)
     limit: int = Field(default=20, ge=1, le=200)
@@ -320,14 +457,17 @@ class SearchMessages(ToolArgs):
     )
 
 
-@mcp_tool("primary")
+@mcp_tool("primary", annotations=ToolAnnotations(readOnlyHint=True))
 async def search_messages(args: SearchMessages) -> ToolResult:
+    global_mode = args.dialog is None
+
     # Resolve dialog_id locally if possible (numeric string / @username)
     dialog_id: int | None = None
-    exact_id = parse_exact_dialog_id(args.dialog)
-    if exact_id is not None:
-        dialog_id = exact_id
-    # If still None, dialog name goes to daemon for server-side resolution
+    if not global_mode:
+        exact_id = parse_exact_dialog_id(args.dialog)
+        if exact_id is not None:
+            dialog_id = exact_id
+        # If still None, dialog name goes to daemon for server-side resolution
 
     # Decode offset from navigation token if provided
     offset = 0
@@ -346,9 +486,12 @@ async def search_messages(args: SearchMessages) -> ToolResult:
             )
 
     try:
-        id_kwarg: dict = (
-            {"dialog_id": dialog_id} if dialog_id else {"dialog": args.dialog}
-        )
+        if global_mode:
+            id_kwarg: dict = {}
+        elif dialog_id:
+            id_kwarg = {"dialog_id": dialog_id}
+        else:
+            id_kwarg = {"dialog": args.dialog}
         async with daemon_connection() as conn:
             response = await conn.search_messages(
                 **id_kwarg,
@@ -378,7 +521,14 @@ async def search_messages(args: SearchMessages) -> ToolResult:
     data = response.get("data", {})
     rows = data.get("messages", [])
     next_nav = data.get("next_navigation")
-    dialog_label = str(dialog_id) if dialog_id else args.dialog
+    dialog_label: str | None = str(dialog_id) if dialog_id else args.dialog
+
+    # Access metadata from daemon response (None for global search — omitted)
+    dialog_access = data.get("dialog_access")
+    last_synced_at = data.get("last_synced_at")
+    last_event_at = data.get("last_event_at")
+    sync_coverage_pct = data.get("sync_coverage_pct")
+    archived_message_count = data.get("archived_message_count")
 
     if not rows:
         result_text = search_no_hits_text(dialog_label, args.query)
@@ -389,9 +539,33 @@ async def search_messages(args: SearchMessages) -> ToolResult:
             has_cursor=args.navigation is not None,
         )
 
-    text = _format_daemon_messages(rows)
+    text = _format_search_results(rows, args.query, global_mode=global_mode)
     nav_note = f"\nnext_navigation: {next_nav}" if next_nav else ""
-    result_text = text + nav_note
+
+    warning = ""
+    if dialog_access == "archived":
+        # Use last_synced_at or last_event_at for "last sync" date (NOT access_lost_at)
+        sync_ts = last_synced_at or last_event_at
+        if sync_ts:
+            date_str = datetime.fromtimestamp(sync_ts, tz=timezone.utc).strftime("%Y-%m-%d")
+        else:
+            date_str = "unknown date"
+        warning = (
+            "\u26a0 No current access to this dialog. "
+            f"Messages are from the local archive (last sync: {date_str}).\n"
+        )
+        if sync_coverage_pct is not None and sync_coverage_pct < 100:
+            warning += f"Archive coverage: {sync_coverage_pct}% of dialog history.\n"
+        elif sync_coverage_pct is None:
+            if archived_message_count is not None:
+                warning += (
+                    f"Archive coverage: unknown "
+                    f"({archived_message_count} messages archived locally).\n"
+                )
+            else:
+                warning += "Archive coverage: unknown.\n"
+
+    result_text = warning + text + nav_note
 
     return ToolResult(
         content=_text_response(result_text),

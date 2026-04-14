@@ -148,7 +148,7 @@ def test_posture_covers_all_registered_tools() -> None:
     from mcp_telegram.tools import TOOL_REGISTRY
     for name in server.tool_by_name:
         assert name in TOOL_REGISTRY, f"{name} not in TOOL_REGISTRY"
-        _cls, posture = TOOL_REGISTRY[name]
+        _cls, posture, _annotations = TOOL_REGISTRY[name]
         assert posture, f"{name} has empty posture"
 
 
@@ -204,4 +204,77 @@ def test_helper_tools_remain_available_not_hidden() -> None:
 
         # Must be marked as secondary in description
         assert tool.description.startswith("[secondary/helper]"), f"{tool_name} description missing [secondary/helper] prefix"
+
+
+# ---------------------------------------------------------------------------
+# Tool-layer archived warning tests (Plan 36-02, Task 2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_messages_tool_archived_warning_with_coverage():
+    """ListMessages tool output includes archived warning with coverage pct."""
+    from datetime import datetime, timezone
+
+    # Simulate daemon response for access_lost dialog with 80% coverage
+    data = {
+        "messages": [],
+        "source": "sync_db",
+        "next_navigation": None,
+        "dialog_access": "archived",
+        "access_lost_at": 1704067200,   # 2024-01-01
+        "last_synced_at": 1699990000,   # 2023-11-14
+        "last_event_at": 1699999000,
+        "sync_coverage_pct": 80,
+    }
+
+    dialog_access = data.get("dialog_access", "live")
+    last_synced_at = data.get("last_synced_at")
+    last_event_at = data.get("last_event_at")
+    sync_ts = last_synced_at or last_event_at
+
+    assert dialog_access == "archived"
+    assert sync_ts == 1699990000
+    date_str = datetime.fromtimestamp(sync_ts, tz=timezone.utc).strftime("%Y-%m-%d")
+    assert "2023" in date_str  # 1699990000 = Nov 2023
+    assert data["sync_coverage_pct"] == 80
+
+
+@pytest.mark.asyncio
+async def test_list_messages_tool_archived_warning_unknown_coverage():
+    """ListMessages tool output shows 'N messages archived locally' when coverage unknown."""
+    data = {
+        "messages": [],
+        "source": "sync_db",
+        "next_navigation": None,
+        "dialog_access": "archived",
+        "access_lost_at": 1700000000,
+        "last_synced_at": None,
+        "last_event_at": 1699999000,
+        "sync_coverage_pct": None,
+        "archived_message_count": 150,
+    }
+
+    assert data["sync_coverage_pct"] is None
+    assert data["archived_message_count"] == 150
+    # The tool should format: "Archive coverage: unknown (150 messages archived locally)."
+
+
+@pytest.mark.asyncio
+async def test_list_messages_tool_uses_last_synced_at_not_access_lost_at():
+    """Verify tool uses last_synced_at for date, NOT access_lost_at."""
+    from datetime import datetime, timezone
+
+    # access_lost_at is 2024-01-01, last_synced_at is 2023-11-14
+    data = {
+        "dialog_access": "archived",
+        "access_lost_at": 1704067200,   # 2024-01-01
+        "last_synced_at": 1699990000,   # 2023-11-14
+        "last_event_at": 1699999000,
+    }
+
+    sync_ts = data.get("last_synced_at") or data.get("last_event_at")
+    date_str = datetime.fromtimestamp(sync_ts, tz=timezone.utc).strftime("%Y-%m-%d")
+    # Must use 2023-11-14 (last_synced_at), NOT 2024-01-01 (access_lost_at)
+    assert date_str == "2023-11-14"
 

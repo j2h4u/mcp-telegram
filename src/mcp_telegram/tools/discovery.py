@@ -13,6 +13,7 @@ from ..errors import (
 from ..resolver import parse_exact_dialog_id
 from ._base import (
     DaemonNotRunningError,
+    ToolAnnotations,
     ToolArgs,
     ToolResult,
     _check_daemon_response,
@@ -35,7 +36,7 @@ class ListDialogs(ToolArgs):
     ignore_pinned: bool = False
 
 
-@mcp_tool("secondary/helper")
+@mcp_tool("secondary/helper", annotations=ToolAnnotations(readOnlyHint=True))
 async def list_dialogs(args: ListDialogs) -> ToolResult:
     try:
         async with daemon_connection() as conn:
@@ -74,9 +75,21 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
         if created is not None:
             meta += f" created={created}"
 
+        sync_coverage_pct = d.get("sync_coverage_pct")
+        access_lost_at_ts = d.get("access_lost_at")
+
+        coverage_str = ""
+        if sync_coverage_pct is not None:
+            coverage_str = f" coverage={sync_coverage_pct}%"
+
+        access_str = ""
+        if access_lost_at_ts is not None:
+            access_str = f" access_lost_at={access_lost_at_ts}"
+
         lines.append(
             f"name='{dialog_name}' id={dialog_id} type={dialog_type} "
-            f"last_message_at={last_at} unread={unread_count}{meta} sync_status={sync_status}"
+            f"last_message_at={last_at} unread={unread_count}{meta} "
+            f"sync_status={sync_status}{coverage_str}{access_str}"
         )
 
         # Upsert entities into daemon for future name resolution
@@ -105,7 +118,7 @@ class ListTopics(ToolArgs):
     dialog: str = Field(max_length=500)
 
 
-@mcp_tool("secondary/helper")
+@mcp_tool("secondary/helper", annotations=ToolAnnotations(readOnlyHint=True))
 async def list_topics(args: ListTopics) -> ToolResult:
     # Try to resolve dialog_id from parsing as numeric/username first
     dialog_id: int | None = parse_exact_dialog_id(args.dialog)
@@ -159,7 +172,7 @@ class GetMyAccount(ToolArgs):
     pass
 
 
-@mcp_tool("secondary/helper")
+@mcp_tool("secondary/helper", annotations=ToolAnnotations(readOnlyHint=True))
 async def get_my_account(args: GetMyAccount) -> ToolResult:
     try:
         async with daemon_connection() as conn:
