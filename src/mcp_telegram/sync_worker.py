@@ -81,7 +81,7 @@ _UPDATE_PROGRESS_SQL = (
     "UPDATE synced_dialogs SET sync_progress = ?, status = ? WHERE dialog_id = ?"
 )
 
-_INSERT_DIALOG_SQL = (
+INSERT_DIALOG_SQL = (
     "INSERT OR IGNORE INTO synced_dialogs (dialog_id, status) VALUES (?, 'syncing')"
 )
 
@@ -246,7 +246,7 @@ class FullSyncWorker:
             async for dialog in self._client.iter_dialogs():
                 if not isinstance(dialog.entity, types.User):
                     continue
-                cursor = self._conn.execute(_INSERT_DIALOG_SQL, (dialog.id,))
+                cursor = self._conn.execute(INSERT_DIALOG_SQL, (dialog.id,))
                 if cursor.rowcount > 0:
                     enrolled += 1
         except FloodWaitError as exc:

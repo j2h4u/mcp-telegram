@@ -28,7 +28,7 @@ from typing import Any
 from telethon import events  # type: ignore[import-untyped]
 
 from .fts import DELETE_FTS_SQL, INSERT_FTS_SQL, stem_text
-from .sync_worker import INSERT_MESSAGE_SQL, extract_message_row, serialize_reactions
+from .sync_worker import INSERT_DIALOG_SQL, INSERT_MESSAGE_SQL, extract_message_row, serialize_reactions
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +139,24 @@ class EventHandlerManager:
         rows = self._conn.execute(_SELECT_SYNCED_DIALOGS_SQL).fetchall()
         self._synced_dialog_ids = {int(row[0]) for row in rows}
 
+    def _auto_enroll_dm(self, dialog_id: int) -> None:
+        """Enroll a new DM dialog into synced_dialogs on first incoming message.
+
+        Called from on_new_message when a private message arrives from a dialog
+        not yet in synced_dialogs.  Uses INSERT OR IGNORE so concurrent calls
+        and daemon restarts are idempotent.  After enrollment, the dialog is
+        added to the in-memory set so subsequent messages are written real-time;
+        FullSyncWorker picks up full history in its next batch cycle.
+        """
+        try:
+            cursor = self._conn.execute(INSERT_DIALOG_SQL, (dialog_id,))
+            self._conn.commit()
+            if cursor.rowcount > 0:
+                self._synced_dialog_ids.add(dialog_id)
+                logger.info("dm_auto_enroll dialog_id=%d", dialog_id)
+        except Exception:
+            logger.exception("dm_auto_enroll_failed dialog_id=%d", dialog_id)
+
     # ------------------------------------------------------------------
     # Event handlers
     # ------------------------------------------------------------------
@@ -146,11 +164,17 @@ class EventHandlerManager:
     async def on_new_message(self, event: Any) -> None:
         """Handle a NewMessage event: INSERT OR REPLACE into messages table.
 
-        Silently ignores events for dialogs not in synced_dialogs.
+        For enrolled dialogs: writes the message to sync.db immediately.
+        For unenrolled private (DM) dialogs: auto-enrolls them so FullSyncWorker
+        picks up the full history in its next batch cycle.
         Updates synced_dialogs.last_event_at in the same transaction.
         """
         dialog_id = event.chat_id
-        if dialog_id is None or dialog_id not in self._synced_dialog_ids:
+        if dialog_id is None:
+            return
+        if dialog_id not in self._synced_dialog_ids:
+            if event.is_private:
+                self._auto_enroll_dm(dialog_id)
             return
 
         try:

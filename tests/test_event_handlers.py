@@ -21,10 +21,12 @@ from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 
 
 def make_new_message_event(
-    chat_id: int | None, message: SimpleNamespace
+    chat_id: int | None,
+    message: SimpleNamespace,
+    is_private: bool = False,
 ) -> SimpleNamespace:
     """Build a minimal NewMessage.Event-like object."""
-    return SimpleNamespace(chat_id=chat_id, message=message)
+    return SimpleNamespace(chat_id=chat_id, message=message, is_private=is_private)
 
 
 def make_message_edited_event(
@@ -159,6 +161,80 @@ async def test_on_new_message_ignores_unsynced(
 
     count = sync_db.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
     assert count == 0
+
+
+@pytest.mark.asyncio
+async def test_on_new_message_auto_enrolls_private_dialog(
+    mock_client: MagicMock,
+    sync_db: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """Private message from an unknown dialog enrolls it into synced_dialogs."""
+    dialog_id = 7001
+    # dialog_id is NOT in synced_dialogs
+
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+    manager.register()
+
+    msg = build_mock_message(id=1, text="hey")
+    event = make_new_message_event(chat_id=dialog_id, message=msg, is_private=True)
+    await manager.on_new_message(event)
+
+    row = sync_db.execute(
+        "SELECT dialog_id, status FROM synced_dialogs WHERE dialog_id=?",
+        (dialog_id,),
+    ).fetchone()
+    assert row is not None, "auto-enroll must insert a synced_dialogs row"
+    assert row[1] == "syncing"
+    assert dialog_id in manager._synced_dialog_ids
+
+
+@pytest.mark.asyncio
+async def test_on_new_message_auto_enroll_idempotent(
+    mock_client: MagicMock,
+    sync_db: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """Auto-enroll is idempotent — two private messages from the same new dialog don't duplicate."""
+    dialog_id = 7002
+
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+    manager.register()
+
+    for msg_id in [1, 2]:
+        msg = build_mock_message(id=msg_id, text="hi")
+        event = make_new_message_event(chat_id=dialog_id, message=msg, is_private=True)
+        await manager.on_new_message(event)
+
+    count = sync_db.execute(
+        "SELECT COUNT(*) FROM synced_dialogs WHERE dialog_id=?",
+        (dialog_id,),
+    ).fetchone()[0]
+    assert count == 1, "synced_dialogs must have exactly one row for the dialog"
+
+
+@pytest.mark.asyncio
+async def test_on_new_message_ignores_unsynced_non_private(
+    mock_client: MagicMock,
+    sync_db: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """New message from an unknown non-private (group) dialog is ignored — no enrollment."""
+    dialog_id = 7003
+
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+    manager.register()
+
+    msg = build_mock_message(id=1, text="group msg")
+    event = make_new_message_event(chat_id=dialog_id, message=msg, is_private=False)
+    await manager.on_new_message(event)
+
+    count = sync_db.execute(
+        "SELECT COUNT(*) FROM synced_dialogs WHERE dialog_id=?",
+        (dialog_id,),
+    ).fetchone()[0]
+    assert count == 0, "non-private unknown dialog must not be enrolled"
+    assert dialog_id not in manager._synced_dialog_ids
 
 
 @pytest.mark.asyncio
