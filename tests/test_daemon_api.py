@@ -52,7 +52,7 @@ def make_server(
     return DaemonAPIServer(conn, client, shutdown_event)
 
 
-def _make_db(*, with_fts: bool = False) -> sqlite3.Connection:
+def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.Connection:
     """Return an in-memory SQLite connection with the required schema."""
     conn = sqlite3.connect(":memory:")
     conn.execute(
@@ -117,6 +117,19 @@ def _make_db(*, with_fts: bool = False) -> sqlite3.Connection:
     )
     if with_fts:
         conn.execute(MESSAGES_FTS_DDL)
+    if with_entities:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS entities (
+                id              INTEGER PRIMARY KEY,
+                type            TEXT NOT NULL,
+                name            TEXT,
+                username        TEXT,
+                name_normalized TEXT,
+                updated_at      INTEGER NOT NULL
+            )
+            """
+        )
     conn.commit()
     return conn
 
@@ -410,6 +423,91 @@ async def test_search_messages_name_resolution() -> None:
 
     assert result["ok"] is True
     client.get_entity.assert_called_once_with("Alice")
+
+
+# ---------------------------------------------------------------------------
+# search_messages — global mode (no dialog)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_search_messages_global_searches_all_dialogs() -> None:
+    """search_messages with no dialog searches across all synced dialogs."""
+    conn = _make_db(with_fts=True, with_entities=True)
+    _insert_synced_dialog(conn, 1, status="synced")
+    _insert_synced_dialog(conn, 2, status="synced")
+    _insert_message(conn, 1, 10, text="написал сообщение")
+    _insert_message(conn, 2, 20, text="написали письмо")
+    _insert_entity(conn, 1, name="Dialog One")
+    _insert_entity(conn, 2, name="Dialog Two")
+
+    for dialog_id, message_id, text in [(1, 10, "написал сообщение"), (2, 20, "написали письмо")]:
+        stemmed = stem_text(text)
+        conn.execute(
+            "INSERT INTO messages_fts(dialog_id, message_id, stemmed_text) VALUES (?, ?, ?)",
+            (dialog_id, message_id, stemmed),
+        )
+    conn.commit()
+
+    server = make_server(conn)
+    result = await server._search_messages({"query": "написали", "limit": 10})
+
+    assert result["ok"] is True
+    messages = result["data"]["messages"]
+    assert len(messages) == 2
+    dialog_ids = {m["dialog_id"] for m in messages}
+    assert dialog_ids == {1, 2}
+    dialog_names = {m["dialog_name"] for m in messages}
+    assert dialog_names == {"Dialog One", "Dialog Two"}
+
+
+@pytest.mark.asyncio
+async def test_search_messages_global_dialog_name_fallback() -> None:
+    """Global search falls back to string dialog_id when entity has no name."""
+    conn = _make_db(with_fts=True, with_entities=True)
+    _insert_synced_dialog(conn, 99, status="synced")
+    _insert_message(conn, 99, 5, text="тест")
+    stemmed = stem_text("тест")
+    conn.execute(
+        "INSERT INTO messages_fts(dialog_id, message_id, stemmed_text) VALUES (99, 5, ?)",
+        (stemmed,),
+    )
+    conn.commit()
+    # No entity row for dialog 99 — COALESCE should return '99'
+
+    server = make_server(conn)
+    result = await server._search_messages({"query": "тест", "limit": 10})
+
+    assert result["ok"] is True
+    messages = result["data"]["messages"]
+    assert len(messages) == 1
+    assert messages[0]["dialog_name"] == "99"
+    assert messages[0]["dialog_id"] == 99
+
+
+@pytest.mark.asyncio
+async def test_search_messages_global_navigation_token_uses_dialog_id_zero() -> None:
+    """Global search next_navigation token encodes dialog_id=0."""
+    from mcp_telegram.pagination import decode_navigation_token
+
+    conn = _make_db(with_fts=True, with_entities=True)
+    _insert_synced_dialog(conn, 1, status="synced")
+    for msg_id in range(1, 6):
+        _insert_message(conn, 1, msg_id, text="слово")
+        conn.execute(
+            "INSERT INTO messages_fts(dialog_id, message_id, stemmed_text) VALUES (1, ?, ?)",
+            (msg_id, stem_text("слово")),
+        )
+    conn.commit()
+
+    server = make_server(conn)
+    result = await server._search_messages({"query": "слово", "limit": 3})
+
+    assert result["ok"] is True
+    next_nav = result["data"]["next_navigation"]
+    assert next_nav is not None
+    nav = decode_navigation_token(next_nav)
+    assert nav.dialog_id == 0
 
 
 # ---------------------------------------------------------------------------
@@ -856,6 +954,40 @@ async def test_get_user_info_returns_profile() -> None:
 
 
 @pytest.mark.asyncio
+async def test_get_user_info_includes_about_and_personal_channel() -> None:
+    """get_user_info includes about (bio) and personal_channel_id from UserFull."""
+    user = MagicMock()
+    user.id = 42
+    user.first_name = "Ivan"
+    user.last_name = None
+    user.username = "ivan"
+
+    full_user = MagicMock()
+    full_user.about = "My bio"
+    full_user.personal_channel_id = 9001
+
+    full_result = MagicMock()
+    full_result.full_user = full_user
+
+    common_result = MagicMock()
+    common_result.chats = []
+
+    client = AsyncMock()
+    client.get_entity = AsyncMock(return_value=user)
+
+    # GetCommonChatsRequest fires first, GetFullUserRequest second
+    client.side_effect = [common_result, full_result]
+
+    server = make_server(client=client)
+    result = await server._get_user_info({"user_id": 42})
+
+    assert result["ok"] is True
+    data = result["data"]
+    assert data["about"] == "My bio"
+    assert data["personal_channel_id"] == 9001
+
+
+@pytest.mark.asyncio
 async def test_get_user_info_user_not_found() -> None:
     """get_user_info returns ok=False with error=user_not_found when get_entity raises."""
     client = AsyncMock()
@@ -934,6 +1066,323 @@ async def test_get_user_info_dispatch_routing() -> None:
     result = await server._dispatch({"method": "get_user_info", "user_id": 42})
 
     assert result["ok"] is True, f"get_user_info dispatch failed: {result}"
+
+
+@pytest.mark.asyncio
+async def test_get_user_info_status_online() -> None:
+    """get_user_info serializes UserStatusOnline to {type: online}."""
+    from datetime import datetime, timezone
+
+    user = MagicMock()
+    user.id = 1
+    user.status = MagicMock()
+    user.status.__class__.__name__ = "UserStatusOnline"
+    expires = datetime(2026, 4, 14, 12, 0, 0, tzinfo=timezone.utc)
+    user.status.expires = expires
+
+    common_result = MagicMock()
+    common_result.chats = []
+    full_result = MagicMock()
+    full_result.full_user = MagicMock()
+    full_result.full_user.folder_id = None
+
+    client = AsyncMock()
+    client.get_entity = AsyncMock(return_value=user)
+    client.side_effect = [common_result, full_result]
+
+    server = make_server(client=client)
+    result = await server._get_user_info({"user_id": 1})
+
+    assert result["ok"] is True
+    status = result["data"]["status"]
+    assert status["type"] == "online"
+    assert status["expires"] == expires.isoformat()
+
+
+@pytest.mark.asyncio
+async def test_get_user_info_status_offline() -> None:
+    """get_user_info serializes UserStatusOffline with was_online timestamp."""
+    from datetime import datetime, timezone
+
+    user = MagicMock()
+    user.id = 2
+    user.status = MagicMock()
+    user.status.__class__.__name__ = "UserStatusOffline"
+    was_online = datetime(2026, 4, 10, 8, 30, 0, tzinfo=timezone.utc)
+    user.status.was_online = was_online
+
+    common_result = MagicMock()
+    common_result.chats = []
+    full_result = MagicMock()
+    full_result.full_user = MagicMock()
+    full_result.full_user.folder_id = None
+
+    client = AsyncMock()
+    client.get_entity = AsyncMock(return_value=user)
+    client.side_effect = [common_result, full_result]
+
+    server = make_server(client=client)
+    result = await server._get_user_info({"user_id": 2})
+
+    assert result["ok"] is True
+    status = result["data"]["status"]
+    assert status["type"] == "offline"
+    assert status["was_online"] == was_online.isoformat()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_class,expected_type", [
+    ("UserStatusRecently", "recently"),
+    ("UserStatusLastWeek", "last_week"),
+    ("UserStatusLastMonth", "last_month"),
+])
+async def test_get_user_info_status_relative(status_class: str, expected_type: str) -> None:
+    """get_user_info serializes relative UserStatus types correctly."""
+    user = MagicMock()
+    user.id = 3
+    user.status = MagicMock()
+    user.status.__class__.__name__ = status_class
+
+    common_result = MagicMock()
+    common_result.chats = []
+    full_result = MagicMock()
+    full_result.full_user = MagicMock()
+    full_result.full_user.folder_id = None
+
+    client = AsyncMock()
+    client.get_entity = AsyncMock(return_value=user)
+    client.side_effect = [common_result, full_result]
+
+    server = make_server(client=client)
+    result = await server._get_user_info({"user_id": 3})
+
+    assert result["ok"] is True
+    assert result["data"]["status"]["type"] == expected_type
+
+
+@pytest.mark.asyncio
+async def test_get_user_info_folder_resolved() -> None:
+    """get_user_info resolves folder_id to folder_name via GetDialogFiltersRequest."""
+    user = MagicMock()
+    user.id = 10
+    user.status = None
+
+    common_result = MagicMock()
+    common_result.chats = []
+
+    full_user = MagicMock()
+    full_user.folder_id = 5
+    full_result = MagicMock()
+    full_result.full_user = full_user
+
+    folder = MagicMock()
+    folder.id = 5
+    folder.title = "Personal"
+    filters_result = [folder]
+
+    client = AsyncMock()
+    client.get_entity = AsyncMock(return_value=user)
+    # side_effect order: GetCommonChatsRequest, GetFullUserRequest, GetDialogFiltersRequest
+    client.side_effect = [common_result, full_result, filters_result]
+
+    server = make_server(client=client)
+    result = await server._get_user_info({"user_id": 10})
+
+    assert result["ok"] is True
+    assert result["data"]["folder_id"] == 5
+    assert result["data"]["folder_name"] == "Personal"
+
+
+@pytest.mark.asyncio
+async def test_get_user_info_contact_and_blocked_flags() -> None:
+    """get_user_info exposes contact, mutual_contact, close_friend, blocked from Telegram."""
+    user = MagicMock()
+    user.id = 20
+    user.contact = True
+    user.mutual_contact = True
+    user.close_friend = False
+    user.status = None
+
+    common_result = MagicMock()
+    common_result.chats = []
+
+    full_user = MagicMock()
+    full_user.blocked = True
+    full_user.folder_id = None
+    full_result = MagicMock()
+    full_result.full_user = full_user
+
+    client = AsyncMock()
+    client.get_entity = AsyncMock(return_value=user)
+    client.side_effect = [common_result, full_result]
+
+    server = make_server(client=client)
+    result = await server._get_user_info({"user_id": 20})
+
+    assert result["ok"] is True
+    data = result["data"]
+    assert data["contact"] is True
+    assert data["mutual_contact"] is True
+    assert data["close_friend"] is False
+    assert data["blocked"] is True
+
+
+@pytest.mark.asyncio
+async def test_get_user_info_restriction_reason() -> None:
+    """get_user_info serializes restriction_reason list with platform/reason/text."""
+    user = MagicMock()
+    user.id = 30
+    user.restricted = True
+    user.status = None
+
+    rr = MagicMock()
+    rr.platform = "ios"
+    rr.reason = "spam"
+    rr.text = "This account was used for spam."
+    user.restriction_reason = [rr]
+
+    common_result = MagicMock()
+    common_result.chats = []
+    full_result = MagicMock()
+    full_result.full_user = MagicMock()
+    full_result.full_user.folder_id = None
+
+    client = AsyncMock()
+    client.get_entity = AsyncMock(return_value=user)
+    client.side_effect = [common_result, full_result]
+
+    server = make_server(client=client)
+    result = await server._get_user_info({"user_id": 30})
+
+    assert result["ok"] is True
+    rrs = result["data"]["restriction_reason"]
+    assert len(rrs) == 1
+    assert rrs[0]["platform"] == "ios"
+    assert rrs[0]["reason"] == "spam"
+    assert rrs[0]["text"] == "This account was used for spam."
+
+
+@pytest.mark.asyncio
+async def test_get_user_info_bot_info() -> None:
+    """get_user_info includes bot_info with description and commands when present."""
+    user = MagicMock()
+    user.id = 40
+    user.bot = True
+    user.status = None
+
+    cmd = MagicMock()
+    cmd.command = "start"
+    cmd.description = "Start the bot"
+
+    raw_bot_info = MagicMock()
+    raw_bot_info.description = "I am a useful bot."
+    raw_bot_info.commands = [cmd]
+
+    full_user = MagicMock()
+    full_user.bot_info = raw_bot_info
+    full_user.folder_id = None
+    full_result = MagicMock()
+    full_result.full_user = full_user
+
+    common_result = MagicMock()
+    common_result.chats = []
+
+    client = AsyncMock()
+    client.get_entity = AsyncMock(return_value=user)
+    client.side_effect = [common_result, full_result]
+
+    server = make_server(client=client)
+    result = await server._get_user_info({"user_id": 40})
+
+    assert result["ok"] is True
+    bot_info = result["data"]["bot_info"]
+    assert bot_info is not None
+    assert bot_info["description"] == "I am a useful bot."
+    assert len(bot_info["commands"]) == 1
+    assert bot_info["commands"][0]["command"] == "start"
+    assert bot_info["commands"][0]["description"] == "Start the bot"
+
+
+@pytest.mark.asyncio
+async def test_get_user_info_business_fields() -> None:
+    """get_user_info serializes business_location, business_intro, business_work_hours."""
+    user = MagicMock()
+    user.id = 50
+    user.status = None
+
+    geo = MagicMock()
+    geo.lat = 55.75
+    geo.long = 37.62
+
+    raw_loc = MagicMock()
+    raw_loc.address = "Moscow, Russia"
+    raw_loc.geo_point = geo
+
+    raw_intro = MagicMock()
+    raw_intro.title = "My Shop"
+    raw_intro.description = "Best prices in town."
+
+    raw_hours = MagicMock()
+    raw_hours.timezone_id = "Europe/Moscow"
+
+    full_user = MagicMock()
+    full_user.business_location = raw_loc
+    full_user.business_intro = raw_intro
+    full_user.business_work_hours = raw_hours
+    full_user.folder_id = None
+    full_result = MagicMock()
+    full_result.full_user = full_user
+
+    common_result = MagicMock()
+    common_result.chats = []
+
+    client = AsyncMock()
+    client.get_entity = AsyncMock(return_value=user)
+    client.side_effect = [common_result, full_result]
+
+    server = make_server(client=client)
+    result = await server._get_user_info({"user_id": 50})
+
+    assert result["ok"] is True
+    data = result["data"]
+    assert data["business_location"]["address"] == "Moscow, Russia"
+    assert data["business_location"]["lat"] == 55.75
+    assert data["business_intro"]["title"] == "My Shop"
+    assert data["business_intro"]["description"] == "Best prices in town."
+    assert data["business_work_hours"]["timezone"] == "Europe/Moscow"
+
+
+@pytest.mark.asyncio
+async def test_get_user_info_note_and_ttl() -> None:
+    """get_user_info includes note text and ttl_period from UserFull."""
+    user = MagicMock()
+    user.id = 60
+    user.status = None
+
+    raw_note = MagicMock()
+    raw_note.text = "Met at conference 2024"
+
+    full_user = MagicMock()
+    full_user.note = raw_note
+    full_user.ttl_period = 604800  # 7 days
+    full_user.folder_id = None
+    full_result = MagicMock()
+    full_result.full_user = full_user
+
+    common_result = MagicMock()
+    common_result.chats = []
+
+    client = AsyncMock()
+    client.get_entity = AsyncMock(return_value=user)
+    client.side_effect = [common_result, full_result]
+
+    server = make_server(client=client)
+    result = await server._get_user_info({"user_id": 60})
+
+    assert result["ok"] is True
+    data = result["data"]
+    assert data["note"] == "Met at conference 2024"
+    assert data["ttl_period"] == 604800
 
 
 # ---------------------------------------------------------------------------
@@ -2276,6 +2725,69 @@ async def test_list_messages_on_demand_unread_after_id_min_id() -> None:
 
 
 # ---------------------------------------------------------------------------
+# context_message_id — _list_messages_context_window
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_messages_context_window_centred() -> None:
+    """context_message_id returns messages centred on anchor (before + anchor + after)."""
+    DIALOG_ID = 7001
+
+    conn = _make_db()
+    _insert_synced_dialog(conn, DIALOG_ID, status="synced")
+    for mid in range(1, 11):
+        _insert_message(conn, DIALOG_ID, mid, text=f"msg {mid}", sent_at=1700000000 + mid)
+    server = make_server(conn)
+
+    result = await server._list_messages({"dialog_id": DIALOG_ID, "context_message_id": 5, "context_size": 4})
+
+    assert result["ok"] is True, f"Unexpected error: {result}"
+    messages = result["data"]["messages"]
+    ids = [m["message_id"] for m in messages]
+    # context_size=4 → half=2, so: ids <= 5 DESC LIMIT 3 → [5,4,3] → reversed [3,4,5]
+    # ids > 5 ASC LIMIT 2 → [6,7]
+    assert ids == [3, 4, 5, 6, 7]
+    assert result["data"]["anchor_message_id"] == 5
+    assert result["data"]["source"] == "sync_db"
+
+
+@pytest.mark.asyncio
+async def test_list_messages_context_window_near_start() -> None:
+    """context_message_id with anchor near start returns fewer before-messages, no error."""
+    DIALOG_ID = 7002
+
+    conn = _make_db()
+    _insert_synced_dialog(conn, DIALOG_ID, status="synced")
+    for mid in range(1, 6):
+        _insert_message(conn, DIALOG_ID, mid, text=f"msg {mid}", sent_at=1700000000 + mid)
+    server = make_server(conn)
+
+    result = await server._list_messages({"dialog_id": DIALOG_ID, "context_message_id": 2, "context_size": 6})
+
+    assert result["ok"] is True, f"Unexpected error: {result}"
+    messages = result["data"]["messages"]
+    ids = [m["message_id"] for m in messages]
+    # half=3; before: ids <= 2 DESC LIMIT 4 → [2,1]; after: ids > 2 ASC LIMIT 3 → [3,4,5]
+    assert ids == [1, 2, 3, 4, 5]
+
+
+@pytest.mark.asyncio
+async def test_list_messages_context_window_not_synced_error() -> None:
+    """context_message_id returns not_synced error when dialog is not in synced_dialogs."""
+    DIALOG_ID = 7003
+
+    conn = _make_db()
+    # Dialog not inserted into synced_dialogs at all
+    server = make_server(conn)
+
+    result = await server._list_messages({"dialog_id": DIALOG_ID, "context_message_id": 10, "context_size": 4})
+
+    assert result["ok"] is False
+    assert result["error"] == "not_synced"
+
+
+# ---------------------------------------------------------------------------
 # Phase 35-01: _msg_to_dict — edit_date from Telethon message
 # ---------------------------------------------------------------------------
 
@@ -2402,3 +2914,316 @@ def test_db_message_columns_length_matches_query() -> None:
     assert len(_DB_MESSAGE_COLUMNS) == 13
     assert _DB_MESSAGE_COLUMNS[0] == "message_id"
     assert _DB_MESSAGE_COLUMNS[-1] == "topic_title"
+
+
+# ---------------------------------------------------------------------------
+# _compute_sync_coverage unit tests (Plan 36-02, Task 1)
+# ---------------------------------------------------------------------------
+
+
+def test_compute_sync_coverage_normal():
+    from mcp_telegram.daemon_api import _compute_sync_coverage
+    assert _compute_sync_coverage(1000, 800) == 80
+
+
+def test_compute_sync_coverage_complete():
+    from mcp_telegram.daemon_api import _compute_sync_coverage
+    assert _compute_sync_coverage(1000, 1000) == 100
+
+
+def test_compute_sync_coverage_clamped_over_100():
+    from mcp_telegram.daemon_api import _compute_sync_coverage
+    assert _compute_sync_coverage(100, 150) == 100
+
+
+def test_compute_sync_coverage_null_total():
+    from mcp_telegram.daemon_api import _compute_sync_coverage
+    assert _compute_sync_coverage(None, 500) is None
+
+
+def test_compute_sync_coverage_zero_total():
+    from mcp_telegram.daemon_api import _compute_sync_coverage
+    assert _compute_sync_coverage(0, 0) == 100
+
+
+# ---------------------------------------------------------------------------
+# get_sync_status enrichment tests (Plan 36-02, Task 1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_sync_status_includes_coverage():
+    """get_sync_status returns sync_coverage_pct and access_lost_at."""
+    conn = _make_db()
+    conn.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, total_messages) "
+        "VALUES (?, 'synced', 1000)",
+        (-100001,),
+    )
+    for i in range(800):
+        conn.execute(
+            "INSERT INTO messages (dialog_id, message_id, sent_at, text, is_deleted) "
+            "VALUES (?, ?, 1000, 'msg', 0)",
+            (-100001, i + 1),
+        )
+    conn.commit()
+    server = make_server(conn)
+    result = await server._get_sync_status({"dialog_id": -100001})
+    assert result["ok"] is True
+    assert result["data"]["sync_coverage_pct"] == 80
+    assert result["data"]["access_lost_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_get_sync_status_access_lost_with_coverage():
+    """access_lost dialog shows frozen coverage with access_lost_at."""
+    conn = _make_db()
+    conn.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, total_messages, access_lost_at) "
+        "VALUES (?, 'access_lost', 500, 1700000000)",
+        (-100002,),
+    )
+    for i in range(400):
+        conn.execute(
+            "INSERT INTO messages (dialog_id, message_id, sent_at, text, is_deleted) "
+            "VALUES (?, ?, 1000, 'msg', 0)",
+            (-100002, i + 1),
+        )
+    conn.commit()
+    server = make_server(conn)
+    result = await server._get_sync_status({"dialog_id": -100002})
+    assert result["data"]["sync_coverage_pct"] == 80
+    assert result["data"]["access_lost_at"] == 1700000000
+
+
+@pytest.mark.asyncio
+async def test_get_sync_status_access_lost_null_total_has_archived_count():
+    """access_lost + total_messages=NULL returns archived_message_count with local count."""
+    conn = _make_db()
+    conn.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, total_messages, access_lost_at) "
+        "VALUES (?, 'access_lost', NULL, 1700000000)",
+        (-100009,),
+    )
+    for i in range(150):
+        conn.execute(
+            "INSERT INTO messages (dialog_id, message_id, sent_at, text, is_deleted) "
+            "VALUES (?, ?, 1000, 'msg', 0)",
+            (-100009, i + 1),
+        )
+    conn.commit()
+    server = make_server(conn)
+    result = await server._get_sync_status({"dialog_id": -100009})
+    assert result["data"]["sync_coverage_pct"] is None
+    assert result["data"]["access_lost_at"] == 1700000000
+    assert result["data"]["archived_message_count"] == 150
+
+
+# ---------------------------------------------------------------------------
+# list_dialogs enrichment tests (Plan 36-02, Task 1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_dialogs_includes_coverage():
+    """list_dialogs includes sync_coverage_pct and access_lost_at per dialog."""
+    conn = _make_db()
+    conn.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, total_messages) "
+        "VALUES (?, 'synced', 100)",
+        (5001,),
+    )
+    for i in range(50):
+        conn.execute(
+            "INSERT INTO messages (dialog_id, message_id, sent_at, text, is_deleted) "
+            "VALUES (?, ?, 1000, 'msg', 0)",
+            (5001, i + 1),
+        )
+    conn.commit()
+
+    mock_client = MagicMock()
+    mock_dialog = MagicMock()
+    mock_dialog.id = 5001
+    mock_dialog.name = "Test Dialog"
+    mock_dialog.entity = MagicMock()
+    type(mock_dialog.entity).__name__ = "User"
+    mock_dialog.entity.participants_count = None
+    mock_dialog.entity.date = None
+    mock_dialog.date = MagicMock()
+    mock_dialog.date.timestamp.return_value = 1700000000
+    mock_dialog.unread_count = 0
+
+    async def _iter_dialogs(**kwargs):
+        yield mock_dialog
+
+    mock_client.iter_dialogs = _iter_dialogs
+
+    server = make_server(conn, mock_client)
+    result = await server._list_dialogs({})
+    assert result["ok"] is True
+    dialogs = result["data"]["dialogs"]
+    assert len(dialogs) == 1
+    assert dialogs[0]["sync_coverage_pct"] == 50
+    assert dialogs[0]["access_lost_at"] is None
+
+
+# ---------------------------------------------------------------------------
+# list_messages access_lost routing tests (Plan 36-02, Task 1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_messages_access_lost_returns_archived():
+    """list_messages on access_lost dialog reads from sync.db with dialog_access=archived."""
+    conn = _make_db()
+    conn.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, access_lost_at, total_messages, "
+        "last_synced_at, last_event_at) "
+        "VALUES (?, 'access_lost', 1700000000, 500, 1699990000, 1699999000)",
+        (6001,),
+    )
+    conn.execute(
+        "INSERT INTO messages (dialog_id, message_id, sent_at, text, sender_id, "
+        "sender_first_name, is_deleted) VALUES (?, 1, 1000, 'archived msg', 42, 'Alice', 0)",
+        (6001,),
+    )
+    conn.commit()
+
+    server = make_server(conn)
+    result = await server._list_messages({"dialog_id": 6001, "limit": 10})
+    assert result["ok"] is True
+    assert result["data"]["dialog_access"] == "archived"
+    assert result["data"]["source"] == "sync_db"
+    assert result["data"]["access_lost_at"] == 1700000000
+    assert result["data"]["last_synced_at"] == 1699990000
+    assert result["data"]["last_event_at"] == 1699999000
+    assert len(result["data"]["messages"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_list_messages_access_lost_null_total_has_archived_count():
+    """access_lost + total_messages=NULL in list_messages returns archived_message_count."""
+    conn = _make_db()
+    conn.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, access_lost_at, total_messages) "
+        "VALUES (?, 'access_lost', 1700000000, NULL)",
+        (6010,),
+    )
+    for i in range(75):
+        conn.execute(
+            "INSERT INTO messages (dialog_id, message_id, sent_at, text, sender_id, "
+            "sender_first_name, is_deleted) VALUES (?, ?, 1000, 'msg', 42, 'Alice', 0)",
+            (6010, i + 1),
+        )
+    conn.commit()
+
+    server = make_server(conn)
+    result = await server._list_messages({"dialog_id": 6010, "limit": 10})
+    assert result["ok"] is True
+    assert result["data"]["dialog_access"] == "archived"
+    assert result["data"]["sync_coverage_pct"] is None
+    assert result["data"]["archived_message_count"] == 75
+
+
+@pytest.mark.asyncio
+async def test_list_messages_synced_returns_live():
+    """list_messages on synced dialog returns dialog_access=live."""
+    conn = _make_db()
+    conn.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')",
+        (6002,),
+    )
+    conn.execute(
+        "INSERT INTO messages (dialog_id, message_id, sent_at, text, sender_id, "
+        "sender_first_name, is_deleted) VALUES (?, 1, 1000, 'live msg', 42, 'Alice', 0)",
+        (6002,),
+    )
+    conn.commit()
+
+    server = make_server(conn)
+    result = await server._list_messages({"dialog_id": 6002, "limit": 10})
+    assert result["ok"] is True
+    assert result["data"]["dialog_access"] == "live"
+
+
+# ---------------------------------------------------------------------------
+# search_messages access metadata tests (Plan 36-02, Task 1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_search_messages_access_lost_returns_full_metadata():
+    """search_messages on access_lost dialog returns dialog_access=archived with full metadata."""
+    conn = _make_db(with_fts=True)
+    conn.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, access_lost_at, total_messages, "
+        "last_synced_at, last_event_at) "
+        "VALUES (?, 'access_lost', 1700000000, 500, 1699990000, 1699999000)",
+        (-100003,),
+    )
+    conn.execute(
+        "INSERT INTO messages (dialog_id, message_id, sent_at, text, sender_id, "
+        "sender_first_name, is_deleted) VALUES (?, 1, 1000, 'test content', 42, 'Alice', 0)",
+        (-100003,),
+    )
+    from mcp_telegram.fts import INSERT_FTS_SQL, stem_text
+    conn.execute(INSERT_FTS_SQL, (-100003, 1, stem_text("test content")))
+    conn.commit()
+
+    server = make_server(conn)
+    result = await server._search_messages({"dialog_id": -100003, "query": "test"})
+    assert result["ok"] is True
+    assert result["data"]["dialog_access"] == "archived"
+    assert result["data"]["access_lost_at"] == 1700000000
+    assert result["data"]["last_synced_at"] == 1699990000
+    assert result["data"]["last_event_at"] == 1699999000
+    assert result["data"]["sync_coverage_pct"] is not None
+
+
+@pytest.mark.asyncio
+async def test_search_messages_access_lost_null_total_has_archived_count():
+    """search_messages on access_lost + total_messages=NULL returns archived_message_count."""
+    conn = _make_db(with_fts=True)
+    conn.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, access_lost_at, total_messages) "
+        "VALUES (?, 'access_lost', 1700000000, NULL)",
+        (-100011,),
+    )
+    conn.execute(
+        "INSERT INTO messages (dialog_id, message_id, sent_at, text, sender_id, "
+        "sender_first_name, is_deleted) VALUES (?, 1, 1000, 'test content', 42, 'Alice', 0)",
+        (-100011,),
+    )
+    from mcp_telegram.fts import INSERT_FTS_SQL, stem_text
+    conn.execute(INSERT_FTS_SQL, (-100011, 1, stem_text("test content")))
+    conn.commit()
+
+    server = make_server(conn)
+    result = await server._search_messages({"dialog_id": -100011, "query": "test"})
+    assert result["ok"] is True
+    assert result["data"]["dialog_access"] == "archived"
+    assert result["data"]["sync_coverage_pct"] is None
+    assert result["data"]["archived_message_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_search_messages_global_omits_dialog_access():
+    """Global search omits dialog_access since results span multiple dialogs."""
+    conn = _make_db(with_fts=True, with_entities=True)
+    conn.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')",
+        (-100004,),
+    )
+    conn.execute(
+        "INSERT INTO messages (dialog_id, message_id, sent_at, text, sender_id, "
+        "sender_first_name, is_deleted) VALUES (?, 1, 1000, 'global test', 42, 'Alice', 0)",
+        (-100004,),
+    )
+    from mcp_telegram.fts import INSERT_FTS_SQL, stem_text
+    conn.execute(INSERT_FTS_SQL, (-100004, 1, stem_text("global test")))
+    conn.commit()
+
+    server = make_server(conn)
+    result = await server._search_messages({"query": "global"})
+    assert result["ok"] is True
+    assert "dialog_access" not in result["data"]

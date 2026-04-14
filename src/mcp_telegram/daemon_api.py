@@ -44,8 +44,10 @@ from xdg_base_dirs import xdg_state_home  # type: ignore[import-error]
 
 from telethon.tl.functions.messages import (  # type: ignore[import-untyped]
     GetCommonChatsRequest,
+    GetDialogFiltersRequest,
     GetForumTopicsRequest,
 )
+from telethon.tl.functions.users import GetFullUserRequest  # type: ignore[import-untyped]
 from telethon.tl.types import Channel, Chat  # type: ignore[import-untyped]
 from telethon import utils as telethon_utils  # type: ignore[import-untyped]
 
@@ -65,6 +67,7 @@ from .resolver import (
     Candidates,
     NotFound,
     Resolved,
+    _parse_tme_link,
     latinize,
     resolve as resolve_entity_sync,
 )
@@ -85,6 +88,52 @@ def _rid() -> str:
 def _clamp(value: int, low: int, high: int) -> int:
     """Clamp *value* to the inclusive range [low, high]."""
     return max(low, min(value, high))
+
+
+def _compute_sync_coverage(
+    total_messages: int | None,
+    local_count: int,
+) -> int | None:
+    """Compute sync_coverage_pct. Returns int 0-100 or None if unknown."""
+    if total_messages is not None and total_messages > 0:
+        return min(100, round(local_count / total_messages * 100))
+    if total_messages == 0:
+        return 100  # trivially complete
+    return None
+
+
+def _build_access_metadata(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    status: str,
+) -> dict:
+    """Build consistent access metadata for list_messages / search_messages responses.
+
+    Returns dict with: dialog_access, and for access_lost dialogs: access_lost_at,
+    last_synced_at, last_event_at, sync_coverage_pct, and optionally
+    archived_message_count (when total_messages is None).
+    """
+    meta: dict = {"dialog_access": "archived" if status == "access_lost" else "live"}
+
+    if status == "access_lost":
+        row = conn.execute(_SELECT_DIALOG_ACCESS_META_SQL, (dialog_id,)).fetchone()
+        if row:
+            _, total_messages, access_lost_at, last_synced_at, last_event_at = row
+            count_row = conn.execute(
+                _COUNT_SYNCED_MESSAGES_SQL, (dialog_id,)
+            ).fetchone()
+            local_count = count_row[0] if count_row else 0
+
+            meta["access_lost_at"] = access_lost_at
+            meta["last_synced_at"] = last_synced_at
+            meta["last_event_at"] = last_event_at
+            meta["sync_coverage_pct"] = _compute_sync_coverage(
+                total_messages, local_count
+            )
+            if total_messages is None:
+                meta["archived_message_count"] = local_count
+
+    return meta
 
 
 # ---------------------------------------------------------------------------
@@ -118,7 +167,20 @@ _SELECT_FTS_SQL = (
     "ORDER BY rank LIMIT ? OFFSET ?"
 )
 
-_SELECT_SYNCED_STATUSES_SQL = "SELECT dialog_id, status FROM synced_dialogs"
+_SELECT_FTS_ALL_SQL = (
+    "SELECT f.message_id, m.text, m.sender_first_name, m.sent_at, "
+    "m.media_description, m.reply_to_msg_id, m.sender_id, m.forum_topic_id, m.reactions, "
+    "f.dialog_id, COALESCE(e.name, CAST(f.dialog_id AS TEXT)) AS dialog_name "
+    "FROM messages_fts f "
+    "JOIN messages m ON m.dialog_id = f.dialog_id AND m.message_id = f.message_id "
+    "LEFT JOIN entities e ON e.id = f.dialog_id "
+    "WHERE messages_fts MATCH ? "
+    "ORDER BY rank LIMIT ? OFFSET ?"
+)
+
+_SELECT_SYNCED_STATUSES_SQL = (
+    "SELECT dialog_id, status, total_messages, access_lost_at FROM synced_dialogs"
+)
 
 _MARK_FOR_SYNC_SQL = "INSERT OR IGNORE INTO synced_dialogs (dialog_id, status) VALUES (?, 'not_synced')"
 _UNMARK_SYNC_SQL = "UPDATE synced_dialogs SET status = 'not_synced' WHERE dialog_id = ?"
@@ -128,6 +190,18 @@ _GET_SYNC_STATUS_SQL = (
     "FROM synced_dialogs WHERE dialog_id = ?"
 )
 _COUNT_SYNCED_MESSAGES_SQL = "SELECT COUNT(*) FROM messages WHERE dialog_id = ? AND is_deleted = 0"
+
+# TODO: _COUNT_MESSAGES_BY_DIALOG_SQL scans the full messages table via GROUP BY.
+# For large datasets (millions of messages), consider adding a covering index
+# on messages(dialog_id, is_deleted) or caching counts in synced_dialogs.
+_COUNT_MESSAGES_BY_DIALOG_SQL = (
+    "SELECT dialog_id, COUNT(*) FROM messages WHERE is_deleted = 0 GROUP BY dialog_id"
+)
+
+_SELECT_DIALOG_ACCESS_META_SQL = (
+    "SELECT status, total_messages, access_lost_at, last_synced_at, last_event_at "
+    "FROM synced_dialogs WHERE dialog_id = ?"
+)
 
 _GET_DELETED_ALERTS_SQL = (
     "SELECT dialog_id, message_id, text, deleted_at "
@@ -152,8 +226,9 @@ _UPSERT_ENTITY_SQL = (
 )
 _ALL_ENTITY_NAMES_SQL = (
     "SELECT id, name FROM entities "
-    "WHERE (type = 'user' AND updated_at >= ?) "
-    "OR (type != 'user' AND updated_at >= ?)"
+    "WHERE name IS NOT NULL "
+    "AND ((type = 'user' AND updated_at >= ?) "
+    "OR (type != 'user' AND updated_at >= ?))"
 )
 _ALL_ENTITY_NAMES_NORMALIZED_SQL = (
     "SELECT id, name_normalized FROM entities "
@@ -175,6 +250,21 @@ _DB_MESSAGE_COLUMNS = (
 # Dynamic SQL builder for list_messages
 # ---------------------------------------------------------------------------
 
+# Base SELECT shared by _build_list_messages_query and _list_messages_context_window.
+# Appends dialog_id=? and is_deleted=0 guards; callers add further conditions.
+_LIST_MESSAGES_BASE_SQL = (
+    "SELECT m.message_id, m.sent_at, m.text, m.sender_id, m.sender_first_name, "
+    "m.media_description, m.reply_to_msg_id, m.forum_topic_id, m.reactions, "
+    "m.is_deleted, m.deleted_at, "
+    "(SELECT MAX(mv.edit_date) FROM message_versions mv "
+    " WHERE mv.dialog_id = m.dialog_id AND mv.message_id = m.message_id) AS edit_date, "
+    "tm.title AS topic_title "
+    "FROM messages m "
+    "LEFT JOIN topic_metadata tm "
+    "  ON tm.dialog_id = m.dialog_id AND tm.topic_id = m.forum_topic_id "
+    "WHERE m.dialog_id = ? AND m.is_deleted = 0"
+)
+
 
 def _build_list_messages_query(
     *,
@@ -194,19 +284,7 @@ def _build_list_messages_query(
     or unpack via _DB_MESSAGE_COLUMNS).
     """
     params: list = [dialog_id]
-
-    sql = (
-        "SELECT m.message_id, m.sent_at, m.text, m.sender_id, m.sender_first_name, "
-        "m.media_description, m.reply_to_msg_id, m.forum_topic_id, m.reactions, "
-        "m.is_deleted, m.deleted_at, "
-        "(SELECT MAX(mv.edit_date) FROM message_versions mv "
-        " WHERE mv.dialog_id = m.dialog_id AND mv.message_id = m.message_id) AS edit_date, "
-        "tm.title AS topic_title "
-        "FROM messages m "
-        "LEFT JOIN topic_metadata tm "
-        "  ON tm.dialog_id = m.dialog_id AND tm.topic_id = m.forum_topic_id "
-        "WHERE m.dialog_id = ? AND m.is_deleted = 0"
-    )
+    sql = _LIST_MESSAGES_BASE_SQL
 
     if sender_id is not None:
         sql += " AND m.sender_id = ?"
@@ -664,6 +742,46 @@ class DaemonAPIServer:
             "data": {"messages": messages, "source": "sync_db", "next_navigation": next_nav},
         }
 
+    def _list_messages_context_window(
+        self,
+        *,
+        dialog_id: int,
+        anchor_message_id: int,
+        context_size: int,
+    ) -> dict:
+        """Return messages centred on anchor_message_id from sync.db.
+
+        Fetches up to context_size//2 messages before the anchor and up to
+        context_size//2 after it (the anchor itself is included in the before
+        half).  Results are returned in chronological order (oldest first).
+
+        Only works for synced dialogs — callers must check sync status first.
+        """
+        half = max(1, context_size // 2)
+
+        before_rows = self._conn.execute(
+            _LIST_MESSAGES_BASE_SQL + " AND m.message_id <= ? ORDER BY m.message_id DESC LIMIT ?",
+            (dialog_id, anchor_message_id, half + 1),
+        ).fetchall()
+
+        after_rows = self._conn.execute(
+            _LIST_MESSAGES_BASE_SQL + " AND m.message_id > ? ORDER BY m.message_id ASC LIMIT ?",
+            (dialog_id, anchor_message_id, half),
+        ).fetchall()
+
+        # before_rows are DESC — reverse to get chronological order, then append after
+        rows = list(reversed(before_rows)) + list(after_rows)
+        messages = [dict(zip(_DB_MESSAGE_COLUMNS, r)) for r in rows]
+        return {
+            "ok": True,
+            "data": {
+                "messages": messages,
+                "source": "sync_db",
+                "anchor_message_id": anchor_message_id,
+                "next_navigation": None,
+            },
+        }
+
     async def _list_messages_from_telegram(
         self,
         *,
@@ -797,6 +915,8 @@ class DaemonAPIServer:
         topic_id: int | None = req.get("topic_id")
         unread_after_id: int | None = req.get("unread_after_id")
         unread: bool = bool(req.get("unread"))
+        context_message_id: int | None = req.get("context_message_id")
+        context_size: int = _clamp(req.get("context_size", 10), 2, 50)
 
         if direction not in ("newest", "oldest"):
             direction = "newest"
@@ -813,6 +933,23 @@ class DaemonAPIServer:
                 "message": "Either dialog_id or dialog name is required",
             }
 
+        if context_message_id is not None:
+            row = self._conn.execute(_SELECT_SYNC_STATUS_SQL, (dialog_id,)).fetchone()
+            if row is None or row[0] not in ("synced", "syncing"):
+                return {
+                    "ok": False,
+                    "error": "not_synced",
+                    "message": (
+                        "Context window requires the dialog to be synced. "
+                        "Use MarkDialogForSync first."
+                    ),
+                }
+            return self._list_messages_context_window(
+                dialog_id=dialog_id,
+                anchor_message_id=context_message_id,
+                context_size=context_size,
+            )
+
         nav_result = self._decode_history_navigation(navigation, dialog_id, direction)
         if isinstance(nav_result, dict):
             return nav_result
@@ -828,8 +965,8 @@ class DaemonAPIServer:
         row = self._conn.execute(_SELECT_SYNC_STATUS_SQL, (dialog_id,)).fetchone()
         status = row[0] if row is not None else None
 
-        if status in ("synced", "syncing"):
-            return self._list_messages_from_db(
+        if status in ("synced", "syncing", "access_lost"):
+            result = self._list_messages_from_db(
                 dialog_id=dialog_id,
                 limit=limit,
                 direction=direction,
@@ -840,8 +977,10 @@ class DaemonAPIServer:
                 topic_id=topic_id,
                 unread_after_id=unread_after_id,
             )
+            result["data"].update(_build_access_metadata(self._conn, dialog_id, status))
+            return result
 
-        return await self._list_messages_from_telegram(
+        telegram_result = await self._list_messages_from_telegram(
             dialog_id=dialog_id,
             limit=limit,
             direction=direction,
@@ -851,54 +990,106 @@ class DaemonAPIServer:
             topic_id=topic_id,
             unread_after_id=unread_after_id,
         )
+        if telegram_result.get("ok"):
+            telegram_result["data"]["dialog_access"] = "live"
+        return telegram_result
 
     # ------------------------------------------------------------------
     # search_messages
     # ------------------------------------------------------------------
 
     async def _search_messages(self, req: dict) -> dict:
-        """FTS5 stemmed full-text search against messages_fts."""
+        """FTS5 stemmed full-text search against messages_fts.
+
+        Global mode (dialog_id=0, dialog=None): searches all synced dialogs.
+        Each result includes dialog_id and dialog_name for identification.
+
+        Scoped mode (dialog provided): searches within one dialog only.
+        """
         dialog_id: int = req.get("dialog_id", 0) or 0
         dialog: str | None = req.get("dialog")
         query: str = req.get("query", "")
         limit: int = _clamp(req.get("limit", 20), 1, 200)
         offset: int = max(0, req.get("offset", 0))
 
-        resolved = await self._resolve_dialog_id(dialog_id, dialog)
-        if isinstance(resolved, dict):
-            return resolved
-        dialog_id = resolved
+        global_mode = not dialog_id and dialog is None
+
+        if not global_mode:
+            resolved = await self._resolve_dialog_id(dialog_id, dialog)
+            if isinstance(resolved, dict):
+                return resolved
+            dialog_id = resolved
 
         # Stem the query
         stemmed = stem_query(query)
         if not stemmed:
             return {"ok": True, "data": {"messages": [], "total": 0}}
 
-        rows = self._conn.execute(
-            _SELECT_FTS_SQL,
-            (stemmed, dialog_id, limit, offset),
-        ).fetchall()
-
-        messages = [
-            {
-                "message_id": r[0],
-                "text": r[1],
-                "sender_first_name": r[2],
-                "sent_at": r[3],
-                "media_description": r[4],
-                "reply_to_msg_id": r[5],
-                "sender_id": r[6],
-                "forum_topic_id": r[7],
-                "reactions": r[8],
-            }
-            for r in rows
-        ]
+        if global_mode:
+            rows = self._conn.execute(
+                _SELECT_FTS_ALL_SQL,
+                (stemmed, limit, offset),
+            ).fetchall()
+            messages = [
+                {
+                    "message_id": r[0],
+                    "text": r[1],
+                    "sender_first_name": r[2],
+                    "sent_at": r[3],
+                    "media_description": r[4],
+                    "reply_to_msg_id": r[5],
+                    "sender_id": r[6],
+                    "forum_topic_id": r[7],
+                    "reactions": r[8],
+                    "dialog_id": r[9],
+                    "dialog_name": r[10],
+                }
+                for r in rows
+            ]
+        else:
+            rows = self._conn.execute(
+                _SELECT_FTS_SQL,
+                (stemmed, dialog_id, limit, offset),
+            ).fetchall()
+            messages = [
+                {
+                    "message_id": r[0],
+                    "text": r[1],
+                    "sender_first_name": r[2],
+                    "sent_at": r[3],
+                    "media_description": r[4],
+                    "reply_to_msg_id": r[5],
+                    "sender_id": r[6],
+                    "forum_topic_id": r[7],
+                    "reactions": r[8],
+                }
+                for r in rows
+            ]
 
         next_nav: str | None = None
         if messages and len(messages) == limit:
             next_offset = offset + limit
-            next_nav = encode_search_navigation(next_offset, dialog_id, query)
+            nav_dialog_id = 0 if global_mode else dialog_id
+            next_nav = encode_search_navigation(next_offset, nav_dialog_id, query)
 
+        # Enrich with access metadata for scoped searches
+        if not global_mode and dialog_id:
+            row = self._conn.execute(_SELECT_SYNC_STATUS_SQL, (dialog_id,)).fetchone()
+            scoped_status = row[0] if row else None
+            access_meta = _build_access_metadata(
+                self._conn, dialog_id, scoped_status or "not_synced"
+            )
+            return {
+                "ok": True,
+                "data": {
+                    "messages": messages,
+                    "total": len(messages),
+                    "next_navigation": next_nav,
+                    **access_meta,
+                },
+            }
+
+        # Global mode: no single dialog_access (results span multiple dialogs)
         return {"ok": True, "data": {"messages": messages, "total": len(messages), "next_navigation": next_nav}}
 
     # ------------------------------------------------------------------
@@ -913,10 +1104,13 @@ class DaemonAPIServer:
         "unread_count", "members", "created", "sync_status"}, ...]}.
         """
         # Load current sync statuses for O(1) lookup
-        synced_statuses: dict[int, str] = {
-            row[0]: row[1]
-            for row in self._conn.execute(_SELECT_SYNCED_STATUSES_SQL).fetchall()
+        synced_rows = self._conn.execute(_SELECT_SYNCED_STATUSES_SQL).fetchall()
+        synced_meta: dict[int, tuple[str, int | None, int | None]] = {
+            row[0]: (row[1], row[2], row[3]) for row in synced_rows
         }
+        local_counts: dict[int, int] = dict(
+            self._conn.execute(_COUNT_MESSAGES_BY_DIALOG_SQL).fetchall()
+        )
 
         exclude_archived: bool = req.get("exclude_archived", False)
         ignore_pinned: bool = req.get("ignore_pinned", False)
@@ -946,6 +1140,12 @@ class DaemonAPIServer:
                     except Exception:
                         pass
 
+                _meta = synced_meta.get(d.id, ("not_synced", None, None))
+                _status = _meta[0]
+                _total = _meta[1]
+                _access_lost = _meta[2]
+                _local = local_counts.get(d.id, 0)
+                _cov = _compute_sync_coverage(_total, _local)
                 dialogs.append(
                     {
                         "id": d.id,
@@ -955,7 +1155,9 @@ class DaemonAPIServer:
                         "unread_count": getattr(d, "unread_count", 0),
                         "members": members,
                         "created": created_ts,
-                        "sync_status": synced_statuses.get(d.id, "not_synced"),
+                        "sync_status": _status,
+                        "sync_coverage_pct": _cov,
+                        "access_lost_at": _access_lost,
                     }
                 )
         except Exception as exc:
@@ -1099,31 +1301,36 @@ class DaemonAPIServer:
             last_event_at: int | None = row[2]
             sync_progress: int | None = row[3]
             total_messages: int | None = row[4]
+            access_lost_at: int | None = row[5]
         else:
             status = "not_synced"
             last_synced_at = None
             last_event_at = None
             sync_progress = None
             total_messages = None
+            access_lost_at = None
 
         count_row = self._conn.execute(_COUNT_SYNCED_MESSAGES_SQL, (dialog_id,)).fetchone()
         message_count: int = count_row[0] if count_row is not None else 0
 
+        sync_coverage_pct = _compute_sync_coverage(total_messages, message_count)
         delete_detection = "reliable (channel)" if dialog_id < 0 else "best-effort weekly (DM)"
 
-        return {
-            "ok": True,
-            "data": {
-                "dialog_id": dialog_id,
-                "status": status,
-                "message_count": message_count,
-                "last_synced_at": last_synced_at,
-                "last_event_at": last_event_at,
-                "sync_progress": sync_progress,
-                "total_messages": total_messages,
-                "delete_detection": delete_detection,
-            },
+        data: dict = {
+            "dialog_id": dialog_id,
+            "status": status,
+            "message_count": message_count,
+            "last_synced_at": last_synced_at,
+            "last_event_at": last_event_at,
+            "sync_progress": sync_progress,
+            "total_messages": total_messages,
+            "delete_detection": delete_detection,
+            "sync_coverage_pct": sync_coverage_pct,
+            "access_lost_at": access_lost_at,
         }
+        if status == "access_lost" and total_messages is None:
+            data["archived_message_count"] = message_count
+        return {"ok": True, "data": data}
 
     # ------------------------------------------------------------------
     # get_sync_alerts
@@ -1183,6 +1390,29 @@ class DaemonAPIServer:
     # get_user_info
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _format_user_status(status: object) -> dict | None:
+        """Serialize a Telethon UserStatus object to a plain dict.
+
+        Returns None for UserStatusEmpty or missing status.
+        """
+        if status is None:
+            return None
+        type_name = type(status).__name__
+        if type_name == "UserStatusOnline":
+            expires = getattr(status, "expires", None)
+            return {"type": "online", "expires": expires.isoformat() if expires else None}
+        if type_name == "UserStatusOffline":
+            was_online = getattr(status, "was_online", None)
+            return {"type": "offline", "was_online": was_online.isoformat() if was_online else None}
+        if type_name == "UserStatusRecently":
+            return {"type": "recently"}
+        if type_name == "UserStatusLastWeek":
+            return {"type": "last_week"}
+        if type_name == "UserStatusLastMonth":
+            return {"type": "last_month"}
+        return None  # UserStatusEmpty or unknown
+
     async def _get_user_info(self, req: dict) -> dict:
         """Return user profile and list of common chats.
 
@@ -1218,6 +1448,113 @@ class DaemonAPIServer:
         except Exception as exc:
             logger.warning("get_user_info common_chats_failed user_id=%r error=%s%s", user_id, exc, _rid(), exc_info=True)
 
+        # Fetch full user profile
+        about: str | None = None
+        personal_channel_id: int | None = None
+        birthday: dict | None = None
+        blocked: bool = False
+        ttl_period: int | None = None
+        private_forward_name: str | None = None
+        bot_info: dict | None = None
+        business_location: dict | None = None
+        business_intro: dict | None = None
+        business_work_hours: dict | None = None
+        note: str | None = None
+        folder_id: int | None = None
+        folder_name: str | None = None
+        try:
+            full_result = await self._client(GetFullUserRequest(id=user_id))
+            user_full = full_result.full_user
+            about = getattr(user_full, "about", None) or None
+            personal_channel_id = getattr(user_full, "personal_channel_id", None)
+            blocked = bool(getattr(user_full, "blocked", False))
+            ttl_period = getattr(user_full, "ttl_period", None)
+            private_forward_name = getattr(user_full, "private_forward_name", None) or None
+            folder_id = getattr(user_full, "folder_id", None)
+
+            bday = getattr(user_full, "birthday", None)
+            if bday is not None:
+                birthday = {
+                    "day": getattr(bday, "day", None),
+                    "month": getattr(bday, "month", None),
+                    "year": getattr(bday, "year", None),
+                }
+
+            raw_bot_info = getattr(user_full, "bot_info", None)
+            if raw_bot_info is not None:
+                commands = []
+                for cmd in getattr(raw_bot_info, "commands", None) or []:
+                    commands.append({
+                        "command": getattr(cmd, "command", ""),
+                        "description": getattr(cmd, "description", ""),
+                    })
+                bot_info = {
+                    "description": getattr(raw_bot_info, "description", None) or None,
+                    "commands": commands,
+                }
+
+            raw_loc = getattr(user_full, "business_location", None)
+            if raw_loc is not None:
+                geo = getattr(raw_loc, "geo_point", None)
+                business_location = {
+                    "address": getattr(raw_loc, "address", None),
+                    "lat": getattr(geo, "lat", None) if geo else None,
+                    "long": getattr(geo, "long", None) if geo else None,
+                }
+
+            raw_intro = getattr(user_full, "business_intro", None)
+            if raw_intro is not None:
+                business_intro = {
+                    "title": getattr(raw_intro, "title", None),
+                    "description": getattr(raw_intro, "description", None),
+                }
+
+            raw_hours = getattr(user_full, "business_work_hours", None)
+            if raw_hours is not None:
+                business_work_hours = {
+                    "timezone": getattr(raw_hours, "timezone_id", None),
+                }
+
+            raw_note = getattr(user_full, "note", None)
+            if raw_note is not None:
+                note = getattr(raw_note, "text", None) or None
+
+        except Exception as exc:
+            logger.warning("get_user_info full_user_failed user_id=%r error=%s%s", user_id, exc, _rid())
+
+        # Resolve folder_id → folder name
+        if folder_id is not None:
+            try:
+                filters = await self._client(GetDialogFiltersRequest())
+                for f in filters or []:
+                    if getattr(f, "id", None) == folder_id:
+                        raw_title = getattr(f, "title", None)
+                        # title may be str or TextWithEntities
+                        folder_name = getattr(raw_title, "text", raw_title) if raw_title else None
+                        break
+            except Exception as exc:
+                logger.warning("get_user_info folder_resolve_failed folder_id=%r error=%s%s", folder_id, exc, _rid())
+
+        # Additional usernames (Telegram allows multiple active usernames)
+        extra_usernames: list[str] = []
+        for uname in getattr(user, "usernames", None) or []:
+            name_str = getattr(uname, "username", None)
+            if name_str and name_str != getattr(user, "username", None):
+                extra_usernames.append(name_str)
+
+        emoji_status = getattr(user, "emoji_status", None)
+        emoji_status_id: int | None = None
+        if emoji_status is not None:
+            emoji_status_id = getattr(emoji_status, "document_id", None)
+
+        restriction_reason: list[dict] = []
+        for rr in getattr(user, "restriction_reason", None) or []:
+            restriction_reason.append({
+                "platform": getattr(rr, "platform", None),
+                "reason": getattr(rr, "reason", None),
+                "text": getattr(rr, "text", None),
+            })
+
         return {
             "ok": True,
             "data": {
@@ -1225,6 +1562,35 @@ class DaemonAPIServer:
                 "first_name": getattr(user, "first_name", None),
                 "last_name": getattr(user, "last_name", None),
                 "username": getattr(user, "username", None),
+                "extra_usernames": extra_usernames,
+                "emoji_status_id": emoji_status_id,
+                "status": self._format_user_status(getattr(user, "status", None)),
+                "phone": getattr(user, "phone", None),
+                "lang_code": getattr(user, "lang_code", None),
+                "contact": bool(getattr(user, "contact", False)),
+                "mutual_contact": bool(getattr(user, "mutual_contact", False)),
+                "close_friend": bool(getattr(user, "close_friend", False)),
+                "send_paid_messages_stars": getattr(user, "send_paid_messages_stars", None),
+                "about": about,
+                "personal_channel_id": personal_channel_id,
+                "birthday": birthday,
+                "verified": bool(getattr(user, "verified", False)),
+                "premium": bool(getattr(user, "premium", False)),
+                "bot": bool(getattr(user, "bot", False)),
+                "scam": bool(getattr(user, "scam", False)),
+                "fake": bool(getattr(user, "fake", False)),
+                "restricted": bool(getattr(user, "restricted", False)),
+                "restriction_reason": restriction_reason,
+                "blocked": blocked,
+                "ttl_period": ttl_period,
+                "private_forward_name": private_forward_name,
+                "bot_info": bot_info,
+                "business_location": business_location,
+                "business_intro": business_intro,
+                "business_work_hours": business_work_hours,
+                "note": note,
+                "folder_id": folder_id,
+                "folder_name": folder_name,
                 "common_chats": common_chats,
             },
         }
@@ -1492,6 +1858,11 @@ class DaemonAPIServer:
         if not query:
             return {"ok": False, "error": "missing_query"}
 
+        # t.me URL: extract @username (and optionally message_id) then fall through
+        tme = _parse_tme_link(query)
+        if tme is not None:
+            query = f"@{tme[0]}"
+
         # @username lookup
         if query.startswith("@"):
             username_query = query[1:]
@@ -1504,7 +1875,7 @@ class DaemonAPIServer:
                     "data": {
                         "result": "resolved",
                         "entity_id": row[0],
-                        "display_name": row[1],
+                        "display_name": row[1] or f"@{username_query}",
                     },
                 }
             return {"ok": True, "data": {"result": "not_found", "query": query}}
