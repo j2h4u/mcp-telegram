@@ -238,6 +238,111 @@ async def test_on_new_message_ignores_unsynced_non_private(
 
 
 @pytest.mark.asyncio
+async def test_auto_enroll_writes_entity_when_sender_available(
+    mock_client: MagicMock,
+    sync_db: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """Auto-enroll writes an entities row when get_sender() returns a User."""
+    dialog_id = 7010
+    sender = SimpleNamespace(first_name="Ivan", last_name="Zakazov", username="ivan_z")
+
+    msg = build_mock_message(id=1, text="hey")
+    event = SimpleNamespace(
+        chat_id=dialog_id,
+        message=msg,
+        is_private=True,
+        get_sender=AsyncMock(return_value=sender),
+    )
+
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+    manager.register()
+    await manager.on_new_message(event)
+
+    row = sync_db.execute(
+        "SELECT id, type, name, username, name_normalized FROM entities WHERE id=?",
+        (dialog_id,),
+    ).fetchone()
+    assert row is not None, "entity must be written when sender is available"
+    assert row[1] == "user"
+    assert row[2] == "Ivan Zakazov"
+    assert row[3] == "ivan_z"
+    assert row[4] == "ivan zakazov"
+
+
+@pytest.mark.asyncio
+async def test_auto_enroll_entity_write_fails_gracefully(
+    mock_client: MagicMock,
+    sync_db: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """Enrollment succeeds even if entity write fails (independent failure domains)."""
+    dialog_id = 7011
+    sender = SimpleNamespace(first_name="Broken", last_name="User", username=None)
+
+    msg = build_mock_message(id=1, text="hi")
+    event = SimpleNamespace(
+        chat_id=dialog_id,
+        message=msg,
+        is_private=True,
+        get_sender=AsyncMock(return_value=sender),
+    )
+
+    # Drop entities table to force entity write to fail
+    sync_db.execute("DROP TABLE entities")
+    sync_db.commit()
+
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+    manager.register()
+    await manager.on_new_message(event)
+
+    # Dialog must still be enrolled despite entity write failure
+    row = sync_db.execute(
+        "SELECT dialog_id, status FROM synced_dialogs WHERE dialog_id=?",
+        (dialog_id,),
+    ).fetchone()
+    assert row is not None, "dialog must be enrolled even when entity write fails"
+    assert row[1] == "syncing"
+    assert dialog_id in manager._synced_dialog_ids
+
+
+@pytest.mark.asyncio
+async def test_auto_enroll_no_entity_when_sender_unavailable(
+    mock_client: MagicMock,
+    sync_db: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """When get_sender() fails, dialog is enrolled but no entity row is written."""
+    dialog_id = 7012
+
+    msg = build_mock_message(id=1, text="hello")
+    event = SimpleNamespace(
+        chat_id=dialog_id,
+        message=msg,
+        is_private=True,
+        get_sender=AsyncMock(side_effect=Exception("Telegram unreachable")),
+    )
+
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+    manager.register()
+    await manager.on_new_message(event)
+
+    # Dialog enrolled
+    row = sync_db.execute(
+        "SELECT status FROM synced_dialogs WHERE dialog_id=?",
+        (dialog_id,),
+    ).fetchone()
+    assert row is not None, "dialog must be enrolled even when sender fetch fails"
+    assert row[0] == "syncing"
+
+    # No entity row
+    entity = sync_db.execute(
+        "SELECT id FROM entities WHERE id=?", (dialog_id,)
+    ).fetchone()
+    assert entity is None, "no entity row must be written when sender is unavailable"
+
+
+@pytest.mark.asyncio
 async def test_on_new_message_updates_last_event_at(
     mock_client: MagicMock,
     sync_db: sqlite3.Connection,

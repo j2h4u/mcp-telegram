@@ -458,6 +458,113 @@ async def test_dm_bootstrap_idempotent(
 
 
 # ---------------------------------------------------------------------------
+# bootstrap_dms() — entity population
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dm_bootstrap_populates_entities(
+    mock_client: MagicMock,
+    sync_db: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """bootstrap_dms() writes an entities row for each User dialog."""
+    from telethon.tl import types  # type: ignore[import-untyped]
+
+    user = MagicMock(spec=types.User)
+    user.first_name = "Ivan"
+    user.last_name = "Zakazov"
+    user.username = "ivan_z"
+    dialog = SimpleNamespace(entity=user, id=40001)
+
+    async def _iter_dialogs():  # noqa: ANN202
+        yield dialog
+
+    mock_client.iter_dialogs = _iter_dialogs
+
+    worker = make_worker(mock_client, sync_db, shutdown_event)
+    await worker.bootstrap_dms()
+
+    row = sync_db.execute(
+        "SELECT id, type, name, username, name_normalized FROM entities WHERE id=?",
+        (40001,),
+    ).fetchone()
+    assert row is not None, "entities row must be written for the enrolled user"
+    assert row[1] == "user"
+    assert row[2] == "Ivan Zakazov"
+    assert row[3] == "ivan_z"
+    assert row[4] == "ivan zakazov"  # latinize("Ivan Zakazov")
+
+
+@pytest.mark.asyncio
+async def test_dm_bootstrap_entity_backfills_existing_enrollment(
+    mock_client: MagicMock,
+    sync_db: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """bootstrap_dms() writes entity even for already-enrolled dialogs (fixes existing gap)."""
+    from telethon.tl import types  # type: ignore[import-untyped]
+
+    dialog_id = 40002
+    sync_db.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, sync_progress) VALUES (?, 'synced', 500)",
+        (dialog_id,),
+    )
+    sync_db.commit()
+
+    user = MagicMock(spec=types.User)
+    user.first_name = "Anna"
+    user.last_name = "Smith"
+    user.username = None
+    dialog = SimpleNamespace(entity=user, id=dialog_id)
+
+    async def _iter_dialogs():  # noqa: ANN202
+        yield dialog
+
+    mock_client.iter_dialogs = _iter_dialogs
+
+    worker = make_worker(mock_client, sync_db, shutdown_event)
+    count = await worker.bootstrap_dms()
+
+    assert count == 0  # already enrolled — no new enrollment
+
+    row = sync_db.execute(
+        "SELECT name, name_normalized FROM entities WHERE id=?",
+        (dialog_id,),
+    ).fetchone()
+    assert row is not None, "entity must be backfilled for already-enrolled dialog"
+    assert row[0] == "Anna Smith"
+    assert row[1] == "anna smith"
+
+
+@pytest.mark.asyncio
+async def test_dm_bootstrap_skips_entity_for_nameless_user(
+    mock_client: MagicMock,
+    sync_db: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """bootstrap_dms() does not crash or write entity when user has no display name."""
+    from telethon.tl import types  # type: ignore[import-untyped]
+
+    user = MagicMock(spec=types.User)
+    user.first_name = None
+    user.last_name = None
+    user.username = "ghost"
+    dialog = SimpleNamespace(entity=user, id=40003)
+
+    async def _iter_dialogs():  # noqa: ANN202
+        yield dialog
+
+    mock_client.iter_dialogs = _iter_dialogs
+
+    worker = make_worker(mock_client, sync_db, shutdown_event)
+    await worker.bootstrap_dms()
+
+    row = sync_db.execute("SELECT id FROM entities WHERE id=?", (40003,)).fetchone()
+    assert row is None, "no entities row must be written when name is empty"
+
+
+# ---------------------------------------------------------------------------
 # Completion detection
 # ---------------------------------------------------------------------------
 

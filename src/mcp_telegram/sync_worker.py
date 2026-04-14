@@ -37,6 +37,7 @@ from telethon.errors import (  # type: ignore[import-untyped]
 from telethon.tl import types  # type: ignore[import-untyped]
 
 from .fts import DELETE_FTS_SQL, INSERT_FTS_SQL, stem_text
+from .resolver import latinize
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +84,12 @@ _UPDATE_PROGRESS_SQL = (
 
 INSERT_DIALOG_SQL = (
     "INSERT OR IGNORE INTO synced_dialogs (dialog_id, status) VALUES (?, 'syncing')"
+)
+
+UPSERT_ENTITY_SQL = (
+    "INSERT OR REPLACE INTO entities "
+    "(id, type, name, username, name_normalized, updated_at) "
+    "VALUES (?, ?, ?, ?, ?, ?)"
 )
 
 _ACCESS_LOST_ERRORS = (
@@ -242,6 +249,7 @@ class FullSyncWorker:
             Count of newly enrolled dialogs (0 if all already present).
         """
         enrolled = 0
+        now = int(time.time())
         try:
             async for dialog in self._client.iter_dialogs():
                 if not isinstance(dialog.entity, types.User):
@@ -249,6 +257,15 @@ class FullSyncWorker:
                 cursor = self._conn.execute(INSERT_DIALOG_SQL, (dialog.id,))
                 if cursor.rowcount > 0:
                     enrolled += 1
+                entity = dialog.entity
+                first = getattr(entity, "first_name", None) or ""
+                last = getattr(entity, "last_name", None) or ""
+                name = f"{first} {last}".strip()
+                if name:
+                    self._conn.execute(
+                        UPSERT_ENTITY_SQL,
+                        (dialog.id, "user", name, getattr(entity, "username", None), latinize(name), now),
+                    )
         except FloodWaitError as exc:
             wait_seconds = getattr(exc, "seconds", 60)
             logger.warning(

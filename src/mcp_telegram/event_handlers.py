@@ -28,7 +28,8 @@ from typing import Any
 from telethon import events  # type: ignore[import-untyped]
 
 from .fts import DELETE_FTS_SQL, INSERT_FTS_SQL, stem_text
-from .sync_worker import INSERT_DIALOG_SQL, INSERT_MESSAGE_SQL, extract_message_row, serialize_reactions
+from .resolver import latinize
+from .sync_worker import INSERT_DIALOG_SQL, INSERT_MESSAGE_SQL, UPSERT_ENTITY_SQL, extract_message_row, serialize_reactions
 
 logger = logging.getLogger(__name__)
 
@@ -139,7 +140,7 @@ class EventHandlerManager:
         rows = self._conn.execute(_SELECT_SYNCED_DIALOGS_SQL).fetchall()
         self._synced_dialog_ids = {int(row[0]) for row in rows}
 
-    def _auto_enroll_dm(self, dialog_id: int) -> None:
+    def _auto_enroll_dm(self, dialog_id: int, sender: Any | None = None) -> None:
         """Enroll a new DM dialog into synced_dialogs on first incoming message.
 
         Called from on_new_message when a private message arrives from a dialog
@@ -147,6 +148,10 @@ class EventHandlerManager:
         and daemon restarts are idempotent.  After enrollment, the dialog is
         added to the in-memory set so subsequent messages are written real-time;
         FullSyncWorker picks up full history in its next batch cycle.
+
+        If sender is provided (types.User), writes an entity row so the resolver
+        can find this contact by name immediately.  Entity write is best-effort —
+        failure does not prevent enrollment.
         """
         try:
             cursor = self._conn.execute(INSERT_DIALOG_SQL, (dialog_id,))
@@ -156,6 +161,23 @@ class EventHandlerManager:
                 logger.info("dm_auto_enroll dialog_id=%d", dialog_id)
         except Exception:
             logger.exception("dm_auto_enroll_failed dialog_id=%d", dialog_id)
+            return
+
+        if sender is None:
+            return
+        try:
+            first = getattr(sender, "first_name", None) or ""
+            last = getattr(sender, "last_name", None) or ""
+            name = f"{first} {last}".strip()
+            if name:
+                self._conn.execute(
+                    UPSERT_ENTITY_SQL,
+                    (dialog_id, "user", name, getattr(sender, "username", None), latinize(name), int(time.time())),
+                )
+                self._conn.commit()
+                logger.info("dm_auto_enroll_entity dialog_id=%d name=%r", dialog_id, name)
+        except Exception:
+            logger.exception("dm_auto_enroll_entity_failed dialog_id=%d", dialog_id)
 
     # ------------------------------------------------------------------
     # Event handlers
@@ -174,7 +196,12 @@ class EventHandlerManager:
             return
         if dialog_id not in self._synced_dialog_ids:
             if event.is_private:
-                self._auto_enroll_dm(dialog_id)
+                sender = None
+                try:
+                    sender = await event.get_sender()
+                except Exception:
+                    logger.debug("dm_auto_enroll_sender_fetch_failed dialog_id=%d", dialog_id)
+                self._auto_enroll_dm(dialog_id, sender=sender)
             return
 
         try:
