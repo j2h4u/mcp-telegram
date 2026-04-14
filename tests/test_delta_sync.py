@@ -473,3 +473,259 @@ async def test_delta_catch_up_populates_fts(
     assert len(fts_rows) == 2, f"Expected 2 FTS rows for gap messages, got {len(fts_rows)}"
     for row in fts_rows:
         assert row[1] != "", "stemmed_text must be non-empty for gap-filled messages with text"
+
+
+# ---------------------------------------------------------------------------
+# Probe-worker tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_probe_restores_access_after_gap_fill(sync_db, mock_client, shutdown_event):
+    """Probe does gap-fill FIRST, then resets status to syncing only on success."""
+    from unittest.mock import AsyncMock
+    from helpers import MockTotalList
+    from mcp_telegram.delta_sync import _probe_access_lost_dialogs, DeltaSyncWorker
+
+    dialog_id = 9001
+    sync_db.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, access_lost_at) "
+        "VALUES (?, 'access_lost', 1000)",
+        (dialog_id,),
+    )
+    # Need a baseline message for delta worker
+    sync_db.execute(
+        "INSERT INTO messages (dialog_id, message_id, sent_at, text) "
+        "VALUES (?, 100, 1000, 'old')",
+        (dialog_id,),
+    )
+    sync_db.commit()
+
+    mock_client.get_messages = AsyncMock(return_value=MockTotalList([], total=200))
+    # iter_messages for delta gap-fill returns empty
+    async def _empty_iter(**kwargs):
+        return
+        yield
+    mock_client.iter_messages = _empty_iter
+
+    delta_worker = DeltaSyncWorker(mock_client, sync_db, shutdown_event)
+    restored = await _probe_access_lost_dialogs(mock_client, sync_db, delta_worker)
+
+    assert restored == 1
+    row = sync_db.execute(
+        "SELECT status, access_lost_at, total_messages FROM synced_dialogs "
+        "WHERE dialog_id = ?",
+        (dialog_id,),
+    ).fetchone()
+    assert row[0] == "syncing"
+    assert row[1] is None  # access_lost_at cleared
+    assert row[2] == 200  # total_messages set from probe
+
+
+@pytest.mark.asyncio
+async def test_probe_gap_fill_failure_keeps_access_lost(sync_db, mock_client, shutdown_event):
+    """If gap-fill fails after successful probe, status stays access_lost."""
+    from unittest.mock import AsyncMock
+    from helpers import MockTotalList
+    from mcp_telegram.delta_sync import _probe_access_lost_dialogs, DeltaSyncWorker
+
+    dialog_id = 9010
+    sync_db.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, access_lost_at) "
+        "VALUES (?, 'access_lost', 1000)",
+        (dialog_id,),
+    )
+    sync_db.execute(
+        "INSERT INTO messages (dialog_id, message_id, sent_at, text) "
+        "VALUES (?, 100, 1000, 'old')",
+        (dialog_id,),
+    )
+    sync_db.commit()
+
+    # Probe succeeds (get_messages returns OK)
+    mock_client.get_messages = AsyncMock(return_value=MockTotalList([], total=200))
+    # But gap-fill fails with a network error (not caught by fetch_delta_for_dialog)
+    async def _failing_iter(**kwargs):
+        raise OSError("connection reset during gap-fill")
+        yield  # pragma: no cover
+    mock_client.iter_messages = _failing_iter
+
+    delta_worker = DeltaSyncWorker(mock_client, sync_db, shutdown_event)
+    restored = await _probe_access_lost_dialogs(mock_client, sync_db, delta_worker)
+
+    assert restored == 0  # not restored because gap-fill failed
+    row = sync_db.execute(
+        "SELECT status, access_lost_at FROM synced_dialogs WHERE dialog_id = ?",
+        (dialog_id,),
+    ).fetchone()
+    assert row[0] == "access_lost"  # status unchanged
+    assert row[1] == 1000  # access_lost_at unchanged
+
+
+@pytest.mark.asyncio
+async def test_probe_still_lost_unchanged(sync_db, mock_client, shutdown_event):
+    """Probe leaves status unchanged when access is still lost."""
+    from unittest.mock import AsyncMock
+    from mcp_telegram.delta_sync import _probe_access_lost_dialogs, DeltaSyncWorker
+    from telethon.errors import ChannelPrivateError
+
+    dialog_id = 9002
+    sync_db.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, access_lost_at) "
+        "VALUES (?, 'access_lost', 1000)",
+        (dialog_id,),
+    )
+    sync_db.commit()
+
+    mock_client.get_messages = AsyncMock(
+        side_effect=ChannelPrivateError(request=None)
+    )
+
+    delta_worker = DeltaSyncWorker(mock_client, sync_db, shutdown_event)
+    restored = await _probe_access_lost_dialogs(mock_client, sync_db, delta_worker)
+
+    assert restored == 0
+    row = sync_db.execute(
+        "SELECT status, access_lost_at FROM synced_dialogs WHERE dialog_id = ?",
+        (dialog_id,),
+    ).fetchone()
+    assert row[0] == "access_lost"
+    assert row[1] == 1000  # unchanged
+
+
+@pytest.mark.asyncio
+async def test_probe_loop_runs_immediately_then_shutdown(shutdown_event):
+    """Probe loop runs immediately (initial_delay=0) then exits on shutdown."""
+    from unittest.mock import MagicMock, AsyncMock, patch
+    from mcp_telegram.delta_sync import run_access_probe_loop, DeltaSyncWorker
+
+    client = MagicMock()
+    conn = MagicMock()
+    conn.execute = MagicMock(return_value=MagicMock(fetchall=MagicMock(return_value=[])))
+    delta_worker = MagicMock(spec=DeltaSyncWorker)
+
+    # Set shutdown after one iteration
+    async def _set_shutdown_after_probe(*args, **kwargs):
+        shutdown_event.set()
+
+    with patch(
+        "mcp_telegram.delta_sync._probe_access_lost_dialogs",
+        new=AsyncMock(side_effect=_set_shutdown_after_probe),
+    ) as mock_probe:
+        await run_access_probe_loop(
+            client, conn, shutdown_event, delta_worker,
+            initial_delay=0.0, interval=86400.0,
+        )
+        # Probe was called exactly once (immediate run, then shutdown)
+        mock_probe.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_probe_loop_shutdown_during_initial_delay(shutdown_event):
+    """Probe loop exits cleanly when shutdown fires during non-zero initial delay."""
+    from unittest.mock import MagicMock, AsyncMock
+    from mcp_telegram.delta_sync import run_access_probe_loop, DeltaSyncWorker
+
+    client = MagicMock()
+    conn = MagicMock()
+    delta_worker = MagicMock(spec=DeltaSyncWorker)
+
+    shutdown_event.set()  # immediate shutdown
+
+    await run_access_probe_loop(
+        client, conn, shutdown_event, delta_worker,
+        initial_delay=10.0, interval=86400.0,
+    )
+    # Should return without error — no probes performed
+    client.get_messages.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Backfill total_messages tests (via daemon._backfill_total_messages)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_backfill_total_messages_fills_null_rows(sync_db, mock_client, shutdown_event):
+    """_backfill_total_messages populates total_messages for NULL rows."""
+    from unittest.mock import AsyncMock
+    from helpers import MockTotalList
+
+    import importlib
+    daemon_mod = importlib.import_module("mcp_telegram.daemon")
+    _backfill = daemon_mod._backfill_total_messages
+
+    sync_db.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, total_messages) "
+        "VALUES (?, 'synced', NULL)",
+        (8001,),
+    )
+    sync_db.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, total_messages) "
+        "VALUES (?, 'syncing', 500)",  # already has total — should be skipped
+        (8002,),
+    )
+    sync_db.commit()
+
+    mock_client.get_messages = AsyncMock(return_value=MockTotalList([], total=999))
+
+    filled = await _backfill(mock_client, sync_db, shutdown_event)
+
+    assert filled == 1
+    row = sync_db.execute(
+        "SELECT total_messages FROM synced_dialogs WHERE dialog_id = ?", (8001,)
+    ).fetchone()
+    assert row[0] == 999
+    # 8002 unchanged
+    row2 = sync_db.execute(
+        "SELECT total_messages FROM synced_dialogs WHERE dialog_id = ?", (8002,)
+    ).fetchone()
+    assert row2[0] == 500
+
+
+@pytest.mark.asyncio
+async def test_backfill_skips_on_error(sync_db, mock_client, shutdown_event):
+    """_backfill_total_messages skips dialogs that raise exceptions."""
+    from unittest.mock import AsyncMock
+
+    import importlib
+    daemon_mod = importlib.import_module("mcp_telegram.daemon")
+    _backfill = daemon_mod._backfill_total_messages
+
+    sync_db.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, total_messages) "
+        "VALUES (?, 'synced', NULL)",
+        (8003,),
+    )
+    sync_db.commit()
+
+    mock_client.get_messages = AsyncMock(side_effect=Exception("network error"))
+
+    filled = await _backfill(mock_client, sync_db, shutdown_event)
+
+    assert filled == 0  # skipped, not crashed
+    row = sync_db.execute(
+        "SELECT total_messages FROM synced_dialogs WHERE dialog_id = ?", (8003,)
+    ).fetchone()
+    assert row[0] is None  # still NULL
+
+
+@pytest.mark.asyncio
+async def test_backfill_respects_shutdown(sync_db, mock_client, shutdown_event):
+    """_backfill_total_messages exits early when shutdown_event is set."""
+    import importlib
+    daemon_mod = importlib.import_module("mcp_telegram.daemon")
+    _backfill = daemon_mod._backfill_total_messages
+
+    for i in range(5):
+        sync_db.execute(
+            "INSERT INTO synced_dialogs (dialog_id, status, total_messages) "
+            "VALUES (?, 'synced', NULL)",
+            (8010 + i,),
+        )
+    sync_db.commit()
+
+    shutdown_event.set()  # immediate shutdown
+
+    filled = await _backfill(mock_client, sync_db, shutdown_event)
+    assert filled == 0  # exited before processing any

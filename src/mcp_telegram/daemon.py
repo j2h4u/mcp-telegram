@@ -41,7 +41,7 @@ import time
 from typing import Any
 
 from .daemon_api import DaemonAPIServer, get_daemon_socket_path
-from .delta_sync import DeltaSyncWorker
+from .delta_sync import DeltaSyncWorker, run_access_probe_loop
 from .event_handlers import EventHandlerManager
 from .fts import backfill_fts_index
 from .sync_db import (
@@ -58,6 +58,56 @@ logger = logging.getLogger(__name__)
 
 HEARTBEAT_INTERVAL_S: float = 60.0
 GAP_SCAN_INTERVAL_S: float = 7 * 24 * 3600.0
+
+_SELECT_NULL_TOTAL_SQL = (
+    "SELECT dialog_id FROM synced_dialogs WHERE total_messages IS NULL "
+    "AND status != 'not_synced'"
+)
+
+_UPDATE_TOTAL_SQL = (
+    "UPDATE synced_dialogs SET total_messages = ? WHERE dialog_id = ?"
+)
+
+# Tracked background tasks — cancelled on shutdown
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _create_tracked_task(coro: Any, *, name: str | None = None) -> asyncio.Task:
+    """Create an asyncio task and track it for shutdown cancellation."""
+    task = asyncio.create_task(coro, name=name)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
+
+async def _backfill_total_messages(
+    client: Any,
+    conn: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+) -> int:
+    """One-time sweep to populate total_messages for dialogs with NULL."""
+    rows = conn.execute(_SELECT_NULL_TOTAL_SQL).fetchall()
+    if not rows:
+        logger.info("backfill_total_messages — no NULL rows, skipping")
+        return 0
+
+    filled = 0
+    for (dialog_id,) in rows:
+        if shutdown_event.is_set():
+            break
+        try:
+            result = await client.get_messages(entity=dialog_id, limit=1)
+            total = getattr(result, "total", None)
+            if total is not None:
+                conn.execute(_UPDATE_TOTAL_SQL, (total, dialog_id))
+                conn.commit()
+                filled += 1
+        except Exception as exc:
+            logger.debug("backfill_total skip dialog_id=%d error=%s", dialog_id, exc)
+        await asyncio.sleep(1.0)
+
+    logger.info("backfill_total_messages filled=%d/%d", filled, len(rows))
+    return filled
 
 
 # ---------------------------------------------------------------------------
@@ -233,6 +283,16 @@ async def sync_main() -> None:
 
         handler_manager.refresh_synced_dialogs()
 
+        # Background tasks — non-blocking, tracked for shutdown
+        _create_tracked_task(
+            _backfill_total_messages(client, conn, shutdown_event),
+            name="backfill_total_messages",
+        )
+        _create_tracked_task(
+            run_access_probe_loop(client, conn, shutdown_event, delta_worker),
+            name="access_probe_loop",
+        )
+
         await _run_sync_loop(worker, handler_manager, shutdown_event, conn, client)
 
     finally:
@@ -242,5 +302,14 @@ async def sync_main() -> None:
         get_daemon_socket_path().unlink(missing_ok=True)
         if handler_manager is not None:
             handler_manager.unregister()
+        # Cancel tracked background tasks
+        for task in _background_tasks:
+            task.cancel()
+        for task in list(_background_tasks):
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        _background_tasks.clear()
         await client.disconnect()
         logger.info("sync-daemon stopped")

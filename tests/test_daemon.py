@@ -37,10 +37,13 @@ def mock_client() -> MagicMock:
     is_connected() is a synchronous call in TelegramClient, so we use MagicMock
     for the base object and AsyncMock only for the async methods.
     """
+    from helpers import MockTotalList
     client = MagicMock()
     client.is_connected.return_value = True  # sync method
     client.connect = AsyncMock()
     client.disconnect = AsyncMock()
+    # get_messages used by backfill and probe-worker
+    client.get_messages = AsyncMock(return_value=MockTotalList([], total=0))
     return client
 
 
