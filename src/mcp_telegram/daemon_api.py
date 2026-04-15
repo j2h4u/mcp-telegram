@@ -62,7 +62,8 @@ from .pagination import (
     encode_history_navigation,
     encode_search_navigation,
 )
-from .sync_worker import extract_reply_and_topic, serialize_reactions
+from .formatter import format_reaction_counts
+from .sync_worker import extract_reply_and_topic
 from .resolver import (
     Candidates,
     NotFound,
@@ -154,13 +155,13 @@ _SELECT_SYNC_STATUS_SQL = "SELECT status FROM synced_dialogs WHERE dialog_id = ?
 
 _SELECT_MESSAGES_SQL = (
     "SELECT message_id, sent_at, text, sender_id, sender_first_name, "
-    "media_description, reply_to_msg_id, forum_topic_id, reactions, is_deleted, deleted_at "
+    "media_description, reply_to_msg_id, forum_topic_id, is_deleted, deleted_at "
     "FROM messages WHERE dialog_id = ? AND is_deleted = 0 ORDER BY sent_at DESC LIMIT ?"
 )
 
 _SELECT_FTS_SQL = (
     "SELECT f.message_id, m.text, m.sender_first_name, m.sent_at, "
-    "m.media_description, m.reply_to_msg_id, m.sender_id, m.forum_topic_id, m.reactions "
+    "m.media_description, m.reply_to_msg_id, m.sender_id, m.forum_topic_id "
     "FROM messages_fts f "
     "JOIN messages m ON m.dialog_id = f.dialog_id AND m.message_id = f.message_id "
     "WHERE messages_fts MATCH ? AND f.dialog_id = ? "
@@ -169,7 +170,7 @@ _SELECT_FTS_SQL = (
 
 _SELECT_FTS_ALL_SQL = (
     "SELECT f.message_id, m.text, m.sender_first_name, m.sent_at, "
-    "m.media_description, m.reply_to_msg_id, m.sender_id, m.forum_topic_id, m.reactions, "
+    "m.media_description, m.reply_to_msg_id, m.sender_id, m.forum_topic_id, "
     "f.dialog_id, COALESCE(e.name, CAST(f.dialog_id AS TEXT)) AS dialog_name "
     "FROM messages_fts f "
     "JOIN messages m ON m.dialog_id = f.dialog_id AND m.message_id = f.message_id "
@@ -241,9 +242,42 @@ _ENTITY_BY_USERNAME_SQL = "SELECT id, name FROM entities WHERE username = ?"
 # Column names returned by _build_list_messages_query, in SELECT order.
 _DB_MESSAGE_COLUMNS = (
     "message_id", "sent_at", "text", "sender_id", "sender_first_name",
-    "media_description", "reply_to_msg_id", "forum_topic_id", "reactions",
+    "media_description", "reply_to_msg_id", "forum_topic_id",
     "is_deleted", "deleted_at", "edit_date", "topic_title",
 )
+
+
+# ---------------------------------------------------------------------------
+# Reaction helper
+# ---------------------------------------------------------------------------
+
+
+def _fetch_reaction_counts(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    message_ids: list[int],
+) -> dict[int, list[tuple[str, int]]]:
+    """Return {message_id: [(emoji, count), ...]} for the given page.
+
+    Single IN query against message_reactions table. Returns empty dict
+    if no message_ids or no reactions found. Results are ordered by
+    count DESC, then emoji ASC (Unicode code point) for deterministic
+    display. This matches the sort contract in format_reaction_counts.
+    Addresses review Priority Action #5.
+    """
+    if not message_ids:
+        return {}
+    placeholders = ",".join("?" * len(message_ids))
+    rows = conn.execute(
+        f"SELECT message_id, emoji, count FROM message_reactions "
+        f"WHERE dialog_id = ? AND message_id IN ({placeholders}) "
+        f"ORDER BY count DESC, emoji",
+        [dialog_id, *message_ids],
+    ).fetchall()
+    result: dict[int, list[tuple[str, int]]] = {}
+    for msg_id, emoji, count in rows:
+        result.setdefault(int(msg_id), []).append((emoji, int(count)))
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -254,7 +288,7 @@ _DB_MESSAGE_COLUMNS = (
 # Appends dialog_id=? and is_deleted=0 guards; callers add further conditions.
 _LIST_MESSAGES_BASE_SQL = (
     "SELECT m.message_id, m.sent_at, m.text, m.sender_id, m.sender_first_name, "
-    "m.media_description, m.reply_to_msg_id, m.forum_topic_id, m.reactions, "
+    "m.media_description, m.reply_to_msg_id, m.forum_topic_id, "
     "m.is_deleted, m.deleted_at, "
     "(SELECT MAX(mv.edit_date) FROM message_versions mv "
     " WHERE mv.dialog_id = m.dialog_id AND mv.message_id = m.message_id) AS edit_date, "
@@ -632,7 +666,18 @@ class DaemonAPIServer:
             from .formatter import _describe_media
             media_description = _describe_media(media)
 
-        reactions = serialize_reactions(getattr(msg, "reactions", None))
+        reactions_obj = getattr(msg, "reactions", None)
+        reactions_display = ""
+        if reactions_obj is not None:
+            results_list = getattr(reactions_obj, "results", None) or []
+            counts: list[tuple[str, int]] = []
+            for item in results_list:
+                reaction = getattr(item, "reaction", None)
+                emoticon = getattr(reaction, "emoticon", None) if reaction else None
+                count = getattr(item, "count", 0)
+                if emoticon is not None:
+                    counts.append((emoticon, int(count)))
+            reactions_display = format_reaction_counts(counts)
 
         reply_to_msg_id, forum_topic_id = extract_reply_and_topic(msg)
 
@@ -653,7 +698,7 @@ class DaemonAPIServer:
             "media_description": media_description,
             "reply_to_msg_id": reply_to_msg_id,
             "forum_topic_id": forum_topic_id,
-            "reactions": reactions,
+            "reactions_display": reactions_display,
             "is_deleted": 0,
             "edit_date": edit_date,
         }
@@ -734,6 +779,12 @@ class DaemonAPIServer:
             dict(zip(_DB_MESSAGE_COLUMNS, r))
             for r in rows
         ]
+        # Inject reaction counts from message_reactions table
+        msg_ids = [m["message_id"] for m in messages]
+        reaction_map = _fetch_reaction_counts(self._conn, dialog_id, msg_ids)
+        for m in messages:
+            counts = reaction_map.get(m["message_id"])
+            m["reactions_display"] = format_reaction_counts(counts) if counts else ""
         next_nav = self._maybe_encode_next_nav(
             messages, limit, dialog_id, direction, direction_enum,
         )
@@ -772,6 +823,12 @@ class DaemonAPIServer:
         # before_rows are DESC — reverse to get chronological order, then append after
         rows = list(reversed(before_rows)) + list(after_rows)
         messages = [dict(zip(_DB_MESSAGE_COLUMNS, r)) for r in rows]
+        # Inject reaction counts from message_reactions table
+        msg_ids = [m["message_id"] for m in messages]
+        reaction_map = _fetch_reaction_counts(self._conn, dialog_id, msg_ids)
+        for m in messages:
+            counts = reaction_map.get(m["message_id"])
+            m["reactions_display"] = format_reaction_counts(counts) if counts else ""
         return {
             "ok": True,
             "data": {
@@ -901,7 +958,7 @@ class DaemonAPIServer:
 
         Each message dict contains: message_id, sent_at, text, sender_id,
         sender_first_name, media_description, reply_to_msg_id, forum_topic_id,
-        reactions, is_deleted, edit_date (int|None), topic_title (str|None, sync.db only).
+        reactions_display (str, sync.db only), is_deleted, edit_date (int|None), topic_title (str|None, sync.db only).
 
         Errors: dialog_not_found, missing_dialog, invalid_navigation.
         """
@@ -1040,9 +1097,13 @@ class DaemonAPIServer:
                     "reply_to_msg_id": r[5],
                     "sender_id": r[6],
                     "forum_topic_id": r[7],
-                    "reactions": r[8],
-                    "dialog_id": r[9],
-                    "dialog_name": r[10],
+                    "dialog_id": r[8],
+                    "dialog_name": r[9],
+                    # Global search: results span multiple dialogs. Skip reaction injection --
+                    # fetching reactions per-dialog for a cross-dialog result set adds complexity
+                    # with little value (search results are for finding messages, not analyzing
+                    # reactions). This is an intentional design decision, not a bug.
+                    "reactions_display": "",
                 }
                 for r in rows
             ]
@@ -1061,10 +1122,19 @@ class DaemonAPIServer:
                     "reply_to_msg_id": r[5],
                     "sender_id": r[6],
                     "forum_topic_id": r[7],
-                    "reactions": r[8],
                 }
                 for r in rows
             ]
+            # Scoped search: single dialog_id -- inject reactions
+            if dialog_id:
+                msg_ids = [r["message_id"] for r in messages]
+                reaction_map = _fetch_reaction_counts(self._conn, dialog_id, msg_ids)
+                for r in messages:
+                    counts = reaction_map.get(r["message_id"])
+                    r["reactions_display"] = format_reaction_counts(counts) if counts else ""
+            else:
+                for r in messages:
+                    r["reactions_display"] = ""
 
         next_nav: str | None = None
         if messages and len(messages) == limit:

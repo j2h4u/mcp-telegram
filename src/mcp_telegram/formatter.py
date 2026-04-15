@@ -205,6 +205,13 @@ def _format_reactions(msg: MessageLike, reaction_names: dict[str, list[str]] | N
     reactions = getattr(msg, "reactions", None)
     if reactions is None:
         return ""
+    # Pre-formatted daemon reactions: pass through directly.
+    # Temporary path -- remove when reaction_names_map is removed from
+    # MessageLike protocol in models.py.
+    preformatted = getattr(reactions, "_display", None)
+    if preformatted is not None:
+        return str(preformatted)
+    # Telethon path: extract from reactions.results
     results = getattr(reactions, "results", None) or []
     parts: list[str] = []
     for r in results:
@@ -225,6 +232,30 @@ def _format_reactions(msg: MessageLike, reaction_names: dict[str, list[str]] | N
         else:
             parts.append(emoji)
     return f"[{' '.join(parts)}]" if parts else ""
+
+
+def format_reaction_counts(counts: list[tuple[str, int]]) -> str:
+    """Format [(emoji, count), ...] as '[thumbsup×3 heart×1]'. Returns '' if empty.
+
+    Used by daemon path where only aggregate counts are available
+    (no reactor names). The on-demand Telethon path continues to use
+    _format_reactions which can display reactor names when available.
+
+    Counts are displayed in descending order (most reactions first),
+    then by emoji Unicode code point for deterministic output when
+    counts are tied. This sort is locked: ORDER BY count DESC, emoji ASC.
+
+    IMPORTANT: Count is ALWAYS shown with × (U+00D7), including ×1.
+    The locked display format from CONTEXT.md is [thumbsup×3 heart×1], NOT [thumbsup×3 heart].
+    The emoji column stores actual Unicode glyphs from Telegram (e.g. 👍 not thumbs_up).
+    """
+    if not counts:
+        return ""
+    # Sort by count descending, then emoji ascending (Unicode code point)
+    # for deterministic output. Addresses review Priority Action #5.
+    sorted_counts = sorted(counts, key=lambda x: (-x[1], x[0]))
+    parts = [f"{emoji}\u00d7{count}" for emoji, count in sorted_counts]
+    return f"[{' '.join(parts)}]"
 
 
 def _safe_attr_chain(obj: object, *attrs: str) -> object | None:

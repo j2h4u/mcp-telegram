@@ -162,12 +162,12 @@ def test_topic_and_sender_name_combined() -> None:
 
 
 def test_select_has_expected_columns() -> None:
-    """SELECT includes all 13 expected columns (0-12)."""
+    """SELECT includes all 12 expected columns (0-11)."""
     sql, _ = _build_list_messages_query(dialog_id=1, limit=1)
     for col in (
         "m.message_id", "m.sent_at", "m.text", "m.sender_id",
         "m.sender_first_name", "m.media_description", "m.reply_to_msg_id",
-        "m.forum_topic_id", "m.reactions", "m.is_deleted", "m.deleted_at",
+        "m.forum_topic_id", "m.is_deleted", "m.deleted_at",
         "edit_date", "topic_title",
     ):
         assert col in sql, f"Missing column: {col}"

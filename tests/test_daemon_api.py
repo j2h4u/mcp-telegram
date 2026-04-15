@@ -80,10 +80,20 @@ def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.
             media_description   TEXT,
             reply_to_msg_id     INTEGER,
             forum_topic_id      INTEGER,
-            reactions           TEXT,
             is_deleted          INTEGER NOT NULL DEFAULT 0,
             deleted_at          INTEGER,
             PRIMARY KEY (dialog_id, message_id)
+        ) WITHOUT ROWID
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS message_reactions (
+            dialog_id   INTEGER NOT NULL,
+            message_id  INTEGER NOT NULL,
+            emoji       TEXT NOT NULL,
+            count       INTEGER NOT NULL DEFAULT 1,
+            PRIMARY KEY (dialog_id, message_id, emoji)
         ) WITHOUT ROWID
         """
     )
@@ -2909,9 +2919,9 @@ def test_decode_nav_search_token_returns_error() -> None:
 
 
 def test_db_message_columns_length_matches_query() -> None:
-    """_DB_MESSAGE_COLUMNS has exactly 13 entries matching the SELECT."""
+    """_DB_MESSAGE_COLUMNS has exactly 12 entries matching the SELECT."""
     from mcp_telegram.daemon_api import _DB_MESSAGE_COLUMNS
-    assert len(_DB_MESSAGE_COLUMNS) == 13
+    assert len(_DB_MESSAGE_COLUMNS) == 12
     assert _DB_MESSAGE_COLUMNS[0] == "message_id"
     assert _DB_MESSAGE_COLUMNS[-1] == "topic_title"
 

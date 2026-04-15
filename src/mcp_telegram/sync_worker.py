@@ -17,7 +17,6 @@ Architecture:
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import sqlite3
 import time
@@ -190,26 +189,6 @@ _SET_ACCESS_LOST_SQL = (
 # ---------------------------------------------------------------------------
 
 
-def serialize_reactions(reactions: Any | None) -> str | None:
-    """Serialize reactions to JSON string. DEPRECATED -- used only by
-    daemon_api._msg_to_dict on-demand path. Will be removed in Plan 02
-    when the on-demand path switches to format_reaction_counts.
-
-    Format: {"emoji": count, ...} or None if no reactions.
-    """
-    if reactions is None:
-        return None
-    results = getattr(reactions, "results", None)
-    if not results:
-        return None
-    reaction_counts: dict[str, int] = {}
-    for item in results:
-        reaction = getattr(item, "reaction", None)
-        emoticon = getattr(reaction, "emoticon", None) if reaction is not None else None
-        count = getattr(item, "count", 0)
-        if emoticon is not None:
-            reaction_counts[emoticon] = int(count)
-    return json.dumps(reaction_counts) if reaction_counts else None
 
 
 def extract_reply_and_topic(msg: Any) -> tuple[int | None, int | None]:
