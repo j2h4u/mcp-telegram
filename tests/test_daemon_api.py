@@ -82,6 +82,7 @@ def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.
             forum_topic_id      INTEGER,
             is_deleted          INTEGER NOT NULL DEFAULT 0,
             deleted_at          INTEGER,
+            edit_date           INTEGER,
             PRIMARY KEY (dialog_id, message_id)
         ) WITHOUT ROWID
         """
@@ -2797,6 +2798,33 @@ async def test_list_messages_context_window_not_synced_error() -> None:
     assert result["error"] == "not_synced"
 
 
+@pytest.mark.asyncio
+async def test_list_messages_context_window_reactions_injected() -> None:
+    """context_message_id path injects reactions_display from message_reactions table."""
+    DIALOG_ID = 7004
+
+    conn = _make_db()
+    _insert_synced_dialog(conn, DIALOG_ID, status="synced")
+    for mid in [10, 20, 30]:
+        _insert_message(conn, DIALOG_ID, mid, text=f"msg {mid}", sent_at=1700000000 + mid)
+    conn.execute(
+        "INSERT INTO message_reactions (dialog_id, message_id, emoji, count) VALUES (?, ?, ?, ?)",
+        (DIALOG_ID, 20, "👍", 3),
+    )
+    conn.commit()
+    server = make_server(conn)
+
+    result = await server._list_messages(
+        {"dialog_id": DIALOG_ID, "context_message_id": 20, "context_size": 4}
+    )
+
+    assert result["ok"] is True
+    by_id = {m["message_id"]: m for m in result["data"]["messages"]}
+    assert "👍" in by_id[20]["reactions_display"]
+    assert by_id[10]["reactions_display"] == ""
+    assert by_id[30]["reactions_display"] == ""
+
+
 # ---------------------------------------------------------------------------
 # Phase 35-01: _msg_to_dict — edit_date from Telethon message
 # ---------------------------------------------------------------------------
@@ -3133,6 +3161,34 @@ async def test_list_messages_access_lost_null_total_has_archived_count():
     assert result["data"]["dialog_access"] == "archived"
     assert result["data"]["sync_coverage_pct"] is None
     assert result["data"]["archived_message_count"] == 75
+
+
+@pytest.mark.asyncio
+async def test_list_messages_access_lost_sync_coverage_pct() -> None:
+    """access_lost dialog with known total_messages returns correct sync_coverage_pct."""
+    conn = _make_db()
+    conn.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, access_lost_at, total_messages, "
+        "last_synced_at, last_event_at) VALUES (?, 'access_lost', 1700000000, 100, 1699990000, 1699999000)",
+        (6020,),
+    )
+    for i in range(25):
+        conn.execute(
+            "INSERT INTO messages (dialog_id, message_id, sent_at, text, sender_id, "
+            "sender_first_name, is_deleted) VALUES (?, ?, 1000, 'msg', 42, 'Alice', 0)",
+            (6020, i + 1),
+        )
+    conn.commit()
+
+    server = make_server(conn)
+    result = await server._list_messages({"dialog_id": 6020, "limit": 10})
+
+    assert result["ok"] is True
+    assert result["data"]["dialog_access"] == "archived"
+    assert result["data"]["access_lost_at"] == 1700000000
+    assert result["data"]["last_synced_at"] == 1699990000
+    assert result["data"]["last_event_at"] == 1699999000
+    assert result["data"]["sync_coverage_pct"] == 25  # 25/100
 
 
 @pytest.mark.asyncio
