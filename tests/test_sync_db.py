@@ -115,9 +115,11 @@ def test_messages_schema(tmp_sync_db_path: Path) -> None:
             "media_description",
             "reply_to_msg_id",
             "forum_topic_id",
-            "reactions",
             "is_deleted",
             "deleted_at",
+            "edit_date",
+            "grouped_id",
+            "reply_to_peer_id",
         }
         assert expected == set(columns.keys()), (
             f"Unexpected columns. Got: {set(columns.keys())}, expected: {expected}"
@@ -247,6 +249,8 @@ def test_schema_migration_idempotent_v2(tmp_sync_db_path: Path) -> None:
         assert rows[2][0] == 3
         assert rows[3][0] == 4
         assert rows[4][0] == 5
+        assert rows[5][0] == 6
+        assert rows[6][0] == 7
     finally:
         conn.close()
 
@@ -362,15 +366,17 @@ def test_schema_v4_entities_table(tmp_sync_db_path: Path) -> None:
         conn.close()
 
 
-def test_schema_v4_reaction_metadata_table(tmp_sync_db_path: Path) -> None:
-    """After ensure_sync_schema(), reaction_metadata table exists with all expected columns."""
+def test_schema_v7_drops_reaction_metadata(tmp_sync_db_path: Path) -> None:
+    """After ensure_sync_schema() v7, reaction_metadata table does NOT exist."""
     ensure_sync_schema(tmp_sync_db_path)
     conn = _open_sync_db(tmp_sync_db_path)
     try:
-        rows = conn.execute("PRAGMA table_info(reaction_metadata)").fetchall()
-        columns = {str(row[1]) for row in rows}
-        expected = {"message_id", "dialog_id", "emoji", "reactor_names", "fetched_at"}
-        assert expected == columns, f"Got: {columns}, expected: {expected}"
+        tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}
+        assert "reaction_metadata" not in tables, (
+            f"reaction_metadata should be dropped in v7. Tables: {tables}"
+        )
     finally:
         conn.close()
 
@@ -392,25 +398,23 @@ def test_schema_v4_topic_metadata_table(tmp_sync_db_path: Path) -> None:
         conn.close()
 
 
-def test_schema_v4_message_cache_table(tmp_sync_db_path: Path) -> None:
-    """After ensure_sync_schema(), message_cache table exists with all expected columns."""
+def test_schema_v7_drops_message_cache(tmp_sync_db_path: Path) -> None:
+    """After ensure_sync_schema() v7, message_cache table does NOT exist."""
     ensure_sync_schema(tmp_sync_db_path)
     conn = _open_sync_db(tmp_sync_db_path)
     try:
-        rows = conn.execute("PRAGMA table_info(message_cache)").fetchall()
-        columns = {str(row[1]) for row in rows}
-        expected = {
-            "dialog_id", "message_id", "sent_at", "text", "sender_id",
-            "sender_first_name", "media_description", "reply_to_msg_id",
-            "forum_topic_id", "edit_date", "fetched_at",
-        }
-        assert expected == columns, f"Got: {columns}, expected: {expected}"
+        tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}
+        assert "message_cache" not in tables, (
+            f"message_cache should be dropped in v7. Tables: {tables}"
+        )
     finally:
         conn.close()
 
 
 def test_schema_v4_indexes_exist(tmp_sync_db_path: Path) -> None:
-    """After ensure_sync_schema(), all v4 indexes exist in sqlite_master."""
+    """After ensure_sync_schema() v7, expected indexes exist and dropped indexes are gone."""
     ensure_sync_schema(tmp_sync_db_path)
     conn = _open_sync_db(tmp_sync_db_path)
     try:
@@ -418,15 +422,22 @@ def test_schema_v4_indexes_exist(tmp_sync_db_path: Path) -> None:
             "SELECT name FROM sqlite_master WHERE type='index'"
         ).fetchall()
         index_names = {str(r[0]) for r in rows}
+        # Indexes that must still exist after v7
         expected_indexes = {
             "idx_entities_type_updated",
             "idx_entities_username",
-            "idx_reactions_dialog_message",
             "idx_topic_metadata_dialog_updated",
-            "idx_message_cache_dialog_sent",
+            "idx_messages_reply",
         }
         for idx in expected_indexes:
             assert idx in index_names, f"Missing index: {idx}. Got: {index_names}"
+        # Indexes dropped in v7 (their tables were dropped)
+        assert "idx_reactions_dialog_message" not in index_names, (
+            "idx_reactions_dialog_message must be gone after v7 drops reaction_metadata"
+        )
+        assert "idx_message_cache_dialog_sent" not in index_names, (
+            "idx_message_cache_dialog_sent must be gone after v7 drops message_cache"
+        )
     finally:
         conn.close()
 
@@ -465,27 +476,27 @@ def test_schema_v5_telemetry_index_exists(tmp_sync_db_path: Path) -> None:
         conn.close()
 
 
-def test_schema_version_is_6(tmp_sync_db_path: Path) -> None:
-    """After ensure_sync_schema(), MAX(version) in schema_version is 6."""
+def test_schema_version_is_7(tmp_sync_db_path: Path) -> None:
+    """After ensure_sync_schema(), MAX(version) in schema_version is 7."""
     ensure_sync_schema(tmp_sync_db_path)
     conn = _open_sync_db(tmp_sync_db_path)
     try:
         row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
-        assert row is not None and row[0] == 6, f"Expected version 6, got {row[0]}"
+        assert row is not None and row[0] == 7, f"Expected version 7, got {row[0]}"
     finally:
         conn.close()
 
 
-def test_ensure_sync_schema_twice_idempotent_v6(tmp_sync_db_path: Path) -> None:
-    """Running ensure_sync_schema twice is idempotent — no errors, version stays 6."""
+def test_ensure_sync_schema_twice_idempotent_v7(tmp_sync_db_path: Path) -> None:
+    """Running ensure_sync_schema twice is idempotent — no errors, version stays 7."""
     ensure_sync_schema(tmp_sync_db_path)
     ensure_sync_schema(tmp_sync_db_path)
     conn = _open_sync_db(tmp_sync_db_path)
     try:
         row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
-        assert row is not None and row[0] == 6
+        assert row is not None and row[0] == 7
         rows = conn.execute("SELECT * FROM schema_version ORDER BY version").fetchall()
-        assert len(rows) == 6, f"Expected 6 schema_version rows, got {len(rows)}"
+        assert len(rows) == 7, f"Expected 7 schema_version rows, got {len(rows)}"
     finally:
         conn.close()
 
@@ -721,6 +732,309 @@ def test_schema_version_records_all_versions(tmp_path: Path) -> None:
                 "SELECT version FROM schema_version ORDER BY version"
             ).fetchall()
         ]
-        assert versions == [1, 2, 3, 4, 5, 6], f"expected all 6 versions, got {versions}"
+        assert versions == [1, 2, 3, 4, 5, 6, 7], f"expected all 7 versions, got {versions}"
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Schema v7: new tables, columns, index
+# ---------------------------------------------------------------------------
+
+
+def test_message_reactions_table_exists(tmp_sync_db_path: Path) -> None:
+    """After ensure_sync_schema() v7, message_reactions table exists with correct columns."""
+    ensure_sync_schema(tmp_sync_db_path)
+    conn = _open_sync_db(tmp_sync_db_path)
+    try:
+        rows = conn.execute("PRAGMA table_info(message_reactions)").fetchall()
+        columns = {str(row[1]) for row in rows}
+        expected = {"dialog_id", "message_id", "emoji", "count"}
+        assert expected == columns, f"Got: {columns}, expected: {expected}"
+    finally:
+        conn.close()
+
+
+def test_message_entities_table_exists(tmp_sync_db_path: Path) -> None:
+    """After ensure_sync_schema() v7, message_entities table exists with correct columns."""
+    ensure_sync_schema(tmp_sync_db_path)
+    conn = _open_sync_db(tmp_sync_db_path)
+    try:
+        rows = conn.execute("PRAGMA table_info(message_entities)").fetchall()
+        columns = {str(row[1]) for row in rows}
+        expected = {"dialog_id", "message_id", "offset", "length", "type", "value"}
+        assert expected == columns, f"Got: {columns}, expected: {expected}"
+    finally:
+        conn.close()
+
+
+def test_message_forwards_table_exists(tmp_sync_db_path: Path) -> None:
+    """After ensure_sync_schema() v7, message_forwards table exists with correct columns."""
+    ensure_sync_schema(tmp_sync_db_path)
+    conn = _open_sync_db(tmp_sync_db_path)
+    try:
+        rows = conn.execute("PRAGMA table_info(message_forwards)").fetchall()
+        columns = {str(row[1]) for row in rows}
+        expected = {
+            "dialog_id", "message_id", "fwd_from_peer_id",
+            "fwd_from_name", "fwd_date", "fwd_channel_post",
+        }
+        assert expected == columns, f"Got: {columns}, expected: {expected}"
+    finally:
+        conn.close()
+
+
+def test_messages_has_new_v7_columns(tmp_sync_db_path: Path) -> None:
+    """After v7, messages table has edit_date, grouped_id, reply_to_peer_id (all INTEGER, nullable)."""
+    ensure_sync_schema(tmp_sync_db_path)
+    conn = _open_sync_db(tmp_sync_db_path)
+    try:
+        rows = conn.execute("PRAGMA table_info(messages)").fetchall()
+        col_map = {str(row[1]): row for row in rows}
+        for col in ("edit_date", "grouped_id", "reply_to_peer_id"):
+            assert col in col_map, f"Column {col!r} missing from messages table"
+            assert col_map[col][2].upper() == "INTEGER", (
+                f"Column {col!r} type should be INTEGER, got {col_map[col][2]}"
+            )
+            assert col_map[col][3] == 0, (
+                f"Column {col!r} should be nullable (notnull=0), got {col_map[col][3]}"
+            )
+    finally:
+        conn.close()
+
+
+def test_idx_messages_reply_exists(tmp_sync_db_path: Path) -> None:
+    """After v7, idx_messages_reply index exists on messages(dialog_id, reply_to_msg_id)."""
+    ensure_sync_schema(tmp_sync_db_path)
+    conn = _open_sync_db(tmp_sync_db_path)
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_messages_reply'"
+        ).fetchone()
+        assert row is not None, "idx_messages_reply index missing after v7 migration"
+    finally:
+        conn.close()
+
+
+def test_v7_backfill_reactions_from_json(tmp_path: Path) -> None:
+    """v7 migration backfills message_reactions from reactions JSON blob.
+
+    Tests:
+    - Valid {emoji: count} JSON is backfilled correctly.
+    - Malformed JSON (not json_valid) is skipped without error.
+    - Non-object JSON (array, scalar) is skipped due to json_type='object' guard.
+    - reactions column is gone after migration.
+    """
+    import json
+
+    db_path = tmp_path / "sync.db"
+
+    # Bootstrap to v6 manually: create schema up to v6, then inject reactions data,
+    # then run ensure_sync_schema to apply v7.
+    # We use a fresh DB, apply migrations 1-6, insert test rows, then complete to v7.
+
+    # Build a v6 DB by running ensure_sync_schema on a patched version.
+    # Since we can't easily stop at v6, we instead:
+    # 1. Apply ensure_sync_schema (goes to v7), verify backfill happened.
+    # We test backfill by using a FRESH DB where we manually inject v6-like data
+    # before the v7 migration runs. We do this by creating a DB with just the
+    # v6 schema (messages with reactions column) and then importing the migration.
+    import sqlite3 as _sqlite3
+    from mcp_telegram.sync_db import _open_sync_db, _apply_migrations
+
+    conn = _open_sync_db(db_path)
+    try:
+        # Apply migrations manually, stopping before v7 by using internal state.
+        # We create a minimal v6-like schema directly.
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS schema_version "
+            "(version INTEGER NOT NULL, applied_at INTEGER NOT NULL)"
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS messages (
+                dialog_id       INTEGER NOT NULL,
+                message_id      INTEGER NOT NULL,
+                sent_at         INTEGER NOT NULL,
+                text            TEXT,
+                sender_id       INTEGER,
+                sender_first_name TEXT,
+                media_description TEXT,
+                reply_to_msg_id INTEGER,
+                forum_topic_id  INTEGER,
+                reactions       TEXT,
+                is_deleted      INTEGER NOT NULL DEFAULT 0,
+                deleted_at      INTEGER,
+                PRIMARY KEY (dialog_id, message_id)
+            ) WITHOUT ROWID"""
+        )
+        conn.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts "
+            "USING fts5(dialog_id UNINDEXED, message_id UNINDEXED, text)"
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS synced_dialogs (
+                dialog_id      INTEGER PRIMARY KEY,
+                status         TEXT NOT NULL DEFAULT 'not_synced',
+                last_synced_at INTEGER,
+                last_event_at  INTEGER,
+                sync_progress  INTEGER DEFAULT 0,
+                total_messages INTEGER,
+                access_lost_at INTEGER
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS message_versions (
+                dialog_id  INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                version    INTEGER NOT NULL,
+                old_text   TEXT,
+                edit_date  INTEGER,
+                PRIMARY KEY (dialog_id, message_id, version)
+            ) WITHOUT ROWID"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS entities (
+                id              INTEGER PRIMARY KEY,
+                type            TEXT NOT NULL,
+                name            TEXT,
+                username        TEXT,
+                name_normalized TEXT,
+                updated_at      INTEGER NOT NULL
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS topic_metadata (
+                dialog_id      INTEGER NOT NULL,
+                topic_id       INTEGER NOT NULL,
+                title          TEXT NOT NULL,
+                top_message_id INTEGER,
+                is_general     INTEGER NOT NULL,
+                is_deleted     INTEGER NOT NULL,
+                inaccessible_error TEXT,
+                inaccessible_at INTEGER,
+                updated_at     INTEGER NOT NULL,
+                PRIMARY KEY (dialog_id, topic_id)
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS telemetry_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tool_name TEXT NOT NULL,
+                timestamp REAL NOT NULL,
+                duration_ms REAL NOT NULL,
+                result_count INTEGER NOT NULL,
+                has_cursor BOOLEAN NOT NULL,
+                page_depth INTEGER NOT NULL,
+                has_filter BOOLEAN NOT NULL,
+                error_type TEXT
+            )"""
+        )
+        # Mark versions 1-6 as applied
+        for v in range(1, 7):
+            conn.execute(
+                "INSERT INTO schema_version VALUES (?, strftime('%s', 'now'))", (v,)
+            )
+
+        # Insert test rows with various reactions values
+        valid_json = json.dumps({"👍": 3, "❤": 1})
+        malformed_json = "not json"
+        array_json = "[1, 2, 3]"  # valid JSON but not an object
+        scalar_json = '"hello"'   # valid JSON but not an object
+
+        conn.execute(
+            "INSERT INTO messages (dialog_id, message_id, sent_at, reactions) VALUES (1, 10, 1, ?)",
+            (valid_json,),
+        )
+        conn.execute(
+            "INSERT INTO messages (dialog_id, message_id, sent_at, reactions) VALUES (1, 20, 2, ?)",
+            (malformed_json,),
+        )
+        conn.execute(
+            "INSERT INTO messages (dialog_id, message_id, sent_at, reactions) VALUES (1, 30, 3, ?)",
+            (array_json,),
+        )
+        conn.execute(
+            "INSERT INTO messages (dialog_id, message_id, sent_at, reactions) VALUES (1, 40, 4, ?)",
+            (scalar_json,),
+        )
+        conn.execute(
+            "INSERT INTO messages (dialog_id, message_id, sent_at, reactions) VALUES (1, 50, 5, NULL)",
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Now apply v7 migration
+    ensure_sync_schema(db_path)
+
+    # Verify results
+    conn = _open_sync_db(db_path)
+    try:
+        # reactions column must be gone
+        col_names = {r[1] for r in conn.execute("PRAGMA table_info(messages)").fetchall()}
+        assert "reactions" not in col_names, "reactions column must be dropped after v7"
+
+        # Valid JSON reactions backfilled
+        reaction_rows = conn.execute(
+            "SELECT emoji, count FROM message_reactions WHERE dialog_id=1 AND message_id=10 ORDER BY emoji"
+        ).fetchall()
+        reaction_dict = {r[0]: r[1] for r in reaction_rows}
+        assert reaction_dict == {"👍": 3, "❤": 1}, (
+            f"Valid JSON reactions should be backfilled. Got: {reaction_dict}"
+        )
+
+        # Malformed JSON row: no reactions backfilled (json_valid() guard)
+        malformed_rows = conn.execute(
+            "SELECT COUNT(*) FROM message_reactions WHERE dialog_id=1 AND message_id=20"
+        ).fetchone()[0]
+        assert malformed_rows == 0, "Malformed JSON must produce no reaction rows"
+
+        # Array JSON row: no reactions backfilled (json_type='object' guard)
+        array_rows = conn.execute(
+            "SELECT COUNT(*) FROM message_reactions WHERE dialog_id=1 AND message_id=30"
+        ).fetchone()[0]
+        assert array_rows == 0, "Array JSON must produce no reaction rows (not an object)"
+
+        # Scalar JSON row: no reactions backfilled (json_type='object' guard)
+        scalar_rows = conn.execute(
+            "SELECT COUNT(*) FROM message_reactions WHERE dialog_id=1 AND message_id=40"
+        ).fetchone()[0]
+        assert scalar_rows == 0, "Scalar JSON must produce no reaction rows (not an object)"
+
+        # NULL reactions: no rows
+        null_rows = conn.execute(
+            "SELECT COUNT(*) FROM message_reactions WHERE dialog_id=1 AND message_id=50"
+        ).fetchone()[0]
+        assert null_rows == 0, "NULL reactions must produce no reaction rows"
+    finally:
+        conn.close()
+
+
+def test_message_entities_pk_allows_same_offset_different_type(tmp_sync_db_path: Path) -> None:
+    """5-column PK: two entities at the same (offset, length) but different type both stored."""
+    ensure_sync_schema(tmp_sync_db_path)
+    conn = _open_sync_db(tmp_sync_db_path)
+    try:
+        # Insert two entity rows with same (dialog_id, message_id, offset, length) but different type
+        conn.execute(
+            "INSERT INTO message_entities (dialog_id, message_id, offset, length, type, value) "
+            "VALUES (1, 100, 0, 5, 'mention', '@alice')"
+        )
+        conn.execute(
+            "INSERT INTO message_entities (dialog_id, message_id, offset, length, type, value) "
+            "VALUES (1, 100, 0, 5, 'hashtag', '#test')"
+        )
+        conn.commit()
+
+        rows = conn.execute(
+            "SELECT type, value FROM message_entities "
+            "WHERE dialog_id=1 AND message_id=100 ORDER BY type"
+        ).fetchall()
+        assert len(rows) == 2, (
+            f"Both entity rows must be retained with 5-column PK. Got: {rows}"
+        )
+        types = {r[0] for r in rows}
+        assert types == {"mention", "hashtag"}
     finally:
         conn.close()

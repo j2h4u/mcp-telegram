@@ -9,7 +9,7 @@ from pathlib import Path
 
 from xdg_base_dirs import xdg_state_home  # type: ignore[import-error]
 
-_CURRENT_SCHEMA_VERSION = 6
+_CURRENT_SCHEMA_VERSION = 7
 
 logger = logging.getLogger(__name__)
 
@@ -307,6 +307,60 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             "FROM synced_dialogs "
             "WHERE dialog_id NOT IN (SELECT id FROM entities)"
         ),
+    ])
+
+    _migrate(7, [
+        # 1. Drop dead tables
+        "DROP TABLE IF EXISTS reaction_metadata",
+        "DROP TABLE IF EXISTS message_cache",
+        # 2. Add new columns to messages
+        "ALTER TABLE messages ADD COLUMN edit_date INTEGER",
+        "ALTER TABLE messages ADD COLUMN grouped_id INTEGER",
+        "ALTER TABLE messages ADD COLUMN reply_to_peer_id INTEGER",
+        # 3. Create message_reactions (WITHOUT ROWID -- composite PK)
+        """CREATE TABLE IF NOT EXISTS message_reactions (
+    dialog_id   INTEGER NOT NULL,
+    message_id  INTEGER NOT NULL,
+    emoji       TEXT NOT NULL,
+    count       INTEGER NOT NULL,
+    PRIMARY KEY (dialog_id, message_id, emoji)
+) WITHOUT ROWID""",
+        # 4. Backfill reactions from JSON blob (runs before DROP COLUMN)
+        # json_valid() + json_type() guards: skip corrupted/malformed JSON and
+        # non-object shapes (arrays, scalars) that would produce bad rows.
+        (
+            "INSERT OR IGNORE INTO message_reactions "
+            "SELECT dialog_id, message_id, j.key, CAST(j.value AS INTEGER) "
+            "FROM messages, json_each(reactions) j "
+            "WHERE reactions IS NOT NULL AND json_valid(reactions) "
+            "AND json_type(reactions) = 'object'"
+        ),
+        # 5. Drop reactions column (SQLite 3.35+, confirmed 3.46.1)
+        "ALTER TABLE messages DROP COLUMN reactions",
+        # 6. Create message_entities
+        # 5-column PK (dialog_id, message_id, offset, length, type) prevents
+        # silent data loss when two entity types share the same byte offset.
+        """CREATE TABLE IF NOT EXISTS message_entities (
+    dialog_id   INTEGER NOT NULL,
+    message_id  INTEGER NOT NULL,
+    offset      INTEGER NOT NULL,
+    length      INTEGER NOT NULL,
+    type        TEXT NOT NULL,
+    value       TEXT,
+    PRIMARY KEY (dialog_id, message_id, offset, length, type)
+) WITHOUT ROWID""",
+        # 7. Create message_forwards
+        """CREATE TABLE IF NOT EXISTS message_forwards (
+    dialog_id        INTEGER NOT NULL,
+    message_id       INTEGER NOT NULL,
+    fwd_from_peer_id INTEGER,
+    fwd_from_name    TEXT,
+    fwd_date         INTEGER,
+    fwd_channel_post INTEGER,
+    PRIMARY KEY (dialog_id, message_id)
+) WITHOUT ROWID""",
+        # 8. Reply-chain index
+        "CREATE INDEX IF NOT EXISTS idx_messages_reply ON messages(dialog_id, reply_to_msg_id)",
     ])
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
