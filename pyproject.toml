@@ -2,7 +2,7 @@
 name = "mcp-telegram"
 version = "0.1.2"
 description = "MCP server to work with Telegram through MTProto"
-requires-python = ">=3.11"
+requires-python = ">=3.14"
 dependencies = [
   "mcp>=1.26.0",
   "telethon>=1.42.0",

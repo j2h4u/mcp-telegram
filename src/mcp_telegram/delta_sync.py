@@ -11,7 +11,6 @@ Architecture:
 - Only processes dialogs with status='synced' — FullSyncWorker handles
   'syncing' and 'not_synced' dialogs.
 """
-from __future__ import annotations
 
 import asyncio
 import logging
@@ -186,6 +185,7 @@ class DeltaSyncWorker:
 async def _probe_access_lost_dialogs(
     client: Any,
     conn: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
     delta_worker: DeltaSyncWorker,
 ) -> int:
     """Probe all access_lost dialogs. Returns count of restored dialogs.
@@ -262,11 +262,11 @@ async def run_access_probe_loop(
             await asyncio.wait_for(shutdown_event.wait(), timeout=initial_delay)
             return  # shutdown during initial delay
         except asyncio.TimeoutError:
-            pass
+            pass  # initial delay elapsed normally; proceed with first probe
 
     while not shutdown_event.is_set():
         try:
-            await _probe_access_lost_dialogs(client, conn, delta_worker)
+            await _probe_access_lost_dialogs(client, conn, shutdown_event, delta_worker)
         except Exception:
             logger.warning("access_probe_error", exc_info=True)
         try:

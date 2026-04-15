@@ -32,7 +32,6 @@ Daemon API:
 - FTS backfill runs once at startup for messages without FTS index entries.
 - Socket file cleaned up on shutdown (and stale file removed on startup).
 """
-from __future__ import annotations
 
 import asyncio
 import logging
@@ -40,6 +39,8 @@ import os
 import sqlite3
 import time
 from typing import Any
+
+from telethon.errors.rpcerrorlist import FloodWaitError  # type: ignore[import-untyped]
 
 from .daemon_api import DaemonAPIServer, get_daemon_socket_path
 from .delta_sync import DeltaSyncWorker, run_access_probe_loop
@@ -110,6 +111,15 @@ async def _backfill_total_messages(
                 conn.execute(_UPDATE_TOTAL_SQL, (total, dialog_id))
                 conn.commit()
                 filled += 1
+        except FloodWaitError as exc:
+            logger.warning(
+                "backfill_total flood_wait dialog_id=%d seconds=%d", dialog_id, exc.seconds
+            )
+            try:
+                await asyncio.wait_for(shutdown_event.wait(), timeout=float(exc.seconds))
+                return filled  # shutdown during flood wait
+            except asyncio.TimeoutError:
+                pass  # flood wait elapsed normally
         except Exception as exc:
             logger.debug("backfill_total skip dialog_id=%d error=%s", dialog_id, exc)
         await asyncio.sleep(1.0)
@@ -272,10 +282,14 @@ async def sync_main() -> None:
         api_server = DaemonAPIServer(conn, client, shutdown_event)
         socket_path = get_daemon_socket_path()
         socket_path.unlink(missing_ok=True)
-        unix_server = await asyncio.start_unix_server(
-            api_server.handle_client, path=str(socket_path), limit=2 * 1024 * 1024,
-        )
-        os.chmod(socket_path, 0o600)
+        old_umask = os.umask(0o177)  # ensure socket created as 0o600 with no race
+        try:
+            unix_server = await asyncio.start_unix_server(
+                api_server.handle_client, path=str(socket_path), limit=2 * 1024 * 1024,
+            )
+        finally:
+            os.umask(old_umask)
+        os.chmod(socket_path, 0o600)  # belt-and-suspenders
         logger.info("daemon API listening on %s", socket_path)
 
         handler_manager = EventHandlerManager(client, conn, shutdown_event)
@@ -318,7 +332,7 @@ async def sync_main() -> None:
             try:
                 await task
             except asyncio.CancelledError:
-                pass
+                pass  # expected on shutdown; task was cancelled cleanly
             except Exception:
                 logger.warning("background_task_shutdown_error name=%s", task.get_name(), exc_info=True)
         _background_tasks.clear()

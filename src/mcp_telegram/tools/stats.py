@@ -1,4 +1,3 @@
-from __future__ import annotations
 
 import logging
 
@@ -64,8 +63,6 @@ def format_usage_summary(stats: dict) -> str:
 
 class GetUsageStats(ToolArgs):
     """Get actionable usage statistics from telemetry (last 30 days)."""
-
-    pass
 
 
 @mcp_tool("secondary/helper", annotations=ToolAnnotations(readOnlyHint=True))

@@ -285,7 +285,7 @@ async def test_list_topics_dialog_not_found():
     with _patch_daemon(conn):
         result = await list_topics(ListTopics(dialog="nonexistent"))
 
-    assert "not found" in result[0].text.lower() or "no dialog" in result[0].text.lower()
+    assert "not found" in result[0].text.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -381,7 +381,7 @@ async def test_list_messages_dialog_not_found():
     with _patch_daemon(conn):
         result = await list_messages(ListMessages(dialog="ghost"))
 
-    assert "not found" in result[0].text.lower() or "no dialog" in result[0].text.lower()
+    assert "not found" in result[0].text.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -670,10 +670,6 @@ async def test_get_user_info_resolves_via_daemon():
     conn.get_user_info.assert_called_once_with(user_id=12345)
 
 
-async def test_get_user_info_via_daemon():
-    """GetUserInfo (legacy name) — alias for test_get_user_info_resolves_via_daemon."""
-    await test_get_user_info_resolves_via_daemon()
-
 
 async def test_get_user_info_candidates_via_daemon():
     """GetUserInfo returns candidate list when resolve_entity returns candidates."""
@@ -735,7 +731,7 @@ async def test_get_user_info_user_not_found_by_daemon():
     with _patch_daemon(conn):
         result = await get_user_info(GetUserInfo(user="Ghost"))
 
-    assert "could not fetch" in result[0].text.lower() or "error" in result[0].text.lower()
+    assert "could not fetch" in result[0].text.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -831,7 +827,8 @@ async def test_get_usage_stats_via_daemon():
         result = await get_usage_stats(GetUsageStats())
 
     text = result[0].text
-    assert len(text) > 0
+    assert "ListDialogs" in text
+    assert "120" in text  # latency_median_ms
     conn.get_usage_stats.assert_called_once()
 
 
@@ -854,7 +851,7 @@ async def test_get_usage_stats_empty_data():
         result = await get_usage_stats(GetUsageStats())
 
     text = result[0].text
-    assert len(text) > 0
+    assert "no usage data" in text.lower()
 
 
 # ---------------------------------------------------------------------------

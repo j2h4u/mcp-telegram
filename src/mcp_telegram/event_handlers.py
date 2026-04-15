@@ -17,7 +17,6 @@ Architecture:
 - In-memory _synced_dialog_ids set refreshed via refresh_synced_dialogs() from
   the daemon heartbeat loop.
 """
-from __future__ import annotations
 
 import asyncio
 import logging

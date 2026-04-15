@@ -1,11 +1,18 @@
-from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
+import hmac
 import json
+import os
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Literal, cast
+
+# Process-local secret — tokens are HMAC-signed to prevent forgery.
+# Not valid across restarts; the LLM must start fresh navigation if the
+# daemon restarts (tokens would fail validation with "signature mismatch").
+_TOKEN_SECRET: bytes = os.urandom(32)
 
 
 NavigationKind = Literal["history", "search"]
@@ -34,18 +41,30 @@ class NavigationToken:
 
 
 def _encode_payload(payload: dict[str, object]) -> str:
-    return base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
+    data = json.dumps(payload, separators=(",", ":")).encode()
+    encoded = base64.urlsafe_b64encode(data).decode()
+    mac = hmac.new(_TOKEN_SECRET, data, hashlib.sha256).hexdigest()[:16]
+    return f"{encoded}.{mac}"
 
 
 def _decode_payload(token: str) -> dict[str, object]:
+    if "." not in token:
+        raise ValueError("Invalid navigation token: missing signature")
+    encoded, _, mac = token.rpartition(".")
     try:
-        data = json.loads(base64.urlsafe_b64decode(token.encode()))
-    except (json.JSONDecodeError, ValueError, binascii.Error) as exc:
+        data = base64.urlsafe_b64decode(encoded.encode())
+    except (ValueError, binascii.Error) as exc:
         raise ValueError(f"Invalid navigation token: {exc}") from exc
-
-    if not isinstance(data, dict):
+    expected_mac = hmac.new(_TOKEN_SECRET, data, hashlib.sha256).hexdigest()[:16]
+    if not hmac.compare_digest(mac, expected_mac):
+        raise ValueError("Invalid navigation token: signature mismatch")
+    try:
+        result = json.loads(data)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid navigation token: {exc}") from exc
+    if not isinstance(result, dict):
         raise ValueError("Invalid navigation token: payload must be an object")
-    return data
+    return result
 
 
 def encode_navigation_token(navigation: NavigationToken) -> str:

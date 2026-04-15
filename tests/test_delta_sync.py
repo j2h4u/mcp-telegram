@@ -509,7 +509,7 @@ async def test_probe_restores_access_after_gap_fill(sync_db, mock_client, shutdo
     mock_client.iter_messages = _empty_iter
 
     delta_worker = DeltaSyncWorker(mock_client, sync_db, shutdown_event)
-    restored = await _probe_access_lost_dialogs(mock_client, sync_db, delta_worker)
+    restored = await _probe_access_lost_dialogs(mock_client, sync_db, shutdown_event, delta_worker)
 
     assert restored == 1
     row = sync_db.execute(
@@ -551,7 +551,7 @@ async def test_probe_gap_fill_failure_keeps_access_lost(sync_db, mock_client, sh
     mock_client.iter_messages = _failing_iter
 
     delta_worker = DeltaSyncWorker(mock_client, sync_db, shutdown_event)
-    restored = await _probe_access_lost_dialogs(mock_client, sync_db, delta_worker)
+    restored = await _probe_access_lost_dialogs(mock_client, sync_db, shutdown_event, delta_worker)
 
     assert restored == 0  # not restored because gap-fill failed
     row = sync_db.execute(
@@ -582,7 +582,7 @@ async def test_probe_still_lost_unchanged(sync_db, mock_client, shutdown_event):
     )
 
     delta_worker = DeltaSyncWorker(mock_client, sync_db, shutdown_event)
-    restored = await _probe_access_lost_dialogs(mock_client, sync_db, delta_worker)
+    restored = await _probe_access_lost_dialogs(mock_client, sync_db, shutdown_event, delta_worker)
 
     assert restored == 0
     row = sync_db.execute(

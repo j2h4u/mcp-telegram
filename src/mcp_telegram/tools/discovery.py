@@ -1,4 +1,3 @@
-from __future__ import annotations
 
 import logging
 
@@ -168,8 +167,6 @@ async def list_topics(args: ListTopics) -> ToolResult:
 
 class GetMyAccount(ToolArgs):
     """Return own account info: numeric id, display name, and username. No arguments required."""
-
-    pass
 
 
 @mcp_tool("secondary/helper", annotations=ToolAnnotations(readOnlyHint=True))

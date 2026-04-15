@@ -1,4 +1,3 @@
-from __future__ import annotations
 
 from datetime import datetime, timezone
 
@@ -91,8 +90,8 @@ def _format_daemon_messages(rows: list[dict], *, global_mode: bool = False) -> s
     )
 
     return format_messages(
-        messages,  # type: ignore[arg-type]
-        reply_map=reply_map,  # type: ignore[arg-type]
+        messages,  # type: ignore[arg-type]  # DaemonMessage satisfies MessageLike duck-typed, not statically
+        reply_map=reply_map,  # type: ignore[arg-type]  # same: dict[int, DaemonMessage] vs dict[int, MessageLike]
         topic_name_getter=topic_name_getter,
         line_prefix_getter=line_prefix_getter,
     )

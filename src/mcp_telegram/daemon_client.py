@@ -17,7 +17,6 @@ DaemonConnection provides convenience methods for all fourteen daemon API method
 list_messages and search_messages accept an optional dialog: str | None
 parameter to support name-based resolution by the daemon.
 """
-from __future__ import annotations
 
 import asyncio
 import contextvars
@@ -314,7 +313,7 @@ async def daemon_connection() -> AsyncIterator[DaemonConnection]:
     writer: asyncio.StreamWriter | None = None
     try:
         reader, writer = await asyncio.open_unix_connection(str(socket_path), limit=2 * 1024 * 1024)
-    except (FileNotFoundError, ConnectionRefusedError) as exc:
+    except OSError as exc:
         raise DaemonNotRunningError(
             "Sync daemon is not running. "
             "Start it with: mcp-telegram sync"

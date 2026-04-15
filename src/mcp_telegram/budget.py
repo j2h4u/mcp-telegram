@@ -1,4 +1,3 @@
-from __future__ import annotations
 
 # Priority tiers for unread chat sorting (lower = higher priority).
 # Gaps between values allow inserting new tiers without renumbering.

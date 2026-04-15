@@ -1,5 +1,4 @@
 # ruff: noqa: T201  — print() used intentionally for interactive CLI output
-from __future__ import annotations
 
 import logging
 import time
@@ -24,6 +23,7 @@ class TelegramSettings(BaseSettings):
 
 
 async def connect_to_telegram(api_id: str, api_hash: str, phone_number: str) -> None:
+    """Interactive login flow: send code, prompt for it, sign in (with 2FA fallback)."""
     client = create_client(api_id=api_id, api_hash=api_hash)
     await client.connect()
 
@@ -48,6 +48,7 @@ async def connect_to_telegram(api_id: str, api_hash: str, phone_number: str) -> 
 
 
 async def logout_from_telegram() -> None:
+    """Terminate the active Telegram session and delete the local session file."""
     client = create_client()
     await client.connect()
     await client.log_out()

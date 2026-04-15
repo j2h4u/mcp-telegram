@@ -3,7 +3,6 @@
 Used by reading.py and unread.py to bridge daemon API dicts to
 format_messages() which expects the MessageLike protocol.
 """
-from __future__ import annotations
 
 from datetime import datetime, timezone
 

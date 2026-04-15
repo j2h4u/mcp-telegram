@@ -871,3 +871,47 @@ def test_sync_main_cleans_socket_on_shutdown(
         asyncio.run(sync_main())
 
     assert not fake_socket_path.exists(), "Socket file must not exist after daemon shuts down"
+
+
+# ---------------------------------------------------------------------------
+# R-8: _backfill_total_messages — FloodWait shutdown interrupt
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_backfill_total_messages_returns_early_when_shutdown_during_flood_wait(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """shutdown_event set during FloodWait sleep → function returns early with filled=0."""
+    import sqlite3
+    from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
+    from mcp_telegram.daemon import _backfill_total_messages
+
+    conn = sqlite3.connect(":memory:")
+    from mcp_telegram.sync_db import _apply_migrations
+    _apply_migrations(conn)
+    conn.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, total_messages) VALUES (?, 'synced', NULL)",
+        (1001,),
+    )
+    conn.commit()
+
+    shutdown_event = asyncio.Event()
+
+    err = FloodWaitError(request=None)
+    err.seconds = 30
+
+    client = MagicMock()
+    client.get_messages = AsyncMock(side_effect=err)
+
+    async def _mock_wait_for(coro: object, timeout: float) -> None:
+        # Simulate shutdown completing before flood wait expires.
+        import inspect
+        if inspect.iscoroutine(coro):
+            coro.close()  # prevent "coroutine never awaited" warning
+        shutdown_event.set()
+
+    with patch("mcp_telegram.daemon.asyncio.wait_for", side_effect=_mock_wait_for):
+        filled = await _backfill_total_messages(client, conn, shutdown_event)
+
+    assert filled == 0, "No rows filled when shutdown fires during FloodWait"

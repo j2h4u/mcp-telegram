@@ -1,5 +1,4 @@
 """Tool package — aggregates domain modules and triggers registration."""
-from __future__ import annotations
 
 # Infrastructure (used by server.py + tests)
 from ._base import (

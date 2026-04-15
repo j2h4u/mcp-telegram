@@ -16,7 +16,6 @@ Design:
 - backfill_fts_index() runs on every daemon startup and indexes only
   messages missing from the FTS table (idempotent, no duplicates).
 """
-from __future__ import annotations
 
 import re
 import sqlite3
@@ -83,10 +82,12 @@ def stem_query(query: str) -> str:
     if not words:
         return ""
     stemmed = _russian_stemmer.stemWords(words)
-    # Quote each token to prevent FTS5 operator interpretation (NOT, OR, AND).
-    # Escape embedded double-quotes (defense-in-depth — _WORD_RE strips most
-    # non-word chars, but stemmer output is not guaranteed to be quote-free).
-    quoted = [f'"{token.replace(chr(34), "")}"' for token in stemmed]
+    # Defense-in-depth: re-extract only word chars from each stemmed token so that
+    # any unexpected stemmer output cannot inject FTS5 operators or special chars.
+    # _WORD_RE already guarantees clean input tokens, but stemmer output is not
+    # contractually restricted to word-only characters.
+    safe_tokens = ["".join(_WORD_RE.findall(token)) for token in stemmed]
+    quoted = [f'"{t}"' for t in safe_tokens if t]
     return " ".join(quoted)
 
 

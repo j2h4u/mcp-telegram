@@ -1,4 +1,3 @@
-from __future__ import annotations
 
 import logging
 import re
@@ -154,7 +153,8 @@ def _fuzzy_resolve(
         return Candidates(query=query, matches=matches)
 
     if exact_entity_id is not None:
-        return Resolved(entity_id=exact_entity_id, display_name=exact_display_name)  # type: ignore[arg-type]
+        assert exact_display_name is not None  # set atomically with exact_entity_id on line above
+        return Resolved(entity_id=exact_entity_id, display_name=exact_display_name)
 
     matches = _build_matches(hits, norm_map, entity_cache)
     return Candidates(query=query, matches=matches)
@@ -202,7 +202,7 @@ def _make_match_info(entity_id: int, display_name: str, score: int, entity_cache
                 entity_info["username"] = entity_cached.get("username")
                 entity_info["entity_type"] = entity_cached.get("type")
         except (sqlite3.OperationalError, sqlite3.DatabaseError, OSError):
-            pass
+            pass  # cache unavailable; proceed without enrichment
         except Exception:
             logger.warning("unexpected entity_cache error in fuzzy resolve for entity_id=%r", entity_id, exc_info=True)
     return entity_info
@@ -238,7 +238,7 @@ def resolve(
                 entity_id, name = result
                 return Resolved(entity_id=entity_id, display_name=name)
         except (sqlite3.OperationalError, sqlite3.DatabaseError, OSError):
-            pass
+            pass  # cache unavailable; fall through to NotFound
         except Exception:
             logger.warning("unexpected entity_cache error in @username resolve for query=%r", query, exc_info=True)
         return NotFound(query=query)

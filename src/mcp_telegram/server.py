@@ -4,7 +4,6 @@ Wires tool_runner (singledispatch) to the MCP Server, tracks per-request IDs
 via _request_ids ContextVar for cross-process log correlation, and runs the
 stdio transport loop.
 """
-from __future__ import annotations
 
 import asyncio
 import logging

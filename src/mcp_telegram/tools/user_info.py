@@ -1,4 +1,3 @@
-from __future__ import annotations
 
 import phonenumbers
 from pydantic import Field
@@ -76,14 +75,14 @@ async def get_user_info(args: GetUserInfo) -> ToolResult:
         ))
 
     resolve_data = resolve_response.get("data", {})
-    resolve_result = resolve_data.get("result", "not_found")
+    resolve_status = resolve_data.get("result", "not_found")
 
-    if resolve_result == "not_found":
+    if resolve_status == "not_found":
         return ToolResult(content=_text_response(
             user_not_found_text(args.user, retry_tool="GetUserInfo")
         ))
 
-    if resolve_result == "candidates":
+    if resolve_status == "candidates":
         matches = resolve_data.get("matches", [])
         match_lines = []
         for match in matches:
