@@ -334,7 +334,7 @@ async def test_list_messages_via_daemon():
                     "media_description": None,
                     "reply_to_msg_id": None,
                     "forum_topic_id": None,
-                    "reactions": None,
+                    "reactions_display": "",
                     "is_deleted": 0,
                 },
             ],

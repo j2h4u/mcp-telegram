@@ -8,6 +8,33 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 
+class _PreformattedReactions:
+    """Carry pre-formatted reaction text through format_messages -> _format_reactions.
+
+    When daemon_api returns reactions_display as a pre-formatted string
+    (e.g. "[👍×3 ❤️×1]"), this wrapper makes it compatible with
+    _format_reactions which normally expects a Telethon reactions object.
+    _format_reactions detects the _display attribute and returns it directly.
+
+    Protocol contract:
+    - Has a `_display` attribute (str) containing the formatted reaction text
+    - `_format_reactions` in formatter.py checks `getattr(reactions, "_display", None)`
+    - If `_display` is not None, returns it directly without Telethon parsing
+    - If `_display` is empty string, returns "" (no reactions shown)
+
+    Temporary infrastructure. Concrete removal criterion: remove this class
+    when `reaction_names_map` field is removed from the `MessageLike` protocol
+    in models.py. At that point, the Telethon _format_reactions path is also
+    gone, and DaemonMessage can carry reactions_display as a plain string
+    without needing protocol compatibility.
+    """
+
+    __slots__ = ("_display",)
+
+    def __init__(self, display: str) -> None:
+        self._display = display
+
+
 class DaemonMessage:
     """Lightweight MessageLike adapter for daemon API row dicts.
 
@@ -29,7 +56,8 @@ class DaemonMessage:
         self.sender = Sender(sender_name) if sender_name else None
         reply_id = row.get("reply_to_msg_id")
         self.reply_to = ReplyHeader(reply_id) if reply_id else None
-        self.reactions = row.get("reactions")  # JSON string or None
+        reactions_display = row.get("reactions_display", "")
+        self.reactions = _PreformattedReactions(reactions_display) if reactions_display else None
         media_desc = row.get("media_description")
         self.media = MediaPlaceholder(media_desc) if media_desc else None
         edit_date_raw = row.get("edit_date")
