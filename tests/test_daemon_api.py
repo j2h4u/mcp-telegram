@@ -3237,3 +3237,557 @@ async def test_search_messages_global_omits_dialog_access():
     result = await server._search_messages({"query": "global"})
     assert result["ok"] is True
     assert "dialog_access" not in result["data"]
+
+
+# ---------------------------------------------------------------------------
+# _fetch_reaction_counts tests (Plan 37-02, Task 3)
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_reaction_counts_empty_list() -> None:
+    """_fetch_reaction_counts returns {} for empty message_ids without hitting DB."""
+    from mcp_telegram.daemon_api import _fetch_reaction_counts
+
+    conn = _make_db()
+    result = _fetch_reaction_counts(conn, dialog_id=1, message_ids=[])
+    assert result == {}
+
+
+def test_fetch_reaction_counts_returns_grouped_by_message() -> None:
+    """_fetch_reaction_counts groups reactions by message_id in DESC count order."""
+    from mcp_telegram.daemon_api import _fetch_reaction_counts
+
+    conn = _make_db()
+    _insert_synced_dialog(conn, 1)
+    _insert_message(conn, 1, 10)
+    _insert_message(conn, 1, 20)
+    conn.execute(
+        "INSERT INTO message_reactions (dialog_id, message_id, emoji, count) VALUES (?, ?, ?, ?)",
+        (1, 10, "👍", 3),
+    )
+    conn.execute(
+        "INSERT INTO message_reactions (dialog_id, message_id, emoji, count) VALUES (?, ?, ?, ?)",
+        (1, 10, "❤️", 1),
+    )
+    conn.execute(
+        "INSERT INTO message_reactions (dialog_id, message_id, emoji, count) VALUES (?, ?, ?, ?)",
+        (1, 20, "👍", 1),
+    )
+    conn.commit()
+
+    result = _fetch_reaction_counts(conn, dialog_id=1, message_ids=[10, 20])
+
+    assert 10 in result
+    assert 20 in result
+    # msg 10: thumbsup(3) before heart(1) by count DESC
+    assert result[10][0] == ("👍", 3)
+    assert result[10][1] == ("❤️", 1)
+    assert result[20] == [("👍", 1)]
+
+
+def test_fetch_reaction_counts_missing_messages_omitted() -> None:
+    """_fetch_reaction_counts omits message_ids that have no reactions."""
+    from mcp_telegram.daemon_api import _fetch_reaction_counts
+
+    conn = _make_db()
+    _insert_synced_dialog(conn, 1)
+    _insert_message(conn, 1, 10)
+    conn.execute(
+        "INSERT INTO message_reactions (dialog_id, message_id, emoji, count) VALUES (?, ?, ?, ?)",
+        (1, 10, "👍", 2),
+    )
+    conn.commit()
+
+    result = _fetch_reaction_counts(conn, dialog_id=1, message_ids=[10, 99])
+
+    assert 10 in result
+    assert 99 not in result
+
+
+# ---------------------------------------------------------------------------
+# list_messages reactions injection tests (Plan 37-02, Task 3)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_messages_from_db_includes_reactions_display() -> None:
+    """list_messages injects reactions_display from message_reactions table."""
+    conn = _make_db()
+    _insert_synced_dialog(conn, 1)
+    _insert_message(conn, 1, 100, text="Hello")
+    conn.execute(
+        "INSERT INTO message_reactions (dialog_id, message_id, emoji, count) VALUES (?, ?, ?, ?)",
+        (1, 100, "👍", 3),
+    )
+    conn.commit()
+
+    server = make_server(conn)
+    result = await server._list_messages({"dialog_id": 1, "limit": 10})
+
+    assert result["ok"] is True
+    messages = result["data"]["messages"]
+    assert len(messages) == 1
+    msg = messages[0]
+    assert "reactions_display" in msg
+    assert "reactions" not in msg  # bare reactions key must not exist
+    assert "👍" in msg["reactions_display"]
+    assert "\u00d7" in msg["reactions_display"]  # × (U+00D7)
+
+
+@pytest.mark.asyncio
+async def test_list_messages_from_db_no_reactions_empty_display() -> None:
+    """list_messages sets reactions_display='' for messages with no reactions."""
+    conn = _make_db()
+    _insert_synced_dialog(conn, 1)
+    _insert_message(conn, 1, 101, text="No reactions")
+    conn.commit()
+
+    server = make_server(conn)
+    result = await server._list_messages({"dialog_id": 1, "limit": 10})
+
+    assert result["ok"] is True
+    messages = result["data"]["messages"]
+    assert messages[0]["reactions_display"] == ""
+
+
+# ---------------------------------------------------------------------------
+# search_messages reactions injection tests (Plan 37-02, Task 3)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_scoped_search_includes_reactions_display() -> None:
+    """Scoped search injects reactions_display from message_reactions."""
+    from mcp_telegram.fts import INSERT_FTS_SQL, stem_text
+
+    conn = _make_db(with_fts=True)
+    _insert_synced_dialog(conn, 1)
+    _insert_message(conn, 1, 200, text="fire message")
+    conn.execute(INSERT_FTS_SQL, (1, 200, stem_text("fire message")))
+    conn.execute(
+        "INSERT INTO message_reactions (dialog_id, message_id, emoji, count) VALUES (?, ?, ?, ?)",
+        (1, 200, "🔥", 5),
+    )
+    conn.commit()
+
+    server = make_server(conn)
+    result = await server._search_messages({"query": "fire", "dialog_id": 1})
+
+    assert result["ok"] is True
+    messages = result["data"]["messages"]
+    assert len(messages) == 1
+    assert "reactions_display" in messages[0]
+    assert "🔥" in messages[0]["reactions_display"]
+
+
+@pytest.mark.asyncio
+async def test_global_search_returns_empty_reactions_display() -> None:
+    """Global search returns reactions_display='' (intentional, cross-dialog result set)."""
+    from mcp_telegram.fts import INSERT_FTS_SQL, stem_text
+
+    conn = _make_db(with_fts=True, with_entities=True)
+    _insert_synced_dialog(conn, 5)
+    _insert_message(conn, 5, 300, text="global search test")
+    conn.execute(INSERT_FTS_SQL, (5, 300, stem_text("global search test")))
+    conn.execute(
+        "INSERT INTO message_reactions (dialog_id, message_id, emoji, count) VALUES (?, ?, ?, ?)",
+        (5, 300, "❤️", 2),
+    )
+    conn.commit()
+
+    server = make_server(conn)
+    # No dialog_id => global mode
+    result = await server._search_messages({"query": "global"})
+
+    assert result["ok"] is True
+    messages = result["data"]["messages"]
+    assert len(messages) == 1
+    # Global search: reactions_display must be present but empty
+    assert "reactions_display" in messages[0]
+    assert messages[0]["reactions_display"] == ""
+
+
+# ---------------------------------------------------------------------------
+# _msg_to_dict reactions_display tests (Plan 37-02, Task 3)
+# ---------------------------------------------------------------------------
+
+
+def test_msg_to_dict_formats_reactions_display() -> None:
+    """_msg_to_dict extracts reactions from Telethon message and formats display string."""
+    from mcp_telegram.daemon_api import DaemonAPIServer
+
+    mock_reaction = MagicMock()
+    mock_reaction.emoticon = "👍"
+    mock_rc = MagicMock()
+    mock_rc.reaction = mock_reaction
+    mock_rc.count = 3
+
+    mock_reactions_obj = MagicMock()
+    mock_reactions_obj.results = [mock_rc]
+
+    mock_msg = MagicMock()
+    mock_msg.id = 999
+    mock_msg.date = MagicMock()
+    mock_msg.date.timestamp.return_value = 1700000000.0
+    mock_msg.message = "hello"
+    mock_msg.sender_id = 42
+    mock_msg.sender = None
+    mock_msg.media = None
+    mock_msg.reply_to = None
+    mock_msg.reply_to_msg_id = None
+    mock_msg.forum_topic_id = None
+    mock_msg.reactions = mock_reactions_obj
+    mock_msg.edit_date = None
+
+    result = DaemonAPIServer._msg_to_dict(mock_msg)
+
+    assert "reactions_display" in result
+    assert "reactions" not in result  # bare 'reactions' key must not exist
+    assert "👍" in result["reactions_display"]
+    assert "\u00d7" in result["reactions_display"]  # × U+00D7
+
+
+def test_msg_to_dict_no_reactions_returns_empty_display() -> None:
+    """_msg_to_dict returns reactions_display='' when msg.reactions is None."""
+    from mcp_telegram.daemon_api import DaemonAPIServer
+
+    mock_msg = MagicMock()
+    mock_msg.id = 1
+    mock_msg.date = MagicMock()
+    mock_msg.date.timestamp.return_value = 1700000000.0
+    mock_msg.message = "no reactions"
+    mock_msg.sender_id = None
+    mock_msg.sender = None
+    mock_msg.media = None
+    mock_msg.reply_to = None
+    mock_msg.reply_to_msg_id = None
+    mock_msg.forum_topic_id = None
+    mock_msg.reactions = None
+    mock_msg.edit_date = None
+
+    result = DaemonAPIServer._msg_to_dict(mock_msg)
+
+    assert result["reactions_display"] == ""
+    assert "reactions" not in result
+
+
+@pytest.mark.asyncio
+async def test_no_remaining_reactions_key_in_responses() -> None:
+    """Integration: list_messages response dict has only reactions_display, no bare 'reactions'."""
+    conn = _make_db()
+    _insert_synced_dialog(conn, 1)
+    _insert_message(conn, 1, 50, text="clean response test")
+    conn.commit()
+
+    server = make_server(conn)
+    result = await server._list_messages({"dialog_id": 1, "limit": 10})
+
+    assert result["ok"] is True
+    for msg in result["data"]["messages"]:
+        assert "reactions" not in msg, f"bare 'reactions' key found: {msg}"
+        assert "reactions_display" in msg
+
+
+# ---------------------------------------------------------------------------
+# format_reaction_counts and _format_reactions tests (Plan 37-02, Task 3)
+# ---------------------------------------------------------------------------
+
+
+def test_format_reactions_with_preformatted_display() -> None:
+    """_format_reactions passes through _PreformattedReactions._display unchanged."""
+    from mcp_telegram.formatter import _format_reactions
+    from mcp_telegram.tools._adapters import _PreformattedReactions
+
+    class _FakeMsg:
+        reactions = _PreformattedReactions("[👍×3 ❤️×1]")
+
+    result = _format_reactions(_FakeMsg())  # type: ignore[arg-type]
+    assert result == "[👍×3 ❤️×1]"
+
+
+def test_format_reactions_with_preformatted_empty_string() -> None:
+    """_format_reactions returns '' for _PreformattedReactions with empty display."""
+    from mcp_telegram.formatter import _format_reactions
+    from mcp_telegram.tools._adapters import _PreformattedReactions
+
+    class _FakeMsg:
+        reactions = _PreformattedReactions("")
+
+    result = _format_reactions(_FakeMsg())  # type: ignore[arg-type]
+    assert result == ""
+
+
+def test_format_reactions_with_none_reactions() -> None:
+    """_format_reactions returns '' for msg.reactions=None."""
+    from mcp_telegram.formatter import _format_reactions
+
+    class _FakeMsg:
+        reactions = None
+
+    result = _format_reactions(_FakeMsg())  # type: ignore[arg-type]
+    assert result == ""
+
+
+def test_format_reaction_counts_emoji_glyphs_with_multiplication_sign() -> None:
+    """format_reaction_counts uses actual emoji glyphs with × (U+00D7), shows ×1 for count=1."""
+    from mcp_telegram.formatter import format_reaction_counts
+
+    result = format_reaction_counts([("👍", 3), ("❤️", 1)])
+
+    # Must start/end with brackets
+    assert result.startswith("[")
+    assert result.endswith("]")
+    # Must contain × (U+00D7), NOT lowercase x
+    assert "\u00d7" in result
+    assert "👍\u00d73" in result
+    # count=1 must be shown (×1 not omitted)
+    assert "❤️\u00d71" in result
+
+
+def test_format_reaction_counts_single_reaction_shows_count() -> None:
+    """format_reaction_counts shows ×1 for count=1, never omits it."""
+    from mcp_telegram.formatter import format_reaction_counts
+
+    result = format_reaction_counts([("❤️", 1)])
+
+    assert result == "[❤️\u00d71]"
+
+
+def test_format_reaction_counts_empty_returns_empty() -> None:
+    """format_reaction_counts returns '' for empty input."""
+    from mcp_telegram.formatter import format_reaction_counts
+
+    assert format_reaction_counts([]) == ""
+
+
+def test_format_reaction_counts_sort_order_with_tied_counts() -> None:
+    """Tied counts are broken by emoji Unicode code point (Priority Action #5)."""
+    from mcp_telegram.formatter import format_reaction_counts
+
+    # fire (🔥 U+1F525) and thumbsup (👍 U+1F44D): both count=3
+    # heart (❤️ U+2764): count=1
+    # Unicode order: 👍 (U+1F44D) < 🔥 (U+1F525), so 👍 comes first in tie
+    result = format_reaction_counts([("❤️", 1), ("👍", 3), ("🔥", 3)])
+
+    inner = result[1:-1]  # strip brackets
+    parts = inner.split(" ")
+    assert len(parts) == 3
+    # count=3 entries come first
+    assert "\u00d73" in parts[0]
+    assert "\u00d73" in parts[1]
+    # count=1 entry is last
+    assert "\u00d71" in parts[2]
+    # Within count=3 tie: 👍 (lower code point) before 🔥
+    assert "👍" in parts[0]
+    assert "🔥" in parts[1]
+
+
+# ---------------------------------------------------------------------------
+# Analytics query tests: SCHEMA-02 (entities), SCHEMA-03 (forwards)
+# (Plan 37-02, Task 3 -- proving Priority Action #1 read paths work)
+# ---------------------------------------------------------------------------
+
+
+def _make_db_with_normalized_tables() -> sqlite3.Connection:
+    """Return in-memory DB with messages + message_entities + message_forwards."""
+    conn = _make_db()
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS message_entities (
+            dialog_id   INTEGER NOT NULL,
+            message_id  INTEGER NOT NULL,
+            offset      INTEGER NOT NULL,
+            length      INTEGER NOT NULL,
+            type        TEXT NOT NULL,
+            value       TEXT,
+            PRIMARY KEY (dialog_id, message_id, offset, length, type)
+        ) WITHOUT ROWID
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS message_forwards (
+            dialog_id           INTEGER NOT NULL,
+            message_id          INTEGER NOT NULL,
+            fwd_from_peer_id    INTEGER,
+            fwd_from_name       TEXT,
+            fwd_date            INTEGER,
+            PRIMARY KEY (dialog_id, message_id)
+        ) WITHOUT ROWID
+        """
+    )
+    conn.commit()
+    return conn
+
+
+def test_entity_read_path_mention_query() -> None:
+    """Analytics: entity mention/hashtag query returns populated value column (Priority Action #1)."""
+    conn = _make_db_with_normalized_tables()
+    _insert_synced_dialog(conn, 1)
+    _insert_message(conn, 1, 1)
+    _insert_message(conn, 1, 2)
+    conn.execute(
+        "INSERT INTO message_entities (dialog_id, message_id, offset, length, type, value) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (1, 1, 0, 6, "mention", "@alice"),
+    )
+    conn.execute(
+        "INSERT INTO message_entities (dialog_id, message_id, offset, length, type, value) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (1, 2, 0, 7, "hashtag", "#python"),
+    )
+    conn.commit()
+
+    rows = conn.execute(
+        "SELECT type, value, COUNT(*) as cnt FROM message_entities "
+        "WHERE dialog_id = ? GROUP BY type, value ORDER BY cnt DESC",
+        (1,),
+    ).fetchall()
+
+    assert len(rows) == 2
+    values = {row[1] for row in rows}
+    assert "@alice" in values
+    assert "#python" in values
+    # All values populated (not NULL) -- proves Priority Action #1
+    for row in rows:
+        assert row[1] is not None
+
+
+def test_entity_read_path_hashtag_frequency() -> None:
+    """Analytics: hashtag frequency query works with populated value column (Priority Action #1)."""
+    conn = _make_db_with_normalized_tables()
+    _insert_synced_dialog(conn, 1)
+    _insert_message(conn, 1, 1)
+    _insert_message(conn, 1, 2)
+    _insert_message(conn, 1, 3)
+    conn.execute(
+        "INSERT INTO message_entities (dialog_id, message_id, offset, length, type, value) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (1, 1, 0, 7, "hashtag", "#python"),
+    )
+    conn.execute(
+        "INSERT INTO message_entities (dialog_id, message_id, offset, length, type, value) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (1, 2, 0, 5, "hashtag", "#rust"),
+    )
+    conn.execute(
+        "INSERT INTO message_entities (dialog_id, message_id, offset, length, type, value) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (1, 3, 0, 7, "hashtag", "#python"),
+    )
+    conn.commit()
+
+    rows = conn.execute(
+        "SELECT me.value, COUNT(*) as cnt FROM message_entities me "
+        "WHERE me.dialog_id = ? AND me.type = 'hashtag' "
+        "GROUP BY me.value ORDER BY cnt DESC",
+        (1,),
+    ).fetchall()
+
+    assert rows[0] == ("#python", 2)
+    assert rows[1] == ("#rust", 1)
+
+
+def test_forward_read_path_source_ranking() -> None:
+    """Analytics: forward source ranking query works (SCHEMA-03 read path)."""
+    conn = _make_db_with_normalized_tables()
+    _insert_synced_dialog(conn, 1)
+    _insert_message(conn, 1, 1)
+    _insert_message(conn, 1, 2)
+    _insert_message(conn, 1, 3)
+    conn.execute(
+        "INSERT INTO message_forwards (dialog_id, message_id, fwd_from_peer_id, fwd_from_name) "
+        "VALUES (?, ?, ?, ?)",
+        (1, 1, 100, "Channel A"),
+    )
+    conn.execute(
+        "INSERT INTO message_forwards (dialog_id, message_id, fwd_from_peer_id, fwd_from_name) "
+        "VALUES (?, ?, ?, ?)",
+        (1, 2, 100, "Channel A"),
+    )
+    conn.execute(
+        "INSERT INTO message_forwards (dialog_id, message_id, fwd_from_peer_id, fwd_from_name) "
+        "VALUES (?, ?, ?, ?)",
+        (1, 3, 200, "Channel B"),
+    )
+    conn.commit()
+
+    rows = conn.execute(
+        "SELECT fwd_from_peer_id, fwd_from_name, COUNT(*) as cnt "
+        "FROM message_forwards WHERE dialog_id = ? AND fwd_from_peer_id IS NOT NULL "
+        "GROUP BY fwd_from_peer_id ORDER BY cnt DESC",
+        (1,),
+    ).fetchall()
+
+    assert rows[0][0] == 100
+    assert rows[0][1] == "Channel A"
+    assert rows[0][2] == 2
+    assert rows[1][0] == 200
+
+
+def test_forward_read_path_includes_private_forwards() -> None:
+    """Analytics: forwards with NULL peer_id return fwd_from_name (private/hidden sender)."""
+    conn = _make_db_with_normalized_tables()
+    _insert_synced_dialog(conn, 1)
+    _insert_message(conn, 1, 1)
+    conn.execute(
+        "INSERT INTO message_forwards (dialog_id, message_id, fwd_from_peer_id, fwd_from_name) "
+        "VALUES (?, ?, ?, ?)",
+        (1, 1, None, "Hidden User"),
+    )
+    conn.commit()
+
+    rows = conn.execute(
+        "SELECT fwd_from_peer_id, fwd_from_name FROM message_forwards WHERE dialog_id = ?",
+        (1,),
+    ).fetchall()
+
+    assert len(rows) == 1
+    assert rows[0][0] is None  # peer_id is NULL
+    assert rows[0][1] == "Hidden User"  # display name is populated
+
+
+def test_reaction_analytics_most_reacted_messages() -> None:
+    """Analytics: SUM-based reaction ranking works without Python-level JSON parsing (phase goal)."""
+    conn = _make_db()
+    _insert_synced_dialog(conn, 1)
+    _insert_message(conn, 1, 1)
+    _insert_message(conn, 1, 2)
+    _insert_message(conn, 1, 3)
+    # msg 1: 3 thumbsup + 2 heart = 5 total
+    conn.execute(
+        "INSERT INTO message_reactions (dialog_id, message_id, emoji, count) VALUES (?, ?, ?, ?)",
+        (1, 1, "👍", 3),
+    )
+    conn.execute(
+        "INSERT INTO message_reactions (dialog_id, message_id, emoji, count) VALUES (?, ?, ?, ?)",
+        (1, 1, "❤️", 2),
+    )
+    # msg 2: 1 heart = 1 total
+    conn.execute(
+        "INSERT INTO message_reactions (dialog_id, message_id, emoji, count) VALUES (?, ?, ?, ?)",
+        (1, 2, "❤️", 1),
+    )
+    conn.commit()
+
+    rows = conn.execute(
+        "SELECT message_id, SUM(count) as total_reactions "
+        "FROM message_reactions WHERE dialog_id = ? "
+        "GROUP BY message_id ORDER BY total_reactions DESC LIMIT 5",
+        (1,),
+    ).fetchall()
+
+    assert len(rows) == 2
+    assert rows[0][0] == 1  # msg 1 has highest reactions
+    assert rows[0][1] == 5
+    assert rows[1][0] == 2
+    assert rows[1][1] == 1
+
+
+# Deferred cleanup items from Phase 37 (concrete removal criteria):
+# - Remove _PreformattedReactions shim in _adapters.py
+#   Criterion: when reaction_names_map is removed from MessageLike protocol in models.py
+# - Remove reaction_names_map infrastructure in models.py/formatter.py
+#   Criterion: when on-demand Telethon path is fully migrated to daemon-only reads
+# - Simplify _format_reactions to only handle count-only display path
+#   Criterion: same as above
