@@ -105,8 +105,8 @@ def insert_message(
     conn.execute(
         "INSERT OR REPLACE INTO messages "
         "(dialog_id, message_id, sent_at, text, sender_id, sender_first_name, "
-        "media_description, reply_to_msg_id, forum_topic_id, reactions, is_deleted, deleted_at) "
-        "VALUES (?, ?, 1704067200, ?, 42, 'Alice', NULL, NULL, NULL, NULL, ?, ?)",
+        "media_description, reply_to_msg_id, forum_topic_id, is_deleted, deleted_at) "
+        "VALUES (?, ?, 1704067200, ?, 42, 'Alice', NULL, NULL, NULL, ?, ?)",
         (dialog_id, message_id, text, is_deleted, deleted_at),
     )
     conn.commit()
@@ -738,8 +738,8 @@ async def test_gap_scan_skips_unsynced_messages(
     sync_db.execute(
         "INSERT OR REPLACE INTO messages "
         "(dialog_id, message_id, sent_at, text, sender_id, sender_first_name, "
-        "media_description, reply_to_msg_id, forum_topic_id, reactions, is_deleted) "
-        "VALUES (?, ?, ?, 'future msg', 42, 'Alice', NULL, NULL, NULL, NULL, 0)",
+        "media_description, reply_to_msg_id, forum_topic_id, is_deleted) "
+        "VALUES (?, ?, ?, 'future msg', 42, 'Alice', NULL, NULL, NULL, 0)",
         (dialog_id, 777, future_sent_at),
     )
     sync_db.commit()

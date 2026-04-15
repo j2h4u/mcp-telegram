@@ -27,9 +27,8 @@ from typing import Any
 
 from telethon import events  # type: ignore[import-untyped]
 
-from .fts import DELETE_FTS_SQL, INSERT_FTS_SQL, stem_text
 from .resolver import latinize
-from .sync_worker import INSERT_DIALOG_SQL, INSERT_MESSAGE_SQL, UPSERT_ENTITY_SQL, extract_message_row, serialize_reactions
+from .sync_worker import INSERT_DIALOG_SQL, UPSERT_ENTITY_SQL, extract_message_row, insert_messages_with_fts
 
 logger = logging.getLogger(__name__)
 
@@ -205,16 +204,11 @@ class EventHandlerManager:
 
         try:
             msg = event.message
-            row = extract_message_row(dialog_id, msg)
+            extracted = extract_message_row(dialog_id, msg)
             now = int(time.time())
 
             with self._conn:
-                self._conn.execute(INSERT_MESSAGE_SQL, row)
-                self._conn.execute(DELETE_FTS_SQL, (dialog_id, int(getattr(msg, "id", 0))))
-                self._conn.execute(
-                    INSERT_FTS_SQL,
-                    (dialog_id, int(getattr(msg, "id", 0)), stem_text(getattr(msg, "message", None))),
-                )
+                insert_messages_with_fts(self._conn, [extracted])
                 self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
 
             logger.info("event_new dialog_id=%d message_id=%d", dialog_id, msg.id)
@@ -249,12 +243,8 @@ class EventHandlerManager:
                 if existing is None:
                     # Message not yet in sync.db: insert with current text;
                     # historical versions are lost (acceptable).
-                    row = extract_message_row(dialog_id, msg)
-                    self._conn.execute(INSERT_MESSAGE_SQL, row)
-                    self._conn.execute(DELETE_FTS_SQL, (dialog_id, message_id))
-                    self._conn.execute(
-                        INSERT_FTS_SQL, (dialog_id, message_id, stem_text(new_text))
-                    )
+                    extracted = extract_message_row(dialog_id, msg)
+                    insert_messages_with_fts(self._conn, [extracted])
                     self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
                     logger.info(
                         "event_edit_new dialog_id=%d message_id=%d (not in sync.db, inserted)",
@@ -280,15 +270,10 @@ class EventHandlerManager:
                     _INSERT_VERSION_SQL,
                     (dialog_id, message_id, next_ver, old_text, edit_date_unix),
                 )
-                self._conn.execute(
-                    _UPDATE_MESSAGE_TEXT_SQL, (new_text, dialog_id, message_id)
-                )
-                # FTS5 INSERT OR REPLACE doesn't replace by content columns — must
-                # delete the old row and insert fresh to avoid duplicate FTS entries.
-                self._conn.execute(DELETE_FTS_SQL, (dialog_id, message_id))
-                self._conn.execute(
-                    INSERT_FTS_SQL, (dialog_id, message_id, stem_text(new_text))
-                )
+                # Re-insert via insert_messages_with_fts: updates messages row,
+                # refreshes FTS, and replaces child rows (edit idempotency).
+                extracted = extract_message_row(dialog_id, msg)
+                insert_messages_with_fts(self._conn, [extracted])
                 self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
 
             logger.info(
