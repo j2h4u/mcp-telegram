@@ -83,8 +83,21 @@ async def list_unread_messages(args: ListUnreadMessages) -> ToolResult:
 
     data = response.get("data", {})
     groups = data.get("groups", [])
+    # Defensive: older daemon responses or test mocks may omit bootstrap_pending.
+    # Treat missing as 0 (full coverage assumed). Also guard against explicit None.
+    bootstrap_pending = int(data.get("bootstrap_pending", 0) or 0)
 
     if not groups:
+        # Closes UAT gap 1: when groups=[] but bootstrap_pending>0 the response is
+        # NOT 'no unread' — results are incomplete because dialogs are still being
+        # bootstrapped. The canned 'no unread' text would mislead the caller.
+        if bootstrap_pending > 0:
+            warning = (
+                f"No unread messages yet — bootstrap_pending={bootstrap_pending} "
+                f"dialog(s) are still being seeded by the sync daemon. Results are "
+                f"incomplete. Retry shortly once bootstrap completes."
+            )
+            return ToolResult(content=_text_response(warning))
         empty_msg = no_unread_all_text() if args.scope == "all" else no_unread_personal_text()
         return ToolResult(content=_text_response(empty_msg))
 
@@ -107,4 +120,13 @@ async def list_unread_messages(args: ListUnreadMessages) -> ToolResult:
         chats.append(chat_data)
 
     result_text = format_unread_messages_grouped(chats)
+    # Closes UAT gap 2: even when results are non-empty, the caller must be told
+    # if some dialogs are still bootstrapping — otherwise partial coverage looks
+    # like complete coverage.
+    if bootstrap_pending > 0:
+        result_text = (
+            f"{result_text}\n\n"
+            f"Note: bootstrap_pending={bootstrap_pending} dialog(s) not yet seeded "
+            f"by the sync daemon — results may be incomplete. Retry shortly."
+        )
     return ToolResult(content=_text_response(result_text), result_count=result_count)
