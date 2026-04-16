@@ -355,9 +355,15 @@ class EventHandlerManager:
         try:
             now = int(time.time())
             with self._conn:
-                self._conn.execute(_UPDATE_READ_POSITION_SQL, (event.max_id, dialog_id))
+                cursor = self._conn.execute(_UPDATE_READ_POSITION_SQL, (event.max_id, dialog_id))
                 self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
-            logger.info("event_read dialog_id=%d max_id=%d", dialog_id, event.max_id)
+            if cursor.rowcount > 0:
+                logger.info("event_read dialog_id=%d max_id=%d", dialog_id, event.max_id)
+            else:
+                logger.warning(
+                    "event_read_no_row dialog_id=%d max_id=%d — UPDATE matched 0 rows",
+                    dialog_id, event.max_id,
+                )
         except Exception:
             logger.exception("event_read_failed dialog_id=%s", dialog_id)
 
