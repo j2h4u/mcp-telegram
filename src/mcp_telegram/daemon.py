@@ -184,8 +184,9 @@ async def _initialize_read_positions(
                     chat_id = telethon_utils.get_peer_id(d.peer)
                     max_id = getattr(d, "read_inbox_max_id", 0) or 0
                     # Monotonic: MAX(existing_or_0, incoming) never regresses
-                    conn.execute(_UPDATE_READ_POSITION_SQL, (max_id, chat_id))
-                    filled += 1
+                    cursor = conn.execute(_UPDATE_READ_POSITION_SQL, (max_id, chat_id))
+                    if cursor.rowcount > 0:
+                        filled += 1
                 conn.commit()
         except FloodWaitError as exc:
             logger.warning("read_pos_bootstrap flood_wait seconds=%d", exc.seconds)
