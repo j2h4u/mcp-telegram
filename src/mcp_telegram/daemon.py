@@ -40,6 +40,7 @@ import sqlite3
 import time
 from typing import Any
 
+from telethon import utils as telethon_utils  # type: ignore[import-untyped]
 from telethon.errors.rpcerrorlist import FloodWaitError  # type: ignore[import-untyped]
 
 from .daemon_api import DaemonAPIServer, get_daemon_socket_path
@@ -68,6 +69,17 @@ _SELECT_NULL_TOTAL_SQL = (
 
 _UPDATE_TOTAL_SQL = (
     "UPDATE synced_dialogs SET total_messages = ? WHERE dialog_id = ?"
+)
+
+_SELECT_NULL_READ_POSITIONS_SQL = (
+    "SELECT dialog_id FROM synced_dialogs "
+    "WHERE read_inbox_max_id IS NULL AND status = 'synced'"
+)
+
+_UPDATE_READ_POSITION_SQL = (
+    "UPDATE synced_dialogs "
+    "SET read_inbox_max_id = MAX(COALESCE(read_inbox_max_id, 0), ?) "
+    "WHERE dialog_id = ?"
 )
 
 # Tracked background tasks — cancelled on shutdown
@@ -125,6 +137,75 @@ async def _backfill_total_messages(
         await asyncio.sleep(1.0)
 
     logger.info("backfill_total_messages filled=%d/%d", filled, len(rows))
+    return filled
+
+
+async def _initialize_read_positions(
+    client: Any,
+    conn: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+) -> int:
+    """One-time sweep to populate read_inbox_max_id for synced dialogs with NULL.
+
+    Uses batched GetPeerDialogsRequest (batch size 15, 1.5s inter-batch pause).
+    Batch size is deliberately low (10-20 range, NOT 100) to avoid the FloodWait
+    burst that broke 260416-ifp. Runs once at daemon startup in the background.
+
+    All writes use monotonic UPDATE — MAX(COALESCE(existing, 0), incoming) —
+    so a live MessageRead event that arrives during the bootstrap window
+    cannot be overwritten by a stale bootstrap reply.
+    """
+    from telethon.tl.functions.messages import GetPeerDialogsRequest  # type: ignore[import-untyped]
+    from telethon.tl.types import InputDialogPeer  # type: ignore[import-untyped]
+
+    rows = conn.execute(_SELECT_NULL_READ_POSITIONS_SQL).fetchall()
+    if not rows:
+        logger.info("initialize_read_positions — no NULL rows, skipping")
+        return 0
+
+    dialog_ids = [row[0] for row in rows]
+    filled = 0
+    BATCH = 15  # 10-20 range, avoids the burst FloodWait that broke 260416-ifp
+
+    for i in range(0, len(dialog_ids), BATCH):
+        if shutdown_event.is_set():
+            break
+        batch_ids = dialog_ids[i : i + BATCH]
+        try:
+            input_peers = []
+            for did in batch_ids:
+                try:
+                    peer = await client.get_input_entity(did)
+                    input_peers.append(InputDialogPeer(peer=peer))
+                except Exception as exc:
+                    logger.debug("read_pos_bootstrap skip dialog_id=%d error=%s", did, exc)
+            if input_peers:
+                result = await client(GetPeerDialogsRequest(peers=input_peers))
+                for d in result.dialogs:
+                    chat_id = telethon_utils.get_peer_id(d.peer)
+                    max_id = getattr(d, "read_inbox_max_id", 0) or 0
+                    # Monotonic: MAX(existing_or_0, incoming) never regresses
+                    conn.execute(_UPDATE_READ_POSITION_SQL, (max_id, chat_id))
+                    filled += 1
+                conn.commit()
+        except FloodWaitError as exc:
+            logger.warning("read_pos_bootstrap flood_wait seconds=%d", exc.seconds)
+            try:
+                await asyncio.wait_for(shutdown_event.wait(), timeout=float(exc.seconds))
+                return filled
+            except asyncio.TimeoutError:
+                pass
+        except Exception as exc:
+            logger.debug("read_pos_bootstrap batch_failed error=%s", exc)
+
+        # Inter-batch pause: 1.5s, SIGTERM-responsive
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=1.5)
+            break
+        except asyncio.TimeoutError:
+            pass
+
+    logger.info("initialize_read_positions filled=%d/%d", filled, len(dialog_ids))
     return filled
 
 
@@ -310,6 +391,13 @@ async def sync_main() -> None:
         _create_tracked_task(
             _backfill_total_messages(client, conn, shutdown_event),
             name="backfill_total_messages",
+        )
+        # Must come AFTER handler_manager.register() (startup-ordering invariant):
+        # the on_message_read handler must be live before bootstrap starts so no
+        # real-time MessageRead events are dropped during the bootstrap window.
+        _create_tracked_task(
+            _initialize_read_positions(client, conn, shutdown_event),
+            name="initialize_read_positions",
         )
         _create_tracked_task(
             run_access_probe_loop(client, conn, shutdown_event, delta_worker),
