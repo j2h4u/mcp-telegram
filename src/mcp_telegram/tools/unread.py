@@ -30,6 +30,19 @@ class ListUnreadMessages(ToolArgs):
     Use scope="personal" (default) to see only DMs and small groups (≤ group_size_threshold members).
     Use scope="all" to include large groups and channels (shows counts only, no messages).
     Use limit to control total messages (default 100, minimum across all chats).
+
+    **Data source**: Results come exclusively from the local sync.db (synced_dialogs, messages,
+    and entities tables) via a single grouped SQL query — zero Telegram API calls in the hot path.
+    Only dialogs with status='synced' AND read_inbox_max_id IS NOT NULL are scanned.
+
+    **Bootstrap**: On first daemon start after a schema upgrade, dialogs are bootstrapped in the
+    background by _initialize_read_positions. Until bootstrap completes for a given dialog it is
+    excluded from results. The response includes bootstrap_pending (count of synced dialogs with
+    NULL read_inbox_max_id) so callers can detect incomplete coverage and retry later — no silent
+    empty results.
+
+    **Real-time updates**: read_inbox_max_id is maintained live via events.MessageRead(inbox=True)
+    with monotonic writes (MAX(COALESCE(existing,0), incoming) — never regresses).
     """
 
     scope: t.Literal["personal", "all"] = Field(
