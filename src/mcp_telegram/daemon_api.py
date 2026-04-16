@@ -52,6 +52,30 @@ from telethon.tl.functions.users import GetFullUserRequest  # type: ignore[impor
 from telethon.tl.types import Channel, Chat  # type: ignore[import-untyped]
 from telethon import utils as telethon_utils  # type: ignore[import-untyped]
 
+
+def _classify_dialog_type(entity: object | None) -> str:
+    """Classify a Telethon dialog entity into a human-readable type string.
+
+    Returns one of: "User", "Bot", "Channel", "Group", "Forum", "Chat", "Unknown".
+    Branch order matters: Forum must be checked before Group because forum=True
+    implies megagroup=True — checking megagroup first would misclassify forums.
+    User detection uses duck-typing (hasattr first_name) to avoid an extra import.
+    """
+    if entity is None:
+        return "Unknown"
+    if isinstance(entity, Channel):
+        if getattr(entity, "megagroup", False) and getattr(entity, "forum", False):
+            return "Forum"
+        if getattr(entity, "megagroup", False):
+            return "Group"
+        return "Channel"
+    if isinstance(entity, Chat):
+        return "Chat"
+    if hasattr(entity, "first_name"):
+        return "Bot" if getattr(entity, "bot", False) else "User"
+    return "Unknown"
+
+
 USER_TTL: int = 2_592_000   # 30 days
 GROUP_TTL: int = 604_800    # 7 days
 
@@ -252,14 +276,14 @@ _UPSERT_ENTITY_SQL = (
 _ALL_ENTITY_NAMES_SQL = (
     "SELECT id, name FROM entities "
     "WHERE name IS NOT NULL "
-    "AND ((type = 'user' AND updated_at >= ?) "
-    "OR (type != 'user' AND updated_at >= ?))"
+    "AND ((type IN ('User', 'Bot') AND updated_at >= ?) "  # PascalCase per ListDialogs type vocabulary
+    "OR (type NOT IN ('User', 'Bot') AND updated_at >= ?))"
 )
 _ALL_ENTITY_NAMES_NORMALIZED_SQL = (
     "SELECT id, name_normalized FROM entities "
     "WHERE name_normalized IS NOT NULL "
-    "AND ((type = 'user' AND updated_at >= ?) "
-    "OR (type != 'user' AND updated_at >= ?))"
+    "AND ((type IN ('User', 'Bot') AND updated_at >= ?) "  # PascalCase per ListDialogs type vocabulary
+    "OR (type NOT IN ('User', 'Bot') AND updated_at >= ?))"
 )
 _ENTITY_BY_USERNAME_SQL = "SELECT id, name FROM entities WHERE username = ?"
 
@@ -617,10 +641,10 @@ class DaemonAPIServer:
     async def _resolve_dialog_name(self, dialog: str) -> int:
         """Resolve a dialog name string to a numeric dialog_id.
 
-        Tries client.get_entity(dialog) first (handles @username, phone,
-        invite link).  Falls back to case-insensitive substring matching
-        via iter_dialogs() if get_entity fails. Returns the first exact
-        match, or the first substring match if no exact match exists.
+        Resolution order (fastest-first):
+        1. client.get_entity() — handles @username, phone, invite link.
+        2. entities table — exact/normalized/substring match against cached DB.
+        3. iter_dialogs() — last resort for dialogs not yet in entities table.
 
         Returns telethon peer id (negative for channels/groups).
         Raises ValueError with descriptive message on failure.
@@ -631,9 +655,31 @@ class DaemonAPIServer:
         except (ValueError, KeyError):
             pass
         except Exception:
-            logger.debug("get_entity failed for %r, falling back to iter_dialogs", dialog, exc_info=True)
+            logger.debug("get_entity failed for %r, falling back to entities DB", dialog, exc_info=True)
 
-        # Fallback: iterate dialogs and fuzzy-match by name
+        # Fast path: look up in local entities table (O(1), no network).
+        # Priority: exact name match > normalized exact > normalized substring.
+        norm = latinize(dialog)
+        row = self._conn.execute(
+            """
+            SELECT id FROM entities
+            WHERE LOWER(name) = LOWER(?)
+               OR name_normalized = ?
+               OR (? != '' AND name_normalized LIKE '%' || ? || '%')
+            ORDER BY
+              CASE WHEN LOWER(name) = LOWER(?) THEN 0
+                   WHEN name_normalized = ?     THEN 1
+                   ELSE 2
+              END
+            LIMIT 1
+            """,
+            (dialog, norm, norm, norm, dialog, norm),
+        ).fetchone()
+        if row:
+            logger.debug("resolve_dialog_entities_cache hit query=%r id=%d", dialog, row[0])
+            return row[0]
+
+        # Slow path: iterate dialogs via Telegram API (catches dialogs not yet in entities).
         logger.debug("resolve_dialog_fallback_iter_dialogs query=%r", dialog)
         matched_dialog: Any | None = None
         async for d in self._client.iter_dialogs():
@@ -1223,7 +1269,7 @@ class DaemonAPIServer:
                 ignore_pinned=ignore_pinned,
             ):
                 entity = getattr(d, "entity", None)
-                entity_type = type(entity).__name__ if entity is not None else "Unknown"
+                entity_type = _classify_dialog_type(entity)
                 last_msg_at: int | None = None
                 if getattr(d, "date", None) is not None:
                     try:

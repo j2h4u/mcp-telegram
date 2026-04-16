@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from mcp_telegram.daemon_api import DaemonAPIServer, get_daemon_socket_path
+from mcp_telegram.daemon_api import DaemonAPIServer, _classify_dialog_type, get_daemon_socket_path
 from mcp_telegram.fts import MESSAGES_FTS_DDL, stem_text
 
 
@@ -52,7 +52,7 @@ def make_server(
     return DaemonAPIServer(conn, client, shutdown_event)
 
 
-def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.Connection:
+def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.Connection:  # noqa: ARG001 (with_entities kept for call-site compatibility, always created now)
     """Return an in-memory SQLite connection with the required schema."""
     conn = sqlite3.connect(":memory:")
     conn.execute(
@@ -126,21 +126,20 @@ def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS entities (
+            id              INTEGER PRIMARY KEY,
+            type            TEXT NOT NULL,
+            name            TEXT,
+            username        TEXT,
+            name_normalized TEXT,
+            updated_at      INTEGER NOT NULL
+        )
+        """
+    )
     if with_fts:
         conn.execute(MESSAGES_FTS_DDL)
-    if with_entities:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS entities (
-                id              INTEGER PRIMARY KEY,
-                type            TEXT NOT NULL,
-                name            TEXT,
-                username        TEXT,
-                name_normalized TEXT,
-                updated_at      INTEGER NOT NULL
-            )
-            """
-        )
     conn.commit()
     return conn
 
@@ -519,6 +518,71 @@ async def test_search_messages_global_navigation_token_uses_dialog_id_zero() -> 
     assert next_nav is not None
     nav = decode_navigation_token(next_nav)
     assert nav.dialog_id == 0
+
+
+
+# ---------------------------------------------------------------------------
+# _classify_dialog_type unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_classify_dialog_type_forum() -> None:
+    from telethon.tl.types import Channel  # type: ignore[import-untyped]
+
+    entity = MagicMock()
+    entity.__class__ = Channel
+    entity.megagroup = True
+    entity.forum = True
+    entity.broadcast = False
+    assert _classify_dialog_type(entity) == "Forum"
+
+
+def test_classify_dialog_type_group() -> None:
+    from telethon.tl.types import Channel  # type: ignore[import-untyped]
+
+    entity = MagicMock()
+    entity.__class__ = Channel
+    entity.megagroup = True
+    entity.forum = False
+    entity.broadcast = False
+    assert _classify_dialog_type(entity) == "Group"
+
+
+def test_classify_dialog_type_channel_broadcast() -> None:
+    from telethon.tl.types import Channel  # type: ignore[import-untyped]
+
+    entity = MagicMock()
+    entity.__class__ = Channel
+    entity.broadcast = True
+    entity.megagroup = False
+    entity.forum = False
+    assert _classify_dialog_type(entity) == "Channel"
+
+
+def test_classify_dialog_type_bot() -> None:
+    entity = MagicMock()
+    entity.first_name = "BotFather"
+    entity.bot = True
+    assert _classify_dialog_type(entity) == "Bot"
+
+
+def test_classify_dialog_type_user() -> None:
+    entity = MagicMock()
+    entity.first_name = "Alice"
+    entity.bot = False
+    assert _classify_dialog_type(entity) == "User"
+
+
+def test_classify_dialog_type_chat() -> None:
+    from telethon.tl.types import Chat  # type: ignore[import-untyped]
+
+    entity = MagicMock()
+    entity.__class__ = Chat
+    assert _classify_dialog_type(entity) == "Chat"
+
+
+def test_classify_dialog_type_none() -> None:
+    assert _classify_dialog_type(None) == "Unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -1681,18 +1745,6 @@ async def test_list_unread_messages_dispatch_routing() -> None:
 def _make_db_with_entities(*, with_fts: bool = False) -> sqlite3.Connection:
     """Return an in-memory SQLite connection with sync.db schema + entities + telemetry."""
     conn = _make_db(with_fts=with_fts)
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS entities (
-            id              INTEGER PRIMARY KEY,
-            type            TEXT NOT NULL,
-            name            TEXT NOT NULL,
-            username        TEXT,
-            name_normalized TEXT,
-            updated_at      INTEGER NOT NULL
-        )
-        """
-    )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_entities_type_updated ON entities(type, updated_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_entities_username ON entities(username)")
     conn.execute(
@@ -3084,7 +3136,8 @@ async def test_list_dialogs_includes_coverage():
     mock_dialog.id = 5001
     mock_dialog.name = "Test Dialog"
     mock_dialog.entity = MagicMock()
-    type(mock_dialog.entity).__name__ = "User"
+    mock_dialog.entity.first_name = "Test"
+    mock_dialog.entity.bot = False
     mock_dialog.entity.participants_count = None
     mock_dialog.entity.date = None
     mock_dialog.date = MagicMock()
@@ -3103,6 +3156,45 @@ async def test_list_dialogs_includes_coverage():
     assert len(dialogs) == 1
     assert dialogs[0]["sync_coverage_pct"] == 50
     assert dialogs[0]["access_lost_at"] is None
+    assert dialogs[0]["type"] == "User"
+
+
+@pytest.mark.asyncio
+async def test_list_dialogs_classifies_forum() -> None:
+    """list_dialogs returns type='Forum' for a megagroup with forum flag."""
+    from telethon.tl.types import Channel  # type: ignore[import-untyped]
+
+    conn = _make_db()
+
+    entity = MagicMock()
+    entity.__class__ = Channel
+    entity.megagroup = True
+    entity.forum = True
+    entity.broadcast = False
+    entity.participants_count = None
+    entity.date = None
+
+    mock_dialog = MagicMock()
+    mock_dialog.id = 6001
+    mock_dialog.name = "Forum Group"
+    mock_dialog.entity = entity
+    mock_dialog.date = MagicMock()
+    mock_dialog.date.timestamp.return_value = 1700000000
+    mock_dialog.unread_count = 0
+
+    mock_client = MagicMock()
+
+    async def _iter_dialogs(**kwargs):
+        yield mock_dialog
+
+    mock_client.iter_dialogs = _iter_dialogs
+
+    server = make_server(conn, mock_client)
+    result = await server._list_dialogs({})
+    assert result["ok"] is True
+    dialogs = result["data"]["dialogs"]
+    assert len(dialogs) == 1
+    assert dialogs[0]["type"] == "Forum"
 
 
 # ---------------------------------------------------------------------------
