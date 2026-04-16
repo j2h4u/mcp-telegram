@@ -292,6 +292,21 @@ class DaemonConnection:
         """Fuzzy entity resolution from sync.db."""
         return await self.request({"method": "resolve_entity", "query": query})
 
+    async def get_dialog_stats(
+        self,
+        *,
+        dialog_id: int = 0,
+        dialog: str | None = None,
+        limit: int = 5,
+    ) -> dict:
+        """Return aggregated stats (reactions, mentions, hashtags, forwards) for a dialog."""
+        return await self.request({
+            "method": "get_dialog_stats",
+            "dialog_id": dialog_id,
+            "dialog": dialog,
+            "limit": limit,
+        })
+
 
 # ---------------------------------------------------------------------------
 # Context manager

@@ -1,6 +1,6 @@
 """Daemon API server — Unix socket request dispatcher.
 
-DaemonAPIServer listens on a Unix domain socket and handles fourteen methods:
+DaemonAPIServer listens on a Unix domain socket and handles fifteen methods:
   - list_messages: read from sync.db (synced dialogs) or Telegram (on-demand)
   - search_messages: FTS5 stemmed full-text search against messages_fts
   - list_dialogs: live dialog list from Telegram enriched with sync_status
@@ -15,6 +15,7 @@ DaemonAPIServer listens on a Unix domain socket and handles fourteen methods:
   - get_usage_stats: read usage statistics from sync.db
   - upsert_entities: batch upsert entities into sync.db
   - resolve_entity: fuzzy entity resolution from sync.db
+  - get_dialog_stats: aggregate analytics (reactions, mentions, hashtags, forwards) for a synced dialog
 
 Protocol: newline-delimited JSON (one request line → one response line).
 
@@ -217,6 +218,29 @@ _GET_EDIT_ALERTS_SQL = (
 _GET_ACCESS_LOST_ALERTS_SQL = (
     "SELECT dialog_id, access_lost_at "
     "FROM synced_dialogs WHERE status = 'access_lost' AND access_lost_at > ?"
+)
+
+# Dialog stats SQL (get_dialog_stats)
+_GET_DIALOG_TOP_REACTIONS_SQL = (
+    "SELECT emoji, SUM(count) AS total "
+    "FROM message_reactions WHERE dialog_id = ? "
+    "GROUP BY emoji ORDER BY total DESC LIMIT ?"
+)
+_GET_DIALOG_TOP_MENTIONS_SQL = (
+    "SELECT value, COUNT(*) AS cnt FROM message_entities "
+    "WHERE dialog_id = ? AND type = 'mention' AND value IS NOT NULL "
+    "GROUP BY value ORDER BY cnt DESC LIMIT ?"
+)
+_GET_DIALOG_TOP_HASHTAGS_SQL = (
+    "SELECT value, COUNT(*) AS cnt FROM message_entities "
+    "WHERE dialog_id = ? AND type = 'hashtag' AND value IS NOT NULL "
+    "GROUP BY value ORDER BY cnt DESC LIMIT ?"
+)
+_GET_DIALOG_TOP_FORWARDS_SQL = (
+    "SELECT fwd_from_peer_id, fwd_from_name, COUNT(*) AS cnt "
+    "FROM message_forwards "
+    "WHERE dialog_id = ? AND (fwd_from_peer_id IS NOT NULL OR fwd_from_name IS NOT NULL) "
+    "GROUP BY fwd_from_peer_id, fwd_from_name ORDER BY cnt DESC LIMIT ?"
 )
 
 # Entity / telemetry SQL
@@ -582,6 +606,8 @@ class DaemonAPIServer:
             return await self._upsert_entities(req)
         if method == "resolve_entity":
             return await self._resolve_entity(req)
+        if method == "get_dialog_stats":
+            return await self._get_dialog_stats(req)
         return {"ok": False, "error": "unknown_method"}
 
     # ------------------------------------------------------------------
@@ -1875,6 +1901,77 @@ class DaemonAPIServer:
         except Exception as exc:
             logger.error("get_usage_stats failed: %s", exc, exc_info=True)
             return {"ok": False, "error": "internal", "message": "internal error"}
+
+    # ------------------------------------------------------------------
+    # get_dialog_stats
+    # ------------------------------------------------------------------
+
+    async def _get_dialog_stats(self, req: dict) -> dict:
+        """Return aggregate analytics for one synced dialog.
+
+        Request: dialog_id (int) OR dialog (str fuzzy name), limit (int 1-20, default 5).
+        Response data: {"dialog_id", "top_reactions", "top_mentions", "top_hashtags",
+        "top_forwards"} — each a list of dicts sorted by count DESC.
+        Errors: not_synced (dialog not in scope), missing_dialog, dialog_not_found.
+        access_lost dialogs are allowed — archived analytics remain useful.
+        """
+        dialog_id: int = req.get("dialog_id", 0) or 0
+        dialog: str | None = req.get("dialog")
+        limit: int = _clamp(req.get("limit", 5), 1, 20)
+
+        resolved = await self._resolve_dialog_id(dialog_id, dialog)
+        if isinstance(resolved, dict):
+            return resolved
+        dialog_id = resolved
+        if not dialog_id:
+            return {
+                "ok": False,
+                "error": "missing_dialog",
+                "message": "Either dialog_id or dialog name is required for get_dialog_stats",
+            }
+
+        row = self._conn.execute(_SELECT_SYNC_STATUS_SQL, (dialog_id,)).fetchone()
+        if row is None or row[0] not in ("synced", "syncing", "access_lost"):
+            return {
+                "ok": False,
+                "error": "not_synced",
+                "message": "GetDialogStats requires a synced dialog. Use MarkDialogForSync first.",
+            }
+
+        reactions = [
+            {"emoji": r[0], "count": int(r[1])}
+            for r in self._conn.execute(
+                _GET_DIALOG_TOP_REACTIONS_SQL, (dialog_id, limit)
+            ).fetchall()
+        ]
+        mentions = [
+            {"value": r[0], "count": int(r[1])}
+            for r in self._conn.execute(
+                _GET_DIALOG_TOP_MENTIONS_SQL, (dialog_id, limit)
+            ).fetchall()
+        ]
+        hashtags = [
+            {"value": r[0], "count": int(r[1])}
+            for r in self._conn.execute(
+                _GET_DIALOG_TOP_HASHTAGS_SQL, (dialog_id, limit)
+            ).fetchall()
+        ]
+        forwards = [
+            {"peer_id": r[0], "name": r[1], "count": int(r[2])}
+            for r in self._conn.execute(
+                _GET_DIALOG_TOP_FORWARDS_SQL, (dialog_id, limit)
+            ).fetchall()
+        ]
+        return {
+            "ok": True,
+            "data": {
+                "dialog_id": dialog_id,
+                "top_reactions": reactions,
+                "top_mentions": mentions,
+                "top_hashtags": hashtags,
+                "top_forwards": forwards,
+            },
+        }
 
     # ------------------------------------------------------------------
     # upsert_entities
