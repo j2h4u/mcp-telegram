@@ -78,6 +78,7 @@ def test_synced_dialogs_schema(tmp_sync_db_path: Path) -> None:
             "sync_progress",
             "total_messages",
             "access_lost_at",
+            "read_inbox_max_id",
         }
         assert expected == set(columns.keys()), (
             f"Unexpected columns. Got: {set(columns.keys())}, expected: {expected}"
@@ -251,6 +252,7 @@ def test_schema_migration_idempotent_v2(tmp_sync_db_path: Path) -> None:
         assert rows[4][0] == 5
         assert rows[5][0] == 6
         assert rows[6][0] == 7
+        assert rows[7][0] == 8
     finally:
         conn.close()
 
@@ -477,26 +479,30 @@ def test_schema_v5_telemetry_index_exists(tmp_sync_db_path: Path) -> None:
 
 
 def test_schema_version_is_7(tmp_sync_db_path: Path) -> None:
-    """After ensure_sync_schema(), MAX(version) in schema_version is 7."""
+    """After ensure_sync_schema(), MAX(version) in schema_version is _CURRENT_SCHEMA_VERSION."""
     ensure_sync_schema(tmp_sync_db_path)
     conn = _open_sync_db(tmp_sync_db_path)
     try:
         row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
-        assert row is not None and row[0] == 7, f"Expected version 7, got {row[0]}"
+        assert row is not None and row[0] == _CURRENT_SCHEMA_VERSION, (
+            f"Expected version {_CURRENT_SCHEMA_VERSION}, got {row[0]}"
+        )
     finally:
         conn.close()
 
 
 def test_ensure_sync_schema_twice_idempotent_v7(tmp_sync_db_path: Path) -> None:
-    """Running ensure_sync_schema twice is idempotent — no errors, version stays 7."""
+    """Running ensure_sync_schema twice is idempotent — no errors, version stays at _CURRENT_SCHEMA_VERSION."""
     ensure_sync_schema(tmp_sync_db_path)
     ensure_sync_schema(tmp_sync_db_path)
     conn = _open_sync_db(tmp_sync_db_path)
     try:
         row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
-        assert row is not None and row[0] == 7
+        assert row is not None and row[0] == _CURRENT_SCHEMA_VERSION
         rows = conn.execute("SELECT * FROM schema_version ORDER BY version").fetchall()
-        assert len(rows) == 7, f"Expected 7 schema_version rows, got {len(rows)}"
+        assert len(rows) == _CURRENT_SCHEMA_VERSION, (
+            f"Expected {_CURRENT_SCHEMA_VERSION} schema_version rows, got {len(rows)}"
+        )
     finally:
         conn.close()
 
@@ -732,7 +738,7 @@ def test_schema_version_records_all_versions(tmp_path: Path) -> None:
                 "SELECT version FROM schema_version ORDER BY version"
             ).fetchall()
         ]
-        assert versions == [1, 2, 3, 4, 5, 6, 7], f"expected all 7 versions, got {versions}"
+        assert versions == [1, 2, 3, 4, 5, 6, 7, 8], f"expected all 8 versions, got {versions}"
     finally:
         conn.close()
 

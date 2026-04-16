@@ -8,7 +8,7 @@ from pathlib import Path
 
 from xdg_base_dirs import xdg_state_home  # type: ignore[import-error]
 
-_CURRENT_SCHEMA_VERSION = 7
+_CURRENT_SCHEMA_VERSION = 8
 
 logger = logging.getLogger(__name__)
 
@@ -360,6 +360,12 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
 ) WITHOUT ROWID""",
         # 8. Reply-chain index
         "CREATE INDEX IF NOT EXISTS idx_messages_reply ON messages(dialog_id, reply_to_msg_id)",
+    ])
+
+    _migrate(8, [
+        "ALTER TABLE synced_dialogs ADD COLUMN read_inbox_max_id INTEGER",
+        "CREATE INDEX IF NOT EXISTS idx_synced_dialogs_status_read_position "
+        "ON synced_dialogs(status, read_inbox_max_id)",
     ])
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
