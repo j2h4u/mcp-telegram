@@ -92,10 +92,13 @@ class GetDialogStats(ToolArgs):
     """Return aggregate analytics for one synced dialog: top reactions (emoji+count),
     top @mentions, top #hashtags, and top forward sources. Pass a dialog name, @username,
     or numeric dialog_id. Requires the dialog to be synced (use MarkDialogForSync first);
-    non-synced dialogs return an actionable error."""
+    non-synced dialogs return an actionable error.
+
+    top_n controls how many entries are returned in each category independently —
+    e.g. top_n=5 returns up to 5 reactions, 5 mentions, 5 hashtags, and 5 forward sources."""
 
     dialog: str = Field(max_length=500, description="Dialog name, @username, or numeric id")
-    limit: int = Field(default=5, ge=1, le=20, description="Top-N per category (reactions, mentions, hashtags, forwards)")
+    top_n: int = Field(default=5, ge=1, le=20, description="How many top entries to return per category (reactions, mentions, hashtags, forward sources)")
 
 
 def _format_stats_section(title: str, entries: list[dict], key: str) -> list[str]:
@@ -119,7 +122,7 @@ async def get_dialog_stats(args: GetDialogStats) -> ToolResult:
             response = await conn.get_dialog_stats(
                 dialog_id=dialog_id or 0,
                 dialog=dialog_name,
-                limit=args.limit,
+                limit=args.top_n,
             )
     except DaemonNotRunningError:
         return ToolResult(content=_text_response(_daemon_not_running_text()))
