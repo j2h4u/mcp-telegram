@@ -30,6 +30,11 @@ class ListUnreadMessages(ToolArgs):
     Use scope="personal" (default) to see only DMs and small groups (≤ group_size_threshold members).
     Use scope="all" to include large groups and channels (shows counts only, no messages).
     Use limit to control total messages (default 100, minimum across all chats).
+
+    Scope: only dialogs actively enrolled in sync are scanned
+    (synced_dialogs.status != 'access_lost'). Non-synced or access-lost dialogs
+    are intentionally excluded — enroll them via MarkDialogForSync if you need
+    them tracked here.
     """
 
     scope: t.Literal["personal", "all"] = Field(
