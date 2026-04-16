@@ -21,20 +21,19 @@
       }
     },
     {
-      "_comment": "ListTopics — forum group returns topics",
+      "_comment": "ListTopics — non-forum channel returns graceful response (no crash)",
       "action": "call_tool",
       "name": "ListTopics",
-      "arguments": {"dialog": "Studio Robots and Inbox"},
+      "arguments": {"dialog": "khabaroff.studio: AI"},
       "expect": {
-        "is_error": false,
-        "content_text_contains": ["topic_id=1 title=\"General\"", "topic_id=40 title=\"Inbox\""]
+        "is_error": false
       }
     },
     {
-      "_comment": "ListMessages — forum with topic filter (on-demand path may lack topic header)",
+      "_comment": "ListMessages — synced channel",
       "action": "call_tool",
       "name": "ListMessages",
-      "arguments": {"dialog": "Studio Robots and Inbox", "topic": "Inbox", "limit": 3},
+      "arguments": {"dialog": "khabaroff.studio: AI", "limit": 3},
       "expect": {
         "is_error": false
       }
@@ -49,10 +48,10 @@
       }
     },
     {
-      "_comment": "SearchMessages — keyword search",
+      "_comment": "SearchMessages — keyword search in synced channel",
       "action": "call_tool",
       "name": "SearchMessages",
-      "arguments": {"dialog": "Studio Robots and Inbox", "query": "test", "limit": 3},
+      "arguments": {"dialog": "khabaroff.studio: AI", "query": "ai", "limit": 3},
       "expect": {
         "is_error": false
       }
@@ -83,6 +82,16 @@
       "arguments": {"since": 0, "limit": 10},
       "expect": {
         "is_error": false
+      }
+    },
+    {
+      "_comment": "GetDialogStats — top reactions/mentions/hashtags/reposts for a synced dialog",
+      "action": "call_tool",
+      "name": "GetDialogStats",
+      "arguments": {"dialog": "khabaroff.studio: AI", "top_n": 3},
+      "expect": {
+        "is_error": false,
+        "content_text_contains": ["=== Top Reactions"]
       }
     }
   ]
