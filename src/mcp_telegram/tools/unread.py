@@ -58,7 +58,11 @@ class ListUnreadMessages(ToolArgs):
     group_size_threshold: int = Field(
         default=100,
         ge=10,
-        description="Group member count above which to hide messages (scope=personal only)"
+        description=(
+            "Group member count above which to hide messages (scope=personal only). "
+            "NOTE: currently has no effect — participants_count is not stored locally. "
+            "All groups are included regardless of size."
+        ),
     )
 
 

@@ -1837,8 +1837,10 @@ class DaemonAPIServer:
 
             category = _ENTITY_TYPE_TO_CATEGORY.get(entity_type, "group")
 
-            # participants_count=None — not stored in sync.db.
-            # _should_include_unread_dialog treats None as permissive for groups.
+            # participants_count=None — not stored in sync.db, so group_size_threshold
+            # has no effect here. _should_include_unread_dialog treats None as permissive
+            # for groups (all groups pass regardless of size).
+            # TODO: persist participants_count in entities to enable threshold filtering.
             if not self._should_include_unread_dialog(
                 category, scope, None, group_size_threshold,
             ):
