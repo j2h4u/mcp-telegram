@@ -26,10 +26,20 @@ from mcp_telegram.fts import MESSAGES_FTS_DDL, stem_text
 
 @pytest.fixture(autouse=True)
 def _patch_get_peer_id():
-    """All tests use MagicMock entities — real get_peer_id can't handle them."""
+    """All tests use MagicMock entities — real get_peer_id/get_display_name can't handle them."""
+    def _display_name(entity: Any) -> str:
+        return (
+            getattr(entity, "first_name", None)
+            or getattr(entity, "title", None)
+            or ""
+        )
+
     with patch(
         "mcp_telegram.daemon_api.telethon_utils.get_peer_id",
         side_effect=lambda entity: int(getattr(entity, "id", 0)),
+    ), patch(
+        "mcp_telegram.daemon_api.telethon_utils.get_display_name",
+        side_effect=_display_name,
     ):
         yield
 
@@ -1528,32 +1538,105 @@ def _make_msg_mock(
     return msg
 
 
+# ---------------------------------------------------------------------------
+# Helpers for _collect_unread_dialogs tests (GetPeerDialogsRequest-based)
+# ---------------------------------------------------------------------------
+
+
+def _seed_synced(conn: sqlite3.Connection, *dialog_ids: int, status: str = "synced") -> None:
+    """Seed synced_dialogs rows for unread tests."""
+    conn.executemany(
+        "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, ?)",
+        [(did, status) for did in dialog_ids],
+    )
+    conn.commit()
+
+
+def _fake_user(uid: int, first_name: str = "User", *, bot: bool = False) -> MagicMock:
+    u = MagicMock()
+    u.id = uid
+    u.first_name = first_name
+    u.bot = bot
+    return u
+
+
+def _fake_channel(
+    cid: int,
+    *,
+    broadcast: bool = False,
+    megagroup: bool = False,
+    participants_count: int | None = None,
+    title: str = "Channel",
+) -> MagicMock:
+    c = MagicMock()
+    c.id = cid
+    c.broadcast = broadcast
+    c.megagroup = megagroup
+    c.participants_count = participants_count
+    c.title = title
+    # No first_name → classified as channel/group, not user
+    del c.first_name
+    return c
+
+
+def _fake_raw_dialog(
+    peer_id: int,
+    *,
+    unread_count: int,
+    mentions: int = 0,
+    read_inbox_max_id: int = 0,
+    top_message: int = 0,
+) -> MagicMock:
+    d = MagicMock()
+    d.peer = MagicMock()
+    d.peer.id = peer_id  # get_peer_id is patched to return entity.id
+    d.unread_count = unread_count
+    d.unread_mentions_count = mentions
+    d.read_inbox_max_id = read_inbox_max_id
+    d.top_message = top_message
+    return d
+
+
+def _make_peer_dialogs_result(
+    dialogs: list[MagicMock],
+    *,
+    chats: list[MagicMock] | None = None,
+    users: list[MagicMock] | None = None,
+    messages: list[MagicMock] | None = None,
+) -> MagicMock:
+    result = MagicMock()
+    result.dialogs = dialogs
+    result.chats = chats or []
+    result.users = users or []
+    result.messages = messages or []
+    return result
+
+
 @pytest.mark.asyncio
 async def test_list_unread_messages_basic() -> None:
     """list_unread_messages returns grouped unread messages with correct structure."""
-    dialog = _make_dialog_mock(
-        chat_id=123,
-        name="Alice",
-        unread_count=2,
-        is_user=True,
-        read_inbox_max_id=10,
-    )
+    conn = _make_db()
+    _seed_synced(conn, 123)
+
+    raw_dialog = _fake_raw_dialog(123, unread_count=2, read_inbox_max_id=10)
+    user = _fake_user(123, "Alice")
 
     msg1 = _make_msg_mock(msg_id=11, text="Hi", timestamp=1700000001.0)
     msg2 = _make_msg_mock(msg_id=12, text="Hey", timestamp=1700000002.0)
 
-    async def _fake_iter_dialogs(*args: Any, **kwargs: Any):  # type: ignore[misc]
-        yield dialog
+    async def _fake_call(request: Any, *a: Any, **kw: Any) -> MagicMock:
+        return _make_peer_dialogs_result([raw_dialog], users=[user])
 
-    async def _fake_iter_messages(chat_id: int, *, min_id: int, limit: int):  # type: ignore[misc]
+    async def _fake_iter_messages(chat_id: int, *, min_id: int, limit: int) -> Any:  # type: ignore[misc]
         yield msg1
         yield msg2
 
     client = MagicMock()
-    client.iter_dialogs = _fake_iter_dialogs
+    client.get_input_entity = AsyncMock(return_value=MagicMock())
+    client.side_effect = _fake_call
     client.iter_messages = _fake_iter_messages
 
-    server = make_server(client=client)
+    server = make_server(conn, client)
     result = await server._dispatch({
         "method": "list_unread_messages",
         "scope": "personal",
@@ -1578,13 +1661,10 @@ async def test_list_unread_messages_basic() -> None:
 
 @pytest.mark.asyncio
 async def test_list_unread_messages_empty() -> None:
-    """list_unread_messages returns empty groups when no unread dialogs exist."""
-    async def _no_dialogs(*args: Any, **kwargs: Any):  # type: ignore[misc]
-        return
-        yield  # make it an async generator
-
+    """list_unread_messages returns empty groups when no synced dialogs exist."""
+    # No rows in synced_dialogs → short-circuits without calling GetPeerDialogsRequest
     client = MagicMock()
-    client.iter_dialogs = _no_dialogs
+    client.get_input_entity = AsyncMock(return_value=MagicMock())
 
     server = make_server(client=client)
     result = await server._dispatch({
@@ -1601,33 +1681,30 @@ async def test_list_unread_messages_empty() -> None:
 @pytest.mark.asyncio
 async def test_list_unread_messages_filters_channels_in_personal_scope() -> None:
     """list_unread_messages scope=personal filters out channels."""
-    channel_dialog = _make_dialog_mock(
-        chat_id=200,
-        name="News Channel",
-        unread_count=5,
-        is_channel=True,
-    )
-    user_dialog = _make_dialog_mock(
-        chat_id=201,
-        name="Bob",
-        unread_count=3,
-        is_user=True,
-        read_inbox_max_id=0,
-    )
+    conn = _make_db()
+    _seed_synced(conn, 200, 201)
 
-    async def _fake_iter_dialogs(*args: Any, **kwargs: Any):  # type: ignore[misc]
-        yield channel_dialog
-        yield user_dialog
+    channel = _fake_channel(200, broadcast=True, title="News Channel")
+    user = _fake_user(201, "Bob")
 
-    async def _no_messages(*args: Any, **kwargs: Any):  # type: ignore[misc]
+    raw_channel = _fake_raw_dialog(200, unread_count=5)
+    raw_user = _fake_raw_dialog(201, unread_count=3)
+
+    async def _fake_call(request: Any, *a: Any, **kw: Any) -> MagicMock:
+        return _make_peer_dialogs_result(
+            [raw_channel, raw_user], chats=[channel], users=[user]
+        )
+
+    async def _no_messages(*args: Any, **kwargs: Any) -> Any:  # type: ignore[misc]
         return
         yield
 
     client = MagicMock()
-    client.iter_dialogs = _fake_iter_dialogs
+    client.get_input_entity = AsyncMock(return_value=MagicMock())
+    client.side_effect = _fake_call
     client.iter_messages = _no_messages
 
-    server = make_server(client=client)
+    server = make_server(conn, client)
     result = await server._dispatch({
         "method": "list_unread_messages",
         "scope": "personal",
@@ -1644,35 +1721,30 @@ async def test_list_unread_messages_filters_channels_in_personal_scope() -> None
 @pytest.mark.asyncio
 async def test_list_unread_messages_filters_large_groups_in_personal_scope() -> None:
     """list_unread_messages scope=personal filters out groups with participants > threshold."""
-    large_group = _make_dialog_mock(
-        chat_id=300,
-        name="Big Group",
-        unread_count=10,
-        is_group=True,
-        participants_count=500,
-    )
-    small_group = _make_dialog_mock(
-        chat_id=301,
-        name="Small Group",
-        unread_count=2,
-        is_group=True,
-        participants_count=10,
-        read_inbox_max_id=0,
-    )
+    conn = _make_db()
+    _seed_synced(conn, 300, 301)
 
-    async def _fake_iter_dialogs(*args: Any, **kwargs: Any):  # type: ignore[misc]
-        yield large_group
-        yield small_group
+    large_group = _fake_channel(300, megagroup=True, participants_count=500, title="Big Group")
+    small_group = _fake_channel(301, megagroup=True, participants_count=10, title="Small Group")
 
-    async def _no_messages(*args: Any, **kwargs: Any):  # type: ignore[misc]
+    raw_large = _fake_raw_dialog(300, unread_count=10)
+    raw_small = _fake_raw_dialog(301, unread_count=2)
+
+    async def _fake_call(request: Any, *a: Any, **kw: Any) -> MagicMock:
+        return _make_peer_dialogs_result(
+            [raw_large, raw_small], chats=[large_group, small_group]
+        )
+
+    async def _no_messages(*args: Any, **kwargs: Any) -> Any:  # type: ignore[misc]
         return
         yield
 
     client = MagicMock()
-    client.iter_dialogs = _fake_iter_dialogs
+    client.get_input_entity = AsyncMock(return_value=MagicMock())
+    client.side_effect = _fake_call
     client.iter_messages = _no_messages
 
-    server = make_server(client=client)
+    server = make_server(conn, client)
     result = await server._dispatch({
         "method": "list_unread_messages",
         "scope": "personal",
@@ -1689,26 +1761,25 @@ async def test_list_unread_messages_filters_large_groups_in_personal_scope() -> 
 @pytest.mark.asyncio
 async def test_list_unread_messages_budget_limits_messages() -> None:
     """list_unread_messages applies budget allocation proportionally."""
-    # Two chats, each with 50 unread, total budget = 10 → each gets ~5
-    dialogs = [
-        _make_dialog_mock(chat_id=400 + i, name=f"Chat{i}", unread_count=50, is_user=True, read_inbox_max_id=0)
-        for i in range(2)
-    ]
+    conn = _make_db()
+    _seed_synced(conn, 400, 401)
 
-    # Each chat has 50 messages available
-    async def _fake_iter_dialogs(*args: Any, **kwargs: Any):  # type: ignore[misc]
-        for d in dialogs:
-            yield d
+    users = [_fake_user(400 + i, f"Chat{i}") for i in range(2)]
+    raw_dialogs = [_fake_raw_dialog(400 + i, unread_count=50) for i in range(2)]
 
-    async def _fake_iter_messages(chat_id: int, *, min_id: int, limit: int):  # type: ignore[misc]
+    async def _fake_call(request: Any, *a: Any, **kw: Any) -> MagicMock:
+        return _make_peer_dialogs_result(raw_dialogs, users=users)
+
+    async def _fake_iter_messages(chat_id: int, *, min_id: int, limit: int) -> Any:  # type: ignore[misc]
         for i in range(limit):  # respect the limit
             yield _make_msg_mock(msg_id=i + 1, text=f"msg {i}")
 
     client = MagicMock()
-    client.iter_dialogs = _fake_iter_dialogs
+    client.get_input_entity = AsyncMock(return_value=MagicMock())
+    client.side_effect = _fake_call
     client.iter_messages = _fake_iter_messages
 
-    server = make_server(client=client)
+    server = make_server(conn, client)
     result = await server._dispatch({
         "method": "list_unread_messages",
         "scope": "personal",
@@ -1724,17 +1795,52 @@ async def test_list_unread_messages_budget_limits_messages() -> None:
 @pytest.mark.asyncio
 async def test_list_unread_messages_dispatch_routing() -> None:
     """_dispatch routes 'list_unread_messages' to _list_unread_messages handler."""
-    async def _no_dialogs(*args: Any, **kwargs: Any):  # type: ignore[misc]
-        return
-        yield
-
+    # Empty synced_dialogs — short-circuits cleanly with ok=True
     client = MagicMock()
-    client.iter_dialogs = _no_dialogs
+    client.get_input_entity = AsyncMock(return_value=MagicMock())
 
     server = make_server(client=client)
     result = await server._dispatch({"method": "list_unread_messages"})
 
     assert result["ok"] is True, f"list_unread_messages dispatch failed: {result}"
+
+
+@pytest.mark.asyncio
+async def test_list_unread_messages_skips_non_synced() -> None:
+    """list_unread_messages only considers synced dialogs; unsynced ones never appear."""
+    conn = _make_db()
+    # Only dialog 500 is synced; dialog 501 is not in synced_dialogs at all
+    _seed_synced(conn, 500)
+
+    user_500 = _fake_user(500, "Synced User")
+    # The mock response includes BOTH 500 and 501 — but 501 was never requested
+    # because it's not in synced_dialogs, so the SQL filter drives exclusion.
+    raw_500 = _fake_raw_dialog(500, unread_count=3)
+
+    async def _fake_call(request: Any, *a: Any, **kw: Any) -> MagicMock:
+        return _make_peer_dialogs_result([raw_500], users=[user_500])
+
+    async def _no_messages(*args: Any, **kwargs: Any) -> Any:  # type: ignore[misc]
+        return
+        yield
+
+    client = MagicMock()
+    client.get_input_entity = AsyncMock(return_value=MagicMock())
+    client.side_effect = _fake_call
+    client.iter_messages = _no_messages
+
+    server = make_server(conn, client)
+    result = await server._dispatch({
+        "method": "list_unread_messages",
+        "scope": "personal",
+        "limit": 100,
+        "group_size_threshold": 100,
+    })
+
+    assert result["ok"] is True
+    ids = [g["dialog_id"] for g in result["data"]["groups"]]
+    assert 500 in ids
+    assert 501 not in ids, "Non-synced dialog must not appear in unread results"
 
 
 # ---------------------------------------------------------------------------
