@@ -13,7 +13,7 @@ Error handling:
 - Both raise DaemonNotRunningError with an actionable "mcp-telegram sync" message.
 - EOF on read (daemon closed connection unexpectedly): DaemonNotRunningError.
 
-DaemonConnection provides convenience methods for all fourteen daemon API methods.
+DaemonConnection provides convenience methods for all fifteen daemon API methods.
 list_messages and search_messages accept an optional dialog: str | None
 parameter to support name-based resolution by the daemon.
 """

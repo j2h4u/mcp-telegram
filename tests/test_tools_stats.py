@@ -66,9 +66,10 @@ async def test_get_dialog_stats_formats_sections() -> None:
     conn = _make_conn({"ok": True, "data": data})
 
     with _patch_daemon(conn):
-        result = await get_dialog_stats(GetDialogStats(dialog="Chat Foo"))
+        content = await get_dialog_stats(GetDialogStats(dialog="Chat Foo"))
 
-    text = result.content[0].text  # type: ignore[index]
+    # @mcp_tool wraps the runner and returns tool_result.content (list of TextContent)
+    text = content[0].text  # type: ignore[index]
     assert "Top Reactions" in text
     assert "Top Mentions" in text
     assert "Top Hashtags" in text
@@ -77,7 +78,6 @@ async def test_get_dialog_stats_formats_sections() -> None:
     assert "count=3" in text
     assert "count=5" in text
     assert "Channel A" in text
-    assert result.result_count == 8  # 2+2+2+2
 
 
 @pytest.mark.asyncio
@@ -90,9 +90,9 @@ async def test_get_dialog_stats_not_synced_error() -> None:
     })
 
     with _patch_daemon(conn):
-        result = await get_dialog_stats(GetDialogStats(dialog="Unknown Chat"))
+        content = await get_dialog_stats(GetDialogStats(dialog="Unknown Chat"))
 
-    text = result.content[0].text  # type: ignore[index]
+    text = content[0].text  # type: ignore[index]
     assert "MarkDialogForSync" in text
 
 
@@ -111,11 +111,10 @@ async def test_get_dialog_stats_empty_sections() -> None:
     })
 
     with _patch_daemon(conn):
-        result = await get_dialog_stats(GetDialogStats(dialog="Empty Chat"))
+        content = await get_dialog_stats(GetDialogStats(dialog="Empty Chat"))
 
-    text = result.content[0].text  # type: ignore[index]
+    text = content[0].text  # type: ignore[index]
     assert text.count("(none)") == 4
-    assert result.result_count == 0
 
 
 @pytest.mark.asyncio
@@ -128,7 +127,7 @@ async def test_get_dialog_stats_daemon_not_running() -> None:
         yield  # noqa: unreachable
 
     with patch("mcp_telegram.tools.stats.daemon_connection", _raise_not_running):
-        result = await get_dialog_stats(GetDialogStats(dialog="Any Chat"))
+        content = await get_dialog_stats(GetDialogStats(dialog="Any Chat"))
 
-    text = result.content[0].text  # type: ignore[index]
+    text = content[0].text  # type: ignore[index]
     assert "mcp-telegram sync" in text or "not running" in text.lower()
