@@ -3845,5 +3845,179 @@ def test_reaction_analytics_most_reacted_messages() -> None:
 #   Criterion: when reaction_names_map is removed from MessageLike protocol in models.py
 # - Remove reaction_names_map infrastructure in models.py/formatter.py
 #   Criterion: when on-demand Telethon path is fully migrated to daemon-only reads
+
+
+# ---------------------------------------------------------------------------
+# _get_dialog_stats (260416-frw)
+# ---------------------------------------------------------------------------
+
+
+def _make_db_for_dialog_stats() -> sqlite3.Connection:
+    """Return in-memory DB with all tables needed by _get_dialog_stats."""
+    conn = _make_db_with_normalized_tables()
+    return conn
+
+
+@pytest.mark.asyncio
+async def test_get_dialog_stats_synced_returns_aggregated() -> None:
+    """_get_dialog_stats with synced dialog returns aggregated reactions/mentions/hashtags/forwards."""
+    conn = _make_db_for_dialog_stats()
+    _insert_synced_dialog(conn, 1, status="synced")
+    _insert_message(conn, 1, 1)
+    _insert_message(conn, 1, 2)
+    _insert_message(conn, 1, 3)
+
+    # Reactions: thumbsup appears on msg1 (3) and msg2 (1) = total 4; heart on msg1 = 2
+    conn.execute(
+        "INSERT INTO message_reactions (dialog_id, message_id, emoji, count) VALUES (?, ?, ?, ?)",
+        (1, 1, "👍", 3),
+    )
+    conn.execute(
+        "INSERT INTO message_reactions (dialog_id, message_id, emoji, count) VALUES (?, ?, ?, ?)",
+        (1, 2, "👍", 1),
+    )
+    conn.execute(
+        "INSERT INTO message_reactions (dialog_id, message_id, emoji, count) VALUES (?, ?, ?, ?)",
+        (1, 1, "❤️", 2),
+    )
+
+    # Mentions: @alice once
+    conn.execute(
+        "INSERT INTO message_entities (dialog_id, message_id, offset, length, type, value) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (1, 1, 0, 6, "mention", "@alice"),
+    )
+
+    # Hashtags: #python twice, #rust once
+    conn.execute(
+        "INSERT INTO message_entities (dialog_id, message_id, offset, length, type, value) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (1, 1, 10, 7, "hashtag", "#python"),
+    )
+    conn.execute(
+        "INSERT INTO message_entities (dialog_id, message_id, offset, length, type, value) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (1, 2, 0, 7, "hashtag", "#python"),
+    )
+    conn.execute(
+        "INSERT INTO message_entities (dialog_id, message_id, offset, length, type, value) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (1, 3, 0, 5, "hashtag", "#rust"),
+    )
+
+    # Forwards: Channel A twice, Channel B once
+    conn.execute(
+        "INSERT INTO message_forwards (dialog_id, message_id, fwd_from_peer_id, fwd_from_name) "
+        "VALUES (?, ?, ?, ?)",
+        (1, 1, 100, "Channel A"),
+    )
+    conn.execute(
+        "INSERT INTO message_forwards (dialog_id, message_id, fwd_from_peer_id, fwd_from_name) "
+        "VALUES (?, ?, ?, ?)",
+        (1, 2, 100, "Channel A"),
+    )
+    conn.execute(
+        "INSERT INTO message_forwards (dialog_id, message_id, fwd_from_peer_id, fwd_from_name) "
+        "VALUES (?, ?, ?, ?)",
+        (1, 3, 200, "Channel B"),
+    )
+    conn.commit()
+
+    server = make_server(conn)
+    result = await server._get_dialog_stats({"dialog_id": 1, "limit": 5})
+
+    assert result["ok"] is True, f"Expected ok=True, got {result}"
+    data = result["data"]
+    assert data["dialog_id"] == 1
+
+    # Reactions sorted by total DESC: 👍 total=4, ❤️ total=2
+    reactions = data["top_reactions"]
+    assert len(reactions) == 2
+    assert reactions[0]["emoji"] == "👍"
+    assert reactions[0]["count"] == 4
+    assert reactions[1]["emoji"] == "❤️"
+
+    # Mentions: @alice count=1
+    mentions = data["top_mentions"]
+    assert len(mentions) == 1
+    assert mentions[0]["value"] == "@alice"
+    assert mentions[0]["count"] == 1
+
+    # Hashtags: #python first (count=2)
+    hashtags = data["top_hashtags"]
+    assert hashtags[0]["value"] == "#python"
+    assert hashtags[0]["count"] == 2
+
+    # Forwards: Channel A first (count=2)
+    forwards = data["top_forwards"]
+    assert forwards[0]["peer_id"] == 100
+    assert forwards[0]["name"] == "Channel A"
+    assert forwards[0]["count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_get_dialog_stats_not_synced_returns_error() -> None:
+    """_get_dialog_stats with no synced row returns not_synced error referencing MarkDialogForSync."""
+    server = make_server()
+    result = await server._get_dialog_stats({"dialog_id": 999})
+
+    assert result["ok"] is False
+    assert result["error"] == "not_synced"
+    assert "MarkDialogForSync" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_get_dialog_stats_empty_synced() -> None:
+    """_get_dialog_stats with synced but empty dialog returns ok=True with all lists empty."""
+    conn = _make_db_for_dialog_stats()
+    _insert_synced_dialog(conn, 1, status="synced")
+    server = make_server(conn)
+
+    result = await server._get_dialog_stats({"dialog_id": 1})
+
+    assert result["ok"] is True
+    data = result["data"]
+    assert data["top_reactions"] == []
+    assert data["top_mentions"] == []
+    assert data["top_hashtags"] == []
+    assert data["top_forwards"] == []
+
+
+@pytest.mark.asyncio
+async def test_get_dialog_stats_access_lost_allowed() -> None:
+    """_get_dialog_stats allows access_lost status — archived analytics remain useful."""
+    conn = _make_db_for_dialog_stats()
+    _insert_synced_dialog(conn, 1, status="access_lost")
+    _insert_message(conn, 1, 1)
+    conn.execute(
+        "INSERT INTO message_reactions (dialog_id, message_id, emoji, count) VALUES (?, ?, ?, ?)",
+        (1, 1, "👍", 5),
+    )
+    conn.commit()
+
+    server = make_server(conn)
+    result = await server._get_dialog_stats({"dialog_id": 1})
+
+    assert result["ok"] is True
+    assert result["data"]["top_reactions"][0]["emoji"] == "👍"
+
+
+@pytest.mark.asyncio
+async def test_get_dialog_stats_resolves_fuzzy_dialog_name() -> None:
+    """_get_dialog_stats resolves fuzzy dialog name to dialog_id via get_entity."""
+    conn = _make_db_for_dialog_stats()
+    _insert_synced_dialog(conn, 1, status="synced")
+
+    entity = MagicMock()
+    entity.id = 1
+    client = MagicMock()
+    client.get_entity = AsyncMock(return_value=entity)
+
+    server = make_server(conn, client)
+    result = await server._get_dialog_stats({"dialog": "Chat Foo"})
+
+    assert result["ok"] is True
+    assert result["data"]["dialog_id"] == 1
+    client.get_entity.assert_called_once_with("Chat Foo")
 # - Simplify _format_reactions to only handle count-only display path
 #   Criterion: same as above
