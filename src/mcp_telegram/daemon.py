@@ -42,6 +42,8 @@ from typing import Any
 
 from telethon import utils as telethon_utils  # type: ignore[import-untyped]
 from telethon.errors.rpcerrorlist import FloodWaitError  # type: ignore[import-untyped]
+from telethon.tl.functions.messages import GetPeerDialogsRequest  # type: ignore[import-untyped]
+from telethon.tl.types import InputDialogPeer  # type: ignore[import-untyped]
 
 from .daemon_api import DaemonAPIServer, get_daemon_socket_path
 from .delta_sync import DeltaSyncWorker, run_access_probe_loop
@@ -155,9 +157,6 @@ async def _initialize_read_positions(
     so a live MessageRead event that arrives during the bootstrap window
     cannot be overwritten by a stale bootstrap reply.
     """
-    from telethon.tl.functions.messages import GetPeerDialogsRequest  # type: ignore[import-untyped]
-    from telethon.tl.types import InputDialogPeer  # type: ignore[import-untyped]
-
     rows = conn.execute(_SELECT_NULL_READ_POSITIONS_SQL).fetchall()
     if not rows:
         logger.info("initialize_read_positions — no NULL rows, skipping")
@@ -165,7 +164,7 @@ async def _initialize_read_positions(
 
     dialog_ids = [row[0] for row in rows]
     filled = 0
-    BATCH = 15  # 10-20 range, avoids the burst FloodWait that broke 260416-ifp
+    BATCH = 15  # noqa: N806 — kept uppercase to match plan spec; 10-20 range avoids burst FloodWait
 
     for i in range(0, len(dialog_ids), BATCH):
         if shutdown_event.is_set():
