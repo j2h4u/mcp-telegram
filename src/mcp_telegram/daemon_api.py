@@ -47,10 +47,9 @@ from telethon.tl.functions.messages import (  # type: ignore[import-untyped]
     GetCommonChatsRequest,
     GetDialogFiltersRequest,
     GetForumTopicsRequest,
-    GetPeerDialogsRequest,
 )
 from telethon.tl.functions.users import GetFullUserRequest  # type: ignore[import-untyped]
-from telethon.tl.types import Channel, Chat, InputDialogPeer  # type: ignore[import-untyped]
+from telethon.tl.types import Channel, Chat  # type: ignore[import-untyped]
 from telethon import utils as telethon_utils  # type: ignore[import-untyped]
 
 
@@ -244,13 +243,6 @@ _GET_ACCESS_LOST_ALERTS_SQL = (
     "SELECT dialog_id, access_lost_at "
     "FROM synced_dialogs WHERE status = 'access_lost' AND access_lost_at > ?"
 )
-
-_SELECT_ACTIVE_SYNCED_DIALOGS_SQL = (
-    "SELECT dialog_id FROM synced_dialogs "
-    "WHERE status != 'access_lost'"
-)
-
-_UNREAD_DIALOGS_BATCH_SIZE = 100
 
 # Dialog stats SQL (get_dialog_stats)
 _GET_DIALOG_TOP_REACTIONS_SQL = (
@@ -449,27 +441,6 @@ def _classify_dialog_for_unread(dialog: object) -> str:
         return "group"
     if getattr(dialog, "is_channel", False):
         return "channel"
-    return "group"
-
-
-def _classify_entity_for_unread(entity: object | None) -> str:
-    """Classify a raw User/Chat/Channel entity into category string.
-
-    Returns one of: "user", "bot", "group", "channel".
-    Used when working with raw MTProto Dialog objects (GetPeerDialogsRequest)
-    rather than the high-level Telethon Dialog wrapper.
-    """
-    if entity is None:
-        return "group"  # conservative default
-    # User (has first_name, no megagroup/broadcast flags)
-    if hasattr(entity, "first_name"):
-        return "bot" if getattr(entity, "bot", False) else "user"
-    # Channel vs megagroup (Telethon Channel class covers both)
-    if getattr(entity, "broadcast", False):
-        return "channel"
-    if getattr(entity, "megagroup", False):
-        return "group"
-    # Small Chat
     return "group"
 
 
@@ -1817,90 +1788,40 @@ class DaemonAPIServer:
     async def _collect_unread_dialogs(
         self, scope: str, group_size_threshold: int
     ) -> tuple[list[dict], dict[int, int]]:
-        """Collect unread dialogs via GetPeerDialogsRequest against synced_dialogs.
-
-        Only dialogs in synced_dialogs (status != 'access_lost') are considered.
-        This is O(synced_dialogs / 100) round-trips vs O(total_dialogs) for
-        iter_dialogs, reducing latency from ~25s to <2s.
-        """
+        """Iterate Telegram dialogs, return those with unread_count > 0."""
         unread_dialogs: list[dict] = []
         unread_counts: dict[int, int] = {}
 
-        cursor = self._conn.execute(_SELECT_ACTIVE_SYNCED_DIALOGS_SQL)
-        dialog_ids = [row[0] for row in cursor.fetchall()]
-
-        if not dialog_ids:
-            return unread_dialogs, unread_counts
-
-        # Resolve input peers, skipping any not in Telethon session cache
-        input_peers: list = []
-        for did in dialog_ids:
-            try:
-                peer = await self._client.get_input_entity(did)
-            except Exception:
-                logger.warning(
-                    "unread_get_input_entity_failed dialog_id=%d", did, exc_info=True
-                )
+        async for dialog in self._client.iter_dialogs(archived=None, ignore_pinned=False):
+            unread_count = getattr(dialog, "unread_count", 0)
+            if unread_count == 0:
                 continue
-            input_peers.append(InputDialogPeer(peer=peer))
+            chat_id = getattr(dialog, "id", None)
+            if not isinstance(chat_id, int):
+                continue
 
-        # Batch requests (Telegram limit: ~100 peers per call)
-        for i in range(0, len(input_peers), _UNREAD_DIALOGS_BATCH_SIZE):
-            batch = input_peers[i : i + _UNREAD_DIALOGS_BATCH_SIZE]
-            result = await self._client(GetPeerDialogsRequest(peers=batch))
+            category = _classify_dialog_for_unread(dialog)
+            entity = getattr(dialog, "entity", None)
+            participants_count = (
+                getattr(entity, "participants_count", None) if entity is not None else None
+            )
 
-            # Build lookup dicts from response
-            entity_by_id: dict[int, object] = {}
-            for entity in list(result.chats) + list(result.users):
-                entity_by_id[telethon_utils.get_peer_id(entity)] = entity
+            if not self._should_include_unread_dialog(
+                category, scope, participants_count, group_size_threshold,
+            ):
+                continue
 
-            msg_by_id: dict[int, object] = {}
-            for msg in result.messages:
-                msg_id = getattr(msg, "id", None)
-                if msg_id is not None:
-                    msg_by_id[msg_id] = msg
-
-            for d in result.dialogs:
-                unread_count = getattr(d, "unread_count", 0)
-                if unread_count == 0:
-                    continue
-
-                chat_id = telethon_utils.get_peer_id(d.peer)
-                entity = entity_by_id.get(chat_id)
-                category = _classify_entity_for_unread(entity)
-                participants_count = (
-                    getattr(entity, "participants_count", None)
-                    if entity is not None
-                    else None
-                )
-
-                if not self._should_include_unread_dialog(
-                    category, scope, participants_count, group_size_threshold
-                ):
-                    continue
-
-                # Resolve display name from entity
-                display_name = (
-                    telethon_utils.get_display_name(entity)
-                    if entity is not None
-                    else None
-                ) or f"Chat {chat_id}"
-
-                # Resolve date from top message
-                top_message_id = getattr(d, "top_message", None)
-                top_msg = msg_by_id.get(top_message_id) if top_message_id else None
-                date = getattr(top_msg, "date", None)
-
-                unread_dialogs.append({
-                    "chat_id": chat_id,
-                    "display_name": display_name,
-                    "unread_count": unread_count,
-                    "unread_mentions_count": getattr(d, "unread_mentions_count", 0),
-                    "category": category,
-                    "date": date,
-                    "read_inbox_max_id": getattr(d, "read_inbox_max_id", 0),
-                })
-                unread_counts[chat_id] = unread_count
+            raw_dialog = getattr(dialog, "dialog", None)
+            unread_dialogs.append({
+                "chat_id": chat_id,
+                "display_name": getattr(dialog, "name", f"Chat {chat_id}"),
+                "unread_count": unread_count,
+                "unread_mentions_count": getattr(dialog, "unread_mentions_count", 0),
+                "category": category,
+                "date": getattr(dialog, "date", None),
+                "read_inbox_max_id": getattr(raw_dialog, "read_inbox_max_id", 0) if raw_dialog else 0,
+            })
+            unread_counts[chat_id] = unread_count
 
         return unread_dialogs, unread_counts
 
