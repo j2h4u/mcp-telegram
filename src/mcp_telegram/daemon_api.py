@@ -454,28 +454,6 @@ def _build_list_messages_query(
 
 
 # ---------------------------------------------------------------------------
-# Dialog category helper (used by _list_unread_messages)
-# ---------------------------------------------------------------------------
-
-
-def _classify_dialog_for_unread(dialog: object) -> str:
-    """Classify a Telethon Dialog object into category string.
-
-    Returns one of: "user", "bot", "group", "channel".
-    """
-    if getattr(dialog, "is_user", False):
-        entity = getattr(dialog, "entity", None)
-        if entity is not None and getattr(entity, "bot", False):
-            return "bot"
-        return "user"
-    if getattr(dialog, "is_group", False):
-        return "group"
-    if getattr(dialog, "is_channel", False):
-        return "channel"
-    return "group"
-
-
-# ---------------------------------------------------------------------------
 # Usage stats query
 # ---------------------------------------------------------------------------
 
