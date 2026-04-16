@@ -1839,7 +1839,7 @@ class DaemonAPIServer:
                 peer = await self._client.get_input_entity(did)
             except Exception:
                 logger.warning(
-                    "unread_get_input_entity_failed dialog_id=%d", did, exc_info=True,
+                    "unread_get_input_entity_failed dialog_id=%d", did, exc_info=True
                 )
                 continue
             input_peers.append(InputDialogPeer(peer=peer))
@@ -1875,7 +1875,7 @@ class DaemonAPIServer:
                 )
 
                 if not self._should_include_unread_dialog(
-                    category, scope, participants_count, group_size_threshold,
+                    category, scope, participants_count, group_size_threshold
                 ):
                     continue
 
