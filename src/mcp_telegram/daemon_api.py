@@ -267,6 +267,37 @@ _GET_DIALOG_TOP_FORWARDS_SQL = (
     "GROUP BY fwd_from_peer_id, fwd_from_name ORDER BY cnt DESC LIMIT ?"
 )
 
+# Unread SQL — zero Telegram API calls (Plan 38-02)
+# Single grouped query: scalar subquery provides per-dialog unread_count in ONE round trip,
+# replacing the N+1 COUNT(*)-per-dialog pattern. Uses idx_synced_dialogs_status_read_position
+# (schema v8) for the outer filter and messages PK (dialog_id, message_id) for range scans.
+_COLLECT_UNREAD_DIALOGS_WITH_COUNTS_SQL = (
+    "SELECT sd.dialog_id, sd.read_inbox_max_id, sd.last_event_at, "
+    "COALESCE(e.name, CAST(sd.dialog_id AS TEXT)) AS display_name, "
+    "COALESCE(e.type, 'Unknown') AS entity_type, "
+    "(SELECT COUNT(*) FROM messages m "
+    " WHERE m.dialog_id = sd.dialog_id "
+    "   AND m.message_id > sd.read_inbox_max_id "
+    "   AND m.is_deleted = 0) AS unread_count "
+    "FROM synced_dialogs sd "
+    "LEFT JOIN entities e ON e.id = sd.dialog_id "
+    "WHERE sd.status = 'synced' "
+    "AND sd.read_inbox_max_id IS NOT NULL"
+)
+_FETCH_UNREAD_MESSAGES_SQL = (
+    "SELECT message_id, sent_at, text, sender_id, sender_first_name "
+    "FROM messages "
+    "WHERE dialog_id = ? AND message_id > ? AND is_deleted = 0 "
+    "ORDER BY message_id DESC LIMIT ?"
+)
+_GET_READ_POSITION_SQL = (
+    "SELECT read_inbox_max_id FROM synced_dialogs WHERE dialog_id = ?"
+)
+_COUNT_BOOTSTRAP_PENDING_SQL = (
+    "SELECT COUNT(*) FROM synced_dialogs "
+    "WHERE status = 'synced' AND read_inbox_max_id IS NULL"
+)
+
 # Entity / telemetry SQL
 _UPSERT_ENTITY_SQL = (
     "INSERT OR REPLACE INTO entities "
@@ -805,24 +836,17 @@ class DaemonAPIServer:
     async def _resolve_unread_position(
         self, dialog_id: int, unread_after_id: int | None,
     ) -> int | None:
-        """Resolve read position via Telegram GetPeerDialogsRequest."""
+        """Resolve unread cutoff from synced_dialogs. Zero Telegram API calls.
+
+        If unread_after_id is explicitly supplied, it wins.
+        Otherwise reads synced_dialogs.read_inbox_max_id — if NULL or row
+        missing, returns None (dialog not bootstrapped; caller skips unread filter).
+        """
         if unread_after_id is not None:
             return unread_after_id
-        try:
-            from telethon.tl.functions.messages import (  # type: ignore[import-untyped]
-                GetPeerDialogsRequest,
-            )
-            peer_result = await self._client(GetPeerDialogsRequest(peers=[dialog_id]))
-            if peer_result.dialogs:
-                read_max_id = getattr(peer_result.dialogs[0], "read_inbox_max_id", 0)
-                return int(read_max_id) if read_max_id else None
-        except Exception:
-            logger.warning(
-                "list_messages_unread_resolve_failed dialog_id=%d — "
-                "unread filter dropped, returning all messages%s",
-                dialog_id, _rid(),
-                exc_info=True,
-            )
+        row = self._conn.execute(_GET_READ_POSITION_SQL, (dialog_id,)).fetchone()
+        if row and row[0] is not None:
+            return int(row[0])
         return None
 
     def _list_messages_from_db(
@@ -1763,7 +1787,9 @@ class DaemonAPIServer:
         allocation = allocate_message_budget_proportional(unread_counts, limit)
         groups = await self._fetch_unread_groups(unread_dialogs, allocation)
 
-        return {"ok": True, "data": {"groups": groups}}
+        pending_row = self._conn.execute(_COUNT_BOOTSTRAP_PENDING_SQL).fetchone()
+        bootstrap_pending = int(pending_row[0]) if pending_row else 0
+        return {"ok": True, "data": {"groups": groups, "bootstrap_pending": bootstrap_pending}}
 
     @staticmethod
     def _should_include_unread_dialog(
@@ -1788,40 +1814,46 @@ class DaemonAPIServer:
     async def _collect_unread_dialogs(
         self, scope: str, group_size_threshold: int
     ) -> tuple[list[dict], dict[int, int]]:
-        """Iterate Telegram dialogs, return those with unread_count > 0."""
+        """Return unread dialog entries from sync.db. Zero Telegram API calls.
+
+        Uses a single grouped query (_COLLECT_UNREAD_DIALOGS_WITH_COUNTS_SQL)
+        — scalar subquery computes unread_count per dialog in one round trip.
+        Excludes dialogs with read_inbox_max_id IS NULL (not yet bootstrapped).
+        See _list_unread_messages for bootstrap_pending visibility.
+        """
+        rows = self._conn.execute(_COLLECT_UNREAD_DIALOGS_WITH_COUNTS_SQL).fetchall()
+
+        _ENTITY_TYPE_TO_CATEGORY: dict[str, str] = {
+            "User": "user", "Bot": "bot", "Channel": "channel",
+        }
+
         unread_dialogs: list[dict] = []
         unread_counts: dict[int, int] = {}
 
-        async for dialog in self._client.iter_dialogs(archived=None, ignore_pinned=False):
-            unread_count = getattr(dialog, "unread_count", 0)
+        for row in rows:
+            dialog_id, read_max, last_event_at, display_name, entity_type, unread_count = row
             if unread_count == 0:
                 continue
-            chat_id = getattr(dialog, "id", None)
-            if not isinstance(chat_id, int):
-                continue
 
-            category = _classify_dialog_for_unread(dialog)
-            entity = getattr(dialog, "entity", None)
-            participants_count = (
-                getattr(entity, "participants_count", None) if entity is not None else None
-            )
+            category = _ENTITY_TYPE_TO_CATEGORY.get(entity_type, "group")
 
+            # participants_count=None — not stored in sync.db.
+            # _should_include_unread_dialog treats None as permissive for groups.
             if not self._should_include_unread_dialog(
-                category, scope, participants_count, group_size_threshold,
+                category, scope, None, group_size_threshold,
             ):
                 continue
 
-            raw_dialog = getattr(dialog, "dialog", None)
             unread_dialogs.append({
-                "chat_id": chat_id,
-                "display_name": getattr(dialog, "name", f"Chat {chat_id}"),
-                "unread_count": unread_count,
-                "unread_mentions_count": getattr(dialog, "unread_mentions_count", 0),
+                "chat_id": dialog_id,
+                "display_name": display_name,
+                "unread_count": int(unread_count),
+                "unread_mentions_count": 0,  # not stored — see RESEARCH open question #1
                 "category": category,
-                "date": getattr(dialog, "date", None),
-                "read_inbox_max_id": getattr(raw_dialog, "read_inbox_max_id", 0) if raw_dialog else 0,
+                "date": last_event_at,  # int unix ts (NOT datetime — see _rank_unread_entries)
+                "read_inbox_max_id": read_max,
             })
-            unread_counts[chat_id] = unread_count
+            unread_counts[dialog_id] = int(unread_count)
 
         return unread_dialogs, unread_counts
 
@@ -1833,19 +1865,19 @@ class DaemonAPIServer:
                 "unread_mentions_count": entry["unread_mentions_count"],
                 "category": entry["category"],
             })
-        entries.sort(
-            key=lambda e: (e["tier"], -(e["date"].timestamp() if e["date"] else 0))
-        )
+        # date is last_event_at (int unix timestamp) after Plan 38-02 rewrite — not datetime
+        entries.sort(key=lambda e: (e["tier"], -(e["date"] if e["date"] else 0)))
 
     async def _fetch_unread_groups(
         self, entries: list[dict], allocation: dict[int, int]
     ) -> list[dict]:
-        """Fetch messages for each unread dialog up to its budget allocation."""
+        """Fetch unread message bodies from sync.db. Zero Telegram API calls."""
         groups: list[dict] = []
         for entry in entries:
-            budget = allocation.get(entry["chat_id"], 0)
+            chat_id = entry["chat_id"]
+            budget = allocation.get(chat_id, 0)
             group: dict = {
-                "dialog_id": entry["chat_id"],
+                "dialog_id": chat_id,
                 "display_name": entry["display_name"],
                 "tier": entry["tier"],
                 "category": entry["category"],
@@ -1857,31 +1889,21 @@ class DaemonAPIServer:
                 if entry["category"] == "channel":
                     groups.append(group)
                 continue
-            try:
-                async for msg in self._client.iter_messages(
-                    entry["chat_id"],
-                    min_id=entry["read_inbox_max_id"],
-                    limit=budget,
-                ):
-                    d = self._msg_to_dict(msg)
-                    group["messages"].append({
-                        "message_id": d["message_id"],
-                        "sent_at": d["sent_at"],
-                        "text": d["text"],
-                        "sender_id": d["sender_id"],
-                        "sender_first_name": d["sender_first_name"],
-                    })
-            except Exception as exc:
-                fetched = len(group["messages"])
-                logger.warning(
-                    "unread_fetch_failed chat_id=%r fetched=%d expected=%d error=%s",
-                    entry["chat_id"],
-                    fetched,
-                    entry["unread_count"],
-                    exc,
-                    exc_info=True,
-                )
-                group["is_truncated"] = True
+
+            rows = self._conn.execute(
+                _FETCH_UNREAD_MESSAGES_SQL,
+                (chat_id, entry["read_inbox_max_id"], budget),
+            ).fetchall()
+            group["messages"] = [
+                {
+                    "message_id": r[0],
+                    "sent_at": r[1],
+                    "text": r[2],
+                    "sender_id": r[3],
+                    "sender_first_name": r[4],
+                }
+                for r in rows
+            ]
             groups.append(group)
 
         return groups
