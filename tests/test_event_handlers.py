@@ -776,11 +776,11 @@ def test_register_adds_handlers(
     sync_db: sqlite3.Connection,
     shutdown_event: asyncio.Event,
 ) -> None:
-    """register() calls client.add_event_handler exactly 3 times."""
+    """register() calls client.add_event_handler exactly 4 times (3 original + on_message_read)."""
     manager = make_manager(mock_client, sync_db, shutdown_event)
     manager.register()
 
-    assert mock_client.add_event_handler.call_count == 3
+    assert mock_client.add_event_handler.call_count == 4
 
 
 def test_unregister_removes_handlers(
@@ -788,12 +788,12 @@ def test_unregister_removes_handlers(
     sync_db: sqlite3.Connection,
     shutdown_event: asyncio.Event,
 ) -> None:
-    """unregister() calls client.remove_event_handler exactly 3 times."""
+    """unregister() calls client.remove_event_handler exactly 4 times (3 original + on_message_read)."""
     manager = make_manager(mock_client, sync_db, shutdown_event)
     manager.register()
     manager.unregister()
 
-    assert mock_client.remove_event_handler.call_count == 3
+    assert mock_client.remove_event_handler.call_count == 4
 
 
 def test_refresh_synced_dialogs(

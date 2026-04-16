@@ -64,6 +64,12 @@ _UPDATE_LAST_EVENT_SQL = (
     "UPDATE synced_dialogs SET last_event_at=? WHERE dialog_id=?"
 )
 
+_UPDATE_READ_POSITION_SQL = (
+    "UPDATE synced_dialogs "
+    "SET read_inbox_max_id = MAX(COALESCE(read_inbox_max_id, 0), ?) "
+    "WHERE dialog_id = ?"
+)
+
 _SELECT_SYNCED_DIALOGS_SQL = (
     "SELECT dialog_id FROM synced_dialogs WHERE status != 'access_lost'"
 )
@@ -118,12 +124,14 @@ class EventHandlerManager:
         self._client.add_event_handler(self.on_new_message, events.NewMessage)
         self._client.add_event_handler(self.on_message_edited, events.MessageEdited)
         self._client.add_event_handler(self.on_message_deleted, events.MessageDeleted)
+        self._client.add_event_handler(self.on_message_read, events.MessageRead(inbox=True))
 
     def unregister(self) -> None:
-        """Remove all three handlers from the client (graceful shutdown)."""
+        """Remove all four handlers from the client (graceful shutdown)."""
         self._client.remove_event_handler(self.on_new_message)
         self._client.remove_event_handler(self.on_message_edited)
         self._client.remove_event_handler(self.on_message_deleted)
+        self._client.remove_event_handler(self.on_message_read)
 
     def refresh_synced_dialogs(self) -> None:
         """Refresh the in-memory synced-dialog set from the DB.
@@ -316,6 +324,42 @@ class EventHandlerManager:
             )
         except Exception:
             logger.exception("event_delete_failed dialog_id=%s", dialog_id)
+
+    async def on_message_read(self, event: Any) -> None:
+        """Handle MessageRead(inbox=True): update read_inbox_max_id monotonically.
+
+        Monotonic write via `MAX(COALESCE(existing, 0), incoming)` ensures the
+        stored value never regresses — protects against out-of-order events and
+        against bootstrap races where an older GetPeerDialogsRequest response
+        could otherwise overwrite a newer live event.
+
+        event.chat_id may be None for PM read events on some Telethon versions
+        (UpdateReadHistoryInbox normalization differs). We log a WARNING so PM
+        read-position staleness is observable; actual state will be re-resolved
+        on next daemon restart via _initialize_read_positions.
+        """
+        dialog_id = event.chat_id
+
+        if dialog_id is None:
+            logger.warning(
+                "event_read_null_chat_id max_id=%s — PM read position not tracked "
+                "in real-time (MTProto/Telethon normalization); bootstrap on next "
+                "daemon restart will reconcile",
+                getattr(event, "max_id", "?"),
+            )
+            return
+
+        if dialog_id not in self._synced_dialog_ids:
+            return
+
+        try:
+            now = int(time.time())
+            with self._conn:
+                self._conn.execute(_UPDATE_READ_POSITION_SQL, (event.max_id, dialog_id))
+                self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
+            logger.info("event_read dialog_id=%d max_id=%d", dialog_id, event.max_id)
+        except Exception:
+            logger.exception("event_read_failed dialog_id=%s", dialog_id)
 
     # ------------------------------------------------------------------
     # DM gap scan
