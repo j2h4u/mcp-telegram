@@ -425,4 +425,5 @@ async def sync_main() -> None:
                 logger.warning("background_task_shutdown_error name=%s", task.get_name(), exc_info=True)
         _background_tasks.clear()
         await client.disconnect()
+        conn.close()
         logger.info("sync-daemon stopped")
