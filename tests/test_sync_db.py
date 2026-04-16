@@ -1011,6 +1011,67 @@ def test_v7_backfill_reactions_from_json(tmp_path: Path) -> None:
         conn.close()
 
 
+# ---------------------------------------------------------------------------
+# Schema v8: read_inbox_max_id column + supporting index
+# ---------------------------------------------------------------------------
+
+
+def test_schema_version_is_8(tmp_sync_db_path: Path) -> None:
+    """After ensure_sync_schema(), MAX(version) in schema_version is 8."""
+    ensure_sync_schema(tmp_sync_db_path)
+    conn = _open_sync_db(tmp_sync_db_path)
+    try:
+        row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
+        assert row is not None and row[0] == 8, f"Expected version 8, got {row[0]}"
+    finally:
+        conn.close()
+
+
+def test_synced_dialogs_has_read_inbox_max_id_column(tmp_sync_db_path: Path) -> None:
+    """After ensure_sync_schema(), synced_dialogs has read_inbox_max_id INTEGER column."""
+    ensure_sync_schema(tmp_sync_db_path)
+    conn = _open_sync_db(tmp_sync_db_path)
+    try:
+        cols = {row[1]: row[2] for row in conn.execute("PRAGMA table_info(synced_dialogs)").fetchall()}
+        assert "read_inbox_max_id" in cols, f"Column missing; got {sorted(cols)}"
+        assert cols["read_inbox_max_id"] == "INTEGER", f"Wrong type: {cols['read_inbox_max_id']}"
+    finally:
+        conn.close()
+
+
+def test_read_inbox_max_id_defaults_to_null_for_existing_rows(tmp_sync_db_path: Path) -> None:
+    """New rows in synced_dialogs have read_inbox_max_id = NULL (no default, not 0)."""
+    ensure_sync_schema(tmp_sync_db_path)
+    conn = _open_sync_db(tmp_sync_db_path)
+    try:
+        conn.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')", (12345,))
+        conn.commit()
+        row = conn.execute("SELECT read_inbox_max_id FROM synced_dialogs WHERE dialog_id = ?", (12345,)).fetchone()
+        assert row is not None
+        assert row[0] is None, f"Expected NULL, got {row[0]!r}"
+    finally:
+        conn.close()
+
+
+def test_v8_index_on_status_and_read_position_exists(tmp_sync_db_path: Path) -> None:
+    """Opencode review flagged perf concern: SQL unread scan needs an index on
+    (status, read_inbox_max_id) for efficient filtering.
+    """
+    ensure_sync_schema(tmp_sync_db_path)
+    conn = _open_sync_db(tmp_sync_db_path)
+    try:
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' "
+            "AND tbl_name='synced_dialogs'"
+        ).fetchall()
+        index_names = {row[0] for row in rows}
+        assert "idx_synced_dialogs_status_read_position" in index_names, (
+            f"Index missing; found: {sorted(index_names)}"
+        )
+    finally:
+        conn.close()
+
+
 def test_message_entities_pk_allows_same_offset_different_type(tmp_sync_db_path: Path) -> None:
     """5-column PK: two entities at the same (offset, length) but different type both stored."""
     ensure_sync_schema(tmp_sync_db_path)
