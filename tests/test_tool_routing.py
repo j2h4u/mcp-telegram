@@ -803,6 +803,134 @@ async def test_list_unread_messages_passes_params():
     assert call_kwargs["group_size_threshold"] == 50
 
 
+async def test_list_unread_messages_empty_with_bootstrap_pending():
+    """UAT gap 1: when groups=[] AND bootstrap_pending>0 the tool MUST NOT return the
+    misleading 'No unread messages' canned text — it must surface the pending count
+    so the caller knows results are incomplete, not genuinely empty.
+    """
+    conn = _make_daemon_conn({
+        "ok": True,
+        "data": {"groups": [], "bootstrap_pending": 329},
+    })
+    with _patch_daemon(conn):
+        result = await list_unread_messages(ListUnreadMessages())
+
+    text = result[0].text
+    # Must mention the pending count
+    assert "329" in text, f"bootstrap_pending count missing from response: {text!r}"
+    # Must mention the bootstrap state in some recognisable form
+    lowered = text.lower()
+    assert (
+        "bootstrap" in lowered
+        or "pending" in lowered
+        or "seeded" in lowered
+        or "bootstrapping" in lowered
+    ), f"bootstrap state not surfaced in response: {text!r}"
+
+
+async def test_list_unread_messages_empty_with_no_bootstrap_pending():
+    """When groups=[] AND bootstrap_pending=0 the existing 'no unread' canned text
+    is correct (truly empty inbox). Asserts no behaviour regression.
+    """
+    conn = _make_daemon_conn({
+        "ok": True,
+        "data": {"groups": [], "bootstrap_pending": 0},
+    })
+    with _patch_daemon(conn):
+        result = await list_unread_messages(ListUnreadMessages())
+
+    lowered = result[0].text.lower()
+    assert "no unread" in lowered or "непрочитанных" in lowered
+
+
+async def test_list_unread_messages_non_empty_with_bootstrap_pending():
+    """UAT gap 2: when groups is non-empty AND bootstrap_pending>0 the formatted
+    output MUST include a one-line note disclosing the pending count, so the
+    caller knows the result is partial coverage.
+    """
+    conn = _make_daemon_conn({
+        "ok": True,
+        "data": {
+            "groups": [
+                {
+                    "dialog_id": 123,
+                    "display_name": "Alice",
+                    "tier": 30,
+                    "category": "user",
+                    "unread_count": 1,
+                    "unread_mentions_count": 0,
+                    "messages": [
+                        {
+                            "message_id": 1,
+                            "sent_at": 1700000000,
+                            "text": "Hello there",
+                            "sender_id": 123,
+                            "sender_first_name": "Alice",
+                        },
+                    ],
+                },
+            ],
+            "bootstrap_pending": 5,
+        },
+    })
+    with _patch_daemon(conn):
+        result = await list_unread_messages(ListUnreadMessages())
+
+    text = result[0].text
+    # Existing format preserved
+    assert "Alice" in text
+    assert "Hello there" in text
+    # New disclosure
+    assert "5" in text, f"bootstrap_pending count missing from non-empty response: {text!r}"
+    lowered = text.lower()
+    assert (
+        "bootstrap" in lowered
+        or "pending" in lowered
+        or "incomplete" in lowered
+    ), f"bootstrap_pending note missing from non-empty response: {text!r}"
+
+
+async def test_list_unread_messages_non_empty_with_no_bootstrap_pending():
+    """When groups is non-empty AND bootstrap_pending=0 the formatted output MUST
+    NOT include a spurious bootstrap note. Asserts no false-positive disclosure.
+    """
+    conn = _make_daemon_conn({
+        "ok": True,
+        "data": {
+            "groups": [
+                {
+                    "dialog_id": 123,
+                    "display_name": "Alice",
+                    "tier": 30,
+                    "category": "user",
+                    "unread_count": 1,
+                    "unread_mentions_count": 0,
+                    "messages": [
+                        {
+                            "message_id": 1,
+                            "sent_at": 1700000000,
+                            "text": "Hello there",
+                            "sender_id": 123,
+                            "sender_first_name": "Alice",
+                        },
+                    ],
+                },
+            ],
+            "bootstrap_pending": 0,
+        },
+    })
+    with _patch_daemon(conn):
+        result = await list_unread_messages(ListUnreadMessages())
+
+    text = result[0].text
+    assert "Alice" in text
+    assert "Hello there" in text
+    # No spurious disclosure when coverage is complete
+    assert "bootstrap_pending" not in text, (
+        f"unexpected bootstrap_pending disclosure when count=0: {text!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # GetUsageStats — daemon routing
 # ---------------------------------------------------------------------------
