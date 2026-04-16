@@ -1866,8 +1866,7 @@ class DaemonAPIServer:
                 "messages": [],
             }
             if budget == 0:
-                if entry["category"] == "channel":
-                    groups.append(group)
+                groups.append(group)  # always include summary even with no messages
                 continue
 
             rows = self._conn.execute(
