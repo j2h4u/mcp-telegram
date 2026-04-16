@@ -143,7 +143,7 @@ async def test_list_dialogs_via_daemon():
                 {
                     "id": 123,
                     "name": "Alice",
-                    "type": "user",
+                    "type": "User",
                     "last_message_at": "2024-01-15 10:00",
                     "unread_count": 2,
                     "sync_status": "synced",
@@ -151,7 +151,7 @@ async def test_list_dialogs_via_daemon():
                 {
                     "id": 456,
                     "name": "Dev Chat",
-                    "type": "group",
+                    "type": "Group",
                     "last_message_at": "2024-01-15 12:00",
                     "unread_count": 0,
                     "sync_status": "not_synced",
@@ -178,7 +178,7 @@ async def test_list_dialogs_sync_status_in_output():
         "data": {
             "dialogs": [
                 {
-                    "id": 1, "name": "Chat", "type": "user",
+                    "id": 1, "name": "Chat", "type": "User",
                     "last_message_at": "2024-01-01 00:00",
                     "unread_count": 0, "sync_status": "synced",
                 },
@@ -208,7 +208,7 @@ async def test_list_dialogs_upserts_entities_via_daemon():
         "data": {
             "dialogs": [
                 {
-                    "id": 100, "name": "TestChat", "type": "group",
+                    "id": 100, "name": "TestChat", "type": "Group",
                     "last_message_at": "2024-01-01", "unread_count": 0,
                     "sync_status": "synced",
                 },
@@ -235,7 +235,7 @@ async def test_list_dialogs_upserts_entities_via_daemon():
     assert len(entities) == 1
     assert entities[0]["id"] == 100
     assert entities[0]["name"] == "TestChat"
-    assert entities[0]["type"] == "group"
+    assert entities[0]["type"] == "Group"
 
 
 # ---------------------------------------------------------------------------

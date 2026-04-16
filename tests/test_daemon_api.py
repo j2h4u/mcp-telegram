@@ -2086,6 +2086,22 @@ async def test_resolve_entity_fuzzy_candidates() -> None:
     assert result["data"]["result"] in ("resolved", "candidates")
 
 
+@pytest.mark.asyncio
+async def test_resolve_entity_pascalcase_type_forward_compat() -> None:
+    """resolve_entity finds entities written with PascalCase type (new vocabulary)."""
+    conn = _make_db_with_entities()
+    import time as _time
+
+    now = int(_time.time())
+    _insert_entity(conn, 201, entity_type="User", name="Carlos New", name_normalized="carlos new", updated_at=now)
+
+    server = make_server(conn)
+    result = await server._dispatch({"method": "resolve_entity", "query": "Carlos New"})
+    assert result["ok"] is True
+    assert result["data"]["result"] == "resolved"
+    assert result["data"]["entity_id"] == 201
+
+
 # ---------------------------------------------------------------------------
 # dispatch routing for new methods (Plan 33-01)
 # ---------------------------------------------------------------------------

@@ -499,9 +499,10 @@ class FullSyncWorker:
                 first = getattr(entity, "first_name", None) or ""
                 last = getattr(entity, "last_name", None) or ""
                 name: str | None = f"{first} {last}".strip() or None
+                entity_type_str = "Bot" if getattr(entity, "bot", False) else "User"
                 self._conn.execute(
                     UPSERT_ENTITY_SQL,
-                    (dialog.id, "user", name, getattr(entity, "username", None), latinize(name) if name else None, now),
+                    (dialog.id, entity_type_str, name, getattr(entity, "username", None), latinize(name) if name else None, now),
                 )
         except FloodWaitError as exc:
             wait_seconds = getattr(exc, "seconds", 60)

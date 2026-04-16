@@ -463,10 +463,42 @@ async def test_dm_bootstrap_populates_entities(
         (40001,),
     ).fetchone()
     assert row is not None, "entities row must be written for the enrolled user"
-    assert row[1] == "user"
+    assert row[1] == "User"
     assert row[2] == "Ivan Zakazov"
     assert row[3] == "ivan_z"
     assert row[4] == "ivan zakazov"  # latinize("Ivan Zakazov")
+
+
+@pytest.mark.asyncio
+async def test_dm_bootstrap_populates_entities_bot(
+    mock_client: MagicMock,
+    sync_db: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """bootstrap_dms() writes type='Bot' for a user entity with bot=True."""
+    from telethon.tl import types  # type: ignore[import-untyped]
+
+    user = MagicMock(spec=types.User)
+    user.first_name = "BotFather"
+    user.last_name = None
+    user.username = "BotFather"
+    user.bot = True
+    dialog = SimpleNamespace(entity=user, id=40099)
+
+    async def _iter_dialogs():  # noqa: ANN202
+        yield dialog
+
+    mock_client.iter_dialogs = _iter_dialogs
+
+    worker = make_worker(mock_client, sync_db, shutdown_event)
+    await worker.bootstrap_dms()
+
+    row = sync_db.execute(
+        "SELECT type FROM entities WHERE id=?",
+        (40099,),
+    ).fetchone()
+    assert row is not None
+    assert row[0] == "Bot"
 
 
 @pytest.mark.asyncio

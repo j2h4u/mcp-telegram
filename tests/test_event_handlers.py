@@ -264,7 +264,7 @@ async def test_auto_enroll_writes_entity_when_sender_available(
         (dialog_id,),
     ).fetchone()
     assert row is not None, "entity must be written when sender is available"
-    assert row[1] == "user"
+    assert row[1] == "User"
     assert row[2] == "Ivan Zakazov"
     assert row[3] == "ivan_z"
     assert row[4] == "ivan zakazov"
