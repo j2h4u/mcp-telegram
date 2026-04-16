@@ -915,3 +915,200 @@ async def test_backfill_total_messages_returns_early_when_shutdown_during_flood_
         filled = await _backfill_total_messages(client, conn, shutdown_event)
 
     assert filled == 0, "No rows filled when shutdown fires during FloodWait"
+
+
+# ---------------------------------------------------------------------------
+# _initialize_read_positions — bootstrap task tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_initialize_read_positions_fills_null_rows(tmp_path):
+    """Given a synced dialog with NULL read_inbox_max_id, bootstrap fills it from API."""
+    import sqlite3
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    from mcp_telegram.sync_db import _apply_migrations
+    from mcp_telegram.daemon import _initialize_read_positions
+
+    conn = sqlite3.connect(":memory:")
+    _apply_migrations(conn)
+    conn.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, read_inbox_max_id) VALUES (?, 'synced', NULL)",
+        (1001,),
+    )
+    conn.commit()
+
+    shutdown_event = asyncio.Event()
+
+    client = MagicMock()
+    client.get_input_entity = AsyncMock(return_value=SimpleNamespace())
+
+    fake_dialog = SimpleNamespace(peer=SimpleNamespace(), read_inbox_max_id=42)
+    fake_response = SimpleNamespace(dialogs=[fake_dialog])
+    client.side_effect = AsyncMock(return_value=fake_response)
+
+    with patch("mcp_telegram.daemon.telethon_utils.get_peer_id", return_value=1001):
+        filled = await _initialize_read_positions(client, conn, shutdown_event)
+
+    assert filled == 1
+    row = conn.execute(
+        "SELECT read_inbox_max_id FROM synced_dialogs WHERE dialog_id = ?", (1001,),
+    ).fetchone()
+    assert row[0] == 42
+
+
+@pytest.mark.asyncio
+async def test_initialize_read_positions_is_monotonic_vs_live_event(tmp_path):
+    """Review-mandated: if a live MessageRead event has already updated the row
+    to a higher value before bootstrap arrives, bootstrap MUST NOT regress it.
+    """
+    import sqlite3
+    from mcp_telegram.sync_db import _apply_migrations
+    from mcp_telegram.daemon import _initialize_read_positions, _UPDATE_READ_POSITION_SQL
+
+    conn = sqlite3.connect(":memory:")
+    _apply_migrations(conn)
+    # Simulate a dialog with a high value already set by a live event.
+    conn.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, read_inbox_max_id) VALUES (?, 'synced', ?)",
+        (1001, 100),
+    )
+    conn.commit()
+
+    # Apply the same monotonic UPDATE SQL that bootstrap uses, with a lower value (42 < 100).
+    # This verifies MAX(COALESCE(existing, 0), incoming) never regresses.
+    conn.execute(_UPDATE_READ_POSITION_SQL, (42, 1001))
+    conn.commit()
+
+    row = conn.execute(
+        "SELECT read_inbox_max_id FROM synced_dialogs WHERE dialog_id = ?", (1001,),
+    ).fetchone()
+    assert row[0] == 100, f"Expected 100 (monotonic), got {row[0]} (bootstrap regressed!)"
+
+
+@pytest.mark.asyncio
+async def test_initialize_read_positions_skips_when_no_null_rows(tmp_path):
+    """Given no NULL rows (all already bootstrapped), returns 0 without calling client."""
+    import sqlite3
+    from mcp_telegram.sync_db import _apply_migrations
+    from mcp_telegram.daemon import _initialize_read_positions
+
+    conn = sqlite3.connect(":memory:")
+    _apply_migrations(conn)
+    conn.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, read_inbox_max_id) VALUES (?, 'synced', ?)",
+        (1001, 5),
+    )
+    conn.commit()
+
+    shutdown_event = asyncio.Event()
+    client = MagicMock()
+    client.get_input_entity = AsyncMock()
+
+    filled = await _initialize_read_positions(client, conn, shutdown_event)
+    assert filled == 0
+    client.get_input_entity.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_initialize_read_positions_returns_early_when_shutdown_during_flood_wait(tmp_path):
+    """shutdown_event set during FloodWait sleep → function returns early with filled=0."""
+    import sqlite3
+    import inspect
+    from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
+    from unittest.mock import patch
+    from mcp_telegram.sync_db import _apply_migrations
+    from mcp_telegram.daemon import _initialize_read_positions
+
+    conn = sqlite3.connect(":memory:")
+    _apply_migrations(conn)
+    conn.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, read_inbox_max_id) VALUES (?, 'synced', NULL)",
+        (1001,),
+    )
+    conn.commit()
+
+    shutdown_event = asyncio.Event()
+    err = FloodWaitError(request=None)
+    err.seconds = 30
+
+    client = MagicMock()
+    client.get_input_entity = AsyncMock(side_effect=err)
+
+    async def _mock_wait_for(coro, timeout):
+        if inspect.iscoroutine(coro):
+            coro.close()
+        shutdown_event.set()
+
+    with patch("mcp_telegram.daemon.asyncio.wait_for", side_effect=_mock_wait_for):
+        filled = await _initialize_read_positions(client, conn, shutdown_event)
+
+    assert filled == 0
+
+
+@pytest.mark.asyncio
+async def test_initialize_read_positions_excludes_non_synced_status(tmp_path):
+    """Only rows with status='synced' AND read_inbox_max_id IS NULL are backfilled."""
+    import sqlite3
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    from mcp_telegram.sync_db import _apply_migrations
+    from mcp_telegram.daemon import _initialize_read_positions
+
+    conn = sqlite3.connect(":memory:")
+    _apply_migrations(conn)
+    conn.executemany(
+        "INSERT INTO synced_dialogs (dialog_id, status, read_inbox_max_id) VALUES (?, ?, NULL)",
+        [
+            (1001, "synced"),
+            (1002, "access_lost"),
+            (1003, "not_synced"),
+        ],
+    )
+    conn.commit()
+
+    shutdown_event = asyncio.Event()
+
+    called_with: list[int] = []
+
+    async def _fake_get_input_entity(did):
+        called_with.append(did)
+        return SimpleNamespace()
+
+    client = MagicMock()
+    client.get_input_entity = _fake_get_input_entity
+
+    fake_dialog = SimpleNamespace(peer=SimpleNamespace(), read_inbox_max_id=42)
+    client.side_effect = AsyncMock(return_value=SimpleNamespace(dialogs=[fake_dialog]))
+
+    with patch("mcp_telegram.daemon.telethon_utils.get_peer_id", return_value=1001):
+        await _initialize_read_positions(client, conn, shutdown_event)
+
+    assert called_with == [1001], (
+        f"Only the 'synced' dialog should be queried; got {called_with}"
+    )
+
+
+def test_sync_main_registers_read_positions_bootstrap_after_handler(tmp_path):
+    """Review-mandated startup ordering: _initialize_read_positions task must be
+    created AFTER handler_manager.register() in the sync_main() source code, so
+    no MessageRead events are dropped during the bootstrap window.
+    """
+    import inspect
+    from mcp_telegram import daemon as daemon_mod
+
+    src = inspect.getsource(daemon_mod.sync_main)
+    # Find both anchor lines and verify ordering
+    register_idx = src.find("handler_manager.register()")
+    if register_idx == -1:
+        register_idx = src.find(".register()")  # broader match
+    bootstrap_idx = src.find('name="initialize_read_positions"')
+
+    assert register_idx != -1, "handler .register() call not found in sync_main"
+    assert bootstrap_idx != -1, "initialize_read_positions task not found in sync_main"
+    assert register_idx < bootstrap_idx, (
+        f"Startup order wrong: handler register at {register_idx}, "
+        f"bootstrap at {bootstrap_idx} — handler must register FIRST to avoid "
+        f"missed MessageRead events during bootstrap window."
+    )
