@@ -58,13 +58,14 @@ def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.
     conn.execute(
         """
         CREATE TABLE synced_dialogs (
-            dialog_id       INTEGER PRIMARY KEY,
-            status          TEXT NOT NULL DEFAULT 'not_synced',
-            last_synced_at  INTEGER,
-            last_event_at   INTEGER,
-            sync_progress   INTEGER DEFAULT 0,
-            total_messages  INTEGER,
-            access_lost_at  INTEGER
+            dialog_id           INTEGER PRIMARY KEY,
+            status              TEXT NOT NULL DEFAULT 'not_synced',
+            last_synced_at      INTEGER,
+            last_event_at       INTEGER,
+            sync_progress       INTEGER DEFAULT 0,
+            total_messages      INTEGER,
+            access_lost_at      INTEGER,
+            read_inbox_max_id   INTEGER
         )
         """
     )
@@ -1528,32 +1529,84 @@ def _make_msg_mock(
     return msg
 
 
+# ---------------------------------------------------------------------------
+# Seeding helpers for Plan 38-02 SQL-only unread tests
+# ---------------------------------------------------------------------------
+
+
+def _seed_unread_state(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    read_inbox_max_id: int | None,
+    *,
+    entity_type: str = "User",
+    entity_name: str = "Alice",
+    last_event_at: int | None = None,
+    status: str = "synced",
+) -> None:
+    """Seed synced_dialogs (with read_inbox_max_id + status) + entities row."""
+    import time as _time
+    conn.execute(
+        "INSERT OR IGNORE INTO synced_dialogs (dialog_id, status) VALUES (?, ?)",
+        (dialog_id, status),
+    )
+    conn.execute(
+        "UPDATE synced_dialogs SET status=?, read_inbox_max_id=?, last_event_at=? "
+        "WHERE dialog_id=?",
+        (status, read_inbox_max_id, last_event_at or int(_time.time()), dialog_id),
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO entities (id, type, name, username, name_normalized, updated_at) "
+        "VALUES (?, ?, ?, NULL, NULL, ?)",
+        (dialog_id, entity_type, entity_name, int(_time.time())),
+    )
+    conn.commit()
+
+
+def _seed_message(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    message_id: int,
+    *,
+    text: str = "hello",
+    sender_id: int = 99,
+    sender_first_name: str = "Alice",
+    sent_at: int | None = None,
+    is_deleted: int = 0,
+) -> None:
+    """Seed a single message row."""
+    import time as _time
+    conn.execute(
+        "INSERT INTO messages "
+        "(dialog_id, message_id, sent_at, text, sender_id, sender_first_name, is_deleted) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            dialog_id, message_id, sent_at or int(_time.time()),
+            text, sender_id, sender_first_name, is_deleted,
+        ),
+    )
+    conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Plan 38-02: SQL-only unread tests (T1-T11)
+# 7 rewrites of original iter_dialogs-based tests + 4 new edge-case tests
+# All assert client was never called (zero Telegram API calls)
+# ---------------------------------------------------------------------------
+
+
 @pytest.mark.asyncio
 async def test_list_unread_messages_basic() -> None:
-    """list_unread_messages returns grouped unread messages with correct structure."""
-    dialog = _make_dialog_mock(
-        chat_id=123,
-        name="Alice",
-        unread_count=2,
-        is_user=True,
-        read_inbox_max_id=10,
-    )
-
-    msg1 = _make_msg_mock(msg_id=11, text="Hi", timestamp=1700000001.0)
-    msg2 = _make_msg_mock(msg_id=12, text="Hey", timestamp=1700000002.0)
-
-    async def _fake_iter_dialogs(*args: Any, **kwargs: Any):  # type: ignore[misc]
-        yield dialog
-
-    async def _fake_iter_messages(chat_id: int, *, min_id: int, limit: int):  # type: ignore[misc]
-        yield msg1
-        yield msg2
+    """list_unread_messages returns grouped unread messages from sync.db (zero API calls)."""
+    conn = _make_db()
+    _seed_unread_state(conn, 1001, read_inbox_max_id=10, entity_type="User", entity_name="Alice")
+    _seed_message(conn, 1001, message_id=11, text="Hi", sender_first_name="Alice")
+    _seed_message(conn, 1001, message_id=12, text="Hey", sender_first_name="Alice")
+    _seed_message(conn, 1001, message_id=13, text="Bye", sender_first_name="Alice")
 
     client = MagicMock()
-    client.iter_dialogs = _fake_iter_dialogs
-    client.iter_messages = _fake_iter_messages
+    server = make_server(conn, client)
 
-    server = make_server(client=client)
     result = await server._dispatch({
         "method": "list_unread_messages",
         "scope": "personal",
@@ -1565,28 +1618,24 @@ async def test_list_unread_messages_basic() -> None:
     groups = result["data"]["groups"]
     assert len(groups) == 1
     group = groups[0]
-    assert group["dialog_id"] == 123
+    assert group["dialog_id"] == 1001
     assert group["display_name"] == "Alice"
     assert group["category"] == "user"
-    assert group["unread_count"] == 2
-    assert len(group["messages"]) == 2
-    assert group["messages"][0]["message_id"] == 11
-    assert group["messages"][0]["text"] == "Hi"
-    assert group["messages"][0]["sender_first_name"] == "Alice"
-    assert isinstance(group["messages"][0]["sent_at"], int)
+    assert group["unread_count"] == 3
+    msgs = group["messages"]
+    assert [m["message_id"] for m in msgs] == [13, 12, 11]  # DESC order
+
+    client.get_input_entity.assert_not_called()
+    client.assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_list_unread_messages_empty() -> None:
-    """list_unread_messages returns empty groups when no unread dialogs exist."""
-    async def _no_dialogs(*args: Any, **kwargs: Any):  # type: ignore[misc]
-        return
-        yield  # make it an async generator
-
+    """list_unread_messages returns empty groups when synced_dialogs is empty."""
+    conn = _make_db()
     client = MagicMock()
-    client.iter_dialogs = _no_dialogs
+    server = make_server(conn, client)
 
-    server = make_server(client=client)
     result = await server._dispatch({
         "method": "list_unread_messages",
         "scope": "personal",
@@ -1596,38 +1645,22 @@ async def test_list_unread_messages_empty() -> None:
 
     assert result["ok"] is True
     assert result["data"]["groups"] == []
+    client.get_input_entity.assert_not_called()
+    client.assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_list_unread_messages_filters_channels_in_personal_scope() -> None:
-    """list_unread_messages scope=personal filters out channels."""
-    channel_dialog = _make_dialog_mock(
-        chat_id=200,
-        name="News Channel",
-        unread_count=5,
-        is_channel=True,
-    )
-    user_dialog = _make_dialog_mock(
-        chat_id=201,
-        name="Bob",
-        unread_count=3,
-        is_user=True,
-        read_inbox_max_id=0,
-    )
-
-    async def _fake_iter_dialogs(*args: Any, **kwargs: Any):  # type: ignore[misc]
-        yield channel_dialog
-        yield user_dialog
-
-    async def _no_messages(*args: Any, **kwargs: Any):  # type: ignore[misc]
-        return
-        yield
+    """scope=personal excludes channels; includes users."""
+    conn = _make_db()
+    _seed_unread_state(conn, 200, read_inbox_max_id=0, entity_type="Channel", entity_name="News")
+    _seed_message(conn, 200, message_id=1)
+    _seed_unread_state(conn, 201, read_inbox_max_id=0, entity_type="User", entity_name="Bob")
+    _seed_message(conn, 201, message_id=1)
 
     client = MagicMock()
-    client.iter_dialogs = _fake_iter_dialogs
-    client.iter_messages = _no_messages
+    server = make_server(conn, client)
 
-    server = make_server(client=client)
     result = await server._dispatch({
         "method": "list_unread_messages",
         "scope": "personal",
@@ -1639,40 +1672,23 @@ async def test_list_unread_messages_filters_channels_in_personal_scope() -> None
     ids = [g["dialog_id"] for g in result["data"]["groups"]]
     assert 200 not in ids, "Channel should be filtered in personal scope"
     assert 201 in ids
+    client.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_list_unread_messages_filters_large_groups_in_personal_scope() -> None:
-    """list_unread_messages scope=personal filters out groups with participants > threshold."""
-    large_group = _make_dialog_mock(
-        chat_id=300,
-        name="Big Group",
-        unread_count=10,
-        is_group=True,
-        participants_count=500,
-    )
-    small_group = _make_dialog_mock(
-        chat_id=301,
-        name="Small Group",
-        unread_count=2,
-        is_group=True,
-        participants_count=10,
-        read_inbox_max_id=0,
-    )
-
-    async def _fake_iter_dialogs(*args: Any, **kwargs: Any):  # type: ignore[misc]
-        yield large_group
-        yield small_group
-
-    async def _no_messages(*args: Any, **kwargs: Any):  # type: ignore[misc]
-        return
-        yield
+async def test_list_unread_messages_includes_groups_in_personal_scope() -> None:
+    """SQL path has no participants_count column; _should_include_unread_dialog
+    with participants_count=None defaults to include groups. This is a documented
+    behaviour change vs the API path which used live participants_count to filter
+    large groups (see RESEARCH.md Pitfall 2).
+    """
+    conn = _make_db()
+    _seed_unread_state(conn, 1001, read_inbox_max_id=10, entity_type="Group", entity_name="BigGroup")
+    _seed_message(conn, 1001, message_id=11)
 
     client = MagicMock()
-    client.iter_dialogs = _fake_iter_dialogs
-    client.iter_messages = _no_messages
+    server = make_server(conn, client)
 
-    server = make_server(client=client)
     result = await server._dispatch({
         "method": "list_unread_messages",
         "scope": "personal",
@@ -1681,60 +1697,191 @@ async def test_list_unread_messages_filters_large_groups_in_personal_scope() -> 
     })
 
     assert result["ok"] is True
-    ids = [g["dialog_id"] for g in result["data"]["groups"]]
-    assert 300 not in ids, "Large group should be filtered in personal scope"
-    assert 301 in ids
+    groups = result["data"]["groups"]
+    assert len(groups) == 1
+    assert groups[0]["category"] == "group"
+    client.assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_list_unread_messages_budget_limits_messages() -> None:
-    """list_unread_messages applies budget allocation proportionally."""
-    # Two chats, each with 50 unread, total budget = 10 → each gets ~5
-    dialogs = [
-        _make_dialog_mock(chat_id=400 + i, name=f"Chat{i}", unread_count=50, is_user=True, read_inbox_max_id=0)
-        for i in range(2)
-    ]
-
-    # Each chat has 50 messages available
-    async def _fake_iter_dialogs(*args: Any, **kwargs: Any):  # type: ignore[misc]
-        for d in dialogs:
-            yield d
-
-    async def _fake_iter_messages(chat_id: int, *, min_id: int, limit: int):  # type: ignore[misc]
-        for i in range(limit):  # respect the limit
-            yield _make_msg_mock(msg_id=i + 1, text=f"msg {i}")
+    """Budget allocation proportionally caps total messages returned."""
+    conn = _make_db()
+    # Two users with 50 unread each
+    for dialog_id in [400, 401]:
+        _seed_unread_state(conn, dialog_id, read_inbox_max_id=0, entity_type="User",
+                           entity_name=f"User{dialog_id}")
+        for msg_id in range(1, 51):
+            _seed_message(conn, dialog_id, message_id=msg_id)
 
     client = MagicMock()
-    client.iter_dialogs = _fake_iter_dialogs
-    client.iter_messages = _fake_iter_messages
+    server = make_server(conn, client)
 
-    server = make_server(client=client)
     result = await server._dispatch({
         "method": "list_unread_messages",
         "scope": "personal",
-        "limit": 10,  # small budget to trigger allocation
+        "limit": 10,
         "group_size_threshold": 100,
     })
 
     assert result["ok"] is True
     total_messages = sum(len(g["messages"]) for g in result["data"]["groups"])
     assert total_messages <= 10, f"Budget exceeded: {total_messages} messages returned"
+    client.assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_list_unread_messages_dispatch_routing() -> None:
-    """_dispatch routes 'list_unread_messages' to _list_unread_messages handler."""
-    async def _no_dialogs(*args: Any, **kwargs: Any):  # type: ignore[misc]
-        return
-        yield
-
+    """_dispatch routes 'list_unread_messages' to _list_unread_messages; empty DB → ok=True."""
+    conn = _make_db()
     client = MagicMock()
-    client.iter_dialogs = _no_dialogs
+    server = make_server(conn, client)
 
-    server = make_server(client=client)
     result = await server._dispatch({"method": "list_unread_messages"})
 
     assert result["ok"] is True, f"list_unread_messages dispatch failed: {result}"
+    client.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_list_unread_messages_skips_non_synced_or_null() -> None:
+    """Only status='synced' AND read_inbox_max_id IS NOT NULL dialogs appear in results."""
+    conn = _make_db()
+    _seed_unread_state(conn, 1001, read_inbox_max_id=10, status="synced")
+    _seed_message(conn, 1001, message_id=11)
+    _seed_unread_state(conn, 1002, read_inbox_max_id=10, status="access_lost")
+    _seed_message(conn, 1002, message_id=11)
+    _seed_unread_state(conn, 1003, read_inbox_max_id=None, status="synced")
+    _seed_message(conn, 1003, message_id=11)
+
+    client = MagicMock()
+    server = make_server(conn, client)
+
+    result = await server._dispatch({
+        "method": "list_unread_messages",
+        "scope": "personal",
+        "limit": 100,
+        "group_size_threshold": 100,
+    })
+
+    groups = result["data"]["groups"]
+    assert len(groups) == 1
+    assert groups[0]["dialog_id"] == 1001
+    client.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_list_unread_messages_read_inbox_max_id_zero_returns_all() -> None:
+    """read_inbox_max_id=0 is valid 'never read anything' — all messages are unread.
+    Review-mandated test (Codex MEDIUM).
+    """
+    conn = _make_db()
+    _seed_unread_state(conn, 1001, read_inbox_max_id=0)
+    _seed_message(conn, 1001, message_id=1)
+    _seed_message(conn, 1001, message_id=2)
+    _seed_message(conn, 1001, message_id=3)
+
+    client = MagicMock()
+    server = make_server(conn, client)
+
+    result = await server._dispatch({
+        "method": "list_unread_messages",
+        "scope": "personal",
+        "limit": 100,
+        "group_size_threshold": 100,
+    })
+
+    groups = result["data"]["groups"]
+    assert len(groups) == 1
+    assert groups[0]["unread_count"] == 3
+    assert [m["message_id"] for m in groups[0]["messages"]] == [3, 2, 1]
+    client.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_list_unread_messages_excludes_deleted_messages() -> None:
+    """Deleted messages (is_deleted=1) must NOT count as unread or appear in messages.
+    Review-mandated test (Codex MEDIUM).
+    """
+    conn = _make_db()
+    _seed_unread_state(conn, 1001, read_inbox_max_id=10)
+    _seed_message(conn, 1001, message_id=11, is_deleted=0)
+    _seed_message(conn, 1001, message_id=12, is_deleted=1)
+    _seed_message(conn, 1001, message_id=13, is_deleted=0)
+
+    client = MagicMock()
+    server = make_server(conn, client)
+
+    result = await server._dispatch({
+        "method": "list_unread_messages",
+        "scope": "personal",
+        "limit": 100,
+        "group_size_threshold": 100,
+    })
+
+    groups = result["data"]["groups"]
+    assert len(groups) == 1
+    assert groups[0]["unread_count"] == 2
+    returned_ids = [m["message_id"] for m in groups[0]["messages"]]
+    assert 12 not in returned_ids
+    assert sorted(returned_ids) == [11, 13]
+    client.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_list_unread_messages_filter_excludes_ids_below_read_position() -> None:
+    """message_id <= read_inbox_max_id excluded; strict > predicate."""
+    conn = _make_db()
+    _seed_unread_state(conn, 1001, read_inbox_max_id=10)
+    _seed_message(conn, 1001, message_id=8)   # below — excluded
+    _seed_message(conn, 1001, message_id=10)  # equal — excluded (strict >)
+    _seed_message(conn, 1001, message_id=11)  # above — included
+    _seed_message(conn, 1001, message_id=12)  # above — included
+
+    client = MagicMock()
+    server = make_server(conn, client)
+
+    result = await server._dispatch({
+        "method": "list_unread_messages",
+        "scope": "personal",
+        "limit": 100,
+        "group_size_threshold": 100,
+    })
+
+    groups = result["data"]["groups"]
+    assert len(groups) == 1
+    assert groups[0]["unread_count"] == 2
+    assert [m["message_id"] for m in groups[0]["messages"]] == [12, 11]
+    client.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_list_unread_messages_response_reports_bootstrap_pending() -> None:
+    """Response carries bootstrap_pending count so callers detect incomplete coverage.
+    Review-mandated by all 3 reviewers as HIGH priority.
+    """
+    conn = _make_db()
+    _seed_unread_state(conn, 1001, read_inbox_max_id=10)
+    _seed_message(conn, 1001, message_id=11)
+    _seed_unread_state(conn, 1002, read_inbox_max_id=None)
+    _seed_unread_state(conn, 1003, read_inbox_max_id=None)
+
+    client = MagicMock()
+    server = make_server(conn, client)
+
+    result = await server._dispatch({
+        "method": "list_unread_messages",
+        "scope": "personal",
+        "limit": 100,
+        "group_size_threshold": 100,
+    })
+
+    assert result["ok"] is True
+    assert len(result["data"]["groups"]) == 1
+    assert result["data"]["bootstrap_pending"] == 2, (
+        f"Expected bootstrap_pending=2, got {result['data'].get('bootstrap_pending')}"
+    )
+    client.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
