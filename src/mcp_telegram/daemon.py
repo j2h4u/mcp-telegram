@@ -84,24 +84,6 @@ _UPDATE_READ_POSITION_SQL = (
     "WHERE dialog_id = ?"
 )
 
-# Tracked background tasks — cancelled on shutdown
-_background_tasks: set[asyncio.Task] = set()
-
-
-def _create_tracked_task(coro: Any, *, name: str | None = None) -> asyncio.Task:
-    """Create an asyncio task and track it for shutdown cancellation."""
-    task = asyncio.create_task(coro, name=name)
-    _background_tasks.add(task)
-
-    def _on_done(t: asyncio.Task) -> None:
-        _background_tasks.discard(t)
-        exc = t.exception() if not t.cancelled() else None
-        if exc is not None:
-            logger.error("background_task_failed name=%s error=%s", t.get_name(), exc, exc_info=exc)
-
-    task.add_done_callback(_on_done)
-    return task
-
 
 async def _backfill_total_messages(
     client: Any,
@@ -350,6 +332,26 @@ async def sync_main() -> None:
     client = create_client(catch_up=True)
     handler_manager: EventHandlerManager | None = None
     unix_server = None
+
+    # Local task set — scoped to this sync_main() invocation so that multiple
+    # calls within the same process (e.g. in tests) never share stale tasks from
+    # a previous event loop.
+    background_tasks: set[asyncio.Task] = set()
+
+    def _create_tracked_task(coro: Any, *, name: str | None = None) -> asyncio.Task:
+        """Create an asyncio task and track it for shutdown cancellation."""
+        task = asyncio.create_task(coro, name=name)
+        background_tasks.add(task)
+
+        def _on_done(t: asyncio.Task) -> None:
+            background_tasks.discard(t)
+            exc = t.exception() if not t.cancelled() else None
+            if exc is not None:
+                logger.error("background_task_failed name=%s error=%s", t.get_name(), exc, exc_info=exc)
+
+        task.add_done_callback(_on_done)
+        return task
+
     try:
         try:
             await client.connect()
@@ -414,16 +416,16 @@ async def sync_main() -> None:
         if handler_manager is not None:
             handler_manager.unregister()
         # Cancel tracked background tasks
-        for task in _background_tasks:
+        for task in background_tasks:
             task.cancel()
-        for task in list(_background_tasks):
+        for task in list(background_tasks):
             try:
                 await task
             except asyncio.CancelledError:
                 pass  # expected on shutdown; task was cancelled cleanly
             except Exception:
                 logger.warning("background_task_shutdown_error name=%s", task.get_name(), exc_info=True)
-        _background_tasks.clear()
+        background_tasks.clear()
         await client.disconnect()
         conn.close()
         logger.info("sync-daemon stopped")
