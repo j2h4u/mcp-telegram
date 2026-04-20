@@ -4276,3 +4276,247 @@ async def test_get_dialog_stats_resolves_fuzzy_dialog_name() -> None:
     client.get_entity.assert_called_once_with("Chat Foo")
 # - Simplify _format_reactions to only handle count-only display path
 #   Criterion: same as above
+
+
+# ---------------------------------------------------------------------------
+# Phase 39-01: entity-as-SoT for sender rendering
+# Tests for LEFT JOIN entities + COALESCE in all five SELECT constants,
+# structured log counter, and related invariants.
+# ---------------------------------------------------------------------------
+
+
+def _seed_entity_p39(conn: sqlite3.Connection, entity_id: int, name: str, entity_type: str = "User") -> None:
+    conn.execute(
+        "INSERT OR REPLACE INTO entities "
+        "(id, type, name, username, name_normalized, updated_at) "
+        "VALUES (?, ?, ?, NULL, ?, ?)",
+        (entity_id, entity_type, name, name.lower(), 0),
+    )
+
+
+def _seed_message_p39(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    message_id: int,
+    sender_id: int | None,
+    sender_first_name: str | None,
+    text: str = "hi",
+) -> None:
+    conn.execute(
+        "INSERT INTO messages "
+        "(dialog_id, message_id, sent_at, text, sender_id, sender_first_name, is_deleted) "
+        "VALUES (?, ?, ?, ?, ?, ?, 0)",
+        (dialog_id, message_id, 1_700_000_000 + message_id, text, sender_id, sender_first_name),
+    )
+
+
+def _seed_synced_dialog_p39(conn: sqlite3.Connection, dialog_id: int, read_inbox_max_id: int | None = None) -> None:
+    conn.execute(
+        "INSERT OR REPLACE INTO synced_dialogs "
+        "(dialog_id, status, read_inbox_max_id) VALUES (?, 'synced', ?)",
+        (dialog_id, read_inbox_max_id),
+    )
+
+
+# --- Task 1: JOIN + COALESCE behavioral tests ---
+
+
+@pytest.mark.asyncio
+async def test_list_messages_uses_entity_name_when_sender_first_name_is_null() -> None:
+    """DM row with sender_first_name=NULL but entities row yields entities.name."""
+    conn = _make_db()
+    _seed_synced_dialog_p39(conn, dialog_id=555)
+    _seed_entity_p39(conn, entity_id=123, name="Konstantin")
+    _seed_message_p39(conn, dialog_id=555, message_id=1, sender_id=123, sender_first_name=None)
+    conn.commit()
+    server = make_server(conn)
+    resp = await server._list_messages({"dialog_id": 555, "limit": 10})
+    assert resp["ok"] is True
+    assert resp["data"]["messages"][0]["sender_first_name"] == "Konstantin"
+
+
+@pytest.mark.asyncio
+async def test_list_messages_falls_back_to_denormalized_column_when_no_entity() -> None:
+    """No entities row → COALESCE falls back to messages.sender_first_name."""
+    conn = _make_db()
+    _seed_synced_dialog_p39(conn, dialog_id=555)
+    _seed_message_p39(conn, dialog_id=555, message_id=1, sender_id=124, sender_first_name="Old Name")
+    conn.commit()
+    server = make_server(conn)
+    resp = await server._list_messages({"dialog_id": 555, "limit": 10})
+    assert resp["data"]["messages"][0]["sender_first_name"] == "Old Name"
+
+
+@pytest.mark.asyncio
+async def test_list_messages_returns_none_when_both_sources_missing() -> None:
+    """Both entities and sender_first_name NULL → result is None (no crash)."""
+    conn = _make_db()
+    _seed_synced_dialog_p39(conn, dialog_id=555)
+    _seed_message_p39(conn, dialog_id=555, message_id=1, sender_id=125, sender_first_name=None)
+    conn.commit()
+    server = make_server(conn)
+    resp = await server._list_messages({"dialog_id": 555, "limit": 10})
+    assert resp["data"]["messages"][0]["sender_first_name"] is None
+
+
+@pytest.mark.asyncio
+async def test_list_messages_entity_name_wins_over_stale_column() -> None:
+    """entities.name wins over non-NULL but stale sender_first_name."""
+    conn = _make_db()
+    _seed_synced_dialog_p39(conn, dialog_id=555)
+    _seed_entity_p39(conn, entity_id=126, name="New")
+    _seed_message_p39(conn, dialog_id=555, message_id=1, sender_id=126, sender_first_name="Old")
+    conn.commit()
+    server = make_server(conn)
+    resp = await server._list_messages({"dialog_id": 555, "limit": 10})
+    assert resp["data"]["messages"][0]["sender_first_name"] == "New"
+
+
+@pytest.mark.asyncio
+async def test_list_unread_messages_uses_entity_name() -> None:
+    """_FETCH_UNREAD_MESSAGES_SQL: NULL sender_first_name resolved via entities JOIN."""
+    conn = _make_db()
+    _seed_synced_dialog_p39(conn, dialog_id=555, read_inbox_max_id=0)
+    # dialog entity (needed by _COLLECT_UNREAD_DIALOGS_WITH_COUNTS_SQL)
+    _seed_entity_p39(conn, entity_id=555, name="Test Dialog")
+    # sender entity (resolved via _FETCH_UNREAD_MESSAGES_SQL JOIN)
+    _seed_entity_p39(conn, entity_id=123, name="Konstantin")
+    _seed_message_p39(conn, dialog_id=555, message_id=10, sender_id=123, sender_first_name=None)
+    conn.commit()
+    server = make_server(conn)
+    result = await server._dispatch({
+        "method": "list_unread_messages",
+        "scope": "personal",
+        "limit": 100,
+        "group_size_threshold": 100,
+    })
+    assert result["ok"] is True
+    groups = result["data"]["groups"]
+    dialog_group = next((g for g in groups if g["dialog_id"] == 555), None)
+    assert dialog_group is not None
+    assert len(dialog_group["messages"]) == 1
+    assert dialog_group["messages"][0]["sender_first_name"] == "Konstantin"
+
+
+# --- Task 1: SQL invariant tests (MANDATORY, no skip) ---
+
+
+def test_fts_sql_invariants_mandatory() -> None:
+    """MANDATORY — no skip clause. Locks FTS SQL-string contract."""
+    from mcp_telegram import daemon_api as d
+    # _SELECT_FTS_SQL: single-alias case
+    assert "LEFT JOIN entities" in d._SELECT_FTS_SQL, "_SELECT_FTS_SQL missing LEFT JOIN entities"
+    assert "COALESCE(e.name, m.sender_first_name)" in d._SELECT_FTS_SQL, (
+        "_SELECT_FTS_SQL missing COALESCE(e.name, m.sender_first_name)"
+    )
+    # _SELECT_FTS_ALL_SQL: two-alias contract (de for dialog, se for sender)
+    assert "LEFT JOIN entities se ON se.id = m.sender_id" in d._SELECT_FTS_ALL_SQL, (
+        "_SELECT_FTS_ALL_SQL missing LEFT JOIN entities se ON se.id = m.sender_id"
+    )
+    assert "LEFT JOIN entities de ON de.id = f.dialog_id" in d._SELECT_FTS_ALL_SQL, (
+        "_SELECT_FTS_ALL_SQL missing LEFT JOIN entities de ON de.id = f.dialog_id"
+    )
+    # Sender COALESCE uses the se alias (NOT e.name)
+    assert "COALESCE(se.name, m.sender_first_name)" in d._SELECT_FTS_ALL_SQL, (
+        "_SELECT_FTS_ALL_SQL must use COALESCE(se.name, ...) not e.name"
+    )
+
+
+def test_all_sql_constants_contain_entity_join_and_coalesce() -> None:
+    from mcp_telegram import daemon_api as d
+    for name in (
+        "_SELECT_MESSAGES_SQL",
+        "_SELECT_FTS_SQL",
+        "_SELECT_FTS_ALL_SQL",
+        "_FETCH_UNREAD_MESSAGES_SQL",
+        "_LIST_MESSAGES_BASE_SQL",
+    ):
+        sql = getattr(d, name)
+        assert "LEFT JOIN entities" in sql, f"{name} missing LEFT JOIN entities"
+        assert "COALESCE(" in sql, f"{name} missing COALESCE"
+
+
+def test_db_message_columns_preserves_sender_first_name_position() -> None:
+    from mcp_telegram.daemon_api import _DB_MESSAGE_COLUMNS
+    assert _DB_MESSAGE_COLUMNS[4] == "sender_first_name"
+
+
+def test_line_409_filter_has_documenting_comment() -> None:
+    """Documents that sender_name filter intentionally uses the denormalized column."""
+    import pathlib
+    src = pathlib.Path("src/mcp_telegram/daemon_api.py").read_text()
+    assert src.count("Filter uses denormalized column intentionally") == 1
+
+
+# --- Task 2: structured log counter tests ---
+
+
+@pytest.mark.asyncio
+async def test_list_messages_emits_structured_log_on_sync_db_success(caplog: pytest.LogCaptureFixture) -> None:
+    """sync.db success path emits exactly one list_messages rendered log with correct counters."""
+    conn = _make_db()
+    _seed_synced_dialog_p39(conn, dialog_id=555)
+    _seed_entity_p39(conn, entity_id=100, name="Resolved")
+    # Row 1: sender resolved via entity (sender_id=100, entity exists)
+    _seed_message_p39(conn, 555, 1, sender_id=100, sender_first_name="Resolved")
+    # Row 2: sender_id present but no entity row → unresolved_entity_rows
+    _seed_message_p39(conn, 555, 2, sender_id=999, sender_first_name=None)
+    # Row 3: sender_id is NULL → null_sender_rows
+    _seed_message_p39(conn, 555, 3, sender_id=None, sender_first_name=None)
+    conn.commit()
+    server = make_server(conn)
+    caplog.clear()
+    with caplog.at_level("INFO", logger="mcp_telegram.daemon_api"):
+        resp = await server._list_messages({"dialog_id": 555, "limit": 50})
+    assert resp["ok"] is True
+    records = [r for r in caplog.records if r.message == "list_messages rendered"]
+    assert len(records) == 1, f"Expected 1 log record, got: {[r.message for r in caplog.records]}"
+    rec = records[0]
+    assert rec.dialog_id == 555
+    assert rec.rows == 3
+    assert rec.null_sender_rows == 1
+    assert rec.unresolved_entity_rows == 1
+
+
+@pytest.mark.asyncio
+async def test_list_messages_logs_zero_counters_when_empty(caplog: pytest.LogCaptureFixture) -> None:
+    """Empty synced dialog emits log with zero counters."""
+    conn = _make_db()
+    _seed_synced_dialog_p39(conn, dialog_id=777)
+    conn.commit()
+    server = make_server(conn)
+    caplog.clear()
+    with caplog.at_level("INFO", logger="mcp_telegram.daemon_api"):
+        await server._list_messages({"dialog_id": 777, "limit": 50})
+    records = [r for r in caplog.records if r.message == "list_messages rendered"]
+    assert len(records) == 1
+    rec = records[0]
+    assert rec.rows == 0
+    assert rec.null_sender_rows == 0
+    assert rec.unresolved_entity_rows == 0
+
+
+def test_list_messages_has_exactly_one_log_site_in_method() -> None:
+    """Source invariant: only one list_messages rendered emission in the whole file,
+    and it is inside _list_messages_from_db (not duplicated on other paths)."""
+    import pathlib
+    src = pathlib.Path("src/mcp_telegram/daemon_api.py").read_text()
+    count = src.count('"list_messages rendered"')
+    assert count == 1, (
+        f"Expected exactly one `list_messages rendered` log call in daemon_api.py, found {count}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_fallback_path_does_not_emit_counter(caplog: pytest.LogCaptureFixture) -> None:
+    """Non-sync.db path (dialog not in synced_dialogs → Telegram fallback) must NOT emit counter."""
+    conn = _make_db()
+    # No synced_dialogs row — triggers live Telegram fallback
+    server = make_server(conn)
+    # Mock telegram client to return empty list (avoid real API call)
+    server._client.iter_messages = AsyncMock(return_value=iter([]))
+    caplog.clear()
+    with caplog.at_level("INFO", logger="mcp_telegram.daemon_api"):
+        await server._list_messages({"dialog_id": 999_999_999, "limit": 10})
+    records = [r for r in caplog.records if r.message == "list_messages rendered"]
+    assert len(records) == 0, "Fallback/non-sync.db path must NOT emit the counter log"

@@ -179,27 +179,36 @@ def get_daemon_socket_path() -> Path:
 _SELECT_SYNC_STATUS_SQL = "SELECT status FROM synced_dialogs WHERE dialog_id = ?"
 
 _SELECT_MESSAGES_SQL = (
-    "SELECT message_id, sent_at, text, sender_id, sender_first_name, "
-    "media_description, reply_to_msg_id, forum_topic_id, is_deleted, deleted_at "
-    "FROM messages WHERE dialog_id = ? AND is_deleted = 0 ORDER BY sent_at DESC LIMIT ?"
+    "SELECT m.message_id, m.sent_at, m.text, m.sender_id, "
+    "COALESCE(e.name, m.sender_first_name) AS sender_first_name, "
+    "m.media_description, m.reply_to_msg_id, m.forum_topic_id, "
+    "m.is_deleted, m.deleted_at "
+    "FROM messages m "
+    "LEFT JOIN entities e ON e.id = m.sender_id "
+    "WHERE m.dialog_id = ? AND m.is_deleted = 0 "
+    "ORDER BY m.sent_at DESC LIMIT ?"
 )
 
 _SELECT_FTS_SQL = (
-    "SELECT f.message_id, m.text, m.sender_first_name, m.sent_at, "
-    "m.media_description, m.reply_to_msg_id, m.sender_id, m.forum_topic_id "
+    "SELECT f.message_id, m.text, "
+    "COALESCE(e.name, m.sender_first_name) AS sender_first_name, "
+    "m.sent_at, m.media_description, m.reply_to_msg_id, m.sender_id, m.forum_topic_id "
     "FROM messages_fts f "
     "JOIN messages m ON m.dialog_id = f.dialog_id AND m.message_id = f.message_id "
+    "LEFT JOIN entities e ON e.id = m.sender_id "
     "WHERE messages_fts MATCH ? AND f.dialog_id = ? "
     "ORDER BY rank LIMIT ? OFFSET ?"
 )
 
 _SELECT_FTS_ALL_SQL = (
-    "SELECT f.message_id, m.text, m.sender_first_name, m.sent_at, "
-    "m.media_description, m.reply_to_msg_id, m.sender_id, m.forum_topic_id, "
-    "f.dialog_id, COALESCE(e.name, CAST(f.dialog_id AS TEXT)) AS dialog_name "
+    "SELECT f.message_id, m.text, "
+    "COALESCE(se.name, m.sender_first_name) AS sender_first_name, "
+    "m.sent_at, m.media_description, m.reply_to_msg_id, m.sender_id, m.forum_topic_id, "
+    "f.dialog_id, COALESCE(de.name, CAST(f.dialog_id AS TEXT)) AS dialog_name "
     "FROM messages_fts f "
     "JOIN messages m ON m.dialog_id = f.dialog_id AND m.message_id = f.message_id "
-    "LEFT JOIN entities e ON e.id = f.dialog_id "
+    "LEFT JOIN entities de ON de.id = f.dialog_id "
+    "LEFT JOIN entities se ON se.id = m.sender_id "
     "WHERE messages_fts MATCH ? "
     "ORDER BY rank LIMIT ? OFFSET ?"
 )
@@ -285,10 +294,12 @@ _COLLECT_UNREAD_DIALOGS_WITH_COUNTS_SQL = (
     "AND sd.read_inbox_max_id IS NOT NULL"
 )
 _FETCH_UNREAD_MESSAGES_SQL = (
-    "SELECT message_id, sent_at, text, sender_id, sender_first_name "
-    "FROM messages "
-    "WHERE dialog_id = ? AND message_id > ? AND is_deleted = 0 "
-    "ORDER BY message_id DESC LIMIT ?"
+    "SELECT m.message_id, m.sent_at, m.text, m.sender_id, "
+    "COALESCE(e.name, m.sender_first_name) AS sender_first_name "
+    "FROM messages m "
+    "LEFT JOIN entities e ON e.id = m.sender_id "
+    "WHERE m.dialog_id = ? AND m.message_id > ? AND m.is_deleted = 0 "
+    "ORDER BY m.message_id DESC LIMIT ?"
 )
 _GET_READ_POSITION_SQL = (
     "SELECT read_inbox_max_id FROM synced_dialogs WHERE dialog_id = ?"
@@ -366,7 +377,8 @@ def _fetch_reaction_counts(
 # Base SELECT shared by _build_list_messages_query and _list_messages_context_window.
 # Appends dialog_id=? and is_deleted=0 guards; callers add further conditions.
 _LIST_MESSAGES_BASE_SQL = (
-    "SELECT m.message_id, m.sent_at, m.text, m.sender_id, m.sender_first_name, "
+    "SELECT m.message_id, m.sent_at, m.text, m.sender_id, "
+    "COALESCE(e.name, m.sender_first_name) AS sender_first_name, "
     "m.media_description, m.reply_to_msg_id, m.forum_topic_id, "
     "m.is_deleted, m.deleted_at, "
     "COALESCE("
@@ -378,6 +390,7 @@ _LIST_MESSAGES_BASE_SQL = (
     "FROM messages m "
     "LEFT JOIN topic_metadata tm "
     "  ON tm.dialog_id = m.dialog_id AND tm.topic_id = m.forum_topic_id "
+    "LEFT JOIN entities e ON e.id = m.sender_id "
     "WHERE m.dialog_id = ? AND m.is_deleted = 0"
 )
 
@@ -406,6 +419,7 @@ def _build_list_messages_query(
         sql += " AND m.sender_id = ?"
         params.append(sender_id)
     elif sender_name is not None:
+        # Filter uses denormalized column intentionally — searches match historical names (name-at-send-time), while display COALESCEs against entities for current name.
         sql += " AND m.sender_first_name LIKE ? ESCAPE '\\' COLLATE NOCASE"
         escaped = sender_name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         params.append(f"%{escaped}%")
@@ -862,6 +876,22 @@ class DaemonAPIServer:
         for m in messages:
             counts = reaction_map.get(m["message_id"])
             m["reactions_display"] = format_reaction_counts(counts) if counts else ""
+        # Phase 39: observability counter. Emit ONCE on the sync.db success path.
+        # Non-sync.db branches (Telegram fallback/error) intentionally do not emit this line.
+        null_sender_rows = sum(1 for m in messages if m.get("sender_id") is None)
+        unresolved_entity_rows = sum(
+            1 for m in messages
+            if m.get("sender_id") is not None and m.get("sender_first_name") is None
+        )
+        logger.info(
+            "list_messages rendered",
+            extra={
+                "dialog_id": dialog_id,
+                "rows": len(messages),
+                "null_sender_rows": null_sender_rows,
+                "unresolved_entity_rows": unresolved_entity_rows,
+            },
+        )
         next_nav = self._maybe_encode_next_nav(
             messages, limit, dialog_id, direction, direction_enum,
         )
