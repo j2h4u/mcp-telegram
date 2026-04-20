@@ -363,6 +363,14 @@ async def sync_main() -> None:
         logger.info("sync-daemon started — connected=%s", client.is_connected())
 
         api_server = DaemonAPIServer(conn, client, shutdown_event)
+
+        # Phase 39.1: cache authenticated user id once at startup so query-build
+        # paths (Plan 39.1-02) can bind it as a SQL parameter without calling
+        # Telethon per request. Failure propagates — daemon cannot serve reads
+        # correctly without a stable self_id.
+        me = await client.get_me()
+        api_server.self_id = int(me.id)
+        logger.info("daemon self_id cached: %s", api_server.self_id)
         socket_path = get_daemon_socket_path()
         socket_path.unlink(missing_ok=True)
         old_umask = os.umask(0o177)  # ensure socket created as 0o600 with no race

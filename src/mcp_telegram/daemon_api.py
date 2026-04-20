@@ -554,6 +554,12 @@ class DaemonAPIServer:
         self._conn = conn
         self._client = client
         self._shutdown_event = shutdown_event
+        # Phase 39.1: cached authenticated user id, populated once by
+        # sync_main() after client.connect() completes (see daemon.py).
+        # Query-build paths (Plan 39.1-02) read this as a bound SQL parameter
+        # to collapse DM direction (`out`) into an effective sender id without
+        # calling Telethon on every read.
+        self.self_id: int | None = None
 
     # ------------------------------------------------------------------
     # Connection handler
@@ -1435,6 +1441,10 @@ class DaemonAPIServer:
         Response data: {"id", "first_name", "last_name", "username"}.
         Errors: telegram_error, not_found.
         """
+        # Note: this path returns the full User object (name, username). The
+        # lightweight `self.self_id` cached at startup is used by query-build
+        # paths (Plan 39.1-02); this handler still fetches full profile on
+        # demand because callers want display fields, not just the id.
         try:
             me = await self._client.get_me()
         except Exception as exc:

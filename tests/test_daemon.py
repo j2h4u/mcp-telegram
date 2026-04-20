@@ -44,6 +44,10 @@ def mock_client() -> MagicMock:
     client.disconnect = AsyncMock()
     # get_messages used by backfill and probe-worker
     client.get_messages = AsyncMock(return_value=MockTotalList([], total=0))
+    # Phase 39.1: sync_main caches self_id from client.get_me() at startup
+    _me = MagicMock()
+    _me.id = 11111
+    client.get_me = AsyncMock(return_value=_me)
     return client
 
 
@@ -125,6 +129,54 @@ def test_sync_main_registers_shutdown(
     mock_reg.assert_called_once()
     call_args = mock_reg.call_args
     assert call_args[0][0] is mock_conn, "register_shutdown_handler must receive the open DB connection"
+
+
+def test_self_id_cached_at_startup(
+    mock_client: MagicMock,
+    instant_shutdown_event: asyncio.Event,
+) -> None:
+    """Phase 39.1: sync_main() caches client.get_me().id on DaemonAPIServer.self_id.
+
+    get_me() must be called exactly once, and the cached integer must be
+    exposed via api_server.self_id for Plan 02's SQL parameter binding.
+    """
+    me_user = MagicMock()
+    me_user.id = 12345
+    mock_client.get_me = AsyncMock(return_value=me_user)
+
+    captured: dict[str, object] = {}
+
+    class _Capturing:
+        def __init__(self, conn, client, shutdown_event):  # noqa: ANN001
+            self._conn = conn
+            self._client = client
+            self._shutdown_event = shutdown_event
+            self.self_id = None
+            captured["instance"] = self
+
+        async def handle_client(self, reader, writer):  # pragma: no cover
+            pass
+
+    with (
+        patch("mcp_telegram.daemon.create_client", return_value=mock_client),
+        patch("mcp_telegram.daemon.ensure_sync_schema"),
+        patch("mcp_telegram.daemon.register_shutdown_handler", return_value=instant_shutdown_event),
+        patch("mcp_telegram.daemon.get_sync_db_path"),
+        patch("mcp_telegram.daemon._open_sync_db"),
+        patch("mcp_telegram.daemon.backfill_fts_index", return_value=0),
+        patch("mcp_telegram.daemon.DaemonAPIServer", _Capturing),
+        patch("mcp_telegram.daemon.migrate_legacy_databases"),
+    ):
+        asyncio.run(sync_main())
+
+    instance = captured.get("instance")
+    assert instance is not None, "DaemonAPIServer was not instantiated"
+    assert instance.self_id == 12345, (  # type: ignore[attr-defined]
+        f"expected self_id=12345, got {instance.self_id!r}"  # type: ignore[attr-defined]
+    )
+    assert mock_client.get_me.call_count == 1, (
+        f"get_me must be called exactly once at startup, got {mock_client.get_me.call_count}"
+    )
 
 
 def test_sync_main_disconnects_client_on_shutdown(
