@@ -121,6 +121,8 @@ def test_messages_schema(tmp_sync_db_path: Path) -> None:
             "edit_date",
             "grouped_id",
             "reply_to_peer_id",
+            "out",
+            "is_service",
         }
         assert expected == set(columns.keys()), (
             f"Unexpected columns. Got: {set(columns.keys())}, expected: {expected}"
@@ -253,6 +255,56 @@ def test_schema_migration_idempotent_v2(tmp_sync_db_path: Path) -> None:
         assert rows[5][0] == 6
         assert rows[6][0] == 7
         assert rows[7][0] == 8
+        assert rows[8][0] == 9
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Schema v9: out + is_service columns on messages (Phase 39.1)
+# ---------------------------------------------------------------------------
+
+
+def test_migration_v9_adds_out_and_is_service_columns(tmp_sync_db_path: Path) -> None:
+    """After ensure_sync_schema(), messages table has `out` and `is_service` columns.
+
+    Both must be INTEGER NOT NULL DEFAULT 0 so existing rows and fresh DBs
+    share the same default posture.
+    """
+    ensure_sync_schema(tmp_sync_db_path)
+    conn = _open_sync_db(tmp_sync_db_path)
+    try:
+        rows = conn.execute("PRAGMA table_info(messages)").fetchall()
+        # PRAGMA table_info: (cid, name, type, notnull, dflt_value, pk)
+        columns = {str(row[1]): row for row in rows}
+        assert "out" in columns, f"`out` column missing. Got: {set(columns.keys())}"
+        assert "is_service" in columns, f"`is_service` column missing. Got: {set(columns.keys())}"
+
+        out_col = columns["out"]
+        assert out_col[2] == "INTEGER"
+        assert out_col[3] == 1, "out must be NOT NULL"
+        assert str(out_col[4]) == "0", f"out default must be 0, got {out_col[4]!r}"
+
+        svc_col = columns["is_service"]
+        assert svc_col[2] == "INTEGER"
+        assert svc_col[3] == 1, "is_service must be NOT NULL"
+        assert str(svc_col[4]) == "0", f"is_service default must be 0, got {svc_col[4]!r}"
+
+        version = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
+        assert version is not None and int(version[0]) == 9
+    finally:
+        conn.close()
+
+
+def test_migration_v9_is_idempotent(tmp_sync_db_path: Path) -> None:
+    """Running ensure_sync_schema() twice keeps schema_version at 9 with no error."""
+    ensure_sync_schema(tmp_sync_db_path)
+    ensure_sync_schema(tmp_sync_db_path)
+    conn = _open_sync_db(tmp_sync_db_path)
+    try:
+        rows = conn.execute("SELECT version FROM schema_version ORDER BY version").fetchall()
+        versions = [int(r[0]) for r in rows]
+        assert versions == list(range(1, 10)), f"Expected versions 1..9, got {versions}"
     finally:
         conn.close()
 
@@ -738,7 +790,7 @@ def test_schema_version_records_all_versions(tmp_path: Path) -> None:
                 "SELECT version FROM schema_version ORDER BY version"
             ).fetchall()
         ]
-        assert versions == [1, 2, 3, 4, 5, 6, 7, 8], f"expected all 8 versions, got {versions}"
+        assert versions == [1, 2, 3, 4, 5, 6, 7, 8, 9], f"expected all 9 versions, got {versions}"
     finally:
         conn.close()
 
@@ -1022,13 +1074,13 @@ def test_v7_backfill_reactions_from_json(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_schema_version_is_8(tmp_sync_db_path: Path) -> None:
-    """After ensure_sync_schema(), MAX(version) in schema_version is 8."""
+def test_schema_version_is_9(tmp_sync_db_path: Path) -> None:
+    """After ensure_sync_schema(), MAX(version) in schema_version is 9."""
     ensure_sync_schema(tmp_sync_db_path)
     conn = _open_sync_db(tmp_sync_db_path)
     try:
         row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
-        assert row is not None and row[0] == 8, f"Expected version 8, got {row[0]}"
+        assert row is not None and row[0] == 9, f"Expected version 9, got {row[0]}"
     finally:
         conn.close()
 

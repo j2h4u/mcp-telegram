@@ -8,7 +8,7 @@ from pathlib import Path
 
 from xdg_base_dirs import xdg_state_home  # type: ignore[import-error]
 
-_CURRENT_SCHEMA_VERSION = 8
+_CURRENT_SCHEMA_VERSION = 9
 
 logger = logging.getLogger(__name__)
 
@@ -366,6 +366,16 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
         "ALTER TABLE synced_dialogs ADD COLUMN read_inbox_max_id INTEGER",
         "CREATE INDEX IF NOT EXISTS idx_synced_dialogs_status_read_position "
         "ON synced_dialogs(status, read_inbox_max_id)",
+    ])
+
+    # v9: DM sender discriminators — direction (out) and service-flag (is_service).
+    # Phase 39's "sender_id IS NULL → System" rule was over-broad for DMs;
+    # these columns let the read path distinguish outgoing DMs (out=1) from
+    # true service messages (is_service=1). ADD COLUMN with DEFAULT is O(1)
+    # metadata in SQLite — no row rewrite on large messages tables.
+    _migrate(9, [
+        "ALTER TABLE messages ADD COLUMN out INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE messages ADD COLUMN is_service INTEGER NOT NULL DEFAULT 0",
     ])
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
