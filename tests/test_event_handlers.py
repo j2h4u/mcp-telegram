@@ -776,11 +776,11 @@ def test_register_adds_handlers(
     sync_db: sqlite3.Connection,
     shutdown_event: asyncio.Event,
 ) -> None:
-    """register() calls client.add_event_handler exactly 4 times (3 original + on_message_read)."""
+    """register() calls client.add_event_handler exactly 5 times (4 original + on_raw_reaction_update)."""
     manager = make_manager(mock_client, sync_db, shutdown_event)
     manager.register()
 
-    assert mock_client.add_event_handler.call_count == 4
+    assert mock_client.add_event_handler.call_count == 5
 
 
 def test_unregister_removes_handlers(
@@ -788,12 +788,12 @@ def test_unregister_removes_handlers(
     sync_db: sqlite3.Connection,
     shutdown_event: asyncio.Event,
 ) -> None:
-    """unregister() calls client.remove_event_handler exactly 4 times (3 original + on_message_read)."""
+    """unregister() calls client.remove_event_handler exactly 5 times (4 original + on_raw_reaction_update)."""
     manager = make_manager(mock_client, sync_db, shutdown_event)
     manager.register()
     manager.unregister()
 
-    assert mock_client.remove_event_handler.call_count == 4
+    assert mock_client.remove_event_handler.call_count == 5
 
 
 def test_refresh_synced_dialogs(
@@ -1199,12 +1199,12 @@ def test_register_adds_message_read_handler(
     sync_db: sqlite3.Connection,
     shutdown_event: asyncio.Event,
 ) -> None:
-    """register() calls client.add_event_handler exactly 4 times after on_message_read is added."""
+    """register() calls client.add_event_handler 5 times; on_message_read is the 4th."""
     manager = make_manager(mock_client, sync_db, shutdown_event)
     manager.register()
-    assert mock_client.add_event_handler.call_count == 4
-    last_call = mock_client.add_event_handler.call_args_list[-1]
-    assert last_call.args[0] == manager.on_message_read
+    assert mock_client.add_event_handler.call_count == 5
+    fourth_call = mock_client.add_event_handler.call_args_list[3]
+    assert fourth_call.args[0] == manager.on_message_read
 
 
 def test_unregister_removes_message_read_handler(
@@ -1212,8 +1212,8 @@ def test_unregister_removes_message_read_handler(
     sync_db: sqlite3.Connection,
     shutdown_event: asyncio.Event,
 ) -> None:
-    """unregister() calls client.remove_event_handler exactly 4 times after on_message_read is added."""
+    """unregister() calls client.remove_event_handler 5 times after on_raw_reaction_update added."""
     manager = make_manager(mock_client, sync_db, shutdown_event)
     manager.register()
     manager.unregister()
-    assert mock_client.remove_event_handler.call_count == 4
+    assert mock_client.remove_event_handler.call_count == 5

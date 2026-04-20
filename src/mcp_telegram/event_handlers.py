@@ -25,9 +25,19 @@ import time
 from typing import Any
 
 from telethon import events  # type: ignore[import-untyped]
+from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
+from telethon.tl.types import UpdateMessageReactions  # type: ignore[import-untyped]
+from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
 from .resolver import latinize
-from .sync_worker import INSERT_DIALOG_SQL, UPSERT_ENTITY_SQL, extract_message_row, insert_messages_with_fts
+from .sync_worker import (
+    INSERT_DIALOG_SQL,
+    UPSERT_ENTITY_SQL,
+    apply_reactions_delta,
+    extract_message_row,
+    extract_reactions_rows,
+    insert_messages_with_fts,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -125,13 +135,23 @@ class EventHandlerManager:
         self._client.add_event_handler(self.on_message_edited, events.MessageEdited)
         self._client.add_event_handler(self.on_message_deleted, events.MessageDeleted)
         self._client.add_event_handler(self.on_message_read, events.MessageRead(inbox=True))
+        # Phase 39.2-01: 5th handler for raw reaction updates. Telethon emits
+        # UpdateMessageReactions for User/Chat/Channel peers (single Update type;
+        # peer field discriminates). Verified against
+        # .venv/lib/python3.14/site-packages/telethon/events/raw.py — single-arg
+        # callback contract: `async def handler(update)`.
+        self._client.add_event_handler(
+            self.on_raw_reaction_update,
+            events.Raw(types=[UpdateMessageReactions]),
+        )
 
     def unregister(self) -> None:
-        """Remove all four handlers from the client (graceful shutdown)."""
+        """Remove all five handlers from the client (graceful shutdown)."""
         self._client.remove_event_handler(self.on_new_message)
         self._client.remove_event_handler(self.on_message_edited)
         self._client.remove_event_handler(self.on_message_deleted)
         self._client.remove_event_handler(self.on_message_read)
+        self._client.remove_event_handler(self.on_raw_reaction_update)
 
     def refresh_synced_dialogs(self) -> None:
         """Refresh the in-memory synced-dialog set from the DB.
@@ -262,7 +282,20 @@ class EventHandlerManager:
 
                 old_text = existing[0]
                 if old_text == new_text:
-                    # No text change — service edit, media caption update, etc.
+                    # No text change. Two sub-cases:
+                    # 1. msg.reactions present -> reactions-only edit; apply delta
+                    #    (Phase 39.2-01 AC-1 via edited path, AC-2 removal via empty results).
+                    # 2. msg.reactions is None -> service edit / media caption etc.; no-op
+                    #    (regression guard AC-8).
+                    reactions_obj = getattr(msg, "reactions", None)
+                    if reactions_obj is not None:
+                        rows = extract_reactions_rows(dialog_id, message_id, reactions_obj)
+                        apply_reactions_delta(self._conn, dialog_id, message_id, rows)
+                        self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
+                        logger.info(
+                            "event_edit_reactions dialog_id=%d message_id=%d count=%d",
+                            dialog_id, message_id, len(rows),
+                        )
                     return
 
                 edit_date_raw = getattr(msg, "edit_date", None)
@@ -366,6 +399,79 @@ class EventHandlerManager:
                 )
         except Exception:
             logger.exception("event_read_failed dialog_id=%s", dialog_id)
+
+    async def on_raw_reaction_update(self, update: Any) -> None:
+        """Handle raw UpdateMessageReactions for synced dialogs.
+
+        Telethon contract (verified against
+        .venv/lib/python3.14/site-packages/telethon/events/raw.py:22-23 and
+        .venv/.../telethon/tl/types/__init__.py UpdateMessageReactions):
+            async def handler(update)  # single-arg
+        ``update`` is the raw TL Update with attributes:
+            .peer (PeerUser | PeerChat | PeerChannel), .msg_id, .reactions
+
+        For synced dialogs only: re-fetch the message via
+        ``client.get_messages(dialog_id, ids=[msg_id])`` (integer dialog_id —
+        no get_entity round-trip), extract reaction rows, apply per-message
+        delta. FloodWait is logged + dropped (next JIT read repairs).
+        Phase 39.2-01: AC-1 / AC-2 / AC-2-RAW / AC-UPD-USER / AC-UPD-CHANNEL.
+        """
+        peer = getattr(update, "peer", None)
+        msg_id = getattr(update, "msg_id", None)
+        if peer is None or msg_id is None:
+            return
+        try:
+            dialog_id = int(get_peer_id(peer))
+        except Exception:
+            logger.debug("raw_reaction_update_unparseable_peer peer=%r", peer)
+            return
+
+        if dialog_id not in self._synced_dialog_ids:
+            logger.debug(
+                "raw_reaction_update_skipped_unsynced dialog_id=%d message_id=%d",
+                dialog_id, msg_id,
+            )
+            return
+
+        try:
+            result = await self._client.get_messages(dialog_id, ids=[msg_id])
+        except FloodWaitError as exc:
+            wait = getattr(exc, "seconds", 0)
+            logger.warning(
+                "raw_reaction_floodwait dialog_id=%d message_id=%d seconds=%d",
+                dialog_id, msg_id, wait,
+            )
+            return
+        except Exception:
+            logger.exception(
+                "event_raw_reaction_failed dialog_id=%d message_id=%d",
+                dialog_id, msg_id,
+            )
+            return
+
+        msg = result[0] if result else None
+        if msg is None:
+            logger.debug(
+                "raw_reaction_update_missing_message dialog_id=%d message_id=%d",
+                dialog_id, msg_id,
+            )
+            return
+
+        try:
+            rows = extract_reactions_rows(dialog_id, msg_id, getattr(msg, "reactions", None))
+            now = int(time.time())
+            with self._conn:
+                apply_reactions_delta(self._conn, dialog_id, msg_id, rows)
+                self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
+            logger.info(
+                "event_raw_reaction dialog_id=%d message_id=%d count=%d",
+                dialog_id, msg_id, len(rows),
+            )
+        except Exception:
+            logger.exception(
+                "event_raw_reaction_apply_failed dialog_id=%d message_id=%d",
+                dialog_id, msg_id,
+            )
 
     # ------------------------------------------------------------------
     # DM gap scan
