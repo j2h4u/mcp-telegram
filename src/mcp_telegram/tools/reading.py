@@ -143,7 +143,16 @@ def _format_search_results(rows: list[dict], query: str, *, global_mode: bool = 
     for row in rows:
         msg_id = row["message_id"]
         sent_at = row.get("sent_at") or 0
-        sender = row.get("sender_first_name") or "?"
+        # Phase 39: align with formatter._resolve_sender_name fallback labels.
+        # sender_first_name is already COALESCEd against entities.name by daemon SQL
+        # (Plan 39-01). When still missing, branch on sender_id presence.
+        _sender_name = row.get("sender_first_name")
+        if _sender_name:
+            sender = _sender_name
+        elif row.get("sender_id") is None:
+            sender = "System"
+        else:
+            sender = f"(unknown user {row['sender_id']})"
         dt = datetime.fromtimestamp(int(sent_at), tz=timezone.utc)
         time_str = dt.strftime("%Y-%m-%d %H:%M")
         snippet = _extract_snippet(row.get("text"), query)
