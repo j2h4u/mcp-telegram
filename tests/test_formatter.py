@@ -31,12 +31,14 @@ def _make_msg(
     media: object = None,
     reactions: object = None,
     reply_to: object = None,
+    sender_id: int = 1,
 ) -> MockMessage:
     return MockMessage(
         id=id,
         date=dt,
         message=text,
         sender=MockSender(first_name=first_name),
+        sender_id=sender_id,
         media=media,
         reactions=reactions,
         reply_to=reply_to,
@@ -362,6 +364,7 @@ def test_edited_marker_shown_when_edit_date_is_int() -> None:
         date=dt,
         message="edited text",
         sender=MockSender(first_name="Alice"),
+        sender_id=1,
         edit_date=1718464800,
     )
     result = format_messages([msg], {})
@@ -379,6 +382,7 @@ def test_edited_marker_shown_when_edit_date_is_datetime() -> None:
         date=dt,
         message="edited text",
         sender=MockSender(first_name="Alice"),
+        sender_id=1,
         edit_date=edit_dt,
     )
     result = format_messages([msg], {})
@@ -422,6 +426,7 @@ def test_edited_marker_before_reactions() -> None:
         date=dt,
         message="hello",
         sender=MockSender(first_name="Alice"),
+        sender_id=1,
         reactions=reactions,
         edit_date=1718460000,
     )
