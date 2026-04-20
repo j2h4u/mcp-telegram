@@ -65,8 +65,8 @@ INSERT_MESSAGE_SQL = (
     "INSERT OR REPLACE INTO messages "
     "(dialog_id, message_id, sent_at, text, sender_id, sender_first_name, "
     "media_description, reply_to_msg_id, forum_topic_id, is_deleted, "
-    "edit_date, grouped_id, reply_to_peer_id) "
-    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)"
+    "edit_date, grouped_id, reply_to_peer_id, out, is_service) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)"
 )
 
 INSERT_REACTION_SQL = (
@@ -428,10 +428,18 @@ def extract_message_row(dialog_id: int, msg: Any) -> ExtractedMessage:
                 reply_to_peer_id = int(pid)
                 break
 
+    # -- Phase 39.1 v9 columns: DM sender discriminators --
+    # `out` carries direction for DMs (sender is implicit — either self or peer).
+    # `is_service` flags MessageService rows (chat events) so "System" rendering
+    # is reserved for them rather than any row with sender_id IS NULL.
+    is_service = 1 if isinstance(msg, types.MessageService) else 0
+    out = 1 if getattr(msg, "out", False) else 0
+
     row = (
         dialog_id, message_id, sent_at, text, sender_id,
         sender_first_name, media_description, reply_to_msg_id,
         forum_topic_id, edit_date, grouped_id, reply_to_peer_id,
+        out, is_service,
     )
     reactions = extract_reactions_rows(dialog_id, message_id, getattr(msg, "reactions", None))
     entities = extract_entity_rows(dialog_id, message_id, msg)

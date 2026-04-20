@@ -1545,6 +1545,121 @@ def test_extract_message_row_populates_v7_columns() -> None:
     assert result_none.row[9:12] == (None, None, None)
 
 
+# ---------------------------------------------------------------------------
+# Phase 39.1 v9 columns: out + is_service extraction
+# ---------------------------------------------------------------------------
+
+
+def _minimal_msg(**overrides: Any) -> SimpleNamespace:
+    """Build a minimal Telethon-like Message for extract_message_row tests."""
+    from datetime import datetime, timezone
+    base = dict(
+        id=1,
+        date=datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+        message="hi",
+        sender_id=1,
+        sender=SimpleNamespace(first_name="Alice"),
+        media=None,
+        reply_to=None,
+        reactions=None,
+        edit_date=None,
+        grouped_id=None,
+        fwd_from=None,
+        entities=None,
+        out=False,
+    )
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+def test_extract_message_row_captures_out_true() -> None:
+    """`msg.out=True` -> row[12] == 1."""
+    from mcp_telegram.sync_worker import extract_message_row
+
+    msg = _minimal_msg(out=True)
+    result = extract_message_row(1, msg)
+    assert result.row[12] == 1, "out must be 1 when msg.out=True"
+    assert result.row[13] == 0, "is_service must be 0 for regular Message"
+
+
+def test_extract_message_row_captures_out_false_when_missing() -> None:
+    """`msg.out=False` or attribute missing -> row[12] == 0."""
+    from mcp_telegram.sync_worker import extract_message_row
+
+    msg_false = _minimal_msg(out=False)
+    assert extract_message_row(1, msg_false).row[12] == 0
+
+    # Attribute missing entirely: use a namespace without `out`
+    from datetime import datetime, timezone
+    msg_missing = SimpleNamespace(
+        id=2,
+        date=datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+        message="hi",
+        sender_id=1,
+        sender=SimpleNamespace(first_name="Alice"),
+        media=None,
+        reply_to=None,
+        reactions=None,
+        edit_date=None,
+        grouped_id=None,
+        fwd_from=None,
+        entities=None,
+    )
+    assert extract_message_row(1, msg_missing).row[12] == 0, (
+        "out must default to 0 when attribute is missing"
+    )
+
+
+def test_extract_message_row_flags_message_service_as_is_service() -> None:
+    """`isinstance(msg, MessageService)` -> row[13] == 1 regardless of `out`."""
+    from telethon.tl import types as tl
+    from datetime import datetime, timezone
+    from mcp_telegram.sync_worker import extract_message_row
+
+    svc = tl.MessageService(
+        id=500,
+        peer_id=tl.PeerUser(user_id=1),
+        date=datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+        action=tl.MessageActionHistoryClear(),
+        out=True,  # even with out=True, is_service must be 1
+    )
+    result = extract_message_row(1, svc)
+    assert result.row[13] == 1, "is_service must be 1 for MessageService"
+
+
+def test_extract_message_row_regular_message_is_service_zero() -> None:
+    """Regular (non-service) Message -> row[13] == 0."""
+    from mcp_telegram.sync_worker import extract_message_row
+
+    msg = _minimal_msg()
+    result = extract_message_row(1, msg)
+    assert result.row[13] == 0
+
+
+def test_extract_message_row_insert_roundtrip_preserves_out_and_is_service(
+    sync_db: sqlite3.Connection,
+) -> None:
+    """End-to-end: extract -> insert -> SELECT returns correct out/is_service."""
+    from mcp_telegram.sync_worker import extract_message_row, insert_messages_with_fts
+
+    dialog_id = 42
+    sync_db.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')", (dialog_id,),
+    )
+    sync_db.commit()
+
+    msg = _minimal_msg(id=777, out=True)
+    em = extract_message_row(dialog_id, msg)
+    with sync_db:
+        insert_messages_with_fts(sync_db, [em])
+
+    row = sync_db.execute(
+        "SELECT out, is_service FROM messages WHERE dialog_id=? AND message_id=?",
+        (dialog_id, 777),
+    ).fetchone()
+    assert row == (1, 0)
+
+
 def test_insert_messages_with_fts_writes_reactions(sync_db: sqlite3.Connection) -> None:
     """insert_messages_with_fts writes reaction rows to message_reactions table."""
     from mcp_telegram.sync_worker import insert_messages_with_fts, ExtractedMessage
@@ -1557,7 +1672,7 @@ def test_insert_messages_with_fts_writes_reactions(sync_db: sqlite3.Connection) 
     sync_db.commit()
 
     em = ExtractedMessage(
-        row=(dialog_id, message_id, 1700000000, "hello", 1, "Alice", None, None, None, None, None, None),
+        row=(dialog_id, message_id, 1700000000, "hello", 1, "Alice", None, None, None, None, None, None, 0, 0),
         reactions=[(dialog_id, message_id, "👍", 5), (dialog_id, message_id, "❤", 2)],
     )
     with sync_db:
@@ -1583,7 +1698,7 @@ def test_insert_messages_with_fts_writes_forwards(sync_db: sqlite3.Connection) -
     sync_db.commit()
 
     em = ExtractedMessage(
-        row=(dialog_id, message_id, 1700000000, "forwarded", 1, "Alice", None, None, None, None, None, None),
+        row=(dialog_id, message_id, 1700000000, "forwarded", 1, "Alice", None, None, None, None, None, None, 0, 0),
         forward=(dialog_id, message_id, 55555, "Original Author", 1700000000, None),
     )
     with sync_db:
@@ -1611,7 +1726,7 @@ def test_insert_messages_with_fts_edit_idempotency_reactions(sync_db: sqlite3.Co
 
     # First insert: 2 reactions
     em1 = ExtractedMessage(
-        row=(dialog_id, message_id, 1700000000, "v1", 1, "Alice", None, None, None, None, None, None),
+        row=(dialog_id, message_id, 1700000000, "v1", 1, "Alice", None, None, None, None, None, None, 0, 0),
         reactions=[(dialog_id, message_id, "👍", 3), (dialog_id, message_id, "❤", 1)],
     )
     with sync_db:
@@ -1619,7 +1734,7 @@ def test_insert_messages_with_fts_edit_idempotency_reactions(sync_db: sqlite3.Co
 
     # Second insert: 1 different reaction
     em2 = ExtractedMessage(
-        row=(dialog_id, message_id, 1700000000, "v2", 1, "Alice", None, None, None, None, None, None),
+        row=(dialog_id, message_id, 1700000000, "v2", 1, "Alice", None, None, None, None, None, None, 0, 0),
         reactions=[(dialog_id, message_id, "🔥", 7)],
     )
     with sync_db:
@@ -1645,7 +1760,7 @@ def test_insert_messages_with_fts_edit_idempotency_entities(sync_db: sqlite3.Con
     sync_db.commit()
 
     em1 = ExtractedMessage(
-        row=(dialog_id, message_id, 1700000000, "old", 1, "Alice", None, None, None, None, None, None),
+        row=(dialog_id, message_id, 1700000000, "old", 1, "Alice", None, None, None, None, None, None, 0, 0),
         entities=[
             (dialog_id, message_id, 0, 5, "mention", "@old1"),
             (dialog_id, message_id, 6, 5, "mention", "@old2"),
@@ -1655,7 +1770,7 @@ def test_insert_messages_with_fts_edit_idempotency_entities(sync_db: sqlite3.Con
         insert_messages_with_fts(sync_db, [em1])
 
     em2 = ExtractedMessage(
-        row=(dialog_id, message_id, 1700000000, "new", 1, "Alice", None, None, None, None, None, None),
+        row=(dialog_id, message_id, 1700000000, "new", 1, "Alice", None, None, None, None, None, None, 0, 0),
         entities=[(dialog_id, message_id, 0, 4, "hashtag", "#new")],
     )
     with sync_db:
@@ -1681,7 +1796,7 @@ def test_insert_messages_with_fts_edit_idempotency_forwards(sync_db: sqlite3.Con
     sync_db.commit()
 
     em1 = ExtractedMessage(
-        row=(dialog_id, message_id, 1700000000, "fwd msg", 1, "Alice", None, None, None, None, None, None),
+        row=(dialog_id, message_id, 1700000000, "fwd msg", 1, "Alice", None, None, None, None, None, None, 0, 0),
         forward=(dialog_id, message_id, 12345, "Src", 1700000000, None),
     )
     with sync_db:
@@ -1696,7 +1811,7 @@ def test_insert_messages_with_fts_edit_idempotency_forwards(sync_db: sqlite3.Con
 
     # Re-insert with no forward
     em2 = ExtractedMessage(
-        row=(dialog_id, message_id, 1700000000, "edited msg", 1, "Alice", None, None, None, None, None, None),
+        row=(dialog_id, message_id, 1700000000, "edited msg", 1, "Alice", None, None, None, None, None, None, 0, 0),
         forward=None,
     )
     with sync_db:
