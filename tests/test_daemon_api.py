@@ -84,6 +84,8 @@ def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.
             is_deleted          INTEGER NOT NULL DEFAULT 0,
             deleted_at          INTEGER,
             edit_date           INTEGER,
+            out                 INTEGER NOT NULL DEFAULT 0,
+            is_service          INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (dialog_id, message_id)
         ) WITHOUT ROWID
         """
@@ -2441,7 +2443,9 @@ def test_build_list_messages_query_basic_shape() -> None:
     assert "topic_title" in sql or "tm.title" in sql
     assert "topic_metadata" in sql
     assert "message_versions" in sql
-    assert params[-1] == 10  # LIMIT param is last
+    assert params["limit"] == 10
+    assert params["dialog_id"] == 1
+    assert "self_id" in params  # Phase 39.1-02: always bound
 
 
 def test_build_list_messages_query_direction_newest() -> None:
@@ -2459,11 +2463,11 @@ def test_build_list_messages_query_direction_oldest() -> None:
 
 
 def test_build_list_messages_query_sender_id_filter() -> None:
-    """_build_list_messages_query with sender_id adds AND m.sender_id = ? clause."""
+    """_build_list_messages_query with sender_id adds AND m.sender_id = :filter_sender_id clause."""
     from mcp_telegram.daemon_api import _build_list_messages_query
     sql, params = _build_list_messages_query(dialog_id=1, limit=10, sender_id=42)
     assert "sender_id" in sql
-    assert 42 in params
+    assert 42 in params.values()
 
 
 def test_build_list_messages_query_sender_name_filter() -> None:
@@ -2471,7 +2475,7 @@ def test_build_list_messages_query_sender_name_filter() -> None:
     from mcp_telegram.daemon_api import _build_list_messages_query
     sql, params = _build_list_messages_query(dialog_id=1, limit=10, sender_name="Alice")
     assert "LIKE" in sql.upper()
-    assert any("Alice" in str(p) for p in params)
+    assert any("Alice" in str(p) for p in params.values())
 
 
 def test_build_list_messages_query_topic_filter() -> None:
@@ -2479,35 +2483,35 @@ def test_build_list_messages_query_topic_filter() -> None:
     from mcp_telegram.daemon_api import _build_list_messages_query
     sql, params = _build_list_messages_query(dialog_id=1, limit=10, topic_id=5)
     assert "forum_topic_id" in sql
-    assert 5 in params
+    assert 5 in params.values()
 
 
 def test_build_list_messages_query_unread_filter() -> None:
-    """_build_list_messages_query with unread_after_id adds message_id > ? clause."""
+    """_build_list_messages_query with unread_after_id adds message_id > :unread_after_id clause."""
     from mcp_telegram.daemon_api import _build_list_messages_query
     sql, params = _build_list_messages_query(dialog_id=1, limit=10, unread_after_id=100)
     assert "message_id" in sql
-    assert 100 in params
+    assert 100 in params.values()
 
 
 def test_build_list_messages_query_cursor_newest() -> None:
-    """_build_list_messages_query with cursor and direction=newest uses message_id < ?."""
+    """_build_list_messages_query with cursor and direction=newest uses message_id < :anchor."""
     from mcp_telegram.daemon_api import _build_list_messages_query
     sql, params = _build_list_messages_query(
         dialog_id=1, limit=10, anchor_msg_id=500, direction="newest"
     )
     assert "<" in sql
-    assert 500 in params
+    assert 500 in params.values()
 
 
 def test_build_list_messages_query_cursor_oldest() -> None:
-    """_build_list_messages_query with cursor and direction=oldest uses message_id > ?."""
+    """_build_list_messages_query with cursor and direction=oldest uses message_id > :anchor."""
     from mcp_telegram.daemon_api import _build_list_messages_query
     sql, params = _build_list_messages_query(
         dialog_id=1, limit=10, anchor_msg_id=500, direction="oldest"
     )
     assert ">" in sql
-    assert 500 in params
+    assert 500 in params.values()
 
 
 # ---------------------------------------------------------------------------
@@ -3162,11 +3166,13 @@ def test_decode_nav_search_token_returns_error() -> None:
 
 
 def test_db_message_columns_length_matches_query() -> None:
-    """_DB_MESSAGE_COLUMNS has exactly 12 entries matching the SELECT."""
+    """_DB_MESSAGE_COLUMNS has 16 entries matching the SELECT (Phase 39.1-02 added effective_sender_id, is_service, out, dialog_id)."""
     from mcp_telegram.daemon_api import _DB_MESSAGE_COLUMNS
-    assert len(_DB_MESSAGE_COLUMNS) == 12
+    assert len(_DB_MESSAGE_COLUMNS) == 16
     assert _DB_MESSAGE_COLUMNS[0] == "message_id"
-    assert _DB_MESSAGE_COLUMNS[-1] == "topic_title"
+    assert _DB_MESSAGE_COLUMNS[-1] == "dialog_id"
+    assert "effective_sender_id" in _DB_MESSAGE_COLUMNS
+    assert "is_service" in _DB_MESSAGE_COLUMNS
 
 
 # ---------------------------------------------------------------------------
@@ -4301,12 +4307,14 @@ def _seed_message_p39(
     sender_id: int | None,
     sender_first_name: str | None,
     text: str = "hi",
+    out: int = 0,
+    is_service: int = 0,
 ) -> None:
     conn.execute(
         "INSERT INTO messages "
-        "(dialog_id, message_id, sent_at, text, sender_id, sender_first_name, is_deleted) "
-        "VALUES (?, ?, ?, ?, ?, ?, 0)",
-        (dialog_id, message_id, 1_700_000_000 + message_id, text, sender_id, sender_first_name),
+        "(dialog_id, message_id, sent_at, text, sender_id, sender_first_name, is_deleted, out, is_service) "
+        "VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)",
+        (dialog_id, message_id, 1_700_000_000 + message_id, text, sender_id, sender_first_name, out, is_service),
     )
 
 
@@ -4402,23 +4410,27 @@ async def test_list_unread_messages_uses_entity_name() -> None:
 
 
 def test_fts_sql_invariants_mandatory() -> None:
-    """MANDATORY — no skip clause. Locks FTS SQL-string contract."""
+    """MANDATORY — no skip clause. Locks FTS SQL-string contract (Phase 39.1-02 aliases)."""
     from mcp_telegram import daemon_api as d
-    # _SELECT_FTS_SQL: single-alias case
-    assert "LEFT JOIN entities" in d._SELECT_FTS_SQL, "_SELECT_FTS_SQL missing LEFT JOIN entities"
-    assert "COALESCE(e.name, m.sender_first_name)" in d._SELECT_FTS_SQL, (
-        "_SELECT_FTS_SQL missing COALESCE(e.name, m.sender_first_name)"
+    # _SELECT_FTS_SQL: dual sender entity JOINs (e_raw + e_eff) for effective_sender_id lookup
+    assert "LEFT JOIN entities e_raw ON e_raw.id = m.sender_id" in d._SELECT_FTS_SQL, (
+        "_SELECT_FTS_SQL missing LEFT JOIN entities e_raw"
     )
-    # _SELECT_FTS_ALL_SQL: two-alias contract (de for dialog, se for sender)
-    assert "LEFT JOIN entities se ON se.id = m.sender_id" in d._SELECT_FTS_ALL_SQL, (
-        "_SELECT_FTS_ALL_SQL missing LEFT JOIN entities se ON se.id = m.sender_id"
+    assert "LEFT JOIN entities e_eff" in d._SELECT_FTS_SQL, (
+        "_SELECT_FTS_SQL missing LEFT JOIN entities e_eff"
+    )
+    assert "COALESCE(e_raw.name, e_eff.name, m.sender_first_name)" in d._SELECT_FTS_SQL, (
+        "_SELECT_FTS_SQL missing triple COALESCE(e_raw.name, e_eff.name, m.sender_first_name)"
+    )
+    # _SELECT_FTS_ALL_SQL: de for dialog, e_raw/e_eff for sender
+    assert "LEFT JOIN entities e_raw ON e_raw.id = m.sender_id" in d._SELECT_FTS_ALL_SQL, (
+        "_SELECT_FTS_ALL_SQL missing LEFT JOIN entities e_raw"
     )
     assert "LEFT JOIN entities de ON de.id = f.dialog_id" in d._SELECT_FTS_ALL_SQL, (
         "_SELECT_FTS_ALL_SQL missing LEFT JOIN entities de ON de.id = f.dialog_id"
     )
-    # Sender COALESCE uses the se alias (NOT e.name)
-    assert "COALESCE(se.name, m.sender_first_name)" in d._SELECT_FTS_ALL_SQL, (
-        "_SELECT_FTS_ALL_SQL must use COALESCE(se.name, ...) not e.name"
+    assert "COALESCE(e_raw.name, e_eff.name, m.sender_first_name)" in d._SELECT_FTS_ALL_SQL, (
+        "_SELECT_FTS_ALL_SQL must use triple COALESCE(e_raw.name, e_eff.name, m.sender_first_name)"
     )
 
 
@@ -4434,6 +4446,9 @@ def test_all_sql_constants_contain_entity_join_and_coalesce() -> None:
         sql = getattr(d, name)
         assert "LEFT JOIN entities" in sql, f"{name} missing LEFT JOIN entities"
         assert "COALESCE(" in sql, f"{name} missing COALESCE"
+        # Phase 39.1-02: every read-path SELECT projects effective_sender_id
+        assert "effective_sender_id" in sql, f"{name} missing effective_sender_id projection"
+        assert ":self_id" in sql, f"{name} missing :self_id parameter binding"
 
 
 def test_db_message_columns_preserves_sender_first_name_position() -> None:
@@ -4521,3 +4536,137 @@ async def test_fallback_path_does_not_emit_counter(caplog: pytest.LogCaptureFixt
         await server._list_messages({"dialog_id": 999_999_999, "limit": 10})
     records = [r for r in caplog.records if r.message == "list_messages rendered"]
     assert len(records) == 0, "Fallback/non-sync.db path must NOT emit the counter log"
+
+
+# ---------------------------------------------------------------------------
+# Phase 39.1-02: effective_sender_id SQL projection tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_messages_effective_sender_dm_outgoing() -> None:
+    """DM outgoing (sender_id=NULL, out=1) resolves effective_sender_id to self_id."""
+    conn = _make_db()
+    _seed_synced_dialog_p39(conn, dialog_id=268071163)
+    _seed_message_p39(
+        conn, dialog_id=268071163, message_id=1,
+        sender_id=None, sender_first_name=None, out=1, is_service=0,
+    )
+    conn.commit()
+    server = make_server(conn)
+    server.self_id = 99999
+    resp = await server._list_messages({"dialog_id": 268071163, "limit": 10})
+    assert resp["ok"] is True
+    assert resp["data"]["messages"][0]["effective_sender_id"] == 99999
+
+
+@pytest.mark.asyncio
+async def test_list_messages_effective_sender_dm_incoming() -> None:
+    """DM incoming (sender_id=NULL, out=0) resolves effective_sender_id to dialog_id (peer)."""
+    conn = _make_db()
+    _seed_synced_dialog_p39(conn, dialog_id=268071163)
+    _seed_message_p39(
+        conn, dialog_id=268071163, message_id=1,
+        sender_id=None, sender_first_name=None, out=0, is_service=0,
+    )
+    conn.commit()
+    server = make_server(conn)
+    server.self_id = 99999
+    resp = await server._list_messages({"dialog_id": 268071163, "limit": 10})
+    assert resp["ok"] is True
+    assert resp["data"]["messages"][0]["effective_sender_id"] == 268071163
+
+
+@pytest.mark.asyncio
+async def test_list_messages_effective_sender_service_message_is_null() -> None:
+    """Service message (is_service=1, sender_id=NULL) keeps effective_sender_id=NULL."""
+    conn = _make_db()
+    _seed_synced_dialog_p39(conn, dialog_id=268071163)
+    _seed_message_p39(
+        conn, dialog_id=268071163, message_id=1,
+        sender_id=None, sender_first_name=None, out=0, is_service=1,
+    )
+    conn.commit()
+    server = make_server(conn)
+    server.self_id = 99999
+    resp = await server._list_messages({"dialog_id": 268071163, "limit": 10})
+    assert resp["ok"] is True
+    assert resp["data"]["messages"][0]["effective_sender_id"] is None
+    assert resp["data"]["messages"][0]["is_service"] == 1
+
+
+@pytest.mark.asyncio
+async def test_list_messages_effective_sender_group_unknown_is_null() -> None:
+    """Group unknown sender (dialog_id<0, sender_id=NULL, is_service=0) stays NULL."""
+    conn = _make_db()
+    _seed_synced_dialog_p39(conn, dialog_id=-100123)
+    _seed_message_p39(
+        conn, dialog_id=-100123, message_id=1,
+        sender_id=None, sender_first_name=None, out=0, is_service=0,
+    )
+    conn.commit()
+    server = make_server(conn)
+    server.self_id = 99999
+    resp = await server._list_messages({"dialog_id": -100123, "limit": 10})
+    assert resp["ok"] is True
+    assert resp["data"]["messages"][0]["effective_sender_id"] is None
+
+
+def test_msg_to_dict_telethon_fallback_computes_effective_sender() -> None:
+    """_msg_to_dict: DM outgoing with sender_id=None, out=True resolves effective_sender_id=self_id."""
+    from types import SimpleNamespace
+
+    # Minimal telethon-ish mock
+    mock_date = SimpleNamespace(timestamp=lambda: 1700000000.0)
+    mock_msg = SimpleNamespace(
+        id=42,
+        date=mock_date,
+        message="hi",
+        sender_id=None,
+        sender=None,
+        media=None,
+        reactions=None,
+        reply_to=None,
+        reply_to_msg_id=None,
+        forum_topic_id=None,
+        edit_date=None,
+        out=True,
+    )
+    result = DaemonAPIServer._msg_to_dict(mock_msg, dialog_id=268071163, self_id=99999)
+    assert result["effective_sender_id"] == 99999
+    assert result["is_service"] == 0
+    assert result["out"] == 1
+
+
+def test_msg_to_dict_telethon_fallback_dm_incoming() -> None:
+    """_msg_to_dict: DM incoming (out=False, sender_id=None) resolves to dialog_id (peer)."""
+    from types import SimpleNamespace
+
+    mock_date = SimpleNamespace(timestamp=lambda: 1700000000.0)
+    mock_msg = SimpleNamespace(
+        id=42, date=mock_date, message="hi",
+        sender_id=None, sender=None, media=None, reactions=None,
+        reply_to=None, reply_to_msg_id=None, forum_topic_id=None,
+        edit_date=None, out=False,
+    )
+    result = DaemonAPIServer._msg_to_dict(mock_msg, dialog_id=268071163, self_id=99999)
+    assert result["effective_sender_id"] == 268071163
+    assert result["is_service"] == 0
+
+
+@pytest.mark.asyncio
+async def test_list_messages_dm_outgoing_resolves_sender_first_name_via_e_eff() -> None:
+    """DM outgoing: e_eff JOIN on effective_sender_id=self_id resolves self's name."""
+    conn = _make_db()
+    _seed_synced_dialog_p39(conn, dialog_id=268071163)
+    _seed_entity_p39(conn, entity_id=99999, name="Me")
+    _seed_message_p39(
+        conn, dialog_id=268071163, message_id=1,
+        sender_id=None, sender_first_name=None, out=1, is_service=0,
+    )
+    conn.commit()
+    server = make_server(conn)
+    server.self_id = 99999
+    resp = await server._list_messages({"dialog_id": 268071163, "limit": 10})
+    assert resp["ok"] is True
+    assert resp["data"]["messages"][0]["sender_first_name"] == "Me"

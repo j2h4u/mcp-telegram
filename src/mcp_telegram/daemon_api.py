@@ -178,39 +178,73 @@ def get_daemon_socket_path() -> Path:
 
 _SELECT_SYNC_STATUS_SQL = "SELECT status FROM synced_dialogs WHERE dialog_id = ?"
 
+# Phase 39.1-02: effective_sender_id collapses DM direction into a concrete user id.
+# For DM outgoing rows (sender_id IS NULL, out=1) → self_id (from :self_id parameter).
+# For DM incoming rows (sender_id IS NULL, out=0) → dialog_id (the peer).
+# For service messages (is_service=1) or group unknown senders → NULL (render as System/unknown).
+# Interpolated into every read-path SELECT; every caller MUST bind :self_id.
+_EFFECTIVE_SENDER_ID_EXPR = (
+    "COALESCE("
+    "m.sender_id, "
+    "CASE "
+    "WHEN m.is_service = 1 THEN NULL "
+    "WHEN m.dialog_id > 0 AND m.out = 1 THEN :self_id "
+    "WHEN m.dialog_id > 0 AND m.out = 0 THEN m.dialog_id "
+    "ELSE NULL "
+    "END"
+    ")"
+)
+EFFECTIVE_SENDER_ID_SQL = _EFFECTIVE_SENDER_ID_EXPR + " AS effective_sender_id"
+
+# Shared sender_first_name projection with dual JOINs: resolve name either from
+# the raw sender_id OR, when sender_id IS NULL, from the effective_sender_id (peer
+# first_name for DM incoming; self name for DM outgoing — though "Я" wins at render).
+_SENDER_FIRST_NAME_SQL = (
+    "COALESCE(e_raw.name, e_eff.name, m.sender_first_name) AS sender_first_name"
+)
+_SENDER_ENTITY_JOINS_SQL = (
+    "LEFT JOIN entities e_raw ON e_raw.id = m.sender_id "
+    f"LEFT JOIN entities e_eff ON e_eff.id = {_EFFECTIVE_SENDER_ID_EXPR} "
+)
+
 _SELECT_MESSAGES_SQL = (
-    "SELECT m.message_id, m.sent_at, m.text, m.sender_id, "
-    "COALESCE(e.name, m.sender_first_name) AS sender_first_name, "
-    "m.media_description, m.reply_to_msg_id, m.forum_topic_id, "
-    "m.is_deleted, m.deleted_at "
-    "FROM messages m "
-    "LEFT JOIN entities e ON e.id = m.sender_id "
-    "WHERE m.dialog_id = ? AND m.is_deleted = 0 "
-    "ORDER BY m.sent_at DESC LIMIT ?"
+    f"SELECT m.message_id, m.sent_at, m.text, m.sender_id, "
+    f"{_SENDER_FIRST_NAME_SQL}, "
+    f"m.media_description, m.reply_to_msg_id, m.forum_topic_id, "
+    f"m.is_deleted, m.deleted_at, "
+    f"{EFFECTIVE_SENDER_ID_SQL}, m.is_service, m.out, m.dialog_id "
+    f"FROM messages m "
+    f"{_SENDER_ENTITY_JOINS_SQL}"
+    f"WHERE m.dialog_id = :dialog_id AND m.is_deleted = 0 "
+    f"ORDER BY m.sent_at DESC LIMIT :limit"
 )
 
 _SELECT_FTS_SQL = (
-    "SELECT f.message_id, m.text, "
-    "COALESCE(e.name, m.sender_first_name) AS sender_first_name, "
-    "m.sent_at, m.media_description, m.reply_to_msg_id, m.sender_id, m.forum_topic_id "
-    "FROM messages_fts f "
-    "JOIN messages m ON m.dialog_id = f.dialog_id AND m.message_id = f.message_id "
-    "LEFT JOIN entities e ON e.id = m.sender_id "
-    "WHERE messages_fts MATCH ? AND f.dialog_id = ? "
-    "ORDER BY rank LIMIT ? OFFSET ?"
+    f"SELECT f.message_id, m.text, "
+    f"{_SENDER_FIRST_NAME_SQL}, "
+    f"m.sent_at, m.media_description, m.reply_to_msg_id, m.sender_id, m.forum_topic_id, "
+    f"{EFFECTIVE_SENDER_ID_SQL}, m.is_service, m.out, m.dialog_id "
+    f"FROM messages_fts f "
+    f"JOIN messages m ON m.dialog_id = f.dialog_id AND m.message_id = f.message_id "
+    f"{_SENDER_ENTITY_JOINS_SQL}"
+    f"WHERE messages_fts MATCH :query AND f.dialog_id = :dialog_id "
+    f"ORDER BY rank LIMIT :limit OFFSET :offset"
 )
 
+# _SELECT_FTS_ALL_SQL uses aliases e_raw/e_eff for sender entity JOINs (matching the
+# shared helpers) and de for dialog name entity JOIN.
 _SELECT_FTS_ALL_SQL = (
-    "SELECT f.message_id, m.text, "
-    "COALESCE(se.name, m.sender_first_name) AS sender_first_name, "
-    "m.sent_at, m.media_description, m.reply_to_msg_id, m.sender_id, m.forum_topic_id, "
-    "f.dialog_id, COALESCE(de.name, CAST(f.dialog_id AS TEXT)) AS dialog_name "
-    "FROM messages_fts f "
-    "JOIN messages m ON m.dialog_id = f.dialog_id AND m.message_id = f.message_id "
-    "LEFT JOIN entities de ON de.id = f.dialog_id "
-    "LEFT JOIN entities se ON se.id = m.sender_id "
-    "WHERE messages_fts MATCH ? "
-    "ORDER BY rank LIMIT ? OFFSET ?"
+    f"SELECT f.message_id, m.text, "
+    f"{_SENDER_FIRST_NAME_SQL}, "
+    f"m.sent_at, m.media_description, m.reply_to_msg_id, m.sender_id, m.forum_topic_id, "
+    f"f.dialog_id, COALESCE(de.name, CAST(f.dialog_id AS TEXT)) AS dialog_name, "
+    f"{EFFECTIVE_SENDER_ID_SQL}, m.is_service, m.out "
+    f"FROM messages_fts f "
+    f"JOIN messages m ON m.dialog_id = f.dialog_id AND m.message_id = f.message_id "
+    f"LEFT JOIN entities de ON de.id = f.dialog_id "
+    f"{_SENDER_ENTITY_JOINS_SQL}"
+    f"WHERE messages_fts MATCH :query "
+    f"ORDER BY rank LIMIT :limit OFFSET :offset"
 )
 
 _SELECT_SYNCED_STATUSES_SQL = (
@@ -294,12 +328,13 @@ _COLLECT_UNREAD_DIALOGS_WITH_COUNTS_SQL = (
     "AND sd.read_inbox_max_id IS NOT NULL"
 )
 _FETCH_UNREAD_MESSAGES_SQL = (
-    "SELECT m.message_id, m.sent_at, m.text, m.sender_id, "
-    "COALESCE(e.name, m.sender_first_name) AS sender_first_name "
-    "FROM messages m "
-    "LEFT JOIN entities e ON e.id = m.sender_id "
-    "WHERE m.dialog_id = ? AND m.message_id > ? AND m.is_deleted = 0 "
-    "ORDER BY m.message_id DESC LIMIT ?"
+    f"SELECT m.message_id, m.sent_at, m.text, m.sender_id, "
+    f"{_SENDER_FIRST_NAME_SQL}, "
+    f"{EFFECTIVE_SENDER_ID_SQL}, m.is_service, m.out, m.dialog_id "
+    f"FROM messages m "
+    f"{_SENDER_ENTITY_JOINS_SQL}"
+    f"WHERE m.dialog_id = :dialog_id AND m.message_id > :after_msg_id AND m.is_deleted = 0 "
+    f"ORDER BY m.message_id DESC LIMIT :limit"
 )
 _GET_READ_POSITION_SQL = (
     "SELECT read_inbox_max_id FROM synced_dialogs WHERE dialog_id = ?"
@@ -334,6 +369,7 @@ _DB_MESSAGE_COLUMNS = (
     "message_id", "sent_at", "text", "sender_id", "sender_first_name",
     "media_description", "reply_to_msg_id", "forum_topic_id",
     "is_deleted", "deleted_at", "edit_date", "topic_title",
+    "effective_sender_id", "is_service", "out", "dialog_id",
 )
 
 
@@ -375,23 +411,26 @@ def _fetch_reaction_counts(
 # ---------------------------------------------------------------------------
 
 # Base SELECT shared by _build_list_messages_query and _list_messages_context_window.
-# Appends dialog_id=? and is_deleted=0 guards; callers add further conditions.
+# Appends dialog_id=:dialog_id and is_deleted=0 guards; callers add further conditions
+# (appended as " AND ..." with named params or positional — see _build_list_messages_query).
+# Callers MUST bind :self_id (used by EFFECTIVE_SENDER_ID_SQL CASE expression).
 _LIST_MESSAGES_BASE_SQL = (
-    "SELECT m.message_id, m.sent_at, m.text, m.sender_id, "
-    "COALESCE(e.name, m.sender_first_name) AS sender_first_name, "
-    "m.media_description, m.reply_to_msg_id, m.forum_topic_id, "
-    "m.is_deleted, m.deleted_at, "
-    "COALESCE("
-    "  (SELECT MAX(mv.edit_date) FROM message_versions mv "
-    "   WHERE mv.dialog_id = m.dialog_id AND mv.message_id = m.message_id), "
-    "  m.edit_date"
-    ") AS edit_date, "
-    "tm.title AS topic_title "
-    "FROM messages m "
-    "LEFT JOIN topic_metadata tm "
-    "  ON tm.dialog_id = m.dialog_id AND tm.topic_id = m.forum_topic_id "
-    "LEFT JOIN entities e ON e.id = m.sender_id "
-    "WHERE m.dialog_id = ? AND m.is_deleted = 0"
+    f"SELECT m.message_id, m.sent_at, m.text, m.sender_id, "
+    f"{_SENDER_FIRST_NAME_SQL}, "
+    f"m.media_description, m.reply_to_msg_id, m.forum_topic_id, "
+    f"m.is_deleted, m.deleted_at, "
+    f"COALESCE("
+    f"  (SELECT MAX(mv.edit_date) FROM message_versions mv "
+    f"   WHERE mv.dialog_id = m.dialog_id AND mv.message_id = m.message_id), "
+    f"  m.edit_date"
+    f") AS edit_date, "
+    f"tm.title AS topic_title, "
+    f"{EFFECTIVE_SENDER_ID_SQL}, m.is_service, m.out, m.dialog_id "
+    f"FROM messages m "
+    f"LEFT JOIN topic_metadata tm "
+    f"  ON tm.dialog_id = m.dialog_id AND tm.topic_id = m.forum_topic_id "
+    f"{_SENDER_ENTITY_JOINS_SQL}"
+    f"WHERE m.dialog_id = :dialog_id AND m.is_deleted = 0"
 )
 
 
@@ -399,53 +438,57 @@ def _build_list_messages_query(
     *,
     dialog_id: int,
     limit: int,
+    self_id: int | None = None,
     direction: str = "newest",
     anchor_msg_id: int | None = None,
     sender_id: int | None = None,
     sender_name: str | None = None,
     topic_id: int | None = None,
     unread_after_id: int | None = None,
-) -> tuple[str, list]:
+) -> tuple[str, dict]:
     """Build a parameterized SELECT for list_messages against sync.db.
 
-    Returns (sql_string, params_list).  Column names in the SELECT match
+    Returns (sql_string, params_dict).  Column names in the SELECT match
     the keys used by _list_messages_from_db (use conn.row_factory = sqlite3.Row
     or unpack via _DB_MESSAGE_COLUMNS).
+
+    self_id is bound to :self_id (used by the EFFECTIVE_SENDER_ID_SQL CASE
+    expression to collapse DM direction). If not set, DM outgoing rows will
+    project effective_sender_id=NULL instead of the authenticated user id.
     """
-    params: list = [dialog_id]
+    params: dict = {"dialog_id": dialog_id, "limit": limit, "self_id": self_id}
     sql = _LIST_MESSAGES_BASE_SQL
 
     if sender_id is not None:
-        sql += " AND m.sender_id = ?"
-        params.append(sender_id)
+        sql += " AND m.sender_id = :filter_sender_id"
+        params["filter_sender_id"] = sender_id
     elif sender_name is not None:
         # Filter uses denormalized column intentionally — searches match historical names (name-at-send-time), while display COALESCEs against entities for current name.
-        sql += " AND m.sender_first_name LIKE ? ESCAPE '\\' COLLATE NOCASE"
+        sql += " AND m.sender_first_name LIKE :sender_name_pattern ESCAPE '\\' COLLATE NOCASE"
         escaped = sender_name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        params.append(f"%{escaped}%")
+        params["sender_name_pattern"] = f"%{escaped}%"
 
     if topic_id is not None:
-        sql += " AND m.forum_topic_id = ?"
-        params.append(topic_id)
+        sql += " AND m.forum_topic_id = :topic_id"
+        params["topic_id"] = topic_id
 
     if unread_after_id is not None:
-        sql += " AND m.message_id > ?"
-        params.append(unread_after_id)
+        sql += " AND m.message_id > :unread_after_id"
+        params["unread_after_id"] = unread_after_id
 
     if anchor_msg_id is not None:
         if direction == "oldest":
-            sql += " AND m.message_id > ?"
+            sql += " AND m.message_id > :anchor_msg_id"
         else:
-            sql += " AND m.message_id < ?"
-        params.append(anchor_msg_id)
+            sql += " AND m.message_id < :anchor_msg_id"
+        params["anchor_msg_id"] = anchor_msg_id
 
     if direction == "oldest":
         sql += " ORDER BY m.message_id ASC"
     else:
         sql += " ORDER BY m.message_id DESC"
 
-    sql += " LIMIT ?"
-    params.append(limit)
+    sql += " LIMIT :limit"
 
     logger.debug(
         "list_messages_query filters=%s param_count=%d direction=%s",
@@ -747,11 +790,20 @@ class DaemonAPIServer:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _msg_to_dict(msg: Any) -> dict:
+    def _msg_to_dict(
+        msg: Any,
+        dialog_id: int | None = None,
+        self_id: int | None = None,
+    ) -> dict:
         """Convert a live Telethon message object to the standard message dict.
 
         Used by the on-demand path in _list_messages and by _list_unread_messages
         to avoid duplicating the same field-extraction logic.
+
+        Phase 39.1-02: when dialog_id and self_id are supplied, computes
+        `effective_sender_id` and `is_service` in Python using the same
+        decision tree as the EFFECTIVE_SENDER_ID_SQL CASE expression so the
+        Telethon fallback path emits the same row shape as the sync.db path.
         """
         sender_first_name: str | None = None
         if getattr(msg, "sender", None) is not None:
@@ -793,11 +845,38 @@ class DaemonAPIServer:
             except Exception:
                 edit_date = None
 
+        # Phase 39.1-02: mirror the SQL EFFECTIVE_SENDER_ID_SQL CASE tree in
+        # Python so Telethon-fallback row dicts carry the same discriminators
+        # as sync.db rows. Fields default to conservative values when inputs
+        # are absent (e.g. pre-Plan-01 test fixtures).
+        is_service_flag = 0
+        try:
+            from telethon.tl import types as _tl_types  # type: ignore[import-untyped]
+            if isinstance(msg, _tl_types.MessageService):
+                is_service_flag = 1
+        except Exception:
+            # Tests may pass bare MagicMock objects with no Telethon type.
+            logger.debug("msg_to_dict: telethon MessageService isinstance check failed", exc_info=True)
+        out_flag = 1 if getattr(msg, "out", False) else 0
+
+        raw_sender_id = getattr(msg, "sender_id", None)
+        effective_sender_id: int | None
+        if raw_sender_id is not None:
+            effective_sender_id = raw_sender_id
+        elif is_service_flag == 1:
+            effective_sender_id = None
+        elif dialog_id is not None and dialog_id > 0 and out_flag == 1 and self_id is not None:
+            effective_sender_id = self_id
+        elif dialog_id is not None and dialog_id > 0 and out_flag == 0:
+            effective_sender_id = dialog_id
+        else:
+            effective_sender_id = None
+
         return {
             "message_id": msg.id,
             "sent_at": sent_at,
             "text": getattr(msg, "message", None),
-            "sender_id": getattr(msg, "sender_id", None),
+            "sender_id": raw_sender_id,
             "sender_first_name": sender_first_name,
             "media_description": media_description,
             "reply_to_msg_id": reply_to_msg_id,
@@ -805,6 +884,10 @@ class DaemonAPIServer:
             "reactions_display": reactions_display,
             "is_deleted": 0,
             "edit_date": edit_date,
+            "effective_sender_id": effective_sender_id,
+            "is_service": is_service_flag,
+            "out": out_flag,
+            "dialog_id": dialog_id,
         }
 
     # ------------------------------------------------------------------
@@ -864,6 +947,7 @@ class DaemonAPIServer:
         sql, params = _build_list_messages_query(
             dialog_id=dialog_id,
             limit=limit,
+            self_id=self.self_id,
             direction=direction,
             anchor_msg_id=anchor_msg_id,
             sender_id=sender_id,
@@ -924,13 +1008,25 @@ class DaemonAPIServer:
         half = max(1, context_size // 2)
 
         before_rows = self._conn.execute(
-            _LIST_MESSAGES_BASE_SQL + " AND m.message_id <= ? ORDER BY m.message_id DESC LIMIT ?",
-            (dialog_id, anchor_message_id, half + 1),
+            _LIST_MESSAGES_BASE_SQL
+            + " AND m.message_id <= :anchor ORDER BY m.message_id DESC LIMIT :limit",
+            {
+                "dialog_id": dialog_id,
+                "self_id": self.self_id,
+                "anchor": anchor_message_id,
+                "limit": half + 1,
+            },
         ).fetchall()
 
         after_rows = self._conn.execute(
-            _LIST_MESSAGES_BASE_SQL + " AND m.message_id > ? ORDER BY m.message_id ASC LIMIT ?",
-            (dialog_id, anchor_message_id, half),
+            _LIST_MESSAGES_BASE_SQL
+            + " AND m.message_id > :anchor ORDER BY m.message_id ASC LIMIT :limit",
+            {
+                "dialog_id": dialog_id,
+                "self_id": self.self_id,
+                "anchor": anchor_message_id,
+                "limit": half,
+            },
         ).fetchall()
 
         # before_rows are DESC — reverse to get chronological order, then append after
@@ -1002,7 +1098,7 @@ class DaemonAPIServer:
         messages: list[dict] = []
         try:
             async for msg in self._client.iter_messages(dialog_id, **iter_kwargs):
-                messages.append(self._msg_to_dict(msg))
+                messages.append(self._msg_to_dict(msg, dialog_id=dialog_id, self_id=self.self_id))
         except Exception as exc:
             logger.warning(
                 "list_messages_telegram_error dialog_id=%d error=%s%s",
@@ -1213,7 +1309,12 @@ class DaemonAPIServer:
         if global_mode:
             rows = self._conn.execute(
                 _SELECT_FTS_ALL_SQL,
-                (stemmed, limit, offset),
+                {
+                    "query": stemmed,
+                    "limit": limit,
+                    "offset": offset,
+                    "self_id": self.self_id,
+                },
             ).fetchall()
             messages = [
                 {
@@ -1227,6 +1328,9 @@ class DaemonAPIServer:
                     "forum_topic_id": r[7],
                     "dialog_id": r[8],
                     "dialog_name": r[9],
+                    "effective_sender_id": r[10],
+                    "is_service": r[11],
+                    "out": r[12],
                     # Global search: results span multiple dialogs. Skip reaction injection --
                     # fetching reactions per-dialog for a cross-dialog result set adds complexity
                     # with little value (search results are for finding messages, not analyzing
@@ -1238,7 +1342,13 @@ class DaemonAPIServer:
         else:
             rows = self._conn.execute(
                 _SELECT_FTS_SQL,
-                (stemmed, dialog_id, limit, offset),
+                {
+                    "query": stemmed,
+                    "dialog_id": dialog_id,
+                    "limit": limit,
+                    "offset": offset,
+                    "self_id": self.self_id,
+                },
             ).fetchall()
             messages = [
                 {
@@ -1250,6 +1360,10 @@ class DaemonAPIServer:
                     "reply_to_msg_id": r[5],
                     "sender_id": r[6],
                     "forum_topic_id": r[7],
+                    "effective_sender_id": r[8],
+                    "is_service": r[9],
+                    "out": r[10],
+                    "dialog_id": r[11],
                 }
                 for r in rows
             ]
@@ -1926,7 +2040,12 @@ class DaemonAPIServer:
 
             rows = self._conn.execute(
                 _FETCH_UNREAD_MESSAGES_SQL,
-                (chat_id, entry["read_inbox_max_id"], budget),
+                {
+                    "dialog_id": chat_id,
+                    "after_msg_id": entry["read_inbox_max_id"],
+                    "limit": budget,
+                    "self_id": self.self_id,
+                },
             ).fetchall()
             group["messages"] = [
                 {
@@ -1935,6 +2054,10 @@ class DaemonAPIServer:
                     "text": r[2],
                     "sender_id": r[3],
                     "sender_first_name": r[4],
+                    "effective_sender_id": r[5],
+                    "is_service": r[6],
+                    "out": r[7],
+                    "dialog_id": r[8],
                 }
                 for r in rows
             ]
