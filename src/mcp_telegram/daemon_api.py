@@ -936,6 +936,21 @@ class DaemonAPIServer:
         for m in messages:
             counts = reaction_map.get(m["message_id"])
             m["reactions_display"] = format_reaction_counts(counts) if counts else ""
+        # Phase 39: observability counter — mirror main path so anchor branch is not a blind spot.
+        null_sender_rows = sum(1 for m in messages if m.get("sender_id") is None)
+        unresolved_entity_rows = sum(
+            1 for m in messages
+            if m.get("sender_id") is not None and m.get("sender_first_name") is None
+        )
+        logger.info(
+            "list_messages rendered",
+            extra={
+                "dialog_id": dialog_id,
+                "rows": len(messages),
+                "null_sender_rows": null_sender_rows,
+                "unresolved_entity_rows": unresolved_entity_rows,
+            },
+        )
         return {
             "ok": True,
             "data": {

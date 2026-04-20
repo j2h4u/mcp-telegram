@@ -4496,14 +4496,15 @@ async def test_list_messages_logs_zero_counters_when_empty(caplog: pytest.LogCap
     assert rec.unresolved_entity_rows == 0
 
 
-def test_list_messages_has_exactly_one_log_site_in_method() -> None:
-    """Source invariant: only one list_messages rendered emission in the whole file,
-    and it is inside _list_messages_from_db (not duplicated on other paths)."""
+def test_list_messages_has_exactly_two_log_sites_in_method() -> None:
+    """Source invariant: exactly two list_messages rendered emissions in daemon_api.py —
+    one in _list_messages_from_db (main sync.db path) and one in
+    _list_messages_context_window (anchor path). Non-sync.db paths must not emit."""
     import pathlib
     src = pathlib.Path("src/mcp_telegram/daemon_api.py").read_text()
     count = src.count('"list_messages rendered"')
-    assert count == 1, (
-        f"Expected exactly one `list_messages rendered` log call in daemon_api.py, found {count}"
+    assert count == 2, (
+        f"Expected exactly two `list_messages rendered` log calls in daemon_api.py, found {count}"
     )
 
 
