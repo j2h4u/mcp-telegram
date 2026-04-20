@@ -1010,7 +1010,7 @@ class DaemonAPIServer:
             return int(row[0])
         return None
 
-    def _list_messages_from_db(
+    async def _list_messages_from_db(
         self,
         *,
         dialog_id: int,
@@ -1042,6 +1042,9 @@ class DaemonAPIServer:
         ]
         # Inject reaction counts from message_reactions table
         msg_ids = [m["message_id"] for m in messages]
+        # Phase 39.2 Plan 02: TTL-gated JIT freshen for stale subset only.
+        if msg_ids:
+            await self._freshen_reactions_if_stale(dialog_id, dialog_id, msg_ids)
         reaction_map = _fetch_reaction_counts(self._conn, dialog_id, msg_ids)
         for m in messages:
             counts = reaction_map.get(m["message_id"])
@@ -1070,7 +1073,7 @@ class DaemonAPIServer:
             "data": {"messages": messages, "source": "sync_db", "next_navigation": next_nav},
         }
 
-    def _list_messages_context_window(
+    async def _list_messages_context_window(
         self,
         *,
         dialog_id: int,
@@ -1114,6 +1117,9 @@ class DaemonAPIServer:
         messages = [dict(zip(_DB_MESSAGE_COLUMNS, r)) for r in rows]
         # Inject reaction counts from message_reactions table
         msg_ids = [m["message_id"] for m in messages]
+        # Phase 39.2 Plan 02: JIT freshen for the context-window slice.
+        if msg_ids:
+            await self._freshen_reactions_if_stale(dialog_id, dialog_id, msg_ids)
         reaction_map = _fetch_reaction_counts(self._conn, dialog_id, msg_ids)
         for m in messages:
             counts = reaction_map.get(m["message_id"])
@@ -1305,7 +1311,7 @@ class DaemonAPIServer:
                         "Use MarkDialogForSync first."
                     ),
                 }
-            return self._list_messages_context_window(
+            return await self._list_messages_context_window(
                 dialog_id=dialog_id,
                 anchor_message_id=context_message_id,
                 context_size=context_size,
@@ -1327,7 +1333,7 @@ class DaemonAPIServer:
         status = row[0] if row is not None else None
 
         if status in ("synced", "syncing", "access_lost"):
-            result = self._list_messages_from_db(
+            result = await self._list_messages_from_db(
                 dialog_id=dialog_id,
                 limit=limit,
                 direction=direction,
@@ -1386,6 +1392,9 @@ class DaemonAPIServer:
         if not stemmed:
             return {"ok": True, "data": {"messages": [], "total": 0}}
 
+        # Phase 39.2 Plan 02: global search (dialog_id=None) is OUT of JIT scope.
+        # No single dialog → per-message freshness gate is not well-defined across
+        # dialogs. Global mode serves best-effort cached reactions only.
         if global_mode:
             rows = self._conn.execute(
                 _SELECT_FTS_ALL_SQL,
@@ -1450,6 +1459,13 @@ class DaemonAPIServer:
             # Scoped search: single dialog_id -- inject reactions
             if dialog_id:
                 msg_ids = [r["message_id"] for r in messages]
+                # Phase 39.2 Plan 02: scoped search → JIT freshen for the slice.
+                # Global search (dialog_id is None / 0) is OUT of JIT scope per
+                # CONTEXT.md §Out of scope — no single dialog for per-message gate.
+                if msg_ids:
+                    await self._freshen_reactions_if_stale(
+                        dialog_id, dialog_id, msg_ids
+                    )
                 reaction_map = _fetch_reaction_counts(self._conn, dialog_id, msg_ids)
                 for r in messages:
                     counts = reaction_map.get(r["message_id"])
@@ -2127,7 +2143,7 @@ class DaemonAPIServer:
                     "self_id": self.self_id,
                 },
             ).fetchall()
-            group["messages"] = [
+            group_messages = [
                 {
                     "message_id": r[0],
                     "sent_at": r[1],
@@ -2141,6 +2157,18 @@ class DaemonAPIServer:
                 }
                 for r in rows
             ]
+            # Phase 39.2 Plan 02: per-dialog JIT freshen + reactions injection.
+            # Multi-dialog call → group by dialog (already grouped by entry/chat_id).
+            msg_ids = [m["message_id"] for m in group_messages]
+            if msg_ids:
+                await self._freshen_reactions_if_stale(chat_id, chat_id, msg_ids)
+                reaction_map = _fetch_reaction_counts(self._conn, chat_id, msg_ids)
+                for m in group_messages:
+                    counts = reaction_map.get(m["message_id"])
+                    m["reactions_display"] = (
+                        format_reaction_counts(counts) if counts else ""
+                    )
+            group["messages"] = group_messages
             groups.append(group)
 
         return groups

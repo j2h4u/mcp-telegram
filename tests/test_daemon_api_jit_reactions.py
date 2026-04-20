@@ -564,3 +564,303 @@ async def test_jit_reactions_cleared_when_telegram_has_none() -> None:
 
 def test_reactions_ttl_constant_is_600() -> None:
     assert REACTIONS_TTL_SECONDS == 600
+
+
+# ---------------------------------------------------------------------------
+# Task 2: Wiring tests through dispatcher
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_messages_triggers_jit_on_cold_read() -> None:
+    """AC-3 end-to-end through _list_messages: one get_messages, reactions in response."""
+    conn = _make_db()
+    dialog_id = 1001
+    _seed_synced(conn, dialog_id)
+    for mid in range(1, 6):
+        _seed_message(conn, dialog_id, mid)
+
+    client = MagicMock()
+    client.get_messages = AsyncMock(
+        return_value=[_msg_with_reactions(mid, "❤", 2) for mid in range(1, 6)]
+    )
+    server = make_server(conn, client)
+    server.self_id = 99
+
+    result = await server._dispatch(
+        {"method": "list_messages", "dialog_id": dialog_id, "limit": 10}
+    )
+
+    assert result["ok"] is True
+    assert client.get_messages.call_count == 1
+    msgs = result["data"]["messages"]
+    assert msgs
+    assert any(m.get("reactions_display") for m in msgs)
+
+
+@pytest.mark.asyncio
+async def test_list_messages_skips_jit_when_all_fresh() -> None:
+    """AC-4 through dispatcher: pre-seeded fresh → zero get_messages."""
+    conn = _make_db()
+    dialog_id = 1001
+    _seed_synced(conn, dialog_id)
+    ids = list(range(1, 6))
+    for mid in ids:
+        _seed_message(conn, dialog_id, mid)
+    _seed_freshness(conn, dialog_id, ids, int(time.time()) - 50)
+
+    client = MagicMock()
+    client.get_messages = AsyncMock()
+    server = make_server(conn, client)
+    server.self_id = 99
+
+    result = await server._dispatch(
+        {"method": "list_messages", "dialog_id": dialog_id, "limit": 10}
+    )
+
+    assert result["ok"] is True
+    assert client.get_messages.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_list_messages_page1_fresh_page2_cold() -> None:
+    """AC-4-PAGED end-to-end: simulate by pre-seeding freshness for half ids."""
+    conn = _make_db()
+    dialog_id = 1001
+    _seed_synced(conn, dialog_id)
+    for mid in range(1, 11):
+        _seed_message(conn, dialog_id, mid)
+    # mark first 5 as fresh
+    _seed_freshness(conn, dialog_id, [1, 2, 3, 4, 5], int(time.time()) - 50)
+
+    client = MagicMock()
+    client.get_messages = AsyncMock(
+        return_value=[_msg_with_reactions(mid) for mid in [10, 9, 8, 7, 6]]
+    )
+    server = make_server(conn, client)
+    server.self_id = 99
+
+    result = await server._dispatch(
+        {"method": "list_messages", "dialog_id": dialog_id, "limit": 10}
+    )
+
+    assert result["ok"] is True
+    assert client.get_messages.call_count == 1
+    # Only the 5 cold ids fetched
+    fetched_ids = sorted(client.get_messages.call_args.kwargs["ids"])
+    assert fetched_ids == [6, 7, 8, 9, 10]
+
+
+@pytest.mark.asyncio
+async def test_list_messages_context_window_wiring() -> None:
+    """Context-window path triggers JIT for the surrounding slice."""
+    conn = _make_db()
+    dialog_id = 1001
+    _seed_synced(conn, dialog_id)
+    for mid in range(1, 11):
+        _seed_message(conn, dialog_id, mid)
+
+    client = MagicMock()
+    client.get_messages = AsyncMock(
+        return_value=[_msg_with_reactions(mid) for mid in range(1, 11)]
+    )
+    server = make_server(conn, client)
+    server.self_id = 99
+
+    result = await server._dispatch(
+        {
+            "method": "list_messages",
+            "dialog_id": dialog_id,
+            "context_message_id": 5,
+            "context_size": 6,
+        }
+    )
+
+    assert result["ok"] is True
+    assert client.get_messages.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_search_messages_scoped_triggers_jit() -> None:
+    """Scoped search (dialog_id provided) triggers JIT freshen."""
+    conn = _make_db(with_fts=True)
+    dialog_id = 1001
+    _seed_synced(conn, dialog_id)
+    for mid in range(1, 4):
+        _seed_message(conn, dialog_id, mid)
+        # Index FTS row matching the message text
+        conn.execute(
+            "INSERT INTO messages_fts (dialog_id, message_id, stemmed_text) "
+            "VALUES (?, ?, ?)",
+            (dialog_id, mid, f"hello {mid}"),
+        )
+    conn.commit()
+
+    client = MagicMock()
+    client.get_messages = AsyncMock(
+        return_value=[_msg_with_reactions(mid) for mid in [3, 2, 1]]
+    )
+    server = make_server(conn, client)
+    server.self_id = 99
+
+    result = await server._dispatch(
+        {
+            "method": "search_messages",
+            "dialog_id": dialog_id,
+            "query": "hello",
+            "limit": 10,
+        }
+    )
+
+    assert result["ok"] is True
+    # JIT fired exactly once for the scoped search
+    assert client.get_messages.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_search_messages_global_skips_jit() -> None:
+    """Global search (dialog_id=None) does NOT trigger JIT."""
+    conn = _make_db(with_fts=True)
+    dialog_id = 1001
+    _seed_synced(conn, dialog_id)
+    for mid in range(1, 4):
+        _seed_message(conn, dialog_id, mid)
+        conn.execute(
+            "INSERT INTO messages_fts (dialog_id, message_id, stemmed_text) "
+            "VALUES (?, ?, ?)",
+            (dialog_id, mid, f"hello {mid}"),
+        )
+    conn.commit()
+
+    client = MagicMock()
+    client.get_messages = AsyncMock()
+    server = make_server(conn, client)
+    server.self_id = 99
+
+    result = await server._dispatch(
+        {
+            "method": "search_messages",
+            "query": "hello",
+            "limit": 10,
+        }
+    )
+
+    assert result["ok"] is True
+    assert client.get_messages.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_list_unread_messages_injects_reactions() -> None:
+    """Unread path now surfaces reactions_display populated from message_reactions."""
+    conn = _make_db()
+    dialog_id = 1001
+    _seed_synced(conn, dialog_id)
+    # Set read_inbox_max_id=10 so messages 11+ are unread
+    conn.execute(
+        "UPDATE synced_dialogs SET read_inbox_max_id=10 WHERE dialog_id=?",
+        (dialog_id,),
+    )
+    for mid in [11, 12, 13]:
+        _seed_message(conn, dialog_id, mid)
+        _seed_reaction(conn, dialog_id, mid, "🔥", 3)
+    # Pre-mark fresh so JIT does not fire (we just want to test reaction injection)
+    _seed_freshness(conn, dialog_id, [11, 12, 13], int(time.time()) - 50)
+    conn.commit()
+
+    client = MagicMock()
+    client.get_messages = AsyncMock()
+    server = make_server(conn, client)
+    server.self_id = 99
+
+    result = await server._dispatch(
+        {"method": "list_unread_messages", "scope": "personal", "limit": 100}
+    )
+
+    assert result["ok"] is True
+    groups = result["data"]["groups"]
+    assert len(groups) == 1
+    msgs = groups[0]["messages"]
+    assert msgs
+    assert all("reactions_display" in m for m in msgs)
+    assert all(m["reactions_display"] for m in msgs)
+
+
+@pytest.mark.asyncio
+async def test_list_unread_messages_triggers_jit_on_cold_read() -> None:
+    """Unread path JIT wiring: cold read fires get_messages."""
+    conn = _make_db()
+    dialog_id = 1001
+    _seed_synced(conn, dialog_id)
+    conn.execute(
+        "UPDATE synced_dialogs SET read_inbox_max_id=10 WHERE dialog_id=?",
+        (dialog_id,),
+    )
+    for mid in [11, 12, 13]:
+        _seed_message(conn, dialog_id, mid)
+    conn.commit()
+
+    client = MagicMock()
+    client.get_messages = AsyncMock(
+        return_value=[_msg_with_reactions(mid) for mid in [13, 12, 11]]
+    )
+    server = make_server(conn, client)
+    server.self_id = 99
+
+    result = await server._dispatch(
+        {"method": "list_unread_messages", "scope": "personal", "limit": 100}
+    )
+
+    assert result["ok"] is True
+    assert client.get_messages.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_list_unread_messages_skips_jit_when_all_fresh() -> None:
+    """TTL gate on unread path: pre-fresh → zero get_messages."""
+    conn = _make_db()
+    dialog_id = 1001
+    _seed_synced(conn, dialog_id)
+    conn.execute(
+        "UPDATE synced_dialogs SET read_inbox_max_id=10 WHERE dialog_id=?",
+        (dialog_id,),
+    )
+    for mid in [11, 12, 13]:
+        _seed_message(conn, dialog_id, mid)
+    _seed_freshness(conn, dialog_id, [11, 12, 13], int(time.time()) - 50)
+    conn.commit()
+
+    client = MagicMock()
+    client.get_messages = AsyncMock()
+    server = make_server(conn, client)
+    server.self_id = 99
+
+    result = await server._dispatch(
+        {"method": "list_unread_messages", "scope": "personal", "limit": 100}
+    )
+
+    assert result["ok"] is True
+    assert client.get_messages.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_non_content_methods_do_not_trigger_jit() -> None:
+    """get_sync_status, list_dialogs etc. → zero JIT calls."""
+    conn = _make_db()
+    dialog_id = 1001
+    _seed_synced(conn, dialog_id)
+
+    client = MagicMock()
+    client.get_messages = AsyncMock()
+    # iter_dialogs needs to be an async iterator; return empty
+    async def _empty(*_a, **_k):
+        if False:
+            yield  # pragma: no cover
+    client.iter_dialogs = MagicMock(side_effect=_empty)
+    server = make_server(conn, client)
+    server.self_id = 99
+
+    result = await server._dispatch(
+        {"method": "get_sync_status", "dialog_id": dialog_id}
+    )
+    assert result["ok"] is True
+    assert client.get_messages.call_count == 0

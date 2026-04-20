@@ -103,6 +103,16 @@ def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.
     )
     conn.execute(
         """
+        CREATE TABLE IF NOT EXISTS message_reactions_freshness (
+            dialog_id   INTEGER NOT NULL,
+            message_id  INTEGER NOT NULL,
+            checked_at  INTEGER NOT NULL,
+            PRIMARY KEY (dialog_id, message_id)
+        ) WITHOUT ROWID
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS message_versions (
             dialog_id   INTEGER NOT NULL,
             message_id  INTEGER NOT NULL,
