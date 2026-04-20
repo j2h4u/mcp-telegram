@@ -175,14 +175,23 @@ def format_search_message_groups(
 
 
 def _resolve_sender_name(msg: MessageLike) -> str:
-    """Return the sender's first name, or 'Unknown' if not available."""
+    """Return the sender label for a message.
+
+    Three-way fallback (locked decision, Phase 39):
+      1. sender_id is None        → "System" (service messages)
+      2. first_name resolves      → return it (daemon path: already COALESCEd;
+                                     Telethon path: msg.sender is hydrated)
+      3. sender_id present but    → f"(unknown user {sender_id})"
+         name missing
+    """
+    sender_id = getattr(msg, "sender_id", None)
+    if sender_id is None:
+        return "System"
     sender = getattr(msg, "sender", None)
-    if sender is None:
-        return "Unknown"
-    first_name = getattr(sender, "first_name", None)
-    if not first_name:
-        return "Unknown"
-    return first_name
+    first_name = getattr(sender, "first_name", None) if sender is not None else None
+    if first_name:
+        return first_name
+    return f"(unknown user {sender_id})"
 
 
 def _render_text(msg: MessageLike) -> str:
