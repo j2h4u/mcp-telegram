@@ -87,8 +87,18 @@ from .pagination import (
     encode_history_navigation,
     encode_search_navigation,
 )
+from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
+
 from .formatter import format_reaction_counts
-from .sync_worker import extract_reply_and_topic
+from .sync_worker import (
+    apply_reactions_delta,
+    extract_reactions_rows,
+    extract_reply_and_topic,
+)
+
+# Phase 39.2 §Key technical decisions: per-message TTL for JIT reactions freshen-on-read.
+# Amortizes rapid paginated reads on the same ids; live events catch most mutations.
+REACTIONS_TTL_SECONDS = 600
 from .resolver import (
     Candidates,
     NotFound,
@@ -913,6 +923,76 @@ class DaemonAPIServer:
                 last_msg_id, dialog_id, direction=direction_enum
             )
         return None
+
+    async def _freshen_reactions_if_stale(
+        self, dialog_id: int, entity: Any, message_ids: list[int]
+    ) -> None:
+        """Per-message TTL-gated JIT reaction freshen (Phase 39.2 Plan 02).
+
+        Looks up freshness rows for ``message_ids``; for any id whose
+        ``checked_at > now - REACTIONS_TTL_SECONDS`` it skips. Fetches ONLY
+        the stale subset from Telegram via ``client.get_messages(entity, ids=...)``
+        in a single bounded round-trip. For each non-None Message returned,
+        applies the reaction delta and upserts the freshness row. Partial
+        ``None`` results retain their prior freshness state (AC-6-PARTIAL).
+
+        On ``FloodWaitError``: warning logged; no DB mutation; stale cache
+        remains served. Other exceptions: logged + swallowed; stale cache
+        served. The fetch window is bounded to ``len(stale_ids)`` and is
+        never expanded — never escalates to ``iter_messages`` or full-history.
+        """
+        if not message_ids:
+            return
+        # synced_dialogs gate: missing row → never freshen (e.g. unsynced dialog).
+        row = self._conn.execute(
+            "SELECT 1 FROM synced_dialogs WHERE dialog_id = ?", (dialog_id,)
+        ).fetchone()
+        if row is None:
+            return
+
+        now = int(time.time())
+        threshold = now - REACTIONS_TTL_SECONDS
+        placeholders = ",".join("?" * len(message_ids))
+        fresh_rows = self._conn.execute(
+            f"SELECT message_id FROM message_reactions_freshness "
+            f"WHERE dialog_id = ? AND message_id IN ({placeholders}) "
+            f"AND checked_at > ?",
+            [dialog_id, *message_ids, threshold],
+        ).fetchall()
+        fresh_ids = {int(r[0]) for r in fresh_rows}
+        stale_ids = [mid for mid in message_ids if mid not in fresh_ids]
+        if not stale_ids:
+            return  # AC-4: zero API cost
+
+        try:
+            messages = await self._client.get_messages(entity, ids=stale_ids)
+        except FloodWaitError as exc:
+            logger.warning(
+                "jit_reactions_floodwait dialog_id=%d stale_count=%d seconds=%d",
+                dialog_id,
+                len(stale_ids),
+                getattr(exc, "seconds", 0),
+            )
+            return  # AC-6: no freshness upsert, no reaction mutation
+        except Exception:
+            logger.exception("jit_reactions_failed dialog_id=%d", dialog_id)
+            return
+
+        # Telethon `get_messages(ids=list)` returns a list aligned to input order;
+        # `None` for missing entries (AC-6-PARTIAL).
+        with self._conn:
+            for msg_id, msg in zip(stale_ids, messages):
+                if msg is None:
+                    continue
+                rows = extract_reactions_rows(
+                    dialog_id, msg_id, getattr(msg, "reactions", None)
+                )
+                apply_reactions_delta(self._conn, dialog_id, msg_id, rows)
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO message_reactions_freshness "
+                    "(dialog_id, message_id, checked_at) VALUES (?, ?, ?)",
+                    (dialog_id, msg_id, now),
+                )
 
     async def _resolve_unread_position(
         self, dialog_id: int, unread_after_id: int | None,
