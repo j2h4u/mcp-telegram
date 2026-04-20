@@ -16,6 +16,7 @@ class MockMessage:
     date: datetime          # must be timezone-aware (UTC)
     message: str = ""
     sender: MockSender | None = None
+    sender_id: int | None = None
     media: object = None
     reactions: object = None
     reply_to: object = None
@@ -162,13 +163,13 @@ def test_newest_first_ordering() -> None:
 
 
 def test_unknown_sender() -> None:
-    """Message with no sender falls back to 'Unknown'."""
+    """Service message (sender_id=None, sender=None) falls back to 'System'."""
     from mcp_telegram.formatter import format_messages
 
     dt = datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
-    msg = MockMessage(id=1, date=dt, message="anonymous", sender=None)
+    msg = MockMessage(id=1, date=dt, message="anonymous", sender=None, sender_id=None)
     result = format_messages([msg], {})
-    assert "Unknown: anonymous" in result, f"Expected 'Unknown: anonymous', got: {result!r}"
+    assert "System: anonymous" in result, f"Expected 'System: anonymous', got: {result!r}"
 
 
 def test_media_fallback() -> None:
@@ -431,3 +432,49 @@ def test_edited_marker_before_reactions() -> None:
     assert result.index("[edited") < result.index("[👍"), (
         f"Expected '[edited' to appear before '[👍' in: {result!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# _resolve_sender_name three-way fallback tests (Phase 39)
+# ---------------------------------------------------------------------------
+
+from types import SimpleNamespace
+
+
+def _rsn_msg(sender_id, sender_first_name=...):
+    """Build a minimal message-like object for _resolve_sender_name."""
+    if sender_first_name is ...:
+        sender = None
+    else:
+        sender = SimpleNamespace(first_name=sender_first_name)
+    return SimpleNamespace(sender_id=sender_id, sender=sender)
+
+
+def test_resolve_sender_name_returns_system_when_sender_id_is_none():
+    from mcp_telegram.formatter import _resolve_sender_name
+    assert _resolve_sender_name(_rsn_msg(sender_id=None)) == "System"
+
+
+def test_resolve_sender_name_returns_system_even_if_sender_object_has_first_name():
+    from mcp_telegram.formatter import _resolve_sender_name
+    assert _resolve_sender_name(_rsn_msg(sender_id=None, sender_first_name="Ignored")) == "System"
+
+
+def test_resolve_sender_name_returns_first_name_when_present():
+    from mcp_telegram.formatter import _resolve_sender_name
+    assert _resolve_sender_name(_rsn_msg(sender_id=42, sender_first_name="Alice")) == "Alice"
+
+
+def test_resolve_sender_name_returns_unknown_user_with_id_when_sender_missing():
+    from mcp_telegram.formatter import _resolve_sender_name
+    assert _resolve_sender_name(_rsn_msg(sender_id=42)) == "(unknown user 42)"
+
+
+def test_resolve_sender_name_returns_unknown_user_with_id_when_first_name_none():
+    from mcp_telegram.formatter import _resolve_sender_name
+    assert _resolve_sender_name(_rsn_msg(sender_id=42, sender_first_name=None)) == "(unknown user 42)"
+
+
+def test_resolve_sender_name_returns_unknown_user_with_id_when_first_name_empty():
+    from mcp_telegram.formatter import _resolve_sender_name
+    assert _resolve_sender_name(_rsn_msg(sender_id=42, sender_first_name="")) == "(unknown user 42)"
