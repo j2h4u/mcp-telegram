@@ -371,6 +371,24 @@ async def sync_main() -> None:
         me = await client.get_me()
         api_server.self_id = int(me.id)
         logger.info("daemon self_id cached: %s", api_server.self_id)
+
+        # Post-v10 runtime backfill: mark historical outgoing DM rows as out=1
+        # using sender_id=self_id (the authoritative signal). Pure-SQL v10
+        # migration can only match sender_id IS NULL, but re-ingestion after
+        # Phase 39.1 typically populates sender_id with the real peer/self
+        # values — so the NULL-sender shape is rare in practice. This daemon
+        # step closes the gap once self_id is known. Idempotent via out=0.
+        try:
+            cur = conn.execute(
+                "UPDATE messages SET out = 1 "
+                "WHERE out = 0 AND dialog_id > 0 AND sender_id = ?",
+                (api_server.self_id,),
+            )
+            conn.commit()
+            if cur.rowcount > 0:
+                logger.info("backfilled out=1 on %d historical outgoing DM rows", cur.rowcount)
+        except Exception:
+            logger.warning("out=1 backfill skipped — non-fatal", exc_info=True)
         socket_path = get_daemon_socket_path()
         socket_path.unlink(missing_ok=True)
         old_umask = os.umask(0o177)  # ensure socket created as 0o600 with no race
