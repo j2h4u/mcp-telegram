@@ -91,6 +91,34 @@ _DELETE_REACTIONS_SQL = (
     "DELETE FROM message_reactions WHERE dialog_id = ? AND message_id = ?"
 )
 
+
+def apply_reactions_delta(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    message_id: int,
+    reaction_rows: list[tuple],
+) -> None:
+    """Per-message reaction delta primitive.
+
+    DELETE existing rows for ``(dialog_id, message_id)`` then INSERT OR REPLACE
+    the supplied rows. Empty ``reaction_rows`` still performs the DELETE — this
+    is the reaction-removal path (Phase 39.2 AC-2 / AC-2-RAW).
+
+    The caller controls transaction boundary (e.g. ``with conn:``); this helper
+    does NOT open its own transaction.
+
+    Tuple shape matches ``extract_reactions_rows`` output:
+    ``(dialog_id, message_id, emoji, count)``.
+
+    Per-message primitive used by event handlers and JIT freshen path.
+    FullSyncWorker retains its own batched ``executemany`` insert path
+    (insert_messages_with_fts) for bulk history inserts; that code path is
+    intentionally NOT refactored to share this helper.
+    """
+    conn.execute(_DELETE_REACTIONS_SQL, (dialog_id, message_id))
+    if reaction_rows:
+        conn.executemany(INSERT_REACTION_SQL, reaction_rows)
+
 _DELETE_ENTITIES_SQL = (
     "DELETE FROM message_entities WHERE dialog_id = ? AND message_id = ?"
 )
