@@ -8,7 +8,7 @@ from pathlib import Path
 
 from xdg_base_dirs import xdg_state_home  # type: ignore[import-error]
 
-_CURRENT_SCHEMA_VERSION = 10
+_CURRENT_SCHEMA_VERSION = 11
 
 logger = logging.getLogger(__name__)
 
@@ -387,6 +387,20 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     _migrate(10, [
         "UPDATE messages SET out = 1 "
         "WHERE out = 0 AND dialog_id > 0 AND sender_id IS NULL",
+    ])
+
+    # v11 per CONTEXT.md §Scope#4: per-message freshness side-table chosen
+    # over dialog-level timestamp (Codex HIGH: slice-bounded refresh +
+    # dialog-level TTL = false freshness) and over column-on-messages
+    # (keeps row width stable; separation of concerns). Missing row =
+    # "never freshened" — Plan 02 JIT path triggers naturally.
+    _migrate(11, [
+        "CREATE TABLE IF NOT EXISTS message_reactions_freshness ("
+        "    dialog_id INTEGER NOT NULL, "
+        "    message_id INTEGER NOT NULL, "
+        "    checked_at INTEGER NOT NULL, "
+        "    PRIMARY KEY (dialog_id, message_id)"
+        ") WITHOUT ROWID",
     ])
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
