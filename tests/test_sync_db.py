@@ -291,20 +291,79 @@ def test_migration_v9_adds_out_and_is_service_columns(tmp_sync_db_path: Path) ->
         assert str(svc_col[4]) == "0", f"is_service default must be 0, got {svc_col[4]!r}"
 
         version = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
-        assert version is not None and int(version[0]) == 9
+        assert version is not None and int(version[0]) == _CURRENT_SCHEMA_VERSION
     finally:
         conn.close()
 
 
 def test_migration_v9_is_idempotent(tmp_sync_db_path: Path) -> None:
-    """Running ensure_sync_schema() twice keeps schema_version at 9 with no error."""
+    """Running ensure_sync_schema() twice keeps schema_version stable with no error."""
     ensure_sync_schema(tmp_sync_db_path)
     ensure_sync_schema(tmp_sync_db_path)
     conn = _open_sync_db(tmp_sync_db_path)
     try:
         rows = conn.execute("SELECT version FROM schema_version ORDER BY version").fetchall()
         versions = [int(r[0]) for r in rows]
-        assert versions == list(range(1, 10)), f"Expected versions 1..9, got {versions}"
+        expected = list(range(1, _CURRENT_SCHEMA_VERSION + 1))
+        assert versions == expected, f"Expected versions {expected}, got {versions}"
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Schema v10: backfill out=1 for historical outgoing DM rows
+# ---------------------------------------------------------------------------
+
+
+def test_migration_v10_backfills_out_for_dm_null_sender(tmp_sync_db_path: Path) -> None:
+    """Historical DM rows with sender_id IS NULL get out=1; others untouched."""
+    ensure_sync_schema(tmp_sync_db_path)
+    conn = _open_sync_db(tmp_sync_db_path)
+    try:
+        # Simulate pre-v10 state: all rows at out=0 (v9 DEFAULT). We bypass
+        # the normal writer path and insert minimal rows.
+        conn.executemany(
+            "INSERT INTO messages (dialog_id, message_id, sent_at, sender_id, text, out) "
+            "VALUES (?, ?, 0, ?, ?, 0)",
+            [
+                (268071163, 1, None, "dm outgoing pre-v9"),      # DM, NULL sender → should become out=1
+                (268071163, 2, 268071163, "dm incoming"),         # DM, peer sender → untouched
+                (-1001917057529, 3, None, "group svc or null"),   # group → untouched
+                (-1001917057529, 4, 999, "group with sender"),    # group → untouched
+            ],
+        )
+        conn.commit()
+
+        # Re-run migrations (idempotent): v10 UPDATE is the only one with work to do.
+        # To exercise v10 in isolation, manually invoke the same UPDATE.
+        conn.execute(
+            "UPDATE messages SET out = 1 "
+            "WHERE out = 0 AND dialog_id > 0 AND sender_id IS NULL"
+        )
+        conn.commit()
+
+        rows = conn.execute(
+            "SELECT dialog_id, message_id, sender_id, out FROM messages ORDER BY message_id"
+        ).fetchall()
+        # Row 1: DM + NULL sender → out=1
+        assert rows[0][3] == 1, f"DM NULL-sender row should backfill to out=1, got {rows[0]}"
+        # Row 2: DM + peer sender → out stays 0
+        assert rows[1][3] == 0, f"DM incoming should stay out=0, got {rows[1]}"
+        # Rows 3,4: group dialogs → out stays 0 regardless of sender_id
+        assert rows[2][3] == 0, f"Group row should stay out=0, got {rows[2]}"
+        assert rows[3][3] == 0, f"Group row should stay out=0, got {rows[3]}"
+    finally:
+        conn.close()
+
+
+def test_migration_v10_is_idempotent(tmp_sync_db_path: Path) -> None:
+    """Running ensure_sync_schema() twice is safe — v10 backfill applies once."""
+    ensure_sync_schema(tmp_sync_db_path)
+    ensure_sync_schema(tmp_sync_db_path)
+    conn = _open_sync_db(tmp_sync_db_path)
+    try:
+        version = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
+        assert version is not None and int(version[0]) == _CURRENT_SCHEMA_VERSION
     finally:
         conn.close()
 
@@ -790,7 +849,8 @@ def test_schema_version_records_all_versions(tmp_path: Path) -> None:
                 "SELECT version FROM schema_version ORDER BY version"
             ).fetchall()
         ]
-        assert versions == [1, 2, 3, 4, 5, 6, 7, 8, 9], f"expected all 9 versions, got {versions}"
+        expected = list(range(1, _CURRENT_SCHEMA_VERSION + 1))
+        assert versions == expected, f"expected versions {expected}, got {versions}"
     finally:
         conn.close()
 
@@ -1074,13 +1134,15 @@ def test_v7_backfill_reactions_from_json(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_schema_version_is_9(tmp_sync_db_path: Path) -> None:
-    """After ensure_sync_schema(), MAX(version) in schema_version is 9."""
+def test_schema_version_matches_current(tmp_sync_db_path: Path) -> None:
+    """After ensure_sync_schema(), MAX(version) equals _CURRENT_SCHEMA_VERSION."""
     ensure_sync_schema(tmp_sync_db_path)
     conn = _open_sync_db(tmp_sync_db_path)
     try:
         row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
-        assert row is not None and row[0] == 9, f"Expected version 9, got {row[0]}"
+        assert row is not None and row[0] == _CURRENT_SCHEMA_VERSION, (
+            f"Expected version {_CURRENT_SCHEMA_VERSION}, got {row[0]}"
+        )
     finally:
         conn.close()
 

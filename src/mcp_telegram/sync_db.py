@@ -8,7 +8,7 @@ from pathlib import Path
 
 from xdg_base_dirs import xdg_state_home  # type: ignore[import-error]
 
-_CURRENT_SCHEMA_VERSION = 9
+_CURRENT_SCHEMA_VERSION = 10
 
 logger = logging.getLogger(__name__)
 
@@ -376,6 +376,17 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     _migrate(9, [
         "ALTER TABLE messages ADD COLUMN out INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE messages ADD COLUMN is_service INTEGER NOT NULL DEFAULT 0",
+    ])
+
+    # v10: backfill out=1 for historical outgoing DM rows. Pre-v9 writes had no
+    # 'out' column, so v9 DEFAULT 0 left all historical rows at out=0. In DMs
+    # (dialog_id > 0), the original bug shape was "outgoing row arrives with
+    # sender_id IS NULL". Incoming DM rows always carry sender_id=peer_id, so
+    # NULL sender_id in a DM is a reliable marker for outgoing. Idempotent:
+    # subsequent runs find no matching rows (already out=1 or already labelled).
+    _migrate(10, [
+        "UPDATE messages SET out = 1 "
+        "WHERE out = 0 AND dialog_id > 0 AND sender_id IS NULL",
     ])
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
