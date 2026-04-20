@@ -12,6 +12,11 @@ from .models import LinePrefixGetter, MessageLike, TopicNameGetter
 # (flags meaningful pauses in conversation flow).
 SESSION_BREAK_MINUTES = 60
 
+# Label for outgoing DM messages. Bracketed form signals "role marker" to LLMs
+# (ChatML/OpenAI convention: [user], [assistant], [system]), avoiding the
+# first-person ambiguity of a bare "Я" when the model later paraphrases the log.
+SELF_SENDER_LABEL = "[me]"
+
 
 def format_messages(
     messages: list[MessageLike],
@@ -179,7 +184,7 @@ def resolve_sender_label(msg_or_row: object) -> str:
 
     Five-branch decision (Phase 39.1-02 contract; supersedes Phase 39 three-way):
       1. is_service == 1                           → "System"
-      2. out == 1 AND dialog_id > 0 AND is_service=0 → "Я"  (DM outgoing literal)
+      2. out == 1 AND dialog_id > 0 AND is_service=0 → SELF_SENDER_LABEL (DM outgoing)
       3. first_name resolves (non-empty str)       → first_name
       4. effective_sender_id OR sender_id known    → "(unknown user {id})"
       5. else                                      → "(unknown user)"
@@ -209,9 +214,9 @@ def resolve_sender_label(msg_or_row: object) -> str:
     # Branch 1: service message wins regardless of other fields
     if is_service == 1:
         return "System"
-    # Branch 2: DM outgoing → "Я" (literal, no self_id comparison needed at render)
+    # Branch 2: DM outgoing → SELF_SENDER_LABEL (no self_id comparison needed at render)
     if out_flag == 1 and (dialog_id or 0) > 0:
-        return "Я"
+        return SELF_SENDER_LABEL
     # Branch 3: known first_name
     if isinstance(first_name, str) and first_name:
         return first_name

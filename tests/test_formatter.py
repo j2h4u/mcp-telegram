@@ -493,12 +493,13 @@ def test_resolve_sender_name_service_message_ignores_first_name():
     ) == "System"
 
 
-def test_resolve_sender_name_dm_outgoing_renders_ya():
-    """DM outgoing (out=1, dialog_id>0, is_service=0) → literal 'Я'."""
-    from mcp_telegram.formatter import _resolve_sender_name
+def test_resolve_sender_name_dm_outgoing_renders_self_label():
+    """DM outgoing (out=1, dialog_id>0, is_service=0) → SELF_SENDER_LABEL."""
+    from mcp_telegram.formatter import SELF_SENDER_LABEL, _resolve_sender_name
     assert _resolve_sender_name(
         _rsn_msg(sender_id=None, out=1, dialog_id=268071163, is_service=0)
-    ) == "Я"
+    ) == SELF_SENDER_LABEL
+    assert SELF_SENDER_LABEL == "[me]"
 
 
 def test_resolve_sender_name_dm_incoming_with_first_name():

@@ -51,8 +51,9 @@ def test_search_snippet_renders_system_when_is_service():
     assert " System (msg_id:1)" in out
 
 
-def test_search_snippet_dm_outgoing_renders_ya():
-    """DM outgoing (out=1, dialog_id>0, is_service=0) renders 'Я'."""
+def test_search_snippet_dm_outgoing_renders_self_label():
+    """DM outgoing (out=1, dialog_id>0, is_service=0) renders SELF_SENDER_LABEL."""
+    from mcp_telegram.formatter import SELF_SENDER_LABEL
     out = _format_search_results(
         [_row(
             sender_id=None, sender_first_name=None,
@@ -61,8 +62,7 @@ def test_search_snippet_dm_outgoing_renders_ya():
         )],
         "hello",
     )
-    # The Russian letter 'Я' must appear as the sender token
-    assert " \u042f (msg_id:1)" in out
+    assert f" {SELF_SENDER_LABEL} (msg_id:1)" in out
 
 
 def test_search_snippet_dm_incoming_uses_first_name():
