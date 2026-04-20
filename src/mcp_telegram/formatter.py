@@ -174,24 +174,58 @@ def format_search_message_groups(
     return "\n\n".join(parts)
 
 
-def _resolve_sender_name(msg: MessageLike) -> str:
-    """Return the sender label for a message.
+def resolve_sender_label(msg_or_row: object) -> str:
+    """Return the sender label for a message-like object or daemon row dict.
 
-    Three-way fallback (locked decision, Phase 39):
-      1. sender_id is None        → "System" (service messages)
-      2. first_name resolves      → return it (daemon path: already COALESCEd;
-                                     Telethon path: msg.sender is hydrated)
-      3. sender_id present but    → f"(unknown user {sender_id})"
-         name missing
+    Five-branch decision (Phase 39.1-02 contract; supersedes Phase 39 three-way):
+      1. is_service == 1                           → "System"
+      2. out == 1 AND dialog_id > 0 AND is_service=0 → "Я"  (DM outgoing literal)
+      3. first_name resolves (non-empty str)       → first_name
+      4. effective_sender_id OR sender_id known    → "(unknown user {id})"
+      5. else                                      → "(unknown user)"
+
+    Accepts both MessageLike objects (attribute access) and row dicts (key access)
+    — uses getattr with safe defaults so both shapes work. Reading-tool callers
+    pass row dicts through a SimpleNamespace or call directly with a dict-like
+    wrapper; formatter callers pass MessageLike/DaemonMessage objects.
     """
-    sender_id = getattr(msg, "sender_id", None)
-    if sender_id is None:
+    if isinstance(msg_or_row, dict):
+        get = msg_or_row.get
+        is_service = int(get("is_service") or 0)
+        out_flag = int(get("out") or 0)
+        dialog_id = get("dialog_id") or 0
+        first_name = get("sender_first_name")
+        effective_sender_id = get("effective_sender_id")
+        sender_id = get("sender_id")
+    else:
+        is_service = int(getattr(msg_or_row, "is_service", 0) or 0)
+        out_flag = int(getattr(msg_or_row, "out", 0) or 0)
+        dialog_id = getattr(msg_or_row, "dialog_id", 0) or 0
+        sender_obj = getattr(msg_or_row, "sender", None)
+        first_name = getattr(sender_obj, "first_name", None) if sender_obj is not None else None
+        effective_sender_id = getattr(msg_or_row, "effective_sender_id", None)
+        sender_id = getattr(msg_or_row, "sender_id", None)
+
+    # Branch 1: service message wins regardless of other fields
+    if is_service == 1:
         return "System"
-    sender = getattr(msg, "sender", None)
-    first_name = getattr(sender, "first_name", None) if sender is not None else None
-    if first_name:
+    # Branch 2: DM outgoing → "Я" (literal, no self_id comparison needed at render)
+    if out_flag == 1 and (dialog_id or 0) > 0:
+        return "Я"
+    # Branch 3: known first_name
+    if isinstance(first_name, str) and first_name:
         return first_name
-    return f"(unknown user {sender_id})"
+    # Branch 4: id is known but name unresolved
+    resolved_id = effective_sender_id if effective_sender_id is not None else sender_id
+    if resolved_id is not None:
+        return f"(unknown user {resolved_id})"
+    # Branch 5: nothing to work with
+    return "(unknown user)"
+
+
+def _resolve_sender_name(msg: MessageLike) -> str:
+    """Backward-compatible wrapper delegating to resolve_sender_label."""
+    return resolve_sender_label(msg)
 
 
 def _render_text(msg: MessageLike) -> str:

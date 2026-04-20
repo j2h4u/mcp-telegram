@@ -44,6 +44,10 @@ class DaemonMessage:
     __slots__ = (
         "id", "date", "message", "sender", "reply_to", "reactions", "media",
         "edit_date", "topic_title", "dialog_name",
+        # Phase 39.1-02: direction + service discriminators for DM rendering.
+        # effective_sender_id collapses DM direction to a concrete user id;
+        # is_service flags MessageService rows so formatter renders "System".
+        "sender_id", "effective_sender_id", "is_service", "out", "dialog_id",
     )
 
     def __init__(self, row: dict) -> None:
@@ -68,6 +72,11 @@ class DaemonMessage:
             self.edit_date = None
         self.topic_title: str | None = row.get("topic_title")
         self.dialog_name: str | None = row.get("dialog_name")
+        self.sender_id: int | None = row.get("sender_id")
+        self.effective_sender_id: int | None = row.get("effective_sender_id")
+        self.is_service: int = int(row.get("is_service") or 0)
+        self.out: int = int(row.get("out") or 0)
+        self.dialog_id: int | None = row.get("dialog_id")
 
 
 class Sender:

@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from pydantic import Field, model_validator
 
 from ..errors import dialog_not_found_text, invalid_navigation_text, search_no_hits_text
-from ..formatter import format_messages
+from ..formatter import format_messages, resolve_sender_label
 from ..resolver import parse_exact_dialog_id
 from ._adapters import DaemonMessage
 from ._base import (
@@ -143,16 +143,9 @@ def _format_search_results(rows: list[dict], query: str, *, global_mode: bool = 
     for row in rows:
         msg_id = row["message_id"]
         sent_at = row.get("sent_at") or 0
-        # Phase 39: align with formatter._resolve_sender_name fallback labels.
-        # sender_first_name is already COALESCEd against entities.name by daemon SQL
-        # (Plan 39-01). When still missing, branch on sender_id presence.
-        _sender_name = row.get("sender_first_name")
-        if _sender_name:
-            sender = _sender_name
-        elif row.get("sender_id") is None:
-            sender = "System"
-        else:
-            sender = f"(unknown user {row['sender_id']})"
+        # Phase 39.1-02: shared 5-branch resolution with formatter.resolve_sender_label.
+        # Single source of truth — same decision tree for list_messages and search_messages.
+        sender = resolve_sender_label(row)
         dt = datetime.fromtimestamp(int(sent_at), tz=timezone.utc)
         time_str = dt.strftime("%Y-%m-%d %H:%M")
         snippet = _extract_snippet(row.get("text"), query)

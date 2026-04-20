@@ -165,11 +165,14 @@ def test_newest_first_ordering() -> None:
 
 
 def test_unknown_sender() -> None:
-    """Service message (sender_id=None, sender=None) falls back to 'System'."""
+    """Service message (is_service=1) renders as 'System' (Phase 39.1-02 contract)."""
     from mcp_telegram.formatter import format_messages
 
     dt = datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
     msg = MockMessage(id=1, date=dt, message="anonymous", sender=None, sender_id=None)
+    # Phase 39.1-02: "System" now requires is_service=1 (not just sender_id=None).
+    # MockMessage lacks is_service; set via direct attribute assignment.
+    msg.is_service = 1  # type: ignore[attr-defined]
     result = format_messages([msg], {})
     assert "System: anonymous" in result, f"Expected 'System: anonymous', got: {result!r}"
 
@@ -446,23 +449,89 @@ def test_edited_marker_before_reactions() -> None:
 from types import SimpleNamespace
 
 
-def _rsn_msg(sender_id, sender_first_name=...):
-    """Build a minimal message-like object for _resolve_sender_name."""
+def _rsn_msg(
+    sender_id=None,
+    sender_first_name=...,
+    *,
+    is_service=0,
+    out=0,
+    dialog_id=0,
+    effective_sender_id=None,
+):
+    """Build a minimal message-like object for resolve_sender_label / _resolve_sender_name.
+
+    Phase 39.1-02: carries is_service, out, dialog_id, effective_sender_id in
+    addition to sender_id/sender_first_name to exercise the 5-branch decision.
+    """
     if sender_first_name is ...:
         sender = None
     else:
         sender = SimpleNamespace(first_name=sender_first_name)
-    return SimpleNamespace(sender_id=sender_id, sender=sender)
+    return SimpleNamespace(
+        sender_id=sender_id,
+        sender=sender,
+        is_service=is_service,
+        out=out,
+        dialog_id=dialog_id,
+        effective_sender_id=effective_sender_id,
+    )
 
 
-def test_resolve_sender_name_returns_system_when_sender_id_is_none():
+# --- Phase 39.1-02: 5-branch decision tree tests ---
+
+
+def test_resolve_sender_name_service_message_renders_system():
     from mcp_telegram.formatter import _resolve_sender_name
-    assert _resolve_sender_name(_rsn_msg(sender_id=None)) == "System"
+    # is_service=1 → "System" regardless of other fields
+    assert _resolve_sender_name(_rsn_msg(sender_id=None, is_service=1)) == "System"
 
 
-def test_resolve_sender_name_returns_system_even_if_sender_object_has_first_name():
+def test_resolve_sender_name_service_message_ignores_first_name():
     from mcp_telegram.formatter import _resolve_sender_name
-    assert _resolve_sender_name(_rsn_msg(sender_id=None, sender_first_name="Ignored")) == "System"
+    assert _resolve_sender_name(
+        _rsn_msg(sender_id=42, sender_first_name="Alice", is_service=1)
+    ) == "System"
+
+
+def test_resolve_sender_name_dm_outgoing_renders_ya():
+    """DM outgoing (out=1, dialog_id>0, is_service=0) → literal 'Я'."""
+    from mcp_telegram.formatter import _resolve_sender_name
+    assert _resolve_sender_name(
+        _rsn_msg(sender_id=None, out=1, dialog_id=268071163, is_service=0)
+    ) == "Я"
+
+
+def test_resolve_sender_name_dm_incoming_with_first_name():
+    from mcp_telegram.formatter import _resolve_sender_name
+    assert _resolve_sender_name(
+        _rsn_msg(
+            sender_id=None, sender_first_name="Alice",
+            out=0, dialog_id=268071163, is_service=0,
+            effective_sender_id=268071163,
+        )
+    ) == "Alice"
+
+
+def test_resolve_sender_name_dm_incoming_unknown_renders_unknown_user_with_id():
+    """DM incoming with no first_name → '(unknown user <effective_sender_id>)'."""
+    from mcp_telegram.formatter import _resolve_sender_name
+    assert _resolve_sender_name(
+        _rsn_msg(
+            sender_id=None, out=0, dialog_id=268071163,
+            is_service=0, effective_sender_id=268071163,
+        )
+    ) == "(unknown user 268071163)"
+
+
+def test_resolve_sender_name_group_unknown_sender_renders_unknown_user():
+    """Group unknown sender (no id anywhere) → '(unknown user)'."""
+    from mcp_telegram.formatter import _resolve_sender_name
+    assert _resolve_sender_name(
+        _rsn_msg(sender_id=None, out=0, dialog_id=-100123, is_service=0)
+    ) == "(unknown user)"
+
+
+# --- Legacy Phase 39 tests, migrated to Phase 39.1-02 contract ---
 
 
 def test_resolve_sender_name_returns_first_name_when_present():
