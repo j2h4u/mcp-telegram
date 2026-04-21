@@ -371,6 +371,11 @@ _SELECT_SYNCED_STATUSES_SQL = (
 # MEDIUM-2 + <threat_model> T-39.3-15c). Header rendering separately maps
 # NULL cursor → "[inbox: unknown (sync pending)]" (D-03) — the two semantics
 # diverge intentionally.
+#
+# Contract note (WR-06): results of this query are emitted on `list_dialogs`
+# rows as `unread_in` / `unread_out` ONLY for DMs (type == "User"). Non-DM
+# rows OMIT both keys entirely. See the inline comment in `_list_dialogs`
+# where the keys are conditionally attached for the full contract text.
 _BATCHED_UNREAD_COUNTS_SQL = (
     "SELECT m.dialog_id, "
     "SUM(CASE WHEN m.\"out\" = 0 AND m.message_id > COALESCE(sd.read_inbox_max_id, -1) "
@@ -1731,6 +1736,16 @@ class DaemonAPIServer:
                 }
                 # Plan 39.3-03 Task 4: include unread_in / unread_out ONLY for DMs
                 # (dialog_type == "User"). Non-DM rows OMIT both keys (AC-11).
+                #
+                # DAEMON API CONTRACT (WR-06): `unread_in` and `unread_out` are
+                # PRESENT only on rows where `type == "User"`. For non-DM rows
+                # (Bot / Group / Channel / Forum / Chat / Unknown) the keys are
+                # ABSENT — not set to None, not set to 0. Consumers must
+                # distinguish "missing key" (non-DM, counts undefined) from
+                # "present with value 0" (DM with nothing unread) using
+                # membership tests (e.g. `"unread_in" in d`) or `.get()` with
+                # an explicit sentinel. This is the canonical contract; the
+                # `ListDialogs` tool docstring mirrors it for the public surface.
                 if entity_type == "User":
                     in_cnt, out_cnt = unread_counts.get(d.id, (0, 0))
                     row["unread_in"] = in_cnt
