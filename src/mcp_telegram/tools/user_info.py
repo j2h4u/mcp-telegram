@@ -59,6 +59,8 @@ async def get_user_info(args: GetUserInfo) -> ToolResult:
                 line += f' @{match["username"]}'
             if match.get("entity_type"):
                 line += f' [{match["entity_type"]}]'
+            if match.get("disambiguation_hint"):
+                line += f'  hint="{match["disambiguation_hint"]}"'
             match_lines.append(line)
         return ToolResult(content=_text_response(
             ambiguous_user_text(args.user, match_lines, retry_tool="GetUserInfo"),
