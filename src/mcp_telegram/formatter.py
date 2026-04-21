@@ -1,4 +1,5 @@
 
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -6,6 +7,8 @@ from zoneinfo import ZoneInfo
 import telethon.tl.types as tl  # type: ignore[import-untyped]
 
 from .models import LinePrefixGetter, MessageLike, ReadState, TopicNameGetter
+
+logger = logging.getLogger(__name__)
 
 # Messages separated by more than this gap get a visual session break marker.
 # 60 min balances readability (avoids clutter in active chats) with context
@@ -33,8 +36,18 @@ def _format_relative_delta(now_unix: int, then_unix: int) -> str:
     - delta ≥ 7 days     → ``{weeks}w``
 
     Negative deltas (future timestamps — shouldn't happen) render as ``0m``.
+    Clock skew between the daemon and the formatter (or server-side timestamps
+    arriving slightly ahead of local ``time.time()``) is a known reality on
+    Telegram; log at debug so the clamp isn't silent (IN-04).
     """
-    delta = max(0, int(now_unix) - int(then_unix))
+    delta_raw = int(now_unix) - int(then_unix)
+    if delta_raw < 0:
+        logger.debug(
+            "read_state_header_negative_delta now=%d then=%d",
+            int(now_unix),
+            int(then_unix),
+        )
+    delta = max(0, delta_raw)
     minutes_total = delta // 60
     if minutes_total < 60:
         return f"{minutes_total}m"
