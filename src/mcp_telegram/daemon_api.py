@@ -114,33 +114,39 @@ def _read_state_for_dialog(
     if dialog_type != "User":
         return None
 
-    cursor_row = conn.execute(
-        "SELECT read_inbox_max_id, read_outbox_max_id "
-        "FROM synced_dialogs WHERE dialog_id = ?",
-        (dialog_id,),
-    ).fetchone()
-    if cursor_row is None:
-        read_inbox_max_id, read_outbox_max_id = None, None
-    else:
-        read_inbox_max_id, read_outbox_max_id = cursor_row[0], cursor_row[1]
-
-    # Aggregate incoming/outgoing unread counts + oldest-unread-sent_at in one pass.
-    # NOTE: NULL cursor → COALESCE(cursor, -1) treats ALL messages on that side as unread
-    # in row semantics (matches the bootstrap-pending trade-off documented in
-    # <interfaces> §MEDIUM-2). Header rendering separately renders cursor_state="null"
-    # as "unknown (sync pending)" — see formatter._render_read_state_header.
-    agg_row = conn.execute(
+    # WR-04 + WR-05: fold cursor lookup and count aggregation into a single
+    # statement (CTE) for atomic snapshot consistency. Without this, a
+    # concurrent on_message_read / on_outbox_read writer committing between
+    # the two reads could produce a mathematically inconsistent response
+    # (cursor at T0, count at T1). WR-05: exclude tombstoned messages
+    # (is_deleted = 0) so counts match _BATCHED_UNREAD_COUNTS_SQL used by
+    # list_dialogs.
+    row = conn.execute(
         """
+        WITH sd AS (
+          SELECT read_inbox_max_id AS in_c, read_outbox_max_id AS out_c
+          FROM synced_dialogs WHERE dialog_id = :dialog_id
+        )
         SELECT
-          SUM(CASE WHEN out = 0 AND message_id > COALESCE(:in_c, -1) THEN 1 ELSE 0 END) AS in_cnt,
-          SUM(CASE WHEN out = 1 AND message_id > COALESCE(:out_c, -1) THEN 1 ELSE 0 END) AS out_cnt,
-          MIN(CASE WHEN out = 0 AND message_id > COALESCE(:in_c, -1) THEN sent_at END) AS in_min,
-          MIN(CASE WHEN out = 1 AND message_id > COALESCE(:out_c, -1) THEN sent_at END) AS out_min
-        FROM messages
-        WHERE dialog_id = :dialog_id
+          (SELECT in_c FROM sd)  AS in_cursor,
+          (SELECT out_c FROM sd) AS out_cursor,
+          SUM(CASE WHEN m.out = 0 AND m.message_id > COALESCE((SELECT in_c FROM sd), -1)  THEN 1 ELSE 0 END) AS in_cnt,
+          SUM(CASE WHEN m.out = 1 AND m.message_id > COALESCE((SELECT out_c FROM sd), -1) THEN 1 ELSE 0 END) AS out_cnt,
+          MIN(CASE WHEN m.out = 0 AND m.message_id > COALESCE((SELECT in_c FROM sd), -1)  THEN m.sent_at END) AS in_min,
+          MIN(CASE WHEN m.out = 1 AND m.message_id > COALESCE((SELECT out_c FROM sd), -1) THEN m.sent_at END) AS out_min
+        FROM messages m
+        WHERE m.dialog_id = :dialog_id AND m.is_deleted = 0
         """,
-        {"dialog_id": dialog_id, "in_c": read_inbox_max_id, "out_c": read_outbox_max_id},
+        {"dialog_id": dialog_id},
     ).fetchone()
+    # ``row`` is always a single aggregate row (SUM/MIN with no FROM rows yield NULL).
+    # Cursor subqueries resolve to NULL when synced_dialogs has no matching row —
+    # identical to the previous two-query behaviour.
+    read_inbox_max_id = row[0] if row is not None else None
+    read_outbox_max_id = row[1] if row is not None else None
+    agg_row = (
+        (row[2], row[3], row[4], row[5]) if row is not None else (None, None, None, None)
+    )
     in_cnt = int(agg_row[0] or 0)
     out_cnt = int(agg_row[1] or 0)
     in_min = agg_row[2]
