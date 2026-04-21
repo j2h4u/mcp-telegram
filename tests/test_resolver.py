@@ -106,11 +106,13 @@ def test_single_word_single_candidate_resolves() -> None:
 
 
 def test_multi_word_exact_resolves() -> None:
-    """Multi-word 'Ольга Петрова' exact normalized match → Resolved."""
+    """Multi-word 'Ольга Петрова' — both names normalize to 'olga petrova', so this is
+    a collision (≥2 entities share same norm name) → Candidates, not Resolved."""
     choices = {1: "Olga Petrova", 2: "Ольга Петрова"}
     result = resolve("Ольга Петрова", choices)
-    # Both normalize to "olga petrova", one should resolve
-    assert isinstance(result, Resolved)
+    # Both normalize to "olga petrova" — collision, not a single Resolved
+    assert isinstance(result, Candidates)
+    assert len(result.matches) == 2
 
 
 def test_single_low_score_match_returns_candidates() -> None:
@@ -316,4 +318,95 @@ def test_parse_tme_link_not_a_link() -> None:
 def test_parse_tme_link_short_username_rejected() -> None:
     """Telegram usernames must be ≥5 chars (4 after prefix), reject 3-char."""
     assert _parse_tme_link("t.me/abc") is None
+
+
+# ---------------------------------------------------------------------------
+# Task 1: disambiguation_hint field on Candidates matches
+# ---------------------------------------------------------------------------
+
+def _make_cache_with_types(entity_types: dict[int, str]):
+    """Build a mock entity_cache that returns entity_type for given ids."""
+    cache = MagicMock()
+    def get_side_effect(entity_id, ttl_seconds=300):
+        if entity_id in entity_types:
+            return {"type": entity_types[entity_id], "username": None}
+        return None
+    cache.get.side_effect = get_side_effect
+    cache.get_by_username.return_value = None
+    return cache
+
+
+def test_candidates_match_has_disambiguation_hint_on_collision() -> None:
+    """Collision case (same norm name, ≥2 entities) → each match dict has non-empty disambiguation_hint."""
+    from mcp_telegram.resolver import _build_norm_map, _fuzzy_resolve
+    # Two entities with names that normalize to the same string → collision
+    choices = {101: "Ivan", 102: "IVAN"}
+    result = resolve("Ivan", choices)
+    assert isinstance(result, Candidates)
+    for match in result.matches:
+        assert "disambiguation_hint" in match
+        assert match["disambiguation_hint"] is not None
+        assert len(match["disambiguation_hint"]) > 0
+
+
+def test_candidates_match_hint_mentions_entity_types() -> None:
+    """Hint text mentions both entity types when known."""
+    cache = _make_cache_with_types({101: "User", 102: "Channel"})
+    choices = {101: "Ivan", 102: "IVAN"}
+    result = resolve("Ivan", choices, entity_cache=cache)
+    assert isinstance(result, Candidates)
+    hint = result.matches[0]["disambiguation_hint"]
+    assert hint is not None
+    # Should mention types (sorted)
+    assert "Channel" in hint or "User" in hint
+
+
+def test_candidates_match_hint_mentions_query() -> None:
+    """Hint contains the original query string."""
+    choices = {101: "Ivan", 102: "IVAN"}
+    result = resolve("Ivan", choices)
+    assert isinstance(result, Candidates)
+    for match in result.matches:
+        hint = match["disambiguation_hint"]
+        assert hint is not None
+        assert "Ivan" in hint
+
+
+def test_candidates_match_hint_suggests_action() -> None:
+    """Hint contains @username or numeric id action guidance."""
+    choices = {101: "Ivan", 102: "IVAN"}
+    result = resolve("Ivan", choices)
+    assert isinstance(result, Candidates)
+    for match in result.matches:
+        hint = match["disambiguation_hint"]
+        assert hint is not None
+        assert "@username" in hint or "numeric id" in hint
+
+
+def test_candidates_no_hint_on_non_collision_candidates() -> None:
+    """Non-collision Candidates (fuzzy neighbors, distinct norm names) → disambiguation_hint is None."""
+    # These have distinct normalized names — fuzzy neighbors, not collision
+    choices = {101: "Alice Smith", 102: "Alicia Jones"}
+    result = resolve("Ali", choices)
+    assert isinstance(result, Candidates)
+    for match in result.matches:
+        assert match.get("disambiguation_hint") is None
+
+
+def test_make_match_info_without_hint_context_has_no_hint_key_or_none() -> None:
+    """_make_match_info called standalone → disambiguation_hint key is None."""
+    from mcp_telegram.resolver import _make_match_info
+    match = _make_match_info(101, "Ivan", 90, None)
+    assert match.get("disambiguation_hint") is None
+
+
+def test_hint_stable_across_calls() -> None:
+    """Deterministic template → identical hint text on repeated calls."""
+    choices = {101: "Ivan", 102: "IVAN"}
+    result1 = resolve("Ivan", choices)
+    result2 = resolve("Ivan", choices)
+    assert isinstance(result1, Candidates)
+    assert isinstance(result2, Candidates)
+    for m1, m2 in zip(result1.matches, result2.matches):
+        assert m1["disambiguation_hint"] == m2["disambiguation_hint"]
 
