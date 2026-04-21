@@ -148,11 +148,13 @@ def _compute_inline_markers(
     def _side(out_flag: int, cursor_state: str | None, anchor: int | None,
               boundary_label: str, tail_label: str) -> None:
         # Select ids for this side; guard against missing .id / .out.
+        # WR-03: explicit None-guard only; do not fold id=0 to sentinel 0
+        # (would collide with "missing id" and emit a bogus marker).
         ids = [
-            int(getattr(m, "id", 0) or 0)
+            int(m.id)
             for m in messages
-            if int(getattr(m, "out", 0) or 0) == out_flag
-            and getattr(m, "id", None) is not None
+            if getattr(m, "id", None) is not None
+            and int(getattr(m, "out", 0) or 0) == out_flag
         ]
         if not ids:
             return
