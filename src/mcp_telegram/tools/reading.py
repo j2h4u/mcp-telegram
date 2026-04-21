@@ -63,7 +63,13 @@ def _format_archived_warning(data: dict) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _format_daemon_messages(rows: list[dict], *, global_mode: bool = False) -> str:
+def _format_daemon_messages(
+    rows: list[dict],
+    *,
+    global_mode: bool = False,
+    read_state: dict | None = None,
+    dialog_type: str | None = None,
+) -> str:
     """Format daemon row dicts into human-readable message text.
 
     Produces the same HH:mm Name: text format as format_messages(),
@@ -72,6 +78,10 @@ def _format_daemon_messages(rows: list[dict], *, global_mode: bool = False) -> s
 
     When global_mode=True, prefixes each line with "[dialog_name]" so results
     from different dialogs are distinguishable.
+
+    Phase 39.3: when ``read_state`` + ``dialog_type`` are supplied from the
+    daemon response dict, threads them into ``format_messages`` to produce the
+    DM header + inline markers (AC-5/6/7/8).
     """
     if not rows:
         return ""
@@ -94,6 +104,8 @@ def _format_daemon_messages(rows: list[dict], *, global_mode: bool = False) -> s
         reply_map=reply_map,  # type: ignore[arg-type]  # same: dict[int, DaemonMessage] vs dict[int, MessageLike]
         topic_name_getter=topic_name_getter,
         line_prefix_getter=line_prefix_getter,
+        read_state=read_state,
+        dialog_type=dialog_type,
     )
 
 
@@ -191,6 +203,15 @@ class ListMessages(ToolArgs):
 
     If response is ambiguous (multiple matches), retry with one exact selector instead of leaving
     both fuzzy and exact selectors in the same request.
+
+    **Read-state annotations** (DMs only):
+    The response begins with a one-line `[read-state: all caught up]` when both sides are clean, OR two lines `[inbox: …]` / `[outbox: …]` (each independently `all read`, `N unread …`, or `unknown (sync pending)`).
+    Inline trailing markers fire on at most four message lines per page:
+      `[I read up to here]` — last incoming you read.
+      `[unread by me]` — first incoming on this page you have not read.
+      `[peer read up to here]` — last outgoing the peer read.
+      `[unread by peer]` — first outgoing on this page the peer has not read.
+    Check the header first for triage, then inspect inline markers if reading the full history.
     """
 
     dialog: str | None = Field(
@@ -407,7 +428,11 @@ async def list_messages(args: ListMessages) -> ToolResult:
     source = data.get("source", "unknown")
     next_nav = data.get("next_navigation")
 
-    text = _format_daemon_messages(rows)
+    # Phase 39.3: extract read_state + dialog_type from daemon response (absent
+    # in pre-39.3 responses → backward compat: format_messages no-ops).
+    read_state = data.get("read_state")
+    dialog_type = data.get("dialog_type")
+    text = _format_daemon_messages(rows, read_state=read_state, dialog_type=dialog_type)
     if not text:
         text = "No messages found."
 

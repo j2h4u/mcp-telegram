@@ -5,7 +5,7 @@ from zoneinfo import ZoneInfo
 
 import telethon.tl.types as tl  # type: ignore[import-untyped]
 
-from .models import LinePrefixGetter, MessageLike, TopicNameGetter
+from .models import LinePrefixGetter, MessageLike, ReadState, TopicNameGetter
 
 # Messages separated by more than this gap get a visual session break marker.
 # 60 min balances readability (avoids clutter in active chats) with context
@@ -18,6 +18,176 @@ SESSION_BREAK_MINUTES = 60
 SELF_SENDER_LABEL = "[me]"
 
 
+# ---------------------------------------------------------------------------
+# Phase 39.3: bidirectional read-state helpers
+# ---------------------------------------------------------------------------
+
+
+def _format_relative_delta(now_unix: int, then_unix: int) -> str:
+    """Compact English delta: ``Xm``, ``Xh Ym``, ``Xd``, ``Xw`` (D-01).
+
+    Rules:
+    - delta < 1 hour     → ``{minutes}m``
+    - delta < 1 day      → ``{hours}h {minutes}m``
+    - delta < 7 days     → ``{days}d``
+    - delta ≥ 7 days     → ``{weeks}w``
+
+    Negative deltas (future timestamps — shouldn't happen) render as ``0m``.
+    """
+    delta = max(0, int(now_unix) - int(then_unix))
+    minutes_total = delta // 60
+    if minutes_total < 60:
+        return f"{minutes_total}m"
+    hours_total = minutes_total // 60
+    if hours_total < 24:
+        return f"{hours_total}h {minutes_total % 60}m"
+    days_total = hours_total // 24
+    if days_total < 7:
+        return f"{days_total}d"
+    return f"{days_total // 7}w"
+
+
+def _render_read_state_header(
+    read_state: ReadState | dict | None,
+    dialog_type: str | None,
+    now_unix: int,
+    tz: ZoneInfo | None = None,
+) -> list[str]:
+    """Return 0, 1, or 2 header lines for a DM read-state snapshot.
+
+    Rules (AC-5/6/7, D-01..D-04):
+    - read_state is None or dialog_type != 'User': return [] (AC-7).
+    - Both sides cursor_state == 'populated' and both counts == 0:
+      single '[read-state: all caught up]' (AC-5, D-02).
+    - Otherwise: two lines, each side computed independently. Cursor='null'
+      always renders 'unknown (sync pending)' — never 'all read' (D-03).
+    """
+    if read_state is None or dialog_type != "User":
+        return []
+
+    inbox_state = read_state.get("inbox_cursor_state")
+    outbox_state = read_state.get("outbox_cursor_state")
+    inbox_count = int(read_state.get("inbox_unread_count", 0) or 0)
+    outbox_count = int(read_state.get("outbox_unread_count", 0) or 0)
+
+    # Collapsed form: both sides populated AND both counts zero.
+    if (
+        inbox_state == "populated"
+        and outbox_state == "populated"
+        and inbox_count == 0
+        and outbox_count == 0
+    ):
+        return ["[read-state: all caught up]"]
+
+    effective_tz = tz if tz is not None else ZoneInfo("UTC")
+
+    def _side(
+        *,
+        side_label: str,     # "inbox" or "outbox"
+        direction_word: str, # "from peer" or "by peer"
+        read_word: str,      # "all read" or "all read by peer"
+        state: str | None,
+        count: int,
+        oldest: int | None,
+    ) -> str:
+        if state == "null":
+            return f"[{side_label}: unknown (sync pending)]"
+        if count == 0:
+            return f"[{side_label}: {read_word}]"
+        # populated with count > 0
+        if oldest is None:
+            # Defensive: no timestamp but count > 0 — render without Δ
+            return f"[{side_label}: {count} unread {direction_word}]"
+        dt_local = datetime.fromtimestamp(int(oldest), tz=timezone.utc).astimezone(effective_tz)
+        hh_mm = dt_local.strftime("%H:%M")
+        delta = _format_relative_delta(now_unix, oldest)
+        return f"[{side_label}: {count} unread {direction_word}, oldest {hh_mm} ({delta} ago)]"
+
+    inbox_line = _side(
+        side_label="inbox",
+        direction_word="from peer",
+        read_word="all read",
+        state=inbox_state,
+        count=inbox_count,
+        oldest=read_state.get("inbox_oldest_unread_date"),
+    )
+    outbox_line = _side(
+        side_label="outbox",
+        direction_word="by peer",
+        read_word="all read by peer",
+        state=outbox_state,
+        count=outbox_count,
+        oldest=read_state.get("outbox_oldest_unread_date"),
+    )
+    return [inbox_line, outbox_line]
+
+
+def _compute_inline_markers(
+    messages: list,
+    read_state: ReadState | dict | None,
+) -> dict[int, str]:
+    """Return {message_id: marker_text} for the four inline markers (AC-8/9/10).
+
+    Marker placement is keyed by ``message.id`` (attribute), NOT by page-render
+    order — ensuring stable behaviour regardless of ascending / descending
+    iteration (codex MEDIUM).
+
+    Per side (inbox=out=0 / outbox=out=1):
+    - Boundary (last-seen): among page messages with ``message_id <= cursor``,
+      pick the HIGHEST message_id; emit `[I read up to here]` / `[peer read up to here]`.
+      NULL cursor or no qualifying message → no boundary marker (AC-10).
+    - Tail-start (first-unseen): among page messages with (cursor IS NULL OR
+      ``message_id > cursor``), pick the LOWEST message_id; emit `[unread by me]`
+      / `[unread by peer]`. Recomputed per page (AC-9).
+    """
+    if read_state is None or not messages:
+        return {}
+
+    markers: dict[int, str] = {}
+
+    def _side(out_flag: int, cursor_state: str | None, anchor: int | None,
+              boundary_label: str, tail_label: str) -> None:
+        # Select ids for this side; guard against missing .id / .out.
+        ids = [
+            int(getattr(m, "id", 0) or 0)
+            for m in messages
+            if int(getattr(m, "out", 0) or 0) == out_flag
+            and getattr(m, "id", None) is not None
+        ]
+        if not ids:
+            return
+        if cursor_state == "null":
+            # Entire side is unread; tail-start on lowest id; no boundary.
+            markers[min(ids)] = tail_label
+            return
+        if anchor is None:
+            # Populated state but no anchor provided (e.g. all_read with count 0):
+            # no markers — nothing unread here.
+            return
+        seen_ids = [i for i in ids if i <= anchor]
+        unseen_ids = [i for i in ids if i > anchor]
+        if seen_ids:
+            markers[max(seen_ids)] = boundary_label
+        if unseen_ids:
+            markers[min(unseen_ids)] = tail_label
+
+    _side(
+        out_flag=0,
+        cursor_state=read_state.get("inbox_cursor_state"),
+        anchor=read_state.get("inbox_max_id_anchor"),
+        boundary_label="[I read up to here]",
+        tail_label="[unread by me]",
+    )
+    _side(
+        out_flag=1,
+        cursor_state=read_state.get("outbox_cursor_state"),
+        anchor=read_state.get("outbox_max_id_anchor"),
+        boundary_label="[peer read up to here]",
+        tail_label="[unread by peer]",
+    )
+    return markers
+
+
 def format_messages(
     messages: list[MessageLike],
     reply_map: dict[int, MessageLike],
@@ -25,6 +195,10 @@ def format_messages(
     tz: ZoneInfo | None = None,
     topic_name_getter: TopicNameGetter | None = None,
     line_prefix_getter: LinePrefixGetter | None = None,
+    *,
+    read_state: ReadState | dict | None = None,
+    dialog_type: str | None = None,
+    now_unix: int | None = None,
 ) -> str:
     """Format a list of messages into human-readable text.
 
@@ -57,7 +231,14 @@ def format_messages(
 
     effective_tz = tz if tz is not None else ZoneInfo("UTC")
 
-    lines: list[str] = []
+    # Phase 39.3: header + inline markers (only emit on DMs; AC-7).
+    resolved_now = now_unix if now_unix is not None else int(datetime.now(tz=timezone.utc).timestamp())
+    header_lines = _render_read_state_header(read_state, dialog_type, resolved_now, effective_tz)
+    inline_markers = (
+        _compute_inline_markers(messages, read_state) if dialog_type == "User" else {}
+    )
+
+    lines: list[str] = list(header_lines)
     prev_date_str: str | None = None
     prev_dt = None
 
@@ -111,9 +292,14 @@ def format_messages(
             if resolved_prefix:
                 line_prefix = f"{resolved_prefix} "
 
-        lines.append(
+        line = (
             f"{line_prefix}{topic_prefix}{dt.strftime('%H:%M')} {sender_name}: {reply_prefix}{text}"
         )
+        # Phase 39.3: append inline marker for this message_id (D-06 — trailing).
+        msg_id_attr = getattr(msg, "id", None)
+        if inline_markers and msg_id_attr in inline_markers:
+            line = f"{line} {inline_markers[msg_id_attr]}"
+        lines.append(line)
 
         prev_dt = dt
 
@@ -468,14 +654,27 @@ class UnreadChatData:
 def format_unread_messages_grouped(
     chats: list[UnreadChatData],
     tz: ZoneInfo | None = None,
+    *,
+    read_state_per_dialog: dict[int, ReadState | dict] | None = None,
+    dialog_type_per_dialog: dict[int, str] | None = None,
+    now_unix: int | None = None,
 ) -> str:
     """Format unread messages grouped by chat.
 
     Messages in each chat are already trimmed to budget by the caller.
     Adds "[и ещё N]" when total_in_chat > len(messages).
+
+    Phase 39.3 (HIGH-3): when ``read_state_per_dialog`` is provided, each
+    DM block is preceded by its read-state header (collapsed or split per
+    AC-5/6). Non-DM blocks emit no header (AC-7). Per-chat headers are
+    injected via ``_render_read_state_header`` and per-message inline
+    markers via ``_compute_inline_markers`` when format_messages is called
+    with ``read_state`` / ``dialog_type`` kwargs.
     """
     if not chats:
         return ""
+
+    resolved_now = now_unix if now_unix is not None else int(datetime.now(tz=timezone.utc).timestamp())
 
     parts: list[str] = []
 
@@ -491,12 +690,40 @@ def format_unread_messages_grouped(
         header_parts.append(f"id={chat.chat_id}")
         parts.append(f"--- {chat.display_name} ({', '.join(header_parts)}) ---")
 
+        # Phase 39.3: per-chat read-state header (AC-5/6/7, D-03).
+        chat_read_state = (
+            read_state_per_dialog.get(chat.chat_id) if read_state_per_dialog else None
+        )
+        chat_dialog_type = (
+            dialog_type_per_dialog.get(chat.chat_id) if dialog_type_per_dialog else None
+        )
+        read_state_header = _render_read_state_header(
+            chat_read_state, chat_dialog_type, resolved_now, tz
+        )
+        if read_state_header:
+            parts.extend(read_state_header)
+
         if chat.is_channel:
             continue
 
         if chat.messages:
-            formatted = format_messages(chat.messages, {}, tz=tz)
+            formatted = format_messages(
+                chat.messages,
+                {},
+                tz=tz,
+                read_state=chat_read_state,
+                dialog_type=chat_dialog_type,
+                now_unix=resolved_now,
+            )
             if formatted:
+                # format_messages already prepends its own header; strip the
+                # header lines we just added independently to avoid duplicates.
+                if read_state_header:
+                    formatted_lines = formatted.splitlines()
+                    # Skip matching header prefix
+                    header_len = len(read_state_header)
+                    if formatted_lines[:header_len] == read_state_header:
+                        formatted = "\n".join(formatted_lines[header_len:])
                 parts.append(formatted)
 
         shown = len(chat.messages)

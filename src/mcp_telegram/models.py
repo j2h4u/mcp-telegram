@@ -1,6 +1,6 @@
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Awaitable, Callable, Literal, Protocol, TypedDict
+from typing import TYPE_CHECKING, Awaitable, Callable, Literal, NotRequired, Protocol, TypedDict
 
 from .resolver import Candidates, NotFound, Resolved, ResolvedWithMessage
 
@@ -252,3 +252,46 @@ SearchCapabilityResult = SearchExecution | DialogTargetFailure | NavigationFailu
 TopicLoader = Callable[..., Awaitable[TopicCatalog]]
 TopicFetcher = Callable[..., Awaitable[list[MessageLike]]]
 TopicRefresher = Callable[..., Awaitable[TopicMetadata | None]]
+
+
+# ---------------------------------------------------------------------------
+# Phase 39.3: bidirectional read-state
+# ---------------------------------------------------------------------------
+
+
+CursorState = Literal["populated", "null", "all_read"]
+"""Tri-state cursor tag:
+
+- ``populated`` — cursor has a value AND there are messages past it (or count == 0 AND cursor is up-to-date).
+- ``null``     — cursor is NULL in sync.db (bootstrap pending). NEVER means "all read".
+- ``all_read`` — cursor value >= highest known message_id on that side (caught up).
+"""
+
+
+class ReadState(TypedDict):
+    """Bidirectional read-state snapshot for one DM.
+
+    Emitted by daemon-side helpers; consumed by formatter-side header /
+    inline-marker helpers. All counts are integers; dates are unix seconds (UTC).
+
+    Fields:
+    - inbox_unread_count  — incoming unread by me (peer → me).
+    - inbox_oldest_unread_date — unix seconds of the oldest unread incoming
+      message (MIN(sent_at) WHERE out=0 AND message_id > read_inbox_max_id);
+      omitted when count == 0 or cursor is NULL.
+    - inbox_cursor_state  — CursorState tag for the inbox side.
+    - inbox_max_id_anchor — current ``read_inbox_max_id`` cursor; omitted when NULL.
+    - outbox_unread_count — outgoing unread by peer (me → peer).
+    - outbox_oldest_unread_date — symmetric MIN over ``out=1``.
+    - outbox_cursor_state — CursorState tag.
+    - outbox_max_id_anchor — current ``read_outbox_max_id`` cursor; omitted when NULL.
+    """
+
+    inbox_unread_count: int
+    inbox_oldest_unread_date: NotRequired[int]
+    inbox_cursor_state: CursorState
+    inbox_max_id_anchor: NotRequired[int]
+    outbox_unread_count: int
+    outbox_oldest_unread_date: NotRequired[int]
+    outbox_cursor_state: CursorState
+    outbox_max_id_anchor: NotRequired[int]
