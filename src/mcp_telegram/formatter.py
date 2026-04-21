@@ -199,6 +199,7 @@ def format_messages(
     read_state: ReadState | dict | None = None,
     dialog_type: str | None = None,
     now_unix: int | None = None,
+    suppress_header: bool = False,
 ) -> str:
     """Format a list of messages into human-readable text.
 
@@ -232,8 +233,15 @@ def format_messages(
     effective_tz = tz if tz is not None else ZoneInfo("UTC")
 
     # Phase 39.3: header + inline markers (only emit on DMs; AC-7).
+    # WR-02: ``suppress_header`` lets callers (e.g. format_unread_messages_grouped)
+    # emit the header themselves and reuse format_messages purely for the body,
+    # avoiding fragile post-hoc header-dedup by string comparison.
     resolved_now = now_unix if now_unix is not None else int(datetime.now(tz=timezone.utc).timestamp())
-    header_lines = _render_read_state_header(read_state, dialog_type, resolved_now, effective_tz)
+    header_lines = (
+        []
+        if suppress_header
+        else _render_read_state_header(read_state, dialog_type, resolved_now, effective_tz)
+    )
     inline_markers = (
         _compute_inline_markers(messages, read_state) if dialog_type == "User" else {}
     )
@@ -718,16 +726,9 @@ def format_unread_messages_grouped(
                 read_state=chat_read_state,
                 dialog_type=chat_dialog_type,
                 now_unix=resolved_now,
+                suppress_header=True,
             )
             if formatted:
-                # format_messages already prepends its own header; strip the
-                # header lines we just added independently to avoid duplicates.
-                if read_state_header:
-                    formatted_lines = formatted.splitlines()
-                    # Skip matching header prefix
-                    header_len = len(read_state_header)
-                    if formatted_lines[:header_len] == read_state_header:
-                        formatted = "\n".join(formatted_lines[header_len:])
                 parts.append(formatted)
 
         shown = len(chat.messages)
