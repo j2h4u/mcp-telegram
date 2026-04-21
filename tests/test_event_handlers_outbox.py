@@ -2,7 +2,7 @@
 
 Covers AC-3 (live handler advances read_outbox_max_id) and related invariants:
   - PeerUser-only filter (PeerChat / PeerChannel drops).
-  - Monotonic guard (smaller max_id absorbed by _apply_read_cursor's MAX).
+  - Monotonic guard (smaller max_id absorbed by apply_read_cursor's MAX).
   - Unsynced dialog → silent drop.
   - last_event_at bumped on happy path.
   - Unexpected exception logged and not propagated.
@@ -238,14 +238,14 @@ async def test_outbox_read_updates_last_event_at(
 async def test_outbox_read_unexpected_exception_logged_not_propagated(
     mock_client, sync_db, shutdown_event, caplog
 ):
-    """Force _apply_read_cursor to raise; handler must log + swallow (not crash loop)."""
+    """Force apply_read_cursor to raise; handler must log + swallow (not crash loop)."""
     dialog_id = 1001
     _enroll(sync_db, dialog_id)
     mgr = _make_manager(mock_client, sync_db, shutdown_event)
     mgr.register()
 
     with patch(
-        "mcp_telegram.event_handlers._apply_read_cursor",
+        "mcp_telegram.event_handlers.apply_read_cursor",
         side_effect=RuntimeError("boom"),
     ):
         with caplog.at_level(logging.ERROR, logger="mcp_telegram.event_handlers"):

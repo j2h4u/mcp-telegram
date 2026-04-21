@@ -1018,7 +1018,7 @@ async def test_initialize_read_positions_is_monotonic_vs_live_event(tmp_path):
     import sqlite3
     from mcp_telegram.sync_db import _apply_migrations
     from mcp_telegram.daemon import _initialize_read_positions  # noqa: F401
-    from mcp_telegram.read_state import _apply_read_cursor
+    from mcp_telegram.read_state import apply_read_cursor
 
     conn = sqlite3.connect(":memory:")
     _apply_migrations(conn)
@@ -1032,7 +1032,7 @@ async def test_initialize_read_positions_is_monotonic_vs_live_event(tmp_path):
     # Invoke the shared primitive that bootstrap uses, with a lower value (42 < 100).
     # Verifies MAX(COALESCE(existing, 0), incoming) never regresses — single
     # source of truth for the monotonic-write pattern now lives in read_state.
-    _apply_read_cursor(conn, 1001, "inbox", 42)
+    apply_read_cursor(conn, 1001, "inbox", 42)
     conn.commit()
 
     row = conn.execute(

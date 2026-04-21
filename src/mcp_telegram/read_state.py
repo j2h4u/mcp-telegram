@@ -6,7 +6,7 @@ SET read_inbox_max_id = MAX(COALESCE(read_inbox_max_id, 0), ?) WHERE dialog_id=?
 fragment was duplicated at ``event_handlers.py`` (live MessageRead handler)
 and ``daemon.py`` (bootstrap loop). Phase 39.3 adds a symmetric ``read_outbox_max_id``
 column (schema v12) — rather than triple the duplication, all callers now
-route through :func:`_apply_read_cursor`.
+route through :func:`apply_read_cursor`.
 
 Contract:
 
@@ -35,7 +35,7 @@ _CURSOR_COLUMNS: Final[Mapping[ReadCursorKind, str]] = {
 }
 
 
-def _apply_read_cursor(
+def apply_read_cursor(
     conn: sqlite3.Connection,
     dialog_id: int,
     kind: ReadCursorKind,

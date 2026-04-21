@@ -29,7 +29,7 @@ from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
 from telethon.tl.types import UpdateMessageReactions  # type: ignore[import-untyped]
 from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
-from .read_state import _apply_read_cursor
+from .read_state import apply_read_cursor
 from .resolver import latinize
 from .sync_worker import (
     INSERT_DIALOG_SQL,
@@ -392,7 +392,7 @@ class EventHandlerManager:
         try:
             now = int(time.time())
             with self._conn:
-                rowcount = _apply_read_cursor(
+                rowcount = apply_read_cursor(
                     self._conn, dialog_id, "inbox", event.max_id
                 )
                 self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
@@ -425,7 +425,7 @@ class EventHandlerManager:
           when absent (synthetic test events), falling back to the
           ``_synced_dialog_ids`` membership check below is sufficient because
           non-DM dialogs never live in DM-enrollment paths.
-        - Monotonic via shared :func:`_apply_read_cursor` primitive — a smaller
+        - Monotonic via shared :func:`apply_read_cursor` primitive — a smaller
           ``max_id`` is absorbed by ``MAX(COALESCE(existing, 0), ?)``.
         - ``event.chat_id`` may be None for PM read events on some Telethon
           versions (mirror of the inbox handler's quirk). Log warning, bail.
@@ -466,7 +466,7 @@ class EventHandlerManager:
         try:
             now = int(time.time())
             with self._conn:
-                rowcount = _apply_read_cursor(
+                rowcount = apply_read_cursor(
                     self._conn, dialog_id, "outbox", max_id
                 )
                 self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))

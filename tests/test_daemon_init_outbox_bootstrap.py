@@ -258,7 +258,7 @@ async def test_bootstrap_telethon_returns_none_outbox_preserves_null():
     """LOCKED (HARD ASSERT): Telethon returns None for outbox → DB stays NULL.
 
     Regression-rejects the old `getattr(d, "read_outbox_max_id", 0) or 0`
-    pattern. NEVER convert None → 0; NEVER call _apply_read_cursor with 0 as
+    pattern. NEVER convert None → 0; NEVER call apply_read_cursor with 0 as
     a stand-in.
     """
     from mcp_telegram.daemon import _initialize_read_positions
@@ -396,11 +396,11 @@ async def test_bootstrap_live_event_race_newer_wins():
 
     Scenario: bootstrap is about to write outbox=500 for a dialog, but while
     the GetPeerDialogs request is in flight a live on_outbox_read event
-    arrives and applies 999. The monotonic MAX semantics of _apply_read_cursor
+    arrives and applies 999. The monotonic MAX semantics of apply_read_cursor
     must ensure the final cursor == 999 (not 500).
     """
     from mcp_telegram.daemon import _initialize_read_positions
-    from mcp_telegram.read_state import _apply_read_cursor
+    from mcp_telegram.read_state import apply_read_cursor
 
     conn = _make_conn()
     _seed(conn, [(1001, None, None, "synced")])
@@ -410,7 +410,7 @@ async def test_bootstrap_live_event_race_newer_wins():
     # Dialog(500).
     async def _slow_call(req):
         # Concurrent live event landed first.
-        _apply_read_cursor(conn, 1001, "outbox", 999)
+        apply_read_cursor(conn, 1001, "outbox", 999)
         conn.commit()
         return SimpleNamespace(
             dialogs=[

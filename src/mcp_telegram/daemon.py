@@ -49,7 +49,7 @@ from .daemon_api import DaemonAPIServer, get_daemon_socket_path
 from .delta_sync import DeltaSyncWorker, run_access_probe_loop
 from .event_handlers import EventHandlerManager
 from .fts import backfill_fts_index
-from .read_state import _apply_read_cursor
+from .read_state import apply_read_cursor
 from .sync_db import (
     _open_sync_db,
     ensure_sync_schema,
@@ -143,10 +143,10 @@ async def _initialize_read_positions(
     endpoints introduced.
 
     D-03 LOCKED NULL preservation: if Telethon returns None for either
-    cursor on a Dialog, ``_apply_read_cursor`` is NOT called for that
+    cursor on a Dialog, ``apply_read_cursor`` is NOT called for that
     side. The DB cursor stays NULL so Plan 03's header renders
     ``[unknown (sync pending)]`` rather than lying with ``[all read]``.
-    NEVER convert None → 0; NEVER call _apply_read_cursor with 0 as a
+    NEVER convert None → 0; NEVER call apply_read_cursor with 0 as a
     stand-in. This consistency rule applies symmetrically to inbox AND
     outbox. It tightens Phase 38's inbox-side behaviour (which used
     ``or 0``) — documented behavioural change.
@@ -194,13 +194,13 @@ async def _initialize_read_positions(
                     wrote_any = False
                     if inbox_max is not None:
                         # Monotonic via shared primitive — see read_state.py.
-                        rowcount = _apply_read_cursor(
+                        rowcount = apply_read_cursor(
                             conn, chat_id, "inbox", inbox_max
                         )
                         if rowcount > 0:
                             wrote_any = True
                     if outbox_max is not None:
-                        rowcount = _apply_read_cursor(
+                        rowcount = apply_read_cursor(
                             conn, chat_id, "outbox", outbox_max
                         )
                         if rowcount > 0:
