@@ -674,6 +674,10 @@ def format_unread_messages_grouped(
     if not chats:
         return ""
 
+    # WR-01: Resolve tz once so header and message lines agree by construction,
+    # not by coincidence — guards against future drift if format_messages'
+    # default changes.
+    effective_tz = tz if tz is not None else ZoneInfo("UTC")
     resolved_now = now_unix if now_unix is not None else int(datetime.now(tz=timezone.utc).timestamp())
 
     parts: list[str] = []
@@ -698,7 +702,7 @@ def format_unread_messages_grouped(
             dialog_type_per_dialog.get(chat.chat_id) if dialog_type_per_dialog else None
         )
         read_state_header = _render_read_state_header(
-            chat_read_state, chat_dialog_type, resolved_now, tz
+            chat_read_state, chat_dialog_type, resolved_now, effective_tz
         )
         if read_state_header:
             parts.extend(read_state_header)
@@ -710,7 +714,7 @@ def format_unread_messages_grouped(
             formatted = format_messages(
                 chat.messages,
                 {},
-                tz=tz,
+                tz=effective_tz,
                 read_state=chat_read_state,
                 dialog_type=chat_dialog_type,
                 now_unix=resolved_now,
