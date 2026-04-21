@@ -164,7 +164,7 @@ def _fuzzy_resolve(
                 query,
                 len(exact_entries),
             )
-            matches = _build_matches(hits, norm_map, entity_cache, exact_first_id=exact_entity_id)
+            matches = _build_matches(hits, norm_map, entity_cache, exact_first_id=exact_entity_id, collision_query=query)
             return Candidates(query=query, matches=matches)
         return Resolved(entity_id=exact_entity_id, display_name=exact_display_name)
 
@@ -177,8 +177,13 @@ def _build_matches(
     norm_map: dict[str, list[tuple[int, str]]],
     entity_cache: Any | None,
     exact_first_id: int | None = None,
+    collision_query: str | None = None,
 ) -> list[dict]:
-    """Build match dicts from rapidfuzz hits, optionally putting exact_first_id first."""
+    """Build match dicts from rapidfuzz hits, optionally putting exact_first_id first.
+
+    When collision_query is provided (≥2 entities share the same normalized name),
+    a ``disambiguation_hint`` string is added to every match dict.
+    """
     matches: list[dict] = []
     seen_ids: set[int] = set()
 
@@ -196,6 +201,19 @@ def _build_matches(
             seen_ids.add(entity_id)
             matches.append(_make_match_info(entity_id, original_name, int(score), entity_cache))
 
+    if collision_query is not None:
+        n = len(matches)
+        types = sorted({m["entity_type"] or "Unknown" for m in matches})
+        hint = (
+            f'{n} entities match "{collision_query}": {", ".join(types)}. '
+            f'Specify @username or numeric id.'
+        )
+        for m in matches:
+            m["disambiguation_hint"] = hint
+    else:
+        for m in matches:
+            m["disambiguation_hint"] = None
+
     return matches
 
 
@@ -206,6 +224,7 @@ def _make_match_info(entity_id: int, display_name: str, score: int, entity_cache
         "score": score,
         "username": None,
         "entity_type": None,
+        "disambiguation_hint": None,
     }
     if entity_cache:
         try:
