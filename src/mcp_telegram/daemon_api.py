@@ -352,7 +352,28 @@ _SELECT_FTS_ALL_SQL = (
 )
 
 _SELECT_SYNCED_STATUSES_SQL = (
-    "SELECT dialog_id, status, total_messages, access_lost_at FROM synced_dialogs"
+    "SELECT dialog_id, status, total_messages, access_lost_at, "
+    "read_inbox_max_id, read_outbox_max_id FROM synced_dialogs"
+)
+
+# Plan 39.3-03 Task 4 (AC-11/AC-12): batched unread-count query.
+# One GROUP BY pass over `messages`; for WITHOUT ROWID messages the PK
+# (dialog_id, message_id) IS the table — scan traverses the PK B-tree.
+# NULL-cursor semantics: COALESCE(cursor, -1) treats a NULL cursor as
+# "everything is unread" on that side. This is a deliberate trade-off for
+# triage display during the bootstrap window (documented in 39.3-03 <interfaces>
+# MEDIUM-2 + <threat_model> T-39.3-15c). Header rendering separately maps
+# NULL cursor → "[inbox: unknown (sync pending)]" (D-03) — the two semantics
+# diverge intentionally.
+_BATCHED_UNREAD_COUNTS_SQL = (
+    "SELECT m.dialog_id, "
+    "SUM(CASE WHEN m.\"out\" = 0 AND m.message_id > COALESCE(sd.read_inbox_max_id, -1) "
+    "THEN 1 ELSE 0 END) AS unread_in, "
+    "SUM(CASE WHEN m.\"out\" = 1 AND m.message_id > COALESCE(sd.read_outbox_max_id, -1) "
+    "THEN 1 ELSE 0 END) AS unread_out "
+    "FROM messages m JOIN synced_dialogs sd USING(dialog_id) "
+    "WHERE sd.status = 'synced' AND m.is_deleted = 0 "
+    "GROUP BY m.dialog_id"
 )
 
 _MARK_FOR_SYNC_SQL = "INSERT OR IGNORE INTO synced_dialogs (dialog_id, status) VALUES (?, 'not_synced')"
@@ -1637,14 +1658,22 @@ class DaemonAPIServer:
         Response data: {"dialogs": [{"id", "name", "type", "last_message_at",
         "unread_count", "members", "created", "sync_status"}, ...]}.
         """
-        # Load current sync statuses for O(1) lookup
+        # Load current sync statuses for O(1) lookup. Plan 39.3-03 Task 4:
+        # tuple now includes read cursors for use by the DM unread enrichment.
         synced_rows = self._conn.execute(_SELECT_SYNCED_STATUSES_SQL).fetchall()
-        synced_meta: dict[int, tuple[str, int | None, int | None]] = {
-            row[0]: (row[1], row[2], row[3]) for row in synced_rows
-        }
+        synced_meta: dict[
+            int, tuple[str, int | None, int | None, int | None, int | None]
+        ] = {row[0]: (row[1], row[2], row[3], row[4], row[5]) for row in synced_rows}
         local_counts: dict[int, int] = dict(
             self._conn.execute(_COUNT_MESSAGES_BY_DIALOG_SQL).fetchall()
         )
+        # Plan 39.3-03 Task 4 (AC-11, AC-12): batched per-dialog (unread_in, unread_out).
+        # Single GROUP BY pass — hits the messages PRIMARY KEY B-tree. Only populated
+        # for DM dialogs in the response loop below (non-DM rows omit both keys).
+        unread_counts: dict[int, tuple[int, int]] = {
+            row[0]: (int(row[1] or 0), int(row[2] or 0))
+            for row in self._conn.execute(_BATCHED_UNREAD_COUNTS_SQL).fetchall()
+        }
 
         exclude_archived: bool = req.get("exclude_archived", False)
         ignore_pinned: bool = req.get("ignore_pinned", False)
@@ -1674,26 +1703,33 @@ class DaemonAPIServer:
                     except Exception:
                         pass
 
-                sync_meta_row = synced_meta.get(d.id, ("not_synced", None, None))
+                sync_meta_row = synced_meta.get(
+                    d.id, ("not_synced", None, None, None, None)
+                )
                 sync_status = sync_meta_row[0]
                 total_messages = sync_meta_row[1]
                 access_lost_at = sync_meta_row[2]
                 local_count = local_counts.get(d.id, 0)
                 coverage_pct = _compute_sync_coverage(total_messages, local_count)
-                dialogs.append(
-                    {
-                        "id": d.id,
-                        "name": getattr(d, "name", None),
-                        "type": entity_type,
-                        "last_message_at": last_msg_at,
-                        "unread_count": getattr(d, "unread_count", 0),
-                        "members": members,
-                        "created": created_ts,
-                        "sync_status": sync_status,
-                        "sync_coverage_pct": coverage_pct,
-                        "access_lost_at": access_lost_at,
-                    }
-                )
+                row: dict = {
+                    "id": d.id,
+                    "name": getattr(d, "name", None),
+                    "type": entity_type,
+                    "last_message_at": last_msg_at,
+                    "unread_count": getattr(d, "unread_count", 0),
+                    "members": members,
+                    "created": created_ts,
+                    "sync_status": sync_status,
+                    "sync_coverage_pct": coverage_pct,
+                    "access_lost_at": access_lost_at,
+                }
+                # Plan 39.3-03 Task 4: include unread_in / unread_out ONLY for DMs
+                # (dialog_type == "User"). Non-DM rows OMIT both keys (AC-11).
+                if entity_type == "User":
+                    in_cnt, out_cnt = unread_counts.get(d.id, (0, 0))
+                    row["unread_in"] = in_cnt
+                    row["unread_out"] = out_cnt
+                dialogs.append(row)
         except Exception as exc:
             logger.warning("list_dialogs_telegram_error error=%s", exc, exc_info=True)
             return {"ok": False, "error": "telegram_error", "message": "failed to list dialogs"}

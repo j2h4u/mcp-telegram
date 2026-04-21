@@ -29,6 +29,9 @@ class ListDialogs(ToolArgs):
     Returns both archived and non-archived dialogs by default (Telegram uses archiving as a UI
     organization tool, not data archival). Set exclude_archived=True to show only non-archived
     dialogs (equivalent to old archived=False behavior).
+
+    DM rows include integer 'unread_in' (incoming unread by me) and 'unread_out' (outgoing
+    unread by peer); non-DM rows omit both fields.
     """
 
     exclude_archived: bool = False
@@ -85,10 +88,17 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
         if access_lost_at_ts is not None:
             access_str = f" access_lost_at={access_lost_at_ts}"
 
+        # Plan 39.3-03 Task 4 (AC-11, D-13): DM rows carry unread_in / unread_out.
+        # Non-DM rows omit both fields from the daemon response; rendering is
+        # conditional on key presence so we don't invent zeros for non-DMs.
+        unread_rw_str = ""
+        if "unread_in" in d and "unread_out" in d:
+            unread_rw_str = f" unread_in={d['unread_in']} unread_out={d['unread_out']}"
+
         lines.append(
             f"name='{dialog_name}' id={dialog_id} type={dialog_type} "
             f"last_message_at={last_at} unread={unread_count}{meta} "
-            f"sync_status={sync_status}{coverage_str}{access_str}"
+            f"sync_status={sync_status}{coverage_str}{access_str}{unread_rw_str}"
         )
 
         # Upsert entities into daemon for future name resolution

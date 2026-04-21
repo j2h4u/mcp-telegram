@@ -455,7 +455,7 @@ async def test_list_dialogs_text_output_renders_unread_for_dm() -> None:
     with patch("mcp_telegram.tools.discovery.daemon_connection", side_effect=_cm):
         result = await list_dialogs(ListDialogs())
 
-    text = result.content[0].text
+    text = result[0].text
     # DM row contains both fields.
     dm_lines = [line for line in text.splitlines() if "Alice" in line]
     assert dm_lines, f"no DM line in output: {text!r}"
