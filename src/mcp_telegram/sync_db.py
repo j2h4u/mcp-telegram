@@ -8,7 +8,7 @@ from pathlib import Path
 
 from xdg_base_dirs import xdg_state_home  # type: ignore[import-error]
 
-_CURRENT_SCHEMA_VERSION = 11
+_CURRENT_SCHEMA_VERSION = 12
 
 logger = logging.getLogger(__name__)
 
@@ -401,6 +401,18 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
         "    checked_at INTEGER NOT NULL, "
         "    PRIMARY KEY (dialog_id, message_id)"
         ") WITHOUT ROWID",
+    ])
+
+    # v12 (Phase 39.3 R1): outbox-side read cursor symmetric to read_inbox_max_id
+    # (Phase 38). Nullable; bootstrap (Plan 02) fills existing rows from
+    # GetPeerDialogs — the same API call that already populates the inbox
+    # cursor, so zero additional Telegram traffic. SQLite's ALTER TABLE ADD
+    # COLUMN has no IF NOT EXISTS form; idempotency is enforced by the
+    # surrounding _migrate framework checking schema_version first. No
+    # companion index — synced_dialogs is small (a few hundred rows); add
+    # idx_synced_dialogs_status_outbox_null if it grows past a few thousand.
+    _migrate(12, [
+        "ALTER TABLE synced_dialogs ADD COLUMN read_outbox_max_id INTEGER",
     ])
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)

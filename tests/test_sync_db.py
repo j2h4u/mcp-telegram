@@ -79,6 +79,7 @@ def test_synced_dialogs_schema(tmp_sync_db_path: Path) -> None:
             "total_messages",
             "access_lost_at",
             "read_inbox_max_id",
+            "read_outbox_max_id",
         }
         assert expected == set(columns.keys()), (
             f"Unexpected columns. Got: {set(columns.keys())}, expected: {expected}"
