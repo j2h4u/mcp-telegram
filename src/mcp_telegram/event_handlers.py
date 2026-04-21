@@ -130,6 +130,14 @@ class EventHandlerManager:
         self._client.add_event_handler(self.on_message_edited, events.MessageEdited)
         self._client.add_event_handler(self.on_message_deleted, events.MessageDeleted)
         self._client.add_event_handler(self.on_message_read, events.MessageRead(inbox=True))
+        # Phase 39.3-02: outbox read handler (peer→me side).
+        # Dispatch path LOCKED to Path A: events.MessageRead(inbox=False).
+        # Verified against .venv/lib/python3.14/site-packages/telethon/events/
+        # messageread.py:37-48 — build() returns cls.Event(update.peer,
+        # update.max_id, True) when the update is UpdateReadHistoryOutbox
+        # (line 41-42); filter at lines 57-61 requires event.outbox == True
+        # when inbox=False. Maximises symmetry with the Phase 38 inbox handler.
+        self._client.add_event_handler(self.on_outbox_read, events.MessageRead(inbox=False))
         # Phase 39.2-01: 5th handler for raw reaction updates. Telethon emits
         # UpdateMessageReactions for User/Chat/Channel peers (single Update type;
         # peer field discriminates). Verified against
@@ -146,6 +154,7 @@ class EventHandlerManager:
         self._client.remove_event_handler(self.on_message_edited)
         self._client.remove_event_handler(self.on_message_deleted)
         self._client.remove_event_handler(self.on_message_read)
+        self._client.remove_event_handler(self.on_outbox_read)
         self._client.remove_event_handler(self.on_raw_reaction_update)
 
     def refresh_synced_dialogs(self) -> None:
@@ -396,6 +405,88 @@ class EventHandlerManager:
                 )
         except Exception:
             logger.exception("event_read_failed dialog_id=%s", dialog_id)
+
+    async def on_outbox_read(self, event: Any) -> None:
+        """Handle MessageRead(inbox=False): update read_outbox_max_id monotonically.
+
+        Path A dispatch (LOCKED). Verified against
+        ``.venv/lib/python3.14/site-packages/telethon/events/messageread.py``
+        lines 37-48: ``MessageRead.build()`` returns
+        ``cls.Event(update.peer, update.max_id, True)`` when the update is an
+        ``UpdateReadHistoryOutbox`` (lines 41-42); ``filter()`` at lines 57-61
+        enforces ``event.outbox == True`` when ``inbox=False``. So this
+        callback only ever fires on outbox reads — same shape as
+        :meth:`on_message_read`, just the mirrored direction.
+
+        Semantics:
+        - PeerUser-only: only DM events advance the cursor. Non-DM events are
+          silently dropped (no exception, no DB write). We detect DMs via
+          ``event.is_private`` when present (Telethon sets it on the Event);
+          when absent (synthetic test events), falling back to the
+          ``_synced_dialog_ids`` membership check below is sufficient because
+          non-DM dialogs never live in DM-enrollment paths.
+        - Monotonic via shared :func:`_apply_read_cursor` primitive — a smaller
+          ``max_id`` is absorbed by ``MAX(COALESCE(existing, 0), ?)``.
+        - ``event.chat_id`` may be None for PM read events on some Telethon
+          versions (mirror of the inbox handler's quirk). Log warning, bail.
+        - Exceptions wrapped in ``try/except Exception`` (not bare ``except``,
+          not swallowing ``asyncio.CancelledError``); observable via the
+          ``event_outbox_read_failed`` log.
+        """
+        dialog_id = event.chat_id
+
+        if dialog_id is None:
+            logger.warning(
+                "event_outbox_read_null_chat_id max_id=%s — PM outbox read "
+                "position not tracked in real-time; bootstrap on next daemon "
+                "restart will reconcile",
+                getattr(event, "max_id", "?"),
+            )
+            return
+
+        # PeerUser-only filter: when the Telethon Event exposes is_private,
+        # use it; otherwise rely on the synced_dialog_ids check below (non-DM
+        # synced dialogs aren't tracked for outbox cursors — the read paths
+        # that consume this surface are DM-only).
+        is_private = getattr(event, "is_private", None)
+        if is_private is False:
+            return
+
+        if dialog_id not in self._synced_dialog_ids:
+            logger.debug(
+                "event_outbox_read_unsynced dialog_id=%d max_id=%s",
+                dialog_id, getattr(event, "max_id", "?"),
+            )
+            return
+
+        max_id = getattr(event, "max_id", None)
+        if max_id is None:
+            return
+
+        try:
+            now = int(time.time())
+            with self._conn:
+                rowcount = _apply_read_cursor(
+                    self._conn, dialog_id, "outbox", max_id
+                )
+                self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
+            if rowcount > 0:
+                logger.info(
+                    "event_outbox_read dialog_id=%d max_id=%d", dialog_id, max_id
+                )
+            else:
+                logger.warning(
+                    "event_outbox_read_no_row dialog_id=%d max_id=%d — "
+                    "UPDATE matched 0 rows",
+                    dialog_id, max_id,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(
+                "event_outbox_read_failed dialog_id=%s max_id=%s error=%r",
+                dialog_id, max_id, exc,
+            )
 
     async def on_raw_reaction_update(self, update: Any) -> None:
         """Handle raw UpdateMessageReactions for synced dialogs.
