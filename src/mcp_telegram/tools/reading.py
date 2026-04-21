@@ -4,7 +4,11 @@ from datetime import datetime, timezone
 from pydantic import Field, model_validator
 
 from ..errors import dialog_not_found_text, invalid_navigation_text, search_no_hits_text
-from ..formatter import format_messages, resolve_sender_label
+from ..formatter import (
+    _render_read_state_header,
+    format_messages,
+    resolve_sender_label,
+)
 from ..resolver import parse_exact_dialog_id
 from ._adapters import DaemonMessage
 from ._base import (
@@ -141,15 +145,53 @@ def _extract_snippet(text: str | None, query: str) -> str:
     return text[:_SNIPPET_MAX_LEN] + "..."
 
 
-def _format_search_results(rows: list[dict], query: str, *, global_mode: bool = False) -> str:
+def _format_search_results(
+    rows: list[dict],
+    query: str,
+    *,
+    global_mode: bool = False,
+    read_state_per_dialog: dict[int, dict] | None = None,
+) -> str:
     """Format search result rows as compact snippet lines with msg_id anchors.
 
     Each line:  [DialogName] YYYY-MM-DD HH:MM Sender (msg_id:N): "...snippet..."
 
     dialog_name prefix is included only when global_mode=True.
+
+    Phase 39.3 (HIGH-1): when ``read_state_per_dialog`` is supplied, the output
+    is prefixed with a per-dialog header block — one read-state header (collapsed
+    or split per AC-5/6) per DM dialog whose hits appear in results. Non-DM
+    dialog_ids are absent from the map per the daemon contract and therefore
+    emit no header line.
+
+    Markers are a full-message concept; snippet lines are not full messages.
+    Per-dialog header block above covers SPEC R5/AC-5/6 for search — inline
+    snippet lines do NOT get the four inline markers (documented trade-off).
     """
     if not rows:
         return ""
+
+    # Build header block first (Phase 39.3 HIGH-1).
+    header_lines: list[str] = []
+    if read_state_per_dialog:
+        # Preserve first-seen order across results (stable for tests).
+        seen: dict[int, str | None] = {}
+        for row in rows:
+            did = row.get("dialog_id")
+            if did is None or did in seen:
+                continue
+            seen[did] = row.get("dialog_name")
+        now_unix = int(datetime.now(tz=timezone.utc).timestamp())
+        for did, dname in seen.items():
+            rs = read_state_per_dialog.get(did)
+            if rs is None:
+                continue
+            lines = _render_read_state_header(rs, "User", now_unix)
+            if not lines:
+                continue
+            label = dname or str(did)
+            header_lines.append(f"# {label}:")
+            header_lines.extend(lines)
 
     lines: list[str] = []
     for row in rows:
@@ -165,6 +207,8 @@ def _format_search_results(rows: list[dict], query: str, *, global_mode: bool = 
         dialog_prefix = f"[{row.get('dialog_name') or '?'}] " if global_mode else ""
         lines.append(f'{dialog_prefix}{time_str} {sender} (msg_id:{msg_id}): "{snippet}"')
 
+    if header_lines:
+        return "\n".join(header_lines + lines)
     return "\n".join(lines)
 
 
@@ -569,7 +613,15 @@ async def search_messages(args: SearchMessages) -> ToolResult:
             has_cursor=args.navigation is not None,
         )
 
-    text = _format_search_results(rows, args.query, global_mode=global_mode)
+    # Phase 39.3 (HIGH-1): extract per-dialog read_state map from daemon
+    # response (absent in pre-39.3 responses → backward compat: no header block).
+    read_state_per_dialog = data.get("read_state_per_dialog")
+    text = _format_search_results(
+        rows,
+        args.query,
+        global_mode=global_mode,
+        read_state_per_dialog=read_state_per_dialog,
+    )
     nav_note = f"\nnext_navigation: {next_nav}" if next_nav else ""
 
     warning = _format_archived_warning(data)

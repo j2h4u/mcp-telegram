@@ -103,11 +103,18 @@ async def list_unread_messages(args: ListUnreadMessages) -> ToolResult:
 
     chats: list[UnreadChatData] = []
     result_count = 0
+    # Phase 39.3 (HIGH-3): build per-dialog read_state + dialog_type maps from
+    # daemon response; threaded into format_unread_messages_grouped so each DM
+    # block gets its own header (AC-5/6/7). Absent fields → no header for that
+    # block (backward compat with pre-39.3 daemon).
+    read_state_per_dialog: dict[int, dict] = {}
+    dialog_type_per_dialog: dict[int, str] = {}
 
     for group in groups:
         messages = [DaemonMessage(m) for m in group.get("messages", [])]
+        dialog_id = group.get("dialog_id", 0)
         chat_data = UnreadChatData(
-            chat_id=group.get("dialog_id", 0),
+            chat_id=dialog_id,
             display_name=group.get("display_name", ""),
             unread_count=group.get("unread_count", 0),
             unread_mentions_count=group.get("unread_mentions_count", 0),
@@ -119,7 +126,18 @@ async def list_unread_messages(args: ListUnreadMessages) -> ToolResult:
         result_count += len(messages)
         chats.append(chat_data)
 
-    result_text = format_unread_messages_grouped(chats)
+        rs = group.get("read_state")
+        if rs is not None:
+            read_state_per_dialog[dialog_id] = rs
+        dt = group.get("dialog_type")
+        if dt is not None:
+            dialog_type_per_dialog[dialog_id] = dt
+
+    result_text = format_unread_messages_grouped(
+        chats,
+        read_state_per_dialog=read_state_per_dialog or None,
+        dialog_type_per_dialog=dialog_type_per_dialog or None,
+    )
     # Closes UAT gap 2: even when results are non-empty, the caller must be told
     # if some dialogs are still bootstrapping — otherwise partial coverage looks
     # like complete coverage.
