@@ -105,6 +105,34 @@ def _make_db() -> sqlite3.Connection:
     )
     conn.execute(
         """
+        CREATE TABLE IF NOT EXISTS topic_metadata (
+            dialog_id           INTEGER NOT NULL,
+            topic_id            INTEGER NOT NULL,
+            title               TEXT NOT NULL,
+            top_message_id      INTEGER,
+            is_general          INTEGER NOT NULL DEFAULT 0,
+            is_deleted          INTEGER NOT NULL DEFAULT 0,
+            inaccessible_error  TEXT,
+            inaccessible_at     INTEGER,
+            updated_at          INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (dialog_id, topic_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS message_versions (
+            dialog_id   INTEGER NOT NULL,
+            message_id  INTEGER NOT NULL,
+            version     INTEGER NOT NULL,
+            old_text    TEXT,
+            edit_date   INTEGER,
+            PRIMARY KEY (dialog_id, message_id, version)
+        ) WITHOUT ROWID
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS entities (
             id              INTEGER PRIMARY KEY,
             type            TEXT NOT NULL,
@@ -194,53 +222,29 @@ def test_classify_dialog_type_channel_group_bot_forum() -> None:
     bot = SimpleNamespace(first_name="Botty", bot=True)
     assert _classify_dialog_type(bot) == "Bot"
 
-    # Channel / Group / Forum via the Channel telethon class
+    # Channel / Group / Forum via the Channel telethon class.
+    # Build via __new__ to avoid telethon-version-specific constructor signatures;
+    # _classify_dialog_type inspects isinstance() + megagroup/forum attrs only.
     from telethon.tl.types import Channel, Chat
 
-    channel = Channel(
-        id=1, title="C", photo=None, date=None, creator=False,
-        left=False, broadcast=True, verified=False, megagroup=False,
-        restricted=False, signatures=False, min=False, scam=False,
-        has_link=False, has_geo=False, slowmode_enabled=False,
-        fake=False, gigagroup=False, noforwards=False,
-        join_to_send=False, join_request=False, forum=False,
-        access_hash=None, username=None, restriction_reason=None,
-        admin_rights=None, banned_rights=None, default_banned_rights=None,
-        participants_count=None,
-    )
+    channel = Channel.__new__(Channel)
+    channel.megagroup = False
+    channel.forum = False
     assert _classify_dialog_type(channel) == "Channel"
 
-    group = Channel(
-        id=2, title="G", photo=None, date=None, creator=False,
-        left=False, broadcast=False, verified=False, megagroup=True,
-        restricted=False, signatures=False, min=False, scam=False,
-        has_link=False, has_geo=False, slowmode_enabled=False,
-        fake=False, gigagroup=False, noforwards=False,
-        join_to_send=False, join_request=False, forum=False,
-        access_hash=None, username=None, restriction_reason=None,
-        admin_rights=None, banned_rights=None, default_banned_rights=None,
-        participants_count=None,
-    )
+    group = Channel.__new__(Channel)
+    group.megagroup = True
+    group.forum = False
     assert _classify_dialog_type(group) == "Group"
 
-    forum = Channel(
-        id=3, title="F", photo=None, date=None, creator=False,
-        left=False, broadcast=False, verified=False, megagroup=True,
-        restricted=False, signatures=False, min=False, scam=False,
-        has_link=False, has_geo=False, slowmode_enabled=False,
-        fake=False, gigagroup=False, noforwards=False,
-        join_to_send=False, join_request=False, forum=True,
-        access_hash=None, username=None, restriction_reason=None,
-        admin_rights=None, banned_rights=None, default_banned_rights=None,
-        participants_count=None,
-    )
+    forum = Channel.__new__(Channel)
+    forum.megagroup = True
+    forum.forum = True
     assert _classify_dialog_type(forum) == "Forum"
 
-    chat = Chat(
-        id=4, title="CH", photo=None, participants_count=0, date=None,
-        version=0, creator=False, kicked=False, left=False,
-        deactivated=False, migrated_to=None,
-    )
+    # Chat is detected via isinstance; constructor signature varies by telethon
+    # version, so build a Chat by bypassing __init__ — isinstance is what matters.
+    chat = Chat.__new__(Chat)
     assert _classify_dialog_type(chat) == "Chat"
 
     assert _classify_dialog_type(None) == "Unknown"
@@ -446,10 +450,9 @@ async def test_search_messages_response_includes_read_state_per_dialog() -> None
             (dialog_id, mid, 1_700_000_000, text),
         )
         conn.execute(
-            "INSERT INTO messages_fts "
-            "(rowid, dialog_id, message_id, text_stemmed, sender_stemmed) "
-            "VALUES (?, ?, ?, ?, '')",
-            (dialog_id * 1000 + mid, dialog_id, mid, stem_text(text)),
+            "INSERT INTO messages_fts (dialog_id, message_id, stemmed_text) "
+            "VALUES (?, ?, ?)",
+            (dialog_id, mid, stem_text(text)),
         )
 
     _add(1, 10, "searchable needle alpha")

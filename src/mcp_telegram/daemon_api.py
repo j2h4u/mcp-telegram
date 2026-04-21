@@ -76,6 +76,100 @@ def _classify_dialog_type(entity: object | None) -> str:
     return "Unknown"
 
 
+def _dialog_type_from_db(conn: sqlite3.Connection, dialog_id: int) -> str:
+    """Return dialog type string from sync.db entities table.
+
+    Zero Telegram API calls — pure sqlite lookup. Returns one of the values
+    produced by _classify_dialog_type() (same vocabulary). Returns "Unknown"
+    when no entity row exists yet (the row is populated by sync bootstrap and
+    by live event handlers).
+
+    This is the cheap daemon-side path for _list_messages / _search_messages /
+    _list_unread_messages where only the numeric dialog_id is available.
+    """
+    row = conn.execute(
+        "SELECT type FROM entities WHERE id = ?", (dialog_id,)
+    ).fetchone()
+    if row is None:
+        return "Unknown"
+    return str(row[0])
+
+
+def _read_state_for_dialog(
+    conn: sqlite3.Connection, dialog_id: int, dialog_type: str
+) -> dict | None:
+    """Compute the bidirectional ReadState for a DM.
+
+    Returns None for non-DM dialog types (Channel/Group/Forum/Chat/Bot/Unknown).
+    For DMs (dialog_type == "User"):
+      * Reads read_inbox_max_id + read_outbox_max_id from synced_dialogs.
+      * Counts unread per side: incoming (out=0) above read_inbox_max_id,
+        outgoing (out=1) above read_outbox_max_id.
+      * Resolves cursor_state in {populated, null, all_read}.
+      * Fetches MIN(sent_at) of the unread tail per side when count > 0.
+
+    Zero Telegram API calls. Single pair of SQL queries (cursor row + one
+    GROUP BY count-and-min over messages). See Plan 39.3-03 / models.ReadState.
+    """
+    if dialog_type != "User":
+        return None
+
+    cursor_row = conn.execute(
+        "SELECT read_inbox_max_id, read_outbox_max_id "
+        "FROM synced_dialogs WHERE dialog_id = ?",
+        (dialog_id,),
+    ).fetchone()
+    if cursor_row is None:
+        read_inbox_max_id, read_outbox_max_id = None, None
+    else:
+        read_inbox_max_id, read_outbox_max_id = cursor_row[0], cursor_row[1]
+
+    # Aggregate incoming/outgoing unread counts + oldest-unread-sent_at in one pass.
+    # NOTE: NULL cursor → COALESCE(cursor, -1) treats ALL messages on that side as unread
+    # in row semantics (matches the bootstrap-pending trade-off documented in
+    # <interfaces> §MEDIUM-2). Header rendering separately renders cursor_state="null"
+    # as "unknown (sync pending)" — see formatter._render_read_state_header.
+    agg_row = conn.execute(
+        """
+        SELECT
+          SUM(CASE WHEN out = 0 AND message_id > COALESCE(:in_c, -1) THEN 1 ELSE 0 END) AS in_cnt,
+          SUM(CASE WHEN out = 1 AND message_id > COALESCE(:out_c, -1) THEN 1 ELSE 0 END) AS out_cnt,
+          MIN(CASE WHEN out = 0 AND message_id > COALESCE(:in_c, -1) THEN sent_at END) AS in_min,
+          MIN(CASE WHEN out = 1 AND message_id > COALESCE(:out_c, -1) THEN sent_at END) AS out_min
+        FROM messages
+        WHERE dialog_id = :dialog_id
+        """,
+        {"dialog_id": dialog_id, "in_c": read_inbox_max_id, "out_c": read_outbox_max_id},
+    ).fetchone()
+    in_cnt = int(agg_row[0] or 0)
+    out_cnt = int(agg_row[1] or 0)
+    in_min = agg_row[2]
+    out_min = agg_row[3]
+
+    def _state(cursor: int | None, unread_count: int) -> str:
+        if cursor is None:
+            return "null"
+        if unread_count == 0:
+            return "all_read"
+        return "populated"
+
+    rs: dict = {
+        "inbox_unread_count": in_cnt,
+        "inbox_cursor_state": _state(read_inbox_max_id, in_cnt),
+        "outbox_unread_count": out_cnt,
+        "outbox_cursor_state": _state(read_outbox_max_id, out_cnt),
+    }
+    if read_inbox_max_id is not None:
+        rs["inbox_max_id_anchor"] = int(read_inbox_max_id)
+    if read_outbox_max_id is not None:
+        rs["outbox_max_id_anchor"] = int(read_outbox_max_id)
+    if in_cnt > 0 and in_min is not None:
+        rs["inbox_oldest_unread_date"] = int(in_min)
+    if out_cnt > 0 and out_min is not None:
+        rs["outbox_oldest_unread_date"] = int(out_min)
+    return rs
+
+
 USER_TTL: int = 2_592_000   # 30 days
 GROUP_TTL: int = 604_800    # 7 days
 
@@ -1139,6 +1233,8 @@ class DaemonAPIServer:
                 "unresolved_entity_rows": unresolved_entity_rows,
             },
         )
+        dialog_type = _dialog_type_from_db(self._conn, dialog_id)
+        read_state = _read_state_for_dialog(self._conn, dialog_id, dialog_type)
         return {
             "ok": True,
             "data": {
@@ -1146,6 +1242,8 @@ class DaemonAPIServer:
                 "source": "sync_db",
                 "anchor_message_id": anchor_message_id,
                 "next_navigation": None,
+                "dialog_type": dialog_type,
+                "read_state": read_state,
             },
         }
 
@@ -1332,6 +1430,9 @@ class DaemonAPIServer:
         row = self._conn.execute(_SELECT_SYNC_STATUS_SQL, (dialog_id,)).fetchone()
         status = row[0] if row is not None else None
 
+        dialog_type = _dialog_type_from_db(self._conn, dialog_id)
+        read_state = _read_state_for_dialog(self._conn, dialog_id, dialog_type)
+
         if status in ("synced", "syncing", "access_lost"):
             result = await self._list_messages_from_db(
                 dialog_id=dialog_id,
@@ -1345,6 +1446,8 @@ class DaemonAPIServer:
                 unread_after_id=unread_after_id,
             )
             result["data"].update(_build_access_metadata(self._conn, dialog_id, status))
+            result["data"]["dialog_type"] = dialog_type
+            result["data"]["read_state"] = read_state
             return result
 
         telegram_result = await self._list_messages_from_telegram(
@@ -1359,6 +1462,8 @@ class DaemonAPIServer:
         )
         if telegram_result.get("ok"):
             telegram_result["data"]["dialog_access"] = "live"
+            telegram_result["data"]["dialog_type"] = dialog_type
+            telegram_result["data"]["read_state"] = read_state
         return telegram_result
 
     # ------------------------------------------------------------------
@@ -1480,6 +1585,18 @@ class DaemonAPIServer:
             nav_dialog_id = 0 if global_mode else dialog_id
             next_nav = encode_search_navigation(next_offset, nav_dialog_id, query)
 
+        # Phase 39.3-03 Task 2: build read_state_per_dialog for every distinct
+        # dialog_id appearing in results. Only DMs (dialog_type == "User") are
+        # included — non-DM hits are absent from the map (documented HIGH-1
+        # resolution: per-dialog header block only covers DMs).
+        distinct_dialog_ids = {m["dialog_id"] for m in messages if m.get("dialog_id")}
+        read_state_per_dialog: dict[int, dict] = {}
+        for did in distinct_dialog_ids:
+            dt = _dialog_type_from_db(self._conn, did)
+            rs = _read_state_for_dialog(self._conn, did, dt)
+            if rs is not None:
+                read_state_per_dialog[did] = rs
+
         # Enrich with access metadata for scoped searches
         if not global_mode and dialog_id:
             row = self._conn.execute(_SELECT_SYNC_STATUS_SQL, (dialog_id,)).fetchone()
@@ -1493,12 +1610,21 @@ class DaemonAPIServer:
                     "messages": messages,
                     "total": len(messages),
                     "next_navigation": next_nav,
+                    "read_state_per_dialog": read_state_per_dialog,
                     **access_meta,
                 },
             }
 
         # Global mode: no single dialog_access (results span multiple dialogs)
-        return {"ok": True, "data": {"messages": messages, "total": len(messages), "next_navigation": next_nav}}
+        return {
+            "ok": True,
+            "data": {
+                "messages": messages,
+                "total": len(messages),
+                "next_navigation": next_nav,
+                "read_state_per_dialog": read_state_per_dialog,
+            },
+        }
 
     # ------------------------------------------------------------------
     # list_dialogs
@@ -2121,6 +2247,10 @@ class DaemonAPIServer:
         for entry in entries:
             chat_id = entry["chat_id"]
             budget = allocation.get(chat_id, 0)
+            # Phase 39.3-03 Task 2: include dialog_type + read_state per group
+            # so the tool layer can render a per-chat header block (HIGH-3).
+            dialog_type = _dialog_type_from_db(self._conn, chat_id)
+            read_state = _read_state_for_dialog(self._conn, chat_id, dialog_type)
             group: dict = {
                 "dialog_id": chat_id,
                 "display_name": entry["display_name"],
@@ -2128,6 +2258,8 @@ class DaemonAPIServer:
                 "category": entry["category"],
                 "unread_count": entry["unread_count"],
                 "unread_mentions_count": entry["unread_mentions_count"],
+                "dialog_type": dialog_type,
+                "read_state": read_state,
                 "messages": [],
             }
             if budget == 0:

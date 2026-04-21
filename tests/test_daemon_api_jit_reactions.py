@@ -54,7 +54,8 @@ def _make_db(*, with_fts: bool = False) -> sqlite3.Connection:
             sync_progress       INTEGER DEFAULT 0,
             total_messages      INTEGER,
             access_lost_at      INTEGER,
-            read_inbox_max_id   INTEGER
+            read_inbox_max_id   INTEGER,
+            read_outbox_max_id  INTEGER
         )
         """
     )
