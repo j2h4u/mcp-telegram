@@ -317,3 +317,144 @@ def test_parse_tme_link_short_username_rejected() -> None:
     """Telegram usernames must be ≥5 chars (4 after prefix), reject 3-char."""
     assert _parse_tme_link("t.me/abc") is None
 
+
+# ---------------------------------------------------------------------------
+# Collision invariant tests (39.4-01)
+# ---------------------------------------------------------------------------
+
+
+def test_collision_doronin_production_repro() -> None:
+    """Production repro: User 268071163 and Channel -1001245391218 share the same name.
+    resolve() must return Candidates — never Resolved — when ≥2 distinct entity_ids
+    share the same normalized display name."""
+    choices = {268071163: "Константин Доронин", -1001245391218: "Константин Доронин"}
+    result = resolve("Константин Доронин", choices)
+    assert isinstance(result, Candidates), f"Expected Candidates, got {result!r}"
+    ids = {m["entity_id"] for m in result.matches}
+    assert 268071163 in ids, "User 268071163 missing from matches"
+    assert -1001245391218 in ids, "Channel -1001245391218 missing from matches"
+
+
+def test_collision_exact_same_norm_name_multiword() -> None:
+    """Two distinct ids share 'Иван Петров' exactly — must be Candidates."""
+    choices = {1: "Иван Петров", 2: "Иван Петров"}
+    result = resolve("Иван Петров", choices)
+    assert isinstance(result, Candidates), f"Expected Candidates, got {result!r}"
+    ids = {m["entity_id"] for m in result.matches}
+    assert {1, 2} <= ids
+
+
+def test_collision_exact_same_norm_name_single_word() -> None:
+    """{1: 'Ivan', 2: 'Ivan'} — single-word query must return Candidates with both ids."""
+    choices = {1: "Ivan", 2: "Ivan"}
+    result = resolve("Ivan", choices)
+    assert isinstance(result, Candidates), f"Expected Candidates, got {result!r}"
+    ids = {m["entity_id"] for m in result.matches}
+    assert {1, 2} <= ids
+
+
+def test_collision_three_entities_same_name() -> None:
+    """{1,2,3} all named 'Anna' — Candidates with all three."""
+    choices = {1: "Anna", 2: "Anna", 3: "Anna"}
+    result = resolve("Anna", choices)
+    assert isinstance(result, Candidates), f"Expected Candidates, got {result!r}"
+    ids = {m["entity_id"] for m in result.matches}
+    assert {1, 2, 3} <= ids
+
+
+def test_collision_diacritic_variants() -> None:
+    """{1: 'Müller', 2: 'Muller'} both latinize to 'muller' — must be Candidates."""
+    choices = {1: "Müller", 2: "Muller"}
+    result = resolve("Müller", choices)
+    assert isinstance(result, Candidates), f"Expected Candidates, got {result!r}"
+    ids = {m["entity_id"] for m in result.matches}
+    assert {1, 2} <= ids
+
+
+def test_collision_decoration_emoji() -> None:
+    """{1: '⭐Ivan⭐', 2: 'Ivan'} both latinize to 'ivan' — must be Candidates."""
+    choices = {1: "⭐Ivan⭐", 2: "Ivan"}
+    result = resolve("Ivan", choices)
+    assert isinstance(result, Candidates), f"Expected Candidates, got {result!r}"
+    ids = {m["entity_id"] for m in result.matches}
+    assert {1, 2} <= ids
+
+
+def test_no_collision_single_exact_multiword_still_resolved() -> None:
+    """Regression guard: unique multiword exact match must still return Resolved."""
+    choices = {101: "Иван Петров", 102: "Анна Иванова"}
+    result = resolve("Иван Петров", choices)
+    assert isinstance(result, Resolved), f"Expected Resolved, got {result!r}"
+    assert result.entity_id == 101
+
+
+def test_no_collision_single_exact_single_word_with_no_other_hits() -> None:
+    """Single unique entity — must not over-trigger Candidates."""
+    choices = {500: "Zxywvut"}
+    result = resolve("Zxywvut", choices)
+    assert isinstance(result, Resolved), f"Expected Resolved, got {result!r}"
+    assert result.entity_id == 500
+
+
+def test_collision_preserves_all_entity_ids_in_matches() -> None:
+    """5 entities sharing 'Name' — all 5 entity_ids must appear in matches."""
+    choices = {i: "Name" for i in range(1, 6)}
+    result = resolve("Name", choices)
+    assert isinstance(result, Candidates), f"Expected Candidates, got {result!r}"
+    ids = {m["entity_id"] for m in result.matches}
+    assert ids == {1, 2, 3, 4, 5}
+
+
+def test_collision_with_additional_near_matches() -> None:
+    """{1:'Ivan', 2:'Ivan', 3:'Ivano'} — Candidates contains {1,2} at minimum."""
+    choices = {1: "Ivan", 2: "Ivan", 3: "Ivano"}
+    result = resolve("Ivan", choices)
+    assert isinstance(result, Candidates), f"Expected Candidates, got {result!r}"
+    ids = {m["entity_id"] for m in result.matches}
+    assert {1, 2} <= ids
+
+
+def test_collision_with_normalized_name_map_path() -> None:
+    """Explicit normalized_name_map with collision must still be detected."""
+    choices = {1: "Ivan A", 2: "Ivan B"}
+    normalized = {1: "ivan", 2: "ivan"}
+    result = resolve("Ivan", choices, normalized_name_map=normalized)
+    assert isinstance(result, Candidates), f"Expected Candidates, got {result!r}"
+    ids = {m["entity_id"] for m in result.matches}
+    assert {1, 2} <= ids
+
+
+def test_collision_cross_type_same_name() -> None:
+    """{100: 'Support', -1001234: 'Support'} (user vs channel) — Candidates with both."""
+    choices = {100: "Support", -1001234: "Support"}
+    result = resolve("Support", choices)
+    assert isinstance(result, Candidates), f"Expected Candidates, got {result!r}"
+    ids = {m["entity_id"] for m in result.matches}
+    assert {100, -1001234} <= ids
+
+
+def test_no_collision_substring_not_exact_match() -> None:
+    """Multiword exact match on id=2; id=1 is only partial — must be Resolved(2)."""
+    choices = {1: "Иван", 2: "Иван Петров"}
+    result = resolve("Иван Петров", choices)
+    assert isinstance(result, Resolved), f"Expected Resolved, got {result!r}"
+    assert result.entity_id == 2
+
+
+def test_collision_returned_matches_nonempty_dicts() -> None:
+    """Each dict in result.matches has all required keys."""
+    choices = {1: "TestName", 2: "TestName"}
+    result = resolve("TestName", choices)
+    assert isinstance(result, Candidates)
+    required_keys = {"entity_id", "display_name", "score", "username", "entity_type"}
+    for match in result.matches:
+        assert required_keys <= set(match.keys()), f"Match missing keys: {match}"
+
+
+def test_numeric_query_bypasses_collision_logic() -> None:
+    """Numeric query '123' on collision map must return Resolved(123) — numeric path unaffected."""
+    choices = {123: "Shared", 456: "Shared"}
+    result = resolve("123", choices)
+    assert isinstance(result, Resolved), f"Expected Resolved, got {result!r}"
+    assert result.entity_id == 123
+
