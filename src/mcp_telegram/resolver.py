@@ -154,6 +154,18 @@ def _fuzzy_resolve(
 
     if exact_entity_id is not None:
         assert exact_display_name is not None  # set atomically with exact_entity_id on line above
+        # Collision check: if ≥2 distinct entity_ids share the same normalized name,
+        # auto-pick would violate the Resolved contract ("unique entity identified").
+        # Always return Candidates when collision is detected.
+        exact_entries = norm_map[norm_query]
+        if len(exact_entries) >= 2:
+            logger.debug(
+                "resolver_collision query=%r n_entities=%d",
+                query,
+                len(exact_entries),
+            )
+            matches = _build_matches(hits, norm_map, entity_cache, exact_first_id=exact_entity_id)
+            return Candidates(query=query, matches=matches)
         return Resolved(entity_id=exact_entity_id, display_name=exact_display_name)
 
     matches = _build_matches(hits, norm_map, entity_cache)

@@ -106,11 +106,15 @@ def test_single_word_single_candidate_resolves() -> None:
 
 
 def test_multi_word_exact_resolves() -> None:
-    """Multi-word 'Ольга Петрова' exact normalized match → Resolved."""
+    """Multi-word 'Ольга Петрова' where two entities share the same normalized name.
+    Both 'Olga Petrova' and 'Ольга Петрова' normalize to 'olga petrova' — collision
+    detected, must return Candidates (not arbitrary Resolved)."""
     choices = {1: "Olga Petrova", 2: "Ольга Петрова"}
     result = resolve("Ольга Петрова", choices)
-    # Both normalize to "olga petrova", one should resolve
-    assert isinstance(result, Resolved)
+    # Both normalize to "olga petrova" — collision: Candidates required
+    assert isinstance(result, Candidates)
+    ids = {m["entity_id"] for m in result.matches}
+    assert {1, 2} <= ids
 
 
 def test_single_low_score_match_returns_candidates() -> None:
