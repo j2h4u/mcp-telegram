@@ -29,6 +29,7 @@ from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
 from telethon.tl.types import UpdateMessageReactions  # type: ignore[import-untyped]
 from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
+from .read_state import _apply_read_cursor
 from .resolver import latinize
 from .sync_worker import (
     INSERT_DIALOG_SQL,
@@ -72,12 +73,6 @@ _MARK_DELETED_SQL = (
 
 _UPDATE_LAST_EVENT_SQL = (
     "UPDATE synced_dialogs SET last_event_at=? WHERE dialog_id=?"
-)
-
-_UPDATE_READ_POSITION_SQL = (
-    "UPDATE synced_dialogs "
-    "SET read_inbox_max_id = MAX(COALESCE(read_inbox_max_id, 0), ?) "
-    "WHERE dialog_id = ?"
 )
 
 _SELECT_SYNCED_DIALOGS_SQL = (
@@ -388,9 +383,11 @@ class EventHandlerManager:
         try:
             now = int(time.time())
             with self._conn:
-                cursor = self._conn.execute(_UPDATE_READ_POSITION_SQL, (event.max_id, dialog_id))
+                rowcount = _apply_read_cursor(
+                    self._conn, dialog_id, "inbox", event.max_id
+                )
                 self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
-            if cursor.rowcount > 0:
+            if rowcount > 0:
                 logger.info("event_read dialog_id=%d max_id=%d", dialog_id, event.max_id)
             else:
                 logger.warning(

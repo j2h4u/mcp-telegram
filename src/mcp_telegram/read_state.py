@@ -40,7 +40,7 @@ def _apply_read_cursor(
     dialog_id: int,
     kind: ReadCursorKind,
     max_id: int,
-) -> None:
+) -> int:
     """Monotonic write of a read cursor on ``synced_dialogs``.
 
     Args:
@@ -50,6 +50,12 @@ def _apply_read_cursor(
             on any other value — caller bug, fail loud.
         max_id: New candidate cursor value. Smaller values are absorbed by
             ``MAX(COALESCE(<col>, 0), ?)`` — the cursor never regresses.
+
+    Returns:
+        ``cursor.rowcount`` from the UPDATE — ``0`` when ``dialog_id`` is not
+        present in ``synced_dialogs``, ``1`` otherwise. Callers use this to
+        preserve observability of "handler fired on unknown dialog" anomalies
+        without re-owning the SQL string.
 
     Raises:
         KeyError: if ``kind`` is not one of ``_CURSOR_COLUMNS``.
@@ -62,4 +68,5 @@ def _apply_read_cursor(
         f"SET {column} = MAX(COALESCE({column}, 0), ?) "
         f"WHERE dialog_id = ?"
     )
-    conn.execute(sql, (max_id, dialog_id))
+    cur = conn.execute(sql, (max_id, dialog_id))
+    return cur.rowcount

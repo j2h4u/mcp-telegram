@@ -49,6 +49,7 @@ from .daemon_api import DaemonAPIServer, get_daemon_socket_path
 from .delta_sync import DeltaSyncWorker, run_access_probe_loop
 from .event_handlers import EventHandlerManager
 from .fts import backfill_fts_index
+from .read_state import _apply_read_cursor
 from .sync_db import (
     _open_sync_db,
     ensure_sync_schema,
@@ -77,13 +78,6 @@ _SELECT_NULL_READ_POSITIONS_SQL = (
     "SELECT dialog_id FROM synced_dialogs "
     "WHERE read_inbox_max_id IS NULL AND status = 'synced'"
 )
-
-_UPDATE_READ_POSITION_SQL = (
-    "UPDATE synced_dialogs "
-    "SET read_inbox_max_id = MAX(COALESCE(read_inbox_max_id, 0), ?) "
-    "WHERE dialog_id = ?"
-)
-
 
 async def _backfill_total_messages(
     client: Any,
@@ -165,9 +159,10 @@ async def _initialize_read_positions(
                 for d in result.dialogs:
                     chat_id = telethon_utils.get_peer_id(d.peer)
                     max_id = getattr(d, "read_inbox_max_id", 0) or 0
-                    # Monotonic: MAX(existing_or_0, incoming) never regresses
-                    cursor = conn.execute(_UPDATE_READ_POSITION_SQL, (max_id, chat_id))
-                    if cursor.rowcount > 0:
+                    # Monotonic: MAX(existing_or_0, incoming) never regresses.
+                    # Shared primitive owns the SQL — see read_state.py.
+                    rowcount = _apply_read_cursor(conn, chat_id, "inbox", max_id)
+                    if rowcount > 0:
                         filled += 1
                 conn.commit()
         except FloodWaitError as exc:
