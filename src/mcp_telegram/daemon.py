@@ -65,6 +65,13 @@ logger = logging.getLogger(__name__)
 HEARTBEAT_INTERVAL_S: float = 60.0
 GAP_SCAN_INTERVAL_S: float = 7 * 24 * 3600.0
 
+# Bootstrap sweep batch size for GetPeerDialogsRequest. Telethon's per-call
+# limit is 100; we intentionally stay in the 10-20 range to avoid the
+# FloodWait burst that broke the 260416-ifp incident. 15 is the sweet spot
+# documented in Plan 39.3-02 (R4) and the _initialize_read_positions docstring.
+# Paired with a 1.5s inter-batch pause in the loop body.
+_BOOTSTRAP_BATCH_SIZE: int = 15
+
 _SELECT_NULL_TOTAL_SQL = (
     "SELECT dialog_id FROM synced_dialogs WHERE total_messages IS NULL "
     "AND status != 'not_synced'"
@@ -160,12 +167,11 @@ async def _initialize_read_positions(
 
     dialog_ids = [row[0] for row in rows]
     filled = 0
-    BATCH = 15  # noqa: N806 — kept uppercase to match plan spec; 10-20 range avoids burst FloodWait
 
-    for i in range(0, len(dialog_ids), BATCH):
+    for i in range(0, len(dialog_ids), _BOOTSTRAP_BATCH_SIZE):
         if shutdown_event.is_set():
             break
-        batch_ids = dialog_ids[i : i + BATCH]
+        batch_ids = dialog_ids[i : i + _BOOTSTRAP_BATCH_SIZE]
         try:
             input_peers = []
             for did in batch_ids:
