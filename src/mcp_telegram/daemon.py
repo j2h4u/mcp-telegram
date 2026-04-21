@@ -74,9 +74,13 @@ _UPDATE_TOTAL_SQL = (
     "UPDATE synced_dialogs SET total_messages = ? WHERE dialog_id = ?"
 )
 
-_SELECT_NULL_READ_POSITIONS_SQL = (
+_SELECT_NULL_READ_CURSORS_SQL = (
+    # Phase 39.3-02: picks up dialogs with EITHER cursor NULL. Post-v12
+    # migration, every existing synced row has read_outbox_max_id = NULL, so
+    # this re-bootstraps all of them in batched GetPeerDialogsRequest calls.
     "SELECT dialog_id FROM synced_dialogs "
-    "WHERE read_inbox_max_id IS NULL AND status = 'synced'"
+    "WHERE (read_inbox_max_id IS NULL OR read_outbox_max_id IS NULL) "
+    "AND status = 'synced'"
 )
 
 async def _backfill_total_messages(
@@ -123,17 +127,33 @@ async def _initialize_read_positions(
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,
 ) -> int:
-    """One-time sweep to populate read_inbox_max_id for synced dialogs with NULL.
+    """One-time sweep to populate BOTH read cursors for synced dialogs.
 
-    Uses batched GetPeerDialogsRequest (batch size 15, 1.5s inter-batch pause).
-    Batch size is deliberately low (10-20 range, NOT 100) to avoid the FloodWait
-    burst that broke 260416-ifp. Runs once at daemon startup in the background.
+    Phase 39.3-02 R4: the same GetPeerDialogsRequest sweep that already
+    populates ``read_inbox_max_id`` also populates ``read_outbox_max_id``
+    from the same ``Dialog`` object — same endpoint, batched at
+    ``ceil(N / 15)`` calls (Telethon's batch limit). No additional API
+    endpoints introduced.
 
-    All writes use monotonic UPDATE — MAX(COALESCE(existing, 0), incoming) —
-    so a live MessageRead event that arrives during the bootstrap window
-    cannot be overwritten by a stale bootstrap reply.
+    D-03 LOCKED NULL preservation: if Telethon returns None for either
+    cursor on a Dialog, ``_apply_read_cursor`` is NOT called for that
+    side. The DB cursor stays NULL so Plan 03's header renders
+    ``[unknown (sync pending)]`` rather than lying with ``[all read]``.
+    NEVER convert None → 0; NEVER call _apply_read_cursor with 0 as a
+    stand-in. This consistency rule applies symmetrically to inbox AND
+    outbox. It tightens Phase 38's inbox-side behaviour (which used
+    ``or 0``) — documented behavioural change.
+
+    Batch size 15, 1.5s inter-batch pause (10-20 range to avoid
+    FloodWait burst that broke 260416-ifp). Runs once at daemon startup
+    in the background.
+
+    All writes use monotonic UPDATE — ``MAX(COALESCE(existing, 0), incoming)``
+    via the shared primitive — so a live MessageRead / outbox-read event
+    that arrives during the bootstrap window cannot be overwritten by a
+    stale bootstrap reply (designed race safety, not accidental).
     """
-    rows = conn.execute(_SELECT_NULL_READ_POSITIONS_SQL).fetchall()
+    rows = conn.execute(_SELECT_NULL_READ_CURSORS_SQL).fetchall()
     if not rows:
         logger.info("initialize_read_positions — no NULL rows, skipping")
         return 0
@@ -158,11 +178,28 @@ async def _initialize_read_positions(
                 result = await client(GetPeerDialogsRequest(peers=input_peers))
                 for d in result.dialogs:
                     chat_id = telethon_utils.get_peer_id(d.peer)
-                    max_id = getattr(d, "read_inbox_max_id", 0) or 0
-                    # Monotonic: MAX(existing_or_0, incoming) never regresses.
-                    # Shared primitive owns the SQL — see read_state.py.
-                    rowcount = _apply_read_cursor(conn, chat_id, "inbox", max_id)
-                    if rowcount > 0:
+                    # D-03 LOCKED: None → skip (preserve NULL). NEVER fold
+                    # None → 0; that would lie with [all read] during the
+                    # bootstrap window. The DB cursor stays NULL and Plan 03
+                    # renders [unknown (sync pending)]. 0 is a legitimate
+                    # distinct value (peer/me has read nothing) — writes 0.
+                    inbox_max = getattr(d, "read_inbox_max_id", None)
+                    outbox_max = getattr(d, "read_outbox_max_id", None)
+                    wrote_any = False
+                    if inbox_max is not None:
+                        # Monotonic via shared primitive — see read_state.py.
+                        rowcount = _apply_read_cursor(
+                            conn, chat_id, "inbox", inbox_max
+                        )
+                        if rowcount > 0:
+                            wrote_any = True
+                    if outbox_max is not None:
+                        rowcount = _apply_read_cursor(
+                            conn, chat_id, "outbox", outbox_max
+                        )
+                        if rowcount > 0:
+                            wrote_any = True
+                    if wrote_any:
                         filled += 1
                 conn.commit()
         except FloodWaitError as exc:

@@ -1050,9 +1050,13 @@ async def test_initialize_read_positions_skips_when_no_null_rows(tmp_path):
 
     conn = sqlite3.connect(":memory:")
     _apply_migrations(conn)
+    # Phase 39.3-02: both cursors must be non-NULL for the row to be skipped.
+    # The extended SELECT now picks up rows with EITHER cursor NULL.
     conn.execute(
-        "INSERT INTO synced_dialogs (dialog_id, status, read_inbox_max_id) VALUES (?, 'synced', ?)",
-        (1001, 5),
+        "INSERT INTO synced_dialogs "
+        "(dialog_id, status, read_inbox_max_id, read_outbox_max_id) "
+        "VALUES (?, 'synced', ?, ?)",
+        (1001, 5, 7),
     )
     conn.commit()
 
