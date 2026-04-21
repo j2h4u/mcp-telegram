@@ -97,7 +97,7 @@ def _dialog_type_from_db(conn: sqlite3.Connection, dialog_id: int) -> str:
 
 def _read_state_for_dialog(
     conn: sqlite3.Connection, dialog_id: int, dialog_type: str
-) -> dict | None:
+) -> ReadState | None:
     """Compute the bidirectional ReadState for a DM.
 
     Returns None for non-DM dialog types (Channel/Group/Forum/Chat/Bot/Unknown).
@@ -159,7 +159,7 @@ def _read_state_for_dialog(
             return "all_read"
         return "populated"
 
-    rs: dict = {
+    rs: ReadState = {
         "inbox_unread_count": in_cnt,
         "inbox_cursor_state": _state(read_inbox_max_id, in_cnt),
         "outbox_unread_count": out_cnt,
@@ -180,6 +180,7 @@ USER_TTL: int = 2_592_000   # 30 days
 GROUP_TTL: int = 604_800    # 7 days
 
 from .budget import allocate_message_budget_proportional, unread_chat_tier
+from .models import ReadState
 from .fts import stem_query
 from .pagination import (
     HistoryDirection,
