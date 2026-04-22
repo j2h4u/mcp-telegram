@@ -1,4 +1,3 @@
-
 import logging
 
 from pydantic import Field
@@ -14,7 +13,6 @@ from ._base import (
     daemon_connection,
     mcp_tool,
 )
-
 
 logger = logging.getLogger(__name__)
 
@@ -115,25 +113,19 @@ async def get_sync_alerts(args: GetSyncAlerts) -> ToolResult:
     if deleted:
         sections.append(f"=== Deleted Messages ({len(deleted)}) ===")
         for d in deleted:
-            sections.append(
-                f"  dialog={d['dialog_id']} msg={d['message_id']} "
-                f"deleted_at={d['deleted_at']}"
-            )
+            sections.append(f"  dialog={d['dialog_id']} msg={d['message_id']} deleted_at={d['deleted_at']}")
 
     if edits:
         sections.append(f"=== Edits ({len(edits)}) ===")
         for e in edits:
             sections.append(
-                f"  dialog={e['dialog_id']} msg={e['message_id']} "
-                f"v{e['version']} edit_date={e['edit_date']}"
+                f"  dialog={e['dialog_id']} msg={e['message_id']} v{e['version']} edit_date={e['edit_date']}"
             )
 
     if access_lost:
         sections.append(f"=== Access Lost ({len(access_lost)}) ===")
         for a in access_lost:
-            sections.append(
-                f"  dialog={a['dialog_id']} lost_at={a.get('access_lost_at')}"
-            )
+            sections.append(f"  dialog={a['dialog_id']} lost_at={a.get('access_lost_at')}")
 
     if not sections:
         text = "No sync alerts."

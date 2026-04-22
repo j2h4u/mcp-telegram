@@ -1,4 +1,3 @@
-
 import asyncio
 import functools
 import logging
@@ -18,6 +17,8 @@ from pydantic import BaseModel, ConfigDict
 
 from ..daemon_client import DaemonConnection, DaemonNotRunningError, daemon_connection
 
+__all__ = ["DaemonConnection", "DaemonNotRunningError", "daemon_connection"]
+
 # Fetch reactor names only when total reactions per message are at or below this limit.
 # Covers personal chats (always ≤ a few) while skipping expensive lookups on busy groups.
 REACTION_NAMES_THRESHOLD = 15
@@ -36,13 +37,10 @@ def _text_response(text: str) -> list[TextContent]:
 
 def _daemon_not_running_text() -> str:
     """Return user-facing error message when the sync daemon is not running."""
-    return (
-        "Telegram backend is not running.\n"
-        "Action: Start it with: mcp-telegram sync"
-    )
+    return "Telegram backend is not running.\nAction: Start it with: mcp-telegram sync"
 
 
-def _check_daemon_response(response: dict, **extra_kwargs) -> "ToolResult | None":
+def _check_daemon_response(response: dict, **extra_kwargs) -> ToolResult | None:
     """Return a ToolResult with error text if response is not ok, else None.
 
     Callers use: ``if err := _check_daemon_response(response): return err``
@@ -56,6 +54,7 @@ def _check_daemon_response(response: dict, **extra_kwargs) -> "ToolResult | None
 @dataclass
 class ToolResult:
     """Internal wrapper carrying MCP content plus telemetry metadata."""
+
     content: t.Sequence[TextContent | ImageContent | EmbeddedResource]
     result_count: int = 0
     has_cursor: bool = False
@@ -89,6 +88,7 @@ def _track_tool_telemetry(tool_name: str):
 
     Applied automatically by @mcp_tool() — do not use directly.
     """
+
     def decorator(fn):
         @functools.wraps(fn)
         async def wrapper(args):
@@ -106,29 +106,33 @@ def _track_tool_telemetry(tool_name: str):
                 duration_ms = (time.monotonic() - start_time) * 1000
                 try:
                     task = asyncio.create_task(
-                        _send_telemetry_event({
-                            "tool_name": tool_name,
-                            "timestamp": time.time(),
-                            "duration_ms": duration_ms,
-                            "result_count": tool_result.result_count if tool_result else 0,
-                            "has_cursor": tool_result.has_cursor if tool_result else False,
-                            "page_depth": tool_result.page_depth if tool_result else 1,
-                            "has_filter": tool_result.has_filter if tool_result else False,
-                            "error_type": error_type,
-                        })
+                        _send_telemetry_event(
+                            {
+                                "tool_name": tool_name,
+                                "timestamp": time.time(),
+                                "duration_ms": duration_ms,
+                                "result_count": tool_result.result_count if tool_result else 0,
+                                "has_cursor": tool_result.has_cursor if tool_result else False,
+                                "page_depth": tool_result.page_depth if tool_result else 1,
+                                "has_filter": tool_result.has_filter if tool_result else False,
+                                "error_type": error_type,
+                            }
+                        )
                     )
                     _background_tasks.add(task)
                     task.add_done_callback(_background_tasks.discard)
                     task.add_done_callback(_telemetry_done_callback)
                 except Exception as e:
                     logger.debug("telemetry_send_skipped: %s", e)
+
         return wrapper
+
     return decorator
 
 
 @singledispatch
 async def tool_runner(
-    args,  # noqa: ANN001
+    args,
 ) -> t.Sequence[TextContent | ImageContent | EmbeddedResource]:
     """Dispatch a ToolArgs instance to its registered async handler."""
     raise NotImplementedError(f"Unsupported type: {type(args)}")
@@ -168,6 +172,7 @@ def mcp_tool(posture: str = "primary", *, annotations: ToolAnnotations | None = 
         @mcp_tool("primary", annotations=ToolAnnotations(readOnlyHint=True))
         async def my_tool(args: MyTool) -> ToolResult: ...
     """
+
     def decorator(fn):
         hints = t.get_type_hints(fn)
         cls = hints["args"]
@@ -179,6 +184,7 @@ def mcp_tool(posture: str = "primary", *, annotations: ToolAnnotations | None = 
         # Add to registry
         TOOL_REGISTRY[name] = (cls, posture, annotations)
         return wrapped
+
     return decorator
 
 
@@ -212,20 +218,14 @@ def _sanitize_tool_schema(value: t.Any) -> t.Any:
 
         any_of = sanitized.get("anyOf")
         if isinstance(any_of, list):
-            non_null_variants = [
-                item for item in any_of if not (isinstance(item, dict) and item.get("type") == "null")
-            ]
+            non_null_variants = [item for item in any_of if not (isinstance(item, dict) and item.get("type") == "null")]
             has_null_variant = len(non_null_variants) != len(any_of)
             if has_null_variant and len(non_null_variants) == 1:
                 replacement = non_null_variants[0]
                 if not isinstance(replacement, dict):
                     return replacement
 
-                merged = {
-                    key: item
-                    for key, item in sanitized.items()
-                    if key not in {"anyOf", "default"}
-                }
+                merged = {key: item for key, item in sanitized.items() if key not in {"anyOf", "default"}}
                 return {**replacement, **merged}
 
         schema_type = sanitized.get("type")
@@ -240,7 +240,7 @@ def _sanitize_tool_schema(value: t.Any) -> t.Any:
     return value
 
 
-def tool_args(tool: Tool, *args, **kwargs) -> ToolArgs:  # noqa: ANN002, ANN003
+def tool_args(tool: Tool, *args, **kwargs) -> ToolArgs:
     """Instantiate the ToolArgs subclass registered for *tool*."""
     entry = TOOL_REGISTRY.get(tool.name)
     if entry is None:
@@ -265,6 +265,4 @@ def verify_tool_registry() -> None:
         if dispatched is tool_runner:
             raise RuntimeError(f"No runner for {name}")
         if not hasattr(dispatched, "__wrapped__"):
-            raise RuntimeError(
-                f"Runner for {name} is missing __wrapped__ — ensure @_track_tool_telemetry is applied"
-            )
+            raise RuntimeError(f"Runner for {name} is missing __wrapped__ — ensure @_track_tool_telemetry is applied")

@@ -72,14 +72,9 @@ GAP_SCAN_INTERVAL_S: float = 7 * 24 * 3600.0
 # Paired with a 1.5s inter-batch pause in the loop body.
 _BOOTSTRAP_BATCH_SIZE: int = 15
 
-_SELECT_NULL_TOTAL_SQL = (
-    "SELECT dialog_id FROM synced_dialogs WHERE total_messages IS NULL "
-    "AND status != 'not_synced'"
-)
+_SELECT_NULL_TOTAL_SQL = "SELECT dialog_id FROM synced_dialogs WHERE total_messages IS NULL AND status != 'not_synced'"
 
-_UPDATE_TOTAL_SQL = (
-    "UPDATE synced_dialogs SET total_messages = ? WHERE dialog_id = ?"
-)
+_UPDATE_TOTAL_SQL = "UPDATE synced_dialogs SET total_messages = ? WHERE dialog_id = ?"
 
 _SELECT_NULL_READ_CURSORS_SQL = (
     # Phase 39.3-02: picks up dialogs with EITHER cursor NULL. Post-v12
@@ -89,6 +84,7 @@ _SELECT_NULL_READ_CURSORS_SQL = (
     "WHERE (read_inbox_max_id IS NULL OR read_outbox_max_id IS NULL) "
     "AND status = 'synced'"
 )
+
 
 async def _backfill_total_messages(
     client: Any,
@@ -113,13 +109,11 @@ async def _backfill_total_messages(
                 conn.commit()
                 filled += 1
         except FloodWaitError as exc:
-            logger.warning(
-                "backfill_total flood_wait dialog_id=%d seconds=%d", dialog_id, exc.seconds
-            )
+            logger.warning("backfill_total flood_wait dialog_id=%d seconds=%d", dialog_id, exc.seconds)
             try:
                 await asyncio.wait_for(shutdown_event.wait(), timeout=float(exc.seconds))
                 return filled  # shutdown during flood wait
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass  # flood wait elapsed normally
         except Exception as exc:
             logger.debug("backfill_total skip dialog_id=%d error=%s", dialog_id, exc)
@@ -194,15 +188,11 @@ async def _initialize_read_positions(
                     wrote_any = False
                     if inbox_max is not None:
                         # Monotonic via shared primitive — see read_state.py.
-                        rowcount = apply_read_cursor(
-                            conn, chat_id, "inbox", inbox_max
-                        )
+                        rowcount = apply_read_cursor(conn, chat_id, "inbox", inbox_max)
                         if rowcount > 0:
                             wrote_any = True
                     if outbox_max is not None:
-                        rowcount = apply_read_cursor(
-                            conn, chat_id, "outbox", outbox_max
-                        )
+                        rowcount = apply_read_cursor(conn, chat_id, "outbox", outbox_max)
                         if rowcount > 0:
                             wrote_any = True
                     if wrote_any:
@@ -213,7 +203,7 @@ async def _initialize_read_positions(
             try:
                 await asyncio.wait_for(shutdown_event.wait(), timeout=float(exc.seconds))
                 return filled
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
         except Exception as exc:
             logger.debug("read_pos_bootstrap batch_failed error=%s", exc)
@@ -222,7 +212,7 @@ async def _initialize_read_positions(
         try:
             await asyncio.wait_for(shutdown_event.wait(), timeout=1.5)
             break
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pass
 
     logger.info("initialize_read_positions filled=%d/%d", filled, len(dialog_ids))
@@ -237,11 +227,7 @@ async def _initialize_read_positions(
 def _log_heartbeat(conn: sqlite3.Connection, client: Any, sync_start: float) -> None:
     """Log heartbeat with sync stats, rate, and ETA from sync.db."""
     try:
-        stats = dict(
-            conn.execute(
-                "SELECT status, COUNT(*) FROM synced_dialogs GROUP BY status"
-            ).fetchall()
-        )
+        stats = dict(conn.execute("SELECT status, COUNT(*) FROM synced_dialogs GROUP BY status").fetchall())
         msg_count = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
     except Exception:
         logger.warning("heartbeat_stats_failed", exc_info=True)
@@ -271,7 +257,11 @@ def _log_heartbeat(conn: sqlite3.Connection, client: Any, sync_start: float) -> 
     logger.info(
         "heartbeat — connected=%s dialogs=%d/%d messages=%d rate=%.0fmsg/s%s",
         client.is_connected(),
-        synced, total, msg_count, rate, eta_str,
+        synced,
+        total,
+        msg_count,
+        rate,
+        eta_str,
     )
 
 
@@ -324,7 +314,12 @@ async def _run_sync_loop(
         await asyncio.sleep(0)
 
         last_heartbeat, last_gap_scan = await _maybe_heartbeat_and_gap_scan(
-            conn, client, handler_manager, sync_start, last_heartbeat, last_gap_scan,
+            conn,
+            client,
+            handler_manager,
+            sync_start,
+            last_heartbeat,
+            last_gap_scan,
         )
 
         if all_synced:
@@ -335,9 +330,14 @@ async def _run_sync_loop(
                     timeout=HEARTBEAT_INTERVAL_S,
                 )
                 break
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 last_heartbeat, last_gap_scan = await _maybe_heartbeat_and_gap_scan(
-                    conn, client, handler_manager, sync_start, last_heartbeat, last_gap_scan,
+                    conn,
+                    client,
+                    handler_manager,
+                    sync_start,
+                    last_heartbeat,
+                    last_gap_scan,
                 )
 
 
@@ -393,7 +393,7 @@ async def sync_main() -> None:
     try:
         try:
             await client.connect()
-        except (OSError, asyncio.TimeoutError) as exc:
+        except (TimeoutError, OSError) as exc:
             logger.error("sync-daemon connection failed: %s", exc, exc_info=True)
             conn.close()
             return
@@ -418,8 +418,7 @@ async def sync_main() -> None:
         # step closes the gap once self_id is known. Idempotent via out=0.
         try:
             cur = conn.execute(
-                "UPDATE messages SET out = 1 "
-                "WHERE out = 0 AND dialog_id > 0 AND sender_id = ?",
+                "UPDATE messages SET out = 1 WHERE out = 0 AND dialog_id > 0 AND sender_id = ?",
                 (api_server.self_id,),
             )
             conn.commit()
@@ -432,7 +431,9 @@ async def sync_main() -> None:
         old_umask = os.umask(0o177)  # ensure socket created as 0o600 with no race
         try:
             unix_server = await asyncio.start_unix_server(
-                api_server.handle_client, path=str(socket_path), limit=2 * 1024 * 1024,
+                api_server.handle_client,
+                path=str(socket_path),
+                limit=2 * 1024 * 1024,
             )
         finally:
             os.umask(old_umask)

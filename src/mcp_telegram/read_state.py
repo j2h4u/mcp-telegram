@@ -22,10 +22,12 @@ Contract:
 * ``UPDATE`` on a missing ``dialog_id`` is a no-op (affects 0 rows, no raise) —
   same as the Phase 38 inbox behaviour it replaces.
 """
+
 from __future__ import annotations
 
 import sqlite3
-from typing import Final, Literal, Mapping
+from collections.abc import Mapping
+from typing import Final, Literal
 
 ReadCursorKind = Literal["inbox", "outbox"]
 
@@ -63,10 +65,6 @@ def apply_read_cursor(
     column = _CURSOR_COLUMNS[kind]  # KeyError on unknown kind — not silent.
     # Safe f-string: ``column`` is always one of two hard-coded strings
     # (see _CURSOR_COLUMNS). No user-controlled text flows into the SQL.
-    sql = (
-        f"UPDATE synced_dialogs "
-        f"SET {column} = MAX(COALESCE({column}, 0), ?) "
-        f"WHERE dialog_id = ?"
-    )
+    sql = f"UPDATE synced_dialogs SET {column} = MAX(COALESCE({column}, 0), ?) WHERE dialog_id = ?"
     cur = conn.execute(sql, (max_id, dialog_id))
     return cur.rowcount

@@ -14,6 +14,7 @@ Architecture:
 - FullSyncWorker is a stateful class instantiated once per daemon run.
 - Plugs into daemon.py sync_main() between heartbeat ticks.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -24,13 +25,13 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
-from telethon.errors import RPCError  # type: ignore[import-untyped]
 from telethon.errors import (  # type: ignore[import-untyped]
     ChannelBannedError,
     ChannelPrivateError,
     ChatForbiddenError,
     ChatWriteForbiddenError,
+    FloodWaitError,  # type: ignore[import-untyped]
+    RPCError,  # type: ignore[import-untyped]
     UserBannedInChannelError,
     UserKickedError,
 )
@@ -52,8 +53,8 @@ class ExtractedMessage:
     """Bundle of extracted rows for atomic multi-table insert."""
 
     row: tuple  # matches INSERT_MESSAGE_SQL param order (no reactions)
-    reactions: list[tuple] = field(default_factory=list)   # [(dialog_id, msg_id, emoji, count)]
-    entities: list[tuple] = field(default_factory=list)    # [(dialog_id, msg_id, offset, length, type, value)]
+    reactions: list[tuple] = field(default_factory=list)  # [(dialog_id, msg_id, emoji, count)]
+    entities: list[tuple] = field(default_factory=list)  # [(dialog_id, msg_id, offset, length, type, value)]
     forward: tuple | None = None  # (dialog_id, msg_id, fwd_from_peer_id, fwd_from_name, fwd_date, fwd_channel_post)
 
 
@@ -70,9 +71,7 @@ INSERT_MESSAGE_SQL = (
 )
 
 INSERT_REACTION_SQL = (
-    "INSERT OR REPLACE INTO message_reactions "
-    "(dialog_id, message_id, emoji, count) "
-    "VALUES (?, ?, ?, ?)"
+    "INSERT OR REPLACE INTO message_reactions (dialog_id, message_id, emoji, count) VALUES (?, ?, ?, ?)"
 )
 
 INSERT_ENTITY_SQL = (
@@ -87,9 +86,7 @@ INSERT_FORWARD_SQL = (
     "VALUES (?, ?, ?, ?, ?, ?)"
 )
 
-_DELETE_REACTIONS_SQL = (
-    "DELETE FROM message_reactions WHERE dialog_id = ? AND message_id = ?"
-)
+_DELETE_REACTIONS_SQL = "DELETE FROM message_reactions WHERE dialog_id = ? AND message_id = ?"
 
 
 def apply_reactions_delta(
@@ -119,17 +116,15 @@ def apply_reactions_delta(
     if reaction_rows:
         conn.executemany(INSERT_REACTION_SQL, reaction_rows)
 
-_DELETE_ENTITIES_SQL = (
-    "DELETE FROM message_entities WHERE dialog_id = ? AND message_id = ?"
-)
 
-_DELETE_FORWARD_SQL = (
-    "DELETE FROM message_forwards WHERE dialog_id = ? AND message_id = ?"
-)
+_DELETE_ENTITIES_SQL = "DELETE FROM message_entities WHERE dialog_id = ? AND message_id = ?"
+
+_DELETE_FORWARD_SQL = "DELETE FROM message_forwards WHERE dialog_id = ? AND message_id = ?"
 
 
 def insert_messages_with_fts(
-    conn: sqlite3.Connection, extracted: list[ExtractedMessage],
+    conn: sqlite3.Connection,
+    extracted: list[ExtractedMessage],
 ) -> None:
     """Insert message rows and all related tables atomically.
 
@@ -168,16 +163,14 @@ def insert_messages_with_fts(
     if all_forwards:
         conn.executemany(INSERT_FORWARD_SQL, all_forwards)
 
+
 _NEXT_PENDING_SQL = (
     "SELECT dialog_id, sync_progress FROM synced_dialogs "
     "WHERE status IN ('syncing', 'not_synced') "
     "ORDER BY rowid LIMIT 1"
 )
 
-_UPDATE_PROGRESS_SQL = (
-    "UPDATE synced_dialogs SET sync_progress = ?, status = ?, total_messages = ? "
-    "WHERE dialog_id = ?"
-)
+_UPDATE_PROGRESS_SQL = "UPDATE synced_dialogs SET sync_progress = ?, status = ?, total_messages = ? WHERE dialog_id = ?"
 # Params: (progress, status, total_messages, dialog_id) — 4 params
 
 _UPDATE_PROGRESS_DONE_SQL = (
@@ -186,14 +179,10 @@ _UPDATE_PROGRESS_DONE_SQL = (
 )
 # Params: (progress, status, total_messages, last_synced_at, dialog_id) — 5 params
 
-INSERT_DIALOG_SQL = (
-    "INSERT OR IGNORE INTO synced_dialogs (dialog_id, status) VALUES (?, 'syncing')"
-)
+INSERT_DIALOG_SQL = "INSERT OR IGNORE INTO synced_dialogs (dialog_id, status) VALUES (?, 'syncing')"
 
 UPSERT_ENTITY_SQL = (
-    "INSERT OR REPLACE INTO entities "
-    "(id, type, name, username, name_normalized, updated_at) "
-    "VALUES (?, ?, ?, ?, ?, ?)"
+    "INSERT OR REPLACE INTO entities (id, type, name, username, name_normalized, updated_at) VALUES (?, ?, ?, ?, ?, ?)"
 )
 
 _ACCESS_LOST_ERRORS = (
@@ -205,18 +194,12 @@ _ACCESS_LOST_ERRORS = (
     ChannelBannedError,
 )
 
-_SET_ACCESS_LOST_SQL = (
-    "UPDATE synced_dialogs "
-    "SET status = 'access_lost', access_lost_at = ? "
-    "WHERE dialog_id = ?"
-)
+_SET_ACCESS_LOST_SQL = "UPDATE synced_dialogs SET status = 'access_lost', access_lost_at = ? WHERE dialog_id = ?"
 
 
 # ---------------------------------------------------------------------------
 # Module-level field extraction helpers (shared with DeltaSyncWorker)
 # ---------------------------------------------------------------------------
-
-
 
 
 def extract_reply_and_topic(msg: Any) -> tuple[int | None, int | None]:
@@ -275,13 +258,16 @@ def _init_entity_types() -> None:
         return
     try:
         from telethon.tl import types as tl  # type: ignore[import-untyped]
-        _ANALYTICS_ENTITY_TYPES.update({
-            tl.MessageEntityMention: "mention",
-            tl.MessageEntityMentionName: "mention_name",
-            tl.MessageEntityHashtag: "hashtag",
-            tl.MessageEntityUrl: "url",
-            tl.MessageEntityTextUrl: "text_url",
-        })
+
+        _ANALYTICS_ENTITY_TYPES.update(
+            {
+                tl.MessageEntityMention: "mention",
+                tl.MessageEntityMentionName: "mention_name",
+                tl.MessageEntityHashtag: "hashtag",
+                tl.MessageEntityUrl: "url",
+                tl.MessageEntityTextUrl: "text_url",
+            }
+        )
     except ImportError:
         pass  # Tests run without telethon
 
@@ -306,8 +292,8 @@ def _utf16_slice(text: str, offset: int, length: int) -> str | None:
         encoded = text.encode("utf-16-le")
         byte_offset = offset * 2
         byte_length = length * 2
-        return encoded[byte_offset:byte_offset + byte_length].decode("utf-16-le")
-    except (UnicodeDecodeError, IndexError):
+        return encoded[byte_offset : byte_offset + byte_length].decode("utf-16-le")
+    except UnicodeDecodeError, IndexError:
         return None
 
 
@@ -427,22 +413,16 @@ def extract_message_row(dialog_id: int, msg: Any) -> ExtractedMessage:
 
     sender_id = getattr(msg, "sender_id", None)
     sender = getattr(msg, "sender", None)
-    sender_first_name = (
-        getattr(sender, "first_name", None) if sender is not None else None
-    )
+    sender_first_name = getattr(sender, "first_name", None) if sender is not None else None
 
     media = getattr(msg, "media", None)
-    media_description: str | None = (
-        type(media).__name__ if media is not None else None
-    )
+    media_description: str | None = type(media).__name__ if media is not None else None
 
     reply_to_msg_id, forum_topic_id = extract_reply_and_topic(msg)
 
     # -- New v7 columns --
     edit_date_raw = getattr(msg, "edit_date", None)
-    edit_date: int | None = (
-        int(edit_date_raw.timestamp()) if edit_date_raw is not None else None
-    )
+    edit_date: int | None = int(edit_date_raw.timestamp()) if edit_date_raw is not None else None
     grouped_id_raw = getattr(msg, "grouped_id", None)
     grouped_id: int | None = int(grouped_id_raw) if grouped_id_raw is not None else None
 
@@ -464,10 +444,20 @@ def extract_message_row(dialog_id: int, msg: Any) -> ExtractedMessage:
     out = 1 if getattr(msg, "out", False) else 0
 
     row = (
-        dialog_id, message_id, sent_at, text, sender_id,
-        sender_first_name, media_description, reply_to_msg_id,
-        forum_topic_id, edit_date, grouped_id, reply_to_peer_id,
-        out, is_service,
+        dialog_id,
+        message_id,
+        sent_at,
+        text,
+        sender_id,
+        sender_first_name,
+        media_description,
+        reply_to_msg_id,
+        forum_topic_id,
+        edit_date,
+        grouped_id,
+        reply_to_peer_id,
+        out,
+        is_service,
     )
     reactions = extract_reactions_rows(dialog_id, message_id, getattr(msg, "reactions", None))
     entities = extract_entity_rows(dialog_id, message_id, msg)
@@ -538,23 +528,33 @@ class FullSyncWorker:
                 entity_type_str = "Bot" if getattr(entity, "bot", False) else "User"
                 self._conn.execute(
                     UPSERT_ENTITY_SQL,
-                    (dialog.id, entity_type_str, name, getattr(entity, "username", None), latinize(name) if name else None, now),
+                    (
+                        dialog.id,
+                        entity_type_str,
+                        name,
+                        getattr(entity, "username", None),
+                        latinize(name) if name else None,
+                        now,
+                    ),
                 )
         except FloodWaitError as exc:
             wait_seconds = getattr(exc, "seconds", 60)
             logger.warning(
                 "dm_bootstrap flood_wait=%ds enrolled_so_far=%d — committing partial progress",
-                wait_seconds, enrolled,
+                wait_seconds,
+                enrolled,
             )
         except RPCError as exc:
             logger.warning(
                 "dm_bootstrap rpc_error=%s enrolled_so_far=%d — committing partial progress",
-                exc, enrolled,
+                exc,
+                enrolled,
             )
-        except (OSError, asyncio.TimeoutError) as exc:
+        except (TimeoutError, OSError) as exc:
             logger.warning(
                 "dm_bootstrap network_error=%s enrolled_so_far=%d — committing partial progress",
-                exc, enrolled,
+                exc,
+                enrolled,
             )
         self._conn.commit()
         logger.info("dm_bootstrap enrolled=%d new DM dialogs", enrolled)
@@ -597,9 +597,7 @@ class FullSyncWorker:
             return None
         return int(row[0]), int(row[1])
 
-    async def _fetch_batch(
-        self, dialog_id: int, sync_progress: int
-    ) -> tuple[int, bool]:
+    async def _fetch_batch(self, dialog_id: int, sync_progress: int) -> tuple[int, bool]:
         """Fetch up to 100 messages for dialog_id older than sync_progress.
 
         Uses offset_id=sync_progress (exclusive) so each batch fetches
@@ -615,27 +613,19 @@ class FullSyncWorker:
             (new_progress, is_done)
         """
         try:
-            result = await self._client.get_messages(
-                entity=dialog_id, limit=100, offset_id=sync_progress
-            )
+            result = await self._client.get_messages(entity=dialog_id, limit=100, offset_id=sync_progress)
             total_messages = result.total  # Telegram-side count from TotalList
             batch = list(result)
             # Note: batch size 100 keeps memory bounded; get_messages needed for .total
         except FloodWaitError as exc:
-            logger.warning(
-                "FloodWait dialog_id=%d — sleeping %ds", dialog_id, exc.seconds
-            )
+            logger.warning("FloodWait dialog_id=%d — sleeping %ds", dialog_id, exc.seconds)
             try:
-                await asyncio.wait_for(
-                    self._shutdown_event.wait(), timeout=float(exc.seconds)
-                )
-            except asyncio.TimeoutError:
+                await asyncio.wait_for(self._shutdown_event.wait(), timeout=float(exc.seconds))
+            except TimeoutError:
                 pass  # slept the full duration; retry same batch next call
             return sync_progress, False
         except _ACCESS_LOST_ERRORS as exc:
-            logger.warning(
-                "access_lost dialog_id=%d — %s: %s", dialog_id, type(exc).__name__, exc
-            )
+            logger.warning("access_lost dialog_id=%d — %s: %s", dialog_id, type(exc).__name__, exc)
             now = int(time.time())
             with self._conn:
                 self._conn.execute(_SET_ACCESS_LOST_SQL, (now, dialog_id))
@@ -682,7 +672,9 @@ class FullSyncWorker:
 
         logger.debug(
             "sync_batch dialog_id=%d fetched=%d progress=%d done=%s",
-            dialog_id, len(batch), new_progress, is_done,
+            dialog_id,
+            len(batch),
+            new_progress,
+            is_done,
         )
         return new_progress, is_done
-

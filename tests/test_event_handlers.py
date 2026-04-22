@@ -4,18 +4,19 @@ Covers DAEMON-07 (NewMessage), DAEMON-08 (MessageEdited),
 DAEMON-09 (channel/supergroup MessageDeleted), and DAEMON-10
 (DM gap scan) behaviors.
 """
+
 from __future__ import annotations
 
 import asyncio
 import sqlite3
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from helpers import build_mock_message
 
-from helpers import build_mock_message, build_mock_reactions
 from mcp_telegram.event_handlers import EventHandlerManager
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 
@@ -29,9 +30,7 @@ def make_new_message_event(
     return SimpleNamespace(chat_id=chat_id, message=message, is_private=is_private)
 
 
-def make_message_edited_event(
-    chat_id: int | None, message: SimpleNamespace
-) -> SimpleNamespace:
+def make_message_edited_event(chat_id: int | None, message: SimpleNamespace) -> SimpleNamespace:
     """Build a minimal MessageEdited.Event-like object.
 
     The message should have .edit_date set to a datetime to signal an edit.
@@ -39,9 +38,7 @@ def make_message_edited_event(
     return SimpleNamespace(chat_id=chat_id, message=message)
 
 
-def make_message_deleted_event(
-    chat_id: int | None, deleted_ids: list[int]
-) -> SimpleNamespace:
+def make_message_deleted_event(chat_id: int | None, deleted_ids: list[int]) -> SimpleNamespace:
     """Build a minimal MessageDeleted.Event-like object."""
     return SimpleNamespace(chat_id=chat_id, deleted_ids=deleted_ids)
 
@@ -341,9 +338,7 @@ async def test_auto_enroll_no_entity_when_sender_unavailable(
     assert row[0] == "syncing"
 
     # No entity row
-    entity = sync_db.execute(
-        "SELECT id FROM entities WHERE id=?", (dialog_id,)
-    ).fetchone()
+    entity = sync_db.execute("SELECT id FROM entities WHERE id=?", (dialog_id,)).fetchone()
     assert entity is None, "no entity row must be written when sender is unavailable"
 
 
@@ -369,9 +364,7 @@ async def test_auto_enroll_writes_tombstone_for_nameless_sender(
     manager.register()
     await manager.on_new_message(event)
 
-    row = sync_db.execute(
-        "SELECT name, username FROM entities WHERE id=?", (dialog_id,)
-    ).fetchone()
+    row = sync_db.execute("SELECT name, username FROM entities WHERE id=?", (dialog_id,)).fetchone()
     assert row is not None, "entity row must exist even when sender has no display name"
     assert row[0] is None, "name must be NULL for nameless sender"
     assert row[1] == "ghost_bot", "username must be preserved"
@@ -388,9 +381,7 @@ async def test_on_new_message_updates_last_event_at(
     insert_synced_dialog(sync_db, dialog_id)
 
     # Verify last_event_at starts as None
-    before = sync_db.execute(
-        "SELECT last_event_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)
-    ).fetchone()[0]
+    before = sync_db.execute("SELECT last_event_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone()[0]
     assert before is None
 
     manager = make_manager(mock_client, sync_db, shutdown_event)
@@ -400,9 +391,7 @@ async def test_on_new_message_updates_last_event_at(
     event = make_new_message_event(chat_id=dialog_id, message=msg)
     await manager.on_new_message(event)
 
-    after = sync_db.execute(
-        "SELECT last_event_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)
-    ).fetchone()[0]
+    after = sync_db.execute("SELECT last_event_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone()[0]
     assert after is not None
 
 
@@ -424,9 +413,7 @@ async def test_burst_50_messages(
         event = make_new_message_event(chat_id=dialog_id, message=msg)
         await manager.on_new_message(event)
 
-    count = sync_db.execute(
-        "SELECT COUNT(*) FROM messages WHERE dialog_id=?", (dialog_id,)
-    ).fetchone()[0]
+    count = sync_db.execute("SELECT COUNT(*) FROM messages WHERE dialog_id=?", (dialog_id,)).fetchone()[0]
     assert count == 50
 
 
@@ -449,7 +436,7 @@ async def test_on_message_edited_creates_version(
     manager = make_manager(mock_client, sync_db, shutdown_event)
     manager.register()
 
-    edit_dt = datetime(2024, 1, 1, 13, 0, 0, tzinfo=timezone.utc)
+    edit_dt = datetime(2024, 1, 1, 13, 0, 0, tzinfo=UTC)
     msg = build_mock_message(id=100, text="new text", edit_date=edit_dt)
     event = make_message_edited_event(chat_id=dialog_id, message=msg)
     await manager.on_message_edited(event)
@@ -485,7 +472,7 @@ async def test_on_message_edited_no_version_if_same(
     manager = make_manager(mock_client, sync_db, shutdown_event)
     manager.register()
 
-    edit_dt = datetime(2024, 1, 1, 13, 0, 0, tzinfo=timezone.utc)
+    edit_dt = datetime(2024, 1, 1, 13, 0, 0, tzinfo=UTC)
     msg = build_mock_message(id=101, text="same", edit_date=edit_dt)
     event = make_message_edited_event(chat_id=dialog_id, message=msg)
     await manager.on_message_edited(event)
@@ -508,7 +495,7 @@ async def test_on_message_edited_unknown_message(
     manager = make_manager(mock_client, sync_db, shutdown_event)
     manager.register()
 
-    edit_dt = datetime(2024, 1, 1, 13, 0, 0, tzinfo=timezone.utc)
+    edit_dt = datetime(2024, 1, 1, 13, 0, 0, tzinfo=UTC)
     msg = build_mock_message(id=999, text="current text", edit_date=edit_dt)
     event = make_message_edited_event(chat_id=dialog_id, message=msg)
     await manager.on_message_edited(event)
@@ -539,11 +526,11 @@ async def test_on_message_edited_increments_version(
     manager = make_manager(mock_client, sync_db, shutdown_event)
     manager.register()
 
-    edit_dt1 = datetime(2024, 1, 1, 13, 0, 0, tzinfo=timezone.utc)
+    edit_dt1 = datetime(2024, 1, 1, 13, 0, 0, tzinfo=UTC)
     msg1 = build_mock_message(id=200, text="v1 text", edit_date=edit_dt1)
     await manager.on_message_edited(make_message_edited_event(dialog_id, msg1))
 
-    edit_dt2 = datetime(2024, 1, 1, 14, 0, 0, tzinfo=timezone.utc)
+    edit_dt2 = datetime(2024, 1, 1, 14, 0, 0, tzinfo=UTC)
     msg2 = build_mock_message(id=200, text="v2 text", edit_date=edit_dt2)
     await manager.on_message_edited(make_message_edited_event(dialog_id, msg2))
 
@@ -622,8 +609,12 @@ async def test_on_message_deleted_already_deleted(
     insert_synced_dialog(sync_db, dialog_id)
     original_deleted_at = 1000
     insert_message(
-        sync_db, dialog_id, message_id=202, text="already gone",
-        is_deleted=1, deleted_at=original_deleted_at,
+        sync_db,
+        dialog_id,
+        message_id=202,
+        text="already gone",
+        is_deleted=1,
+        deleted_at=original_deleted_at,
     )
 
     manager = make_manager(mock_client, sync_db, shutdown_event)
@@ -653,17 +644,13 @@ async def test_on_message_deleted_updates_last_event_at(
     manager = make_manager(mock_client, sync_db, shutdown_event)
     manager.register()
 
-    before = sync_db.execute(
-        "SELECT last_event_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)
-    ).fetchone()[0]
+    before = sync_db.execute("SELECT last_event_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone()[0]
     assert before is None
 
     event = make_message_deleted_event(chat_id=dialog_id, deleted_ids=[203])
     await manager.on_message_deleted(event)
 
-    after = sync_db.execute(
-        "SELECT last_event_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)
-    ).fetchone()[0]
+    after = sync_db.execute("SELECT last_event_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone()[0]
     assert after is not None
 
 
@@ -843,12 +830,8 @@ def test_refresh_excludes_access_lost(
     manager = make_manager(mock_client, sync_db, shutdown_event)
     manager.register()
 
-    assert 9901 not in manager._synced_dialog_ids, (
-        "access_lost dialog must be excluded from _synced_dialog_ids"
-    )
-    assert 9902 in manager._synced_dialog_ids, (
-        "synced dialog must remain in _synced_dialog_ids"
-    )
+    assert 9901 not in manager._synced_dialog_ids, "access_lost dialog must be excluded from _synced_dialog_ids"
+    assert 9902 in manager._synced_dialog_ids, "synced dialog must remain in _synced_dialog_ids"
 
 
 def test_refresh_includes_syncing(
@@ -865,9 +848,7 @@ def test_refresh_includes_syncing(
     manager = make_manager(mock_client, sync_db, shutdown_event)
     manager.register()
 
-    assert 9903 in manager._synced_dialog_ids, (
-        "syncing dialog must be included in _synced_dialog_ids"
-    )
+    assert 9903 in manager._synced_dialog_ids, "syncing dialog must be included in _synced_dialog_ids"
 
 
 @pytest.mark.asyncio
@@ -902,9 +883,7 @@ async def test_gap_scan_excludes_syncing_dialogs(
 
     await manager.run_dm_gap_scan()
 
-    assert dialog_id not in get_messages_calls, (
-        f"'syncing' dialog {dialog_id} must not be scanned"
-    )
+    assert dialog_id not in get_messages_calls, f"'syncing' dialog {dialog_id} must not be scanned"
 
 
 @pytest.mark.asyncio
@@ -939,9 +918,7 @@ async def test_gap_scan_excludes_access_lost_dialogs(
 
     await manager.run_dm_gap_scan()
 
-    assert dialog_id not in get_messages_calls, (
-        f"'access_lost' dialog {dialog_id} must not be scanned"
-    )
+    assert dialog_id not in get_messages_calls, f"'access_lost' dialog {dialog_id} must not be scanned"
 
 
 @pytest.mark.asyncio
@@ -1015,8 +992,7 @@ async def test_on_new_message_populates_fts(
     await manager.on_new_message(event)
 
     fts_row = sync_db.execute(
-        "SELECT dialog_id, message_id, stemmed_text FROM messages_fts "
-        "WHERE dialog_id=? AND message_id=?",
+        "SELECT dialog_id, message_id, stemmed_text FROM messages_fts WHERE dialog_id=? AND message_id=?",
         (dialog_id, 500),
     ).fetchone()
     assert fts_row is not None, "messages_fts must have a row for the new message"
@@ -1045,7 +1021,7 @@ async def test_on_message_edited_updates_fts(
     manager = make_manager(mock_client, sync_db, shutdown_event)
     manager.register()
 
-    edit_dt = datetime(2024, 1, 1, 13, 0, 0, tzinfo=timezone.utc)
+    edit_dt = datetime(2024, 1, 1, 13, 0, 0, tzinfo=UTC)
     msg = build_mock_message(id=600, text="new edited content", edit_date=edit_dt)
     event = make_message_edited_event(chat_id=dialog_id, message=msg)
     await manager.on_message_edited(event)
@@ -1056,9 +1032,7 @@ async def test_on_message_edited_updates_fts(
     ).fetchone()
     assert fts_row is not None, "messages_fts row must exist after edit"
     # stemmed text must differ from the original stub
-    assert fts_row[0] != "old text here", (
-        "FTS stemmed_text must be updated after message edit"
-    )
+    assert fts_row[0] != "old text here", "FTS stemmed_text must be updated after message edit"
 
 
 # ---------------------------------------------------------------------------
@@ -1165,7 +1139,8 @@ async def test_on_message_read_ignores_unknown_dialog(
     await manager.on_message_read(event)  # must not raise
 
     row = sync_db.execute(
-        "SELECT COUNT(*) FROM synced_dialogs WHERE dialog_id = ?", (9999,),
+        "SELECT COUNT(*) FROM synced_dialogs WHERE dialog_id = ?",
+        (9999,),
     ).fetchone()
     assert row[0] == 0  # no row created
 
@@ -1189,9 +1164,9 @@ async def test_on_message_read_logs_warning_on_null_chat_id(
     with caplog.at_level(logging.WARNING, logger="mcp_telegram.event_handlers"):
         await manager.on_message_read(event)  # must not raise
 
-    assert any(
-        "event_read_null_chat_id" in rec.message for rec in caplog.records
-    ), f"Expected WARNING log; got {[r.message for r in caplog.records]}"
+    assert any("event_read_null_chat_id" in rec.message for rec in caplog.records), (
+        f"Expected WARNING log; got {[r.message for r in caplog.records]}"
+    )
 
 
 def test_register_adds_message_read_handler(

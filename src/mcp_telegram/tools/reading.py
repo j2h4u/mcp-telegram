@@ -1,5 +1,4 @@
-
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from pydantic import Field, model_validator
 
@@ -38,25 +37,15 @@ def _format_archived_warning(data: dict) -> str:
     last_synced_at = data.get("last_synced_at")
     last_event_at = data.get("last_event_at")
     sync_ts = last_synced_at or last_event_at
-    date_str = (
-        datetime.fromtimestamp(sync_ts, tz=timezone.utc).strftime("%Y-%m-%d")
-        if sync_ts
-        else "unknown date"
-    )
-    warning = (
-        "\u26a0 No current access to this dialog. "
-        f"Messages are from the local archive (last sync: {date_str}).\n"
-    )
+    date_str = datetime.fromtimestamp(sync_ts, tz=UTC).strftime("%Y-%m-%d") if sync_ts else "unknown date"
+    warning = f"\u26a0 No current access to this dialog. Messages are from the local archive (last sync: {date_str}).\n"
     sync_coverage_pct = data.get("sync_coverage_pct")
     archived_message_count = data.get("archived_message_count")
     if sync_coverage_pct is not None and sync_coverage_pct < 100:
         warning += f"Archive coverage: {sync_coverage_pct}% of dialog history.\n"
     elif sync_coverage_pct is None:
         if archived_message_count is not None:
-            warning += (
-                f"Archive coverage: unknown "
-                f"({archived_message_count} messages archived locally).\n"
-            )
+            warning += f"Archive coverage: unknown ({archived_message_count} messages archived locally).\n"
         else:
             warning += "Archive coverage: unknown.\n"
     return warning
@@ -99,9 +88,7 @@ def _format_daemon_messages(
     has_topics = any(getattr(m, "topic_title", None) for m in messages)
     topic_name_getter = (lambda msg: getattr(msg, "topic_title", None)) if has_topics else None
 
-    line_prefix_getter = (
-        (lambda msg: f"[{getattr(msg, 'dialog_name', None) or '?'}]") if global_mode else None
-    )
+    line_prefix_getter = (lambda msg: f"[{getattr(msg, 'dialog_name', None) or '?'}]") if global_mode else None
 
     return format_messages(
         messages,  # type: ignore[arg-type]  # DaemonMessage satisfies MessageLike duck-typed, not statically
@@ -181,17 +168,17 @@ def _format_search_results(
             if did is None or did in seen:
                 continue
             seen[did] = row.get("dialog_name")
-        now_unix = int(datetime.now(tz=timezone.utc).timestamp())
+        now_unix = int(datetime.now(tz=UTC).timestamp())
         for did, dname in seen.items():
             rs = read_state_per_dialog.get(did)
             if rs is None:
                 continue
-            lines = _render_read_state_header(rs, "User", now_unix)
-            if not lines:
+            rs_lines = _render_read_state_header(rs, "User", now_unix)
+            if not rs_lines:
                 continue
             label = dname or str(did)
             header_lines.append(f"# {label}:")
-            header_lines.extend(lines)
+            header_lines.extend(rs_lines)
 
     lines: list[str] = []
     for row in rows:
@@ -200,7 +187,7 @@ def _format_search_results(
         # Phase 39.1-02: shared 5-branch resolution with formatter.resolve_sender_label.
         # Single source of truth — same decision tree for list_messages and search_messages.
         sender = resolve_sender_label(row)
-        dt = datetime.fromtimestamp(int(sent_at), tz=timezone.utc)
+        dt = datetime.fromtimestamp(int(sent_at), tz=UTC)
         time_str = dt.strftime("%Y-%m-%d %H:%M")
         snippet = _extract_snippet(row.get("text"), query)
 
@@ -264,7 +251,7 @@ class ListMessages(ToolArgs):
         description=(
             "Optional natural dialog selector: numeric id, @username, or fuzzy dialog name. "
             "Use this for exploratory or ambiguity-safe reads. Mutually exclusive with exact_dialog_id."
-        )
+        ),
     )
     exact_dialog_id: int | None = Field(
         default=None,
@@ -292,8 +279,7 @@ class ListMessages(ToolArgs):
         default=None,
         max_length=500,
         description=(
-            "Optional natural topic title resolved within the selected dialog. "
-            "Mutually exclusive with exact_topic_id."
+            "Optional natural topic title resolved within the selected dialog. Mutually exclusive with exact_topic_id."
         ),
     )
     exact_topic_id: int | None = Field(
@@ -347,7 +333,8 @@ async def _resolve_topic_id(
     try:
         async with daemon_connection() as conn:
             response = await conn.list_topics(
-                dialog_id=dialog_id, dialog=dialog_name,
+                dialog_id=dialog_id,
+                dialog=dialog_name,
             )
     except DaemonNotRunningError as e:
         return ToolResult(content=_text_response(str(e)))
@@ -370,9 +357,7 @@ async def _resolve_topic_id(
             return exact_matches[0]["id"]
         names = ", ".join(t.get("title", "?") for t in fuzzy_matches[:5])
         return ToolResult(
-            content=_text_response(
-                f"Ambiguous topic '{topic_name}'. Matches: {names}. Use exact_topic_id."
-            ),
+            content=_text_response(f"Ambiguous topic '{topic_name}'. Matches: {names}. Use exact_topic_id."),
         )
 
     return ToolResult(
@@ -419,13 +404,12 @@ async def list_messages(args: ListMessages) -> ToolResult:
         )
         if isinstance(resolved, ToolResult):
             return ToolResult(
-                content=resolved.content, has_filter=has_filter,
+                content=resolved.content,
+                has_filter=has_filter,
             )
         topic_id = resolved
 
-    id_kwarg: dict = (
-        {"dialog_id": dialog_id} if dialog_id else {"dialog": args.dialog}
-    )
+    id_kwarg: dict = {"dialog_id": dialog_id} if dialog_id else {"dialog": args.dialog}
     try:
         async with daemon_connection() as conn:
             response = await conn.list_messages(
@@ -544,7 +528,7 @@ async def search_messages(args: SearchMessages) -> ToolResult:
 
     # Resolve dialog_id locally if possible (numeric string / @username)
     dialog_id: int | None = None
-    if not global_mode:
+    if args.dialog is not None:
         exact_id = parse_exact_dialog_id(args.dialog)
         if exact_id is not None:
             dialog_id = exact_id
@@ -555,14 +539,13 @@ async def search_messages(args: SearchMessages) -> ToolResult:
     if args.navigation and args.navigation not in {"newest", "oldest"}:
         try:
             from ..pagination import decode_navigation_token
+
             nav = decode_navigation_token(args.navigation)
             if nav.kind == "search":
                 offset = nav.value
         except Exception as exc:
             return ToolResult(
-                content=_text_response(
-                    invalid_navigation_text(str(exc), retry_tool="SearchMessages")
-                ),
+                content=_text_response(invalid_navigation_text(str(exc), retry_tool="SearchMessages")),
                 has_cursor=True,
             )
 
@@ -583,13 +566,14 @@ async def search_messages(args: SearchMessages) -> ToolResult:
     except DaemonNotRunningError as e:
         return ToolResult(content=_text_response(str(e)))
 
+    dialog_label: str | None = str(dialog_id) if dialog_id else args.dialog
+
     if not response.get("ok"):
         error = response.get("error", "unknown")
         error_detail = response.get("message", "")
         if error == "dialog_not_found":
-            dialog_label = str(dialog_id) if dialog_id else args.dialog
             return ToolResult(
-                content=_text_response(dialog_not_found_text(dialog_label, retry_tool="SearchMessages")),
+                content=_text_response(dialog_not_found_text(dialog_label or "?", retry_tool="SearchMessages")),
                 has_filter=True,
                 has_cursor=args.navigation is not None,
             )
@@ -602,7 +586,6 @@ async def search_messages(args: SearchMessages) -> ToolResult:
     data = response.get("data", {})
     rows = data.get("messages", [])
     next_nav = data.get("next_navigation")
-    dialog_label: str | None = str(dialog_id) if dialog_id else args.dialog
 
     if not rows:
         result_text = search_no_hits_text(dialog_label, args.query)

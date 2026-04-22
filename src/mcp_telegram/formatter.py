@@ -1,7 +1,6 @@
-
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
 import telethon.tl.types as tl  # type: ignore[import-untyped]
@@ -84,21 +83,16 @@ def _render_read_state_header(
     outbox_count = int(read_state.get("outbox_unread_count", 0) or 0)
 
     # Collapsed form: both sides populated AND both counts zero.
-    if (
-        inbox_state == "populated"
-        and outbox_state == "populated"
-        and inbox_count == 0
-        and outbox_count == 0
-    ):
+    if inbox_state == "populated" and outbox_state == "populated" and inbox_count == 0 and outbox_count == 0:
         return ["[read-state: all caught up]"]
 
     effective_tz = tz if tz is not None else ZoneInfo("UTC")
 
     def _side(
         *,
-        side_label: str,     # "inbox" or "outbox"
-        direction_word: str, # "from peer" or "by peer"
-        read_word: str,      # "all read" or "all read by peer"
+        side_label: str,  # "inbox" or "outbox"
+        direction_word: str,  # "from peer" or "by peer"
+        read_word: str,  # "all read" or "all read by peer"
         state: str | None,
         count: int,
         oldest: int | None,
@@ -111,7 +105,7 @@ def _render_read_state_header(
         if oldest is None:
             # Defensive: no timestamp but count > 0 — render without Δ
             return f"[{side_label}: {count} unread {direction_word}]"
-        dt_local = datetime.fromtimestamp(int(oldest), tz=timezone.utc).astimezone(effective_tz)
+        dt_local = datetime.fromtimestamp(int(oldest), tz=UTC).astimezone(effective_tz)
         hh_mm = dt_local.strftime("%H:%M")
         delta = _format_relative_delta(now_unix, oldest)
         return f"[{side_label}: {count} unread {direction_word}, oldest {hh_mm} ({delta} ago)]"
@@ -158,16 +152,16 @@ def _compute_inline_markers(
 
     markers: dict[int, str] = {}
 
-    def _side(out_flag: int, cursor_state: str | None, anchor: int | None,
-              boundary_label: str, tail_label: str) -> None:
+    def _side(
+        out_flag: int, cursor_state: str | None, anchor: int | None, boundary_label: str, tail_label: str
+    ) -> None:
         # Select ids for this side; guard against missing .id / .out.
         # WR-03: explicit None-guard only; do not fold id=0 to sentinel 0
         # (would collide with "missing id" and emit a bogus marker).
         ids = [
             int(m.id)
             for m in messages
-            if getattr(m, "id", None) is not None
-            and int(getattr(m, "out", 0) or 0) == out_flag
+            if getattr(m, "id", None) is not None and int(getattr(m, "out", 0) or 0) == out_flag
         ]
         if not ids:
             return
@@ -251,15 +245,11 @@ def format_messages(
     # WR-02: ``suppress_header`` lets callers (e.g. format_unread_messages_grouped)
     # emit the header themselves and reuse format_messages purely for the body,
     # avoiding fragile post-hoc header-dedup by string comparison.
-    resolved_now = now_unix if now_unix is not None else int(datetime.now(tz=timezone.utc).timestamp())
+    resolved_now = now_unix if now_unix is not None else int(datetime.now(tz=UTC).timestamp())
     header_lines = (
-        []
-        if suppress_header
-        else _render_read_state_header(read_state, dialog_type, resolved_now, effective_tz)
+        [] if suppress_header else _render_read_state_header(read_state, dialog_type, resolved_now, effective_tz)
     )
-    inline_markers = (
-        _compute_inline_markers(messages, read_state) if dialog_type == "User" else {}
-    )
+    inline_markers = _compute_inline_markers(messages, read_state) if dialog_type == "User" else {}
 
     lines: list[str] = list(header_lines)
     prev_date_str: str | None = None
@@ -286,7 +276,7 @@ def format_messages(
             if isinstance(edit_date_raw, datetime):
                 ed_dt = edit_date_raw.astimezone(effective_tz)
             else:
-                ed_dt = datetime.fromtimestamp(int(edit_date_raw), tz=timezone.utc).astimezone(effective_tz)
+                ed_dt = datetime.fromtimestamp(int(edit_date_raw), tz=UTC).astimezone(effective_tz)
             text = f"{text} [edited {ed_dt.strftime('%H:%M')}]"
         reaction_names = reaction_names_map.get(msg.id) if reaction_names_map else None
         reactions_str = _format_reactions(msg, reaction_names)
@@ -315,9 +305,7 @@ def format_messages(
             if resolved_prefix:
                 line_prefix = f"{resolved_prefix} "
 
-        line = (
-            f"{line_prefix}{topic_prefix}{dt.strftime('%H:%M')} {sender_name}: {reply_prefix}{text}"
-        )
+        line = f"{line_prefix}{topic_prefix}{dt.strftime('%H:%M')} {sender_name}: {reply_prefix}{text}"
         # Phase 39.3: append inline marker for this message_id (D-06 — trailing).
         msg_id_attr = getattr(msg, "id", None)
         if inline_markers and msg_id_attr in inline_markers:
@@ -353,6 +341,16 @@ def build_search_hit_window(
     return sorted([*before, hit, *after], key=lambda message: message.id, reverse=True)
 
 
+def _hit_line_prefix_getter(hit_id: int) -> LinePrefixGetter:
+    """Factory that binds ``hit_id`` so the returned closure is not tied to the loop
+    variable (B023). Keeps type inference stable for mypy."""
+
+    def _getter(message: MessageLike) -> str | None:
+        return "[HIT]" if getattr(message, "id", None) == hit_id else None
+
+    return _getter
+
+
 def format_search_message_groups(
     hits: list[MessageLike],
     *,
@@ -378,9 +376,7 @@ def format_search_message_groups(
             reply_map={},
             reaction_names_map=reaction_names_map,
             line_prefix_getter=(
-                (lambda message: "[HIT]" if getattr(message, "id", None) == hit_id else None)
-                if isinstance(hit_id, int)
-                else None
+                _hit_line_prefix_getter(hit_id) if isinstance(hit_id, int) else None
             ),
         )
         parts.append(f"--- hit {index}/{total_hits} ---\n{group_text}")
@@ -540,10 +536,7 @@ def _describe_media(media: object) -> str:
 
     if isinstance(media, tl.MessageMediaPoll):
         question = _safe_attr_chain(media, "poll", "question")
-        q_text = (
-            getattr(question, "text", None) or str(question)
-            if question is not None else None
-        )
+        q_text = getattr(question, "text", None) or str(question) if question is not None else None
         return f"[опрос: «{q_text}»]" if q_text else "[опрос]"
 
     if isinstance(media, tl.MessageMediaGeoLive):
@@ -701,7 +694,7 @@ def format_unread_messages_grouped(
     # not by coincidence — guards against future drift if format_messages'
     # default changes.
     effective_tz = tz if tz is not None else ZoneInfo("UTC")
-    resolved_now = now_unix if now_unix is not None else int(datetime.now(tz=timezone.utc).timestamp())
+    resolved_now = now_unix if now_unix is not None else int(datetime.now(tz=UTC).timestamp())
 
     parts: list[str] = []
 
@@ -718,15 +711,9 @@ def format_unread_messages_grouped(
         parts.append(f"--- {chat.display_name} ({', '.join(header_parts)}) ---")
 
         # Phase 39.3: per-chat read-state header (AC-5/6/7, D-03).
-        chat_read_state = (
-            read_state_per_dialog.get(chat.chat_id) if read_state_per_dialog else None
-        )
-        chat_dialog_type = (
-            dialog_type_per_dialog.get(chat.chat_id) if dialog_type_per_dialog else None
-        )
-        read_state_header = _render_read_state_header(
-            chat_read_state, chat_dialog_type, resolved_now, effective_tz
-        )
+        chat_read_state = read_state_per_dialog.get(chat.chat_id) if read_state_per_dialog else None
+        chat_dialog_type = dialog_type_per_dialog.get(chat.chat_id) if dialog_type_per_dialog else None
+        read_state_header = _render_read_state_header(chat_read_state, chat_dialog_type, resolved_now, effective_tz)
         if read_state_header:
             parts.extend(read_state_header)
 

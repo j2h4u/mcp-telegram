@@ -1,4 +1,3 @@
-
 import logging
 
 from pydantic import Field
@@ -8,7 +7,16 @@ from ..errors import (
     usage_stats_query_error_text,
 )
 from ..resolver import parse_exact_dialog_id
-from ._base import DaemonNotRunningError, ToolAnnotations, ToolArgs, ToolResult, _check_daemon_response, _daemon_not_running_text, _text_response, daemon_connection, mcp_tool
+from ._base import (
+    DaemonNotRunningError,
+    ToolAnnotations,
+    ToolArgs,
+    ToolResult,
+    _daemon_not_running_text,
+    _text_response,
+    daemon_connection,
+    mcp_tool,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +49,10 @@ def format_usage_summary(stats: dict) -> str:
 
     if stats.get("error_distribution"):
         errors_str = ", ".join(
-            [f"{err} ({cnt})" for err, cnt in sorted(stats["error_distribution"].items(), key=lambda x: x[1], reverse=True)[:3]]
+            [
+                f"{err} ({cnt})"
+                for err, cnt in sorted(stats["error_distribution"].items(), key=lambda x: x[1], reverse=True)[:3]
+            ]
         )
         parts.append(f"Errors: {errors_str}")
 
@@ -98,7 +109,12 @@ class GetDialogStats(ToolArgs):
     e.g. top_n=5 returns up to 5 reactions, 5 mentions, 5 hashtags, and 5 forward sources."""
 
     dialog: str = Field(max_length=500, description="Dialog name, @username, or numeric id")
-    top_n: int = Field(default=5, ge=1, le=20, description="How many top entries to return per category (reactions, mentions, hashtags, forward sources)")
+    top_n: int = Field(
+        default=5,
+        ge=1,
+        le=20,
+        description="How many top entries to return per category (reactions, mentions, hashtags, forward sources)",
+    )
 
 
 def _format_stats_section(title: str, entries: list[dict], key: str) -> list[str]:
@@ -131,14 +147,11 @@ async def get_dialog_stats(args: GetDialogStats) -> ToolResult:
         error = response.get("error", "")
         msg = response.get("message", "Request failed.")
         if error == "not_synced":
-            return ToolResult(content=_text_response(
-                f"Error: dialog is not synced. {msg}"
-            ))
+            return ToolResult(content=_text_response(f"Error: dialog is not synced. {msg}"))
         if error == "dialog_not_found":
             from ..errors import dialog_not_found_text
-            return ToolResult(content=_text_response(
-                dialog_not_found_text(args.dialog, retry_tool="GetDialogStats")
-            ))
+
+            return ToolResult(content=_text_response(dialog_not_found_text(args.dialog, retry_tool="GetDialogStats")))
         return ToolResult(content=_text_response(f"Error: {error}: {msg}"))
 
     data = response.get("data", {})
@@ -152,8 +165,7 @@ async def get_dialog_stats(args: GetDialogStats) -> ToolResult:
     sections += _format_stats_section("Top Mentions", mentions, "value")
     sections += _format_stats_section("Top Hashtags", hashtags, "value")
     forwards_flat = [
-        {"label": (f.get("name") or str(f.get("peer_id") or "?")), "count": f.get("count", 0)}
-        for f in forwards
+        {"label": (f.get("name") or str(f.get("peer_id") or "?")), "count": f.get("count", 0)} for f in forwards
     ]
     sections += _format_stats_section("Top Forward Sources", forwards_flat, "label")
 

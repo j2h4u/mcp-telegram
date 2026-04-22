@@ -37,6 +37,7 @@ Tools and their resolution paths
 
 - daemon_api passthrough : pure verification that _resolve_entity returns matches verbatim.
 """
+
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
@@ -45,8 +46,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from mcp_telegram.tools import GetUserInfo, get_user_info
-from mcp_telegram.tools._base import DaemonNotRunningError
-
 
 # ---------------------------------------------------------------------------
 # Shared fixtures
@@ -63,10 +62,7 @@ _CANDIDATES_RESPONSE = {
                 "score": 100,
                 "username": "ivan",
                 "entity_type": "User",
-                "disambiguation_hint": (
-                    '2 entities match "Ivan": Channel, User. '
-                    'Specify @username or numeric id.'
-                ),
+                "disambiguation_hint": ('2 entities match "Ivan": Channel, User. Specify @username or numeric id.'),
             },
             {
                 "entity_id": 202,
@@ -74,10 +70,7 @@ _CANDIDATES_RESPONSE = {
                 "score": 100,
                 "username": None,
                 "entity_type": "Channel",
-                "disambiguation_hint": (
-                    '2 entities match "Ivan": Channel, User. '
-                    'Specify @username or numeric id.'
-                ),
+                "disambiguation_hint": ('2 entities match "Ivan": Channel, User. Specify @username or numeric id.'),
             },
         ],
     },

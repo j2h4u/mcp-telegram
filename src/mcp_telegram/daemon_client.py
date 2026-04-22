@@ -23,9 +23,8 @@ import contextvars
 import json
 import logging
 import uuid
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from pathlib import Path
-from typing import AsyncIterator
 
 from .daemon_api import get_daemon_socket_path
 
@@ -34,13 +33,11 @@ logger = logging.getLogger(__name__)
 # ContextVar for collecting request_ids during a tool call.
 # server.py sets a fresh list before running the tool; request() appends to it.
 # This enables cross-process log correlation without passing rid through tool signatures.
-_request_ids: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar(
-    "_request_ids", default=None
-)
+_request_ids: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar("_request_ids", default=None)
 
 __all__ = [
-    "DaemonNotRunningError",
     "DaemonConnection",
+    "DaemonNotRunningError",
     "daemon_connection",
     "get_daemon_socket_path",
 ]
@@ -97,21 +94,17 @@ class DaemonConnection:
             line = await self._reader.readline()
         except (ConnectionResetError, BrokenPipeError, OSError) as exc:
             raise DaemonNotRunningError(
-                "Sync daemon closed the connection unexpectedly. "
-                "Restart it with: mcp-telegram sync"
+                "Sync daemon closed the connection unexpectedly. Restart it with: mcp-telegram sync"
             ) from exc
 
         if not line:
             raise DaemonNotRunningError(
-                "Sync daemon closed the connection unexpectedly. "
-                "Restart it with: mcp-telegram sync"
+                "Sync daemon closed the connection unexpectedly. Restart it with: mcp-telegram sync"
             )
         try:
             response = json.loads(line.decode())
         except json.JSONDecodeError as exc:
-            raise DaemonNotRunningError(
-                f"Daemon returned malformed JSON: {exc}"
-            ) from exc
+            raise DaemonNotRunningError(f"Daemon returned malformed JSON: {exc}") from exc
         logger.debug(
             "daemon_response method=%s request_id=%s ok=%s",
             payload.get("method"),
@@ -266,12 +259,14 @@ class DaemonConnection:
         group_size_threshold: int = 100,
     ) -> dict:
         """Return prioritized unread messages across dialogs."""
-        return await self.request({
-            "method": "list_unread_messages",
-            "scope": scope,
-            "limit": limit,
-            "group_size_threshold": group_size_threshold,
-        })
+        return await self.request(
+            {
+                "method": "list_unread_messages",
+                "scope": scope,
+                "limit": limit,
+                "group_size_threshold": group_size_threshold,
+            }
+        )
 
     async def record_telemetry(self, *, event: dict) -> dict:
         """Write a telemetry event to sync.db."""
@@ -300,12 +295,14 @@ class DaemonConnection:
         limit: int = 5,
     ) -> dict:
         """Return aggregated stats (reactions, mentions, hashtags, forwards) for a dialog."""
-        return await self.request({
-            "method": "get_dialog_stats",
-            "dialog_id": dialog_id,
-            "dialog": dialog,
-            "limit": limit,
-        })
+        return await self.request(
+            {
+                "method": "get_dialog_stats",
+                "dialog_id": dialog_id,
+                "dialog": dialog,
+                "limit": limit,
+            }
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -329,10 +326,7 @@ async def daemon_connection() -> AsyncIterator[DaemonConnection]:
     try:
         reader, writer = await asyncio.open_unix_connection(str(socket_path), limit=2 * 1024 * 1024)
     except OSError as exc:
-        raise DaemonNotRunningError(
-            "Sync daemon is not running. "
-            "Start it with: mcp-telegram sync"
-        ) from exc
+        raise DaemonNotRunningError("Sync daemon is not running. Start it with: mcp-telegram sync") from exc
 
     try:
         yield DaemonConnection(reader, writer)

@@ -1,4 +1,5 @@
 """Tests for error text generation functions in errors.py."""
+
 from __future__ import annotations
 
 from unittest.mock import MagicMock
@@ -67,6 +68,7 @@ def test_rpc_error_detail_falls_back_to_str():
     class FakeExc:
         def __str__(self):
             return "some error"
+
     exc = FakeExc()
     assert rpc_error_detail(exc) == "some error"
 

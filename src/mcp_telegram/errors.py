@@ -1,4 +1,3 @@
-
 from telethon.errors import RPCError  # type: ignore[import-untyped]
 
 
@@ -97,7 +96,6 @@ def no_active_topics_text(dialog_name: str) -> str:
         f'No active forum topics found for "{dialog_name}".',
         "Retry ListMessages without topic to read dialog-wide messages, or choose another forum-enabled dialog.",
     )
-
 
 
 def invalid_navigation_text(detail: str, *, retry_tool: str) -> str:

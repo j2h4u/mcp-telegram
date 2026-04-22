@@ -8,18 +8,18 @@ D-13 (description mentions unread_in / unread_out).
 Schema is set up inline (mirrors test_daemon_api_read_state.py pattern).
 Zero real Telegram calls — `iter_dialogs` is mocked with an async generator.
 """
+
 from __future__ import annotations
 
 import asyncio
 import sqlite3
 import time
-from unittest.mock import AsyncMock, MagicMock, patch
 from contextlib import asynccontextmanager
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from mcp_telegram.daemon_api import DaemonAPIServer
-
 
 # ---------------------------------------------------------------------------
 # get_peer_id patch (daemon_api imports telethon_utils.get_peer_id; tests
@@ -104,9 +104,7 @@ def _insert_synced_dialog(
     read_outbox_max_id: int | None = None,
 ) -> None:
     conn.execute(
-        "INSERT INTO synced_dialogs "
-        "(dialog_id, status, read_inbox_max_id, read_outbox_max_id) "
-        "VALUES (?, ?, ?, ?)",
+        "INSERT INTO synced_dialogs (dialog_id, status, read_inbox_max_id, read_outbox_max_id) VALUES (?, ?, ?, ?)",
         (dialog_id, status, read_inbox_max_id, read_outbox_max_id),
     )
     conn.commit()
@@ -121,8 +119,7 @@ def _insert_message(
     sent_at: int = 1_700_000_000,
 ) -> None:
     conn.execute(
-        "INSERT INTO messages (dialog_id, message_id, sent_at, out, is_deleted) "
-        "VALUES (?, ?, ?, ?, 0)",
+        "INSERT INTO messages (dialog_id, message_id, sent_at, out, is_deleted) VALUES (?, ?, ?, ?, 0)",
         (dialog_id, message_id, sent_at, out),
     )
     conn.commit()
@@ -173,6 +170,7 @@ def _iter_dialogs_factory(dialogs):
     async def _iter(**kwargs):
         for d in dialogs:
             yield d
+
     return _iter
 
 
@@ -330,9 +328,9 @@ async def test_list_dialogs_query_uses_messages_pk_index() -> None:
     # Mirror the daemon_api batched query shape.
     sql = (
         "SELECT m.dialog_id, "
-        "SUM(CASE WHEN m.\"out\" = 0 AND m.message_id > COALESCE(sd.read_inbox_max_id, -1) "
+        'SUM(CASE WHEN m."out" = 0 AND m.message_id > COALESCE(sd.read_inbox_max_id, -1) '
         "THEN 1 ELSE 0 END) AS unread_in, "
-        "SUM(CASE WHEN m.\"out\" = 1 AND m.message_id > COALESCE(sd.read_outbox_max_id, -1) "
+        'SUM(CASE WHEN m."out" = 1 AND m.message_id > COALESCE(sd.read_outbox_max_id, -1) '
         "THEN 1 ELSE 0 END) AS unread_out "
         "FROM messages m JOIN synced_dialogs sd USING(dialog_id) "
         "WHERE sd.status = 'synced' "
@@ -343,11 +341,7 @@ async def test_list_dialogs_query_uses_messages_pk_index() -> None:
     # HARD guard: reject if any row hints at an unintended redundant index path
     # (e.g. a covering secondary index that shadows the PK). The canonical
     # plans are "SCAN m" or "SEARCH ... USING PRIMARY KEY". Accept either.
-    has_pk_path = (
-        "PRIMARY KEY" in plan_text
-        or "SCAN m" in plan_text
-        or "SCAN messages" in plan_text
-    )
+    has_pk_path = "PRIMARY KEY" in plan_text or "SCAN m" in plan_text or "SCAN messages" in plan_text
     assert has_pk_path, f"Query plan does not show PK access: {plan_text}"
     # Guard against an unrelated index sneaking in (regression detector).
     assert "sqlite_autoindex_messages_" not in plan_text or "messages_1" in plan_text
@@ -370,8 +364,7 @@ async def test_list_dialogs_latency_200_dialog_fixture(capsys) -> None:
     for d in range(1, N_DIALOGS + 1):
         for m in range(1, MSGS_PER + 1):
             conn.execute(
-                "INSERT INTO messages (dialog_id, message_id, sent_at, out, is_deleted) "
-                "VALUES (?, ?, ?, ?, 0)",
+                "INSERT INTO messages (dialog_id, message_id, sent_at, out, is_deleted) VALUES (?, ?, ?, ?, 0)",
                 (d, m, 1_700_000_000 + m, m % 2),
             )
     conn.commit()
@@ -396,12 +389,9 @@ async def test_list_dialogs_latency_200_dialog_fixture(capsys) -> None:
     mean = sum(sample_times) / len(sample_times)
     p95 = sample_times[int(0.95 * len(sample_times)) - 1]
     # Non-failing diagnostic output.
-    print(
-        f"\n[AC-12 soft guard] list_dialogs 200×50 mean={mean*1000:.1f}ms "
-        f"p95={p95*1000:.1f}ms"
-    )
+    print(f"\n[AC-12 soft guard] list_dialogs 200×50 mean={mean * 1000:.1f}ms p95={p95 * 1000:.1f}ms")
     # Ceiling: 2× the 50ms budget — absorbs CI flake while still catching real regressions.
-    assert mean < 0.100, f"ListDialogs mean latency regressed: {mean*1000:.1f}ms > 100ms"
+    assert mean < 0.100, f"ListDialogs mean latency regressed: {mean * 1000:.1f}ms > 100ms"
 
 
 # ---------------------------------------------------------------------------
@@ -430,15 +420,22 @@ async def test_list_dialogs_text_output_renders_unread_for_dm() -> None:
         "data": {
             "dialogs": [
                 {
-                    "id": 1, "name": "Alice", "type": "User",
+                    "id": 1,
+                    "name": "Alice",
+                    "type": "User",
                     "last_message_at": "2024-01-01 00:00",
-                    "unread_count": 2, "sync_status": "synced",
-                    "unread_in": 3, "unread_out": 1,
+                    "unread_count": 2,
+                    "sync_status": "synced",
+                    "unread_in": 3,
+                    "unread_out": 1,
                 },
                 {
-                    "id": 2, "name": "Announcements", "type": "Channel",
+                    "id": 2,
+                    "name": "Announcements",
+                    "type": "Channel",
                     "last_message_at": "2024-01-01 00:00",
-                    "unread_count": 0, "sync_status": "synced",
+                    "unread_count": 0,
+                    "sync_status": "synced",
                 },
             ]
         },

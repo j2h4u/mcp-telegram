@@ -1,10 +1,10 @@
-
 import typing as t
 
 from pydantic import Field
 
 from ..errors import no_unread_all_text, no_unread_personal_text
 from ..formatter import UnreadChatData, format_unread_messages_grouped
+from ..models import ReadState
 from ._adapters import DaemonMessage
 from ._base import (
     DaemonNotRunningError,
@@ -46,15 +46,9 @@ class ListUnreadMessages(ToolArgs):
     """
 
     scope: t.Literal["personal", "all"] = Field(
-        default="personal",
-        description="'personal' (DMs + small groups) or 'all' (everything)"
+        default="personal", description="'personal' (DMs + small groups) or 'all' (everything)"
     )
-    limit: int = Field(
-        default=100,
-        ge=50,
-        le=500,
-        description="Total message budget across all chats (50-500)"
-    )
+    limit: int = Field(default=100, ge=50, le=500, description="Total message budget across all chats (50-500)")
     group_size_threshold: int = Field(
         default=100,
         ge=10,
@@ -107,7 +101,7 @@ async def list_unread_messages(args: ListUnreadMessages) -> ToolResult:
     # daemon response; threaded into format_unread_messages_grouped so each DM
     # block gets its own header (AC-5/6/7). Absent fields → no header for that
     # block (backward compat with pre-39.3 daemon).
-    read_state_per_dialog: dict[int, dict] = {}
+    read_state_per_dialog: dict[int, ReadState | dict] = {}
     dialog_type_per_dialog: dict[int, str] = {}
 
     for group in groups:

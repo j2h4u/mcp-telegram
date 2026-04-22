@@ -30,6 +30,7 @@ Architecture:
 - Formatting (format_messages) stays on the MCP server side — the daemon
   returns raw row dicts that the MCP tools format.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -39,10 +40,9 @@ import logging
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-from xdg_base_dirs import xdg_state_home  # type: ignore[import-error]
-
+from telethon import utils as telethon_utils  # type: ignore[import-untyped]
 from telethon.tl.functions.messages import (  # type: ignore[import-untyped]
     GetCommonChatsRequest,
     GetDialogFiltersRequest,
@@ -50,7 +50,7 @@ from telethon.tl.functions.messages import (  # type: ignore[import-untyped]
 )
 from telethon.tl.functions.users import GetFullUserRequest  # type: ignore[import-untyped]
 from telethon.tl.types import Channel, Chat  # type: ignore[import-untyped]
-from telethon import utils as telethon_utils  # type: ignore[import-untyped]
+from xdg_base_dirs import xdg_state_home  # type: ignore[import-error]
 
 
 def _classify_dialog_type(entity: object | None) -> str:
@@ -87,17 +87,13 @@ def _dialog_type_from_db(conn: sqlite3.Connection, dialog_id: int) -> str:
     This is the cheap daemon-side path for _list_messages / _search_messages /
     _list_unread_messages where only the numeric dialog_id is available.
     """
-    row = conn.execute(
-        "SELECT type FROM entities WHERE id = ?", (dialog_id,)
-    ).fetchone()
+    row = conn.execute("SELECT type FROM entities WHERE id = ?", (dialog_id,)).fetchone()
     if row is None:
         return "Unknown"
     return str(row[0])
 
 
-def _read_state_for_dialog(
-    conn: sqlite3.Connection, dialog_id: int, dialog_type: str
-) -> ReadState | None:
+def _read_state_for_dialog(conn: sqlite3.Connection, dialog_id: int, dialog_type: str) -> ReadState | None:
     """Compute the bidirectional ReadState for a DM.
 
     Returns None for non-DM dialog types (Channel/Group/Forum/Chat/Bot/Unknown).
@@ -144,15 +140,13 @@ def _read_state_for_dialog(
     # identical to the previous two-query behaviour.
     read_inbox_max_id = row[0] if row is not None else None
     read_outbox_max_id = row[1] if row is not None else None
-    agg_row = (
-        (row[2], row[3], row[4], row[5]) if row is not None else (None, None, None, None)
-    )
+    agg_row = (row[2], row[3], row[4], row[5]) if row is not None else (None, None, None, None)
     in_cnt = int(agg_row[0] or 0)
     out_cnt = int(agg_row[1] or 0)
     in_min = agg_row[2]
     out_min = agg_row[3]
 
-    def _state(cursor: int | None, unread_count: int) -> str:
+    def _state(cursor: int | None, unread_count: int) -> Literal["populated", "null", "all_read"]:
         if cursor is None:
             return "null"
         if unread_count == 0:
@@ -176,21 +170,21 @@ def _read_state_for_dialog(
     return rs
 
 
-USER_TTL: int = 2_592_000   # 30 days
-GROUP_TTL: int = 604_800    # 7 days
+USER_TTL: int = 2_592_000  # 30 days
+GROUP_TTL: int = 604_800  # 7 days
+
+from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
 
 from .budget import allocate_message_budget_proportional, unread_chat_tier
-from .models import ReadState
+from .formatter import format_reaction_counts
 from .fts import stem_query
+from .models import ReadState
 from .pagination import (
     HistoryDirection,
     decode_navigation_token,
     encode_history_navigation,
     encode_search_navigation,
 )
-from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
-
-from .formatter import format_reaction_counts
 from .sync_worker import (
     apply_reactions_delta,
     extract_reactions_rows,
@@ -202,17 +196,19 @@ from .sync_worker import (
 REACTIONS_TTL_SECONDS = 600
 from .resolver import (
     Candidates,
-    NotFound,
     Resolved,
     _parse_tme_link,
     latinize,
+)
+from .resolver import (
     resolve as resolve_entity_sync,
 )
 
 logger = logging.getLogger(__name__)
 
 _current_request_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
-    "_current_request_id", default=None,
+    "_current_request_id",
+    default=None,
 )
 
 
@@ -256,17 +252,13 @@ def _build_access_metadata(
         row = conn.execute(_SELECT_DIALOG_ACCESS_META_SQL, (dialog_id,)).fetchone()
         if row:
             _, total_messages, access_lost_at, last_synced_at, last_event_at = row
-            count_row = conn.execute(
-                _COUNT_SYNCED_MESSAGES_SQL, (dialog_id,)
-            ).fetchone()
+            count_row = conn.execute(_COUNT_SYNCED_MESSAGES_SQL, (dialog_id,)).fetchone()
             local_count = count_row[0] if count_row else 0
 
             meta["access_lost_at"] = access_lost_at
             meta["last_synced_at"] = last_synced_at
             meta["last_event_at"] = last_event_at
-            meta["sync_coverage_pct"] = _compute_sync_coverage(
-                total_messages, local_count
-            )
+            meta["sync_coverage_pct"] = _compute_sync_coverage(total_messages, local_count)
             if total_messages is None:
                 meta["archived_message_count"] = local_count
 
@@ -310,9 +302,7 @@ EFFECTIVE_SENDER_ID_SQL = _EFFECTIVE_SENDER_ID_EXPR + " AS effective_sender_id"
 # Shared sender_first_name projection with dual JOINs: resolve name either from
 # the raw sender_id OR, when sender_id IS NULL, from the effective_sender_id (peer
 # first_name for DM incoming; self name for DM outgoing — though "Я" wins at render).
-_SENDER_FIRST_NAME_SQL = (
-    "COALESCE(e_raw.name, e_eff.name, m.sender_first_name) AS sender_first_name"
-)
+_SENDER_FIRST_NAME_SQL = "COALESCE(e_raw.name, e_eff.name, m.sender_first_name) AS sender_first_name"
 _SENDER_ENTITY_JOINS_SQL = (
     "LEFT JOIN entities e_raw ON e_raw.id = m.sender_id "
     f"LEFT JOIN entities e_eff ON e_eff.id = {_EFFECTIVE_SENDER_ID_EXPR} "
@@ -379,9 +369,9 @@ _SELECT_SYNCED_STATUSES_SQL = (
 # where the keys are conditionally attached for the full contract text.
 _BATCHED_UNREAD_COUNTS_SQL = (
     "SELECT m.dialog_id, "
-    "SUM(CASE WHEN m.\"out\" = 0 AND m.message_id > COALESCE(sd.read_inbox_max_id, -1) "
+    'SUM(CASE WHEN m."out" = 0 AND m.message_id > COALESCE(sd.read_inbox_max_id, -1) '
     "THEN 1 ELSE 0 END) AS unread_in, "
-    "SUM(CASE WHEN m.\"out\" = 1 AND m.message_id > COALESCE(sd.read_outbox_max_id, -1) "
+    'SUM(CASE WHEN m."out" = 1 AND m.message_id > COALESCE(sd.read_outbox_max_id, -1) '
     "THEN 1 ELSE 0 END) AS unread_out "
     "FROM messages m JOIN synced_dialogs sd USING(dialog_id) "
     "WHERE sd.status = 'synced' AND m.is_deleted = 0 "
@@ -400,9 +390,7 @@ _COUNT_SYNCED_MESSAGES_SQL = "SELECT COUNT(*) FROM messages WHERE dialog_id = ? 
 # TODO: _COUNT_MESSAGES_BY_DIALOG_SQL scans the full messages table via GROUP BY.
 # For large datasets (millions of messages), consider adding a covering index
 # on messages(dialog_id, is_deleted) or caching counts in synced_dialogs.
-_COUNT_MESSAGES_BY_DIALOG_SQL = (
-    "SELECT dialog_id, COUNT(*) FROM messages WHERE is_deleted = 0 GROUP BY dialog_id"
-)
+_COUNT_MESSAGES_BY_DIALOG_SQL = "SELECT dialog_id, COUNT(*) FROM messages WHERE is_deleted = 0 GROUP BY dialog_id"
 
 _SELECT_DIALOG_ACCESS_META_SQL = (
     "SELECT status, total_messages, access_lost_at, last_synced_at, last_event_at "
@@ -420,8 +408,7 @@ _GET_EDIT_ALERTS_SQL = (
     "ORDER BY edit_date DESC LIMIT ?"
 )
 _GET_ACCESS_LOST_ALERTS_SQL = (
-    "SELECT dialog_id, access_lost_at "
-    "FROM synced_dialogs WHERE status = 'access_lost' AND access_lost_at > ?"
+    "SELECT dialog_id, access_lost_at FROM synced_dialogs WHERE status = 'access_lost' AND access_lost_at > ?"
 )
 
 # Dialog stats SQL (get_dialog_stats)
@@ -473,19 +460,14 @@ _FETCH_UNREAD_MESSAGES_SQL = (
     f"WHERE m.dialog_id = :dialog_id AND m.message_id > :after_msg_id AND m.is_deleted = 0 "
     f"ORDER BY m.message_id DESC LIMIT :limit"
 )
-_GET_READ_POSITION_SQL = (
-    "SELECT read_inbox_max_id FROM synced_dialogs WHERE dialog_id = ?"
-)
+_GET_READ_POSITION_SQL = "SELECT read_inbox_max_id FROM synced_dialogs WHERE dialog_id = ?"
 _COUNT_BOOTSTRAP_PENDING_SQL = (
-    "SELECT COUNT(*) FROM synced_dialogs "
-    "WHERE status = 'synced' AND read_inbox_max_id IS NULL"
+    "SELECT COUNT(*) FROM synced_dialogs WHERE status = 'synced' AND read_inbox_max_id IS NULL"
 )
 
 # Entity / telemetry SQL
 _UPSERT_ENTITY_SQL = (
-    "INSERT OR REPLACE INTO entities "
-    "(id, type, name, username, name_normalized, updated_at) "
-    "VALUES (?, ?, ?, ?, ?, ?)"
+    "INSERT OR REPLACE INTO entities (id, type, name, username, name_normalized, updated_at) VALUES (?, ?, ?, ?, ?, ?)"
 )
 _ALL_ENTITY_NAMES_SQL = (
     "SELECT id, name FROM entities "
@@ -503,10 +485,22 @@ _ENTITY_BY_USERNAME_SQL = "SELECT id, name FROM entities WHERE username = ?"
 
 # Column names returned by _build_list_messages_query, in SELECT order.
 _DB_MESSAGE_COLUMNS = (
-    "message_id", "sent_at", "text", "sender_id", "sender_first_name",
-    "media_description", "reply_to_msg_id", "forum_topic_id",
-    "is_deleted", "deleted_at", "edit_date", "topic_title",
-    "effective_sender_id", "is_service", "out", "dialog_id",
+    "message_id",
+    "sent_at",
+    "text",
+    "sender_id",
+    "sender_first_name",
+    "media_description",
+    "reply_to_msg_id",
+    "forum_topic_id",
+    "is_deleted",
+    "deleted_at",
+    "edit_date",
+    "topic_title",
+    "effective_sender_id",
+    "is_service",
+    "out",
+    "dialog_id",
 )
 
 
@@ -696,11 +690,7 @@ def _query_usage_stats(cursor: sqlite3.Cursor, since: int) -> dict:
         latency_values_ms = [lat[0] for lat in latencies]
         latency_median_ms = latency_values_ms[len(latency_values_ms) // 2]
         p95_idx = int(len(latency_values_ms) * 0.95)
-        latency_p95_ms = (
-            latency_values_ms[p95_idx]
-            if p95_idx < len(latency_values_ms)
-            else latency_values_ms[-1]
-        )
+        latency_p95_ms = latency_values_ms[p95_idx] if p95_idx < len(latency_values_ms) else latency_values_ms[-1]
 
     return {
         "tool_distribution": tool_dist,
@@ -771,9 +761,7 @@ class DaemonAPIServer:
                 request_id = req.get("request_id")
                 method = req.get("method", "")
                 if request_id:
-                    logger.debug(
-                        "daemon_api_request method=%s request_id=%s", method, request_id
-                    )
+                    logger.debug("daemon_api_request method=%s request_id=%s", method, request_id)
                 token = _current_request_id.set(request_id)
                 try:
                     response = await self._dispatch(req)
@@ -795,7 +783,8 @@ class DaemonAPIServer:
         except Exception:
             logger.exception(
                 "daemon_api handle_client_write_error method=%s request_id=%s",
-                method, request_id,
+                method,
+                request_id,
             )
         finally:
             writer.close()
@@ -861,7 +850,7 @@ class DaemonAPIServer:
         try:
             entity = await self._client.get_entity(dialog)
             return int(telethon_utils.get_peer_id(entity))
-        except (ValueError, KeyError):
+        except ValueError, KeyError:
             pass
         except Exception:
             logger.debug("get_entity failed for %r, falling back to entities DB", dialog, exc_info=True)
@@ -902,13 +891,12 @@ class DaemonAPIServer:
         if matched_dialog is not None:
             return int(telethon_utils.get_peer_id(matched_dialog.entity))
 
-        raise ValueError(
-            f"Dialog {dialog!r} not found. "
-            "Check the dialog name or use dialog_id from ListDialogs."
-        )
+        raise ValueError(f"Dialog {dialog!r} not found. Check the dialog name or use dialog_id from ListDialogs.")
 
     async def _resolve_dialog_id(
-        self, dialog_id: int, dialog: str | None,
+        self,
+        dialog_id: int,
+        dialog: str | None,
     ) -> int | dict:
         """Resolve dialog_id from name if needed.
 
@@ -950,13 +938,16 @@ class DaemonAPIServer:
             try:
                 sent_at = int(msg.date.timestamp())
             except Exception:
-                logger.debug("msg_to_dict timestamp conversion failed msg_id=%s", getattr(msg, "id", "?"), exc_info=True)
+                logger.debug(
+                    "msg_to_dict timestamp conversion failed msg_id=%s", getattr(msg, "id", "?"), exc_info=True
+                )
                 sent_at = 0
 
         media = getattr(msg, "media", None)
         media_description: str | None = None
         if media is not None:
             from .formatter import _describe_media
+
             media_description = _describe_media(media)
 
         reactions_obj = getattr(msg, "reactions", None)
@@ -989,6 +980,7 @@ class DaemonAPIServer:
         is_service_flag = 0
         try:
             from telethon.tl import types as _tl_types  # type: ignore[import-untyped]
+
             if isinstance(msg, _tl_types.MessageService):
                 is_service_flag = 1
         except Exception:
@@ -1044,16 +1036,15 @@ class DaemonAPIServer:
             last_msg_id = messages[-1]["message_id"]
             logger.debug(
                 "list_messages_pagination anchor_msg_id=%d dialog_id=%d direction=%s%s",
-                last_msg_id, dialog_id, direction, _rid(),
+                last_msg_id,
+                dialog_id,
+                direction,
+                _rid(),
             )
-            return encode_history_navigation(
-                last_msg_id, dialog_id, direction=direction_enum
-            )
+            return encode_history_navigation(last_msg_id, dialog_id, direction=direction_enum)
         return None
 
-    async def _freshen_reactions_if_stale(
-        self, dialog_id: int, entity: Any, message_ids: list[int]
-    ) -> None:
+    async def _freshen_reactions_if_stale(self, dialog_id: int, entity: Any, message_ids: list[int]) -> None:
         """Per-message TTL-gated JIT reaction freshen (Phase 39.2 Plan 02).
 
         Looks up freshness rows for ``message_ids``; for any id whose
@@ -1071,9 +1062,7 @@ class DaemonAPIServer:
         if not message_ids:
             return
         # synced_dialogs gate: missing row → never freshen (e.g. unsynced dialog).
-        row = self._conn.execute(
-            "SELECT 1 FROM synced_dialogs WHERE dialog_id = ?", (dialog_id,)
-        ).fetchone()
+        row = self._conn.execute("SELECT 1 FROM synced_dialogs WHERE dialog_id = ?", (dialog_id,)).fetchone()
         if row is None:
             return
 
@@ -1108,12 +1097,10 @@ class DaemonAPIServer:
         # Telethon `get_messages(ids=list)` returns a list aligned to input order;
         # `None` for missing entries (AC-6-PARTIAL).
         with self._conn:
-            for msg_id, msg in zip(stale_ids, messages):
+            for msg_id, msg in zip(stale_ids, messages, strict=False):
                 if msg is None:
                     continue
-                rows = extract_reactions_rows(
-                    dialog_id, msg_id, getattr(msg, "reactions", None)
-                )
+                rows = extract_reactions_rows(dialog_id, msg_id, getattr(msg, "reactions", None))
                 apply_reactions_delta(self._conn, dialog_id, msg_id, rows)
                 self._conn.execute(
                     "INSERT OR REPLACE INTO message_reactions_freshness "
@@ -1122,7 +1109,9 @@ class DaemonAPIServer:
                 )
 
     async def _resolve_unread_position(
-        self, dialog_id: int, unread_after_id: int | None,
+        self,
+        dialog_id: int,
+        unread_after_id: int | None,
     ) -> int | None:
         """Resolve unread cutoff from synced_dialogs. Zero Telegram API calls.
 
@@ -1163,10 +1152,7 @@ class DaemonAPIServer:
             unread_after_id=unread_after_id,
         )
         rows = self._conn.execute(sql, params).fetchall()
-        messages = [
-            dict(zip(_DB_MESSAGE_COLUMNS, r))
-            for r in rows
-        ]
+        messages = [dict(zip(_DB_MESSAGE_COLUMNS, r, strict=False)) for r in rows]
         # Inject reaction counts from message_reactions table
         msg_ids = [m["message_id"] for m in messages]
         # Phase 39.2 Plan 02: TTL-gated JIT freshen for stale subset only.
@@ -1180,8 +1166,7 @@ class DaemonAPIServer:
         # Non-sync.db branches (Telegram fallback/error) intentionally do not emit this line.
         null_sender_rows = sum(1 for m in messages if m.get("sender_id") is None)
         unresolved_entity_rows = sum(
-            1 for m in messages
-            if m.get("sender_id") is not None and m.get("sender_first_name") is None
+            1 for m in messages if m.get("sender_id") is not None and m.get("sender_first_name") is None
         )
         logger.info(
             "list_messages rendered",
@@ -1193,7 +1178,11 @@ class DaemonAPIServer:
             },
         )
         next_nav = self._maybe_encode_next_nav(
-            messages, limit, dialog_id, direction, direction_enum,
+            messages,
+            limit,
+            dialog_id,
+            direction,
+            direction_enum,
         )
         return {
             "ok": True,
@@ -1218,8 +1207,7 @@ class DaemonAPIServer:
         half = max(1, context_size // 2)
 
         before_rows = self._conn.execute(
-            _LIST_MESSAGES_BASE_SQL
-            + " AND m.message_id <= :anchor ORDER BY m.message_id DESC LIMIT :limit",
+            _LIST_MESSAGES_BASE_SQL + " AND m.message_id <= :anchor ORDER BY m.message_id DESC LIMIT :limit",
             {
                 "dialog_id": dialog_id,
                 "self_id": self.self_id,
@@ -1229,8 +1217,7 @@ class DaemonAPIServer:
         ).fetchall()
 
         after_rows = self._conn.execute(
-            _LIST_MESSAGES_BASE_SQL
-            + " AND m.message_id > :anchor ORDER BY m.message_id ASC LIMIT :limit",
+            _LIST_MESSAGES_BASE_SQL + " AND m.message_id > :anchor ORDER BY m.message_id ASC LIMIT :limit",
             {
                 "dialog_id": dialog_id,
                 "self_id": self.self_id,
@@ -1241,7 +1228,7 @@ class DaemonAPIServer:
 
         # before_rows are DESC — reverse to get chronological order, then append after
         rows = list(reversed(before_rows)) + list(after_rows)
-        messages = [dict(zip(_DB_MESSAGE_COLUMNS, r)) for r in rows]
+        messages = [dict(zip(_DB_MESSAGE_COLUMNS, r, strict=False)) for r in rows]
         # Inject reaction counts from message_reactions table
         msg_ids = [m["message_id"] for m in messages]
         # Phase 39.2 Plan 02: JIT freshen for the context-window slice.
@@ -1254,8 +1241,7 @@ class DaemonAPIServer:
         # Phase 39: observability counter — mirror main path so anchor branch is not a blind spot.
         null_sender_rows = sum(1 for m in messages if m.get("sender_id") is None)
         unresolved_entity_rows = sum(
-            1 for m in messages
-            if m.get("sender_id") is not None and m.get("sender_first_name") is None
+            1 for m in messages if m.get("sender_id") is not None and m.get("sender_first_name") is None
         )
         logger.info(
             "list_messages rendered",
@@ -1319,12 +1305,19 @@ class DaemonAPIServer:
         except Exception as exc:
             logger.warning(
                 "list_messages_telegram_error dialog_id=%d error=%s%s",
-                dialog_id, exc, _rid(), exc_info=True,
+                dialog_id,
+                exc,
+                _rid(),
+                exc_info=True,
             )
             return {"ok": False, "error": "telegram_error", "message": "failed to fetch messages"}
 
         next_nav = self._maybe_encode_next_nav(
-            messages, limit, dialog_id, direction, direction_enum,
+            messages,
+            limit,
+            dialog_id,
+            direction,
+            direction_enum,
         )
         return {
             "ok": True,
@@ -1362,10 +1355,7 @@ class DaemonAPIServer:
                 return {
                     "ok": False,
                     "error": "invalid_navigation",
-                    "message": (
-                        f"Navigation token belongs to dialog {nav.dialog_id}, "
-                        f"not {dialog_id}"
-                    ),
+                    "message": (f"Navigation token belongs to dialog {nav.dialog_id}, not {dialog_id}"),
                 }
             anchor_msg_id = nav.value
             if nav.direction is not None:
@@ -1437,10 +1427,7 @@ class DaemonAPIServer:
                 return {
                     "ok": False,
                     "error": "not_synced",
-                    "message": (
-                        "Context window requires the dialog to be synced. "
-                        "Use MarkDialogForSync first."
-                    ),
+                    "message": ("Context window requires the dialog to be synced. Use MarkDialogForSync first."),
                 }
             return await self._list_messages_context_window(
                 dialog_id=dialog_id,
@@ -1453,9 +1440,7 @@ class DaemonAPIServer:
             return nav_result
         anchor_msg_id, direction = nav_result
 
-        direction_enum = (
-            HistoryDirection.OLDEST if direction == "oldest" else HistoryDirection.NEWEST
-        )
+        direction_enum = HistoryDirection.OLDEST if direction == "oldest" else HistoryDirection.NEWEST
 
         if unread:
             unread_after_id = await self._resolve_unread_position(dialog_id, unread_after_id)
@@ -1601,9 +1586,7 @@ class DaemonAPIServer:
                 # Global search (dialog_id is None / 0) is OUT of JIT scope per
                 # CONTEXT.md §Out of scope — no single dialog for per-message gate.
                 if msg_ids:
-                    await self._freshen_reactions_if_stale(
-                        dialog_id, dialog_id, msg_ids
-                    )
+                    await self._freshen_reactions_if_stale(dialog_id, dialog_id, msg_ids)
                 reaction_map = _fetch_reaction_counts(self._conn, dialog_id, msg_ids)
                 for r in messages:
                     counts = reaction_map.get(r["message_id"])
@@ -1623,7 +1606,7 @@ class DaemonAPIServer:
         # included — non-DM hits are absent from the map (documented HIGH-1
         # resolution: per-dialog header block only covers DMs).
         distinct_dialog_ids = {m["dialog_id"] for m in messages if m.get("dialog_id")}
-        read_state_per_dialog: dict[int, dict] = {}
+        read_state_per_dialog: dict[int, ReadState] = {}
         for did in distinct_dialog_ids:
             dt = _dialog_type_from_db(self._conn, did)
             rs = _read_state_for_dialog(self._conn, did, dt)
@@ -1634,9 +1617,7 @@ class DaemonAPIServer:
         if not global_mode and dialog_id:
             row = self._conn.execute(_SELECT_SYNC_STATUS_SQL, (dialog_id,)).fetchone()
             scoped_status = row[0] if row else None
-            access_meta = _build_access_metadata(
-                self._conn, dialog_id, scoped_status or "not_synced"
-            )
+            access_meta = _build_access_metadata(self._conn, dialog_id, scoped_status or "not_synced")
             return {
                 "ok": True,
                 "data": {
@@ -1673,12 +1654,10 @@ class DaemonAPIServer:
         # Load current sync statuses for O(1) lookup. Plan 39.3-03 Task 4:
         # tuple now includes read cursors for use by the DM unread enrichment.
         synced_rows = self._conn.execute(_SELECT_SYNCED_STATUSES_SQL).fetchall()
-        synced_meta: dict[
-            int, tuple[str, int | None, int | None, int | None, int | None]
-        ] = {row[0]: (row[1], row[2], row[3], row[4], row[5]) for row in synced_rows}
-        local_counts: dict[int, int] = dict(
-            self._conn.execute(_COUNT_MESSAGES_BY_DIALOG_SQL).fetchall()
-        )
+        synced_meta: dict[int, tuple[str, int | None, int | None, int | None, int | None]] = {
+            row[0]: (row[1], row[2], row[3], row[4], row[5]) for row in synced_rows
+        }
+        local_counts: dict[int, int] = dict(self._conn.execute(_COUNT_MESSAGES_BY_DIALOG_SQL).fetchall())
         # Plan 39.3-03 Task 4 (AC-11, AC-12): batched per-dialog (unread_in, unread_out).
         # Single GROUP BY pass — hits the messages PRIMARY KEY B-tree. Only populated
         # for DM dialogs in the response loop below (non-DM rows omit both keys).
@@ -1715,9 +1694,7 @@ class DaemonAPIServer:
                     except Exception:
                         pass
 
-                sync_meta_row = synced_meta.get(
-                    d.id, ("not_synced", None, None, None, None)
-                )
+                sync_meta_row = synced_meta.get(d.id, ("not_synced", None, None, None, None))
                 sync_status = sync_meta_row[0]
                 total_messages = sync_meta_row[1]
                 access_lost_at = sync_meta_row[2]
@@ -1810,7 +1787,9 @@ class DaemonAPIServer:
                     "id": t.id,
                     "title": getattr(t, "title", None),
                     "icon_emoji_id": getattr(t, "icon_emoji_id", None),
-                    "date": int(t.date.timestamp()) if hasattr(getattr(t, "date", None), "timestamp") else getattr(t, "date", None),
+                    "date": int(t.date.timestamp())
+                    if hasattr(getattr(t, "date", None), "timestamp")
+                    else getattr(t, "date", None),
                 }
                 for t in getattr(result, "topics", [])
             ]
@@ -2026,9 +2005,7 @@ class DaemonAPIServer:
         # Fetch common chats (only available for user entities)
         common_chats: list[dict] = []
         try:
-            common_result = await self._client(
-                GetCommonChatsRequest(user_id=user_id, max_id=0, limit=100)
-            )
+            common_result = await self._client(GetCommonChatsRequest(user_id=user_id, max_id=0, limit=100))
             for chat in getattr(common_result, "chats", []):
                 if isinstance(chat, Channel):
                     chat_type = "supergroup" if getattr(chat, "megagroup", False) else "channel"
@@ -2037,13 +2014,17 @@ class DaemonAPIServer:
                 else:
                     chat_type = "user"
 
-                common_chats.append({
-                    "id": int(telethon_utils.get_peer_id(chat)),
-                    "name": getattr(chat, "title", None) or str(chat.id),
-                    "type": chat_type,
-                })
+                common_chats.append(
+                    {
+                        "id": int(telethon_utils.get_peer_id(chat)),
+                        "name": getattr(chat, "title", None) or str(chat.id),
+                        "type": chat_type,
+                    }
+                )
         except Exception as exc:
-            logger.warning("get_user_info common_chats_failed user_id=%r error=%s%s", user_id, exc, _rid(), exc_info=True)
+            logger.warning(
+                "get_user_info common_chats_failed user_id=%r error=%s%s", user_id, exc, _rid(), exc_info=True
+            )
 
         # Fetch full user profile
         about: str | None = None
@@ -2081,10 +2062,12 @@ class DaemonAPIServer:
             if raw_bot_info is not None:
                 commands = []
                 for cmd in getattr(raw_bot_info, "commands", None) or []:
-                    commands.append({
-                        "command": getattr(cmd, "command", ""),
-                        "description": getattr(cmd, "description", ""),
-                    })
+                    commands.append(
+                        {
+                            "command": getattr(cmd, "command", ""),
+                            "description": getattr(cmd, "description", ""),
+                        }
+                    )
                 bot_info = {
                     "description": getattr(raw_bot_info, "description", None) or None,
                     "commands": commands,
@@ -2130,7 +2113,9 @@ class DaemonAPIServer:
                         folder_name = getattr(raw_title, "text", raw_title) if raw_title else None
                         break
             except Exception as exc:
-                logger.warning("get_user_info folder_resolve_failed folder_id=%r error=%s%s", folder_id, exc, _rid(), exc_info=True)
+                logger.warning(
+                    "get_user_info folder_resolve_failed folder_id=%r error=%s%s", folder_id, exc, _rid(), exc_info=True
+                )
 
         # Additional usernames (Telegram allows multiple active usernames)
         extra_usernames: list[str] = []
@@ -2146,11 +2131,13 @@ class DaemonAPIServer:
 
         restriction_reason: list[dict] = []
         for rr in getattr(user, "restriction_reason", None) or []:
-            restriction_reason.append({
-                "platform": getattr(rr, "platform", None),
-                "reason": getattr(rr, "reason", None),
-                "text": getattr(rr, "text", None),
-            })
+            restriction_reason.append(
+                {
+                    "platform": getattr(rr, "platform", None),
+                    "reason": getattr(rr, "reason", None),
+                    "text": getattr(rr, "text", None),
+                }
+            )
 
         return {
             "ok": True,
@@ -2230,17 +2217,11 @@ class DaemonAPIServer:
             return True
         if category == "channel":
             return False
-        if (
-            category == "group"
-            and participants_count is not None
-            and participants_count > group_size_threshold
-        ):
+        if category == "group" and participants_count is not None and participants_count > group_size_threshold:  # noqa: SIM103
             return False
         return True
 
-    async def _collect_unread_dialogs(
-        self, scope: str, group_size_threshold: int
-    ) -> tuple[list[dict], dict[int, int]]:
+    async def _collect_unread_dialogs(self, scope: str, group_size_threshold: int) -> tuple[list[dict], dict[int, int]]:
         """Return unread dialog entries from sync.db. Zero Telegram API calls.
 
         Uses a single grouped query (_COLLECT_UNREAD_DIALOGS_WITH_COUNTS_SQL)
@@ -2251,7 +2232,9 @@ class DaemonAPIServer:
         rows = self._conn.execute(_COLLECT_UNREAD_DIALOGS_WITH_COUNTS_SQL).fetchall()
 
         _ENTITY_TYPE_TO_CATEGORY: dict[str, str] = {
-            "User": "user", "Bot": "bot", "Channel": "channel",
+            "User": "user",
+            "Bot": "bot",
+            "Channel": "channel",
         }
 
         unread_dialogs: list[dict] = []
@@ -2269,19 +2252,24 @@ class DaemonAPIServer:
             # for groups (all groups pass regardless of size).
             # TODO: persist participants_count in entities to enable threshold filtering.
             if not self._should_include_unread_dialog(
-                category, scope, None, group_size_threshold,
+                category,
+                scope,
+                None,
+                group_size_threshold,
             ):
                 continue
 
-            unread_dialogs.append({
-                "chat_id": dialog_id,
-                "display_name": display_name,
-                "unread_count": int(unread_count),
-                "unread_mentions_count": 0,  # not stored — see RESEARCH open question #1
-                "category": category,
-                "date": last_event_at,  # int unix ts (NOT datetime — see _rank_unread_entries)
-                "read_inbox_max_id": read_max,
-            })
+            unread_dialogs.append(
+                {
+                    "chat_id": dialog_id,
+                    "display_name": display_name,
+                    "unread_count": int(unread_count),
+                    "unread_mentions_count": 0,  # not stored — see RESEARCH open question #1
+                    "category": category,
+                    "date": last_event_at,  # int unix ts (NOT datetime — see _rank_unread_entries)
+                    "read_inbox_max_id": read_max,
+                }
+            )
             unread_counts[dialog_id] = int(unread_count)
 
         return unread_dialogs, unread_counts
@@ -2290,16 +2278,16 @@ class DaemonAPIServer:
     def _rank_unread_entries(entries: list[dict]) -> None:
         """Assign priority tiers and sort in place (lower tier = higher priority)."""
         for entry in entries:
-            entry["tier"] = unread_chat_tier({
-                "unread_mentions_count": entry["unread_mentions_count"],
-                "category": entry["category"],
-            })
+            entry["tier"] = unread_chat_tier(
+                {
+                    "unread_mentions_count": entry["unread_mentions_count"],
+                    "category": entry["category"],
+                }
+            )
         # date is last_event_at (int unix timestamp) after Plan 38-02 rewrite — not datetime
         entries.sort(key=lambda e: (e["tier"], -(e["date"] if e["date"] else 0)))
 
-    async def _fetch_unread_groups(
-        self, entries: list[dict], allocation: dict[int, int]
-    ) -> list[dict]:
+    async def _fetch_unread_groups(self, entries: list[dict], allocation: dict[int, int]) -> list[dict]:
         """Fetch unread message bodies from sync.db. Zero Telegram API calls."""
         groups: list[dict] = []
         for entry in entries:
@@ -2355,9 +2343,7 @@ class DaemonAPIServer:
                 reaction_map = _fetch_reaction_counts(self._conn, chat_id, msg_ids)
                 for m in group_messages:
                     counts = reaction_map.get(m["message_id"])
-                    m["reactions_display"] = (
-                        format_reaction_counts(counts) if counts else ""
-                    )
+                    m["reactions_display"] = format_reaction_counts(counts) if counts else ""
             group["messages"] = group_messages
             groups.append(group)
 
@@ -2396,9 +2382,7 @@ class DaemonAPIServer:
                 ),
             )
             cutoff = time.time() - self._TELEMETRY_TTL_SECONDS
-            self._conn.execute(
-                "DELETE FROM telemetry_events WHERE timestamp < ?", (cutoff,)
-            )
+            self._conn.execute("DELETE FROM telemetry_events WHERE timestamp < ?", (cutoff,))
             self._conn.commit()
             return {"ok": True}
         except Exception as exc:
@@ -2463,27 +2447,19 @@ class DaemonAPIServer:
 
         reactions = [
             {"emoji": r[0], "count": int(r[1])}
-            for r in self._conn.execute(
-                _GET_DIALOG_TOP_REACTIONS_SQL, (dialog_id, limit)
-            ).fetchall()
+            for r in self._conn.execute(_GET_DIALOG_TOP_REACTIONS_SQL, (dialog_id, limit)).fetchall()
         ]
         mentions = [
             {"value": r[0], "count": int(r[1])}
-            for r in self._conn.execute(
-                _GET_DIALOG_TOP_MENTIONS_SQL, (dialog_id, limit)
-            ).fetchall()
+            for r in self._conn.execute(_GET_DIALOG_TOP_MENTIONS_SQL, (dialog_id, limit)).fetchall()
         ]
         hashtags = [
             {"value": r[0], "count": int(r[1])}
-            for r in self._conn.execute(
-                _GET_DIALOG_TOP_HASHTAGS_SQL, (dialog_id, limit)
-            ).fetchall()
+            for r in self._conn.execute(_GET_DIALOG_TOP_HASHTAGS_SQL, (dialog_id, limit)).fetchall()
         ]
         forwards = [
             {"peer_id": r[0], "name": r[1], "count": int(r[2])}
-            for r in self._conn.execute(
-                _GET_DIALOG_TOP_FORWARDS_SQL, (dialog_id, limit)
-            ).fetchall()
+            for r in self._conn.execute(_GET_DIALOG_TOP_FORWARDS_SQL, (dialog_id, limit)).fetchall()
         ]
         return {
             "ok": True,
@@ -2560,9 +2536,7 @@ class DaemonAPIServer:
         # @username lookup
         if query.startswith("@"):
             username_query = query[1:]
-            row = self._conn.execute(
-                _ENTITY_BY_USERNAME_SQL, (username_query,)
-            ).fetchone()
+            row = self._conn.execute(_ENTITY_BY_USERNAME_SQL, (username_query,)).fetchone()
             if row:
                 return {
                     "ok": True,
@@ -2575,20 +2549,12 @@ class DaemonAPIServer:
             return {"ok": True, "data": {"result": "not_found", "query": query}}
 
         now = int(time.time())
-        display_name_map = dict(
-            self._conn.execute(
-                _ALL_ENTITY_NAMES_SQL, (now - USER_TTL, now - GROUP_TTL)
-            ).fetchall()
-        )
+        display_name_map = dict(self._conn.execute(_ALL_ENTITY_NAMES_SQL, (now - USER_TTL, now - GROUP_TTL)).fetchall())
         normalized = dict(
-            self._conn.execute(
-                _ALL_ENTITY_NAMES_NORMALIZED_SQL, (now - USER_TTL, now - GROUP_TTL)
-            ).fetchall()
+            self._conn.execute(_ALL_ENTITY_NAMES_NORMALIZED_SQL, (now - USER_TTL, now - GROUP_TTL)).fetchall()
         )
 
-        result = resolve_entity_sync(
-            query, display_name_map, None, normalized_name_map=normalized
-        )
+        result = resolve_entity_sync(query, display_name_map, None, normalized_name_map=normalized)
 
         if isinstance(result, Resolved):
             return {

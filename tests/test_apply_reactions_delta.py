@@ -4,6 +4,7 @@ Per Phase 39.2-01 Task 1. Helper is the shared per-message primitive used by
 event handlers and JIT freshen path. FullSyncWorker's batched executemany
 path is intentionally NOT refactored.
 """
+
 from __future__ import annotations
 
 import sqlite3
@@ -32,8 +33,7 @@ def conn(tmp_path: Path) -> sqlite3.Connection:
 def _rows(conn: sqlite3.Connection, dialog_id: int, message_id: int) -> list[tuple]:
     return list(
         conn.execute(
-            "SELECT emoji, count FROM message_reactions "
-            "WHERE dialog_id=? AND message_id=? ORDER BY emoji",
+            "SELECT emoji, count FROM message_reactions WHERE dialog_id=? AND message_id=? ORDER BY emoji",
             (dialog_id, message_id),
         )
     )

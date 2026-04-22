@@ -1,8 +1,6 @@
-
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Awaitable, Callable, Literal, NotRequired, Protocol, TypedDict
-
-from .resolver import Candidates, NotFound, Resolved, ResolvedWithMessage
+from typing import TYPE_CHECKING, Literal, NotRequired, Protocol, TypedDict
 
 if TYPE_CHECKING:
     from datetime import datetime
@@ -77,6 +75,7 @@ class TopicCatalog(TypedDict):
 @dataclass(frozen=True)
 class ExactTargetHints:
     """Bundle of pre-resolved identifiers that bypass fuzzy resolution."""
+
     dialog_id: int | None = None
     dialog_name: str | None = None
     topic_id: int | None = None
@@ -98,6 +97,7 @@ class DialogMatch:
 @dataclass(frozen=True)
 class DialogTargetFailure:
     """Dialog resolution failure: ``not_found`` or ``ambiguous`` (with candidate matches)."""
+
     kind: Literal["not_found", "ambiguous"]
     query: str
     text: str
@@ -122,6 +122,7 @@ class ResolvedDialogTarget:
 @dataclass(frozen=True)
 class TopicMatch:
     """One candidate from fuzzy topic resolution (used in ambiguous responses)."""
+
     entity_id: int
     display_name: str
     score: int
@@ -138,6 +139,7 @@ class ForumTopicFailure:
     not_found (no match), ambiguous (multiple matches), deleted (matched but tombstoned),
     deleted_ambiguous (all matches tombstoned).
     """
+
     kind: Literal[
         "catalog_unavailable",
         "inaccessible",
@@ -155,6 +157,7 @@ class ForumTopicFailure:
 @dataclass(frozen=True)
 class ResolvedForumTopic:
     """Successfully resolved forum topic. ``reply_to_message_id`` is None for General topic."""
+
     query: str
     display_name: str
     metadata: TopicMetadata
@@ -170,6 +173,7 @@ class MessageReadFailure:
     nothing), sender_ambiguous (multiple sender matches), deleted (dialog tombstoned in sync.db),
     inaccessible (Telegram RPC denied access).
     """
+
     kind: Literal[
         "invalid_cursor",
         "sender_not_found",
@@ -183,6 +187,7 @@ class MessageReadFailure:
 @dataclass(frozen=True)
 class NavigationFailure:
     """Invalid or mismatched navigation token — returned when decode/validation fails."""
+
     kind: Literal["invalid_navigation"]
     text: str
 
@@ -190,6 +195,7 @@ class NavigationFailure:
 @dataclass(frozen=True)
 class CapabilityNavigation:
     """Opaque next-page token for history or search continuation."""
+
     kind: Literal["history", "search"]
     token: str
 
@@ -197,6 +203,7 @@ class CapabilityNavigation:
 @dataclass(frozen=True)
 class ListTopicsExecution:
     """Successful topic listing — ``active_topics`` excludes deleted topics."""
+
     resolve_prefix: str
     dialog_name: str
     active_topics: tuple[TopicMetadata, ...]
@@ -242,11 +249,7 @@ DialogTargetResult = ResolvedDialogTarget | DialogTargetFailure
 ForumTopicCapabilityResult = TopicCatalog | ResolvedForumTopic | ForumTopicFailure
 ListTopicsCapabilityResult = ListTopicsExecution | DialogTargetFailure | ForumTopicFailure
 HistoryReadCapabilityResult = (
-    HistoryReadExecution
-    | DialogTargetFailure
-    | ForumTopicFailure
-    | MessageReadFailure
-    | NavigationFailure
+    HistoryReadExecution | DialogTargetFailure | ForumTopicFailure | MessageReadFailure | NavigationFailure
 )
 SearchCapabilityResult = SearchExecution | DialogTargetFailure | NavigationFailure
 TopicLoader = Callable[..., Awaitable[TopicCatalog]]

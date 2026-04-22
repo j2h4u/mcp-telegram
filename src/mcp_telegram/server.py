@@ -15,8 +15,6 @@ from collections.abc import Sequence
 from functools import cache
 
 from mcp.server import Server
-
-from .daemon_client import _request_ids
 from mcp.types import (
     EmbeddedResource,
     ImageContent,
@@ -28,6 +26,7 @@ from mcp.types import (
 )
 
 from . import tools
+from .daemon_client import _request_ids
 
 logger = logging.getLogger(__name__)
 app = Server("mcp-telegram")
@@ -50,7 +49,7 @@ def _safe_boundary_error_text(*, tool_name: str, stage: str, exc: Exception) -> 
     if not detail or "traceback" in detail.lower():
         detail = type(exc).__name__
     if len(detail) > _MAX_ERROR_DETAIL_LENGTH:
-        detail = f"{detail[:_MAX_ERROR_DETAIL_LENGTH - 3]}..."
+        detail = f"{detail[: _MAX_ERROR_DETAIL_LENGTH - 3]}..."
 
     if stage == "validation":
         action = "Check the tool arguments against the exported schema and retry."
@@ -87,7 +86,7 @@ async def progress_notification(progress: str | int, p: float, s: float | None) 
 
 
 @app.call_tool()
-async def call_tool(name: str, arguments: t.Any) -> Sequence[TextContent | ImageContent | EmbeddedResource]:  # noqa: ANN401
+async def call_tool(name: str, arguments: t.Any) -> Sequence[TextContent | ImageContent | EmbeddedResource]:
     """Handle tool calls for command line run."""
 
     if not isinstance(arguments, dict):
@@ -129,7 +128,7 @@ async def _build_server_instructions() -> str:
     Falls back to a generic message if the daemon is unavailable — the
     client can still use GetMyAccount explicitly.
     """
-    from .daemon_client import daemon_connection, DaemonNotRunningError
+    from .daemon_client import DaemonNotRunningError, daemon_connection
 
     base = (
         "Read-only access to a Telegram account's message history via a local sync cache.\n\n"
@@ -137,7 +136,7 @@ async def _build_server_instructions() -> str:
         "- SEARCH THEN READ: Use SearchMessages (omit dialog= for global, add dialog= to scope) "
         "to find messages. Results include msg_id: anchors. "
         "Use ListMessages(exact_dialog_id=N, anchor_message_id=M) to read context around any hit.\n"
-        "- BROWSE: Use ListMessages with navigation=\"newest\"/\"oldest\" "
+        '- BROWSE: Use ListMessages with navigation="newest"/"oldest" '
         "or a next_navigation token from a previous response. "
         "To read an entire channel or chat: call ListMessages repeatedly, passing the next_navigation "
         "token from each response into the next call. Continue until next_navigation is absent. "
@@ -156,9 +155,7 @@ async def _build_server_instructions() -> str:
             data = response["data"]
             name = " ".join(filter(None, [data.get("first_name"), data.get("last_name")]))
             username = data.get("username") or "none"
-            base += (
-                f" Connected account: id={data['id']}, name=\"{name}\", @{username}."
-            )
+            base += f' Connected account: id={data["id"]}, name="{name}", @{username}.'
     except (DaemonNotRunningError, Exception) as exc:
         logger.debug("server_instructions: could not fetch account info: %s", exc)
     return base

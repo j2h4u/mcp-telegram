@@ -76,9 +76,7 @@ class TestDecodeHistoryNavigation:
     def test_direction_mismatch_raises(self):
         token = encode_history_navigation(1, dialog_id=100, direction=HistoryDirection.NEWEST)
         with pytest.raises(ValueError, match="newest.*oldest"):
-            decode_history_navigation(
-                token, expected_dialog_id=100, expected_direction=HistoryDirection.OLDEST
-            )
+            decode_history_navigation(token, expected_dialog_id=100, expected_direction=HistoryDirection.OLDEST)
 
     def test_search_token_rejected_as_history(self):
         token = encode_search_navigation(0, dialog_id=100, query="q")

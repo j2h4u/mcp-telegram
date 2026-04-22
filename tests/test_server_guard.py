@@ -6,7 +6,6 @@ from unittest.mock import patch
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # MCP server startup log — daemon API routing
 # ---------------------------------------------------------------------------
@@ -37,11 +36,7 @@ def test_run_mcp_server_logs_daemon_api_message(
             if "stop after logging" not in str(exc):
                 raise
 
-    daemon_logs = [
-        r.message
-        for r in caplog.records
-        if "daemon api" in r.message.lower()
-    ]
+    daemon_logs = [r.message for r in caplog.records if "daemon api" in r.message.lower()]
     assert daemon_logs, (
         f"Expected daemon API INFO log at MCP server startup. Got logs: {[r.message for r in caplog.records]}"
     )
@@ -60,7 +55,8 @@ async def _run_mcp_server_until_guard_log() -> None:
 
 def test_base_exports_daemon_connection() -> None:
     """daemon_connection and DaemonNotRunningError must be importable from _base."""
-    from mcp_telegram.tools._base import daemon_connection, DaemonNotRunningError  # noqa: F401
+    from mcp_telegram.tools._base import DaemonNotRunningError, daemon_connection
+
     assert daemon_connection is not None
     assert DaemonNotRunningError is not None
 
@@ -68,14 +64,14 @@ def test_base_exports_daemon_connection() -> None:
 def test_base_has_no_connected_client() -> None:
     """connected_client must not exist in _base after migration."""
     import mcp_telegram.tools._base as _base_mod
-    assert not hasattr(_base_mod, "connected_client"), (
-        "connected_client was removed — it should not exist in _base"
-    )
+
+    assert not hasattr(_base_mod, "connected_client"), "connected_client was removed — it should not exist in _base"
 
 
 def test_base_has_no_disable_telegram_session() -> None:
     """disable_telegram_session must not exist in _base after migration."""
     import mcp_telegram.tools._base as _base_mod
+
     assert not hasattr(_base_mod, "disable_telegram_session"), (
         "disable_telegram_session was removed — it should not exist in _base"
     )
@@ -84,6 +80,5 @@ def test_base_has_no_disable_telegram_session() -> None:
 def test_base_has_no_session_disabled_flag() -> None:
     """_session_disabled module-level flag must not exist in _base after migration."""
     import mcp_telegram.tools._base as _base_mod
-    assert not hasattr(_base_mod, "_session_disabled"), (
-        "_session_disabled was removed — it should not exist in _base"
-    )
+
+    assert not hasattr(_base_mod, "_session_disabled"), "_session_disabled was removed — it should not exist in _base"

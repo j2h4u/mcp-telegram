@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from mcp_telegram.daemon import sync_main, _log_heartbeat
-
+from mcp_telegram.daemon import _log_heartbeat, sync_main
 
 # ---------------------------------------------------------------------------
 # CLI registration
@@ -17,6 +16,7 @@ from mcp_telegram.daemon import sync_main, _log_heartbeat
 def test_sync_command_exists() -> None:
     """Typer CLI has a 'sync' command — verified via --help output."""
     from typer.testing import CliRunner
+
     from mcp_telegram import app
 
     runner = CliRunner()
@@ -38,6 +38,7 @@ def mock_client() -> MagicMock:
     for the base object and AsyncMock only for the async methods.
     """
     from helpers import MockTotalList
+
     client = MagicMock()
     client.is_connected.return_value = True  # sync method
     client.connect = AsyncMock()
@@ -66,10 +67,10 @@ def test_sync_main_connects_and_heartbeats(
     """sync_main() calls client.connect() and invokes _log_heartbeat."""
     shutdown_event = asyncio.Event()
 
-    def mock_register_shutdown(conn, loop):  # noqa: ANN001
+    def mock_register_shutdown(conn, loop):
         return shutdown_event
 
-    def heartbeat_then_shutdown(*args):  # noqa: ANN002
+    def heartbeat_then_shutdown(*args):
         _log_heartbeat(*args)
         shutdown_event.set()
 
@@ -147,7 +148,7 @@ def test_self_id_cached_at_startup(
     captured: dict[str, object] = {}
 
     class _Capturing:
-        def __init__(self, conn, client, shutdown_event):  # noqa: ANN001
+        def __init__(self, conn, client, shutdown_event):
             self._conn = conn
             self._client = client
             self._shutdown_event = shutdown_event
@@ -204,10 +205,10 @@ def test_sync_main_heartbeat_logs_connection_state(
     """Heartbeat INFO log includes 'connected=True' (or connection state)."""
     shutdown_event = asyncio.Event()
 
-    def mock_register_shutdown(conn, loop):  # noqa: ANN001
+    def mock_register_shutdown(conn, loop):
         return shutdown_event
 
-    def heartbeat_then_shutdown(*args):  # noqa: ANN002
+    def heartbeat_then_shutdown(*args):
         _log_heartbeat(*args)
         shutdown_event.set()
 
@@ -326,7 +327,7 @@ def test_sync_main_idles_when_all_synced(
     wait. Verify heartbeat log appears after idle starts."""
     shutdown_event = asyncio.Event()
 
-    def mock_register_shutdown(conn, loop):  # noqa: ANN001
+    def mock_register_shutdown(conn, loop):
         async def _set_after_delay() -> None:
             await asyncio.sleep(0.05)
             shutdown_event.set()
@@ -409,17 +410,13 @@ def test_handlers_registered_before_worker(
     call_order: list[str] = []
 
     worker_instance = MagicMock()
-    worker_instance.bootstrap_dms = AsyncMock(
-        side_effect=lambda: call_order.append("bootstrap_dms") or 0
-    )
+    worker_instance.bootstrap_dms = AsyncMock(side_effect=lambda: call_order.append("bootstrap_dms") or 0)
     worker_instance.process_one_batch = AsyncMock(return_value=True)
 
     worker_class = MagicMock(return_value=worker_instance)
 
     handler_instance = MagicMock()
-    handler_instance.register = MagicMock(
-        side_effect=lambda: call_order.append("register")
-    )
+    handler_instance.register = MagicMock(side_effect=lambda: call_order.append("register"))
     handler_instance.unregister = MagicMock()
     handler_instance.refresh_synced_dialogs = MagicMock()
     handler_instance.run_dm_gap_scan = AsyncMock(return_value=0)
@@ -441,8 +438,7 @@ def test_handlers_registered_before_worker(
     assert "register" in call_order, "handler_manager.register() was never called"
     assert "bootstrap_dms" in call_order, "worker.bootstrap_dms() was never called"
     assert call_order.index("register") < call_order.index("bootstrap_dms"), (
-        f"handler_manager.register() must be called BEFORE bootstrap_dms(); "
-        f"got order: {call_order}"
+        f"handler_manager.register() must be called BEFORE bootstrap_dms(); got order: {call_order}"
     )
 
 
@@ -580,9 +576,7 @@ def test_handlers_unregistered_on_shutdown(
     """handler_manager.unregister() must be called before client.disconnect() in finally block."""
     call_order: list[str] = []
 
-    mock_client.disconnect = AsyncMock(
-        side_effect=lambda: call_order.append("disconnect")
-    )
+    mock_client.disconnect = AsyncMock(side_effect=lambda: call_order.append("disconnect"))
 
     worker_instance = MagicMock()
     worker_instance.bootstrap_dms = AsyncMock(return_value=0)
@@ -592,9 +586,7 @@ def test_handlers_unregistered_on_shutdown(
 
     handler_instance = MagicMock()
     handler_instance.register = MagicMock()
-    handler_instance.unregister = MagicMock(
-        side_effect=lambda: call_order.append("unregister")
-    )
+    handler_instance.unregister = MagicMock(side_effect=lambda: call_order.append("unregister"))
     handler_instance.refresh_synced_dialogs = MagicMock()
     handler_instance.run_dm_gap_scan = AsyncMock(return_value=0)
 
@@ -615,8 +607,7 @@ def test_handlers_unregistered_on_shutdown(
     assert "unregister" in call_order, "handler_manager.unregister() was never called"
     assert "disconnect" in call_order, "client.disconnect() was never called"
     assert call_order.index("unregister") < call_order.index("disconnect"), (
-        f"handler_manager.unregister() must be called BEFORE client.disconnect(); "
-        f"got order: {call_order}"
+        f"handler_manager.unregister() must be called BEFORE client.disconnect(); got order: {call_order}"
     )
 
 
@@ -662,6 +653,7 @@ def test_create_client_called_with_catch_up(
 def test_create_client_catch_up_default_false() -> None:
     """create_client() signature has catch_up parameter with default False (backward compat)."""
     import inspect
+
     from mcp_telegram.telegram import create_client
 
     sig = inspect.signature(create_client.__wrapped__)  # unwrap @cache
@@ -677,20 +669,14 @@ def test_delta_catch_up_runs_before_bootstrap(
     call_order: list[str] = []
 
     worker_instance = MagicMock()
-    worker_instance.bootstrap_dms = AsyncMock(
-        side_effect=lambda: call_order.append("bootstrap_dms") or 0
-    )
+    worker_instance.bootstrap_dms = AsyncMock(side_effect=lambda: call_order.append("bootstrap_dms") or 0)
     worker_instance.process_one_batch = AsyncMock(return_value=True)
 
     delta_instance = MagicMock()
-    delta_instance.run_delta_catch_up = AsyncMock(
-        side_effect=lambda: call_order.append("delta_catch_up") or 0
-    )
+    delta_instance.run_delta_catch_up = AsyncMock(side_effect=lambda: call_order.append("delta_catch_up") or 0)
 
     handler_instance = MagicMock()
-    handler_instance.register = MagicMock(
-        side_effect=lambda: call_order.append("register")
-    )
+    handler_instance.register = MagicMock(side_effect=lambda: call_order.append("register"))
     handler_instance.unregister = MagicMock()
     handler_instance.refresh_synced_dialogs = MagicMock()
     handler_instance.run_dm_gap_scan = AsyncMock(return_value=0)
@@ -792,9 +778,7 @@ def test_delta_catch_up_result_logged(
 
     delta_logs = [r.message for r in caplog.records if "delta_catch_up" in r.message]
     assert delta_logs, "Expected at least one log message containing 'delta_catch_up'"
-    assert any("5" in msg for msg in delta_logs), (
-        f"Expected log to contain return value '5'; got: {delta_logs}"
-    )
+    assert any("5" in msg for msg in delta_logs), f"Expected log to contain return value '5'; got: {delta_logs}"
 
 
 # ---------------------------------------------------------------------------
@@ -829,7 +813,6 @@ def test_sync_main_starts_api_server(
     instant_shutdown_event: asyncio.Event,
 ) -> None:
     """sync_main() calls asyncio.start_unix_server with the correct socket path."""
-    from pathlib import Path
     mocks = _make_standard_mocks(instant_shutdown_event)
 
     mock_unix_server = MagicMock()
@@ -838,7 +821,7 @@ def test_sync_main_starts_api_server(
 
     captured_args: list = []
 
-    async def mock_start_unix_server(handler, path=None, **kwargs):  # noqa: ANN001, ANN202
+    async def mock_start_unix_server(handler, path=None, **kwargs):
         captured_args.append((handler, path))
         return mock_unix_server
 
@@ -896,7 +879,7 @@ def test_sync_main_runs_fts_backfill(
 def test_sync_main_cleans_socket_on_shutdown(
     mock_client: MagicMock,
     instant_shutdown_event: asyncio.Event,
-    tmp_path,  # noqa: ANN001
+    tmp_path,
 ) -> None:
     """Socket file does not exist after sync_main() exits (cleanup in finally block)."""
     fake_socket_path = tmp_path / "mcp_telegram.sock"
@@ -936,11 +919,14 @@ async def test_backfill_total_messages_returns_early_when_shutdown_during_flood_
 ) -> None:
     """shutdown_event set during FloodWait sleep → function returns early with filled=0."""
     import sqlite3
+
     from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
+
     from mcp_telegram.daemon import _backfill_total_messages
 
     conn = sqlite3.connect(":memory:")
     from mcp_telegram.sync_db import _apply_migrations
+
     _apply_migrations(conn)
     conn.execute(
         "INSERT INTO synced_dialogs (dialog_id, status, total_messages) VALUES (?, 'synced', NULL)",
@@ -959,6 +945,7 @@ async def test_backfill_total_messages_returns_early_when_shutdown_during_flood_
     async def _mock_wait_for(coro: object, timeout: float) -> None:
         # Simulate shutdown completing before flood wait expires.
         import inspect
+
         if inspect.iscoroutine(coro):
             coro.close()  # prevent "coroutine never awaited" warning
         shutdown_event.set()
@@ -980,8 +967,9 @@ async def test_initialize_read_positions_fills_null_rows(tmp_path):
     import sqlite3
     from types import SimpleNamespace
     from unittest.mock import patch
-    from mcp_telegram.sync_db import _apply_migrations
+
     from mcp_telegram.daemon import _initialize_read_positions
+    from mcp_telegram.sync_db import _apply_migrations
 
     conn = sqlite3.connect(":memory:")
     _apply_migrations(conn)
@@ -1005,7 +993,8 @@ async def test_initialize_read_positions_fills_null_rows(tmp_path):
 
     assert filled == 1
     row = conn.execute(
-        "SELECT read_inbox_max_id FROM synced_dialogs WHERE dialog_id = ?", (1001,),
+        "SELECT read_inbox_max_id FROM synced_dialogs WHERE dialog_id = ?",
+        (1001,),
     ).fetchone()
     assert row[0] == 42
 
@@ -1016,9 +1005,10 @@ async def test_initialize_read_positions_is_monotonic_vs_live_event(tmp_path):
     to a higher value before bootstrap arrives, bootstrap MUST NOT regress it.
     """
     import sqlite3
-    from mcp_telegram.sync_db import _apply_migrations
+
     from mcp_telegram.daemon import _initialize_read_positions  # noqa: F401
     from mcp_telegram.read_state import apply_read_cursor
+    from mcp_telegram.sync_db import _apply_migrations
 
     conn = sqlite3.connect(":memory:")
     _apply_migrations(conn)
@@ -1036,7 +1026,8 @@ async def test_initialize_read_positions_is_monotonic_vs_live_event(tmp_path):
     conn.commit()
 
     row = conn.execute(
-        "SELECT read_inbox_max_id FROM synced_dialogs WHERE dialog_id = ?", (1001,),
+        "SELECT read_inbox_max_id FROM synced_dialogs WHERE dialog_id = ?",
+        (1001,),
     ).fetchone()
     assert row[0] == 100, f"Expected 100 (monotonic), got {row[0]} (bootstrap regressed!)"
 
@@ -1045,8 +1036,9 @@ async def test_initialize_read_positions_is_monotonic_vs_live_event(tmp_path):
 async def test_initialize_read_positions_skips_when_no_null_rows(tmp_path):
     """Given no NULL rows (all already bootstrapped), returns 0 without calling client."""
     import sqlite3
-    from mcp_telegram.sync_db import _apply_migrations
+
     from mcp_telegram.daemon import _initialize_read_positions
+    from mcp_telegram.sync_db import _apply_migrations
 
     conn = sqlite3.connect(":memory:")
     _apply_migrations(conn)
@@ -1072,12 +1064,14 @@ async def test_initialize_read_positions_skips_when_no_null_rows(tmp_path):
 @pytest.mark.asyncio
 async def test_initialize_read_positions_returns_early_when_shutdown_during_flood_wait(tmp_path):
     """shutdown_event set during FloodWait sleep → function returns early with filled=0."""
-    import sqlite3
     import inspect
-    from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
+    import sqlite3
     from unittest.mock import patch
-    from mcp_telegram.sync_db import _apply_migrations
+
+    from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
+
     from mcp_telegram.daemon import _initialize_read_positions
+    from mcp_telegram.sync_db import _apply_migrations
 
     conn = sqlite3.connect(":memory:")
     _apply_migrations(conn)
@@ -1111,8 +1105,9 @@ async def test_initialize_read_positions_excludes_non_synced_status(tmp_path):
     import sqlite3
     from types import SimpleNamespace
     from unittest.mock import patch
-    from mcp_telegram.sync_db import _apply_migrations
+
     from mcp_telegram.daemon import _initialize_read_positions
+    from mcp_telegram.sync_db import _apply_migrations
 
     conn = sqlite3.connect(":memory:")
     _apply_migrations(conn)
@@ -1143,9 +1138,7 @@ async def test_initialize_read_positions_excludes_non_synced_status(tmp_path):
     with patch("mcp_telegram.daemon.telethon_utils.get_peer_id", return_value=1001):
         await _initialize_read_positions(client, conn, shutdown_event)
 
-    assert called_with == [1001], (
-        f"Only the 'synced' dialog should be queried; got {called_with}"
-    )
+    assert called_with == [1001], f"Only the 'synced' dialog should be queried; got {called_with}"
 
 
 def test_sync_main_registers_read_positions_bootstrap_after_handler(tmp_path):
@@ -1154,6 +1147,7 @@ def test_sync_main_registers_read_positions_bootstrap_after_handler(tmp_path):
     no MessageRead events are dropped during the bootstrap window.
     """
     import inspect
+
     from mcp_telegram import daemon as daemon_mod
 
     src = inspect.getsource(daemon_mod.sync_main)

@@ -8,12 +8,13 @@ Covers:
 
 Uses in-memory SQLite; telethon client mocked. Zero real Telegram calls.
 """
+
 from __future__ import annotations
 
 import asyncio
 import sqlite3
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -23,7 +24,6 @@ from mcp_telegram.daemon_api import (
     _dialog_type_from_db,
     _read_state_for_dialog,
 )
-
 
 # ---------------------------------------------------------------------------
 # Module-wide patch: telethon_utils.get_peer_id returns entity.id for mocks
@@ -168,9 +168,7 @@ def _insert_synced_dialog(
     conn.commit()
 
 
-def _insert_entity(
-    conn: sqlite3.Connection, id_: int, type_: str, *, name: str = "X"
-) -> None:
+def _insert_entity(conn: sqlite3.Connection, id_: int, type_: str, *, name: str = "X") -> None:
     conn.execute(
         "INSERT INTO entities (id, type, name, updated_at) VALUES (?, ?, ?, 0)",
         (id_, type_, name),
@@ -188,8 +186,7 @@ def _insert_message(
     text: str = "hi",
 ) -> None:
     conn.execute(
-        "INSERT INTO messages "
-        "(dialog_id, message_id, sent_at, text, out) VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO messages (dialog_id, message_id, sent_at, text, out) VALUES (?, ?, ?, ?, ?)",
         (dialog_id, message_id, sent_at, text, out),
     )
     conn.commit()
@@ -420,9 +417,7 @@ async def test_list_messages_context_window_response_includes_read_state() -> No
 
     server = make_server(conn)
     server.self_id = 999
-    result = await server._list_messages(
-        {"dialog_id": 1, "context_message_id": 3, "context_size": 4}
-    )
+    result = await server._list_messages({"dialog_id": 1, "context_message_id": 3, "context_size": 4})
     assert result["ok"] is True
     data = result["data"]
     assert data["dialog_type"] == "User"
@@ -445,13 +440,11 @@ async def test_search_messages_response_includes_read_state_per_dialog() -> None
 
     def _add(dialog_id: int, mid: int, text: str) -> None:
         conn.execute(
-            "INSERT INTO messages (dialog_id, message_id, sent_at, text, out) "
-            "VALUES (?, ?, ?, ?, 0)",
+            "INSERT INTO messages (dialog_id, message_id, sent_at, text, out) VALUES (?, ?, ?, ?, 0)",
             (dialog_id, mid, 1_700_000_000, text),
         )
         conn.execute(
-            "INSERT INTO messages_fts (dialog_id, message_id, stemmed_text) "
-            "VALUES (?, ?, ?)",
+            "INSERT INTO messages_fts (dialog_id, message_id, stemmed_text) VALUES (?, ?, ?)",
             (dialog_id, mid, stem_text(text)),
         )
 
@@ -489,9 +482,7 @@ async def test_list_unread_messages_response_includes_per_group_read_state() -> 
     server = make_server(conn)
     server.self_id = 999
 
-    result = await server._list_unread_messages(
-        {"scope": "personal", "limit": 100}
-    )
+    result = await server._list_unread_messages({"scope": "personal", "limit": 100})
     assert result["ok"] is True
     groups = result["data"]["groups"]
     assert len(groups) >= 2

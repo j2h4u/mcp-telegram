@@ -4,13 +4,14 @@ Covers single-owner monotonic-write behaviour for both `inbox` and `outbox`
 read cursors on `synced_dialogs`. See 39.3-01-PLAN.md <tasks> for the full
 behavioural contract.
 """
+
 from __future__ import annotations
 
 import os
 import sqlite3
 import tempfile
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Iterator
 
 import pytest
 
@@ -148,9 +149,7 @@ def testapply_read_cursor_unknown_dialog_id_is_noop(mem_conn: sqlite3.Connection
     # UPDATE on missing row: affects 0 rows, no exception.
     apply_read_cursor(mem_conn, 999_999, "inbox", 10)
     mem_conn.commit()
-    row = mem_conn.execute(
-        "SELECT dialog_id FROM synced_dialogs WHERE dialog_id=?", (999_999,)
-    ).fetchone()
+    row = mem_conn.execute("SELECT dialog_id FROM synced_dialogs WHERE dialog_id=?", (999_999,)).fetchone()
     assert row is None
 
 
@@ -208,5 +207,5 @@ def test_read_state_module_importable_by_daemon_and_event_handlers() -> None:
     Phase 39.3-01 Task 2 wires daemon.py + event_handlers.py through this
     module. A circular import would surface here as ImportError.
     """
-    from mcp_telegram.read_state import apply_read_cursor  # noqa: F401
     from mcp_telegram import daemon, event_handlers  # noqa: F401
+    from mcp_telegram.read_state import apply_read_cursor  # noqa: F401

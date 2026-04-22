@@ -17,6 +17,7 @@ Telethon dispatch path LOCKED to Path A:
   requires ``event.outbox == True`` when ``inbox=False``). This maximises
   symmetry with the Phase 38 inbox handler (``on_message_read``).
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -31,7 +32,6 @@ import pytest
 
 from mcp_telegram.event_handlers import EventHandlerManager
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -70,8 +70,7 @@ def _enroll(conn: sqlite3.Connection, dialog_id: int) -> None:
 
 def _read_cursors(conn: sqlite3.Connection, dialog_id: int) -> tuple[Any, Any, Any]:
     row = conn.execute(
-        "SELECT read_inbox_max_id, read_outbox_max_id, last_event_at "
-        "FROM synced_dialogs WHERE dialog_id=?",
+        "SELECT read_inbox_max_id, read_outbox_max_id, last_event_at FROM synced_dialogs WHERE dialog_id=?",
         (dialog_id,),
     ).fetchone()
     return (None, None, None) if row is None else (row[0], row[1], row[2])
@@ -95,9 +94,7 @@ def _make_manager(client, conn, ev) -> EventHandlerManager:
 
 
 @pytest.mark.asyncio
-async def test_outbox_read_user_peer_advances_cursor(
-    mock_client, sync_db, shutdown_event
-):
+async def test_outbox_read_user_peer_advances_cursor(mock_client, sync_db, shutdown_event):
     """AC-3 happy path: a synced DM + max_id=42 writes read_outbox_max_id=42."""
     dialog_id = 1001
     _enroll(sync_db, dialog_id)
@@ -112,9 +109,7 @@ async def test_outbox_read_user_peer_advances_cursor(
 
 
 @pytest.mark.asyncio
-async def test_outbox_read_monotonic_no_regression(
-    mock_client, sync_db, shutdown_event
-):
+async def test_outbox_read_monotonic_no_regression(mock_client, sync_db, shutdown_event):
     """AC-3 monotonic guard: stored 100; incoming 50 → cursor stays 100."""
     dialog_id = 1001
     _enroll(sync_db, dialog_id)
@@ -134,9 +129,7 @@ async def test_outbox_read_monotonic_no_regression(
 
 
 @pytest.mark.asyncio
-async def test_outbox_read_unsynced_dialog_dropped(
-    mock_client, sync_db, shutdown_event, caplog
-):
+async def test_outbox_read_unsynced_dialog_dropped(mock_client, sync_db, shutdown_event, caplog):
     """dialog_id not in _synced_dialog_ids → no DB mutation, no exception."""
     mgr = _make_manager(mock_client, sync_db, shutdown_event)
     mgr.register()
@@ -146,15 +139,14 @@ async def test_outbox_read_unsynced_dialog_dropped(
 
     # no row should be created
     row = sync_db.execute(
-        "SELECT COUNT(*) FROM synced_dialogs WHERE dialog_id=?", (9999,),
+        "SELECT COUNT(*) FROM synced_dialogs WHERE dialog_id=?",
+        (9999,),
     ).fetchone()
     assert row[0] == 0
 
 
 @pytest.mark.asyncio
-async def test_outbox_read_null_chat_id_silently_dropped(
-    mock_client, sync_db, shutdown_event
-):
+async def test_outbox_read_null_chat_id_silently_dropped(mock_client, sync_db, shutdown_event):
     """PeerChat / PeerChannel would land here as chat_id for non-DM peers.
 
     Our filter drops non-DM peers. Use chat_id=None as the "untrackable" sentinel
@@ -170,9 +162,7 @@ async def test_outbox_read_null_chat_id_silently_dropped(
 
 
 @pytest.mark.asyncio
-async def test_outbox_read_chat_peer_dropped(
-    mock_client, sync_db, shutdown_event
-):
+async def test_outbox_read_chat_peer_dropped(mock_client, sync_db, shutdown_event):
     """PeerChat event (positive chat_id but not a DM User) → no DB mutation.
 
     We implement this by enrolling a non-DM-shaped dialog_id in synced_dialogs
@@ -190,9 +180,7 @@ async def test_outbox_read_chat_peer_dropped(
     mgr = _make_manager(mock_client, sync_db, shutdown_event)
     mgr.register()
 
-    event = SimpleNamespace(
-        chat_id=dialog_id, max_id=42, outbox=True, is_private=False
-    )
+    event = SimpleNamespace(chat_id=dialog_id, max_id=42, outbox=True, is_private=False)
     await mgr.on_outbox_read(event)
 
     _, outbox, _ = _read_cursors(sync_db, dialog_id)
@@ -200,18 +188,14 @@ async def test_outbox_read_chat_peer_dropped(
 
 
 @pytest.mark.asyncio
-async def test_outbox_read_channel_peer_dropped(
-    mock_client, sync_db, shutdown_event
-):
+async def test_outbox_read_channel_peer_dropped(mock_client, sync_db, shutdown_event):
     """PeerChannel event → handler's PeerUser-only filter drops it."""
     dialog_id = -1001234567890  # channel-shaped id
     _enroll(sync_db, dialog_id)
     mgr = _make_manager(mock_client, sync_db, shutdown_event)
     mgr.register()
 
-    event = SimpleNamespace(
-        chat_id=dialog_id, max_id=42, outbox=True, is_private=False
-    )
+    event = SimpleNamespace(chat_id=dialog_id, max_id=42, outbox=True, is_private=False)
     await mgr.on_outbox_read(event)
 
     _, outbox, _ = _read_cursors(sync_db, dialog_id)
@@ -219,9 +203,7 @@ async def test_outbox_read_channel_peer_dropped(
 
 
 @pytest.mark.asyncio
-async def test_outbox_read_updates_last_event_at(
-    mock_client, sync_db, shutdown_event
-):
+async def test_outbox_read_updates_last_event_at(mock_client, sync_db, shutdown_event):
     """Happy path bumps last_event_at (same convention as inbox)."""
     dialog_id = 1001
     _enroll(sync_db, dialog_id)
@@ -235,9 +217,7 @@ async def test_outbox_read_updates_last_event_at(
 
 
 @pytest.mark.asyncio
-async def test_outbox_read_unexpected_exception_logged_not_propagated(
-    mock_client, sync_db, shutdown_event, caplog
-):
+async def test_outbox_read_unexpected_exception_logged_not_propagated(mock_client, sync_db, shutdown_event, caplog):
     """Force apply_read_cursor to raise; handler must log + swallow (not crash loop)."""
     dialog_id = 1001
     _enroll(sync_db, dialog_id)
@@ -252,15 +232,13 @@ async def test_outbox_read_unexpected_exception_logged_not_propagated(
             # Must not raise.
             await mgr.on_outbox_read(_make_event(chat_id=dialog_id, max_id=42))
 
-    assert any(
-        "event_outbox_read_failed" in rec.message for rec in caplog.records
-    ), f"Expected event_outbox_read_failed log; got {[r.message for r in caplog.records]}"
+    assert any("event_outbox_read_failed" in rec.message for rec in caplog.records), (
+        f"Expected event_outbox_read_failed log; got {[r.message for r in caplog.records]}"
+    )
 
 
 @pytest.mark.asyncio
-async def test_outbox_handler_does_not_touch_inbox_cursor(
-    mock_client, sync_db, shutdown_event
-):
+async def test_outbox_handler_does_not_touch_inbox_cursor(mock_client, sync_db, shutdown_event):
     """Happy path must leave read_inbox_max_id untouched."""
     dialog_id = 1001
     _enroll(sync_db, dialog_id)
@@ -285,26 +263,23 @@ async def test_outbox_handler_does_not_touch_inbox_cursor(
 # ---------------------------------------------------------------------------
 
 
-def test_register_unregister_register_no_double_outbox_handler(
-    mock_client, sync_db, shutdown_event
-):
+def test_register_unregister_register_no_double_outbox_handler(mock_client, sync_db, shutdown_event):
     """AC-REG-IDEMPOTENT for outbox: register → unregister → register = net 1 active."""
     mgr = _make_manager(mock_client, sync_db, shutdown_event)
 
     mgr.register()
     add_count_after_first_register = sum(
-        1 for call in mock_client.add_event_handler.call_args_list
-        if call.args and call.args[0] == mgr.on_outbox_read
+        1 for call in mock_client.add_event_handler.call_args_list if call.args and call.args[0] == mgr.on_outbox_read
     )
     mgr.unregister()
     rm_count_after_unregister = sum(
-        1 for call in mock_client.remove_event_handler.call_args_list
+        1
+        for call in mock_client.remove_event_handler.call_args_list
         if call.args and call.args[0] == mgr.on_outbox_read
     )
     mgr.register()
     add_count_after_second_register = sum(
-        1 for call in mock_client.add_event_handler.call_args_list
-        if call.args and call.args[0] == mgr.on_outbox_read
+        1 for call in mock_client.add_event_handler.call_args_list if call.args and call.args[0] == mgr.on_outbox_read
     )
 
     assert add_count_after_first_register == 1
@@ -315,9 +290,7 @@ def test_register_unregister_register_no_double_outbox_handler(
     assert net_active == 1
 
 
-def test_unregister_uses_correct_callback_identity(
-    mock_client, sync_db, shutdown_event
-):
+def test_unregister_uses_correct_callback_identity(mock_client, sync_db, shutdown_event):
     """Per codex MEDIUM: remove_event_handler must receive the SAME callback
     object that was passed to add_event_handler (identity equality, not just
     method name). Catches the footgun where Telethon decorators wrap the
@@ -328,7 +301,8 @@ def test_unregister_uses_correct_callback_identity(
 
     # Capture the exact callback object registered with add_event_handler.
     registered = [
-        call.args[0] for call in mock_client.add_event_handler.call_args_list
+        call.args[0]
+        for call in mock_client.add_event_handler.call_args_list
         if call.args and call.args[0] == mgr.on_outbox_read
     ]
     assert len(registered) == 1, "outbox handler must be registered exactly once"
@@ -337,7 +311,8 @@ def test_unregister_uses_correct_callback_identity(
     mgr.unregister()
 
     removed = [
-        call.args[0] for call in mock_client.remove_event_handler.call_args_list
+        call.args[0]
+        for call in mock_client.remove_event_handler.call_args_list
         if call.args and call.args[0] == mgr.on_outbox_read
     ]
     assert len(removed) == 1, "outbox handler must be removed exactly once"

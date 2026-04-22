@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import pytest
-from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 from mcp_telegram.resolver import (
     Candidates,
@@ -466,17 +464,22 @@ def test_numeric_query_bypasses_collision_logic() -> None:
     result = resolve("123", choices)
     assert isinstance(result, Resolved), f"Expected Resolved, got {result!r}"
     assert result.entity_id == 123
+
+
 # ---------------------------------------------------------------------------
 # Task 1: disambiguation_hint field on Candidates matches
 # ---------------------------------------------------------------------------
 
+
 def _make_cache_with_types(entity_types: dict[int, str]):
     """Build a mock entity_cache that returns entity_type for given ids."""
     cache = MagicMock()
+
     def get_side_effect(entity_id, ttl_seconds=300):
         if entity_id in entity_types:
             return {"type": entity_types[entity_id], "username": None}
         return None
+
     cache.get.side_effect = get_side_effect
     cache.get_by_username.return_value = None
     return cache
@@ -484,7 +487,6 @@ def _make_cache_with_types(entity_types: dict[int, str]):
 
 def test_candidates_match_has_disambiguation_hint_on_collision() -> None:
     """Collision case (same norm name, ≥2 entities) → each match dict has non-empty disambiguation_hint."""
-    from mcp_telegram.resolver import _build_norm_map, _fuzzy_resolve
     # Two entities with names that normalize to the same string → collision
     choices = {101: "Ivan", 102: "IVAN"}
     result = resolve("Ivan", choices)
@@ -542,6 +544,7 @@ def test_candidates_no_hint_on_non_collision_candidates() -> None:
 def test_make_match_info_without_hint_context_has_no_hint_key_or_none() -> None:
     """_make_match_info called standalone → disambiguation_hint key is None."""
     from mcp_telegram.resolver import _make_match_info
+
     match = _make_match_info(101, "Ivan", 90, None)
     assert match.get("disambiguation_hint") is None
 
@@ -550,9 +553,11 @@ def test_make_match_info_without_hint_context_has_no_hint_key_or_none() -> None:
 # Task 2: observability log on collision
 # ---------------------------------------------------------------------------
 
+
 def test_collision_emits_debug_log(caplog) -> None:
     """Collision case → one log record with text matching 'resolver_collision'."""
     import logging
+
     choices = {101: "Ivan", 102: "IVAN"}
     with caplog.at_level(logging.DEBUG, logger="mcp_telegram.resolver"):
         resolve("Ivan", choices)
@@ -563,6 +568,7 @@ def test_collision_emits_debug_log(caplog) -> None:
 def test_collision_log_contains_query_and_count(caplog) -> None:
     """Log record has query and n_entities=2 in its formatted message."""
     import logging
+
     choices = {101: "Ivan", 102: "IVAN"}
     with caplog.at_level(logging.DEBUG, logger="mcp_telegram.resolver"):
         resolve("Ivan", choices)
@@ -576,6 +582,7 @@ def test_collision_log_contains_query_and_count(caplog) -> None:
 def test_collision_log_contains_entity_types(caplog) -> None:
     """Log record args include entity types list."""
     import logging
+
     cache = _make_cache_with_types({101: "User", 102: "Channel"})
     choices = {101: "Ivan", 102: "IVAN"}
     with caplog.at_level(logging.DEBUG, logger="mcp_telegram.resolver"):
@@ -587,6 +594,7 @@ def test_collision_log_contains_entity_types(caplog) -> None:
 def test_no_log_when_no_collision(caplog) -> None:
     """Resolved path → zero resolver_collision log records."""
     import logging
+
     choices = {101: "Alice"}
     with caplog.at_level(logging.DEBUG, logger="mcp_telegram.resolver"):
         result = resolve("Alice", choices)
@@ -598,6 +606,7 @@ def test_no_log_when_no_collision(caplog) -> None:
 def test_not_found_no_collision_log(caplog) -> None:
     """NotFound path → zero collision log records."""
     import logging
+
     choices = {101: "Alice"}
     with caplog.at_level(logging.DEBUG, logger="mcp_telegram.resolver"):
         result = resolve("xyzzznomatch", choices)
@@ -609,6 +618,7 @@ def test_not_found_no_collision_log(caplog) -> None:
 def test_log_level_is_debug_not_info(caplog) -> None:
     """Collision log must be DEBUG level, not INFO."""
     import logging
+
     choices = {101: "Ivan", 102: "IVAN"}
     with caplog.at_level(logging.DEBUG, logger="mcp_telegram.resolver"):
         resolve("Ivan", choices)
@@ -624,6 +634,5 @@ def test_hint_stable_across_calls() -> None:
     result2 = resolve("Ivan", choices)
     assert isinstance(result1, Candidates)
     assert isinstance(result2, Candidates)
-    for m1, m2 in zip(result1.matches, result2.matches):
+    for m1, m2 in zip(result1.matches, result2.matches, strict=True):
         assert m1["disambiguation_hint"] == m2["disambiguation_hint"]
-

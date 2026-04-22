@@ -3,13 +3,14 @@
 Uses in-memory SQLite for DB connections, MagicMock/AsyncMock for the
 Telegram client.  No real Telegram API calls are made.
 """
+
 from __future__ import annotations
 
 import asyncio
-import io
 import json
 import sqlite3
 import time
+from datetime import UTC
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -17,7 +18,6 @@ import pytest
 
 from mcp_telegram.daemon_api import DaemonAPIServer, _classify_dialog_type, get_daemon_socket_path
 from mcp_telegram.fts import MESSAGES_FTS_DDL, stem_text
-
 
 # ---------------------------------------------------------------------------
 # Module-wide patch: telethon_utils.get_peer_id returns entity.id for mocks
@@ -52,7 +52,7 @@ def make_server(
     return DaemonAPIServer(conn, client, shutdown_event)
 
 
-def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.Connection:  # noqa: ARG001 (with_entities kept for call-site compatibility, always created now)
+def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.Connection:
     """Return an in-memory SQLite connection with the required schema."""
     conn = sqlite3.connect(":memory:")
     conn.execute(
@@ -187,8 +187,7 @@ def _insert_message_version(
     edit_date: int = 1700000000,
 ) -> None:
     conn.execute(
-        "INSERT INTO message_versions (dialog_id, message_id, version, old_text, edit_date) "
-        "VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO message_versions (dialog_id, message_id, version, old_text, edit_date) VALUES (?, ?, ?, ?, ?)",
         (dialog_id, message_id, version, old_text, edit_date),
     )
     conn.commit()
@@ -534,7 +533,6 @@ async def test_search_messages_global_navigation_token_uses_dialog_id_zero() -> 
     assert nav.dialog_id == 0
 
 
-
 # ---------------------------------------------------------------------------
 # _classify_dialog_type unit tests
 # ---------------------------------------------------------------------------
@@ -859,9 +857,13 @@ async def test_get_sync_status_synced_dialog() -> None:
     """get_sync_status returns all required fields for a synced dialog."""
     conn = _make_db()
     _insert_synced_dialog(
-        conn, -1001234567890, status="synced",
-        last_synced_at=1700000000, last_event_at=1700001000,
-        sync_progress=500, total_messages=500,
+        conn,
+        -1001234567890,
+        status="synced",
+        last_synced_at=1700000000,
+        last_event_at=1700001000,
+        sync_progress=500,
+        total_messages=500,
     )
     _insert_message(conn, -1001234567890, 1, text="msg1")
     _insert_message(conn, -1001234567890, 2, text="msg2")
@@ -971,10 +973,7 @@ async def test_get_sync_alerts_respects_limit() -> None:
     _insert_synced_dialog(conn, 1, status="synced")
     for i in range(10):
         _insert_message(conn, 1, 100 + i, text=f"del {i}")
-        conn.execute(
-            f"UPDATE messages SET is_deleted = 1, deleted_at = {1700000000 + i} "
-            f"WHERE message_id = {100 + i}"
-        )
+        conn.execute(f"UPDATE messages SET is_deleted = 1, deleted_at = {1700000000 + i} WHERE message_id = {100 + i}")
     conn.commit()
     server = make_server(conn)
     result = await server._dispatch({"method": "get_sync_alerts", "since": 0, "limit": 3})
@@ -990,8 +989,11 @@ async def test_get_sync_alerts_respects_limit() -> None:
 async def test_get_user_info_returns_profile() -> None:
     """get_user_info returns user profile with id, names, username, and common_chats."""
     try:
+        from telethon.tl.functions.messages import (
+            GetCommonChatsRequest as TelethonGetCommonChatsRequest,  # type: ignore[import-untyped]  # noqa: F401
+        )
         from telethon.tl.types import Channel as TelethonChannel  # type: ignore[import-untyped]
-        from telethon.tl.functions.messages import GetCommonChatsRequest as TelethonGetCommonChatsRequest  # type: ignore[import-untyped]
+
         TELETHON_REAL = True
     except ImportError:
         TELETHON_REAL = False
@@ -1095,6 +1097,7 @@ async def test_get_user_info_channel_type_classification() -> None:
     """get_user_info classifies Channel with megagroup=False as 'channel'."""
     try:
         from telethon.tl.types import Channel as TelethonChannel  # type: ignore[import-untyped]
+
         TELETHON_REAL = True
     except ImportError:
         TELETHON_REAL = False
@@ -1160,13 +1163,13 @@ async def test_get_user_info_dispatch_routing() -> None:
 @pytest.mark.asyncio
 async def test_get_user_info_status_online() -> None:
     """get_user_info serializes UserStatusOnline to {type: online}."""
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     user = MagicMock()
     user.id = 1
     user.status = MagicMock()
     user.status.__class__.__name__ = "UserStatusOnline"
-    expires = datetime(2026, 4, 14, 12, 0, 0, tzinfo=timezone.utc)
+    expires = datetime(2026, 4, 14, 12, 0, 0, tzinfo=UTC)
     user.status.expires = expires
 
     common_result = MagicMock()
@@ -1191,13 +1194,13 @@ async def test_get_user_info_status_online() -> None:
 @pytest.mark.asyncio
 async def test_get_user_info_status_offline() -> None:
     """get_user_info serializes UserStatusOffline with was_online timestamp."""
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     user = MagicMock()
     user.id = 2
     user.status = MagicMock()
     user.status.__class__.__name__ = "UserStatusOffline"
-    was_online = datetime(2026, 4, 10, 8, 30, 0, tzinfo=timezone.utc)
+    was_online = datetime(2026, 4, 10, 8, 30, 0, tzinfo=UTC)
     user.status.was_online = was_online
 
     common_result = MagicMock()
@@ -1220,11 +1223,14 @@ async def test_get_user_info_status_offline() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status_class,expected_type", [
-    ("UserStatusRecently", "recently"),
-    ("UserStatusLastWeek", "last_week"),
-    ("UserStatusLastMonth", "last_month"),
-])
+@pytest.mark.parametrize(
+    "status_class,expected_type",
+    [
+        ("UserStatusRecently", "recently"),
+        ("UserStatusLastWeek", "last_week"),
+        ("UserStatusLastMonth", "last_month"),
+    ],
+)
 async def test_get_user_info_status_relative(status_class: str, expected_type: str) -> None:
     """get_user_info serializes relative UserStatus types correctly."""
     user = MagicMock()
@@ -1559,13 +1565,13 @@ def _seed_unread_state(
 ) -> None:
     """Seed synced_dialogs (with read_inbox_max_id + status) + entities row."""
     import time as _time
+
     conn.execute(
         "INSERT OR IGNORE INTO synced_dialogs (dialog_id, status) VALUES (?, ?)",
         (dialog_id, status),
     )
     conn.execute(
-        "UPDATE synced_dialogs SET status=?, read_inbox_max_id=?, last_event_at=? "
-        "WHERE dialog_id=?",
+        "UPDATE synced_dialogs SET status=?, read_inbox_max_id=?, last_event_at=? WHERE dialog_id=?",
         (status, read_inbox_max_id, last_event_at or int(_time.time()), dialog_id),
     )
     conn.execute(
@@ -1589,13 +1595,19 @@ def _seed_message(
 ) -> None:
     """Seed a single message row."""
     import time as _time
+
     conn.execute(
         "INSERT INTO messages "
         "(dialog_id, message_id, sent_at, text, sender_id, sender_first_name, is_deleted) "
         "VALUES (?, ?, ?, ?, ?, ?, ?)",
         (
-            dialog_id, message_id, sent_at or int(_time.time()),
-            text, sender_id, sender_first_name, is_deleted,
+            dialog_id,
+            message_id,
+            sent_at or int(_time.time()),
+            text,
+            sender_id,
+            sender_first_name,
+            is_deleted,
         ),
     )
     conn.commit()
@@ -1620,12 +1632,14 @@ async def test_list_unread_messages_basic() -> None:
     client = MagicMock()
     server = make_server(conn, client)
 
-    result = await server._dispatch({
-        "method": "list_unread_messages",
-        "scope": "personal",
-        "limit": 100,
-        "group_size_threshold": 100,
-    })
+    result = await server._dispatch(
+        {
+            "method": "list_unread_messages",
+            "scope": "personal",
+            "limit": 100,
+            "group_size_threshold": 100,
+        }
+    )
 
     assert result["ok"] is True, f"Expected ok=True, got {result}"
     groups = result["data"]["groups"]
@@ -1649,12 +1663,14 @@ async def test_list_unread_messages_empty() -> None:
     client = MagicMock()
     server = make_server(conn, client)
 
-    result = await server._dispatch({
-        "method": "list_unread_messages",
-        "scope": "personal",
-        "limit": 100,
-        "group_size_threshold": 100,
-    })
+    result = await server._dispatch(
+        {
+            "method": "list_unread_messages",
+            "scope": "personal",
+            "limit": 100,
+            "group_size_threshold": 100,
+        }
+    )
 
     assert result["ok"] is True
     assert result["data"]["groups"] == []
@@ -1674,12 +1690,14 @@ async def test_list_unread_messages_filters_channels_in_personal_scope() -> None
     client = MagicMock()
     server = make_server(conn, client)
 
-    result = await server._dispatch({
-        "method": "list_unread_messages",
-        "scope": "personal",
-        "limit": 100,
-        "group_size_threshold": 100,
-    })
+    result = await server._dispatch(
+        {
+            "method": "list_unread_messages",
+            "scope": "personal",
+            "limit": 100,
+            "group_size_threshold": 100,
+        }
+    )
 
     assert result["ok"] is True
     ids = [g["dialog_id"] for g in result["data"]["groups"]]
@@ -1702,12 +1720,14 @@ async def test_list_unread_messages_includes_groups_in_personal_scope() -> None:
     client = MagicMock()
     server = make_server(conn, client)
 
-    result = await server._dispatch({
-        "method": "list_unread_messages",
-        "scope": "personal",
-        "limit": 100,
-        "group_size_threshold": 100,
-    })
+    result = await server._dispatch(
+        {
+            "method": "list_unread_messages",
+            "scope": "personal",
+            "limit": 100,
+            "group_size_threshold": 100,
+        }
+    )
 
     assert result["ok"] is True
     groups = result["data"]["groups"]
@@ -1722,20 +1742,21 @@ async def test_list_unread_messages_budget_limits_messages() -> None:
     conn = _make_db()
     # Two users with 50 unread each
     for dialog_id in [400, 401]:
-        _seed_unread_state(conn, dialog_id, read_inbox_max_id=0, entity_type="User",
-                           entity_name=f"User{dialog_id}")
+        _seed_unread_state(conn, dialog_id, read_inbox_max_id=0, entity_type="User", entity_name=f"User{dialog_id}")
         for msg_id in range(1, 51):
             _seed_message(conn, dialog_id, message_id=msg_id)
 
     client = MagicMock()
     server = make_server(conn, client)
 
-    result = await server._dispatch({
-        "method": "list_unread_messages",
-        "scope": "personal",
-        "limit": 10,
-        "group_size_threshold": 100,
-    })
+    result = await server._dispatch(
+        {
+            "method": "list_unread_messages",
+            "scope": "personal",
+            "limit": 10,
+            "group_size_threshold": 100,
+        }
+    )
 
     assert result["ok"] is True
     total_messages = sum(len(g["messages"]) for g in result["data"]["groups"])
@@ -1770,12 +1791,14 @@ async def test_list_unread_messages_skips_non_synced_or_null() -> None:
     client = MagicMock()
     server = make_server(conn, client)
 
-    result = await server._dispatch({
-        "method": "list_unread_messages",
-        "scope": "personal",
-        "limit": 100,
-        "group_size_threshold": 100,
-    })
+    result = await server._dispatch(
+        {
+            "method": "list_unread_messages",
+            "scope": "personal",
+            "limit": 100,
+            "group_size_threshold": 100,
+        }
+    )
 
     groups = result["data"]["groups"]
     assert len(groups) == 1
@@ -1797,12 +1820,14 @@ async def test_list_unread_messages_read_inbox_max_id_zero_returns_all() -> None
     client = MagicMock()
     server = make_server(conn, client)
 
-    result = await server._dispatch({
-        "method": "list_unread_messages",
-        "scope": "personal",
-        "limit": 100,
-        "group_size_threshold": 100,
-    })
+    result = await server._dispatch(
+        {
+            "method": "list_unread_messages",
+            "scope": "personal",
+            "limit": 100,
+            "group_size_threshold": 100,
+        }
+    )
 
     groups = result["data"]["groups"]
     assert len(groups) == 1
@@ -1825,12 +1850,14 @@ async def test_list_unread_messages_excludes_deleted_messages() -> None:
     client = MagicMock()
     server = make_server(conn, client)
 
-    result = await server._dispatch({
-        "method": "list_unread_messages",
-        "scope": "personal",
-        "limit": 100,
-        "group_size_threshold": 100,
-    })
+    result = await server._dispatch(
+        {
+            "method": "list_unread_messages",
+            "scope": "personal",
+            "limit": 100,
+            "group_size_threshold": 100,
+        }
+    )
 
     groups = result["data"]["groups"]
     assert len(groups) == 1
@@ -1846,7 +1873,7 @@ async def test_list_unread_messages_filter_excludes_ids_below_read_position() ->
     """message_id <= read_inbox_max_id excluded; strict > predicate."""
     conn = _make_db()
     _seed_unread_state(conn, 1001, read_inbox_max_id=10)
-    _seed_message(conn, 1001, message_id=8)   # below — excluded
+    _seed_message(conn, 1001, message_id=8)  # below — excluded
     _seed_message(conn, 1001, message_id=10)  # equal — excluded (strict >)
     _seed_message(conn, 1001, message_id=11)  # above — included
     _seed_message(conn, 1001, message_id=12)  # above — included
@@ -1854,12 +1881,14 @@ async def test_list_unread_messages_filter_excludes_ids_below_read_position() ->
     client = MagicMock()
     server = make_server(conn, client)
 
-    result = await server._dispatch({
-        "method": "list_unread_messages",
-        "scope": "personal",
-        "limit": 100,
-        "group_size_threshold": 100,
-    })
+    result = await server._dispatch(
+        {
+            "method": "list_unread_messages",
+            "scope": "personal",
+            "limit": 100,
+            "group_size_threshold": 100,
+        }
+    )
 
     groups = result["data"]["groups"]
     assert len(groups) == 1
@@ -1882,12 +1911,14 @@ async def test_list_unread_messages_response_reports_bootstrap_pending() -> None
     client = MagicMock()
     server = make_server(conn, client)
 
-    result = await server._dispatch({
-        "method": "list_unread_messages",
-        "scope": "personal",
-        "limit": 100,
-        "group_size_threshold": 100,
-    })
+    result = await server._dispatch(
+        {
+            "method": "list_unread_messages",
+            "scope": "personal",
+            "limit": 100,
+            "group_size_threshold": 100,
+        }
+    )
 
     assert result["ok"] is True
     assert len(result["data"]["groups"]) == 1
@@ -1982,19 +2013,21 @@ async def test_record_telemetry_inserts_row() -> None:
     """record_telemetry inserts a row into telemetry_events with all 8 fields."""
     conn = _make_db_with_entities()
     server = make_server(conn)
-    result = await server._dispatch({
-        "method": "record_telemetry",
-        "event": {
-            "tool_name": "ListDialogs",
-            "timestamp": time.time(),
-            "duration_ms": 123.4,
-            "result_count": 5,
-            "has_cursor": False,
-            "page_depth": 1,
-            "has_filter": True,
-            "error_type": None,
-        },
-    })
+    result = await server._dispatch(
+        {
+            "method": "record_telemetry",
+            "event": {
+                "tool_name": "ListDialogs",
+                "timestamp": time.time(),
+                "duration_ms": 123.4,
+                "result_count": 5,
+                "has_cursor": False,
+                "page_depth": 1,
+                "has_filter": True,
+                "error_type": None,
+            },
+        }
+    )
     assert result["ok"] is True
     row = conn.execute("SELECT tool_name, duration_ms, has_filter FROM telemetry_events").fetchone()
     assert row is not None
@@ -2008,18 +2041,20 @@ async def test_record_telemetry_returns_ok() -> None:
     """record_telemetry returns ok=True on success."""
     conn = _make_db_with_entities()
     server = make_server(conn)
-    result = await server._record_telemetry({
-        "event": {
-            "tool_name": "SearchMessages",
-            "timestamp": 1700000000.0,
-            "duration_ms": 50.0,
-            "result_count": 0,
-            "has_cursor": False,
-            "page_depth": 1,
-            "has_filter": False,
-            "error_type": "NotFound",
-        },
-    })
+    result = await server._record_telemetry(
+        {
+            "event": {
+                "tool_name": "SearchMessages",
+                "timestamp": 1700000000.0,
+                "duration_ms": 50.0,
+                "result_count": 0,
+                "has_cursor": False,
+                "page_depth": 1,
+                "has_filter": False,
+                "error_type": "NotFound",
+            },
+        }
+    )
     assert result == {"ok": True}
 
 
@@ -2029,9 +2064,20 @@ async def test_record_telemetry_db_failure() -> None:
     conn = _make_db_with_entities()
     server = make_server(conn)
     conn.close()  # force DB failure
-    result = await server._record_telemetry({
-        "event": {"tool_name": "X", "timestamp": 0, "duration_ms": 0, "result_count": 0, "has_cursor": False, "page_depth": 1, "has_filter": False, "error_type": None},
-    })
+    result = await server._record_telemetry(
+        {
+            "event": {
+                "tool_name": "X",
+                "timestamp": 0,
+                "duration_ms": 0,
+                "result_count": 0,
+                "has_cursor": False,
+                "page_depth": 1,
+                "has_filter": False,
+                "error_type": None,
+            },
+        }
+    )
     assert result["ok"] is False
     assert "error" in result
 
@@ -2103,13 +2149,15 @@ async def test_upsert_entities_inserts_rows() -> None:
     """upsert_entities inserts/replaces rows in entities table."""
     conn = _make_db_with_entities()
     server = make_server(conn)
-    result = await server._dispatch({
-        "method": "upsert_entities",
-        "entities": [
-            {"id": 100, "type": "user", "name": "Alice", "username": "alice"},
-            {"id": 200, "type": "group", "name": "Dev Chat"},
-        ],
-    })
+    result = await server._dispatch(
+        {
+            "method": "upsert_entities",
+            "entities": [
+                {"id": 100, "type": "user", "name": "Alice", "username": "alice"},
+                {"id": 200, "type": "group", "name": "Dev Chat"},
+            ],
+        }
+    )
     assert result["ok"] is True
     assert result["upserted"] == 2
     rows = conn.execute("SELECT id, name FROM entities ORDER BY id").fetchall()
@@ -2123,12 +2171,14 @@ async def test_upsert_entities_computes_name_normalized() -> None:
     """upsert_entities computes name_normalized via latinize() for each entity."""
     conn = _make_db_with_entities()
     server = make_server(conn)
-    await server._dispatch({
-        "method": "upsert_entities",
-        "entities": [
-            {"id": 300, "type": "user", "name": "Николай"},
-        ],
-    })
+    await server._dispatch(
+        {
+            "method": "upsert_entities",
+            "entities": [
+                {"id": 300, "type": "user", "name": "Николай"},
+            ],
+        }
+    )
     row = conn.execute("SELECT name_normalized FROM entities WHERE id = 300").fetchone()
     assert row is not None
     assert row[0] is not None
@@ -2152,10 +2202,12 @@ async def test_upsert_entities_replaces_on_conflict() -> None:
     conn = _make_db_with_entities()
     _insert_entity(conn, 100, name="Old Name")
     server = make_server(conn)
-    await server._dispatch({
-        "method": "upsert_entities",
-        "entities": [{"id": 100, "type": "user", "name": "New Name"}],
-    })
+    await server._dispatch(
+        {
+            "method": "upsert_entities",
+            "entities": [{"id": 100, "type": "user", "name": "New Name"}],
+        }
+    )
     row = conn.execute("SELECT name FROM entities WHERE id = 100").fetchone()
     assert row[0] == "New Name"
 
@@ -2272,10 +2324,21 @@ async def test_dispatch_routes_record_telemetry() -> None:
     """_dispatch routes 'record_telemetry' correctly."""
     conn = _make_db_with_entities()
     server = make_server(conn)
-    result = await server._dispatch({
-        "method": "record_telemetry",
-        "event": {"tool_name": "X", "timestamp": 0, "duration_ms": 0, "result_count": 0, "has_cursor": False, "page_depth": 1, "has_filter": False, "error_type": None},
-    })
+    result = await server._dispatch(
+        {
+            "method": "record_telemetry",
+            "event": {
+                "tool_name": "X",
+                "timestamp": 0,
+                "duration_ms": 0,
+                "result_count": 0,
+                "has_cursor": False,
+                "page_depth": 1,
+                "has_filter": False,
+                "error_type": None,
+            },
+        }
+    )
     assert result.get("error") != "unknown_method"
 
 
@@ -2432,6 +2495,7 @@ async def test_daemon_connection_resolve_entity_payload() -> None:
 def test_daemon_imports_migrate_legacy_databases() -> None:
     """daemon.py imports migrate_legacy_databases from sync_db."""
     from mcp_telegram import daemon
+
     assert hasattr(daemon, "migrate_legacy_databases")
 
 
@@ -2443,12 +2507,14 @@ def test_daemon_imports_migrate_legacy_databases() -> None:
 def test_build_list_messages_query_exists() -> None:
     """_build_list_messages_query is exported from daemon_api."""
     from mcp_telegram.daemon_api import _build_list_messages_query
+
     assert callable(_build_list_messages_query)
 
 
 def test_build_list_messages_query_basic_shape() -> None:
     """_build_list_messages_query returns (sql, params) with edit_date and topic_title columns."""
     from mcp_telegram.daemon_api import _build_list_messages_query
+
     sql, params = _build_list_messages_query(dialog_id=1, limit=10)
     assert "edit_date" in sql
     assert "topic_title" in sql or "tm.title" in sql
@@ -2462,6 +2528,7 @@ def test_build_list_messages_query_basic_shape() -> None:
 def test_build_list_messages_query_direction_newest() -> None:
     """_build_list_messages_query with direction=newest uses DESC order."""
     from mcp_telegram.daemon_api import _build_list_messages_query
+
     sql, _ = _build_list_messages_query(dialog_id=1, limit=10, direction="newest")
     assert "DESC" in sql.upper()
 
@@ -2469,6 +2536,7 @@ def test_build_list_messages_query_direction_newest() -> None:
 def test_build_list_messages_query_direction_oldest() -> None:
     """_build_list_messages_query with direction=oldest uses ASC order."""
     from mcp_telegram.daemon_api import _build_list_messages_query
+
     sql, _ = _build_list_messages_query(dialog_id=1, limit=10, direction="oldest")
     assert "ASC" in sql.upper()
 
@@ -2476,6 +2544,7 @@ def test_build_list_messages_query_direction_oldest() -> None:
 def test_build_list_messages_query_sender_id_filter() -> None:
     """_build_list_messages_query with sender_id adds AND m.sender_id = :filter_sender_id clause."""
     from mcp_telegram.daemon_api import _build_list_messages_query
+
     sql, params = _build_list_messages_query(dialog_id=1, limit=10, sender_id=42)
     assert "sender_id" in sql
     assert 42 in params.values()
@@ -2484,6 +2553,7 @@ def test_build_list_messages_query_sender_id_filter() -> None:
 def test_build_list_messages_query_sender_name_filter() -> None:
     """_build_list_messages_query with sender_name adds LIKE clause."""
     from mcp_telegram.daemon_api import _build_list_messages_query
+
     sql, params = _build_list_messages_query(dialog_id=1, limit=10, sender_name="Alice")
     assert "LIKE" in sql.upper()
     assert any("Alice" in str(p) for p in params.values())
@@ -2492,6 +2562,7 @@ def test_build_list_messages_query_sender_name_filter() -> None:
 def test_build_list_messages_query_topic_filter() -> None:
     """_build_list_messages_query with topic_id adds forum_topic_id filter."""
     from mcp_telegram.daemon_api import _build_list_messages_query
+
     sql, params = _build_list_messages_query(dialog_id=1, limit=10, topic_id=5)
     assert "forum_topic_id" in sql
     assert 5 in params.values()
@@ -2500,6 +2571,7 @@ def test_build_list_messages_query_topic_filter() -> None:
 def test_build_list_messages_query_unread_filter() -> None:
     """_build_list_messages_query with unread_after_id adds message_id > :unread_after_id clause."""
     from mcp_telegram.daemon_api import _build_list_messages_query
+
     sql, params = _build_list_messages_query(dialog_id=1, limit=10, unread_after_id=100)
     assert "message_id" in sql
     assert 100 in params.values()
@@ -2508,9 +2580,8 @@ def test_build_list_messages_query_unread_filter() -> None:
 def test_build_list_messages_query_cursor_newest() -> None:
     """_build_list_messages_query with cursor and direction=newest uses message_id < :anchor."""
     from mcp_telegram.daemon_api import _build_list_messages_query
-    sql, params = _build_list_messages_query(
-        dialog_id=1, limit=10, anchor_msg_id=500, direction="newest"
-    )
+
+    sql, params = _build_list_messages_query(dialog_id=1, limit=10, anchor_msg_id=500, direction="newest")
     assert "<" in sql
     assert 500 in params.values()
 
@@ -2518,9 +2589,8 @@ def test_build_list_messages_query_cursor_newest() -> None:
 def test_build_list_messages_query_cursor_oldest() -> None:
     """_build_list_messages_query with cursor and direction=oldest uses message_id > :anchor."""
     from mcp_telegram.daemon_api import _build_list_messages_query
-    sql, params = _build_list_messages_query(
-        dialog_id=1, limit=10, anchor_msg_id=500, direction="oldest"
-    )
+
+    sql, params = _build_list_messages_query(dialog_id=1, limit=10, anchor_msg_id=500, direction="oldest")
     assert ">" in sql
     assert 500 in params.values()
 
@@ -2552,7 +2622,8 @@ async def test_list_messages_pagination_sync_db() -> None:
 @pytest.mark.asyncio
 async def test_list_messages_pagination_cursor_continues() -> None:
     """list_messages with navigation token continues from cursor position."""
-    from mcp_telegram.pagination import encode_history_navigation, HistoryDirection
+    from mcp_telegram.pagination import HistoryDirection, encode_history_navigation
+
     DIALOG_ID = 9002
     conn = _make_db()
     _insert_synced_dialog(conn, DIALOG_ID, status="synced")
@@ -2565,21 +2636,21 @@ async def test_list_messages_pagination_cursor_continues() -> None:
     token = encode_history_navigation(103, DIALOG_ID, direction=HistoryDirection.NEWEST)
 
     server = make_server(conn)
-    result = await server._list_messages({
-        "dialog_id": DIALOG_ID, "limit": 2, "navigation": token
-    })
+    result = await server._list_messages({"dialog_id": DIALOG_ID, "limit": 2, "navigation": token})
 
     assert result["ok"] is True, f"Unexpected error: {result}"
     messages = result["data"]["messages"]
     # cursor=103 with direction=newest → message_id < 103 → returns 102, 101
-    assert all(m["message_id"] < 103 for m in messages), \
+    assert all(m["message_id"] < 103 for m in messages), (
         f"Expected messages before 103, got: {[m['message_id'] for m in messages]}"
+    )
 
 
 @pytest.mark.asyncio
 async def test_list_messages_pagination_wrong_dialog_error() -> None:
     """list_messages with navigation token for wrong dialog returns error."""
-    from mcp_telegram.pagination import encode_history_navigation, HistoryDirection
+    from mcp_telegram.pagination import HistoryDirection, encode_history_navigation
+
     DIALOG_ID = 9003
     OTHER_DIALOG = 9099
     conn = _make_db()
@@ -2590,9 +2661,7 @@ async def test_list_messages_pagination_wrong_dialog_error() -> None:
     token = encode_history_navigation(101, OTHER_DIALOG, direction=HistoryDirection.NEWEST)
 
     server = make_server(conn)
-    result = await server._list_messages({
-        "dialog_id": DIALOG_ID, "limit": 10, "navigation": token
-    })
+    result = await server._list_messages({"dialog_id": DIALOG_ID, "limit": 10, "navigation": token})
 
     assert result["ok"] is False
     assert "error" in result
@@ -2614,9 +2683,7 @@ async def test_list_messages_direction_oldest() -> None:
     _insert_message(conn, DIALOG_ID, 103, text="third", sent_at=1700000003)
 
     server = make_server(conn)
-    result = await server._list_messages({
-        "dialog_id": DIALOG_ID, "limit": 10, "direction": "oldest"
-    })
+    result = await server._list_messages({"dialog_id": DIALOG_ID, "limit": 10, "direction": "oldest"})
 
     assert result["ok"] is True, f"Unexpected error: {result}"
     messages = result["data"]["messages"]
@@ -2635,9 +2702,7 @@ async def test_list_messages_direction_newest() -> None:
     _insert_message(conn, DIALOG_ID, 103, text="third", sent_at=1700000003)
 
     server = make_server(conn)
-    result = await server._list_messages({
-        "dialog_id": DIALOG_ID, "limit": 10, "direction": "newest"
-    })
+    result = await server._list_messages({"dialog_id": DIALOG_ID, "limit": 10, "direction": "newest"})
 
     assert result["ok"] is True, f"Unexpected error: {result}"
     messages = result["data"]["messages"]
@@ -2660,9 +2725,7 @@ async def test_list_messages_sender_filter() -> None:
     _insert_message(conn, DIALOG_ID, 102, text="from bob", sender_id=99)
 
     server = make_server(conn)
-    result = await server._list_messages({
-        "dialog_id": DIALOG_ID, "limit": 10, "sender_id": 42
-    })
+    result = await server._list_messages({"dialog_id": DIALOG_ID, "limit": 10, "sender_id": 42})
 
     assert result["ok"] is True, f"Unexpected error: {result}"
     messages = result["data"]["messages"]
@@ -2681,9 +2744,7 @@ async def test_list_messages_sender_name_filter() -> None:
     _insert_message(conn, DIALOG_ID, 102, text="from bob", sender_first_name="Bob")
 
     server = make_server(conn)
-    result = await server._list_messages({
-        "dialog_id": DIALOG_ID, "limit": 10, "sender_name": "alice"
-    })
+    result = await server._list_messages({"dialog_id": DIALOG_ID, "limit": 10, "sender_name": "alice"})
 
     assert result["ok"] is True, f"Unexpected error: {result}"
     messages = result["data"]["messages"]
@@ -2707,9 +2768,7 @@ async def test_list_messages_topic_filter() -> None:
     _insert_message(conn, DIALOG_ID, 103, text="no topic msg", forum_topic_id=None)
 
     server = make_server(conn)
-    result = await server._list_messages({
-        "dialog_id": DIALOG_ID, "limit": 10, "topic_id": 5
-    })
+    result = await server._list_messages({"dialog_id": DIALOG_ID, "limit": 10, "topic_id": 5})
 
     assert result["ok"] is True, f"Unexpected error: {result}"
     messages = result["data"]["messages"]
@@ -2735,9 +2794,7 @@ async def test_list_messages_unread_filter() -> None:
     _insert_message(conn, DIALOG_ID, 102, text="newer msg", sent_at=1700000004)
 
     server = make_server(conn)
-    result = await server._list_messages({
-        "dialog_id": DIALOG_ID, "limit": 10, "unread_after_id": 100
-    })
+    result = await server._list_messages({"dialog_id": DIALOG_ID, "limit": 10, "unread_after_id": 100})
 
     assert result["ok"] is True, f"Unexpected error: {result}"
     messages = result["data"]["messages"]
@@ -2830,7 +2887,8 @@ async def test_list_messages_topic_label() -> None:
 @pytest.mark.asyncio
 async def test_list_messages_on_demand_navigation_offset_id() -> None:
     """list_messages with on-demand dialog + navigation token passes offset_id to iter_messages."""
-    from mcp_telegram.pagination import encode_history_navigation, HistoryDirection
+    from mcp_telegram.pagination import HistoryDirection, encode_history_navigation
+
     DIALOG_ID = 9070
 
     captured_kwargs: dict = {}
@@ -2847,13 +2905,12 @@ async def test_list_messages_on_demand_navigation_offset_id() -> None:
     server = make_server(conn, client)
 
     token = encode_history_navigation(200, DIALOG_ID, direction=HistoryDirection.NEWEST)
-    result = await server._list_messages({
-        "dialog_id": DIALOG_ID, "limit": 10, "navigation": token
-    })
+    result = await server._list_messages({"dialog_id": DIALOG_ID, "limit": 10, "navigation": token})
 
     assert result["ok"] is True, f"Unexpected error: {result}"
-    assert captured_kwargs.get("offset_id") == 200, \
+    assert captured_kwargs.get("offset_id") == 200, (
         f"Expected offset_id=200 in iter_messages kwargs, got: {captured_kwargs}"
+    )
 
 
 @pytest.mark.asyncio
@@ -2873,13 +2930,12 @@ async def test_list_messages_on_demand_direction_oldest_reverse() -> None:
     client.iter_messages = _fake_iter_messages
     server = make_server(conn, client)
 
-    result = await server._list_messages({
-        "dialog_id": DIALOG_ID, "limit": 10, "direction": "oldest"
-    })
+    result = await server._list_messages({"dialog_id": DIALOG_ID, "limit": 10, "direction": "oldest"})
 
     assert result["ok"] is True, f"Unexpected error: {result}"
-    assert captured_kwargs.get("reverse") is True, \
+    assert captured_kwargs.get("reverse") is True, (
         f"Expected reverse=True in iter_messages kwargs, got: {captured_kwargs}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2904,13 +2960,12 @@ async def test_list_messages_on_demand_sender_id_from_user() -> None:
     client.iter_messages = _fake_iter_messages
     server = make_server(conn, client)
 
-    result = await server._list_messages({
-        "dialog_id": DIALOG_ID, "limit": 10, "sender_id": 42
-    })
+    result = await server._list_messages({"dialog_id": DIALOG_ID, "limit": 10, "sender_id": 42})
 
     assert result["ok"] is True, f"Unexpected error: {result}"
-    assert captured_kwargs.get("from_user") == 42, \
+    assert captured_kwargs.get("from_user") == 42, (
         f"Expected from_user=42 in iter_messages kwargs, got: {captured_kwargs}"
+    )
 
 
 @pytest.mark.asyncio
@@ -2930,13 +2985,10 @@ async def test_list_messages_on_demand_topic_id_reply_to() -> None:
     client.iter_messages = _fake_iter_messages
     server = make_server(conn, client)
 
-    result = await server._list_messages({
-        "dialog_id": DIALOG_ID, "limit": 10, "topic_id": 5
-    })
+    result = await server._list_messages({"dialog_id": DIALOG_ID, "limit": 10, "topic_id": 5})
 
     assert result["ok"] is True, f"Unexpected error: {result}"
-    assert captured_kwargs.get("reply_to") == 5, \
-        f"Expected reply_to=5 in iter_messages kwargs, got: {captured_kwargs}"
+    assert captured_kwargs.get("reply_to") == 5, f"Expected reply_to=5 in iter_messages kwargs, got: {captured_kwargs}"
 
 
 @pytest.mark.asyncio
@@ -2956,13 +3008,10 @@ async def test_list_messages_on_demand_unread_after_id_min_id() -> None:
     client.iter_messages = _fake_iter_messages
     server = make_server(conn, client)
 
-    result = await server._list_messages({
-        "dialog_id": DIALOG_ID, "limit": 10, "unread_after_id": 100
-    })
+    result = await server._list_messages({"dialog_id": DIALOG_ID, "limit": 10, "unread_after_id": 100})
 
     assert result["ok"] is True, f"Unexpected error: {result}"
-    assert captured_kwargs.get("min_id") == 100, \
-        f"Expected min_id=100 in iter_messages kwargs, got: {captured_kwargs}"
+    assert captured_kwargs.get("min_id") == 100, f"Expected min_id=100 in iter_messages kwargs, got: {captured_kwargs}"
 
 
 # ---------------------------------------------------------------------------
@@ -3044,9 +3093,7 @@ async def test_list_messages_context_window_reactions_injected() -> None:
     conn.commit()
     server = make_server(conn)
 
-    result = await server._list_messages(
-        {"dialog_id": DIALOG_ID, "context_message_id": 20, "context_size": 4}
-    )
+    result = await server._list_messages({"dialog_id": DIALOG_ID, "context_message_id": 20, "context_size": 4})
 
     assert result["ok"] is True
     by_id = {m["message_id"]: m for m in result["data"]["messages"]}
@@ -3062,8 +3109,9 @@ async def test_list_messages_context_window_reactions_injected() -> None:
 
 def test_msg_to_dict_edit_date() -> None:
     """_msg_to_dict includes edit_date as unix timestamp from msg.edit_date."""
+    from datetime import datetime
+
     from mcp_telegram.daemon_api import DaemonAPIServer
-    from datetime import datetime, timezone
 
     mock_msg = MagicMock()
     mock_msg.id = 300
@@ -3076,7 +3124,7 @@ def test_msg_to_dict_edit_date() -> None:
     mock_msg.media = None
     mock_msg.reply_to = None
     mock_msg.reactions = None
-    edit_dt = datetime(2023, 11, 14, 12, 0, 0, tzinfo=timezone.utc)
+    edit_dt = datetime(2023, 11, 14, 12, 0, 0, tzinfo=UTC)
     mock_msg.edit_date = edit_dt
 
     result = DaemonAPIServer._msg_to_dict(mock_msg)
@@ -3139,7 +3187,7 @@ def test_decode_nav_invalid_token_returns_error_dict() -> None:
 
 def test_decode_nav_wrong_dialog_returns_error_dict() -> None:
     """Navigation token for different dialog → error dict."""
-    from mcp_telegram.pagination import encode_history_navigation, HistoryDirection
+    from mcp_telegram.pagination import HistoryDirection, encode_history_navigation
 
     token = encode_history_navigation(100, dialog_id=999, direction=HistoryDirection.NEWEST)
     result = DaemonAPIServer._decode_history_navigation(token, 123, "newest")
@@ -3150,7 +3198,7 @@ def test_decode_nav_wrong_dialog_returns_error_dict() -> None:
 
 def test_decode_nav_valid_token_returns_anchor() -> None:
     """Valid history token → returns (anchor_msg_id, direction)."""
-    from mcp_telegram.pagination import encode_history_navigation, HistoryDirection
+    from mcp_telegram.pagination import HistoryDirection, encode_history_navigation
 
     token = encode_history_navigation(42, dialog_id=123, direction=HistoryDirection.NEWEST)
     result = DaemonAPIServer._decode_history_navigation(token, 123, "oldest")
@@ -3179,6 +3227,7 @@ def test_decode_nav_search_token_returns_error() -> None:
 def test_db_message_columns_length_matches_query() -> None:
     """_DB_MESSAGE_COLUMNS has 16 entries matching the SELECT (Phase 39.1-02 added effective_sender_id, is_service, out, dialog_id)."""
     from mcp_telegram.daemon_api import _DB_MESSAGE_COLUMNS
+
     assert len(_DB_MESSAGE_COLUMNS) == 16
     assert _DB_MESSAGE_COLUMNS[0] == "message_id"
     assert _DB_MESSAGE_COLUMNS[-1] == "dialog_id"
@@ -3193,26 +3242,31 @@ def test_db_message_columns_length_matches_query() -> None:
 
 def test_compute_sync_coverage_normal():
     from mcp_telegram.daemon_api import _compute_sync_coverage
+
     assert _compute_sync_coverage(1000, 800) == 80
 
 
 def test_compute_sync_coverage_complete():
     from mcp_telegram.daemon_api import _compute_sync_coverage
+
     assert _compute_sync_coverage(1000, 1000) == 100
 
 
 def test_compute_sync_coverage_clamped_over_100():
     from mcp_telegram.daemon_api import _compute_sync_coverage
+
     assert _compute_sync_coverage(100, 150) == 100
 
 
 def test_compute_sync_coverage_null_total():
     from mcp_telegram.daemon_api import _compute_sync_coverage
+
     assert _compute_sync_coverage(None, 500) is None
 
 
 def test_compute_sync_coverage_zero_total():
     from mcp_telegram.daemon_api import _compute_sync_coverage
+
     assert _compute_sync_coverage(0, 0) == 100
 
 
@@ -3226,14 +3280,12 @@ async def test_get_sync_status_includes_coverage():
     """get_sync_status returns sync_coverage_pct and access_lost_at."""
     conn = _make_db()
     conn.execute(
-        "INSERT INTO synced_dialogs (dialog_id, status, total_messages) "
-        "VALUES (?, 'synced', 1000)",
+        "INSERT INTO synced_dialogs (dialog_id, status, total_messages) VALUES (?, 'synced', 1000)",
         (-100001,),
     )
     for i in range(800):
         conn.execute(
-            "INSERT INTO messages (dialog_id, message_id, sent_at, text, is_deleted) "
-            "VALUES (?, ?, 1000, 'msg', 0)",
+            "INSERT INTO messages (dialog_id, message_id, sent_at, text, is_deleted) VALUES (?, ?, 1000, 'msg', 0)",
             (-100001, i + 1),
         )
     conn.commit()
@@ -3255,8 +3307,7 @@ async def test_get_sync_status_access_lost_with_coverage():
     )
     for i in range(400):
         conn.execute(
-            "INSERT INTO messages (dialog_id, message_id, sent_at, text, is_deleted) "
-            "VALUES (?, ?, 1000, 'msg', 0)",
+            "INSERT INTO messages (dialog_id, message_id, sent_at, text, is_deleted) VALUES (?, ?, 1000, 'msg', 0)",
             (-100002, i + 1),
         )
     conn.commit()
@@ -3277,8 +3328,7 @@ async def test_get_sync_status_access_lost_null_total_has_archived_count():
     )
     for i in range(150):
         conn.execute(
-            "INSERT INTO messages (dialog_id, message_id, sent_at, text, is_deleted) "
-            "VALUES (?, ?, 1000, 'msg', 0)",
+            "INSERT INTO messages (dialog_id, message_id, sent_at, text, is_deleted) VALUES (?, ?, 1000, 'msg', 0)",
             (-100009, i + 1),
         )
     conn.commit()
@@ -3299,14 +3349,12 @@ async def test_list_dialogs_includes_coverage():
     """list_dialogs includes sync_coverage_pct and access_lost_at per dialog."""
     conn = _make_db()
     conn.execute(
-        "INSERT INTO synced_dialogs (dialog_id, status, total_messages) "
-        "VALUES (?, 'synced', 100)",
+        "INSERT INTO synced_dialogs (dialog_id, status, total_messages) VALUES (?, 'synced', 100)",
         (5001,),
     )
     for i in range(50):
         conn.execute(
-            "INSERT INTO messages (dialog_id, message_id, sent_at, text, is_deleted) "
-            "VALUES (?, ?, 1000, 'msg', 0)",
+            "INSERT INTO messages (dialog_id, message_id, sent_at, text, is_deleted) VALUES (?, ?, 1000, 'msg', 0)",
             (5001, i + 1),
         )
     conn.commit()
@@ -3505,6 +3553,7 @@ async def test_search_messages_access_lost_returns_full_metadata():
         (-100003,),
     )
     from mcp_telegram.fts import INSERT_FTS_SQL, stem_text
+
     conn.execute(INSERT_FTS_SQL, (-100003, 1, stem_text("test content")))
     conn.commit()
 
@@ -3533,6 +3582,7 @@ async def test_search_messages_access_lost_null_total_has_archived_count():
         (-100011,),
     )
     from mcp_telegram.fts import INSERT_FTS_SQL, stem_text
+
     conn.execute(INSERT_FTS_SQL, (-100011, 1, stem_text("test content")))
     conn.commit()
 
@@ -3558,6 +3608,7 @@ async def test_search_messages_global_omits_dialog_access():
         (-100004,),
     )
     from mcp_telegram.fts import INSERT_FTS_SQL, stem_text
+
     conn.execute(INSERT_FTS_SQL, (-100004, 1, stem_text("global test")))
     conn.commit()
 
@@ -3955,13 +4006,11 @@ def test_entity_read_path_mention_query() -> None:
     _insert_message(conn, 1, 1)
     _insert_message(conn, 1, 2)
     conn.execute(
-        "INSERT INTO message_entities (dialog_id, message_id, offset, length, type, value) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO message_entities (dialog_id, message_id, offset, length, type, value) VALUES (?, ?, ?, ?, ?, ?)",
         (1, 1, 0, 6, "mention", "@alice"),
     )
     conn.execute(
-        "INSERT INTO message_entities (dialog_id, message_id, offset, length, type, value) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO message_entities (dialog_id, message_id, offset, length, type, value) VALUES (?, ?, ?, ?, ?, ?)",
         (1, 2, 0, 7, "hashtag", "#python"),
     )
     conn.commit()
@@ -3989,18 +4038,15 @@ def test_entity_read_path_hashtag_frequency() -> None:
     _insert_message(conn, 1, 2)
     _insert_message(conn, 1, 3)
     conn.execute(
-        "INSERT INTO message_entities (dialog_id, message_id, offset, length, type, value) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO message_entities (dialog_id, message_id, offset, length, type, value) VALUES (?, ?, ?, ?, ?, ?)",
         (1, 1, 0, 7, "hashtag", "#python"),
     )
     conn.execute(
-        "INSERT INTO message_entities (dialog_id, message_id, offset, length, type, value) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO message_entities (dialog_id, message_id, offset, length, type, value) VALUES (?, ?, ?, ?, ?, ?)",
         (1, 2, 0, 5, "hashtag", "#rust"),
     )
     conn.execute(
-        "INSERT INTO message_entities (dialog_id, message_id, offset, length, type, value) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO message_entities (dialog_id, message_id, offset, length, type, value) VALUES (?, ?, ?, ?, ?, ?)",
         (1, 3, 0, 7, "hashtag", "#python"),
     )
     conn.commit()
@@ -4024,18 +4070,15 @@ def test_forward_read_path_source_ranking() -> None:
     _insert_message(conn, 1, 2)
     _insert_message(conn, 1, 3)
     conn.execute(
-        "INSERT INTO message_forwards (dialog_id, message_id, fwd_from_peer_id, fwd_from_name) "
-        "VALUES (?, ?, ?, ?)",
+        "INSERT INTO message_forwards (dialog_id, message_id, fwd_from_peer_id, fwd_from_name) VALUES (?, ?, ?, ?)",
         (1, 1, 100, "Channel A"),
     )
     conn.execute(
-        "INSERT INTO message_forwards (dialog_id, message_id, fwd_from_peer_id, fwd_from_name) "
-        "VALUES (?, ?, ?, ?)",
+        "INSERT INTO message_forwards (dialog_id, message_id, fwd_from_peer_id, fwd_from_name) VALUES (?, ?, ?, ?)",
         (1, 2, 100, "Channel A"),
     )
     conn.execute(
-        "INSERT INTO message_forwards (dialog_id, message_id, fwd_from_peer_id, fwd_from_name) "
-        "VALUES (?, ?, ?, ?)",
+        "INSERT INTO message_forwards (dialog_id, message_id, fwd_from_peer_id, fwd_from_name) VALUES (?, ?, ?, ?)",
         (1, 3, 200, "Channel B"),
     )
     conn.commit()
@@ -4059,8 +4102,7 @@ def test_forward_read_path_includes_private_forwards() -> None:
     _insert_synced_dialog(conn, 1)
     _insert_message(conn, 1, 1)
     conn.execute(
-        "INSERT INTO message_forwards (dialog_id, message_id, fwd_from_peer_id, fwd_from_name) "
-        "VALUES (?, ?, ?, ?)",
+        "INSERT INTO message_forwards (dialog_id, message_id, fwd_from_peer_id, fwd_from_name) VALUES (?, ?, ?, ?)",
         (1, 1, None, "Hidden User"),
     )
     conn.commit()
@@ -4155,42 +4197,35 @@ async def test_get_dialog_stats_synced_returns_aggregated() -> None:
 
     # Mentions: @alice once
     conn.execute(
-        "INSERT INTO message_entities (dialog_id, message_id, offset, length, type, value) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO message_entities (dialog_id, message_id, offset, length, type, value) VALUES (?, ?, ?, ?, ?, ?)",
         (1, 1, 0, 6, "mention", "@alice"),
     )
 
     # Hashtags: #python twice, #rust once
     conn.execute(
-        "INSERT INTO message_entities (dialog_id, message_id, offset, length, type, value) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO message_entities (dialog_id, message_id, offset, length, type, value) VALUES (?, ?, ?, ?, ?, ?)",
         (1, 1, 10, 7, "hashtag", "#python"),
     )
     conn.execute(
-        "INSERT INTO message_entities (dialog_id, message_id, offset, length, type, value) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO message_entities (dialog_id, message_id, offset, length, type, value) VALUES (?, ?, ?, ?, ?, ?)",
         (1, 2, 0, 7, "hashtag", "#python"),
     )
     conn.execute(
-        "INSERT INTO message_entities (dialog_id, message_id, offset, length, type, value) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO message_entities (dialog_id, message_id, offset, length, type, value) VALUES (?, ?, ?, ?, ?, ?)",
         (1, 3, 0, 5, "hashtag", "#rust"),
     )
 
     # Forwards: Channel A twice, Channel B once
     conn.execute(
-        "INSERT INTO message_forwards (dialog_id, message_id, fwd_from_peer_id, fwd_from_name) "
-        "VALUES (?, ?, ?, ?)",
+        "INSERT INTO message_forwards (dialog_id, message_id, fwd_from_peer_id, fwd_from_name) VALUES (?, ?, ?, ?)",
         (1, 1, 100, "Channel A"),
     )
     conn.execute(
-        "INSERT INTO message_forwards (dialog_id, message_id, fwd_from_peer_id, fwd_from_name) "
-        "VALUES (?, ?, ?, ?)",
+        "INSERT INTO message_forwards (dialog_id, message_id, fwd_from_peer_id, fwd_from_name) VALUES (?, ?, ?, ?)",
         (1, 2, 100, "Channel A"),
     )
     conn.execute(
-        "INSERT INTO message_forwards (dialog_id, message_id, fwd_from_peer_id, fwd_from_name) "
-        "VALUES (?, ?, ?, ?)",
+        "INSERT INTO message_forwards (dialog_id, message_id, fwd_from_peer_id, fwd_from_name) VALUES (?, ?, ?, ?)",
         (1, 3, 200, "Channel B"),
     )
     conn.commit()
@@ -4291,6 +4326,8 @@ async def test_get_dialog_stats_resolves_fuzzy_dialog_name() -> None:
     assert result["ok"] is True
     assert result["data"]["dialog_id"] == 1
     client.get_entity.assert_called_once_with("Chat Foo")
+
+
 # - Simplify _format_reactions to only handle count-only display path
 #   Criterion: same as above
 
@@ -4331,8 +4368,7 @@ def _seed_message_p39(
 
 def _seed_synced_dialog_p39(conn: sqlite3.Connection, dialog_id: int, read_inbox_max_id: int | None = None) -> None:
     conn.execute(
-        "INSERT OR REPLACE INTO synced_dialogs "
-        "(dialog_id, status, read_inbox_max_id) VALUES (?, 'synced', ?)",
+        "INSERT OR REPLACE INTO synced_dialogs (dialog_id, status, read_inbox_max_id) VALUES (?, 'synced', ?)",
         (dialog_id, read_inbox_max_id),
     )
 
@@ -4403,12 +4439,14 @@ async def test_list_unread_messages_uses_entity_name() -> None:
     _seed_message_p39(conn, dialog_id=555, message_id=10, sender_id=123, sender_first_name=None)
     conn.commit()
     server = make_server(conn)
-    result = await server._dispatch({
-        "method": "list_unread_messages",
-        "scope": "personal",
-        "limit": 100,
-        "group_size_threshold": 100,
-    })
+    result = await server._dispatch(
+        {
+            "method": "list_unread_messages",
+            "scope": "personal",
+            "limit": 100,
+            "group_size_threshold": 100,
+        }
+    )
     assert result["ok"] is True
     groups = result["data"]["groups"]
     dialog_group = next((g for g in groups if g["dialog_id"] == 555), None)
@@ -4423,13 +4461,12 @@ async def test_list_unread_messages_uses_entity_name() -> None:
 def test_fts_sql_invariants_mandatory() -> None:
     """MANDATORY — no skip clause. Locks FTS SQL-string contract (Phase 39.1-02 aliases)."""
     from mcp_telegram import daemon_api as d
+
     # _SELECT_FTS_SQL: dual sender entity JOINs (e_raw + e_eff) for effective_sender_id lookup
     assert "LEFT JOIN entities e_raw ON e_raw.id = m.sender_id" in d._SELECT_FTS_SQL, (
         "_SELECT_FTS_SQL missing LEFT JOIN entities e_raw"
     )
-    assert "LEFT JOIN entities e_eff" in d._SELECT_FTS_SQL, (
-        "_SELECT_FTS_SQL missing LEFT JOIN entities e_eff"
-    )
+    assert "LEFT JOIN entities e_eff" in d._SELECT_FTS_SQL, "_SELECT_FTS_SQL missing LEFT JOIN entities e_eff"
     assert "COALESCE(e_raw.name, e_eff.name, m.sender_first_name)" in d._SELECT_FTS_SQL, (
         "_SELECT_FTS_SQL missing triple COALESCE(e_raw.name, e_eff.name, m.sender_first_name)"
     )
@@ -4447,6 +4484,7 @@ def test_fts_sql_invariants_mandatory() -> None:
 
 def test_all_sql_constants_contain_entity_join_and_coalesce() -> None:
     from mcp_telegram import daemon_api as d
+
     for name in (
         "_SELECT_MESSAGES_SQL",
         "_SELECT_FTS_SQL",
@@ -4464,12 +4502,14 @@ def test_all_sql_constants_contain_entity_join_and_coalesce() -> None:
 
 def test_db_message_columns_preserves_sender_first_name_position() -> None:
     from mcp_telegram.daemon_api import _DB_MESSAGE_COLUMNS
+
     assert _DB_MESSAGE_COLUMNS[4] == "sender_first_name"
 
 
 def test_line_409_filter_has_documenting_comment() -> None:
     """Documents that sender_name filter intentionally uses the denormalized column."""
     import pathlib
+
     src = pathlib.Path("src/mcp_telegram/daemon_api.py").read_text()
     assert src.count("Filter uses denormalized column intentionally") == 1
 
@@ -4527,11 +4567,10 @@ def test_list_messages_has_exactly_two_log_sites_in_method() -> None:
     one in _list_messages_from_db (main sync.db path) and one in
     _list_messages_context_window (anchor path). Non-sync.db paths must not emit."""
     import pathlib
+
     src = pathlib.Path("src/mcp_telegram/daemon_api.py").read_text()
     count = src.count('"list_messages rendered"')
-    assert count == 2, (
-        f"Expected exactly two `list_messages rendered` log calls in daemon_api.py, found {count}"
-    )
+    assert count == 2, f"Expected exactly two `list_messages rendered` log calls in daemon_api.py, found {count}"
 
 
 @pytest.mark.asyncio
@@ -4560,8 +4599,13 @@ async def test_list_messages_effective_sender_dm_outgoing() -> None:
     conn = _make_db()
     _seed_synced_dialog_p39(conn, dialog_id=268071163)
     _seed_message_p39(
-        conn, dialog_id=268071163, message_id=1,
-        sender_id=None, sender_first_name=None, out=1, is_service=0,
+        conn,
+        dialog_id=268071163,
+        message_id=1,
+        sender_id=None,
+        sender_first_name=None,
+        out=1,
+        is_service=0,
     )
     conn.commit()
     server = make_server(conn)
@@ -4577,8 +4621,13 @@ async def test_list_messages_effective_sender_dm_incoming() -> None:
     conn = _make_db()
     _seed_synced_dialog_p39(conn, dialog_id=268071163)
     _seed_message_p39(
-        conn, dialog_id=268071163, message_id=1,
-        sender_id=None, sender_first_name=None, out=0, is_service=0,
+        conn,
+        dialog_id=268071163,
+        message_id=1,
+        sender_id=None,
+        sender_first_name=None,
+        out=0,
+        is_service=0,
     )
     conn.commit()
     server = make_server(conn)
@@ -4594,8 +4643,13 @@ async def test_list_messages_effective_sender_service_message_is_null() -> None:
     conn = _make_db()
     _seed_synced_dialog_p39(conn, dialog_id=268071163)
     _seed_message_p39(
-        conn, dialog_id=268071163, message_id=1,
-        sender_id=None, sender_first_name=None, out=0, is_service=1,
+        conn,
+        dialog_id=268071163,
+        message_id=1,
+        sender_id=None,
+        sender_first_name=None,
+        out=0,
+        is_service=1,
     )
     conn.commit()
     server = make_server(conn)
@@ -4612,8 +4666,13 @@ async def test_list_messages_effective_sender_group_unknown_is_null() -> None:
     conn = _make_db()
     _seed_synced_dialog_p39(conn, dialog_id=-100123)
     _seed_message_p39(
-        conn, dialog_id=-100123, message_id=1,
-        sender_id=None, sender_first_name=None, out=0, is_service=0,
+        conn,
+        dialog_id=-100123,
+        message_id=1,
+        sender_id=None,
+        sender_first_name=None,
+        out=0,
+        is_service=0,
     )
     conn.commit()
     server = make_server(conn)
@@ -4655,10 +4714,18 @@ def test_msg_to_dict_telethon_fallback_dm_incoming() -> None:
 
     mock_date = SimpleNamespace(timestamp=lambda: 1700000000.0)
     mock_msg = SimpleNamespace(
-        id=42, date=mock_date, message="hi",
-        sender_id=None, sender=None, media=None, reactions=None,
-        reply_to=None, reply_to_msg_id=None, forum_topic_id=None,
-        edit_date=None, out=False,
+        id=42,
+        date=mock_date,
+        message="hi",
+        sender_id=None,
+        sender=None,
+        media=None,
+        reactions=None,
+        reply_to=None,
+        reply_to_msg_id=None,
+        forum_topic_id=None,
+        edit_date=None,
+        out=False,
     )
     result = DaemonAPIServer._msg_to_dict(mock_msg, dialog_id=268071163, self_id=99999)
     assert result["effective_sender_id"] == 268071163
@@ -4672,8 +4739,13 @@ async def test_list_messages_dm_outgoing_resolves_sender_first_name_via_e_eff() 
     _seed_synced_dialog_p39(conn, dialog_id=268071163)
     _seed_entity_p39(conn, entity_id=99999, name="Me")
     _seed_message_p39(
-        conn, dialog_id=268071163, message_id=1,
-        sender_id=None, sender_first_name=None, out=1, is_service=0,
+        conn,
+        dialog_id=268071163,
+        message_id=1,
+        sender_id=None,
+        sender_first_name=None,
+        out=1,
+        is_service=0,
     )
     conn.commit()
     server = make_server(conn)

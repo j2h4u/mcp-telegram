@@ -4,6 +4,7 @@ Covers AC-3, AC-4, AC-4-PAGED, AC-5, AC-6, AC-6-PARTIAL plus per-path wiring
 for _list_messages, _list_messages_context_window, scoped _search_messages,
 and _list_unread_messages.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -17,11 +18,10 @@ import pytest
 from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
 
 from mcp_telegram.daemon_api import (
-    DaemonAPIServer,
     REACTIONS_TTL_SECONDS,
+    DaemonAPIServer,
 )
 from mcp_telegram.fts import MESSAGES_FTS_DDL
-
 
 # ---------------------------------------------------------------------------
 # Patch get_peer_id for MagicMock entities
@@ -149,8 +149,7 @@ def _make_db(*, with_fts: bool = False) -> sqlite3.Connection:
 
 def _seed_synced(conn: sqlite3.Connection, dialog_id: int) -> None:
     conn.execute(
-        "INSERT INTO synced_dialogs (dialog_id, status, read_inbox_max_id, last_event_at) "
-        "VALUES (?, 'synced', 0, ?)",
+        "INSERT INTO synced_dialogs (dialog_id, status, read_inbox_max_id, last_event_at) VALUES (?, 'synced', 0, ?)",
         (dialog_id, int(time.time())),
     )
     conn.execute(
@@ -171,32 +170,24 @@ def _seed_message(conn: sqlite3.Connection, dialog_id: int, message_id: int) -> 
     conn.commit()
 
 
-def _seed_freshness(
-    conn: sqlite3.Connection, dialog_id: int, message_ids: list[int], checked_at: int
-) -> None:
+def _seed_freshness(conn: sqlite3.Connection, dialog_id: int, message_ids: list[int], checked_at: int) -> None:
     for mid in message_ids:
         conn.execute(
-            "INSERT OR REPLACE INTO message_reactions_freshness "
-            "(dialog_id, message_id, checked_at) VALUES (?, ?, ?)",
+            "INSERT OR REPLACE INTO message_reactions_freshness (dialog_id, message_id, checked_at) VALUES (?, ?, ?)",
             (dialog_id, mid, checked_at),
         )
     conn.commit()
 
 
-def _seed_reaction(
-    conn: sqlite3.Connection, dialog_id: int, message_id: int, emoji: str, count: int
-) -> None:
+def _seed_reaction(conn: sqlite3.Connection, dialog_id: int, message_id: int, emoji: str, count: int) -> None:
     conn.execute(
-        "INSERT OR REPLACE INTO message_reactions "
-        "(dialog_id, message_id, emoji, count) VALUES (?, ?, ?, ?)",
+        "INSERT OR REPLACE INTO message_reactions (dialog_id, message_id, emoji, count) VALUES (?, ?, ?, ?)",
         (dialog_id, message_id, emoji, count),
     )
     conn.commit()
 
 
-def _msg_with_reactions(
-    msg_id: int, emoji: str = "❤", count: int = 1
-) -> SimpleNamespace:
+def _msg_with_reactions(msg_id: int, emoji: str = "❤", count: int = 1) -> SimpleNamespace:
     """Mock Telethon Message with .reactions populated like a real ReactionCount."""
     rc = SimpleNamespace(
         reaction=SimpleNamespace(emoticon=emoji),
@@ -232,9 +223,7 @@ async def test_jit_cold_fetch_updates_state() -> None:
         _seed_message(conn, dialog_id, mid)
 
     client = MagicMock()
-    client.get_messages = AsyncMock(
-        return_value=[_msg_with_reactions(mid) for mid in ids]
-    )
+    client.get_messages = AsyncMock(return_value=[_msg_with_reactions(mid) for mid in ids])
     server = make_server(conn, client)
 
     await server._freshen_reactions_if_stale(dialog_id, dialog_id, ids)
@@ -249,9 +238,7 @@ async def test_jit_cold_fetch_updates_state() -> None:
     ).fetchone()[0]
     assert fresh == 30
 
-    rxn = conn.execute(
-        "SELECT COUNT(*) FROM message_reactions WHERE dialog_id=?", (dialog_id,)
-    ).fetchone()[0]
+    rxn = conn.execute("SELECT COUNT(*) FROM message_reactions WHERE dialog_id=?", (dialog_id,)).fetchone()[0]
     assert rxn == 30
 
 
@@ -274,9 +261,7 @@ async def test_jit_all_fresh_no_api_call() -> None:
     await server._freshen_reactions_if_stale(dialog_id, dialog_id, ids)
 
     assert client.get_messages.call_count == 0
-    rxn = conn.execute(
-        "SELECT COUNT(*) FROM message_reactions WHERE dialog_id=?", (dialog_id,)
-    ).fetchone()[0]
+    rxn = conn.execute("SELECT COUNT(*) FROM message_reactions WHERE dialog_id=?", (dialog_id,)).fetchone()[0]
     assert rxn == 0
 
 
@@ -293,9 +278,7 @@ async def test_jit_page1_fresh_page2_cold_partial_fetch() -> None:
     _seed_freshness(conn, dialog_id, list(range(1, 31)), now - 100)
 
     client = MagicMock()
-    client.get_messages = AsyncMock(
-        return_value=[_msg_with_reactions(mid) for mid in range(31, 61)]
-    )
+    client.get_messages = AsyncMock(return_value=[_msg_with_reactions(mid) for mid in range(31, 61)])
     server = make_server(conn, client)
 
     await server._freshen_reactions_if_stale(dialog_id, dialog_id, ids_all)
@@ -307,16 +290,14 @@ async def test_jit_page1_fresh_page2_cold_partial_fetch() -> None:
 
     # page 1 freshness rows unchanged
     p1_checked = conn.execute(
-        "SELECT checked_at FROM message_reactions_freshness "
-        "WHERE dialog_id=? AND message_id<=30",
+        "SELECT checked_at FROM message_reactions_freshness WHERE dialog_id=? AND message_id<=30",
         (dialog_id,),
     ).fetchall()
     assert all(c[0] == now - 100 for c in p1_checked)
 
     # page 2 upserted
     p2_count = conn.execute(
-        "SELECT COUNT(*) FROM message_reactions_freshness "
-        "WHERE dialog_id=? AND message_id>30",
+        "SELECT COUNT(*) FROM message_reactions_freshness WHERE dialog_id=? AND message_id>30",
         (dialog_id,),
     ).fetchone()[0]
     assert p2_count == 30
@@ -337,9 +318,7 @@ async def test_jit_partial_stale_subset_fetch() -> None:
     _seed_freshness(conn, dialog_id, fresh_ids, now - 50)
 
     client = MagicMock()
-    client.get_messages = AsyncMock(
-        return_value=[_msg_with_reactions(mid) for mid in stale_ids]
-    )
+    client.get_messages = AsyncMock(return_value=[_msg_with_reactions(mid) for mid in stale_ids])
     server = make_server(conn, client)
 
     await server._freshen_reactions_if_stale(dialog_id, dialog_id, ids)
@@ -371,17 +350,14 @@ async def test_jit_ttl_expired_refreshes_no_duplicates() -> None:
     _seed_freshness(conn, dialog_id, ids, expired)
 
     client = MagicMock()
-    client.get_messages = AsyncMock(
-        return_value=[_msg_with_reactions(mid, emoji="❤", count=1) for mid in ids]
-    )
+    client.get_messages = AsyncMock(return_value=[_msg_with_reactions(mid, emoji="❤", count=1) for mid in ids])
     server = make_server(conn, client)
 
     await server._freshen_reactions_if_stale(dialog_id, dialog_id, ids)
 
     assert client.get_messages.call_count == 1
     rxn_rows = conn.execute(
-        "SELECT message_id, emoji, count FROM message_reactions WHERE dialog_id=? "
-        "ORDER BY message_id",
+        "SELECT message_id, emoji, count FROM message_reactions WHERE dialog_id=? ORDER BY message_id",
         (dialog_id,),
     ).fetchall()
     assert rxn_rows == [(mid, "❤", 1) for mid in ids]
@@ -389,8 +365,7 @@ async def test_jit_ttl_expired_refreshes_no_duplicates() -> None:
     # freshness updated to ~now
     now = int(time.time())
     fr = conn.execute(
-        "SELECT message_id, checked_at FROM message_reactions_freshness "
-        "WHERE dialog_id=?",
+        "SELECT message_id, checked_at FROM message_reactions_freshness WHERE dialog_id=?",
         (dialog_id,),
     ).fetchall()
     for _mid, ca in fr:
@@ -421,9 +396,7 @@ async def test_jit_floodwait_preserves_stale() -> None:
         await server._freshen_reactions_if_stale(dialog_id, dialog_id, ids)
 
     # reactions untouched
-    rxn_rows = conn.execute(
-        "SELECT count FROM message_reactions WHERE dialog_id=?", (dialog_id,)
-    ).fetchall()
+    rxn_rows = conn.execute("SELECT count FROM message_reactions WHERE dialog_id=?", (dialog_id,)).fetchall()
     assert all(r[0] == 2 for r in rxn_rows)
     assert len(rxn_rows) == 5
 
@@ -518,9 +491,7 @@ async def test_jit_fetch_window_never_expanded() -> None:
     ask_ids = [10, 20, 30, 40, 50]
 
     client = MagicMock()
-    client.get_messages = AsyncMock(
-        return_value=[_msg_with_reactions(mid) for mid in ask_ids]
-    )
+    client.get_messages = AsyncMock(return_value=[_msg_with_reactions(mid) for mid in ask_ids])
     server = make_server(conn, client)
 
     await server._freshen_reactions_if_stale(dialog_id, dialog_id, ask_ids)
@@ -551,8 +522,7 @@ async def test_jit_reactions_cleared_when_telegram_has_none() -> None:
     assert rxn == 0
 
     fr = conn.execute(
-        "SELECT checked_at FROM message_reactions_freshness "
-        "WHERE dialog_id=? AND message_id=1",
+        "SELECT checked_at FROM message_reactions_freshness WHERE dialog_id=? AND message_id=1",
         (dialog_id,),
     ).fetchone()
     assert fr is not None
@@ -582,15 +552,11 @@ async def test_list_messages_triggers_jit_on_cold_read() -> None:
         _seed_message(conn, dialog_id, mid)
 
     client = MagicMock()
-    client.get_messages = AsyncMock(
-        return_value=[_msg_with_reactions(mid, "❤", 2) for mid in range(1, 6)]
-    )
+    client.get_messages = AsyncMock(return_value=[_msg_with_reactions(mid, "❤", 2) for mid in range(1, 6)])
     server = make_server(conn, client)
     server.self_id = 99
 
-    result = await server._dispatch(
-        {"method": "list_messages", "dialog_id": dialog_id, "limit": 10}
-    )
+    result = await server._dispatch({"method": "list_messages", "dialog_id": dialog_id, "limit": 10})
 
     assert result["ok"] is True
     assert client.get_messages.call_count == 1
@@ -615,9 +581,7 @@ async def test_list_messages_skips_jit_when_all_fresh() -> None:
     server = make_server(conn, client)
     server.self_id = 99
 
-    result = await server._dispatch(
-        {"method": "list_messages", "dialog_id": dialog_id, "limit": 10}
-    )
+    result = await server._dispatch({"method": "list_messages", "dialog_id": dialog_id, "limit": 10})
 
     assert result["ok"] is True
     assert client.get_messages.call_count == 0
@@ -635,15 +599,11 @@ async def test_list_messages_page1_fresh_page2_cold() -> None:
     _seed_freshness(conn, dialog_id, [1, 2, 3, 4, 5], int(time.time()) - 50)
 
     client = MagicMock()
-    client.get_messages = AsyncMock(
-        return_value=[_msg_with_reactions(mid) for mid in [10, 9, 8, 7, 6]]
-    )
+    client.get_messages = AsyncMock(return_value=[_msg_with_reactions(mid) for mid in [10, 9, 8, 7, 6]])
     server = make_server(conn, client)
     server.self_id = 99
 
-    result = await server._dispatch(
-        {"method": "list_messages", "dialog_id": dialog_id, "limit": 10}
-    )
+    result = await server._dispatch({"method": "list_messages", "dialog_id": dialog_id, "limit": 10})
 
     assert result["ok"] is True
     assert client.get_messages.call_count == 1
@@ -662,9 +622,7 @@ async def test_list_messages_context_window_wiring() -> None:
         _seed_message(conn, dialog_id, mid)
 
     client = MagicMock()
-    client.get_messages = AsyncMock(
-        return_value=[_msg_with_reactions(mid) for mid in range(1, 11)]
-    )
+    client.get_messages = AsyncMock(return_value=[_msg_with_reactions(mid) for mid in range(1, 11)])
     server = make_server(conn, client)
     server.self_id = 99
 
@@ -691,16 +649,13 @@ async def test_search_messages_scoped_triggers_jit() -> None:
         _seed_message(conn, dialog_id, mid)
         # Index FTS row matching the message text
         conn.execute(
-            "INSERT INTO messages_fts (dialog_id, message_id, stemmed_text) "
-            "VALUES (?, ?, ?)",
+            "INSERT INTO messages_fts (dialog_id, message_id, stemmed_text) VALUES (?, ?, ?)",
             (dialog_id, mid, f"hello {mid}"),
         )
     conn.commit()
 
     client = MagicMock()
-    client.get_messages = AsyncMock(
-        return_value=[_msg_with_reactions(mid) for mid in [3, 2, 1]]
-    )
+    client.get_messages = AsyncMock(return_value=[_msg_with_reactions(mid) for mid in [3, 2, 1]])
     server = make_server(conn, client)
     server.self_id = 99
 
@@ -727,8 +682,7 @@ async def test_search_messages_global_skips_jit() -> None:
     for mid in range(1, 4):
         _seed_message(conn, dialog_id, mid)
         conn.execute(
-            "INSERT INTO messages_fts (dialog_id, message_id, stemmed_text) "
-            "VALUES (?, ?, ?)",
+            "INSERT INTO messages_fts (dialog_id, message_id, stemmed_text) VALUES (?, ?, ?)",
             (dialog_id, mid, f"hello {mid}"),
         )
     conn.commit()
@@ -773,9 +727,7 @@ async def test_list_unread_messages_injects_reactions() -> None:
     server = make_server(conn, client)
     server.self_id = 99
 
-    result = await server._dispatch(
-        {"method": "list_unread_messages", "scope": "personal", "limit": 100}
-    )
+    result = await server._dispatch({"method": "list_unread_messages", "scope": "personal", "limit": 100})
 
     assert result["ok"] is True
     groups = result["data"]["groups"]
@@ -801,15 +753,11 @@ async def test_list_unread_messages_triggers_jit_on_cold_read() -> None:
     conn.commit()
 
     client = MagicMock()
-    client.get_messages = AsyncMock(
-        return_value=[_msg_with_reactions(mid) for mid in [13, 12, 11]]
-    )
+    client.get_messages = AsyncMock(return_value=[_msg_with_reactions(mid) for mid in [13, 12, 11]])
     server = make_server(conn, client)
     server.self_id = 99
 
-    result = await server._dispatch(
-        {"method": "list_unread_messages", "scope": "personal", "limit": 100}
-    )
+    result = await server._dispatch({"method": "list_unread_messages", "scope": "personal", "limit": 100})
 
     assert result["ok"] is True
     assert client.get_messages.call_count == 1
@@ -835,9 +783,7 @@ async def test_list_unread_messages_skips_jit_when_all_fresh() -> None:
     server = make_server(conn, client)
     server.self_id = 99
 
-    result = await server._dispatch(
-        {"method": "list_unread_messages", "scope": "personal", "limit": 100}
-    )
+    result = await server._dispatch({"method": "list_unread_messages", "scope": "personal", "limit": 100})
 
     assert result["ok"] is True
     assert client.get_messages.call_count == 0
@@ -852,16 +798,16 @@ async def test_non_content_methods_do_not_trigger_jit() -> None:
 
     client = MagicMock()
     client.get_messages = AsyncMock()
+
     # iter_dialogs needs to be an async iterator; return empty
     async def _empty(*_a, **_k):
         if False:
             yield  # pragma: no cover
+
     client.iter_dialogs = MagicMock(side_effect=_empty)
     server = make_server(conn, client)
     server.self_id = 99
 
-    result = await server._dispatch(
-        {"method": "get_sync_status", "dialog_id": dialog_id}
-    )
+    result = await server._dispatch({"method": "get_sync_status", "dialog_id": dialog_id})
     assert result["ok"] is True
     assert client.get_messages.call_count == 0

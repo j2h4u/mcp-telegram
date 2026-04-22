@@ -2,6 +2,7 @@
 
 Tests are ordered: unit tests first, then integration tests.
 """
+
 from __future__ import annotations
 
 import sqlite3
@@ -11,7 +12,6 @@ import pytest
 
 from mcp_telegram.fts import (
     MESSAGES_FTS_DDL,
-    INSERT_FTS_SQL,
     backfill_fts_index,
     stem_query,
     stem_text,
@@ -20,7 +20,6 @@ from mcp_telegram.sync_db import (
     _open_sync_db,
     ensure_sync_schema,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -50,13 +49,9 @@ def fts_conn() -> sqlite3.Connection:
 def test_stem_text_russian_morphology() -> None:
     """stem_text reduces Russian morphological variants to the same stem."""
     # "написал" (wrote, masc) and "написали" (wrote, plural) should share a stem
-    assert stem_text("написал") == stem_text("написали"), (
-        "Russian morphological variants must produce identical stems"
-    )
+    assert stem_text("написал") == stem_text("написали"), "Russian morphological variants must produce identical stems"
     # "сообщение" (message, nom) and "сообщениями" (messages, instrumental)
-    assert stem_text("сообщение") == stem_text("сообщениями"), (
-        "Russian noun case variants must produce identical stems"
-    )
+    assert stem_text("сообщение") == stem_text("сообщениями"), "Russian noun case variants must produce identical stems"
 
 
 # ---------------------------------------------------------------------------
@@ -100,13 +95,9 @@ def test_stem_query() -> None:
     stem_result = stem_text("написал сообщение")
     # Unquoted stems must match stem_text output
     unquoted = result.replace('"', "")
-    assert unquoted == stem_result, (
-        f"stem_query stems must match stem_text output: {unquoted!r} != {stem_result!r}"
-    )
+    assert unquoted == stem_result, f"stem_query stems must match stem_text output: {unquoted!r} != {stem_result!r}"
     # Each token must be quoted
-    assert result.startswith('"') and result.endswith('"'), (
-        f"stem_query output must use quoted tokens: {result!r}"
-    )
+    assert result.startswith('"') and result.endswith('"'), f"stem_query output must use quoted tokens: {result!r}"
     # stem_query on Russian verbs produces consistent output
     q1 = stem_query("написал")
     q2 = stem_query("написали")
@@ -126,9 +117,7 @@ def test_fts_table_created_by_migration(tmp_sync_db_path: Path) -> None:
     ensure_sync_schema(tmp_sync_db_path)
     conn = _open_sync_db(tmp_sync_db_path)
     try:
-        rows = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='messages_fts'"
-        ).fetchall()
+        rows = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='messages_fts'").fetchall()
         assert len(rows) == 1, "messages_fts table must exist after migration v3"
     finally:
         conn.close()
@@ -156,8 +145,7 @@ def test_fts_morphological_search(fts_conn: sqlite3.Connection) -> None:
         (query, 1),
     ).fetchall()
     assert len(rows) == 1, (
-        f"FTS MATCH for stem of 'написал' must find row containing 'написали', "
-        f"stemmed={stemmed!r}, query={query!r}"
+        f"FTS MATCH for stem of 'написал' must find row containing 'написали', stemmed={stemmed!r}, query={query!r}"
     )
     assert rows[0][0] == 100
 
@@ -186,9 +174,7 @@ def test_fts_dialog_scope(fts_conn: sqlite3.Connection) -> None:
         (query, 1),
     ).fetchall()
     dialog_ids = {row[0] for row in rows}
-    assert 2 not in dialog_ids, (
-        f"FTS scoped to dialog_id=1 must not return dialog_id=2 rows, got {rows!r}"
-    )
+    assert 2 not in dialog_ids, f"FTS scoped to dialog_id=1 must not return dialog_id=2 rows, got {rows!r}"
     assert 1 in dialog_ids, "FTS must return the matching row for dialog_id=1"
 
 
@@ -203,9 +189,7 @@ def test_schema_migration_v3_idempotent(tmp_sync_db_path: Path) -> None:
     ensure_sync_schema(tmp_sync_db_path)  # must not raise
     conn = _open_sync_db(tmp_sync_db_path)
     try:
-        rows = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='messages_fts'"
-        ).fetchall()
+        rows = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='messages_fts'").fetchall()
         assert len(rows) == 1, "messages_fts must still exist after second ensure_sync_schema"
     finally:
         conn.close()
@@ -252,9 +236,7 @@ def test_backfill_fts_index(tmp_sync_db_path: Path) -> None:
             "SELECT message_id FROM messages_fts WHERE messages_fts MATCH ? AND dialog_id = ?",
             (query, 1),
         ).fetchall()
-        assert len(results) >= 1, (
-            f"FTS must find message with 'написал' via stem query {query!r}"
-        )
+        assert len(results) >= 1, f"FTS must find message with 'написал' via stem query {query!r}"
         assert results[0][0] == 100
     finally:
         conn.close()
@@ -267,7 +249,7 @@ def test_backfill_fts_index(tmp_sync_db_path: Path) -> None:
 
 def test_stem_query_strips_embedded_double_quotes():
     """stem_query must not produce unbalanced FTS5 double-quotes."""
-    result = stem_query('test')
+    result = stem_query("test")
     assert '"' in result, "tokens should be quoted"
     # Each token should be properly quoted — no unbalanced quotes
     assert result.count('"') % 2 == 0

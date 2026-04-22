@@ -11,16 +11,17 @@ Covers:
 - AC-REG-IDEMPOTENT (register/unregister symmetry)
 - AC-6 (FloodWait on Raw path skips DB mutation)
 """
+
 from __future__ import annotations
 
 import asyncio
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from helpers import build_mock_message, build_mock_reactions
 from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
 from telethon.tl.types import (  # type: ignore[import-untyped]
     PeerChannel,
@@ -28,10 +29,8 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
     UpdateMessageReactions,
 )
 
-from helpers import build_mock_message, build_mock_reactions
 from mcp_telegram.event_handlers import EventHandlerManager
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -98,9 +97,7 @@ def _reactions(conn: sqlite3.Connection, dialog_id: int, message_id: int) -> lis
 
 
 def _last_event_at(conn: sqlite3.Connection, dialog_id: int) -> int | None:
-    row = conn.execute(
-        "SELECT last_event_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)
-    ).fetchone()
+    row = conn.execute("SELECT last_event_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone()
     return None if row is None or row[0] is None else int(row[0])
 
 
@@ -116,9 +113,7 @@ def _make_manager(client, conn, ev) -> EventHandlerManager:
 
 
 @pytest.mark.asyncio
-async def test_on_message_edited_reactions_only_applies_delta(
-    mock_client, sync_db, shutdown_event
-):
+async def test_on_message_edited_reactions_only_applies_delta(mock_client, sync_db, shutdown_event):
     """AC-1 via edited path: text unchanged, msg.reactions populated -> rows applied."""
     dialog_id = 12345
     _enroll(sync_db, dialog_id)
@@ -135,9 +130,7 @@ async def test_on_message_edited_reactions_only_applies_delta(
 
 
 @pytest.mark.asyncio
-async def test_on_message_edited_reactions_removed_clears_rows(
-    mock_client, sync_db, shutdown_event
-):
+async def test_on_message_edited_reactions_removed_clears_rows(mock_client, sync_db, shutdown_event):
     """AC-2: reactions object present but empty results -> rows deleted."""
     dialog_id = 12345
     _enroll(sync_db, dialog_id)
@@ -155,9 +148,7 @@ async def test_on_message_edited_reactions_removed_clears_rows(
 
 
 @pytest.mark.asyncio
-async def test_on_message_edited_no_text_change_no_reactions_is_noop(
-    mock_client, sync_db, shutdown_event
-):
+async def test_on_message_edited_no_text_change_no_reactions_is_noop(mock_client, sync_db, shutdown_event):
     """AC-8: text unchanged AND reactions is None -> message_reactions untouched, last_event_at untouched."""
     dialog_id = 12345
     _enroll(sync_db, dialog_id)
@@ -257,9 +248,7 @@ async def test_on_raw_reaction_removal(mock_client, sync_db, shutdown_event):
 
 
 @pytest.mark.asyncio
-async def test_on_raw_reaction_update_drops_silently_for_unsynced_dialog(
-    mock_client, sync_db, shutdown_event
-):
+async def test_on_raw_reaction_update_drops_silently_for_unsynced_dialog(mock_client, sync_db, shutdown_event):
     """Non-synced dialog -> no DB mutation, no API call."""
     dialog_id = 999999
     # Do NOT enroll
@@ -276,9 +265,7 @@ async def test_on_raw_reaction_update_drops_silently_for_unsynced_dialog(
 
 
 @pytest.mark.asyncio
-async def test_on_raw_reaction_update_floodwait_logs_and_skips(
-    mock_client, sync_db, shutdown_event
-):
+async def test_on_raw_reaction_update_floodwait_logs_and_skips(mock_client, sync_db, shutdown_event):
     """AC-6 supporting: FloodWaitError -> no DB mutation, warning logged."""
     dialog_id = 268071163
     _enroll(sync_db, dialog_id)
@@ -301,9 +288,7 @@ async def test_on_raw_reaction_update_floodwait_logs_and_skips(
 
 
 @pytest.mark.asyncio
-async def test_on_raw_reaction_update_missing_message_no_op(
-    mock_client, sync_db, shutdown_event
-):
+async def test_on_raw_reaction_update_missing_message_no_op(mock_client, sync_db, shutdown_event):
     """get_messages returns [None] -> no DB mutation."""
     dialog_id = 268071163
     _enroll(sync_db, dialog_id)
@@ -325,9 +310,7 @@ async def test_on_raw_reaction_update_missing_message_no_op(
 
 
 @pytest.mark.asyncio
-async def test_idempotency_edited_then_raw_same_state(
-    mock_client, sync_db, shutdown_event
-):
+async def test_idempotency_edited_then_raw_same_state(mock_client, sync_db, shutdown_event):
     """AC-7: same change via both paths converges to same DB state."""
     dialog_id = 268071163
     _enroll(sync_db, dialog_id)
@@ -362,9 +345,7 @@ async def test_idempotency_edited_then_raw_same_state(
 # ---------------------------------------------------------------------------
 
 
-def test_register_unregister_register_no_double_handler(
-    mock_client, sync_db, shutdown_event
-):
+def test_register_unregister_register_no_double_handler(mock_client, sync_db, shutdown_event):
     """AC-REG-IDEMPOTENT: register -> unregister -> register; raw handler net 1 active."""
     mgr = EventHandlerManager(mock_client, sync_db, shutdown_event)
 

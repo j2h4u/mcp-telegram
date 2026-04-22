@@ -40,14 +40,9 @@ MESSAGES_FTS_DDL = (
     "tokenize='unicode61')"
 )
 
-INSERT_FTS_SQL = (
-    "INSERT INTO messages_fts(dialog_id, message_id, stemmed_text) "
-    "VALUES (?, ?, ?)"
-)
+INSERT_FTS_SQL = "INSERT INTO messages_fts(dialog_id, message_id, stemmed_text) VALUES (?, ?, ?)"
 
-DELETE_FTS_SQL = (
-    "DELETE FROM messages_fts WHERE dialog_id=? AND message_id=?"
-)
+DELETE_FTS_SQL = "DELETE FROM messages_fts WHERE dialog_id=? AND message_id=?"
 
 
 # ---------------------------------------------------------------------------
@@ -103,9 +98,7 @@ def backfill_fts_index(conn: sqlite3.Connection) -> int:
 
     Returns the number of rows inserted.
     """
-    msg_count = conn.execute(
-        "SELECT COUNT(*) FROM messages WHERE is_deleted = 0"
-    ).fetchone()[0]
+    msg_count = conn.execute("SELECT COUNT(*) FROM messages WHERE is_deleted = 0").fetchone()[0]
     fts_count = conn.execute("SELECT COUNT(*) FROM messages_fts").fetchone()[0]
 
     if msg_count == 0 or fts_count >= msg_count:

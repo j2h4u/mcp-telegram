@@ -47,46 +47,25 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-_SELECT_MESSAGE_TEXT_SQL = (
-    "SELECT text FROM messages WHERE dialog_id=? AND message_id=?"
-)
+_SELECT_MESSAGE_TEXT_SQL = "SELECT text FROM messages WHERE dialog_id=? AND message_id=?"
 
-_NEXT_VERSION_SQL = (
-    "SELECT COALESCE(MAX(version), 0) + 1 FROM message_versions "
-    "WHERE dialog_id=? AND message_id=?"
-)
+_NEXT_VERSION_SQL = "SELECT COALESCE(MAX(version), 0) + 1 FROM message_versions WHERE dialog_id=? AND message_id=?"
 
 _INSERT_VERSION_SQL = (
-    "INSERT INTO message_versions "
-    "(dialog_id, message_id, version, old_text, edit_date) "
-    "VALUES (?, ?, ?, ?, ?)"
+    "INSERT INTO message_versions (dialog_id, message_id, version, old_text, edit_date) VALUES (?, ?, ?, ?, ?)"
 )
 
-_UPDATE_MESSAGE_TEXT_SQL = (
-    "UPDATE messages SET text=? WHERE dialog_id=? AND message_id=?"
-)
+_UPDATE_MESSAGE_TEXT_SQL = "UPDATE messages SET text=? WHERE dialog_id=? AND message_id=?"
 
-_MARK_DELETED_SQL = (
-    "UPDATE messages SET is_deleted=1, deleted_at=? "
-    "WHERE dialog_id=? AND message_id=? AND is_deleted=0"
-)
+_MARK_DELETED_SQL = "UPDATE messages SET is_deleted=1, deleted_at=? WHERE dialog_id=? AND message_id=? AND is_deleted=0"
 
-_UPDATE_LAST_EVENT_SQL = (
-    "UPDATE synced_dialogs SET last_event_at=? WHERE dialog_id=?"
-)
+_UPDATE_LAST_EVENT_SQL = "UPDATE synced_dialogs SET last_event_at=? WHERE dialog_id=?"
 
-_SELECT_SYNCED_DIALOGS_SQL = (
-    "SELECT dialog_id FROM synced_dialogs WHERE status != 'access_lost'"
-)
+_SELECT_SYNCED_DIALOGS_SQL = "SELECT dialog_id FROM synced_dialogs WHERE status != 'access_lost'"
 
-_SELECT_SYNCED_ONLY_SQL = (
-    "SELECT dialog_id FROM synced_dialogs WHERE status = 'synced'"
-)
+_SELECT_SYNCED_ONLY_SQL = "SELECT dialog_id FROM synced_dialogs WHERE status = 'synced'"
 
-_SELECT_UNDELETED_MESSAGES_SQL = (
-    "SELECT message_id FROM messages "
-    "WHERE dialog_id=? AND is_deleted=0 AND sent_at < ?"
-)
+_SELECT_UNDELETED_MESSAGES_SQL = "SELECT message_id FROM messages WHERE dialog_id=? AND is_deleted=0 AND sent_at < ?"
 
 
 # ---------------------------------------------------------------------------
@@ -202,7 +181,14 @@ class EventHandlerManager:
             entity_type_str = "Bot" if getattr(sender, "bot", False) else "User"
             self._conn.execute(
                 UPSERT_ENTITY_SQL,
-                (dialog_id, entity_type_str, name, getattr(sender, "username", None), latinize(name) if name else None, int(time.time())),
+                (
+                    dialog_id,
+                    entity_type_str,
+                    name,
+                    getattr(sender, "username", None),
+                    latinize(name) if name else None,
+                    int(time.time()),
+                ),
             )
             self._conn.commit()
             logger.info("dm_auto_enroll_entity dialog_id=%d name=%r", dialog_id, name)
@@ -268,9 +254,7 @@ class EventHandlerManager:
             now = int(time.time())
 
             with self._conn:
-                existing = self._conn.execute(
-                    _SELECT_MESSAGE_TEXT_SQL, (dialog_id, message_id)
-                ).fetchone()
+                existing = self._conn.execute(_SELECT_MESSAGE_TEXT_SQL, (dialog_id, message_id)).fetchone()
 
                 if existing is None:
                     # Message not yet in sync.db: insert with current text;
@@ -280,7 +264,8 @@ class EventHandlerManager:
                     self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
                     logger.info(
                         "event_edit_new dialog_id=%d message_id=%d (not in sync.db, inserted)",
-                        dialog_id, message_id,
+                        dialog_id,
+                        message_id,
                     )
                     return
 
@@ -298,18 +283,16 @@ class EventHandlerManager:
                         self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
                         logger.info(
                             "event_edit_reactions dialog_id=%d message_id=%d count=%d",
-                            dialog_id, message_id, len(rows),
+                            dialog_id,
+                            message_id,
+                            len(rows),
                         )
                     return
 
                 edit_date_raw = getattr(msg, "edit_date", None)
-                edit_date_unix = (
-                    int(edit_date_raw.timestamp()) if edit_date_raw is not None else now
-                )
+                edit_date_unix = int(edit_date_raw.timestamp()) if edit_date_raw is not None else now
 
-                next_ver = self._conn.execute(
-                    _NEXT_VERSION_SQL, (dialog_id, message_id)
-                ).fetchone()[0]
+                next_ver = self._conn.execute(_NEXT_VERSION_SQL, (dialog_id, message_id)).fetchone()[0]
 
                 self._conn.execute(
                     _INSERT_VERSION_SQL,
@@ -323,7 +306,9 @@ class EventHandlerManager:
 
             logger.info(
                 "event_edit dialog_id=%d message_id=%d version=%d",
-                dialog_id, message_id, next_ver,
+                dialog_id,
+                message_id,
+                next_ver,
             )
         except Exception:
             logger.exception("event_edit_failed dialog_id=%s", dialog_id)
@@ -356,9 +341,7 @@ class EventHandlerManager:
                     self._conn.execute(_MARK_DELETED_SQL, (now, dialog_id, msg_id))
                 self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
 
-            logger.info(
-                "event_delete dialog_id=%d count=%d", dialog_id, len(event.deleted_ids)
-            )
+            logger.info("event_delete dialog_id=%d count=%d", dialog_id, len(event.deleted_ids))
         except Exception:
             logger.exception("event_delete_failed dialog_id=%s", dialog_id)
 
@@ -392,16 +375,15 @@ class EventHandlerManager:
         try:
             now = int(time.time())
             with self._conn:
-                rowcount = apply_read_cursor(
-                    self._conn, dialog_id, "inbox", event.max_id
-                )
+                rowcount = apply_read_cursor(self._conn, dialog_id, "inbox", event.max_id)
                 self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
             if rowcount > 0:
                 logger.info("event_read dialog_id=%d max_id=%d", dialog_id, event.max_id)
             else:
                 logger.warning(
                     "event_read_no_row dialog_id=%d max_id=%d — UPDATE matched 0 rows",
-                    dialog_id, event.max_id,
+                    dialog_id,
+                    event.max_id,
                 )
         except Exception:
             logger.exception("event_read_failed dialog_id=%s", dialog_id)
@@ -455,7 +437,8 @@ class EventHandlerManager:
         if dialog_id not in self._synced_dialog_ids:
             logger.debug(
                 "event_outbox_read_unsynced dialog_id=%d max_id=%s",
-                dialog_id, getattr(event, "max_id", "?"),
+                dialog_id,
+                getattr(event, "max_id", "?"),
             )
             return
 
@@ -466,26 +449,24 @@ class EventHandlerManager:
         try:
             now = int(time.time())
             with self._conn:
-                rowcount = apply_read_cursor(
-                    self._conn, dialog_id, "outbox", max_id
-                )
+                rowcount = apply_read_cursor(self._conn, dialog_id, "outbox", max_id)
                 self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
             if rowcount > 0:
-                logger.info(
-                    "event_outbox_read dialog_id=%d max_id=%d", dialog_id, max_id
-                )
+                logger.info("event_outbox_read dialog_id=%d max_id=%d", dialog_id, max_id)
             else:
                 logger.warning(
-                    "event_outbox_read_no_row dialog_id=%d max_id=%d — "
-                    "UPDATE matched 0 rows",
-                    dialog_id, max_id,
+                    "event_outbox_read_no_row dialog_id=%d max_id=%d — UPDATE matched 0 rows",
+                    dialog_id,
+                    max_id,
                 )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             logger.error(
                 "event_outbox_read_failed dialog_id=%s max_id=%s error=%r",
-                dialog_id, max_id, exc,
+                dialog_id,
+                max_id,
+                exc,
             )
 
     async def on_raw_reaction_update(self, update: Any) -> None:
@@ -517,7 +498,8 @@ class EventHandlerManager:
         if dialog_id not in self._synced_dialog_ids:
             logger.debug(
                 "raw_reaction_update_skipped_unsynced dialog_id=%d message_id=%d",
-                dialog_id, msg_id,
+                dialog_id,
+                msg_id,
             )
             return
 
@@ -527,13 +509,16 @@ class EventHandlerManager:
             wait = getattr(exc, "seconds", 0)
             logger.warning(
                 "raw_reaction_floodwait dialog_id=%d message_id=%d seconds=%d",
-                dialog_id, msg_id, wait,
+                dialog_id,
+                msg_id,
+                wait,
             )
             return
         except Exception:
             logger.exception(
                 "event_raw_reaction_failed dialog_id=%d message_id=%d",
-                dialog_id, msg_id,
+                dialog_id,
+                msg_id,
             )
             return
 
@@ -541,7 +526,8 @@ class EventHandlerManager:
         if msg is None:
             logger.debug(
                 "raw_reaction_update_missing_message dialog_id=%d message_id=%d",
-                dialog_id, msg_id,
+                dialog_id,
+                msg_id,
             )
             return
 
@@ -553,12 +539,15 @@ class EventHandlerManager:
                 self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
             logger.info(
                 "event_raw_reaction dialog_id=%d message_id=%d count=%d",
-                dialog_id, msg_id, len(rows),
+                dialog_id,
+                msg_id,
+                len(rows),
             )
         except Exception:
             logger.exception(
                 "event_raw_reaction_apply_failed dialog_id=%d message_id=%d",
-                dialog_id, msg_id,
+                dialog_id,
+                msg_id,
             )
 
     # ------------------------------------------------------------------
@@ -581,10 +570,7 @@ class EventHandlerManager:
         scan_started_at = int(time.time())
         total_marked = 0
 
-        dialog_ids = [
-            int(row[0])
-            for row in self._conn.execute(_SELECT_SYNCED_ONLY_SQL).fetchall()
-        ]
+        dialog_ids = [int(row[0]) for row in self._conn.execute(_SELECT_SYNCED_ONLY_SQL).fetchall()]
 
         for dialog_id in dialog_ids:
             try:
@@ -605,17 +591,16 @@ class EventHandlerManager:
 
                     now = int(time.time())
                     with self._conn:  # atomic per-dialog batch
-                        for queried_id, returned_msg in zip(batch, results):
+                        for queried_id, returned_msg in zip(batch, results, strict=False):
                             if returned_msg is None:
-                                self._conn.execute(
-                                    _MARK_DELETED_SQL, (now, dialog_id, queried_id)
-                                )
+                                self._conn.execute(_MARK_DELETED_SQL, (now, dialog_id, queried_id))
                                 total_marked += 1
             except Exception:
                 logger.warning(
-                    "dm_gap_scan_dialog_failed dialog_id=%d", dialog_id, exc_info=True,
+                    "dm_gap_scan_dialog_failed dialog_id=%d",
+                    dialog_id,
+                    exc_info=True,
                 )
 
         logger.info("dm_gap_scan marked_deleted=%d", total_marked)
         return total_marked
-

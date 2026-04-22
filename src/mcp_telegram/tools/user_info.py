@@ -1,4 +1,3 @@
-
 import phonenumbers
 from pydantic import Field
 
@@ -70,17 +69,13 @@ async def get_user_info(args: GetUserInfo) -> ToolResult:
         return ToolResult(content=_text_response(_daemon_not_running_text()))
 
     if not resolve_response.get("ok"):
-        return ToolResult(content=_text_response(
-            user_not_found_text(args.user, retry_tool="GetUserInfo")
-        ))
+        return ToolResult(content=_text_response(user_not_found_text(args.user, retry_tool="GetUserInfo")))
 
     resolve_data = resolve_response.get("data", {})
     resolve_status = resolve_data.get("result", "not_found")
 
     if resolve_status == "not_found":
-        return ToolResult(content=_text_response(
-            user_not_found_text(args.user, retry_tool="GetUserInfo")
-        ))
+        return ToolResult(content=_text_response(user_not_found_text(args.user, retry_tool="GetUserInfo")))
 
     if resolve_status == "candidates":
         matches = resolve_data.get("matches", [])
@@ -88,15 +83,17 @@ async def get_user_info(args: GetUserInfo) -> ToolResult:
         for match in matches:
             line = f'id={match["entity_id"]} name="{match["display_name"]}" score={match["score"]}'
             if match.get("username"):
-                line += f' @{match["username"]}'
+                line += f" @{match['username']}"
             if match.get("entity_type"):
-                line += f' [{match["entity_type"]}]'
+                line += f" [{match['entity_type']}]"
             if match.get("disambiguation_hint"):
                 line += f'  hint="{match["disambiguation_hint"]}"'
             match_lines.append(line)
-        return ToolResult(content=_text_response(
-            ambiguous_user_text(args.user, match_lines, retry_tool="GetUserInfo"),
-        ))
+        return ToolResult(
+            content=_text_response(
+                ambiguous_user_text(args.user, match_lines, retry_tool="GetUserInfo"),
+            )
+        )
 
     entity_id: int = resolve_data["entity_id"]
     display_name: str = resolve_data["display_name"]
@@ -110,9 +107,7 @@ async def get_user_info(args: GetUserInfo) -> ToolResult:
     if not response.get("ok"):
         error_code = response.get("error", "")
         if error_code == "user_not_found":
-            return ToolResult(content=_text_response(
-                fetch_user_info_error_text(args.user, "user not found")
-            ))
+            return ToolResult(content=_text_response(fetch_user_info_error_text(args.user, "user not found")))
         error_msg = response.get("message", "Request failed.")
         return ToolResult(content=_text_response(f"Error: {error_msg}"))
 
@@ -147,20 +142,19 @@ async def get_user_info(args: GetUserInfo) -> ToolResult:
 
     # Flags — only show true ones to keep output compact
     flags = [
-        label for label, val in [
+        label
+        for label, val in [
             ("verified", data.get("verified")),
             ("premium", data.get("premium")),
             ("bot", data.get("bot")),
             ("scam", data.get("scam")),
             ("fake", data.get("fake")),
             ("restricted", data.get("restricted")),
-        ] if val
+        ]
+        if val
     ]
 
-    chat_lines = [
-        f"  id={chat['id']} type={chat['type']} name='{chat['name']}'"
-        for chat in common_chats
-    ]
+    chat_lines = [f"  id={chat['id']} type={chat['type']} name='{chat['name']}'" for chat in common_chats]
     chats_text = "\n".join(chat_lines) if chat_lines else "  (none)"
 
     lines: list[str] = [f'[resolved: "{display_name}"]']
@@ -200,11 +194,16 @@ async def get_user_info(args: GetUserInfo) -> ToolResult:
     if about:
         lines.append(f"bio: {about}")
     if birthday:
-        bday_parts = list(filter(None, [
-            str(birthday.get("day")) if birthday.get("day") else None,
-            str(birthday.get("month")) if birthday.get("month") else None,
-            str(birthday.get("year")) if birthday.get("year") else None,
-        ]))
+        bday_parts = list(
+            filter(
+                None,
+                [
+                    str(birthday.get("day")) if birthday.get("day") else None,
+                    str(birthday.get("month")) if birthday.get("month") else None,
+                    str(birthday.get("year")) if birthday.get("year") else None,
+                ],
+            )
+        )
         lines.append(f"birthday: {'/'.join(bday_parts)}")
     if personal_channel_id:
         lines.append(f"personal_channel_id={personal_channel_id}")
@@ -226,9 +225,7 @@ async def get_user_info(args: GetUserInfo) -> ToolResult:
         lines.append(f"forwards_as: {private_forward_name}")
     if restriction_reason:
         for rr in restriction_reason:
-            lines.append(
-                f"restriction: [{rr.get('platform')}] {rr.get('reason')} — {rr.get('text')}"
-            )
+            lines.append(f"restriction: [{rr.get('platform')}] {rr.get('reason')} — {rr.get('text')}")
 
     # Bot info (only present when bot=True)
     if bot_info:
@@ -241,10 +238,15 @@ async def get_user_info(args: GetUserInfo) -> ToolResult:
 
     # Business profile
     if business_intro:
-        parts = list(filter(None, [
-            business_intro.get("title"),
-            business_intro.get("description"),
-        ]))
+        parts = list(
+            filter(
+                None,
+                [
+                    business_intro.get("title"),
+                    business_intro.get("description"),
+                ],
+            )
+        )
         lines.append("business_intro: " + " / ".join(parts))
     if business_location:
         addr = business_location.get("address")

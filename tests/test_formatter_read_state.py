@@ -11,11 +11,11 @@ Covers:
 Markers are keyed by `message_id` (NOT page-render order) — verified by a
 descending-render-order test (codex MEDIUM).
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
-
+from datetime import UTC, datetime
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -60,7 +60,7 @@ class MockMsg:
 
 
 def _dt(h: int, m: int = 0, *, y: int = 2026, mo: int = 4, d: int = 21) -> datetime:
-    return datetime(y, mo, d, h, m, 0, tzinfo=timezone.utc)
+    return datetime(y, mo, d, h, m, 0, tzinfo=UTC)
 
 
 def _unix(h: int, m: int = 0, *, y: int = 2026, mo: int = 4, d: int = 21) -> int:
@@ -74,10 +74,11 @@ def _unix(h: int, m: int = 0, *, y: int = 2026, mo: int = 4, d: int = 21) -> int
 
 def test_readstate_typeddict_exports() -> None:
     """models.py exports CursorState Literal + ReadState TypedDict."""
-    from mcp_telegram.models import CursorState, ReadState  # noqa: F401
-
     # Literal alias: three allowed values
     import typing
+
+    from mcp_telegram.models import CursorState, ReadState
+
     args = typing.get_args(CursorState)
     assert set(args) == {"populated", "null", "all_read"}
 
@@ -109,9 +110,7 @@ def test_header_collapsed_when_both_zero_and_populated() -> None:
     """AC-5: both sides populated AND both counts==0 → single '[read-state: all caught up]'."""
     from mcp_telegram.formatter import _render_read_state_header
 
-    lines = _render_read_state_header(
-        _collapsed_read_state(), "User", now_unix=_unix(12, 0)
-    )
+    lines = _render_read_state_header(_collapsed_read_state(), "User", now_unix=_unix(12, 0))
     assert lines == ["[read-state: all caught up]"]
 
 
@@ -219,9 +218,7 @@ def test_header_omitted_for_non_dm_dialog_type() -> None:
     from mcp_telegram.formatter import _render_read_state_header
 
     for dt in ["Channel", "Group", "Forum", "Bot", "Chat"]:
-        lines = _render_read_state_header(
-            _collapsed_read_state(), dt, now_unix=_unix(12, 0)
-        )
+        lines = _render_read_state_header(_collapsed_read_state(), dt, now_unix=_unix(12, 0))
         assert lines == [], f"non-DM dialog_type={dt} produced: {lines!r}"
 
 
@@ -492,9 +489,7 @@ def test_format_messages_emits_header_when_dm() -> None:
 
     msgs = [MockMsg(id=1, date=_dt(12, 0), message="hi", out=0)]
     rs = _collapsed_read_state()
-    result = format_messages(
-        msgs, reply_map={}, read_state=rs, dialog_type="User", now_unix=_unix(12, 0)
-    )
+    result = format_messages(msgs, reply_map={}, read_state=rs, dialog_type="User", now_unix=_unix(12, 0))
     assert result.splitlines()[0] == "[read-state: all caught up]"
 
 
@@ -504,9 +499,7 @@ def test_format_messages_no_header_when_non_dm() -> None:
 
     msgs = [MockMsg(id=1, date=_dt(12, 0), message="hi", out=0)]
     rs = _collapsed_read_state()
-    result = format_messages(
-        msgs, reply_map={}, read_state=rs, dialog_type="Channel", now_unix=_unix(12, 0)
-    )
+    result = format_messages(msgs, reply_map={}, read_state=rs, dialog_type="Channel", now_unix=_unix(12, 0))
     for banned in ["[read-state:", "[inbox:", "[outbox:"]:
         assert banned not in result, f"non-DM output contained {banned!r}: {result!r}"
 
@@ -518,9 +511,7 @@ def test_format_messages_backward_compat_without_kwargs() -> None:
     msgs = [MockMsg(id=1, date=_dt(14, 30), message="hi there")]
     baseline = format_messages(msgs, reply_map={})
     # Also callable with read_state=None, dialog_type=None → identical
-    with_none = format_messages(
-        msgs, reply_map={}, read_state=None, dialog_type=None
-    )
+    with_none = format_messages(msgs, reply_map={}, read_state=None, dialog_type=None)
     assert baseline == with_none
     assert "[read-state:" not in baseline
     assert "[inbox:" not in baseline
@@ -541,9 +532,7 @@ def test_format_messages_emits_inline_marker_trailing() -> None:
         "outbox_unread_count": 0,
         "outbox_cursor_state": "populated",
     }
-    result = format_messages(
-        msgs, reply_map={}, read_state=rs, dialog_type="User", now_unix=_unix(12, 10)
-    )
+    result = format_messages(msgs, reply_map={}, read_state=rs, dialog_type="User", now_unix=_unix(12, 10))
     # Msg 1 line should end with "[I read up to here]"
     lines = result.splitlines()
     boundary_line = next(l for l in lines if "oldest" in l)
@@ -556,7 +545,7 @@ def test_marker_trails_after_existing_edited_metadata() -> None:
     """D-06: marker goes AFTER [edited HH:mm]."""
     from mcp_telegram.formatter import format_messages
 
-    edit_dt = datetime(2026, 4, 21, 12, 30, tzinfo=timezone.utc)
+    edit_dt = datetime(2026, 4, 21, 12, 30, tzinfo=UTC)
     msg = MockMsg(id=1, date=_dt(12, 0), message="hi", out=0, edit_date=edit_dt)
     rs = {
         "inbox_unread_count": 0,
@@ -565,9 +554,7 @@ def test_marker_trails_after_existing_edited_metadata() -> None:
         "outbox_unread_count": 0,
         "outbox_cursor_state": "populated",
     }
-    result = format_messages(
-        [msg], reply_map={}, read_state=rs, dialog_type="User", now_unix=_unix(13, 0)
-    )
+    result = format_messages([msg], reply_map={}, read_state=rs, dialog_type="User", now_unix=_unix(13, 0))
     line = [l for l in result.splitlines() if "hi" in l][0]
     assert "[edited 12:30]" in line
     assert line.endswith("[I read up to here]")

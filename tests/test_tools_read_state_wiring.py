@@ -5,10 +5,11 @@ These tests verify that tools/reading.py and tools/unread.py correctly extract
 dicts and thread them into the formatters. Rendered-output assertions where
 possible (HIGH-1 + HIGH-3 resolution).
 """
+
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -22,7 +23,6 @@ from mcp_telegram.tools.reading import (
     search_messages,
 )
 from mcp_telegram.tools.unread import ListUnreadMessages, list_unread_messages
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -259,9 +259,7 @@ def test_format_search_results_prepends_per_dialog_header_block() -> None:
         111: _split_rs_inbox_unread(),
         222: _collapsed_rs(),
     }
-    out = _format_search_results(
-        rows, "hi", global_mode=True, read_state_per_dialog=rs_map
-    )
+    out = _format_search_results(rows, "hi", global_mode=True, read_state_per_dialog=rs_map)
     # Both dialogs' headers must appear
     assert "[inbox: 2 unread from peer" in out
     assert "[read-state: all caught up]" in out
@@ -280,9 +278,7 @@ def test_format_search_results_no_inline_markers_on_snippet_lines() -> None:
         _dm_row(message_id=10, dialog_id=111, dialog_name="Alice", text="hit two"),
     ]
     rs_map = {111: _split_rs_inbox_unread()}
-    out = _format_search_results(
-        rows, "hit", global_mode=True, read_state_per_dialog=rs_map
-    )
+    out = _format_search_results(rows, "hit", global_mode=True, read_state_per_dialog=rs_map)
     # Locate the snippet region (after the header block). Then scan for markers.
     snippet_start = out.find("(msg_id:")
     assert snippet_start >= 0
@@ -304,9 +300,7 @@ def test_format_search_results_skips_non_dm_in_header_block() -> None:
     ]
     # Only DM 111 is in the map — non-DM absent per daemon contract.
     rs_map = {111: _collapsed_rs()}
-    out = _format_search_results(
-        rows, "hello", global_mode=True, read_state_per_dialog=rs_map
-    )
+    out = _format_search_results(rows, "hello", global_mode=True, read_state_per_dialog=rs_map)
     # Exactly one header line (for DM 111)
     assert out.count("[read-state: all caught up]") == 1
     # Channel X has no header

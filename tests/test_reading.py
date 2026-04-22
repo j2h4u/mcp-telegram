@@ -1,4 +1,5 @@
 """Tests for tools/reading.py helpers."""
+
 from __future__ import annotations
 
 from mcp_telegram.tools.reading import _format_search_results
@@ -45,21 +46,25 @@ def test_search_snippet_renders_unknown_user_with_id_when_name_missing():
 
 def test_search_snippet_renders_system_when_is_service():
     """Phase 39.1-02: 'System' requires is_service=1 (not just sender_id=None)."""
-    out = _format_search_results(
-        [_row(sender_id=None, sender_first_name=None, is_service=1)], "hello"
-    )
+    out = _format_search_results([_row(sender_id=None, sender_first_name=None, is_service=1)], "hello")
     assert " System (msg_id:1)" in out
 
 
 def test_search_snippet_dm_outgoing_renders_self_label():
     """DM outgoing (out=1, dialog_id>0, is_service=0) renders SELF_SENDER_LABEL."""
     from mcp_telegram.formatter import SELF_SENDER_LABEL
+
     out = _format_search_results(
-        [_row(
-            sender_id=None, sender_first_name=None,
-            out=1, dialog_id=268071163, is_service=0,
-            effective_sender_id=99999,
-        )],
+        [
+            _row(
+                sender_id=None,
+                sender_first_name=None,
+                out=1,
+                dialog_id=268071163,
+                is_service=0,
+                effective_sender_id=99999,
+            )
+        ],
         "hello",
     )
     assert f" {SELF_SENDER_LABEL} (msg_id:1)" in out
@@ -67,11 +72,16 @@ def test_search_snippet_dm_outgoing_renders_self_label():
 
 def test_search_snippet_dm_incoming_uses_first_name():
     out = _format_search_results(
-        [_row(
-            sender_id=None, sender_first_name="Alice",
-            out=0, dialog_id=268071163, is_service=0,
-            effective_sender_id=268071163,
-        )],
+        [
+            _row(
+                sender_id=None,
+                sender_first_name="Alice",
+                out=0,
+                dialog_id=268071163,
+                is_service=0,
+                effective_sender_id=268071163,
+            )
+        ],
         "hello",
     )
     assert " Alice (msg_id:1)" in out
@@ -79,11 +89,16 @@ def test_search_snippet_dm_incoming_uses_first_name():
 
 def test_search_snippet_dm_incoming_unknown_uses_effective_sender_id():
     out = _format_search_results(
-        [_row(
-            sender_id=None, sender_first_name=None,
-            out=0, dialog_id=268071163, is_service=0,
-            effective_sender_id=268071163,
-        )],
+        [
+            _row(
+                sender_id=None,
+                sender_first_name=None,
+                out=0,
+                dialog_id=268071163,
+                is_service=0,
+                effective_sender_id=268071163,
+            )
+        ],
         "hello",
     )
     assert " (unknown user 268071163) (msg_id:1)" in out
@@ -92,11 +107,16 @@ def test_search_snippet_dm_incoming_unknown_uses_effective_sender_id():
 def test_search_snippet_group_unknown_renders_unknown_user():
     """Group unknown sender (no id anywhere) → '(unknown user)' no trailing id."""
     out = _format_search_results(
-        [_row(
-            sender_id=None, sender_first_name=None,
-            out=0, dialog_id=-100123, is_service=0,
-            effective_sender_id=None,
-        )],
+        [
+            _row(
+                sender_id=None,
+                sender_first_name=None,
+                out=0,
+                dialog_id=-100123,
+                is_service=0,
+                effective_sender_id=None,
+            )
+        ],
         "hello",
     )
     assert " (unknown user) (msg_id:1)" in out
@@ -104,5 +124,6 @@ def test_search_snippet_group_unknown_renders_unknown_user():
 
 def test_search_snippet_no_raw_question_mark_sender_fallback_in_source():
     import pathlib
+
     src = pathlib.Path("src/mcp_telegram/tools/reading.py").read_text()
     assert 'row.get("sender_first_name") or "?"' not in src

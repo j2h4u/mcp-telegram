@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import datetime, timezone, timedelta
+from dataclasses import dataclass
+from datetime import UTC, datetime
 
 
 @dataclass
@@ -13,7 +13,7 @@ class MockSender:
 @dataclass
 class MockMessage:
     id: int
-    date: datetime          # must be timezone-aware (UTC)
+    date: datetime  # must be timezone-aware (UTC)
     message: str = ""
     sender: MockSender | None = None
     sender_id: int | None = None
@@ -54,7 +54,7 @@ def test_basic_format() -> None:
     """Single message → 'HH:mm FirstName: text' plus a date header."""
     from mcp_telegram.formatter import format_messages
 
-    dt = datetime(2024, 6, 15, 14, 30, 0, tzinfo=timezone.utc)
+    dt = datetime(2024, 6, 15, 14, 30, 0, tzinfo=UTC)
     msg = _make_msg(1, dt, text="hi there", first_name="Bob")
     # Telethon returns newest-first; single message is both newest and oldest
     result = format_messages([msg], {})
@@ -69,8 +69,8 @@ def test_date_header() -> None:
     """Two messages on different calendar days → date header between them."""
     from mcp_telegram.formatter import format_messages
 
-    dt1 = datetime(2024, 6, 15, 23, 0, 0, tzinfo=timezone.utc)
-    dt2 = datetime(2024, 6, 16, 1, 0, 0, tzinfo=timezone.utc)  # next day, 2h later
+    dt1 = datetime(2024, 6, 15, 23, 0, 0, tzinfo=UTC)
+    dt2 = datetime(2024, 6, 16, 1, 0, 0, tzinfo=UTC)  # next day, 2h later
     # newest-first: dt2 first, dt1 second
     msgs = [
         _make_msg(2, dt2, text="good morning", first_name="Alice"),
@@ -98,8 +98,8 @@ def test_session_break() -> None:
     """Two messages 90 minutes apart → session-break line '--- N мин ---'."""
     from mcp_telegram.formatter import format_messages
 
-    dt1 = datetime(2024, 6, 15, 10, 0, 0, tzinfo=timezone.utc)
-    dt2 = datetime(2024, 6, 15, 11, 30, 0, tzinfo=timezone.utc)  # 90 min later
+    dt1 = datetime(2024, 6, 15, 10, 0, 0, tzinfo=UTC)
+    dt2 = datetime(2024, 6, 15, 11, 30, 0, tzinfo=UTC)  # 90 min later
     # newest-first
     msgs = [
         _make_msg(2, dt2, text="later", first_name="Alice"),
@@ -118,8 +118,8 @@ def test_no_session_break_within_60_min() -> None:
     """Two messages 30 minutes apart → no session-break line."""
     from mcp_telegram.formatter import format_messages
 
-    dt1 = datetime(2024, 6, 15, 10, 0, 0, tzinfo=timezone.utc)
-    dt2 = datetime(2024, 6, 15, 10, 30, 0, tzinfo=timezone.utc)  # 30 min later
+    dt1 = datetime(2024, 6, 15, 10, 0, 0, tzinfo=UTC)
+    dt2 = datetime(2024, 6, 15, 10, 30, 0, tzinfo=UTC)  # 30 min later
     # newest-first
     msgs = [
         _make_msg(2, dt2, text="second", first_name="Alice"),
@@ -128,9 +128,7 @@ def test_no_session_break_within_60_min() -> None:
     result = format_messages(msgs, {})
     lines = result.strip().splitlines()
     break_lines = [l for l in lines if "мин" in l and l.startswith("---")]
-    assert not break_lines, (
-        f"Unexpected session-break line for 30-min gap. Lines: {lines}"
-    )
+    assert not break_lines, f"Unexpected session-break line for 30-min gap. Lines: {lines}"
 
 
 def test_empty_message_list() -> None:
@@ -145,9 +143,9 @@ def test_newest_first_ordering() -> None:
     """Messages passed newest-first are displayed oldest-first in output."""
     from mcp_telegram.formatter import format_messages
 
-    dt1 = datetime(2024, 6, 15, 9, 0, 0, tzinfo=timezone.utc)
-    dt2 = datetime(2024, 6, 15, 9, 5, 0, tzinfo=timezone.utc)   # 5 min later
-    dt3 = datetime(2024, 6, 15, 9, 10, 0, tzinfo=timezone.utc)  # 10 min from start
+    dt1 = datetime(2024, 6, 15, 9, 0, 0, tzinfo=UTC)
+    dt2 = datetime(2024, 6, 15, 9, 5, 0, tzinfo=UTC)  # 5 min later
+    dt3 = datetime(2024, 6, 15, 9, 10, 0, tzinfo=UTC)  # 10 min from start
     # newest-first order: dt3, dt2, dt1
     msgs = [
         _make_msg(3, dt3, text="third", first_name="Alice"),
@@ -159,16 +157,14 @@ def test_newest_first_ordering() -> None:
     pos_first = result.index("first")
     pos_second = result.index("second")
     pos_third = result.index("third")
-    assert pos_first < pos_second < pos_third, (
-        "Messages not displayed oldest-first"
-    )
+    assert pos_first < pos_second < pos_third, "Messages not displayed oldest-first"
 
 
 def test_unknown_sender() -> None:
     """Service message (is_service=1) renders as 'System' (Phase 39.1-02 contract)."""
     from mcp_telegram.formatter import format_messages
 
-    dt = datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+    dt = datetime(2024, 6, 15, 12, 0, 0, tzinfo=UTC)
     msg = MockMessage(id=1, date=dt, message="anonymous", sender=None, sender_id=None)
     # Phase 39.1-02: "System" now requires is_service=1 (not just sender_id=None).
     # MockMessage lacks is_service; set via direct attribute assignment.
@@ -181,7 +177,7 @@ def test_media_fallback() -> None:
     """Message with unknown media type shows '[медиа: ClassName]'."""
     from mcp_telegram.formatter import format_messages
 
-    dt = datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+    dt = datetime(2024, 6, 15, 12, 0, 0, tzinfo=UTC)
     msg = _make_msg(1, dt, text="", first_name="Carol", media=object())
     result = format_messages([msg], {})
     assert "[медиа:" in result, f"Expected '[медиа: ...]' for unknown media, got: {result!r}"
@@ -191,8 +187,8 @@ def test_reply_annotation() -> None:
     """Message with reply_to shows '[↑ SenderName HH:mm]' prefix."""
     from mcp_telegram.formatter import format_messages
 
-    dt_orig = datetime(2024, 6, 15, 9, 0, 0, tzinfo=timezone.utc)
-    dt_reply = datetime(2024, 6, 15, 9, 5, 0, tzinfo=timezone.utc)
+    dt_orig = datetime(2024, 6, 15, 9, 0, 0, tzinfo=UTC)
+    dt_reply = datetime(2024, 6, 15, 9, 5, 0, tzinfo=UTC)
     orig = _make_msg(1, dt_orig, text="original", first_name="Alice")
     reply_msg = _make_msg(2, dt_reply, text="reply text", first_name="Bob")
 
@@ -211,7 +207,7 @@ def test_reactions_display() -> None:
     """Message with reactions shows '[emoji×count: name]' when names provided."""
     from mcp_telegram.formatter import format_messages
 
-    dt = datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+    dt = datetime(2024, 6, 15, 12, 0, 0, tzinfo=UTC)
 
     @dataclass
     class FakeReaction:
@@ -226,10 +222,12 @@ def test_reactions_display() -> None:
     class FakeReactions:
         results: list
 
-    reactions = FakeReactions(results=[
-        FakeReactionCount(reaction=FakeReaction(emoticon="👍"), count=2),
-        FakeReactionCount(reaction=FakeReaction(emoticon="❤️"), count=1),
-    ])
+    reactions = FakeReactions(
+        results=[
+            FakeReactionCount(reaction=FakeReaction(emoticon="👍"), count=2),
+            FakeReactionCount(reaction=FakeReaction(emoticon="❤️"), count=1),
+        ]
+    )
     msg = _make_msg(1, dt, text="hello", first_name="Alice", reactions=reactions)
     reaction_names_map = {1: {"👍": ["Bob", "Carol"], "❤️": ["Dave"]}}
     result = format_messages([msg], {}, reaction_names_map=reaction_names_map)
@@ -240,7 +238,7 @@ def test_reactions_count_only() -> None:
     """Message with reactions shows count-only '[emoji×N]' when no names provided."""
     from mcp_telegram.formatter import format_messages
 
-    dt = datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+    dt = datetime(2024, 6, 15, 12, 0, 0, tzinfo=UTC)
 
     @dataclass
     class FakeReaction:
@@ -255,9 +253,11 @@ def test_reactions_count_only() -> None:
     class FakeReactions:
         results: list
 
-    reactions = FakeReactions(results=[
-        FakeReactionCount(reaction=FakeReaction(emoticon="🔥"), count=42),
-    ])
+    reactions = FakeReactions(
+        results=[
+            FakeReactionCount(reaction=FakeReaction(emoticon="🔥"), count=42),
+        ]
+    )
     msg = _make_msg(1, dt, text="hot", first_name="Alice", reactions=reactions)
     result = format_messages([msg], {})
     assert "[🔥×42]" in result, f"Expected count-only reactions, got: {result!r}"
@@ -272,12 +272,14 @@ def test_format_unread_grouped_single_chat() -> None:
     """Single chat formatted with header and messages."""
     from mcp_telegram.formatter import UnreadChatData, format_unread_messages_grouped
 
-    dt = datetime(2024, 6, 15, 14, 30, 0, tzinfo=timezone.utc)
+    dt = datetime(2024, 6, 15, 14, 30, 0, tzinfo=UTC)
     msg = _make_msg(1, dt, text="hello", first_name="Alice")
 
-    result = format_unread_messages_grouped([
-        UnreadChatData(chat_id=123, display_name="Alice", unread_count=1, messages=[msg], total_in_chat=1),
-    ])
+    result = format_unread_messages_grouped(
+        [
+            UnreadChatData(chat_id=123, display_name="Alice", unread_count=1, messages=[msg], total_in_chat=1),
+        ]
+    )
     assert "--- Alice (1 непрочитанных, id=123) ---" in result
     assert "hello" in result
 
@@ -286,12 +288,21 @@ def test_format_unread_grouped_with_mentions() -> None:
     """Chat with mentions shows mention count in header."""
     from mcp_telegram.formatter import UnreadChatData, format_unread_messages_grouped
 
-    dt = datetime(2024, 6, 15, 14, 30, 0, tzinfo=timezone.utc)
+    dt = datetime(2024, 6, 15, 14, 30, 0, tzinfo=UTC)
     msg = _make_msg(1, dt, text="@User hello", first_name="Bob")
 
-    result = format_unread_messages_grouped([
-        UnreadChatData(chat_id=456, display_name="Рабочий чат", unread_count=3, unread_mentions_count=2, messages=[msg], total_in_chat=3),
-    ])
+    result = format_unread_messages_grouped(
+        [
+            UnreadChatData(
+                chat_id=456,
+                display_name="Рабочий чат",
+                unread_count=3,
+                unread_mentions_count=2,
+                messages=[msg],
+                total_in_chat=3,
+            ),
+        ]
+    )
     assert "2 упоминания" in result or "2 упоминаний" in result
     assert "id=456" in result
 
@@ -300,12 +311,14 @@ def test_format_unread_grouped_trim_marker() -> None:
     """When messages < total_in_chat, shows '[и ещё N]' marker."""
     from mcp_telegram.formatter import UnreadChatData, format_unread_messages_grouped
 
-    dt = datetime(2024, 6, 15, 14, 30, 0, tzinfo=timezone.utc)
+    dt = datetime(2024, 6, 15, 14, 30, 0, tzinfo=UTC)
     msg = _make_msg(1, dt, text="msg1", first_name="Alice")
 
-    result = format_unread_messages_grouped([
-        UnreadChatData(chat_id=789, display_name="Big Chat", unread_count=10, messages=[msg], total_in_chat=10),
-    ])
+    result = format_unread_messages_grouped(
+        [
+            UnreadChatData(chat_id=789, display_name="Big Chat", unread_count=10, messages=[msg], total_in_chat=10),
+        ]
+    )
     assert "[и ещё 9]" in result
 
 
@@ -313,12 +326,21 @@ def test_format_unread_grouped_channel_no_messages() -> None:
     """Channel shows count only, no messages."""
     from mcp_telegram.formatter import UnreadChatData, format_unread_messages_grouped
 
-    dt = datetime(2024, 6, 15, 14, 30, 0, tzinfo=timezone.utc)
+    dt = datetime(2024, 6, 15, 14, 30, 0, tzinfo=UTC)
     msg = _make_msg(1, dt, text="news", first_name="NewsBot")
 
-    result = format_unread_messages_grouped([
-        UnreadChatData(chat_id=-1001234567890, display_name="TechNews", unread_count=47, messages=[msg], total_in_chat=47, is_channel=True),
-    ])
+    result = format_unread_messages_grouped(
+        [
+            UnreadChatData(
+                chat_id=-1001234567890,
+                display_name="TechNews",
+                unread_count=47,
+                messages=[msg],
+                total_in_chat=47,
+                is_channel=True,
+            ),
+        ]
+    )
     assert "TechNews (47 непрочитанных" in result
     assert "news" not in result
 
@@ -335,15 +357,17 @@ def test_format_unread_grouped_multiple_chats() -> None:
     """Multiple chats formatted separately."""
     from mcp_telegram.formatter import UnreadChatData, format_unread_messages_grouped
 
-    dt1 = datetime(2024, 6, 15, 14, 30, 0, tzinfo=timezone.utc)
-    dt2 = datetime(2024, 6, 15, 14, 40, 0, tzinfo=timezone.utc)
+    dt1 = datetime(2024, 6, 15, 14, 30, 0, tzinfo=UTC)
+    dt2 = datetime(2024, 6, 15, 14, 40, 0, tzinfo=UTC)
     msg1 = _make_msg(1, dt1, text="hi from alice", first_name="Alice")
     msg2 = _make_msg(2, dt2, text="hi from bob", first_name="Bob")
 
-    result = format_unread_messages_grouped([
-        UnreadChatData(chat_id=111, display_name="Alice", unread_count=2, messages=[msg1], total_in_chat=2),
-        UnreadChatData(chat_id=222, display_name="Bob", unread_count=1, messages=[msg2], total_in_chat=1),
-    ])
+    result = format_unread_messages_grouped(
+        [
+            UnreadChatData(chat_id=111, display_name="Alice", unread_count=2, messages=[msg1], total_in_chat=2),
+            UnreadChatData(chat_id=222, display_name="Bob", unread_count=1, messages=[msg2], total_in_chat=1),
+        ]
+    )
     assert "Alice" in result
     assert "Bob" in result
     assert "id=111" in result
@@ -361,7 +385,7 @@ def test_edited_marker_shown_when_edit_date_is_int() -> None:
     from mcp_telegram.formatter import format_messages
 
     # 1718464800 = 2024-06-15 15:20:00 UTC
-    dt = datetime(2024, 6, 15, 14, 30, 0, tzinfo=timezone.utc)
+    dt = datetime(2024, 6, 15, 14, 30, 0, tzinfo=UTC)
     msg = MockMessage(
         id=1,
         date=dt,
@@ -378,8 +402,8 @@ def test_edited_marker_shown_when_edit_date_is_datetime() -> None:
     """[edited HH:mm] appears when edit_date is a datetime (Telethon style)."""
     from mcp_telegram.formatter import format_messages
 
-    dt = datetime(2024, 6, 15, 14, 30, 0, tzinfo=timezone.utc)
-    edit_dt = datetime(2024, 6, 15, 14, 30, 0, tzinfo=timezone.utc)
+    dt = datetime(2024, 6, 15, 14, 30, 0, tzinfo=UTC)
+    edit_dt = datetime(2024, 6, 15, 14, 30, 0, tzinfo=UTC)
     msg = MockMessage(
         id=1,
         date=dt,
@@ -396,7 +420,7 @@ def test_edited_marker_absent_when_edit_date_none() -> None:
     """No [edited ...] marker when edit_date is absent or None."""
     from mcp_telegram.formatter import format_messages
 
-    dt = datetime(2024, 6, 15, 14, 30, 0, tzinfo=timezone.utc)
+    dt = datetime(2024, 6, 15, 14, 30, 0, tzinfo=UTC)
     msg = _make_msg(1, dt, text="no edit")
     result = format_messages([msg], {})
     assert "[edited" not in result, f"Unexpected '[edited' in output: {result!r}"
@@ -406,7 +430,7 @@ def test_edited_marker_before_reactions() -> None:
     """[edited HH:mm] appears before reactions bracket in the output line."""
     from mcp_telegram.formatter import format_messages
 
-    dt = datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+    dt = datetime(2024, 6, 15, 12, 0, 0, tzinfo=UTC)
 
     @dataclass
     class FakeReaction:
@@ -421,9 +445,11 @@ def test_edited_marker_before_reactions() -> None:
     class FakeReactions:
         results: list
 
-    reactions = FakeReactions(results=[
-        FakeReactionCount(reaction=FakeReaction(emoticon="👍"), count=2),
-    ])
+    reactions = FakeReactions(
+        results=[
+            FakeReactionCount(reaction=FakeReaction(emoticon="👍"), count=2),
+        ]
+    )
     msg = MockMessage(
         id=1,
         date=dt,
@@ -437,9 +463,7 @@ def test_edited_marker_before_reactions() -> None:
     result = format_messages([msg], {}, reaction_names_map=reaction_names_map)
     assert "[edited" in result, f"Expected '[edited' in output: {result!r}"
     assert "[👍" in result, f"Expected '[👍' in output: {result!r}"
-    assert result.index("[edited") < result.index("[👍"), (
-        f"Expected '[edited' to appear before '[👍' in: {result!r}"
-    )
+    assert result.index("[edited") < result.index("[👍"), f"Expected '[edited' to appear before '[👍' in: {result!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -482,54 +506,66 @@ def _rsn_msg(
 
 def test_resolve_sender_name_service_message_renders_system():
     from mcp_telegram.formatter import _resolve_sender_name
+
     # is_service=1 → "System" regardless of other fields
     assert _resolve_sender_name(_rsn_msg(sender_id=None, is_service=1)) == "System"
 
 
 def test_resolve_sender_name_service_message_ignores_first_name():
     from mcp_telegram.formatter import _resolve_sender_name
-    assert _resolve_sender_name(
-        _rsn_msg(sender_id=42, sender_first_name="Alice", is_service=1)
-    ) == "System"
+
+    assert _resolve_sender_name(_rsn_msg(sender_id=42, sender_first_name="Alice", is_service=1)) == "System"
 
 
 def test_resolve_sender_name_dm_outgoing_renders_self_label():
     """DM outgoing (out=1, dialog_id>0, is_service=0) → SELF_SENDER_LABEL."""
     from mcp_telegram.formatter import SELF_SENDER_LABEL, _resolve_sender_name
-    assert _resolve_sender_name(
-        _rsn_msg(sender_id=None, out=1, dialog_id=268071163, is_service=0)
-    ) == SELF_SENDER_LABEL
+
+    assert _resolve_sender_name(_rsn_msg(sender_id=None, out=1, dialog_id=268071163, is_service=0)) == SELF_SENDER_LABEL
     assert SELF_SENDER_LABEL == "[me]"
 
 
 def test_resolve_sender_name_dm_incoming_with_first_name():
     from mcp_telegram.formatter import _resolve_sender_name
-    assert _resolve_sender_name(
-        _rsn_msg(
-            sender_id=None, sender_first_name="Alice",
-            out=0, dialog_id=268071163, is_service=0,
-            effective_sender_id=268071163,
+
+    assert (
+        _resolve_sender_name(
+            _rsn_msg(
+                sender_id=None,
+                sender_first_name="Alice",
+                out=0,
+                dialog_id=268071163,
+                is_service=0,
+                effective_sender_id=268071163,
+            )
         )
-    ) == "Alice"
+        == "Alice"
+    )
 
 
 def test_resolve_sender_name_dm_incoming_unknown_renders_unknown_user_with_id():
     """DM incoming with no first_name → '(unknown user <effective_sender_id>)'."""
     from mcp_telegram.formatter import _resolve_sender_name
-    assert _resolve_sender_name(
-        _rsn_msg(
-            sender_id=None, out=0, dialog_id=268071163,
-            is_service=0, effective_sender_id=268071163,
+
+    assert (
+        _resolve_sender_name(
+            _rsn_msg(
+                sender_id=None,
+                out=0,
+                dialog_id=268071163,
+                is_service=0,
+                effective_sender_id=268071163,
+            )
         )
-    ) == "(unknown user 268071163)"
+        == "(unknown user 268071163)"
+    )
 
 
 def test_resolve_sender_name_group_unknown_sender_renders_unknown_user():
     """Group unknown sender (no id anywhere) → '(unknown user)'."""
     from mcp_telegram.formatter import _resolve_sender_name
-    assert _resolve_sender_name(
-        _rsn_msg(sender_id=None, out=0, dialog_id=-100123, is_service=0)
-    ) == "(unknown user)"
+
+    assert _resolve_sender_name(_rsn_msg(sender_id=None, out=0, dialog_id=-100123, is_service=0)) == "(unknown user)"
 
 
 # --- Legacy Phase 39 tests, migrated to Phase 39.1-02 contract ---
@@ -537,19 +573,23 @@ def test_resolve_sender_name_group_unknown_sender_renders_unknown_user():
 
 def test_resolve_sender_name_returns_first_name_when_present():
     from mcp_telegram.formatter import _resolve_sender_name
+
     assert _resolve_sender_name(_rsn_msg(sender_id=42, sender_first_name="Alice")) == "Alice"
 
 
 def test_resolve_sender_name_returns_unknown_user_with_id_when_sender_missing():
     from mcp_telegram.formatter import _resolve_sender_name
+
     assert _resolve_sender_name(_rsn_msg(sender_id=42)) == "(unknown user 42)"
 
 
 def test_resolve_sender_name_returns_unknown_user_with_id_when_first_name_none():
     from mcp_telegram.formatter import _resolve_sender_name
+
     assert _resolve_sender_name(_rsn_msg(sender_id=42, sender_first_name=None)) == "(unknown user 42)"
 
 
 def test_resolve_sender_name_returns_unknown_user_with_id_when_first_name_empty():
     from mcp_telegram.formatter import _resolve_sender_name
+
     assert _resolve_sender_name(_rsn_msg(sender_id=42, sender_first_name="")) == "(unknown user 42)"

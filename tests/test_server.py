@@ -146,6 +146,7 @@ def test_posture_secondary_tools_reflected_in_descriptions() -> None:
 def test_posture_covers_all_registered_tools() -> None:
     """Every registered tool must have a posture classification."""
     from mcp_telegram.tools import TOOL_REGISTRY
+
     for name in server.tool_by_name:
         assert name in TOOL_REGISTRY, f"{name} not in TOOL_REGISTRY"
         _cls, posture, _annotations = TOOL_REGISTRY[name]
@@ -155,6 +156,7 @@ def test_posture_covers_all_registered_tools() -> None:
 def test_posture_get_user_info_classified_as_primary() -> None:
     """GetUserInfo must be classified as primary, not helper."""
     from mcp_telegram.tools import TOOL_REGISTRY
+
     assert TOOL_REGISTRY["GetUserInfo"][1] == "primary", "GetUserInfo should be a primary user-task tool"
     tool = server.tool_by_name["GetUserInfo"]
     assert tool.description.startswith("[primary]"), "GetUserInfo missing [primary] prefix"
@@ -203,7 +205,9 @@ def test_helper_tools_remain_available_not_hidden() -> None:
         tool = server.tool_by_name[tool_name]
 
         # Must be marked as secondary in description
-        assert tool.description.startswith("[secondary/helper]"), f"{tool_name} description missing [secondary/helper] prefix"
+        assert tool.description.startswith("[secondary/helper]"), (
+            f"{tool_name} description missing [secondary/helper] prefix"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -223,19 +227,21 @@ def _make_mock_conn(list_messages_response: dict):
 @pytest.mark.asyncio
 async def test_list_messages_tool_archived_warning_with_coverage(monkeypatch):
     """ListMessages tool output includes archived warning with coverage pct."""
-    mock_conn = _make_mock_conn({
-        "ok": True,
-        "data": {
-            "messages": [],
-            "source": "sync_db",
-            "next_navigation": None,
-            "dialog_access": "archived",
-            "access_lost_at": 1704067200,
-            "last_synced_at": 1699990000,   # 2023-11-14
-            "last_event_at": 1699999000,
-            "sync_coverage_pct": 80,
-        },
-    })
+    mock_conn = _make_mock_conn(
+        {
+            "ok": True,
+            "data": {
+                "messages": [],
+                "source": "sync_db",
+                "next_navigation": None,
+                "dialog_access": "archived",
+                "access_lost_at": 1704067200,
+                "last_synced_at": 1699990000,  # 2023-11-14
+                "last_event_at": 1699999000,
+                "sync_coverage_pct": 80,
+            },
+        }
+    )
     monkeypatch.setattr("mcp_telegram.tools.reading.daemon_connection", lambda: mock_conn)
 
     result = await server.call_tool("ListMessages", {"exact_dialog_id": 123})
@@ -249,20 +255,22 @@ async def test_list_messages_tool_archived_warning_with_coverage(monkeypatch):
 @pytest.mark.asyncio
 async def test_list_messages_tool_archived_warning_unknown_coverage(monkeypatch):
     """ListMessages tool output shows 'N messages archived locally' when coverage unknown."""
-    mock_conn = _make_mock_conn({
-        "ok": True,
-        "data": {
-            "messages": [],
-            "source": "sync_db",
-            "next_navigation": None,
-            "dialog_access": "archived",
-            "access_lost_at": 1700000000,
-            "last_synced_at": None,
-            "last_event_at": 1699999000,
-            "sync_coverage_pct": None,
-            "archived_message_count": 150,
-        },
-    })
+    mock_conn = _make_mock_conn(
+        {
+            "ok": True,
+            "data": {
+                "messages": [],
+                "source": "sync_db",
+                "next_navigation": None,
+                "dialog_access": "archived",
+                "access_lost_at": 1700000000,
+                "last_synced_at": None,
+                "last_event_at": 1699999000,
+                "sync_coverage_pct": None,
+                "archived_message_count": 150,
+            },
+        }
+    )
     monkeypatch.setattr("mcp_telegram.tools.reading.daemon_connection", lambda: mock_conn)
 
     result = await server.call_tool("ListMessages", {"exact_dialog_id": 123})
@@ -274,19 +282,21 @@ async def test_list_messages_tool_archived_warning_unknown_coverage(monkeypatch)
 @pytest.mark.asyncio
 async def test_list_messages_tool_uses_last_synced_at_not_access_lost_at(monkeypatch):
     """Verify tool uses last_synced_at for the archive date, NOT access_lost_at."""
-    mock_conn = _make_mock_conn({
-        "ok": True,
-        "data": {
-            "messages": [],
-            "source": "sync_db",
-            "next_navigation": None,
-            "dialog_access": "archived",
-            "access_lost_at": 1704067200,   # 2024-01-01
-            "last_synced_at": 1699990000,   # 2023-11-14
-            "last_event_at": 1699999000,
-            "sync_coverage_pct": None,
-        },
-    })
+    mock_conn = _make_mock_conn(
+        {
+            "ok": True,
+            "data": {
+                "messages": [],
+                "source": "sync_db",
+                "next_navigation": None,
+                "dialog_access": "archived",
+                "access_lost_at": 1704067200,  # 2024-01-01
+                "last_synced_at": 1699990000,  # 2023-11-14
+                "last_event_at": 1699999000,
+                "sync_coverage_pct": None,
+            },
+        }
+    )
     monkeypatch.setattr("mcp_telegram.tools.reading.daemon_connection", lambda: mock_conn)
 
     result = await server.call_tool("ListMessages", {"exact_dialog_id": 123})
@@ -294,4 +304,3 @@ async def test_list_messages_tool_uses_last_synced_at_not_access_lost_at(monkeyp
     # Must show 2023-11-14 (last_synced_at), NOT 2024-01-01 (access_lost_at)
     assert "2023-11-14" in text
     assert "2024-01-01" not in text
-

@@ -11,12 +11,12 @@ if sys.platform != "win32":
     _soft, _hard = resource.getrlimit(resource.RLIMIT_AS)
     resource.setrlimit(resource.RLIMIT_AS, (_MAX_AS_BYTES, _hard))
 
-import pytest
+from datetime import UTC, datetime
 from pathlib import Path
-from datetime import datetime, timezone
-from unittest.mock import AsyncMock, MagicMock
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 from telethon.errors import RPCError
 
 
@@ -37,14 +37,10 @@ class _MockEntityCache:
                 updated_at INTEGER NOT NULL
             )
         """)
-        self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_entities_username ON entities(username)"
-        )
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_entities_username ON entities(username)")
         self._conn.commit()
 
-    def upsert(
-        self, entity_id: int, entity_type: str, name: str, username: str | None = None
-    ) -> None:
+    def upsert(self, entity_id: int, entity_type: str, name: str, username: str | None = None) -> None:
         import time
 
         self._conn.execute(
@@ -54,9 +50,7 @@ class _MockEntityCache:
         self._conn.commit()
 
     def get(self, entity_id: int, ttl_seconds: int = 300) -> dict | None:
-        row = self._conn.execute(
-            "SELECT type, name, username FROM entities WHERE id = ?", (entity_id,)
-        ).fetchone()
+        row = self._conn.execute("SELECT type, name, username FROM entities WHERE id = ?", (entity_id,)).fetchone()
         if row is None:
             return None
         return {"type": row[0], "name": row[1], "username": row[2]}
@@ -75,8 +69,7 @@ class _MockEntityCache:
 
         now = int(time.time())
         rows = self._conn.execute(
-            "SELECT id, name FROM entities WHERE "
-            "(type='user' AND updated_at > ?) OR (type!='user' AND updated_at > ?)",
+            "SELECT id, name FROM entities WHERE (type='user' AND updated_at > ?) OR (type!='user' AND updated_at > ?)",
             (now - user_ttl, now - group_ttl),
         ).fetchall()
         return {row[0]: row[1] for row in rows}
@@ -130,7 +123,7 @@ def make_mock_message():
         msg.message = text  # Telethon exposes message text via .message; formatter reads this
         msg.sender_id = sender_id
         msg.sender = MagicMock(first_name=sender_name, last_name=None, username=None)
-        msg.date = date or datetime(2024, 1, 15, 10, 0, 0, tzinfo=timezone.utc)
+        msg.date = date or datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC)
         msg.reply_to = None
         msg.reactions = None
         msg.media = None

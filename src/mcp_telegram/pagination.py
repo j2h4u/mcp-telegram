@@ -1,4 +1,3 @@
-
 import base64
 import binascii
 import hashlib
@@ -20,6 +19,7 @@ NavigationKind = Literal["history", "search"]
 
 class HistoryDirection(StrEnum):
     """Direction for history navigation — newest-first (default) or oldest-first."""
+
     NEWEST = "newest"
     OLDEST = "oldest"
 
@@ -191,5 +191,3 @@ def decode_search_navigation(token: str, *, expected_dialog_id: int, expected_qu
         msg = f'Navigation token belongs to query "{navigation.query}", not "{expected_query}"'
         raise ValueError(msg)
     return navigation.value
-
-

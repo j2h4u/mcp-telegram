@@ -18,12 +18,15 @@ import sqlite3
 import time
 from typing import Any
 
-from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
-from telethon.errors import RPCError  # type: ignore[import-untyped]
+from telethon.errors import (
+    FloodWaitError,  # type: ignore[import-untyped]
+    RPCError,  # type: ignore[import-untyped]
+)
 
 from .sync_worker import (
     _ACCESS_LOST_ERRORS,
     _SET_ACCESS_LOST_SQL,
+    ExtractedMessage,
     extract_message_row,
     insert_messages_with_fts,
 )
@@ -34,26 +37,15 @@ logger = logging.getLogger(__name__)
 # SQL constants
 # ---------------------------------------------------------------------------
 
-_SELECT_SYNCED_DIALOG_IDS_SQL = (
-    "SELECT dialog_id FROM synced_dialogs WHERE status = 'synced'"
-)
+_SELECT_SYNCED_DIALOG_IDS_SQL = "SELECT dialog_id FROM synced_dialogs WHERE status = 'synced'"
 
-_SELECT_MAX_MESSAGE_ID_SQL = (
-    "SELECT COALESCE(MAX(message_id), 0) FROM messages WHERE dialog_id = ?"
-)
+_SELECT_MAX_MESSAGE_ID_SQL = "SELECT COALESCE(MAX(message_id), 0) FROM messages WHERE dialog_id = ?"
 
-_SELECT_ACCESS_LOST_SQL = (
-    "SELECT dialog_id FROM synced_dialogs WHERE status = 'access_lost'"
-)
+_SELECT_ACCESS_LOST_SQL = "SELECT dialog_id FROM synced_dialogs WHERE status = 'access_lost'"
 
-_RESTORE_ACCESS_SQL = (
-    "UPDATE synced_dialogs SET status = 'syncing', access_lost_at = NULL "
-    "WHERE dialog_id = ?"
-)
+_RESTORE_ACCESS_SQL = "UPDATE synced_dialogs SET status = 'syncing', access_lost_at = NULL WHERE dialog_id = ?"
 
-_UPDATE_TOTAL_MESSAGES_SQL = (
-    "UPDATE synced_dialogs SET total_messages = ? WHERE dialog_id = ?"
-)
+_UPDATE_TOTAL_MESSAGES_SQL = "UPDATE synced_dialogs SET total_messages = ? WHERE dialog_id = ?"
 
 
 # ---------------------------------------------------------------------------
@@ -115,15 +107,13 @@ class DeltaSyncWorker:
         Returns:
             Count of new messages stored. 0 if no gap, no baseline, or error.
         """
-        row = self._conn.execute(
-            _SELECT_MAX_MESSAGE_ID_SQL, (dialog_id,)
-        ).fetchone()
+        row = self._conn.execute(_SELECT_MAX_MESSAGE_ID_SQL, (dialog_id,)).fetchone()
         max_known_id = row[0] if row else 0
         if max_known_id == 0:
             # No baseline yet — FullSyncWorker handles this dialog
             return 0
 
-        new_message_rows: list[tuple[object, ...]] = []
+        new_message_rows: list[ExtractedMessage] = []
         try:
             async for msg in self._client.iter_messages(
                 entity=dialog_id, min_id=max_known_id, reverse=True, limit=None
@@ -147,16 +137,15 @@ class DeltaSyncWorker:
                     len(new_message_rows),
                 )
             try:
-                await asyncio.wait_for(
-                    self._shutdown_event.wait(), timeout=float(exc.seconds)
-                )
-            except asyncio.TimeoutError:
+                await asyncio.wait_for(self._shutdown_event.wait(), timeout=float(exc.seconds))
+            except TimeoutError:
                 pass  # slept the full duration; caller will retry remaining gap
             return len(new_message_rows)
         except _ACCESS_LOST_ERRORS as exc:
             logger.warning(
                 "access_lost delta dialog_id=%d — %s",
-                dialog_id, type(exc).__name__,
+                dialog_id,
+                type(exc).__name__,
             )
             now = int(time.time())
             with self._conn:
@@ -164,16 +153,17 @@ class DeltaSyncWorker:
             return 0
         except RPCError as exc:
             logger.error(
-                "RPC error delta dialog_id=%d — skipping: %s", dialog_id, exc, exc_info=True,
+                "RPC error delta dialog_id=%d — skipping: %s",
+                dialog_id,
+                exc,
+                exc_info=True,
             )
             return 0
 
         if new_message_rows:
             with self._conn:
                 insert_messages_with_fts(self._conn, new_message_rows)
-            logger.info(
-                "delta dialog_id=%d new_messages=%d", dialog_id, len(new_message_rows)
-            )
+            logger.info("delta dialog_id=%d new_messages=%d", dialog_id, len(new_message_rows))
         return len(new_message_rows)
 
 
@@ -207,9 +197,7 @@ async def _probe_access_lost_dialogs(
             # Gap-fill FIRST, while status is still access_lost.
             # If this fails, we skip the dialog — status stays access_lost.
             new_msgs = await delta_worker.fetch_delta_for_dialog(dialog_id)
-            logger.info(
-                "access_restored_gap_fill dialog_id=%d new=%d", dialog_id, new_msgs
-            )
+            logger.info("access_restored_gap_fill dialog_id=%d new=%d", dialog_id, new_msgs)
 
             # Gap-fill succeeded — NOW reset status to syncing.
             with conn:
@@ -221,22 +209,16 @@ async def _probe_access_lost_dialogs(
         except _ACCESS_LOST_ERRORS:
             logger.debug("access_still_lost dialog_id=%d", dialog_id)
         except FloodWaitError as exc:
-            logger.warning(
-                "probe_flood_wait dialog_id=%d seconds=%d", dialog_id, exc.seconds
-            )
+            logger.warning("probe_flood_wait dialog_id=%d seconds=%d", dialog_id, exc.seconds)
             try:
-                await asyncio.wait_for(
-                    shutdown_event.wait(), timeout=float(exc.seconds)
-                )
-                return  # shutdown during flood wait
-            except asyncio.TimeoutError:
+                await asyncio.wait_for(shutdown_event.wait(), timeout=float(exc.seconds))
+                return restored  # shutdown during flood wait
+            except TimeoutError:
                 pass  # flood wait elapsed normally
         except RPCError as exc:
             logger.warning("probe_rpc_error dialog_id=%d error=%s", dialog_id, exc)
-        except (OSError, asyncio.TimeoutError) as exc:
-            logger.warning(
-                "probe_network_error dialog_id=%d error=%s", dialog_id, exc
-            )
+        except (TimeoutError, OSError) as exc:
+            logger.warning("probe_network_error dialog_id=%d error=%s", dialog_id, exc)
 
         await asyncio.sleep(1.0)  # rate limit between probes
 
@@ -261,7 +243,7 @@ async def run_access_probe_loop(
         try:
             await asyncio.wait_for(shutdown_event.wait(), timeout=initial_delay)
             return  # shutdown during initial delay
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pass  # initial delay elapsed normally; proceed with first probe
 
     while not shutdown_event.is_set():
@@ -272,5 +254,5 @@ async def run_access_probe_loop(
         try:
             await asyncio.wait_for(shutdown_event.wait(), timeout=interval)
             return  # shutdown during sleep
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pass  # interval elapsed, run again

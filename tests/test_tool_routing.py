@@ -8,13 +8,13 @@ instead of directly connecting to Telegram. These tests verify:
 - Response formatting (sync_status, message display, etc.)
 - Zero Telegram imports in tools/ package
 """
+
 from __future__ import annotations
 
 import pathlib
 from contextlib import asynccontextmanager
+from datetime import UTC
 from unittest.mock import AsyncMock, MagicMock, patch
-
-import pytest
 
 from mcp_telegram.tools import (
     GetMyAccount,
@@ -40,7 +40,6 @@ from mcp_telegram.tools import (
 )
 from mcp_telegram.tools._base import DaemonNotRunningError
 from mcp_telegram.tools.stats import GetUsageStats, get_usage_stats
-
 
 # ---------------------------------------------------------------------------
 # Daemon mock helpers
@@ -136,29 +135,31 @@ class _patch_daemon_not_running:
 
 async def test_list_dialogs_via_daemon():
     """ListDialogs routes through daemon API and formats output."""
-    conn = _make_daemon_conn({
-        "ok": True,
-        "data": {
-            "dialogs": [
-                {
-                    "id": 123,
-                    "name": "Alice",
-                    "type": "User",
-                    "last_message_at": "2024-01-15 10:00",
-                    "unread_count": 2,
-                    "sync_status": "synced",
-                },
-                {
-                    "id": 456,
-                    "name": "Dev Chat",
-                    "type": "Group",
-                    "last_message_at": "2024-01-15 12:00",
-                    "unread_count": 0,
-                    "sync_status": "not_synced",
-                },
-            ]
-        },
-    })
+    conn = _make_daemon_conn(
+        {
+            "ok": True,
+            "data": {
+                "dialogs": [
+                    {
+                        "id": 123,
+                        "name": "Alice",
+                        "type": "User",
+                        "last_message_at": "2024-01-15 10:00",
+                        "unread_count": 2,
+                        "sync_status": "synced",
+                    },
+                    {
+                        "id": 456,
+                        "name": "Dev Chat",
+                        "type": "Group",
+                        "last_message_at": "2024-01-15 12:00",
+                        "unread_count": 0,
+                        "sync_status": "not_synced",
+                    },
+                ]
+            },
+        }
+    )
     with _patch_daemon(conn):
         result = await list_dialogs(ListDialogs())
 
@@ -173,18 +174,23 @@ async def test_list_dialogs_via_daemon():
 
 async def test_list_dialogs_sync_status_in_output():
     """ListDialogs output includes sync_status field for every dialog."""
-    conn = _make_daemon_conn({
-        "ok": True,
-        "data": {
-            "dialogs": [
-                {
-                    "id": 1, "name": "Chat", "type": "User",
-                    "last_message_at": "2024-01-01 00:00",
-                    "unread_count": 0, "sync_status": "synced",
-                },
-            ]
-        },
-    })
+    conn = _make_daemon_conn(
+        {
+            "ok": True,
+            "data": {
+                "dialogs": [
+                    {
+                        "id": 1,
+                        "name": "Chat",
+                        "type": "User",
+                        "last_message_at": "2024-01-01 00:00",
+                        "unread_count": 0,
+                        "sync_status": "synced",
+                    },
+                ]
+            },
+        }
+    )
     with _patch_daemon(conn):
         result = await list_dialogs(ListDialogs())
 
@@ -203,18 +209,23 @@ async def test_list_dialogs_empty_via_daemon():
 async def test_list_dialogs_upserts_entities_via_daemon():
     """ListDialogs upserts dialog entries into daemon entity store via upsert_entities."""
     upsert_conn = _make_daemon_conn({"ok": True, "upserted": 1})
-    list_conn = _make_daemon_conn({
-        "ok": True,
-        "data": {
-            "dialogs": [
-                {
-                    "id": 100, "name": "TestChat", "type": "Group",
-                    "last_message_at": "2024-01-01", "unread_count": 0,
-                    "sync_status": "synced",
-                },
-            ]
-        },
-    })
+    list_conn = _make_daemon_conn(
+        {
+            "ok": True,
+            "data": {
+                "dialogs": [
+                    {
+                        "id": 100,
+                        "name": "TestChat",
+                        "type": "Group",
+                        "last_message_at": "2024-01-01",
+                        "unread_count": 0,
+                        "sync_status": "synced",
+                    },
+                ]
+            },
+        }
+    )
 
     call_count = 0
 
@@ -245,16 +256,18 @@ async def test_list_dialogs_upserts_entities_via_daemon():
 
 async def test_list_topics_via_daemon():
     """ListTopics routes through daemon API."""
-    conn = _make_daemon_conn({
-        "ok": True,
-        "data": {
-            "topics": [
-                {"id": 1, "title": "General"},
-                {"id": 2, "title": "Off-topic"},
-            ],
-            "dialog_id": 123,
-        },
-    })
+    conn = _make_daemon_conn(
+        {
+            "ok": True,
+            "data": {
+                "topics": [
+                    {"id": 1, "title": "General"},
+                    {"id": 2, "title": "Off-topic"},
+                ],
+                "dialog_id": 123,
+            },
+        }
+    )
     with _patch_daemon(conn):
         result = await list_topics(ListTopics(dialog="MyGroup"))
 
@@ -277,11 +290,13 @@ async def test_list_topics_passes_dialog_name():
 
 async def test_list_topics_dialog_not_found():
     """ListTopics handles dialog_not_found error from daemon."""
-    conn = _make_daemon_conn({
-        "ok": False,
-        "error": "dialog_not_found",
-        "message": "No dialog matching 'nonexistent'",
-    })
+    conn = _make_daemon_conn(
+        {
+            "ok": False,
+            "error": "dialog_not_found",
+            "message": "No dialog matching 'nonexistent'",
+        }
+    )
     with _patch_daemon(conn):
         result = await list_topics(ListTopics(dialog="nonexistent"))
 
@@ -295,16 +310,18 @@ async def test_list_topics_dialog_not_found():
 
 async def test_get_my_account_via_daemon():
     """GetMyAccount routes through daemon API."""
-    conn = _make_daemon_conn({
-        "ok": True,
-        "data": {
-            "id": 999,
-            "first_name": "Test",
-            "last_name": "User",
-            "username": "testuser",
-            "phone": "+1234567890",
-        },
-    })
+    conn = _make_daemon_conn(
+        {
+            "ok": True,
+            "data": {
+                "id": 999,
+                "first_name": "Test",
+                "last_name": "User",
+                "username": "testuser",
+                "phone": "+1234567890",
+            },
+        }
+    )
     with _patch_daemon(conn):
         result = await get_my_account(GetMyAccount())
 
@@ -322,25 +339,27 @@ async def test_get_my_account_via_daemon():
 
 async def test_list_messages_via_daemon():
     """ListMessages routes through daemon API and formats messages."""
-    conn = _make_daemon_conn({
-        "ok": True,
-        "data": {
-            "messages": [
-                {
-                    "message_id": 1,
-                    "sent_at": 1705312800,
-                    "text": "Hello",
-                    "sender_first_name": "Alice",
-                    "media_description": None,
-                    "reply_to_msg_id": None,
-                    "forum_topic_id": None,
-                    "reactions_display": "",
-                    "is_deleted": 0,
-                },
-            ],
-            "source": "sync_db",
-        },
-    })
+    conn = _make_daemon_conn(
+        {
+            "ok": True,
+            "data": {
+                "messages": [
+                    {
+                        "message_id": 1,
+                        "sent_at": 1705312800,
+                        "text": "Hello",
+                        "sender_first_name": "Alice",
+                        "media_description": None,
+                        "reply_to_msg_id": None,
+                        "forum_topic_id": None,
+                        "reactions_display": "",
+                        "is_deleted": 0,
+                    },
+                ],
+                "source": "sync_db",
+            },
+        }
+    )
     with _patch_daemon(conn):
         result = await list_messages(ListMessages(exact_dialog_id=123))
 
@@ -373,11 +392,13 @@ async def test_list_messages_uses_exact_dialog_id():
 
 async def test_list_messages_dialog_not_found():
     """ListMessages handles dialog_not_found error from daemon."""
-    conn = _make_daemon_conn({
-        "ok": False,
-        "error": "dialog_not_found",
-        "message": "No dialog matching 'ghost'",
-    })
+    conn = _make_daemon_conn(
+        {
+            "ok": False,
+            "error": "dialog_not_found",
+            "message": "No dialog matching 'ghost'",
+        }
+    )
     with _patch_daemon(conn):
         result = await list_messages(ListMessages(dialog="ghost"))
 
@@ -391,22 +412,24 @@ async def test_list_messages_dialog_not_found():
 
 async def test_search_messages_via_daemon():
     """SearchMessages routes through daemon API."""
-    conn = _make_daemon_conn({
-        "ok": True,
-        "data": {
-            "messages": [
-                {
-                    "message_id": 5,
-                    "sent_at": 1705312800,
-                    "text": "Found this result",
-                    "sender_first_name": "Bob",
-                    "media_description": None,
-                    "reply_to_msg_id": None,
-                },
-            ],
-            "total": 1,
-        },
-    })
+    conn = _make_daemon_conn(
+        {
+            "ok": True,
+            "data": {
+                "messages": [
+                    {
+                        "message_id": 5,
+                        "sent_at": 1705312800,
+                        "text": "Found this result",
+                        "sender_first_name": "Bob",
+                        "media_description": None,
+                        "reply_to_msg_id": None,
+                    },
+                ],
+                "total": 1,
+            },
+        }
+    )
     with _patch_daemon(conn):
         result = await search_messages(SearchMessages(dialog="123", query="result"))
 
@@ -540,19 +563,21 @@ async def test_mark_dialog_for_sync_daemon_not_running():
 
 async def test_get_sync_status_via_daemon():
     """GetSyncStatus routes through daemon and formats key=value output."""
-    conn = _make_daemon_conn({
-        "ok": True,
-        "data": {
-            "dialog_id": -1001234567890,
-            "status": "synced",
-            "message_count": 100,
-            "sync_progress": 100,
-            "total_messages": 100,
-            "last_synced_at": 1700000000,
-            "last_event_at": 1700001000,
-            "delete_detection": "reliable (channel)",
-        },
-    })
+    conn = _make_daemon_conn(
+        {
+            "ok": True,
+            "data": {
+                "dialog_id": -1001234567890,
+                "status": "synced",
+                "message_count": 100,
+                "sync_progress": 100,
+                "total_messages": 100,
+                "last_synced_at": 1700000000,
+                "last_event_at": 1700001000,
+                "delete_detection": "reliable (channel)",
+            },
+        }
+    )
     with _patch_daemon(conn):
         result = await get_sync_status(GetSyncStatus(dialog_id=-1001234567890))
     text = result[0].text
@@ -576,21 +601,22 @@ async def test_get_sync_status_daemon_not_running():
 
 async def test_get_sync_alerts_via_daemon():
     """GetSyncAlerts routes through daemon and formats alert sections."""
-    conn = _make_daemon_conn({
-        "ok": True,
-        "data": {
-            "deleted_messages": [
-                {"dialog_id": 1, "message_id": 100, "deleted_at": 1700000500},
-            ],
-            "edits": [
-                {"dialog_id": 1, "message_id": 200, "version": 1,
-                 "edit_date": 1700000600},
-            ],
-            "access_lost": [
-                {"dialog_id": 2, "access_lost_at": 1700000700},
-            ],
-        },
-    })
+    conn = _make_daemon_conn(
+        {
+            "ok": True,
+            "data": {
+                "deleted_messages": [
+                    {"dialog_id": 1, "message_id": 100, "deleted_at": 1700000500},
+                ],
+                "edits": [
+                    {"dialog_id": 1, "message_id": 200, "version": 1, "edit_date": 1700000600},
+                ],
+                "access_lost": [
+                    {"dialog_id": 2, "access_lost_at": 1700000700},
+                ],
+            },
+        }
+    )
     with _patch_daemon(conn):
         result = await get_sync_alerts(GetSyncAlerts(since=0, limit=50))
     text = result[0].text
@@ -604,10 +630,12 @@ async def test_get_sync_alerts_via_daemon():
 
 async def test_get_sync_alerts_empty():
     """GetSyncAlerts returns 'no alerts' text when all lists empty."""
-    conn = _make_daemon_conn({
-        "ok": True,
-        "data": {"deleted_messages": [], "edits": [], "access_lost": []},
-    })
+    conn = _make_daemon_conn(
+        {
+            "ok": True,
+            "data": {"deleted_messages": [], "edits": [], "access_lost": []},
+        }
+    )
     with _patch_daemon(conn):
         result = await get_sync_alerts(GetSyncAlerts())
     assert "No sync alerts" in result[0].text
@@ -641,22 +669,26 @@ async def test_get_user_info_resolves_via_daemon():
     Uses a single daemon connection (resolve + get_user_info in same context).
     """
     conn = MagicMock()
-    conn.resolve_entity = AsyncMock(return_value={
-        "ok": True,
-        "data": {"result": "resolved", "entity_id": 12345, "display_name": "Alice"},
-    })
-    conn.get_user_info = AsyncMock(return_value={
-        "ok": True,
-        "data": {
-            "id": 12345,
-            "first_name": "Alice",
-            "last_name": "Smith",
-            "username": "alice",
-            "common_chats": [
-                {"id": -1001234, "name": "Dev Chat", "type": "supergroup"},
-            ],
-        },
-    })
+    conn.resolve_entity = AsyncMock(
+        return_value={
+            "ok": True,
+            "data": {"result": "resolved", "entity_id": 12345, "display_name": "Alice"},
+        }
+    )
+    conn.get_user_info = AsyncMock(
+        return_value={
+            "ok": True,
+            "data": {
+                "id": 12345,
+                "first_name": "Alice",
+                "last_name": "Smith",
+                "username": "alice",
+                "common_chats": [
+                    {"id": -1001234, "name": "Dev Chat", "type": "supergroup"},
+                ],
+            },
+        }
+    )
     conn.record_telemetry = AsyncMock(return_value={"ok": True})
 
     with _patch_daemon(conn):
@@ -670,19 +702,26 @@ async def test_get_user_info_resolves_via_daemon():
     conn.get_user_info.assert_called_once_with(user_id=12345)
 
 
-
 async def test_get_user_info_candidates_via_daemon():
     """GetUserInfo returns candidate list when resolve_entity returns candidates."""
-    conn = _make_daemon_conn({
-        "ok": True,
-        "data": {
-            "result": "candidates",
-            "matches": [
-                {"entity_id": 1, "display_name": "Alice A", "score": 90, "username": "alicea", "entity_type": "user"},
-                {"entity_id": 2, "display_name": "Alice B", "score": 80, "username": None, "entity_type": "user"},
-            ],
-        },
-    })
+    conn = _make_daemon_conn(
+        {
+            "ok": True,
+            "data": {
+                "result": "candidates",
+                "matches": [
+                    {
+                        "entity_id": 1,
+                        "display_name": "Alice A",
+                        "score": 90,
+                        "username": "alicea",
+                        "entity_type": "user",
+                    },
+                    {"entity_id": 2, "display_name": "Alice B", "score": 80, "username": None, "entity_type": "user"},
+                ],
+            },
+        }
+    )
 
     with patch("mcp_telegram.tools.user_info.daemon_connection", return_value=_fake_daemon_cm(conn)):
         result = await get_user_info(GetUserInfo(user="Alice"))
@@ -694,10 +733,12 @@ async def test_get_user_info_candidates_via_daemon():
 
 async def test_get_user_info_not_found_via_daemon():
     """GetUserInfo returns user_not_found text when resolve_entity returns not_found."""
-    conn = _make_daemon_conn({
-        "ok": True,
-        "data": {"result": "not_found", "query": "nobody"},
-    })
+    conn = _make_daemon_conn(
+        {
+            "ok": True,
+            "data": {"result": "not_found", "query": "nobody"},
+        }
+    )
 
     with patch("mcp_telegram.tools.user_info.daemon_connection", return_value=_fake_daemon_cm(conn)):
         result = await get_user_info(GetUserInfo(user="nobody"))
@@ -717,15 +758,19 @@ async def test_get_user_info_daemon_not_running():
 async def test_get_user_info_user_not_found_by_daemon():
     """GetUserInfo handles user_not_found error from daemon profile fetch."""
     conn = MagicMock()
-    conn.resolve_entity = AsyncMock(return_value={
-        "ok": True,
-        "data": {"result": "resolved", "entity_id": 999, "display_name": "Ghost"},
-    })
-    conn.get_user_info = AsyncMock(return_value={
-        "ok": False,
-        "error": "user_not_found",
-        "message": "User 999 not found",
-    })
+    conn.resolve_entity = AsyncMock(
+        return_value={
+            "ok": True,
+            "data": {"result": "resolved", "entity_id": 999, "display_name": "Ghost"},
+        }
+    )
+    conn.get_user_info = AsyncMock(
+        return_value={
+            "ok": False,
+            "error": "user_not_found",
+            "message": "User 999 not found",
+        }
+    )
     conn.record_telemetry = AsyncMock(return_value={"ok": True})
 
     with _patch_daemon(conn):
@@ -741,30 +786,32 @@ async def test_get_user_info_user_not_found_by_daemon():
 
 async def test_list_unread_messages_via_daemon():
     """ListUnreadMessages routes through daemon API and formats grouped output."""
-    conn = _make_daemon_conn({
-        "ok": True,
-        "data": {
-            "groups": [
-                {
-                    "dialog_id": 123,
-                    "display_name": "Alice",
-                    "tier": 30,
-                    "category": "user",
-                    "unread_count": 2,
-                    "unread_mentions_count": 0,
-                    "messages": [
-                        {
-                            "message_id": 1,
-                            "sent_at": 1700000000,
-                            "text": "Hello there",
-                            "sender_id": 123,
-                            "sender_first_name": "Alice",
-                        },
-                    ],
-                },
-            ],
-        },
-    })
+    conn = _make_daemon_conn(
+        {
+            "ok": True,
+            "data": {
+                "groups": [
+                    {
+                        "dialog_id": 123,
+                        "display_name": "Alice",
+                        "tier": 30,
+                        "category": "user",
+                        "unread_count": 2,
+                        "unread_mentions_count": 0,
+                        "messages": [
+                            {
+                                "message_id": 1,
+                                "sent_at": 1700000000,
+                                "text": "Hello there",
+                                "sender_id": 123,
+                                "sender_first_name": "Alice",
+                            },
+                        ],
+                    },
+                ],
+            },
+        }
+    )
     with _patch_daemon(conn):
         result = await list_unread_messages(ListUnreadMessages())
 
@@ -808,10 +855,12 @@ async def test_list_unread_messages_empty_with_bootstrap_pending():
     misleading 'No unread messages' canned text — it must surface the pending count
     so the caller knows results are incomplete, not genuinely empty.
     """
-    conn = _make_daemon_conn({
-        "ok": True,
-        "data": {"groups": [], "bootstrap_pending": 329},
-    })
+    conn = _make_daemon_conn(
+        {
+            "ok": True,
+            "data": {"groups": [], "bootstrap_pending": 329},
+        }
+    )
     with _patch_daemon(conn):
         result = await list_unread_messages(ListUnreadMessages())
 
@@ -820,22 +869,21 @@ async def test_list_unread_messages_empty_with_bootstrap_pending():
     assert "329" in text, f"bootstrap_pending count missing from response: {text!r}"
     # Must mention the bootstrap state in some recognisable form
     lowered = text.lower()
-    assert (
-        "bootstrap" in lowered
-        or "pending" in lowered
-        or "seeded" in lowered
-        or "bootstrapping" in lowered
-    ), f"bootstrap state not surfaced in response: {text!r}"
+    assert "bootstrap" in lowered or "pending" in lowered or "seeded" in lowered or "bootstrapping" in lowered, (
+        f"bootstrap state not surfaced in response: {text!r}"
+    )
 
 
 async def test_list_unread_messages_empty_with_no_bootstrap_pending():
     """When groups=[] AND bootstrap_pending=0 the existing 'no unread' canned text
     is correct (truly empty inbox). Asserts no behaviour regression.
     """
-    conn = _make_daemon_conn({
-        "ok": True,
-        "data": {"groups": [], "bootstrap_pending": 0},
-    })
+    conn = _make_daemon_conn(
+        {
+            "ok": True,
+            "data": {"groups": [], "bootstrap_pending": 0},
+        }
+    )
     with _patch_daemon(conn):
         result = await list_unread_messages(ListUnreadMessages())
 
@@ -848,31 +896,33 @@ async def test_list_unread_messages_non_empty_with_bootstrap_pending():
     output MUST include a one-line note disclosing the pending count, so the
     caller knows the result is partial coverage.
     """
-    conn = _make_daemon_conn({
-        "ok": True,
-        "data": {
-            "groups": [
-                {
-                    "dialog_id": 123,
-                    "display_name": "Alice",
-                    "tier": 30,
-                    "category": "user",
-                    "unread_count": 1,
-                    "unread_mentions_count": 0,
-                    "messages": [
-                        {
-                            "message_id": 1,
-                            "sent_at": 1700000000,
-                            "text": "Hello there",
-                            "sender_id": 123,
-                            "sender_first_name": "Alice",
-                        },
-                    ],
-                },
-            ],
-            "bootstrap_pending": 5,
-        },
-    })
+    conn = _make_daemon_conn(
+        {
+            "ok": True,
+            "data": {
+                "groups": [
+                    {
+                        "dialog_id": 123,
+                        "display_name": "Alice",
+                        "tier": 30,
+                        "category": "user",
+                        "unread_count": 1,
+                        "unread_mentions_count": 0,
+                        "messages": [
+                            {
+                                "message_id": 1,
+                                "sent_at": 1700000000,
+                                "text": "Hello there",
+                                "sender_id": 123,
+                                "sender_first_name": "Alice",
+                            },
+                        ],
+                    },
+                ],
+                "bootstrap_pending": 5,
+            },
+        }
+    )
     with _patch_daemon(conn):
         result = await list_unread_messages(ListUnreadMessages())
 
@@ -883,42 +933,42 @@ async def test_list_unread_messages_non_empty_with_bootstrap_pending():
     # New disclosure
     assert "5" in text, f"bootstrap_pending count missing from non-empty response: {text!r}"
     lowered = text.lower()
-    assert (
-        "bootstrap" in lowered
-        or "pending" in lowered
-        or "incomplete" in lowered
-    ), f"bootstrap_pending note missing from non-empty response: {text!r}"
+    assert "bootstrap" in lowered or "pending" in lowered or "incomplete" in lowered, (
+        f"bootstrap_pending note missing from non-empty response: {text!r}"
+    )
 
 
 async def test_list_unread_messages_non_empty_with_no_bootstrap_pending():
     """When groups is non-empty AND bootstrap_pending=0 the formatted output MUST
     NOT include a spurious bootstrap note. Asserts no false-positive disclosure.
     """
-    conn = _make_daemon_conn({
-        "ok": True,
-        "data": {
-            "groups": [
-                {
-                    "dialog_id": 123,
-                    "display_name": "Alice",
-                    "tier": 30,
-                    "category": "user",
-                    "unread_count": 1,
-                    "unread_mentions_count": 0,
-                    "messages": [
-                        {
-                            "message_id": 1,
-                            "sent_at": 1700000000,
-                            "text": "Hello there",
-                            "sender_id": 123,
-                            "sender_first_name": "Alice",
-                        },
-                    ],
-                },
-            ],
-            "bootstrap_pending": 0,
-        },
-    })
+    conn = _make_daemon_conn(
+        {
+            "ok": True,
+            "data": {
+                "groups": [
+                    {
+                        "dialog_id": 123,
+                        "display_name": "Alice",
+                        "tier": 30,
+                        "category": "user",
+                        "unread_count": 1,
+                        "unread_mentions_count": 0,
+                        "messages": [
+                            {
+                                "message_id": 1,
+                                "sent_at": 1700000000,
+                                "text": "Hello there",
+                                "sender_id": 123,
+                                "sender_first_name": "Alice",
+                            },
+                        ],
+                    },
+                ],
+                "bootstrap_pending": 0,
+            },
+        }
+    )
     with _patch_daemon(conn):
         result = await list_unread_messages(ListUnreadMessages())
 
@@ -926,9 +976,7 @@ async def test_list_unread_messages_non_empty_with_no_bootstrap_pending():
     assert "Alice" in text
     assert "Hello there" in text
     # No spurious disclosure when coverage is complete
-    assert "bootstrap_pending" not in text, (
-        f"unexpected bootstrap_pending disclosure when count=0: {text!r}"
-    )
+    assert "bootstrap_pending" not in text, f"unexpected bootstrap_pending disclosure when count=0: {text!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -938,19 +986,21 @@ async def test_list_unread_messages_non_empty_with_no_bootstrap_pending():
 
 async def test_get_usage_stats_via_daemon():
     """GetUsageStats reads telemetry via daemon API get_usage_stats."""
-    conn = _make_daemon_conn({
-        "ok": True,
-        "data": {
-            "tool_distribution": {"ListDialogs": 10, "ListMessages": 5},
-            "error_distribution": {},
-            "total_calls": 15,
-            "max_page_depth": 2,
-            "filter_count": 3,
-            "latency_median_ms": 120,
-            "latency_p95_ms": 350,
-            "dialogs_with_deep_scroll": 0,
-        },
-    })
+    conn = _make_daemon_conn(
+        {
+            "ok": True,
+            "data": {
+                "tool_distribution": {"ListDialogs": 10, "ListMessages": 5},
+                "error_distribution": {},
+                "total_calls": 15,
+                "max_page_depth": 2,
+                "filter_count": 3,
+                "latency_median_ms": 120,
+                "latency_p95_ms": 350,
+                "dialogs_with_deep_scroll": 0,
+            },
+        }
+    )
     with _patch_daemon(conn):
         result = await get_usage_stats(GetUsageStats())
 
@@ -971,10 +1021,12 @@ async def test_get_usage_stats_daemon_not_running():
 
 async def test_get_usage_stats_empty_data():
     """GetUsageStats returns no-data message when daemon reports zero calls."""
-    conn = _make_daemon_conn({
-        "ok": True,
-        "data": {"total_calls": 0},
-    })
+    conn = _make_daemon_conn(
+        {
+            "ok": True,
+            "data": {"total_calls": 0},
+        }
+    )
     with _patch_daemon(conn):
         result = await get_usage_stats(GetUsageStats())
 
@@ -990,6 +1042,7 @@ async def test_get_usage_stats_empty_data():
 def test_no_sqlite3_or_cache_in_tools():
     """CONSOLIDATE-03: tools/ must have zero sqlite3, cache, or analytics DB imports."""
     import pathlib
+
     tools_dir = pathlib.Path(__file__).parent.parent / "src" / "mcp_telegram" / "tools"
     forbidden = [
         "import sqlite3",
@@ -1019,8 +1072,9 @@ def test_no_sqlite3_or_cache_in_tools():
 
 async def test_daemon_connection_list_messages_passes_sender_id():
     """DaemonConnection.list_messages passes sender_id in request payload."""
-    from mcp_telegram.daemon_client import DaemonConnection
     import json
+
+    from mcp_telegram.daemon_client import DaemonConnection
 
     sent_payload = {}
 
@@ -1028,6 +1082,7 @@ async def test_daemon_connection_list_messages_passes_sender_id():
         def write(self, data: bytes) -> None:
             nonlocal sent_payload
             sent_payload = json.loads(data.strip())
+
         async def drain(self) -> None:
             pass
 
@@ -1042,8 +1097,9 @@ async def test_daemon_connection_list_messages_passes_sender_id():
 
 async def test_daemon_connection_list_messages_passes_sender_name():
     """DaemonConnection.list_messages passes sender_name in request payload."""
-    from mcp_telegram.daemon_client import DaemonConnection
     import json
+
+    from mcp_telegram.daemon_client import DaemonConnection
 
     sent_payload = {}
 
@@ -1051,6 +1107,7 @@ async def test_daemon_connection_list_messages_passes_sender_name():
         def write(self, data: bytes) -> None:
             nonlocal sent_payload
             sent_payload = json.loads(data.strip())
+
         async def drain(self) -> None:
             pass
 
@@ -1065,8 +1122,9 @@ async def test_daemon_connection_list_messages_passes_sender_name():
 
 async def test_daemon_connection_list_messages_passes_topic_id():
     """DaemonConnection.list_messages passes topic_id in request payload."""
-    from mcp_telegram.daemon_client import DaemonConnection
     import json
+
+    from mcp_telegram.daemon_client import DaemonConnection
 
     sent_payload = {}
 
@@ -1074,6 +1132,7 @@ async def test_daemon_connection_list_messages_passes_topic_id():
         def write(self, data: bytes) -> None:
             nonlocal sent_payload
             sent_payload = json.loads(data.strip())
+
         async def drain(self) -> None:
             pass
 
@@ -1088,8 +1147,9 @@ async def test_daemon_connection_list_messages_passes_topic_id():
 
 async def test_daemon_connection_list_messages_passes_unread_after_id():
     """DaemonConnection.list_messages passes unread_after_id in request payload."""
-    from mcp_telegram.daemon_client import DaemonConnection
     import json
+
+    from mcp_telegram.daemon_client import DaemonConnection
 
     sent_payload = {}
 
@@ -1097,6 +1157,7 @@ async def test_daemon_connection_list_messages_passes_unread_after_id():
         def write(self, data: bytes) -> None:
             nonlocal sent_payload
             sent_payload = json.loads(data.strip())
+
         async def drain(self) -> None:
             pass
 
@@ -1111,8 +1172,9 @@ async def test_daemon_connection_list_messages_passes_unread_after_id():
 
 async def test_daemon_connection_list_messages_passes_direction():
     """DaemonConnection.list_messages passes direction in request payload."""
-    from mcp_telegram.daemon_client import DaemonConnection
     import json
+
+    from mcp_telegram.daemon_client import DaemonConnection
 
     sent_payload = {}
 
@@ -1120,6 +1182,7 @@ async def test_daemon_connection_list_messages_passes_direction():
         def write(self, data: bytes) -> None:
             nonlocal sent_payload
             sent_payload = json.loads(data.strip())
+
         async def drain(self) -> None:
             pass
 
@@ -1134,8 +1197,9 @@ async def test_daemon_connection_list_messages_passes_direction():
 
 async def test_daemon_connection_list_messages_passes_unread_flag():
     """DaemonConnection.list_messages passes unread=True in request payload."""
-    from mcp_telegram.daemon_client import DaemonConnection
     import json
+
+    from mcp_telegram.daemon_client import DaemonConnection
 
     sent_payload = {}
 
@@ -1143,6 +1207,7 @@ async def test_daemon_connection_list_messages_passes_unread_flag():
         def write(self, data: bytes) -> None:
             nonlocal sent_payload
             sent_payload = json.loads(data.strip())
+
         async def drain(self) -> None:
             pass
 
@@ -1157,8 +1222,9 @@ async def test_daemon_connection_list_messages_passes_unread_flag():
 
 async def test_daemon_connection_list_messages_omits_none_params():
     """DaemonConnection.list_messages omits optional params when not provided (backward compat)."""
-    from mcp_telegram.daemon_client import DaemonConnection
     import json
+
+    from mcp_telegram.daemon_client import DaemonConnection
 
     sent_payload = {}
 
@@ -1166,6 +1232,7 @@ async def test_daemon_connection_list_messages_omits_none_params():
         def write(self, data: bytes) -> None:
             nonlocal sent_payload
             sent_payload = json.loads(data.strip())
+
         async def drain(self) -> None:
             pass
 
@@ -1190,8 +1257,9 @@ async def test_daemon_connection_list_messages_omits_none_params():
 
 def test_daemon_message_reads_edit_date_from_row():
     """_DaemonMessage reads edit_date from row dict as datetime (not hardcoded None)."""
+    from datetime import datetime
+
     from mcp_telegram.tools._adapters import DaemonMessage as _DaemonMessage
-    from datetime import datetime, timezone
 
     row = {
         "message_id": 1,
@@ -1204,7 +1272,7 @@ def test_daemon_message_reads_edit_date_from_row():
     msg = _DaemonMessage(row)
     assert msg.edit_date is not None
     assert isinstance(msg.edit_date, datetime)
-    assert msg.edit_date == datetime.fromtimestamp(1700001000, tz=timezone.utc)
+    assert msg.edit_date == datetime.fromtimestamp(1700001000, tz=UTC)
 
 
 def test_daemon_message_edit_date_none_when_absent():
@@ -1254,8 +1322,9 @@ def test_daemon_message_topic_title_none_when_absent():
 
 def test_format_daemon_messages_passes_topic_name_getter():
     """_format_daemon_messages passes topic_name_getter to format_messages when topic_title present."""
+    from unittest.mock import patch
+
     from mcp_telegram.tools.reading import _format_daemon_messages
-    from unittest.mock import patch, call
 
     rows = [
         {
@@ -1277,6 +1346,7 @@ def test_format_daemon_messages_passes_topic_name_getter():
     with patch("mcp_telegram.tools.reading.format_messages", _fake_format_messages):
         # Need to ensure format_messages is called from within the module
         import mcp_telegram.tools.reading as reading_mod
+
         with patch.object(reading_mod, "_format_daemon_messages", wraps=reading_mod._format_daemon_messages):
             result = _format_daemon_messages(rows)
 
@@ -1286,8 +1356,9 @@ def test_format_daemon_messages_passes_topic_name_getter():
 
 def test_format_daemon_messages_no_topic_name_getter_when_no_topics():
     """_format_daemon_messages does not pass topic_name_getter when no topic_title present."""
-    from mcp_telegram.tools.reading import _format_daemon_messages
     from unittest.mock import patch
+
+    from mcp_telegram.tools.reading import _format_daemon_messages
 
     rows = [
         {

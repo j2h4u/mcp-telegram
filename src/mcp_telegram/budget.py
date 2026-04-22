@@ -1,12 +1,11 @@
-
 # Priority tiers for unread chat sorting (lower = higher priority).
 # Gaps between values allow inserting new tiers without renumbering.
-UNREAD_TIER_MENTION_DM = 10       # DM with unread @mention
-UNREAD_TIER_MENTION_GROUP = 20    # Group with unread @mention
-UNREAD_TIER_HUMAN_DM = 30        # 1-on-1 with a real person
-UNREAD_TIER_BOT_DM = 40          # 1-on-1 with a bot
-UNREAD_TIER_SMALL_GROUP = 50     # Group within size threshold
-UNREAD_TIER_CHANNEL = 70         # Channel / broadcast
+UNREAD_TIER_MENTION_DM = 10  # DM with unread @mention
+UNREAD_TIER_MENTION_GROUP = 20  # Group with unread @mention
+UNREAD_TIER_HUMAN_DM = 30  # 1-on-1 with a real person
+UNREAD_TIER_BOT_DM = 40  # 1-on-1 with a bot
+UNREAD_TIER_SMALL_GROUP = 50  # Group within size threshold
+UNREAD_TIER_CHANNEL = 70  # Channel / broadcast
 
 
 def unread_chat_tier(chat: dict) -> int:

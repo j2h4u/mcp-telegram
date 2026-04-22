@@ -45,11 +45,10 @@ def logout() -> None:
 def sync() -> None:
     """Run the sync daemon (owns TelegramClient exclusively)."""
     import logging
+    import os
     import sys
 
     from .daemon import sync_main
-
-    import os
 
     log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
     logging.basicConfig(

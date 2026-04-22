@@ -1,7 +1,4 @@
-# ruff: noqa: T201  — print() used intentionally for interactive CLI output
-
 import logging
-import time
 from functools import cache
 from getpass import getpass
 
@@ -16,6 +13,7 @@ logger = logging.getLogger(__name__)
 
 class TelegramSettings(BaseSettings):
     """Reads TELEGRAM_API_ID and TELEGRAM_API_HASH from environment or ``.env`` in CWD."""
+
     model_config = SettingsConfigDict(env_prefix="TELEGRAM_", env_file=".env")
 
     api_id: str

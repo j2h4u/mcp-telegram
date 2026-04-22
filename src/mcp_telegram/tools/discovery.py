@@ -1,4 +1,3 @@
-
 import logging
 
 from pydantic import Field
@@ -147,10 +146,9 @@ async def list_topics(args: ListTopics) -> ToolResult:
         error_msg = response.get("message", "Request failed.")
         if error_code == "dialog_not_found":
             from ..errors import dialog_not_found_text
+
             return ToolResult(
-                content=_text_response(
-                    dialog_not_found_text(args.dialog, retry_tool="ListTopics")
-                ),
+                content=_text_response(dialog_not_found_text(args.dialog, retry_tool="ListTopics")),
                 has_filter=True,
             )
         return ToolResult(content=_text_response(f"Error: {error_msg}"), has_filter=True)
@@ -193,6 +191,7 @@ async def get_my_account(args: GetMyAccount) -> ToolResult:
     data = response.get("data", {})
     if not data:
         from ..errors import not_authenticated_text
+
         return ToolResult(content=_text_response(not_authenticated_text("GetMyAccount")))
 
     first_name = data.get("first_name") or ""

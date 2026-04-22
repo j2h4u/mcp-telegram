@@ -1,12 +1,13 @@
 """Shared test helpers for sync/event/delta tests."""
+
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 
 def build_mock_message(
-    id: int,  # noqa: A002
+    id: int,
     text: str | None = "hello",
     sender_id: int | None = 42,
     sender_first_name: str | None = "Alice",
@@ -18,11 +19,7 @@ def build_mock_message(
     edit_date: datetime | None = None,
 ) -> SimpleNamespace:
     """Build a minimal Telethon-like message object."""
-    sender = (
-        SimpleNamespace(first_name=sender_first_name)
-        if sender_first_name is not None
-        else None
-    )
+    sender = SimpleNamespace(first_name=sender_first_name) if sender_first_name is not None else None
 
     reply_to_obj: SimpleNamespace | None = None
     if reply_to_msg_id is not None or forum_topic:
@@ -34,7 +31,7 @@ def build_mock_message(
 
     return SimpleNamespace(
         id=id,
-        date=datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+        date=datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC),
         message=text,
         sender_id=sender_id,
         sender=sender,
@@ -48,8 +45,7 @@ def build_mock_message(
 def build_mock_reactions(counts: dict[str, int]) -> SimpleNamespace:
     """Build a mock MessageReactions object."""
     results = [
-        SimpleNamespace(reaction=SimpleNamespace(emoticon=emoji), count=count)
-        for emoji, count in counts.items()
+        SimpleNamespace(reaction=SimpleNamespace(emoticon=emoji), count=count) for emoji, count in counts.items()
     ]
     return SimpleNamespace(results=results)
 

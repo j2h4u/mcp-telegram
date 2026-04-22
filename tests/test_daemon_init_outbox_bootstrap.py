@@ -17,16 +17,16 @@ Test inventory (≥11):
   10. test_bootstrap_v12_upgrade_scenario                      — LOW-2 from review.
   11. test_bootstrap_live_event_race_newer_wins                — MEDIUM codex designed race safety.
 """
+
 from __future__ import annotations
 
 import asyncio
 import math
 import sqlite3
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -35,6 +35,7 @@ import pytest
 
 def _make_conn() -> sqlite3.Connection:
     from mcp_telegram.sync_db import _apply_migrations
+
     conn = sqlite3.connect(":memory:")
     _apply_migrations(conn)
     return conn
@@ -44,9 +45,7 @@ def _seed(conn: sqlite3.Connection, rows):
     """rows: iterable of (dialog_id, inbox_max_id, outbox_max_id, status)."""
     for dialog_id, inbox_max, outbox_max, status in rows:
         conn.execute(
-            "INSERT INTO synced_dialogs "
-            "(dialog_id, status, read_inbox_max_id, read_outbox_max_id) "
-            "VALUES (?, ?, ?, ?)",
+            "INSERT INTO synced_dialogs (dialog_id, status, read_inbox_max_id, read_outbox_max_id) VALUES (?, ?, ?, ?)",
             (dialog_id, status, inbox_max, outbox_max),
         )
     conn.commit()
@@ -54,8 +53,7 @@ def _seed(conn: sqlite3.Connection, rows):
 
 def _read_cursors(conn: sqlite3.Connection, dialog_id: int):
     row = conn.execute(
-        "SELECT read_inbox_max_id, read_outbox_max_id FROM synced_dialogs "
-        "WHERE dialog_id=?",
+        "SELECT read_inbox_max_id, read_outbox_max_id FROM synced_dialogs WHERE dialog_id=?",
         (dialog_id,),
     ).fetchone()
     return row if row is None else (row[0], row[1])
@@ -72,9 +70,7 @@ def _patch_get_peer_id(mapping):
     def _side_effect(peer):
         return next(iterator)
 
-    return patch(
-        "mcp_telegram.daemon.telethon_utils.get_peer_id", side_effect=_side_effect
-    )
+    return patch("mcp_telegram.daemon.telethon_utils.get_peer_id", side_effect=_side_effect)
 
 
 def _fake_client_with_dialogs(dialogs_per_call):
@@ -189,8 +185,7 @@ async def test_bootstrap_call_count_equals_ceil_n_over_15():
 
     expected = math.ceil(N / 15)
     assert client._call_count["n"] == expected, (
-        f"Expected {expected} GetPeerDialogsRequest calls, "
-        f"got {client._call_count['n']}"
+        f"Expected {expected} GetPeerDialogsRequest calls, got {client._call_count['n']}"
     )
 
 
@@ -217,9 +212,7 @@ async def test_bootstrap_runs_when_only_outbox_null():
     conn = _make_conn()
     _seed(conn, [(1001, 100, None, "synced")])
 
-    fake_dialog = SimpleNamespace(
-        peer=SimpleNamespace(), read_inbox_max_id=150, read_outbox_max_id=42
-    )
+    fake_dialog = SimpleNamespace(peer=SimpleNamespace(), read_inbox_max_id=150, read_outbox_max_id=42)
     client = _fake_client_with_dialogs([[fake_dialog]])
 
     with _patch_get_peer_id([1001]):
@@ -239,9 +232,7 @@ async def test_bootstrap_runs_when_only_inbox_null():
     conn = _make_conn()
     _seed(conn, [(1001, None, 200, "synced")])
 
-    fake_dialog = SimpleNamespace(
-        peer=SimpleNamespace(), read_inbox_max_id=100, read_outbox_max_id=250
-    )
+    fake_dialog = SimpleNamespace(peer=SimpleNamespace(), read_inbox_max_id=100, read_outbox_max_id=250)
     client = _fake_client_with_dialogs([[fake_dialog]])
 
     with _patch_get_peer_id([1001]):
@@ -280,8 +271,7 @@ async def test_bootstrap_telethon_returns_none_outbox_preserves_null():
     inbox, outbox = _read_cursors(conn, 1001)
     assert inbox == 42
     assert outbox is None, (
-        f"Expected outbox NULL (Telethon returned None), got {outbox!r} "
-        "— implementation must NOT fold None → 0"
+        f"Expected outbox NULL (Telethon returned None), got {outbox!r} — implementation must NOT fold None → 0"
     )
 
 
@@ -308,9 +298,7 @@ async def test_bootstrap_telethon_returns_zero_outbox_writes_zero():
         await _initialize_read_positions(client, conn, asyncio.Event())
 
     inbox, outbox = _read_cursors(conn, 1001)
-    assert outbox == 0, (
-        f"Expected outbox == 0 (legitimate zero), got {outbox!r}"
-    )
+    assert outbox == 0, f"Expected outbox == 0 (legitimate zero), got {outbox!r}"
 
 
 @pytest.mark.asyncio
@@ -332,10 +320,7 @@ async def test_bootstrap_telethon_returns_none_inbox_preserves_null():
         await _initialize_read_positions(client, conn, asyncio.Event())
 
     inbox, outbox = _read_cursors(conn, 1001)
-    assert inbox is None, (
-        f"Expected inbox NULL (Telethon returned None), got {inbox!r} "
-        "— must NOT fold None → 0"
-    )
+    assert inbox is None, f"Expected inbox NULL (Telethon returned None), got {inbox!r} — must NOT fold None → 0"
     assert outbox == 42
 
 
@@ -386,8 +371,8 @@ async def test_bootstrap_v12_upgrade_scenario():
     # equalled Telethon's values, monotonic MAX keeps them).
     for i in range(N):
         inbox, outbox = _read_cursors(conn, 1000 + i)
-        assert inbox == 100 + i, f"row {i}: expected inbox {100+i}, got {inbox}"
-        assert outbox == 1000 + i, f"row {i}: expected outbox {1000+i}, got {outbox}"
+        assert inbox == 100 + i, f"row {i}: expected inbox {100 + i}, got {inbox}"
+        assert outbox == 1000 + i, f"row {i}: expected outbox {1000 + i}, got {outbox}"
 
 
 @pytest.mark.asyncio

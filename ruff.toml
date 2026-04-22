@@ -32,12 +32,26 @@ exclude = [
 line-length = 120
 indent-width = 4
 
+target-version = "py314"
+
 [lint]
-# Enable Pyflakes (`F`) and a subset of the pycodestyle (`E`)  codes by default.
-# Unlike Flake8, Ruff doesn't enable pycodestyle warnings (`W`) or
-# McCabe complexity (`C901`) by default.
-select = ["ALL"]
-ignore = ["D", "TRY003", "EM101", "EM102", "TCH"]
+# Pragmatic set: correctness (F, E, W, B), imports (I), modernization (UP),
+# ruff-specific (RUF), bugbear-adjacent simplifications (SIM). Excluding
+# stylistic/annotation/docstring/strictness categories that would flag the
+# entire codebase without changing correctness.
+select = ["E", "F", "I", "W", "B", "UP", "RUF", "SIM"]
+ignore = [
+  "E501",   # line length — formatter handles this
+  "B008",   # Typer default values
+  "SIM105", # try/except/pass — explicit about best-effort intent
+  "SIM108", # ternary preference — case-by-case
+  "SIM117", # nested with — sometimes clearer
+  "RUF001", # ambiguous unicode — Cyrillic is intentional
+  "RUF002",
+  "RUF003",
+  "UP007",  # Optional[X] vs X | None
+  "UP045",  # typing.Optional still fine
+]
 
 # Allow fix for all enabled rules (when `--fix`) is provided.
 fixable = ["ALL"]
@@ -45,6 +59,20 @@ unfixable = []
 
 # Allow unused variables when underscore-prefixed.
 dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
+
+[lint.per-file-ignores]
+"tests/**" = [
+  "E741",    # ambiguous `l` is fine in short test comprehensions
+  "F841",    # unused locals are common test scaffolding
+  "RUF059",  # unused tuple unpacks (common in test readability)
+  "SIM105",  # try/except/pass in tests is explicit about intent
+  "RUF043",  # regex meta chars in pytest match=
+  "E402",    # late imports in tests (coverage-driven placement)
+  "B007",    # unused loop vars in warmup/iteration patterns
+  "RUF015",  # list slicing in one-off assertions
+]
+"src/mcp_telegram/daemon_api.py" = ["E402"]
+"src/mcp_telegram/tools/discovery.py" = ["E402"]
 
 [format]
 # Like Black, use double quotes for strings.

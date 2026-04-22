@@ -3,21 +3,21 @@
 Covers DAEMON-03 (full fetch), DAEMON-04 (resume), DAEMON-05 (FloodWait),
 and DAEMON-06 (DM bootstrap) behaviors.
 """
+
 from __future__ import annotations
 
 import asyncio
-import json
 import sqlite3
+from datetime import UTC
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
 from helpers import MockTotalList, build_mock_message, build_mock_reactions
+
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.sync_worker import FullSyncWorker
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -266,9 +266,9 @@ async def test_floodwait_sleep_continues(
 
     slept_for: list[float] = []
 
-    async def _mock_wait_for(coro: Any, timeout: float) -> None:  # noqa: ANN401
+    async def _mock_wait_for(coro: Any, timeout: float) -> None:
         slept_for.append(timeout)
-        raise asyncio.TimeoutError
+        raise TimeoutError
 
     worker = make_worker(mock_client, sync_db, shutdown_event)
 
@@ -304,8 +304,8 @@ async def test_floodwait_no_progress_loss(
 
     mock_client.get_messages = AsyncMock(side_effect=err)
 
-    async def _mock_wait_for(coro: Any, timeout: float) -> None:  # noqa: ANN401
-        raise asyncio.TimeoutError
+    async def _mock_wait_for(coro: Any, timeout: float) -> None:
+        raise TimeoutError
 
     worker = make_worker(mock_client, sync_db, shutdown_event)
 
@@ -342,7 +342,7 @@ async def test_dm_bootstrap_enrolls_users(
     dialog2 = SimpleNamespace(entity=user2, id=10002)
     dialog3 = SimpleNamespace(entity=channel, id=10003)
 
-    async def _iter_dialogs():  # noqa: ANN202
+    async def _iter_dialogs():
         for d in [dialog1, dialog2, dialog3]:
             yield d
 
@@ -353,9 +353,7 @@ async def test_dm_bootstrap_enrolls_users(
 
     assert count == 2
 
-    rows = sync_db.execute(
-        "SELECT dialog_id, status FROM synced_dialogs ORDER BY dialog_id"
-    ).fetchall()
+    rows = sync_db.execute("SELECT dialog_id, status FROM synced_dialogs ORDER BY dialog_id").fetchall()
     assert len(rows) == 2
     assert rows[0] == (10001, "syncing")
     assert rows[1] == (10002, "syncing")
@@ -376,7 +374,7 @@ async def test_dm_bootstrap_skips_groups(
     dialog1 = SimpleNamespace(entity=chat, id=20001)
     dialog2 = SimpleNamespace(entity=channel, id=20002)
 
-    async def _iter_dialogs():  # noqa: ANN202
+    async def _iter_dialogs():
         for d in [dialog1, dialog2]:
             yield d
 
@@ -410,7 +408,7 @@ async def test_dm_bootstrap_idempotent(
     user = MagicMock(spec=types.User)
     dialog = SimpleNamespace(entity=user, id=dialog_id)
 
-    async def _iter_dialogs():  # noqa: ANN202
+    async def _iter_dialogs():
         yield dialog
 
     mock_client.iter_dialogs = _iter_dialogs
@@ -450,7 +448,7 @@ async def test_dm_bootstrap_populates_entities(
     user.username = "ivan_z"
     dialog = SimpleNamespace(entity=user, id=40001)
 
-    async def _iter_dialogs():  # noqa: ANN202
+    async def _iter_dialogs():
         yield dialog
 
     mock_client.iter_dialogs = _iter_dialogs
@@ -485,7 +483,7 @@ async def test_dm_bootstrap_populates_entities_bot(
     user.bot = True
     dialog = SimpleNamespace(entity=user, id=40099)
 
-    async def _iter_dialogs():  # noqa: ANN202
+    async def _iter_dialogs():
         yield dialog
 
     mock_client.iter_dialogs = _iter_dialogs
@@ -523,7 +521,7 @@ async def test_dm_bootstrap_entity_backfills_existing_enrollment(
     user.username = None
     dialog = SimpleNamespace(entity=user, id=dialog_id)
 
-    async def _iter_dialogs():  # noqa: ANN202
+    async def _iter_dialogs():
         yield dialog
 
     mock_client.iter_dialogs = _iter_dialogs
@@ -562,7 +560,7 @@ async def test_dm_bootstrap_writes_tombstone_for_nameless_user(
     user.username = "ghost"
     dialog = SimpleNamespace(entity=user, id=40003)
 
-    async def _iter_dialogs():  # noqa: ANN202
+    async def _iter_dialogs():
         yield dialog
 
     mock_client.iter_dialogs = _iter_dialogs
@@ -570,9 +568,7 @@ async def test_dm_bootstrap_writes_tombstone_for_nameless_user(
     worker = make_worker(mock_client, sync_db, shutdown_event)
     await worker.bootstrap_dms()
 
-    row = sync_db.execute(
-        "SELECT name, username FROM entities WHERE id=?", (40003,)
-    ).fetchone()
+    row = sync_db.execute("SELECT name, username FROM entities WHERE id=?", (40003,)).fetchone()
     assert row is not None, "entity row must exist even when display name is empty"
     assert row[0] is None, "name must be NULL for nameless user"
     assert row[1] == "ghost", "username must be preserved"
@@ -600,7 +596,7 @@ async def test_dm_bootstrap_invariant_every_enrolled_dialog_has_entity(
         _make_user(None, None, None, 50003),
     ]
 
-    async def _iter_dialogs():  # noqa: ANN202
+    async def _iter_dialogs():
         for d in dialogs:
             yield d
 
@@ -862,9 +858,7 @@ async def test_access_lost_preserves_messages(
     worker = make_worker(mock_client, sync_db, shutdown_event)
     await worker.process_one_batch()
 
-    count = sync_db.execute(
-        "SELECT COUNT(*) FROM messages WHERE dialog_id=?", (dialog_id,)
-    ).fetchone()[0]
+    count = sync_db.execute("SELECT COUNT(*) FROM messages WHERE dialog_id=?", (dialog_id,)).fetchone()[0]
     assert count == 3, f"Expected 3 messages preserved, got {count}"
 
 
@@ -932,8 +926,7 @@ async def test_process_one_batch_populates_fts(
     await worker.process_one_batch()
 
     fts_rows = sync_db.execute(
-        "SELECT dialog_id, message_id, stemmed_text FROM messages_fts "
-        "WHERE dialog_id = ? ORDER BY message_id",
+        "SELECT dialog_id, message_id, stemmed_text FROM messages_fts WHERE dialog_id = ? ORDER BY message_id",
         (dialog_id,),
     ).fetchall()
     assert len(fts_rows) == 3, f"Expected 3 FTS rows, got {len(fts_rows)}"
@@ -965,9 +958,7 @@ async def test_process_one_batch_fts_matches_message_ids(
 
     fts_ids = {
         row[0]
-        for row in sync_db.execute(
-            "SELECT message_id FROM messages_fts WHERE dialog_id = ?", (dialog_id,)
-        ).fetchall()
+        for row in sync_db.execute("SELECT message_id FROM messages_fts WHERE dialog_id = ?", (dialog_id,)).fetchall()
     }
     assert fts_ids == {200, 201}
 
@@ -984,8 +975,8 @@ async def test_dm_bootstrap_handles_flood_wait(
     shutdown_event: asyncio.Event,
 ) -> None:
     """bootstrap_dms() catches FloodWaitError and commits partial progress."""
-    from telethon.tl import types  # type: ignore[import-untyped]
     from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
+    from telethon.tl import types  # type: ignore[import-untyped]
 
     user = MagicMock(spec=types.User)
     dialog = SimpleNamespace(entity=user, id=40001)
@@ -1004,9 +995,7 @@ async def test_dm_bootstrap_handles_flood_wait(
     count = await worker.bootstrap_dms()
 
     assert count == 1, "should have enrolled the dialog yielded before the error"
-    row = sync_db.execute(
-        "SELECT dialog_id FROM synced_dialogs WHERE dialog_id = ?", (40001,)
-    ).fetchone()
+    row = sync_db.execute("SELECT dialog_id FROM synced_dialogs WHERE dialog_id = ?", (40001,)).fetchone()
     assert row is not None, "partial progress should be committed"
 
 
@@ -1019,7 +1008,7 @@ async def test_dm_bootstrap_handles_rpc_error(
     """bootstrap_dms() catches RPCError and commits partial progress."""
     from telethon.errors import RPCError  # type: ignore[import-untyped]
 
-    async def _iter_dialogs():  # noqa: ANN202
+    async def _iter_dialogs():
         raise RPCError(request=None, message="TEST_ERROR", code=400)
         yield  # make it an async generator  # noqa: unreachable
 
@@ -1038,7 +1027,8 @@ async def test_dm_bootstrap_handles_network_error(
     shutdown_event: asyncio.Event,
 ) -> None:
     """bootstrap_dms() catches OSError and doesn't crash."""
-    async def _iter_dialogs():  # noqa: ANN202
+
+    async def _iter_dialogs():
         raise OSError("Connection reset")
         yield  # make it an async generator  # noqa: unreachable
 
@@ -1067,7 +1057,9 @@ def test_extract_reply_and_topic_simple_reply():
     from mcp_telegram.sync_worker import extract_reply_and_topic
 
     reply_to = SimpleNamespace(
-        reply_to_msg_id=42, forum_topic=False, reply_to_reply_top_id=None,
+        reply_to_msg_id=42,
+        forum_topic=False,
+        reply_to_reply_top_id=None,
     )
     msg = SimpleNamespace(reply_to=reply_to)
     reply_id, topic_id = extract_reply_and_topic(msg)
@@ -1079,7 +1071,9 @@ def test_extract_reply_and_topic_forum_with_top_id():
     from mcp_telegram.sync_worker import extract_reply_and_topic
 
     reply_to = SimpleNamespace(
-        reply_to_msg_id=100, forum_topic=True, reply_to_reply_top_id=7,
+        reply_to_msg_id=100,
+        forum_topic=True,
+        reply_to_reply_top_id=7,
     )
     msg = SimpleNamespace(reply_to=reply_to)
     reply_id, topic_id = extract_reply_and_topic(msg)
@@ -1092,7 +1086,9 @@ def test_extract_reply_and_topic_forum_general():
     from mcp_telegram.sync_worker import extract_reply_and_topic
 
     reply_to = SimpleNamespace(
-        reply_to_msg_id=200, forum_topic=True, reply_to_reply_top_id=None,
+        reply_to_msg_id=200,
+        forum_topic=True,
+        reply_to_reply_top_id=None,
     )
     msg = SimpleNamespace(reply_to=reply_to)
     reply_id, topic_id = extract_reply_and_topic(msg)
@@ -1122,9 +1118,7 @@ async def test_total_messages_written_on_batch(
     mock_client.get_messages = AsyncMock(return_value=MockTotalList(msgs, total=9999))
     worker = make_worker(mock_client, sync_db, shutdown_event)
     await worker.process_one_batch()
-    row = sync_db.execute(
-        "SELECT total_messages FROM synced_dialogs WHERE dialog_id = ?", (dialog_id,)
-    ).fetchone()
+    row = sync_db.execute("SELECT total_messages FROM synced_dialogs WHERE dialog_id = ?", (dialog_id,)).fetchone()
     assert row[0] == 9999
 
 
@@ -1191,9 +1185,7 @@ async def test_total_messages_written_on_completion(
     mock_client.get_messages = AsyncMock(return_value=MockTotalList([], total=5000))
     worker = make_worker(mock_client, sync_db, shutdown_event)
     await worker.process_one_batch()
-    row = sync_db.execute(
-        "SELECT total_messages FROM synced_dialogs WHERE dialog_id = ?", (dialog_id,)
-    ).fetchone()
+    row = sync_db.execute("SELECT total_messages FROM synced_dialogs WHERE dialog_id = ?", (dialog_id,)).fetchone()
     assert row[0] == 5000
 
 
@@ -1211,7 +1203,7 @@ def test_extract_reactions_rows_returns_empty_for_none() -> None:
 
 def test_extract_entity_rows_mention_and_bold(monkeypatch: Any) -> None:
     """Only mention is extracted; bold is skipped (not in analytics types)."""
-    from mcp_telegram.sync_worker import extract_entity_rows, _ANALYTICS_ENTITY_TYPES
+    from mcp_telegram.sync_worker import _ANALYTICS_ENTITY_TYPES, extract_entity_rows
 
     class FakeMention:
         offset = 0
@@ -1240,7 +1232,7 @@ def test_extract_entity_rows_mention_and_bold(monkeypatch: Any) -> None:
 
 def test_extract_entity_rows_hashtag_populates_value(monkeypatch: Any) -> None:
     """Hashtag entity value is the text span (not None). Priority Action #1."""
-    from mcp_telegram.sync_worker import extract_entity_rows, _ANALYTICS_ENTITY_TYPES
+    from mcp_telegram.sync_worker import _ANALYTICS_ENTITY_TYPES, extract_entity_rows
 
     class FakeHashtag:
         offset = 6
@@ -1256,14 +1248,12 @@ def test_extract_entity_rows_hashtag_populates_value(monkeypatch: Any) -> None:
 
     assert len(rows) == 1
     assert rows[0][4] == "hashtag"
-    assert rows[0][5] == "#python", (
-        f"hashtag value should be text span '#python', got {rows[0][5]!r}"
-    )
+    assert rows[0][5] == "#python", f"hashtag value should be text span '#python', got {rows[0][5]!r}"
 
 
 def test_extract_entity_rows_url_populates_value(monkeypatch: Any) -> None:
     """URL entity value is the text span (not None). Priority Action #1."""
-    from mcp_telegram.sync_worker import extract_entity_rows, _ANALYTICS_ENTITY_TYPES
+    from mcp_telegram.sync_worker import _ANALYTICS_ENTITY_TYPES, extract_entity_rows
 
     class FakeUrl:
         offset = 6
@@ -1279,14 +1269,12 @@ def test_extract_entity_rows_url_populates_value(monkeypatch: Any) -> None:
 
     assert len(rows) == 1
     assert rows[0][4] == "url"
-    assert rows[0][5] == "https://example.com", (
-        f"url value should be text span, got {rows[0][5]!r}"
-    )
+    assert rows[0][5] == "https://example.com", f"url value should be text span, got {rows[0][5]!r}"
 
 
 def test_extract_entity_rows_text_url(monkeypatch: Any) -> None:
     """text_url entity value is from entity.url attribute (not text span)."""
-    from mcp_telegram.sync_worker import extract_entity_rows, _ANALYTICS_ENTITY_TYPES
+    from mcp_telegram.sync_worker import _ANALYTICS_ENTITY_TYPES, extract_entity_rows
 
     class FakeTextUrl:
         offset = 0
@@ -1308,7 +1296,7 @@ def test_extract_entity_rows_text_url(monkeypatch: Any) -> None:
 
 def test_extract_entity_rows_mention_name(monkeypatch: Any) -> None:
     """mention_name entity value is str(user_id)."""
-    from mcp_telegram.sync_worker import extract_entity_rows, _ANALYTICS_ENTITY_TYPES
+    from mcp_telegram.sync_worker import _ANALYTICS_ENTITY_TYPES, extract_entity_rows
 
     class FakeMentionName:
         offset = 0
@@ -1335,11 +1323,11 @@ def test_extract_entity_rows_mention_stores_username_text_span(monkeypatch: Any)
     has no peer_id. @username text span is the correct value -- enables
     'who is mentioned most' analytics via GROUP BY value.
     """
-    from mcp_telegram.sync_worker import extract_entity_rows, _ANALYTICS_ENTITY_TYPES
+    from mcp_telegram.sync_worker import _ANALYTICS_ENTITY_TYPES, extract_entity_rows
 
     class FakeMention:
-        offset = 6   # "@alice" starts at index 6 in "Hello @alice how are you"
-        length = 6   # len("@alice") == 6
+        offset = 6  # "@alice" starts at index 6 in "Hello @alice how are you"
+        length = 6  # len("@alice") == 6
 
     monkeypatch.setitem(_ANALYTICS_ENTITY_TYPES, FakeMention, "mention")
 
@@ -1351,14 +1339,12 @@ def test_extract_entity_rows_mention_stores_username_text_span(monkeypatch: Any)
 
     assert len(rows) == 1
     assert rows[0][4] == "mention"
-    assert rows[0][5] == "@alice", (
-        f"mention value should be '@alice' text span, got {rows[0][5]!r}"
-    )
+    assert rows[0][5] == "@alice", f"mention value should be '@alice' text span, got {rows[0][5]!r}"
 
 
 def test_extract_entity_rows_uses_isinstance(monkeypatch: Any) -> None:
     """isinstance() dispatch matches subclasses of tracked entity types."""
-    from mcp_telegram.sync_worker import extract_entity_rows, _ANALYTICS_ENTITY_TYPES
+    from mcp_telegram.sync_worker import _ANALYTICS_ENTITY_TYPES, extract_entity_rows
 
     class BaseHashtag:
         offset = 0
@@ -1375,9 +1361,7 @@ def test_extract_entity_rows_uses_isinstance(monkeypatch: Any) -> None:
     )
     rows = extract_entity_rows(1, 100, msg)
 
-    assert len(rows) == 1, (
-        "SubHashtag must be matched via isinstance() dispatch"
-    )
+    assert len(rows) == 1, "SubHashtag must be matched via isinstance() dispatch"
     assert rows[0][4] == "hashtag"
 
 
@@ -1424,7 +1408,7 @@ def test_utf16_slice_returns_none_on_decode_error() -> None:
 def test_extract_entity_rows_skips_on_utf16_decode_error(monkeypatch: Any) -> None:
     """Entity row is SKIPPED (not stored) when _utf16_slice returns None. Priority Action #4."""
     from mcp_telegram import sync_worker
-    from mcp_telegram.sync_worker import extract_entity_rows, _ANALYTICS_ENTITY_TYPES
+    from mcp_telegram.sync_worker import _ANALYTICS_ENTITY_TYPES, extract_entity_rows
 
     class FakeMention:
         offset = 0
@@ -1440,17 +1424,16 @@ def test_extract_entity_rows_skips_on_utf16_decode_error(monkeypatch: Any) -> No
     )
     rows = extract_entity_rows(1, 100, msg)
 
-    assert rows == [], (
-        "Entity row must be SKIPPED (not stored) when _utf16_slice returns None"
-    )
+    assert rows == [], "Entity row must be SKIPPED (not stored) when _utf16_slice returns None"
 
 
 def test_extract_fwd_row() -> None:
     """extract_fwd_row extracts forward metadata from a message."""
-    from mcp_telegram.sync_worker import extract_fwd_row
-    from datetime import datetime, timezone
+    from datetime import datetime
 
-    fwd_date = datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    from mcp_telegram.sync_worker import extract_fwd_row
+
+    fwd_date = datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC)
     fwd_from = SimpleNamespace(
         from_id=SimpleNamespace(channel_id=99999, user_id=None, chat_id=None),
         from_name="Test Channel",
@@ -1462,7 +1445,7 @@ def test_extract_fwd_row() -> None:
     result = extract_fwd_row(1, 100, msg)
 
     assert result is not None
-    assert result[0] == 1    # dialog_id
+    assert result[0] == 1  # dialog_id
     assert result[1] == 100  # message_id
     assert result[2] == 99999  # fwd_from_peer_id (channel_id)
     assert result[3] == "Test Channel"
@@ -1476,7 +1459,7 @@ def test_extract_fwd_row() -> None:
 
 def test_extract_message_row_returns_dataclass() -> None:
     """extract_message_row returns an ExtractedMessage with expected fields."""
-    from mcp_telegram.sync_worker import extract_message_row, ExtractedMessage
+    from mcp_telegram.sync_worker import ExtractedMessage, extract_message_row
 
     msg = build_mock_message(id=123, text="hello")
     result = extract_message_row(1, msg)
@@ -1490,10 +1473,11 @@ def test_extract_message_row_returns_dataclass() -> None:
 
 def test_extract_message_row_populates_v7_columns() -> None:
     """extract_message_row populates edit_date, grouped_id, reply_to_peer_id."""
-    from mcp_telegram.sync_worker import extract_message_row
-    from datetime import datetime, timezone
+    from datetime import datetime
 
-    edit_dt = datetime(2024, 6, 1, 10, 0, 0, tzinfo=timezone.utc)
+    from mcp_telegram.sync_worker import extract_message_row
+
+    edit_dt = datetime(2024, 6, 1, 10, 0, 0, tzinfo=UTC)
 
     class FakeReplyPeer:
         channel_id = 12345
@@ -1508,7 +1492,7 @@ def test_extract_message_row_populates_v7_columns() -> None:
     )
     msg = SimpleNamespace(
         id=500,
-        date=datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+        date=datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC),
         message="test",
         sender_id=1,
         sender=SimpleNamespace(first_name="Alice"),
@@ -1529,7 +1513,7 @@ def test_extract_message_row_populates_v7_columns() -> None:
     # All three as None
     msg_none = SimpleNamespace(
         id=501,
-        date=datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+        date=datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC),
         message="test",
         sender_id=1,
         sender=None,
@@ -1552,10 +1536,11 @@ def test_extract_message_row_populates_v7_columns() -> None:
 
 def _minimal_msg(**overrides: Any) -> SimpleNamespace:
     """Build a minimal Telethon-like Message for extract_message_row tests."""
-    from datetime import datetime, timezone
+    from datetime import datetime
+
     base = dict(
         id=1,
-        date=datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+        date=datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC),
         message="hi",
         sender_id=1,
         sender=SimpleNamespace(first_name="Alice"),
@@ -1590,10 +1575,11 @@ def test_extract_message_row_captures_out_false_when_missing() -> None:
     assert extract_message_row(1, msg_false).row[12] == 0
 
     # Attribute missing entirely: use a namespace without `out`
-    from datetime import datetime, timezone
+    from datetime import datetime
+
     msg_missing = SimpleNamespace(
         id=2,
-        date=datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+        date=datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC),
         message="hi",
         sender_id=1,
         sender=SimpleNamespace(first_name="Alice"),
@@ -1605,21 +1591,21 @@ def test_extract_message_row_captures_out_false_when_missing() -> None:
         fwd_from=None,
         entities=None,
     )
-    assert extract_message_row(1, msg_missing).row[12] == 0, (
-        "out must default to 0 when attribute is missing"
-    )
+    assert extract_message_row(1, msg_missing).row[12] == 0, "out must default to 0 when attribute is missing"
 
 
 def test_extract_message_row_flags_message_service_as_is_service() -> None:
     """`isinstance(msg, MessageService)` -> row[13] == 1 regardless of `out`."""
+    from datetime import datetime
+
     from telethon.tl import types as tl
-    from datetime import datetime, timezone
+
     from mcp_telegram.sync_worker import extract_message_row
 
     svc = tl.MessageService(
         id=500,
         peer_id=tl.PeerUser(user_id=1),
-        date=datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+        date=datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC),
         action=tl.MessageActionHistoryClear(),
         out=True,  # even with out=True, is_service must be 1
     )
@@ -1644,7 +1630,8 @@ def test_extract_message_row_insert_roundtrip_preserves_out_and_is_service(
 
     dialog_id = 42
     sync_db.execute(
-        "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')", (dialog_id,),
+        "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')",
+        (dialog_id,),
     )
     sync_db.commit()
 
@@ -1662,13 +1649,11 @@ def test_extract_message_row_insert_roundtrip_preserves_out_and_is_service(
 
 def test_insert_messages_with_fts_writes_reactions(sync_db: sqlite3.Connection) -> None:
     """insert_messages_with_fts writes reaction rows to message_reactions table."""
-    from mcp_telegram.sync_worker import insert_messages_with_fts, ExtractedMessage
+    from mcp_telegram.sync_worker import ExtractedMessage, insert_messages_with_fts
 
     dialog_id = 9001
     message_id = 1
-    sync_db.execute(
-        "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')", (dialog_id,)
-    )
+    sync_db.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')", (dialog_id,))
     sync_db.commit()
 
     em = ExtractedMessage(
@@ -1688,13 +1673,11 @@ def test_insert_messages_with_fts_writes_reactions(sync_db: sqlite3.Connection) 
 
 def test_insert_messages_with_fts_writes_forwards(sync_db: sqlite3.Connection) -> None:
     """insert_messages_with_fts writes forward metadata to message_forwards table."""
-    from mcp_telegram.sync_worker import insert_messages_with_fts, ExtractedMessage
+    from mcp_telegram.sync_worker import ExtractedMessage, insert_messages_with_fts
 
     dialog_id = 9002
     message_id = 2
-    sync_db.execute(
-        "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')", (dialog_id,)
-    )
+    sync_db.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')", (dialog_id,))
     sync_db.commit()
 
     em = ExtractedMessage(
@@ -1715,13 +1698,11 @@ def test_insert_messages_with_fts_writes_forwards(sync_db: sqlite3.Connection) -
 
 def test_insert_messages_with_fts_edit_idempotency_reactions(sync_db: sqlite3.Connection) -> None:
     """Inserting same message_id twice replaces reactions (DELETE-before-INSERT)."""
-    from mcp_telegram.sync_worker import insert_messages_with_fts, ExtractedMessage
+    from mcp_telegram.sync_worker import ExtractedMessage, insert_messages_with_fts
 
     dialog_id = 9003
     message_id = 3
-    sync_db.execute(
-        "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')", (dialog_id,)
-    )
+    sync_db.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')", (dialog_id,))
     sync_db.commit()
 
     # First insert: 2 reactions
@@ -1750,13 +1731,11 @@ def test_insert_messages_with_fts_edit_idempotency_reactions(sync_db: sqlite3.Co
 
 def test_insert_messages_with_fts_edit_idempotency_entities(sync_db: sqlite3.Connection) -> None:
     """Inserting same message_id twice replaces entities (DELETE-before-INSERT)."""
-    from mcp_telegram.sync_worker import insert_messages_with_fts, ExtractedMessage
+    from mcp_telegram.sync_worker import ExtractedMessage, insert_messages_with_fts
 
     dialog_id = 9004
     message_id = 4
-    sync_db.execute(
-        "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')", (dialog_id,)
-    )
+    sync_db.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')", (dialog_id,))
     sync_db.commit()
 
     em1 = ExtractedMessage(
@@ -1786,13 +1765,11 @@ def test_insert_messages_with_fts_edit_idempotency_entities(sync_db: sqlite3.Con
 
 def test_insert_messages_with_fts_edit_idempotency_forwards(sync_db: sqlite3.Connection) -> None:
     """Inserting same message_id with no forward clears forward row."""
-    from mcp_telegram.sync_worker import insert_messages_with_fts, ExtractedMessage
+    from mcp_telegram.sync_worker import ExtractedMessage, insert_messages_with_fts
 
     dialog_id = 9005
     message_id = 5
-    sync_db.execute(
-        "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')", (dialog_id,)
-    )
+    sync_db.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')", (dialog_id,))
     sync_db.commit()
 
     em1 = ExtractedMessage(

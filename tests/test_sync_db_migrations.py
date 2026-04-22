@@ -2,6 +2,7 @@
 
 Covers v11: message_reactions_freshness side-table.
 """
+
 from __future__ import annotations
 
 import sqlite3
@@ -22,9 +23,7 @@ def test_migration_v11_creates_freshness_table(db_path: Path) -> None:
     conn = _open_sync_db(db_path)
     try:
         rows = list(
-            conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='message_reactions_freshness'"
-            )
+            conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='message_reactions_freshness'")
         )
         assert rows == [("message_reactions_freshness",)]
         cols = list(conn.execute("PRAGMA table_info(message_reactions_freshness)"))
@@ -115,14 +114,11 @@ def test_migration_v12_existing_rows_have_null_outbox(db_path: Path, tmp_path: P
     conn = _open_sync_db(db_path)
     try:
         conn.execute(
-            "INSERT INTO synced_dialogs (dialog_id, status, read_inbox_max_id) "
-            "VALUES (?, 'synced', ?)",
+            "INSERT INTO synced_dialogs (dialog_id, status, read_inbox_max_id) VALUES (?, 'synced', ?)",
             (4242, 5),
         )
         conn.commit()
-        row = conn.execute(
-            "SELECT read_outbox_max_id FROM synced_dialogs WHERE dialog_id=?", (4242,)
-        ).fetchone()
+        row = conn.execute("SELECT read_outbox_max_id FROM synced_dialogs WHERE dialog_id=?", (4242,)).fetchone()
         assert row[0] is None, "new rows default read_outbox_max_id to NULL"
     finally:
         conn.close()
@@ -164,14 +160,11 @@ def test_migration_v12_does_not_drop_inbox_column(db_path: Path) -> None:
         assert "read_inbox_max_id" in cols
         # Inbox column is still writable via the existing monotonic primitive.
         conn.execute(
-            "INSERT INTO synced_dialogs (dialog_id, status, read_inbox_max_id) "
-            "VALUES (?, 'synced', ?)",
+            "INSERT INTO synced_dialogs (dialog_id, status, read_inbox_max_id) VALUES (?, 'synced', ?)",
             (7777, 123),
         )
         conn.commit()
-        row = conn.execute(
-            "SELECT read_inbox_max_id FROM synced_dialogs WHERE dialog_id=?", (7777,)
-        ).fetchone()
+        row = conn.execute("SELECT read_inbox_max_id FROM synced_dialogs WHERE dialog_id=?", (7777,)).fetchone()
         assert row[0] == 123
     finally:
         conn.close()

@@ -1,4 +1,3 @@
-
 import logging
 import re
 import sqlite3
@@ -13,9 +12,7 @@ logger = logging.getLogger(__name__)
 CANDIDATE_THRESHOLD = 60
 
 # t.me link pattern: optional https://, optional www., t.me/username[/message_id]
-_TME_RE = re.compile(
-    r"^(?:https?://)?(?:www\.)?t\.me/([a-zA-Z_][a-zA-Z0-9_]{3,})(?:/(\d+))?$"
-)
+_TME_RE = re.compile(r"^(?:https?://)?(?:www\.)?t\.me/([a-zA-Z_][a-zA-Z0-9_]{3,})(?:/(\d+))?$")
 
 
 def latinize(text: str) -> str:
@@ -26,6 +23,7 @@ def latinize(text: str) -> str:
 @dataclass(frozen=True)
 class Resolved:
     """Exact match: entity uniquely identified."""
+
     entity_id: int
     display_name: str
 
@@ -33,12 +31,14 @@ class Resolved:
 @dataclass(frozen=True)
 class ResolvedWithMessage(Resolved):
     """Resolution result that also carries a message_id (from t.me/channel/123 links)."""
+
     message_id: int | None = None
 
 
 @dataclass(frozen=True)
 class Candidates:
     """Multiple matches found — caller should disambiguate."""
+
     query: str
     matches: list[dict]
     """Each dict: {entity_id: int, display_name: str, score: float, username: str|None, entity_type: str}."""
@@ -47,6 +47,7 @@ class Candidates:
 @dataclass(frozen=True)
 class NotFound:
     """No match found for the query."""
+
     query: str
 
 
@@ -121,9 +122,7 @@ def _fuzzy_resolve(
     - No exact → all hits ≥60 as Candidates
     """
     norm_map = _build_norm_map(display_name_map, normalized_name_map)
-    norm_name_to_id: dict[str, int] = {
-        norm_name: entries[0][0] for norm_name, entries in norm_map.items()
-    }
+    norm_name_to_id: dict[str, int] = {norm_name: entries[0][0] for norm_name, entries in norm_map.items()}
     norm_query = latinize(query)
 
     hits = process.extract(
@@ -216,10 +215,7 @@ def _build_matches(
         n = collision_count if collision_count is not None else len(matches)
         scope = matches[:n] if collision_count is not None else matches
         types = sorted({m["entity_type"] or "Unknown" for m in scope})
-        hint = (
-            f'{n} entities match "{collision_query}": {", ".join(types)}. '
-            f'Specify @username or numeric id.'
-        )
+        hint = f'{n} entities match "{collision_query}": {", ".join(types)}. Specify @username or numeric id.'
         for m in matches:
             m["disambiguation_hint"] = hint
     else:
@@ -244,7 +240,7 @@ def _make_match_info(entity_id: int, display_name: str, score: int, entity_cache
             if entity_cached:
                 entity_info["username"] = entity_cached.get("username")
                 entity_info["entity_type"] = entity_cached.get("type")
-        except (sqlite3.OperationalError, sqlite3.DatabaseError, OSError):
+        except sqlite3.OperationalError, sqlite3.DatabaseError, OSError:
             pass  # cache unavailable; proceed without enrichment
         except Exception:
             logger.warning("unexpected entity_cache error in fuzzy resolve for entity_id=%r", entity_id, exc_info=True)
@@ -288,7 +284,7 @@ def resolve(
             if result:
                 entity_id, name = result
                 return Resolved(entity_id=entity_id, display_name=name)
-        except (sqlite3.OperationalError, sqlite3.DatabaseError, OSError):
+        except sqlite3.OperationalError, sqlite3.DatabaseError, OSError:
             pass  # cache unavailable; fall through to NotFound
         except Exception:
             logger.warning("unexpected entity_cache error in @username resolve for query=%r", query, exc_info=True)

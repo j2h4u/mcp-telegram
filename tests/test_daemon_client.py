@@ -3,15 +3,14 @@
 Uses real asyncio Unix sockets in tests for protocol round-trip tests.
 Uses monkeypatching for error path tests.
 """
+
 from __future__ import annotations
 
 import asyncio
 import json
-import os
-import tempfile
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -19,9 +18,7 @@ from mcp_telegram.daemon_client import (
     DaemonConnection,
     DaemonNotRunningError,
     daemon_connection,
-    get_daemon_socket_path,
 )
-
 
 # ---------------------------------------------------------------------------
 # DaemonNotRunningError — not running when socket absent
@@ -56,8 +53,10 @@ async def test_daemon_not_running_connection_refused(tmp_path: Path) -> None:
     async def _raise_refused(path: str) -> Any:
         raise ConnectionRefusedError("Connection refused")
 
-    with patch("mcp_telegram.daemon_client.get_daemon_socket_path", return_value=sock_path), \
-         patch("asyncio.open_unix_connection", side_effect=ConnectionRefusedError("refused")):
+    with (
+        patch("mcp_telegram.daemon_client.get_daemon_socket_path", return_value=sock_path),
+        patch("asyncio.open_unix_connection", side_effect=ConnectionRefusedError("refused")),
+    ):
         with pytest.raises(DaemonNotRunningError) as exc_info:
             async with daemon_connection():
                 pass  # pragma: no cover

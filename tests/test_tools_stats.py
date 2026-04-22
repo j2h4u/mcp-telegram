@@ -1,15 +1,15 @@
 """MCP-layer tests for GetDialogStats tool (260416-frw)."""
+
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from mcp_telegram.tools._base import DaemonNotRunningError
 from mcp_telegram.tools.stats import GetDialogStats, get_dialog_stats
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -83,11 +83,13 @@ async def test_get_dialog_stats_formats_sections() -> None:
 @pytest.mark.asyncio
 async def test_get_dialog_stats_not_synced_error() -> None:
     """GetDialogStats with not_synced error returns actionable text referencing MarkDialogForSync."""
-    conn = _make_conn({
-        "ok": False,
-        "error": "not_synced",
-        "message": "GetDialogStats requires a synced dialog. Use MarkDialogForSync first.",
-    })
+    conn = _make_conn(
+        {
+            "ok": False,
+            "error": "not_synced",
+            "message": "GetDialogStats requires a synced dialog. Use MarkDialogForSync first.",
+        }
+    )
 
     with _patch_daemon(conn):
         content = await get_dialog_stats(GetDialogStats(dialog="Unknown Chat"))
@@ -99,16 +101,18 @@ async def test_get_dialog_stats_not_synced_error() -> None:
 @pytest.mark.asyncio
 async def test_get_dialog_stats_empty_sections() -> None:
     """GetDialogStats with all empty lists shows (none) in each section and result_count=0."""
-    conn = _make_conn({
-        "ok": True,
-        "data": {
-            "dialog_id": 1,
-            "top_reactions": [],
-            "top_mentions": [],
-            "top_hashtags": [],
-            "top_forwards": [],
-        },
-    })
+    conn = _make_conn(
+        {
+            "ok": True,
+            "data": {
+                "dialog_id": 1,
+                "top_reactions": [],
+                "top_mentions": [],
+                "top_hashtags": [],
+                "top_forwards": [],
+            },
+        }
+    )
 
     with _patch_daemon(conn):
         content = await get_dialog_stats(GetDialogStats(dialog="Empty Chat"))

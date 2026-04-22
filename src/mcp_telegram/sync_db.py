@@ -1,4 +1,3 @@
-
 import asyncio
 import fcntl
 import logging
@@ -216,11 +215,7 @@ def _schema_ready(conn: sqlite3.Connection) -> bool:
         return False
     try:
         row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
-        return (
-            row is not None
-            and row[0] is not None
-            and int(row[0]) >= _CURRENT_SCHEMA_VERSION
-        )
+        return row is not None and row[0] is not None and int(row[0]) >= _CURRENT_SCHEMA_VERSION
     except sqlite3.OperationalError:
         return False
 
@@ -232,9 +227,7 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     except sqlite3.OperationalError as exc:
         if "locked" not in str(exc).lower():
             raise
-        logger.debug(
-            "sync_db WAL pragma skipped (DB locked), will retry next open"
-        )
+        logger.debug("sync_db WAL pragma skipped (DB locked), will retry next open")
 
     conn.execute(
         """
@@ -273,20 +266,31 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
 
     if current < 3:
         from .fts import MESSAGES_FTS_DDL
+
         _migrate(3, [MESSAGES_FTS_DDL])
 
-    _migrate(4, [
-        _ENTITY_TABLE_DDL, _ENTITY_UPDATED_INDEX_DDL, _ENTITY_USERNAME_INDEX_DDL,
-        _REACTION_TABLE_DDL, _REACTION_INDEX_DDL,
-        _TOPIC_TABLE_DDL, _TOPIC_INDEX_DDL,
-        _MESSAGE_CACHE_TABLE_DDL, _MESSAGE_CACHE_INDEX_DDL,
-    ])
+    _migrate(
+        4,
+        [
+            _ENTITY_TABLE_DDL,
+            _ENTITY_UPDATED_INDEX_DDL,
+            _ENTITY_USERNAME_INDEX_DDL,
+            _REACTION_TABLE_DDL,
+            _REACTION_INDEX_DDL,
+            _TOPIC_TABLE_DDL,
+            _TOPIC_INDEX_DDL,
+            _MESSAGE_CACHE_TABLE_DDL,
+            _MESSAGE_CACHE_INDEX_DDL,
+        ],
+    )
 
     _migrate(5, [_TELEMETRY_EVENTS_DDL, _TELEMETRY_EVENTS_INDEX_DDL])
 
-    _migrate(6, [
-        # SQLite cannot ALTER COLUMN to drop NOT NULL — recreate with nullable name.
-        """CREATE TABLE entities_new (
+    _migrate(
+        6,
+        [
+            # SQLite cannot ALTER COLUMN to drop NOT NULL — recreate with nullable name.
+            """CREATE TABLE entities_new (
             id              INTEGER PRIMARY KEY,
             type            TEXT NOT NULL,
             name            TEXT,
@@ -294,52 +298,55 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             name_normalized TEXT,
             updated_at      INTEGER NOT NULL
         )""",
-        "INSERT INTO entities_new SELECT id, type, name, username, name_normalized, updated_at FROM entities",
-        "DROP TABLE entities",
-        "ALTER TABLE entities_new RENAME TO entities",
-        "CREATE INDEX IF NOT EXISTS idx_entities_type_updated ON entities(type, updated_at)",
-        "CREATE INDEX IF NOT EXISTS idx_entities_username ON entities(username)",
-        # Backfill tombstone rows for enrolled dialogs that have no entity row yet.
-        (
-            "INSERT OR IGNORE INTO entities (id, type, updated_at) "
-            "SELECT dialog_id, 'user', strftime('%s', 'now') "
-            "FROM synced_dialogs "
-            "WHERE dialog_id NOT IN (SELECT id FROM entities)"
-        ),
-    ])
+            "INSERT INTO entities_new SELECT id, type, name, username, name_normalized, updated_at FROM entities",
+            "DROP TABLE entities",
+            "ALTER TABLE entities_new RENAME TO entities",
+            "CREATE INDEX IF NOT EXISTS idx_entities_type_updated ON entities(type, updated_at)",
+            "CREATE INDEX IF NOT EXISTS idx_entities_username ON entities(username)",
+            # Backfill tombstone rows for enrolled dialogs that have no entity row yet.
+            (
+                "INSERT OR IGNORE INTO entities (id, type, updated_at) "
+                "SELECT dialog_id, 'user', strftime('%s', 'now') "
+                "FROM synced_dialogs "
+                "WHERE dialog_id NOT IN (SELECT id FROM entities)"
+            ),
+        ],
+    )
 
-    _migrate(7, [
-        # 1. Drop dead tables
-        "DROP TABLE IF EXISTS reaction_metadata",
-        "DROP TABLE IF EXISTS message_cache",
-        # 2. Add new columns to messages
-        "ALTER TABLE messages ADD COLUMN edit_date INTEGER",
-        "ALTER TABLE messages ADD COLUMN grouped_id INTEGER",
-        "ALTER TABLE messages ADD COLUMN reply_to_peer_id INTEGER",
-        # 3. Create message_reactions (WITHOUT ROWID -- composite PK)
-        """CREATE TABLE IF NOT EXISTS message_reactions (
+    _migrate(
+        7,
+        [
+            # 1. Drop dead tables
+            "DROP TABLE IF EXISTS reaction_metadata",
+            "DROP TABLE IF EXISTS message_cache",
+            # 2. Add new columns to messages
+            "ALTER TABLE messages ADD COLUMN edit_date INTEGER",
+            "ALTER TABLE messages ADD COLUMN grouped_id INTEGER",
+            "ALTER TABLE messages ADD COLUMN reply_to_peer_id INTEGER",
+            # 3. Create message_reactions (WITHOUT ROWID -- composite PK)
+            """CREATE TABLE IF NOT EXISTS message_reactions (
     dialog_id   INTEGER NOT NULL,
     message_id  INTEGER NOT NULL,
     emoji       TEXT NOT NULL,
     count       INTEGER NOT NULL,
     PRIMARY KEY (dialog_id, message_id, emoji)
 ) WITHOUT ROWID""",
-        # 4. Backfill reactions from JSON blob (runs before DROP COLUMN)
-        # json_valid() + json_type() guards: skip corrupted/malformed JSON and
-        # non-object shapes (arrays, scalars) that would produce bad rows.
-        (
-            "INSERT OR IGNORE INTO message_reactions "
-            "SELECT dialog_id, message_id, j.key, CAST(j.value AS INTEGER) "
-            "FROM messages, json_each(reactions) j "
-            "WHERE reactions IS NOT NULL AND json_valid(reactions) "
-            "AND json_type(reactions) = 'object'"
-        ),
-        # 5. Drop reactions column (SQLite 3.35+, confirmed 3.46.1)
-        "ALTER TABLE messages DROP COLUMN reactions",
-        # 6. Create message_entities
-        # 5-column PK (dialog_id, message_id, offset, length, type) prevents
-        # silent data loss when two entity types share the same byte offset.
-        """CREATE TABLE IF NOT EXISTS message_entities (
+            # 4. Backfill reactions from JSON blob (runs before DROP COLUMN)
+            # json_valid() + json_type() guards: skip corrupted/malformed JSON and
+            # non-object shapes (arrays, scalars) that would produce bad rows.
+            (
+                "INSERT OR IGNORE INTO message_reactions "
+                "SELECT dialog_id, message_id, j.key, CAST(j.value AS INTEGER) "
+                "FROM messages, json_each(reactions) j "
+                "WHERE reactions IS NOT NULL AND json_valid(reactions) "
+                "AND json_type(reactions) = 'object'"
+            ),
+            # 5. Drop reactions column (SQLite 3.35+, confirmed 3.46.1)
+            "ALTER TABLE messages DROP COLUMN reactions",
+            # 6. Create message_entities
+            # 5-column PK (dialog_id, message_id, offset, length, type) prevents
+            # silent data loss when two entity types share the same byte offset.
+            """CREATE TABLE IF NOT EXISTS message_entities (
     dialog_id   INTEGER NOT NULL,
     message_id  INTEGER NOT NULL,
     offset      INTEGER NOT NULL,
@@ -348,8 +355,8 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     value       TEXT,
     PRIMARY KEY (dialog_id, message_id, offset, length, type)
 ) WITHOUT ROWID""",
-        # 7. Create message_forwards
-        """CREATE TABLE IF NOT EXISTS message_forwards (
+            # 7. Create message_forwards
+            """CREATE TABLE IF NOT EXISTS message_forwards (
     dialog_id        INTEGER NOT NULL,
     message_id       INTEGER NOT NULL,
     fwd_from_peer_id INTEGER,
@@ -358,25 +365,32 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     fwd_channel_post INTEGER,
     PRIMARY KEY (dialog_id, message_id)
 ) WITHOUT ROWID""",
-        # 8. Reply-chain index
-        "CREATE INDEX IF NOT EXISTS idx_messages_reply ON messages(dialog_id, reply_to_msg_id)",
-    ])
+            # 8. Reply-chain index
+            "CREATE INDEX IF NOT EXISTS idx_messages_reply ON messages(dialog_id, reply_to_msg_id)",
+        ],
+    )
 
-    _migrate(8, [
-        "ALTER TABLE synced_dialogs ADD COLUMN read_inbox_max_id INTEGER",
-        "CREATE INDEX IF NOT EXISTS idx_synced_dialogs_status_read_position "
-        "ON synced_dialogs(status, read_inbox_max_id)",
-    ])
+    _migrate(
+        8,
+        [
+            "ALTER TABLE synced_dialogs ADD COLUMN read_inbox_max_id INTEGER",
+            "CREATE INDEX IF NOT EXISTS idx_synced_dialogs_status_read_position "
+            "ON synced_dialogs(status, read_inbox_max_id)",
+        ],
+    )
 
     # v9: DM sender discriminators — direction (out) and service-flag (is_service).
     # Phase 39's "sender_id IS NULL → System" rule was over-broad for DMs;
     # these columns let the read path distinguish outgoing DMs (out=1) from
     # true service messages (is_service=1). ADD COLUMN with DEFAULT is O(1)
     # metadata in SQLite — no row rewrite on large messages tables.
-    _migrate(9, [
-        "ALTER TABLE messages ADD COLUMN out INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE messages ADD COLUMN is_service INTEGER NOT NULL DEFAULT 0",
-    ])
+    _migrate(
+        9,
+        [
+            "ALTER TABLE messages ADD COLUMN out INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE messages ADD COLUMN is_service INTEGER NOT NULL DEFAULT 0",
+        ],
+    )
 
     # v10: backfill out=1 for historical outgoing DM rows. Pre-v9 writes had no
     # 'out' column, so v9 DEFAULT 0 left all historical rows at out=0. In DMs
@@ -384,24 +398,29 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     # sender_id IS NULL". Incoming DM rows always carry sender_id=peer_id, so
     # NULL sender_id in a DM is a reliable marker for outgoing. Idempotent:
     # subsequent runs find no matching rows (already out=1 or already labelled).
-    _migrate(10, [
-        "UPDATE messages SET out = 1 "
-        "WHERE out = 0 AND dialog_id > 0 AND sender_id IS NULL",
-    ])
+    _migrate(
+        10,
+        [
+            "UPDATE messages SET out = 1 WHERE out = 0 AND dialog_id > 0 AND sender_id IS NULL",
+        ],
+    )
 
     # v11 per CONTEXT.md §Scope#4: per-message freshness side-table chosen
     # over dialog-level timestamp (Codex HIGH: slice-bounded refresh +
     # dialog-level TTL = false freshness) and over column-on-messages
     # (keeps row width stable; separation of concerns). Missing row =
     # "never freshened" — Plan 02 JIT path triggers naturally.
-    _migrate(11, [
-        "CREATE TABLE IF NOT EXISTS message_reactions_freshness ("
-        "    dialog_id INTEGER NOT NULL, "
-        "    message_id INTEGER NOT NULL, "
-        "    checked_at INTEGER NOT NULL, "
-        "    PRIMARY KEY (dialog_id, message_id)"
-        ") WITHOUT ROWID",
-    ])
+    _migrate(
+        11,
+        [
+            "CREATE TABLE IF NOT EXISTS message_reactions_freshness ("
+            "    dialog_id INTEGER NOT NULL, "
+            "    message_id INTEGER NOT NULL, "
+            "    checked_at INTEGER NOT NULL, "
+            "    PRIMARY KEY (dialog_id, message_id)"
+            ") WITHOUT ROWID",
+        ],
+    )
 
     # v12 (Phase 39.3 R1): outbox-side read cursor symmetric to read_inbox_max_id
     # (Phase 38). Nullable; bootstrap (Plan 02) fills existing rows from
@@ -411,9 +430,12 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     # surrounding _migrate framework checking schema_version first. No
     # companion index — synced_dialogs is small (a few hundred rows); add
     # idx_synced_dialogs_status_outbox_null if it grows past a few thousand.
-    _migrate(12, [
-        "ALTER TABLE synced_dialogs ADD COLUMN read_outbox_max_id INTEGER",
-    ])
+    _migrate(
+        12,
+        [
+            "ALTER TABLE synced_dialogs ADD COLUMN read_outbox_max_id INTEGER",
+        ],
+    )
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 

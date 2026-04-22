@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 import sqlite3
-import threading
+import time
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
-
-import time
 
 from mcp_telegram.sync_db import (
     _CURRENT_SCHEMA_VERSION,
@@ -81,9 +79,7 @@ def test_synced_dialogs_schema(tmp_sync_db_path: Path) -> None:
             "read_inbox_max_id",
             "read_outbox_max_id",
         }
-        assert expected == set(columns.keys()), (
-            f"Unexpected columns. Got: {set(columns.keys())}, expected: {expected}"
-        )
+        assert expected == set(columns.keys()), f"Unexpected columns. Got: {set(columns.keys())}, expected: {expected}"
         # dialog_id is primary key
         assert columns["dialog_id"][5] == 1, "dialog_id must be PRIMARY KEY"
         # status default is 'not_synced'
@@ -125,9 +121,7 @@ def test_messages_schema(tmp_sync_db_path: Path) -> None:
             "out",
             "is_service",
         }
-        assert expected == set(columns.keys()), (
-            f"Unexpected columns. Got: {set(columns.keys())}, expected: {expected}"
-        )
+        assert expected == set(columns.keys()), f"Unexpected columns. Got: {set(columns.keys())}, expected: {expected}"
         # Both dialog_id and message_id are part of composite PK (pk > 0)
         assert columns["dialog_id"][5] > 0, "dialog_id must be part of PRIMARY KEY"
         assert columns["message_id"][5] > 0, "message_id must be part of PRIMARY KEY"
@@ -148,9 +142,7 @@ def test_message_versions_schema(tmp_sync_db_path: Path) -> None:
         rows = conn.execute("PRAGMA table_info(message_versions)").fetchall()
         columns = {str(row[1]): row for row in rows}
         expected = {"dialog_id", "message_id", "version", "old_text", "edit_date"}
-        assert expected == set(columns.keys()), (
-            f"Unexpected columns. Got: {set(columns.keys())}, expected: {expected}"
-        )
+        assert expected == set(columns.keys()), f"Unexpected columns. Got: {set(columns.keys())}, expected: {expected}"
         # dialog_id, message_id, version are all part of composite PK
         assert columns["dialog_id"][5] > 0, "dialog_id must be part of PRIMARY KEY"
         assert columns["message_id"][5] > 0, "message_id must be part of PRIMARY KEY"
@@ -169,9 +161,7 @@ def test_is_deleted_columns(tmp_sync_db_path: Path) -> None:
     ensure_sync_schema(tmp_sync_db_path)
     conn = _open_sync_db(tmp_sync_db_path)
     try:
-        conn.execute(
-            "INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (1, 100, 1700000000)"
-        )
+        conn.execute("INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (1, 100, 1700000000)")
         conn.commit()
         row = conn.execute(
             "SELECT is_deleted, deleted_at FROM messages WHERE dialog_id=1 AND message_id=100"
@@ -215,9 +205,7 @@ def test_schema_version_value(tmp_sync_db_path: Path) -> None:
     try:
         row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
         assert row is not None and row[0] is not None, "schema_version has no rows"
-        assert int(row[0]) == _CURRENT_SCHEMA_VERSION, (
-            f"Expected version {_CURRENT_SCHEMA_VERSION}, got {row[0]}"
-        )
+        assert int(row[0]) == _CURRENT_SCHEMA_VERSION, f"Expected version {_CURRENT_SCHEMA_VERSION}, got {row[0]}"
     finally:
         conn.close()
 
@@ -324,28 +312,22 @@ def test_migration_v10_backfills_out_for_dm_null_sender(tmp_sync_db_path: Path) 
         # Simulate pre-v10 state: all rows at out=0 (v9 DEFAULT). We bypass
         # the normal writer path and insert minimal rows.
         conn.executemany(
-            "INSERT INTO messages (dialog_id, message_id, sent_at, sender_id, text, out) "
-            "VALUES (?, ?, 0, ?, ?, 0)",
+            "INSERT INTO messages (dialog_id, message_id, sent_at, sender_id, text, out) VALUES (?, ?, 0, ?, ?, 0)",
             [
-                (268071163, 1, None, "dm outgoing pre-v9"),      # DM, NULL sender → should become out=1
-                (268071163, 2, 268071163, "dm incoming"),         # DM, peer sender → untouched
-                (-1001917057529, 3, None, "group svc or null"),   # group → untouched
-                (-1001917057529, 4, 999, "group with sender"),    # group → untouched
+                (268071163, 1, None, "dm outgoing pre-v9"),  # DM, NULL sender → should become out=1
+                (268071163, 2, 268071163, "dm incoming"),  # DM, peer sender → untouched
+                (-1001917057529, 3, None, "group svc or null"),  # group → untouched
+                (-1001917057529, 4, 999, "group with sender"),  # group → untouched
             ],
         )
         conn.commit()
 
         # Re-run migrations (idempotent): v10 UPDATE is the only one with work to do.
         # To exercise v10 in isolation, manually invoke the same UPDATE.
-        conn.execute(
-            "UPDATE messages SET out = 1 "
-            "WHERE out = 0 AND dialog_id > 0 AND sender_id IS NULL"
-        )
+        conn.execute("UPDATE messages SET out = 1 WHERE out = 0 AND dialog_id > 0 AND sender_id IS NULL")
         conn.commit()
 
-        rows = conn.execute(
-            "SELECT dialog_id, message_id, sender_id, out FROM messages ORDER BY message_id"
-        ).fetchall()
+        rows = conn.execute("SELECT dialog_id, message_id, sender_id, out FROM messages ORDER BY message_id").fetchall()
         # Row 1: DM + NULL sender → out=1
         assert rows[0][3] == 1, f"DM NULL-sender row should backfill to out=1, got {rows[0]}"
         # Row 2: DM + peer sender → out stays 0
@@ -381,13 +363,9 @@ def test_concurrent_read_during_write(tmp_sync_db_path: Path) -> None:
     writer = _open_sync_db(tmp_sync_db_path)
     try:
         writer.execute("BEGIN IMMEDIATE")
-        writer.execute(
-            "INSERT INTO synced_dialogs (dialog_id, status) VALUES (42, 'syncing')"
-        )
+        writer.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (42, 'syncing')")
         # Reader opens while writer transaction is active (not yet committed)
-        reader = sqlite3.connect(
-            f"file:{tmp_sync_db_path}?mode=ro", uri=True, timeout=5.0
-        )
+        reader = sqlite3.connect(f"file:{tmp_sync_db_path}?mode=ro", uri=True, timeout=5.0)
         try:
             # Should succeed — reads committed snapshot, not seeing the uncommitted INSERT
             rows = reader.execute("SELECT * FROM synced_dialogs").fetchall()
@@ -427,15 +405,9 @@ def test_sigterm_checkpoint(tmp_sync_db_path: Path) -> None:
     reopen = sqlite3.connect(str(tmp_sync_db_path), timeout=10.0)
     try:
         integrity = reopen.execute("PRAGMA integrity_check").fetchone()
-        assert integrity is not None and str(integrity[0]).lower() == "ok", (
-            f"integrity_check failed: {integrity}"
-        )
-        row = reopen.execute(
-            "SELECT status FROM synced_dialogs WHERE dialog_id=1"
-        ).fetchone()
-        assert row is not None and row[0] == "synced", (
-            f"Data not preserved after shutdown: {row}"
-        )
+        assert integrity is not None and str(integrity[0]).lower() == "ok", f"integrity_check failed: {integrity}"
+        row = reopen.execute("SELECT status FROM synced_dialogs WHERE dialog_id=1").fetchone()
+        assert row is not None and row[0] == "synced", f"Data not preserved after shutdown: {row}"
     finally:
         reopen.close()
 
@@ -455,9 +427,7 @@ def test_open_sync_db_reader_readonly(tmp_sync_db_path: Path) -> None:
         assert isinstance(rows, list)
         # INSERT must fail with OperationalError
         with pytest.raises(sqlite3.OperationalError):
-            reader.execute(
-                "INSERT INTO synced_dialogs (dialog_id) VALUES (999)"
-            )
+            reader.execute("INSERT INTO synced_dialogs (dialog_id) VALUES (999)")
     finally:
         reader.close()
 
@@ -485,12 +455,8 @@ def test_schema_v7_drops_reaction_metadata(tmp_sync_db_path: Path) -> None:
     ensure_sync_schema(tmp_sync_db_path)
     conn = _open_sync_db(tmp_sync_db_path)
     try:
-        tables = {r[0] for r in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        ).fetchall()}
-        assert "reaction_metadata" not in tables, (
-            f"reaction_metadata should be dropped in v7. Tables: {tables}"
-        )
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        assert "reaction_metadata" not in tables, f"reaction_metadata should be dropped in v7. Tables: {tables}"
     finally:
         conn.close()
 
@@ -503,9 +469,15 @@ def test_schema_v4_topic_metadata_table(tmp_sync_db_path: Path) -> None:
         rows = conn.execute("PRAGMA table_info(topic_metadata)").fetchall()
         columns = {str(row[1]) for row in rows}
         expected = {
-            "dialog_id", "topic_id", "title", "top_message_id",
-            "is_general", "is_deleted", "inaccessible_error",
-            "inaccessible_at", "updated_at",
+            "dialog_id",
+            "topic_id",
+            "title",
+            "top_message_id",
+            "is_general",
+            "is_deleted",
+            "inaccessible_error",
+            "inaccessible_at",
+            "updated_at",
         }
         assert expected == columns, f"Got: {columns}, expected: {expected}"
     finally:
@@ -517,12 +489,8 @@ def test_schema_v7_drops_message_cache(tmp_sync_db_path: Path) -> None:
     ensure_sync_schema(tmp_sync_db_path)
     conn = _open_sync_db(tmp_sync_db_path)
     try:
-        tables = {r[0] for r in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        ).fetchall()}
-        assert "message_cache" not in tables, (
-            f"message_cache should be dropped in v7. Tables: {tables}"
-        )
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        assert "message_cache" not in tables, f"message_cache should be dropped in v7. Tables: {tables}"
     finally:
         conn.close()
 
@@ -532,9 +500,7 @@ def test_schema_v4_indexes_exist(tmp_sync_db_path: Path) -> None:
     ensure_sync_schema(tmp_sync_db_path)
     conn = _open_sync_db(tmp_sync_db_path)
     try:
-        rows = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='index'"
-        ).fetchall()
+        rows = conn.execute("SELECT name FROM sqlite_master WHERE type='index'").fetchall()
         index_names = {str(r[0]) for r in rows}
         # Indexes that must still exist after v7
         expected_indexes = {
@@ -569,8 +535,15 @@ def test_schema_v5_telemetry_events_table(tmp_sync_db_path: Path) -> None:
         rows = conn.execute("PRAGMA table_info(telemetry_events)").fetchall()
         columns = {str(row[1]) for row in rows}
         expected = {
-            "id", "tool_name", "timestamp", "duration_ms", "result_count",
-            "has_cursor", "page_depth", "has_filter", "error_type",
+            "id",
+            "tool_name",
+            "timestamp",
+            "duration_ms",
+            "result_count",
+            "has_cursor",
+            "page_depth",
+            "has_filter",
+            "error_type",
         }
         assert expected == columns, f"Got: {columns}, expected: {expected}"
     finally:
@@ -672,11 +645,14 @@ def test_migrate_from_legacy_db_copies_entities(tmp_path: Path) -> None:
     conn = _open_sync_db(db_path)
 
     legacy_path = tmp_path / "entity_cache.db"
-    _make_entity_cache_db(legacy_path, [
-        (1, "user", "Alice", "alice", 1700000000),
-        (2, "user", "Bob", None, 1700000001),
-        (3, "group", "Test Group", "testgroup", 1700000002),
-    ])
+    _make_entity_cache_db(
+        legacy_path,
+        [
+            (1, "user", "Alice", "alice", 1700000000),
+            (2, "user", "Bob", None, 1700000001),
+            (3, "group", "Test Group", "testgroup", 1700000002),
+        ],
+    )
 
     copy_stmts = [
         "INSERT OR IGNORE INTO entities (id, type, name, username, updated_at) "
@@ -723,10 +699,13 @@ def test_migrate_from_legacy_db_insert_or_ignore_on_pk_conflict(tmp_path: Path) 
     conn.commit()
 
     legacy_path = tmp_path / "entity_cache.db"
-    _make_entity_cache_db(legacy_path, [
-        (1, "user", "LegacyName", None, 1700000000),  # conflict
-        (2, "user", "NewUser", None, 1700000001),
-    ])
+    _make_entity_cache_db(
+        legacy_path,
+        [
+            (1, "user", "LegacyName", None, 1700000000),  # conflict
+            (2, "user", "NewUser", None, 1700000001),
+        ],
+    )
 
     copy_stmts = [
         "INSERT OR IGNORE INTO entities (id, type, name, username, updated_at) "
@@ -735,9 +714,7 @@ def test_migrate_from_legacy_db_insert_or_ignore_on_pk_conflict(tmp_path: Path) 
     try:
         _migrate_from_legacy_db(conn, legacy_path, copy_stmts)
         row = conn.execute("SELECT name FROM entities WHERE id=1").fetchone()
-        assert row is not None and row[0] == "SyncName", (
-            f"sync.db row should win on conflict, got {row[0]}"
-        )
+        assert row is not None and row[0] == "SyncName", f"sync.db row should win on conflict, got {row[0]}"
         row2 = conn.execute("SELECT name FROM entities WHERE id=2").fetchone()
         assert row2 is not None and row2[0] == "NewUser"
     finally:
@@ -751,14 +728,17 @@ def test_migrate_from_legacy_db_telemetry_30day_filter(tmp_path: Path) -> None:
     conn = _open_sync_db(db_path)
 
     now = time.time()
-    recent = now - 86400       # 1 day ago — should be copied
-    old = now - 40 * 86400    # 40 days ago — should be excluded
+    recent = now - 86400  # 1 day ago — should be copied
+    old = now - 40 * 86400  # 40 days ago — should be excluded
 
     analytics_path = tmp_path / "analytics.db"
-    _make_analytics_db(analytics_path, [
-        ("ListMessages", recent, 100.0, 10, False, 1, False, None),
-        ("ListDialogs", old, 50.0, 5, False, 1, False, None),
-    ])
+    _make_analytics_db(
+        analytics_path,
+        [
+            ("ListMessages", recent, 100.0, 10, False, 1, False, None),
+            ("ListDialogs", old, 50.0, 5, False, 1, False, None),
+        ],
+    )
 
     copy_stmts = [
         "INSERT OR IGNORE INTO telemetry_events "
@@ -844,12 +824,7 @@ def test_schema_version_records_all_versions(tmp_path: Path) -> None:
 
     conn = _open_sync_db(db_path)
     try:
-        versions = [
-            row[0]
-            for row in conn.execute(
-                "SELECT version FROM schema_version ORDER BY version"
-            ).fetchall()
-        ]
+        versions = [row[0] for row in conn.execute("SELECT version FROM schema_version ORDER BY version").fetchall()]
         expected = list(range(1, _CURRENT_SCHEMA_VERSION + 1))
         assert versions == expected, f"expected versions {expected}, got {versions}"
     finally:
@@ -895,8 +870,12 @@ def test_message_forwards_table_exists(tmp_sync_db_path: Path) -> None:
         rows = conn.execute("PRAGMA table_info(message_forwards)").fetchall()
         columns = {str(row[1]) for row in rows}
         expected = {
-            "dialog_id", "message_id", "fwd_from_peer_id",
-            "fwd_from_name", "fwd_date", "fwd_channel_post",
+            "dialog_id",
+            "message_id",
+            "fwd_from_peer_id",
+            "fwd_from_name",
+            "fwd_date",
+            "fwd_channel_post",
         }
         assert expected == columns, f"Got: {columns}, expected: {expected}"
     finally:
@@ -912,12 +891,8 @@ def test_messages_has_new_v7_columns(tmp_sync_db_path: Path) -> None:
         col_map = {str(row[1]): row for row in rows}
         for col in ("edit_date", "grouped_id", "reply_to_peer_id"):
             assert col in col_map, f"Column {col!r} missing from messages table"
-            assert col_map[col][2].upper() == "INTEGER", (
-                f"Column {col!r} type should be INTEGER, got {col_map[col][2]}"
-            )
-            assert col_map[col][3] == 0, (
-                f"Column {col!r} should be nullable (notnull=0), got {col_map[col][3]}"
-            )
+            assert col_map[col][2].upper() == "INTEGER", f"Column {col!r} type should be INTEGER, got {col_map[col][2]}"
+            assert col_map[col][3] == 0, f"Column {col!r} should be nullable (notnull=0), got {col_map[col][3]}"
     finally:
         conn.close()
 
@@ -927,9 +902,7 @@ def test_idx_messages_reply_exists(tmp_sync_db_path: Path) -> None:
     ensure_sync_schema(tmp_sync_db_path)
     conn = _open_sync_db(tmp_sync_db_path)
     try:
-        row = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_messages_reply'"
-        ).fetchone()
+        row = conn.execute("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_messages_reply'").fetchone()
         assert row is not None, "idx_messages_reply index missing after v7 migration"
     finally:
         conn.close()
@@ -958,8 +931,7 @@ def test_v7_backfill_reactions_from_json(tmp_path: Path) -> None:
     # We test backfill by using a FRESH DB where we manually inject v6-like data
     # before the v7 migration runs. We do this by creating a DB with just the
     # v6 schema (messages with reactions column) and then importing the migration.
-    import sqlite3 as _sqlite3
-    from mcp_telegram.sync_db import _open_sync_db, _apply_migrations
+    from mcp_telegram.sync_db import _open_sync_db
 
     conn = _open_sync_db(db_path)
     try:
@@ -967,8 +939,7 @@ def test_v7_backfill_reactions_from_json(tmp_path: Path) -> None:
         # We create a minimal v6-like schema directly.
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute(
-            "CREATE TABLE IF NOT EXISTS schema_version "
-            "(version INTEGER NOT NULL, applied_at INTEGER NOT NULL)"
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL, applied_at INTEGER NOT NULL)"
         )
         conn.execute(
             """CREATE TABLE IF NOT EXISTS messages (
@@ -1051,15 +1022,13 @@ def test_v7_backfill_reactions_from_json(tmp_path: Path) -> None:
         )
         # Mark versions 1-6 as applied
         for v in range(1, 7):
-            conn.execute(
-                "INSERT INTO schema_version VALUES (?, strftime('%s', 'now'))", (v,)
-            )
+            conn.execute("INSERT INTO schema_version VALUES (?, strftime('%s', 'now'))", (v,))
 
         # Insert test rows with various reactions values
         valid_json = json.dumps({"👍": 3, "❤": 1})
         malformed_json = "not json"
         array_json = "[1, 2, 3]"  # valid JSON but not an object
-        scalar_json = '"hello"'   # valid JSON but not an object
+        scalar_json = '"hello"'  # valid JSON but not an object
 
         conn.execute(
             "INSERT INTO messages (dialog_id, message_id, sent_at, reactions) VALUES (1, 10, 1, ?)",
@@ -1099,9 +1068,7 @@ def test_v7_backfill_reactions_from_json(tmp_path: Path) -> None:
             "SELECT emoji, count FROM message_reactions WHERE dialog_id=1 AND message_id=10 ORDER BY emoji"
         ).fetchall()
         reaction_dict = {r[0]: r[1] for r in reaction_rows}
-        assert reaction_dict == {"👍": 3, "❤": 1}, (
-            f"Valid JSON reactions should be backfilled. Got: {reaction_dict}"
-        )
+        assert reaction_dict == {"👍": 3, "❤": 1}, f"Valid JSON reactions should be backfilled. Got: {reaction_dict}"
 
         # Malformed JSON row: no reactions backfilled (json_valid() guard)
         malformed_rows = conn.execute(
@@ -1182,13 +1149,10 @@ def test_v8_index_on_status_and_read_position_exists(tmp_sync_db_path: Path) -> 
     conn = _open_sync_db(tmp_sync_db_path)
     try:
         rows = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='index' "
-            "AND tbl_name='synced_dialogs'"
+            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='synced_dialogs'"
         ).fetchall()
         index_names = {row[0] for row in rows}
-        assert "idx_synced_dialogs_status_read_position" in index_names, (
-            f"Index missing; found: {sorted(index_names)}"
-        )
+        assert "idx_synced_dialogs_status_read_position" in index_names, f"Index missing; found: {sorted(index_names)}"
     finally:
         conn.close()
 
@@ -1210,12 +1174,9 @@ def test_message_entities_pk_allows_same_offset_different_type(tmp_sync_db_path:
         conn.commit()
 
         rows = conn.execute(
-            "SELECT type, value FROM message_entities "
-            "WHERE dialog_id=1 AND message_id=100 ORDER BY type"
+            "SELECT type, value FROM message_entities WHERE dialog_id=1 AND message_id=100 ORDER BY type"
         ).fetchall()
-        assert len(rows) == 2, (
-            f"Both entity rows must be retained with 5-column PK. Got: {rows}"
-        )
+        assert len(rows) == 2, f"Both entity rows must be retained with 5-column PK. Got: {rows}"
         types = {r[0] for r in rows}
         assert types == {"mention", "hashtag"}
     finally:

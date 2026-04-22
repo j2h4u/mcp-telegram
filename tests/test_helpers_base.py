@@ -1,14 +1,13 @@
 """Tests for shared helpers in tools/_base.py and daemon.py."""
+
 from __future__ import annotations
 
-import asyncio
 import sqlite3
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from mcp_telegram.tools._base import _check_daemon_response, ToolResult
-
+from mcp_telegram.tools._base import ToolResult, _check_daemon_response
 
 # ---------------------------------------------------------------------------
 # _check_daemon_response (M-13)
@@ -34,7 +33,8 @@ def test_check_daemon_response_missing_message_uses_default():
 def test_check_daemon_response_passes_extra_kwargs():
     result = _check_daemon_response(
         {"ok": False, "message": "err"},
-        has_filter=True, has_cursor=True,
+        has_filter=True,
+        has_cursor=True,
     )
     assert result.has_filter is True
     assert result.has_cursor is True
@@ -48,7 +48,7 @@ def test_check_daemon_response_passes_extra_kwargs():
 @pytest.mark.asyncio
 async def test_maybe_heartbeat_fires_when_interval_elapsed():
     """Heartbeat fires when enough time has passed."""
-    from mcp_telegram.daemon import _maybe_heartbeat_and_gap_scan, HEARTBEAT_INTERVAL_S
+    from mcp_telegram.daemon import HEARTBEAT_INTERVAL_S, _maybe_heartbeat_and_gap_scan
 
     conn = MagicMock(spec=sqlite3.Connection)
     # Make the stats query return something
@@ -65,13 +65,19 @@ async def test_maybe_heartbeat_fires_when_interval_elapsed():
     handler_manager.run_dm_gap_scan = AsyncMock(return_value=0)
 
     import time
+
     sync_start = time.monotonic()
     # Set last_heartbeat far in the past to trigger
     old_heartbeat = sync_start - HEARTBEAT_INTERVAL_S - 1
     old_gap_scan = sync_start  # gap scan should NOT fire
 
     new_hb, new_gs = await _maybe_heartbeat_and_gap_scan(
-        conn, client, handler_manager, sync_start, old_heartbeat, old_gap_scan,
+        conn,
+        client,
+        handler_manager,
+        sync_start,
+        old_heartbeat,
+        old_gap_scan,
     )
 
     assert new_hb > old_heartbeat, "heartbeat timestamp should be updated"
@@ -88,10 +94,16 @@ async def test_maybe_heartbeat_skips_when_recent():
     handler_manager = MagicMock()
 
     import time
+
     now = time.monotonic()
 
     new_hb, new_gs = await _maybe_heartbeat_and_gap_scan(
-        conn, client, handler_manager, now, now, now,
+        conn,
+        client,
+        handler_manager,
+        now,
+        now,
+        now,
     )
 
     assert new_hb == now, "heartbeat timestamp should not change"
