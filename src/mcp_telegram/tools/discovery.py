@@ -29,12 +29,18 @@ class ListDialogs(ToolArgs):
     organization tool, not data archival). Set exclude_archived=True to show only non-archived
     dialogs (equivalent to old archived=False behavior).
 
+    Pass `filter` to narrow by dialog name: case- and script-insensitive fuzzy match.
+    Order: substring in latinized space → word-initials acronym (for 2-4 char queries,
+    e.g. "ЖС" → "KS x Женские Сезоны") → typo-tolerant partial ratio. Prefer a filter
+    over loading the full list.
+
     DM rows include integer 'unread_in' (incoming unread by me) and 'unread_out' (outgoing
     unread by peer); non-DM rows omit both fields.
     """
 
     exclude_archived: bool = False
     ignore_pinned: bool = False
+    filter: str | None = Field(default=None, max_length=200)
 
 
 @mcp_tool("secondary/helper", annotations=ToolAnnotations(readOnlyHint=True))
@@ -44,6 +50,7 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
             response = await conn.list_dialogs(
                 exclude_archived=args.exclude_archived,
                 ignore_pinned=args.ignore_pinned,
+                filter=args.filter,
             )
     except DaemonNotRunningError:
         return ToolResult(content=_text_response(_daemon_not_running_text()))

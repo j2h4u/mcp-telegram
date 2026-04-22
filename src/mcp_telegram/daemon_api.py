@@ -174,6 +174,7 @@ def _read_state_for_dialog(conn: sqlite3.Connection, dialog_id: int, dialog_type
 USER_TTL: int = 2_592_000  # 30 days
 GROUP_TTL: int = 604_800  # 7 days
 
+from rapidfuzz import fuzz as _fuzz
 from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
 
 from .budget import allocate_message_budget_proportional, unread_chat_tier
@@ -1669,6 +1670,22 @@ class DaemonAPIServer:
 
         exclude_archived: bool = req.get("exclude_archived", False)
         ignore_pinned: bool = req.get("ignore_pinned", False)
+        name_filter_raw: str | None = req.get("filter")
+
+        # Prepare fuzzy filter state. Empty / whitespace-only filter is treated
+        # as no filter. We normalize via `latinize` (same as resolver) so the
+        # comparison is case- and script-insensitive. Matching strategy:
+        #   1. substring in normalized space — captures the typical "give me
+        #      anything with 'женск'" intent without surprising fuzzy expansion
+        #   2. Word-initials match — short queries (2-4 chars) treated as
+        #      acronyms against word-initial sequences of the dialog name
+        #      (e.g. "ЖС" → "zs" hits "KS x Женские Сезоны" which initials to "kxzs").
+        #   3. rapidfuzz.partial_ratio >= 80 fallback for queries AND targets ≥ 4 chars.
+        filter_norm: str | None = None
+        if name_filter_raw is not None:
+            stripped = name_filter_raw.strip()
+            if stripped:
+                filter_norm = latinize(stripped)
 
         archived_filter = False if exclude_archived else None
 
@@ -1680,6 +1697,39 @@ class DaemonAPIServer:
             ):
                 entity = getattr(d, "entity", None)
                 entity_type = _classify_dialog_type(entity)
+
+                # Name filter (tool-level convenience: Telethon iter_dialogs has
+                # no server-side filter — we scan everything and screen here).
+                # Match order (first-hit wins):
+                #   1. Substring in latinized space — primary. "женск" hits
+                #      "Женские сезоны" cleanly.
+                #   2. Word-initials match — short upper/mixed queries treated as
+                #      acronyms. "ЖС" → initials "zs" → matches any dialog whose
+                #      word-initial sequence contains "zs" (e.g. "KS x Женские
+                #      Сезоны" → initials "kxzs").
+                #   3. rapidfuzz.partial_ratio ≥ 80 — typo-tolerant fallback for
+                #      queries AND targets ≥ 4 chars (avoids short-name noise).
+                if filter_norm is not None:
+                    raw_name = getattr(d, "name", None) or ""
+                    if not raw_name:
+                        continue
+                    name_norm = latinize(raw_name)
+                    # Acronym initials use raw case-folded chars — latinizing
+                    # would expand "Ж" to "zh" and break single-char-per-word matching.
+                    name_initials_raw = "".join(w[0] for w in raw_name.split() if w).lower()
+                    filter_raw_lc = (name_filter_raw or "").strip().lower()
+                    if filter_norm in name_norm:
+                        pass
+                    elif 2 <= len(filter_raw_lc) <= 4 and filter_raw_lc in name_initials_raw:
+                        pass  # acronym hit ("ЖС" → "жс" ⊆ "kxжс")
+                    elif (
+                        len(filter_norm) >= 4
+                        and len(name_norm) >= 4
+                        and _fuzz.partial_ratio(filter_norm, name_norm) >= 80
+                    ):
+                        pass  # typo-tolerant fuzzy hit
+                    else:
+                        continue
                 last_msg_at: int | None = None
                 if getattr(d, "date", None) is not None:
                     try:

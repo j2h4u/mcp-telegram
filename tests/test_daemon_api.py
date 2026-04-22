@@ -647,6 +647,103 @@ async def test_list_dialogs_sync_status() -> None:
     assert by_id[2]["sync_status"] == "not_synced"
 
 
+@pytest.mark.asyncio
+async def test_list_dialogs_filter_substring_latinized() -> None:
+    """filter='женск' matches 'KS x Женские сезоны' via latinized substring."""
+    conn = _make_db()
+    dialogs = [
+        ("KS x Женские сезоны", -100),
+        ("Random Chat", -200),
+        ("Golang Дайджест", -300),
+    ]
+    mocks = []
+    for name, did in dialogs:
+        m = MagicMock()
+        m.id = did
+        m.name = name
+        m.entity = MagicMock()
+        m.entity.__class__.__name__ = "Chat"
+        m.date = MagicMock()
+        m.date.timestamp.return_value = 1700000000.0
+        m.unread_count = 0
+        mocks.append(m)
+
+    async def _iter(*args: Any, **kwargs: Any):  # type: ignore[misc]
+        for m in mocks:
+            yield m
+
+    client = MagicMock()
+    client.iter_dialogs = _iter
+    server = make_server(conn, client)
+
+    out = await server._list_dialogs({"filter": "женск"})
+    names = {d["name"] for d in out["data"]["dialogs"]}
+    assert "KS x Женские сезоны" in names
+    assert "Random Chat" not in names
+
+
+@pytest.mark.asyncio
+async def test_list_dialogs_filter_acronym() -> None:
+    """filter='ЖС' matches 'KS x Женские сезоны' via word-initials (к,x,ж,с → кxжс)."""
+    conn = _make_db()
+    dialogs = [
+        ("KS x Женские Сезоны", -100),
+        ("Random Channel", -200),
+    ]
+    mocks = []
+    for name, did in dialogs:
+        m = MagicMock()
+        m.id = did
+        m.name = name
+        m.entity = MagicMock()
+        m.entity.__class__.__name__ = "Chat"
+        m.date = MagicMock()
+        m.date.timestamp.return_value = 1700000000.0
+        m.unread_count = 0
+        mocks.append(m)
+
+    async def _iter(*args: Any, **kwargs: Any):  # type: ignore[misc]
+        for m in mocks:
+            yield m
+
+    client = MagicMock()
+    client.iter_dialogs = _iter
+    server = make_server(conn, client)
+
+    out = await server._list_dialogs({"filter": "ЖС"})
+    names = {d["name"] for d in out["data"]["dialogs"]}
+    assert names == {"KS x Женские Сезоны"}
+
+
+@pytest.mark.asyncio
+async def test_list_dialogs_filter_empty_and_none_are_noop() -> None:
+    """Missing filter / empty string must NOT filter anything (backward-compat)."""
+    conn = _make_db()
+    mocks = []
+    for i, name in enumerate(["Alpha", "Beta"]):
+        m = MagicMock()
+        m.id = -(100 + i)
+        m.name = name
+        m.entity = MagicMock()
+        m.entity.__class__.__name__ = "Chat"
+        m.date = MagicMock()
+        m.date.timestamp.return_value = 1700000000.0
+        m.unread_count = 0
+        mocks.append(m)
+
+    async def _iter(*args: Any, **kwargs: Any):  # type: ignore[misc]
+        for m in mocks:
+            yield m
+
+    client = MagicMock()
+    client.iter_dialogs = _iter
+
+    for req in ({}, {"filter": None}, {"filter": "   "}):
+        server = make_server(conn, client)
+        out = await server._list_dialogs(req)
+        assert len(out["data"]["dialogs"]) == 2, req
+
+
 # ---------------------------------------------------------------------------
 # list_topics — through daemon
 # ---------------------------------------------------------------------------

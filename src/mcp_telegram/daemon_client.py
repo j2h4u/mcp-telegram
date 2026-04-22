@@ -200,15 +200,17 @@ class DaemonConnection:
         *,
         exclude_archived: bool = False,
         ignore_pinned: bool = False,
+        filter: str | None = None,
     ) -> dict:
-        """List dialogs with optional archive/pin filtering."""
-        return await self.request(
-            {
-                "method": "list_dialogs",
-                "exclude_archived": exclude_archived,
-                "ignore_pinned": ignore_pinned,
-            }
-        )
+        """List dialogs with optional archive/pin/name filtering."""
+        payload: dict = {
+            "method": "list_dialogs",
+            "exclude_archived": exclude_archived,
+            "ignore_pinned": ignore_pinned,
+        }
+        if filter is not None:
+            payload["filter"] = filter
+        return await self.request(payload)
 
     async def list_topics(
         self,
