@@ -164,7 +164,14 @@ def _fuzzy_resolve(
                 query,
                 len(exact_entries),
             )
-            matches = _build_matches(hits, norm_map, entity_cache, exact_first_id=exact_entity_id, collision_query=query)
+            matches = _build_matches(
+                hits,
+                norm_map,
+                entity_cache,
+                exact_first_id=exact_entity_id,
+                collision_query=query,
+                collision_count=len(exact_entries),
+            )
             return Candidates(query=query, matches=matches)
         return Resolved(entity_id=exact_entity_id, display_name=exact_display_name)
 
@@ -178,11 +185,15 @@ def _build_matches(
     entity_cache: Any | None,
     exact_first_id: int | None = None,
     collision_query: str | None = None,
+    collision_count: int | None = None,
 ) -> list[dict]:
     """Build match dicts from rapidfuzz hits, optionally putting exact_first_id first.
 
     When collision_query is provided (≥2 entities share the same normalized name),
-    a ``disambiguation_hint`` string is added to every match dict.
+    a ``disambiguation_hint`` string is added to every match dict. The hint reports
+    ``collision_count`` (the true number of norm-name collisions) rather than the full
+    fuzzy match list, and restricts the type list to the first ``collision_count`` entries
+    (the exact-match leaders), which are the actual ambiguous candidates.
     """
     matches: list[dict] = []
     seen_ids: set[int] = set()
@@ -202,8 +213,9 @@ def _build_matches(
             matches.append(_make_match_info(entity_id, original_name, int(score), entity_cache))
 
     if collision_query is not None:
-        n = len(matches)
-        types = sorted({m["entity_type"] or "Unknown" for m in matches})
+        n = collision_count if collision_count is not None else len(matches)
+        scope = matches[:n] if collision_count is not None else matches
+        types = sorted({m["entity_type"] or "Unknown" for m in scope})
         hint = (
             f'{n} entities match "{collision_query}": {", ".join(types)}. '
             f'Specify @username or numeric id.'
@@ -236,6 +248,14 @@ def _make_match_info(entity_id: int, display_name: str, score: int, entity_cache
             pass  # cache unavailable; proceed without enrichment
         except Exception:
             logger.warning("unexpected entity_cache error in fuzzy resolve for entity_id=%r", entity_id, exc_info=True)
+    if entity_info["entity_type"] is None:
+        # Telegram id-sign convention: positive=user, -100…=channel/supergroup, other negative=chat/group.
+        if entity_id > 0:
+            entity_info["entity_type"] = "User"
+        elif str(entity_id).startswith("-100"):
+            entity_info["entity_type"] = "Channel"
+        else:
+            entity_info["entity_type"] = "Group"
     return entity_info
 
 

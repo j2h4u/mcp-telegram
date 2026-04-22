@@ -253,13 +253,18 @@ def test_candidates_include_metadata_from_cache(mock_cache) -> None:
     assert match_101["entity_type"] == "user"
 
 
-def test_candidates_without_cache_have_none_metadata() -> None:
-    choices = {101: "Sergei Khabarov", 102: "Sergei Ivanov"}
+def test_candidates_without_cache_derive_type_from_id_sign() -> None:
+    """No cache → username is None, but entity_type is derived from the Telegram id sign
+    convention (positive=User, -100…=Channel, other negative=Group). This keeps the
+    disambiguation_hint informative even before entity_cache is populated."""
+    choices = {101: "Sergei Khabarov", 102: "Sergei Ivanov", -1001234567: "Sergei Ch"}
     result = resolve("сергей", choices, entity_cache=None)
     assert isinstance(result, Candidates)
-    for match in result.matches:
-        assert match["username"] is None
-        assert match["entity_type"] is None
+    by_id = {m["entity_id"]: m for m in result.matches}
+    assert by_id[101]["username"] is None
+    assert by_id[101]["entity_type"] == "User"
+    assert by_id[102]["entity_type"] == "User"
+    assert by_id[-1001234567]["entity_type"] == "Channel"
 
 
 def test_exact_match_among_fuzzy_returns_candidates_single_word() -> None:
