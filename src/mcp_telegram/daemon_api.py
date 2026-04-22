@@ -48,6 +48,7 @@ from telethon.tl.functions.messages import (  # type: ignore[import-untyped]
     GetDialogFiltersRequest,
     GetForumTopicsRequest,
 )
+from telethon.tl.functions.photos import GetUserPhotosRequest  # type: ignore[import-untyped]
 from telethon.tl.functions.users import GetFullUserRequest  # type: ignore[import-untyped]
 from telethon.tl.types import Channel, Chat  # type: ignore[import-untyped]
 from xdg_base_dirs import xdg_state_home  # type: ignore[import-error]
@@ -2139,6 +2140,31 @@ class DaemonAPIServer:
                 }
             )
 
+        # Fetch profile photo history (OSINT: avatar change frequency).
+        # Thin pass-through of photos.GetUserPhotos — only id+date exposed,
+        # no binary content. Telegram caps at ~100 per request.
+        # Order: fetched last so existing common+full mock sequences in tests stay stable.
+        photos: list[dict] = []
+        try:
+            photos_result = await self._client(
+                GetUserPhotosRequest(user_id=user, offset=0, max_id=0, limit=100)
+            )
+            for photo in getattr(photos_result, "photos", []):
+                photo_id = getattr(photo, "id", None)
+                photo_date = getattr(photo, "date", None)
+                if photo_id is None or photo_date is None:
+                    continue
+                photos.append(
+                    {
+                        "photo_id": int(photo_id),
+                        "date": photo_date.isoformat(),
+                    }
+                )
+        except Exception as exc:
+            logger.warning(
+                "get_user_info photos_failed user_id=%r error=%s%s", user_id, exc, _rid(), exc_info=True
+            )
+
         return {
             "ok": True,
             "data": {
@@ -2176,6 +2202,7 @@ class DaemonAPIServer:
                 "folder_id": folder_id,
                 "folder_name": folder_name,
                 "common_chats": common_chats,
+                "photos": photos,
             },
         }
 

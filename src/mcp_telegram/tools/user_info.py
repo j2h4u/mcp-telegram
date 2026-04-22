@@ -1,3 +1,5 @@
+from datetime import UTC, datetime
+
 import phonenumbers
 from pydantic import Field
 
@@ -16,6 +18,33 @@ from ._base import (
     daemon_connection,
     mcp_tool,
 )
+
+
+def _format_relative_ymd(iso_date: str, now: datetime | None = None) -> str:
+    """Render an ISO date as a coarse relative string (year/month/day granularity).
+
+    Examples: "3y ago", "5mo ago", "2d ago", "today".
+    """
+    try:
+        then = datetime.fromisoformat(iso_date)
+    except ValueError:
+        return iso_date
+    if then.tzinfo is None:
+        then = then.replace(tzinfo=UTC)
+    reference = now or datetime.now(tz=UTC)
+    delta_days = (reference.date() - then.date()).days
+    if delta_days <= 0:
+        return "today"
+    years, rem = divmod(delta_days, 365)
+    months, days = divmod(rem, 30)
+    parts: list[str] = []
+    if years:
+        parts.append(f"{years}y")
+    if months:
+        parts.append(f"{months}mo")
+    if days and not years:  # keep low-precision for distant past
+        parts.append(f"{days}d")
+    return (" ".join(parts) + " ago") if parts else f"{delta_days}d ago"
 
 
 def _phone_country(phone: str) -> str | None:
@@ -51,7 +80,8 @@ class GetUserInfo(ToolArgs):
     Look up a Telegram user by name. Returns their full profile: id, name, username(s),
     bio, phone (with country), language, online status, relationship (contact/blocked),
     status flags (verified, premium, bot, scam, fake), emoji status, personal channel,
-    birthday, folder, business info, and common chats with this account.
+    birthday, folder, business info, common chats, and profile-photo history
+    (each avatar's id and relative+absolute change date — useful for OSINT).
     Resolves the name via fuzzy match — returns candidates if ambiguous.
     """
 
@@ -265,6 +295,20 @@ async def get_user_info(args: GetUserInfo) -> ToolResult:
     # Personal note
     if note:
         lines.append(f"note: {note}")
+
+    # Profile photo history (OSINT: avatar change cadence).
+    # Thin pass-through of photos.GetUserPhotos — id + date only, no binaries.
+    # Telegram returns newest-first and caps at ~100 per request.
+    photos: list[dict] = data.get("photos", []) or []
+    if photos:
+        photo_lines = [f"profile_photos ({len(photos)}):"]
+        now = datetime.now(tz=UTC)
+        for idx, photo in enumerate(photos, start=1):
+            iso = photo.get("date", "")
+            relative = _format_relative_ymd(iso, now=now)
+            absolute = iso[:10] if iso else "?"
+            photo_lines.append(f"  {idx}. {relative} ({absolute}) id={photo.get('photo_id')}")
+        lines.append("\n".join(photo_lines))
 
     lines.append(f"Common chats ({len(common_chats)}):\n{chats_text}")
 
