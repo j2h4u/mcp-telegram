@@ -319,8 +319,8 @@ def test_property_not_found_disjoint(ids: tuple[int, int], name_a: str, name_b: 
     """Query with no token overlap against display_name_map → NotFound (threshold guard)."""
     id_a, id_b = ids
     dm = {id_a: name_a, id_b: name_b}
-    # Use a query that is clearly disjoint: pure digits (not in display_name_map) → NotFound
-    disjoint_query = "zzzzzzzzzzzzzzzzzzzz"  # no overlap with any reasonable name
+    # Pure digits are parsed as exact_id, never fuzzy-matched against display names → NotFound
+    disjoint_query = "99999999999"
     result = resolve(disjoint_query, dm)
     # Should be NotFound since score will be below threshold; Candidates would be a false positive
     assert isinstance(result, NotFound), f"Disjoint query should be NotFound, got {result}"
