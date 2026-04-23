@@ -24,7 +24,7 @@
       "_comment": "ListTopics — non-forum channel returns graceful response (no crash)",
       "action": "call_tool",
       "name": "ListTopics",
-      "arguments": {"dialog": "khabaroff.studio: AI"},
+      "arguments": {"dialog": "Vibecoding is so last year"},
       "expect": {
         "is_error": false
       }
@@ -33,7 +33,7 @@
       "_comment": "ListMessages — synced channel",
       "action": "call_tool",
       "name": "ListMessages",
-      "arguments": {"dialog": "khabaroff.studio: AI", "limit": 3},
+      "arguments": {"dialog": "Vibecoding is so last year", "limit": 3},
       "expect": {
         "is_error": false
       }
@@ -51,7 +51,7 @@
       "_comment": "SearchMessages — keyword search in synced channel",
       "action": "call_tool",
       "name": "SearchMessages",
-      "arguments": {"dialog": "khabaroff.studio: AI", "query": "ai", "limit": 3},
+      "arguments": {"dialog": "Vibecoding is so last year", "query": "ai", "limit": 3},
       "expect": {
         "is_error": false
       }
@@ -88,7 +88,7 @@
       "_comment": "GetDialogStats — top reactions/mentions/hashtags/reposts for a synced dialog",
       "action": "call_tool",
       "name": "GetDialogStats",
-      "arguments": {"dialog": "khabaroff.studio: AI", "top_n": 3},
+      "arguments": {"dialog": "Vibecoding is so last year", "top_n": 3},
       "expect": {
         "is_error": false,
         "content_text_contains": ["=== Top Reactions"]
