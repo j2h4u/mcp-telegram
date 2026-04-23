@@ -1,207 +1,48 @@
-# Telegram MCP server
+# mcp-telegram
 
-- [Telegram MCP server](#telegram-mcp-server)
-  - [About](#about)
-  - [What is MCP?](#what-is-mcp)
-  - [What does this server do?](#what-does-this-server-do)
-  - [Practical use cases](#practical-use-cases)
-  - [Prerequisites](#prerequisites)
-  - [Installation](#installation)
-  - [Configuration](#configuration)
-    - [Telegram API Configuration](#telegram-api-configuration)
-    - [Claude Desktop Configuration](#claude-desktop-configuration)
-    - [Telegram Configuration](#telegram-configuration)
-  - [Development](#development)
-    - [Getting started](#getting-started)
-    - [Debugging the server in terminal](#debugging-the-server-in-terminal)
-    - [Debugging the server in the Inspector](#debugging-the-server-in-the-inspector)
-  - [Troubleshooting](#troubleshooting)
-    - [Message 'Could not connect to MCP server mcp-telegram'](#message-could-not-connect-to-mcp-server-mcp-telegram)
-
-## About
-
-The server is a bridge between the Telegram API and the AI assistants and is based on the [Model Context Protocol](https://modelcontextprotocol.io).
+A read-only Telegram bridge for AI assistants, built on the [Model Context Protocol](https://modelcontextprotocol.io).
 
 > [!IMPORTANT]
-> Ensure that you have read and understood the [Telegram API Terms of Service](https://core.telegram.org/api/terms) before using this server.
-> Any misuse of the Telegram API may result in the suspension of your account.
+> Review the [Telegram API Terms of Service](https://core.telegram.org/api/terms) before use.
+> Misuse may result in account suspension.
 
-<a href="https://glama.ai/mcp/servers/484jega1au">
-  <img width="380" height="200" src="https://glama.ai/mcp/servers/484jega1au/badge" alt="Telegram Server MCP server" />
-</a>
+## Architecture
 
-## What is MCP?
+Two-process model:
 
-The Model Context Protocol (MCP) is a system that lets AI apps, like Claude Desktop, connect to external tools and data sources. It gives a clear and safe way for AI assistants to work with local services and APIs while keeping the user in control.
+- **Daemon** (`mcp-telegram sync`) — owns the TelegramClient, syncs messages to `sync.db`, runs as PID 1 in the container
+- **MCP server** (`mcp-telegram run`) — connects to the daemon via Unix socket on demand, exposes tools over stdio
 
-## What does this server do?
+Deployed as a Docker container. MCP clients connect by running `docker exec -i mcp-telegram mcp-telegram run`.
 
-The server provides read-only access to the Telegram API:
+## Tools
 
-- [x] List dialogs (chats, channels, groups) with unread counts
-- [x] Read messages in a dialog (with pagination, sender filter, unread filter)
-- [x] Search messages by text query
-- [x] List and navigate forum topics
-- [x] Fetch unread messages across chats, prioritized by tier
-- [x] Look up users by name (fuzzy match + common chats)
-- [x] Get account info and usage statistics
-- [ ] Mark channel as read
-- [ ] Download media files
-- [ ] Draft a message
+- `ListDialogs` — list chats, channels, groups with unread counts
+- `ListMessages` — read messages in a dialog (pagination, topic, sender, unread filters)
+- `SearchMessages` — full-text search within a dialog
+- `ListTopics` — list forum topics
+- `ListUnreadMessages` — fetch unread messages across chats, prioritized by tier
+- `GetMyAccount` — authenticated user info
+- `GetUserInfo` — look up a user by name (fuzzy match)
+- `GetUsageStats` — local telemetry (last 30 days)
 
-## Practical use cases
+## Deploy
 
-- [x] Create a summary of the unread messages
-- [x] Find discussions on a given topic, summarize them and provide a list of links
-- [ ] Find contacts with upcoming birthdays and schedule a greeting
+The `deploy/` directory contains everything needed to run the container:
 
-## Prerequisites
+- `Dockerfile` — multi-stage build; takes source from the cloned repo via `additional_contexts`
+- `docker-compose.yml` — template; fill in paths to your repo clone and deploy directory
+- `scripts/` — healthcheck scripts (copied into the image at build time)
+- `telegram_qr_login.py` — one-time auth script; run it in your deploy directory to create `telegram_session.session`
 
-- [`uv` tool](https://docs.astral.sh/uv/getting-started/installation/)
+Create a deploy directory with `.env` (containing `TELEGRAM_API_ID` and `TELEGRAM_API_HASH`), adapt `docker-compose.yml`, then build with `docker compose up -d --build`.
 
-## Installation
+## Setup
 
-```bash
-uv tool install git+https://github.com/sparfenyuk/mcp-telegram
-```
-
-> [!NOTE]
-> If you have already installed the server, you can update it using `uv tool upgrade --reinstall` command.
-
-> [!NOTE]
-> If you want to delete the server, use the `uv tool uninstall mcp-telegram` command.
-
-## Configuration
-
-### Telegram API Configuration
-
-Before you can use the server, you need to connect to the Telegram API.
-
-1. Get the API ID and hash from [Telegram API](https://my.telegram.org/auth)
-2. Run the following command:
-
-   ```bash
-   mcp-telegram sign-in --api-id <your-api-id> --api-hash <your-api-hash> --phone-number <your-phone-number>
-   ```
-
-   Enter the code you received from Telegram to connect to the API.
-
-   The password may be required if you have two-factor authentication enabled.
-
-> [!NOTE]
-> To log out from the Telegram API, use the `mcp-telegram logout` command.
-
-### Claude Desktop Configuration
-
-Configure Claude Desktop to recognize the Telegram MCP server.
-
-1. Open the Claude Desktop configuration file:
-   - in MacOS, the configuration file is located at `~/Library/Application Support/Claude/claude_desktop_config.json`
-   - in Windows, the configuration file is located at `%APPDATA%\Claude\claude_desktop_config.json`
-
-   > __Note:__
-   > You can also find claude_desktop_config.json inside the settings of Claude Desktop app
-
-2. Add the server configuration
-
-    ```json
-    {
-      "mcpServers": {
-        "mcp-telegram": {
-          "command": "mcp-telegram",
-          "env": {
-            "TELEGRAM_API_ID": "<your-api-id>",
-            "TELEGRAM_API_HASH": "<your-api-hash>"
-          }
-        }
-      }
-    }
-    ```
-
-### Telegram Configuration
-
-Before working with Telegram’s API, you need to get your own API ID and hash:
-
-1. Login to your Telegram account with the phone number of the developer account to use.
-1. Click under API Development tools.
-1. A 'Create new application' window will appear. Fill in your application details. There is no need to enter any URL, and only the first two fields (App title and Short name) can currently be changed later.
-1. Click on 'Create application' at the end. Remember that your API hash is secret and Telegram won’t let you revoke it. __Don’t post it anywhere!__
+1. Get an API ID and hash at [my.telegram.org/auth](https://my.telegram.org/auth) → API Development tools → Create application
+2. Authenticate via QR code using `deploy/telegram_qr_login.py` — the SMS code method (`mcp-telegram sign-in`) is unreliable as Telegram often does not deliver the code
+3. To log out: `docker exec -it mcp-telegram mcp-telegram logout`
 
 ## Development
 
-### Getting started
-
-1. Clone the repository
-2. Install the dependencies
-
-   ```bash
-   uv sync
-   ```
-
-3. Run the server
-
-   ```bash
-   uv run mcp-telegram --help
-   ```
-
-Tools live in the `src/mcp_telegram/tools/` package, split by domain.
-
-How to add a new tool:
-
-1. Create a ToolArgs subclass and a runner in the appropriate domain module (or create a new one):
-
-   ```python
-   from ._base import ToolArgs, ToolResult, _text_response, mcp_tool
-
-   class NewTool(ToolArgs):
-       """Description of the new tool."""
-       field: str
-
-   @mcp_tool("primary")
-   async def new_tool(args: NewTool) -> ToolResult:
-       return ToolResult(content=_text_response("result"))
-   ```
-
-   The class docstring becomes the tool description. `@mcp_tool` handles registration,
-   telemetry, and tool registry in one decorator.
-
-2. Import the module in `src/mcp_telegram/tools/__init__.py` so it registers at import time.
-
-3. Done! Restart the client and the new tool should be available.
-
-Validation can accomplished either through Claude Desktop or by running the tool directly.
-
-### Debugging the server in terminal
-
-To run the tool directly, use the following command:
-
-```bash
-
-# List all available tools
-uv run cli.py list-tools
-
-# Run the concrete tool
-uv run cli.py call-tool --name ListDialogs --arguments '{"unread": true}'
-```
-
-### Debugging the server in the Inspector
-
-The MCP inspector is a tool that helps to debug the server using fancy UI. To run it, use the following command:
-
-```bash
-npx @modelcontextprotocol/inspector uv run mcp-telegram
-```
-
-> [!WARNING]
-> Do not forget to define Environment Variables TELEGRAM_API_ID and TELEGRAM_API_HASH in the inspector.
-
-## Troubleshooting
-
-### Message 'Could not connect to MCP server mcp-telegram'
-
-If you see the message 'Could not connect to MCP server mcp-telegram' in Claude Desktop, it means that the server configuration is incorrect.
-
-Try the following:
-
-- Use the full path to the `uv` binary in the configuration file
-- Check the path to the cloned repository in the configuration file
+See `AGENTS.md` for codebase map, tool patterns, and runtime discipline.

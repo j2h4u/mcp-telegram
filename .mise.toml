@@ -1,4 +1,0 @@
-[tools]
-python = "3.11.10"
-uv = "0.4"
-pre-commit = "latest"

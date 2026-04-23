@@ -4,83 +4,110 @@
 
 - Trust source, tests, and live runtime over `.planning/*`.
 
+## Architecture
+
+Two-process model running inside a Docker container:
+
+- **Daemon** (`mcp-telegram sync`) — PID 1; owns the TelegramClient exclusively, runs FullSyncWorker
+  and DeltaSyncWorker, handles real-time events, exposes a Unix socket API.
+- **MCP server** (`mcp-telegram run`) — started on demand via `docker exec`; connects to the daemon
+  over the Unix socket, translates tool calls into daemon API requests.
+
+State lives in `sync.db` (XDG state home) plus the Telegram session file. The daemon is the only
+writer; the MCP server opens `sync.db` read-only for lightweight queries.
+
 ## Brownfield Map
 
-- `src/mcp_telegram/tools/`: tool package — `_base.py` (ToolArgs, ToolResult, mcp_tool, TOOL_REGISTRY, singledispatch, telemetry), `discovery.py`, `reading.py`, `unread.py`, `user_info.py`, `stats.py`.
-- `src/mcp_telegram/server.py`: MCP stdio server; iterates `TOOL_REGISTRY` for tool listing.
-- `src/mcp_telegram/telegram.py`: Telethon client factory and auth flows.
-- `src/mcp_telegram/cache.py`: SQLite caches for entities, reactions, topics.
-- `src/mcp_telegram/capabilities.py`: re-export shim for split capability modules.
-- `src/mcp_telegram/capability_history.py`: history read orchestration.
-- `src/mcp_telegram/capability_search.py`: search orchestration.
-- `src/mcp_telegram/capability_topics.py`: topic listing orchestration.
-- `src/mcp_telegram/models.py`: shared dataclasses, TypedDicts, type aliases.
-- `src/mcp_telegram/budget.py`: unread tier classification, budget allocation.
-- `src/mcp_telegram/dialog_target.py`: dialog resolution orchestration.
-- `src/mcp_telegram/forum_topics.py`: topic catalog loading, topic resolution.
-- `src/mcp_telegram/message_ops.py`: message fetch helpers, reply/reaction maps.
-- `src/mcp_telegram/errors.py`: action-oriented error text functions.
-- `src/mcp_telegram/resolver.py`: fuzzy resolution (Cyrillic + transliteration).
-- `src/mcp_telegram/formatter.py`: message formatting.
-- `src/mcp_telegram/pagination.py`: cursor encode/decode.
-- `src/mcp_telegram/analytics.py`: local telemetry into `analytics.db`.
-- `cli.py`: local debug entrypoint.
+### Core
+- `daemon.py` — `sync_main()` entry point; owns TelegramClient, heartbeat loop, gap scan scheduling
+- `daemon_api.py` — Unix socket server; 14+ API methods; `_build_list_messages_query()` dynamic SQL builder
+- `daemon_client.py` — Unix socket client used by MCP tool runners
+- `sync_db.py` — `sync.db` schema + migrations; `open_sync_db()` / `open_sync_db_readonly()`
+- `sync_worker.py` — `FullSyncWorker`: batch history fetch, FloodWait handling, checkpoint progress
+- `delta_sync.py` — `DeltaSyncWorker`: gap-fill, catch-up, access-loss detection
+- `event_handlers.py` — `EventHandlerManager`: real-time NewMessage / Edited / Deleted via Telethon events
+- `read_state.py` — `apply_read_cursor()`: monotonic inbox/outbox read cursor writes to `synced_dialogs`
+- `fts.py` — FTS5 full-text search with Russian snowball stemming
+- `telegram.py` — TelegramClient factory and auth flows
+- `__init__.py` — CLI entrypoint: `sign-in`, `run`, `logout`, `sync`
 
-## Current Tools
+### Shared Utilities
+- `models.py` — TypedDict schemas, dataclasses, Protocol types (`MessageLike`, `SenderLike`)
+- `budget.py` — message budget allocation for tool responses
+- `resolver.py` — fuzzy name resolution (anyascii + Cyrillic transliteration); single match auto-resolves
+- `formatter.py` — `format_messages()` with `[edited HH:mm]`, media, reactions
+- `pagination.py` — `NavigationToken`, `HistoryDirection` StrEnum, encode/decode
+- `errors.py` — structured error types
+- `server.py` — MCP stdio server; iterates `TOOL_REGISTRY` for tool listing
 
-- `ListDialogs` — list dialogs (chats, channels, groups)
-- `ListMessages` — read messages in one dialog (with pagination, topic, sender, unread filters)
-- `SearchMessages` — search messages in a dialog by text query
-- `ListTopics` — list forum topics in a dialog
-- `ListUnreadMessages` — fetch unread messages across chats, prioritized by tier
-- `GetMyAccount` — get current authenticated user info
-- `GetUserInfo` — look up a user by name (fuzzy match + common chats)
-- `GetUsageStats` — get usage statistics from telemetry (last 30 days)
+### Deploy (`deploy/`)
+- `Dockerfile` — multi-stage build; copies source via `--from=src additional_contexts`
+- `docker-compose.yml` — template with path placeholders
+- `scripts/healthcheck_daemon.py` — Unix socket healthcheck (copied into image)
+- `scripts/healthcheck_all.sh` — healthcheck entrypoint (copied into image)
+- `telegram_qr_login.py` — QR-based auth (SMS method unreliable); run from deploy dir to produce `telegram_session.session`
+
+### Tools Package (`tools/`)
+- `_base.py` — `ToolArgs`, `ToolResult`, `@mcp_tool`, `TOOL_REGISTRY`, `daemon_connection`, telemetry
+- `_adapters.py` — daemon row dict → `MessageLike`-compatible objects (temporary bridging layer)
+- `discovery.py` — `ListDialogs`, `ListTopics`, `GetMyAccount`
+- `reading.py` — `ListMessages`, `SearchMessages`
+- `stats.py` — `GetUsageStats`, `GetDialogStats`
+- `sync.py` — `MarkDialogForSync`, `GetSyncStatus`, `GetSyncAlerts`
+- `unread.py` — `ListUnreadMessages`
+- `user_info.py` — `GetUserInfo`
+
+Canonical tool registry: `tools/__init__.py`.
 
 ## Tool Pattern
 
-- Add tools in `src/mcp_telegram/tools/` (pick the appropriate domain module, or create a new one).
-- Normal pattern:
-  - `class NewTool(ToolArgs): ...`
-  - `@mcp_tool("primary") async def new_tool(args: NewTool) -> ToolResult: ...`
-- Import the module in `src/mcp_telegram/tools/__init__.py` so it registers at import time.
-- Do not wire new tools in `server.py`; discovery iterates `TOOL_REGISTRY`.
+```python
+from ._base import ToolArgs, ToolResult, mcp_tool
+from mcp.types import ToolAnnotations
 
-## State
+class NewTool(ToolArgs):
+    """Description shown to the LLM."""
+    field: str
 
-- This is read-only against Telegram, not stateless.
-- XDG state dir stores Telegram session, `entity_cache.db`, and `analytics.db`.
-- `create_client()` is process-cached. Cache and telemetry objects are singleton-like within process lifetime.
+@mcp_tool("primary", annotations=ToolAnnotations(readOnlyHint=True))
+async def new_tool(args: NewTool) -> ToolResult:
+    async with daemon_connection() as conn:
+        ...
+```
+
+- Add to the appropriate domain module (or create a new one).
+- Import in `tools/__init__.py` — registration happens at import time; `server.py` discovers via `TOOL_REGISTRY`.
+- Use `"primary"` for user-facing tools, `"secondary/helper"` for supporting tools.
 
 ## Testing
 
-- Full suite: `uv run pytest`
-- Focused topic slice: `uv run pytest tests/test_tools.py -k topic -v`
-- Manual debug:
-  - `uv run cli.py list-tools`
-  - `uv run cli.py call-tool --name ListMessages --arguments '{"dialog":"..."}'`
+```bash
+uv run pytest                                          # full suite
+uv run pytest tests/test_daemon_api.py -v             # focused
+uv run cli.py list-tools                               # manual: list registered tools
+uv run cli.py call-tool --name ListDialogs --arguments '{"unread": true}'
+```
+
+`cli.py` requires the daemon to be running (or a test double).
 
 ## Runtime On This Machine
 
 - Source repo: `/home/j2h4u/repos/j2h4u/mcp-telegram`
 - Deploy project: `/opt/docker/mcp-telegram`
-- Compose build uses this repo via `additional_contexts.src=/home/j2h4u/repos/j2h4u/mcp-telegram`
-- Runtime container: `mcp-telegram`
-- Clients commonly hit a long-lived container and start the MCP server through `docker exec ... mcp-telegram run`
+- Compose build pulls source via `additional_contexts.src`
+- Rebuild after code changes:
+  ```bash
+  docker compose -f /opt/docker/mcp-telegram/docker-compose.yml up -d --build mcp-telegram
+  ```
 
 ## Runtime Discipline
 
-- After any runtime-affecting change: update runtime, not just code.
-- Rebuild when needed.
-- Always restart the runtime.
-- Do not mark work done until the restarted runtime is verified to expose the new behavior/schema.
-- Safe update path here:
-  - `docker compose -f /opt/docker/mcp-telegram/docker-compose.yml up -d --build mcp-telegram`
-  - then verify inside container
+- After any runtime-affecting change: rebuild the container, then verify.
+- Do not mark work done until the restarted runtime exposes the expected behavior.
+- Green tests do not prove the live container is current — stale containers serve stale schemas.
 
 ## Lessons Learned
 
-- Green tests do not prove the live runtime is current; stale containers can serve old tool schemas.
-- Forum-topic support is test-covered, but live Telegram semantics can still require manual validation.
+- Forum-topic support is test-covered, but live Telegram semantics require manual validation.
 - Avoid logging Telegram message content or other sensitive data.
-- Treat Telegram session files and `.env` credentials as secrets.
+- Treat session files and `.env` credentials as secrets.

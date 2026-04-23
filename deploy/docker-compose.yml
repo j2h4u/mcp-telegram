@@ -1,0 +1,19 @@
+services:
+  mcp-telegram:
+    build:
+      context: /path/to/deploy-dir      # directory containing .env and telegram_session.session
+      dockerfile: /path/to/repo/deploy/Dockerfile
+      additional_contexts:
+        src: /path/to/repo               # path to cloned mcp-telegram repo
+    container_name: mcp-telegram
+    restart: unless-stopped
+    environment:
+      - TELEGRAM_API_ID=${TELEGRAM_API_ID}
+      - TELEGRAM_API_HASH=${TELEGRAM_API_HASH}
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - state:/root/.local/state/mcp-telegram
+      - ./telegram_session.session:/root/.local/state/mcp-telegram/mcp_telegram_session.session
+
+volumes:
+  state:
