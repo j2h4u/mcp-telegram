@@ -87,6 +87,7 @@ def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.
             edit_date           INTEGER,
             out                 INTEGER NOT NULL DEFAULT 0,
             is_service          INTEGER NOT NULL DEFAULT 0,
+            post_author         TEXT,
             PRIMARY KEY (dialog_id, message_id)
         ) WITHOUT ROWID
         """
@@ -150,6 +151,19 @@ def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.
             name_normalized TEXT,
             updated_at      INTEGER NOT NULL
         )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS message_forwards (
+            dialog_id           INTEGER NOT NULL,
+            message_id          INTEGER NOT NULL,
+            fwd_from_peer_id    INTEGER,
+            fwd_from_name       TEXT,
+            fwd_date            INTEGER,
+            fwd_channel_post    INTEGER,
+            PRIMARY KEY (dialog_id, message_id)
+        ) WITHOUT ROWID
         """
     )
     if with_fts:
@@ -3322,14 +3336,16 @@ def test_decode_nav_search_token_returns_error() -> None:
 
 
 def test_db_message_columns_length_matches_query() -> None:
-    """_DB_MESSAGE_COLUMNS has 16 entries matching the SELECT (Phase 39.1-02 added effective_sender_id, is_service, out, dialog_id)."""
+    """_DB_MESSAGE_COLUMNS has 18 entries matching the SELECT (post_author added for channel author signatures)."""
     from mcp_telegram.daemon_api import _DB_MESSAGE_COLUMNS
 
-    assert len(_DB_MESSAGE_COLUMNS) == 16
+    assert len(_DB_MESSAGE_COLUMNS) == 18
     assert _DB_MESSAGE_COLUMNS[0] == "message_id"
-    assert _DB_MESSAGE_COLUMNS[-1] == "dialog_id"
+    assert _DB_MESSAGE_COLUMNS[-1] == "post_author"
     assert "effective_sender_id" in _DB_MESSAGE_COLUMNS
     assert "is_service" in _DB_MESSAGE_COLUMNS
+    assert "dialog_id" in _DB_MESSAGE_COLUMNS
+    assert "fwd_from_name" in _DB_MESSAGE_COLUMNS
 
 
 # ---------------------------------------------------------------------------

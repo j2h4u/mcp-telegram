@@ -7,7 +7,7 @@ from pathlib import Path
 
 from xdg_base_dirs import xdg_state_home  # type: ignore[import-error]
 
-_CURRENT_SCHEMA_VERSION = 12
+_CURRENT_SCHEMA_VERSION = 13
 
 logger = logging.getLogger(__name__)
 
@@ -434,6 +434,16 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
         12,
         [
             "ALTER TABLE synced_dialogs ADD COLUMN read_outbox_max_id INTEGER",
+        ],
+    )
+
+    # v13: store channel post author signature. Message.post_author is set when
+    # a channel allows authors to sign their posts (multiple contributors). NULL
+    # for all other message types. ADD COLUMN is O(1) metadata in SQLite.
+    _migrate(
+        13,
+        [
+            "ALTER TABLE messages ADD COLUMN post_author TEXT",
         ],
     )
 

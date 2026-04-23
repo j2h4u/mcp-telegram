@@ -76,6 +76,7 @@ def _make_db(*, with_fts: bool = False) -> sqlite3.Connection:
             edit_date           INTEGER,
             out                 INTEGER NOT NULL DEFAULT 0,
             is_service          INTEGER NOT NULL DEFAULT 0,
+            post_author         TEXT,
             PRIMARY KEY (dialog_id, message_id)
         ) WITHOUT ROWID
         """
@@ -139,6 +140,19 @@ def _make_db(*, with_fts: bool = False) -> sqlite3.Connection:
             name_normalized TEXT,
             updated_at      INTEGER NOT NULL
         )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS message_forwards (
+            dialog_id           INTEGER NOT NULL,
+            message_id          INTEGER NOT NULL,
+            fwd_from_peer_id    INTEGER,
+            fwd_from_name       TEXT,
+            fwd_date            INTEGER,
+            fwd_channel_post    INTEGER,
+            PRIMARY KEY (dialog_id, message_id)
+        ) WITHOUT ROWID
         """
     )
     if with_fts:
