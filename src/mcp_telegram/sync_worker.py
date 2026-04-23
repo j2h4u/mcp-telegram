@@ -31,9 +31,15 @@ from telethon.errors import (  # type: ignore[import-untyped]
     ChatForbiddenError,
     ChatWriteForbiddenError,
     FloodWaitError,  # type: ignore[import-untyped]
+    InputUserDeactivatedError,
+    PeerFloodError,
+    PeerIdInvalidError,
     RPCError,  # type: ignore[import-untyped]
     UserBannedInChannelError,
+    UserDeactivatedBanError,
+    UserDeactivatedError,
     UserKickedError,
+    UserPrivacyRestrictedError,
 )
 from telethon.tl import types  # type: ignore[import-untyped]
 
@@ -425,11 +431,11 @@ def extract_entity_rows(dialog_id: int, message_id: int, msg: Any) -> list[Entit
 
 
 async def _resolve_peer_name(client: Any, peer_id: int) -> str | None:
-    """Return display name for a Telegram peer from Telethon's entity cache.
+    """Return display name for a Telegram peer.
 
-    After get_messages(), forward-source entities are already cached by
-    Telethon — this call is a local dict lookup, not an API round-trip.
-    Returns None on any failure so callers can fall back gracefully.
+    Tries Telethon's session cache first; falls back to an API call when the
+    entity is not cached. Returns None when the peer is permanently inaccessible
+    (private/deleted/banned account, unknown ID).
     """
     try:
         entity = await client.get_entity(peer_id)
@@ -438,7 +444,24 @@ async def _resolve_peer_name(client: Any, peer_id: int) -> str | None:
         if last:
             name = f"{name} {last}".strip()
         return name or None
+    except FloodWaitError as e:
+        logger.warning("resolve_peer_name_flood_wait peer_id=%d retry_after=%ds", peer_id, e.seconds)
+        return None
+    except PeerFloodError:
+        logger.warning("resolve_peer_name_peer_flood peer_id=%d", peer_id)
+        return None
+    except (
+        ChannelPrivateError,
+        InputUserDeactivatedError,
+        PeerIdInvalidError,
+        UserDeactivatedBanError,
+        UserDeactivatedError,
+        UserPrivacyRestrictedError,
+    ):
+        logger.debug("resolve_peer_name_inaccessible peer_id=%d", peer_id)
+        return None
     except Exception:
+        logger.warning("resolve_peer_name_unexpected peer_id=%d", peer_id, exc_info=True)
         return None
 
 
