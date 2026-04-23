@@ -120,6 +120,7 @@ def test_messages_schema(tmp_sync_db_path: Path) -> None:
             "reply_to_peer_id",
             "out",
             "is_service",
+            "post_author",
         }
         assert expected == set(columns.keys()), f"Unexpected columns. Got: {set(columns.keys())}, expected: {expected}"
         # Both dialog_id and message_id are part of composite PK (pk > 0)

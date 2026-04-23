@@ -503,6 +503,8 @@ _DB_MESSAGE_COLUMNS = (
     "is_service",
     "out",
     "dialog_id",
+    "fwd_from_name",
+    "post_author",
 )
 
 
@@ -558,11 +560,13 @@ _LIST_MESSAGES_BASE_SQL = (
     f"  m.edit_date"
     f") AS edit_date, "
     f"tm.title AS topic_title, "
-    f"{EFFECTIVE_SENDER_ID_SQL}, m.is_service, m.out, m.dialog_id "
+    f"{EFFECTIVE_SENDER_ID_SQL}, m.is_service, m.out, m.dialog_id, "
+    f"mf.fwd_from_name, m.post_author "
     f"FROM messages m "
     f"LEFT JOIN topic_metadata tm "
     f"  ON tm.dialog_id = m.dialog_id AND tm.topic_id = m.forum_topic_id "
     f"{_SENDER_ENTITY_JOINS_SQL}"
+    f"LEFT JOIN message_forwards mf ON mf.dialog_id = m.dialog_id AND mf.message_id = m.message_id "
     f"WHERE m.dialog_id = :dialog_id AND m.is_deleted = 0"
 )
 

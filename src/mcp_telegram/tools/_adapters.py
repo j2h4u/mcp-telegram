@@ -60,6 +60,8 @@ class DaemonMessage:
         "is_service",
         "out",
         "dialog_id",
+        "fwd_from_name",
+        "post_author",
     )
 
     def __init__(self, row: dict) -> None:
@@ -87,6 +89,8 @@ class DaemonMessage:
         self.is_service: int = int(row.get("is_service") or 0)
         self.out: int = int(row.get("out") or 0)
         self.dialog_id: int | None = row.get("dialog_id")
+        self.fwd_from_name: str | None = row.get("fwd_from_name") or None
+        self.post_author: str | None = row.get("post_author") or None
 
 
 class Sender:

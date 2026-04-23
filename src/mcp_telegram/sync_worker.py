@@ -66,8 +66,8 @@ INSERT_MESSAGE_SQL = (
     "INSERT OR REPLACE INTO messages "
     "(dialog_id, message_id, sent_at, text, sender_id, sender_first_name, "
     "media_description, reply_to_msg_id, forum_topic_id, is_deleted, "
-    "edit_date, grouped_id, reply_to_peer_id, out, is_service) "
-    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)"
+    "edit_date, grouped_id, reply_to_peer_id, out, is_service, post_author) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)"
 )
 
 INSERT_REACTION_SQL = (
@@ -366,8 +366,59 @@ def extract_entity_rows(dialog_id: int, message_id: int, msg: Any) -> list[tuple
     return rows
 
 
-def extract_fwd_row(dialog_id: int, message_id: int, msg: Any) -> tuple | None:
+async def _resolve_peer_name(client: Any, peer_id: int) -> str | None:
+    """Return display name for a Telegram peer from Telethon's entity cache.
+
+    After get_messages(), forward-source entities are already cached by
+    Telethon — this call is a local dict lookup, not an API round-trip.
+    Returns None on any failure so callers can fall back gracefully.
+    """
+    try:
+        entity = await client.get_entity(peer_id)
+        name = getattr(entity, "title", None) or getattr(entity, "first_name", None) or ""
+        last = getattr(entity, "last_name", None)
+        if last:
+            name = f"{name} {last}".strip()
+        return name or None
+    except Exception:
+        return None
+
+
+async def _build_fwd_entity_map(msg: Any, client: Any) -> dict[int, str]:
+    """Return {peer_id: name} for the forward source of a single message.
+
+    Returns an empty dict when the message is not a forward, already has
+    fwd_from.from_name, or the peer cannot be resolved.
+    """
+    fwd = getattr(msg, "fwd_from", None)
+    if not fwd or getattr(fwd, "from_name", None) is not None:
+        return {}
+    from_id = getattr(fwd, "from_id", None)
+    if from_id is None:
+        return {}
+    peer_id: int | None = None
+    for attr in ("user_id", "channel_id", "chat_id"):
+        pid = getattr(from_id, attr, None)
+        if pid is not None:
+            peer_id = int(pid)
+            break
+    if peer_id is None:
+        return {}
+    name = await _resolve_peer_name(client, peer_id)
+    return {peer_id: name} if name else {}
+
+
+def extract_fwd_row(
+    dialog_id: int,
+    message_id: int,
+    msg: Any,
+    entity_name_map: dict[int, str] | None = None,
+) -> tuple | None:
     """Extract forward metadata from a Telethon message.
+
+    entity_name_map is a {peer_id: name} dict built from the batch response
+    before this call — used to populate fwd_from_name for public senders
+    whose name lives in the batch's users/chats, not in fwd_from.from_name.
 
     Returns (dialog_id, message_id, fwd_from_peer_id, fwd_from_name,
              fwd_date, fwd_channel_post) or None if not a forward.
@@ -384,6 +435,8 @@ def extract_fwd_row(dialog_id: int, message_id: int, msg: Any) -> tuple | None:
                 fwd_from_peer_id = int(pid)
                 break
     fwd_from_name = getattr(fwd, "from_name", None)
+    if fwd_from_name is None and fwd_from_peer_id is not None and entity_name_map:
+        fwd_from_name = entity_name_map.get(fwd_from_peer_id)
     fwd_date_raw = getattr(fwd, "date", None)
     fwd_date: int | None = None
     if fwd_date_raw is not None:
@@ -397,7 +450,7 @@ def extract_fwd_row(dialog_id: int, message_id: int, msg: Any) -> tuple | None:
     return (dialog_id, message_id, fwd_from_peer_id, fwd_from_name, fwd_date, fwd_channel_post)
 
 
-def extract_message_row(dialog_id: int, msg: Any) -> ExtractedMessage:
+def extract_message_row(dialog_id: int, msg: Any, entity_name_map: dict[int, str] | None = None) -> ExtractedMessage:
     """Extract sync.db row bundle from a Telethon message object.
 
     Returns an ExtractedMessage with the main row tuple (matching
@@ -442,6 +495,7 @@ def extract_message_row(dialog_id: int, msg: Any) -> ExtractedMessage:
     # is reserved for them rather than any row with sender_id IS NULL.
     is_service = 1 if isinstance(msg, types.MessageService) else 0
     out = 1 if getattr(msg, "out", False) else 0
+    post_author: str | None = getattr(msg, "post_author", None)
 
     row = (
         dialog_id,
@@ -458,10 +512,11 @@ def extract_message_row(dialog_id: int, msg: Any) -> ExtractedMessage:
         reply_to_peer_id,
         out,
         is_service,
+        post_author,
     )
     reactions = extract_reactions_rows(dialog_id, message_id, getattr(msg, "reactions", None))
     entities = extract_entity_rows(dialog_id, message_id, msg)
-    forward = extract_fwd_row(dialog_id, message_id, msg)
+    forward = extract_fwd_row(dialog_id, message_id, msg, entity_name_map=entity_name_map)
 
     return ExtractedMessage(row=row, reactions=reactions, entities=entities, forward=forward)
 
@@ -650,7 +705,28 @@ class FullSyncWorker:
             logger.info("sync_done dialog_id=%d status=synced (empty batch)", dialog_id)
             return sync_progress, True
 
-        rows = [extract_message_row(dialog_id, msg) for msg in batch]
+        # Resolve forward-source names from the batch entity cache.
+        # Telegram includes users/chats for forward sources in the same
+        # GetHistory response, so get_entity() hits the local cache — no
+        # extra API round-trips in the common case.
+        fwd_peer_ids: set[int] = set()
+        for msg in batch:
+            fwd = getattr(msg, "fwd_from", None)
+            if fwd and getattr(fwd, "from_name", None) is None:
+                from_id = getattr(fwd, "from_id", None)
+                if from_id is not None:
+                    for attr in ("user_id", "channel_id", "chat_id"):
+                        pid = getattr(from_id, attr, None)
+                        if pid is not None:
+                            fwd_peer_ids.add(int(pid))
+                            break
+        entity_name_map: dict[int, str] = {}
+        for peer_id in fwd_peer_ids:
+            name = await _resolve_peer_name(self._client, peer_id)
+            if name:
+                entity_name_map[peer_id] = name
+
+        rows = [extract_message_row(dialog_id, msg, entity_name_map=entity_name_map) for msg in batch]
         new_progress = min(int(getattr(msg, "id", 0)) for msg in batch)
         is_done = len(batch) < 100  # partial batch = last batch
         new_status = "synced" if is_done else "syncing"

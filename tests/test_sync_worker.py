@@ -1657,7 +1657,7 @@ def test_insert_messages_with_fts_writes_reactions(sync_db: sqlite3.Connection) 
     sync_db.commit()
 
     em = ExtractedMessage(
-        row=(dialog_id, message_id, 1700000000, "hello", 1, "Alice", None, None, None, None, None, None, 0, 0),
+        row=(dialog_id, message_id, 1700000000, "hello", 1, "Alice", None, None, None, None, None, None, 0, 0, None),
         reactions=[(dialog_id, message_id, "👍", 5), (dialog_id, message_id, "❤", 2)],
     )
     with sync_db:
@@ -1681,7 +1681,7 @@ def test_insert_messages_with_fts_writes_forwards(sync_db: sqlite3.Connection) -
     sync_db.commit()
 
     em = ExtractedMessage(
-        row=(dialog_id, message_id, 1700000000, "forwarded", 1, "Alice", None, None, None, None, None, None, 0, 0),
+        row=(dialog_id, message_id, 1700000000, "forwarded", 1, "Alice", None, None, None, None, None, None, 0, 0, None),
         forward=(dialog_id, message_id, 55555, "Original Author", 1700000000, None),
     )
     with sync_db:
@@ -1707,7 +1707,7 @@ def test_insert_messages_with_fts_edit_idempotency_reactions(sync_db: sqlite3.Co
 
     # First insert: 2 reactions
     em1 = ExtractedMessage(
-        row=(dialog_id, message_id, 1700000000, "v1", 1, "Alice", None, None, None, None, None, None, 0, 0),
+        row=(dialog_id, message_id, 1700000000, "v1", 1, "Alice", None, None, None, None, None, None, 0, 0, None),
         reactions=[(dialog_id, message_id, "👍", 3), (dialog_id, message_id, "❤", 1)],
     )
     with sync_db:
@@ -1715,7 +1715,7 @@ def test_insert_messages_with_fts_edit_idempotency_reactions(sync_db: sqlite3.Co
 
     # Second insert: 1 different reaction
     em2 = ExtractedMessage(
-        row=(dialog_id, message_id, 1700000000, "v2", 1, "Alice", None, None, None, None, None, None, 0, 0),
+        row=(dialog_id, message_id, 1700000000, "v2", 1, "Alice", None, None, None, None, None, None, 0, 0, None),
         reactions=[(dialog_id, message_id, "🔥", 7)],
     )
     with sync_db:
@@ -1739,7 +1739,7 @@ def test_insert_messages_with_fts_edit_idempotency_entities(sync_db: sqlite3.Con
     sync_db.commit()
 
     em1 = ExtractedMessage(
-        row=(dialog_id, message_id, 1700000000, "old", 1, "Alice", None, None, None, None, None, None, 0, 0),
+        row=(dialog_id, message_id, 1700000000, "old", 1, "Alice", None, None, None, None, None, None, 0, 0, None),
         entities=[
             (dialog_id, message_id, 0, 5, "mention", "@old1"),
             (dialog_id, message_id, 6, 5, "mention", "@old2"),
@@ -1749,7 +1749,7 @@ def test_insert_messages_with_fts_edit_idempotency_entities(sync_db: sqlite3.Con
         insert_messages_with_fts(sync_db, [em1])
 
     em2 = ExtractedMessage(
-        row=(dialog_id, message_id, 1700000000, "new", 1, "Alice", None, None, None, None, None, None, 0, 0),
+        row=(dialog_id, message_id, 1700000000, "new", 1, "Alice", None, None, None, None, None, None, 0, 0, None),
         entities=[(dialog_id, message_id, 0, 4, "hashtag", "#new")],
     )
     with sync_db:
@@ -1773,7 +1773,7 @@ def test_insert_messages_with_fts_edit_idempotency_forwards(sync_db: sqlite3.Con
     sync_db.commit()
 
     em1 = ExtractedMessage(
-        row=(dialog_id, message_id, 1700000000, "fwd msg", 1, "Alice", None, None, None, None, None, None, 0, 0),
+        row=(dialog_id, message_id, 1700000000, "fwd msg", 1, "Alice", None, None, None, None, None, None, 0, 0, None),
         forward=(dialog_id, message_id, 12345, "Src", 1700000000, None),
     )
     with sync_db:
@@ -1788,7 +1788,7 @@ def test_insert_messages_with_fts_edit_idempotency_forwards(sync_db: sqlite3.Con
 
     # Re-insert with no forward
     em2 = ExtractedMessage(
-        row=(dialog_id, message_id, 1700000000, "edited msg", 1, "Alice", None, None, None, None, None, None, 0, 0),
+        row=(dialog_id, message_id, 1700000000, "edited msg", 1, "Alice", None, None, None, None, None, None, 0, 0, None),
         forward=None,
     )
     with sync_db:

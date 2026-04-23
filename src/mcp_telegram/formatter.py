@@ -283,6 +283,16 @@ def format_messages(
         if reactions_str:
             text = f"{text} {reactions_str}" if text else reactions_str
 
+        author_prefix = ""
+        post_author = getattr(msg, "post_author", None)
+        if post_author:
+            author_prefix = f"[by {post_author}] "
+
+        fwd_prefix = ""
+        fwd_name = getattr(msg, "fwd_from_name", None)
+        if fwd_name:
+            fwd_prefix = f"[↪ fwd: {fwd_name}] "
+
         reply_prefix = ""
         reply_to = getattr(msg, "reply_to", None)
         if reply_to:
@@ -305,7 +315,7 @@ def format_messages(
             if resolved_prefix:
                 line_prefix = f"{resolved_prefix} "
 
-        line = f"{line_prefix}{topic_prefix}{dt.strftime('%H:%M')} {sender_name}: {reply_prefix}{text}"
+        line = f"{line_prefix}{topic_prefix}{dt.strftime('%H:%M')} {sender_name}: {author_prefix}{fwd_prefix}{reply_prefix}{text}"
         # Phase 39.3: append inline marker for this message_id (D-06 — trailing).
         msg_id_attr = getattr(msg, "id", None)
         if inline_markers and msg_id_attr in inline_markers:

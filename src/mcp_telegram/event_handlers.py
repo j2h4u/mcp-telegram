@@ -34,6 +34,7 @@ from .resolver import latinize
 from .sync_worker import (
     INSERT_DIALOG_SQL,
     UPSERT_ENTITY_SQL,
+    _build_fwd_entity_map,
     apply_reactions_delta,
     extract_message_row,
     extract_reactions_rows,
@@ -222,7 +223,8 @@ class EventHandlerManager:
 
         try:
             msg = event.message
-            extracted = extract_message_row(dialog_id, msg)
+            entity_name_map = await _build_fwd_entity_map(msg, self._client)
+            extracted = extract_message_row(dialog_id, msg, entity_name_map=entity_name_map)
             now = int(time.time())
 
             with self._conn:
@@ -259,7 +261,8 @@ class EventHandlerManager:
                 if existing is None:
                     # Message not yet in sync.db: insert with current text;
                     # historical versions are lost (acceptable).
-                    extracted = extract_message_row(dialog_id, msg)
+                    entity_name_map = await _build_fwd_entity_map(msg, self._client)
+                    extracted = extract_message_row(dialog_id, msg, entity_name_map=entity_name_map)
                     insert_messages_with_fts(self._conn, [extracted])
                     self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
                     logger.info(
@@ -300,7 +303,8 @@ class EventHandlerManager:
                 )
                 # Re-insert via insert_messages_with_fts: updates messages row,
                 # refreshes FTS, and replaces child rows (edit idempotency).
-                extracted = extract_message_row(dialog_id, msg)
+                entity_name_map = await _build_fwd_entity_map(msg, self._client)
+                extracted = extract_message_row(dialog_id, msg, entity_name_map=entity_name_map)
                 insert_messages_with_fts(self._conn, [extracted])
                 self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
 
