@@ -1,9 +1,7 @@
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Literal, NotRequired, Protocol, TypedDict
-
-if TYPE_CHECKING:
-    from datetime import datetime
+from datetime import UTC, datetime
+from typing import Literal, NotRequired, TypedDict
 
 FORUM_TOPICS_PAGE_SIZE = 100
 TOPIC_METADATA_TTL_SECONDS = 600
@@ -12,34 +10,54 @@ GENERAL_TOPIC_TITLE = "General"
 
 
 # ---------------------------------------------------------------------------
-# Protocol types for Telethon message objects
+# Message data model — read side
 # ---------------------------------------------------------------------------
 
 
-class SenderLike(Protocol):
-    first_name: str | None
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ReadMessage:
+    """Message row as returned by list_messages and search queries.
+
+    Field names match the SELECT column names in _LIST_MESSAGES_BASE_SQL.
+    reactions_display and dialog_name are injected after the DB query.
+    """
+
+    # Core fields — always present in every query path
+    message_id: int
+    sent_at: int
+    dialog_id: int
+    # Fields present in full list_messages query; default to None/0 for
+    # partial queries (search snippets, unread summary) where they are absent.
+    text: str | None = None
+    sender_id: int | None = None
+    sender_first_name: str | None = None
+    media_description: str | None = None
+    reply_to_msg_id: int | None = None
+    forum_topic_id: int | None = None
+    is_deleted: int = 0
+    deleted_at: int | None = None
+    edit_date: int | None = None
+    topic_title: str | None = None
+    effective_sender_id: int | None = None
+    is_service: int = 0
+    out: int = 0
+    fwd_from_name: str | None = None
+    post_author: str | None = None
+    # injected after DB query
+    reactions_display: str = ""
+    dialog_name: str | None = None
+
+    @property
+    def id(self) -> int:
+        return self.message_id
+
+    @property
+    def date(self) -> datetime:
+        return datetime.fromtimestamp(self.sent_at, tz=UTC)
 
 
-class ReplyHeaderLike(Protocol):
-    reply_to_msg_id: int | None
-
-
-class ReactionsLike(Protocol):
-    results: list  # list of reaction result objects
-
-
-class MessageLike(Protocol):
-    id: int
-    date: datetime
-    message: str | None
-    sender: SenderLike | None
-    reply_to: ReplyHeaderLike | None
-    reactions: ReactionsLike | None
-    media: object
-
-
-TopicNameGetter = Callable[[MessageLike], str | None]
-LinePrefixGetter = Callable[[MessageLike], str | None]
+TopicNameGetter = Callable[[ReadMessage], str | None]
+LinePrefixGetter = Callable[[ReadMessage], str | None]
 
 
 class TopicMetadata(TypedDict, total=False):
@@ -221,9 +239,9 @@ class HistoryReadExecution:
     entity_id: int
     resolve_prefix: str
     topic_name: str | None
-    messages: tuple[MessageLike, ...]
-    fetched_messages: tuple[MessageLike, ...]
-    reply_map: dict[int, MessageLike]
+    messages: tuple[ReadMessage, ...]
+    fetched_messages: tuple[ReadMessage, ...]
+    reply_map: dict[int, ReadMessage]
     reaction_names_map: dict[int, dict[str, list[str]]]
     topic_name_getter: TopicNameGetter | None
     navigation: CapabilityNavigation | None = None
@@ -236,8 +254,8 @@ class SearchExecution:
     entity_id: int
     dialog_name: str
     resolve_prefix: str
-    hits: tuple[MessageLike, ...]
-    context_messages_by_id: dict[int, MessageLike]
+    hits: tuple[ReadMessage, ...]
+    context_messages_by_id: dict[int, ReadMessage]
     reaction_names_map: dict[int, dict[str, list[str]]]
     next_offset: int | None
     navigation: CapabilityNavigation | None = None
@@ -253,7 +271,7 @@ HistoryReadCapabilityResult = (
 )
 SearchCapabilityResult = SearchExecution | DialogTargetFailure | NavigationFailure
 TopicLoader = Callable[..., Awaitable[TopicCatalog]]
-TopicFetcher = Callable[..., Awaitable[list[MessageLike]]]
+TopicFetcher = Callable[..., Awaitable[list[ReadMessage]]]
 TopicRefresher = Callable[..., Awaitable[TopicMetadata | None]]
 
 
