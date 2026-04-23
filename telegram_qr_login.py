@@ -49,6 +49,19 @@ def clear_screen():
     os.system('clear' if os.name == 'posix' else 'cls')
 
 
+def _qr_lifetime(qr_login) -> int:
+    """Return seconds until qr_login expires (minimum 1)."""
+    return max(
+        1,
+        int(
+            (
+                qr_login.expires.astimezone(datetime.timezone.utc)
+                - datetime.datetime.now(tz=datetime.timezone.utc)
+            ).total_seconds()
+        ),
+    )
+
+
 def build_countdown_bar(remaining_seconds: int, total_seconds: int) -> str:
     """Строит текстовый progress bar обратного отсчета."""
     if total_seconds <= 0:
@@ -146,15 +159,7 @@ async def main():
 
         # Инициируем QR логин
         qr_login = await client.qr_login()
-        qr_total_seconds = max(
-            1,
-            int(
-                (
-                    qr_login.expires.astimezone(datetime.timezone.utc)
-                    - datetime.datetime.now(tz=datetime.timezone.utc)
-                ).total_seconds()
-            ),
-        )
+        qr_total_seconds = _qr_lifetime(qr_login)
 
         while True:
             expires_at = qr_login.expires.astimezone(datetime.timezone.utc)
@@ -163,15 +168,7 @@ async def main():
 
             if remaining_seconds <= QR_REFRESH_MARGIN_SECONDS:
                 qr_login = await client.qr_login()
-                qr_total_seconds = max(
-                    1,
-                    int(
-                        (
-                            qr_login.expires.astimezone(datetime.timezone.utc)
-                            - datetime.datetime.now(tz=datetime.timezone.utc)
-                        ).total_seconds()
-                    ),
-                )
+                qr_total_seconds = _qr_lifetime(qr_login)
                 continue
 
             # Генерируем QR с URL
@@ -195,15 +192,7 @@ async def main():
             except asyncio.TimeoutError:
                 if datetime.datetime.now(tz=datetime.timezone.utc) >= expires_at:
                     qr_login = await client.qr_login()
-                    qr_total_seconds = max(
-                        1,
-                        int(
-                            (
-                                qr_login.expires.astimezone(datetime.timezone.utc)
-                                - datetime.datetime.now(tz=datetime.timezone.utc)
-                            ).total_seconds()
-                        ),
-                    )
+                    qr_total_seconds = _qr_lifetime(qr_login)
                 continue
             except SessionPasswordNeededError:
                 await complete_2fa_login(client)
