@@ -4,8 +4,7 @@ from pydantic import Field
 
 from ..errors import no_unread_all_text, no_unread_personal_text
 from ..formatter import UnreadChatData, format_unread_messages_grouped
-from ..models import ReadState
-from ._adapters import DaemonMessage
+from ..models import ReadMessage, ReadState
 from ._base import (
     DaemonNotRunningError,
     ToolAnnotations,
@@ -105,7 +104,7 @@ async def list_unread_messages(args: ListUnreadMessages) -> ToolResult:
     dialog_type_per_dialog: dict[int, str] = {}
 
     for group in groups:
-        messages = [DaemonMessage(m) for m in group.get("messages", [])]
+        messages = [ReadMessage(**m) for m in group.get("messages", [])]
         dialog_id = group.get("dialog_id", 0)
         chat_data = UnreadChatData(
             chat_id=dialog_id,

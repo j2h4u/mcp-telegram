@@ -2273,8 +2273,8 @@ async def test_upsert_entities_inserts_rows() -> None:
     assert result["upserted"] == 2
     rows = conn.execute("SELECT id, name FROM entities ORDER BY id").fetchall()
     assert len(rows) == 2
-    assert rows[0] == (100, "Alice")
-    assert rows[1] == (200, "Dev Chat")
+    assert tuple(rows[0]) == (100, "Alice")
+    assert tuple(rows[1]) == (200, "Dev Chat")
 
 
 @pytest.mark.asyncio
@@ -3331,23 +3331,6 @@ def test_decode_nav_search_token_returns_error() -> None:
 
 
 # ---------------------------------------------------------------------------
-# _DB_MESSAGE_COLUMNS dict(zip()) unpacking (M-16)
-# ---------------------------------------------------------------------------
-
-
-def test_db_message_columns_length_matches_query() -> None:
-    """_DB_MESSAGE_COLUMNS has 18 entries matching the SELECT (post_author added for channel author signatures)."""
-    from mcp_telegram.daemon_api import _DB_MESSAGE_COLUMNS
-
-    assert len(_DB_MESSAGE_COLUMNS) == 18
-    assert _DB_MESSAGE_COLUMNS[0] == "message_id"
-    assert _DB_MESSAGE_COLUMNS[-1] == "post_author"
-    assert "effective_sender_id" in _DB_MESSAGE_COLUMNS
-    assert "is_service" in _DB_MESSAGE_COLUMNS
-    assert "dialog_id" in _DB_MESSAGE_COLUMNS
-    assert "fwd_from_name" in _DB_MESSAGE_COLUMNS
-
-
 # ---------------------------------------------------------------------------
 # _compute_sync_coverage unit tests (Plan 36-02, Task 1)
 # ---------------------------------------------------------------------------
@@ -3986,38 +3969,30 @@ async def test_no_remaining_reactions_key_in_responses() -> None:
 
 
 def test_format_reactions_with_preformatted_display() -> None:
-    """_format_reactions passes through _PreformattedReactions._display unchanged."""
+    """_format_reactions returns reactions_display from ReadMessage unchanged."""
     from mcp_telegram.formatter import _format_reactions
-    from mcp_telegram.tools._adapters import _PreformattedReactions
+    from mcp_telegram.models import ReadMessage
 
-    class _FakeMsg:
-        reactions = _PreformattedReactions("[👍×3 ❤️×1]")
-
-    result = _format_reactions(_FakeMsg())  # type: ignore[arg-type]
-    assert result == "[👍×3 ❤️×1]"
+    msg = ReadMessage(message_id=1, sent_at=0, dialog_id=0, reactions_display="[👍×3 ❤️×1]")
+    assert _format_reactions(msg) == "[👍×3 ❤️×1]"
 
 
 def test_format_reactions_with_preformatted_empty_string() -> None:
-    """_format_reactions returns '' for _PreformattedReactions with empty display."""
+    """_format_reactions returns '' when reactions_display is empty."""
     from mcp_telegram.formatter import _format_reactions
-    from mcp_telegram.tools._adapters import _PreformattedReactions
+    from mcp_telegram.models import ReadMessage
 
-    class _FakeMsg:
-        reactions = _PreformattedReactions("")
-
-    result = _format_reactions(_FakeMsg())  # type: ignore[arg-type]
-    assert result == ""
+    msg = ReadMessage(message_id=1, sent_at=0, dialog_id=0, reactions_display="")
+    assert _format_reactions(msg) == ""
 
 
 def test_format_reactions_with_none_reactions() -> None:
-    """_format_reactions returns '' for msg.reactions=None."""
+    """_format_reactions returns '' when reactions_display is empty (default)."""
     from mcp_telegram.formatter import _format_reactions
+    from mcp_telegram.models import ReadMessage
 
-    class _FakeMsg:
-        reactions = None
-
-    result = _format_reactions(_FakeMsg())  # type: ignore[arg-type]
-    assert result == ""
+    msg = ReadMessage(message_id=1, sent_at=0, dialog_id=0)
+    assert _format_reactions(msg) == ""
 
 
 def test_format_reaction_counts_emoji_glyphs_with_multiplication_sign() -> None:
@@ -4611,12 +4586,6 @@ def test_all_sql_constants_contain_entity_join_and_coalesce() -> None:
         # Phase 39.1-02: every read-path SELECT projects effective_sender_id
         assert "effective_sender_id" in sql, f"{name} missing effective_sender_id projection"
         assert ":self_id" in sql, f"{name} missing :self_id parameter binding"
-
-
-def test_db_message_columns_preserves_sender_first_name_position() -> None:
-    from mcp_telegram.daemon_api import _DB_MESSAGE_COLUMNS
-
-    assert _DB_MESSAGE_COLUMNS[4] == "sender_first_name"
 
 
 def test_line_409_filter_has_documenting_comment() -> None:

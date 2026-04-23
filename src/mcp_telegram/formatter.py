@@ -5,7 +5,7 @@ from zoneinfo import ZoneInfo
 
 import telethon.tl.types as tl  # type: ignore[import-untyped]
 
-from .models import LinePrefixGetter, MessageLike, ReadState, TopicNameGetter
+from .models import LinePrefixGetter, ReadMessage, ReadState, TopicNameGetter
 
 logger = logging.getLogger(__name__)
 
@@ -130,7 +130,7 @@ def _render_read_state_header(
 
 
 def _compute_inline_markers(
-    messages: list,
+    messages: list[ReadMessage],
     read_state: ReadState | dict | None,
 ) -> dict[int, str]:
     """Return {message_id: marker_text} for the four inline markers (AC-8/9/10).
@@ -155,14 +155,7 @@ def _compute_inline_markers(
     def _side(
         out_flag: int, cursor_state: str | None, anchor: int | None, boundary_label: str, tail_label: str
     ) -> None:
-        # Select ids for this side; guard against missing .id / .out.
-        # WR-03: explicit None-guard only; do not fold id=0 to sentinel 0
-        # (would collide with "missing id" and emit a bogus marker).
-        ids = [
-            int(m.id)
-            for m in messages
-            if getattr(m, "id", None) is not None and int(getattr(m, "out", 0) or 0) == out_flag
-        ]
+        ids = [m.id for m in messages if m.out == out_flag]
         if not ids:
             return
         if cursor_state == "null":
@@ -198,9 +191,8 @@ def _compute_inline_markers(
 
 
 def format_messages(
-    messages: list[MessageLike],
-    reply_map: dict[int, MessageLike],
-    reaction_names_map: dict[int, dict[str, list[str]]] | None = None,
+    messages: list[ReadMessage],
+    reply_map: dict[int, ReadMessage],
     tz: ZoneInfo | None = None,
     topic_name_getter: TopicNameGetter | None = None,
     line_prefix_getter: LinePrefixGetter | None = None,
@@ -210,29 +202,12 @@ def format_messages(
     now_unix: int | None = None,
     suppress_header: bool = False,
 ) -> str:
-    """Format a list of messages into human-readable text.
+    """Format a list of ReadMessage objects into human-readable text.
 
     Output lines:
     - '--- YYYY-MM-DD ---'  on calendar day change
     - '--- N мин ---'       when gap between consecutive messages exceeds 60 min
     - 'HH:mm FirstName: text'  for each message
-
-    Parameters
-    ----------
-    messages:
-        Telethon Message objects, newest-first (as returned by iter_messages).
-    reply_map:
-        message_id → Message mapping for reply annotation lines.
-        Should contain only messages from the current page — replies to
-        messages outside the page produce no annotation.
-    reaction_names_map:
-        message_id → {emoji: [reactor_names]} for inline reaction display.
-    tz:
-        Timezone for display. Defaults to UTC.
-    topic_name_getter:
-        Callable(msg) → topic title or None; labels cross-topic forum pages.
-    line_prefix_getter:
-        Callable(msg) → prefix string or None; prepended to each message line.
 
     Returns empty string for empty input.
     """
@@ -271,37 +246,27 @@ def format_messages(
 
         sender_name = _resolve_sender_name(msg)
         text = _render_text(msg)
-        edit_date_raw = getattr(msg, "edit_date", None)
-        if edit_date_raw is not None:
-            if isinstance(edit_date_raw, datetime):
-                ed_dt = edit_date_raw.astimezone(effective_tz)
-            else:
-                ed_dt = datetime.fromtimestamp(int(edit_date_raw), tz=UTC).astimezone(effective_tz)
+        if msg.edit_date is not None:
+            ed_dt = datetime.fromtimestamp(msg.edit_date, tz=UTC).astimezone(effective_tz)
             text = f"{text} [edited {ed_dt.strftime('%H:%M')}]"
-        reaction_names = reaction_names_map.get(msg.id) if reaction_names_map else None
-        reactions_str = _format_reactions(msg, reaction_names)
+        reactions_str = _format_reactions(msg)
         if reactions_str:
             text = f"{text} {reactions_str}" if text else reactions_str
 
         author_prefix = ""
-        post_author = getattr(msg, "post_author", None)
-        if post_author:
-            author_prefix = f"[by {post_author}] "
+        if msg.post_author:
+            author_prefix = f"[by {msg.post_author}] "
 
         fwd_prefix = ""
-        fwd_name = getattr(msg, "fwd_from_name", None)
-        if fwd_name:
-            fwd_prefix = f"[↪ fwd: {fwd_name}] "
+        if msg.fwd_from_name:
+            fwd_prefix = f"[↪ fwd: {msg.fwd_from_name}] "
 
         reply_prefix = ""
-        reply_to = getattr(msg, "reply_to", None)
-        if reply_to:
-            reply_id = getattr(reply_to, "reply_to_msg_id", None)
-            if reply_id and reply_id in reply_map:
-                orig = reply_map[reply_id]
-                orig_sender = _resolve_sender_name(orig)
-                orig_dt = orig.date.astimezone(effective_tz)
-                reply_prefix = f"[↑ {orig_sender} {orig_dt.strftime('%H:%M')}] "
+        if msg.reply_to_msg_id and msg.reply_to_msg_id in reply_map:
+            orig = reply_map[msg.reply_to_msg_id]
+            orig_sender = _resolve_sender_name(orig)
+            orig_dt = orig.date.astimezone(effective_tz)
+            reply_prefix = f"[↑ {orig_sender} {orig_dt.strftime('%H:%M')}] "
 
         topic_prefix = ""
         if topic_name_getter is not None:
@@ -316,10 +281,8 @@ def format_messages(
                 line_prefix = f"{resolved_prefix} "
 
         line = f"{line_prefix}{topic_prefix}{dt.strftime('%H:%M')} {sender_name}: {author_prefix}{fwd_prefix}{reply_prefix}{text}"
-        # Phase 39.3: append inline marker for this message_id (D-06 — trailing).
-        msg_id_attr = getattr(msg, "id", None)
-        if inline_markers and msg_id_attr in inline_markers:
-            line = f"{line} {inline_markers[msg_id_attr]}"
+        if inline_markers and msg.id in inline_markers:
+            line = f"{line} {inline_markers[msg.id]}"
         lines.append(line)
 
         prev_dt = dt
@@ -328,16 +291,13 @@ def format_messages(
 
 
 def build_search_hit_window(
-    hit: MessageLike,
+    hit: ReadMessage,
     *,
-    context_messages_by_id: dict[int, MessageLike],
+    context_messages_by_id: dict[int, ReadMessage],
     context_radius: int = 3,
-) -> list[MessageLike]:
+) -> list[ReadMessage]:
     """Return one hit-local message window ordered for format_messages()."""
-    hit_id = getattr(hit, "id", None)
-    if not isinstance(hit_id, int):
-        return [hit]
-
+    hit_id = hit.id
     before = [
         context_messages_by_id[hit_id - offset]
         for offset in range(context_radius, 0, -1)
@@ -355,17 +315,16 @@ def _hit_line_prefix_getter(hit_id: int) -> LinePrefixGetter:
     """Factory that binds ``hit_id`` so the returned closure is not tied to the loop
     variable (B023). Keeps type inference stable for mypy."""
 
-    def _getter(message: MessageLike) -> str | None:
-        return "[HIT]" if getattr(message, "id", None) == hit_id else None
+    def _getter(message: ReadMessage) -> str | None:
+        return "[HIT]" if message.id == hit_id else None
 
     return _getter
 
 
 def format_search_message_groups(
-    hits: list[MessageLike],
+    hits: list[ReadMessage],
     *,
-    context_messages_by_id: dict[int, MessageLike],
-    reaction_names_map: dict[int, dict[str, list[str]]] | None = None,
+    context_messages_by_id: dict[int, ReadMessage],
     context_radius: int = 3,
 ) -> str:
     """Return grouped search output with hit-local context and hit markers."""
@@ -376,7 +335,6 @@ def format_search_message_groups(
     total_hits = len(hits)
 
     for index, hit in enumerate(hits, start=1):
-        hit_id = getattr(hit, "id", None)
         group_text = format_messages(
             build_search_hit_window(
                 hit,
@@ -384,10 +342,7 @@ def format_search_message_groups(
                 context_radius=context_radius,
             ),
             reply_map={},
-            reaction_names_map=reaction_names_map,
-            line_prefix_getter=(
-                _hit_line_prefix_getter(hit_id) if isinstance(hit_id, int) else None
-            ),
+            line_prefix_getter=_hit_line_prefix_getter(hit.id),
         )
         parts.append(f"--- hit {index}/{total_hits} ---\n{group_text}")
 
@@ -395,19 +350,17 @@ def format_search_message_groups(
 
 
 def resolve_sender_label(msg_or_row: object) -> str:
-    """Return the sender label for a message-like object or daemon row dict.
+    """Return the sender label for a ReadMessage or a raw row dict.
 
-    Five-branch decision (Phase 39.1-02 contract; supersedes Phase 39 three-way):
-      1. is_service == 1                           → "System"
-      2. out == 1 AND dialog_id > 0 AND is_service=0 → SELF_SENDER_LABEL (DM outgoing)
-      3. first_name resolves (non-empty str)       → first_name
-      4. effective_sender_id OR sender_id known    → "(unknown user {id})"
-      5. else                                      → "(unknown user)"
+    Five-branch decision:
+      1. is_service == 1                             → "System"
+      2. out == 1 AND dialog_id > 0 AND is_service=0 → SELF_SENDER_LABEL
+      3. sender_first_name resolves (non-empty str)  → sender_first_name
+      4. effective_sender_id OR sender_id known      → "(unknown user {id})"
+      5. else                                        → "(unknown user)"
 
-    Accepts both MessageLike objects (attribute access) and row dicts (key access)
-    — uses getattr with safe defaults so both shapes work. Reading-tool callers
-    pass row dicts through a SimpleNamespace or call directly with a dict-like
-    wrapper; formatter callers pass MessageLike/DaemonMessage objects.
+    Accepts ReadMessage objects and plain row dicts (used by search snippet
+    formatting in reading.py which works with raw daemon response dicts).
     """
     if isinstance(msg_or_row, dict):
         get = msg_or_row.get
@@ -421,8 +374,7 @@ def resolve_sender_label(msg_or_row: object) -> str:
         is_service = int(getattr(msg_or_row, "is_service", 0) or 0)
         out_flag = int(getattr(msg_or_row, "out", 0) or 0)
         dialog_id = getattr(msg_or_row, "dialog_id", 0) or 0
-        sender_obj = getattr(msg_or_row, "sender", None)
-        first_name = getattr(sender_obj, "first_name", None) if sender_obj is not None else None
+        first_name = getattr(msg_or_row, "sender_first_name", None)
         effective_sender_id = getattr(msg_or_row, "effective_sender_id", None)
         sender_id = getattr(msg_or_row, "sender_id", None)
 
@@ -443,57 +395,19 @@ def resolve_sender_label(msg_or_row: object) -> str:
     return "(unknown user)"
 
 
-def _resolve_sender_name(msg: MessageLike) -> str:
-    """Backward-compatible wrapper delegating to resolve_sender_label."""
+def _resolve_sender_name(msg: ReadMessage) -> str:
     return resolve_sender_label(msg)
 
 
-def _render_text(msg: MessageLike) -> str:
-    """Return message text, or a media placeholder for media-only messages."""
-    text = getattr(msg, "message", "") or ""
-    if text:
-        return text
-    media = getattr(msg, "media", None)
-    if media is None:
-        return ""
-    # Pre-formatted daemon description (has _description attr from _MediaPlaceholder)
-    if hasattr(media, "_description"):
-        return str(media)
-    return _describe_media(media)
+def _render_text(msg: ReadMessage) -> str:
+    """Return message text, or a pre-formatted media placeholder."""
+    if msg.text:
+        return msg.text
+    return msg.media_description or ""
 
 
-def _format_reactions(msg: MessageLike, reaction_names: dict[str, list[str]] | None = None) -> str:
-    """Return formatted reactions string like '[👍×3: Alice, Bob ❤️: Carol]', or empty string."""
-    reactions = getattr(msg, "reactions", None)
-    if reactions is None:
-        return ""
-    # Pre-formatted daemon reactions: pass through directly.
-    # Temporary path -- remove when reaction_names_map is removed from
-    # MessageLike protocol in models.py.
-    preformatted = getattr(reactions, "_display", None)
-    if preformatted is not None:
-        return str(preformatted)
-    # Telethon path: extract from reactions.results
-    results = getattr(reactions, "results", None) or []
-    parts: list[str] = []
-    for r in results:
-        reaction = getattr(r, "reaction", None)
-        count = getattr(r, "count", 0)
-        emoji = getattr(reaction, "emoticon", None) or str(reaction)
-        names = reaction_names.get(emoji) if reaction_names else None
-        if names:
-            names_str = ", ".join(names)
-            if count > len(names):
-                parts.append(f"{emoji}×{count}: {names_str}…")
-            elif count > 1:
-                parts.append(f"{emoji}×{count}: {names_str}")
-            else:
-                parts.append(f"{emoji}: {names_str}")
-        elif count > 1:
-            parts.append(f"{emoji}×{count}")
-        else:
-            parts.append(emoji)
-    return f"[{' '.join(parts)}]" if parts else ""
+def _format_reactions(msg: ReadMessage) -> str:
+    return msg.reactions_display
 
 
 def format_reaction_counts(counts: list[tuple[str, int]]) -> str:

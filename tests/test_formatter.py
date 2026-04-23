@@ -1,26 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import UTC, datetime
 
-
-@dataclass
-class MockSender:
-    first_name: str
-    last_name: str | None = None
-
-
-@dataclass
-class MockMessage:
-    id: int
-    date: datetime  # must be timezone-aware (UTC)
-    message: str = ""
-    sender: MockSender | None = None
-    sender_id: int | None = None
-    media: object = None
-    reactions: object = None
-    reply_to: object = None
-    edit_date: int | datetime | None = None
+from mcp_telegram.models import ReadMessage
 
 
 def _make_msg(
@@ -28,20 +10,21 @@ def _make_msg(
     dt: datetime,
     text: str = "hello",
     first_name: str = "Alice",
-    media: object = None,
-    reactions: object = None,
-    reply_to: object = None,
+    media_description: str | None = None,
+    reactions_display: str = "",
+    reply_to_msg_id: int | None = None,
     sender_id: int = 1,
-) -> MockMessage:
-    return MockMessage(
-        id=id,
-        date=dt,
-        message=text,
-        sender=MockSender(first_name=first_name),
+) -> ReadMessage:
+    return ReadMessage(
+        message_id=id,
+        sent_at=int(dt.timestamp()),
+        dialog_id=0,
+        text=text,
+        sender_first_name=first_name,
         sender_id=sender_id,
-        media=media,
-        reactions=reactions,
-        reply_to=reply_to,
+        media_description=media_description,
+        reactions_display=reactions_display,
+        reply_to_msg_id=reply_to_msg_id,
     )
 
 
@@ -56,12 +39,9 @@ def test_basic_format() -> None:
 
     dt = datetime(2024, 6, 15, 14, 30, 0, tzinfo=UTC)
     msg = _make_msg(1, dt, text="hi there", first_name="Bob")
-    # Telethon returns newest-first; single message is both newest and oldest
     result = format_messages([msg], {})
     lines = result.strip().splitlines()
-    # First line must be a date header
     assert lines[0] == "--- 2024-06-15 ---", f"Expected date header, got: {lines[0]!r}"
-    # Second line: message
     assert lines[1] == "14:30 Bob: hi there", f"Unexpected message line: {lines[1]!r}"
 
 
@@ -70,28 +50,20 @@ def test_date_header() -> None:
     from mcp_telegram.formatter import format_messages
 
     dt1 = datetime(2024, 6, 15, 23, 0, 0, tzinfo=UTC)
-    dt2 = datetime(2024, 6, 16, 1, 0, 0, tzinfo=UTC)  # next day, 2h later
-    # newest-first: dt2 first, dt1 second
+    dt2 = datetime(2024, 6, 16, 1, 0, 0, tzinfo=UTC)
     msgs = [
         _make_msg(2, dt2, text="good morning", first_name="Alice"),
         _make_msg(1, dt1, text="good night", first_name="Alice"),
     ]
     result = format_messages(msgs, {})
     lines = result.strip().splitlines()
-    # Expect: date_header_june15, msg1, date_header_june16, msg2
-    assert "--- 2024-06-15 ---" in lines, f"Missing June 15 header. Lines: {lines}"
-    assert "--- 2024-06-16 ---" in lines, f"Missing June 16 header. Lines: {lines}"
+    assert "--- 2024-06-15 ---" in lines
+    assert "--- 2024-06-16 ---" in lines
     idx15 = lines.index("--- 2024-06-15 ---")
     idx16 = lines.index("--- 2024-06-16 ---")
-    assert idx15 < idx16, "June 15 header should come before June 16 header"
-    # msg1 (23:00) between the two headers
-    assert any("23:00" in l and "good night" in l for l in lines[idx15:idx16]), (
-        "23:00 good night not found between date headers"
-    )
-    # msg2 (01:00) after June 16 header
-    assert any("01:00" in l and "good morning" in l for l in lines[idx16:]), (
-        "01:00 good morning not found after June 16 header"
-    )
+    assert idx15 < idx16
+    assert any("23:00" in l and "good night" in l for l in lines[idx15:idx16])
+    assert any("01:00" in l and "good morning" in l for l in lines[idx16:])
 
 
 def test_session_break() -> None:
@@ -99,19 +71,16 @@ def test_session_break() -> None:
     from mcp_telegram.formatter import format_messages
 
     dt1 = datetime(2024, 6, 15, 10, 0, 0, tzinfo=UTC)
-    dt2 = datetime(2024, 6, 15, 11, 30, 0, tzinfo=UTC)  # 90 min later
-    # newest-first
+    dt2 = datetime(2024, 6, 15, 11, 30, 0, tzinfo=UTC)
     msgs = [
         _make_msg(2, dt2, text="later", first_name="Alice"),
         _make_msg(1, dt1, text="earlier", first_name="Alice"),
     ]
     result = format_messages(msgs, {})
     lines = result.strip().splitlines()
-    # There must be a session-break line containing 'мин'
     break_lines = [l for l in lines if "мин" in l and l.startswith("---")]
     assert break_lines, f"Expected session-break line, got none. Lines: {lines}"
-    # The break should indicate 90 minutes
-    assert "90" in break_lines[0], f"Expected 90 мин in break line, got: {break_lines[0]!r}"
+    assert "90" in break_lines[0]
 
 
 def test_no_session_break_within_60_min() -> None:
@@ -119,8 +88,7 @@ def test_no_session_break_within_60_min() -> None:
     from mcp_telegram.formatter import format_messages
 
     dt1 = datetime(2024, 6, 15, 10, 0, 0, tzinfo=UTC)
-    dt2 = datetime(2024, 6, 15, 10, 30, 0, tzinfo=UTC)  # 30 min later
-    # newest-first
+    dt2 = datetime(2024, 6, 15, 10, 30, 0, tzinfo=UTC)
     msgs = [
         _make_msg(2, dt2, text="second", first_name="Alice"),
         _make_msg(1, dt1, text="first", first_name="Alice"),
@@ -128,7 +96,7 @@ def test_no_session_break_within_60_min() -> None:
     result = format_messages(msgs, {})
     lines = result.strip().splitlines()
     break_lines = [l for l in lines if "мин" in l and l.startswith("---")]
-    assert not break_lines, f"Unexpected session-break line for 30-min gap. Lines: {lines}"
+    assert not break_lines
 
 
 def test_empty_message_list() -> None:
@@ -136,7 +104,7 @@ def test_empty_message_list() -> None:
     from mcp_telegram.formatter import format_messages
 
     result = format_messages([], {})
-    assert result == "", f"Expected empty string, got: {result!r}"
+    assert result == ""
 
 
 def test_newest_first_ordering() -> None:
@@ -144,123 +112,78 @@ def test_newest_first_ordering() -> None:
     from mcp_telegram.formatter import format_messages
 
     dt1 = datetime(2024, 6, 15, 9, 0, 0, tzinfo=UTC)
-    dt2 = datetime(2024, 6, 15, 9, 5, 0, tzinfo=UTC)  # 5 min later
-    dt3 = datetime(2024, 6, 15, 9, 10, 0, tzinfo=UTC)  # 10 min from start
-    # newest-first order: dt3, dt2, dt1
+    dt2 = datetime(2024, 6, 15, 9, 5, 0, tzinfo=UTC)
+    dt3 = datetime(2024, 6, 15, 9, 10, 0, tzinfo=UTC)
     msgs = [
         _make_msg(3, dt3, text="third", first_name="Alice"),
         _make_msg(2, dt2, text="second", first_name="Alice"),
         _make_msg(1, dt1, text="first", first_name="Alice"),
     ]
     result = format_messages(msgs, {})
-    # "first" should appear before "second" before "third" in output
     pos_first = result.index("first")
     pos_second = result.index("second")
     pos_third = result.index("third")
-    assert pos_first < pos_second < pos_third, "Messages not displayed oldest-first"
+    assert pos_first < pos_second < pos_third
 
 
 def test_unknown_sender() -> None:
-    """Service message (is_service=1) renders as 'System' (Phase 39.1-02 contract)."""
+    """Service message (is_service=1) renders as 'System'."""
     from mcp_telegram.formatter import format_messages
 
     dt = datetime(2024, 6, 15, 12, 0, 0, tzinfo=UTC)
-    msg = MockMessage(id=1, date=dt, message="anonymous", sender=None, sender_id=None)
-    # Phase 39.1-02: "System" now requires is_service=1 (not just sender_id=None).
-    # MockMessage lacks is_service; set via direct attribute assignment.
-    msg.is_service = 1  # type: ignore[attr-defined]
+    msg = ReadMessage(
+        message_id=1,
+        sent_at=int(dt.timestamp()),
+        dialog_id=0,
+        text="anonymous",
+        is_service=1,
+    )
     result = format_messages([msg], {})
-    assert "System: anonymous" in result, f"Expected 'System: anonymous', got: {result!r}"
+    assert "System: anonymous" in result
 
 
 def test_media_fallback() -> None:
-    """Message with unknown media type shows '[медиа: ClassName]'."""
+    """Message with media_description renders the pre-formatted description."""
     from mcp_telegram.formatter import format_messages
 
     dt = datetime(2024, 6, 15, 12, 0, 0, tzinfo=UTC)
-    msg = _make_msg(1, dt, text="", first_name="Carol", media=object())
+    msg = _make_msg(1, dt, text="", first_name="Carol", media_description="[медиа: SomeType]")
     result = format_messages([msg], {})
-    assert "[медиа:" in result, f"Expected '[медиа: ...]' for unknown media, got: {result!r}"
+    assert "[медиа:" in result
 
 
 def test_reply_annotation() -> None:
-    """Message with reply_to shows '[↑ SenderName HH:mm]' prefix."""
+    """Message with reply_to_msg_id shows '[↑ SenderName HH:mm]' prefix."""
     from mcp_telegram.formatter import format_messages
 
     dt_orig = datetime(2024, 6, 15, 9, 0, 0, tzinfo=UTC)
     dt_reply = datetime(2024, 6, 15, 9, 5, 0, tzinfo=UTC)
     orig = _make_msg(1, dt_orig, text="original", first_name="Alice")
-    reply_msg = _make_msg(2, dt_reply, text="reply text", first_name="Bob")
-
-    @dataclass
-    class FakeReplyTo:
-        reply_to_msg_id: int
-
-    reply_msg.reply_to = FakeReplyTo(reply_to_msg_id=1)
+    reply_msg = _make_msg(2, dt_reply, text="reply text", first_name="Bob", reply_to_msg_id=1)
 
     result = format_messages([reply_msg, orig], reply_map={1: orig})
-    assert "[↑ Alice 09:00]" in result, f"Expected reply annotation, got: {result!r}"
+    assert "[↑ Alice 09:00]" in result
     assert "reply text" in result
 
 
 def test_reactions_display() -> None:
-    """Message with reactions shows '[emoji×count: name]' when names provided."""
+    """Pre-formatted reactions_display is passed through to the output line."""
     from mcp_telegram.formatter import format_messages
 
     dt = datetime(2024, 6, 15, 12, 0, 0, tzinfo=UTC)
-
-    @dataclass
-    class FakeReaction:
-        emoticon: str
-
-    @dataclass
-    class FakeReactionCount:
-        reaction: FakeReaction
-        count: int
-
-    @dataclass
-    class FakeReactions:
-        results: list
-
-    reactions = FakeReactions(
-        results=[
-            FakeReactionCount(reaction=FakeReaction(emoticon="👍"), count=2),
-            FakeReactionCount(reaction=FakeReaction(emoticon="❤️"), count=1),
-        ]
-    )
-    msg = _make_msg(1, dt, text="hello", first_name="Alice", reactions=reactions)
-    reaction_names_map = {1: {"👍": ["Bob", "Carol"], "❤️": ["Dave"]}}
-    result = format_messages([msg], {}, reaction_names_map=reaction_names_map)
-    assert "[👍×2: Bob, Carol ❤️: Dave]" in result, f"Expected reactions with names, got: {result!r}"
+    msg = _make_msg(1, dt, text="hello", first_name="Alice", reactions_display="[👍×2: Bob, Carol ❤️: Dave]")
+    result = format_messages([msg], {})
+    assert "[👍×2: Bob, Carol ❤️: Dave]" in result
 
 
 def test_reactions_count_only() -> None:
-    """Message with reactions shows count-only '[emoji×N]' when no names provided."""
+    """Count-only reactions_display is passed through to the output line."""
     from mcp_telegram.formatter import format_messages
 
     dt = datetime(2024, 6, 15, 12, 0, 0, tzinfo=UTC)
-
-    @dataclass
-    class FakeReaction:
-        emoticon: str
-
-    @dataclass
-    class FakeReactionCount:
-        reaction: FakeReaction
-        count: int
-
-    @dataclass
-    class FakeReactions:
-        results: list
-
-    reactions = FakeReactions(
-        results=[
-            FakeReactionCount(reaction=FakeReaction(emoticon="🔥"), count=42),
-        ]
-    )
-    msg = _make_msg(1, dt, text="hot", first_name="Alice", reactions=reactions)
+    msg = _make_msg(1, dt, text="hot", first_name="Alice", reactions_display="[🔥×42]")
     result = format_messages([msg], {})
-    assert "[🔥×42]" in result, f"Expected count-only reactions, got: {result!r}"
+    assert "[🔥×42]" in result
 
 
 # ---------------------------------------------------------------------------
@@ -372,7 +295,7 @@ def test_format_unread_grouped_multiple_chats() -> None:
     assert "Bob" in result
     assert "id=111" in result
     assert "id=222" in result
-    assert "[и ещё 1]" in result  # Alice's remaining
+    assert "[и ещё 1]" in result
 
 
 # ---------------------------------------------------------------------------
@@ -381,49 +304,32 @@ def test_format_unread_grouped_multiple_chats() -> None:
 
 
 def test_edited_marker_shown_when_edit_date_is_int() -> None:
-    """[edited HH:mm] appears when edit_date is an integer Unix timestamp (CachedMessage style)."""
+    """[edited HH:mm] appears when edit_date is an integer Unix timestamp."""
     from mcp_telegram.formatter import format_messages
 
     # 1718464800 = 2024-06-15 15:20:00 UTC
     dt = datetime(2024, 6, 15, 14, 30, 0, tzinfo=UTC)
-    msg = MockMessage(
-        id=1,
-        date=dt,
-        message="edited text",
-        sender=MockSender(first_name="Alice"),
+    msg = ReadMessage(
+        message_id=1,
+        sent_at=int(dt.timestamp()),
+        dialog_id=0,
+        text="edited text",
+        sender_first_name="Alice",
         sender_id=1,
         edit_date=1718464800,
     )
     result = format_messages([msg], {})
-    assert "[edited 15:20]" in result, f"Expected '[edited 15:20]' in output, got: {result!r}"
-
-
-def test_edited_marker_shown_when_edit_date_is_datetime() -> None:
-    """[edited HH:mm] appears when edit_date is a datetime (Telethon style)."""
-    from mcp_telegram.formatter import format_messages
-
-    dt = datetime(2024, 6, 15, 14, 30, 0, tzinfo=UTC)
-    edit_dt = datetime(2024, 6, 15, 14, 30, 0, tzinfo=UTC)
-    msg = MockMessage(
-        id=1,
-        date=dt,
-        message="edited text",
-        sender=MockSender(first_name="Alice"),
-        sender_id=1,
-        edit_date=edit_dt,
-    )
-    result = format_messages([msg], {})
-    assert "[edited 14:30]" in result, f"Expected '[edited 14:30]' in output, got: {result!r}"
+    assert "[edited 15:20]" in result
 
 
 def test_edited_marker_absent_when_edit_date_none() -> None:
-    """No [edited ...] marker when edit_date is absent or None."""
+    """No [edited ...] marker when edit_date is None."""
     from mcp_telegram.formatter import format_messages
 
     dt = datetime(2024, 6, 15, 14, 30, 0, tzinfo=UTC)
     msg = _make_msg(1, dt, text="no edit")
     result = format_messages([msg], {})
-    assert "[edited" not in result, f"Unexpected '[edited' in output: {result!r}"
+    assert "[edited" not in result
 
 
 def test_edited_marker_before_reactions() -> None:
@@ -431,43 +337,24 @@ def test_edited_marker_before_reactions() -> None:
     from mcp_telegram.formatter import format_messages
 
     dt = datetime(2024, 6, 15, 12, 0, 0, tzinfo=UTC)
-
-    @dataclass
-    class FakeReaction:
-        emoticon: str
-
-    @dataclass
-    class FakeReactionCount:
-        reaction: FakeReaction
-        count: int
-
-    @dataclass
-    class FakeReactions:
-        results: list
-
-    reactions = FakeReactions(
-        results=[
-            FakeReactionCount(reaction=FakeReaction(emoticon="👍"), count=2),
-        ]
-    )
-    msg = MockMessage(
-        id=1,
-        date=dt,
-        message="hello",
-        sender=MockSender(first_name="Alice"),
+    msg = ReadMessage(
+        message_id=1,
+        sent_at=int(dt.timestamp()),
+        dialog_id=0,
+        text="hello",
+        sender_first_name="Alice",
         sender_id=1,
-        reactions=reactions,
+        reactions_display="[👍×2: Bob, Carol]",
         edit_date=1718460000,
     )
-    reaction_names_map = {1: {"👍": ["Bob", "Carol"]}}
-    result = format_messages([msg], {}, reaction_names_map=reaction_names_map)
-    assert "[edited" in result, f"Expected '[edited' in output: {result!r}"
-    assert "[👍" in result, f"Expected '[👍' in output: {result!r}"
-    assert result.index("[edited") < result.index("[👍"), f"Expected '[edited' to appear before '[👍' in: {result!r}"
+    result = format_messages([msg], {})
+    assert "[edited" in result
+    assert "[👍" in result
+    assert result.index("[edited") < result.index("[👍")
 
 
 # ---------------------------------------------------------------------------
-# _resolve_sender_name three-way fallback tests (Phase 39)
+# _resolve_sender_name five-branch tests (Phase 39.1-02)
 # ---------------------------------------------------------------------------
 
 from types import SimpleNamespace
@@ -484,16 +371,12 @@ def _rsn_msg(
 ):
     """Build a minimal message-like object for resolve_sender_label / _resolve_sender_name.
 
-    Phase 39.1-02: carries is_service, out, dialog_id, effective_sender_id in
-    addition to sender_id/sender_first_name to exercise the 5-branch decision.
+    Uses sender_first_name directly (flat field) as ReadMessage does.
     """
-    if sender_first_name is ...:
-        sender = None
-    else:
-        sender = SimpleNamespace(first_name=sender_first_name)
+    first_name = None if sender_first_name is ... else sender_first_name
     return SimpleNamespace(
         sender_id=sender_id,
-        sender=sender,
+        sender_first_name=first_name,
         is_service=is_service,
         out=out,
         dialog_id=dialog_id,
@@ -501,13 +384,9 @@ def _rsn_msg(
     )
 
 
-# --- Phase 39.1-02: 5-branch decision tree tests ---
-
-
 def test_resolve_sender_name_service_message_renders_system():
     from mcp_telegram.formatter import _resolve_sender_name
 
-    # is_service=1 → "System" regardless of other fields
     assert _resolve_sender_name(_rsn_msg(sender_id=None, is_service=1)) == "System"
 
 
@@ -562,13 +441,9 @@ def test_resolve_sender_name_dm_incoming_unknown_renders_unknown_user_with_id():
 
 
 def test_resolve_sender_name_group_unknown_sender_renders_unknown_user():
-    """Group unknown sender (no id anywhere) → '(unknown user)'."""
     from mcp_telegram.formatter import _resolve_sender_name
 
     assert _resolve_sender_name(_rsn_msg(sender_id=None, out=0, dialog_id=-100123, is_service=0)) == "(unknown user)"
-
-
-# --- Legacy Phase 39 tests, migrated to Phase 39.1-02 contract ---
 
 
 def test_resolve_sender_name_returns_first_name_when_present():
@@ -603,37 +478,28 @@ def test_resolve_sender_name_returns_unknown_user_with_id_when_first_name_empty(
 def test_golden_daemon_fields() -> None:
     """Golden contract for format_messages on the daemon path.
 
-    Covers the four fields that arrive via the daemon API and are absent from
-    the Telethon MockMessage helpers above: fwd_from_name, post_author,
-    edit_date, and pre-formatted reactions_display.  The expected string pins
-    the exact output format; update it only when the format intentionally
-    changes (e.g. after Wave 2 ReadMessage migration).
+    Covers fwd_from_name, post_author, edit_date, and reactions_display as they
+    arrive from the daemon API — all flat fields on ReadMessage.
     """
-    from types import SimpleNamespace
     from mcp_telegram.formatter import format_messages
 
     dt = datetime(2024, 6, 15, 14, 30, 0, tzinfo=UTC)
     edit_dt = datetime(2024, 6, 15, 15, 0, 0, tzinfo=UTC)
 
-    msg = SimpleNamespace(
-        id=1,
-        date=dt,
-        message="Interesting article",
-        sender=SimpleNamespace(first_name="Olga"),
+    msg = ReadMessage(
+        message_id=1,
+        sent_at=int(dt.timestamp()),
+        dialog_id=100,
+        text="Interesting article",
+        sender_first_name="Olga",
         sender_id=101,
         effective_sender_id=101,
-        # Pre-formatted reactions_display simulates _PreformattedReactions
-        # (formatter checks getattr(reactions, "_display", None)).
-        reactions=SimpleNamespace(_display="[👍×2]"),
-        media=None,
-        reply_to=None,
-        edit_date=edit_dt,
+        reactions_display="[👍×2]",
+        edit_date=int(edit_dt.timestamp()),
         post_author="Olga Smith",
         fwd_from_name="Tech News",
         is_service=0,
         out=0,
-        dialog_id=100,
-        topic_title=None,
     )
 
     result = format_messages([msg], {})
