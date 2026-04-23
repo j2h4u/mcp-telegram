@@ -307,6 +307,20 @@ class ReadMessage:
     dialog_name: str | None = None # только в FTS all-search пути
 ```
 
+### Phase 999.6: Резолвинг имён для пересылок — fix в sync-воркере (BACKLOG)
+
+**Goal:** Пересланные сообщения с `peer_id` без `from_name` корректно отображают имя отправителя — в новых сообщениях сразу, в исторических при следующей синхронизации.
+
+**Requirements:** TBD
+**Plans:** 0 plans
+
+**Контекст (2026-04-24):**
+
+Бэкфил существующих записей бессмысленен — покроет только то, что есть в БД сейчас, но не поможет с будущими форвардами. Правильный фикс: в sync-воркере при обходе истории (`iter_messages`), когда встречаем forward с `peer_id` но без `from_name` — резолвить entity через `GetUsersRequest`/`GetChannelsRequest` и класть результат в таблицу `entities`. Тогда и будущие сообщения покрываются, и исторические при следующем полном обходе.
+
+Plans:
+- [ ] TBD (promote with /gsd-review-backlog when ready)
+
 **Satellite dataclasses (сейчас — позиционные tuple):**
 
 ```python
