@@ -32,7 +32,7 @@ writer; the MCP server opens `sync.db` read-only for lightweight queries.
 - `__init__.py` — CLI entrypoint: `sign-in`, `run`, `logout`, `sync`
 
 ### Shared Utilities
-- `models.py` — TypedDict schemas, dataclasses, Protocol types (`MessageLike`, `SenderLike`)
+- `models.py` — TypedDict schemas, dataclasses (`StoredMessage`, `ReadMessage`)
 - `budget.py` — message budget allocation for tool responses
 - `resolver.py` — fuzzy name resolution (anyascii + Cyrillic transliteration); single match auto-resolves
 - `formatter.py` — `format_messages()` with `[edited HH:mm]`, media, reactions
@@ -49,7 +49,6 @@ writer; the MCP server opens `sync.db` read-only for lightweight queries.
 
 ### Tools Package (`tools/`)
 - `_base.py` — `ToolArgs`, `ToolResult`, `@mcp_tool`, `TOOL_REGISTRY`, `daemon_connection`, telemetry
-- `_adapters.py` — daemon row dict → `MessageLike`-compatible objects (temporary bridging layer)
 - `discovery.py` — `ListDialogs`, `ListTopics`, `GetMyAccount`
 - `reading.py` — `ListMessages`, `SearchMessages`
 - `stats.py` — `GetUsageStats`, `GetDialogStats`
@@ -82,13 +81,34 @@ async def new_tool(args: NewTool) -> ToolResult:
 ## Testing
 
 ```bash
-uv run pytest                                          # full suite
-uv run pytest tests/test_daemon_api.py -v             # focused
-uv run cli.py list-tools                               # manual: list registered tools
-uv run cli.py call-tool --name ListDialogs --arguments '{"unread": true}'
+uv run pytest                              # full suite
+uv run pytest tests/test_daemon_api.py -v  # focused
 ```
 
-`cli.py` requires the daemon to be running (or a test double).
+## Вызов MCP tools (devtools-клиент)
+
+**Всегда используй `devtools/mcp_client/cli.py` для ad-hoc проверок и E2E-валидации — не `docker exec python3` и не самодельные скрипты.**
+
+Запускается из корня репозитория (`~/repos/j2h4u/mcp-telegram/`):
+
+```bash
+# Список доступных tools
+uv run python -m devtools.mcp_client.cli list-tools \
+  -- docker exec -i mcp-telegram mcp-telegram run
+
+# Разовый вызов tool'а
+uv run python -m devtools.mcp_client.cli call-tool \
+  --name GetSyncStatus \
+  --arguments '{"dialog_id": 228055330}' \
+  -- docker exec -i mcp-telegram mcp-telegram run
+
+# Запуск smoke-теста из JSON-файла
+uv run python -m devtools.mcp_client.cli script \
+  --file devtools/mcp_client/smoke-integration.json \
+  -- docker exec -i mcp-telegram mcp-telegram run
+```
+
+Требует живого daemon (контейнер должен быть Healthy).
 
 ## Runtime On This Machine
 
