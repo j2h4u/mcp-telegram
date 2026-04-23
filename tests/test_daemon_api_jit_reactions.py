@@ -374,7 +374,7 @@ async def test_jit_ttl_expired_refreshes_no_duplicates() -> None:
         "SELECT message_id, emoji, count FROM message_reactions WHERE dialog_id=? ORDER BY message_id",
         (dialog_id,),
     ).fetchall()
-    assert rxn_rows == [(mid, "❤", 1) for mid in ids]
+    assert [tuple(r) for r in rxn_rows] == [(mid, "❤", 1) for mid in ids]
 
     # freshness updated to ~now
     now = int(time.time())

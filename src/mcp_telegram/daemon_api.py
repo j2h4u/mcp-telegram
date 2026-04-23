@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import dataclasses
 import json
 import logging
 import sqlite3
@@ -1175,7 +1176,7 @@ class DaemonAPIServer:
         )
         return {
             "ok": True,
-            "data": {"messages": messages, "source": "sync_db", "next_navigation": next_nav},
+            "data": {"messages": [dataclasses.asdict(m) for m in messages], "source": "sync_db", "next_navigation": next_nav},
         }
 
     async def _list_messages_context_window(
@@ -1248,7 +1249,7 @@ class DaemonAPIServer:
         return {
             "ok": True,
             "data": {
-                "messages": messages,
+                "messages": [dataclasses.asdict(m) for m in messages],
                 "source": "sync_db",
                 "anchor_message_id": anchor_message_id,
                 "next_navigation": None,
@@ -1578,7 +1579,7 @@ class DaemonAPIServer:
             return {
                 "ok": True,
                 "data": {
-                    "messages": messages,
+                    "messages": [dataclasses.asdict(m) for m in messages],
                     "total": len(messages),
                     "next_navigation": next_nav,
                     "read_state_per_dialog": read_state_per_dialog,
@@ -1590,7 +1591,7 @@ class DaemonAPIServer:
         return {
             "ok": True,
             "data": {
-                "messages": messages,
+                "messages": [dataclasses.asdict(m) for m in messages],
                 "total": len(messages),
                 "next_navigation": next_nav,
                 "read_state_per_dialog": read_state_per_dialog,
@@ -2364,7 +2365,7 @@ class DaemonAPIServer:
                 ]
             else:
                 group_messages = [ReadMessage(**dict(r)) for r in rows]
-            group["messages"] = group_messages
+            group["messages"] = [dataclasses.asdict(m) for m in group_messages]
             groups.append(group)
 
         return groups

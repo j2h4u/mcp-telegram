@@ -347,6 +347,7 @@ async def test_list_messages_via_daemon():
                     {
                         "message_id": 1,
                         "sent_at": 1705312800,
+                        "dialog_id": 123,
                         "text": "Hello",
                         "sender_first_name": "Alice",
                         "media_description": None,
@@ -802,6 +803,7 @@ async def test_list_unread_messages_via_daemon():
                             {
                                 "message_id": 1,
                                 "sent_at": 1700000000,
+                                "dialog_id": 123,
                                 "text": "Hello there",
                                 "sender_id": 123,
                                 "sender_first_name": "Alice",
@@ -912,6 +914,7 @@ async def test_list_unread_messages_non_empty_with_bootstrap_pending():
                             {
                                 "message_id": 1,
                                 "sent_at": 1700000000,
+                                "dialog_id": 123,
                                 "text": "Hello there",
                                 "sender_id": 123,
                                 "sender_first_name": "Alice",
@@ -958,6 +961,7 @@ async def test_list_unread_messages_non_empty_with_no_bootstrap_pending():
                             {
                                 "message_id": 1,
                                 "sent_at": 1700000000,
+                                "dialog_id": 123,
                                 "text": "Hello there",
                                 "sender_id": 123,
                                 "sender_first_name": "Alice",
@@ -1251,72 +1255,39 @@ async def test_daemon_connection_list_messages_omits_none_params():
 
 
 # ---------------------------------------------------------------------------
-# _DaemonMessage adapter — edit_date and topic_title (Phase 35-02, Task 1)
+# ReadMessage — edit_date and topic_title (migrated from DaemonMessage, Phase 999.5)
 # ---------------------------------------------------------------------------
 
 
-def test_daemon_message_reads_edit_date_from_row():
-    """_DaemonMessage reads edit_date from row dict as datetime (not hardcoded None)."""
-    from datetime import datetime
+def test_read_message_edit_date_from_row():
+    """ReadMessage carries edit_date as int (unix timestamp), not datetime."""
+    from mcp_telegram.models import ReadMessage
 
-    from mcp_telegram.tools._adapters import DaemonMessage as _DaemonMessage
-
-    row = {
-        "message_id": 1,
-        "sent_at": 1700000000,
-        "text": "hi",
-        "sender_first_name": None,
-        "edit_date": 1700001000,
-        "topic_title": None,
-    }
-    msg = _DaemonMessage(row)
-    assert msg.edit_date is not None
-    assert isinstance(msg.edit_date, datetime)
-    assert msg.edit_date == datetime.fromtimestamp(1700001000, tz=UTC)
+    msg = ReadMessage(message_id=1, sent_at=1700000000, dialog_id=0, text="hi", edit_date=1700001000)
+    assert msg.edit_date == 1700001000
 
 
-def test_daemon_message_edit_date_none_when_absent():
-    """_DaemonMessage.edit_date is None when row has no edit_date key."""
-    from mcp_telegram.tools._adapters import DaemonMessage as _DaemonMessage
+def test_read_message_edit_date_none_when_absent():
+    """ReadMessage.edit_date defaults to None."""
+    from mcp_telegram.models import ReadMessage
 
-    row = {
-        "message_id": 1,
-        "sent_at": 1700000000,
-        "text": "hi",
-        "sender_first_name": None,
-        "topic_title": None,
-    }
-    msg = _DaemonMessage(row)
+    msg = ReadMessage(message_id=1, sent_at=1700000000, dialog_id=0, text="hi")
     assert msg.edit_date is None
 
 
-def test_daemon_message_reads_topic_title_from_row():
-    """_DaemonMessage reads topic_title from row dict."""
-    from mcp_telegram.tools._adapters import DaemonMessage as _DaemonMessage
+def test_read_message_reads_topic_title():
+    """ReadMessage carries topic_title from the row."""
+    from mcp_telegram.models import ReadMessage
 
-    row = {
-        "message_id": 1,
-        "sent_at": 1700000000,
-        "text": "hi",
-        "sender_first_name": None,
-        "topic_title": "General",
-        "edit_date": None,
-    }
-    msg = _DaemonMessage(row)
+    msg = ReadMessage(message_id=1, sent_at=1700000000, dialog_id=0, text="hi", topic_title="General")
     assert msg.topic_title == "General"
 
 
-def test_daemon_message_topic_title_none_when_absent():
-    """_DaemonMessage.topic_title is None when row has no topic_title key."""
-    from mcp_telegram.tools._adapters import DaemonMessage as _DaemonMessage
+def test_read_message_topic_title_none_by_default():
+    """ReadMessage.topic_title defaults to None."""
+    from mcp_telegram.models import ReadMessage
 
-    row = {
-        "message_id": 1,
-        "sent_at": 1700000000,
-        "text": "hi",
-        "sender_first_name": None,
-    }
-    msg = _DaemonMessage(row)
+    msg = ReadMessage(message_id=1, sent_at=1700000000, dialog_id=0, text="hi")
     assert msg.topic_title is None
 
 
@@ -1330,6 +1301,7 @@ def test_format_daemon_messages_passes_topic_name_getter():
         {
             "message_id": 1,
             "sent_at": 1700000000,
+            "dialog_id": 0,
             "text": "hi",
             "sender_first_name": "Alice",
             "topic_title": "General",
@@ -1344,7 +1316,6 @@ def test_format_daemon_messages_passes_topic_name_getter():
         return "formatted"
 
     with patch("mcp_telegram.tools.reading.format_messages", _fake_format_messages):
-        # Need to ensure format_messages is called from within the module
         import mcp_telegram.tools.reading as reading_mod
 
         with patch.object(reading_mod, "_format_daemon_messages", wraps=reading_mod._format_daemon_messages):
@@ -1364,6 +1335,7 @@ def test_format_daemon_messages_no_topic_name_getter_when_no_topics():
         {
             "message_id": 1,
             "sent_at": 1700000000,
+            "dialog_id": 0,
             "text": "hi",
             "sender_first_name": "Alice",
             "topic_title": None,
@@ -1384,13 +1356,14 @@ def test_format_daemon_messages_no_topic_name_getter_when_no_topics():
 
 
 def test_format_daemon_messages_edit_date_shown():
-    """format_messages shows [edited HH:MM] when edit_date is set on _DaemonMessage."""
+    """format_messages shows [edited HH:MM] when edit_date is set on ReadMessage."""
     from mcp_telegram.tools.reading import _format_daemon_messages
 
     rows = [
         {
             "message_id": 1,
             "sent_at": 1700000000,
+            "dialog_id": 0,
             "text": "edited message",
             "sender_first_name": "Alice",
             "topic_title": None,

@@ -8,8 +8,8 @@ from ..formatter import (
     format_messages,
     resolve_sender_label,
 )
+from ..models import ReadMessage
 from ..resolver import parse_exact_dialog_id
-from ._adapters import DaemonMessage
 from ._base import (
     DaemonNotRunningError,
     ToolAnnotations,
@@ -63,36 +63,20 @@ def _format_daemon_messages(
     read_state: dict | None = None,
     dialog_type: str | None = None,
 ) -> str:
-    """Format daemon row dicts into human-readable message text.
-
-    Produces the same HH:mm Name: text format as format_messages(),
-    but handles pre-formatted media descriptions and skips Telethon-specific
-    protocol details that don't apply to daemon rows.
-
-    When global_mode=True, prefixes each line with "[dialog_name]" so results
-    from different dialogs are distinguishable.
-
-    Phase 39.3: when ``read_state`` + ``dialog_type`` are supplied from the
-    daemon response dict, threads them into ``format_messages`` to produce the
-    DM header + inline markers (AC-5/6/7/8).
-    """
+    """Format daemon row dicts into human-readable message text."""
     if not rows:
         return ""
 
-    messages = [DaemonMessage(r) for r in rows]
+    messages = [ReadMessage(**r) for r in rows]
+    reply_map: dict[int, ReadMessage] = {m.id: m for m in messages}
 
-    # Build reply map from rows available in this page
-    reply_map: dict[int, DaemonMessage] = {m.id: m for m in messages}
-
-    # Pass topic_name_getter when any message has a topic_title
-    has_topics = any(getattr(m, "topic_title", None) for m in messages)
-    topic_name_getter = (lambda msg: getattr(msg, "topic_title", None)) if has_topics else None
-
-    line_prefix_getter = (lambda msg: f"[{getattr(msg, 'dialog_name', None) or '?'}]") if global_mode else None
+    has_topics = any(m.topic_title for m in messages)
+    topic_name_getter = (lambda msg: msg.topic_title) if has_topics else None
+    line_prefix_getter = (lambda msg: f"[{msg.dialog_name or '?'}]") if global_mode else None
 
     return format_messages(
-        messages,  # type: ignore[arg-type]  # DaemonMessage satisfies MessageLike duck-typed, not statically
-        reply_map=reply_map,  # type: ignore[arg-type]  # same: dict[int, DaemonMessage] vs dict[int, MessageLike]
+        messages,
+        reply_map=reply_map,
         topic_name_getter=topic_name_getter,
         line_prefix_getter=line_prefix_getter,
         read_state=read_state,

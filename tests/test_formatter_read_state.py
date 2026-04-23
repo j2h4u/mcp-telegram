@@ -14,49 +14,43 @@ descending-render-order test (codex MEDIUM).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import UTC, datetime
+
+from mcp_telegram.models import ReadMessage
 
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
 
 
-@dataclass
-class MockSender:
-    first_name: str | None = "Alice"
-
-
-@dataclass
-class MockMsg:
-    """Synthetic message for formatter tests.
-
-    Mirrors MessageLike's duck-typed surface:
-    - id          → message_id for marker lookup
-    - date        → datetime (UTC)
-    - message     → body text
-    - out         → 0 incoming / 1 outgoing
-    - sender      → SenderLike-ish
-    - sender_id, is_service, dialog_id — needed by resolve_sender_label
-    - reactions, reply_to, media, edit_date — optional
-    """
-
-    id: int
-    date: datetime
-    message: str = "hi"
-    out: int = 0
-    sender: MockSender | None = None
-    sender_id: int | None = 11
-    is_service: int = 0
-    dialog_id: int = 12345  # positive → DM
-    reactions: object = None
-    reply_to: object = None
-    media: object = None
-    edit_date: int | datetime | None = None
-
-    def __post_init__(self) -> None:
-        if self.sender is None:
-            self.sender = MockSender(first_name="Alice")
+def _make_msg(
+    mid: int,
+    *,
+    text: str = "hi",
+    out: int = 0,
+    dialog_id: int = 12345,
+    edit_date: datetime | int | None = None,
+    sender_first_name: str | None = "Alice",
+    sent_at_dt: datetime | None = None,
+) -> ReadMessage:
+    """Create a ReadMessage for formatter tests with sensible defaults."""
+    if sent_at_dt is None:
+        sent_at_dt = _dt(12, 0)
+    edit_date_int: int | None = None
+    if isinstance(edit_date, datetime):
+        edit_date_int = int(edit_date.timestamp())
+    elif isinstance(edit_date, int):
+        edit_date_int = edit_date
+    return ReadMessage(
+        message_id=mid,
+        sent_at=int(sent_at_dt.timestamp()),
+        dialog_id=dialog_id,
+        text=text,
+        out=out,
+        sender_first_name=sender_first_name,
+        sender_id=11,
+        edit_date=edit_date_int,
+    )
 
 
 def _dt(h: int, m: int = 0, *, y: int = 2026, mo: int = 4, d: int = 21) -> datetime:
@@ -298,8 +292,8 @@ def test_header_oldest_relative_delta_weeks() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _mkmsg(mid: int, out: int = 0) -> MockMsg:
-    return MockMsg(id=mid, date=_dt(12, 0), out=out)
+def _mkmsg(mid: int, out: int = 0) -> ReadMessage:
+    return _make_msg(mid, out=out)
 
 
 def test_marker_inbox_boundary_on_highest_seen_incoming() -> None:
@@ -487,7 +481,7 @@ def test_format_messages_emits_header_when_dm() -> None:
     """DM + read_state → output starts with header line(s)."""
     from mcp_telegram.formatter import format_messages
 
-    msgs = [MockMsg(id=1, date=_dt(12, 0), message="hi", out=0)]
+    msgs = [_make_msg(1, text="hi", out=0)]
     rs = _collapsed_read_state()
     result = format_messages(msgs, reply_map={}, read_state=rs, dialog_type="User", now_unix=_unix(12, 0))
     assert result.splitlines()[0] == "[read-state: all caught up]"
@@ -497,7 +491,7 @@ def test_format_messages_no_header_when_non_dm() -> None:
     """AC-7: Channel dialog → no header regardless of read_state."""
     from mcp_telegram.formatter import format_messages
 
-    msgs = [MockMsg(id=1, date=_dt(12, 0), message="hi", out=0)]
+    msgs = [_make_msg(1, text="hi", out=0)]
     rs = _collapsed_read_state()
     result = format_messages(msgs, reply_map={}, read_state=rs, dialog_type="Channel", now_unix=_unix(12, 0))
     for banned in ["[read-state:", "[inbox:", "[outbox:"]:
@@ -508,7 +502,7 @@ def test_format_messages_backward_compat_without_kwargs() -> None:
     """Default call (no new kwargs) produces byte-identical output to today."""
     from mcp_telegram.formatter import format_messages
 
-    msgs = [MockMsg(id=1, date=_dt(14, 30), message="hi there")]
+    msgs = [_make_msg(1, text="hi there", sent_at_dt=_dt(14, 30))]
     baseline = format_messages(msgs, reply_map={})
     # Also callable with read_state=None, dialog_type=None → identical
     with_none = format_messages(msgs, reply_map={}, read_state=None, dialog_type=None)
@@ -522,8 +516,8 @@ def test_format_messages_emits_inline_marker_trailing() -> None:
     from mcp_telegram.formatter import format_messages
 
     msgs = [
-        MockMsg(id=2, date=_dt(12, 5), message="newest", out=0),
-        MockMsg(id=1, date=_dt(12, 0), message="oldest", out=0),
+        _make_msg(2, text="newest", out=0, sent_at_dt=_dt(12, 5)),
+        _make_msg(1, text="oldest", out=0),
     ]
     rs = {
         "inbox_unread_count": 1,
@@ -546,7 +540,7 @@ def test_marker_trails_after_existing_edited_metadata() -> None:
     from mcp_telegram.formatter import format_messages
 
     edit_dt = datetime(2026, 4, 21, 12, 30, tzinfo=UTC)
-    msg = MockMsg(id=1, date=_dt(12, 0), message="hi", out=0, edit_date=edit_dt)
+    msg = _make_msg(1, text="hi", out=0, edit_date=edit_dt)
     rs = {
         "inbox_unread_count": 0,
         "inbox_cursor_state": "populated",
@@ -575,14 +569,14 @@ def test_format_unread_messages_grouped_emits_per_chat_header() -> None:
         chat_id=111,
         display_name="Alice",
         unread_count=1,
-        messages=[MockMsg(id=1, date=_dt(12, 0), message="hey A", dialog_id=111)],
+        messages=[_make_msg(1, text="hey A", dialog_id=111)],
         total_in_chat=1,
     )
     chat_b = UnreadChatData(
         chat_id=222,
         display_name="Bob",
         unread_count=0,
-        messages=[MockMsg(id=2, date=_dt(12, 0), message="hey B", dialog_id=222)],
+        messages=[_make_msg(2, text="hey B", dialog_id=222)],
         total_in_chat=1,
     )
     rs_a = {
@@ -641,7 +635,7 @@ def test_format_unread_messages_grouped_backward_compat_without_kwargs() -> None
         chat_id=111,
         display_name="Alice",
         unread_count=1,
-        messages=[MockMsg(id=1, date=_dt(12, 0), message="hey", dialog_id=111)],
+        messages=[_make_msg(1, text="hey", dialog_id=111)],
         total_in_chat=1,
     )
     baseline = format_unread_messages_grouped([chat])
