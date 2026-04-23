@@ -753,6 +753,8 @@ class FullSyncWorker:
         Returns:
             (new_progress, is_done)
         """
+        if sync_progress == 0:
+            logger.info("sync_start dialog_id=%d", dialog_id)
         try:
             result = await self._client.get_messages(entity=dialog_id, limit=100, offset_id=sync_progress)
             total_messages = result.total  # Telegram-side count from TotalList
@@ -839,4 +841,6 @@ class FullSyncWorker:
             new_progress,
             is_done,
         )
+        if is_done:
+            logger.info("sync_done dialog_id=%d status=synced total_messages=%d", dialog_id, total_messages)
         return new_progress, is_done
