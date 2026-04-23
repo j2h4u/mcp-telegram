@@ -45,7 +45,7 @@ writer; the MCP server opens `sync.db` read-only for lightweight queries.
 - `docker-compose.yml` — template with path placeholders
 - `scripts/healthcheck_daemon.py` — Unix socket healthcheck (copied into image)
 - `scripts/healthcheck_all.sh` — healthcheck entrypoint (copied into image)
-- `telegram_qr_login.py` — QR-based auth (SMS method unreliable); run from deploy dir to produce `telegram_session.session`
+- `telegram_qr_login.py` — QR-based auth (repo root, SMS method unreliable); run from deploy dir to produce `telegram_session.session`
 
 ### Tools Package (`tools/`)
 - `_base.py` — `ToolArgs`, `ToolResult`, `@mcp_tool`, `TOOL_REGISTRY`, `daemon_connection`, telemetry

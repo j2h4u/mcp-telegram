@@ -33,14 +33,14 @@ The `deploy/` directory contains everything needed to run the container:
 - `Dockerfile` — multi-stage build; takes source from the cloned repo via `additional_contexts`
 - `docker-compose.yml` — template; fill in paths to your repo clone and deploy directory
 - `scripts/` — healthcheck scripts (copied into the image at build time)
-- `telegram_qr_login.py` — one-time auth script; run it in your deploy directory to create `telegram_session.session`
+- `telegram_qr_login.py` — one-time auth script (repo root); run it in your deploy directory to create `telegram_session.session`
 
 Create a deploy directory with `.env` (containing `TELEGRAM_API_ID` and `TELEGRAM_API_HASH`), adapt `docker-compose.yml`, then build with `docker compose up -d --build`.
 
 ## Setup
 
 1. Get an API ID and hash at [my.telegram.org/auth](https://my.telegram.org/auth) → API Development tools → Create application
-2. Authenticate via QR code using `deploy/telegram_qr_login.py` — the SMS code method (`mcp-telegram sign-in`) is unreliable as Telegram often does not deliver the code
+2. Authenticate via QR code using `telegram_qr_login.py` (repo root) — the SMS code method (`mcp-telegram sign-in`) is unreliable as Telegram often does not deliver the code
 3. To log out: `docker exec -it mcp-telegram mcp-telegram logout`
 
 ## Development
