@@ -650,7 +650,7 @@ class FullSyncWorker:
         row = self._conn.execute(_NEXT_PENDING_SQL).fetchone()
         if row is None:
             return None
-        return int(row[0]), int(row[1])
+        return int(row[0]), int(row[1]) if row[1] is not None else 0
 
     async def _fetch_batch(self, dialog_id: int, sync_progress: int) -> tuple[int, bool]:
         """Fetch up to 100 messages for dialog_id older than sync_progress.

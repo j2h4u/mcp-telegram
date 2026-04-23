@@ -381,7 +381,7 @@ _BATCHED_UNREAD_COUNTS_SQL = (
 )
 
 _MARK_FOR_SYNC_SQL = "INSERT OR IGNORE INTO synced_dialogs (dialog_id, status) VALUES (?, 'not_synced')"
-_UNMARK_SYNC_SQL = "UPDATE synced_dialogs SET status = 'not_synced' WHERE dialog_id = ?"
+_UNMARK_SYNC_SQL = "UPDATE synced_dialogs SET status = 'not_synced', sync_progress = NULL WHERE dialog_id = ?"
 
 _GET_SYNC_STATUS_SQL = (
     "SELECT status, last_synced_at, last_event_at, sync_progress, total_messages, access_lost_at "
