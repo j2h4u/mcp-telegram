@@ -180,7 +180,7 @@ from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
 from .budget import allocate_message_budget_proportional, unread_chat_tier
 from .formatter import format_reaction_counts
 from .fts import stem_query
-from .models import ReadState
+from .models import ReadMessage, ReadState
 from .pagination import (
     HistoryDirection,
     decode_navigation_token,
@@ -486,26 +486,6 @@ _ALL_ENTITY_NAMES_NORMALIZED_SQL = (
 _ENTITY_BY_USERNAME_SQL = "SELECT id, name FROM entities WHERE username = ?"
 
 # Column names returned by _build_list_messages_query, in SELECT order.
-_DB_MESSAGE_COLUMNS = (
-    "message_id",
-    "sent_at",
-    "text",
-    "sender_id",
-    "sender_first_name",
-    "media_description",
-    "reply_to_msg_id",
-    "forum_topic_id",
-    "is_deleted",
-    "deleted_at",
-    "edit_date",
-    "topic_title",
-    "effective_sender_id",
-    "is_service",
-    "out",
-    "dialog_id",
-    "fwd_from_name",
-    "post_author",
-)
 
 
 # ---------------------------------------------------------------------------
@@ -586,8 +566,8 @@ def _build_list_messages_query(
     """Build a parameterized SELECT for list_messages against sync.db.
 
     Returns (sql_string, params_dict).  Column names in the SELECT match
-    the keys used by _list_messages_from_db (use conn.row_factory = sqlite3.Row
-    or unpack via _DB_MESSAGE_COLUMNS).
+    ReadMessage field names; rows are fetched via conn.row_factory = sqlite3.Row
+    and converted to ReadMessage objects by _list_messages_from_db.
 
     self_id is bound to :self_id (used by the EFFECTIVE_SENDER_ID_SQL CASE
     expression to collapse DM direction). If not set, DM outgoing rows will
@@ -727,6 +707,7 @@ class DaemonAPIServer:
         client: Any,
         shutdown_event: asyncio.Event,
     ) -> None:
+        conn.row_factory = sqlite3.Row
         self._conn = conn
         self._client = client
         self._shutdown_event = shutdown_event
@@ -1031,7 +1012,7 @@ class DaemonAPIServer:
 
     @staticmethod
     def _maybe_encode_next_nav(
-        messages: list[dict],
+        messages: list[ReadMessage],
         limit: int,
         dialog_id: int,
         direction: str,
@@ -1039,7 +1020,7 @@ class DaemonAPIServer:
     ) -> str | None:
         """Encode a next-page navigation token if the result set is full."""
         if messages and len(messages) == limit:
-            last_msg_id = messages[-1]["message_id"]
+            last_msg_id = messages[-1].message_id
             logger.debug(
                 "list_messages_pagination anchor_msg_id=%d dialog_id=%d direction=%s%s",
                 last_msg_id,
@@ -1158,21 +1139,23 @@ class DaemonAPIServer:
             unread_after_id=unread_after_id,
         )
         rows = self._conn.execute(sql, params).fetchall()
-        messages = [dict(zip(_DB_MESSAGE_COLUMNS, r, strict=False)) for r in rows]
-        # Inject reaction counts from message_reactions table
-        msg_ids = [m["message_id"] for m in messages]
+        msg_ids = [r["message_id"] for r in rows]
         # Phase 39.2 Plan 02: TTL-gated JIT freshen for stale subset only.
         if msg_ids:
             await self._freshen_reactions_if_stale(dialog_id, dialog_id, msg_ids)
         reaction_map = _fetch_reaction_counts(self._conn, dialog_id, msg_ids)
-        for m in messages:
-            counts = reaction_map.get(m["message_id"])
-            m["reactions_display"] = format_reaction_counts(counts) if counts else ""
+        messages = [
+            ReadMessage(
+                **dict(r),
+                reactions_display=format_reaction_counts(reaction_map[r["message_id"]]) if r["message_id"] in reaction_map else "",
+            )
+            for r in rows
+        ]
         # Phase 39: observability counter. Emit ONCE on the sync.db success path.
         # Non-sync.db branches (Telegram fallback/error) intentionally do not emit this line.
-        null_sender_rows = sum(1 for m in messages if m.get("sender_id") is None)
+        null_sender_rows = sum(1 for m in messages if m.sender_id is None)
         unresolved_entity_rows = sum(
-            1 for m in messages if m.get("sender_id") is not None and m.get("sender_first_name") is None
+            1 for m in messages if m.sender_id is not None and m.sender_first_name is None
         )
         logger.info(
             "list_messages rendered",
@@ -1234,20 +1217,22 @@ class DaemonAPIServer:
 
         # before_rows are DESC — reverse to get chronological order, then append after
         rows = list(reversed(before_rows)) + list(after_rows)
-        messages = [dict(zip(_DB_MESSAGE_COLUMNS, r, strict=False)) for r in rows]
-        # Inject reaction counts from message_reactions table
-        msg_ids = [m["message_id"] for m in messages]
+        msg_ids = [r["message_id"] for r in rows]
         # Phase 39.2 Plan 02: JIT freshen for the context-window slice.
         if msg_ids:
             await self._freshen_reactions_if_stale(dialog_id, dialog_id, msg_ids)
         reaction_map = _fetch_reaction_counts(self._conn, dialog_id, msg_ids)
-        for m in messages:
-            counts = reaction_map.get(m["message_id"])
-            m["reactions_display"] = format_reaction_counts(counts) if counts else ""
+        messages = [
+            ReadMessage(
+                **dict(r),
+                reactions_display=format_reaction_counts(reaction_map[r["message_id"]]) if r["message_id"] in reaction_map else "",
+            )
+            for r in rows
+        ]
         # Phase 39: observability counter — mirror main path so anchor branch is not a blind spot.
-        null_sender_rows = sum(1 for m in messages if m.get("sender_id") is None)
+        null_sender_rows = sum(1 for m in messages if m.sender_id is None)
         unresolved_entity_rows = sum(
-            1 for m in messages if m.get("sender_id") is not None and m.get("sender_first_name") is None
+            1 for m in messages if m.sender_id is not None and m.sender_first_name is None
         )
         logger.info(
             "list_messages rendered",
@@ -1534,29 +1519,12 @@ class DaemonAPIServer:
                     "self_id": self.self_id,
                 },
             ).fetchall()
-            messages = [
-                {
-                    "message_id": r[0],
-                    "text": r[1],
-                    "sender_first_name": r[2],
-                    "sent_at": r[3],
-                    "media_description": r[4],
-                    "reply_to_msg_id": r[5],
-                    "sender_id": r[6],
-                    "forum_topic_id": r[7],
-                    "dialog_id": r[8],
-                    "dialog_name": r[9],
-                    "effective_sender_id": r[10],
-                    "is_service": r[11],
-                    "out": r[12],
-                    # Global search: results span multiple dialogs. Skip reaction injection --
-                    # fetching reactions per-dialog for a cross-dialog result set adds complexity
-                    # with little value (search results are for finding messages, not analyzing
-                    # reactions). This is an intentional design decision, not a bug.
-                    "reactions_display": "",
-                }
-                for r in rows
-            ]
+            # Global search: skip reaction injection (cross-dialog, intentional — see comment below)
+            messages = [ReadMessage(**dict(r)) for r in rows]
+            # Global search: results span multiple dialogs. Skip reaction injection --
+            # fetching reactions per-dialog for a cross-dialog result set adds complexity
+            # with little value (search results are for finding messages, not analyzing
+            # reactions). This is an intentional design decision, not a bug.
         else:
             rows = self._conn.execute(
                 _SELECT_FTS_SQL,
@@ -1568,38 +1536,21 @@ class DaemonAPIServer:
                     "self_id": self.self_id,
                 },
             ).fetchall()
-            messages = [
-                {
-                    "message_id": r[0],
-                    "text": r[1],
-                    "sender_first_name": r[2],
-                    "sent_at": r[3],
-                    "media_description": r[4],
-                    "reply_to_msg_id": r[5],
-                    "sender_id": r[6],
-                    "forum_topic_id": r[7],
-                    "effective_sender_id": r[8],
-                    "is_service": r[9],
-                    "out": r[10],
-                    "dialog_id": r[11],
-                }
-                for r in rows
-            ]
-            # Scoped search: single dialog_id -- inject reactions
+            # Scoped search: single dialog_id — inject reactions before building ReadMessage
             if dialog_id:
-                msg_ids = [r["message_id"] for r in messages]
+                msg_ids = [r["message_id"] for r in rows]
                 # Phase 39.2 Plan 02: scoped search → JIT freshen for the slice.
                 # Global search (dialog_id is None / 0) is OUT of JIT scope per
                 # CONTEXT.md §Out of scope — no single dialog for per-message gate.
                 if msg_ids:
                     await self._freshen_reactions_if_stale(dialog_id, dialog_id, msg_ids)
                 reaction_map = _fetch_reaction_counts(self._conn, dialog_id, msg_ids)
-                for r in messages:
-                    counts = reaction_map.get(r["message_id"])
-                    r["reactions_display"] = format_reaction_counts(counts) if counts else ""
+                messages = [
+                    ReadMessage(**dict(r), reactions_display=format_reaction_counts(reaction_map[r["message_id"]]) if r["message_id"] in reaction_map else "")
+                    for r in rows
+                ]
             else:
-                for r in messages:
-                    r["reactions_display"] = ""
+                messages = [ReadMessage(**dict(r)) for r in rows]
 
         next_nav: str | None = None
         if messages and len(messages) == limit:
@@ -1611,7 +1562,7 @@ class DaemonAPIServer:
         # dialog_id appearing in results. Only DMs (dialog_type == "User") are
         # included — non-DM hits are absent from the map (documented HIGH-1
         # resolution: per-dialog header block only covers DMs).
-        distinct_dialog_ids = {m["dialog_id"] for m in messages if m.get("dialog_id")}
+        distinct_dialog_ids = {m.dialog_id for m in messages if m.dialog_id}
         read_state_per_dialog: dict[int, ReadState] = {}
         for did in distinct_dialog_ids:
             dt = _dialog_type_from_db(self._conn, did)
@@ -2402,29 +2353,17 @@ class DaemonAPIServer:
                     "self_id": self.self_id,
                 },
             ).fetchall()
-            group_messages = [
-                {
-                    "message_id": r[0],
-                    "sent_at": r[1],
-                    "text": r[2],
-                    "sender_id": r[3],
-                    "sender_first_name": r[4],
-                    "effective_sender_id": r[5],
-                    "is_service": r[6],
-                    "out": r[7],
-                    "dialog_id": r[8],
-                }
-                for r in rows
-            ]
+            msg_ids = [r["message_id"] for r in rows]
             # Phase 39.2 Plan 02: per-dialog JIT freshen + reactions injection.
-            # Multi-dialog call → group by dialog (already grouped by entry/chat_id).
-            msg_ids = [m["message_id"] for m in group_messages]
             if msg_ids:
                 await self._freshen_reactions_if_stale(chat_id, chat_id, msg_ids)
                 reaction_map = _fetch_reaction_counts(self._conn, chat_id, msg_ids)
-                for m in group_messages:
-                    counts = reaction_map.get(m["message_id"])
-                    m["reactions_display"] = format_reaction_counts(counts) if counts else ""
+                group_messages = [
+                    ReadMessage(**dict(r), reactions_display=format_reaction_counts(reaction_map[r["message_id"]]) if r["message_id"] in reaction_map else "")
+                    for r in rows
+                ]
+            else:
+                group_messages = [ReadMessage(**dict(r)) for r in rows]
             group["messages"] = group_messages
             groups.append(group)
 
