@@ -21,7 +21,7 @@ import asyncio
 import logging
 import sqlite3
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
 from typing import Any
 
@@ -48,43 +48,98 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class StoredMessage:
+    """Row shape for INSERT OR REPLACE INTO messages.
+
+    Field names are the single source of truth for column names and INSERT SQL.
+    is_deleted is always 0 at insert time (hardcoded in INSERT_MESSAGE_SQL).
+    """
+
+    dialog_id: int
+    message_id: int
+    sent_at: int
+    text: str | None
+    sender_id: int | None
+    sender_first_name: str | None
+    media_description: str | None
+    reply_to_msg_id: int | None
+    forum_topic_id: int | None
+    edit_date: int | None
+    grouped_id: int | None
+    reply_to_peer_id: int | None
+    out: int
+    is_service: int
+    post_author: str | None
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ReactionRecord:
+    """One row in message_reactions."""
+
+    dialog_id: int
+    message_id: int
+    emoji: str
+    count: int
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class EntityRecord:
+    """One row in message_entities."""
+
+    dialog_id: int
+    message_id: int
+    offset: int
+    length: int
+    type: str
+    value: str | None
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ForwardRecord:
+    """One row in message_forwards."""
+
+    dialog_id: int
+    message_id: int
+    fwd_from_peer_id: int | None
+    fwd_from_name: str | None
+    fwd_date: int | None
+    fwd_channel_post: int | None
+
+
 @dataclass
 class ExtractedMessage:
     """Bundle of extracted rows for atomic multi-table insert."""
 
-    row: tuple  # matches INSERT_MESSAGE_SQL param order (no reactions)
-    reactions: list[tuple] = field(default_factory=list)  # [(dialog_id, msg_id, emoji, count)]
-    entities: list[tuple] = field(default_factory=list)  # [(dialog_id, msg_id, offset, length, type, value)]
-    forward: tuple | None = None  # (dialog_id, msg_id, fwd_from_peer_id, fwd_from_name, fwd_date, fwd_channel_post)
+    message: StoredMessage
+    reactions: list[ReactionRecord] = field(default_factory=list)
+    entities: list[EntityRecord] = field(default_factory=list)
+    forward: ForwardRecord | None = None
 
 
 # ---------------------------------------------------------------------------
-# SQL constants
+# SQL constants — generated from dataclass field names (single source of truth)
 # ---------------------------------------------------------------------------
 
+
+def _insert_sql(table: str, dc_type: type) -> str:
+    """Return INSERT OR REPLACE SQL with named params derived from a dataclass."""
+    col_names = tuple(f.name for f in fields(dc_type))
+    return (
+        f"INSERT OR REPLACE INTO {table} ({', '.join(col_names)}) "
+        f"VALUES ({', '.join(':' + n for n in col_names)})"
+    )
+
+
+_SM_FIELDS = tuple(f.name for f in fields(StoredMessage))
 INSERT_MESSAGE_SQL = (
-    "INSERT OR REPLACE INTO messages "
-    "(dialog_id, message_id, sent_at, text, sender_id, sender_first_name, "
-    "media_description, reply_to_msg_id, forum_topic_id, is_deleted, "
-    "edit_date, grouped_id, reply_to_peer_id, out, is_service, post_author) "
-    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)"
+    f"INSERT OR REPLACE INTO messages ({', '.join(_SM_FIELDS)}, is_deleted) "
+    f"VALUES ({', '.join(':' + n for n in _SM_FIELDS)}, 0)"
 )
 
-INSERT_REACTION_SQL = (
-    "INSERT OR REPLACE INTO message_reactions (dialog_id, message_id, emoji, count) VALUES (?, ?, ?, ?)"
-)
-
-INSERT_ENTITY_SQL = (
-    "INSERT OR REPLACE INTO message_entities "
-    "(dialog_id, message_id, offset, length, type, value) "
-    "VALUES (?, ?, ?, ?, ?, ?)"
-)
-
-INSERT_FORWARD_SQL = (
-    "INSERT OR REPLACE INTO message_forwards "
-    "(dialog_id, message_id, fwd_from_peer_id, fwd_from_name, fwd_date, fwd_channel_post) "
-    "VALUES (?, ?, ?, ?, ?, ?)"
-)
+INSERT_REACTION_SQL = _insert_sql("message_reactions", ReactionRecord)
+INSERT_ENTITY_SQL = _insert_sql("message_entities", EntityRecord)
+INSERT_FORWARD_SQL = _insert_sql("message_forwards", ForwardRecord)
 
 _DELETE_REACTIONS_SQL = "DELETE FROM message_reactions WHERE dialog_id = ? AND message_id = ?"
 
@@ -93,7 +148,7 @@ def apply_reactions_delta(
     conn: sqlite3.Connection,
     dialog_id: int,
     message_id: int,
-    reaction_rows: list[tuple],
+    reaction_rows: list[ReactionRecord],
 ) -> None:
     """Per-message reaction delta primitive.
 
@@ -104,9 +159,6 @@ def apply_reactions_delta(
     The caller controls transaction boundary (e.g. ``with conn:``); this helper
     does NOT open its own transaction.
 
-    Tuple shape matches ``extract_reactions_rows`` output:
-    ``(dialog_id, message_id, emoji, count)``.
-
     Per-message primitive used by event handlers and JIT freshen path.
     FullSyncWorker retains its own batched ``executemany`` insert path
     (insert_messages_with_fts) for bulk history inserts; that code path is
@@ -114,7 +166,7 @@ def apply_reactions_delta(
     """
     conn.execute(_DELETE_REACTIONS_SQL, (dialog_id, message_id))
     if reaction_rows:
-        conn.executemany(INSERT_REACTION_SQL, reaction_rows)
+        conn.executemany(INSERT_REACTION_SQL, [asdict(r) for r in reaction_rows])
 
 
 _DELETE_ENTITIES_SQL = "DELETE FROM message_entities WHERE dialog_id = ? AND message_id = ?"
@@ -135,19 +187,16 @@ def insert_messages_with_fts(
     before INSERT to ensure edit idempotency. Without this, an edited
     message would accumulate stale child rows from prior versions.
     """
-    rows = [em.row for em in extracted]
-    conn.executemany(INSERT_MESSAGE_SQL, rows)
-    conn.executemany(
-        DELETE_FTS_SQL,
-        ((row[0], row[1]) for row in rows),
-    )
+    msgs = [em.message for em in extracted]
+    conn.executemany(INSERT_MESSAGE_SQL, [asdict(m) for m in msgs])
+    conn.executemany(DELETE_FTS_SQL, ((m.dialog_id, m.message_id) for m in msgs))
     conn.executemany(
         INSERT_FTS_SQL,
-        ((row[0], row[1], stem_text(row[3])) for row in rows),
+        ((m.dialog_id, m.message_id, stem_text(m.text)) for m in msgs),
     )
 
     # Delete existing child rows before re-inserting (edit idempotency).
-    id_pairs = [(row[0], row[1]) for row in rows]
+    id_pairs = [(m.dialog_id, m.message_id) for m in msgs]
     conn.executemany(_DELETE_REACTIONS_SQL, id_pairs)
     conn.executemany(_DELETE_ENTITIES_SQL, id_pairs)
     conn.executemany(_DELETE_FORWARD_SQL, id_pairs)
@@ -155,13 +204,13 @@ def insert_messages_with_fts(
     # Insert fresh child rows
     all_reactions = [r for em in extracted for r in em.reactions]
     if all_reactions:
-        conn.executemany(INSERT_REACTION_SQL, all_reactions)
+        conn.executemany(INSERT_REACTION_SQL, [asdict(r) for r in all_reactions])
     all_entities = [e for em in extracted for e in em.entities]
     if all_entities:
-        conn.executemany(INSERT_ENTITY_SQL, all_entities)
+        conn.executemany(INSERT_ENTITY_SQL, [asdict(e) for e in all_entities])
     all_forwards = [em.forward for em in extracted if em.forward is not None]
     if all_forwards:
-        conn.executemany(INSERT_FORWARD_SQL, all_forwards)
+        conn.executemany(INSERT_FORWARD_SQL, [asdict(f) for f in all_forwards])
 
 
 _NEXT_PENDING_SQL = (
@@ -222,10 +271,9 @@ def extract_reply_and_topic(msg: Any) -> tuple[int | None, int | None]:
     return reply_to_msg_id, forum_topic_id
 
 
-def extract_reactions_rows(dialog_id: int, message_id: int, reactions: Any | None) -> list[tuple]:
+def extract_reactions_rows(dialog_id: int, message_id: int, reactions: Any | None) -> list[ReactionRecord]:
     """Extract reaction rows from a Telethon MessageReactions object.
 
-    Returns list of (dialog_id, message_id, emoji, count) tuples.
     Returns empty list if reactions is None or has no results.
     """
     if reactions is None:
@@ -233,13 +281,18 @@ def extract_reactions_rows(dialog_id: int, message_id: int, reactions: Any | Non
     results = getattr(reactions, "results", None)
     if not results:
         return []
-    rows: list[tuple] = []
+    rows: list[ReactionRecord] = []
     for item in results:
         reaction = getattr(item, "reaction", None)
         emoticon = getattr(reaction, "emoticon", None) if reaction is not None else None
         count = getattr(item, "count", 0)
         if emoticon is not None:
-            rows.append((dialog_id, message_id, emoticon, int(count)))
+            rows.append(ReactionRecord(
+                dialog_id=dialog_id,
+                message_id=message_id,
+                emoji=emoticon,
+                count=int(count),
+            ))
     return rows
 
 
@@ -293,17 +346,15 @@ def _utf16_slice(text: str, offset: int, length: int) -> str | None:
         byte_offset = offset * 2
         byte_length = length * 2
         return encoded[byte_offset : byte_offset + byte_length].decode("utf-16-le")
-    except UnicodeDecodeError, IndexError:
+    except (UnicodeDecodeError, IndexError):
         return None
 
 
-def extract_entity_rows(dialog_id: int, message_id: int, msg: Any) -> list[tuple]:
+def extract_entity_rows(dialog_id: int, message_id: int, msg: Any) -> list[EntityRecord]:
     """Extract analytics-valuable entity rows from a Telethon message.
 
     Captures: mention, mention_name, hashtag, url, text_url.
     Skips: bold, italic, code, strikethrough (no analytics value).
-
-    Returns list of (dialog_id, message_id, offset, length, type, value) tuples.
 
     Entity value population (addresses review Priority Action #1):
     - mention: value = @username text span (e.g. "@alice"). Note: CONTEXT.md
@@ -329,7 +380,7 @@ def extract_entity_rows(dialog_id: int, message_id: int, msg: Any) -> list[tuple
     if not _ANALYTICS_ENTITY_TYPES:
         return []  # Telethon not available (test env)
     text = getattr(msg, "message", "") or ""
-    rows: list[tuple] = []
+    rows: list[EntityRecord] = []
     for e in entities:
         entity_type: str | None = None
         for cls, type_name in _ANALYTICS_ENTITY_TYPES.items():
@@ -362,7 +413,14 @@ def extract_entity_rows(dialog_id: int, message_id: int, msg: Any) -> list[tuple
         elif entity_type == "text_url":
             # Hyperlink URL from entity attribute (display text is different)
             value = getattr(e, "url", None)
-        rows.append((dialog_id, message_id, offset, length, entity_type, value))
+        rows.append(EntityRecord(
+            dialog_id=dialog_id,
+            message_id=message_id,
+            offset=offset,
+            length=length,
+            type=entity_type,
+            value=value,
+        ))
     return rows
 
 
@@ -413,15 +471,14 @@ def extract_fwd_row(
     message_id: int,
     msg: Any,
     entity_name_map: dict[int, str] | None = None,
-) -> tuple | None:
+) -> ForwardRecord | None:
     """Extract forward metadata from a Telethon message.
 
     entity_name_map is a {peer_id: name} dict built from the batch response
     before this call — used to populate fwd_from_name for public senders
     whose name lives in the batch's users/chats, not in fwd_from.from_name.
 
-    Returns (dialog_id, message_id, fwd_from_peer_id, fwd_from_name,
-             fwd_date, fwd_channel_post) or None if not a forward.
+    Returns ForwardRecord or None if not a forward.
     """
     fwd = getattr(msg, "fwd_from", None)
     if fwd is None:
@@ -447,15 +504,21 @@ def extract_fwd_row(
     fwd_channel_post = getattr(fwd, "channel_post", None)
     if fwd_channel_post is not None:
         fwd_channel_post = int(fwd_channel_post)
-    return (dialog_id, message_id, fwd_from_peer_id, fwd_from_name, fwd_date, fwd_channel_post)
+    return ForwardRecord(
+        dialog_id=dialog_id,
+        message_id=message_id,
+        fwd_from_peer_id=fwd_from_peer_id,
+        fwd_from_name=fwd_from_name,
+        fwd_date=fwd_date,
+        fwd_channel_post=fwd_channel_post,
+    )
 
 
 def extract_message_row(dialog_id: int, msg: Any, entity_name_map: dict[int, str] | None = None) -> ExtractedMessage:
     """Extract sync.db row bundle from a Telethon message object.
 
-    Returns an ExtractedMessage with the main row tuple (matching
-    INSERT_MESSAGE_SQL parameter order) plus related reaction, entity,
-    and forward rows for atomic multi-table insert.
+    Returns an ExtractedMessage with a typed StoredMessage plus typed satellite
+    records for atomic multi-table insert.
     """
     message_id = int(getattr(msg, "id", 0))
 
@@ -497,28 +560,28 @@ def extract_message_row(dialog_id: int, msg: Any, entity_name_map: dict[int, str
     out = 1 if getattr(msg, "out", False) else 0
     post_author: str | None = getattr(msg, "post_author", None)
 
-    row = (
-        dialog_id,
-        message_id,
-        sent_at,
-        text,
-        sender_id,
-        sender_first_name,
-        media_description,
-        reply_to_msg_id,
-        forum_topic_id,
-        edit_date,
-        grouped_id,
-        reply_to_peer_id,
-        out,
-        is_service,
-        post_author,
+    stored = StoredMessage(
+        dialog_id=dialog_id,
+        message_id=message_id,
+        sent_at=sent_at,
+        text=text,
+        sender_id=sender_id,
+        sender_first_name=sender_first_name,
+        media_description=media_description,
+        reply_to_msg_id=reply_to_msg_id,
+        forum_topic_id=forum_topic_id,
+        edit_date=edit_date,
+        grouped_id=grouped_id,
+        reply_to_peer_id=reply_to_peer_id,
+        out=out,
+        is_service=is_service,
+        post_author=post_author,
     )
     reactions = extract_reactions_rows(dialog_id, message_id, getattr(msg, "reactions", None))
     entities = extract_entity_rows(dialog_id, message_id, msg)
     forward = extract_fwd_row(dialog_id, message_id, msg, entity_name_map=entity_name_map)
 
-    return ExtractedMessage(row=row, reactions=reactions, entities=entities, forward=forward)
+    return ExtractedMessage(message=stored, reactions=reactions, entities=entities, forward=forward)
 
 
 # ---------------------------------------------------------------------------

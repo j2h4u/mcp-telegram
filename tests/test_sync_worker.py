@@ -165,16 +165,16 @@ async def test_extract_reactions_rows(
 
     result = extract_message_row(dialog_id, msg)
 
-    # result.reactions is list of tuples, not JSON
     assert isinstance(result.reactions, list)
     assert len(result.reactions) == 2
-    emojis = {r[2] for r in result.reactions}
+    emojis = {r.emoji for r in result.reactions}
     assert emojis == {"👍", "❤"}
 
-    # result.row does NOT contain any JSON string
-    for item in result.row:
+    # message fields must not contain any JSON reactions blob
+    import dataclasses
+    for item in dataclasses.astuple(result.message):
         assert not isinstance(item, str) or not item.startswith("{"), (
-            f"row should not contain JSON reactions, got: {item!r}"
+            f"message should not contain JSON reactions, got: {item!r}"
         )
 
 
@@ -1224,10 +1224,10 @@ def test_extract_entity_rows_mention_and_bold(monkeypatch: Any) -> None:
     rows = extract_entity_rows(1, 100, msg)
 
     # Only the mention should be extracted
-    types_found = {r[4] for r in rows}
+    types_found = {r.type for r in rows}
     assert "mention" in types_found, "mention entity must be extracted"
     # Bold is not in _ANALYTICS_ENTITY_TYPES so no 'bold' type should appear
-    assert all(r[4] != "bold" for r in rows), "bold must not be extracted"
+    assert all(r.type != "bold" for r in rows), "bold must not be extracted"
 
 
 def test_extract_entity_rows_hashtag_populates_value(monkeypatch: Any) -> None:
@@ -1247,8 +1247,8 @@ def test_extract_entity_rows_hashtag_populates_value(monkeypatch: Any) -> None:
     rows = extract_entity_rows(1, 100, msg)
 
     assert len(rows) == 1
-    assert rows[0][4] == "hashtag"
-    assert rows[0][5] == "#python", f"hashtag value should be text span '#python', got {rows[0][5]!r}"
+    assert rows[0].type == "hashtag"
+    assert rows[0].value == "#python", f"hashtag value should be text span '#python', got {rows[0].value!r}"
 
 
 def test_extract_entity_rows_url_populates_value(monkeypatch: Any) -> None:
@@ -1268,8 +1268,8 @@ def test_extract_entity_rows_url_populates_value(monkeypatch: Any) -> None:
     rows = extract_entity_rows(1, 100, msg)
 
     assert len(rows) == 1
-    assert rows[0][4] == "url"
-    assert rows[0][5] == "https://example.com", f"url value should be text span, got {rows[0][5]!r}"
+    assert rows[0].type == "url"
+    assert rows[0].value == "https://example.com", f"url value should be text span, got {rows[0].value!r}"
 
 
 def test_extract_entity_rows_text_url(monkeypatch: Any) -> None:
@@ -1290,8 +1290,8 @@ def test_extract_entity_rows_text_url(monkeypatch: Any) -> None:
     rows = extract_entity_rows(1, 100, msg)
 
     assert len(rows) == 1
-    assert rows[0][4] == "text_url"
-    assert rows[0][5] == "https://real-url.example.com"
+    assert rows[0].type == "text_url"
+    assert rows[0].value == "https://real-url.example.com"
 
 
 def test_extract_entity_rows_mention_name(monkeypatch: Any) -> None:
@@ -1312,8 +1312,8 @@ def test_extract_entity_rows_mention_name(monkeypatch: Any) -> None:
     rows = extract_entity_rows(1, 100, msg)
 
     assert len(rows) == 1
-    assert rows[0][4] == "mention_name"
-    assert rows[0][5] == "12345"
+    assert rows[0].type == "mention_name"
+    assert rows[0].value == "12345"
 
 
 def test_extract_entity_rows_mention_stores_username_text_span(monkeypatch: Any) -> None:
@@ -1338,8 +1338,8 @@ def test_extract_entity_rows_mention_stores_username_text_span(monkeypatch: Any)
     rows = extract_entity_rows(1, 100, msg)
 
     assert len(rows) == 1
-    assert rows[0][4] == "mention"
-    assert rows[0][5] == "@alice", f"mention value should be '@alice' text span, got {rows[0][5]!r}"
+    assert rows[0].type == "mention"
+    assert rows[0].value == "@alice", f"mention value should be '@alice' text span, got {rows[0].value!r}"
 
 
 def test_extract_entity_rows_uses_isinstance(monkeypatch: Any) -> None:
@@ -1362,7 +1362,7 @@ def test_extract_entity_rows_uses_isinstance(monkeypatch: Any) -> None:
     rows = extract_entity_rows(1, 100, msg)
 
     assert len(rows) == 1, "SubHashtag must be matched via isinstance() dispatch"
-    assert rows[0][4] == "hashtag"
+    assert rows[0].type == "hashtag"
 
 
 def test_utf16_slice_with_emoji() -> None:
@@ -1445,12 +1445,12 @@ def test_extract_fwd_row() -> None:
     result = extract_fwd_row(1, 100, msg)
 
     assert result is not None
-    assert result[0] == 1  # dialog_id
-    assert result[1] == 100  # message_id
-    assert result[2] == 99999  # fwd_from_peer_id (channel_id)
-    assert result[3] == "Test Channel"
-    assert result[4] == int(fwd_date.timestamp())
-    assert result[5] == 42  # fwd_channel_post
+    assert result.dialog_id == 1
+    assert result.message_id == 100
+    assert result.fwd_from_peer_id == 99999  # channel_id
+    assert result.fwd_from_name == "Test Channel"
+    assert result.fwd_date == int(fwd_date.timestamp())
+    assert result.fwd_channel_post == 42
 
     # None when no fwd_from
     msg_no_fwd = SimpleNamespace(fwd_from=None)
@@ -1464,8 +1464,10 @@ def test_extract_message_row_returns_dataclass() -> None:
     msg = build_mock_message(id=123, text="hello")
     result = extract_message_row(1, msg)
 
+    from mcp_telegram.sync_worker import StoredMessage
+
     assert isinstance(result, ExtractedMessage)
-    assert isinstance(result.row, tuple)
+    assert isinstance(result.message, StoredMessage)
     assert isinstance(result.reactions, list)
     assert isinstance(result.entities, list)
     assert result.forward is None  # build_mock_message has no fwd_from
@@ -1506,9 +1508,9 @@ def test_extract_message_row_populates_v7_columns() -> None:
     )
     result = extract_message_row(1, msg)
 
-    assert result.row[9] == int(edit_dt.timestamp()), "edit_date mismatch"
-    assert result.row[10] == 9999, "grouped_id mismatch"
-    assert result.row[11] == 12345, "reply_to_peer_id mismatch"
+    assert result.message.edit_date == int(edit_dt.timestamp()), "edit_date mismatch"
+    assert result.message.grouped_id == 9999, "grouped_id mismatch"
+    assert result.message.reply_to_peer_id == 12345, "reply_to_peer_id mismatch"
 
     # All three as None
     msg_none = SimpleNamespace(
@@ -1526,7 +1528,9 @@ def test_extract_message_row_populates_v7_columns() -> None:
         entities=None,
     )
     result_none = extract_message_row(1, msg_none)
-    assert result_none.row[9:12] == (None, None, None)
+    assert result_none.message.edit_date is None
+    assert result_none.message.grouped_id is None
+    assert result_none.message.reply_to_peer_id is None
 
 
 # ---------------------------------------------------------------------------
@@ -1558,21 +1562,21 @@ def _minimal_msg(**overrides: Any) -> SimpleNamespace:
 
 
 def test_extract_message_row_captures_out_true() -> None:
-    """`msg.out=True` -> row[12] == 1."""
+    """`msg.out=True` -> message.out == 1."""
     from mcp_telegram.sync_worker import extract_message_row
 
     msg = _minimal_msg(out=True)
     result = extract_message_row(1, msg)
-    assert result.row[12] == 1, "out must be 1 when msg.out=True"
-    assert result.row[13] == 0, "is_service must be 0 for regular Message"
+    assert result.message.out == 1, "out must be 1 when msg.out=True"
+    assert result.message.is_service == 0, "is_service must be 0 for regular Message"
 
 
 def test_extract_message_row_captures_out_false_when_missing() -> None:
-    """`msg.out=False` or attribute missing -> row[12] == 0."""
+    """`msg.out=False` or attribute missing -> message.out == 0."""
     from mcp_telegram.sync_worker import extract_message_row
 
     msg_false = _minimal_msg(out=False)
-    assert extract_message_row(1, msg_false).row[12] == 0
+    assert extract_message_row(1, msg_false).message.out == 0
 
     # Attribute missing entirely: use a namespace without `out`
     from datetime import datetime
@@ -1591,11 +1595,11 @@ def test_extract_message_row_captures_out_false_when_missing() -> None:
         fwd_from=None,
         entities=None,
     )
-    assert extract_message_row(1, msg_missing).row[12] == 0, "out must default to 0 when attribute is missing"
+    assert extract_message_row(1, msg_missing).message.out == 0, "out must default to 0 when attribute is missing"
 
 
 def test_extract_message_row_flags_message_service_as_is_service() -> None:
-    """`isinstance(msg, MessageService)` -> row[13] == 1 regardless of `out`."""
+    """`isinstance(msg, MessageService)` -> message.is_service == 1 regardless of `out`."""
     from datetime import datetime
 
     from telethon.tl import types as tl
@@ -1610,16 +1614,16 @@ def test_extract_message_row_flags_message_service_as_is_service() -> None:
         out=True,  # even with out=True, is_service must be 1
     )
     result = extract_message_row(1, svc)
-    assert result.row[13] == 1, "is_service must be 1 for MessageService"
+    assert result.message.is_service == 1, "is_service must be 1 for MessageService"
 
 
 def test_extract_message_row_regular_message_is_service_zero() -> None:
-    """Regular (non-service) Message -> row[13] == 0."""
+    """Regular (non-service) Message -> message.is_service == 0."""
     from mcp_telegram.sync_worker import extract_message_row
 
     msg = _minimal_msg()
     result = extract_message_row(1, msg)
-    assert result.row[13] == 0
+    assert result.message.is_service == 0
 
 
 def test_extract_message_row_insert_roundtrip_preserves_out_and_is_service(
@@ -1647,9 +1651,31 @@ def test_extract_message_row_insert_roundtrip_preserves_out_and_is_service(
     assert row == (1, 0)
 
 
+def _stored(dialog_id: int, message_id: int, text: str = "hello") -> "StoredMessage":
+    from mcp_telegram.sync_worker import StoredMessage
+
+    return StoredMessage(
+        dialog_id=dialog_id,
+        message_id=message_id,
+        sent_at=1700000000,
+        text=text,
+        sender_id=1,
+        sender_first_name="Alice",
+        media_description=None,
+        reply_to_msg_id=None,
+        forum_topic_id=None,
+        edit_date=None,
+        grouped_id=None,
+        reply_to_peer_id=None,
+        out=0,
+        is_service=0,
+        post_author=None,
+    )
+
+
 def test_insert_messages_with_fts_writes_reactions(sync_db: sqlite3.Connection) -> None:
     """insert_messages_with_fts writes reaction rows to message_reactions table."""
-    from mcp_telegram.sync_worker import ExtractedMessage, insert_messages_with_fts
+    from mcp_telegram.sync_worker import ExtractedMessage, ReactionRecord, insert_messages_with_fts
 
     dialog_id = 9001
     message_id = 1
@@ -1657,8 +1683,11 @@ def test_insert_messages_with_fts_writes_reactions(sync_db: sqlite3.Connection) 
     sync_db.commit()
 
     em = ExtractedMessage(
-        row=(dialog_id, message_id, 1700000000, "hello", 1, "Alice", None, None, None, None, None, None, 0, 0, None),
-        reactions=[(dialog_id, message_id, "👍", 5), (dialog_id, message_id, "❤", 2)],
+        message=_stored(dialog_id, message_id, "hello"),
+        reactions=[
+            ReactionRecord(dialog_id=dialog_id, message_id=message_id, emoji="👍", count=5),
+            ReactionRecord(dialog_id=dialog_id, message_id=message_id, emoji="❤", count=2),
+        ],
     )
     with sync_db:
         insert_messages_with_fts(sync_db, [em])
@@ -1673,7 +1702,7 @@ def test_insert_messages_with_fts_writes_reactions(sync_db: sqlite3.Connection) 
 
 def test_insert_messages_with_fts_writes_forwards(sync_db: sqlite3.Connection) -> None:
     """insert_messages_with_fts writes forward metadata to message_forwards table."""
-    from mcp_telegram.sync_worker import ExtractedMessage, insert_messages_with_fts
+    from mcp_telegram.sync_worker import ExtractedMessage, ForwardRecord, insert_messages_with_fts
 
     dialog_id = 9002
     message_id = 2
@@ -1681,8 +1710,15 @@ def test_insert_messages_with_fts_writes_forwards(sync_db: sqlite3.Connection) -
     sync_db.commit()
 
     em = ExtractedMessage(
-        row=(dialog_id, message_id, 1700000000, "forwarded", 1, "Alice", None, None, None, None, None, None, 0, 0, None),
-        forward=(dialog_id, message_id, 55555, "Original Author", 1700000000, None),
+        message=_stored(dialog_id, message_id, "forwarded"),
+        forward=ForwardRecord(
+            dialog_id=dialog_id,
+            message_id=message_id,
+            fwd_from_peer_id=55555,
+            fwd_from_name="Original Author",
+            fwd_date=1700000000,
+            fwd_channel_post=None,
+        ),
     )
     with sync_db:
         insert_messages_with_fts(sync_db, [em])
@@ -1698,25 +1734,26 @@ def test_insert_messages_with_fts_writes_forwards(sync_db: sqlite3.Connection) -
 
 def test_insert_messages_with_fts_edit_idempotency_reactions(sync_db: sqlite3.Connection) -> None:
     """Inserting same message_id twice replaces reactions (DELETE-before-INSERT)."""
-    from mcp_telegram.sync_worker import ExtractedMessage, insert_messages_with_fts
+    from mcp_telegram.sync_worker import ExtractedMessage, ReactionRecord, insert_messages_with_fts
 
     dialog_id = 9003
     message_id = 3
     sync_db.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')", (dialog_id,))
     sync_db.commit()
 
-    # First insert: 2 reactions
     em1 = ExtractedMessage(
-        row=(dialog_id, message_id, 1700000000, "v1", 1, "Alice", None, None, None, None, None, None, 0, 0, None),
-        reactions=[(dialog_id, message_id, "👍", 3), (dialog_id, message_id, "❤", 1)],
+        message=_stored(dialog_id, message_id, "v1"),
+        reactions=[
+            ReactionRecord(dialog_id=dialog_id, message_id=message_id, emoji="👍", count=3),
+            ReactionRecord(dialog_id=dialog_id, message_id=message_id, emoji="❤", count=1),
+        ],
     )
     with sync_db:
         insert_messages_with_fts(sync_db, [em1])
 
-    # Second insert: 1 different reaction
     em2 = ExtractedMessage(
-        row=(dialog_id, message_id, 1700000000, "v2", 1, "Alice", None, None, None, None, None, None, 0, 0, None),
-        reactions=[(dialog_id, message_id, "🔥", 7)],
+        message=_stored(dialog_id, message_id, "v2"),
+        reactions=[ReactionRecord(dialog_id=dialog_id, message_id=message_id, emoji="🔥", count=7)],
     )
     with sync_db:
         insert_messages_with_fts(sync_db, [em2])
@@ -1731,7 +1768,7 @@ def test_insert_messages_with_fts_edit_idempotency_reactions(sync_db: sqlite3.Co
 
 def test_insert_messages_with_fts_edit_idempotency_entities(sync_db: sqlite3.Connection) -> None:
     """Inserting same message_id twice replaces entities (DELETE-before-INSERT)."""
-    from mcp_telegram.sync_worker import ExtractedMessage, insert_messages_with_fts
+    from mcp_telegram.sync_worker import EntityRecord, ExtractedMessage, insert_messages_with_fts
 
     dialog_id = 9004
     message_id = 4
@@ -1739,18 +1776,18 @@ def test_insert_messages_with_fts_edit_idempotency_entities(sync_db: sqlite3.Con
     sync_db.commit()
 
     em1 = ExtractedMessage(
-        row=(dialog_id, message_id, 1700000000, "old", 1, "Alice", None, None, None, None, None, None, 0, 0, None),
+        message=_stored(dialog_id, message_id, "old"),
         entities=[
-            (dialog_id, message_id, 0, 5, "mention", "@old1"),
-            (dialog_id, message_id, 6, 5, "mention", "@old2"),
+            EntityRecord(dialog_id=dialog_id, message_id=message_id, offset=0, length=5, type="mention", value="@old1"),
+            EntityRecord(dialog_id=dialog_id, message_id=message_id, offset=6, length=5, type="mention", value="@old2"),
         ],
     )
     with sync_db:
         insert_messages_with_fts(sync_db, [em1])
 
     em2 = ExtractedMessage(
-        row=(dialog_id, message_id, 1700000000, "new", 1, "Alice", None, None, None, None, None, None, 0, 0, None),
-        entities=[(dialog_id, message_id, 0, 4, "hashtag", "#new")],
+        message=_stored(dialog_id, message_id, "new"),
+        entities=[EntityRecord(dialog_id=dialog_id, message_id=message_id, offset=0, length=4, type="hashtag", value="#new")],
     )
     with sync_db:
         insert_messages_with_fts(sync_db, [em2])
@@ -1765,7 +1802,7 @@ def test_insert_messages_with_fts_edit_idempotency_entities(sync_db: sqlite3.Con
 
 def test_insert_messages_with_fts_edit_idempotency_forwards(sync_db: sqlite3.Connection) -> None:
     """Inserting same message_id with no forward clears forward row."""
-    from mcp_telegram.sync_worker import ExtractedMessage, insert_messages_with_fts
+    from mcp_telegram.sync_worker import ExtractedMessage, ForwardRecord, insert_messages_with_fts
 
     dialog_id = 9005
     message_id = 5
@@ -1773,22 +1810,27 @@ def test_insert_messages_with_fts_edit_idempotency_forwards(sync_db: sqlite3.Con
     sync_db.commit()
 
     em1 = ExtractedMessage(
-        row=(dialog_id, message_id, 1700000000, "fwd msg", 1, "Alice", None, None, None, None, None, None, 0, 0, None),
-        forward=(dialog_id, message_id, 12345, "Src", 1700000000, None),
+        message=_stored(dialog_id, message_id, "fwd msg"),
+        forward=ForwardRecord(
+            dialog_id=dialog_id,
+            message_id=message_id,
+            fwd_from_peer_id=12345,
+            fwd_from_name="Src",
+            fwd_date=1700000000,
+            fwd_channel_post=None,
+        ),
     )
     with sync_db:
         insert_messages_with_fts(sync_db, [em1])
 
-    # Verify forward exists
     fwd = sync_db.execute(
         "SELECT COUNT(*) FROM message_forwards WHERE dialog_id=? AND message_id=?",
         (dialog_id, message_id),
     ).fetchone()[0]
     assert fwd == 1
 
-    # Re-insert with no forward
     em2 = ExtractedMessage(
-        row=(dialog_id, message_id, 1700000000, "edited msg", 1, "Alice", None, None, None, None, None, None, 0, 0, None),
+        message=_stored(dialog_id, message_id, "edited msg"),
         forward=None,
     )
     with sync_db:
