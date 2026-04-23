@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import resource
+import sqlite3
 import sys
 
 # Hard virtual memory limit: 512 MB per test process.
@@ -227,6 +228,29 @@ def make_private_topic_error():
         return RPCError(request=None, message=message, code=code)
 
     return _make
+
+
+@pytest.fixture
+def make_synced_db():
+    """Factory fixture: call make_synced_db() to get a fresh in-memory DB at current schema.
+
+    Replaces per-file _make_db() helpers. Schema always matches production via
+    _apply_migrations — no manual DDL, no drift.
+
+    Usage::
+
+        def test_something(make_synced_db):
+            conn = make_synced_db()
+            ...
+    """
+    from mcp_telegram.sync_db import _apply_migrations
+
+    def _factory() -> sqlite3.Connection:
+        conn = sqlite3.connect(":memory:")
+        _apply_migrations(conn)
+        return conn
+
+    return _factory
 
 
 @pytest.fixture()
