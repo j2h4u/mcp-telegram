@@ -1,10 +1,8 @@
 services:
   mcp-telegram:
     build:
-      context: /path/to/deploy-dir      # directory containing .env and telegram_session.session
-      dockerfile: /path/to/repo/deploy/Dockerfile
-      additional_contexts:
-        src: /path/to/repo               # path to cloned mcp-telegram repo
+      context: /path/to/repo          # path to cloned mcp-telegram repo
+      dockerfile: deploy/Dockerfile
     container_name: mcp-telegram
     restart: unless-stopped
     environment:
