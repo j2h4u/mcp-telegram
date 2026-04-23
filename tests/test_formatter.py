@@ -593,3 +593,54 @@ def test_resolve_sender_name_returns_unknown_user_with_id_when_first_name_empty(
     from mcp_telegram.formatter import _resolve_sender_name
 
     assert _resolve_sender_name(_rsn_msg(sender_id=42, sender_first_name="")) == "(unknown user 42)"
+
+
+# ---------------------------------------------------------------------------
+# Golden output test — daemon path (fwd, post_author, edit, reactions)
+# ---------------------------------------------------------------------------
+
+
+def test_golden_daemon_fields() -> None:
+    """Golden contract for format_messages on the daemon path.
+
+    Covers the four fields that arrive via the daemon API and are absent from
+    the Telethon MockMessage helpers above: fwd_from_name, post_author,
+    edit_date, and pre-formatted reactions_display.  The expected string pins
+    the exact output format; update it only when the format intentionally
+    changes (e.g. after Wave 2 ReadMessage migration).
+    """
+    from types import SimpleNamespace
+    from mcp_telegram.formatter import format_messages
+
+    dt = datetime(2024, 6, 15, 14, 30, 0, tzinfo=UTC)
+    edit_dt = datetime(2024, 6, 15, 15, 0, 0, tzinfo=UTC)
+
+    msg = SimpleNamespace(
+        id=1,
+        date=dt,
+        message="Interesting article",
+        sender=SimpleNamespace(first_name="Olga"),
+        sender_id=101,
+        effective_sender_id=101,
+        # Pre-formatted reactions_display simulates _PreformattedReactions
+        # (formatter checks getattr(reactions, "_display", None)).
+        reactions=SimpleNamespace(_display="[👍×2]"),
+        media=None,
+        reply_to=None,
+        edit_date=edit_dt,
+        post_author="Olga Smith",
+        fwd_from_name="Tech News",
+        is_service=0,
+        out=0,
+        dialog_id=100,
+        topic_title=None,
+    )
+
+    result = format_messages([msg], {})
+
+    assert "--- 2024-06-15 ---" in result
+    expected_line = (
+        "14:30 Olga: [by Olga Smith] [↪ fwd: Tech News] "
+        "Interesting article [edited 15:00] [👍×2]"
+    )
+    assert expected_line in result, f"Golden output mismatch.\nGot:\n{result}"
