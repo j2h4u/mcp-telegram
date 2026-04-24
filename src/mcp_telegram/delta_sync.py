@@ -37,9 +37,23 @@ logger = logging.getLogger(__name__)
 # SQL constants
 # ---------------------------------------------------------------------------
 
-_SELECT_SYNCED_DIALOG_IDS_SQL = "SELECT dialog_id FROM synced_dialogs WHERE status = 'synced'"
+# Skip delta probe for dialogs fully synced within this window — prevents
+# GetHistoryRequest storm on quick restarts (D-01 expert panel).
+RECENT_SYNC_SKIP_THRESHOLD_S: float = 300.0
+
+_SELECT_SYNCED_DIALOGS_FOR_DELTA_SQL = (
+    "SELECT dialog_id, last_synced_at FROM synced_dialogs WHERE status = 'synced'"
+)
+# Backward-compat alias (no external importers, kept for safety)
+_SELECT_SYNCED_DIALOG_IDS_SQL = _SELECT_SYNCED_DIALOGS_FOR_DELTA_SQL
 
 _SELECT_MAX_MESSAGE_ID_SQL = "SELECT COALESCE(MAX(message_id), 0) FROM messages WHERE dialog_id = ?"
+
+# Stamp last_synced_at on successful delta completion.
+# Distinct from FullSyncWorker's _UPDATE_PROGRESS_DONE_SQL (different column set).
+_UPDATE_DELTA_LAST_SYNCED_AT_SQL = (
+    "UPDATE synced_dialogs SET last_synced_at = ? WHERE dialog_id = ?"
+)
 
 _SELECT_ACCESS_LOST_SQL = "SELECT dialog_id FROM synced_dialogs WHERE status = 'access_lost'"
 
@@ -86,14 +100,39 @@ class DeltaSyncWorker:
         Idempotent: dialogs with no gap complete instantly (empty first
         batch from iter_messages). Skips dialogs with no baseline
         (max_known_id=0) — FullSyncWorker handles those.
+
+        Quick-restart guard: dialogs whose last_synced_at is within
+        RECENT_SYNC_SKIP_THRESHOLD_S are skipped to prevent a
+        GetHistoryRequest storm after a rapid daemon restart (D-01).
         """
-        rows = self._conn.execute(_SELECT_SYNCED_DIALOG_IDS_SQL).fetchall()
+        rows = self._conn.execute(_SELECT_SYNCED_DIALOGS_FOR_DELTA_SQL).fetchall()
+        now = int(time.time())
         total_new = 0
-        for (dialog_id,) in rows:
+        skipped = 0
+        probed = 0
+        for (dialog_id, last_synced_at) in rows:
             if self._shutdown_event.is_set():
                 break
+            if (
+                last_synced_at is not None
+                and (now - last_synced_at) < RECENT_SYNC_SKIP_THRESHOLD_S
+            ):
+                age_s = now - last_synced_at
+                logger.info(
+                    "delta_catch_up_skip dialog_id=%d age_s=%d",
+                    dialog_id,
+                    age_s,
+                )
+                skipped += 1
+                continue
+            probed += 1
             total_new += await self.fetch_delta_for_dialog(dialog_id)
-        logger.info("delta_catch_up complete — new_messages=%d", total_new)
+        logger.info(
+            "delta_catch_up complete — new_messages=%d skipped=%d probed=%d",
+            total_new,
+            skipped,
+            probed,
+        )
         return total_new
 
     async def fetch_delta_for_dialog(self, dialog_id: int) -> int:
@@ -164,6 +203,10 @@ class DeltaSyncWorker:
             with self._conn:
                 insert_messages_with_fts(self._conn, new_message_rows)
             logger.info("delta dialog_id=%d new_messages=%d", dialog_id, len(new_message_rows))
+        # Stamp last_synced_at unconditionally on the success path so that
+        # run_delta_catch_up's quick-restart skip check has a fresh anchor.
+        with self._conn:
+            self._conn.execute(_UPDATE_DELTA_LAST_SYNCED_AT_SQL, (int(time.time()), dialog_id))
         return len(new_message_rows)
 
 
