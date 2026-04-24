@@ -30,7 +30,10 @@ def main() -> int:
 
         response = json.loads(buf.strip())
         if not response.get("ok"):
-            print(f"daemon returned error: {response.get('error', 'unknown')}", file=sys.stderr)
+            error = response.get("error", "unknown")
+            detail = response.get("detail", "")
+            msg = f"daemon not ready: {detail}" if error == "daemon_not_ready" else f"daemon error: {error}"
+            print(msg, file=sys.stderr)
             return 1
 
         return 0

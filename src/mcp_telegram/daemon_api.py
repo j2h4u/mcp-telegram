@@ -718,6 +718,10 @@ class DaemonAPIServer:
         # to collapse DM direction (`out`) into an effective sender id without
         # calling Telethon on every read.
         self.self_id: int | None = None
+        # Set to True once Telegram is connected and all startup steps complete.
+        # While False, handle_client returns daemon_not_ready with startup_detail.
+        self._ready: bool = False
+        self.startup_detail: str = "connecting to Telegram"
 
     # ------------------------------------------------------------------
     # Connection handler
@@ -748,22 +752,29 @@ class DaemonAPIServer:
             else:
                 request_id = req.get("request_id")
                 method = req.get("method", "")
-                if request_id:
-                    logger.debug("daemon_api_request method=%s request_id=%s", method, request_id)
-                token = _current_request_id.set(request_id)
-                try:
-                    response = await self._dispatch(req)
-                except Exception:
-                    logger.exception(
-                        "daemon_api_dispatch_error method=%s request_id=%s",
-                        method,
-                        request_id,
-                    )
-                    response = {"ok": False, "error": "internal", "message": "internal error"}
-                finally:
-                    _current_request_id.reset(token)
-                if request_id:
-                    response = {**response, "request_id": request_id}
+                if not self._ready:
+                    response = {
+                        "ok": False,
+                        "error": "daemon_not_ready",
+                        "detail": self.startup_detail,
+                    }
+                else:
+                    if request_id:
+                        logger.debug("daemon_api_request method=%s request_id=%s", method, request_id)
+                    token = _current_request_id.set(request_id)
+                    try:
+                        response = await self._dispatch(req)
+                    except Exception:
+                        logger.exception(
+                            "daemon_api_dispatch_error method=%s request_id=%s",
+                            method,
+                            request_id,
+                        )
+                        response = {"ok": False, "error": "internal", "message": "internal error"}
+                    finally:
+                        _current_request_id.reset(token)
+                    if request_id:
+                        response = {**response, "request_id": request_id}
 
             encoded = json.dumps(response).encode() + b"\n"
             writer.write(encoded)

@@ -49,7 +49,9 @@ def make_server(
     if client is None:
         client = MagicMock()
     shutdown_event = asyncio.Event()
-    return DaemonAPIServer(conn, client, shutdown_event)
+    server = DaemonAPIServer(conn, client, shutdown_event)
+    server._ready = True
+    return server
 
 
 def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.Connection:
