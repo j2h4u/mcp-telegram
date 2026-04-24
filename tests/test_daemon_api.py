@@ -173,28 +173,14 @@ def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.
 
 
 def _make_db_with_activity() -> sqlite3.Connection:
-    """_make_db() + Phase 999.1 v14 DDL (activity_comments + activity_sync_state).
+    """_make_db() + v14/v15 activity_sync_state (Phase 999.1 and 999.1.1).
 
-    We cannot call ensure_sync_schema here because _make_db() builds a curated
-    in-memory schema; adding the two new tables inline is the minimal delta.
-    The entities table is also created here (needed by LEFT JOIN in
-    _get_my_recent_activity) because _make_db() only creates it with_entities=True.
+    Since v15 dropped activity_comments, this helper only layers the
+    activity_sync_state table on top of the in-memory schema from _make_db().
+    Tests that used to INSERT into activity_comments now INSERT into the
+    messages table with out=1 — the unified write path post-Phase 999.1.1.
     """
     conn = _make_db()
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS activity_comments (
-            dialog_id       INTEGER NOT NULL,
-            message_id      INTEGER NOT NULL,
-            sent_at         INTEGER NOT NULL,
-            text            TEXT,
-            reactions       TEXT,
-            reply_count     INTEGER NOT NULL DEFAULT 0,
-            last_synced_at  INTEGER,
-            PRIMARY KEY (dialog_id, message_id)
-        )
-        """
-    )
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS activity_sync_state (
@@ -203,7 +189,7 @@ def _make_db_with_activity() -> sqlite3.Connection:
         )
         """
     )
-    # Seed the three state rows (mirroring Plan 01 migration seeds).
+    # Seed the three state rows (mirroring v14 migration seeds).
     conn.executemany(
         "INSERT OR IGNORE INTO activity_sync_state (key, value) VALUES (?, ?)",
         [
@@ -4937,14 +4923,16 @@ async def test_get_my_recent_activity_filters_by_since_hours() -> None:
     now = int(time.time())
     with server._conn:
         server._conn.execute(
-            "INSERT INTO activity_comments (dialog_id, message_id, sent_at, text, reactions, reply_count, last_synced_at) "
-            "VALUES (42, 1, ?, 'recent', NULL, 0, ?)",
-            (now - 60, now),
+            "INSERT INTO messages "
+            "(dialog_id, message_id, sent_at, text, out, is_service, is_deleted) "
+            "VALUES (42, 1, ?, 'recent', 1, 0, 0)",
+            (now - 60,),
         )
         server._conn.execute(
-            "INSERT INTO activity_comments (dialog_id, message_id, sent_at, text, reactions, reply_count, last_synced_at) "
-            "VALUES (42, 2, ?, 'old', NULL, 0, ?)",
-            (now - 999_999, now),
+            "INSERT INTO messages "
+            "(dialog_id, message_id, sent_at, text, out, is_service, is_deleted) "
+            "VALUES (42, 2, ?, 'old', 1, 0, 0)",
+            (now - 999_999,),
         )
         server._conn.execute("UPDATE activity_sync_state SET value='1' WHERE key='backfill_complete'")
         server._conn.execute(f"UPDATE activity_sync_state SET value='{now}' WHERE key='last_sync_at'")
@@ -4966,9 +4954,10 @@ async def test_get_my_recent_activity_joins_dialog_name() -> None:
             (now,),
         )
         server._conn.execute(
-            "INSERT INTO activity_comments (dialog_id, message_id, sent_at, text, reactions, reply_count, last_synced_at) "
-            "VALUES (42, 1, ?, 'hi', NULL, 0, ?)",
-            (now - 60, now),
+            "INSERT INTO messages "
+            "(dialog_id, message_id, sent_at, text, out, is_service, is_deleted) "
+            "VALUES (42, 1, ?, 'hi', 1, 0, 0)",
+            (now - 60,),
         )
         server._conn.execute("UPDATE activity_sync_state SET value='1' WHERE key='backfill_complete'")
         server._conn.execute(f"UPDATE activity_sync_state SET value='{now}' WHERE key='last_sync_at'")
@@ -4984,9 +4973,10 @@ async def test_get_my_recent_activity_falls_back_to_str_dialog_id() -> None:
     now = int(time.time())
     with server._conn:
         server._conn.execute(
-            "INSERT INTO activity_comments (dialog_id, message_id, sent_at, text, reactions, reply_count, last_synced_at) "
-            "VALUES (999, 1, ?, 'x', NULL, 0, ?)",
-            (now - 60, now),
+            "INSERT INTO messages "
+            "(dialog_id, message_id, sent_at, text, out, is_service, is_deleted) "
+            "VALUES (999, 1, ?, 'x', 1, 0, 0)",
+            (now - 60,),
         )
         server._conn.execute("UPDATE activity_sync_state SET value='1' WHERE key='backfill_complete'")
         server._conn.execute(f"UPDATE activity_sync_state SET value='{now}' WHERE key='last_sync_at'")
@@ -5002,3 +4992,115 @@ async def test_get_my_recent_activity_clamps_since_hours() -> None:
     resp = await server._dispatch({"method": "get_my_recent_activity", "since_hours": 999_999})
     assert resp["ok"] is True
     assert resp["data"]["scan_status"] == "never_run"
+
+
+@pytest.mark.asyncio
+async def test_get_my_recent_activity_filters_incoming_messages() -> None:
+    """All three predicate filters are load-bearing: out=1 AND is_service=0 AND is_deleted=0.
+
+    Cross-AI review (2026-04-24) HIGH finding: `WHERE m.out = 1` alone
+    is too broad after unification because the unified messages table
+    also holds is_service=1 rows (group join/leave events) and
+    is_deleted=1 rows (tombstones) that activity_comments never stored.
+    This test seeds all four combinations and asserts the tool returns
+    ONLY the (out=1, is_service=0, is_deleted=0) row.
+    """
+    server = make_server(_make_db_with_activity())
+    now = int(time.time())
+    with server._conn:
+        # KEEP: outgoing, non-service, non-deleted.
+        server._conn.execute(
+            "INSERT INTO messages "
+            "(dialog_id, message_id, sent_at, text, out, is_service, is_deleted) "
+            "VALUES (42, 1, ?, 'mine', 1, 0, 0)",
+            (now - 60,),
+        )
+        # DROP: out=0 (incoming from full sync).
+        server._conn.execute(
+            "INSERT INTO messages "
+            "(dialog_id, message_id, sent_at, text, out, is_service, is_deleted) "
+            "VALUES (42, 2, ?, 'theirs', 0, 0, 0)",
+            (now - 120,),
+        )
+        # DROP: out=1 but is_service=1 (e.g. 'You created this group').
+        #   activity_comments never stored service rows — the read path
+        #   must not start surfacing them after unification.
+        server._conn.execute(
+            "INSERT INTO messages "
+            "(dialog_id, message_id, sent_at, text, out, is_service, is_deleted) "
+            "VALUES (42, 3, ?, 'you-created-group', 1, 1, 0)",
+            (now - 180,),
+        )
+        # DROP: out=1 but is_deleted=1 (tombstone for a message the user
+        #   deleted). Same rationale — must not leak via the read path.
+        server._conn.execute(
+            "INSERT INTO messages "
+            "(dialog_id, message_id, sent_at, text, out, is_service, is_deleted) "
+            "VALUES (42, 4, ?, 'ghost', 1, 0, 1)",
+            (now - 240,),
+        )
+        server._conn.execute("UPDATE activity_sync_state SET value='1' WHERE key='backfill_complete'")
+        server._conn.execute(f"UPDATE activity_sync_state SET value='{now}' WHERE key='last_sync_at'")
+    resp = await server._dispatch({"method": "get_my_recent_activity"})
+    texts = sorted(c["text"] for c in resp["data"]["comments"])
+    assert texts == ["mine"], (
+        f"Expected exactly the (out=1, is_service=0, is_deleted=0) row 'mine'; "
+        f"got {texts}. Did the SQL predicate omit is_service/is_deleted filters?"
+    )
+
+
+def test_search_messages_finds_migrated_own_message() -> None:
+    """D-5 proof: migrated own messages become FTS-searchable.
+
+    Cross-AI review (2026-04-24) HIGH finding: neither Codex nor
+    OpenCode could find a test that proves the headline phase goal
+    — own messages become findable via SearchMessages after migration.
+    This test simulates the migration-then-FTS-backfill path at unit
+    level: seed an out=1 row directly in messages (no FTS entry yet,
+    as would happen immediately after the v15 migration INSERT);
+    invoke backfill_fts_index() to close the gap (the same function
+    daemon.py runs at startup after ensure_sync_schema); then
+    execute a raw `messages_fts MATCH` query and assert the row is
+    findable. A live MCP-level SearchMessages call is additionally
+    performed by Task 4 against the running container.
+    """
+    from mcp_telegram.fts import backfill_fts_index
+
+    conn = _make_db_with_activity()
+    # _make_db() creates messages_fts only with with_fts=True (default False).
+    # Create the FTS table here to simulate the daemon startup environment.
+    from mcp_telegram.fts import MESSAGES_FTS_DDL
+    conn.execute(MESSAGES_FTS_DDL)
+    conn.commit()
+
+    # Seed an out=1 row as if v15 migration had just placed it there.
+    conn.execute(
+        "INSERT INTO messages "
+        "(dialog_id, message_id, sent_at, text, out, is_service, is_deleted) "
+        "VALUES (42, 7, 1700000000, 'unique-search-needle alpha', 1, 0, 0)",
+    )
+    conn.commit()
+
+    # Close the FTS gap — this is what daemon.py does on startup after
+    # ensure_sync_schema applies the v15 migration.
+    backfill_fts_index(conn)
+
+    # Now the row must be findable via FTS MATCH.
+    # messages_fts stores dialog_id and message_id as UNINDEXED columns;
+    # messages uses WITHOUT ROWID so we join on the natural PK pair.
+    # FTS5 MATCH must target stemmed_text column and use the stemmed query form
+    # (same as daemon_api._search_messages via stem_query()).
+    from mcp_telegram.fts import stem_query
+    stemmed = stem_query("unique-search-needle")
+    hits = conn.execute(
+        "SELECT m.dialog_id, m.message_id, m.text "
+        "FROM messages_fts fts "
+        "JOIN messages m ON m.dialog_id = fts.dialog_id AND m.message_id = fts.message_id "
+        "WHERE fts.stemmed_text MATCH ? AND m.out = 1",
+        (stemmed,),
+    ).fetchall()
+    assert len(hits) == 1, (
+        f"D-5 violated: migrated own message must be FTS-searchable after "
+        f"backfill_fts_index(). Hits: {hits}"
+    )
+    assert hits[0] == (42, 7, "unique-search-needle alpha")
