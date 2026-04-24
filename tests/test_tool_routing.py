@@ -64,6 +64,7 @@ def _make_daemon_conn(response: dict | None = None) -> MagicMock:
     conn.get_usage_stats = AsyncMock(return_value=r)
     conn.upsert_entities = AsyncMock(return_value={"ok": True, "upserted": 0})
     conn.resolve_entity = AsyncMock(return_value=r)
+    conn.get_my_recent_activity = AsyncMock(return_value=r)  # Phase 999.1 (B4b)
     return conn
 
 
@@ -87,6 +88,7 @@ class _patch_daemon:
             "mcp_telegram.tools.user_info.daemon_connection",
             "mcp_telegram.tools.unread.daemon_connection",
             "mcp_telegram.tools.stats.daemon_connection",
+            "mcp_telegram.tools.activity.daemon_connection",  # Phase 999.1 (B4b)
         ]
         for target in targets:
             p = patch(target, side_effect=lambda c=self._conn: _fake_daemon_cm(c))
@@ -116,6 +118,7 @@ class _patch_daemon_not_running:
             "mcp_telegram.tools.user_info.daemon_connection",
             "mcp_telegram.tools.unread.daemon_connection",
             "mcp_telegram.tools.stats.daemon_connection",
+            "mcp_telegram.tools.activity.daemon_connection",  # Phase 999.1 (B4b)
         ]
         for target in targets:
             p = patch(target, return_value=_raise_not_running())
@@ -1501,3 +1504,137 @@ async def test_list_messages_no_optional_params_not_sent():
     assert call_kwargs.get("sender_name") is None
     assert call_kwargs.get("topic_id") is None
     assert call_kwargs.get("unread") is None
+
+
+# ---------------------------------------------------------------------------
+# Phase 999.1 — GetMyRecentActivity + ListMessages coverage annotation
+# ---------------------------------------------------------------------------
+
+
+async def test_get_my_recent_activity_routes_primary():
+    """GetMyRecentActivity with 2 comments in the same group returns 2 separate blocks (D-09)."""
+    from mcp_telegram.tools.activity import GetMyRecentActivity, get_my_recent_activity
+
+    conn = _make_daemon_conn(
+        {
+            "ok": True,
+            "data": {
+                "comments": [
+                    {
+                        "dialog_id": 42,
+                        "message_id": 100,
+                        "sent_at": 1_700_000_000,
+                        "text": "first",
+                        "reactions": None,
+                        "reply_count": 0,
+                        "dialog_name": "MyGroup",
+                    },
+                    {
+                        "dialog_id": 42,
+                        "message_id": 101,
+                        "sent_at": 1_700_000_060,
+                        "text": "second",
+                        "reactions": None,
+                        "reply_count": 2,
+                        "dialog_name": "MyGroup",
+                    },
+                ],
+                "scan_status": "complete",
+                "scanned_at": 1_700_003_600,
+            },
+        }
+    )
+    with _patch_daemon(conn):
+        result = await get_my_recent_activity(GetMyRecentActivity(since_hours=168, limit=500))
+    text = result[0].text
+    # Per-comment granularity (D-09): both blocks present
+    assert "message_id=100" in text
+    assert "message_id=101" in text
+    assert "first" in text
+    assert "second" in text
+
+
+async def test_get_my_recent_activity_never_run_header():
+    """GetMyRecentActivity with scan_status='never_run' includes the expected header line."""
+    from mcp_telegram.tools.activity import GetMyRecentActivity, get_my_recent_activity
+
+    conn = _make_daemon_conn(
+        {
+            "ok": True,
+            "data": {"comments": [], "scan_status": "never_run", "scanned_at": None},
+        }
+    )
+    with _patch_daemon(conn):
+        result = await get_my_recent_activity(GetMyRecentActivity())
+    assert "Scan status: never run" in result[0].text
+
+
+async def test_get_my_recent_activity_in_progress_header():
+    """GetMyRecentActivity with scan_status='in_progress' includes the expected header line."""
+    from mcp_telegram.tools.activity import GetMyRecentActivity, get_my_recent_activity
+
+    conn = _make_daemon_conn(
+        {
+            "ok": True,
+            "data": {
+                "comments": [],
+                "scan_status": "in_progress",
+                "scanned_at": 1_700_000_000,
+            },
+        }
+    )
+    with _patch_daemon(conn):
+        result = await get_my_recent_activity(GetMyRecentActivity())
+    assert "Scan status: in progress" in result[0].text
+
+
+async def test_get_my_recent_activity_reactions_formatted():
+    """GetMyRecentActivity formats reactions JSON as emoji×count pairs."""
+    from mcp_telegram.tools.activity import GetMyRecentActivity, get_my_recent_activity
+
+    conn = _make_daemon_conn(
+        {
+            "ok": True,
+            "data": {
+                "comments": [
+                    {
+                        "dialog_id": 42,
+                        "message_id": 100,
+                        "sent_at": 1_700_000_000,
+                        "text": "hi",
+                        "reactions": '{"👍": 2, "❤": 1}',
+                        "reply_count": 0,
+                        "dialog_name": "X",
+                    },
+                ],
+                "scan_status": "complete",
+                "scanned_at": 1_700_003_600,
+            },
+        }
+    )
+    with _patch_daemon(conn):
+        result = await get_my_recent_activity(GetMyRecentActivity())
+    text = result[0].text
+    assert "👍×2" in text
+    assert "❤×1" in text
+
+
+async def test_list_messages_fragment_coverage_header():
+    """ListMessages prepends 'Coverage: fragment' header when daemon returns coverage='fragment'."""
+    conn = _make_daemon_conn(
+        {
+            "ok": True,
+            "data": {"messages": [], "coverage": "fragment"},
+        }
+    )
+    with _patch_daemon(conn):
+        result = await list_messages(ListMessages(exact_dialog_id=42))
+    assert "Coverage: fragment" in result[0].text
+
+
+async def test_list_messages_no_fragment_no_header():
+    """ListMessages does NOT include 'Coverage: fragment' header when coverage field is absent."""
+    conn = _make_daemon_conn({"ok": True, "data": {"messages": []}})
+    with _patch_daemon(conn):
+        result = await list_messages(ListMessages(exact_dialog_id=42))
+    assert "Coverage: fragment" not in result[0].text
