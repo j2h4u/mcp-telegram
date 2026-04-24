@@ -3175,11 +3175,17 @@ async def test_list_messages_context_window_near_start() -> None:
 
 @pytest.mark.asyncio
 async def test_list_messages_context_window_not_synced_error() -> None:
-    """context_message_id returns not_synced error when dialog is not in synced_dialogs."""
+    """context_message_id returns not_synced error for access_lost dialogs.
+
+    Phase 999.1 (D-07): absent/not_synced/fragment statuses now trigger the
+    fragment-fetch path instead of being rejected. Only 'access_lost' dialogs
+    (where we lost access and cannot fetch) are rejected with not_synced.
+    """
     DIALOG_ID = 7003
 
     conn = _make_db()
-    # Dialog not inserted into synced_dialogs at all
+    # access_lost: we had access but lost it — cannot perform fragment fetch
+    _insert_synced_dialog(conn, DIALOG_ID, status="access_lost")
     server = make_server(conn)
 
     result = await server._list_messages({"dialog_id": DIALOG_ID, "context_message_id": 10, "context_size": 4})
