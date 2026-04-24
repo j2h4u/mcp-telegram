@@ -253,7 +253,7 @@ class DaemonConnection:
         """Return user profile and common chats."""
         return await self.request({"method": "get_user_info", "user_id": user_id})
 
-    async def list_unread_messages(
+    async def get_inbox(
         self,
         *,
         scope: str = "personal",
@@ -263,7 +263,7 @@ class DaemonConnection:
         """Return prioritized unread messages across dialogs."""
         return await self.request(
             {
-                "method": "list_unread_messages",
+                "method": "get_inbox",
                 "scope": scope,
                 "limit": limit,
                 "group_size_threshold": group_size_threshold,

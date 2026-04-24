@@ -83,16 +83,20 @@ async def get_sync_status(args: GetSyncStatus) -> ToolResult:
 
 
 class GetSyncAlerts(ToolArgs):
-    """Get sync alerts: deleted messages (with preserved text), edit history, and access-lost
-    notifications. Use since (unix timestamp) to filter alerts after a specific time.
-    Default since=0 returns all alerts. Deleted messages include the last known text before
-    deletion. Edit history shows previous versions of edited messages."""
+    """Audit what changed in synced dialogs: deleted messages (text preserved), edit history,
+    and dialogs where access was lost after syncing.
+
+    Use when investigating anomalies — e.g. after GetSyncStatus shows access_lost, or to
+    audit what was deleted or silently edited since a given timestamp.
+    Use since= (unix timestamp) to scope alerts to a time window. Default since=0 returns all.
+    Deleted messages include the last known text before deletion.
+    Edit history shows previous versions of edited messages."""
 
     since: int = Field(default=0, description="Unix timestamp — only return alerts after this time. Default 0 = all.")
-    limit: int = Field(default=50, description="Maximum number of deleted messages and edits to return. Default 50.")
+    limit: int = Field(default=50, description="Maximum deleted messages and edits to return. Default 50.")
 
 
-@mcp_tool("primary", annotations=ToolAnnotations(readOnlyHint=True))
+@mcp_tool("secondary/helper", annotations=ToolAnnotations(readOnlyHint=True))
 async def get_sync_alerts(args: GetSyncAlerts) -> ToolResult:
     try:
         async with daemon_connection() as conn:
@@ -135,3 +139,5 @@ async def get_sync_alerts(args: GetSyncAlerts) -> ToolResult:
 
     total = len(deleted) + len(edits) + len(access_lost)
     return ToolResult(content=_text_response("\n".join(sections)), result_count=total)
+
+

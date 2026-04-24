@@ -1802,7 +1802,7 @@ async def test_list_unread_messages_basic() -> None:
 
     result = await server._dispatch(
         {
-            "method": "list_unread_messages",
+            "method": "get_inbox",
             "scope": "personal",
             "limit": 100,
             "group_size_threshold": 100,
@@ -1833,7 +1833,7 @@ async def test_list_unread_messages_empty() -> None:
 
     result = await server._dispatch(
         {
-            "method": "list_unread_messages",
+            "method": "get_inbox",
             "scope": "personal",
             "limit": 100,
             "group_size_threshold": 100,
@@ -1860,7 +1860,7 @@ async def test_list_unread_messages_filters_channels_in_personal_scope() -> None
 
     result = await server._dispatch(
         {
-            "method": "list_unread_messages",
+            "method": "get_inbox",
             "scope": "personal",
             "limit": 100,
             "group_size_threshold": 100,
@@ -1890,7 +1890,7 @@ async def test_list_unread_messages_includes_groups_in_personal_scope() -> None:
 
     result = await server._dispatch(
         {
-            "method": "list_unread_messages",
+            "method": "get_inbox",
             "scope": "personal",
             "limit": 100,
             "group_size_threshold": 100,
@@ -1919,7 +1919,7 @@ async def test_list_unread_messages_budget_limits_messages() -> None:
 
     result = await server._dispatch(
         {
-            "method": "list_unread_messages",
+            "method": "get_inbox",
             "scope": "personal",
             "limit": 10,
             "group_size_threshold": 100,
@@ -1939,7 +1939,7 @@ async def test_list_unread_messages_dispatch_routing() -> None:
     client = MagicMock()
     server = make_server(conn, client)
 
-    result = await server._dispatch({"method": "list_unread_messages"})
+    result = await server._dispatch({"method": "get_inbox"})
 
     assert result["ok"] is True, f"list_unread_messages dispatch failed: {result}"
     client.assert_not_called()
@@ -1961,7 +1961,7 @@ async def test_list_unread_messages_skips_non_synced_or_null() -> None:
 
     result = await server._dispatch(
         {
-            "method": "list_unread_messages",
+            "method": "get_inbox",
             "scope": "personal",
             "limit": 100,
             "group_size_threshold": 100,
@@ -1990,7 +1990,7 @@ async def test_list_unread_messages_read_inbox_max_id_zero_returns_all() -> None
 
     result = await server._dispatch(
         {
-            "method": "list_unread_messages",
+            "method": "get_inbox",
             "scope": "personal",
             "limit": 100,
             "group_size_threshold": 100,
@@ -2020,7 +2020,7 @@ async def test_list_unread_messages_excludes_deleted_messages() -> None:
 
     result = await server._dispatch(
         {
-            "method": "list_unread_messages",
+            "method": "get_inbox",
             "scope": "personal",
             "limit": 100,
             "group_size_threshold": 100,
@@ -2051,7 +2051,7 @@ async def test_list_unread_messages_filter_excludes_ids_below_read_position() ->
 
     result = await server._dispatch(
         {
-            "method": "list_unread_messages",
+            "method": "get_inbox",
             "scope": "personal",
             "limit": 100,
             "group_size_threshold": 100,
@@ -2081,7 +2081,7 @@ async def test_list_unread_messages_response_reports_bootstrap_pending() -> None
 
     result = await server._dispatch(
         {
-            "method": "list_unread_messages",
+            "method": "get_inbox",
             "scope": "personal",
             "limit": 100,
             "group_size_threshold": 100,
@@ -4592,7 +4592,7 @@ async def test_list_unread_messages_uses_entity_name() -> None:
     server = make_server(conn)
     result = await server._dispatch(
         {
-            "method": "list_unread_messages",
+            "method": "get_inbox",
             "scope": "personal",
             "limit": 100,
             "group_size_threshold": 100,

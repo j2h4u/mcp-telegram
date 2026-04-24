@@ -9,7 +9,7 @@
           "ListMessages",
           "SearchMessages",
           "ListTopics",
-          "ListUnreadMessages",
+          "GetInbox",
           "GetMyAccount",
           "GetUserInfo",
           "GetUsageStats",
@@ -31,10 +31,6 @@
           },
           "GetSyncStatus": {
             "inputSchema.properties.dialog_id.type": "integer"
-          },
-          "GetSyncAlerts": {
-            "inputSchema.properties.since.default": 0,
-            "inputSchema.properties.limit.default": 50
           }
         }
       }
@@ -111,17 +107,6 @@
       }
     },
     {
-      "_comment": "GetSyncAlerts — daemon route",
-      "action": "call_tool",
-      "name": "GetSyncAlerts",
-      "arguments": {"since": 0, "limit": 10},
-      "expect": {
-        "is_error": false,
-        "content_text_contains": ["not running", "mcp-telegram sync"]
-      }
-    },
-
-    {
       "_comment": "GetUserInfo — entity_cache resolve first, 'not found' for unknown user (daemon never reached)",
       "action": "call_tool",
       "name": "GetUserInfo",
@@ -132,9 +117,9 @@
       }
     },
     {
-      "_comment": "ListUnreadMessages — daemon route",
+      "_comment": "GetInbox — daemon route",
       "action": "call_tool",
-      "name": "ListUnreadMessages",
+      "name": "GetInbox",
       "arguments": {},
       "expect": {
         "is_error": false,

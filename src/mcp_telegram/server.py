@@ -146,7 +146,7 @@ async def _build_server_instructions() -> str:
         "- FIND DIALOG IDS: Use ListDialogs to get exact numeric dialog ids for direct reads.\n"
         "- SYNC STATUS: Only synced dialogs support SearchMessages and anchor-based reading. "
         "Plain ListMessages browsing works on any dialog without syncing. "
-        "Use GetSyncStatus / GetSyncAlerts to check coverage.\n"
+        "Use GetSyncStatus to check coverage.\n"
     )
     try:
         async with daemon_connection() as conn:

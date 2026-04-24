@@ -741,7 +741,7 @@ async def test_list_unread_messages_injects_reactions() -> None:
     server = make_server(conn, client)
     server.self_id = 99
 
-    result = await server._dispatch({"method": "list_unread_messages", "scope": "personal", "limit": 100})
+    result = await server._dispatch({"method": "get_inbox", "scope": "personal", "limit": 100})
 
     assert result["ok"] is True
     groups = result["data"]["groups"]
@@ -771,7 +771,7 @@ async def test_list_unread_messages_triggers_jit_on_cold_read() -> None:
     server = make_server(conn, client)
     server.self_id = 99
 
-    result = await server._dispatch({"method": "list_unread_messages", "scope": "personal", "limit": 100})
+    result = await server._dispatch({"method": "get_inbox", "scope": "personal", "limit": 100})
 
     assert result["ok"] is True
     assert client.get_messages.call_count == 1
@@ -797,7 +797,7 @@ async def test_list_unread_messages_skips_jit_when_all_fresh() -> None:
     server = make_server(conn, client)
     server.self_id = 99
 
-    result = await server._dispatch({"method": "list_unread_messages", "scope": "personal", "limit": 100})
+    result = await server._dispatch({"method": "get_inbox", "scope": "personal", "limit": 100})
 
     assert result["ok"] is True
     assert client.get_messages.call_count == 0

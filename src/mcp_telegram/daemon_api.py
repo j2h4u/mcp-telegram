@@ -806,7 +806,7 @@ class DaemonAPIServer:
             return await self._get_sync_alerts(req)
         if method == "get_user_info":
             return await self._get_user_info(req)
-        if method == "list_unread_messages":
+        if method == "get_inbox":
             return await self._list_unread_messages(req)
         if method == "record_telemetry":
             return await self._record_telemetry(req)

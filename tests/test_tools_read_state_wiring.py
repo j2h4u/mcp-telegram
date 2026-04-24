@@ -22,7 +22,7 @@ from mcp_telegram.tools.reading import (
     list_messages,
     search_messages,
 )
-from mcp_telegram.tools.unread import ListUnreadMessages, list_unread_messages
+from mcp_telegram.tools.unread import GetInbox, get_inbox
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -361,7 +361,7 @@ async def test_search_tool_backward_compat_no_read_state_per_dialog() -> None:
 
 
 # ---------------------------------------------------------------------------
-# list_unread_messages MCP tool (end-to-end)
+# get_inbox MCP tool (end-to-end)
 # ---------------------------------------------------------------------------
 
 
@@ -423,9 +423,9 @@ async def test_unread_tool_renders_per_chat_header() -> None:
         ),
     ]
     response = {"ok": True, "data": {"groups": groups, "bootstrap_pending": 0}}
-    conn = _make_conn("list_unread_messages", response)
+    conn = _make_conn("get_inbox", response)
     with _patch_daemon("mcp_telegram.tools.unread.daemon_connection", conn):
-        result = await list_unread_messages(ListUnreadMessages())
+        result = await get_inbox(GetInbox())
     text = result[0].text  # type: ignore[index]
     assert "[inbox: 2 unread from peer" in text
     assert "[read-state: all caught up]" in text
@@ -446,9 +446,9 @@ async def test_unread_tool_renders_collapsed_header_when_chat_caught_up() -> Non
         ),
     ]
     response = {"ok": True, "data": {"groups": groups, "bootstrap_pending": 0}}
-    conn = _make_conn("list_unread_messages", response)
+    conn = _make_conn("get_inbox", response)
     with _patch_daemon("mcp_telegram.tools.unread.daemon_connection", conn):
-        result = await list_unread_messages(ListUnreadMessages())
+        result = await get_inbox(GetInbox())
     text = result[0].text  # type: ignore[index]
     assert "[read-state: all caught up]" in text
 
@@ -465,9 +465,9 @@ async def test_unread_tool_renders_split_header_when_inbox_unread() -> None:
         ),
     ]
     response = {"ok": True, "data": {"groups": groups, "bootstrap_pending": 0}}
-    conn = _make_conn("list_unread_messages", response)
+    conn = _make_conn("get_inbox", response)
     with _patch_daemon("mcp_telegram.tools.unread.daemon_connection", conn):
-        result = await list_unread_messages(ListUnreadMessages())
+        result = await get_inbox(GetInbox())
     text = result[0].text  # type: ignore[index]
     assert "[inbox: 2 unread from peer" in text
     assert "[outbox: all read by peer]" in text
@@ -486,9 +486,9 @@ async def test_unread_tool_no_header_for_non_dm_group() -> None:
         ),
     ]
     response = {"ok": True, "data": {"groups": groups, "bootstrap_pending": 0}}
-    conn = _make_conn("list_unread_messages", response)
+    conn = _make_conn("get_inbox", response)
     with _patch_daemon("mcp_telegram.tools.unread.daemon_connection", conn):
-        result = await list_unread_messages(ListUnreadMessages())
+        result = await get_inbox(GetInbox())
     text = result[0].text  # type: ignore[index]
     assert "[read-state:" not in text
     assert "[inbox:" not in text
@@ -507,9 +507,9 @@ async def test_unread_tool_backward_compat_no_read_state() -> None:
         ),
     ]
     response = {"ok": True, "data": {"groups": groups, "bootstrap_pending": 0}}
-    conn = _make_conn("list_unread_messages", response)
+    conn = _make_conn("get_inbox", response)
     with _patch_daemon("mcp_telegram.tools.unread.daemon_connection", conn):
-        result = await list_unread_messages(ListUnreadMessages())
+        result = await get_inbox(GetInbox())
     text = result[0].text  # type: ignore[index]
     assert "[read-state:" not in text
     assert "[inbox:" not in text

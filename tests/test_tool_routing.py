@@ -17,6 +17,7 @@ from datetime import UTC
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from mcp_telegram.tools import (
+    GetInbox,
     GetMyAccount,
     GetSyncAlerts,
     GetSyncStatus,
@@ -24,9 +25,9 @@ from mcp_telegram.tools import (
     ListDialogs,
     ListMessages,
     ListTopics,
-    ListUnreadMessages,
     MarkDialogForSync,
     SearchMessages,
+    get_inbox,
     get_my_account,
     get_sync_alerts,
     get_sync_status,
@@ -34,7 +35,6 @@ from mcp_telegram.tools import (
     list_dialogs,
     list_messages,
     list_topics,
-    list_unread_messages,
     mark_dialog_for_sync,
     search_messages,
 )
@@ -59,7 +59,7 @@ def _make_daemon_conn(response: dict | None = None) -> MagicMock:
     conn.get_sync_status = AsyncMock(return_value=r)
     conn.get_sync_alerts = AsyncMock(return_value=r)
     conn.get_user_info = AsyncMock(return_value=r)
-    conn.list_unread_messages = AsyncMock(return_value=r)
+    conn.get_inbox = AsyncMock(return_value=r)
     conn.record_telemetry = AsyncMock(return_value={"ok": True})
     conn.get_usage_stats = AsyncMock(return_value=r)
     conn.upsert_entities = AsyncMock(return_value={"ok": True, "upserted": 0})
@@ -784,12 +784,12 @@ async def test_get_user_info_user_not_found_by_daemon():
 
 
 # ---------------------------------------------------------------------------
-# ListUnreadMessages — daemon routing
+# GetInbox — daemon routing
 # ---------------------------------------------------------------------------
 
 
-async def test_list_unread_messages_via_daemon():
-    """ListUnreadMessages routes through daemon API and formats grouped output."""
+async def test_get_inbox_via_daemon():
+    """GetInbox routes through daemon API and formats grouped output."""
     conn = _make_daemon_conn(
         {
             "ok": True,
@@ -818,44 +818,44 @@ async def test_list_unread_messages_via_daemon():
         }
     )
     with _patch_daemon(conn):
-        result = await list_unread_messages(ListUnreadMessages())
+        result = await get_inbox(GetInbox())
 
     text = result[0].text
     assert "Alice" in text
     assert "Hello there" in text
-    conn.list_unread_messages.assert_called_once()
+    conn.get_inbox.assert_called_once()
 
 
-async def test_list_unread_messages_empty():
-    """ListUnreadMessages returns empty-inbox text when no groups."""
+async def test_get_inbox_empty():
+    """GetInbox returns empty-inbox text when no groups."""
     conn = _make_daemon_conn({"ok": True, "data": {"groups": []}})
     with _patch_daemon(conn):
-        result = await list_unread_messages(ListUnreadMessages())
+        result = await get_inbox(GetInbox())
 
     assert "no unread" in result[0].text.lower() or "непрочитанных" in result[0].text.lower()
 
 
-async def test_list_unread_messages_daemon_not_running():
-    """ListUnreadMessages returns actionable error when daemon is not running."""
+async def test_get_inbox_daemon_not_running():
+    """GetInbox returns actionable error when daemon is not running."""
     with _patch_daemon_not_running():
-        result = await list_unread_messages(ListUnreadMessages())
+        result = await get_inbox(GetInbox())
 
     assert "not running" in result[0].text.lower() or "mcp-telegram sync" in result[0].text.lower()
 
 
-async def test_list_unread_messages_passes_params():
-    """ListUnreadMessages passes scope, limit, group_size_threshold to daemon."""
+async def test_get_inbox_passes_params():
+    """GetInbox passes scope, limit, group_size_threshold to daemon."""
     conn = _make_daemon_conn({"ok": True, "data": {"groups": []}})
     with _patch_daemon(conn):
-        await list_unread_messages(ListUnreadMessages(scope="all", limit=200, group_size_threshold=50))
+        await get_inbox(GetInbox(scope="all", limit=200, group_size_threshold=50))
 
-    call_kwargs = conn.list_unread_messages.call_args[1]
+    call_kwargs = conn.get_inbox.call_args[1]
     assert call_kwargs["scope"] == "all"
     assert call_kwargs["limit"] == 200
     assert call_kwargs["group_size_threshold"] == 50
 
 
-async def test_list_unread_messages_empty_with_bootstrap_pending():
+async def test_get_inbox_empty_with_bootstrap_pending():
     """UAT gap 1: when groups=[] AND bootstrap_pending>0 the tool MUST NOT return the
     misleading 'No unread messages' canned text — it must surface the pending count
     so the caller knows results are incomplete, not genuinely empty.
@@ -867,7 +867,7 @@ async def test_list_unread_messages_empty_with_bootstrap_pending():
         }
     )
     with _patch_daemon(conn):
-        result = await list_unread_messages(ListUnreadMessages())
+        result = await get_inbox(GetInbox())
 
     text = result[0].text
     # Must mention the pending count
@@ -879,7 +879,7 @@ async def test_list_unread_messages_empty_with_bootstrap_pending():
     )
 
 
-async def test_list_unread_messages_empty_with_no_bootstrap_pending():
+async def test_get_inbox_empty_with_no_bootstrap_pending():
     """When groups=[] AND bootstrap_pending=0 the existing 'no unread' canned text
     is correct (truly empty inbox). Asserts no behaviour regression.
     """
@@ -890,13 +890,13 @@ async def test_list_unread_messages_empty_with_no_bootstrap_pending():
         }
     )
     with _patch_daemon(conn):
-        result = await list_unread_messages(ListUnreadMessages())
+        result = await get_inbox(GetInbox())
 
     lowered = result[0].text.lower()
     assert "no unread" in lowered or "непрочитанных" in lowered
 
 
-async def test_list_unread_messages_non_empty_with_bootstrap_pending():
+async def test_get_inbox_non_empty_with_bootstrap_pending():
     """UAT gap 2: when groups is non-empty AND bootstrap_pending>0 the formatted
     output MUST include a one-line note disclosing the pending count, so the
     caller knows the result is partial coverage.
@@ -930,7 +930,7 @@ async def test_list_unread_messages_non_empty_with_bootstrap_pending():
         }
     )
     with _patch_daemon(conn):
-        result = await list_unread_messages(ListUnreadMessages())
+        result = await get_inbox(GetInbox())
 
     text = result[0].text
     # Existing format preserved
@@ -944,7 +944,7 @@ async def test_list_unread_messages_non_empty_with_bootstrap_pending():
     )
 
 
-async def test_list_unread_messages_non_empty_with_no_bootstrap_pending():
+async def test_get_inbox_non_empty_with_no_bootstrap_pending():
     """When groups is non-empty AND bootstrap_pending=0 the formatted output MUST
     NOT include a spurious bootstrap note. Asserts no false-positive disclosure.
     """
@@ -977,7 +977,7 @@ async def test_list_unread_messages_non_empty_with_no_bootstrap_pending():
         }
     )
     with _patch_daemon(conn):
-        result = await list_unread_messages(ListUnreadMessages())
+        result = await get_inbox(GetInbox())
 
     text = result[0].text
     assert "Alice" in text
