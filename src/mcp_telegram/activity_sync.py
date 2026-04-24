@@ -1,12 +1,12 @@
 """Global own-message archive worker.
 
-Populates activity_comments table via messages.Search(InputPeerEmpty, from_id=InputPeerSelf).
+Populates own-message rows (out=1) in the unified messages table
+via messages.Search(InputPeerEmpty, from_id=InputPeerSelf).
 Runs as a named daemon background task alongside run_access_probe_loop.
 """
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import sqlite3
 import time
@@ -23,7 +23,11 @@ from telethon.tl.types import (
     User,
 )
 
-from .sync_worker import extract_reactions_rows
+from .sync_worker import (
+    ExtractedMessage,
+    extract_message_row,
+    insert_messages_with_fts,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -31,18 +35,21 @@ _DEFAULT_INTERVAL_S = 3600.0
 _BACKFILL_BATCH_LIMIT = 100
 _BACKFILL_INTER_BATCH_PAUSE_S = 0.5
 
-INSERT_ACTIVITY_SQL = (
-    "INSERT OR REPLACE INTO activity_comments "
-    "(dialog_id, message_id, sent_at, text, reactions, reply_count, last_synced_at) "
-    "VALUES (?, ?, ?, ?, ?, ?, ?)"
-)
-
 # Mirrors sync_worker.UPSERT_ENTITY_SQL (verified line 239).
 # NOTE: `type` and `updated_at` are NOT NULL with no DEFAULT — both MUST be supplied.
 UPSERT_ENTITY_SQL = (
     "INSERT OR REPLACE INTO entities "
     "(id, type, name, username, name_normalized, updated_at) "
     "VALUES (?, ?, ?, ?, ?, ?)"
+)
+
+# Activity-sync dialog enrollment: 'own_only' is the lowest non-empty
+# coverage status (D-2). INSERT OR IGNORE preserves higher-status rows
+# already enrolled by FullSyncWorker (syncing/synced) or probe loops
+# (fragment/access_lost). Status only escalates.
+INSERT_OWN_ONLY_DIALOG_SQL = (
+    "INSERT OR IGNORE INTO synced_dialogs (dialog_id, status) "
+    "VALUES (?, 'own_only')"
 )
 
 
@@ -72,29 +79,6 @@ def _extract_dialog_id(msg: Any) -> int | None:
     except Exception:
         logger.warning("activity_sync_peer_id_unresolvable", exc_info=True)
         return None
-
-
-def _message_to_row(msg: Any) -> tuple | None:
-    dialog_id = _extract_dialog_id(msg)
-    if dialog_id is None:
-        return None
-    sent_at = int(msg.date.timestamp()) if getattr(msg, "date", None) else None
-    if sent_at is None:
-        return None
-    reaction_rows = extract_reactions_rows(dialog_id, msg.id, getattr(msg, "reactions", None))
-    reactions_json: str | None = None
-    if reaction_rows:
-        reactions_json = json.dumps({r.emoji: r.count for r in reaction_rows})
-    reply_count = getattr(getattr(msg, "replies", None), "replies", 0) or 0
-    return (
-        dialog_id,
-        msg.id,
-        sent_at,
-        getattr(msg, "message", None),
-        reactions_json,
-        int(reply_count),
-        int(time.time()),
-    )
 
 
 def _normalize(text: str | None) -> str | None:
@@ -235,10 +219,28 @@ async def _run_backfill(
             return
 
         batch_num += 1
-        rows = [r for r in (_message_to_row(m) for m in batch) if r is not None]
+        extracted: list[ExtractedMessage] = []
+        for m in batch:
+            # Step 1: resolve dialog_id from the Telethon message's peer.
+            #   _extract_dialog_id returns None if the peer cannot be
+            #   mapped (malformed / unexpected shape). Skip such rows —
+            #   the canonical pipeline requires a concrete int dialog_id.
+            dialog_id = _extract_dialog_id(m)
+            if dialog_id is None:
+                continue
+            # Step 2: feed the resolved (dialog_id, msg) to the canonical
+            #   extractor. extract_message_row builds a full StoredMessage
+            #   plus reactions/entities/forward side-tables.
+            extracted.append(extract_message_row(dialog_id, m))
+
         with conn:
-            if rows:
-                conn.executemany(INSERT_ACTIVITY_SQL, rows)
+            if extracted:
+                insert_messages_with_fts(conn, extracted)
+                dialog_ids = {em.message.dialog_id for em in extracted}
+                conn.executemany(
+                    INSERT_OWN_ONLY_DIALOG_SQL,
+                    [(did,) for did in dialog_ids],
+                )
 
         _upsert_entities_from_search(conn, result)
 
@@ -282,7 +284,15 @@ async def _run_incremental(
     if state.get("backfill_complete") != "1":
         return
 
-    row = conn.execute("SELECT MAX(message_id) FROM activity_comments").fetchone()
+    # v15 unification (Phase 999.1.1): anchor reads from messages WHERE out=1.
+    # Own messages live in messages with out=1 (merged from prior separate table).
+    # CORRECTNESS: full-sync inserts into the same table with out=0 for
+    # incoming messages. The WHERE out = 1 filter isolates own messages, so
+    # a higher-ID incoming row from full sync does NOT shift this anchor —
+    # verified live by test_incremental_anchor_ignores_higher_id_out0_row.
+    row = conn.execute(
+        "SELECT MAX(message_id) FROM messages WHERE out = 1"
+    ).fetchone()
     max_message_id = int(row[0]) if row and row[0] is not None else 0
 
     # W5: empty archive → nothing to anchor on, skip.
@@ -318,10 +328,22 @@ async def _run_incremental(
         if not batch:
             break
 
-        rows = [r for r in (_message_to_row(m) for m in batch) if r is not None]
+        extracted: list[ExtractedMessage] = []
+        for m in batch:
+            dialog_id = _extract_dialog_id(m)
+            if dialog_id is None:
+                continue
+            extracted.append(extract_message_row(dialog_id, m))
+
         with conn:
-            if rows:
-                conn.executemany(INSERT_ACTIVITY_SQL, rows)
+            if extracted:
+                insert_messages_with_fts(conn, extracted)
+                dialog_ids = {em.message.dialog_id for em in extracted}
+                conn.executemany(
+                    INSERT_OWN_ONLY_DIALOG_SQL,
+                    [(did,) for did in dialog_ids],
+                )
+
         _upsert_entities_from_search(conn, result)
         inserted += len(batch)
         offset_id = min(m.id for m in batch if getattr(m, "id", None) is not None)
@@ -344,7 +366,7 @@ async def run_activity_sync_loop(
     *,
     interval: float = _DEFAULT_INTERVAL_S,
 ) -> None:
-    """Background task: keep activity_comments up-to-date.
+    """Background task: keep own-message rows (out=1) in messages up-to-date.
 
     One pass = (backfill if incomplete) + (incremental if backfill complete).
     Sleeps `interval` between passes, interruptible via shutdown_event.
