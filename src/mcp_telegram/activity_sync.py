@@ -284,20 +284,18 @@ async def _run_incremental(
     if state.get("backfill_complete") != "1":
         return
 
-    # v15 unification (Phase 999.1.1): anchor reads from messages WHERE out=1.
-    # Own messages live in messages with out=1 (merged from prior separate table).
-    # CORRECTNESS: full-sync inserts into the same table with out=0 for
-    # incoming messages. The WHERE out = 1 filter isolates own messages, so
-    # a higher-ID incoming row from full sync does NOT shift this anchor —
-    # verified live by test_incremental_anchor_ignores_higher_id_out0_row.
-    row = conn.execute(
-        "SELECT MAX(message_id) FROM messages WHERE out = 1"
-    ).fetchone()
-    max_message_id = int(row[0]) if row and row[0] is not None else 0
-
-    # W5: empty archive → nothing to anchor on, skip.
-    if max_message_id == 0:
+    # Anchor by timestamp, not per-chat message_id. Global SearchRequest with
+    # InputPeerEmpty returns messages from many dialogs — each with its own
+    # message_id sequence. Using min_id=MAX(message_id) across chats causes
+    # newer messages in dialogs with lower per-chat IDs to be silently skipped.
+    # min_date is a wall-clock filter applied uniformly across all dialogs.
+    last_sync_at = int(state.get("last_sync_at") or 0)
+    if last_sync_at == 0:
         return
+
+    # 60-second buffer guards against messages at the exact boundary being
+    # missed when the previous sync finished mid-second.
+    min_date = max(0, last_sync_at - 60)
 
     inserted = 0
     offset_id = 0  # start from newest
@@ -307,13 +305,13 @@ async def _run_incremental(
                 peer=InputPeerEmpty(),
                 q="",
                 filter=InputMessagesFilterEmpty(),
-                min_date=None,
+                min_date=min_date,
                 max_date=None,
                 offset_id=offset_id,
                 add_offset=0,
                 limit=_BACKFILL_BATCH_LIMIT,
                 max_id=0,
-                min_id=max_message_id,  # only messages newer than our last known
+                min_id=0,
                 hash=0,
                 from_id=InputPeerSelf(),
             ))
