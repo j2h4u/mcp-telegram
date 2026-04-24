@@ -328,3 +328,86 @@ async def test_incremental_anchor_ignores_higher_id_out0_row(tmp_path):
     assert decoy_still_present is not None and decoy_still_present[0] == 0, (
         "Incoming row must remain unchanged"
     )
+
+
+# -- D-02: SearchRequest RPC timeout tests -----------------------------------
+
+@pytest.mark.asyncio
+async def test_run_incremental_search_request_timeout(tmp_path, caplog):
+    """_run_incremental exits and advances last_sync_at when SearchRequest hangs."""
+    import logging
+    from unittest.mock import patch
+
+    conn = _make_db(tmp_path)
+    anchor_ts = 1_700_000_000
+    with conn:
+        conn.execute("UPDATE activity_sync_state SET value='1' WHERE key='backfill_complete'")
+        conn.execute(
+            "INSERT OR REPLACE INTO activity_sync_state (key, value) VALUES ('last_sync_at', ?)",
+            (str(anchor_ts),),
+        )
+
+    # Client that hangs forever on __call__
+    class _HangingClient:
+        async def __call__(self, request):
+            await asyncio.Event().wait()  # hangs indefinitely
+
+    client = _HangingClient()
+    shutdown = asyncio.Event()
+
+    # Patch timeout to 0.05s so the test is fast
+    with patch("mcp_telegram.activity_sync._SEARCH_RPC_TIMEOUT_S", 0.05):
+        with caplog.at_level(logging.WARNING, logger="mcp_telegram.activity_sync"):
+            # Safety net: the whole call must finish well under 2s
+            await asyncio.wait_for(
+                _run_incremental(client, conn, shutdown),
+                timeout=2.0,
+            )
+
+    # last_sync_at must have been advanced
+    state = dict(conn.execute("SELECT key, value FROM activity_sync_state").fetchall())
+    assert state["last_sync_at"] != str(anchor_ts), (
+        "last_sync_at must be advanced after RPC timeout"
+    )
+
+    timeout_logs = [r for r in caplog.records if "activity_sync_rpc_timeout" in r.getMessage()]
+    assert len(timeout_logs) >= 1, (
+        f"Expected 'activity_sync_rpc_timeout' log; got: {[r.getMessage() for r in caplog.records]}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_backfill_search_request_timeout(tmp_path, caplog):
+    """_run_backfill returns and logs when SearchRequest hangs."""
+    import logging
+    from unittest.mock import patch
+
+    conn = _make_db(tmp_path)
+    # backfill not complete — will attempt to run
+
+    class _HangingClient:
+        async def __call__(self, request):
+            await asyncio.Event().wait()
+
+    client = _HangingClient()
+    shutdown = asyncio.Event()
+
+    with patch("mcp_telegram.activity_sync._SEARCH_RPC_TIMEOUT_S", 0.05):
+        with caplog.at_level(logging.WARNING, logger="mcp_telegram.activity_sync"):
+            await asyncio.wait_for(
+                _run_backfill(client, conn, shutdown),
+                timeout=2.0,
+            )
+
+    # backfill_offset_id must not be corrupted (still 0 / initial value)
+    state = dict(conn.execute("SELECT key, value FROM activity_sync_state").fetchall())
+    assert state.get("backfill_complete") != "1", (
+        "backfill must NOT be marked complete after a timeout"
+    )
+
+    timeout_logs = [
+        r for r in caplog.records if "activity_sync_backfill_rpc_timeout" in r.getMessage()
+    ]
+    assert len(timeout_logs) >= 1, (
+        f"Expected 'activity_sync_backfill_rpc_timeout' log; got: {[r.getMessage() for r in caplog.records]}"
+    )

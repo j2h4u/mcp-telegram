@@ -34,6 +34,10 @@ logger = logging.getLogger(__name__)
 _DEFAULT_INTERVAL_S = 3600.0
 _BACKFILL_BATCH_LIMIT = 100
 _BACKFILL_INTER_BATCH_PAUSE_S = 0.5
+# Upper bound on a single SearchRequest await. Prevents a wedged MTProto
+# socket after startup FloodWait from hanging the incremental loop
+# indefinitely (D-02 expert panel).
+_SEARCH_RPC_TIMEOUT_S: float = 120.0
 
 # Mirrors sync_worker.UPSERT_ENTITY_SQL (verified line 239).
 # NOTE: `type` and `updated_at` are NOT NULL with no DEFAULT — both MUST be supplied.
@@ -158,6 +162,7 @@ async def _run_backfill(
 ) -> None:
     state = _load_state(conn)
     if state.get("backfill_complete") == "1":
+        logger.debug("activity_sync_backfill_skip reason=already_complete")
         return
 
     checkpoint = int(state.get("backfill_offset_id") or 0)
@@ -179,20 +184,23 @@ async def _run_backfill(
 
     while not shutdown_event.is_set():
         try:
-            result = await client(SearchRequest(
-                peer=InputPeerEmpty(),
-                q="",
-                filter=InputMessagesFilterEmpty(),
-                min_date=None,
-                max_date=None,
-                offset_id=checkpoint,
-                add_offset=0,
-                limit=_BACKFILL_BATCH_LIMIT,
-                max_id=0,
-                min_id=0,
-                hash=0,
-                from_id=InputPeerSelf(),
-            ))
+            result = await asyncio.wait_for(
+                client(SearchRequest(
+                    peer=InputPeerEmpty(),
+                    q="",
+                    filter=InputMessagesFilterEmpty(),
+                    min_date=None,
+                    max_date=None,
+                    offset_id=checkpoint,
+                    add_offset=0,
+                    limit=_BACKFILL_BATCH_LIMIT,
+                    max_id=0,
+                    min_id=0,
+                    hash=0,
+                    from_id=InputPeerSelf(),
+                )),
+                timeout=_SEARCH_RPC_TIMEOUT_S,
+            )
         except FloodWaitError as exc:
             logger.warning(
                 "activity_sync_floodwait seconds=%d total_fetched=%d",
@@ -203,6 +211,13 @@ async def _run_backfill(
                 return
             except TimeoutError:
                 continue
+        except TimeoutError:
+            logger.warning(
+                "activity_sync_backfill_rpc_timeout offset_id=%d total_fetched=%d",
+                checkpoint,
+                total_fetched,
+            )
+            return  # outer run_activity_sync_loop re-enters after interval
 
         if total_known is None:
             total_known = getattr(result, "count", None)
@@ -296,25 +311,33 @@ async def _run_incremental(
     # 60-second buffer guards against messages at the exact boundary being
     # missed when the previous sync finished mid-second.
     min_date = max(0, last_sync_at - 60)
+    logger.info(
+        "activity_sync_incremental_start min_date=%d window_s=%d",
+        min_date,
+        int(time.time()) - min_date,
+    )
 
     inserted = 0
     offset_id = 0  # start from newest
     while not shutdown_event.is_set():
         try:
-            result = await client(SearchRequest(
-                peer=InputPeerEmpty(),
-                q="",
-                filter=InputMessagesFilterEmpty(),
-                min_date=min_date,
-                max_date=None,
-                offset_id=offset_id,
-                add_offset=0,
-                limit=_BACKFILL_BATCH_LIMIT,
-                max_id=0,
-                min_id=0,
-                hash=0,
-                from_id=InputPeerSelf(),
-            ))
+            result = await asyncio.wait_for(
+                client(SearchRequest(
+                    peer=InputPeerEmpty(),
+                    q="",
+                    filter=InputMessagesFilterEmpty(),
+                    min_date=min_date,
+                    max_date=None,
+                    offset_id=offset_id,
+                    add_offset=0,
+                    limit=_BACKFILL_BATCH_LIMIT,
+                    max_id=0,
+                    min_id=0,
+                    hash=0,
+                    from_id=InputPeerSelf(),
+                )),
+                timeout=_SEARCH_RPC_TIMEOUT_S,
+            )
         except FloodWaitError as exc:
             logger.warning("activity_sync_incremental_floodwait seconds=%d", exc.seconds)
             try:
@@ -322,6 +345,14 @@ async def _run_incremental(
                 return  # shutdown fired during flood wait — exit cleanly
             except TimeoutError:
                 continue
+        except TimeoutError:
+            logger.warning(
+                "activity_sync_rpc_timeout offset_id=%d inserted=%d",
+                offset_id,
+                inserted,
+            )
+            _set_state(conn, "last_sync_at", str(int(time.time())))
+            break
 
         batch = list(getattr(result, "messages", []) or [])
         if not batch:
@@ -356,8 +387,7 @@ async def _run_incremental(
             pass
 
     _set_state(conn, "last_sync_at", str(int(time.time())))
-    if inserted:
-        logger.info("activity_sync_incremental_inserted count=%d", inserted)
+    logger.info("activity_sync_incremental_done inserted=%d", inserted)
 
 
 async def run_activity_sync_loop(
@@ -373,6 +403,7 @@ async def run_activity_sync_loop(
     Sleeps `interval` between passes, interruptible via shutdown_event.
     """
     while not shutdown_event.is_set():
+        logger.info("activity_sync_loop_start")
         try:
             await _run_backfill(client, conn, shutdown_event)
             await _run_incremental(client, conn, shutdown_event)
