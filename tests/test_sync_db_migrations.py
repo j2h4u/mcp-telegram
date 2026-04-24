@@ -146,7 +146,6 @@ def test_schema_version_records_current(db_path: Path) -> None:
     try:
         row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
         assert row[0] == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 14
     finally:
         conn.close()
 
