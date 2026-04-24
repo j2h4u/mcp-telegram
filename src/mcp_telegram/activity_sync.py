@@ -355,6 +355,7 @@ async def run_activity_sync_loop(
             await _run_incremental(client, conn, shutdown_event)
         except Exception:
             logger.warning("activity_sync_error", exc_info=True)
+        logger.info("activity_sync_loop_sleeping interval=%.0fs", interval)
         try:
             await asyncio.wait_for(shutdown_event.wait(), timeout=interval)
             return
