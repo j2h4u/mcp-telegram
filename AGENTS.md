@@ -55,6 +55,7 @@ writer; the MCP server opens `sync.db` read-only for lightweight queries.
 - `sync.py` — `MarkDialogForSync`, `GetSyncStatus`, `GetSyncAlerts`
 - `unread.py` — `GetInbox`
 - `user_info.py` — `GetUserInfo`
+- `activity.py` — `GetMyRecentActivity`
 
 Canonical tool registry: `tools/__init__.py`.
 
@@ -122,7 +123,7 @@ uv run python -m devtools.mcp_client.cli script \
 
 ## Runtime Discipline
 
-- After any runtime-affecting change: rebuild the container, then verify.
+- After any runtime-affecting change: **the agent rebuilds the container and verifies** — this is not a handoff to the operator.
 - Do not mark work done until the restarted runtime exposes the expected behavior.
 - Green tests do not prove the live container is current — stale containers serve stale schemas.
 
