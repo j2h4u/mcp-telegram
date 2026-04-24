@@ -147,19 +147,20 @@ async def test_backfill_floodwait_recovers(tmp_path):
 @pytest.mark.asyncio
 async def test_incremental_only_new_messages(tmp_path):
     conn = _make_db(tmp_path)
-    # Mark backfill complete, pre-seed one row with message_id=50 in messages (out=1).
+    anchor_ts = 1_700_000_000
     with conn:
         conn.execute("UPDATE activity_sync_state SET value='1' WHERE key='backfill_complete'")
-        # Seed one row directly in messages with out=1 — mimics a prior backfill run.
+        conn.execute("INSERT OR REPLACE INTO activity_sync_state (key, value) VALUES ('last_sync_at', ?)",
+                     (str(anchor_ts),))
         conn.execute(
             "INSERT INTO messages (dialog_id, message_id, sent_at, text, out, is_service, is_deleted) "
             "VALUES (?, ?, ?, ?, 1, 0, 0)",
-            (42, 50, 1000, "old"),
+            (42, 50, anchor_ts - 100, "old"),
         )
 
-    # Incremental uses SearchRequest(min_id=50) — only messages with id > 50 come back.
-    # First batch: id=51. Second batch: empty → done.
-    new_msg = _msg(51, 42, 2000, text="new")
+    # Incremental uses SearchRequest(min_date=anchor_ts-60) — message sent_at=anchor_ts+100
+    # is newer and must be returned. First batch: id=51. Second batch: empty → done.
+    new_msg = _msg(51, 42, anchor_ts + 100, text="new")
     client = _FakeClient(batches=[
         FakeSearchResult(messages=[new_msg]),
         FakeSearchResult(messages=[]),
@@ -191,11 +192,11 @@ async def test_incremental_skipped_before_backfill_complete(tmp_path):
 
 @pytest.mark.asyncio
 async def test_incremental_skipped_when_messages_empty(tmp_path):
-    """W5: backfill complete but no rows in messages WHERE out=1 — incremental must no-op."""
+    """W5: backfill complete but last_sync_at not set — incremental must no-op."""
     conn = _make_db(tmp_path)
     with conn:
         conn.execute("UPDATE activity_sync_state SET value='1' WHERE key='backfill_complete'")
-    # Client should never be called — max_message_id == 0.
+    # Client should never be called — last_sync_at == 0.
     client = _FakeClient(batches=[FakeSearchResult(messages=[_msg(100, 42, 1_700_000_000)])])
     shutdown = asyncio.Event()
     await _run_incremental(client, conn, shutdown)
@@ -282,52 +283,48 @@ async def test_incremental_anchor_ignores_higher_id_out0_row(tmp_path):
     The incremental run's anchor query must see max(out=1)=50 — NOT 99_999
     — so the subsequent SearchRequest includes message_id=51.
     """
+    # Anchor is now timestamp-based (min_date), not min_id. A message in a
+    # different dialog with a low per-chat message_id but a recent sent_at
+    # must be captured — this was the original failure mode.
+    anchor_ts = 1_700_000_000
     conn = _make_db(tmp_path)
     with conn:
-        # Mark backfill complete so _run_incremental actually runs.
         conn.execute("UPDATE activity_sync_state SET value='1' WHERE key='backfill_complete'")
-        # Seed an authoritative own-message row with a modest message_id.
+        conn.execute("INSERT OR REPLACE INTO activity_sync_state (key, value) VALUES ('last_sync_at', ?)",
+                     (str(anchor_ts),))
+        # Seed an old own-message in dialog 42.
         conn.execute(
             "INSERT INTO messages "
             "(dialog_id, message_id, sent_at, text, out, is_service, is_deleted) "
             "VALUES (42, 50, 1700000000, 'mine-old', 1, 0, 0)",
         )
-        # Seed a DECOY full-sync incoming row with a much higher message_id.
-        # If the anchor code uses MAX(message_id) without filtering on out=1,
-        # it would pick 99_999 and request messages above that, skipping 51.
+        # Seed an incoming row with a high message_id in dialog 42.
+        # Under the old min_id anchor this would have blocked id=51 from being fetched.
+        # Under the new min_date anchor it is irrelevant.
         conn.execute(
             "INSERT INTO messages "
             "(dialog_id, message_id, sent_at, text, out, is_service, is_deleted) "
-            "VALUES (42, 99999, 1700000010, 'decoy-incoming', 0, 0, 0)",
+            "VALUES (42, 99999, 1700000010, 'incoming-high-id', 0, 0, 0)",
         )
-    # Verify the anchor query directly — this is the load-bearing assertion.
-    anchor = conn.execute(
-        "SELECT MAX(message_id) FROM messages WHERE out = 1"
-    ).fetchone()[0]
-    assert anchor == 50, (
-        f"Anchor must read MAX(out=1)=50, not absolute max 99_999. Got: {anchor}"
-    )
-    # End-to-end: incremental should fetch messages above id=50.
-    # Provide a batch containing a new own-message with id=51 and an
-    # empty follow-up so the loop terminates cleanly.
+    # New own-message in dialog 99 with message_id=3 (low per-chat id, newer by date).
+    # Old min_id logic would skip it (3 < 50). Timestamp logic must find it.
     client = _FakeClient(batches=[
-        FakeSearchResult(messages=[_msg(51, 42, 1_700_000_100)]),
+        FakeSearchResult(messages=[_msg(3, 99, anchor_ts + 100)]),
         FakeSearchResult(messages=[]),
     ])
     shutdown = asyncio.Event()
     await _run_incremental(client, conn, shutdown)
-    # The new own message landed; decoy stays put.
     own_ids = sorted(
         r[0] for r in conn.execute(
             "SELECT message_id FROM messages WHERE out = 1"
         ).fetchall()
     )
-    assert own_ids == [50, 51], (
-        f"Incremental must write id=51 as a new own-message; got own_ids={own_ids}"
+    assert own_ids == [3, 50], (
+        f"Incremental must capture id=3 from dialog 99 despite low per-chat id; got {own_ids}"
     )
     decoy_still_present = conn.execute(
         "SELECT out FROM messages WHERE dialog_id=42 AND message_id=99999"
     ).fetchone()
     assert decoy_still_present is not None and decoy_still_present[0] == 0, (
-        "Decoy out=0 row must remain unchanged — activity_sync never touches incoming rows"
+        "Incoming row must remain unchanged"
     )
