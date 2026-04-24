@@ -2590,14 +2590,13 @@ class DaemonAPIServer:
     # ------------------------------------------------------------------
 
     async def _get_my_recent_activity(self, req: dict) -> dict:
-        """Read activity_comments with scan_status context.
+        """Read own outgoing messages (out=1, non-service, non-deleted) with scan_status context.
 
         D-05: per-comment blocks, scan_status from activity_sync_state.
 
         Request: since_hours (int, 1–8760, default 168), limit (int, 1–2000, default 500).
         Response: {"ok": True, "data": {"comments": [...], "scan_status": str, "scanned_at": int|None}}
-        Each comment: {"dialog_id", "message_id", "sent_at", "text", "reactions",
-                       "reply_count", "dialog_name"}
+        Each comment: {"dialog_id", "message_id", "sent_at", "text", "dialog_name"}
         dialog_name falls back to str(dialog_id) when no entities row exists.
         scan_status: "never_run" if backfill_started_at IS NULL (daemon never ran the loop),
                      "in_progress" if backfill_started_at IS NOT NULL but backfill_complete != '1',
@@ -2620,12 +2619,19 @@ class DaemonAPIServer:
         since_ts = int(time.time()) - since_hours * 3600
 
         rows = self._conn.execute(
-            "SELECT ac.dialog_id, ac.message_id, ac.sent_at, ac.text, "
-            "       ac.reactions, ac.reply_count, e.name AS dialog_name "
-            "FROM activity_comments ac "
-            "LEFT JOIN entities e ON e.id = ac.dialog_id "
-            "WHERE ac.sent_at >= ? "
-            "ORDER BY ac.sent_at DESC "
+            "SELECT m.dialog_id, m.message_id, m.sent_at, m.text, "
+            "       e.name AS dialog_name "
+            "FROM messages m "
+            "LEFT JOIN entities e ON e.id = m.dialog_id "
+            # out=1: authored by the account owner.
+            # is_service=0: exclude join/leave/group-created system events
+            #   — activity_comments never held these rows, so the read
+            #   path must not start surfacing them after unification.
+            # is_deleted=0: exclude tombstones for messages the user
+            #   deleted — same pre-v15 behavior preservation rationale.
+            "WHERE m.out = 1 AND m.is_service = 0 AND m.is_deleted = 0 "
+            "  AND m.sent_at >= ? "
+            "ORDER BY m.sent_at DESC "
             "LIMIT ?",
             (since_ts, limit),
         ).fetchall()
@@ -2651,9 +2657,7 @@ class DaemonAPIServer:
                 "message_id": r[1],
                 "sent_at": r[2],
                 "text": r[3],
-                "reactions": r[4],
-                "reply_count": r[5],
-                "dialog_name": r[6] if r[6] else str(r[0]),
+                "dialog_name": r[4] if r[4] else str(r[0]),
             }
             for r in rows
         ]

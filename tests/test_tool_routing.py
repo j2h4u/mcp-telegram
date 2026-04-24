@@ -1588,8 +1588,8 @@ async def test_get_my_recent_activity_in_progress_header():
     assert "Scan status: in progress" in result[0].text
 
 
-async def test_get_my_recent_activity_reactions_formatted():
-    """GetMyRecentActivity formats reactions JSON as emoji×count pairs."""
+async def test_get_my_recent_activity_formats_comment_block():
+    """GetMyRecentActivity renders dialog/time/text + nav line (no reactions/replies after v15)."""
     from mcp_telegram.tools.activity import GetMyRecentActivity, get_my_recent_activity
 
     conn = _make_daemon_conn(
@@ -1602,8 +1602,6 @@ async def test_get_my_recent_activity_reactions_formatted():
                         "message_id": 100,
                         "sent_at": 1_700_000_000,
                         "text": "hi",
-                        "reactions": '{"👍": 2, "❤": 1}',
-                        "reply_count": 0,
                         "dialog_name": "X",
                     },
                 ],
@@ -1615,8 +1613,11 @@ async def test_get_my_recent_activity_reactions_formatted():
     with _patch_daemon(conn):
         result = await get_my_recent_activity(GetMyRecentActivity())
     text = result[0].text
-    assert "👍×2" in text
-    assert "❤×1" in text
+    assert "[X]" in text
+    assert "hi" in text
+    assert "nav: dialog_id=42 message_id=100" in text
+    assert "reactions:" not in text
+    assert "replies:" not in text
 
 
 async def test_list_messages_fragment_coverage_header():
