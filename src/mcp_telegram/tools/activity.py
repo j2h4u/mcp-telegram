@@ -1,7 +1,6 @@
 """GetMyRecentActivity MCP tool — Phase 999.1."""
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
 from typing import Any
 
@@ -18,7 +17,7 @@ from ._base import (
 
 
 class GetMyRecentActivity(ToolArgs):
-    """[primary] Show messages you sent across all chats, with reply counts and reactions.
+    """[primary] Show messages you sent across all chats.
 
     Reads from the local own-message archive populated by the daemon's
     activity_sync loop — zero Telegram API calls in the hot path.
@@ -44,28 +43,13 @@ class GetMyRecentActivity(ToolArgs):
     )
 
 
-def _format_reactions(reactions_json: str | None) -> str:
-    if not reactions_json:
-        return "—"
-    try:
-        data = json.loads(reactions_json)
-    except (ValueError, TypeError):
-        return "—"
-    if not isinstance(data, dict) or not data:
-        return "—"
-    return " ".join(f"{emoji}×{count}" for emoji, count in data.items())
-
-
 def _format_block(comment: dict[str, Any]) -> str:
     ts = comment.get("sent_at") or 0
     dt = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
     dialog_name = comment.get("dialog_name") or str(comment.get("dialog_id", "?"))
     text = (comment.get("text") or "").replace("\n", " ")
-    reactions = _format_reactions(comment.get("reactions"))
-    reply_count = int(comment.get("reply_count") or 0)
     return (
         f"[{dialog_name}] {dt}  {text}\n"
-        f"  reactions: {reactions}  replies: {reply_count}\n"
         f"  nav: dialog_id={comment.get('dialog_id')} message_id={comment.get('message_id')}"
     )
 
