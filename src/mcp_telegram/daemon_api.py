@@ -2599,8 +2599,9 @@ class DaemonAPIServer:
         Each comment: {"dialog_id", "message_id", "sent_at", "text", "reactions",
                        "reply_count", "dialog_name"}
         dialog_name falls back to str(dialog_id) when no entities row exists.
-        scan_status: "never_run" if last_sync_at is NULL, "in_progress" if backfill_complete != '1',
-                     "complete" otherwise.
+        scan_status: "never_run" if backfill_started_at IS NULL (daemon never ran the loop),
+                     "in_progress" if backfill_started_at IS NOT NULL but backfill_complete != '1',
+                     "complete" if backfill_complete == '1'.
         """
         since_hours_raw = req.get("since_hours", 168)
         try:
@@ -2633,15 +2634,16 @@ class DaemonAPIServer:
             self._conn.execute("SELECT key, value FROM activity_sync_state").fetchall()
         )
         backfill_complete = state_rows.get("backfill_complete") == "1"
+        backfill_started = state_rows.get("backfill_started_at") is not None
         last_sync_at_str = state_rows.get("last_sync_at")
         last_sync_at: int | None = int(last_sync_at_str) if last_sync_at_str else None
 
-        if last_sync_at is None:
-            scan_status = "never_run"
-        elif not backfill_complete:
+        if backfill_complete:
+            scan_status = "complete"
+        elif backfill_started:
             scan_status = "in_progress"
         else:
-            scan_status = "complete"
+            scan_status = "never_run"
 
         comments = [
             {

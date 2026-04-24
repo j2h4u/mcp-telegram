@@ -4918,16 +4918,16 @@ async def test_get_my_recent_activity_never_run() -> None:
 
 @pytest.mark.asyncio
 async def test_get_my_recent_activity_in_progress() -> None:
-    """backfill_complete='0' with last_sync_at set → scan_status='in_progress'."""
+    """backfill_started_at set but backfill_complete='0' → scan_status='in_progress'."""
     server = make_server(_make_db_with_activity())
     with server._conn:
         server._conn.execute(
-            "UPDATE activity_sync_state SET value='1700000000' WHERE key='last_sync_at'"
+            "INSERT OR IGNORE INTO activity_sync_state (key, value) VALUES ('backfill_started_at', '1700000000')"
         )
-        # backfill_complete stays '0'
+        # backfill_complete stays '0', last_sync_at stays NULL
     resp = await server._dispatch({"method": "get_my_recent_activity"})
     assert resp["data"]["scan_status"] == "in_progress"
-    assert resp["data"]["scanned_at"] == 1700000000
+    assert resp["data"]["scanned_at"] is None
 
 
 @pytest.mark.asyncio
