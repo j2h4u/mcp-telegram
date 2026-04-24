@@ -459,7 +459,8 @@ async def sync_main() -> None:
                 logger.info("backfilled out=1 on %d historical outgoing DM rows", cur.rowcount)
         except Exception:
             logger.warning("out=1 backfill skipped — non-fatal", exc_info=True)
-        logger.info("daemon API ready on %s", socket_path)
+        api_server._ready = True
+        logger.info("daemon ready — serving requests on %s", socket_path)
 
         handler_manager = EventHandlerManager(client, conn, shutdown_event)
         handler_manager.register()
@@ -476,8 +477,6 @@ async def sync_main() -> None:
         logger.info("dm_bootstrap complete — enrolled=%d", enrolled)
 
         handler_manager.refresh_synced_dialogs()
-        api_server._ready = True
-        logger.info("daemon ready — serving requests")
 
         # Background tasks — non-blocking, tracked for shutdown
         _create_tracked_task(
