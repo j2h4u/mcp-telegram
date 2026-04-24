@@ -7,7 +7,7 @@ from pathlib import Path
 
 from xdg_base_dirs import xdg_state_home  # type: ignore[import-error]
 
-_CURRENT_SCHEMA_VERSION = 13
+_CURRENT_SCHEMA_VERSION = 14
 
 logger = logging.getLogger(__name__)
 
@@ -164,6 +164,42 @@ CREATE TABLE IF NOT EXISTS telemetry_events (
 _TELEMETRY_EVENTS_INDEX_DDL = """
 CREATE INDEX IF NOT EXISTS idx_telemetry_tool_timestamp
 ON telemetry_events(tool_name, timestamp)
+"""
+
+# ---------------------------------------------------------------------------
+# DDL for v14: activity_comments and activity_sync_state tables (Phase 999.1)
+# ---------------------------------------------------------------------------
+
+# synced_dialogs.status accepted values:
+#   'not_synced'  — default; no bulk fetch has been attempted
+#   'syncing'     — FullSyncWorker in progress
+#   'synced'      — bulk fetch complete, real-time events active
+#   'access_lost' — account was removed; read-only metadata
+#   'fragment'    — no full sync; point-fetched snippets only (Phase 999.1)
+
+_ACTIVITY_COMMENTS_DDL = """
+CREATE TABLE IF NOT EXISTS activity_comments (
+    dialog_id       INTEGER NOT NULL,
+    message_id      INTEGER NOT NULL,
+    sent_at         INTEGER NOT NULL,
+    text            TEXT,
+    reactions       TEXT,
+    reply_count     INTEGER NOT NULL DEFAULT 0,
+    last_synced_at  INTEGER,
+    PRIMARY KEY (dialog_id, message_id)
+)
+"""
+
+_ACTIVITY_COMMENTS_INDEX_DDL = (
+    "CREATE INDEX IF NOT EXISTS idx_activity_comments_sent_at "
+    "ON activity_comments(sent_at DESC)"
+)
+
+_ACTIVITY_SYNC_STATE_DDL = """
+CREATE TABLE IF NOT EXISTS activity_sync_state (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+)
 """
 
 
@@ -444,6 +480,26 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
         13,
         [
             "ALTER TABLE messages ADD COLUMN post_author TEXT",
+        ],
+    )
+
+    # v14: own-message archive for Phase 999.1 (track group messages for replies
+    # and reactions). activity_comments stores messages sent by the account owner
+    # across all chats (via messages.Search global own-message query). Separate
+    # from the main messages table — not FTS-indexed (not a user-searchable corpus).
+    # activity_sync_state is a key/value table tracking backfill progress:
+    #   backfill_complete — '1' when full history scan is done, '0' otherwise
+    #   backfill_offset_id — Telegram message_id pagination anchor (exclusive upper bound)
+    #   last_sync_at — Unix timestamp of most recent sync run (NULL = never run)
+    _migrate(
+        14,
+        [
+            _ACTIVITY_COMMENTS_DDL,
+            _ACTIVITY_COMMENTS_INDEX_DDL,
+            _ACTIVITY_SYNC_STATE_DDL,
+            "INSERT OR IGNORE INTO activity_sync_state (key, value) VALUES ('backfill_complete', '0')",
+            "INSERT OR IGNORE INTO activity_sync_state (key, value) VALUES ('backfill_offset_id', '0')",
+            "INSERT OR IGNORE INTO activity_sync_state (key, value) VALUES ('last_sync_at', NULL)",
         ],
     )
 
