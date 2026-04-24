@@ -850,7 +850,7 @@ def test_sync_main_runs_fts_backfill(
     mock_client: MagicMock,
     instant_shutdown_event: asyncio.Event,
 ) -> None:
-    """sync_main() calls backfill_fts_index(conn) once at startup."""
+    """sync_main() schedules backfill_fts_index(conn) as a background task."""
     mocks = _make_standard_mocks(instant_shutdown_event)
     mock_conn = MagicMock()
 
@@ -858,17 +858,25 @@ def test_sync_main_runs_fts_backfill(
     mock_unix_server.close = MagicMock()
     mock_unix_server.wait_closed = AsyncMock()
 
+    mock_backfill = MagicMock(return_value=0)
+
+    # Run backfill_fts_index synchronously inside the test so the assertion
+    # fires before asyncio.run() returns, regardless of shutdown timing.
+    async def fake_to_thread(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
     with (
         patch("mcp_telegram.daemon.create_client", return_value=mock_client),
         patch("mcp_telegram.daemon.ensure_sync_schema"),
         patch("mcp_telegram.daemon.register_shutdown_handler", return_value=instant_shutdown_event),
         patch("mcp_telegram.daemon.get_sync_db_path"),
         patch("mcp_telegram.daemon._open_sync_db", return_value=mock_conn),
-        patch("mcp_telegram.daemon.backfill_fts_index", return_value=0) as mock_backfill,
+        patch("mcp_telegram.daemon.backfill_fts_index", mock_backfill),
         patch("mcp_telegram.daemon.FullSyncWorker", return_value=mocks["worker"]),
         patch("mcp_telegram.daemon.DeltaSyncWorker", return_value=mocks["delta"]),
         patch("mcp_telegram.daemon.EventHandlerManager", return_value=mocks["handler"]),
         patch("mcp_telegram.daemon.asyncio.start_unix_server", new=AsyncMock(return_value=mock_unix_server)),
+        patch("mcp_telegram.daemon.asyncio.to_thread", side_effect=fake_to_thread),
         patch("mcp_telegram.daemon.os.chmod"),
     ):
         asyncio.run(sync_main())
