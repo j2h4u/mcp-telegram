@@ -818,6 +818,8 @@ class DaemonAPIServer:
             return await self._resolve_entity(req)
         if method == "get_dialog_stats":
             return await self._get_dialog_stats(req)
+        if method == "get_my_recent_activity":
+            return await self._get_my_recent_activity(req)
         return {"ok": False, "error": "unknown_method"}
 
     # ------------------------------------------------------------------
@@ -1415,7 +1417,27 @@ class DaemonAPIServer:
 
         if context_message_id is not None:
             row = self._conn.execute(_SELECT_SYNC_STATUS_SQL, (dialog_id,)).fetchone()
-            if row is None or row[0] not in ("synced", "syncing"):
+            current_status = row[0] if row else None
+
+            # Phase 999.1 (D-07): Fragment-dialog branch. If the dialog is not fully
+            # synced, perform a targeted getMessages fetch, cache into messages,
+            # then serve the context window from sync.db with coverage='fragment'.
+            if current_status in (None, "not_synced", "fragment"):
+                await self._fetch_fragment_context(dialog_id, context_message_id)
+                result = await self._list_messages_context_window(
+                    dialog_id=dialog_id,
+                    anchor_message_id=context_message_id,
+                    context_size=context_size,
+                )
+                # Annotate coverage on the response payload.
+                data = result.get("data") if isinstance(result.get("data"), dict) else None
+                if data is not None:
+                    data["coverage"] = "fragment"
+                else:
+                    result["coverage"] = "fragment"
+                return result
+
+            if current_status not in ("synced", "syncing"):
                 return {
                     "ok": False,
                     "error": "not_synced",
@@ -2490,6 +2512,156 @@ class DaemonAPIServer:
                 "top_mentions": mentions,
                 "top_hashtags": hashtags,
                 "top_forwards": forwards,
+            },
+        }
+
+    # ------------------------------------------------------------------
+    # _fetch_fragment_context (helper for _list_messages fragment branch)
+    # ------------------------------------------------------------------
+
+    async def _fetch_fragment_context(
+        self, dialog_id: int, anchor_message_id: int
+    ) -> None:
+        """Targeted getMessages around an anchor; caches into messages table.
+
+        Per D-08: default context window is 5 messages AFTER the anchor.
+        Fragment dialog row is INSERT OR IGNORE (never overwrites 'synced').
+        """
+        # Ensure synced_dialogs row exists with status='fragment' (idempotent).
+        with self._conn:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO synced_dialogs (dialog_id, status) VALUES (?, 'fragment')",
+                (dialog_id,),
+            )
+
+        try:
+            ids = list(range(anchor_message_id, anchor_message_id + 6))  # anchor + 5 after
+            entity = await self._client.get_input_entity(dialog_id)
+            fetched = await self._client.get_messages(entity, ids=ids)
+        except Exception:
+            logger.warning(
+                "fragment_fetch_failed dialog_id=%s anchor=%s",
+                dialog_id, anchor_message_id, exc_info=True,
+            )
+            return
+
+        # Upsert into messages using existing sync_worker helpers.
+        # ExtractedMessage.message is a StoredMessage dataclass — bind via asdict().
+        from dataclasses import asdict
+
+        from .sync_worker import (
+            INSERT_MESSAGE_SQL,
+            extract_message_row,
+            extract_reactions_rows,
+        )
+
+        stored_msgs = []
+        reaction_rows_all = []
+        for msg in fetched:
+            if msg is None:
+                continue
+            extracted = extract_message_row(dialog_id, msg)
+            if extracted is None:
+                continue
+            # Use .message field (StoredMessage dataclass), not the deprecated .row attribute.
+            stored_msgs.append(extracted.message)
+            reactions = extract_reactions_rows(dialog_id, msg.id, getattr(msg, "reactions", None))
+            reaction_rows_all.extend(reactions)
+
+        if not stored_msgs:
+            return
+
+        with self._conn:
+            # INSERT_MESSAGE_SQL uses named params bound to StoredMessage field names.
+            self._conn.executemany(
+                INSERT_MESSAGE_SQL,
+                [asdict(m) for m in stored_msgs],
+            )
+            # message_reactions upsert: mirror sync_worker pattern exactly.
+            if reaction_rows_all:
+                self._conn.executemany(
+                    "INSERT OR REPLACE INTO message_reactions "
+                    "(dialog_id, message_id, emoji, count) VALUES (?, ?, ?, ?)",
+                    [(r.dialog_id, r.message_id, r.emoji, r.count) for r in reaction_rows_all],
+                )
+
+    # ------------------------------------------------------------------
+    # get_my_recent_activity
+    # ------------------------------------------------------------------
+
+    async def _get_my_recent_activity(self, req: dict) -> dict:
+        """Read activity_comments with scan_status context.
+
+        D-05: per-comment blocks, scan_status from activity_sync_state.
+
+        Request: since_hours (int, 1–8760, default 168), limit (int, 1–2000, default 500).
+        Response: {"ok": True, "data": {"comments": [...], "scan_status": str, "scanned_at": int|None}}
+        Each comment: {"dialog_id", "message_id", "sent_at", "text", "reactions",
+                       "reply_count", "dialog_name"}
+        dialog_name falls back to str(dialog_id) when no entities row exists.
+        scan_status: "never_run" if last_sync_at is NULL, "in_progress" if backfill_complete != '1',
+                     "complete" otherwise.
+        """
+        since_hours_raw = req.get("since_hours", 168)
+        try:
+            since_hours = int(since_hours_raw)
+        except (TypeError, ValueError):
+            since_hours = 168
+        since_hours = max(1, min(8760, since_hours))
+
+        limit_raw = req.get("limit", 500)
+        try:
+            limit = int(limit_raw)
+        except (TypeError, ValueError):
+            limit = 500
+        limit = max(1, min(2000, limit))
+
+        since_ts = int(time.time()) - since_hours * 3600
+
+        rows = self._conn.execute(
+            "SELECT ac.dialog_id, ac.message_id, ac.sent_at, ac.text, "
+            "       ac.reactions, ac.reply_count, e.name AS dialog_name "
+            "FROM activity_comments ac "
+            "LEFT JOIN entities e ON e.id = ac.dialog_id "
+            "WHERE ac.sent_at >= ? "
+            "ORDER BY ac.sent_at DESC "
+            "LIMIT ?",
+            (since_ts, limit),
+        ).fetchall()
+
+        state_rows = dict(
+            self._conn.execute("SELECT key, value FROM activity_sync_state").fetchall()
+        )
+        backfill_complete = state_rows.get("backfill_complete") == "1"
+        last_sync_at_str = state_rows.get("last_sync_at")
+        last_sync_at: int | None = int(last_sync_at_str) if last_sync_at_str else None
+
+        if last_sync_at is None:
+            scan_status = "never_run"
+        elif not backfill_complete:
+            scan_status = "in_progress"
+        else:
+            scan_status = "complete"
+
+        comments = [
+            {
+                "dialog_id": r[0],
+                "message_id": r[1],
+                "sent_at": r[2],
+                "text": r[3],
+                "reactions": r[4],
+                "reply_count": r[5],
+                "dialog_name": r[6] if r[6] else str(r[0]),
+            }
+            for r in rows
+        ]
+
+        return {
+            "ok": True,
+            "data": {
+                "comments": comments,
+                "scan_status": scan_status,
+                "scanned_at": last_sync_at,
             },
         }
 

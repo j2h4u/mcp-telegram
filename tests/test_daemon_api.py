@@ -172,6 +172,63 @@ def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.
     return conn
 
 
+def _make_db_with_activity() -> sqlite3.Connection:
+    """_make_db() + Phase 999.1 v14 DDL (activity_comments + activity_sync_state).
+
+    We cannot call ensure_sync_schema here because _make_db() builds a curated
+    in-memory schema; adding the two new tables inline is the minimal delta.
+    The entities table is also created here (needed by LEFT JOIN in
+    _get_my_recent_activity) because _make_db() only creates it with_entities=True.
+    """
+    conn = _make_db()
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS activity_comments (
+            dialog_id       INTEGER NOT NULL,
+            message_id      INTEGER NOT NULL,
+            sent_at         INTEGER NOT NULL,
+            text            TEXT,
+            reactions       TEXT,
+            reply_count     INTEGER NOT NULL DEFAULT 0,
+            last_synced_at  INTEGER,
+            PRIMARY KEY (dialog_id, message_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS activity_sync_state (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        )
+        """
+    )
+    # Seed the three state rows (mirroring Plan 01 migration seeds).
+    conn.executemany(
+        "INSERT OR IGNORE INTO activity_sync_state (key, value) VALUES (?, ?)",
+        [
+            ("backfill_complete", "0"),
+            ("backfill_offset_id", "0"),
+            ("last_sync_at", None),
+        ],
+    )
+    # entities table (needed by LEFT JOIN entities in _get_my_recent_activity).
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS entities (
+            id              INTEGER PRIMARY KEY,
+            type            TEXT NOT NULL,
+            name            TEXT,
+            username        TEXT,
+            name_normalized TEXT,
+            updated_at      INTEGER NOT NULL
+        )
+        """
+    )
+    conn.commit()
+    return conn
+
+
 def _insert_synced_dialog(
     conn: sqlite3.Connection,
     dialog_id: int,
@@ -3175,11 +3232,17 @@ async def test_list_messages_context_window_near_start() -> None:
 
 @pytest.mark.asyncio
 async def test_list_messages_context_window_not_synced_error() -> None:
-    """context_message_id returns not_synced error when dialog is not in synced_dialogs."""
+    """context_message_id returns not_synced error for access_lost dialogs.
+
+    Phase 999.1 (D-07): absent/not_synced/fragment statuses now trigger the
+    fragment-fetch path instead of being rejected. Only 'access_lost' dialogs
+    (where we lost access and cannot fetch) are rejected with not_synced.
+    """
     DIALOG_ID = 7003
 
     conn = _make_db()
-    # Dialog not inserted into synced_dialogs at all
+    # access_lost: we had access but lost it — cannot perform fragment fetch
+    _insert_synced_dialog(conn, DIALOG_ID, status="access_lost")
     server = make_server(conn)
 
     result = await server._list_messages({"dialog_id": DIALOG_ID, "context_message_id": 10, "context_size": 4})
@@ -4835,3 +4898,107 @@ async def test_list_messages_dm_outgoing_resolves_sender_first_name_via_e_eff() 
     resp = await server._list_messages({"dialog_id": 268071163, "limit": 10})
     assert resp["ok"] is True
     assert resp["data"]["messages"][0]["sender_first_name"] == "Me"
+
+
+# --- Phase 999.1: get_my_recent_activity ----------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_my_recent_activity_never_run() -> None:
+    """Empty DB with last_sync_at=NULL → scan_status='never_run', empty comments."""
+    server = make_server(_make_db_with_activity())
+    req = {"method": "get_my_recent_activity", "since_hours": 168, "limit": 100}
+    resp = await server._dispatch(req)
+    assert resp["ok"] is True
+    data = resp["data"]
+    assert data["comments"] == []
+    assert data["scan_status"] == "never_run"
+    assert data["scanned_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_get_my_recent_activity_in_progress() -> None:
+    """backfill_complete='0' with last_sync_at set → scan_status='in_progress'."""
+    server = make_server(_make_db_with_activity())
+    with server._conn:
+        server._conn.execute(
+            "UPDATE activity_sync_state SET value='1700000000' WHERE key='last_sync_at'"
+        )
+        # backfill_complete stays '0'
+    resp = await server._dispatch({"method": "get_my_recent_activity"})
+    assert resp["data"]["scan_status"] == "in_progress"
+    assert resp["data"]["scanned_at"] == 1700000000
+
+
+@pytest.mark.asyncio
+async def test_get_my_recent_activity_filters_by_since_hours() -> None:
+    """since_hours=1 returns only the recent row; scan_status='complete'."""
+    server = make_server(_make_db_with_activity())
+    now = int(time.time())
+    with server._conn:
+        server._conn.execute(
+            "INSERT INTO activity_comments (dialog_id, message_id, sent_at, text, reactions, reply_count, last_synced_at) "
+            "VALUES (42, 1, ?, 'recent', NULL, 0, ?)",
+            (now - 60, now),
+        )
+        server._conn.execute(
+            "INSERT INTO activity_comments (dialog_id, message_id, sent_at, text, reactions, reply_count, last_synced_at) "
+            "VALUES (42, 2, ?, 'old', NULL, 0, ?)",
+            (now - 999_999, now),
+        )
+        server._conn.execute("UPDATE activity_sync_state SET value='1' WHERE key='backfill_complete'")
+        server._conn.execute(f"UPDATE activity_sync_state SET value='{now}' WHERE key='last_sync_at'")
+    resp = await server._dispatch({"method": "get_my_recent_activity", "since_hours": 1})
+    texts = [c["text"] for c in resp["data"]["comments"]]
+    assert texts == ["recent"]
+    assert resp["data"]["scan_status"] == "complete"
+
+
+@pytest.mark.asyncio
+async def test_get_my_recent_activity_joins_dialog_name() -> None:
+    """dialog_name is populated from entities table via LEFT JOIN."""
+    server = make_server(_make_db_with_activity())
+    now = int(time.time())
+    with server._conn:
+        server._conn.execute(
+            "INSERT OR REPLACE INTO entities (id, type, name, username, name_normalized, updated_at) "
+            "VALUES (42, 'group', 'My Group', NULL, 'my group', ?)",
+            (now,),
+        )
+        server._conn.execute(
+            "INSERT INTO activity_comments (dialog_id, message_id, sent_at, text, reactions, reply_count, last_synced_at) "
+            "VALUES (42, 1, ?, 'hi', NULL, 0, ?)",
+            (now - 60, now),
+        )
+        server._conn.execute("UPDATE activity_sync_state SET value='1' WHERE key='backfill_complete'")
+        server._conn.execute(f"UPDATE activity_sync_state SET value='{now}' WHERE key='last_sync_at'")
+    resp = await server._dispatch({"method": "get_my_recent_activity"})
+    names = [c["dialog_name"] for c in resp["data"]["comments"]]
+    assert names == ["My Group"]
+
+
+@pytest.mark.asyncio
+async def test_get_my_recent_activity_falls_back_to_str_dialog_id() -> None:
+    """When no entities row exists, dialog_name falls back to str(dialog_id)."""
+    server = make_server(_make_db_with_activity())
+    now = int(time.time())
+    with server._conn:
+        server._conn.execute(
+            "INSERT INTO activity_comments (dialog_id, message_id, sent_at, text, reactions, reply_count, last_synced_at) "
+            "VALUES (999, 1, ?, 'x', NULL, 0, ?)",
+            (now - 60, now),
+        )
+        server._conn.execute("UPDATE activity_sync_state SET value='1' WHERE key='backfill_complete'")
+        server._conn.execute(f"UPDATE activity_sync_state SET value='{now}' WHERE key='last_sync_at'")
+    resp = await server._dispatch({"method": "get_my_recent_activity"})
+    assert resp["data"]["comments"][0]["dialog_name"] == "999"
+
+
+@pytest.mark.asyncio
+async def test_get_my_recent_activity_clamps_since_hours() -> None:
+    """Wildly out-of-range since_hours must not crash — clamped to 8760."""
+    server = make_server(_make_db_with_activity())
+    # Request wildly out-of-range since_hours — must not crash or error out
+    resp = await server._dispatch({"method": "get_my_recent_activity", "since_hours": 999_999})
+    assert resp["ok"] is True
+    assert resp["data"]["scan_status"] == "never_run"
