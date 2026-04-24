@@ -818,6 +818,8 @@ class DaemonAPIServer:
             return await self._resolve_entity(req)
         if method == "get_dialog_stats":
             return await self._get_dialog_stats(req)
+        if method == "get_my_recent_activity":
+            return await self._get_my_recent_activity(req)
         return {"ok": False, "error": "unknown_method"}
 
     # ------------------------------------------------------------------
@@ -2490,6 +2492,86 @@ class DaemonAPIServer:
                 "top_mentions": mentions,
                 "top_hashtags": hashtags,
                 "top_forwards": forwards,
+            },
+        }
+
+    # ------------------------------------------------------------------
+    # get_my_recent_activity
+    # ------------------------------------------------------------------
+
+    async def _get_my_recent_activity(self, req: dict) -> dict:
+        """Read activity_comments with scan_status context.
+
+        D-05: per-comment blocks, scan_status from activity_sync_state.
+
+        Request: since_hours (int, 1–8760, default 168), limit (int, 1–2000, default 500).
+        Response: {"ok": True, "data": {"comments": [...], "scan_status": str, "scanned_at": int|None}}
+        Each comment: {"dialog_id", "message_id", "sent_at", "text", "reactions",
+                       "reply_count", "dialog_name"}
+        dialog_name falls back to str(dialog_id) when no entities row exists.
+        scan_status: "never_run" if last_sync_at is NULL, "in_progress" if backfill_complete != '1',
+                     "complete" otherwise.
+        """
+        since_hours_raw = req.get("since_hours", 168)
+        try:
+            since_hours = int(since_hours_raw)
+        except (TypeError, ValueError):
+            since_hours = 168
+        since_hours = max(1, min(8760, since_hours))
+
+        limit_raw = req.get("limit", 500)
+        try:
+            limit = int(limit_raw)
+        except (TypeError, ValueError):
+            limit = 500
+        limit = max(1, min(2000, limit))
+
+        since_ts = int(time.time()) - since_hours * 3600
+
+        rows = self._conn.execute(
+            "SELECT ac.dialog_id, ac.message_id, ac.sent_at, ac.text, "
+            "       ac.reactions, ac.reply_count, e.name AS dialog_name "
+            "FROM activity_comments ac "
+            "LEFT JOIN entities e ON e.id = ac.dialog_id "
+            "WHERE ac.sent_at >= ? "
+            "ORDER BY ac.sent_at DESC "
+            "LIMIT ?",
+            (since_ts, limit),
+        ).fetchall()
+
+        state_rows = dict(
+            self._conn.execute("SELECT key, value FROM activity_sync_state").fetchall()
+        )
+        backfill_complete = state_rows.get("backfill_complete") == "1"
+        last_sync_at_str = state_rows.get("last_sync_at")
+        last_sync_at: int | None = int(last_sync_at_str) if last_sync_at_str else None
+
+        if last_sync_at is None:
+            scan_status = "never_run"
+        elif not backfill_complete:
+            scan_status = "in_progress"
+        else:
+            scan_status = "complete"
+
+        comments = [
+            {
+                "dialog_id": r[0],
+                "message_id": r[1],
+                "sent_at": r[2],
+                "text": r[3],
+                "reactions": r[4],
+                "reply_count": r[5],
+                "dialog_name": r[6] if r[6] else str(r[0]),
+            }
+            for r in rows
+        ]
+
+        return {
+            "ok": True,
+            "data": {
+                "comments": comments,
+                "scan_status": scan_status,
+                "scanned_at": last_sync_at,
             },
         }
 
