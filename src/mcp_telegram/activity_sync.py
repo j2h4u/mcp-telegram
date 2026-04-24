@@ -159,6 +159,14 @@ def _upsert_entities_from_search(conn: sqlite3.Connection, result: Any) -> None:
         conn.executemany(UPSERT_ENTITY_SQL, rows)
 
 
+def _fmt_duration(seconds: int) -> str:
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m{seconds % 60:02d}s"
+    return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
+
+
 async def _run_backfill(
     client: Any,
     conn: sqlite3.Connection,
@@ -183,6 +191,7 @@ async def _run_backfill(
     total_fetched = 0
     total_known: int | None = None  # filled from result.count on first batch
     batch_num = 0
+    loop_start = time.monotonic()
 
     while not shutdown_event.is_set():
         try:
@@ -238,15 +247,23 @@ async def _run_backfill(
         _set_state(conn, "backfill_offset_id", str(new_checkpoint))
         checkpoint = new_checkpoint
 
+        elapsed = time.monotonic() - loop_start
+        rate = total_fetched / elapsed if elapsed > 0 else 0.0
         if total_known is not None:
+            remaining = total_known - total_fetched
+            eta_s = int(remaining / rate) if rate > 0 else None
+            eta_str = _fmt_duration(eta_s) if eta_s is not None else "?"
             logger.info(
-                "activity_sync_backfill_batch batch=%d fetched=%d total_fetched=%d/%d offset_id=%d",
-                batch_num, len(batch), total_fetched, total_known, checkpoint,
+                "activity_sync_backfill_batch batch=%d fetched=%d total=%d/%d"
+                " rate=%.0f/s eta=%s offset_id=%d",
+                batch_num, len(batch), total_fetched, total_known,
+                rate, eta_str, checkpoint,
             )
         else:
             logger.info(
-                "activity_sync_backfill_batch batch=%d fetched=%d total_fetched=%d offset_id=%d",
-                batch_num, len(batch), total_fetched, checkpoint,
+                "activity_sync_backfill_batch batch=%d fetched=%d total=%d"
+                " rate=%.0f/s offset_id=%d",
+                batch_num, len(batch), total_fetched, rate, checkpoint,
             )
 
         try:
