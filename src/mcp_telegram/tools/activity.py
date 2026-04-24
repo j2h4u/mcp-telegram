@@ -105,4 +105,4 @@ async def get_my_recent_activity(args: GetMyRecentActivity) -> ToolResult:
         body = "\n\n".join(_format_block(c) for c in comments)
 
     output = "\n".join(header_lines + [body]) if header_lines else body
-    return _text_response(output)
+    return ToolResult(content=_text_response(output), result_count=len(comments))

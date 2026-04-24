@@ -93,6 +93,15 @@
         "is_error": false,
         "content_text_contains": ["=== Top Reactions"]
       }
+    },
+    {
+      "_comment": "GetMyRecentActivity — own sent messages with reply counts and reactions",
+      "action": "call_tool",
+      "name": "GetMyRecentActivity",
+      "arguments": {"since_hours": 24, "limit": 50},
+      "expect": {
+        "is_error": false
+      }
     }
   ]
 }
