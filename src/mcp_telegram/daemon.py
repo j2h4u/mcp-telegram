@@ -388,7 +388,16 @@ async def sync_main() -> None:
     # search" while we work. Total startup time = FTS time + Telegram time.
     api_server.startup_detail = "indexing messages for search"
     try:
-        backfilled = await asyncio.to_thread(backfill_fts_index, conn)
+        # Open a dedicated connection for the thread — sqlite3 connections are
+        # not thread-safe and cannot be shared across threads.
+        def _backfill_in_thread() -> int:
+            thread_conn = _open_sync_db(db_path)
+            try:
+                return backfill_fts_index(thread_conn)
+            finally:
+                thread_conn.close()
+
+        backfilled = await asyncio.to_thread(_backfill_in_thread)
         if backfilled:
             logger.info("fts_backfill=%d messages indexed", backfilled)
     except Exception:
