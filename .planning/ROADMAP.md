@@ -171,6 +171,16 @@ Plans:
 - [x] 999.1-03-PLAN.md — Daemon API: get_my_recent_activity + fragment-coverage branch in _list_messages
 - [x] 999.1-04-PLAN.md — MCP tool GetMyRecentActivity + ListDialogs/ListMessages AX fixes
 
+### Phase 999.1.1: unify-messages-table: merge activity_comments into messages, drop message_cache, add own_only status to synced_dialogs (INSERTED)
+
+**Goal:** [Urgent work - to be planned]
+**Requirements**: TBD
+**Depends on:** Phase 999.1
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (run /gsd-plan-phase 999.1.1 to break down)
+
 ### Phase 999.2: Saved Messages journal for sync events (BACKLOG)
 
 **Goal:** Send system events (access_lost, access_restored, re-enrollment, sync milestones) as Telegram messages to user's own "Saved Messages", making the MCP server self-reporting without requiring active polling of GetSyncAlerts.

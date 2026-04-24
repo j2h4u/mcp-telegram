@@ -21,11 +21,11 @@ progress:
 See: .planning/PROJECT.md (updated 2026-04-22)
 
 **Core value:** LLM can work with Telegram using natural names — zero cold-start friction
-**Current focus:** Phase 999.1 — track-own-group-messages-for-replies-and-reactions
+**Current focus:** Phase 999.1.1 — unify-messages-table
 
 ## Current Position
 
-Phase: 999.2
+Phase: 999.1.1
 Plan: Not started
 Status: Ready to plan
 Last activity: 2026-04-24
@@ -138,6 +138,7 @@ Key architectural constraint driving entire v1.5 design:
 
 ### Roadmap Evolution
 
+- Phase 999.1.1 inserted after Phase 999.1: unify messages table — merge activity_comments into messages, drop message_cache, add own_only status to synced_dialogs (INSERTED)
 - Phase 32 added: Complete daemon API migration — migrate GetUserInfo and ListUnreadMessages to daemon API, remove all direct Telegram imports from tools/
 - Phase 33 added: Consolidate all persistent state into daemon-owned sync.db — migrate entity_cache and analytics into sync.db, MCP server becomes fully stateless
 - Phase 35 added: Daemon API Feature Parity — eliminate sync.db vs on-demand dual path, normalize message format, wire pagination/filters/reactions/edit markers/topic labels/search context
