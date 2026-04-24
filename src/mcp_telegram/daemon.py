@@ -370,7 +370,24 @@ async def sync_main() -> None:
 
     client = create_client(catch_up=True)
     handler_manager: EventHandlerManager | None = None
-    unix_server = None
+
+    # Create API server and socket early so healthcheck and MCP tools get a
+    # meaningful "daemon_not_ready" response (with detail) instead of
+    # "connection refused" while Telegram is connecting.
+    api_server = DaemonAPIServer(conn, client, shutdown_event)
+    socket_path = get_daemon_socket_path()
+    socket_path.unlink(missing_ok=True)
+    old_umask = os.umask(0o177)
+    try:
+        unix_server = await asyncio.start_unix_server(
+            api_server.handle_client,
+            path=str(socket_path),
+            limit=2 * 1024 * 1024,
+        )
+    finally:
+        os.umask(old_umask)
+    os.chmod(socket_path, 0o600)
+    logger.info("daemon API listening on %s (not ready yet)", socket_path)
 
     # Local task set — scoped to this sync_main() invocation so that multiple
     # calls within the same process (e.g. in tests) never share stale tasks from
@@ -393,20 +410,21 @@ async def sync_main() -> None:
 
     try:
         try:
+            api_server.startup_detail = "connecting to Telegram"
             await client.connect()
         except (TimeoutError, OSError) as exc:
+            api_server.startup_detail = f"connection failed: {exc}"
             logger.error("sync-daemon connection failed: %s", exc, exc_info=True)
             conn.close()
             return
 
         logger.info("sync-daemon started — connected=%s", client.is_connected())
 
-        api_server = DaemonAPIServer(conn, client, shutdown_event)
-
         # Phase 39.1: cache authenticated user id once at startup so query-build
         # paths (Plan 39.1-02) can bind it as a SQL parameter without calling
         # Telethon per request. Failure propagates — daemon cannot serve reads
         # correctly without a stable self_id.
+        api_server.startup_detail = "fetching account info"
         me = await client.get_me()
         api_server.self_id = int(me.id)
         logger.info("daemon self_id cached: %s", api_server.self_id)
@@ -427,33 +445,25 @@ async def sync_main() -> None:
                 logger.info("backfilled out=1 on %d historical outgoing DM rows", cur.rowcount)
         except Exception:
             logger.warning("out=1 backfill skipped — non-fatal", exc_info=True)
-        socket_path = get_daemon_socket_path()
-        socket_path.unlink(missing_ok=True)
-        old_umask = os.umask(0o177)  # ensure socket created as 0o600 with no race
-        try:
-            unix_server = await asyncio.start_unix_server(
-                api_server.handle_client,
-                path=str(socket_path),
-                limit=2 * 1024 * 1024,
-            )
-        finally:
-            os.umask(old_umask)
-        os.chmod(socket_path, 0o600)  # belt-and-suspenders
-        logger.info("daemon API listening on %s", socket_path)
+        logger.info("daemon API ready on %s", socket_path)
 
         handler_manager = EventHandlerManager(client, conn, shutdown_event)
         handler_manager.register()
         logger.info("event handlers registered")
 
+        api_server.startup_detail = "running delta catch-up"
         delta_worker = DeltaSyncWorker(client, conn, shutdown_event)
         delta_new = await delta_worker.run_delta_catch_up()
         logger.info("delta_catch_up=%d new messages from gap-fill", delta_new)
 
+        api_server.startup_detail = "bootstrapping DMs"
         worker = FullSyncWorker(client, conn, shutdown_event)
         enrolled = await worker.bootstrap_dms()
         logger.info("dm_bootstrap complete — enrolled=%d", enrolled)
 
         handler_manager.refresh_synced_dialogs()
+        api_server._ready = True
+        logger.info("daemon ready — serving requests")
 
         # Background tasks — non-blocking, tracked for shutdown
         _create_tracked_task(
