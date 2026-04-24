@@ -57,9 +57,9 @@
       }
     },
     {
-      "_comment": "ListUnreadMessages — personal scope",
+      "_comment": "GetInbox — personal scope",
       "action": "call_tool",
-      "name": "ListUnreadMessages",
+      "name": "GetInbox",
       "arguments": {},
       "expect": {
         "is_error": false

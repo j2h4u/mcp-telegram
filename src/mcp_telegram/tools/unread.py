@@ -18,7 +18,7 @@ from ._base import (
 )
 
 
-class ListUnreadMessages(ToolArgs):
+class GetInbox(ToolArgs):
     """Fetch unread messages from personal chats and small groups, prioritized by tier.
 
     Priority tiers (lower = higher priority): @mentions in DMs, @mentions in groups,
@@ -60,10 +60,10 @@ class ListUnreadMessages(ToolArgs):
 
 
 @mcp_tool("primary", annotations=ToolAnnotations(readOnlyHint=True))
-async def list_unread_messages(args: ListUnreadMessages) -> ToolResult:
+async def get_inbox(args: GetInbox) -> ToolResult:
     try:
         async with daemon_connection() as conn:
-            response = await conn.list_unread_messages(
+            response = await conn.get_inbox(
                 scope=args.scope,
                 limit=args.limit,
                 group_size_threshold=args.group_size_threshold,

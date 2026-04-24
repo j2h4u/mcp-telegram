@@ -361,13 +361,13 @@ async def test_get_user_info_convenience() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Convenience method: list_unread_messages with explicit params
+# Convenience method: get_inbox with explicit params
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_list_unread_messages_convenience_explicit() -> None:
-    """list_unread_messages sends correct request dict with all explicit params."""
+async def test_get_inbox_convenience_explicit() -> None:
+    """get_inbox sends correct request dict with all explicit params."""
     reader = MagicMock(spec=asyncio.StreamReader)
     writer = MagicMock(spec=asyncio.StreamWriter)
     conn = DaemonConnection(reader, writer)
@@ -380,24 +380,24 @@ async def test_list_unread_messages_convenience_explicit() -> None:
 
     conn.request = _mock_request  # type: ignore[method-assign]
 
-    await conn.list_unread_messages(scope="all", limit=200, group_size_threshold=50)
+    await conn.get_inbox(scope="all", limit=200, group_size_threshold=50)
 
     assert len(captured) == 1
     req = captured[0]
-    assert req["method"] == "list_unread_messages"
+    assert req["method"] == "get_inbox"
     assert req["scope"] == "all"
     assert req["limit"] == 200
     assert req["group_size_threshold"] == 50
 
 
 # ---------------------------------------------------------------------------
-# Convenience method: list_unread_messages with default params
+# Convenience method: get_inbox with default params
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_list_unread_messages_convenience_defaults() -> None:
-    """list_unread_messages sends scope='personal', limit=100, group_size_threshold=100 by default."""
+async def test_get_inbox_convenience_defaults() -> None:
+    """get_inbox sends scope='personal', limit=100, group_size_threshold=100 by default."""
     reader = MagicMock(spec=asyncio.StreamReader)
     writer = MagicMock(spec=asyncio.StreamWriter)
     conn = DaemonConnection(reader, writer)
@@ -410,11 +410,11 @@ async def test_list_unread_messages_convenience_defaults() -> None:
 
     conn.request = _mock_request  # type: ignore[method-assign]
 
-    await conn.list_unread_messages()
+    await conn.get_inbox()
 
     assert len(captured) == 1
     req = captured[0]
-    assert req["method"] == "list_unread_messages"
+    assert req["method"] == "get_inbox"
     assert req["scope"] == "personal"
     assert req["limit"] == 100
     assert req["group_size_threshold"] == 100

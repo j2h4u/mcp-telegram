@@ -21,7 +21,7 @@ Deployed as a Docker container. MCP clients connect by running `docker exec -i m
 - `ListMessages` — read messages in a dialog (pagination, topic, sender, unread filters)
 - `SearchMessages` — full-text search within a dialog
 - `ListTopics` — list forum topics
-- `ListUnreadMessages` — fetch unread messages across chats, prioritized by tier
+- `GetInbox` — fetch unread messages across chats, prioritized by tier
 - `GetMyAccount` — authenticated user info
 - `GetUserInfo` — look up a user by name (fuzzy match)
 - `GetUsageStats` — local telemetry (last 30 days)

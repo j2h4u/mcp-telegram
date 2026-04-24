@@ -27,13 +27,14 @@ from .sync import (
     mark_dialog_for_sync,
 )
 from .activity import GetMyRecentActivity, get_my_recent_activity  # noqa: F401
-from .unread import ListUnreadMessages, list_unread_messages
+from .unread import GetInbox, get_inbox
 from .user_info import GetUserInfo, get_user_info
 
 __all__ = [
     "TOOL_REGISTRY",
     "DaemonNotRunningError",
     "GetDialogStats",
+    "GetInbox",
     "GetMyAccount",
     "GetMyRecentActivity",
     "GetSyncAlerts",
@@ -43,13 +44,13 @@ __all__ = [
     "ListDialogs",
     "ListMessages",
     "ListTopics",
-    "ListUnreadMessages",
     "MarkDialogForSync",
     "SearchMessages",
     "ToolArgs",
     "ToolResult",
     "daemon_connection",
     "get_dialog_stats",
+    "get_inbox",
     "get_my_account",
     "get_my_recent_activity",
     "get_sync_alerts",
@@ -59,7 +60,6 @@ __all__ = [
     "list_dialogs",
     "list_messages",
     "list_topics",
-    "list_unread_messages",
     "mark_dialog_for_sync",
     "mcp_tool",
     "search_messages",

@@ -53,7 +53,7 @@ writer; the MCP server opens `sync.db` read-only for lightweight queries.
 - `reading.py` — `ListMessages`, `SearchMessages`
 - `stats.py` — `GetUsageStats`, `GetDialogStats`
 - `sync.py` — `MarkDialogForSync`, `GetSyncStatus`, `GetSyncAlerts`
-- `unread.py` — `ListUnreadMessages`
+- `unread.py` — `GetInbox`
 - `user_info.py` — `GetUserInfo`
 
 Canonical tool registry: `tools/__init__.py`.

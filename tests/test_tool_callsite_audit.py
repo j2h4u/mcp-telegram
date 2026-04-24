@@ -178,7 +178,7 @@ async def test_reading_candidates_handled_without_silent_pick() -> None:
 
 @pytest.mark.xfail(
     reason=(
-        "src/mcp_telegram/tools/unread.py:56 — conn.list_unread_messages() called "
+        "src/mcp_telegram/tools/unread.py — conn.get_inbox() called "
         "with no dialog selector; no entity resolution at the tool layer"
     ),
     strict=False,
@@ -186,10 +186,10 @@ async def test_reading_candidates_handled_without_silent_pick() -> None:
 async def test_unread_candidates_handled() -> None:
     """tools/unread.py: Candidates unreachable at tool layer.
 
-    Evidence (unread.py line 56):
-        response = await conn.list_unread_messages(...)
+    Evidence:
+        response = await conn.get_inbox(...)
 
-    ListUnreadMessages takes no dialog= argument; it returns unread groups from
+    GetInbox takes no dialog= argument; it returns unread groups from
     the daemon. No entity resolution happens at the tool layer, so Candidates
     can never be received here.
     """
