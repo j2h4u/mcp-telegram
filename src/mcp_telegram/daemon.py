@@ -46,6 +46,7 @@ from telethon.tl.functions.messages import GetPeerDialogsRequest  # type: ignore
 from telethon.tl.types import InputDialogPeer  # type: ignore[import-untyped]
 
 from .daemon_api import DaemonAPIServer, get_daemon_socket_path
+from .activity_sync import run_activity_sync_loop
 from .delta_sync import DeltaSyncWorker, run_access_probe_loop
 from .event_handlers import EventHandlerManager
 from .fts import backfill_fts_index
@@ -469,6 +470,10 @@ async def sync_main() -> None:
         _create_tracked_task(
             run_access_probe_loop(client, conn, shutdown_event, delta_worker),
             name="access_probe_loop",
+        )
+        _create_tracked_task(
+            run_activity_sync_loop(client, conn, shutdown_event),
+            name="activity_sync_loop",
         )
 
         await _run_sync_loop(worker, handler_manager, shutdown_event, conn, client)
