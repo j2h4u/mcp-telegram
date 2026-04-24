@@ -227,6 +227,11 @@ class ListMessages(ToolArgs):
       `[peer read up to here]` — last outgoing the peer read.
       `[unread by peer]` — first outgoing on this page the peer has not read.
     Check the header first for triage, then inspect inline markers if reading the full history.
+
+    When this tool is called with `context_message_id` on a dialog that has not been fully
+    synced ("fragment" dialog), the daemon performs a targeted message fetch. In that case,
+    the response is prefixed with a `Coverage: fragment` header — treat the returned messages
+    as a snippet, NOT the full chat history.
     """
 
     dialog: str | None = Field(
@@ -439,6 +444,7 @@ async def list_messages(args: ListMessages) -> ToolResult:
     rows = data.get("messages", [])
     source = data.get("source", "unknown")
     next_nav = data.get("next_navigation")
+    coverage = data.get("coverage")
 
     # Phase 39.3: extract read_state + dialog_type from daemon response (absent
     # in pre-39.3 responses → backward compat: format_messages no-ops).
@@ -452,6 +458,16 @@ async def list_messages(args: ListMessages) -> ToolResult:
     source_note = f"[source: {source}]\n" if source else ""
     nav_note = f"\nnext_navigation: {next_nav}" if next_nav else ""
     result_text = warning + source_note + text + nav_note
+
+    # Phase 999.1: surface coverage='fragment' annotation when daemon returns it.
+    # Prepend a header so the agent knows the result is a point-fetched snippet,
+    # not the full chat history.
+    if coverage == "fragment":
+        fragment_header = (
+            "Coverage: fragment (partial — only point-fetched snippets; "
+            "full sync not performed on this dialog)."
+        )
+        result_text = f"{fragment_header}\n\n{result_text}"
 
     return ToolResult(
         content=_text_response(result_text),
