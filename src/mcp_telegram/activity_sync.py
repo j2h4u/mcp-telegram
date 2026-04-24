@@ -169,7 +169,20 @@ async def _run_backfill(
         return
 
     checkpoint = int(state.get("backfill_offset_id") or 0)
+
+    # Mark that backfill has started so scan_status can distinguish
+    # "never touched" from "running but not yet done".
+    with conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO activity_sync_state (key, value) VALUES ('backfill_started_at', ?)",
+            (str(int(time.time())),),
+        )
+
     logger.info("activity_sync_backfill_start offset_id=%d", checkpoint)
+
+    total_fetched = 0
+    total_known: int | None = None  # filled from result.count on first batch
+    batch_num = 0
 
     while not shutdown_event.is_set():
         try:
@@ -188,20 +201,31 @@ async def _run_backfill(
                 from_id=InputPeerSelf(),
             ))
         except FloodWaitError as exc:
-            logger.warning("activity_sync_floodwait seconds=%d", exc.seconds)
+            logger.warning(
+                "activity_sync_floodwait seconds=%d total_fetched=%d",
+                exc.seconds, total_fetched,
+            )
             try:
                 await asyncio.wait_for(shutdown_event.wait(), timeout=float(exc.seconds))
                 return
             except TimeoutError:
                 continue
 
+        if total_known is None:
+            total_known = getattr(result, "count", None)
+            if total_known is not None:
+                logger.info("activity_sync_backfill_total total=%d", total_known)
+
         batch = list(getattr(result, "messages", []) or [])
         if not batch:
             _set_state(conn, "backfill_complete", "1")
             _set_state(conn, "last_sync_at", str(int(time.time())))
-            logger.info("activity_sync_backfill_complete")
+            logger.info(
+                "activity_sync_backfill_complete total_fetched=%d", total_fetched,
+            )
             return
 
+        batch_num += 1
         rows = [r for r in (_message_to_row(m) for m in batch) if r is not None]
         with conn:
             if rows:
@@ -209,9 +233,21 @@ async def _run_backfill(
 
         _upsert_entities_from_search(conn, result)
 
+        total_fetched += len(batch)
         new_checkpoint = min(m.id for m in batch if getattr(m, "id", None) is not None)
         _set_state(conn, "backfill_offset_id", str(new_checkpoint))
         checkpoint = new_checkpoint
+
+        if total_known is not None:
+            logger.info(
+                "activity_sync_backfill_batch batch=%d fetched=%d total_fetched=%d/%d offset_id=%d",
+                batch_num, len(batch), total_fetched, total_known, checkpoint,
+            )
+        else:
+            logger.info(
+                "activity_sync_backfill_batch batch=%d fetched=%d total_fetched=%d offset_id=%d",
+                batch_num, len(batch), total_fetched, checkpoint,
+            )
 
         try:
             await asyncio.wait_for(shutdown_event.wait(), timeout=_BACKFILL_INTER_BATCH_PAUSE_S)
