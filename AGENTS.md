@@ -121,9 +121,13 @@ uv run python -m devtools.mcp_client.cli script \
   docker compose -f /opt/docker/mcp-telegram/docker-compose.yml up -d --build mcp-telegram
   ```
 
+## Ownership
+
+The agent owns the full development cycle end to end: writing code, running tests, rebuilding the container, verifying live behavior, and reporting results. Nothing is handed off to the operator for execution. If something requires a command to be run, the agent runs it.
+
 ## Runtime Discipline
 
-- After any runtime-affecting change: **the agent rebuilds the container and verifies** — this is not a handoff to the operator.
+- After any runtime-affecting change: rebuild the container and verify live behavior — do not hand off to the operator.
 - Do not mark work done until the restarted runtime exposes the expected behavior.
 - Green tests do not prove the live container is current — stale containers serve stale schemas.
 
