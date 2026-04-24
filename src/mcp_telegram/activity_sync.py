@@ -349,6 +349,8 @@ async def _run_incremental(
         inserted += len(batch)
         offset_id = min(m.id for m in batch if getattr(m, "id", None) is not None)
 
+        _set_state(conn, "last_sync_at", str(int(time.time())))
+
         try:
             await asyncio.wait_for(shutdown_event.wait(), timeout=_BACKFILL_INTER_BATCH_PAUSE_S)
             return
