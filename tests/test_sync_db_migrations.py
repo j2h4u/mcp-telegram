@@ -70,7 +70,7 @@ def test_migration_v11_does_not_touch_synced_dialogs(db_path: Path) -> None:
         conn.close()
 
 
-def test_schema_version_records_current(db_path: Path) -> None:
+def test_schema_version_records_current_v11(db_path: Path) -> None:
     ensure_sync_schema(db_path)
     conn = _open_sync_db(db_path)
     try:
@@ -140,7 +140,7 @@ def test_migration_v12_idempotent(db_path: Path) -> None:
         conn.close()
 
 
-def test_schema_version_records_current(db_path: Path) -> None:
+def test_schema_version_records_current_v12(db_path: Path) -> None:
     ensure_sync_schema(db_path)
     conn = _open_sync_db(db_path)
     try:
