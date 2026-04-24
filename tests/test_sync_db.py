@@ -1182,3 +1182,82 @@ def test_message_entities_pk_allows_same_offset_different_type(tmp_sync_db_path:
         assert types == {"mention", "hashtag"}
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Schema v14: activity_comments and activity_sync_state tables (Phase 999.1)
+# ---------------------------------------------------------------------------
+
+
+def test_migration_v14_activity_comments(tmp_path: Path) -> None:
+    """After ensure_sync_schema, activity_comments table exists with correct columns, PK, and index."""
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='activity_comments'"
+        ).fetchone()
+        assert row is not None, "activity_comments table not created"
+        cols = {r[1]: r[2] for r in conn.execute("PRAGMA table_info(activity_comments)").fetchall()}
+        assert cols == {
+            "dialog_id": "INTEGER",
+            "message_id": "INTEGER",
+            "sent_at": "INTEGER",
+            "text": "TEXT",
+            "reactions": "TEXT",
+            "reply_count": "INTEGER",
+            "last_synced_at": "INTEGER",
+        }
+        pk_rows = [r for r in conn.execute("PRAGMA table_info(activity_comments)").fetchall() if r[5] > 0]
+        pk_names = {r[1] for r in pk_rows}
+        assert pk_names == {"dialog_id", "message_id"}
+        idx = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_activity_comments_sent_at'"
+        ).fetchone()
+        assert idx is not None
+
+
+def test_migration_v14_activity_sync_state_seeded(tmp_path: Path) -> None:
+    """After migration, activity_sync_state contains exactly 3 seeded rows with correct values."""
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    with sqlite3.connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT key, value FROM activity_sync_state ORDER BY key"
+        ).fetchall()
+    assert rows == [
+        ("backfill_complete", "0"),
+        ("backfill_offset_id", "0"),
+        ("last_sync_at", None),
+    ]
+
+
+def test_migration_v14_idempotent(tmp_path: Path) -> None:
+    """Calling ensure_sync_schema twice keeps schema_version=14 and does not duplicate activity_sync_state rows."""
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    ensure_sync_schema(db_path)  # second run must be a no-op
+    with sqlite3.connect(db_path) as conn:
+        version = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
+        count = conn.execute("SELECT COUNT(*) FROM activity_sync_state").fetchone()[0]
+    assert version == 14
+    assert count == 3
+
+
+def test_migration_v14_preserves_existing_data(tmp_path: Path) -> None:
+    """v14 migration on a DB that already has synced_dialogs rows preserves those rows."""
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)  # migrate fresh to v14
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, ?)",
+            (12345, "synced"),
+        )
+        conn.commit()
+    # Re-run migration (simulating daemon restart)
+    ensure_sync_schema(db_path)
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT dialog_id, status FROM synced_dialogs WHERE dialog_id = 12345"
+        ).fetchone()
+    assert row == (12345, "synced")

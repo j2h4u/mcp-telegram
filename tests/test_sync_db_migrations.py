@@ -140,13 +140,13 @@ def test_migration_v12_idempotent(db_path: Path) -> None:
         conn.close()
 
 
-def test_schema_version_records_13(db_path: Path) -> None:
+def test_schema_version_records_current(db_path: Path) -> None:
     ensure_sync_schema(db_path)
     conn = _open_sync_db(db_path)
     try:
         row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
-        assert row[0] == 13
-        assert _CURRENT_SCHEMA_VERSION == 13
+        assert row[0] == _CURRENT_SCHEMA_VERSION
+        assert _CURRENT_SCHEMA_VERSION == 14
     finally:
         conn.close()
 
