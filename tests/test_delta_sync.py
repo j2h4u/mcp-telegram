@@ -725,3 +725,326 @@ async def test_backfill_respects_shutdown(sync_db, mock_client, shutdown_event):
 
     filled = await _backfill(mock_client, sync_db, shutdown_event)
     assert filled == 0  # exited before processing any
+
+
+# ---------------------------------------------------------------------------
+# D-01: Checkpoint skip + last_synced_at stamp
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_skip_recent_dialog(
+    mock_client: MagicMock,
+    sync_db: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """Dialog with last_synced_at within threshold is skipped — no iter_messages call."""
+    import time as _time
+
+    dialog_id = 6001
+    now = int(_time.time())
+
+    sync_db.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, last_synced_at) VALUES (?, 'synced', ?)",
+        (dialog_id, now - 60),  # 60s ago — well within 300s threshold
+    )
+    sync_db.execute(
+        "INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (?, 10, 1704067200)",
+        (dialog_id,),
+    )
+    sync_db.commit()
+
+    calls: list[Any] = []
+
+    async def _iter_messages(**kwargs: Any):
+        calls.append(kwargs)
+        return
+        yield
+
+    mock_client.iter_messages = _iter_messages
+
+    worker = make_worker(mock_client, sync_db, shutdown_event)
+    total = await worker.run_delta_catch_up()
+
+    assert total == 0
+    assert len(calls) == 0, "iter_messages must NOT be called for recently-synced dialog"
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_skip_null_last_synced_at(
+    mock_client: MagicMock,
+    sync_db: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """Dialog with last_synced_at=NULL is NOT skipped — must be probed."""
+    dialog_id = 6002
+
+    sync_db.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, last_synced_at) VALUES (?, 'synced', NULL)",
+        (dialog_id,),
+    )
+    sync_db.execute(
+        "INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (?, 10, 1704067200)",
+        (dialog_id,),
+    )
+    sync_db.commit()
+
+    calls: list[Any] = []
+
+    async def _iter_messages(**kwargs: Any):
+        calls.append(kwargs)
+        return
+        yield
+
+    mock_client.iter_messages = _iter_messages
+
+    worker = make_worker(mock_client, sync_db, shutdown_event)
+    await worker.run_delta_catch_up()
+
+    assert len(calls) == 1, "iter_messages MUST be called for dialog with NULL last_synced_at"
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_skip_stale_last_synced_at(
+    mock_client: MagicMock,
+    sync_db: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """Dialog with last_synced_at older than threshold is NOT skipped — must be probed."""
+    import time as _time
+
+    dialog_id = 6003
+    now = int(_time.time())
+
+    sync_db.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, last_synced_at) VALUES (?, 'synced', ?)",
+        (dialog_id, now - 3600),  # 1 hour ago — beyond 300s threshold
+    )
+    sync_db.execute(
+        "INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (?, 10, 1704067200)",
+        (dialog_id,),
+    )
+    sync_db.commit()
+
+    calls: list[Any] = []
+
+    async def _iter_messages(**kwargs: Any):
+        calls.append(kwargs)
+        return
+        yield
+
+    mock_client.iter_messages = _iter_messages
+
+    worker = make_worker(mock_client, sync_db, shutdown_event)
+    await worker.run_delta_catch_up()
+
+    assert len(calls) == 1, "iter_messages MUST be called for stale dialog (last_synced_at > threshold)"
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_skip_access_lost_not_selected(
+    mock_client: MagicMock,
+    sync_db: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """status='access_lost' dialog is never selected by delta catch-up (existing behavior)."""
+    import time as _time
+
+    dialog_id = 6004
+    now = int(_time.time())
+
+    # access_lost with very old last_synced_at — even if selected, should not be
+    sync_db.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, last_synced_at) VALUES (?, 'access_lost', ?)",
+        (dialog_id, now - 9999),
+    )
+    sync_db.execute(
+        "INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (?, 10, 1704067200)",
+        (dialog_id,),
+    )
+    sync_db.commit()
+
+    calls: list[Any] = []
+
+    async def _iter_messages(**kwargs: Any):
+        calls.append(kwargs)
+        return
+        yield
+
+    mock_client.iter_messages = _iter_messages
+
+    worker = make_worker(mock_client, sync_db, shutdown_event)
+    await worker.run_delta_catch_up()
+
+    assert len(calls) == 0, "access_lost dialog must never be selected for delta catch-up"
+
+
+@pytest.mark.asyncio
+async def test_fetch_delta_stamps_last_synced_at_on_success(
+    mock_client: MagicMock,
+    sync_db: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """fetch_delta_for_dialog stamps last_synced_at on success (both no-gap and gap paths)."""
+    import time as _time
+
+    dialog_id = 6005
+
+    sync_db.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, last_synced_at) VALUES (?, 'synced', NULL)",
+        (dialog_id,),
+    )
+    sync_db.execute(
+        "INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (?, 10, 1704067200)",
+        (dialog_id,),
+    )
+    sync_db.commit()
+
+    # Empty iterator — no-gap path
+    async def _iter_messages(**kwargs: Any):
+        return
+        yield
+
+    mock_client.iter_messages = _iter_messages
+
+    before = int(_time.time())
+    worker = make_worker(mock_client, sync_db, shutdown_event)
+    await worker.fetch_delta_for_dialog(dialog_id)
+    after = int(_time.time())
+
+    row = sync_db.execute(
+        "SELECT last_synced_at FROM synced_dialogs WHERE dialog_id = ?",
+        (dialog_id,),
+    ).fetchone()
+    assert row is not None
+    assert row[0] is not None, "last_synced_at must be set on success"
+    assert before <= row[0] <= after + 2, f"last_synced_at={row[0]} not in [{before}, {after+2}]"
+
+
+@pytest.mark.asyncio
+async def test_fetch_delta_stamps_last_synced_at_on_gap_filled(
+    mock_client: MagicMock,
+    sync_db: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """fetch_delta_for_dialog stamps last_synced_at when messages are actually fetched."""
+    import time as _time
+
+    dialog_id = 6006
+
+    sync_db.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, last_synced_at) VALUES (?, 'synced', NULL)",
+        (dialog_id,),
+    )
+    sync_db.execute(
+        "INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (?, 10, 1704067200)",
+        (dialog_id,),
+    )
+    sync_db.commit()
+
+    # Returns one message — gap-filled path
+    async def _iter_messages(**kwargs: Any):
+        yield build_mock_message(id=11, text="new msg")
+
+    mock_client.iter_messages = _iter_messages
+
+    before = int(_time.time())
+    worker = make_worker(mock_client, sync_db, shutdown_event)
+    result = await worker.fetch_delta_for_dialog(dialog_id)
+    after = int(_time.time())
+
+    assert result == 1
+    row = sync_db.execute(
+        "SELECT last_synced_at FROM synced_dialogs WHERE dialog_id = ?",
+        (dialog_id,),
+    ).fetchone()
+    assert row is not None
+    assert row[0] is not None, "last_synced_at must be set after gap fill"
+    assert before <= row[0] <= after + 2
+
+
+@pytest.mark.asyncio
+async def test_fetch_delta_no_stamp_on_floodwait(
+    mock_client: MagicMock,
+    sync_db: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """fetch_delta_for_dialog does NOT stamp last_synced_at when FloodWaitError fires."""
+    from telethon.errors import FloodWaitError as _FloodWaitError
+
+    dialog_id = 6007
+    original_ts = 1000
+
+    sync_db.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, last_synced_at) VALUES (?, 'synced', ?)",
+        (dialog_id, original_ts),
+    )
+    sync_db.execute(
+        "INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (?, 10, 1704067200)",
+        (dialog_id,),
+    )
+    sync_db.commit()
+
+    err = _FloodWaitError(request=None)
+    err.seconds = 1
+
+    async def _iter_messages(**kwargs: Any):
+        raise err
+        yield
+
+    mock_client.iter_messages = _iter_messages
+
+    worker = make_worker(mock_client, sync_db, shutdown_event)
+
+    async def _fast_wait_for(coro: Any, timeout: float) -> None:
+        raise TimeoutError
+
+    with patch("mcp_telegram.delta_sync.asyncio.wait_for", side_effect=_fast_wait_for):
+        await worker.fetch_delta_for_dialog(dialog_id)
+
+    row = sync_db.execute(
+        "SELECT last_synced_at FROM synced_dialogs WHERE dialog_id = ?",
+        (dialog_id,),
+    ).fetchone()
+    assert row[0] == original_ts, (
+        f"last_synced_at must NOT be updated on FloodWait; got {row[0]}, expected {original_ts}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_skip_emits_log(
+    mock_client: MagicMock,
+    sync_db: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+    caplog: Any,
+) -> None:
+    """run_delta_catch_up emits delta_catch_up_skip log for skipped dialogs."""
+    import time as _time
+
+    dialog_id = 6008
+    now = int(_time.time())
+
+    sync_db.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, last_synced_at) VALUES (?, 'synced', ?)",
+        (dialog_id, now - 30),
+    )
+    sync_db.execute(
+        "INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (?, 10, 1704067200)",
+        (dialog_id,),
+    )
+    sync_db.commit()
+
+    async def _iter_messages(**kwargs: Any):
+        return
+        yield
+
+    mock_client.iter_messages = _iter_messages
+
+    worker = make_worker(mock_client, sync_db, shutdown_event)
+    import logging
+    with caplog.at_level(logging.INFO, logger="mcp_telegram.delta_sync"):
+        await worker.run_delta_catch_up()
+
+    skip_logs = [r for r in caplog.records if "delta_catch_up_skip" in r.getMessage()]
+    assert len(skip_logs) == 1, f"Expected 1 skip log, got {len(skip_logs)}: {[r.getMessage() for r in caplog.records]}"
+    assert f"dialog_id={dialog_id}" in skip_logs[0].getMessage()
