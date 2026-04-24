@@ -36,6 +36,14 @@ class ListDialogs(ToolArgs):
 
     DM rows include integer 'unread_in' (incoming unread by me) and 'unread_out' (outgoing
     unread by peer); non-DM rows omit both fields.
+
+    sync_status values:
+      - 'not_synced'  — no bulk fetch attempted
+      - 'syncing'     — bulk fetch in progress
+      - 'synced'      — full history mirrored locally, real-time events active
+      - 'access_lost' — account no longer has access; read-only snapshot
+      - 'fragment'    — no full sync; only point-fetched snippets from targeted
+                        ListMessages(context_message_id=...) calls (Phase 999.1)
     """
 
     exclude_archived: bool = False
