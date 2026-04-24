@@ -321,6 +321,7 @@ async def _run_incremental(
             logger.warning("activity_sync_incremental_floodwait seconds=%d", exc.seconds)
             try:
                 await asyncio.wait_for(shutdown_event.wait(), timeout=float(exc.seconds))
+                return  # shutdown fired during flood wait — exit cleanly
             except TimeoutError:
                 continue
 
