@@ -161,7 +161,7 @@ Full details: `.planning/milestones/v1.5-ROADMAP.md`
 - Telegram desktop/mobile "Replies" chat is insufficient — no reactions, incomplete coverage
 
 **Requirements:** D-01, D-02, D-03, D-04, D-05, D-06, D-07, D-08, D-09 (design decisions, see 999.1-CONTEXT.md)
-**Plans:** 3/4 plans executed
+**Plans:** 4/4 plans complete
 
 **Prerequisites:** None — uses Telegram's global `messages.search(from_id=self)` API instead of full group sync.
 
@@ -169,7 +169,7 @@ Plans:
 - [x] 999.1-01-PLAN.md — Schema v14 migration: activity_comments + activity_sync_state tables
 - [x] 999.1-02-PLAN.md — ActivitySyncLoop daemon task: backfill + incremental + FloodWait handling
 - [x] 999.1-03-PLAN.md — Daemon API: get_my_recent_activity + fragment-coverage branch in _list_messages
-- [ ] 999.1-04-PLAN.md — MCP tool GetMyRecentActivity + ListDialogs/ListMessages AX fixes
+- [x] 999.1-04-PLAN.md — MCP tool GetMyRecentActivity + ListDialogs/ListMessages AX fixes
 
 ### Phase 999.2: Saved Messages journal for sync events (BACKLOG)
 
