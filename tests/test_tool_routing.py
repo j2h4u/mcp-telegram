@@ -1589,7 +1589,7 @@ async def test_get_my_recent_activity_in_progress_header():
 
 
 async def test_get_my_recent_activity_formats_comment_block():
-    """GetMyRecentActivity renders dialog/time/text + nav line (no reactions/replies after v15)."""
+    """GetMyRecentActivity renders dialog/time/text + nav line; no reactions line when absent."""
     from mcp_telegram.tools.activity import GetMyRecentActivity, get_my_recent_activity
 
     conn = _make_daemon_conn(
@@ -1617,7 +1617,40 @@ async def test_get_my_recent_activity_formats_comment_block():
     assert "hi" in text
     assert "nav: dialog_id=42 message_id=100" in text
     assert "reactions:" not in text
-    assert "replies:" not in text
+
+
+async def test_get_my_recent_activity_renders_reactions():
+    """GetMyRecentActivity shows reactions line when reactions are present."""
+    from mcp_telegram.tools.activity import GetMyRecentActivity, get_my_recent_activity
+
+    conn = _make_daemon_conn(
+        {
+            "ok": True,
+            "data": {
+                "comments": [
+                    {
+                        "dialog_id": 42,
+                        "message_id": 100,
+                        "sent_at": 1_700_000_000,
+                        "text": "hi",
+                        "dialog_name": "X",
+                        "reactions": [
+                            {"emoji": "🔥", "count": 3},
+                            {"emoji": "❤", "count": 1},
+                        ],
+                    },
+                ],
+                "scan_status": "complete",
+                "scanned_at": 1_700_003_600,
+            },
+        }
+    )
+    with _patch_daemon(conn):
+        result = await get_my_recent_activity(GetMyRecentActivity())
+    text = result[0].text
+    assert "reactions:" in text
+    assert "🔥×3" in text
+    assert "❤×1" in text
 
 
 async def test_list_messages_fragment_coverage_header():
