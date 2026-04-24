@@ -1034,7 +1034,8 @@ class DaemonAPIServer:
     ) -> str | None:
         """Encode a next-page navigation token if the result set is full."""
         if messages and len(messages) == limit:
-            last_msg_id = messages[-1].message_id
+            last = messages[-1]
+            last_msg_id = last["message_id"] if isinstance(last, dict) else last.message_id
             logger.debug(
                 "list_messages_pagination anchor_msg_id=%d dialog_id=%d direction=%s%s",
                 last_msg_id,
