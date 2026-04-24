@@ -840,7 +840,7 @@ class DaemonAPIServer:
         try:
             entity = await self._client.get_entity(dialog)
             return int(telethon_utils.get_peer_id(entity))
-        except ValueError, KeyError:
+        except (ValueError, KeyError):
             pass
         except Exception:
             logger.debug("get_entity failed for %r, falling back to entities DB", dialog, exc_info=True)
