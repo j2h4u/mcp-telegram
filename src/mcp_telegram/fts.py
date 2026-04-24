@@ -104,13 +104,16 @@ def backfill_fts_index(conn: sqlite3.Connection) -> int:
     if msg_count == 0 or fts_count >= msg_count:
         return 0
 
-    rows = conn.execute(
-        "SELECT m.dialog_id, m.message_id, m.text "
-        "FROM messages m "
-        "LEFT JOIN messages_fts f "
-        "  ON f.dialog_id = m.dialog_id AND f.message_id = m.message_id "
-        "WHERE m.is_deleted = 0 AND f.message_id IS NULL"
+    # Avoid LEFT JOIN against FTS5 — the FTS virtual table has no B-tree index
+    # for the planner, making a JOIN O(n*m). Instead: fetch both key sets into
+    # Python, compute the difference, then load text only for missing rows.
+    fts_keys: set[tuple[int, int]] = set(
+        conn.execute("SELECT dialog_id, message_id FROM messages_fts").fetchall()
+    )
+    all_rows = conn.execute(
+        "SELECT dialog_id, message_id, text FROM messages WHERE is_deleted = 0"
     ).fetchall()
+    rows = [(d, m, t) for d, m, t in all_rows if (d, m) not in fts_keys]
 
     if not rows:
         return 0
