@@ -90,4 +90,10 @@ def create_client(
         settings.api_hash,
         base_logger="telethon",
         catch_up=catch_up,
+        # flood_sleep_threshold=0: always propagate FloodWaitError to our code.
+        # Our DeltaSyncWorker and activity_sync loops have explicit FloodWait
+        # handlers with interruptible sleeps; Telethon's built-in auto-sleep
+        # would otherwise block all requests sharing the same CONSTRUCTOR_ID
+        # globally (D-03 expert panel).
+        flood_sleep_threshold=0,
     )
