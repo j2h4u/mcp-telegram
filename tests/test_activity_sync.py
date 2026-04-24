@@ -142,7 +142,7 @@ async def test_backfill_floodwait_recovers(tmp_path):
 @pytest.mark.asyncio
 async def test_incremental_only_new_messages(tmp_path):
     conn = _make_db(tmp_path)
-    # Mark backfill complete, pre-seed one row
+    # Mark backfill complete, pre-seed one row with message_id=50
     with conn:
         conn.execute("UPDATE activity_sync_state SET value='1' WHERE key='backfill_complete'")
         conn.execute(
@@ -151,9 +151,13 @@ async def test_incremental_only_new_messages(tmp_path):
             (42, 50, 1000, "old", None, 0, 1000),
         )
 
+    # Incremental uses SearchRequest(min_id=50) — only messages with id > 50 come back.
+    # First batch: id=51. Second batch: empty → done.
     new_msg = _msg(51, 42, 2000, text="new")
-    old_msg = _msg(49, 42, 900, text="skip")  # should break the loop
-    client = _FakeClient(batches=[], iter_msgs=[new_msg, old_msg])
+    client = _FakeClient(batches=[
+        FakeSearchResult(messages=[new_msg]),
+        FakeSearchResult(messages=[]),
+    ])
     shutdown = asyncio.Event()
     await _run_incremental(client, conn, shutdown)
 
@@ -164,26 +168,28 @@ async def test_incremental_only_new_messages(tmp_path):
 @pytest.mark.asyncio
 async def test_incremental_skipped_before_backfill_complete(tmp_path):
     conn = _make_db(tmp_path)
-    client = _FakeClient(batches=[], iter_msgs=[_msg(100, 42, 1_700_000_000)])
+    # Client should never be called — backfill not complete.
+    client = _FakeClient(batches=[FakeSearchResult(messages=[_msg(100, 42, 1_700_000_000)])])
     shutdown = asyncio.Event()
     await _run_incremental(client, conn, shutdown)
     count = conn.execute("SELECT COUNT(*) FROM activity_comments").fetchone()[0]
     assert count == 0
+    assert client.calls == 0
 
 
 @pytest.mark.asyncio
 async def test_incremental_skipped_when_activity_empty(tmp_path):
-    """W5: backfill may complete with zero own messages — incremental must no-op."""
+    """W5: backfill complete but no rows in activity_comments — incremental must no-op."""
     conn = _make_db(tmp_path)
     with conn:
         conn.execute("UPDATE activity_sync_state SET value='1' WHERE key='backfill_complete'")
-    # iter_messages should never be awaited — verify by supplying an iterator that
-    # would insert a row if touched.
-    client = _FakeClient(batches=[], iter_msgs=[_msg(100, 42, 1_700_000_000)])
+    # Client should never be called — max_message_id == 0.
+    client = _FakeClient(batches=[FakeSearchResult(messages=[_msg(100, 42, 1_700_000_000)])])
     shutdown = asyncio.Event()
     await _run_incremental(client, conn, shutdown)
     count = conn.execute("SELECT COUNT(*) FROM activity_comments").fetchone()[0]
     assert count == 0
+    assert client.calls == 0
 
 
 @pytest.mark.asyncio

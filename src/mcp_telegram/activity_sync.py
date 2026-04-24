@@ -282,32 +282,53 @@ async def _run_incremental(
     if state.get("backfill_complete") != "1":
         return
 
-    row = conn.execute("SELECT MAX(sent_at) FROM activity_comments").fetchone()
-    max_sent_at = int(row[0]) if row and row[0] is not None else 0
+    row = conn.execute("SELECT MAX(message_id) FROM activity_comments").fetchone()
+    max_message_id = int(row[0]) if row and row[0] is not None else 0
 
-    # W5: If activity_comments is empty (backfill just flipped to complete but no
-    # own messages exist for this account), skip the iteration entirely.
-    if max_sent_at == 0:
+    # W5: empty archive → nothing to anchor on, skip.
+    if max_message_id == 0:
         return
 
     inserted = 0
-    try:
-        async for msg in client.iter_messages(entity=None, from_user="me"):
-            if shutdown_event.is_set():
-                break
-            sent_at = int(msg.date.timestamp()) if getattr(msg, "date", None) else 0
-            if sent_at <= max_sent_at:
-                break
-            r = _message_to_row(msg)
-            if r is None:
-                continue
-            with conn:
-                conn.execute(INSERT_ACTIVITY_SQL, r)
-            inserted += 1
-    except FloodWaitError as exc:
-        logger.warning("activity_sync_incremental_floodwait seconds=%d", exc.seconds)
+    offset_id = 0  # start from newest
+    while not shutdown_event.is_set():
         try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=float(exc.seconds))
+            result = await client(SearchRequest(
+                peer=InputPeerEmpty(),
+                q="",
+                filter=InputMessagesFilterEmpty(),
+                min_date=None,
+                max_date=None,
+                offset_id=offset_id,
+                add_offset=0,
+                limit=_BACKFILL_BATCH_LIMIT,
+                max_id=0,
+                min_id=max_message_id,  # only messages newer than our last known
+                hash=0,
+                from_id=InputPeerSelf(),
+            ))
+        except FloodWaitError as exc:
+            logger.warning("activity_sync_incremental_floodwait seconds=%d", exc.seconds)
+            try:
+                await asyncio.wait_for(shutdown_event.wait(), timeout=float(exc.seconds))
+            except TimeoutError:
+                continue
+
+        batch = list(getattr(result, "messages", []) or [])
+        if not batch:
+            break
+
+        rows = [r for r in (_message_to_row(m) for m in batch) if r is not None]
+        with conn:
+            if rows:
+                conn.executemany(INSERT_ACTIVITY_SQL, rows)
+        _upsert_entities_from_search(conn, result)
+        inserted += len(batch)
+        offset_id = min(m.id for m in batch if getattr(m, "id", None) is not None)
+
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=_BACKFILL_INTER_BATCH_PAUSE_S)
+            return
         except TimeoutError:
             pass
 
