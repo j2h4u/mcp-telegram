@@ -358,13 +358,6 @@ async def sync_main() -> None:
     conn = _open_sync_db(db_path)
     migrate_legacy_databases(conn, db_path.parent)
 
-    try:
-        backfilled = backfill_fts_index(conn)
-        if backfilled:
-            logger.info("fts_backfill=%d messages indexed", backfilled)
-    except sqlite3.OperationalError:
-        logger.warning("fts_backfill failed — FTS search may be incomplete until next restart", exc_info=True)
-
     loop = asyncio.get_running_loop()
     shutdown_event = register_shutdown_handler(conn, loop)
 
@@ -388,6 +381,18 @@ async def sync_main() -> None:
         os.umask(old_umask)
     os.chmod(socket_path, 0o600)
     logger.info("daemon API listening on %s (not ready yet)", socket_path)
+
+    # FTS backfill runs in a thread pool (stemming is CPU-bound) so it doesn't
+    # block the event loop. Awaited here — before Telegram connect — so the
+    # socket is already up and responding "not ready / indexing messages for
+    # search" while we work. Total startup time = FTS time + Telegram time.
+    api_server.startup_detail = "indexing messages for search"
+    try:
+        backfilled = await asyncio.to_thread(backfill_fts_index, conn)
+        if backfilled:
+            logger.info("fts_backfill=%d messages indexed", backfilled)
+    except Exception:
+        logger.warning("fts_backfill failed — FTS search may be incomplete until next restart", exc_info=True)
 
     # Local task set — scoped to this sync_main() invocation so that multiple
     # calls within the same process (e.g. in tests) never share stale tasks from
