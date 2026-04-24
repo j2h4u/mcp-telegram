@@ -306,6 +306,26 @@ class DaemonConnection:
             }
         )
 
+    async def get_my_recent_activity(
+        self,
+        *,
+        since_hours: int = 168,
+        limit: int = 500,
+    ) -> dict:
+        """Return recent activity_comments with scan_status from the daemon.
+
+        Args:
+            since_hours: Look-back window in hours (clamped 1–8760 server-side).
+            limit: Maximum comments to return (clamped 1–2000 server-side).
+        """
+        return await self.request(
+            {
+                "method": "get_my_recent_activity",
+                "since_hours": int(since_hours),
+                "limit": int(limit),
+            }
+        )
+
 
 # ---------------------------------------------------------------------------
 # Context manager
