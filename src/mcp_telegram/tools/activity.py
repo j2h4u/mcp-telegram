@@ -48,10 +48,15 @@ def _format_block(comment: dict[str, Any]) -> str:
     dt = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
     dialog_name = comment.get("dialog_name") or str(comment.get("dialog_id", "?"))
     text = (comment.get("text") or "").replace("\n", " ")
-    return (
+    block = (
         f"[{dialog_name}] {dt}  {text}\n"
         f"  nav: dialog_id={comment.get('dialog_id')} message_id={comment.get('message_id')}"
     )
+    reactions = comment.get("reactions") or []
+    if reactions:
+        rx_str = "  ".join(f"{r['emoji']}×{r['count']}" for r in reactions)
+        block += f"\n  reactions: {rx_str}"
+    return block
 
 
 @mcp_tool("primary", annotations=ToolAnnotations(readOnlyHint=True))

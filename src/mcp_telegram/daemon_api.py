@@ -2663,6 +2663,22 @@ class DaemonAPIServer:
         else:
             scan_status = "never_run"
 
+        reactions_by_msg: dict[tuple[int, int], list[dict]] = {}
+        if rows:
+            rx_params: list[int] = []
+            for r in rows:
+                rx_params.extend([r[0], r[1]])
+            rx_placeholders = ",".join("(?,?)" for _ in rows)
+            for rx in self._conn.execute(
+                f"SELECT dialog_id, message_id, emoji, count FROM message_reactions "
+                f"WHERE (dialog_id, message_id) IN (VALUES {rx_placeholders}) "
+                f"ORDER BY count DESC",
+                rx_params,
+            ).fetchall():
+                reactions_by_msg.setdefault((rx[0], rx[1]), []).append(
+                    {"emoji": rx[2], "count": rx[3]}
+                )
+
         comments = [
             {
                 "dialog_id": r[0],
@@ -2670,6 +2686,7 @@ class DaemonAPIServer:
                 "sent_at": r[2],
                 "text": r[3],
                 "dialog_name": r[4] if r[4] else str(r[0]),
+                "reactions": reactions_by_msg.get((r[0], r[1]), []),
             }
             for r in rows
         ]
