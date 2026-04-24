@@ -1417,7 +1417,27 @@ class DaemonAPIServer:
 
         if context_message_id is not None:
             row = self._conn.execute(_SELECT_SYNC_STATUS_SQL, (dialog_id,)).fetchone()
-            if row is None or row[0] not in ("synced", "syncing"):
+            current_status = row[0] if row else None
+
+            # Phase 999.1 (D-07): Fragment-dialog branch. If the dialog is not fully
+            # synced, perform a targeted getMessages fetch, cache into messages,
+            # then serve the context window from sync.db with coverage='fragment'.
+            if current_status in (None, "not_synced", "fragment"):
+                await self._fetch_fragment_context(dialog_id, context_message_id)
+                result = await self._list_messages_context_window(
+                    dialog_id=dialog_id,
+                    anchor_message_id=context_message_id,
+                    context_size=context_size,
+                )
+                # Annotate coverage on the response payload.
+                data = result.get("data") if isinstance(result.get("data"), dict) else None
+                if data is not None:
+                    data["coverage"] = "fragment"
+                else:
+                    result["coverage"] = "fragment"
+                return result
+
+            if current_status not in ("synced", "syncing"):
                 return {
                     "ok": False,
                     "error": "not_synced",
@@ -2494,6 +2514,76 @@ class DaemonAPIServer:
                 "top_forwards": forwards,
             },
         }
+
+    # ------------------------------------------------------------------
+    # _fetch_fragment_context (helper for _list_messages fragment branch)
+    # ------------------------------------------------------------------
+
+    async def _fetch_fragment_context(
+        self, dialog_id: int, anchor_message_id: int
+    ) -> None:
+        """Targeted getMessages around an anchor; caches into messages table.
+
+        Per D-08: default context window is 5 messages AFTER the anchor.
+        Fragment dialog row is INSERT OR IGNORE (never overwrites 'synced').
+        """
+        # Ensure synced_dialogs row exists with status='fragment' (idempotent).
+        with self._conn:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO synced_dialogs (dialog_id, status) VALUES (?, 'fragment')",
+                (dialog_id,),
+            )
+
+        try:
+            ids = list(range(anchor_message_id, anchor_message_id + 6))  # anchor + 5 after
+            entity = await self._client.get_input_entity(dialog_id)
+            fetched = await self._client.get_messages(entity, ids=ids)
+        except Exception:
+            logger.warning(
+                "fragment_fetch_failed dialog_id=%s anchor=%s",
+                dialog_id, anchor_message_id, exc_info=True,
+            )
+            return
+
+        # Upsert into messages using existing sync_worker helpers.
+        # ExtractedMessage.message is a StoredMessage dataclass — bind via asdict().
+        from dataclasses import asdict
+
+        from .sync_worker import (
+            INSERT_MESSAGE_SQL,
+            extract_message_row,
+            extract_reactions_rows,
+        )
+
+        stored_msgs = []
+        reaction_rows_all = []
+        for msg in fetched:
+            if msg is None:
+                continue
+            extracted = extract_message_row(dialog_id, msg)
+            if extracted is None:
+                continue
+            # Use .message field (StoredMessage dataclass), not the deprecated .row attribute.
+            stored_msgs.append(extracted.message)
+            reactions = extract_reactions_rows(dialog_id, msg.id, getattr(msg, "reactions", None))
+            reaction_rows_all.extend(reactions)
+
+        if not stored_msgs:
+            return
+
+        with self._conn:
+            # INSERT_MESSAGE_SQL uses named params bound to StoredMessage field names.
+            self._conn.executemany(
+                INSERT_MESSAGE_SQL,
+                [asdict(m) for m in stored_msgs],
+            )
+            # message_reactions upsert: mirror sync_worker pattern exactly.
+            if reaction_rows_all:
+                self._conn.executemany(
+                    "INSERT OR REPLACE INTO message_reactions "
+                    "(dialog_id, message_id, emoji, count) VALUES (?, ?, ?, ?)",
+                    [(r.dialog_id, r.message_id, r.emoji, r.count) for r in reaction_rows_all],
+                )
 
     # ------------------------------------------------------------------
     # get_my_recent_activity
