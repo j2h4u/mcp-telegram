@@ -26,6 +26,7 @@ from .sync import (
     get_sync_status,
     mark_dialog_for_sync,
 )
+from .activity import GetMyRecentActivity, get_my_recent_activity  # noqa: F401
 from .unread import ListUnreadMessages, list_unread_messages
 from .user_info import GetUserInfo, get_user_info
 
@@ -34,6 +35,7 @@ __all__ = [
     "DaemonNotRunningError",
     "GetDialogStats",
     "GetMyAccount",
+    "GetMyRecentActivity",
     "GetSyncAlerts",
     "GetSyncStatus",
     "GetUsageStats",
@@ -49,6 +51,7 @@ __all__ = [
     "daemon_connection",
     "get_dialog_stats",
     "get_my_account",
+    "get_my_recent_activity",
     "get_sync_alerts",
     "get_sync_status",
     "get_usage_stats",
