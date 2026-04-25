@@ -167,3 +167,89 @@ def test_migration_v12_does_not_drop_inbox_column(db_path: Path) -> None:
         assert row[0] == 123
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# v16: entity_details sibling table (Phase 47-01)
+# ---------------------------------------------------------------------------
+
+
+def test_schema_v16_creates_entity_details(tmp_path: Path) -> None:
+    """v16 creates the entity_details sibling table per CONTEXT D-01."""
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    with sqlite3.connect(db_path) as conn:
+        cols = {(r[1], r[2]) for r in conn.execute(
+            "PRAGMA table_info(entity_details)"
+        ).fetchall()}
+    assert cols == {
+        ("entity_id", "INTEGER"),
+        ("detail_json", "TEXT"),
+        ("fetched_at", "INTEGER"),
+    }, f"entity_details columns mismatch: {cols}"
+
+
+def test_schema_v16_creates_fetched_at_index(tmp_path: Path) -> None:
+    """v16 adds an index on entity_details.fetched_at for future eviction sweeps (D-04)."""
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    with sqlite3.connect(db_path) as conn:
+        idx = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='entity_details'"
+        ).fetchall()}
+    assert "idx_entity_details_fetched_at" in idx
+
+
+def test_migration_v16_fk_cascade_deletes_detail_row(tmp_path: Path) -> None:
+    """Deleting an entities row CASCADES to delete the matching entity_details row."""
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("PRAGMA foreign_keys = ON")  # SQLite defaults FKs OFF per connection
+        conn.execute(
+            "INSERT INTO entities (id, type, name, updated_at) "
+            "VALUES (?, ?, ?, ?)",
+            (42, 'user', 'Alice', 1000),
+        )
+        conn.execute(
+            "INSERT INTO entity_details (entity_id, detail_json, fetched_at) "
+            "VALUES (?, ?, ?)",
+            (42, '{"schema": 1, "type": "user"}', 1000),
+        )
+        conn.commit()
+        assert conn.execute(
+            "SELECT COUNT(*) FROM entity_details WHERE entity_id=42"
+        ).fetchone()[0] == 1
+        conn.execute("DELETE FROM entities WHERE id = 42")
+        conn.commit()
+        assert conn.execute(
+            "SELECT COUNT(*) FROM entity_details WHERE entity_id=42"
+        ).fetchone()[0] == 0, "FK CASCADE failed"
+
+
+def test_migration_v16_idempotent(tmp_path: Path) -> None:
+    """Running ensure_sync_schema twice is a no-op — schema_version has 16 rows, MAX=16."""
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    ensure_sync_schema(db_path)  # second call must be a no-op
+    with sqlite3.connect(db_path) as conn:
+        count = conn.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0]
+        max_v = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
+    assert count == 16
+    assert max_v == 16
+
+
+def test_migration_v16_does_not_touch_entities_columns(tmp_path: Path) -> None:
+    """SPEC Constraint #4: v16 does NOT widen the entities table.
+
+    The exact column set must remain {id, type, name, username, name_normalized, updated_at}.
+    """
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    with sqlite3.connect(db_path) as conn:
+        cols = {r[1] for r in conn.execute(
+            "PRAGMA table_info(entities)"
+        ).fetchall()}
+    assert cols == {"id", "type", "name", "username", "name_normalized", "updated_at"}, (
+        f"entities columns must not change in v16; got {cols}"
+    )
