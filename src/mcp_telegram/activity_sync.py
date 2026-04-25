@@ -155,6 +155,29 @@ def _fmt_duration(seconds: int) -> str:
     return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
 
 
+async def _call_with_timeout(client: Any, request: Any) -> Any:
+    """Invoke a Telethon RPC with a hard timeout and abandon on overrun.
+
+    asyncio.wait_for awaits the wrapped task to actually finish after
+    cancellation. Telethon's MTProto futures sometimes never resolve
+    (post-startup flood wait corridor), causing wait_for to hang
+    indefinitely past the requested deadline.
+
+    asyncio.wait + explicit cancel returns immediately on timeout;
+    the abandoned task is left to complete (or be GC'd) in the background
+    rather than blocking our control flow.
+
+    Raises TimeoutError on overrun. Re-raises FloodWaitError and other
+    exceptions surfaced by the RPC call.
+    """
+    task = asyncio.create_task(client(request))
+    done, _pending = await asyncio.wait({task}, timeout=_SEARCH_RPC_TIMEOUT_S)
+    if not done:
+        task.cancel()
+        raise TimeoutError(f"RPC exceeded {_SEARCH_RPC_TIMEOUT_S}s deadline")
+    return task.result()
+
+
 async def _run_backfill(
     client: Any,
     conn: sqlite3.Connection,
@@ -184,8 +207,9 @@ async def _run_backfill(
 
     while not shutdown_event.is_set():
         try:
-            result = await asyncio.wait_for(
-                client(SearchRequest(
+            result = await _call_with_timeout(
+                client,
+                SearchRequest(
                     peer=InputPeerEmpty(),
                     q="",
                     filter=InputMessagesFilterEmpty(),
@@ -198,8 +222,7 @@ async def _run_backfill(
                     min_id=0,
                     hash=0,
                     from_id=InputPeerSelf(),
-                )),
-                timeout=_SEARCH_RPC_TIMEOUT_S,
+                ),
             )
         except FloodWaitError as exc:
             logger.warning(
@@ -321,8 +344,9 @@ async def _run_incremental(
     offset_id = 0  # start from newest
     while not shutdown_event.is_set():
         try:
-            result = await asyncio.wait_for(
-                client(SearchRequest(
+            result = await _call_with_timeout(
+                client,
+                SearchRequest(
                     peer=InputPeerEmpty(),
                     q="",
                     filter=InputMessagesFilterEmpty(),
@@ -335,8 +359,7 @@ async def _run_incremental(
                     min_id=0,
                     hash=0,
                     from_id=InputPeerSelf(),
-                )),
-                timeout=_SEARCH_RPC_TIMEOUT_S,
+                ),
             )
         except FloodWaitError as exc:
             logger.warning("activity_sync_incremental_floodwait seconds=%d", exc.seconds)
