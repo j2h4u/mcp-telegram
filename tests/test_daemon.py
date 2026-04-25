@@ -71,8 +71,9 @@ def test_sync_main_connects_and_heartbeats(
         return shutdown_event
 
     def heartbeat_then_shutdown(*args):
-        _log_heartbeat(*args)
+        result = _log_heartbeat(*args)
         shutdown_event.set()
+        return result  # caller unpacks (msg_count, mono) — patched mock must propagate
 
     with (
         patch("mcp_telegram.daemon.create_client", return_value=mock_client),
@@ -209,8 +210,9 @@ def test_sync_main_heartbeat_logs_connection_state(
         return shutdown_event
 
     def heartbeat_then_shutdown(*args):
-        _log_heartbeat(*args)
+        result = _log_heartbeat(*args)
         shutdown_event.set()
+        return result  # caller unpacks (msg_count, mono) — patched mock must propagate
 
     with (
         patch("mcp_telegram.daemon.create_client", return_value=mock_client),

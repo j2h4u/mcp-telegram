@@ -225,25 +225,42 @@ async def _initialize_read_positions(
 # ---------------------------------------------------------------------------
 
 
-def _log_heartbeat(conn: sqlite3.Connection, client: Any, sync_start: float) -> None:
-    """Log heartbeat with sync stats, rate, and ETA from sync.db."""
+def _log_heartbeat(
+    conn: sqlite3.Connection,
+    client: Any,
+    sync_start: float,
+    prev_msg_count: int,
+    prev_mono: float,
+) -> tuple[int, float]:
+    """Log heartbeat with sync stats, interval-based rate, and ETA from sync.db.
+
+    Rate is computed over the heartbeat interval (since the last call), not
+    since daemon startup — so an idle daemon shows 0msg/s instead of a stale
+    decaying lifetime average.
+
+    Returns (current_msg_count, current_mono) for the caller to feed into the
+    next invocation.
+    """
     try:
         stats = dict(conn.execute("SELECT status, COUNT(*) FROM synced_dialogs GROUP BY status").fetchall())
-        msg_count = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+        msg_count = int(conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0])
     except Exception:
         logger.warning("heartbeat_stats_failed", exc_info=True)
         stats = {}
         msg_count = 0
-    synced = stats.get("synced", 0)
-    syncing = stats.get("syncing", 0)
-    total = synced + syncing + stats.get("not_synced", 0)
+    synced = int(stats.get("synced", 0) or 0)
+    syncing = int(stats.get("syncing", 0) or 0)
+    total = synced + syncing + int(stats.get("not_synced", 0) or 0)
 
-    elapsed = time.monotonic() - sync_start
-    rate = msg_count / elapsed if elapsed > 0 else 0
+    now_mono = time.monotonic()
+    interval = now_mono - prev_mono
+    delta = max(0, msg_count - int(prev_msg_count or 0))
+    rate = delta / interval if interval > 0 else 0.0
 
     eta_str = ""
     if synced > 0 and synced < total:
         remaining = total - synced
+        elapsed = now_mono - sync_start
         secs_per_dialog = elapsed / synced
         eta_secs = int(remaining * secs_per_dialog)
         if eta_secs >= 3600:
@@ -264,6 +281,7 @@ def _log_heartbeat(conn: sqlite3.Connection, client: Any, sync_start: float) -> 
         rate,
         eta_str,
     )
+    return msg_count, now_mono
 
 
 # ---------------------------------------------------------------------------
@@ -278,15 +296,19 @@ async def _maybe_heartbeat_and_gap_scan(
     sync_start: float,
     last_heartbeat: float,
     last_gap_scan: float,
-) -> tuple[float, float]:
+    last_hb_msg_count: int,
+    last_hb_mono: float,
+) -> tuple[float, float, int, float]:
     """Run heartbeat and gap scan if their intervals have elapsed.
 
-    Returns updated (last_heartbeat, last_gap_scan) timestamps.
+    Returns updated (last_heartbeat, last_gap_scan, last_hb_msg_count, last_hb_mono).
     """
     now_mono = time.monotonic()
 
     if now_mono - last_heartbeat >= HEARTBEAT_INTERVAL_S:
-        _log_heartbeat(conn, client, sync_start)
+        last_hb_msg_count, last_hb_mono = _log_heartbeat(
+            conn, client, sync_start, last_hb_msg_count, last_hb_mono
+        )
         handler_manager.refresh_synced_dialogs()
         last_heartbeat = now_mono
 
@@ -295,7 +317,7 @@ async def _maybe_heartbeat_and_gap_scan(
         logger.info("gap_scan complete — marked_deleted=%d", deleted_count)
         last_gap_scan = now_mono
 
-    return last_heartbeat, last_gap_scan
+    return last_heartbeat, last_gap_scan, last_hb_msg_count, last_hb_mono
 
 
 async def _run_sync_loop(
@@ -309,18 +331,29 @@ async def _run_sync_loop(
     sync_start = time.monotonic()
     last_heartbeat = sync_start
     last_gap_scan = sync_start
+    # Heartbeat rate state — initialized to current snapshot so the first
+    # rate sample reflects the first interval, not a divide-by-zero.
+    try:
+        last_hb_msg_count = int(conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0])
+    except Exception:
+        last_hb_msg_count = 0
+    last_hb_mono = sync_start
 
     while not shutdown_event.is_set():
         all_synced = await worker.process_one_batch()
         await asyncio.sleep(0)
 
-        last_heartbeat, last_gap_scan = await _maybe_heartbeat_and_gap_scan(
-            conn,
-            client,
-            handler_manager,
-            sync_start,
-            last_heartbeat,
-            last_gap_scan,
+        last_heartbeat, last_gap_scan, last_hb_msg_count, last_hb_mono = (
+            await _maybe_heartbeat_and_gap_scan(
+                conn,
+                client,
+                handler_manager,
+                sync_start,
+                last_heartbeat,
+                last_gap_scan,
+                last_hb_msg_count,
+                last_hb_mono,
+            )
         )
 
         if all_synced:
@@ -332,13 +365,17 @@ async def _run_sync_loop(
                 )
                 break
             except TimeoutError:
-                last_heartbeat, last_gap_scan = await _maybe_heartbeat_and_gap_scan(
-                    conn,
-                    client,
-                    handler_manager,
-                    sync_start,
-                    last_heartbeat,
-                    last_gap_scan,
+                last_heartbeat, last_gap_scan, last_hb_msg_count, last_hb_mono = (
+                    await _maybe_heartbeat_and_gap_scan(
+                        conn,
+                        client,
+                        handler_manager,
+                        sync_start,
+                        last_heartbeat,
+                        last_gap_scan,
+                        last_hb_msg_count,
+                        last_hb_mono,
+                    )
                 )
 
 
