@@ -2360,7 +2360,8 @@ class DaemonAPIServer:
         if folder_id is not None:
             try:
                 filters = await self._client(GetDialogFiltersRequest())
-                for f in filters or []:
+                filter_list = getattr(filters, "filters", filters) or []
+                for f in filter_list:
                     if getattr(f, "id", None) == folder_id:
                         raw_title = getattr(f, "title", None)
                         folder_name = getattr(raw_title, "text", raw_title) if raw_title else None
