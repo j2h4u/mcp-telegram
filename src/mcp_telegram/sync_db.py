@@ -188,6 +188,10 @@ def _open_sync_db(db_path: Path, *, read_only: bool = False) -> sqlite3.Connecti
     else:
         conn = sqlite3.connect(str(db_path), timeout=10.0)
     conn.execute("PRAGMA busy_timeout=10000")
+    # Enable FK enforcement on every connection. SQLite defaults foreign_keys
+    # to OFF per connection; without this the entity_details ON DELETE CASCADE
+    # added in v16 silently does nothing in production.
+    conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
 
