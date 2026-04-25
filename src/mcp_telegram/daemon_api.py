@@ -2658,34 +2658,70 @@ class DaemonAPIServer:
             ),
         }
 
-        # ----- contacts_subscribed (Plan 02 partial: privacy gate only; Plan 03 enumerates) -----
-        # HIGH-A from 47-REVIEWS.md cycle 2 (2026-04-25, opencode + codex
-        # consensus): Plan 03 Task 3 REPLACES the `enumeration_owned_by_plan_03`
-        # admin-path stub below with real enumeration on this same helper.
-        # Plan 02's responsibility ends at the privacy-gate (`not_an_admin`)
-        # branch; Plan 03 owns the admin branch. This is a TEMPORARY stub
-        # designed to be overwritten in Wave 3 — leaving it in production
-        # would violate SPEC Req 9 (acceptance: GetEntityInfo on a known
-        # broadcast channel returns contacts_subscribed for an admin caller).
+        # ----- contacts_subscribed (HIGH-A from 47-REVIEWS.md cycle 2 — Plan 03 Task 3 replaces Plan 02's stub) -----
+        # Privacy gate (SPEC Req 9): only admin callers see contacts_subscribed
+        # on broadcast Channels. Broadcast Channels do not expose
+        # `hidden_members` (megagroup-only flag in current Telegram layers),
+        # so the admin/non-admin axis is the only privacy decision here.
         contacts_subscribed = None
         contacts_subscribed_partial = False
-        contacts_reason = None
+        contacts_reason: str | None = None
+
         if not is_admin:
-            # Broadcast channels hide subscriber lists from non-admins. SPEC Req 9.
+            # SPEC Req 9: broadcast subscriber list is admin-only.
             contacts_subscribed = None
             contacts_reason = "not_an_admin"
+        elif subscribers_count is not None and subscribers_count > 1000:
+            # D-15 above-threshold: phone-contacts intersection only.
+            # Same pattern as _fetch_supergroup_detail's >1000 branch.
+            try:
+                gp_result = await self._client(GetParticipantsRequest(
+                    channel=channel,
+                    filter=ChannelParticipantsContacts(q=""),
+                    offset=0, limit=200, hash=0,
+                ))
+                contact_ids = {int(u.id) for u in getattr(gp_result, "users", []) if hasattr(u, "id")}
+                dm_peers = self._dm_peer_ids()
+                intersect_ids = contact_ids & dm_peers
+                contacts_subscribed = self._enrich_contact_ids_with_names(intersect_ids)
+                contacts_subscribed_partial = True
+                contacts_reason = "too_large"
+            except ChatAdminRequiredError:
+                # Defensive: admin rights revoked between cache and call.
+                contacts_subscribed = None
+                contacts_reason = "not_an_admin"
+            except Exception as exc:
+                logger.warning(
+                    "entity_info channel contacts_enumeration_failed channel_id=%r error=%s%s",
+                    channel_id, exc, _rid(),
+                )
+                contacts_subscribed = None
+                contacts_reason = "enumeration_failed"
         else:
-            # Plan 03 Task 3 replaces this admin branch with real enumeration:
-            #   subscribers_count <= 1000  →  iter_participants ∩ _dm_peer_ids()
-            #   subscribers_count > 1000   →  ChannelParticipantsContacts ∩ _dm_peer_ids()
-            #                                  + contacts_subscribed_partial=True
-            # Plan 02 commits with this stub so the broadcast envelope shape is
-            # complete; Plan 03 OVERWRITES this branch in the same file.
-            # If Plan 03 ships and any production response still carries
-            # contacts_reason="enumeration_owned_by_plan_03", that is a HIGH
-            # regression — the Plan 04 acceptance grep enforces this.
-            contacts_subscribed = None
-            contacts_reason = "enumeration_owned_by_plan_03"
+            # D-14 ≤1000: full enumerate + intersect with DM-peer set.
+            # Same pattern as _fetch_supergroup_detail's ≤1000 branch.
+            try:
+                participant_ids: set[int] = set()
+                async for p in self._client.iter_participants(channel, limit=1000):
+                    pid = getattr(p, "id", None)
+                    if pid is not None:
+                        participant_ids.add(int(pid))
+                dm_peers = self._dm_peer_ids()
+                intersect_ids = participant_ids & dm_peers
+                contacts_subscribed = self._enrich_contact_ids_with_names(intersect_ids)
+                contacts_subscribed_partial = False
+                contacts_reason = None
+            except ChatAdminRequiredError:
+                # Defensive: admin rights revoked between cache and call.
+                contacts_subscribed = None
+                contacts_reason = "not_an_admin"
+            except Exception as exc:
+                logger.warning(
+                    "entity_info channel contacts_enumeration_failed channel_id=%r error=%s%s",
+                    channel_id, exc, _rid(),
+                )
+                contacts_subscribed = None
+                contacts_reason = "enumeration_failed"
 
         # ----- avatar_history via shared helper (D-17..D-20) -----
         # MEDIUM-1 from 47-REVIEWS.md (opencode 2026-04-25): avatar-search +
