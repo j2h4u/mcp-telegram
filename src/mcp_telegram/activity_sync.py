@@ -341,6 +341,7 @@ async def _run_incremental(
     )
 
     inserted = 0
+    batch_num = 0
     offset_id = 0  # start from newest
     while not shutdown_event.is_set():
         try:
@@ -399,9 +400,15 @@ async def _run_incremental(
 
         _upsert_entities_from_search(conn, result)
         inserted += len(batch)
+        batch_num += 1
         offset_id = min(m.id for m in batch if getattr(m, "id", None) is not None)
 
         _set_state(conn, "last_sync_at", str(int(time.time())))
+        logger.info(
+            "activity_sync_incremental_batch batch=%d fetched=%d extracted=%d "
+            "total_inserted=%d next_offset_id=%d",
+            batch_num, len(batch), len(extracted), inserted, offset_id,
+        )
 
         try:
             await asyncio.wait_for(shutdown_event.wait(), timeout=_BACKFILL_INTER_BATCH_PAUSE_S)
@@ -410,7 +417,9 @@ async def _run_incremental(
             pass
 
     _set_state(conn, "last_sync_at", str(int(time.time())))
-    logger.info("activity_sync_incremental_done inserted=%d", inserted)
+    logger.info(
+        "activity_sync_incremental_done batches=%d inserted=%d", batch_num, inserted
+    )
 
 
 async def run_activity_sync_loop(
