@@ -153,6 +153,31 @@ def fetch_user_info_error_text(user_name: str, detail: str) -> str:
     )
 
 
+def ambiguous_entity_text(query: str, match_lines: list[str], *, retry_tool: str = "GetEntityInfo") -> str:
+    """Multi-candidate disambiguation prompt for entity resolution."""
+    joined = "\n  ".join(match_lines)
+    return (
+        f"Multiple entities match {query!r}. Pick one and re-run {retry_tool}:\n"
+        f"  {joined}"
+    )
+
+
+def entity_not_found_text(query: str, *, retry_tool: str = "GetEntityInfo") -> str:
+    """Single-candidate not-found prompt for entity resolution."""
+    return action_text(
+        f'No entity matches {query!r}.',
+        f"Call ListDialogs to discover available entities, then re-run {retry_tool} with a more specific name.",
+    )
+
+
+def fetch_entity_info_error_text(query: str, error: str) -> str:
+    """Daemon-side fetch error wrapper for entity info."""
+    return action_text(
+        f'Could not fetch entity info for {query!r} ({error}).',
+        "Retry GetEntityInfo later. If this persists, verify the Telegram session has access to this entity.",
+    )
+
+
 def not_authenticated_text(retry_tool: str) -> str:
     """Return an action-oriented response for missing Telegram auth."""
     return action_text(
