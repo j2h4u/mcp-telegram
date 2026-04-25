@@ -249,9 +249,15 @@ class DaemonConnection:
         """Return deleted messages, edit history, and access-lost alerts."""
         return await self.request({"method": "get_sync_alerts", "since": since, "limit": limit})
 
-    async def get_user_info(self, *, user_id: int) -> dict:
-        """Return user profile and common chats."""
-        return await self.request({"method": "get_user_info", "user_id": user_id})
+    async def get_entity_info(self, *, entity_id: int) -> dict:
+        """Return type-tagged entity profile (user/bot/channel/supergroup/group).
+
+        DB-first; daemon falls back to Telegram on cache miss/stale (TTL=5 min,
+        per CONTEXT D-01 / SPEC Req 8). Response carries one of five 'type'
+        discriminators in data['type']: 'user' | 'bot' | 'channel' |
+        'supergroup' | 'group'.
+        """
+        return await self.request({"method": "get_entity_info", "entity_id": entity_id})
 
     async def get_inbox(
         self,

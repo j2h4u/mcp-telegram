@@ -28,19 +28,19 @@ from .sync import (
 )
 from .activity import GetMyRecentActivity, get_my_recent_activity  # noqa: F401
 from .unread import GetInbox, get_inbox
-from .user_info import GetUserInfo, get_user_info
+from .entity_info import GetEntityInfo, get_entity_info
 
 __all__ = [
     "TOOL_REGISTRY",
     "DaemonNotRunningError",
     "GetDialogStats",
+    "GetEntityInfo",
     "GetInbox",
     "GetMyAccount",
     "GetMyRecentActivity",
     "GetSyncAlerts",
     "GetSyncStatus",
     "GetUsageStats",
-    "GetUserInfo",
     "ListDialogs",
     "ListMessages",
     "ListTopics",
@@ -50,13 +50,13 @@ __all__ = [
     "ToolResult",
     "daemon_connection",
     "get_dialog_stats",
+    "get_entity_info",
     "get_inbox",
     "get_my_account",
     "get_my_recent_activity",
     "get_sync_alerts",
     "get_sync_status",
     "get_usage_stats",
-    "get_user_info",
     "list_dialogs",
     "list_messages",
     "list_topics",
