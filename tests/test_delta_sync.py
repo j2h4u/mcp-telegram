@@ -1048,7 +1048,7 @@ async def test_checkpoint_skip_emits_log(
 
     worker = make_worker(mock_client, sync_db, shutdown_event)
     import logging
-    with caplog.at_level(logging.INFO, logger="mcp_telegram.delta_sync"):
+    with caplog.at_level(logging.DEBUG, logger="mcp_telegram.delta_sync"):
         await worker.run_delta_catch_up()
 
     skip_logs = [r for r in caplog.records if "delta_catch_up_skip" in r.getMessage()]
