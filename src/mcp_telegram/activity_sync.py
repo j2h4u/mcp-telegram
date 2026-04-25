@@ -382,8 +382,23 @@ async def _run_incremental(
         if not batch:
             break
 
-        extracted: list[ExtractedMessage] = []
+        # messages.search(InputPeerEmpty) silently ignores min_date — canonical
+        # Telegram-API behavior, see Telethon #218. Apply the date bound
+        # client-side. Batch is ordered newest-first by offset_id, so dates
+        # are monotonically decreasing: once we hit one older than min_date,
+        # every later batch will be older too — break the outer loop.
+        in_window: list[Any] = []
+        past_window = False
         for m in batch:
+            m_ts = int(m.date.timestamp()) if getattr(m, "date", None) else 0
+            if m_ts >= min_date:
+                in_window.append(m)
+            else:
+                past_window = True
+                break
+
+        extracted: list[ExtractedMessage] = []
+        for m in in_window:
             dialog_id = _extract_dialog_id(m)
             if dialog_id is None:
                 continue
@@ -399,16 +414,22 @@ async def _run_incremental(
                 )
 
         _upsert_entities_from_search(conn, result)
-        inserted += len(batch)
+        inserted += len(in_window)
         batch_num += 1
+        # Always advance offset_id by the full batch — even messages outside
+        # the window must be skipped past so we don't re-fetch them.
         offset_id = min(m.id for m in batch if getattr(m, "id", None) is not None)
 
         _set_state(conn, "last_sync_at", str(int(time.time())))
         logger.info(
-            "activity_sync_incremental_batch batch=%d fetched=%d extracted=%d "
-            "total_inserted=%d next_offset_id=%d",
-            batch_num, len(batch), len(extracted), inserted, offset_id,
+            "activity_sync_incremental_batch batch=%d fetched=%d in_window=%d "
+            "extracted=%d total_inserted=%d next_offset_id=%d past_window=%s",
+            batch_num, len(batch), len(in_window), len(extracted),
+            inserted, offset_id, past_window,
         )
+
+        if past_window:
+            break
 
         try:
             await asyncio.wait_for(shutdown_event.wait(), timeout=_BACKFILL_INTER_BATCH_PAUSE_S)
