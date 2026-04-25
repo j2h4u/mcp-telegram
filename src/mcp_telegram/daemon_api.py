@@ -54,9 +54,13 @@ from telethon.tl.functions.users import GetFullUserRequest  # type: ignore[impor
 from telethon.tl.types import Channel, Chat  # type: ignore[import-untyped]
 from xdg_base_dirs import xdg_state_home  # type: ignore[import-error]
 
+from telethon.errors import ChatAdminRequiredError  # type: ignore[import-untyped]
 from telethon.tl.functions.channels import GetFullChannelRequest  # type: ignore[import-untyped]
+from telethon.tl.functions.channels import GetParticipantsRequest  # type: ignore[import-untyped]
+from telethon.tl.functions.messages import GetFullChatRequest  # type: ignore[import-untyped]
 from telethon.tl.functions.messages import SearchRequest as MessagesSearchRequest  # type: ignore[import-untyped]
 from telethon.tl.types import (  # type: ignore[import-untyped]
+    ChannelParticipantsContacts,
     ChatReactionsAll,
     ChatReactionsNone,
     ChatReactionsSome,
@@ -2182,25 +2186,9 @@ class DaemonAPIServer:
         elif dispatch_kind == "Channel":
             detail = await self._fetch_channel_detail(entity)
         elif dispatch_kind in ("Group", "Forum"):
-            # Plan 03 owns supergroup helper. Until 03 lands, return a clean
-            # unsupported error so the contract is unambiguous in tests and
-            # smoke runs. Plan 03 replaces this branch with:
-            #     detail = await self._fetch_supergroup_detail(entity)
-            return {
-                "ok": False,
-                "error": "unsupported_entity_type",
-                "message": "supergroup detail not yet implemented (Plan 03)",
-                "data": None,
-            }
+            detail = await self._fetch_supergroup_detail(entity)
         elif dispatch_kind == "Chat":
-            # Plan 03 owns legacy-group helper. Until 03 lands:
-            #     detail = await self._fetch_group_detail(entity)
-            return {
-                "ok": False,
-                "error": "unsupported_entity_type",
-                "message": "legacy group detail not yet implemented (Plan 03)",
-                "data": None,
-            }
+            detail = await self._fetch_group_detail(entity)
         else:
             return {
                 "ok": False,
@@ -2725,6 +2713,332 @@ class DaemonAPIServer:
             "pinned_msg_id": pinned_msg_id,
             "slow_mode_seconds": slow_mode_seconds,
             "available_reactions": available_reactions,
+            "restrictions": restrictions,
+            "contacts_subscribed": contacts_subscribed,
+            "contacts_subscribed_partial": contacts_subscribed_partial,
+            "contacts_reason": contacts_reason,
+        }
+
+    def _enrich_contact_ids_with_names(self, ids: set[int]) -> list[dict]:
+        """Resolve a set of entity ids to {id, name, username} dicts via JOIN
+        on the entities table. Per CONTEXT D-14: ids alone aren't useful for
+        the LLM; names are.
+
+        Returns a list (not set) sorted by name for stable ordering across
+        repeated calls. Empty input → empty list.
+        """
+        if not ids:
+            return []
+        placeholders = ",".join("?" * len(ids))
+        rows = self._conn.execute(
+            f"SELECT id, name, username FROM entities WHERE id IN ({placeholders})",
+            tuple(ids),
+        ).fetchall()
+        # ids that have no entities row are returned with name/username=None so
+        # the count still matches; LLM sees the gap and can re-resolve later.
+        seen = {row[0] for row in rows}
+        out = [{"id": row[0], "name": row[1], "username": row[2]} for row in rows]
+        for missing_id in ids - seen:
+            out.append({"id": missing_id, "name": None, "username": None})
+        return sorted(out, key=lambda d: ((d["name"] or ""), d["id"]))
+
+    async def _fetch_supergroup_detail(self, channel) -> dict:
+        """Per-type helper: Supergroup (Channel.megagroup=True). Forum
+        supergroups (forum=True) also route here per CONTEXT D-09 / SPEC Req 6.
+
+        SPEC Req 6 surface: members_count, linked_broadcast_id,
+        slow_mode_seconds, has_topics, restrictions, contacts_subscribed +
+        common envelope + avatar_history.
+
+        contacts_subscribed enumeration policy (CONTEXT D-14 / D-15, SPEC Req 9):
+          - non-admin + hidden members:        null + reason='hidden_by_admin'
+          - admin or open + members_count<=1000: iter_participants ∩ _dm_peer_ids()
+          - members_count>1000:                ChannelParticipantsContacts ∩ _dm_peer_ids()
+                                                with contacts_subscribed_partial=True,
+                                                reason='too_large'
+        """
+        channel_id = int(telethon_utils.get_peer_id(channel))
+
+        # ----- GetFullChannelRequest -----
+        full_chat = None
+        members_count: int | None = None
+        linked_broadcast_id: int | None = None
+        slow_mode_seconds: int | None = None
+        about: str | None = None
+        try:
+            full_result = await self._client(GetFullChannelRequest(channel=channel))
+            full_chat = full_result.full_chat
+            members_count = getattr(full_chat, "participants_count", None)
+            linked_chat_raw = getattr(full_chat, "linked_chat_id", None)
+            if linked_chat_raw is not None:
+                # MEDIUM from 47-REVIEWS.md cycle 2 (codex): use the canonical
+                # Telethon helper instead of `int(f"-100{raw}")` string
+                # concatenation — see Plan 02 Task 3 for the same fix on
+                # `_fetch_channel_detail`. The string form is brittle.
+                if linked_chat_raw > 0:
+                    from telethon.tl.types import PeerChannel  # type: ignore[import-untyped]
+                    linked_broadcast_id = int(telethon_utils.get_peer_id(PeerChannel(linked_chat_raw)))
+                else:
+                    # Already in peer-id form — pass through.
+                    linked_broadcast_id = int(linked_chat_raw)
+            slow_mode_seconds = getattr(full_chat, "slowmode_seconds", None)
+            about = getattr(full_chat, "about", None) or None
+        except Exception as exc:
+            logger.warning(
+                "entity_info supergroup full_channel_failed channel_id=%r error=%s%s",
+                channel_id, exc, _rid(), exc_info=True,
+            )
+
+        # ----- restrictions -----
+        restrictions: list[dict] = []
+        for rr in getattr(channel, "restriction_reason", None) or []:
+            restrictions.append({
+                "platform": getattr(rr, "platform", None),
+                "reason": getattr(rr, "reason", None),
+                "text": getattr(rr, "text", None),
+            })
+
+        # ----- my_membership -----
+        is_creator = bool(getattr(channel, "creator", False))
+        admin_rights_obj = getattr(channel, "admin_rights", None)
+        is_admin = is_creator or (admin_rights_obj is not None)
+        my_membership = {
+            "is_member": not bool(getattr(channel, "left", False)),
+            "is_admin": is_admin,
+            "admin_rights": (
+                {
+                    field: bool(getattr(admin_rights_obj, field, False))
+                    for field in (
+                        "change_info", "post_messages", "edit_messages",
+                        "delete_messages", "ban_users", "invite_users",
+                        "pin_messages", "add_admins", "anonymous", "manage_call",
+                        "other", "manage_topics", "post_stories", "edit_stories",
+                        "delete_stories",
+                    )
+                }
+                if admin_rights_obj is not None else None
+            ),
+        }
+
+        # ----- contacts_subscribed (D-14 / D-15 / SPEC Req 9) -----
+        contacts_subscribed = None
+        contacts_subscribed_partial = False
+        contacts_reason: str | None = None
+
+        # Privacy gate (HIGH-3 from 47-REVIEWS.md, opencode 2026-04-25):
+        # Telethon's Channel.hidden_members attribute (layer 160+) is the explicit
+        # signal that the supergroup admin has hidden the member list. If the
+        # attribute is present and True AND we are not admin, gate immediately.
+        # Otherwise, attempt enumeration and let ChatAdminRequiredError be the
+        # ground truth (Telegram raises it when a non-admin tries to enumerate
+        # a hidden-members supergroup). Do NOT use channel.noforwards as a proxy
+        # — that flag controls "Restrict Saving Content" and is independent of
+        # member-list visibility (a supergroup can have noforwards=True with an
+        # open member list, or noforwards=False with hidden members).
+        hidden_members = bool(getattr(channel, "hidden_members", False)) and not is_admin
+
+        if hidden_members:
+            contacts_subscribed = None
+            contacts_reason = "hidden_by_admin"
+        elif members_count is not None and members_count > 1000:
+            # D-15 above-threshold: phone-contacts intersection only.
+            try:
+                gp_result = await self._client(GetParticipantsRequest(
+                    channel=channel,
+                    filter=ChannelParticipantsContacts(q=""),
+                    offset=0, limit=200, hash=0,
+                ))
+                contact_ids = {int(u.id) for u in getattr(gp_result, "users", []) if hasattr(u, "id")}
+                dm_peers = self._dm_peer_ids()
+                intersect_ids = contact_ids & dm_peers
+                contacts_subscribed = self._enrich_contact_ids_with_names(intersect_ids)
+                contacts_subscribed_partial = True
+                contacts_reason = "too_large"
+            except ChatAdminRequiredError:
+                # Telegram refused the enumeration → ground-truth hidden members.
+                contacts_subscribed = None
+                contacts_reason = "hidden_by_admin"
+            except Exception as exc:
+                logger.warning(
+                    "entity_info supergroup contacts_filter_failed channel_id=%r error=%s%s",
+                    channel_id, exc, _rid(), exc_info=True,
+                )
+                contacts_subscribed = None
+                contacts_reason = "enumeration_failed"
+        else:
+            # D-14 ≤1000 path: iter_participants → intersect → enrich with names.
+            try:
+                participant_ids: set[int] = set()
+                async for participant in self._client.iter_participants(channel, limit=1000):
+                    pid = getattr(participant, "id", None)
+                    if pid is not None:
+                        participant_ids.add(int(pid))
+                dm_peers = self._dm_peer_ids()
+                intersect_ids = participant_ids & dm_peers
+                contacts_subscribed = self._enrich_contact_ids_with_names(intersect_ids)
+                contacts_subscribed_partial = False
+            except ChatAdminRequiredError:
+                # Telegram refused the enumeration → ground-truth hidden members.
+                contacts_subscribed = None
+                contacts_reason = "hidden_by_admin"
+            except Exception as exc:
+                logger.warning(
+                    "entity_info supergroup iter_participants_failed channel_id=%r error=%s%s",
+                    channel_id, exc, _rid(), exc_info=True,
+                )
+                contacts_subscribed = None
+                contacts_reason = "enumeration_failed"
+
+        # ----- avatar_history per D-17 / D-19 / D-20 (same pattern as Channel) -----
+        avatar_history, avatar_count = await self._search_chat_photo_history(channel, full_chat)
+
+        title = getattr(channel, "title", None)
+        username = getattr(channel, "username", None)
+
+        return {
+            # Common envelope (D-06)
+            "id": channel_id,
+            "type": "supergroup",
+            "name": title,
+            "username": username,
+            "about": about,
+            "my_membership": my_membership,
+            "avatar_history": avatar_history,
+            "avatar_count": avatar_count,
+            # Supergroup-specific (SPEC Req 6)
+            "members_count": members_count,
+            "linked_broadcast_id": linked_broadcast_id,
+            "slow_mode_seconds": slow_mode_seconds,
+            "has_topics": bool(getattr(channel, "forum", False)),
+            "restrictions": restrictions,
+            "contacts_subscribed": contacts_subscribed,
+            "contacts_subscribed_partial": contacts_subscribed_partial,
+            "contacts_reason": contacts_reason,
+        }
+
+    async def _fetch_group_detail(self, chat) -> dict:
+        """Per-type helper: legacy basic Chat (Telethon Chat, not Channel).
+
+        Per CONTEXT D-16: legacy basic groups always expose their participant
+        list — no admin gate, no hide-members setting. Full enumerate +
+        intersect with DM-peer set per SPEC Req 9 / Req 7.
+
+        SPEC Req 12: migrated_to returned verbatim in peer-id form
+        (int(telethon_utils.get_peer_id(migrated_to_obj))) when Telegram
+        reports it. NO auto-follow code path exists in this method or in
+        _get_entity_info — LLM is responsible for re-querying with the new id.
+        """
+        chat_id = int(telethon_utils.get_peer_id(chat))
+
+        # ----- migrated_to (SPEC Req 12) -----
+        migrated_to_obj = getattr(chat, "migrated_to", None)
+        migrated_to: int | None = None
+        if migrated_to_obj is not None:
+            try:
+                migrated_to = int(telethon_utils.get_peer_id(migrated_to_obj))
+            except Exception as exc:
+                logger.warning(
+                    "entity_info group migrated_to_normalize_failed chat_id=%r error=%s%s",
+                    chat_id, exc, _rid(),
+                )
+
+        # ----- GetFullChatRequest -----
+        full_chat = None
+        members_count: int | None = None
+        about: str | None = None
+        invite_link: str | None = None
+        participants_objs: list = []
+        try:
+            full_result = await self._client(GetFullChatRequest(chat_id=int(chat.id)))
+            full_chat = full_result.full_chat
+            about = getattr(full_chat, "about", None) or None
+            exported_invite = getattr(full_chat, "exported_invite", None)
+            if exported_invite is not None:
+                invite_link = getattr(exported_invite, "link", None)
+            raw_participants = getattr(full_chat, "participants", None)
+            if raw_participants is not None:
+                participants_objs = list(getattr(raw_participants, "participants", []) or [])
+                members_count = len(participants_objs)
+            # Telethon Chat itself also exposes participants_count at times:
+            if members_count is None:
+                members_count = getattr(chat, "participants_count", None)
+        except Exception as exc:
+            logger.warning(
+                "entity_info group full_chat_failed chat_id=%r error=%s%s",
+                chat_id, exc, _rid(), exc_info=True,
+            )
+
+        # ----- restrictions -----
+        restrictions: list[dict] = []
+        for rr in getattr(chat, "restriction_reason", None) or []:
+            restrictions.append({
+                "platform": getattr(rr, "platform", None),
+                "reason": getattr(rr, "reason", None),
+                "text": getattr(rr, "text", None),
+            })
+
+        # ----- my_membership: legacy chats have a creator flag and admin_rights -----
+        is_creator = bool(getattr(chat, "creator", False))
+        admin_rights_obj = getattr(chat, "admin_rights", None)
+        is_admin = is_creator or (admin_rights_obj is not None)
+        my_membership = {
+            "is_member": not bool(getattr(chat, "left", False)),
+            "is_admin": is_admin,
+            "admin_rights": (
+                {
+                    field: bool(getattr(admin_rights_obj, field, False))
+                    for field in (
+                        "change_info", "post_messages", "edit_messages",
+                        "delete_messages", "ban_users", "invite_users",
+                        "pin_messages", "add_admins", "anonymous", "manage_call",
+                        "other", "manage_topics", "post_stories", "edit_stories",
+                        "delete_stories",
+                    )
+                }
+                if admin_rights_obj is not None else None
+            ),
+        }
+
+        # ----- contacts_subscribed: full participant list always available (D-16) -----
+        contacts_subscribed = None
+        contacts_subscribed_partial = False
+        contacts_reason: str | None = None
+        try:
+            participant_ids = {
+                int(getattr(p, "user_id", 0))
+                for p in participants_objs
+                if getattr(p, "user_id", None) is not None
+            }
+            dm_peers = self._dm_peer_ids()
+            intersect_ids = participant_ids & dm_peers
+            contacts_subscribed = self._enrich_contact_ids_with_names(intersect_ids)
+        except Exception as exc:
+            logger.warning(
+                "entity_info group contacts_intersect_failed chat_id=%r error=%s%s",
+                chat_id, exc, _rid(),
+            )
+            contacts_subscribed = None
+            contacts_reason = "enumeration_failed"
+
+        # ----- avatar_history (shared helper) -----
+        avatar_history, avatar_count = await self._search_chat_photo_history(chat, full_chat)
+
+        title = getattr(chat, "title", None)
+
+        return {
+            # Common envelope (D-06)
+            "id": chat_id,
+            "type": "group",
+            "name": title,
+            "username": None,  # legacy chats have no username
+            "about": about,
+            "my_membership": my_membership,
+            "avatar_history": avatar_history,
+            "avatar_count": avatar_count,
+            # Group-specific (SPEC Req 7)
+            "members_count": members_count,
+            "migrated_to": migrated_to,
+            "invite_link": invite_link,
             "restrictions": restrictions,
             "contacts_subscribed": contacts_subscribed,
             "contacts_subscribed_partial": contacts_subscribed_partial,
