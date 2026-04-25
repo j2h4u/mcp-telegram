@@ -338,6 +338,7 @@ async def _run_sync_loop(
     except Exception:
         last_hb_msg_count = 0
     last_hb_mono = sync_start
+    was_idle = False  # log idle transition once, not every cycle
 
     while not shutdown_event.is_set():
         all_synced = await worker.process_one_batch()
@@ -357,7 +358,9 @@ async def _run_sync_loop(
         )
 
         if all_synced:
-            logger.info("sync_idle — all dialogs synced, waiting %ds", HEARTBEAT_INTERVAL_S)
+            if not was_idle:
+                logger.info("sync_idle — all dialogs synced, waiting %ds", HEARTBEAT_INTERVAL_S)
+                was_idle = True
             try:
                 await asyncio.wait_for(
                     shutdown_event.wait(),
@@ -377,6 +380,9 @@ async def _run_sync_loop(
                         last_hb_mono,
                     )
                 )
+        elif was_idle:
+            logger.info("sync_resume — work appeared, exiting idle")
+            was_idle = False
 
 
 # ---------------------------------------------------------------------------
