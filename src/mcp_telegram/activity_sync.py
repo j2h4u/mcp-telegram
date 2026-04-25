@@ -420,7 +420,10 @@ async def _run_incremental(
         # the window must be skipped past so we don't re-fetch them.
         offset_id = min(m.id for m in batch if getattr(m, "id", None) is not None)
 
-        _set_state(conn, "last_sync_at", str(int(time.time())))
+        # last_sync_at is stamped once at end-of-loop, not per batch:
+        # with the client-side min_date filter the loop terminates within
+        # a few iterations anyway, and a mid-loop shutdown just means the
+        # next incremental re-fetches the in-progress window (UPSERT no-op).
         logger.info(
             "activity_sync_incremental_batch batch=%d fetched=%d in_window=%d "
             "extracted=%d total_inserted=%d next_offset_id=%d past_window=%s",
