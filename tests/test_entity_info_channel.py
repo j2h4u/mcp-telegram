@@ -275,3 +275,175 @@ async def test_get_entity_info_channel_avatar_search_fails_d20_fallback() -> Non
         "D-20 violation: chat_photo present but avatar_count == 0; "
         "search_failed flag fix from cycle-3 HIGH-3 missing"
     )
+
+
+# ---------------------------------------------------------------------------
+# Plan 03 Task 3: Broadcast Channel admin-path enumeration tests
+# (HIGH-A from 47-REVIEWS.md cycle 2 — admin branch replaces Plan 02 stub)
+# ---------------------------------------------------------------------------
+
+def _full_broadcast_channel(*, participants_count: int) -> MagicMock:
+    full = MagicMock()
+    full.participants_count = participants_count
+    full.linked_chat_id = None
+    full.pinned_msg_id = None
+    full.slowmode_seconds = None
+    full.about = None
+    full.available_reactions = None
+    full.chat_photo = None
+    return full
+
+
+@pytest.mark.asyncio
+async def test_get_entity_info_channel_admin_enumerates_subscribers_small() -> None:
+    """HIGH-A from 47-REVIEWS.md cycle 2: broadcast Channel with admin caller
+    and subscribers_count <= 1000 returns a real contacts_subscribed list
+    (DM-peer ∩ participant ids), NOT the Plan 02 stub
+    contacts_reason='enumeration_owned_by_plan_03'.
+    """
+    client = AsyncMock()
+    # Resolve broadcast channel (megagroup=False, admin via creator=True)
+    ch = MagicMock(spec=TelethonChannel)
+    ch.id = -1001234567890
+    ch.title = "Broadcast Admin"
+    ch.username = "broadcast_admin"
+    ch.megagroup = False
+    ch.broadcast = True
+    ch.creator = True              # is_admin=True via creator
+    ch.admin_rights = None
+    ch.left = False
+    ch.restriction_reason = None
+    client.get_entity = AsyncMock(return_value=ch)
+
+    # GetFullChannelRequest returns subscribers_count=42 (≤1000 path).
+    full = MagicMock()
+    full.full_chat = _full_broadcast_channel(participants_count=42)
+    client.side_effect = [full]    # one MTProto call before iter_participants
+
+    # iter_participants yields 3 participant objects with ids 111, 222, 333.
+    async def _iter(*args, **kwargs):
+        for pid in (111, 222, 333):
+            p = MagicMock()
+            p.id = pid
+            yield p
+    client.iter_participants = _iter
+
+    server = make_server(client=client)
+    # Seed _dm_peer_ids: operator has DMed 111 and 333 (NOT 222).
+    server._conn.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')", (111,)
+    )
+    server._conn.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')", (333,)
+    )
+    # Names for the contact ids (entity rows for enrichment).
+    server._conn.execute(
+        "INSERT INTO entities (id, type, name, username, name_normalized, updated_at) "
+        "VALUES (?, 'User', 'Alice', 'alice', 'alice', 0)", (111,)
+    )
+    server._conn.execute(
+        "INSERT INTO entities (id, type, name, username, name_normalized, updated_at) "
+        "VALUES (?, 'User', 'Carol', 'carol', 'carol', 0)", (333,)
+    )
+
+    r = await server._dispatch({"method": "get_entity_info", "entity_id": -1001234567890})
+    d = r["data"]
+    assert d["type"] == "channel"
+    assert d["contacts_subscribed_partial"] is False
+    assert d["contacts_reason"] is None
+    # Real enumeration result — must be {111, 333} (222 is not a DM peer).
+    ids = sorted(c["id"] for c in d["contacts_subscribed"])
+    assert ids == [111, 333], f"expected [111, 333], got {ids}"
+    # The Plan 02 stub MUST NOT survive into production responses.
+    assert d.get("contacts_reason") != "enumeration_owned_by_plan_03"
+
+
+@pytest.mark.asyncio
+async def test_get_entity_info_channel_admin_enumerates_subscribers_large() -> None:
+    """HIGH-A from 47-REVIEWS.md cycle 2: broadcast Channel with admin caller
+    and subscribers_count > 1000 uses ChannelParticipantsContacts filter
+    and returns contacts_subscribed_partial=True, reason='too_large'.
+    """
+    client = AsyncMock()
+    ch = MagicMock(spec=TelethonChannel)
+    ch.id = -1009876543210
+    ch.title = "Big Broadcast"
+    ch.username = "big_broadcast"
+    ch.megagroup = False
+    ch.broadcast = True
+    ch.creator = True
+    ch.admin_rights = None
+    ch.left = False
+    ch.restriction_reason = None
+    client.get_entity = AsyncMock(return_value=ch)
+
+    full = MagicMock()
+    full.full_chat = _full_broadcast_channel(participants_count=50000)
+
+    # GetParticipantsRequest(filter=ChannelParticipantsContacts) returns 2 contacts.
+    gp_result = MagicMock()
+    u1 = MagicMock(); u1.id = 111
+    u2 = MagicMock(); u2.id = 222
+    gp_result.users = [u1, u2]
+    client.side_effect = [full, gp_result]
+
+    # iter_participants MUST NOT be called on the >1000 path.
+    async def _iter_should_not_be_called(*args, **kwargs):
+        raise AssertionError("iter_participants must not run on >1000 broadcast path")
+        yield  # pragma: no cover
+    client.iter_participants = _iter_should_not_be_called
+
+    server = make_server(client=client)
+    server._conn.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')", (111,)
+    )
+    server._conn.execute(
+        "INSERT INTO entities (id, type, name, username, name_normalized, updated_at) "
+        "VALUES (?, 'User', 'Alice', 'alice', 'alice', 0)", (111,)
+    )
+
+    r = await server._dispatch({"method": "get_entity_info", "entity_id": -1009876543210})
+    d = r["data"]
+    assert d["contacts_subscribed_partial"] is True
+    assert d["contacts_reason"] == "too_large"
+    ids = sorted(c["id"] for c in d["contacts_subscribed"])
+    assert ids == [111]
+
+
+@pytest.mark.asyncio
+async def test_get_entity_info_channel_admin_chat_admin_required_falls_back_to_not_an_admin() -> None:
+    """HIGH-A from 47-REVIEWS.md cycle 2: defensive ChatAdminRequiredError
+    handler — if Telegram raises ChatAdminRequiredError on the enumeration
+    call (e.g. admin rights revoked between cache and call), the response
+    falls back to contacts_subscribed=null, reason='not_an_admin' rather
+    than crashing or surfacing the exception.
+    """
+    from telethon.errors import ChatAdminRequiredError
+
+    client = AsyncMock()
+    ch = MagicMock(spec=TelethonChannel)
+    ch.id = -1001112223334
+    ch.title = "Revoked Admin"
+    ch.username = None
+    ch.megagroup = False
+    ch.broadcast = True
+    ch.creator = True
+    ch.admin_rights = None
+    ch.left = False
+    ch.restriction_reason = None
+    client.get_entity = AsyncMock(return_value=ch)
+
+    full = MagicMock()
+    full.full_chat = _full_broadcast_channel(participants_count=42)
+    client.side_effect = [full]
+
+    async def _iter_raises(*args, **kwargs):
+        raise ChatAdminRequiredError(request=None)
+        yield  # pragma: no cover
+    client.iter_participants = _iter_raises
+
+    server = make_server(client=client)
+    r = await server._dispatch({"method": "get_entity_info", "entity_id": -1001112223334})
+    d = r["data"]
+    assert d["contacts_subscribed"] is None
+    assert d["contacts_reason"] == "not_an_admin"
