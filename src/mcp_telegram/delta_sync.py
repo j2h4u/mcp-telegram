@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 # GetHistoryRequest storm on quick restarts (D-01 expert panel).
 # 1h covers typical dev iteration cycles (rebuild + edit + rebuild) where
 # the user's account hasn't received meaningful new traffic worth probing.
-RECENT_SYNC_SKIP_THRESHOLD_S: float = 3600.0
+RECENT_SYNC_SKIP_THRESHOLD_S: int = 3600
 
 _SELECT_SYNCED_DIALOGS_FOR_DELTA_SQL = (
     "SELECT dialog_id, last_synced_at FROM synced_dialogs WHERE status = 'synced'"
