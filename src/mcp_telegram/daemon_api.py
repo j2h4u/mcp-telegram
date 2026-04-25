@@ -779,6 +779,15 @@ class DaemonAPIServer:
             encoded = json.dumps(response).encode() + b"\n"
             writer.write(encoded)
             await writer.drain()
+        except (ConnectionResetError, BrokenPipeError):
+            # MCP client (or healthcheck) disconnected before we finished
+            # writing the response — expected on tool-call timeouts and
+            # short-lived health probes. Don't log a stack trace.
+            logger.debug(
+                "daemon_api client_disconnected method=%s request_id=%s",
+                method,
+                request_id,
+            )
         except Exception:
             logger.exception(
                 "daemon_api handle_client_write_error method=%s request_id=%s",
