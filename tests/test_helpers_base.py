@@ -71,13 +71,15 @@ async def test_maybe_heartbeat_fires_when_interval_elapsed():
     old_heartbeat = sync_start - HEARTBEAT_INTERVAL_S - 1
     old_gap_scan = sync_start  # gap scan should NOT fire
 
-    new_hb, new_gs = await _maybe_heartbeat_and_gap_scan(
+    new_hb, new_gs, _hb_count, _hb_mono = await _maybe_heartbeat_and_gap_scan(
         conn,
         client,
         handler_manager,
         sync_start,
         old_heartbeat,
         old_gap_scan,
+        0,
+        old_heartbeat,
     )
 
     assert new_hb > old_heartbeat, "heartbeat timestamp should be updated"
@@ -97,12 +99,14 @@ async def test_maybe_heartbeat_skips_when_recent():
 
     now = time.monotonic()
 
-    new_hb, new_gs = await _maybe_heartbeat_and_gap_scan(
+    new_hb, new_gs, _hb_count, _hb_mono = await _maybe_heartbeat_and_gap_scan(
         conn,
         client,
         handler_manager,
         now,
         now,
+        now,
+        0,
         now,
     )
 
