@@ -1238,7 +1238,9 @@ def test_migration_v15_copies_own_only_into_messages(tmp_path: Path) -> None:
             "INSERT INTO activity_comments (dialog_id, message_id, sent_at, text) "
             "VALUES (100, 1, 1000, 'hello'), (100, 2, 2000, 'world')"
         )
-        conn.execute("DELETE FROM schema_version WHERE version = 15")
+        # Delete v15 AND any higher versions so _schema_ready returns False
+        # and the migration framework re-runs from v14.
+        conn.execute("DELETE FROM schema_version WHERE version >= 15")
         conn.commit()
     # Re-run migrations → v15 re-applies the data migration.
     ensure_sync_schema(db_path)
@@ -1272,7 +1274,9 @@ def test_migration_v15_preserves_existing_messages(tmp_path: Path) -> None:
             "INSERT INTO activity_comments (dialog_id, message_id, sent_at, text) "
             "VALUES (200, 5, 9999, 'stale-copy')"
         )
-        conn.execute("DELETE FROM schema_version WHERE version = 15")
+        # Delete v15 AND any higher versions so _schema_ready returns False
+        # and the migration framework re-runs from v14.
+        conn.execute("DELETE FROM schema_version WHERE version >= 15")
         conn.commit()
     ensure_sync_schema(db_path)
     with sqlite3.connect(db_path) as conn:
@@ -1305,7 +1309,9 @@ def test_migration_v15_enrolls_own_only_but_preserves_higher_status(tmp_path: Pa
             "INSERT INTO activity_comments (dialog_id, message_id, sent_at, text) "
             "VALUES (300, 1, 1000, 'a'), (400, 2, 2000, 'b')"
         )
-        conn.execute("DELETE FROM schema_version WHERE version = 15")
+        # Delete v15 AND any higher versions so _schema_ready returns False
+        # and the migration framework re-runs from v14.
+        conn.execute("DELETE FROM schema_version WHERE version >= 15")
         conn.commit()
     ensure_sync_schema(db_path)
     with sqlite3.connect(db_path) as conn:
