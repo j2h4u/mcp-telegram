@@ -43,7 +43,9 @@ def _format_relative_ymd(iso_date: str, now: datetime | None = None) -> str:
         then = then.replace(tzinfo=UTC)
     reference = now or datetime.now(tz=UTC)
     delta_days = (reference.date() - then.date()).days
-    if delta_days <= 0:
+    if delta_days < 0:
+        return "future date"
+    if delta_days == 0:
         return "today"
     years, rem = divmod(delta_days, 365)
     months, days = divmod(rem, 30)
@@ -120,6 +122,9 @@ class GetEntityInfo(ToolArgs):
 @mcp_tool("primary", annotations=ToolAnnotations(readOnlyHint=True))
 async def get_entity_info(args: GetEntityInfo) -> ToolResult:
     # Two daemon connections: daemon handles one request per connection.
+    # Accepted race: entity_id obtained from resolve_entity could theoretically
+    # become stale if the entities table is modified between the two calls, but
+    # this window is negligible in practice (entities are stable once synced).
     try:
         async with daemon_connection() as conn:
             resolve_response = await conn.resolve_entity(query=args.entity)
