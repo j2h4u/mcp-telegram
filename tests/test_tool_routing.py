@@ -85,7 +85,7 @@ class _patch_daemon:
             "mcp_telegram.tools.discovery.daemon_connection",
             "mcp_telegram.tools.reading.daemon_connection",
             "mcp_telegram.tools.sync.daemon_connection",
-            "mcp_telegram.tools.user_info.daemon_connection",
+            "mcp_telegram.tools.entity_info.daemon_connection",
             "mcp_telegram.tools.unread.daemon_connection",
             "mcp_telegram.tools.stats.daemon_connection",
             "mcp_telegram.tools.activity.daemon_connection",  # Phase 999.1 (B4b)
@@ -115,7 +115,7 @@ class _patch_daemon_not_running:
             "mcp_telegram.tools.discovery.daemon_connection",
             "mcp_telegram.tools.reading.daemon_connection",
             "mcp_telegram.tools.sync.daemon_connection",
-            "mcp_telegram.tools.user_info.daemon_connection",
+            "mcp_telegram.tools.entity_info.daemon_connection",
             "mcp_telegram.tools.unread.daemon_connection",
             "mcp_telegram.tools.stats.daemon_connection",
             "mcp_telegram.tools.activity.daemon_connection",  # Phase 999.1 (B4b)
@@ -520,7 +520,7 @@ async def test_get_my_account_daemon_not_running():
 def test_no_telethon_imports_in_tools():
     """Tool modules must not import telethon."""
     tools_dir = pathlib.Path(__file__).parent.parent / "src" / "mcp_telegram" / "tools"
-    for filename in ["discovery.py", "reading.py", "_base.py", "sync.py", "user_info.py", "unread.py"]:
+    for filename in ["discovery.py", "reading.py", "_base.py", "sync.py", "entity_info.py", "unread.py"]:
         filepath = tools_dir / filename
         content = filepath.read_text()
         assert "from telethon" not in content, f"{filename} imports telethon"
