@@ -120,7 +120,10 @@ class DeltaSyncWorker:
                 and (now - last_synced_at) < RECENT_SYNC_SKIP_THRESHOLD_S
             ):
                 age_s = now - last_synced_at
-                logger.info(
+                # DEBUG, not INFO — with 300+ skipped dialogs this floods the
+                # log and obscures real signal. The aggregate count lives in
+                # the delta_catch_up complete summary at the end of this loop.
+                logger.debug(
                     "delta_catch_up_skip dialog_id=%d age_s=%d",
                     dialog_id,
                     age_s,
