@@ -103,19 +103,19 @@ async def test_call_tool_runtime_failure_escaped_error_includes_actionable_guida
 
 @pytest.mark.asyncio
 async def test_call_tool_passthrough_action_text_contract(monkeypatch) -> None:
-    monkeypatch.setitem(server.tool_by_name, "GetUserInfo", _tool("GetUserInfo"))
+    monkeypatch.setitem(server.tool_by_name, "GetEntityInfo", _tool("GetEntityInfo"))
 
     expected = [
         TextContent(
             type="text",
-            text='Could not fetch info for user "Iris" (boom).\nAction: Retry GetUserInfo later.',
+            text='Could not fetch entity info for \'Iris\' (boom).\nAction: Retry GetEntityInfo later.',
         )
     ]
 
     monkeypatch.setattr("mcp_telegram.server.tools.tool_args", lambda tool, **kwargs: object())
     monkeypatch.setattr("mcp_telegram.server.tools.tool_runner", AsyncMock(return_value=expected))
 
-    result = await server.call_tool("GetUserInfo", {"user": "Iris"})
+    result = await server.call_tool("GetEntityInfo", {"entity": "Iris"})
 
     assert result == expected
     assert result[0].text == expected[0].text
@@ -131,7 +131,7 @@ async def test_call_tool_unknown_tool_control_contract() -> None:
 
 def test_posture_primary_tools_reflected_in_descriptions() -> None:
     """Primary tools should have [primary] tag in their reflected descriptions."""
-    for name in ("ListMessages", "SearchMessages", "GetUserInfo"):
+    for name in ("ListMessages", "SearchMessages", "GetEntityInfo"):
         tool = server.tool_by_name[name]
         assert tool.description.startswith("[primary]"), f"{name} missing [primary] prefix"
 
@@ -153,13 +153,13 @@ def test_posture_covers_all_registered_tools() -> None:
         assert posture, f"{name} has empty posture"
 
 
-def test_posture_get_user_info_classified_as_primary() -> None:
-    """GetUserInfo must be classified as primary, not helper."""
+def test_posture_get_entity_info_classified_as_primary() -> None:
+    """GetEntityInfo must be classified as primary, not helper."""
     from mcp_telegram.tools import TOOL_REGISTRY
 
-    assert TOOL_REGISTRY["GetUserInfo"][1] == "primary", "GetUserInfo should be a primary user-task tool"
-    tool = server.tool_by_name["GetUserInfo"]
-    assert tool.description.startswith("[primary]"), "GetUserInfo missing [primary] prefix"
+    assert TOOL_REGISTRY["GetEntityInfo"][1] == "primary", "GetEntityInfo should be a primary user-task tool"
+    tool = server.tool_by_name["GetEntityInfo"]
+    assert tool.description.startswith("[primary]"), "GetEntityInfo missing [primary] prefix"
 
 
 def test_primary_tools_have_core_read_search_schema() -> None:
@@ -178,10 +178,10 @@ def test_primary_tools_have_core_read_search_schema() -> None:
     assert "query" in sm_props, "SearchMessages missing query"
     assert "navigation" in sm_props, "SearchMessages missing shared navigation field"
 
-    # GetUserInfo: must have user field for direct user lookup
-    get_user_info = server.tool_by_name["GetUserInfo"]
-    gui_props = get_user_info.inputSchema["properties"]
-    assert "user" in gui_props, "GetUserInfo missing user field for direct lookup"
+    # GetEntityInfo: must have entity field for universal entity lookup
+    get_entity_info = server.tool_by_name["GetEntityInfo"]
+    gei_props = get_entity_info.inputSchema["properties"]
+    assert "entity" in gei_props, "GetEntityInfo missing entity field for direct lookup"
 
 
 def test_helper_tools_remain_available_not_hidden() -> None:

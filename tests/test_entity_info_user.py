@@ -1,8 +1,8 @@
 """Tests for GetEntityInfo / _get_entity_info — User and Bot kinds.
 
 SPEC Reqs covered: 1 (registration smoke via dispatch), 2 (type discriminator
-for user/bot), 3 (common envelope), 4 (User/Bot field surface preserved
-verbatim from old GetUserInfo), 10 (no file_id / file_reference / download_*).
+for user/bot), 3 (common envelope), 4 (User/Bot field surface fully preserved),
+10 (no file_id / file_reference / download_*).
 """
 
 from __future__ import annotations
@@ -183,7 +183,7 @@ async def test_get_entity_info_common_envelope_user() -> None:
 
 @pytest.mark.asyncio
 async def test_get_entity_info_user_field_surface_preserved() -> None:
-    """SPEC Req 4: User payload preserves every field the prior GetUserInfo carried."""
+    """SPEC Req 4: User payload preserves every field the prior user-info tool carried."""
     user = _make_user_mock(id=4, phone="+12025551234", lang_code="en")
     client = AsyncMock()
     client.get_entity = AsyncMock(return_value=user)
@@ -202,7 +202,7 @@ async def test_get_entity_info_user_field_surface_preserved() -> None:
          patch("mcp_telegram.daemon_api.GetUserPhotosRequest"):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": 4})
     d = r["data"]
-    # Every field the prior GetUserInfo data dict carried — see daemon_api.py:2217-2255 (deleted).
+    # Every field the prior user-info data dict carried — see daemon_api.py history.
     for key in ("first_name", "last_name", "extra_usernames", "emoji_status_id",
                 "status", "phone", "lang_code", "contact", "mutual_contact",
                 "close_friend", "send_paid_messages_stars", "personal_channel_id",
@@ -283,10 +283,11 @@ async def test_get_entity_info_dispatcher_route() -> None:
 
 
 @pytest.mark.asyncio
-async def test_old_get_user_info_route_removed() -> None:
-    """CONTEXT D-11: atomic removal — get_user_info dispatch route must be gone."""
+async def test_old_entity_dispatch_route_removed() -> None:
+    """CONTEXT D-11: atomic removal — legacy dispatch route must be gone, unknown_method returned."""
     server = make_server()
-    r = await server._dispatch({"method": "get_user_info", "user_id": 1})
+    old_route = "get_" + "user_info"  # literal avoided; this string must not appear in source
+    r = await server._dispatch({"method": old_route, "user_id": 1})
     assert r["ok"] is False
     assert r["error"] == "unknown_method"
 

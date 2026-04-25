@@ -10,11 +10,12 @@ from mcp_telegram.errors import (
     ambiguous_dialog_text,
     ambiguous_sender_text,
     ambiguous_topic_text,
-    ambiguous_user_text,
+    ambiguous_entity_text,
     deleted_topic_text,
     dialog_not_found_text,
     dialog_topics_unavailable_text,
-    fetch_user_info_error_text,
+    entity_not_found_text,
+    fetch_entity_info_error_text,
     inaccessible_topic_text,
     invalid_navigation_text,
     no_active_topics_text,
@@ -29,7 +30,6 @@ from mcp_telegram.errors import (
     topic_not_found_text,
     usage_stats_db_missing_text,
     usage_stats_query_error_text,
-    user_not_found_text,
 )
 
 
@@ -134,18 +134,18 @@ def test_ambiguous_sender_text():
     assert "id=1" in result
 
 
-def test_user_not_found_text():
-    result = user_not_found_text("Nobody", retry_tool="GetUserInfo")
+def test_entity_not_found_text():
+    result = entity_not_found_text("Nobody", retry_tool="GetEntityInfo")
     assert "Nobody" in result
 
 
-def test_ambiguous_user_text():
-    result = ambiguous_user_text("Ivan", ["match1", "match2"], retry_tool="GetUserInfo")
+def test_ambiguous_entity_text():
+    result = ambiguous_entity_text("Ivan", ["match1", "match2"], retry_tool="GetEntityInfo")
     assert "multiple" in result.lower()
 
 
-def test_fetch_user_info_error_text():
-    result = fetch_user_info_error_text("Bob", "timeout")
+def test_fetch_entity_info_error_text():
+    result = fetch_entity_info_error_text("Bob", "timeout")
     assert "Bob" in result
     assert "timeout" in result
 
