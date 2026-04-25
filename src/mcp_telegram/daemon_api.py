@@ -9,7 +9,7 @@ DaemonAPIServer listens on a Unix domain socket and handles fifteen methods:
   - mark_dialog_for_sync: add/remove dialog from sync scope
   - get_sync_status: sync status and message statistics for a dialog
   - get_sync_alerts: deleted messages, edit history, access-lost dialogs
-  - get_user_info: user profile and common chats
+  - get_entity_info: type-tagged entity profile (user/bot/channel/supergroup/group), DB-first with 5-min TTL
   - list_unread_messages: prioritized unread messages across dialogs
   - record_telemetry: write telemetry event to sync.db
   - get_usage_stats: read usage statistics from sync.db
@@ -53,6 +53,27 @@ from telethon.tl.functions.photos import GetUserPhotosRequest  # type: ignore[im
 from telethon.tl.functions.users import GetFullUserRequest  # type: ignore[import-untyped]
 from telethon.tl.types import Channel, Chat  # type: ignore[import-untyped]
 from xdg_base_dirs import xdg_state_home  # type: ignore[import-error]
+
+from telethon.tl.functions.channels import GetFullChannelRequest  # type: ignore[import-untyped]
+from telethon.tl.functions.messages import SearchRequest as MessagesSearchRequest  # type: ignore[import-untyped]
+from telethon.tl.types import (  # type: ignore[import-untyped]
+    ChatReactionsAll,
+    ChatReactionsNone,
+    ChatReactionsSome,
+    InputMessagesFilterChatPhotos,
+    MessageActionChatEditPhoto,
+)
+
+# Per CONTEXT D-01 / SPEC Req 8: GetEntityInfo cache TTL is uniform 5 minutes.
+# Single value — per-field TTL tiers are explicitly out of scope (see CONTEXT
+# Deferred Ideas §"Per-field TTL tiers"). The orchestrator gates on
+# int(time.time()) - entity_details.fetched_at < _ENTITY_DETAIL_TTL_SECONDS.
+_ENTITY_DETAIL_TTL_SECONDS = 300
+
+# Per CONTEXT D-02: detail_json blobs carry an embedded schema discriminator
+# at the top level so future Telethon-driven shape changes are detectable
+# without an ALTER TABLE. Bump on any breaking shape change.
+_ENTITY_DETAIL_SCHEMA_VERSION = 1
 
 
 def _classify_dialog_type(entity: object | None) -> str:
@@ -723,6 +744,35 @@ class DaemonAPIServer:
         self._ready: bool = False
         self.startup_detail: str = "connecting to Telegram"
 
+    def _dm_peer_ids(self) -> set[int]:
+        """Return ids of all DM peers the operator has ever exchanged messages with.
+
+        Per CONTEXT D-12 / D-13 (PRODUCT-LOCKED): "people I know" is defined as
+        anyone with whom the operator has ever exchanged DMs (a synced 1:1
+        dialog). Phonebook contacts are a subset signal, not a separate axis.
+        Group/channel-only message senders are explicitly excluded.
+
+        Source: SELECT dialog_id FROM synced_dialogs WHERE dialog_id > 0 AND
+        status != 'access_lost' (DM peers have positive dialog_id; channels
+        and groups have negative ids). The access_lost filter excludes peers
+        the operator was blocked by, deleted, or otherwise can no longer
+        reach — those aren't "known" relationships any more (LOW-1 from
+        47-REVIEWS.md, opencode 2026-04-25).
+
+        Bounded to hundreds of rows in practice — no precomputed table, no
+        new column on entities. Computed per call in Python from one indexed
+        SELECT — O(n) in DM-peer count. Re-runs on every contacts_subscribed
+        invocation; not cached.
+
+        Used by _fetch_channel_detail / _fetch_supergroup_detail /
+        _fetch_group_detail in Plan 03 to compute contacts_subscribed.
+        """
+        rows = self._conn.execute(
+            "SELECT dialog_id FROM synced_dialogs "
+            "WHERE dialog_id > 0 AND status != 'access_lost'"
+        ).fetchall()
+        return {row[0] for row in rows}
+
     # ------------------------------------------------------------------
     # Connection handler
     # ------------------------------------------------------------------
@@ -824,8 +874,8 @@ class DaemonAPIServer:
             return await self._get_sync_status(req)
         if method == "get_sync_alerts":
             return await self._get_sync_alerts(req)
-        if method == "get_user_info":
-            return await self._get_user_info(req)
+        if method == "get_entity_info":
+            return await self._get_entity_info(req)
         if method == "get_inbox":
             return await self._list_unread_messages(req)
         if method == "record_telemetry":
@@ -2013,7 +2063,7 @@ class DaemonAPIServer:
         }
 
     # ------------------------------------------------------------------
-    # get_user_info
+    # get_entity_info
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -2039,20 +2089,190 @@ class DaemonAPIServer:
             return {"type": "last_month"}
         return None  # UserStatusEmpty or unknown
 
-    async def _get_user_info(self, req: dict) -> dict:
-        """Return user profile and list of common chats.
+    async def _get_entity_info(self, req: dict) -> dict:
+        """Type-tagged entity inspector covering 5 Telegram entity kinds.
 
-        Calls client.get_entity(user_id) and GetCommonChatsRequest to build
-        a complete user profile dict with typed common_chats entries.
+        DB-first read from sync.db.entity_details; live MTProto fetch only on
+        cache miss or staleness. Returns one of five 'type' discriminators:
+        'user' | 'bot' | 'channel' | 'supergroup' | 'group'. Per CONTEXT D-05
+        + D-06: this orchestrator owns DB cache, TTL gate, common-envelope
+        assembly, write-back, and error envelope shaping. Per-type helpers
+        (_fetch_user_detail / _fetch_channel_detail / _fetch_supergroup_detail
+        / _fetch_group_detail) own only the type-specific RPC chain.
+
+        Request schema: {method: "get_entity_info", entity_id: int}
+        Response schema: see CONTEXT §"Daemon dispatch layout" D-06 + D-10.
         """
-        user_id: int = req.get("user_id", 0)
-        try:
-            user = await self._client.get_entity(user_id)
-        except Exception as exc:
-            logger.warning("get_entity failed for user_id=%s: %s%s", user_id, exc, _rid())
-            return {"ok": False, "error": "user_not_found", "message": "telegram API error"}
+        entity_id = req.get("entity_id")
+        if not isinstance(entity_id, int):
+            return {
+                "ok": False,
+                "error": "telegram_api_error",
+                "message": "entity_id missing or not an integer",
+                "data": None,
+            }
 
-        # Fetch common chats (only available for user entities)
+        now = int(time.time())
+
+        # ----- DB-first read (SPEC Req 8) -----
+        try:
+            row = self._conn.execute(
+                "SELECT detail_json, fetched_at FROM entity_details WHERE entity_id = ?",
+                (entity_id,),
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            logger.warning(
+                "entity_info db_read_failed entity_id=%r error=%s%s",
+                entity_id, exc, _rid(),
+            )
+            return {
+                "ok": False,
+                "error": "db_unavailable",
+                "message": str(exc),
+                "data": None,
+            }
+
+        if row is not None:
+            detail_json, fetched_at = row
+            if now - fetched_at < _ENTITY_DETAIL_TTL_SECONDS:
+                # Cache HIT, fresh
+                try:
+                    detail = json.loads(detail_json)
+                except json.JSONDecodeError:
+                    logger.warning(
+                        "entity_info detail_json_corrupt entity_id=%r%s — treating as cache miss",
+                        entity_id, _rid(),
+                    )
+                    detail = None
+                if detail is not None and detail.get("schema") == _ENTITY_DETAIL_SCHEMA_VERSION:
+                    return {"ok": True, "data": self._strip_envelope_schema(detail)}
+                # Schema mismatch or corrupt JSON → fall through to live fetch.
+
+        # ----- Cache miss / stale: live fetch -----
+        try:
+            entity = await self._client.get_entity(entity_id)
+        except (ValueError, KeyError) as exc:
+            logger.warning(
+                "entity_info entity_not_found entity_id=%r error=%s%s",
+                entity_id, exc, _rid(),
+            )
+            return {
+                "ok": False,
+                "error": "entity_not_found",
+                "message": str(exc),
+                "data": None,
+            }
+        except Exception as exc:
+            logger.warning(
+                "entity_info get_entity_failed entity_id=%r error=%s%s",
+                entity_id, exc, _rid(), exc_info=True,
+            )
+            return {
+                "ok": False,
+                "error": "telegram_api_error",
+                "message": str(exc),
+                "data": None,
+            }
+
+        # ----- Dispatch by type (D-09 — reuses _classify_dialog_type) -----
+        dispatch_kind = _classify_dialog_type(entity)
+
+        if dispatch_kind in ("User", "Bot"):
+            detail = await self._fetch_user_detail(entity)
+        elif dispatch_kind == "Channel":
+            detail = await self._fetch_channel_detail(entity)
+        elif dispatch_kind in ("Group", "Forum"):
+            # Plan 03 owns supergroup helper. Until 03 lands, return a clean
+            # unsupported error so the contract is unambiguous in tests and
+            # smoke runs. Plan 03 replaces this branch with:
+            #     detail = await self._fetch_supergroup_detail(entity)
+            return {
+                "ok": False,
+                "error": "unsupported_entity_type",
+                "message": "supergroup detail not yet implemented (Plan 03)",
+                "data": None,
+            }
+        elif dispatch_kind == "Chat":
+            # Plan 03 owns legacy-group helper. Until 03 lands:
+            #     detail = await self._fetch_group_detail(entity)
+            return {
+                "ok": False,
+                "error": "unsupported_entity_type",
+                "message": "legacy group detail not yet implemented (Plan 03)",
+                "data": None,
+            }
+        else:
+            return {
+                "ok": False,
+                "error": "unsupported_entity_type",
+                "message": f"unknown entity kind: {dispatch_kind}",
+                "data": None,
+            }
+
+        if detail is None:
+            return {
+                "ok": False,
+                "error": "telegram_api_error",
+                "message": "per-type helper returned no detail",
+                "data": None,
+            }
+
+        # ----- Write back: entities (auto-resolve, SPEC Req 11) + entity_details -----
+        try:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO entities (id, type, name, username, updated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    entity_id,
+                    detail.get("type", "unknown"),
+                    detail.get("name"),
+                    detail.get("username"),
+                    now,
+                ),
+            )
+            payload_with_schema = {"schema": _ENTITY_DETAIL_SCHEMA_VERSION, **detail}
+            self._conn.execute(
+                "INSERT OR REPLACE INTO entity_details (entity_id, detail_json, fetched_at) "
+                "VALUES (?, ?, ?)",
+                (entity_id, json.dumps(payload_with_schema), now),
+            )
+            self._conn.commit()
+        except sqlite3.OperationalError as exc:
+            logger.warning(
+                "entity_info db_writeback_failed entity_id=%r error=%s%s",
+                entity_id, exc, _rid(), exc_info=True,
+            )
+            # Continue: still return the live data even if cache write failed.
+
+        return {"ok": True, "data": detail}
+
+    @staticmethod
+    def _strip_envelope_schema(detail: dict) -> dict:
+        """Remove the internal 'schema' discriminator before returning to the wire.
+
+        The 'schema' field is a write-back implementation detail; clients see
+        only the typed payload. Pure-Python dict copy — bounded size.
+        """
+        return {k: v for k, v in detail.items() if k != "schema"}
+
+    async def _fetch_user_detail(self, user) -> dict:
+        """Per-type helper: User/Bot detail. Per CONTEXT D-07, body refactored
+        verbatim from the prior _get_user_info except for the resolution
+        prelude (orchestrator passes an already-resolved entity).
+
+        Per CONTEXT D-08: User vs Bot discriminated via getattr(user, "bot", False)
+        — same RPC chain (GetFullUserRequest + GetUserPhotosRequest +
+        GetCommonChatsRequest) for both kinds, only the response 'type' differs.
+
+        SPEC Req 4: User/Bot field surface preserved verbatim from prior
+        GetUserInfo. The diff between the prior tool's data dict and this
+        helper's return is exactly: 'type' added, 'my_membership' added,
+        'photos' renamed to 'avatar_history', 'avatar_count' added; everything
+        else unchanged.
+        """
+        user_id = int(user.id)
+
+        # --- common_chats (existing _get_user_info body) ---
         common_chats: list[dict] = []
         try:
             common_result = await self._client(GetCommonChatsRequest(user_id=user_id, max_id=0, limit=100))
@@ -2063,20 +2283,18 @@ class DaemonAPIServer:
                     chat_type = "group"
                 else:
                     chat_type = "user"
-
-                common_chats.append(
-                    {
-                        "id": int(telethon_utils.get_peer_id(chat)),
-                        "name": getattr(chat, "title", None) or str(chat.id),
-                        "type": chat_type,
-                    }
-                )
+                common_chats.append({
+                    "id": int(telethon_utils.get_peer_id(chat)),
+                    "name": getattr(chat, "title", None) or str(chat.id),
+                    "type": chat_type,
+                })
         except Exception as exc:
             logger.warning(
-                "get_user_info common_chats_failed user_id=%r error=%s%s", user_id, exc, _rid(), exc_info=True
+                "entity_info user common_chats_failed user_id=%r error=%s%s",
+                user_id, exc, _rid(), exc_info=True,
             )
 
-        # Fetch full user profile
+        # --- GetFullUserRequest body — verbatim from old _get_user_info ---
         about: str | None = None
         personal_channel_id: int | None = None
         birthday: dict | None = None
@@ -2099,7 +2317,6 @@ class DaemonAPIServer:
             ttl_period = getattr(user_full, "ttl_period", None)
             private_forward_name = getattr(user_full, "private_forward_name", None) or None
             folder_id = getattr(user_full, "folder_id", None)
-
             bday = getattr(user_full, "birthday", None)
             if bday is not None:
                 birthday = {
@@ -2107,22 +2324,18 @@ class DaemonAPIServer:
                     "month": getattr(bday, "month", None),
                     "year": getattr(bday, "year", None),
                 }
-
             raw_bot_info = getattr(user_full, "bot_info", None)
             if raw_bot_info is not None:
                 commands = []
                 for cmd in getattr(raw_bot_info, "commands", None) or []:
-                    commands.append(
-                        {
-                            "command": getattr(cmd, "command", ""),
-                            "description": getattr(cmd, "description", ""),
-                        }
-                    )
+                    commands.append({
+                        "command": getattr(cmd, "command", ""),
+                        "description": getattr(cmd, "description", ""),
+                    })
                 bot_info = {
                     "description": getattr(raw_bot_info, "description", None) or None,
                     "commands": commands,
                 }
-
             raw_loc = getattr(user_full, "business_location", None)
             if raw_loc is not None:
                 geo = getattr(raw_loc, "geo_point", None)
@@ -2131,128 +2344,391 @@ class DaemonAPIServer:
                     "lat": getattr(geo, "lat", None) if geo else None,
                     "long": getattr(geo, "long", None) if geo else None,
                 }
-
             raw_intro = getattr(user_full, "business_intro", None)
             if raw_intro is not None:
                 business_intro = {
                     "title": getattr(raw_intro, "title", None),
                     "description": getattr(raw_intro, "description", None),
                 }
-
             raw_hours = getattr(user_full, "business_work_hours", None)
             if raw_hours is not None:
-                business_work_hours = {
-                    "timezone": getattr(raw_hours, "timezone_id", None),
-                }
-
+                business_work_hours = {"timezone": getattr(raw_hours, "timezone_id", None)}
             raw_note = getattr(user_full, "note", None)
             if raw_note is not None:
                 note = getattr(raw_note, "text", None) or None
-
         except Exception as exc:
-            logger.warning("get_user_info full_user_failed user_id=%r error=%s%s", user_id, exc, _rid(), exc_info=True)
+            logger.warning(
+                "entity_info user full_user_failed user_id=%r error=%s%s",
+                user_id, exc, _rid(), exc_info=True,
+            )
 
-        # Resolve folder_id → folder name
+        # --- folder name resolution (verbatim from old _get_user_info) ---
         if folder_id is not None:
             try:
                 filters = await self._client(GetDialogFiltersRequest())
                 for f in filters or []:
                     if getattr(f, "id", None) == folder_id:
                         raw_title = getattr(f, "title", None)
-                        # title may be str or TextWithEntities
                         folder_name = getattr(raw_title, "text", raw_title) if raw_title else None
                         break
             except Exception as exc:
                 logger.warning(
-                    "get_user_info folder_resolve_failed folder_id=%r error=%s%s", folder_id, exc, _rid(), exc_info=True
+                    "entity_info user folder_resolve_failed folder_id=%r error=%s%s",
+                    folder_id, exc, _rid(), exc_info=True,
                 )
 
-        # Additional usernames (Telegram allows multiple active usernames)
+        # --- extra usernames + emoji status + restriction reason (verbatim) ---
         extra_usernames: list[str] = []
         for uname in getattr(user, "usernames", None) or []:
             name_str = getattr(uname, "username", None)
             if name_str and name_str != getattr(user, "username", None):
                 extra_usernames.append(name_str)
-
         emoji_status = getattr(user, "emoji_status", None)
         emoji_status_id: int | None = None
         if emoji_status is not None:
             emoji_status_id = getattr(emoji_status, "document_id", None)
-
         restriction_reason: list[dict] = []
         for rr in getattr(user, "restriction_reason", None) or []:
-            restriction_reason.append(
-                {
-                    "platform": getattr(rr, "platform", None),
-                    "reason": getattr(rr, "reason", None),
-                    "text": getattr(rr, "text", None),
-                }
-            )
+            restriction_reason.append({
+                "platform": getattr(rr, "platform", None),
+                "reason": getattr(rr, "reason", None),
+                "text": getattr(rr, "text", None),
+            })
 
-        # Fetch profile photo history (OSINT: avatar change frequency).
-        # Thin pass-through of photos.GetUserPhotos — only id+date exposed,
-        # no binary content. Telegram caps at ~100 per request.
-        # Order: fetched last so existing common+full mock sequences in tests stay stable.
-        photos: list[dict] = []
+        # --- avatar_history + avatar_count (rename from `photos`; SPEC Req 10 —
+        #     no file_id / file_reference / download_*) ---
+        avatar_history: list[dict] = []
+        avatar_count: int = 0
         try:
             photos_result = await self._client(
                 GetUserPhotosRequest(user_id=user, offset=0, max_id=0, limit=100)
             )
+            avatar_count = int(getattr(photos_result, "count", len(getattr(photos_result, "photos", []))))
             for photo in getattr(photos_result, "photos", []):
                 photo_id = getattr(photo, "id", None)
                 photo_date = getattr(photo, "date", None)
                 if photo_id is None or photo_date is None:
                     continue
-                photos.append(
-                    {
-                        "photo_id": int(photo_id),
-                        "date": photo_date.isoformat(),
-                    }
-                )
+                avatar_history.append({
+                    "photo_id": int(photo_id),
+                    "date": photo_date.isoformat(),
+                })
         except Exception as exc:
             logger.warning(
-                "get_user_info photos_failed user_id=%r error=%s%s", user_id, exc, _rid(), exc_info=True
+                "entity_info user photos_failed user_id=%r error=%s%s",
+                user_id, exc, _rid(), exc_info=True,
             )
 
-        return {
-            "ok": True,
-            "data": {
-                "id": user.id,
-                "first_name": getattr(user, "first_name", None),
-                "last_name": getattr(user, "last_name", None),
-                "username": getattr(user, "username", None),
-                "extra_usernames": extra_usernames,
-                "emoji_status_id": emoji_status_id,
-                "status": self._format_user_status(getattr(user, "status", None)),
-                "phone": getattr(user, "phone", None),
-                "lang_code": getattr(user, "lang_code", None),
-                "contact": bool(getattr(user, "contact", False)),
-                "mutual_contact": bool(getattr(user, "mutual_contact", False)),
-                "close_friend": bool(getattr(user, "close_friend", False)),
-                "send_paid_messages_stars": getattr(user, "send_paid_messages_stars", None),
-                "about": about,
-                "personal_channel_id": personal_channel_id,
-                "birthday": birthday,
-                "verified": bool(getattr(user, "verified", False)),
-                "premium": bool(getattr(user, "premium", False)),
-                "bot": bool(getattr(user, "bot", False)),
-                "scam": bool(getattr(user, "scam", False)),
-                "fake": bool(getattr(user, "fake", False)),
-                "restricted": bool(getattr(user, "restricted", False)),
-                "restriction_reason": restriction_reason,
+        # --- common-envelope fields (D-06) ---
+        first_name = getattr(user, "first_name", None)
+        last_name = getattr(user, "last_name", None)
+        name = " ".join(part for part in (first_name, last_name) if part)
+        username = getattr(user, "username", None)
+
+        # --- my_membership for User/Bot: relationship sub-block per SPEC Req 3 ---
+        contact_flag = bool(getattr(user, "contact", False))
+        mutual_contact = bool(getattr(user, "mutual_contact", False))
+        close_friend = bool(getattr(user, "close_friend", False))
+        my_membership = {
+            "is_member": contact_flag or mutual_contact,
+            "is_admin": False,
+            "admin_rights": None,
+            "relationship": {
+                "contact": contact_flag,
+                "mutual_contact": mutual_contact,
+                "close_friend": close_friend,
                 "blocked": blocked,
-                "ttl_period": ttl_period,
-                "private_forward_name": private_forward_name,
-                "bot_info": bot_info,
-                "business_location": business_location,
-                "business_intro": business_intro,
-                "business_work_hours": business_work_hours,
-                "note": note,
-                "folder_id": folder_id,
-                "folder_name": folder_name,
-                "common_chats": common_chats,
-                "photos": photos,
             },
+        }
+
+        # --- type discriminator (D-08) ---
+        entity_type = "bot" if bool(getattr(user, "bot", False)) else "user"
+
+        return {
+            # Common envelope (D-06)
+            "id": user_id,
+            "type": entity_type,
+            "name": name or None,
+            "username": username,
+            "about": about,
+            "my_membership": my_membership,
+            "avatar_history": avatar_history,
+            "avatar_count": avatar_count,
+            # User/Bot-specific (verbatim shape from old _get_user_info data dict)
+            "first_name": first_name,
+            "last_name": last_name,
+            "extra_usernames": extra_usernames,
+            "emoji_status_id": emoji_status_id,
+            "status": self._format_user_status(getattr(user, "status", None)),
+            "phone": getattr(user, "phone", None),
+            "lang_code": getattr(user, "lang_code", None),
+            "contact": contact_flag,
+            "mutual_contact": mutual_contact,
+            "close_friend": close_friend,
+            "send_paid_messages_stars": getattr(user, "send_paid_messages_stars", None),
+            "personal_channel_id": personal_channel_id,
+            "birthday": birthday,
+            "verified": bool(getattr(user, "verified", False)),
+            "premium": bool(getattr(user, "premium", False)),
+            "bot": bool(getattr(user, "bot", False)),
+            "scam": bool(getattr(user, "scam", False)),
+            "fake": bool(getattr(user, "fake", False)),
+            "restricted": bool(getattr(user, "restricted", False)),
+            "restriction_reason": restriction_reason,
+            "blocked": blocked,
+            "ttl_period": ttl_period,
+            "private_forward_name": private_forward_name,
+            "bot_info": bot_info,
+            "business_location": business_location,
+            "business_intro": business_intro,
+            "business_work_hours": business_work_hours,
+            "note": note,
+            "folder_id": folder_id,
+            "folder_name": folder_name,
+            "common_chats": common_chats,
+        }
+
+    async def _search_chat_photo_history(self, peer, full_chat) -> tuple[list[dict], int]:
+        """Avatar history via messages.Search(filter=ChatPhotos), with the
+        D-19 broadcast-channel reconciliation (prepend full.chat_photo if
+        missing) and D-20 fallback (degrade to chat_photo-only on RPC error).
+
+        Returns (avatar_history, avatar_count). Reused by _fetch_channel_detail
+        (this task), _fetch_supergroup_detail (Plan 03), and _fetch_group_detail
+        (Plan 03).
+        """
+        peer_id = int(telethon_utils.get_peer_id(peer))
+        avatar_history: list[dict] = []
+        avatar_count = 0
+        # HIGH-3 from 47-REVIEWS.md cycle 3 (codex 2026-04-25): explicit
+        # search_failed flag. Without it, after the photo search raises and
+        # D-19 reconciliation inserts `full_chat.chat_photo`, `avatar_history`
+        # is no longer empty, so the old D-20 fallback block (`if not
+        # avatar_history and current_photo_id is not None`) is skipped — and
+        # `avatar_count` stays at 0 even though one current photo is present.
+        # That contradicts D-20's locked contract: "avatar_count = 1 in this
+        # fallback case". The flag lets D-20 run alongside D-19 instead of
+        # being short-circuited by it.
+        search_failed = False
+        try:
+            search_result = await self._client(MessagesSearchRequest(
+                peer=peer,
+                q="",
+                filter=InputMessagesFilterChatPhotos(),
+                min_date=None, max_date=None,
+                offset_id=0, add_offset=0, limit=100,
+                max_id=0, min_id=0, hash=0,
+                from_id=None,
+            ))
+            avatar_count = int(getattr(search_result, "count", len(getattr(search_result, "messages", []))))
+            for msg in getattr(search_result, "messages", []):
+                action = getattr(msg, "action", None)
+                if isinstance(action, MessageActionChatEditPhoto):
+                    photo = getattr(action, "photo", None)
+                    photo_date = getattr(msg, "date", None)
+                    if photo is not None and photo_date is not None and getattr(photo, "id", None) is not None:
+                        avatar_history.append({
+                            "photo_id": int(photo.id),
+                            "date": photo_date.isoformat(),
+                        })
+        except Exception as exc:
+            search_failed = True
+            logger.warning(
+                "entity_info avatar_search_failed peer_id=%r error=%s%s",
+                peer_id, exc, _rid(),
+            )
+
+        # D-19 reconciliation: prepend full.chat_photo if it's missing from search.
+        chat_photo = getattr(full_chat, "chat_photo", None) if full_chat is not None else None
+        current_photo_id = getattr(chat_photo, "id", None) if chat_photo is not None else None
+        if current_photo_id is not None and not any(
+            p["photo_id"] == int(current_photo_id) for p in avatar_history
+        ):
+            chat_photo_date = getattr(chat_photo, "date", None)
+            avatar_history.insert(0, {
+                "photo_id": int(current_photo_id),
+                "date": chat_photo_date.isoformat() if chat_photo_date is not None else None,
+            })
+
+        # D-20 fallback (HIGH-3 from 47-REVIEWS.md cycle 3 — re-ordered): runs
+        # whenever the search raised, regardless of whether D-19 just inserted
+        # the current chat_photo. Two cases:
+        #   (a) Search failed AND chat_photo unknown → empty history, count=0
+        #       (already the natural state — nothing to do).
+        #   (b) Search failed AND chat_photo known → D-19 already prepended
+        #       the current photo, but `avatar_count` is still the broken
+        #       initial 0 (the failed Search never gave us a count). D-20
+        #       mandates `avatar_count = 1` here. Use max(...) so a partial
+        #       (rare) success — non-zero count + later raise — is preserved.
+        if search_failed and current_photo_id is not None:
+            avatar_count = max(avatar_count, 1)
+        # Belt-and-suspenders: legacy D-20 path for the (theoretical) case
+        # where avatar_history is still empty AND chat_photo exists AND search
+        # did NOT raise (e.g. Search returned a degenerate empty payload).
+        # Same surface as before the fix.
+        if not avatar_history and current_photo_id is not None:
+            chat_photo_date = getattr(chat_photo, "date", None)
+            avatar_history = [{
+                "photo_id": int(current_photo_id),
+                "date": chat_photo_date.isoformat() if chat_photo_date is not None else None,
+            }]
+            avatar_count = max(avatar_count, 1)
+
+        return avatar_history, avatar_count
+
+    async def _fetch_channel_detail(self, channel) -> dict:
+        """Per-type helper: Broadcast Channel detail (megagroup=False).
+
+        Per CONTEXT D-09 / D-21: max 6 MTProto requests on the non-User path
+        — 1 GetFullChannelRequest + ≤1 messages.Search(ChatPhotos) + ≤1 photo
+        item (current chat_photo reconciliation per D-19). Plan 03 adds the
+        ≤2 GetParticipants pages for the contacts_subscribed enumeration.
+
+        Returns SPEC Req 5 surface + common envelope. contacts_subscribed
+        enumeration is Plan 03's territory; Plan 02 returns either the
+        privacy-gated null + reason='not_an_admin' (SPEC Req 9) or a stub
+        flagged for Plan 03.
+        """
+        channel_id = int(telethon_utils.get_peer_id(channel))
+
+        # ----- GetFullChannelRequest -----
+        full_chat = None
+        subscribers_count: int | None = None
+        linked_chat_id: int | None = None
+        pinned_msg_id: int | None = None
+        slow_mode_seconds: int | None = None
+        available_reactions: dict = {"kind": "none", "emojis": []}
+        about: str | None = None
+        try:
+            full_result = await self._client(GetFullChannelRequest(channel=channel))
+            full_chat = full_result.full_chat
+            subscribers_count = getattr(full_chat, "participants_count", None)
+            linked_chat_id_raw = getattr(full_chat, "linked_chat_id", None)
+            if linked_chat_id_raw is not None:
+                # Channel ids are returned in bare form by Telethon; normalize to peer-id form
+                # so downstream GetEntityInfo calls work with the same id scheme.
+                # MEDIUM from 47-REVIEWS.md cycle 2 (codex): use the canonical Telethon
+                # helper instead of `int(f"-100{raw}")` string concatenation. The string
+                # form is brittle — it assumes raw > 0 and channel-shape, and breaks if
+                # Telethon ever returns a peer-form id directly. The util handles both.
+                if linked_chat_id_raw > 0:
+                    from telethon.tl.types import PeerChannel  # type: ignore[import-untyped]
+                    linked_chat_id = int(telethon_utils.get_peer_id(PeerChannel(linked_chat_id_raw)))
+                else:
+                    # Already in peer-id form — pass through.
+                    linked_chat_id = int(linked_chat_id_raw)
+            pinned_msg_id = getattr(full_chat, "pinned_msg_id", None)
+            slow_mode_seconds = getattr(full_chat, "slowmode_seconds", None)
+            about = getattr(full_chat, "about", None) or None
+
+            raw_reactions = getattr(full_chat, "available_reactions", None)
+            if isinstance(raw_reactions, ChatReactionsAll):
+                available_reactions = {"kind": "all", "emojis": []}
+            elif isinstance(raw_reactions, ChatReactionsSome):
+                emojis = []
+                for r in getattr(raw_reactions, "reactions", []) or []:
+                    em = getattr(r, "emoticon", None)
+                    if em:
+                        emojis.append(em)
+                available_reactions = {"kind": "some", "emojis": emojis}
+            elif isinstance(raw_reactions, ChatReactionsNone) or raw_reactions is None:
+                available_reactions = {"kind": "none", "emojis": []}
+        except Exception as exc:
+            logger.warning(
+                "entity_info channel full_channel_failed channel_id=%r error=%s%s",
+                channel_id, exc, _rid(), exc_info=True,
+            )
+
+        # ----- restrictions (from the channel entity itself, mirrors User path) -----
+        restrictions: list[dict] = []
+        for rr in getattr(channel, "restriction_reason", None) or []:
+            restrictions.append({
+                "platform": getattr(rr, "platform", None),
+                "reason": getattr(rr, "reason", None),
+                "text": getattr(rr, "text", None),
+            })
+
+        # ----- my_membership: is_admin derived from channel flags -----
+        is_creator = bool(getattr(channel, "creator", False))
+        admin_rights_obj = getattr(channel, "admin_rights", None)
+        is_admin = is_creator or (admin_rights_obj is not None)
+        my_membership = {
+            "is_member": not bool(getattr(channel, "left", False)),
+            "is_admin": is_admin,
+            "admin_rights": (
+                {
+                    field: bool(getattr(admin_rights_obj, field, False))
+                    for field in (
+                        "change_info", "post_messages", "edit_messages",
+                        "delete_messages", "ban_users", "invite_users",
+                        "pin_messages", "add_admins", "anonymous", "manage_call",
+                        "other", "manage_topics", "post_stories", "edit_stories",
+                        "delete_stories",
+                    )
+                }
+                if admin_rights_obj is not None else None
+            ),
+        }
+
+        # ----- contacts_subscribed (Plan 02 partial: privacy gate only; Plan 03 enumerates) -----
+        # HIGH-A from 47-REVIEWS.md cycle 2 (2026-04-25, opencode + codex
+        # consensus): Plan 03 Task 3 REPLACES the `enumeration_owned_by_plan_03`
+        # admin-path stub below with real enumeration on this same helper.
+        # Plan 02's responsibility ends at the privacy-gate (`not_an_admin`)
+        # branch; Plan 03 owns the admin branch. This is a TEMPORARY stub
+        # designed to be overwritten in Wave 3 — leaving it in production
+        # would violate SPEC Req 9 (acceptance: GetEntityInfo on a known
+        # broadcast channel returns contacts_subscribed for an admin caller).
+        contacts_subscribed = None
+        contacts_subscribed_partial = False
+        contacts_reason = None
+        if not is_admin:
+            # Broadcast channels hide subscriber lists from non-admins. SPEC Req 9.
+            contacts_subscribed = None
+            contacts_reason = "not_an_admin"
+        else:
+            # Plan 03 Task 3 replaces this admin branch with real enumeration:
+            #   subscribers_count <= 1000  →  iter_participants ∩ _dm_peer_ids()
+            #   subscribers_count > 1000   →  ChannelParticipantsContacts ∩ _dm_peer_ids()
+            #                                  + contacts_subscribed_partial=True
+            # Plan 02 commits with this stub so the broadcast envelope shape is
+            # complete; Plan 03 OVERWRITES this branch in the same file.
+            # If Plan 03 ships and any production response still carries
+            # contacts_reason="enumeration_owned_by_plan_03", that is a HIGH
+            # regression — the Plan 04 acceptance grep enforces this.
+            contacts_subscribed = None
+            contacts_reason = "enumeration_owned_by_plan_03"
+
+        # ----- avatar_history via shared helper (D-17..D-20) -----
+        # MEDIUM-1 from 47-REVIEWS.md (opencode 2026-04-25): avatar-search +
+        # D-19 reconciliation + D-20 fallback live in the shared
+        # `_search_chat_photo_history` helper defined above.
+        avatar_history, avatar_count = await self._search_chat_photo_history(channel, full_chat)
+
+        # ----- common envelope assembly -----
+        title = getattr(channel, "title", None)
+        username = getattr(channel, "username", None)
+
+        return {
+            # Common envelope (D-06)
+            "id": channel_id,
+            "type": "channel",
+            "name": title,
+            "username": username,
+            "about": about,
+            "my_membership": my_membership,
+            "avatar_history": avatar_history,
+            "avatar_count": avatar_count,
+            # Channel-specific (SPEC Req 5)
+            "subscribers_count": subscribers_count,
+            "linked_chat_id": linked_chat_id,
+            "pinned_msg_id": pinned_msg_id,
+            "slow_mode_seconds": slow_mode_seconds,
+            "available_reactions": available_reactions,
+            "restrictions": restrictions,
+            "contacts_subscribed": contacts_subscribed,
+            "contacts_subscribed_partial": contacts_subscribed_partial,
+            "contacts_reason": contacts_reason,
         }
 
     # ------------------------------------------------------------------
