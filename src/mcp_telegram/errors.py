@@ -124,35 +124,6 @@ def ambiguous_sender_text(sender_name: str, match_lines: list[str], *, retry_too
     )
 
 
-def user_not_found_text(user_name: str, *, retry_tool: str) -> str:
-    """Return an action-oriented response for missing users."""
-    return action_text(
-        f'User "{user_name}" was not found.',
-        f"Call ListDialogs, then retry {retry_tool} with an exact user name or @username.",
-    )
-
-
-def ambiguous_user_text(user_name: str, match_lines: list[str], *, retry_tool: str) -> str:
-    """Return an action-oriented response for ambiguous users."""
-    matches = "\n".join(match_lines)
-    return (
-        f'User "{user_name}" matched multiple users.\n'
-        f"Action: Retry {retry_tool} with one exact user match from the list below.\n"
-        f"{matches}"
-    )
-
-
-# Tool-specific error texts (moved from tools.py)
-
-
-def fetch_user_info_error_text(user_name: str, detail: str) -> str:
-    """Return an action-oriented response for user-info fetch failures."""
-    return action_text(
-        f'Could not fetch info for user "{user_name}" ({detail}).',
-        "Retry GetUserInfo later. If this persists, verify that the Telegram session still has access to this user and shared chats.",
-    )
-
-
 def ambiguous_entity_text(query: str, match_lines: list[str], *, retry_tool: str = "GetEntityInfo") -> str:
     """Multi-candidate disambiguation prompt for entity resolution."""
     joined = "\n  ".join(match_lines)

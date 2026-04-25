@@ -11,7 +11,7 @@
           "ListTopics",
           "GetInbox",
           "GetMyAccount",
-          "GetUserInfo",
+          "GetEntityInfo",
           "GetUsageStats",
           "MarkDialogForSync",
           "GetSyncStatus",
@@ -107,13 +107,13 @@
       }
     },
     {
-      "_comment": "GetUserInfo — entity_cache resolve first, 'not found' for unknown user (daemon never reached)",
+      "_comment": "GetEntityInfo — resolve first, daemon not running so returns not-running message",
       "action": "call_tool",
-      "name": "GetUserInfo",
-      "arguments": {"user": "nonexistent_test_user_12345"},
+      "name": "GetEntityInfo",
+      "arguments": {"entity": "nonexistent_test_entity_12345"},
       "expect": {
         "is_error": false,
-        "content_text_contains": ["not found"]
+        "content_text_contains": ["not running", "mcp-telegram sync"]
       }
     },
     {

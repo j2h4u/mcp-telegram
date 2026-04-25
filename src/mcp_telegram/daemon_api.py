@@ -2245,7 +2245,7 @@ class DaemonAPIServer:
 
     async def _fetch_user_detail(self, user) -> dict:
         """Per-type helper: User/Bot detail. Per CONTEXT D-07, body refactored
-        verbatim from the prior _get_user_info except for the resolution
+        verbatim from the prior _fetch_user_detail except for the resolution
         prelude (orchestrator passes an already-resolved entity).
 
         Per CONTEXT D-08: User vs Bot discriminated via getattr(user, "bot", False)
@@ -2253,14 +2253,14 @@ class DaemonAPIServer:
         GetCommonChatsRequest) for both kinds, only the response 'type' differs.
 
         SPEC Req 4: User/Bot field surface preserved verbatim from prior
-        GetUserInfo. The diff between the prior tool's data dict and this
+        GetEntityInfo. The diff between the prior tool's data dict and this
         helper's return is exactly: 'type' added, 'my_membership' added,
         'photos' renamed to 'avatar_history', 'avatar_count' added; everything
         else unchanged.
         """
         user_id = int(user.id)
 
-        # --- common_chats (existing _get_user_info body) ---
+        # --- common_chats (existing _fetch_user_detail body) ---
         common_chats: list[dict] = []
         try:
             common_result = await self._client(GetCommonChatsRequest(user_id=user_id, max_id=0, limit=100))
@@ -2282,7 +2282,7 @@ class DaemonAPIServer:
                 user_id, exc, _rid(), exc_info=True,
             )
 
-        # --- GetFullUserRequest body — verbatim from old _get_user_info ---
+        # --- GetFullUserRequest body — verbatim from old _fetch_user_detail ---
         about: str | None = None
         personal_channel_id: int | None = None
         birthday: dict | None = None
@@ -2350,7 +2350,7 @@ class DaemonAPIServer:
                 user_id, exc, _rid(), exc_info=True,
             )
 
-        # --- folder name resolution (verbatim from old _get_user_info) ---
+        # --- folder name resolution (verbatim from old _fetch_user_detail) ---
         if folder_id is not None:
             try:
                 filters = await self._client(GetDialogFiltersRequest())
@@ -2442,7 +2442,7 @@ class DaemonAPIServer:
             "my_membership": my_membership,
             "avatar_history": avatar_history,
             "avatar_count": avatar_count,
-            # User/Bot-specific (verbatim shape from old _get_user_info data dict)
+            # User/Bot-specific (verbatim shape from _fetch_user_detail data dict)
             "first_name": first_name,
             "last_name": last_name,
             "extra_usernames": extra_usernames,

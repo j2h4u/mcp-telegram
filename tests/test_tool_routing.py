@@ -21,7 +21,7 @@ from mcp_telegram.tools import (
     GetMyAccount,
     GetSyncAlerts,
     GetSyncStatus,
-    GetUserInfo,
+    GetEntityInfo,
     ListDialogs,
     ListMessages,
     ListTopics,
@@ -31,7 +31,7 @@ from mcp_telegram.tools import (
     get_my_account,
     get_sync_alerts,
     get_sync_status,
-    get_user_info,
+    get_entity_info,
     list_dialogs,
     list_messages,
     list_topics,
@@ -58,7 +58,7 @@ def _make_daemon_conn(response: dict | None = None) -> MagicMock:
     conn.mark_dialog_for_sync = AsyncMock(return_value=r)
     conn.get_sync_status = AsyncMock(return_value=r)
     conn.get_sync_alerts = AsyncMock(return_value=r)
-    conn.get_user_info = AsyncMock(return_value=r)
+    conn.get_entity_info = AsyncMock(return_value=r)
     conn.get_inbox = AsyncMock(return_value=r)
     conn.record_telemetry = AsyncMock(return_value={"ok": True})
     conn.get_usage_stats = AsyncMock(return_value=r)
@@ -663,124 +663,60 @@ def test_no_connected_client_in_tools():
 
 
 # ---------------------------------------------------------------------------
-# GetUserInfo — daemon routing
+# GetEntityInfo — MCP tool routing (full coverage in test_entity_info_tool.py)
 # ---------------------------------------------------------------------------
 
 
-async def test_get_user_info_resolves_via_daemon():
-    """GetUserInfo resolves entity via daemon resolve_entity then fetches profile.
-
-    Uses a single daemon connection (resolve + get_user_info in same context).
-    """
+async def test_get_entity_info_resolves_via_daemon():
+    """GetEntityInfo resolves entity via daemon resolve_entity then fetches typed profile."""
     conn = MagicMock()
     conn.resolve_entity = AsyncMock(
         return_value={
             "ok": True,
-            "data": {"result": "resolved", "entity_id": 12345, "display_name": "Alice"},
+            "data": {"result": "match", "entity_id": 12345, "display_name": "Alice"},
         }
     )
-    conn.get_user_info = AsyncMock(
+    conn.get_entity_info = AsyncMock(
         return_value={
             "ok": True,
             "data": {
-                "id": 12345,
-                "first_name": "Alice",
-                "last_name": "Smith",
-                "username": "alice",
-                "common_chats": [
-                    {"id": -1001234, "name": "Dev Chat", "type": "supergroup"},
-                ],
+                "id": 12345, "type": "user", "name": "Alice Smith",
+                "username": "alice", "about": None,
+                "my_membership": {"is_member": True, "is_admin": False},
+                "avatar_history": [], "avatar_count": 0,
+                "common_chats": [{"id": -1001234, "name": "Dev Chat", "type": "supergroup"}],
+                "contact": False, "mutual_contact": False, "close_friend": False,
+                "blocked": False, "verified": False, "premium": False, "bot": False,
+                "scam": False, "fake": False, "restricted": False,
+                "restriction_reason": [], "phone": None, "lang_code": None,
+                "status": None, "emoji_status_id": None, "personal_channel_id": None,
+                "birthday": None, "folder_id": None, "folder_name": None,
+                "send_paid_messages_stars": None, "ttl_period": None,
+                "private_forward_name": None, "bot_info": None,
+                "business_location": None, "business_intro": None,
+                "business_work_hours": None, "note": None,
             },
         }
     )
     conn.record_telemetry = AsyncMock(return_value={"ok": True})
 
     with _patch_daemon(conn):
-        result = await get_user_info(GetUserInfo(user="Alice"))
+        result = await get_entity_info(GetEntityInfo(entity="Alice"))
 
     text = result[0].text
     assert '[resolved: "Alice"]' in text
     assert "12345" in text
     assert "Dev Chat" in text
     conn.resolve_entity.assert_called_once_with(query="Alice")
-    conn.get_user_info.assert_called_once_with(user_id=12345)
+    conn.get_entity_info.assert_called_once_with(entity_id=12345)
 
 
-async def test_get_user_info_candidates_via_daemon():
-    """GetUserInfo returns candidate list when resolve_entity returns candidates."""
-    conn = _make_daemon_conn(
-        {
-            "ok": True,
-            "data": {
-                "result": "candidates",
-                "matches": [
-                    {
-                        "entity_id": 1,
-                        "display_name": "Alice A",
-                        "score": 90,
-                        "username": "alicea",
-                        "entity_type": "user",
-                    },
-                    {"entity_id": 2, "display_name": "Alice B", "score": 80, "username": None, "entity_type": "user"},
-                ],
-            },
-        }
-    )
-
-    with patch("mcp_telegram.tools.user_info.daemon_connection", return_value=_fake_daemon_cm(conn)):
-        result = await get_user_info(GetUserInfo(user="Alice"))
-
-    text = result[0].text
-    assert "Alice A" in text or "alice" in text.lower()
-    assert "ambiguous" in text.lower() or "matched" in text.lower() or "multiple" in text.lower()
-
-
-async def test_get_user_info_not_found_via_daemon():
-    """GetUserInfo returns user_not_found text when resolve_entity returns not_found."""
-    conn = _make_daemon_conn(
-        {
-            "ok": True,
-            "data": {"result": "not_found", "query": "nobody"},
-        }
-    )
-
-    with patch("mcp_telegram.tools.user_info.daemon_connection", return_value=_fake_daemon_cm(conn)):
-        result = await get_user_info(GetUserInfo(user="nobody"))
-
-    text = result[0].text
-    assert "not found" in text.lower() or "nobody" in text.lower()
-
-
-async def test_get_user_info_daemon_not_running():
-    """GetUserInfo returns actionable error when daemon is not running."""
+async def test_get_entity_info_daemon_not_running():
+    """GetEntityInfo returns actionable error when daemon is not running."""
     with _patch_daemon_not_running():
-        result = await get_user_info(GetUserInfo(user="Alice"))
+        result = await get_entity_info(GetEntityInfo(entity="Alice"))
 
     assert "not running" in result[0].text.lower() or "mcp-telegram sync" in result[0].text.lower()
-
-
-async def test_get_user_info_user_not_found_by_daemon():
-    """GetUserInfo handles user_not_found error from daemon profile fetch."""
-    conn = MagicMock()
-    conn.resolve_entity = AsyncMock(
-        return_value={
-            "ok": True,
-            "data": {"result": "resolved", "entity_id": 999, "display_name": "Ghost"},
-        }
-    )
-    conn.get_user_info = AsyncMock(
-        return_value={
-            "ok": False,
-            "error": "user_not_found",
-            "message": "User 999 not found",
-        }
-    )
-    conn.record_telemetry = AsyncMock(return_value={"ok": True})
-
-    with _patch_daemon(conn):
-        result = await get_user_info(GetUserInfo(user="Ghost"))
-
-    assert "could not fetch" in result[0].text.lower()
 
 
 # ---------------------------------------------------------------------------

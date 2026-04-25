@@ -7,7 +7,7 @@ For each tool that touches entity/dialog resolution, we verify:
 
 Tools and their resolution paths
 ---------------------------------
-- GetUserInfo        : calls conn.resolve_entity() → can receive Candidates directly.
+- GetEntityInfo      : calls conn.resolve_entity() → can receive Candidates directly.
                        Real assertion — Candidates IS reachable.
 
 - tools/reading.py   : passes dialog= string to daemon via conn.list_messages(dialog=...).
@@ -45,7 +45,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from mcp_telegram.tools import GetUserInfo, get_user_info
+from mcp_telegram.tools import GetEntityInfo, get_entity_info
 
 # ---------------------------------------------------------------------------
 # Shared fixtures
@@ -90,18 +90,18 @@ async def _conn_ctx(conn: MagicMock):
 
 
 # ---------------------------------------------------------------------------
-# Test 1 & 2: GetUserInfo — Candidates IS reachable
+# Test 1 & 2: GetEntityInfo — Candidates IS reachable
 # ---------------------------------------------------------------------------
 
 
-async def test_user_info_candidates_surfaces_hint() -> None:
-    """GetUserInfo with Candidates response → output includes disambiguation_hint text."""
+async def test_entity_info_candidates_surfaces_hint() -> None:
+    """GetEntityInfo with Candidates response → output includes disambiguation_hint text."""
     conn = _make_conn_resolve_candidates()
     with patch(
-        "mcp_telegram.tools.user_info.daemon_connection",
+        "mcp_telegram.tools.entity_info.daemon_connection",
         return_value=_conn_ctx(conn),
     ):
-        result = await get_user_info(GetUserInfo(user="Ivan"))
+        result = await get_entity_info(GetEntityInfo(entity="Ivan"))
 
     text = result[0].text
     assert "disambiguation_hint" not in text or "hint=" in text  # hint= prefix is the format
@@ -109,35 +109,35 @@ async def test_user_info_candidates_surfaces_hint() -> None:
     assert "Specify @username or numeric id" in text
 
 
-async def test_user_info_candidates_lists_all_matches() -> None:
-    """GetUserInfo with Candidates → output contains all match entity_ids."""
+async def test_entity_info_candidates_lists_all_matches() -> None:
+    """GetEntityInfo with Candidates → output contains all match entity_ids."""
     conn = _make_conn_resolve_candidates()
     with patch(
-        "mcp_telegram.tools.user_info.daemon_connection",
+        "mcp_telegram.tools.entity_info.daemon_connection",
         return_value=_conn_ctx(conn),
     ):
-        result = await get_user_info(GetUserInfo(user="Ivan"))
+        result = await get_entity_info(GetEntityInfo(entity="Ivan"))
 
     text = result[0].text
     assert "101" in text
     assert "202" in text
-    # Must NOT silently auto-pick (i.e. must not proceed to get_user_info call)
-    assert conn.get_user_info is not conn.resolve_entity  # sanity; no silent pick
+    # Must NOT silently auto-pick (i.e. must not proceed to get_entity_info call)
+    assert conn.get_entity_info is not conn.resolve_entity  # sanity; no silent pick
 
 
-async def test_user_info_candidates_does_not_auto_pick() -> None:
-    """GetUserInfo must NOT silently resolve to first match — must return ambiguity response."""
+async def test_entity_info_candidates_does_not_auto_pick() -> None:
+    """GetEntityInfo must NOT silently resolve to first match — must return ambiguity response."""
     conn = _make_conn_resolve_candidates()
-    # get_user_info (the second call) should NOT be called on Candidates
-    conn.get_user_info = AsyncMock(return_value={"ok": True, "data": {}})
+    # get_entity_info (the second call) should NOT be called on Candidates
+    conn.get_entity_info = AsyncMock(return_value={"ok": True, "data": {}})
     with patch(
-        "mcp_telegram.tools.user_info.daemon_connection",
+        "mcp_telegram.tools.entity_info.daemon_connection",
         return_value=_conn_ctx(conn),
     ):
-        result = await get_user_info(GetUserInfo(user="Ivan"))
+        result = await get_entity_info(GetEntityInfo(entity="Ivan"))
 
-    # Tool must not have proceeded to fetch user profile
-    conn.get_user_info.assert_not_called()
+    # Tool must not have proceeded to fetch entity profile
+    conn.get_entity_info.assert_not_called()
     text = result[0].text
     # Must be an ambiguity response, not a profile
     assert "id=101" in text or "id=202" in text  # listed matches, not profile data

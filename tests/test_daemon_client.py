@@ -333,13 +333,13 @@ async def test_get_me_convenience() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Convenience method: get_user_info
+# Convenience method: get_entity_info
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_get_user_info_convenience() -> None:
-    """get_user_info sends correct request dict with user_id."""
+async def test_get_entity_info_convenience() -> None:
+    """get_entity_info sends correct request dict with entity_id."""
     reader = MagicMock(spec=asyncio.StreamReader)
     writer = MagicMock(spec=asyncio.StreamWriter)
     conn = DaemonConnection(reader, writer)
@@ -348,16 +348,16 @@ async def test_get_user_info_convenience() -> None:
 
     async def _mock_request(payload: dict) -> dict:
         captured.append(payload)
-        return {"ok": True, "data": {"id": 123, "first_name": "Alice", "common_chats": []}}
+        return {"ok": True, "data": {"type": "user", "name": "Alice"}}
 
     conn.request = _mock_request  # type: ignore[method-assign]
 
-    await conn.get_user_info(user_id=123)
+    await conn.get_entity_info(entity_id=123)
 
     assert len(captured) == 1
     req = captured[0]
-    assert req["method"] == "get_user_info"
-    assert req["user_id"] == 123
+    assert req["method"] == "get_entity_info"
+    assert req["entity_id"] == 123
 
 
 # ---------------------------------------------------------------------------
