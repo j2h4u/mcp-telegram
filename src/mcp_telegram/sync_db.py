@@ -7,7 +7,7 @@ from pathlib import Path
 
 from xdg_base_dirs import xdg_state_home  # type: ignore[import-error]
 
-_CURRENT_SCHEMA_VERSION = 15
+_CURRENT_SCHEMA_VERSION = 16
 
 logger = logging.getLogger(__name__)
 
@@ -188,6 +188,10 @@ def _open_sync_db(db_path: Path, *, read_only: bool = False) -> sqlite3.Connecti
     else:
         conn = sqlite3.connect(str(db_path), timeout=10.0)
     conn.execute("PRAGMA busy_timeout=10000")
+    # Enable FK enforcement on every connection. SQLite defaults foreign_keys
+    # to OFF per connection; without this the entity_details ON DELETE CASCADE
+    # added in v16 silently does nothing in production.
+    conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
 
@@ -536,6 +540,40 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             #    constant survived in v4's migration stmts, so every fresh DB
             #    recreated the table. v15 makes the drop permanent.
             "DROP TABLE IF EXISTS message_cache",
+        ],
+    )
+
+    # v16 (Phase 47): entity_details sibling table for the new GetEntityInfo
+    # tool. Per CONTEXT D-01: a JSON-blob cache keyed on entity_id with a
+    # FETCHED_AT TTL stamp, foreign-keyed to entities(id) with ON DELETE
+    # CASCADE so dropping an entity row also drops the cached detail. Mirrors
+    # the message_reactions_freshness sibling-with-fetched_at precedent at v11.
+    #
+    # SCHEMA DISCRIMINATOR (D-02): the JSON payload itself carries a top-level
+    # "schema": 1 field so future Telethon-driven shape changes are detectable
+    # in code without another ALTER TABLE. The migration does NOT enforce or
+    # validate this; the orchestrator (daemon_api._get_entity_info) writes it.
+    #
+    # CACHE-MISS SEMANTICS (D-03): entity_details rows are absent for the v6
+    # backfill tombstones in entities (rows that exist for FK-target reasons
+    # only). The orchestrator treats "entities row exists, entity_details row
+    # missing" as a normal cache miss → live fetch + write back, NOT as an
+    # error. No backfill is performed by this migration.
+    #
+    # FETCHED_AT INDEX (D-04): cheap to add at table creation; lets a future
+    # phase implement cache eviction sweeps without a schema bump.
+    _migrate(
+        16,
+        [
+            (
+                "CREATE TABLE IF NOT EXISTS entity_details ("
+                "    entity_id   INTEGER PRIMARY KEY, "
+                "    detail_json TEXT NOT NULL, "
+                "    fetched_at  INTEGER NOT NULL, "
+                "    FOREIGN KEY (entity_id) REFERENCES entities(id) ON DELETE CASCADE"
+                ") WITHOUT ROWID"
+            ),
+            "CREATE INDEX IF NOT EXISTS idx_entity_details_fetched_at ON entity_details(fetched_at)",
         ],
     )
 

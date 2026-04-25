@@ -1238,7 +1238,9 @@ def test_migration_v15_copies_own_only_into_messages(tmp_path: Path) -> None:
             "INSERT INTO activity_comments (dialog_id, message_id, sent_at, text) "
             "VALUES (100, 1, 1000, 'hello'), (100, 2, 2000, 'world')"
         )
-        conn.execute("DELETE FROM schema_version WHERE version = 15")
+        # Delete v15 AND any higher versions so _schema_ready returns False
+        # and the migration framework re-runs from v14.
+        conn.execute("DELETE FROM schema_version WHERE version >= 15")
         conn.commit()
     # Re-run migrations → v15 re-applies the data migration.
     ensure_sync_schema(db_path)
@@ -1272,7 +1274,9 @@ def test_migration_v15_preserves_existing_messages(tmp_path: Path) -> None:
             "INSERT INTO activity_comments (dialog_id, message_id, sent_at, text) "
             "VALUES (200, 5, 9999, 'stale-copy')"
         )
-        conn.execute("DELETE FROM schema_version WHERE version = 15")
+        # Delete v15 AND any higher versions so _schema_ready returns False
+        # and the migration framework re-runs from v14.
+        conn.execute("DELETE FROM schema_version WHERE version >= 15")
         conn.commit()
     ensure_sync_schema(db_path)
     with sqlite3.connect(db_path) as conn:
@@ -1305,7 +1309,9 @@ def test_migration_v15_enrolls_own_only_but_preserves_higher_status(tmp_path: Pa
             "INSERT INTO activity_comments (dialog_id, message_id, sent_at, text) "
             "VALUES (300, 1, 1000, 'a'), (400, 2, 2000, 'b')"
         )
-        conn.execute("DELETE FROM schema_version WHERE version = 15")
+        # Delete v15 AND any higher versions so _schema_ready returns False
+        # and the migration framework re-runs from v14.
+        conn.execute("DELETE FROM schema_version WHERE version >= 15")
         conn.commit()
     ensure_sync_schema(db_path)
     with sqlite3.connect(db_path) as conn:
@@ -1363,3 +1369,76 @@ def test_migration_v14_preserves_existing_data(tmp_path: Path) -> None:
             "SELECT dialog_id, status FROM synced_dialogs WHERE dialog_id = 12345"
         ).fetchone()
     assert row == (12345, "synced")
+
+
+# ---------------------------------------------------------------------------
+# v16: PRAGMA foreign_keys = ON on production sync.db connections
+# (MEDIUM finding from 47-REVIEWS.md cycle 2 — codex)
+# ---------------------------------------------------------------------------
+
+
+def test_open_sync_db_enables_foreign_keys(tmp_path: Path) -> None:
+    """MEDIUM from 47-REVIEWS.md cycle 2 (codex): production sync.db
+    connections MUST enable PRAGMA foreign_keys=ON, otherwise the v16
+    entity_details FK CASCADE silently does nothing in production
+    despite the test_migration_v16_fk_cascade_deletes_detail_row test
+    passing on a separately-PRAGMA'd test connection.
+    """
+    db_path = tmp_path / "fk.db"
+    ensure_sync_schema(db_path)
+
+    # Writable factory must enable FKs.
+    conn = _open_sync_db(db_path)
+    try:
+        row = conn.execute("PRAGMA foreign_keys").fetchone()
+        assert row[0] == 1, f"_open_sync_db must enable foreign_keys (got {row[0]})"
+    finally:
+        conn.close()
+
+    # Read-only factory must enable FKs too — read connections still
+    # observe FK state (e.g., no orphan rows post-cascade).
+    conn = open_sync_db_reader(db_path)
+    try:
+        row = conn.execute("PRAGMA foreign_keys").fetchone()
+        assert row[0] == 1, f"open_sync_db_reader must enable foreign_keys (got {row[0]})"
+    finally:
+        conn.close()
+
+
+def test_v16_fk_cascade_works_through_production_factory(tmp_path: Path) -> None:
+    """End-to-end variant of test_migration_v16_fk_cascade_deletes_detail_row
+    but using the production _open_sync_db() factory (not a hand-built
+    sqlite3.connect with manual PRAGMA). Confirms the FK cascade fires
+    through the real production code path. MEDIUM from 47-REVIEWS.md
+    cycle 2 (codex).
+    """
+    db_path = tmp_path / "cascade.db"
+    ensure_sync_schema(db_path)
+
+    conn = _open_sync_db(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO entities (id, type, name, username, name_normalized, updated_at) "
+            "VALUES (?, 'User', 'Alice', 'alice', 'alice', 0)", (12345,)
+        )
+        conn.execute(
+            "INSERT INTO entity_details (entity_id, detail_json, fetched_at) "
+            "VALUES (?, '{}', 1700000000)", (12345,)
+        )
+        conn.commit()
+
+        # Sanity: detail row exists.
+        assert conn.execute(
+            "SELECT COUNT(*) FROM entity_details WHERE entity_id = ?", (12345,)
+        ).fetchone()[0] == 1
+
+        # Delete the parent entities row.
+        conn.execute("DELETE FROM entities WHERE id = ?", (12345,))
+        conn.commit()
+
+        # Cascade must have removed the detail row.
+        assert conn.execute(
+            "SELECT COUNT(*) FROM entity_details WHERE entity_id = ?", (12345,)
+        ).fetchone()[0] == 0, "FK CASCADE did not fire — PRAGMA foreign_keys is OFF on production factory"
+    finally:
+        conn.close()
