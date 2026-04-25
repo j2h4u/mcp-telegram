@@ -1,7 +1,7 @@
 {
   "steps": [
     {
-      "_comment": "All 11 tools registered with correct schemas",
+      "_comment": "All 13 tools registered with correct schemas",
       "action": "list_tools",
       "expect": {
         "tool_names_include": [
@@ -13,6 +13,8 @@
           "GetMyAccount",
           "GetEntityInfo",
           "GetUsageStats",
+          "GetDialogStats",
+          "GetMyRecentActivity",
           "MarkDialogForSync",
           "GetSyncStatus",
           "GetSyncAlerts"
