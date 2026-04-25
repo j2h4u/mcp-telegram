@@ -2671,7 +2671,12 @@ class DaemonAPIServer:
             # SPEC Req 9: broadcast subscriber list is admin-only.
             contacts_subscribed = None
             contacts_reason = "not_an_admin"
-        elif subscribers_count is not None and subscribers_count > 1000:
+        elif subscribers_count is None:
+            # GetFullChannelRequest failed — count unknown; skip enumeration to
+            # avoid unbounded iter_participants on a potentially large channel.
+            contacts_subscribed = None
+            contacts_reason = "count_unavailable"
+        elif subscribers_count > 1000:
             # D-15 above-threshold: phone-contacts intersection only.
             # Same pattern as _fetch_supergroup_detail's >1000 branch.
             try:
@@ -2876,7 +2881,12 @@ class DaemonAPIServer:
         if hidden_members:
             contacts_subscribed = None
             contacts_reason = "hidden_by_admin"
-        elif members_count is not None and members_count > 1000:
+        elif members_count is None:
+            # GetFullChannelRequest failed — count unknown; skip enumeration to
+            # avoid unbounded iter_participants on a potentially large supergroup.
+            contacts_subscribed = None
+            contacts_reason = "count_unavailable"
+        elif members_count > 1000:
             # D-15 above-threshold: phone-contacts intersection only.
             try:
                 gp_result = await self._client(GetParticipantsRequest(
