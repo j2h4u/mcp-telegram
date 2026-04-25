@@ -818,7 +818,7 @@ async def test_checkpoint_skip_stale_last_synced_at(
 
     sync_db.execute(
         "INSERT INTO synced_dialogs (dialog_id, status, last_synced_at) VALUES (?, 'synced', ?)",
-        (dialog_id, now - 3600),  # 1 hour ago — beyond 300s threshold
+        (dialog_id, now - 7200),  # 2 hours ago — well beyond skip threshold
     )
     sync_db.execute(
         "INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (?, 10, 1704067200)",
