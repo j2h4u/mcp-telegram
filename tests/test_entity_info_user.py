@@ -40,6 +40,7 @@ def _patch_get_peer_id():
 def _make_db() -> sqlite3.Connection:
     """Return an in-memory SQLite at v16 (entity_details present)."""
     conn = sqlite3.connect(":memory:")
+    conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(
         """
         CREATE TABLE synced_dialogs (
