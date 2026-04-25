@@ -2206,6 +2206,9 @@ class DaemonAPIServer:
             }
 
         # ----- Write back: entities (auto-resolve, SPEC Req 11) + entity_details -----
+        # Pop internal marker before caching; skip entity_details when full fetch failed
+        # to avoid caching a degraded response for the full TTL period.
+        full_fetch_ok = detail.pop("_full_fetch_ok", True)
         try:
             self._conn.execute(
                 "INSERT OR IGNORE INTO entities (id, type, name, username, updated_at) "
@@ -2218,12 +2221,13 @@ class DaemonAPIServer:
                     now,
                 ),
             )
-            payload_with_schema = {"schema": _ENTITY_DETAIL_SCHEMA_VERSION, **detail}
-            self._conn.execute(
-                "INSERT OR REPLACE INTO entity_details (entity_id, detail_json, fetched_at) "
-                "VALUES (?, ?, ?)",
-                (entity_id, json.dumps(payload_with_schema), now),
-            )
+            if full_fetch_ok:
+                payload_with_schema = {"schema": _ENTITY_DETAIL_SCHEMA_VERSION, **detail}
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO entity_details (entity_id, detail_json, fetched_at) "
+                    "VALUES (?, ?, ?)",
+                    (entity_id, json.dumps(payload_with_schema), now),
+                )
             self._conn.commit()
         except sqlite3.OperationalError as exc:
             logger.warning(
@@ -2296,6 +2300,7 @@ class DaemonAPIServer:
         note: str | None = None
         folder_id: int | None = None
         folder_name: str | None = None
+        full_user_ok = False
         try:
             full_result = await self._client(GetFullUserRequest(id=user_id))
             user_full = full_result.full_user
@@ -2344,6 +2349,7 @@ class DaemonAPIServer:
             raw_note = getattr(user_full, "note", None)
             if raw_note is not None:
                 note = getattr(raw_note, "text", None) or None
+            full_user_ok = True
         except Exception as exc:
             logger.warning(
                 "entity_info user full_user_failed user_id=%r error=%s%s",
@@ -2474,6 +2480,7 @@ class DaemonAPIServer:
             "folder_id": folder_id,
             "folder_name": folder_name,
             "common_chats": common_chats,
+            "_full_fetch_ok": full_user_ok,
         }
 
     async def _search_chat_photo_history(self, peer, full_chat) -> tuple[list[dict], int]:
@@ -2587,6 +2594,7 @@ class DaemonAPIServer:
         slow_mode_seconds: int | None = None
         available_reactions: dict = {"kind": "none", "emojis": []}
         about: str | None = None
+        full_channel_ok = False
         try:
             full_result = await self._client(GetFullChannelRequest(channel=channel))
             full_chat = full_result.full_chat
@@ -2621,6 +2629,7 @@ class DaemonAPIServer:
                 available_reactions = {"kind": "some", "emojis": emojis}
             elif isinstance(raw_reactions, ChatReactionsNone) or raw_reactions is None:
                 available_reactions = {"kind": "none", "emojis": []}
+            full_channel_ok = True
         except Exception as exc:
             logger.warning(
                 "entity_info channel full_channel_failed channel_id=%r error=%s%s",
@@ -2758,6 +2767,7 @@ class DaemonAPIServer:
             "contacts_subscribed": contacts_subscribed,
             "contacts_subscribed_partial": contacts_subscribed_partial,
             "contacts_reason": contacts_reason,
+            "_full_fetch_ok": full_channel_ok,
         }
 
     def _enrich_contact_ids_with_names(self, ids: set[int]) -> list[dict]:
@@ -2806,6 +2816,7 @@ class DaemonAPIServer:
         linked_broadcast_id: int | None = None
         slow_mode_seconds: int | None = None
         about: str | None = None
+        full_channel_ok = False
         try:
             full_result = await self._client(GetFullChannelRequest(channel=channel))
             full_chat = full_result.full_chat
@@ -2824,6 +2835,7 @@ class DaemonAPIServer:
                     linked_broadcast_id = int(linked_chat_raw)
             slow_mode_seconds = getattr(full_chat, "slowmode_seconds", None)
             about = getattr(full_chat, "about", None) or None
+            full_channel_ok = True
         except Exception as exc:
             logger.warning(
                 "entity_info supergroup full_channel_failed channel_id=%r error=%s%s",
@@ -2960,6 +2972,7 @@ class DaemonAPIServer:
             "contacts_subscribed": contacts_subscribed,
             "contacts_subscribed_partial": contacts_subscribed_partial,
             "contacts_reason": contacts_reason,
+            "_full_fetch_ok": full_channel_ok,
         }
 
     async def _fetch_group_detail(self, chat) -> dict:
@@ -3051,9 +3064,10 @@ class DaemonAPIServer:
         contacts_reason: str | None = None
         try:
             participant_ids = {
-                int(getattr(p, "user_id", 0))
+                int(p_user_id)
                 for p in participants_objs
-                if getattr(p, "user_id", None) is not None
+                if (p_user_id := getattr(p, "user_id", None)) is not None
+                and int(p_user_id) != 0
             }
             dm_peers = self._dm_peer_ids()
             intersect_ids = participant_ids & dm_peers
@@ -3089,6 +3103,7 @@ class DaemonAPIServer:
             "contacts_subscribed": contacts_subscribed,
             "contacts_subscribed_partial": contacts_subscribed_partial,
             "contacts_reason": contacts_reason,
+            "_full_fetch_ok": True,
         }
 
     # ------------------------------------------------------------------
