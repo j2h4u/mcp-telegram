@@ -169,9 +169,16 @@ class DeltaSyncWorker:
                 exc.seconds,
                 len(new_message_rows),
             )
-            if new_message_rows:
-                with self._conn:
+            # Stamp last_synced_at so the next cold restart skips this dialog
+            # via the checkpoint guard instead of repeatedly hitting FloodWait
+            # on the same hot dialogs every boot. Trade-off: gap-fill for this
+            # dialog is deferred until the skip threshold expires (~1h).
+            now = int(time.time())
+            with self._conn:
+                if new_message_rows:
                     insert_messages_with_fts(self._conn, new_message_rows)
+                self._conn.execute(_UPDATE_DELTA_LAST_SYNCED_AT_SQL, (now, dialog_id))
+            if new_message_rows:
                 logger.info(
                     "delta dialog_id=%d preserved_messages=%d before FloodWait",
                     dialog_id,

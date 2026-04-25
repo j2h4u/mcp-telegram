@@ -964,12 +964,15 @@ async def test_fetch_delta_stamps_last_synced_at_on_gap_filled(
 
 
 @pytest.mark.asyncio
-async def test_fetch_delta_no_stamp_on_floodwait(
+async def test_fetch_delta_stamps_on_floodwait(
     mock_client: MagicMock,
     sync_db: sqlite3.Connection,
     shutdown_event: asyncio.Event,
 ) -> None:
-    """fetch_delta_for_dialog does NOT stamp last_synced_at when FloodWaitError fires."""
+    """fetch_delta_for_dialog stamps last_synced_at=now on FloodWait so the
+    checkpoint skip catches the dialog on the next cold restart instead of
+    repeatedly hitting FloodWait on the same hot dialogs every boot."""
+    import time as _time
     from telethon.errors import FloodWaitError as _FloodWaitError
 
     dialog_id = 6007
@@ -999,15 +1002,18 @@ async def test_fetch_delta_no_stamp_on_floodwait(
     async def _fast_wait_for(coro: Any, timeout: float) -> None:
         raise TimeoutError
 
+    before = int(_time.time())
     with patch("mcp_telegram.delta_sync.asyncio.wait_for", side_effect=_fast_wait_for):
         await worker.fetch_delta_for_dialog(dialog_id)
+    after = int(_time.time())
 
     row = sync_db.execute(
         "SELECT last_synced_at FROM synced_dialogs WHERE dialog_id = ?",
         (dialog_id,),
     ).fetchone()
-    assert row[0] == original_ts, (
-        f"last_synced_at must NOT be updated on FloodWait; got {row[0]}, expected {original_ts}"
+    assert row[0] is not None and row[0] >= before and row[0] <= after, (
+        f"last_synced_at must be stamped to ~now on FloodWait; got {row[0]} "
+        f"(window {before}..{after}), original was {original_ts}"
     )
 
 
