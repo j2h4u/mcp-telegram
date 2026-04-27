@@ -47,6 +47,7 @@ from telethon.tl.types import InputDialogPeer  # type: ignore[import-untyped]
 
 from .daemon_api import DaemonAPIServer, get_daemon_socket_path
 from .activity_sync import run_activity_sync_loop
+from .feedback_db import ensure_feedback_schema, get_feedback_db_path
 from .delta_sync import DeltaSyncWorker, run_access_probe_loop
 from .event_handlers import EventHandlerManager
 from .fts import backfill_fts_index
@@ -401,16 +402,30 @@ async def sync_main() -> None:
     conn = _open_sync_db(db_path)
     migrate_legacy_databases(conn, db_path.parent)
 
+    # Open feedback.db before registering the shutdown handler so the SIGTERM
+    # handler can checkpoint it.  feedback_conn is opened on the asyncio thread
+    # (sync_main coroutine) — the same thread the SIGTERM handler runs on via
+    # loop.add_signal_handler — so no cross-thread SQLite sharing occurs.
+    feedback_db_path = get_feedback_db_path()
+    feedback_conn = ensure_feedback_schema(feedback_db_path)
+    logger.info("feedback.db ready at %s", feedback_db_path)
+
     loop = asyncio.get_running_loop()
-    shutdown_event = register_shutdown_handler(conn, loop)
+    shutdown_event = register_shutdown_handler(conn, loop, feedback_conn=feedback_conn)
 
     client = create_client(catch_up=True)
     handler_manager: EventHandlerManager | None = None
 
+    def _close_feedback_conn() -> None:
+        try:
+            feedback_conn.close()
+        except Exception:
+            logger.debug("feedback_conn close error", exc_info=True)
+
     # Create API server and socket early so healthcheck and MCP tools get a
     # meaningful "daemon_not_ready" response (with detail) instead of
     # "connection refused" while Telegram is connecting.
-    api_server = DaemonAPIServer(conn, client, shutdown_event)
+    api_server = DaemonAPIServer(conn, client, shutdown_event, feedback_conn)
     socket_path = get_daemon_socket_path()
     socket_path.unlink(missing_ok=True)
     old_umask = os.umask(0o177)
@@ -472,6 +487,7 @@ async def sync_main() -> None:
         except (TimeoutError, OSError) as exc:
             api_server.startup_detail = f"connection failed: {exc}"
             logger.error("sync-daemon connection failed: %s", exc, exc_info=True)
+            _close_feedback_conn()
             conn.close()
             return
 
@@ -563,5 +579,6 @@ async def sync_main() -> None:
                 logger.warning("background_task_shutdown_error name=%s", task.get_name(), exc_info=True)
         background_tasks.clear()
         await client.disconnect()
+        _close_feedback_conn()
         conn.close()
         logger.info("sync-daemon stopped")

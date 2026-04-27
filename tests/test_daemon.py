@@ -60,6 +60,23 @@ def instant_shutdown_event() -> asyncio.Event:
     return event
 
 
+@pytest.fixture(autouse=True)
+def _patch_feedback_db():
+    """Patch feedback_db helpers in daemon so tests don't touch the filesystem.
+
+    sync_main() now calls ensure_feedback_schema() and get_feedback_db_path()
+    at startup.  Without this patch every daemon test would create a real
+    feedback.db under the test user's XDG state dir.  The returned mock
+    connection satisfies DaemonAPIServer.__init__'s type annotation.
+    """
+    mock_conn = MagicMock()
+    with (
+        patch("mcp_telegram.daemon.get_feedback_db_path"),
+        patch("mcp_telegram.daemon.ensure_feedback_schema", return_value=mock_conn),
+    ):
+        yield
+
+
 def test_sync_main_connects_and_heartbeats(
     mock_client: AsyncMock,
     caplog: pytest.LogCaptureFixture,
@@ -67,7 +84,7 @@ def test_sync_main_connects_and_heartbeats(
     """sync_main() calls client.connect() and invokes _log_heartbeat."""
     shutdown_event = asyncio.Event()
 
-    def mock_register_shutdown(conn, loop):
+    def mock_register_shutdown(conn, loop, **kwargs):
         return shutdown_event
 
     def heartbeat_then_shutdown(*args):
@@ -149,10 +166,11 @@ def test_self_id_cached_at_startup(
     captured: dict[str, object] = {}
 
     class _Capturing:
-        def __init__(self, conn, client, shutdown_event):
+        def __init__(self, conn, client, shutdown_event, feedback_conn):
             self._conn = conn
             self._client = client
             self._shutdown_event = shutdown_event
+            self._feedback_conn = feedback_conn
             self.self_id = None
             captured["instance"] = self
 
@@ -206,7 +224,7 @@ def test_sync_main_heartbeat_logs_connection_state(
     """Heartbeat INFO log includes 'connected=True' (or connection state)."""
     shutdown_event = asyncio.Event()
 
-    def mock_register_shutdown(conn, loop):
+    def mock_register_shutdown(conn, loop, **kwargs):
         return shutdown_event
 
     def heartbeat_then_shutdown(*args):
@@ -329,7 +347,7 @@ def test_sync_main_idles_when_all_synced(
     wait. Verify heartbeat log appears after idle starts."""
     shutdown_event = asyncio.Event()
 
-    def mock_register_shutdown(conn, loop):
+    def mock_register_shutdown(conn, loop, **kwargs):
         async def _set_after_delay() -> None:
             await asyncio.sleep(0.05)
             shutdown_event.set()

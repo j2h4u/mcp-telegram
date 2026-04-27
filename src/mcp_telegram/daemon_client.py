@@ -332,6 +332,32 @@ class DaemonConnection:
             }
         )
 
+    async def submit_feedback(
+        self,
+        *,
+        message: str,
+        severity: str | None = None,
+        context: str | None = None,
+        model: str | None = None,
+        harness: str | None = None,
+    ) -> dict:
+        """Submit feedback to the daemon for storage in feedback.db.
+
+        Optional fields are omitted from the wire payload when None — matches
+        the list_messages convention so the daemon-side handler treats absent
+        and None identically.
+        """
+        payload: dict = {"method": "submit_feedback", "message": message}
+        if severity is not None:
+            payload["severity"] = severity
+        if context is not None:
+            payload["context"] = context
+        if model is not None:
+            payload["model"] = model
+        if harness is not None:
+            payload["harness"] = harness
+        return await self.request(payload)
+
 
 # ---------------------------------------------------------------------------
 # Context manager

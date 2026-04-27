@@ -678,8 +678,15 @@ def migrate_legacy_databases(conn: sqlite3.Connection, state_dir: Path) -> None:
 def register_shutdown_handler(
     conn: sqlite3.Connection,
     loop: asyncio.AbstractEventLoop,
+    feedback_conn: sqlite3.Connection | None = None,
 ) -> asyncio.Event:
-    """Register a SIGTERM handler that checkpoints sync.db before exit.
+    """Register a SIGTERM handler that checkpoints sync.db (and feedback.db if provided) before exit.
+
+    Both checkpoint blocks are isolated in their own try/except so a failure
+    in either CANNOT prevent shutdown_event.set() — the set() is what unblocks
+    sync_main and lets the process exit. Order: sync.db first (production-
+    critical), feedback.db second (low-value). The default None keeps every
+    existing call site working without modification.
 
     Returns an asyncio.Event that will be set when SIGTERM is received.
     The caller (sync daemon) should await this event to know when to stop.
@@ -688,13 +695,23 @@ def register_shutdown_handler(
 
     def _on_sigterm() -> None:
         logger.info("SIGTERM received — checkpointing sync.db")
+        # ── sync.db checkpoint — isolated ────────────────────────────────────
         try:
             conn.rollback()
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         except Exception:
             logger.exception("sync.db shutdown error")
-        finally:
-            shutdown_event.set()  # signal AFTER checkpoint so handlers don't race
+        # ── feedback.db checkpoint — isolated, MUST NOT block shutdown ───────
+        if feedback_conn is not None:
+            try:
+                feedback_conn.rollback()
+                feedback_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except Exception:
+                # Swallow: feedback.db corruption / lock cannot be allowed to
+                # delay shutdown_event.set(). Logged for postmortem only.
+                logger.exception("feedback.db shutdown error (suppressed — shutdown continues)")
+        # ── Always set, even if both checkpoints raised above ─────────────────
+        shutdown_event.set()  # signal AFTER checkpoints so handlers don't race
 
     loop.add_signal_handler(signal.SIGTERM, _on_sigterm)
     return shutdown_event
