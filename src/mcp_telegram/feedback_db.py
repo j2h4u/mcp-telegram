@@ -7,6 +7,7 @@ Public API:
   get_feedback_db_path()        -> Path
   ensure_feedback_schema(path)  -> sqlite3.Connection  (caller owns lifecycle)
   VALID_SEVERITIES              frozenset[str]
+  VALID_STATUSES                frozenset[str]
   _FEEDBACK_SCHEMA_VERSION      int
 
 The daemon is the sole writer. The CLI (mcp-telegram feedback list/delete)
@@ -23,14 +24,16 @@ from xdg_base_dirs import xdg_state_home  # type: ignore[import-error]
 
 __all__ = [
     "VALID_SEVERITIES",
+    "VALID_STATUSES",
     "_FEEDBACK_SCHEMA_VERSION",
     "get_feedback_db_path",
     "ensure_feedback_schema",
 ]
 
-_FEEDBACK_SCHEMA_VERSION: int = 1
+_FEEDBACK_SCHEMA_VERSION: int = 2
 
 VALID_SEVERITIES: frozenset[str] = frozenset({"bug", "suggestion", "question"})
+VALID_STATUSES: frozenset[str] = frozenset({"open", "in_progress", "done", "dismissed"})
 
 _FEEDBACK_DDL = """
 CREATE TABLE IF NOT EXISTS feedback (
@@ -96,5 +99,19 @@ def ensure_feedback_schema(db_path: Path) -> sqlite3.Connection:
     if current < 1:
         conn.execute(_FEEDBACK_DDL)
         conn.execute("INSERT INTO schema_version VALUES (1, strftime('%s', 'now'))")
+        conn.commit()
+    if current < 2:
+        conn.execute(
+            "ALTER TABLE feedback ADD COLUMN status TEXT NOT NULL DEFAULT 'open'"
+        )
+        conn.execute(
+            "ALTER TABLE feedback ADD COLUMN status_changed_at INTEGER"
+        )
+        conn.execute(
+            "ALTER TABLE feedback ADD COLUMN status_comment TEXT"
+        )
+        conn.execute(
+            "INSERT INTO schema_version VALUES (2, strftime('%s', 'now'))"
+        )
         conn.commit()
     return conn
