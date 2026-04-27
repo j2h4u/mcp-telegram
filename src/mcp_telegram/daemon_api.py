@@ -1528,7 +1528,12 @@ class DaemonAPIServer:
             # synced, perform a targeted getMessages fetch, cache into messages,
             # then serve the context window from sync.db with coverage='fragment'.
             if current_status in (None, "not_synced", "fragment"):
-                await self._fetch_fragment_context(dialog_id, context_message_id)
+                if not await self._fetch_fragment_context(dialog_id, context_message_id):
+                    return {
+                        "ok": False,
+                        "error": "fragment_fetch_failed",
+                        "message": "Could not fetch messages from Telegram.",
+                    }
                 result = await self._list_messages_context_window(
                     dialog_id=dialog_id,
                     anchor_message_id=context_message_id,
@@ -3585,7 +3590,7 @@ class DaemonAPIServer:
 
     async def _fetch_fragment_context(
         self, dialog_id: int, anchor_message_id: int
-    ) -> None:
+    ) -> bool:
         """Targeted getMessages around an anchor; caches into messages table.
 
         Per D-08: default context window is 5 messages AFTER the anchor.
@@ -3607,7 +3612,7 @@ class DaemonAPIServer:
                 "fragment_fetch_failed dialog_id=%s anchor=%s",
                 dialog_id, anchor_message_id, exc_info=True,
             )
-            return
+            return False
 
         # Upsert into messages using existing sync_worker helpers.
         # ExtractedMessage.message is a StoredMessage dataclass — bind via asdict().
@@ -3633,7 +3638,7 @@ class DaemonAPIServer:
             reaction_rows_all.extend(reactions)
 
         if not stored_msgs:
-            return
+            return True
 
         with self._conn:
             # INSERT_MESSAGE_SQL uses named params bound to StoredMessage field names.
@@ -3648,6 +3653,7 @@ class DaemonAPIServer:
                     "(dialog_id, message_id, emoji, count) VALUES (?, ?, ?, ?)",
                     [(r.dialog_id, r.message_id, r.emoji, r.count) for r in reaction_rows_all],
                 )
+        return True
 
     # ------------------------------------------------------------------
     # get_my_recent_activity

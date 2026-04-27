@@ -483,13 +483,14 @@ async def test_list_topics_daemon_not_running():
 def test_no_telethon_imports_in_tools():
     """Tool modules must not import telethon."""
     tools_dir = pathlib.Path(__file__).parent.parent / "src" / "mcp_telegram" / "tools"
-    for filename in ["discovery.py", "reading.py", "_base.py", "sync.py", "entity_info.py", "unread.py"]:
-        filepath = tools_dir / filename
+    for filepath in tools_dir.glob("*.py"):
+        if filepath.name.startswith("__"):
+            continue
         content = filepath.read_text()
-        assert "from telethon" not in content, f"{filename} imports telethon"
-        assert "import telethon" not in content, f"{filename} imports telethon"
-        assert "from .. import telegram" not in content, f"{filename} imports telegram module"
-        assert "from ..telegram" not in content, f"{filename} imports from telegram"
+        assert "from telethon" not in content, f"{filepath.name} imports telethon"
+        assert "import telethon" not in content, f"{filepath.name} imports telethon"
+        assert "from .. import telegram" not in content, f"{filepath.name} imports telegram module"
+        assert "from ..telegram" not in content, f"{filepath.name} imports from telegram"
 
 
 # ---------------------------------------------------------------------------

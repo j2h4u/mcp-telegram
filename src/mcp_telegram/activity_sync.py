@@ -67,8 +67,8 @@ def _load_state(conn: sqlite3.Connection) -> dict[str, str | None]:
 def _set_state(conn: sqlite3.Connection, key: str, value: str | None) -> None:
     with conn:
         conn.execute(
-            "UPDATE activity_sync_state SET value=? WHERE key=?",
-            (value, key),
+            "INSERT OR REPLACE INTO activity_sync_state (key, value) VALUES (?, ?)",
+            (key, value),
         )
 
 
