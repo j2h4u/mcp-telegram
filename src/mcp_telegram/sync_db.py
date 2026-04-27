@@ -7,7 +7,7 @@ from pathlib import Path
 
 from xdg_base_dirs import xdg_state_home  # type: ignore[import-error]
 
-_CURRENT_SCHEMA_VERSION = 16
+_CURRENT_SCHEMA_VERSION = 17
 
 logger = logging.getLogger(__name__)
 
@@ -163,6 +163,44 @@ CREATE TABLE IF NOT EXISTS activity_sync_state (
 )
 """
 
+# ---------------------------------------------------------------------------
+# DDL for v17: dialogs snapshot table (Phase 40 — v1.6 Local Mirror)
+# ---------------------------------------------------------------------------
+
+_DIALOGS_DDL = """
+CREATE TABLE IF NOT EXISTS dialogs (
+    dialog_id               INTEGER PRIMARY KEY,
+    name                    TEXT,
+    type                    TEXT,
+    archived                INTEGER NOT NULL DEFAULT 0,
+    pinned                  INTEGER NOT NULL DEFAULT 0,
+    members                 INTEGER,
+    created                 INTEGER,
+    last_message_at         INTEGER,
+    snapshot_at             INTEGER,
+    hidden                  INTEGER NOT NULL DEFAULT 0,
+    needs_refresh           INTEGER NOT NULL DEFAULT 0,
+    unread_mentions_count   INTEGER NOT NULL DEFAULT 0,
+    unread_reactions_count  INTEGER NOT NULL DEFAULT 0,
+    draft_text              TEXT
+)
+"""
+
+_DIALOGS_HIDDEN_PINNED_INDEX_DDL = """
+CREATE INDEX IF NOT EXISTS idx_dialogs_hidden_pinned
+ON dialogs(hidden, pinned DESC)
+"""
+
+_DIALOGS_TYPE_INDEX_DDL = """
+CREATE INDEX IF NOT EXISTS idx_dialogs_type
+ON dialogs(type)
+"""
+
+_DIALOGS_SNAPSHOT_AT_INDEX_DDL = """
+CREATE INDEX IF NOT EXISTS idx_dialogs_snapshot_at
+ON dialogs(snapshot_at)
+"""
+
 
 # ---------------------------------------------------------------------------
 # Path helper
@@ -219,6 +257,17 @@ def _schema_ready(conn: sqlite3.Connection) -> bool:
         return row is not None and row[0] is not None and int(row[0]) >= _CURRENT_SCHEMA_VERSION
     except sqlite3.OperationalError:
         return False
+
+
+def _dialogs_snapshot_populated(conn: sqlite3.Connection) -> bool:
+    """Return True if the dialogs snapshot table has at least one row.
+
+    Used by Phase 41 bootstrap to check whether the initial iter_dialogs() sweep
+    has already run (idempotency guard). Returns False on a freshly migrated v17 DB
+    before any bootstrap data is written.
+    """
+    row = conn.execute("SELECT 1 FROM dialogs LIMIT 1").fetchone()
+    return row is not None
 
 
 def _apply_migrations(conn: sqlite3.Connection) -> None:
@@ -574,6 +623,20 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
                 ") WITHOUT ROWID"
             ),
             "CREATE INDEX IF NOT EXISTS idx_entity_details_fetched_at ON entity_details(fetched_at)",
+        ],
+    )
+
+    # v17 (Phase 40): dialogs snapshot table for v1.6 Local Mirror milestone.
+    # Separate from synced_dialogs (sync machinery) and entities (sender data) — MIRROR-03.
+    # unread_count is intentionally absent — computed from local read cursor (MIRROR-05).
+    # Phase 41 bootstrap populates rows; Phase 42 event handlers update them in real time.
+    _migrate(
+        17,
+        [
+            _DIALOGS_DDL,
+            _DIALOGS_HIDDEN_PINNED_INDEX_DDL,
+            _DIALOGS_TYPE_INDEX_DDL,
+            _DIALOGS_SNAPSHOT_AT_INDEX_DDL,
         ],
     )
 
