@@ -228,15 +228,15 @@ def test_migration_v16_fk_cascade_deletes_detail_row(tmp_path: Path) -> None:
 
 
 def test_migration_v16_idempotent(tmp_path: Path) -> None:
-    """Running ensure_sync_schema twice is a no-op — schema_version has 17 rows, MAX=17."""
+    """Running ensure_sync_schema twice is a no-op — schema_version has _CURRENT_SCHEMA_VERSION rows, MAX=_CURRENT_SCHEMA_VERSION."""
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     ensure_sync_schema(db_path)  # second call must be a no-op
     with sqlite3.connect(db_path) as conn:
         count = conn.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0]
         max_v = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
-    assert count == 17
-    assert max_v == 17
+    assert count == _CURRENT_SCHEMA_VERSION
+    assert max_v == _CURRENT_SCHEMA_VERSION
 
 
 def test_migration_v16_does_not_touch_entities_columns(tmp_path: Path) -> None:
