@@ -52,6 +52,9 @@ def _format_block(comment: dict[str, Any]) -> str:
         f"[{dialog_name}] {dt}  {text}\n"
         f"  nav: dialog_id={comment.get('dialog_id')} message_id={comment.get('message_id')}"
     )
+    sync_status = comment.get("sync_status")
+    if sync_status and sync_status != "synced":
+        block += f"\n  sync: {sync_status}"
     reactions = comment.get("reactions") or []
     if reactions:
         rx_str = "  ".join(f"{r['emoji']}×{r['count']}" for r in reactions)

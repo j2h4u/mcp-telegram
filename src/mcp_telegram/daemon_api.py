@@ -3690,9 +3690,11 @@ class DaemonAPIServer:
 
         rows = self._conn.execute(
             "SELECT m.dialog_id, m.message_id, m.sent_at, m.text, "
-            "       e.name AS dialog_name "
+            "       e.name AS dialog_name, "
+            "       sd.status AS sync_status "
             "FROM messages m "
             "LEFT JOIN entities e ON e.id = m.dialog_id "
+            "LEFT JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id "
             # out=1: authored by the account owner.
             # is_service=0: exclude join/leave/group-created system events
             #   — activity_comments never held these rows, so the read
@@ -3744,6 +3746,7 @@ class DaemonAPIServer:
                 "sent_at": r[2],
                 "text": r[3],
                 "dialog_name": r[4] if r[4] else str(r[0]),
+                "sync_status": r[5],
                 "reactions": reactions_by_msg.get((r[0], r[1]), []),
             }
             for r in rows
