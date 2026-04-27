@@ -49,15 +49,16 @@ writer; the MCP server opens `sync.db` read-only for lightweight queries.
 
 ### Tools Package (`tools/`)
 - `_base.py` — `ToolArgs`, `ToolResult`, `@mcp_tool`, `TOOL_REGISTRY`, `daemon_connection`, telemetry
+- `activity.py` — `GetMyRecentActivity`
 - `discovery.py` — `ListDialogs`, `ListTopics`, `GetMyAccount`
+- `entity_info.py` — `GetEntityInfo` (universal entity inspector: User/Bot/Channel/Supergroup/LegacyChat)
+- `feedback.py` — `SubmitFeedback` (write tool — agents report bugs/suggestions; daemon writes to feedback.db)
 - `reading.py` — `ListMessages`, `SearchMessages`
 - `stats.py` — `GetUsageStats`, `GetDialogStats`
 - `sync.py` — `MarkDialogForSync`, `GetSyncStatus`, `GetSyncAlerts`
 - `unread.py` — `GetInbox`
-- `user_info.py` — `GetUserInfo`
-- `activity.py` — `GetMyRecentActivity`
 
-Canonical tool registry: `tools/__init__.py`.
+Canonical tool registry: `tools/__init__.py`. Total: 14 primary MCP tools.
 
 ## Tool Pattern
 
@@ -78,6 +79,19 @@ async def new_tool(args: NewTool) -> ToolResult:
 - Add to the appropriate domain module (or create a new one).
 - Import in `tools/__init__.py` — registration happens at import time; `server.py` discovers via `TOOL_REGISTRY`.
 - Use `"primary"` for user-facing tools, `"secondary/helper"` for supporting tools.
+
+## Feedback queue
+
+Agents submit feedback via the `SubmitFeedback` MCP tool; the daemon
+persists rows in `feedback.db` (XDG state dir, alongside `sync.db`).
+Operator manages the queue with:
+
+- `mcp-telegram feedback list [--limit N]` — print recent entries (most-recent-first)
+- `mcp-telegram feedback delete <id>` — remove a row
+
+No MCP read tool exists for feedback by design — agents submit, operator
+reviews. Source: `src/mcp_telegram/feedback_db.py`,
+`src/mcp_telegram/tools/feedback.py`, `src/mcp_telegram/__init__.py`.
 
 ## Testing
 
