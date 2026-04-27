@@ -358,6 +358,27 @@ class DaemonConnection:
             payload["harness"] = harness
         return await self.request(payload)
 
+    async def update_feedback_status(
+        self,
+        *,
+        feedback_id: int,
+        status: str,
+        comment: str | None = None,
+    ) -> dict:
+        """Update the status of a feedback row via the daemon Unix socket.
+
+        Routes through the daemon — feedback.db is daemon-write-only.
+        Returns the daemon response dict; caller inspects `ok` and `error`.
+        """
+        payload: dict = {
+            "method": "update_feedback_status",
+            "id": feedback_id,
+            "status": status,
+        }
+        if comment is not None:
+            payload["comment"] = comment
+        return await self.request(payload)
+
 
 # ---------------------------------------------------------------------------
 # Context manager
