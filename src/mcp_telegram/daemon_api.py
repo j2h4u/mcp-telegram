@@ -205,7 +205,7 @@ from rapidfuzz import fuzz as _fuzz
 from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
 
 from .budget import allocate_message_budget_proportional, unread_chat_tier
-from .feedback_db import VALID_SEVERITIES
+from .feedback_db import VALID_SEVERITIES, VALID_STATUSES
 from .formatter import format_reaction_counts
 from .fts import stem_query
 from .models import ReadMessage, ReadState
@@ -900,6 +900,8 @@ class DaemonAPIServer:
             return await self._get_my_recent_activity(req)
         if method == "submit_feedback":
             return await self._submit_feedback(req)
+        if method == "update_feedback_status":
+            return await self._update_feedback_status(req)
         return {"ok": False, "error": "unknown_method"}
 
     # ------------------------------------------------------------------
@@ -3376,6 +3378,101 @@ class DaemonAPIServer:
         except Exception as exc:
             logger.error("submit_feedback failed: %s", exc, exc_info=True)
             return {"ok": False, "error": "internal", "message": "internal error"}
+
+    # ------------------------------------------------------------------
+    # update_feedback_status
+    # ------------------------------------------------------------------
+
+    async def _update_feedback_status(self, req: dict) -> dict:
+        """Update the status of a feedback row in feedback.db.
+
+        Sole-writer contract: every status change for feedback rows arrives
+        through this handler. The CLI never writes feedback.db directly.
+
+        Validates id (positive int), status (must be in VALID_STATUSES),
+        and comment (must be None or a str — direct socket callers could
+        send arbitrary JSON, so we type-check before binding into SQL).
+
+        Optional `comment` is stored verbatim in the status_comment column;
+        omitted comment writes NULL.
+
+        Commit ordering: the UPDATE runs first, then we inspect rowcount.
+        If rowcount == 0 (row not found) we return without committing — no
+        observable DB change. Only successful updates reach `commit()`.
+
+        NOTE: row contents (message text, comment text) are never logged.
+        """
+        feedback_id = req.get("id")
+        if not isinstance(feedback_id, int) or feedback_id <= 0:
+            return {
+                "ok": False,
+                "error": "invalid_input",
+                "message": "id must be a positive integer",
+            }
+
+        status = req.get("status")
+        if status not in VALID_STATUSES:
+            valid_list = ", ".join(sorted(VALID_STATUSES))
+            return {
+                "ok": False,
+                "error": "invalid_input",
+                "message": f"status must be one of: {valid_list}",
+            }
+
+        comment = req.get("comment")  # may be None or a string
+        # Type-check comment BEFORE binding into SQL. A direct socket caller
+        # could send a list/dict and trigger a sqlite3 binding error which
+        # would surface as 'internal' instead of 'invalid_input'.
+        if comment is not None and not isinstance(comment, str):
+            return {
+                "ok": False,
+                "error": "invalid_input",
+                "message": "comment must be a string or null",
+            }
+
+        # T-49-11: no length cap on status_comment by design (single-operator
+        # low-volume queue; SQLite handles multi-MB TEXT comfortably).
+
+        if self._feedback_conn is None:
+            return {
+                "ok": False,
+                "error": "internal",
+                "message": "feedback database not initialised",
+            }
+
+        try:
+            cur = self._feedback_conn.execute(
+                "UPDATE feedback SET status = ?, status_changed_at = ?, "
+                "status_comment = ? WHERE id = ?",
+                (status, int(time.time()), comment, feedback_id),
+            )
+            if cur.rowcount == 0:
+                # No row matched — do NOT commit (nothing to persist anyway,
+                # but explicit ordering keeps the success/no-op paths clean).
+                return {
+                    "ok": False,
+                    "error": "not_found",
+                    "message": f"Feedback id {feedback_id} not found.",
+                }
+            self._feedback_conn.commit()
+            # NOTE: response intentionally returns only a confirmation message,
+            # not the full updated row. CLI prints the message string. Both
+            # reviewers (opencode, codex) flagged this as LOW; accepted for
+            # this phase to keep the surface minimal — revisit if `feedback
+            # status` UX needs to echo the canonical row state.
+            return {
+                "ok": True,
+                "data": {
+                    "message": f"Feedback {feedback_id} status set to '{status}'."
+                },
+            }
+        except Exception as exc:
+            logger.error("update_feedback_status failed: %s", exc, exc_info=True)
+            return {
+                "ok": False,
+                "error": "internal",
+                "message": "internal error",
+            }
 
     # ------------------------------------------------------------------
     # get_usage_stats
