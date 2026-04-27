@@ -294,3 +294,156 @@ async def test_submit_feedback_db_error_returns_internal(tmp_path) -> None:
     # No traceback details in user-facing message
     assert "Traceback" not in response.get("message", "")
     assert "OperationalError" not in response.get("message", "")
+
+
+# ---------------------------------------------------------------------------
+# _update_feedback_status — happy path, validation, comment lifecycle, dispatch
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_update_feedback_status_happy_path(tmp_path) -> None:
+    server, feedback_conn = _make_feedback_server(tmp_path)
+    feedback_conn.execute(
+        "INSERT INTO feedback (submitted_at, message, status) VALUES (?, ?, 'open')",
+        (int(time.time()), "needs review"),
+    )
+    feedback_conn.commit()
+    rid = feedback_conn.execute("SELECT id FROM feedback").fetchone()[0]
+
+    response = await server._update_feedback_status({"id": rid, "status": "done"})
+
+    assert response["ok"] is True
+    assert "set to 'done'" in response["data"]["message"]
+    row = feedback_conn.execute(
+        "SELECT status, status_changed_at FROM feedback WHERE id=?", (rid,)
+    ).fetchone()
+    assert row[0] == "done"
+    assert isinstance(row[1], int) and row[1] > 0
+
+
+@pytest.mark.asyncio
+async def test_update_feedback_status_not_found(tmp_path) -> None:
+    server, feedback_conn = _make_feedback_server(tmp_path)
+    response = await server._update_feedback_status({"id": 9999, "status": "done"})
+    assert response["ok"] is False
+    assert response.get("error") == "not_found"
+    assert "9999" in response.get("message", "")
+    # No row was inserted — handler returned BEFORE commit on no-op.
+    count = feedback_conn.execute("SELECT COUNT(*) FROM feedback").fetchone()[0]
+    assert count == 0
+
+
+@pytest.mark.asyncio
+async def test_update_feedback_status_invalid_status(tmp_path) -> None:
+    server, feedback_conn = _make_feedback_server(tmp_path)
+    feedback_conn.execute(
+        "INSERT INTO feedback (submitted_at, message, status) VALUES (?, ?, 'open')",
+        (int(time.time()), "row"),
+    )
+    feedback_conn.commit()
+    rid = feedback_conn.execute("SELECT id FROM feedback").fetchone()[0]
+
+    response = await server._update_feedback_status({"id": rid, "status": "wontfix"})
+    assert response["ok"] is False
+    assert response.get("error") == "invalid_input"
+    assert "status" in response.get("message", "").lower()
+    # Row was NOT updated
+    row = feedback_conn.execute("SELECT status FROM feedback WHERE id=?", (rid,)).fetchone()
+    assert row[0] == "open"
+
+
+@pytest.mark.asyncio
+async def test_update_feedback_status_invalid_id(tmp_path) -> None:
+    server, _ = _make_feedback_server(tmp_path)
+    for bad_id in (0, -1, "abc", None):
+        response = await server._update_feedback_status({"id": bad_id, "status": "done"})
+        assert response["ok"] is False, f"bad_id={bad_id!r} should fail"
+        assert response.get("error") == "invalid_input"
+        assert "id" in response.get("message", "").lower()
+
+
+@pytest.mark.asyncio
+async def test_update_feedback_status_invalid_comment_type(tmp_path) -> None:
+    """Non-string, non-None comment is rejected as invalid_input (not internal)."""
+    server, feedback_conn = _make_feedback_server(tmp_path)
+    feedback_conn.execute(
+        "INSERT INTO feedback (submitted_at, message, status) VALUES (?, ?, 'open')",
+        (int(time.time()), "row"),
+    )
+    feedback_conn.commit()
+    rid = feedback_conn.execute("SELECT id FROM feedback").fetchone()[0]
+
+    for bad_comment in ([1, 2, 3], {"x": 1}, 42):
+        response = await server._update_feedback_status(
+            {"id": rid, "status": "done", "comment": bad_comment}
+        )
+        assert response["ok"] is False, f"bad_comment={bad_comment!r} should fail"
+        assert response.get("error") == "invalid_input"
+        assert "comment" in response.get("message", "").lower()
+    # Row status was not changed by any of the rejected calls
+    row = feedback_conn.execute("SELECT status FROM feedback WHERE id=?", (rid,)).fetchone()
+    assert row[0] == "open"
+
+
+@pytest.mark.asyncio
+async def test_update_feedback_status_with_comment(tmp_path) -> None:
+    server, feedback_conn = _make_feedback_server(tmp_path)
+    feedback_conn.execute(
+        "INSERT INTO feedback (submitted_at, message, status) VALUES (?, ?, 'open')",
+        (int(time.time()), "noisy bug"),
+    )
+    feedback_conn.commit()
+    rid = feedback_conn.execute("SELECT id FROM feedback").fetchone()[0]
+
+    response = await server._update_feedback_status(
+        {"id": rid, "status": "dismissed", "comment": "noise"}
+    )
+    assert response["ok"] is True
+    row = feedback_conn.execute(
+        "SELECT status, status_comment FROM feedback WHERE id=?", (rid,)
+    ).fetchone()
+    assert row[0] == "dismissed"
+    assert row[1] == "noise"
+
+
+@pytest.mark.asyncio
+async def test_update_feedback_status_omitting_comment_clears_it(tmp_path) -> None:
+    """Each status transition writes status_comment fresh; omitted → NULL."""
+    server, feedback_conn = _make_feedback_server(tmp_path)
+    feedback_conn.execute(
+        "INSERT INTO feedback (submitted_at, message, status) VALUES (?, ?, 'open')",
+        (int(time.time()), "row"),
+    )
+    feedback_conn.commit()
+    rid = feedback_conn.execute("SELECT id FROM feedback").fetchone()[0]
+
+    # First transition with comment
+    await server._update_feedback_status(
+        {"id": rid, "status": "in_progress", "comment": "starting"}
+    )
+    # Second transition without comment
+    await server._update_feedback_status({"id": rid, "status": "done"})
+
+    row = feedback_conn.execute(
+        "SELECT status, status_comment FROM feedback WHERE id=?", (rid,)
+    ).fetchone()
+    assert row[0] == "done"
+    assert row[1] is None  # comment cleared
+
+
+@pytest.mark.asyncio
+async def test_update_feedback_status_dispatch_route(tmp_path) -> None:
+    server, feedback_conn = _make_feedback_server(tmp_path)
+    feedback_conn.execute(
+        "INSERT INTO feedback (submitted_at, message, status) VALUES (?, ?, 'open')",
+        (int(time.time()), "route test"),
+    )
+    feedback_conn.commit()
+    rid = feedback_conn.execute("SELECT id FROM feedback").fetchone()[0]
+
+    response = await server._dispatch(
+        {"method": "update_feedback_status", "id": rid, "status": "done"}
+    )
+    assert response.get("error") != "unknown_method"
+    assert response["ok"] is True
