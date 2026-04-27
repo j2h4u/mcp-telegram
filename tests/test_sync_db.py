@@ -9,6 +9,7 @@ import pytest
 
 from mcp_telegram.sync_db import (
     _CURRENT_SCHEMA_VERSION,
+    _dialogs_snapshot_populated,
     _migrate_from_legacy_db,
     _open_sync_db,
     ensure_sync_schema,
@@ -1440,5 +1441,151 @@ def test_v16_fk_cascade_works_through_production_factory(tmp_path: Path) -> None
         assert conn.execute(
             "SELECT COUNT(*) FROM entity_details WHERE entity_id = ?", (12345,)
         ).fetchone()[0] == 0, "FK CASCADE did not fire — PRAGMA foreign_keys is OFF on production factory"
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Schema v17: dialogs snapshot table (Phase 40 — v1.6 Local Mirror)
+# ---------------------------------------------------------------------------
+
+
+def test_schema_v17_dialogs_table_exists(tmp_sync_db_path: Path) -> None:
+    """After ensure_sync_schema(), dialogs table exists and is queryable."""
+    ensure_sync_schema(tmp_sync_db_path)
+    conn = _open_sync_db(tmp_sync_db_path)
+    try:
+        # Should not raise — table exists
+        conn.execute("SELECT * FROM dialogs LIMIT 0").fetchall()
+    finally:
+        conn.close()
+
+
+def test_schema_v17_dialogs_columns(tmp_sync_db_path: Path) -> None:
+    """dialogs table has all 14 required columns with correct types and constraints."""
+    ensure_sync_schema(tmp_sync_db_path)
+    conn = _open_sync_db(tmp_sync_db_path)
+    try:
+        rows = conn.execute("PRAGMA table_info(dialogs)").fetchall()
+        columns = {str(row[1]): row for row in rows}
+
+        required = {
+            "dialog_id", "name", "type", "archived", "pinned",
+            "members", "created", "last_message_at", "snapshot_at",
+            "hidden", "needs_refresh", "unread_mentions_count",
+            "unread_reactions_count", "draft_text",
+        }
+        assert required == set(columns.keys()), (
+            f"Column mismatch.\nExpected: {sorted(required)}\nGot: {sorted(columns.keys())}"
+        )
+
+        assert "unread_count" not in columns, "unread_count must not be stored in dialogs (MIRROR-05)"
+
+        for col_name in ("archived", "pinned", "hidden", "needs_refresh",
+                         "unread_mentions_count", "unread_reactions_count"):
+            col = columns[col_name]
+            assert col[2] == "INTEGER", f"{col_name} must be INTEGER, got {col[2]}"
+            assert col[3] == 1, f"{col_name} must be NOT NULL"
+            assert str(col[4]) == "0", f"{col_name} default must be 0, got {col[4]!r}"
+
+        for col_name in ("name", "type", "members", "created",
+                         "last_message_at", "snapshot_at", "draft_text"):
+            col = columns[col_name]
+            assert col[3] == 0, f"{col_name} must be nullable (NOT NULL=0), got notnull={col[3]}"
+    finally:
+        conn.close()
+
+
+def test_schema_v17_dialogs_indexes(tmp_sync_db_path: Path) -> None:
+    """dialogs table has the three expected indexes after migration."""
+    ensure_sync_schema(tmp_sync_db_path)
+    conn = _open_sync_db(tmp_sync_db_path)
+    try:
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='dialogs' ORDER BY name"
+        ).fetchall()
+        index_names = {r[0] for r in rows}
+        assert "idx_dialogs_hidden_pinned" in index_names, (
+            f"idx_dialogs_hidden_pinned missing. Got: {index_names}"
+        )
+        assert "idx_dialogs_type" in index_names, (
+            f"idx_dialogs_type missing. Got: {index_names}"
+        )
+        assert "idx_dialogs_snapshot_at" in index_names, (
+            f"idx_dialogs_snapshot_at missing. Got: {index_names}"
+        )
+    finally:
+        conn.close()
+
+
+def test_dialogs_snapshot_populated_false_on_fresh(tmp_sync_db_path: Path) -> None:
+    """_dialogs_snapshot_populated() returns False on a fresh v17 DB with no rows."""
+    ensure_sync_schema(tmp_sync_db_path)
+    conn = _open_sync_db(tmp_sync_db_path)
+    try:
+        assert _dialogs_snapshot_populated(conn) is False, (
+            "Expected False on empty dialogs table"
+        )
+    finally:
+        conn.close()
+
+
+def test_dialogs_snapshot_populated_true_after_insert(tmp_sync_db_path: Path) -> None:
+    """_dialogs_snapshot_populated() returns True after at least one row is inserted."""
+    ensure_sync_schema(tmp_sync_db_path)
+    conn = _open_sync_db(tmp_sync_db_path)
+    try:
+        conn.execute(
+            "INSERT INTO dialogs (dialog_id, snapshot_at) VALUES (?, strftime('%s', 'now'))",
+            (123456789,),
+        )
+        conn.commit()
+        assert _dialogs_snapshot_populated(conn) is True, (
+            "Expected True after inserting one row into dialogs"
+        )
+    finally:
+        conn.close()
+
+
+def test_dialogs_no_fk_to_synced_dialogs(tmp_sync_db_path: Path) -> None:
+    """dialogs table has no FOREIGN KEY constraints (MIRROR-03: independent evolution)."""
+    ensure_sync_schema(tmp_sync_db_path)
+    conn = _open_sync_db(tmp_sync_db_path)
+    try:
+        rows = conn.execute("PRAGMA foreign_key_list(dialogs)").fetchall()
+        assert rows == [], (
+            f"dialogs must have no FK constraints (MIRROR-03). Got: {rows}"
+        )
+    finally:
+        conn.close()
+
+
+def test_schema_v17_idempotent(tmp_sync_db_path: Path) -> None:
+    """Running ensure_sync_schema() twice produces exactly _CURRENT_SCHEMA_VERSION rows in schema_version."""
+    ensure_sync_schema(tmp_sync_db_path)
+    ensure_sync_schema(tmp_sync_db_path)
+    conn = _open_sync_db(tmp_sync_db_path)
+    try:
+        rows = conn.execute("SELECT version FROM schema_version ORDER BY version").fetchall()
+        versions = [int(r[0]) for r in rows]
+        expected = list(range(1, _CURRENT_SCHEMA_VERSION + 1))
+        assert versions == expected, f"Expected versions {expected}, got {versions}"
+        conn.execute("SELECT * FROM dialogs LIMIT 0").fetchall()
+    finally:
+        conn.close()
+
+
+def test_schema_version_is_17(tmp_sync_db_path: Path) -> None:
+    """After ensure_sync_schema(), MAX(version) in schema_version is 17."""
+    ensure_sync_schema(tmp_sync_db_path)
+    conn = _open_sync_db(tmp_sync_db_path)
+    try:
+        row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
+        assert row is not None and int(row[0]) == 17, (
+            f"Expected schema version 17, got {row}"
+        )
+        assert _CURRENT_SCHEMA_VERSION == 17, (
+            f"_CURRENT_SCHEMA_VERSION must be 17, got {_CURRENT_SCHEMA_VERSION}"
+        )
     finally:
         conn.close()
