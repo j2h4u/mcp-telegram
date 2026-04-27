@@ -1,7 +1,7 @@
 {
   "steps": [
     {
-      "_comment": "All 13 tools registered with correct schemas",
+      "_comment": "All 14 tools registered with correct schemas",
       "action": "list_tools",
       "expect": {
         "tool_names_include": [
@@ -17,7 +17,8 @@
           "GetMyRecentActivity",
           "MarkDialogForSync",
           "GetSyncStatus",
-          "GetSyncAlerts"
+          "GetSyncAlerts",
+          "SubmitFeedback"
         ],
         "tool_expectations": {
           "ListMessages": {
@@ -33,6 +34,10 @@
           },
           "GetSyncStatus": {
             "inputSchema.properties.dialog_id.type": "integer"
+          },
+          "SubmitFeedback": {
+            "inputSchema.properties.message.type": "string",
+            "inputSchema.properties.message.maxLength": 10000
           }
         }
       }
@@ -135,6 +140,16 @@
       "arguments": {},
       "expect": {
         "is_error": false
+      }
+    },
+    {
+      "_comment": "SubmitFeedback — daemon route, fails gracefully when daemon is down",
+      "action": "call_tool",
+      "name": "SubmitFeedback",
+      "arguments": {"message": "smoke test from no-daemon harness", "severity": "bug"},
+      "expect": {
+        "is_error": false,
+        "content_text_contains": ["not running", "mcp-telegram sync"]
       }
     }
   ]
