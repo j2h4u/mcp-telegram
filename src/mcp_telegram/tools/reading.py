@@ -375,8 +375,14 @@ async def list_messages(args: ListMessages) -> ToolResult:
         direction = "newest"
     # If navigation is an opaque token, direction is encoded in it (daemon handles it)
 
-    # Sender passthrough
-    sender_name: str | None = args.sender
+    # Sender passthrough: numeric string → sender_id (works on live Telegram path via from_user=)
+    sender_id: int | None = None
+    sender_name: str | None = None
+    if args.sender is not None:
+        try:
+            sender_id = int(args.sender)
+        except ValueError:
+            sender_name = args.sender
 
     # Unread flag
     unread_flag: bool | None = True if args.unread else None
@@ -406,6 +412,7 @@ async def list_messages(args: ListMessages) -> ToolResult:
                 limit=args.limit,
                 navigation=args.navigation,
                 direction=direction,
+                sender_id=sender_id,
                 sender_name=sender_name,
                 topic_id=topic_id,
                 unread=unread_flag,

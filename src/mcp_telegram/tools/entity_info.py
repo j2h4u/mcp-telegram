@@ -121,45 +121,53 @@ class GetEntityInfo(ToolArgs):
 
 @mcp_tool("primary", annotations=ToolAnnotations(readOnlyHint=True))
 async def get_entity_info(args: GetEntityInfo) -> ToolResult:
-    # Two daemon connections: daemon handles one request per connection.
-    # Accepted race: entity_id obtained from resolve_entity could theoretically
-    # become stale if the entities table is modified between the two calls, but
-    # this window is negligible in practice (entities are stable once synced).
+    # Numeric ID shortcut: skip resolver entirely and go straight to daemon.
     try:
-        async with daemon_connection() as conn:
-            resolve_response = await conn.resolve_entity(query=args.entity)
-    except DaemonNotRunningError:
-        return ToolResult(content=_text_response(_daemon_not_running_text()))
+        entity_id = int(args.entity)
+        display_name = args.entity
+    except ValueError:
+        entity_id = None
 
-    if not resolve_response.get("ok"):
-        return ToolResult(content=_text_response(entity_not_found_text(args.entity, retry_tool="GetEntityInfo")))
+    if entity_id is None:
+        # Two daemon connections: daemon handles one request per connection.
+        # Accepted race: entity_id obtained from resolve_entity could theoretically
+        # become stale if the entities table is modified between the two calls, but
+        # this window is negligible in practice (entities are stable once synced).
+        try:
+            async with daemon_connection() as conn:
+                resolve_response = await conn.resolve_entity(query=args.entity)
+        except DaemonNotRunningError:
+            return ToolResult(content=_text_response(_daemon_not_running_text()))
 
-    resolve_data = resolve_response.get("data", {})
-    resolve_status = resolve_data.get("result", "not_found")
+        if not resolve_response.get("ok"):
+            return ToolResult(content=_text_response(entity_not_found_text(args.entity, retry_tool="GetEntityInfo")))
 
-    if resolve_status == "not_found":
-        return ToolResult(content=_text_response(entity_not_found_text(args.entity, retry_tool="GetEntityInfo")))
+        resolve_data = resolve_response.get("data", {})
+        resolve_status = resolve_data.get("result", "not_found")
 
-    if resolve_status == "candidates":
-        matches = resolve_data.get("matches", [])
-        match_lines = []
-        for match in matches:
-            line = f'id={match["entity_id"]} name="{match["display_name"]}" score={match["score"]}'
-            if match.get("username"):
-                line += f" @{match['username']}"
-            if match.get("entity_type"):
-                line += f" [{match['entity_type']}]"
-            if match.get("disambiguation_hint"):
-                line += f'  hint="{match["disambiguation_hint"]}"'
-            match_lines.append(line)
-        return ToolResult(
-            content=_text_response(
-                ambiguous_entity_text(args.entity, match_lines, retry_tool="GetEntityInfo"),
+        if resolve_status == "not_found":
+            return ToolResult(content=_text_response(entity_not_found_text(args.entity, retry_tool="GetEntityInfo")))
+
+        if resolve_status == "candidates":
+            matches = resolve_data.get("matches", [])
+            match_lines = []
+            for match in matches:
+                line = f'id={match["entity_id"]} name="{match["display_name"]}" score={match["score"]}'
+                if match.get("username"):
+                    line += f" @{match['username']}"
+                if match.get("entity_type"):
+                    line += f" [{match['entity_type']}]"
+                if match.get("disambiguation_hint"):
+                    line += f'  hint="{match["disambiguation_hint"]}"'
+                match_lines.append(line)
+            return ToolResult(
+                content=_text_response(
+                    ambiguous_entity_text(args.entity, match_lines, retry_tool="GetEntityInfo"),
+                )
             )
-        )
 
-    entity_id: int = resolve_data["entity_id"]
-    display_name: str = resolve_data["display_name"]
+        entity_id = resolve_data["entity_id"]
+        display_name = resolve_data["display_name"]
 
     try:
         async with daemon_connection() as conn:
