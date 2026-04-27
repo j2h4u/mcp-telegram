@@ -188,32 +188,3 @@ async def list_topics(args: ListTopics) -> ToolResult:
     return ToolResult(content=_text_response(result_text), result_count=len(lines), has_filter=True)
 
 
-class GetMyAccount(ToolArgs):
-    """Return own account info: numeric id, display name, and username. No arguments required."""
-
-
-@mcp_tool("secondary/helper", annotations=ToolAnnotations(readOnlyHint=True))
-async def get_my_account(args: GetMyAccount) -> ToolResult:
-    try:
-        async with daemon_connection() as conn:
-            response = await conn.get_me()
-    except DaemonNotRunningError:
-        return ToolResult(content=_text_response(_daemon_not_running_text()))
-
-    if err := _check_daemon_response(response):
-        return err
-
-    data = response.get("data", {})
-    if not data:
-        from ..errors import not_authenticated_text
-
-        return ToolResult(content=_text_response(not_authenticated_text("GetMyAccount")))
-
-    first_name = data.get("first_name") or ""
-    last_name = data.get("last_name") or ""
-    name = " ".join(filter(None, [first_name, last_name]))
-    username = data.get("username") or "none"
-    user_id = data.get("id", 0)
-
-    text = f"id={user_id} name='{name}' username=@{username}"
-    return ToolResult(content=_text_response(text), result_count=1)

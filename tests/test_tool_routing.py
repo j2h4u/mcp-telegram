@@ -18,7 +18,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from mcp_telegram.tools import (
     GetInbox,
-    GetMyAccount,
     GetSyncAlerts,
     GetSyncStatus,
     GetEntityInfo,
@@ -28,7 +27,6 @@ from mcp_telegram.tools import (
     MarkDialogForSync,
     SearchMessages,
     get_inbox,
-    get_my_account,
     get_sync_alerts,
     get_sync_status,
     get_entity_info,
@@ -306,33 +304,6 @@ async def test_list_topics_dialog_not_found():
     assert "not found" in result[0].text.lower()
 
 
-# ---------------------------------------------------------------------------
-# GetMyAccount — daemon routing
-# ---------------------------------------------------------------------------
-
-
-async def test_get_my_account_via_daemon():
-    """GetMyAccount routes through daemon API."""
-    conn = _make_daemon_conn(
-        {
-            "ok": True,
-            "data": {
-                "id": 999,
-                "first_name": "Test",
-                "last_name": "User",
-                "username": "testuser",
-                "phone": "+1234567890",
-            },
-        }
-    )
-    with _patch_daemon(conn):
-        result = await get_my_account(GetMyAccount())
-
-    text = result[0].text
-    assert "id=999" in text
-    assert "Test" in text
-    assert "testuser" in text
-    conn.get_me.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -502,14 +473,6 @@ async def test_list_topics_daemon_not_running():
     text = result[0].text
     assert "not running" in text.lower() or "mcp-telegram sync" in text.lower()
 
-
-async def test_get_my_account_daemon_not_running():
-    """GetMyAccount returns actionable error when daemon is not running."""
-    with _patch_daemon_not_running():
-        result = await get_my_account(GetMyAccount())
-
-    text = result[0].text
-    assert "not running" in text.lower() or "mcp-telegram sync" in text.lower()
 
 
 # ---------------------------------------------------------------------------

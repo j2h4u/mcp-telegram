@@ -125,8 +125,7 @@ async def call_tool(name: str, arguments: t.Any) -> Sequence[TextContent | Image
 async def _build_server_instructions() -> str:
     """Fetch account info from daemon and build server instructions string.
 
-    Falls back to a generic message if the daemon is unavailable — the
-    client can still use GetMyAccount explicitly.
+    Falls back to a generic message if the daemon is unavailable.
     """
     from .daemon_client import DaemonNotRunningError, daemon_connection
 

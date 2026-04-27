@@ -138,7 +138,7 @@ def test_posture_primary_tools_reflected_in_descriptions() -> None:
 
 def test_posture_secondary_tools_reflected_in_descriptions() -> None:
     """Secondary/helper tools should have [secondary/helper] tag in descriptions."""
-    for name in ("ListDialogs", "ListTopics", "GetMyAccount", "GetUsageStats"):
+    for name in ("ListDialogs", "ListTopics", "GetUsageStats"):
         tool = server.tool_by_name[name]
         assert tool.description.startswith("[secondary/helper]"), f"{name} missing [secondary/helper] prefix"
 
@@ -191,7 +191,6 @@ def test_helper_tools_remain_available_not_hidden() -> None:
     helper_tools = [
         ("ListDialogs", "secondary/helper"),
         ("ListTopics", "secondary/helper"),
-        ("GetMyAccount", "secondary/helper"),
         ("GetUsageStats", "secondary/helper"),
     ]
 
