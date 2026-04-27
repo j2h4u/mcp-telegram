@@ -266,3 +266,17 @@ def mock_client() -> AsyncMock:
     client.iter_messages = MagicMock(return_value=async_iter([]))
     client.__call__ = AsyncMock(return_value=MagicMock())
     return client
+
+
+@pytest.fixture
+def make_feedback_db(tmp_path):
+    """Factory: returns (conn, db_path) for a freshly-migrated feedback.db."""
+
+    def _factory():
+        from mcp_telegram.feedback_db import ensure_feedback_schema
+
+        db_path = tmp_path / "feedback.db"
+        conn = ensure_feedback_schema(db_path)
+        return conn, db_path
+
+    return _factory
