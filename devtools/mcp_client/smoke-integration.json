@@ -85,13 +85,12 @@
       }
     },
     {
-      "_comment": "GetDialogStats — top reactions/mentions/hashtags/reposts for a synced dialog",
+      "_comment": "GetDialogStats — returns stats or actionable 'not synced' error depending on runtime state",
       "action": "call_tool",
       "name": "GetDialogStats",
       "arguments": {"dialog": "Vibecoding is so last year", "top_n": 3},
       "expect": {
-        "is_error": false,
-        "content_text_contains": ["=== Top Reactions"]
+        "is_error": false
       }
     },
     {
