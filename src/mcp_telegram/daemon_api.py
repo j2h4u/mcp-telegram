@@ -39,6 +39,7 @@ import contextvars
 import dataclasses
 import json
 import logging
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -513,8 +514,6 @@ _ALL_ENTITY_NAMES_NORMALIZED_SQL = (
 )
 _ENTITY_BY_USERNAME_SQL = "SELECT id, name FROM entities WHERE username = ?"
 
-# Column names returned by _build_list_messages_query, in SELECT order.
-
 
 # ---------------------------------------------------------------------------
 # Reaction helper
@@ -577,6 +576,29 @@ _LIST_MESSAGES_BASE_SQL = (
     f"LEFT JOIN message_forwards mf ON mf.dialog_id = m.dialog_id AND mf.message_id = m.message_id "
     f"WHERE m.dialog_id = :dialog_id AND m.is_deleted = 0"
 )
+
+
+def _assert_select_columns_match_read_message() -> None:
+    """Verify SELECT aliases in _LIST_MESSAGES_BASE_SQL cover all
+    ReadMessage fields except the two injected post-query fields."""
+    from dataclasses import fields as dc_fields
+
+    expected = frozenset(
+        f.name for f in dc_fields(ReadMessage)
+        if f.name not in {"reactions_display", "dialog_name"}
+    )
+    # Match both `... AS alias` forms and bare table-qualified refs (`m.col`, `mf.col`)
+    aliases = frozenset(re.findall(r"\bAS\s+(\w+)", _LIST_MESSAGES_BASE_SQL))
+    bare = frozenset(re.findall(r"\b(?:m|mf)\.(\w+)\b", _LIST_MESSAGES_BASE_SQL))
+    found = aliases | bare
+    missing = expected - found
+    extra = found - expected
+    assert not missing and not extra, (
+        f"SELECT/ReadMessage field mismatch — missing: {missing}, extra: {extra}"
+    )
+
+
+_assert_select_columns_match_read_message()
 
 
 def _build_list_messages_query(
