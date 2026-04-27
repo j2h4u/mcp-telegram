@@ -147,6 +147,8 @@ async def _build_server_instructions() -> str:
         "- SYNC STATUS: Only synced dialogs support SearchMessages and anchor-based reading. "
         "Plain ListMessages browsing works on any dialog without syncing. "
         "Use GetSyncStatus to check coverage.\n"
+        "- FEEDBACK: Use SubmitFeedback immediately when a tool response is wrong, "
+        "surprising, or missing a useful capability -- don't wait until end of session.\n"
     )
     try:
         async with daemon_connection() as conn:
