@@ -42,14 +42,23 @@ def _patch_get_peer_id():
 def make_server(
     conn: sqlite3.Connection | None = None,
     client: Any | None = None,
+    feedback_conn: sqlite3.Connection | None = None,
 ) -> DaemonAPIServer:
     """Return a DaemonAPIServer wired to in-memory DB and mock client."""
     if conn is None:
         conn = _make_db()
     if client is None:
         client = MagicMock()
+    if feedback_conn is None:
+        # In-memory feedback.db with the canonical schema applied.
+        feedback_conn = sqlite3.connect(":memory:")
+        feedback_conn.execute(
+            "CREATE TABLE feedback ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, submitted_at INTEGER NOT NULL, "
+            "message TEXT NOT NULL, severity TEXT, context TEXT, model TEXT, harness TEXT)"
+        )
     shutdown_event = asyncio.Event()
-    server = DaemonAPIServer(conn, client, shutdown_event)
+    server = DaemonAPIServer(conn, client, shutdown_event, feedback_conn)
     server._ready = True
     return server
 

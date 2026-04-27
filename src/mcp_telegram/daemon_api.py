@@ -1,6 +1,6 @@
 """Daemon API server — Unix socket request dispatcher.
 
-DaemonAPIServer listens on a Unix domain socket and handles fifteen methods:
+DaemonAPIServer listens on a Unix domain socket and handles sixteen methods:
   - list_messages: read from sync.db (synced dialogs) or Telegram (on-demand)
   - search_messages: FTS5 stemmed full-text search against messages_fts
   - list_dialogs: live dialog list from Telegram enriched with sync_status
@@ -16,6 +16,7 @@ DaemonAPIServer listens on a Unix domain socket and handles fifteen methods:
   - upsert_entities: batch upsert entities into sync.db
   - resolve_entity: fuzzy entity resolution from sync.db
   - get_dialog_stats: aggregate analytics (reactions, mentions, hashtags, forwards) for a synced dialog
+  - submit_feedback: write a feedback row to feedback.db
 
 Protocol: newline-delimited JSON (one request line → one response line).
 
@@ -204,6 +205,7 @@ from rapidfuzz import fuzz as _fuzz
 from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
 
 from .budget import allocate_message_budget_proportional, unread_chat_tier
+from .feedback_db import VALID_SEVERITIES
 from .formatter import format_reaction_counts
 from .fts import stem_query
 from .models import ReadMessage, ReadState
@@ -732,9 +734,11 @@ class DaemonAPIServer:
         conn: sqlite3.Connection,
         client: Any,
         shutdown_event: asyncio.Event,
+        feedback_conn: sqlite3.Connection,
     ) -> None:
         conn.row_factory = sqlite3.Row
         self._conn = conn
+        self._feedback_conn = feedback_conn  # feedback.db — daemon is sole writer
         self._client = client
         self._shutdown_event = shutdown_event
         # Phase 39.1: cached authenticated user id, populated once by
@@ -894,6 +898,8 @@ class DaemonAPIServer:
             return await self._get_dialog_stats(req)
         if method == "get_my_recent_activity":
             return await self._get_my_recent_activity(req)
+        if method == "submit_feedback":
+            return await self._submit_feedback(req)
         return {"ok": False, "error": "unknown_method"}
 
     # ------------------------------------------------------------------
@@ -3303,6 +3309,72 @@ class DaemonAPIServer:
             return {"ok": True}
         except Exception as exc:
             logger.error("record_telemetry failed: %s", exc, exc_info=True)
+            return {"ok": False, "error": "internal", "message": "internal error"}
+
+    # ------------------------------------------------------------------
+    # submit_feedback
+    # ------------------------------------------------------------------
+
+    async def _submit_feedback(self, req: dict) -> dict:
+        """Persist a feedback row in feedback.db.
+
+        Validates message (required, non-empty after strip, ≤10000 chars) and
+        optional severity (must be in VALID_SEVERITIES).  Optional context,
+        model, harness fields are length-capped at the daemon layer as
+        defense-in-depth — direct socket callers bypass the Pydantic tool layer.
+
+        NOTE: the user-supplied message text is intentionally NOT logged at any
+        level to avoid accidental disclosure of sensitive context.
+        """
+        message = req.get("message", "")
+        if not isinstance(message, str):
+            return {"ok": False, "error": "invalid_input", "message": "message must be a string"}
+        stripped = message.strip()
+        if not stripped:
+            return {"ok": False, "error": "invalid_input", "message": "message is required"}
+        if len(message) > 10000:
+            return {"ok": False, "error": "invalid_input", "message": "message too long (max 10000 chars)"}
+
+        severity = req.get("severity")
+        if severity is not None and severity not in VALID_SEVERITIES:
+            valid_list = ", ".join(sorted(VALID_SEVERITIES))
+            return {
+                "ok": False,
+                "error": "invalid_input",
+                "message": f"severity must be one of: {valid_list}",
+            }
+
+        # Defense-in-depth: cap optional fields at the daemon layer too.
+        # Pydantic max_length on SubmitFeedback (48-03) blocks oversize payloads
+        # from MCP clients, but a direct socket caller could bypass the tool —
+        # daemon is the canonical trust boundary, so it enforces the same caps.
+        context = req.get("context")
+        model = req.get("model")
+        harness = req.get("harness")
+        if context is not None and len(str(context)) > 2000:
+            return {"ok": False, "error": "invalid_input", "message": "context too long (max 2000 chars)"}
+        if model is not None and len(str(model)) > 200:
+            return {"ok": False, "error": "invalid_input", "message": "model too long (max 200 chars)"}
+        if harness is not None and len(str(harness)) > 200:
+            return {"ok": False, "error": "invalid_input", "message": "harness too long (max 200 chars)"}
+
+        try:
+            self._feedback_conn.execute(
+                "INSERT INTO feedback (submitted_at, message, severity, context, model, harness) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    int(time.time()),
+                    stripped,
+                    severity,
+                    context,
+                    model,
+                    harness,
+                ),
+            )
+            self._feedback_conn.commit()
+            return {"ok": True, "data": {"message": "Feedback recorded. Thank you!"}}
+        except Exception as exc:
+            logger.error("submit_feedback failed: %s", exc, exc_info=True)
             return {"ok": False, "error": "internal", "message": "internal error"}
 
     # ------------------------------------------------------------------

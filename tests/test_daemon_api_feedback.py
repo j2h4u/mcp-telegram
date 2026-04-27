@@ -267,16 +267,24 @@ async def test_submit_feedback_harness_too_long(tmp_path) -> None:
 @pytest.mark.asyncio
 async def test_submit_feedback_db_error_returns_internal(tmp_path) -> None:
     """sqlite3.OperationalError from execute → ok=False, error='internal', no traceback leak."""
-    server, feedback_conn = _make_feedback_server(tmp_path)
-
-    original_execute = feedback_conn.execute
+    # Python 3.14 made sqlite3.Connection.execute a read-only C attribute so
+    # direct assignment and patch.object both fail.  Inject a MagicMock that
+    # raises on INSERT — this is the correct approach for C-extension objects.
+    sync_conn = sqlite3.connect(":memory:")
+    mock_feedback_conn = MagicMock(spec=sqlite3.Connection)
 
     def _raise(*args, **kwargs):
         if args and "INSERT" in str(args[0]):
             raise sqlite3.OperationalError("disk full")
-        return original_execute(*args, **kwargs)
+        # Pass through non-INSERT calls (none expected in this test path)
+        return MagicMock()
 
-    feedback_conn.execute = _raise  # type: ignore[method-assign]
+    mock_feedback_conn.execute.side_effect = _raise
+
+    client = MagicMock()
+    shutdown_event = asyncio.Event()
+    server = DaemonAPIServer(sync_conn, client, shutdown_event, mock_feedback_conn)
+    server._ready = True
 
     response = await server._submit_feedback({"message": "trigger db error"})
 
