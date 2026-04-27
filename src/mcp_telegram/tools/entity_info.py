@@ -237,6 +237,7 @@ async def get_entity_info(args: GetEntityInfo) -> ToolResult:
 
 
 def _render_user_or_bot(data: dict, lines: list[str]) -> None:
+    lines.append(f"is_bot: {str(bool(data.get('bot', False))).lower()}")
     flags = [
         label
         for label, val in [

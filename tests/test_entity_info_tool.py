@@ -71,6 +71,7 @@ async def test_get_entity_info_user_renders() -> None:
         result = await get_entity_info(GetEntityInfo(entity="Alice"))
     text = result[0].text
     assert "type=user" in text
+    assert "is_bot: false" in text
     assert "name='Alice Smith'" in text
     assert "username=@alice" in text
     assert "about: QA engineer" in text
@@ -108,6 +109,7 @@ async def test_get_entity_info_bot_renders_type_bot() -> None:
         result = await get_entity_info(GetEntityInfo(entity="MyBot"))
     text = result[0].text
     assert "type=bot" in text
+    assert "is_bot: true" in text
     assert "flags: bot" in text
     assert "bot_description: A test bot" in text
     assert "bot_commands: /start" in text
