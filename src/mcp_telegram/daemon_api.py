@@ -734,7 +734,7 @@ class DaemonAPIServer:
         conn: sqlite3.Connection,
         client: Any,
         shutdown_event: asyncio.Event,
-        feedback_conn: sqlite3.Connection,
+        feedback_conn: sqlite3.Connection | None = None,
     ) -> None:
         conn.row_factory = sqlite3.Row
         self._conn = conn
