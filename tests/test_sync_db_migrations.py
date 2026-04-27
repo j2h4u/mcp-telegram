@@ -253,3 +253,77 @@ def test_migration_v16_does_not_touch_entities_columns(tmp_path: Path) -> None:
     assert cols == {"id", "type", "name", "username", "name_normalized", "updated_at"}, (
         f"entities columns must not change in v16; got {cols}"
     )
+
+
+# ---------------------------------------------------------------------------
+# v18: daemon_state KV table (Phase 41 — bootstrap sweep cursor + flags)
+# ---------------------------------------------------------------------------
+
+
+def test_migration_v18_creates_daemon_state_table(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    try:
+        rows = list(
+            conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='daemon_state'"
+            )
+        )
+        assert rows == [("daemon_state",)]
+        cols = list(conn.execute("PRAGMA table_info(daemon_state)"))
+        col_map = {c[1]: (c[2], c[3], c[5]) for c in cols}
+        # name -> (type, notnull, pk)
+        assert col_map["key"] == ("TEXT", 0, 1)
+        assert col_map["value"] == ("TEXT", 0, 0)
+    finally:
+        conn.close()
+
+
+def test_migration_v18_daemon_state_empty_after_migration(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    try:
+        count = conn.execute("SELECT COUNT(*) FROM daemon_state").fetchone()[0]
+        assert count == 0
+    finally:
+        conn.close()
+
+
+def test_migration_v18_idempotent(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO daemon_state(key, value) VALUES ('probe', 'value')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    ensure_sync_schema(db_path)  # second call: must not raise or wipe data
+
+    conn = _open_sync_db(db_path)
+    try:
+        row = conn.execute(
+            "SELECT value FROM daemon_state WHERE key = 'probe'"
+        ).fetchone()
+        assert row == ("value",)
+    finally:
+        conn.close()
+
+
+def test_schema_version_records_current_v18(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    try:
+        max_version = conn.execute(
+            "SELECT MAX(version) FROM schema_version"
+        ).fetchone()[0]
+        assert max_version == _CURRENT_SCHEMA_VERSION
+        assert _CURRENT_SCHEMA_VERSION == 18  # Phase 41 lock — flips when next migration ships
+    finally:
+        conn.close()
