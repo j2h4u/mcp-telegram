@@ -1,7 +1,7 @@
 import asyncio
 from typing import Annotated
 
-from typer import Context, Option, Typer
+from typer import Argument, Context, Option, Typer
 
 app = Typer()
 
@@ -71,8 +71,13 @@ app.add_typer(feedback_app, name="feedback")
 @feedback_app.command("list")
 def feedback_list(
     limit: Annotated[int, Option(help="Max rows to display (default 50).")] = 50,
+    show_all: Annotated[bool, Option("--all", help="Include done and dismissed items.")] = False,
 ) -> None:
-    """List recent agent feedback (most-recent first)."""
+    """List recent agent feedback (most-recent first).
+
+    Default view shows only `open` and `in_progress` items -- what needs
+    attention. Use --all to include `done` and `dismissed` history.
+    """
     import sqlite3
     from datetime import datetime as _dt
 
@@ -88,22 +93,51 @@ def feedback_list(
     conn = sqlite3.connect(str(path), timeout=5.0)
     try:
         conn.execute("PRAGMA busy_timeout=5000")
-        rows = conn.execute(
-            "SELECT id, submitted_at, severity, message, context, model, harness "
-            "FROM feedback ORDER BY submitted_at DESC, id DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
+        base_select = (
+            "SELECT id, submitted_at, severity, status, status_changed_at, "
+            "status_comment, message, context, model, harness FROM feedback"
+        )
+        order_limit = " ORDER BY submitted_at DESC, id DESC LIMIT ?"
+        if show_all:
+            rows = conn.execute(base_select + order_limit, (limit,)).fetchall()
+        else:
+            rows = conn.execute(
+                base_select
+                + " WHERE status IN ('open','in_progress')"
+                + order_limit,
+                (limit,),
+            ).fetchall()
+
+        if not rows:
+            if show_all:
+                # --all is set and we still got nothing -> table is empty.
+                print("No feedback recorded yet.")
+                return
+            # Default filter empty — distinguish "queue empty" from
+            # "all open work cleared, history exists".
+            total = conn.execute("SELECT COUNT(*) FROM feedback").fetchone()[0]
+            if total == 0:
+                print("No feedback recorded yet.")
+            else:
+                print(
+                    "No open or in-progress feedback. "
+                    "Use --all to show history."
+                )
+            return
     finally:
         conn.close()
 
-    if not rows:
-        print("No feedback recorded yet.")
-        return
-
-    for rid, ts, sev, msg, ctx, mdl, harn in rows:
+    for (
+        rid, ts, sev, status, status_changed_at, status_comment,
+        msg, ctx, mdl, harn,
+    ) in rows:
         sev_tag = f"[{sev}]" if sev else "[?]"
+        status_tag = f"[{status}]"
         ts_human = _dt.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
-        metadata_parts = [f"id={rid}", sev_tag, ts_human]
+        metadata_parts = [f"id={rid}", sev_tag, status_tag, ts_human]
+        if status_changed_at:
+            changed_human = _dt.fromtimestamp(status_changed_at).strftime("%Y-%m-%d %H:%M")
+            metadata_parts.append(f"changed={changed_human}")
         if mdl:
             metadata_parts.append(f"model={mdl}")
         if harn:
@@ -112,43 +146,52 @@ def feedback_list(
         print(f"  message: {msg}")
         if ctx:
             print(f"  context: {ctx}")
+        if status_comment:
+            print(f"  status_comment: {status_comment}")
         print()  # blank line between rows
 
 
-@feedback_app.command("delete")
-def feedback_delete(feedback_id: int) -> None:
-    """Delete a feedback row by id."""
-    import sqlite3
+@feedback_app.command("status")
+def feedback_status(
+    feedback_id: Annotated[int, Argument(help="Feedback row id (see `feedback list`).")],
+    status: Annotated[
+        str,
+        Argument(help="New status: open | in_progress | done | dismissed"),
+    ],
+    comment: Annotated[
+        str | None,
+        Option("--comment", help="Optional rationale for this status change."),
+    ] = None,
+) -> None:
+    """Set the status of a feedback row.
+
+    Routes through the daemon Unix socket — feedback.db is daemon-write-only.
+    Validates the status string locally before opening the socket so an
+    invalid value never reaches the daemon.
+    """
     import sys
 
-    from .feedback_db import get_feedback_db_path
+    from .feedback_db import VALID_STATUSES
+    from .daemon_client import daemon_connection
 
-    path = get_feedback_db_path()
-    if not path.exists():
-        print("No feedback database — nothing to delete.")
+    if status not in VALID_STATUSES:
+        valid_list = ", ".join(sorted(VALID_STATUSES))
+        print(f"Invalid status '{status}'. Must be one of: {valid_list}")
         sys.exit(1)
 
-    # ──────────────────────────────────────────────────────────────────────
-    # Concurrent-writer note (admin-tool exception to "daemon is sole writer"):
-    # The daemon may be INSERT-ing new feedback rows at the exact moment this
-    # CLI runs DELETE. SQLite WAL mode allows ONE writer at a time, so the
-    # second writer waits up to busy_timeout (5s here) before raising
-    # OperationalError. For a low-volume admin tool this is acceptable —
-    # operator retries if the lock is held longer than 5s. The two writers
-    # never corrupt each other because:
-    #   1. WAL serialises writes (one at a time)
-    #   2. busy_timeout=5000 gives a bounded wait, not an unbounded hang
-    #   3. AUTOINCREMENT id avoids primary-key collisions even mid-write
-    # See Pitfall 3 in 48-RESEARCH.md.
-    # ──────────────────────────────────────────────────────────────────────
-    conn = sqlite3.connect(str(path), timeout=5.0)
-    try:
-        conn.execute("PRAGMA busy_timeout=5000")
-        cur = conn.execute("DELETE FROM feedback WHERE id = ?", (feedback_id,))
-        conn.commit()
-        if cur.rowcount == 0:
-            print(f"Feedback id {feedback_id} not found.")
+    async def _run() -> None:
+        async with daemon_connection() as conn:
+            response = await conn.update_feedback_status(
+                feedback_id=feedback_id,
+                status=status,
+                comment=comment,
+            )
+        if response.get("ok"):
+            data = response.get("data", {}) or {}
+            print(data.get("message", f"Feedback {feedback_id} -> {status}"))
+        else:
+            err_msg = response.get("message") or response.get("error") or "unknown error"
+            print(f"Error: {err_msg}")
             sys.exit(1)
-        print(f"Deleted feedback id {feedback_id}.")
-    finally:
-        conn.close()
+
+    asyncio.run(_run())
