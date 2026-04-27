@@ -29,9 +29,9 @@ from .sync import (
 from .activity import GetMyRecentActivity, get_my_recent_activity  # noqa: F401
 from .unread import GetInbox, get_inbox
 from .entity_info import GetEntityInfo, get_entity_info
+from .feedback import SubmitFeedback, submit_feedback
 
 __all__ = [
-    "TOOL_REGISTRY",
     "DaemonNotRunningError",
     "GetDialogStats",
     "GetEntityInfo",
@@ -46,6 +46,8 @@ __all__ = [
     "ListTopics",
     "MarkDialogForSync",
     "SearchMessages",
+    "SubmitFeedback",
+    "TOOL_REGISTRY",
     "ToolArgs",
     "ToolResult",
     "daemon_connection",
@@ -63,6 +65,7 @@ __all__ = [
     "mark_dialog_for_sync",
     "mcp_tool",
     "search_messages",
+    "submit_feedback",
     "tool_args",
     "tool_description",
     "tool_runner",
