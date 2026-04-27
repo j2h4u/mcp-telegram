@@ -21,7 +21,6 @@ from mcp_telegram.daemon_api import (
     REACTIONS_TTL_SECONDS,
     DaemonAPIServer,
 )
-from mcp_telegram.fts import MESSAGES_FTS_DDL
 
 # ---------------------------------------------------------------------------
 # Patch get_peer_id for MagicMock entities
@@ -38,127 +37,8 @@ def _patch_get_peer_id():
 
 
 # ---------------------------------------------------------------------------
-# In-memory DB harness — schema mirrors Plan 01 v11
+# Seed helpers — schema via make_synced_db fixture (_apply_migrations)
 # ---------------------------------------------------------------------------
-
-
-def _make_db(*, with_fts: bool = False) -> sqlite3.Connection:
-    conn = sqlite3.connect(":memory:")
-    conn.execute(
-        """
-        CREATE TABLE synced_dialogs (
-            dialog_id           INTEGER PRIMARY KEY,
-            status              TEXT NOT NULL DEFAULT 'not_synced',
-            last_synced_at      INTEGER,
-            last_event_at       INTEGER,
-            sync_progress       INTEGER DEFAULT 0,
-            total_messages      INTEGER,
-            access_lost_at      INTEGER,
-            read_inbox_max_id   INTEGER,
-            read_outbox_max_id  INTEGER
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE messages (
-            dialog_id           INTEGER NOT NULL,
-            message_id          INTEGER NOT NULL,
-            sent_at             INTEGER NOT NULL,
-            text                TEXT,
-            sender_id           INTEGER,
-            sender_first_name   TEXT,
-            media_description   TEXT,
-            reply_to_msg_id     INTEGER,
-            forum_topic_id      INTEGER,
-            is_deleted          INTEGER NOT NULL DEFAULT 0,
-            deleted_at          INTEGER,
-            edit_date           INTEGER,
-            out                 INTEGER NOT NULL DEFAULT 0,
-            is_service          INTEGER NOT NULL DEFAULT 0,
-            post_author         TEXT,
-            PRIMARY KEY (dialog_id, message_id)
-        ) WITHOUT ROWID
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE message_reactions (
-            dialog_id   INTEGER NOT NULL,
-            message_id  INTEGER NOT NULL,
-            emoji       TEXT NOT NULL,
-            count       INTEGER NOT NULL DEFAULT 1,
-            PRIMARY KEY (dialog_id, message_id, emoji)
-        ) WITHOUT ROWID
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE message_reactions_freshness (
-            dialog_id   INTEGER NOT NULL,
-            message_id  INTEGER NOT NULL,
-            checked_at  INTEGER NOT NULL,
-            PRIMARY KEY (dialog_id, message_id)
-        ) WITHOUT ROWID
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE message_versions (
-            dialog_id   INTEGER NOT NULL,
-            message_id  INTEGER NOT NULL,
-            version     INTEGER NOT NULL,
-            old_text    TEXT,
-            edit_date   INTEGER,
-            PRIMARY KEY (dialog_id, message_id, version)
-        ) WITHOUT ROWID
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE topic_metadata (
-            dialog_id           INTEGER NOT NULL,
-            topic_id            INTEGER NOT NULL,
-            title               TEXT NOT NULL,
-            top_message_id      INTEGER,
-            is_general          INTEGER NOT NULL DEFAULT 0,
-            is_deleted          INTEGER NOT NULL DEFAULT 0,
-            inaccessible_error  TEXT,
-            inaccessible_at     INTEGER,
-            updated_at          INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (dialog_id, topic_id)
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE entities (
-            id              INTEGER PRIMARY KEY,
-            type            TEXT NOT NULL,
-            name            TEXT,
-            username        TEXT,
-            name_normalized TEXT,
-            updated_at      INTEGER NOT NULL
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS message_forwards (
-            dialog_id           INTEGER NOT NULL,
-            message_id          INTEGER NOT NULL,
-            fwd_from_peer_id    INTEGER,
-            fwd_from_name       TEXT,
-            fwd_date            INTEGER,
-            fwd_channel_post    INTEGER,
-            PRIMARY KEY (dialog_id, message_id)
-        ) WITHOUT ROWID
-        """
-    )
-    if with_fts:
-        conn.execute(MESSAGES_FTS_DDL)
-    conn.commit()
-    return conn
 
 
 def _seed_synced(conn: sqlite3.Connection, dialog_id: int) -> None:
@@ -227,9 +107,9 @@ def make_server(conn: sqlite3.Connection, client: Any) -> DaemonAPIServer:
 
 
 @pytest.mark.asyncio
-async def test_jit_cold_fetch_updates_state() -> None:
+async def test_jit_cold_fetch_updates_state(make_synced_db) -> None:
     """AC-3: 30 cold ids → 1 get_messages, 30 freshness rows, 30 reaction rows."""
-    conn = _make_db()
+    conn = make_synced_db()
     dialog_id = 1001
     _seed_synced(conn, dialog_id)
     ids = list(range(1, 31))
@@ -257,9 +137,9 @@ async def test_jit_cold_fetch_updates_state() -> None:
 
 
 @pytest.mark.asyncio
-async def test_jit_all_fresh_no_api_call() -> None:
+async def test_jit_all_fresh_no_api_call(make_synced_db) -> None:
     """AC-4: all 30 ids fresh in TTL → zero get_messages, DB untouched."""
-    conn = _make_db()
+    conn = make_synced_db()
     dialog_id = 1001
     _seed_synced(conn, dialog_id)
     ids = list(range(1, 31))
@@ -280,9 +160,9 @@ async def test_jit_all_fresh_no_api_call() -> None:
 
 
 @pytest.mark.asyncio
-async def test_jit_page1_fresh_page2_cold_partial_fetch() -> None:
+async def test_jit_page1_fresh_page2_cold_partial_fetch(make_synced_db) -> None:
     """AC-4-PAGED: page1 ids 1..30 fresh; ids 1..60 requested → fetch only 31..60."""
-    conn = _make_db()
+    conn = make_synced_db()
     dialog_id = 1001
     _seed_synced(conn, dialog_id)
     ids_all = list(range(1, 61))
@@ -318,9 +198,9 @@ async def test_jit_page1_fresh_page2_cold_partial_fetch() -> None:
 
 
 @pytest.mark.asyncio
-async def test_jit_partial_stale_subset_fetch() -> None:
+async def test_jit_partial_stale_subset_fetch(make_synced_db) -> None:
     """30 requested, 10 fresh, 20 stale → get_messages with 20 ids."""
-    conn = _make_db()
+    conn = make_synced_db()
     dialog_id = 1001
     _seed_synced(conn, dialog_id)
     ids = list(range(1, 31))
@@ -351,9 +231,9 @@ async def test_jit_partial_stale_subset_fetch() -> None:
 
 
 @pytest.mark.asyncio
-async def test_jit_ttl_expired_refreshes_no_duplicates() -> None:
+async def test_jit_ttl_expired_refreshes_no_duplicates(make_synced_db) -> None:
     """AC-5: TTL expired → refetch; no duplicates; freshness rows updated."""
-    conn = _make_db()
+    conn = make_synced_db()
     dialog_id = 1001
     _seed_synced(conn, dialog_id)
     ids = list(range(1, 6))
@@ -388,9 +268,9 @@ async def test_jit_ttl_expired_refreshes_no_duplicates() -> None:
 
 
 @pytest.mark.asyncio
-async def test_jit_floodwait_preserves_stale() -> None:
+async def test_jit_floodwait_preserves_stale(make_synced_db) -> None:
     """AC-6: FloodWait → no reactions mutation, no freshness upsert, warning logged."""
-    conn = _make_db()
+    conn = make_synced_db()
     dialog_id = 1001
     _seed_synced(conn, dialog_id)
     ids = list(range(1, 6))
@@ -425,9 +305,9 @@ async def test_jit_floodwait_preserves_stale() -> None:
 
 
 @pytest.mark.asyncio
-async def test_jit_partial_none_results_skip_freshness_upsert() -> None:
+async def test_jit_partial_none_results_skip_freshness_upsert(make_synced_db) -> None:
     """AC-6-PARTIAL: None entries get NO freshness row, no reactions mutation."""
-    conn = _make_db()
+    conn = make_synced_db()
     dialog_id = 1001
     _seed_synced(conn, dialog_id)
     ids = [1, 2, 3, 4, 5]
@@ -468,8 +348,8 @@ async def test_jit_partial_none_results_skip_freshness_upsert() -> None:
 
 
 @pytest.mark.asyncio
-async def test_jit_empty_message_ids_early_returns() -> None:
-    conn = _make_db()
+async def test_jit_empty_message_ids_early_returns(make_synced_db) -> None:
+    conn = make_synced_db()
     _seed_synced(conn, 1001)
     client = MagicMock()
     client.get_messages = AsyncMock()
@@ -481,8 +361,8 @@ async def test_jit_empty_message_ids_early_returns() -> None:
 
 
 @pytest.mark.asyncio
-async def test_jit_unsynced_dialog_early_returns() -> None:
-    conn = _make_db()
+async def test_jit_unsynced_dialog_early_returns(make_synced_db) -> None:
+    conn = make_synced_db()
     # No synced_dialogs row
     client = MagicMock()
     client.get_messages = AsyncMock()
@@ -494,9 +374,9 @@ async def test_jit_unsynced_dialog_early_returns() -> None:
 
 
 @pytest.mark.asyncio
-async def test_jit_fetch_window_never_expanded() -> None:
+async def test_jit_fetch_window_never_expanded(make_synced_db) -> None:
     """5 stale ids → get_messages called with exactly those 5, not more."""
-    conn = _make_db()
+    conn = make_synced_db()
     dialog_id = 1001
     _seed_synced(conn, dialog_id)
     # Seed many messages but only ask about 5
@@ -515,9 +395,9 @@ async def test_jit_fetch_window_never_expanded() -> None:
 
 
 @pytest.mark.asyncio
-async def test_jit_reactions_cleared_when_telegram_has_none() -> None:
+async def test_jit_reactions_cleared_when_telegram_has_none(make_synced_db) -> None:
     """msg.reactions=None should clear cached rows (apply_reactions_delta with [])."""
-    conn = _make_db()
+    conn = make_synced_db()
     dialog_id = 1001
     _seed_synced(conn, dialog_id)
     _seed_message(conn, dialog_id, 1)
@@ -557,9 +437,9 @@ def test_reactions_ttl_constant_is_600() -> None:
 
 
 @pytest.mark.asyncio
-async def test_list_messages_triggers_jit_on_cold_read() -> None:
+async def test_list_messages_triggers_jit_on_cold_read(make_synced_db) -> None:
     """AC-3 end-to-end through _list_messages: one get_messages, reactions in response."""
-    conn = _make_db()
+    conn = make_synced_db()
     dialog_id = 1001
     _seed_synced(conn, dialog_id)
     for mid in range(1, 6):
@@ -580,9 +460,9 @@ async def test_list_messages_triggers_jit_on_cold_read() -> None:
 
 
 @pytest.mark.asyncio
-async def test_list_messages_skips_jit_when_all_fresh() -> None:
+async def test_list_messages_skips_jit_when_all_fresh(make_synced_db) -> None:
     """AC-4 through dispatcher: pre-seeded fresh → zero get_messages."""
-    conn = _make_db()
+    conn = make_synced_db()
     dialog_id = 1001
     _seed_synced(conn, dialog_id)
     ids = list(range(1, 6))
@@ -602,9 +482,9 @@ async def test_list_messages_skips_jit_when_all_fresh() -> None:
 
 
 @pytest.mark.asyncio
-async def test_list_messages_page1_fresh_page2_cold() -> None:
+async def test_list_messages_page1_fresh_page2_cold(make_synced_db) -> None:
     """AC-4-PAGED end-to-end: simulate by pre-seeding freshness for half ids."""
-    conn = _make_db()
+    conn = make_synced_db()
     dialog_id = 1001
     _seed_synced(conn, dialog_id)
     for mid in range(1, 11):
@@ -627,9 +507,9 @@ async def test_list_messages_page1_fresh_page2_cold() -> None:
 
 
 @pytest.mark.asyncio
-async def test_list_messages_context_window_wiring() -> None:
+async def test_list_messages_context_window_wiring(make_synced_db) -> None:
     """Context-window path triggers JIT for the surrounding slice."""
-    conn = _make_db()
+    conn = make_synced_db()
     dialog_id = 1001
     _seed_synced(conn, dialog_id)
     for mid in range(1, 11):
@@ -654,9 +534,9 @@ async def test_list_messages_context_window_wiring() -> None:
 
 
 @pytest.mark.asyncio
-async def test_search_messages_scoped_triggers_jit() -> None:
+async def test_search_messages_scoped_triggers_jit(make_synced_db) -> None:
     """Scoped search (dialog_id provided) triggers JIT freshen."""
-    conn = _make_db(with_fts=True)
+    conn = make_synced_db()
     dialog_id = 1001
     _seed_synced(conn, dialog_id)
     for mid in range(1, 4):
@@ -688,9 +568,9 @@ async def test_search_messages_scoped_triggers_jit() -> None:
 
 
 @pytest.mark.asyncio
-async def test_search_messages_global_skips_jit() -> None:
+async def test_search_messages_global_skips_jit(make_synced_db) -> None:
     """Global search (dialog_id=None) does NOT trigger JIT."""
-    conn = _make_db(with_fts=True)
+    conn = make_synced_db()
     dialog_id = 1001
     _seed_synced(conn, dialog_id)
     for mid in range(1, 4):
@@ -719,9 +599,9 @@ async def test_search_messages_global_skips_jit() -> None:
 
 
 @pytest.mark.asyncio
-async def test_list_unread_messages_injects_reactions() -> None:
+async def test_list_unread_messages_injects_reactions(make_synced_db) -> None:
     """Unread path now surfaces reactions_display populated from message_reactions."""
-    conn = _make_db()
+    conn = make_synced_db()
     dialog_id = 1001
     _seed_synced(conn, dialog_id)
     # Set read_inbox_max_id=10 so messages 11+ are unread
@@ -753,9 +633,9 @@ async def test_list_unread_messages_injects_reactions() -> None:
 
 
 @pytest.mark.asyncio
-async def test_list_unread_messages_triggers_jit_on_cold_read() -> None:
+async def test_list_unread_messages_triggers_jit_on_cold_read(make_synced_db) -> None:
     """Unread path JIT wiring: cold read fires get_messages."""
-    conn = _make_db()
+    conn = make_synced_db()
     dialog_id = 1001
     _seed_synced(conn, dialog_id)
     conn.execute(
@@ -778,9 +658,9 @@ async def test_list_unread_messages_triggers_jit_on_cold_read() -> None:
 
 
 @pytest.mark.asyncio
-async def test_list_unread_messages_skips_jit_when_all_fresh() -> None:
+async def test_list_unread_messages_skips_jit_when_all_fresh(make_synced_db) -> None:
     """TTL gate on unread path: pre-fresh → zero get_messages."""
-    conn = _make_db()
+    conn = make_synced_db()
     dialog_id = 1001
     _seed_synced(conn, dialog_id)
     conn.execute(
@@ -804,9 +684,9 @@ async def test_list_unread_messages_skips_jit_when_all_fresh() -> None:
 
 
 @pytest.mark.asyncio
-async def test_non_content_methods_do_not_trigger_jit() -> None:
+async def test_non_content_methods_do_not_trigger_jit(make_synced_db) -> None:
     """get_sync_status, list_dialogs etc. → zero JIT calls."""
-    conn = _make_db()
+    conn = make_synced_db()
     dialog_id = 1001
     _seed_synced(conn, dialog_id)
 
