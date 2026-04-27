@@ -1576,16 +1576,16 @@ def test_schema_v17_idempotent(tmp_sync_db_path: Path) -> None:
 
 
 def test_schema_version_is_17(tmp_sync_db_path: Path) -> None:
-    """After ensure_sync_schema(), MAX(version) in schema_version is 17."""
+    """After ensure_sync_schema(), MAX(version) in schema_version equals _CURRENT_SCHEMA_VERSION."""
     ensure_sync_schema(tmp_sync_db_path)
     conn = _open_sync_db(tmp_sync_db_path)
     try:
         row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
-        assert row is not None and int(row[0]) == 17, (
-            f"Expected schema version 17, got {row}"
+        assert row is not None and int(row[0]) == _CURRENT_SCHEMA_VERSION, (
+            f"Expected schema version {_CURRENT_SCHEMA_VERSION}, got {row}"
         )
-        assert _CURRENT_SCHEMA_VERSION == 17, (
-            f"_CURRENT_SCHEMA_VERSION must be 17, got {_CURRENT_SCHEMA_VERSION}"
+        assert _CURRENT_SCHEMA_VERSION == 18, (
+            f"_CURRENT_SCHEMA_VERSION must be 18, got {_CURRENT_SCHEMA_VERSION}"
         )
     finally:
         conn.close()

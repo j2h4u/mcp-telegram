@@ -7,7 +7,7 @@ from pathlib import Path
 
 from xdg_base_dirs import xdg_state_home  # type: ignore[import-error]
 
-_CURRENT_SCHEMA_VERSION = 17
+_CURRENT_SCHEMA_VERSION = 18
 
 logger = logging.getLogger(__name__)
 
@@ -158,6 +158,13 @@ ON telemetry_events(tool_name, timestamp)
 
 _ACTIVITY_SYNC_STATE_DDL = """
 CREATE TABLE IF NOT EXISTS activity_sync_state (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+)
+"""
+
+_DAEMON_STATE_DDL = """
+CREATE TABLE IF NOT EXISTS daemon_state (
     key   TEXT PRIMARY KEY,
     value TEXT
 )
@@ -639,6 +646,12 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             _DIALOGS_SNAPSHOT_AT_INDEX_DDL,
         ],
     )
+
+    # v18 (Phase 41): generic key/value daemon_state table (D-01).
+    # Bootstrap sweep cursor (D-02: offset_date / offset_id / offset_peer) and
+    # completion flag (D-03: bootstrap_sweep_status) live here. No seed rows —
+    # absence of bootstrap_sweep_status is the canonical "not run yet" state (D-04).
+    _migrate(18, [_DAEMON_STATE_DDL])
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 
