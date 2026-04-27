@@ -102,6 +102,22 @@
       "expect": {
         "is_error": false
       }
+    },
+    {
+      "_comment": "SubmitFeedback — live round-trip into feedback.db",
+      "action": "call_tool",
+      "name": "SubmitFeedback",
+      "arguments": {
+        "message": "Phase 48 integration smoke — please ignore",
+        "severity": "bug",
+        "context": "smoke-integration.json automated test",
+        "model": "claude-opus-4-7",
+        "harness": "devtools.mcp_client.cli"
+      },
+      "expect": {
+        "is_error": false,
+        "content_text_contains": ["Feedback recorded", "Thank you"]
+      }
     }
   ]
 }
