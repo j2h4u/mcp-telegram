@@ -11,13 +11,12 @@
       }
     },
     {
-      "_comment": "GetMyAccount — returns account info",
+      "_comment": "GetUsageStats — returns account-level usage stats (GetMyAccount removed in Phase 40+)",
       "action": "call_tool",
-      "name": "GetMyAccount",
+      "name": "GetUsageStats",
       "arguments": {},
       "expect": {
-        "is_error": false,
-        "content_text_contains": ["id="]
+        "is_error": false
       }
     },
     {
