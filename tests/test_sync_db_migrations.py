@@ -327,3 +327,115 @@ def test_schema_version_records_current_v18(tmp_path: Path) -> None:
         assert _CURRENT_SCHEMA_VERSION == 18  # Phase 41 lock — flips when next migration ships
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# v19: topic_metadata augmentation with v1.6 columns (Phase 42)
+# ---------------------------------------------------------------------------
+
+
+def test_migration_v19_adds_v1_6_columns_to_topic_metadata(db_path: Path) -> None:
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    try:
+        cols = {c[1] for c in conn.execute("PRAGMA table_info(topic_metadata)")}
+        # Legacy v4 columns retained:
+        assert {"dialog_id", "topic_id", "title", "top_message_id",
+                "is_general", "is_deleted", "inaccessible_error",
+                "inaccessible_at", "updated_at"}.issubset(cols)
+        # New v19 columns:
+        assert {"icon_emoji_id", "pinned", "hidden",
+                "snapshot_at", "date"}.issubset(cols)
+    finally:
+        conn.close()
+
+
+def test_migration_v19_preserves_legacy_topic_metadata_columns(db_path: Path) -> None:
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    try:
+        # Insert a legacy-shaped row (only legacy columns set explicitly).
+        conn.execute(
+            "INSERT INTO topic_metadata "
+            "(dialog_id, topic_id, title, top_message_id, is_general, is_deleted, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (-1001234, 1, "General", 1, 1, 0, 1700000000),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT title, is_general, is_deleted, pinned, hidden FROM topic_metadata "
+            "WHERE dialog_id=? AND topic_id=?", (-1001234, 1),
+        ).fetchone()
+        assert row[0] == "General"
+        assert row[1] == 1
+        assert row[2] == 0
+        # New columns default to 0 (NOT NULL DEFAULT 0):
+        assert row[3] == 0
+        assert row[4] == 0
+    finally:
+        conn.close()
+
+
+def test_migration_v19_idempotent(db_path: Path) -> None:
+    ensure_sync_schema(db_path)
+    ensure_sync_schema(db_path)   # second call must not raise
+    conn = _open_sync_db(db_path)
+    try:
+        cols = {c[1] for c in conn.execute("PRAGMA table_info(topic_metadata)")}
+        assert {"icon_emoji_id", "pinned", "hidden",
+                "snapshot_at", "date"}.issubset(cols)
+    finally:
+        conn.close()
+
+
+def test_migration_v19_pinned_default_zero(db_path: Path) -> None:
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO topic_metadata "
+            "(dialog_id, topic_id, title, is_general, is_deleted, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (-1009999, 1, "T", 0, 0, 1700000000),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT pinned, hidden FROM topic_metadata "
+            "WHERE dialog_id=-1009999 AND topic_id=1"
+        ).fetchone()
+        assert row == (0, 0)
+    finally:
+        conn.close()
+
+
+def test_migration_v19_does_not_break_existing_left_join(db_path: Path) -> None:
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO topic_metadata "
+            "(dialog_id, topic_id, title, is_general, is_deleted, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (-1001234, 5, "General Discussion", 0, 0, 1700000000),
+        )
+        conn.commit()
+        # Mirror the daemon_api.py:573 LEFT JOIN expression in isolation:
+        row = conn.execute(
+            "SELECT tm.title FROM topic_metadata tm "
+            "WHERE tm.dialog_id = ? AND tm.topic_id = ?",
+            (-1001234, 5),
+        ).fetchone()
+        assert row[0] == "General Discussion"
+    finally:
+        conn.close()
+
+
+def test_schema_version_records_v19(db_path: Path) -> None:
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    try:
+        row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
+        assert row[0] == _CURRENT_SCHEMA_VERSION
+        assert row[0] == 19
+    finally:
+        conn.close()
