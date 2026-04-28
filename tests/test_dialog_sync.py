@@ -611,3 +611,62 @@ class TestClearCursor:
                 assert _get_state(conn, k) is None
         finally:
             conn.close()
+
+
+# ---------------------------------------------------------------------------
+# _set_access_lost — RECON-04
+# ---------------------------------------------------------------------------
+
+
+def test_set_access_lost_atomic(db_path: Path) -> None:
+    """RECON-04: _set_access_lost writes synced_dialogs and dialogs in one txn."""
+    from mcp_telegram.dialog_sync import _set_access_lost
+
+    dialog_id = 12345
+    now = 1700000000
+
+    conn = _open_sync_db(db_path)
+    try:
+        # Seed both tables so we can observe the UPDATEs land.
+        with conn:
+            conn.execute(
+                "INSERT INTO synced_dialogs (dialog_id, status) "
+                "VALUES (?, 'syncing')",
+                (dialog_id,),
+            )
+            conn.execute(
+                "INSERT INTO dialogs (dialog_id, name, type, archived, pinned, "
+                "snapshot_at, hidden, needs_refresh) "
+                "VALUES (?, 'Test', 'user', 0, 0, ?, 0, 0)",
+                (dialog_id, now - 1000),
+            )
+
+        _set_access_lost(conn, dialog_id, now)
+
+        row = conn.execute(
+            "SELECT status, access_lost_at FROM synced_dialogs WHERE dialog_id=?",
+            (dialog_id,),
+        ).fetchone()
+        assert row[0] == "access_lost"
+        assert row[1] == now
+
+        row = conn.execute(
+            "SELECT hidden, snapshot_at FROM dialogs WHERE dialog_id=?",
+            (dialog_id,),
+        ).fetchone()
+        assert row[0] == 1
+        assert row[1] == now
+    finally:
+        conn.close()
+
+
+def test_set_access_lost_no_op_on_missing_rows(db_path: Path) -> None:
+    """Helper does not raise when one or both rows are missing."""
+    from mcp_telegram.dialog_sync import _set_access_lost
+
+    conn = _open_sync_db(db_path)
+    try:
+        # Neither table has dialog_id=99999 — must not raise.
+        _set_access_lost(conn, 99999, 1700000000)
+    finally:
+        conn.close()

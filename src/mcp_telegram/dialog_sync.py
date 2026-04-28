@@ -47,9 +47,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from telethon.errors import (
-    FloodWaitError,  # type: ignore[import-untyped]
-    RPCError,  # type: ignore[import-untyped]
+from telethon.errors import (  # type: ignore[import-untyped]
+    ChannelBannedError,
+    ChannelPrivateError,
+    ChatForbiddenError,
+    ChatWriteForbiddenError,
+    FloodWaitError,
+    RPCError,
+    UserBannedInChannelError,
+    UserKickedError,
 )
 from telethon.tl import types  # type: ignore[import-untyped]
 from telethon.tl.types import (  # type: ignore[import-untyped]
@@ -120,6 +126,43 @@ _STATUS_COMPLETE = "complete"
 
 # Progress-reporting cadence (every Nth dialog updates startup_detail)
 _PROGRESS_REPORT_EVERY = 50
+
+# ---------------------------------------------------------------------------
+# Access-loss handling (RECON-04). Canonical home for both the error
+# tuple and the atomic transition helper. sync_worker.py and
+# delta_sync.py import these symbols from here.
+# ---------------------------------------------------------------------------
+
+_ACCESS_LOST_ERRORS = (
+    ChannelPrivateError,
+    ChatForbiddenError,
+    ChatWriteForbiddenError,
+    UserBannedInChannelError,
+    UserKickedError,
+    ChannelBannedError,
+)
+
+_SET_ACCESS_LOST_SQL = (
+    "UPDATE synced_dialogs SET status = 'access_lost', access_lost_at = ? "
+    "WHERE dialog_id = ?"
+)
+_SET_DIALOGS_HIDDEN_SQL = (
+    "UPDATE dialogs SET hidden = 1, snapshot_at = ? WHERE dialog_id = ?"
+)
+
+
+def _set_access_lost(
+    conn: sqlite3.Connection, dialog_id: int, now: int
+) -> None:
+    """Atomic access-loss transition (RECON-04).
+
+    Writes synced_dialogs.status='access_lost' and dialogs.hidden=1 in a
+    single transaction. UPDATEs against a missing row are no-ops; safe
+    to call even when only one of the two tables has the dialog_id.
+    """
+    with conn:
+        conn.execute(_SET_ACCESS_LOST_SQL, (now, dialog_id))
+        conn.execute(_SET_DIALOGS_HIDDEN_SQL, (now, dialog_id))
 
 
 # ---------------------------------------------------------------------------
