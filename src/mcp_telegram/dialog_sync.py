@@ -380,7 +380,7 @@ class DialogsBootstrapWorker:
                 async for dialog in self._client.iter_dialogs(
                     offset_date=offset_date,
                     offset_id=offset_id,
-                    offset_peer=offset_peer,
+                    offset_peer=offset_peer if offset_peer is not None else types.InputPeerEmpty(),
                 ):
                     if self._shutdown_event.is_set():
                         logger.info(
