@@ -363,7 +363,7 @@ class DaemonConnection:
         *,
         feedback_id: int,
         status: str,
-        comment: str | None = None,
+        reason: str | None = None,
     ) -> dict:
         """Update the status of a feedback row via the daemon Unix socket.
 
@@ -375,8 +375,8 @@ class DaemonConnection:
             "id": feedback_id,
             "status": status,
         }
-        if comment is not None:
-            payload["comment"] = comment
+        if reason is not None:
+            payload["reason"] = reason
         return await self.request(payload)
 
 

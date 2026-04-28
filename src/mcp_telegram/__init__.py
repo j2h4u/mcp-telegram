@@ -158,9 +158,9 @@ def feedback_status(
         str,
         Argument(help="New status: open | in_progress | done | dismissed"),
     ],
-    comment: Annotated[
+    reason: Annotated[
         str | None,
-        Option("--comment", help="Optional rationale for this status change."),
+        Option("--reason", help="Optional rationale for this status change."),
     ] = None,
 ) -> None:
     """Set the status of a feedback row.
@@ -184,7 +184,7 @@ def feedback_status(
             response = await conn.update_feedback_status(
                 feedback_id=feedback_id,
                 status=status,
-                comment=comment,
+                reason=reason,
             )
         if response.get("ok"):
             data = response.get("data", {}) or {}

@@ -364,8 +364,8 @@ async def test_update_feedback_status_invalid_id(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_update_feedback_status_invalid_comment_type(tmp_path) -> None:
-    """Non-string, non-None comment is rejected as invalid_input (not internal)."""
+async def test_update_feedback_status_invalid_reason_type(tmp_path) -> None:
+    """Non-string, non-None reason is rejected as invalid_input (not internal)."""
     server, feedback_conn = _make_feedback_server(tmp_path)
     feedback_conn.execute(
         "INSERT INTO feedback (submitted_at, message, status) VALUES (?, ?, 'open')",
@@ -374,20 +374,20 @@ async def test_update_feedback_status_invalid_comment_type(tmp_path) -> None:
     feedback_conn.commit()
     rid = feedback_conn.execute("SELECT id FROM feedback").fetchone()[0]
 
-    for bad_comment in ([1, 2, 3], {"x": 1}, 42):
+    for bad_reason in ([1, 2, 3], {"x": 1}, 42):
         response = await server._update_feedback_status(
-            {"id": rid, "status": "done", "comment": bad_comment}
+            {"id": rid, "status": "done", "reason": bad_reason}
         )
-        assert response["ok"] is False, f"bad_comment={bad_comment!r} should fail"
+        assert response["ok"] is False, f"bad_reason={bad_reason!r} should fail"
         assert response.get("error") == "invalid_input"
-        assert "comment" in response.get("message", "").lower()
+        assert "reason" in response.get("message", "").lower()
     # Row status was not changed by any of the rejected calls
     row = feedback_conn.execute("SELECT status FROM feedback WHERE id=?", (rid,)).fetchone()
     assert row[0] == "open"
 
 
 @pytest.mark.asyncio
-async def test_update_feedback_status_with_comment(tmp_path) -> None:
+async def test_update_feedback_status_with_reason(tmp_path) -> None:
     server, feedback_conn = _make_feedback_server(tmp_path)
     feedback_conn.execute(
         "INSERT INTO feedback (submitted_at, message, status) VALUES (?, ?, 'open')",
@@ -397,7 +397,7 @@ async def test_update_feedback_status_with_comment(tmp_path) -> None:
     rid = feedback_conn.execute("SELECT id FROM feedback").fetchone()[0]
 
     response = await server._update_feedback_status(
-        {"id": rid, "status": "dismissed", "comment": "noise"}
+        {"id": rid, "status": "dismissed", "reason": "noise"}
     )
     assert response["ok"] is True
     row = feedback_conn.execute(
@@ -408,7 +408,7 @@ async def test_update_feedback_status_with_comment(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_update_feedback_status_omitting_comment_clears_it(tmp_path) -> None:
+async def test_update_feedback_status_omitting_reason_clears_it(tmp_path) -> None:
     """Each status transition writes status_comment fresh; omitted → NULL."""
     server, feedback_conn = _make_feedback_server(tmp_path)
     feedback_conn.execute(
@@ -418,18 +418,18 @@ async def test_update_feedback_status_omitting_comment_clears_it(tmp_path) -> No
     feedback_conn.commit()
     rid = feedback_conn.execute("SELECT id FROM feedback").fetchone()[0]
 
-    # First transition with comment
+    # First transition with reason
     await server._update_feedback_status(
-        {"id": rid, "status": "in_progress", "comment": "starting"}
+        {"id": rid, "status": "in_progress", "reason": "starting"}
     )
-    # Second transition without comment
+    # Second transition without reason
     await server._update_feedback_status({"id": rid, "status": "done"})
 
     row = feedback_conn.execute(
         "SELECT status, status_comment FROM feedback WHERE id=?", (rid,)
     ).fetchone()
     assert row[0] == "done"
-    assert row[1] is None  # comment cleared
+    assert row[1] is None  # reason omitted → NULL
 
 
 @pytest.mark.asyncio

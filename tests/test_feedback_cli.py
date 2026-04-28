@@ -133,21 +133,21 @@ def test_feedback_status_sets_status(feedback_db):
         result = runner.invoke(app, ["feedback", "status", "1", "done"])
     assert result.exit_code == 0, result.stdout
     mock_conn.update_feedback_status.assert_called_once_with(
-        feedback_id=1, status="done", comment=None
+        feedback_id=1, status="done", reason=None
     )
 
 
-def test_feedback_status_with_comment(feedback_db):
-    """--comment is forwarded to the daemon client."""
+def test_feedback_status_with_reason(feedback_db):
+    """--reason is forwarded to the daemon client."""
     ok_response = {"ok": True, "data": {"message": "Feedback 2 status set to 'dismissed'."}}
     patcher, mock_conn = _patched_daemon(ok_response)
     with patcher:
         result = runner.invoke(
-            app, ["feedback", "status", "2", "dismissed", "--comment", "noise"]
+            app, ["feedback", "status", "2", "dismissed", "--reason", "noise"]
         )
     assert result.exit_code == 0, result.stdout
     mock_conn.update_feedback_status.assert_called_once_with(
-        feedback_id=2, status="dismissed", comment="noise"
+        feedback_id=2, status="dismissed", reason="noise"
     )
 
 

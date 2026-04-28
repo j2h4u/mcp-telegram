@@ -3417,17 +3417,17 @@ class DaemonAPIServer:
         through this handler. The CLI never writes feedback.db directly.
 
         Validates id (positive int), status (must be in VALID_STATUSES),
-        and comment (must be None or a str — direct socket callers could
+        and reason (must be None or a str — direct socket callers could
         send arbitrary JSON, so we type-check before binding into SQL).
 
-        Optional `comment` is stored verbatim in the status_comment column;
-        omitted comment writes NULL.
+        Optional `reason` is stored verbatim in the status_comment column;
+        omitted reason writes NULL.
 
         Commit ordering: the UPDATE runs first, then we inspect rowcount.
         If rowcount == 0 (row not found) we return without committing — no
         observable DB change. Only successful updates reach `commit()`.
 
-        NOTE: row contents (message text, comment text) are never logged.
+        NOTE: row contents (message text, reason text) are never logged.
         """
         feedback_id = req.get("id")
         if not isinstance(feedback_id, int) or feedback_id <= 0:
@@ -3446,15 +3446,15 @@ class DaemonAPIServer:
                 "message": f"status must be one of: {valid_list}",
             }
 
-        comment = req.get("comment")  # may be None or a string
-        # Type-check comment BEFORE binding into SQL. A direct socket caller
+        reason = req.get("reason")  # may be None or a string
+        # Type-check reason BEFORE binding into SQL. A direct socket caller
         # could send a list/dict and trigger a sqlite3 binding error which
         # would surface as 'internal' instead of 'invalid_input'.
-        if comment is not None and not isinstance(comment, str):
+        if reason is not None and not isinstance(reason, str):
             return {
                 "ok": False,
                 "error": "invalid_input",
-                "message": "comment must be a string or null",
+                "message": "reason must be a string or null",
             }
 
         # T-49-11: no length cap on status_comment by design (single-operator
@@ -3471,7 +3471,7 @@ class DaemonAPIServer:
             cur = self._feedback_conn.execute(
                 "UPDATE feedback SET status = ?, status_changed_at = ?, "
                 "status_comment = ? WHERE id = ?",
-                (status, int(time.time()), comment, feedback_id),
+                (status, int(time.time()), reason, feedback_id),
             )
             if cur.rowcount == 0:
                 # No row matched — do NOT commit (nothing to persist anyway,
