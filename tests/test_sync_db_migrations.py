@@ -324,7 +324,7 @@ def test_schema_version_records_current_v18(tmp_path: Path) -> None:
             "SELECT MAX(version) FROM schema_version"
         ).fetchone()[0]
         assert max_version == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 18  # Phase 41 lock — flips when next migration ships
+        assert _CURRENT_SCHEMA_VERSION == 19  # Phase 42 lock — flips when next migration ships
     finally:
         conn.close()
 

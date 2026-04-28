@@ -464,13 +464,18 @@ def test_schema_v7_drops_reaction_metadata(tmp_sync_db_path: Path) -> None:
 
 
 def test_schema_v4_topic_metadata_table(tmp_sync_db_path: Path) -> None:
-    """After ensure_sync_schema(), topic_metadata table exists with all expected columns."""
+    """After ensure_sync_schema(), topic_metadata table exists with all expected columns.
+
+    v19 (Phase 42) extends topic_metadata with v1.6 columns via ALTER TABLE — the
+    legacy v4 columns must remain present (issubset, not equality).
+    """
     ensure_sync_schema(tmp_sync_db_path)
     conn = _open_sync_db(tmp_sync_db_path)
     try:
         rows = conn.execute("PRAGMA table_info(topic_metadata)").fetchall()
         columns = {str(row[1]) for row in rows}
-        expected = {
+        # Legacy v4 columns must all still be present:
+        legacy_cols = {
             "dialog_id",
             "topic_id",
             "title",
@@ -481,7 +486,14 @@ def test_schema_v4_topic_metadata_table(tmp_sync_db_path: Path) -> None:
             "inaccessible_at",
             "updated_at",
         }
-        assert expected == columns, f"Got: {columns}, expected: {expected}"
+        assert legacy_cols.issubset(columns), (
+            f"Legacy v4 columns missing after v19 migration. Got: {columns}"
+        )
+        # v19 columns must also be present:
+        v19_cols = {"icon_emoji_id", "pinned", "hidden", "snapshot_at", "date"}
+        assert v19_cols.issubset(columns), (
+            f"v19 columns missing after migration. Got: {columns}"
+        )
     finally:
         conn.close()
 
@@ -1584,8 +1596,8 @@ def test_schema_version_is_17(tmp_sync_db_path: Path) -> None:
         assert row is not None and int(row[0]) == _CURRENT_SCHEMA_VERSION, (
             f"Expected schema version {_CURRENT_SCHEMA_VERSION}, got {row}"
         )
-        assert _CURRENT_SCHEMA_VERSION == 18, (
-            f"_CURRENT_SCHEMA_VERSION must be 18, got {_CURRENT_SCHEMA_VERSION}"
+        assert _CURRENT_SCHEMA_VERSION == 19, (
+            f"_CURRENT_SCHEMA_VERSION must be 19, got {_CURRENT_SCHEMA_VERSION}"
         )
     finally:
         conn.close()
