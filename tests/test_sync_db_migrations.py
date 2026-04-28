@@ -324,7 +324,7 @@ def test_schema_version_records_current_v18(tmp_path: Path) -> None:
             "SELECT MAX(version) FROM schema_version"
         ).fetchone()[0]
         assert max_version == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 19  # Phase 42 lock — flips when next migration ships
+        assert _CURRENT_SCHEMA_VERSION == 20  # Phase 43 lock — flips when next migration ships
     finally:
         conn.close()
 
@@ -434,8 +434,10 @@ def test_schema_version_records_v19(db_path: Path) -> None:
     ensure_sync_schema(db_path)
     conn = _open_sync_db(db_path)
     try:
-        row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
-        assert row[0] == _CURRENT_SCHEMA_VERSION
-        assert row[0] == 19
+        # v19 must be present in the version history (migration ran).
+        row = conn.execute(
+            "SELECT version FROM schema_version WHERE version = 19"
+        ).fetchone()
+        assert row is not None, "v19 migration did not run"
     finally:
         conn.close()

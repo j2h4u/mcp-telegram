@@ -26,23 +26,19 @@ from datetime import datetime
 from typing import Any
 
 from telethon.errors import (  # type: ignore[import-untyped]
-    ChannelBannedError,
     ChannelPrivateError,
-    ChatForbiddenError,
-    ChatWriteForbiddenError,
-    FloodWaitError,  # type: ignore[import-untyped]
+    FloodWaitError,
     InputUserDeactivatedError,
     PeerFloodError,
     PeerIdInvalidError,
-    RPCError,  # type: ignore[import-untyped]
-    UserBannedInChannelError,
+    RPCError,
     UserDeactivatedBanError,
     UserDeactivatedError,
-    UserKickedError,
     UserPrivacyRestrictedError,
 )
 from telethon.tl import types  # type: ignore[import-untyped]
 
+from .dialog_sync import _ACCESS_LOST_ERRORS, _set_access_lost
 from .fts import DELETE_FTS_SQL, INSERT_FTS_SQL, stem_text
 from .resolver import latinize
 
@@ -239,18 +235,6 @@ INSERT_DIALOG_SQL = "INSERT OR IGNORE INTO synced_dialogs (dialog_id, status) VA
 UPSERT_ENTITY_SQL = (
     "INSERT OR REPLACE INTO entities (id, type, name, username, name_normalized, updated_at) VALUES (?, ?, ?, ?, ?, ?)"
 )
-
-_ACCESS_LOST_ERRORS = (
-    ChannelPrivateError,
-    ChatForbiddenError,
-    ChatWriteForbiddenError,
-    UserBannedInChannelError,
-    UserKickedError,
-    ChannelBannedError,
-)
-
-_SET_ACCESS_LOST_SQL = "UPDATE synced_dialogs SET status = 'access_lost', access_lost_at = ? WHERE dialog_id = ?"
-
 
 # ---------------------------------------------------------------------------
 # Module-level field extraction helpers (shared with DeltaSyncWorker)
@@ -770,8 +754,7 @@ class FullSyncWorker:
         except _ACCESS_LOST_ERRORS as exc:
             logger.warning("access_lost dialog_id=%d — %s: %s", dialog_id, type(exc).__name__, exc)
             now = int(time.time())
-            with self._conn:
-                self._conn.execute(_SET_ACCESS_LOST_SQL, (now, dialog_id))
+            _set_access_lost(self._conn, dialog_id, now)
             return sync_progress, True
         except RPCError as exc:
             logger.error(
