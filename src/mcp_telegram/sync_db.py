@@ -7,7 +7,7 @@ from pathlib import Path
 
 from xdg_base_dirs import xdg_state_home  # type: ignore[import-error]
 
-_CURRENT_SCHEMA_VERSION = 19
+_CURRENT_SCHEMA_VERSION = 20
 
 logger = logging.getLogger(__name__)
 
@@ -206,6 +206,11 @@ ON dialogs(type)
 _DIALOGS_SNAPSHOT_AT_INDEX_DDL = """
 CREATE INDEX IF NOT EXISTS idx_dialogs_snapshot_at
 ON dialogs(snapshot_at)
+"""
+
+_DIALOGS_NEEDS_REFRESH_INDEX_DDL = """
+CREATE INDEX IF NOT EXISTS idx_dialogs_needs_refresh_hidden
+ON dialogs(needs_refresh, hidden)
 """
 
 # ---------------------------------------------------------------------------
@@ -699,6 +704,13 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     # dedicated UpdatePinnedForumTopic handler toggles pinned. Phase 45
     # ListTopics reads from this same table.
     _migrate(19, _TOPIC_METADATA_V19_ALTERS, ignore_duplicate_column=True)
+
+    # v20 (Phase 43 / RECON-02): composite index gating the hourly light pass.
+    # Plan 02's _SELECT_DIRTY_DIALOGS_SQL filters
+    # `WHERE needs_refresh = 1 AND hidden = 0`. Without this index it is a full
+    # table scan every hour; with it, the planner uses the index leftmost-prefix
+    # on needs_refresh and drops the dialog count to roughly the dirty set size.
+    _migrate(20, [_DIALOGS_NEEDS_REFRESH_INDEX_DDL])
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 

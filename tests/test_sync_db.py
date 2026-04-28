@@ -1596,8 +1596,48 @@ def test_schema_version_is_17(tmp_sync_db_path: Path) -> None:
         assert row is not None and int(row[0]) == _CURRENT_SCHEMA_VERSION, (
             f"Expected schema version {_CURRENT_SCHEMA_VERSION}, got {row}"
         )
-        assert _CURRENT_SCHEMA_VERSION == 19, (
-            f"_CURRENT_SCHEMA_VERSION must be 19, got {_CURRENT_SCHEMA_VERSION}"
+        assert _CURRENT_SCHEMA_VERSION == 20, (
+            f"_CURRENT_SCHEMA_VERSION must be 20, got {_CURRENT_SCHEMA_VERSION}"
         )
     finally:
         conn.close()
+
+
+def test_v20_adds_needs_refresh_index(tmp_path: Path) -> None:
+    """Phase 43 RECON-02: composite index covers needs_refresh + hidden."""
+    from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
+
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    try:
+        row = conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='index' AND name='idx_dialogs_needs_refresh_hidden'"
+        ).fetchone()
+        assert row is not None, (
+            "idx_dialogs_needs_refresh_hidden missing — Plan 02 SELECT will "
+            "trigger a full table scan every hourly cycle"
+        )
+        # Confirm SQLite uses the new index for the planned light-pass query.
+        plan = conn.execute(
+            "EXPLAIN QUERY PLAN "
+            "SELECT dialog_id FROM dialogs "
+            "WHERE needs_refresh = 1 AND hidden = 0"
+        ).fetchall()
+        plan_text = " ".join(str(r) for r in plan)
+        assert "idx_dialogs_needs_refresh_hidden" in plan_text, (
+            f"Query planner ignored the index. EXPLAIN: {plan_text}"
+        )
+    finally:
+        conn.close()
+
+
+def test_v20_migration_is_idempotent(tmp_path: Path) -> None:
+    """Re-running ensure_sync_schema after v20 must be a no-op."""
+    from mcp_telegram.sync_db import ensure_sync_schema
+
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    # Second call must not raise.
+    ensure_sync_schema(db_path)
