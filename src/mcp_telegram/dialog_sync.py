@@ -53,6 +53,7 @@ from telethon.errors import (  # type: ignore[import-untyped]
     ChatForbiddenError,
     ChatWriteForbiddenError,
     FloodWaitError,
+    PeerIdInvalidError,
     RPCError,
     UserBannedInChannelError,
     UserKickedError,
@@ -166,6 +167,25 @@ def _set_access_lost(
 
 
 # ---------------------------------------------------------------------------
+# Reconciliation SQL (Phase 43)
+# ---------------------------------------------------------------------------
+
+_SELECT_DIRTY_DIALOGS_SQL = (
+    "SELECT dialog_id FROM dialogs WHERE needs_refresh = 1 AND hidden = 0"
+)
+_UPDATE_DIALOG_ENTITY_SQL = (
+    "UPDATE dialogs "
+    "SET name=?, type=?, members=?, created=?, needs_refresh=0, snapshot_at=? "
+    "WHERE dialog_id=?"
+)
+_HIDE_DIALOG_SQL = (
+    "UPDATE dialogs SET hidden=1, snapshot_at=? WHERE dialog_id=? AND hidden=0"
+)
+_SELECT_VISIBLE_DIALOG_IDS_SQL = (
+    "SELECT dialog_id FROM dialogs WHERE hidden = 0"
+)
+
+# ---------------------------------------------------------------------------
 # State helpers
 # ---------------------------------------------------------------------------
 
@@ -239,6 +259,39 @@ def _decode_offset_peer(json_str: str) -> Any:
 # ---------------------------------------------------------------------------
 
 
+def _extract_entity_fields(entity: Any) -> dict[str, Any]:
+    """Return {name, type, members, created} from a bare entity (User/Chat/Channel).
+
+    Single source of truth for entity-type dispatch (RECON-02 + 43-REVIEWS.md
+    "Make _extract_entity_fields refactor mandatory"). Called by:
+      - _extract_dialog_row (full pass — has a Dialog wrapper, passes dialog.entity)
+      - DialogReconciliationWorker.run_light_pass (no Dialog wrapper — get_entity result)
+    """
+    if isinstance(entity, types.User):
+        dialog_type = "bot" if getattr(entity, "bot", False) else "user"
+        members = None
+        created = None
+    elif isinstance(entity, types.Chat):
+        dialog_type = "group"
+        members = getattr(entity, "participants_count", None)
+        created = None
+    elif isinstance(entity, types.Channel):
+        dialog_type = "channel" if getattr(entity, "broadcast", False) else "supergroup"
+        members = getattr(entity, "participants_count", None)
+        date = getattr(entity, "date", None)
+        created = int(date.timestamp()) if date else None
+    else:
+        dialog_type = "unknown"
+        members = None
+        created = None
+    return {
+        "name": _extract_name(entity),
+        "type": dialog_type,
+        "members": members,
+        "created": created,
+    }
+
+
 def _extract_name(entity: Any) -> str | None:
     """Build a display name from a Telethon entity (User/Chat/Channel)."""
     title = getattr(entity, "title", None)
@@ -261,26 +314,11 @@ def _extract_dialog_row(dialog: Any, snapshot_at: int) -> dict[str, Any]:
     - D-11: needs_refresh = 0 for all bootstrap rows (handled in INSERT clause).
     """
     entity = dialog.entity
-    members: int | None
-    created: int | None
-
-    if isinstance(entity, types.User):
-        dialog_type = "bot" if getattr(entity, "bot", False) else "user"
-        members = None
-        created = None
-    elif isinstance(entity, types.Chat):
-        dialog_type = "group"
-        members = getattr(entity, "participants_count", None)
-        created = None  # Chat has no creation date in Telethon
-    elif isinstance(entity, types.Channel):
-        dialog_type = "channel" if getattr(entity, "broadcast", False) else "supergroup"
-        members = getattr(entity, "participants_count", None)
-        date = getattr(entity, "date", None)
-        created = int(date.timestamp()) if date else None
-    else:
-        dialog_type = "unknown"
-        members = None
-        created = None
+    fields = _extract_entity_fields(entity)
+    name = fields["name"]
+    dialog_type = fields["type"]
+    members = fields["members"]
+    created = fields["created"]
 
     last_msg = getattr(dialog, "message", None)
     last_message_at: int | None = None
@@ -301,7 +339,7 @@ def _extract_dialog_row(dialog: Any, snapshot_at: int) -> dict[str, Any]:
 
     return {
         "dialog_id": int(dialog.id),
-        "name": _extract_name(entity),
+        "name": name,
         "type": dialog_type,
         # `archived` is True iff dialog.folder_id is not None
         "archived": int(getattr(dialog, "folder_id", None) is not None),
@@ -502,3 +540,250 @@ class DialogsBootstrapWorker:
                 self._conn.close()
             except Exception:
                 logger.debug("bootstrap_sweep conn close error", exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# Reconciliation Worker (Phase 43)
+# ---------------------------------------------------------------------------
+
+
+class DialogReconciliationWorker:
+    """Hourly light pass + daily full pass to keep `dialogs` snapshot fresh.
+
+    Light pass: refreshes entity-derived fields for rows with needs_refresh=1.
+    Full pass:  iter_dialogs() sweep + soft-deletes dialogs no longer returned.
+
+    Connection ownership (deliberate divergence from DialogsBootstrapWorker):
+      DialogsBootstrapWorker opens a DEDICATED sqlite3 connection (its own
+      db_path arg) because the bootstrap sweep holds the connection across
+      a long-lived async generator. DialogReconciliationWorker takes the
+      daemon's MAIN `conn` directly because:
+        (1) Each UPSERT in run_full_pass uses its own `with self._conn:`
+            block — no transaction spans an await.
+        (2) The RECON-04 helper `_set_access_lost` already operates on the
+            same main `conn` from sync_worker.py and delta_sync.py — keeping
+            reconciliation on that connection avoids cross-connection
+            coordination for the atomic synced_dialogs+dialogs transition.
+        (3) The light pass writes are short-lived and low-volume (a few
+            hundred rows at most per hourly cycle).
+      See 43-RESEARCH.md "Connection Ownership" and 43-REVIEWS.md
+      "Connection ownership note".
+
+    FloodWait semantics (RECON-05):
+      - Light pass: sleep, then advance to next dialog. Does NOT retry the
+        same dialog. The needs_refresh=1 flag remains set on the dialog that
+        triggered the FloodWait, so the NEXT hourly cycle picks it up.
+      - Full pass: sleep, then return. Does NOT resume the iter_dialogs
+        stream (Telethon's iter_dialogs is a generator and cannot be resumed
+        mid-stream). The next daily cycle re-runs the full pass from
+        scratch. last_full_pass is NOT updated when the pass is interrupted
+        this way — see run_reconciliation_loop's success-only update logic.
+    """
+
+    def __init__(
+        self,
+        client: Any,
+        conn: sqlite3.Connection,
+        shutdown_event: asyncio.Event,
+    ) -> None:
+        self._client = client
+        self._conn = conn
+        self._shutdown_event = shutdown_event
+
+    async def run_light_pass(self) -> int:
+        """RECON-02: refresh dialogs flagged with needs_refresh=1.
+
+        Returns count of dialogs successfully refreshed.
+
+        FloodWait behavior: on FloodWaitError we sleep (interruptible by
+        shutdown_event), then ADVANCE TO THE NEXT DIALOG. We do NOT retry
+        the same dialog — its needs_refresh=1 flag remains set, so the next
+        hourly cycle picks it up. Returning early on shutdown preserves the
+        partial count.
+
+        Telethon session-cache dependency: client.get_entity(dialog_id)
+        requires Telethon's session to have access_hash cached for channels
+        and supergroups. After a session reset, channels lose this cache
+        until iter_dialogs() repopulates it (typically via the daily full
+        pass or the bootstrap sweep). When this happens, get_entity raises
+        PeerIdInvalidError — we log distinctly so the issue is observable
+        and leave needs_refresh=1 for retry once the cache is warm again.
+        """
+        rows = self._conn.execute(_SELECT_DIRTY_DIALOGS_SQL).fetchall()
+        count = 0
+        for (dialog_id,) in rows:
+            if self._shutdown_event.is_set():
+                logger.info(
+                    "recon_light_pass_complete count=%d (shutdown)", count,
+                )
+                return count
+            try:
+                entity = await self._client.get_entity(dialog_id)
+                fields = _extract_entity_fields(entity)
+                snapshot_at = int(time.time())
+                with self._conn:
+                    self._conn.execute(
+                        _UPDATE_DIALOG_ENTITY_SQL,
+                        (
+                            fields["name"],
+                            fields["type"],
+                            fields["members"],
+                            fields["created"],
+                            snapshot_at,
+                            dialog_id,
+                        ),
+                    )
+                count += 1
+            except FloodWaitError as exc:
+                wait_s = int(getattr(exc, "seconds", 60) or 60)
+                logger.warning(
+                    "recon_light_flood_wait dialog_id=%d wait=%ds",
+                    dialog_id, wait_s,
+                )
+                try:
+                    await asyncio.wait_for(
+                        self._shutdown_event.wait(), timeout=float(wait_s)
+                    )
+                    logger.info(
+                        "recon_light_pass_complete count=%d (shutdown_during_flood_wait)",
+                        count,
+                    )
+                    return count  # shutdown during flood wait
+                except TimeoutError:
+                    # Slept full duration; advance to NEXT dialog (per
+                    # FloodWait semantics in class docstring). Do NOT retry
+                    # the same dialog — its needs_refresh=1 will be picked
+                    # up by the next hourly cycle.
+                    pass
+            except _ACCESS_LOST_ERRORS as exc:
+                logger.warning(
+                    "recon_light_access_lost dialog_id=%d — %s",
+                    dialog_id, type(exc).__name__,
+                )
+                _set_access_lost(self._conn, dialog_id, int(time.time()))
+                # do not increment count — refresh did not succeed
+            except PeerIdInvalidError:
+                # Telethon session does not have access_hash cached for this
+                # peer (typical for channels/supergroups after a session
+                # reset). Leave needs_refresh=1 — the next iter_dialogs
+                # sweep (full pass or bootstrap) will repopulate the cache.
+                logger.warning(
+                    "recon_light_pass_peer_invalid dialog_id=%s "
+                    "(session cache miss; will retry next cycle)",
+                    dialog_id,
+                )
+            except RPCError as exc:
+                logger.warning(
+                    "recon_light_rpc_error dialog_id=%d error=%s",
+                    dialog_id, exc,
+                )
+                # leave needs_refresh=1 for next cycle
+        logger.info("recon_light_pass_complete count=%d", count)
+        return count
+
+    async def run_full_pass(self) -> int:
+        """RECON-03: full iter_dialogs() sweep with soft-delete of missing rows.
+
+        Returns count of dialogs UPSERTed during the sweep. Dialogs visible
+        before the sweep but not returned by iter_dialogs() get hidden=1.
+
+        FloodWait behavior: iter_dialogs is a generator — it cannot be
+        resumed mid-stream. On FloodWaitError we sleep (interruptible by
+        shutdown_event) and return the partial count. Soft-deletes are NOT
+        applied (we cannot tell which dialogs are truly missing vs simply
+        not yet streamed). The next daily cycle re-runs the entire sweep
+        from scratch. The caller (run_reconciliation_loop) keeps
+        last_full_pass at its old value when this pass returns abnormally
+        (raising) so the retry happens at the next hourly tick instead of
+        the next daily tick.
+        """
+        pre_pass_ids = {
+            row[0]
+            for row in self._conn.execute(_SELECT_VISIBLE_DIALOG_IDS_SQL).fetchall()
+        }
+        seen_ids: set[int] = set()
+        count = 0
+        snapshot_at = int(time.time())
+        try:
+            async for dialog in self._client.iter_dialogs():
+                if self._shutdown_event.is_set():
+                    return count
+                row = _extract_dialog_row(dialog, snapshot_at)
+                with self._conn:
+                    self._conn.execute(_UPSERT_DIALOG_SQL, row)
+                seen_ids.add(int(dialog.id))
+                count += 1
+        except FloodWaitError as exc:
+            wait_s = int(getattr(exc, "seconds", 60) or 60)
+            logger.warning(
+                "recon_full_flood_wait wait=%ds processed=%d", wait_s, count,
+            )
+            try:
+                await asyncio.wait_for(
+                    self._shutdown_event.wait(), timeout=float(wait_s)
+                )
+            except TimeoutError:
+                pass
+            return count  # cannot resume mid-stream; next cycle retries
+
+        # Soft-delete dialogs visible pre-pass but not returned by iter_dialogs.
+        now = int(time.time())
+        missing = pre_pass_ids - seen_ids
+        for dialog_id in missing:
+            with self._conn:
+                self._conn.execute(_HIDE_DIALOG_SQL, (now, dialog_id))
+        logger.info(
+            "recon_full_pass_complete count=%d hidden=%d",
+            count, len(missing),
+        )
+        return count
+
+
+async def run_reconciliation_loop(
+    client: Any,
+    conn: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+    *,
+    hourly_interval: float = 3600.0,
+    daily_interval: float = 86400.0,
+) -> None:
+    """Background loop: light pass every hourly_interval, full pass every daily_interval.
+
+    First iteration always runs a full pass (last_full_pass starts at 0.0).
+    Shutdown-responsive: returns from inside asyncio.wait_for as soon as
+    shutdown_event fires.
+
+    last_full_pass is updated ONLY when run_full_pass() returns without
+    raising. If the per-pass try/except catches an exception, last_full_pass
+    stays at its prior value — the next hourly tick will retry the full
+    pass instead of waiting a full day. This addresses 43-REVIEWS.md
+    "Update last_full_pass only on success" (Codex MEDIUM).
+
+    UAT support: Plan 03's daemon caller may pass a smaller hourly_interval
+    sourced from RECON_HOURLY_SECONDS env var so an operator can observe a
+    needs_refresh=1 -> 0 transition without waiting an hour.
+    """
+    last_full_pass: float = 0.0  # force daily pass on first iteration
+    while not shutdown_event.is_set():
+        now = time.monotonic()
+        worker = DialogReconciliationWorker(client, conn, shutdown_event)
+        try:
+            await worker.run_light_pass()
+        except Exception:
+            logger.warning("recon_light_pass_error", exc_info=True)
+        if now - last_full_pass >= daily_interval:
+            try:
+                await worker.run_full_pass()
+                # Only mark the daily slot as filled when the pass
+                # completed without raising. A caught exception leaves
+                # last_full_pass unchanged so the next hourly tick retries.
+                last_full_pass = time.monotonic()
+            except Exception:
+                logger.warning("recon_full_pass_error", exc_info=True)
+        try:
+            await asyncio.wait_for(
+                shutdown_event.wait(), timeout=hourly_interval
+            )
+            return  # shutdown
+        except TimeoutError:
+            pass
