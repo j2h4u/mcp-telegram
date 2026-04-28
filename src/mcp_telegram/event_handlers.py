@@ -451,56 +451,65 @@ class EventHandlerManager:
             new_text = getattr(msg, "message", None)
             now = int(time.time())
 
-            with self._conn:
-                existing = self._conn.execute(_SELECT_MESSAGE_TEXT_SQL, (dialog_id, message_id)).fetchone()
+            # Resolve async data BEFORE opening transaction — SQLite's synchronous
+            # driver cannot safely suspend inside a `with self._conn:` block while
+            # another coroutine may call into the same connection.
+            existing = self._conn.execute(
+                _SELECT_MESSAGE_TEXT_SQL, (dialog_id, message_id)
+            ).fetchone()
 
-                if existing is None:
-                    # Message not yet in sync.db: insert with current text;
-                    # historical versions are lost (acceptable).
-                    entity_name_map = await _build_fwd_entity_map(msg, self._client)
-                    extracted = extract_message_row(dialog_id, msg, entity_name_map=entity_name_map)
+            if existing is None:
+                # Message not yet in sync.db: resolve entity map then insert.
+                entity_name_map = await _build_fwd_entity_map(msg, self._client)
+                extracted = extract_message_row(dialog_id, msg, entity_name_map=entity_name_map)
+                with self._conn:
                     insert_messages_with_fts(self._conn, [extracted])
                     self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
-                    logger.info(
-                        "event_edit_new dialog_id=%d message_id=%d (not in sync.db, inserted)",
-                        dialog_id,
-                        message_id,
-                    )
-                    return
+                logger.info(
+                    "event_edit_new dialog_id=%d message_id=%d (not in sync.db, inserted)",
+                    dialog_id,
+                    message_id,
+                )
+                return
 
-                old_text = existing[0]
-                if old_text == new_text:
-                    # No text change. Two sub-cases:
-                    # 1. msg.reactions present -> reactions-only edit; apply delta
-                    #    (Phase 39.2-01 AC-1 via edited path, AC-2 removal via empty results).
-                    # 2. msg.reactions is None -> service edit / media caption etc.; no-op
-                    #    (regression guard AC-8).
-                    reactions_obj = getattr(msg, "reactions", None)
-                    if reactions_obj is not None:
-                        rows = extract_reactions_rows(dialog_id, message_id, reactions_obj)
+            old_text = existing[0]
+            if old_text == new_text:
+                # No text change. Two sub-cases:
+                # 1. msg.reactions present -> reactions-only edit; apply delta
+                #    (Phase 39.2-01 AC-1 via edited path, AC-2 removal via empty results).
+                # 2. msg.reactions is None -> service edit / media caption etc.; no-op
+                #    (regression guard AC-8).
+                reactions_obj = getattr(msg, "reactions", None)
+                if reactions_obj is not None:
+                    rows = extract_reactions_rows(dialog_id, message_id, reactions_obj)
+                    with self._conn:
                         apply_reactions_delta(self._conn, dialog_id, message_id, rows)
                         self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
-                        logger.info(
-                            "event_edit_reactions dialog_id=%d message_id=%d count=%d",
-                            dialog_id,
-                            message_id,
-                            len(rows),
-                        )
-                    return
+                    logger.info(
+                        "event_edit_reactions dialog_id=%d message_id=%d count=%d",
+                        dialog_id,
+                        message_id,
+                        len(rows),
+                    )
+                return
 
-                edit_date_raw = getattr(msg, "edit_date", None)
-                edit_date_unix = int(edit_date_raw.timestamp()) if edit_date_raw is not None else now
+            edit_date_raw = getattr(msg, "edit_date", None)
+            edit_date_unix = int(edit_date_raw.timestamp()) if edit_date_raw is not None else now
 
-                next_ver = self._conn.execute(_NEXT_VERSION_SQL, (dialog_id, message_id)).fetchone()[0]
+            # Resolve entity map before the transaction (no await inside with).
+            entity_name_map = await _build_fwd_entity_map(msg, self._client)
+            extracted = extract_message_row(dialog_id, msg, entity_name_map=entity_name_map)
 
+            with self._conn:
+                next_ver = self._conn.execute(
+                    _NEXT_VERSION_SQL, (dialog_id, message_id)
+                ).fetchone()[0]
                 self._conn.execute(
                     _INSERT_VERSION_SQL,
                     (dialog_id, message_id, next_ver, old_text, edit_date_unix),
                 )
                 # Re-insert via insert_messages_with_fts: updates messages row,
                 # refreshes FTS, and replaces child rows (edit idempotency).
-                entity_name_map = await _build_fwd_entity_map(msg, self._client)
-                extracted = extract_message_row(dialog_id, msg, entity_name_map=entity_name_map)
                 insert_messages_with_fts(self._conn, [extracted])
                 self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
 
