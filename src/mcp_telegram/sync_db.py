@@ -7,7 +7,7 @@ from pathlib import Path
 
 from xdg_base_dirs import xdg_state_home  # type: ignore[import-error]
 
-_CURRENT_SCHEMA_VERSION = 18
+_CURRENT_SCHEMA_VERSION = 19
 
 logger = logging.getLogger(__name__)
 
@@ -208,6 +208,28 @@ CREATE INDEX IF NOT EXISTS idx_dialogs_snapshot_at
 ON dialogs(snapshot_at)
 """
 
+# ---------------------------------------------------------------------------
+# v19: extend topic_metadata with v1.6 columns (Phase 42 — Local Mirror)
+#
+# Rationale: keep the existing schema-v4 topic_metadata table (consumed by
+# daemon_api.py:573 LEFT JOIN for `topic_title`); add the v1.6 forum_topics
+# spec columns via additive ALTER TABLE so Plan 02 / Phase 45 read paths can
+# treat topic_metadata as the canonical forum-topic snapshot.
+#
+# `snapshot_at` cannot be NOT NULL via ALTER TABLE (no constant default
+# available); legacy rows keep snapshot_at=NULL. Phase 45 read path tolerates
+# NULL via `WHERE snapshot_at IS NULL OR snapshot_at < ...` checks where
+# recency matters.
+# ---------------------------------------------------------------------------
+
+_TOPIC_METADATA_V19_ALTERS = [
+    "ALTER TABLE topic_metadata ADD COLUMN icon_emoji_id INTEGER",
+    "ALTER TABLE topic_metadata ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE topic_metadata ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE topic_metadata ADD COLUMN snapshot_at INTEGER",
+    "ALTER TABLE topic_metadata ADD COLUMN date INTEGER",
+]
+
 
 # ---------------------------------------------------------------------------
 # Path helper
@@ -298,14 +320,33 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
     current = row[0] if row is not None and row[0] is not None else 0
 
-    def _migrate(version: int, stmts: list[str]) -> None:
-        """Apply one migration version atomically and record it."""
+    def _migrate(version: int, stmts: list[str], *, ignore_duplicate_column: bool = False) -> None:
+        """Apply one migration version atomically and record it.
+
+        When `ignore_duplicate_column=True`, each statement is executed
+        individually and `OperationalError: duplicate column name` is
+        silently swallowed. This is necessary for ALTER TABLE ADD COLUMN
+        migrations that may re-run after a manual `DELETE FROM schema_version`
+        in tests, or on databases where a partial migration already added the
+        column. All other errors still propagate and roll back.
+        """
         nonlocal current
         if current >= version:
             return
         try:
             for stmt in stmts:
-                conn.execute(stmt)
+                if ignore_duplicate_column:
+                    try:
+                        conn.execute(stmt)
+                    except sqlite3.OperationalError as exc:
+                        if "duplicate column name" in str(exc).lower():
+                            logger.debug(
+                                "sync_db v%d: column already exists, skipping: %s", version, exc
+                            )
+                        else:
+                            raise
+                else:
+                    conn.execute(stmt)
             conn.execute(
                 "INSERT INTO schema_version VALUES (?, strftime('%s', 'now'))",
                 (version,),
@@ -652,6 +693,12 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     # completion flag (D-03: bootstrap_sweep_status) live here. No seed rows —
     # absence of bootstrap_sweep_status is the canonical "not run yet" state (D-04).
     _migrate(18, [_DAEMON_STATE_DDL])
+
+    # v19 (Phase 42): augment topic_metadata with v1.6 forum_topics columns.
+    # Plan 02 event handlers UPSERT title / icon_emoji_id / hidden here; the
+    # dedicated UpdatePinnedForumTopic handler toggles pinned. Phase 45
+    # ListTopics reads from this same table.
+    _migrate(19, _TOPIC_METADATA_V19_ALTERS, ignore_duplicate_column=True)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 
