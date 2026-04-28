@@ -796,6 +796,10 @@ class EventHandlerManager:
                 if order is None:
                     logger.debug("event_pinned_dialogs_order_none — skip")
                     return
+                # folder_id=None means the main list; folder_id=1 means Archived, etc.
+                # A folder-scoped update carries only pins *within* that folder, so we
+                # must not use it to clear pins in other folders.
+                folder_id = getattr(update, "folder_id", None)
                 # Decode peers; gate by _synced_dialog_ids so we never UPDATE
                 # rows for dialogs the daemon does not own.
                 pinned_ids: list[int] = []
@@ -808,22 +812,30 @@ class EventHandlerManager:
                     if did in self._synced_dialog_ids:
                         pinned_ids.append(did)
                 with self._conn:
-                    if pinned_ids:
-                        for did in pinned_ids:
-                            self._conn.execute(
-                                _UPDATE_DIALOG_PINNED_SQL, (1, now, did),
-                            )
-                        placeholders = ",".join("?" * len(pinned_ids))
-                        sql = _CLEAR_PINS_NOT_IN_SQL_TEMPLATE.format(
-                            placeholders=placeholders,
+                    for did in pinned_ids:
+                        self._conn.execute(
+                            _UPDATE_DIALOG_PINNED_SQL, (1, now, did),
                         )
-                        self._conn.execute(sql, (now, *pinned_ids))
-                    else:
-                        # Empty order list → all dialogs unpinned in this folder.
-                        # NOT IN () is invalid SQLite — use the dedicated SQL.
-                        self._conn.execute(_CLEAR_ALL_PINS_SQL, (now,))
+                    if folder_id is None:
+                        # Main list: rewrite the full pin set — the update is
+                        # authoritative for all main-list pins.
+                        if pinned_ids:
+                            placeholders = ",".join("?" * len(pinned_ids))
+                            sql = _CLEAR_PINS_NOT_IN_SQL_TEMPLATE.format(
+                                placeholders=placeholders,
+                            )
+                            self._conn.execute(sql, (now, *pinned_ids))
+                        else:
+                            # Empty order list → all dialogs unpinned in main list.
+                            # NOT IN () is invalid SQLite — use the dedicated SQL.
+                            self._conn.execute(_CLEAR_ALL_PINS_SQL, (now,))
+                    # For folder-scoped updates (folder_id != None) we only set the
+                    # pinned=1 rows above; we do not clear other dialogs because the
+                    # update does not describe pins outside that folder.
                 logger.info(
-                    "event_pinned_dialogs_rewrote pinned_count=%d", len(pinned_ids),
+                    "event_pinned_dialogs_rewrote pinned_count=%d folder_id=%s",
+                    len(pinned_ids),
+                    folder_id,
                 )
 
             elif isinstance(update, UpdateDialogUnreadMark):
