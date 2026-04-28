@@ -49,7 +49,7 @@ from .daemon_api import DaemonAPIServer, get_daemon_socket_path
 from .activity_sync import run_activity_sync_loop
 from .feedback_db import ensure_feedback_schema, get_feedback_db_path
 from .delta_sync import DeltaSyncWorker, run_access_probe_loop
-from .dialog_sync import DialogsBootstrapWorker
+from .dialog_sync import DialogsBootstrapWorker, run_reconciliation_loop
 from .event_handlers import EventHandlerManager
 from .fts import backfill_fts_index
 from .read_state import apply_read_cursor
@@ -574,6 +574,23 @@ async def sync_main() -> None:
         _create_tracked_task(
             run_activity_sync_loop(client, conn, shutdown_event),
             name="activity_sync_loop",
+        )
+        # Phase 43 / RECON-01: hourly light pass + daily full pass keeps the
+        # `dialogs` snapshot fresh; processes needs_refresh=1 rows written by
+        # Phase 42 event handlers and soft-deletes left/kicked dialogs once a day.
+        #
+        # RECON_HOURLY_SECONDS env var override (43-REVIEWS.md MEDIUM): default is
+        # 3600s (1h) for production; setting it to a smaller value (e.g. "30") lets
+        # an operator observe a needs_refresh=1 -> 0 transition in seconds during
+        # UAT. Daily interval stays at the default 86400s — there is no need for a
+        # daily override yet, and the first iteration always runs a full pass
+        # regardless of last_full_pass anyway.
+        _recon_hourly = float(os.environ.get("RECON_HOURLY_SECONDS", "3600"))
+        _create_tracked_task(
+            run_reconciliation_loop(
+                client, conn, shutdown_event, hourly_interval=_recon_hourly,
+            ),
+            name="reconciliation_loop",
         )
 
         await _run_sync_loop(worker, handler_manager, shutdown_event, conn, client)
