@@ -295,18 +295,18 @@ class EventHandlerManager:
             last = getattr(sender, "last_name", None) or ""
             name: str | None = f"{first} {last}".strip() or None
             entity_type_str = "Bot" if getattr(sender, "bot", False) else "User"
-            self._conn.execute(
-                UPSERT_ENTITY_SQL,
-                (
-                    dialog_id,
-                    entity_type_str,
-                    name,
-                    getattr(sender, "username", None),
-                    latinize(name) if name else None,
-                    int(time.time()),
-                ),
-            )
-            self._conn.commit()
+            with self._conn:
+                self._conn.execute(
+                    UPSERT_ENTITY_SQL,
+                    (
+                        dialog_id,
+                        entity_type_str,
+                        name,
+                        getattr(sender, "username", None),
+                        latinize(name) if name else None,
+                        int(time.time()),
+                    ),
+                )
             logger.info("dm_auto_enroll_entity dialog_id=%d name=%r", dialog_id, name)
         except Exception:
             logger.exception("dm_auto_enroll_entity_failed dialog_id=%d", dialog_id)
