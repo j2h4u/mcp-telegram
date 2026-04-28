@@ -681,21 +681,21 @@ class DialogReconciliationWorker:
         logger.info("recon_light_pass_complete count=%d", count)
         return count
 
-    async def run_full_pass(self) -> int:
+    async def run_full_pass(self) -> tuple[int, bool]:
         """RECON-03: full iter_dialogs() sweep with soft-delete of missing rows.
 
-        Returns count of dialogs UPSERTed during the sweep. Dialogs visible
-        before the sweep but not returned by iter_dialogs() get hidden=1.
+        Returns (count, completed) where count is the number of dialogs UPSERTed
+        and completed is True only when the sweep finished normally (soft-delete
+        phase ran). Dialogs visible before the sweep but not returned by
+        iter_dialogs() get hidden=1 when completed=True.
 
         FloodWait behavior: iter_dialogs is a generator — it cannot be
         resumed mid-stream. On FloodWaitError we sleep (interruptible by
-        shutdown_event) and return the partial count. Soft-deletes are NOT
+        shutdown_event) and return (count, False). Soft-deletes are NOT
         applied (we cannot tell which dialogs are truly missing vs simply
-        not yet streamed). The next daily cycle re-runs the entire sweep
-        from scratch. The caller (run_reconciliation_loop) keeps
-        last_full_pass at its old value when this pass returns abnormally
-        (raising) so the retry happens at the next hourly tick instead of
-        the next daily tick.
+        not yet streamed). The caller (run_reconciliation_loop) only advances
+        last_full_pass when completed=True, so the next hourly tick retries
+        the full pass instead of waiting a full day.
         """
         pre_pass_ids = {
             row[0]
@@ -703,11 +703,11 @@ class DialogReconciliationWorker:
         }
         seen_ids: set[int] = set()
         count = 0
-        snapshot_at = int(time.time())
         try:
             async for dialog in self._client.iter_dialogs():
                 if self._shutdown_event.is_set():
-                    return count
+                    return count, False
+                snapshot_at = int(time.time())  # fresh per dialog — avoids stale recency guard
                 row = _extract_dialog_row(dialog, snapshot_at)
                 with self._conn:
                     self._conn.execute(_UPSERT_DIALOG_SQL, row)
@@ -724,7 +724,7 @@ class DialogReconciliationWorker:
                 )
             except TimeoutError:
                 pass
-            return count  # cannot resume mid-stream; next cycle retries
+            return count, False  # cannot resume mid-stream; next cycle retries
 
         # Soft-delete dialogs visible pre-pass but not returned by iter_dialogs.
         now = int(time.time())
@@ -736,7 +736,7 @@ class DialogReconciliationWorker:
             "recon_full_pass_complete count=%d hidden=%d",
             count, len(missing),
         )
-        return count
+        return count, True
 
 
 async def run_reconciliation_loop(
@@ -773,11 +773,13 @@ async def run_reconciliation_loop(
             logger.warning("recon_light_pass_error", exc_info=True)
         if now - last_full_pass >= daily_interval:
             try:
-                await worker.run_full_pass()
-                # Only mark the daily slot as filled when the pass
-                # completed without raising. A caught exception leaves
-                # last_full_pass unchanged so the next hourly tick retries.
-                last_full_pass = time.monotonic()
+                _count, completed = await worker.run_full_pass()
+                # Advance last_full_pass only when the sweep completed
+                # normally (soft-delete phase ran). FloodWait or shutdown
+                # mid-stream returns completed=False, leaving last_full_pass
+                # unchanged so the next hourly tick retries the full pass.
+                if completed:
+                    last_full_pass = time.monotonic()
             except Exception:
                 logger.warning("recon_full_pass_error", exc_info=True)
         try:

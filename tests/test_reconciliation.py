@@ -332,9 +332,10 @@ async def test_recon_full_pass_upserts_returned(
     )
 
     worker = DialogReconciliationWorker(mock_client, sync_db, shutdown_event)
-    count = await worker.run_full_pass()
+    count, completed = await worker.run_full_pass()
 
     assert count == 2
+    assert completed is True
     rows = sync_db.execute(
         "SELECT dialog_id, name, hidden FROM dialogs ORDER BY dialog_id"
     ).fetchall()
@@ -397,10 +398,11 @@ async def test_recon_full_pass_flood_wait_skips_soft_delete(
     asyncio.get_event_loop().call_later(0.02, shutdown_event.set)
 
     worker = DialogReconciliationWorker(mock_client, sync_db, shutdown_event)
-    count = await worker.run_full_pass()
+    count, completed = await worker.run_full_pass()
 
     # 1 row UPSERTed before flood; soft-delete branch did NOT run.
     assert count == 1
+    assert completed is False
     hidden = {
         row[0]: row[1]
         for row in sync_db.execute("SELECT dialog_id, hidden FROM dialogs").fetchall()
@@ -465,7 +467,7 @@ async def test_recon_loop_full_pass_failure_does_not_advance_last_full_pass(
     full_call_count = 0
     light_call_count = 0
 
-    async def _fake_full(self):
+    async def _fake_full(self) -> tuple[int, bool]:
         nonlocal full_call_count
         full_call_count += 1
         raise RuntimeError("simulated full pass failure")
