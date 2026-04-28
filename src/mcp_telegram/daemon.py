@@ -49,6 +49,7 @@ from .daemon_api import DaemonAPIServer, get_daemon_socket_path
 from .activity_sync import run_activity_sync_loop
 from .feedback_db import ensure_feedback_schema, get_feedback_db_path
 from .delta_sync import DeltaSyncWorker, run_access_probe_loop
+from .dialog_sync import DialogsBootstrapWorker
 from .event_handlers import EventHandlerManager
 from .fts import backfill_fts_index
 from .read_state import apply_read_cursor
@@ -538,6 +539,23 @@ async def sync_main() -> None:
         handler_manager.refresh_synced_dialogs()
 
         # Background tasks — non-blocking, tracked for shutdown
+        # D-07 / BOOTSTRAP-05: handler_manager.register() and refresh_synced_dialogs()
+        # are both above this line, so live events for any dialog the bootstrap
+        # touches are guaranteed to be wired before the first UPSERT.
+        # BOOTSTRAP-02: this is a background task — does not block api_server._ready
+        # (already set) or the /health endpoint.
+        # Phase 41 review HIGH: pass db_path (NOT conn) — the worker opens its own
+        # dedicated SQLite connection inside __init__, isolating it from the
+        # daemon's main conn used by the other background tasks.
+        _create_tracked_task(
+            DialogsBootstrapWorker(
+                client,
+                db_path,
+                shutdown_event,
+                startup_detail_setter=lambda s: setattr(api_server, "startup_detail", s),
+            ).run(),
+            name="dialogs_bootstrap_sweep",
+        )
         _create_tracked_task(
             _backfill_total_messages(client, conn, shutdown_event),
             name="backfill_total_messages",
