@@ -1509,7 +1509,12 @@ def test_schema_v17_dialogs_columns(tmp_sync_db_path: Path) -> None:
 
 
 def test_schema_v17_dialogs_indexes(tmp_sync_db_path: Path) -> None:
-    """dialogs table has the three expected indexes after migration."""
+    """dialogs table has at least the three v17-era indexes after full migration.
+
+    Note: idx_dialogs_needs_refresh_hidden is intentionally NOT listed here —
+    it is added by the v20 migration (Phase 43). That index is verified
+    separately by test_v20_adds_needs_refresh_index.
+    """
     ensure_sync_schema(tmp_sync_db_path)
     conn = _open_sync_db(tmp_sync_db_path)
     try:
@@ -1517,14 +1522,15 @@ def test_schema_v17_dialogs_indexes(tmp_sync_db_path: Path) -> None:
             "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='dialogs' ORDER BY name"
         ).fetchall()
         index_names = {r[0] for r in rows}
-        assert "idx_dialogs_hidden_pinned" in index_names, (
-            f"idx_dialogs_hidden_pinned missing. Got: {index_names}"
-        )
-        assert "idx_dialogs_type" in index_names, (
-            f"idx_dialogs_type missing. Got: {index_names}"
-        )
-        assert "idx_dialogs_snapshot_at" in index_names, (
-            f"idx_dialogs_snapshot_at missing. Got: {index_names}"
+        expected_v17_indexes = {
+            "idx_dialogs_hidden_pinned",
+            "idx_dialogs_type",
+            "idx_dialogs_snapshot_at",
+        }
+        # Use issubset so future migrations adding new indexes don't break this test.
+        # v20 adds idx_dialogs_needs_refresh_hidden — see test_v20_adds_needs_refresh_index.
+        assert expected_v17_indexes.issubset(index_names), (
+            f"v17-era indexes missing. Expected subset {expected_v17_indexes}, got: {index_names}"
         )
     finally:
         conn.close()
