@@ -27,6 +27,8 @@ from typing import Any
 from telethon import events  # type: ignore[import-untyped]
 from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
 from telethon.tl.types import (  # type: ignore[import-untyped]
+    MessageActionTopicCreate,
+    MessageActionTopicEdit,
     PeerChannel,
     PeerChat,
     UpdateChannel,
@@ -35,6 +37,7 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
     UpdateDialogUnreadMark,
     UpdateMessageReactions,
     UpdatePinnedDialogs,
+    UpdatePinnedForumTopic,
     UpdateReadChannelInbox,
     UpdateReadHistoryInbox,
 )
@@ -111,6 +114,53 @@ _CLEAR_ALL_PINS_SQL = (
     "UPDATE dialogs SET pinned=0, snapshot_at=? WHERE pinned=1"
 )
 
+# ---------------------------------------------------------------------------
+# Phase 42 SQL — topic_metadata event writes (target table extended by
+# Plan 01 v19 ALTER. ON CONFLICT preserves existing fields not present in
+# the edit via COALESCE. `pinned` is intentionally OMITTED from the UPDATE
+# clause — pin state is owned by the dedicated UpdatePinnedForumTopic
+# handler. Legacy NOT NULL columns (is_general, is_deleted, updated_at)
+# supplied with safe defaults; the on-conflict path leaves them alone
+# because they are not in the SET list.)
+# ---------------------------------------------------------------------------
+
+_UPSERT_TOPIC_METADATA_SQL = """
+INSERT INTO topic_metadata
+    (dialog_id, topic_id, title, top_message_id,
+     is_general, is_deleted, updated_at,
+     icon_emoji_id, pinned, hidden, snapshot_at, date)
+VALUES
+    (:dialog_id, :topic_id, :title, NULL,
+     0, 0, :updated_at,
+     :icon_emoji_id, 0, 0, :snapshot_at, :date)
+ON CONFLICT(dialog_id, topic_id) DO UPDATE SET
+    title          = COALESCE(excluded.title, topic_metadata.title),
+    icon_emoji_id  = COALESCE(excluded.icon_emoji_id, topic_metadata.icon_emoji_id),
+    updated_at     = excluded.updated_at,
+    snapshot_at    = excluded.snapshot_at
+WHERE topic_metadata.snapshot_at IS NULL
+   OR topic_metadata.snapshot_at < excluded.snapshot_at
+"""
+
+_UPDATE_TOPIC_METADATA_EDIT_SQL = (
+    "UPDATE topic_metadata "
+    "SET title      = COALESCE(?, title), "
+    "    icon_emoji_id = COALESCE(?, icon_emoji_id), "
+    "    updated_at = ?, snapshot_at = ? "
+    "WHERE dialog_id = ? AND topic_id = ? "
+    "  AND (snapshot_at IS NULL OR snapshot_at < ?)"
+)
+
+_UPDATE_TOPIC_METADATA_HIDDEN_SQL = (
+    "UPDATE topic_metadata SET hidden=1, snapshot_at=?, updated_at=? "
+    "WHERE dialog_id=? AND topic_id=?"
+)
+
+_UPDATE_TOPIC_METADATA_PINNED_SQL = (
+    "UPDATE topic_metadata SET pinned=?, snapshot_at=?, updated_at=? "
+    "WHERE dialog_id=? AND topic_id=?"
+)
+
 
 # ---------------------------------------------------------------------------
 # EventHandlerManager
@@ -183,6 +233,11 @@ class EventHandlerManager:
             self.on_raw_inbox_read,
             events.Raw(types=[UpdateReadHistoryInbox, UpdateReadChannelInbox]),
         )
+        # Phase 42 EVENTS-05: forum topic pin state.
+        self._client.add_event_handler(
+            self.on_raw_forum_topic_pinned,
+            events.Raw(types=[UpdatePinnedForumTopic]),
+        )
 
     def unregister(self) -> None:
         """Remove all handlers from the client (graceful shutdown)."""
@@ -195,6 +250,7 @@ class EventHandlerManager:
         self._client.remove_event_handler(self.on_raw_dialog_pinned)
         self._client.remove_event_handler(self.on_raw_channel_chat_update)
         self._client.remove_event_handler(self.on_raw_inbox_read)
+        self._client.remove_event_handler(self.on_raw_forum_topic_pinned)
 
     def refresh_synced_dialogs(self) -> None:
         """Refresh the in-memory synced-dialog set from the DB.
@@ -300,6 +356,76 @@ class EventHandlerManager:
                         (new_ts, now, dialog_id),
                     )
                 self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
+
+                # Phase 42 EVENTS-05: forum topic mutations carried in service
+                # messages. The upstream _synced_dialog_ids gate at line 273
+                # already filters unenrolled dialogs — no duplicate check needed
+                # here. Only MessageActionTopicCreate and MessageActionTopicEdit
+                # trigger writes; all other action types (or action=None) fall
+                # through silently.
+                action = getattr(msg, "action", None)
+                if isinstance(action, MessageActionTopicCreate):
+                    topic_id = int(getattr(msg, "id", 0))
+                    if topic_id > 0:
+                        title = getattr(action, "title", None) or "Topic"
+                        self._conn.execute(_UPSERT_TOPIC_METADATA_SQL, {
+                            "dialog_id": dialog_id,
+                            "topic_id": topic_id,
+                            "title": title,
+                            "icon_emoji_id": getattr(action, "icon_emoji_id", None),
+                            "updated_at": now,
+                            "snapshot_at": now,
+                            "date": int(msg_date.timestamp()) if msg_date is not None else now,
+                        })
+                        logger.info(
+                            "event_topic_create dialog_id=%d topic_id=%d",
+                            dialog_id, topic_id,
+                        )
+                elif isinstance(action, MessageActionTopicEdit):
+                    reply_to = getattr(msg, "reply_to", None)
+                    if reply_to is None:
+                        # Defensive: some MessageActionTopicEdit events carry no
+                        # reply_to; without it we cannot identify the target topic.
+                        logger.debug(
+                            "event_topic_edit_skipped reason=no_reply_to dialog_id=%d",
+                            dialog_id,
+                        )
+                    else:
+                        topic_id_raw = getattr(reply_to, "reply_to_msg_id", None)
+                        if topic_id_raw is None:
+                            logger.debug(
+                                "event_topic_edit_skipped reason=no_reply_to_msg_id "
+                                "dialog_id=%d", dialog_id,
+                            )
+                        else:
+                            topic_id = int(topic_id_raw)
+                            if bool(getattr(action, "hidden", False)):
+                                self._conn.execute(
+                                    _UPDATE_TOPIC_METADATA_HIDDEN_SQL,
+                                    (now, now, dialog_id, topic_id),
+                                )
+                                logger.info(
+                                    "event_topic_hidden dialog_id=%d topic_id=%d",
+                                    dialog_id, topic_id,
+                                )
+                            else:
+                                # Non-hidden edits use an UPDATE-only path.
+                                # COALESCE(?, existing) preserves fields when the
+                                # edit omits them (action.title / icon_emoji_id may
+                                # be None). UPDATE matches 0 rows for unknown topics
+                                # — silent no-op; on_new_message UPSERT is the sole
+                                # row-creation path.
+                                edit_title = getattr(action, "title", None)
+                                edit_icon = getattr(action, "icon_emoji_id", None)
+                                self._conn.execute(
+                                    _UPDATE_TOPIC_METADATA_EDIT_SQL,
+                                    (edit_title, edit_icon, now, now,
+                                     dialog_id, topic_id, now),
+                                )
+                                logger.info(
+                                    "event_topic_edit dialog_id=%d topic_id=%d",
+                                    dialog_id, topic_id,
+                                )
 
             logger.info("event_new dialog_id=%d message_id=%d", dialog_id, msg.id)
         except Exception:
@@ -768,6 +894,41 @@ class EventHandlerManager:
         except Exception:
             logger.exception(
                 "event_raw_inbox_read_failed update=%r", type(update).__name__,
+            )
+
+    async def on_raw_forum_topic_pinned(self, update: Any) -> None:
+        """Phase 42 EVENTS-05: UpdatePinnedForumTopic → topic_metadata.pinned.
+
+        Gated on _synced_dialog_ids; UPDATE-only. Missing-row UPDATE matches
+        0 rows without crashing — bootstrap / on_new_message UPSERT remain the
+        sole row-creation paths.
+        """
+        try:
+            if not isinstance(update, UpdatePinnedForumTopic):
+                return
+            peer = getattr(update, "peer", None)
+            topic_id_raw = getattr(update, "topic_id", None)
+            if peer is None or topic_id_raw is None:
+                return
+            dialog_id = int(get_peer_id(peer))
+            if dialog_id not in self._synced_dialog_ids:
+                return
+            topic_id = int(topic_id_raw)
+            pinned = 1 if getattr(update, "pinned", False) else 0
+            now = int(time.time())
+            with self._conn:
+                self._conn.execute(
+                    _UPDATE_TOPIC_METADATA_PINNED_SQL,
+                    (pinned, now, now, dialog_id, topic_id),
+                )
+            logger.info(
+                "event_forum_topic_pinned dialog_id=%d topic_id=%d pinned=%d",
+                dialog_id, topic_id, pinned,
+            )
+        except Exception:
+            logger.exception(
+                "event_forum_topic_pinned_failed update=%r",
+                type(update).__name__,
             )
 
     # ------------------------------------------------------------------
