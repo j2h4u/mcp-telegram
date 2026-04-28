@@ -282,6 +282,12 @@ class EventHandlerManager:
             cursor = self._conn.execute(INSERT_DIALOG_SQL, (dialog_id,))
             self._conn.commit()
             if cursor.rowcount > 0:
+                # status='syncing' is stable once inserted — FullSyncWorker only
+                # advances it to 'synced', never back to 'not_synced'. Adding to
+                # _synced_dialog_ids here is safe: the real-time handler path only
+                # writes to messages and synced_dialogs.last_event_at, neither of
+                # which depends on the status column. FullSyncWorker will backfill
+                # full history via INSERT OR REPLACE in its next batch cycle.
                 self._synced_dialog_ids.add(dialog_id)
                 logger.info("dm_auto_enroll dialog_id=%d", dialog_id)
         except Exception:
