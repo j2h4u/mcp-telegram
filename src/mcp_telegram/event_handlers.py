@@ -282,6 +282,12 @@ class EventHandlerManager:
             cursor = self._conn.execute(INSERT_DIALOG_SQL, (dialog_id,))
             self._conn.commit()
             if cursor.rowcount > 0:
+                # status='syncing' is stable once inserted — FullSyncWorker only
+                # advances it to 'synced', never back to 'not_synced'. Adding to
+                # _synced_dialog_ids here is safe: the real-time handler path only
+                # writes to messages and synced_dialogs.last_event_at, neither of
+                # which depends on the status column. FullSyncWorker will backfill
+                # full history via INSERT OR REPLACE in its next batch cycle.
                 self._synced_dialog_ids.add(dialog_id)
                 logger.info("dm_auto_enroll dialog_id=%d", dialog_id)
         except Exception:
@@ -295,18 +301,18 @@ class EventHandlerManager:
             last = getattr(sender, "last_name", None) or ""
             name: str | None = f"{first} {last}".strip() or None
             entity_type_str = "Bot" if getattr(sender, "bot", False) else "User"
-            self._conn.execute(
-                UPSERT_ENTITY_SQL,
-                (
-                    dialog_id,
-                    entity_type_str,
-                    name,
-                    getattr(sender, "username", None),
-                    latinize(name) if name else None,
-                    int(time.time()),
-                ),
-            )
-            self._conn.commit()
+            with self._conn:
+                self._conn.execute(
+                    UPSERT_ENTITY_SQL,
+                    (
+                        dialog_id,
+                        entity_type_str,
+                        name,
+                        getattr(sender, "username", None),
+                        latinize(name) if name else None,
+                        int(time.time()),
+                    ),
+                )
             logger.info("dm_auto_enroll_entity dialog_id=%d name=%r", dialog_id, name)
         except Exception:
             logger.exception("dm_auto_enroll_entity_failed dialog_id=%d", dialog_id)
@@ -451,56 +457,65 @@ class EventHandlerManager:
             new_text = getattr(msg, "message", None)
             now = int(time.time())
 
-            with self._conn:
-                existing = self._conn.execute(_SELECT_MESSAGE_TEXT_SQL, (dialog_id, message_id)).fetchone()
+            # Resolve async data BEFORE opening transaction — SQLite's synchronous
+            # driver cannot safely suspend inside a `with self._conn:` block while
+            # another coroutine may call into the same connection.
+            existing = self._conn.execute(
+                _SELECT_MESSAGE_TEXT_SQL, (dialog_id, message_id)
+            ).fetchone()
 
-                if existing is None:
-                    # Message not yet in sync.db: insert with current text;
-                    # historical versions are lost (acceptable).
-                    entity_name_map = await _build_fwd_entity_map(msg, self._client)
-                    extracted = extract_message_row(dialog_id, msg, entity_name_map=entity_name_map)
+            if existing is None:
+                # Message not yet in sync.db: resolve entity map then insert.
+                entity_name_map = await _build_fwd_entity_map(msg, self._client)
+                extracted = extract_message_row(dialog_id, msg, entity_name_map=entity_name_map)
+                with self._conn:
                     insert_messages_with_fts(self._conn, [extracted])
                     self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
-                    logger.info(
-                        "event_edit_new dialog_id=%d message_id=%d (not in sync.db, inserted)",
-                        dialog_id,
-                        message_id,
-                    )
-                    return
+                logger.info(
+                    "event_edit_new dialog_id=%d message_id=%d (not in sync.db, inserted)",
+                    dialog_id,
+                    message_id,
+                )
+                return
 
-                old_text = existing[0]
-                if old_text == new_text:
-                    # No text change. Two sub-cases:
-                    # 1. msg.reactions present -> reactions-only edit; apply delta
-                    #    (Phase 39.2-01 AC-1 via edited path, AC-2 removal via empty results).
-                    # 2. msg.reactions is None -> service edit / media caption etc.; no-op
-                    #    (regression guard AC-8).
-                    reactions_obj = getattr(msg, "reactions", None)
-                    if reactions_obj is not None:
-                        rows = extract_reactions_rows(dialog_id, message_id, reactions_obj)
+            old_text = existing[0]
+            if old_text == new_text:
+                # No text change. Two sub-cases:
+                # 1. msg.reactions present -> reactions-only edit; apply delta
+                #    (Phase 39.2-01 AC-1 via edited path, AC-2 removal via empty results).
+                # 2. msg.reactions is None -> service edit / media caption etc.; no-op
+                #    (regression guard AC-8).
+                reactions_obj = getattr(msg, "reactions", None)
+                if reactions_obj is not None:
+                    rows = extract_reactions_rows(dialog_id, message_id, reactions_obj)
+                    with self._conn:
                         apply_reactions_delta(self._conn, dialog_id, message_id, rows)
                         self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
-                        logger.info(
-                            "event_edit_reactions dialog_id=%d message_id=%d count=%d",
-                            dialog_id,
-                            message_id,
-                            len(rows),
-                        )
-                    return
+                    logger.info(
+                        "event_edit_reactions dialog_id=%d message_id=%d count=%d",
+                        dialog_id,
+                        message_id,
+                        len(rows),
+                    )
+                return
 
-                edit_date_raw = getattr(msg, "edit_date", None)
-                edit_date_unix = int(edit_date_raw.timestamp()) if edit_date_raw is not None else now
+            edit_date_raw = getattr(msg, "edit_date", None)
+            edit_date_unix = int(edit_date_raw.timestamp()) if edit_date_raw is not None else now
 
-                next_ver = self._conn.execute(_NEXT_VERSION_SQL, (dialog_id, message_id)).fetchone()[0]
+            # Resolve entity map before the transaction (no await inside with).
+            entity_name_map = await _build_fwd_entity_map(msg, self._client)
+            extracted = extract_message_row(dialog_id, msg, entity_name_map=entity_name_map)
 
+            with self._conn:
+                next_ver = self._conn.execute(
+                    _NEXT_VERSION_SQL, (dialog_id, message_id)
+                ).fetchone()[0]
                 self._conn.execute(
                     _INSERT_VERSION_SQL,
                     (dialog_id, message_id, next_ver, old_text, edit_date_unix),
                 )
                 # Re-insert via insert_messages_with_fts: updates messages row,
                 # refreshes FTS, and replaces child rows (edit idempotency).
-                entity_name_map = await _build_fwd_entity_map(msg, self._client)
-                extracted = extract_message_row(dialog_id, msg, entity_name_map=entity_name_map)
                 insert_messages_with_fts(self._conn, [extracted])
                 self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
 
@@ -787,6 +802,10 @@ class EventHandlerManager:
                 if order is None:
                     logger.debug("event_pinned_dialogs_order_none — skip")
                     return
+                # folder_id=None means the main list; folder_id=1 means Archived, etc.
+                # A folder-scoped update carries only pins *within* that folder, so we
+                # must not use it to clear pins in other folders.
+                folder_id = getattr(update, "folder_id", None)
                 # Decode peers; gate by _synced_dialog_ids so we never UPDATE
                 # rows for dialogs the daemon does not own.
                 pinned_ids: list[int] = []
@@ -799,22 +818,30 @@ class EventHandlerManager:
                     if did in self._synced_dialog_ids:
                         pinned_ids.append(did)
                 with self._conn:
-                    if pinned_ids:
-                        for did in pinned_ids:
-                            self._conn.execute(
-                                _UPDATE_DIALOG_PINNED_SQL, (1, now, did),
-                            )
-                        placeholders = ",".join("?" * len(pinned_ids))
-                        sql = _CLEAR_PINS_NOT_IN_SQL_TEMPLATE.format(
-                            placeholders=placeholders,
+                    for did in pinned_ids:
+                        self._conn.execute(
+                            _UPDATE_DIALOG_PINNED_SQL, (1, now, did),
                         )
-                        self._conn.execute(sql, (now, *pinned_ids))
-                    else:
-                        # Empty order list → all dialogs unpinned in this folder.
-                        # NOT IN () is invalid SQLite — use the dedicated SQL.
-                        self._conn.execute(_CLEAR_ALL_PINS_SQL, (now,))
+                    if folder_id is None:
+                        # Main list: rewrite the full pin set — the update is
+                        # authoritative for all main-list pins.
+                        if pinned_ids:
+                            placeholders = ",".join("?" * len(pinned_ids))
+                            sql = _CLEAR_PINS_NOT_IN_SQL_TEMPLATE.format(
+                                placeholders=placeholders,
+                            )
+                            self._conn.execute(sql, (now, *pinned_ids))
+                        else:
+                            # Empty order list → all dialogs unpinned in main list.
+                            # NOT IN () is invalid SQLite — use the dedicated SQL.
+                            self._conn.execute(_CLEAR_ALL_PINS_SQL, (now,))
+                    # For folder-scoped updates (folder_id != None) we only set the
+                    # pinned=1 rows above; we do not clear other dialogs because the
+                    # update does not describe pins outside that folder.
                 logger.info(
-                    "event_pinned_dialogs_rewrote pinned_count=%d", len(pinned_ids),
+                    "event_pinned_dialogs_rewrote pinned_count=%d folder_id=%s",
+                    len(pinned_ids),
+                    folder_id,
                 )
 
             elif isinstance(update, UpdateDialogUnreadMark):
