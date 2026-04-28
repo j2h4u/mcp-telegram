@@ -26,7 +26,18 @@ from typing import Any
 
 from telethon import events  # type: ignore[import-untyped]
 from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
-from telethon.tl.types import UpdateMessageReactions  # type: ignore[import-untyped]
+from telethon.tl.types import (  # type: ignore[import-untyped]
+    PeerChannel,
+    PeerChat,
+    UpdateChannel,
+    UpdateChat,
+    UpdateDialogPinned,
+    UpdateDialogUnreadMark,
+    UpdateMessageReactions,
+    UpdatePinnedDialogs,
+    UpdateReadChannelInbox,
+    UpdateReadHistoryInbox,
+)
 from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
 from .read_state import apply_read_cursor
@@ -67,6 +78,38 @@ _SELECT_SYNCED_DIALOGS_SQL = "SELECT dialog_id FROM synced_dialogs WHERE status 
 _SELECT_SYNCED_ONLY_SQL = "SELECT dialog_id FROM synced_dialogs WHERE status = 'synced'"
 
 _SELECT_UNDELETED_MESSAGES_SQL = "SELECT message_id FROM messages WHERE dialog_id=? AND is_deleted=0 AND sent_at < ?"
+
+# ---------------------------------------------------------------------------
+# Phase 42 SQL — dialogs event writes (UPDATE-only; bootstrap is the sole
+# row creator. snapshot_at always bound to int(time.time()) — never NULL —
+# per inter-phase contract documented in dialog_sync.py:23-27.)
+# ---------------------------------------------------------------------------
+
+_UPDATE_DIALOG_PINNED_SQL = (
+    "UPDATE dialogs SET pinned=?, snapshot_at=? WHERE dialog_id=?"
+)
+
+_UPDATE_DIALOG_NEEDS_REFRESH_SQL = (
+    "UPDATE dialogs SET needs_refresh=1, snapshot_at=? WHERE dialog_id=?"
+)
+
+_UPDATE_DIALOG_LAST_MESSAGE_AT_SQL = (
+    "UPDATE dialogs "
+    "SET last_message_at = MAX(COALESCE(last_message_at, 0), ?), "
+    "    snapshot_at = ? "
+    "WHERE dialog_id = ?"
+)
+
+# IN-list rewrite — placeholder count substituted at call site:
+_CLEAR_PINS_NOT_IN_SQL_TEMPLATE = (
+    "UPDATE dialogs SET pinned=0, snapshot_at=? "
+    "WHERE pinned=1 AND dialog_id NOT IN ({placeholders})"
+)
+
+# Empty-list fast path (NOT IN () is invalid SQLite — see review):
+_CLEAR_ALL_PINS_SQL = (
+    "UPDATE dialogs SET pinned=0, snapshot_at=? WHERE pinned=1"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -127,15 +170,31 @@ class EventHandlerManager:
             self.on_raw_reaction_update,
             events.Raw(types=[UpdateMessageReactions]),
         )
+        # Phase 42: three new Raw handlers for dialog metadata events.
+        self._client.add_event_handler(
+            self.on_raw_dialog_pinned,
+            events.Raw(types=[UpdateDialogPinned, UpdatePinnedDialogs, UpdateDialogUnreadMark]),
+        )
+        self._client.add_event_handler(
+            self.on_raw_channel_chat_update,
+            events.Raw(types=[UpdateChannel, UpdateChat]),
+        )
+        self._client.add_event_handler(
+            self.on_raw_inbox_read,
+            events.Raw(types=[UpdateReadHistoryInbox, UpdateReadChannelInbox]),
+        )
 
     def unregister(self) -> None:
-        """Remove all five handlers from the client (graceful shutdown)."""
+        """Remove all handlers from the client (graceful shutdown)."""
         self._client.remove_event_handler(self.on_new_message)
         self._client.remove_event_handler(self.on_message_edited)
         self._client.remove_event_handler(self.on_message_deleted)
         self._client.remove_event_handler(self.on_message_read)
         self._client.remove_event_handler(self.on_outbox_read)
         self._client.remove_event_handler(self.on_raw_reaction_update)
+        self._client.remove_event_handler(self.on_raw_dialog_pinned)
+        self._client.remove_event_handler(self.on_raw_channel_chat_update)
+        self._client.remove_event_handler(self.on_raw_inbox_read)
 
     def refresh_synced_dialogs(self) -> None:
         """Refresh the in-memory synced-dialog set from the DB.
@@ -229,6 +288,17 @@ class EventHandlerManager:
 
             with self._conn:
                 insert_messages_with_fts(self._conn, [extracted])
+                # Phase 42 EVENTS-04: advance dialogs.last_message_at monotonically.
+                # MAX(COALESCE(..., 0), new_ts) ensures no regression on out-of-order
+                # events. UPDATE matches 0 rows when the dialog is not yet bootstrapped
+                # (no dialogs row) — silent no-op; bootstrap is the sole row creator.
+                msg_date = getattr(msg, "date", None)
+                if msg_date is not None:
+                    new_ts = int(msg_date.timestamp())
+                    self._conn.execute(
+                        _UPDATE_DIALOG_LAST_MESSAGE_AT_SQL,
+                        (new_ts, now, dialog_id),
+                    )
                 self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
 
             logger.info("event_new dialog_id=%d message_id=%d", dialog_id, msg.id)
@@ -552,6 +622,152 @@ class EventHandlerManager:
                 "event_raw_reaction_apply_failed dialog_id=%d message_id=%d",
                 dialog_id,
                 msg_id,
+            )
+
+    # ------------------------------------------------------------------
+    # Phase 42: dialog metadata Raw handlers (EVENTS-01, EVENTS-02, EVENTS-03)
+    # ------------------------------------------------------------------
+
+    async def on_raw_dialog_pinned(self, update: Any) -> None:
+        """Phase 42 EVENTS-01: dialogs.pinned + needs_refresh from raw updates.
+
+        Handles three update types:
+          - UpdateDialogPinned: single dialog pin toggle. Gated on
+            _synced_dialog_ids; UPDATE-only (bootstrap creates rows).
+          - UpdatePinnedDialogs: full pinned-set replacement (order list).
+            order=None → no actionable data, skip.
+            order=[] → unpin everything via _CLEAR_ALL_PINS_SQL (NOT IN () is
+            invalid SQLite).
+          - UpdateDialogUnreadMark: no dedicated column today; signal via
+            needs_refresh=1 so reconciliation re-fetches the dialog (Phase 43).
+        """
+        try:
+            now = int(time.time())
+            if isinstance(update, UpdateDialogPinned):
+                peer = getattr(update, "peer", None)
+                inner_peer = getattr(peer, "peer", peer)  # DialogPeer.peer → TypePeer
+                if inner_peer is None:
+                    return
+                dialog_id = int(get_peer_id(inner_peer))
+                if dialog_id not in self._synced_dialog_ids:
+                    return
+                pinned = 1 if getattr(update, "pinned", False) else 0
+                with self._conn:
+                    self._conn.execute(_UPDATE_DIALOG_PINNED_SQL, (pinned, now, dialog_id))
+                logger.info("event_dialog_pinned dialog_id=%d pinned=%d", dialog_id, pinned)
+
+            elif isinstance(update, UpdatePinnedDialogs):
+                order = getattr(update, "order", None)
+                if order is None:
+                    logger.debug("event_pinned_dialogs_order_none — skip")
+                    return
+                # Decode peers; gate by _synced_dialog_ids so we never UPDATE
+                # rows for dialogs the daemon does not own.
+                pinned_ids: list[int] = []
+                for dp in order:
+                    inner = getattr(dp, "peer", dp)
+                    try:
+                        did = int(get_peer_id(inner))
+                    except Exception:
+                        continue
+                    if did in self._synced_dialog_ids:
+                        pinned_ids.append(did)
+                with self._conn:
+                    if pinned_ids:
+                        for did in pinned_ids:
+                            self._conn.execute(
+                                _UPDATE_DIALOG_PINNED_SQL, (1, now, did),
+                            )
+                        placeholders = ",".join("?" * len(pinned_ids))
+                        sql = _CLEAR_PINS_NOT_IN_SQL_TEMPLATE.format(
+                            placeholders=placeholders,
+                        )
+                        self._conn.execute(sql, (now, *pinned_ids))
+                    else:
+                        # Empty order list → all dialogs unpinned in this folder.
+                        # NOT IN () is invalid SQLite — use the dedicated SQL.
+                        self._conn.execute(_CLEAR_ALL_PINS_SQL, (now,))
+                logger.info(
+                    "event_pinned_dialogs_rewrote pinned_count=%d", len(pinned_ids),
+                )
+
+            elif isinstance(update, UpdateDialogUnreadMark):
+                peer = getattr(update, "peer", None)
+                inner_peer = getattr(peer, "peer", peer)
+                if inner_peer is None:
+                    return
+                dialog_id = int(get_peer_id(inner_peer))
+                if dialog_id not in self._synced_dialog_ids:
+                    return
+                with self._conn:
+                    self._conn.execute(
+                        _UPDATE_DIALOG_NEEDS_REFRESH_SQL, (now, dialog_id),
+                    )
+                logger.info(
+                    "event_dialog_unread_mark dialog_id=%d needs_refresh=1",
+                    dialog_id,
+                )
+        except Exception:
+            logger.exception(
+                "event_dialog_pinned_failed update=%r", type(update).__name__,
+            )
+
+    async def on_raw_channel_chat_update(self, update: Any) -> None:
+        """Phase 42 EVENTS-03: UpdateChannel / UpdateChat → dialogs.needs_refresh=1.
+
+        Gated on _synced_dialog_ids; UPDATE-only.
+        """
+        try:
+            if isinstance(update, UpdateChannel):
+                dialog_id = int(get_peer_id(PeerChannel(update.channel_id)))
+            elif isinstance(update, UpdateChat):
+                dialog_id = int(get_peer_id(PeerChat(update.chat_id)))
+            else:
+                return
+            if dialog_id not in self._synced_dialog_ids:
+                return
+            now = int(time.time())
+            with self._conn:
+                self._conn.execute(_UPDATE_DIALOG_NEEDS_REFRESH_SQL, (now, dialog_id))
+            logger.info("event_channel_chat_dirty dialog_id=%d", dialog_id)
+        except Exception:
+            logger.exception(
+                "event_channel_chat_update_failed update=%r", type(update).__name__,
+            )
+
+    async def on_raw_inbox_read(self, update: Any) -> None:
+        """Phase 42 EVENTS-02: UpdateReadHistoryInbox / UpdateReadChannelInbox.
+
+        Captures still_unread_count via structured log (the high-level
+        events.MessageRead wrapper drops this field). No dialogs.unread_count
+        column is added in this milestone — capture-via-log is the explicit
+        satisfaction strategy for EVENTS-02 (see plan revision_notes).
+
+        Gated on _synced_dialog_ids; observability-only — no dialogs UPDATE.
+        Updates synced_dialogs.last_event_at via the existing _UPDATE_LAST_EVENT_SQL
+        so the last_event_at observability stays intact.
+        """
+        try:
+            if isinstance(update, UpdateReadHistoryInbox):
+                dialog_id = int(get_peer_id(update.peer))
+            elif isinstance(update, UpdateReadChannelInbox):
+                dialog_id = int(get_peer_id(PeerChannel(update.channel_id)))
+            else:
+                return
+            if dialog_id not in self._synced_dialog_ids:
+                return
+            still_unread = int(getattr(update, "still_unread_count", 0))
+            max_id = int(getattr(update, "max_id", 0))
+            now = int(time.time())
+            with self._conn:
+                self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
+            logger.info(
+                "event_raw_inbox_read dialog_id=%d max_id=%d still_unread_count=%d",
+                dialog_id, max_id, still_unread,
+            )
+        except Exception:
+            logger.exception(
+                "event_raw_inbox_read_failed update=%r", type(update).__name__,
             )
 
     # ------------------------------------------------------------------

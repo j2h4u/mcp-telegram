@@ -140,12 +140,13 @@ def _make_manager(client: MagicMock, conn: sqlite3.Connection, ev: asyncio.Event
 @pytest.mark.asyncio
 async def test_update_dialog_pinned_sets_pinned_true(mock_client, sync_db, shutdown_event):
     """EVENTS-01: single dialog pin sets dialogs.pinned=1 and advances snapshot_at."""
-    dialog_id = 12345
+    channel_id = 12345
+    dialog_id = get_peer_id(PeerChannel(channel_id))  # -1000000012345
     _enroll_synced(sync_db, dialog_id)
     _insert_dialog(sync_db, dialog_id, pinned=0, snapshot_at=1)
 
     upd = UpdateDialogPinned(
-        peer=DialogPeer(peer=PeerChannel(channel_id=12345)),
+        peer=DialogPeer(peer=PeerChannel(channel_id=channel_id)),
         pinned=True,
         folder_id=None,
     )
@@ -162,12 +163,13 @@ async def test_update_dialog_pinned_sets_pinned_true(mock_client, sync_db, shutd
 @pytest.mark.asyncio
 async def test_update_dialog_pinned_with_pinned_false_unsets(mock_client, sync_db, shutdown_event):
     """EVENTS-01: UpdateDialogPinned(pinned=False) sets dialogs.pinned=0."""
-    dialog_id = 12345
+    channel_id = 12345
+    dialog_id = get_peer_id(PeerChannel(channel_id))
     _enroll_synced(sync_db, dialog_id)
     _insert_dialog(sync_db, dialog_id, pinned=1, snapshot_at=1)
 
     upd = UpdateDialogPinned(
-        peer=DialogPeer(peer=PeerChannel(channel_id=12345)),
+        peer=DialogPeer(peer=PeerChannel(channel_id=channel_id)),
         pinned=False,
         folder_id=None,
     )
@@ -183,12 +185,13 @@ async def test_update_dialog_pinned_with_pinned_false_unsets(mock_client, sync_d
 @pytest.mark.asyncio
 async def test_update_dialog_pinned_skips_unenrolled_dialog(mock_client, sync_db, shutdown_event):
     """EVENTS-01: unenrolled dialog — no UPDATE issued (snapshot_at stays at seeded=1)."""
-    dialog_id = 99999
+    channel_id = 99999
+    dialog_id = get_peer_id(PeerChannel(channel_id))
     # NOT enrolled in _synced_dialog_ids
     _insert_dialog(sync_db, dialog_id, pinned=0, snapshot_at=1)
 
     upd = UpdateDialogPinned(
-        peer=DialogPeer(peer=PeerChannel(channel_id=99999)),
+        peer=DialogPeer(peer=PeerChannel(channel_id=channel_id)),
         pinned=True,
         folder_id=None,
     )
@@ -205,12 +208,13 @@ async def test_update_dialog_pinned_skips_unenrolled_dialog(mock_client, sync_db
 @pytest.mark.asyncio
 async def test_update_dialog_pinned_missing_dialogs_row_is_noop(mock_client, sync_db, shutdown_event):
     """EVENTS-01: enrolled in _synced_dialog_ids but NO dialogs row — no exception, no INSERT."""
-    dialog_id = 77777
+    channel_id = 77777
+    dialog_id = get_peer_id(PeerChannel(channel_id))
     _enroll_synced(sync_db, dialog_id)
     # No dialogs row
 
     upd = UpdateDialogPinned(
-        peer=DialogPeer(peer=PeerChannel(channel_id=77777)),
+        peer=DialogPeer(peer=PeerChannel(channel_id=channel_id)),
         pinned=True,
         folder_id=None,
     )
@@ -293,12 +297,13 @@ async def test_update_pinned_dialogs_with_order_none_is_noop(mock_client, sync_d
 @pytest.mark.asyncio
 async def test_update_dialog_unread_mark_sets_needs_refresh(mock_client, sync_db, shutdown_event):
     """EVENTS-01: UpdateDialogUnreadMark sets needs_refresh=1."""
-    dialog_id = get_peer_id(PeerUser(user_id=12345))
+    user_id = 12345
+    dialog_id = get_peer_id(PeerUser(user_id=user_id))  # positive int for DM
     _enroll_synced(sync_db, dialog_id)
     _insert_dialog(sync_db, dialog_id, needs_refresh=0, snapshot_at=1)
 
     upd = UpdateDialogUnreadMark(
-        peer=DialogPeer(peer=PeerUser(user_id=12345)),
+        peer=DialogPeer(peer=PeerUser(user_id=user_id)),
         unread=True,
     )
     mgr = _make_manager(mock_client, sync_db, shutdown_event)
@@ -425,7 +430,7 @@ def test_events_02_satisfaction_documented_via_log_only() -> None:
 @pytest.mark.asyncio
 async def test_update_channel_sets_needs_refresh(mock_client, sync_db, shutdown_event):
     """EVENTS-03: UpdateChannel sets dialogs.needs_refresh=1 and advances snapshot_at."""
-    channel_id = 12345
+    channel_id = 123456789
     dialog_id = get_peer_id(PeerChannel(channel_id))
     _enroll_synced(sync_db, dialog_id)
     _insert_dialog(sync_db, dialog_id, needs_refresh=0, snapshot_at=1)
