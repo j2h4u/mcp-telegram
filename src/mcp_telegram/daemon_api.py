@@ -3909,9 +3909,9 @@ class DaemonAPIServer:
                     (
                         e["id"],
                         e["type"],
-                        e["name"],
+                        e.get("name") or None,
                         e.get("username"),
-                        latinize(e["name"]),
+                        latinize(e["name"]) if e.get("name") else None,
                         now,
                     )
                     for e in entities
