@@ -356,6 +356,37 @@ def _insert_topic_metadata(
     conn.commit()
 
 
+def _make_db_with_topics() -> sqlite3.Connection:
+    """Return an in-memory DB with topic_metadata including v19 columns."""
+    conn = _make_db()
+    # _make_db() already creates topic_metadata with the v4 schema (no v19 cols).
+    # Drop and recreate with the full v19 schema so hidden/icon_emoji_id/etc. exist.
+    conn.executescript("DROP TABLE IF EXISTS topic_metadata;")
+    conn.execute(
+        """
+        CREATE TABLE topic_metadata (
+            dialog_id      INTEGER NOT NULL,
+            topic_id       INTEGER NOT NULL,
+            title          TEXT NOT NULL,
+            top_message_id INTEGER,
+            is_general     INTEGER NOT NULL DEFAULT 0,
+            is_deleted     INTEGER NOT NULL DEFAULT 0,
+            inaccessible_error TEXT,
+            inaccessible_at    INTEGER,
+            updated_at     INTEGER NOT NULL DEFAULT 0,
+            icon_emoji_id  INTEGER,
+            pinned         INTEGER NOT NULL DEFAULT 0,
+            hidden         INTEGER NOT NULL DEFAULT 0,
+            snapshot_at    INTEGER,
+            date           INTEGER,
+            PRIMARY KEY (dialog_id, topic_id)
+        )
+        """
+    )
+    conn.commit()
+    return conn
+
+
 # ---------------------------------------------------------------------------
 # get_daemon_socket_path
 # ---------------------------------------------------------------------------
@@ -1094,34 +1125,24 @@ async def test_list_dialogs_ignore_pinned_filters_via_sql() -> None:
 
 @pytest.mark.asyncio
 async def test_list_topics_through_daemon() -> None:
-    """list_topics calls Telegram and returns topics list."""
-    conn = _make_db()
+    """list_topics reads from topic_metadata snapshot — zero Telegram API calls."""
+    conn = _make_db_with_topics()
+    conn.execute(
+        "INSERT INTO topic_metadata (dialog_id, topic_id, title, updated_at) VALUES (123, 1, 'General', 0)"
+    )
+    conn.commit()
 
-    # Mock forum topics result
-    mock_topic = MagicMock()
-    mock_topic.id = 1
-    mock_topic.title = "General"
-    mock_topic.date = 1700000000
-    mock_topic.icon_emoji_id = None
-
-    mock_result = MagicMock()
-    mock_result.topics = [mock_topic]
-
-    # Build a client where get_entity and __call__ are awaitable
-    client = AsyncMock()
-    client.get_entity = AsyncMock(return_value=MagicMock(id=123))
-    # client(request) should return the mock result
-    client.return_value = mock_result
-
+    client = MagicMock()
     server = make_server(conn, client)
 
-    with patch("mcp_telegram.daemon_api.GetForumTopicsRequest"):
-        result = await server._list_topics({"dialog_id": 123})
+    result = await server._list_topics({"dialog_id": 123})
 
     assert result["ok"] is True, f"Expected ok=True, got {result}"
     assert "topics" in result["data"]
     assert len(result["data"]["topics"]) == 1
     assert result["data"]["topics"][0]["id"] == 1
+    assert result["data"]["topics"][0]["title"] == "General"
+    client.get_entity.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
