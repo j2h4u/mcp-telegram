@@ -3470,6 +3470,12 @@ class DaemonAPIServer:
         NOTE: the user-supplied message text is intentionally NOT logged at any
         level to avoid accidental disclosure of sensitive context.
         """
+        if self._feedback_conn is None:
+            return {
+                "ok": False,
+                "error": "internal",
+                "message": "feedback database not initialised",
+            }
         message = req.get("message", "")
         if not isinstance(message, str):
             return {"ok": False, "error": "invalid_input", "message": "message must be a string"}
