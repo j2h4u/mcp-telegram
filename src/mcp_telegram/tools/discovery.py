@@ -151,6 +151,8 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
     # (or unknown — same UX). One line, after all rows. Per RESEARCH.md
     # Assumption A2 the underlying MAX(snapshot_at) is optimistic; this is
     # documented in daemon_api.py near _SNAPSHOT_STALE_THRESHOLD_S.
+    result_count = len(lines)
+
     snapshot_age_h = data.get("snapshot_age_h")
     if snapshot_age_h is not None:
         lines.append(f"[snapshot_age={snapshot_age_h}h — data may be stale]")
@@ -163,7 +165,7 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
             logger.debug("entity_upsert_skipped", exc_info=True)
 
     result_text = "\n".join(lines)
-    return ToolResult(content=_text_response(result_text), result_count=len(lines))
+    return ToolResult(content=_text_response(result_text), result_count=result_count)
 
 
 class ListTopics(ToolArgs):
