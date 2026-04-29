@@ -4950,3 +4950,141 @@ def test_search_messages_finds_migrated_own_message() -> None:
         f"backfill_fts_index(). Hits: {hits}"
     )
     assert hits[0] == (42, 7, "unique-search-needle alpha")
+
+
+# ---------------------------------------------------------------------------
+# _resolve_dialog_name — step 2.5 dialogs snapshot table (Phase 46 D-04)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_resolve_dialog_name_dialogs_snapshot_exact_match() -> None:
+    """Step 2.5 resolves dialog by exact name from dialogs table; iter_dialogs not called."""
+    conn = _make_db_with_dialogs()
+    _seed_dialog_row(conn, 12345, name="Project Foo", type_="user")
+
+    client = MagicMock()
+    client.get_entity = AsyncMock(side_effect=ValueError("force fallthrough from step 1"))
+    client.iter_dialogs = MagicMock(
+        side_effect=AssertionError("step 2.5 must hit; iter_dialogs forbidden")
+    )
+
+    server = make_server(conn, client)
+    result = await server._resolve_dialog_name("Project Foo")
+
+    assert result == 12345
+    client.iter_dialogs.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_resolve_dialog_name_dialogs_snapshot_substring() -> None:
+    """Step 2.5 resolves dialog by case-insensitive substring from dialogs table."""
+    conn = _make_db_with_dialogs()
+    _seed_dialog_row(conn, 777, name="Acme Corp Discussion", type_="supergroup")
+
+    client = MagicMock()
+    client.get_entity = AsyncMock(side_effect=ValueError(""))
+    client.iter_dialogs = MagicMock(side_effect=AssertionError("forbidden"))
+
+    server = make_server(conn, client)
+    result = await server._resolve_dialog_name("acme corp")
+
+    assert result == 777
+    client.iter_dialogs.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_resolve_dialog_name_dialogs_snapshot_skips_hidden() -> None:
+    """hidden=1 rows must NOT match step 2.5 — fallthrough to iter_dialogs is required."""
+    conn = _make_db_with_dialogs()
+    _seed_dialog_row(conn, 999, name="Old Group", type_="supergroup", hidden=1)
+
+    fake_entity = MagicMock()
+    fake_entity.id = 999
+
+    fake_dialog = MagicMock()
+    fake_dialog.name = "Old Group"
+    fake_dialog.entity = fake_entity
+
+    client = MagicMock()
+    client.get_entity = AsyncMock(side_effect=ValueError(""))
+
+    async def fake_iter(*args: Any, **kwargs: Any):  # type: ignore[misc]
+        yield fake_dialog
+
+    client.iter_dialogs = MagicMock(return_value=fake_iter())
+
+    server = make_server(conn, client)
+    result = await server._resolve_dialog_name("Old Group")
+
+    # Came from iter_dialogs — proves step 2.5 correctly skipped hidden=1
+    assert result == 999
+    client.iter_dialogs.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_resolve_dialog_name_entities_wins_over_dialogs() -> None:
+    """When same name is in both entities and dialogs, entities (step 2) wins."""
+    conn = _make_db_with_dialogs()
+    conn.execute(
+        "INSERT INTO entities (id, type, name, name_normalized, updated_at) VALUES (?, ?, ?, ?, ?)",
+        (111, "user", "Same Name", "same name", 1700000000),
+    )
+    conn.commit()
+    _seed_dialog_row(conn, 222, name="Same Name", type_="user")
+
+    client = MagicMock()
+    client.get_entity = AsyncMock(side_effect=ValueError(""))
+    client.iter_dialogs = MagicMock(side_effect=AssertionError("forbidden"))
+
+    server = make_server(conn, client)
+    result = await server._resolve_dialog_name("Same Name")
+
+    assert result == 111  # entities (step 2) wins over dialogs (step 2.5)
+    client.iter_dialogs.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_resolve_dialog_name_falls_through_to_iter_dialogs_when_miss() -> None:
+    """Empty entities + empty dialogs → step 3 iter_dialogs runs (regression check)."""
+    conn = _make_db_with_dialogs()
+    # No rows inserted — both tables empty
+
+    fake_entity = MagicMock()
+    fake_entity.id = 42
+
+    fake_dialog = MagicMock()
+    fake_dialog.name = "Brand New Chat"
+    fake_dialog.entity = fake_entity
+
+    client = MagicMock()
+    client.get_entity = AsyncMock(side_effect=ValueError(""))
+
+    async def fake_iter(*args: Any, **kwargs: Any):  # type: ignore[misc]
+        yield fake_dialog
+
+    client.iter_dialogs = MagicMock(return_value=fake_iter())
+
+    server = make_server(conn, client)
+    result = await server._resolve_dialog_name("Brand New Chat")
+
+    # Came from iter_dialogs — step 3 fallback is still functional
+    assert result == 42
+    client.iter_dialogs.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_resolve_dialog_name_dialogs_snapshot_case_insensitive() -> None:
+    """Step 2.5 is case-insensitive — 'PROJECT FOO' matches 'Project Foo'."""
+    conn = _make_db_with_dialogs()
+    _seed_dialog_row(conn, 555, name="Project Foo", type_="user")
+
+    client = MagicMock()
+    client.get_entity = AsyncMock(side_effect=ValueError(""))
+    client.iter_dialogs = MagicMock(side_effect=AssertionError("forbidden"))
+
+    server = make_server(conn, client)
+    result = await server._resolve_dialog_name("PROJECT FOO")
+
+    assert result == 555
+    client.iter_dialogs.assert_not_called()
