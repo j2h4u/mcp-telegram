@@ -528,7 +528,9 @@ _COLLECT_UNREAD_DIALOGS_WITH_COUNTS_SQL = (
     "(SELECT COUNT(*) FROM messages m "
     " WHERE m.dialog_id = sd.dialog_id "
     "   AND m.message_id > sd.read_inbox_max_id "
-    "   AND m.is_deleted = 0) AS unread_count "
+    "   AND m.is_deleted = 0"
+    '   AND m."out" = 0'
+    "   AND m.is_service = 0) AS unread_count "
     "FROM synced_dialogs sd "
     "LEFT JOIN entities e ON e.id = sd.dialog_id "
     "WHERE sd.status = 'synced' "
@@ -540,7 +542,8 @@ _FETCH_UNREAD_MESSAGES_SQL = (
     f"{EFFECTIVE_SENDER_ID_SQL}, m.is_service, m.out, m.dialog_id "
     f"FROM messages m "
     f"{_SENDER_ENTITY_JOINS_SQL}"
-    f"WHERE m.dialog_id = :dialog_id AND m.message_id > :after_msg_id AND m.is_deleted = 0 "
+    f'WHERE m.dialog_id = :dialog_id AND m.message_id > :after_msg_id AND m.is_deleted = 0 '
+    f'AND m."out" = 0 AND m.is_service = 0 '
     f"ORDER BY m.message_id DESC LIMIT :limit"
 )
 _GET_READ_POSITION_SQL = "SELECT read_inbox_max_id FROM synced_dialogs WHERE dialog_id = ?"
@@ -3423,7 +3426,9 @@ class DaemonAPIServer:
 
         Evicts rows older than 30 days on every write to prevent unbounded growth.
         """
-        event = req.get("event", {})
+        event = req.get("event")
+        if not isinstance(event, dict):
+            return {"ok": False, "error": "invalid_input", "message": "event must be a JSON object"}
         tool_name = event.get("tool_name", "")
         if not isinstance(tool_name, str) or len(tool_name) > 200:
             return {"ok": False, "error": "invalid_input", "message": "tool_name must be a string (max 200 chars)"}
@@ -3434,7 +3439,7 @@ class DaemonAPIServer:
                 "has_cursor, page_depth, has_filter, error_type) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    event.get("tool_name"),
+                    tool_name,
                     event.get("timestamp"),
                     event.get("duration_ms"),
                     event.get("result_count"),
@@ -3467,6 +3472,12 @@ class DaemonAPIServer:
         NOTE: the user-supplied message text is intentionally NOT logged at any
         level to avoid accidental disclosure of sensitive context.
         """
+        if self._feedback_conn is None:
+            return {
+                "ok": False,
+                "error": "internal",
+                "message": "feedback database not initialised",
+            }
         message = req.get("message", "")
         if not isinstance(message, str):
             return {"ok": False, "error": "invalid_input", "message": "message must be a string"}
@@ -3898,9 +3909,9 @@ class DaemonAPIServer:
                     (
                         e["id"],
                         e["type"],
-                        e["name"],
+                        e.get("name") or None,
                         e.get("username"),
-                        latinize(e["name"]),
+                        latinize(e["name"]) if e.get("name") else None,
                         now,
                     )
                     for e in entities
