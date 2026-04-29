@@ -1145,6 +1145,69 @@ async def test_list_topics_through_daemon() -> None:
     client.get_entity.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_list_topics_empty_snapshot() -> None:
+    """_list_topics returns empty list when no topic_metadata rows exist."""
+    conn = _make_db_with_topics()
+    client = MagicMock()
+    server = make_server(conn, client)
+
+    result = await server._list_topics({"dialog_id": 456})
+
+    assert result["ok"] is True
+    assert result["data"]["topics"] == []
+    assert result["data"]["dialog_id"] == 456
+    client.get_entity.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_list_topics_hidden_excluded() -> None:
+    """_list_topics excludes rows with hidden=1."""
+    conn = _make_db_with_topics()
+    conn.execute(
+        "INSERT INTO topic_metadata (dialog_id, topic_id, title, updated_at, hidden) "
+        "VALUES (789, 1, 'Visible', 0, 0)"
+    )
+    conn.execute(
+        "INSERT INTO topic_metadata (dialog_id, topic_id, title, updated_at, hidden) "
+        "VALUES (789, 2, 'HiddenTopic', 0, 1)"
+    )
+    conn.commit()
+    client = MagicMock()
+    server = make_server(conn, client)
+
+    result = await server._list_topics({"dialog_id": 789})
+
+    assert result["ok"] is True
+    topic_ids = [t["id"] for t in result["data"]["topics"]]
+    assert 1 in topic_ids
+    assert 2 not in topic_ids, "hidden=1 topic must not appear"
+
+
+@pytest.mark.asyncio
+async def test_list_topics_deleted_excluded() -> None:
+    """_list_topics excludes rows with is_deleted=1."""
+    conn = _make_db_with_topics()
+    conn.execute(
+        "INSERT INTO topic_metadata (dialog_id, topic_id, title, updated_at, is_deleted) "
+        "VALUES (101, 1, 'Active', 0, 0)"
+    )
+    conn.execute(
+        "INSERT INTO topic_metadata (dialog_id, topic_id, title, updated_at, is_deleted) "
+        "VALUES (101, 2, 'Deleted', 0, 1)"
+    )
+    conn.commit()
+    client = MagicMock()
+    server = make_server(conn, client)
+
+    result = await server._list_topics({"dialog_id": 101})
+
+    assert result["ok"] is True
+    topic_ids = [t["id"] for t in result["data"]["topics"]]
+    assert 1 in topic_ids
+    assert 2 not in topic_ids, "is_deleted=1 topic must not appear"
+
+
 # ---------------------------------------------------------------------------
 # get_me — through daemon
 # ---------------------------------------------------------------------------
