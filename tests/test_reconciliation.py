@@ -6,7 +6,7 @@ import logging
 import sqlite3
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from telethon.errors import (
@@ -506,3 +506,79 @@ async def test_recon_loop_full_pass_failure_does_not_advance_last_full_pass(
     )
     # Light pass also runs every iteration.
     assert light_call_count >= 2
+
+
+# --- _refresh_forum_topics tests --------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_refresh_forum_topics_upserts(
+    sync_db: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """_refresh_forum_topics writes topics into topic_metadata via upsert."""
+    # Build a mock entity with forum=True (a Channel)
+    entity = MagicMock()
+    entity.forum = True
+
+    # Build a mock ForumTopic
+    topic = MagicMock()
+    topic.id = 1
+    topic.title = "General"
+    topic.icon_emoji_id = None
+    topic.date = MagicMock()
+    topic.date.timestamp = MagicMock(return_value=1700000000.0)
+
+    mock_result = MagicMock()
+    mock_result.topics = [topic]
+
+    # _refresh_forum_topics calls await self._client(GetForumTopicsRequest(...))
+    # Use AsyncMock for the client so the call is awaitable
+    client = AsyncMock()
+    client.return_value = mock_result
+
+    worker = DialogReconciliationWorker(client, sync_db, shutdown_event)
+    count = await worker._refresh_forum_topics(dialog_id=999, entity=entity)
+
+    assert count == 1
+    row = sync_db.execute(
+        "SELECT title FROM topic_metadata WHERE dialog_id=999 AND topic_id=1"
+    ).fetchone()
+    assert row is not None, "topic_metadata row must exist after refresh"
+    assert row[0] == "General"
+
+
+@pytest.mark.asyncio
+async def test_light_pass_refreshes_forum_topics(
+    sync_db: sqlite3.Connection,
+    mock_client: MagicMock,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """run_light_pass calls _refresh_forum_topics for forum=True dialogs."""
+    # Seed a forum dialog with needs_refresh=1
+    _seed_dialog_row(sync_db, 777, name="Forum Group", needs_refresh=1)
+
+    # get_entity returns an entity with forum=True
+    forum_entity = MagicMock()
+    forum_entity.forum = True
+    forum_entity.first_name = None
+    forum_entity.last_name = None
+    forum_entity.title = "Forum Group"
+    forum_entity.username = None
+    forum_entity.participants_count = None
+    forum_entity.date = None
+    mock_client.get_entity = AsyncMock(return_value=forum_entity)
+
+    # client(GetForumTopicsRequest(...)) returns empty topics
+    mock_result = MagicMock()
+    mock_result.topics = []
+    mock_client.return_value = mock_result
+    mock_client.side_effect = None
+
+    worker = DialogReconciliationWorker(mock_client, sync_db, shutdown_event)
+    with patch.object(
+        worker, "_refresh_forum_topics", wraps=worker._refresh_forum_topics
+    ) as spy:
+        await worker.run_light_pass()
+
+    spy.assert_called_once_with(777, forum_entity)
