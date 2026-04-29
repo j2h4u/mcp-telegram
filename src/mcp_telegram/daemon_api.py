@@ -160,7 +160,7 @@ def _read_state_for_dialog(conn: sqlite3.Connection, dialog_id: int, dialog_type
           MIN(CASE WHEN m.out = 0 AND m.message_id > COALESCE((SELECT in_c FROM sd), -1)  THEN m.sent_at END) AS in_min,
           MIN(CASE WHEN m.out = 1 AND m.message_id > COALESCE((SELECT out_c FROM sd), -1) THEN m.sent_at END) AS out_min
         FROM messages m
-        WHERE m.dialog_id = :dialog_id AND m.is_deleted = 0
+        WHERE m.dialog_id = :dialog_id AND m.is_deleted = 0 AND m.is_service = 0
         """,
         {"dialog_id": dialog_id},
     ).fetchone()
@@ -457,7 +457,7 @@ _BATCHED_UNREAD_COUNTS_SQL = (
     'SUM(CASE WHEN m."out" = 1 AND m.message_id > COALESCE(sd.read_outbox_max_id, -1) '
     "THEN 1 ELSE 0 END) AS unread_out "
     "FROM messages m JOIN synced_dialogs sd USING(dialog_id) "
-    "WHERE sd.status = 'synced' AND m.is_deleted = 0 "
+    "WHERE sd.status = 'synced' AND m.is_deleted = 0 AND m.is_service = 0 "
     "GROUP BY m.dialog_id"
 )
 
