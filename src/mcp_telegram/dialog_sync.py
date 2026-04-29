@@ -58,6 +58,7 @@ from telethon.errors import (  # type: ignore[import-untyped]
     UserBannedInChannelError,
     UserKickedError,
 )
+from telethon.tl.functions.messages import GetForumTopicsRequest  # type: ignore[import-untyped]
 from telethon.tl import types  # type: ignore[import-untyped]
 from telethon.tl.types import (  # type: ignore[import-untyped]
     InputPeerChannel,
@@ -173,6 +174,24 @@ def _set_access_lost(
 _SELECT_DIRTY_DIALOGS_SQL = (
     "SELECT dialog_id FROM dialogs WHERE needs_refresh = 1 AND hidden = 0"
 )
+
+_UPSERT_TOPIC_FROM_RECON_SQL = """
+INSERT INTO topic_metadata
+    (dialog_id, topic_id, title, top_message_id,
+     is_general, is_deleted, updated_at,
+     icon_emoji_id, pinned, hidden, snapshot_at, date)
+VALUES
+    (:dialog_id, :topic_id, :title, NULL,
+     0, 0, :updated_at,
+     :icon_emoji_id, 0, 0, :snapshot_at, :date)
+ON CONFLICT(dialog_id, topic_id) DO UPDATE SET
+    title          = COALESCE(excluded.title, topic_metadata.title),
+    icon_emoji_id  = COALESCE(excluded.icon_emoji_id, topic_metadata.icon_emoji_id),
+    updated_at     = excluded.updated_at,
+    snapshot_at    = excluded.snapshot_at
+WHERE topic_metadata.snapshot_at IS NULL
+   OR topic_metadata.snapshot_at < excluded.snapshot_at
+"""
 _UPDATE_DIALOG_ENTITY_SQL = (
     "UPDATE dialogs "
     "SET name=?, type=?, members=?, created=?, needs_refresh=0, snapshot_at=? "
@@ -634,6 +653,12 @@ class DialogReconciliationWorker:
                         ),
                     )
                 count += 1
+                if getattr(entity, "forum", False):
+                    topic_count = await self._refresh_forum_topics(dialog_id, entity)
+                    logger.debug(
+                        "recon_light_pass_forum_topics dialog_id=%d count=%d",
+                        dialog_id, topic_count,
+                    )
             except FloodWaitError as exc:
                 wait_s = int(getattr(exc, "seconds", 60) or 60)
                 logger.warning(
@@ -713,6 +738,14 @@ class DialogReconciliationWorker:
                     self._conn.execute(_UPSERT_DIALOG_SQL, row)
                 seen_ids.add(int(dialog.id))
                 count += 1
+                if getattr(dialog.entity, "forum", False):
+                    topic_count = await self._refresh_forum_topics(
+                        int(dialog.id), dialog.entity
+                    )
+                    logger.debug(
+                        "recon_full_pass_forum_topics dialog_id=%d count=%d",
+                        int(dialog.id), topic_count,
+                    )
         except FloodWaitError as exc:
             wait_s = int(getattr(exc, "seconds", 60) or 60)
             logger.warning(
@@ -737,6 +770,78 @@ class DialogReconciliationWorker:
             count, len(missing),
         )
         return count, True
+
+    async def _refresh_forum_topics(
+        self,
+        dialog_id: int,
+        entity: Any,
+    ) -> int:
+        """Fetch topics for a forum supergroup and upsert into topic_metadata.
+
+        Called from run_light_pass after entity is already fetched. Handles
+        FloodWaitError by sleeping (interruptible by shutdown_event) and returning 0.
+        Non-forum entities must not be passed — callers must guard with
+        getattr(entity, 'forum', False).
+
+        Returns count of topics written.
+        """
+        try:
+            result = await self._client(
+                GetForumTopicsRequest(
+                    peer=entity,
+                    offset_date=None,
+                    offset_id=0,
+                    offset_topic=0,
+                    limit=100,
+                )
+            )
+        except FloodWaitError as exc:
+            wait_s = int(getattr(exc, "seconds", 60) or 60)
+            logger.warning(
+                "recon_forum_topics_flood_wait dialog_id=%d wait=%ds",
+                dialog_id, wait_s,
+            )
+            try:
+                await asyncio.wait_for(
+                    self._shutdown_event.wait(), timeout=float(wait_s)
+                )
+            except TimeoutError:
+                pass
+            return 0
+        except Exception as exc:
+            logger.warning(
+                "recon_forum_topics_fetch_failed dialog_id=%d error=%s",
+                dialog_id, exc,
+            )
+            return 0
+
+        topics = getattr(result, "topics", []) or []
+        # NOTE: hard cap of 100 topics per GetForumTopicsRequest (Telegram limit).
+        # Forums with >100 topics will silently drop topics beyond the first 100.
+        # This matches the pre-existing _list_topics limit=100 behaviour.
+        now = int(time.time())
+        rows = []
+        for t in topics:
+            rows.append({
+                "dialog_id": dialog_id,
+                "topic_id": int(t.id),
+                "title": getattr(t, "title", None) or "",
+                "icon_emoji_id": getattr(t, "icon_emoji_id", None),
+                "updated_at": now,
+                "snapshot_at": now,
+                "date": int(t.date.timestamp())
+                if hasattr(getattr(t, "date", None), "timestamp")
+                else getattr(t, "date", None),
+            })
+        # Batch all upserts in a single transaction for atomicity and performance.
+        with self._conn:
+            for row in rows:
+                self._conn.execute(_UPSERT_TOPIC_FROM_RECON_SQL, row)
+        count = len(rows)
+        logger.info(
+            "recon_forum_topics_complete dialog_id=%d count=%d", dialog_id, count
+        )
+        return count
 
 
 async def run_reconciliation_loop(
