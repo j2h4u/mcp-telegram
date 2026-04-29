@@ -394,6 +394,58 @@ _SELECT_SYNCED_STATUSES_SQL = (
 # NULL cursor → "[inbox: unknown (sync pending)]" (D-03) — the two semantics
 # diverge intentionally.
 #
+# Phase 44 (LISTDIALOGS-04): stale-snapshot threshold. Computed against
+# MAX(dialogs.snapshot_at WHERE hidden=0). Returned in response.data as
+# snapshot_age_h: int (hours) when stale, None when fresh or unknown.
+#
+# NOTE (RESEARCH.md Assumption A2): MAX(snapshot_at) is OPTIMISTIC.
+# Even one recently-refreshed dialog will make the whole snapshot appear
+# fresh, hiding the case where the majority of rows are stale. This is
+# accepted in v1.6: the reconciliation watermark and per-row staleness
+# would be more accurate, but require additional schema and reconciliation
+# changes that are out of scope. The agent-facing UX is "if stale, surface
+# one number; otherwise stay quiet" and MAX is the simplest signal that
+# satisfies that contract. Revisit if user feedback shows the optimistic
+# bias misleads agents (track in beads, not here).
+_SNAPSHOT_STALE_THRESHOLD_S = 12 * 3600
+
+
+def _compute_snapshot_age_h(max_snapshot_at: int | None) -> int | None:
+    """Return integer hours since the freshest snapshot, or None when fresh/unknown.
+
+    Per Assumption A2 (RESEARCH.md): MAX(snapshot_at) is the freshest row's
+    timestamp, not a watermark. One refreshed row makes the whole snapshot
+    appear fresh — accepted trade-off for v1.6.
+    """
+    if max_snapshot_at is None:
+        return None
+    age_s = int(time.time()) - int(max_snapshot_at)
+    if age_s > _SNAPSHOT_STALE_THRESHOLD_S:
+        return age_s // 3600
+    return None
+
+
+# Phase 44 (LISTDIALOGS-01/02/04, DIFF-04): pure-SQL dialog list.
+# LEFT JOIN synced_dialogs to preserve sync_status/total_messages/access_lost_at.
+# `:name_pat` is a Python-lowered LIKE pattern (e.g. "%женск%") OR None for
+# no pre-filter. Cyrillic case-folding is delegated to the Python fuzzy pass
+# because SQLite LOWER() is ASCII-only — see RESEARCH.md Pitfall 1.
+# `:archived_filter` and `:pinned_filter` are 0 (filter rows where col=0)
+# or None (no filter). See filter_design_contract in 44-01-PLAN.md.
+_LIST_DIALOGS_SQL = (
+    "SELECT d.dialog_id, d.name, d.type, d.archived, d.pinned, "
+    "d.members, d.created, d.last_message_at, d.snapshot_at, "
+    "d.unread_mentions_count, d.unread_reactions_count, d.draft_text, "
+    "sd.status AS sync_status, sd.total_messages, sd.access_lost_at "
+    "FROM dialogs d "
+    "LEFT JOIN synced_dialogs sd USING(dialog_id) "
+    "WHERE d.hidden = 0 "
+    "AND (:archived_filter IS NULL OR d.archived = :archived_filter) "
+    "AND (:pinned_filter IS NULL OR d.pinned = :pinned_filter) "
+    "AND (:name_pat IS NULL OR LOWER(d.name) LIKE :name_pat ESCAPE '\\') "
+    "ORDER BY d.pinned DESC, d.last_message_at DESC"
+)
+
 # Contract note (WR-06): results of this query are emitted on `list_dialogs`
 # rows as `unread_in` / `unread_out` ONLY for DMs (type == "User"). Non-DM
 # rows OMIT both keys entirely. See the inline comment in `_list_dialogs`
@@ -1735,144 +1787,178 @@ class DaemonAPIServer:
     # ------------------------------------------------------------------
 
     async def _list_dialogs(self, req: dict) -> dict:
-        """Return live dialog list from Telegram enriched with sync_status.
+        """Return dialog list from the local dialogs snapshot (pure SQL, zero Telegram calls).
 
-        Request: exclude_archived (bool), ignore_pinned (bool).
-        Response data: {"dialogs": [{"id", "name", "type", "last_message_at",
-        "unread_count", "members", "created", "sync_status"}, ...]}.
+        Implements LISTDIALOGS-01 (no iter_dialogs), LISTDIALOGS-02/03 (SQL LIKE pre-filter
+        + Python fuzzy pass with ASCII acronym safety-net retry), LISTDIALOGS-04 (snapshot
+        staleness annotation), and DIFF-04 (per-row unread_mentions_count, unread_reactions_count,
+        draft_text fields added to daemon response for Plan 02 renderer).
+
+        Request keys:
+          exclude_archived (bool, default False) — WHERE archived=0 clause
+          ignore_pinned    (bool, default False) — WHERE pinned=0 clause (row filter)
+          filter           (str|None)            — name filter (SQL LIKE + Python fuzzy)
+
+        Response data:
+          dialogs          list of dialog dicts
+          snapshot_age_h   int (hours) when MAX(snapshot_at) > 12h old, else None
+          bootstrap_pending bool — True only when dialogs table has zero rows (sync not started)
+
+        WR-06 contract preserved: User rows carry unread_in/unread_out; non-User rows omit both.
         """
-        # Load current sync statuses for O(1) lookup. Plan 39.3-03 Task 4:
-        # tuple now includes read cursors for use by the DM unread enrichment.
-        synced_rows = self._conn.execute(_SELECT_SYNCED_STATUSES_SQL).fetchall()
-        synced_meta: dict[int, tuple[str, int | None, int | None, int | None, int | None]] = {
-            row[0]: (row[1], row[2], row[3], row[4], row[5]) for row in synced_rows
-        }
+        # -- param extraction -------------------------------------------------
+        exclude_archived: bool = bool(req.get("exclude_archived", False))
+        ignore_pinned: bool = bool(req.get("ignore_pinned", False))
+        name_filter_raw: str | None = req.get("filter")
+
+        # -- filter_norm + SQL LIKE pattern -----------------------------------
+        # Empty / whitespace-only filter treated as no filter.
+        # ASCII filter: SQL LIKE pre-filter + Python fuzzy pass.
+        # Cyrillic filter: LIKE skipped (SQLite LOWER() is ASCII-only per RESEARCH.md
+        # Pitfall 1, Assumption A1); Python fuzzy pass runs on the unfiltered SQL set.
+        filter_norm: str | None = None
+        name_pat: str | None = None
+        if name_filter_raw is not None:
+            stripped = name_filter_raw.strip()
+            if stripped:
+                filter_norm = latinize(stripped)
+                if stripped.isascii():
+                    # Escape LIKE-special chars before wrapping in %...%
+                    esc = (
+                        stripped.lower()
+                        .replace("\\", "\\\\")
+                        .replace("%", "\\%")
+                        .replace("_", "\\_")
+                    )
+                    name_pat = f"%{esc}%"
+                # else: Cyrillic — leave name_pat=None, Python pass handles it
+
+        # -- SQL bind params --------------------------------------------------
+        archived_filter: int | None = 0 if exclude_archived else None
+        pinned_filter: int | None = 0 if ignore_pinned else None
+
+        # -- pre-load enrichment maps (unchanged from pre-rewrite) ------------
         local_counts: dict[int, int] = dict(self._conn.execute(_COUNT_MESSAGES_BY_DIALOG_SQL).fetchall())
-        # Plan 39.3-03 Task 4 (AC-11, AC-12): batched per-dialog (unread_in, unread_out).
-        # Single GROUP BY pass — hits the messages PRIMARY KEY B-tree. Only populated
-        # for DM dialogs in the response loop below (non-DM rows omit both keys).
+        # Plan 39.3-03 Task 4 (AC-11, WR-06): batched per-dialog (unread_in, unread_out).
+        # Single GROUP BY pass — hits the messages PRIMARY KEY B-tree.
         unread_counts: dict[int, tuple[int, int]] = {
             row[0]: (int(row[1] or 0), int(row[2] or 0))
             for row in self._conn.execute(_BATCHED_UNREAD_COUNTS_SQL).fetchall()
         }
 
-        exclude_archived: bool = req.get("exclude_archived", False)
-        ignore_pinned: bool = req.get("ignore_pinned", False)
-        name_filter_raw: str | None = req.get("filter")
+        # -- main SQL query ---------------------------------------------------
+        params: dict = {
+            "archived_filter": archived_filter,
+            "pinned_filter": pinned_filter,
+            "name_pat": name_pat,
+        }
+        sql_rows = self._conn.execute(_LIST_DIALOGS_SQL, params).fetchall()
 
-        # Prepare fuzzy filter state. Empty / whitespace-only filter is treated
-        # as no filter. We normalize via `latinize` (same as resolver) so the
-        # comparison is case- and script-insensitive. Matching strategy:
-        #   1. substring in normalized space — captures the typical "give me
-        #      anything with 'женск'" intent without surprising fuzzy expansion
-        #   2. Word-initials match — short queries (2-4 chars) treated as
-        #      acronyms against word-initial sequences of the dialog name
-        #      (e.g. "ЖС" → "zs" hits "KS x Женские Сезоны" which initials to "kxzs").
-        #   3. rapidfuzz.partial_ratio >= 80 fallback for queries AND targets ≥ 4 chars.
-        filter_norm: str | None = None
-        if name_filter_raw is not None:
-            stripped = name_filter_raw.strip()
-            if stripped:
-                filter_norm = latinize(stripped)
+        # ASCII acronym safety net (per filter_design_contract, REVIEWS Concern 1):
+        # If the LIKE pre-filter was active and returned nothing, but the caller
+        # supplied a non-empty filter, retry without LIKE so the Python fuzzy
+        # pass can still match acronyms like "KJ" -> "Kitchen Journal".
+        if not sql_rows and name_pat is not None and filter_norm:
+            params_retry = {**params, "name_pat": None}
+            sql_rows = self._conn.execute(_LIST_DIALOGS_SQL, params_retry).fetchall()
 
-        archived_filter = False if exclude_archived else None
+        # -- bootstrap-empty path (REVIEWS Concern 2) -------------------------
+        # bootstrap_pending=True means the table is truly empty (sync hasn't run).
+        # COUNT(*) includes hidden rows — a table with only hidden rows is NOT
+        # bootstrap-pending (sync has run, the rows are simply hidden/excluded).
+        if not sql_rows:
+            count_total = self._conn.execute("SELECT COUNT(*) FROM dialogs").fetchone()[0]
+            if count_total == 0:
+                return {"ok": True, "data": {
+                    "dialogs": [],
+                    "snapshot_age_h": None,
+                    "bootstrap_pending": True,
+                }}
+            return {"ok": True, "data": {
+                "dialogs": [],
+                "snapshot_age_h": None,
+                "bootstrap_pending": False,
+            }}
 
-        dialogs = []
-        try:
-            async for d in self._client.iter_dialogs(
-                archived=archived_filter,
-                ignore_pinned=ignore_pinned,
-            ):
-                entity = getattr(d, "entity", None)
-                entity_type = _classify_dialog_type(entity)
+        # -- build result list ------------------------------------------------
+        dialogs: list[dict] = []
+        max_snapshot: int | None = None
 
-                # Name filter (tool-level convenience: Telethon iter_dialogs has
-                # no server-side filter — we scan everything and screen here).
-                # Match order (first-hit wins):
-                #   1. Substring in latinized space — primary. "женск" hits
-                #      "Женские сезоны" cleanly.
-                #   2. Word-initials match — short upper/mixed queries treated as
-                #      acronyms. "ЖС" → initials "zs" → matches any dialog whose
-                #      word-initial sequence contains "zs" (e.g. "KS x Женские
-                #      Сезоны" → initials "kxzs").
-                #   3. rapidfuzz.partial_ratio ≥ 80 — typo-tolerant fallback for
-                #      queries AND targets ≥ 4 chars (avoids short-name noise).
-                if filter_norm is not None:
-                    raw_name = getattr(d, "name", None) or ""
-                    if not raw_name:
-                        continue
-                    name_norm = latinize(raw_name)
-                    # Acronym initials use raw case-folded chars — latinizing
-                    # would expand "Ж" to "zh" and break single-char-per-word matching.
-                    name_initials_raw = "".join(w[0] for w in raw_name.split() if w).lower()
-                    filter_raw_lc = (name_filter_raw or "").strip().lower()
-                    if filter_norm in name_norm:
-                        pass
-                    elif 2 <= len(filter_raw_lc) <= 4 and filter_raw_lc in name_initials_raw:
-                        pass  # acronym hit ("ЖС" → "жс" ⊆ "kxжс")
-                    elif (
-                        len(filter_norm) >= 4
-                        and len(name_norm) >= 4
-                        and _fuzz.partial_ratio(filter_norm, name_norm) >= 80
-                    ):
-                        pass  # typo-tolerant fuzzy hit
-                    else:
-                        continue
-                last_msg_at: int | None = None
-                if getattr(d, "date", None) is not None:
-                    try:
-                        last_msg_at = int(d.date.timestamp())
-                    except Exception:
-                        last_msg_at = None
-                members = getattr(entity, "participants_count", None) if entity is not None else None
-                created_ts: int | None = None
-                entity_date = getattr(entity, "date", None)
-                if entity_date is not None:
-                    try:
-                        created_ts = int(entity_date.timestamp())
-                    except Exception:
-                        pass
+        for sql_row in sql_rows:
+            (
+                d_id, d_name, d_type, d_archived, d_pinned,
+                d_members, d_created, d_last_at, d_snapshot_at,
+                d_mentions, d_reactions, d_draft,
+                sd_status, sd_total, sd_access_lost,
+            ) = sql_row
 
-                sync_meta_row = synced_meta.get(d.id, ("not_synced", None, None, None, None))
-                sync_status = sync_meta_row[0]
-                total_messages = sync_meta_row[1]
-                access_lost_at = sync_meta_row[2]
-                local_count = local_counts.get(d.id, 0)
-                coverage_pct = _compute_sync_coverage(total_messages, local_count)
-                row: dict = {
-                    "id": d.id,
-                    "name": getattr(d, "name", None),
-                    "type": entity_type,
-                    "last_message_at": last_msg_at,
-                    "unread_count": getattr(d, "unread_count", 0),
-                    "members": members,
-                    "created": created_ts,
-                    "sync_status": sync_status,
-                    "sync_coverage_pct": coverage_pct,
-                    "access_lost_at": access_lost_at,
-                }
-                # Plan 39.3-03 Task 4: include unread_in / unread_out ONLY for DMs
-                # (dialog_type == "User"). Non-DM rows OMIT both keys (AC-11).
-                #
-                # DAEMON API CONTRACT (WR-06): `unread_in` and `unread_out` are
-                # PRESENT only on rows where `type == "User"`. For non-DM rows
-                # (Bot / Group / Channel / Forum / Chat / Unknown) the keys are
-                # ABSENT — not set to None, not set to 0. Consumers must
-                # distinguish "missing key" (non-DM, counts undefined) from
-                # "present with value 0" (DM with nothing unread) using
-                # membership tests (e.g. `"unread_in" in d`) or `.get()` with
-                # an explicit sentinel. This is the canonical contract; the
-                # `ListDialogs` tool docstring mirrors it for the public surface.
-                if entity_type == "User":
-                    in_cnt, out_cnt = unread_counts.get(d.id, (0, 0))
-                    row["unread_in"] = in_cnt
-                    row["unread_out"] = out_cnt
-                dialogs.append(row)
-        except Exception as exc:
-            logger.warning("list_dialogs_telegram_error error=%s", exc, exc_info=True)
-            return {"ok": False, "error": "telegram_error", "message": "failed to list dialogs"}
+            # -- Python fuzzy filter (Pass 2) ---------------------------------
+            # Runs when filter_norm is set (Cyrillic input: always;
+            # ASCII input: only when name_pat is already narrow or retry path ran).
+            # Match order: substring -> acronym -> partial_ratio.
+            if filter_norm is not None:
+                raw_name = d_name or ""
+                if not raw_name:
+                    continue
+                name_norm = latinize(raw_name)
+                # Acronym initials use raw case-folded chars — latinizing would
+                # expand "Ж" to "zh" and break single-char-per-word matching.
+                name_initials_raw = "".join(w[0] for w in raw_name.split() if w).lower()
+                filter_raw_lc = (name_filter_raw or "").strip().lower()
+                if filter_norm in name_norm:
+                    pass  # substring hit
+                elif 2 <= len(filter_raw_lc) <= 4 and filter_raw_lc in name_initials_raw:
+                    pass  # acronym hit ("ЖС" -> "жс" ⊆ "kxжс")
+                elif (
+                    len(filter_norm) >= 4
+                    and len(name_norm) >= 4
+                    and _fuzz.partial_ratio(filter_norm, name_norm) >= 75
+                ):
+                    pass  # typo-tolerant fuzzy hit
+                else:
+                    continue
 
-        return {"ok": True, "data": {"dialogs": dialogs}}
+            # -- accumulate max_snapshot_at (over visible+filtered rows) ------
+            if d_snapshot_at is not None:
+                if max_snapshot is None or d_snapshot_at > max_snapshot:
+                    max_snapshot = d_snapshot_at
+
+            # -- sync coverage ------------------------------------------------
+            coverage_pct = _compute_sync_coverage(sd_total, local_counts.get(d_id, 0))
+
+            # -- row dict (DIFF-04: three new fields added) --------------------
+            row: dict = {
+                "id": d_id,
+                "name": d_name,
+                "type": d_type,
+                "last_message_at": d_last_at,
+                "unread_count": 0,  # legacy key — iter_dialogs value gone; kept for compat
+                "members": d_members,
+                "created": d_created,
+                "sync_status": sd_status if sd_status is not None else "not_synced",
+                "sync_coverage_pct": coverage_pct,
+                "access_lost_at": sd_access_lost,
+                # DIFF-04: per-row snapshot fields (Plan 02 renderer decides display)
+                "unread_mentions_count": int(d_mentions or 0),
+                "unread_reactions_count": int(d_reactions or 0),
+                "draft_text": d_draft,
+            }
+
+            # WR-06 contract: unread_in/unread_out ONLY on User (DM) rows.
+            # Non-DM rows OMIT both keys entirely — not None, not 0.
+            if d_type == "User":
+                in_cnt, out_cnt = unread_counts.get(d_id, (0, 0))
+                row["unread_in"] = in_cnt
+                row["unread_out"] = out_cnt
+
+            dialogs.append(row)
+
+        snapshot_age_h = _compute_snapshot_age_h(max_snapshot)
+        return {"ok": True, "data": {
+            "dialogs": dialogs,
+            "snapshot_age_h": snapshot_age_h,
+            "bootstrap_pending": False,
+        }}
 
     # ------------------------------------------------------------------
     # list_topics
