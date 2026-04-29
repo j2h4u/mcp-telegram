@@ -5,6 +5,7 @@ from pydantic import Field
 logger = logging.getLogger(__name__)
 
 from ..errors import (
+    bootstrap_pending_text,
     no_active_topics_text,
     no_dialogs_text,
 )
@@ -70,6 +71,16 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
     dialogs = data.get("dialogs", [])
 
     if not dialogs:
+        # Phase 44 (Plan 01 contract): bootstrap_pending=True => dialogs table is
+        # empty (sync hasn't populated yet — SELECT COUNT(*) FROM dialogs = 0).
+        # Render a sync-pending banner; bootstrap_pending=False => truly no
+        # matches (e.g. caller's filter excluded all rows in a populated
+        # table) -> preserve the existing no_dialogs_text behavior.
+        if data.get("bootstrap_pending"):
+            return ToolResult(
+                content=_text_response(bootstrap_pending_text()),
+                result_count=0,
+            )
         return ToolResult(content=_text_response(no_dialogs_text()))
 
     entity_dicts: list[dict] = []
@@ -109,15 +120,40 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
         if "unread_in" in d and "unread_out" in d:
             unread_rw_str = f" unread_in={d['unread_in']} unread_out={d['unread_out']}"
 
+        # Phase 44 DIFF-04: inline mentions/reactions/draft tokens.
+        # Zero / empty values are SUPPRESSED (no `mentions=0` noise).
+        # Note: draft text containing double quotes is rendered as-is — accepted
+        # cosmetic behavior (threat-model T-44-07 in 44-02-PLAN.md). The renderer
+        # output is text-only for an LLM; no parser interprets the format.
+        diff_parts: list[str] = []
+        mentions_n = d.get("unread_mentions_count", 0)
+        reactions_n = d.get("unread_reactions_count", 0)
+        draft = d.get("draft_text") or ""
+        if mentions_n:
+            diff_parts.append(f"mentions={mentions_n}")
+        if reactions_n:
+            diff_parts.append(f"reactions={reactions_n}")
+        if draft:
+            diff_parts.append(f'draft="{draft}"')
+        diff_suffix = (" " + " ".join(diff_parts)) if diff_parts else ""
+
         lines.append(
             f"name='{dialog_name}' id={dialog_id} type={dialog_type} "
             f"last_message_at={last_at} unread={unread_count}{meta} "
-            f"sync_status={sync_status}{coverage_str}{access_str}{unread_rw_str}"
+            f"sync_status={sync_status}{coverage_str}{access_str}{unread_rw_str}{diff_suffix}"
         )
 
         # Upsert entities into daemon for future name resolution
         if isinstance(dialog_id, int) and isinstance(dialog_name, str):
             entity_dicts.append({"id": dialog_id, "type": dialog_type, "name": dialog_name, "username": None})
+
+    # Phase 44 LISTDIALOGS-04: trailing snapshot-age annotation. None => fresh
+    # (or unknown — same UX). One line, after all rows. Per RESEARCH.md
+    # Assumption A2 the underlying MAX(snapshot_at) is optimistic; this is
+    # documented in daemon_api.py near _SNAPSHOT_STALE_THRESHOLD_S.
+    snapshot_age_h = data.get("snapshot_age_h")
+    if snapshot_age_h is not None:
+        lines.append(f"[snapshot_age={snapshot_age_h}h — data may be stale]")
 
     if entity_dicts:
         try:

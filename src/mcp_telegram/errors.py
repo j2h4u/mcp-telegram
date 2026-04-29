@@ -189,6 +189,18 @@ def no_dialogs_text() -> str:
     )
 
 
+def bootstrap_pending_text() -> str:
+    """Return text shown when the local dialogs snapshot is empty
+    because sync hasn't populated it yet (Plan 01 contract:
+    bootstrap_pending=True => SELECT COUNT(*) FROM dialogs = 0).
+
+    Co-located with no_dialogs_text() — errors.py already owns
+    user-facing empty/state fallback strings (REVIEWS divergent-views
+    consensus).
+    """
+    return "[sync in progress — dialog list will grow as sync completes]"
+
+
 def no_unread_personal_text() -> str:
     """Return text for empty unread in personal scope."""
     return action_text(
