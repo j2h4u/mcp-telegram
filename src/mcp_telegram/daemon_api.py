@@ -528,7 +528,9 @@ _COLLECT_UNREAD_DIALOGS_WITH_COUNTS_SQL = (
     "(SELECT COUNT(*) FROM messages m "
     " WHERE m.dialog_id = sd.dialog_id "
     "   AND m.message_id > sd.read_inbox_max_id "
-    "   AND m.is_deleted = 0) AS unread_count "
+    "   AND m.is_deleted = 0"
+    '   AND m."out" = 0'
+    "   AND m.is_service = 0) AS unread_count "
     "FROM synced_dialogs sd "
     "LEFT JOIN entities e ON e.id = sd.dialog_id "
     "WHERE sd.status = 'synced' "
@@ -540,7 +542,8 @@ _FETCH_UNREAD_MESSAGES_SQL = (
     f"{EFFECTIVE_SENDER_ID_SQL}, m.is_service, m.out, m.dialog_id "
     f"FROM messages m "
     f"{_SENDER_ENTITY_JOINS_SQL}"
-    f"WHERE m.dialog_id = :dialog_id AND m.message_id > :after_msg_id AND m.is_deleted = 0 "
+    f'WHERE m.dialog_id = :dialog_id AND m.message_id > :after_msg_id AND m.is_deleted = 0 '
+    f'AND m."out" = 0 AND m.is_service = 0 '
     f"ORDER BY m.message_id DESC LIMIT :limit"
 )
 _GET_READ_POSITION_SQL = "SELECT read_inbox_max_id FROM synced_dialogs WHERE dialog_id = ?"

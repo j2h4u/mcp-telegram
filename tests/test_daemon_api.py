@@ -1962,6 +1962,66 @@ async def test_list_unread_messages_response_reports_bootstrap_pending() -> None
     client.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_list_unread_messages_excludes_outgoing_and_service_messages() -> None:
+    """Regression: CR-01 — out=1 and is_service=1 messages above read_inbox_max_id
+    must NOT count as unread and must NOT appear in the returned message list.
+    The inbox cursor (read_inbox_max_id) only tracks incoming messages, so
+    outgoing and service messages with higher IDs are semantically already-read.
+    """
+    import time as _time
+
+    conn = _make_db()
+    _seed_unread_state(conn, 1001, read_inbox_max_id=10, entity_type="User", entity_name="Alice")
+    # Incoming message above cursor — should be counted and returned
+    conn.execute(
+        "INSERT INTO messages "
+        "(dialog_id, message_id, sent_at, text, sender_id, sender_first_name, is_deleted, out, is_service) "
+        "VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0)",
+        (1001, 11, int(_time.time()), "incoming", 99, "Alice"),
+    )
+    # Outgoing message above cursor — must NOT count as unread
+    conn.execute(
+        "INSERT INTO messages "
+        "(dialog_id, message_id, sent_at, text, sender_id, sender_first_name, is_deleted, out, is_service) "
+        "VALUES (?, ?, ?, ?, ?, ?, 0, 1, 0)",
+        (1001, 12, int(_time.time()), "outgoing", 0, "Me"),
+    )
+    # Service message above cursor — must NOT count as unread
+    conn.execute(
+        "INSERT INTO messages "
+        "(dialog_id, message_id, sent_at, text, sender_id, sender_first_name, is_deleted, out, is_service) "
+        "VALUES (?, ?, ?, ?, ?, ?, 0, 0, 1)",
+        (1001, 13, int(_time.time()), "", None, None),
+    )
+    conn.commit()
+
+    client = MagicMock()
+    server = make_server(conn, client)
+
+    result = await server._dispatch(
+        {
+            "method": "get_inbox",
+            "scope": "personal",
+            "limit": 100,
+            "group_size_threshold": 100,
+        }
+    )
+
+    assert result["ok"] is True, f"Expected ok=True, got {result}"
+    groups = result["data"]["groups"]
+    assert len(groups) == 1, f"Expected 1 dialog group, got {len(groups)}"
+    group = groups[0]
+    assert group["unread_count"] == 1, (
+        f"Expected unread_count=1 (only incoming), got {group['unread_count']}"
+    )
+    returned_ids = [m["message_id"] for m in group["messages"]]
+    assert 11 in returned_ids, "Incoming message (id=11) must appear in results"
+    assert 12 not in returned_ids, "Outgoing message (id=12) must NOT appear in inbox"
+    assert 13 not in returned_ids, "Service message (id=13) must NOT appear in inbox"
+    client.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # Helpers for Plan 33-01 tests (entities + telemetry tables)
 # ---------------------------------------------------------------------------
