@@ -3511,7 +3511,7 @@ class DaemonAPIServer:
             return {"ok": False, "error": "invalid_input", "message": "harness too long (max 200 chars)"}
 
         try:
-            self._feedback_conn.execute(
+            cur = self._feedback_conn.execute(
                 "INSERT INTO feedback (submitted_at, message, severity, context, model, harness) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
                 (
@@ -3524,7 +3524,7 @@ class DaemonAPIServer:
                 ),
             )
             self._feedback_conn.commit()
-            return {"ok": True, "data": {"message": "Feedback recorded. Thank you!"}}
+            return {"ok": True, "data": {"message": "Feedback recorded. Thank you!", "id": cur.lastrowid}}
         except Exception as exc:
             logger.error("submit_feedback failed: %s", exc, exc_info=True)
             return {"ok": False, "error": "internal", "message": "internal error"}

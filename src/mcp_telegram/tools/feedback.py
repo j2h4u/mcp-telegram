@@ -48,7 +48,7 @@ class SubmitFeedback(ToolArgs):
                 the maintainer correlate feedback with model versions.
       harness:  optional. Your client name (e.g. "Claude Desktop", "Cursor",
                 "Codex CLI"). Helps the maintainer prioritise client-specific
-                issues.
+                issues. Up to 200 chars.
 
     Submissions are fire-and-forget — there is no follow-up tool, no
     tracking ID, and no read access for agents. The maintainer reviews
@@ -99,5 +99,6 @@ async def submit_feedback(args: SubmitFeedback) -> ToolResult:
         return err
 
     data = response.get("data", {})
-    confirmation = data.get("message", "Feedback recorded.")
-    return ToolResult(content=_text_response(confirmation), result_count=1)
+    feedback_id = data.get("id")
+    suffix = f" id={feedback_id}" if feedback_id is not None else ""
+    return ToolResult(content=_text_response(f"Feedback recorded. Thank you!{suffix}"), result_count=1)
