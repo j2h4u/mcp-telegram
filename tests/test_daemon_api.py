@@ -508,7 +508,9 @@ async def test_list_messages_name_resolution() -> None:
 @pytest.mark.asyncio
 async def test_list_messages_name_resolution_not_found() -> None:
     """list_messages returns error when dialog name cannot be resolved."""
-    conn = _make_db()
+    # Use _make_db_with_dialogs() — dialogs table exists since schema v17 (Phase 41)
+    # and is always present in production. Step 2.5 queries this table.
+    conn = _make_db_with_dialogs()
 
     client = MagicMock()
     client.get_entity = AsyncMock(side_effect=ValueError("Not found"))

@@ -996,7 +996,10 @@ class DaemonAPIServer:
         Resolution order (fastest-first):
         1. client.get_entity() — handles @username, phone, invite link.
         2. entities table — exact/normalized/substring match against cached DB.
-        3. iter_dialogs() — last resort for dialogs not yet in entities table.
+        2.5. dialogs snapshot table — Phase 41 mirror of iter_dialogs() data.
+             No name_normalized column → no transliteration; Cyrillic queries
+             that need anyascii fall through to step 3.
+        3. iter_dialogs() — last resort for dialogs not in entities or dialogs snapshot.
 
         Returns telethon peer id (negative for channels/groups).
         Raises ValueError with descriptive message on failure.
@@ -1029,6 +1032,46 @@ class DaemonAPIServer:
         ).fetchone()
         if row:
             logger.debug("resolve_dialog_entities_cache hit query=%r id=%d", dialog, row[0])
+            return row[0]
+
+        # Step 2.5: dialogs snapshot table — name lookup with hidden=0 guard.
+        # Mirrors entities step 2 structure; uses hidden=0 (same as _LIST_DIALOGS_SQL).
+        # Phase 46 D-04: avoids live iter_dialogs() RPC for dialogs already in snapshot.
+        #
+        # Known limitation: the `dialogs` table has NO `name_normalized` column,
+        # so this branch does not perform anyascii / Cyrillic transliteration.
+        # A query like "zhenskie sezony" against a dialog named "Женские сезоны"
+        # will MISS step 2.5 and fall through to step 3 (iter_dialogs). This is
+        # acceptable: the entities table step 2 already covers the transliteration
+        # path via `name_normalized`, and step 3 is a correct (if slower) fallback.
+        # The cache hit rate of step 2.5 is therefore lower for non-Latin names
+        # than the entities path, by design.
+        #
+        # LIKE-wildcard parity: the `'%' || LOWER(?) || '%'` substring pattern is
+        # the same shape used by the entities-table step 2 query above. Literal
+        # `%` or `_` in the user's query string are interpreted as LIKE wildcards
+        # in BOTH branches — pre-existing behaviour, not a regression. No
+        # external-attacker model applies (daemon socket is local-only).
+        #
+        # Performance note: no index covers `LOWER(name)`; the query does a
+        # linear scan over non-hidden rows (filtered by `idx_dialogs_hidden_pinned`).
+        # `dialogs` is bounded by user's dialog count (typically <500); sub-ms.
+        row = self._conn.execute(
+            """
+            SELECT dialog_id FROM dialogs
+            WHERE hidden = 0
+              AND (LOWER(name) = LOWER(?)
+                   OR (? != '' AND LOWER(name) LIKE '%' || LOWER(?) || '%'))
+            ORDER BY
+              CASE WHEN LOWER(name) = LOWER(?) THEN 0
+                   ELSE 1
+              END
+            LIMIT 1
+            """,
+            (dialog, dialog, dialog, dialog),
+        ).fetchone()
+        if row:
+            logger.debug("resolve_dialog_dialogs_cache hit query=%r id=%d", dialog, row[0])
             return row[0]
 
         # Slow path: iterate dialogs via Telegram API (catches dialogs not yet in entities).
