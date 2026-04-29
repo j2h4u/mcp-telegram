@@ -791,6 +791,14 @@ def _query_usage_stats(cursor: sqlite3.Cursor, since: int) -> dict:
     }
 
 
+# list_topics — read from topic_metadata snapshot (Phase 45)
+_LIST_TOPICS_SQL = (
+    "SELECT topic_id, title, icon_emoji_id, date "
+    "FROM topic_metadata "
+    "WHERE dialog_id = ? AND is_deleted = 0 AND hidden = 0 "
+    "ORDER BY topic_id ASC"
+)
+
 # ---------------------------------------------------------------------------
 # DaemonAPIServer
 # ---------------------------------------------------------------------------
@@ -1965,12 +1973,16 @@ class DaemonAPIServer:
     # ------------------------------------------------------------------
 
     async def _list_topics(self, req: dict) -> dict:
-        """Return forum topics for a dialog via Telegram API.
+        """Return forum topics for a dialog from the topic_metadata snapshot table.
+
+        Zero Telegram API calls. Returns the same response shape as the previous
+        live-API implementation. The topic_metadata table is kept current by
+        Phase 42 event handlers and Phase 43 reconciliation.
 
         Request: dialog_id (int) or dialog (str).
         Response data: {"topics": [{"id", "title", "icon_emoji_id", "date"}],
         "dialog_id": int}.
-        Errors: entity_not_found, topics_fetch_failed, missing_dialog.
+        Errors: missing_dialog, dialog_not_found (from _resolve_dialog_id).
         """
         dialog_id: int = req.get("dialog_id", 0) or 0
         dialog: str | None = req.get("dialog")
@@ -1987,45 +1999,16 @@ class DaemonAPIServer:
                 "message": "Either dialog_id or dialog name is required for list_topics",
             }
 
-        try:
-            entity = await self._client.get_entity(dialog_id)
-        except Exception as exc:
-            logger.warning("get_entity failed for dialog_id=%s: %s%s", dialog_id, exc, _rid())
-            return {
-                "ok": False,
-                "error": "entity_not_found",
-                "message": "telegram API error",
+        rows = self._conn.execute(_LIST_TOPICS_SQL, (dialog_id,)).fetchall()
+        topics = [
+            {
+                "id": row[0],
+                "title": row[1],
+                "icon_emoji_id": row[2],
+                "date": row[3],
             }
-
-        try:
-            result = await self._client(
-                GetForumTopicsRequest(
-                    peer=entity,
-                    offset_date=None,
-                    offset_id=0,
-                    offset_topic=0,
-                    limit=100,
-                )
-            )
-            topics = [
-                {
-                    "id": t.id,
-                    "title": getattr(t, "title", None),
-                    "icon_emoji_id": getattr(t, "icon_emoji_id", None),
-                    "date": int(t.date.timestamp())
-                    if hasattr(getattr(t, "date", None), "timestamp")
-                    else getattr(t, "date", None),
-                }
-                for t in getattr(result, "topics", [])
-            ]
-        except Exception as exc:
-            logger.warning("topics fetch failed for dialog_id=%s: %s%s", dialog_id, exc, _rid())
-            return {
-                "ok": False,
-                "error": "topics_fetch_failed",
-                "message": "telegram API error",
-            }
-
+            for row in rows
+        ]
         return {"ok": True, "data": {"topics": topics, "dialog_id": dialog_id}}
 
     # ------------------------------------------------------------------
