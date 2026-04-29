@@ -183,6 +183,37 @@ def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.
     return conn
 
 
+def _make_db_with_dialogs(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.Connection:
+    """_make_db() + dialogs table + 4 indexes (Phase 40 schema v17)."""
+    conn = _make_db(with_fts=with_fts, with_entities=with_entities)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS dialogs (
+            dialog_id               INTEGER PRIMARY KEY,
+            name                    TEXT,
+            type                    TEXT,
+            archived                INTEGER NOT NULL DEFAULT 0,
+            pinned                  INTEGER NOT NULL DEFAULT 0,
+            members                 INTEGER,
+            created                 INTEGER,
+            last_message_at         INTEGER,
+            snapshot_at             INTEGER,
+            hidden                  INTEGER NOT NULL DEFAULT 0,
+            needs_refresh           INTEGER NOT NULL DEFAULT 0,
+            unread_mentions_count   INTEGER NOT NULL DEFAULT 0,
+            unread_reactions_count  INTEGER NOT NULL DEFAULT 0,
+            draft_text              TEXT
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_dialogs_hidden_pinned ON dialogs(hidden, pinned DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_dialogs_type ON dialogs(type)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_dialogs_snapshot_at ON dialogs(snapshot_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_dialogs_needs_refresh_hidden ON dialogs(needs_refresh, hidden)")
+    conn.commit()
+    return conn
+
+
 def _make_db_with_activity() -> sqlite3.Connection:
     """_make_db() + v14/v15 activity_sync_state (Phase 999.1 and 999.1.1).
 
@@ -242,6 +273,38 @@ def _insert_synced_dialog(
         "(dialog_id, status, last_synced_at, last_event_at, sync_progress, total_messages, access_lost_at) "
         "VALUES (?, ?, ?, ?, ?, ?, ?)",
         (dialog_id, status, last_synced_at, last_event_at, sync_progress, total_messages, access_lost_at),
+    )
+    conn.commit()
+
+
+def _seed_dialog_row(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    *,
+    name: str = "Dialog",
+    type_: str = "user",
+    archived: int = 0,
+    pinned: int = 0,
+    members: int | None = None,
+    created: int | None = None,
+    last_message_at: int | None = None,
+    snapshot_at: int | None = 1700000000,
+    hidden: int = 0,
+    needs_refresh: int = 0,
+    unread_mentions_count: int = 0,
+    unread_reactions_count: int = 0,
+    draft_text: str | None = None,
+) -> None:
+    """Insert a row into the dialogs table (Phase 44 test helper)."""
+    conn.execute(
+        "INSERT INTO dialogs (dialog_id, name, type, archived, pinned, members, created, "
+        "last_message_at, snapshot_at, hidden, needs_refresh, unread_mentions_count, "
+        "unread_reactions_count, draft_text) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            dialog_id, name, type_, archived, pinned, members, created,
+            last_message_at, snapshot_at, hidden, needs_refresh,
+            unread_mentions_count, unread_reactions_count, draft_text,
+        ),
     )
     conn.commit()
 
@@ -671,37 +734,16 @@ def test_classify_dialog_type_none() -> None:
 
 
 @pytest.mark.asyncio
-async def test_list_dialogs_sync_status() -> None:
-    """list_dialogs returns correct sync_status for each dialog."""
-    conn = _make_db()
+async def test_list_dialogs_sync_status_via_sql() -> None:
+    """list_dialogs returns correct sync_status for each dialog via SQL path."""
+    conn = _make_db_with_dialogs()
+    _seed_dialog_row(conn, 1, name="Chat One", type_="User")
+    _seed_dialog_row(conn, 2, name="Chat Two", type_="Channel")
     _insert_synced_dialog(conn, 1, status="synced")
-    # dialog_id=2 not in synced_dialogs
-
-    # Mock two dialogs from Telegram
-    dialog1 = MagicMock()
-    dialog1.id = 1
-    dialog1.name = "Chat One"
-    dialog1.entity = MagicMock()
-    dialog1.entity.__class__.__name__ = "User"
-    dialog1.date = MagicMock()
-    dialog1.date.timestamp.return_value = 1700000000.0
-    dialog1.unread_count = 0
-
-    dialog2 = MagicMock()
-    dialog2.id = 2
-    dialog2.name = "Chat Two"
-    dialog2.entity = MagicMock()
-    dialog2.entity.__class__.__name__ = "Channel"
-    dialog2.date = MagicMock()
-    dialog2.date.timestamp.return_value = 1700000001.0
-    dialog2.unread_count = 5
-
-    async def _fake_iter_dialogs(*args: Any, **kwargs: Any):  # type: ignore[misc]
-        yield dialog1
-        yield dialog2
+    # dialog_id=2 not in synced_dialogs — should default to "not_synced"
 
     client = MagicMock()
-    client.iter_dialogs = _fake_iter_dialogs
+    client.iter_dialogs = MagicMock(side_effect=AssertionError("SQL path must not call iter_dialogs"))
     server = make_server(conn, client)
 
     result = await server._list_dialogs({})
@@ -713,103 +755,336 @@ async def test_list_dialogs_sync_status() -> None:
     by_id = {d["id"]: d for d in dialogs}
     assert by_id[1]["sync_status"] == "synced"
     assert by_id[2]["sync_status"] == "not_synced"
+    client.iter_dialogs.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_list_dialogs_filter_substring_latinized() -> None:
-    """filter='женск' matches 'KS x Женские сезоны' via latinized substring."""
-    conn = _make_db()
-    dialogs = [
-        ("KS x Женские сезоны", -100),
-        ("Random Chat", -200),
-        ("Golang Дайджест", -300),
-    ]
-    mocks = []
-    for name, did in dialogs:
-        m = MagicMock()
-        m.id = did
-        m.name = name
-        m.entity = MagicMock()
-        m.entity.__class__.__name__ = "Chat"
-        m.date = MagicMock()
-        m.date.timestamp.return_value = 1700000000.0
-        m.unread_count = 0
-        mocks.append(m)
-
-    async def _iter(*args: Any, **kwargs: Any):  # type: ignore[misc]
-        for m in mocks:
-            yield m
+async def test_list_dialogs_filter_substring_latinized_sql() -> None:
+    """filter='женск' matches 'KS x Женские сезоны' via Python fuzzy pass on SQL result set."""
+    conn = _make_db_with_dialogs()
+    _seed_dialog_row(conn, 1, name="KS x Женские сезоны", type_="Chat")
+    _seed_dialog_row(conn, 2, name="Random Chat", type_="Chat")
+    _seed_dialog_row(conn, 3, name="Golang Дайджест", type_="Chat")
 
     client = MagicMock()
-    client.iter_dialogs = _iter
+    client.iter_dialogs = MagicMock(side_effect=AssertionError("SQL path must not call iter_dialogs"))
     server = make_server(conn, client)
 
     out = await server._list_dialogs({"filter": "женск"})
     names = {d["name"] for d in out["data"]["dialogs"]}
     assert "KS x Женские сезоны" in names
     assert "Random Chat" not in names
+    client.iter_dialogs.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_list_dialogs_filter_acronym() -> None:
-    """filter='ЖС' matches 'KS x Женские сезоны' via word-initials (к,x,ж,с → кxжс)."""
-    conn = _make_db()
-    dialogs = [
-        ("KS x Женские Сезоны", -100),
-        ("Random Channel", -200),
-    ]
-    mocks = []
-    for name, did in dialogs:
-        m = MagicMock()
-        m.id = did
-        m.name = name
-        m.entity = MagicMock()
-        m.entity.__class__.__name__ = "Chat"
-        m.date = MagicMock()
-        m.date.timestamp.return_value = 1700000000.0
-        m.unread_count = 0
-        mocks.append(m)
-
-    async def _iter(*args: Any, **kwargs: Any):  # type: ignore[misc]
-        for m in mocks:
-            yield m
+async def test_list_dialogs_filter_acronym_sql() -> None:
+    """filter='ЖС' matches 'KS x Женские Сезоны' via Python acronym pass on SQL result set."""
+    conn = _make_db_with_dialogs()
+    _seed_dialog_row(conn, 1, name="KS x Женские Сезоны", type_="Chat")
+    _seed_dialog_row(conn, 2, name="Random Channel", type_="Channel")
 
     client = MagicMock()
-    client.iter_dialogs = _iter
+    client.iter_dialogs = MagicMock(side_effect=AssertionError("SQL path must not call iter_dialogs"))
     server = make_server(conn, client)
 
     out = await server._list_dialogs({"filter": "ЖС"})
     names = {d["name"] for d in out["data"]["dialogs"]}
     assert names == {"KS x Женские Сезоны"}
+    client.iter_dialogs.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_list_dialogs_filter_empty_and_none_are_noop() -> None:
-    """Missing filter / empty string must NOT filter anything (backward-compat)."""
-    conn = _make_db()
-    mocks = []
-    for i, name in enumerate(["Alpha", "Beta"]):
-        m = MagicMock()
-        m.id = -(100 + i)
-        m.name = name
-        m.entity = MagicMock()
-        m.entity.__class__.__name__ = "Chat"
-        m.date = MagicMock()
-        m.date.timestamp.return_value = 1700000000.0
-        m.unread_count = 0
-        mocks.append(m)
-
-    async def _iter(*args: Any, **kwargs: Any):  # type: ignore[misc]
-        for m in mocks:
-            yield m
+async def test_list_dialogs_filter_empty_and_none_are_noop_sql() -> None:
+    """Missing filter / empty string must NOT filter anything (backward-compat, SQL path)."""
+    conn = _make_db_with_dialogs()
+    _seed_dialog_row(conn, 1, name="Alpha", type_="Chat")
+    _seed_dialog_row(conn, 2, name="Beta", type_="Chat")
 
     client = MagicMock()
-    client.iter_dialogs = _iter
+    client.iter_dialogs = MagicMock(side_effect=AssertionError("SQL path must not call iter_dialogs"))
 
     for req in ({}, {"filter": None}, {"filter": "   "}):
         server = make_server(conn, client)
         out = await server._list_dialogs(req)
         assert len(out["data"]["dialogs"]) == 2, req
+    client.iter_dialogs.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Phase 44 ListDialogs SQL migration — new tests (RED bar before Task 2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_dialogs_sql_only_no_iter_dialogs() -> None:
+    """Test A: pure SQL path — iter_dialogs must never be called."""
+    conn = _make_db_with_dialogs()
+    _seed_dialog_row(conn, 1, name="User Chat", type_="User")
+    _seed_dialog_row(conn, 2, name="My Channel", type_="Channel")
+
+    client = MagicMock()
+    client.iter_dialogs = MagicMock(side_effect=AssertionError("SQL path must not call iter_dialogs"))
+    server = make_server(conn, client)
+
+    result = await server._list_dialogs({})
+    assert result["ok"] is True
+    assert len(result["data"]["dialogs"]) == 2
+    client.iter_dialogs.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_list_dialogs_filter_substring_sql_pushdown() -> None:
+    """Test B: ASCII substring filter pushes down to SQL LIKE."""
+    conn = _make_db_with_dialogs()
+    _seed_dialog_row(conn, 1, name="KS x Женские сезоны", type_="Chat")
+    _seed_dialog_row(conn, 2, name="Random Chat", type_="Chat")
+    _seed_dialog_row(conn, 3, name="Golang Дайджест", type_="Chat")
+
+    client = MagicMock()
+    client.iter_dialogs = MagicMock(side_effect=AssertionError("SQL path must not call iter_dialogs"))
+    server = make_server(conn, client)
+
+    out = await server._list_dialogs({"filter": "женск"})
+    assert out["ok"] is True
+    names = {d["name"] for d in out["data"]["dialogs"]}
+    assert names == {"KS x Женские сезоны"}
+    client.iter_dialogs.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_list_dialogs_filter_cyrillic_acronym_on_full_set() -> None:
+    """Test C: Cyrillic filter skips LIKE (name_pat=None) — Python acronym pass runs on full set."""
+    conn = _make_db_with_dialogs()
+    _seed_dialog_row(conn, 1, name="KS x Женские Сезоны", type_="Chat")
+    _seed_dialog_row(conn, 2, name="Random Channel", type_="Channel")
+
+    client = MagicMock()
+    client.iter_dialogs = MagicMock(side_effect=AssertionError("SQL path must not call iter_dialogs"))
+    server = make_server(conn, client)
+
+    out = await server._list_dialogs({"filter": "ЖС"})
+    assert out["ok"] is True
+    names = {d["name"] for d in out["data"]["dialogs"]}
+    assert names == {"KS x Женские Сезоны"}
+    client.iter_dialogs.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_list_dialogs_filter_ascii_acronym_falls_back_when_like_empty() -> None:
+    """Test C2: ASCII acronym 'KJ' matches 'Kitchen Journal' via safety-net retry."""
+    conn = _make_db_with_dialogs()
+    _seed_dialog_row(conn, 1, name="Kitchen Journal", type_="Chat")
+    _seed_dialog_row(conn, 2, name="Random Channel", type_="Channel")
+
+    client = MagicMock()
+    client.iter_dialogs = MagicMock(side_effect=AssertionError("SQL path must not call iter_dialogs"))
+    server = make_server(conn, client)
+
+    # "KJ" has no literal substring match ("kj" not in "kitchen journal")
+    # but acronym match via word-initials "kj" works.
+    out = await server._list_dialogs({"filter": "KJ"})
+    assert out["ok"] is True
+    names = {d["name"] for d in out["data"]["dialogs"]}
+    assert names == {"Kitchen Journal"}
+    client.iter_dialogs.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_list_dialogs_snapshot_age_annotation_when_stale() -> None:
+    """Test D: snapshot_age_h returned as integer when MAX(snapshot_at) older than 12h."""
+    conn = _make_db_with_dialogs()
+    stale_at = int(time.time()) - 13 * 3600
+    _seed_dialog_row(conn, 1, name="Old Chat", type_="Chat", snapshot_at=stale_at)
+
+    client = MagicMock()
+    client.iter_dialogs = MagicMock(side_effect=AssertionError("SQL path must not call iter_dialogs"))
+    server = make_server(conn, client)
+
+    result = await server._list_dialogs({})
+    assert result["ok"] is True
+    assert result["data"]["snapshot_age_h"] == 13
+    client.iter_dialogs.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_list_dialogs_snapshot_age_annotation_when_fresh() -> None:
+    """Test E: snapshot_age_h is None when MAX(snapshot_at) is recent."""
+    conn = _make_db_with_dialogs()
+    fresh_at = int(time.time())
+    _seed_dialog_row(conn, 1, name="Fresh Chat", type_="Chat", snapshot_at=fresh_at)
+
+    client = MagicMock()
+    client.iter_dialogs = MagicMock(side_effect=AssertionError("SQL path must not call iter_dialogs"))
+    server = make_server(conn, client)
+
+    result = await server._list_dialogs({})
+    assert result["ok"] is True
+    assert result["data"]["snapshot_age_h"] is None
+    client.iter_dialogs.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_list_dialogs_bootstrap_pending_when_table_truly_empty() -> None:
+    """Test F: bootstrap_pending=True when dialogs table has zero rows (truly empty)."""
+    conn = _make_db_with_dialogs()
+    # No rows inserted at all.
+
+    client = MagicMock()
+    client.iter_dialogs = MagicMock(side_effect=AssertionError("SQL path must not call iter_dialogs"))
+    server = make_server(conn, client)
+
+    result = await server._list_dialogs({})
+    assert result["ok"] is True
+    assert result["data"]["dialogs"] == []
+    assert result["data"]["bootstrap_pending"] is True
+    assert result["data"]["snapshot_age_h"] is None
+    client.iter_dialogs.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_list_dialogs_bootstrap_false_when_only_hidden_rows() -> None:
+    """Test F2: bootstrap_pending=False when dialogs table has rows (even if all hidden)."""
+    conn = _make_db_with_dialogs()
+    # One hidden row — table is NOT empty, sync has run, rows are just hidden.
+    _seed_dialog_row(conn, 1, name="Hidden Chat", type_="Chat", hidden=1)
+
+    client = MagicMock()
+    client.iter_dialogs = MagicMock(side_effect=AssertionError("SQL path must not call iter_dialogs"))
+    server = make_server(conn, client)
+
+    result = await server._list_dialogs({})
+    assert result["ok"] is True
+    assert result["data"]["dialogs"] == []
+    assert result["data"]["bootstrap_pending"] is False
+    assert result["data"]["snapshot_age_h"] is None
+    client.iter_dialogs.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_list_dialogs_diff04_fields_present_in_data() -> None:
+    """Test G: per-row unread_mentions_count, unread_reactions_count, draft_text fields."""
+    conn = _make_db_with_dialogs()
+    _seed_dialog_row(
+        conn, 1, name="Active Chat", type_="Chat",
+        unread_mentions_count=2, unread_reactions_count=1, draft_text="WIP",
+    )
+    _seed_dialog_row(
+        conn, 2, name="Quiet Chat", type_="Chat",
+        unread_mentions_count=0, unread_reactions_count=0, draft_text=None,
+    )
+
+    client = MagicMock()
+    client.iter_dialogs = MagicMock(side_effect=AssertionError("SQL path must not call iter_dialogs"))
+    server = make_server(conn, client)
+
+    result = await server._list_dialogs({})
+    assert result["ok"] is True
+    by_id = {d["id"]: d for d in result["data"]["dialogs"]}
+    assert by_id[1]["unread_mentions_count"] == 2
+    assert by_id[1]["unread_reactions_count"] == 1
+    assert by_id[1]["draft_text"] == "WIP"
+    assert by_id[2]["unread_mentions_count"] == 0
+    assert by_id[2]["unread_reactions_count"] == 0
+    assert by_id[2]["draft_text"] is None
+    client.iter_dialogs.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_list_dialogs_dm_unread_in_out_preserved() -> None:
+    """Test H: WR-06 — User rows carry unread_in/unread_out; Channel rows omit both."""
+    conn = _make_db_with_dialogs()
+    # User DM row
+    _seed_dialog_row(conn, 10, name="DM Peer", type_="User")
+    # Direct INSERT with read cursors — _insert_synced_dialog doesn't expose read_inbox_max_id
+    conn.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, read_inbox_max_id, read_outbox_max_id) "
+        "VALUES (10, 'synced', 10, 10)"
+    )
+    conn.commit()
+    conn.execute(
+        "INSERT INTO messages (dialog_id, message_id, sent_at, out, is_deleted) VALUES (10, 11, 1700000001, 0, 0)"
+    )
+    conn.execute(
+        "INSERT INTO messages (dialog_id, message_id, sent_at, out, is_deleted) VALUES (10, 12, 1700000002, 1, 0)"
+    )
+    conn.commit()
+
+    # Channel row — no synced_dialogs entry
+    _seed_dialog_row(conn, 20, name="News Channel", type_="Channel")
+
+    client = MagicMock()
+    client.iter_dialogs = MagicMock(side_effect=AssertionError("SQL path must not call iter_dialogs"))
+    server = make_server(conn, client)
+
+    result = await server._list_dialogs({})
+    assert result["ok"] is True
+    by_id = {d["id"]: d for d in result["data"]["dialogs"]}
+
+    # User row has unread_in and unread_out
+    assert "unread_in" in by_id[10]
+    assert "unread_out" in by_id[10]
+    assert by_id[10]["unread_in"] == 1
+    assert by_id[10]["unread_out"] == 1
+
+    # Channel row omits both
+    assert "unread_in" not in by_id[20]
+    assert "unread_out" not in by_id[20]
+    client.iter_dialogs.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_list_dialogs_exclude_archived_filters_via_sql() -> None:
+    """Test I: exclude_archived=True maps to WHERE archived=0 (row filter, not just order)."""
+    conn = _make_db_with_dialogs()
+    _seed_dialog_row(conn, 1, name="Active Chat", type_="Chat", archived=0)
+    _seed_dialog_row(conn, 2, name="Archived Chat", type_="Chat", archived=1)
+    _seed_dialog_row(conn, 3, name="Another Active", type_="Chat", archived=0)
+
+    client = MagicMock()
+    client.iter_dialogs = MagicMock(side_effect=AssertionError("SQL path must not call iter_dialogs"))
+    server = make_server(conn, client)
+
+    # With exclude_archived=True, only non-archived rows returned
+    out = await server._list_dialogs({"exclude_archived": True})
+    assert out["ok"] is True
+    ids = {d["id"] for d in out["data"]["dialogs"]}
+    assert ids == {1, 3}
+    assert 2 not in ids
+
+    # Default (exclude_archived=False) returns all three
+    out_all = await server._list_dialogs({})
+    assert len(out_all["data"]["dialogs"]) == 3
+    client.iter_dialogs.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_list_dialogs_ignore_pinned_filters_via_sql() -> None:
+    """Test J: ignore_pinned=True maps to WHERE pinned=0 (row filter); default returns all ordered pinned-first."""
+    conn = _make_db_with_dialogs()
+    _seed_dialog_row(conn, 1, name="Pinned A", type_="Chat", pinned=1, last_message_at=1700000010)
+    _seed_dialog_row(conn, 2, name="Unpinned B", type_="Chat", pinned=0, last_message_at=1700000020)
+    _seed_dialog_row(conn, 3, name="Pinned C", type_="Chat", pinned=1, last_message_at=1700000005)
+
+    client = MagicMock()
+    client.iter_dialogs = MagicMock(side_effect=AssertionError("SQL path must not call iter_dialogs"))
+    server = make_server(conn, client)
+
+    # With ignore_pinned=True, only unpinned rows returned
+    out = await server._list_dialogs({"ignore_pinned": True})
+    assert out["ok"] is True
+    ids = [d["id"] for d in out["data"]["dialogs"]]
+    assert ids == [2]
+
+    # Default (ignore_pinned=False) returns all three, pinned rows first
+    out_all = await server._list_dialogs({})
+    all_ids = [d["id"] for d in out_all["data"]["dialogs"]]
+    assert len(all_ids) == 3
+    # Pinned rows (1 and 3) come before unpinned row (2)
+    pinned_positions = [i for i, d in enumerate(out_all["data"]["dialogs"]) if d["id"] in {1, 3}]
+    unpinned_positions = [i for i, d in enumerate(out_all["data"]["dialogs"]) if d["id"] == 2]
+    assert max(pinned_positions) < min(unpinned_positions)
+    client.iter_dialogs.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -3010,8 +3285,9 @@ async def test_get_sync_status_access_lost_null_total_has_archived_count():
 
 @pytest.mark.asyncio
 async def test_list_dialogs_includes_coverage():
-    """list_dialogs includes sync_coverage_pct and access_lost_at per dialog."""
-    conn = _make_db()
+    """list_dialogs includes sync_coverage_pct and access_lost_at per dialog (SQL path)."""
+    conn = _make_db_with_dialogs()
+    _seed_dialog_row(conn, 5001, name="Test Dialog", type_="User")
     conn.execute(
         "INSERT INTO synced_dialogs (dialog_id, status, total_messages) VALUES (?, 'synced', 100)",
         (5001,),
@@ -3024,22 +3300,7 @@ async def test_list_dialogs_includes_coverage():
     conn.commit()
 
     mock_client = MagicMock()
-    mock_dialog = MagicMock()
-    mock_dialog.id = 5001
-    mock_dialog.name = "Test Dialog"
-    mock_dialog.entity = MagicMock()
-    mock_dialog.entity.first_name = "Test"
-    mock_dialog.entity.bot = False
-    mock_dialog.entity.participants_count = None
-    mock_dialog.entity.date = None
-    mock_dialog.date = MagicMock()
-    mock_dialog.date.timestamp.return_value = 1700000000
-    mock_dialog.unread_count = 0
-
-    async def _iter_dialogs(**kwargs):
-        yield mock_dialog
-
-    mock_client.iter_dialogs = _iter_dialogs
+    mock_client.iter_dialogs = MagicMock(side_effect=AssertionError("SQL path must not call iter_dialogs"))
 
     server = make_server(conn, mock_client)
     result = await server._list_dialogs({})
@@ -3049,37 +3310,18 @@ async def test_list_dialogs_includes_coverage():
     assert dialogs[0]["sync_coverage_pct"] == 50
     assert dialogs[0]["access_lost_at"] is None
     assert dialogs[0]["type"] == "User"
+    mock_client.iter_dialogs.assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_list_dialogs_classifies_forum() -> None:
-    """list_dialogs returns type='Forum' for a megagroup with forum flag."""
-    from telethon.tl.types import Channel  # type: ignore[import-untyped]
-
-    conn = _make_db()
-
-    entity = MagicMock()
-    entity.__class__ = Channel
-    entity.megagroup = True
-    entity.forum = True
-    entity.broadcast = False
-    entity.participants_count = None
-    entity.date = None
-
-    mock_dialog = MagicMock()
-    mock_dialog.id = 6001
-    mock_dialog.name = "Forum Group"
-    mock_dialog.entity = entity
-    mock_dialog.date = MagicMock()
-    mock_dialog.date.timestamp.return_value = 1700000000
-    mock_dialog.unread_count = 0
+    """list_dialogs returns type='Forum' for a Forum row in dialogs snapshot table."""
+    conn = _make_db_with_dialogs()
+    # Forum type is stored directly in the dialogs.type column by the bootstrap sweep.
+    _seed_dialog_row(conn, 6001, name="Forum Group", type_="Forum")
 
     mock_client = MagicMock()
-
-    async def _iter_dialogs(**kwargs):
-        yield mock_dialog
-
-    mock_client.iter_dialogs = _iter_dialogs
+    mock_client.iter_dialogs = MagicMock(side_effect=AssertionError("SQL path must not call iter_dialogs"))
 
     server = make_server(conn, mock_client)
     result = await server._list_dialogs({})
@@ -3087,6 +3329,7 @@ async def test_list_dialogs_classifies_forum() -> None:
     dialogs = result["data"]["dialogs"]
     assert len(dialogs) == 1
     assert dialogs[0]["type"] == "Forum"
+    mock_client.iter_dialogs.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
