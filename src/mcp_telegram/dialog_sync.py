@@ -182,13 +182,15 @@ INSERT INTO topic_metadata
      icon_emoji_id, pinned, hidden, snapshot_at, date)
 VALUES
     (:dialog_id, :topic_id, :title, NULL,
-     0, 0, :updated_at,
+     :is_general, 0, :updated_at,
      :icon_emoji_id, 0, 0, :snapshot_at, :date)
 ON CONFLICT(dialog_id, topic_id) DO UPDATE SET
     title          = COALESCE(excluded.title, topic_metadata.title),
     icon_emoji_id  = COALESCE(excluded.icon_emoji_id, topic_metadata.icon_emoji_id),
+    is_general     = excluded.is_general,
     updated_at     = excluded.updated_at,
-    snapshot_at    = excluded.snapshot_at
+    snapshot_at    = excluded.snapshot_at,
+    date           = COALESCE(excluded.date, topic_metadata.date)
 WHERE topic_metadata.snapshot_at IS NULL
    OR topic_metadata.snapshot_at < excluded.snapshot_at
 """
@@ -826,6 +828,7 @@ class DialogReconciliationWorker:
                 "dialog_id": dialog_id,
                 "topic_id": int(t.id),
                 "title": getattr(t, "title", None) or "",
+                "is_general": int(getattr(t, "is_general", False) or (int(t.id) == 1)),
                 "icon_emoji_id": getattr(t, "icon_emoji_id", None),
                 "updated_at": now,
                 "snapshot_at": now,
