@@ -3426,7 +3426,9 @@ class DaemonAPIServer:
 
         Evicts rows older than 30 days on every write to prevent unbounded growth.
         """
-        event = req.get("event", {})
+        event = req.get("event")
+        if not isinstance(event, dict):
+            return {"ok": False, "error": "invalid_input", "message": "event must be a JSON object"}
         tool_name = event.get("tool_name", "")
         if not isinstance(tool_name, str) or len(tool_name) > 200:
             return {"ok": False, "error": "invalid_input", "message": "tool_name must be a string (max 200 chars)"}
@@ -3437,7 +3439,7 @@ class DaemonAPIServer:
                 "has_cursor, page_depth, has_filter, error_type) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    event.get("tool_name"),
+                    tool_name,
                     event.get("timestamp"),
                     event.get("duration_ms"),
                     event.get("result_count"),
