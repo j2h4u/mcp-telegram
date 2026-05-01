@@ -246,6 +246,7 @@ async def test_delta_floodwait_handled(
 
     async def _mock_wait_for(coro: Any, timeout: float) -> None:
         slept_for.append(timeout)
+        coro.close()
         raise TimeoutError
 
     worker = make_worker(mock_client, sync_db, shutdown_event)
@@ -1000,6 +1001,7 @@ async def test_fetch_delta_stamps_on_floodwait(
     worker = make_worker(mock_client, sync_db, shutdown_event)
 
     async def _fast_wait_for(coro: Any, timeout: float) -> None:
+        coro.close()
         raise TimeoutError
 
     before = int(_time.time())

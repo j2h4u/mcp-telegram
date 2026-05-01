@@ -71,6 +71,22 @@ def make_server(conn=None, client=None) -> DaemonAPIServer:
     return server
 
 
+def _mock_client(*call_results):
+    client = MagicMock()
+    results = list(call_results)
+
+    async def _call_client(*args, **kwargs):
+        if not results:
+            raise RuntimeError("unexpected Telegram client request")
+        result = results.pop(0)
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    client.side_effect = _call_client
+    return client
+
+
 def _broadcast_channel(id_=-1001, **kwargs):
     # `TelethonChannel` is now imported at module scope (see top of file)
     # per HIGH-2 from 47-REVIEWS.md cycle 3 — Plan 03 Task 3 appends
@@ -108,11 +124,10 @@ def _full_channel(**kwargs):
 async def test_get_entity_info_channel_type() -> None:
     """SPEC Req 2: Broadcast channel returns type='channel'."""
     chan = _broadcast_channel(id_=-1001)
-    client = AsyncMock()
-    client.get_entity = AsyncMock(return_value=chan)
     full = _full_channel()
     search = MagicMock(count=0, messages=[])
-    client.side_effect = [full, search]
+    client = _mock_client(full, search)
+    client.get_entity = AsyncMock(return_value=chan)
     server = make_server(client=client)
     with patch("mcp_telegram.daemon_api.GetFullChannelRequest"), \
          patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
@@ -125,11 +140,10 @@ async def test_get_entity_info_channel_type() -> None:
 async def test_get_entity_info_channel_common_envelope() -> None:
     """SPEC Req 3: Channel response carries the common envelope keys."""
     chan = _broadcast_channel(id_=-1002, title="News", username="news_chan")
-    client = AsyncMock()
-    client.get_entity = AsyncMock(return_value=chan)
     full = _full_channel(about="Channel about text")
     search = MagicMock(count=0, messages=[])
-    client.side_effect = [full, search]
+    client = _mock_client(full, search)
+    client.get_entity = AsyncMock(return_value=chan)
     server = make_server(client=client)
     with patch("mcp_telegram.daemon_api.GetFullChannelRequest"), \
          patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
@@ -147,11 +161,10 @@ async def test_get_entity_info_channel_common_envelope() -> None:
 async def test_get_entity_info_channel_field_surface() -> None:
     """SPEC Req 5: Channel response carries all per-type fields."""
     chan = _broadcast_channel(id_=-1003)
-    client = AsyncMock()
-    client.get_entity = AsyncMock(return_value=chan)
     full = _full_channel(participants_count=12345, pinned_msg_id=999, slowmode_seconds=30)
     search = MagicMock(count=0, messages=[])
-    client.side_effect = [full, search]
+    client = _mock_client(full, search)
+    client.get_entity = AsyncMock(return_value=chan)
     server = make_server(client=client)
     with patch("mcp_telegram.daemon_api.GetFullChannelRequest"), \
          patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
@@ -170,11 +183,10 @@ async def test_get_entity_info_channel_field_surface() -> None:
 async def test_get_entity_info_channel_non_admin_contacts_null() -> None:
     """SPEC Req 9: non-admin call on a broadcast → contacts_subscribed=null + reason='not_an_admin'."""
     chan = _broadcast_channel(id_=-1004, creator=False, admin_rights=None)
-    client = AsyncMock()
-    client.get_entity = AsyncMock(return_value=chan)
     full = _full_channel()
     search = MagicMock(count=0, messages=[])
-    client.side_effect = [full, search]
+    client = _mock_client(full, search)
+    client.get_entity = AsyncMock(return_value=chan)
     server = make_server(client=client)
     with patch("mcp_telegram.daemon_api.GetFullChannelRequest"), \
          patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
@@ -192,11 +204,10 @@ async def test_get_entity_info_channel_available_reactions_some() -> None:
     emoji_obj.emoticon = "👍"
     reactions = ChatReactionsSome(reactions=[emoji_obj])
     chan = _broadcast_channel(id_=-1005)
-    client = AsyncMock()
-    client.get_entity = AsyncMock(return_value=chan)
     full = _full_channel(available_reactions=reactions)
     search = MagicMock(count=0, messages=[])
-    client.side_effect = [full, search]
+    client = _mock_client(full, search)
+    client.get_entity = AsyncMock(return_value=chan)
     server = make_server(client=client)
     with patch("mcp_telegram.daemon_api.GetFullChannelRequest"), \
          patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
@@ -209,11 +220,10 @@ async def test_get_entity_info_channel_available_reactions_some() -> None:
 async def test_get_entity_info_no_download_keys_channel() -> None:
     """SPEC Req 10: Channel response contains no file_id / file_reference / download_*."""
     chan = _broadcast_channel(id_=-1006)
-    client = AsyncMock()
-    client.get_entity = AsyncMock(return_value=chan)
     full = _full_channel()
     search = MagicMock(count=0, messages=[])
-    client.side_effect = [full, search]
+    client = _mock_client(full, search)
+    client.get_entity = AsyncMock(return_value=chan)
     server = make_server(client=client)
     with patch("mcp_telegram.daemon_api.GetFullChannelRequest"), \
          patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
@@ -247,9 +257,6 @@ async def test_get_entity_info_channel_avatar_search_fails_d20_fallback() -> Non
     from datetime import datetime, timezone
 
     chan = _broadcast_channel(id_=-1007)
-    client = AsyncMock()
-    client.get_entity = AsyncMock(return_value=chan)
-
     # full_chat.chat_photo is set (current avatar known).
     chat_photo = MagicMock()
     chat_photo.id = 99999
@@ -260,7 +267,8 @@ async def test_get_entity_info_channel_avatar_search_fails_d20_fallback() -> Non
     # messages.Search(ChatPhotos) RAISES — search_failed branch.
     search_exc = RuntimeError("flood wait simulated")
 
-    client.side_effect = [full, search_exc]
+    client = _mock_client(full, search_exc)
+    client.get_entity = AsyncMock(return_value=chan)
     server = make_server(client=client)
     with patch("mcp_telegram.daemon_api.GetFullChannelRequest"), \
          patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
@@ -302,7 +310,6 @@ async def test_get_entity_info_channel_admin_enumerates_subscribers_small() -> N
     (DM-peer ∩ participant ids), NOT the Plan 02 stub
     contacts_reason='enumeration_owned_by_plan_03'.
     """
-    client = AsyncMock()
     # Resolve broadcast channel (megagroup=False, admin via creator=True)
     ch = MagicMock(spec=TelethonChannel)
     ch.id = -1001234567890
@@ -314,12 +321,11 @@ async def test_get_entity_info_channel_admin_enumerates_subscribers_small() -> N
     ch.admin_rights = None
     ch.left = False
     ch.restriction_reason = None
-    client.get_entity = AsyncMock(return_value=ch)
-
     # GetFullChannelRequest returns subscribers_count=42 (≤1000 path).
     full = MagicMock()
     full.full_chat = _full_broadcast_channel(participants_count=42)
-    client.side_effect = [full]    # one MTProto call before iter_participants
+    client = _mock_client(full)    # one MTProto call before iter_participants
+    client.get_entity = AsyncMock(return_value=ch)
 
     # iter_participants yields 3 participant objects with ids 111, 222, 333.
     async def _iter(*args, **kwargs):
@@ -365,7 +371,6 @@ async def test_get_entity_info_channel_admin_enumerates_subscribers_large() -> N
     and subscribers_count > 1000 uses ChannelParticipantsContacts filter
     and returns contacts_subscribed_partial=True, reason='too_large'.
     """
-    client = AsyncMock()
     ch = MagicMock(spec=TelethonChannel)
     ch.id = -1009876543210
     ch.title = "Big Broadcast"
@@ -376,8 +381,6 @@ async def test_get_entity_info_channel_admin_enumerates_subscribers_large() -> N
     ch.admin_rights = None
     ch.left = False
     ch.restriction_reason = None
-    client.get_entity = AsyncMock(return_value=ch)
-
     full = MagicMock()
     full.full_chat = _full_broadcast_channel(participants_count=50000)
 
@@ -386,7 +389,8 @@ async def test_get_entity_info_channel_admin_enumerates_subscribers_large() -> N
     u1 = MagicMock(); u1.id = 111
     u2 = MagicMock(); u2.id = 222
     gp_result.users = [u1, u2]
-    client.side_effect = [full, gp_result]
+    client = _mock_client(full, gp_result)
+    client.get_entity = AsyncMock(return_value=ch)
 
     # iter_participants MUST NOT be called on the >1000 path.
     async def _iter_should_not_be_called(*args, **kwargs):
@@ -421,7 +425,6 @@ async def test_get_entity_info_channel_admin_chat_admin_required_falls_back_to_n
     """
     from telethon.errors import ChatAdminRequiredError
 
-    client = AsyncMock()
     ch = MagicMock(spec=TelethonChannel)
     ch.id = -1001112223334
     ch.title = "Revoked Admin"
@@ -432,11 +435,10 @@ async def test_get_entity_info_channel_admin_chat_admin_required_falls_back_to_n
     ch.admin_rights = None
     ch.left = False
     ch.restriction_reason = None
-    client.get_entity = AsyncMock(return_value=ch)
-
     full = MagicMock()
     full.full_chat = _full_broadcast_channel(participants_count=42)
-    client.side_effect = [full]
+    client = _mock_client(full, RuntimeError("avatar search unavailable"))
+    client.get_entity = AsyncMock(return_value=ch)
 
     async def _iter_raises(*args, **kwargs):
         raise ChatAdminRequiredError(request=None)

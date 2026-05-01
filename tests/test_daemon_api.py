@@ -4619,7 +4619,11 @@ async def test_fallback_path_does_not_emit_counter(caplog: pytest.LogCaptureFixt
     # No synced_dialogs row — triggers live Telegram fallback
     server = make_server(conn)
     # Mock telegram client to return empty list (avoid real API call)
-    server._client.iter_messages = AsyncMock(return_value=iter([]))
+    async def _empty_iter_messages(*args: Any, **kwargs: Any):  # type: ignore[misc]
+        return
+        yield  # make it an async generator
+
+    server._client.iter_messages = _empty_iter_messages
     caplog.clear()
     with caplog.at_level("INFO", logger="mcp_telegram.daemon_api"):
         await server._list_messages({"dialog_id": 999_999_999, "limit": 10})

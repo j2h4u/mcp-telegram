@@ -36,6 +36,10 @@ st_id_triple = st.tuples(st_entity_id, st_entity_id, st_entity_id).filter(lambda
 st_shared_name_latin = st.text(alphabet=ascii_letters + " ", min_size=2, max_size=20).filter(
     lambda x: len(latinize(x)) >= 2
 )
+st_multi_word_latin = st.tuples(
+    st.text(alphabet=ascii_letters, min_size=2, max_size=9),
+    st.text(alphabet=ascii_letters, min_size=2, max_size=10),
+).map(lambda parts: f"{parts[0]} {parts[1]}")
 
 # Cyrillic range U+0410..U+044F (А-я)
 _cyrillic_alphabet = "".join(chr(c) for c in range(0x0410, 0x0450))
@@ -277,9 +281,7 @@ def test_property_cross_type_collision_three_types(user_id: int, bot_id: int, ch
 
 @given(
     entity_id=st_entity_id,
-    name=st.text(alphabet=ascii_letters + " ", min_size=4, max_size=20).filter(
-        lambda x: " " in x.strip() and len(latinize(x)) >= 4
-    ),
+    name=st_multi_word_latin,
 )
 @settings(max_examples=50, deadline=None)
 def test_property_no_collision_single_entity_resolves(entity_id: int, name: str) -> None:

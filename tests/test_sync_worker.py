@@ -268,6 +268,7 @@ async def test_floodwait_sleep_continues(
 
     async def _mock_wait_for(coro: Any, timeout: float) -> None:
         slept_for.append(timeout)
+        coro.close()
         raise TimeoutError
 
     worker = make_worker(mock_client, sync_db, shutdown_event)
@@ -305,6 +306,7 @@ async def test_floodwait_no_progress_loss(
     mock_client.get_messages = AsyncMock(side_effect=err)
 
     async def _mock_wait_for(coro: Any, timeout: float) -> None:
+        coro.close()
         raise TimeoutError
 
     worker = make_worker(mock_client, sync_db, shutdown_event)
