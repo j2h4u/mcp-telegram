@@ -15,6 +15,7 @@ from ..errors import (
     entity_not_found_text,
     fetch_entity_info_error_text,
 )
+from ..formatter import frame_telegram_content
 from ._base import (
     DaemonNotRunningError,
     ToolAnnotations,
@@ -84,6 +85,10 @@ def _format_status(status: dict | None) -> str | None:
     if kind == "last_month":
         return "last seen last month"
     return None
+
+
+def _append_framed_field(lines: list[str], label: str, text: str) -> None:
+    lines.append(f"{label}:\n{frame_telegram_content(text)}")
 
 
 # ---------------------------------------------------------------------------
@@ -191,7 +196,7 @@ async def get_entity_info(args: GetEntityInfo) -> ToolResult:
 
     about = data.get("about")
     if about:
-        lines.append(f"about: {about}")
+        _append_framed_field(lines, "about", about)
 
     my_membership = data.get("my_membership") or {}
     if my_membership:
@@ -309,12 +314,16 @@ def _render_user_or_bot(data: dict, lines: list[str]) -> None:
     if private_forward_name:
         lines.append(f"forwards_as: {private_forward_name}")
     for rr in data.get("restriction_reason") or []:
-        lines.append(f"restriction: [{rr.get('platform')}] {rr.get('reason')} — {rr.get('text')}")
+        text = rr.get("text")
+        line = f"restriction: [{rr.get('platform')}] {rr.get('reason')}"
+        if text:
+            line = f"{line}\n{frame_telegram_content(text)}"
+        lines.append(line)
 
     bot_info = data.get("bot_info")
     if bot_info:
         if bot_info.get("description"):
-            lines.append(f"bot_description: {bot_info['description']}")
+            _append_framed_field(lines, "bot_description", bot_info["description"])
         cmds = bot_info.get("commands") or []
         if cmds:
             cmd_str = ", ".join(f"/{c['command']}" for c in cmds)
@@ -322,22 +331,24 @@ def _render_user_or_bot(data: dict, lines: list[str]) -> None:
 
     business_intro = data.get("business_intro")
     if business_intro:
-        parts = list(filter(None, [
-            business_intro.get("title"),
-            business_intro.get("description"),
-        ]))
-        lines.append("business_intro: " + " / ".join(parts))
+        title = business_intro.get("title")
+        if title:
+            lines.append(f"business_intro: {title}")
+        description = business_intro.get("description")
+        if description:
+            _append_framed_field(lines, "business_intro_description", description)
     business_location = data.get("business_location")
     if business_location:
         addr = business_location.get("address")
         lat = business_location.get("lat")
         lon = business_location.get("long")
         loc_parts = []
-        if addr:
-            loc_parts.append(addr)
         if lat is not None and lon is not None:
             loc_parts.append(f"({lat}, {lon})")
-        lines.append("business_location: " + ", ".join(loc_parts))
+        if loc_parts:
+            lines.append("business_location: " + ", ".join(loc_parts))
+        if addr:
+            _append_framed_field(lines, "business_location_address", addr)
     business_work_hours = data.get("business_work_hours")
     if business_work_hours:
         tz = business_work_hours.get("timezone")
@@ -345,7 +356,7 @@ def _render_user_or_bot(data: dict, lines: list[str]) -> None:
 
     note = data.get("note")
     if note:
-        lines.append(f"note: {note}")
+        _append_framed_field(lines, "note", note)
 
     common_chats = data.get("common_chats") or []
     chat_lines = [f"  id={chat['id']} type={chat['type']} name='{chat['name']}'" for chat in common_chats]
@@ -376,7 +387,11 @@ def _render_channel(data: dict, lines: list[str]) -> None:
         else:
             lines.append("available_reactions: none")
     for rr in data.get("restrictions") or []:
-        lines.append(f"restriction: [{rr.get('platform')}] {rr.get('reason')} — {rr.get('text')}")
+        text = rr.get("text")
+        line = f"restriction: [{rr.get('platform')}] {rr.get('reason')}"
+        if text:
+            line = f"{line}\n{frame_telegram_content(text)}"
+        lines.append(line)
     _render_contacts_subscribed(data, lines)
 
 
@@ -393,7 +408,11 @@ def _render_supergroup(data: dict, lines: list[str]) -> None:
     if data.get("has_topics"):
         lines.append("has_topics: yes")
     for rr in data.get("restrictions") or []:
-        lines.append(f"restriction: [{rr.get('platform')}] {rr.get('reason')} — {rr.get('text')}")
+        text = rr.get("text")
+        line = f"restriction: [{rr.get('platform')}] {rr.get('reason')}"
+        if text:
+            line = f"{line}\n{frame_telegram_content(text)}"
+        lines.append(line)
     _render_contacts_subscribed(data, lines)
 
 
@@ -408,7 +427,11 @@ def _render_group(data: dict, lines: list[str]) -> None:
     if invite:
         lines.append(f"invite_link: {invite}")
     for rr in data.get("restrictions") or []:
-        lines.append(f"restriction: [{rr.get('platform')}] {rr.get('reason')} — {rr.get('text')}")
+        text = rr.get("text")
+        line = f"restriction: [{rr.get('platform')}] {rr.get('reason')}"
+        if text:
+            line = f"{line}\n{frame_telegram_content(text)}"
+        lines.append(line)
     _render_contacts_subscribed(data, lines)
 
 
