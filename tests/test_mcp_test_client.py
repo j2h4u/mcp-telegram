@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import re
 import sys
 from pathlib import Path
 
@@ -12,6 +14,10 @@ from devtools.mcp_client.client import McpClientError, StdioMcpClient, execute_s
 def _fake_server_command() -> list[str]:
     fixture_path = Path(__file__).parent / "fixtures" / "fake_mcp_server.py"
     return [sys.executable, str(fixture_path)]
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[1]
 
 
 @pytest.mark.asyncio
@@ -130,3 +136,35 @@ def test_mcp_test_client_redacts_printed_script_output(tmp_path, capsys) -> None
     assert exit_code == 0
     assert "[REDACTED " in captured.out
     assert "sensitive text" not in captured.out
+
+
+def test_smoke_scripts_use_snake_case_tool_names() -> None:
+    exposed_pascal_case = re.compile(r"\b(?:Get|List|Search|Submit|Mark)[A-Z]\w*")
+    for relative_path in (
+        "devtools/mcp_client/smoke-no-daemon.json",
+        "devtools/mcp_client/smoke-integration.json",
+    ):
+        text = (_repo_root() / relative_path).read_text(encoding="utf-8")
+        assert exposed_pascal_case.search(text) is None
+
+
+def test_no_daemon_smoke_expects_backend_errors() -> None:
+    script = json.loads(
+        (_repo_root() / "devtools/mcp_client/smoke-no-daemon.json").read_text(encoding="utf-8")
+    )
+    backend_tools = {
+        "list_dialogs",
+        "list_messages",
+        "search_messages",
+        "list_topics",
+        "mark_dialog_for_sync",
+        "get_sync_status",
+        "get_entity_info",
+        "get_inbox",
+        "submit_feedback",
+    }
+
+    assert "get_dialog_stats" in script["steps"][0]["expect"]["tool_names_include"]
+    for step in script["steps"]:
+        if step.get("action") == "call_tool" and step.get("name") in backend_tools:
+            assert step["expect"]["is_error"] is True

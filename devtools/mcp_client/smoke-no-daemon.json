@@ -48,7 +48,7 @@
       "name": "list_dialogs",
       "arguments": {},
       "expect": {
-        "is_error": false,
+        "is_error": true,
         "content_text_contains": ["not running", "mcp-telegram sync"]
       }
     },
@@ -58,7 +58,7 @@
       "name": "list_messages",
       "arguments": {"dialog": "test", "limit": 1},
       "expect": {
-        "is_error": false,
+        "is_error": true,
         "content_text_contains": ["not running", "mcp-telegram sync"]
       }
     },
@@ -68,7 +68,7 @@
       "name": "search_messages",
       "arguments": {"dialog": "test", "query": "hello", "limit": 1},
       "expect": {
-        "is_error": false,
+        "is_error": true,
         "content_text_contains": ["not running", "mcp-telegram sync"]
       }
     },
@@ -78,7 +78,7 @@
       "name": "list_topics",
       "arguments": {"dialog": "test"},
       "expect": {
-        "is_error": false,
+        "is_error": true,
         "content_text_contains": ["not running", "mcp-telegram sync"]
       }
     },
@@ -88,7 +88,7 @@
       "name": "mark_dialog_for_sync",
       "arguments": {"dialog_id": 12345, "enable": true},
       "expect": {
-        "is_error": false,
+        "is_error": true,
         "content_text_contains": ["not running", "mcp-telegram sync"]
       }
     },
@@ -98,7 +98,7 @@
       "name": "get_sync_status",
       "arguments": {"dialog_id": 12345},
       "expect": {
-        "is_error": false,
+        "is_error": true,
         "content_text_contains": ["not running", "mcp-telegram sync"]
       }
     },
@@ -108,7 +108,7 @@
       "name": "get_entity_info",
       "arguments": {"entity": "nonexistent_test_entity_12345"},
       "expect": {
-        "is_error": false,
+        "is_error": true,
         "content_text_contains": ["not running", "mcp-telegram sync"]
       }
     },
@@ -118,7 +118,7 @@
       "name": "get_inbox",
       "arguments": {},
       "expect": {
-        "is_error": false,
+        "is_error": true,
         "content_text_contains": ["not running", "mcp-telegram sync"]
       }
     },
@@ -137,7 +137,7 @@
       "name": "submit_feedback",
       "arguments": {"message": "smoke test from no-daemon harness", "severity": "bug"},
       "expect": {
-        "is_error": false,
+        "is_error": true,
         "content_text_contains": ["not running", "mcp-telegram sync"]
       }
     }
