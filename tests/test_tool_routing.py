@@ -16,6 +16,10 @@ from contextlib import asynccontextmanager
 from datetime import UTC
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+from mcp.types import TextContent
+
+from mcp_telegram.tools import TOOL_REGISTRY
 from mcp_telegram.tools import (
     GetInbox,
     GetSyncAlerts,
@@ -38,6 +42,107 @@ from mcp_telegram.tools import (
 )
 from mcp_telegram.tools._base import DaemonNotRunningError
 from mcp_telegram.tools.stats import GetUsageStats, get_usage_stats
+
+
+STRUCTURED_TOOL_CASES = {
+    "list_dialogs": (
+        list_dialogs,
+        ListDialogs(),
+        {
+            "ok": True,
+            "data": {
+                "dialogs": [
+                    {
+                        "id": 123,
+                        "name": "Alice",
+                        "type": "User",
+                        "unread_count": 1,
+                        "sync_status": "synced",
+                    }
+                ]
+            },
+        },
+    ),
+    "search_messages": (
+        search_messages,
+        SearchMessages(dialog="123", query="hello"),
+        {
+            "ok": True,
+            "data": {
+                "messages": [
+                    {
+                        "dialog_id": 123,
+                        "message_id": 5,
+                        "sent_at": 1705312800,
+                        "text": "hello world",
+                        "sender_first_name": "Bob",
+                    }
+                ],
+                "total": 1,
+            },
+        },
+    ),
+    "get_sync_status": (
+        get_sync_status,
+        GetSyncStatus(dialog_id=123),
+        {
+            "ok": True,
+            "data": {
+                "dialog_id": 123,
+                "status": "synced",
+                "message_count": 10,
+                "last_synced_at": 1700000000,
+            },
+        },
+    ),
+    "get_sync_alerts": (
+        get_sync_alerts,
+        GetSyncAlerts(),
+        {"ok": True, "data": {"deleted_messages": [], "edits": [], "access_lost": []}},
+    ),
+    "get_inbox": (
+        get_inbox,
+        GetInbox(),
+        {
+            "ok": True,
+            "data": {
+                "groups": [
+                    {
+                        "dialog_id": 123,
+                        "display_name": "Alice",
+                        "category": "user",
+                        "unread_count": 1,
+                        "messages": [
+                            {
+                                "message_id": 1,
+                                "sent_at": 1700000000,
+                                "dialog_id": 123,
+                                "text": "Hello",
+                                "sender_first_name": "Alice",
+                            }
+                        ],
+                    }
+                ]
+            },
+        },
+    ),
+}
+
+
+@pytest.mark.parametrize("tool_name", sorted(STRUCTURED_TOOL_CASES))
+async def test_schema_bearing_tools_return_structured_content_and_text(tool_name: str):
+    schema_tools = {name for name, entry in TOOL_REGISTRY.items() if entry.output_schema is not None}
+    assert set(STRUCTURED_TOOL_CASES) == schema_tools
+    runner, args, response = STRUCTURED_TOOL_CASES[tool_name]
+    conn = _make_daemon_conn(response)
+
+    with _patch_daemon(conn):
+        result = await runner(args)
+
+    assert result.is_error is False
+    assert result.structured_content is not None
+    assert result.content
+    assert isinstance(result.content[0], TextContent)
 
 # ---------------------------------------------------------------------------
 # Daemon mock helpers

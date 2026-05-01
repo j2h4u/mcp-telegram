@@ -219,6 +219,39 @@ def test_list_tools_exposes_list_dialogs_output_schema() -> None:
     assert "count" in tool.outputSchema["required"]
 
 
+def test_list_tools_structured_output_schema_surface_is_explicit() -> None:
+    schema_tools = {name for name, tool in server.tool_by_name.items() if tool.outputSchema is not None}
+
+    assert schema_tools == {
+        "list_dialogs",
+        "search_messages",
+        "get_sync_status",
+        "get_sync_alerts",
+        "get_inbox",
+    }
+
+
+@pytest.mark.asyncio
+async def test_call_tool_preserves_structuredContent_and_text_content(monkeypatch) -> None:
+    monkeypatch.setitem(server.tool_by_name, "list_dialogs", _tool("list_dialogs"))
+    monkeypatch.setattr("mcp_telegram.server.tools.tool_args", lambda tool, **kwargs: object())
+    monkeypatch.setattr(
+        "mcp_telegram.server.tools.tool_runner",
+        AsyncMock(
+            return_value=ToolResult(
+                content=[TextContent(type="text", text="1 dialog")],
+                structured_content={"dialogs": [{"id": 1, "name": "Alice"}], "count": 1},
+            )
+        ),
+    )
+
+    result = await server.call_tool("list_dialogs", {})
+
+    assert result.structuredContent == {"dialogs": [{"id": 1, "name": "Alice"}], "count": 1}
+    assert result.content
+    assert isinstance(result.content[0], TextContent)
+
+
 def test_posture_covers_all_registered_tools() -> None:
     """Every registered tool must have a posture classification."""
     from mcp_telegram.tools import TOOL_REGISTRY
