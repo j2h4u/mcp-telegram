@@ -102,6 +102,49 @@ async def test_mcp_test_client_script_assertions_fail() -> None:
             await execute_script_steps(client, steps)
 
 
+@pytest.mark.asyncio
+async def test_mcp_test_client_script_one_of_accepts_matching_branch() -> None:
+    steps = [
+        {
+            "action": "call_tool",
+            "name": "Echo",
+            "arguments": {"value": "script"},
+            "expect": {
+                "one_of": [
+                    {"content_text_contains": ["not-there"]},
+                    {"is_error": False, "content_text_contains": ["script"]},
+                ],
+            },
+        },
+    ]
+
+    async with StdioMcpClient(_fake_server_command()) as client:
+        results = await execute_script_steps(client, steps)
+
+    assert results[0]["result"]["isError"] is False
+
+
+@pytest.mark.asyncio
+async def test_mcp_test_client_script_one_of_fails_when_no_branch_matches() -> None:
+    steps = [
+        {
+            "action": "call_tool",
+            "name": "Echo",
+            "arguments": {"value": "script"},
+            "expect": {
+                "one_of": [
+                    {"content_text_contains": ["missing-a"]},
+                    {"content_text_contains": ["missing-b"]},
+                ],
+            },
+        },
+    ]
+
+    async with StdioMcpClient(_fake_server_command()) as client:
+        with pytest.raises(McpClientError, match="did not match any expect.one_of branch"):
+            await execute_script_steps(client, steps)
+
+
 def test_mcp_test_client_redacts_printed_script_output(tmp_path, capsys) -> None:
     script_path = tmp_path / "script.json"
     script_path.write_text(

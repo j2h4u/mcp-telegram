@@ -49,31 +49,37 @@ writer; the MCP server opens `sync.db` read-only for lightweight queries.
 
 ### Tools Package (`tools/`)
 - `_base.py` — `ToolArgs`, `ToolResult`, `@mcp_tool`, `TOOL_REGISTRY`, `daemon_connection`, telemetry
-- `activity.py` — `GetMyRecentActivity`
-- `discovery.py` — `ListDialogs`, `ListTopics`, `GetMyAccount`
-- `entity_info.py` — `GetEntityInfo` (universal entity inspector: User/Bot/Channel/Supergroup/LegacyChat)
-- `feedback.py` — `SubmitFeedback` (write tool — agents report bugs/suggestions; daemon writes to feedback.db)
-- `reading.py` — `ListMessages`, `SearchMessages`
-- `stats.py` — `GetUsageStats`, `GetDialogStats`
-- `sync.py` — `MarkDialogForSync`, `GetSyncStatus`, `GetSyncAlerts`
-- `unread.py` — `GetInbox`
+- `activity.py` — `get_my_recent_activity`
+- `discovery.py` — `list_dialogs`, `list_topics`
+- `entity_info.py` — `get_entity_info` (universal entity inspector: User/Bot/Channel/Supergroup/LegacyChat)
+- `feedback.py` — `submit_feedback` (write tool — agents report bugs/suggestions; daemon writes to feedback.db)
+- `reading.py` — `list_messages`, `search_messages`
+- `stats.py` — `get_usage_stats`, `get_dialog_stats`
+- `sync.py` — `mark_dialog_for_sync`, `get_sync_status`, `get_sync_alerts`
+- `unread.py` — `get_inbox`
 
-Canonical tool registry: `tools/__init__.py`. Total: 14 primary MCP tools.
+Canonical tool registry: `tools/__init__.py`. Total: 13 MCP tools.
 
 ## Tool Pattern
 
 ```python
-from ._base import ToolArgs, ToolResult, mcp_tool
+from ._base import ToolArgs, ToolResult, mcp_tool, text_result
 from mcp.types import ToolAnnotations
 
 class NewTool(ToolArgs):
     """Description shown to the LLM."""
     field: str
 
-@mcp_tool("primary", annotations=ToolAnnotations(readOnlyHint=True))
+@mcp_tool(
+    name="new_tool",
+    title="New Tool",
+    posture="primary",
+    annotations=ToolAnnotations(readOnlyHint=True),
+)
 async def new_tool(args: NewTool) -> ToolResult:
     async with daemon_connection() as conn:
         ...
+    return text_result("...")
 ```
 
 - Add to the appropriate domain module (or create a new one).
@@ -82,7 +88,7 @@ async def new_tool(args: NewTool) -> ToolResult:
 
 ## Feedback queue
 
-Agents submit feedback via the `SubmitFeedback` MCP tool; the daemon
+Agents submit feedback via the `submit_feedback` MCP tool; the daemon
 persists rows in `feedback.db` (XDG state dir, alongside `sync.db`).
 Operator manages the queue with:
 
@@ -114,7 +120,7 @@ uv run python -m devtools.mcp_client.cli list-tools \
 
 # Разовый вызов tool'а
 uv run python -m devtools.mcp_client.cli call-tool \
-  --name GetSyncStatus \
+  --name get_sync_status \
   --arguments '{"dialog_id": 228055330}' \
   -- docker exec -i mcp-telegram mcp-telegram run
 

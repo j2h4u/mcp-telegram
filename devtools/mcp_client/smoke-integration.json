@@ -84,13 +84,21 @@
       }
     },
     {
-      "_comment": "get_dialog_stats — returns stats or actionable 'not synced' error depending on runtime state",
+      "_comment": "get_dialog_stats — accepts either real stats or actionable 'not synced' error depending on live sync state",
       "action": "call_tool",
       "name": "get_dialog_stats",
       "arguments": {"dialog": "Vibecoding is so last year", "top_n": 3},
       "expect": {
-        "is_error": true,
-        "content_text_contains": ["requires a synced dialog"]
+        "one_of": [
+          {
+            "is_error": false,
+            "content_text_contains": ["Message stats"]
+          },
+          {
+            "is_error": true,
+            "content_text_contains": ["requires a synced dialog"]
+          }
+        ]
       }
     },
     {

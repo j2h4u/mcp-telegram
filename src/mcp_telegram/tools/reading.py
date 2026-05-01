@@ -595,8 +595,15 @@ async def search_messages(args: SearchMessages) -> ToolResult:
             from ..pagination import decode_navigation_token
 
             nav = decode_navigation_token(args.navigation)
-            if nav.kind == "search":
-                offset = nav.value
+            if nav.kind != "search":
+                return error_result(
+                    invalid_navigation_text(
+                        f"Navigation token is for {nav.kind}, not search",
+                        retry_tool="SearchMessages",
+                    ),
+                    has_cursor=True,
+                )
+            offset = nav.value
         except Exception as exc:
             return error_result(
                 invalid_navigation_text(str(exc), retry_tool="SearchMessages"),

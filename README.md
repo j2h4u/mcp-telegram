@@ -17,14 +17,19 @@ Deployed as a Docker container. MCP clients connect by running `docker exec -i m
 
 ## Tools
 
-- `ListDialogs` — list chats, channels, groups with unread counts
-- `ListMessages` — read messages in a dialog (pagination, topic, sender, unread filters)
-- `SearchMessages` — full-text search within a dialog
-- `ListTopics` — list forum topics
-- `GetInbox` — fetch unread messages across chats, prioritized by tier
-- `GetMyAccount` — authenticated user info
-- `GetUserInfo` — look up a user by name (fuzzy match)
-- `GetUsageStats` — local telemetry (last 30 days)
+- `list_dialogs` — list chats, channels, groups with unread counts
+- `list_topics` — list forum topics
+- `list_messages` — read messages in a dialog (pagination, topic, sender, unread filters)
+- `search_messages` — full-text search within a dialog or across all synced dialogs
+- `get_inbox` — fetch unread messages across chats, prioritized by tier
+- `get_entity_info` — inspect users, bots, channels, supergroups, and legacy chats
+- `get_usage_stats` — local telemetry (last 30 days)
+- `get_dialog_stats` — local per-dialog activity statistics
+- `mark_dialog_for_sync` — enable or disable dialog sync
+- `get_sync_status` — inspect sync status for one dialog
+- `get_sync_alerts` — inspect recent sync alerts
+- `get_my_recent_activity` — summarize the operator's recent sent messages
+- `submit_feedback` — write-only agent feedback queue
 
 ## Deploy
 

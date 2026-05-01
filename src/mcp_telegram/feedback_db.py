@@ -1,7 +1,7 @@
 """feedback_db — Feedback database lifecycle for the mcp-telegram daemon.
 
 Manages feedback.db, a separate SQLite file for storing AI-agent feedback
-entries submitted via the SubmitFeedback MCP tool.
+entries submitted via the submit_feedback MCP tool.
 
 Public API:
   get_feedback_db_path()        -> Path

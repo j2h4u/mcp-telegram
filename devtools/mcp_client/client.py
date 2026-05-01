@@ -170,6 +170,21 @@ def _assert_step_expectations(
     if not isinstance(expect, dict):
         raise ValueError(f"script step {index} field 'expect' must be an object")
 
+    one_of = expect.get("one_of")
+    if one_of is not None:
+        if not isinstance(one_of, list) or not all(isinstance(item, dict) for item in one_of):
+            raise ValueError(f"script step {index} field 'expect.one_of' must be a list of objects")
+        errors: list[str] = []
+        for candidate in one_of:
+            try:
+                _assert_step_expectations(index=index, action=action, result=result, expect=candidate)
+                return
+            except McpClientError as exc:
+                errors.append(str(exc))
+        raise McpClientError(
+            f"script step {index} did not match any expect.one_of branch: {'; '.join(errors)}"
+        )
+
     path_equals = expect.get("path_equals")
     if path_equals is not None:
         if not isinstance(path_equals, dict):

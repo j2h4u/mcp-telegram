@@ -61,7 +61,7 @@ def sync() -> None:
 
 
 # ---------------------------------------------------------------------------
-# feedback sub-app — admin queue management for SubmitFeedback (Phase 48)
+# feedback sub-app — admin queue management for submit_feedback (Phase 48)
 # ---------------------------------------------------------------------------
 
 feedback_app = Typer(help="Inspect and manage agent feedback queue.")

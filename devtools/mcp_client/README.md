@@ -5,19 +5,19 @@ Small stdio MCP client for local regression testing.
 Usage:
 
 ```bash
-uv run python -m devtools.mcp_client.cli list-tools -- docker exec mcp-telegram mcp-telegram run
+uv run python -m devtools.mcp_client.cli list-tools -- docker exec -i mcp-telegram mcp-telegram run
 ```
 
 ```bash
 uv run python -m devtools.mcp_client.cli call-tool \
   --name list_topics \
   --arguments '{"dialog":"Studio Robots and Inbox"}' \
-  -- docker exec mcp-telegram mcp-telegram run
+  -- docker exec -i mcp-telegram mcp-telegram run
 ```
 
 ## Smoke Tests
 
-Two smoke scripts cover all 11 MCP tools:
+Two smoke scripts cover all 13 MCP tools:
 
 **No-daemon smoke** — schema validation + graceful degradation (after every build):
 ```bash
