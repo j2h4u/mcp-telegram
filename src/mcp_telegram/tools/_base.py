@@ -1,6 +1,7 @@
 import asyncio
 import functools
 import logging
+import re
 import time
 import typing as t
 from dataclasses import dataclass
@@ -62,6 +63,25 @@ class ToolResult:
     has_cursor: bool = False
     page_depth: int = 1
     has_filter: bool = False
+
+
+@dataclass(frozen=True)
+class ToolRegistryEntry:
+    cls: type[ToolArgs]
+    posture: str
+    annotations: ToolAnnotations | None
+    exported_name: str
+    title: str
+    output_schema: dict[str, t.Any] | None = None
+
+    def __iter__(self) -> t.Iterator[object]:
+        """Preserve tuple-unpack compatibility while callers migrate."""
+        yield self.cls
+        yield self.posture
+        yield self.annotations
+
+    def __getitem__(self, index: int) -> object:
+        return (self.cls, self.posture, self.annotations)[index]
 
 
 def text_result(text: str, **metadata) -> ToolResult:
@@ -154,10 +174,22 @@ async def tool_runner(
 # Explicit tool registry — replaces class introspection + sys.modules lookup
 # ---------------------------------------------------------------------------
 
-TOOL_REGISTRY: dict[str, tuple[type[ToolArgs], str, ToolAnnotations | None]] = {}
+TOOL_REGISTRY: dict[str, ToolRegistryEntry] = {}
 
 
-def mcp_tool(posture: str = "primary", *, annotations: ToolAnnotations | None = None):
+def _class_name_to_snake(name: str) -> str:
+    first_pass = re.sub("(.)([A-Z][a-z]+)", r"\1_\2", name)
+    return re.sub("([a-z0-9])([A-Z])", r"\1_\2", first_pass).lower()
+
+
+def mcp_tool(
+    name: str,
+    title: str | None = None,
+    *,
+    posture: str = "primary",
+    annotations: ToolAnnotations | None = None,
+    output_schema: dict[str, t.Any] | None = None,
+):
     """Register runner with singledispatch + telemetry + tool registry.
 
     ``posture`` is a free-form label prepended to the tool description so the
@@ -181,20 +213,33 @@ def mcp_tool(posture: str = "primary", *, annotations: ToolAnnotations | None = 
     Usage:
         class MyTool(ToolArgs): ...
 
-        @mcp_tool("primary", annotations=ToolAnnotations(readOnlyHint=True))
+        @mcp_tool(name="my_tool", title="My Tool", annotations=ToolAnnotations(readOnlyHint=True))
         async def my_tool(args: MyTool) -> ToolResult: ...
     """
 
     def decorator(fn):
         hints = t.get_type_hints(fn)
         cls = hints["args"]
-        name = cls.__name__
+        exported_name = name
+        exported_title = title
+        exported_posture = posture
+        if title is None and name in {"primary", "secondary/helper"}:
+            exported_name = _class_name_to_snake(cls.__name__)
+            exported_title = cls.__name__
+            exported_posture = name
         # Apply telemetry wrapper
-        wrapped = _track_tool_telemetry(name)(fn)
+        wrapped = _track_tool_telemetry(exported_name)(fn)
         # Register with singledispatch
         tool_runner.register(cls, wrapped)
         # Add to registry
-        TOOL_REGISTRY[name] = (cls, posture, annotations)
+        TOOL_REGISTRY[exported_name] = ToolRegistryEntry(
+            cls=cls,
+            posture=exported_posture,
+            annotations=annotations,
+            exported_name=exported_name,
+            title=exported_title or cls.__name__,
+            output_schema=output_schema,
+        )
         return wrapped
 
     return decorator
