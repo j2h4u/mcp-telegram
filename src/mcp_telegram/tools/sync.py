@@ -27,7 +27,7 @@ class MarkDialogForSync(ToolArgs):
     enable: bool = Field(default=True, description="True to start syncing, False to stop")
 
 
-@mcp_tool("primary", annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True))
+@mcp_tool(name="mark_dialog_for_sync", title="Mark Sync", annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True))
 async def mark_dialog_for_sync(args: MarkDialogForSync) -> ToolResult:
     try:
         async with daemon_connection() as conn:
@@ -58,7 +58,7 @@ class GetSyncStatus(ToolArgs):
     dialog_id: int = Field(description="Numeric dialog ID from ListDialogs")
 
 
-@mcp_tool("secondary/helper", annotations=ToolAnnotations(readOnlyHint=True))
+@mcp_tool(name="get_sync_status", title="Sync Status", posture="secondary/helper", annotations=ToolAnnotations(readOnlyHint=True))
 async def get_sync_status(args: GetSyncStatus) -> ToolResult:
     try:
         async with daemon_connection() as conn:
@@ -97,7 +97,7 @@ class GetSyncAlerts(ToolArgs):
     limit: int = Field(default=50, description="Maximum deleted messages and edits to return. Default 50.")
 
 
-@mcp_tool("secondary/helper", annotations=ToolAnnotations(readOnlyHint=True))
+@mcp_tool(name="get_sync_alerts", title="Sync Alerts", posture="secondary/helper", annotations=ToolAnnotations(readOnlyHint=True))
 async def get_sync_alerts(args: GetSyncAlerts) -> ToolResult:
     try:
         async with daemon_connection() as conn:
@@ -140,4 +140,3 @@ async def get_sync_alerts(args: GetSyncAlerts) -> ToolResult:
 
     total = len(deleted) + len(edits) + len(access_lost)
     return ToolResult(content=_text_response("\n".join(sections)), result_count=total)
-

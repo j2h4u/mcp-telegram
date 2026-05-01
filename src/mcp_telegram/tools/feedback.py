@@ -82,7 +82,7 @@ class SubmitFeedback(ToolArgs):
         return stripped
 
 
-@mcp_tool("primary", annotations=ToolAnnotations(readOnlyHint=False))
+@mcp_tool(name="submit_feedback", title="Submit Feedback", annotations=ToolAnnotations(readOnlyHint=False))
 async def submit_feedback(args: SubmitFeedback) -> ToolResult:
     try:
         async with daemon_connection() as conn:

@@ -60,7 +60,7 @@ class GetInbox(ToolArgs):
     )
 
 
-@mcp_tool("primary", annotations=ToolAnnotations(readOnlyHint=True))
+@mcp_tool(name="get_inbox", title="Inbox", annotations=ToolAnnotations(readOnlyHint=True))
 async def get_inbox(args: GetInbox) -> ToolResult:
     try:
         async with daemon_connection() as conn:

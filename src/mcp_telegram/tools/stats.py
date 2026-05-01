@@ -80,7 +80,7 @@ class GetUsageStats(ToolArgs):
     """Get actionable usage statistics from telemetry (last 30 days)."""
 
 
-@mcp_tool("secondary/helper", annotations=ToolAnnotations(readOnlyHint=True))
+@mcp_tool(name="get_usage_stats", title="Usage Stats", posture="secondary/helper", annotations=ToolAnnotations(readOnlyHint=True))
 async def get_usage_stats(args: GetUsageStats) -> ToolResult:
     try:
         async with daemon_connection() as conn:
@@ -130,7 +130,7 @@ def _format_stats_section(title: str, entries: list[dict], key: str) -> list[str
     return lines
 
 
-@mcp_tool("secondary/helper", annotations=ToolAnnotations(readOnlyHint=True))
+@mcp_tool(name="get_dialog_stats", title="Dialog Stats", posture="secondary/helper", annotations=ToolAnnotations(readOnlyHint=True))
 async def get_dialog_stats(args: GetDialogStats) -> ToolResult:
     dialog_id: int | None = parse_exact_dialog_id(args.dialog)
     dialog_name: str | None = None if dialog_id else args.dialog

@@ -53,7 +53,7 @@ class ListDialogs(ToolArgs):
     filter: str | None = Field(default=None, max_length=200)
 
 
-@mcp_tool("secondary/helper", annotations=ToolAnnotations(readOnlyHint=True))
+@mcp_tool(name="list_dialogs", title="List Dialogs", posture="secondary/helper", annotations=ToolAnnotations(readOnlyHint=True))
 async def list_dialogs(args: ListDialogs) -> ToolResult:
     try:
         async with daemon_connection() as conn:
@@ -180,7 +180,7 @@ class ListTopics(ToolArgs):
     dialog: str = Field(max_length=500)
 
 
-@mcp_tool("secondary/helper", annotations=ToolAnnotations(readOnlyHint=True))
+@mcp_tool(name="list_topics", title="List Topics", posture="secondary/helper", annotations=ToolAnnotations(readOnlyHint=True))
 async def list_topics(args: ListTopics) -> ToolResult:
     # Try to resolve dialog_id from parsing as numeric/username first
     dialog_id: int | None = parse_exact_dialog_id(args.dialog)

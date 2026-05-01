@@ -68,7 +68,7 @@ def _format_block(comment: dict[str, Any]) -> str:
     return block
 
 
-@mcp_tool("primary", annotations=ToolAnnotations(readOnlyHint=True))
+@mcp_tool(name="get_my_recent_activity", title="Recent Activity", annotations=ToolAnnotations(readOnlyHint=True))
 async def get_my_recent_activity(args: GetMyRecentActivity) -> ToolResult:
     try:
         async with daemon_connection() as conn:

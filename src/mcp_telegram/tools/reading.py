@@ -353,7 +353,7 @@ async def _resolve_topic_id(
     return error_result(f"Topic '{topic_name}' not found in this dialog.")
 
 
-@mcp_tool("primary", annotations=ToolAnnotations(readOnlyHint=True))
+@mcp_tool(name="list_messages", title="List Messages", annotations=ToolAnnotations(readOnlyHint=True))
 async def list_messages(args: ListMessages) -> ToolResult:
     has_filter = bool(args.sender or args.topic or args.exact_topic_id is not None or args.unread)
     has_cursor = args.navigation is not None and args.navigation not in {"newest", "oldest"}
@@ -526,7 +526,7 @@ class SearchMessages(ToolArgs):
     )
 
 
-@mcp_tool("primary", annotations=ToolAnnotations(readOnlyHint=True))
+@mcp_tool(name="search_messages", title="Search Messages", annotations=ToolAnnotations(readOnlyHint=True))
 async def search_messages(args: SearchMessages) -> ToolResult:
     global_mode = args.dialog is None
 

@@ -1,9 +1,9 @@
 {
   "steps": [
     {
-      "_comment": "ListDialogs — returns real dialogs with metadata",
+      "_comment": "list_dialogs — returns real dialogs with metadata",
       "action": "call_tool",
-      "name": "ListDialogs",
+      "name": "list_dialogs",
       "arguments": {},
       "expect": {
         "is_error": false,
@@ -11,63 +11,63 @@
       }
     },
     {
-      "_comment": "GetUsageStats — returns account-level usage stats",
+      "_comment": "get_usage_stats — returns account-level usage stats",
       "action": "call_tool",
-      "name": "GetUsageStats",
+      "name": "get_usage_stats",
       "arguments": {},
       "expect": {
         "is_error": false
       }
     },
     {
-      "_comment": "ListTopics — non-forum channel returns graceful response (no crash)",
+      "_comment": "list_topics — non-forum channel returns graceful response (no crash)",
       "action": "call_tool",
-      "name": "ListTopics",
+      "name": "list_topics",
       "arguments": {"dialog": "Vibecoding is so last year"},
       "expect": {
         "is_error": false
       }
     },
     {
-      "_comment": "ListMessages — synced channel",
+      "_comment": "list_messages — synced channel",
       "action": "call_tool",
-      "name": "ListMessages",
+      "name": "list_messages",
       "arguments": {"dialog": "Vibecoding is so last year", "limit": 3},
       "expect": {
         "is_error": false
       }
     },
     {
-      "_comment": "ListMessages — Saved Messages",
+      "_comment": "list_messages — Saved Messages",
       "action": "call_tool",
-      "name": "ListMessages",
+      "name": "list_messages",
       "arguments": {"dialog": "Saved Messages", "limit": 5},
       "expect": {
         "is_error": false
       }
     },
     {
-      "_comment": "SearchMessages — keyword search in synced channel",
+      "_comment": "search_messages — keyword search in synced channel",
       "action": "call_tool",
-      "name": "SearchMessages",
+      "name": "search_messages",
       "arguments": {"dialog": "Vibecoding is so last year", "query": "ai", "limit": 3},
       "expect": {
         "is_error": false
       }
     },
     {
-      "_comment": "GetInbox — personal scope",
+      "_comment": "get_inbox — personal scope",
       "action": "call_tool",
-      "name": "GetInbox",
+      "name": "get_inbox",
       "arguments": {},
       "expect": {
         "is_error": false
       }
     },
     {
-      "_comment": "GetSyncStatus — returns structured status (synced or not_synced)",
+      "_comment": "get_sync_status — returns structured status (synced or not_synced)",
       "action": "call_tool",
-      "name": "GetSyncStatus",
+      "name": "get_sync_status",
       "arguments": {"dialog_id": 12345},
       "expect": {
         "is_error": false,
@@ -75,36 +75,36 @@
       }
     },
     {
-      "_comment": "GetSyncAlerts — returns alerts or 'No sync alerts'",
+      "_comment": "get_sync_alerts — returns alerts or 'No sync alerts'",
       "action": "call_tool",
-      "name": "GetSyncAlerts",
+      "name": "get_sync_alerts",
       "arguments": {"since": 0, "limit": 10},
       "expect": {
         "is_error": false
       }
     },
     {
-      "_comment": "GetDialogStats — returns stats or actionable 'not synced' error depending on runtime state",
+      "_comment": "get_dialog_stats — returns stats or actionable 'not synced' error depending on runtime state",
       "action": "call_tool",
-      "name": "GetDialogStats",
+      "name": "get_dialog_stats",
       "arguments": {"dialog": "Vibecoding is so last year", "top_n": 3},
       "expect": {
         "is_error": false
       }
     },
     {
-      "_comment": "GetMyRecentActivity — own sent messages with reply counts and reactions",
+      "_comment": "get_my_recent_activity — own sent messages with reply counts and reactions",
       "action": "call_tool",
-      "name": "GetMyRecentActivity",
+      "name": "get_my_recent_activity",
       "arguments": {"since_hours": 24, "limit": 50},
       "expect": {
         "is_error": false
       }
     },
     {
-      "_comment": "SubmitFeedback — live round-trip into feedback.db",
+      "_comment": "submit_feedback — live round-trip into feedback.db",
       "action": "call_tool",
-      "name": "SubmitFeedback",
+      "name": "submit_feedback",
       "arguments": {
         "message": "Phase 48 integration smoke — please ignore",
         "severity": "bug",

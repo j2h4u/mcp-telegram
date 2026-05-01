@@ -10,7 +10,7 @@ uv run python -m devtools.mcp_client.cli list-tools -- docker exec mcp-telegram 
 
 ```bash
 uv run python -m devtools.mcp_client.cli call-tool \
-  --name ListTopics \
+  --name list_topics \
   --arguments '{"dialog":"Studio Robots and Inbox"}' \
   -- docker exec mcp-telegram mcp-telegram run
 ```
@@ -43,7 +43,7 @@ Run several actions in one MCP session:
     {"action": "list_tools"},
     {
       "action": "call_tool",
-      "name": "ListDialogs",
+      "name": "list_dialogs",
       "arguments": {}
     }
   ]

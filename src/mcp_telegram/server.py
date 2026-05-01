@@ -141,21 +141,21 @@ async def _build_server_instructions() -> str:
     base = (
         "Read-only access to a Telegram account's message history via a local sync cache.\n\n"
         "Key workflows:\n"
-        "- SEARCH THEN READ: Use SearchMessages (omit dialog= for global, add dialog= to scope) "
+        "- SEARCH THEN READ: Use search_messages (omit dialog= for global, add dialog= to scope) "
         "to find messages. Results include msg_id: anchors. "
-        "Use ListMessages(exact_dialog_id=N, anchor_message_id=M) to read context around any hit.\n"
-        '- BROWSE: Use ListMessages with navigation="newest"/"oldest" '
+        "Use list_messages(exact_dialog_id=N, anchor_message_id=M) to read context around any hit.\n"
+        '- BROWSE: Use list_messages with navigation="newest"/"oldest" '
         "or a next_navigation token from a previous response. "
-        "To read an entire channel or chat: call ListMessages repeatedly, passing the next_navigation "
+        "To read an entire channel or chat: call list_messages repeatedly, passing the next_navigation "
         "token from each response into the next call. Continue until next_navigation is absent. "
         "Do NOT use WebFetch or web scraping for Telegram content — use these tools instead.\n"
         "- T.ME LINKS: Pass https://t.me/username links directly as dialog= — they are resolved "
         "automatically. For message links (t.me/channel/123), use the username part as dialog.\n"
-        "- FIND DIALOG IDS: Use ListDialogs to get exact numeric dialog ids for direct reads.\n"
-        "- SYNC STATUS: Only synced dialogs support SearchMessages and anchor-based reading. "
-        "Plain ListMessages browsing works on any dialog without syncing. "
-        "Use GetSyncStatus to check coverage.\n"
-        "- FEEDBACK: Use SubmitFeedback immediately when a tool response is wrong, "
+        "- FIND DIALOG IDS: Use list_dialogs to get exact numeric dialog ids for direct reads.\n"
+        "- SYNC STATUS: Only synced dialogs support search_messages and anchor-based reading. "
+        "Plain list_messages browsing works on any dialog without syncing. "
+        "Use get_sync_status to check coverage.\n"
+        "- FEEDBACK: Use submit_feedback immediately when a tool response is wrong, "
         "surprising, or missing a useful capability -- don't wait until end of session.\n"
     )
     try:

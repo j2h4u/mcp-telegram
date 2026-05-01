@@ -125,7 +125,7 @@ class GetEntityInfo(ToolArgs):
     entity: str = Field(max_length=500)
 
 
-@mcp_tool("primary", annotations=ToolAnnotations(readOnlyHint=True))
+@mcp_tool(name="get_entity_info", title="Entity Info", annotations=ToolAnnotations(readOnlyHint=True))
 async def get_entity_info(args: GetEntityInfo) -> ToolResult:
     # Numeric ID shortcut: skip resolver entirely and go straight to daemon.
     try:

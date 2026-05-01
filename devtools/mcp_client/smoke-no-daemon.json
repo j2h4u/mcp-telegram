@@ -5,36 +5,36 @@
       "action": "list_tools",
       "expect": {
         "tool_names_include": [
-          "ListDialogs",
-          "ListMessages",
-          "SearchMessages",
-          "ListTopics",
-          "GetInbox",
-          "GetEntityInfo",
-          "GetUsageStats",
-          "GetDialogStats",
-          "GetMyRecentActivity",
-          "MarkDialogForSync",
-          "GetSyncStatus",
-          "GetSyncAlerts",
-          "SubmitFeedback"
+          "list_dialogs",
+          "list_messages",
+          "search_messages",
+          "list_topics",
+          "get_inbox",
+          "get_entity_info",
+          "get_usage_stats",
+          "get_dialog_stats",
+          "get_my_recent_activity",
+          "mark_dialog_for_sync",
+          "get_sync_status",
+          "get_sync_alerts",
+          "submit_feedback"
         ],
         "tool_expectations": {
-          "ListMessages": {
+          "list_messages": {
             "inputSchema.properties.limit.default": 50,
             "inputSchema.properties.navigation.type": "string"
           },
-          "SearchMessages": {
+          "search_messages": {
             "inputSchema.properties.navigation.type": "string"
           },
-          "MarkDialogForSync": {
+          "mark_dialog_for_sync": {
             "inputSchema.properties.dialog_id.type": "integer",
             "inputSchema.properties.enable.default": true
           },
-          "GetSyncStatus": {
+          "get_sync_status": {
             "inputSchema.properties.dialog_id.type": "integer"
           },
-          "SubmitFeedback": {
+          "submit_feedback": {
             "inputSchema.properties.message.type": "string",
             "inputSchema.properties.message.maxLength": 10000
           }
@@ -43,9 +43,9 @@
     },
 
     {
-      "_comment": "ListDialogs — daemon route",
+      "_comment": "list_dialogs — daemon route",
       "action": "call_tool",
-      "name": "ListDialogs",
+      "name": "list_dialogs",
       "arguments": {},
       "expect": {
         "is_error": false,
@@ -53,9 +53,9 @@
       }
     },
     {
-      "_comment": "ListMessages — daemon route",
+      "_comment": "list_messages — daemon route",
       "action": "call_tool",
-      "name": "ListMessages",
+      "name": "list_messages",
       "arguments": {"dialog": "test", "limit": 1},
       "expect": {
         "is_error": false,
@@ -63,9 +63,9 @@
       }
     },
     {
-      "_comment": "SearchMessages — daemon route",
+      "_comment": "search_messages — daemon route",
       "action": "call_tool",
-      "name": "SearchMessages",
+      "name": "search_messages",
       "arguments": {"dialog": "test", "query": "hello", "limit": 1},
       "expect": {
         "is_error": false,
@@ -73,9 +73,9 @@
       }
     },
     {
-      "_comment": "ListTopics — daemon route",
+      "_comment": "list_topics — daemon route",
       "action": "call_tool",
-      "name": "ListTopics",
+      "name": "list_topics",
       "arguments": {"dialog": "test"},
       "expect": {
         "is_error": false,
@@ -83,9 +83,9 @@
       }
     },
     {
-      "_comment": "MarkDialogForSync — daemon route",
+      "_comment": "mark_dialog_for_sync — daemon route",
       "action": "call_tool",
-      "name": "MarkDialogForSync",
+      "name": "mark_dialog_for_sync",
       "arguments": {"dialog_id": 12345, "enable": true},
       "expect": {
         "is_error": false,
@@ -93,9 +93,9 @@
       }
     },
     {
-      "_comment": "GetSyncStatus — daemon route",
+      "_comment": "get_sync_status — daemon route",
       "action": "call_tool",
-      "name": "GetSyncStatus",
+      "name": "get_sync_status",
       "arguments": {"dialog_id": 12345},
       "expect": {
         "is_error": false,
@@ -103,9 +103,9 @@
       }
     },
     {
-      "_comment": "GetEntityInfo — resolve first, daemon not running so returns not-running message",
+      "_comment": "get_entity_info — resolve first, daemon not running so returns not-running message",
       "action": "call_tool",
-      "name": "GetEntityInfo",
+      "name": "get_entity_info",
       "arguments": {"entity": "nonexistent_test_entity_12345"},
       "expect": {
         "is_error": false,
@@ -113,9 +113,9 @@
       }
     },
     {
-      "_comment": "GetInbox — daemon route",
+      "_comment": "get_inbox — daemon route",
       "action": "call_tool",
-      "name": "GetInbox",
+      "name": "get_inbox",
       "arguments": {},
       "expect": {
         "is_error": false,
@@ -123,18 +123,18 @@
       }
     },
     {
-      "_comment": "GetUsageStats — analytics.db, works without daemon",
+      "_comment": "get_usage_stats — analytics.db, works without daemon",
       "action": "call_tool",
-      "name": "GetUsageStats",
+      "name": "get_usage_stats",
       "arguments": {},
       "expect": {
         "is_error": false
       }
     },
     {
-      "_comment": "SubmitFeedback — daemon route, fails gracefully when daemon is down",
+      "_comment": "submit_feedback — daemon route, fails gracefully when daemon is down",
       "action": "call_tool",
-      "name": "SubmitFeedback",
+      "name": "submit_feedback",
       "arguments": {"message": "smoke test from no-daemon harness", "severity": "bug"},
       "expect": {
         "is_error": false,
