@@ -19,6 +19,7 @@ from mcp.types import (
     Prompt,
     Resource,
     ResourceTemplate,
+    TextContent,
     Tool,
 )
 
@@ -54,6 +55,10 @@ def _safe_boundary_error_text(*, tool_name: str, stage: str, exc: Exception) -> 
 
     action = "Retry the tool. If this persists, inspect the server logs for the underlying exception type."
     return f"Tool {tool_name} runtime execution failed: {detail}. Action: {action}"
+
+
+def _error_call_result(text: str) -> CallToolResult:
+    return CallToolResult(content=[TextContent(type="text", text=text)], isError=True)
 
 
 @app.list_prompts()
@@ -102,14 +107,14 @@ async def call_tool(name: str, arguments: t.Any) -> CallToolResult:
         except Exception as exc:
             elapsed = time.monotonic() - t0
             logger.exception("call_tool[%s] validation_failed after %.3fs", name, elapsed)
-            raise RuntimeError(_safe_boundary_error_text(tool_name=name, stage="validation", exc=exc)) from exc
+            return _error_call_result(_safe_boundary_error_text(tool_name=name, stage="validation", exc=exc))
 
         try:
             result = await tools.tool_runner(args)
         except Exception as exc:
             elapsed = time.monotonic() - t0
             logger.exception("call_tool[%s] runtime failed after %.3fs", name, elapsed)
-            raise RuntimeError(_safe_boundary_error_text(tool_name=name, stage="runtime", exc=exc)) from exc
+            return _error_call_result(_safe_boundary_error_text(tool_name=name, stage="runtime", exc=exc))
 
         elapsed = time.monotonic() - t0
         rid_str = ",".join(rids) if rids else "-"

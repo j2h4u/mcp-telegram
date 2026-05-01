@@ -164,8 +164,8 @@ async def test_list_dialogs_via_daemon():
     with _patch_daemon(conn):
         result = await list_dialogs(ListDialogs())
 
-    assert len(result) == 1
-    text = result[0].text
+    assert len(result.content) == 1
+    text = result.content[0].text
     assert "Alice" in text
     assert "Dev Chat" in text
     assert "sync_status=synced" in text
@@ -195,7 +195,7 @@ async def test_list_dialogs_sync_status_in_output():
     with _patch_daemon(conn):
         result = await list_dialogs(ListDialogs())
 
-    assert "sync_status=" in result[0].text
+    assert "sync_status=" in result.content[0].text
 
 
 async def test_list_dialogs_empty_via_daemon():
@@ -204,7 +204,7 @@ async def test_list_dialogs_empty_via_daemon():
     with _patch_daemon(conn):
         result = await list_dialogs(ListDialogs())
 
-    assert "No dialogs" in result[0].text
+    assert "No dialogs" in result.content[0].text
 
 
 async def test_list_dialogs_upserts_entities_via_daemon():
@@ -272,8 +272,8 @@ async def test_list_topics_via_daemon():
     with _patch_daemon(conn):
         result = await list_topics(ListTopics(dialog="MyGroup"))
 
-    assert len(result) == 1
-    text = result[0].text
+    assert len(result.content) == 1
+    text = result.content[0].text
     assert "General" in text
     assert "Off-topic" in text
     conn.list_topics.assert_called_once()
@@ -301,7 +301,7 @@ async def test_list_topics_dialog_not_found():
     with _patch_daemon(conn):
         result = await list_topics(ListTopics(dialog="nonexistent"))
 
-    assert "not found" in result[0].text.lower()
+    assert "not found" in result.content[0].text.lower()
 
 
 
@@ -338,8 +338,8 @@ async def test_list_messages_via_daemon():
     with _patch_daemon(conn):
         result = await list_messages(ListMessages(exact_dialog_id=123))
 
-    assert len(result) == 1
-    assert "Hello" in result[0].text
+    assert len(result.content) == 1
+    assert "Hello" in result.content[0].text
     conn.list_messages.assert_called_once()
 
 
@@ -377,7 +377,7 @@ async def test_list_messages_dialog_not_found():
     with _patch_daemon(conn):
         result = await list_messages(ListMessages(dialog="ghost"))
 
-    assert "not found" in result[0].text.lower()
+    assert "not found" in result.content[0].text.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -408,7 +408,7 @@ async def test_search_messages_via_daemon():
     with _patch_daemon(conn):
         result = await search_messages(SearchMessages(dialog="123", query="result"))
 
-    assert "Found this result" in result[0].text
+    assert "Found this result" in result.content[0].text
     conn.search_messages.assert_called_once()
 
 
@@ -429,8 +429,8 @@ async def test_search_messages_no_hits():
     with _patch_daemon(conn):
         result = await search_messages(SearchMessages(dialog="123", query="nonexistent"))
 
-    assert len(result) == 1
-    assert "no messages matched" in result[0].text.lower(), f"Expected no-hits text, got: {result[0].text}"
+    assert len(result.content) == 1
+    assert "no messages matched" in result.content[0].text.lower(), f"Expected no-hits text, got: {result.content[0].text}"
 
 
 # ---------------------------------------------------------------------------
@@ -443,7 +443,7 @@ async def test_list_dialogs_daemon_not_running():
     with _patch_daemon_not_running():
         result = await list_dialogs(ListDialogs())
 
-    text = result[0].text
+    text = result.content[0].text
     assert "not running" in text.lower() or "mcp-telegram sync" in text.lower()
 
 
@@ -452,7 +452,7 @@ async def test_list_messages_daemon_not_running():
     with _patch_daemon_not_running():
         result = await list_messages(ListMessages(exact_dialog_id=123))
 
-    text = result[0].text
+    text = result.content[0].text
     assert "not running" in text.lower() or "mcp-telegram sync" in text.lower()
 
 
@@ -461,7 +461,7 @@ async def test_search_messages_daemon_not_running():
     with _patch_daemon_not_running():
         result = await search_messages(SearchMessages(dialog="123", query="test"))
 
-    text = result[0].text
+    text = result.content[0].text
     assert "not running" in text.lower() or "mcp-telegram sync" in text.lower()
 
 
@@ -470,7 +470,7 @@ async def test_list_topics_daemon_not_running():
     with _patch_daemon_not_running():
         result = await list_topics(ListTopics(dialog="group"))
 
-    text = result[0].text
+    text = result.content[0].text
     assert "not running" in text.lower() or "mcp-telegram sync" in text.lower()
 
 
@@ -503,8 +503,8 @@ async def test_mark_dialog_for_sync_via_daemon():
     conn = _make_daemon_conn({"ok": True})
     with _patch_daemon(conn):
         result = await mark_dialog_for_sync(MarkDialogForSync(dialog_id=42, enable=True))
-    assert len(result) == 1
-    assert "marked for sync" in result[0].text
+    assert len(result.content) == 1
+    assert "marked for sync" in result.content[0].text
     conn.mark_dialog_for_sync.assert_called_once_with(dialog_id=42, enable=True)
 
 
@@ -513,7 +513,7 @@ async def test_mark_dialog_for_sync_disable():
     conn = _make_daemon_conn({"ok": True})
     with _patch_daemon(conn):
         result = await mark_dialog_for_sync(MarkDialogForSync(dialog_id=42, enable=False))
-    assert "unmarked from sync" in result[0].text
+    assert "unmarked from sync" in result.content[0].text
     conn.mark_dialog_for_sync.assert_called_once_with(dialog_id=42, enable=False)
 
 
@@ -521,7 +521,7 @@ async def test_mark_dialog_for_sync_daemon_not_running():
     """MarkDialogForSync returns actionable error when daemon is not running."""
     with _patch_daemon_not_running():
         result = await mark_dialog_for_sync(MarkDialogForSync(dialog_id=42))
-    assert "not running" in result[0].text.lower() or "mcp-telegram sync" in result[0].text.lower()
+    assert "not running" in result.content[0].text.lower() or "mcp-telegram sync" in result.content[0].text.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -548,7 +548,7 @@ async def test_get_sync_status_via_daemon():
     )
     with _patch_daemon(conn):
         result = await get_sync_status(GetSyncStatus(dialog_id=-1001234567890))
-    text = result[0].text
+    text = result.content[0].text
     assert "status=synced" in text
     assert "message_count=100" in text
     assert "delete_detection=reliable (channel)" in text
@@ -559,7 +559,7 @@ async def test_get_sync_status_daemon_not_running():
     """GetSyncStatus returns actionable error when daemon is not running."""
     with _patch_daemon_not_running():
         result = await get_sync_status(GetSyncStatus(dialog_id=123))
-    assert "not running" in result[0].text.lower() or "mcp-telegram sync" in result[0].text.lower()
+    assert "not running" in result.content[0].text.lower() or "mcp-telegram sync" in result.content[0].text.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -587,7 +587,7 @@ async def test_get_sync_alerts_via_daemon():
     )
     with _patch_daemon(conn):
         result = await get_sync_alerts(GetSyncAlerts(since=0, limit=50))
-    text = result[0].text
+    text = result.content[0].text
     assert "Deleted Messages" in text
     assert "dialog=1" in text
     assert "Edits" in text
@@ -606,14 +606,14 @@ async def test_get_sync_alerts_empty():
     )
     with _patch_daemon(conn):
         result = await get_sync_alerts(GetSyncAlerts())
-    assert "No sync alerts" in result[0].text
+    assert "No sync alerts" in result.content[0].text
 
 
 async def test_get_sync_alerts_daemon_not_running():
     """GetSyncAlerts returns actionable error when daemon is not running."""
     with _patch_daemon_not_running():
         result = await get_sync_alerts(GetSyncAlerts())
-    assert "not running" in result[0].text.lower() or "mcp-telegram sync" in result[0].text.lower()
+    assert "not running" in result.content[0].text.lower() or "mcp-telegram sync" in result.content[0].text.lower()
 
 
 def test_no_connected_client_in_tools():
@@ -667,7 +667,7 @@ async def test_get_entity_info_resolves_via_daemon():
     with _patch_daemon(conn):
         result = await get_entity_info(GetEntityInfo(entity="Alice"))
 
-    text = result[0].text
+    text = result.content[0].text
     assert '[resolved: "Alice"]' in text
     assert "12345" in text
     assert "Dev Chat" in text
@@ -680,7 +680,7 @@ async def test_get_entity_info_daemon_not_running():
     with _patch_daemon_not_running():
         result = await get_entity_info(GetEntityInfo(entity="Alice"))
 
-    assert "not running" in result[0].text.lower() or "mcp-telegram sync" in result[0].text.lower()
+    assert "not running" in result.content[0].text.lower() or "mcp-telegram sync" in result.content[0].text.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -720,7 +720,7 @@ async def test_get_inbox_via_daemon():
     with _patch_daemon(conn):
         result = await get_inbox(GetInbox())
 
-    text = result[0].text
+    text = result.content[0].text
     assert "Alice" in text
     assert "Hello there" in text
     conn.get_inbox.assert_called_once()
@@ -732,7 +732,7 @@ async def test_get_inbox_empty():
     with _patch_daemon(conn):
         result = await get_inbox(GetInbox())
 
-    assert "no unread" in result[0].text.lower() or "непрочитанных" in result[0].text.lower()
+    assert "no unread" in result.content[0].text.lower() or "непрочитанных" in result.content[0].text.lower()
 
 
 async def test_get_inbox_daemon_not_running():
@@ -740,7 +740,7 @@ async def test_get_inbox_daemon_not_running():
     with _patch_daemon_not_running():
         result = await get_inbox(GetInbox())
 
-    assert "not running" in result[0].text.lower() or "mcp-telegram sync" in result[0].text.lower()
+    assert "not running" in result.content[0].text.lower() or "mcp-telegram sync" in result.content[0].text.lower()
 
 
 async def test_get_inbox_passes_params():
@@ -769,7 +769,7 @@ async def test_get_inbox_empty_with_bootstrap_pending():
     with _patch_daemon(conn):
         result = await get_inbox(GetInbox())
 
-    text = result[0].text
+    text = result.content[0].text
     # Must mention the pending count
     assert "329" in text, f"bootstrap_pending count missing from response: {text!r}"
     # Must mention the bootstrap state in some recognisable form
@@ -792,7 +792,7 @@ async def test_get_inbox_empty_with_no_bootstrap_pending():
     with _patch_daemon(conn):
         result = await get_inbox(GetInbox())
 
-    lowered = result[0].text.lower()
+    lowered = result.content[0].text.lower()
     assert "no unread" in lowered or "непрочитанных" in lowered
 
 
@@ -832,7 +832,7 @@ async def test_get_inbox_non_empty_with_bootstrap_pending():
     with _patch_daemon(conn):
         result = await get_inbox(GetInbox())
 
-    text = result[0].text
+    text = result.content[0].text
     # Existing format preserved
     assert "Alice" in text
     assert "Hello there" in text
@@ -879,7 +879,7 @@ async def test_get_inbox_non_empty_with_no_bootstrap_pending():
     with _patch_daemon(conn):
         result = await get_inbox(GetInbox())
 
-    text = result[0].text
+    text = result.content[0].text
     assert "Alice" in text
     assert "Hello there" in text
     # No spurious disclosure when coverage is complete
@@ -911,7 +911,7 @@ async def test_get_usage_stats_via_daemon():
     with _patch_daemon(conn):
         result = await get_usage_stats(GetUsageStats())
 
-    text = result[0].text
+    text = result.content[0].text
     assert "ListDialogs" in text
     assert "120" in text  # latency_median_ms
     conn.get_usage_stats.assert_called_once()
@@ -922,7 +922,7 @@ async def test_get_usage_stats_daemon_not_running():
     with _patch_daemon_not_running():
         result = await get_usage_stats(GetUsageStats())
 
-    text = result[0].text
+    text = result.content[0].text
     assert "not running" in text.lower() or "mcp-telegram sync" in text.lower()
 
 
@@ -937,7 +937,7 @@ async def test_get_usage_stats_empty_data():
     with _patch_daemon(conn):
         result = await get_usage_stats(GetUsageStats())
 
-    text = result[0].text
+    text = result.content[0].text
     assert "no usage data" in text.lower()
 
 
@@ -1370,7 +1370,7 @@ async def test_list_messages_topic_fuzzy_ambiguous_returns_error():
     with _patch_daemon(conn):
         result = await list_messages(ListMessages(exact_dialog_id=1, topic="General"))
 
-    text = result[0].text
+    text = result.content[0].text
     assert "ambiguous" in text.lower() or "matches" in text.lower() or "exact_topic_id" in text.lower()
 
 
@@ -1390,7 +1390,7 @@ async def test_list_messages_topic_not_found_returns_error():
     with _patch_daemon(conn):
         result = await list_messages(ListMessages(exact_dialog_id=1, topic="nonexistent"))
 
-    text = result[0].text
+    text = result.content[0].text
     assert "not found" in text.lower() or "nonexistent" in text.lower()
 
 
@@ -1446,7 +1446,7 @@ async def test_get_my_recent_activity_routes_primary():
     )
     with _patch_daemon(conn):
         result = await get_my_recent_activity(GetMyRecentActivity(since_hours=168, limit=500))
-    text = result[0].text
+    text = result.content[0].text
     # Per-comment granularity (D-09): both blocks present
     assert "message_id=100" in text
     assert "message_id=101" in text
@@ -1466,7 +1466,7 @@ async def test_get_my_recent_activity_never_run_header():
     )
     with _patch_daemon(conn):
         result = await get_my_recent_activity(GetMyRecentActivity())
-    assert "Scan status: never run" in result[0].text
+    assert "Scan status: never run" in result.content[0].text
 
 
 async def test_get_my_recent_activity_in_progress_header():
@@ -1485,7 +1485,7 @@ async def test_get_my_recent_activity_in_progress_header():
     )
     with _patch_daemon(conn):
         result = await get_my_recent_activity(GetMyRecentActivity())
-    assert "Scan status: in progress" in result[0].text
+    assert "Scan status: in progress" in result.content[0].text
 
 
 async def test_get_my_recent_activity_formats_comment_block():
@@ -1512,7 +1512,7 @@ async def test_get_my_recent_activity_formats_comment_block():
     )
     with _patch_daemon(conn):
         result = await get_my_recent_activity(GetMyRecentActivity())
-    text = result[0].text
+    text = result.content[0].text
     assert "[X]" in text
     assert "hi" in text
     assert "nav: dialog_id=42 message_id=100" in text
@@ -1547,7 +1547,7 @@ async def test_get_my_recent_activity_renders_reactions():
     )
     with _patch_daemon(conn):
         result = await get_my_recent_activity(GetMyRecentActivity())
-    text = result[0].text
+    text = result.content[0].text
     assert "reactions:" in text
     assert "🔥×3" in text
     assert "❤×1" in text
@@ -1563,7 +1563,7 @@ async def test_list_messages_fragment_coverage_header():
     )
     with _patch_daemon(conn):
         result = await list_messages(ListMessages(exact_dialog_id=42))
-    assert "Coverage: fragment" in result[0].text
+    assert "Coverage: fragment" in result.content[0].text
 
 
 async def test_list_messages_no_fragment_no_header():
@@ -1571,4 +1571,4 @@ async def test_list_messages_no_fragment_no_header():
     conn = _make_daemon_conn({"ok": True, "data": {"messages": []}})
     with _patch_daemon(conn):
         result = await list_messages(ListMessages(exact_dialog_id=42))
-    assert "Coverage: fragment" not in result[0].text
+    assert "Coverage: fragment" not in result.content[0].text

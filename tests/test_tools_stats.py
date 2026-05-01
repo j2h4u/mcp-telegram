@@ -68,8 +68,7 @@ async def test_get_dialog_stats_formats_sections() -> None:
     with _patch_daemon(conn):
         content = await get_dialog_stats(GetDialogStats(dialog="Chat Foo"))
 
-    # @mcp_tool wraps the runner and returns tool_result.content (list of TextContent)
-    text = content[0].text  # type: ignore[index]
+    text = content.content[0].text
     assert "Top Reactions" in text
     assert "Top Mentions" in text
     assert "Top Hashtags" in text
@@ -94,7 +93,8 @@ async def test_get_dialog_stats_not_synced_error() -> None:
     with _patch_daemon(conn):
         content = await get_dialog_stats(GetDialogStats(dialog="Unknown Chat"))
 
-    text = content[0].text  # type: ignore[index]
+    assert content.is_error is True
+    text = content.content[0].text
     assert "MarkDialogForSync" in text
 
 
@@ -117,7 +117,7 @@ async def test_get_dialog_stats_empty_sections() -> None:
     with _patch_daemon(conn):
         content = await get_dialog_stats(GetDialogStats(dialog="Empty Chat"))
 
-    text = content[0].text  # type: ignore[index]
+    text = content.content[0].text
     assert text.count("(none)") == 4
 
 
@@ -133,5 +133,6 @@ async def test_get_dialog_stats_daemon_not_running() -> None:
     with patch("mcp_telegram.tools.stats.daemon_connection", _raise_not_running):
         content = await get_dialog_stats(GetDialogStats(dialog="Any Chat"))
 
-    text = content[0].text  # type: ignore[index]
+    assert content.is_error is True
+    text = content.content[0].text
     assert "mcp-telegram sync" in text or "not running" in text.lower()

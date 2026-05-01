@@ -50,8 +50,8 @@ async def test_submit_feedback_tool_happy_path(mock_daemon_connection) -> None:
     args = SubmitFeedback(message="the bug")
     result = await submit_feedback(args)
 
-    assert len(result) == 1
-    assert result[0].text == "Feedback recorded. Thank you!"
+    assert len(result.content) == 1
+    assert result.content[0].text == "Feedback recorded. Thank you!"
 
 
 @pytest.mark.asyncio
@@ -109,8 +109,9 @@ async def test_submit_feedback_tool_daemon_not_running() -> None:
         args = SubmitFeedback(message="test")
         result = await submit_feedback(args)
 
-    assert "mcp-telegram sync" in result[0].text
-    assert result[0].text == _daemon_not_running_text()
+    assert result.is_error is True
+    assert "mcp-telegram sync" in result.content[0].text
+    assert result.content[0].text == _daemon_not_running_text()
 
 
 @pytest.mark.asyncio
@@ -129,8 +130,9 @@ async def test_submit_feedback_tool_daemon_error_response() -> None:
         args = SubmitFeedback(message="test")
         result = await submit_feedback(args)
 
-    assert result[0].text.startswith("Error:")
-    assert "internal error" in result[0].text
+    assert result.is_error is True
+    assert result.content[0].text.startswith("Error:")
+    assert "internal error" in result.content[0].text
 
 
 # ---------------------------------------------------------------------------

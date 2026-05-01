@@ -6,6 +6,7 @@ import pytest
 from mcp.types import TextContent, Tool
 
 from mcp_telegram import server
+from mcp_telegram.tools._base import ToolResult
 
 
 def _tool(name: str) -> Tool:
@@ -39,10 +40,10 @@ def test_list_messages_reflection_exposes_shared_navigation_schema() -> None:
 
 @pytest.mark.asyncio
 async def test_call_tool_validation_rejects_conflicting_list_messages_selectors() -> None:
-    with pytest.raises(RuntimeError, match="ListMessages") as exc_info:
-        await server.call_tool("ListMessages", {"dialog": "Backend", "exact_dialog_id": 701})
+    result = await server.call_tool("ListMessages", {"dialog": "Backend", "exact_dialog_id": 701})
 
-    message = str(exc_info.value)
+    assert result.isError is True
+    message = result.content[0].text
     assert "validation" in message.lower()
     assert "mutually exclusive" in message.lower()
     assert "exact_dialog_id" in message
@@ -72,10 +73,10 @@ async def test_call_tool_validation_failure_escaped_error_includes_actionable_gu
 
     monkeypatch.setattr("mcp_telegram.server.tools.tool_args", _raise_validation_error)
 
-    with pytest.raises(RuntimeError, match="ListDialogs") as exc_info:
-        await server.call_tool("ListDialogs", {"dialog": 123})
+    result = await server.call_tool("ListDialogs", {"dialog": 123})
 
-    message = str(exc_info.value)
+    assert result.isError is True
+    message = result.content[0].text
     assert "validation" in message.lower() or "argument" in message.lower()
     assert "dialog" in message.lower()
     assert "action:" in message.lower() or "retry" in message.lower() or "check" in message.lower()
@@ -91,10 +92,10 @@ async def test_call_tool_runtime_failure_escaped_error_includes_actionable_guida
         AsyncMock(side_effect=RuntimeError("telegram backend timed out")),
     )
 
-    with pytest.raises(RuntimeError, match="ListDialogs") as exc_info:
-        await server.call_tool("ListDialogs", {})
+    result = await server.call_tool("ListDialogs", {})
 
-    message = str(exc_info.value)
+    assert result.isError is True
+    message = result.content[0].text
     assert "runtime" in message.lower() or "execution" in message.lower()
     assert "timed out" in message.lower() or "timeout" in message.lower()
     assert "action:" in message.lower() or "retry" in message.lower() or "check" in message.lower()
@@ -113,20 +114,27 @@ async def test_call_tool_passthrough_action_text_contract(monkeypatch) -> None:
     ]
 
     monkeypatch.setattr("mcp_telegram.server.tools.tool_args", lambda tool, **kwargs: object())
-    monkeypatch.setattr("mcp_telegram.server.tools.tool_runner", AsyncMock(return_value=expected))
+    monkeypatch.setattr("mcp_telegram.server.tools.tool_runner", AsyncMock(return_value=ToolResult(content=expected)))
 
     result = await server.call_tool("GetEntityInfo", {"entity": "Iris"})
 
-    assert result == expected
-    assert result[0].text == expected[0].text
-    assert "Action:" in result[0].text
-    assert "failed" not in result[0].text
+    assert result.content == expected
+    assert result.isError is False
+    assert result.content[0].text == expected[0].text
+    assert "Action:" in result.content[0].text
+    assert "failed" not in result.content[0].text
 
 
 @pytest.mark.asyncio
 async def test_call_tool_unknown_tool_control_contract() -> None:
     with pytest.raises(ValueError, match="Unknown tool: MissingTool"):
         await server.call_tool("MissingTool", {})
+
+
+@pytest.mark.asyncio
+async def test_call_tool_non_dict_arguments_control_contract() -> None:
+    with pytest.raises(TypeError, match="arguments must be dictionary"):
+        await server.call_tool("ListDialogs", [])
 
 
 def test_posture_primary_tools_reflected_in_descriptions() -> None:
@@ -244,7 +252,7 @@ async def test_list_messages_tool_archived_warning_with_coverage(monkeypatch):
     monkeypatch.setattr("mcp_telegram.tools.reading.daemon_connection", lambda: mock_conn)
 
     result = await server.call_tool("ListMessages", {"exact_dialog_id": 123})
-    text = result[0].text
+    text = result.content[0].text
     assert "⚠" in text
     assert "archive" in text.lower()
     assert "2023-11-14" in text
@@ -273,7 +281,7 @@ async def test_list_messages_tool_archived_warning_unknown_coverage(monkeypatch)
     monkeypatch.setattr("mcp_telegram.tools.reading.daemon_connection", lambda: mock_conn)
 
     result = await server.call_tool("ListMessages", {"exact_dialog_id": 123})
-    text = result[0].text
+    text = result.content[0].text
     assert "⚠" in text
     assert "150 messages archived locally" in text
 
@@ -299,7 +307,7 @@ async def test_list_messages_tool_uses_last_synced_at_not_access_lost_at(monkeyp
     monkeypatch.setattr("mcp_telegram.tools.reading.daemon_connection", lambda: mock_conn)
 
     result = await server.call_tool("ListMessages", {"exact_dialog_id": 123})
-    text = result[0].text
+    text = result.content[0].text
     # Must show 2023-11-14 (last_synced_at), NOT 2024-01-01 (access_lost_at)
     assert "2023-11-14" in text
     assert "2024-01-01" not in text
