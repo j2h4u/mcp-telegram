@@ -512,7 +512,7 @@ def test_format_messages_backward_compat_without_kwargs() -> None:
 
 
 def test_format_messages_emits_inline_marker_trailing() -> None:
-    """Marker appended at end of the message line."""
+    """Marker appended at end of the framed Telegram content block."""
     from mcp_telegram.formatter import format_messages
 
     msgs = [
@@ -527,10 +527,9 @@ def test_format_messages_emits_inline_marker_trailing() -> None:
         "outbox_cursor_state": "populated",
     }
     result = format_messages(msgs, reply_map={}, read_state=rs, dialog_type="User", now_unix=_unix(12, 10))
-    # Msg 1 line should end with "[I read up to here]"
     lines = result.splitlines()
-    boundary_line = next(l for l in lines if "oldest" in l)
-    tail_line = next(l for l in lines if "newest" in l)
+    boundary_line = lines[lines.index("oldest") + 1]
+    tail_line = lines[lines.index("newest") + 1]
     assert boundary_line.endswith("[I read up to here]"), boundary_line
     assert tail_line.endswith("[unread by me]"), tail_line
 
@@ -549,7 +548,8 @@ def test_marker_trails_after_existing_edited_metadata() -> None:
         "outbox_cursor_state": "populated",
     }
     result = format_messages([msg], reply_map={}, read_state=rs, dialog_type="User", now_unix=_unix(13, 0))
-    line = [l for l in result.splitlines() if "hi" in l][0]
+    lines = result.splitlines()
+    line = lines[lines.index("hi") + 1]
     assert "[edited 12:30]" in line
     assert line.endswith("[I read up to here]")
     # Order: ... [edited 12:30] [I read up to here]
