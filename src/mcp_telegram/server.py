@@ -16,6 +16,7 @@ from functools import cache
 
 from mcp.server import Server
 from mcp.types import (
+    CallToolResult,
     EmbeddedResource,
     ImageContent,
     Prompt,

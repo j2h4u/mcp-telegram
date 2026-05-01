@@ -56,6 +56,8 @@ class ToolResult:
     """Internal wrapper carrying MCP content plus telemetry metadata."""
 
     content: t.Sequence[TextContent | ImageContent | EmbeddedResource]
+    is_error: bool = False
+    structured_content: dict[str, object] | None = None
     result_count: int = 0
     has_cursor: bool = False
     page_depth: int = 1
