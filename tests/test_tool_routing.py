@@ -592,6 +592,14 @@ async def test_get_sync_status_via_daemon():
     assert "status=synced" in text
     assert "message_count=100" in text
     assert "delete_detection=reliable (channel)" in text
+    assert result.structured_content == {
+        "dialog_id": -1001234567890,
+        "status": "synced",
+        "is_syncing": False,
+        "last_synced_at": 1700000000,
+        "message_count": 100,
+        "action": None,
+    }
     conn.get_sync_status.assert_called_once_with(dialog_id=-1001234567890)
 
 
@@ -633,6 +641,10 @@ async def test_get_sync_alerts_via_daemon():
     assert "Edits" in text
     assert "edit_date=" in text
     assert "Access Lost" in text
+    assert result.structured_content is not None
+    assert result.structured_content["count"] == 3
+    assert result.structured_content["alerts"][0]["dialog_id"] == 1
+    assert result.structured_content["alerts"][2]["severity"] == "high"
     conn.get_sync_alerts.assert_called_once_with(since=0, limit=50)
 
 
@@ -647,6 +659,40 @@ async def test_get_sync_alerts_empty():
     with _patch_daemon(conn):
         result = await get_sync_alerts(GetSyncAlerts())
     assert "No sync alerts" in result.content[0].text
+    assert result.is_error is False
+    assert result.structured_content == {"alerts": [], "count": 0}
+
+
+async def test_get_sync_status_recoverable_error_has_no_structured_content():
+    """Recoverable sync status errors remain is_error=True and may omit structured content."""
+    conn = _make_daemon_conn(
+        {
+            "ok": False,
+            "error": "backend_error",
+            "message": "sync status unavailable",
+        }
+    )
+    with _patch_daemon(conn):
+        result = await get_sync_status(GetSyncStatus(dialog_id=123))
+
+    assert result.is_error is True
+    assert result.structured_content is None
+
+
+async def test_get_sync_alerts_recoverable_error_has_no_structured_content():
+    """Recoverable sync alert errors remain is_error=True and may omit structured content."""
+    conn = _make_daemon_conn(
+        {
+            "ok": False,
+            "error": "backend_error",
+            "message": "sync alerts unavailable",
+        }
+    )
+    with _patch_daemon(conn):
+        result = await get_sync_alerts(GetSyncAlerts())
+
+    assert result.is_error is True
+    assert result.structured_content is None
 
 
 async def test_get_sync_alerts_daemon_not_running():
