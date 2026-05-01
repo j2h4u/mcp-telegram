@@ -69,7 +69,7 @@ async def test_list_dialogs_renders_mentions_token() -> None:
     }
     with _patched_daemon(response):
         result = await list_dialogs(ListDialogs())
-    text = result[0].text
+    text = result.content[0].text
     assert " mentions=3" in text
     assert " reactions=" not in text
 
@@ -86,7 +86,7 @@ async def test_list_dialogs_renders_reactions_token() -> None:
     }
     with _patched_daemon(response):
         result = await list_dialogs(ListDialogs())
-    text = result[0].text
+    text = result.content[0].text
     assert " reactions=2" in text
     assert " mentions=" not in text
 
@@ -103,7 +103,7 @@ async def test_list_dialogs_renders_draft_token() -> None:
     }
     with _patched_daemon(response):
         result = await list_dialogs(ListDialogs())
-    text = result[0].text
+    text = result.content[0].text
     assert 'draft="Hi all"' in text
 
 
@@ -125,7 +125,7 @@ async def test_list_dialogs_omits_zero_diff_tokens() -> None:
     }
     with _patched_daemon(response):
         result = await list_dialogs(ListDialogs())
-    text = result[0].text
+    text = result.content[0].text
     assert "id=" in text  # row is present
     assert "mentions=" not in text
     assert "reactions=" not in text
@@ -150,7 +150,7 @@ async def test_list_dialogs_renders_all_three_diff_tokens_together() -> None:
     }
     with _patched_daemon(response):
         result = await list_dialogs(ListDialogs())
-    text = result[0].text
+    text = result.content[0].text
     lines = text.splitlines()
     # Single row only
     assert len(lines) == 1
@@ -173,7 +173,7 @@ async def test_list_dialogs_renders_snapshot_age_trailing_line_when_stale() -> N
     }
     with _patched_daemon(response):
         result = await list_dialogs(ListDialogs())
-    text = result[0].text
+    text = result.content[0].text
     assert "[snapshot_age=18h" in text
     # Must appear as the last line
     last_line = text.splitlines()[-1]
@@ -192,7 +192,7 @@ async def test_list_dialogs_omits_snapshot_age_line_when_fresh() -> None:
     }
     with _patched_daemon(response):
         result = await list_dialogs(ListDialogs())
-    text = result[0].text
+    text = result.content[0].text
     assert "snapshot_age=" not in text
 
 
@@ -208,7 +208,7 @@ async def test_list_dialogs_renders_bootstrap_pending_line_when_true() -> None:
     }
     with _patched_daemon(response):
         result = await list_dialogs(ListDialogs())
-    text = result[0].text
+    text = result.content[0].text
     assert "sync in progress" in text
     # result_count=0 is set on the ToolResult internally; the MCP wrapper
     # returns .content (a list), so result_count is not accessible here.
@@ -231,7 +231,7 @@ async def test_list_dialogs_renders_no_dialogs_when_empty_and_not_bootstrap() ->
     }
     with _patched_daemon(response):
         result = await list_dialogs(ListDialogs())
-    text = result[0].text
+    text = result.content[0].text
     assert text == no_dialogs_text()
 
 
@@ -252,7 +252,7 @@ async def test_list_dialogs_renders_draft_with_double_quotes() -> None:
     }
     with _patched_daemon(response):
         result = await list_dialogs(ListDialogs())
-    text = result[0].text
+    text = result.content[0].text
     assert 'draft="Say "hi" to Bob"' in text
     # The embedded quotes must not introduce extra lines
     assert text.count("\n") == 0

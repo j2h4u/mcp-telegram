@@ -103,7 +103,7 @@ async def test_entity_info_candidates_surfaces_hint() -> None:
     ):
         result = await get_entity_info(GetEntityInfo(entity="Ivan"))
 
-    text = result[0].text
+    text = result.content[0].text
     assert "disambiguation_hint" not in text or "hint=" in text  # hint= prefix is the format
     # The hint string itself must appear in output
     assert "Specify @username or numeric id" in text
@@ -118,7 +118,7 @@ async def test_entity_info_candidates_lists_all_matches() -> None:
     ):
         result = await get_entity_info(GetEntityInfo(entity="Ivan"))
 
-    text = result[0].text
+    text = result.content[0].text
     assert "101" in text
     assert "202" in text
     # Must NOT silently auto-pick (i.e. must not proceed to get_entity_info call)
@@ -138,7 +138,7 @@ async def test_entity_info_candidates_does_not_auto_pick() -> None:
 
     # Tool must not have proceeded to fetch entity profile
     conn.get_entity_info.assert_not_called()
-    text = result[0].text
+    text = result.content[0].text
     # Must be an ambiguity response, not a profile
     assert "id=101" in text or "id=202" in text  # listed matches, not profile data
 

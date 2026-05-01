@@ -69,7 +69,7 @@ async def test_get_entity_info_user_renders() -> None:
     }
     with _patch_daemon(_resolve_ok(42, "Alice Smith"), get_resp):
         result = await get_entity_info(GetEntityInfo(entity="Alice"))
-    text = result[0].text
+    text = result.content[0].text
     assert "type=user" in text
     assert "is_bot: false" in text
     assert "name='Alice Smith'" in text
@@ -107,7 +107,7 @@ async def test_get_entity_info_bot_renders_type_bot() -> None:
     }
     with _patch_daemon(_resolve_ok(1, "MyBot"), get_resp):
         result = await get_entity_info(GetEntityInfo(entity="MyBot"))
-    text = result[0].text
+    text = result.content[0].text
     assert "type=bot" in text
     assert "is_bot: true" in text
     assert "flags: bot" in text
@@ -132,7 +132,7 @@ async def test_get_entity_info_channel_renders() -> None:
     }
     with _patch_daemon(_resolve_ok(-1001, "News"), get_resp):
         result = await get_entity_info(GetEntityInfo(entity="News"))
-    text = result[0].text
+    text = result.content[0].text
     assert "type=channel" in text
     assert "subscribers_count: 12345" in text
     assert "pinned_msg_id: 999" in text
@@ -157,7 +157,7 @@ async def test_get_entity_info_supergroup_renders() -> None:
     }
     with _patch_daemon(_resolve_ok(-1002, "DevChat"), get_resp):
         result = await get_entity_info(GetEntityInfo(entity="DevChat"))
-    text = result[0].text
+    text = result.content[0].text
     assert "type=supergroup" in text
     assert "members_count: 42" in text
     assert "has_topics: yes" in text
@@ -181,7 +181,7 @@ async def test_get_entity_info_group_renders_migrated_to() -> None:
     }
     with _patch_daemon(_resolve_ok(-100, "Old Chat"), get_resp):
         result = await get_entity_info(GetEntityInfo(entity="Old Chat"))
-    text = result[0].text
+    text = result.content[0].text
     assert "type=group" in text
     assert "members_count: 5" in text
     assert "migrated_to: -1002005000000" in text
@@ -209,7 +209,7 @@ async def test_get_entity_info_resolver_ambiguous() -> None:
 
     with patch("mcp_telegram.tools.entity_info.daemon_connection", fake_dc):
         result = await get_entity_info(GetEntityInfo(entity="Alice"))
-    text = result[0].text
+    text = result.content[0].text
     assert "Multiple entities match" in text
     assert "Alice A" in text and "Alice B" in text
     assert "GetEntityInfo" in text
@@ -227,7 +227,7 @@ async def test_get_entity_info_resolver_not_found() -> None:
 
     with patch("mcp_telegram.tools.entity_info.daemon_connection", fake_dc):
         result = await get_entity_info(GetEntityInfo(entity="Nobody"))
-    text = result[0].text
+    text = result.content[0].text
     assert "No entity matches 'Nobody'" in text
     assert "GetEntityInfo" in text
 
@@ -243,5 +243,5 @@ async def test_get_entity_info_daemon_not_running() -> None:
 
     with patch("mcp_telegram.tools.entity_info.daemon_connection", raising_dc):
         result = await get_entity_info(GetEntityInfo(entity="Anyone"))
-    text = result[0].text
+    text = result.content[0].text
     assert "Telegram backend is not running" in text

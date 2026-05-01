@@ -138,7 +138,7 @@ async def test_list_messages_tool_renders_header_in_output() -> None:
     conn = _make_conn("list_messages", response)
     with _patch_daemon("mcp_telegram.tools.reading.daemon_connection", conn):
         result = await list_messages(ListMessages(exact_dialog_id=111))
-    text = result[0].text  # type: ignore[index]
+    text = result.content[0].text
     assert "[inbox: 2 unread from peer" in text
 
 
@@ -169,7 +169,7 @@ async def test_list_messages_tool_renders_inline_marker_in_output() -> None:
     conn = _make_conn("list_messages", response)
     with _patch_daemon("mcp_telegram.tools.reading.daemon_connection", conn):
         result = await list_messages(ListMessages(exact_dialog_id=111))
-    text = result[0].text  # type: ignore[index]
+    text = result.content[0].text
     assert any(
         marker in text
         for marker in [
@@ -196,7 +196,7 @@ async def test_list_messages_tool_non_dm_omits_header() -> None:
     conn = _make_conn("list_messages", response)
     with _patch_daemon("mcp_telegram.tools.reading.daemon_connection", conn):
         result = await list_messages(ListMessages(exact_dialog_id=-100500))
-    text = result[0].text  # type: ignore[index]
+    text = result.content[0].text
     assert "[read-state:" not in text
     assert "[inbox:" not in text
     assert "[outbox:" not in text
@@ -215,7 +215,7 @@ async def test_list_messages_tool_backward_compat_no_read_state_in_response() ->
     conn = _make_conn("list_messages", response)
     with _patch_daemon("mcp_telegram.tools.reading.daemon_connection", conn):
         result = await list_messages(ListMessages(exact_dialog_id=111))
-    text = result[0].text  # type: ignore[index]
+    text = result.content[0].text
     assert "[read-state:" not in text
     assert "[inbox:" not in text
     assert "[outbox:" not in text
@@ -342,7 +342,7 @@ async def test_search_tool_renders_per_dialog_header_block() -> None:
     conn = _make_conn("search_messages", response)
     with _patch_daemon("mcp_telegram.tools.reading.daemon_connection", conn):
         result = await search_messages(SearchMessages(query="ping"))
-    text = result[0].text  # type: ignore[index]
+    text = result.content[0].text
     assert "[inbox: 2 unread from peer" in text
     assert "[read-state: all caught up]" in text
 
@@ -355,7 +355,7 @@ async def test_search_tool_backward_compat_no_read_state_per_dialog() -> None:
     conn = _make_conn("search_messages", response)
     with _patch_daemon("mcp_telegram.tools.reading.daemon_connection", conn):
         result = await search_messages(SearchMessages(query="ping"))
-    text = result[0].text  # type: ignore[index]
+    text = result.content[0].text
     assert "[read-state:" not in text
     assert "[inbox:" not in text
 
@@ -426,7 +426,7 @@ async def test_unread_tool_renders_per_chat_header() -> None:
     conn = _make_conn("get_inbox", response)
     with _patch_daemon("mcp_telegram.tools.unread.daemon_connection", conn):
         result = await get_inbox(GetInbox())
-    text = result[0].text  # type: ignore[index]
+    text = result.content[0].text
     assert "[inbox: 2 unread from peer" in text
     assert "[read-state: all caught up]" in text
     # Order: Alice block first → header precedes "hey A"; Bob block → header precedes "hey B".
@@ -449,7 +449,7 @@ async def test_unread_tool_renders_collapsed_header_when_chat_caught_up() -> Non
     conn = _make_conn("get_inbox", response)
     with _patch_daemon("mcp_telegram.tools.unread.daemon_connection", conn):
         result = await get_inbox(GetInbox())
-    text = result[0].text  # type: ignore[index]
+    text = result.content[0].text
     assert "[read-state: all caught up]" in text
 
 
@@ -468,7 +468,7 @@ async def test_unread_tool_renders_split_header_when_inbox_unread() -> None:
     conn = _make_conn("get_inbox", response)
     with _patch_daemon("mcp_telegram.tools.unread.daemon_connection", conn):
         result = await get_inbox(GetInbox())
-    text = result[0].text  # type: ignore[index]
+    text = result.content[0].text
     assert "[inbox: 2 unread from peer" in text
     assert "[outbox: all read by peer]" in text
 
@@ -489,7 +489,7 @@ async def test_unread_tool_no_header_for_non_dm_group() -> None:
     conn = _make_conn("get_inbox", response)
     with _patch_daemon("mcp_telegram.tools.unread.daemon_connection", conn):
         result = await get_inbox(GetInbox())
-    text = result[0].text  # type: ignore[index]
+    text = result.content[0].text
     assert "[read-state:" not in text
     assert "[inbox:" not in text
     assert "[outbox:" not in text
@@ -510,7 +510,7 @@ async def test_unread_tool_backward_compat_no_read_state() -> None:
     conn = _make_conn("get_inbox", response)
     with _patch_daemon("mcp_telegram.tools.unread.daemon_connection", conn):
         result = await get_inbox(GetInbox())
-    text = result[0].text  # type: ignore[index]
+    text = result.content[0].text
     assert "[read-state:" not in text
     assert "[inbox:" not in text
     assert "[outbox:" not in text
