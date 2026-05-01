@@ -11,7 +11,7 @@
       }
     },
     {
-      "_comment": "GetUsageStats — returns account-level usage stats (GetMyAccount removed in Phase 40+)",
+      "_comment": "GetUsageStats — returns account-level usage stats",
       "action": "call_tool",
       "name": "GetUsageStats",
       "arguments": {},

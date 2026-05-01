@@ -10,7 +10,6 @@
           "SearchMessages",
           "ListTopics",
           "GetInbox",
-          "GetMyAccount",
           "GetEntityInfo",
           "GetUsageStats",
           "GetDialogStats",
@@ -78,16 +77,6 @@
       "action": "call_tool",
       "name": "ListTopics",
       "arguments": {"dialog": "test"},
-      "expect": {
-        "is_error": false,
-        "content_text_contains": ["not running", "mcp-telegram sync"]
-      }
-    },
-    {
-      "_comment": "GetMyAccount — daemon route",
-      "action": "call_tool",
-      "name": "GetMyAccount",
-      "arguments": {},
       "expect": {
         "is_error": false,
         "content_text_contains": ["not running", "mcp-telegram sync"]
