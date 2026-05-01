@@ -257,7 +257,10 @@ def format_messages(
                 lines.append(f"--- {gap_minutes} мин ---")
 
         sender_name = _resolve_sender_name(msg)
+        has_telegram_body = bool(msg.text)
         text = _render_text(msg)
+        if msg.text:
+            text = frame_telegram_content(msg.text)
         if msg.edit_date is not None:
             ed_dt = datetime.fromtimestamp(msg.edit_date, tz=UTC).astimezone(effective_tz)
             text = f"{text} [edited {ed_dt.strftime('%H:%M')}]"
@@ -292,7 +295,8 @@ def format_messages(
             if resolved_prefix:
                 line_prefix = f"{resolved_prefix} "
 
-        line = f"{line_prefix}{topic_prefix}{dt.strftime('%H:%M')} {sender_name}: {author_prefix}{fwd_prefix}{reply_prefix}{text}"
+        message_prefix = f"{line_prefix}{topic_prefix}{dt.strftime('%H:%M')} {sender_name}: {author_prefix}{fwd_prefix}{reply_prefix}"
+        line = f"{message_prefix.rstrip()}\n{text}" if has_telegram_body else f"{message_prefix}{text}"
         if inline_markers and msg.id in inline_markers:
             line = f"{line} {inline_markers[msg.id]}"
         lines.append(line)
