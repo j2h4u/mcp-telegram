@@ -11,18 +11,14 @@ import os
 import sys
 import time
 import typing as t
-from collections.abc import Sequence
 from functools import cache
 
 from mcp.server import Server
 from mcp.types import (
     CallToolResult,
-    EmbeddedResource,
-    ImageContent,
     Prompt,
     Resource,
     ResourceTemplate,
-    TextContent,
     Tool,
 )
 
@@ -87,7 +83,7 @@ async def progress_notification(progress: str | int, p: float, s: float | None) 
 
 
 @app.call_tool()
-async def call_tool(name: str, arguments: t.Any) -> Sequence[TextContent | ImageContent | EmbeddedResource]:
+async def call_tool(name: str, arguments: t.Any) -> CallToolResult:
     """Handle tool calls for command line run."""
 
     if not isinstance(arguments, dict):
@@ -118,7 +114,11 @@ async def call_tool(name: str, arguments: t.Any) -> Sequence[TextContent | Image
         elapsed = time.monotonic() - t0
         rid_str = ",".join(rids) if rids else "-"
         logger.info("call_tool[%s] completed in %.3fs rids=%s", name, elapsed, rid_str)
-        return result
+        return CallToolResult(
+            content=list(result.content),
+            structuredContent=result.structured_content,
+            isError=result.is_error,
+        )
     finally:
         _request_ids.reset(token)
 

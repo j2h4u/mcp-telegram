@@ -110,7 +110,7 @@ def _track_tool_telemetry(tool_name: str):
             tool_result: ToolResult | None = None
             try:
                 tool_result = await fn(args)
-                return tool_result.content
+                return tool_result
             except Exception as exc:
                 error_type = type(exc).__name__
                 raise
@@ -145,7 +145,7 @@ def _track_tool_telemetry(tool_name: str):
 @singledispatch
 async def tool_runner(
     args,
-) -> t.Sequence[TextContent | ImageContent | EmbeddedResource]:
+) -> ToolResult:
     """Dispatch a ToolArgs instance to its registered async handler."""
     raise NotImplementedError(f"Unsupported type: {type(args)}")
 
