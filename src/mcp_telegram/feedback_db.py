@@ -10,9 +10,9 @@ Public API:
   VALID_STATUSES                frozenset[str]
   _FEEDBACK_SCHEMA_VERSION      int
 
-The daemon is the sole writer. The CLI (mcp-telegram feedback list/delete)
-opens the same file read-only in a separate process — WAL mode lets them
-coexist without blocking each other.
+The daemon is the sole writer. The CLI reads rows with
+`mcp-telegram feedback list` and routes status changes through the daemon with
+`mcp-telegram feedback status <id> <status> [--reason TEXT]`.
 """
 
 from __future__ import annotations

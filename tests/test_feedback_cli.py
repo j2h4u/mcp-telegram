@@ -102,7 +102,7 @@ def test_feedback_list_respects_limit(feedback_db):
 
 
 def test_feedback_delete_removed(feedback_db):
-    """`feedback delete` no longer exists — Typer exits 2 (no such command)."""
+    """The removed delete subcommand still exits 2 (no such command)."""
     result = runner.invoke(app, ["feedback", "delete", "1"])
     assert result.exit_code == 2
 

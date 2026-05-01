@@ -87,7 +87,8 @@ persists rows in `feedback.db` (XDG state dir, alongside `sync.db`).
 Operator manages the queue with:
 
 - `mcp-telegram feedback list [--limit N]` — print recent entries (most-recent-first)
-- `mcp-telegram feedback delete <id>` — remove a row
+- `mcp-telegram feedback status <id> <status> [--reason TEXT]` — move a row through `open`,
+  `in_progress`, `done`, or `dismissed`
 
 No MCP read tool exists for feedback by design — agents submit, operator
 reviews. Source: `src/mcp_telegram/feedback_db.py`,
