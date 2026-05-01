@@ -18,6 +18,18 @@ SESSION_BREAK_MINUTES = 60
 # (ChatML/OpenAI convention: [user], [assistant], [system]), avoiding the
 # first-person ambiguity of a bare "Я" when the model later paraphrases the log.
 SELF_SENDER_LABEL = "[me]"
+TELEGRAM_CONTENT_OPEN = "[Telegram content]"
+TELEGRAM_CONTENT_CLOSE = "[/Telegram content]"
+
+
+def frame_telegram_content(text: str) -> str:
+    """Mark full Telegram-originated body text as untrusted content."""
+    return f"{TELEGRAM_CONTENT_OPEN}\n{text}\n{TELEGRAM_CONTENT_CLOSE}"
+
+
+def frame_telegram_snippet(text: str) -> str:
+    """Mark compact one-line Telegram-originated snippets as untrusted content."""
+    return f"{TELEGRAM_CONTENT_OPEN} {text} {TELEGRAM_CONTENT_CLOSE}"
 
 
 # ---------------------------------------------------------------------------
