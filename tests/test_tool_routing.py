@@ -968,7 +968,7 @@ async def test_get_usage_stats_via_daemon():
         {
             "ok": True,
             "data": {
-                "tool_distribution": {"ListDialogs": 10, "ListMessages": 5},
+                "tool_distribution": {"list_dialogs": 10, "list_messages": 5},
                 "error_distribution": {},
                 "total_calls": 15,
                 "max_page_depth": 2,
@@ -983,7 +983,7 @@ async def test_get_usage_stats_via_daemon():
         result = await get_usage_stats(GetUsageStats())
 
     text = result.content[0].text
-    assert "ListDialogs" in text
+    assert "list_dialogs" in text
     assert "120" in text  # latency_median_ms
     conn.get_usage_stats.assert_called_once()
 

@@ -158,9 +158,9 @@ def test_submit_feedback_tool_message_max_length() -> None:
 
 
 def test_submit_feedback_tool_registered_in_registry() -> None:
-    """TOOL_REGISTRY['SubmitFeedback'] exists with posture='primary' and readOnlyHint=False."""
-    assert "SubmitFeedback" in TOOL_REGISTRY
-    tool_cls, posture, annotations = TOOL_REGISTRY["SubmitFeedback"]
+    """TOOL_REGISTRY['submit_feedback'] exists with posture='primary' and readOnlyHint=False."""
+    assert "submit_feedback" in TOOL_REGISTRY
+    tool_cls, posture, annotations = TOOL_REGISTRY["submit_feedback"]
     assert posture == "primary"
     assert annotations is not None
     assert annotations.readOnlyHint is False

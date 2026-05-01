@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from unittest.mock import AsyncMock
 
 import pytest
@@ -12,13 +13,14 @@ from mcp_telegram.tools._base import ToolResult
 def _tool(name: str) -> Tool:
     return Tool(
         name=name,
+        title=name.replace("_", " ").title(),
         description=f"{name} test tool",
         inputSchema={"type": "object", "properties": {}},
     )
 
 
 def test_list_messages_reflection_exposes_shared_navigation_schema() -> None:
-    tool = server.tool_by_name["ListMessages"]
+    tool = server.tool_by_name["list_messages"]
     properties = tool.inputSchema["properties"]
     required = tool.inputSchema.get("required", [])
 
@@ -40,7 +42,7 @@ def test_list_messages_reflection_exposes_shared_navigation_schema() -> None:
 
 @pytest.mark.asyncio
 async def test_call_tool_validation_rejects_conflicting_list_messages_selectors() -> None:
-    result = await server.call_tool("ListMessages", {"dialog": "Backend", "exact_dialog_id": 701})
+    result = await server.call_tool("list_messages", {"dialog": "Backend", "exact_dialog_id": 701})
 
     assert result.isError is True
     message = result.content[0].text
@@ -50,7 +52,7 @@ async def test_call_tool_validation_rejects_conflicting_list_messages_selectors(
 
 
 def test_search_messages_reflection_exposes_shared_navigation_schema() -> None:
-    tool = server.tool_by_name["SearchMessages"]
+    tool = server.tool_by_name["search_messages"]
     properties = tool.inputSchema["properties"]
 
     assert "dialog" in properties
@@ -66,57 +68,57 @@ def test_search_messages_reflection_exposes_shared_navigation_schema() -> None:
 
 @pytest.mark.asyncio
 async def test_call_tool_validation_failure_escaped_error_includes_actionable_guidance(monkeypatch) -> None:
-    monkeypatch.setitem(server.tool_by_name, "ListDialogs", _tool("ListDialogs"))
+    monkeypatch.setitem(server.tool_by_name, "list_dialogs", _tool("list_dialogs"))
 
     def _raise_validation_error(tool: Tool, **kwargs) -> object:
         raise ValueError("dialog must be a string")
 
     monkeypatch.setattr("mcp_telegram.server.tools.tool_args", _raise_validation_error)
 
-    result = await server.call_tool("ListDialogs", {"dialog": 123})
+    result = await server.call_tool("list_dialogs", {"dialog": 123})
 
     assert result.isError is True
     message = result.content[0].text
     assert "validation" in message.lower() or "argument" in message.lower()
     assert "dialog" in message.lower()
     assert "action:" in message.lower() or "retry" in message.lower() or "check" in message.lower()
-    assert message != "Tool ListDialogs failed"
+    assert message != "Tool list_dialogs failed"
 
 
 @pytest.mark.asyncio
 async def test_call_tool_runtime_failure_escaped_error_includes_actionable_guidance(monkeypatch) -> None:
-    monkeypatch.setitem(server.tool_by_name, "ListDialogs", _tool("ListDialogs"))
+    monkeypatch.setitem(server.tool_by_name, "list_dialogs", _tool("list_dialogs"))
     monkeypatch.setattr("mcp_telegram.server.tools.tool_args", lambda tool, **kwargs: object())
     monkeypatch.setattr(
         "mcp_telegram.server.tools.tool_runner",
         AsyncMock(side_effect=RuntimeError("telegram backend timed out")),
     )
 
-    result = await server.call_tool("ListDialogs", {})
+    result = await server.call_tool("list_dialogs", {})
 
     assert result.isError is True
     message = result.content[0].text
     assert "runtime" in message.lower() or "execution" in message.lower()
     assert "timed out" in message.lower() or "timeout" in message.lower()
     assert "action:" in message.lower() or "retry" in message.lower() or "check" in message.lower()
-    assert message != "Tool ListDialogs failed"
+    assert message != "Tool list_dialogs failed"
 
 
 @pytest.mark.asyncio
 async def test_call_tool_passthrough_action_text_contract(monkeypatch) -> None:
-    monkeypatch.setitem(server.tool_by_name, "GetEntityInfo", _tool("GetEntityInfo"))
+    monkeypatch.setitem(server.tool_by_name, "get_entity_info", _tool("get_entity_info"))
 
     expected = [
         TextContent(
             type="text",
-            text='Could not fetch entity info for \'Iris\' (boom).\nAction: Retry GetEntityInfo later.',
+            text='Could not fetch entity info for \'Iris\' (boom).\nAction: Retry get_entity_info later.',
         )
     ]
 
     monkeypatch.setattr("mcp_telegram.server.tools.tool_args", lambda tool, **kwargs: object())
     monkeypatch.setattr("mcp_telegram.server.tools.tool_runner", AsyncMock(return_value=ToolResult(content=expected)))
 
-    result = await server.call_tool("GetEntityInfo", {"entity": "Iris"})
+    result = await server.call_tool("get_entity_info", {"entity": "Iris"})
 
     assert result.content == expected
     assert result.isError is False
@@ -134,21 +136,53 @@ async def test_call_tool_unknown_tool_control_contract() -> None:
 @pytest.mark.asyncio
 async def test_call_tool_non_dict_arguments_control_contract() -> None:
     with pytest.raises(TypeError, match="arguments must be dictionary"):
-        await server.call_tool("ListDialogs", [])
+        await server.call_tool("list_dialogs", [])
 
 
 def test_posture_primary_tools_reflected_in_descriptions() -> None:
     """Primary tools should have [primary] tag in their reflected descriptions."""
-    for name in ("ListMessages", "SearchMessages", "GetEntityInfo"):
+    for name in ("list_messages", "search_messages", "get_entity_info"):
         tool = server.tool_by_name[name]
         assert tool.description.startswith("[primary]"), f"{name} missing [primary] prefix"
 
 
 def test_posture_secondary_tools_reflected_in_descriptions() -> None:
     """Secondary/helper tools should have [secondary/helper] tag in descriptions."""
-    for name in ("ListDialogs", "ListTopics", "GetUsageStats"):
+    for name in ("list_dialogs", "list_topics", "get_usage_stats"):
         tool = server.tool_by_name[name]
         assert tool.description.startswith("[secondary/helper]"), f"{name} missing [secondary/helper] prefix"
+
+
+def test_list_tools_exposes_snake_case_names_titles_and_annotations() -> None:
+    expected_titles = {
+        "list_dialogs": "List Dialogs",
+        "list_topics": "List Topics",
+        "list_messages": "List Messages",
+        "search_messages": "Search Messages",
+        "get_usage_stats": "Usage Stats",
+        "get_dialog_stats": "Dialog Stats",
+        "mark_dialog_for_sync": "Mark Sync",
+        "get_sync_status": "Sync Status",
+        "get_sync_alerts": "Sync Alerts",
+        "get_my_recent_activity": "Recent Activity",
+        "get_inbox": "Inbox",
+        "get_entity_info": "Entity Info",
+        "submit_feedback": "Submit Feedback",
+    }
+
+    assert set(server.tool_by_name) == set(expected_titles)
+    for name, tool in server.tool_by_name.items():
+        assert re.match(r"^[a-z][a-z0-9_]{0,63}$", tool.name)
+        assert tool.name == name
+        assert tool.title == expected_titles[name]
+        assert 1 <= len(tool.title.split()) <= 3
+        assert tool.annotations is not None
+
+    assert server.tool_by_name["list_messages"].annotations.readOnlyHint is True
+    assert server.tool_by_name["mark_dialog_for_sync"].annotations.readOnlyHint is False
+    assert server.tool_by_name["mark_dialog_for_sync"].annotations.idempotentHint is True
+    assert server.tool_by_name["submit_feedback"].annotations.readOnlyHint is False
+    assert all(not any(part[:1].isupper() for part in name.split("_")) for name in server.tool_by_name)
 
 
 def test_posture_covers_all_registered_tools() -> None:
@@ -162,34 +196,34 @@ def test_posture_covers_all_registered_tools() -> None:
 
 
 def test_posture_get_entity_info_classified_as_primary() -> None:
-    """GetEntityInfo must be classified as primary, not helper."""
+    """get_entity_info must be classified as primary, not helper."""
     from mcp_telegram.tools import TOOL_REGISTRY
 
-    assert TOOL_REGISTRY["GetEntityInfo"][1] == "primary", "GetEntityInfo should be a primary user-task tool"
-    tool = server.tool_by_name["GetEntityInfo"]
-    assert tool.description.startswith("[primary]"), "GetEntityInfo missing [primary] prefix"
+    assert TOOL_REGISTRY["get_entity_info"][1] == "primary", "get_entity_info should be a primary user-task tool"
+    tool = server.tool_by_name["get_entity_info"]
+    assert tool.description.startswith("[primary]"), "get_entity_info missing [primary] prefix"
 
 
 def test_primary_tools_have_core_read_search_schema() -> None:
     """Primary read and search tools expose the direct-access schema patterns from Phase 17."""
-    # ListMessages: must have exact_dialog_id for direct reads
-    list_messages = server.tool_by_name["ListMessages"]
+    # list_messages: must have exact_dialog_id for direct reads
+    list_messages = server.tool_by_name["list_messages"]
     lm_props = list_messages.inputSchema["properties"]
-    assert "exact_dialog_id" in lm_props, "ListMessages missing exact_dialog_id for direct dialog access"
-    assert "exact_topic_id" in lm_props, "ListMessages missing exact_topic_id for direct topic access"
-    assert "navigation" in lm_props, "ListMessages missing shared navigation field"
+    assert "exact_dialog_id" in lm_props, "list_messages missing exact_dialog_id for direct dialog access"
+    assert "exact_topic_id" in lm_props, "list_messages missing exact_topic_id for direct topic access"
+    assert "navigation" in lm_props, "list_messages missing shared navigation field"
 
-    # SearchMessages: must keep dialog + query shape for direct scoping
-    search_messages = server.tool_by_name["SearchMessages"]
+    # search_messages: must keep dialog + query shape for direct scoping
+    search_messages = server.tool_by_name["search_messages"]
     sm_props = search_messages.inputSchema["properties"]
-    assert "dialog" in sm_props, "SearchMessages missing dialog for exact numeric ID pattern"
-    assert "query" in sm_props, "SearchMessages missing query"
-    assert "navigation" in sm_props, "SearchMessages missing shared navigation field"
+    assert "dialog" in sm_props, "search_messages missing dialog for exact numeric ID pattern"
+    assert "query" in sm_props, "search_messages missing query"
+    assert "navigation" in sm_props, "search_messages missing shared navigation field"
 
-    # GetEntityInfo: must have entity field for universal entity lookup
-    get_entity_info = server.tool_by_name["GetEntityInfo"]
+    # get_entity_info: must have entity field for universal entity lookup
+    get_entity_info = server.tool_by_name["get_entity_info"]
     gei_props = get_entity_info.inputSchema["properties"]
-    assert "entity" in gei_props, "GetEntityInfo missing entity field for direct lookup"
+    assert "entity" in gei_props, "get_entity_info missing entity field for direct lookup"
 
 
 def test_helper_tools_remain_available_not_hidden() -> None:
@@ -197,9 +231,9 @@ def test_helper_tools_remain_available_not_hidden() -> None:
     from mcp_telegram.tools import TOOL_REGISTRY
 
     helper_tools = [
-        ("ListDialogs", "secondary/helper"),
-        ("ListTopics", "secondary/helper"),
-        ("GetUsageStats", "secondary/helper"),
+        ("list_dialogs", "secondary/helper"),
+        ("list_topics", "secondary/helper"),
+        ("get_usage_stats", "secondary/helper"),
     ]
 
     for tool_name, expected_posture in helper_tools:
@@ -233,7 +267,7 @@ def _make_mock_conn(list_messages_response: dict):
 
 @pytest.mark.asyncio
 async def test_list_messages_tool_archived_warning_with_coverage(monkeypatch):
-    """ListMessages tool output includes archived warning with coverage pct."""
+    """list_messages tool output includes archived warning with coverage pct."""
     mock_conn = _make_mock_conn(
         {
             "ok": True,
@@ -251,7 +285,7 @@ async def test_list_messages_tool_archived_warning_with_coverage(monkeypatch):
     )
     monkeypatch.setattr("mcp_telegram.tools.reading.daemon_connection", lambda: mock_conn)
 
-    result = await server.call_tool("ListMessages", {"exact_dialog_id": 123})
+    result = await server.call_tool("list_messages", {"exact_dialog_id": 123})
     text = result.content[0].text
     assert "⚠" in text
     assert "archive" in text.lower()
@@ -261,7 +295,7 @@ async def test_list_messages_tool_archived_warning_with_coverage(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_list_messages_tool_archived_warning_unknown_coverage(monkeypatch):
-    """ListMessages tool output shows 'N messages archived locally' when coverage unknown."""
+    """list_messages tool output shows 'N messages archived locally' when coverage unknown."""
     mock_conn = _make_mock_conn(
         {
             "ok": True,
@@ -280,7 +314,7 @@ async def test_list_messages_tool_archived_warning_unknown_coverage(monkeypatch)
     )
     monkeypatch.setattr("mcp_telegram.tools.reading.daemon_connection", lambda: mock_conn)
 
-    result = await server.call_tool("ListMessages", {"exact_dialog_id": 123})
+    result = await server.call_tool("list_messages", {"exact_dialog_id": 123})
     text = result.content[0].text
     assert "⚠" in text
     assert "150 messages archived locally" in text
@@ -306,7 +340,7 @@ async def test_list_messages_tool_uses_last_synced_at_not_access_lost_at(monkeyp
     )
     monkeypatch.setattr("mcp_telegram.tools.reading.daemon_connection", lambda: mock_conn)
 
-    result = await server.call_tool("ListMessages", {"exact_dialog_id": 123})
+    result = await server.call_tool("list_messages", {"exact_dialog_id": 123})
     text = result.content[0].text
     # Must show 2023-11-14 (last_synced_at), NOT 2024-01-01 (access_lost_at)
     assert "2023-11-14" in text
