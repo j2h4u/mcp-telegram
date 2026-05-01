@@ -245,18 +245,18 @@ def mcp_tool(
     return decorator
 
 
-def tool_description(args: type[ToolArgs]) -> Tool:
-    """Build an MCP Tool descriptor from a ToolArgs subclass."""
-    schema = _sanitize_tool_schema(args.model_json_schema())
-    entry = TOOL_REGISTRY.get(args.__name__)
-    posture = entry[1] if entry else ""
-    tool_annotations = entry[2] if entry else None
+def tool_description(exported_name: str, cls: type[ToolArgs], entry: ToolRegistryEntry) -> Tool:
+    """Build an MCP Tool descriptor from registry metadata."""
+    schema = _sanitize_tool_schema(cls.model_json_schema())
+    posture = entry.posture
     prefix = f"[{posture}] " if posture else ""
     return Tool(
-        name=args.__name__,
-        description=f"{prefix}{args.__doc__}",
+        name=exported_name,
+        title=entry.title,
+        description=f"{prefix}{cls.__doc__}",
         inputSchema=schema,
-        annotations=tool_annotations,
+        outputSchema=entry.output_schema,
+        annotations=entry.annotations,
     )
 
 
@@ -307,7 +307,7 @@ def tool_args(tool: Tool, *args, **kwargs) -> ToolArgs:
 
 
 def verify_tool_registry() -> None:
-    """Startup check: every registry entry has a matching class name, runner, and telemetry decorator.
+    """Startup check: every registry entry has a valid exported name, runner, and telemetry decorator.
 
     Raises ``RuntimeError`` on mismatch — called at module load time in
     ``server.py`` without a catch, so failures crash the process immediately.
@@ -315,9 +315,16 @@ def verify_tool_registry() -> None:
     The expected decorator stack is @tool_runner.register (outer) then @_track_tool_telemetry (inner).
     singledispatch sees the original type annotation via __wrapped__ on the telemetry wrapper.
     """
-    for name, (cls, _posture, _annotations) in TOOL_REGISTRY.items():
-        if cls.__name__ != name:
-            raise RuntimeError(f"Registry key {name!r} != class {cls.__name__!r}")
+    name_pattern = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+    for name, entry in TOOL_REGISTRY.items():
+        if not name_pattern.match(name):
+            raise RuntimeError(f"Registry key {name!r} is not a valid snake_case tool name")
+        if entry.exported_name != name:
+            raise RuntimeError(f"Registry key {name!r} != exported name {entry.exported_name!r}")
+        title_words = entry.title.split()
+        if not 1 <= len(title_words) <= 3:
+            raise RuntimeError(f"Tool {name} title must be 1-3 words")
+        cls = entry.cls
         dispatched = tool_runner.dispatch(cls)
         if dispatched is tool_runner:
             raise RuntimeError(f"No runner for {name}")
