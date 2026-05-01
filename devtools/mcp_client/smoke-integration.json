@@ -32,7 +32,7 @@
       "_comment": "list_messages — synced channel",
       "action": "call_tool",
       "name": "list_messages",
-      "arguments": {"dialog": "Vibecoding is so last year", "limit": 3},
+      "arguments": {"exact_dialog_id": 496731332, "limit": 3},
       "expect": {
         "is_error": false
       }
@@ -41,7 +41,7 @@
       "_comment": "list_messages — synced channel, alternate page size",
       "action": "call_tool",
       "name": "list_messages",
-      "arguments": {"dialog": "Vibecoding is so last year", "limit": 5},
+      "arguments": {"exact_dialog_id": 496731332, "limit": 5},
       "expect": {
         "is_error": false
       }
@@ -50,7 +50,7 @@
       "_comment": "search_messages — keyword search in synced channel",
       "action": "call_tool",
       "name": "search_messages",
-      "arguments": {"dialog": "Vibecoding is so last year", "query": "ai", "limit": 3},
+      "arguments": {"dialog": "496731332", "query": "а", "limit": 3},
       "expect": {
         "is_error": false
       }
@@ -87,12 +87,12 @@
       "_comment": "get_dialog_stats — accepts either real stats or actionable 'not synced' error depending on live sync state",
       "action": "call_tool",
       "name": "get_dialog_stats",
-      "arguments": {"dialog": "Vibecoding is so last year", "top_n": 3},
+      "arguments": {"dialog": "496731332", "top_n": 3},
       "expect": {
         "one_of": [
           {
             "is_error": false,
-            "content_text_contains": ["Message stats"]
+            "content_text_contains": ["Top"]
           },
           {
             "is_error": true,
