@@ -15,6 +15,7 @@ from ._base import (
     _daemon_not_running_text,
     _text_response,
     daemon_connection,
+    error_result,
     mcp_tool,
 )
 
@@ -85,11 +86,11 @@ async def get_usage_stats(args: GetUsageStats) -> ToolResult:
         async with daemon_connection() as conn:
             response = await conn.get_usage_stats()
     except DaemonNotRunningError:
-        return ToolResult(content=_text_response(_daemon_not_running_text()))
+        return error_result(_daemon_not_running_text())
 
     if not response.get("ok"):
         error_msg = response.get("error", "Unknown error")
-        return ToolResult(content=_text_response(usage_stats_query_error_text(error_msg)))
+        return error_result(usage_stats_query_error_text(error_msg))
 
     stats = response.get("data", {})
     if not stats or stats.get("total_calls", 0) == 0:
@@ -141,18 +142,18 @@ async def get_dialog_stats(args: GetDialogStats) -> ToolResult:
                 limit=args.top_n,
             )
     except DaemonNotRunningError:
-        return ToolResult(content=_text_response(_daemon_not_running_text()))
+        return error_result(_daemon_not_running_text())
 
     if not response.get("ok"):
         error = response.get("error", "")
         msg = response.get("message", "Request failed.")
         if error == "not_synced":
-            return ToolResult(content=_text_response(f"Error: dialog is not synced. {msg}"))
+            return error_result(f"Error: dialog is not synced. {msg}")
         if error == "dialog_not_found":
             from ..errors import dialog_not_found_text
 
-            return ToolResult(content=_text_response(dialog_not_found_text(args.dialog, retry_tool="GetDialogStats")))
-        return ToolResult(content=_text_response(f"Error: {error}: {msg}"))
+            return error_result(dialog_not_found_text(args.dialog, retry_tool="GetDialogStats"))
+        return error_result(f"Error: {error}: {msg}")
 
     data = response.get("data", {})
     reactions = data.get("top_reactions", [])

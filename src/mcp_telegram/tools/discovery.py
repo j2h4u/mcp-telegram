@@ -19,6 +19,7 @@ from ._base import (
     _daemon_not_running_text,
     _text_response,
     daemon_connection,
+    error_result,
     mcp_tool,
 )
 
@@ -62,7 +63,7 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
                 filter=args.filter,
             )
     except DaemonNotRunningError:
-        return ToolResult(content=_text_response(_daemon_not_running_text()))
+        return error_result(_daemon_not_running_text())
 
     if err := _check_daemon_response(response):
         return err
@@ -192,7 +193,7 @@ async def list_topics(args: ListTopics) -> ToolResult:
             else:
                 response = await conn.list_topics(dialog=dialog_name)
     except DaemonNotRunningError:
-        return ToolResult(content=_text_response(_daemon_not_running_text()), has_filter=True)
+        return error_result(_daemon_not_running_text(), has_filter=True)
 
     if not response.get("ok"):
         error_code = response.get("error", "")
@@ -200,11 +201,8 @@ async def list_topics(args: ListTopics) -> ToolResult:
         if error_code == "dialog_not_found":
             from ..errors import dialog_not_found_text
 
-            return ToolResult(
-                content=_text_response(dialog_not_found_text(args.dialog, retry_tool="ListTopics")),
-                has_filter=True,
-            )
-        return ToolResult(content=_text_response(f"Error: {error_msg}"), has_filter=True)
+            return error_result(dialog_not_found_text(args.dialog, retry_tool="ListTopics"), has_filter=True)
+        return error_result(f"Error: {error_msg}", has_filter=True)
 
     data = response.get("data", {})
     topics = data.get("topics", [])
@@ -224,5 +222,3 @@ async def list_topics(args: ListTopics) -> ToolResult:
 
     result_text = "\n".join(lines)
     return ToolResult(content=_text_response(result_text), result_count=len(lines), has_filter=True)
-
-

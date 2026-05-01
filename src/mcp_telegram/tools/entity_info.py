@@ -23,6 +23,7 @@ from ._base import (
     _daemon_not_running_text,
     _text_response,
     daemon_connection,
+    error_result,
     mcp_tool,
 )
 
@@ -137,16 +138,16 @@ async def get_entity_info(args: GetEntityInfo) -> ToolResult:
             async with daemon_connection() as conn:
                 resolve_response = await conn.resolve_entity(query=args.entity)
         except DaemonNotRunningError:
-            return ToolResult(content=_text_response(_daemon_not_running_text()))
+            return error_result(_daemon_not_running_text())
 
         if not resolve_response.get("ok"):
-            return ToolResult(content=_text_response(entity_not_found_text(args.entity, retry_tool="GetEntityInfo")))
+            return error_result(entity_not_found_text(args.entity, retry_tool="GetEntityInfo"))
 
         resolve_data = resolve_response.get("data", {})
         resolve_status = resolve_data.get("result", "not_found")
 
         if resolve_status == "not_found":
-            return ToolResult(content=_text_response(entity_not_found_text(args.entity, retry_tool="GetEntityInfo")))
+            return error_result(entity_not_found_text(args.entity, retry_tool="GetEntityInfo"))
 
         if resolve_status == "candidates":
             matches = resolve_data.get("matches", [])
@@ -160,11 +161,7 @@ async def get_entity_info(args: GetEntityInfo) -> ToolResult:
                 if match.get("disambiguation_hint"):
                     line += f'  hint="{match["disambiguation_hint"]}"'
                 match_lines.append(line)
-            return ToolResult(
-                content=_text_response(
-                    ambiguous_entity_text(args.entity, match_lines, retry_tool="GetEntityInfo"),
-                )
-            )
+            return error_result(ambiguous_entity_text(args.entity, match_lines, retry_tool="GetEntityInfo"))
 
         entity_id = resolve_data["entity_id"]
         display_name = resolve_data["display_name"]
@@ -173,14 +170,14 @@ async def get_entity_info(args: GetEntityInfo) -> ToolResult:
         async with daemon_connection() as conn:
             response = await conn.get_entity_info(entity_id=entity_id)
     except DaemonNotRunningError:
-        return ToolResult(content=_text_response(_daemon_not_running_text()))
+        return error_result(_daemon_not_running_text())
 
     if not response.get("ok"):
         error_code = response.get("error", "")
         if error_code == "entity_not_found":
-            return ToolResult(content=_text_response(entity_not_found_text(args.entity, retry_tool="GetEntityInfo")))
+            return error_result(entity_not_found_text(args.entity, retry_tool="GetEntityInfo"))
         error_msg = response.get("message", "Request failed.")
-        return ToolResult(content=_text_response(fetch_entity_info_error_text(args.entity, error_msg)))
+        return error_result(fetch_entity_info_error_text(args.entity, error_msg))
 
     data = response.get("data", {})
     entity_type = data.get("type", "unknown")

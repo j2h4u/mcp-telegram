@@ -17,6 +17,7 @@ from ._base import (
     _daemon_not_running_text,
     _text_response,
     daemon_connection,
+    error_result,
     mcp_tool,
 )
 
@@ -93,7 +94,7 @@ async def submit_feedback(args: SubmitFeedback) -> ToolResult:
                 harness=args.harness,
             )
     except DaemonNotRunningError:
-        return ToolResult(content=_text_response(_daemon_not_running_text()))
+        return error_result(_daemon_not_running_text())
 
     if err := _check_daemon_response(response):
         return err

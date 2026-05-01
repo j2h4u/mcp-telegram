@@ -8,10 +8,14 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from ._base import (
+    DaemonNotRunningError,
     ToolArgs,
     ToolResult,
+    _check_daemon_response,
+    _daemon_not_running_text,
     _text_response,
     daemon_connection,
+    error_result,
     mcp_tool,
 )
 
@@ -64,11 +68,17 @@ def _format_block(comment: dict[str, Any]) -> str:
 
 @mcp_tool("primary", annotations=ToolAnnotations(readOnlyHint=True))
 async def get_my_recent_activity(args: GetMyRecentActivity) -> ToolResult:
-    async with daemon_connection() as conn:
-        response = await conn.get_my_recent_activity(
-            since_hours=args.since_hours,
-            limit=args.limit,
-        )
+    try:
+        async with daemon_connection() as conn:
+            response = await conn.get_my_recent_activity(
+                since_hours=args.since_hours,
+                limit=args.limit,
+            )
+    except DaemonNotRunningError:
+        return error_result(_daemon_not_running_text())
+
+    if err := _check_daemon_response(response):
+        return err
 
     data = response.get("data") or {}
     comments = data.get("comments") or []

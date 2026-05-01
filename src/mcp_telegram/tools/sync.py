@@ -11,6 +11,7 @@ from ._base import (
     _daemon_not_running_text,
     _text_response,
     daemon_connection,
+    error_result,
     mcp_tool,
 )
 
@@ -35,7 +36,7 @@ async def mark_dialog_for_sync(args: MarkDialogForSync) -> ToolResult:
                 enable=args.enable,
             )
     except DaemonNotRunningError:
-        return ToolResult(content=_text_response(_daemon_not_running_text()))
+        return error_result(_daemon_not_running_text())
 
     if err := _check_daemon_response(response):
         return err
@@ -63,7 +64,7 @@ async def get_sync_status(args: GetSyncStatus) -> ToolResult:
         async with daemon_connection() as conn:
             response = await conn.get_sync_status(dialog_id=args.dialog_id)
     except DaemonNotRunningError:
-        return ToolResult(content=_text_response(_daemon_not_running_text()))
+        return error_result(_daemon_not_running_text())
 
     if err := _check_daemon_response(response):
         return err
@@ -102,7 +103,7 @@ async def get_sync_alerts(args: GetSyncAlerts) -> ToolResult:
         async with daemon_connection() as conn:
             response = await conn.get_sync_alerts(since=args.since, limit=args.limit)
     except DaemonNotRunningError:
-        return ToolResult(content=_text_response(_daemon_not_running_text()))
+        return error_result(_daemon_not_running_text())
 
     if err := _check_daemon_response(response):
         return err
@@ -139,5 +140,4 @@ async def get_sync_alerts(args: GetSyncAlerts) -> ToolResult:
 
     total = len(deleted) + len(edits) + len(access_lost)
     return ToolResult(content=_text_response("\n".join(sections)), result_count=total)
-
 

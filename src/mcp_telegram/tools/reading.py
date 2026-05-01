@@ -15,8 +15,10 @@ from ._base import (
     ToolAnnotations,
     ToolArgs,
     ToolResult,
+    _daemon_not_running_text,
     _text_response,
     daemon_connection,
+    error_result,
     mcp_tool,
 )
 
@@ -325,13 +327,13 @@ async def _resolve_topic_id(
                 dialog_id=dialog_id,
                 dialog=dialog_name,
             )
-    except DaemonNotRunningError as e:
-        return ToolResult(content=_text_response(str(e)))
+    except DaemonNotRunningError:
+        return error_result(_daemon_not_running_text())
 
     if not response.get("ok"):
         error = response.get("error", "unknown")
         error_detail = response.get("message", "")
-        return ToolResult(content=_text_response(f"Topic lookup failed: {error}: {error_detail}"))
+        return error_result(f"Topic lookup failed: {error}: {error_detail}")
 
     topics = response.get("data", {}).get("topics", [])
     query = topic_name.lower()
@@ -345,13 +347,9 @@ async def _resolve_topic_id(
         if len(exact_matches) == 1:
             return exact_matches[0]["id"]
         names = ", ".join(t.get("title", "?") for t in fuzzy_matches[:5])
-        return ToolResult(
-            content=_text_response(f"Ambiguous topic '{topic_name}'. Matches: {names}. Use exact_topic_id."),
-        )
+        return error_result(f"Ambiguous topic '{topic_name}'. Matches: {names}. Use exact_topic_id.")
 
-    return ToolResult(
-        content=_text_response(f"Topic '{topic_name}' not found in this dialog."),
-    )
+    return error_result(f"Topic '{topic_name}' not found in this dialog.")
 
 
 @mcp_tool("primary", annotations=ToolAnnotations(readOnlyHint=True))
@@ -419,30 +417,28 @@ async def list_messages(args: ListMessages) -> ToolResult:
                 context_message_id=args.anchor_message_id,
                 context_size=args.context_size if args.anchor_message_id else None,
             )
-    except DaemonNotRunningError as e:
-        return ToolResult(content=_text_response(str(e)))
+    except DaemonNotRunningError:
+        return error_result(_daemon_not_running_text())
 
     if not response.get("ok"):
         error = response.get("error", "unknown")
         error_detail = response.get("message", "")
         if error == "dialog_not_found":
             dialog_label = str(dialog_id) if dialog_id else (args.dialog or "")
-            return ToolResult(
-                content=_text_response(dialog_not_found_text(dialog_label, retry_tool="ListMessages")),
+            return error_result(
+                dialog_not_found_text(dialog_label, retry_tool="ListMessages"),
                 has_filter=has_filter,
                 has_cursor=has_cursor,
             )
         if error == "not_synced":
-            return ToolResult(
-                content=_text_response(
-                    "Error: dialog is not synced. "
-                    "Use MarkDialogForSync to enable sync, then wait for syncing to complete."
-                ),
+            return error_result(
+                "Error: dialog is not synced. "
+                "Use MarkDialogForSync to enable sync, then wait for syncing to complete.",
                 has_filter=has_filter,
                 has_cursor=has_cursor,
             )
-        return ToolResult(
-            content=_text_response(f"Error: {error}: {error_detail}"),
+        return error_result(
+            f"Error: {error}: {error_detail}",
             has_filter=has_filter,
             has_cursor=has_cursor,
         )
@@ -551,8 +547,8 @@ async def search_messages(args: SearchMessages) -> ToolResult:
             if nav.kind == "search":
                 offset = nav.value
         except Exception as exc:
-            return ToolResult(
-                content=_text_response(invalid_navigation_text(str(exc), retry_tool="SearchMessages")),
+            return error_result(
+                invalid_navigation_text(str(exc), retry_tool="SearchMessages"),
                 has_cursor=True,
             )
 
@@ -570,8 +566,8 @@ async def search_messages(args: SearchMessages) -> ToolResult:
                 limit=args.limit,
                 offset=offset,
             )
-    except DaemonNotRunningError as e:
-        return ToolResult(content=_text_response(str(e)))
+    except DaemonNotRunningError:
+        return error_result(_daemon_not_running_text())
 
     dialog_label: str | None = str(dialog_id) if dialog_id else args.dialog
 
@@ -579,13 +575,13 @@ async def search_messages(args: SearchMessages) -> ToolResult:
         error = response.get("error", "unknown")
         error_detail = response.get("message", "")
         if error == "dialog_not_found":
-            return ToolResult(
-                content=_text_response(dialog_not_found_text(dialog_label or "?", retry_tool="SearchMessages")),
+            return error_result(
+                dialog_not_found_text(dialog_label or "?", retry_tool="SearchMessages"),
                 has_filter=True,
                 has_cursor=args.navigation is not None,
             )
-        return ToolResult(
-            content=_text_response(f"Error: {error}: {error_detail}"),
+        return error_result(
+            f"Error: {error}: {error_detail}",
             has_filter=True,
             has_cursor=args.navigation is not None,
         )
