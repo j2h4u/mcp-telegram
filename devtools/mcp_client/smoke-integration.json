@@ -38,10 +38,10 @@
       }
     },
     {
-      "_comment": "list_messages — Saved Messages",
+      "_comment": "list_messages — synced channel, alternate page size",
       "action": "call_tool",
       "name": "list_messages",
-      "arguments": {"dialog": "Saved Messages", "limit": 5},
+      "arguments": {"dialog": "Vibecoding is so last year", "limit": 5},
       "expect": {
         "is_error": false
       }
@@ -89,7 +89,8 @@
       "name": "get_dialog_stats",
       "arguments": {"dialog": "Vibecoding is so last year", "top_n": 3},
       "expect": {
-        "is_error": false
+        "is_error": true,
+        "content_text_contains": ["requires a synced dialog"]
       }
     },
     {

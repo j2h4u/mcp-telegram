@@ -32,7 +32,7 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
                 "type": "object",
                 "properties": {
                     "id": {"type": "integer"},
-                    "name": {"type": "string"},
+                    "name": {"type": ["string", "null"]},
                     "type": {"type": ["string", "null"]},
                     "unread_count": {"type": ["integer", "null"]},
                     "synced": {"type": ["boolean", "null"]},

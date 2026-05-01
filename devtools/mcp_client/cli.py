@@ -124,13 +124,14 @@ def redact_script_output(payload: Any) -> Any:
             continue
         content = result.get("content")
         if not isinstance(content, list):
-            continue
+            content = []
         for item in content:
-            if not isinstance(item, dict):
-                continue
-            text = item.get("text")
-            if isinstance(text, str):
-                item["text"] = f"[REDACTED {len(text)} chars]"
+            if isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str):
+                    item["text"] = f"[REDACTED {len(text)} chars]"
+        if "structuredContent" in result:
+            result["structuredContent"] = "[REDACTED structuredContent]"
     return redacted
 
 

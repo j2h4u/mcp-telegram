@@ -288,6 +288,35 @@ async def test_list_dialogs_via_daemon():
     conn.list_dialogs.assert_called_once()
 
 
+async def test_list_dialogs_structured_output_allows_null_name():
+    conn = _make_daemon_conn(
+        {
+            "ok": True,
+            "data": {
+                "dialogs": [
+                    {
+                        "id": 123,
+                        "name": None,
+                        "type": "User",
+                        "last_message_at": None,
+                        "unread_count": 0,
+                        "sync_status": "synced",
+                    }
+                ]
+            },
+        }
+    )
+
+    with _patch_daemon(conn):
+        result = await list_dialogs(ListDialogs())
+
+    assert TOOL_REGISTRY["list_dialogs"].output_schema is not None
+    name_schema = TOOL_REGISTRY["list_dialogs"].output_schema["properties"]["dialogs"]["items"]["properties"]["name"]
+    assert name_schema == {"type": ["string", "null"]}
+    assert result.structured_content is not None
+    assert result.structured_content["dialogs"][0]["name"] is None
+
+
 async def test_list_dialogs_sync_status_in_output():
     """ListDialogs output includes sync_status field for every dialog."""
     conn = _make_daemon_conn(

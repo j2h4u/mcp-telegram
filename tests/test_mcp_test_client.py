@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from devtools.mcp_client.cli import main
+from devtools.mcp_client.cli import main, redact_script_output
 from devtools.mcp_client.client import McpClientError, StdioMcpClient, execute_script_steps
 
 
@@ -136,6 +136,36 @@ def test_mcp_test_client_redacts_printed_script_output(tmp_path, capsys) -> None
     assert exit_code == 0
     assert "[REDACTED " in captured.out
     assert "sensitive text" not in captured.out
+
+
+def test_mcp_test_client_redacts_structured_content() -> None:
+    payload = [
+        {
+            "action": "call_tool",
+            "name": "get_inbox",
+            "result": {
+                "content": [{"type": "text", "text": "sensitive rendered text"}],
+                "structuredContent": {
+                    "dialogs": [
+                        {
+                            "name": "Sensitive Name",
+                            "messages": [{"text": "Sensitive structured text"}],
+                        }
+                    ]
+                },
+                "isError": False,
+            },
+        }
+    ]
+
+    redacted = redact_script_output(payload)
+
+    rendered = json.dumps(redacted, ensure_ascii=False)
+    assert "[REDACTED " in rendered
+    assert "[REDACTED structuredContent]" in rendered
+    assert "sensitive rendered text" not in rendered
+    assert "Sensitive Name" not in rendered
+    assert "Sensitive structured text" not in rendered
 
 
 def test_smoke_scripts_use_snake_case_tool_names() -> None:
