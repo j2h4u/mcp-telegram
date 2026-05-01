@@ -7,7 +7,8 @@ import pytest
 from mcp.types import TextContent, Tool
 
 from mcp_telegram import server
-from mcp_telegram.tools._base import ToolResult
+from mcp_telegram.tools._base import ToolResult, ToolRegistryEntry, tool_description
+from mcp_telegram.tools.discovery import ListDialogs
 
 
 def _tool(name: str) -> Tool:
@@ -183,6 +184,31 @@ def test_list_tools_exposes_snake_case_names_titles_and_annotations() -> None:
     assert server.tool_by_name["mark_dialog_for_sync"].annotations.idempotentHint is True
     assert server.tool_by_name["submit_feedback"].annotations.readOnlyHint is False
     assert all(not any(part[:1].isupper() for part in name.split("_")) for name in server.tool_by_name)
+
+
+def test_tool_descriptor_preserves_registry_output_schema() -> None:
+    output_schema = {
+        "type": "object",
+        "properties": {
+            "dialogs": {"type": "array", "items": {"type": "object"}},
+            "count": {"type": "integer"},
+        },
+        "required": ["dialogs", "count"],
+    }
+    entry = ToolRegistryEntry(
+        cls=ListDialogs,
+        posture="secondary/helper",
+        annotations=None,
+        exported_name="list_dialogs",
+        title="List Dialogs",
+        output_schema=output_schema,
+    )
+
+    tool = tool_description("list_dialogs", ListDialogs, entry)
+
+    assert tool.inputSchema["type"] == "object"
+    assert tool.outputSchema == output_schema
+    assert tool.title == "List Dialogs"
 
 
 def test_posture_covers_all_registered_tools() -> None:
