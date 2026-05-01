@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from devtools.mcp_client.cli import main
 from devtools.mcp_client.client import McpClientError, StdioMcpClient, execute_script_steps
 
 
@@ -93,3 +94,39 @@ async def test_mcp_test_client_script_assertions_fail() -> None:
     async with StdioMcpClient(_fake_server_command()) as client:
         with pytest.raises(McpClientError, match="missing expected text fragment"):
             await execute_script_steps(client, steps)
+
+
+def test_mcp_test_client_redacts_printed_script_output(tmp_path, capsys) -> None:
+    script_path = tmp_path / "script.json"
+    script_path.write_text(
+        """
+        {
+          "steps": [
+            {
+              "action": "call_tool",
+              "name": "Echo",
+              "arguments": {"value": "sensitive text"},
+              "expect": {
+                "is_error": false,
+                "content_text_contains": ["sensitive text"]
+              }
+            }
+          ]
+        }
+        """,
+        encoding="utf-8",
+    )
+
+    exit_code = main([
+        "script",
+        "--redact",
+        "--file",
+        str(script_path),
+        "--",
+        *_fake_server_command(),
+    ])
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "[REDACTED " in captured.out
+    assert "sensitive text" not in captured.out

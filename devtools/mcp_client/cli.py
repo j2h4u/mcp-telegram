@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import json
 import sys
 from pathlib import Path
@@ -37,6 +38,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     script_parser = subparsers.add_parser("script", help="Run several MCP actions in one session from a JSON file.")
     script_parser.add_argument("--file", required=True, help="Path to a JSON script file.")
+    script_parser.add_argument(
+        "--redact",
+        action="store_true",
+        help="Redact call_tool text content in printed script output.",
+    )
     _add_common_arguments(script_parser)
 
     return parser
@@ -97,8 +103,35 @@ async def _run_command(args: argparse.Namespace) -> Any:
         if args.command == "call-tool":
             return await client.call_tool(args.name, parse_tool_arguments(args.arguments))
         if args.command == "script":
-            return await execute_script_steps(client, load_script_steps(Path(args.file)))
+            payload = await execute_script_steps(client, load_script_steps(Path(args.file)))
+            if args.redact:
+                return redact_script_output(payload)
+            return payload
         raise ValueError(f"unsupported command: {args.command}")
+
+
+def redact_script_output(payload: Any) -> Any:
+    """Return a printable copy with call_tool text content redacted."""
+    redacted = copy.deepcopy(payload)
+    if not isinstance(redacted, list):
+        return redacted
+
+    for step in redacted:
+        if not isinstance(step, dict) or step.get("action") != "call_tool":
+            continue
+        result = step.get("result")
+        if not isinstance(result, dict):
+            continue
+        content = result.get("content")
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            text = item.get("text")
+            if isinstance(text, str):
+                item["text"] = f"[REDACTED {len(text)} chars]"
+    return redacted
 
 
 def main(argv: list[str] | None = None) -> int:
