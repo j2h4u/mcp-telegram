@@ -48,7 +48,7 @@ def _check_daemon_response(response: dict, **extra_kwargs) -> ToolResult | None:
     if response.get("ok"):
         return None
     error_detail = response.get("message", "Request failed.")
-    return ToolResult(content=_text_response(f"Error: {error_detail}"), **extra_kwargs)
+    return error_result(f"Error: {error_detail}", **extra_kwargs)
 
 
 @dataclass
@@ -62,6 +62,16 @@ class ToolResult:
     has_cursor: bool = False
     page_depth: int = 1
     has_filter: bool = False
+
+
+def text_result(text: str, **metadata) -> ToolResult:
+    """Return successful text content with optional telemetry metadata."""
+    return ToolResult(content=_text_response(text), **metadata)
+
+
+def error_result(text: str, **metadata) -> ToolResult:
+    """Return recoverable error text as an MCP tool result."""
+    return ToolResult(content=_text_response(text), is_error=True, **metadata)
 
 
 # Strong references to fire-and-forget tasks prevent GC before completion.
