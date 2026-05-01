@@ -5,6 +5,7 @@ from pydantic import Field, model_validator
 from ..errors import dialog_not_found_text, invalid_navigation_text, search_no_hits_text
 from ..formatter import (
     _render_read_state_header,
+    frame_telegram_snippet,
     format_messages,
     resolve_sender_label,
 )
@@ -175,10 +176,10 @@ def _format_search_results(
         sender = resolve_sender_label(row)
         dt = datetime.fromtimestamp(int(sent_at), tz=UTC)
         time_str = dt.strftime("%Y-%m-%d %H:%M")
-        snippet = _extract_snippet(row.get("text"), query)
+        snippet = frame_telegram_snippet(_extract_snippet(row.get("text"), query))
 
         dialog_prefix = f"[{row.get('dialog_name') or '?'}] " if global_mode else ""
-        lines.append(f'{dialog_prefix}{time_str} {sender} (msg_id:{msg_id}): "{snippet}"')
+        lines.append(f"{dialog_prefix}{time_str} {sender} (msg_id:{msg_id}): {snippet}")
 
     if header_lines:
         return "\n".join(header_lines + lines)

@@ -7,6 +7,7 @@ from typing import Any
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
+from ..formatter import frame_telegram_snippet
 from ._base import (
     DaemonNotRunningError,
     ToolArgs,
@@ -52,6 +53,7 @@ def _format_block(comment: dict[str, Any]) -> str:
     dt = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
     dialog_name = comment.get("dialog_name") or str(comment.get("dialog_id", "?"))
     text = (comment.get("text") or "").replace("\n", " ")
+    text = frame_telegram_snippet(text)
     block = (
         f"[{dialog_name}] {dt}  {text}\n"
         f"  nav: dialog_id={comment.get('dialog_id')} message_id={comment.get('message_id')}"
