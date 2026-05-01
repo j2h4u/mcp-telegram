@@ -52,6 +52,26 @@ async def test_submit_feedback_tool_happy_path(mock_daemon_connection) -> None:
 
     assert len(result.content) == 1
     assert result.content[0].text == "Feedback recorded. Thank you!"
+    assert "id=" not in result.content[0].text
+
+
+@pytest.mark.asyncio
+async def test_submit_feedback_tool_does_not_expose_feedback_id() -> None:
+    """Agent-facing response stays fire-and-forget even if daemon returns an id."""
+    mock_conn = AsyncMock()
+    mock_conn.submit_feedback = AsyncMock(
+        return_value={"ok": True, "data": {"id": 123, "message": "Feedback recorded. Thank you!"}}
+    )
+
+    @asynccontextmanager
+    async def fake_dc():
+        yield mock_conn
+
+    with patch("mcp_telegram.tools.feedback.daemon_connection", fake_dc):
+        result = await submit_feedback(SubmitFeedback(message="the bug"))
+
+    assert result.content[0].text == "Feedback recorded. Thank you!"
+    assert "id=" not in result.content[0].text
 
 
 @pytest.mark.asyncio

@@ -99,7 +99,4 @@ async def submit_feedback(args: SubmitFeedback) -> ToolResult:
     if err := _check_daemon_response(response):
         return err
 
-    data = response.get("data", {})
-    feedback_id = data.get("id")
-    suffix = f" id={feedback_id}" if feedback_id is not None else ""
-    return ToolResult(content=_text_response(f"Feedback recorded. Thank you!{suffix}"), result_count=1)
+    return ToolResult(content=_text_response("Feedback recorded. Thank you!"), result_count=1)
