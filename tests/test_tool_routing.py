@@ -403,6 +403,7 @@ async def test_search_messages_via_daemon():
             "data": {
                 "messages": [
                     {
+                        "dialog_id": 123,
                         "message_id": 5,
                         "sent_at": 1705312800,
                         "text": "Found this result",
@@ -420,6 +421,12 @@ async def test_search_messages_via_daemon():
 
     assert "Found this result" in result.content[0].text
     assert "[Telegram content] Found this result [/Telegram content]" in result.content[0].text
+    assert result.structured_content is not None
+    assert result.structured_content["query"] == "result"
+    assert result.structured_content["count"] == 1
+    assert result.structured_content["results"][0]["dialog_id"] == 123
+    assert result.structured_content["results"][0]["msg_id"] == 5
+    assert result.structured_content["results"][0]["snippet"] == "Found this result"
     conn.search_messages.assert_called_once()
 
 
@@ -432,6 +439,7 @@ async def test_search_messages_frames_adversarial_snippet():
             "data": {
                 "messages": [
                     {
+                        "dialog_id": 123,
                         "message_id": 5,
                         "sent_at": 1705312800,
                         "text": adversarial,
@@ -471,6 +479,12 @@ async def test_search_messages_no_hits():
 
     assert len(result.content) == 1
     assert "no messages matched" in result.content[0].text.lower(), f"Expected no-hits text, got: {result.content[0].text}"
+    assert result.structured_content == {
+        "query": "nonexistent",
+        "results": [],
+        "count": 0,
+        "next_navigation": None,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -812,6 +826,11 @@ async def test_get_inbox_via_daemon():
     header_line = next(line for line in text.splitlines() if line.startswith("--- Alice"))
     assert "[Telegram content]" not in header_line
     assert "[Telegram content]\nHello there\n[/Telegram content]" in text
+    assert result.structured_content is not None
+    assert result.structured_content["count"] == 1
+    assert result.structured_content["dialogs"][0]["dialog_id"] == 123
+    assert result.structured_content["dialogs"][0]["messages"][0]["msg_id"] == 1
+    assert result.structured_content["dialogs"][0]["messages"][0]["text"] == "Hello there"
     conn.get_inbox.assert_called_once()
 
 

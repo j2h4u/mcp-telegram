@@ -94,6 +94,32 @@ def _format_daemon_messages(
 _SNIPPET_MAX_LEN = 150
 _SNIPPET_LEAD = 50  # chars to show before the matched word
 
+SEARCH_MESSAGES_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "query": {"type": "string"},
+        "results": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "dialog_id": {"type": "integer"},
+                    "msg_id": {"type": "integer"},
+                    "date": {"type": ["string", "null"]},
+                    "sender": {"type": ["string", "null"]},
+                    "snippet": {"type": "string"},
+                },
+                "required": ["dialog_id", "msg_id", "snippet"],
+                "additionalProperties": False,
+            },
+        },
+        "count": {"type": "integer"},
+        "next_navigation": {"type": ["string", "null"]},
+    },
+    "required": ["query", "results", "count", "next_navigation"],
+    "additionalProperties": False,
+}
+
 
 def _extract_snippet(text: str | None, query: str) -> str:
     """Return a short excerpt from *text* centred on the first query word match.
@@ -117,6 +143,25 @@ def _extract_snippet(text: str | None, query: str) -> str:
             return f"{prefix}{snippet}{suffix}"
 
     return text[:_SNIPPET_MAX_LEN] + "..."
+
+
+def _search_result_structured_rows(rows: list[dict], query: str) -> list[dict[str, object]]:
+    results: list[dict[str, object]] = []
+    for row in rows:
+        sent_at = row.get("sent_at")
+        date: str | None = None
+        if sent_at is not None:
+            date = datetime.fromtimestamp(int(sent_at), tz=UTC).strftime("%Y-%m-%d %H:%M")
+        results.append(
+            {
+                "dialog_id": row.get("dialog_id"),
+                "msg_id": row["message_id"],
+                "date": date,
+                "sender": resolve_sender_label(row),
+                "snippet": _extract_snippet(row.get("text"), query),
+            }
+        )
+    return results
 
 
 def _format_search_results(
@@ -526,7 +571,12 @@ class SearchMessages(ToolArgs):
     )
 
 
-@mcp_tool(name="search_messages", title="Search Messages", annotations=ToolAnnotations(readOnlyHint=True))
+@mcp_tool(
+    name="search_messages",
+    title="Search Messages",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    output_schema=SEARCH_MESSAGES_OUTPUT_SCHEMA,
+)
 async def search_messages(args: SearchMessages) -> ToolResult:
     global_mode = args.dialog is None
 
@@ -590,11 +640,19 @@ async def search_messages(args: SearchMessages) -> ToolResult:
     data = response.get("data", {})
     rows = data.get("messages", [])
     next_nav = data.get("next_navigation")
+    structured_results = _search_result_structured_rows(rows, args.query)
+    structured_content = {
+        "query": args.query,
+        "results": structured_results,
+        "count": len(structured_results),
+        "next_navigation": next_nav,
+    }
 
     if not rows:
         result_text = search_no_hits_text(dialog_label, args.query)
         return ToolResult(
             content=_text_response(result_text),
+            structured_content=structured_content,
             result_count=0,
             has_filter=True,
             has_cursor=args.navigation is not None,
@@ -616,6 +674,7 @@ async def search_messages(args: SearchMessages) -> ToolResult:
 
     return ToolResult(
         content=_text_response(result_text),
+        structured_content=structured_content,
         result_count=len(rows),
         has_filter=True,
         has_cursor=args.navigation is not None or bool(next_nav),

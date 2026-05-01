@@ -18,6 +18,42 @@ from ._base import (
     mcp_tool,
 )
 
+GET_INBOX_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "dialogs": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "dialog_id": {"type": "integer"},
+                    "name": {"type": "string"},
+                    "unread_count": {"type": "integer"},
+                    "messages": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "msg_id": {"type": "integer"},
+                                "sender": {"type": ["string", "null"]},
+                                "date": {"type": ["string", "null"]},
+                                "text": {"type": "string"},
+                            },
+                            "required": ["msg_id", "text"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "required": ["dialog_id", "name", "unread_count", "messages"],
+                "additionalProperties": False,
+            },
+        },
+        "count": {"type": "integer"},
+    },
+    "required": ["dialogs", "count"],
+    "additionalProperties": False,
+}
+
 
 class GetInbox(ToolArgs):
     """Fetch unread messages from personal chats and small groups, prioritized by tier.
@@ -60,7 +96,28 @@ class GetInbox(ToolArgs):
     )
 
 
-@mcp_tool(name="get_inbox", title="Inbox", annotations=ToolAnnotations(readOnlyHint=True))
+def _message_date(sent_at: object) -> str | None:
+    if sent_at is None:
+        return None
+    try:
+        return str(sent_at)
+    except Exception:
+        return None
+
+
+def _message_sender(row: dict) -> str | None:
+    first = row.get("sender_first_name")
+    last = row.get("sender_last_name")
+    name = " ".join(str(part) for part in (first, last) if part)
+    return name or None
+
+
+@mcp_tool(
+    name="get_inbox",
+    title="Inbox",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    output_schema=GET_INBOX_OUTPUT_SCHEMA,
+)
 async def get_inbox(args: GetInbox) -> ToolResult:
     try:
         async with daemon_connection() as conn:
@@ -77,6 +134,26 @@ async def get_inbox(args: GetInbox) -> ToolResult:
 
     data = response.get("data", {})
     groups = data.get("groups", [])
+    structured_dialogs: list[dict[str, object]] = []
+    for group in groups:
+        messages = [
+            {
+                "msg_id": m.get("message_id"),
+                "sender": _message_sender(m),
+                "date": _message_date(m.get("sent_at")),
+                "text": m.get("text") or "",
+            }
+            for m in group.get("messages", [])
+        ]
+        structured_dialogs.append(
+            {
+                "dialog_id": group.get("dialog_id", 0),
+                "name": group.get("display_name", ""),
+                "unread_count": group.get("unread_count", 0),
+                "messages": messages,
+            }
+        )
+    structured_content = {"dialogs": structured_dialogs, "count": len(structured_dialogs)}
     # Defensive: older daemon responses or test mocks may omit bootstrap_pending.
     # Treat missing as 0 (full coverage assumed). Also guard against explicit None.
     bootstrap_pending = int(data.get("bootstrap_pending", 0) or 0)
@@ -91,9 +168,9 @@ async def get_inbox(args: GetInbox) -> ToolResult:
                 f"dialog(s) are still being seeded by the sync daemon. Results are "
                 f"incomplete. Retry shortly once bootstrap completes."
             )
-            return ToolResult(content=_text_response(warning))
+            return ToolResult(content=_text_response(warning), structured_content=structured_content)
         empty_msg = no_unread_all_text() if args.scope == "all" else no_unread_personal_text()
-        return ToolResult(content=_text_response(empty_msg))
+        return ToolResult(content=_text_response(empty_msg), structured_content=structured_content)
 
     chats: list[UnreadChatData] = []
     result_count = 0
@@ -141,4 +218,4 @@ async def get_inbox(args: GetInbox) -> ToolResult:
             f"Note: bootstrap_pending={bootstrap_pending} dialog(s) not yet seeded "
             f"by the sync daemon — results may be incomplete. Retry shortly."
         )
-    return ToolResult(content=_text_response(result_text), result_count=result_count)
+    return ToolResult(content=_text_response(result_text), structured_content=structured_content, result_count=result_count)
