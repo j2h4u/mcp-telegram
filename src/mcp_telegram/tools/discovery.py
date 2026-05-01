@@ -23,6 +23,30 @@ from ._base import (
     mcp_tool,
 )
 
+LIST_DIALOGS_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "dialogs": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer"},
+                    "name": {"type": "string"},
+                    "type": {"type": ["string", "null"]},
+                    "unread_count": {"type": ["integer", "null"]},
+                    "synced": {"type": ["boolean", "null"]},
+                },
+                "required": ["id", "name"],
+                "additionalProperties": True,
+            },
+        },
+        "count": {"type": "integer"},
+    },
+    "required": ["dialogs", "count"],
+    "additionalProperties": False,
+}
+
 
 class ListDialogs(ToolArgs):
     """List available dialogs, chats and channels with type and last message timestamp.
@@ -53,7 +77,13 @@ class ListDialogs(ToolArgs):
     filter: str | None = Field(default=None, max_length=200)
 
 
-@mcp_tool(name="list_dialogs", title="List Dialogs", posture="secondary/helper", annotations=ToolAnnotations(readOnlyHint=True))
+@mcp_tool(
+    name="list_dialogs",
+    title="List Dialogs",
+    posture="secondary/helper",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    output_schema=LIST_DIALOGS_OUTPUT_SCHEMA,
+)
 async def list_dialogs(args: ListDialogs) -> ToolResult:
     try:
         async with daemon_connection() as conn:
@@ -70,6 +100,19 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
 
     data = response.get("data", {})
     dialogs = data.get("dialogs", [])
+    structured_dialogs: list[dict[str, object]] = []
+    for d in dialogs:
+        sync_status = d.get("sync_status")
+        structured_dialogs.append(
+            {
+                "id": d.get("id"),
+                "name": d.get("name", ""),
+                "type": d.get("type"),
+                "unread_count": d.get("unread_count"),
+                "synced": (sync_status == "synced") if sync_status is not None else None,
+            }
+        )
+    structured_content = {"dialogs": structured_dialogs, "count": len(structured_dialogs)}
 
     if not dialogs:
         # Phase 44 (Plan 01 contract): bootstrap_pending=True => dialogs table is
@@ -80,19 +123,20 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
         if data.get("bootstrap_pending"):
             return ToolResult(
                 content=_text_response(bootstrap_pending_text()),
+                structured_content=structured_content,
                 result_count=0,
             )
-        return ToolResult(content=_text_response(no_dialogs_text()))
+        return ToolResult(content=_text_response(no_dialogs_text()), structured_content=structured_content)
 
     entity_dicts: list[dict] = []
     lines: list[str] = []
 
-    for d in dialogs:
+    for d, structured_dialog in zip(dialogs, structured_dialogs, strict=False):
         dialog_id = d.get("id")
-        dialog_name = d.get("name", "")
-        dialog_type = d.get("type", "unknown")
+        dialog_name = structured_dialog["name"]
+        dialog_type = structured_dialog["type"] or "unknown"
         last_at = d.get("last_message_at", "unknown")
-        unread_count = d.get("unread_count", 0)
+        unread_count = structured_dialog["unread_count"]
         sync_status = d.get("sync_status", "unknown")
 
         members = d.get("members")
@@ -166,7 +210,11 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
             logger.debug("entity_upsert_skipped", exc_info=True)
 
     result_text = "\n".join(lines)
-    return ToolResult(content=_text_response(result_text), result_count=result_count)
+    return ToolResult(
+        content=_text_response(result_text),
+        structured_content=structured_content,
+        result_count=result_count,
+    )
 
 
 class ListTopics(ToolArgs):

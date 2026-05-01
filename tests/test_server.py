@@ -211,6 +211,14 @@ def test_tool_descriptor_preserves_registry_output_schema() -> None:
     assert tool.title == "List Dialogs"
 
 
+def test_list_tools_exposes_list_dialogs_output_schema() -> None:
+    tool = server.tool_by_name["list_dialogs"]
+
+    assert tool.outputSchema is not None
+    assert "dialogs" in tool.outputSchema["properties"]
+    assert "count" in tool.outputSchema["required"]
+
+
 def test_posture_covers_all_registered_tools() -> None:
     """Every registered tool must have a posture classification."""
     from mcp_telegram.tools import TOOL_REGISTRY

@@ -170,6 +170,16 @@ async def test_list_dialogs_via_daemon():
     assert "Dev Chat" in text
     assert "sync_status=synced" in text
     assert "sync_status=not_synced" in text
+    assert result.structured_content is not None
+    assert result.structured_content["count"] == len(result.structured_content["dialogs"])
+    assert result.structured_content["dialogs"][0] == {
+        "id": 123,
+        "name": "Alice",
+        "type": "User",
+        "unread_count": 2,
+        "synced": True,
+    }
+    assert result.structured_content["dialogs"][1]["synced"] is False
     conn.list_dialogs.assert_called_once()
 
 
