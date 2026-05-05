@@ -14,6 +14,8 @@ dependencies = [
   "anyascii>=0.3.3",
   "snowballstemmer>=3.0.1",
   "phonenumbers>=9.0.28",
+  "starlette>=0.52.1",
+  "uvicorn>=0.41.0",
 ]
 
 [build-system]

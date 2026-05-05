@@ -13,7 +13,9 @@ function main {
     command -v python3 >/dev/null 2>&1 || die "python3 is not installed"
 
     [[ -x /usr/local/bin/healthcheck_daemon.py ]] || die "missing daemon healthcheck script"
+    [[ -x /usr/local/bin/healthcheck_http.py ]] || die "missing HTTP healthcheck script"
     python3 /usr/local/bin/healthcheck_daemon.py
+    python3 /usr/local/bin/healthcheck_http.py
 }
 
 main "$@"

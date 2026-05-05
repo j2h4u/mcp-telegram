@@ -13,6 +13,7 @@ if __package__ in {None, ""}:
 
 from devtools.mcp_client.client import (
     DEFAULT_TIMEOUT_SECONDS,
+    HttpMcpClient,
     McpClientError,
     StdioMcpClient,
     execute_script_steps,
@@ -21,11 +22,12 @@ from devtools.mcp_client.client import (
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Small stdio MCP client for local testing.")
+    parser = argparse.ArgumentParser(description="Small MCP client for local testing.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     list_tools_parser = subparsers.add_parser("list-tools", help="Initialize the server and print tools/list.")
     _add_common_arguments(list_tools_parser)
+    _add_http_arguments(list_tools_parser)
 
     call_tool_parser = subparsers.add_parser("call-tool", help="Initialize the server and invoke one tool.")
     call_tool_parser.add_argument("--name", required=True, help="Tool name to invoke.")
@@ -35,6 +37,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="JSON object with tool arguments. Default: {}",
     )
     _add_common_arguments(call_tool_parser)
+    _add_http_arguments(call_tool_parser)
 
     script_parser = subparsers.add_parser("script", help="Run several MCP actions in one session from a JSON file.")
     script_parser.add_argument("--file", required=True, help="Path to a JSON script file.")
@@ -44,6 +47,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Redact call_tool text content in printed script output.",
     )
     _add_common_arguments(script_parser)
+    _add_http_arguments(script_parser)
 
     return parser
 
@@ -64,6 +68,13 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
         "server_command",
         nargs=argparse.REMAINDER,
         help="Command used to launch the stdio MCP server. Prefix with '--'.",
+    )
+
+
+def _add_http_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--url",
+        help="Streamable HTTP MCP endpoint. When set, server_command is ignored.",
     )
 
 
@@ -96,6 +107,19 @@ def print_json(payload: Any, *, compact: bool) -> None:
 
 
 async def _run_command(args: argparse.Namespace) -> Any:
+    if args.url:
+        async with HttpMcpClient(args.url, timeout_seconds=args.timeout) as client:
+            if args.command == "list-tools":
+                return await client.list_tools()
+            if args.command == "call-tool":
+                return await client.call_tool(args.name, parse_tool_arguments(args.arguments))
+            if args.command == "script":
+                payload = await execute_script_steps(client, load_script_steps(Path(args.file)))
+                if args.redact:
+                    return redact_script_output(payload)
+                return payload
+            raise ValueError(f"unsupported command: {args.command}")
+
     command = normalize_server_command(args.server_command)
     async with StdioMcpClient(command, timeout_seconds=args.timeout) as client:
         if args.command == "list-tools":

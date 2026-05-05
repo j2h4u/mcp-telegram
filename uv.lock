@@ -352,8 +352,10 @@ dependencies = [
     { name = "pydantic-settings" },
     { name = "rapidfuzz" },
     { name = "snowballstemmer" },
+    { name = "starlette" },
     { name = "telethon" },
     { name = "typer" },
+    { name = "uvicorn" },
     { name = "xdg-base-dirs" },
 ]
 
@@ -375,8 +377,10 @@ requires-dist = [
     { name = "pydantic-settings", specifier = ">=2.13.1" },
     { name = "rapidfuzz", specifier = ">=3.14.3" },
     { name = "snowballstemmer", specifier = ">=3.0.1" },
+    { name = "starlette", specifier = ">=0.52.1" },
     { name = "telethon", specifier = ">=1.42.0" },
     { name = "typer", specifier = ">=0.24.1" },
+    { name = "uvicorn", specifier = ">=0.41.0" },
     { name = "xdg-base-dirs", specifier = ">=6.0.0" },
 ]
 

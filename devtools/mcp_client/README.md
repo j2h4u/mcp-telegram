@@ -1,11 +1,17 @@
 # MCP Test Client
 
-Small stdio MCP client for local regression testing.
+Small MCP client for local regression testing.
 
 Usage:
 
 ```bash
 uv run python -m devtools.mcp_client.cli list-tools -- docker exec -i mcp-telegram mcp-telegram run
+```
+
+Streamable HTTP:
+
+```bash
+uv run python -m devtools.mcp_client.cli list-tools --url http://senbonzakura:3100/mcp
 ```
 
 ```bash

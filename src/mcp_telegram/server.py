@@ -1,11 +1,12 @@
-"""MCP server entrypoint — tool registration, request dispatch, stdio transport.
+"""MCP server entrypoint — tool registration, request dispatch, transports.
 
 Wires tool_runner (singledispatch) to the MCP Server, tracks per-request IDs
-via _request_ids ContextVar for cross-process log correlation, and runs the
-stdio transport loop.
+via _request_ids ContextVar for cross-process log correlation, and runs stdio
+or Streamable HTTP transport loops.
 """
 
 import asyncio
+import contextlib
 import logging
 import os
 import sys
@@ -189,6 +190,81 @@ async def run_mcp_server() -> None:
 
     async with stdio_server() as (read_stream, write_stream):
         await app.run(read_stream, write_stream, app.create_initialization_options())
+
+
+async def run_mcp_http_server(
+    *,
+    host: str = "0.0.0.0",
+    port: int = 3100,
+    mount_path: str = "/mcp",
+) -> None:
+    """Run the MCP server over Streamable HTTP."""
+
+    import uvicorn
+    from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+    from mcp.server.transport_security import TransportSecuritySettings
+    from starlette.applications import Starlette
+    from starlette.requests import Request
+    from starlette.responses import JSONResponse
+    from starlette.routing import Mount, Route
+
+    log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(
+        level=getattr(logging, log_level, logging.INFO),
+        stream=sys.stderr,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+        force=True,
+    )
+
+    normalized_mount_path = mount_path if mount_path.startswith("/") else f"/{mount_path}"
+    logger.info(
+        "MCP HTTP server starting on %s:%d%s — routing through daemon API",
+        host,
+        port,
+        normalized_mount_path,
+    )
+
+    app.instructions = await _build_server_instructions()
+    session_manager = StreamableHTTPSessionManager(
+        app=app,
+        security_settings=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+    )
+
+    async def handle_mcp(scope: t.Any, receive: t.Any, send: t.Any) -> None:
+        await session_manager.handle_request(scope, receive, send)
+
+    async def handle_health(_: Request) -> JSONResponse:
+        return JSONResponse({"ok": True, "transport": "streamable-http"})
+
+    @contextlib.asynccontextmanager
+    async def lifespan(_: Starlette) -> t.AsyncIterator[None]:
+        async with session_manager.run():
+            yield
+
+    asgi_app = Starlette(
+        debug=False,
+        routes=[
+            Mount(normalized_mount_path, app=handle_mcp),
+            Route("/health", endpoint=handle_health, methods=["GET"]),
+        ],
+        lifespan=lifespan,
+    )
+
+    class _NoSignalServer(uvicorn.Server):
+        @contextlib.contextmanager
+        def capture_signals(self) -> t.Iterator[None]:
+            # The sync daemon owns process signal handling; this server is
+            # cancelled by the combined `serve` entrypoint during shutdown.
+            yield
+
+    config = uvicorn.Config(
+        asgi_app,
+        host=host,
+        port=port,
+        log_level=log_level.lower(),
+        access_log=False,
+    )
+    await _NoSignalServer(config).serve()
 
 
 def main() -> None:

@@ -60,6 +60,64 @@ def sync() -> None:
     asyncio.run(sync_main())
 
 
+@app.command()
+def serve(
+    host: Annotated[
+        str,
+        Option(
+            "--host",
+            help="HTTP bind host for the Streamable HTTP MCP endpoint.",
+            envvar="MCP_TELEGRAM_HTTP_HOST",
+        ),
+    ] = "0.0.0.0",
+    port: Annotated[
+        int,
+        Option(
+            "--port",
+            help="HTTP bind port for the Streamable HTTP MCP endpoint.",
+            envvar="MCP_TELEGRAM_HTTP_PORT",
+        ),
+    ] = 3100,
+) -> None:
+    """Run the sync daemon and Streamable HTTP MCP endpoint in one process."""
+    import logging
+    import os
+    import sys
+
+    from .daemon import sync_main
+    from .server import run_mcp_http_server
+
+    log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(
+        level=getattr(logging, log_level, logging.INFO),
+        stream=sys.stderr,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+        force=True,
+    )
+
+    async def _run() -> None:
+        sync_task = asyncio.create_task(sync_main(), name="sync-daemon")
+        http_task = asyncio.create_task(
+            run_mcp_http_server(host=host, port=port),
+            name="mcp-http",
+        )
+        tasks = {sync_task, http_task}
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        for task in pending:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        for task in done:
+            exc = task.exception()
+            if exc is not None:
+                raise exc
+
+    asyncio.run(_run())
+
+
 # ---------------------------------------------------------------------------
 # feedback sub-app — admin queue management for submit_feedback (Phase 48)
 # ---------------------------------------------------------------------------
