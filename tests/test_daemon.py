@@ -1330,8 +1330,8 @@ async def test_source_export_describe_source_and_bootstrap_records() -> None:
 async def test_source_export_update_watermark_mixed_stream_does_not_regress_checkpoint() -> None:
     server, conn = _make_source_export_server()
     _source_export_seed_dialog(conn, -1001)
-    _source_export_seed_message(conn, -1001, 30, text="Edited old", sent_at=1769990000, edit_date=1770000060)
-    _source_export_seed_message(conn, -1001, 51, text="New bootstrap", sent_at=1770000030)
+    _source_export_seed_message(conn, -1001, 30, text="Edited old", sent_at=1769890000, edit_date=1769904060)
+    _source_export_seed_message(conn, -1001, 51, text="New bootstrap", sent_at=1769904030)
 
     result = await server._dispatch(
         {
@@ -1358,8 +1358,8 @@ async def test_source_export_update_watermark_mixed_stream_does_not_regress_chec
 async def test_source_export_same_timestamp_uses_updated_after_cursor_tie_break() -> None:
     server, conn = _make_source_export_server()
     _source_export_seed_dialog(conn, -1001)
-    _source_export_seed_message(conn, -1001, 30, text="first edit", sent_at=1769990000, edit_date=1770000060)
-    _source_export_seed_message(conn, -1001, 31, text="second edit", sent_at=1769990001, edit_date=1770000060)
+    _source_export_seed_message(conn, -1001, 30, text="first edit", sent_at=1769890000, edit_date=1769904060)
+    _source_export_seed_message(conn, -1001, 31, text="second edit", sent_at=1769890001, edit_date=1769904060)
 
     result = await server._dispatch(
         {

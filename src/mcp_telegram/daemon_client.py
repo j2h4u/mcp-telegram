@@ -231,6 +231,47 @@ class DaemonConnection:
         """Return current authenticated user info."""
         return await self.request({"method": "get_me"})
 
+    async def describe_source(self) -> dict:
+        """Return the structured source description consumed by dotMD."""
+        return await self.request({"method": "describe_source"})
+
+    async def export_source_changes(
+        self,
+        *,
+        cursor: str | None = None,
+        limit: int = 100,
+        updated_after: str | None = None,
+        updated_after_cursor: str | None = None,
+    ) -> dict:
+        """Export structured Telegram source changes for dotMD ingestion."""
+        payload: dict = {
+            "method": "export_source_changes",
+            "cursor": cursor,
+            "limit": limit,
+        }
+        if updated_after is not None:
+            payload["updated_after"] = updated_after
+        if updated_after_cursor is not None:
+            payload["updated_after_cursor"] = updated_after_cursor
+        return await self.request(payload)
+
+    async def read_source_unit_window(
+        self,
+        *,
+        unit_ref: str,
+        before: int = 0,
+        after: int = 0,
+    ) -> dict:
+        """Return neighboring Telegram source units around *unit_ref*."""
+        return await self.request(
+            {
+                "method": "read_source_unit_window",
+                "unit_ref": unit_ref,
+                "before": before,
+                "after": after,
+            }
+        )
+
     async def mark_dialog_for_sync(self, *, dialog_id: int, enable: bool = True) -> dict:
         """Mark or unmark a dialog for persistent sync."""
         return await self.request(
