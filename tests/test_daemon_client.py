@@ -101,6 +101,36 @@ async def test_request_round_trip(tmp_path: Path) -> None:
         await server.wait_closed()
 
 
+@pytest.mark.asyncio
+async def test_request_supports_multiple_calls_in_one_connection(tmp_path: Path) -> None:
+    """DaemonConnection can send sequential requests on the same stream."""
+    sock_path = tmp_path / "multi.sock"
+
+    async def _multi_server(
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        while line := await reader.readline():
+            req = json.loads(line.decode())
+            response = {"ok": True, "method": req["method"]}
+            writer.write(json.dumps(response).encode() + b"\n")
+            await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_unix_server(_multi_server, path=str(sock_path))
+    try:
+        with patch("mcp_telegram.daemon_client.get_daemon_socket_path", return_value=sock_path):
+            async with daemon_connection() as conn:
+                first = await conn.request({"method": "get_me"})
+                second = await conn.request({"method": "describe_source"})
+
+        assert first["method"] == "get_me"
+        assert second["method"] == "describe_source"
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
 # ---------------------------------------------------------------------------
 # request — EOF raises DaemonNotRunningError
 # ---------------------------------------------------------------------------

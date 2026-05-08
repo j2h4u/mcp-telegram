@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import sqlite3
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1327,6 +1328,42 @@ async def test_source_export_describe_source_and_bootstrap_records() -> None:
 
 
 @pytest.mark.asyncio
+async def test_daemon_api_keeps_connection_open_for_sequential_requests(tmp_path) -> None:
+    server, _conn = _make_source_export_server()
+    sock_path = tmp_path / "daemon.sock"
+    unix_server = await asyncio.start_unix_server(
+        server.handle_client,
+        path=str(sock_path),
+    )
+    try:
+        reader, writer = await asyncio.open_unix_connection(str(sock_path))
+        writer.write(
+            json.dumps({"method": "describe_source", "request_id": "one"}).encode()
+            + b"\n"
+        )
+        await writer.drain()
+        first = json.loads((await reader.readline()).decode())
+
+        writer.write(
+            json.dumps({"method": "describe_source", "request_id": "two"}).encode()
+            + b"\n"
+        )
+        await writer.drain()
+        second = json.loads((await reader.readline()).decode())
+
+        assert first["ok"] is True
+        assert first["request_id"] == "one"
+        assert second["ok"] is True
+        assert second["request_id"] == "two"
+
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        unix_server.close()
+        await unix_server.wait_closed()
+
+
+@pytest.mark.asyncio
 async def test_source_export_update_watermark_mixed_stream_does_not_regress_checkpoint() -> None:
     server, conn = _make_source_export_server()
     _source_export_seed_dialog(conn, -1001)
@@ -1395,7 +1432,13 @@ async def test_source_export_read_unit_window_and_negative_dialog_cursor() -> No
     server, conn = _make_source_export_server()
     _source_export_seed_dialog(conn, -1001)
     for message_id in (40, 41, 42):
-        _source_export_seed_message(conn, -1001, message_id, text=f"message {message_id}", sent_at=1770000000 + message_id)
+        _source_export_seed_message(
+            conn,
+            -1001,
+            message_id,
+            text=f"message {message_id}",
+            sent_at=1770000000 + message_id,
+        )
 
     export = await server._dispatch(
         {

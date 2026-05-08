@@ -880,53 +880,63 @@ class DaemonAPIServer:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
-        """Handle one client connection: read one request, write one response.
+        """Handle one client connection: read JSON-line requests until EOF.
 
-        One request per connection — client opens a new Unix socket connection
-        for each call. The request_id field (if present) is echoed back in the
-        response for cross-process log correlation.
+        DaemonConnection supports multiple sequential request() calls inside one
+        async-with block, so the server keeps the stream open and returns one
+        response line per request line.
         """
         method = ""
         request_id: str | None = None
         try:
-            line = await reader.readline()
-            if not line:
-                return
-            try:
-                req = json.loads(line.decode())
-            except json.JSONDecodeError as exc:
-                logger.warning("daemon_api invalid JSON: %s", exc)
-                response = {"ok": False, "error": "invalid_json", "message": "invalid JSON"}
-            else:
-                request_id = req.get("request_id")
-                method = req.get("method", "")
-                if not self._ready:
+            while line := await reader.readline():
+                try:
+                    req = json.loads(line.decode())
+                except json.JSONDecodeError as exc:
+                    logger.warning("daemon_api invalid JSON: %s", exc)
                     response = {
                         "ok": False,
-                        "error": "daemon_not_ready",
-                        "detail": self.startup_detail,
+                        "error": "invalid_json",
+                        "message": "invalid JSON",
                     }
                 else:
-                    if request_id:
-                        logger.debug("daemon_api_request method=%s request_id=%s", method, request_id)
-                    token = _current_request_id.set(request_id)
-                    try:
-                        response = await self._dispatch(req)
-                    except Exception:
-                        logger.exception(
-                            "daemon_api_dispatch_error method=%s request_id=%s",
-                            method,
-                            request_id,
-                        )
-                        response = {"ok": False, "error": "internal", "message": "internal error"}
-                    finally:
-                        _current_request_id.reset(token)
-                    if request_id:
-                        response = {**response, "request_id": request_id}
+                    request_id = req.get("request_id")
+                    method = req.get("method", "")
+                    if not self._ready:
+                        response = {
+                            "ok": False,
+                            "error": "daemon_not_ready",
+                            "detail": self.startup_detail,
+                        }
+                    else:
+                        if request_id:
+                            logger.debug(
+                                "daemon_api_request method=%s request_id=%s",
+                                method,
+                                request_id,
+                            )
+                        token = _current_request_id.set(request_id)
+                        try:
+                            response = await self._dispatch(req)
+                        except Exception:
+                            logger.exception(
+                                "daemon_api_dispatch_error method=%s request_id=%s",
+                                method,
+                                request_id,
+                            )
+                            response = {
+                                "ok": False,
+                                "error": "internal",
+                                "message": "internal error",
+                            }
+                        finally:
+                            _current_request_id.reset(token)
+                        if request_id:
+                            response = {**response, "request_id": request_id}
 
-            encoded = json.dumps(response).encode() + b"\n"
-            writer.write(encoded)
-            await writer.drain()
+                encoded = json.dumps(response).encode() + b"\n"
+                writer.write(encoded)
+                await writer.drain()
         except (ConnectionResetError, BrokenPipeError):
             # MCP client (or healthcheck) disconnected before we finished
             # writing the response — expected on tool-call timeouts and
@@ -1116,7 +1126,13 @@ class DaemonAPIServer:
                 "document_type": "dialog",
                 "updated_at": unit_updated_at,
                 "content_fingerprint": self._source_fingerprint("dialog-content", dialog_id),
-                "metadata_fingerprint": self._source_fingerprint("dialog-meta", dialog_id, dialog_name, dialog_type, username),
+                "metadata_fingerprint": self._source_fingerprint(
+                    "dialog-meta",
+                    dialog_id,
+                    dialog_name,
+                    dialog_type,
+                    username,
+                ),
                 "metadata_json": document_metadata,
             },
             "unit": {
@@ -1126,7 +1142,14 @@ class DaemonAPIServer:
                 "unit_type": "message",
                 "text": text,
                 "order_key": f"{message_id:020d}",
-                "fingerprint": self._source_fingerprint("message", dialog_id, message_id, text, row["sent_at"], edit_date),
+                "fingerprint": self._source_fingerprint(
+                    "message",
+                    dialog_id,
+                    message_id,
+                    text,
+                    row["sent_at"],
+                    edit_date,
+                ),
                 "updated_at": unit_updated_at,
                 "metadata_json": unit_metadata,
                 "chunking_hints": {},
