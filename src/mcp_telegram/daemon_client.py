@@ -29,6 +29,7 @@ from contextlib import asynccontextmanager
 from .daemon_api import get_daemon_socket_path
 
 logger = logging.getLogger(__name__)
+DEFAULT_DAEMON_TIMEOUT_SECONDS = 30.0
 
 # ContextVar for collecting request_ids during a tool call.
 # server.py sets a fresh list before running the tool; request() appends to it.
@@ -67,9 +68,12 @@ class DaemonConnection:
         self,
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
+        *,
+        timeout_seconds: float = DEFAULT_DAEMON_TIMEOUT_SECONDS,
     ) -> None:
         self._reader = reader
         self._writer = writer
+        self._timeout_seconds = timeout_seconds
 
     async def request(self, payload: dict) -> dict:
         """Send *payload* as a JSON line, read one JSON response line, return dict.
@@ -88,10 +92,25 @@ class DaemonConnection:
         encoded = json.dumps(payload).encode() + b"\n"
         logger.debug("daemon_request method=%s request_id=%s", payload.get("method"), rid)
         self._writer.write(encoded)
-        await self._writer.drain()
+        try:
+            await asyncio.wait_for(
+                self._writer.drain(),
+                timeout=self._timeout_seconds,
+            )
+        except TimeoutError as exc:
+            raise DaemonNotRunningError(
+                "Sync daemon timed out while sending request. Restart it with: mcp-telegram sync"
+            ) from exc
 
         try:
-            line = await self._reader.readline()
+            line = await asyncio.wait_for(
+                self._reader.readline(),
+                timeout=self._timeout_seconds,
+            )
+        except TimeoutError as exc:
+            raise DaemonNotRunningError(
+                "Sync daemon timed out waiting for response. Restart it with: mcp-telegram sync"
+            ) from exc
         except (ConnectionResetError, BrokenPipeError, OSError) as exc:
             raise DaemonNotRunningError(
                 "Sync daemon closed the connection unexpectedly. Restart it with: mcp-telegram sync"
@@ -427,7 +446,9 @@ class DaemonConnection:
 
 
 @asynccontextmanager
-async def daemon_connection() -> AsyncIterator[DaemonConnection]:
+async def daemon_connection(
+    timeout_seconds: float = DEFAULT_DAEMON_TIMEOUT_SECONDS,
+) -> AsyncIterator[DaemonConnection]:
     """Open a Unix socket connection to the sync daemon.
 
     Yields a DaemonConnection ready for request/response exchanges.
@@ -440,12 +461,19 @@ async def daemon_connection() -> AsyncIterator[DaemonConnection]:
     reader: asyncio.StreamReader | None = None
     writer: asyncio.StreamWriter | None = None
     try:
-        reader, writer = await asyncio.open_unix_connection(str(socket_path), limit=2 * 1024 * 1024)
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_unix_connection(str(socket_path), limit=2 * 1024 * 1024),
+            timeout=timeout_seconds,
+        )
+    except TimeoutError as exc:
+        raise DaemonNotRunningError(
+            "Sync daemon timed out while connecting. Restart it with: mcp-telegram sync"
+        ) from exc
     except OSError as exc:
         raise DaemonNotRunningError("Sync daemon is not running. Start it with: mcp-telegram sync") from exc
 
     try:
-        yield DaemonConnection(reader, writer)
+        yield DaemonConnection(reader, writer, timeout_seconds=timeout_seconds)
     finally:
         if writer is not None:
             writer.close()

@@ -167,6 +167,30 @@ async def test_request_eof_raises(tmp_path: Path) -> None:
         await server.wait_closed()
 
 
+@pytest.mark.asyncio
+async def test_request_timeout_raises_daemon_not_running(tmp_path: Path) -> None:
+    """DaemonConnection.request times out instead of waiting forever."""
+    sock_path = tmp_path / "stall.sock"
+
+    async def _stall_server(
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        await reader.readline()
+        await asyncio.sleep(1)
+        writer.close()
+
+    server = await asyncio.start_unix_server(_stall_server, path=str(sock_path))
+    try:
+        with patch("mcp_telegram.daemon_client.get_daemon_socket_path", return_value=sock_path):
+            async with daemon_connection(timeout_seconds=0.01) as conn:
+                with pytest.raises(DaemonNotRunningError, match="timed out"):
+                    await conn.request({"method": "get_me"})
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
 # ---------------------------------------------------------------------------
 # Convenience method: list_messages with dialog_id
 # ---------------------------------------------------------------------------
