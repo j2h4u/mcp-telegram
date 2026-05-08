@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from mcp_telegram.daemon import _log_heartbeat, sync_main
+from mcp_telegram.daemon_api import DaemonAPIServer
 
 # ---------------------------------------------------------------------------
 # CLI registration
@@ -1192,3 +1194,247 @@ def test_sync_main_registers_read_positions_bootstrap_after_handler(tmp_path):
         f"bootstrap at {bootstrap_idx} — handler must register FIRST to avoid "
         f"missed MessageRead events during bootstrap window."
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 29-01: dotMD structured source export API
+# ---------------------------------------------------------------------------
+
+
+def _make_source_export_server() -> tuple[DaemonAPIServer, sqlite3.Connection]:
+    from mcp_telegram.sync_db import _apply_migrations
+
+    conn = sqlite3.connect(":memory:")
+    _apply_migrations(conn)
+    server = DaemonAPIServer(conn, MagicMock(), asyncio.Event())
+    server._ready = True
+    return server, conn
+
+
+def _source_export_seed_dialog(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    *,
+    status: str = "synced",
+    name: str = "Project Chat",
+    dialog_type: str = "Group",
+) -> None:
+    conn.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, last_synced_at, last_event_at) "
+        "VALUES (?, ?, 1770000000, 1770000000)",
+        (dialog_id, status),
+    )
+    conn.execute(
+        "INSERT INTO entities (id, type, name, username, name_normalized, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, 1770000000)",
+        (dialog_id, dialog_type, name, f"dialog_{abs(dialog_id)}", name.lower()),
+    )
+    conn.commit()
+
+
+def _source_export_seed_message(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    message_id: int,
+    *,
+    text: str = "Deployment checklist is ready",
+    sent_at: int = 1770000000,
+    sender_id: int | None = 111,
+    sender_first_name: str | None = "Alice",
+    reply_to_msg_id: int | None = None,
+    forum_topic_id: int | None = None,
+    edit_date: int | None = None,
+    is_deleted: int = 0,
+    topic_title: str | None = None,
+) -> None:
+    conn.execute(
+        "INSERT INTO messages "
+        "(dialog_id, message_id, sent_at, text, sender_id, sender_first_name, "
+        "reply_to_msg_id, forum_topic_id, edit_date, is_deleted) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            dialog_id,
+            message_id,
+            sent_at,
+            text,
+            sender_id,
+            sender_first_name,
+            reply_to_msg_id,
+            forum_topic_id,
+            edit_date,
+            is_deleted,
+        ),
+    )
+    if forum_topic_id is not None and topic_title is not None:
+        conn.execute(
+            "INSERT OR REPLACE INTO topic_metadata "
+            "(dialog_id, topic_id, title, is_general, is_deleted, updated_at) "
+            "VALUES (?, ?, ?, 0, 0, ?)",
+            (dialog_id, forum_topic_id, topic_title, sent_at),
+        )
+    conn.commit()
+
+
+@pytest.mark.asyncio
+async def test_source_export_describe_source_and_bootstrap_records() -> None:
+    server, conn = _make_source_export_server()
+    _source_export_seed_dialog(conn, -1001, status="synced", name="Project Chat")
+    _source_export_seed_dialog(conn, -1002, status="access_lost", name="Archive Chat")
+    _source_export_seed_dialog(conn, -1003, status="not_synced", name="Private Draft")
+    _source_export_seed_message(
+        conn,
+        -1001,
+        41,
+        reply_to_msg_id=40,
+        forum_topic_id=7,
+        topic_title="Deployments",
+    )
+    _source_export_seed_message(conn, -1002, 5, text="Archived but available")
+    _source_export_seed_message(conn, -1003, 1, text="must not export")
+
+    description = await server._dispatch({"method": "describe_source"})
+    assert description == {
+        "ok": True,
+        "data": {
+            "namespace": "telegram",
+            "source_kind": "chat",
+            "display_name": "Telegram",
+            "capabilities": ["incremental-export", "unit-window"],
+            "metadata_json": {"transport": "mcp-telegram-daemon"},
+        },
+    }
+
+    result = await server._dispatch({"method": "export_source_changes", "cursor": None, "limit": 2})
+
+    assert result["ok"] is True
+    data = result["data"]
+    exported_refs = [change["unit"]["unit_ref"] for change in data["changes"]]
+    assert exported_refs == [
+        "dialog:-1002:message:5",
+        "dialog:-1001:message:41",
+    ]
+    assert all(change["document"]["ref"].startswith("telegram:dialog:") for change in data["changes"])
+    assert data["changes"][1]["document"]["document_ref"] == "dialog:-1001"
+    assert data["changes"][1]["unit"]["metadata_json"]["topic_title"] == "Deployments"
+    assert data["changes"][1]["unit"]["metadata_json"]["reply_to_msg_id"] == 40
+    assert data["checkpoint_cursor"] == "telegram:v1:dialog:-1001:message:41"
+    assert data["next_cursor"] is None
+    assert "updated_after" in data
+    assert "updated_after_cursor" in data
+    assert "dialog:-1003:message:1" not in exported_refs
+    assert "[resolved:" not in str(data)
+    assert "next_navigation" not in str(data)
+
+
+@pytest.mark.asyncio
+async def test_source_export_update_watermark_mixed_stream_does_not_regress_checkpoint() -> None:
+    server, conn = _make_source_export_server()
+    _source_export_seed_dialog(conn, -1001)
+    _source_export_seed_message(conn, -1001, 30, text="Edited old", sent_at=1769990000, edit_date=1770000060)
+    _source_export_seed_message(conn, -1001, 51, text="New bootstrap", sent_at=1770000030)
+
+    result = await server._dispatch(
+        {
+            "method": "export_source_changes",
+            "cursor": "telegram:v1:dialog:-1001:message:50",
+            "limit": 10,
+            "updated_after": "2026-02-01T00:00:00.000000Z",
+            "updated_after_cursor": "telegram:v1:dialog:-1001:message:20",
+        }
+    )
+
+    assert result["ok"] is True
+    data = result["data"]
+    assert [change["unit"]["unit_ref"] for change in data["changes"]] == [
+        "dialog:-1001:message:51",
+        "dialog:-1001:message:30",
+    ]
+    assert data["checkpoint_cursor"] == "telegram:v1:dialog:-1001:message:51"
+    assert data["updated_after"] == "2026-02-01T00:01:00.000000Z"
+    assert data["updated_after_cursor"] == "telegram:v1:dialog:-1001:message:30"
+
+
+@pytest.mark.asyncio
+async def test_source_export_same_timestamp_uses_updated_after_cursor_tie_break() -> None:
+    server, conn = _make_source_export_server()
+    _source_export_seed_dialog(conn, -1001)
+    _source_export_seed_message(conn, -1001, 30, text="first edit", sent_at=1769990000, edit_date=1770000060)
+    _source_export_seed_message(conn, -1001, 31, text="second edit", sent_at=1769990001, edit_date=1770000060)
+
+    result = await server._dispatch(
+        {
+            "method": "export_source_changes",
+            "cursor": "telegram:v1:dialog:-1001:message:50",
+            "limit": 10,
+            "updated_after": "2026-02-01T00:01:00.000000Z",
+            "updated_after_cursor": "telegram:v1:dialog:-1001:message:30",
+        }
+    )
+
+    assert result["ok"] is True
+    assert [change["unit"]["unit_ref"] for change in result["data"]["changes"]] == [
+        "dialog:-1001:message:31",
+    ]
+    assert result["data"]["updated_after_cursor"] == "telegram:v1:dialog:-1001:message:31"
+
+    exhausted = await server._dispatch(
+        {
+            "method": "export_source_changes",
+            "cursor": "telegram:v1:dialog:-1001:message:50",
+            "limit": 10,
+            "updated_after": "2026-02-01T00:01:00.000000Z",
+            "updated_after_cursor": "telegram:v1:dialog:-1001:message:31",
+        }
+    )
+    assert exhausted["ok"] is True
+    assert exhausted["data"]["changes"] == []
+
+
+@pytest.mark.asyncio
+async def test_source_export_read_unit_window_and_negative_dialog_cursor() -> None:
+    server, conn = _make_source_export_server()
+    _source_export_seed_dialog(conn, -1001)
+    for message_id in (40, 41, 42):
+        _source_export_seed_message(conn, -1001, message_id, text=f"message {message_id}", sent_at=1770000000 + message_id)
+
+    export = await server._dispatch(
+        {
+            "method": "export_source_changes",
+            "cursor": "telegram:v1:dialog:-1001:message:41",
+            "limit": 10,
+        }
+    )
+    assert export["ok"] is True
+    assert [change["unit"]["unit_ref"] for change in export["data"]["changes"]] == [
+        "dialog:-1001:message:42",
+    ]
+
+    window = await server._dispatch(
+        {
+            "method": "read_source_unit_window",
+            "unit_ref": "dialog:-1001:message:41",
+            "before": 1,
+            "after": 1,
+        }
+    )
+
+    assert window["ok"] is True
+    data = window["data"]
+    assert data["namespace"] == "telegram"
+    assert data["document_ref"] == "dialog:-1001"
+    assert data["unit_ref"] == "dialog:-1001:message:41"
+    assert [unit["unit_ref"] for unit in data["units"]] == [
+        "dialog:-1001:message:40",
+        "dialog:-1001:message:41",
+        "dialog:-1001:message:42",
+    ]
+
+    missing = await server._dispatch(
+        {
+            "method": "read_source_unit_window",
+            "unit_ref": "dialog:-1001:message:404",
+            "before": 1,
+            "after": 1,
+        }
+    )
+    assert missing == {"ok": False, "error": "not_found"}
