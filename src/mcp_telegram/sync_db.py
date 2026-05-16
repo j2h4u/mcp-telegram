@@ -7,7 +7,7 @@ from pathlib import Path
 
 from xdg_base_dirs import xdg_state_home  # type: ignore[import-error]
 
-_CURRENT_SCHEMA_VERSION = 20
+_CURRENT_SCHEMA_VERSION = 21
 
 logger = logging.getLogger(__name__)
 
@@ -234,6 +234,32 @@ _TOPIC_METADATA_V19_ALTERS = [
     "ALTER TABLE topic_metadata ADD COLUMN snapshot_at INTEGER",
     "ALTER TABLE topic_metadata ADD COLUMN date INTEGER",
 ]
+
+# ---------------------------------------------------------------------------
+# v21: account trace target-specific coverage fragments (Phase 51)
+# ---------------------------------------------------------------------------
+
+_TRACE_COVERAGE_FRAGMENTS_DDL = """
+CREATE TABLE IF NOT EXISTS trace_coverage_fragments (
+    target_user_id INTEGER NOT NULL,
+    dialog_id      INTEGER NOT NULL,
+    topic_id       INTEGER NOT NULL DEFAULT 0,
+    coverage_kind  TEXT NOT NULL,
+    status         TEXT NOT NULL,
+    fetched_at     INTEGER,
+    checkpoint     TEXT,
+    last_error     TEXT,
+    next_retry_at  INTEGER,
+    created_at     INTEGER NOT NULL,
+    updated_at     INTEGER NOT NULL,
+    PRIMARY KEY (target_user_id, dialog_id, topic_id, coverage_kind)
+) WITHOUT ROWID
+"""
+
+_TRACE_COVERAGE_TARGET_STATUS_INDEX_DDL = """
+CREATE INDEX IF NOT EXISTS idx_trace_coverage_target_status
+ON trace_coverage_fragments(target_user_id, status, next_retry_at)
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -711,6 +737,19 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     # table scan every hour; with it, the planner uses the index leftmost-prefix
     # on needs_refresh and drops the dialog count to roughly the dirty set size.
     _migrate(20, [_DIALOGS_NEEDS_REFRESH_INDEX_DDL])
+
+    # v21 (Phase 51): target-specific trace coverage. synced_dialogs.status
+    # describes broad dialog lifecycle; account traces need per-target,
+    # per-dialog/topic coverage attempts to avoid false completeness claims.
+    # topic_id=0 is reserved as the dialog-level sentinel; real forum topic ids
+    # in topic_metadata are >= 1.
+    _migrate(
+        21,
+        [
+            _TRACE_COVERAGE_FRAGMENTS_DDL,
+            _TRACE_COVERAGE_TARGET_STATUS_INDEX_DDL,
+        ],
+    )
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 

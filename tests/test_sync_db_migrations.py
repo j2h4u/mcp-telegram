@@ -324,7 +324,7 @@ def test_schema_version_records_current_v18(tmp_path: Path) -> None:
             "SELECT MAX(version) FROM schema_version"
         ).fetchone()[0]
         assert max_version == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 20  # Phase 43 lock — flips when next migration ships
+        assert _CURRENT_SCHEMA_VERSION == 21  # Phase 51 lock — flips when next migration ships
     finally:
         conn.close()
 
@@ -439,5 +439,126 @@ def test_schema_version_records_v19(db_path: Path) -> None:
             "SELECT version FROM schema_version WHERE version = 19"
         ).fetchone()
         assert row is not None, "v19 migration did not run"
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# v21: trace_coverage_fragments (Phase 51 — Account Trace)
+# ---------------------------------------------------------------------------
+
+
+def test_migration_v21_creates_trace_coverage_fragments(db_path: Path) -> None:
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    try:
+        rows = list(
+            conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name='trace_coverage_fragments'"
+            )
+        )
+        assert rows == [("trace_coverage_fragments",)]
+        cols = list(conn.execute("PRAGMA table_info(trace_coverage_fragments)"))
+        col_map = {c[1]: (c[2], c[3], c[4], c[5]) for c in cols}
+        assert col_map["target_user_id"] == ("INTEGER", 1, None, 1)
+        assert col_map["dialog_id"] == ("INTEGER", 1, None, 2)
+        assert col_map["topic_id"] == ("INTEGER", 1, "0", 3)
+        assert col_map["coverage_kind"] == ("TEXT", 1, None, 4)
+        assert col_map["status"] == ("TEXT", 1, None, 0)
+        assert col_map["created_at"] == ("INTEGER", 1, None, 0)
+        assert col_map["updated_at"] == ("INTEGER", 1, None, 0)
+    finally:
+        conn.close()
+
+
+def test_migration_v21_creates_target_status_index(db_path: Path) -> None:
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    try:
+        indexes = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='index' AND tbl_name='trace_coverage_fragments'"
+            )
+        }
+        assert "idx_trace_coverage_target_status" in indexes
+    finally:
+        conn.close()
+
+
+def test_migration_v21_accepts_dialog_level_trace_fragment(db_path: Path) -> None:
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    try:
+        conn.execute(
+            """
+            INSERT INTO trace_coverage_fragments
+                (target_user_id, dialog_id, topic_id, coverage_kind, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (101, -100123, 0, "authored_message", "pending", 1700000000, 1700000001),
+        )
+        conn.commit()
+        row = conn.execute(
+            """
+            SELECT target_user_id, dialog_id, topic_id, status, created_at, updated_at
+            FROM trace_coverage_fragments
+            WHERE target_user_id = 101
+            """
+        ).fetchone()
+        assert row == (101, -100123, 0, "pending", 1700000000, 1700000001)
+    finally:
+        conn.close()
+
+
+def test_migration_v21_topic_zero_reserved_for_dialog_level(db_path: Path) -> None:
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO topic_metadata "
+            "(dialog_id, topic_id, title, is_general, is_deleted, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (-100123, 1, "General", 1, 0, 1700000000),
+        )
+        conn.commit()
+        topic_ids = [
+            row[0]
+            for row in conn.execute(
+                "SELECT topic_id FROM topic_metadata WHERE dialog_id = -100123"
+            )
+        ]
+        assert topic_ids == [1]
+        assert 0 not in topic_ids
+    finally:
+        conn.close()
+
+
+def test_migration_v21_runs_from_v20_database(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE schema_version (
+                version INTEGER NOT NULL,
+                applied_at INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute("INSERT INTO schema_version VALUES (20, 1700000000)")
+        conn.commit()
+
+    ensure_sync_schema(db_path)
+
+    conn = _open_sync_db(db_path)
+    try:
+        assert conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name='trace_coverage_fragments'"
+        ).fetchone() == ("trace_coverage_fragments",)
+        max_version = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
+        assert max_version == 21
     finally:
         conn.close()
