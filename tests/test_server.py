@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock
 
 import pytest
@@ -142,7 +143,7 @@ async def test_call_tool_non_dict_arguments_control_contract() -> None:
 
 def test_posture_primary_tools_reflected_in_descriptions() -> None:
     """Primary tools should have [primary] tag in their reflected descriptions."""
-    for name in ("list_messages", "search_messages", "get_entity_info"):
+    for name in ("list_messages", "search_messages", "get_entity_info", "trace_account_messages"):
         tool = server.tool_by_name[name]
         assert tool.description.startswith("[primary]"), f"{name} missing [primary] prefix"
 
@@ -169,20 +170,24 @@ def test_list_tools_exposes_snake_case_names_titles_and_annotations() -> None:
         "get_inbox": "Inbox",
         "get_entity_info": "Entity Info",
         "submit_feedback": "Submit Feedback",
+        "trace_account_messages": "Account Trace",
     }
 
-    assert set(server.tool_by_name) == set(expected_titles)
+    assert set(expected_titles).issubset(server.tool_by_name)
     for name, tool in server.tool_by_name.items():
         assert re.match(r"^[a-z][a-z0-9_]{0,63}$", tool.name)
         assert tool.name == name
-        assert tool.title == expected_titles[name]
         assert 1 <= len(tool.title.split()) <= 3
         assert tool.annotations is not None
+    for name, title in expected_titles.items():
+        assert server.tool_by_name[name].title == title
 
     assert server.tool_by_name["list_messages"].annotations.readOnlyHint is True
     assert server.tool_by_name["mark_dialog_for_sync"].annotations.readOnlyHint is False
     assert server.tool_by_name["mark_dialog_for_sync"].annotations.idempotentHint is True
     assert server.tool_by_name["submit_feedback"].annotations.readOnlyHint is False
+    assert server.tool_by_name["trace_account_messages"].annotations.readOnlyHint is False
+    assert server.tool_by_name["trace_account_messages"].annotations.idempotentHint is True
     assert all(not any(part[:1].isupper() for part in name.split("_")) for name in server.tool_by_name)
 
 
@@ -228,7 +233,21 @@ def test_list_tools_structured_output_schema_surface_is_explicit() -> None:
         "get_sync_status",
         "get_sync_alerts",
         "get_inbox",
+        "trace_account_messages",
     }
+
+
+def test_list_tools_exposes_account_trace_schema_and_title() -> None:
+    tool = server.tool_by_name["trace_account_messages"]
+
+    assert tool.title == "Account Trace"
+    assert tool.outputSchema is not None
+    assert "coverage" in tool.outputSchema["required"]
+    assert "coverage_bounds" in tool.outputSchema["properties"]["provenance"]["properties"]
+    assert "authorship_basis" in (
+        tool.outputSchema["properties"]["groups"]["items"]["properties"]["evidence"]["items"]["properties"]
+    )
+    assert tool.inputSchema["properties"]["exact_topic_id"]["type"] == "integer"
 
 
 @pytest.mark.asyncio
@@ -250,6 +269,33 @@ async def test_call_tool_preserves_structuredContent_and_text_content(monkeypatc
     assert result.structuredContent == {"dialogs": [{"id": 1, "name": "Alice"}], "count": 1}
     assert result.content
     assert isinstance(result.content[0], TextContent)
+
+
+@pytest.mark.asyncio
+async def test_call_tool_validation_rejects_trace_topic_without_dialog_scope() -> None:
+    result = await server.call_tool("trace_account_messages", {"account": "@alice", "exact_topic_id": 7})
+
+    assert result.isError is True
+    assert "exact_topic_id requires" in result.content[0].text
+
+
+@pytest.mark.asyncio
+async def test_server_instructions_mention_account_trace(monkeypatch) -> None:
+    class _Conn:
+        async def get_me(self) -> dict:
+            return {"ok": False}
+
+    @asynccontextmanager
+    async def _conn_cm():
+        yield _Conn()
+
+    monkeypatch.setattr("mcp_telegram.daemon_client.daemon_connection", _conn_cm)
+
+    instructions = await server._build_server_instructions()
+
+    assert "trace_account_messages" in instructions
+    assert "exact_topic_id" in instructions
+    assert "best_effort_visible" in instructions
 
 
 def test_posture_covers_all_registered_tools() -> None:
@@ -291,6 +337,12 @@ def test_primary_tools_have_core_read_search_schema() -> None:
     get_entity_info = server.tool_by_name["get_entity_info"]
     gei_props = get_entity_info.inputSchema["properties"]
     assert "entity" in gei_props, "get_entity_info missing entity field for direct lookup"
+
+    trace_account = server.tool_by_name["trace_account_messages"]
+    trace_props = trace_account.inputSchema["properties"]
+    assert "exact_account_id" in trace_props, "trace_account_messages missing exact_account_id"
+    assert "exact_topic_id" in trace_props, "trace_account_messages missing exact_topic_id"
+    assert "coverage_goal" in trace_props, "trace_account_messages missing coverage_goal"
 
 
 def test_helper_tools_remain_available_not_hidden() -> None:

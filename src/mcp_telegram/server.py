@@ -156,6 +156,10 @@ async def _build_server_instructions() -> str:
         "- SYNC STATUS: Only synced dialogs support search_messages and anchor-based reading. "
         "Plain list_messages browsing works on any dialog without syncing. "
         "Use get_sync_status to check coverage.\n"
+        "- ACCOUNT TRACE: Use trace_account_messages when you need observable messages authored "
+        "by one account. Use exact_topic_id only with dialog or exact_dialog_id. "
+        "Interpret coverage_goal=best_effort_visible as bounded visible sampling, not completeness. "
+        "Treat gaps as visibility or sync limitations.\n"
         "- FEEDBACK: Use submit_feedback immediately when a tool response is wrong, "
         "surprising, or missing a useful capability -- don't wait until end of session.\n"
     )

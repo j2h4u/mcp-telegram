@@ -30,6 +30,7 @@ from .activity import GetMyRecentActivity, get_my_recent_activity  # noqa: F401
 from .unread import GetInbox, get_inbox
 from .entity_info import GetEntityInfo, get_entity_info
 from .feedback import SubmitFeedback, submit_feedback
+from .account_trace import TraceAccountMessages, trace_account_messages
 
 __all__ = [
     "DaemonNotRunningError",
@@ -49,6 +50,7 @@ __all__ = [
     "TOOL_REGISTRY",
     "ToolArgs",
     "ToolResult",
+    "TraceAccountMessages",
     "daemon_connection",
     "get_dialog_stats",
     "get_entity_info",
@@ -67,5 +69,6 @@ __all__ = [
     "tool_args",
     "tool_description",
     "tool_runner",
+    "trace_account_messages",
     "verify_tool_registry",
 ]

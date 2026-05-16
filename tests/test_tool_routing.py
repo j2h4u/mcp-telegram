@@ -30,6 +30,7 @@ from mcp_telegram.tools import (
     ListTopics,
     MarkDialogForSync,
     SearchMessages,
+    TraceAccountMessages,
     get_inbox,
     get_sync_alerts,
     get_sync_status,
@@ -39,6 +40,7 @@ from mcp_telegram.tools import (
     list_topics,
     mark_dialog_for_sync,
     search_messages,
+    trace_account_messages,
 )
 from mcp_telegram.tools._base import DaemonNotRunningError
 from mcp_telegram.tools.stats import GetUsageStats, get_usage_stats
@@ -126,6 +128,75 @@ STRUCTURED_TOOL_CASES = {
             },
         },
     ),
+    "trace_account_messages": (
+        trace_account_messages,
+        TraceAccountMessages(exact_account_id=101, group_by="dialog"),
+        {
+            "ok": True,
+            "data": {
+                "resolved_account": {
+                    "confidence": "resolved",
+                    "account_id": 101,
+                    "display_name": "Alice Example",
+                    "username": "alice",
+                    "candidate_ids": [],
+                    "display_aliases": ["Alice Example", "alice"],
+                    "resolution_source": "entities_exact_id",
+                },
+                "groups": [
+                    {
+                        "group_key": "dialog:-100123",
+                        "group_label": "Channel",
+                        "evidence": [
+                            {
+                                "source": "sync_db",
+                                "evidence_kind": "authored_message",
+                                "dialog_id": -100123,
+                                "dialog_title": "Channel",
+                                "dialog_type": "Channel",
+                                "topic_id": None,
+                                "topic_title": None,
+                                "message_id": 42,
+                                "sent_at": 1_700_000_000,
+                                "sender_id": 101,
+                                "effective_sender_id": 101,
+                                "authorship_basis": "effective_sender_id",
+                                "author_signature": None,
+                                "text": "trace hit",
+                                "media_description": None,
+                            }
+                        ],
+                    }
+                ],
+                "coverage": {
+                    "state": "complete",
+                    "observed_message_count": 1,
+                    "dialogs_considered": 1,
+                    "dialogs_considered_basis": "evidence_or_fragments_or_access_lost",
+                    "dialogs_with_hits": 1,
+                    "dialogs_with_gaps": 0,
+                    "as_of": 1_700_000_100,
+                },
+                "gaps": [],
+                "provenance": {
+                    "source": "sync_db",
+                    "query_basis": "effective_sender_id_or_post_author_signature",
+                    "coverage_goal": "observed",
+                    "coverage_bounds": {
+                        "limit": 50,
+                        "exact_dialog_id": None,
+                        "exact_topic_id": None,
+                        "sent_after": None,
+                        "sent_before": None,
+                    },
+                    "authorship_basis_counts": {"effective_sender_id": 1},
+                    "dialogs_considered_basis": "evidence_or_fragments_or_access_lost",
+                    "local_cache_writes": 0,
+                },
+                "next_navigation": None,
+            },
+        },
+    ),
 }
 
 
@@ -165,6 +236,7 @@ def _make_daemon_conn(response: dict | None = None) -> MagicMock:
     conn.get_inbox = AsyncMock(return_value=r)
     conn.record_telemetry = AsyncMock(return_value={"ok": True})
     conn.get_usage_stats = AsyncMock(return_value=r)
+    conn.trace_account_messages = AsyncMock(return_value=r)
     conn.upsert_entities = AsyncMock(return_value={"ok": True, "upserted": 0})
     conn.resolve_entity = AsyncMock(return_value=r)
     conn.get_my_recent_activity = AsyncMock(return_value=r)  # Phase 999.1 (B4b)
@@ -192,6 +264,7 @@ class _patch_daemon:
             "mcp_telegram.tools.unread.daemon_connection",
             "mcp_telegram.tools.stats.daemon_connection",
             "mcp_telegram.tools.activity.daemon_connection",  # Phase 999.1 (B4b)
+            "mcp_telegram.tools.account_trace.daemon_connection",
         ]
         for target in targets:
             p = patch(target, side_effect=lambda c=self._conn: _fake_daemon_cm(c))
@@ -222,6 +295,7 @@ class _patch_daemon_not_running:
             "mcp_telegram.tools.unread.daemon_connection",
             "mcp_telegram.tools.stats.daemon_connection",
             "mcp_telegram.tools.activity.daemon_connection",  # Phase 999.1 (B4b)
+            "mcp_telegram.tools.account_trace.daemon_connection",
         ]
         for target in targets:
             p = patch(target, return_value=_raise_not_running())
@@ -637,6 +711,249 @@ async def test_search_messages_rejects_history_navigation_token():
 
 
 # ---------------------------------------------------------------------------
+# TraceAccountMessages — daemon routing and structured results
+# ---------------------------------------------------------------------------
+
+
+def _trace_daemon_payload(
+    *,
+    groups: list[dict] | None = None,
+    gaps: list[dict] | None = None,
+    confidence: str = "resolved",
+    account_id: int | None = 101,
+    coverage_goal: str = "observed",
+    local_cache_writes: int = 0,
+) -> dict:
+    return {
+        "ok": True,
+        "data": {
+            "resolved_account": {
+                "confidence": confidence,
+                "account_id": account_id,
+                "display_name": "Alice Example" if account_id is not None else None,
+                "username": "alice" if account_id is not None else None,
+                "candidate_ids": [101, 202] if confidence == "ambiguous" else [],
+                "display_aliases": ["Alice Example", "alice"] if account_id is not None else [],
+                "resolution_source": "entities_exact_id",
+            },
+            "groups": groups or [],
+            "coverage": {
+                "state": "complete" if groups else "unknown",
+                "observed_message_count": sum(len(group.get("evidence", [])) for group in groups or []),
+                "dialogs_considered": 1 if groups else 0,
+                "dialogs_considered_basis": "exact_dialog_scope" if groups else "none",
+                "dialogs_with_hits": 1 if groups else 0,
+                "dialogs_with_gaps": 0,
+                "as_of": 1_700_000_100,
+            },
+            "gaps": gaps or [],
+            "provenance": {
+                "source": "sync_db",
+                "query_basis": "effective_sender_id_or_post_author_signature",
+                "coverage_goal": coverage_goal,
+                "coverage_bounds": {
+                    "limit": 50,
+                    "exact_dialog_id": -100123,
+                    "exact_topic_id": 7,
+                    "sent_after": None,
+                    "sent_before": None,
+                },
+                "authorship_basis_counts": {"effective_sender_id": 2} if groups else {},
+                "dialogs_considered_basis": "exact_dialog_scope" if groups else "none",
+                "local_cache_writes": local_cache_writes,
+            },
+            "next_navigation": None,
+        },
+    }
+
+
+def _trace_evidence_group() -> dict:
+    return {
+        "group_key": "dialog:-100123:topic:7",
+        "group_label": "Forum / Topic",
+        "evidence": [
+            {
+                "source": "sync_db",
+                "evidence_kind": "authored_message",
+                "dialog_id": -100123,
+                "dialog_title": "Forum",
+                "dialog_type": "Forum",
+                "topic_id": 7,
+                "topic_title": "Topic",
+                "message_id": 10,
+                "sent_at": 1_700_000_010,
+                "sender_id": 101,
+                "effective_sender_id": 101,
+                "authorship_basis": "effective_sender_id",
+                "author_signature": None,
+                "text": "first trace hit",
+                "media_description": None,
+            },
+            {
+                "source": "sync_db",
+                "evidence_kind": "authored_message",
+                "dialog_id": -100123,
+                "dialog_title": "Forum",
+                "dialog_type": "Forum",
+                "topic_id": 7,
+                "topic_title": "Topic",
+                "message_id": 11,
+                "sent_at": 1_700_000_011,
+                "sender_id": 101,
+                "effective_sender_id": 101,
+                "authorship_basis": "effective_sender_id",
+                "author_signature": None,
+                "text": "second trace hit",
+                "media_description": None,
+            },
+        ],
+    }
+
+
+async def test_trace_account_messages_routes_flat_arguments_and_counts_evidence_items() -> None:
+    conn = _make_daemon_conn(_trace_daemon_payload(groups=[_trace_evidence_group()]))
+
+    with _patch_daemon(conn):
+        result = await trace_account_messages(
+            TraceAccountMessages(
+                account="@alice",
+                group_by="dialog",
+                dialog="Forum",
+                exact_topic_id=7,
+                coverage_goal="observed",
+            )
+        )
+
+    assert result.is_error is False
+    assert result.structured_content is not None
+    assert result.structured_content["coverage"]["state"] == "complete"
+    assert result.result_count == 2
+    assert result.content[0].text
+    assert "[Telegram content] first trace hit [/Telegram content]" in result.content[0].text
+    conn.trace_account_messages.assert_called_once()
+    call_kwargs = conn.trace_account_messages.call_args[1]
+    assert call_kwargs["account"] == "@alice"
+    assert call_kwargs["dialog"] == "Forum"
+    assert call_kwargs["exact_topic_id"] == 7
+
+
+async def test_trace_account_messages_unresolved_is_structured_non_error() -> None:
+    response = _trace_daemon_payload(
+        confidence="unresolved",
+        account_id=None,
+        gaps=[
+            {
+                "kind": "account_unresolved",
+                "severity": "action_required",
+                "detail": "No visible account matched this reference.",
+            }
+        ],
+    )
+    conn = _make_daemon_conn(response)
+
+    with _patch_daemon(conn):
+        result = await trace_account_messages(TraceAccountMessages(account="unknown"))
+
+    assert result.is_error is False
+    assert result.structured_content is not None
+    assert result.structured_content["gaps"][0]["kind"] == "account_unresolved"
+
+
+async def test_trace_account_messages_ambiguous_is_structured_non_error() -> None:
+    response = _trace_daemon_payload(
+        confidence="ambiguous",
+        account_id=None,
+        gaps=[
+            {
+                "kind": "account_ambiguous",
+                "severity": "action_required",
+                "detail": "Multiple visible accounts match this reference.",
+                "next_action": {"argument": "exact_account_id", "candidate_ids": [101, 202]},
+            }
+        ],
+    )
+    conn = _make_daemon_conn(response)
+
+    with _patch_daemon(conn):
+        result = await trace_account_messages(TraceAccountMessages(account="Alice"))
+
+    assert result.is_error is False
+    assert result.structured_content is not None
+    assert result.structured_content["gaps"][0]["next_action"]["candidate_ids"] == [101, 202]
+
+
+async def test_trace_account_messages_observed_zero_is_structured_non_error() -> None:
+    response = _trace_daemon_payload(
+        gaps=[
+            {
+                "kind": "observed_zero",
+                "severity": "info",
+                "detail": "No authored-message evidence was observed.",
+            }
+        ],
+    )
+    conn = _make_daemon_conn(response)
+
+    with _patch_daemon(conn):
+        result = await trace_account_messages(TraceAccountMessages(exact_account_id=101))
+
+    assert result.is_error is False
+    assert result.result_count == 0
+    assert result.structured_content is not None
+    assert result.structured_content["gaps"][0]["kind"] == "observed_zero"
+
+
+async def test_trace_account_messages_best_effort_provenance_keeps_cache_writes() -> None:
+    conn = _make_daemon_conn(
+        _trace_daemon_payload(
+            coverage_goal="best_effort_visible",
+            local_cache_writes=3,
+        )
+    )
+
+    with _patch_daemon(conn):
+        result = await trace_account_messages(
+            TraceAccountMessages(exact_account_id=101, coverage_goal="best_effort_visible")
+        )
+
+    assert result.structured_content is not None
+    provenance = result.structured_content["provenance"]
+    assert provenance["coverage_goal"] == "best_effort_visible"
+    assert provenance["local_cache_writes"] == 3
+    assert "coverage_bounds" in provenance
+
+
+async def test_trace_account_messages_daemon_error_is_tool_error() -> None:
+    conn = _make_daemon_conn({"ok": False, "error": "invalid_time_bound", "message": "sent_after is invalid"})
+
+    with _patch_daemon(conn):
+        result = await trace_account_messages(TraceAccountMessages(exact_account_id=101))
+
+    assert result.is_error is True
+    assert "invalid_time_bound" in result.content[0].text
+
+
+def test_trace_account_messages_rejects_topic_without_dialog_scope() -> None:
+    with pytest.raises(ValueError, match="exact_topic_id requires"):
+        TraceAccountMessages(account="@alice", exact_topic_id=7)
+
+
+def test_trace_account_messages_schema_and_docstring_contract() -> None:
+    schema = TraceAccountMessages.model_json_schema()
+    doc = TraceAccountMessages.__doc__ or ""
+
+    assert "coverage_goal" in schema["properties"]
+    assert "exact_topic_id" in schema["properties"]
+    assert "authored-message" in doc or "authored message" in doc
+    assert "bounded visible sampling" in doc
+    assert " local " not in f" {doc.lower()} "
+    assert " live " not in f" {doc.lower()} "
+    assert " cache " not in f" {doc.lower()} "
+    assert " sql " not in f" {doc.lower()} "
+    assert " telegram " not in f" {doc.lower()} "
+
+
+# ---------------------------------------------------------------------------
 # DaemonNotRunningError handling
 # ---------------------------------------------------------------------------
 
@@ -664,6 +981,16 @@ async def test_search_messages_daemon_not_running():
     with _patch_daemon_not_running():
         result = await search_messages(SearchMessages(dialog="123", query="test"))
 
+    text = result.content[0].text
+    assert "not running" in text.lower() or "mcp-telegram sync" in text.lower()
+
+
+async def test_trace_account_messages_daemon_not_running():
+    """TraceAccountMessages returns actionable error when daemon is not running."""
+    with _patch_daemon_not_running():
+        result = await trace_account_messages(TraceAccountMessages(exact_account_id=101))
+
+    assert result.is_error is True
     text = result.content[0].text
     assert "not running" in text.lower() or "mcp-telegram sync" in text.lower()
 
