@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from devtools.mcp_client.cli import main, redact_script_output
-from devtools.mcp_client.client import McpClientError, StdioMcpClient, execute_script_steps
+from devtools.mcp_client.client import McpClientError, StdioMcpClient, execute_script_steps, load_script_steps
 
 
 def _fake_server_command() -> list[str]:
@@ -209,6 +209,41 @@ def test_mcp_test_client_redacts_structured_content() -> None:
     assert "sensitive rendered text" not in rendered
     assert "Sensitive Name" not in rendered
     assert "Sensitive structured text" not in rendered
+
+
+def test_mcp_test_client_expands_env_placeholders(tmp_path, monkeypatch) -> None:
+    script_path = tmp_path / "script.json"
+    script_path.write_text(
+        json.dumps(
+            {
+                "steps": [
+                    {
+                        "action": "call_tool",
+                        "name": "trace_account_messages",
+                        "arguments": {"account": "${MCP_TG_SMOKE_ACCOUNT}"},
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MCP_TG_SMOKE_ACCOUNT", "12345")
+
+    steps = load_script_steps(script_path)
+
+    assert steps[0]["arguments"]["account"] == "12345"
+
+
+def test_mcp_test_client_missing_env_placeholder_fails(tmp_path, monkeypatch) -> None:
+    script_path = tmp_path / "script.json"
+    script_path.write_text(
+        json.dumps({"steps": [{"action": "call_tool", "name": "x", "arguments": {"account": "${MISSING_VAR}"}}]}),
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("MISSING_VAR", raising=False)
+
+    with pytest.raises(ValueError, match="MISSING_VAR"):
+        load_script_steps(script_path)
 
 
 def test_smoke_scripts_use_snake_case_tool_names() -> None:

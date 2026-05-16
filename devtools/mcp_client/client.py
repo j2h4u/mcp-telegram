@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 from contextlib import AsyncExitStack
 from datetime import timedelta
 from pathlib import Path
@@ -10,6 +12,7 @@ from mcp import ClientSession, StdioServerParameters, stdio_client
 from mcp.client.streamable_http import streamable_http_client
 
 DEFAULT_TIMEOUT_SECONDS = 10.0
+_ENV_PLACEHOLDER_RE = re.compile(r"^\$\{([A-Z_][A-Z0-9_]*)\}$")
 
 
 class McpClientError(RuntimeError):
@@ -179,7 +182,7 @@ class HttpMcpClient:
 
 def load_script_steps(script_path: Path) -> list[dict[str, Any]]:
     """Load one JSON script file with MCP client steps."""
-    payload = json.loads(script_path.read_text(encoding="utf-8"))
+    payload = _expand_script_env(json.loads(script_path.read_text(encoding="utf-8")))
     if isinstance(payload, list):
         steps = payload
     elif isinstance(payload, dict):
@@ -196,6 +199,22 @@ def load_script_steps(script_path: Path) -> list[dict[str, Any]]:
             raise ValueError(f"script step {index} must be an object")
         normalized_steps.append(step)
     return normalized_steps
+
+
+def _expand_script_env(value: Any) -> Any:
+    if isinstance(value, str):
+        match = _ENV_PLACEHOLDER_RE.match(value)
+        if match is None:
+            return value
+        name = match.group(1)
+        if name not in os.environ:
+            raise ValueError(f"script requires environment variable {name}")
+        return os.environ[name]
+    if isinstance(value, list):
+        return [_expand_script_env(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _expand_script_env(item) for key, item in value.items()}
+    return value
 
 
 async def execute_script_steps(client: StdioMcpClient, steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
