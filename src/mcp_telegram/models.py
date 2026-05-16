@@ -8,6 +8,86 @@ TOPIC_METADATA_TTL_SECONDS = 600
 GENERAL_TOPIC_ID = 1
 GENERAL_TOPIC_TITLE = "General"
 
+TraceGapSeverity = Literal["info", "warning", "action_required"]
+TraceCoverageState = Literal["complete", "partial", "unknown"]
+TraceAuthorshipBasis = Literal["effective_sender_id", "post_author_signature"]
+TraceCoverageGoal = Literal["observed", "best_effort_visible"]
+
+
+class TraceResolvedAccount(TypedDict):
+    """Account resolution metadata returned with every Account Trace result."""
+
+    confidence: Literal["resolved", "ambiguous", "unresolved"]
+    account_id: int | None
+    display_name: str | None
+    username: str | None
+    candidate_ids: list[int]
+    display_aliases: list[str]
+    resolution_source: str
+
+
+class TraceEvidenceItem(TypedDict):
+    """One observable authored-message evidence item in an Account Trace page."""
+
+    source: str
+    evidence_kind: Literal["authored_message"]
+    dialog_id: int
+    dialog_title: str | None
+    dialog_type: str | None
+    topic_id: int | None
+    topic_title: str | None
+    message_id: int
+    sent_at: int
+    sender_id: int | None
+    effective_sender_id: int | None
+    authorship_basis: TraceAuthorshipBasis
+    author_signature: str | None
+    text: str | None
+    media_description: str | None
+
+
+class TraceCoverageGap(TypedDict):
+    """A controlled explanation for missing or partial Account Trace coverage."""
+
+    kind: str
+    severity: TraceGapSeverity
+    detail: str
+    dialog_id: NotRequired[int]
+    topic_id: NotRequired[int]
+    action: NotRequired[dict[str, object]]
+    next_action: NotRequired[dict[str, object]]
+
+
+class TraceCoverageSummary(TypedDict):
+    """Bounded coverage accounting for the returned evidence page."""
+
+    state: TraceCoverageState
+    observed_message_count: int
+    dialogs_considered: int
+    dialogs_considered_basis: str
+    dialogs_with_hits: int
+    dialogs_with_gaps: int
+    as_of: int
+
+
+class TraceGroup(TypedDict):
+    """A presentation group for the current Account Trace page."""
+
+    group_key: str
+    group_label: str
+    evidence: list[TraceEvidenceItem]
+
+
+class TraceAccountResult(TypedDict):
+    """Structured Account Trace response used by daemon and MCP tool layers."""
+
+    resolved_account: TraceResolvedAccount
+    groups: list[TraceGroup]
+    coverage: TraceCoverageSummary
+    gaps: list[TraceCoverageGap]
+    provenance: dict[str, object]
+    next_navigation: str | None
+
 
 # ---------------------------------------------------------------------------
 # Message data model — read side
