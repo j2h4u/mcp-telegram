@@ -1,8 +1,9 @@
 """Daemon API server — Unix socket request dispatcher.
 
-DaemonAPIServer listens on a Unix domain socket and handles sixteen methods:
+DaemonAPIServer listens on a Unix domain socket and handles seventeen methods:
   - list_messages: read from sync.db (synced dialogs) or Telegram (on-demand)
   - search_messages: FTS5 stemmed full-text search against messages_fts
+  - trace_account_messages: observable authored-message evidence for one account
   - list_dialogs: live dialog list from Telegram enriched with sync_status
   - list_topics: forum topic list via Telegram API
   - get_me: current user info via Telegram API
@@ -53,6 +54,7 @@ from telethon.tl.functions.messages import (  # type: ignore[import-untyped]
     GetDialogFiltersRequest,
     GetForumTopicsRequest,
 )
+from telethon.tl.functions.contacts import ResolveUsernameRequest  # type: ignore[import-untyped]
 from telethon.tl.functions.photos import GetUserPhotosRequest  # type: ignore[import-untyped]
 from telethon.tl.functions.users import GetFullUserRequest  # type: ignore[import-untyped]
 from telethon.tl.types import Channel, Chat  # type: ignore[import-untyped]
@@ -214,7 +216,9 @@ from .fts import stem_query
 from .models import ReadMessage, ReadState
 from .pagination import (
     HistoryDirection,
+    decode_account_trace_navigation,
     decode_navigation_token,
+    encode_account_trace_navigation,
     encode_history_navigation,
     encode_search_navigation,
 )
@@ -572,7 +576,134 @@ _ALL_ENTITY_NAMES_NORMALIZED_SQL = (
     "AND ((type IN ('User', 'Bot') AND updated_at >= ?) "  # PascalCase per ListDialogs type vocabulary
     "OR (type NOT IN ('User', 'Bot') AND updated_at >= ?))"
 )
-_ENTITY_BY_USERNAME_SQL = "SELECT id, name FROM entities WHERE username = ?"
+_ENTITY_BY_USERNAME_SQL = (
+    "SELECT id, name, username, name_normalized FROM entities "
+    "WHERE username = ? COLLATE NOCASE"
+)
+_TRACE_ACCOUNT_BY_ID_SQL = (
+    "SELECT id, name, username, name_normalized FROM entities WHERE id = ?"
+)
+_TRACE_ACCOUNT_NAMES_SQL = (
+    "SELECT id, name FROM entities "
+    "WHERE id > 0 AND name IS NOT NULL "
+    "AND ((type IN ('User', 'Bot', 'user', 'bot') AND updated_at >= ?) "
+    "OR (type NOT IN ('User', 'Bot', 'user', 'bot') AND updated_at >= ?))"
+)
+_TRACE_ACCOUNT_NAMES_NORMALIZED_SQL = (
+    "SELECT id, name_normalized FROM entities "
+    "WHERE id > 0 AND name_normalized IS NOT NULL "
+    "AND ((type IN ('User', 'Bot', 'user', 'bot') AND updated_at >= ?) "
+    "OR (type NOT IN ('User', 'Bot', 'user', 'bot') AND updated_at >= ?))"
+)
+
+
+def _parse_trace_int(value: object) -> int | None:
+    """Return an int for a signed numeric trace selector, otherwise None."""
+    if isinstance(value, int):
+        return value
+    if not isinstance(value, str):
+        return None
+    selector = value.strip()
+    if not selector:
+        return None
+    if selector.isdigit():
+        return int(selector)
+    if selector[0] in "+-" and selector[1:].isdigit():
+        return int(selector)
+    return None
+
+
+def _unique_trace_aliases(*values: object) -> list[str]:
+    """Build a stable de-duplicated non-empty alias list for post_author matching."""
+    aliases: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        alias = value.strip()
+        if not alias:
+            continue
+        for candidate in (alias, alias.removeprefix("@")):
+            if candidate and candidate not in seen:
+                seen.add(candidate)
+                aliases.append(candidate)
+    return aliases
+
+
+def _trace_account_from_entity_row(row: sqlite3.Row, *, resolution_source: str) -> dict:
+    """Convert an entities row into the Account Trace resolution envelope."""
+    account_id = int(row["id"])
+    display_name = row["name"]
+    username = row["username"]
+    display_aliases = _unique_trace_aliases(
+        display_name,
+        username,
+        f"@{username}" if username else None,
+        row["name_normalized"],
+    )
+    return {
+        "confidence": "resolved",
+        "account_id": account_id,
+        "display_name": display_name,
+        "username": username,
+        "candidate_ids": [],
+        "display_aliases": display_aliases,
+        "resolution_source": resolution_source,
+    }
+
+
+def _unresolved_trace_account(
+    *,
+    query: object,
+    resolution_source: str,
+    candidate_ids: list[int] | None = None,
+    display_aliases: list[str] | None = None,
+    confidence: Literal["ambiguous", "unresolved"] = "unresolved",
+) -> dict:
+    """Build a normal non-exception trace resolution failure envelope."""
+    return {
+        "confidence": confidence,
+        "account_id": None,
+        "display_name": str(query) if query is not None else None,
+        "username": None,
+        "candidate_ids": candidate_ids or [],
+        "display_aliases": display_aliases or [],
+        "resolution_source": resolution_source,
+    }
+
+
+def _trace_post_author_aliases(resolved_account: dict) -> list[str]:
+    """Return post_author aliases for lower-confidence channel signature evidence."""
+    return _unique_trace_aliases(
+        resolved_account.get("username"),
+        f"@{resolved_account.get('username')}" if resolved_account.get("username") else None,
+        resolved_account.get("display_name"),
+        *resolved_account.get("display_aliases", []),
+    )
+
+
+def _parse_trace_time_bound(value: object) -> int | None:
+    """Parse a trace time bound as unix seconds or ISO datetime string."""
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    parsed_int = _parse_trace_int(text)
+    if parsed_int is not None:
+        return parsed_int
+    iso_text = text[:-1] + "+00:00" if text.endswith("Z") else text
+    try:
+        parsed = datetime.fromisoformat(iso_text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return int(parsed.timestamp())
 
 
 # ---------------------------------------------------------------------------
@@ -734,6 +865,94 @@ def _build_list_messages_query(
         len(params),
         direction,
     )
+    return sql, params
+
+
+def _build_trace_account_messages_query(
+    *,
+    target_user_id: int,
+    self_id: int | None,
+    limit: int,
+    post_author_aliases: list[str] | None = None,
+    exact_dialog_id: int | None = None,
+    exact_topic_id: int | None = None,
+    sent_after_ts: int | None = None,
+    sent_before_ts: int | None = None,
+    navigation: dict[str, int] | None = None,
+) -> tuple[str, dict]:
+    """Build the baseline Account Trace query over canonical message rows."""
+    params: dict[str, object] = {
+        "target_user_id": target_user_id,
+        "self_id": self_id,
+        "limit": limit,
+    }
+    sql = (
+        "SELECT "
+        "m.dialog_id, "
+        "m.message_id, "
+        "m.sent_at, "
+        "m.text, "
+        "m.sender_id, "
+        "m.media_description, "
+        "m.forum_topic_id AS topic_id, "
+        "COALESCE(d.name, e_dialog.name, CAST(m.dialog_id AS TEXT)) AS dialog_title, "
+        "COALESCE(d.type, e_dialog.type) AS dialog_type, "
+        "tm.title AS topic_title, "
+        "m.post_author AS author_signature, "
+        f"{EFFECTIVE_SENDER_ID_SQL}, "
+        "CASE "
+        f"WHEN {_EFFECTIVE_SENDER_ID_EXPR} = :target_user_id THEN 'effective_sender_id' "
+        "ELSE 'post_author_signature' "
+        "END AS authorship_basis "
+        "FROM messages m "
+        "LEFT JOIN dialogs d ON d.dialog_id = m.dialog_id "
+        "LEFT JOIN entities e_dialog ON e_dialog.id = m.dialog_id "
+        "LEFT JOIN topic_metadata tm "
+        "  ON tm.dialog_id = m.dialog_id AND tm.topic_id = m.forum_topic_id "
+        "WHERE m.is_deleted = 0 AND m.is_service = 0"
+    )
+
+    authorship_predicates = [f"{_EFFECTIVE_SENDER_ID_EXPR} = :target_user_id"]
+    aliases = post_author_aliases or []
+    if aliases:
+        placeholders: list[str] = []
+        for idx, alias in enumerate(aliases):
+            param_name = f"post_author_alias_{idx}"
+            placeholders.append(f":{param_name}")
+            params[param_name] = alias
+        authorship_predicates.append(f"m.post_author IN ({', '.join(placeholders)})")
+    sql += f" AND ({' OR '.join(authorship_predicates)})"
+
+    if exact_dialog_id is not None:
+        sql += " AND m.dialog_id = :exact_dialog_id"
+        params["exact_dialog_id"] = exact_dialog_id
+
+    if exact_topic_id is not None:
+        sql += " AND m.forum_topic_id = :exact_topic_id"
+        params["exact_topic_id"] = exact_topic_id
+
+    if sent_after_ts is not None:
+        sql += " AND m.sent_at >= :sent_after"
+        params["sent_after"] = sent_after_ts
+
+    if sent_before_ts is not None:
+        sql += " AND m.sent_at <= :sent_before"
+        params["sent_before"] = sent_before_ts
+
+    if navigation is not None:
+        sql += (
+            " AND ("
+            "m.sent_at < :nav_sent_at "
+            "OR (m.sent_at = :nav_sent_at AND m.dialog_id < :nav_dialog_id) "
+            "OR (m.sent_at = :nav_sent_at AND m.dialog_id = :nav_dialog_id "
+            "AND m.message_id < :nav_message_id)"
+            ")"
+        )
+        params["nav_sent_at"] = navigation["sent_at"]
+        params["nav_dialog_id"] = navigation["dialog_id"]
+        params["nav_message_id"] = navigation["message_id"]
+
+    sql += " ORDER BY m.sent_at DESC, m.dialog_id DESC, m.message_id DESC LIMIT :limit"
     return sql, params
 
 
@@ -976,6 +1195,8 @@ class DaemonAPIServer:
             return await self._read_source_unit_window(req)
         if method == "search_messages":
             return await self._search_messages(req)
+        if method == "trace_account_messages":
+            return await self._trace_account_messages(req)
         if method == "list_dialogs":
             return await self._list_dialogs(req)
         if method == "list_topics":
@@ -1543,6 +1764,139 @@ class DaemonAPIServer:
                 return {"ok": False, "error": "dialog_not_found", "message": str(exc)}
         return dialog_id
 
+    async def _resolve_trace_account(self, req: dict) -> dict:
+        """Resolve an Account Trace target without probing arbitrary numeric ids."""
+        exact_account_id = _parse_trace_int(req.get("exact_account_id"))
+        account = req.get("account")
+        if exact_account_id is not None:
+            row = self._conn.execute(_TRACE_ACCOUNT_BY_ID_SQL, (exact_account_id,)).fetchone()
+            if row is not None:
+                return _trace_account_from_entity_row(row, resolution_source="entities_exact_id")
+            return _unresolved_trace_account(
+                query=exact_account_id,
+                resolution_source="unresolved_numeric_id",
+            )
+
+        numeric_account_id = _parse_trace_int(account)
+        if numeric_account_id is not None:
+            row = self._conn.execute(_TRACE_ACCOUNT_BY_ID_SQL, (numeric_account_id,)).fetchone()
+            if row is not None:
+                return _trace_account_from_entity_row(row, resolution_source="entities_numeric_account")
+            return _unresolved_trace_account(
+                query=numeric_account_id,
+                resolution_source="unresolved_numeric_id",
+            )
+
+        if not isinstance(account, str) or not account.strip():
+            return _unresolved_trace_account(query=account, resolution_source="missing_account")
+
+        query = account.strip()
+        tme = _parse_tme_link(query)
+        explicit_username = False
+        if tme is not None:
+            query = f"@{tme[0]}"
+            explicit_username = True
+        elif query.startswith("@"):
+            explicit_username = True
+
+        if explicit_username:
+            username_query = query[1:]
+            row = self._conn.execute(_ENTITY_BY_USERNAME_SQL, (username_query,)).fetchone()
+            if row is not None:
+                return _trace_account_from_entity_row(row, resolution_source="entities_username")
+            return await self._resolve_trace_username(username_query)
+
+        now = int(time.time())
+        display_name_map = dict(
+            self._conn.execute(_TRACE_ACCOUNT_NAMES_SQL, (now - USER_TTL, now - GROUP_TTL)).fetchall()
+        )
+        normalized = dict(
+            self._conn.execute(
+                _TRACE_ACCOUNT_NAMES_NORMALIZED_SQL,
+                (now - USER_TTL, now - GROUP_TTL),
+            ).fetchall()
+        )
+        result = resolve_entity_sync(query, display_name_map, None, normalized_name_map=normalized)
+        if isinstance(result, Resolved):
+            row = self._conn.execute(_TRACE_ACCOUNT_BY_ID_SQL, (result.entity_id,)).fetchone()
+            if row is not None:
+                return _trace_account_from_entity_row(row, resolution_source="entities_fuzzy")
+            return {
+                "confidence": "resolved",
+                "account_id": result.entity_id,
+                "display_name": result.display_name,
+                "username": None,
+                "candidate_ids": [],
+                "display_aliases": _unique_trace_aliases(result.display_name, latinize(result.display_name)),
+                "resolution_source": "entities_fuzzy",
+            }
+        if isinstance(result, Candidates):
+            candidate_ids = [int(match["entity_id"]) for match in result.matches]
+            display_aliases = [
+                str(match["display_name"])
+                for match in result.matches
+                if match.get("display_name")
+            ]
+            return _unresolved_trace_account(
+                query=query,
+                resolution_source="entities_fuzzy_candidates",
+                candidate_ids=candidate_ids,
+                display_aliases=display_aliases,
+                confidence="ambiguous",
+            )
+        return _unresolved_trace_account(query=query, resolution_source="entities_fuzzy_not_found")
+
+    async def _resolve_trace_username(self, username: str) -> dict:
+        """Resolve an explicit username with one daemon-owned Telegram lookup."""
+        try:
+            result = await self._client(ResolveUsernameRequest(username=username))
+        except Exception as exc:
+            logger.info(
+                "trace_account username_lookup_failed username=%r error_type=%s%s",
+                username,
+                type(exc).__name__,
+                _rid(),
+            )
+            return _unresolved_trace_account(
+                query=f"@{username}",
+                resolution_source="telegram_username_lookup_failed",
+            )
+
+        users = list(getattr(result, "users", []) or [])
+        if not users:
+            return _unresolved_trace_account(
+                query=f"@{username}",
+                resolution_source="telegram_username_lookup_empty",
+            )
+
+        user = users[0]
+        user_id = int(getattr(user, "id"))
+        first_name = getattr(user, "first_name", None)
+        last_name = getattr(user, "last_name", None)
+        display_name = " ".join(part for part in (first_name, last_name) if part) or username
+        resolved_username = getattr(user, "username", None) or username
+        entity_type = "Bot" if bool(getattr(user, "bot", False)) else "User"
+        now = int(time.time())
+        self._conn.execute(
+            _UPSERT_ENTITY_SQL,
+            (
+                user_id,
+                entity_type,
+                display_name,
+                resolved_username,
+                latinize(display_name),
+                now,
+            ),
+        )
+        self._conn.commit()
+        row = self._conn.execute(_TRACE_ACCOUNT_BY_ID_SQL, (user_id,)).fetchone()
+        if row is None:
+            return _unresolved_trace_account(
+                query=f"@{username}",
+                resolution_source="telegram_username_lookup_write_failed",
+            )
+        return _trace_account_from_entity_row(row, resolution_source="telegram_username_lookup")
+
     # ------------------------------------------------------------------
     # Shared message helpers
     # ------------------------------------------------------------------
@@ -1824,6 +2178,230 @@ class DaemonAPIServer:
             "ok": True,
             "data": {"messages": [dataclasses.asdict(m) for m in messages], "source": "sync_db", "next_navigation": next_nav},
         }
+
+    @staticmethod
+    def _trace_row_to_evidence(row: sqlite3.Row) -> dict:
+        """Convert one trace SQL row into a structured evidence item."""
+        return {
+            "source": "sync_db",
+            "evidence_kind": "authored_message",
+            "dialog_id": row["dialog_id"],
+            "dialog_title": row["dialog_title"],
+            "dialog_type": row["dialog_type"],
+            "topic_id": row["topic_id"],
+            "topic_title": row["topic_title"],
+            "message_id": row["message_id"],
+            "sent_at": row["sent_at"],
+            "sender_id": row["sender_id"],
+            "effective_sender_id": row["effective_sender_id"],
+            "authorship_basis": row["authorship_basis"],
+            "author_signature": row["author_signature"],
+            "text": row["text"],
+            "media_description": row["media_description"],
+        }
+
+    @staticmethod
+    def _group_trace_evidence(evidence: list[dict], group_by: str) -> list[dict]:
+        """Group the already-selected Account Trace page for presentation."""
+        groups: dict[str, dict] = {}
+        for item in evidence:
+            if group_by == "dialog":
+                topic_id = item.get("topic_id")
+                topic_suffix = f":topic:{topic_id}" if topic_id is not None else ""
+                key = f"dialog:{item['dialog_id']}{topic_suffix}"
+                label = str(item.get("dialog_title") or item["dialog_id"])
+                if item.get("topic_title"):
+                    label = f"{label} / {item['topic_title']}"
+            else:
+                day = datetime.fromtimestamp(int(item["sent_at"]), tz=UTC).strftime("%Y-%m-%d")
+                key = f"day:{day}"
+                label = day
+            if key not in groups:
+                groups[key] = {"group_key": key, "group_label": label, "evidence": []}
+            groups[key]["evidence"].append(item)
+        return list(groups.values())
+
+    @staticmethod
+    def _trace_account_resolution_gap(resolved_account: dict) -> dict:
+        """Build the baseline gap for unresolved or ambiguous trace targets."""
+        if resolved_account.get("confidence") == "ambiguous":
+            return {
+                "kind": "account_ambiguous",
+                "severity": "action_required",
+                "detail": "Multiple visible accounts match this reference.",
+                "next_action": {
+                    "field": "exact_account_id",
+                    "candidate_ids": resolved_account.get("candidate_ids", []),
+                },
+            }
+        return {
+            "kind": "account_unresolved",
+            "severity": "action_required",
+            "detail": "No visible account matched this reference.",
+        }
+
+    def _empty_trace_result(self, resolved_account: dict, *, gaps: list[dict] | None = None) -> dict:
+        """Return a structurally complete empty Account Trace payload."""
+        as_of = int(time.time())
+        return {
+            "resolved_account": resolved_account,
+            "groups": [],
+            "coverage": {
+                "state": "unknown",
+                "observed_message_count": 0,
+                "dialogs_considered": 0,
+                "dialogs_considered_basis": "no_resolved_account",
+                "dialogs_with_hits": 0,
+                "dialogs_with_gaps": 0,
+                "as_of": as_of,
+            },
+            "gaps": gaps or [],
+            "provenance": {
+                "source": "sync_db",
+                "query_basis": "account_resolution",
+                "coverage_goal": "observed",
+                "authorship_basis_counts": {},
+                "cache_writes": 0,
+            },
+            "next_navigation": None,
+        }
+
+    async def _trace_account_messages(self, req: dict) -> dict:
+        """Return observable authored-message evidence for one account reference."""
+        group_by = req.get("group_by", "timeline")
+        if group_by not in ("timeline", "dialog"):
+            return {"ok": False, "error": "invalid_group_by", "message": "group_by must be timeline or dialog"}
+
+        coverage_goal = req.get("coverage_goal", "observed")
+        if coverage_goal not in ("observed", "best_effort_visible"):
+            return {
+                "ok": False,
+                "error": "invalid_coverage_goal",
+                "message": "coverage_goal must be observed or best_effort_visible",
+            }
+
+        exact_dialog_id = _parse_trace_int(req.get("exact_dialog_id"))
+        dialog = req.get("dialog")
+        if exact_dialog_id is None and isinstance(dialog, str) and dialog.strip():
+            resolved_dialog = await self._resolve_dialog_id(0, dialog)
+            if isinstance(resolved_dialog, dict):
+                return resolved_dialog
+            exact_dialog_id = resolved_dialog
+
+        exact_topic_id = _parse_trace_int(req.get("exact_topic_id"))
+        if exact_topic_id is not None and exact_dialog_id is None:
+            return {
+                "ok": False,
+                "error": "invalid_topic_scope",
+                "message": "exact_topic_id requires exact_dialog_id or dialog",
+            }
+
+        limit = _clamp(int(req.get("limit", 50)), 1, 200)
+        sent_after = req.get("sent_after")
+        sent_before = req.get("sent_before")
+        sent_after_ts = _parse_trace_time_bound(sent_after)
+        sent_before_ts = _parse_trace_time_bound(sent_before)
+        if sent_after is not None and sent_after_ts is None:
+            return {"ok": False, "error": "invalid_time_bound", "message": "sent_after is invalid"}
+        if sent_before is not None and sent_before_ts is None:
+            return {"ok": False, "error": "invalid_time_bound", "message": "sent_before is invalid"}
+
+        resolved_account = await self._resolve_trace_account(req)
+        if resolved_account.get("confidence") != "resolved" or resolved_account.get("account_id") is None:
+            gap = self._trace_account_resolution_gap(resolved_account)
+            return {"ok": True, "data": self._empty_trace_result(resolved_account, gaps=[gap])}
+
+        target_user_id = int(resolved_account["account_id"])
+        navigation_payload: dict[str, int] | None = None
+        navigation = req.get("navigation")
+        if isinstance(navigation, str) and navigation:
+            try:
+                decoded = decode_account_trace_navigation(
+                    navigation,
+                    expected_target_user_id=target_user_id,
+                    expected_group_by=group_by,
+                    expected_exact_dialog_id=exact_dialog_id,
+                    expected_exact_topic_id=exact_topic_id,
+                    expected_sent_after=sent_after,
+                    expected_sent_before=sent_before,
+                )
+            except ValueError as exc:
+                return {"ok": False, "error": "invalid_navigation", "message": str(exc)}
+            navigation_payload = {
+                "sent_at": decoded.sent_at,
+                "dialog_id": decoded.dialog_id,
+                "message_id": decoded.message_id,
+            }
+
+        post_author_aliases = _trace_post_author_aliases(resolved_account)
+        sql, params = _build_trace_account_messages_query(
+            target_user_id=target_user_id,
+            self_id=self.self_id,
+            limit=limit + 1,
+            post_author_aliases=post_author_aliases,
+            exact_dialog_id=exact_dialog_id,
+            exact_topic_id=exact_topic_id,
+            sent_after_ts=sent_after_ts,
+            sent_before_ts=sent_before_ts,
+            navigation=navigation_payload,
+        )
+        rows = self._conn.execute(sql, params).fetchall()
+        selected_rows = rows[:limit]
+        evidence = [self._trace_row_to_evidence(row) for row in selected_rows]
+
+        next_navigation: str | None = None
+        if len(rows) > limit and selected_rows:
+            last = selected_rows[-1]
+            next_navigation = encode_account_trace_navigation(
+                target_user_id=target_user_id,
+                sent_at=int(last["sent_at"]),
+                dialog_id=int(last["dialog_id"]),
+                message_id=int(last["message_id"]),
+                group_by=group_by,
+                exact_dialog_id=exact_dialog_id,
+                exact_topic_id=exact_topic_id,
+                sent_after=sent_after,
+                sent_before=sent_before,
+            )
+
+        basis_counts: dict[str, int] = {}
+        for item in evidence:
+            basis = str(item["authorship_basis"])
+            basis_counts[basis] = basis_counts.get(basis, 0) + 1
+
+        dialog_ids = {int(item["dialog_id"]) for item in evidence}
+        as_of = int(time.time())
+        data = {
+            "resolved_account": resolved_account,
+            "groups": self._group_trace_evidence(evidence, group_by),
+            "coverage": {
+                "state": "complete" if evidence else "unknown",
+                "observed_message_count": len(evidence),
+                "dialogs_considered": len(dialog_ids),
+                "dialogs_considered_basis": "current_page_evidence",
+                "dialogs_with_hits": len(dialog_ids),
+                "dialogs_with_gaps": 0,
+                "as_of": as_of,
+            },
+            "gaps": [],
+            "provenance": {
+                "source": "sync_db",
+                "query_basis": "canonical_messages",
+                "coverage_goal": coverage_goal,
+                "coverage_bounds": {
+                    "limit": limit,
+                    "exact_dialog_id": exact_dialog_id,
+                    "exact_topic_id": exact_topic_id,
+                    "sent_after": sent_after,
+                    "sent_before": sent_before,
+                },
+                "authorship_basis_counts": basis_counts,
+                "post_author_aliases_considered": post_author_aliases,
+                "cache_writes": 0,
+            },
+            "next_navigation": next_navigation,
+        }
+        return {"ok": True, "data": data}
 
     async def _list_messages_context_window(
         self,
