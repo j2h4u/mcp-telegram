@@ -214,6 +214,46 @@ class DaemonConnection:
             }
         )
 
+    async def trace_account_messages(
+        self,
+        *,
+        account: str | None = None,
+        exact_account_id: int | None = None,
+        group_by: str = "timeline",
+        dialog: str | None = None,
+        exact_dialog_id: int | None = None,
+        exact_topic_id: int | None = None,
+        sent_after: str | None = None,
+        sent_before: str | None = None,
+        limit: int = 50,
+        navigation: str | None = None,
+        coverage_goal: str = "observed",
+    ) -> dict:
+        """Send trace_account_messages request to the daemon."""
+        payload: dict = {
+            "method": "trace_account_messages",
+            "group_by": group_by,
+            "limit": limit,
+            "coverage_goal": coverage_goal,
+        }
+        if account is not None:
+            payload["account"] = account
+        if exact_account_id is not None:
+            payload["exact_account_id"] = exact_account_id
+        if dialog is not None:
+            payload["dialog"] = dialog
+        if exact_dialog_id is not None:
+            payload["exact_dialog_id"] = exact_dialog_id
+        if exact_topic_id is not None:
+            payload["exact_topic_id"] = exact_topic_id
+        if sent_after is not None:
+            payload["sent_after"] = sent_after
+        if sent_before is not None:
+            payload["sent_before"] = sent_before
+        if navigation is not None:
+            payload["navigation"] = navigation
+        return await self.request(payload)
+
     async def list_dialogs(
         self,
         *,

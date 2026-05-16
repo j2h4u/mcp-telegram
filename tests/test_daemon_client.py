@@ -307,6 +307,77 @@ async def test_search_messages_convenience_with_name() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Convenience method: trace_account_messages
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_trace_account_messages_convenience() -> None:
+    """trace_account_messages sends flat request and omits None optionals."""
+    reader = MagicMock(spec=asyncio.StreamReader)
+    writer = MagicMock(spec=asyncio.StreamWriter)
+    conn = DaemonConnection(reader, writer)
+
+    captured: list[dict] = []
+
+    async def _mock_request(payload: dict) -> dict:
+        captured.append(payload)
+        return {"ok": True, "data": {"groups": []}}
+
+    conn.request = _mock_request  # type: ignore[method-assign]
+
+    await conn.trace_account_messages(
+        exact_account_id=123,
+        exact_topic_id=5,
+        group_by="dialog",
+        limit=25,
+        coverage_goal="best_effort_visible",
+    )
+
+    req = captured[0]
+    assert req["method"] == "trace_account_messages"
+    assert req["exact_account_id"] == 123
+    assert req["exact_topic_id"] == 5
+    assert req["group_by"] == "dialog"
+    assert req["limit"] == 25
+    assert req["coverage_goal"] == "best_effort_visible"
+    assert "account" not in req
+
+
+@pytest.mark.asyncio
+async def test_trace_account_messages_includes_optional_filters() -> None:
+    reader = MagicMock(spec=asyncio.StreamReader)
+    writer = MagicMock(spec=asyncio.StreamWriter)
+    conn = DaemonConnection(reader, writer)
+
+    captured: list[dict] = []
+
+    async def _mock_request(payload: dict) -> dict:
+        captured.append(payload)
+        return {"ok": True, "data": {"groups": []}}
+
+    conn.request = _mock_request  # type: ignore[method-assign]
+
+    await conn.trace_account_messages(
+        account="@alice",
+        dialog="Forum",
+        exact_dialog_id=-100222,
+        sent_after="2024-01-01T00:00:00Z",
+        sent_before="2024-02-01T00:00:00Z",
+        navigation="cursor",
+    )
+
+    req = captured[0]
+    assert req["method"] == "trace_account_messages"
+    assert req["account"] == "@alice"
+    assert req["dialog"] == "Forum"
+    assert req["exact_dialog_id"] == -100222
+    assert req["sent_after"] == "2024-01-01T00:00:00Z"
+    assert req["sent_before"] == "2024-02-01T00:00:00Z"
+    assert req["navigation"] == "cursor"
+
+
+# ---------------------------------------------------------------------------
 # Convenience method: list_dialogs
 # ---------------------------------------------------------------------------
 
