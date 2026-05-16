@@ -207,9 +207,10 @@ USER_TTL: int = 2_592_000  # 30 days
 GROUP_TTL: int = 604_800  # 7 days
 
 from rapidfuzz import fuzz as _fuzz
-from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
+from telethon.errors import FloodWaitError, RPCError  # type: ignore[import-untyped]
 
 from .budget import allocate_message_budget_proportional, unread_chat_tier
+from .dialog_sync import _ACCESS_LOST_ERRORS
 from .feedback_db import VALID_SEVERITIES, VALID_STATUSES
 from .formatter import format_reaction_counts
 from .fts import stem_query
@@ -223,9 +224,12 @@ from .pagination import (
     encode_search_navigation,
 )
 from .sync_worker import (
+    ExtractedMessage,
     apply_reactions_delta,
+    extract_message_row,
     extract_reactions_rows,
     extract_reply_and_topic,
+    insert_messages_with_fts,
 )
 
 # Phase 39.2 §Key technical decisions: per-message TTL for JIT reactions freshen-on-read.
@@ -1063,6 +1067,295 @@ def _build_trace_gaps(
         )
 
     return gaps
+
+
+_TRACE_ENRICHMENT_MAX_DIALOGS = 10
+_TRACE_ENRICHMENT_MAX_PER_DIALOG = 100
+_TRACE_ENRICHMENT_DEADLINE_MS = 15_000
+_TRACE_ENRICHMENT_CONCURRENCY = 2
+
+_TRACE_MESSAGE_BASE_FIELDS = (
+    "dialog_id",
+    "message_id",
+    "sent_at",
+    "text",
+    "sender_id",
+    "sender_first_name",
+    "media_description",
+    "reply_to_msg_id",
+    "forum_topic_id",
+    "edit_date",
+    "grouped_id",
+    "reply_to_peer_id",
+    "out",
+    "is_service",
+    "post_author",
+)
+_TRACE_MESSAGE_COMPARE_FIELDS = (*_TRACE_MESSAGE_BASE_FIELDS, "is_deleted")
+
+
+def _trace_strategy_for_dialog(dialog_type: str, *, status: str | None, hidden: bool) -> str:
+    if hidden:
+        return "hidden"
+    if status == "access_lost":
+        return "access_lost"
+    if dialog_type in {"User", "Bot"}:
+        return "dialog_scan"
+    if dialog_type in {"Group", "Forum", "Chat"}:
+        return "author_search"
+    if dialog_type == "Channel":
+        return "signature_only"
+    return "unsupported"
+
+
+def _trace_dialog_metadata(conn: sqlite3.Connection, dialog_id: int) -> dict:
+    row = conn.execute(
+        """
+        SELECT
+            COALESCE(d.type, e.type, 'Unknown') AS dialog_type,
+            COALESCE(sd.status, 'not_synced') AS status,
+            COALESCE(d.hidden, 0) AS hidden
+        FROM (SELECT ? AS dialog_id) x
+        LEFT JOIN dialogs d ON d.dialog_id = x.dialog_id
+        LEFT JOIN entities e ON e.id = x.dialog_id
+        LEFT JOIN synced_dialogs sd ON sd.dialog_id = x.dialog_id
+        """,
+        (dialog_id,),
+    ).fetchone()
+    return {
+        "dialog_type": str(row[0]) if row else "Unknown",
+        "status": str(row[1]) if row else "not_synced",
+        "hidden": bool(row[2]) if row else False,
+    }
+
+
+def _trace_common_chat_ids(conn: sqlite3.Connection, target_user_id: int) -> list[int]:
+    row = conn.execute(
+        "SELECT detail_json FROM entity_details WHERE entity_id = ?",
+        (target_user_id,),
+    ).fetchone()
+    if row is None:
+        return []
+    try:
+        detail = json.loads(row[0])
+    except Exception:
+        return []
+    common_chats = detail.get("common_chats", [])
+    if not isinstance(common_chats, list):
+        return []
+    ids: list[int] = []
+    for item in common_chats:
+        if not isinstance(item, dict):
+            continue
+        raw_id = item.get("id")
+        try:
+            ids.append(int(raw_id))
+        except (TypeError, ValueError):
+            continue
+    return ids
+
+
+def _trace_candidate_dialogs(
+    conn: sqlite3.Connection,
+    target_user_id: int,
+    observed_rows: list[sqlite3.Row] | list[dict],
+    *,
+    exact_dialog_id: int | None = None,
+    exact_topic_id: int | None = None,
+    max_dialogs: int = _TRACE_ENRICHMENT_MAX_DIALOGS,
+) -> list[dict]:
+    """Select deterministic bounded Account Trace enrichment candidates."""
+    now = int(time.time())
+    candidates: list[dict] = []
+    seen: set[int] = set()
+
+    def add_candidate(dialog_id: int, *, origin: str, include_inaccessible: bool = False) -> None:
+        if dialog_id in seen or len(candidates) >= max_dialogs:
+            return
+        meta = _trace_dialog_metadata(conn, dialog_id)
+        if not include_inaccessible and (meta["status"] == "access_lost" or meta["hidden"]):
+            return
+        strategy = _trace_strategy_for_dialog(
+            meta["dialog_type"],
+            status=meta["status"],
+            hidden=bool(meta["hidden"]),
+        )
+        candidates.append(
+            {
+                "dialog_id": dialog_id,
+                "dialog_type": meta["dialog_type"],
+                "status": meta["status"],
+                "hidden": bool(meta["hidden"]),
+                "strategy": strategy,
+                "origin": origin,
+                "topic_id": exact_topic_id if exact_dialog_id == dialog_id else None,
+            }
+        )
+        seen.add(dialog_id)
+
+    if exact_dialog_id is not None:
+        add_candidate(exact_dialog_id, origin="exact_dialog", include_inaccessible=True)
+
+    for row in observed_rows:
+        add_candidate(int(_row_value(row, "dialog_id")), origin="observed_evidence")
+
+    fragment_rows = conn.execute(
+        """
+        SELECT dialog_id
+        FROM trace_coverage_fragments
+        WHERE target_user_id = ?
+          AND status != 'complete'
+          AND (next_retry_at IS NULL OR next_retry_at <= ?)
+        ORDER BY updated_at ASC, dialog_id ASC
+        """,
+        (target_user_id, now),
+    ).fetchall()
+    for row in fragment_rows:
+        add_candidate(int(row[0]), origin="trace_fragment_retry")
+
+    for dialog_id in _trace_common_chat_ids(conn, target_user_id):
+        add_candidate(dialog_id, origin="cached_common_chat")
+
+    visible_rows = conn.execute(
+        """
+        SELECT sd.dialog_id
+        FROM synced_dialogs sd
+        LEFT JOIN dialogs d ON d.dialog_id = sd.dialog_id
+        WHERE sd.status != 'access_lost'
+          AND COALESCE(d.hidden, 0) = 0
+        ORDER BY sd.dialog_id ASC
+        """
+    ).fetchall()
+    for row in visible_rows:
+        add_candidate(int(row[0]), origin="visible_synced")
+
+    return candidates
+
+
+def _trace_existing_message_bundle(
+    conn: sqlite3.Connection,
+    *,
+    dialog_id: int,
+    message_id: int,
+) -> dict | None:
+    columns = ", ".join(_TRACE_MESSAGE_COMPARE_FIELDS)
+    row = conn.execute(
+        f"SELECT {columns} FROM messages WHERE dialog_id = ? AND message_id = ?",
+        (dialog_id, message_id),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "message": {
+            field: row[index]
+            for index, field in enumerate(_TRACE_MESSAGE_COMPARE_FIELDS)
+        },
+        "reactions": sorted(
+            tuple(item)
+            for item in conn.execute(
+                """
+                SELECT emoji, count FROM message_reactions
+                WHERE dialog_id = ? AND message_id = ?
+                ORDER BY emoji, count
+                """,
+                (dialog_id, message_id),
+            ).fetchall()
+        ),
+        "entities": sorted(
+            tuple(item)
+            for item in conn.execute(
+                """
+                SELECT offset, length, type, value FROM message_entities
+                WHERE dialog_id = ? AND message_id = ?
+                ORDER BY offset, length, type, value
+                """,
+                (dialog_id, message_id),
+            ).fetchall()
+        ),
+        "forward": (
+            tuple(forward_row)
+            if (
+                forward_row := conn.execute(
+                    """
+                    SELECT fwd_from_peer_id, fwd_from_name, fwd_date, fwd_channel_post
+                    FROM message_forwards
+                    WHERE dialog_id = ? AND message_id = ?
+                    """,
+                    (dialog_id, message_id),
+                ).fetchone()
+            )
+            else None
+        ),
+    }
+
+
+def _messages_row_equal(existing: dict | None, candidate: ExtractedMessage) -> bool:
+    """Compare existing base/child rows with one extracted candidate bundle."""
+    if existing is None:
+        return False
+    existing_message = existing.get("message", {})
+    if existing_message.get("is_deleted") != 0:
+        return False
+
+    candidate_message = dataclasses.asdict(candidate.message)
+    candidate_message["is_deleted"] = 0
+    for field in _TRACE_MESSAGE_COMPARE_FIELDS:
+        if existing_message.get(field) != candidate_message.get(field):
+            return False
+
+    candidate_reactions = sorted(
+        (item.emoji, item.count)
+        for item in candidate.reactions
+    )
+    if existing.get("reactions", []) != candidate_reactions:
+        return False
+
+    candidate_entities = sorted(
+        (item.offset, item.length, item.type, item.value)
+        for item in candidate.entities
+    )
+    if existing.get("entities", []) != candidate_entities:
+        return False
+
+    if candidate.forward is None:
+        candidate_forward = None
+    else:
+        candidate_forward = (
+            candidate.forward.fwd_from_peer_id,
+            candidate.forward.fwd_from_name,
+            candidate.forward.fwd_date,
+            candidate.forward.fwd_channel_post,
+        )
+    return existing.get("forward") == candidate_forward
+
+
+def _trace_enrichment_result(
+    *,
+    deadline_ms: int,
+    concurrency: int,
+    max_dialogs: int,
+    max_per_dialog: int,
+) -> dict:
+    return {
+        "dialogs_attempted": 0,
+        "dialogs_skipped": 0,
+        "messages_seen": 0,
+        "messages_persisted": 0,
+        "duplicates_skipped": 0,
+        "deadline_ms": deadline_ms,
+        "concurrency": concurrency,
+        "coverage_bounds": {
+            "max_dialogs": max_dialogs,
+            "max_per_dialog": max_per_dialog,
+            "deadline_ms": deadline_ms,
+        },
+        "fragment_status_counts": {},
+    }
+
+
+def _trace_increment_status(result: dict, status: str) -> None:
+    counts = result.setdefault("fragment_status_counts", {})
+    counts[status] = counts.get(status, 0) + 1
 
 
 # ---------------------------------------------------------------------------
@@ -2635,6 +2928,256 @@ class DaemonAPIServer:
             "next_navigation": None,
         }
 
+    async def _trace_enrich_one_candidate(
+        self,
+        *,
+        target_user_id: int,
+        candidate: dict,
+        max_per_dialog: int,
+        deadline_ms: int,
+        deadline_at: float,
+    ) -> dict:
+        """Fetch and persist one bounded Account Trace enrichment candidate."""
+        dialog_id = int(candidate["dialog_id"])
+        topic_id = candidate.get("topic_id")
+        strategy = str(candidate.get("strategy", "unsupported"))
+        result = {
+            "status": "complete",
+            "attempted": 0,
+            "skipped": 0,
+            "messages_seen": 0,
+            "messages_persisted": 0,
+            "duplicates_skipped": 0,
+        }
+
+        now = int(time.time())
+        fragment = self._conn.execute(
+            """
+            SELECT next_retry_at FROM trace_coverage_fragments
+            WHERE target_user_id = ? AND dialog_id = ? AND topic_id = ? AND coverage_kind = 'authored_message'
+            """,
+            (target_user_id, dialog_id, 0 if topic_id is None else int(topic_id)),
+        ).fetchone()
+        if fragment is not None and fragment[0] is not None and int(fragment[0]) > now:
+            result["status"] = "pending"
+            result["skipped"] = 1
+            return result
+
+        if strategy in {"hidden", "access_lost", "unsupported", "signature_only"}:
+            status = {
+                "hidden": "unsupported",
+                "access_lost": "access_lost",
+                "unsupported": "unsupported",
+                "signature_only": "unsupported",
+            }[strategy]
+            _upsert_trace_coverage_fragment(
+                self._conn,
+                target_user_id=target_user_id,
+                dialog_id=dialog_id,
+                topic_id=topic_id,
+                status=status,
+                fetched_at=now,
+                last_error=f"{strategy}:no_author_search",
+                now=now,
+            )
+            result["status"] = status
+            result["skipped"] = 1
+            return result
+
+        if time.monotonic() >= deadline_at:
+            _upsert_trace_coverage_fragment(
+                self._conn,
+                target_user_id=target_user_id,
+                dialog_id=dialog_id,
+                topic_id=topic_id,
+                status="budget_exceeded",
+                last_error=f"BudgetExceeded:{deadline_ms}",
+                now=now,
+            )
+            result["status"] = "budget_exceeded"
+            result["skipped"] = 1
+            return result
+
+        iter_kwargs: dict[str, object] = {"limit": max_per_dialog}
+        if topic_id is not None:
+            iter_kwargs["reply_to"] = int(topic_id)
+        if strategy == "author_search":
+            iter_kwargs["from_user"] = target_user_id
+
+        fetched: list[ExtractedMessage] = []
+        result["attempted"] = 1
+        try:
+            async for msg in self._client.iter_messages(dialog_id, **iter_kwargs):
+                if time.monotonic() >= deadline_at:
+                    break
+                fetched.append(extract_message_row(dialog_id, msg, entity_name_map={}))
+        except FloodWaitError as exc:
+            seconds = int(getattr(exc, "seconds", 0))
+            _upsert_trace_coverage_fragment(
+                self._conn,
+                target_user_id=target_user_id,
+                dialog_id=dialog_id,
+                topic_id=topic_id,
+                status="flood_wait",
+                last_error=f"FloodWaitError:{seconds}",
+                next_retry_at=now + seconds,
+                now=now,
+            )
+            result["status"] = "flood_wait"
+            return result
+        except _ACCESS_LOST_ERRORS as exc:
+            _upsert_trace_coverage_fragment(
+                self._conn,
+                target_user_id=target_user_id,
+                dialog_id=dialog_id,
+                topic_id=topic_id,
+                status="access_lost",
+                last_error=type(exc).__name__,
+                now=now,
+            )
+            result["status"] = "access_lost"
+            return result
+        except RPCError as exc:
+            _upsert_trace_coverage_fragment(
+                self._conn,
+                target_user_id=target_user_id,
+                dialog_id=dialog_id,
+                topic_id=topic_id,
+                status="partial",
+                last_error=type(exc).__name__,
+                now=now,
+            )
+            result["status"] = "partial"
+            return result
+        except Exception as exc:
+            _upsert_trace_coverage_fragment(
+                self._conn,
+                target_user_id=target_user_id,
+                dialog_id=dialog_id,
+                topic_id=topic_id,
+                status="partial",
+                last_error=type(exc).__name__,
+                now=now,
+            )
+            result["status"] = "partial"
+            return result
+
+        result["messages_seen"] = len(fetched)
+        unique: dict[tuple[int, int], ExtractedMessage] = {}
+        for extracted in fetched:
+            key = (extracted.message.dialog_id, extracted.message.message_id)
+            unique[key] = extracted
+        result["duplicates_skipped"] += len(fetched) - len(unique)
+
+        changed: list[ExtractedMessage] = []
+        for key, extracted in unique.items():
+            existing = _trace_existing_message_bundle(
+                self._conn,
+                dialog_id=key[0],
+                message_id=key[1],
+            )
+            if _messages_row_equal(existing, extracted):
+                result["duplicates_skipped"] += 1
+            else:
+                changed.append(extracted)
+
+        if changed:
+            with self._conn:
+                insert_messages_with_fts(self._conn, changed)
+            result["messages_persisted"] = len(changed)
+
+        status = "partial" if len(fetched) >= max_per_dialog else "complete"
+        if time.monotonic() >= deadline_at:
+            status = "budget_exceeded"
+        _upsert_trace_coverage_fragment(
+            self._conn,
+            target_user_id=target_user_id,
+            dialog_id=dialog_id,
+            topic_id=topic_id,
+            status=status,
+            fetched_at=now,
+            last_error=f"BudgetExceeded:{deadline_ms}" if status == "budget_exceeded" else None,
+            now=now,
+        )
+        result["status"] = status
+        return result
+
+    async def _trace_enrich_visible_dialogs(
+        self,
+        target_user_id: int,
+        candidate_dialogs: list[dict],
+        *,
+        max_per_dialog: int = _TRACE_ENRICHMENT_MAX_PER_DIALOG,
+        max_dialogs: int = _TRACE_ENRICHMENT_MAX_DIALOGS,
+        deadline_ms: int = _TRACE_ENRICHMENT_DEADLINE_MS,
+        concurrency: int = _TRACE_ENRICHMENT_CONCURRENCY,
+    ) -> dict:
+        """Bounded best-effort visible Account Trace enrichment."""
+        result = _trace_enrichment_result(
+            deadline_ms=deadline_ms,
+            concurrency=concurrency,
+            max_dialogs=max_dialogs,
+            max_per_dialog=max_per_dialog,
+        )
+        now = int(time.time())
+        selected = candidate_dialogs[:max_dialogs]
+        overflow = candidate_dialogs[max_dialogs:]
+        for candidate in overflow:
+            _upsert_trace_coverage_fragment(
+                self._conn,
+                target_user_id=target_user_id,
+                dialog_id=int(candidate["dialog_id"]),
+                topic_id=candidate.get("topic_id"),
+                status="budget_exceeded",
+                last_error=f"BudgetExceeded:{deadline_ms}",
+                now=now,
+            )
+            result["dialogs_skipped"] += 1
+            _trace_increment_status(result, "budget_exceeded")
+
+        if not selected:
+            self._conn.commit()
+            return result
+
+        if deadline_ms <= 0:
+            for candidate in selected:
+                _upsert_trace_coverage_fragment(
+                    self._conn,
+                    target_user_id=target_user_id,
+                    dialog_id=int(candidate["dialog_id"]),
+                    topic_id=candidate.get("topic_id"),
+                    status="budget_exceeded",
+                    last_error=f"BudgetExceeded:{deadline_ms}",
+                    now=now,
+                )
+                result["dialogs_skipped"] += 1
+                _trace_increment_status(result, "budget_exceeded")
+            self._conn.commit()
+            return result
+
+        deadline_at = time.monotonic() + (deadline_ms / 1000)
+        semaphore = asyncio.Semaphore(max(1, concurrency))
+
+        async def run_candidate(candidate: dict) -> dict:
+            async with semaphore:
+                return await self._trace_enrich_one_candidate(
+                    target_user_id=target_user_id,
+                    candidate=candidate,
+                    max_per_dialog=max_per_dialog,
+                    deadline_ms=deadline_ms,
+                    deadline_at=deadline_at,
+                )
+
+        for item in await asyncio.gather(*(run_candidate(candidate) for candidate in selected)):
+            result["dialogs_attempted"] += int(item["attempted"])
+            result["dialogs_skipped"] += int(item["skipped"])
+            result["messages_seen"] += int(item["messages_seen"])
+            result["messages_persisted"] += int(item["messages_persisted"])
+            result["duplicates_skipped"] += int(item["duplicates_skipped"])
+            _trace_increment_status(result, str(item["status"]))
+        self._conn.commit()
+        return result
+
     async def _trace_account_messages(self, req: dict) -> dict:
         """Return observable authored-message evidence for one account reference."""
         group_by = req.get("group_by", "timeline")
@@ -2729,24 +3272,39 @@ class DaemonAPIServer:
             sent_before_ts=sent_before_ts,
             navigation=navigation_payload,
         )
-        rows = self._conn.execute(sql, params).fetchall()
-        selected_rows = rows[:limit]
-        evidence = [self._trace_row_to_evidence(row) for row in selected_rows]
 
-        next_navigation: str | None = None
-        if len(rows) > limit and selected_rows:
-            last = selected_rows[-1]
-            next_navigation = encode_account_trace_navigation(
-                target_user_id=target_user_id,
-                sent_at=int(last["sent_at"]),
-                dialog_id=int(last["dialog_id"]),
-                message_id=int(last["message_id"]),
-                group_by=group_by,
+        def run_trace_query() -> tuple[list[sqlite3.Row], list[sqlite3.Row], list[dict], str | None]:
+            rows = self._conn.execute(sql, params).fetchall()
+            selected_rows = rows[:limit]
+            evidence = [self._trace_row_to_evidence(row) for row in selected_rows]
+            next_navigation: str | None = None
+            if len(rows) > limit and selected_rows:
+                last = selected_rows[-1]
+                next_navigation = encode_account_trace_navigation(
+                    target_user_id=target_user_id,
+                    sent_at=int(last["sent_at"]),
+                    dialog_id=int(last["dialog_id"]),
+                    message_id=int(last["message_id"]),
+                    group_by=group_by,
+                    exact_dialog_id=exact_dialog_id,
+                    exact_topic_id=exact_topic_id,
+                    sent_after=sent_after,
+                    sent_before=sent_before,
+                )
+            return rows, selected_rows, evidence, next_navigation
+
+        _, selected_rows, evidence, next_navigation = run_trace_query()
+        enrichment: dict | None = None
+        if coverage_goal == "best_effort_visible":
+            candidates = _trace_candidate_dialogs(
+                self._conn,
+                target_user_id,
+                selected_rows,
                 exact_dialog_id=exact_dialog_id,
                 exact_topic_id=exact_topic_id,
-                sent_after=sent_after,
-                sent_before=sent_before,
             )
+            enrichment = await self._trace_enrich_visible_dialogs(target_user_id, candidates)
+            _, selected_rows, evidence, next_navigation = run_trace_query()
 
         basis_counts: dict[str, int] = {}
         for item in evidence:
@@ -2781,10 +3339,12 @@ class DaemonAPIServer:
                 "authorship_basis_counts": basis_counts,
                 "dialogs_considered_basis": coverage["dialogs_considered_basis"],
                 "post_author_aliases_considered": post_author_aliases,
-                "local_cache_writes": 0,
+                "local_cache_writes": enrichment["messages_persisted"] if enrichment else 0,
             },
             "next_navigation": next_navigation,
         }
+        if enrichment is not None:
+            data["provenance"]["enrichment"] = enrichment
         return {"ok": True, "data": data}
 
     async def _list_messages_context_window(
