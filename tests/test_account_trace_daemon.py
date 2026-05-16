@@ -21,6 +21,9 @@ from account_trace_fixtures import (
 from mcp_telegram.daemon_api import (
     DaemonAPIServer,
     _build_trace_account_messages_query,
+    _build_trace_coverage,
+    _get_trace_coverage_fragments,
+    _upsert_trace_coverage_fragment,
 )
 from mcp_telegram.models import (
     TraceCoverageGap,
@@ -33,6 +36,7 @@ from mcp_telegram.pagination import (
     decode_account_trace_navigation,
     encode_account_trace_navigation,
 )
+from mcp_telegram.tools import TOOL_REGISTRY
 
 
 @pytest.fixture()
@@ -204,6 +208,94 @@ def test_trace_fragment_fixture_uses_dialog_level_topic_sentinel(tmp_path) -> No
         conn.close()
 
 
+def test_trace_coverage_counts_access_lost_as_gap(trace_server) -> None:
+    _server, conn, _client = trace_server
+    seed_synced_dialog(conn, dialog_id=-100123, status="access_lost")
+    conn.commit()
+
+    coverage = _build_trace_coverage(conn, 101, [])
+
+    assert coverage["state"] == "partial"
+    assert coverage["dialogs_considered"] == 1
+    assert coverage["dialogs_considered_basis"] == "evidence_or_fragments_or_access_lost"
+    assert coverage["dialogs_with_gaps"] == 1
+
+
+def test_trace_coverage_marks_fragment_and_own_only_partial(trace_server) -> None:
+    _server, conn, _client = trace_server
+    seed_synced_dialog(conn, dialog_id=-100123, status="fragment")
+    seed_synced_dialog(conn, dialog_id=-100124, status="own_only")
+    conn.commit()
+
+    fragment_coverage = _build_trace_coverage(conn, 101, [], exact_dialog_id=-100123)
+    own_only_coverage = _build_trace_coverage(conn, 101, [], exact_dialog_id=-100124)
+
+    assert fragment_coverage["state"] == "partial"
+    assert fragment_coverage["dialogs_considered"] == 1
+    assert own_only_coverage["state"] == "partial"
+    assert own_only_coverage["dialogs_considered"] == 1
+
+
+def test_trace_coverage_exact_dialog_scope_counts_only_that_dialog(trace_server) -> None:
+    _server, conn, _client = trace_server
+    seed_synced_dialog(conn, dialog_id=-100123, status="synced")
+    seed_synced_dialog(conn, dialog_id=-100124, status="synced")
+    conn.commit()
+
+    coverage = _build_trace_coverage(conn, 101, [], exact_dialog_id=-100123)
+
+    assert coverage["state"] == "complete"
+    assert coverage["dialogs_considered"] == 1
+    assert coverage["dialogs_considered_basis"] == "exact_dialog_scope"
+
+
+def test_trace_coverage_unscoped_zero_hit_does_not_count_every_synced_dialog(trace_server) -> None:
+    _server, conn, _client = trace_server
+    seed_synced_dialog(conn, dialog_id=-100123, status="synced")
+    seed_synced_dialog(conn, dialog_id=-100124, status="synced")
+    conn.commit()
+
+    coverage = _build_trace_coverage(conn, 101, [])
+
+    assert coverage["state"] == "unknown"
+    assert coverage["dialogs_considered"] == 0
+    assert coverage["dialogs_considered_basis"] == "none"
+
+
+def test_trace_fragment_helpers_preserve_created_at_and_store_retry(trace_server) -> None:
+    _server, conn, _client = trace_server
+
+    _upsert_trace_coverage_fragment(
+        conn,
+        target_user_id=101,
+        dialog_id=-100123,
+        status="flood_wait",
+        next_retry_at=1_700_000_120,
+        last_error="FloodWaitError:120",
+        now=1_700_000_000,
+    )
+    _upsert_trace_coverage_fragment(
+        conn,
+        target_user_id=101,
+        dialog_id=-100123,
+        status="complete",
+        now=1_700_000_060,
+    )
+    conn.commit()
+
+    fragments = _get_trace_coverage_fragments(conn, target_user_id=101)
+
+    assert len(fragments) == 1
+    assert fragments[0]["topic_id"] == 0
+    assert fragments[0]["status"] == "complete"
+    assert fragments[0]["created_at"] == 1_700_000_000
+    assert fragments[0]["updated_at"] == 1_700_000_060
+
+
+def test_mark_dialog_for_sync_tool_exists_for_trace_gap_action() -> None:
+    assert "mark_dialog_for_sync" in TOOL_REGISTRY
+
+
 @pytest.mark.asyncio
 async def test_resolve_trace_exact_account_id_from_entities(trace_server) -> None:
     server, conn, _client = trace_server
@@ -295,6 +387,33 @@ async def test_resolve_trace_fuzzy_ambiguous_returns_candidate_ids(trace_server)
     assert set(result["candidate_ids"]) == {123, 124}
 
 
+@pytest.mark.asyncio
+async def test_trace_unresolved_account_returns_structured_gap(trace_server) -> None:
+    server, _conn, _client = trace_server
+
+    result = await server._trace_account_messages({"account": "123"})
+
+    assert result["ok"] is True
+    assert result["data"]["gaps"][0]["kind"] == "account_unresolved"
+    assert result["data"]["provenance"]["query_basis"] == "effective_sender_id_or_post_author_signature"
+
+
+@pytest.mark.asyncio
+async def test_trace_ambiguous_account_gap_has_candidate_ids(trace_server) -> None:
+    server, conn, _client = trace_server
+    now = int(time.time())
+    seed_entity(conn, entity_id=123, name="Alex One", username="alex1", updated_at=now)
+    seed_entity(conn, entity_id=124, name="Alex Two", username="alex2", updated_at=now)
+    conn.commit()
+
+    result = await server._trace_account_messages({"account": "Alex"})
+
+    gap = result["data"]["gaps"][0]
+    assert gap["kind"] == "account_ambiguous"
+    assert gap["next_action"]["argument"] == "exact_account_id"
+    assert set(gap["next_action"]["candidate_ids"]) == {123, 124}
+
+
 def test_trace_query_uses_effective_sender_topic_and_signature_params() -> None:
     sql, params = _build_trace_account_messages_query(
         target_user_id=101,
@@ -381,6 +500,72 @@ async def test_trace_includes_channel_signature_without_numeric_identity_claim(t
     assert evidence[0]["authorship_basis"] == "post_author_signature"
     assert evidence[0]["effective_sender_id"] == -100123
     assert evidence[0]["author_signature"] == "Alice Example"
+    assert any(gap["kind"] == "channel_signature_ambiguous" for gap in result["data"]["gaps"])
+
+
+@pytest.mark.asyncio
+async def test_trace_access_lost_dialog_gap_has_no_sync_action(trace_server) -> None:
+    server, conn, _client = trace_server
+    seed_entity(conn, entity_id=101, name="Me", username="me")
+    seed_synced_dialog(conn, dialog_id=-100123, status="access_lost")
+    conn.commit()
+
+    result = await server._trace_account_messages(
+        {"exact_account_id": 101, "exact_dialog_id": -100123}
+    )
+
+    gaps = result["data"]["gaps"]
+    access_lost = next(gap for gap in gaps if gap["kind"] == "access_lost")
+    assert access_lost["severity"] == "warning"
+    assert "action" not in access_lost
+
+
+@pytest.mark.asyncio
+async def test_trace_not_synced_dialog_gap_includes_sync_action(trace_server) -> None:
+    server, conn, _client = trace_server
+    seed_entity(conn, entity_id=101, name="Me", username="me")
+    conn.commit()
+
+    result = await server._trace_account_messages({"exact_account_id": 101, "exact_dialog_id": -100123})
+
+    gap = next(item for item in result["data"]["gaps"] if item["kind"] == "dialog_not_synced")
+    assert gap["severity"] == "action_required"
+    assert gap["action"]["tool"] == "mark_dialog_for_sync"
+    assert gap["action"]["arguments"] == {"dialog_id": -100123}
+
+
+@pytest.mark.asyncio
+async def test_trace_zero_hit_resolved_account_returns_observed_zero_gap(trace_server) -> None:
+    server, conn, _client = trace_server
+    seed_entity(conn, entity_id=101, name="Me", username="me")
+    conn.commit()
+
+    result = await server._trace_account_messages({"exact_account_id": 101})
+
+    assert result["ok"] is True
+    assert result["data"]["coverage"]["state"] == "unknown"
+    assert result["data"]["coverage"]["observed_message_count"] == 0
+    assert result["data"]["gaps"][0]["kind"] == "observed_zero"
+    assert result["data"]["gaps"][0]["severity"] == "info"
+
+
+@pytest.mark.asyncio
+async def test_trace_provenance_includes_basis_counts_and_coverage_bounds(trace_server) -> None:
+    server, conn, _client = trace_server
+    seed_entity(conn, entity_id=101, name="Me", username="me")
+    seed_dialog(conn, dialog_id=222, name="Alice", dialog_type="User")
+    seed_synced_dialog(conn, dialog_id=222)
+    seed_message(conn, dialog_id=222, message_id=1, sent_at=1, sender_id=101)
+    conn.commit()
+
+    result = await server._trace_account_messages({"exact_account_id": 101, "exact_dialog_id": 222})
+
+    provenance = result["data"]["provenance"]
+    assert provenance["query_basis"] == "effective_sender_id_or_post_author_signature"
+    assert provenance["authorship_basis_counts"] == {"effective_sender_id": 1}
+    assert provenance["dialogs_considered_basis"] == "exact_dialog_scope"
+    assert provenance["local_cache_writes"] == 0
+    assert provenance["coverage_bounds"]["exact_dialog_id"] == 222
 
 
 @pytest.mark.asyncio

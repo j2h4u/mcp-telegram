@@ -706,6 +706,365 @@ def _parse_trace_time_bound(value: object) -> int | None:
     return int(parsed.timestamp())
 
 
+_TRACE_FRAGMENT_STATUSES = {
+    "pending",
+    "partial",
+    "complete",
+    "flood_wait",
+    "access_lost",
+    "unsupported",
+    "budget_exceeded",
+}
+_TRACE_PARTIAL_SYNC_STATUSES = {"fragment", "own_only", "syncing", "access_lost"}
+_TRACE_PARTIAL_FRAGMENT_STATUSES = {
+    "pending",
+    "partial",
+    "flood_wait",
+    "access_lost",
+    "unsupported",
+    "budget_exceeded",
+}
+_TRACE_GAP_SEVERITIES = {"info", "warning", "action_required"}
+
+
+def _row_value(row: sqlite3.Row | dict, key: str) -> object:
+    if isinstance(row, dict):
+        return row.get(key)
+    return row[key]
+
+
+def _dialog_status_map(conn: sqlite3.Connection, dialog_ids: set[int]) -> dict[int, str | None]:
+    if not dialog_ids:
+        return {}
+    placeholders = ",".join("?" * len(dialog_ids))
+    rows = conn.execute(
+        f"SELECT dialog_id, status FROM synced_dialogs WHERE dialog_id IN ({placeholders})",
+        tuple(dialog_ids),
+    ).fetchall()
+    result = {int(row[0]): str(row[1]) for row in rows}
+    for dialog_id in dialog_ids:
+        result.setdefault(dialog_id, None)
+    return result
+
+
+def _get_trace_coverage_fragments(
+    conn: sqlite3.Connection,
+    *,
+    target_user_id: int,
+    exact_dialog_id: int | None = None,
+    exact_topic_id: int | None = None,
+    coverage_kind: str = "authored_message",
+) -> list[dict]:
+    """Read target-specific Account Trace coverage fragment rows."""
+    sql = (
+        "SELECT target_user_id, dialog_id, topic_id, coverage_kind, status, "
+        "fetched_at, checkpoint, last_error, next_retry_at, created_at, updated_at "
+        "FROM trace_coverage_fragments "
+        "WHERE target_user_id = :target_user_id AND coverage_kind = :coverage_kind"
+    )
+    params: dict[str, object] = {
+        "target_user_id": target_user_id,
+        "coverage_kind": coverage_kind,
+    }
+    if exact_dialog_id is not None:
+        sql += " AND dialog_id = :exact_dialog_id"
+        params["exact_dialog_id"] = exact_dialog_id
+    if exact_topic_id is not None:
+        sql += " AND topic_id = :exact_topic_id"
+        params["exact_topic_id"] = exact_topic_id
+    rows = conn.execute(sql, params).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _sanitize_trace_last_error(last_error: str | None) -> str | None:
+    if last_error is None:
+        return None
+    compact = " ".join(last_error.split())
+    return compact[:120]
+
+
+def _upsert_trace_coverage_fragment(
+    conn: sqlite3.Connection,
+    *,
+    target_user_id: int,
+    dialog_id: int,
+    status: str,
+    topic_id: int | None = None,
+    coverage_kind: str = "authored_message",
+    fetched_at: int | None = None,
+    checkpoint: str | None = None,
+    last_error: str | None = None,
+    next_retry_at: int | None = None,
+    now: int | None = None,
+) -> None:
+    """Insert/update one target-specific coverage fragment."""
+    if status not in _TRACE_FRAGMENT_STATUSES:
+        raise ValueError(f"invalid trace coverage status: {status}")
+    timestamp = now if now is not None else int(time.time())
+    conn.execute(
+        """
+        INSERT INTO trace_coverage_fragments
+            (target_user_id, dialog_id, topic_id, coverage_kind, status,
+             fetched_at, checkpoint, last_error, next_retry_at, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(target_user_id, dialog_id, topic_id, coverage_kind)
+        DO UPDATE SET
+            status = excluded.status,
+            fetched_at = excluded.fetched_at,
+            checkpoint = excluded.checkpoint,
+            last_error = excluded.last_error,
+            next_retry_at = excluded.next_retry_at,
+            updated_at = excluded.updated_at
+        """,
+        (
+            target_user_id,
+            dialog_id,
+            0 if topic_id is None else topic_id,
+            coverage_kind,
+            status,
+            fetched_at,
+            checkpoint,
+            _sanitize_trace_last_error(last_error),
+            next_retry_at,
+            timestamp,
+            timestamp,
+        ),
+    )
+
+
+def _build_trace_coverage(
+    conn: sqlite3.Connection,
+    target_user_id: int,
+    rows: list[sqlite3.Row] | list[dict],
+    *,
+    exact_dialog_id: int | None = None,
+    exact_topic_id: int | None = None,
+) -> dict:
+    """Build bounded Account Trace coverage semantics for the current response."""
+    observed_dialogs = {int(_row_value(row, "dialog_id")) for row in rows}
+    fragments = _get_trace_coverage_fragments(
+        conn,
+        target_user_id=target_user_id,
+        exact_dialog_id=exact_dialog_id,
+        exact_topic_id=exact_topic_id,
+    )
+    fragment_dialogs = {int(fragment["dialog_id"]) for fragment in fragments}
+
+    if exact_dialog_id is not None:
+        considered_dialogs = {exact_dialog_id}
+        basis = "exact_dialog_scope"
+    else:
+        access_lost_dialogs = {
+            int(row[0])
+            for row in conn.execute(
+                "SELECT dialog_id FROM synced_dialogs WHERE status = 'access_lost'"
+            ).fetchall()
+        }
+        considered_dialogs = observed_dialogs | fragment_dialogs | access_lost_dialogs
+        basis = "evidence_or_fragments_or_access_lost" if considered_dialogs else "none"
+
+    status_by_dialog = _dialog_status_map(conn, considered_dialogs)
+    gap_dialogs: set[int] = set()
+    for dialog_id, status in status_by_dialog.items():
+        if status is None or status in _TRACE_PARTIAL_SYNC_STATUSES:
+            gap_dialogs.add(dialog_id)
+    for fragment in fragments:
+        if str(fragment["status"]) in _TRACE_PARTIAL_FRAGMENT_STATUSES:
+            gap_dialogs.add(int(fragment["dialog_id"]))
+
+    if not considered_dialogs:
+        state = "unknown"
+    elif gap_dialogs:
+        state = "partial"
+    else:
+        state = "complete"
+
+    return {
+        "state": state,
+        "observed_message_count": len(rows),
+        "dialogs_considered": len(considered_dialogs),
+        "dialogs_considered_basis": basis,
+        "dialogs_with_hits": len(observed_dialogs),
+        "dialogs_with_gaps": len(gap_dialogs),
+        "as_of": int(time.time()),
+    }
+
+
+def _trace_gap(
+    kind: str,
+    severity: str,
+    detail: str,
+    *,
+    dialog_id: int | None = None,
+    topic_id: int | None = None,
+    action: dict | None = None,
+    next_action: dict | None = None,
+    extra: dict | None = None,
+) -> dict:
+    if severity not in _TRACE_GAP_SEVERITIES:
+        raise ValueError(f"invalid trace gap severity: {severity}")
+    gap: dict[str, object] = {"kind": kind, "severity": severity, "detail": detail}
+    if dialog_id is not None:
+        gap["dialog_id"] = dialog_id
+    if topic_id is not None:
+        gap["topic_id"] = topic_id
+    if action is not None:
+        gap["action"] = action
+    if next_action is not None:
+        gap["next_action"] = next_action
+    if extra:
+        gap.update(extra)
+    return gap
+
+
+def _build_trace_gaps(
+    conn: sqlite3.Connection,
+    *,
+    target_user_id: int,
+    evidence: list[dict],
+    coverage: dict,
+    exact_dialog_id: int | None = None,
+    exact_topic_id: int | None = None,
+) -> list[dict]:
+    """Build controlled Account Trace coverage gaps and actions."""
+    gaps: list[dict] = []
+    fragment_rows = _get_trace_coverage_fragments(
+        conn,
+        target_user_id=target_user_id,
+        exact_dialog_id=exact_dialog_id,
+        exact_topic_id=exact_topic_id,
+    )
+
+    considered_dialogs = {int(item["dialog_id"]) for item in evidence}
+    considered_dialogs.update(int(row["dialog_id"]) for row in fragment_rows)
+    if exact_dialog_id is not None:
+        considered_dialogs.add(exact_dialog_id)
+    elif coverage.get("dialogs_considered", 0):
+        considered_dialogs.update(
+            int(row[0])
+            for row in conn.execute(
+                "SELECT dialog_id FROM synced_dialogs WHERE status = 'access_lost'"
+            ).fetchall()
+        )
+
+    status_by_dialog = _dialog_status_map(conn, considered_dialogs)
+    for dialog_id in sorted(considered_dialogs):
+        status = status_by_dialog.get(dialog_id)
+        if status is None or status == "not_synced":
+            gaps.append(
+                _trace_gap(
+                    "dialog_not_synced",
+                    "action_required",
+                    "This dialog has not been synced for Account Trace evidence.",
+                    dialog_id=dialog_id,
+                    topic_id=exact_topic_id if dialog_id == exact_dialog_id else None,
+                    action={
+                        "tool": "mark_dialog_for_sync",
+                        "arguments": {"dialog_id": dialog_id},
+                    },
+                )
+            )
+        elif status == "access_lost":
+            gaps.append(
+                _trace_gap(
+                    "access_lost",
+                    "warning",
+                    "The local archive has no current access to this dialog.",
+                    dialog_id=dialog_id,
+                    topic_id=exact_topic_id if dialog_id == exact_dialog_id else None,
+                )
+            )
+        elif status in {"fragment", "own_only"}:
+            gaps.append(
+                _trace_gap(
+                    "fragment_only",
+                    "warning",
+                    f"Dialog coverage is {status}; Account Trace may be incomplete.",
+                    dialog_id=dialog_id,
+                    topic_id=exact_topic_id if dialog_id == exact_dialog_id else None,
+                )
+            )
+        elif status == "syncing":
+            gaps.append(
+                _trace_gap(
+                    "history_incomplete",
+                    "warning",
+                    "Dialog sync is still in progress.",
+                    dialog_id=dialog_id,
+                    topic_id=exact_topic_id if dialog_id == exact_dialog_id else None,
+                )
+            )
+
+    hidden_rows = conn.execute("SELECT dialog_id FROM dialogs WHERE hidden = 1").fetchall()
+    hidden_dialogs = {int(row[0]) for row in hidden_rows}
+    for dialog_id in sorted(considered_dialogs & hidden_dialogs):
+        gaps.append(
+            _trace_gap(
+                "hidden_dialog",
+                "warning",
+                "Dialog is hidden in the local mirror.",
+                dialog_id=dialog_id,
+            )
+        )
+
+    for fragment in fragment_rows:
+        dialog_id = int(fragment["dialog_id"])
+        topic_id = int(fragment["topic_id"])
+        topic_value = None if topic_id == 0 else topic_id
+        status = str(fragment["status"])
+        if status == "flood_wait":
+            gaps.append(
+                _trace_gap(
+                    "flood_wait",
+                    "warning",
+                    "Targeted trace enrichment is waiting for Telegram rate-limit cooldown.",
+                    dialog_id=dialog_id,
+                    topic_id=topic_value,
+                    extra={"next_retry_at": fragment.get("next_retry_at")},
+                )
+            )
+        elif status == "budget_exceeded":
+            gaps.append(
+                _trace_gap(
+                    "budget_exceeded",
+                    "warning",
+                    "Bounded trace enrichment exhausted its request budget.",
+                    dialog_id=dialog_id,
+                    topic_id=topic_value,
+                )
+            )
+        elif status == "unsupported":
+            gaps.append(
+                _trace_gap(
+                    "history_incomplete",
+                    "warning",
+                    "This dialog type is not supported for targeted enrichment.",
+                    dialog_id=dialog_id,
+                    topic_id=topic_value,
+                )
+            )
+
+    if any(item.get("authorship_basis") == "post_author_signature" for item in evidence):
+        gaps.append(
+            _trace_gap(
+                "channel_signature_ambiguous",
+                "info",
+                "Channel post signatures are author text, not numeric Telegram user identity proof.",
+            )
+        )
+
+    if not evidence and not gaps:
+        gaps.append(
+            _trace_gap(
+                "observed_zero",
+                "info",
+                "No authored-message evidence was observed in the considered local coverage.",
+            )
+        )
+
+    return gaps
+
+
 # ---------------------------------------------------------------------------
 # Reaction helper
 # ---------------------------------------------------------------------------
@@ -2231,6 +2590,7 @@ class DaemonAPIServer:
                 "detail": "Multiple visible accounts match this reference.",
                 "next_action": {
                     "field": "exact_account_id",
+                    "argument": "exact_account_id",
                     "candidate_ids": resolved_account.get("candidate_ids", []),
                 },
             }
@@ -2240,7 +2600,14 @@ class DaemonAPIServer:
             "detail": "No visible account matched this reference.",
         }
 
-    def _empty_trace_result(self, resolved_account: dict, *, gaps: list[dict] | None = None) -> dict:
+    def _empty_trace_result(
+        self,
+        resolved_account: dict,
+        *,
+        gaps: list[dict] | None = None,
+        coverage_goal: str = "observed",
+        coverage_bounds: dict | None = None,
+    ) -> dict:
         """Return a structurally complete empty Account Trace payload."""
         as_of = int(time.time())
         return {
@@ -2258,10 +2625,12 @@ class DaemonAPIServer:
             "gaps": gaps or [],
             "provenance": {
                 "source": "sync_db",
-                "query_basis": "account_resolution",
-                "coverage_goal": "observed",
+                "query_basis": "effective_sender_id_or_post_author_signature",
+                "coverage_goal": coverage_goal,
+                "coverage_bounds": coverage_bounds or {},
                 "authorship_basis_counts": {},
-                "cache_writes": 0,
+                "dialogs_considered_basis": "no_resolved_account",
+                "local_cache_writes": 0,
             },
             "next_navigation": None,
         }
@@ -2306,10 +2675,25 @@ class DaemonAPIServer:
         if sent_before is not None and sent_before_ts is None:
             return {"ok": False, "error": "invalid_time_bound", "message": "sent_before is invalid"}
 
+        coverage_bounds = {
+            "limit": limit,
+            "exact_dialog_id": exact_dialog_id,
+            "exact_topic_id": exact_topic_id,
+            "sent_after": sent_after,
+            "sent_before": sent_before,
+        }
         resolved_account = await self._resolve_trace_account(req)
         if resolved_account.get("confidence") != "resolved" or resolved_account.get("account_id") is None:
             gap = self._trace_account_resolution_gap(resolved_account)
-            return {"ok": True, "data": self._empty_trace_result(resolved_account, gaps=[gap])}
+            return {
+                "ok": True,
+                "data": self._empty_trace_result(
+                    resolved_account,
+                    gaps=[gap],
+                    coverage_goal=coverage_goal,
+                    coverage_bounds=coverage_bounds,
+                ),
+            }
 
         target_user_id = int(resolved_account["account_id"])
         navigation_payload: dict[str, int] | None = None
@@ -2369,35 +2753,35 @@ class DaemonAPIServer:
             basis = str(item["authorship_basis"])
             basis_counts[basis] = basis_counts.get(basis, 0) + 1
 
-        dialog_ids = {int(item["dialog_id"]) for item in evidence}
-        as_of = int(time.time())
+        coverage = _build_trace_coverage(
+            self._conn,
+            target_user_id,
+            selected_rows,
+            exact_dialog_id=exact_dialog_id,
+            exact_topic_id=exact_topic_id,
+        )
+        gaps = _build_trace_gaps(
+            self._conn,
+            target_user_id=target_user_id,
+            evidence=evidence,
+            coverage=coverage,
+            exact_dialog_id=exact_dialog_id,
+            exact_topic_id=exact_topic_id,
+        )
         data = {
             "resolved_account": resolved_account,
             "groups": self._group_trace_evidence(evidence, group_by),
-            "coverage": {
-                "state": "complete" if evidence else "unknown",
-                "observed_message_count": len(evidence),
-                "dialogs_considered": len(dialog_ids),
-                "dialogs_considered_basis": "current_page_evidence",
-                "dialogs_with_hits": len(dialog_ids),
-                "dialogs_with_gaps": 0,
-                "as_of": as_of,
-            },
-            "gaps": [],
+            "coverage": coverage,
+            "gaps": gaps,
             "provenance": {
                 "source": "sync_db",
-                "query_basis": "canonical_messages",
+                "query_basis": "effective_sender_id_or_post_author_signature",
                 "coverage_goal": coverage_goal,
-                "coverage_bounds": {
-                    "limit": limit,
-                    "exact_dialog_id": exact_dialog_id,
-                    "exact_topic_id": exact_topic_id,
-                    "sent_after": sent_after,
-                    "sent_before": sent_before,
-                },
+                "coverage_bounds": coverage_bounds,
                 "authorship_basis_counts": basis_counts,
+                "dialogs_considered_basis": coverage["dialogs_considered_basis"],
                 "post_author_aliases_considered": post_author_aliases,
-                "cache_writes": 0,
+                "local_cache_writes": 0,
             },
             "next_navigation": next_navigation,
         }
