@@ -30,6 +30,7 @@ from mcp_telegram.tools import (
     ListTopics,
     MarkDialogForSync,
     SearchMessages,
+    SubmitFeedback,
     TraceAccountMessages,
     get_entity_info,
     get_inbox,
@@ -41,6 +42,7 @@ from mcp_telegram.tools import (
     list_topics,
     mark_dialog_for_sync,
     search_messages,
+    submit_feedback,
     trace_account_messages,
 )
 from mcp_telegram.tools._base import DaemonNotRunningError, ToolResult
@@ -176,6 +178,17 @@ STRUCTURED_TOOL_CASES = {
                 "total": 1,
             },
         },
+    ),
+    "submit_feedback": (
+        submit_feedback,
+        SubmitFeedback(
+            message="structured feedback",
+            severity="bug",
+            context="trace_account_messages",
+            model="codex",
+            harness="pytest",
+        ),
+        {"ok": True, "data": {"id": 99}},
     ),
     "get_sync_status": (
         get_sync_status,
@@ -433,6 +446,7 @@ def _make_daemon_conn(response: dict | None = None) -> MagicMock:
     conn.get_usage_stats = AsyncMock(return_value=r)
     conn.get_dialog_stats = AsyncMock(return_value=r)
     conn.trace_account_messages = AsyncMock(return_value=r)
+    conn.submit_feedback = AsyncMock(return_value=r)
     conn.upsert_entities = AsyncMock(return_value={"ok": True, "upserted": 0})
     conn.resolve_entity = AsyncMock(return_value=r)
     conn.get_my_recent_activity = AsyncMock(return_value=r)  # Phase 999.1 (B4b)
@@ -461,6 +475,7 @@ class _patch_daemon:
             "mcp_telegram.tools.stats.daemon_connection",
             "mcp_telegram.tools.activity.daemon_connection",  # Phase 999.1 (B4b)
             "mcp_telegram.tools.account_trace.daemon_connection",
+            "mcp_telegram.tools.feedback.daemon_connection",
         ]
         for target in targets:
             p = patch(target, side_effect=lambda c=self._conn: _fake_daemon_cm(c))
@@ -492,6 +507,7 @@ class _patch_daemon_not_running:
             "mcp_telegram.tools.stats.daemon_connection",
             "mcp_telegram.tools.activity.daemon_connection",  # Phase 999.1 (B4b)
             "mcp_telegram.tools.account_trace.daemon_connection",
+            "mcp_telegram.tools.feedback.daemon_connection",
         ]
         for target in targets:
             p = patch(target, return_value=_raise_not_running())
@@ -1083,8 +1099,8 @@ def _trace_evidence_group() -> dict:
                 "effective_sender_id": 101,
                 "authorship_basis": "effective_sender_id",
                 "author_signature": None,
-                "text": "second trace hit",
-                "media_description": None,
+                "text": None,
+                "media_description": "photo attachment",
             },
         ],
     }
@@ -1107,6 +1123,25 @@ async def test_trace_account_messages_routes_flat_arguments_and_counts_evidence_
     assert result.is_error is False
     assert result.structured_content is not None
     assert result.structured_content["coverage"]["state"] == "complete"
+    evidence = result.structured_content["groups"][0]["evidence"]
+    assert evidence[0]["content"] == {
+        "text": "first trace hit",
+        "is_telegram_content": True,
+        "content_kind": "message_text",
+    }
+    assert evidence[0]["untrusted_content"] is True
+    assert evidence[1]["media_content"] == {
+        "text": "photo attachment",
+        "is_telegram_content": True,
+        "content_kind": "media_description",
+    }
+    assert result.structured_content["text_preview"] == {
+        "shown_count": 2,
+        "hidden_count": 0,
+        "gap_summary": [],
+    }
+    assert result.structured_content["limits"]["requested_limit"] == 50
+    assert result.structured_content["navigation"]["has_more"] is False
     assert result.result_count == 2
     assert result.content[0].text
     assert "[Telegram content] first trace hit [/Telegram content]" in result.content[0].text
@@ -1137,6 +1172,7 @@ async def test_trace_account_messages_unresolved_is_structured_non_error() -> No
     assert result.is_error is False
     assert result.structured_content is not None
     assert result.structured_content["gaps"][0]["kind"] == "account_unresolved"
+    assert result.structured_content["warnings"][0]["kind"] == "account_unresolved"
 
 
 async def test_trace_account_messages_ambiguous_is_structured_non_error() -> None:

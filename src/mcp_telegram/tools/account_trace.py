@@ -16,6 +16,7 @@ from ._base import (
     error_result,
     mcp_tool,
 )
+from .structured import navigation_metadata, structured_warning, telegram_content
 
 TRACE_ACCOUNT_MESSAGES_OUTPUT_SCHEMA = {
     "type": "object",
@@ -72,6 +73,9 @@ TRACE_ACCOUNT_MESSAGES_OUTPUT_SCHEMA = {
                                 "author_signature": {"type": ["string", "null"]},
                                 "text": {"type": ["string", "null"]},
                                 "media_description": {"type": ["string", "null"]},
+                                "content": {"type": "object", "additionalProperties": True},
+                                "media_content": {"type": "object", "additionalProperties": True},
+                                "untrusted_content": {"type": "boolean"},
                             },
                             "required": [
                                 "source",
@@ -153,10 +157,26 @@ TRACE_ACCOUNT_MESSAGES_OUTPUT_SCHEMA = {
             "additionalProperties": True,
         },
         "next_navigation": {"type": ["string", "null"]},
+        "navigation": {"type": "object", "additionalProperties": True},
+        "text_preview": {"type": "object", "additionalProperties": True},
+        "warnings": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
+        "limits": {"type": "object", "additionalProperties": True},
         "result_count_semantics": {"type": "string"},
         "is_error_conditions": {"type": "string"},
     },
-    "required": ["resolved_account", "groups", "coverage", "gaps", "provenance", "next_navigation"],
+    "required": [
+        "resolved_account",
+        "groups",
+        "coverage",
+        "gaps",
+        "provenance",
+        "next_navigation",
+        "navigation",
+        "text_preview",
+        "warnings",
+        "limits",
+        "result_count_semantics",
+    ],
     "additionalProperties": True,
 }
 
@@ -238,6 +258,87 @@ def _trace_evidence_count(data: dict) -> int:
             if isinstance(evidence, list):
                 count += len(evidence)
     return count
+
+
+def _trace_preview(data: dict, *, evidence_count: int) -> dict[str, object]:
+    gaps = data.get("gaps", [])
+    gap_summary = []
+    if isinstance(gaps, list):
+        for gap in gaps[:5]:
+            if isinstance(gap, dict):
+                gap_summary.append({"kind": gap.get("kind"), "severity": gap.get("severity")})
+    shown_count = min(evidence_count, 5)
+    return {
+        "shown_count": shown_count,
+        "hidden_count": max(evidence_count - shown_count, 0),
+        "gap_summary": gap_summary,
+    }
+
+
+def _trace_warnings(data: dict) -> list[dict[str, object]]:
+    warnings: list[dict[str, object]] = []
+    gaps = data.get("gaps", [])
+    if not isinstance(gaps, list):
+        return warnings
+    for gap in gaps:
+        if not isinstance(gap, dict):
+            continue
+        severity = gap.get("severity")
+        if severity in {"warning", "action_required"}:
+            warnings.append(
+                structured_warning(
+                    str(gap.get("kind") or "coverage_gap"),
+                    str(gap.get("detail") or "Account Trace reported a coverage gap."),
+                    severity=severity,
+                )
+            )
+    return warnings
+
+
+def _trace_limits(data: dict, args: "TraceAccountMessages", *, evidence_count: int) -> dict[str, object]:
+    provenance = data.get("provenance") if isinstance(data.get("provenance"), dict) else {}
+    coverage_bounds = provenance.get("coverage_bounds") if isinstance(provenance, dict) else {}
+    return {
+        "requested_limit": args.limit,
+        "returned_evidence_count": evidence_count,
+        "coverage_bounds": coverage_bounds or {},
+    }
+
+
+def _attach_trace_content_metadata(data: dict) -> None:
+    for group in data.get("groups", []):
+        if not isinstance(group, dict):
+            continue
+        evidence_items = group.get("evidence", [])
+        if not isinstance(evidence_items, list):
+            continue
+        for item in evidence_items:
+            if not isinstance(item, dict):
+                continue
+            text = item.get("text")
+            if text:
+                item.setdefault("content", telegram_content(str(text), "message_text"))
+                item.setdefault("untrusted_content", True)
+            media_description = item.get("media_description")
+            if media_description:
+                item.setdefault("media_content", telegram_content(str(media_description), "media_description"))
+                item.setdefault("untrusted_content", True)
+
+
+def _trace_structured_content(data: dict, args: "TraceAccountMessages") -> dict[str, object]:
+    _attach_trace_content_metadata(data)
+    evidence_count = _trace_evidence_count(data)
+    next_navigation = data.get("next_navigation")
+    data.setdefault("result_count_semantics", "current_page_evidence_items")
+    data.setdefault(
+        "is_error_conditions",
+        "Only tool validation, daemon-unavailable, and daemon protocol failures set is_error=true.",
+    )
+    data.setdefault("text_preview", _trace_preview(data, evidence_count=evidence_count))
+    data.setdefault("warnings", _trace_warnings(data))
+    data.setdefault("limits", _trace_limits(data, args, evidence_count=evidence_count))
+    data.setdefault("navigation", navigation_metadata(next_navigation if isinstance(next_navigation, str) else None))
+    return data
 
 
 def _trace_text_summary(data: dict) -> str:
@@ -331,12 +432,7 @@ async def trace_account_messages(args: TraceAccountMessages) -> ToolResult:
             has_cursor=args.navigation is not None,
         )
 
-    data = dict(response.get("data", {}))
-    data.setdefault("result_count_semantics", "current_page_evidence_items")
-    data.setdefault(
-        "is_error_conditions",
-        "Only tool validation, daemon-unavailable, and daemon protocol failures set is_error=true.",
-    )
+    data = _trace_structured_content(dict(response.get("data", {})), args)
     evidence_count = _trace_evidence_count(data)
     next_navigation = data.get("next_navigation")
     return ToolResult(

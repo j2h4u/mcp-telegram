@@ -53,6 +53,10 @@ async def test_submit_feedback_tool_happy_path(mock_daemon_connection) -> None:
     assert len(result.content) == 1
     assert result.content[0].text == "Feedback recorded. Thank you!"
     assert "id=" not in result.content[0].text
+    assert result.structured_content is not None
+    assert result.structured_content["accepted"] is True
+    assert result.structured_content["follow_up_available"] is False
+    assert result.structured_content["tracking_id"] is None
 
 
 @pytest.mark.asyncio
@@ -72,6 +76,9 @@ async def test_submit_feedback_tool_does_not_expose_feedback_id() -> None:
 
     assert result.content[0].text == "Feedback recorded. Thank you!"
     assert "id=" not in result.content[0].text
+    assert result.structured_content is not None
+    assert "id" not in result.structured_content
+    assert result.structured_content["tracking_id"] is None
 
 
 @pytest.mark.asyncio
@@ -84,7 +91,7 @@ async def test_submit_feedback_tool_passes_all_fields(mock_daemon_connection) ->
         model="claude-opus-4-7",
         harness="Claude Desktop",
     )
-    await submit_feedback(args)
+    result = await submit_feedback(args)
 
     mock_daemon_connection.submit_feedback.assert_called_once_with(
         message="test message",
@@ -93,6 +100,11 @@ async def test_submit_feedback_tool_passes_all_fields(mock_daemon_connection) ->
         model="claude-opus-4-7",
         harness="Claude Desktop",
     )
+    assert result.structured_content is not None
+    assert result.structured_content["severity"] == "bug"
+    assert result.structured_content["has_context"] is True
+    assert result.structured_content["has_model"] is True
+    assert result.structured_content["has_harness"] is True
 
 
 @pytest.mark.asyncio
@@ -184,3 +196,4 @@ def test_submit_feedback_tool_registered_in_registry() -> None:
     assert posture == "primary"
     assert annotations is not None
     assert annotations.readOnlyHint is False
+    assert TOOL_REGISTRY["submit_feedback"].output_schema is not None

@@ -258,6 +258,8 @@ def test_list_tools_structured_output_schema_surface_is_explicit() -> None:
         "get_my_recent_activity",
         "get_usage_stats",
         "get_dialog_stats",
+        "get_entity_info",
+        "submit_feedback",
         "trace_account_messages",
     }
 
@@ -268,11 +270,31 @@ def test_list_tools_exposes_account_trace_schema_and_title() -> None:
     assert tool.title == "Account Trace"
     assert tool.outputSchema is not None
     assert "coverage" in tool.outputSchema["required"]
+    assert "result_count_semantics" in tool.outputSchema["required"]
+    assert "text_preview" in tool.outputSchema["properties"]
+    assert "warnings" in tool.outputSchema["properties"]
+    assert "limits" in tool.outputSchema["properties"]
+    assert "navigation" in tool.outputSchema["properties"]
     assert "coverage_bounds" in tool.outputSchema["properties"]["provenance"]["properties"]
     assert "authorship_basis" in (
         tool.outputSchema["properties"]["groups"]["items"]["properties"]["evidence"]["items"]["properties"]
     )
+    assert "content" in (
+        tool.outputSchema["properties"]["groups"]["items"]["properties"]["evidence"]["items"]["properties"]
+    )
     assert tool.inputSchema["properties"]["exact_topic_id"]["type"] == "integer"
+
+
+def test_list_tools_exposes_feedback_and_entity_info_output_schemas() -> None:
+    feedback_tool = server.tool_by_name["submit_feedback"]
+    entity_tool = server.tool_by_name["get_entity_info"]
+
+    assert feedback_tool.outputSchema is not None
+    assert "accepted" in feedback_tool.outputSchema["required"]
+    assert "tracking_id" in feedback_tool.outputSchema["required"]
+    assert entity_tool.outputSchema is not None
+    assert "type_specific" in entity_tool.outputSchema["required"]
+    assert "content_fields" in entity_tool.outputSchema["required"]
 
 
 @pytest.mark.asyncio

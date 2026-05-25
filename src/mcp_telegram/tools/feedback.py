@@ -21,6 +21,31 @@ from ._base import (
     mcp_tool,
 )
 
+SUBMIT_FEEDBACK_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "accepted": {"type": "boolean"},
+        "severity": {"type": ["string", "null"], "enum": ["bug", "suggestion", "question", None]},
+        "has_context": {"type": "boolean"},
+        "has_model": {"type": "boolean"},
+        "has_harness": {"type": "boolean"},
+        "follow_up_available": {"type": "boolean"},
+        "tracking_id": {"type": "null"},
+        "status": {"type": "string"},
+        "message": {"type": "string"},
+    },
+    "required": [
+        "accepted",
+        "severity",
+        "has_context",
+        "has_model",
+        "has_harness",
+        "follow_up_available",
+        "tracking_id",
+    ],
+    "additionalProperties": True,
+}
+
 
 class SubmitFeedback(ToolArgs):
     """
@@ -82,7 +107,12 @@ class SubmitFeedback(ToolArgs):
         return stripped
 
 
-@mcp_tool(name="submit_feedback", title="Submit Feedback", annotations=ToolAnnotations(readOnlyHint=False))
+@mcp_tool(
+    name="submit_feedback",
+    title="Submit Feedback",
+    annotations=ToolAnnotations(readOnlyHint=False),
+    output_schema=SUBMIT_FEEDBACK_OUTPUT_SCHEMA,
+)
 async def submit_feedback(args: SubmitFeedback) -> ToolResult:
     try:
         async with daemon_connection() as conn:
@@ -99,4 +129,20 @@ async def submit_feedback(args: SubmitFeedback) -> ToolResult:
     if err := _check_daemon_response(response):
         return err
 
-    return ToolResult(content=_text_response("Feedback recorded. Thank you!"), result_count=1)
+    message = "Feedback recorded. Thank you!"
+    structured_content = {
+        "accepted": True,
+        "severity": args.severity,
+        "has_context": args.context is not None,
+        "has_model": args.model is not None,
+        "has_harness": args.harness is not None,
+        "follow_up_available": False,
+        "tracking_id": None,
+        "status": "accepted",
+        "message": message,
+    }
+    return ToolResult(
+        content=_text_response(message),
+        structured_content=structured_content,
+        result_count=1,
+    )
