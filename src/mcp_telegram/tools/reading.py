@@ -11,6 +11,7 @@ from ..formatter import (
 )
 from ..models import ReadMessage
 from ..resolver import parse_exact_dialog_id
+from .structured import structured_warning
 from ._base import (
     DaemonNotRunningError,
     ToolAnnotations,
@@ -85,6 +86,295 @@ def _format_daemon_messages(
         read_state=read_state,
         dialog_type=dialog_type,
     )
+
+
+# ---------------------------------------------------------------------------
+# Tool: ListMessages structured output
+# ---------------------------------------------------------------------------
+
+LIST_MESSAGES_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "dialog_id": {"type": ["integer", "null"]},
+        "dialog": {
+            "type": "object",
+            "properties": {
+                "id": {"type": ["integer", "null"]},
+                "name": {"type": ["string", "null"]},
+                "type": {"type": ["string", "null"]},
+                "access": {"type": ["string", "null"]},
+            },
+            "required": ["id", "name", "type", "access"],
+            "additionalProperties": False,
+        },
+        "source": {"type": "string"},
+        "coverage": {
+            "type": "object",
+            "properties": {
+                "kind": {"type": "string"},
+                "state": {"type": "string"},
+                "fragment_coverage": {"type": "boolean"},
+                "dialog_access": {"type": ["string", "null"]},
+                "access_lost_at": {"type": ["integer", "null"]},
+                "last_synced_at": {"type": ["integer", "null"]},
+                "last_event_at": {"type": ["integer", "null"]},
+                "sync_coverage_pct": {"type": ["integer", "null"]},
+                "archived_message_count": {"type": ["integer", "null"]},
+            },
+            "required": [
+                "kind",
+                "state",
+                "fragment_coverage",
+                "dialog_access",
+                "access_lost_at",
+                "last_synced_at",
+                "last_event_at",
+                "sync_coverage_pct",
+                "archived_message_count",
+            ],
+            "additionalProperties": False,
+        },
+        "warnings": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string"},
+                    "severity": {"type": "string"},
+                    "message": {"type": "string"},
+                    "action": {"type": "string"},
+                },
+                "required": ["kind", "severity", "message"],
+                "additionalProperties": False,
+            },
+        },
+        "filters": {
+            "type": "object",
+            "properties": {
+                "dialog": {"type": ["string", "null"]},
+                "exact_dialog_id": {"type": ["integer", "null"]},
+                "sender": {"type": ["string", "null"]},
+                "sender_id": {"type": ["integer", "null"]},
+                "sender_name": {"type": ["string", "null"]},
+                "topic": {"type": ["string", "null"]},
+                "exact_topic_id": {"type": ["integer", "null"]},
+                "applied_topic_id": {"type": ["integer", "null"]},
+                "unread": {"type": "boolean"},
+                "anchor_message_id": {"type": ["integer", "null"]},
+            },
+            "required": [
+                "dialog",
+                "exact_dialog_id",
+                "sender",
+                "sender_id",
+                "sender_name",
+                "topic",
+                "exact_topic_id",
+                "applied_topic_id",
+                "unread",
+                "anchor_message_id",
+            ],
+            "additionalProperties": False,
+        },
+        "limits": {
+            "type": "object",
+            "properties": {
+                "requested_limit": {"type": "integer"},
+                "applied_limit": {"type": "integer"},
+                "requested_context_size": {"type": "integer"},
+                "applied_context_size": {"type": ["integer", "null"]},
+            },
+            "required": ["requested_limit", "applied_limit", "requested_context_size", "applied_context_size"],
+            "additionalProperties": False,
+        },
+        "navigation": {
+            "type": "object",
+            "properties": {
+                "next_navigation": {"type": ["string", "null"]},
+                "has_more": {"type": "boolean"},
+                "source_cursor": {"type": ["string", "null"]},
+                "direction": {"type": "string"},
+                "direction_input": {"type": "string"},
+                "anchor_message_id": {"type": ["integer", "null"]},
+            },
+            "required": [
+                "next_navigation",
+                "has_more",
+                "source_cursor",
+                "direction",
+                "direction_input",
+                "anchor_message_id",
+            ],
+            "additionalProperties": False,
+        },
+        "read_state": {
+            "type": ["object", "null"],
+            "properties": {
+                "dialog_type": {"type": ["string", "null"]},
+                "state": {"type": ["object", "null"]},
+                "header_lines": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["dialog_type", "state", "header_lines"],
+            "additionalProperties": False,
+        },
+        "count": {"type": "integer"},
+        "result_count_semantics": {"type": "string"},
+    },
+    "required": [
+        "dialog_id",
+        "dialog",
+        "source",
+        "coverage",
+        "warnings",
+        "filters",
+        "limits",
+        "navigation",
+        "read_state",
+        "count",
+        "result_count_semantics",
+    ],
+    "additionalProperties": False,
+}
+
+
+def _list_messages_resolved_dialog_id(data: dict, rows: list[dict], fallback_dialog_id: int | None) -> int | None:
+    if fallback_dialog_id is not None:
+        return fallback_dialog_id
+    data_dialog_id = data.get("dialog_id")
+    if isinstance(data_dialog_id, int):
+        return data_dialog_id
+    if rows:
+        row_dialog_id = rows[0].get("dialog_id")
+        if isinstance(row_dialog_id, int):
+            return row_dialog_id
+    return None
+
+
+def _list_messages_dialog_name(data: dict, rows: list[dict], fallback_dialog: str | None) -> str | None:
+    data_dialog_name = data.get("dialog_name")
+    if isinstance(data_dialog_name, str):
+        return data_dialog_name
+    if rows:
+        row_dialog_name = rows[0].get("dialog_name")
+        if isinstance(row_dialog_name, str):
+            return row_dialog_name
+    return fallback_dialog
+
+
+def _list_messages_coverage(data: dict) -> dict[str, object]:
+    raw_coverage = data.get("coverage")
+    dialog_access = data.get("dialog_access")
+    if raw_coverage == "fragment":
+        kind = "fragment"
+    elif dialog_access == "archived":
+        kind = "archived"
+    elif dialog_access == "live":
+        kind = "live"
+    else:
+        kind = str(data.get("source") or "unknown")
+    return {
+        "kind": kind,
+        "state": kind,
+        "fragment_coverage": raw_coverage == "fragment",
+        "dialog_access": dialog_access,
+        "access_lost_at": data.get("access_lost_at"),
+        "last_synced_at": data.get("last_synced_at"),
+        "last_event_at": data.get("last_event_at"),
+        "sync_coverage_pct": data.get("sync_coverage_pct"),
+        "archived_message_count": data.get("archived_message_count"),
+    }
+
+
+def _list_messages_warnings(data: dict) -> list[dict[str, object]]:
+    archived_warning = _format_archived_warning(data).strip()
+    if not archived_warning:
+        return []
+    return [
+        structured_warning(
+            "archived_dialog",
+            archived_warning,
+            severity="warning",
+            action="Treat results as local archive content; sync cannot fetch current messages until access is restored.",
+        )
+    ]
+
+
+def _navigation_direction_for_structured(direction: str, anchor_message_id: int | None) -> str:
+    if anchor_message_id is not None:
+        return "around"
+    if direction == "oldest":
+        return "newer"
+    return "older"
+
+
+def _list_messages_structured_content(
+    *,
+    args: "ListMessages",
+    data: dict,
+    rows: list[dict],
+    dialog_id: int | None,
+    sender_id: int | None,
+    sender_name: str | None,
+    topic_id: int | None,
+    direction: str,
+    next_navigation: str | None,
+) -> dict[str, object]:
+    resolved_dialog_id = _list_messages_resolved_dialog_id(data, rows, dialog_id)
+    dialog_type = data.get("dialog_type")
+    read_state = data.get("read_state")
+    header_lines = _render_read_state_header(
+        read_state,
+        dialog_type,
+        int(datetime.now(tz=UTC).timestamp()),
+    )
+    structured_read_state: dict[str, object] | None = None
+    if read_state is not None or dialog_type is not None or header_lines:
+        structured_read_state = {
+            "dialog_type": dialog_type,
+            "state": read_state,
+            "header_lines": header_lines,
+        }
+    return {
+        "dialog_id": resolved_dialog_id,
+        "dialog": {
+            "id": resolved_dialog_id,
+            "name": _list_messages_dialog_name(data, rows, args.dialog),
+            "type": dialog_type,
+            "access": data.get("dialog_access"),
+        },
+        "source": data.get("source", "unknown"),
+        "coverage": _list_messages_coverage(data),
+        "warnings": _list_messages_warnings(data),
+        "filters": {
+            "dialog": args.dialog,
+            "exact_dialog_id": args.exact_dialog_id,
+            "sender": args.sender,
+            "sender_id": sender_id,
+            "sender_name": sender_name,
+            "topic": args.topic,
+            "exact_topic_id": args.exact_topic_id,
+            "applied_topic_id": topic_id,
+            "unread": args.unread,
+            "anchor_message_id": args.anchor_message_id,
+        },
+        "limits": {
+            "requested_limit": args.limit,
+            "applied_limit": len(rows),
+            "requested_context_size": args.context_size,
+            "applied_context_size": args.context_size if args.anchor_message_id is not None else None,
+        },
+        "navigation": {
+            "next_navigation": next_navigation,
+            "has_more": next_navigation is not None,
+            "source_cursor": args.navigation,
+            "direction": _navigation_direction_for_structured(direction, args.anchor_message_id),
+            "direction_input": direction,
+            "anchor_message_id": args.anchor_message_id,
+        },
+        "read_state": structured_read_state,
+        "count": len(rows),
+        "result_count_semantics": "count is the number of message rows returned in this response page",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -398,7 +688,12 @@ async def _resolve_topic_id(
     return error_result(f"Topic '{topic_name}' not found in this dialog.")
 
 
-@mcp_tool(name="list_messages", title="List Messages", annotations=ToolAnnotations(readOnlyHint=True))
+@mcp_tool(
+    name="list_messages",
+    title="List Messages",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    output_schema=LIST_MESSAGES_OUTPUT_SCHEMA,
+)
 async def list_messages(args: ListMessages) -> ToolResult:
     has_filter = bool(args.sender or args.topic or args.exact_topic_id is not None or args.unread)
     has_cursor = args.navigation is not None and args.navigation not in {"newest", "oldest"}
@@ -518,8 +813,20 @@ async def list_messages(args: ListMessages) -> ToolResult:
         )
         result_text = f"{fragment_header}\n\n{result_text}"
 
+    structured_content = _list_messages_structured_content(
+        args=args,
+        data=data,
+        rows=rows,
+        dialog_id=dialog_id,
+        sender_id=sender_id,
+        sender_name=sender_name,
+        topic_id=topic_id,
+        direction=direction,
+        next_navigation=next_nav,
+    )
     return ToolResult(
         content=_text_response(result_text),
+        structured_content=structured_content,
         result_count=len(rows),
         has_filter=has_filter,
         has_cursor=has_cursor or bool(next_nav),

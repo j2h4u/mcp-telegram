@@ -136,6 +136,26 @@ STRUCTURED_TOOL_CASES = {
             },
         },
     ),
+    "list_messages": (
+        list_messages,
+        ListMessages(exact_dialog_id=123),
+        {
+            "ok": True,
+            "data": {
+                "messages": [
+                    {
+                        "message_id": 5,
+                        "sent_at": 1705312800,
+                        "dialog_id": 123,
+                        "text": "hello world",
+                        "sender_first_name": "Bob",
+                    }
+                ],
+                "source": "sync_db",
+                "next_navigation": "history-token",
+            },
+        },
+    ),
     "search_messages": (
         search_messages,
         SearchMessages(dialog="123", query="hello"),
@@ -700,6 +720,11 @@ async def test_list_messages_via_daemon():
 
     assert len(result.content) == 1
     assert "Hello" in result.content[0].text
+    assert result.structured_content is not None
+    assert result.structured_content["source"] == "sync_db"
+    assert result.structured_content["count"] == 1
+    assert result.structured_content["limits"]["requested_limit"] == 50
+    assert result.structured_content["limits"]["applied_limit"] == 1
     conn.list_messages.assert_called_once()
 
 

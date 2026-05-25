@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from mcp_telegram.tools.reading import _format_search_results
+from mcp_telegram.tools.reading import ListMessages, _format_search_results, _list_messages_structured_content
 
 
 def _row(
@@ -127,3 +127,51 @@ def test_search_snippet_no_raw_question_mark_sender_fallback_in_source():
 
     src = pathlib.Path("src/mcp_telegram/tools/reading.py").read_text()
     assert 'row.get("sender_first_name") or "?"' not in src
+
+
+def test_list_messages_structured_page_metadata_preserves_navigation_warning_coverage_and_limits():
+    payload = _list_messages_structured_content(
+        args=ListMessages(exact_dialog_id=123, limit=10, navigation="oldest", anchor_message_id=50),
+        data={
+            "messages": [],
+            "source": "sync_db",
+            "next_navigation": "history-token",
+            "coverage": "fragment",
+            "dialog_access": "archived",
+            "last_synced_at": 1_699_990_000,
+            "last_event_at": 1_699_999_000,
+            "sync_coverage_pct": 80,
+            "dialog_type": "User",
+            "read_state": {
+                "inbox_unread_count": 0,
+                "inbox_cursor_state": "populated",
+                "outbox_unread_count": 0,
+                "outbox_cursor_state": "populated",
+            },
+        },
+        rows=[],
+        dialog_id=123,
+        sender_id=None,
+        sender_name=None,
+        topic_id=None,
+        direction="oldest",
+        next_navigation="history-token",
+    )
+
+    assert payload["dialog_id"] == 123
+    assert payload["coverage"]["kind"] == "fragment"
+    assert payload["coverage"]["fragment_coverage"] is True
+    assert payload["warnings"][0]["kind"] == "archived_dialog"
+    assert "No current access" in payload["warnings"][0]["message"]
+    assert payload["navigation"]["next_navigation"] == "history-token"
+    assert payload["navigation"]["anchor_message_id"] == 50
+    assert payload["navigation"]["direction_input"] == "oldest"
+    assert payload["limits"] == {
+        "requested_limit": 10,
+        "applied_limit": 0,
+        "requested_context_size": 10,
+        "applied_context_size": 10,
+    }
+    assert payload["count"] == 0
+    assert payload["result_count_semantics"] == "count is the number of message rows returned in this response page"
+    assert payload["read_state"]["header_lines"] == ["[read-state: all caught up]"]
