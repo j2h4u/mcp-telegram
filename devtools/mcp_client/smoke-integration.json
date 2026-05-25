@@ -7,7 +7,16 @@
       "arguments": {},
       "expect": {
         "is_error": false,
-        "content_text_contains": ["members=", "created="]
+        "path_exists": [
+          "structuredContent.dialogs",
+          "structuredContent.count",
+          "structuredContent.filters"
+        ],
+        "path_nonempty": [
+          "structuredContent",
+          "structuredContent.dialogs",
+          "content.0.text"
+        ]
       }
     },
     {
@@ -16,7 +25,15 @@
       "name": "get_usage_stats",
       "arguments": {},
       "expect": {
-        "is_error": false
+        "is_error": false,
+        "path_exists": [
+          "structuredContent.total_calls",
+          "structuredContent.tool_distribution"
+        ],
+        "path_nonempty": [
+          "structuredContent",
+          "content.0.text"
+        ]
       }
     },
     {
@@ -25,7 +42,16 @@
       "name": "list_topics",
       "arguments": {"dialog": "Vibecoding is so last year"},
       "expect": {
-        "is_error": false
+        "is_error": false,
+        "path_exists": [
+          "structuredContent.dialog",
+          "structuredContent.topics",
+          "structuredContent.count"
+        ],
+        "path_nonempty": [
+          "structuredContent",
+          "content.0.text"
+        ]
       }
     },
     {
@@ -34,7 +60,17 @@
       "name": "list_messages",
       "arguments": {"exact_dialog_id": 496731332, "limit": 3},
       "expect": {
-        "is_error": false
+        "is_error": false,
+        "path_exists": [
+          "structuredContent.source",
+          "structuredContent.messages",
+          "structuredContent.count",
+          "structuredContent.limits"
+        ],
+        "path_nonempty": [
+          "structuredContent",
+          "content.0.text"
+        ]
       }
     },
     {
@@ -43,7 +79,17 @@
       "name": "list_messages",
       "arguments": {"exact_dialog_id": 496731332, "limit": 5},
       "expect": {
-        "is_error": false
+        "is_error": false,
+        "path_exists": [
+          "structuredContent.source",
+          "structuredContent.messages",
+          "structuredContent.count",
+          "structuredContent.limits"
+        ],
+        "path_nonempty": [
+          "structuredContent",
+          "content.0.text"
+        ]
       }
     },
     {
@@ -52,7 +98,17 @@
       "name": "search_messages",
       "arguments": {"dialog": "496731332", "query": "а", "limit": 3},
       "expect": {
-        "is_error": false
+        "is_error": false,
+        "path_exists": [
+          "structuredContent.query",
+          "structuredContent.results",
+          "structuredContent.count",
+          "structuredContent.limits"
+        ],
+        "path_nonempty": [
+          "structuredContent",
+          "content.0.text"
+        ]
       }
     },
     {
@@ -61,7 +117,16 @@
       "name": "get_inbox",
       "arguments": {},
       "expect": {
-        "is_error": false
+        "is_error": false,
+        "path_exists": [
+          "structuredContent.dialogs",
+          "structuredContent.count",
+          "structuredContent.coverage"
+        ],
+        "path_nonempty": [
+          "structuredContent",
+          "content.0.text"
+        ]
       }
     },
     {
@@ -71,7 +136,16 @@
       "arguments": {"dialog_id": 12345},
       "expect": {
         "is_error": false,
-        "content_text_contains": ["status=", "delete_detection="]
+        "path_exists": [
+          "structuredContent.dialog_id",
+          "structuredContent.status",
+          "structuredContent.delete_detection"
+        ],
+        "path_nonempty": [
+          "structuredContent",
+          "structuredContent.status",
+          "content.0.text"
+        ]
       }
     },
     {
@@ -80,7 +154,16 @@
       "name": "get_sync_alerts",
       "arguments": {"since": 0, "limit": 10},
       "expect": {
-        "is_error": false
+        "is_error": false,
+        "path_exists": [
+          "structuredContent.alerts",
+          "structuredContent.count",
+          "structuredContent.limited_by"
+        ],
+        "path_nonempty": [
+          "structuredContent",
+          "content.0.text"
+        ]
       }
     },
     {
@@ -92,7 +175,15 @@
         "one_of": [
           {
             "is_error": false,
-            "content_text_contains": ["Top"]
+            "path_exists": [
+              "structuredContent.dialog",
+              "structuredContent.top_reactions",
+              "structuredContent.section_counts"
+            ],
+            "path_nonempty": [
+              "structuredContent",
+              "content.0.text"
+            ]
           },
           {
             "is_error": true,
@@ -107,7 +198,16 @@
       "name": "get_my_recent_activity",
       "arguments": {"since_hours": 24, "limit": 50},
       "expect": {
-        "is_error": false
+        "is_error": false,
+        "path_exists": [
+          "structuredContent.scan_status",
+          "structuredContent.comments",
+          "structuredContent.count"
+        ],
+        "path_nonempty": [
+          "structuredContent",
+          "content.0.text"
+        ]
       }
     },
     {
@@ -123,7 +223,16 @@
       },
       "expect": {
         "is_error": false,
-        "content_text_contains": ["Feedback recorded", "Thank you"]
+        "path_exists": [
+          "structuredContent.accepted",
+          "structuredContent.status",
+          "structuredContent.tracking_id"
+        ],
+        "path_nonempty": [
+          "structuredContent.accepted",
+          "structuredContent.status",
+          "content.0.text"
+        ]
       }
     }
   ]

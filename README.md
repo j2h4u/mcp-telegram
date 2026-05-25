@@ -17,6 +17,10 @@ Deployed as a Docker container. MCP clients connect by running `docker exec -i m
 
 ## Tools
 
+All 14 tools expose `outputSchema`. Successful calls include `structuredContent` for
+machine-readable ids, counts, navigation, coverage, and result facts; text content is a
+human-readable preview or fallback.
+
 - `list_dialogs` — list chats, channels, groups with unread counts
 - `list_topics` — list forum topics
 - `list_messages` — read messages in a dialog (pagination, topic, sender, unread filters)
@@ -30,6 +34,7 @@ Deployed as a Docker container. MCP clients connect by running `docker exec -i m
 - `get_sync_alerts` — inspect recent sync alerts
 - `get_my_recent_activity` — summarize the operator's recent sent messages
 - `submit_feedback` — write-only agent feedback queue
+- `trace_account_messages` — trace observable messages authored by one account
 
 ## Deploy
 

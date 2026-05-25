@@ -1,42 +1,75 @@
 {
   "steps": [
     {
-      "_comment": "All 13 tools registered with correct schemas",
+      "_comment": "All 14 tools registered with output schemas",
       "action": "list_tools",
       "expect": {
         "tool_names_include": [
+          "get_dialog_stats",
+          "get_entity_info",
+          "get_inbox",
+          "get_my_recent_activity",
+          "get_sync_alerts",
+          "get_sync_status",
+          "get_usage_stats",
           "list_dialogs",
           "list_messages",
-          "search_messages",
           "list_topics",
-          "get_inbox",
-          "get_entity_info",
-          "get_usage_stats",
-          "get_dialog_stats",
-          "get_my_recent_activity",
           "mark_dialog_for_sync",
-          "get_sync_status",
-          "get_sync_alerts",
-          "submit_feedback"
+          "search_messages",
+          "submit_feedback",
+          "trace_account_messages"
         ],
         "tool_expectations": {
+          "get_dialog_stats": {
+            "outputSchema.type": "object"
+          },
+          "get_entity_info": {
+            "outputSchema.type": "object"
+          },
+          "get_inbox": {
+            "outputSchema.type": "object"
+          },
+          "get_my_recent_activity": {
+            "outputSchema.type": "object"
+          },
+          "get_sync_alerts": {
+            "outputSchema.type": "object"
+          },
+          "get_sync_status": {
+            "inputSchema.properties.dialog_id.type": "integer",
+            "outputSchema.type": "object"
+          },
+          "get_usage_stats": {
+            "outputSchema.type": "object"
+          },
           "list_messages": {
             "inputSchema.properties.limit.default": 50,
-            "inputSchema.properties.navigation.type": "string"
+            "inputSchema.properties.navigation.type": "string",
+            "outputSchema.type": "object"
           },
           "search_messages": {
-            "inputSchema.properties.navigation.type": "string"
+            "inputSchema.properties.navigation.type": "string",
+            "outputSchema.type": "object"
+          },
+          "list_dialogs": {
+            "outputSchema.type": "object"
+          },
+          "list_topics": {
+            "outputSchema.type": "object"
           },
           "mark_dialog_for_sync": {
             "inputSchema.properties.dialog_id.type": "integer",
-            "inputSchema.properties.enable.default": true
-          },
-          "get_sync_status": {
-            "inputSchema.properties.dialog_id.type": "integer"
+            "inputSchema.properties.enable.default": true,
+            "outputSchema.type": "object"
           },
           "submit_feedback": {
             "inputSchema.properties.message.type": "string",
-            "inputSchema.properties.message.maxLength": 10000
+            "inputSchema.properties.message.maxLength": 10000,
+            "outputSchema.type": "object"
+          },
+          "trace_account_messages": {
+            "outputSchema.type": "object"
           }
         }
       }
@@ -103,10 +136,40 @@
       }
     },
     {
+      "_comment": "get_sync_alerts — daemon route",
+      "action": "call_tool",
+      "name": "get_sync_alerts",
+      "arguments": {"since": 0, "limit": 1},
+      "expect": {
+        "is_error": true,
+        "content_text_contains": ["not running", "mcp-telegram sync"]
+      }
+    },
+    {
       "_comment": "get_entity_info — resolve first, daemon not running so returns not-running message",
       "action": "call_tool",
       "name": "get_entity_info",
       "arguments": {"entity": "nonexistent_test_entity_12345"},
+      "expect": {
+        "is_error": true,
+        "content_text_contains": ["not running", "mcp-telegram sync"]
+      }
+    },
+    {
+      "_comment": "get_dialog_stats — daemon route",
+      "action": "call_tool",
+      "name": "get_dialog_stats",
+      "arguments": {"dialog": "test", "top_n": 3},
+      "expect": {
+        "is_error": true,
+        "content_text_contains": ["not running", "mcp-telegram sync"]
+      }
+    },
+    {
+      "_comment": "get_my_recent_activity — daemon route",
+      "action": "call_tool",
+      "name": "get_my_recent_activity",
+      "arguments": {"since_hours": 24, "limit": 50},
       "expect": {
         "is_error": true,
         "content_text_contains": ["not running", "mcp-telegram sync"]
@@ -123,12 +186,13 @@
       }
     },
     {
-      "_comment": "get_usage_stats — analytics.db, works without daemon",
+      "_comment": "get_usage_stats — daemon route",
       "action": "call_tool",
       "name": "get_usage_stats",
       "arguments": {},
       "expect": {
-        "is_error": false
+        "is_error": true,
+        "content_text_contains": ["not running", "mcp-telegram sync"]
       }
     },
     {
@@ -136,6 +200,16 @@
       "action": "call_tool",
       "name": "submit_feedback",
       "arguments": {"message": "smoke test from no-daemon harness", "severity": "bug"},
+      "expect": {
+        "is_error": true,
+        "content_text_contains": ["not running", "mcp-telegram sync"]
+      }
+    },
+    {
+      "_comment": "trace_account_messages — daemon route",
+      "action": "call_tool",
+      "name": "trace_account_messages",
+      "arguments": {"account": "12345", "limit": 5},
       "expect": {
         "is_error": true,
         "content_text_contains": ["not running", "mcp-telegram sync"]

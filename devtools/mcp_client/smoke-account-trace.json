@@ -30,7 +30,20 @@
           "structuredContent.provenance.coverage_goal": "observed",
           "structuredContent.result_count_semantics": "current_page_evidence_items"
         },
-        "content_text_contains": ["Account Trace:", "evidence_items=", "coverage_state="]
+        "path_exists": [
+          "structuredContent.resolved_account",
+          "structuredContent.coverage",
+          "structuredContent.groups",
+          "structuredContent.provenance",
+          "structuredContent.text_preview"
+        ],
+        "path_nonempty": [
+          "structuredContent",
+          "structuredContent.resolved_account",
+          "structuredContent.coverage",
+          "structuredContent.provenance",
+          "content.0.text"
+        ]
       }
     },
     {
@@ -51,7 +64,20 @@
           "structuredContent.provenance.enrichment.coverage_bounds.max_per_dialog": 100,
           "structuredContent.provenance.enrichment.coverage_bounds.deadline_ms": 15000
         },
-        "content_text_contains": ["Account Trace:", "coverage_state="]
+        "path_exists": [
+          "structuredContent.resolved_account",
+          "structuredContent.coverage",
+          "structuredContent.groups",
+          "structuredContent.provenance",
+          "structuredContent.text_preview"
+        ],
+        "path_nonempty": [
+          "structuredContent",
+          "structuredContent.resolved_account",
+          "structuredContent.coverage",
+          "structuredContent.provenance",
+          "content.0.text"
+        ]
       }
     },
     {
@@ -69,7 +95,18 @@
           "structuredContent.resolved_account.confidence": "unresolved",
           "structuredContent.gaps.0.kind": "account_unresolved"
         },
-        "content_text_contains": ["Account Trace:", "gap_summary=account_unresolved:action_required"]
+        "path_exists": [
+          "structuredContent.resolved_account",
+          "structuredContent.gaps",
+          "structuredContent.warnings",
+          "structuredContent.provenance"
+        ],
+        "path_nonempty": [
+          "structuredContent",
+          "structuredContent.gaps",
+          "structuredContent.warnings",
+          "content.0.text"
+        ]
       }
     }
   ]

@@ -15,6 +15,7 @@ from devtools.mcp_client.client import (
     execute_script_steps,
     load_script_steps,
 )
+from mcp_telegram import server
 
 
 def _fake_server_command() -> list[str]:
@@ -279,26 +280,63 @@ def test_smoke_scripts_use_snake_case_tool_names() -> None:
     for relative_path in (
         "devtools/mcp_client/smoke-no-daemon.json",
         "devtools/mcp_client/smoke-integration.json",
+        "devtools/mcp_client/smoke-account-trace.json",
     ):
         text = (_repo_root() / relative_path).read_text(encoding="utf-8")
         assert exposed_pascal_case.search(text) is None
+
+
+def test_no_daemon_smoke_expects_all_registered_tools_and_output_schemas() -> None:
+    script = json.loads(
+        (_repo_root() / "devtools/mcp_client/smoke-no-daemon.json").read_text(encoding="utf-8")
+    )
+    list_tools_expect = script["steps"][0]["expect"]
+    registered_tools = set(server.tool_by_name)
+
+    assert set(list_tools_expect["tool_names_include"]) == registered_tools
+    assert set(list_tools_expect["tool_expectations"]) == registered_tools
+    for tool_name, path_map in list_tools_expect["tool_expectations"].items():
+        assert path_map["outputSchema.type"] == "object", tool_name
+
+
+def _expectation_branches(expect: dict) -> list[dict]:
+    one_of = expect.get("one_of")
+    if one_of is None:
+        return [expect]
+    return [branch for branch in one_of if isinstance(branch, dict)]
+
+
+def test_successful_smoke_steps_assert_structured_content_paths_not_text_parsing() -> None:
+    for relative_path in (
+        "devtools/mcp_client/smoke-no-daemon.json",
+        "devtools/mcp_client/smoke-integration.json",
+        "devtools/mcp_client/smoke-account-trace.json",
+    ):
+        script = json.loads((_repo_root() / relative_path).read_text(encoding="utf-8"))
+        for step in script["steps"]:
+            if step.get("action") != "call_tool":
+                continue
+            for expect in _expectation_branches(step.get("expect", {})):
+                if expect.get("is_error") is not False:
+                    continue
+                structured_paths = [
+                    path
+                    for key in ("path_exists", "path_nonempty")
+                    for path in expect.get(key, [])
+                    if isinstance(path, str)
+                ]
+                assert any(path.startswith("structuredContent") for path in structured_paths), (
+                    relative_path,
+                    step.get("name"),
+                )
+                assert "content_text_contains" not in expect, (relative_path, step.get("name"))
 
 
 def test_no_daemon_smoke_expects_backend_errors() -> None:
     script = json.loads(
         (_repo_root() / "devtools/mcp_client/smoke-no-daemon.json").read_text(encoding="utf-8")
     )
-    backend_tools = {
-        "list_dialogs",
-        "list_messages",
-        "search_messages",
-        "list_topics",
-        "mark_dialog_for_sync",
-        "get_sync_status",
-        "get_entity_info",
-        "get_inbox",
-        "submit_feedback",
-    }
+    backend_tools = set(server.tool_by_name)
 
     assert "get_dialog_stats" in script["steps"][0]["expect"]["tool_names_include"]
     for step in script["steps"]:
