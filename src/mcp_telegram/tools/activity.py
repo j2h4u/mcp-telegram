@@ -1,25 +1,23 @@
 """GetMyRecentActivity MCP tool — Phase 999.1."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from typing import Any
 
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
-from ..formatter import frame_telegram_snippet
-from .structured import telegram_content
 from ._base import (
     DaemonNotRunningError,
     ToolArgs,
     ToolResult,
     _check_daemon_response,
     _daemon_not_running_text,
-    _text_response,
     daemon_connection,
     error_result,
     mcp_tool,
+    structured_result,
 )
+from .structured import telegram_content
 
 GET_MY_RECENT_ACTIVITY_OUTPUT_SCHEMA = {
     "type": "object",
@@ -117,26 +115,6 @@ class GetMyRecentActivity(ToolArgs):
     )
 
 
-def _format_block(comment: dict[str, Any]) -> str:
-    ts = comment.get("sent_at") or 0
-    dt = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
-    dialog_name = comment.get("dialog_name") or str(comment.get("dialog_id", "?"))
-    text = (comment.get("text") or "").replace("\n", " ")
-    text = frame_telegram_snippet(text)
-    block = (
-        f"[{dialog_name}] {dt}  {text}\n"
-        f"  nav: dialog_id={comment.get('dialog_id')} message_id={comment.get('message_id')}"
-    )
-    sync_status = comment.get("sync_status")
-    if sync_status and sync_status != "synced":
-        block += f"\n  sync: {sync_status}"
-    reactions = comment.get("reactions") or []
-    if reactions:
-        rx_str = "  ".join(f"{r['emoji']}×{r['count']}" for r in reactions)
-        block += f"\n  reactions: {rx_str}"
-    return block
-
-
 def _structured_comment(comment: dict[str, Any]) -> dict[str, object]:
     dialog_id = int(comment.get("dialog_id") or 0)
     message_id = int(comment.get("message_id") or 0)
@@ -195,30 +173,7 @@ async def get_my_recent_activity(args: GetMyRecentActivity) -> ToolResult:
         "result_count_semantics": "count is the number of own-message activity rows returned in this response",
     }
 
-    header_lines: list[str] = []
-    if scan_status == "never_run":
-        header_lines.append(
-            "Scan status: never run — backfill has not completed yet."
-        )
-    elif scan_status == "in_progress":
-        header_lines.append(
-            "Scan status: in progress — backfill still running, results may be incomplete."
-        )
-    else:
-        if scanned_at:
-            dt = datetime.fromtimestamp(int(scanned_at), tz=timezone.utc).strftime(
-                "%Y-%m-%d %H:%M UTC"
-            )
-            header_lines.append(f"Scanned at: {dt}")
-
-    if not comments:
-        body = f"No recent activity in the last {args.since_hours}h."
-    else:
-        body = "\n\n".join(_format_block(c) for c in comments)
-
-    output = "\n".join(header_lines + [body]) if header_lines else body
-    return ToolResult(
-        content=_text_response(output),
-        structured_content=structured_content,
+    return structured_result(
+        structured_content,
         result_count=len(comments),
     )

@@ -35,9 +35,9 @@ import sqlite3
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from telethon.tl.types import Channel as TelethonChannel  # type: ignore[import-untyped]
 
 from mcp_telegram.daemon_api import DaemonAPIServer
-from telethon.tl.types import Channel as TelethonChannel  # type: ignore[import-untyped]
 
 
 @pytest.fixture(autouse=True)

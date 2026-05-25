@@ -45,12 +45,12 @@ from telethon.errors.rpcerrorlist import FloodWaitError  # type: ignore[import-u
 from telethon.tl.functions.messages import GetPeerDialogsRequest  # type: ignore[import-untyped]
 from telethon.tl.types import InputDialogPeer  # type: ignore[import-untyped]
 
-from .daemon_api import DaemonAPIServer, get_daemon_socket_path
 from .activity_sync import run_activity_sync_loop
-from .feedback_db import ensure_feedback_schema, get_feedback_db_path
+from .daemon_api import DaemonAPIServer, get_daemon_socket_path
 from .delta_sync import DeltaSyncWorker, run_access_probe_loop
 from .dialog_sync import DialogsBootstrapWorker, run_reconciliation_loop
 from .event_handlers import EventHandlerManager
+from .feedback_db import ensure_feedback_schema, get_feedback_db_path
 from .fts import backfill_fts_index
 from .read_state import apply_read_cursor
 from .sync_db import (

@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import re
 import sqlite3
+from datetime import UTC
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -99,7 +100,7 @@ def _broadcast_channel(id_=-1001, **kwargs):
     c.broadcast = True
     c.forum = False
     c.creator = kwargs.get("creator", False)
-    c.admin_rights = kwargs.get("admin_rights", None)
+    c.admin_rights = kwargs.get("admin_rights")
     c.left = kwargs.get("left", False)
     c.restriction_reason = []
     return c
@@ -110,12 +111,12 @@ def _full_channel(**kwargs):
     full = MagicMock()
     full.full_chat = MagicMock(
         participants_count=kwargs.get("participants_count", 1000),
-        linked_chat_id=kwargs.get("linked_chat_id", None),
-        pinned_msg_id=kwargs.get("pinned_msg_id", None),
-        slowmode_seconds=kwargs.get("slowmode_seconds", None),
-        about=kwargs.get("about", None),
+        linked_chat_id=kwargs.get("linked_chat_id"),
+        pinned_msg_id=kwargs.get("pinned_msg_id"),
+        slowmode_seconds=kwargs.get("slowmode_seconds"),
+        about=kwargs.get("about"),
         available_reactions=kwargs.get("available_reactions", ChatReactionsNone()),
-        chat_photo=kwargs.get("chat_photo", None),
+        chat_photo=kwargs.get("chat_photo"),
     )
     return full
 
@@ -231,7 +232,7 @@ async def test_get_entity_info_no_download_keys_channel() -> None:
 
     def _walk_keys(o):
         if isinstance(o, dict):
-            for k in o.keys():
+            for k in o:
                 yield k
                 yield from _walk_keys(o[k])
         elif isinstance(o, list):
@@ -254,13 +255,13 @@ async def test_get_entity_info_channel_avatar_search_fails_d20_fallback() -> Non
     avatar_history`) would skip — leaving avatar_count == 0 while a
     current photo is present. That contradicts D-20.
     """
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     chan = _broadcast_channel(id_=-1007)
     # full_chat.chat_photo is set (current avatar known).
     chat_photo = MagicMock()
     chat_photo.id = 99999
-    chat_photo.date = datetime(2024, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+    chat_photo.date = datetime(2024, 6, 1, 12, 0, 0, tzinfo=UTC)
     full = _full_channel()
     full.full_chat.chat_photo = chat_photo
 
@@ -386,8 +387,10 @@ async def test_get_entity_info_channel_admin_enumerates_subscribers_large() -> N
 
     # GetParticipantsRequest(filter=ChannelParticipantsContacts) returns 2 contacts.
     gp_result = MagicMock()
-    u1 = MagicMock(); u1.id = 111
-    u2 = MagicMock(); u2.id = 222
+    u1 = MagicMock()
+    u1.id = 111
+    u2 = MagicMock()
+    u2.id = 222
     gp_result.users = [u1, u2]
     client = _mock_client(full, gp_result)
     client.get_entity = AsyncMock(return_value=ch)

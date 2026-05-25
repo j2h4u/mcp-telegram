@@ -2,7 +2,7 @@
 
 Universal replacement covering User / Bot / BroadcastChannel / Supergroup /
 LegacyChat. DB-first cache with 5-minute TTL on the daemon side; tool itself
-is the formatter.
+maps daemon data into the structured MCP response.
 """
 
 from datetime import UTC, datetime
@@ -11,24 +11,21 @@ import phonenumbers
 from pydantic import Field
 
 from ..errors import (
-    ambiguous_entity_text,
     entity_not_found_text,
     fetch_entity_info_error_text,
 )
-from ..formatter import frame_telegram_content
 from ._base import (
     DaemonNotRunningError,
     ToolAnnotations,
     ToolArgs,
     ToolResult,
     _daemon_not_running_text,
-    _text_response,
     daemon_connection,
     error_result,
     mcp_tool,
+    structured_result,
 )
-from .structured import TelegramContentKind, structured_warning, telegram_content
-
+from .structured import StructuredWarning, TelegramContentKind, structured_warning, telegram_content
 
 GET_ENTITY_INFO_OUTPUT_SCHEMA = {
     "type": "object",
@@ -112,28 +109,6 @@ def _phone_country(phone: str) -> str | None:
         return None
 
 
-def _format_status(status: dict | None) -> str | None:
-    if not status:
-        return None
-    kind = status.get("type")
-    if kind == "online":
-        return "online"
-    if kind == "offline":
-        was_online = status.get("was_online")
-        return f"last seen {was_online}" if was_online else "offline"
-    if kind == "recently":
-        return "last seen recently"
-    if kind == "last_week":
-        return "last seen last week"
-    if kind == "last_month":
-        return "last seen last month"
-    return None
-
-
-def _append_framed_field(lines: list[str], label: str, text: str) -> None:
-    lines.append(f"{label}:\n{frame_telegram_content(text)}")
-
-
 def _content_field(path: str, text: str | None, kind: TelegramContentKind) -> dict[str, object] | None:
     if not text:
         return None
@@ -146,6 +121,26 @@ def _content_field(path: str, text: str | None, kind: TelegramContentKind) -> di
             "is_untrusted": True,
         },
     }
+
+
+def _entity_candidate_payload(match: dict) -> dict[str, object]:
+    candidate: dict[str, object] = {
+        "entity_id": match.get("entity_id"),
+        "score": match.get("score"),
+        "entity_type": match.get("entity_type"),
+        "untrusted_content": True,
+        "trust": {
+            "source": "telegram",
+            "is_untrusted": True,
+        },
+    }
+    if display_name := match.get("display_name"):
+        candidate["display_name_content"] = telegram_content(str(display_name), "message_text")
+    if username := match.get("username"):
+        candidate["username_content"] = telegram_content(str(username), "message_text")
+    if hint := match.get("disambiguation_hint"):
+        candidate["disambiguation_hint_content"] = telegram_content(str(hint), "message_text")
+    return candidate
 
 
 def _restriction_payloads(restrictions: list[dict] | None, *, base_path: str) -> list[dict[str, object]]:
@@ -225,8 +220,8 @@ def _privacy_or_access_structured(data: dict) -> dict[str, object]:
     }
 
 
-def _entity_warnings(data: dict) -> list[dict[str, object]]:
-    warnings: list[dict[str, object]] = []
+def _entity_warnings(data: dict) -> list[StructuredWarning]:
+    warnings: list[StructuredWarning] = []
     contacts_reason = data.get("contacts_reason")
     if contacts_reason:
         warnings.append(
@@ -507,7 +502,7 @@ def _type_specific_structured(data: dict) -> dict[str, object]:
 
 def _entity_structured_content(
     *,
-    args: "GetEntityInfo",
+    args: GetEntityInfo,
     data: dict,
     entity_id: int,
     display_name: str,
@@ -604,17 +599,14 @@ async def get_entity_info(args: GetEntityInfo) -> ToolResult:
 
         if resolve_status == "candidates":
             matches = resolve_data.get("matches", [])
-            match_lines = []
-            for match in matches:
-                line = f'id={match["entity_id"]} name="{match["display_name"]}" score={match["score"]}'
-                if match.get("username"):
-                    line += f" @{match['username']}"
-                if match.get("entity_type"):
-                    line += f" [{match['entity_type']}]"
-                if match.get("disambiguation_hint"):
-                    line += f'  hint="{match["disambiguation_hint"]}"'
-                match_lines.append(line)
-            return error_result(ambiguous_entity_text(args.entity, match_lines, retry_tool="GetEntityInfo"))
+            return error_result(
+                "Multiple entities matched.\n"
+                "Action: Retry get_entity_info with one numeric entity_id from structuredContent.candidates.",
+                structured_content={
+                    "error": "ambiguous_entity",
+                    "candidates": [_entity_candidate_payload(match) for match in matches if isinstance(match, dict)],
+                },
+            )
 
         entity_id = resolve_data["entity_id"]
         display_name = resolve_data["display_name"]
@@ -634,51 +626,6 @@ async def get_entity_info(args: GetEntityInfo) -> ToolResult:
         return error_result(fetch_entity_info_error_text(args.entity, error_msg))
 
     data = response.get("data", {})
-    entity_type = data.get("type", "unknown")
-
-    # ---------- Common envelope (rendered for ALL types) ----------
-    lines: list[str] = [f'[resolved: "{display_name}"]']
-    name = data.get("name") or "?"
-    username = data.get("username") or "none"
-    id_line = f"id={entity_id} type={entity_type} name='{name}' username=@{username}"
-    lines.append(id_line)
-
-    about = data.get("about")
-    if about:
-        _append_framed_field(lines, "about", about)
-
-    my_membership = data.get("my_membership") or {}
-    if my_membership:
-        mem_parts = []
-        if my_membership.get("is_member"):
-            mem_parts.append("member")
-        if my_membership.get("is_admin"):
-            mem_parts.append("admin")
-        if mem_parts:
-            lines.append("my_membership: " + ", ".join(mem_parts))
-
-    avatar_history = data.get("avatar_history") or []
-    avatar_count = data.get("avatar_count") or len(avatar_history)
-    if avatar_history:
-        now = datetime.now(tz=UTC)
-        avatar_lines = [f"avatars ({avatar_count} total, showing {len(avatar_history)}):"]
-        for idx, photo in enumerate(avatar_history, start=1):
-            iso = photo.get("date", "") or ""
-            relative = _format_relative_ymd(iso, now=now) if iso else "?"
-            absolute = iso[:10] if iso else "?"
-            avatar_lines.append(f"  {idx}. {relative} ({absolute}) id={photo.get('photo_id')}")
-        lines.append("\n".join(avatar_lines))
-
-    # ---------- Per-type rendering ----------
-    if entity_type in ("user", "bot"):
-        _render_user_or_bot(data, lines)
-    elif entity_type == "channel":
-        _render_channel(data, lines)
-    elif entity_type == "supergroup":
-        _render_supergroup(data, lines)
-    elif entity_type == "group":
-        _render_group(data, lines)
-
     structured_content = _entity_structured_content(
         args=args,
         data=data,
@@ -686,234 +633,4 @@ async def get_entity_info(args: GetEntityInfo) -> ToolResult:
         display_name=display_name,
         resolution=resolution,
     )
-    return ToolResult(
-        content=_text_response("\n".join(lines)),
-        structured_content=structured_content,
-        result_count=1,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Per-type rendering — User/Bot block preserved verbatim from old user_info.py
-# ---------------------------------------------------------------------------
-
-
-def _render_user_or_bot(data: dict, lines: list[str]) -> None:
-    lines.append(f"is_bot: {str(bool(data.get('bot', False))).lower()}")
-    flags = [
-        label
-        for label, val in [
-            ("verified", data.get("verified")),
-            ("premium", data.get("premium")),
-            ("bot", data.get("bot")),
-            ("scam", data.get("scam")),
-            ("fake", data.get("fake")),
-            ("restricted", data.get("restricted")),
-        ]
-        if val
-    ]
-    if flags:
-        lines.append("flags: " + ", ".join(flags))
-
-    status_str = _format_status(data.get("status"))
-    if status_str:
-        lines.append(f"status: {status_str}")
-
-    contact: bool = data.get("contact", False)
-    mutual_contact: bool = data.get("mutual_contact", False)
-    close_friend: bool = data.get("close_friend", False)
-    blocked: bool = data.get("blocked", False)
-    if contact or mutual_contact or close_friend or blocked:
-        rel_parts = []
-        if contact:
-            rel_parts.append("mutual" if mutual_contact else "contact")
-        if close_friend:
-            rel_parts.append("close friend")
-        if blocked:
-            rel_parts.append("blocked by you")
-        lines.append("relationship: " + ", ".join(rel_parts))
-
-    phone = data.get("phone")
-    if phone:
-        country = _phone_country(phone)
-        country_suffix = f" ({country})" if country else ""
-        lines.append(f"phone: {phone}{country_suffix}")
-    lang_code = data.get("lang_code")
-    if lang_code:
-        lines.append(f"lang: {lang_code}")
-
-    birthday = data.get("birthday")
-    if birthday:
-        bday_parts = list(filter(None, [
-            str(birthday.get("day")) if birthday.get("day") else None,
-            str(birthday.get("month")) if birthday.get("month") else None,
-            str(birthday.get("year")) if birthday.get("year") else None,
-        ]))
-        lines.append(f"birthday: {'/'.join(bday_parts)}")
-    personal_channel_id = data.get("personal_channel_id")
-    if personal_channel_id:
-        lines.append(f"personal_channel_id={personal_channel_id}")
-    emoji_status_id = data.get("emoji_status_id")
-    if emoji_status_id:
-        lines.append(f"emoji_status_id={emoji_status_id}")
-
-    folder_id: int | None = data.get("folder_id")
-    folder_name: str | None = data.get("folder_name")
-    if folder_id is not None:
-        folder_display = f"{folder_name} (id={folder_id})" if folder_name else f"id={folder_id}"
-        lines.append(f"folder: {folder_display}")
-
-    send_paid_stars = data.get("send_paid_messages_stars")
-    if send_paid_stars:
-        lines.append(f"paid_messages: {send_paid_stars} stars required")
-    ttl_period = data.get("ttl_period")
-    if ttl_period:
-        days = ttl_period // 86400
-        lines.append(f"auto_delete: {days}d" if days else f"auto_delete: {ttl_period}s")
-    private_forward_name = data.get("private_forward_name")
-    if private_forward_name:
-        lines.append(f"forwards_as: {private_forward_name}")
-    for rr in data.get("restriction_reason") or []:
-        text = rr.get("text")
-        line = f"restriction: [{rr.get('platform')}] {rr.get('reason')}"
-        if text:
-            line = f"{line}\n{frame_telegram_content(text)}"
-        lines.append(line)
-
-    bot_info = data.get("bot_info")
-    if bot_info:
-        if bot_info.get("description"):
-            _append_framed_field(lines, "bot_description", bot_info["description"])
-        cmds = bot_info.get("commands") or []
-        if cmds:
-            cmd_str = ", ".join(f"/{c['command']}" for c in cmds)
-            lines.append(f"bot_commands: {cmd_str}")
-
-    business_intro = data.get("business_intro")
-    if business_intro:
-        title = business_intro.get("title")
-        if title:
-            lines.append(f"business_intro: {title}")
-        description = business_intro.get("description")
-        if description:
-            _append_framed_field(lines, "business_intro_description", description)
-    business_location = data.get("business_location")
-    if business_location:
-        addr = business_location.get("address")
-        lat = business_location.get("lat")
-        lon = business_location.get("long")
-        loc_parts = []
-        if lat is not None and lon is not None:
-            loc_parts.append(f"({lat}, {lon})")
-        if loc_parts:
-            lines.append("business_location: " + ", ".join(loc_parts))
-        if addr:
-            _append_framed_field(lines, "business_location_address", addr)
-    business_work_hours = data.get("business_work_hours")
-    if business_work_hours:
-        tz = business_work_hours.get("timezone")
-        lines.append(f"business_hours: configured (timezone={tz})")
-
-    note = data.get("note")
-    if note:
-        _append_framed_field(lines, "note", note)
-
-    common_chats = data.get("common_chats") or []
-    chat_lines = [f"  id={chat['id']} type={chat['type']} name='{chat['name']}'" for chat in common_chats]
-    chats_text = "\n".join(chat_lines) if chat_lines else "  (none)"
-    lines.append(f"Common chats ({len(common_chats)}):\n{chats_text}")
-
-
-def _render_channel(data: dict, lines: list[str]) -> None:
-    subs = data.get("subscribers_count")
-    if subs is not None:
-        lines.append(f"subscribers_count: {subs}")
-    linked = data.get("linked_chat_id")
-    if linked is not None:
-        lines.append(f"linked_chat_id: {linked}")
-    pinned = data.get("pinned_msg_id")
-    if pinned is not None:
-        lines.append(f"pinned_msg_id: {pinned}")
-    slow = data.get("slow_mode_seconds")
-    if slow is not None:
-        lines.append(f"slow_mode_seconds: {slow}")
-    ar = data.get("available_reactions") or {}
-    if ar:
-        kind = ar.get("kind", "none")
-        if kind == "all":
-            lines.append("available_reactions: all")
-        elif kind == "some":
-            lines.append("available_reactions: " + ", ".join(ar.get("emojis", [])))
-        else:
-            lines.append("available_reactions: none")
-    for rr in data.get("restrictions") or []:
-        text = rr.get("text")
-        line = f"restriction: [{rr.get('platform')}] {rr.get('reason')}"
-        if text:
-            line = f"{line}\n{frame_telegram_content(text)}"
-        lines.append(line)
-    _render_contacts_subscribed(data, lines)
-
-
-def _render_supergroup(data: dict, lines: list[str]) -> None:
-    mc = data.get("members_count")
-    if mc is not None:
-        lines.append(f"members_count: {mc}")
-    linked = data.get("linked_broadcast_id")
-    if linked is not None:
-        lines.append(f"linked_broadcast_id: {linked}")
-    slow = data.get("slow_mode_seconds")
-    if slow is not None:
-        lines.append(f"slow_mode_seconds: {slow}")
-    if data.get("has_topics"):
-        lines.append("has_topics: yes")
-    for rr in data.get("restrictions") or []:
-        text = rr.get("text")
-        line = f"restriction: [{rr.get('platform')}] {rr.get('reason')}"
-        if text:
-            line = f"{line}\n{frame_telegram_content(text)}"
-        lines.append(line)
-    _render_contacts_subscribed(data, lines)
-
-
-def _render_group(data: dict, lines: list[str]) -> None:
-    mc = data.get("members_count")
-    if mc is not None:
-        lines.append(f"members_count: {mc}")
-    migrated = data.get("migrated_to")
-    if migrated is not None:
-        lines.append(f"migrated_to: {migrated}  (re-run GetEntityInfo with this id to inspect the migrated supergroup)")
-    invite = data.get("invite_link")
-    if invite:
-        lines.append(f"invite_link: {invite}")
-    for rr in data.get("restrictions") or []:
-        text = rr.get("text")
-        line = f"restriction: [{rr.get('platform')}] {rr.get('reason')}"
-        if text:
-            line = f"{line}\n{frame_telegram_content(text)}"
-        lines.append(line)
-    _render_contacts_subscribed(data, lines)
-
-
-def _render_contacts_subscribed(data: dict, lines: list[str]) -> None:
-    contacts = data.get("contacts_subscribed")
-    partial = data.get("contacts_subscribed_partial", False)
-    reason = data.get("contacts_reason")
-    if contacts is None:
-        tag = f" (reason: {reason})" if reason else ""
-        lines.append(f"contacts_subscribed: null{tag}")
-        return
-    if not contacts:
-        tag = f" (reason: {reason})" if reason else ""
-        lines.append(f"contacts_subscribed: (none in your DM peers){tag}")
-        return
-    partial_tag = " — partial (contact-filter only)" if partial else ""
-    contact_lines = [f"contacts_subscribed ({len(contacts)}{partial_tag}):"]
-    for c in contacts:
-        entry = f"  id={c['id']}"
-        if c.get("name"):
-            entry += f" name='{c['name']}'"
-        if c.get("username"):
-            entry += f" @{c['username']}"
-        contact_lines.append(entry)
-    lines.append("\n".join(contact_lines))
+    return structured_result(structured_content, result_count=1)

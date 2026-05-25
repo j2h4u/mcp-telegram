@@ -2,28 +2,28 @@ from datetime import UTC, datetime
 
 from pydantic import Field, model_validator
 
-from ..errors import dialog_not_found_text, invalid_navigation_text, search_no_hits_text
+from ..errors import dialog_not_found_text, invalid_navigation_text
 from ..formatter import (
     _compute_inline_markers,
     _render_read_state_header,
-    frame_telegram_snippet,
     format_messages,
+    frame_telegram_snippet,
     resolve_sender_label,
 )
 from ..models import ReadMessage
 from ..resolver import parse_exact_dialog_id
-from .structured import TelegramContentKind, structured_warning, telegram_content
 from ._base import (
     DaemonNotRunningError,
     ToolAnnotations,
     ToolArgs,
     ToolResult,
     _daemon_not_running_text,
-    _text_response,
     daemon_connection,
     error_result,
     mcp_tool,
+    structured_result,
 )
+from .structured import StructuredWarning, TelegramContent, TelegramContentKind, structured_warning, telegram_content
 
 # ---------------------------------------------------------------------------
 # Shared archived-dialog warning formatter
@@ -57,7 +57,7 @@ def _format_archived_warning(data: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# format_messages adapter for daemon data
+# Text renderers for future non-MCP surfaces
 # ---------------------------------------------------------------------------
 
 
@@ -344,7 +344,7 @@ def _list_messages_coverage(data: dict) -> dict[str, object]:
     }
 
 
-def _list_messages_warnings(data: dict) -> list[dict[str, object]]:
+def _list_messages_warnings(data: dict) -> list[StructuredWarning]:
     archived_warning = _format_archived_warning(data).strip()
     if not archived_warning:
         return []
@@ -390,10 +390,23 @@ _READ_MARKER_METADATA = {
 }
 
 
-def _content_or_none(text: str | None, kind: TelegramContentKind) -> dict[str, object] | None:
+def _content_or_none(text: str | None, kind: TelegramContentKind) -> TelegramContent | None:
     if not text:
         return None
     return telegram_content(text, kind)
+
+
+def _topic_candidate_payload(topic: dict) -> dict[str, object]:
+    title = topic.get("title") or ""
+    return {
+        "topic_id": topic.get("id", topic.get("topic_id")),
+        "title_content": telegram_content(str(title), "message_text"),
+        "untrusted_content": True,
+        "trust": {
+            "source": "telegram",
+            "is_untrusted": True,
+        },
+    }
 
 
 def _message_date(sent_at: int) -> str:
@@ -501,7 +514,7 @@ def _list_messages_structured_messages(
 
 def _list_messages_structured_content(
     *,
-    args: "ListMessages",
+    args: ListMessages,
     data: dict,
     rows: list[dict],
     dialog_id: int | None,
@@ -759,7 +772,7 @@ def _search_dialog_name(rows: list[dict], global_mode: bool, dialog_label: str |
 
 def _search_structured_content(
     *,
-    args: "SearchMessages",
+    args: SearchMessages,
     data: dict,
     rows: list[dict],
     dialog_id: int | None,
@@ -815,29 +828,12 @@ def _format_search_results(
     global_mode: bool = False,
     read_state_per_dialog: dict[int, dict] | None = None,
 ) -> str:
-    """Format search result rows as compact snippet lines with msg_id anchors.
-
-    Each line:  [DialogName] YYYY-MM-DD HH:MM Sender (msg_id:N): "...snippet..."
-
-    dialog_name prefix is included only when global_mode=True.
-
-    Phase 39.3 (HIGH-1): when ``read_state_per_dialog`` is supplied, the output
-    is prefixed with a per-dialog header block — one read-state header (collapsed
-    or split per AC-5/6) per DM dialog whose hits appear in results. Non-DM
-    dialog_ids are absent from the map per the daemon contract and therefore
-    emit no header line.
-
-    Markers are a full-message concept; snippet lines are not full messages.
-    Per-dialog header block above covers SPEC R5/AC-5/6 for search — inline
-    snippet lines do NOT get the four inline markers (documented trade-off).
-    """
+    """Format search result rows as compact snippet lines with msg_id anchors."""
     if not rows:
         return ""
 
-    # Build header block first (Phase 39.3 HIGH-1).
     header_lines: list[str] = []
     if read_state_per_dialog:
-        # Preserve first-seen order across results (stable for tests).
         seen: dict[int, str | None] = {}
         for row in rows:
             did = row.get("dialog_id")
@@ -860,8 +856,6 @@ def _format_search_results(
     for row in rows:
         msg_id = row["message_id"]
         sent_at = row.get("sent_at") or 0
-        # Phase 39.1-02: shared 5-branch resolution with formatter.resolve_sender_label.
-        # Single source of truth — same decision tree for list_messages and search_messages.
         sender = resolve_sender_label(row)
         dt = datetime.fromtimestamp(int(sent_at), tz=UTC)
         time_str = dt.strftime("%Y-%m-%d %H:%M")
@@ -888,8 +882,9 @@ class ListMessages(ToolArgs):
     target dialog is already known. This tool does not support a global "latest messages across all
     dialogs" mode.
 
-    Returns messages in human-readable format (HH:mm FirstName: text) with date headers and
-    session breaks.
+    Returns structured messages with stable ids, timestamps, sender metadata, content fields,
+    read-state metadata, coverage, filters, limits, truncation, and pagination metadata in
+    structuredContent. Successful MCP responses intentionally leave text content empty.
 
     Use navigation="newest" (or omit navigation) to start from the latest messages.
     Use navigation="oldest" to start from the oldest messages in the dialog.
@@ -912,18 +907,16 @@ class ListMessages(ToolArgs):
     both fuzzy and exact selectors in the same request.
 
     **Read-state annotations** (DMs only):
-    The response begins with a one-line `[read-state: all caught up]` when both sides are clean, OR two lines `[inbox: …]` / `[outbox: …]` (each independently `all read`, `N unread …`, or `unknown (sync pending)`).
-    Inline trailing markers fire on at most four message lines per page:
-      `[I read up to here]` — last incoming you read.
-      `[unread by me]` — first incoming on this page you have not read.
-      `[peer read up to here]` — last outgoing the peer read.
-      `[unread by peer]` — first outgoing on this page the peer has not read.
-    Check the header first for triage, then inspect inline markers if reading the full history.
+    structuredContent.read_state.header_lines carries `[read-state: all caught up]` or
+    `[inbox: ...]` / `[outbox: ...]` status lines (`all read`, `N unread ...`, or `unknown`).
+    structuredContent.messages[].inline_markers carries page-local read cursor markers:
+    `[I read up to here]`, `[unread by me]`, `[peer read up to here]`, `[unread by peer]`.
+    Check read_state first for triage, then inspect inline_markers if reading the full history.
 
     When this tool is called with `context_message_id` on a dialog that has not been fully
     synced ("fragment" dialog), the daemon performs a targeted message fetch. In that case,
-    the response is prefixed with a `Coverage: fragment` header — treat the returned messages
-    as a snippet, NOT the full chat history.
+    structuredContent.coverage.state is `fragment`; treat the returned messages as a snippet,
+    NOT the full chat history.
     """
 
     dialog: str | None = Field(
@@ -1022,8 +1015,11 @@ async def _resolve_topic_id(
 
     if not response.get("ok"):
         error = response.get("error", "unknown")
-        error_detail = response.get("message", "")
-        return error_result(f"Topic lookup failed: {error}: {error_detail}")
+        error_detail = response.get("message", "Request failed.")
+        return error_result(
+            f"Topic lookup failed: {error}: {error_detail}\n"
+            "Action: Call list_topics for this dialog, then retry list_messages with a numeric exact_topic_id.",
+        )
 
     topics = response.get("data", {}).get("topics", [])
     query = topic_name.lower()
@@ -1036,10 +1032,19 @@ async def _resolve_topic_id(
         exact_matches = [t for t in fuzzy_matches if (t.get("title") or "").lower() == query]
         if len(exact_matches) == 1:
             return exact_matches[0]["id"]
-        names = ", ".join(t.get("title", "?") for t in fuzzy_matches[:5])
-        return error_result(f"Ambiguous topic '{topic_name}'. Matches: {names}. Use exact_topic_id.")
+        return error_result(
+            "Multiple topics matched.\n"
+            "Action: Retry list_messages with one numeric exact_topic_id from structuredContent.candidates.",
+            structured_content={
+                "error": "ambiguous_topic",
+                "candidates": [_topic_candidate_payload(topic) for topic in fuzzy_matches[:5]],
+            },
+        )
 
-    return error_result(f"Topic '{topic_name}' not found in this dialog.")
+    return error_result(
+        "Topic was not found in this dialog.\n"
+        "Action: Call list_topics for this dialog, then retry list_messages with a numeric exact_topic_id.",
+    )
 
 
 @mcp_tool(
@@ -1093,7 +1098,10 @@ async def list_messages(args: ListMessages) -> ToolResult:
         if isinstance(resolved, ToolResult):
             return ToolResult(
                 content=resolved.content,
+                is_error=resolved.is_error,
+                structured_content=resolved.structured_content,
                 has_filter=has_filter,
+                has_cursor=has_cursor,
             )
         topic_id = resolved
 
@@ -1128,44 +1136,20 @@ async def list_messages(args: ListMessages) -> ToolResult:
         if error == "not_synced":
             return error_result(
                 "Error: dialog is not synced. "
-                "Use MarkDialogForSync to enable sync, then wait for syncing to complete.",
+                "Action: Use MarkDialogForSync to enable sync, then wait for syncing to complete.",
                 has_filter=has_filter,
                 has_cursor=has_cursor,
             )
         return error_result(
-            f"Error: {error}: {error_detail}",
+            f"Error: {error}: {error_detail}\n"
+            "Action: Retry list_messages with corrected arguments, or call list_dialogs/list_topics first to discover valid ids.",
             has_filter=has_filter,
             has_cursor=has_cursor,
         )
 
     data = response.get("data", {})
     rows = data.get("messages", [])
-    source = data.get("source", "unknown")
     next_nav = data.get("next_navigation")
-    coverage = data.get("coverage")
-
-    # Phase 39.3: extract read_state + dialog_type from daemon response (absent
-    # in pre-39.3 responses → backward compat: format_messages no-ops).
-    read_state = data.get("read_state")
-    dialog_type = data.get("dialog_type")
-    text = _format_daemon_messages(rows, read_state=read_state, dialog_type=dialog_type)
-    if not text:
-        text = "No messages found."
-
-    warning = _format_archived_warning(data)
-    source_note = f"[source: {source}]\n" if source else ""
-    nav_note = f"\nnext_navigation: {next_nav}" if next_nav else ""
-    result_text = warning + source_note + text + nav_note
-
-    # Phase 999.1: surface coverage='fragment' annotation when daemon returns it.
-    # Prepend a header so the agent knows the result is a point-fetched snippet,
-    # not the full chat history.
-    if coverage == "fragment":
-        fragment_header = (
-            "Coverage: fragment (partial — only point-fetched snippets; "
-            "full sync not performed on this dialog)."
-        )
-        result_text = f"{fragment_header}\n\n{result_text}"
 
     structured_content = _list_messages_structured_content(
         args=args,
@@ -1178,9 +1162,8 @@ async def list_messages(args: ListMessages) -> ToolResult:
         direction=direction,
         next_navigation=next_nav,
     )
-    return ToolResult(
-        content=_text_response(result_text),
-        structured_content=structured_content,
+    return structured_result(
+        structured_content,
         result_count=len(rows),
         has_filter=has_filter,
         has_cursor=has_cursor or bool(next_nav),
@@ -1300,7 +1283,8 @@ async def search_messages(args: SearchMessages) -> ToolResult:
                 has_cursor=args.navigation is not None,
             )
         return error_result(
-            f"Error: {error}: {error_detail}",
+            f"Error: {error}: {error_detail}\n"
+            "Action: Retry search_messages with corrected arguments, or call list_dialogs first to discover a valid dialog id.",
             has_filter=True,
             has_cursor=args.navigation is not None,
         )
@@ -1320,32 +1304,15 @@ async def search_messages(args: SearchMessages) -> ToolResult:
     )
 
     if not rows:
-        result_text = search_no_hits_text(dialog_label, args.query)
-        return ToolResult(
-            content=_text_response(result_text),
-            structured_content=structured_content,
+        return structured_result(
+            structured_content,
             result_count=0,
             has_filter=True,
             has_cursor=args.navigation is not None,
         )
 
-    # Phase 39.3 (HIGH-1): extract per-dialog read_state map from daemon
-    # response (absent in pre-39.3 responses → backward compat: no header block).
-    read_state_per_dialog = data.get("read_state_per_dialog")
-    text = _format_search_results(
-        rows,
-        args.query,
-        global_mode=global_mode,
-        read_state_per_dialog=read_state_per_dialog,
-    )
-    nav_note = f"\nnext_navigation: {next_nav}" if next_nav else ""
-
-    warning = _format_archived_warning(data)
-    result_text = warning + text + nav_note
-
-    return ToolResult(
-        content=_text_response(result_text),
-        structured_content=structured_content,
+    return structured_result(
+        structured_content,
         result_count=len(rows),
         has_filter=True,
         has_cursor=args.navigation is not None or bool(next_nav),

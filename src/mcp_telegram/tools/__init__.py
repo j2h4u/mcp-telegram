@@ -13,9 +13,13 @@ from ._base import (
     tool_runner,
     verify_tool_registry,
 )
+from .account_trace import TraceAccountMessages, trace_account_messages
+from .activity import GetMyRecentActivity, get_my_recent_activity
 
 # --- Domain modules (import triggers @mcp_tool registration) ---
 from .discovery import ListDialogs, ListTopics, list_dialogs, list_topics
+from .entity_info import GetEntityInfo, get_entity_info
+from .feedback import SubmitFeedback, submit_feedback
 from .reading import ListMessages, SearchMessages, list_messages, search_messages
 from .stats import GetDialogStats, GetUsageStats, get_dialog_stats, get_usage_stats
 from .sync import (
@@ -26,13 +30,10 @@ from .sync import (
     get_sync_status,
     mark_dialog_for_sync,
 )
-from .activity import GetMyRecentActivity, get_my_recent_activity  # noqa: F401
 from .unread import GetInbox, get_inbox
-from .entity_info import GetEntityInfo, get_entity_info
-from .feedback import SubmitFeedback, submit_feedback
-from .account_trace import TraceAccountMessages, trace_account_messages
 
 __all__ = [
+    "TOOL_REGISTRY",
     "DaemonNotRunningError",
     "GetDialogStats",
     "GetEntityInfo",
@@ -47,7 +48,6 @@ __all__ = [
     "MarkDialogForSync",
     "SearchMessages",
     "SubmitFeedback",
-    "TOOL_REGISTRY",
     "ToolArgs",
     "ToolResult",
     "TraceAccountMessages",

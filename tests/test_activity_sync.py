@@ -3,9 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -17,7 +16,6 @@ from mcp_telegram.activity_sync import (
     run_activity_sync_loop,
 )
 from mcp_telegram.sync_db import ensure_sync_schema
-
 
 # -- Fakes --------------------------------------------------------
 
@@ -81,7 +79,7 @@ def _make_db(tmp_path) -> sqlite3.Connection:
 def _msg(msg_id: int, user_id: int, ts: int, text: str = "hi", replies: int = 0, out: bool = True) -> FakeMessage:
     return FakeMessage(
         id=msg_id,
-        date=datetime.fromtimestamp(ts, tz=timezone.utc),
+        date=datetime.fromtimestamp(ts, tz=UTC),
         message=text,
         peer_id=PeerUser(user_id=user_id),
         replies=FakeReplies(replies=replies) if replies else None,

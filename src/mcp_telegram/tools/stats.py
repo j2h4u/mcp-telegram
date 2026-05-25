@@ -13,10 +13,10 @@ from ._base import (
     ToolArgs,
     ToolResult,
     _daemon_not_running_text,
-    _text_response,
     daemon_connection,
     error_result,
     mcp_tool,
+    structured_result,
 )
 
 logger = logging.getLogger(__name__)
@@ -227,17 +227,11 @@ async def get_usage_stats(args: GetUsageStats) -> ToolResult:
     stats = response.get("data", {})
     if not stats or stats.get("total_calls", 0) == 0:
         summary = no_usage_data_text()
-        return ToolResult(
-            content=_text_response(summary),
-            structured_content=_usage_structured_content(stats, summary=summary, empty=True),
-        )
+        return structured_result(_usage_structured_content(stats, summary=summary, empty=True))
 
     summary = format_usage_summary(stats)
     summary_text = summary if summary else no_usage_data_text()
-    return ToolResult(
-        content=_text_response(summary_text),
-        structured_content=_usage_structured_content(stats, summary=summary_text, empty=False),
-    )
+    return structured_result(_usage_structured_content(stats, summary=summary_text, empty=False))
 
 
 class GetDialogStats(ToolArgs):
@@ -256,18 +250,6 @@ class GetDialogStats(ToolArgs):
         le=20,
         description="How many top entries to return per category (reactions, mentions, hashtags, forward sources)",
     )
-
-
-def _format_stats_section(title: str, entries: list[dict], key: str) -> list[str]:
-    lines = [f"=== {title} ({len(entries)}) ==="]
-    if not entries:
-        lines.append("  (none)")
-        return lines
-    for e in entries:
-        label = e.get(key) or "?"
-        count = e.get("count", 0)
-        lines.append(f"  {label} count={count}")
-    return lines
 
 
 @mcp_tool(
@@ -294,27 +276,24 @@ async def get_dialog_stats(args: GetDialogStats) -> ToolResult:
         error = response.get("error", "")
         msg = response.get("message", "Request failed.")
         if error == "not_synced":
-            return error_result(f"Error: dialog is not synced. {msg}")
+            return error_result(
+                f"Error: dialog is not synced. {msg}\n"
+                "Action: Call MarkDialogForSync for this dialog, wait for sync completion, then retry GetDialogStats."
+            )
         if error == "dialog_not_found":
             from ..errors import dialog_not_found_text
 
             return error_result(dialog_not_found_text(args.dialog, retry_tool="GetDialogStats"))
-        return error_result(f"Error: {error}: {msg}")
+        return error_result(
+            f"Error: {error}: {msg}\n"
+            "Action: Retry GetDialogStats with a corrected dialog id/name, or call ListDialogs first."
+        )
 
     data = response.get("data", {})
     reactions = data.get("top_reactions", [])
     mentions = data.get("top_mentions", [])
     hashtags = data.get("top_hashtags", [])
     forwards = data.get("top_forwards", [])
-
-    sections: list[str] = []
-    sections += _format_stats_section("Top Reactions", reactions, "emoji")
-    sections += _format_stats_section("Top Mentions", mentions, "value")
-    sections += _format_stats_section("Top Hashtags", hashtags, "value")
-    forwards_flat = [
-        {"label": (f.get("name") or str(f.get("peer_id") or "?")), "count": f.get("count", 0)} for f in forwards
-    ]
-    sections += _format_stats_section("Top Forward Sources", forwards_flat, "label")
 
     total = len(reactions) + len(mentions) + len(hashtags) + len(forwards)
     structured_content = {
@@ -334,8 +313,4 @@ async def get_dialog_stats(args: GetDialogStats) -> ToolResult:
         "count": total,
         "result_count_semantics": "count is the total number of aggregate rows across reactions, mentions, hashtags, and forward sources",
     }
-    return ToolResult(
-        content=_text_response("\n".join(sections)),
-        structured_content=structured_content,
-        result_count=total,
-    )
+    return structured_result(structured_content, result_count=total)

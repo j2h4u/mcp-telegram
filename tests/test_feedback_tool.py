@@ -13,10 +13,9 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from pydantic import ValidationError
 
+from mcp_telegram.daemon_client import DaemonNotRunningError
 from mcp_telegram.tools import TOOL_REGISTRY
 from mcp_telegram.tools.feedback import SubmitFeedback, submit_feedback
-from mcp_telegram.daemon_client import DaemonNotRunningError
-
 
 # ---------------------------------------------------------------------------
 # Test fixture: mock daemon_connection
@@ -46,13 +45,11 @@ def mock_daemon_connection():
 
 @pytest.mark.asyncio
 async def test_submit_feedback_tool_happy_path(mock_daemon_connection) -> None:
-    """Successful submission → content[0].text equals daemon confirmation message."""
+    """Successful submission returns structured-only MCP content."""
     args = SubmitFeedback(message="the bug")
     result = await submit_feedback(args)
 
-    assert len(result.content) == 1
-    assert result.content[0].text == "Feedback recorded. Thank you!"
-    assert "id=" not in result.content[0].text
+    assert result.content == ()
     assert result.structured_content is not None
     assert result.structured_content["accepted"] is True
     assert result.structured_content["follow_up_available"] is False
@@ -74,8 +71,7 @@ async def test_submit_feedback_tool_does_not_expose_feedback_id() -> None:
     with patch("mcp_telegram.tools.feedback.daemon_connection", fake_dc):
         result = await submit_feedback(SubmitFeedback(message="the bug"))
 
-    assert result.content[0].text == "Feedback recorded. Thank you!"
-    assert "id=" not in result.content[0].text
+    assert result.content == ()
     assert result.structured_content is not None
     assert "id" not in result.structured_content
     assert result.structured_content["tracking_id"] is None

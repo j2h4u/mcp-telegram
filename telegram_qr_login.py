@@ -16,17 +16,16 @@ import sys
 from io import StringIO
 from pathlib import Path
 
+import qrcode
 from dotenv import load_dotenv
 from telethon import TelegramClient
 from telethon.errors import PasswordHashInvalidError, SessionPasswordNeededError
-import qrcode
 
 # Загружаем .env
 load_dotenv()
 
 API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
 API_HASH = os.getenv("TELEGRAM_API_HASH", "")
-PHONE = os.getenv("TELEGRAM_PHONE", "")
 TWO_FA_PASSWORD = os.getenv("TELEGRAM_2FA_PASSWORD", "")
 QR_LEFT_PADDING = " " * 6
 QR_BORDER = 4
@@ -63,8 +62,8 @@ def _qr_lifetime(qr_login) -> int:
         1,
         int(
             (
-                qr_login.expires.astimezone(datetime.timezone.utc)
-                - datetime.datetime.now(tz=datetime.timezone.utc)
+                qr_login.expires.astimezone(datetime.UTC)
+                - datetime.datetime.now(tz=datetime.UTC)
             ).total_seconds()
         ),
     )
@@ -142,11 +141,6 @@ async def main():
         print("❌ TELEGRAM_API_ID или TELEGRAM_API_HASH не установлены в .env")
         sys.exit(1)
 
-    if not PHONE:
-        phone = input("📱 Введите номер телефона Telegram (с кодом страны, например +79...): ")
-    else:
-        phone = PHONE
-
     # Используем session в текущей папке
     session_file = Path("telegram_session")
 
@@ -170,8 +164,8 @@ async def main():
         qr_total_seconds = _qr_lifetime(qr_login)
 
         while True:
-            expires_at = qr_login.expires.astimezone(datetime.timezone.utc)
-            now = datetime.datetime.now(tz=datetime.timezone.utc)
+            expires_at = qr_login.expires.astimezone(datetime.UTC)
+            now = datetime.datetime.now(tz=datetime.UTC)
             remaining_seconds = max(0, int((expires_at - now).total_seconds()))
 
             if remaining_seconds <= QR_REFRESH_MARGIN_SECONDS:
@@ -197,8 +191,8 @@ async def main():
             try:
                 wait_timeout = min(10, max(1, remaining_seconds))
                 await qr_login.wait(timeout=wait_timeout)
-            except asyncio.TimeoutError:
-                if datetime.datetime.now(tz=datetime.timezone.utc) >= expires_at:
+            except TimeoutError:
+                if datetime.datetime.now(tz=datetime.UTC) >= expires_at:
                     qr_login = await client.qr_login()
                     qr_total_seconds = _qr_lifetime(qr_login)
                 continue

@@ -19,6 +19,7 @@ import json
 import logging
 import sqlite3
 import time
+from datetime import UTC
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -31,12 +32,10 @@ from mcp_telegram.dialog_sync import (
     _clear_cursor,
     _decode_offset_peer,
     _encode_offset_peer,
-    _extract_dialog_row,
     _get_state,
     _set_state,
 )
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
-
 
 # ---------------------------------------------------------------------------
 # Entity + dialog factories
@@ -68,7 +67,7 @@ def _make_chat_entity(
     title: str = "Group",
     participants_count: int | None = 5,
 ) -> Any:
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     from telethon.tl.types import Chat
 
@@ -77,7 +76,7 @@ def _make_chat_entity(
         title=title,
         photo=None,
         participants_count=participants_count or 0,
-        date=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        date=datetime(2024, 1, 1, tzinfo=UTC),
         version=1,
     )
 
@@ -91,7 +90,7 @@ def _make_channel_entity(
     access_hash: int = 9999,
     date: Any | None = None,
 ) -> Any:
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     from telethon.tl.types import Channel
 
@@ -99,7 +98,7 @@ def _make_channel_entity(
         id=cid,
         title=title,
         photo=None,
-        date=date if date is not None else datetime(2024, 1, 1, tzinfo=timezone.utc),
+        date=date if date is not None else datetime(2024, 1, 1, tzinfo=UTC),
         broadcast=broadcast,
         megagroup=not broadcast,
         access_hash=access_hash,
@@ -118,10 +117,10 @@ def _make_dialog(
     unread_reactions_count: int = 0,
     draft_message: str | None = None,
 ) -> SimpleNamespace:
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     if message_date is None:
-        message_date = datetime(2024, 6, 1, 12, 0, tzinfo=timezone.utc)
+        message_date = datetime(2024, 6, 1, 12, 0, tzinfo=UTC)
     msg = SimpleNamespace(date=message_date)
     draft = SimpleNamespace(message=draft_message) if draft_message is not None else None
     return SimpleNamespace(

@@ -17,9 +17,10 @@ Deployed as a Docker container. MCP clients connect by running `docker exec -i m
 
 ## Tools
 
-All 14 tools expose `outputSchema`. Successful calls include `structuredContent` for
-machine-readable ids, counts, navigation, coverage, and result facts; text content is a
-human-readable preview or fallback.
+All 14 tools expose `outputSchema`. Successful calls are structured-only: agents
+should read `structuredContent` for ids, counts, navigation, coverage, warnings, and
+result facts. Successful `content` is empty; concise text content is reserved for
+recoverable `isError=true` tool errors.
 
 - `list_dialogs` — list chats, channels, groups with unread counts
 - `list_topics` — list forum topics

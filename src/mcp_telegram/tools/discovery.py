@@ -4,11 +4,6 @@ from pydantic import Field
 
 logger = logging.getLogger(__name__)
 
-from ..errors import (
-    bootstrap_pending_text,
-    no_active_topics_text,
-    no_dialogs_text,
-)
 from ..resolver import parse_exact_dialog_id
 from ._base import (
     DaemonNotRunningError,
@@ -17,12 +12,12 @@ from ._base import (
     ToolResult,
     _check_daemon_response,
     _daemon_not_running_text,
-    _text_response,
     daemon_connection,
     error_result,
     mcp_tool,
+    structured_result,
 )
-from .structured import structured_warning, telegram_content
+from .structured import StructuredWarning, structured_warning, telegram_content
 
 TELEGRAM_CONTENT_OUTPUT_SCHEMA = {
     "type": "object",
@@ -206,7 +201,7 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
     dialogs = data.get("dialogs", [])
     snapshot_age_h = data.get("snapshot_age_h")
     bootstrap_pending = bool(data.get("bootstrap_pending", False))
-    warnings: list[dict[str, object]] = []
+    warnings: list[StructuredWarning] = []
     if snapshot_age_h is not None:
         warnings.append(
             structured_warning(
@@ -257,91 +252,18 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
     }
 
     if not dialogs:
-        # Phase 44 (Plan 01 contract): bootstrap_pending=True => dialogs table is
-        # empty (sync hasn't populated yet — SELECT COUNT(*) FROM dialogs = 0).
-        # Render a sync-pending banner; bootstrap_pending=False => truly no
-        # matches (e.g. caller's filter excluded all rows in a populated
-        # table) -> preserve the existing no_dialogs_text behavior.
-        if bootstrap_pending:
-            return ToolResult(
-                content=_text_response(bootstrap_pending_text()),
-                structured_content=structured_content,
-                result_count=0,
-            )
-        return ToolResult(content=_text_response(no_dialogs_text()), structured_content=structured_content)
+        return structured_result(structured_content, result_count=0)
 
     entity_dicts: list[dict] = []
-    lines: list[str] = []
 
-    for d, structured_dialog in zip(dialogs, structured_dialogs, strict=False):
-        dialog_id = d.get("id")
+    for structured_dialog in structured_dialogs:
+        dialog_id = structured_dialog.get("id")
         dialog_name = structured_dialog["name"]
         dialog_type = structured_dialog["type"] or "unknown"
-        last_at = d.get("last_message_at", "unknown")
-        unread_count = structured_dialog["unread_count"]
-        sync_status = d.get("sync_status", "unknown")
-
-        members = d.get("members")
-        created = d.get("created")
-        meta = ""
-        if members is not None:
-            meta += f" members={members}"
-        if created is not None:
-            meta += f" created={created}"
-
-        sync_coverage_pct = d.get("sync_coverage_pct")
-        access_lost_at_ts = d.get("access_lost_at")
-
-        coverage_str = ""
-        if sync_coverage_pct is not None:
-            coverage_str = f" coverage={sync_coverage_pct}%"
-
-        access_str = ""
-        if access_lost_at_ts is not None:
-            access_str = f" access_lost_at={access_lost_at_ts}"
-
-        # Plan 39.3-03 Task 4 (AC-11, D-13): DM rows carry unread_in / unread_out.
-        # Non-DM rows omit both fields from the daemon response; rendering is
-        # conditional on key presence so we don't invent zeros for non-DMs.
-        unread_rw_str = ""
-        if "unread_in" in d and "unread_out" in d:
-            unread_rw_str = f" unread_in={d['unread_in']} unread_out={d['unread_out']}"
-
-        # Phase 44 DIFF-04: inline mentions/reactions/draft tokens.
-        # Zero / empty values are SUPPRESSED (no `mentions=0` noise).
-        # Note: draft text containing double quotes is rendered as-is — accepted
-        # cosmetic behavior (threat-model T-44-07 in 44-02-PLAN.md). The renderer
-        # output is text-only for an LLM; no parser interprets the format.
-        diff_parts: list[str] = []
-        mentions_n = d.get("unread_mentions_count", 0)
-        reactions_n = d.get("unread_reactions_count", 0)
-        draft = d.get("draft_text") or ""
-        if mentions_n:
-            diff_parts.append(f"mentions={mentions_n}")
-        if reactions_n:
-            diff_parts.append(f"reactions={reactions_n}")
-        if draft:
-            diff_parts.append(f'draft="{draft}"')
-        diff_suffix = (" " + " ".join(diff_parts)) if diff_parts else ""
-
-        lines.append(
-            f"name='{dialog_name}' id={dialog_id} type={dialog_type} "
-            f"last_message_at={last_at} unread={unread_count}{meta} "
-            f"sync_status={sync_status}{coverage_str}{access_str}{unread_rw_str}{diff_suffix}"
-        )
 
         # Upsert entities into daemon for future name resolution
         if isinstance(dialog_id, int) and isinstance(dialog_name, str):
             entity_dicts.append({"id": dialog_id, "type": dialog_type, "name": dialog_name, "username": None})
-
-    # Phase 44 LISTDIALOGS-04: trailing snapshot-age annotation. None => fresh
-    # (or unknown — same UX). One line, after all rows. Per RESEARCH.md
-    # Assumption A2 the underlying MAX(snapshot_at) is optimistic; this is
-    # documented in daemon_api.py near _SNAPSHOT_STALE_THRESHOLD_S.
-    result_count = len(lines)
-
-    if snapshot_age_h is not None:
-        lines.append(f"[snapshot_age={snapshot_age_h}h — data may be stale]")
 
     if entity_dicts:
         try:
@@ -350,12 +272,7 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
         except Exception:
             logger.debug("entity_upsert_skipped", exc_info=True)
 
-    result_text = "\n".join(lines)
-    return ToolResult(
-        content=_text_response(result_text),
-        structured_content=structured_content,
-        result_count=result_count,
-    )
+    return structured_result(structured_content, result_count=len(structured_dialogs))
 
 
 class ListTopics(ToolArgs):
@@ -397,7 +314,12 @@ async def list_topics(args: ListTopics) -> ToolResult:
             from ..errors import dialog_not_found_text
 
             return error_result(dialog_not_found_text(args.dialog, retry_tool="ListTopics"), has_filter=True)
-        return error_result(f"Error: {error_msg}", has_filter=True)
+        error_prefix = f"{error_code}: " if error_code else ""
+        return error_result(
+            f"Error: {error_prefix}{error_msg}\n"
+            "Action: Retry ListTopics with a corrected dialog id/name, or call ListDialogs first.",
+            has_filter=True,
+        )
 
     data = response.get("data", {})
     topics = data.get("topics", [])
@@ -425,23 +347,10 @@ async def list_topics(args: ListTopics) -> ToolResult:
     }
 
     if not topics:
-        dialog_display = args.dialog
-        return ToolResult(
-            content=_text_response(no_active_topics_text(dialog_display)),
-            structured_content=structured_content,
-            has_filter=True,
-        )
+        return structured_result(structured_content, has_filter=True)
 
-    lines: list[str] = []
-    for topic in topics:
-        topic_id = topic.get("id")
-        title = topic.get("title", "")
-        lines.append(f'topic_id={topic_id} title="{title}"')
-
-    result_text = "\n".join(lines)
-    return ToolResult(
-        content=_text_response(result_text),
-        structured_content=structured_content,
-        result_count=len(lines),
+    return structured_result(
+        structured_content,
+        result_count=len(structured_topics),
         has_filter=True,
     )

@@ -4,19 +4,19 @@ from typing import Literal
 
 from pydantic import Field, model_validator
 
-from ..formatter import frame_telegram_snippet
 from ._base import (
     DaemonNotRunningError,
     ToolAnnotations,
     ToolArgs,
     ToolResult,
+    _check_daemon_response,
     _daemon_not_running_text,
-    _text_response,
     daemon_connection,
     error_result,
     mcp_tool,
+    structured_result,
 )
-from .structured import navigation_metadata, structured_warning, telegram_content
+from .structured import StructuredWarning, navigation_metadata, structured_warning, telegram_content
 
 TRACE_ACCOUNT_MESSAGES_OUTPUT_SCHEMA = {
     "type": "object",
@@ -158,7 +158,7 @@ TRACE_ACCOUNT_MESSAGES_OUTPUT_SCHEMA = {
         },
         "next_navigation": {"type": ["string", "null"]},
         "navigation": {"type": "object", "additionalProperties": True},
-        "text_preview": {"type": "object", "additionalProperties": True},
+        "preview": {"type": "object", "additionalProperties": True},
         "warnings": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
         "limits": {"type": "object", "additionalProperties": True},
         "result_count_semantics": {"type": "string"},
@@ -172,7 +172,7 @@ TRACE_ACCOUNT_MESSAGES_OUTPUT_SCHEMA = {
         "provenance",
         "next_navigation",
         "navigation",
-        "text_preview",
+        "preview",
         "warnings",
         "limits",
         "result_count_semantics",
@@ -242,7 +242,7 @@ class TraceAccountMessages(ToolArgs):
     )
 
     @model_validator(mode="after")
-    def _validate_scope(self) -> "TraceAccountMessages":
+    def _validate_scope(self) -> TraceAccountMessages:
         if self.exact_topic_id is not None and self.dialog is None and self.exact_dialog_id is None:
             raise ValueError("exact_topic_id requires dialog or exact_dialog_id")
         if self.account is not None and self.exact_account_id is not None:
@@ -275,8 +275,8 @@ def _trace_preview(data: dict, *, evidence_count: int) -> dict[str, object]:
     }
 
 
-def _trace_warnings(data: dict) -> list[dict[str, object]]:
-    warnings: list[dict[str, object]] = []
+def _trace_warnings(data: dict) -> list[StructuredWarning]:
+    warnings: list[StructuredWarning] = []
     gaps = data.get("gaps", [])
     if not isinstance(gaps, list):
         return warnings
@@ -295,7 +295,7 @@ def _trace_warnings(data: dict) -> list[dict[str, object]]:
     return warnings
 
 
-def _trace_limits(data: dict, args: "TraceAccountMessages", *, evidence_count: int) -> dict[str, object]:
+def _trace_limits(data: dict, args: TraceAccountMessages, *, evidence_count: int) -> dict[str, object]:
     provenance = data.get("provenance") if isinstance(data.get("provenance"), dict) else {}
     coverage_bounds = provenance.get("coverage_bounds") if isinstance(provenance, dict) else {}
     return {
@@ -325,7 +325,7 @@ def _attach_trace_content_metadata(data: dict) -> None:
                 item.setdefault("untrusted_content", True)
 
 
-def _trace_structured_content(data: dict, args: "TraceAccountMessages") -> dict[str, object]:
+def _trace_structured_content(data: dict, args: TraceAccountMessages) -> dict[str, object]:
     _attach_trace_content_metadata(data)
     evidence_count = _trace_evidence_count(data)
     next_navigation = data.get("next_navigation")
@@ -334,74 +334,17 @@ def _trace_structured_content(data: dict, args: "TraceAccountMessages") -> dict[
         "is_error_conditions",
         "Only tool validation, daemon-unavailable, and daemon protocol failures set is_error=true.",
     )
-    data.setdefault("text_preview", _trace_preview(data, evidence_count=evidence_count))
+    data.setdefault("preview", _trace_preview(data, evidence_count=evidence_count))
     data.setdefault("warnings", _trace_warnings(data))
     data.setdefault("limits", _trace_limits(data, args, evidence_count=evidence_count))
     data.setdefault("navigation", navigation_metadata(next_navigation if isinstance(next_navigation, str) else None))
     return data
 
 
-def _trace_text_summary(data: dict) -> str:
-    resolved = data.get("resolved_account", {})
-    coverage = data.get("coverage", {})
-    gaps = data.get("gaps", [])
-    groups = data.get("groups", [])
-    next_navigation = data.get("next_navigation")
-    evidence_count = _trace_evidence_count(data)
-
-    label = resolved.get("display_name") or resolved.get("username") or resolved.get("account_id") or "unresolved"
-    lines = [
-        f"Account Trace: {label}",
-        f"evidence_items={evidence_count}",
-        f"coverage_state={coverage.get('state', 'unknown')}",
-        f"gaps={len(gaps) if isinstance(gaps, list) else 0}",
-    ]
-
-    shown = 0
-    for group in groups if isinstance(groups, list) else []:
-        if not isinstance(group, dict):
-            continue
-        evidence = group.get("evidence", [])
-        if not isinstance(evidence, list):
-            continue
-        for item in evidence:
-            if not isinstance(item, dict):
-                continue
-            shown += 1
-            dialog_label = item.get("dialog_title") or item.get("dialog_id")
-            topic_label = f" / {item['topic_title']}" if item.get("topic_title") else ""
-            text = str(item.get("text") or item.get("media_description") or "").replace("\n", " ").strip()
-            snippet = frame_telegram_snippet(text[:180]) if text else "(no text)"
-            lines.append(
-                f"- {dialog_label}{topic_label} msg_id={item.get('message_id')} "
-                f"basis={item.get('authorship_basis')}: {snippet}"
-            )
-            if shown >= 5:
-                break
-        if shown >= 5:
-            break
-
-    if evidence_count > shown:
-        lines.append(f"... {evidence_count - shown} more evidence item(s) in structured_content")
-
-    if isinstance(gaps, list) and gaps:
-        gap_bits = []
-        for gap in gaps[:5]:
-            if not isinstance(gap, dict):
-                continue
-            gap_bits.append(f"{gap.get('kind')}:{gap.get('severity')}")
-        lines.append("gap_summary=" + ", ".join(gap_bits))
-
-    if next_navigation:
-        lines.append(f"next_navigation: {next_navigation}")
-
-    return "\n".join(lines)
-
-
 @mcp_tool(
     name="trace_account_messages",
     title="Account Trace",
-    annotations=ToolAnnotations(readOnlyHint=False, idempotentHint=True),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True),
     output_schema=TRACE_ACCOUNT_MESSAGES_OUTPUT_SCHEMA,
 )
 async def trace_account_messages(args: TraceAccountMessages) -> ToolResult:
@@ -423,21 +366,19 @@ async def trace_account_messages(args: TraceAccountMessages) -> ToolResult:
     except DaemonNotRunningError:
         return error_result(_daemon_not_running_text(), has_filter=True, has_cursor=args.navigation is not None)
 
-    if not response.get("ok"):
-        error = response.get("error", "unknown")
-        error_detail = response.get("message", "Request failed.")
-        return error_result(
-            f"Error: {error}: {error_detail}",
-            has_filter=True,
-            has_cursor=args.navigation is not None,
-        )
+    if err := _check_daemon_response(
+        response,
+        action="Retry trace_account_messages with corrected ids, or call list_dialogs/list_topics first to discover valid scope ids.",
+        has_filter=True,
+        has_cursor=args.navigation is not None,
+    ):
+        return err
 
     data = _trace_structured_content(dict(response.get("data", {})), args)
     evidence_count = _trace_evidence_count(data)
     next_navigation = data.get("next_navigation")
-    return ToolResult(
-        content=_text_response(_trace_text_summary(data)),
-        structured_content=data,
+    return structured_result(
+        data,
         result_count=evidence_count,
         has_filter=True,
         has_cursor=args.navigation is not None or bool(next_navigation),

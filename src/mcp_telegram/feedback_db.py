@@ -26,8 +26,8 @@ __all__ = [
     "VALID_SEVERITIES",
     "VALID_STATUSES",
     "_FEEDBACK_SCHEMA_VERSION",
-    "get_feedback_db_path",
     "ensure_feedback_schema",
+    "get_feedback_db_path",
 ]
 
 _FEEDBACK_SCHEMA_VERSION: int = 2

@@ -69,7 +69,7 @@ def serve(
             help="HTTP bind host for the Streamable HTTP MCP endpoint.",
             envvar="MCP_TELEGRAM_HTTP_HOST",
         ),
-    ] = "0.0.0.0",
+    ] = "127.0.0.1",
     port: Annotated[
         int,
         Option(
@@ -229,8 +229,8 @@ def feedback_status(
     """
     import sys
 
-    from .feedback_db import VALID_STATUSES
     from .daemon_client import daemon_connection
+    from .feedback_db import VALID_STATUSES
 
     if status not in VALID_STATUSES:
         valid_list = ", ".join(sorted(VALID_STATUSES))

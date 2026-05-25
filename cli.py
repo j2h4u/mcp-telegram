@@ -16,9 +16,9 @@ logging.basicConfig(level=logging.DEBUG)
 app = typer.Typer()
 
 
-def typer_async(f):  # noqa: ANN001, ANN201
+def typer_async(f):
     @wraps(f)
-    def wrapper(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+    def wrapper(*args, **kwargs):
         return asyncio.run(f(*args, **kwargs))
 
     return wrapper
@@ -52,8 +52,11 @@ async def call_tool(
     arguments: str = typer.Option(help="Arguments for the tool as JSON string"),
 ) -> None:
     """Handle tool calls for command line run."""
-    for response in await server.call_tool(name, json.loads(arguments)):
-        typer.echo(response)
+    result = await server.call_tool(name, json.loads(arguments))
+    payload = result.model_dump(by_alias=True, mode="json", exclude_none=True)
+    typer.echo(json.dumps(payload, ensure_ascii=False))
+    if result.isError:
+        raise typer.Exit(1)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import re
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -110,7 +111,7 @@ async def test_call_tool_runtime_failure_escaped_error_includes_actionable_guida
 
 
 @pytest.mark.asyncio
-async def test_call_tool_passthrough_action_text_contract(monkeypatch) -> None:
+async def test_call_tool_passthrough_recoverable_error_text_contract(monkeypatch) -> None:
     monkeypatch.setitem(server.tool_by_name, "get_entity_info", _tool("get_entity_info"))
 
     expected = [
@@ -121,12 +122,15 @@ async def test_call_tool_passthrough_action_text_contract(monkeypatch) -> None:
     ]
 
     monkeypatch.setattr("mcp_telegram.server.tools.tool_args", lambda tool, **kwargs: object())
-    monkeypatch.setattr("mcp_telegram.server.tools.tool_runner", AsyncMock(return_value=ToolResult(content=expected)))
+    monkeypatch.setattr(
+        "mcp_telegram.server.tools.tool_runner",
+        AsyncMock(return_value=ToolResult(content=expected, is_error=True)),
+    )
 
     result = await server.call_tool("get_entity_info", {"entity": "Iris"})
 
     assert result.content == expected
-    assert result.isError is False
+    assert result.isError is True
     assert result.content[0].text == expected[0].text
     assert "Action:" in result.content[0].text
     assert "failed" not in result.content[0].text
@@ -189,7 +193,9 @@ def test_list_tools_exposes_snake_case_names_titles_and_annotations() -> None:
     assert server.tool_by_name["mark_dialog_for_sync"].annotations.readOnlyHint is False
     assert server.tool_by_name["mark_dialog_for_sync"].annotations.idempotentHint is True
     assert server.tool_by_name["submit_feedback"].annotations.readOnlyHint is False
+    assert server.tool_by_name["submit_feedback"].annotations.destructiveHint is False
     assert server.tool_by_name["trace_account_messages"].annotations.readOnlyHint is False
+    assert server.tool_by_name["trace_account_messages"].annotations.destructiveHint is False
     assert server.tool_by_name["trace_account_messages"].annotations.idempotentHint is True
     assert all(not any(part[:1].isupper() for part in name.split("_")) for name in server.tool_by_name)
 
@@ -244,6 +250,39 @@ def test_tool_descriptor_preserves_registry_output_schema() -> None:
     assert tool.title == "List Dialogs"
 
 
+def test_http_server_defaults_to_loopback_bind() -> None:
+    signature = inspect.signature(server.run_mcp_http_server)
+
+    assert signature.parameters["host"].default == "127.0.0.1"
+
+
+def test_http_server_rejects_non_loopback_bind_without_explicit_opt_in(monkeypatch) -> None:
+    monkeypatch.delenv("MCP_TELEGRAM_HTTP_ALLOW_UNSAFE", raising=False)
+
+    with pytest.raises(RuntimeError, match="Refusing to bind MCP HTTP transport"):
+        server._assert_http_exposure_allowed("0.0.0.0")
+
+
+def test_http_server_allows_non_loopback_bind_with_explicit_opt_in(monkeypatch) -> None:
+    monkeypatch.setenv("MCP_TELEGRAM_HTTP_ALLOW_UNSAFE", "1")
+
+    server._assert_http_exposure_allowed("0.0.0.0")
+
+
+def test_http_transport_security_allows_loopback_and_configured_hosts(monkeypatch) -> None:
+    monkeypatch.setenv("MCP_TELEGRAM_HTTP_ALLOWED_HOSTS", "mcp-telegram:3100")
+    monkeypatch.setenv("MCP_TELEGRAM_HTTP_ALLOWED_ORIGINS", "http://gateway.local")
+
+    hosts = server._http_allowed_hosts(host="127.0.0.1", port=3100)
+    origins = server._http_allowed_origins()
+
+    assert "127.0.0.1:*" in hosts
+    assert "localhost:*" in hosts
+    assert "mcp-telegram:3100" in hosts
+    assert "http://localhost:*" in origins
+    assert "http://gateway.local" in origins
+
+
 def test_list_tools_exposes_list_dialogs_output_schema() -> None:
     tool = server.tool_by_name["list_dialogs"]
 
@@ -291,7 +330,7 @@ def test_list_tools_exposes_account_trace_schema_and_title() -> None:
     assert tool.outputSchema is not None
     assert "coverage" in tool.outputSchema["required"]
     assert "result_count_semantics" in tool.outputSchema["required"]
-    assert "text_preview" in tool.outputSchema["properties"]
+    assert "preview" in tool.outputSchema["properties"]
     assert "warnings" in tool.outputSchema["properties"]
     assert "limits" in tool.outputSchema["properties"]
     assert "navigation" in tool.outputSchema["properties"]
@@ -318,14 +357,14 @@ def test_list_tools_exposes_feedback_and_entity_info_output_schemas() -> None:
 
 
 @pytest.mark.asyncio
-async def test_call_tool_preserves_structuredContent_and_text_content(monkeypatch) -> None:
+async def test_call_tool_returns_structuredContent_with_empty_success_content(monkeypatch) -> None:
     monkeypatch.setitem(server.tool_by_name, "list_dialogs", _tool("list_dialogs"))
     monkeypatch.setattr("mcp_telegram.server.tools.tool_args", lambda tool, **kwargs: object())
     monkeypatch.setattr(
         "mcp_telegram.server.tools.tool_runner",
         AsyncMock(
             return_value=ToolResult(
-                content=[TextContent(type="text", text="1 dialog")],
+                content=[TextContent(type="text", text="legacy success preview")],
                 structured_content={"dialogs": [{"id": 1, "name": "Alice"}], "count": 1},
             )
         ),
@@ -335,9 +374,7 @@ async def test_call_tool_preserves_structuredContent_and_text_content(monkeypatc
 
     assert result.isError is False
     assert result.structuredContent == {"dialogs": [{"id": 1, "name": "Alice"}], "count": 1}
-    assert result.content
-    assert isinstance(result.content[0], TextContent)
-    assert result.content[0].text
+    assert result.content == []
 
 
 @pytest.mark.asyncio
@@ -368,7 +405,7 @@ async def test_server_instructions_mention_account_trace(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_server_instructions_describe_structured_first_response_contract(monkeypatch) -> None:
+async def test_server_instructions_describe_structured_only_response_contract(monkeypatch) -> None:
     class _Conn:
         async def get_me(self) -> dict:
             return {"ok": False}
@@ -383,9 +420,9 @@ async def test_server_instructions_describe_structured_first_response_contract(m
     normalized = instructions.lower()
 
     assert "structuredContent" in instructions
-    assert "text" in normalized
-    assert "preview" in normalized or "fallback" in normalized
-    assert "do not reparse human-readable text" in normalized
+    assert "structured-only" in normalized
+    assert "content may be empty" in normalized
+    assert "iserror=true" in normalized
     assert "untrusted content" in normalized
 
 
@@ -496,11 +533,12 @@ async def test_list_messages_tool_archived_warning_with_coverage(monkeypatch):
     monkeypatch.setattr("mcp_telegram.tools.reading.daemon_connection", lambda: mock_conn)
 
     result = await server.call_tool("list_messages", {"exact_dialog_id": 123})
-    text = result.content[0].text
-    assert "⚠" in text
-    assert "archive" in text.lower()
-    assert "2023-11-14" in text
-    assert "80%" in text
+    assert result.content == []
+    warning = result.structuredContent["warnings"][0]
+    assert warning["kind"] == "archived_dialog"
+    assert "archive" in warning["message"].lower()
+    assert "2023-11-14" in warning["message"]
+    assert "80%" in warning["message"]
 
 
 @pytest.mark.asyncio
@@ -525,9 +563,9 @@ async def test_list_messages_tool_archived_warning_unknown_coverage(monkeypatch)
     monkeypatch.setattr("mcp_telegram.tools.reading.daemon_connection", lambda: mock_conn)
 
     result = await server.call_tool("list_messages", {"exact_dialog_id": 123})
-    text = result.content[0].text
-    assert "⚠" in text
-    assert "150 messages archived locally" in text
+    assert result.content == []
+    warning = result.structuredContent["warnings"][0]
+    assert "150 messages archived locally" in warning["message"]
 
 
 @pytest.mark.asyncio
@@ -551,7 +589,7 @@ async def test_list_messages_tool_uses_last_synced_at_not_access_lost_at(monkeyp
     monkeypatch.setattr("mcp_telegram.tools.reading.daemon_connection", lambda: mock_conn)
 
     result = await server.call_tool("list_messages", {"exact_dialog_id": 123})
-    text = result.content[0].text
+    warning = result.structuredContent["warnings"][0]
     # Must show 2023-11-14 (last_synced_at), NOT 2024-01-01 (access_lost_at)
-    assert "2023-11-14" in text
-    assert "2024-01-01" not in text
+    assert "2023-11-14" in warning["message"]
+    assert "2024-01-01" not in warning["message"]

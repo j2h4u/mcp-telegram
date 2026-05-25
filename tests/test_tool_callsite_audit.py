@@ -3,7 +3,7 @@
 For each tool that touches entity/dialog resolution, we verify:
 - The tool does NOT crash on a Candidates response.
 - The tool does NOT silently auto-pick the first match (silent resolution regression).
-- The tool returns an action-oriented message (both match ids present, or error-dict).
+- The tool returns action-oriented text plus structured candidates when ambiguity is reachable.
 
 Tools and their resolution paths
 ---------------------------------
@@ -95,7 +95,7 @@ async def _conn_ctx(conn: MagicMock):
 
 
 async def test_entity_info_candidates_surfaces_hint() -> None:
-    """GetEntityInfo with Candidates response → output includes disambiguation_hint text."""
+    """GetEntityInfo with Candidates response keeps hints out of error text."""
     conn = _make_conn_resolve_candidates()
     with patch(
         "mcp_telegram.tools.entity_info.daemon_connection",
@@ -104,13 +104,21 @@ async def test_entity_info_candidates_surfaces_hint() -> None:
         result = await get_entity_info(GetEntityInfo(entity="Ivan"))
 
     text = result.content[0].text
-    assert "disambiguation_hint" not in text or "hint=" in text  # hint= prefix is the format
-    # The hint string itself must appear in output
-    assert "Specify @username or numeric id" in text
+    assert "structuredContent.candidates" in text
+    assert "Specify @username or numeric id" not in text
+    payload = result.structured_content
+    assert payload is not None
+    candidates = payload["candidates"]
+    assert isinstance(candidates, list)
+    assert candidates[0]["disambiguation_hint_content"] == {
+        "text": '2 entities match "Ivan": Channel, User. Specify @username or numeric id.',
+        "is_telegram_content": True,
+        "content_kind": "message_text",
+    }
 
 
 async def test_entity_info_candidates_lists_all_matches() -> None:
-    """GetEntityInfo with Candidates → output contains all match entity_ids."""
+    """GetEntityInfo with Candidates → structuredContent contains all match entity_ids."""
     conn = _make_conn_resolve_candidates()
     with patch(
         "mcp_telegram.tools.entity_info.daemon_connection",
@@ -119,8 +127,18 @@ async def test_entity_info_candidates_lists_all_matches() -> None:
         result = await get_entity_info(GetEntityInfo(entity="Ivan"))
 
     text = result.content[0].text
-    assert "101" in text
-    assert "202" in text
+    assert "101" not in text
+    assert "202" not in text
+    payload = result.structured_content
+    assert payload is not None
+    candidates = payload["candidates"]
+    assert isinstance(candidates, list)
+    assert [candidate["entity_id"] for candidate in candidates] == [101, 202]
+    assert candidates[0]["display_name_content"] == {
+        "text": "Ivan Petrov",
+        "is_telegram_content": True,
+        "content_kind": "message_text",
+    }
     # Must NOT silently auto-pick (i.e. must not proceed to get_entity_info call)
     assert conn.get_entity_info is not conn.resolve_entity  # sanity; no silent pick
 
@@ -140,7 +158,10 @@ async def test_entity_info_candidates_does_not_auto_pick() -> None:
     conn.get_entity_info.assert_not_called()
     text = result.content[0].text
     # Must be an ambiguity response, not a profile
-    assert "id=101" in text or "id=202" in text  # listed matches, not profile data
+    assert "structuredContent.candidates" in text
+    assert "id=101" not in text and "id=202" not in text
+    assert result.structured_content is not None
+    assert result.structured_content["error"] == "ambiguous_entity"
 
 
 # ---------------------------------------------------------------------------

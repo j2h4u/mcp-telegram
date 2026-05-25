@@ -22,7 +22,6 @@ from mcp_telegram.dialog_sync import (
 )
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 
-
 # --- fixtures ---------------------------------------------------------------
 
 

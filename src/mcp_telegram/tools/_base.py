@@ -4,6 +4,7 @@ import logging
 import re
 import time
 import typing as t
+from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import singledispatch
 
@@ -41,7 +42,12 @@ def _daemon_not_running_text() -> str:
     return "Telegram backend is not running.\nAction: Start it with: mcp-telegram sync"
 
 
-def _check_daemon_response(response: dict, **extra_kwargs) -> ToolResult | None:
+def _check_daemon_response(
+    response: dict,
+    *,
+    action: str = "Retry with corrected arguments or inspect the relevant status/list tool for valid ids.",
+    **extra_kwargs: t.Any,
+) -> ToolResult | None:
     """Return a ToolResult with error text if response is not ok, else None.
 
     Callers use: ``if err := _check_daemon_response(response): return err``
@@ -49,16 +55,23 @@ def _check_daemon_response(response: dict, **extra_kwargs) -> ToolResult | None:
     if response.get("ok"):
         return None
     error_detail = response.get("message", "Request failed.")
-    return error_result(f"Error: {error_detail}", **extra_kwargs)
+    error_code = response.get("error")
+    if isinstance(error_code, str) and error_code and error_code not in str(error_detail):
+        text = f"Error: {error_code}: {error_detail}"
+    else:
+        text = f"Error: {error_detail}"
+    if "action:" not in text.lower():
+        text = f"{text}\nAction: {action}"
+    return error_result(text, **extra_kwargs)
 
 
 @dataclass
 class ToolResult:
     """Internal wrapper carrying MCP content plus telemetry metadata."""
 
-    content: t.Sequence[TextContent | ImageContent | EmbeddedResource]
+    content: t.Sequence[TextContent | ImageContent | EmbeddedResource] = ()
     is_error: bool = False
-    structured_content: dict[str, object] | None = None
+    structured_content: dict[str, t.Any] | None = None
     result_count: int = 0
     has_cursor: bool = False
     page_depth: int = 1
@@ -84,12 +97,12 @@ class ToolRegistryEntry:
         return (self.cls, self.posture, self.annotations)[index]
 
 
-def text_result(text: str, **metadata) -> ToolResult:
-    """Return successful text content with optional telemetry metadata."""
-    return ToolResult(content=_text_response(text), **metadata)
+def structured_result(structured_content: Mapping[str, t.Any], **metadata: t.Any) -> ToolResult:
+    """Return a successful structured-only tool result."""
+    return ToolResult(content=(), structured_content=dict(structured_content), **metadata)
 
 
-def error_result(text: str, **metadata) -> ToolResult:
+def error_result(text: str, **metadata: t.Any) -> ToolResult:
     """Return recoverable error text as an MCP tool result."""
     return ToolResult(content=_text_response(text), is_error=True, **metadata)
 
@@ -302,7 +315,7 @@ def tool_args(tool: Tool, *args, **kwargs) -> ToolArgs:
     entry = TOOL_REGISTRY.get(tool.name)
     if entry is None:
         raise ValueError(f"Unknown tool: {tool.name}")
-    cls = entry[0]
+    cls = entry.cls
     return cls(*args, **kwargs)
 
 

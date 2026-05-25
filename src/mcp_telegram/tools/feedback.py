@@ -15,10 +15,10 @@ from ._base import (
     ToolResult,
     _check_daemon_response,
     _daemon_not_running_text,
-    _text_response,
     daemon_connection,
     error_result,
     mcp_tool,
+    structured_result,
 )
 
 SUBMIT_FEEDBACK_OUTPUT_SCHEMA = {
@@ -110,7 +110,7 @@ class SubmitFeedback(ToolArgs):
 @mcp_tool(
     name="submit_feedback",
     title="Submit Feedback",
-    annotations=ToolAnnotations(readOnlyHint=False),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False),
     output_schema=SUBMIT_FEEDBACK_OUTPUT_SCHEMA,
 )
 async def submit_feedback(args: SubmitFeedback) -> ToolResult:
@@ -141,8 +141,4 @@ async def submit_feedback(args: SubmitFeedback) -> ToolResult:
         "status": "accepted",
         "message": message,
     }
-    return ToolResult(
-        content=_text_response(message),
-        structured_content=structured_content,
-        result_count=1,
-    )
+    return structured_result(structured_content, result_count=1)

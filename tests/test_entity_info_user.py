@@ -10,8 +10,6 @@ from __future__ import annotations
 import asyncio
 import re
 import sqlite3
-import time
-from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -25,7 +23,6 @@ import pytest
 from telethon.tl.types import User  # type: ignore[import-untyped]
 
 from mcp_telegram.daemon_api import DaemonAPIServer
-from mcp_telegram.sync_db import ensure_sync_schema
 
 
 @pytest.fixture(autouse=True)
@@ -94,8 +91,8 @@ def _make_user_mock(**kwargs) -> MagicMock:
     u.mutual_contact = kwargs.get("mutual_contact", False)
     u.close_friend = kwargs.get("close_friend", False)
     u.verified = u.premium = u.scam = u.fake = u.restricted = False
-    u.phone = kwargs.get("phone", None)
-    u.lang_code = kwargs.get("lang_code", None)
+    u.phone = kwargs.get("phone")
+    u.lang_code = kwargs.get("lang_code")
     u.usernames = []
     u.emoji_status = None
     u.restriction_reason = []
@@ -246,7 +243,7 @@ async def test_get_entity_info_no_download_keys_user() -> None:
 
     def _walk_keys(o):
         if isinstance(o, dict):
-            for k in o.keys():
+            for k in o:
                 yield k
                 yield from _walk_keys(o[k])
         elif isinstance(o, list):

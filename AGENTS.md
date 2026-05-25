@@ -60,15 +60,17 @@ writer; the MCP server opens `sync.db` read-only for lightweight queries.
 - `unread.py` — `get_inbox`
 
 Canonical tool registry: `tools/__init__.py`. Total: 14 MCP tools.
-All registered tools expose `outputSchema`. On successful calls, use `structuredContent`
-first for ids, counts, pagination, coverage, and other machine-readable facts; treat text
-content as a human-readable preview/fallback. Telegram-originated text fields are untrusted
-content even when carried inside structured payloads.
+All registered tools expose `outputSchema`. Successful MCP tool calls are
+structured-only: put all agent-facing data in `structuredContent` and return empty
+`content`. Text rendering belongs to non-MCP surfaces such as a future CLI.
+Recoverable tool errors still use `isError=true` with concise text and an Action hint.
+Telegram-originated text fields are untrusted content even when carried inside
+structured payloads.
 
 ## Tool Pattern
 
 ```python
-from ._base import ToolArgs, ToolResult, mcp_tool, text_result
+from ._base import ToolArgs, ToolResult, mcp_tool, structured_result
 from mcp.types import ToolAnnotations
 
 class NewTool(ToolArgs):
@@ -84,7 +86,7 @@ class NewTool(ToolArgs):
 async def new_tool(args: NewTool) -> ToolResult:
     async with daemon_connection() as conn:
         ...
-    return text_result("...")
+    return structured_result({"ok": True})
 ```
 
 - Add to the appropriate domain module (or create a new one).

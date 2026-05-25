@@ -49,30 +49,31 @@ from pathlib import Path
 from typing import Any, Literal
 
 from telethon import utils as telethon_utils  # type: ignore[import-untyped]
+from telethon.errors import ChatAdminRequiredError  # type: ignore[import-untyped]
+from telethon.tl.functions.channels import (
+    GetFullChannelRequest,  # type: ignore[import-untyped]
+    GetParticipantsRequest,  # type: ignore[import-untyped]
+)
+from telethon.tl.functions.contacts import ResolveUsernameRequest  # type: ignore[import-untyped]
 from telethon.tl.functions.messages import (  # type: ignore[import-untyped]
     GetCommonChatsRequest,
     GetDialogFiltersRequest,
-    GetForumTopicsRequest,
+    GetFullChatRequest,  # type: ignore[import-untyped]
 )
-from telethon.tl.functions.contacts import ResolveUsernameRequest  # type: ignore[import-untyped]
+from telethon.tl.functions.messages import SearchRequest as MessagesSearchRequest  # type: ignore[import-untyped]
 from telethon.tl.functions.photos import GetUserPhotosRequest  # type: ignore[import-untyped]
 from telethon.tl.functions.users import GetFullUserRequest  # type: ignore[import-untyped]
-from telethon.tl.types import Channel, Chat  # type: ignore[import-untyped]
-from xdg_base_dirs import xdg_state_home  # type: ignore[import-error]
-
-from telethon.errors import ChatAdminRequiredError  # type: ignore[import-untyped]
-from telethon.tl.functions.channels import GetFullChannelRequest  # type: ignore[import-untyped]
-from telethon.tl.functions.channels import GetParticipantsRequest  # type: ignore[import-untyped]
-from telethon.tl.functions.messages import GetFullChatRequest  # type: ignore[import-untyped]
-from telethon.tl.functions.messages import SearchRequest as MessagesSearchRequest  # type: ignore[import-untyped]
 from telethon.tl.types import (  # type: ignore[import-untyped]
+    Channel,
     ChannelParticipantsContacts,
+    Chat,
     ChatReactionsAll,
     ChatReactionsNone,
     ChatReactionsSome,
     InputMessagesFilterChatPhotos,
     MessageActionChatEditPhoto,
 )
+from xdg_base_dirs import xdg_state_home  # type: ignore[import-error]
 
 # Per CONTEXT D-01 / SPEC Req 8: GetEntityInfo cache TTL is uniform 5 minutes.
 # Single value — per-field TTL tiers are explicitly out of scope (see CONTEXT
@@ -2522,7 +2523,7 @@ class DaemonAPIServer:
             )
 
         user = users[0]
-        user_id = int(getattr(user, "id"))
+        user_id = int(user.id)
         first_name = getattr(user, "first_name", None)
         last_name = getattr(user, "last_name", None)
         display_name = " ".join(part for part in (first_name, last_name) if part) or username
@@ -3895,7 +3896,7 @@ class DaemonAPIServer:
 
         for sql_row in sql_rows:
             (
-                d_id, d_name, d_type, d_archived, d_pinned,
+                d_id, d_name, d_type, _d_archived, _d_pinned,
                 d_members, d_created, d_last_at, d_snapshot_at,
                 d_mentions, d_reactions, d_draft,
                 sd_status, sd_total, sd_access_lost,
@@ -3928,9 +3929,8 @@ class DaemonAPIServer:
                     continue
 
             # -- accumulate max_snapshot_at (over visible+filtered rows) ------
-            if d_snapshot_at is not None:
-                if max_snapshot is None or d_snapshot_at > max_snapshot:
-                    max_snapshot = d_snapshot_at
+            if d_snapshot_at is not None and (max_snapshot is None or d_snapshot_at > max_snapshot):
+                max_snapshot = d_snapshot_at
 
             # -- sync coverage ------------------------------------------------
             coverage_pct = _compute_sync_coverage(sd_total, local_counts.get(d_id, 0))

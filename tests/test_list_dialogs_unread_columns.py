@@ -446,7 +446,7 @@ def test_list_dialogs_description_mentions_unread_fields() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_list_dialogs_text_output_renders_unread_for_dm() -> None:
+async def test_list_dialogs_structured_output_includes_unread_values_and_channel_nulls() -> None:
     from mcp_telegram.tools.discovery import ListDialogs, list_dialogs
 
     response = {
@@ -486,15 +486,12 @@ async def test_list_dialogs_text_output_renders_unread_for_dm() -> None:
     with patch("mcp_telegram.tools.discovery.daemon_connection", side_effect=_cm):
         result = await list_dialogs(ListDialogs())
 
-    text = result.content[0].text
-    # DM row contains both fields.
-    dm_lines = [line for line in text.splitlines() if "Alice" in line]
-    assert dm_lines, f"no DM line in output: {text!r}"
-    assert "unread_in=3" in dm_lines[0]
-    assert "unread_out=1" in dm_lines[0]
+    assert result.content == ()
+    assert result.structured_content is not None
+    dm_row = result.structured_content["dialogs"][0]
+    assert dm_row["unread_in"] == 3
+    assert dm_row["unread_out"] == 1
 
-    # Channel row omits both fields.
-    ch_lines = [line for line in text.splitlines() if "Announcements" in line]
-    assert ch_lines
-    assert "unread_in" not in ch_lines[0]
-    assert "unread_out" not in ch_lines[0]
+    channel_row = result.structured_content["dialogs"][1]
+    assert channel_row["unread_in"] is None
+    assert channel_row["unread_out"] is None

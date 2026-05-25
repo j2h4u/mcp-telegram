@@ -17,7 +17,7 @@ import pytest
 from helpers import MockTotalList, build_mock_message, build_mock_reactions
 
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
-from mcp_telegram.sync_worker import FullSyncWorker
+from mcp_telegram.sync_worker import FullSyncWorker, StoredMessage
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -1011,8 +1011,9 @@ async def test_dm_bootstrap_handles_rpc_error(
     from telethon.errors import RPCError  # type: ignore[import-untyped]
 
     async def _iter_dialogs():
+        if False:
+            yield None
         raise RPCError(request=None, message="TEST_ERROR", code=400)
-        yield  # make it an async generator  # noqa: unreachable
 
     mock_client.iter_dialogs = _iter_dialogs
 
@@ -1031,8 +1032,9 @@ async def test_dm_bootstrap_handles_network_error(
     """bootstrap_dms() catches OSError and doesn't crash."""
 
     async def _iter_dialogs():
+        if False:
+            yield None
         raise OSError("Connection reset")
-        yield  # make it an async generator  # noqa: unreachable
 
     mock_client.iter_dialogs = _iter_dialogs
 
@@ -1653,9 +1655,7 @@ def test_extract_message_row_insert_roundtrip_preserves_out_and_is_service(
     assert row == (1, 0)
 
 
-def _stored(dialog_id: int, message_id: int, text: str = "hello") -> "StoredMessage":
-    from mcp_telegram.sync_worker import StoredMessage
-
+def _stored(dialog_id: int, message_id: int, text: str = "hello") -> StoredMessage:
     return StoredMessage(
         dialog_id=dialog_id,
         message_id=message_id,

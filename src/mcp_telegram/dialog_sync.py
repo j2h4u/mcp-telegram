@@ -58,8 +58,8 @@ from telethon.errors import (  # type: ignore[import-untyped]
     UserBannedInChannelError,
     UserKickedError,
 )
-from telethon.tl.functions.messages import GetForumTopicsRequest  # type: ignore[import-untyped]
 from telethon.tl import types  # type: ignore[import-untyped]
+from telethon.tl.functions.messages import GetForumTopicsRequest  # type: ignore[import-untyped]
 from telethon.tl.types import (  # type: ignore[import-untyped]
     InputPeerChannel,
     InputPeerChat,

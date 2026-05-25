@@ -7,6 +7,9 @@
       "arguments": {},
       "expect": {
         "is_error": false,
+        "path_equals": {
+          "content": []
+        },
         "path_exists": [
           "structuredContent.dialogs",
           "structuredContent.count",
@@ -14,8 +17,7 @@
         ],
         "path_nonempty": [
           "structuredContent",
-          "structuredContent.dialogs",
-          "content.0.text"
+          "structuredContent.dialogs"
         ]
       }
     },
@@ -26,13 +28,15 @@
       "arguments": {},
       "expect": {
         "is_error": false,
+        "path_equals": {
+          "content": []
+        },
         "path_exists": [
           "structuredContent.total_calls",
           "structuredContent.tool_distribution"
         ],
         "path_nonempty": [
-          "structuredContent",
-          "content.0.text"
+          "structuredContent"
         ]
       }
     },
@@ -43,14 +47,16 @@
       "arguments": {"dialog": "Vibecoding is so last year"},
       "expect": {
         "is_error": false,
+        "path_equals": {
+          "content": []
+        },
         "path_exists": [
           "structuredContent.dialog",
           "structuredContent.topics",
           "structuredContent.count"
         ],
         "path_nonempty": [
-          "structuredContent",
-          "content.0.text"
+          "structuredContent"
         ]
       }
     },
@@ -61,6 +67,9 @@
       "arguments": {"exact_dialog_id": 496731332, "limit": 3},
       "expect": {
         "is_error": false,
+        "path_equals": {
+          "content": []
+        },
         "path_exists": [
           "structuredContent.source",
           "structuredContent.messages",
@@ -68,8 +77,7 @@
           "structuredContent.limits"
         ],
         "path_nonempty": [
-          "structuredContent",
-          "content.0.text"
+          "structuredContent"
         ]
       }
     },
@@ -80,6 +88,9 @@
       "arguments": {"exact_dialog_id": 496731332, "limit": 5},
       "expect": {
         "is_error": false,
+        "path_equals": {
+          "content": []
+        },
         "path_exists": [
           "structuredContent.source",
           "structuredContent.messages",
@@ -87,8 +98,7 @@
           "structuredContent.limits"
         ],
         "path_nonempty": [
-          "structuredContent",
-          "content.0.text"
+          "structuredContent"
         ]
       }
     },
@@ -99,6 +109,9 @@
       "arguments": {"dialog": "496731332", "query": "а", "limit": 3},
       "expect": {
         "is_error": false,
+        "path_equals": {
+          "content": []
+        },
         "path_exists": [
           "structuredContent.query",
           "structuredContent.results",
@@ -106,8 +119,7 @@
           "structuredContent.limits"
         ],
         "path_nonempty": [
-          "structuredContent",
-          "content.0.text"
+          "structuredContent"
         ]
       }
     },
@@ -118,14 +130,16 @@
       "arguments": {},
       "expect": {
         "is_error": false,
+        "path_equals": {
+          "content": []
+        },
         "path_exists": [
           "structuredContent.dialogs",
           "structuredContent.count",
           "structuredContent.coverage"
         ],
         "path_nonempty": [
-          "structuredContent",
-          "content.0.text"
+          "structuredContent"
         ]
       }
     },
@@ -136,6 +150,9 @@
       "arguments": {"dialog_id": 12345},
       "expect": {
         "is_error": false,
+        "path_equals": {
+          "content": []
+        },
         "path_exists": [
           "structuredContent.dialog_id",
           "structuredContent.status",
@@ -143,8 +160,7 @@
         ],
         "path_nonempty": [
           "structuredContent",
-          "structuredContent.status",
-          "content.0.text"
+          "structuredContent.status"
         ]
       }
     },
@@ -161,8 +177,7 @@
           "structuredContent.limited_by"
         ],
         "path_nonempty": [
-          "structuredContent",
-          "content.0.text"
+          "structuredContent"
         ]
       }
     },
@@ -175,14 +190,16 @@
         "one_of": [
           {
             "is_error": false,
+            "path_equals": {
+              "content": []
+            },
             "path_exists": [
               "structuredContent.dialog",
               "structuredContent.top_reactions",
               "structuredContent.section_counts"
             ],
             "path_nonempty": [
-              "structuredContent",
-              "content.0.text"
+              "structuredContent"
             ]
           },
           {
@@ -199,14 +216,16 @@
       "arguments": {"since_hours": 24, "limit": 50},
       "expect": {
         "is_error": false,
+        "path_equals": {
+          "content": []
+        },
         "path_exists": [
           "structuredContent.scan_status",
           "structuredContent.comments",
           "structuredContent.count"
         ],
         "path_nonempty": [
-          "structuredContent",
-          "content.0.text"
+          "structuredContent"
         ]
       }
     },
@@ -223,6 +242,9 @@
       },
       "expect": {
         "is_error": false,
+        "path_equals": {
+          "content": []
+        },
         "path_exists": [
           "structuredContent.accepted",
           "structuredContent.status",
@@ -230,8 +252,7 @@
         ],
         "path_nonempty": [
           "structuredContent.accepted",
-          "structuredContent.status",
-          "content.0.text"
+          "structuredContent.status"
         ]
       }
     }

@@ -16,13 +16,11 @@ from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
 from telethon.tl.types import Channel as TelethonChannel  # type: ignore[import-untyped]
 from telethon.tl.types import User  # type: ignore[import-untyped]
 
 from mcp_telegram.daemon_api import DaemonAPIServer
 from mcp_telegram.tools.entity_info import _format_relative_ymd
-
 
 # ---------------------------------------------------------------------------
 # Helpers

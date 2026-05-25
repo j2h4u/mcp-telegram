@@ -9,10 +9,10 @@ from ._base import (
     ToolResult,
     _check_daemon_response,
     _daemon_not_running_text,
-    _text_response,
     daemon_connection,
     error_result,
     mcp_tool,
+    structured_result,
 )
 
 logger = logging.getLogger(__name__)
@@ -244,11 +244,7 @@ async def mark_dialog_for_sync(args: MarkDialogForSync) -> ToolResult:
     if err := _check_daemon_response(response):
         return err
 
-    action = "marked for sync" if args.enable else "unmarked from sync"
     logger.info("mark_dialog_for_sync dialog_id=%d enable=%s", args.dialog_id, args.enable)
-    text = f"Dialog {args.dialog_id} {action}."
-    if args.enable:
-        text += " Full message history will be fetched shortly."
     structured_content = {
         "dialog_id": args.dialog_id,
         "enabled": args.enable,
@@ -257,7 +253,7 @@ async def mark_dialog_for_sync(args: MarkDialogForSync) -> ToolResult:
         "expected_next_state": "syncing" if args.enable else "not_synced",
         "full_history_will_be_fetched": args.enable,
     }
-    return ToolResult(content=_text_response(text), structured_content=structured_content, result_count=1)
+    return structured_result(structured_content, result_count=1)
 
 
 class GetSyncStatus(ToolArgs):
@@ -303,17 +299,7 @@ async def get_sync_status(args: GetSyncStatus) -> ToolResult:
         "access_lost_at": data.get("access_lost_at"),
         "action": data.get("action"),
     }
-    lines = [
-        f"dialog_id={structured_content['dialog_id']}",
-        f"status={structured_content['status']}",
-        f"message_count={data.get('message_count', 0)}",
-        f"sync_progress={data.get('sync_progress', 0)}",
-        f"total_messages={data.get('total_messages', 0)}",
-        f"last_synced_at={data.get('last_synced_at')}",
-        f"last_event_at={data.get('last_event_at')}",
-        f"delete_detection={data.get('delete_detection')}",
-    ]
-    return ToolResult(content=_text_response("\n".join(lines)), structured_content=structured_content, result_count=1)
+    return structured_result(structured_content, result_count=1)
 
 
 class GetSyncAlerts(ToolArgs):
@@ -352,17 +338,14 @@ async def get_sync_alerts(args: GetSyncAlerts) -> ToolResult:
     edits = data.get("edits", [])
     access_lost = data.get("access_lost", [])
 
-    sections: list[str] = []
     alerts: list[dict[str, object]] = []
     deleted_messages: list[dict[str, object]] = []
     edit_alerts: list[dict[str, object]] = []
     access_lost_alerts: list[dict[str, object]] = []
 
     if deleted:
-        sections.append(f"=== Deleted Messages ({len(deleted)}) ===")
         for d in deleted:
             message = f"Deleted message msg={d['message_id']} deleted_at={d['deleted_at']}"
-            sections.append(f"  dialog={d['dialog_id']} msg={d['message_id']} deleted_at={d['deleted_at']}")
             action = "Inspect the dialog history around this message id if surrounding context is needed."
             deleted_messages.append(
                 {
@@ -388,12 +371,8 @@ async def get_sync_alerts(args: GetSyncAlerts) -> ToolResult:
             )
 
     if edits:
-        sections.append(f"=== Edits ({len(edits)}) ===")
         for e in edits:
             message = f"Edited message msg={e['message_id']} v{e['version']} edit_date={e['edit_date']}"
-            sections.append(
-                f"  dialog={e['dialog_id']} msg={e['message_id']} v{e['version']} edit_date={e['edit_date']}"
-            )
             action = "Treat cached text as versioned; inspect edit history before relying on older wording."
             edit_alerts.append(
                 {
@@ -420,10 +399,8 @@ async def get_sync_alerts(args: GetSyncAlerts) -> ToolResult:
             )
 
     if access_lost:
-        sections.append(f"=== Access Lost ({len(access_lost)}) ===")
         for a in access_lost:
             action = "Use get_sync_status for coverage details."
-            sections.append(f"  dialog={a['dialog_id']} lost_at={a.get('access_lost_at')}")
             access_lost_alerts.append(
                 {
                     "dialog_id": a.get("dialog_id"),
@@ -467,10 +444,4 @@ async def get_sync_alerts(args: GetSyncAlerts) -> ToolResult:
         },
     }
 
-    if not sections:
-        text = "No sync alerts."
-        if args.since > 0:
-            text += f" (since={args.since})"
-        return ToolResult(content=_text_response(text), structured_content=structured_content)
-
-    return ToolResult(content=_text_response("\n".join(sections)), structured_content=structured_content, result_count=len(alerts))
+    return structured_result(structured_content, result_count=len(alerts))

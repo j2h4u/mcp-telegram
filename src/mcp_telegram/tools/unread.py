@@ -1,18 +1,14 @@
-import typing as t
 import time
+import typing as t
 
 from pydantic import Field
 
-from ..errors import no_unread_all_text, no_unread_personal_text
 from ..formatter import (
-    UnreadChatData,
     _compute_inline_markers,
     _render_read_state_header,
-    format_unread_messages_grouped,
     resolve_sender_label,
 )
 from ..models import ReadMessage, ReadState
-from .structured import structured_warning, telegram_content
 from ._base import (
     DaemonNotRunningError,
     ToolAnnotations,
@@ -20,11 +16,12 @@ from ._base import (
     ToolResult,
     _check_daemon_response,
     _daemon_not_running_text,
-    _text_response,
     daemon_connection,
     error_result,
     mcp_tool,
+    structured_result,
 )
+from .structured import TelegramContent, TelegramContentKind, structured_warning, telegram_content
 
 GET_INBOX_OUTPUT_SCHEMA = {
     "type": "object",
@@ -281,10 +278,10 @@ _READ_MARKER_METADATA = {
 }
 
 
-def _content_or_none(text: str | None, kind: str) -> dict[str, object] | None:
+def _content_or_none(text: str | None, kind: TelegramContentKind) -> TelegramContent | None:
     if not text:
         return None
-    return telegram_content(text, t.cast(t.Any, kind))
+    return telegram_content(text, kind)
 
 
 def _structured_media(description: str | None) -> dict[str, object] | None:
@@ -316,7 +313,7 @@ def _structured_read_marker(message_id: int, label: str) -> dict[str, object]:
     }
 
 
-def _read_state_payload(read_state: object, dialog_type: str | None) -> dict[str, object] | None:
+def _read_state_payload(read_state: ReadState | dict | None, dialog_type: str | None) -> dict[str, object] | None:
     if read_state is None and dialog_type is None:
         return None
     return {
@@ -412,9 +409,10 @@ async def get_inbox(args: GetInbox) -> ToolResult:
         result_message_count += len(message_rows)
         if hidden_count:
             hidden_count_by_dialog.append({"dialog_id": int(group.get("dialog_id", 0) or 0), "hidden_count": hidden_count})
+        read_state_payload = read_state if isinstance(read_state, dict) else None
         messages = _structured_messages(
             message_rows,
-            read_state=read_state if isinstance(read_state, dict) else None,
+            read_state=read_state_payload,
             dialog_type=dialog_type,
         )
         structured_dialogs.append(
@@ -428,7 +426,7 @@ async def get_inbox(args: GetInbox) -> ToolResult:
                 "total_in_chat": total_in_chat,
                 "is_channel": category == "channel",
                 "is_bot": category == "bot",
-                "read_state": _read_state_payload(read_state, dialog_type),
+                "read_state": _read_state_payload(read_state_payload, dialog_type),
                 "budget": {
                     "shown_count": len(message_rows),
                     "total_in_chat": total_in_chat,
@@ -462,63 +460,6 @@ async def get_inbox(args: GetInbox) -> ToolResult:
     }
 
     if not groups:
-        # Closes UAT gap 1: when groups=[] but bootstrap_pending>0 the response is
-        # NOT 'no unread' — results are incomplete because dialogs are still being
-        # bootstrapped. The canned 'no unread' text would mislead the caller.
-        if bootstrap_pending > 0:
-            warning = (
-                f"No unread messages yet — bootstrap_pending={bootstrap_pending} "
-                f"dialog(s) are still being seeded by the sync daemon. Results are "
-                f"incomplete. Retry shortly once bootstrap completes."
-            )
-            return ToolResult(content=_text_response(warning), structured_content=structured_content)
-        empty_msg = no_unread_all_text() if args.scope == "all" else no_unread_personal_text()
-        return ToolResult(content=_text_response(empty_msg), structured_content=structured_content)
+        return structured_result(structured_content, result_count=0)
 
-    chats: list[UnreadChatData] = []
-    result_count = 0
-    # Phase 39.3 (HIGH-3): build per-dialog read_state + dialog_type maps from
-    # daemon response; threaded into format_unread_messages_grouped so each DM
-    # block gets its own header (AC-5/6/7). Absent fields → no header for that
-    # block (backward compat with pre-39.3 daemon).
-    read_state_per_dialog: dict[int, ReadState | dict] = {}
-    dialog_type_per_dialog: dict[int, str] = {}
-
-    for group in groups:
-        messages = [ReadMessage(**m) for m in group.get("messages", [])]
-        dialog_id = group.get("dialog_id", 0)
-        chat_data = UnreadChatData(
-            chat_id=dialog_id,
-            display_name=group.get("display_name", ""),
-            unread_count=group.get("unread_count", 0),
-            unread_mentions_count=group.get("unread_mentions_count", 0),
-            total_in_chat=group.get("unread_count", 0),
-            is_channel=group.get("category") == "channel",
-            is_bot=group.get("category") == "bot",
-        )
-        chat_data.messages = messages
-        result_count += len(messages)
-        chats.append(chat_data)
-
-        rs = group.get("read_state")
-        if rs is not None:
-            read_state_per_dialog[dialog_id] = rs
-        dt = group.get("dialog_type")
-        if dt is not None:
-            dialog_type_per_dialog[dialog_id] = dt
-
-    result_text = format_unread_messages_grouped(
-        chats,
-        read_state_per_dialog=read_state_per_dialog or None,
-        dialog_type_per_dialog=dialog_type_per_dialog or None,
-    )
-    # Closes UAT gap 2: even when results are non-empty, the caller must be told
-    # if some dialogs are still bootstrapping — otherwise partial coverage looks
-    # like complete coverage.
-    if bootstrap_pending > 0:
-        result_text = (
-            f"{result_text}\n\n"
-            f"Note: bootstrap_pending={bootstrap_pending} dialog(s) not yet seeded "
-            f"by the sync daemon — results may be incomplete. Retry shortly."
-        )
-    return ToolResult(content=_text_response(result_text), structured_content=structured_content, result_count=result_count)
+    return structured_result(structured_content, result_count=result_message_count)

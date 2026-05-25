@@ -74,10 +74,10 @@ def _text_content(result: StructuredResult) -> str:
 
 def assert_structured_success_payload(result: StructuredResult) -> dict[str, object]:
     assert _is_error(result) is False
+    assert list(result.content) == []
     payload = _structured_payload(result)
     assert payload is not None
     assert isinstance(payload, dict)
-    _text_content(result)
     return payload
 
 
@@ -105,7 +105,7 @@ def assert_structured_text_parity(
     payload = assert_structured_success_payload(result)
     value = _field_path_value(payload, structured_field_path)
     assert value is not None
-    assert expected_text_substring in _text_content(result)
+    assert expected_text_substring in str(value)
     return value
 
 
@@ -557,12 +557,7 @@ async def test_list_dialogs_via_daemon():
     with _patch_daemon(conn):
         result = await list_dialogs(ListDialogs())
 
-    assert len(result.content) == 1
-    text = result.content[0].text
-    assert "Alice" in text
-    assert "Dev Chat" in text
-    assert "sync_status=synced" in text
-    assert "sync_status=not_synced" in text
+    assert result.content == ()
     assert result.structured_content is not None
     assert result.structured_content["count"] == len(result.structured_content["dialogs"])
     assert result.structured_content["snapshot_age_h"] is None
@@ -637,7 +632,7 @@ async def test_list_dialogs_sync_status_in_output():
     with _patch_daemon(conn):
         result = await list_dialogs(ListDialogs())
 
-    assert "sync_status=" in result.content[0].text
+    assert result.content == ()
     assert result.structured_content is not None
     assert result.structured_content["dialogs"][0]["sync_status"] == "synced"
 
@@ -648,7 +643,10 @@ async def test_list_dialogs_empty_via_daemon():
     with _patch_daemon(conn):
         result = await list_dialogs(ListDialogs())
 
-    assert "No dialogs" in result.content[0].text
+    assert result.content == ()
+    assert result.structured_content is not None
+    assert result.structured_content["dialogs"] == []
+    assert result.structured_content["count"] == 0
 
 
 async def test_list_dialogs_upserts_entities_via_daemon():
@@ -716,10 +714,7 @@ async def test_list_topics_via_daemon():
     with _patch_daemon(conn):
         result = await list_topics(ListTopics(dialog="MyGroup"))
 
-    assert len(result.content) == 1
-    text = result.content[0].text
-    assert "General" in text
-    assert "Off-topic" in text
+    assert result.content == ()
     assert result.structured_content is not None
     assert result.structured_content["dialog"] == "MyGroup"
     assert result.structured_content["dialog_id"] == 123
@@ -754,7 +749,7 @@ async def test_list_topics_empty_is_structured_non_error():
         result = await list_topics(ListTopics(dialog="Some Group"))
 
     assert result.is_error is False
-    assert "No active forum topics" in result.content[0].text
+    assert result.content == ()
     assert result.structured_content == {
         "dialog": "Some Group",
         "dialog_id": 123,
@@ -849,8 +844,7 @@ async def test_list_messages_via_daemon():
     with _patch_daemon(conn):
         result = await list_messages(ListMessages(exact_dialog_id=123))
 
-    assert len(result.content) == 1
-    assert "Hello" in result.content[0].text
+    assert result.content == ()
     assert result.structured_content is not None
     assert result.structured_content["source"] == "sync_db"
     assert result.structured_content["count"] == 1
@@ -927,8 +921,7 @@ async def test_search_messages_via_daemon():
         result = await search_messages(SearchMessages(dialog="123", query="result"))
 
     assert_structured_text_parity(result, "results.0.snippet", "Found this result")
-    assert "Found this result" in result.content[0].text
-    assert "[Telegram content] Found this result [/Telegram content]" in result.content[0].text
+    assert result.content == ()
     assert result.structured_content is not None
     assert result.structured_content["query"] == "result"
     assert result.structured_content["count"] == 1
@@ -969,9 +962,14 @@ async def test_search_messages_frames_adversarial_snippet():
     with _patch_daemon(conn):
         result = await search_messages(SearchMessages(dialog="123", query="submit_feedback"))
 
-    text = result.content[0].text
-    assert f"[Telegram content] {adversarial} [/Telegram content]" in text
-    assert f': "{adversarial}"' not in text
+    assert result.content == ()
+    assert result.structured_content is not None
+    content = result.structured_content["results"][0]["content"]
+    assert content == {
+        "text": adversarial,
+        "is_telegram_content": True,
+        "content_kind": "snippet",
+    }
 
 
 async def test_search_messages_passes_dialog_name():
@@ -991,8 +989,7 @@ async def test_search_messages_no_hits():
     with _patch_daemon(conn):
         result = await search_messages(SearchMessages(dialog="123", query="nonexistent"))
 
-    assert len(result.content) == 1
-    assert "no messages matched" in result.content[0].text.lower(), f"Expected no-hits text, got: {result.content[0].text}"
+    assert result.content == ()
     assert result.structured_content is not None
     assert result.structured_content["query"] == "nonexistent"
     assert result.structured_content["results"] == []
@@ -1147,7 +1144,7 @@ async def test_trace_account_messages_routes_flat_arguments_and_counts_evidence_
         "is_telegram_content": True,
         "content_kind": "media_description",
     }
-    assert result.structured_content["text_preview"] == {
+    assert result.structured_content["preview"] == {
         "shown_count": 2,
         "hidden_count": 0,
         "gap_summary": [],
@@ -1155,8 +1152,7 @@ async def test_trace_account_messages_routes_flat_arguments_and_counts_evidence_
     assert result.structured_content["limits"]["requested_limit"] == 50
     assert result.structured_content["navigation"]["has_more"] is False
     assert result.result_count == 2
-    assert result.content[0].text
-    assert "[Telegram content] first trace hit [/Telegram content]" in result.content[0].text
+    assert result.content == ()
     conn.trace_account_messages.assert_called_once()
     call_kwargs = conn.trace_account_messages.call_args[1]
     assert call_kwargs["account"] == "@alice"
@@ -1361,8 +1357,7 @@ async def test_mark_dialog_for_sync_via_daemon():
     conn = _make_daemon_conn({"ok": True})
     with _patch_daemon(conn):
         result = await mark_dialog_for_sync(MarkDialogForSync(dialog_id=42, enable=True))
-    assert len(result.content) == 1
-    assert "marked for sync" in result.content[0].text
+    assert result.content == ()
     assert result.structured_content == {
         "dialog_id": 42,
         "enabled": True,
@@ -1379,7 +1374,7 @@ async def test_mark_dialog_for_sync_disable():
     conn = _make_daemon_conn({"ok": True})
     with _patch_daemon(conn):
         result = await mark_dialog_for_sync(MarkDialogForSync(dialog_id=42, enable=False))
-    assert "unmarked from sync" in result.content[0].text
+    assert result.content == ()
     assert result.structured_content == {
         "dialog_id": 42,
         "enabled": False,
@@ -1422,10 +1417,7 @@ async def test_get_sync_status_via_daemon():
     )
     with _patch_daemon(conn):
         result = await get_sync_status(GetSyncStatus(dialog_id=-1001234567890))
-    text = result.content[0].text
-    assert "status=synced" in text
-    assert "message_count=100" in text
-    assert "delete_detection=reliable (channel)" in text
+    assert result.content == ()
     assert result.structured_content == {
         "dialog_id": -1001234567890,
         "status": "synced",
@@ -1476,12 +1468,7 @@ async def test_get_sync_alerts_via_daemon():
     )
     with _patch_daemon(conn):
         result = await get_sync_alerts(GetSyncAlerts(since=0, limit=50))
-    text = result.content[0].text
-    assert "Deleted Messages" in text
-    assert "dialog=1" in text
-    assert "Edits" in text
-    assert "edit_date=" in text
-    assert "Access Lost" in text
+    assert result.content == ()
     assert result.structured_content is not None
     assert result.structured_content["count"] == 3
     assert result.structured_content["alerts"][0]["dialog_id"] == 1
@@ -1562,8 +1549,7 @@ async def test_get_sync_alerts_empty():
     )
     with _patch_daemon(conn):
         result = await get_sync_alerts(GetSyncAlerts())
-    assert_structured_text_parity(result, "count", "No sync alerts")
-    assert "No sync alerts" in result.content[0].text
+    assert result.content == ()
     assert result.is_error is False
     assert result.structured_content == {
         "alerts": [],
@@ -1677,10 +1663,11 @@ async def test_get_entity_info_resolves_via_daemon():
     with _patch_daemon(conn):
         result = await get_entity_info(GetEntityInfo(entity="Alice"))
 
-    text = result.content[0].text
-    assert '[resolved: "Alice"]' in text
-    assert "12345" in text
-    assert "Dev Chat" in text
+    assert result.content == ()
+    assert result.structured_content is not None
+    assert result.structured_content["resolved_query"]["display_name"] == "Alice"
+    assert result.structured_content["entity_id"] == 12345
+    assert result.structured_content["relationships"]["common_chats"][0]["name"] == "Dev Chat"
     conn.resolve_entity.assert_called_once_with(query="Alice")
     conn.get_entity_info.assert_called_once_with(entity_id=12345)
 
@@ -1737,12 +1724,7 @@ async def test_get_inbox_via_daemon():
     with _patch_daemon(conn):
         result = await get_inbox(GetInbox())
 
-    text = result.content[0].text
-    assert "Alice" in text
-    assert "Hello there" in text
-    header_line = next(line for line in text.splitlines() if line.startswith("--- Alice"))
-    assert "[Telegram content]" not in header_line
-    assert "[Telegram content]\nHello there\n[/Telegram content]" in text
+    assert result.content == ()
     assert result.structured_content is not None
     schema = TOOL_REGISTRY["get_inbox"].output_schema
     assert schema is not None
@@ -1802,10 +1784,14 @@ async def test_get_inbox_frames_adversarial_body_without_framing_group_header():
     with _patch_daemon(conn):
         result = await get_inbox(GetInbox())
 
-    text = result.content[0].text
-    header_line = next(line for line in text.splitlines() if line.startswith("--- Alice"))
-    assert "[Telegram content]" not in header_line
-    assert f"[Telegram content]\n{adversarial}\n[/Telegram content]" in text
+    assert result.content == ()
+    assert result.structured_content is not None
+    content = result.structured_content["dialogs"][0]["messages"][0]["content"]
+    assert content == {
+        "text": adversarial,
+        "is_telegram_content": True,
+        "content_kind": "message_text",
+    }
 
 
 async def test_get_inbox_empty():
@@ -1814,7 +1800,10 @@ async def test_get_inbox_empty():
     with _patch_daemon(conn):
         result = await get_inbox(GetInbox())
 
-    assert "no unread" in result.content[0].text.lower() or "непрочитанных" in result.content[0].text.lower()
+    assert result.content == ()
+    assert result.structured_content is not None
+    assert result.structured_content["dialogs"] == []
+    assert result.structured_content["count"] == 0
 
 
 async def test_get_inbox_daemon_not_running():
@@ -1851,15 +1840,8 @@ async def test_get_inbox_empty_with_bootstrap_pending():
     with _patch_daemon(conn):
         result = await get_inbox(GetInbox())
 
-    text = result.content[0].text
+    assert result.content == ()
     assert result.is_error is False
-    # Must mention the pending count
-    assert "329" in text, f"bootstrap_pending count missing from response: {text!r}"
-    # Must mention the bootstrap state in some recognisable form
-    lowered = text.lower()
-    assert "bootstrap" in lowered or "pending" in lowered or "seeded" in lowered or "bootstrapping" in lowered, (
-        f"bootstrap state not surfaced in response: {text!r}"
-    )
     assert result.structured_content is not None
     assert result.structured_content["bootstrap_pending"] == 329
     assert result.structured_content["coverage"] == {
@@ -1883,8 +1865,10 @@ async def test_get_inbox_empty_with_no_bootstrap_pending():
     with _patch_daemon(conn):
         result = await get_inbox(GetInbox())
 
-    lowered = result.content[0].text.lower()
-    assert "no unread" in lowered or "непрочитанных" in lowered
+    assert result.content == ()
+    assert result.structured_content is not None
+    assert result.structured_content["dialogs"] == []
+    assert result.structured_content["coverage"]["complete"] is True
 
 
 async def test_get_inbox_non_empty_with_bootstrap_pending():
@@ -1923,16 +1907,7 @@ async def test_get_inbox_non_empty_with_bootstrap_pending():
     with _patch_daemon(conn):
         result = await get_inbox(GetInbox())
 
-    text = result.content[0].text
-    # Existing format preserved
-    assert "Alice" in text
-    assert "Hello there" in text
-    # New disclosure
-    assert "5" in text, f"bootstrap_pending count missing from non-empty response: {text!r}"
-    lowered = text.lower()
-    assert "bootstrap" in lowered or "pending" in lowered or "incomplete" in lowered, (
-        f"bootstrap_pending note missing from non-empty response: {text!r}"
-    )
+    assert result.content == ()
     assert result.structured_content is not None
     assert result.structured_content["bootstrap_pending"] == 5
     assert result.structured_content["coverage"]["complete"] is False
@@ -1974,11 +1949,10 @@ async def test_get_inbox_non_empty_with_no_bootstrap_pending():
     with _patch_daemon(conn):
         result = await get_inbox(GetInbox())
 
-    text = result.content[0].text
-    assert "Alice" in text
-    assert "Hello there" in text
-    # No spurious disclosure when coverage is complete
-    assert "bootstrap_pending" not in text, f"unexpected bootstrap_pending disclosure when count=0: {text!r}"
+    assert result.content == ()
+    assert result.structured_content is not None
+    assert result.structured_content["bootstrap_pending"] == 0
+    assert result.structured_content["coverage"]["complete"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -2006,9 +1980,7 @@ async def test_get_usage_stats_via_daemon():
     with _patch_daemon(conn):
         result = await get_usage_stats(GetUsageStats())
 
-    text = result.content[0].text
-    assert "list_dialogs" in text
-    assert "120" in text  # latency_median_ms
+    assert result.content == ()
     assert result.structured_content is not None
     assert result.structured_content["empty"] is False
     assert result.structured_content["total_calls"] == 15
@@ -2041,8 +2013,7 @@ async def test_get_usage_stats_empty_data():
     with _patch_daemon(conn):
         result = await get_usage_stats(GetUsageStats())
 
-    text = result.content[0].text
-    assert "no usage data" in text.lower()
+    assert result.content == ()
     assert result.structured_content is not None
     assert result.structured_content["empty"] is True
     assert result.structured_content["total_calls"] == 0
@@ -2462,7 +2433,7 @@ async def test_list_messages_topic_fuzzy_resolves_via_list_topics():
 
 
 async def test_list_messages_topic_fuzzy_ambiguous_returns_error():
-    """list_messages with ambiguous topic= returns error listing matches."""
+    """list_messages with ambiguous topic= returns structured candidates without text labels."""
     list_topics_response = {
         "ok": True,
         "data": {
@@ -2479,7 +2450,25 @@ async def test_list_messages_topic_fuzzy_ambiguous_returns_error():
         result = await list_messages(ListMessages(exact_dialog_id=1, topic="General"))
 
     text = result.content[0].text
-    assert "ambiguous" in text.lower() or "matches" in text.lower() or "exact_topic_id" in text.lower()
+    assert result.is_error is True
+    assert "Multiple topics matched" in text
+    assert "structuredContent.candidates" in text
+    assert "exact_topic_id" in text
+    assert "General Chat" not in text
+    assert "General Topics" not in text
+    payload = result.structured_content
+    assert payload is not None
+    assert payload["error"] == "ambiguous_topic"
+    candidates = payload["candidates"]
+    assert isinstance(candidates, list)
+    assert [candidate["topic_id"] for candidate in candidates] == [7, 8]
+    assert candidates[0]["title_content"] == {
+        "text": "General Chat",
+        "is_telegram_content": True,
+        "content_kind": "message_text",
+    }
+    assert candidates[0]["untrusted_content"] is True
+    assert candidates[0]["trust"] == {"source": "telegram", "is_untrusted": True}
 
 
 async def test_list_messages_topic_not_found_returns_error():
@@ -2554,14 +2543,7 @@ async def test_get_my_recent_activity_routes_primary():
     )
     with _patch_daemon(conn):
         result = await get_my_recent_activity(GetMyRecentActivity(since_hours=168, limit=500))
-    text = result.content[0].text
-    # Per-comment granularity (D-09): both blocks present
-    assert "message_id=100" in text
-    assert "message_id=101" in text
-    assert "first" in text
-    assert "second" in text
-    assert "[Telegram content] first [/Telegram content]" in text
-    assert "[Telegram content] second [/Telegram content]" in text
+    assert result.content == ()
     assert result.structured_content is not None
     assert result.structured_content["since_hours"] == 168
     assert result.structured_content["limit"] == 500
@@ -2606,9 +2588,15 @@ async def test_get_my_recent_activity_frames_adversarial_text():
     with _patch_daemon(conn):
         result = await get_my_recent_activity(GetMyRecentActivity())
 
-    text = result.content[0].text
-    assert f"[Telegram content] {adversarial} [/Telegram content]" in text
-    assert "nav: dialog_id=42 message_id=100" in text
+    assert result.content == ()
+    assert result.structured_content is not None
+    comment = result.structured_content["comments"][0]
+    assert comment["content"] == {
+        "text": adversarial,
+        "is_telegram_content": True,
+        "content_kind": "message_text",
+    }
+    assert comment["navigation"]["arguments"] == {"exact_dialog_id": 42, "anchor_message_id": 100}
 
 
 async def test_get_my_recent_activity_never_run_header():
@@ -2623,7 +2611,7 @@ async def test_get_my_recent_activity_never_run_header():
     )
     with _patch_daemon(conn):
         result = await get_my_recent_activity(GetMyRecentActivity())
-    assert "Scan status: never run" in result.content[0].text
+    assert result.content == ()
     assert result.structured_content is not None
     assert result.structured_content["scan_status"] == "never_run"
     assert result.structured_content["comments"] == []
@@ -2646,7 +2634,9 @@ async def test_get_my_recent_activity_in_progress_header():
     )
     with _patch_daemon(conn):
         result = await get_my_recent_activity(GetMyRecentActivity())
-    assert "Scan status: in progress" in result.content[0].text
+    assert result.content == ()
+    assert result.structured_content is not None
+    assert result.structured_content["scan_status"] == "in_progress"
 
 
 async def test_get_my_recent_activity_formats_comment_block():
@@ -2673,11 +2663,13 @@ async def test_get_my_recent_activity_formats_comment_block():
     )
     with _patch_daemon(conn):
         result = await get_my_recent_activity(GetMyRecentActivity())
-    text = result.content[0].text
-    assert "[X]" in text
-    assert "hi" in text
-    assert "nav: dialog_id=42 message_id=100" in text
-    assert "reactions:" not in text
+    assert result.content == ()
+    assert result.structured_content is not None
+    comment = result.structured_content["comments"][0]
+    assert comment["dialog_name"] == "X"
+    assert comment["text"] == "hi"
+    assert comment["navigation"]["arguments"] == {"exact_dialog_id": 42, "anchor_message_id": 100}
+    assert comment["reactions"] == []
 
 
 async def test_get_my_recent_activity_renders_reactions():
@@ -2708,10 +2700,12 @@ async def test_get_my_recent_activity_renders_reactions():
     )
     with _patch_daemon(conn):
         result = await get_my_recent_activity(GetMyRecentActivity())
-    text = result.content[0].text
-    assert "reactions:" in text
-    assert "🔥×3" in text
-    assert "❤×1" in text
+    assert result.content == ()
+    assert result.structured_content is not None
+    assert result.structured_content["comments"][0]["reactions"] == [
+        {"emoji": "🔥", "count": 3},
+        {"emoji": "❤", "count": 1},
+    ]
 
 
 async def test_list_messages_fragment_coverage_header():
@@ -2724,7 +2718,8 @@ async def test_list_messages_fragment_coverage_header():
     )
     with _patch_daemon(conn):
         result = await list_messages(ListMessages(exact_dialog_id=42))
-    assert "Coverage: fragment" in result.content[0].text
+    assert result.content == ()
+    assert result.structured_content["coverage"]["fragment_coverage"] is True
 
 
 async def test_list_messages_no_fragment_no_header():
@@ -2732,4 +2727,5 @@ async def test_list_messages_no_fragment_no_header():
     conn = _make_daemon_conn({"ok": True, "data": {"messages": []}})
     with _patch_daemon(conn):
         result = await list_messages(ListMessages(exact_dialog_id=42))
-    assert "Coverage: fragment" not in result.content[0].text
+    assert result.content == ()
+    assert result.structured_content["coverage"]["fragment_coverage"] is False

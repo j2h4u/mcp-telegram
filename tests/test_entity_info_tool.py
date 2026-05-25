@@ -1,7 +1,7 @@
 """Tests for tools/entity_info.py — MCP tool surface (Phase 47).
 
-SPEC Reqs covered: 1 (registration smoke + tool renders), 3 (common envelope
-rendered), 4-7 (per-type rendering), and end-to-end resolver behavior.
+SPEC Reqs covered: 1 (registration smoke + structured tool output), 3 (common
+envelope), 4-7 (per-type fields), and end-to-end resolver behavior.
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ def _patch_daemon(resolve_response, get_entity_info_response):
         try:
             yield next(connections)
         except StopIteration:
-            raise AssertionError("more daemon_connection calls than scripted")
+            raise AssertionError("more daemon_connection calls than scripted") from None
 
     return patch("mcp_telegram.tools.entity_info.daemon_connection", fake_daemon_connection)
 
@@ -69,14 +69,7 @@ async def test_get_entity_info_user_renders() -> None:
     }
     with _patch_daemon(_resolve_ok(42, "Alice Smith"), get_resp):
         result = await get_entity_info(GetEntityInfo(entity="Alice"))
-    text = result.content[0].text
-    assert "type=user" in text
-    assert "is_bot: false" in text
-    assert "name='Alice Smith'" in text
-    assert "username=@alice" in text
-    assert "about:\n[Telegram content]\nQA engineer\n[/Telegram content]" in text
-    assert "phone: +12025551234 (US)" in text
-    assert "Common chats (0):" in text
+    assert result.content == ()
     payload = result.structured_content
     assert payload is not None
     assert payload["type"] == "user"
@@ -132,12 +125,7 @@ async def test_get_entity_info_bot_renders_type_bot() -> None:
     }
     with _patch_daemon(_resolve_ok(1, "MyBot"), get_resp):
         result = await get_entity_info(GetEntityInfo(entity="MyBot"))
-    text = result.content[0].text
-    assert "type=bot" in text
-    assert "is_bot: true" in text
-    assert "flags: bot" in text
-    assert "bot_description:\n[Telegram content]\nA test bot\n[/Telegram content]" in text
-    assert "bot_commands: /start" in text
+    assert result.content == ()
     payload = result.structured_content
     assert payload is not None
     assert payload["type"] == "bot"
@@ -173,14 +161,7 @@ async def test_get_entity_info_channel_renders() -> None:
     }
     with _patch_daemon(_resolve_ok(-1001, "News"), get_resp):
         result = await get_entity_info(GetEntityInfo(entity="News"))
-    text = result.content[0].text
-    assert "type=channel" in text
-    assert "about:\n[Telegram content]\nDaily news\n[/Telegram content]" in text
-    assert "subscribers_count: 12345" in text
-    assert "pinned_msg_id: 999" in text
-    assert "slow_mode_seconds: 30" in text
-    assert "available_reactions: 👍, ❤" in text
-    assert "contacts_subscribed: null (reason: not_an_admin)" in text
+    assert result.content == ()
     payload = result.structured_content
     assert payload is not None
     assert payload["type"] == "channel"
@@ -216,12 +197,7 @@ async def test_get_entity_info_supergroup_renders() -> None:
     }
     with _patch_daemon(_resolve_ok(-1002, "DevChat"), get_resp):
         result = await get_entity_info(GetEntityInfo(entity="DevChat"))
-    text = result.content[0].text
-    assert "type=supergroup" in text
-    assert "members_count: 42" in text
-    assert "has_topics: yes" in text
-    assert "contacts_subscribed (1):" in text
-    assert "id=10" in text and "name='Anna'" in text
+    assert result.content == ()
     payload = result.structured_content
     assert payload is not None
     assert payload["type"] == "supergroup"
@@ -259,11 +235,7 @@ async def test_get_entity_info_group_renders_migrated_to() -> None:
     }
     with _patch_daemon(_resolve_ok(-100, "Old Chat"), get_resp):
         result = await get_entity_info(GetEntityInfo(entity="Old Chat"))
-    text = result.content[0].text
-    assert "type=group" in text
-    assert "members_count: 5" in text
-    assert "migrated_to: -1002005000000" in text
-    assert "re-run GetEntityInfo with this id" in text
+    assert result.content == ()
     payload = result.structured_content
     assert payload is not None
     assert payload["type"] == "group"
@@ -297,9 +269,28 @@ async def test_get_entity_info_resolver_ambiguous() -> None:
     with patch("mcp_telegram.tools.entity_info.daemon_connection", fake_dc):
         result = await get_entity_info(GetEntityInfo(entity="Alice"))
     text = result.content[0].text
-    assert "Multiple entities match" in text
-    assert "Alice A" in text and "Alice B" in text
-    assert "GetEntityInfo" in text
+    assert result.is_error is True
+    assert "Multiple entities matched" in text
+    assert "structuredContent.candidates" in text
+    assert "Alice A" not in text and "Alice B" not in text
+    payload = result.structured_content
+    assert payload is not None
+    assert payload["error"] == "ambiguous_entity"
+    candidates = payload["candidates"]
+    assert isinstance(candidates, list)
+    assert [candidate["entity_id"] for candidate in candidates] == [1, 2]
+    assert candidates[0]["display_name_content"] == {
+        "text": "Alice A",
+        "is_telegram_content": True,
+        "content_kind": "message_text",
+    }
+    assert candidates[0]["username_content"] == {
+        "text": "alicea",
+        "is_telegram_content": True,
+        "content_kind": "message_text",
+    }
+    assert candidates[0]["untrusted_content"] is True
+    assert candidates[0]["trust"] == {"source": "telegram", "is_untrusted": True}
 
 
 @pytest.mark.asyncio
@@ -366,9 +357,9 @@ async def test_get_entity_info_frames_adversarial_profile_fields() -> None:
     with _patch_daemon(_resolve_ok(42, "Alice Smith"), get_resp):
         result = await get_entity_info(GetEntityInfo(entity="Alice"))
 
-    text = result.content[0].text
-    id_line = next(line for line in text.splitlines() if line.startswith("id=42 "))
-    type_line = id_line
-    assert "type=user" in type_line
-    assert "[Telegram content]" not in id_line
-    assert f"[Telegram content]\n{adversarial}\n[/Telegram content]" in text
+    assert result.content == ()
+    payload = result.structured_content
+    assert payload is not None
+    content_texts = [field["content"]["text"] for field in payload["content_fields"]]
+    assert adversarial in content_texts
+    assert all(field["untrusted_content"] is True for field in payload["content_fields"])

@@ -138,8 +138,9 @@ async def test_list_messages_tool_renders_header_in_output() -> None:
     conn = _make_conn("list_messages", response)
     with _patch_daemon("mcp_telegram.tools.reading.daemon_connection", conn):
         result = await list_messages(ListMessages(exact_dialog_id=111))
-    text = result.content[0].text
-    assert "[inbox: 2 unread from peer" in text
+    assert result.content == ()
+    assert result.structured_content is not None
+    assert result.structured_content["read_state"]["header_lines"][0].startswith("[inbox: 2 unread from peer")
 
 
 @pytest.mark.asyncio
@@ -169,9 +170,15 @@ async def test_list_messages_tool_renders_inline_marker_in_output() -> None:
     conn = _make_conn("list_messages", response)
     with _patch_daemon("mcp_telegram.tools.reading.daemon_connection", conn):
         result = await list_messages(ListMessages(exact_dialog_id=111))
-    text = result.content[0].text
+    assert result.content == ()
+    assert result.structured_content is not None
+    markers = [
+        marker["label"]
+        for message in result.structured_content["messages"]
+        for marker in message["inline_markers"]
+    ]
     assert any(
-        marker in text
+        marker in markers
         for marker in [
             "[I read up to here]",
             "[unread by me]",
@@ -196,10 +203,9 @@ async def test_list_messages_tool_non_dm_omits_header() -> None:
     conn = _make_conn("list_messages", response)
     with _patch_daemon("mcp_telegram.tools.reading.daemon_connection", conn):
         result = await list_messages(ListMessages(exact_dialog_id=-100500))
-    text = result.content[0].text
-    assert "[read-state:" not in text
-    assert "[inbox:" not in text
-    assert "[outbox:" not in text
+    assert result.content == ()
+    assert result.structured_content is not None
+    assert result.structured_content["read_state"]["header_lines"] == []
 
 
 @pytest.mark.asyncio
@@ -215,15 +221,14 @@ async def test_list_messages_tool_backward_compat_no_read_state_in_response() ->
     conn = _make_conn("list_messages", response)
     with _patch_daemon("mcp_telegram.tools.reading.daemon_connection", conn):
         result = await list_messages(ListMessages(exact_dialog_id=111))
-    text = result.content[0].text
-    assert "[read-state:" not in text
-    assert "[inbox:" not in text
-    assert "[outbox:" not in text
+    assert result.content == ()
+    assert result.structured_content is not None
+    assert result.structured_content["read_state"] is None
 
 
 @pytest.mark.asyncio
-async def test_list_messages_passes_dialog_type_through() -> None:
-    """Kwarg-capture: format_messages receives dialog_type from daemon response."""
+async def test_list_messages_structures_dialog_type_read_state() -> None:
+    """Daemon read_state and dialog_type are surfaced in structuredContent."""
     response = {
         "ok": True,
         "data": {
@@ -234,14 +239,12 @@ async def test_list_messages_passes_dialog_type_through() -> None:
         },
     }
     conn = _make_conn("list_messages", response)
-    with patch("mcp_telegram.tools.reading.format_messages") as mock_fmt:
-        mock_fmt.return_value = "rendered"
-        with _patch_daemon("mcp_telegram.tools.reading.daemon_connection", conn):
-            await list_messages(ListMessages(exact_dialog_id=111))
-    assert mock_fmt.called
-    kwargs = mock_fmt.call_args.kwargs
-    assert kwargs.get("dialog_type") == "User"
-    assert kwargs.get("read_state") == _collapsed_rs()
+    with _patch_daemon("mcp_telegram.tools.reading.daemon_connection", conn):
+        result = await list_messages(ListMessages(exact_dialog_id=111))
+    assert result.content == ()
+    assert result.structured_content is not None
+    assert result.structured_content["read_state"]["dialog_type"] == "User"
+    assert result.structured_content["read_state"]["state"] == _collapsed_rs()
 
 
 # ---------------------------------------------------------------------------
@@ -342,9 +345,11 @@ async def test_search_tool_renders_per_dialog_header_block() -> None:
     conn = _make_conn("search_messages", response)
     with _patch_daemon("mcp_telegram.tools.reading.daemon_connection", conn):
         result = await search_messages(SearchMessages(query="ping"))
-    text = result.content[0].text
-    assert "[inbox: 2 unread from peer" in text
-    assert "[read-state: all caught up]" in text
+    assert result.content == ()
+    assert result.structured_content is not None
+    read_state = result.structured_content["read_state_per_dialog"]
+    assert read_state["111"]["header_lines"][0].startswith("[inbox: 2 unread from peer")
+    assert read_state["222"]["header_lines"] == ["[read-state: all caught up]"]
 
 
 @pytest.mark.asyncio
@@ -355,9 +360,9 @@ async def test_search_tool_backward_compat_no_read_state_per_dialog() -> None:
     conn = _make_conn("search_messages", response)
     with _patch_daemon("mcp_telegram.tools.reading.daemon_connection", conn):
         result = await search_messages(SearchMessages(query="ping"))
-    text = result.content[0].text
-    assert "[read-state:" not in text
-    assert "[inbox:" not in text
+    assert result.content == ()
+    assert result.structured_content is not None
+    assert result.structured_content["read_state_per_dialog"] == {}
 
 
 # ---------------------------------------------------------------------------
@@ -426,12 +431,11 @@ async def test_unread_tool_renders_per_chat_header() -> None:
     conn = _make_conn("get_inbox", response)
     with _patch_daemon("mcp_telegram.tools.unread.daemon_connection", conn):
         result = await get_inbox(GetInbox())
-    text = result.content[0].text
-    assert "[inbox: 2 unread from peer" in text
-    assert "[read-state: all caught up]" in text
-    # Order: Alice block first → header precedes "hey A"; Bob block → header precedes "hey B".
-    assert text.index("[inbox: 2 unread from peer") < text.index("hey A")
-    assert text.index("[read-state: all caught up]") < text.index("hey B")
+    assert result.content == ()
+    assert result.structured_content is not None
+    dialogs = result.structured_content["dialogs"]
+    assert dialogs[0]["read_state"]["header_lines"][0].startswith("[inbox: 2 unread from peer")
+    assert dialogs[1]["read_state"]["header_lines"] == ["[read-state: all caught up]"]
 
 
 @pytest.mark.asyncio
@@ -449,8 +453,8 @@ async def test_unread_tool_renders_collapsed_header_when_chat_caught_up() -> Non
     conn = _make_conn("get_inbox", response)
     with _patch_daemon("mcp_telegram.tools.unread.daemon_connection", conn):
         result = await get_inbox(GetInbox())
-    text = result.content[0].text
-    assert "[read-state: all caught up]" in text
+    assert result.content == ()
+    assert result.structured_content["dialogs"][0]["read_state"]["header_lines"] == ["[read-state: all caught up]"]
 
 
 @pytest.mark.asyncio
@@ -468,9 +472,10 @@ async def test_unread_tool_renders_split_header_when_inbox_unread() -> None:
     conn = _make_conn("get_inbox", response)
     with _patch_daemon("mcp_telegram.tools.unread.daemon_connection", conn):
         result = await get_inbox(GetInbox())
-    text = result.content[0].text
-    assert "[inbox: 2 unread from peer" in text
-    assert "[outbox: all read by peer]" in text
+    assert result.content == ()
+    header_lines = result.structured_content["dialogs"][0]["read_state"]["header_lines"]
+    assert header_lines[0].startswith("[inbox: 2 unread from peer")
+    assert header_lines[1] == "[outbox: all read by peer]"
 
 
 @pytest.mark.asyncio
@@ -489,10 +494,8 @@ async def test_unread_tool_no_header_for_non_dm_group() -> None:
     conn = _make_conn("get_inbox", response)
     with _patch_daemon("mcp_telegram.tools.unread.daemon_connection", conn):
         result = await get_inbox(GetInbox())
-    text = result.content[0].text
-    assert "[read-state:" not in text
-    assert "[inbox:" not in text
-    assert "[outbox:" not in text
+    assert result.content == ()
+    assert result.structured_content["dialogs"][0]["read_state"]["header_lines"] == []
 
 
 @pytest.mark.asyncio
@@ -510,7 +513,5 @@ async def test_unread_tool_backward_compat_no_read_state() -> None:
     conn = _make_conn("get_inbox", response)
     with _patch_daemon("mcp_telegram.tools.unread.daemon_connection", conn):
         result = await get_inbox(GetInbox())
-    text = result.content[0].text
-    assert "[read-state:" not in text
-    assert "[inbox:" not in text
-    assert "[outbox:" not in text
+    assert result.content == ()
+    assert result.structured_content["dialogs"][0]["read_state"] is None

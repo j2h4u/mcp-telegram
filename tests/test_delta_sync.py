@@ -974,6 +974,7 @@ async def test_fetch_delta_stamps_on_floodwait(
     checkpoint skip catches the dialog on the next cold restart instead of
     repeatedly hitting FloodWait on the same hot dialogs every boot."""
     import time as _time
+
     from telethon.errors import FloodWaitError as _FloodWaitError
 
     dialog_id = 6007

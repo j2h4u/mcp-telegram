@@ -42,8 +42,8 @@ def _patch_daemon(conn: MagicMock):
 
 
 @pytest.mark.asyncio
-async def test_get_dialog_stats_formats_sections() -> None:
-    """GetDialogStats with populated data formats four section headers and entries."""
+async def test_get_dialog_stats_structures_sections() -> None:
+    """GetDialogStats with populated data returns four structured sections."""
     data = {
         "dialog_id": 1,
         "top_reactions": [
@@ -68,15 +68,7 @@ async def test_get_dialog_stats_formats_sections() -> None:
     with _patch_daemon(conn):
         content = await get_dialog_stats(GetDialogStats(dialog="Chat Foo"))
 
-    text = content.content[0].text
-    assert "Top Reactions" in text
-    assert "Top Mentions" in text
-    assert "Top Hashtags" in text
-    assert "Top Forward Sources" in text
-    assert "count=4" in text
-    assert "count=3" in text
-    assert "count=5" in text
-    assert "Channel A" in text
+    assert content.content == ()
     assert content.structured_content is not None
     assert content.structured_content["dialog"] == "Chat Foo"
     assert content.structured_content["dialog_id"] == 1
@@ -115,7 +107,7 @@ async def test_get_dialog_stats_not_synced_error() -> None:
 
 @pytest.mark.asyncio
 async def test_get_dialog_stats_empty_sections() -> None:
-    """GetDialogStats with all empty lists shows (none) in each section and result_count=0."""
+    """GetDialogStats with all empty lists returns result_count=0."""
     conn = _make_conn(
         {
             "ok": True,
@@ -132,8 +124,7 @@ async def test_get_dialog_stats_empty_sections() -> None:
     with _patch_daemon(conn):
         content = await get_dialog_stats(GetDialogStats(dialog="Empty Chat"))
 
-    text = content.content[0].text
-    assert text.count("(none)") == 4
+    assert content.content == ()
     assert content.structured_content is not None
     assert content.structured_content["top_reactions"] == []
     assert content.structured_content["top_mentions"] == []

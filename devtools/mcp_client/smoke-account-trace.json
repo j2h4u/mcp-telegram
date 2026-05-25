@@ -26,6 +26,7 @@
       "expect": {
         "is_error": false,
         "path_equals": {
+          "content": [],
           "structuredContent.resolved_account.confidence": "resolved",
           "structuredContent.provenance.coverage_goal": "observed",
           "structuredContent.result_count_semantics": "current_page_evidence_items"
@@ -35,14 +36,13 @@
           "structuredContent.coverage",
           "structuredContent.groups",
           "structuredContent.provenance",
-          "structuredContent.text_preview"
+          "structuredContent.preview"
         ],
         "path_nonempty": [
           "structuredContent",
           "structuredContent.resolved_account",
           "structuredContent.coverage",
-          "structuredContent.provenance",
-          "content.0.text"
+          "structuredContent.provenance"
         ]
       }
     },
@@ -58,6 +58,7 @@
       "expect": {
         "is_error": false,
         "path_equals": {
+          "content": [],
           "structuredContent.resolved_account.confidence": "resolved",
           "structuredContent.provenance.coverage_goal": "best_effort_visible",
           "structuredContent.provenance.enrichment.coverage_bounds.max_dialogs": 10,
@@ -69,14 +70,13 @@
           "structuredContent.coverage",
           "structuredContent.groups",
           "structuredContent.provenance",
-          "structuredContent.text_preview"
+          "structuredContent.preview"
         ],
         "path_nonempty": [
           "structuredContent",
           "structuredContent.resolved_account",
           "structuredContent.coverage",
-          "structuredContent.provenance",
-          "content.0.text"
+          "structuredContent.provenance"
         ]
       }
     },
@@ -92,6 +92,7 @@
       "expect": {
         "is_error": false,
         "path_equals": {
+          "content": [],
           "structuredContent.resolved_account.confidence": "unresolved",
           "structuredContent.gaps.0.kind": "account_unresolved"
         },
@@ -104,8 +105,7 @@
         "path_nonempty": [
           "structuredContent",
           "structuredContent.gaps",
-          "structuredContent.warnings",
-          "content.0.text"
+          "structuredContent.warnings"
         ]
       }
     }

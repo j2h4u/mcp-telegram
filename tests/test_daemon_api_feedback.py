@@ -13,13 +13,12 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
 from mcp_telegram.daemon_api import DaemonAPIServer
 from mcp_telegram.feedback_db import VALID_SEVERITIES, ensure_feedback_schema
-
 
 # ---------------------------------------------------------------------------
 # Local test helper — 4-arg constructor intentionally triggers TypeError

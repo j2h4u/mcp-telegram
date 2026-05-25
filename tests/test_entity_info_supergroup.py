@@ -73,7 +73,7 @@ def _supergroup(id_=-1001, **kwargs):
     c.broadcast = False
     c.forum = kwargs.get("forum", False)
     c.creator = kwargs.get("creator", False)
-    c.admin_rights = kwargs.get("admin_rights", None)
+    c.admin_rights = kwargs.get("admin_rights")
     c.left = kwargs.get("left", False)
     c.restriction_reason = []
     c.noforwards = False
@@ -86,9 +86,9 @@ def _full_supergroup(**kwargs):
     full = MagicMock()
     full.full_chat = MagicMock(
         participants_count=kwargs.get("participants_count", 100),
-        linked_chat_id=kwargs.get("linked_chat_id", None),
-        slowmode_seconds=kwargs.get("slowmode_seconds", None),
-        about=kwargs.get("about", None),
+        linked_chat_id=kwargs.get("linked_chat_id"),
+        slowmode_seconds=kwargs.get("slowmode_seconds"),
+        about=kwargs.get("about"),
         available_reactions=ChatReactionsNone(),
         chat_photo=None,
     )
@@ -152,8 +152,8 @@ async def test_get_entity_info_supergroup_field_surface() -> None:
     # in peer-id form). The assertion is updated to derive the expected
     # value from the same helper the production code uses, so the test
     # is robust to any future Telethon peer-id encoding tweaks.
-    from telethon.tl.types import PeerChannel
     from telethon import utils as telethon_utils
+    from telethon.tl.types import PeerChannel
     assert d["linked_broadcast_id"] == int(telethon_utils.get_peer_id(PeerChannel(200500)))
     assert d["has_topics"] is False
 
@@ -203,7 +203,8 @@ async def test_get_entity_info_supergroup_small_enumerates_dm_intersection() -> 
 
     async def iter_three(*args, **kwargs):
         for pid in (10, 20, 30):
-            p = MagicMock(); p.id = pid
+            p = MagicMock()
+            p.id = pid
             yield p
 
     client = AsyncMock()
@@ -246,8 +247,10 @@ async def test_get_entity_info_supergroup_large_uses_contact_filter() -> None:
     ))
     # Raw GetParticipantsRequest returns 2 contacts (50 and 60) — only 50/60 are in DM peers
     gp_users = [MagicMock(), MagicMock()]
-    gp_users[0].id = 50; gp_users[1].id = 60
-    gp_result = MagicMock(); gp_result.users = gp_users
+    gp_users[0].id = 50
+    gp_users[1].id = 60
+    gp_result = MagicMock()
+    gp_result.users = gp_users
     client.side_effect = [
         _full_supergroup(participants_count=5000),
         gp_result,           # GetParticipantsRequest call
@@ -332,7 +335,7 @@ async def test_get_entity_info_no_download_keys_supergroup() -> None:
 
     def _walk(o):
         if isinstance(o, dict):
-            for k in o.keys():
+            for k in o:
                 yield k
                 yield from _walk(o[k])
         elif isinstance(o, list):

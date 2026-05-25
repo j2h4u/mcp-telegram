@@ -10,6 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+
 from mcp_telegram.feedback_db import (
     _FEEDBACK_SCHEMA_VERSION,
     VALID_SEVERITIES,
@@ -66,7 +67,7 @@ def test_get_feedback_db_path_under_xdg_state(
 
 def test_valid_severities_constant() -> None:
     """VALID_SEVERITIES is a frozenset equal to {bug, suggestion, question}."""
-    assert VALID_SEVERITIES == frozenset({"bug", "suggestion", "question"})
+    assert frozenset({"bug", "suggestion", "question"}) == VALID_SEVERITIES
     assert isinstance(VALID_SEVERITIES, frozenset)
 
 

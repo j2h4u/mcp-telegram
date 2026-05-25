@@ -19,15 +19,24 @@ def test_check_daemon_response_ok_returns_none():
 
 
 def test_check_daemon_response_error_returns_tool_result():
-    result = _check_daemon_response({"ok": False, "message": "something broke"})
+    result = _check_daemon_response({"ok": False, "error": "bad_request", "message": "something broke"})
     assert isinstance(result, ToolResult)
+    assert "bad_request" in result.content[0].text
     assert "something broke" in result.content[0].text
+    assert "Action:" in result.content[0].text
 
 
 def test_check_daemon_response_missing_message_uses_default():
     result = _check_daemon_response({"ok": False})
     assert isinstance(result, ToolResult)
     assert "Request failed" in result.content[0].text
+    assert "Action:" in result.content[0].text
+
+
+def test_check_daemon_response_preserves_existing_action_hint():
+    result = _check_daemon_response({"ok": False, "message": "boom\nAction: Retry later."})
+    assert isinstance(result, ToolResult)
+    assert result.content[0].text.count("Action:") == 1
 
 
 def test_check_daemon_response_passes_extra_kwargs():

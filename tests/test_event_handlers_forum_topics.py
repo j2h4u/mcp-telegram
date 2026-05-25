@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -133,7 +133,7 @@ def _make_service_msg(msg_id: int, action: object, reply_to_obj: object = None) 
     msg = MagicMock()
     msg.id = msg_id
     msg.action = action
-    msg.date = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    msg.date = datetime(2024, 1, 1, tzinfo=UTC)
     msg.reactions = None
     msg.message = ""
     # Service messages have no sender

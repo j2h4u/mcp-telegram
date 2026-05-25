@@ -72,8 +72,8 @@ def _legacy_chat(id_=-12345, **kwargs):
     c.left = False
     c.admin_rights = None
     c.restriction_reason = []
-    c.migrated_to = kwargs.get("migrated_to", None)
-    c.participants_count = kwargs.get("participants_count", None)
+    c.migrated_to = kwargs.get("migrated_to")
+    c.participants_count = kwargs.get("participants_count")
     return c
 
 
@@ -215,6 +215,7 @@ async def test_get_entity_info_group_migrated_to_verbatim() -> None:
     assert r["data"]["migrated_to"] == -1002005000000
     # SPEC Req 12 + RESEARCH: no auto-follow code path. Verify by source-grep:
     import inspect
+
     from mcp_telegram import daemon_api as da
     src = inspect.getsource(da._fetch_group_detail if hasattr(da, "_fetch_group_detail") else da.DaemonAPIServer._fetch_group_detail)
     # No "follow" or "redirect" or recursive call to _get_entity_info inside the helper
@@ -241,7 +242,7 @@ async def test_get_entity_info_no_download_keys_group() -> None:
 
     def _walk(o):
         if isinstance(o, dict):
-            for k in o.keys():
+            for k in o:
                 yield k
                 yield from _walk(o[k])
         elif isinstance(o, list):

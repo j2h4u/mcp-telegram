@@ -10,9 +10,12 @@ services:
       - TELEGRAM_API_HASH=${TELEGRAM_API_HASH}
       - MCP_TELEGRAM_HTTP_HOST=0.0.0.0
       - MCP_TELEGRAM_HTTP_PORT=3100
+      # The container binds all interfaces internally, while Docker publishes
+      # the port only on host loopback below.
+      - MCP_TELEGRAM_HTTP_ALLOW_UNSAFE=1
       - PYTHONUNBUFFERED=1
     ports:
-      - "3100:3100"
+      - "127.0.0.1:3100:3100"
     volumes:
       - state:/root/.local/state/mcp-telegram
       - ./telegram_session.session:/root/.local/state/mcp-telegram/mcp_telegram_session.session
