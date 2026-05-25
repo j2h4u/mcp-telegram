@@ -1523,8 +1523,15 @@ async def test_get_inbox_via_daemon():
                         "display_name": "Alice",
                         "tier": 30,
                         "category": "user",
+                        "dialog_type": "User",
                         "unread_count": 2,
                         "unread_mentions_count": 0,
+                        "read_state": {
+                            "inbox_cursor_state": "populated",
+                            "outbox_cursor_state": "populated",
+                            "inbox_unread_count": 0,
+                            "outbox_unread_count": 0,
+                        },
                         "messages": [
                             {
                                 "message_id": 1,
@@ -1550,10 +1557,29 @@ async def test_get_inbox_via_daemon():
     assert "[Telegram content]" not in header_line
     assert "[Telegram content]\nHello there\n[/Telegram content]" in text
     assert result.structured_content is not None
+    schema = TOOL_REGISTRY["get_inbox"].output_schema
+    assert schema is not None
+    assert "bootstrap_pending" in schema["properties"]
+    assert "read_state" in schema["properties"]["dialogs"]["items"]["properties"]
+    assert result.structured_content["scope"] == "personal"
+    assert result.structured_content["limit"] == 100
+    assert result.structured_content["group_size_threshold"] == 100
+    assert result.structured_content["bootstrap_pending"] == 0
+    assert result.structured_content["coverage"]["complete"] is True
+    assert result.structured_content["budget"]["result_message_count"] == 1
     assert result.structured_content["count"] == 1
-    assert result.structured_content["dialogs"][0]["dialog_id"] == 123
-    assert result.structured_content["dialogs"][0]["messages"][0]["msg_id"] == 1
-    assert result.structured_content["dialogs"][0]["messages"][0]["text"] == "Hello there"
+    dialog = result.structured_content["dialogs"][0]
+    assert dialog["dialog_id"] == 123
+    assert dialog["category"] == "user"
+    assert dialog["dialog_type"] == "User"
+    assert dialog["unread_mentions_count"] == 0
+    assert dialog["total_in_chat"] == 2
+    assert dialog["read_state"]["header_lines"] == ["[read-state: all caught up]"]
+    assert dialog["budget"]["hidden_count"] == 1
+    assert dialog["messages"][0]["msg_id"] == 1
+    assert dialog["messages"][0]["text"] == "Hello there"
+    assert dialog["messages"][0]["content"]["is_telegram_content"] is True
+    assert dialog["messages"][0]["content"]["content_kind"] == "message_text"
     conn.get_inbox.assert_called_once()
 
 
@@ -1639,6 +1665,7 @@ async def test_get_inbox_empty_with_bootstrap_pending():
         result = await get_inbox(GetInbox())
 
     text = result.content[0].text
+    assert result.is_error is False
     # Must mention the pending count
     assert "329" in text, f"bootstrap_pending count missing from response: {text!r}"
     # Must mention the bootstrap state in some recognisable form
@@ -1646,6 +1673,14 @@ async def test_get_inbox_empty_with_bootstrap_pending():
     assert "bootstrap" in lowered or "pending" in lowered or "seeded" in lowered or "bootstrapping" in lowered, (
         f"bootstrap state not surfaced in response: {text!r}"
     )
+    assert result.structured_content is not None
+    assert result.structured_content["bootstrap_pending"] == 329
+    assert result.structured_content["coverage"] == {
+        "complete": False,
+        "state": "partial",
+        "bootstrap_pending_count": 329,
+    }
+    assert result.structured_content["warnings"][0]["kind"] == "bootstrap_pending"
 
 
 async def test_get_inbox_empty_with_no_bootstrap_pending():
@@ -1711,6 +1746,10 @@ async def test_get_inbox_non_empty_with_bootstrap_pending():
     assert "bootstrap" in lowered or "pending" in lowered or "incomplete" in lowered, (
         f"bootstrap_pending note missing from non-empty response: {text!r}"
     )
+    assert result.structured_content is not None
+    assert result.structured_content["bootstrap_pending"] == 5
+    assert result.structured_content["coverage"]["complete"] is False
+    assert result.structured_content["warnings"][0]["kind"] == "bootstrap_pending"
 
 
 async def test_get_inbox_non_empty_with_no_bootstrap_pending():
