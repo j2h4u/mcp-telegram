@@ -103,6 +103,34 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
 }
 
 
+LIST_TOPICS_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "dialog": {"type": "string"},
+        "dialog_id": {"type": ["integer", "null"]},
+        "topics": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "topic_id": {"type": "integer"},
+                    "title": {"type": "string"},
+                    "pinned": {"type": ["boolean", "null"]},
+                    "hidden": {"type": ["boolean", "null"]},
+                    "snapshot_at": {"type": ["integer", "null"]},
+                },
+                "required": ["topic_id", "title"],
+                "additionalProperties": False,
+            },
+        },
+        "count": {"type": "integer"},
+        "empty_reason": {"type": ["string", "null"]},
+    },
+    "required": ["dialog", "dialog_id", "topics", "count", "empty_reason"],
+    "additionalProperties": False,
+}
+
+
 class ListDialogs(ToolArgs):
     """List available dialogs, chats and channels with type and last message timestamp.
 
@@ -316,7 +344,13 @@ class ListTopics(ToolArgs):
     dialog: str = Field(max_length=500)
 
 
-@mcp_tool(name="list_topics", title="List Topics", posture="secondary/helper", annotations=ToolAnnotations(readOnlyHint=True))
+@mcp_tool(
+    name="list_topics",
+    title="List Topics",
+    posture="secondary/helper",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    output_schema=LIST_TOPICS_OUTPUT_SCHEMA,
+)
 async def list_topics(args: ListTopics) -> ToolResult:
     # Try to resolve dialog_id from parsing as numeric/username first
     dialog_id: int | None = parse_exact_dialog_id(args.dialog)
@@ -342,11 +376,32 @@ async def list_topics(args: ListTopics) -> ToolResult:
 
     data = response.get("data", {})
     topics = data.get("topics", [])
+    structured_topics: list[dict[str, object]] = []
+    for topic in topics:
+        structured_topic: dict[str, object] = {
+            "topic_id": topic.get("topic_id", topic.get("id")),
+            "title": topic.get("title", ""),
+        }
+        if "pinned" in topic:
+            structured_topic["pinned"] = topic.get("pinned")
+        if "hidden" in topic:
+            structured_topic["hidden"] = topic.get("hidden")
+        if "snapshot_at" in topic:
+            structured_topic["snapshot_at"] = topic.get("snapshot_at")
+        structured_topics.append(structured_topic)
+    structured_content = {
+        "dialog": args.dialog,
+        "dialog_id": data.get("dialog_id"),
+        "topics": structured_topics,
+        "count": len(structured_topics),
+        "empty_reason": None if structured_topics else "no_active_topics",
+    }
 
     if not topics:
         dialog_display = args.dialog
         return ToolResult(
             content=_text_response(no_active_topics_text(dialog_display)),
+            structured_content=structured_content,
             has_filter=True,
         )
 
@@ -357,4 +412,9 @@ async def list_topics(args: ListTopics) -> ToolResult:
         lines.append(f'topic_id={topic_id} title="{title}"')
 
     result_text = "\n".join(lines)
-    return ToolResult(content=_text_response(result_text), result_count=len(lines), has_filter=True)
+    return ToolResult(
+        content=_text_response(result_text),
+        structured_content=structured_content,
+        result_count=len(lines),
+        has_filter=True,
+    )

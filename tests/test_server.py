@@ -248,6 +248,7 @@ def test_list_tools_structured_output_schema_surface_is_explicit() -> None:
 
     assert schema_tools == {
         "list_dialogs",
+        "list_topics",
         "search_messages",
         "get_sync_status",
         "get_sync_alerts",

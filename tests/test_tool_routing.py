@@ -123,6 +123,19 @@ STRUCTURED_TOOL_CASES = {
             },
         },
     ),
+    "list_topics": (
+        list_topics,
+        ListTopics(dialog="123"),
+        {
+            "ok": True,
+            "data": {
+                "topics": [
+                    {"id": 1, "title": "General"},
+                ],
+                "dialog_id": 123,
+            },
+        },
+    ),
     "search_messages": (
         search_messages,
         SearchMessages(dialog="123", query="hello"),
@@ -561,6 +574,15 @@ async def test_list_topics_via_daemon():
     text = result.content[0].text
     assert "General" in text
     assert "Off-topic" in text
+    assert result.structured_content is not None
+    assert result.structured_content["dialog"] == "MyGroup"
+    assert result.structured_content["dialog_id"] == 123
+    assert result.structured_content["count"] == 2
+    assert result.structured_content["empty_reason"] is None
+    assert result.structured_content["topics"][0] == {
+        "topic_id": 1,
+        "title": "General",
+    }
     conn.list_topics.assert_called_once()
 
 
@@ -572,6 +594,54 @@ async def test_list_topics_passes_dialog_name():
 
     call_kwargs = conn.list_topics.call_args[1]
     assert call_kwargs.get("dialog") == "Some Group"
+
+
+async def test_list_topics_empty_is_structured_non_error():
+    """ListTopics empty state is a structured successful response."""
+    conn = _make_daemon_conn({"ok": True, "data": {"topics": [], "dialog_id": 123}})
+    with _patch_daemon(conn):
+        result = await list_topics(ListTopics(dialog="Some Group"))
+
+    assert result.is_error is False
+    assert "No active forum topics" in result.content[0].text
+    assert result.structured_content == {
+        "dialog": "Some Group",
+        "dialog_id": 123,
+        "topics": [],
+        "count": 0,
+        "empty_reason": "no_active_topics",
+    }
+
+
+async def test_list_topics_structures_optional_topic_metadata():
+    conn = _make_daemon_conn(
+        {
+            "ok": True,
+            "data": {
+                "topics": [
+                    {
+                        "id": 10,
+                        "title": "Pinned",
+                        "pinned": True,
+                        "hidden": False,
+                        "snapshot_at": 1700000000,
+                    },
+                ],
+                "dialog_id": -100,
+            },
+        }
+    )
+    with _patch_daemon(conn):
+        result = await list_topics(ListTopics(dialog="-100"))
+
+    assert result.structured_content is not None
+    assert result.structured_content["topics"][0] == {
+        "topic_id": 10,
+        "title": "Pinned",
+        "pinned": True,
+        "hidden": False,
+        "snapshot_at": 1700000000,
+    }
 
 
 async def test_list_topics_dialog_not_found():
