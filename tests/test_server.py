@@ -332,6 +332,28 @@ async def test_server_instructions_mention_account_trace(monkeypatch) -> None:
     assert "best_effort_visible" in instructions
 
 
+@pytest.mark.asyncio
+async def test_server_instructions_describe_structured_first_response_contract(monkeypatch) -> None:
+    class _Conn:
+        async def get_me(self) -> dict:
+            return {"ok": False}
+
+    @asynccontextmanager
+    async def _conn_cm():
+        yield _Conn()
+
+    monkeypatch.setattr("mcp_telegram.daemon_client.daemon_connection", _conn_cm)
+
+    instructions = await server._build_server_instructions()
+    normalized = instructions.lower()
+
+    assert "structuredContent" in instructions
+    assert "text" in normalized
+    assert "preview" in normalized or "fallback" in normalized
+    assert "do not reparse human-readable text" in normalized
+    assert "untrusted content" in normalized
+
+
 def test_posture_covers_all_registered_tools() -> None:
     """Every registered tool must have a posture classification."""
     from mcp_telegram.tools import TOOL_REGISTRY
