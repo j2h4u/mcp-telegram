@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from contextlib import asynccontextmanager
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
@@ -10,6 +11,9 @@ from mcp.types import TextContent, Tool
 from mcp_telegram import server
 from mcp_telegram.tools._base import ToolResult, ToolRegistryEntry, tool_description
 from mcp_telegram.tools.discovery import ListDialogs
+
+
+INVENTORY_PATH = Path(__file__).parent / "fixtures" / "52-TOOL-OUTPUT-INVENTORY.md"
 
 
 def _tool(name: str) -> Tool:
@@ -189,6 +193,22 @@ def test_list_tools_exposes_snake_case_names_titles_and_annotations() -> None:
     assert server.tool_by_name["trace_account_messages"].annotations.readOnlyHint is False
     assert server.tool_by_name["trace_account_messages"].annotations.idempotentHint is True
     assert all(not any(part[:1].isupper() for part in name.split("_")) for name in server.tool_by_name)
+
+
+def test_phase_52_tool_output_inventory_covers_registered_tools() -> None:
+    inventory_text = INVENTORY_PATH.read_text(encoding="utf-8")
+    inventory_tools = {
+        columns[0].strip().strip("`")
+        for line in inventory_text.splitlines()
+        if line.startswith("| `")
+        for columns in [line.strip("|").split("|")]
+    }
+
+    missing_tools = sorted(set(server.tool_by_name) - inventory_tools)
+
+    assert not missing_tools, (
+        f"{INVENTORY_PATH.name} is missing registered tool(s): {', '.join(missing_tools)}"
+    )
 
 
 def test_tool_descriptor_preserves_registry_output_schema() -> None:
