@@ -84,12 +84,29 @@ GET_SYNC_ALERTS_OUTPUT_SCHEMA = {
             "items": {
                 "type": "object",
                 "properties": {
+                    "kind": {"type": "string"},
                     "dialog_id": {"type": ["integer", "null"]},
+                    "message_id": {"type": ["integer", "null"]},
+                    "deleted_at": {"type": ["integer", "null"]},
+                    "version": {"type": ["integer", "null"]},
+                    "edit_date": {"type": ["integer", "null"]},
+                    "access_lost_at": {"type": ["integer", "null"]},
                     "severity": {"type": "string"},
                     "message": {"type": "string"},
                     "action": {"type": ["string", "null"]},
                 },
-                "required": ["dialog_id", "severity", "message", "action"],
+                "required": [
+                    "kind",
+                    "dialog_id",
+                    "message_id",
+                    "deleted_at",
+                    "version",
+                    "edit_date",
+                    "access_lost_at",
+                    "severity",
+                    "message",
+                    "action",
+                ],
                 "additionalProperties": False,
             },
         },
@@ -357,7 +374,13 @@ async def get_sync_alerts(args: GetSyncAlerts) -> ToolResult:
             )
             alerts.append(
                 {
+                    "kind": "deleted_message",
                     "dialog_id": d.get("dialog_id"),
+                    "message_id": d.get("message_id"),
+                    "deleted_at": d.get("deleted_at"),
+                    "version": None,
+                    "edit_date": None,
+                    "access_lost_at": None,
                     "severity": "medium",
                     "message": message,
                     "action": action,
@@ -383,7 +406,13 @@ async def get_sync_alerts(args: GetSyncAlerts) -> ToolResult:
             )
             alerts.append(
                 {
+                    "kind": "edit",
                     "dialog_id": e.get("dialog_id"),
+                    "message_id": e.get("message_id"),
+                    "deleted_at": None,
+                    "version": e.get("version"),
+                    "edit_date": e.get("edit_date"),
+                    "access_lost_at": None,
                     "severity": "low",
                     "message": message,
                     "action": action,
@@ -404,7 +433,13 @@ async def get_sync_alerts(args: GetSyncAlerts) -> ToolResult:
             )
             alerts.append(
                 {
+                    "kind": "access_lost",
                     "dialog_id": a.get("dialog_id"),
+                    "message_id": None,
+                    "deleted_at": None,
+                    "version": None,
+                    "edit_date": None,
+                    "access_lost_at": a.get("access_lost_at"),
                     "severity": "high",
                     "message": f"Access lost at {a.get('access_lost_at')}",
                     "action": action,

@@ -210,6 +210,15 @@ def test_phase_52_tool_output_inventory_covers_registered_tools() -> None:
     )
 
 
+def test_phase_52_tool_output_inventory_marks_baseline_columns() -> None:
+    inventory_text = INVENTORY_PATH.read_text(encoding="utf-8")
+
+    assert "Current Phase 52 completion status:" in inventory_text
+    assert "pre-implementation baseline" in inventory_text
+    assert "Baseline outputSchema" in inventory_text
+    assert "Baseline successful structuredContent" in inventory_text
+
+
 def test_tool_descriptor_preserves_registry_output_schema() -> None:
     output_schema = {
         "type": "object",
@@ -247,6 +256,32 @@ def test_all_registered_tools_declare_output_schema() -> None:
     schema_tools = {name for name, tool in server.tool_by_name.items() if tool.outputSchema is not None}
 
     assert schema_tools == set(server.tool_by_name)
+
+
+def test_phase_52_agent_metadata_fields_are_in_output_schemas() -> None:
+    list_dialogs_schema = server.tool_by_name["list_dialogs"].outputSchema
+    assert list_dialogs_schema is not None
+    dialog_item = list_dialogs_schema["properties"]["dialogs"]["items"]
+    assert "draft_content" in dialog_item["required"]
+    assert "draft_content" in dialog_item["properties"]
+
+    list_topics_schema = server.tool_by_name["list_topics"].outputSchema
+    assert list_topics_schema is not None
+    topic_item = list_topics_schema["properties"]["topics"]["items"]
+    assert "title_content" in topic_item["required"]
+    assert "title_content" in topic_item["properties"]
+
+    sync_alerts_schema = server.tool_by_name["get_sync_alerts"].outputSchema
+    assert sync_alerts_schema is not None
+    alert_item = sync_alerts_schema["properties"]["alerts"]["items"]
+    assert {
+        "kind",
+        "message_id",
+        "deleted_at",
+        "version",
+        "edit_date",
+        "access_lost_at",
+    }.issubset(alert_item["required"])
 
 
 def test_list_tools_exposes_account_trace_schema_and_title() -> None:

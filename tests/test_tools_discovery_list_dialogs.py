@@ -110,7 +110,13 @@ async def test_list_dialogs_renders_draft_token() -> None:
     text = result.content[0].text
     assert 'draft="Hi all"' in text
     assert result.structured_content is not None
-    assert result.structured_content["dialogs"][0]["draft_text"] == "Hi all"
+    dialog = result.structured_content["dialogs"][0]
+    assert dialog["draft_text"] == "Hi all"
+    assert dialog["draft_content"] == {
+        "text": "Hi all",
+        "is_telegram_content": True,
+        "content_kind": "message_text",
+    }
 
 
 @pytest.mark.asyncio
@@ -136,6 +142,8 @@ async def test_list_dialogs_omits_zero_diff_tokens() -> None:
     assert "mentions=" not in text
     assert "reactions=" not in text
     assert "draft=" not in text
+    assert result.structured_content is not None
+    assert result.structured_content["dialogs"][0]["draft_content"] is None
 
 
 @pytest.mark.asyncio

@@ -10,7 +10,13 @@ uv run python -c "from mcp_telegram import server; print(len(server.tool_by_name
 
 Runtime registry count: 14 tools.
 
-| Tool | Title | Posture | ReadOnly | Has outputSchema | Has successful structuredContent | Current text-only facts | Target structured fields | Exception |
+Current Phase 52 completion status:
+- All 14 registered tools declare `outputSchema` in the live MCP tool descriptors.
+- Every successful tool path returns `structuredContent`; recoverable error paths may stay text-only.
+- The table below is the Plan 52-01 pre-implementation baseline and lossless migration map. Its
+  `Baseline` columns intentionally preserve the state observed before later Phase 52 plans ran.
+
+| Tool | Title | Posture | ReadOnly | Baseline outputSchema | Baseline successful structuredContent | Baseline text-only facts | Target structured fields | Exception |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `get_dialog_stats` | Dialog Stats | secondary/helper | true | false | no | section counts for top reactions, mentions, hashtags, forwards; per-entry labels/counts; empty-section `(none)` state; not-synced and dialog-not-found actionable errors | `dialog`, `top_reactions[] {emoji,count}`, `top_mentions[] {value,count}`, `top_hashtags[] {value,count}`, `top_forwards[] {peer_id,name,count}`, `section_counts`, `limits.top_n`, `is_synced_required`, `result_count_semantics` | none |
 | `get_entity_info` | Entity Info | primary | true | false | no | resolved display name; id/type/name/username; about/bot description/business/note/restriction text framed as untrusted_content; avatar history with relative age; user/bot flags, status, relationship, phone country, language, birthday, folder, business info, common chats; channel/supergroup/group counts, linked ids, slow mode, reactions, topics, invite/migration, contacts_subscribed partiality | `resolved_entity`, `profile.type`, `profile.common`, `profile.user`, `profile.bot`, `profile.channel`, `profile.supergroup`, `profile.group`, `avatar_history[]`, `membership`, `contacts_subscribed`, `framed_fields[] {field,text,untrusted_content:true}`, `restrictions[]`, `available_reactions`, `topics.has_topics`, `lookup.candidates` | none |
@@ -54,6 +60,7 @@ Runtime registry count: 14 tools.
 
 ## Structured Parity Notes
 
-- Existing `outputSchema` tools are not accepted as complete; rows above mark their current structured status and still list missing target fields where text has more facts.
+- Baseline rows are retained as historical evidence; current completion is enforced by registry and smoke tests, not by the baseline status columns.
+- Existing baseline `outputSchema` tools were not accepted as complete; rows above preserve the gaps that later migration plans had to close.
 - Error results may remain text-only per D-05. This inventory is scoped to successful tool calls.
 - Exceptions are `none` for all tools in Plan 52-01; later migration plans must either fill the target fields or update this inventory with a concrete exception and justification.

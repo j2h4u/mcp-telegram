@@ -728,6 +728,11 @@ async def test_list_topics_via_daemon():
     assert result.structured_content["topics"][0] == {
         "topic_id": 1,
         "title": "General",
+        "title_content": {
+            "text": "General",
+            "is_telegram_content": True,
+            "content_kind": "message_text",
+        },
     }
     conn.list_topics.assert_called_once()
 
@@ -784,6 +789,11 @@ async def test_list_topics_structures_optional_topic_metadata():
     assert result.structured_content["topics"][0] == {
         "topic_id": 10,
         "title": "Pinned",
+        "title_content": {
+            "text": "Pinned",
+            "is_telegram_content": True,
+            "content_kind": "message_text",
+        },
         "pinned": True,
         "hidden": False,
         "snapshot_at": 1700000000,
@@ -1475,7 +1485,43 @@ async def test_get_sync_alerts_via_daemon():
     assert result.structured_content is not None
     assert result.structured_content["count"] == 3
     assert result.structured_content["alerts"][0]["dialog_id"] == 1
+    assert result.structured_content["alerts"][0] == {
+        "kind": "deleted_message",
+        "dialog_id": 1,
+        "message_id": 100,
+        "deleted_at": 1700000500,
+        "version": None,
+        "edit_date": None,
+        "access_lost_at": None,
+        "severity": "medium",
+        "message": "Deleted message msg=100 deleted_at=1700000500",
+        "action": "Inspect the dialog history around this message id if surrounding context is needed.",
+    }
+    assert result.structured_content["alerts"][1] == {
+        "kind": "edit",
+        "dialog_id": 1,
+        "message_id": 200,
+        "deleted_at": None,
+        "version": 1,
+        "edit_date": 1700000600,
+        "access_lost_at": None,
+        "severity": "low",
+        "message": "Edited message msg=200 v1 edit_date=1700000600",
+        "action": "Treat cached text as versioned; inspect edit history before relying on older wording.",
+    }
     assert result.structured_content["alerts"][2]["severity"] == "high"
+    assert result.structured_content["alerts"][2] == {
+        "kind": "access_lost",
+        "dialog_id": 2,
+        "message_id": None,
+        "deleted_at": None,
+        "version": None,
+        "edit_date": None,
+        "access_lost_at": 1700000700,
+        "severity": "high",
+        "message": "Access lost at 1700000700",
+        "action": "Use get_sync_status for coverage details.",
+    }
     assert result.structured_content["deleted_messages"] == [
         {
             "dialog_id": 1,

@@ -22,7 +22,25 @@ from ._base import (
     error_result,
     mcp_tool,
 )
-from .structured import structured_warning
+from .structured import structured_warning, telegram_content
+
+TELEGRAM_CONTENT_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "text": {"type": "string"},
+        "is_telegram_content": {"type": "boolean"},
+        "content_kind": {"type": "string"},
+    },
+    "required": ["text", "is_telegram_content", "content_kind"],
+    "additionalProperties": False,
+}
+
+NULLABLE_TELEGRAM_CONTENT_OUTPUT_SCHEMA = {
+    "type": ["object", "null"],
+    "properties": TELEGRAM_CONTENT_OUTPUT_SCHEMA["properties"],
+    "required": TELEGRAM_CONTENT_OUTPUT_SCHEMA["required"],
+    "additionalProperties": False,
+}
 
 LIST_DIALOGS_OUTPUT_SCHEMA = {
     "type": "object",
@@ -48,6 +66,7 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
                     "unread_mentions_count": {"type": "integer"},
                     "unread_reactions_count": {"type": "integer"},
                     "draft_text": {"type": ["string", "null"]},
+                    "draft_content": NULLABLE_TELEGRAM_CONTENT_OUTPUT_SCHEMA,
                 },
                 "required": [
                     "id",
@@ -66,6 +85,7 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
                     "unread_mentions_count",
                     "unread_reactions_count",
                     "draft_text",
+                    "draft_content",
                 ],
                 "additionalProperties": False,
             },
@@ -115,11 +135,12 @@ LIST_TOPICS_OUTPUT_SCHEMA = {
                 "properties": {
                     "topic_id": {"type": "integer"},
                     "title": {"type": "string"},
+                    "title_content": TELEGRAM_CONTENT_OUTPUT_SCHEMA,
                     "pinned": {"type": ["boolean", "null"]},
                     "hidden": {"type": ["boolean", "null"]},
                     "snapshot_at": {"type": ["integer", "null"]},
                 },
-                "required": ["topic_id", "title"],
+                "required": ["topic_id", "title", "title_content"],
                 "additionalProperties": False,
             },
         },
@@ -198,6 +219,7 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
     structured_dialogs: list[dict[str, object]] = []
     for d in dialogs:
         sync_status = d.get("sync_status")
+        draft_text = d.get("draft_text")
         structured_dialogs.append(
             {
                 "id": d.get("id"),
@@ -215,7 +237,10 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
                 "unread_out": d.get("unread_out"),
                 "unread_mentions_count": int(d.get("unread_mentions_count", 0) or 0),
                 "unread_reactions_count": int(d.get("unread_reactions_count", 0) or 0),
-                "draft_text": d.get("draft_text"),
+                "draft_text": draft_text,
+                "draft_content": telegram_content(str(draft_text), "message_text")
+                if draft_text is not None
+                else None,
             }
         )
     structured_content = {
@@ -378,9 +403,11 @@ async def list_topics(args: ListTopics) -> ToolResult:
     topics = data.get("topics", [])
     structured_topics: list[dict[str, object]] = []
     for topic in topics:
+        title = topic.get("title") or ""
         structured_topic: dict[str, object] = {
             "topic_id": topic.get("topic_id", topic.get("id")),
-            "title": topic.get("title", ""),
+            "title": title,
+            "title_content": telegram_content(str(title), "message_text"),
         }
         if "pinned" in topic:
             structured_topic["pinned"] = topic.get("pinned")
