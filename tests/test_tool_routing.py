@@ -13,28 +13,27 @@ from __future__ import annotations
 
 import pathlib
 from contextlib import asynccontextmanager
-from datetime import UTC
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from mcp.types import CallToolResult, TextContent
 
-from mcp_telegram.tools import TOOL_REGISTRY
 from mcp_telegram.tools import (
+    TOOL_REGISTRY,
+    GetEntityInfo,
     GetInbox,
     GetSyncAlerts,
     GetSyncStatus,
-    GetEntityInfo,
     ListDialogs,
     ListMessages,
     ListTopics,
     MarkDialogForSync,
     SearchMessages,
     TraceAccountMessages,
+    get_entity_info,
     get_inbox,
     get_sync_alerts,
     get_sync_status,
-    get_entity_info,
     list_dialogs,
     list_messages,
     list_topics,

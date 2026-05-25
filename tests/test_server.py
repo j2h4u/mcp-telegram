@@ -9,9 +9,8 @@ import pytest
 from mcp.types import TextContent, Tool
 
 from mcp_telegram import server
-from mcp_telegram.tools._base import ToolResult, ToolRegistryEntry, tool_description
+from mcp_telegram.tools._base import ToolRegistryEntry, ToolResult, tool_description
 from mcp_telegram.tools.discovery import ListDialogs
-
 
 INVENTORY_PATH = Path(__file__).parent / "fixtures" / "52-TOOL-OUTPUT-INVENTORY.md"
 
