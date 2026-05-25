@@ -27,6 +27,49 @@ from ._base import (
     error_result,
     mcp_tool,
 )
+from .structured import TelegramContentKind, structured_warning, telegram_content
+
+
+GET_ENTITY_INFO_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "resolved_query": {
+            "type": "object",
+            "properties": {
+                "input": {"type": "string"},
+                "resolution": {"type": "string"},
+                "entity_id": {"type": "integer"},
+                "display_name": {"type": "string"},
+            },
+            "required": ["input", "resolution", "entity_id", "display_name"],
+            "additionalProperties": True,
+        },
+        "entity_id": {"type": "integer"},
+        "display_name": {"type": "string"},
+        "type": {"type": "string", "enum": ["user", "bot", "channel", "supergroup", "group", "unknown"]},
+        "common": {"type": "object", "additionalProperties": True},
+        "avatar_history": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
+        "type_specific": {"type": "object", "additionalProperties": True},
+        "relationships": {"type": "object", "additionalProperties": True},
+        "privacy_or_access": {"type": "object", "additionalProperties": True},
+        "warnings": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
+        "content_fields": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
+    },
+    "required": [
+        "resolved_query",
+        "entity_id",
+        "display_name",
+        "type",
+        "common",
+        "avatar_history",
+        "type_specific",
+        "relationships",
+        "privacy_or_access",
+        "warnings",
+        "content_fields",
+    ],
+    "additionalProperties": True,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +134,324 @@ def _append_framed_field(lines: list[str], label: str, text: str) -> None:
     lines.append(f"{label}:\n{frame_telegram_content(text)}")
 
 
+def _content_field(path: str, text: str | None, kind: TelegramContentKind) -> dict[str, object] | None:
+    if not text:
+        return None
+    return {
+        "field": path,
+        "content": telegram_content(text, kind),
+        "untrusted_content": True,
+        "trust": {
+            "source": "telegram",
+            "is_untrusted": True,
+        },
+    }
+
+
+def _restriction_payloads(restrictions: list[dict] | None, *, base_path: str) -> list[dict[str, object]]:
+    payloads: list[dict[str, object]] = []
+    for idx, restriction in enumerate(restrictions or []):
+        text = restriction.get("text")
+        payloads.append(
+            {
+                "platform": restriction.get("platform"),
+                "reason": restriction.get("reason"),
+                "text": text,
+                "content": (
+                    _content_field(f"{base_path}.{idx}.text", text, "restriction_reason")
+                    if text
+                    else None
+                ),
+            }
+        )
+    return payloads
+
+
+def _common_structured(data: dict, *, entity_id: int) -> dict[str, object]:
+    about = data.get("about")
+    return {
+        "id": data.get("id", entity_id),
+        "name": data.get("name"),
+        "username": data.get("username"),
+        "about": _content_field("common.about", about, "about") if about else None,
+        "my_membership": data.get("my_membership") or {},
+        "avatar_count": data.get("avatar_count") or len(data.get("avatar_history") or []),
+    }
+
+
+def _relationships_structured(data: dict) -> dict[str, object]:
+    contacts = data.get("contacts_subscribed")
+    return {
+        "membership": data.get("my_membership") or {},
+        "contact": {
+            "contact": data.get("contact"),
+            "mutual_contact": data.get("mutual_contact"),
+            "close_friend": data.get("close_friend"),
+            "blocked": data.get("blocked"),
+        },
+        "common_chats": data.get("common_chats") or [],
+        "contacts_subscribed": {
+            "items": contacts,
+            "available": contacts is not None,
+            "partial": data.get("contacts_subscribed_partial"),
+            "reason": data.get("contacts_reason"),
+        },
+    }
+
+
+def _privacy_or_access_structured(data: dict) -> dict[str, object]:
+    contacts = data.get("contacts_subscribed")
+    phone = data.get("phone")
+    return {
+        "phone": {
+            "value": phone,
+            "country": _phone_country(phone) if phone else None,
+            "visibility": "visible_to_operator" if phone else "absent_or_hidden",
+        },
+        "contacts_subscribed": {
+            "items": contacts,
+            "is_gated": contacts is None and data.get("contacts_reason") is not None,
+            "reason": data.get("contacts_reason"),
+            "partial": data.get("contacts_subscribed_partial"),
+        },
+        "restrictions": _restriction_payloads(
+            data.get("restriction_reason") or data.get("restrictions"),
+            base_path="privacy_or_access.restrictions",
+        ),
+        "access": {
+            "left": data.get("left"),
+            "membership": data.get("my_membership") or {},
+        },
+    }
+
+
+def _entity_warnings(data: dict) -> list[dict[str, object]]:
+    warnings: list[dict[str, object]] = []
+    contacts_reason = data.get("contacts_reason")
+    if contacts_reason:
+        warnings.append(
+            structured_warning(
+                "contacts_subscribed_gated",
+                f"contacts_subscribed unavailable: {contacts_reason}",
+                severity="info",
+            )
+        )
+    restrictions = data.get("restriction_reason") or data.get("restrictions") or []
+    if restrictions:
+        warnings.append(
+            structured_warning(
+                "entity_restricted",
+                "Telegram reports restriction metadata for this entity.",
+                severity="warning",
+            )
+        )
+    return warnings
+
+
+def _content_fields(data: dict) -> list[dict[str, object]]:
+    maybe_fields = [
+        _content_field("common.about", data.get("about"), "about"),
+        _content_field("type_specific.note", data.get("note"), "note"),
+        _content_field("type_specific.private_forward_name", data.get("private_forward_name"), "private_forward_name"),
+    ]
+    bot_info = data.get("bot_info") or {}
+    maybe_fields.append(
+        _content_field("type_specific.bot_info.description", bot_info.get("description"), "bot_description")
+    )
+    for idx, command in enumerate(bot_info.get("commands") or []):
+        maybe_fields.append(
+            _content_field(
+                f"type_specific.bot_info.commands.{idx}.description",
+                command.get("description"),
+                "bot_command_description",
+            )
+        )
+    business_intro = data.get("business_intro") or {}
+    maybe_fields.extend(
+        [
+            _content_field("type_specific.business.intro.title", business_intro.get("title"), "business_intro"),
+            _content_field(
+                "type_specific.business.intro.description",
+                business_intro.get("description"),
+                "business_intro",
+            ),
+        ]
+    )
+    business_location = data.get("business_location") or {}
+    maybe_fields.append(
+        _content_field("type_specific.business.location.address", business_location.get("address"), "business_location")
+    )
+    for idx, restriction in enumerate(data.get("restriction_reason") or data.get("restrictions") or []):
+        maybe_fields.append(
+            _content_field(
+                f"type_specific.restrictions.{idx}.text",
+                restriction.get("text"),
+                "restriction_reason",
+            )
+        )
+    return [field for field in maybe_fields if field is not None]
+
+
+def _bot_info_structured(bot_info: dict | None) -> dict[str, object] | None:
+    if bot_info is None:
+        return None
+    commands = []
+    for idx, command in enumerate(bot_info.get("commands") or []):
+        commands.append(
+            {
+                "command": command.get("command"),
+                "description": command.get("description"),
+                "description_content": _content_field(
+                    f"type_specific.bot_info.commands.{idx}.description",
+                    command.get("description"),
+                    "bot_command_description",
+                ),
+            }
+        )
+    return {
+        "description": bot_info.get("description"),
+        "description_content": _content_field(
+            "type_specific.bot_info.description",
+            bot_info.get("description"),
+            "bot_description",
+        ),
+        "commands": commands,
+    }
+
+
+def _business_structured(data: dict) -> dict[str, object]:
+    intro = data.get("business_intro") or {}
+    location = data.get("business_location") or {}
+    return {
+        "intro": (
+            {
+                "title": intro.get("title"),
+                "title_content": _content_field(
+                    "type_specific.business.intro.title",
+                    intro.get("title"),
+                    "business_intro",
+                ),
+                "description": intro.get("description"),
+                "description_content": _content_field(
+                    "type_specific.business.intro.description",
+                    intro.get("description"),
+                    "business_intro",
+                ),
+            }
+            if data.get("business_intro") is not None
+            else None
+        ),
+        "location": (
+            {
+                "address": location.get("address"),
+                "address_content": _content_field(
+                    "type_specific.business.location.address",
+                    location.get("address"),
+                    "business_location",
+                ),
+                "lat": location.get("lat"),
+                "long": location.get("long"),
+            }
+            if data.get("business_location") is not None
+            else None
+        ),
+        "work_hours": data.get("business_work_hours"),
+    }
+
+
+def _user_or_bot_structured(data: dict) -> dict[str, object]:
+    phone = data.get("phone")
+    return {
+        "kind": data.get("type"),
+        "identity": {
+            "first_name": data.get("first_name"),
+            "last_name": data.get("last_name"),
+            "username": data.get("username"),
+            "extra_usernames": data.get("extra_usernames") or [],
+            "display_name": data.get("name"),
+            "lang_code": data.get("lang_code"),
+            "status": data.get("status"),
+            "emoji_status_id": data.get("emoji_status_id"),
+            "birthday": data.get("birthday"),
+            "personal_channel_id": data.get("personal_channel_id"),
+        },
+        "flags": {
+            "verified": data.get("verified"),
+            "premium": data.get("premium"),
+            "bot": data.get("bot"),
+            "scam": data.get("scam"),
+            "fake": data.get("fake"),
+            "restricted": data.get("restricted"),
+        },
+        "phone": {
+            "value": phone,
+            "country": _phone_country(phone) if phone else None,
+            "visibility": "visible_to_operator" if phone else "absent_or_hidden",
+        },
+        "relationship": {
+            "contact": data.get("contact"),
+            "mutual_contact": data.get("mutual_contact"),
+            "close_friend": data.get("close_friend"),
+            "blocked": data.get("blocked"),
+        },
+        "bot_info": _bot_info_structured(data.get("bot_info")),
+        "business": _business_structured(data),
+        "common_chats": data.get("common_chats") or [],
+        "restrictions": _restriction_payloads(data.get("restriction_reason"), base_path="type_specific.restrictions"),
+        "folder": {
+            "folder_id": data.get("folder_id"),
+            "folder_name": data.get("folder_name"),
+        },
+        "message_options": {
+            "send_paid_messages_stars": data.get("send_paid_messages_stars"),
+            "ttl_period": data.get("ttl_period"),
+            "private_forward_name": data.get("private_forward_name"),
+            "private_forward_name_content": _content_field(
+                "type_specific.message_options.private_forward_name",
+                data.get("private_forward_name"),
+                "private_forward_name",
+            ),
+        },
+        "note": data.get("note"),
+        "note_content": _content_field("type_specific.note", data.get("note"), "note"),
+    }
+
+
+def _type_specific_structured(data: dict) -> dict[str, object]:
+    entity_type = data.get("type", "unknown")
+    if entity_type in ("user", "bot"):
+        return _user_or_bot_structured(data)
+    return {"kind": entity_type}
+
+
+def _entity_structured_content(
+    *,
+    args: "GetEntityInfo",
+    data: dict,
+    entity_id: int,
+    display_name: str,
+    resolution: str,
+) -> dict[str, object]:
+    return {
+        "resolved_query": {
+            "input": args.entity,
+            "resolution": resolution,
+            "entity_id": entity_id,
+            "display_name": display_name,
+        },
+        "entity_id": entity_id,
+        "display_name": display_name,
+        "type": data.get("type", "unknown"),
+        "common": _common_structured(data, entity_id=entity_id),
+        "avatar_history": data.get("avatar_history") or [],
+        "type_specific": _type_specific_structured(data),
+        "relationships": _relationships_structured(data),
+        "privacy_or_access": _privacy_or_access_structured(data),
+        "warnings": _entity_warnings(data),
+        "content_fields": _content_fields(data),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Tool definition
 # ---------------------------------------------------------------------------
@@ -125,12 +486,18 @@ class GetEntityInfo(ToolArgs):
     entity: str = Field(max_length=500)
 
 
-@mcp_tool(name="get_entity_info", title="Entity Info", annotations=ToolAnnotations(readOnlyHint=True))
+@mcp_tool(
+    name="get_entity_info",
+    title="Entity Info",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    output_schema=GET_ENTITY_INFO_OUTPUT_SCHEMA,
+)
 async def get_entity_info(args: GetEntityInfo) -> ToolResult:
     # Numeric ID shortcut: skip resolver entirely and go straight to daemon.
     try:
         entity_id = int(args.entity)
         display_name = args.entity
+        resolution = "numeric_id"
     except ValueError:
         entity_id = None
 
@@ -170,6 +537,7 @@ async def get_entity_info(args: GetEntityInfo) -> ToolResult:
 
         entity_id = resolve_data["entity_id"]
         display_name = resolve_data["display_name"]
+        resolution = "resolver_match"
 
     try:
         async with daemon_connection() as conn:
@@ -230,7 +598,18 @@ async def get_entity_info(args: GetEntityInfo) -> ToolResult:
     elif entity_type == "group":
         _render_group(data, lines)
 
-    return ToolResult(content=_text_response("\n".join(lines)), result_count=1)
+    structured_content = _entity_structured_content(
+        args=args,
+        data=data,
+        entity_id=entity_id,
+        display_name=display_name,
+        resolution=resolution,
+    )
+    return ToolResult(
+        content=_text_response("\n".join(lines)),
+        structured_content=structured_content,
+        result_count=1,
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -10,6 +10,10 @@ TelegramContentKind = Literal[
     "about",
     "bio",
     "bot_description",
+    "bot_command_description",
+    "business_intro",
+    "business_location",
+    "private_forward_name",
     "restriction_reason",
     "note",
 ]

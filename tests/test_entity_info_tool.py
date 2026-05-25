@@ -77,6 +77,31 @@ async def test_get_entity_info_user_renders() -> None:
     assert "about:\n[Telegram content]\nQA engineer\n[/Telegram content]" in text
     assert "phone: +12025551234 (US)" in text
     assert "Common chats (0):" in text
+    payload = result.structured_content
+    assert payload is not None
+    assert payload["type"] == "user"
+    assert payload["resolved_query"] == {
+        "input": "Alice",
+        "resolution": "resolver_match",
+        "entity_id": 42,
+        "display_name": "Alice Smith",
+    }
+    assert payload["common"]["about"]["content"] == {
+        "text": "QA engineer",
+        "is_telegram_content": True,
+        "content_kind": "about",
+    }
+    assert payload["type_specific"]["kind"] == "user"
+    assert payload["type_specific"]["identity"]["first_name"] == "Alice"
+    assert payload["type_specific"]["identity"]["personal_channel_id"] is None
+    assert payload["type_specific"]["phone"] == {
+        "value": "+12025551234",
+        "country": "US",
+        "visibility": "visible_to_operator",
+    }
+    assert payload["type_specific"]["bot_info"] is None
+    assert payload["privacy_or_access"]["phone"]["visibility"] == "visible_to_operator"
+    assert payload["content_fields"][0]["untrusted_content"] is True
 
 
 @pytest.mark.asyncio
@@ -113,6 +138,21 @@ async def test_get_entity_info_bot_renders_type_bot() -> None:
     assert "flags: bot" in text
     assert "bot_description:\n[Telegram content]\nA test bot\n[/Telegram content]" in text
     assert "bot_commands: /start" in text
+    payload = result.structured_content
+    assert payload is not None
+    assert payload["type"] == "bot"
+    assert payload["type_specific"]["kind"] == "bot"
+    assert payload["type_specific"]["flags"]["bot"] is True
+    assert payload["type_specific"]["bot_info"]["description_content"]["content"] == {
+        "text": "A test bot",
+        "is_telegram_content": True,
+        "content_kind": "bot_description",
+    }
+    assert payload["type_specific"]["bot_info"]["commands"][0]["description_content"]["content"] == {
+        "text": "Start",
+        "is_telegram_content": True,
+        "content_kind": "bot_command_description",
+    }
 
 
 @pytest.mark.asyncio
