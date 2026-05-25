@@ -168,6 +168,11 @@ STRUCTURED_TOOL_CASES = {
             },
         },
     ),
+    "mark_dialog_for_sync": (
+        mark_dialog_for_sync,
+        MarkDialogForSync(dialog_id=123),
+        {"ok": True},
+    ),
     "get_sync_alerts": (
         get_sync_alerts,
         GetSyncAlerts(),
@@ -1173,6 +1178,14 @@ async def test_mark_dialog_for_sync_via_daemon():
         result = await mark_dialog_for_sync(MarkDialogForSync(dialog_id=42, enable=True))
     assert len(result.content) == 1
     assert "marked for sync" in result.content[0].text
+    assert result.structured_content == {
+        "dialog_id": 42,
+        "enabled": True,
+        "status": "accepted",
+        "action": "mark_for_sync",
+        "expected_next_state": "syncing",
+        "full_history_will_be_fetched": True,
+    }
     conn.mark_dialog_for_sync.assert_called_once_with(dialog_id=42, enable=True)
 
 
@@ -1182,6 +1195,14 @@ async def test_mark_dialog_for_sync_disable():
     with _patch_daemon(conn):
         result = await mark_dialog_for_sync(MarkDialogForSync(dialog_id=42, enable=False))
     assert "unmarked from sync" in result.content[0].text
+    assert result.structured_content == {
+        "dialog_id": 42,
+        "enabled": False,
+        "status": "accepted",
+        "action": "unmark_from_sync",
+        "expected_next_state": "not_synced",
+        "full_history_will_be_fetched": False,
+    }
     conn.mark_dialog_for_sync.assert_called_once_with(dialog_id=42, enable=False)
 
 
@@ -1223,9 +1244,16 @@ async def test_get_sync_status_via_daemon():
     assert result.structured_content == {
         "dialog_id": -1001234567890,
         "status": "synced",
+        "raw_status": "synced",
         "is_syncing": False,
         "last_synced_at": 1700000000,
+        "last_event_at": 1700001000,
         "message_count": 100,
+        "sync_progress": 100,
+        "total_messages": 100,
+        "delete_detection": "reliable (channel)",
+        "sync_coverage_pct": None,
+        "access_lost_at": None,
         "action": None,
     }
     conn.get_sync_status.assert_called_once_with(dialog_id=-1001234567890)
@@ -1273,6 +1301,33 @@ async def test_get_sync_alerts_via_daemon():
     assert result.structured_content["count"] == 3
     assert result.structured_content["alerts"][0]["dialog_id"] == 1
     assert result.structured_content["alerts"][2]["severity"] == "high"
+    assert result.structured_content["deleted_messages"] == [
+        {
+            "dialog_id": 1,
+            "message_id": 100,
+            "deleted_at": 1700000500,
+            "action": "Inspect the dialog history around this message id if surrounding context is needed.",
+        }
+    ]
+    assert result.structured_content["edits"] == [
+        {
+            "dialog_id": 1,
+            "message_id": 200,
+            "version": 1,
+            "edit_date": 1700000600,
+            "action": "Treat cached text as versioned; inspect edit history before relying on older wording.",
+        }
+    ]
+    assert result.structured_content["access_lost"] == [
+        {
+            "dialog_id": 2,
+            "access_lost_at": 1700000700,
+            "action": "Use get_sync_status for coverage details.",
+        }
+    ]
+    assert result.structured_content["since"] == 0
+    assert result.structured_content["limit"] == 50
+    assert result.structured_content["limited_by"]["deleted_messages"] == {"since": 0, "limit": 50}
     conn.get_sync_alerts.assert_called_once_with(since=0, limit=50)
 
 
@@ -1289,7 +1344,26 @@ async def test_get_sync_alerts_empty():
     assert_structured_text_parity(result, "count", "No sync alerts")
     assert "No sync alerts" in result.content[0].text
     assert result.is_error is False
-    assert result.structured_content == {"alerts": [], "count": 0}
+    assert result.structured_content == {
+        "alerts": [],
+        "deleted_messages": [],
+        "edits": [],
+        "access_lost": [],
+        "counts": {
+            "deleted_messages": 0,
+            "edits": 0,
+            "access_lost": 0,
+            "total": 0,
+        },
+        "count": 0,
+        "since": 0,
+        "limit": 50,
+        "limited_by": {
+            "deleted_messages": {"since": 0, "limit": 50},
+            "edits": {"since": 0, "limit": 50},
+            "access_lost": {"since": 0, "limit": None},
+        },
+    }
 
 
 async def test_get_sync_status_recoverable_error_has_no_structured_content():

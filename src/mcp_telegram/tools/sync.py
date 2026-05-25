@@ -18,17 +18,60 @@ from ._base import (
 logger = logging.getLogger(__name__)
 
 
+MARK_DIALOG_FOR_SYNC_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "dialog_id": {"type": "integer"},
+        "enabled": {"type": "boolean"},
+        "status": {"type": "string"},
+        "action": {"type": "string"},
+        "expected_next_state": {"type": "string"},
+        "full_history_will_be_fetched": {"type": "boolean"},
+    },
+    "required": [
+        "dialog_id",
+        "enabled",
+        "status",
+        "action",
+        "expected_next_state",
+        "full_history_will_be_fetched",
+    ],
+    "additionalProperties": False,
+}
+
+
 GET_SYNC_STATUS_OUTPUT_SCHEMA = {
     "type": "object",
     "properties": {
         "dialog_id": {"type": ["integer", "null"]},
         "status": {"type": "string"},
+        "raw_status": {"type": "string"},
         "is_syncing": {"type": "boolean"},
         "last_synced_at": {"type": ["integer", "null"]},
+        "last_event_at": {"type": ["integer", "null"]},
         "message_count": {"type": ["integer", "null"]},
+        "sync_progress": {"type": ["integer", "null"]},
+        "total_messages": {"type": ["integer", "null"]},
+        "delete_detection": {"type": ["string", "null"]},
+        "sync_coverage_pct": {"type": ["integer", "null"]},
+        "access_lost_at": {"type": ["integer", "null"]},
         "action": {"type": ["string", "null"]},
     },
-    "required": ["dialog_id", "status", "is_syncing", "last_synced_at", "message_count", "action"],
+    "required": [
+        "dialog_id",
+        "status",
+        "raw_status",
+        "is_syncing",
+        "last_synced_at",
+        "last_event_at",
+        "message_count",
+        "sync_progress",
+        "total_messages",
+        "delete_detection",
+        "sync_coverage_pct",
+        "access_lost_at",
+        "action",
+    ],
     "additionalProperties": False,
 }
 
@@ -50,9 +93,108 @@ GET_SYNC_ALERTS_OUTPUT_SCHEMA = {
                 "additionalProperties": False,
             },
         },
+        "deleted_messages": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "dialog_id": {"type": ["integer", "null"]},
+                    "message_id": {"type": ["integer", "null"]},
+                    "deleted_at": {"type": ["integer", "null"]},
+                    "action": {"type": "string"},
+                },
+                "required": ["dialog_id", "message_id", "deleted_at", "action"],
+                "additionalProperties": False,
+            },
+        },
+        "edits": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "dialog_id": {"type": ["integer", "null"]},
+                    "message_id": {"type": ["integer", "null"]},
+                    "version": {"type": ["integer", "null"]},
+                    "edit_date": {"type": ["integer", "null"]},
+                    "action": {"type": "string"},
+                },
+                "required": ["dialog_id", "message_id", "version", "edit_date", "action"],
+                "additionalProperties": False,
+            },
+        },
+        "access_lost": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "dialog_id": {"type": ["integer", "null"]},
+                    "access_lost_at": {"type": ["integer", "null"]},
+                    "action": {"type": "string"},
+                },
+                "required": ["dialog_id", "access_lost_at", "action"],
+                "additionalProperties": False,
+            },
+        },
+        "counts": {
+            "type": "object",
+            "properties": {
+                "deleted_messages": {"type": "integer"},
+                "edits": {"type": "integer"},
+                "access_lost": {"type": "integer"},
+                "total": {"type": "integer"},
+            },
+            "required": ["deleted_messages", "edits", "access_lost", "total"],
+            "additionalProperties": False,
+        },
         "count": {"type": "integer"},
+        "since": {"type": "integer"},
+        "limit": {"type": "integer"},
+        "limited_by": {
+            "type": "object",
+            "properties": {
+                "deleted_messages": {
+                    "type": "object",
+                    "properties": {
+                        "since": {"type": "integer"},
+                        "limit": {"type": "integer"},
+                    },
+                    "required": ["since", "limit"],
+                    "additionalProperties": False,
+                },
+                "edits": {
+                    "type": "object",
+                    "properties": {
+                        "since": {"type": "integer"},
+                        "limit": {"type": "integer"},
+                    },
+                    "required": ["since", "limit"],
+                    "additionalProperties": False,
+                },
+                "access_lost": {
+                    "type": "object",
+                    "properties": {
+                        "since": {"type": "integer"},
+                        "limit": {"type": "null"},
+                    },
+                    "required": ["since", "limit"],
+                    "additionalProperties": False,
+                },
+            },
+            "required": ["deleted_messages", "edits", "access_lost"],
+            "additionalProperties": False,
+        },
     },
-    "required": ["alerts", "count"],
+    "required": [
+        "alerts",
+        "deleted_messages",
+        "edits",
+        "access_lost",
+        "counts",
+        "count",
+        "since",
+        "limit",
+        "limited_by",
+    ],
     "additionalProperties": False,
 }
 
@@ -66,7 +208,12 @@ class MarkDialogForSync(ToolArgs):
     enable: bool = Field(default=True, description="True to start syncing, False to stop")
 
 
-@mcp_tool(name="mark_dialog_for_sync", title="Mark Sync", annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True))
+@mcp_tool(
+    name="mark_dialog_for_sync",
+    title="Mark Sync",
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True),
+    output_schema=MARK_DIALOG_FOR_SYNC_OUTPUT_SCHEMA,
+)
 async def mark_dialog_for_sync(args: MarkDialogForSync) -> ToolResult:
     try:
         async with daemon_connection() as conn:
@@ -85,7 +232,15 @@ async def mark_dialog_for_sync(args: MarkDialogForSync) -> ToolResult:
     text = f"Dialog {args.dialog_id} {action}."
     if args.enable:
         text += " Full message history will be fetched shortly."
-    return ToolResult(content=_text_response(text), result_count=1)
+    structured_content = {
+        "dialog_id": args.dialog_id,
+        "enabled": args.enable,
+        "status": "accepted",
+        "action": "mark_for_sync" if args.enable else "unmark_from_sync",
+        "expected_next_state": "syncing" if args.enable else "not_synced",
+        "full_history_will_be_fetched": args.enable,
+    }
+    return ToolResult(content=_text_response(text), structured_content=structured_content, result_count=1)
 
 
 class GetSyncStatus(ToolArgs):
@@ -119,9 +274,16 @@ async def get_sync_status(args: GetSyncStatus) -> ToolResult:
     structured_content = {
         "dialog_id": data.get("dialog_id"),
         "status": status,
+        "raw_status": data.get("raw_status", status),
         "is_syncing": status == "syncing",
         "last_synced_at": data.get("last_synced_at"),
+        "last_event_at": data.get("last_event_at"),
         "message_count": data.get("message_count"),
+        "sync_progress": data.get("sync_progress"),
+        "total_messages": data.get("total_messages"),
+        "delete_detection": data.get("delete_detection"),
+        "sync_coverage_pct": data.get("sync_coverage_pct"),
+        "access_lost_at": data.get("access_lost_at"),
         "action": data.get("action"),
     }
     lines = [
@@ -175,18 +337,30 @@ async def get_sync_alerts(args: GetSyncAlerts) -> ToolResult:
 
     sections: list[str] = []
     alerts: list[dict[str, object]] = []
+    deleted_messages: list[dict[str, object]] = []
+    edit_alerts: list[dict[str, object]] = []
+    access_lost_alerts: list[dict[str, object]] = []
 
     if deleted:
         sections.append(f"=== Deleted Messages ({len(deleted)}) ===")
         for d in deleted:
             message = f"Deleted message msg={d['message_id']} deleted_at={d['deleted_at']}"
             sections.append(f"  dialog={d['dialog_id']} msg={d['message_id']} deleted_at={d['deleted_at']}")
+            action = "Inspect the dialog history around this message id if surrounding context is needed."
+            deleted_messages.append(
+                {
+                    "dialog_id": d.get("dialog_id"),
+                    "message_id": d.get("message_id"),
+                    "deleted_at": d.get("deleted_at"),
+                    "action": action,
+                }
+            )
             alerts.append(
                 {
                     "dialog_id": d.get("dialog_id"),
                     "severity": "medium",
                     "message": message,
-                    "action": None,
+                    "action": action,
                 }
             )
 
@@ -197,29 +371,66 @@ async def get_sync_alerts(args: GetSyncAlerts) -> ToolResult:
             sections.append(
                 f"  dialog={e['dialog_id']} msg={e['message_id']} v{e['version']} edit_date={e['edit_date']}"
             )
+            action = "Treat cached text as versioned; inspect edit history before relying on older wording."
+            edit_alerts.append(
+                {
+                    "dialog_id": e.get("dialog_id"),
+                    "message_id": e.get("message_id"),
+                    "version": e.get("version"),
+                    "edit_date": e.get("edit_date"),
+                    "action": action,
+                }
+            )
             alerts.append(
                 {
                     "dialog_id": e.get("dialog_id"),
                     "severity": "low",
                     "message": message,
-                    "action": None,
+                    "action": action,
                 }
             )
 
     if access_lost:
         sections.append(f"=== Access Lost ({len(access_lost)}) ===")
         for a in access_lost:
+            action = "Use get_sync_status for coverage details."
             sections.append(f"  dialog={a['dialog_id']} lost_at={a.get('access_lost_at')}")
+            access_lost_alerts.append(
+                {
+                    "dialog_id": a.get("dialog_id"),
+                    "access_lost_at": a.get("access_lost_at"),
+                    "action": action,
+                }
+            )
             alerts.append(
                 {
                     "dialog_id": a.get("dialog_id"),
                     "severity": "high",
                     "message": f"Access lost at {a.get('access_lost_at')}",
-                    "action": "Use get_sync_status for coverage details.",
+                    "action": action,
                 }
             )
 
-    structured_content = {"alerts": alerts, "count": len(alerts)}
+    structured_content = {
+        "alerts": alerts,
+        "deleted_messages": deleted_messages,
+        "edits": edit_alerts,
+        "access_lost": access_lost_alerts,
+        "counts": {
+            "deleted_messages": len(deleted_messages),
+            "edits": len(edit_alerts),
+            "access_lost": len(access_lost_alerts),
+            "total": len(alerts),
+        },
+        "count": len(alerts),
+        "since": args.since,
+        "limit": args.limit,
+        "limited_by": {
+            "deleted_messages": {"since": args.since, "limit": args.limit},
+            "edits": {"since": args.since, "limit": args.limit},
+            "access_lost": {"since": args.since, "limit": None},
+        },
+    }
 
     if not sections:
         text = "No sync alerts."

@@ -250,6 +250,7 @@ def test_list_tools_structured_output_schema_surface_is_explicit() -> None:
         "list_dialogs",
         "list_topics",
         "search_messages",
+        "mark_dialog_for_sync",
         "get_sync_status",
         "get_sync_alerts",
         "get_inbox",
