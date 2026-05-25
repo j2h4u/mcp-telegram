@@ -22,6 +22,7 @@ from mcp_telegram.tools import (
     TOOL_REGISTRY,
     GetEntityInfo,
     GetInbox,
+    GetMyRecentActivity,
     GetSyncAlerts,
     GetSyncStatus,
     ListDialogs,
@@ -32,6 +33,7 @@ from mcp_telegram.tools import (
     TraceAccountMessages,
     get_entity_info,
     get_inbox,
+    get_my_recent_activity,
     get_sync_alerts,
     get_sync_status,
     list_dialogs,
@@ -221,6 +223,28 @@ STRUCTURED_TOOL_CASES = {
                         ],
                     }
                 ]
+            },
+        },
+    ),
+    "get_my_recent_activity": (
+        get_my_recent_activity,
+        GetMyRecentActivity(),
+        {
+            "ok": True,
+            "data": {
+                "comments": [
+                    {
+                        "dialog_id": 42,
+                        "dialog_name": "MyGroup",
+                        "message_id": 100,
+                        "sent_at": 1_700_000_000,
+                        "text": "first",
+                        "sync_status": "synced",
+                        "reactions": [{"emoji": "🔥", "count": 1}],
+                    }
+                ],
+                "scan_status": "complete",
+                "scanned_at": 1_700_003_600,
             },
         },
     ),
@@ -2362,6 +2386,22 @@ async def test_get_my_recent_activity_routes_primary():
     assert "second" in text
     assert "[Telegram content] first [/Telegram content]" in text
     assert "[Telegram content] second [/Telegram content]" in text
+    assert result.structured_content is not None
+    assert result.structured_content["since_hours"] == 168
+    assert result.structured_content["limit"] == 500
+    assert result.structured_content["scan_status"] == "complete"
+    assert result.structured_content["scanned_at"] == 1_700_003_600
+    assert result.structured_content["count"] == 2
+    first_comment = result.structured_content["comments"][0]
+    assert first_comment["dialog_id"] == 42
+    assert first_comment["message_id"] == 100
+    assert first_comment["content"]["is_telegram_content"] is True
+    assert first_comment["content"]["content_kind"] == "message_text"
+    assert first_comment["navigation"] == {
+        "text": "nav: dialog_id=42 message_id=100",
+        "tool": "list_messages",
+        "arguments": {"exact_dialog_id": 42, "anchor_message_id": 100},
+    }
 
 
 async def test_get_my_recent_activity_frames_adversarial_text():
@@ -2408,6 +2448,10 @@ async def test_get_my_recent_activity_never_run_header():
     with _patch_daemon(conn):
         result = await get_my_recent_activity(GetMyRecentActivity())
     assert "Scan status: never run" in result.content[0].text
+    assert result.structured_content is not None
+    assert result.structured_content["scan_status"] == "never_run"
+    assert result.structured_content["comments"] == []
+    assert result.structured_content["count"] == 0
 
 
 async def test_get_my_recent_activity_in_progress_header():
