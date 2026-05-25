@@ -44,7 +44,7 @@ from mcp_telegram.tools import (
     trace_account_messages,
 )
 from mcp_telegram.tools._base import DaemonNotRunningError, ToolResult
-from mcp_telegram.tools.stats import GetUsageStats, get_usage_stats
+from mcp_telegram.tools.stats import GetDialogStats, GetUsageStats, get_dialog_stats, get_usage_stats
 
 StructuredResult = ToolResult | CallToolResult
 
@@ -226,6 +226,36 @@ STRUCTURED_TOOL_CASES = {
             },
         },
     ),
+    "get_usage_stats": (
+        get_usage_stats,
+        GetUsageStats(),
+        {
+            "ok": True,
+            "data": {
+                "tool_distribution": {"list_dialogs": 10, "list_messages": 5},
+                "error_distribution": {},
+                "total_calls": 15,
+                "max_page_depth": 2,
+                "filter_count": 3,
+                "latency_median_ms": 120,
+                "latency_p95_ms": 350,
+            },
+        },
+    ),
+    "get_dialog_stats": (
+        get_dialog_stats,
+        GetDialogStats(dialog="Chat Foo"),
+        {
+            "ok": True,
+            "data": {
+                "dialog_id": 1,
+                "top_reactions": [{"emoji": "👍", "count": 4}],
+                "top_mentions": [{"value": "@alice", "count": 3}],
+                "top_hashtags": [{"value": "#python", "count": 5}],
+                "top_forwards": [{"peer_id": 100, "name": "Channel A", "count": 3}],
+            },
+        },
+    ),
     "get_my_recent_activity": (
         get_my_recent_activity,
         GetMyRecentActivity(),
@@ -353,6 +383,7 @@ def _make_daemon_conn(response: dict | None = None) -> MagicMock:
     conn.get_inbox = AsyncMock(return_value=r)
     conn.record_telemetry = AsyncMock(return_value={"ok": True})
     conn.get_usage_stats = AsyncMock(return_value=r)
+    conn.get_dialog_stats = AsyncMock(return_value=r)
     conn.trace_account_messages = AsyncMock(return_value=r)
     conn.upsert_entities = AsyncMock(return_value={"ok": True, "upserted": 0})
     conn.resolve_entity = AsyncMock(return_value=r)
@@ -1846,6 +1877,15 @@ async def test_get_usage_stats_via_daemon():
     text = result.content[0].text
     assert "list_dialogs" in text
     assert "120" in text  # latency_median_ms
+    assert result.structured_content is not None
+    assert result.structured_content["empty"] is False
+    assert result.structured_content["total_calls"] == 15
+    assert result.structured_content["tool_distribution"] == {"list_dialogs": 10, "list_messages": 5}
+    assert result.structured_content["error_distribution"] == {}
+    assert result.structured_content["max_page_depth"] == 2
+    assert result.structured_content["filter_count"] == 3
+    assert result.structured_content["latency_median_ms"] == 120
+    assert result.structured_content["latency_p95_ms"] == 350
     conn.get_usage_stats.assert_called_once()
 
 
@@ -1871,6 +1911,10 @@ async def test_get_usage_stats_empty_data():
 
     text = result.content[0].text
     assert "no usage data" in text.lower()
+    assert result.structured_content is not None
+    assert result.structured_content["empty"] is True
+    assert result.structured_content["total_calls"] == 0
+    assert result.structured_content["tool_distribution"] == {}
 
 
 # ---------------------------------------------------------------------------

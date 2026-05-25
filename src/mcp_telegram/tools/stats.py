@@ -21,6 +21,118 @@ from ._base import (
 
 logger = logging.getLogger(__name__)
 
+GET_USAGE_STATS_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "summary": {"type": "string"},
+        "empty": {"type": "boolean"},
+        "total_calls": {"type": "integer"},
+        "tool_distribution": {"type": "object"},
+        "error_distribution": {"type": "object"},
+        "max_page_depth": {"type": "integer"},
+        "filter_count": {"type": "integer"},
+        "latency_median_ms": {"type": ["number", "null"]},
+        "latency_p95_ms": {"type": ["number", "null"]},
+    },
+    "required": [
+        "summary",
+        "empty",
+        "total_calls",
+        "tool_distribution",
+        "error_distribution",
+        "max_page_depth",
+        "filter_count",
+        "latency_median_ms",
+        "latency_p95_ms",
+    ],
+    "additionalProperties": False,
+}
+
+
+GET_DIALOG_STATS_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "dialog": {"type": "string"},
+        "dialog_id": {"type": ["integer", "null"]},
+        "top_n": {"type": "integer"},
+        "top_reactions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "emoji": {"type": ["string", "null"]},
+                    "count": {"type": "integer"},
+                },
+                "required": ["emoji", "count"],
+                "additionalProperties": False,
+            },
+        },
+        "top_mentions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "value": {"type": ["string", "null"]},
+                    "count": {"type": "integer"},
+                },
+                "required": ["value", "count"],
+                "additionalProperties": False,
+            },
+        },
+        "top_hashtags": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "value": {"type": ["string", "null"]},
+                    "count": {"type": "integer"},
+                },
+                "required": ["value", "count"],
+                "additionalProperties": False,
+            },
+        },
+        "top_forwards": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "peer_id": {"type": ["integer", "null"]},
+                    "name": {"type": ["string", "null"]},
+                    "count": {"type": "integer"},
+                },
+                "required": ["peer_id", "name", "count"],
+                "additionalProperties": False,
+            },
+        },
+        "section_counts": {
+            "type": "object",
+            "properties": {
+                "top_reactions": {"type": "integer"},
+                "top_mentions": {"type": "integer"},
+                "top_hashtags": {"type": "integer"},
+                "top_forwards": {"type": "integer"},
+            },
+            "required": ["top_reactions", "top_mentions", "top_hashtags", "top_forwards"],
+            "additionalProperties": False,
+        },
+        "count": {"type": "integer"},
+        "result_count_semantics": {"type": "string"},
+    },
+    "required": [
+        "dialog",
+        "dialog_id",
+        "top_n",
+        "top_reactions",
+        "top_mentions",
+        "top_hashtags",
+        "top_forwards",
+        "section_counts",
+        "count",
+        "result_count_semantics",
+    ],
+    "additionalProperties": False,
+}
+
 
 def format_usage_summary(stats: dict) -> str:
     """Generate <100 token natural-language summary of usage patterns.
@@ -80,7 +192,27 @@ class GetUsageStats(ToolArgs):
     """Get actionable usage statistics from telemetry (last 30 days)."""
 
 
-@mcp_tool(name="get_usage_stats", title="Usage Stats", posture="secondary/helper", annotations=ToolAnnotations(readOnlyHint=True))
+def _usage_structured_content(stats: dict, *, summary: str, empty: bool) -> dict[str, object]:
+    return {
+        "summary": summary,
+        "empty": empty,
+        "total_calls": int(stats.get("total_calls", 0) or 0),
+        "tool_distribution": stats.get("tool_distribution") or {},
+        "error_distribution": stats.get("error_distribution") or {},
+        "max_page_depth": int(stats.get("max_page_depth", 0) or 0),
+        "filter_count": int(stats.get("filter_count", 0) or 0),
+        "latency_median_ms": stats.get("latency_median_ms"),
+        "latency_p95_ms": stats.get("latency_p95_ms"),
+    }
+
+
+@mcp_tool(
+    name="get_usage_stats",
+    title="Usage Stats",
+    posture="secondary/helper",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    output_schema=GET_USAGE_STATS_OUTPUT_SCHEMA,
+)
 async def get_usage_stats(args: GetUsageStats) -> ToolResult:
     try:
         async with daemon_connection() as conn:
@@ -94,10 +226,18 @@ async def get_usage_stats(args: GetUsageStats) -> ToolResult:
 
     stats = response.get("data", {})
     if not stats or stats.get("total_calls", 0) == 0:
-        return ToolResult(content=_text_response(no_usage_data_text()))
+        summary = no_usage_data_text()
+        return ToolResult(
+            content=_text_response(summary),
+            structured_content=_usage_structured_content(stats, summary=summary, empty=True),
+        )
 
     summary = format_usage_summary(stats)
-    return ToolResult(content=_text_response(summary if summary else no_usage_data_text()))
+    summary_text = summary if summary else no_usage_data_text()
+    return ToolResult(
+        content=_text_response(summary_text),
+        structured_content=_usage_structured_content(stats, summary=summary_text, empty=False),
+    )
 
 
 class GetDialogStats(ToolArgs):
@@ -130,7 +270,13 @@ def _format_stats_section(title: str, entries: list[dict], key: str) -> list[str
     return lines
 
 
-@mcp_tool(name="get_dialog_stats", title="Dialog Stats", posture="secondary/helper", annotations=ToolAnnotations(readOnlyHint=True))
+@mcp_tool(
+    name="get_dialog_stats",
+    title="Dialog Stats",
+    posture="secondary/helper",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    output_schema=GET_DIALOG_STATS_OUTPUT_SCHEMA,
+)
 async def get_dialog_stats(args: GetDialogStats) -> ToolResult:
     dialog_id: int | None = parse_exact_dialog_id(args.dialog)
     dialog_name: str | None = None if dialog_id else args.dialog
@@ -171,4 +317,25 @@ async def get_dialog_stats(args: GetDialogStats) -> ToolResult:
     sections += _format_stats_section("Top Forward Sources", forwards_flat, "label")
 
     total = len(reactions) + len(mentions) + len(hashtags) + len(forwards)
-    return ToolResult(content=_text_response("\n".join(sections)), result_count=total)
+    structured_content = {
+        "dialog": args.dialog,
+        "dialog_id": data.get("dialog_id", dialog_id),
+        "top_n": args.top_n,
+        "top_reactions": reactions,
+        "top_mentions": mentions,
+        "top_hashtags": hashtags,
+        "top_forwards": forwards,
+        "section_counts": {
+            "top_reactions": len(reactions),
+            "top_mentions": len(mentions),
+            "top_hashtags": len(hashtags),
+            "top_forwards": len(forwards),
+        },
+        "count": total,
+        "result_count_semantics": "count is the total number of aggregate rows across reactions, mentions, hashtags, and forward sources",
+    }
+    return ToolResult(
+        content=_text_response("\n".join(sections)),
+        structured_content=structured_content,
+        result_count=total,
+    )

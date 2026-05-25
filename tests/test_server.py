@@ -255,6 +255,9 @@ def test_list_tools_structured_output_schema_surface_is_explicit() -> None:
         "get_sync_status",
         "get_sync_alerts",
         "get_inbox",
+        "get_my_recent_activity",
+        "get_usage_stats",
+        "get_dialog_stats",
         "trace_account_messages",
     }
 

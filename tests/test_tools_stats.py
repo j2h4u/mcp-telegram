@@ -77,6 +77,21 @@ async def test_get_dialog_stats_formats_sections() -> None:
     assert "count=3" in text
     assert "count=5" in text
     assert "Channel A" in text
+    assert content.structured_content is not None
+    assert content.structured_content["dialog"] == "Chat Foo"
+    assert content.structured_content["dialog_id"] == 1
+    assert content.structured_content["top_n"] == 5
+    assert content.structured_content["top_reactions"] == data["top_reactions"]
+    assert content.structured_content["top_mentions"] == data["top_mentions"]
+    assert content.structured_content["top_hashtags"] == data["top_hashtags"]
+    assert content.structured_content["top_forwards"] == data["top_forwards"]
+    assert content.structured_content["section_counts"] == {
+        "top_reactions": 2,
+        "top_mentions": 2,
+        "top_hashtags": 2,
+        "top_forwards": 2,
+    }
+    assert content.structured_content["count"] == 8
 
 
 @pytest.mark.asyncio
@@ -119,6 +134,12 @@ async def test_get_dialog_stats_empty_sections() -> None:
 
     text = content.content[0].text
     assert text.count("(none)") == 4
+    assert content.structured_content is not None
+    assert content.structured_content["top_reactions"] == []
+    assert content.structured_content["top_mentions"] == []
+    assert content.structured_content["top_hashtags"] == []
+    assert content.structured_content["top_forwards"] == []
+    assert content.structured_content["count"] == 0
 
 
 @pytest.mark.asyncio
