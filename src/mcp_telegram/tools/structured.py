@@ -3,6 +3,10 @@ from typing import Literal, NotRequired, TypedDict
 TelegramContentKind = Literal[
     "message_text",
     "snippet",
+    "media_description",
+    "reply_snippet",
+    "forward_snippet",
+    "reaction",
     "about",
     "bio",
     "bot_description",

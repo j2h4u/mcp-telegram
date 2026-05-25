@@ -4,6 +4,7 @@ from pydantic import Field, model_validator
 
 from ..errors import dialog_not_found_text, invalid_navigation_text, search_no_hits_text
 from ..formatter import (
+    _compute_inline_markers,
     _render_read_state_header,
     frame_telegram_snippet,
     format_messages,
@@ -11,7 +12,7 @@ from ..formatter import (
 )
 from ..models import ReadMessage
 from ..resolver import parse_exact_dialog_id
-from .structured import structured_warning
+from .structured import TelegramContentKind, structured_warning, telegram_content
 from ._base import (
     DaemonNotRunningError,
     ToolAnnotations,
@@ -217,6 +218,63 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
             "required": ["dialog_type", "state", "header_lines"],
             "additionalProperties": False,
         },
+        "messages": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "dialog_id": {"type": "integer"},
+                    "msg_id": {"type": "integer"},
+                    "sent_at": {"type": "integer"},
+                    "date": {"type": "string"},
+                    "sender": {"type": "string"},
+                    "sender_id": {"type": ["integer", "null"]},
+                    "effective_sender_id": {"type": ["integer", "null"]},
+                    "out": {"type": "boolean"},
+                    "is_service": {"type": "boolean"},
+                    "topic_id": {"type": ["integer", "null"]},
+                    "topic_title": {"type": ["string", "null"]},
+                    "text": {"type": ["string", "null"]},
+                    "content": {"type": ["object", "null"]},
+                    "media_description": {"type": ["string", "null"]},
+                    "media": {"type": ["object", "null"]},
+                    "reply_to_msg_id": {"type": ["integer", "null"]},
+                    "reply_context": {"type": ["object", "null"]},
+                    "forward": {"type": ["object", "null"]},
+                    "post_author": {"type": ["string", "null"]},
+                    "edit_date": {"type": ["integer", "null"]},
+                    "reactions": {"type": ["object", "null"]},
+                    "read_markers": {"type": "array", "items": {"type": "object"}},
+                    "inline_markers": {"type": "array", "items": {"type": "object"}},
+                },
+                "required": [
+                    "dialog_id",
+                    "msg_id",
+                    "sent_at",
+                    "date",
+                    "sender",
+                    "sender_id",
+                    "effective_sender_id",
+                    "out",
+                    "is_service",
+                    "topic_id",
+                    "topic_title",
+                    "text",
+                    "content",
+                    "media_description",
+                    "media",
+                    "reply_to_msg_id",
+                    "reply_context",
+                    "forward",
+                    "post_author",
+                    "edit_date",
+                    "reactions",
+                    "read_markers",
+                    "inline_markers",
+                ],
+                "additionalProperties": False,
+            },
+        },
         "count": {"type": "integer"},
         "result_count_semantics": {"type": "string"},
     },
@@ -230,6 +288,7 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
         "limits",
         "navigation",
         "read_state",
+        "messages",
         "count",
         "result_count_semantics",
     ],
@@ -307,6 +366,139 @@ def _navigation_direction_for_structured(direction: str, anchor_message_id: int 
     return "older"
 
 
+_READ_MARKER_METADATA = {
+    "[I read up to here]": {
+        "kind": "i_read_up_to_here",
+        "side": "inbox",
+        "role": "boundary",
+    },
+    "[unread by me]": {
+        "kind": "unread_by_me",
+        "side": "inbox",
+        "role": "tail_start",
+    },
+    "[peer read up to here]": {
+        "kind": "peer_read_up_to_here",
+        "side": "outbox",
+        "role": "boundary",
+    },
+    "[unread by peer]": {
+        "kind": "unread_by_peer",
+        "side": "outbox",
+        "role": "tail_start",
+    },
+}
+
+
+def _content_or_none(text: str | None, kind: TelegramContentKind) -> dict[str, object] | None:
+    if not text:
+        return None
+    return telegram_content(text, kind)
+
+
+def _message_date(sent_at: int) -> str:
+    return datetime.fromtimestamp(int(sent_at), tz=UTC).isoformat()
+
+
+def _structured_read_marker(message_id: int, label: str) -> dict[str, object]:
+    metadata = _READ_MARKER_METADATA[label]
+    return {
+        "kind": metadata["kind"],
+        "label": label,
+        "side": metadata["side"],
+        "role": metadata["role"],
+        "anchor_message_id": message_id,
+    }
+
+
+def _structured_reply_context(reply: ReadMessage | None) -> dict[str, object] | None:
+    if reply is None:
+        return None
+    return {
+        "msg_id": reply.id,
+        "sent_at": reply.sent_at,
+        "date": _message_date(reply.sent_at),
+        "sender": resolve_sender_label(reply),
+        "sender_id": reply.sender_id,
+        "effective_sender_id": reply.effective_sender_id,
+        "text": reply.text,
+        "content": _content_or_none(reply.text, "reply_snippet"),
+    }
+
+
+def _structured_forward(from_name: str | None) -> dict[str, object] | None:
+    if not from_name:
+        return None
+    return {
+        "from_name": from_name,
+        "content": _content_or_none(from_name, "forward_snippet"),
+    }
+
+
+def _structured_media(description: str | None) -> dict[str, object] | None:
+    if not description:
+        return None
+    return {
+        "description": description,
+        "content": _content_or_none(description, "media_description"),
+    }
+
+
+def _structured_reactions(display: str | None) -> dict[str, object] | None:
+    if not display:
+        return None
+    return {
+        "display": display,
+        "content": _content_or_none(display, "reaction"),
+    }
+
+
+def _list_messages_structured_messages(
+    rows: list[dict],
+    *,
+    read_state: dict | None = None,
+    dialog_type: str | None = None,
+) -> list[dict[str, object]]:
+    if not rows:
+        return []
+    messages = [ReadMessage(**row) for row in rows]
+    reply_map: dict[int, ReadMessage] = {message.id: message for message in messages}
+    marker_by_message = _compute_inline_markers(messages, read_state) if dialog_type == "User" else {}
+
+    structured: list[dict[str, object]] = []
+    for message in messages:
+        marker_label = marker_by_message.get(message.id)
+        read_markers = [_structured_read_marker(message.id, marker_label)] if marker_label else []
+        structured.append(
+            {
+                "dialog_id": message.dialog_id,
+                "msg_id": message.id,
+                "sent_at": message.sent_at,
+                "date": _message_date(message.sent_at),
+                "sender": resolve_sender_label(message),
+                "sender_id": message.sender_id,
+                "effective_sender_id": message.effective_sender_id,
+                "out": bool(message.out),
+                "is_service": bool(message.is_service),
+                "topic_id": message.forum_topic_id,
+                "topic_title": message.topic_title,
+                "text": message.text,
+                "content": _content_or_none(message.text, "message_text"),
+                "media_description": message.media_description,
+                "media": _structured_media(message.media_description),
+                "reply_to_msg_id": message.reply_to_msg_id,
+                "reply_context": _structured_reply_context(reply_map.get(message.reply_to_msg_id or -1)),
+                "forward": _structured_forward(message.fwd_from_name),
+                "post_author": message.post_author,
+                "edit_date": message.edit_date,
+                "reactions": _structured_reactions(message.reactions_display),
+                "read_markers": read_markers,
+                "inline_markers": read_markers,
+            }
+        )
+    return structured
+
+
 def _list_messages_structured_content(
     *,
     args: "ListMessages",
@@ -372,6 +564,7 @@ def _list_messages_structured_content(
             "anchor_message_id": args.anchor_message_id,
         },
         "read_state": structured_read_state,
+        "messages": _list_messages_structured_messages(rows, read_state=read_state, dialog_type=dialog_type),
         "count": len(rows),
         "result_count_semantics": "count is the number of message rows returned in this response page",
     }

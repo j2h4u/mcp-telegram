@@ -549,3 +549,64 @@ def test_golden_daemon_fields() -> None:
         "[/Telegram content] [edited 15:00] [👍×2]"
     )
     assert expected_block in result, f"Golden output mismatch.\nGot:\n{result}"
+
+
+def test_structured_read_markers_match_formatter_marker_positions() -> None:
+    """Structured rows use the same marker placement helper as format_messages."""
+    from mcp_telegram.formatter import _compute_inline_markers
+    from mcp_telegram.tools.reading import _list_messages_structured_messages
+
+    dt = datetime(2024, 6, 15, 14, 30, 0, tzinfo=UTC)
+    rows = [
+        {
+            "message_id": 1,
+            "sent_at": int(dt.timestamp()),
+            "dialog_id": 123,
+            "text": "incoming seen",
+            "sender_first_name": "Alice",
+            "sender_id": 11,
+            "out": 0,
+        },
+        {
+            "message_id": 2,
+            "sent_at": int(dt.timestamp()) + 60,
+            "dialog_id": 123,
+            "text": "incoming unread",
+            "sender_first_name": "Alice",
+            "sender_id": 11,
+            "out": 0,
+        },
+        {
+            "message_id": 10,
+            "sent_at": int(dt.timestamp()) + 120,
+            "dialog_id": 123,
+            "text": "outgoing seen",
+            "out": 1,
+        },
+        {
+            "message_id": 11,
+            "sent_at": int(dt.timestamp()) + 180,
+            "dialog_id": 123,
+            "text": "outgoing unread",
+            "out": 1,
+        },
+    ]
+    read_state = {
+        "inbox_unread_count": 1,
+        "inbox_cursor_state": "populated",
+        "inbox_max_id_anchor": 1,
+        "outbox_unread_count": 1,
+        "outbox_cursor_state": "populated",
+        "outbox_max_id_anchor": 10,
+    }
+    messages = [ReadMessage(**row) for row in rows]
+    expected = _compute_inline_markers(messages, read_state)
+
+    structured = _list_messages_structured_messages(rows, read_state=read_state, dialog_type="User")
+    actual = {
+        item["msg_id"]: item["read_markers"][0]["label"]
+        for item in structured
+        if item["read_markers"]
+    }
+
+    assert actual == expected

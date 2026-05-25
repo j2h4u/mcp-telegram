@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-from mcp_telegram.tools.reading import ListMessages, _format_search_results, _list_messages_structured_content
+from mcp_telegram.tools.reading import (
+    ListMessages,
+    _format_search_results,
+    _list_messages_structured_content,
+    _list_messages_structured_messages,
+)
 
 
 def _row(
@@ -175,3 +180,120 @@ def test_list_messages_structured_page_metadata_preserves_navigation_warning_cov
     assert payload["count"] == 0
     assert payload["result_count_semantics"] == "count is the number of message rows returned in this response page"
     assert payload["read_state"]["header_lines"] == ["[read-state: all caught up]"]
+
+
+def test_list_messages_structured_messages_include_content_metadata_and_all_read_markers():
+    rows = [
+        {
+            "message_id": 1,
+            "sent_at": 1_700_000_000,
+            "dialog_id": 123,
+            "text": "incoming seen",
+            "sender_first_name": "Alice",
+            "sender_id": 11,
+            "effective_sender_id": 11,
+            "out": 0,
+        },
+        {
+            "message_id": 2,
+            "sent_at": 1_700_000_060,
+            "dialog_id": 123,
+            "text": "incoming unread",
+            "sender_first_name": "Alice",
+            "sender_id": 11,
+            "effective_sender_id": 11,
+            "out": 0,
+        },
+        {
+            "message_id": 10,
+            "sent_at": 1_700_000_120,
+            "dialog_id": 123,
+            "text": "outgoing seen",
+            "sender_first_name": None,
+            "sender_id": None,
+            "effective_sender_id": 999,
+            "out": 1,
+        },
+        {
+            "message_id": 11,
+            "sent_at": 1_700_000_180,
+            "dialog_id": 123,
+            "text": "outgoing unread",
+            "sender_first_name": None,
+            "sender_id": None,
+            "effective_sender_id": 999,
+            "out": 1,
+        },
+    ]
+    read_state = {
+        "inbox_unread_count": 1,
+        "inbox_cursor_state": "populated",
+        "inbox_max_id_anchor": 1,
+        "outbox_unread_count": 1,
+        "outbox_cursor_state": "populated",
+        "outbox_max_id_anchor": 10,
+    }
+
+    messages = _list_messages_structured_messages(rows, read_state=read_state, dialog_type="User")
+
+    marker_by_id = {message["msg_id"]: message["read_markers"][0] for message in messages}
+    assert marker_by_id[1]["kind"] == "i_read_up_to_here"
+    assert marker_by_id[2]["kind"] == "unread_by_me"
+    assert marker_by_id[10]["kind"] == "peer_read_up_to_here"
+    assert marker_by_id[11]["kind"] == "unread_by_peer"
+    assert marker_by_id[11]["label"] == "[unread by peer]"
+    assert messages[0]["content"] == {
+        "text": "incoming seen",
+        "is_telegram_content": True,
+        "content_kind": "message_text",
+    }
+    assert messages[2]["sender"] == "[me]"
+    assert messages[2]["out"] is True
+
+
+def test_list_messages_structured_messages_cover_media_reply_forward_reaction_topic_and_edit_fields():
+    rows = [
+        {
+            "message_id": 1,
+            "sent_at": 1_700_000_000,
+            "dialog_id": -100,
+            "text": "original",
+            "sender_first_name": "Alice",
+            "sender_id": 11,
+        },
+        {
+            "message_id": 2,
+            "sent_at": 1_700_000_060,
+            "dialog_id": -100,
+            "text": "reply with all metadata",
+            "sender_first_name": "Bob",
+            "sender_id": 22,
+            "media_description": "[фото]",
+            "reply_to_msg_id": 1,
+            "forum_topic_id": 7,
+            "topic_title": "General",
+            "fwd_from_name": "Forward Source",
+            "post_author": "Channel Author",
+            "edit_date": 1_700_000_120,
+            "reactions_display": "[👍×2]",
+        },
+    ]
+
+    messages = _list_messages_structured_messages(rows, dialog_type="Forum")
+    second = messages[1]
+
+    assert second["topic_id"] == 7
+    assert second["topic_title"] == "General"
+    assert second["media"] == {
+        "description": "[фото]",
+        "content": {"text": "[фото]", "is_telegram_content": True, "content_kind": "media_description"},
+    }
+    assert second["reply_context"]["msg_id"] == 1
+    assert second["reply_context"]["content"]["content_kind"] == "reply_snippet"
+    assert second["forward"]["from_name"] == "Forward Source"
+    assert second["forward"]["content"]["content_kind"] == "forward_snippet"
+    assert second["post_author"] == "Channel Author"
+    assert second["edit_date"] == 1_700_000_120
+    assert second["reactions"]["display"] == "[👍×2]"
+    assert second["reactions"]["content"]["content_kind"] == "reaction"
+    assert second["read_markers"] == []
