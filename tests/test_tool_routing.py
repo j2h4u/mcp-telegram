@@ -17,7 +17,7 @@ from datetime import UTC
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from mcp.types import TextContent
+from mcp.types import CallToolResult, TextContent
 
 from mcp_telegram.tools import TOOL_REGISTRY
 from mcp_telegram.tools import (
@@ -42,8 +42,67 @@ from mcp_telegram.tools import (
     search_messages,
     trace_account_messages,
 )
-from mcp_telegram.tools._base import DaemonNotRunningError
+from mcp_telegram.tools._base import DaemonNotRunningError, ToolResult
 from mcp_telegram.tools.stats import GetUsageStats, get_usage_stats
+
+StructuredResult = ToolResult | CallToolResult
+
+
+def _structured_payload(result: StructuredResult) -> dict[str, object] | None:
+    if isinstance(result, ToolResult):
+        return result.structured_content
+    return result.structuredContent
+
+
+def _is_error(result: StructuredResult) -> bool | None:
+    if isinstance(result, ToolResult):
+        return result.is_error
+    return result.isError
+
+
+def _text_content(result: StructuredResult) -> str:
+    assert result.content
+    first_content = result.content[0]
+    assert isinstance(first_content, TextContent)
+    assert first_content.text
+    return first_content.text
+
+
+def assert_structured_success_payload(result: StructuredResult) -> dict[str, object]:
+    assert _is_error(result) is False
+    payload = _structured_payload(result)
+    assert payload is not None
+    assert isinstance(payload, dict)
+    _text_content(result)
+    return payload
+
+
+def _field_path_value(payload: dict[str, object], field_path: str) -> object:
+    current: object = payload
+    for segment in field_path.split("."):
+        if isinstance(current, dict):
+            assert segment in current, f"{field_path!r} missing segment {segment!r}"
+            current = current[segment]
+            continue
+        if isinstance(current, list) and segment.isdecimal():
+            index = int(segment)
+            assert index < len(current), f"{field_path!r} index {index} out of range"
+            current = current[index]
+            continue
+        raise AssertionError(f"{field_path!r} cannot traverse segment {segment!r} in {current!r}")
+    return current
+
+
+def assert_structured_text_parity(
+    result: StructuredResult,
+    structured_field_path: str,
+    expected_text_substring: str,
+) -> object:
+    payload = assert_structured_success_payload(result)
+    value = _field_path_value(payload, structured_field_path)
+    assert value is not None
+    assert expected_text_substring in _text_content(result)
+    return value
 
 
 STRUCTURED_TOOL_CASES = {
@@ -210,10 +269,7 @@ async def test_schema_bearing_tools_return_structured_content_and_text(tool_name
     with _patch_daemon(conn):
         result = await runner(args)
 
-    assert result.is_error is False
-    assert result.structured_content is not None
-    assert result.content
-    assert isinstance(result.content[0], TextContent)
+    assert_structured_success_payload(result)
 
 # ---------------------------------------------------------------------------
 # Daemon mock helpers
@@ -627,6 +683,7 @@ async def test_search_messages_via_daemon():
     with _patch_daemon(conn):
         result = await search_messages(SearchMessages(dialog="123", query="result"))
 
+    assert_structured_text_parity(result, "results.0.snippet", "Found this result")
     assert "Found this result" in result.content[0].text
     assert "[Telegram content] Found this result [/Telegram content]" in result.content[0].text
     assert result.structured_content is not None
@@ -1148,6 +1205,7 @@ async def test_get_sync_alerts_empty():
     )
     with _patch_daemon(conn):
         result = await get_sync_alerts(GetSyncAlerts())
+    assert_structured_text_parity(result, "count", "No sync alerts")
     assert "No sync alerts" in result.content[0].text
     assert result.is_error is False
     assert result.structured_content == {"alerts": [], "count": 0}

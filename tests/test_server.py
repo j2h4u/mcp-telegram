@@ -286,9 +286,11 @@ async def test_call_tool_preserves_structuredContent_and_text_content(monkeypatc
 
     result = await server.call_tool("list_dialogs", {})
 
+    assert result.isError is False
     assert result.structuredContent == {"dialogs": [{"id": 1, "name": "Alice"}], "count": 1}
     assert result.content
     assert isinstance(result.content[0], TextContent)
+    assert result.content[0].text
 
 
 @pytest.mark.asyncio
