@@ -783,6 +783,7 @@ async def test_search_messages_via_daemon():
                         "sent_at": 1705312800,
                         "text": "Found this result",
                         "sender_first_name": "Bob",
+                        "dialog_name": "Search Chat",
                         "media_description": None,
                         "reply_to_msg_id": None,
                     },
@@ -801,8 +802,14 @@ async def test_search_messages_via_daemon():
     assert result.structured_content["query"] == "result"
     assert result.structured_content["count"] == 1
     assert result.structured_content["results"][0]["dialog_id"] == 123
+    assert result.structured_content["results"][0]["dialog_name"] == "Search Chat"
     assert result.structured_content["results"][0]["msg_id"] == 5
     assert result.structured_content["results"][0]["snippet"] == "Found this result"
+    assert result.structured_content["results"][0]["content"]["content_kind"] == "snippet"
+    assert result.structured_content["results"][0]["anchor_call"] == {
+        "tool": "list_messages",
+        "arguments": {"exact_dialog_id": 123, "anchor_message_id": 5},
+    }
     conn.search_messages.assert_called_once()
 
 
@@ -855,12 +862,14 @@ async def test_search_messages_no_hits():
 
     assert len(result.content) == 1
     assert "no messages matched" in result.content[0].text.lower(), f"Expected no-hits text, got: {result.content[0].text}"
-    assert result.structured_content == {
-        "query": "nonexistent",
-        "results": [],
-        "count": 0,
-        "next_navigation": None,
-    }
+    assert result.structured_content is not None
+    assert result.structured_content["query"] == "nonexistent"
+    assert result.structured_content["results"] == []
+    assert result.structured_content["count"] == 0
+    assert result.structured_content["next_navigation"] is None
+    assert result.structured_content["navigation"]["next_navigation"] is None
+    assert result.structured_content["limits"]["requested_limit"] == 20
+    assert result.structured_content["anchor_call"]["tool"] == "list_messages"
 
 
 async def test_search_messages_rejects_history_navigation_token():

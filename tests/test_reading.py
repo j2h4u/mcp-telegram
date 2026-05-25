@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from mcp_telegram.tools.reading import (
     ListMessages,
+    SearchMessages,
     _format_search_results,
     _list_messages_structured_content,
     _list_messages_structured_messages,
+    _search_structured_content,
 )
 
 
@@ -132,6 +134,82 @@ def test_search_snippet_no_raw_question_mark_sender_fallback_in_source():
 
     src = pathlib.Path("src/mcp_telegram/tools/reading.py").read_text()
     assert 'row.get("sender_first_name") or "?"' not in src
+
+
+def test_search_messages_structured_payload_includes_dialog_anchor_read_state_warning_and_limits():
+    payload = _search_structured_content(
+        args=SearchMessages(
+            dialog="123",
+            query="needle",
+            limit=5,
+            navigation="search-token",
+        ),
+        data={
+            "messages": [
+                {
+                    "dialog_id": 123,
+                    "dialog_name": "Alice",
+                    "message_id": 9,
+                    "sent_at": 1_700_000_000,
+                    "text": "needle in Telegram text",
+                    "sender_first_name": "Alice",
+                }
+            ],
+            "dialog_access": "archived",
+            "last_synced_at": 1_699_990_000,
+            "last_event_at": 1_699_999_000,
+            "sync_coverage_pct": 80,
+            "read_state_per_dialog": {
+                123: {
+                    "inbox_unread_count": 0,
+                    "inbox_cursor_state": "populated",
+                    "outbox_unread_count": 0,
+                    "outbox_cursor_state": "populated",
+                }
+            },
+        },
+        rows=[
+            {
+                "dialog_id": 123,
+                "dialog_name": "Alice",
+                "message_id": 9,
+                "sent_at": 1_700_000_000,
+                "text": "needle in Telegram text",
+                "sender_first_name": "Alice",
+            }
+        ],
+        dialog_id=123,
+        dialog_label="123",
+        global_mode=False,
+        offset=20,
+        next_navigation="next-search-token",
+    )
+
+    assert payload["dialog_name"] == "Alice"
+    assert payload["source"] == "sync_db"
+    assert payload["coverage"]["kind"] == "archived"
+    assert payload["warnings"][0]["kind"] == "archived_dialog"
+    assert payload["read_state_per_dialog"]["123"]["header_lines"] == ["[read-state: all caught up]"]
+    assert payload["navigation"] == {
+        "next_navigation": "next-search-token",
+        "has_more": True,
+        "source_cursor": "search-token",
+        "offset": 20,
+    }
+    assert payload["limits"] == {"requested_limit": 5, "applied_limit": 1, "offset": 20}
+    assert payload["anchor_call"]["arguments_template"]["anchor_message_id"] == "<result.msg_id>"
+    result = payload["results"][0]
+    assert result["dialog_name"] == "Alice"
+    assert result["content"] == {
+        "text": "needle in Telegram text",
+        "is_telegram_content": True,
+        "content_kind": "snippet",
+    }
+    assert result["anchor_call"] == {
+        "tool": "list_messages",
+        "arguments": {"exact_dialog_id": 123, "anchor_message_id": 9},
+    }
+    assert payload["result_count_semantics"] == "count is the number of search hits returned in this response page"
 
 
 def test_list_messages_structured_page_metadata_preserves_navigation_warning_coverage_and_limits():

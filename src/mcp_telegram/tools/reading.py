@@ -581,25 +581,89 @@ SEARCH_MESSAGES_OUTPUT_SCHEMA = {
     "type": "object",
     "properties": {
         "query": {"type": "string"},
+        "dialog_name": {"type": ["string", "null"]},
+        "scope": {
+            "type": "object",
+            "properties": {
+                "dialog": {"type": ["string", "null"]},
+                "dialog_id": {"type": ["integer", "null"]},
+                "global": {"type": "boolean"},
+            },
+            "required": ["dialog", "dialog_id", "global"],
+            "additionalProperties": False,
+        },
+        "source": {"type": "string"},
+        "coverage": {"type": "object"},
+        "warnings": {"type": "array", "items": {"type": "object"}},
+        "read_state_per_dialog": {"type": "object"},
+        "navigation": {
+            "type": "object",
+            "properties": {
+                "next_navigation": {"type": ["string", "null"]},
+                "has_more": {"type": "boolean"},
+                "source_cursor": {"type": ["string", "null"]},
+                "offset": {"type": "integer"},
+            },
+            "required": ["next_navigation", "has_more", "source_cursor", "offset"],
+            "additionalProperties": False,
+        },
+        "limits": {
+            "type": "object",
+            "properties": {
+                "requested_limit": {"type": "integer"},
+                "applied_limit": {"type": "integer"},
+                "offset": {"type": "integer"},
+            },
+            "required": ["requested_limit", "applied_limit", "offset"],
+            "additionalProperties": False,
+        },
+        "anchor_call": {
+            "type": "object",
+            "properties": {
+                "tool": {"type": "string"},
+                "arguments_template": {"type": "object"},
+            },
+            "required": ["tool", "arguments_template"],
+            "additionalProperties": False,
+        },
         "results": {
             "type": "array",
             "items": {
                 "type": "object",
                 "properties": {
                     "dialog_id": {"type": "integer"},
+                    "dialog_name": {"type": ["string", "null"]},
                     "msg_id": {"type": "integer"},
                     "date": {"type": ["string", "null"]},
                     "sender": {"type": ["string", "null"]},
                     "snippet": {"type": "string"},
+                    "content": {"type": "object"},
+                    "anchor_call": {"type": "object"},
                 },
-                "required": ["dialog_id", "msg_id", "snippet"],
+                "required": ["dialog_id", "dialog_name", "msg_id", "snippet", "content", "anchor_call"],
                 "additionalProperties": False,
             },
         },
         "count": {"type": "integer"},
         "next_navigation": {"type": ["string", "null"]},
+        "result_count_semantics": {"type": "string"},
     },
-    "required": ["query", "results", "count", "next_navigation"],
+    "required": [
+        "query",
+        "dialog_name",
+        "scope",
+        "source",
+        "coverage",
+        "warnings",
+        "read_state_per_dialog",
+        "navigation",
+        "limits",
+        "anchor_call",
+        "results",
+        "count",
+        "next_navigation",
+        "result_count_semantics",
+    ],
     "additionalProperties": False,
 }
 
@@ -628,6 +692,16 @@ def _extract_snippet(text: str | None, query: str) -> str:
     return text[:_SNIPPET_MAX_LEN] + "..."
 
 
+def _search_anchor_call(dialog_id: int, msg_id: int) -> dict[str, object]:
+    return {
+        "tool": "list_messages",
+        "arguments": {
+            "exact_dialog_id": dialog_id,
+            "anchor_message_id": msg_id,
+        },
+    }
+
+
 def _search_result_structured_rows(rows: list[dict], query: str) -> list[dict[str, object]]:
     results: list[dict[str, object]] = []
     for row in rows:
@@ -635,16 +709,103 @@ def _search_result_structured_rows(rows: list[dict], query: str) -> list[dict[st
         date: str | None = None
         if sent_at is not None:
             date = datetime.fromtimestamp(int(sent_at), tz=UTC).strftime("%Y-%m-%d %H:%M")
+        snippet = _extract_snippet(row.get("text"), query)
+        dialog_id = int(row.get("dialog_id") or 0)
         results.append(
             {
-                "dialog_id": row.get("dialog_id"),
+                "dialog_id": dialog_id,
+                "dialog_name": row.get("dialog_name"),
                 "msg_id": row["message_id"],
                 "date": date,
                 "sender": resolve_sender_label(row),
-                "snippet": _extract_snippet(row.get("text"), query),
+                "snippet": snippet,
+                "content": telegram_content(snippet, "snippet"),
+                "anchor_call": _search_anchor_call(dialog_id, row["message_id"]),
             }
         )
     return results
+
+
+def _search_read_state_per_dialog(data: dict) -> dict[str, object]:
+    read_state_per_dialog = data.get("read_state_per_dialog") or {}
+    structured: dict[str, object] = {}
+    for raw_dialog_id, read_state in read_state_per_dialog.items():
+        try:
+            dialog_id = int(raw_dialog_id)
+        except (TypeError, ValueError):
+            continue
+        structured[str(dialog_id)] = {
+            "dialog_id": dialog_id,
+            "dialog_type": "User",
+            "state": read_state,
+            "header_lines": _render_read_state_header(
+                read_state,
+                "User",
+                int(datetime.now(tz=UTC).timestamp()),
+            ),
+        }
+    return structured
+
+
+def _search_dialog_name(rows: list[dict], global_mode: bool, dialog_label: str | None) -> str | None:
+    if global_mode:
+        return None
+    for row in rows:
+        dialog_name = row.get("dialog_name")
+        if isinstance(dialog_name, str):
+            return dialog_name
+    return dialog_label
+
+
+def _search_structured_content(
+    *,
+    args: "SearchMessages",
+    data: dict,
+    rows: list[dict],
+    dialog_id: int | None,
+    dialog_label: str | None,
+    global_mode: bool,
+    offset: int,
+    next_navigation: str | None,
+) -> dict[str, object]:
+    structured_results = _search_result_structured_rows(rows, args.query)
+    source = data.get("source", "sync_db")
+    data_with_source = {**data, "source": source}
+    return {
+        "query": args.query,
+        "dialog_name": _search_dialog_name(rows, global_mode, dialog_label),
+        "scope": {
+            "dialog": args.dialog,
+            "dialog_id": dialog_id,
+            "global": global_mode,
+        },
+        "source": source,
+        "coverage": _list_messages_coverage(data_with_source),
+        "warnings": _list_messages_warnings(data),
+        "read_state_per_dialog": _search_read_state_per_dialog(data),
+        "navigation": {
+            "next_navigation": next_navigation,
+            "has_more": next_navigation is not None,
+            "source_cursor": args.navigation,
+            "offset": offset,
+        },
+        "limits": {
+            "requested_limit": args.limit,
+            "applied_limit": len(rows),
+            "offset": offset,
+        },
+        "anchor_call": {
+            "tool": "list_messages",
+            "arguments_template": {
+                "exact_dialog_id": "<result.dialog_id>",
+                "anchor_message_id": "<result.msg_id>",
+            },
+        },
+        "results": structured_results,
+        "count": len(structured_results),
+        "next_navigation": next_navigation,
+        "result_count_semantics": "count is the number of search hits returned in this response page",
+    }
 
 
 def _format_search_results(
@@ -1147,13 +1308,16 @@ async def search_messages(args: SearchMessages) -> ToolResult:
     data = response.get("data", {})
     rows = data.get("messages", [])
     next_nav = data.get("next_navigation")
-    structured_results = _search_result_structured_rows(rows, args.query)
-    structured_content = {
-        "query": args.query,
-        "results": structured_results,
-        "count": len(structured_results),
-        "next_navigation": next_nav,
-    }
+    structured_content = _search_structured_content(
+        args=args,
+        data=data,
+        rows=rows,
+        dialog_id=dialog_id,
+        dialog_label=dialog_label,
+        global_mode=global_mode,
+        offset=offset,
+        next_navigation=next_nav,
+    )
 
     if not rows:
         result_text = search_no_hits_text(dialog_label, args.query)
