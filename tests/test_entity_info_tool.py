@@ -166,7 +166,8 @@ async def test_get_entity_info_channel_renders() -> None:
             "subscribers_count": 12345, "linked_chat_id": None,
             "pinned_msg_id": 999, "slow_mode_seconds": 30,
             "available_reactions": {"kind": "some", "emojis": ["👍", "❤"]},
-            "restrictions": [], "contacts_subscribed": None,
+            "restrictions": [{"platform": "all", "reason": "copyright", "text": "Restricted text"}],
+            "contacts_subscribed": None,
             "contacts_subscribed_partial": False, "contacts_reason": "not_an_admin",
         },
     }
@@ -180,6 +181,23 @@ async def test_get_entity_info_channel_renders() -> None:
     assert "slow_mode_seconds: 30" in text
     assert "available_reactions: 👍, ❤" in text
     assert "contacts_subscribed: null (reason: not_an_admin)" in text
+    payload = result.structured_content
+    assert payload is not None
+    assert payload["type"] == "channel"
+    assert payload["common"]["about"]["content"]["content_kind"] == "about"
+    assert payload["type_specific"]["classification"] == {"broadcast": True, "megagroup": False}
+    assert payload["type_specific"]["subscribers_count"] == 12345
+    assert payload["type_specific"]["pinned_msg_id"] == 999
+    assert payload["type_specific"]["slow_mode_seconds"] == 30
+    assert payload["type_specific"]["available_reactions"] == {"kind": "some", "emojis": ["👍", "❤"]}
+    assert payload["type_specific"]["restrictions"][0]["content"]["content"]["content_kind"] == "restriction_reason"
+    assert payload["type_specific"]["contacts_subscribed"] == {
+        "items": None,
+        "available": False,
+        "partial": False,
+        "reason": "not_an_admin",
+    }
+    assert payload["privacy_or_access"]["contacts_subscribed"]["is_gated"] is True
 
 
 @pytest.mark.asyncio
@@ -188,7 +206,7 @@ async def test_get_entity_info_supergroup_renders() -> None:
         "ok": True,
         "data": {
             "id": -1002, "type": "supergroup", "name": "DevChat", "username": "devchat",
-            "about": None, "my_membership": {"is_member": True, "is_admin": True},
+            "about": "Group rules", "my_membership": {"is_member": True, "is_admin": True},
             "avatar_history": [], "avatar_count": 0,
             "members_count": 42, "linked_broadcast_id": None,
             "slow_mode_seconds": None, "has_topics": True, "restrictions": [],
@@ -204,6 +222,25 @@ async def test_get_entity_info_supergroup_renders() -> None:
     assert "has_topics: yes" in text
     assert "contacts_subscribed (1):" in text
     assert "id=10" in text and "name='Anna'" in text
+    payload = result.structured_content
+    assert payload is not None
+    assert payload["type"] == "supergroup"
+    assert payload["common"]["about"]["content"] == {
+        "text": "Group rules",
+        "is_telegram_content": True,
+        "content_kind": "about",
+    }
+    assert payload["type_specific"]["classification"] == {
+        "broadcast": False,
+        "megagroup": True,
+        "forum": True,
+    }
+    assert payload["type_specific"]["members_count"] == 42
+    assert payload["type_specific"]["has_topics"] is True
+    assert payload["type_specific"]["contacts_subscribed"]["items"] == [
+        {"id": 10, "name": "Anna", "username": "anna"}
+    ]
+    assert payload["type_specific"]["contacts_subscribed"]["available"] is True
 
 
 @pytest.mark.asyncio
@@ -212,7 +249,7 @@ async def test_get_entity_info_group_renders_migrated_to() -> None:
         "ok": True,
         "data": {
             "id": -100, "type": "group", "name": "Old Chat", "username": None,
-            "about": None, "my_membership": {"is_member": True, "is_admin": True},
+            "about": "Old group info", "my_membership": {"is_member": True, "is_admin": True},
             "avatar_history": [], "avatar_count": 0,
             "members_count": 5, "migrated_to": -1002005000000,
             "invite_link": None, "restrictions": [],
@@ -227,6 +264,15 @@ async def test_get_entity_info_group_renders_migrated_to() -> None:
     assert "members_count: 5" in text
     assert "migrated_to: -1002005000000" in text
     assert "re-run GetEntityInfo with this id" in text
+    payload = result.structured_content
+    assert payload is not None
+    assert payload["type"] == "group"
+    assert payload["common"]["about"]["untrusted_content"] is True
+    assert payload["type_specific"]["classification"] == {"broadcast": False, "megagroup": False}
+    assert payload["type_specific"]["members_count"] == 5
+    assert payload["type_specific"]["migrated_to"] == -1002005000000
+    assert "linked_chat_id" not in payload["type_specific"]
+    assert "available_reactions" in payload["type_specific"]["omitted_type_specific_fields"]
 
 
 @pytest.mark.asyncio

@@ -417,10 +417,91 @@ def _user_or_bot_structured(data: dict) -> dict[str, object]:
     }
 
 
+def _contacts_subscribed_structured(data: dict) -> dict[str, object]:
+    contacts = data.get("contacts_subscribed")
+    return {
+        "items": contacts,
+        "available": contacts is not None,
+        "partial": data.get("contacts_subscribed_partial"),
+        "reason": data.get("contacts_reason"),
+    }
+
+
+def _channel_structured(data: dict) -> dict[str, object]:
+    return {
+        "kind": "channel",
+        "classification": {
+            "broadcast": True,
+            "megagroup": False,
+        },
+        "title": data.get("name"),
+        "username": data.get("username"),
+        "subscribers_count": data.get("subscribers_count"),
+        "linked_chat_id": data.get("linked_chat_id"),
+        "pinned_msg_id": data.get("pinned_msg_id"),
+        "slow_mode_seconds": data.get("slow_mode_seconds"),
+        "available_reactions": data.get("available_reactions"),
+        "restrictions": _restriction_payloads(data.get("restrictions"), base_path="type_specific.restrictions"),
+        "contacts_subscribed": _contacts_subscribed_structured(data),
+        "membership": data.get("my_membership") or {},
+    }
+
+
+def _supergroup_structured(data: dict) -> dict[str, object]:
+    return {
+        "kind": "supergroup",
+        "classification": {
+            "broadcast": False,
+            "megagroup": True,
+            "forum": data.get("has_topics"),
+        },
+        "title": data.get("name"),
+        "username": data.get("username"),
+        "members_count": data.get("members_count"),
+        "linked_broadcast_id": data.get("linked_broadcast_id"),
+        "slow_mode_seconds": data.get("slow_mode_seconds"),
+        "has_topics": data.get("has_topics"),
+        "restrictions": _restriction_payloads(data.get("restrictions"), base_path="type_specific.restrictions"),
+        "contacts_subscribed": _contacts_subscribed_structured(data),
+        "membership": data.get("my_membership") or {},
+    }
+
+
+def _group_structured(data: dict) -> dict[str, object]:
+    return {
+        "kind": "group",
+        "classification": {
+            "broadcast": False,
+            "megagroup": False,
+        },
+        "title": data.get("name"),
+        "members_count": data.get("members_count"),
+        "migrated_to": data.get("migrated_to"),
+        "invite_link": data.get("invite_link"),
+        "restrictions": _restriction_payloads(data.get("restrictions"), base_path="type_specific.restrictions"),
+        "contacts_subscribed": _contacts_subscribed_structured(data),
+        "membership": data.get("my_membership") or {},
+        "omitted_type_specific_fields": [
+            "available_reactions",
+            "has_topics",
+            "linked_broadcast_id",
+            "linked_chat_id",
+            "pinned_msg_id",
+            "slow_mode_seconds",
+        ],
+    }
+
+
 def _type_specific_structured(data: dict) -> dict[str, object]:
     entity_type = data.get("type", "unknown")
     if entity_type in ("user", "bot"):
         return _user_or_bot_structured(data)
+    if entity_type == "channel":
+        return _channel_structured(data)
+    if entity_type == "supergroup":
+        return _supergroup_structured(data)
+    if entity_type == "group":
+        return _group_structured(data)
     return {"kind": entity_type}
 
 
