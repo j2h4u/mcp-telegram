@@ -72,6 +72,8 @@ async def test_list_dialogs_renders_mentions_token() -> None:
     text = result.content[0].text
     assert " mentions=3" in text
     assert " reactions=" not in text
+    assert result.structured_content is not None
+    assert result.structured_content["dialogs"][0]["unread_mentions_count"] == 3
 
 
 @pytest.mark.asyncio
@@ -89,6 +91,8 @@ async def test_list_dialogs_renders_reactions_token() -> None:
     text = result.content[0].text
     assert " reactions=2" in text
     assert " mentions=" not in text
+    assert result.structured_content is not None
+    assert result.structured_content["dialogs"][0]["unread_reactions_count"] == 2
 
 
 @pytest.mark.asyncio
@@ -105,6 +109,8 @@ async def test_list_dialogs_renders_draft_token() -> None:
         result = await list_dialogs(ListDialogs())
     text = result.content[0].text
     assert 'draft="Hi all"' in text
+    assert result.structured_content is not None
+    assert result.structured_content["dialogs"][0]["draft_text"] == "Hi all"
 
 
 @pytest.mark.asyncio
@@ -210,6 +216,8 @@ async def test_list_dialogs_renders_bootstrap_pending_line_when_true() -> None:
         result = await list_dialogs(ListDialogs())
     text = result.content[0].text
     assert "sync in progress" in text
+    assert result.structured_content is not None
+    assert result.structured_content["bootstrap_pending"] is True
     # result_count=0 is set on the ToolResult internally; the MCP wrapper
     # returns .content (a list), so result_count is not accessible here.
     # The implementation passes result_count=0 explicitly — verified by code review.

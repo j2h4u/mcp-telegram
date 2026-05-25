@@ -406,13 +406,23 @@ async def test_list_dialogs_via_daemon():
     assert "sync_status=not_synced" in text
     assert result.structured_content is not None
     assert result.structured_content["count"] == len(result.structured_content["dialogs"])
-    assert result.structured_content["dialogs"][0] == {
-        "id": 123,
-        "name": "Alice",
-        "type": "User",
-        "unread_count": 2,
-        "synced": True,
+    assert result.structured_content["snapshot_age_h"] is None
+    assert result.structured_content["bootstrap_pending"] is False
+    assert result.structured_content["filters"] == {
+        "exclude_archived": False,
+        "ignore_pinned": False,
+        "filter": None,
     }
+    first_dialog = result.structured_content["dialogs"][0]
+    assert first_dialog["id"] == 123
+    assert first_dialog["name"] == "Alice"
+    assert first_dialog["type"] == "User"
+    assert first_dialog["unread_count"] == 2
+    assert first_dialog["sync_status"] == "synced"
+    assert first_dialog["synced"] is True
+    assert "last_message_at" in first_dialog
+    assert "sync_coverage_pct" in first_dialog
+    assert "access_lost_at" in first_dialog
     assert result.structured_content["dialogs"][1]["synced"] is False
     conn.list_dialogs.assert_called_once()
 
@@ -469,6 +479,8 @@ async def test_list_dialogs_sync_status_in_output():
         result = await list_dialogs(ListDialogs())
 
     assert "sync_status=" in result.content[0].text
+    assert result.structured_content is not None
+    assert result.structured_content["dialogs"][0]["sync_status"] == "synced"
 
 
 async def test_list_dialogs_empty_via_daemon():

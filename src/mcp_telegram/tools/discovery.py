@@ -22,6 +22,7 @@ from ._base import (
     error_result,
     mcp_tool,
 )
+from .structured import structured_warning
 
 LIST_DIALOGS_OUTPUT_SCHEMA = {
     "type": "object",
@@ -34,16 +35,70 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
                     "id": {"type": "integer"},
                     "name": {"type": ["string", "null"]},
                     "type": {"type": ["string", "null"]},
+                    "last_message_at": {"type": ["integer", "string", "null"]},
                     "unread_count": {"type": ["integer", "null"]},
+                    "sync_status": {"type": ["string", "null"]},
                     "synced": {"type": ["boolean", "null"]},
+                    "sync_coverage_pct": {"type": ["integer", "null"]},
+                    "access_lost_at": {"type": ["integer", "null"]},
+                    "members": {"type": ["integer", "null"]},
+                    "created": {"type": ["integer", "string", "null"]},
+                    "unread_in": {"type": ["integer", "null"]},
+                    "unread_out": {"type": ["integer", "null"]},
+                    "unread_mentions_count": {"type": "integer"},
+                    "unread_reactions_count": {"type": "integer"},
+                    "draft_text": {"type": ["string", "null"]},
                 },
-                "required": ["id", "name"],
-                "additionalProperties": True,
+                "required": [
+                    "id",
+                    "name",
+                    "type",
+                    "last_message_at",
+                    "unread_count",
+                    "sync_status",
+                    "synced",
+                    "sync_coverage_pct",
+                    "access_lost_at",
+                    "members",
+                    "created",
+                    "unread_in",
+                    "unread_out",
+                    "unread_mentions_count",
+                    "unread_reactions_count",
+                    "draft_text",
+                ],
+                "additionalProperties": False,
             },
         },
         "count": {"type": "integer"},
+        "filters": {
+            "type": "object",
+            "properties": {
+                "exclude_archived": {"type": "boolean"},
+                "ignore_pinned": {"type": "boolean"},
+                "filter": {"type": ["string", "null"]},
+            },
+            "required": ["exclude_archived", "ignore_pinned", "filter"],
+            "additionalProperties": False,
+        },
+        "snapshot_age_h": {"type": ["integer", "null"]},
+        "bootstrap_pending": {"type": "boolean"},
+        "warnings": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string"},
+                    "severity": {"type": "string"},
+                    "message": {"type": "string"},
+                    "action": {"type": "string"},
+                },
+                "required": ["kind", "severity", "message"],
+                "additionalProperties": False,
+            },
+        },
     },
-    "required": ["dialogs", "count"],
+    "required": ["dialogs", "count", "filters", "snapshot_age_h", "bootstrap_pending", "warnings"],
     "additionalProperties": False,
 }
 
@@ -100,6 +155,18 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
 
     data = response.get("data", {})
     dialogs = data.get("dialogs", [])
+    snapshot_age_h = data.get("snapshot_age_h")
+    bootstrap_pending = bool(data.get("bootstrap_pending", False))
+    warnings: list[dict[str, object]] = []
+    if snapshot_age_h is not None:
+        warnings.append(
+            structured_warning(
+                "snapshot_stale",
+                f"Dialog snapshot may be stale: snapshot_age_h={snapshot_age_h}.",
+                severity="warning",
+                action="Treat list_dialogs as a cached snapshot; call get_sync_status for critical dialogs.",
+            )
+        )
     structured_dialogs: list[dict[str, object]] = []
     for d in dialogs:
         sync_status = d.get("sync_status")
@@ -108,11 +175,33 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
                 "id": d.get("id"),
                 "name": d.get("name", ""),
                 "type": d.get("type"),
+                "last_message_at": d.get("last_message_at"),
                 "unread_count": d.get("unread_count"),
+                "sync_status": sync_status,
                 "synced": (sync_status == "synced") if sync_status is not None else None,
+                "sync_coverage_pct": d.get("sync_coverage_pct"),
+                "access_lost_at": d.get("access_lost_at"),
+                "members": d.get("members"),
+                "created": d.get("created"),
+                "unread_in": d.get("unread_in"),
+                "unread_out": d.get("unread_out"),
+                "unread_mentions_count": int(d.get("unread_mentions_count", 0) or 0),
+                "unread_reactions_count": int(d.get("unread_reactions_count", 0) or 0),
+                "draft_text": d.get("draft_text"),
             }
         )
-    structured_content = {"dialogs": structured_dialogs, "count": len(structured_dialogs)}
+    structured_content = {
+        "dialogs": structured_dialogs,
+        "count": len(structured_dialogs),
+        "filters": {
+            "exclude_archived": args.exclude_archived,
+            "ignore_pinned": args.ignore_pinned,
+            "filter": args.filter,
+        },
+        "snapshot_age_h": snapshot_age_h,
+        "bootstrap_pending": bootstrap_pending,
+        "warnings": warnings,
+    }
 
     if not dialogs:
         # Phase 44 (Plan 01 contract): bootstrap_pending=True => dialogs table is
@@ -120,7 +209,7 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
         # Render a sync-pending banner; bootstrap_pending=False => truly no
         # matches (e.g. caller's filter excluded all rows in a populated
         # table) -> preserve the existing no_dialogs_text behavior.
-        if data.get("bootstrap_pending"):
+        if bootstrap_pending:
             return ToolResult(
                 content=_text_response(bootstrap_pending_text()),
                 structured_content=structured_content,
@@ -198,7 +287,6 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
     # documented in daemon_api.py near _SNAPSHOT_STALE_THRESHOLD_S.
     result_count = len(lines)
 
-    snapshot_age_h = data.get("snapshot_age_h")
     if snapshot_age_h is not None:
         lines.append(f"[snapshot_age={snapshot_age_h}h — data may be stale]")
 
