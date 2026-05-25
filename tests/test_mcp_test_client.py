@@ -8,7 +8,13 @@ from pathlib import Path
 import pytest
 
 from devtools.mcp_client.cli import main, redact_script_output
-from devtools.mcp_client.client import McpClientError, StdioMcpClient, execute_script_steps, load_script_steps
+from devtools.mcp_client.client import (
+    McpClientError,
+    StdioMcpClient,
+    _assert_step_expectations,
+    execute_script_steps,
+    load_script_steps,
+)
 
 
 def _fake_server_command() -> list[str]:
@@ -100,6 +106,28 @@ async def test_mcp_test_client_script_assertions_fail() -> None:
     async with StdioMcpClient(_fake_server_command()) as client:
         with pytest.raises(McpClientError, match="missing expected text fragment"):
             await execute_script_steps(client, steps)
+
+
+def test_mcp_test_client_script_asserts_structured_paths() -> None:
+    result = {
+        "content": [{"type": "text", "text": "1 dialog"}],
+        "isError": False,
+        "structuredContent": {
+            "dialogs": [{"id": 123, "name": "Alice"}],
+            "count": 1,
+        },
+    }
+
+    _assert_step_expectations(
+        index=1,
+        action="call_tool",
+        result=result,
+        expect={
+            "path_exists": ["structuredContent.dialogs.0.name"],
+            "path_not_exists": ["structuredContent.dialogs.0.missing"],
+            "path_nonempty": ["structuredContent.dialogs"],
+        },
+    )
 
 
 @pytest.mark.asyncio

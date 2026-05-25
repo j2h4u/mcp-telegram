@@ -294,6 +294,10 @@ def _assert_step_expectations(
                     f"script step {index} expected path {path!r} to equal {expected_value!r}, got {actual_value!r}"
                 )
 
+    _assert_path_exists(index=index, result=result, expected=expect.get("path_exists"), should_exist=True)
+    _assert_path_exists(index=index, result=result, expected=expect.get("path_not_exists"), should_exist=False)
+    _assert_path_nonempty(index=index, result=result, expected=expect.get("path_nonempty"))
+
     if action == "list_tools":
         _assert_list_tools_expectations(index=index, result=result, expect=expect)
     elif action == "call_tool":
@@ -393,6 +397,49 @@ def _assert_text_membership(
             raise McpClientError(f"script step {index} is missing expected text fragment: {item!r}")
 
 
+def _assert_path_list(index: int, field_name: str, expected: Any) -> list[str] | None:
+    if expected is None:
+        return None
+    if not isinstance(expected, list) or not all(isinstance(item, str) and item for item in expected):
+        raise ValueError(f"script step {index} field 'expect.{field_name}' must be a list of non-empty strings")
+    return expected
+
+
+def _assert_path_exists(*, index: int, result: Any, expected: Any, should_exist: bool) -> None:
+    field_name = "path_exists" if should_exist else "path_not_exists"
+    paths = _assert_path_list(index, field_name, expected)
+    if paths is None:
+        return
+
+    for path in paths:
+        found, _value, _error = _try_lookup_path(result, path)
+        if should_exist and not found:
+            raise McpClientError(f"script step {index} expected path {path!r} to exist")
+        if not should_exist and found:
+            raise McpClientError(f"script step {index} expected path {path!r} not to exist")
+
+
+def _assert_path_nonempty(*, index: int, result: Any, expected: Any) -> None:
+    paths = _assert_path_list(index, "path_nonempty", expected)
+    if paths is None:
+        return
+
+    for path in paths:
+        found, value, _error = _try_lookup_path(result, path)
+        if not found:
+            raise McpClientError(f"script step {index} expected path {path!r} to exist and be non-empty")
+        if not _is_nonempty_path_value(value):
+            raise McpClientError(f"script step {index} expected path {path!r} to be non-empty")
+
+
+def _is_nonempty_path_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str | list | dict | tuple | set):
+        return bool(value)
+    return True
+
+
 def _extract_text_content(result: dict[str, Any]) -> str:
     content = result.get("content")
     if not isinstance(content, list):
@@ -407,25 +454,30 @@ def _extract_text_content(result: dict[str, Any]) -> str:
 
 
 def _lookup_path(payload: Any, path: str) -> Any:
-    current = payload
+    found, value, error = _try_lookup_path(payload, path)
+    if found:
+        return value
+    raise McpClientError(error or f"missing path {path!r}")
+
+
+def _try_lookup_path(payload: Any, path: str) -> tuple[bool, Any, str | None]:
+    current: Any = payload
     for segment in path.split("."):
         if isinstance(current, list):
-            try:
-                index = int(segment)
-            except ValueError as exc:
-                raise McpClientError(f"cannot use non-numeric segment {segment!r} on list path {path!r}") from exc
-            try:
-                current = current[index]
-            except IndexError as exc:
-                raise McpClientError(f"list index {index} out of range for path {path!r}") from exc
+            if not segment.isdecimal():
+                return False, None, f"cannot use non-numeric segment {segment!r} on list path {path!r}"
+            index = int(segment)
+            if index >= len(current):
+                return False, None, f"list index {index} out of range for path {path!r}"
+            current = current[index]
             continue
 
         if isinstance(current, dict):
             if segment not in current:
-                raise McpClientError(f"missing path segment {segment!r} in path {path!r}")
+                return False, None, f"missing path segment {segment!r} in path {path!r}"
             current = current[segment]
             continue
 
-        raise McpClientError(f"cannot descend into non-container value at segment {segment!r} for path {path!r}")
+        return False, None, f"cannot descend into non-container value at segment {segment!r} for path {path!r}"
 
-    return current
+    return True, current, None
