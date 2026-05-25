@@ -8,6 +8,7 @@ __pycache__
 .claude/
 .hypothesis/
 .planning/
+graphify-out/
 
 # Test artefacts: MagicMock paths leaked to cwd by tests that mock get_sync_db_path()
 *MagicMock*
