@@ -243,25 +243,10 @@ def test_list_tools_exposes_list_dialogs_output_schema() -> None:
     assert "count" in tool.outputSchema["required"]
 
 
-def test_list_tools_structured_output_schema_surface_is_explicit() -> None:
+def test_all_registered_tools_declare_output_schema() -> None:
     schema_tools = {name for name, tool in server.tool_by_name.items() if tool.outputSchema is not None}
 
-    assert schema_tools == {
-        "list_dialogs",
-        "list_topics",
-        "list_messages",
-        "search_messages",
-        "mark_dialog_for_sync",
-        "get_sync_status",
-        "get_sync_alerts",
-        "get_inbox",
-        "get_my_recent_activity",
-        "get_usage_stats",
-        "get_dialog_stats",
-        "get_entity_info",
-        "submit_feedback",
-        "trace_account_messages",
-    }
+    assert schema_tools == set(server.tool_by_name)
 
 
 def test_list_tools_exposes_account_trace_schema_and_title() -> None:

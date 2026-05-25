@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from mcp.types import CallToolResult, TextContent
 
+from mcp_telegram import server
 from mcp_telegram.tools import (
     TOOL_REGISTRY,
     GetEntityInfo,
@@ -411,10 +412,11 @@ STRUCTURED_TOOL_CASES = {
 }
 
 
-@pytest.mark.parametrize("tool_name", sorted(STRUCTURED_TOOL_CASES))
-async def test_schema_bearing_tools_return_structured_content_and_text(tool_name: str):
-    schema_tools = {name for name, entry in TOOL_REGISTRY.items() if entry.output_schema is not None}
-    assert set(STRUCTURED_TOOL_CASES) == schema_tools
+@pytest.mark.parametrize("tool_name", sorted(server.tool_by_name))
+async def test_registered_tools_return_structured_content_and_text(tool_name: str):
+    assert set(STRUCTURED_TOOL_CASES) == set(server.tool_by_name)
+    assert TOOL_REGISTRY[tool_name].output_schema is not None
+
     runner, args, response = STRUCTURED_TOOL_CASES[tool_name]
     conn = _make_daemon_conn(response)
 
