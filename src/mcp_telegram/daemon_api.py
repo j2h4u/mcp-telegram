@@ -4389,7 +4389,7 @@ class DaemonAPIServer:
         return {"ok": True, "data": detail}
 
     @staticmethod
-    def _strip_envelope_schema(detail: dict) -> dict:
+    def _strip_envelope_schema(detail: dict[str, Any]) -> dict[str, Any]:
         """Remove the internal 'schema' discriminator before returning to the wire.
 
         The 'schema' field is a write-back implementation detail; clients see
@@ -4397,7 +4397,7 @@ class DaemonAPIServer:
         """
         return {k: v for k, v in detail.items() if k != "schema"}
 
-    async def _fetch_user_detail(self, user) -> dict:
+    async def _fetch_user_detail(self, user: Any) -> dict[str, Any]:
         """Per-type helper: User/Bot detail. Per CONTEXT D-07, body refactored
         verbatim from the prior _fetch_user_detail except for the resolution
         prelude (orchestrator passes an already-resolved entity).
@@ -4634,7 +4634,7 @@ class DaemonAPIServer:
             "_full_fetch_ok": full_user_ok,
         }
 
-    async def _search_chat_photo_history(self, peer, full_chat) -> tuple[list[dict], int]:
+    async def _search_chat_photo_history(self, peer: Any, full_chat: Any) -> tuple[list[dict[str, Any]], int]:
         """Avatar history via messages.Search(filter=ChatPhotos), with the
         D-19 broadcast-channel reconciliation (prepend full.chat_photo if
         missing) and D-20 fallback (degrade to chat_photo-only on RPC error).
@@ -4722,7 +4722,7 @@ class DaemonAPIServer:
 
         return avatar_history, avatar_count
 
-    async def _fetch_channel_detail(self, channel) -> dict:
+    async def _fetch_channel_detail(self, channel: Any) -> dict[str, Any]:
         """Per-type helper: Broadcast Channel detail (megagroup=False).
 
         Per CONTEXT D-09 / D-21: max 6 MTProto requests on the non-User path
@@ -4921,7 +4921,7 @@ class DaemonAPIServer:
             "_full_fetch_ok": full_channel_ok,
         }
 
-    def _enrich_contact_ids_with_names(self, ids: set[int]) -> list[dict]:
+    def _enrich_contact_ids_with_names(self, ids: set[int]) -> list[dict[str, Any]]:
         """Resolve a set of entity ids to {id, name, username} dicts via JOIN
         on the entities table. Per CONTEXT D-14: ids alone aren't useful for
         the LLM; names are.
@@ -4944,7 +4944,7 @@ class DaemonAPIServer:
             out.append({"id": missing_id, "name": None, "username": None})
         return sorted(out, key=lambda d: ((d["name"] or ""), d["id"]))
 
-    async def _fetch_supergroup_detail(self, channel) -> dict:
+    async def _fetch_supergroup_detail(self, channel: Any) -> dict[str, Any]:
         """Per-type helper: Supergroup (Channel.megagroup=True). Forum
         supergroups (forum=True) also route here per CONTEXT D-09 / SPEC Req 6.
 
@@ -5126,7 +5126,7 @@ class DaemonAPIServer:
             "_full_fetch_ok": full_channel_ok,
         }
 
-    async def _fetch_group_detail(self, chat) -> dict:
+    async def _fetch_group_detail(self, chat: Any) -> dict[str, Any]:
         """Per-type helper: legacy basic Chat (Telethon Chat, not Channel).
 
         Per CONTEXT D-16: legacy basic groups always expose their participant

@@ -36,9 +36,17 @@ runtime-wait:
     done; \
     exit 1
 
-# Run the redacted MCP integration smoke against the live container.
-runtime-smoke:
+# Run the redacted stdio MCP integration smoke against the live container.
+runtime-smoke-stdio:
     uv run python -m devtools.mcp_client.cli script --redact --file devtools/mcp_client/smoke-integration.json -- {{mcp_command}}
+
+# Run an HTTP MCP smoke against the live container.
+runtime-smoke-http:
+    uv run python -m devtools.mcp_client.cli list-tools --url http://127.0.0.1:3100/mcp > /tmp/mcp-telegram-http-tools.json
+    count="$(jq 'length' /tmp/mcp-telegram-http-tools.json)"; echo "http_tool_count $count"; test "$count" -gt 0
+
+# Run MCP smoke tests against the live container.
+runtime-smoke: runtime-smoke-stdio runtime-smoke-http
 
 # Rebuild the live container and run the redacted MCP smoke.
 runtime-verify: runtime-build runtime-wait runtime-smoke

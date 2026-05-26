@@ -78,6 +78,10 @@ class ToolResult:
     has_filter: bool = False
 
 
+ToolArgT = t.TypeVar("ToolArgT", bound=ToolArgs)
+type ToolRunnerFunc[TToolArg: ToolArgs] = t.Callable[[TToolArg], t.Coroutine[t.Any, t.Any, ToolResult]]
+
+
 @dataclass(frozen=True)
 class ToolRegistryEntry:
     cls: type[ToolArgs]
@@ -108,10 +112,10 @@ def error_result(text: str, **metadata: t.Any) -> ToolResult:
 
 
 # Strong references to fire-and-forget tasks prevent GC before completion.
-_background_tasks: set[asyncio.Task] = set()
+_background_tasks: set[asyncio.Task[None]] = set()
 
 
-async def _send_telemetry_event(event_dict: dict) -> None:
+async def _send_telemetry_event(event_dict: dict[str, t.Any]) -> None:
     """Fire-and-forget: send telemetry to daemon. Never raises."""
     try:
         async with daemon_connection() as conn:
@@ -128,15 +132,15 @@ def _telemetry_done_callback(task: asyncio.Task[None]) -> None:
         logger.warning("telemetry_event_failed error=%s", exc)
 
 
-def _track_tool_telemetry(tool_name: str):
+def _track_tool_telemetry(tool_name: str) -> t.Callable[[ToolRunnerFunc[ToolArgT]], ToolRunnerFunc[ToolArgT]]:
     """Decorator that wraps an async tool runner with timing + telemetry recording.
 
     Applied automatically by @mcp_tool() — do not use directly.
     """
 
-    def decorator(fn):
+    def decorator(fn: ToolRunnerFunc[ToolArgT]) -> ToolRunnerFunc[ToolArgT]:
         @functools.wraps(fn)
-        async def wrapper(args):
+        async def wrapper(args: ToolArgT) -> ToolResult:
             logger.debug("method[%s]", tool_name)
             start_time = time.monotonic()
             error_type = None
@@ -177,7 +181,7 @@ def _track_tool_telemetry(tool_name: str):
 
 @singledispatch
 async def tool_runner(
-    args,
+    args: ToolArgs,
 ) -> ToolResult:
     """Dispatch a ToolArgs instance to its registered async handler."""
     raise NotImplementedError(f"Unsupported type: {type(args)}")
@@ -202,7 +206,7 @@ def mcp_tool(
     posture: str = "primary",
     annotations: ToolAnnotations | None = None,
     output_schema: dict[str, t.Any] | None = None,
-):
+) -> t.Callable[[ToolRunnerFunc[ToolArgT]], ToolRunnerFunc[ToolArgT]]:
     """Register runner with singledispatch + telemetry + tool registry.
 
     ``posture`` is a free-form label prepended to the tool description so the
@@ -230,9 +234,12 @@ def mcp_tool(
         async def my_tool(args: MyTool) -> ToolResult: ...
     """
 
-    def decorator(fn):
+    def decorator(fn: ToolRunnerFunc[ToolArgT]) -> ToolRunnerFunc[ToolArgT]:
         hints = t.get_type_hints(fn)
-        cls = hints["args"]
+        cls_obj = hints["args"]
+        if not isinstance(cls_obj, type) or not issubclass(cls_obj, ToolArgs):
+            raise TypeError("@mcp_tool runner must annotate args with a ToolArgs subclass")
+        cls: type[ToolArgs] = cls_obj
         exported_name = name
         exported_title = title
         exported_posture = posture
@@ -310,7 +317,7 @@ def _sanitize_tool_schema(value: t.Any) -> t.Any:
     return value
 
 
-def tool_args(tool: Tool, *args, **kwargs) -> ToolArgs:
+def tool_args(tool: Tool, *args: t.Any, **kwargs: t.Any) -> ToolArgs:
     """Instantiate the ToolArgs subclass registered for *tool*."""
     entry = TOOL_REGISTRY.get(tool.name)
     if entry is None:
