@@ -105,6 +105,7 @@ def candidate_message(
             sender_first_name=None,
             media_description=None,
             reply_to_msg_id=None,
+            reply_count=0,
             forum_topic_id=None,
             edit_date=edit_date,
             grouped_id=None,

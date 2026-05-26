@@ -33,11 +33,14 @@ GET_MY_RECENT_ACTIVITY_OUTPUT_SCHEMA = {
                 "properties": {
                     "dialog_id": {"type": "integer"},
                     "dialog_name": {"type": ["string", "null"]},
+                    "dialog_type": {"type": "string"},
+                    "dialog_category": {"type": "string"},
                     "message_id": {"type": "integer"},
                     "sent_at": {"type": ["integer", "null"]},
                     "text": {"type": "string"},
                     "content": {"type": "object"},
                     "sync_status": {"type": ["string", "null"]},
+                    "reply_count": {"type": "integer"},
                     "reactions": {"type": "array", "items": {"type": "object"}},
                     "navigation": {
                         "type": "object",
@@ -61,11 +64,14 @@ GET_MY_RECENT_ACTIVITY_OUTPUT_SCHEMA = {
                 "required": [
                     "dialog_id",
                     "dialog_name",
+                    "dialog_type",
+                    "dialog_category",
                     "message_id",
                     "sent_at",
                     "text",
                     "content",
                     "sync_status",
+                    "reply_count",
                     "reactions",
                     "navigation",
                 ],
@@ -96,6 +102,8 @@ class GetMyRecentActivity(ToolArgs):
 
     Per-comment granularity: if you sent 3 messages in the same group,
     the response contains 3 separate blocks (not one collapsed entry).
+    Each comment includes dialog_type/dialog_category plus aggregate
+    reply_count and reactions for prioritising follow-up.
 
     Use `scan_status` to distinguish `never_run` (archive empty — backfill
     has not completed yet) from `complete` + empty result (you were quiet).
@@ -122,11 +130,14 @@ def _structured_comment(comment: dict[str, Any]) -> dict[str, object]:
     return {
         "dialog_id": dialog_id,
         "dialog_name": comment.get("dialog_name"),
+        "dialog_type": str(comment.get("dialog_type") or "unknown"),
+        "dialog_category": str(comment.get("dialog_category") or "unknown"),
         "message_id": message_id,
         "sent_at": comment.get("sent_at"),
         "text": text,
         "content": telegram_content(text, "message_text"),
         "sync_status": comment.get("sync_status"),
+        "reply_count": int(comment.get("reply_count") or 0),
         "reactions": comment.get("reactions") or [],
         "navigation": {
             "text": f"nav: dialog_id={dialog_id} message_id={message_id}",

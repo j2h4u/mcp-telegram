@@ -7,7 +7,7 @@ from pathlib import Path
 
 from xdg_base_dirs import xdg_state_home  # type: ignore[import-error]
 
-_CURRENT_SCHEMA_VERSION = 21
+_CURRENT_SCHEMA_VERSION = 22
 
 logger = logging.getLogger(__name__)
 
@@ -749,6 +749,17 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             _TRACE_COVERAGE_FRAGMENTS_DDL,
             _TRACE_COVERAGE_TARGET_STATUS_INDEX_DDL,
         ],
+    )
+
+    # v22: persist Telegram's aggregate reply/comment counter on message rows.
+    # Telethon exposes this as Message.replies.replies. It is a count of replies,
+    # not a unique replier count; historical rows default to 0 until refreshed.
+    _migrate(
+        22,
+        [
+            "ALTER TABLE messages ADD COLUMN reply_count INTEGER NOT NULL DEFAULT 0",
+        ],
+        ignore_duplicate_column=True,
     )
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)

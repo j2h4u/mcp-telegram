@@ -66,6 +66,7 @@ class StoredMessage:
     sender_first_name: str | None
     media_description: str | None
     reply_to_msg_id: int | None
+    reply_count: int
     forum_topic_id: int | None
     edit_date: int | None
     grouped_id: int | None
@@ -259,6 +260,17 @@ def extract_reply_and_topic(msg: Any) -> tuple[int | None, int | None]:
         reply_top_id = getattr(reply_to, "reply_to_reply_top_id", None)
         forum_topic_id = int(reply_top_id) if reply_top_id is not None else 1
     return reply_to_msg_id, forum_topic_id
+
+
+def extract_reply_count(msg: Any) -> int:
+    """Extract Telegram's aggregate reply/comment count from a message."""
+    replies = getattr(msg, "replies", None)
+    if replies is None:
+        return 0
+    raw_count = getattr(replies, "replies", None)
+    if isinstance(raw_count, int) and not isinstance(raw_count, bool):
+        return max(0, raw_count)
+    return 0
 
 
 def extract_reactions_rows(dialog_id: int, message_id: int, reactions: Any | None) -> list[ReactionRecord]:
@@ -542,6 +554,7 @@ def extract_message_row(dialog_id: int, msg: Any, entity_name_map: dict[int, str
     media_description: str | None = type(media).__name__ if media is not None else None
 
     reply_to_msg_id, forum_topic_id = extract_reply_and_topic(msg)
+    reply_count = extract_reply_count(msg)
 
     # -- New v7 columns --
     edit_date_raw = getattr(msg, "edit_date", None)
@@ -576,6 +589,7 @@ def extract_message_row(dialog_id: int, msg: Any, entity_name_map: dict[int, str
         sender_first_name=sender_first_name,
         media_description=media_description,
         reply_to_msg_id=reply_to_msg_id,
+        reply_count=reply_count,
         forum_topic_id=forum_topic_id,
         edit_date=edit_date,
         grouped_id=grouped_id,

@@ -1094,6 +1094,7 @@ _TRACE_MESSAGE_BASE_FIELDS = (
     "sender_first_name",
     "media_description",
     "reply_to_msg_id",
+    "reply_count",
     "forum_topic_id",
     "edit_date",
     "grouped_id",
@@ -2178,6 +2179,7 @@ class DaemonAPIServer:
 
         changes = [self._source_row_to_change(row) for row in [*identity_rows, *update_rows]]
 
+        checkpoint_cursor: str | None
         if identity_rows:
             checkpoint_cursor = self._source_cursor(
                 int(identity_rows[-1]["dialog_id"]),
@@ -2187,6 +2189,8 @@ class DaemonAPIServer:
             cursor_value = req.get("cursor")
             checkpoint_cursor = cursor_value if isinstance(cursor_value, str) else None
 
+        updated_after: str | None
+        updated_after_cursor_out: str | None
         if update_rows:
             max_update_epoch = max(int(row["unit_updated_epoch"]) for row in update_rows)
             updated_after = self._source_iso(max_update_epoch)
@@ -2203,7 +2207,7 @@ class DaemonAPIServer:
                 updated_after_cursor_value if isinstance(updated_after_cursor_value, str) else None
             )
 
-        next_cursor = None
+        next_cursor: str | None = None
         if identity_rows and has_more_identity:
             next_cursor = self._source_cursor(
                 int(identity_rows[-1]["dialog_id"]),
@@ -5762,6 +5766,15 @@ class DaemonAPIServer:
     # get_my_recent_activity
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _activity_dialog_category(dialog_type: str | None) -> str:
+        normalized = (dialog_type or "unknown").strip().lower()
+        if normalized in {"user", "bot", "channel"}:
+            return normalized
+        if normalized in {"group", "supergroup", "forum", "chat"}:
+            return "group"
+        return "unknown"
+
     async def _get_my_recent_activity(self, req: dict) -> dict:
         """Read own outgoing messages (out=1, non-service, non-deleted) with scan_status context.
 
@@ -5769,7 +5782,8 @@ class DaemonAPIServer:
 
         Request: since_hours (int, 1–8760, default 168), limit (int, 1–2000, default 500).
         Response: {"ok": True, "data": {"comments": [...], "scan_status": str, "scanned_at": int|None}}
-        Each comment: {"dialog_id", "message_id", "sent_at", "text", "dialog_name"}
+        Each comment includes dialog identity/type, message identity/time/text,
+        sync status, reply_count, and reaction counters.
         dialog_name falls back to str(dialog_id) when no entities row exists.
         scan_status: "never_run" if backfill_started_at IS NULL (daemon never ran the loop),
                      "in_progress" if backfill_started_at IS NOT NULL but backfill_complete != '1',
@@ -5796,9 +5810,17 @@ class DaemonAPIServer:
             "SELECT m.dialog_id AS dialog_id, m.message_id AS message_id, "
             "       m.sent_at AS sent_at, m.text AS text, "
             "       e.name AS dialog_name, "
+            "       CASE "
+            "         WHEN lower(COALESCE(e.type, '')) = 'bot' THEN 'bot' "
+            "         WHEN d.type IS NOT NULL AND d.type != '' THEN d.type "
+            "         WHEN e.type IS NOT NULL AND e.type != '' THEN e.type "
+            "         ELSE 'unknown' "
+            "       END AS dialog_type, "
+            "       COALESCE(m.reply_count, 0) AS reply_count, "
             "       sd.status AS sync_status "
             "FROM messages m "
             "LEFT JOIN entities e ON e.id = m.dialog_id "
+            "LEFT JOIN dialogs d ON d.dialog_id = m.dialog_id "
             "LEFT JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id "
             # out=1: authored by the account owner.
             # is_service=0: exclude join/leave/group-created system events
@@ -5852,7 +5874,10 @@ class DaemonAPIServer:
                 "sent_at": r[2],
                 "text": r[3],
                 "dialog_name": r[4] if r[4] else str(r[0]),
-                "sync_status": r[5],
+                "dialog_type": r[5],
+                "dialog_category": self._activity_dialog_category(r[5]),
+                "reply_count": r[6],
+                "sync_status": r[7],
                 "reactions": reactions_by_msg.get((r[0], r[1]), []),
             }
             for r in rows

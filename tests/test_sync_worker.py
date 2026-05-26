@@ -1655,6 +1655,29 @@ def test_extract_message_row_insert_roundtrip_preserves_out_and_is_service(
     assert row == (1, 0)
 
 
+def test_extract_message_row_persists_reply_count(sync_db: sqlite3.Connection) -> None:
+    """Telegram Message.replies.replies is stored as messages.reply_count."""
+    from mcp_telegram.sync_worker import extract_message_row, insert_messages_with_fts
+
+    dialog_id = 42
+    sync_db.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')",
+        (dialog_id,),
+    )
+    sync_db.commit()
+
+    msg = build_mock_message(id=778, reply_count=3)
+    em = extract_message_row(dialog_id, msg)
+    with sync_db:
+        insert_messages_with_fts(sync_db, [em])
+
+    row = sync_db.execute(
+        "SELECT reply_count FROM messages WHERE dialog_id=? AND message_id=?",
+        (dialog_id, 778),
+    ).fetchone()
+    assert row == (3,)
+
+
 def _stored(dialog_id: int, message_id: int, text: str = "hello") -> StoredMessage:
     return StoredMessage(
         dialog_id=dialog_id,
@@ -1665,6 +1688,7 @@ def _stored(dialog_id: int, message_id: int, text: str = "hello") -> StoredMessa
         sender_first_name="Alice",
         media_description=None,
         reply_to_msg_id=None,
+        reply_count=0,
         forum_topic_id=None,
         edit_date=None,
         grouped_id=None,

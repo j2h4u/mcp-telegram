@@ -93,7 +93,7 @@ def _msg(msg_id: int, user_id: int, ts: int, text: str = "hi", replies: int = 0,
 @pytest.mark.asyncio
 async def test_backfill_inserts_rows(tmp_path):
     conn = _make_db(tmp_path)
-    m1 = _msg(100, 42, 1_700_000_100)
+    m1 = _msg(100, 42, 1_700_000_100, replies=2)
     m2 = _msg(99, 42, 1_700_000_090)
     client = _FakeClient(batches=[
         FakeSearchResult(messages=[m1, m2]),
@@ -103,10 +103,10 @@ async def test_backfill_inserts_rows(tmp_path):
     await _run_backfill(client, conn, shutdown)
 
     rows = conn.execute(
-        "SELECT message_id, dialog_id, sent_at, out FROM messages "
+        "SELECT message_id, dialog_id, sent_at, out, reply_count FROM messages "
         "WHERE out = 1 ORDER BY message_id"
     ).fetchall()
-    assert rows == [(99, 42, 1_700_000_090, 1), (100, 42, 1_700_000_100, 1)]
+    assert rows == [(99, 42, 1_700_000_090, 1, 0), (100, 42, 1_700_000_100, 1, 2)]
     state = dict(conn.execute("SELECT key, value FROM activity_sync_state").fetchall())
     assert state["backfill_complete"] == "1"
     assert state["last_sync_at"] is not None

@@ -113,6 +113,7 @@ def test_messages_schema(tmp_sync_db_path: Path) -> None:
             "sender_first_name",
             "media_description",
             "reply_to_msg_id",
+            "reply_count",
             "forum_topic_id",
             "is_deleted",
             "deleted_at",
@@ -1230,6 +1231,14 @@ def test_schema_v15_drops_message_cache_permanently(tmp_path: Path) -> None:
         assert "message_cache" not in tables
 
 
+def test_messages_table_has_reply_count(tmp_sync_db_path: Path) -> None:
+    """v22 adds messages.reply_count for Telegram reply/comment counters."""
+    ensure_sync_schema(tmp_sync_db_path)
+    with sqlite3.connect(tmp_sync_db_path) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()}
+    assert "reply_count" in columns
+
+
 def test_migration_v15_copies_own_only_into_messages(tmp_path: Path) -> None:
     """v15 copies activity_comments rows into messages with out=1."""
     db_path = tmp_path / "sync.db"
@@ -1602,8 +1611,8 @@ def test_schema_version_is_current(tmp_sync_db_path: Path) -> None:
         assert row is not None and int(row[0]) == _CURRENT_SCHEMA_VERSION, (
             f"Expected schema version {_CURRENT_SCHEMA_VERSION}, got {row}"
         )
-        assert _CURRENT_SCHEMA_VERSION == 21, (
-            f"_CURRENT_SCHEMA_VERSION must be 21, got {_CURRENT_SCHEMA_VERSION}"
+        assert _CURRENT_SCHEMA_VERSION == 22, (
+            f"_CURRENT_SCHEMA_VERSION must be 22, got {_CURRENT_SCHEMA_VERSION}"
         )
     finally:
         conn.close()

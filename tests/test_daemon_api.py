@@ -92,6 +92,7 @@ def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.
             sender_first_name   TEXT,
             media_description   TEXT,
             reply_to_msg_id     INTEGER,
+            reply_count         INTEGER NOT NULL DEFAULT 0,
             forum_topic_id      INTEGER,
             is_deleted          INTEGER NOT NULL DEFAULT 0,
             deleted_at          INTEGER,
@@ -250,6 +251,15 @@ def _make_db_with_activity() -> sqlite3.Connection:
             username        TEXT,
             name_normalized TEXT,
             updated_at      INTEGER NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS dialogs (
+            dialog_id               INTEGER PRIMARY KEY,
+            name                    TEXT,
+            type                    TEXT
         )
         """
     )
@@ -4877,7 +4887,7 @@ async def test_get_my_recent_activity_returns_latest_page_chronologically() -> N
 
 @pytest.mark.asyncio
 async def test_get_my_recent_activity_joins_dialog_name() -> None:
-    """dialog_name is populated from entities table via LEFT JOIN."""
+    """dialog_name/type/category/reply_count are populated for own-message activity."""
     server = make_server(_make_db_with_activity())
     now = int(time.time())
     with server._conn:
@@ -4887,16 +4897,22 @@ async def test_get_my_recent_activity_joins_dialog_name() -> None:
             (now,),
         )
         server._conn.execute(
+            "INSERT OR REPLACE INTO dialogs (dialog_id, name, type) VALUES (42, 'My Group', 'supergroup')"
+        )
+        server._conn.execute(
             "INSERT INTO messages "
-            "(dialog_id, message_id, sent_at, text, out, is_service, is_deleted) "
-            "VALUES (42, 1, ?, 'hi', 1, 0, 0)",
+            "(dialog_id, message_id, sent_at, text, out, is_service, is_deleted, reply_count) "
+            "VALUES (42, 1, ?, 'hi', 1, 0, 0, 4)",
             (now - 60,),
         )
         server._conn.execute("UPDATE activity_sync_state SET value='1' WHERE key='backfill_complete'")
         server._conn.execute(f"UPDATE activity_sync_state SET value='{now}' WHERE key='last_sync_at'")
     resp = await server._dispatch({"method": "get_my_recent_activity"})
-    names = [c["dialog_name"] for c in resp["data"]["comments"]]
-    assert names == ["My Group"]
+    comment = resp["data"]["comments"][0]
+    assert comment["dialog_name"] == "My Group"
+    assert comment["dialog_type"] == "supergroup"
+    assert comment["dialog_category"] == "group"
+    assert comment["reply_count"] == 4
 
 
 @pytest.mark.asyncio

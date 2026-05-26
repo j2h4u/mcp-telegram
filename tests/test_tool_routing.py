@@ -2577,6 +2577,8 @@ async def test_get_my_recent_activity_routes_primary():
                         "reactions": None,
                         "reply_count": 2,
                         "dialog_name": "MyGroup",
+                        "dialog_type": "supergroup",
+                        "dialog_category": "group",
                     },
                     {
                         "dialog_id": 42,
@@ -2586,6 +2588,8 @@ async def test_get_my_recent_activity_routes_primary():
                         "reactions": None,
                         "reply_count": 0,
                         "dialog_name": "MyGroup",
+                        "dialog_type": "supergroup",
+                        "dialog_category": "group",
                     },
                 ],
                 "scan_status": "complete",
@@ -2604,7 +2608,10 @@ async def test_get_my_recent_activity_routes_primary():
     assert result.structured_content["count"] == 2
     first_comment = result.structured_content["comments"][0]
     assert first_comment["dialog_id"] == 42
+    assert first_comment["dialog_type"] == "supergroup"
+    assert first_comment["dialog_category"] == "group"
     assert first_comment["message_id"] == 100
+    assert first_comment["reply_count"] == 0
     assert first_comment["content"]["is_telegram_content"] is True
     assert first_comment["content"]["content_kind"] == "message_text"
     assert first_comment["navigation"] == {

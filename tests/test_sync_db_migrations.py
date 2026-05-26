@@ -324,7 +324,7 @@ def test_schema_version_records_current_v18(tmp_path: Path) -> None:
             "SELECT MAX(version) FROM schema_version"
         ).fetchone()[0]
         assert max_version == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 21  # Phase 51 lock — flips when next migration ships
+        assert _CURRENT_SCHEMA_VERSION == 22  # Phase 52 follow-up lock — flips when next migration ships
     finally:
         conn.close()
 
@@ -547,6 +547,16 @@ def test_migration_v21_runs_from_v20_database(tmp_path: Path) -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE messages (
+                dialog_id  INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                sent_at    INTEGER NOT NULL,
+                PRIMARY KEY (dialog_id, message_id)
+            ) WITHOUT ROWID
+            """
+        )
         conn.execute("INSERT INTO schema_version VALUES (20, 1700000000)")
         conn.commit()
 
@@ -558,7 +568,9 @@ def test_migration_v21_runs_from_v20_database(tmp_path: Path) -> None:
             "SELECT name FROM sqlite_master "
             "WHERE type='table' AND name='trace_coverage_fragments'"
         ).fetchone() == ("trace_coverage_fragments",)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()}
+        assert "reply_count" in columns
         max_version = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
-        assert max_version == 21
+        assert max_version == 22
     finally:
         conn.close()

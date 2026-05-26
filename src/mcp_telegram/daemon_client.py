@@ -512,6 +512,9 @@ async def daemon_connection(
     except OSError as exc:
         raise DaemonNotRunningError("Sync daemon is not running. Start it with: mcp-telegram sync") from exc
 
+    if reader is None or writer is None:
+        raise DaemonNotRunningError("Sync daemon connection was not established. Restart it with: mcp-telegram sync")
+
     try:
         yield DaemonConnection(reader, writer, timeout_seconds=timeout_seconds)
     finally:

@@ -15,6 +15,7 @@ def build_mock_message(
     reply_to_msg_id: int | None = None,
     forum_topic: bool = False,
     reply_to_top_id: int | None = None,
+    reply_count: int = 0,
     reactions: object | None = None,
     edit_date: datetime | None = None,
 ) -> SimpleNamespace:
@@ -37,6 +38,7 @@ def build_mock_message(
         sender=sender,
         media=media,
         reply_to=reply_to_obj,
+        replies=SimpleNamespace(replies=reply_count) if reply_count else None,
         reactions=reactions,
         edit_date=edit_date,
     )
