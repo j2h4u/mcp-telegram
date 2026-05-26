@@ -249,6 +249,8 @@ def test_list_messages_structured_page_metadata_preserves_navigation_warning_cov
     assert payload["navigation"]["next_navigation"] == "history-token"
     assert payload["navigation"]["anchor_message_id"] == 50
     assert payload["navigation"]["direction_input"] == "oldest"
+    assert payload["presentation"]["messages_order"] == "chronological"
+    assert payload["presentation"]["is_chronological"] is True
     assert payload["limits"] == {
         "requested_limit": 10,
         "applied_limit": 0,
@@ -258,6 +260,56 @@ def test_list_messages_structured_page_metadata_preserves_navigation_warning_cov
     assert payload["count"] == 0
     assert payload["result_count_semantics"] == "count is the number of message rows returned in this response page"
     assert payload["read_state"]["header_lines"] == ["[read-state: all caught up]"]
+
+
+def test_list_messages_always_presents_selected_page_chronologically_with_reply_refs():
+    rows = [
+        {
+            "message_id": 3,
+            "sent_at": 1_700_000_120,
+            "dialog_id": 123,
+            "text": "newest reply",
+            "sender_first_name": "Bob",
+            "sender_id": 22,
+            "reply_to_msg_id": 2,
+        },
+        {
+            "message_id": 2,
+            "sent_at": 1_700_000_060,
+            "dialog_id": 123,
+            "text": "middle parent",
+            "sender_first_name": "Alice",
+            "sender_id": 11,
+        },
+        {
+            "message_id": 1,
+            "sent_at": 1_700_000_000,
+            "dialog_id": 123,
+            "text": "oldest in latest page",
+            "sender_first_name": "Alice",
+            "sender_id": 11,
+        },
+    ]
+
+    payload = _list_messages_structured_content(
+        args=ListMessages(exact_dialog_id=123, navigation="newest"),
+        data={"messages": rows, "source": "sync_db", "next_navigation": "history-token"},
+        rows=rows,
+        dialog_id=123,
+        sender_id=None,
+        sender_name=None,
+        topic_id=None,
+        direction="newest",
+        next_navigation="history-token",
+    )
+
+    assert [message["msg_id"] for message in payload["messages"]] == [1, 2, 3]
+    assert payload["presentation"]["messages_order"] == "chronological"
+    assert payload["presentation"]["is_chronological"] is True
+    reply = payload["messages"][2]
+    assert reply["reply_to_msg_id"] == 2
+    assert reply["reply_context_ref"] == {"msg_id": 2, "in_page": True, "context_included": False}
+    assert reply["reply_context"] is None
 
 
 def test_list_messages_structured_messages_include_content_metadata_and_all_read_markers():
@@ -366,8 +418,8 @@ def test_list_messages_structured_messages_cover_media_reply_forward_reaction_to
         "description": "[фото]",
         "content": {"text": "[фото]", "is_telegram_content": True, "content_kind": "media_description"},
     }
-    assert second["reply_context"]["msg_id"] == 1
-    assert second["reply_context"]["content"]["content_kind"] == "reply_snippet"
+    assert second["reply_context_ref"] == {"msg_id": 1, "in_page": True, "context_included": False}
+    assert second["reply_context"] is None
     assert second["forward"]["from_name"] == "Forward Source"
     assert second["forward"]["content"]["content_kind"] == "forward_snippet"
     assert second["post_author"] == "Channel Author"

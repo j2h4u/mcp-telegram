@@ -208,6 +208,20 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
             ],
             "additionalProperties": False,
         },
+        "presentation": {
+            "type": "object",
+            "properties": {
+                "messages_order": {"type": "string"},
+                "is_chronological": {"type": "boolean"},
+                "reply_context_policy": {"type": "string"},
+            },
+            "required": [
+                "messages_order",
+                "is_chronological",
+                "reply_context_policy",
+            ],
+            "additionalProperties": False,
+        },
         "read_state": {
             "type": ["object", "null"],
             "properties": {
@@ -239,6 +253,7 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
                     "media_description": {"type": ["string", "null"]},
                     "media": {"type": ["object", "null"]},
                     "reply_to_msg_id": {"type": ["integer", "null"]},
+                    "reply_context_ref": {"type": ["object", "null"]},
                     "reply_context": {"type": ["object", "null"]},
                     "forward": {"type": ["object", "null"]},
                     "post_author": {"type": ["string", "null"]},
@@ -264,6 +279,7 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
                     "media_description",
                     "media",
                     "reply_to_msg_id",
+                    "reply_context_ref",
                     "reply_context",
                     "forward",
                     "post_author",
@@ -287,6 +303,7 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
         "filters",
         "limits",
         "navigation",
+        "presentation",
         "read_state",
         "messages",
         "count",
@@ -424,18 +441,18 @@ def _structured_read_marker(message_id: int, label: str) -> dict[str, object]:
     }
 
 
-def _structured_reply_context(reply: ReadMessage | None) -> dict[str, object] | None:
-    if reply is None:
+def _structured_reply_context_ref(
+    reply_to_msg_id: int | None,
+    *,
+    parent_in_page: bool,
+    context_included: bool,
+) -> dict[str, object] | None:
+    if reply_to_msg_id is None:
         return None
     return {
-        "msg_id": reply.id,
-        "sent_at": reply.sent_at,
-        "date": _message_date(reply.sent_at),
-        "sender": resolve_sender_label(reply),
-        "sender_id": reply.sender_id,
-        "effective_sender_id": reply.effective_sender_id,
-        "text": reply.text,
-        "content": _content_or_none(reply.text, "reply_snippet"),
+        "msg_id": reply_to_msg_id,
+        "in_page": parent_in_page,
+        "context_included": context_included,
     }
 
 
@@ -482,6 +499,8 @@ def _list_messages_structured_messages(
     for message in messages:
         marker_label = marker_by_message.get(message.id)
         read_markers = [_structured_read_marker(message.id, marker_label)] if marker_label else []
+        reply_parent = reply_map.get(message.reply_to_msg_id or -1)
+        parent_in_page = reply_parent is not None
         structured.append(
             {
                 "dialog_id": message.dialog_id,
@@ -500,7 +519,12 @@ def _list_messages_structured_messages(
                 "media_description": message.media_description,
                 "media": _structured_media(message.media_description),
                 "reply_to_msg_id": message.reply_to_msg_id,
-                "reply_context": _structured_reply_context(reply_map.get(message.reply_to_msg_id or -1)),
+                "reply_context_ref": _structured_reply_context_ref(
+                    message.reply_to_msg_id,
+                    parent_in_page=parent_in_page,
+                    context_included=False,
+                ),
+                "reply_context": None,
                 "forward": _structured_forward(message.fwd_from_name),
                 "post_author": message.post_author,
                 "edit_date": message.edit_date,
@@ -510,6 +534,16 @@ def _list_messages_structured_messages(
             }
         )
     return structured
+
+
+def _chronological_message_rows(rows: list[dict]) -> list[dict]:
+    return sorted(
+        rows,
+        key=lambda row: (
+            int(row.get("sent_at") or 0),
+            int(row.get("message_id") or 0),
+        ),
+    )
 
 
 def _list_messages_structured_content(
@@ -539,6 +573,7 @@ def _list_messages_structured_content(
             "state": read_state,
             "header_lines": header_lines,
         }
+    ordered_rows = _chronological_message_rows(rows)
     return {
         "dialog_id": resolved_dialog_id,
         "dialog": {
@@ -576,8 +611,20 @@ def _list_messages_structured_content(
             "direction_input": direction,
             "anchor_message_id": args.anchor_message_id,
         },
+        "presentation": {
+            "messages_order": "chronological",
+            "is_chronological": True,
+            "reply_context_policy": (
+                "reply_context is omitted to keep messages[] as a clean timeline; "
+                "use reply_context_ref.msg_id to link replies to parent rows"
+            ),
+        },
         "read_state": structured_read_state,
-        "messages": _list_messages_structured_messages(rows, read_state=read_state, dialog_type=dialog_type),
+        "messages": _list_messages_structured_messages(
+            ordered_rows,
+            read_state=read_state,
+            dialog_type=dialog_type,
+        ),
         "count": len(rows),
         "result_count_semantics": "count is the number of message rows returned in this response page",
     }
@@ -887,6 +934,8 @@ class ListMessages(ToolArgs):
     structuredContent. Successful MCP responses intentionally leave text content empty.
 
     Use navigation="newest" (or omit navigation) to start from the latest messages.
+    The returned page is always presented chronologically (oldest-to-newest within the page)
+    so agents can read the conversation top-to-bottom while still getting the recent tail.
     Use navigation="oldest" to start from the oldest messages in the dialog.
     Use navigation= with the next_navigation token from a previous response to continue paging.
     To read an entire channel or chat history: call this tool repeatedly, passing the next_navigation
@@ -980,7 +1029,6 @@ class ListMessages(ToolArgs):
         le=50,
         description="Number of messages to return around anchor_message_id (default 10).",
     )
-
     @model_validator(mode="after")
     def validate_direct_read_selectors(self) -> ListMessages:
         """Reject missing or conflicting selector combinations."""

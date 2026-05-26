@@ -35,6 +35,8 @@ def test_list_messages_reflection_exposes_shared_navigation_schema() -> None:
     assert "exact_topic_id" in properties
     assert "cursor" not in properties
     assert "from_beginning" not in properties
+    assert "response_order" not in properties
+    assert "reply_context_mode" not in properties
     assert properties["navigation"]["type"] == "string"
     assert properties["exact_dialog_id"]["type"] == "integer"
     assert properties["exact_topic_id"]["type"] == "integer"
@@ -298,6 +300,13 @@ def test_all_registered_tools_declare_output_schema() -> None:
 
 
 def test_phase_52_agent_metadata_fields_are_in_output_schemas() -> None:
+    list_messages_schema = server.tool_by_name["list_messages"].outputSchema
+    assert list_messages_schema is not None
+    assert "presentation" in list_messages_schema["required"]
+    message_item = list_messages_schema["properties"]["messages"]["items"]
+    assert "reply_context_ref" in message_item["required"]
+    assert "reply_context_ref" in message_item["properties"]
+
     list_dialogs_schema = server.tool_by_name["list_dialogs"].outputSchema
     assert list_dialogs_schema is not None
     dialog_item = list_dialogs_schema["properties"]["dialogs"]["items"]
