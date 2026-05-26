@@ -497,7 +497,8 @@ class _patch_daemon_not_running:
         @asynccontextmanager
         async def _raise_not_running():
             raise DaemonNotRunningError("Sync daemon is not running. Start it with: mcp-telegram sync")
-            yield  # noqa: unreachable
+            if False:
+                yield
 
         self._patches = []
         targets = [

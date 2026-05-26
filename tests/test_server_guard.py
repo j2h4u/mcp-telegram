@@ -22,7 +22,8 @@ def test_run_mcp_server_logs_daemon_api_message(
     @asynccontextmanager
     async def fake_stdio_server():
         raise RuntimeError("stop after logging")
-        yield  # noqa: unreachable
+        if False:
+            yield
 
     with (
         patch("mcp.server.stdio.stdio_server", fake_stdio_server),

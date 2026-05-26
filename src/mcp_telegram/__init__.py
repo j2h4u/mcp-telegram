@@ -1,9 +1,36 @@
 import asyncio
+import os
 from typing import Annotated
 
-from typer import Argument, Context, Option, Typer
+from typer import Argument, BadParameter, Context, Option, Typer
 
 app = Typer()
+
+_DEFAULT_HTTP_HOST = "127.0.0.1"
+_DEFAULT_HTTP_PORT = 3100
+
+
+def _resolve_http_host(host: str | None) -> str:
+    if host is not None:
+        return host
+    return os.environ.get("MCP_TELEGRAM_HTTP_HOST") or _DEFAULT_HTTP_HOST
+
+
+def _resolve_http_port(port: int | None) -> int:
+    if port is not None:
+        resolved = port
+    else:
+        raw_port = os.environ.get("MCP_TELEGRAM_HTTP_PORT")
+        if raw_port is None or raw_port == "":
+            resolved = _DEFAULT_HTTP_PORT
+        elif raw_port.isdecimal():
+            resolved = int(raw_port)
+        else:
+            raise BadParameter("MCP_TELEGRAM_HTTP_PORT must be an integer")
+
+    if not 1 <= resolved <= 65535:
+        raise BadParameter("HTTP port must be between 1 and 65535")
+    return resolved
 
 
 @app.callback(invoke_without_command=True)
@@ -51,21 +78,21 @@ def sync() -> None:
 @app.command()
 def serve(
     host: Annotated[
-        str,
+        str | None,
         Option(
             "--host",
             help="HTTP bind host for the Streamable HTTP MCP endpoint.",
             envvar="MCP_TELEGRAM_HTTP_HOST",
         ),
-    ] = "127.0.0.1",
+    ] = None,
     port: Annotated[
-        int,
+        int | None,
         Option(
             "--port",
             help="HTTP bind port for the Streamable HTTP MCP endpoint.",
             envvar="MCP_TELEGRAM_HTTP_PORT",
         ),
-    ] = 3100,
+    ] = None,
 ) -> None:
     """Run the sync daemon and Streamable HTTP MCP endpoint in one process."""
     import logging
@@ -75,6 +102,8 @@ def serve(
     from .daemon import sync_main
     from .server import run_mcp_http_server
 
+    resolved_host = _resolve_http_host(host)
+    resolved_port = _resolve_http_port(port)
     log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
     logging.basicConfig(
         level=getattr(logging, log_level, logging.INFO),
@@ -86,7 +115,7 @@ def serve(
     async def _run() -> None:
         sync_task = asyncio.create_task(sync_main(), name="sync-daemon")
         http_task = asyncio.create_task(
-            run_mcp_http_server(host=host, port=port),
+            run_mcp_http_server(host=resolved_host, port=resolved_port),
             name="mcp-http",
         )
         tasks = {sync_task, http_task}

@@ -140,7 +140,8 @@ async def test_get_dialog_stats_daemon_not_running() -> None:
     @asynccontextmanager
     async def _raise_not_running() -> AsyncIterator[None]:
         raise DaemonNotRunningError("Sync daemon is not running.")
-        yield  # noqa: unreachable
+        if False:
+            yield
 
     with patch("mcp_telegram.tools.stats.daemon_connection", _raise_not_running):
         content = await get_dialog_stats(GetDialogStats(dialog="Any Chat"))
