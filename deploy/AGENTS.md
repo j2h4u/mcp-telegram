@@ -13,6 +13,13 @@ This directory is the live deployment workspace, not the source checkout.
 - `database/*-wal` and `database/*-shm` are normal SQLite WAL-mode sidecar files.
 - `backups/` contains point-in-time operator backups only; it is not mounted into the container.
 
+## Downstream Consumers
+
+- dotMD is the external Telegram indexer/search engine. It reaches this
+  deployment through dotMD's Telegram adapter/source integration.
+- On this machine dotMD mounts `database/` read-only. If this deployment path
+  changes, update `/opt/docker/dotmd/docker-compose.override.yml` as well.
+
 ## Operations
 
 - Rebuild and restart after source changes:

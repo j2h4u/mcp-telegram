@@ -21,6 +21,14 @@ State lives in the XDG state directory: `sync.db`, `feedback.db`, and the Telegr
 In Docker this is bind-mounted from `/opt/docker/mcp-telegram/database`. The daemon is the only
 writer; MCP serving code uses daemon APIs and read-only DB access for lightweight queries.
 
+### Downstream consumers
+
+- **dotMD** is the external indexer/search engine for Telegram content. Treat it
+  as a downstream consumer that reaches mcp-telegram through dotMD's Telegram
+  adapter/source integration, not as part of this server's core runtime.
+- Keep the integration boundary explicit: mcp-telegram owns Telegram auth,
+  sync, and local state; dotMD owns indexing, search, and materialization.
+
 ## Brownfield Map
 
 ### Core
@@ -169,5 +177,7 @@ The agent owns the full development cycle end to end: writing code, running test
 ## Lessons Learned
 
 - Forum-topic support is test-covered, but live Telegram semantics require manual validation.
+- dotMD may depend on the deployed mcp-telegram state directory for its Telegram
+  adapter. When changing deployment storage, update the dotMD mount/config too.
 - Avoid logging Telegram message content or other sensitive data.
 - Treat session files and `.env` credentials as secrets.
