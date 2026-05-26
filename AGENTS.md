@@ -17,7 +17,8 @@ Default Docker runtime is one container process:
 - **Daemon-only mode** (`mcp-telegram sync`) — useful for split-mode debugging, but it is not the
   default Docker command.
 
-State lives in `sync.db` (XDG state home) plus the Telegram session file. The daemon is the only
+State lives in the XDG state directory: `sync.db`, `feedback.db`, and the Telegram session file.
+In Docker this is bind-mounted from `/opt/docker/mcp-telegram/database`. The daemon is the only
 writer; MCP serving code uses daemon APIs and read-only DB access for lightweight queries.
 
 ## Brownfield Map
@@ -50,7 +51,8 @@ writer; MCP serving code uses daemon APIs and read-only DB access for lightweigh
 - `scripts/healthcheck_daemon.py` — Unix socket healthcheck (copied into image)
 - `scripts/healthcheck_http.py` — Streamable HTTP healthcheck (copied into image)
 - `scripts/healthcheck_all.sh` — healthcheck entrypoint (copied into image)
-- `telegram_qr_login.py` — QR-based auth helper; copy from `deploy/` and run from deploy dir to produce `telegram_session.session`
+- `telegram_qr_login.py` — QR-based auth helper; copy from `deploy/` and run from deploy dir to produce `database/mcp_telegram_session.session`
+- `AGENTS.md` — deployment-local agent notes for `/opt/docker/mcp-telegram`
 
 ### Tools Package (`tools/`)
 - `_base.py` — `ToolArgs`, `ToolResult`, `@mcp_tool`, `TOOL_REGISTRY`, `daemon_connection`, telemetry

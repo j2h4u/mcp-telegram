@@ -11,4 +11,6 @@ __pycache__
 .hypothesis/
 .planning/
 graphify-out/
+/deploy/database/
+/deploy/backups/
 .opencode/

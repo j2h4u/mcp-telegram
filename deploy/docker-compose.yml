@@ -19,8 +19,4 @@ services:
     ports:
       - "127.0.0.1:3100:3100"
     volumes:
-      - state:/root/.local/state/mcp-telegram
-      - ./telegram_session.session:/root/.local/state/mcp-telegram/mcp_telegram_session.session
-
-volumes:
-  state:
+      - ./database:/root/.local/state/mcp-telegram

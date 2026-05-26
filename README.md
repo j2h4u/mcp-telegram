@@ -144,11 +144,12 @@ get_sync_status(dialog_id=<dialog_id>)
    cd mcp-telegram
    ```
 
-2. Create a deploy directory and copy the compose template plus QR login script.
+2. Create a deploy directory and copy the compose template plus deployment
+   helper files.
 
    ```bash
    mkdir -p /opt/docker/mcp-telegram
-   cp deploy/docker-compose.yml deploy/telegram_qr_login.py /opt/docker/mcp-telegram/
+   cp deploy/docker-compose.yml deploy/telegram_qr_login.py deploy/AGENTS.md /opt/docker/mcp-telegram/
    ```
 
 3. Edit `/opt/docker/mcp-telegram/docker-compose.yml` and set
@@ -173,8 +174,9 @@ get_sync_status(dialog_id=<dialog_id>)
    `TELEGRAM_API_ID` and `TELEGRAM_API_HASH` to start a Telegram client session,
    prints a QR code in the terminal, and waits for you to approve that login
    from an already logged-in Telegram mobile or desktop app. After approval, it
-   writes `telegram_session.session` in the deploy directory, which the compose
-   file mounts into the container.
+   writes `database/mcp_telegram_session.session` in the deploy directory. The
+   compose file mounts that `database/` directory into the container as the MCP
+   server's persistent state directory.
 
    ```bash
    cd /opt/docker/mcp-telegram
@@ -282,15 +284,14 @@ uv run python -m devtools.mcp_client.cli call-tool \
   path and extra Docker networks.
 - Runtime state lives under the XDG state directory inside the container:
   `/root/.local/state/mcp-telegram`. In Docker, that directory is backed by the
-  named volume `mcp-telegram_state`.
-- The live Telegram mirror is `/root/.local/state/mcp-telegram/sync.db` inside
-  the container. Its `sync.db-wal` and `sync.db-shm` siblings are normal SQLite
-  WAL-mode sidecar files, not separate databases.
-- `feedback.db` in the same state directory stores agent-submitted feedback.
-- `/opt/docker/mcp-telegram/telegram_session.session` is bind-mounted into the
-  container as `/root/.local/state/mcp-telegram/mcp_telegram_session.session`.
-  This is the active Telegram session file and must be treated like an account
-  credential.
+  host directory `/opt/docker/mcp-telegram/database`.
+- The live Telegram mirror is `/opt/docker/mcp-telegram/database/sync.db` on the
+  host and `/root/.local/state/mcp-telegram/sync.db` inside the container. Its
+  `sync.db-wal` and `sync.db-shm` siblings are normal SQLite WAL-mode sidecar
+  files, not separate databases.
+- `feedback.db` in the same directory stores agent-submitted feedback.
+- `/opt/docker/mcp-telegram/database/mcp_telegram_session.session` is the active
+  Telegram session file and must be treated like an account credential.
 - Files under `/opt/docker/mcp-telegram/backups/` are point-in-time operator
   backups. They are not mounted into the running container and may be smaller or
   older than the live SQLite files.

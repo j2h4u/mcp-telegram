@@ -148,8 +148,8 @@ async def main() -> None:
         sys.exit(1)
     api_id = int(api_id_raw)
 
-    # Используем session в текущей папке
-    session_file = Path("telegram_session")
+    session_file = Path("database") / "mcp_telegram_session"
+    session_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
 
     client = TelegramClient(str(session_file), api_id, api_hash)
     await client.connect()
