@@ -10,13 +10,13 @@ default:
 # Run all local source checks.
 check: lint typecheck test
 
-# Run ruff over source and tests.
+# Run ruff over source, tests, and deploy helpers.
 lint:
-    uv run ruff check src tests
+    uv run ruff check src tests deploy
 
-# Run mypy over the package.
+# Run mypy over the package and deploy helpers.
 typecheck:
-    uv run mypy src/mcp_telegram
+    uv run mypy src/mcp_telegram deploy
 
 # Run pytest. Extra args are forwarded, e.g. `just test tests/test_daemon_api.py -q`.
 test *args:

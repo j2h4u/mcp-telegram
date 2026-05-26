@@ -33,7 +33,7 @@ writer; MCP serving code uses daemon APIs and read-only DB access for lightweigh
 - `read_state.py` — `apply_read_cursor()`: monotonic inbox/outbox read cursor writes to `synced_dialogs`
 - `fts.py` — FTS5 full-text search with Russian snowball stemming
 - `telegram.py` — TelegramClient factory and auth flows
-- `__init__.py` — CLI entrypoint: `sign-in`, `run`, `logout`, `sync`
+- `__init__.py` — CLI entrypoint: `sign-in`, `run`, `logout`, `sync`, `serve`, `feedback`
 
 ### Shared Utilities
 - `models.py` — TypedDict schemas, dataclasses (`StoredMessage`, `ReadMessage`)
@@ -50,7 +50,7 @@ writer; MCP serving code uses daemon APIs and read-only DB access for lightweigh
 - `scripts/healthcheck_daemon.py` — Unix socket healthcheck (copied into image)
 - `scripts/healthcheck_http.py` — Streamable HTTP healthcheck (copied into image)
 - `scripts/healthcheck_all.sh` — healthcheck entrypoint (copied into image)
-- `telegram_qr_login.py` — QR-based auth (repo root, SMS method unreliable); run from deploy dir to produce `telegram_session.session`
+- `telegram_qr_login.py` — QR-based auth helper; copy from `deploy/` and run from deploy dir to produce `telegram_session.session`
 
 ### Tools Package (`tools/`)
 - `_base.py` — `ToolArgs`, `ToolResult`, `@mcp_tool`, `TOOL_REGISTRY`, `daemon_connection`, telemetry

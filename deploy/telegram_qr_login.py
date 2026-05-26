@@ -13,8 +13,10 @@ import getpass
 import os
 import shutil
 import sys
+import traceback
 from io import StringIO
 from pathlib import Path
+from typing import Any
 
 import qrcode
 from dotenv import load_dotenv
@@ -24,9 +26,6 @@ from telethon.errors import PasswordHashInvalidError, SessionPasswordNeededError
 # Загружаем .env
 load_dotenv()
 
-API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
-API_HASH = os.getenv("TELEGRAM_API_HASH", "")
-TWO_FA_PASSWORD = os.getenv("TELEGRAM_2FA_PASSWORD", "")
 QR_LEFT_PADDING = " " * 6
 QR_BORDER = 4
 QR_REFRESH_MARGIN_SECONDS = 20
@@ -51,12 +50,12 @@ def qr_to_terminal(data: str) -> str:
     left_padding = " " * max(len(QR_LEFT_PADDING), (terminal_width - qr_visible_width) // 2)
     return "\n".join(f"{left_padding}{line}" for line in qr_ascii)
 
-def clear_screen():
+def clear_screen() -> None:
     """Очищает экран терминала"""
     os.system('clear' if os.name == 'posix' else 'cls')
 
 
-def _qr_lifetime(qr_login) -> int:
+def _qr_lifetime(qr_login: Any) -> int:
     """Return seconds until qr_login expires (minimum 1)."""
     return max(
         1,
@@ -98,11 +97,11 @@ def show_2fa_screen(using_env_password: bool) -> None:
     sys.stdout.flush()
 
 
-async def complete_2fa_login(client: TelegramClient) -> None:
+async def complete_2fa_login(client: TelegramClient, two_fa_password: str) -> None:
     """Завершает авторизацию через пароль 2FA."""
-    if TWO_FA_PASSWORD:
+    if two_fa_password:
         show_2fa_screen(using_env_password=True)
-        await client.sign_in(password=TWO_FA_PASSWORD)
+        await client.sign_in(password=two_fa_password)
         return
 
     show_2fa_screen(using_env_password=False)
@@ -136,15 +135,23 @@ async def complete_2fa_login(client: TelegramClient) -> None:
             print(f"⚠️  Неверный пароль 2FA. Осталось попыток: {remaining_attempts}")
 
 
-async def main():
-    if not API_ID or not API_HASH:
+async def main() -> None:
+    api_id_raw = os.getenv("TELEGRAM_API_ID", "").strip()
+    api_hash = os.getenv("TELEGRAM_API_HASH", "").strip()
+    two_fa_password = os.getenv("TELEGRAM_2FA_PASSWORD", "")
+
+    if not api_id_raw or not api_hash:
         print("❌ TELEGRAM_API_ID или TELEGRAM_API_HASH не установлены в .env")
         sys.exit(1)
+    if not api_id_raw.isdecimal():
+        print("❌ TELEGRAM_API_ID должен быть целым числом")
+        sys.exit(1)
+    api_id = int(api_id_raw)
 
     # Используем session в текущей папке
     session_file = Path("telegram_session")
 
-    client = TelegramClient(str(session_file), API_ID, API_HASH)
+    client = TelegramClient(str(session_file), api_id, api_hash)
     await client.connect()
 
     try:
@@ -197,7 +204,7 @@ async def main():
                     qr_total_seconds = _qr_lifetime(qr_login)
                 continue
             except SessionPasswordNeededError:
-                await complete_2fa_login(client)
+                await complete_2fa_login(client, two_fa_password)
 
             print("\n✅ Успешно авторизован!")
             me = await client.get_me()
@@ -215,7 +222,6 @@ async def main():
         print("\n❌ Пароль 2FA неверный. Авторизация не завершена.")
     except Exception as e:
         print(f"\n❌ Ошибка: {e}")
-        import traceback
         traceback.print_exc()
     finally:
         await client.disconnect()

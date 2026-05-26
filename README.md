@@ -148,7 +148,7 @@ get_sync_status(dialog_id=<dialog_id>)
 
    ```bash
    mkdir -p /opt/docker/mcp-telegram
-   cp deploy/docker-compose.yml telegram_qr_login.py /opt/docker/mcp-telegram/
+   cp deploy/docker-compose.yml deploy/telegram_qr_login.py /opt/docker/mcp-telegram/
    ```
 
 3. Edit `/opt/docker/mcp-telegram/docker-compose.yml` and set
@@ -259,7 +259,7 @@ uv run python -m devtools.mcp_client.cli call-tool \
 | `src/mcp_telegram/sync_db.py` | Local SQLite schema and migrations. |
 | `src/mcp_telegram/event_handlers.py` | Real-time Telegram update handling. |
 | `src/mcp_telegram/activity_sync.py` | Own-message archive used by recent activity audits. |
-| `deploy/` | Dockerfile, compose template, and healthcheck scripts. |
+| `deploy/` | Dockerfile, compose template, QR login helper, and healthcheck scripts. |
 | `devtools/mcp_client/` | Local MCP client and smoke-test runner. |
 | `tests/` | Unit, integration-style, and contract tests. |
 
