@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 from mcp.types import ToolAnnotations
-from pydantic import Field
+from pydantic import Field, field_validator
 
 from ._base import (
     DaemonNotRunningError,
@@ -19,11 +19,28 @@ from ._base import (
 )
 from .structured import telegram_content
 
+DEFAULT_ACTIVITY_DIALOG_KINDS = ("group", "forum")
+_ALLOWED_ACTIVITY_DIALOG_KINDS = {"all", "user", "bot", "group", "forum", "channel", "unknown"}
+_ACTIVITY_DIALOG_KIND_ALIASES = {
+    "dm": ("user", "bot"),
+    "dms": ("user", "bot"),
+    "private": ("user", "bot"),
+    "personal": ("user", "bot"),
+    "direct": ("user", "bot"),
+    "groups": ("group", "forum"),
+    "supergroup": ("group",),
+    "supergroups": ("group",),
+    "chat": ("group",),
+    "chats": ("group",),
+    "forums": ("forum",),
+}
+
 GET_MY_RECENT_ACTIVITY_OUTPUT_SCHEMA = {
     "type": "object",
     "properties": {
         "since_hours": {"type": "integer"},
         "limit": {"type": "integer"},
+        "dialog_kinds": {"type": "array", "items": {"type": "string"}},
         "scan_status": {"type": "string"},
         "scanned_at": {"type": ["integer", "null"]},
         "comments": {
@@ -84,6 +101,7 @@ GET_MY_RECENT_ACTIVITY_OUTPUT_SCHEMA = {
     "required": [
         "since_hours",
         "limit",
+        "dialog_kinds",
         "scan_status",
         "scanned_at",
         "comments",
@@ -95,7 +113,7 @@ GET_MY_RECENT_ACTIVITY_OUTPUT_SCHEMA = {
 
 
 class GetMyRecentActivity(ToolArgs):
-    """[primary] Show messages you sent across all chats.
+    """[primary] Show messages you sent in recent non-DM chats by default.
 
     Reads from the local own-message archive populated by the daemon's
     activity_sync loop — zero Telegram API calls in the hot path.
@@ -104,6 +122,11 @@ class GetMyRecentActivity(ToolArgs):
     the response contains 3 separate blocks (not one collapsed entry).
     Each comment includes dialog_type/dialog_category plus aggregate
     reply_count and reactions for prioritising follow-up.
+
+    By default, dialog_kinds=["group", "forum"] excludes personal DMs so
+    group follow-up audits are not drowned by one-to-one chat noise. Pass
+    dialog_kinds=["user", "bot"] for DMs, ["channel"] for channels, or
+    ["all"] to disable the dialog-kind filter.
 
     Use `scan_status` to distinguish `never_run` (archive empty — backfill
     has not completed yet) from `complete` + empty result (you were quiet).
@@ -121,6 +144,48 @@ class GetMyRecentActivity(ToolArgs):
         le=2000,
         description="Maximum number of per-comment blocks to return.",
     )
+    dialog_kinds: list[str] = Field(
+        default_factory=lambda: list(DEFAULT_ACTIVITY_DIALOG_KINDS),
+        min_length=1,
+        max_length=8,
+        description=(
+            "Dialog kinds to include. Default ['group','forum'] excludes DMs. "
+            "Use ['user','bot'] for personal/bot DMs, ['channel'] for channels, or ['all'] for no filter."
+        ),
+    )
+
+    @field_validator("dialog_kinds", mode="before")
+    @classmethod
+    def _normalize_dialog_kinds(cls, value: object) -> list[str]:
+        if value is None:
+            return list(DEFAULT_ACTIVITY_DIALOG_KINDS)
+        if isinstance(value, str):
+            raw_values: list[object] = [value]
+        elif isinstance(value, list | tuple | set):
+            raw_values = list(value)
+        else:
+            raise ValueError("dialog_kinds must be a list of strings")
+
+        normalized_values: list[str] = []
+        for raw in raw_values:
+            if not isinstance(raw, str):
+                raise ValueError("dialog_kinds entries must be strings")
+            normalized = raw.strip().lower()
+            if not normalized:
+                continue
+            expanded = _ACTIVITY_DIALOG_KIND_ALIASES.get(normalized, (normalized,))
+            for kind in expanded:
+                if kind not in _ALLOWED_ACTIVITY_DIALOG_KINDS:
+                    allowed = ", ".join(sorted(_ALLOWED_ACTIVITY_DIALOG_KINDS))
+                    raise ValueError(f"dialog_kinds entries must be one of: {allowed}")
+                if kind not in normalized_values:
+                    normalized_values.append(kind)
+
+        if "all" in normalized_values:
+            return ["all"]
+        if not normalized_values:
+            raise ValueError("dialog_kinds must include at least one kind")
+        return normalized_values
 
 
 def _structured_comment(comment: dict[str, Any]) -> dict[str, object]:
@@ -173,6 +238,7 @@ async def get_my_recent_activity(args: GetMyRecentActivity) -> ToolResult:
             response = await conn.get_my_recent_activity(
                 since_hours=args.since_hours,
                 limit=args.limit,
+                dialog_kinds=args.dialog_kinds,
             )
     except DaemonNotRunningError:
         return error_result(_daemon_not_running_text())
@@ -182,12 +248,14 @@ async def get_my_recent_activity(args: GetMyRecentActivity) -> ToolResult:
 
     data = response.get("data") or {}
     comments = data.get("comments") or []
+    dialog_kinds = data.get("dialog_kinds") or args.dialog_kinds
     scan_status = data.get("scan_status") or "never_run"
     scanned_at = data.get("scanned_at")
     structured_comments = [_structured_comment(comment) for comment in _chronological_comments(comments)]
     structured_content = {
         "since_hours": args.since_hours,
         "limit": args.limit,
+        "dialog_kinds": dialog_kinds,
         "scan_status": scan_status,
         "scanned_at": scanned_at,
         "comments": structured_comments,
@@ -198,4 +266,5 @@ async def get_my_recent_activity(args: GetMyRecentActivity) -> ToolResult:
     return structured_result(
         structured_content,
         result_count=len(comments),
+        has_filter=dialog_kinds != ["all"],
     )

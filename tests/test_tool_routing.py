@@ -2603,6 +2603,7 @@ async def test_get_my_recent_activity_routes_primary():
     assert result.structured_content is not None
     assert result.structured_content["since_hours"] == 168
     assert result.structured_content["limit"] == 500
+    assert result.structured_content["dialog_kinds"] == ["group", "forum"]
     assert result.structured_content["scan_status"] == "complete"
     assert result.structured_content["scanned_at"] == 1_700_003_600
     assert result.structured_content["count"] == 2
@@ -2619,6 +2620,33 @@ async def test_get_my_recent_activity_routes_primary():
         "tool": "list_messages",
         "arguments": {"exact_dialog_id": 42, "anchor_message_id": 100},
     }
+    conn.get_my_recent_activity.assert_awaited_once_with(
+        since_hours=168,
+        limit=500,
+        dialog_kinds=["group", "forum"],
+    )
+
+
+async def test_get_my_recent_activity_accepts_dm_alias():
+    """GetMyRecentActivity normalizes dialog_kinds aliases before daemon call."""
+    from mcp_telegram.tools.activity import GetMyRecentActivity, get_my_recent_activity
+
+    conn = _make_daemon_conn(
+        {
+            "ok": True,
+            "data": {"comments": [], "scan_status": "complete", "scanned_at": None},
+        }
+    )
+    with _patch_daemon(conn):
+        result = await get_my_recent_activity(GetMyRecentActivity(dialog_kinds=["dm"]))
+
+    assert result.structured_content is not None
+    assert result.structured_content["dialog_kinds"] == ["user", "bot"]
+    conn.get_my_recent_activity.assert_awaited_once_with(
+        since_hours=168,
+        limit=500,
+        dialog_kinds=["user", "bot"],
+    )
 
 
 async def test_get_my_recent_activity_frames_adversarial_text():

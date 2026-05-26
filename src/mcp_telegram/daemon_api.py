@@ -256,6 +256,22 @@ _current_request_id: contextvars.ContextVar[str | None] = contextvars.ContextVar
     default=None,
 )
 
+DEFAULT_ACTIVITY_DIALOG_KINDS = ("group", "forum")
+_ALLOWED_ACTIVITY_DIALOG_KINDS = {"all", "user", "bot", "group", "forum", "channel", "unknown"}
+_ACTIVITY_DIALOG_KIND_ALIASES = {
+    "dm": ("user", "bot"),
+    "dms": ("user", "bot"),
+    "private": ("user", "bot"),
+    "personal": ("user", "bot"),
+    "direct": ("user", "bot"),
+    "groups": ("group", "forum"),
+    "supergroup": ("group",),
+    "supergroups": ("group",),
+    "chat": ("group",),
+    "chats": ("group",),
+    "forums": ("forum",),
+}
+
 
 def _rid() -> str:
     """Return ' request_id=X' suffix for log lines, or empty string."""
@@ -5767,13 +5783,36 @@ class DaemonAPIServer:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _activity_dialog_category(dialog_type: str | None) -> str:
-        normalized = (dialog_type or "unknown").strip().lower()
-        if normalized in {"user", "bot", "channel"}:
-            return normalized
-        if normalized in {"group", "supergroup", "forum", "chat"}:
-            return "group"
-        return "unknown"
+    def _normalize_activity_dialog_kinds(value: object) -> tuple[list[str] | None, str | None]:
+        if value is None:
+            return list(DEFAULT_ACTIVITY_DIALOG_KINDS), None
+        if isinstance(value, str):
+            raw_values: list[object] = [value]
+        elif isinstance(value, list | tuple | set):
+            raw_values = list(value)
+        else:
+            return None, "dialog_kinds must be a list of strings"
+
+        normalized_values: list[str] = []
+        for raw in raw_values:
+            if not isinstance(raw, str):
+                return None, "dialog_kinds entries must be strings"
+            normalized = raw.strip().lower()
+            if not normalized:
+                continue
+            expanded = _ACTIVITY_DIALOG_KIND_ALIASES.get(normalized, (normalized,))
+            for kind in expanded:
+                if kind not in _ALLOWED_ACTIVITY_DIALOG_KINDS:
+                    allowed = ", ".join(sorted(_ALLOWED_ACTIVITY_DIALOG_KINDS))
+                    return None, f"dialog_kinds entries must be one of: {allowed}"
+                if kind not in normalized_values:
+                    normalized_values.append(kind)
+
+        if "all" in normalized_values:
+            return ["all"], None
+        if not normalized_values:
+            return None, "dialog_kinds must include at least one kind"
+        return normalized_values, None
 
     async def _get_my_recent_activity(self, req: dict) -> dict:
         """Read own outgoing messages (out=1, non-service, non-deleted) with scan_status context.
@@ -5781,6 +5820,7 @@ class DaemonAPIServer:
         D-05: per-comment blocks, scan_status from activity_sync_state.
 
         Request: since_hours (int, 1–8760, default 168), limit (int, 1–2000, default 500).
+        Optional dialog_kinds defaults to ["group", "forum"] to exclude DMs.
         Response: {"ok": True, "data": {"comments": [...], "scan_status": str, "scanned_at": int|None}}
         Each comment includes dialog identity/type, message identity/time/text,
         sync status, reply_count, and reaction counters.
@@ -5803,10 +5843,27 @@ class DaemonAPIServer:
             limit = 500
         limit = max(1, min(2000, limit))
 
+        dialog_kinds, dialog_kind_error = self._normalize_activity_dialog_kinds(
+            req.get("dialog_kinds", list(DEFAULT_ACTIVITY_DIALOG_KINDS))
+        )
+        if dialog_kind_error is not None or dialog_kinds is None:
+            return {
+                "ok": False,
+                "error": "invalid_dialog_kinds",
+                "message": dialog_kind_error or "invalid dialog_kinds",
+            }
+
         since_ts = int(time.time()) - since_hours * 3600
+        dialog_kind_filter_sql = ""
+        query_params: list[object] = [since_ts]
+        if dialog_kinds != ["all"]:
+            dialog_kind_placeholders = ",".join("?" for _ in dialog_kinds)
+            dialog_kind_filter_sql = f"WHERE dialog_kind IN ({dialog_kind_placeholders}) "
+            query_params.extend(dialog_kinds)
+        query_params.append(limit)
 
         rows = self._conn.execute(
-            "SELECT * FROM ("
+            "WITH typed_activity AS ("
             "SELECT m.dialog_id AS dialog_id, m.message_id AS message_id, "
             "       m.sent_at AS sent_at, m.text AS text, "
             "       e.name AS dialog_name, "
@@ -5830,10 +5887,28 @@ class DaemonAPIServer:
             #   deleted — same pre-v15 behavior preservation rationale.
             "WHERE m.out = 1 AND m.is_service = 0 AND m.is_deleted = 0 "
             "  AND m.sent_at >= ? "
-            "ORDER BY m.sent_at DESC, m.dialog_id DESC, m.message_id DESC "
+            "), kinded_activity AS ("
+            "SELECT ta.*, "
+            "       CASE "
+            "         WHEN lower(ta.dialog_type) = 'bot' THEN 'bot' "
+            "         WHEN lower(ta.dialog_type) = 'user' THEN 'user' "
+            "         WHEN lower(ta.dialog_type) = 'forum' THEN 'forum' "
+            "         WHEN EXISTS (SELECT 1 FROM topic_metadata tm WHERE tm.dialog_id = ta.dialog_id) THEN 'forum' "
+            "         WHEN lower(ta.dialog_type) IN ('group', 'supergroup', 'chat') THEN 'group' "
+            "         WHEN lower(ta.dialog_type) = 'channel' THEN 'channel' "
+            "         WHEN lower(ta.dialog_type) = 'unknown' AND ta.dialog_id > 0 THEN 'user' "
+            "         WHEN lower(ta.dialog_type) = 'unknown' AND ta.dialog_id < 0 THEN 'group' "
+            "         ELSE 'unknown' "
+            "       END AS dialog_kind "
+            "FROM typed_activity ta"
+            ") "
+            "SELECT * FROM ("
+            "SELECT * FROM kinded_activity "
+            f"{dialog_kind_filter_sql}"
+            "ORDER BY sent_at DESC, dialog_id DESC, message_id DESC "
             "LIMIT ?"
             ") ORDER BY sent_at ASC, dialog_id ASC, message_id ASC",
-            (since_ts, limit),
+            query_params,
         ).fetchall()
 
         state_rows = dict(
@@ -5875,7 +5950,7 @@ class DaemonAPIServer:
                 "text": r[3],
                 "dialog_name": r[4] if r[4] else str(r[0]),
                 "dialog_type": r[5],
-                "dialog_category": self._activity_dialog_category(r[5]),
+                "dialog_category": r[8],
                 "reply_count": r[6],
                 "sync_status": r[7],
                 "reactions": reactions_by_msg.get((r[0], r[1]), []),
@@ -5887,6 +5962,7 @@ class DaemonAPIServer:
             "ok": True,
             "data": {
                 "comments": comments,
+                "dialog_kinds": dialog_kinds,
                 "scan_status": scan_status,
                 "scanned_at": last_sync_at,
             },

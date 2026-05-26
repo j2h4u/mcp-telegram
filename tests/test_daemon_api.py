@@ -4858,7 +4858,9 @@ async def test_get_my_recent_activity_filters_by_since_hours() -> None:
         )
         server._conn.execute("UPDATE activity_sync_state SET value='1' WHERE key='backfill_complete'")
         server._conn.execute(f"UPDATE activity_sync_state SET value='{now}' WHERE key='last_sync_at'")
-    resp = await server._dispatch({"method": "get_my_recent_activity", "since_hours": 1})
+    resp = await server._dispatch(
+        {"method": "get_my_recent_activity", "since_hours": 1, "dialog_kinds": ["all"]}
+    )
     texts = [c["text"] for c in resp["data"]["comments"]]
     assert texts == ["recent"]
     assert resp["data"]["scan_status"] == "complete"
@@ -4880,7 +4882,9 @@ async def test_get_my_recent_activity_returns_latest_page_chronologically() -> N
         server._conn.execute("UPDATE activity_sync_state SET value='1' WHERE key='backfill_complete'")
         server._conn.execute(f"UPDATE activity_sync_state SET value='{now}' WHERE key='last_sync_at'")
 
-    resp = await server._dispatch({"method": "get_my_recent_activity", "since_hours": 1, "limit": 2})
+    resp = await server._dispatch(
+        {"method": "get_my_recent_activity", "since_hours": 1, "limit": 2, "dialog_kinds": ["all"]}
+    )
 
     assert [comment["message_id"] for comment in resp["data"]["comments"]] == [2, 3]
 
@@ -4929,8 +4933,91 @@ async def test_get_my_recent_activity_falls_back_to_str_dialog_id() -> None:
         )
         server._conn.execute("UPDATE activity_sync_state SET value='1' WHERE key='backfill_complete'")
         server._conn.execute(f"UPDATE activity_sync_state SET value='{now}' WHERE key='last_sync_at'")
-    resp = await server._dispatch({"method": "get_my_recent_activity"})
+    resp = await server._dispatch({"method": "get_my_recent_activity", "dialog_kinds": ["all"]})
     assert resp["data"]["comments"][0]["dialog_name"] == "999"
+
+
+@pytest.mark.asyncio
+async def test_get_my_recent_activity_default_filters_dms_before_limit() -> None:
+    """Default dialog_kinds excludes DMs before LIMIT so group rows are not paged out."""
+    server = make_server(_make_db_with_activity())
+    now = int(time.time())
+    with server._conn:
+        server._conn.execute(
+            "INSERT OR REPLACE INTO dialogs (dialog_id, name, type) VALUES (42, 'Alice', 'user')"
+        )
+        server._conn.execute(
+            "INSERT OR REPLACE INTO dialogs (dialog_id, name, type) VALUES (-1001, 'Group', 'supergroup')"
+        )
+        server._conn.execute(
+            "INSERT INTO messages "
+            "(dialog_id, message_id, sent_at, text, out, is_service, is_deleted) "
+            "VALUES (42, 1, ?, 'dm-recent', 1, 0, 0)",
+            (now - 10,),
+        )
+        server._conn.execute(
+            "INSERT INTO messages "
+            "(dialog_id, message_id, sent_at, text, out, is_service, is_deleted) "
+            "VALUES (-1001, 2, ?, 'group-older', 1, 0, 0)",
+            (now - 100,),
+        )
+        server._conn.execute("UPDATE activity_sync_state SET value='1' WHERE key='backfill_complete'")
+        server._conn.execute(f"UPDATE activity_sync_state SET value='{now}' WHERE key='last_sync_at'")
+
+    resp = await server._dispatch({"method": "get_my_recent_activity", "since_hours": 1, "limit": 1})
+    assert resp["data"]["dialog_kinds"] == ["group", "forum"]
+    assert [(c["dialog_id"], c["dialog_category"], c["text"]) for c in resp["data"]["comments"]] == [
+        (-1001, "group", "group-older")
+    ]
+
+    dm_resp = await server._dispatch(
+        {"method": "get_my_recent_activity", "since_hours": 1, "limit": 1, "dialog_kinds": ["user"]}
+    )
+    assert [(c["dialog_id"], c["dialog_category"], c["text"]) for c in dm_resp["data"]["comments"]] == [
+        (42, "user", "dm-recent")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_get_my_recent_activity_forum_kind_uses_topic_metadata() -> None:
+    """A supergroup with topic metadata is filterable as forum."""
+    server = make_server(_make_db_with_activity())
+    now = int(time.time())
+    with server._conn:
+        server._conn.execute(
+            "INSERT OR REPLACE INTO dialogs (dialog_id, name, type) VALUES (-1002, 'Forum', 'supergroup')"
+        )
+        server._conn.execute(
+            "INSERT INTO topic_metadata "
+            "(dialog_id, topic_id, title, is_general, is_deleted, updated_at) "
+            "VALUES (-1002, 1, 'General', 1, 0, ?)",
+            (now,),
+        )
+        server._conn.execute(
+            "INSERT INTO messages "
+            "(dialog_id, message_id, sent_at, text, out, is_service, is_deleted) "
+            "VALUES (-1002, 1, ?, 'forum-message', 1, 0, 0)",
+            (now - 60,),
+        )
+        server._conn.execute("UPDATE activity_sync_state SET value='1' WHERE key='backfill_complete'")
+        server._conn.execute(f"UPDATE activity_sync_state SET value='{now}' WHERE key='last_sync_at'")
+
+    resp = await server._dispatch(
+        {"method": "get_my_recent_activity", "since_hours": 1, "dialog_kinds": ["forum"]}
+    )
+    assert [(c["dialog_id"], c["dialog_category"], c["text"]) for c in resp["data"]["comments"]] == [
+        (-1002, "forum", "forum-message")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_get_my_recent_activity_rejects_invalid_dialog_kinds() -> None:
+    """Invalid dialog_kinds returns a daemon-level recoverable error."""
+    server = make_server(_make_db_with_activity())
+    resp = await server._dispatch({"method": "get_my_recent_activity", "dialog_kinds": ["spaceship"]})
+    assert resp["ok"] is False
+    assert resp["error"] == "invalid_dialog_kinds"
+    assert "dialog_kinds entries" in resp["message"]
 
 
 @pytest.mark.asyncio
@@ -4990,7 +5077,7 @@ async def test_get_my_recent_activity_filters_incoming_messages() -> None:
         )
         server._conn.execute("UPDATE activity_sync_state SET value='1' WHERE key='backfill_complete'")
         server._conn.execute(f"UPDATE activity_sync_state SET value='{now}' WHERE key='last_sync_at'")
-    resp = await server._dispatch({"method": "get_my_recent_activity"})
+    resp = await server._dispatch({"method": "get_my_recent_activity", "dialog_kinds": ["all"]})
     texts = sorted(c["text"] for c in resp["data"]["comments"])
     assert texts == ["mine"], (
         f"Expected exactly the (out=1, is_service=0, is_deleted=0) row 'mine'; "
