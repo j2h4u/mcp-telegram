@@ -33,7 +33,6 @@ dev = [
 
 [project.scripts]
 mcp-telegram = "mcp_telegram:app"
-mcp-telegram-server = "mcp_telegram:app" # backward compatibility
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

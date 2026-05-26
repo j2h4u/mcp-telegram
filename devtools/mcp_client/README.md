@@ -11,7 +11,7 @@ uv run python -m devtools.mcp_client.cli list-tools -- docker exec -i mcp-telegr
 Streamable HTTP:
 
 ```bash
-uv run python -m devtools.mcp_client.cli list-tools --url http://senbonzakura:3100/mcp
+uv run python -m devtools.mcp_client.cli list-tools --url http://127.0.0.1:3100/mcp
 ```
 
 ```bash
@@ -23,7 +23,7 @@ uv run python -m devtools.mcp_client.cli call-tool \
 
 ## Smoke Tests
 
-Two smoke scripts cover all 13 MCP tools:
+Two smoke scripts cover all registered MCP tools:
 
 **No-daemon smoke** — schema validation + graceful degradation (after every build):
 ```bash

@@ -1,9 +1,4 @@
-"""RED tests for feedback_db.py — schema init, DDL contract, constants.
-
-These tests deliberately import symbols from mcp_telegram.feedback_db which
-does NOT yet exist.  The expected outcome is ImportError/ModuleNotFoundError
-at collection time — confirming the RED state before 48-02 lands.
-"""
+"""Tests for feedback_db.py schema lifecycle and constants."""
 
 from __future__ import annotations
 

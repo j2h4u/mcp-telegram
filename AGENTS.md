@@ -6,15 +6,19 @@
 
 ## Architecture
 
-Two-process model running inside a Docker container:
+Default Docker runtime is one container process:
 
-- **Daemon** (`mcp-telegram sync`) — PID 1; owns the TelegramClient exclusively, runs FullSyncWorker
-  and DeltaSyncWorker, handles real-time events, exposes a Unix socket API.
-- **MCP server** (`mcp-telegram run`) — started on demand via `docker exec`; connects to the daemon
-  over the Unix socket, translates tool calls into daemon API requests.
+- **Service** (`mcp-telegram serve`) — PID 1; runs the sync daemon and Streamable HTTP MCP endpoint
+  together. The daemon owns the TelegramClient, runs FullSyncWorker and DeltaSyncWorker, handles
+  real-time events, and exposes its Unix socket API internally.
+- **stdio MCP server** (`mcp-telegram run`) — still available for `docker exec` checks and MCP
+  clients that need stdio. It connects to the daemon over the Unix socket and translates tool calls
+  into daemon API requests.
+- **Daemon-only mode** (`mcp-telegram sync`) — useful for split-mode debugging, but it is not the
+  default Docker command.
 
 State lives in `sync.db` (XDG state home) plus the Telegram session file. The daemon is the only
-writer; the MCP server opens `sync.db` read-only for lightweight queries.
+writer; MCP serving code uses daemon APIs and read-only DB access for lightweight queries.
 
 ## Brownfield Map
 
@@ -41,9 +45,10 @@ writer; the MCP server opens `sync.db` read-only for lightweight queries.
 - `server.py` — MCP stdio server; iterates `TOOL_REGISTRY` for tool listing
 
 ### Deploy (`deploy/`)
-- `Dockerfile` — multi-stage build; copies source via `--from=src additional_contexts`
+- `Dockerfile` — multi-stage build; default command is `mcp-telegram serve`
 - `docker-compose.yml` — template with path placeholders
 - `scripts/healthcheck_daemon.py` — Unix socket healthcheck (copied into image)
+- `scripts/healthcheck_http.py` — Streamable HTTP healthcheck (copied into image)
 - `scripts/healthcheck_all.sh` — healthcheck entrypoint (copied into image)
 - `telegram_qr_login.py` — QR-based auth (repo root, SMS method unreliable); run from deploy dir to produce `telegram_session.session`
 
@@ -143,7 +148,7 @@ uv run python -m devtools.mcp_client.cli script \
 
 - Source repo: `/home/j2h4u/repos/j2h4u/mcp-telegram`
 - Deploy project: `/opt/docker/mcp-telegram`
-- Compose build pulls source via `additional_contexts.src`
+- Compose build uses the repo path as Docker build context
 - Rebuild after code changes:
   ```bash
   docker compose -f /opt/docker/mcp-telegram/docker-compose.yml up -d --build mcp-telegram

@@ -1,12 +1,4 @@
-"""RED tests for DaemonAPIServer._submit_feedback (Phase 48).
-
-Tests reference:
- - mcp_telegram.feedback_db (new in 48-02) — ImportError until that plan lands
- - DaemonAPIServer(conn, client, event, feedback_conn) — 4-arg constructor
-   added in 48-02 — TypeError until that plan lands
-
-Both failures are valid RED signals confirming production wiring is absent.
-"""
+"""Tests for DaemonAPIServer feedback queue methods."""
 
 from __future__ import annotations
 
@@ -20,12 +12,8 @@ import pytest
 from mcp_telegram.daemon_api import DaemonAPIServer
 from mcp_telegram.feedback_db import VALID_SEVERITIES, ensure_feedback_schema
 
-# ---------------------------------------------------------------------------
-# Local test helper — 4-arg constructor intentionally triggers TypeError
-# until 48-02 adds the feedback_conn param to DaemonAPIServer.__init__
-# ---------------------------------------------------------------------------
 
-
+# ---------------------------------------------------------------------------
 def _make_feedback_server(tmp_path):
     """Return (server, feedback_conn) wired to a real feedback.db + in-memory sync.db."""
     sync_conn = sqlite3.connect(":memory:")

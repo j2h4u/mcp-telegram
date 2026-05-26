@@ -1,9 +1,4 @@
-"""RED tests for tools/feedback.py — SubmitFeedback MCP tool (Phase 48).
-
-These tests import from mcp_telegram.tools.feedback which does NOT yet exist.
-Expected outcome: ModuleNotFoundError at collection time — confirming RED state
-before 48-03 lands.
-"""
+"""Tests for the submit_feedback MCP tool."""
 
 from __future__ import annotations
 

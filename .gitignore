@@ -9,3 +9,4 @@ __pycache__
 .hypothesis/
 .planning/
 graphify-out/
+.opencode/

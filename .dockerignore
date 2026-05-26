@@ -1,7 +1,14 @@
 .git/
 .venv/
+.hypothesis/
+.mypy_cache/
+.opencode/
+.planning/
+.pytest_cache/
+.ruff_cache/
 __pycache__/
 *.pyc
 *.session
 .env
 *.egg-info/
+graphify-out/
