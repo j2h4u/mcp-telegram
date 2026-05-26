@@ -43,6 +43,7 @@ asyncio_mode = "auto"
 
 [tool.mypy]
 plugins = ["pydantic.mypy"]
+check_untyped_defs = true
 
 [[tool.mypy.overrides]]
 module = "telethon.*"

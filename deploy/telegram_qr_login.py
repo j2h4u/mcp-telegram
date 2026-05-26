@@ -23,7 +23,6 @@ from dotenv import load_dotenv
 from telethon import TelegramClient
 from telethon.errors import PasswordHashInvalidError, SessionPasswordNeededError
 
-# Загружаем .env
 load_dotenv()
 
 QR_LEFT_PADDING = " " * 6
@@ -32,7 +31,7 @@ QR_REFRESH_MARGIN_SECONDS = 20
 QR_PROGRESS_BAR_WIDTH = 28
 
 def qr_to_terminal(data: str) -> str:
-    """Конвертирует QR данные в терминальный QR код."""
+    """Render QR data as terminal text."""
     qr = qrcode.QRCode(
         version=None,
         error_correction=qrcode.constants.ERROR_CORRECT_L,
@@ -51,7 +50,7 @@ def qr_to_terminal(data: str) -> str:
     return "\n".join(f"{left_padding}{line}" for line in qr_ascii)
 
 def clear_screen() -> None:
-    """Очищает экран терминала"""
+    """Clear the terminal screen."""
     os.system('clear' if os.name == 'posix' else 'cls')
 
 
@@ -69,7 +68,7 @@ def _qr_lifetime(qr_login: Any) -> int:
 
 
 def build_countdown_bar(remaining_seconds: int, total_seconds: int) -> str:
-    """Строит текстовый progress bar обратного отсчета."""
+    """Build a text countdown progress bar."""
     if total_seconds <= 0:
         total_seconds = 1
 
@@ -80,25 +79,25 @@ def build_countdown_bar(remaining_seconds: int, total_seconds: int) -> str:
 
 
 def show_2fa_screen(using_env_password: bool) -> None:
-    """Показывает отдельный экран для шага 2FA."""
+    """Show a dedicated screen for the 2FA step."""
     clear_screen()
     print("=" * 50)
-    print("🔐 TELEGRAM 2FA PASSWORD".center(50))
+    print("TELEGRAM 2FA PASSWORD".center(50))
     print("=" * 50)
-    print("\n✅ QR-код принят Telegram.\n")
+    print("\nTelegram accepted the QR code.\n")
 
     if using_env_password:
-        print("🔒 Используем пароль из TELEGRAM_2FA_PASSWORD.")
+        print("Using the password from TELEGRAM_2FA_PASSWORD.")
     else:
-        print("🔒 Для завершения входа нужен облачный пароль Telegram 2FA.")
-        print("   Это не SMS-код и не код из приложения.")
+        print("Telegram needs the cloud 2FA password to finish login.")
+        print("This is not an SMS code or an in-app login code.")
 
     print("\n" + "=" * 50)
     sys.stdout.flush()
 
 
 async def complete_2fa_login(client: TelegramClient, two_fa_password: str) -> None:
-    """Завершает авторизацию через пароль 2FA."""
+    """Complete login with a 2FA password."""
     if two_fa_password:
         show_2fa_screen(using_env_password=True)
         await client.sign_in(password=two_fa_password)
@@ -108,21 +107,21 @@ async def complete_2fa_login(client: TelegramClient, two_fa_password: str) -> No
 
     if not sys.stdin.isatty():
         raise RuntimeError(
-            "Для ввода 2FA-пароля нужен интерактивный терминал. "
-            "Запусти скрипт в обычном TTY или задай TELEGRAM_2FA_PASSWORD в .env."
+            "Entering a 2FA password requires an interactive terminal. "
+            "Run this script in a normal TTY or set TELEGRAM_2FA_PASSWORD in .env."
         )
 
     for attempt in range(3):
         try:
-            password = getpass.getpass("Введите облачный пароль Telegram 2FA: ")
+            password = getpass.getpass("Enter Telegram cloud 2FA password: ")
         except EOFError as e:
             raise RuntimeError(
-                "Не удалось прочитать 2FA-пароль из терминала. "
-                "Запусти скрипт в интерактивной консоли."
+                "Could not read the 2FA password from the terminal. "
+                "Run this script in an interactive console."
             ) from e
 
         if not password:
-            print("⚠️  Пароль не должен быть пустым.")
+            print("Password must not be empty.")
             continue
 
         try:
@@ -132,7 +131,7 @@ async def complete_2fa_login(client: TelegramClient, two_fa_password: str) -> No
             remaining_attempts = 2 - attempt
             if remaining_attempts == 0:
                 raise
-            print(f"⚠️  Неверный пароль 2FA. Осталось попыток: {remaining_attempts}")
+            print(f"Invalid 2FA password. Attempts remaining: {remaining_attempts}")
 
 
 async def main() -> None:
@@ -141,10 +140,10 @@ async def main() -> None:
     two_fa_password = os.getenv("TELEGRAM_2FA_PASSWORD", "")
 
     if not api_id_raw or not api_hash:
-        print("❌ TELEGRAM_API_ID или TELEGRAM_API_HASH не установлены в .env")
+        print("TELEGRAM_API_ID or TELEGRAM_API_HASH is not set in .env")
         sys.exit(1)
     if not api_id_raw.isdecimal():
-        print("❌ TELEGRAM_API_ID должен быть целым числом")
+        print("TELEGRAM_API_ID must be an integer")
         sys.exit(1)
     api_id = int(api_id_raw)
 
@@ -155,18 +154,16 @@ async def main() -> None:
     await client.connect()
 
     try:
-        # Проверяем, уже ли авторизованы
         if await client.is_user_authorized():
-            print("✅ Уже авторизован!")
+            print("Already authorized.")
             me = await client.get_me()
-            print(f"📞 Номер: {me.phone}")
-            print(f"👤 Имя: {me.first_name}")
+            print(f"Phone: {me.phone}")
+            print(f"Name: {me.first_name}")
             await client.disconnect()
             return
 
-        print("🔐 Запрашиваем QR код для авторизации...\n")
+        print("Requesting a Telegram QR login code...\n")
 
-        # Инициируем QR логин
         qr_login = await client.qr_login()
         qr_total_seconds = _qr_lifetime(qr_login)
 
@@ -180,19 +177,18 @@ async def main() -> None:
                 qr_total_seconds = _qr_lifetime(qr_login)
                 continue
 
-            # Генерируем QR с URL
             qr_ascii = qr_to_terminal(qr_login.url)
             countdown_bar = build_countdown_bar(remaining_seconds, qr_total_seconds)
 
             clear_screen()
             print("=" * 50)
-            print("🔐 TELEGRAM QR LOGIN".center(50))
+            print("TELEGRAM QR LOGIN".center(50))
             print("=" * 50)
-            print(f"\n⏱️  Время истечения QR: {remaining_seconds}с\n")
+            print(f"\nQR expires in: {remaining_seconds}s\n")
             print(f"{countdown_bar}\n")
             print(qr_ascii)
-            print("\n📱 Отсканируй QR код телефоном Telegram")
-            print("⏳ Ожидаем подтверждения...\n")
+            print("\nScan this QR code with Telegram on your phone.")
+            print("Waiting for confirmation...\n")
             print("=" * 50)
 
             try:
@@ -206,22 +202,22 @@ async def main() -> None:
             except SessionPasswordNeededError:
                 await complete_2fa_login(client, two_fa_password)
 
-            print("\n✅ Успешно авторизован!")
+            print("\nAuthorization successful.")
             me = await client.get_me()
-            print(f"📞 Номер: {me.phone}")
-            print(f"👤 Имя: {me.first_name}")
-            print(f"💾 Сессия сохранена в: {session_file}")
+            print(f"Phone: {me.phone}")
+            print(f"Name: {me.first_name}")
+            print(f"Session saved to: {session_file}")
             await client.disconnect()
             return
 
     except asyncio.CancelledError:
-        print("\n⛔ Отменено пользователем")
+        print("\nCancelled by user.")
     except TimeoutError as e:
-        print(f"\n❌ {e}")
+        print(f"\n{e}")
     except PasswordHashInvalidError:
-        print("\n❌ Пароль 2FA неверный. Авторизация не завершена.")
+        print("\nInvalid 2FA password. Authorization was not completed.")
     except Exception as e:
-        print(f"\n❌ Ошибка: {e}")
+        print(f"\nError: {e}")
         traceback.print_exc()
     finally:
         await client.disconnect()
@@ -230,5 +226,5 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n\n⛔ Отменено пользователем")
+        print("\n\nCancelled by user.")
         sys.exit(0)
