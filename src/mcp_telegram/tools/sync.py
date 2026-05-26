@@ -316,6 +316,31 @@ class GetSyncAlerts(ToolArgs):
     limit: int = Field(default=50, description="Maximum deleted messages and edits to return. Default 50.")
 
 
+def _as_int(value: object) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return 0
+    return 0
+
+
+def _alert_timestamp(alert: dict[str, object]) -> tuple[int, int, int, str]:
+    timestamp = alert.get("deleted_at") or alert.get("edit_date") or alert.get("access_lost_at") or 0
+    return (
+        _as_int(timestamp),
+        _as_int(alert.get("dialog_id")),
+        _as_int(alert.get("message_id")),
+        str(alert.get("kind") or ""),
+    )
+
+
 @mcp_tool(
     name="get_sync_alerts",
     title="Sync Alerts",
@@ -422,6 +447,11 @@ async def get_sync_alerts(args: GetSyncAlerts) -> ToolResult:
                     "action": action,
                 }
             )
+
+    deleted_messages.sort(key=_alert_timestamp)
+    edit_alerts.sort(key=_alert_timestamp)
+    access_lost_alerts.sort(key=_alert_timestamp)
+    alerts.sort(key=_alert_timestamp)
 
     structured_content = {
         "alerts": alerts,

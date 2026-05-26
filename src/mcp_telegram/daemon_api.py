@@ -558,7 +558,7 @@ _FETCH_UNREAD_MESSAGES_SQL = (
     f"{_SENDER_ENTITY_JOINS_SQL}"
     f'WHERE m.dialog_id = :dialog_id AND m.message_id > :after_msg_id AND m.is_deleted = 0 '
     f'AND m."out" = 0 AND m.is_service = 0 '
-    f"ORDER BY m.message_id DESC LIMIT :limit"
+    f"ORDER BY m.message_id ASC LIMIT :limit"
 )
 _GET_READ_POSITION_SQL = "SELECT read_inbox_max_id FROM synced_dialogs WHERE dialog_id = ?"
 _COUNT_BOOTSTRAP_PENDING_SQL = (
@@ -746,10 +746,20 @@ def _dialog_status_map(conn: sqlite3.Connection, dialog_ids: set[int]) -> dict[i
         f"SELECT dialog_id, status FROM synced_dialogs WHERE dialog_id IN ({placeholders})",
         tuple(dialog_ids),
     ).fetchall()
-    result = {int(row[0]): str(row[1]) for row in rows}
+    result: dict[int, str | None] = {int(row[0]): str(row[1]) for row in rows}
     for dialog_id in dialog_ids:
         result.setdefault(dialog_id, None)
     return result
+
+
+def _row_int(row: sqlite3.Row | dict, key: str) -> int:
+    value = _row_value(row, key)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        return int(value)
+    msg = f"{key} must be an integer"
+    raise ValueError(msg)
 
 
 def _get_trace_coverage_fragments(
@@ -846,7 +856,7 @@ def _build_trace_coverage(
     exact_topic_id: int | None = None,
 ) -> dict:
     """Build bounded Account Trace coverage semantics for the current response."""
-    observed_dialogs = {int(_row_value(row, "dialog_id")) for row in rows}
+    observed_dialogs = {_row_int(row, "dialog_id") for row in rows}
     fragments = _get_trace_coverage_fragments(
         conn,
         target_user_id=target_user_id,
@@ -1149,6 +1159,8 @@ def _trace_common_chat_ids(conn: sqlite3.Connection, target_user_id: int) -> lis
         if not isinstance(item, dict):
             continue
         raw_id = item.get("id")
+        if raw_id is None:
+            continue
         try:
             ids.append(int(raw_id))
         except (TypeError, ValueError):
@@ -1198,7 +1210,7 @@ def _trace_candidate_dialogs(
         add_candidate(exact_dialog_id, origin="exact_dialog", include_inaccessible=True)
 
     for row in observed_rows:
-        add_candidate(int(_row_value(row, "dialog_id")), origin="observed_evidence")
+        add_candidate(_row_int(row, "dialog_id"), origin="observed_evidence")
 
     fragment_rows = conn.execute(
         """
@@ -2172,7 +2184,8 @@ class DaemonAPIServer:
                 int(identity_rows[-1]["message_id"]),
             )
         else:
-            checkpoint_cursor = req.get("cursor")
+            cursor_value = req.get("cursor")
+            checkpoint_cursor = cursor_value if isinstance(cursor_value, str) else None
 
         if update_rows:
             max_update_epoch = max(int(row["unit_updated_epoch"]) for row in update_rows)
@@ -2183,8 +2196,12 @@ class DaemonAPIServer:
                 int(last_at_watermark["message_id"]),
             )
         else:
-            updated_after = req.get("updated_after")
-            updated_after_cursor_out = req.get("updated_after_cursor")
+            updated_after_value = req.get("updated_after")
+            updated_after = updated_after_value if isinstance(updated_after_value, str) else None
+            updated_after_cursor_value = req.get("updated_after_cursor")
+            updated_after_cursor_out = (
+                updated_after_cursor_value if isinstance(updated_after_cursor_value, str) else None
+            )
 
         next_cursor = None
         if identity_rows and has_more_identity:
@@ -2665,7 +2682,7 @@ class DaemonAPIServer:
 
     @staticmethod
     def _maybe_encode_next_nav(
-        messages: list[ReadMessage],
+        messages: list[ReadMessage] | list[dict],
         limit: int,
         dialog_id: int,
         direction: str,
@@ -2674,7 +2691,7 @@ class DaemonAPIServer:
         """Encode a next-page navigation token if the result set is full."""
         if messages and len(messages) == limit:
             last = messages[-1]
-            last_msg_id = last["message_id"] if isinstance(last, dict) else last.message_id
+            last_msg_id = int(last["message_id"] if isinstance(last, dict) else last.message_id)
             logger.debug(
                 "list_messages_pagination anchor_msg_id=%d dialog_id=%d direction=%s%s",
                 last_msg_id,
@@ -2857,7 +2874,15 @@ class DaemonAPIServer:
     def _group_trace_evidence(evidence: list[dict], group_by: str) -> list[dict]:
         """Group the already-selected Account Trace page for presentation."""
         groups: dict[str, dict] = {}
-        for item in evidence:
+        ordered_evidence = sorted(
+            evidence,
+            key=lambda item: (
+                int(item.get("sent_at") or 0),
+                int(item.get("dialog_id") or 0),
+                int(item.get("message_id") or 0),
+            ),
+        )
+        for item in ordered_evidence:
             if group_by == "dialog":
                 topic_id = item.get("topic_id")
                 topic_suffix = f":topic:{topic_id}" if topic_id is not None else ""
@@ -2942,7 +2967,7 @@ class DaemonAPIServer:
         dialog_id = int(candidate["dialog_id"])
         topic_id = candidate.get("topic_id")
         strategy = str(candidate.get("strategy", "unsupported"))
-        result = {
+        result: dict[str, Any] = {
             "status": "complete",
             "attempted": 0,
             "skipped": 0,
@@ -3327,7 +3352,7 @@ class DaemonAPIServer:
             exact_dialog_id=exact_dialog_id,
             exact_topic_id=exact_topic_id,
         )
-        data = {
+        data: dict[str, Any] = {
             "resolved_account": resolved_account,
             "groups": self._group_trace_evidence(evidence, group_by),
             "coverage": coverage,
@@ -5767,7 +5792,9 @@ class DaemonAPIServer:
         since_ts = int(time.time()) - since_hours * 3600
 
         rows = self._conn.execute(
-            "SELECT m.dialog_id, m.message_id, m.sent_at, m.text, "
+            "SELECT * FROM ("
+            "SELECT m.dialog_id AS dialog_id, m.message_id AS message_id, "
+            "       m.sent_at AS sent_at, m.text AS text, "
             "       e.name AS dialog_name, "
             "       sd.status AS sync_status "
             "FROM messages m "
@@ -5781,8 +5808,9 @@ class DaemonAPIServer:
             #   deleted — same pre-v15 behavior preservation rationale.
             "WHERE m.out = 1 AND m.is_service = 0 AND m.is_deleted = 0 "
             "  AND m.sent_at >= ? "
-            "ORDER BY m.sent_at DESC "
-            "LIMIT ?",
+            "ORDER BY m.sent_at DESC, m.dialog_id DESC, m.message_id DESC "
+            "LIMIT ?"
+            ") ORDER BY sent_at ASC, dialog_id ASC, message_id ASC",
             (since_ts, limit),
         ).fetchall()
 

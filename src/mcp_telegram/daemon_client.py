@@ -159,7 +159,7 @@ class DaemonConnection:
             dialog: Fuzzy dialog name — daemon resolves via get_entity/iter_dialogs.
             limit: Max messages to return (daemon clamps to 1..500).
             navigation: Opaque cursor token from a previous next_navigation response.
-            direction: "newest" (default) or "oldest" sort order.
+            direction: Internal page-selection direction; response presentation is chronological.
             sender_id: Filter messages by sender id (sync.db: AND clause, on-demand: from_user=).
             sender_name: Filter by sender name (case-insensitive LIKE, sync.db only).
             topic_id: Filter by forum topic id.

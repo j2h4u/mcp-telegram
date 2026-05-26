@@ -214,7 +214,7 @@ def test_search_messages_structured_payload_includes_dialog_anchor_read_state_wa
 
 def test_list_messages_structured_page_metadata_preserves_navigation_warning_coverage_and_limits():
     payload = _list_messages_structured_content(
-        args=ListMessages(exact_dialog_id=123, limit=10, navigation="oldest", anchor_message_id=50),
+        args=ListMessages(exact_dialog_id=123, limit=10, navigation="start", anchor_message_id=50),
         data={
             "messages": [],
             "source": "sync_db",
@@ -248,7 +248,7 @@ def test_list_messages_structured_page_metadata_preserves_navigation_warning_cov
     assert "No current access" in payload["warnings"][0]["message"]
     assert payload["navigation"]["next_navigation"] == "history-token"
     assert payload["navigation"]["anchor_message_id"] == 50
-    assert payload["navigation"]["direction_input"] == "oldest"
+    assert payload["navigation"]["direction"] == "around"
     assert payload["presentation"]["messages_order"] == "chronological"
     assert payload["presentation"]["is_chronological"] is True
     assert payload["limits"] == {
@@ -292,7 +292,7 @@ def test_list_messages_always_presents_selected_page_chronologically_with_reply_
     ]
 
     payload = _list_messages_structured_content(
-        args=ListMessages(exact_dialog_id=123, navigation="newest"),
+        args=ListMessages(exact_dialog_id=123, navigation="latest"),
         data={"messages": rows, "source": "sync_db", "next_navigation": "history-token"},
         rows=rows,
         dialog_id=123,

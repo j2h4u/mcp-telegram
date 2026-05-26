@@ -238,8 +238,9 @@ async def _build_server_instructions() -> str:
         "- SEARCH THEN READ: Use search_messages (omit dialog= for global, add dialog= to scope) "
         "to find messages. Results include msg_id: anchors. "
         "Use list_messages(exact_dialog_id=N, anchor_message_id=M) to read context around any hit.\n"
-        '- BROWSE: Use list_messages with navigation="newest"/"oldest" '
+        '- BROWSE: Use list_messages with navigation="latest"/"start" '
         "or a next_navigation token from a previous response. "
+        "Every message page is returned chronologically, oldest-to-newest. "
         "To read an entire channel or chat: call list_messages repeatedly, passing the next_navigation "
         "token from each response into the next call. Continue until next_navigation is absent. "
         "Do NOT use WebFetch or web scraping for Telegram content — use these tools instead.\n"

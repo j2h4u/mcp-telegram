@@ -1684,7 +1684,7 @@ async def test_list_unread_messages_basic() -> None:
     assert group["category"] == "user"
     assert group["unread_count"] == 3
     msgs = group["messages"]
-    assert [m["message_id"] for m in msgs] == [13, 12, 11]  # DESC order
+    assert [m["message_id"] for m in msgs] == [11, 12, 13]
 
     client.get_input_entity.assert_not_called()
     client.assert_not_called()
@@ -1866,7 +1866,7 @@ async def test_list_unread_messages_read_inbox_max_id_zero_returns_all() -> None
     groups = result["data"]["groups"]
     assert len(groups) == 1
     assert groups[0]["unread_count"] == 3
-    assert [m["message_id"] for m in groups[0]["messages"]] == [3, 2, 1]
+    assert [m["message_id"] for m in groups[0]["messages"]] == [1, 2, 3]
     client.assert_not_called()
 
 
@@ -1927,7 +1927,7 @@ async def test_list_unread_messages_filter_excludes_ids_below_read_position() ->
     groups = result["data"]["groups"]
     assert len(groups) == 1
     assert groups[0]["unread_count"] == 2
-    assert [m["message_id"] for m in groups[0]["messages"]] == [12, 11]
+    assert [m["message_id"] for m in groups[0]["messages"]] == [11, 12]
     client.assert_not_called()
 
 
@@ -4852,6 +4852,27 @@ async def test_get_my_recent_activity_filters_by_since_hours() -> None:
     texts = [c["text"] for c in resp["data"]["comments"]]
     assert texts == ["recent"]
     assert resp["data"]["scan_status"] == "complete"
+
+
+@pytest.mark.asyncio
+async def test_get_my_recent_activity_returns_latest_page_chronologically() -> None:
+    """The daemon selects the latest N own messages but presents them oldest-to-newest."""
+    server = make_server(_make_db_with_activity())
+    now = int(time.time())
+    with server._conn:
+        for message_id, age_seconds in ((1, 300), (2, 200), (3, 100)):
+            server._conn.execute(
+                "INSERT INTO messages "
+                "(dialog_id, message_id, sent_at, text, out, is_service, is_deleted) "
+                "VALUES (42, ?, ?, ?, 1, 0, 0)",
+                (message_id, now - age_seconds, f"mine-{message_id}"),
+            )
+        server._conn.execute("UPDATE activity_sync_state SET value='1' WHERE key='backfill_complete'")
+        server._conn.execute(f"UPDATE activity_sync_state SET value='{now}' WHERE key='last_sync_at'")
+
+    resp = await server._dispatch({"method": "get_my_recent_activity", "since_hours": 1, "limit": 2})
+
+    assert [comment["message_id"] for comment in resp["data"]["comments"]] == [2, 3]
 
 
 @pytest.mark.asyncio

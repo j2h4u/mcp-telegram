@@ -1085,14 +1085,14 @@ def _trace_evidence_group() -> dict:
                 "dialog_type": "Forum",
                 "topic_id": 7,
                 "topic_title": "Topic",
-                "message_id": 10,
-                "sent_at": 1_700_000_010,
+                "message_id": 11,
+                "sent_at": 1_700_000_011,
                 "sender_id": 101,
                 "effective_sender_id": 101,
                 "authorship_basis": "effective_sender_id",
                 "author_signature": None,
-                "text": "first trace hit",
-                "media_description": None,
+                "text": None,
+                "media_description": "photo attachment",
             },
             {
                 "source": "sync_db",
@@ -1102,14 +1102,14 @@ def _trace_evidence_group() -> dict:
                 "dialog_type": "Forum",
                 "topic_id": 7,
                 "topic_title": "Topic",
-                "message_id": 11,
-                "sent_at": 1_700_000_011,
+                "message_id": 10,
+                "sent_at": 1_700_000_010,
                 "sender_id": 101,
                 "effective_sender_id": 101,
                 "authorship_basis": "effective_sender_id",
                 "author_signature": None,
-                "text": None,
-                "media_description": "photo attachment",
+                "text": "first trace hit",
+                "media_description": None,
             },
         ],
     }
@@ -1455,7 +1455,7 @@ async def test_get_sync_alerts_via_daemon():
             "ok": True,
             "data": {
                 "deleted_messages": [
-                    {"dialog_id": 1, "message_id": 100, "deleted_at": 1700000500},
+                    {"dialog_id": 1, "message_id": 100, "deleted_at": 1700000800},
                 ],
                 "edits": [
                     {"dialog_id": 1, "message_id": 200, "version": 1, "edit_date": 1700000600},
@@ -1471,20 +1471,7 @@ async def test_get_sync_alerts_via_daemon():
     assert result.content == ()
     assert result.structured_content is not None
     assert result.structured_content["count"] == 3
-    assert result.structured_content["alerts"][0]["dialog_id"] == 1
     assert result.structured_content["alerts"][0] == {
-        "kind": "deleted_message",
-        "dialog_id": 1,
-        "message_id": 100,
-        "deleted_at": 1700000500,
-        "version": None,
-        "edit_date": None,
-        "access_lost_at": None,
-        "severity": "medium",
-        "message": "Deleted message msg=100 deleted_at=1700000500",
-        "action": "Inspect the dialog history around this message id if surrounding context is needed.",
-    }
-    assert result.structured_content["alerts"][1] == {
         "kind": "edit",
         "dialog_id": 1,
         "message_id": 200,
@@ -1496,8 +1483,7 @@ async def test_get_sync_alerts_via_daemon():
         "message": "Edited message msg=200 v1 edit_date=1700000600",
         "action": "Treat cached text as versioned; inspect edit history before relying on older wording.",
     }
-    assert result.structured_content["alerts"][2]["severity"] == "high"
-    assert result.structured_content["alerts"][2] == {
+    assert result.structured_content["alerts"][1] == {
         "kind": "access_lost",
         "dialog_id": 2,
         "message_id": None,
@@ -1509,11 +1495,23 @@ async def test_get_sync_alerts_via_daemon():
         "message": "Access lost at 1700000700",
         "action": "Use get_sync_status for coverage details.",
     }
+    assert result.structured_content["alerts"][2] == {
+        "kind": "deleted_message",
+        "dialog_id": 1,
+        "message_id": 100,
+        "deleted_at": 1700000800,
+        "version": None,
+        "edit_date": None,
+        "access_lost_at": None,
+        "severity": "medium",
+        "message": "Deleted message msg=100 deleted_at=1700000800",
+        "action": "Inspect the dialog history around this message id if surrounding context is needed.",
+    }
     assert result.structured_content["deleted_messages"] == [
         {
             "dialog_id": 1,
             "message_id": 100,
-            "deleted_at": 1700000500,
+            "deleted_at": 1700000800,
             "action": "Inspect the dialog history around this message id if surrounding context is needed.",
         }
     ]
@@ -1750,6 +1748,48 @@ async def test_get_inbox_via_daemon():
     assert dialog["messages"][0]["content"]["is_telegram_content"] is True
     assert dialog["messages"][0]["content"]["content_kind"] == "message_text"
     conn.get_inbox.assert_called_once()
+
+
+async def test_get_inbox_presents_each_dialog_chronologically():
+    conn = _make_daemon_conn(
+        {
+            "ok": True,
+            "data": {
+                "groups": [
+                    {
+                        "dialog_id": 123,
+                        "display_name": "Alice",
+                        "tier": 30,
+                        "category": "user",
+                        "dialog_type": "User",
+                        "unread_count": 2,
+                        "read_state": None,
+                        "messages": [
+                            {
+                                "message_id": 2,
+                                "sent_at": 1_700_000_060,
+                                "dialog_id": 123,
+                                "text": "second",
+                                "sender_id": 123,
+                            },
+                            {
+                                "message_id": 1,
+                                "sent_at": 1_700_000_000,
+                                "dialog_id": 123,
+                                "text": "first",
+                                "sender_id": 123,
+                            },
+                        ],
+                    },
+                ],
+            },
+        }
+    )
+    with _patch_daemon(conn):
+        result = await get_inbox(GetInbox())
+
+    dialog = result.structured_content["dialogs"][0]
+    assert [message["msg_id"] for message in dialog["messages"]] == [1, 2]
 
 
 async def test_get_inbox_frames_adversarial_body_without_framing_group_header():
@@ -2392,13 +2432,25 @@ async def test_list_messages_sends_direction_newest():
 
 
 async def test_list_messages_sends_direction_oldest():
-    """list_messages with navigation='oldest' passes direction='oldest' to conn.list_messages."""
+    """list_messages with navigation='start' passes direction='oldest' to conn.list_messages."""
     conn = _make_daemon_conn({"ok": True, "data": {"messages": [], "source": "sync_db"}})
     with _patch_daemon(conn):
-        await list_messages(ListMessages(exact_dialog_id=1, navigation="oldest"))
+        await list_messages(ListMessages(exact_dialog_id=1, navigation="start"))
 
     call_kwargs = conn.list_messages.call_args[1]
     assert call_kwargs.get("direction") == "oldest"
+    assert call_kwargs.get("navigation") is None
+
+
+async def test_list_messages_rejects_legacy_navigation_selectors():
+    conn = _make_daemon_conn({"ok": True, "data": {"messages": [], "source": "sync_db"}})
+    with _patch_daemon(conn):
+        result = await list_messages(ListMessages(exact_dialog_id=1, navigation="oldest"))
+
+    assert result.is_error is True
+    assert "latest" in result.content[0].text
+    assert "start" in result.content[0].text
+    conn.list_messages.assert_not_called()
 
 
 async def test_list_messages_sends_unread():
@@ -2519,20 +2571,20 @@ async def test_get_my_recent_activity_routes_primary():
                 "comments": [
                     {
                         "dialog_id": 42,
-                        "message_id": 100,
-                        "sent_at": 1_700_000_000,
-                        "text": "first",
-                        "reactions": None,
-                        "reply_count": 0,
-                        "dialog_name": "MyGroup",
-                    },
-                    {
-                        "dialog_id": 42,
                         "message_id": 101,
                         "sent_at": 1_700_000_060,
                         "text": "second",
                         "reactions": None,
                         "reply_count": 2,
+                        "dialog_name": "MyGroup",
+                    },
+                    {
+                        "dialog_id": 42,
+                        "message_id": 100,
+                        "sent_at": 1_700_000_000,
+                        "text": "first",
+                        "reactions": None,
+                        "reply_count": 0,
                         "dialog_name": "MyGroup",
                     },
                 ],

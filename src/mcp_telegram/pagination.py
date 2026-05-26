@@ -19,7 +19,7 @@ AccountTraceGroupBy = Literal["timeline", "dialog"]
 
 
 class HistoryDirection(StrEnum):
-    """Direction for history navigation — newest-first (default) or oldest-first."""
+    """Internal history page-selection direction; presentation stays chronological."""
 
     NEWEST = "newest"
     OLDEST = "oldest"

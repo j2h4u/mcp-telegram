@@ -139,6 +139,17 @@ def _structured_comment(comment: dict[str, Any]) -> dict[str, object]:
     }
 
 
+def _chronological_comments(comments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(
+        comments,
+        key=lambda comment: (
+            int(comment.get("sent_at") or 0),
+            int(comment.get("dialog_id") or 0),
+            int(comment.get("message_id") or 0),
+        ),
+    )
+
+
 @mcp_tool(
     name="get_my_recent_activity",
     title="Recent Activity",
@@ -162,7 +173,7 @@ async def get_my_recent_activity(args: GetMyRecentActivity) -> ToolResult:
     comments = data.get("comments") or []
     scan_status = data.get("scan_status") or "never_run"
     scanned_at = data.get("scanned_at")
-    structured_comments = [_structured_comment(comment) for comment in comments]
+    structured_comments = [_structured_comment(comment) for comment in _chronological_comments(comments)]
     structured_content = {
         "since_hours": args.since_hours,
         "limit": args.limit,

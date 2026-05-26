@@ -195,7 +195,6 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
                 "has_more": {"type": "boolean"},
                 "source_cursor": {"type": ["string", "null"]},
                 "direction": {"type": "string"},
-                "direction_input": {"type": "string"},
                 "anchor_message_id": {"type": ["integer", "null"]},
             },
             "required": [
@@ -203,7 +202,6 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
                 "has_more",
                 "source_cursor",
                 "direction",
-                "direction_input",
                 "anchor_message_id",
             ],
             "additionalProperties": False,
@@ -608,7 +606,6 @@ def _list_messages_structured_content(
             "has_more": next_navigation is not None,
             "source_cursor": args.navigation,
             "direction": _navigation_direction_for_structured(direction, args.anchor_message_id),
-            "direction_input": direction,
             "anchor_message_id": args.anchor_message_id,
         },
         "presentation": {
@@ -933,10 +930,10 @@ class ListMessages(ToolArgs):
     read-state metadata, coverage, filters, limits, truncation, and pagination metadata in
     structuredContent. Successful MCP responses intentionally leave text content empty.
 
-    Use navigation="newest" (or omit navigation) to start from the latest messages.
+    Omit navigation or set navigation="latest" to start from the latest message page.
     The returned page is always presented chronologically (oldest-to-newest within the page)
     so agents can read the conversation top-to-bottom while still getting the recent tail.
-    Use navigation="oldest" to start from the oldest messages in the dialog.
+    Use navigation="start" to start from the oldest messages in the dialog.
     Use navigation= with the next_navigation token from a previous response to continue paging.
     To read an entire channel or chat history: call this tool repeatedly, passing the next_navigation
     token from each response as navigation= in the next call. Stop when next_navigation is absent.
@@ -988,8 +985,8 @@ class ListMessages(ToolArgs):
         default=None,
         max_length=2000,
         description=(
-            'Optional shared navigation state. Omit or set to "newest" to start from the latest '
-            'messages. Set to "oldest" to start from the oldest messages. Reuse the exact '
+            'Optional shared navigation state. Omit or set to "latest" to start from the latest '
+            'message page. Set to "start" to start from the beginning. Reuse the exact '
             "next_navigation token from the previous ListMessages response to continue."
         ),
     )
@@ -1103,7 +1100,16 @@ async def _resolve_topic_id(
 )
 async def list_messages(args: ListMessages) -> ToolResult:
     has_filter = bool(args.sender or args.topic or args.exact_topic_id is not None or args.unread)
-    has_cursor = args.navigation is not None and args.navigation not in {"newest", "oldest"}
+    navigation_sentinels = {"latest", "start"}
+    has_cursor = args.navigation is not None and args.navigation not in navigation_sentinels
+    if args.navigation in {"newest", "oldest"}:
+        return error_result(
+            'Unsupported navigation selector. Use navigation="latest", navigation="start", '
+            "or an opaque next_navigation token returned by list_messages.\n"
+            "Action: Retry list_messages with latest/start page navigation.",
+            has_filter=has_filter,
+            has_cursor=False,
+        )
 
     # Resolve dialog_id locally if possible (numeric string / @username / entity cache)
     dialog_id: int | None = args.exact_dialog_id
@@ -1113,13 +1119,14 @@ async def list_messages(args: ListMessages) -> ToolResult:
             dialog_id = exact_id
         # If still None, dialog name goes to daemon for server-side resolution
 
-    # Derive direction from navigation sentinel or default to newest
+    # Derive page-selection direction from navigation sentinel; response order is always chronological.
     direction: str
-    if args.navigation == "oldest":
+    if args.navigation in {"start", "oldest"}:
         direction = "oldest"
     else:
         direction = "newest"
     # If navigation is an opaque token, direction is encoded in it (daemon handles it)
+    daemon_navigation = None if args.navigation in navigation_sentinels else args.navigation
 
     # Sender passthrough: numeric string → sender_id (works on live Telegram path via from_user=)
     sender_id: int | None = None
@@ -1159,7 +1166,7 @@ async def list_messages(args: ListMessages) -> ToolResult:
             response = await conn.list_messages(
                 **id_kwarg,
                 limit=args.limit,
-                navigation=args.navigation,
+                navigation=daemon_navigation,
                 direction=direction,
                 sender_id=sender_id,
                 sender_name=sender_name,

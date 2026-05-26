@@ -40,8 +40,8 @@ def test_list_messages_reflection_exposes_shared_navigation_schema() -> None:
     assert properties["navigation"]["type"] == "string"
     assert properties["exact_dialog_id"]["type"] == "integer"
     assert properties["exact_topic_id"]["type"] == "integer"
-    assert '"newest"' in properties["navigation"]["description"]
-    assert '"oldest"' in properties["navigation"]["description"]
+    assert '"latest"' in properties["navigation"]["description"]
+    assert '"start"' in properties["navigation"]["description"]
     assert "already known" in properties["exact_dialog_id"]["description"]
     assert "Mutually exclusive with dialog" in properties["exact_dialog_id"]["description"]
     assert "full topic catalog" in properties["exact_topic_id"]["description"]

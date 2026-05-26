@@ -202,7 +202,7 @@ class GetInbox(ToolArgs):
 
     Priority tiers (lower = higher priority): @mentions in DMs, @mentions in groups,
     human DMs, bot DMs, small groups, large groups, channels.
-    Within each tier, chats are sorted by recency (newest first).
+    Within each tier, chats are prioritized by recent activity; messages inside each chat are chronological.
     Per-chat message budget is allocated proportionally to prevent flooding.
 
     Use scope="personal" (default) to see only DMs and small groups (≤ group_size_threshold members).
@@ -326,10 +326,17 @@ def _read_state_payload(read_state: ReadState | dict | None, dialog_type: str | 
 def _structured_messages(rows: list[dict], *, read_state: dict | None, dialog_type: str | None) -> list[dict[str, object]]:
     if not rows:
         return []
-    messages = [ReadMessage(**row) for row in rows]
+    ordered_rows = sorted(
+        rows,
+        key=lambda row: (
+            int(row.get("sent_at") or 0),
+            int(row.get("message_id") or 0),
+        ),
+    )
+    messages = [ReadMessage(**row) for row in ordered_rows]
     marker_by_message = _compute_inline_markers(messages, read_state) if dialog_type == "User" else {}
     structured: list[dict[str, object]] = []
-    for row, message in zip(rows, messages, strict=False):
+    for row, message in zip(ordered_rows, messages, strict=False):
         marker_label = marker_by_message.get(message.id)
         read_markers = [_structured_read_marker(message.id, marker_label)] if marker_label else []
         text = message.text or ""
