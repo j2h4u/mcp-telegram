@@ -13,6 +13,8 @@ services:
       # The container binds all interfaces internally, while Docker publishes
       # the port only on host loopback below.
       - MCP_TELEGRAM_HTTP_ALLOW_UNSAFE=1
+      - MCP_TELEGRAM_HTTP_ALLOWED_HOSTS=127.0.0.1:*,localhost:*,mcp-telegram:3100,mcp-telegram:*
+      - MCP_TELEGRAM_HTTP_ALLOWED_ORIGINS=http://127.0.0.1:*,http://localhost:*
       - PYTHONUNBUFFERED=1
     ports:
       - "127.0.0.1:3100:3100"

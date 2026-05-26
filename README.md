@@ -276,12 +276,24 @@ uv run python -m devtools.mcp_client.cli call-tool \
 
 ## Data and Privacy
 
+- `/opt/docker/mcp-telegram/docker-compose.yml` is the live deployment control
+  file on this machine. `deploy/docker-compose.yml` is the repository template;
+  the deployed file can have local-only values such as the absolute repository
+  path and extra Docker networks.
 - Runtime state lives under the XDG state directory inside the container:
-  `/root/.local/state/mcp-telegram`.
-- `sync.db` stores mirrored Telegram metadata and message content for synced or
-  locally observed dialogs.
-- `feedback.db` stores agent-submitted feedback.
-- `telegram_session.session` is a secret. Treat it like an account credential.
+  `/root/.local/state/mcp-telegram`. In Docker, that directory is backed by the
+  named volume `mcp-telegram_state`.
+- The live Telegram mirror is `/root/.local/state/mcp-telegram/sync.db` inside
+  the container. Its `sync.db-wal` and `sync.db-shm` siblings are normal SQLite
+  WAL-mode sidecar files, not separate databases.
+- `feedback.db` in the same state directory stores agent-submitted feedback.
+- `/opt/docker/mcp-telegram/telegram_session.session` is bind-mounted into the
+  container as `/root/.local/state/mcp-telegram/mcp_telegram_session.session`.
+  This is the active Telegram session file and must be treated like an account
+  credential.
+- Files under `/opt/docker/mcp-telegram/backups/` are point-in-time operator
+  backups. They are not mounted into the running container and may be smaller or
+  older than the live SQLite files.
 - Telegram text, usernames, dialog titles, reactions, media descriptions, and
   forwarded metadata are untrusted external content.
 - Logs should not be used as a place to inspect raw Telegram message content.
