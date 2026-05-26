@@ -14,18 +14,6 @@ def _run(ctx: Context) -> None:
 
 
 @app.command()
-def sign_in(
-    api_id: Annotated[str, Option(help="Telegram API id")],
-    api_hash: Annotated[str, Option(help="Telegram API hash")],
-    phone_number: Annotated[str, Option(help="Phone number with country code")],
-) -> None:
-    """Connect to Telegram API."""
-    from .telegram import connect_to_telegram
-
-    asyncio.run(connect_to_telegram(api_id, api_hash, phone_number))
-
-
-@app.command()
 def run() -> None:
     """Run the mcp-telegram server."""
     from .server import run_mcp_server

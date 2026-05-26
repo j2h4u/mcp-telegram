@@ -18,7 +18,7 @@ from mcp_telegram.daemon_api import DaemonAPIServer
 
 
 def test_sync_command_exists() -> None:
-    """Typer CLI has a 'sync' command — verified via --help output."""
+    """Typer CLI exposes runtime commands and not the retired login-code flow."""
     from typer.testing import CliRunner
 
     from mcp_telegram import app
@@ -27,6 +27,8 @@ def test_sync_command_exists() -> None:
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
     assert "sync" in result.output
+    assert "serve" in result.output
+    assert "sign-in" not in result.output
 
 
 # ---------------------------------------------------------------------------

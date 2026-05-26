@@ -181,8 +181,10 @@ get_sync_status(dialog_id=<dialog_id>)
    uv run ./telegram_qr_login.py
    ```
 
-   The older `mcp-telegram sign-in` SMS flow still exists, but QR login is the
-   reliable path in practice.
+   The old login-code flow is intentionally not documented or exposed here. It
+   used to rely on Telegram delivering a login code through Telegram messages
+   or SMS, but repeated project setup attempts showed that those codes were not
+   delivered for this client flow. QR login is the supported setup path.
 
 6. Build and start the container.
 

@@ -1,11 +1,8 @@
 import logging
 from functools import cache
-from getpass import getpass
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from telethon import TelegramClient  # type: ignore[import-untyped]
-from telethon.errors.rpcerrorlist import SessionPasswordNeededError  # type: ignore[import-untyped]
-from telethon.tl.types import User  # type: ignore[import-untyped]
 from xdg_base_dirs import xdg_state_home  # type: ignore[import-error]
 
 logger = logging.getLogger(__name__)
@@ -18,31 +15,6 @@ class TelegramSettings(BaseSettings):
 
     api_id: str
     api_hash: str
-
-
-async def connect_to_telegram(api_id: str, api_hash: str, phone_number: str) -> None:
-    """Interactive login flow: send code, prompt for it, sign in (with 2FA fallback)."""
-    client = create_client(api_id=api_id, api_hash=api_hash)
-    await client.connect()
-
-    result = await client.send_code_request(phone_number)
-    code = input("Enter login code: ")
-    try:
-        await client.sign_in(
-            phone=phone_number,
-            code=code,
-            phone_code_hash=result.phone_code_hash,
-        )
-    except SessionPasswordNeededError:
-        password = getpass("Enter 2FA password: ")
-        await client.sign_in(password=password)
-
-    user = await client.get_me()
-    if isinstance(user, User):
-        print(f"Hey {user.username}! You are connected!")
-    else:
-        print("Connected!")
-    print("You can now use the mcp-telegram server.")
 
 
 async def logout_from_telegram() -> None:

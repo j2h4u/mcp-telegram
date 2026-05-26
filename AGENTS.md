@@ -33,7 +33,7 @@ writer; MCP serving code uses daemon APIs and read-only DB access for lightweigh
 - `read_state.py` — `apply_read_cursor()`: monotonic inbox/outbox read cursor writes to `synced_dialogs`
 - `fts.py` — FTS5 full-text search with Russian snowball stemming
 - `telegram.py` — TelegramClient factory and auth flows
-- `__init__.py` — CLI entrypoint: `sign-in`, `run`, `logout`, `sync`, `serve`, `feedback`
+- `__init__.py` — CLI entrypoint: `run`, `logout`, `sync`, `serve`, `feedback`
 
 ### Shared Utilities
 - `models.py` — TypedDict schemas, dataclasses (`StoredMessage`, `ReadMessage`)
