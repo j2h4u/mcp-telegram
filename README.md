@@ -57,3 +57,11 @@ Create a deploy directory with `.env` (containing `TELEGRAM_API_ID` and `TELEGRA
 ## Development
 
 See `AGENTS.md` for codebase map, tool patterns, and runtime discipline.
+
+## Project origin
+
+This project originally started as a fork of
+[`sparfenyuk/mcp-telegram`](https://github.com/sparfenyuk/mcp-telegram). It has
+since diverged substantially in architecture, runtime model, local sync storage,
+and MCP tool surface, and is now maintained as an independent project rather
+than a downstream variant of the original server.
