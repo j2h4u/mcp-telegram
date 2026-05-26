@@ -156,6 +156,12 @@ get_sync_status(dialog_id=<dialog_id>)
 
 4. Create `/opt/docker/mcp-telegram/.env`.
 
+   First create a Telegram API application at
+   [my.telegram.org](https://my.telegram.org/) → **API development tools**. This
+   produces `api_id` and `api_hash` for an MTProto client application. These
+   values identify the client software; they do not authorize this server to
+   read your account yet.
+
    ```env
    TELEGRAM_API_ID=123456
    TELEGRAM_API_HASH=your_api_hash
@@ -163,9 +169,12 @@ get_sync_status(dialog_id=<dialog_id>)
    # TELEGRAM_2FA_PASSWORD=your_cloud_password
    ```
 
-5. Authenticate once via QR login from the deploy directory. The script reads
-   `.env` and writes `telegram_session.session` in that directory, which the
-   compose file mounts into the container.
+5. Authenticate once via QR login from the deploy directory. The helper uses
+   `TELEGRAM_API_ID` and `TELEGRAM_API_HASH` to start a Telegram client session,
+   prints a QR code in the terminal, and waits for you to approve that login
+   from an already logged-in Telegram mobile or desktop app. After approval, it
+   writes `telegram_session.session` in the deploy directory, which the compose
+   file mounts into the container.
 
    ```bash
    cd /opt/docker/mcp-telegram
