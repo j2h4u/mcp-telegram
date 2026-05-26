@@ -4920,6 +4920,38 @@ async def test_get_my_recent_activity_joins_dialog_name() -> None:
 
 
 @pytest.mark.asyncio
+async def test_get_my_recent_activity_counts_local_direct_replies() -> None:
+    """reply_count includes local messages that directly reply to the own message."""
+    server = make_server(_make_db_with_activity())
+    now = int(time.time())
+    with server._conn:
+        server._conn.execute(
+            "INSERT OR REPLACE INTO entities (id, type, name, username, name_normalized, updated_at) "
+            "VALUES (42, 'group', 'My Group', NULL, 'my group', ?)",
+            (now,),
+        )
+        server._conn.execute(
+            "INSERT INTO messages "
+            "(dialog_id, message_id, sent_at, text, out, is_service, is_deleted, reply_count) "
+            "VALUES (42, 10, ?, 'mine', 1, 0, 0, 0)",
+            (now - 60,),
+        )
+        server._conn.execute(
+            "INSERT INTO messages "
+            "(dialog_id, message_id, sent_at, text, out, is_service, is_deleted, reply_to_msg_id) "
+            "VALUES (42, 11, ?, 'reply', 0, 0, 0, 10)",
+            (now - 30,),
+        )
+        server._conn.execute("UPDATE activity_sync_state SET value='1' WHERE key='backfill_complete'")
+        server._conn.execute(f"UPDATE activity_sync_state SET value='{now}' WHERE key='last_sync_at'")
+
+    resp = await server._dispatch({"method": "get_my_recent_activity"})
+
+    assert resp["data"]["comments"][0]["message_id"] == 10
+    assert resp["data"]["comments"][0]["reply_count"] == 1
+
+
+@pytest.mark.asyncio
 async def test_get_my_recent_activity_falls_back_to_str_dialog_id() -> None:
     """When no entities row exists, dialog_name falls back to str(dialog_id)."""
     server = make_server(_make_db_with_activity())
