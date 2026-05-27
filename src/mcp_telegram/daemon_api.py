@@ -210,6 +210,8 @@ GROUP_TTL: int = 604_800  # 7 days
 from rapidfuzz import fuzz as _fuzz
 from telethon.errors import FloodWaitError, RPCError  # type: ignore[import-untyped]
 
+from .activity_peer_resolve import LinkedChatResolution, resolve_linked_chat_id
+from .activity_peer_sweep import enroll_activity_dialog
 from .budget import allocate_message_budget_proportional, unread_chat_tier
 from .dialog_sync import _ACCESS_LOST_ERRORS
 from .feedback_db import VALID_SEVERITIES, VALID_STATUSES
