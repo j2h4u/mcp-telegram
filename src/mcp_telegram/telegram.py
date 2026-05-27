@@ -15,20 +15,6 @@ class TelegramSettings(BaseSettings):
 
     api_id: str
     api_hash: str
-    flood_sleep_threshold_seconds: int = 60
-    """Telethon auto-sleeps FloodWaits whose duration is <= this value (seconds).
-
-    Short floods (observed 22-27s in production, phase-53 finding) are handled
-    transparently by Telethon: it sleeps the coroutine and pre-emptively gates
-    further same-CONSTRUCTOR_ID requests via ``_flood_waited_requests``.
-    Only floods *above* this threshold raise ``FloodWaitError`` to our code, where
-    the durable ``*_next_retry_at`` backoff takes over.
-
-    60 seconds: covers observed short floods with margin; a coroutine sleeping
-    up to 60s is acceptable for background sync work; floods above this indicate
-    a serious rate-limit that warrants a full durable defer rather than an inline
-    sleep.  Override via TELEGRAM_FLOOD_SLEEP_THRESHOLD_SECONDS env var.
-    """
 
 
 async def logout_from_telegram() -> None:
@@ -76,12 +62,15 @@ def create_client(
         settings.api_hash,
         base_logger="telethon",
         catch_up=catch_up,
-        # flood_sleep_threshold: Telethon auto-sleeps short floods (<=threshold) and
-        # pre-emptively gates same-CONSTRUCTOR_ID requests, yielding the asyncio loop
-        # during the sleep.  Only floods > threshold raise FloodWaitError to our durable
-        # *_next_retry_at backoff handlers (delta_sync, activity_sync, sweep helpers).
-        # Default 60s covers observed 22-27s production floods (phase-53 finding) with
-        # margin; above this a flood is serious enough to warrant a full durable defer.
-        # Tunable via TELEGRAM_FLOOD_SLEEP_THRESHOLD_SECONDS.
-        flood_sleep_threshold=settings.flood_sleep_threshold_seconds,
+        # flood_sleep_threshold is intentionally NOT set — we inherit Telethon's
+        # default (60s). Telethon auto-sleeps floods <= the threshold and pre-emptively
+        # gates same-CONSTRUCTOR_ID requests via _flood_waited_requests (yielding the
+        # asyncio loop during the sleep); only floods > threshold raise FloodWaitError
+        # to our durable *_next_retry_at backoff (delta_sync, activity_sync, sweep
+        # helpers). We previously forced flood_sleep_threshold=0 to "own" all flood
+        # handling, which disabled this built-in gate and caused a request burst
+        # (phase-53 finding). Observed production floods were 22-27s — well under the
+        # default — so the library handles them. No need to duplicate the default or
+        # expose a knob nothing tunes; our code reacts to the raised exception's
+        # .seconds, never to the threshold value itself.
     )
