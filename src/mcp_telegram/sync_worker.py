@@ -39,6 +39,7 @@ from telethon.errors import (  # type: ignore[import-untyped]
 from telethon.tl import types  # type: ignore[import-untyped]
 
 from .dialog_sync import _ACCESS_LOST_ERRORS, _set_access_lost
+from .flood import flood_seconds, sleep_through_flood
 from .fts import DELETE_FTS_SQL, INSERT_FTS_SQL, stem_text
 from .models import DialogType
 from .resolver import latinize
@@ -761,10 +762,9 @@ class FullSyncWorker:
             # Note: batch size 100 keeps memory bounded; get_messages needed for .total
         except FloodWaitError as exc:
             logger.warning("FloodWait dialog_id=%d — sleeping %ds", dialog_id, exc.seconds)
-            try:
-                await asyncio.wait_for(self._shutdown_event.wait(), timeout=float(exc.seconds))
-            except TimeoutError:
-                pass  # slept the full duration; retry same batch next call
+            # Either outcome (shutdown or full sleep) retries the same batch on
+            # the next call, so the shutdown signal is not distinguished here.
+            await sleep_through_flood(self._shutdown_event, flood_seconds(exc))
             return sync_progress, False
         except _ACCESS_LOST_ERRORS as exc:
             logger.warning("access_lost dialog_id=%d — %s: %s", dialog_id, type(exc).__name__, exc)

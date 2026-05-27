@@ -66,6 +66,7 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
     InputPeerUser,
 )
 
+from .flood import flood_seconds, sleep_through_flood
 from .sync_db import _open_sync_db
 
 logger = logging.getLogger(__name__)
@@ -518,7 +519,7 @@ class DialogsBootstrapWorker:
                         )
 
             except FloodWaitError as exc:
-                wait_s = int(getattr(exc, "seconds", 60) or 60)
+                wait_s = flood_seconds(exc)
                 logger.warning(
                     "bootstrap_sweep flood_wait=%ds processed_so_far=%d — sleeping",
                     wait_s,
@@ -527,10 +528,7 @@ class DialogsBootstrapWorker:
                 self._set_detail(
                     f"bootstrap sweep: flood_wait {wait_s}s (processed {count})"
                 )
-                try:
-                    await asyncio.wait_for(self._shutdown_event.wait(), timeout=float(wait_s))
-                except TimeoutError:
-                    pass  # slept full duration; iter_dialogs cannot resume mid-stream
+                await sleep_through_flood(self._shutdown_event, wait_s)
                 # Return without writing 'complete'. iter_dialogs() is an async
                 # generator and is not restartable mid-stream after FloodWait — the
                 # next daemon start re-enters this method, picks up the cursor,
@@ -662,26 +660,20 @@ class DialogReconciliationWorker:
                         dialog_id, topic_count,
                     )
             except FloodWaitError as exc:
-                wait_s = int(getattr(exc, "seconds", 60) or 60)
+                wait_s = flood_seconds(exc)
                 logger.warning(
                     "recon_light_flood_wait dialog_id=%d wait=%ds",
                     dialog_id, wait_s,
                 )
-                try:
-                    await asyncio.wait_for(
-                        self._shutdown_event.wait(), timeout=float(wait_s)
-                    )
+                if await sleep_through_flood(self._shutdown_event, wait_s):
                     logger.info(
                         "recon_light_pass_complete count=%d (shutdown_during_flood_wait)",
                         count,
                     )
                     return count  # shutdown during flood wait
-                except TimeoutError:
-                    # Slept full duration; advance to NEXT dialog (per
-                    # FloodWait semantics in class docstring). Do NOT retry
-                    # the same dialog — its needs_refresh=1 will be picked
-                    # up by the next hourly cycle.
-                    pass
+                # Slept full duration; advance to NEXT dialog (per FloodWait
+                # semantics in class docstring). Do NOT retry the same dialog —
+                # its needs_refresh=1 will be picked up by the next hourly cycle.
             except _ACCESS_LOST_ERRORS as exc:
                 logger.warning(
                     "recon_light_access_lost dialog_id=%d — %s",
@@ -749,16 +741,11 @@ class DialogReconciliationWorker:
                         int(dialog.id), topic_count,
                     )
         except FloodWaitError as exc:
-            wait_s = int(getattr(exc, "seconds", 60) or 60)
+            wait_s = flood_seconds(exc)
             logger.warning(
                 "recon_full_flood_wait wait=%ds processed=%d", wait_s, count,
             )
-            try:
-                await asyncio.wait_for(
-                    self._shutdown_event.wait(), timeout=float(wait_s)
-                )
-            except TimeoutError:
-                pass
+            await sleep_through_flood(self._shutdown_event, wait_s)
             return count, False  # cannot resume mid-stream; next cycle retries
 
         # Soft-delete dialogs visible pre-pass but not returned by iter_dialogs.
@@ -798,17 +785,12 @@ class DialogReconciliationWorker:
                 )
             )
         except FloodWaitError as exc:
-            wait_s = int(getattr(exc, "seconds", 60) or 60)
+            wait_s = flood_seconds(exc)
             logger.warning(
                 "recon_forum_topics_flood_wait dialog_id=%d wait=%ds",
                 dialog_id, wait_s,
             )
-            try:
-                await asyncio.wait_for(
-                    self._shutdown_event.wait(), timeout=float(wait_s)
-                )
-            except TimeoutError:
-                pass
+            await sleep_through_flood(self._shutdown_event, wait_s)
             return 0
         except Exception as exc:
             logger.warning(

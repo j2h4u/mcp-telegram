@@ -24,6 +24,7 @@ from telethon.errors import (
 )
 
 from .dialog_sync import _ACCESS_LOST_ERRORS, _set_access_lost
+from .flood import flood_seconds, sleep_through_flood
 from .sync_worker import (
     ExtractedMessage,
     extract_message_row,
@@ -186,10 +187,7 @@ class DeltaSyncWorker:
                     dialog_id,
                     len(new_message_rows),
                 )
-            try:
-                await asyncio.wait_for(self._shutdown_event.wait(), timeout=float(exc.seconds))
-            except TimeoutError:
-                pass  # slept the full duration; caller will retry remaining gap
+            await sleep_through_flood(self._shutdown_event, flood_seconds(exc))
             return len(new_message_rows)
         except _ACCESS_LOST_ERRORS as exc:
             logger.warning(
@@ -263,11 +261,9 @@ async def _probe_access_lost_dialogs(
             logger.debug("access_still_lost dialog_id=%d", dialog_id)
         except FloodWaitError as exc:
             logger.warning("probe_flood_wait dialog_id=%d seconds=%d", dialog_id, exc.seconds)
-            try:
-                await asyncio.wait_for(shutdown_event.wait(), timeout=float(exc.seconds))
+            if await sleep_through_flood(shutdown_event, flood_seconds(exc)):
                 return restored  # shutdown during flood wait
-            except TimeoutError:
-                pass  # flood wait elapsed normally
+            # flood wait elapsed normally — continue to next probe
         except RPCError as exc:
             logger.warning("probe_rpc_error dialog_id=%d error=%s", dialog_id, exc)
         except (TimeoutError, OSError) as exc:

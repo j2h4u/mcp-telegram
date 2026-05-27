@@ -20,6 +20,7 @@ from telethon.tl.types import (
     InputPeerSelf,
 )
 
+from .flood import flood_seconds, sleep_through_flood
 from .models import DialogType
 from .sync_worker import (
     ExtractedMessage,
@@ -239,11 +240,9 @@ async def _run_backfill(
                 "activity_sync_floodwait seconds=%d total_fetched=%d",
                 exc.seconds, total_fetched,
             )
-            try:
-                await asyncio.wait_for(shutdown_event.wait(), timeout=float(exc.seconds))
+            if await sleep_through_flood(shutdown_event, flood_seconds(exc)):
                 return
-            except TimeoutError:
-                continue
+            continue
         except TimeoutError:
             logger.warning(
                 "activity_sync_backfill_rpc_timeout offset_id=%d total_fetched=%d",
@@ -374,11 +373,9 @@ async def _run_incremental(
             )
         except FloodWaitError as exc:
             logger.warning("activity_sync_incremental_floodwait seconds=%d", exc.seconds)
-            try:
-                await asyncio.wait_for(shutdown_event.wait(), timeout=float(exc.seconds))
+            if await sleep_through_flood(shutdown_event, flood_seconds(exc)):
                 return  # shutdown fired during flood wait — exit cleanly
-            except TimeoutError:
-                continue
+            continue
         except TimeoutError:
             logger.warning(
                 "activity_sync_rpc_timeout offset_id=%d inserted=%d",

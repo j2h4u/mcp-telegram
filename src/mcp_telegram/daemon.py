@@ -53,6 +53,7 @@ from .delta_sync import DeltaSyncWorker, run_access_probe_loop
 from .dialog_sync import DialogsBootstrapWorker, run_reconciliation_loop
 from .event_handlers import EventHandlerManager
 from .feedback_db import ensure_feedback_schema, get_feedback_db_path
+from .flood import flood_seconds, sleep_through_flood
 from .fts import backfill_fts_index
 from .read_state import apply_read_cursor
 from .sync_db import (
@@ -115,11 +116,9 @@ async def _backfill_total_messages(
                 filled += 1
         except FloodWaitError as exc:
             logger.warning("backfill_total flood_wait dialog_id=%d seconds=%d", dialog_id, exc.seconds)
-            try:
-                await asyncio.wait_for(shutdown_event.wait(), timeout=float(exc.seconds))
+            if await sleep_through_flood(shutdown_event, flood_seconds(exc)):
                 return filled  # shutdown during flood wait
-            except TimeoutError:
-                pass  # flood wait elapsed normally
+            # flood wait elapsed normally — fall through to next dialog
         except Exception as exc:
             logger.debug("backfill_total skip dialog_id=%d error=%s", dialog_id, exc)
         await asyncio.sleep(1.0)
@@ -205,11 +204,8 @@ async def _initialize_read_positions(
                 conn.commit()
         except FloodWaitError as exc:
             logger.warning("read_pos_bootstrap flood_wait seconds=%d", exc.seconds)
-            try:
-                await asyncio.wait_for(shutdown_event.wait(), timeout=float(exc.seconds))
+            if await sleep_through_flood(shutdown_event, flood_seconds(exc)):
                 return filled
-            except TimeoutError:
-                pass
         except Exception as exc:
             logger.debug("read_pos_bootstrap batch_failed error=%s", exc)
 
