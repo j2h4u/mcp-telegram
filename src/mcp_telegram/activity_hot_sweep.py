@@ -102,7 +102,10 @@ async def run_hot_sweep_pass(
 
             # --- FloodWait (concern 5): Tier A owns hot_next_retry_at ---
             if result.flood_wait_seconds is not None:
-                next_retry_at = now + result.flood_wait_seconds
+                # Read the clock at the event, not the pass-start snapshot: a long
+                # multi-peer pass would otherwise back-date next_retry_at into the
+                # past and grant the peer zero effective backoff.
+                next_retry_at = int(time.time()) + result.flood_wait_seconds
                 # Persist any already-drained progress first (do not lose pages
                 # drained so far this pass)
                 save_fields: dict[str, Any] = {
@@ -120,7 +123,7 @@ async def run_hot_sweep_pass(
 
             # --- ACCESS_SKIP (concern 3): transient miss, do NOT advance cursor ---
             if result.skip_reason is SkipReason.ACCESS_SKIP:
-                transient_retry_at = now + _ACCESS_SKIP_RETRY_S
+                transient_retry_at = int(time.time()) + _ACCESS_SKIP_RETRY_S
                 _save_dialog_state(
                     conn, dialog_id,
                     hot_next_retry_at=transient_retry_at,

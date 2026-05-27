@@ -171,14 +171,36 @@ async def resolve_linked_chat_id(
         if about is not None:
             existing_blob["about"] = about
 
+        # entity_details.entity_id has a FK to entities(id) with foreign_keys=ON,
+        # so the parent row MUST exist first or the write raises sqlite3.IntegrityError
+        # (NOT OperationalError). Mirror _get_entity_info: INSERT OR IGNORE the entity
+        # before the detail write. Pull name/username from the GetFullChannel result's
+        # chats list when available; otherwise a minimal channel row (refreshed later by
+        # entity_info). Catch sqlite3.Error so a cache-write failure can never bubble to
+        # the outer handler and masquerade as "no linked chat".
+        channel_name: str | None = None
+        channel_username: str | None = None
+        for chat in getattr(full_result, "chats", None) or []:
+            try:
+                if int(get_peer_id(chat)) == int(channel_id):
+                    channel_name = getattr(chat, "title", None)
+                    channel_username = getattr(chat, "username", None)
+                    break
+            except (TypeError, ValueError):
+                continue
         try:
             with conn:
+                conn.execute(
+                    "INSERT OR IGNORE INTO entities (id, type, name, username, updated_at) "
+                    "VALUES (?, 'channel', ?, ?, ?)",
+                    (channel_id, channel_name, channel_username, now),
+                )
                 conn.execute(
                     "INSERT OR REPLACE INTO entity_details (entity_id, detail_json, fetched_at) "
                     "VALUES (?, ?, ?)",
                     (channel_id, json.dumps(existing_blob), now),
                 )
-        except sqlite3.OperationalError:
+        except sqlite3.Error:
             logger.debug(
                 "activity_peer_resolve_linked_cache_write_error channel_id=%r", channel_id,
                 exc_info=True,

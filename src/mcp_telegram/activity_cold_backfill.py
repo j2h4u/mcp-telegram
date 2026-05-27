@@ -258,7 +258,7 @@ async def run_cold_backfill_loop(
     while not shutdown_event.is_set():
         # Throttled enrollment — call build_working_set no more than once per
         # _COLD_ENROLL_EVERY_S so peer set stays current without over-calling.
-        now_mono = asyncio.get_event_loop().time()
+        now_mono = asyncio.get_running_loop().time()
         if now_mono - last_enroll_at >= _COLD_ENROLL_EVERY_S:
             try:
                 enrolled = await build_working_set(client, conn)
@@ -267,7 +267,7 @@ async def run_cold_backfill_loop(
                 )
             except Exception:
                 logger.warning("activity_cold_backfill_enroll_error", exc_info=True)
-            last_enroll_at = asyncio.get_event_loop().time()
+            last_enroll_at = asyncio.get_running_loop().time()
 
         try:
             pass_result = await run_cold_backfill_pass(client, conn, shutdown_event)
