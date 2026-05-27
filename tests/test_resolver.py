@@ -260,9 +260,9 @@ def test_candidates_without_cache_derive_type_from_id_sign() -> None:
     assert isinstance(result, Candidates)
     by_id = {m["entity_id"]: m for m in result.matches}
     assert by_id[101]["username"] is None
-    assert by_id[101]["entity_type"] == "User"
-    assert by_id[102]["entity_type"] == "User"
-    assert by_id[-1001234567]["entity_type"] == "Channel"
+    assert by_id[101]["entity_type"] == "user"
+    assert by_id[102]["entity_type"] == "user"
+    assert by_id[-1001234567]["entity_type"] == "channel"
 
 
 def test_exact_match_among_fuzzy_returns_candidates_single_word() -> None:

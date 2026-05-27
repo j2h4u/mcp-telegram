@@ -43,6 +43,7 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
 )
 from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
+from .models import DialogType
 from .read_state import apply_read_cursor
 from .resolver import latinize
 from .sync_worker import (
@@ -300,7 +301,7 @@ class EventHandlerManager:
             first = getattr(sender, "first_name", None) or ""
             last = getattr(sender, "last_name", None) or ""
             name: str | None = f"{first} {last}".strip() or None
-            entity_type_str = "Bot" if getattr(sender, "bot", False) else "User"
+            entity_type_str = DialogType.from_entity(sender).value
             with self._conn:
                 self._conn.execute(
                     UPSERT_ENTITY_SQL,

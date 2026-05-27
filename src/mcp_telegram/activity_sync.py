@@ -15,14 +15,12 @@ from typing import Any
 from telethon.errors import FloodWaitError
 from telethon.tl.functions.messages import SearchRequest
 from telethon.tl.types import (
-    Channel,
-    Chat,
     InputMessagesFilterEmpty,
     InputPeerEmpty,
     InputPeerSelf,
-    User,
 )
 
+from .models import DialogType
 from .sync_worker import (
     ExtractedMessage,
     extract_message_row,
@@ -102,18 +100,14 @@ def _normalize(text: str | None) -> str | None:
 
 
 def _classify_entity(obj: Any) -> str | None:
-    """Infer entities.type from Telethon object.
+    """Infer entities.type from a Telethon object via the single source of truth.
 
-    Matches the taxonomy used elsewhere: 'user', 'bot', 'channel', 'group'.
+    Returns the canonical DialogType value string, or None for an unclassifiable
+    object. (Previously this independently mapped megagroup -> 'group', which
+    diverged from dialogs.type's 'supergroup' — DialogType.from_entity fixes that.)
     """
-    if isinstance(obj, User):
-        return "bot" if getattr(obj, "bot", False) else "user"
-    if isinstance(obj, Channel):
-        # megagroup=True → group; else channel (broadcast)
-        return "group" if getattr(obj, "megagroup", False) else "channel"
-    if isinstance(obj, Chat):
-        return "group"
-    return None
+    dt = DialogType.from_entity(obj)
+    return None if dt is DialogType.UNKNOWN else dt.value
 
 
 def _upsert_entities_from_search(conn: sqlite3.Connection, result: Any) -> None:

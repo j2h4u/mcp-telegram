@@ -1,3 +1,5 @@
+from .models import DialogType
+
 # Priority tiers for unread chat sorting (lower = higher priority).
 # Gaps between values allow inserting new tiers without renumbering.
 UNREAD_TIER_MENTION_DM = 10  # DM with unread @mention
@@ -16,15 +18,15 @@ def unread_chat_tier(chat: dict) -> int:
     not raw Telegram flags. Unknown categories fall back to SMALL_GROUP.
     """
     has_mentions = chat["unread_mentions_count"] > 0
-    category = chat["category"]
+    category = DialogType.parse(chat["category"])
 
     if has_mentions:
-        return UNREAD_TIER_MENTION_DM if category in ("user", "bot") else UNREAD_TIER_MENTION_GROUP
-    if category == "user":
+        return UNREAD_TIER_MENTION_DM if category in (DialogType.USER, DialogType.BOT) else UNREAD_TIER_MENTION_GROUP
+    if category == DialogType.USER:
         return UNREAD_TIER_HUMAN_DM
-    if category == "bot":
+    if category == DialogType.BOT:
         return UNREAD_TIER_BOT_DM
-    if category == "channel":
+    if category == DialogType.CHANNEL:
         return UNREAD_TIER_CHANNEL
     return UNREAD_TIER_SMALL_GROUP
 

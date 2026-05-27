@@ -40,6 +40,7 @@ from telethon.tl import types  # type: ignore[import-untyped]
 
 from .dialog_sync import _ACCESS_LOST_ERRORS, _set_access_lost
 from .fts import DELETE_FTS_SQL, INSERT_FTS_SQL, stem_text
+from .models import DialogType
 from .resolver import latinize
 
 logger = logging.getLogger(__name__)
@@ -664,7 +665,7 @@ class FullSyncWorker:
                 first = getattr(entity, "first_name", None) or ""
                 last = getattr(entity, "last_name", None) or ""
                 name: str | None = f"{first} {last}".strip() or None
-                entity_type_str = "Bot" if getattr(entity, "bot", False) else "User"
+                entity_type_str = DialogType.from_entity(entity).value
                 self._conn.execute(
                     UPSERT_ENTITY_SQL,
                     (

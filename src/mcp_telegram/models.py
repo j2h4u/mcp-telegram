@@ -35,7 +35,7 @@ class DialogType(StrEnum):
     UNKNOWN = "unknown"
 
     @classmethod
-    def from_entity(cls, entity: object | None) -> "DialogType":
+    def from_entity(cls, entity: object | None) -> DialogType:
         """Derive the canonical type from a live Telethon entity (class + flags).
 
         This is the SINGLE place allowed to read Telethon's class/flags. Branch order
@@ -60,7 +60,7 @@ class DialogType(StrEnum):
         return cls.UNKNOWN
 
     @classmethod
-    def parse(cls, raw: "str | DialogType | None") -> "DialogType":
+    def parse(cls, raw: str | DialogType | None) -> DialogType:
         """Parse a stored/legacy type string to the canonical enum.
 
         Trap-aware by design — NEVER lowercase-and-match. The capitalized vocabulary

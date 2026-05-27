@@ -87,27 +87,14 @@ _ENTITY_DETAIL_TTL_SECONDS = 300
 _ENTITY_DETAIL_SCHEMA_VERSION = 1
 
 
-def _classify_dialog_type(entity: object | None) -> str:
-    """Classify a Telethon dialog entity into a human-readable type string.
+def _classify_dialog_type(entity: object | None) -> DialogType:
+    """Classify a live Telethon dialog entity into the canonical DialogType.
 
-    Returns one of: "User", "Bot", "Channel", "Group", "Forum", "Chat", "Unknown".
-    Branch order matters: Forum must be checked before Group because forum=True
-    implies megagroup=True — checking megagroup first would misclassify forums.
-    User detection uses duck-typing (hasattr first_name) to avoid an extra import.
+    Thin wrapper over the single source of truth, ``DialogType.from_entity`` (which
+    owns the Telethon class/flags branch logic). Kept as a named alias because it is
+    referenced in several call sites and comments as the entity-classification entry.
     """
-    if entity is None:
-        return "Unknown"
-    if isinstance(entity, Channel):
-        if getattr(entity, "megagroup", False) and getattr(entity, "forum", False):
-            return "Forum"
-        if getattr(entity, "megagroup", False):
-            return "Group"
-        return "Channel"
-    if isinstance(entity, Chat):
-        return "Chat"
-    if hasattr(entity, "first_name"):
-        return "Bot" if getattr(entity, "bot", False) else "User"
-    return "Unknown"
+    return DialogType.from_entity(entity)
 
 
 def _dialog_type_from_db(conn: sqlite3.Connection, dialog_id: int) -> str:
@@ -141,7 +128,7 @@ def _read_state_for_dialog(conn: sqlite3.Connection, dialog_id: int, dialog_type
     Zero Telegram API calls. Single pair of SQL queries (cursor row + one
     GROUP BY count-and-min over messages). See Plan 39.3-03 / models.ReadState.
     """
-    if dialog_type != "User":
+    if DialogType.parse(dialog_type) != DialogType.USER:
         return None
 
     # WR-04 + WR-05: fold cursor lookup and count aggregation into a single
@@ -210,14 +197,14 @@ GROUP_TTL: int = 604_800  # 7 days
 from rapidfuzz import fuzz as _fuzz
 from telethon.errors import FloodWaitError, RPCError  # type: ignore[import-untyped]
 
-from .activity_peer_resolve import LinkedChatResolution, resolve_linked_chat_id
+from .activity_peer_resolve import resolve_linked_chat_id
 from .activity_peer_sweep import enroll_activity_dialog
 from .budget import allocate_message_budget_proportional, unread_chat_tier
 from .dialog_sync import _ACCESS_LOST_ERRORS
 from .feedback_db import VALID_SEVERITIES, VALID_STATUSES
 from .formatter import format_reaction_counts
 from .fts import stem_query
-from .models import ReadMessage, ReadState
+from .models import DialogType, ReadMessage, ReadState
 from .pagination import (
     HistoryDirection,
     decode_account_trace_navigation,
@@ -1129,18 +1116,18 @@ def _trace_strategy_for_dialog(dialog_type: str, *, status: str | None, hidden: 
         return "hidden"
     if status == "access_lost":
         return "access_lost"
-    # The `dialogs` table stores types lowercase ('channel', 'supergroup', 'group',
-    # 'user', 'bot'); the `entities` table may carry capitalized legacy values
-    # ('Channel', 'User', 'Bot'). Normalize case-insensitively so the classifier is
-    # robust to both sources — a case mismatch here silently mislabels a broadcast
-    # channel as `unsupported`, which disables the channel→linked-discussion-group
-    # scope expansion (phase 53 D-06) for every real channel.
-    t = dialog_type.strip().lower()
-    if t in {"user", "bot"}:
+    # Parse the stored type through the single source of truth. DialogType.parse is
+    # trap-aware (capitalized "Group"=megagroup vs lowercase "group"=legacy basic
+    # group) so this is robust to both the dialogs (lowercase) and entities (legacy
+    # mixed-case) sources. A mismatch here silently mislabels a broadcast channel as
+    # `unsupported`, disabling the channel→linked-discussion-group scope expansion
+    # (phase 53 D-06).
+    dt = DialogType.parse(dialog_type)
+    if dt in (DialogType.USER, DialogType.BOT):
         return "dialog_scan"
-    if t in {"group", "supergroup", "megagroup", "forum", "chat"}:
+    if dt in (DialogType.SUPERGROUP, DialogType.FORUM, DialogType.GROUP):
         return "author_search"
-    if t == "channel":
+    if dt == DialogType.CHANNEL:
         return "signature_only"
     return "unsupported"
 
@@ -2628,7 +2615,7 @@ class DaemonAPIServer:
         last_name = getattr(user, "last_name", None)
         display_name = " ".join(part for part in (first_name, last_name) if part) or username
         resolved_username = getattr(user, "username", None) or username
-        entity_type = "Bot" if bool(getattr(user, "bot", False)) else "User"
+        entity_type = DialogType.from_entity(user).value
         now = int(time.time())
         self._conn.execute(
             _UPSERT_ENTITY_SQL,
@@ -4098,7 +4085,7 @@ class DaemonAPIServer:
 
             # WR-06 contract: unread_in/unread_out ONLY on User (DM) rows.
             # Non-DM rows OMIT both keys entirely — not None, not 0.
-            if d_type == "User":
+            if DialogType.parse(d_type) == DialogType.USER:
                 in_cnt, out_cnt = unread_counts.get(d_id, (0, 0))
                 row["unread_in"] = in_cnt
                 row["unread_out"] = out_cnt
@@ -4429,13 +4416,13 @@ class DaemonAPIServer:
         # ----- Dispatch by type (D-09 — reuses _classify_dialog_type) -----
         dispatch_kind = _classify_dialog_type(entity)
 
-        if dispatch_kind in ("User", "Bot"):
+        if dispatch_kind in (DialogType.USER, DialogType.BOT):
             detail = await self._fetch_user_detail(entity)
-        elif dispatch_kind == "Channel":
+        elif dispatch_kind == DialogType.CHANNEL:
             detail = await self._fetch_channel_detail(entity)
-        elif dispatch_kind in ("Group", "Forum"):
+        elif dispatch_kind in (DialogType.SUPERGROUP, DialogType.FORUM):
             detail = await self._fetch_supergroup_detail(entity)
-        elif dispatch_kind == "Chat":
+        elif dispatch_kind == DialogType.GROUP:
             detail = await self._fetch_group_detail(entity)
         else:
             return {
@@ -5391,9 +5378,10 @@ class DaemonAPIServer:
         """Decide whether a dialog should be included in unread results."""
         if scope != "personal":
             return True
-        if category == "channel":
+        dt = DialogType.parse(category)
+        if dt == DialogType.CHANNEL:
             return False
-        if category == "group" and participants_count is not None and participants_count > group_size_threshold:  # noqa: SIM103
+        if dt in (DialogType.SUPERGROUP, DialogType.GROUP, DialogType.FORUM) and participants_count is not None and participants_count > group_size_threshold:  # noqa: SIM103
             return False
         return True
 
@@ -5407,12 +5395,6 @@ class DaemonAPIServer:
         """
         rows = self._conn.execute(_COLLECT_UNREAD_DIALOGS_WITH_COUNTS_SQL).fetchall()
 
-        _ENTITY_TYPE_TO_CATEGORY: dict[str, str] = {
-            "User": "user",
-            "Bot": "bot",
-            "Channel": "channel",
-        }
-
         unread_dialogs: list[dict] = []
         unread_counts: dict[int, int] = {}
 
@@ -5421,7 +5403,9 @@ class DaemonAPIServer:
             if unread_count == 0:
                 continue
 
-            category = _ENTITY_TYPE_TO_CATEGORY.get(entity_type, "group")
+            # Single source of truth — parse the stored type (tolerates legacy
+            # mixed-case rows) instead of a bespoke capitalized→category map.
+            category = DialogType.parse(entity_type)
 
             # participants_count=None — not stored in sync.db, so group_size_threshold
             # has no effect here. _should_include_unread_dialog treats None as permissive

@@ -8,7 +8,7 @@ from ..formatter import (
     _render_read_state_header,
     resolve_sender_label,
 )
-from ..models import ReadMessage, ReadState
+from ..models import DialogType, ReadMessage, ReadState
 from ._base import (
     DaemonNotRunningError,
     ToolAnnotations,
@@ -334,7 +334,7 @@ def _structured_messages(rows: list[dict], *, read_state: dict | None, dialog_ty
         ),
     )
     messages = [ReadMessage(**row) for row in ordered_rows]
-    marker_by_message = _compute_inline_markers(messages, read_state) if dialog_type == "User" else {}
+    marker_by_message = _compute_inline_markers(messages, read_state) if DialogType.parse(dialog_type) == DialogType.USER else {}
     structured: list[dict[str, object]] = []
     for row, message in zip(ordered_rows, messages, strict=False):
         marker_label = marker_by_message.get(message.id)
@@ -431,8 +431,8 @@ async def get_inbox(args: GetInbox) -> ToolResult:
                 "unread_count": group.get("unread_count", 0),
                 "unread_mentions_count": group.get("unread_mentions_count", 0),
                 "total_in_chat": total_in_chat,
-                "is_channel": category == "channel",
-                "is_bot": category == "bot",
+                "is_channel": DialogType.parse(category) == DialogType.CHANNEL,
+                "is_bot": DialogType.parse(category) == DialogType.BOT,
                 "read_state": _read_state_payload(read_state_payload, dialog_type),
                 "budget": {
                     "shown_count": len(message_rows),

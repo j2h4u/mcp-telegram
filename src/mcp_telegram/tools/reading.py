@@ -10,7 +10,7 @@ from ..formatter import (
     frame_telegram_snippet,
     resolve_sender_label,
 )
-from ..models import ReadMessage
+from ..models import DialogType, ReadMessage
 from ..resolver import parse_exact_dialog_id
 from ._base import (
     DaemonNotRunningError,
@@ -491,7 +491,7 @@ def _list_messages_structured_messages(
         return []
     messages = [ReadMessage(**row) for row in rows]
     reply_map: dict[int, ReadMessage] = {message.id: message for message in messages}
-    marker_by_message = _compute_inline_markers(messages, read_state) if dialog_type == "User" else {}
+    marker_by_message = _compute_inline_markers(messages, read_state) if DialogType.parse(dialog_type) == DialogType.USER else {}
 
     structured: list[dict[str, object]] = []
     for message in messages:
@@ -793,11 +793,11 @@ def _search_read_state_per_dialog(data: dict) -> dict[str, object]:
             continue
         structured[str(dialog_id)] = {
             "dialog_id": dialog_id,
-            "dialog_type": "User",
+            "dialog_type": DialogType.USER.value,
             "state": read_state,
             "header_lines": _render_read_state_header(
                 read_state,
-                "User",
+                DialogType.USER.value,
                 int(datetime.now(tz=UTC).timestamp()),
             ),
         }
@@ -889,7 +889,7 @@ def _format_search_results(
             rs = read_state_per_dialog.get(did)
             if rs is None:
                 continue
-            rs_lines = _render_read_state_header(rs, "User", now_unix)
+            rs_lines = _render_read_state_header(rs, DialogType.USER.value, now_unix)
             if not rs_lines:
                 continue
             label = dname or str(did)

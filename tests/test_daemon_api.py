@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from mcp_telegram.daemon_api import DaemonAPIServer, _classify_dialog_type, get_daemon_socket_path
+from mcp_telegram.models import DialogType
 from mcp_telegram.fts import MESSAGES_FTS_DDL, stem_text
 
 # ---------------------------------------------------------------------------
@@ -720,7 +721,7 @@ def test_classify_dialog_type_forum() -> None:
     entity.megagroup = True
     entity.forum = True
     entity.broadcast = False
-    assert _classify_dialog_type(entity) == "Forum"
+    assert _classify_dialog_type(entity) == DialogType.FORUM
 
 
 def test_classify_dialog_type_group() -> None:
@@ -731,7 +732,8 @@ def test_classify_dialog_type_group() -> None:
     entity.megagroup = True
     entity.forum = False
     entity.broadcast = False
-    assert _classify_dialog_type(entity) == "Group"
+    # megagroup (not forum) → SUPERGROUP under the canonical vocabulary
+    assert _classify_dialog_type(entity) == DialogType.SUPERGROUP
 
 
 def test_classify_dialog_type_channel_broadcast() -> None:
@@ -742,21 +744,21 @@ def test_classify_dialog_type_channel_broadcast() -> None:
     entity.broadcast = True
     entity.megagroup = False
     entity.forum = False
-    assert _classify_dialog_type(entity) == "Channel"
+    assert _classify_dialog_type(entity) == DialogType.CHANNEL
 
 
 def test_classify_dialog_type_bot() -> None:
     entity = MagicMock()
     entity.first_name = "BotFather"
     entity.bot = True
-    assert _classify_dialog_type(entity) == "Bot"
+    assert _classify_dialog_type(entity) == DialogType.BOT
 
 
 def test_classify_dialog_type_user() -> None:
     entity = MagicMock()
     entity.first_name = "Alice"
     entity.bot = False
-    assert _classify_dialog_type(entity) == "User"
+    assert _classify_dialog_type(entity) == DialogType.USER
 
 
 def test_classify_dialog_type_chat() -> None:
@@ -764,11 +766,12 @@ def test_classify_dialog_type_chat() -> None:
 
     entity = MagicMock()
     entity.__class__ = Chat
-    assert _classify_dialog_type(entity) == "Chat"
+    # legacy basic group (Chat) → GROUP under the canonical vocabulary
+    assert _classify_dialog_type(entity) == DialogType.GROUP
 
 
 def test_classify_dialog_type_none() -> None:
-    assert _classify_dialog_type(None) == "Unknown"
+    assert _classify_dialog_type(None) == DialogType.UNKNOWN
 
 
 # ---------------------------------------------------------------------------
@@ -1776,7 +1779,10 @@ async def test_list_unread_messages_includes_groups_in_personal_scope() -> None:
     assert result["ok"] is True
     groups = result["data"]["groups"]
     assert len(groups) == 1
-    assert groups[0]["category"] == "group"
+    # Seeded entity_type "Group" (capitalized) is the legacy megagroup marker, which
+    # parses to the canonical SUPERGROUP. Still group-tier, still included in personal
+    # scope — only the category label sharpened from the old flat "group".
+    assert groups[0]["category"] == "supergroup"
     client.assert_not_called()
 
 

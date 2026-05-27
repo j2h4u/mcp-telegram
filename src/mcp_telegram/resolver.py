@@ -7,6 +7,8 @@ from typing import Any
 from anyascii import anyascii
 from rapidfuzz import fuzz, process, utils
 
+from .models import DialogType
+
 logger = logging.getLogger(__name__)
 
 CANDIDATE_THRESHOLD = 60
@@ -247,11 +249,11 @@ def _make_match_info(entity_id: int, display_name: str, score: int, entity_cache
     if entity_info["entity_type"] is None:
         # Telegram id-sign convention: positive=user, -100…=channel/supergroup, other negative=chat/group.
         if entity_id > 0:
-            entity_info["entity_type"] = "User"
+            entity_info["entity_type"] = DialogType.USER.value
         elif str(entity_id).startswith("-100"):
-            entity_info["entity_type"] = "Channel"
+            entity_info["entity_type"] = DialogType.CHANNEL.value
         else:
-            entity_info["entity_type"] = "Group"
+            entity_info["entity_type"] = DialogType.GROUP.value
     return entity_info
 
 

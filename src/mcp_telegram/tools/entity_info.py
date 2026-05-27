@@ -14,6 +14,7 @@ from ..errors import (
     entity_not_found_text,
     fetch_entity_info_error_text,
 )
+from ..models import DialogType
 from ._base import (
     DaemonNotRunningError,
     ToolAnnotations,
@@ -489,13 +490,14 @@ def _group_structured(data: dict) -> dict[str, object]:
 
 def _type_specific_structured(data: dict) -> dict[str, object]:
     entity_type = data.get("type", "unknown")
-    if entity_type in ("user", "bot"):
+    dt = DialogType.parse(entity_type)
+    if dt in (DialogType.USER, DialogType.BOT):
         return _user_or_bot_structured(data)
-    if entity_type == "channel":
+    if dt == DialogType.CHANNEL:
         return _channel_structured(data)
-    if entity_type == "supergroup":
+    if dt in (DialogType.SUPERGROUP, DialogType.FORUM):
         return _supergroup_structured(data)
-    if entity_type == "group":
+    if dt == DialogType.GROUP:
         return _group_structured(data)
     return {"kind": entity_type}
 

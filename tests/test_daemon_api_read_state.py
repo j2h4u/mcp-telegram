@@ -225,13 +225,13 @@ def make_server(
 
 def test_classify_dialog_type_user() -> None:
     user = SimpleNamespace(first_name="Alice", bot=False)
-    assert _classify_dialog_type(user) == "User"
+    assert _classify_dialog_type(user) == "user"
 
 
 def test_classify_dialog_type_channel_group_bot_forum() -> None:
     # Bot
     bot = SimpleNamespace(first_name="Botty", bot=True)
-    assert _classify_dialog_type(bot) == "Bot"
+    assert _classify_dialog_type(bot) == "bot"
 
     # Channel / Group / Forum via the Channel telethon class.
     # Build via __new__ to avoid telethon-version-specific constructor signatures;
@@ -241,24 +241,26 @@ def test_classify_dialog_type_channel_group_bot_forum() -> None:
     channel = Channel.__new__(Channel)
     channel.megagroup = False
     channel.forum = False
-    assert _classify_dialog_type(channel) == "Channel"
+    assert _classify_dialog_type(channel) == "channel"
 
+    # megagroup (non-forum) is a supergroup, NOT a legacy "group".
     group = Channel.__new__(Channel)
     group.megagroup = True
     group.forum = False
-    assert _classify_dialog_type(group) == "Group"
+    assert _classify_dialog_type(group) == "supergroup"
 
     forum = Channel.__new__(Channel)
     forum.megagroup = True
     forum.forum = True
-    assert _classify_dialog_type(forum) == "Forum"
+    assert _classify_dialog_type(forum) == "forum"
 
     # Chat is detected via isinstance; constructor signature varies by telethon
     # version, so build a Chat by bypassing __init__ — isinstance is what matters.
+    # A legacy basic Chat maps to "group" (NOT "chat").
     chat = Chat.__new__(Chat)
-    assert _classify_dialog_type(chat) == "Chat"
+    assert _classify_dialog_type(chat) == "group"
 
-    assert _classify_dialog_type(None) == "Unknown"
+    assert _classify_dialog_type(None) == "unknown"
 
 
 # ---------------------------------------------------------------------------

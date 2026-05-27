@@ -5,7 +5,7 @@ from zoneinfo import ZoneInfo
 
 import telethon.tl.types as tl  # type: ignore[import-untyped]
 
-from .models import LinePrefixGetter, ReadMessage, ReadState, TopicNameGetter
+from .models import DialogType, LinePrefixGetter, ReadMessage, ReadState, TopicNameGetter
 
 logger = logging.getLogger(__name__)
 
@@ -86,7 +86,7 @@ def _render_read_state_header(
     - Otherwise: two lines, each side computed independently. Cursor='null'
       always renders 'unknown (sync pending)' — never 'all read' (D-03).
     """
-    if read_state is None or dialog_type != "User":
+    if read_state is None or DialogType.parse(dialog_type) != DialogType.USER:
         return []
 
     inbox_state = read_state.get("inbox_cursor_state")
@@ -236,7 +236,7 @@ def format_messages(
     header_lines = (
         [] if suppress_header else _render_read_state_header(read_state, dialog_type, resolved_now, effective_tz)
     )
-    inline_markers = _compute_inline_markers(messages, read_state) if dialog_type == "User" else {}
+    inline_markers = _compute_inline_markers(messages, read_state) if DialogType.parse(dialog_type) == DialogType.USER else {}
 
     lines: list[str] = list(header_lines)
     prev_date_str: str | None = None
