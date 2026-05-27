@@ -231,7 +231,16 @@ def enroll_activity_dialog(
                 (dialog_id, source, last_activity_at, cold_status, created_at, updated_at)
             VALUES (?, ?, ?, 'pending', ?, ?)
             ON CONFLICT(dialog_id) DO UPDATE SET
-                source           = excluded.source,
+                -- Provenance precedence: a peer enrolled as a direct 'supergroup'
+                -- membership must NOT be downgraded to 'linked_chat' by a later
+                -- trace-driven enrollment (the same peer can be both a direct
+                -- supergroup AND a channel's linked discussion group). 'supergroup'
+                -- is sticky; any other existing source is refreshed normally.
+                source           = CASE
+                                       WHEN activity_dialog_state.source = 'supergroup'
+                                       THEN activity_dialog_state.source
+                                       ELSE excluded.source
+                                   END,
                 updated_at       = excluded.updated_at,
                 last_activity_at = COALESCE(excluded.last_activity_at,
                                             activity_dialog_state.last_activity_at)

@@ -32,6 +32,7 @@ import pytest
 
 from mcp_telegram.activity_peer_resolve import LinkedChatResolution
 from mcp_telegram.activity_peer_sweep import (
+    _DIALOG_STATE_COLUMNS,
     SkipReason,
     SweepResult,
     _channel_resolution_due,
@@ -557,3 +558,62 @@ def test_hit_floor_only_for_history_floor():
         assert r.hit_floor == expected, (
             f"hit_floor expected {expected} for {reason!r}, got {r.hit_floor}"
         )
+
+
+# ---------------------------------------------------------------------------
+# WR-01: allowlist/DDL drift guard for _save_dialog_state
+# ---------------------------------------------------------------------------
+
+def test_dialog_state_column_allowlist_matches_table():
+    """_DIALOG_STATE_COLUMNS must stay in sync with the real activity_dialog_state
+    columns. _save_dialog_state interpolates these names into SQL, so a drifted
+    allowlist either fails at runtime (name not in table) or silently permits
+    updating an identity/bookkeeping column. Guard both directions.
+    """
+    conn = _make_db()
+    real_cols = {
+        row[1] for row in conn.execute("PRAGMA table_info(activity_dialog_state)").fetchall()
+    }
+    # Every allowlisted column must exist in the table.
+    missing = _DIALOG_STATE_COLUMNS - real_cols
+    assert not missing, f"allowlist references non-existent columns: {missing}"
+    # The allowlist must NOT include identity / bookkeeping columns — those are
+    # never updated through _save_dialog_state.
+    forbidden = {"dialog_id", "source", "created_at", "updated_at", "last_activity_at"}
+    leaked = _DIALOG_STATE_COLUMNS & forbidden
+    assert not leaked, f"allowlist must not expose identity/bookkeeping columns: {leaked}"
+
+
+# ---------------------------------------------------------------------------
+# WR-03: enrollment provenance precedence (no supergroup → linked_chat downgrade)
+# ---------------------------------------------------------------------------
+
+def test_enroll_does_not_downgrade_supergroup_source():
+    """A peer enrolled as 'supergroup' keeps that provenance even if a later
+    trace-driven call tries to enroll it as 'linked_chat'. Other sources refresh
+    normally (including linked_chat -> supergroup upgrade).
+    """
+    conn = _make_db()
+    peer = -100123123123
+
+    # Direct supergroup membership first.
+    enroll_activity_dialog(conn, peer, "supergroup", last_activity_at=1000)
+    assert _source_of(conn, peer) == "supergroup"
+
+    # A trace later resolves the same peer as a channel's linked discussion group.
+    enroll_activity_dialog(conn, peer, "linked_chat", last_activity_at=2000)
+    assert _source_of(conn, peer) == "supergroup", "must not downgrade supergroup → linked_chat"
+
+    # Upgrade path still works: a linked_chat peer found to be a direct supergroup.
+    other = -100456456456
+    enroll_activity_dialog(conn, other, "linked_chat", last_activity_at=1000)
+    assert _source_of(conn, other) == "linked_chat"
+    enroll_activity_dialog(conn, other, "supergroup", last_activity_at=2000)
+    assert _source_of(conn, other) == "supergroup", "linked_chat → supergroup upgrade must apply"
+
+
+def _source_of(conn: sqlite3.Connection, dialog_id: int) -> str | None:
+    row = conn.execute(
+        "SELECT source FROM activity_dialog_state WHERE dialog_id = ?", (dialog_id,)
+    ).fetchone()
+    return row[0] if row else None
