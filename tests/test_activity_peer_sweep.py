@@ -300,6 +300,52 @@ def test_durable_retry_resolver_not_recalled(monkeypatch):
     )
 
 
+def test_flood_halts_resolution_pass_account_safety(monkeypatch):
+    """ACCOUNT SAFETY: the FIRST FloodWait halts the whole resolution pass.
+
+    FloodWait is account-global. Continuing to call GetFullChannel for the
+    remaining channels during the wait window is what escalates rate-limiting
+    toward a ban. So on the first flood the loop MUST stop — later channels are
+    left untouched (still due) and drain over subsequent passes.
+    """
+    conn = _make_db()
+    # Three broadcast channels, ALL of which would flood. Iteration order is by
+    # dialog_id (PK), not insertion order — so we make every channel flood and
+    # assert the resolver is called exactly ONCE: a correct break halts the pass
+    # on whichever channel is visited first, regardless of order.
+    ch_a = -100111111111
+    ch_b = -100222222222
+    ch_c = -100333333333
+    _insert_dialog(conn, ch_a, "channel", last_message_at=9000)
+    _insert_dialog(conn, ch_b, "channel", last_message_at=8000)
+    _insert_dialog(conn, ch_c, "channel", last_message_at=7000)
+
+    resolver = _FakeResolver({
+        ch_a: LinkedChatResolution(linked_chat_id=None, flood_wait_seconds=26),
+        ch_b: LinkedChatResolution(linked_chat_id=None, flood_wait_seconds=26),
+        ch_c: LinkedChatResolution(linked_chat_id=None, flood_wait_seconds=26),
+    })
+    monkeypatch.setattr(
+        "mcp_telegram.activity_peer_sweep.resolve_linked_chat_id",
+        resolver,
+    )
+
+    asyncio.run(build_working_set(_FakeClient(), conn))
+
+    # Exactly ONE resolver call — the pass stopped on the first flood and never
+    # issued further GetFullChannel requests during the account-global wait window.
+    assert resolver.call_count == 1, (
+        f"pass must halt on first flood; resolver called {resolver.call_count} times"
+    )
+    # Only the first-visited channel has a backoff row; the other two were untouched.
+    backoff_rows = conn.execute(
+        "SELECT COUNT(*) FROM activity_channel_resolution"
+    ).fetchone()[0]
+    assert backoff_rows == 1, (
+        f"only the flooded channel should have a backoff row, got {backoff_rows}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # (g) Restart-proof: linked-chat last_activity_at from channel's last_message_at
 # ---------------------------------------------------------------------------

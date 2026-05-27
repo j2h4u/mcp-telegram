@@ -500,3 +500,38 @@ async def test_hot_sweep_never_writes_cold_columns(monkeypatch):
             f"dialog {did}: cold_status must remain 'pending' (unchanged by HotSweep), "
             f"got {state.get('cold_status')}"
         )
+
+
+async def test_flood_halts_whole_pass_account_safety(monkeypatch):
+    """ACCOUNT SAFETY: a FloodWait halts the ENTIRE pass, not just the current peer.
+
+    FloodWait is account-global. Advancing to the next peer and issuing another
+    SearchRequest during the wait window is what escalates rate-limiting toward a
+    ban. Peers after the flooded one must NOT be swept this pass — they stay due
+    and resume next pass.
+    """
+    conn = _make_db()
+    # Recent timestamps so all peers pass the 30-day recency cutoff. Processed
+    # ORDER BY last_activity_at DESC → flood_first (highest) is swept first.
+    now = int(time.time())
+    flood_first = -100100000001
+    later_a = -100100000002
+    later_b = -100100000003
+    _enroll(conn, flood_first, last_activity_at=now)
+    _enroll(conn, later_a, last_activity_at=now - 10)
+    _enroll(conn, later_b, last_activity_at=now - 20)
+
+    _patch_build_working_set(monkeypatch)
+    call_log = _patch_sweep(monkeypatch, {flood_first: [_flood_result(26)]})
+
+    shutdown = asyncio.Event()
+    await run_hot_sweep_pass(None, conn, shutdown)
+
+    # Only the first peer was swept; the pass halted on its FloodWait.
+    assert set(call_log.keys()) == {flood_first}, (
+        f"pass must halt on first flood; swept peers were {sorted(call_log.keys())}"
+    )
+    # The flooded peer carries durable backoff; later peers were never touched.
+    assert _get_state(conn, flood_first).get("hot_next_retry_at") is not None
+    assert _get_state(conn, later_a).get("hot_next_retry_at") is None
+    assert _get_state(conn, later_b).get("hot_next_retry_at") is None

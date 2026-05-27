@@ -71,6 +71,11 @@ async def run_hot_sweep_pass(
     )
 
     total_written = 0
+    # FloodWait from Telegram is account-global. Once we hit one, every further
+    # SearchRequest this pass is sent during the wait window — exactly what
+    # escalates rate-limiting toward a ban. Stop the whole pass on the first flood
+    # and let the per-peer hot_next_retry_at backoff resume work next pass.
+    pass_flooded = False
 
     for dialog_id, old_hot_cursor in rows:
         if shutdown_event.is_set():
@@ -116,10 +121,11 @@ async def run_hot_sweep_pass(
                 _save_dialog_state(conn, dialog_id, **save_fields)
                 logger.warning(
                     "activity_hot_sweep_flood dialog_id=%r flood_wait_seconds=%d"
-                    " max_seen=%d pages_fetched=%d",
+                    " max_seen=%d pages_fetched=%d — halting pass (account-global wait)",
                     dialog_id, result.flood_wait_seconds, max_seen, pages_fetched,
                 )
-                break  # Move on to next peer — this peer retries after backoff
+                pass_flooded = True
+                break  # Stop this peer; pass_flooded halts the whole pass below
 
             # --- ACCESS_SKIP (concern 3): transient miss, do NOT advance cursor ---
             if result.skip_reason is SkipReason.ACCESS_SKIP:
@@ -178,6 +184,11 @@ async def run_hot_sweep_pass(
                 break
 
             page_offset = result.min_id  # Walk down within [pass_min_id, page_offset)
+
+        # Account-global FloodWait hit on this peer — do not advance to the next
+        # peer (that would send another request during the wait window).
+        if pass_flooded:
+            break
 
     logger.info(
         "activity_hot_sweep_pass_done peers=%d total_written=%d",

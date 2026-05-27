@@ -424,7 +424,14 @@ async def build_working_set(client: Any, conn: sqlite3.Connection) -> int:
         res: LinkedChatResolution = await resolve_linked_chat_id(client, conn, channel_id)
 
         if res.flood_wait_seconds is not None:
-            # Resolver path hit FloodWait — persist durable backoff
+            # FloodWait from GetFullChannel is ACCOUNT-GLOBAL, not per-channel:
+            # once Telegram issues it, every further request in this pass is sent
+            # *during* the wait window, which is exactly what escalates rate-limiting
+            # toward an account ban. Persist durable backoff for this channel, then
+            # STOP the pass (break, not continue). The remaining unresolved channels
+            # stay due and drain over subsequent passes (enroll cadence ~30 min), by
+            # which point the short global wait has long cleared. Resolved channels
+            # are cache-first (entity_details TTL) so they never re-hit the API.
             next_retry_at = now + res.flood_wait_seconds
             _record_channel_resolution_flood(
                 conn,
@@ -434,10 +441,10 @@ async def build_working_set(client: Any, conn: sqlite3.Connection) -> int:
             )
             logger.warning(
                 "build_working_set_channel_flood channel_id=%r flood_wait_seconds=%d"
-                " next_retry_at=%d",
+                " next_retry_at=%d — halting resolution pass (account-global wait)",
                 channel_id, res.flood_wait_seconds, next_retry_at,
             )
-            continue
+            break
 
         # Clean resolution (linked or clean-None) — clear any prior backoff
         _clear_channel_resolution(conn, channel_id, now=now)
