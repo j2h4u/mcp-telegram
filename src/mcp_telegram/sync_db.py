@@ -7,7 +7,7 @@ from pathlib import Path
 
 from xdg_base_dirs import xdg_state_home  # type: ignore[import-error]
 
-_CURRENT_SCHEMA_VERSION = 22
+_CURRENT_SCHEMA_VERSION = 23
 
 logger = logging.getLogger(__name__)
 
@@ -840,6 +840,22 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             "ALTER TABLE messages ADD COLUMN reply_count INTEGER NOT NULL DEFAULT 0",
         ],
         ignore_duplicate_column=True,
+    )
+
+    # v23 (Phase 53): per-peer own-message sweep substrate tables.
+    # activity_dialog_state: durable work/cursor table for Tier A (HotSweep) and
+    # Tier B (ColdBackfill); per-tier retry/error columns — no shared next_retry_at.
+    # activity_channel_resolution: resolver-path FloodWait backoff keyed by the
+    # broadcast channel_id (known before linked peer is resolved — concern 5 residual).
+    # Both tables are additive and idempotent (CREATE TABLE/INDEX IF NOT EXISTS).
+    _migrate(
+        23,
+        [
+            _ACTIVITY_DIALOG_STATE_DDL,
+            _ACTIVITY_DIALOG_STATE_HOT_INDEX_DDL,
+            _ACTIVITY_DIALOG_STATE_COLD_INDEX_DDL,
+            _ACTIVITY_CHANNEL_RESOLUTION_DDL,
+        ],
     )
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
