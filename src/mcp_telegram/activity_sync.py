@@ -72,7 +72,12 @@ def _set_state(conn: sqlite3.Connection, key: str, value: str | None) -> None:
         )
 
 
-def _extract_dialog_id(msg: Any) -> int | None:
+def extract_dialog_id(msg: Any) -> int | None:
+    """Resolve dialog_id from a Telethon message's peer_id field.
+
+    Public name so activity_peer_sweep can import it without relying on the
+    module-private underscore convention.
+    """
     peer = getattr(msg, "peer_id", None)
     if peer is None:
         return None
@@ -83,6 +88,10 @@ def _extract_dialog_id(msg: Any) -> int | None:
     except Exception:
         logger.warning("activity_sync_peer_id_unresolvable", exc_info=True)
         return None
+
+
+# Backward-compat alias for callers that used the private name.
+_extract_dialog_id = extract_dialog_id
 
 
 def _normalize(text: str | None) -> str | None:
@@ -155,7 +164,7 @@ def _fmt_duration(seconds: int) -> str:
     return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
 
 
-async def _call_with_timeout(client: Any, request: Any) -> Any:
+async def call_with_timeout(client: Any, request: Any) -> Any:
     """Invoke a Telethon RPC with a hard timeout and abandon on overrun.
 
     asyncio.wait_for awaits the wrapped task to actually finish after
@@ -169,6 +178,9 @@ async def _call_with_timeout(client: Any, request: Any) -> Any:
 
     Raises TimeoutError on overrun. Re-raises FloodWaitError and other
     exceptions surfaced by the RPC call.
+
+    Public name so activity_peer_sweep can import it without relying on the
+    module-private underscore convention.
     """
     task = asyncio.create_task(client(request))
     done, _pending = await asyncio.wait({task}, timeout=_SEARCH_RPC_TIMEOUT_S)
@@ -176,6 +188,10 @@ async def _call_with_timeout(client: Any, request: Any) -> Any:
         task.cancel()
         raise TimeoutError(f"RPC exceeded {_SEARCH_RPC_TIMEOUT_S}s deadline")
     return task.result()
+
+
+# Backward-compat alias for callers that used the private name.
+_call_with_timeout = call_with_timeout
 
 
 async def _run_backfill(
