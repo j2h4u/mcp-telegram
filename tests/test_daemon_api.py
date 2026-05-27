@@ -5310,3 +5310,519 @@ async def test_resolve_dialog_name_dialogs_snapshot_case_insensitive() -> None:
 
     assert result == 555
     client.iter_dialogs.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Task 03 (Plan 53-05): Account-trace scope-remap tests
+#
+# These tests assert the six sub-points (a)-(f) from the plan specification:
+#   (a) linked discussion group enrolled as own_only in synced_dialogs and
+#       present in activity_dialog_state
+#   (b) candidate set includes linked supergroup with author_search strategy
+#       and coverage no longer signature_only/unsupported
+#   (c) query-side proof: channel-scoped trace evidence CONTAINS own-messages
+#       stored under linked_chat_id
+#   (d) built SQL uses m.dialog_id IN (...)
+#   (e) authorship-bounded (from_id = target_user_id equivalent)
+#   (f) pagination second-page carries scope_dialog_ids in the token and
+#       rebuilds the IN(...) scope WITHOUT a live GetFullChannel call
+#   (g) no-discussion-group channel: unchanged scalar behavior
+# ---------------------------------------------------------------------------
+
+
+def _make_trace_db() -> sqlite3.Connection:
+    """Minimal in-memory DB for account-trace scope-remap tests.
+
+    Includes all tables required by:
+    - _build_trace_account_messages_query  (messages, dialogs, entities, topic_metadata)
+    - _trace_candidate_dialogs             (synced_dialogs, dialogs, trace_coverage_fragments,
+                                            entity_details)
+    - enroll_activity_dialog               (activity_dialog_state, synced_dialogs)
+    """
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        """
+        CREATE TABLE synced_dialogs (
+            dialog_id           INTEGER PRIMARY KEY,
+            status              TEXT NOT NULL DEFAULT 'not_synced',
+            last_synced_at      INTEGER,
+            last_event_at       INTEGER,
+            sync_progress       INTEGER DEFAULT 0,
+            total_messages      INTEGER,
+            access_lost_at      INTEGER,
+            read_inbox_max_id   INTEGER,
+            read_outbox_max_id  INTEGER
+        );
+
+        CREATE TABLE messages (
+            dialog_id       INTEGER NOT NULL,
+            message_id      INTEGER NOT NULL,
+            sent_at         INTEGER NOT NULL,
+            text            TEXT,
+            sender_id       INTEGER,
+            sender_first_name TEXT,
+            media_description TEXT,
+            reply_to_msg_id INTEGER,
+            reply_count     INTEGER NOT NULL DEFAULT 0,
+            forum_topic_id  INTEGER,
+            is_deleted      INTEGER NOT NULL DEFAULT 0,
+            deleted_at      INTEGER,
+            edit_date       INTEGER,
+            out             INTEGER NOT NULL DEFAULT 0,
+            is_service      INTEGER NOT NULL DEFAULT 0,
+            post_author     TEXT,
+            PRIMARY KEY (dialog_id, message_id)
+        ) WITHOUT ROWID;
+
+        CREATE TABLE dialogs (
+            dialog_id               INTEGER PRIMARY KEY,
+            name                    TEXT,
+            type                    TEXT,
+            archived                INTEGER NOT NULL DEFAULT 0,
+            pinned                  INTEGER NOT NULL DEFAULT 0,
+            members                 INTEGER,
+            created                 INTEGER,
+            last_message_at         INTEGER,
+            snapshot_at             INTEGER,
+            hidden                  INTEGER NOT NULL DEFAULT 0,
+            needs_refresh           INTEGER NOT NULL DEFAULT 0,
+            unread_mentions_count   INTEGER NOT NULL DEFAULT 0,
+            unread_reactions_count  INTEGER NOT NULL DEFAULT 0,
+            draft_text              TEXT
+        );
+
+        CREATE TABLE entities (
+            id              INTEGER PRIMARY KEY,
+            type            TEXT NOT NULL,
+            name            TEXT,
+            username        TEXT,
+            name_normalized TEXT,
+            updated_at      INTEGER NOT NULL
+        );
+
+        CREATE TABLE entity_details (
+            entity_id   INTEGER PRIMARY KEY,
+            detail_json TEXT NOT NULL,
+            fetched_at  INTEGER NOT NULL
+        );
+
+        CREATE TABLE topic_metadata (
+            dialog_id   INTEGER NOT NULL,
+            topic_id    INTEGER NOT NULL,
+            title       TEXT NOT NULL,
+            top_message_id  INTEGER,
+            is_general      INTEGER NOT NULL DEFAULT 0,
+            is_deleted      INTEGER NOT NULL DEFAULT 0,
+            inaccessible_error TEXT,
+            inaccessible_at INTEGER,
+            updated_at  INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (dialog_id, topic_id)
+        );
+
+        CREATE TABLE message_versions (
+            dialog_id   INTEGER NOT NULL,
+            message_id  INTEGER NOT NULL,
+            version     INTEGER NOT NULL,
+            old_text    TEXT,
+            edit_date   INTEGER,
+            PRIMARY KEY (dialog_id, message_id, version)
+        ) WITHOUT ROWID;
+
+        CREATE TABLE message_forwards (
+            dialog_id           INTEGER NOT NULL,
+            message_id          INTEGER NOT NULL,
+            fwd_from_peer_id    INTEGER,
+            fwd_from_name       TEXT,
+            fwd_date            INTEGER,
+            fwd_channel_post    INTEGER,
+            PRIMARY KEY (dialog_id, message_id)
+        ) WITHOUT ROWID;
+
+        CREATE TABLE trace_coverage_fragments (
+            target_user_id INTEGER NOT NULL,
+            dialog_id      INTEGER NOT NULL,
+            topic_id       INTEGER NOT NULL DEFAULT 0,
+            coverage_kind  TEXT NOT NULL,
+            status         TEXT NOT NULL,
+            fetched_at     INTEGER,
+            checkpoint     TEXT,
+            last_error     TEXT,
+            next_retry_at  INTEGER,
+            created_at     INTEGER NOT NULL,
+            updated_at     INTEGER NOT NULL,
+            PRIMARY KEY (target_user_id, dialog_id, topic_id, coverage_kind)
+        ) WITHOUT ROWID;
+
+        CREATE TABLE activity_dialog_state (
+            dialog_id           INTEGER PRIMARY KEY,
+            source              TEXT NOT NULL,
+            last_activity_at    INTEGER,
+            hot_cursor          INTEGER,
+            hot_last_sync_at    INTEGER,
+            hot_next_retry_at   INTEGER,
+            hot_last_error      TEXT,
+            cold_offset_id      INTEGER,
+            cold_status         TEXT NOT NULL DEFAULT 'pending',
+            cold_next_retry_at  INTEGER,
+            cold_last_error     TEXT,
+            created_at          INTEGER NOT NULL,
+            updated_at          INTEGER NOT NULL
+        ) WITHOUT ROWID;
+        """
+    )
+    conn.commit()
+    return conn
+
+
+# Channel + linked-chat constants used across all scope-remap tests.
+_CHANNEL_ID = -1001000000100
+_LINKED_CHAT_ID = -1001000000200
+_TARGET_USER_ID = 9999
+
+
+def _seed_channel_with_linked_chat(conn: sqlite3.Connection) -> None:
+    """Seed the broadcast channel (type=Channel) in dialogs + entity_details.
+
+    The entity_details blob carries linked_chat_id so the cache-first resolver
+    returns it without a live API call.
+    """
+    now = int(time.time())
+    conn.execute(
+        "INSERT INTO dialogs (dialog_id, name, type, hidden) VALUES (?, ?, ?, 0)",
+        (_CHANNEL_ID, "Test Channel", "Channel"),
+    )
+    conn.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')",
+        (_CHANNEL_ID,),
+    )
+    # Cache-first resolver reads entity_details.detail_json for linked_chat_id.
+    conn.execute(
+        "INSERT INTO entity_details (entity_id, detail_json, fetched_at) VALUES (?, ?, ?)",
+        (_CHANNEL_ID, json.dumps({"linked_chat_id": _LINKED_CHAT_ID}), now),
+    )
+    # Linked discussion group type so _trace_strategy_for_dialog returns author_search.
+    conn.execute(
+        "INSERT INTO dialogs (dialog_id, name, type, hidden) VALUES (?, ?, ?, 0)",
+        (_LINKED_CHAT_ID, "Test Discussion Group", "Group"),
+    )
+    conn.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')",
+        (_LINKED_CHAT_ID,),
+    )
+    conn.commit()
+
+
+def _insert_own_message(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    message_id: int,
+    sender_id: int,
+    sent_at: int = 1700000001,
+) -> None:
+    conn.execute(
+        "INSERT INTO messages "
+        "(dialog_id, message_id, sent_at, text, sender_id, out, is_deleted, is_service) "
+        "VALUES (?, ?, ?, 'hello', ?, 1, 0, 0)",
+        (dialog_id, message_id, sent_at, sender_id),
+    )
+    conn.commit()
+
+
+# -------- (a) Enrollment --------
+
+def test_linked_group_enrolled_in_activity_dialog_state() -> None:
+    """(a) enroll_activity_dialog writes activity_dialog_state + synced_dialogs."""
+    from mcp_telegram.activity_peer_sweep import enroll_activity_dialog
+
+    conn = _make_trace_db()
+    _seed_channel_with_linked_chat(conn)
+
+    # The shared fixture pre-seeds the linked group as a fully 'synced' dialog
+    # for the candidate/query tests. Sub-point (a) is about NET-NEW enrollment,
+    # where enroll_activity_dialog is the first writer for this peer — so remove
+    # the pre-seeded synced_dialogs row first. (enroll uses INSERT OR IGNORE and
+    # deliberately never downgrades an existing 'synced'/'active' row to
+    # 'own_only' — see enroll_activity_dialog docstring; the non-downgrade path
+    # is asserted separately below.)
+    conn.execute("DELETE FROM synced_dialogs WHERE dialog_id = ?", (_LINKED_CHAT_ID,))
+    conn.commit()
+
+    enroll_activity_dialog(conn, _LINKED_CHAT_ID, source="linked_chat")
+
+    # activity_dialog_state row must exist
+    row = conn.execute(
+        "SELECT source FROM activity_dialog_state WHERE dialog_id = ?",
+        (_LINKED_CHAT_ID,),
+    ).fetchone()
+    assert row is not None, "linked group not in activity_dialog_state"
+    assert row[0] == "linked_chat"
+
+    # synced_dialogs must have own_only status (net-new enrollment)
+    sd_row = conn.execute(
+        "SELECT status FROM synced_dialogs WHERE dialog_id = ?",
+        (_LINKED_CHAT_ID,),
+    ).fetchone()
+    assert sd_row is not None, "linked group not in synced_dialogs"
+    assert sd_row[0] == "own_only"
+
+    # Non-downgrade guard: re-enrolling a peer already 'synced' must NOT
+    # demote it to 'own_only' (coverage must never shrink).
+    conn.execute(
+        "UPDATE synced_dialogs SET status = 'synced' WHERE dialog_id = ?",
+        (_LINKED_CHAT_ID,),
+    )
+    conn.commit()
+    enroll_activity_dialog(conn, _LINKED_CHAT_ID, source="linked_chat")
+    sd_row2 = conn.execute(
+        "SELECT status FROM synced_dialogs WHERE dialog_id = ?",
+        (_LINKED_CHAT_ID,),
+    ).fetchone()
+    assert sd_row2[0] == "synced", "enrollment must not downgrade a synced dialog"
+
+
+# -------- (b) Candidate set expansion --------
+
+def test_trace_candidate_includes_linked_group_as_author_search() -> None:
+    """(b) _trace_candidate_dialogs adds linked supergroup as author_search candidate."""
+    from mcp_telegram.daemon_api import _trace_candidate_dialogs
+
+    conn = _make_trace_db()
+    _seed_channel_with_linked_chat(conn)
+
+    linked_chat_map = {_CHANNEL_ID: _LINKED_CHAT_ID}
+    candidates = _trace_candidate_dialogs(
+        conn,
+        _TARGET_USER_ID,
+        [],
+        exact_dialog_id=_CHANNEL_ID,
+        linked_chat_map=linked_chat_map,
+    )
+
+    strategies = {c["dialog_id"]: c["strategy"] for c in candidates}
+
+    # The broadcast channel itself is still in the list (signature_only).
+    assert _CHANNEL_ID in strategies, "channel not in candidates"
+    assert strategies[_CHANNEL_ID] == "signature_only"
+
+    # The linked discussion group must be added as author_search.
+    assert _LINKED_CHAT_ID in strategies, "linked group not added to candidates"
+    assert strategies[_LINKED_CHAT_ID] == "author_search", (
+        f"expected author_search for linked group, got {strategies[_LINKED_CHAT_ID]!r}"
+    )
+
+    # Origin of the linked-group candidate must be "linked_chat".
+    origins = {c["dialog_id"]: c["origin"] for c in candidates}
+    assert origins[_LINKED_CHAT_ID] == "linked_chat"
+
+
+# -------- (c) Query-side proof: evidence contains linked-chat messages --------
+
+def test_trace_query_returns_messages_under_linked_chat_id() -> None:
+    """(c) A channel-scoped trace with scope_dialog_ids=[channel, linked] returns
+    messages stored under linked_chat_id — not just the channel's dialog_id.
+    """
+    from mcp_telegram.daemon_api import _build_trace_account_messages_query
+
+    conn = _make_trace_db()
+    _seed_channel_with_linked_chat(conn)
+
+    # Message is stored under the LINKED CHAT, not the channel.
+    _insert_own_message(conn, _LINKED_CHAT_ID, message_id=42, sender_id=_TARGET_USER_ID)
+
+    scope_dialog_ids = [_CHANNEL_ID, _LINKED_CHAT_ID]
+    sql, params = _build_trace_account_messages_query(
+        target_user_id=_TARGET_USER_ID,
+        self_id=_TARGET_USER_ID,
+        limit=50,
+        exact_dialog_id=_CHANNEL_ID,
+        scope_dialog_ids=scope_dialog_ids,
+    )
+
+    rows = conn.execute(sql, params).fetchall()
+    message_ids = [int(r["message_id"]) for r in rows]
+    assert 42 in message_ids, (
+        "own-message stored under linked_chat_id not returned by channel-scoped trace; "
+        f"rows={message_ids}"
+    )
+
+
+# -------- (d) SQL uses IN(...) --------
+
+def test_trace_query_uses_in_filter_for_scope_dialog_ids() -> None:
+    """(d) When scope_dialog_ids is set, the built SQL contains 'IN' not '= :exact_dialog_id'."""
+    from mcp_telegram.daemon_api import _build_trace_account_messages_query
+
+    scope_dialog_ids = [_CHANNEL_ID, _LINKED_CHAT_ID]
+    sql, params = _build_trace_account_messages_query(
+        target_user_id=_TARGET_USER_ID,
+        self_id=_TARGET_USER_ID,
+        limit=50,
+        exact_dialog_id=_CHANNEL_ID,
+        scope_dialog_ids=scope_dialog_ids,
+    )
+
+    # SQL must use IN(...) parameterized form.
+    assert "IN (" in sql, f"expected 'IN (' in SQL; got:\n{sql}"
+    assert ":scope_0" in sql
+    assert ":scope_1" in sql
+
+    # Must NOT use the scalar filter when scope_dialog_ids is set.
+    assert "= :exact_dialog_id" not in sql, (
+        "scalar m.dialog_id = :exact_dialog_id must be absent when scope_dialog_ids is set"
+    )
+
+    # Both ids bound as named params.
+    assert params["scope_0"] == _CHANNEL_ID
+    assert params["scope_1"] == _LINKED_CHAT_ID
+
+
+# -------- (e) Authorship is bounded (from_id predicate present) --------
+
+def test_trace_query_authorship_predicate_unchanged() -> None:
+    """(e) scope_dialog_ids does not widen authorship — target_user_id still filters sender."""
+    from mcp_telegram.daemon_api import _build_trace_account_messages_query
+
+    conn = _make_trace_db()
+    _seed_channel_with_linked_chat(conn)
+
+    # Insert an own-message and a foreign-sender message under the linked chat.
+    _insert_own_message(conn, _LINKED_CHAT_ID, message_id=10, sender_id=_TARGET_USER_ID)
+    conn.execute(
+        "INSERT INTO messages "
+        "(dialog_id, message_id, sent_at, text, sender_id, out, is_deleted, is_service) "
+        "VALUES (?, ?, ?, 'other', ?, 0, 0, 0)",
+        (_LINKED_CHAT_ID, 11, 1700000002, 12345),
+    )
+    conn.commit()
+
+    scope_dialog_ids = [_CHANNEL_ID, _LINKED_CHAT_ID]
+    sql, params = _build_trace_account_messages_query(
+        target_user_id=_TARGET_USER_ID,
+        self_id=_TARGET_USER_ID,
+        limit=50,
+        exact_dialog_id=_CHANNEL_ID,
+        scope_dialog_ids=scope_dialog_ids,
+    )
+
+    rows = conn.execute(sql, params).fetchall()
+    returned_ids = {int(r["message_id"]) for r in rows}
+
+    # Own message (sender_id == _TARGET_USER_ID) must be present.
+    assert 10 in returned_ids, "own message missing from result"
+    # Foreign sender must be absent (authorship filter still applies).
+    assert 11 not in returned_ids, (
+        "foreign-sender message returned — authorship widened unexpectedly"
+    )
+
+
+# -------- (f) Pagination: second page carries scope_dialog_ids in token --------
+
+def test_trace_navigation_token_carries_scope_dialog_ids() -> None:
+    """(f) encode → decode round-trip preserves scope_dialog_ids without a live API call."""
+    from mcp_telegram.pagination import (
+        decode_account_trace_navigation,
+        encode_account_trace_navigation,
+    )
+
+    scope_dialog_ids = [_CHANNEL_ID, _LINKED_CHAT_ID]
+    token = encode_account_trace_navigation(
+        target_user_id=_TARGET_USER_ID,
+        sent_at=1700000001,
+        dialog_id=_LINKED_CHAT_ID,
+        message_id=42,
+        group_by="timeline",
+        exact_dialog_id=_CHANNEL_ID,
+        scope_dialog_ids=scope_dialog_ids,
+    )
+
+    # Decode — no live API call possible (pure token decode).
+    decoded = decode_account_trace_navigation(
+        token,
+        expected_target_user_id=_TARGET_USER_ID,
+        expected_group_by="timeline",
+        expected_exact_dialog_id=_CHANNEL_ID,
+    )
+
+    assert decoded.scope_dialog_ids == scope_dialog_ids, (
+        f"scope_dialog_ids not preserved across encode/decode: {decoded.scope_dialog_ids!r}"
+    )
+    assert decoded.exact_dialog_id == _CHANNEL_ID
+
+    # Feeding the decoded scope back into the query builder must produce IN(...).
+    from mcp_telegram.daemon_api import _build_trace_account_messages_query
+
+    conn = _make_trace_db()
+    _seed_channel_with_linked_chat(conn)
+    _insert_own_message(conn, _LINKED_CHAT_ID, message_id=43, sender_id=_TARGET_USER_ID)
+
+    sql, params = _build_trace_account_messages_query(
+        target_user_id=_TARGET_USER_ID,
+        self_id=_TARGET_USER_ID,
+        limit=50,
+        exact_dialog_id=_CHANNEL_ID,
+        scope_dialog_ids=decoded.scope_dialog_ids,
+    )
+
+    assert "IN (" in sql, "second-page query does not use IN(...) from token-carried scope"
+    rows = conn.execute(sql, params).fetchall()
+    assert any(int(r["message_id"]) == 43 for r in rows), (
+        "second-page query misses linked-chat message — scope not restored from token"
+    )
+
+
+# -------- (g) No-discussion-group channel: scalar behavior unchanged --------
+
+def test_trace_query_scalar_filter_when_no_scope_dialog_ids() -> None:
+    """(g) When scope_dialog_ids is absent, the scalar m.dialog_id = :exact_dialog_id is used."""
+    from mcp_telegram.daemon_api import _build_trace_account_messages_query
+
+    sql, params = _build_trace_account_messages_query(
+        target_user_id=_TARGET_USER_ID,
+        self_id=_TARGET_USER_ID,
+        limit=50,
+        exact_dialog_id=_CHANNEL_ID,
+        scope_dialog_ids=None,
+    )
+
+    assert "= :exact_dialog_id" in sql, "scalar filter missing when scope_dialog_ids=None"
+    assert "IN (" not in sql, "IN(...) filter must be absent when scope_dialog_ids=None"
+    assert params["exact_dialog_id"] == _CHANNEL_ID
+
+
+def test_trace_candidate_no_discussion_group_stays_signature_only() -> None:
+    """(g) A channel with no linked_chat_map entry stays signature_only; no expansion."""
+    from mcp_telegram.daemon_api import _trace_candidate_dialogs
+
+    conn = _make_trace_db()
+    # Register a plain broadcast channel — no linked chat.
+    conn.execute(
+        "INSERT INTO dialogs (dialog_id, name, type, hidden) VALUES (?, ?, ?, 0)",
+        (_CHANNEL_ID, "Bare Channel", "Channel"),
+    )
+    conn.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')",
+        (_CHANNEL_ID,),
+    )
+    conn.commit()
+
+    # Pass an EMPTY linked_chat_map (no discussion group resolved).
+    candidates = _trace_candidate_dialogs(
+        conn,
+        _TARGET_USER_ID,
+        [],
+        exact_dialog_id=_CHANNEL_ID,
+        linked_chat_map={},
+    )
+
+    dialog_ids = {c["dialog_id"] for c in candidates}
+    strategies = {c["dialog_id"]: c["strategy"] for c in candidates}
+
+    assert _CHANNEL_ID in dialog_ids, "channel missing from candidates"
+    assert strategies[_CHANNEL_ID] == "signature_only", (
+        f"bare channel strategy should be signature_only, got {strategies[_CHANNEL_ID]!r}"
+    )
+    # No linked-chat candidate must appear.
+    assert _LINKED_CHAT_ID not in dialog_ids, (
+        "linked group appeared in candidates despite no discussion group"
+    )
