@@ -1,12 +1,94 @@
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from enum import StrEnum
 from typing import Literal, NotRequired, TypedDict
 
 FORUM_TOPICS_PAGE_SIZE = 100
 TOPIC_METADATA_TTL_SECONDS = 600
 GENERAL_TOPIC_ID = 1
 GENERAL_TOPIC_TITLE = "General"
+
+
+class DialogType(StrEnum):
+    """Canonical dialog/entity type — the single vocabulary for this project.
+
+    Telethon has no flat type: the kind is an entity class (``User`` / ``Chat`` /
+    ``Channel``) plus boolean flags (``megagroup`` / ``forum`` / ``bot``). This enum
+    is the one canonical flattening, derived from a live entity by
+    :meth:`from_entity` (the ONLY place that reads Telethon flags) and parsed from a
+    stored/legacy string by :meth:`parse`. Values are lowercase to match what the
+    ``dialogs.type`` column already stores (no data migration).
+
+    Historical hazard this replaces: the codebase previously flattened the type in
+    three divergent ways, and a capitalized ``"Group"`` meant a MEGAGROUP while a
+    lowercase ``"group"`` meant a LEGACY BASIC GROUP — opposites. :meth:`parse` uses
+    an explicit map (never ``.lower()``) so that hazard cannot recur.
+    """
+
+    USER = "user"
+    BOT = "bot"
+    CHANNEL = "channel"        # broadcast channel (Channel, megagroup=False)
+    SUPERGROUP = "supergroup"  # megagroup (Channel, megagroup=True, forum=False)
+    FORUM = "forum"            # forum supergroup (Channel, megagroup=True, forum=True)
+    GROUP = "group"            # legacy basic group (Chat)
+    UNKNOWN = "unknown"
+
+    @classmethod
+    def from_entity(cls, entity: object | None) -> "DialogType":
+        """Derive the canonical type from a live Telethon entity (class + flags).
+
+        This is the SINGLE place allowed to read Telethon's class/flags. Branch order
+        matters: forum implies megagroup, so it must be checked first.
+        """
+        if entity is None:
+            return cls.UNKNOWN
+        # Lazy import keeps models.py import-light; matches the codebase's pattern.
+        from telethon.tl.types import Channel, Chat  # type: ignore[import-untyped]
+
+        if isinstance(entity, Channel):
+            if getattr(entity, "forum", False):
+                return cls.FORUM
+            if getattr(entity, "megagroup", False):
+                return cls.SUPERGROUP
+            return cls.CHANNEL
+        if isinstance(entity, Chat):
+            return cls.GROUP
+        # Duck-typed user detection (avoids importing User); bots are Users with bot=True.
+        if hasattr(entity, "first_name"):
+            return cls.BOT if getattr(entity, "bot", False) else cls.USER
+        return cls.UNKNOWN
+
+    @classmethod
+    def parse(cls, raw: "str | DialogType | None") -> "DialogType":
+        """Parse a stored/legacy type string to the canonical enum.
+
+        Trap-aware by design — NEVER lowercase-and-match. The capitalized vocabulary
+        (``"Group"`` = megagroup, ``"Chat"`` = legacy basic group) is the inverse of
+        the lowercase one, so both casings are mapped explicitly.
+        """
+        if isinstance(raw, DialogType):
+            return raw
+        if raw is None:
+            return cls.UNKNOWN
+        return _DIALOG_TYPE_ALIASES.get(raw.strip(), cls.UNKNOWN)
+
+
+# Explicit alias map for DialogType.parse — the trap-aware replacement for `.lower()`.
+# Lowercase entries = the `dialogs.type` storage vocabulary; capitalized entries =
+# the legacy `_classify_dialog_type` vocabulary. Note "Group"->SUPERGROUP (megagroup)
+# vs "group"->GROUP (legacy), and "Chat"->GROUP — these inversions are intentional.
+_DIALOG_TYPE_ALIASES: dict[str, DialogType] = {
+    "user": DialogType.USER, "User": DialogType.USER,
+    "bot": DialogType.BOT, "Bot": DialogType.BOT,
+    "channel": DialogType.CHANNEL, "Channel": DialogType.CHANNEL,
+    "supergroup": DialogType.SUPERGROUP, "megagroup": DialogType.SUPERGROUP,
+    "Group": DialogType.SUPERGROUP,        # capitalized "Group" = megagroup
+    "forum": DialogType.FORUM, "Forum": DialogType.FORUM,
+    "group": DialogType.GROUP,             # lowercase "group" = legacy basic group
+    "Chat": DialogType.GROUP,              # capitalized "Chat" = legacy basic group
+    "unknown": DialogType.UNKNOWN, "Unknown": DialogType.UNKNOWN,
+}
 
 TraceGapSeverity = Literal["info", "warning", "action_required"]
 TraceCoverageState = Literal["complete", "partial", "unknown"]
