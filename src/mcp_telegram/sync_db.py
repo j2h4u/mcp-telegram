@@ -261,6 +261,86 @@ CREATE INDEX IF NOT EXISTS idx_trace_coverage_target_status
 ON trace_coverage_fragments(target_user_id, status, next_retry_at)
 """
 
+# ---------------------------------------------------------------------------
+# DDL for v23: per-peer self-search substrate tables (Phase 53)
+#
+# activity_dialog_state is the durable work/cursor table for Tier A (HotSweep)
+# and Tier B (ColdBackfill) per-peer own-message sweeps. It is keyed by the
+# resolved supergroup/discussion-group peer id (dialog_id). Retry/error
+# bookkeeping is split per tier so a cold full-history FloodWait can NEVER
+# suppress Tier-A hot sweeps (concern 5 fix).
+#
+# activity_channel_resolution is a second tiny table keyed by the broadcast
+# channel_id (which IS known at GetFullChannelRequest flood time, before the
+# linked discussion peer is resolved). It stores the durable resolver-path
+# backoff so FloodWaits longer than the scheduler cadence survive daemon
+# restarts (cycle-4 HIGH — concern 5 residual).
+# ---------------------------------------------------------------------------
+
+_ACTIVITY_DIALOG_STATE_DDL = """
+CREATE TABLE IF NOT EXISTS activity_dialog_state (
+    dialog_id           INTEGER PRIMARY KEY,
+                        -- the -100… peer id; PK enforces D-03 dedup intrinsically
+    source              TEXT NOT NULL,
+                        -- enrollment origin: 'supergroup' | 'linked_chat'
+    last_activity_at    INTEGER,
+                        -- newest authored-activity epoch; drives Tier-A ≤30d eligibility
+                        -- (populated by build_working_set from dialogs.last_message_at — plan 02)
+    hot_cursor          INTEGER,
+                        -- Tier-A newest-side message_id high-water mark
+                        -- (NULL = never swept; HotSweep advances forward and persists max(batch_ids))
+    hot_last_sync_at    INTEGER,
+                        -- epoch of last successful Tier-A pass for this peer
+    hot_next_retry_at   INTEGER,
+                        -- Tier-A durable backoff (NULL = due now); set ONLY by HotSweep
+    hot_last_error      TEXT,
+                        -- sanitized Tier-A error class (no content)
+    cold_offset_id      INTEGER,
+                        -- Tier-B backward-walk message_id cursor
+                        -- (NULL = start from newest; ColdBackfill advances downward and persists min(batch_ids))
+    cold_status         TEXT NOT NULL DEFAULT 'pending',
+                        -- Tier-B state machine: 'pending' | 'running' | 'complete'
+    cold_next_retry_at  INTEGER,
+                        -- Tier-B durable backoff (NULL = due now); set ONLY by ColdBackfill —
+                        -- this is the single owner of FloodWait retry for full-history walks (concern 5)
+    cold_last_error     TEXT,
+                        -- sanitized Tier-B error class (no content)
+    created_at          INTEGER NOT NULL,
+    updated_at          INTEGER NOT NULL
+) WITHOUT ROWID
+"""
+
+_ACTIVITY_DIALOG_STATE_HOT_INDEX_DDL = """
+CREATE INDEX IF NOT EXISTS idx_activity_dialog_state_hot
+ON activity_dialog_state(last_activity_at, hot_next_retry_at)
+"""
+# Tier-A selection: recency-bounded due peers
+# WHERE last_activity_at >= :cutoff AND (hot_next_retry_at IS NULL OR hot_next_retry_at <= :now)
+
+_ACTIVITY_DIALOG_STATE_COLD_INDEX_DDL = """
+CREATE INDEX IF NOT EXISTS idx_activity_dialog_state_cold
+ON activity_dialog_state(cold_status, cold_next_retry_at)
+"""
+# Tier-B selection: pending/running due peers
+# WHERE cold_status IN ('pending', 'running') AND (cold_next_retry_at IS NULL OR cold_next_retry_at <= :now)
+
+_ACTIVITY_CHANNEL_RESOLUTION_DDL = """
+CREATE TABLE IF NOT EXISTS activity_channel_resolution (
+    channel_id      INTEGER PRIMARY KEY,
+                    -- the broadcast channel's -100… id; the durable retry key for
+                    -- linked-chat resolution (known at flood time even though the
+                    -- linked peer is not)
+    next_retry_at   INTEGER,
+                    -- durable resolver-path backoff (NULL = due now); set to
+                    -- now+flood_wait_seconds by build_working_set when
+                    -- resolve_linked_chat_id surfaces a FloodWait, cleared on a
+                    -- successful/none resolution
+    last_error      TEXT,
+                    -- sanitized resolver error class (no content, no session secrets)
+    updated_at      INTEGER NOT NULL
+) WITHOUT ROWID
+"""
+
 
 # ---------------------------------------------------------------------------
 # Path helper
