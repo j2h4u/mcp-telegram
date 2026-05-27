@@ -1195,11 +1195,27 @@ def _trace_candidate_dialogs(
     exact_dialog_id: int | None = None,
     exact_topic_id: int | None = None,
     max_dialogs: int = _TRACE_ENRICHMENT_MAX_DIALOGS,
+    linked_chat_map: dict[int, int] | None = None,
 ) -> list[dict]:
-    """Select deterministic bounded Account Trace enrichment candidates."""
+    """Select deterministic bounded Account Trace enrichment candidates.
+
+    ``linked_chat_map`` is an optional pre-resolved mapping of
+    broadcast-channel dialog_id → linked-discussion-group dialog_id.
+    When a candidate is classified as ``signature_only`` (broadcast Channel)
+    and its dialog_id appears in the map, the linked discussion supergroup is
+    enrolled as ``own_only`` and added as an additional ``author_search``
+    candidate — closing the coverage blind spot for channel-linked groups
+    (concern 6 / D-06).  The original channel candidate is still recorded so
+    coverage reporting can reference the channel id.
+
+    Pre-resolution (rather than live resolution inside the sync loop here)
+    is intentional: the async caller computes the map once and passes it in,
+    so no live Telegram API call is made from inside this sync function.
+    """
     now = int(time.time())
     candidates: list[dict] = []
     seen: set[int] = set()
+    _linked_chat_map: dict[int, int] = linked_chat_map or {}
 
     def add_candidate(dialog_id: int, *, origin: str, include_inaccessible: bool = False) -> None:
         if dialog_id in seen or len(candidates) >= max_dialogs:
@@ -1224,6 +1240,20 @@ def _trace_candidate_dialogs(
             }
         )
         seen.add(dialog_id)
+
+        # Scope expansion (concern 6): when a broadcast Channel yields
+        # ``signature_only`` and a pre-resolved linked discussion group exists,
+        # enroll the group as own_only and add it as an author_search candidate.
+        # Account-target semantics are preserved: the linked-chat candidate will
+        # be searched with from_user=target_user_id by _trace_enrich_one_candidate
+        # because _trace_strategy_for_dialog returns "author_search" for a Group.
+        if strategy == "signature_only" and dialog_id in _linked_chat_map:
+            linked_id = _linked_chat_map[dialog_id]
+            if linked_id not in seen:
+                # Enroll the linked chat as own_only so the sweep schedulers
+                # start collecting its own-message coverage going forward.
+                enroll_activity_dialog(conn, linked_id, source="linked_chat")
+                add_candidate(linked_id, origin="linked_chat", include_inaccessible=False)
 
     if exact_dialog_id is not None:
         add_candidate(exact_dialog_id, origin="exact_dialog", include_inaccessible=True)
@@ -1563,8 +1593,24 @@ def _build_trace_account_messages_query(
     sent_after_ts: int | None = None,
     sent_before_ts: int | None = None,
     navigation: dict[str, int] | None = None,
+    scope_dialog_ids: list[int] | None = None,
 ) -> tuple[str, dict]:
-    """Build the baseline Account Trace query over canonical message rows."""
+    """Build the baseline Account Trace query over canonical message rows.
+
+    ``scope_dialog_ids`` carries the effective dialog-id set for a channel-
+    scoped trace that has a linked discussion group.  When non-empty it
+    replaces the scalar ``m.dialog_id = :exact_dialog_id`` filter with
+    ``m.dialog_id IN (:scope_0, :scope_1, …)`` (parameterized — never
+    string-interpolated) so linked-chat messages stored under the discussion
+    group's dialog_id appear in results (concern 6 / REVIEW-FIX query side).
+
+    When ``scope_dialog_ids`` is None or empty and ``exact_dialog_id`` is set,
+    the scalar scalar filter is used unchanged — no regression for non-channel
+    traces.
+
+    The ``scope_dialog_ids`` list is bounded at ≤2 ids (channel + linked chat),
+    matching the navigation token field by the same name.
+    """
     params: dict[str, object] = {
         "target_user_id": target_user_id,
         "self_id": self_id,
@@ -1607,7 +1653,15 @@ def _build_trace_account_messages_query(
         authorship_predicates.append(f"m.post_author IN ({', '.join(placeholders)})")
     sql += f" AND ({' OR '.join(authorship_predicates)})"
 
-    if exact_dialog_id is not None:
+    # Dialog-scope filter: prefer the expanded set when provided (concern 6 /
+    # REVIEW-FIX query side).  Each id is bound as a distinct named parameter
+    # so SQLite never interpolates ids as literals.
+    if scope_dialog_ids:
+        scope_placeholders = [f":scope_{i}" for i in range(len(scope_dialog_ids))]
+        sql += f" AND m.dialog_id IN ({', '.join(scope_placeholders)})"
+        for i, sid in enumerate(scope_dialog_ids):
+            params[f"scope_{i}"] = sid
+    elif exact_dialog_id is not None:
         sql += " AND m.dialog_id = :exact_dialog_id"
         params["exact_dialog_id"] = exact_dialog_id
 
@@ -3287,6 +3341,28 @@ class DaemonAPIServer:
             }
 
         target_user_id = int(resolved_account["account_id"])
+
+        # --- Pre-resolve linked-chat scope for a channel exact_dialog_id (concern 6 / cycle-3).
+        # Resolve once here; reused by both the query builder and _trace_candidate_dialogs so
+        # we never issue a second live GetFullChannelRequest in the same call.
+        # scope_dialog_ids is the token-carried field: [channel_id, linked_chat_id] when the
+        # channel has a discussion group, or None otherwise.  The recompute fork is intentionally
+        # dropped — see AccountTraceNavigationToken.scope_dialog_ids docstring.
+        scope_dialog_ids: list[int] | None = None
+        linked_chat_map: dict[int, int] = {}
+        if exact_dialog_id is not None:
+            meta = _trace_dialog_metadata(self._conn, exact_dialog_id)
+            if _trace_strategy_for_dialog(
+                meta["dialog_type"], status=meta["status"], hidden=bool(meta["hidden"])
+            ) == "signature_only":
+                resolution = await resolve_linked_chat_id(self._client, self._conn, exact_dialog_id)
+                if resolution.flood_wait_seconds is None and resolution.linked_chat_id is not None:
+                    linked_chat_id_resolved = resolution.linked_chat_id
+                    linked_chat_map[exact_dialog_id] = linked_chat_id_resolved
+                    scope_dialog_ids = [exact_dialog_id, linked_chat_id_resolved]
+                    # Enroll the linked chat as own_only so the sweep schedulers cover it.
+                    enroll_activity_dialog(self._conn, linked_chat_id_resolved, source="linked_chat")
+
         navigation_payload: dict[str, int] | None = None
         navigation = req.get("navigation")
         if isinstance(navigation, str) and navigation:
@@ -3307,6 +3383,16 @@ class DaemonAPIServer:
                 "dialog_id": decoded.dialog_id,
                 "message_id": decoded.message_id,
             }
+            # Restore the token-carried scope so cross-page queries use the same
+            # m.dialog_id IN (...) filter without a live re-resolution (cycle-4 MEDIUM).
+            if decoded.scope_dialog_ids is not None:
+                scope_dialog_ids = decoded.scope_dialog_ids
+                # Also repopulate linked_chat_map for _trace_candidate_dialogs.
+                if exact_dialog_id is not None and len(scope_dialog_ids) == 2:
+                    channel_id_from_token = scope_dialog_ids[0]
+                    linked_id_from_token = scope_dialog_ids[1]
+                    if channel_id_from_token == exact_dialog_id:
+                        linked_chat_map[exact_dialog_id] = linked_id_from_token
 
         post_author_aliases = _trace_post_author_aliases(resolved_account)
         sql, params = _build_trace_account_messages_query(
@@ -3319,6 +3405,7 @@ class DaemonAPIServer:
             sent_after_ts=sent_after_ts,
             sent_before_ts=sent_before_ts,
             navigation=navigation_payload,
+            scope_dialog_ids=scope_dialog_ids,
         )
 
         def run_trace_query() -> tuple[list[sqlite3.Row], list[sqlite3.Row], list[dict], str | None]:
@@ -3338,6 +3425,7 @@ class DaemonAPIServer:
                     exact_topic_id=exact_topic_id,
                     sent_after=sent_after,
                     sent_before=sent_before,
+                    scope_dialog_ids=scope_dialog_ids,
                 )
             return rows, selected_rows, evidence, next_navigation
 
@@ -3350,6 +3438,7 @@ class DaemonAPIServer:
                 selected_rows,
                 exact_dialog_id=exact_dialog_id,
                 exact_topic_id=exact_topic_id,
+                linked_chat_map=linked_chat_map,
             )
             enrichment = await self._trace_enrich_visible_dialogs(target_user_id, candidates)
             _, selected_rows, evidence, next_navigation = run_trace_query()

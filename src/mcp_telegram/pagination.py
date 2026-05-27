@@ -48,6 +48,21 @@ class AccountTraceNavigationToken:
     The cursor is bound to the account, grouping mode, optional dialog/topic
     scope, and time bounds so callers cannot accidentally reuse a page token
     for a different trace.
+
+    ``scope_dialog_ids`` carries the effective dialog-id set for a channel-
+    scoped trace that has a linked discussion group (≤2 ids: channel +
+    linked chat).  It is encoded in the token and fed back into
+    ``_build_trace_account_messages_query(scope_dialog_ids=…)`` on decode so
+    the expanded ``m.dialog_id IN (…)`` scope is preserved across pages
+    WITHOUT any live ``GetFullChannelRequest`` re-resolution.
+
+    When absent/None the decoder falls back to the scalar ``exact_dialog_id``
+    path with no live call (legacy token or non-channel trace).
+
+    The recompute fork (resolving the channel again on decode) is intentionally
+    dropped here: a cache expiry between pages could FloodWait and silently
+    collapse the scope back to the scalar channel id, causing page-boundary
+    evidence loss (cycle-4 MEDIUM finding from OpenCode).
     """
 
     target_user_id: int
@@ -59,6 +74,7 @@ class AccountTraceNavigationToken:
     exact_topic_id: int | None = None
     sent_after: str | None = None
     sent_before: str | None = None
+    scope_dialog_ids: list[int] | None = None
 
 
 def _encode_payload(payload: dict[str, object]) -> str:
@@ -225,8 +241,14 @@ def encode_account_trace_navigation(
     exact_topic_id: int | None = None,
     sent_after: str | None = None,
     sent_before: str | None = None,
+    scope_dialog_ids: list[int] | None = None,
 ) -> str:
-    """Encode an Account Trace keyset continuation cursor."""
+    """Encode an Account Trace keyset continuation cursor.
+
+    ``scope_dialog_ids`` encodes the effective dialog-id set so the next page
+    rebuilds the same ``m.dialog_id IN (…)`` scope from the token alone — no
+    live ``GetFullChannelRequest`` re-resolution on decode.  Bounded at ≤2 ids.
+    """
     payload: dict[str, object] = {
         "kind": "account_trace",
         "target_user_id": target_user_id,
@@ -243,6 +265,8 @@ def encode_account_trace_navigation(
         payload["sent_after"] = sent_after
     if sent_before is not None:
         payload["sent_before"] = sent_before
+    if scope_dialog_ids is not None:
+        payload["scope_dialog_ids"] = scope_dialog_ids
     return _encode_payload(payload)
 
 
@@ -317,6 +341,20 @@ def decode_account_trace_navigation(
         msg = f"Navigation token belongs to sent_before {sent_before}, not {expected_sent_before}"
         raise ValueError(msg)
 
+    # scope_dialog_ids is optional (absent in legacy/non-channel tokens).
+    # When present it must be a list of ints bounded at ≤2 ids.
+    scope_dialog_ids_raw = data.get("scope_dialog_ids")
+    scope_dialog_ids: list[int] | None = None
+    if scope_dialog_ids_raw is not None:
+        if not isinstance(scope_dialog_ids_raw, list):
+            raise ValueError("Invalid navigation token: scope_dialog_ids must be a list when present")
+        if len(scope_dialog_ids_raw) > 2:
+            raise ValueError("Invalid navigation token: scope_dialog_ids must have at most 2 elements")
+        for item in scope_dialog_ids_raw:
+            if not isinstance(item, int):
+                raise ValueError("Invalid navigation token: all scope_dialog_ids elements must be integers")
+        scope_dialog_ids = [int(x) for x in scope_dialog_ids_raw]
+
     return AccountTraceNavigationToken(
         target_user_id=target_user_id,
         sent_at=sent_at,
@@ -327,4 +365,5 @@ def decode_account_trace_navigation(
         exact_topic_id=exact_topic_id,
         sent_after=sent_after,
         sent_before=sent_before,
+        scope_dialog_ids=scope_dialog_ids,
     )
