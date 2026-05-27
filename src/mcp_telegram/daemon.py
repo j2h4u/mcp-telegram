@@ -45,6 +45,7 @@ from telethon.errors.rpcerrorlist import FloodWaitError  # type: ignore[import-u
 from telethon.tl.functions.messages import GetPeerDialogsRequest  # type: ignore[import-untyped]
 from telethon.tl.types import InputDialogPeer  # type: ignore[import-untyped]
 
+from .activity_cold_backfill import run_cold_backfill_loop
 from .activity_hot_sweep import run_hot_sweep_loop
 from .activity_sync import run_activity_sync_loop
 from .daemon_api import DaemonAPIServer, get_daemon_socket_path
@@ -579,6 +580,10 @@ async def sync_main() -> None:
         _create_tracked_task(
             run_hot_sweep_loop(client, conn, shutdown_event),
             name="activity_hot_sweep",
+        )
+        _create_tracked_task(
+            run_cold_backfill_loop(client, conn, shutdown_event),
+            name="activity_cold_backfill",
         )
         # Phase 43 / RECON-01: hourly light pass + daily full pass keeps the
         # `dialogs` snapshot fresh; processes needs_refresh=1 rows written by
