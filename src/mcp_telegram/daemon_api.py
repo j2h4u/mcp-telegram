@@ -1129,11 +1129,18 @@ def _trace_strategy_for_dialog(dialog_type: str, *, status: str | None, hidden: 
         return "hidden"
     if status == "access_lost":
         return "access_lost"
-    if dialog_type in {"User", "Bot"}:
+    # The `dialogs` table stores types lowercase ('channel', 'supergroup', 'group',
+    # 'user', 'bot'); the `entities` table may carry capitalized legacy values
+    # ('Channel', 'User', 'Bot'). Normalize case-insensitively so the classifier is
+    # robust to both sources — a case mismatch here silently mislabels a broadcast
+    # channel as `unsupported`, which disables the channel→linked-discussion-group
+    # scope expansion (phase 53 D-06) for every real channel.
+    t = dialog_type.strip().lower()
+    if t in {"user", "bot"}:
         return "dialog_scan"
-    if dialog_type in {"Group", "Forum", "Chat"}:
+    if t in {"group", "supergroup", "megagroup", "forum", "chat"}:
         return "author_search"
-    if dialog_type == "Channel":
+    if t == "channel":
         return "signature_only"
     return "unsupported"
 

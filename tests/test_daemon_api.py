@@ -5488,9 +5488,15 @@ def _seed_channel_with_linked_chat(conn: sqlite3.Connection) -> None:
     returns it without a live API call.
     """
     now = int(time.time())
+    # NOTE: use the LOWERCASE type casing the live `dialogs` table actually stores
+    # ('channel', 'supergroup') — NOT the capitalized values. A prior version of this
+    # fixture seeded "Channel"/"Group", which masked a real case-sensitivity bug:
+    # _trace_strategy_for_dialog matched capitalized "Channel" only, so live channels
+    # (lowercase) classified as `unsupported` and the channel→linked-group scope
+    # expansion never fired in production.
     conn.execute(
         "INSERT INTO dialogs (dialog_id, name, type, hidden) VALUES (?, ?, ?, 0)",
-        (_CHANNEL_ID, "Test Channel", "Channel"),
+        (_CHANNEL_ID, "Test Channel", "channel"),
     )
     conn.execute(
         "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')",
@@ -5504,7 +5510,7 @@ def _seed_channel_with_linked_chat(conn: sqlite3.Connection) -> None:
     # Linked discussion group type so _trace_strategy_for_dialog returns author_search.
     conn.execute(
         "INSERT INTO dialogs (dialog_id, name, type, hidden) VALUES (?, ?, ?, 0)",
-        (_LINKED_CHAT_ID, "Test Discussion Group", "Group"),
+        (_LINKED_CHAT_ID, "Test Discussion Group", "supergroup"),
     )
     conn.execute(
         "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')",
@@ -5527,6 +5533,35 @@ def _insert_own_message(
         (dialog_id, message_id, sent_at, sender_id),
     )
     conn.commit()
+
+
+# -------- (0) Strategy classifier case-insensitivity (regression) --------
+
+def test_trace_strategy_for_dialog_is_case_insensitive() -> None:
+    """Live `dialogs.type` is lowercase — the classifier must not require capitals.
+
+    Regression: a broadcast channel stored as lowercase 'channel' was classified as
+    `unsupported`, which disabled the channel→linked-discussion-group scope expansion
+    (phase 53 D-06) for every real channel.
+    """
+    from mcp_telegram.daemon_api import _trace_strategy_for_dialog
+
+    s = _trace_strategy_for_dialog
+    # lowercase (the casing the dialogs table actually stores)
+    assert s("channel", status="synced", hidden=False) == "signature_only"
+    assert s("supergroup", status="synced", hidden=False) == "author_search"
+    assert s("group", status="synced", hidden=False) == "author_search"
+    assert s("user", status="synced", hidden=False) == "dialog_scan"
+    assert s("bot", status="synced", hidden=False) == "dialog_scan"
+    # capitalized legacy values (entities table) still map identically
+    assert s("Channel", status="synced", hidden=False) == "signature_only"
+    assert s("Group", status="synced", hidden=False) == "author_search"
+    assert s("User", status="synced", hidden=False) == "dialog_scan"
+    # precedence guards unchanged
+    assert s("channel", status="synced", hidden=True) == "hidden"
+    assert s("channel", status="access_lost", hidden=False) == "access_lost"
+    # genuinely unknown type still unsupported
+    assert s("unknown", status="synced", hidden=False) == "unsupported"
 
 
 # -------- (a) Enrollment --------
