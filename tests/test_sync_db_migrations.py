@@ -324,7 +324,7 @@ def test_schema_version_records_current_v18(tmp_path: Path) -> None:
             "SELECT MAX(version) FROM schema_version"
         ).fetchone()[0]
         assert max_version == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 22  # Phase 52 follow-up lock — flips when next migration ships
+        assert _CURRENT_SCHEMA_VERSION == 23  # Phase 53 follow-up lock — flips when next migration ships
     finally:
         conn.close()
 
@@ -571,6 +571,185 @@ def test_migration_v21_runs_from_v20_database(tmp_path: Path) -> None:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()}
         assert "reply_count" in columns
         max_version = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
-        assert max_version == 22
+        assert max_version == 23
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# v23: activity_dialog_state + activity_channel_resolution (Phase 53)
+# ---------------------------------------------------------------------------
+
+
+def test_migration_v23_schema_version(db_path: Path) -> None:
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    try:
+        row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
+        assert row[0] == 23, f"expected schema version 23, got {row[0]}"
+    finally:
+        conn.close()
+
+
+def test_migration_v23_creates_activity_dialog_state(db_path: Path) -> None:
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    try:
+        row = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='activity_dialog_state'"
+        ).fetchone()
+        assert row == ("activity_dialog_state",)
+
+        cols = {c[1]: c for c in conn.execute("PRAGMA table_info(activity_dialog_state)")}
+        # (cid, name, type, notnull, dflt_value, pk)
+        assert "dialog_id" in cols
+        assert "source" in cols
+        assert "last_activity_at" in cols
+        assert "hot_cursor" in cols
+        assert "hot_last_sync_at" in cols
+        assert "hot_next_retry_at" in cols
+        assert "hot_last_error" in cols
+        assert "cold_offset_id" in cols
+        assert "cold_status" in cols
+        assert "cold_next_retry_at" in cols
+        assert "cold_last_error" in cols
+        assert "created_at" in cols
+        assert "updated_at" in cols
+
+        # dialog_id is PK
+        assert cols["dialog_id"][5] == 1, "dialog_id must be PRIMARY KEY"
+        # source is NOT NULL
+        assert cols["source"][3] == 1, "source must be NOT NULL"
+        # cold_status has default 'pending'
+        assert cols["cold_status"][4] == "'pending'", f"cold_status default must be 'pending', got {cols['cold_status'][4]}"
+    finally:
+        conn.close()
+
+
+def test_migration_v23_per_tier_retry_columns_no_shared(db_path: Path) -> None:
+    """Both hot_next_retry_at and cold_next_retry_at exist; no bare next_retry_at column."""
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    try:
+        col_names = {c[1] for c in conn.execute("PRAGMA table_info(activity_dialog_state)")}
+        assert "hot_next_retry_at" in col_names, "hot_next_retry_at must exist (Tier-A retry)"
+        assert "cold_next_retry_at" in col_names, "cold_next_retry_at must exist (Tier-B retry)"
+        assert "next_retry_at" not in col_names, "bare next_retry_at must NOT exist (tier coupling)"
+    finally:
+        conn.close()
+
+
+def test_migration_v23_creates_per_tier_indexes(db_path: Path) -> None:
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    try:
+        indexes = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='index' AND tbl_name='activity_dialog_state'"
+            )
+        }
+        assert "idx_activity_dialog_state_hot" in indexes, "Tier-A hot index missing"
+        assert "idx_activity_dialog_state_cold" in indexes, "Tier-B cold index missing"
+    finally:
+        conn.close()
+
+
+def test_migration_v23_creates_activity_channel_resolution(db_path: Path) -> None:
+    """cycle-4 HIGH: activity_channel_resolution table exists with correct columns."""
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    try:
+        row = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='activity_channel_resolution'"
+        ).fetchone()
+        assert row == ("activity_channel_resolution",), "activity_channel_resolution table missing"
+
+        cols = {c[1]: c for c in conn.execute("PRAGMA table_info(activity_channel_resolution)")}
+        # (cid, name, type, notnull, dflt_value, pk)
+        assert "channel_id" in cols, "channel_id column missing"
+        assert "next_retry_at" in cols, "next_retry_at column missing"
+        assert "last_error" in cols, "last_error column missing"
+        assert "updated_at" in cols, "updated_at column missing"
+
+        # channel_id is PK (pk=1)
+        assert cols["channel_id"][5] == 1, "channel_id must be PRIMARY KEY"
+        # updated_at is NOT NULL
+        assert cols["updated_at"][3] == 1, "updated_at must be NOT NULL"
+    finally:
+        conn.close()
+
+
+def test_migration_v23_activity_channel_resolution_without_rowid(db_path: Path) -> None:
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    try:
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='activity_channel_resolution'"
+        ).fetchone()
+        assert row is not None
+        assert "WITHOUT ROWID" in row[0].upper()
+    finally:
+        conn.close()
+
+
+def test_migration_v23_activity_dialog_state_without_rowid(db_path: Path) -> None:
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    try:
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='activity_dialog_state'"
+        ).fetchone()
+        assert row is not None
+        assert "WITHOUT ROWID" in row[0].upper()
+    finally:
+        conn.close()
+
+
+def test_migration_v23_idempotent(db_path: Path) -> None:
+    ensure_sync_schema(db_path)
+    ensure_sync_schema(db_path)  # second call must not raise
+    conn = _open_sync_db(db_path)
+    try:
+        row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
+        assert row[0] == 23
+    finally:
+        conn.close()
+
+
+def test_migration_v23_runs_from_v22_database(tmp_path: Path) -> None:
+    """v22 → v23 upgrade path creates both new tables."""
+    db_path = tmp_path / "sync.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "CREATE TABLE schema_version (version INTEGER NOT NULL, applied_at INTEGER NOT NULL)"
+        )
+        conn.execute(
+            """
+            CREATE TABLE messages (
+                dialog_id  INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                sent_at    INTEGER NOT NULL,
+                reply_count INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (dialog_id, message_id)
+            ) WITHOUT ROWID
+            """
+        )
+        conn.execute("INSERT INTO schema_version VALUES (22, 1700000000)")
+        conn.commit()
+
+    ensure_sync_schema(db_path)
+
+    conn = _open_sync_db(db_path)
+    try:
+        assert conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='activity_dialog_state'"
+        ).fetchone() == ("activity_dialog_state",)
+        assert conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='activity_channel_resolution'"
+        ).fetchone() == ("activity_channel_resolution",)
+        max_version = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
+        assert max_version == 23
     finally:
         conn.close()
