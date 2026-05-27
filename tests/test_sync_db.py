@@ -1611,8 +1611,8 @@ def test_schema_version_is_current(tmp_sync_db_path: Path) -> None:
         assert row is not None and int(row[0]) == _CURRENT_SCHEMA_VERSION, (
             f"Expected schema version {_CURRENT_SCHEMA_VERSION}, got {row}"
         )
-        assert _CURRENT_SCHEMA_VERSION == 22, (
-            f"_CURRENT_SCHEMA_VERSION must be 22, got {_CURRENT_SCHEMA_VERSION}"
+        assert _CURRENT_SCHEMA_VERSION == 23, (
+            f"_CURRENT_SCHEMA_VERSION must be 23, got {_CURRENT_SCHEMA_VERSION}"
         )
     finally:
         conn.close()
