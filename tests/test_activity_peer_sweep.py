@@ -8,11 +8,12 @@ Covers:
       the peer's dialogs.last_message_at.
   (d) dialogs.type='group' is NOT selected as a supergroup; type='supergroup'
       IS selected (proves the source/casing fix — concern 4).
+  (e) FloodWait on the second of three channels halts the pass (break, not
+      continue) — account-global wait invariant regression guard (Phase 54).
 
-Note: tests (e)–(h) and the _channel_resolution_due helper tests covered the
-Phase-53 activity_channel_resolution backoff table, which was dropped in v24
-(Phase 54). Those tests are removed here; the new event-driven resolver model
-is tested in the Phase 54 plan 02–04 test suite.
+Note: Phase-53 durable backoff tests and helpers were removed in Phase 54
+(plan 04). The new event-driven resolver model is tested in the
+Phase 54 plan 02–04 test suite.
 """
 from __future__ import annotations
 
@@ -161,12 +162,145 @@ def test_last_activity_at_from_dialogs(monkeypatch):
 
 
 # Note: tests (b) channel_no_discussion_group_not_enrolled and (a)
-# test_dedup_supergroup_and_linked_chat are removed here because build_working_set
-# calls the Phase-53 dead-code _channel_resolution_due which references the now-dropped
-# activity_channel_resolution table (v24). Plan 04 will delete the dead-code gate and
-# restore these integration-level tests.
+# test_dedup_supergroup_and_linked_chat are restored below (Phase 54, plan 04)
+# now that the dead-code backoff gate has been removed from build_working_set.
 
 
+# ---------------------------------------------------------------------------
+# (b) channel with no discussion group contributes no row
+# ---------------------------------------------------------------------------
+
+def test_channel_no_discussion_group_not_enrolled(monkeypatch):
+    """A broadcast channel with no linked_chat_id must not appear in activity_dialog_state."""
+    conn = _make_db()
+    channel_id = -100200000001
+    _insert_dialog(conn, channel_id, "channel", last_message_at=1000)
+
+    # Resolver returns no linked chat
+    resolver = _FakeResolver({
+        channel_id: LinkedChatResolution(linked_chat_id=None, flood_wait_seconds=None),
+    })
+    monkeypatch.setattr(
+        "mcp_telegram.activity_peer_sweep.resolve_linked_chat_id",
+        resolver,
+    )
+
+    count = asyncio.run(build_working_set(_FakeClient(), conn))
+
+    assert count == 0, f"Expected 0 peers enrolled, got {count}"
+    assert _get_activity_row(conn, channel_id) is None, (
+        "Channel with no discussion group must NOT be enrolled"
+    )
+
+
+# ---------------------------------------------------------------------------
+# (a) dedup: peer that is both a direct supergroup and a channel's linked_chat
+# ---------------------------------------------------------------------------
+
+def test_dedup_supergroup_and_linked_chat(monkeypatch):
+    """A peer that is both a supergroup and a channel's linked_chat appears exactly once."""
+    conn = _make_db()
+    supergroup_id = -100300000001
+    channel_id = -100300000002
+    _insert_dialog(conn, supergroup_id, "supergroup", last_message_at=2000)
+    _insert_dialog(conn, channel_id, "channel", last_message_at=3000)
+
+    # Channel resolves to the same peer as the supergroup
+    resolver = _FakeResolver({
+        channel_id: LinkedChatResolution(linked_chat_id=supergroup_id, flood_wait_seconds=None),
+    })
+    monkeypatch.setattr(
+        "mcp_telegram.activity_peer_sweep.resolve_linked_chat_id",
+        resolver,
+    )
+
+    count = asyncio.run(build_working_set(_FakeClient(), conn))
+
+    assert count == 1, f"Expected 1 peer (dedup), got {count}"
+    row = _get_activity_row(conn, supergroup_id)
+    assert row is not None
+    # Source must be 'supergroup' (direct enrollment wins over linked_chat)
+    assert row["source"] == "supergroup", (
+        f"Deduped peer source must be 'supergroup', got {row['source']!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# (e) FloodWait on second channel halts the pass — account-global invariant
+# ---------------------------------------------------------------------------
+
+def test_build_working_set_floodwait_halts_pass(monkeypatch):
+    """FloodWait on the 2nd of 3 channels must halt the pass (break, not continue).
+
+    Verifies the account-global FloodWait invariant: once Telegram issues a
+    wait, every further request in the same pass is sent during the wait window.
+    The resolver must be called exactly TWICE (the first and second channels
+    visited in iteration order); the third channel must never be reached.
+
+    Uses position-based flood assignment so the test is order-agnostic with
+    respect to SQLite's internal rowid iteration.
+    """
+    conn = _make_db()
+    channel_a = -100400000001
+    channel_b = -100400000002
+    channel_c = -100400000003
+    linked_first = -100400000010
+
+    _insert_dialog(conn, channel_a, "channel", last_message_at=1000)
+    _insert_dialog(conn, channel_b, "channel", last_message_at=2000)
+    _insert_dialog(conn, channel_c, "channel", last_message_at=3000)
+
+    all_channel_ids = {channel_a, channel_b, channel_c}
+    call_log: list[int] = []
+
+    async def mock_resolver(client: Any, conn: Any, channel_id: int) -> LinkedChatResolution:
+        call_log.append(channel_id)
+        if len(call_log) == 1:
+            # First channel visited → clean resolution with a linked chat
+            return LinkedChatResolution(linked_chat_id=linked_first, flood_wait_seconds=None)
+        if len(call_log) == 2:
+            # Second channel visited → FloodWait; pass must halt here
+            return LinkedChatResolution(linked_chat_id=None, flood_wait_seconds=30)
+        # Third channel must never be reached
+        raise AssertionError(
+            f"resolve_linked_chat_id called a 3rd time for channel_id={channel_id!r}"
+        )
+
+    monkeypatch.setattr(
+        "mcp_telegram.activity_peer_sweep.resolve_linked_chat_id",
+        mock_resolver,
+    )
+
+    asyncio.run(build_working_set(_FakeClient(), conn))
+
+    # Resolver called exactly twice: first (ok) + second (flood) → break
+    assert len(call_log) == 2, (
+        f"Expected exactly 2 resolver calls, got {len(call_log)}: {call_log}"
+    )
+    flood_channel = call_log[1]   # second channel visited triggered FloodWait
+    skipped_channel = (all_channel_ids - set(call_log)).pop()  # third, never reached
+
+    # Working set contains linked_first (from the first channel) only
+    assert _get_activity_row(conn, linked_first) is not None, (
+        "linked_first (from first channel) must be enrolled"
+    )
+    assert _get_activity_row(conn, flood_channel) is None, (
+        "FloodWait channel must NOT be enrolled"
+    )
+    assert _get_activity_row(conn, skipped_channel) is None, (
+        "Skipped (never-reached) channel must NOT be enrolled"
+    )
+
+    # flood_channel's dialogs.linked_chat_resolved_at stays NULL (resolver's FloodWait
+    # branch did not write to it — plan 02 task 3 guarantee)
+    row = conn.execute(
+        "SELECT linked_chat_resolved_at FROM dialogs WHERE dialog_id = ?",
+        (flood_channel,),
+    ).fetchone()
+    assert row is not None
+    assert row[0] is None, (
+        f"flood_channel linked_chat_resolved_at must stay NULL after FloodWait, got {row[0]!r}"
+    )
 
 
 # ---------------------------------------------------------------------------
