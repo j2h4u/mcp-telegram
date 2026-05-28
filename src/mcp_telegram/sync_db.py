@@ -7,7 +7,7 @@ from pathlib import Path
 
 from xdg_base_dirs import xdg_state_home  # type: ignore[import-error]
 
-_CURRENT_SCHEMA_VERSION = 23
+_CURRENT_SCHEMA_VERSION = 24
 
 logger = logging.getLogger(__name__)
 
@@ -324,22 +324,68 @@ ON activity_dialog_state(cold_status, cold_next_retry_at)
 # Tier-B selection: pending/running due peers
 # WHERE cold_status IN ('pending', 'running') AND (cold_next_retry_at IS NULL OR cold_next_retry_at <= :now)
 
-_ACTIVITY_CHANNEL_RESOLUTION_DDL = """
-CREATE TABLE IF NOT EXISTS activity_channel_resolution (
-    channel_id      INTEGER PRIMARY KEY,
-                    -- the broadcast channel's -100… id; the durable retry key for
-                    -- linked-chat resolution (known at flood time even though the
-                    -- linked peer is not)
-    next_retry_at   INTEGER,
-                    -- durable resolver-path backoff (NULL = due now); set to
-                    -- now+flood_wait_seconds by build_working_set when
-                    -- resolve_linked_chat_id surfaces a FloodWait, cleared on a
-                    -- successful/none resolution
-    last_error      TEXT,
-                    -- sanitized resolver error class (no content, no session secrets)
-    updated_at      INTEGER NOT NULL
-) WITHOUT ROWID
+# ---------------------------------------------------------------------------
+# DDL for v24: linked-chat columns on dialogs (Phase 54)
+#
+# Two NULL-able columns are added to dialogs to promote linked-chat resolution
+# from the polled entity_details cache to a first-class, event-maintained
+# contract:
+#
+#   linked_chat_id INTEGER NULL
+#     The discussion group's -100… peer id.  NULL means "no linked chat exists".
+#     A NOT NULL value is the canonical answer; resolver (plan 02) normalises the
+#     id to -100… form via Telethon's get_peer_id(PeerChannel(…)) before writing.
+#
+#   linked_chat_resolved_at INTEGER NULL
+#     Unix-seconds timestamp of the last authoritative answer received from
+#     GetFullChannelRequest or an UpdateChannel event.
+#     NULL = never asked → resolver cold path must fire on next access.
+#     NOT NULL = authoritative answer on record; linked_chat_id may still be NULL
+#               (meaning: we asked, and the channel has no discussion group).
+# ---------------------------------------------------------------------------
+
+_DIALOGS_V24_ADD_LINKED_CHAT_ID = "ALTER TABLE dialogs ADD COLUMN linked_chat_id INTEGER"
+
+_DIALOGS_V24_ADD_LINKED_CHAT_RESOLVED_AT = (
+    "ALTER TABLE dialogs ADD COLUMN linked_chat_resolved_at INTEGER"
+)
+
+_DIALOGS_V24_BACKFILL_LINKED_CHAT = """
+UPDATE dialogs
+SET linked_chat_id = (
+        SELECT json_extract(ed.detail_json, '$.linked_chat_id')
+        FROM entity_details ed
+        JOIN entities e ON e.id = ed.entity_id
+        WHERE ed.entity_id = dialogs.dialog_id
+          AND e.type = 'channel'
+          AND json_type(ed.detail_json, '$.linked_chat_id') IS NOT NULL
+    ),
+    linked_chat_resolved_at = (
+        SELECT ed.fetched_at
+        FROM entity_details ed
+        JOIN entities e ON e.id = ed.entity_id
+        WHERE ed.entity_id = dialogs.dialog_id
+          AND e.type = 'channel'
+          AND json_type(ed.detail_json, '$.linked_chat_id') IS NOT NULL
+    )
+WHERE dialogs.type = 'channel'
+  AND EXISTS (
+        SELECT 1 FROM entity_details ed
+        JOIN entities e ON e.id = ed.entity_id
+        WHERE ed.entity_id = dialogs.dialog_id
+          AND e.type = 'channel'
+          AND json_type(ed.detail_json, '$.linked_chat_id') IS NOT NULL
+    )
 """
+
+_ENTITY_DETAILS_V24_STRIP_LINKED_CHAT = """
+UPDATE entity_details
+SET detail_json = json_remove(detail_json, '$.linked_chat_id')
+WHERE entity_id IN (SELECT id FROM entities WHERE type = 'channel')
+  AND json_type(detail_json, '$.linked_chat_id') IS NOT NULL
+"""
+
+_DROP_ACTIVITY_CHANNEL_RESOLUTION = "DROP TABLE IF EXISTS activity_channel_resolution"
 
 
 # ---------------------------------------------------------------------------
@@ -845,17 +891,49 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     # v23 (Phase 53): per-peer own-message sweep substrate tables.
     # activity_dialog_state: durable work/cursor table for Tier A (HotSweep) and
     # Tier B (ColdBackfill); per-tier retry/error columns — no shared next_retry_at.
-    # activity_channel_resolution: resolver-path FloodWait backoff keyed by the
-    # broadcast channel_id (known before linked peer is resolved — concern 5 residual).
-    # Both tables are additive and idempotent (CREATE TABLE/INDEX IF NOT EXISTS).
+    # NOTE: activity_channel_resolution was originally created here but is dropped
+    # by v24. Its DDL constant has been removed; a fresh install on v24 never creates
+    # the table, and existing v23 deployments have it removed by the v24 DROP.
     _migrate(
         23,
         [
             _ACTIVITY_DIALOG_STATE_DDL,
             _ACTIVITY_DIALOG_STATE_HOT_INDEX_DDL,
             _ACTIVITY_DIALOG_STATE_COLD_INDEX_DDL,
-            _ACTIVITY_CHANNEL_RESOLUTION_DDL,
         ],
+    )
+
+    # v24 (Phase 54): promote linked-chat resolution to first-class dialogs columns.
+    #
+    # (i)  Pure SQL — entity_details already has 128/128 broadcast-channel coverage
+    #      from the Phase-53 resolver passes (99 with linked_chat_id, 29 with the key
+    #      explicitly set to JSON null, 0 missing). No Telethon calls during migration.
+    #
+    # (ii) json_type(detail_json, '$.linked_chat_id') IS NOT NULL is the correct
+    #      SQLite predicate for "key present". json_extract returns SQL NULL for both
+    #      "key absent" and "key present with JSON null value"; json_type returns the
+    #      string 'null' (non-NULL) when the key is present with JSON null, and SQL
+    #      NULL only when the key is absent entirely. Using json_type preserves the
+    #      29 explicitly-resolved-none channels by setting linked_chat_resolved_at to
+    #      a real timestamp while linked_chat_id stays SQL NULL.
+    #
+    # (iii) The DROP is safe: the new event-driven model in plans 02–04 recreates
+    #      resolution state implicitly via dialogs.linked_chat_resolved_at. The backoff
+    #      table is moot once resolved_at IS NULL is the retry signal.
+    #
+    # (iv) Forward-compat: removing _ACTIVITY_CHANNEL_RESOLUTION_DDL from the v23
+    #      list means a fresh install on v24 never creates the table; existing v23
+    #      deployments have it removed by the DROP below.
+    _migrate(
+        24,
+        [
+            _DIALOGS_V24_ADD_LINKED_CHAT_ID,
+            _DIALOGS_V24_ADD_LINKED_CHAT_RESOLVED_AT,
+            _DIALOGS_V24_BACKFILL_LINKED_CHAT,
+            _ENTITY_DETAILS_V24_STRIP_LINKED_CHAT,
+            _DROP_ACTIVITY_CHANNEL_RESOLUTION,
+        ],
+        ignore_duplicate_column=True,
     )
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
