@@ -869,6 +869,10 @@ class EventHandlerManager:
     async def on_raw_channel_chat_update(self, update: Any) -> None:
         """Phase 42 EVENTS-03: UpdateChannel / UpdateChat → dialogs.needs_refresh=1.
 
+        Phase 54 EVENTS-03 extension: UpdateChannel for a broadcast channel with
+        linked_chat_resolved_at IS NOT NULL also triggers one GetFullChannelRequest
+        to refresh dialogs.linked_chat_id (D-10, D-11, D-12).
+
         Gated on _synced_dialog_ids; UPDATE-only.
         """
         try:
@@ -883,11 +887,88 @@ class EventHandlerManager:
             now = int(time.time())
             with self._conn:
                 self._conn.execute(_UPDATE_DIALOG_NEEDS_REFRESH_SQL, (now, dialog_id))
+                row = self._conn.execute(
+                    "SELECT type, linked_chat_resolved_at FROM dialogs WHERE dialog_id = ?",
+                    (dialog_id,),
+                ).fetchone()
             logger.info("event_channel_chat_dirty dialog_id=%d", dialog_id)
         except Exception:
             logger.exception(
                 "event_channel_chat_update_failed update=%r", type(update).__name__,
             )
+            return
+
+        # D-10 / D-11: refresh linked_chat_id ONLY for UpdateChannel on a channel
+        # that has been resolved at least once. Never-resolved channels belong to the
+        # sweep's cold path (D-11) — we must not amplify bursts into resolution storms.
+        # This await is deliberately OUTSIDE the with self._conn: block above to avoid
+        # holding a write transaction open across an async round-trip.
+        if (
+            isinstance(update, UpdateChannel)
+            and row is not None
+            and row[0] == "channel"
+            and row[1] is not None
+        ):
+            await self._refresh_linked_chat_id(dialog_id)
+
+    async def _refresh_linked_chat_id(self, dialog_id: int) -> None:
+        """Phase 54: event-driven linked_chat_id refresh for a previously-resolved channel.
+
+        Issues exactly one GetFullChannelRequest and UPSERTs linked_chat_id +
+        linked_chat_resolved_at into dialogs. FloodWait is swallowed without
+        writing — the unchanged resolved_at acts as the retry signal for the
+        next sweep cycle or UpdateChannel event.
+        """
+        from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
+        from telethon.tl.functions.channels import GetFullChannelRequest  # type: ignore[import-untyped]
+        from telethon.tl.types import PeerChannel as _PeerChannel  # type: ignore[import-untyped]
+        from telethon.utils import get_peer_id as _get_peer_id  # type: ignore[import-untyped]
+
+        from .activity_peer_resolve import resolve_input_peer
+
+        input_channel = await resolve_input_peer(self._client, dialog_id)
+        if input_channel is None:
+            logger.debug(
+                "event_linked_chat_refresh_no_input_peer dialog_id=%d", dialog_id
+            )
+            return
+
+        try:
+            full_result = await self._client(GetFullChannelRequest(channel=input_channel))
+        except FloodWaitError as exc:
+            logger.warning(
+                "event_linked_chat_refresh_flood dialog_id=%d flood_wait_seconds=%d",
+                dialog_id, int(exc.seconds),
+            )
+            return
+        except Exception:
+            logger.debug(
+                "event_linked_chat_refresh_failed dialog_id=%d", dialog_id, exc_info=True
+            )
+            return
+
+        raw = getattr(full_result.full_chat, "linked_chat_id", None)
+        normalised: int | None = None
+        if raw is not None:
+            if raw > 0:
+                normalised = int(_get_peer_id(_PeerChannel(raw)))
+            else:
+                normalised = int(raw)
+
+        now = int(time.time())
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO dialogs (dialog_id, linked_chat_id, linked_chat_resolved_at) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT(dialog_id) DO UPDATE SET "
+                "    linked_chat_id = excluded.linked_chat_id, "
+                "    linked_chat_resolved_at = excluded.linked_chat_resolved_at",
+                (dialog_id, normalised, now),
+            )
+        logger.info(
+            "event_linked_chat_refresh dialog_id=%d linked_chat_id=%r",
+            dialog_id, normalised,
+        )
 
     async def on_raw_inbox_read(self, update: Any) -> None:
         """Phase 42 EVENTS-02: UpdateReadHistoryInbox / UpdateReadChannelInbox.
