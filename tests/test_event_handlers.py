@@ -1192,3 +1192,219 @@ def test_unregister_removes_message_read_handler(
     manager.register()
     manager.unregister()
     assert mock_client.remove_event_handler.call_count == 10
+
+
+# ---------------------------------------------------------------------------
+# Phase 54 Plan 03: event-driven linked_chat_id refresh
+# ---------------------------------------------------------------------------
+
+
+class _LinkedChatFakeClient:
+    """Minimal fake TelegramClient for linked_chat_id refresh tests.
+
+    Mirrors the _FakeClient pattern from test_activity_peer_resolve.py.
+    Supports async __call__ (for GetFullChannelRequest) and async get_input_entity.
+    """
+
+    def __init__(
+        self,
+        *,
+        input_entity: Any = None,
+        full_channel_result: Any = None,
+        full_channel_error: Exception | None = None,
+        forbid_call: bool = False,
+    ):
+        self._input_entity = input_entity
+        self._full_channel_result = full_channel_result
+        self._full_channel_error = full_channel_error
+        self._forbid_call = forbid_call
+        # Attributes expected by EventHandlerManager constructor
+        self.add_event_handler = MagicMock()
+        self.remove_event_handler = MagicMock()
+        self.call_args_list: list[Any] = []
+
+    async def get_input_entity(self, dialog_id: Any) -> Any:
+        if self._forbid_call:
+            raise AssertionError("get_input_entity must not be called")
+        return self._input_entity
+
+    async def __call__(self, request: Any) -> Any:
+        if self._forbid_call:
+            raise AssertionError("client() must not be called")
+        self.call_args_list.append(request)
+        if self._full_channel_error is not None:
+            raise self._full_channel_error
+        return self._full_channel_result
+
+
+@pytest.mark.asyncio
+async def test_linked_chat_refresh_updates_dialogs(
+    sync_db: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """UpdateChannel for a previously-resolved broadcast channel refreshes linked_chat_id.
+
+    Asserts:
+    - Exactly one GetFullChannelRequest was issued.
+    - dialogs.linked_chat_id is updated to the normalised new value.
+    - dialogs.linked_chat_resolved_at is bumped to approximately now.
+    - Unrelated columns (type, hidden) are unchanged.
+    - needs_refresh = 1 was also written (original branch still runs).
+    """
+    import time
+
+    from telethon.tl.types import UpdateChannel  # type: ignore[import-untyped]
+    from telethon.tl.functions.channels import GetFullChannelRequest  # type: ignore[import-untyped]
+    from types import SimpleNamespace
+
+    dialog_id = -1004444444444
+    channel_id = 4444444444  # positive form Telegram sends
+
+    # Seed dialogs row: already resolved, has a linked chat
+    sync_db.execute(
+        "INSERT INTO dialogs (dialog_id, type, linked_chat_id, linked_chat_resolved_at, hidden) "
+        "VALUES (?, 'channel', -1005555555555, 1700000000, 0)",
+        (dialog_id,),
+    )
+    sync_db.commit()
+
+    # Seed synced_dialogs so the gate passes
+    insert_synced_dialog(sync_db, dialog_id)
+
+    # Build fake full_result with a NEW linked_chat_id (positive raw form)
+    fake_full_chat = SimpleNamespace(linked_chat_id=6666666666)
+    fake_full_result = SimpleNamespace(full_chat=fake_full_chat, chats=[])
+    fake_input = SimpleNamespace(channel_id=channel_id)
+
+    client = _LinkedChatFakeClient(
+        input_entity=fake_input,
+        full_channel_result=fake_full_result,
+    )
+
+    manager = make_manager(client, sync_db, shutdown_event)
+    manager.register()
+
+    update = UpdateChannel(channel_id=channel_id)
+    before = int(time.time())
+    await manager.on_raw_channel_chat_update(update)
+    after = int(time.time())
+
+    # Exactly one GetFullChannelRequest was issued
+    assert len(client.call_args_list) == 1
+    assert isinstance(client.call_args_list[0], GetFullChannelRequest)
+
+    # Row reflects the new linked_chat_id (6666666666 normalised to -1006666666666)
+    row = sync_db.execute(
+        "SELECT linked_chat_id, linked_chat_resolved_at, type, hidden, needs_refresh "
+        "FROM dialogs WHERE dialog_id = ?",
+        (dialog_id,),
+    ).fetchone()
+    assert row is not None
+    assert row[0] == -1006666666666, f"Expected -1006666666666, got {row[0]}"
+    assert before <= row[1] <= after + 1, f"resolved_at={row[1]} not within [{before}, {after+1}]"
+    # Unrelated columns unchanged
+    assert row[2] == "channel"
+    assert row[3] == 0
+    # needs_refresh set by original branch
+    assert row[4] == 1
+
+
+@pytest.mark.asyncio
+async def test_linked_chat_refresh_skips_never_resolved(
+    sync_db: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """UpdateChannel for a never-resolved channel does NOT call GetFullChannelRequest (D-11).
+
+    Asserts:
+    - No GetFullChannelRequest is issued.
+    - linked_chat_id and linked_chat_resolved_at remain NULL.
+    - needs_refresh = 1 is still set (original branch runs for all channels).
+    """
+    from telethon.tl.types import UpdateChannel  # type: ignore[import-untyped]
+
+    dialog_id = -1007777777777
+    channel_id = 7777777777
+
+    # Seed dialogs row: type=channel, never resolved (linked_chat_resolved_at IS NULL)
+    sync_db.execute(
+        "INSERT INTO dialogs (dialog_id, type, linked_chat_id, linked_chat_resolved_at, hidden) "
+        "VALUES (?, 'channel', NULL, NULL, 0)",
+        (dialog_id,),
+    )
+    sync_db.commit()
+
+    insert_synced_dialog(sync_db, dialog_id)
+
+    # Client raises on any call — the refresh branch must NOT fire
+    client = _LinkedChatFakeClient(forbid_call=True)
+
+    manager = make_manager(client, sync_db, shutdown_event)
+    manager.register()
+
+    update = UpdateChannel(channel_id=channel_id)
+    await manager.on_raw_channel_chat_update(update)  # must not raise
+
+    row = sync_db.execute(
+        "SELECT linked_chat_id, linked_chat_resolved_at, needs_refresh "
+        "FROM dialogs WHERE dialog_id = ?",
+        (dialog_id,),
+    ).fetchone()
+    assert row is not None
+    assert row[0] is None, "linked_chat_id must remain NULL for never-resolved channel"
+    assert row[1] is None, "linked_chat_resolved_at must remain NULL for never-resolved channel"
+    assert row[2] == 1, "needs_refresh must be set by the original branch"
+
+
+@pytest.mark.asyncio
+async def test_linked_chat_refresh_flood_no_op(
+    sync_db: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """FloodWait inside _refresh_linked_chat_id leaves dialogs unchanged.
+
+    Asserts:
+    - Handler returns without raising.
+    - linked_chat_id and linked_chat_resolved_at are unchanged (no write on FloodWait).
+    - needs_refresh = 1 was still written by the original branch.
+    """
+    from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
+    from telethon.tl.types import UpdateChannel  # type: ignore[import-untyped]
+    from types import SimpleNamespace
+
+    dialog_id = -1009999999999
+    channel_id = 9999999999
+
+    # Seed dialogs row: already resolved
+    sync_db.execute(
+        "INSERT INTO dialogs (dialog_id, type, linked_chat_id, linked_chat_resolved_at, hidden) "
+        "VALUES (?, 'channel', -1008888888888, 1700000000, 0)",
+        (dialog_id,),
+    )
+    sync_db.commit()
+
+    insert_synced_dialog(sync_db, dialog_id)
+
+    # FloodWaitError — constructor takes (request, capture) where capture is seconds
+    flood_error = FloodWaitError(request=None, capture=120)
+    fake_input = SimpleNamespace(channel_id=channel_id)
+    client = _LinkedChatFakeClient(
+        input_entity=fake_input,
+        full_channel_error=flood_error,
+    )
+
+    manager = make_manager(client, sync_db, shutdown_event)
+    manager.register()
+
+    update = UpdateChannel(channel_id=channel_id)
+    await manager.on_raw_channel_chat_update(update)  # must not raise
+
+    row = sync_db.execute(
+        "SELECT linked_chat_id, linked_chat_resolved_at, needs_refresh "
+        "FROM dialogs WHERE dialog_id = ?",
+        (dialog_id,),
+    ).fetchone()
+    assert row is not None
+    assert row[0] == -1008888888888, "linked_chat_id must be unchanged after FloodWait"
+    assert row[1] == 1700000000, "linked_chat_resolved_at must be unchanged after FloodWait"
+    assert row[2] == 1, "needs_refresh must be set by the original branch"
