@@ -628,6 +628,16 @@ async def get_entity_info(args: GetEntityInfo) -> ToolResult:
         return error_result(fetch_entity_info_error_text(args.entity, error_msg))
 
     data = response.get("data", {})
+    # Numeric-id path only: we initially stored the numeric string itself as
+    # display_name (no resolver run). Now that the daemon has resolved the
+    # entity we have a real title — prefer it. For the resolver path,
+    # display_name is intentionally kept as whatever the fuzzy resolver
+    # matched (so the caller can verify the match they got), even if the
+    # canonical title from data["name"] is slightly different.
+    if resolution == "numeric_id":
+        resolved_name = data.get("name")
+        if resolved_name:
+            display_name = resolved_name
     structured_content = _entity_structured_content(
         args=args,
         data=data,

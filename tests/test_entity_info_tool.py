@@ -363,3 +363,45 @@ async def test_get_entity_info_frames_adversarial_profile_fields() -> None:
     content_texts = [field["content"]["text"] for field in payload["content_fields"]]
     assert adversarial in content_texts
     assert all(field["untrusted_content"] is True for field in payload["content_fields"])
+
+
+@pytest.mark.asyncio
+async def test_get_entity_info_numeric_id_uses_resolved_name() -> None:
+    """When the caller passes a numeric id we initially store it verbatim as
+    display_name (resolver is skipped), but once the daemon returns the real
+    title we must surface it at the top-level display_name — not leave the
+    numeric string in place (Bug #2 — entity_info numeric-id path)."""
+    get_resp = {
+        "ok": True,
+        "data": {
+            "id": -1001079568001, "type": "supergroup",
+            "name": "Дзен-мани чатик", "username": "zenmoneychat",
+            "about": None,
+            "my_membership": {"is_member": False, "is_admin": False, "admin_rights": None},
+            "avatar_history": [], "avatar_count": 0,
+            "members_count": None, "linked_broadcast_id": None,
+            "slow_mode_seconds": None, "has_topics": False, "restrictions": [],
+            "contacts_subscribed": None, "contacts_subscribed_partial": False,
+            "contacts_reason": "hidden_by_admin",
+        },
+    }
+    # Numeric-id path skips the resolver entirely; only the daemon's
+    # get_entity_info is called. Use a single-connection patch.
+    conn = MagicMock()
+    conn.get_entity_info = AsyncMock(return_value=get_resp)
+
+    @asynccontextmanager
+    async def fake_daemon_connection():
+        yield conn
+
+    with patch("mcp_telegram.tools.entity_info.daemon_connection", fake_daemon_connection):
+        result = await get_entity_info(GetEntityInfo(entity="-1001079568001"))
+
+    assert result.content == ()
+    payload = result.structured_content
+    assert payload is not None
+    assert payload["resolved_query"]["resolution"] == "numeric_id"
+    assert payload["resolved_query"]["entity_id"] == -1001079568001
+    # The fix: display_name must be the resolved title, not the numeric string.
+    assert payload["display_name"] == "Дзен-мани чатик"
+    assert payload["resolved_query"]["input"] == "-1001079568001"
