@@ -324,7 +324,7 @@ def test_schema_version_records_current_v18(tmp_path: Path) -> None:
             "SELECT MAX(version) FROM schema_version"
         ).fetchone()[0]
         assert max_version == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 23  # Phase 53 follow-up lock — flips when next migration ships
+        assert _CURRENT_SCHEMA_VERSION == 24  # Phase 54 follow-up lock — flips when next migration ships
     finally:
         conn.close()
 
@@ -557,6 +557,39 @@ def test_migration_v21_runs_from_v20_database(tmp_path: Path) -> None:
             ) WITHOUT ROWID
             """
         )
+        # entities/entity_details were created in v16; dialogs in v17.
+        # Stub both so v24 ALTER/UPDATE succeeds when this test seeds version=20
+        # (skipping v1-v20 migration steps).
+        conn.execute(
+            """
+            CREATE TABLE entities (
+                id INTEGER PRIMARY KEY,
+                type TEXT NOT NULL,
+                name TEXT,
+                username TEXT,
+                updated_at INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE entity_details (
+                entity_id   INTEGER PRIMARY KEY,
+                detail_json TEXT NOT NULL,
+                fetched_at  INTEGER NOT NULL
+            ) WITHOUT ROWID
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE dialogs (
+                dialog_id INTEGER PRIMARY KEY,
+                name TEXT, type TEXT,
+                archived INTEGER NOT NULL DEFAULT 0,
+                pinned INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
         conn.execute("INSERT INTO schema_version VALUES (20, 1700000000)")
         conn.commit()
 
@@ -571,7 +604,7 @@ def test_migration_v21_runs_from_v20_database(tmp_path: Path) -> None:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()}
         assert "reply_count" in columns
         max_version = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
-        assert max_version == 23
+        assert max_version >= 23
     finally:
         conn.close()
 
@@ -586,7 +619,7 @@ def test_migration_v23_schema_version(db_path: Path) -> None:
     conn = _open_sync_db(db_path)
     try:
         row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
-        assert row[0] == 23, f"expected schema version 23, got {row[0]}"
+        assert row[0] >= 23, f"expected schema version >= 23, got {row[0]}"
     finally:
         conn.close()
 
@@ -656,43 +689,6 @@ def test_migration_v23_creates_per_tier_indexes(db_path: Path) -> None:
         conn.close()
 
 
-def test_migration_v23_creates_activity_channel_resolution(db_path: Path) -> None:
-    """cycle-4 HIGH: activity_channel_resolution table exists with correct columns."""
-    ensure_sync_schema(db_path)
-    conn = _open_sync_db(db_path)
-    try:
-        row = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='activity_channel_resolution'"
-        ).fetchone()
-        assert row == ("activity_channel_resolution",), "activity_channel_resolution table missing"
-
-        cols = {c[1]: c for c in conn.execute("PRAGMA table_info(activity_channel_resolution)")}
-        # (cid, name, type, notnull, dflt_value, pk)
-        assert "channel_id" in cols, "channel_id column missing"
-        assert "next_retry_at" in cols, "next_retry_at column missing"
-        assert "last_error" in cols, "last_error column missing"
-        assert "updated_at" in cols, "updated_at column missing"
-
-        # channel_id is PK (pk=1)
-        assert cols["channel_id"][5] == 1, "channel_id must be PRIMARY KEY"
-        # updated_at is NOT NULL
-        assert cols["updated_at"][3] == 1, "updated_at must be NOT NULL"
-    finally:
-        conn.close()
-
-
-def test_migration_v23_activity_channel_resolution_without_rowid(db_path: Path) -> None:
-    ensure_sync_schema(db_path)
-    conn = _open_sync_db(db_path)
-    try:
-        row = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='activity_channel_resolution'"
-        ).fetchone()
-        assert row is not None
-        assert "WITHOUT ROWID" in row[0].upper()
-    finally:
-        conn.close()
-
 
 def test_migration_v23_activity_dialog_state_without_rowid(db_path: Path) -> None:
     ensure_sync_schema(db_path)
@@ -713,13 +709,13 @@ def test_migration_v23_idempotent(db_path: Path) -> None:
     conn = _open_sync_db(db_path)
     try:
         row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
-        assert row[0] == 23
+        assert row[0] >= 23
     finally:
         conn.close()
 
 
 def test_migration_v23_runs_from_v22_database(tmp_path: Path) -> None:
-    """v22 → v23 upgrade path creates both new tables."""
+    """v22 → current upgrade path creates activity_dialog_state; activity_channel_resolution is absent after v24."""
     db_path = tmp_path / "sync.db"
     with sqlite3.connect(db_path) as conn:
         conn.execute(
@@ -736,6 +732,39 @@ def test_migration_v23_runs_from_v22_database(tmp_path: Path) -> None:
             ) WITHOUT ROWID
             """
         )
+        # entities/entity_details were created in v16; dialogs in v17.
+        # Stub both so v24 ALTER/UPDATE succeeds when this test seeds version=22
+        # (skipping v1-v22 migration steps).
+        conn.execute(
+            """
+            CREATE TABLE entities (
+                id INTEGER PRIMARY KEY,
+                type TEXT NOT NULL,
+                name TEXT,
+                username TEXT,
+                updated_at INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE entity_details (
+                entity_id   INTEGER PRIMARY KEY,
+                detail_json TEXT NOT NULL,
+                fetched_at  INTEGER NOT NULL
+            ) WITHOUT ROWID
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE dialogs (
+                dialog_id INTEGER PRIMARY KEY,
+                name TEXT, type TEXT,
+                archived INTEGER NOT NULL DEFAULT 0,
+                pinned INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
         conn.execute("INSERT INTO schema_version VALUES (22, 1700000000)")
         conn.commit()
 
@@ -743,13 +772,238 @@ def test_migration_v23_runs_from_v22_database(tmp_path: Path) -> None:
 
     conn = _open_sync_db(db_path)
     try:
+        # activity_dialog_state survives v24
         assert conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='activity_dialog_state'"
         ).fetchone() == ("activity_dialog_state",)
+        # activity_channel_resolution is ABSENT after v24 drops it
         assert conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='activity_channel_resolution'"
-        ).fetchone() == ("activity_channel_resolution",)
+        ).fetchone() is None, "activity_channel_resolution must be absent after v24"
         max_version = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
-        assert max_version == 23
+        assert max_version >= 23
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# v24: linked_chat columns on dialogs, backfill from entity_details, strip
+#      detail_json, drop activity_channel_resolution (Phase 54)
+# ---------------------------------------------------------------------------
+
+
+def test_migration_v24_schema_version(db_path: Path) -> None:
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    try:
+        row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
+        assert row[0] == 24, f"expected schema version 24, got {row[0]}"
+    finally:
+        conn.close()
+
+
+def test_migration_v24_columns_exist(db_path: Path) -> None:
+    """dialogs table has linked_chat_id and linked_chat_resolved_at columns after v24."""
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    try:
+        cols = {c[1] for c in conn.execute("PRAGMA table_info(dialogs)")}
+        assert "linked_chat_id" in cols, "linked_chat_id column missing from dialogs"
+        assert "linked_chat_resolved_at" in cols, "linked_chat_resolved_at column missing from dialogs"
+    finally:
+        conn.close()
+
+
+def _seed_v24_fixtures(conn: sqlite3.Connection) -> None:
+    """Seed three channel rows covering the three production-observed shapes for v24 backfill tests.
+
+    (a) channel A (id=1001): linked_chat_id = -1002000000000 (linked chat present)
+    (b) channel B (id=1002): linked_chat_id = null (JSON null, key present — explicitly no linked chat)
+    (c) channel C (id=1003): no linked_chat_id key at all (cold path, lazy resolve)
+    """
+    now = 1700000000
+    # entities
+    conn.executemany(
+        "INSERT OR IGNORE INTO entities (id, type, name, username, updated_at) VALUES (?, 'channel', ?, NULL, ?)",
+        [
+            (1001, "Channel A", now),
+            (1002, "Channel B", now),
+            (1003, "Channel C", now),
+        ],
+    )
+    # entity_details
+    conn.execute(
+        "INSERT OR IGNORE INTO entity_details (entity_id, detail_json, fetched_at) VALUES (?, ?, ?)",
+        (1001, '{"linked_chat_id": -1002000000000, "subscribers_count": 42}', 1700000000),
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO entity_details (entity_id, detail_json, fetched_at) VALUES (?, ?, ?)",
+        (1002, '{"linked_chat_id": null}', 1700000001),
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO entity_details (entity_id, detail_json, fetched_at) VALUES (?, ?, ?)",
+        (1003, '{"subscribers_count": 7}', 1700000002),
+    )
+    # dialogs
+    now_snap = now
+    conn.executemany(
+        "INSERT OR IGNORE INTO dialogs (dialog_id, name, type, snapshot_at) VALUES (?, ?, 'channel', ?)",
+        [
+            (1001, "Channel A", now_snap),
+            (1002, "Channel B", now_snap),
+            (1003, "Channel C", now_snap),
+        ],
+    )
+    conn.commit()
+
+
+def test_migration_v24_backfill_three_shapes(tmp_path: Path) -> None:
+    """Full v24 migration: three channel shapes produce correct post-migration dialogs state."""
+    db_path = tmp_path / "sync.db"
+    # Open at v23 to seed data before v24 runs
+    with sqlite3.connect(db_path) as pre_conn:
+        pre_conn.execute("PRAGMA journal_mode=WAL")
+        pre_conn.execute(
+            "CREATE TABLE schema_version (version INTEGER NOT NULL, applied_at INTEGER NOT NULL)"
+        )
+        # Minimal tables required by the migration path up to v23
+        pre_conn.execute(
+            """CREATE TABLE entities (
+                id INTEGER PRIMARY KEY,
+                type TEXT NOT NULL,
+                name TEXT,
+                username TEXT,
+                name_normalized TEXT,
+                updated_at INTEGER NOT NULL
+            )"""
+        )
+        pre_conn.execute(
+            """CREATE TABLE entity_details (
+                entity_id   INTEGER PRIMARY KEY,
+                detail_json TEXT NOT NULL,
+                fetched_at  INTEGER NOT NULL
+            ) WITHOUT ROWID"""
+        )
+        pre_conn.execute(
+            """CREATE TABLE dialogs (
+                dialog_id               INTEGER PRIMARY KEY,
+                name                    TEXT,
+                type                    TEXT,
+                archived                INTEGER NOT NULL DEFAULT 0,
+                pinned                  INTEGER NOT NULL DEFAULT 0,
+                members                 INTEGER,
+                created                 INTEGER,
+                last_message_at         INTEGER,
+                snapshot_at             INTEGER,
+                hidden                  INTEGER NOT NULL DEFAULT 0,
+                needs_refresh           INTEGER NOT NULL DEFAULT 0,
+                unread_mentions_count   INTEGER NOT NULL DEFAULT 0,
+                unread_reactions_count  INTEGER NOT NULL DEFAULT 0,
+                draft_text              TEXT
+            )"""
+        )
+        # Simulate v23 table existing (to verify DROP works on existing deployment)
+        pre_conn.execute(
+            """CREATE TABLE activity_channel_resolution (
+                channel_id  INTEGER PRIMARY KEY,
+                next_retry_at INTEGER,
+                last_error  TEXT,
+                updated_at  INTEGER NOT NULL
+            ) WITHOUT ROWID"""
+        )
+        pre_conn.execute("INSERT INTO schema_version VALUES (23, 1700000000)")
+        pre_conn.commit()
+        _seed_v24_fixtures(pre_conn)
+
+    ensure_sync_schema(db_path)
+
+    conn = _open_sync_db(db_path)
+    try:
+        # Schema version
+        row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
+        assert row[0] == 24, f"expected v24, got {row[0]}"
+
+        # Both new columns exist
+        cols = {c[1] for c in conn.execute("PRAGMA table_info(dialogs)")}
+        assert "linked_chat_id" in cols
+        assert "linked_chat_resolved_at" in cols
+
+        # (a) channel A: linked chat present
+        r = conn.execute(
+            "SELECT linked_chat_id, linked_chat_resolved_at FROM dialogs WHERE dialog_id = 1001"
+        ).fetchone()
+        assert r[0] == -1002000000000, f"channel A linked_chat_id: expected -1002000000000, got {r[0]}"
+        assert r[1] == 1700000000, f"channel A resolved_at: expected 1700000000, got {r[1]}"
+
+        # (b) channel B: key present, JSON null → linked_chat_id NULL, resolved_at populated
+        r = conn.execute(
+            "SELECT linked_chat_id, linked_chat_resolved_at FROM dialogs WHERE dialog_id = 1002"
+        ).fetchone()
+        assert r[0] is None, f"channel B linked_chat_id should be NULL, got {r[0]}"
+        assert r[1] == 1700000001, f"channel B resolved_at: expected 1700000001, got {r[1]}"
+
+        # (c) channel C: key absent → both NULL (lazy resolve)
+        r = conn.execute(
+            "SELECT linked_chat_id, linked_chat_resolved_at FROM dialogs WHERE dialog_id = 1003"
+        ).fetchone()
+        assert r[0] is None, f"channel C linked_chat_id should be NULL, got {r[0]}"
+        assert r[1] is None, f"channel C resolved_at should be NULL, got {r[1]}"
+
+        # entity_details strip: channels A and B no longer have linked_chat_id key
+        for eid, label in [(1001, "A"), (1002, "B")]:
+            row = conn.execute(
+                "SELECT json_type(detail_json, '$.linked_chat_id') FROM entity_details WHERE entity_id = ?",
+                (eid,),
+            ).fetchone()
+            assert row[0] is None, f"channel {label} detail_json still has linked_chat_id key: {row[0]}"
+
+        # Sibling key survives strip: channel A's subscribers_count = 42
+        row = conn.execute(
+            "SELECT json_extract(detail_json, '$.subscribers_count') FROM entity_details WHERE entity_id = 1001"
+        ).fetchone()
+        assert row[0] == 42, f"channel A subscribers_count should be 42, got {row[0]}"
+
+        # activity_channel_resolution is absent
+        assert conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='activity_channel_resolution'"
+        ).fetchone() is None, "activity_channel_resolution must be absent after v24"
+    finally:
+        conn.close()
+
+
+def test_migration_v24_idempotent(db_path: Path) -> None:
+    """Running ensure_sync_schema twice on a v24 DB is a no-op (no exception, version stays 24)."""
+    ensure_sync_schema(db_path)
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    try:
+        row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
+        assert row[0] == 24
+    finally:
+        conn.close()
+
+
+def test_migration_v24_channel_c_not_stripped(db_path: Path) -> None:
+    """Channel C (no linked_chat_id key) is unaffected by the strip — json_type still NULL."""
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    try:
+        # No entity_details row was seeded for this db_path, so the strip is vacuously safe.
+        # Insert a channel row post-migration to verify json_type on fresh rows behaves.
+        conn.execute(
+            "INSERT OR IGNORE INTO entities (id, type, name, username, updated_at) VALUES (9999, 'channel', 'Test', NULL, 1700000000)"
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO entity_details (entity_id, detail_json, fetched_at) VALUES (9999, '{\"subscribers_count\": 5}', 1700000000)"
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT json_type(detail_json, '$.linked_chat_id') FROM entity_details WHERE entity_id = 9999"
+        ).fetchone()
+        assert row[0] is None, "key-absent channel should have NULL json_type for linked_chat_id"
+        row2 = conn.execute(
+            "SELECT json_extract(detail_json, '$.subscribers_count') FROM entity_details WHERE entity_id = 9999"
+        ).fetchone()
+        assert row2[0] == 5, "subscribers_count should be preserved"
     finally:
         conn.close()

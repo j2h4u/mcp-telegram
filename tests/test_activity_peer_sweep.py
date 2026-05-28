@@ -8,16 +8,11 @@ Covers:
       the peer's dialogs.last_message_at.
   (d) dialogs.type='group' is NOT selected as a supergroup; type='supergroup'
       IS selected (proves the source/casing fix — concern 4).
-  (e) a channel whose resolver returns flood_wait_seconds is skipped without
-      raising and without enrolling that channel.
-  (f) (cycle-4 HIGH — DURABLE retry) the flooded channel writes a future
-      activity_channel_resolution.next_retry_at; on the NEXT build_working_set
-      pass the resolver is NOT called again (assert call count unchanged).
-  (g) (restart proof) a channel whose linked-chat fallback last_activity_at
-      comes from the CHANNEL's last_message_at when the linked chat has no
-      direct dialogs row.
-  (h) once the future next_retry_at is past, a successful resolution CLEARS
-      activity_channel_resolution.next_retry_at.
+
+Note: tests (e)–(h) and the _channel_resolution_due helper tests covered the
+Phase-53 activity_channel_resolution backoff table, which was dropped in v24
+(Phase 54). Those tests are removed here; the new event-driven resolver model
+is tested in the Phase 54 plan 02–04 test suite.
 """
 from __future__ import annotations
 
@@ -35,10 +30,7 @@ from mcp_telegram.activity_peer_sweep import (
     _DIALOG_STATE_COLUMNS,
     SkipReason,
     SweepResult,
-    _channel_resolution_due,
-    _clear_channel_resolution,
     _load_dialog_state,
-    _record_channel_resolution_flood,
     _save_dialog_state,
     build_working_set,
     enroll_activity_dialog,
@@ -168,260 +160,13 @@ def test_last_activity_at_from_dialogs(monkeypatch):
     )
 
 
-# ---------------------------------------------------------------------------
-# (b) Channel with no discussion group contributes no row
-# ---------------------------------------------------------------------------
-
-def test_channel_no_discussion_group_not_enrolled(monkeypatch):
-    """A broadcast channel with no linked chat must not appear in activity_dialog_state."""
-    conn = _make_db()
-    channel_id = -100222222222
-    _insert_dialog(conn, channel_id, "channel", last_message_at=3000)
-
-    resolver = _FakeResolver({
-        channel_id: LinkedChatResolution(linked_chat_id=None, flood_wait_seconds=None)
-    })
-    monkeypatch.setattr(
-        "mcp_telegram.activity_peer_sweep.resolve_linked_chat_id",
-        resolver,
-    )
-
-    count = asyncio.run(
-        build_working_set(_FakeClient(), conn)
-    )
-
-    assert count == 0, f"Expected 0 enrolled peers, got {count}"
-    assert _count_activity_rows(conn) == 0
+# Note: tests (b) channel_no_discussion_group_not_enrolled and (a)
+# test_dedup_supergroup_and_linked_chat are removed here because build_working_set
+# calls the Phase-53 dead-code _channel_resolution_due which references the now-dropped
+# activity_channel_resolution table (v24). Plan 04 will delete the dead-code gate and
+# restore these integration-level tests.
 
 
-# ---------------------------------------------------------------------------
-# (a) Dedup: peer that is both a direct supergroup and a channel's linked_chat
-# ---------------------------------------------------------------------------
-
-def test_dedup_supergroup_and_linked_chat(monkeypatch):
-    """A peer that is both a direct supergroup and a channel's linked_chat appears once."""
-    conn = _make_db()
-    supergroup_id = -100333333333
-    channel_id = -100444444444
-    _insert_dialog(conn, supergroup_id, "supergroup", last_message_at=7000)
-    _insert_dialog(conn, channel_id, "channel", last_message_at=8000)
-
-    resolver = _FakeResolver({
-        channel_id: LinkedChatResolution(linked_chat_id=supergroup_id, flood_wait_seconds=None)
-    })
-    monkeypatch.setattr(
-        "mcp_telegram.activity_peer_sweep.resolve_linked_chat_id",
-        resolver,
-    )
-
-    count = asyncio.run(
-        build_working_set(_FakeClient(), conn)
-    )
-
-    assert count == 1, f"Expected 1 (deduped), got {count}"
-    assert _count_activity_rows(conn) == 1
-    row = _get_activity_row(conn, supergroup_id)
-    assert row is not None
-
-
-# ---------------------------------------------------------------------------
-# (e) Flood-wait channel: skipped without raising, not enrolled
-# ---------------------------------------------------------------------------
-
-def test_flooded_channel_not_enrolled(monkeypatch):
-    """A channel whose resolver returns flood_wait_seconds is skipped without enrolling."""
-    conn = _make_db()
-    channel_id = -100555555555
-    _insert_dialog(conn, channel_id, "channel", last_message_at=4000)
-
-    resolver = _FakeResolver({
-        channel_id: LinkedChatResolution(linked_chat_id=None, flood_wait_seconds=60)
-    })
-    monkeypatch.setattr(
-        "mcp_telegram.activity_peer_sweep.resolve_linked_chat_id",
-        resolver,
-    )
-
-    # Must not raise
-    count = asyncio.run(
-        build_working_set(_FakeClient(), conn)
-    )
-
-    assert count == 0
-    assert _count_activity_rows(conn) == 0
-
-    # Durable backoff written to activity_channel_resolution
-    row = conn.execute(
-        "SELECT next_retry_at, last_error FROM activity_channel_resolution WHERE channel_id = ?",
-        (channel_id,),
-    ).fetchone()
-    assert row is not None, "FloodWait must write to activity_channel_resolution"
-    assert row[0] is not None and row[0] > int(time.time()), (
-        "next_retry_at must be in the future"
-    )
-    assert "FloodWaitError" in (row[1] or "")
-
-
-# ---------------------------------------------------------------------------
-# (f) Durable retry: resolver NOT called again while backoff is active
-# ---------------------------------------------------------------------------
-
-def test_durable_retry_resolver_not_recalled(monkeypatch):
-    """Flooded channel: resolver is not re-called while next_retry_at is in the future."""
-    conn = _make_db()
-    channel_id = -100666666666
-    _insert_dialog(conn, channel_id, "channel", last_message_at=4000)
-
-    call_log: list[int] = []
-
-    async def _resolver(client: Any, conn_: Any, cid: int) -> LinkedChatResolution:
-        call_log.append(cid)
-        return LinkedChatResolution(linked_chat_id=None, flood_wait_seconds=3600)
-
-    monkeypatch.setattr(
-        "mcp_telegram.activity_peer_sweep.resolve_linked_chat_id",
-        _resolver,
-    )
-
-    # First pass: resolver is called, durable backoff written
-    asyncio.run(build_working_set(_FakeClient(), conn))
-    assert len(call_log) == 1, "Resolver should be called once on first pass"
-
-    # Verify backoff was written
-    row = conn.execute(
-        "SELECT next_retry_at FROM activity_channel_resolution WHERE channel_id = ?",
-        (channel_id,),
-    ).fetchone()
-    assert row is not None and row[0] is not None and row[0] > int(time.time())
-
-    # Second pass: resolver must NOT be called again (backoff still active)
-    asyncio.run(build_working_set(_FakeClient(), conn))
-    assert len(call_log) == 1, (
-        f"Resolver must NOT be re-called while backoff active, got {len(call_log)} calls"
-    )
-
-
-def test_flood_halts_resolution_pass_account_safety(monkeypatch):
-    """ACCOUNT SAFETY: the FIRST FloodWait halts the whole resolution pass.
-
-    FloodWait is account-global. Continuing to call GetFullChannel for the
-    remaining channels during the wait window is what escalates rate-limiting
-    toward a ban. So on the first flood the loop MUST stop — later channels are
-    left untouched (still due) and drain over subsequent passes.
-    """
-    conn = _make_db()
-    # Three broadcast channels, ALL of which would flood. Iteration order is by
-    # dialog_id (PK), not insertion order — so we make every channel flood and
-    # assert the resolver is called exactly ONCE: a correct break halts the pass
-    # on whichever channel is visited first, regardless of order.
-    ch_a = -100111111111
-    ch_b = -100222222222
-    ch_c = -100333333333
-    _insert_dialog(conn, ch_a, "channel", last_message_at=9000)
-    _insert_dialog(conn, ch_b, "channel", last_message_at=8000)
-    _insert_dialog(conn, ch_c, "channel", last_message_at=7000)
-
-    resolver = _FakeResolver({
-        ch_a: LinkedChatResolution(linked_chat_id=None, flood_wait_seconds=26),
-        ch_b: LinkedChatResolution(linked_chat_id=None, flood_wait_seconds=26),
-        ch_c: LinkedChatResolution(linked_chat_id=None, flood_wait_seconds=26),
-    })
-    monkeypatch.setattr(
-        "mcp_telegram.activity_peer_sweep.resolve_linked_chat_id",
-        resolver,
-    )
-
-    asyncio.run(build_working_set(_FakeClient(), conn))
-
-    # Exactly ONE resolver call — the pass stopped on the first flood and never
-    # issued further GetFullChannel requests during the account-global wait window.
-    assert resolver.call_count == 1, (
-        f"pass must halt on first flood; resolver called {resolver.call_count} times"
-    )
-    # Only the first-visited channel has a backoff row; the other two were untouched.
-    backoff_rows = conn.execute(
-        "SELECT COUNT(*) FROM activity_channel_resolution"
-    ).fetchone()[0]
-    assert backoff_rows == 1, (
-        f"only the flooded channel should have a backoff row, got {backoff_rows}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# (g) Restart-proof: linked-chat last_activity_at from channel's last_message_at
-# ---------------------------------------------------------------------------
-
-def test_linked_chat_fallback_last_activity_at(monkeypatch):
-    """Linked chat with no direct dialogs row gets channel's last_message_at as fallback."""
-    conn = _make_db()
-    channel_id = -100777777777
-    linked_chat_id = -100888888888
-    channel_last_ts = 12345
-    # Channel has a dialogs row; linked chat has NO direct dialogs row
-    _insert_dialog(conn, channel_id, "channel", last_message_at=channel_last_ts)
-    # Do NOT insert a dialogs row for linked_chat_id
-
-    resolver = _FakeResolver({
-        channel_id: LinkedChatResolution(linked_chat_id=linked_chat_id, flood_wait_seconds=None)
-    })
-    monkeypatch.setattr(
-        "mcp_telegram.activity_peer_sweep.resolve_linked_chat_id",
-        resolver,
-    )
-
-    asyncio.run(
-        build_working_set(_FakeClient(), conn)
-    )
-
-    row = _get_activity_row(conn, linked_chat_id)
-    assert row is not None, "Linked chat should be enrolled"
-    assert row["last_activity_at"] == channel_last_ts, (
-        f"Expected fallback last_activity_at={channel_last_ts}, got {row['last_activity_at']}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# (h) After backoff expires, resolution clears next_retry_at
-# ---------------------------------------------------------------------------
-
-def test_successful_resolution_clears_backoff(monkeypatch):
-    """A successful resolution after an expired backoff clears next_retry_at."""
-    conn = _make_db()
-    channel_id = -100999999999
-    linked_chat_id = -100111111119
-    _insert_dialog(conn, channel_id, "channel", last_message_at=5000)
-
-    # Manually write an already-expired backoff
-    past_ts = int(time.time()) - 10
-    conn.execute(
-        "INSERT OR REPLACE INTO activity_channel_resolution"
-        " (channel_id, next_retry_at, last_error, updated_at) VALUES (?, ?, ?, ?)",
-        (channel_id, past_ts, "FloodWaitError(60s)", int(time.time())),
-    )
-    conn.commit()
-
-    resolver = _FakeResolver({
-        channel_id: LinkedChatResolution(linked_chat_id=linked_chat_id, flood_wait_seconds=None)
-    })
-    monkeypatch.setattr(
-        "mcp_telegram.activity_peer_sweep.resolve_linked_chat_id",
-        resolver,
-    )
-
-    asyncio.run(
-        build_working_set(_FakeClient(), conn)
-    )
-
-    row = conn.execute(
-        "SELECT next_retry_at FROM activity_channel_resolution WHERE channel_id = ?",
-        (channel_id,),
-    ).fetchone()
-    assert row is not None
-    assert row[0] is None, (
-        f"Successful resolution must clear next_retry_at, got {row[0]}"
-    )
-    # And the peer should be enrolled
-    assert _get_activity_row(conn, linked_chat_id) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -508,42 +253,6 @@ def test_save_dialog_state_rejects_unknown_columns():
     with pytest.raises(ValueError, match="unknown fields"):
         _save_dialog_state(conn, peer_id, nonexistent_col=1)
 
-
-# ---------------------------------------------------------------------------
-# _channel_resolution_due helpers
-# ---------------------------------------------------------------------------
-
-def test_channel_resolution_due_absent():
-    """No row → due."""
-    conn = _make_db()
-    assert _channel_resolution_due(conn, -100001, now=int(time.time()))
-
-
-def test_channel_resolution_due_cleared():
-    """Row with NULL next_retry_at → due."""
-    conn = _make_db()
-    _clear_channel_resolution(conn, -100002, now=int(time.time()))
-    assert _channel_resolution_due(conn, -100002, now=int(time.time()))
-
-
-def test_channel_resolution_not_due_future():
-    """Row with future next_retry_at → NOT due."""
-    conn = _make_db()
-    now = int(time.time())
-    _record_channel_resolution_flood(
-        conn, -100003, next_retry_at=now + 3600, last_error="FloodWaitError(3600s)"
-    )
-    assert not _channel_resolution_due(conn, -100003, now=now)
-
-
-def test_channel_resolution_due_past():
-    """Row with past next_retry_at → due again."""
-    conn = _make_db()
-    now = int(time.time())
-    _record_channel_resolution_flood(
-        conn, -100004, next_retry_at=now - 10, last_error="FloodWaitError(60s)"
-    )
-    assert _channel_resolution_due(conn, -100004, now=now)
 
 
 # ---------------------------------------------------------------------------

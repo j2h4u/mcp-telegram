@@ -1495,6 +1495,8 @@ def test_schema_v17_dialogs_columns(tmp_sync_db_path: Path) -> None:
             "members", "created", "last_message_at", "snapshot_at",
             "hidden", "needs_refresh", "unread_mentions_count",
             "unread_reactions_count", "draft_text",
+            # v24 (Phase 54): linked-chat resolution columns
+            "linked_chat_id", "linked_chat_resolved_at",
         }
         assert required == set(columns.keys()), (
             f"Column mismatch.\nExpected: {sorted(required)}\nGot: {sorted(columns.keys())}"
@@ -1510,7 +1512,8 @@ def test_schema_v17_dialogs_columns(tmp_sync_db_path: Path) -> None:
             assert str(col[4]) == "0", f"{col_name} default must be 0, got {col[4]!r}"
 
         for col_name in ("name", "type", "members", "created",
-                         "last_message_at", "snapshot_at", "draft_text"):
+                         "last_message_at", "snapshot_at", "draft_text",
+                         "linked_chat_id", "linked_chat_resolved_at"):
             col = columns[col_name]
             assert col[3] == 0, f"{col_name} must be nullable (NOT NULL=0), got notnull={col[3]}"
     finally:
@@ -1611,8 +1614,8 @@ def test_schema_version_is_current(tmp_sync_db_path: Path) -> None:
         assert row is not None and int(row[0]) == _CURRENT_SCHEMA_VERSION, (
             f"Expected schema version {_CURRENT_SCHEMA_VERSION}, got {row}"
         )
-        assert _CURRENT_SCHEMA_VERSION == 23, (
-            f"_CURRENT_SCHEMA_VERSION must be 23, got {_CURRENT_SCHEMA_VERSION}"
+        assert _CURRENT_SCHEMA_VERSION == 24, (
+            f"_CURRENT_SCHEMA_VERSION must be 24, got {_CURRENT_SCHEMA_VERSION}"
         )
     finally:
         conn.close()
