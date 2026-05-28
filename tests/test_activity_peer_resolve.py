@@ -4,16 +4,17 @@ Covers:
   (a) resolve_input_peer returns the input entity for a known dialog_id.
   (b) resolve_input_peer returns None (not raises) when get_input_entity
       raises an access-loss error.
-  (c) resolve_linked_chat_id reads a FRESH entity_details blob WITHOUT
-      calling GetFullChannel (cache hit).
-  (d) On cache miss it calls GetFullChannel exactly once, MERGES the result
-      into the existing detail_json blob (a pre-existing key like 'about'
-      survives), normalizes to -100… form, and returns the result.
+  (c) resolve_linked_chat_id reads from dialogs.linked_chat_resolved_at
+      WITHOUT calling GetFullChannel (dialogs cache hit).
+  (d) On cold path (no dialogs row or NULL resolved_at) it calls
+      GetFullChannel exactly once, UPSERTs result into dialogs, preserves
+      sibling fields (about, subscribers_count) in entity_details but does
+      NOT write linked_chat_id into detail_json, normalizes to -100… form.
   (e) A channel with no linked chat returns
       LinkedChatResolution(linked_chat_id=None, flood_wait_seconds=None).
   (f) When GetFullChannel raises FloodWaitError(seconds=N), the resolver
       returns LinkedChatResolution(linked_chat_id=None, flood_wait_seconds=N)
-      WITHOUT sleeping and WITHOUT raising (concern 5 resolver path).
+      WITHOUT sleeping, WITHOUT raising, and WITHOUT touching dialogs.
 """
 from __future__ import annotations
 
@@ -77,6 +78,44 @@ def _read_entity_details(conn: sqlite3.Connection, entity_id: int) -> dict | Non
     if row is None:
         return None
     return json.loads(row[0])
+
+
+def _write_dialogs_row(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    *,
+    linked_chat_id: int | None = None,
+    linked_chat_resolved_at: int | None = None,
+    name: str | None = None,
+    type_: str | None = None,
+) -> None:
+    """Insert a minimal dialogs row for resolver tests."""
+    conn.execute(
+        "INSERT OR REPLACE INTO dialogs "
+        "(dialog_id, name, type, linked_chat_id, linked_chat_resolved_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (dialog_id, name, type_, linked_chat_id, linked_chat_resolved_at),
+    )
+    conn.commit()
+
+
+def _read_dialogs_row(conn: sqlite3.Connection, dialog_id: int) -> dict | None:
+    """Read a dialogs row as a dict, or None if absent."""
+    row = conn.execute(
+        "SELECT dialog_id, linked_chat_id, linked_chat_resolved_at, name, type, hidden "
+        "FROM dialogs WHERE dialog_id = ?",
+        (dialog_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "dialog_id": row[0],
+        "linked_chat_id": row[1],
+        "linked_chat_resolved_at": row[2],
+        "name": row[3],
+        "type": row[4],
+        "hidden": row[5],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -159,20 +198,23 @@ async def test_resolve_input_peer_returns_none_on_key_error():
 
 
 # ---------------------------------------------------------------------------
-# (c) resolve_linked_chat_id: cache hit — no GetFullChannel call
+# (c) resolve_linked_chat_id: dialogs cache hit — no GetFullChannel call
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_resolve_linked_chat_id_cache_hit_no_live_call():
-    """A fresh entity_details blob serves linked_chat_id without GetFullChannel."""
+    """A dialogs row with non-NULL linked_chat_resolved_at serves the answer
+    without calling GetFullChannel (Phase 54: dialogs-first cache substrate)."""
     conn = _make_db()
     channel_id = -100200000001
     linked_id = -100300000001
 
-    _write_entity_details(
+    # Seed the authoritative answer into dialogs (not entity_details).
+    # Any non-NULL linked_chat_resolved_at is the authority signal.
+    _write_dialogs_row(
         conn, channel_id,
-        {"linked_chat_id": linked_id, "about": "test channel"},
-        fetched_at=int(time.time()),  # fresh
+        linked_chat_id=linked_id,
+        linked_chat_resolved_at=int(time.time()) - 99999,  # deliberately old — no TTL
     )
 
     client = _FakeClient(input_entity=MagicMock())
@@ -224,12 +266,21 @@ async def test_resolve_linked_chat_id_cache_miss_calls_once_and_merges():
     )
     assert result.flood_wait_seconds is None
 
-    # Blob was written back and pre-existing 'about' is still there
+    # entity_details blob was written back with sibling fields preserved.
+    # Phase 54: linked_chat_id is now owned by dialogs — it must NOT appear
+    # in entity_details.detail_json.
     written = _read_entity_details(conn, channel_id)
     assert written is not None
-    assert "linked_chat_id" in written
+    assert "linked_chat_id" not in written, (
+        "linked_chat_id must NOT be written into entity_details (Phase 54 contract)"
+    )
     # The merge preserved the about field (updated from the fresh result)
     assert "about" in written
+    # The live result wrote its row into dialogs instead
+    dialogs_row = _read_dialogs_row(conn, channel_id)
+    assert dialogs_row is not None
+    assert dialogs_row["linked_chat_id"] is not None
+    assert str(dialogs_row["linked_chat_id"]).startswith("-100")
 
 
 @pytest.mark.asyncio

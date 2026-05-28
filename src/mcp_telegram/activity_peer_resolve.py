@@ -70,65 +70,88 @@ async def resolve_linked_chat_id(
     conn: sqlite3.Connection,
     channel_id: int,
 ) -> LinkedChatResolution:
-    """Cache-first linked-chat resolver for a broadcast channel.
+    """Dialogs-first linked-chat resolver for a broadcast channel.
 
     Resolution order:
-    1. Read entity_details.detail_json for channel_id; if present and fresh
-       (within _ENTITY_DETAIL_TTL_SECONDS), return cached linked_chat_id with
-       flood_wait_seconds=None — no live call.
-    2. On miss / expired / absent, call GetFullChannelRequest exactly once.
-       The result is MERGED into the existing detail_json blob (read-modify-
-       write) so pre-existing keys like subscribers_count/about/pinned_msg_id
-       are preserved.  linked_chat_id is normalized to -100… form.
-    3. On FloodWaitError: return LinkedChatResolution(linked_chat_id=None,
-       flood_wait_seconds=<n>) immediately — do NOT sleep.  The calling tier
-       owns the durable backoff write.
-    4. A channel with no linked chat returns linked_chat_id=None,
+    1. Assert schema v24+ (dialogs.linked_chat_id + linked_chat_resolved_at
+       columns must exist). A half-migrated connection raises RuntimeError —
+       never silently degrades to live fetch (which would re-create the
+       ban-trigger pattern Phase 54 eliminates).
+    2. Read dialogs.linked_chat_resolved_at for channel_id. NOT NULL = we have
+       a definitive answer — return it immediately with no Telethon call.
+       NULL (or no row) = fall through to live GetFullChannelRequest.
+    3. On live fetch success: UPSERT dialogs(dialog_id, linked_chat_id,
+       linked_chat_resolved_at = now). Only the two linked-chat columns are
+       updated — name/type/hidden/members etc. are never touched here.
+       Sibling fields (subscribers_count, about, pinned_msg_id) still flow
+       into entity_details.detail_json as before.
+    4. On FloodWaitError: do NOT touch dialogs. resolved_at stays NULL, which
+       IS the retry signal. The next sweep cycle re-attempts naturally.
+    5. A channel with no linked chat returns linked_chat_id=None,
        flood_wait_seconds=None (distinct from a flood wait by flood_wait_seconds
        being None).
 
-    Never raises into the caller.
+    No TTL on linked_chat_resolved_at: a definitive answer stays definitive
+    until the event handler (plan 03) refreshes it on a real UpdateChannel.
+
+    Never raises into the caller (beyond the schema-floor RuntimeError on
+    misconfigured connections).
     """
     from telethon.errors import FloodWaitError
     from telethon.tl.functions.channels import GetFullChannelRequest
     from telethon.utils import get_peer_id
 
+    # --- Schema-floor assertion (review HIGH-2 mitigation) ---
+    # This project tracks schema version in the schema_version table (not
+    # PRAGMA user_version, which is always 0 here). Check MAX(version) from
+    # schema_version — if the table is absent or the max version is below 24,
+    # the connection is not migrated to v24 and the dialogs.linked_chat_*
+    # columns do not exist.
+    #
+    # This converts the highest-risk silent-failure mode (resolver silently
+    # degrades to live-fetch storm on a misconfigured daemon) into a loud
+    # RuntimeError that surfaces during the first sweep pass after a broken
+    # deploy.
+    try:
+        ver_row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
+        schema_version = ver_row[0] if ver_row is not None and ver_row[0] is not None else 0
+    except sqlite3.OperationalError:
+        schema_version = 0
+    if schema_version < 24:
+        raise RuntimeError(
+            f"activity_peer_resolve.resolve_linked_chat_id requires schema v24+ "
+            f"(dialogs.linked_chat_id, dialogs.linked_chat_resolved_at). "
+            f"Connection reports schema_version={schema_version}. "
+            f"Phase 54 cache-substrate flip: a half-migrated daemon must NOT fall "
+            f"through to live GetFullChannelRequest on every call — that re-creates "
+            f"the exact ban-trigger pattern Phase 54 exists to eliminate. "
+            f"Run ensure_sync_schema() on this connection before calling the resolver."
+        )
+
     now = int(time.time())
 
-    # --- Cache read ---
-    try:
-        row = conn.execute(
-            "SELECT detail_json, fetched_at FROM entity_details WHERE entity_id = ?",
-            (channel_id,),
-        ).fetchone()
-    except sqlite3.OperationalError:
-        logger.debug(
-            "activity_peer_resolve_linked_cache_read_error channel_id=%r", channel_id,
-            exc_info=True,
-        )
-        row = None
+    # --- Dialogs cache read (authoritative, no TTL) ---
+    # Do NOT wrap in a broad except sqlite3.OperationalError — the schema floor
+    # assertion above guarantees the columns exist. Any OperationalError here
+    # is a genuine database error (corruption, disk-full, locked) and MUST
+    # propagate so the caller can react instead of silently falling through to
+    # live fetch (which would re-create the very ban trigger Phase 54 eliminates).
+    row = conn.execute(
+        "SELECT linked_chat_id, linked_chat_resolved_at FROM dialogs WHERE dialog_id = ?",
+        (channel_id,),
+    ).fetchone()
 
     if row is not None:
-        detail_json_str, fetched_at = row
-        if now - fetched_at < _ENTITY_DETAIL_TTL_SECONDS:
-            try:
-                blob = json.loads(detail_json_str)
-                cached_raw = blob.get("linked_chat_id")
-                if cached_raw is not None:
-                    return LinkedChatResolution(
-                        linked_chat_id=int(cached_raw), flood_wait_seconds=None
-                    )
-                # Explicitly cached as None (no discussion group)
-                if "linked_chat_id" in blob:
-                    return LinkedChatResolution(linked_chat_id=None, flood_wait_seconds=None)
-                # Key absent from blob — treat as miss and re-fetch
-            except (json.JSONDecodeError, ValueError):
-                logger.debug(
-                    "activity_peer_resolve_linked_cache_corrupt channel_id=%r", channel_id
-                )
-    else:
-        row = None  # not in cache at all
-        detail_json_str = None
+        cached_linked_chat_id, linked_chat_resolved_at = row
+        if linked_chat_resolved_at is not None:
+            # Authoritative answer on record — NOT NULL resolved_at means we asked
+            # and got a definitive answer. linked_chat_id may be NULL (= no
+            # discussion group). Return immediately with zero Telethon calls.
+            return LinkedChatResolution(
+                linked_chat_id=cached_linked_chat_id,
+                flood_wait_seconds=None,
+            )
+        # Row exists but resolved_at IS NULL — "never asked" state; fall through.
 
     # --- Live fetch ---
     try:
@@ -150,17 +173,22 @@ async def resolve_linked_chat_id(
             else:
                 linked_chat_id = int(linked_chat_id_raw)
 
-        # --- Merge into existing blob (read-modify-write, preserve other keys) ---
+        # --- Merge sibling fields into entity_details (subscribers_count, about,
+        #     pinned_msg_id). linked_chat_id is owned by dialogs now — do NOT
+        #     write it into detail_json. ---
         existing_blob: dict = {}
-        if detail_json_str is not None:
+        existing_detail_row = conn.execute(
+            "SELECT detail_json FROM entity_details WHERE entity_id = ?",
+            (channel_id,),
+        ).fetchone()
+        if existing_detail_row is not None:
             try:
-                existing_blob = json.loads(detail_json_str)
+                existing_blob = json.loads(existing_detail_row[0])
             except json.JSONDecodeError:
                 existing_blob = {}
 
-        # Merge: overlay only the fields we freshly fetched
-        existing_blob["linked_chat_id"] = linked_chat_id
-        # Also update other full_channel fields if present
+        # Overlay only the sibling fields we freshly fetched; linked_chat_id
+        # is intentionally omitted — it now lives in dialogs exclusively.
         subscribers_count = getattr(full_chat, "participants_count", None)
         if subscribers_count is not None:
             existing_blob["subscribers_count"] = subscribers_count
@@ -195,11 +223,32 @@ async def resolve_linked_chat_id(
                     "VALUES (?, 'channel', ?, ?, ?)",
                     (channel_id, channel_name, channel_username, now),
                 )
+                # D-07: UPSERT linked-chat columns into dialogs. This is intentionally
+                # a thin write — only the two linked-chat columns are updated. Every
+                # other dialogs column (name, type, hidden, members, …) is left at its
+                # default on the create path; the dialog snapshot pipeline owns the full
+                # row. On conflict (common case after Phase 41 bootstrap), only the two
+                # linked-chat columns are updated — name/type/hidden/members are NEVER
+                # touched here.
                 conn.execute(
-                    "INSERT OR REPLACE INTO entity_details (entity_id, detail_json, fetched_at) "
-                    "VALUES (?, ?, ?)",
-                    (channel_id, json.dumps(existing_blob), now),
+                    "INSERT INTO dialogs (dialog_id, linked_chat_id, linked_chat_resolved_at) "
+                    "VALUES (?, ?, ?) "
+                    "ON CONFLICT(dialog_id) DO UPDATE SET "
+                    "    linked_chat_id = excluded.linked_chat_id, "
+                    "    linked_chat_resolved_at = excluded.linked_chat_resolved_at",
+                    (channel_id, linked_chat_id, now),
                 )
+                # Write sibling fields into entity_details only if there is something
+                # to write (avoid persisting an empty {} payload).
+                has_sibling_fields = any(
+                    k in existing_blob for k in ("subscribers_count", "pinned_msg_id", "about")
+                )
+                if existing_detail_row is not None or has_sibling_fields:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO entity_details (entity_id, detail_json, fetched_at) "
+                        "VALUES (?, ?, ?)",
+                        (channel_id, json.dumps(existing_blob), now),
+                    )
         except sqlite3.Error:
             logger.debug(
                 "activity_peer_resolve_linked_cache_write_error channel_id=%r", channel_id,
@@ -214,10 +263,14 @@ async def resolve_linked_chat_id(
             "activity_peer_resolve_linked_flood channel_id=%r flood_wait_seconds=%d",
             channel_id, exc.seconds,
         )
-        # FloodWait-NEUTRAL: do NOT sleep — surface wait to calling tier
+        # FloodWait-NEUTRAL: do NOT sleep — surface wait to calling tier.
+        # D-08: do NOT touch dialogs — resolved_at stays NULL, which IS the retry
+        # signal. The next sweep cycle will re-attempt naturally.
         return LinkedChatResolution(linked_chat_id=None, flood_wait_seconds=int(exc.seconds))
     except Exception:
         logger.debug(
             "activity_peer_resolve_linked_error channel_id=%r", channel_id, exc_info=True
         )
+        # D-08 (generic error path): do NOT touch dialogs — resolved_at stays NULL
+        # so the next sweep pass retries naturally.
         return LinkedChatResolution(linked_chat_id=None, flood_wait_seconds=None)
