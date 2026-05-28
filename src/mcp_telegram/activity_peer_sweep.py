@@ -11,9 +11,9 @@ This module provides:
   - build_working_set: working-set builder enrolling from dialogs.type=
     'supergroup'/'channel' with durable resolver-path FloodWait retry.
   - _load_dialog_state / _save_dialog_state: per-tier cursor helpers.
-  - _channel_resolution_due / _record_channel_resolution_flood /
-    _clear_channel_resolution: durable resolver-path retry helpers over
-    activity_channel_resolution (schema v23).
+
+Phase 54: linked_chat_id resolution is dialogs-cache-trust; no per-channel
+backoff helpers — see activity_peer_resolve.resolve_linked_chat_id.
 
 No scheduling loops live here — those are plans 03 and 04.
 """
@@ -313,83 +313,6 @@ def _save_dialog_state(
 
 
 # ---------------------------------------------------------------------------
-# Durable channel-resolution retry helpers (activity_channel_resolution)
-# ---------------------------------------------------------------------------
-
-def _channel_resolution_due(
-    conn: sqlite3.Connection, channel_id: int, *, now: int
-) -> bool:
-    """Return True when the channel is due for a resolution attempt.
-
-    Returns False (skip) iff activity_channel_resolution.next_retry_at is
-    non-NULL and greater than now — the durable backoff is being honored.
-    Returns True when the row is absent or next_retry_at is NULL/past.
-    """
-    row = conn.execute(
-        "SELECT next_retry_at FROM activity_channel_resolution WHERE channel_id = ?",
-        (channel_id,),
-    ).fetchone()
-    if row is None:
-        return True  # no record → due
-    next_retry_at = row[0]
-    if next_retry_at is None:
-        return True  # cleared → due
-    return int(next_retry_at) <= now  # past → due; future → skip
-
-
-def _record_channel_resolution_flood(
-    conn: sqlite3.Connection,
-    channel_id: int,
-    *,
-    next_retry_at: int,
-    last_error: str,
-) -> None:
-    """Persist durable resolver-path FloodWait backoff for a broadcast channel.
-
-    On FloodWaitError, build_working_set calls this to write
-    next_retry_at = now + flood_wait_seconds into activity_channel_resolution
-    so the backoff survives builder passes and daemon restarts.
-    """
-    now = int(time.time())
-    with conn:
-        conn.execute(
-            """
-            INSERT INTO activity_channel_resolution
-                (channel_id, next_retry_at, last_error, updated_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(channel_id) DO UPDATE SET
-                next_retry_at = excluded.next_retry_at,
-                last_error    = excluded.last_error,
-                updated_at    = excluded.updated_at
-            """,
-            (channel_id, next_retry_at, last_error, now),
-        )
-
-
-def _clear_channel_resolution(
-    conn: sqlite3.Connection, channel_id: int, *, now: int
-) -> None:
-    """Clear the resolver-path backoff after a successful (or clean-None) resolution.
-
-    Sets next_retry_at = NULL so the channel is immediately due again on the
-    next builder pass.  last_error is also cleared.
-    """
-    with conn:
-        conn.execute(
-            """
-            INSERT INTO activity_channel_resolution
-                (channel_id, next_retry_at, last_error, updated_at)
-            VALUES (?, NULL, NULL, ?)
-            ON CONFLICT(channel_id) DO UPDATE SET
-                next_retry_at = NULL,
-                last_error    = NULL,
-                updated_at    = excluded.updated_at
-            """,
-            (channel_id, now),
-        )
-
-
-# ---------------------------------------------------------------------------
 # Working-set builder
 # ---------------------------------------------------------------------------
 
@@ -398,13 +321,12 @@ async def build_working_set(client: Any, conn: sqlite3.Connection) -> int:
 
     Source: dialogs.type='supergroup' (megagroups) and dialogs.type='channel'
     (broadcast channels whose linked discussion group is resolved via
-    resolve_linked_chat_id).  NOT entities.type='group' — that taxonomy
-    differs (concern 4 fix).
+    resolve_linked_chat_id (post-Phase-54: dialogs-cache hot read; falls through
+    to GetFullChannelRequest only when linked_chat_resolved_at IS NULL)).
+    NOT entities.type='group' — that taxonomy differs (concern 4 fix).
 
     Returns the count of peers enrolled in the working set.
     """
-    now = int(time.time())
-
     # Step 1: standalone supergroups (directly self-searchable)
     supergroup_rows = conn.execute(
         "SELECT dialog_id, last_message_at FROM dialogs WHERE type = 'supergroup' AND hidden = 0"
@@ -423,50 +345,21 @@ async def build_working_set(client: Any, conn: sqlite3.Connection) -> int:
 
     # Step 3: resolve broadcast channels to their discussion groups
     for channel_id, channel_last_message_at in channel_rows:
-        # Durable backoff: skip if still in flood-wait period
-        if not _channel_resolution_due(conn, channel_id, now=now):
-            logger.debug(
-                "build_working_set_channel_skip_backoff channel_id=%r", channel_id
-            )
-            continue
-
         res: LinkedChatResolution = await resolve_linked_chat_id(client, conn, channel_id)
 
         if res.flood_wait_seconds is not None:
-            # FloodWait from GetFullChannel is ACCOUNT-GLOBAL, not per-channel:
-            # once Telegram issues it, every further request in this pass is sent
-            # *during* the wait window, which is exactly what escalates rate-limiting
-            # toward an account ban. Persist durable backoff for this channel, then
-            # STOP the pass (break, not continue). The remaining unresolved channels
-            # stay due and drain over subsequent passes (enroll cadence ~30 min), by
-            # which point the short global wait has long cleared. Resolved channels
-            # are cache-first (entity_details TTL) so they never re-hit the API.
-            next_retry_at = now + res.flood_wait_seconds
-            _record_channel_resolution_flood(
-                conn,
-                channel_id,
-                next_retry_at=next_retry_at,
-                last_error=f"FloodWaitError({res.flood_wait_seconds}s)",
-            )
             logger.warning(
                 "build_working_set_channel_flood channel_id=%r flood_wait_seconds=%d"
-                " next_retry_at=%d — halting resolution pass (account-global wait)",
-                channel_id, res.flood_wait_seconds, next_retry_at,
+                " — halting resolution pass (FloodWait from GetFullChannelRequest is"
+                " account-global; remaining channels stay due for next sweep cycle)",
+                channel_id, res.flood_wait_seconds,
             )
             break
 
-        # Clean resolution (linked or clean-None) — clear any prior backoff
-        _clear_channel_resolution(conn, channel_id, now=now)
-
         if res.linked_chat_id is not None:
-            # Use channel's last_message_at as fallback if linked chat has
-            # no direct dialogs row (review MEDIUM)
             existing = working_set.get(res.linked_chat_id)
             if existing is None:
-                # No prior entry — use channel's last_message_at as fallback
                 working_set[res.linked_chat_id] = channel_last_message_at
-            # else: already in set (dedup — possibly a direct supergroup row)
-
         # else: no discussion group → drop channel (D-03)
 
     # Step 4-5: enroll all peers via shared helper
