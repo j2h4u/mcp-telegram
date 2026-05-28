@@ -5488,12 +5488,19 @@ _TARGET_USER_ID = 9999
 
 
 def _seed_channel_with_linked_chat(conn: sqlite3.Connection) -> None:
-    """Seed the broadcast channel (type=Channel) in dialogs + entity_details.
+    """Seed a broadcast channel + its linked discussion group as synced dialogs.
 
-    The entity_details blob carries linked_chat_id so the cache-first resolver
-    returns it without a live API call.
+    The trace tests that consume this fixture call pure-SQL builders such as
+    `_build_trace_account_messages_query` and pass `linked_chat_map` directly —
+    they do NOT invoke `resolve_linked_chat_id`, so no `entity_details` row or
+    `dialogs.linked_chat_*` column needs to be populated here. The fixture's
+    only job is to make the two peers exist as `dialogs`/`synced_dialogs` rows
+    so SQL joins find them and `_trace_strategy_for_dialog` classifies them.
+
+    Phase 54 (schema v24) made `dialogs.linked_chat_id` / `linked_chat_resolved_at`
+    the authoritative cache and stripped `linked_chat_id` out of
+    `entity_details.detail_json`. Do not re-introduce that seed here.
     """
-    now = int(time.time())
     # NOTE: use the LOWERCASE type casing the live `dialogs` table actually stores
     # ('channel', 'supergroup') — NOT the capitalized values. A prior version of this
     # fixture seeded "Channel"/"Group", which masked a real case-sensitivity bug:
@@ -5507,11 +5514,6 @@ def _seed_channel_with_linked_chat(conn: sqlite3.Connection) -> None:
     conn.execute(
         "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')",
         (_CHANNEL_ID,),
-    )
-    # Cache-first resolver reads entity_details.detail_json for linked_chat_id.
-    conn.execute(
-        "INSERT INTO entity_details (entity_id, detail_json, fetched_at) VALUES (?, ?, ?)",
-        (_CHANNEL_ID, json.dumps({"linked_chat_id": _LINKED_CHAT_ID}), now),
     )
     # Linked discussion group type so _trace_strategy_for_dialog returns author_search.
     conn.execute(
