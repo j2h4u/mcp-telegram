@@ -324,7 +324,7 @@ def test_schema_version_records_current_v18(tmp_path: Path) -> None:
             "SELECT MAX(version) FROM schema_version"
         ).fetchone()[0]
         assert max_version == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 24  # Phase 54 follow-up lock — flips when next migration ships
+        assert _CURRENT_SCHEMA_VERSION == 25  # Phase 55 (Bug #1 orphan own_only fix) — flips when next migration ships
     finally:
         conn.close()
 
@@ -586,9 +586,23 @@ def test_migration_v21_runs_from_v20_database(tmp_path: Path) -> None:
                 dialog_id INTEGER PRIMARY KEY,
                 name TEXT, type TEXT,
                 archived INTEGER NOT NULL DEFAULT 0,
-                pinned INTEGER NOT NULL DEFAULT 0
+                pinned INTEGER NOT NULL DEFAULT 0,
+                members INTEGER,
+                created INTEGER,
+                last_message_at INTEGER,
+                snapshot_at INTEGER,
+                hidden INTEGER NOT NULL DEFAULT 0,
+                needs_refresh INTEGER NOT NULL DEFAULT 0,
+                unread_mentions_count INTEGER NOT NULL DEFAULT 0,
+                unread_reactions_count INTEGER NOT NULL DEFAULT 0,
+                draft_text TEXT
             )
             """
+        )
+        # synced_dialogs exists since v1; stub it so the v25 own_only backfill
+        # (INSERT...SELECT FROM synced_dialogs) succeeds when seeding mid-chain.
+        conn.execute(
+            "CREATE TABLE synced_dialogs (dialog_id INTEGER PRIMARY KEY, status TEXT NOT NULL DEFAULT 'pending')"
         )
         conn.execute("INSERT INTO schema_version VALUES (20, 1700000000)")
         conn.commit()
@@ -761,9 +775,23 @@ def test_migration_v23_runs_from_v22_database(tmp_path: Path) -> None:
                 dialog_id INTEGER PRIMARY KEY,
                 name TEXT, type TEXT,
                 archived INTEGER NOT NULL DEFAULT 0,
-                pinned INTEGER NOT NULL DEFAULT 0
+                pinned INTEGER NOT NULL DEFAULT 0,
+                members INTEGER,
+                created INTEGER,
+                last_message_at INTEGER,
+                snapshot_at INTEGER,
+                hidden INTEGER NOT NULL DEFAULT 0,
+                needs_refresh INTEGER NOT NULL DEFAULT 0,
+                unread_mentions_count INTEGER NOT NULL DEFAULT 0,
+                unread_reactions_count INTEGER NOT NULL DEFAULT 0,
+                draft_text TEXT
             )
             """
+        )
+        # synced_dialogs exists since v1; stub it so the v25 own_only backfill
+        # (INSERT...SELECT FROM synced_dialogs) succeeds when seeding mid-chain.
+        conn.execute(
+            "CREATE TABLE synced_dialogs (dialog_id INTEGER PRIMARY KEY, status TEXT NOT NULL DEFAULT 'pending')"
         )
         conn.execute("INSERT INTO schema_version VALUES (22, 1700000000)")
         conn.commit()
@@ -797,7 +825,7 @@ def test_migration_v24_schema_version(db_path: Path) -> None:
     conn = _open_sync_db(db_path)
     try:
         row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
-        assert row[0] == 24, f"expected schema version 24, got {row[0]}"
+        assert row[0] == _CURRENT_SCHEMA_VERSION, f"expected schema version {_CURRENT_SCHEMA_VERSION}, got {row[0]}"
     finally:
         conn.close()
 
@@ -911,6 +939,11 @@ def test_migration_v24_backfill_three_shapes(tmp_path: Path) -> None:
                 updated_at  INTEGER NOT NULL
             ) WITHOUT ROWID"""
         )
+        # synced_dialogs exists since v1; stub it so the v25 own_only backfill
+        # (INSERT...SELECT FROM synced_dialogs) succeeds when seeding mid-chain.
+        pre_conn.execute(
+            "CREATE TABLE synced_dialogs (dialog_id INTEGER PRIMARY KEY, status TEXT NOT NULL DEFAULT 'pending')"
+        )
         pre_conn.execute("INSERT INTO schema_version VALUES (23, 1700000000)")
         pre_conn.commit()
         _seed_v24_fixtures(pre_conn)
@@ -919,9 +952,9 @@ def test_migration_v24_backfill_three_shapes(tmp_path: Path) -> None:
 
     conn = _open_sync_db(db_path)
     try:
-        # Schema version
+        # Schema version (v24 columns exist; MAX will be _CURRENT_SCHEMA_VERSION as later migrations run too)
         row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
-        assert row[0] == 24, f"expected v24, got {row[0]}"
+        assert row[0] == _CURRENT_SCHEMA_VERSION, f"expected v{_CURRENT_SCHEMA_VERSION}, got {row[0]}"
 
         # Both new columns exist
         cols = {c[1] for c in conn.execute("PRAGMA table_info(dialogs)")}
@@ -972,13 +1005,13 @@ def test_migration_v24_backfill_three_shapes(tmp_path: Path) -> None:
 
 
 def test_migration_v24_idempotent(db_path: Path) -> None:
-    """Running ensure_sync_schema twice on a v24 DB is a no-op (no exception, version stays 24)."""
+    """Running ensure_sync_schema twice is a no-op (no exception, version stays at current)."""
     ensure_sync_schema(db_path)
     ensure_sync_schema(db_path)
     conn = _open_sync_db(db_path)
     try:
         row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
-        assert row[0] == 24
+        assert row[0] == _CURRENT_SCHEMA_VERSION
     finally:
         conn.close()
 
@@ -1005,5 +1038,171 @@ def test_migration_v24_channel_c_not_stripped(db_path: Path) -> None:
             "SELECT json_extract(detail_json, '$.subscribers_count') FROM entity_details WHERE entity_id = 9999"
         ).fetchone()
         assert row2[0] == 5, "subscribers_count should be preserved"
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# v25: one-shot backfill of thin dialogs rows for orphan own_only peers
+# ---------------------------------------------------------------------------
+#
+# Approach (Lazy): enroll_activity_dialog now writes a thin dialogs row alongside
+# the synced_dialogs own_only insert. The v25 migration materialises thin rows for
+# the ~88 pre-existing orphans. Existing run_light_pass (needs_refresh=1 AND hidden=0)
+# fills name/type/members/created on its hourly cycle — no new code paths.
+#
+# FloodWait note: ~88 net-new candidates added at once; ship-as-is per operator
+# decision. Observe logs for burst; cap/stagger deferred to a follow-up if needed.
+
+
+def _make_v24_db(tmp_path: Path) -> Path:
+    """Create a minimal v24 database (pre-v25) for migration tests."""
+    db_path = tmp_path / "sync.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            "CREATE TABLE schema_version (version INTEGER NOT NULL, applied_at INTEGER NOT NULL)"
+        )
+        # Minimal dialogs table as it exists post-v24 (includes linked_chat columns)
+        conn.execute(
+            """CREATE TABLE dialogs (
+                dialog_id               INTEGER PRIMARY KEY,
+                name                    TEXT,
+                type                    TEXT,
+                archived                INTEGER NOT NULL DEFAULT 0,
+                pinned                  INTEGER NOT NULL DEFAULT 0,
+                members                 INTEGER,
+                created                 INTEGER,
+                last_message_at         INTEGER,
+                snapshot_at             INTEGER,
+                hidden                  INTEGER NOT NULL DEFAULT 0,
+                needs_refresh           INTEGER NOT NULL DEFAULT 0,
+                unread_mentions_count   INTEGER NOT NULL DEFAULT 0,
+                unread_reactions_count  INTEGER NOT NULL DEFAULT 0,
+                draft_text              TEXT,
+                linked_chat_id          INTEGER,
+                linked_chat_resolved_at INTEGER
+            )"""
+        )
+        # Minimal synced_dialogs table
+        conn.execute(
+            """CREATE TABLE synced_dialogs (
+                dialog_id   INTEGER PRIMARY KEY,
+                status      TEXT NOT NULL DEFAULT 'pending',
+                access_lost_at INTEGER
+            )"""
+        )
+        conn.execute("INSERT INTO schema_version VALUES (24, 1700000000)")
+        conn.commit()
+    return db_path
+
+
+def test_migration_v25_schema_version(tmp_path: Path) -> None:
+    """After v25 migration, MAX(schema_version) == 25 == _CURRENT_SCHEMA_VERSION."""
+    db_path = _make_v24_db(tmp_path)
+    ensure_sync_schema(db_path)
+    conn = _open_sync_db(db_path)
+    try:
+        row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
+        assert row[0] == 25, f"expected schema version 25, got {row[0]}"
+        assert _CURRENT_SCHEMA_VERSION == 25
+    finally:
+        conn.close()
+
+
+def test_migration_v25_backfills_orphan_own_only(tmp_path: Path) -> None:
+    """v25: an orphan synced_dialogs(status='own_only') with no dialogs row gets a thin
+    dialogs row (needs_refresh=1, name IS NULL) after ensure_sync_schema."""
+    db_path = _make_v24_db(tmp_path)
+    orphan_id = -100888000001
+
+    with sqlite3.connect(db_path) as pre_conn:
+        pre_conn.execute(
+            "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'own_only')",
+            (orphan_id,),
+        )
+        pre_conn.commit()
+
+    ensure_sync_schema(db_path)
+
+    conn = _open_sync_db(db_path)
+    try:
+        row = conn.execute(
+            "SELECT needs_refresh, name FROM dialogs WHERE dialog_id = ?",
+            (orphan_id,),
+        ).fetchone()
+        assert row is not None, "v25 backfill must create a thin dialogs row for orphan own_only peer"
+        assert row[0] == 1, f"needs_refresh must be 1 after backfill, got {row[0]!r}"
+        assert row[1] is None, f"name must remain NULL until reconciliation fills it, got {row[1]!r}"
+    finally:
+        conn.close()
+
+
+def test_migration_v25_leaves_resolved_own_only_untouched(tmp_path: Path) -> None:
+    """v25: an own_only peer that already has a resolved dialogs row is untouched
+    (INSERT OR IGNORE preserves name, type, needs_refresh=0)."""
+    db_path = _make_v24_db(tmp_path)
+    peer_id = -100888000002
+
+    with sqlite3.connect(db_path) as pre_conn:
+        pre_conn.execute(
+            "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'own_only')",
+            (peer_id,),
+        )
+        pre_conn.execute(
+            "INSERT INTO dialogs (dialog_id, name, type, needs_refresh, snapshot_at,"
+            " archived, pinned, hidden, unread_mentions_count, unread_reactions_count)"
+            " VALUES (?, 'Already Resolved', 'user', 0, 1700000000, 0, 0, 0, 0, 0)",
+            (peer_id,),
+        )
+        pre_conn.commit()
+
+    ensure_sync_schema(db_path)
+
+    conn = _open_sync_db(db_path)
+    try:
+        row = conn.execute(
+            "SELECT name, type, needs_refresh FROM dialogs WHERE dialog_id = ?",
+            (peer_id,),
+        ).fetchone()
+        assert row is not None
+        assert row[0] == "Already Resolved", f"name must not be clobbered, got {row[0]!r}"
+        assert row[1] == "user", f"type must not be clobbered, got {row[1]!r}"
+        assert row[2] == 0, f"needs_refresh must stay 0 (already resolved), got {row[2]!r}"
+    finally:
+        conn.close()
+
+
+def test_migration_v25_ignores_non_own_only(tmp_path: Path) -> None:
+    """v25: a synced_dialogs row with status != 'own_only' that has no dialogs row
+    must NOT get a thin dialogs row — the backfill is own_only-only."""
+    db_path = _make_v24_db(tmp_path)
+    synced_id = -100888000003
+    pending_id = -100888000004
+
+    with sqlite3.connect(db_path) as pre_conn:
+        pre_conn.execute(
+            "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')",
+            (synced_id,),
+        )
+        pre_conn.execute(
+            "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'pending')",
+            (pending_id,),
+        )
+        pre_conn.commit()
+
+    ensure_sync_schema(db_path)
+
+    conn = _open_sync_db(db_path)
+    try:
+        row_synced = conn.execute(
+            "SELECT dialog_id FROM dialogs WHERE dialog_id = ?", (synced_id,)
+        ).fetchone()
+        assert row_synced is None, "non-own_only 'synced' peer must NOT get a thin dialogs row"
+
+        row_pending = conn.execute(
+            "SELECT dialog_id FROM dialogs WHERE dialog_id = ?", (pending_id,)
+        ).fetchone()
+        assert row_pending is None, "non-own_only 'pending' peer must NOT get a thin dialogs row"
     finally:
         conn.close()

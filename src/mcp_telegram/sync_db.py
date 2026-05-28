@@ -7,7 +7,7 @@ from pathlib import Path
 
 from xdg_base_dirs import xdg_state_home  # type: ignore[import-error]
 
-_CURRENT_SCHEMA_VERSION = 24
+_CURRENT_SCHEMA_VERSION = 25
 
 logger = logging.getLogger(__name__)
 
@@ -386,6 +386,31 @@ WHERE entity_id IN (SELECT id FROM entities WHERE type = 'channel')
 """
 
 _DROP_ACTIVITY_CHANNEL_RESOLUTION = "DROP TABLE IF EXISTS activity_channel_resolution"
+
+# ---------------------------------------------------------------------------
+# v25 (Bug #1 orphan own_only fix): one-shot backfill of thin dialogs rows.
+#
+# Phase 53's enroll_activity_dialog wrote only synced_dialogs(status='own_only')
+# + activity_dialog_state, never a dialogs row. Result: ~88 of 192 own_only peers
+# have no dialogs row and surface as raw numeric IDs in get_my_recent_activity.
+#
+# This INSERT...SELECT materialises a thin dialogs row (needs_refresh=1, name NULL)
+# for every own_only peer lacking one. INSERT OR IGNORE is belt-and-suspenders: the
+# WHERE d.dialog_id IS NULL already excludes resolved peers, and OR IGNORE guarantees
+# no clobber of name/type/needs_refresh even under a concurrent enroll. The existing
+# DialogReconciler.run_light_pass (WHERE needs_refresh=1 AND hidden=0) fills
+# name/type/members/created on its hourly cycle — no new resolution machinery.
+# ---------------------------------------------------------------------------
+
+_DIALOGS_V25_BACKFILL_ORPHAN_OWN_ONLY = """
+INSERT OR IGNORE INTO dialogs
+    (dialog_id, needs_refresh, snapshot_at, archived, pinned, hidden,
+     unread_mentions_count, unread_reactions_count)
+SELECT s.dialog_id, 1, strftime('%s','now'), 0, 0, 0, 0, 0
+FROM synced_dialogs s
+LEFT JOIN dialogs d ON d.dialog_id = s.dialog_id
+WHERE s.status = 'own_only' AND d.dialog_id IS NULL
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -934,6 +959,28 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             _DROP_ACTIVITY_CHANNEL_RESOLUTION,
         ],
         ignore_duplicate_column=True,
+    )
+
+    # v25 (Bug #1 orphan own_only fix): one-shot backfill of thin dialogs rows for
+    # the ~88 pre-existing own_only peers that Phase 53 never wrote to dialogs.
+    #
+    # (i)  Pure SQL INSERT...SELECT — no Telethon calls. Each materialised row carries
+    #      needs_refresh=1, name/type NULL; DialogReconciler.run_light_pass then fills
+    #      name/type/members/created on its hourly cycle (the Lazy approach — reuses the
+    #      Phase 43 light-reconciliation path, zero new resolution code).
+    #
+    # (ii) No ignore_duplicate_column: this is an INSERT...SELECT (not ALTER TABLE), so
+    #      the default error-propagating path is correct.
+    #
+    # (iii) FloodWait: ~88 net-new candidates enter the light-pass queue at once. Shipped
+    #      un-capped per operator decision — observe the backfill catch-up logs for a
+    #      sustained burst. The cap/stagger mitigation (needs_refresh tier) is DEFERRED
+    #      to a follow-up only if observation shows it is needed.
+    _migrate(
+        25,
+        [
+            _DIALOGS_V25_BACKFILL_ORPHAN_OWN_ONLY,
+        ],
     )
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)

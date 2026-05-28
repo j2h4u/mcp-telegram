@@ -460,3 +460,52 @@ def _source_of(conn: sqlite3.Connection, dialog_id: int) -> str | None:
         "SELECT source FROM activity_dialog_state WHERE dialog_id = ?", (dialog_id,)
     ).fetchone()
     return row[0] if row else None
+
+
+# ---------------------------------------------------------------------------
+# enroll_activity_dialog: thin dialogs row (needs_refresh=1) — Bug #1 fix
+# ---------------------------------------------------------------------------
+
+def test_enroll_creates_thin_dialogs_row():
+    """enroll_activity_dialog must create a thin dialogs row with needs_refresh=1, hidden=0,
+    name IS NULL for a peer that has no prior dialogs entry."""
+    conn = _make_db()
+    peer_id = -100777000001
+
+    enroll_activity_dialog(conn, peer_id, "supergroup", last_activity_at=1000)
+
+    row = conn.execute(
+        "SELECT needs_refresh, hidden, name FROM dialogs WHERE dialog_id = ?",
+        (peer_id,),
+    ).fetchone()
+    assert row is not None, "enroll_activity_dialog must create a dialogs row"
+    assert row[0] == 1, f"needs_refresh must be 1, got {row[0]!r}"
+    assert row[1] == 0, f"hidden must be 0, got {row[1]!r}"
+    assert row[2] is None, f"name must be NULL until reconciliation fills it, got {row[2]!r}"
+
+
+def test_enroll_does_not_clobber_resolved_dialog():
+    """enroll_activity_dialog must NOT overwrite an already-resolved dialogs row.
+    INSERT OR IGNORE means the existing row (name, type, needs_refresh) is unchanged."""
+    conn = _make_db()
+    peer_id = -100777000002
+
+    # Pre-insert a fully resolved dialogs row
+    conn.execute(
+        "INSERT INTO dialogs (dialog_id, name, type, needs_refresh, snapshot_at,"
+        " archived, pinned, hidden, unread_mentions_count, unread_reactions_count)"
+        " VALUES (?, 'Resolved Chat', 'user', 0, 1700000000, 0, 0, 0, 0, 0)",
+        (peer_id,),
+    )
+    conn.commit()
+
+    enroll_activity_dialog(conn, peer_id, "supergroup", last_activity_at=1000)
+
+    row = conn.execute(
+        "SELECT name, type, needs_refresh FROM dialogs WHERE dialog_id = ?",
+        (peer_id,),
+    ).fetchone()
+    assert row is not None
+    assert row[0] == "Resolved Chat", f"name must not be clobbered, got {row[0]!r}"
+    assert row[1] == "user", f"type must not be clobbered, got {row[1]!r}"
+    assert row[2] == 0, f"needs_refresh must stay 0 (not reset to 1), got {row[2]!r}"

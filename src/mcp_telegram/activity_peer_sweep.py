@@ -32,6 +32,20 @@ from .sync_worker import ExtractedMessage, extract_message_row, insert_messages_
 
 logger = logging.getLogger(__name__)
 
+# Thin dialogs row written alongside the own_only synced_dialogs insert so the
+# peer becomes visible to list_dialogs / get_my_recent_activity. INSERT OR IGNORE
+# is mandatory: it preserves any already-resolved/bootstrap/synced dialogs row and
+# never downgrades name/type/needs_refresh. name/type/members/created stay NULL
+# until DialogReconciler.run_light_pass (WHERE needs_refresh=1 AND hidden=0) fills
+# them on its hourly cycle (Bug #1 lazy fix).
+_INSERT_THIN_DIALOG_SQL = (
+    "INSERT OR IGNORE INTO dialogs"
+    " (dialog_id, needs_refresh, snapshot_at, archived, pinned, hidden,"
+    " unread_mentions_count, unread_reactions_count)"
+    " VALUES (?, 1, ?, 0, 0, 0, 0, 0)"
+)
+
+
 # ---------------------------------------------------------------------------
 # SkipReason: load-bearing enum — ONLY HISTORY_FLOOR authorises cold complete
 # ---------------------------------------------------------------------------
@@ -248,6 +262,7 @@ def enroll_activity_dialog(
             (dialog_id, source, last_activity_at, now, now),
         )
         conn.execute(INSERT_OWN_ONLY_DIALOG_SQL, (dialog_id,))
+        conn.execute(_INSERT_THIN_DIALOG_SQL, (dialog_id, now))
 
 
 # ---------------------------------------------------------------------------
