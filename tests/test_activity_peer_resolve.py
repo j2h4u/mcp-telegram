@@ -399,3 +399,224 @@ def test_linked_chat_resolution_fields():
 def test_entity_detail_ttl_constant():
     assert isinstance(_ENTITY_DETAIL_TTL_SECONDS, int)
     assert _ENTITY_DETAIL_TTL_SECONDS > 0
+
+
+# ---------------------------------------------------------------------------
+# Phase 54 TDD tests: dialogs cache substrate
+# ---------------------------------------------------------------------------
+
+# Task 4: dialogs cache hit does NOT call GetFullChannelRequest
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_resolve_linked_chat_id_dialogs_cache_hit_returns_without_telethon_call():
+    """Pre-resolved channel: resolver returns the dialogs row without any Telethon call."""
+    conn = _make_db()
+    channel_id = -1001234567890
+    expected_linked = -1009876543210
+
+    _write_dialogs_row(
+        conn, channel_id,
+        linked_chat_id=expected_linked,
+        linked_chat_resolved_at=int(time.time()) - 99999,  # deliberately old — no TTL
+    )
+
+    # _FakeClient records all calls; on a cache hit, none should be made
+    client = _FakeClient(input_entity=MagicMock())
+
+    result = await resolve_linked_chat_id(client, conn, channel_id)
+
+    assert result == LinkedChatResolution(
+        linked_chat_id=expected_linked, flood_wait_seconds=None
+    )
+    assert len(client.get_input_entity_calls) == 0, (
+        "get_input_entity must not be called on a dialogs cache hit"
+    )
+    assert len(client.call_calls) == 0, (
+        "GetFullChannelRequest must not be called on a dialogs cache hit"
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolve_linked_chat_id_dialogs_cache_hit_null_linked_chat():
+    """dialogs row with linked_chat_id=NULL and non-NULL resolved_at = definitively no
+    discussion group. Returns linked_chat_id=None, flood_wait_seconds=None with zero
+    Telethon calls."""
+    conn = _make_db()
+    channel_id = -1001234567891
+
+    # NULL linked_chat_id + NOT-NULL resolved_at = "we asked, no linked chat exists"
+    _write_dialogs_row(
+        conn, channel_id,
+        linked_chat_id=None,
+        linked_chat_resolved_at=int(time.time()) - 50,
+    )
+
+    client = _FakeClient(input_entity=MagicMock())
+
+    result = await resolve_linked_chat_id(client, conn, channel_id)
+
+    assert result == LinkedChatResolution(linked_chat_id=None, flood_wait_seconds=None)
+    assert len(client.get_input_entity_calls) == 0, (
+        "get_input_entity must not be called on a dialogs cache hit"
+    )
+    assert len(client.call_calls) == 0, (
+        "GetFullChannelRequest must not be called on a dialogs cache hit"
+    )
+
+
+# Task 5: cold path UPSERTs into dialogs and does not pollute detail_json
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_resolve_linked_chat_id_cold_path_upserts_dialogs():
+    """Cold path (no dialogs row): live fetch UPSERTs into dialogs; linked_chat_id
+    absent from entity_details.detail_json; sibling fields present in detail_json."""
+    conn = _make_db()
+    channel_id = -1001111111111
+    raw_linked = 2222222222  # positive bare id → resolver normalises to -1002222222222
+
+    full_result = _fake_full_channel_result(
+        linked_chat_id=raw_linked,
+        participants_count=5000,
+        about="Test channel about",
+        pinned_msg_id=42,
+    )
+    # No chats list → no title/username lookup for entities row
+    full_result.chats = []
+
+    client = _FakeClient(input_entity=MagicMock(), full_channel_result=full_result)
+
+    before_call = int(time.time())
+    result = await resolve_linked_chat_id(client, conn, channel_id)
+    after_call = int(time.time())
+
+    # Return value
+    assert result.linked_chat_id == -1002222222222
+    assert result.flood_wait_seconds is None
+
+    # dialogs row was UPSERTed
+    dr = _read_dialogs_row(conn, channel_id)
+    assert dr is not None, "dialogs row must be created by cold-path UPSERT"
+    assert dr["linked_chat_id"] == -1002222222222
+    assert dr["linked_chat_resolved_at"] is not None
+    assert before_call <= dr["linked_chat_resolved_at"] <= after_call + 1, (
+        f"resolved_at={dr['linked_chat_resolved_at']} not within 5s of now"
+    )
+
+    # Resolver only owns the two linked-chat columns — other columns at defaults
+    assert dr["name"] is None, "resolver must not write name into dialogs"
+    assert dr["type"] is None, "resolver must not write type into dialogs"
+    assert dr["hidden"] == 0, "resolver must not write hidden into dialogs"
+
+    # entity_details: sibling fields present, linked_chat_id absent
+    ed = _read_entity_details(conn, channel_id)
+    assert ed is not None
+    assert "linked_chat_id" not in ed, (
+        "linked_chat_id must NOT appear in entity_details (Phase 54 contract)"
+    )
+    assert "subscribers_count" in ed
+    assert "about" in ed
+    assert "pinned_msg_id" in ed
+
+    # Second call: dialogs cache now hot — zero further GetFullChannelRequest calls
+    call_count_before = len(client.call_calls)
+    result2 = await resolve_linked_chat_id(client, conn, channel_id)
+    assert result2 == result
+    assert len(client.call_calls) == call_count_before, (
+        "Second call must use dialogs cache — no further GetFullChannelRequest"
+    )
+
+
+# Task 6: schema-floor assertion raises RuntimeError on sub-v24 connections
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_resolve_linked_chat_id_schema_floor_raises_on_v23():
+    """A connection with schema_version < 24 raises RuntimeError with a greppable message."""
+    import sqlite3 as _sqlite3
+
+    raw_conn = _sqlite3.connect(":memory:")
+    # Create schema_version table and insert a sub-v24 version
+    raw_conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL, applied_at INTEGER NOT NULL)")
+    raw_conn.execute("INSERT INTO schema_version VALUES (23, 1000000)")
+    raw_conn.commit()
+
+    # The assertion fires before any Telethon call — client is never touched
+    client = _FakeClient(input_entity=MagicMock())
+
+    with pytest.raises(RuntimeError, match=r"requires schema v24\+"):
+        await resolve_linked_chat_id(client, raw_conn, -1004444444444)
+
+    # Confirm client was never touched
+    assert len(client.get_input_entity_calls) == 0
+    assert len(client.call_calls) == 0
+
+
+@pytest.mark.asyncio
+async def test_resolve_linked_chat_id_schema_floor_passes_on_v24():
+    """A connection migrated to v24 via _apply_migrations does NOT raise RuntimeError."""
+    conn = _make_db()  # _apply_migrations → schema_version includes v24
+
+    channel_id = -1005555555555
+    # Seed a resolved dialogs row so the resolver returns without a Telethon call
+    _write_dialogs_row(
+        conn, channel_id,
+        linked_chat_id=-1006666666666,
+        linked_chat_resolved_at=int(time.time()),
+    )
+
+    client = _FakeClient(input_entity=MagicMock())
+
+    # Must not raise
+    result = await resolve_linked_chat_id(client, conn, channel_id)
+    assert result.linked_chat_id == -1006666666666
+    assert result.flood_wait_seconds is None
+
+
+# Task 7: FloodWait leaves dialogs untouched (retry signal preserved)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_resolve_linked_chat_id_flood_wait_leaves_dialogs_untouched():
+    """FloodWaitError must NOT touch dialogs; resolved_at stays NULL so the next
+    sweep pass retries naturally (D-08 contract)."""
+    from telethon.errors import FloodWaitError
+
+    conn = _make_db()
+    channel_id = -1003333333333
+
+    # Seed a dialogs row in "never asked" state (NULL, NULL)
+    _write_dialogs_row(
+        conn, channel_id,
+        linked_chat_id=None,
+        linked_chat_resolved_at=None,
+    )
+
+    flood_error = FloodWaitError(request=None, capture=42)
+    client = _FakeClient(
+        input_entity=MagicMock(),
+        full_channel_error=flood_error,
+    )
+
+    result = await resolve_linked_chat_id(client, conn, channel_id)
+
+    # Return value
+    assert result.linked_chat_id is None
+    assert result.flood_wait_seconds == 42
+
+    # dialogs row UNCHANGED — resolved_at still NULL (the retry signal)
+    dr = _read_dialogs_row(conn, channel_id)
+    assert dr is not None
+    assert dr["linked_chat_id"] is None, (
+        "FloodWait must NOT write linked_chat_id into dialogs"
+    )
+    assert dr["linked_chat_resolved_at"] is None, (
+        "FloodWait must NOT set resolved_at — NULL IS the retry signal (D-08)"
+    )
+
+    # No additional rows inserted
+    row_count = conn.execute(
+        "SELECT COUNT(*) FROM dialogs WHERE dialog_id = ?", (channel_id,)
+    ).fetchone()[0]
+    assert row_count == 1, "exactly one dialogs row for this channel"
