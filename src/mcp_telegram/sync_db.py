@@ -7,7 +7,7 @@ from pathlib import Path
 
 from xdg_base_dirs import xdg_state_home  # type: ignore[import-error]
 
-_CURRENT_SCHEMA_VERSION = 25
+_CURRENT_SCHEMA_VERSION = 26
 
 logger = logging.getLogger(__name__)
 
@@ -980,6 +980,45 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
         25,
         [
             _DIALOGS_V25_BACKFILL_ORPHAN_OWN_ONLY,
+        ],
+    )
+
+    # v26 (forward-source marked-id normalisation): store message_forwards.fwd_from_peer_id
+    # as a MARKED id (-100… channel, -id legacy chat, +id user) — same convention as
+    # dialogs.dialog_id / entities.id — so the column is JOINable and unambiguous about peer
+    # kind. The write path now emits marked ids; this migrates pre-existing bare rows.
+    #
+    # Pure SQL, no Telethon calls: a bare positive int alone cannot reveal peer kind, so we
+    # only remark rows whose marked form is a peer we already know locally (present in
+    # `dialogs`). Known users keep bare == marked (no row touched). Forwards from channels we
+    # are NOT a member of stay bare here and are re-derived by a separate one-shot re-scan
+    # that reads the message's typed from_id (network, FloodWait-aware) — deliberately kept
+    # out of startup migration.
+    #
+    # Order matters: the channel UPDATE turns matched rows negative; the chat UPDATE then
+    # only sees still-positive rows. No row can match both (distinct dialog_ids).
+    _migrate(
+        26,
+        [
+            # Defensive no-op in real DBs (message_forwards exists since v7); guarantees the
+            # table is present so the UPDATEs below never hit "no such table" on partial DBs.
+            """CREATE TABLE IF NOT EXISTS message_forwards (
+    dialog_id        INTEGER NOT NULL,
+    message_id       INTEGER NOT NULL,
+    fwd_from_peer_id INTEGER,
+    fwd_from_name    TEXT,
+    fwd_date         INTEGER,
+    fwd_channel_post INTEGER,
+    PRIMARY KEY (dialog_id, message_id)
+) WITHOUT ROWID""",
+            # channel/supergroup: bare -> -1000000000000 - bare when that marked id is a known dialog
+            "UPDATE message_forwards SET fwd_from_peer_id = -1000000000000 - fwd_from_peer_id "
+            "WHERE fwd_from_peer_id > 0 AND EXISTS (SELECT 1 FROM dialogs d "
+            "WHERE d.dialog_id = -1000000000000 - message_forwards.fwd_from_peer_id)",
+            # legacy chat: bare -> -bare when -bare is a known dialog
+            "UPDATE message_forwards SET fwd_from_peer_id = -fwd_from_peer_id "
+            "WHERE fwd_from_peer_id > 0 AND EXISTS (SELECT 1 FROM dialogs d "
+            "WHERE d.dialog_id = -message_forwards.fwd_from_peer_id)",
         ],
     )
 

@@ -1451,7 +1451,7 @@ def test_extract_fwd_row() -> None:
     assert result is not None
     assert result.dialog_id == 1
     assert result.message_id == 100
-    assert result.fwd_from_peer_id == 99999  # channel_id
+    assert result.fwd_from_peer_id == -1000000000000 - 99999  # marked channel id
     assert result.fwd_from_name == "Test Channel"
     assert result.fwd_date == int(fwd_date.timestamp())
     assert result.fwd_channel_post == 42
@@ -1929,8 +1929,8 @@ async def test_resolve_peer_name_uncacheable_logs_marked_id_without_raising(
 
 
 @pytest.mark.asyncio
-async def test_build_fwd_entity_map_resolves_channel_keyed_by_bare_id() -> None:
-    """End-to-end: channel forward resolves via typed Peer; map keyed by bare id."""
+async def test_build_fwd_entity_map_resolves_channel_keyed_by_marked_id() -> None:
+    """End-to-end: channel forward resolves via typed Peer; map keyed by marked id."""
     from telethon.tl import types
 
     from mcp_telegram.sync_worker import _build_fwd_entity_map
@@ -1945,5 +1945,22 @@ async def test_build_fwd_entity_map_resolves_channel_keyed_by_bare_id() -> None:
 
     # Resolution used the typed Peer...
     assert isinstance(client.get_entity.await_args.args[0], types.PeerChannel)
-    # ...but the map key stays the bare id (stable storage/lookup contract).
-    assert result == {1579759981: "Private meme collection"}
+    # ...and the map key is the MARKED id (JOINable, kind-unambiguous storage contract).
+    assert result == {-1001579759981: "Private meme collection"}
+
+
+def test_marked_peer_id_matches_telethon_convention() -> None:
+    """_marked_peer_id mirrors telethon.utils.get_peer_id for every Peer kind."""
+    from telethon import utils as tl_utils
+    from telethon.tl import types
+
+    from mcp_telegram.sync_worker import _marked_peer_id
+
+    cases = [
+        types.PeerChannel(channel_id=1579759981),
+        types.PeerChat(chat_id=4276001234),
+        types.PeerUser(user_id=429356),
+    ]
+    for peer in cases:
+        assert _marked_peer_id(peer) == tl_utils.get_peer_id(peer)
+    assert _marked_peer_id(SimpleNamespace(channel_id=None, chat_id=None, user_id=None)) is None

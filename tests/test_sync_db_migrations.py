@@ -324,7 +324,7 @@ def test_schema_version_records_current_v18(tmp_path: Path) -> None:
             "SELECT MAX(version) FROM schema_version"
         ).fetchone()[0]
         assert max_version == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 25  # Phase 55 (Bug #1 orphan own_only fix) — flips when next migration ships
+        assert _CURRENT_SCHEMA_VERSION == 26  # v26 fwd_from_peer_id marked-id normalisation — flips when next migration ships
     finally:
         conn.close()
 
@@ -1092,20 +1092,75 @@ def _make_v24_db(tmp_path: Path) -> Path:
                 access_lost_at INTEGER
             )"""
         )
+        # Minimal message_forwards table (exists since v7 in real DBs; v26 UPDATEs it)
+        conn.execute(
+            """CREATE TABLE message_forwards (
+                dialog_id        INTEGER NOT NULL,
+                message_id       INTEGER NOT NULL,
+                fwd_from_peer_id INTEGER,
+                fwd_from_name    TEXT,
+                fwd_date         INTEGER,
+                fwd_channel_post INTEGER,
+                PRIMARY KEY (dialog_id, message_id)
+            )"""
+        )
         conn.execute("INSERT INTO schema_version VALUES (24, 1700000000)")
         conn.commit()
     return db_path
 
 
-def test_migration_v25_schema_version(tmp_path: Path) -> None:
-    """After v25 migration, MAX(schema_version) == 25 == _CURRENT_SCHEMA_VERSION."""
+def test_migration_schema_version_is_current(tmp_path: Path) -> None:
+    """After all migrations, MAX(schema_version) == _CURRENT_SCHEMA_VERSION (26)."""
     db_path = _make_v24_db(tmp_path)
     ensure_sync_schema(db_path)
     conn = _open_sync_db(db_path)
     try:
         row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
-        assert row[0] == 25, f"expected schema version 25, got {row[0]}"
-        assert _CURRENT_SCHEMA_VERSION == 25
+        assert row[0] == _CURRENT_SCHEMA_VERSION, f"expected {_CURRENT_SCHEMA_VERSION}, got {row[0]}"
+        assert _CURRENT_SCHEMA_VERSION == 26
+    finally:
+        conn.close()
+
+
+def test_migration_v26_remarks_known_channel_and_chat_forwards(tmp_path: Path) -> None:
+    """v26: bare fwd_from_peer_id is remarked to the marked id only when that marked id is a
+    known local dialog. Known users (bare == marked) and already-marked rows are untouched."""
+    db_path = _make_v24_db(tmp_path)
+    known_channel = -1001579759981  # marked; bare source = 1579759981
+    known_chat = -4276001234  # marked legacy chat; bare source = 4276001234
+    with sqlite3.connect(db_path) as pre:
+        for did in (known_channel, known_chat):
+            pre.execute("INSERT INTO dialogs (dialog_id) VALUES (?)", (did,))
+        rows = [
+            # (message_id, fwd_from_peer_id) — channel, chat, user, already-marked, null
+            (1, 1579759981),   # -> known channel marked
+            (2, 4276001234),   # -> known legacy chat marked
+            (3, 429356),       # known user (not a dialog) -> stays bare
+            (4, known_channel),  # already marked -> untouched (guard: >0)
+            (5, None),         # null -> untouched
+        ]
+        for mid, peer in rows:
+            pre.execute(
+                "INSERT INTO message_forwards (dialog_id, message_id, fwd_from_peer_id) VALUES (?,?,?)",
+                (100, mid, peer),
+            )
+        pre.commit()
+
+    ensure_sync_schema(db_path)
+
+    conn = _open_sync_db(db_path)
+    try:
+        got = {
+            mid: peer
+            for mid, peer in conn.execute(
+                "SELECT message_id, fwd_from_peer_id FROM message_forwards WHERE dialog_id = 100"
+            )
+        }
+        assert got[1] == known_channel, f"known channel must be remarked, got {got[1]}"
+        assert got[2] == known_chat, f"known chat must be remarked, got {got[2]}"
+        assert got[3] == 429356, f"unknown user-shaped peer must stay bare, got {got[3]}"
+        assert got[4] == known_channel, f"already-marked row must be untouched, got {got[4]}"
+        assert got[5] is None, f"null peer must stay null, got {got[5]}"
     finally:
         conn.close()
 

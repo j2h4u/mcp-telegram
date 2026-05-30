@@ -429,17 +429,28 @@ def extract_entity_rows(dialog_id: int, message_id: int, msg: Any) -> list[Entit
     return rows
 
 
-def _flatten_peer_id(from_id: Any) -> int | None:
-    """Bare numeric id from a Telethon Peer (PeerUser/PeerChannel/PeerChat).
+def _marked_peer_id(from_id: Any) -> int | None:
+    """Marked id from a Telethon Peer (PeerUser/PeerChannel/PeerChat).
 
-    Returns the *unmarked* id (e.g. 1579759981 for a channel) — used as a stable
-    map key and stored value. NOTE: this is type-erased; for entity resolution
-    pass the original Peer object, not this int (see _resolve_peer_name).
+    Returns the *marked* id (e.g. -1001579759981 for a channel, -id for a legacy
+    chat, +id for a user) — the same convention as ``dialogs.dialog_id`` /
+    ``entities.id``, so the stored value is JOINable across the schema. Mirrors
+    ``telethon.utils.get_peer_id`` but is duck-typed: it reads channel_id/chat_id/
+    user_id attributes directly, so it also works on test doubles.
+
+    NOTE: the marked id still encodes the kind, but for entity *resolution* pass
+    the original Peer object, not this int (see _resolve_peer_name): get_entity
+    treats a bare int as a user_id regardless of sign-stripping.
     """
-    for attr in ("user_id", "channel_id", "chat_id"):
-        pid = getattr(from_id, attr, None)
-        if pid is not None:
-            return int(pid)
+    channel_id = getattr(from_id, "channel_id", None)
+    if channel_id is not None:
+        return -1000000000000 - int(channel_id)
+    chat_id = getattr(from_id, "chat_id", None)
+    if chat_id is not None:
+        return -int(chat_id)
+    user_id = getattr(from_id, "user_id", None)
+    if user_id is not None:
+        return int(user_id)
     return None
 
 
@@ -504,10 +515,10 @@ async def _build_fwd_entity_map(msg: Any, client: Any) -> dict[int, str]:
     from_id = getattr(fwd, "from_id", None)
     if from_id is None:
         return {}
-    peer_id = _flatten_peer_id(from_id)
+    peer_id = _marked_peer_id(from_id)
     if peer_id is None:
         return {}
-    # Resolve with the typed Peer (preserves channel/chat kind); key by bare id.
+    # Resolve with the typed Peer (preserves channel/chat kind); key by marked id.
     name = await _resolve_peer_name(client, from_id)
     return {peer_id: name} if name else {}
 
@@ -530,7 +541,7 @@ def extract_fwd_row(
     if fwd is None:
         return None
     from_id = getattr(fwd, "from_id", None)
-    fwd_from_peer_id = _flatten_peer_id(from_id) if from_id is not None else None
+    fwd_from_peer_id = _marked_peer_id(from_id) if from_id is not None else None
     fwd_from_name = getattr(fwd, "from_name", None)
     if fwd_from_name is None and fwd_from_peer_id is not None and entity_name_map:
         fwd_from_name = entity_name_map.get(fwd_from_peer_id)
@@ -814,13 +825,13 @@ class FullSyncWorker:
         # Telegram includes users/chats for forward sources in the same
         # GetHistory response, so get_entity() hits the local cache — no
         # extra API round-trips in the common case.
-        fwd_peers: dict[int, Any] = {}  # bare peer_id -> typed from_id Peer
+        fwd_peers: dict[int, Any] = {}  # marked peer_id -> typed from_id Peer
         for msg in batch:
             fwd = getattr(msg, "fwd_from", None)
             if fwd and getattr(fwd, "from_name", None) is None:
                 from_id = getattr(fwd, "from_id", None)
                 if from_id is not None:
-                    pid = _flatten_peer_id(from_id)
+                    pid = _marked_peer_id(from_id)
                     if pid is not None:
                         fwd_peers.setdefault(pid, from_id)
         entity_name_map: dict[int, str] = {}
