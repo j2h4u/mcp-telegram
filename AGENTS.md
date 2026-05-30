@@ -44,6 +44,15 @@ writer; MCP serving code uses daemon APIs and read-only DB access for lightweigh
 - `telegram.py` — TelegramClient factory and auth flows
 - `__init__.py` — CLI entrypoint: `run`, `logout`, `sync`, `serve`, `feedback`
 
+### Dialog & Own-Message Substrate
+- `dialog_sync.py` — dialog snapshot synchronisation: bootstrap sweep + (Phase 43) reconciliation
+- `activity_sync.py` — global own-message archive worker
+- `activity_hot_sweep.py` — Tier A `HotSweep`: hourly incremental per-peer self-search scheduler
+- `activity_cold_backfill.py` — Tier B `ColdBackfill`: full-history low-priority per-peer self-search scheduler
+- `activity_peer_sweep.py` — shared substrate for per-peer self-search sweeps and working-set enrollment
+- `activity_peer_resolve.py` — low-level peer and linked-chat resolution primitives (`GetFullChannelRequest`)
+- `flood.py` — shared FloodWait helpers
+
 ### Shared Utilities
 - `models.py` — TypedDict schemas, dataclasses (`StoredMessage`, `ReadMessage`)
 - `budget.py` — message budget allocation for tool responses
