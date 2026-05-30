@@ -2,7 +2,7 @@
 FROM python:3.14-slim AS builder
 
 # uv from official image — no curl or shell pipe
-COPY --from=ghcr.io/astral-sh/uv:0.10.9 /uv /usr/local/bin/uv
+COPY --from=ghcr.io/astral-sh/uv:0.11.17 /uv /usr/local/bin/uv
 
 # --- Dependency layer (cached when lock files unchanged) ---
 COPY pyproject.toml uv.lock /src/mcp-telegram/
