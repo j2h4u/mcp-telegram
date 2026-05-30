@@ -1867,3 +1867,83 @@ def test_insert_messages_with_fts_edit_idempotency_forwards(sync_db: sqlite3.Con
         (dialog_id, message_id),
     ).fetchone()[0]
     assert fwd_after == 0, "Forward row must be cleared when re-inserted without forward"
+
+
+# ---------------------------------------------------------------------------
+# Forward-source peer resolution — type preservation (regression)
+# ---------------------------------------------------------------------------
+# A channel forward-source arrives as PeerChannel(channel_id=N). Flattening it
+# to the bare positive int N and calling get_entity(N) makes Telethon treat N as
+# a *user_id* → "Could not find the input entity for PeerUser(user_id=N)". The
+# resolver must receive the typed Peer so the channel/chat kind survives.
+
+from telethon.tl.types import PeerChannel as _PeerChannel  # noqa: E402
+from telethon.tl.types import PeerUser as _PeerUser  # noqa: E402
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "peer",
+    [
+        _PeerChannel(channel_id=1579759981),
+        _PeerUser(user_id=429356),
+    ],
+    ids=["channel", "user"],
+)
+async def test_resolve_peer_name_passes_typed_peer_to_get_entity(peer: Any) -> None:
+    """get_entity receives the typed Peer object, never a type-erased bare int."""
+    from mcp_telegram.sync_worker import _resolve_peer_name
+
+    client = MagicMock()
+    client.get_entity = AsyncMock(return_value=SimpleNamespace(title="Private meme collection"))
+
+    name = await _resolve_peer_name(client, peer)
+
+    assert name == "Private meme collection"
+    passed = client.get_entity.await_args.args[0]
+    assert passed is peer, "resolver must hand get_entity the typed Peer, not a bare int"
+
+
+@pytest.mark.asyncio
+async def test_resolve_peer_name_uncacheable_logs_marked_id_without_raising(
+    caplog: Any,
+) -> None:
+    """ValueError → single warning with the marked id, returns None, no stacktrace/raise."""
+    import logging
+
+    from telethon.tl import types
+
+    from mcp_telegram.sync_worker import _resolve_peer_name
+
+    peer = types.PeerChannel(channel_id=1579759981)
+    client = MagicMock()
+    client.get_entity = AsyncMock(side_effect=ValueError("Could not find the input entity"))
+
+    with caplog.at_level(logging.WARNING):
+        name = await _resolve_peer_name(client, peer)
+
+    assert name is None
+    assert "resolve_peer_name_uncacheable" in caplog.text
+    # Marked channel id proves type-aware logging (a channel, not a phantom user).
+    assert "-1001579759981" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_build_fwd_entity_map_resolves_channel_keyed_by_bare_id() -> None:
+    """End-to-end: channel forward resolves via typed Peer; map keyed by bare id."""
+    from telethon.tl import types
+
+    from mcp_telegram.sync_worker import _build_fwd_entity_map
+
+    peer = types.PeerChannel(channel_id=1579759981)
+    fwd = SimpleNamespace(from_id=peer, from_name=None, date=None, channel_post=None)
+    msg = SimpleNamespace(fwd_from=fwd)
+    client = MagicMock()
+    client.get_entity = AsyncMock(return_value=SimpleNamespace(title="Private meme collection"))
+
+    result = await _build_fwd_entity_map(msg, client)
+
+    # Resolution used the typed Peer...
+    assert isinstance(client.get_entity.await_args.args[0], types.PeerChannel)
+    # ...but the map key stays the bare id (stable storage/lookup contract).
+    assert result == {1579759981: "Private meme collection"}

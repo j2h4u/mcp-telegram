@@ -36,6 +36,7 @@ from telethon.errors import (  # type: ignore[import-untyped]
     UserDeactivatedError,
     UserPrivacyRestrictedError,
 )
+from telethon import utils as tl_utils  # type: ignore[import-untyped]
 from telethon.tl import types  # type: ignore[import-untyped]
 
 from .dialog_sync import _ACCESS_LOST_ERRORS, _set_access_lost
@@ -428,25 +429,45 @@ def extract_entity_rows(dialog_id: int, message_id: int, msg: Any) -> list[Entit
     return rows
 
 
-async def _resolve_peer_name(client: Any, peer_id: int) -> str | None:
+def _flatten_peer_id(from_id: Any) -> int | None:
+    """Bare numeric id from a Telethon Peer (PeerUser/PeerChannel/PeerChat).
+
+    Returns the *unmarked* id (e.g. 1579759981 for a channel) — used as a stable
+    map key and stored value. NOTE: this is type-erased; for entity resolution
+    pass the original Peer object, not this int (see _resolve_peer_name).
+    """
+    for attr in ("user_id", "channel_id", "chat_id"):
+        pid = getattr(from_id, attr, None)
+        if pid is not None:
+            return int(pid)
+    return None
+
+
+async def _resolve_peer_name(client: Any, peer: Any) -> str | None:
     """Return display name for a Telegram peer.
+
+    `peer` must be a Telethon Peer (PeerUser/PeerChannel/PeerChat), NOT a bare
+    int: get_entity treats a bare positive id as a user_id, so a channel/chat id
+    would be mis-resolved as a non-existent user and raise. Passing the typed
+    Peer preserves the entity kind so the session cache lookup succeeds.
 
     Tries Telethon's session cache first; falls back to an API call when the
     entity is not cached. Returns None when the peer is permanently inaccessible
     (private/deleted/banned account, unknown ID).
     """
+    log_id = tl_utils.get_peer_id(peer)
     try:
-        entity = await client.get_entity(peer_id)
+        entity = await client.get_entity(peer)
         name = getattr(entity, "title", None) or getattr(entity, "first_name", None) or ""
         last = getattr(entity, "last_name", None)
         if last:
             name = f"{name} {last}".strip()
         return name or None
     except FloodWaitError as e:
-        logger.warning("resolve_peer_name_flood_wait peer_id=%d retry_after=%ds", peer_id, e.seconds)
+        logger.warning("resolve_peer_name_flood_wait peer_id=%d retry_after=%ds", log_id, e.seconds)
         return None
     except PeerFloodError:
-        logger.warning("resolve_peer_name_peer_flood peer_id=%d", peer_id)
+        logger.warning("resolve_peer_name_peer_flood peer_id=%d", log_id)
         return None
     except (
         ChannelPrivateError,
@@ -456,10 +477,18 @@ async def _resolve_peer_name(client: Any, peer_id: int) -> str | None:
         UserDeactivatedError,
         UserPrivacyRestrictedError,
     ):
-        logger.debug("resolve_peer_name_inaccessible peer_id=%d", peer_id)
+        logger.debug("resolve_peer_name_inaccessible peer_id=%d", log_id)
+        return None
+    except ValueError:
+        # Telethon could not build an InputPeer: the typed peer is not in the
+        # session cache and carries no usable access_hash (a stranger whose User
+        # object never arrived in a processed response). The request never
+        # reaches Telegram, so there is no finer server-side reason. Expected for
+        # forwards from un-cached authors — record the fact, no stacktrace.
+        logger.warning("resolve_peer_name_uncacheable peer_id=%d", log_id)
         return None
     except Exception:
-        logger.warning("resolve_peer_name_unexpected peer_id=%d", peer_id, exc_info=True)
+        logger.warning("resolve_peer_name_unexpected peer_id=%d", log_id, exc_info=True)
         return None
 
 
@@ -475,15 +504,11 @@ async def _build_fwd_entity_map(msg: Any, client: Any) -> dict[int, str]:
     from_id = getattr(fwd, "from_id", None)
     if from_id is None:
         return {}
-    peer_id: int | None = None
-    for attr in ("user_id", "channel_id", "chat_id"):
-        pid = getattr(from_id, attr, None)
-        if pid is not None:
-            peer_id = int(pid)
-            break
+    peer_id = _flatten_peer_id(from_id)
     if peer_id is None:
         return {}
-    name = await _resolve_peer_name(client, peer_id)
+    # Resolve with the typed Peer (preserves channel/chat kind); key by bare id.
+    name = await _resolve_peer_name(client, from_id)
     return {peer_id: name} if name else {}
 
 
@@ -505,13 +530,7 @@ def extract_fwd_row(
     if fwd is None:
         return None
     from_id = getattr(fwd, "from_id", None)
-    fwd_from_peer_id: int | None = None
-    if from_id is not None:
-        for attr in ("user_id", "channel_id", "chat_id"):
-            pid = getattr(from_id, attr, None)
-            if pid is not None:
-                fwd_from_peer_id = int(pid)
-                break
+    fwd_from_peer_id = _flatten_peer_id(from_id) if from_id is not None else None
     fwd_from_name = getattr(fwd, "from_name", None)
     if fwd_from_name is None and fwd_from_peer_id is not None and entity_name_map:
         fwd_from_name = entity_name_map.get(fwd_from_peer_id)
@@ -795,20 +814,18 @@ class FullSyncWorker:
         # Telegram includes users/chats for forward sources in the same
         # GetHistory response, so get_entity() hits the local cache — no
         # extra API round-trips in the common case.
-        fwd_peer_ids: set[int] = set()
+        fwd_peers: dict[int, Any] = {}  # bare peer_id -> typed from_id Peer
         for msg in batch:
             fwd = getattr(msg, "fwd_from", None)
             if fwd and getattr(fwd, "from_name", None) is None:
                 from_id = getattr(fwd, "from_id", None)
                 if from_id is not None:
-                    for attr in ("user_id", "channel_id", "chat_id"):
-                        pid = getattr(from_id, attr, None)
-                        if pid is not None:
-                            fwd_peer_ids.add(int(pid))
-                            break
+                    pid = _flatten_peer_id(from_id)
+                    if pid is not None:
+                        fwd_peers.setdefault(pid, from_id)
         entity_name_map: dict[int, str] = {}
-        for peer_id in fwd_peer_ids:
-            name = await _resolve_peer_name(self._client, peer_id)
+        for peer_id, from_id in fwd_peers.items():
+            name = await _resolve_peer_name(self._client, from_id)
             if name:
                 entity_name_map[peer_id] = name
 
