@@ -426,6 +426,9 @@ async def sync_main() -> None:
     # "connection refused" while Telegram is connecting.
     api_server = DaemonAPIServer(conn, client, shutdown_event, feedback_conn)
     socket_path = get_daemon_socket_path()
+    # Ensure the runtime/state dir exists before binding — do not assume a prior
+    # get_sync_db_path() call (or a Docker volume mount) already created it.
+    socket_path.parent.mkdir(parents=True, exist_ok=True)
     socket_path.unlink(missing_ok=True)
     old_umask = os.umask(0o177)
     try:
