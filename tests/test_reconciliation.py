@@ -433,19 +433,27 @@ async def test_run_reconciliation_loop_runs_full_pass_first(
     sync_db: sqlite3.Connection,
     mock_client: MagicMock,
 ) -> None:
-    # Empty dialogs table; iter_dialogs yields nothing.
-    mock_client.iter_dialogs = MagicMock(return_value=_async_iter([]))
+    # Empty dialogs table; iter_dialogs yields nothing but signals when the full
+    # pass actually invokes it — so the test waits on that event instead of racing
+    # a fixed sleep (which flaked on slow CI runners).
+    iter_called = asyncio.Event()
+
+    def _iter_dialogs(*args, **kwargs):
+        iter_called.set()
+        return _async_iter([])
+
+    mock_client.iter_dialogs = MagicMock(side_effect=_iter_dialogs)
 
     event = asyncio.Event()
 
-    # Run the loop briefly: short hourly interval + shutdown after one cycle.
+    # Run the loop; short hourly interval so the first full pass fires promptly.
     task = asyncio.create_task(
         run_reconciliation_loop(
             mock_client, sync_db, event,
             hourly_interval=0.01, daily_interval=86400.0,
         )
     )
-    await asyncio.sleep(0.05)
+    await asyncio.wait_for(iter_called.wait(), timeout=2.0)
     event.set()
     await asyncio.wait_for(task, timeout=1.0)
 
