@@ -1252,10 +1252,10 @@ async def test_linked_chat_refresh_updates_dialogs(
     - needs_refresh = 1 was also written (original branch still runs).
     """
     import time
-
-    from telethon.tl.types import UpdateChannel  # type: ignore[import-untyped]
-    from telethon.tl.functions.channels import GetFullChannelRequest  # type: ignore[import-untyped]
     from types import SimpleNamespace
+
+    from telethon.tl.functions.channels import GetFullChannelRequest  # type: ignore[import-untyped]
+    from telethon.tl.types import UpdateChannel  # type: ignore[import-untyped]
 
     dialog_id = -1004444444444
     channel_id = 4444444444  # positive form Telegram sends
@@ -1368,9 +1368,10 @@ async def test_linked_chat_refresh_flood_no_op(
     - linked_chat_id and linked_chat_resolved_at are unchanged (no write on FloodWait).
     - needs_refresh = 1 was still written by the original branch.
     """
+    from types import SimpleNamespace
+
     from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
     from telethon.tl.types import UpdateChannel  # type: ignore[import-untyped]
-    from types import SimpleNamespace
 
     dialog_id = -1009999999999
     channel_id = 9999999999

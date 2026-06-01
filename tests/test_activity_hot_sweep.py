@@ -22,9 +22,6 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import time
-from dataclasses import dataclass, field
-from typing import Any
-from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -37,7 +34,6 @@ from mcp_telegram.activity_peer_sweep import (
     enroll_activity_dialog,
 )
 from mcp_telegram.sync_db import _apply_migrations
-
 
 # ---------------------------------------------------------------------------
 # DB and enrollment helpers

@@ -16,13 +16,11 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import time
-from typing import Any
 
 import pytest
 
 from mcp_telegram.activity_cold_backfill import (
     ColdPassOutcome,
-    ColdPassResult,
     run_cold_backfill_pass,
 )
 from mcp_telegram.activity_peer_sweep import (
@@ -33,7 +31,6 @@ from mcp_telegram.activity_peer_sweep import (
     enroll_activity_dialog,
 )
 from mcp_telegram.sync_db import _apply_migrations
-
 
 # ---------------------------------------------------------------------------
 # DB helpers

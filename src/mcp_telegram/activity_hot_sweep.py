@@ -211,7 +211,6 @@ async def run_hot_sweep_loop(
     while not shutdown_event.is_set():
         logger.info("activity_hot_sweep_loop_start")
         try:
-            peers_selected_approx = 0
             written = await run_hot_sweep_pass(client, conn, shutdown_event)
             logger.info(
                 "activity_hot_sweep_loop_done total_written=%d", written

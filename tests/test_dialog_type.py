@@ -12,7 +12,6 @@ import pytest
 
 from mcp_telegram.models import DialogType
 
-
 # --- parse(): trap-aware string parsing -------------------------------------
 
 @pytest.mark.parametrize(

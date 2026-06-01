@@ -11,7 +11,6 @@ from mcp_telegram.flood import (
     sleep_through_flood,
 )
 
-
 # ---------------------------------------------------------------------------
 # flood_seconds
 # ---------------------------------------------------------------------------
@@ -75,8 +74,9 @@ async def test_sleep_through_flood_wakes_early_when_event_set_mid_wait() -> None
         await asyncio.sleep(0.01)
         event.set()
 
-    asyncio.create_task(signal_soon())
+    signal_task = asyncio.create_task(signal_soon())
     # 5s nominal wait, but the event fires at ~10ms — must return True well
     # before the timeout, proving the wait is interruptible.
     result = await asyncio.wait_for(sleep_through_flood(event, 5), timeout=1.0)
     assert result is True
+    await signal_task  # keep a reference and let the helper task finish cleanly

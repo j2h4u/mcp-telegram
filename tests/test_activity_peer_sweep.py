@@ -20,9 +20,8 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import time
-from dataclasses import dataclass
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -35,10 +34,8 @@ from mcp_telegram.activity_peer_sweep import (
     _save_dialog_state,
     build_working_set,
     enroll_activity_dialog,
-    sweep_peer_once,
 )
 from mcp_telegram.sync_db import _apply_migrations
-
 
 # ---------------------------------------------------------------------------
 # Helpers

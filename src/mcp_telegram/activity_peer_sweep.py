@@ -298,7 +298,7 @@ def _load_dialog_state(conn: sqlite3.Connection, dialog_id: int) -> dict:
         "hot_cursor", "hot_last_sync_at", "hot_next_retry_at", "hot_last_error",
         "cold_offset_id", "cold_status", "cold_next_retry_at", "cold_last_error",
     ]
-    return dict(zip(keys, row))
+    return dict(zip(keys, row, strict=True))
 
 
 def _save_dialog_state(

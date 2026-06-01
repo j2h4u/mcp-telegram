@@ -22,18 +22,17 @@ import json
 import sqlite3
 import time
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
 from mcp_telegram.activity_peer_resolve import (
-    LinkedChatResolution,
     _ENTITY_DETAIL_TTL_SECONDS,
+    LinkedChatResolution,
     resolve_input_peer,
     resolve_linked_chat_id,
 )
 from mcp_telegram.sync_db import _apply_migrations
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -157,9 +156,9 @@ def _fake_full_channel_result(linked_chat_id: int | None, **kwargs: Any) -> Any:
     """Build a fake GetFullChannelRequest result."""
     full_chat = MagicMock()
     full_chat.linked_chat_id = linked_chat_id
-    full_chat.participants_count = kwargs.get("participants_count", None)
-    full_chat.pinned_msg_id = kwargs.get("pinned_msg_id", None)
-    full_chat.about = kwargs.get("about", None)
+    full_chat.participants_count = kwargs.get("participants_count")
+    full_chat.pinned_msg_id = kwargs.get("pinned_msg_id")
+    full_chat.about = kwargs.get("about")
     result = MagicMock()
     result.full_chat = full_chat
     return result
@@ -238,7 +237,7 @@ async def test_resolve_linked_chat_id_cache_miss_calls_once_and_merges():
     conn = _make_db()
     channel_id = -100200000002
     raw_linked = 555666777  # positive bare id
-    expected_linked = int(-1002555666777)  # -100{raw}
+    expected_linked = -1002555666777  # -100{raw}
 
     # Pre-existing blob with an 'about' key that must survive the merge
     _write_entity_details(

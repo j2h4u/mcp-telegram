@@ -17,8 +17,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from mcp_telegram.daemon_api import DaemonAPIServer, _classify_dialog_type, get_daemon_socket_path
-from mcp_telegram.models import DialogType
 from mcp_telegram.fts import MESSAGES_FTS_DDL, stem_text
+from mcp_telegram.models import DialogType
 
 # ---------------------------------------------------------------------------
 # Module-wide patch: telethon_utils.get_peer_id returns entity.id for mocks

@@ -1877,8 +1877,8 @@ def test_insert_messages_with_fts_edit_idempotency_forwards(sync_db: sqlite3.Con
 # a *user_id* → "Could not find the input entity for PeerUser(user_id=N)". The
 # resolver must receive the typed Peer so the channel/chat kind survives.
 
-from telethon.tl.types import PeerChannel as _PeerChannel  # noqa: E402
-from telethon.tl.types import PeerUser as _PeerUser  # noqa: E402
+from telethon.tl.types import PeerChannel as _PeerChannel
+from telethon.tl.types import PeerUser as _PeerUser
 
 
 @pytest.mark.asyncio

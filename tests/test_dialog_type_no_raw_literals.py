@@ -55,9 +55,12 @@ def test_no_capitalized_dialog_type_literals_outside_models():
     for path in _iter_py_files():
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
-            if isinstance(node, ast.Constant) and isinstance(node.value, str):
-                if node.value in CAPITALIZED_TYPE_LITERALS:
-                    offenders.append(f"{path.relative_to(SRC)}:{node.lineno}  \"{node.value}\"")
+            if (
+                isinstance(node, ast.Constant)
+                and isinstance(node.value, str)
+                and node.value in CAPITALIZED_TYPE_LITERALS
+            ):
+                offenders.append(f"{path.relative_to(SRC)}:{node.lineno}  \"{node.value}\"")
     assert not offenders, (
         "Raw capitalized dialog-type literals found — use models.DialogType instead:\n  "
         + "\n  ".join(offenders)

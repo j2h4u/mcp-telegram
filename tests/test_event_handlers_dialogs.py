@@ -406,22 +406,6 @@ async def test_update_read_history_inbox_skips_unenrolled_dialog(
     assert not any("still_unread_count" in r.message for r in caplog.records)
 
 
-def test_events_02_satisfaction_documented_via_log_only() -> None:
-    """EVENTS-02 satisfaction: structured log captures still_unread_count.
-
-    The high-level events.MessageRead wrapper drops still_unread_count.
-    The Raw handler (on_raw_inbox_read) captures it via INFO log so the
-    value is observable in journald. No dialogs.unread_count column is added
-    in this milestone — logging at the daemon boundary is the explicit
-    satisfaction strategy documented in the plan revision_notes.
-
-    Future milestones may add a column; this test locks the current contract.
-    """
-    # The test body is the docstring contract — the test passing means the
-    # module imported and the contract is documented.
-    assert True
-
-
 # ---------------------------------------------------------------------------
 # EVENTS-03: dirty flag (UpdateChannel / UpdateChat) — UPDATE-only, gated
 # ---------------------------------------------------------------------------

@@ -25,6 +25,7 @@ from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
 from typing import Any
 
+from telethon import utils as tl_utils  # type: ignore[import-untyped]
 from telethon.errors import (  # type: ignore[import-untyped]
     ChannelPrivateError,
     FloodWaitError,
@@ -36,7 +37,6 @@ from telethon.errors import (  # type: ignore[import-untyped]
     UserDeactivatedError,
     UserPrivacyRestrictedError,
 )
-from telethon import utils as tl_utils  # type: ignore[import-untyped]
 from telethon.tl import types  # type: ignore[import-untyped]
 
 from .dialog_sync import _ACCESS_LOST_ERRORS, _set_access_lost
