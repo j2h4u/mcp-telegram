@@ -839,7 +839,7 @@ async def run_reconciliation_loop(
 ) -> None:
     """Background loop: light pass every hourly_interval, full pass every daily_interval.
 
-    First iteration always runs a full pass (last_full_pass starts at 0.0).
+    First iteration always runs a full pass (last_full_pass starts at None).
     Shutdown-responsive: returns from inside asyncio.wait_for as soon as
     shutdown_event fires.
 
@@ -853,7 +853,11 @@ async def run_reconciliation_loop(
     sourced from RECON_HOURLY_SECONDS env var so an operator can observe a
     needs_refresh=1 -> 0 transition without waiting an hour.
     """
-    last_full_pass: float = 0.0  # force daily pass on first iteration
+    # None (not 0.0) forces the full pass on the first iteration: time.monotonic()
+    # is seconds-since-boot, so on a freshly-booted host monotonic() < daily_interval
+    # and `now - 0.0 >= daily_interval` would be False — the daily pass would never
+    # run until the host had been up for a full day.
+    last_full_pass: float | None = None
     while not shutdown_event.is_set():
         now = time.monotonic()
         worker = DialogReconciliationWorker(client, conn, shutdown_event)
@@ -861,7 +865,7 @@ async def run_reconciliation_loop(
             await worker.run_light_pass()
         except Exception:
             logger.warning("recon_light_pass_error", exc_info=True)
-        if now - last_full_pass >= daily_interval:
+        if last_full_pass is None or now - last_full_pass >= daily_interval:
             try:
                 _count, completed = await worker.run_full_pass()
                 # Advance last_full_pass only when the sweep completed
