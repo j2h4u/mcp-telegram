@@ -22,6 +22,14 @@ typecheck:
 test *args:
     uv run pytest {{args}}
 
+# Dead-code sieve (advisory — vulture has false positives, read with judgment).
+deadcode:
+    uv run vulture
+
+# Test coverage report.
+coverage:
+    uv run pytest --cov=src/mcp_telegram --cov-report=term-missing
+
 # Rebuild and restart the live Docker container.
 runtime-build:
     docker compose -f {{compose_file}} up -d --build {{container}}
