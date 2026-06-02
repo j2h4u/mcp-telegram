@@ -152,25 +152,6 @@ class TraceCoverageSummary(TypedDict):
     as_of: int
 
 
-class TraceGroup(TypedDict):
-    """A presentation group for the current Account Trace page."""
-
-    group_key: str
-    group_label: str
-    evidence: list[TraceEvidenceItem]
-
-
-class TraceAccountResult(TypedDict):
-    """Structured Account Trace response used by daemon and MCP tool layers."""
-
-    resolved_account: TraceResolvedAccount
-    groups: list[TraceGroup]
-    coverage: TraceCoverageSummary
-    gaps: list[TraceCoverageGap]
-    provenance: dict[str, object]
-    next_navigation: str | None
-
-
 # ---------------------------------------------------------------------------
 # Message data model — read side
 # ---------------------------------------------------------------------------
@@ -250,17 +231,6 @@ class TopicCatalog(TypedDict):
     choices: dict[int, str]
     metadata_by_id: dict[int, TopicMetadata]
     deleted_topics: dict[int, TopicMetadata]
-
-
-@dataclass(frozen=True)
-class ExactTargetHints:
-    """Bundle of pre-resolved identifiers that bypass fuzzy resolution."""
-
-    dialog_id: int | None = None
-    dialog_name: str | None = None
-    topic_id: int | None = None
-    topic_name: str | None = None
-    topic_metadata: TopicMetadata | None = None
 
 
 @dataclass(frozen=True)
