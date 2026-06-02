@@ -47,3 +47,35 @@ format_unread_messages_grouped  # unused function (src/mcp_telegram/formatter.py
 # --- tools/reading.py: str-returning message/search text formatters ---
 _format_daemon_messages  # unused function (src/mcp_telegram/tools/reading.py:64)
 _format_search_results  # unused function (src/mcp_telegram/tools/reading.py:868)
+
+# ---------------------------------------------------------------------------
+# Confirmed false positives — used via frameworks/external consumers/tests that
+# vulture's static scan cannot see. NOT the text layer; triaged individually.
+# ---------------------------------------------------------------------------
+
+# Framework/SDK attributes set for, and read by, a library — never by our code:
+instructions     # MCP server instructions, read by the MCP SDK (server.py:287,326)
+row_factory      # sqlite3.Connection.row_factory, consumed by sqlite3 (daemon_api.py:1780)
+model_config     # Pydantic BaseModel config, consumed by Pydantic (tools/_base.py)
+capture_signals  # override of uvicorn.Server.capture_signals, called by uvicorn (server.py:357)
+
+# dotMD adapter API — the external indexer is the only caller (AGENTS.md: dotMD
+# is a downstream consumer reached through its Telegram adapter):
+describe_source         # daemon_client.py:293
+export_source_changes   # daemon_client.py:297
+read_source_unit_window # daemon_client.py:317
+
+# Used in production but missed by vulture's call-graph (re-imports / dynamic use):
+open_sync_db_reader   # MCP read-path DB opener (sync_db.py:447)
+result_count_semantics  # tools/structured.py:97 — referenced across tool modules
+
+# Symmetric test-support accessor: _save_dialog_state is production; _load_dialog_state
+# reads it back in the activity sweep tests (tools never read state via it directly).
+_load_dialog_state  # activity_peer_sweep.py:284
+
+# Date display helper — part of the retained text/display layer (see header).
+_format_relative_ymd  # tools/entity_info.py:79
+
+# Required-signature params / schema fields vulture can't tie to a reader:
+progress             # unused param of the no-op MCP progress_notification handler (server.py:175)
+is_telegram_content  # TypedDict field on TelegramContent, a structured-output shape (structured.py:27)
