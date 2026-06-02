@@ -5,7 +5,6 @@ via _request_ids ContextVar for cross-process log correlation, and runs stdio
 or Streamable HTTP transport loops.
 """
 
-import asyncio
 import contextlib
 import ipaddress
 import logging
@@ -368,7 +367,3 @@ async def run_mcp_http_server(
         access_log=False,
     )
     await _NoSignalServer(config).serve()
-
-
-def main() -> None:
-    asyncio.run(run_mcp_server())

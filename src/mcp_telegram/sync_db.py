@@ -470,17 +470,6 @@ def _schema_ready(conn: sqlite3.Connection) -> bool:
         return False
 
 
-def _dialogs_snapshot_populated(conn: sqlite3.Connection) -> bool:
-    """Return True if the dialogs snapshot table has at least one row.
-
-    Used by Phase 41 bootstrap to check whether the initial iter_dialogs() sweep
-    has already run (idempotency guard). Returns False on a freshly migrated v17 DB
-    before any bootstrap data is written.
-    """
-    row = conn.execute("SELECT 1 FROM dialogs LIMIT 1").fetchone()
-    return row is not None
-
-
 def _apply_migrations(conn: sqlite3.Connection) -> None:
     """Apply WAL mode and all pending schema migrations in version order."""
     try:

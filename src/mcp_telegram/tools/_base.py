@@ -21,10 +21,6 @@ from ..daemon_client import DaemonConnection, DaemonNotRunningError, daemon_conn
 
 __all__ = ["DaemonConnection", "DaemonNotRunningError", "daemon_connection"]
 
-# Fetch reactor names only when total reactions per message are at or below this limit.
-# Covers personal chats (always ≤ a few) while skipping expensive lookups on busy groups.
-REACTION_NAMES_THRESHOLD = 15
-
 logger = logging.getLogger(__name__)
 
 

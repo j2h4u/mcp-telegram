@@ -410,7 +410,6 @@ class DialogsBootstrapWorker:
         startup_detail_setter: Callable[[str], None] | None = None,
     ) -> None:
         self._client = client
-        self._db_path = db_path
         # Open a dedicated connection — NOT shared with the daemon's main conn.
         # See module docstring "Connection ownership". Same pattern as
         # _backfill_in_thread() at daemon.py:449-456.

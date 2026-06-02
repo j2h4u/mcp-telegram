@@ -9,7 +9,6 @@ import pytest
 
 from mcp_telegram.sync_db import (
     _CURRENT_SCHEMA_VERSION,
-    _dialogs_snapshot_populated,
     _migrate_from_legacy_db,
     _open_sync_db,
     ensure_sync_schema,
@@ -1548,33 +1547,6 @@ def test_schema_v17_dialogs_indexes(tmp_sync_db_path: Path) -> None:
         conn.close()
 
 
-def test_dialogs_snapshot_populated_false_on_fresh(tmp_sync_db_path: Path) -> None:
-    """_dialogs_snapshot_populated() returns False on a fresh v17 DB with no rows."""
-    ensure_sync_schema(tmp_sync_db_path)
-    conn = _open_sync_db(tmp_sync_db_path)
-    try:
-        assert _dialogs_snapshot_populated(conn) is False, (
-            "Expected False on empty dialogs table"
-        )
-    finally:
-        conn.close()
-
-
-def test_dialogs_snapshot_populated_true_after_insert(tmp_sync_db_path: Path) -> None:
-    """_dialogs_snapshot_populated() returns True after at least one row is inserted."""
-    ensure_sync_schema(tmp_sync_db_path)
-    conn = _open_sync_db(tmp_sync_db_path)
-    try:
-        conn.execute(
-            "INSERT INTO dialogs (dialog_id, snapshot_at) VALUES (?, strftime('%s', 'now'))",
-            (123456789,),
-        )
-        conn.commit()
-        assert _dialogs_snapshot_populated(conn) is True, (
-            "Expected True after inserting one row into dialogs"
-        )
-    finally:
-        conn.close()
 
 
 def test_dialogs_no_fk_to_synced_dialogs(tmp_sync_db_path: Path) -> None:

@@ -180,30 +180,6 @@ def encode_history_navigation(
     )
 
 
-def decode_history_navigation(
-    token: str,
-    *,
-    expected_dialog_id: int,
-    expected_topic_id: int | None = None,
-    expected_direction: HistoryDirection | None = None,
-) -> int:
-    """Decode a history cursor, raising ``ValueError`` on dialog/topic/direction mismatch."""
-    navigation = decode_navigation_token(token)
-    if navigation.kind != "history":
-        raise ValueError(f"Navigation token is for {navigation.kind}, not history")
-    if navigation.dialog_id != expected_dialog_id:
-        msg = f"Navigation token belongs to dialog {navigation.dialog_id}, not {expected_dialog_id}"
-        raise ValueError(msg)
-    if navigation.topic_id != expected_topic_id:
-        msg = f"Navigation token belongs to topic {navigation.topic_id}, not {expected_topic_id}"
-        raise ValueError(msg)
-    direction = navigation.direction or "newest"
-    if expected_direction is not None and direction != expected_direction:
-        msg = f"Navigation token belongs to {direction} history, not {expected_direction}"
-        raise ValueError(msg)
-    return navigation.value
-
-
 def encode_search_navigation(offset: int, dialog_id: int, query: str) -> str:
     """Encode a search continuation cursor as a base64 token."""
     return encode_navigation_token(
@@ -214,20 +190,6 @@ def encode_search_navigation(offset: int, dialog_id: int, query: str) -> str:
             query=query,
         )
     )
-
-
-def decode_search_navigation(token: str, *, expected_dialog_id: int, expected_query: str) -> int:
-    """Decode a search cursor, raising ``ValueError`` on dialog/query mismatch."""
-    navigation = decode_navigation_token(token)
-    if navigation.kind != "search":
-        raise ValueError(f"Navigation token is for {navigation.kind}, not search")
-    if navigation.dialog_id != expected_dialog_id:
-        msg = f"Navigation token belongs to dialog {navigation.dialog_id}, not {expected_dialog_id}"
-        raise ValueError(msg)
-    if navigation.query != expected_query:
-        msg = f'Navigation token belongs to query "{navigation.query}", not "{expected_query}"'
-        raise ValueError(msg)
-    return navigation.value
 
 
 def encode_account_trace_navigation(

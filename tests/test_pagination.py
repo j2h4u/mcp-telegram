@@ -5,9 +5,7 @@ import pytest
 from mcp_telegram.pagination import (
     HistoryDirection,
     NavigationToken,
-    decode_history_navigation,
     decode_navigation_token,
-    decode_search_navigation,
     encode_history_navigation,
     encode_navigation_token,
     encode_search_navigation,
@@ -55,55 +53,6 @@ class TestNavigationTokenRoundTrip:
         token = encode_navigation_token(original)
         decoded = decode_navigation_token(token)
         assert decoded == original
-
-
-class TestDecodeHistoryNavigation:
-    def test_valid_decode_returns_message_id(self):
-        token = encode_history_navigation(12345, dialog_id=100)
-        msg_id = decode_history_navigation(token, expected_dialog_id=100)
-        assert msg_id == 12345
-
-    def test_dialog_mismatch_raises(self):
-        token = encode_history_navigation(1, dialog_id=100)
-        with pytest.raises(ValueError, match="dialog 100, not 200"):
-            decode_history_navigation(token, expected_dialog_id=200)
-
-    def test_topic_mismatch_raises(self):
-        token = encode_history_navigation(1, dialog_id=100, topic_id=5)
-        with pytest.raises(ValueError, match="topic 5, not 10"):
-            decode_history_navigation(token, expected_dialog_id=100, expected_topic_id=10)
-
-    def test_direction_mismatch_raises(self):
-        token = encode_history_navigation(1, dialog_id=100, direction=HistoryDirection.NEWEST)
-        with pytest.raises(ValueError, match="newest.*oldest"):
-            decode_history_navigation(token, expected_dialog_id=100, expected_direction=HistoryDirection.OLDEST)
-
-    def test_search_token_rejected_as_history(self):
-        token = encode_search_navigation(0, dialog_id=100, query="q")
-        with pytest.raises(ValueError, match="search, not history"):
-            decode_history_navigation(token, expected_dialog_id=100)
-
-
-class TestDecodeSearchNavigation:
-    def test_valid_decode_returns_offset(self):
-        token = encode_search_navigation(offset=20, dialog_id=100, query="test")
-        offset = decode_search_navigation(token, expected_dialog_id=100, expected_query="test")
-        assert offset == 20
-
-    def test_dialog_mismatch_raises(self):
-        token = encode_search_navigation(0, dialog_id=100, query="test")
-        with pytest.raises(ValueError, match="dialog 100, not 200"):
-            decode_search_navigation(token, expected_dialog_id=200, expected_query="test")
-
-    def test_query_mismatch_raises(self):
-        token = encode_search_navigation(0, dialog_id=100, query="hello")
-        with pytest.raises(ValueError, match='query "hello", not "world"'):
-            decode_search_navigation(token, expected_dialog_id=100, expected_query="world")
-
-    def test_history_token_rejected_as_search(self):
-        token = encode_history_navigation(1, dialog_id=100)
-        with pytest.raises(ValueError, match="history, not search"):
-            decode_search_navigation(token, expected_dialog_id=100, expected_query="q")
 
 
 class TestDecodeValidation:
