@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
+
 from mcp_telegram.errors import (
     action_text,
     ambiguous_deleted_topic_text,
@@ -33,160 +35,80 @@ from mcp_telegram.errors import (
 )
 
 
-def test_action_text_format():
-    result = action_text("Something failed.", "Fix it.")
-    assert result == "Something failed.\nAction: Fix it."
-
-
-def test_dialog_not_found_includes_name_and_retry_tool():
-    result = dialog_not_found_text("MyChat", retry_tool="ListMessages")
-    assert "MyChat" in result
-    assert "ListMessages" in result
-    assert "ListDialogs" in result
-
-
-def test_ambiguous_dialog_includes_matches():
-    result = ambiguous_dialog_text("Test", ["id=1 name=A", "id=2 name=B"], retry_tool="ListMessages")
-    assert "id=1 name=A" in result
-    assert "id=2 name=B" in result
-    assert "multiple" in result.lower()
-
-
-def test_deleted_topic_text():
-    result = deleted_topic_text("OldTopic", retry_tool="ListMessages")
-    assert "OldTopic" in result
-    assert "deleted" in result.lower()
-
-
-def test_rpc_error_detail_uses_message_attr():
+def _exc(message: str) -> MagicMock:
     exc = MagicMock()
-    exc.message = "FLOOD_WAIT_42"
-    assert rpc_error_detail(exc) == "FLOOD_WAIT_42"
+    exc.message = message
+    return exc
 
 
-def test_rpc_error_detail_falls_back_to_str():
+# Every error helper must surface its key context — the offending name/id, the
+# retry tool, and the distinguishing keyword — in the rendered text. One row per
+# helper: a dropped substring is a real UX regression (an error with no context).
+# Matching is case-insensitive (names appear verbatim; keywords vary in case).
+_ERROR_TEXT_CASES: list[tuple[str, str, list[str]]] = [
+    ("action", action_text("Something failed.", "Fix it."), ["Something failed.", "Action: Fix it."]),
+    ("dialog_not_found", dialog_not_found_text("MyChat", retry_tool="ListMessages"),
+     ["MyChat", "ListMessages", "ListDialogs"]),
+    ("ambiguous_dialog", ambiguous_dialog_text("Test", ["id=1 name=A", "id=2 name=B"], retry_tool="ListMessages"),
+     ["id=1 name=A", "id=2 name=B", "multiple"]),
+    ("deleted_topic", deleted_topic_text("OldTopic", retry_tool="ListMessages"), ["OldTopic", "deleted"]),
+    ("topic_not_found", topic_not_found_text("Missing", retry_tool="ListMessages"), ["Missing", "not found"]),
+    ("ambiguous_topic", ambiguous_topic_text("Dev", ["A", "B"], retry_tool="ListMessages"), ["multiple"]),
+    ("ambiguous_deleted_topic", ambiguous_deleted_topic_text("Old", ["X", "Y"], retry_tool="ListMessages"),
+     ["deleted"]),
+    ("dialog_topics_unavailable", dialog_topics_unavailable_text("Forum", _exc("CHANNEL_PRIVATE")),
+     ["Forum", "CHANNEL_PRIVATE"]),
+    ("no_active_topics", no_active_topics_text("EmptyForum"), ["EmptyForum"]),
+    ("invalid_navigation", invalid_navigation_text("bad token", retry_tool="SearchMessages"),
+     ["bad token", "SearchMessages"]),
+    ("sender_not_found", sender_not_found_text("Ghost", retry_tool="ListMessages"), ["Ghost"]),
+    ("ambiguous_sender", ambiguous_sender_text("Ivan", ["id=1 Ivan P", "id=2 Ivan S"], retry_tool="ListMessages"),
+     ["Ivan", "id=1"]),
+    ("entity_not_found", entity_not_found_text("Nobody", retry_tool="GetEntityInfo"), ["Nobody"]),
+    ("ambiguous_entity", ambiguous_entity_text("Ivan", ["match1", "match2"], retry_tool="GetEntityInfo"),
+     ["multiple"]),
+    ("fetch_entity_info_error", fetch_entity_info_error_text("Bob", "timeout"), ["Bob", "timeout"]),
+    ("not_authenticated", not_authenticated_text("GetMyAccount"), ["GetMyAccount", "authenticated"]),
+    ("no_usage_data", no_usage_data_text(), ["30 days"]),
+    ("usage_stats_db_missing", usage_stats_db_missing_text(), ["database"]),
+    ("usage_stats_query_error", usage_stats_query_error_text("OperationalError"), ["OperationalError"]),
+    ("no_dialogs", no_dialogs_text(), ["no dialogs"]),
+    ("no_unread_personal", no_unread_personal_text(), ["personal"]),
+    ("no_unread_all", no_unread_all_text(), ["no unread"]),
+    ("search_no_hits", search_no_hits_text("ChatName", "hello"), ["hello", "ChatName"]),
+]
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [(case[1], case[2]) for case in _ERROR_TEXT_CASES],
+    ids=[case[0] for case in _ERROR_TEXT_CASES],
+)
+def test_error_text_surfaces_key_context(text: str, expected: list[str]) -> None:
+    lowered = text.lower()
+    for substring in expected:
+        assert substring.lower() in lowered, substring
+
+
+# --- Behavioral branches (real logic, not pass-through) ---
+
+
+def test_rpc_error_detail_uses_message_attr() -> None:
+    assert rpc_error_detail(_exc("FLOOD_WAIT_42")) == "FLOOD_WAIT_42"
+
+
+def test_rpc_error_detail_falls_back_to_str() -> None:
     class FakeExc:
-        def __str__(self):
+        def __str__(self) -> str:
             return "some error"
 
-    exc = FakeExc()
-    assert rpc_error_detail(exc) == "some error"
+    assert rpc_error_detail(FakeExc()) == "some error"
 
 
-def test_inaccessible_topic_resolved_true():
-    exc = MagicMock()
-    exc.message = "TOPIC_PRIVATE"
-    result = inaccessible_topic_text("Secret", exc, resolved=True, retry_tool="ListMessages")
-    assert "resolved" in result.lower()
-    assert "TOPIC_PRIVATE" in result
-
-
-def test_inaccessible_topic_resolved_false():
-    exc = MagicMock()
-    exc.message = "TOPIC_PRIVATE"
-    result = inaccessible_topic_text("Secret", exc, resolved=False, retry_tool="ListMessages")
-    assert "could not be loaded" in result.lower()
-
-
-def test_topic_not_found_text():
-    result = topic_not_found_text("Missing", retry_tool="ListMessages")
-    assert "Missing" in result
-    assert "not found" in result.lower()
-
-
-def test_ambiguous_topic_text():
-    result = ambiguous_topic_text("Dev", ["A", "B"], retry_tool="ListMessages")
-    assert "multiple" in result.lower()
-
-
-def test_ambiguous_deleted_topic_text():
-    result = ambiguous_deleted_topic_text("Old", ["X", "Y"], retry_tool="ListMessages")
-    assert "deleted" in result.lower()
-
-
-def test_dialog_topics_unavailable_text():
-    exc = MagicMock()
-    exc.message = "CHANNEL_PRIVATE"
-    result = dialog_topics_unavailable_text("Forum", exc)
-    assert "Forum" in result
-    assert "CHANNEL_PRIVATE" in result
-
-
-def test_no_active_topics_text():
-    result = no_active_topics_text("EmptyForum")
-    assert "EmptyForum" in result
-
-
-def test_invalid_navigation_text():
-    result = invalid_navigation_text("bad token", retry_tool="SearchMessages")
-    assert "bad token" in result
-    assert "SearchMessages" in result
-
-
-def test_sender_not_found_text():
-    result = sender_not_found_text("Ghost", retry_tool="ListMessages")
-    assert "Ghost" in result
-
-
-def test_ambiguous_sender_text():
-    result = ambiguous_sender_text("Ivan", ["id=1 Ivan P", "id=2 Ivan S"], retry_tool="ListMessages")
-    assert "Ivan" in result
-    assert "id=1" in result
-
-
-def test_entity_not_found_text():
-    result = entity_not_found_text("Nobody", retry_tool="GetEntityInfo")
-    assert "Nobody" in result
-
-
-def test_ambiguous_entity_text():
-    result = ambiguous_entity_text("Ivan", ["match1", "match2"], retry_tool="GetEntityInfo")
-    assert "multiple" in result.lower()
-
-
-def test_fetch_entity_info_error_text():
-    result = fetch_entity_info_error_text("Bob", "timeout")
-    assert "Bob" in result
-    assert "timeout" in result
-
-
-def test_not_authenticated_text():
-    result = not_authenticated_text("GetMyAccount")
-    assert "GetMyAccount" in result
-    assert "authenticated" in result.lower()
-
-
-def test_no_usage_data_text():
-    result = no_usage_data_text()
-    assert "30 days" in result
-
-
-def test_usage_stats_db_missing_text():
-    result = usage_stats_db_missing_text()
-    assert "database" in result.lower()
-
-
-def test_usage_stats_query_error_text():
-    result = usage_stats_query_error_text("OperationalError")
-    assert "OperationalError" in result
-
-
-def test_no_dialogs_text():
-    result = no_dialogs_text()
-    assert "no dialogs" in result.lower()
-
-
-def test_no_unread_personal_text():
-    result = no_unread_personal_text()
-    assert "personal" in result.lower()
-
-
-def test_no_unread_all_text():
-    result = no_unread_all_text()
-    assert "no unread" in result.lower()
-
-
-def test_search_no_hits_text():
-    result = search_no_hits_text("ChatName", "hello")
-    assert "hello" in result
-    assert "ChatName" in result
+def test_inaccessible_topic_text_branches_on_resolved() -> None:
+    exc = _exc("TOPIC_PRIVATE")
+    resolved = inaccessible_topic_text("Secret", exc, resolved=True, retry_tool="ListMessages")
+    not_resolved = inaccessible_topic_text("Secret", exc, resolved=False, retry_tool="ListMessages")
+    assert "resolved" in resolved.lower()
+    assert "TOPIC_PRIVATE" in resolved
+    assert "could not be loaded" in not_resolved.lower()

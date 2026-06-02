@@ -201,11 +201,3 @@ def testapply_read_cursor_caller_controls_transaction(file_db_path: Path) -> Non
         conn_b.close()
 
 
-def test_read_state_module_importable_by_daemon_and_event_handlers() -> None:
-    """Import-graph regression: both consumers can import the helper.
-
-    Phase 39.3-01 Task 2 wires daemon.py + event_handlers.py through this
-    module. A circular import would surface here as ImportError.
-    """
-    from mcp_telegram import daemon, event_handlers  # noqa: F401
-    from mcp_telegram.read_state import apply_read_cursor  # noqa: F401

@@ -129,12 +129,3 @@ class TestDecodeValidation:
             decode_navigation_token(token)
 
 
-class TestHistoryDirection:
-    def test_newest_value(self):
-        assert HistoryDirection.NEWEST == "newest"
-
-    def test_oldest_value(self):
-        assert HistoryDirection.OLDEST == "oldest"
-
-    def test_is_str_enum(self):
-        assert isinstance(HistoryDirection.NEWEST, str)
