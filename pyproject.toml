@@ -62,7 +62,9 @@ ignore_missing_imports = true
 "*" = ["py.typed"]
 
 [tool.vulture]
-paths = ["src/mcp_telegram"]
+# vulture_whitelist.py lists intentionally-retained symbols (the text-rendering
+# layer kept for a future CLI) so the advisory scan flags only NEW dead code.
+paths = ["src/mcp_telegram", "vulture_whitelist.py"]
 min_confidence = 60
 # Entrypoints registered via decorators look "unused" to vulture's static scan.
 ignore_decorators = ["@app.command", "@app.callback", "@feedback_app.command", "@mcp_tool"]
