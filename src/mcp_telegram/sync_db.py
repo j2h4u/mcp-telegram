@@ -8,6 +8,7 @@ from pathlib import Path
 from xdg_base_dirs import xdg_state_home  # type: ignore[import-error]
 
 _CURRENT_SCHEMA_VERSION = 26
+_SCHEMA_VERSION_WITH_FTS = 3
 
 logger = logging.getLogger(__name__)
 
@@ -529,7 +530,7 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
 
     _migrate(2, ["ALTER TABLE synced_dialogs ADD COLUMN access_lost_at INTEGER"])
 
-    if current < 3:
+    if current < _SCHEMA_VERSION_WITH_FTS:
         from .fts import MESSAGES_FTS_DDL
 
         _migrate(3, [MESSAGES_FTS_DDL])

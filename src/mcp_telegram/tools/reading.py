@@ -25,6 +25,9 @@ from ._base import (
 )
 from .structured import StructuredWarning, TelegramContent, TelegramContentKind, structured_warning, telegram_content
 
+# Archive coverage values are expressed as percentages.
+_ARCHIVE_COVERAGE_COMPLETE_PERCENT = 100
+
 # ---------------------------------------------------------------------------
 # Shared archived-dialog warning formatter
 # ---------------------------------------------------------------------------
@@ -46,7 +49,7 @@ def _format_archived_warning(data: dict) -> str:
     warning = f"\u26a0 No current access to this dialog. Messages are from the local archive (last sync: {date_str}).\n"
     sync_coverage_pct = data.get("sync_coverage_pct")
     archived_message_count = data.get("archived_message_count")
-    if sync_coverage_pct is not None and sync_coverage_pct < 100:
+    if sync_coverage_pct is not None and sync_coverage_pct < _ARCHIVE_COVERAGE_COMPLETE_PERCENT:
         warning += f"Archive coverage: {sync_coverage_pct}% of dialog history.\n"
     elif sync_coverage_pct is None:
         if archived_message_count is not None:

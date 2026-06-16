@@ -8,6 +8,8 @@ app = Typer()
 
 _DEFAULT_HTTP_HOST = "127.0.0.1"
 _DEFAULT_HTTP_PORT = 3100
+_MIN_HTTP_PORT = 1
+_MAX_HTTP_PORT = 65535
 
 
 def _resolve_http_host(host: str | None) -> str:
@@ -28,7 +30,7 @@ def _resolve_http_port(port: int | None) -> int:
         else:
             raise BadParameter("MCP_TELEGRAM_HTTP_PORT must be an integer")
 
-    if not 1 <= resolved <= 65535:
+    if not _MIN_HTTP_PORT <= resolved <= _MAX_HTTP_PORT:
         raise BadParameter("HTTP port must be between 1 and 65535")
     return resolved
 

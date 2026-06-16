@@ -46,6 +46,7 @@ from .models import DialogType
 from .resolver import latinize
 
 logger = logging.getLogger(__name__)
+_BATCH_SIZE = 100
 
 
 # ---------------------------------------------------------------------------
@@ -787,7 +788,7 @@ class FullSyncWorker:
         if sync_progress == 0:
             logger.info("sync_start dialog_id=%d", dialog_id)
         try:
-            result = await self._client.get_messages(entity=dialog_id, limit=100, offset_id=sync_progress)
+            result = await self._client.get_messages(entity=dialog_id, limit=_BATCH_SIZE, offset_id=sync_progress)
             total_messages = result.total  # Telegram-side count from TotalList
             batch = list(result)
             # Note: batch size 100 keeps memory bounded; get_messages needed for .total
@@ -843,7 +844,7 @@ class FullSyncWorker:
 
         rows = [extract_message_row(dialog_id, msg, entity_name_map=entity_name_map) for msg in batch]
         new_progress = min(int(getattr(msg, "id", 0)) for msg in batch)
-        is_done = len(batch) < 100  # partial batch = last batch
+        is_done = len(batch) < _BATCH_SIZE  # partial batch = last batch
         new_status = "synced" if is_done else "syncing"
 
         # Single atomic transaction: messages + FTS + progress update

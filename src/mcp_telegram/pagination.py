@@ -16,6 +16,7 @@ _TOKEN_SECRET: bytes = os.urandom(32)
 
 NavigationKind = Literal["history", "search"]
 AccountTraceGroupBy = Literal["timeline", "dialog"]
+_MAX_SCOPE_DIALOG_IDS = 2
 
 
 class HistoryDirection(StrEnum):
@@ -310,8 +311,10 @@ def decode_account_trace_navigation(
     if scope_dialog_ids_raw is not None:
         if not isinstance(scope_dialog_ids_raw, list):
             raise ValueError("Invalid navigation token: scope_dialog_ids must be a list when present")
-        if len(scope_dialog_ids_raw) > 2:
-            raise ValueError("Invalid navigation token: scope_dialog_ids must have at most 2 elements")
+        if len(scope_dialog_ids_raw) > _MAX_SCOPE_DIALOG_IDS:
+            raise ValueError(
+                f"Invalid navigation token: scope_dialog_ids must have at most {_MAX_SCOPE_DIALOG_IDS} elements"
+            )
         for item in scope_dialog_ids_raw:
             if not isinstance(item, int):
                 raise ValueError("Invalid navigation token: all scope_dialog_ids elements must be integers")

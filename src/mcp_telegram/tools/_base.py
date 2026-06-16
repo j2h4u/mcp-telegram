@@ -22,6 +22,8 @@ from ..daemon_client import DaemonConnection, DaemonNotRunningError, daemon_conn
 __all__ = ["DaemonConnection", "DaemonNotRunningError", "daemon_connection"]
 
 logger = logging.getLogger(__name__)
+_TOOL_TITLE_WORDS_MIN = 1
+_TOOL_TITLE_WORDS_MAX = 3
 
 
 class ToolArgs(BaseModel):
@@ -335,7 +337,7 @@ def verify_tool_registry() -> None:
         if entry.exported_name != name:
             raise RuntimeError(f"Registry key {name!r} != exported name {entry.exported_name!r}")
         title_words = entry.title.split()
-        if not 1 <= len(title_words) <= 3:
+        if not _TOOL_TITLE_WORDS_MIN <= len(title_words) <= _TOOL_TITLE_WORDS_MAX:
             raise RuntimeError(f"Tool {name} title must be 1-3 words")
         cls = entry.cls
         dispatched = tool_runner.dispatch(cls)

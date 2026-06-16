@@ -96,10 +96,10 @@ def ensure_feedback_schema(db_path: Path) -> sqlite3.Connection:
         conn.execute(_FEEDBACK_DDL)
         conn.execute("INSERT INTO schema_version VALUES (1, strftime('%s', 'now'))")
         conn.commit()
-    if current < 2:
+    if current < _FEEDBACK_SCHEMA_VERSION:
         conn.execute("ALTER TABLE feedback ADD COLUMN status TEXT NOT NULL DEFAULT 'open'")
         conn.execute("ALTER TABLE feedback ADD COLUMN status_changed_at INTEGER")
         conn.execute("ALTER TABLE feedback ADD COLUMN status_comment TEXT")
-        conn.execute("INSERT INTO schema_version VALUES (2, strftime('%s', 'now'))")
+        conn.execute("INSERT INTO schema_version VALUES (?, strftime('%s', 'now'))", (_FEEDBACK_SCHEMA_VERSION,))
         conn.commit()
     return conn

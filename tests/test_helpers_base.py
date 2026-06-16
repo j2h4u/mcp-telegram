@@ -93,11 +93,11 @@ async def test_maybe_heartbeat_fires_when_interval_elapsed():
         conn,
         client,
         handler_manager,
-        sync_start,
-        old_heartbeat,
-        old_gap_scan,
-        0,
-        old_heartbeat,
+        sync_start=sync_start,
+        last_heartbeat=old_heartbeat,
+        last_gap_scan=old_gap_scan,
+        last_hb_msg_count=0,
+        last_hb_mono=old_heartbeat,
     )
 
     assert new_hb > old_heartbeat, "heartbeat timestamp should be updated"
@@ -121,11 +121,11 @@ async def test_maybe_heartbeat_skips_when_recent():
         conn,
         client,
         handler_manager,
-        now,
-        now,
-        now,
-        0,
-        now,
+        sync_start=now,
+        last_heartbeat=now,
+        last_gap_scan=now,
+        last_hb_msg_count=0,
+        last_hb_mono=now,
     )
 
     assert new_hb == now, "heartbeat timestamp should not change"

@@ -12,6 +12,7 @@ from .models import DialogType
 logger = logging.getLogger(__name__)
 
 CANDIDATE_THRESHOLD = 60
+_MIN_HIT_COLLISION_COUNT = 2
 
 # t.me link pattern: optional https://, optional www., t.me/username[/message_id]
 _TME_RE = re.compile(r"^(?:https?://)?(?:www\.)?t\.me/([a-zA-Z_][a-zA-Z0-9_]{3,})(?:/(\d+))?$")
@@ -149,7 +150,7 @@ def _fuzzy_resolve(
             exact_display_name = entries[0][1]
             break
 
-    if is_single_word and len(hits) >= 2:
+    if is_single_word and len(hits) >= _MIN_HIT_COLLISION_COUNT:
         matches = _build_matches(hits, norm_map, entity_cache, exact_first_id=exact_entity_id)
         return Candidates(query=query, matches=matches)
 
@@ -159,7 +160,7 @@ def _fuzzy_resolve(
         # auto-pick would violate the Resolved contract ("unique entity identified").
         # Always return Candidates when collision is detected.
         exact_entries = norm_map[norm_query]
-        if len(exact_entries) >= 2:
+        if len(exact_entries) >= _MIN_HIT_COLLISION_COUNT:
             logger.debug(
                 "resolver_collision query=%r n_entities=%d",
                 query,

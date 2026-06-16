@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 # Canonical TTL for entity_details cache reads.
 # Owned here as a single source of truth; importable by higher-level layers.
 _ENTITY_DETAIL_TTL_SECONDS: int = 300
+_MIN_LINKED_CHAT_SCHEMA_VERSION = 24
 
 
 @dataclass
@@ -117,7 +118,7 @@ async def resolve_linked_chat_id(
         schema_version = ver_row[0] if ver_row is not None and ver_row[0] is not None else 0
     except sqlite3.OperationalError:
         schema_version = 0
-    if schema_version < 24:
+    if schema_version < _MIN_LINKED_CHAT_SCHEMA_VERSION:
         raise RuntimeError(
             f"activity_peer_resolve.resolve_linked_chat_id requires schema v24+ "
             f"(dialogs.linked_chat_id, dialogs.linked_chat_resolved_at). "

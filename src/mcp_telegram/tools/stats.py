@@ -20,6 +20,8 @@ from ._base import (
 )
 
 logger = logging.getLogger(__name__)
+_DEEP_PAGE_DEPTH_THRESHOLD = 5
+_USAGE_SUMMARY_TOKEN_LIMIT = 100
 
 GET_USAGE_STATS_OUTPUT_SCHEMA = {
     "type": "object",
@@ -157,7 +159,7 @@ def format_usage_summary(stats: dict) -> str:
             most_used_pct = int(most_used_count * 100 / stats["total_calls"]) if stats["total_calls"] > 0 else 0
             parts.append(f"Most active: {most_used_name} ({most_used_pct}% of calls)")
 
-    if stats.get("max_page_depth", 0) >= 5:
+    if stats.get("max_page_depth", 0) >= _DEEP_PAGE_DEPTH_THRESHOLD:
         parts.append(f"Deep scrolling detected: max page depth {stats['max_page_depth']}")
 
     if stats.get("error_distribution"):
@@ -182,8 +184,8 @@ def format_usage_summary(stats: dict) -> str:
 
     # Safety: if summary exceeds 100 tokens, truncate gracefully
     tokens = summary.split()
-    if len(tokens) > 100:
-        summary = " ".join(tokens[:100]) + "..."
+    if len(tokens) > _USAGE_SUMMARY_TOKEN_LIMIT:
+        summary = " ".join(tokens[:_USAGE_SUMMARY_TOKEN_LIMIT]) + "..."
 
     return summary
 
