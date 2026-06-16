@@ -47,7 +47,6 @@ def _patch_get_peer_id():
 # ---------------------------------------------------------------------------
 
 
-
 @contextmanager
 def _make_db() -> Iterator[sqlite3.Connection]:
     conn = sqlite3.connect(":memory:")
