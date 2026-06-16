@@ -950,34 +950,36 @@ async def test_backfill_total_messages_returns_early_when_shutdown_during_flood_
 
     conn = sqlite3.connect(":memory:")
     from mcp_telegram.sync_db import _apply_migrations
+    try:
+        _apply_migrations(conn)
+        conn.execute(
+            "INSERT INTO synced_dialogs (dialog_id, status, total_messages) VALUES (?, 'synced', NULL)",
+            (1001,),
+        )
+        conn.commit()
 
-    _apply_migrations(conn)
-    conn.execute(
-        "INSERT INTO synced_dialogs (dialog_id, status, total_messages) VALUES (?, 'synced', NULL)",
-        (1001,),
-    )
-    conn.commit()
+        shutdown_event = asyncio.Event()
 
-    shutdown_event = asyncio.Event()
+        err = FloodWaitError(request=None)
+        err.seconds = 30
 
-    err = FloodWaitError(request=None)
-    err.seconds = 30
+        client = MagicMock()
+        client.get_messages = AsyncMock(side_effect=err)
 
-    client = MagicMock()
-    client.get_messages = AsyncMock(side_effect=err)
+        async def _mock_wait_for(coro: object, timeout: float) -> None:
+            # Simulate shutdown completing before flood wait expires.
+            import inspect
 
-    async def _mock_wait_for(coro: object, timeout: float) -> None:
-        # Simulate shutdown completing before flood wait expires.
-        import inspect
+            if inspect.iscoroutine(coro):
+                coro.close()  # prevent "coroutine never awaited" warning
+            shutdown_event.set()
 
-        if inspect.iscoroutine(coro):
-            coro.close()  # prevent "coroutine never awaited" warning
-        shutdown_event.set()
+        with patch("mcp_telegram.daemon.asyncio.wait_for", side_effect=_mock_wait_for):
+            filled = await _backfill_total_messages(client, conn, shutdown_event)
 
-    with patch("mcp_telegram.daemon.asyncio.wait_for", side_effect=_mock_wait_for):
-        filled = await _backfill_total_messages(client, conn, shutdown_event)
-
-    assert filled == 0, "No rows filled when shutdown fires during FloodWait"
+        assert filled == 0, "No rows filled when shutdown fires during FloodWait"
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -997,30 +999,33 @@ async def test_initialize_read_positions_fills_null_rows(tmp_path):
 
     conn = sqlite3.connect(":memory:")
     _apply_migrations(conn)
-    conn.execute(
-        "INSERT INTO synced_dialogs (dialog_id, status, read_inbox_max_id) VALUES (?, 'synced', NULL)",
-        (1001,),
-    )
-    conn.commit()
+    try:
+        conn.execute(
+            "INSERT INTO synced_dialogs (dialog_id, status, read_inbox_max_id) VALUES (?, 'synced', NULL)",
+            (1001,),
+        )
+        conn.commit()
 
-    shutdown_event = asyncio.Event()
+        shutdown_event = asyncio.Event()
 
-    client = MagicMock()
-    client.get_input_entity = AsyncMock(return_value=SimpleNamespace())
+        client = MagicMock()
+        client.get_input_entity = AsyncMock(return_value=SimpleNamespace())
 
-    fake_dialog = SimpleNamespace(peer=SimpleNamespace(), read_inbox_max_id=42)
-    fake_response = SimpleNamespace(dialogs=[fake_dialog])
-    client.side_effect = AsyncMock(return_value=fake_response)
+        fake_dialog = SimpleNamespace(peer=SimpleNamespace(), read_inbox_max_id=42)
+        fake_response = SimpleNamespace(dialogs=[fake_dialog])
+        client.side_effect = AsyncMock(return_value=fake_response)
 
-    with patch("mcp_telegram.daemon.telethon_utils.get_peer_id", return_value=1001):
-        filled = await _initialize_read_positions(client, conn, shutdown_event)
+        with patch("mcp_telegram.daemon.telethon_utils.get_peer_id", return_value=1001):
+            filled = await _initialize_read_positions(client, conn, shutdown_event)
 
-    assert filled == 1
-    row = conn.execute(
-        "SELECT read_inbox_max_id FROM synced_dialogs WHERE dialog_id = ?",
-        (1001,),
-    ).fetchone()
-    assert row[0] == 42
+        assert filled == 1
+        row = conn.execute(
+            "SELECT read_inbox_max_id FROM synced_dialogs WHERE dialog_id = ?",
+            (1001,),
+        ).fetchone()
+        assert row[0] == 42
+    finally:
+        conn.close()
 
 
 @pytest.mark.asyncio
@@ -1036,24 +1041,27 @@ async def test_initialize_read_positions_is_monotonic_vs_live_event(tmp_path):
 
     conn = sqlite3.connect(":memory:")
     _apply_migrations(conn)
-    # Simulate a dialog with a high value already set by a live event.
-    conn.execute(
-        "INSERT INTO synced_dialogs (dialog_id, status, read_inbox_max_id) VALUES (?, 'synced', ?)",
-        (1001, 100),
-    )
-    conn.commit()
+    try:
+        # Simulate a dialog with a high value already set by a live event.
+        conn.execute(
+            "INSERT INTO synced_dialogs (dialog_id, status, read_inbox_max_id) VALUES (?, 'synced', ?)",
+            (1001, 100),
+        )
+        conn.commit()
 
-    # Invoke the shared primitive that bootstrap uses, with a lower value (42 < 100).
-    # Verifies MAX(COALESCE(existing, 0), incoming) never regresses — single
-    # source of truth for the monotonic-write pattern now lives in read_state.
-    apply_read_cursor(conn, 1001, "inbox", 42)
-    conn.commit()
+        # Invoke the shared primitive that bootstrap uses, with a lower value (42 < 100).
+        # Verifies MAX(COALESCE(existing, 0), incoming) never regresses — single
+        # source of truth for the monotonic-write pattern now lives in read_state.
+        apply_read_cursor(conn, 1001, "inbox", 42)
+        conn.commit()
 
-    row = conn.execute(
-        "SELECT read_inbox_max_id FROM synced_dialogs WHERE dialog_id = ?",
-        (1001,),
-    ).fetchone()
-    assert row[0] == 100, f"Expected 100 (monotonic), got {row[0]} (bootstrap regressed!)"
+        row = conn.execute(
+            "SELECT read_inbox_max_id FROM synced_dialogs WHERE dialog_id = ?",
+            (1001,),
+        ).fetchone()
+        assert row[0] == 100, f"Expected 100 (monotonic), got {row[0]} (bootstrap regressed!)"
+    finally:
+        conn.close()
 
 
 @pytest.mark.asyncio
@@ -1066,23 +1074,26 @@ async def test_initialize_read_positions_skips_when_no_null_rows(tmp_path):
 
     conn = sqlite3.connect(":memory:")
     _apply_migrations(conn)
-    # Phase 39.3-02: both cursors must be non-NULL for the row to be skipped.
-    # The extended SELECT now picks up rows with EITHER cursor NULL.
-    conn.execute(
-        "INSERT INTO synced_dialogs "
-        "(dialog_id, status, read_inbox_max_id, read_outbox_max_id) "
-        "VALUES (?, 'synced', ?, ?)",
-        (1001, 5, 7),
-    )
-    conn.commit()
+    try:
+        # Phase 39.3-02: both cursors must be non-NULL for the row to be skipped.
+        # The extended SELECT now picks up rows with EITHER cursor NULL.
+        conn.execute(
+            "INSERT INTO synced_dialogs "
+            "(dialog_id, status, read_inbox_max_id, read_outbox_max_id) "
+            "VALUES (?, 'synced', ?, ?)",
+            (1001, 5, 7),
+        )
+        conn.commit()
 
-    shutdown_event = asyncio.Event()
-    client = MagicMock()
-    client.get_input_entity = AsyncMock()
+        shutdown_event = asyncio.Event()
+        client = MagicMock()
+        client.get_input_entity = AsyncMock()
 
-    filled = await _initialize_read_positions(client, conn, shutdown_event)
-    assert filled == 0
-    client.get_input_entity.assert_not_called()
+        filled = await _initialize_read_positions(client, conn, shutdown_event)
+        assert filled == 0
+        client.get_input_entity.assert_not_called()
+    finally:
+        conn.close()
 
 
 @pytest.mark.asyncio
@@ -1099,28 +1110,31 @@ async def test_initialize_read_positions_returns_early_when_shutdown_during_floo
 
     conn = sqlite3.connect(":memory:")
     _apply_migrations(conn)
-    conn.execute(
-        "INSERT INTO synced_dialogs (dialog_id, status, read_inbox_max_id) VALUES (?, 'synced', NULL)",
-        (1001,),
-    )
-    conn.commit()
+    try:
+        conn.execute(
+            "INSERT INTO synced_dialogs (dialog_id, status, read_inbox_max_id) VALUES (?, 'synced', NULL)",
+            (1001,),
+        )
+        conn.commit()
 
-    shutdown_event = asyncio.Event()
-    err = FloodWaitError(request=None)
-    err.seconds = 30
+        shutdown_event = asyncio.Event()
+        err = FloodWaitError(request=None)
+        err.seconds = 30
 
-    client = MagicMock()
-    client.get_input_entity = AsyncMock(side_effect=err)
+        client = MagicMock()
+        client.get_input_entity = AsyncMock(side_effect=err)
 
-    async def _mock_wait_for(coro, timeout):
-        if inspect.iscoroutine(coro):
-            coro.close()
-        shutdown_event.set()
+        async def _mock_wait_for(coro, timeout):
+            if inspect.iscoroutine(coro):
+                coro.close()
+            shutdown_event.set()
 
-    with patch("mcp_telegram.daemon.asyncio.wait_for", side_effect=_mock_wait_for):
-        filled = await _initialize_read_positions(client, conn, shutdown_event)
+        with patch("mcp_telegram.daemon.asyncio.wait_for", side_effect=_mock_wait_for):
+            filled = await _initialize_read_positions(client, conn, shutdown_event)
 
-    assert filled == 0
+        assert filled == 0
+    finally:
+        conn.close()
 
 
 @pytest.mark.asyncio
@@ -1135,34 +1149,37 @@ async def test_initialize_read_positions_excludes_non_synced_status(tmp_path):
 
     conn = sqlite3.connect(":memory:")
     _apply_migrations(conn)
-    conn.executemany(
-        "INSERT INTO synced_dialogs (dialog_id, status, read_inbox_max_id) VALUES (?, ?, NULL)",
-        [
-            (1001, "synced"),
-            (1002, "access_lost"),
-            (1003, "not_synced"),
-        ],
-    )
-    conn.commit()
+    try:
+        conn.executemany(
+            "INSERT INTO synced_dialogs (dialog_id, status, read_inbox_max_id) VALUES (?, ?, NULL)",
+            [
+                (1001, "synced"),
+                (1002, "access_lost"),
+                (1003, "not_synced"),
+            ],
+        )
+        conn.commit()
 
-    shutdown_event = asyncio.Event()
+        shutdown_event = asyncio.Event()
 
-    called_with: list[int] = []
+        called_with: list[int] = []
 
-    async def _fake_get_input_entity(did):
-        called_with.append(did)
-        return SimpleNamespace()
+        async def _fake_get_input_entity(did):
+            called_with.append(did)
+            return SimpleNamespace()
 
-    client = MagicMock()
-    client.get_input_entity = _fake_get_input_entity
+        client = MagicMock()
+        client.get_input_entity = _fake_get_input_entity
 
-    fake_dialog = SimpleNamespace(peer=SimpleNamespace(), read_inbox_max_id=42)
-    client.side_effect = AsyncMock(return_value=SimpleNamespace(dialogs=[fake_dialog]))
+        fake_dialog = SimpleNamespace(peer=SimpleNamespace(), read_inbox_max_id=42)
+        client.side_effect = AsyncMock(return_value=SimpleNamespace(dialogs=[fake_dialog]))
 
-    with patch("mcp_telegram.daemon.telethon_utils.get_peer_id", return_value=1001):
-        await _initialize_read_positions(client, conn, shutdown_event)
+        with patch("mcp_telegram.daemon.telethon_utils.get_peer_id", return_value=1001):
+            await _initialize_read_positions(client, conn, shutdown_event)
 
-    assert called_with == [1001], f"Only the 'synced' dialog should be queried; got {called_with}"
+        assert called_with == [1001], f"Only the 'synced' dialog should be queried; got {called_with}"
+    finally:
+        conn.close()
 
 
 def test_sync_main_registers_read_positions_bootstrap_after_handler(tmp_path):
@@ -1272,57 +1289,60 @@ def _source_export_seed_message(
 @pytest.mark.asyncio
 async def test_source_export_describe_source_and_bootstrap_records() -> None:
     server, conn = _make_source_export_server()
-    _source_export_seed_dialog(conn, -1001, status="synced", name="Project Chat")
-    _source_export_seed_dialog(conn, -1002, status="access_lost", name="Archive Chat")
-    _source_export_seed_dialog(conn, -1003, status="not_synced", name="Private Draft")
-    _source_export_seed_message(
-        conn,
-        -1001,
-        41,
-        reply_to_msg_id=40,
-        forum_topic_id=7,
-        topic_title="Deployments",
-    )
-    _source_export_seed_message(conn, -1002, 5, text="Archived but available")
-    _source_export_seed_message(conn, -1003, 1, text="must not export")
+    try:
+        _source_export_seed_dialog(conn, -1001, status="synced", name="Project Chat")
+        _source_export_seed_dialog(conn, -1002, status="access_lost", name="Archive Chat")
+        _source_export_seed_dialog(conn, -1003, status="not_synced", name="Private Draft")
+        _source_export_seed_message(
+            conn,
+            -1001,
+            41,
+            reply_to_msg_id=40,
+            forum_topic_id=7,
+            topic_title="Deployments",
+        )
+        _source_export_seed_message(conn, -1002, 5, text="Archived but available")
+        _source_export_seed_message(conn, -1003, 1, text="must not export")
 
-    description = await server._dispatch({"method": "describe_source"})
-    assert description == {
-        "ok": True,
-        "data": {
-            "namespace": "telegram",
-            "source_kind": "chat",
-            "display_name": "Telegram",
-            "capabilities": ["incremental-export", "unit-window"],
-            "metadata_json": {"transport": "mcp-telegram-daemon"},
-        },
-    }
+        description = await server._dispatch({"method": "describe_source"})
+        assert description == {
+            "ok": True,
+            "data": {
+                "namespace": "telegram",
+                "source_kind": "chat",
+                "display_name": "Telegram",
+                "capabilities": ["incremental-export", "unit-window"],
+                "metadata_json": {"transport": "mcp-telegram-daemon"},
+            },
+        }
 
-    result = await server._dispatch({"method": "export_source_changes", "cursor": None, "limit": 2})
+        result = await server._dispatch({"method": "export_source_changes", "cursor": None, "limit": 2})
 
-    assert result["ok"] is True
-    data = result["data"]
-    exported_refs = [change["unit"]["unit_ref"] for change in data["changes"]]
-    assert exported_refs == [
-        "dialog:-1002:message:5",
-        "dialog:-1001:message:41",
-    ]
-    assert all(change["document"]["ref"].startswith("telegram:dialog:") for change in data["changes"])
-    assert data["changes"][1]["document"]["document_ref"] == "dialog:-1001"
-    assert data["changes"][1]["unit"]["metadata_json"]["topic_title"] == "Deployments"
-    assert data["changes"][1]["unit"]["metadata_json"]["reply_to_msg_id"] == 40
-    assert data["checkpoint_cursor"] == "telegram:v1:dialog:-1001:message:41"
-    assert data["next_cursor"] is None
-    assert "updated_after" in data
-    assert "updated_after_cursor" in data
-    assert "dialog:-1003:message:1" not in exported_refs
-    assert "[resolved:" not in str(data)
-    assert "next_navigation" not in str(data)
+        assert result["ok"] is True
+        data = result["data"]
+        exported_refs = [change["unit"]["unit_ref"] for change in data["changes"]]
+        assert exported_refs == [
+            "dialog:-1002:message:5",
+            "dialog:-1001:message:41",
+        ]
+        assert all(change["document"]["ref"].startswith("telegram:dialog:") for change in data["changes"])
+        assert data["changes"][1]["document"]["document_ref"] == "dialog:-1001"
+        assert data["changes"][1]["unit"]["metadata_json"]["topic_title"] == "Deployments"
+        assert data["changes"][1]["unit"]["metadata_json"]["reply_to_msg_id"] == 40
+        assert data["checkpoint_cursor"] == "telegram:v1:dialog:-1001:message:41"
+        assert data["next_cursor"] is None
+        assert "updated_after" in data
+        assert "updated_after_cursor" in data
+        assert "dialog:-1003:message:1" not in exported_refs
+        assert "[resolved:" not in str(data)
+        assert "next_navigation" not in str(data)
+    finally:
+        conn.close()
 
 
 @pytest.mark.asyncio
 async def test_daemon_api_keeps_connection_open_for_sequential_requests(tmp_path) -> None:
-    server, _conn = _make_source_export_server()
+    server, conn = _make_source_export_server()
     sock_path = tmp_path / "daemon.sock"
     unix_server = await asyncio.start_unix_server(
         server.handle_client,
@@ -1346,6 +1366,7 @@ async def test_daemon_api_keeps_connection_open_for_sequential_requests(tmp_path
         writer.close()
         await writer.wait_closed()
     finally:
+        conn.close()
         unix_server.close()
         await unix_server.wait_closed()
 
@@ -1353,118 +1374,127 @@ async def test_daemon_api_keeps_connection_open_for_sequential_requests(tmp_path
 @pytest.mark.asyncio
 async def test_source_export_update_watermark_mixed_stream_does_not_regress_checkpoint() -> None:
     server, conn = _make_source_export_server()
-    _source_export_seed_dialog(conn, -1001)
-    _source_export_seed_message(conn, -1001, 30, text="Edited old", sent_at=1769890000, edit_date=1769904060)
-    _source_export_seed_message(conn, -1001, 51, text="New bootstrap", sent_at=1769904030)
+    try:
+        _source_export_seed_dialog(conn, -1001)
+        _source_export_seed_message(conn, -1001, 30, text="Edited old", sent_at=1769890000, edit_date=1769904060)
+        _source_export_seed_message(conn, -1001, 51, text="New bootstrap", sent_at=1769904030)
 
-    result = await server._dispatch(
-        {
-            "method": "export_source_changes",
-            "cursor": "telegram:v1:dialog:-1001:message:50",
-            "limit": 10,
-            "updated_after": "2026-02-01T00:00:00.000000Z",
-            "updated_after_cursor": "telegram:v1:dialog:-1001:message:20",
-        }
-    )
+        result = await server._dispatch(
+            {
+                "method": "export_source_changes",
+                "cursor": "telegram:v1:dialog:-1001:message:50",
+                "limit": 10,
+                "updated_after": "2026-02-01T00:00:00.000000Z",
+                "updated_after_cursor": "telegram:v1:dialog:-1001:message:20",
+            }
+        )
 
-    assert result["ok"] is True
-    data = result["data"]
-    assert [change["unit"]["unit_ref"] for change in data["changes"]] == [
-        "dialog:-1001:message:51",
-        "dialog:-1001:message:30",
-    ]
-    assert data["checkpoint_cursor"] == "telegram:v1:dialog:-1001:message:51"
-    assert data["updated_after"] == "2026-02-01T00:01:00.000000Z"
-    assert data["updated_after_cursor"] == "telegram:v1:dialog:-1001:message:30"
+        assert result["ok"] is True
+        data = result["data"]
+        assert [change["unit"]["unit_ref"] for change in data["changes"]] == [
+            "dialog:-1001:message:51",
+            "dialog:-1001:message:30",
+        ]
+        assert data["checkpoint_cursor"] == "telegram:v1:dialog:-1001:message:51"
+        assert data["updated_after"] == "2026-02-01T00:01:00.000000Z"
+        assert data["updated_after_cursor"] == "telegram:v1:dialog:-1001:message:30"
+    finally:
+        conn.close()
 
 
 @pytest.mark.asyncio
 async def test_source_export_same_timestamp_uses_updated_after_cursor_tie_break() -> None:
     server, conn = _make_source_export_server()
-    _source_export_seed_dialog(conn, -1001)
-    _source_export_seed_message(conn, -1001, 30, text="first edit", sent_at=1769890000, edit_date=1769904060)
-    _source_export_seed_message(conn, -1001, 31, text="second edit", sent_at=1769890001, edit_date=1769904060)
+    try:
+        _source_export_seed_dialog(conn, -1001)
+        _source_export_seed_message(conn, -1001, 30, text="first edit", sent_at=1769890000, edit_date=1769904060)
+        _source_export_seed_message(conn, -1001, 31, text="second edit", sent_at=1769890001, edit_date=1769904060)
 
-    result = await server._dispatch(
-        {
-            "method": "export_source_changes",
-            "cursor": "telegram:v1:dialog:-1001:message:50",
-            "limit": 10,
-            "updated_after": "2026-02-01T00:01:00.000000Z",
-            "updated_after_cursor": "telegram:v1:dialog:-1001:message:30",
-        }
-    )
+        result = await server._dispatch(
+            {
+                "method": "export_source_changes",
+                "cursor": "telegram:v1:dialog:-1001:message:50",
+                "limit": 10,
+                "updated_after": "2026-02-01T00:01:00.000000Z",
+                "updated_after_cursor": "telegram:v1:dialog:-1001:message:30",
+            }
+        )
 
-    assert result["ok"] is True
-    assert [change["unit"]["unit_ref"] for change in result["data"]["changes"]] == [
-        "dialog:-1001:message:31",
-    ]
-    assert result["data"]["updated_after_cursor"] == "telegram:v1:dialog:-1001:message:31"
+        assert result["ok"] is True
+        assert [change["unit"]["unit_ref"] for change in result["data"]["changes"]] == [
+            "dialog:-1001:message:31",
+        ]
+        assert result["data"]["updated_after_cursor"] == "telegram:v1:dialog:-1001:message:31"
 
-    exhausted = await server._dispatch(
-        {
-            "method": "export_source_changes",
-            "cursor": "telegram:v1:dialog:-1001:message:50",
-            "limit": 10,
-            "updated_after": "2026-02-01T00:01:00.000000Z",
-            "updated_after_cursor": "telegram:v1:dialog:-1001:message:31",
-        }
-    )
-    assert exhausted["ok"] is True
-    assert exhausted["data"]["changes"] == []
+        exhausted = await server._dispatch(
+            {
+                "method": "export_source_changes",
+                "cursor": "telegram:v1:dialog:-1001:message:50",
+                "limit": 10,
+                "updated_after": "2026-02-01T00:01:00.000000Z",
+                "updated_after_cursor": "telegram:v1:dialog:-1001:message:31",
+            }
+        )
+        assert exhausted["ok"] is True
+        assert exhausted["data"]["changes"] == []
+    finally:
+        conn.close()
 
 
 @pytest.mark.asyncio
 async def test_source_export_read_unit_window_and_negative_dialog_cursor() -> None:
     server, conn = _make_source_export_server()
-    _source_export_seed_dialog(conn, -1001)
-    for message_id in (40, 41, 42):
-        _source_export_seed_message(
-            conn,
-            -1001,
-            message_id,
-            text=f"message {message_id}",
-            sent_at=1770000000 + message_id,
+    try:
+        _source_export_seed_dialog(conn, -1001)
+        for message_id in (40, 41, 42):
+            _source_export_seed_message(
+                conn,
+                -1001,
+                message_id,
+                text=f"message {message_id}",
+                sent_at=1770000000 + message_id,
+            )
+
+        export = await server._dispatch(
+            {
+                "method": "export_source_changes",
+                "cursor": "telegram:v1:dialog:-1001:message:41",
+                "limit": 10,
+            }
+        )
+        assert export["ok"] is True
+        assert [change["unit"]["unit_ref"] for change in export["data"]["changes"]] == [
+            "dialog:-1001:message:42",
+        ]
+
+        window = await server._dispatch(
+            {
+                "method": "read_source_unit_window",
+                "unit_ref": "dialog:-1001:message:41",
+                "before": 1,
+                "after": 1,
+            }
         )
 
-    export = await server._dispatch(
-        {
-            "method": "export_source_changes",
-            "cursor": "telegram:v1:dialog:-1001:message:41",
-            "limit": 10,
-        }
-    )
-    assert export["ok"] is True
-    assert [change["unit"]["unit_ref"] for change in export["data"]["changes"]] == [
-        "dialog:-1001:message:42",
-    ]
+        assert window["ok"] is True
+        data = window["data"]
+        assert data["namespace"] == "telegram"
+        assert data["document_ref"] == "dialog:-1001"
+        assert data["unit_ref"] == "dialog:-1001:message:41"
+        assert [unit["unit_ref"] for unit in data["units"]] == [
+            "dialog:-1001:message:40",
+            "dialog:-1001:message:41",
+            "dialog:-1001:message:42",
+        ]
 
-    window = await server._dispatch(
-        {
-            "method": "read_source_unit_window",
-            "unit_ref": "dialog:-1001:message:41",
-            "before": 1,
-            "after": 1,
-        }
-    )
-
-    assert window["ok"] is True
-    data = window["data"]
-    assert data["namespace"] == "telegram"
-    assert data["document_ref"] == "dialog:-1001"
-    assert data["unit_ref"] == "dialog:-1001:message:41"
-    assert [unit["unit_ref"] for unit in data["units"]] == [
-        "dialog:-1001:message:40",
-        "dialog:-1001:message:41",
-        "dialog:-1001:message:42",
-    ]
-
-    missing = await server._dispatch(
-        {
-            "method": "read_source_unit_window",
-            "unit_ref": "dialog:-1001:message:404",
-            "before": 1,
-            "after": 1,
-        }
-    )
-    assert missing == {"ok": False, "error": "not_found"}
+        missing = await server._dispatch(
+            {
+                "method": "read_source_unit_window",
+                "unit_ref": "dialog:-1001:message:404",
+                "before": 1,
+                "after": 1,
+            }
+        )
+        assert missing == {"ok": False, "error": "not_found"}
+    finally:
+        conn.close()
