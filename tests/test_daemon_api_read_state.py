@@ -12,7 +12,9 @@ Uses in-memory SQLite; telethon client mocked. Zero real Telegram calls.
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
 import sqlite3
+from collections.abc import Iterator
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -24,20 +26,6 @@ from mcp_telegram.daemon_api import (
     _dialog_type_from_db,
     _read_state_for_dialog,
 )
-
-
-_open_db_connections = set()
-
-
-@pytest.fixture(autouse=True)
-def _cleanup_db_connections():
-    yield
-    for conn in list(_open_db_connections):
-        try:
-            conn.close()
-        except Exception:
-            pass
-    _open_db_connections.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -59,9 +47,10 @@ def _patch_get_peer_id():
 # ---------------------------------------------------------------------------
 
 
-def _make_db() -> sqlite3.Connection:
+
+@contextmanager
+def _make_db() -> Iterator[sqlite3.Connection]:
     conn = sqlite3.connect(":memory:")
-    _open_db_connections.add(conn)
     conn.execute(
         """
         CREATE TABLE synced_dialogs (
@@ -177,7 +166,10 @@ def _make_db() -> sqlite3.Connection:
 
     conn.execute(MESSAGES_FTS_DDL)
     conn.commit()
-    return conn
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 
 def _insert_synced_dialog(
@@ -223,11 +215,9 @@ def _insert_message(
 
 
 def make_server(
-    conn: sqlite3.Connection | None = None,
+    conn: sqlite3.Connection,
     client: object | None = None,
 ) -> DaemonAPIServer:
-    if conn is None:
-        conn = _make_db()
     if client is None:
         client = MagicMock()
     shutdown_event = asyncio.Event()
@@ -285,16 +275,16 @@ def test_classify_dialog_type_channel_group_bot_forum() -> None:
 
 
 def test_dialog_type_from_db_reads_entities_table() -> None:
-    conn = _make_db()
-    _insert_entity(conn, 100, "User")
-    _insert_entity(conn, 200, "Channel")
-    assert _dialog_type_from_db(conn, 100) == "User"
-    assert _dialog_type_from_db(conn, 200) == "Channel"
+    with _make_db() as conn:
+        _insert_entity(conn, 100, "User")
+        _insert_entity(conn, 200, "Channel")
+        assert _dialog_type_from_db(conn, 100) == "User"
+        assert _dialog_type_from_db(conn, 200) == "Channel"
 
 
 def test_dialog_type_from_db_missing_entity_returns_unknown() -> None:
-    conn = _make_db()
-    assert _dialog_type_from_db(conn, 999) == "Unknown"
+    with _make_db() as conn:
+        assert _dialog_type_from_db(conn, 999) == "Unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -303,117 +293,117 @@ def test_dialog_type_from_db_missing_entity_returns_unknown() -> None:
 
 
 def test_read_state_for_dialog_dm_populated() -> None:
-    conn = _make_db()
-    _insert_synced_dialog(conn, 1, read_inbox_max_id=5, read_outbox_max_id=10)
-    # two unread incoming (ids 6, 7), one unread outgoing (id 11)
-    _insert_message(conn, 1, 6, out=0, sent_at=1000)
-    _insert_message(conn, 1, 7, out=0, sent_at=1100)
-    _insert_message(conn, 1, 11, out=1, sent_at=1200)
-    # Already-read messages (below cursor)
-    _insert_message(conn, 1, 3, out=0, sent_at=500)
-    _insert_message(conn, 1, 9, out=1, sent_at=600)
+    with _make_db() as conn:
+        _insert_synced_dialog(conn, 1, read_inbox_max_id=5, read_outbox_max_id=10)
+        # two unread incoming (ids 6, 7), one unread outgoing (id 11)
+        _insert_message(conn, 1, 6, out=0, sent_at=1000)
+        _insert_message(conn, 1, 7, out=0, sent_at=1100)
+        _insert_message(conn, 1, 11, out=1, sent_at=1200)
+        # Already-read messages (below cursor)
+        _insert_message(conn, 1, 3, out=0, sent_at=500)
+        _insert_message(conn, 1, 9, out=1, sent_at=600)
 
-    rs = _read_state_for_dialog(conn, 1, "User")
-    assert rs is not None
-    assert rs["inbox_unread_count"] == 2
-    assert rs["outbox_unread_count"] == 1
-    assert rs["inbox_cursor_state"] == "populated"
-    assert rs["outbox_cursor_state"] == "populated"
-    assert rs["inbox_max_id_anchor"] == 5
-    assert rs["outbox_max_id_anchor"] == 10
+        rs = _read_state_for_dialog(conn, 1, "User")
+        assert rs is not None
+        assert rs["inbox_unread_count"] == 2
+        assert rs["outbox_unread_count"] == 1
+        assert rs["inbox_cursor_state"] == "populated"
+        assert rs["outbox_cursor_state"] == "populated"
+        assert rs["inbox_max_id_anchor"] == 5
+        assert rs["outbox_max_id_anchor"] == 10
 
 
 def test_read_state_for_dialog_dm_all_read() -> None:
-    conn = _make_db()
-    _insert_synced_dialog(conn, 1, read_inbox_max_id=50, read_outbox_max_id=50)
-    _insert_message(conn, 1, 5, out=0)
-    _insert_message(conn, 1, 6, out=1)
+    with _make_db() as conn:
+        _insert_synced_dialog(conn, 1, read_inbox_max_id=50, read_outbox_max_id=50)
+        _insert_message(conn, 1, 5, out=0)
+        _insert_message(conn, 1, 6, out=1)
 
-    rs = _read_state_for_dialog(conn, 1, "User")
-    assert rs is not None
-    assert rs["inbox_unread_count"] == 0
-    assert rs["outbox_unread_count"] == 0
-    assert rs["inbox_cursor_state"] == "all_read"
-    assert rs["outbox_cursor_state"] == "all_read"
+        rs = _read_state_for_dialog(conn, 1, "User")
+        assert rs is not None
+        assert rs["inbox_unread_count"] == 0
+        assert rs["outbox_unread_count"] == 0
+        assert rs["inbox_cursor_state"] == "all_read"
+        assert rs["outbox_cursor_state"] == "all_read"
 
 
 def test_read_state_for_dialog_dm_inbox_null() -> None:
-    conn = _make_db()
-    _insert_synced_dialog(conn, 1, read_inbox_max_id=None, read_outbox_max_id=10)
-    _insert_message(conn, 1, 5, out=0)
-    _insert_message(conn, 1, 11, out=1)
+    with _make_db() as conn:
+        _insert_synced_dialog(conn, 1, read_inbox_max_id=None, read_outbox_max_id=10)
+        _insert_message(conn, 1, 5, out=0)
+        _insert_message(conn, 1, 11, out=1)
 
-    rs = _read_state_for_dialog(conn, 1, "User")
-    assert rs is not None
-    assert rs["inbox_cursor_state"] == "null"
-    # NULL cursor: "inbox_max_id_anchor" must be omitted
-    assert "inbox_max_id_anchor" not in rs
-    assert rs["outbox_cursor_state"] == "populated"
-    assert rs["outbox_unread_count"] == 1
+        rs = _read_state_for_dialog(conn, 1, "User")
+        assert rs is not None
+        assert rs["inbox_cursor_state"] == "null"
+        # NULL cursor: "inbox_max_id_anchor" must be omitted
+        assert "inbox_max_id_anchor" not in rs
+        assert rs["outbox_cursor_state"] == "populated"
+        assert rs["outbox_unread_count"] == 1
 
 
 def test_read_state_for_dialog_dm_outbox_null() -> None:
-    conn = _make_db()
-    _insert_synced_dialog(conn, 1, read_inbox_max_id=5, read_outbox_max_id=None)
-    _insert_message(conn, 1, 6, out=0)
-    _insert_message(conn, 1, 7, out=1)
+    with _make_db() as conn:
+        _insert_synced_dialog(conn, 1, read_inbox_max_id=5, read_outbox_max_id=None)
+        _insert_message(conn, 1, 6, out=0)
+        _insert_message(conn, 1, 7, out=1)
 
-    rs = _read_state_for_dialog(conn, 1, "User")
-    assert rs is not None
-    assert rs["inbox_cursor_state"] == "populated"
-    assert rs["outbox_cursor_state"] == "null"
-    assert "outbox_max_id_anchor" not in rs
+        rs = _read_state_for_dialog(conn, 1, "User")
+        assert rs is not None
+        assert rs["inbox_cursor_state"] == "populated"
+        assert rs["outbox_cursor_state"] == "null"
+        assert "outbox_max_id_anchor" not in rs
 
 
 def test_read_state_for_dialog_non_dm_returns_none() -> None:
-    conn = _make_db()
-    _insert_synced_dialog(conn, 1, read_inbox_max_id=0, read_outbox_max_id=0)
-    assert _read_state_for_dialog(conn, 1, "Channel") is None
-    assert _read_state_for_dialog(conn, 1, "Group") is None
-    assert _read_state_for_dialog(conn, 1, "Forum") is None
-    assert _read_state_for_dialog(conn, 1, "Chat") is None
-    assert _read_state_for_dialog(conn, 1, "Bot") is None
-    assert _read_state_for_dialog(conn, 1, "Unknown") is None
+    with _make_db() as conn:
+        _insert_synced_dialog(conn, 1, read_inbox_max_id=0, read_outbox_max_id=0)
+        assert _read_state_for_dialog(conn, 1, "Channel") is None
+        assert _read_state_for_dialog(conn, 1, "Group") is None
+        assert _read_state_for_dialog(conn, 1, "Forum") is None
+        assert _read_state_for_dialog(conn, 1, "Chat") is None
+        assert _read_state_for_dialog(conn, 1, "Bot") is None
+        assert _read_state_for_dialog(conn, 1, "Unknown") is None
 
 
 def test_read_state_for_dialog_oldest_unread_date_inbox() -> None:
-    conn = _make_db()
-    _insert_synced_dialog(conn, 1, read_inbox_max_id=5, read_outbox_max_id=100)
-    _insert_message(conn, 1, 6, out=0, sent_at=1500)
-    _insert_message(conn, 1, 7, out=0, sent_at=1400)  # oldest unread incoming
-    _insert_message(conn, 1, 8, out=0, sent_at=1600)
+    with _make_db() as conn:
+        _insert_synced_dialog(conn, 1, read_inbox_max_id=5, read_outbox_max_id=100)
+        _insert_message(conn, 1, 6, out=0, sent_at=1500)
+        _insert_message(conn, 1, 7, out=0, sent_at=1400)  # oldest unread incoming
+        _insert_message(conn, 1, 8, out=0, sent_at=1600)
 
-    rs = _read_state_for_dialog(conn, 1, "User")
-    assert rs is not None
-    assert rs["inbox_oldest_unread_date"] == 1400
-    assert "outbox_oldest_unread_date" not in rs  # outbox caught up
+        rs = _read_state_for_dialog(conn, 1, "User")
+        assert rs is not None
+        assert rs["inbox_oldest_unread_date"] == 1400
+        assert "outbox_oldest_unread_date" not in rs  # outbox caught up
 
 
 def test_read_state_for_dialog_oldest_unread_date_outbox() -> None:
-    conn = _make_db()
-    _insert_synced_dialog(conn, 1, read_inbox_max_id=100, read_outbox_max_id=5)
-    _insert_message(conn, 1, 6, out=1, sent_at=2500)
-    _insert_message(conn, 1, 7, out=1, sent_at=2400)  # oldest unread outgoing
-    _insert_message(conn, 1, 8, out=1, sent_at=2600)
+    with _make_db() as conn:
+        _insert_synced_dialog(conn, 1, read_inbox_max_id=100, read_outbox_max_id=5)
+        _insert_message(conn, 1, 6, out=1, sent_at=2500)
+        _insert_message(conn, 1, 7, out=1, sent_at=2400)  # oldest unread outgoing
+        _insert_message(conn, 1, 8, out=1, sent_at=2600)
 
-    rs = _read_state_for_dialog(conn, 1, "User")
-    assert rs is not None
-    assert rs["outbox_oldest_unread_date"] == 2400
-    assert "inbox_oldest_unread_date" not in rs
+        rs = _read_state_for_dialog(conn, 1, "User")
+        assert rs is not None
+        assert rs["outbox_oldest_unread_date"] == 2400
+        assert "inbox_oldest_unread_date" not in rs
 
 
 def test_read_state_for_dialog_zero_telegram_api_calls() -> None:
-    conn = _make_db()
-    _insert_synced_dialog(conn, 1, read_inbox_max_id=0, read_outbox_max_id=0)
-    _insert_message(conn, 1, 1, out=0)
+    with _make_db() as conn:
+        _insert_synced_dialog(conn, 1, read_inbox_max_id=0, read_outbox_max_id=0)
+        _insert_message(conn, 1, 1, out=0)
 
-    # Use a strict MagicMock that would raise if any attribute is accessed
-    client = MagicMock(spec=[])  # no attributes at all — any access raises AttributeError
-    # Helper takes only conn + dialog_id + dialog_type; never touches client.
-    rs = _read_state_for_dialog(conn, 1, "User")
-    assert rs is not None
-    # Double-check: client stayed untouched
-    assert client.mock_calls == []
+        # Use a strict MagicMock that would raise if any attribute is accessed
+        client = MagicMock(spec=[])  # no attributes at all — any access raises AttributeError
+        # Helper takes only conn + dialog_id + dialog_type; never touches client.
+        rs = _read_state_for_dialog(conn, 1, "User")
+        assert rs is not None
+        # Double-check: client stayed untouched
+        assert client.mock_calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -423,119 +413,119 @@ def test_read_state_for_dialog_zero_telegram_api_calls() -> None:
 
 @pytest.mark.asyncio
 async def test_list_messages_response_includes_read_state_and_dialog_type() -> None:
-    conn = _make_db()
-    _insert_synced_dialog(conn, 1, read_inbox_max_id=0, read_outbox_max_id=0)
-    _insert_entity(conn, 1, "User")
-    _insert_message(conn, 1, 2, out=0, sent_at=1234)
+    with _make_db() as conn:
+        _insert_synced_dialog(conn, 1, read_inbox_max_id=0, read_outbox_max_id=0)
+        _insert_entity(conn, 1, "User")
+        _insert_message(conn, 1, 2, out=0, sent_at=1234)
 
-    server = make_server(conn)
-    server.self_id = 999
-    result = await server._list_messages({"dialog_id": 1, "limit": 10})
-    assert result["ok"] is True
-    data = result["data"]
-    assert data["dialog_type"] == "User"
-    rs = data["read_state"]
-    assert rs is not None
-    assert rs["inbox_unread_count"] == 1
+        server = make_server(conn)
+        server.self_id = 999
+        result = await server._list_messages({"dialog_id": 1, "limit": 10})
+        assert result["ok"] is True
+        data = result["data"]
+        assert data["dialog_type"] == "User"
+        rs = data["read_state"]
+        assert rs is not None
+        assert rs["inbox_unread_count"] == 1
 
 
 @pytest.mark.asyncio
 async def test_list_messages_context_window_response_includes_read_state() -> None:
-    conn = _make_db()
-    _insert_synced_dialog(conn, 1, read_inbox_max_id=0, read_outbox_max_id=5)
-    _insert_entity(conn, 1, "User")
-    for mid in (1, 2, 3, 4, 5):
-        _insert_message(conn, 1, mid, out=0, sent_at=1000 + mid)
+    with _make_db() as conn:
+        _insert_synced_dialog(conn, 1, read_inbox_max_id=0, read_outbox_max_id=5)
+        _insert_entity(conn, 1, "User")
+        for mid in (1, 2, 3, 4, 5):
+            _insert_message(conn, 1, mid, out=0, sent_at=1000 + mid)
 
-    server = make_server(conn)
-    server.self_id = 999
-    result = await server._list_messages({"dialog_id": 1, "context_message_id": 3, "context_size": 4})
-    assert result["ok"] is True
-    data = result["data"]
-    assert data["dialog_type"] == "User"
-    assert data["read_state"] is not None
-    assert data["read_state"]["inbox_unread_count"] == 5
+        server = make_server(conn)
+        server.self_id = 999
+        result = await server._list_messages({"dialog_id": 1, "context_message_id": 3, "context_size": 4})
+        assert result["ok"] is True
+        data = result["data"]
+        assert data["dialog_type"] == "User"
+        assert data["read_state"] is not None
+        assert data["read_state"]["inbox_unread_count"] == 5
 
 
 @pytest.mark.asyncio
 async def test_search_messages_response_includes_read_state_per_dialog() -> None:
-    conn = _make_db()
-    _insert_synced_dialog(conn, 1, read_inbox_max_id=0, read_outbox_max_id=0)
-    _insert_synced_dialog(conn, 2, read_inbox_max_id=0, read_outbox_max_id=0)
-    _insert_synced_dialog(conn, 3, read_inbox_max_id=0, read_outbox_max_id=0)
-    _insert_entity(conn, 1, "User")
-    _insert_entity(conn, 2, "User")
-    _insert_entity(conn, 3, "Channel")
+    with _make_db() as conn:
+        _insert_synced_dialog(conn, 1, read_inbox_max_id=0, read_outbox_max_id=0)
+        _insert_synced_dialog(conn, 2, read_inbox_max_id=0, read_outbox_max_id=0)
+        _insert_synced_dialog(conn, 3, read_inbox_max_id=0, read_outbox_max_id=0)
+        _insert_entity(conn, 1, "User")
+        _insert_entity(conn, 2, "User")
+        _insert_entity(conn, 3, "Channel")
 
-    # Insert messages and index into FTS
-    from mcp_telegram.fts import stem_text
+        # Insert messages and index into FTS
+        from mcp_telegram.fts import stem_text
 
-    def _add(dialog_id: int, mid: int, text: str) -> None:
-        conn.execute(
-            "INSERT INTO messages (dialog_id, message_id, sent_at, text, out) VALUES (?, ?, ?, ?, 0)",
-            (dialog_id, mid, 1_700_000_000, text),
-        )
-        conn.execute(
-            "INSERT INTO messages_fts (dialog_id, message_id, stemmed_text) VALUES (?, ?, ?)",
-            (dialog_id, mid, stem_text(text)),
-        )
+        def _add(dialog_id: int, mid: int, text: str) -> None:
+            conn.execute(
+                "INSERT INTO messages (dialog_id, message_id, sent_at, text, out) VALUES (?, ?, ?, ?, 0)",
+                (dialog_id, mid, 1_700_000_000, text),
+            )
+            conn.execute(
+                "INSERT INTO messages_fts (dialog_id, message_id, stemmed_text) VALUES (?, ?, ?)",
+                (dialog_id, mid, stem_text(text)),
+            )
 
-    _add(1, 10, "searchable needle alpha")
-    _add(2, 20, "searchable needle beta")
-    _add(3, 30, "searchable needle gamma")
-    conn.commit()
+        _add(1, 10, "searchable needle alpha")
+        _add(2, 20, "searchable needle beta")
+        _add(3, 30, "searchable needle gamma")
+        conn.commit()
 
-    server = make_server(conn)
-    server.self_id = 999
+        server = make_server(conn)
+        server.self_id = 999
 
-    result = await server._search_messages({"query": "needle", "limit": 50})
-    assert result["ok"] is True
-    rsp = result["data"].get("read_state_per_dialog")
-    assert rsp is not None
-    # Only DMs (1, 2) included; Channel (3) excluded
-    assert 1 in rsp and 2 in rsp
-    assert 3 not in rsp
+        result = await server._search_messages({"query": "needle", "limit": 50})
+        assert result["ok"] is True
+        rsp = result["data"].get("read_state_per_dialog")
+        assert rsp is not None
+        # Only DMs (1, 2) included; Channel (3) excluded
+        assert 1 in rsp and 2 in rsp
+        assert 3 not in rsp
 
 
 @pytest.mark.asyncio
 async def test_list_unread_messages_response_includes_per_group_read_state() -> None:
-    conn = _make_db()
-    _insert_synced_dialog(conn, 1, read_inbox_max_id=5, read_outbox_max_id=0)
-    _insert_synced_dialog(conn, 2, read_inbox_max_id=3, read_outbox_max_id=0)
-    _insert_entity(conn, 1, "User", name="Alice")
-    _insert_entity(conn, 2, "User", name="Bob")
-    _insert_message(conn, 1, 6, out=0, sent_at=1100)
-    _insert_message(conn, 1, 7, out=0, sent_at=1200)
-    _insert_message(conn, 2, 4, out=0, sent_at=1300)
-    # Give each dialog a last_event_at so they appear in unread
-    conn.execute("UPDATE synced_dialogs SET last_event_at = 1500")
-    conn.commit()
+    with _make_db() as conn:
+        _insert_synced_dialog(conn, 1, read_inbox_max_id=5, read_outbox_max_id=0)
+        _insert_synced_dialog(conn, 2, read_inbox_max_id=3, read_outbox_max_id=0)
+        _insert_entity(conn, 1, "User", name="Alice")
+        _insert_entity(conn, 2, "User", name="Bob")
+        _insert_message(conn, 1, 6, out=0, sent_at=1100)
+        _insert_message(conn, 1, 7, out=0, sent_at=1200)
+        _insert_message(conn, 2, 4, out=0, sent_at=1300)
+        # Give each dialog a last_event_at so they appear in unread
+        conn.execute("UPDATE synced_dialogs SET last_event_at = 1500")
+        conn.commit()
 
-    server = make_server(conn)
-    server.self_id = 999
+        server = make_server(conn)
+        server.self_id = 999
 
-    result = await server._list_unread_messages({"scope": "personal", "limit": 100})
-    assert result["ok"] is True
-    groups = result["data"]["groups"]
-    assert len(groups) >= 2
-    for g in groups:
-        assert "dialog_type" in g
-        assert "read_state" in g
-        if g["dialog_id"] in (1, 2):
-            assert g["dialog_type"] == "User"
-            assert g["read_state"] is not None
+        result = await server._list_unread_messages({"scope": "personal", "limit": 100})
+        assert result["ok"] is True
+        groups = result["data"]["groups"]
+        assert len(groups) >= 2
+        for g in groups:
+            assert "dialog_type" in g
+            assert "read_state" in g
+            if g["dialog_id"] in (1, 2):
+                assert g["dialog_type"] == "User"
+                assert g["read_state"] is not None
 
 
 @pytest.mark.asyncio
 async def test_non_dm_read_path_response_has_none_read_state() -> None:
-    conn = _make_db()
-    _insert_synced_dialog(conn, 42, read_inbox_max_id=0, read_outbox_max_id=0)
-    _insert_entity(conn, 42, "Channel")
-    _insert_message(conn, 42, 1, out=0, sent_at=1000)
+    with _make_db() as conn:
+        _insert_synced_dialog(conn, 42, read_inbox_max_id=0, read_outbox_max_id=0)
+        _insert_entity(conn, 42, "Channel")
+        _insert_message(conn, 42, 1, out=0, sent_at=1000)
 
-    server = make_server(conn)
-    server.self_id = 999
-    result = await server._list_messages({"dialog_id": 42, "limit": 10})
-    assert result["ok"] is True
-    assert result["data"]["dialog_type"] == "Channel"
-    assert result["data"]["read_state"] is None
+        server = make_server(conn)
+        server.self_id = 999
+        result = await server._list_messages({"dialog_id": 42, "limit": 10})
+        assert result["ok"] is True
+        assert result["data"]["dialog_type"] == "Channel"
+        assert result["data"]["read_state"] is None
