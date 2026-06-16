@@ -8,19 +8,55 @@ default:
     @just --list
 
 # Run all local source checks.
-check: lint typecheck test
+check: lint typecheck actionlint compile deadcode
 
 # Run ruff over source, tests, and deploy helpers.
 lint:
     uv run ruff check src tests deploy
 
+# Check formatting without writing. Not yet part of `check`; the current tree
+# needs a separate formatting migration.
+fmt-check:
+    uv run ruff format --check src tests deploy
+
 # Run mypy over the package and deploy helpers.
 typecheck:
     uv run mypy src/mcp_telegram deploy
 
+# Run basedpyright. Advisory for now; mypy remains the canonical type gate until
+# the basedpyright backlog is burned down.
+typecheck-pyright:
+    uv run basedpyright src/mcp_telegram deploy --warnings
+
+# Type-check tests with basedpyright. Advisory for now.
+typecheck-tests:
+    uv run basedpyright tests --warnings
+
+# Check import-layer architecture contracts. Contract definitions will be added
+# incrementally once the package boundaries are explicit enough to ratchet.
+import-contracts:
+    uv run lint-imports
+
+# Check GitHub Actions workflow syntax and expressions.
+actionlint:
+    uv run actionlint
+
+# Compile Python sources for syntax errors.
+compile:
+    uv run python -m compileall -q src tests deploy
+
 # Run pytest. Extra args are forwarded, e.g. `just test tests/test_daemon_api.py -q`.
 test *args:
     uv run pytest {{args}}
+
+# Run a bounded parallel pytest slice. Avoid `-n auto` on this host: execnet can
+# hit thread limits during worker teardown.
+test-parallel *args:
+    uv run pytest -n 2 {{args}}
+
+# Unit tests.
+unit:
+    uv run pytest
 
 # Dead-code sieve (advisory — vulture has false positives, read with judgment).
 deadcode:
@@ -59,8 +95,13 @@ runtime-smoke: runtime-smoke-stdio runtime-smoke-http
 # Rebuild the live container and run the redacted MCP smoke.
 runtime-verify: runtime-build runtime-wait runtime-smoke
 
-# Run local checks, rebuild the runtime, and smoke-test live MCP behavior.
-verify: check runtime-verify
+# Auto-fix ruff findings and formatting.
+fix:
+    uv run ruff check --fix src tests deploy
+    uv run ruff format src tests deploy
+
+# Run local checks, unit tests, rebuild the runtime, and smoke-test live MCP behavior.
+verify: check unit runtime-verify
 
 # Show live Docker container state.
 runtime-status:

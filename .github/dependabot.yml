@@ -15,6 +15,8 @@ updates:
       - "dependencies"
     groups:
       python-minor-patch:
+        patterns:
+          - "*"
         update-types:
           - "minor"
           - "patch"

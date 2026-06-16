@@ -33,6 +33,10 @@ dev = [
     "ruff>=0.15.11",
     "vulture>=2",
     "pytest-cov>=7",
+    "pytest-xdist>=3.8.0",
+    "actionlint-py>=1.7.12.24",
+    "basedpyright>=1.39.8",
+    "import-linter>=2.11",
 ]
 
 [project.scripts]
@@ -88,3 +92,24 @@ branch = true
 
 [tool.coverage.report]
 show_missing = true
+
+[tool.pyright]
+include = ["src/mcp_telegram", "deploy", "tests"]
+pythonVersion = "3.14"
+typeCheckingMode = "standard"
+reportAny = "error"
+reportExplicitAny = "error"
+reportUnknownVariableType = "none"
+reportUnknownArgumentType = "none"
+reportUnknownMemberType = "none"
+reportUnknownParameterType = "none"
+reportUnknownLambdaType = "none"
+reportMissingParameterType = "error"
+reportMissingTypeArgument = "none"
+reportUnannotatedClassAttribute = "none"
+reportUnusedCallResult = "none"
+reportImplicitStringConcatenation = "none"
+reportPrivateUsage = "none"
+
+[tool.importlinter]
+root_package = "mcp_telegram"
