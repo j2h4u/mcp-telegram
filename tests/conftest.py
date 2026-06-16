@@ -249,14 +249,21 @@ def make_synced_db():
             conn = make_synced_db()
             ...
     """
+    connections = []
     from mcp_telegram.sync_db import _apply_migrations
 
     def _factory() -> sqlite3.Connection:
         conn = sqlite3.connect(":memory:")
         _apply_migrations(conn)
+        connections.append(conn)
         return conn
 
-    return _factory
+    try:
+        yield _factory
+    finally:
+        for conn in connections:
+            conn.close()
+        connections.clear()
 
 
 @pytest.fixture()
