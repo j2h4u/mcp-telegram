@@ -75,6 +75,9 @@ class _MockEntityCache:
         ).fetchall()
         return {row[0]: row[1] for row in rows}
 
+    def close(self) -> None:
+        self._conn.close()
+
 
 @pytest.fixture()
 def tmp_db_path(tmp_path: Path) -> Path:
@@ -100,11 +103,14 @@ async def async_iter(items):
 
 
 @pytest.fixture()
-def mock_cache(tmp_db_path: Path) -> _MockEntityCache:
+def mock_cache(tmp_db_path: Path):
     """Return _MockEntityCache seeded with entity 101 (Иван Петров)."""
     cache = _MockEntityCache(tmp_db_path)
     cache.upsert(101, "user", "Иван Петров", "ivan")
-    return cache
+    try:
+        yield cache
+    finally:
+        cache.close()
 
 
 @pytest.fixture()
