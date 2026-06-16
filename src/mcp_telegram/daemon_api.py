@@ -232,6 +232,18 @@ from .sync_worker import (
 # Phase 39.2 §Key technical decisions: per-message TTL for JIT reactions freshen-on-read.
 # Amortizes rapid paginated reads on the same ids; live events catch most mutations.
 REACTIONS_TTL_SECONDS = 600
+_TRACE_SCOPE_DIALOG_IDS_LEN = 2
+_TRACE_ACRONYM_MIN_LEN = 2
+_TRACE_ACRONYM_MAX_LEN = 4
+_TRACE_FUZZY_MIN_LEN = 4
+_TRACE_FUZZY_SCORE_MIN = 75
+_MEMBERSHIP_THRESHOLD_LARGE = 1000
+_TELEMETRY_TOOL_NAME_MAX_LEN = 200
+_FEEDBACK_MESSAGE_MAX_LEN = 10000
+_FEEDBACK_CONTEXT_MAX_LEN = 2000
+_FEEDBACK_MODEL_MAX_LEN = 200
+_FEEDBACK_HARNESS_MAX_LEN = 200
+_UPSERT_ENTITIES_MAX_LEN = 10000
 from .resolver import (
     Candidates,
     Resolved,
@@ -3356,7 +3368,7 @@ class DaemonAPIServer:
             if decoded.scope_dialog_ids is not None:
                 scope_dialog_ids = decoded.scope_dialog_ids
                 # Also repopulate linked_chat_map for _trace_candidate_dialogs.
-                if exact_dialog_id is not None and len(scope_dialog_ids) == 2:
+                if exact_dialog_id is not None and len(scope_dialog_ids) == _TRACE_SCOPE_DIALOG_IDS_LEN:
                     channel_id_from_token = scope_dialog_ids[0]
                     linked_id_from_token = scope_dialog_ids[1]
                     if channel_id_from_token == exact_dialog_id:
@@ -4042,10 +4054,15 @@ class DaemonAPIServer:
                 filter_raw_lc = (name_filter_raw or "").strip().lower()
                 if filter_norm in name_norm:
                     pass  # substring hit
-                elif 2 <= len(filter_raw_lc) <= 4 and filter_raw_lc in name_initials_raw:
+                elif (
+                    _TRACE_ACRONYM_MIN_LEN <= len(filter_raw_lc) <= _TRACE_ACRONYM_MAX_LEN
+                    and filter_raw_lc in name_initials_raw
+                ):
                     pass  # acronym hit ("ЖС" -> "жс" ⊆ "kxжс")
                 elif (
-                    len(filter_norm) >= 4 and len(name_norm) >= 4 and _fuzz.partial_ratio(filter_norm, name_norm) >= 75
+                    len(filter_norm) >= _TRACE_FUZZY_MIN_LEN
+                    and len(name_norm) >= _TRACE_FUZZY_MIN_LEN
+                    and _fuzz.partial_ratio(filter_norm, name_norm) >= _TRACE_FUZZY_SCORE_MIN
                 ):
                     pass  # typo-tolerant fuzzy hit
                 else:
@@ -4972,7 +4989,7 @@ class DaemonAPIServer:
             # avoid unbounded iter_participants on a potentially large channel.
             contacts_subscribed = None
             contacts_reason = "count_unavailable"
-        elif subscribers_count > 1000:
+        elif subscribers_count > _MEMBERSHIP_THRESHOLD_LARGE:
             # D-15 above-threshold: phone-contacts intersection only.
             # Same pattern as _fetch_supergroup_detail's >1000 branch.
             try:
@@ -5208,7 +5225,7 @@ class DaemonAPIServer:
             # avoid unbounded iter_participants on a potentially large supergroup.
             contacts_subscribed = None
             contacts_reason = "count_unavailable"
-        elif members_count > 1000:
+        elif members_count > _MEMBERSHIP_THRESHOLD_LARGE:
             # D-15 above-threshold: phone-contacts intersection only.
             try:
                 gp_result = await self._client(
@@ -5621,7 +5638,7 @@ class DaemonAPIServer:
         if not isinstance(event, dict):
             return {"ok": False, "error": "invalid_input", "message": "event must be a JSON object"}
         tool_name = event.get("tool_name", "")
-        if not isinstance(tool_name, str) or len(tool_name) > 200:
+        if not isinstance(tool_name, str) or len(tool_name) > _TELEMETRY_TOOL_NAME_MAX_LEN:
             return {"ok": False, "error": "invalid_input", "message": "tool_name must be a string (max 200 chars)"}
         try:
             self._conn.execute(
@@ -5675,7 +5692,7 @@ class DaemonAPIServer:
         stripped = message.strip()
         if not stripped:
             return {"ok": False, "error": "invalid_input", "message": "message is required"}
-        if len(message) > 10000:
+        if len(message) > _FEEDBACK_MESSAGE_MAX_LEN:
             return {"ok": False, "error": "invalid_input", "message": "message too long (max 10000 chars)"}
 
         severity = req.get("severity")
@@ -5694,11 +5711,11 @@ class DaemonAPIServer:
         context = req.get("context")
         model = req.get("model")
         harness = req.get("harness")
-        if context is not None and len(str(context)) > 2000:
+        if context is not None and len(str(context)) > _FEEDBACK_CONTEXT_MAX_LEN:
             return {"ok": False, "error": "invalid_input", "message": "context too long (max 2000 chars)"}
-        if model is not None and len(str(model)) > 200:
+        if model is not None and len(str(model)) > _FEEDBACK_MODEL_MAX_LEN:
             return {"ok": False, "error": "invalid_input", "message": "model too long (max 200 chars)"}
-        if harness is not None and len(str(harness)) > 200:
+        if harness is not None and len(str(harness)) > _FEEDBACK_HARNESS_MAX_LEN:
             return {"ok": False, "error": "invalid_input", "message": "harness too long (max 200 chars)"}
 
         try:
@@ -6175,7 +6192,7 @@ class DaemonAPIServer:
         Errors: invalid_input (not a list or >10000), internal.
         """
         entities = req.get("entities", [])
-        if not isinstance(entities, list) or len(entities) > 10000:
+        if not isinstance(entities, list) or len(entities) > _UPSERT_ENTITIES_MAX_LEN:
             return {"ok": False, "error": "invalid_input", "message": "entities must be a list (max 10000)"}
         if not entities:
             return {"ok": True, "upserted": 0}
