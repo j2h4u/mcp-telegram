@@ -95,6 +95,16 @@ def _patch_feedback_db(tmp_path: Path):
         yield
 
 
+@pytest.fixture(autouse=True)
+def _patch_bootstrap_worker():
+    """Avoid opening a real sqlite connection for DialogsBootstrapWorker in tests."""
+    bootstrap_worker = MagicMock()
+    bootstrap_worker.run = AsyncMock(return_value=0)
+
+    with patch("mcp_telegram.daemon.DialogsBootstrapWorker", return_value=bootstrap_worker):
+        yield
+
+
 def test_sync_main_connects_and_heartbeats(
     mock_client: AsyncMock,
     caplog: pytest.LogCaptureFixture,
