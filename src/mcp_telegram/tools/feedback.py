@@ -49,36 +49,10 @@ SUBMIT_FEEDBACK_OUTPUT_SCHEMA = {
 
 class SubmitFeedback(ToolArgs):
     """
-    Send feedback to the maintainer of this MCP server — bugs, confusing
-    behaviour, or improvement suggestions. Use this proactively whenever
-    you notice that a tool's response is unhelpful, surprising, or wrong;
-    when an error message is unclear; or when you can think of a missing
-    capability that would have helped on the current task.
-
-    Fields:
-      message:  required. Free-form text describing what you observed and,
-                if you have one, what you would expect instead. Up to
-                10,000 characters.
-      severity: optional. One of:
-                  bug        — the tool produced incorrect output, crashed,
-                               or violated its documented contract
-                  suggestion — request for a new tool, new option, or
-                               improved UX
-                  question   — you're unsure how something is supposed to
-                               work and want the maintainer to clarify the
-                               docs
-      context:  optional. Which tool you were calling and what arguments
-                you passed (or what task you were trying to accomplish).
-                Helps the maintainer reproduce the issue. Up to 2,000 chars.
-      model:    optional. Your model name (e.g. "claude-opus-4-7"). Helps
-                the maintainer correlate feedback with model versions.
-      harness:  optional. Your client name (e.g. "Claude Desktop", "Cursor",
-                "Codex CLI"). Helps the maintainer prioritise client-specific
-                issues. Up to 200 chars.
-
-    Submissions are fire-and-forget — there is no follow-up tool, no
-    tracking ID, and no read access for agents. The maintainer reviews
-    feedback out-of-band and may act on it in future releases.
+    Report a bug, confusing response, unclear error, or missing capability to
+    the maintainer. Use proactively when the current task exposes tool friction.
+    Submissions are fire-and-forget: no read-back tool, tracking ID, or agent
+    access to the feedback queue.
     """
 
     message: str = Field(min_length=1, max_length=10000)
@@ -110,7 +84,12 @@ class SubmitFeedback(ToolArgs):
 @mcp_tool(
     name="submit_feedback",
     title="Submit Feedback",
-    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False),
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=False,
+    ),
     output_schema=SUBMIT_FEEDBACK_OUTPUT_SCHEMA,
 )
 async def submit_feedback(args: SubmitFeedback) -> ToolResult:

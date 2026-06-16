@@ -210,7 +210,12 @@ def _usage_structured_content(stats: dict, *, summary: str, empty: bool) -> dict
     name="get_usage_stats",
     title="Usage Stats",
     posture="secondary/helper",
-    annotations=ToolAnnotations(readOnlyHint=True),
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
     output_schema=GET_USAGE_STATS_OUTPUT_SCHEMA,
 )
 async def get_usage_stats(args: GetUsageStats) -> ToolResult:
@@ -256,7 +261,12 @@ class GetDialogStats(ToolArgs):
     name="get_dialog_stats",
     title="Dialog Stats",
     posture="secondary/helper",
-    annotations=ToolAnnotations(readOnlyHint=True),
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
     output_schema=GET_DIALOG_STATS_OUTPUT_SCHEMA,
 )
 async def get_dialog_stats(args: GetDialogStats) -> ToolResult:

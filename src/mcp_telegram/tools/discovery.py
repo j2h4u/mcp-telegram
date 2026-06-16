@@ -180,7 +180,12 @@ class ListDialogs(ToolArgs):
     name="list_dialogs",
     title="List Dialogs",
     posture="secondary/helper",
-    annotations=ToolAnnotations(readOnlyHint=True),
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
     output_schema=LIST_DIALOGS_OUTPUT_SCHEMA,
 )
 async def list_dialogs(args: ListDialogs) -> ToolResult:
@@ -290,7 +295,12 @@ class ListTopics(ToolArgs):
     name="list_topics",
     title="List Topics",
     posture="secondary/helper",
-    annotations=ToolAnnotations(readOnlyHint=True),
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
     output_schema=LIST_TOPICS_OUTPUT_SCHEMA,
 )
 async def list_topics(args: ListTopics) -> ToolResult:

@@ -567,7 +567,12 @@ class GetEntityInfo(ToolArgs):
 @mcp_tool(
     name="get_entity_info",
     title="Entity Info",
-    annotations=ToolAnnotations(readOnlyHint=True),
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
     output_schema=GET_ENTITY_INFO_OUTPUT_SCHEMA,
 )
 async def get_entity_info(args: GetEntityInfo) -> ToolResult:

@@ -376,7 +376,12 @@ def _trace_structured_content(data: dict, args: TraceAccountMessages) -> dict[st
 @mcp_tool(
     name="trace_account_messages",
     title="Account Trace",
-    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True),
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
     output_schema=TRACE_ACCOUNT_MESSAGES_OUTPUT_SCHEMA,
 )
 async def trace_account_messages(args: TraceAccountMessages) -> ToolResult:

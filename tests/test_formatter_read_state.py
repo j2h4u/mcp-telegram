@@ -648,35 +648,27 @@ def test_format_unread_messages_grouped_backward_compat_without_kwargs() -> None
 # ---------------------------------------------------------------------------
 
 
-def test_tool_description_contains_all_seven_ac13_literals() -> None:
-    """AC-13: ListMessages description contains all 7 literal strings."""
+def test_tool_description_points_to_structured_read_state_fields() -> None:
+    """ListMessages description should stay compact and point agents to structured fields."""
     from mcp_telegram.tools.reading import ListMessages
 
     doc = ListMessages.__doc__ or ""
-    for literal in [
+    assert "read_state" in doc
+    assert "inline read markers" in doc
+    assert "[I read up to here]" not in doc
+    assert len(doc.split()) < 160
+
+
+def test_read_state_marker_labels_remain_available_in_structured_output_helpers() -> None:
+    """The old marker information lives in structured output, not the tool descriptor."""
+    from mcp_telegram.tools.reading import ListMessages
+    from mcp_telegram.tools.unread import _structured_read_marker
+
+    assert ListMessages.__doc__
+    for label in [
         "[I read up to here]",
         "[unread by me]",
         "[peer read up to here]",
         "[unread by peer]",
-        "[read-state:",
-        "[inbox:",
-        "[outbox:",
     ]:
-        assert literal in doc, f"ListMessages doc missing AC-13 literal: {literal!r}"
-
-
-def test_tool_description_read_state_section_under_8_lines() -> None:
-    """D-11: The 'Read-state annotations' section is ≤ 8 lines."""
-    from mcp_telegram.tools.reading import ListMessages
-
-    doc = ListMessages.__doc__ or ""
-    assert "Read-state annotations" in doc
-    # Extract the section starting at its heading up to next blank-line gap
-    lines = doc.splitlines()
-    start = next(i for i, l in enumerate(lines) if "Read-state annotations" in l)
-    section: list[str] = []
-    for l in lines[start:]:
-        if not l.strip():
-            break
-        section.append(l)
-    assert len(section) <= 8, f"Section has {len(section)} lines: {section}"
+        assert _structured_read_marker(123, label)["label"] == label

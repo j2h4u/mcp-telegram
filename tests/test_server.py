@@ -150,18 +150,11 @@ async def test_call_tool_non_dict_arguments_control_contract() -> None:
         await server.call_tool("list_dialogs", [])
 
 
-def test_posture_primary_tools_reflected_in_descriptions() -> None:
-    """Primary tools should have [primary] tag in their reflected descriptions."""
-    for name in ("list_messages", "search_messages", "get_entity_info", "trace_account_messages"):
-        tool = server.tool_by_name[name]
-        assert tool.description.startswith("[primary]"), f"{name} missing [primary] prefix"
-
-
-def test_posture_secondary_tools_reflected_in_descriptions() -> None:
-    """Secondary/helper tools should have [secondary/helper] tag in descriptions."""
-    for name in ("list_dialogs", "list_topics", "get_usage_stats"):
-        tool = server.tool_by_name[name]
-        assert tool.description.startswith("[secondary/helper]"), f"{name} missing [secondary/helper] prefix"
+def test_posture_tags_are_not_reflected_in_descriptions() -> None:
+    """Posture is internal metadata and must not consume agent-facing description budget."""
+    for tool in server.tool_by_name.values():
+        assert not tool.description.startswith("[primary]"), f"{tool.name} leaks primary posture"
+        assert not tool.description.startswith("[secondary/helper]"), f"{tool.name} leaks helper posture"
 
 
 def test_list_tools_exposes_snake_case_names_titles_and_annotations() -> None:
@@ -188,6 +181,10 @@ def test_list_tools_exposes_snake_case_names_titles_and_annotations() -> None:
         assert tool.name == name
         assert 1 <= len(tool.title.split()) <= 3
         assert tool.annotations is not None
+        assert tool.annotations.readOnlyHint is not None
+        assert tool.annotations.destructiveHint is not None
+        assert tool.annotations.idempotentHint is not None
+        assert tool.annotations.openWorldHint is not None
     for name, title in expected_titles.items():
         assert server.tool_by_name[name].title == title
 
@@ -435,6 +432,26 @@ async def test_server_instructions_describe_structured_only_response_contract(mo
     assert "untrusted content" in normalized
 
 
+@pytest.mark.asyncio
+async def test_server_instructions_describe_identity_model(monkeypatch) -> None:
+    class _Conn:
+        async def get_me(self) -> dict:
+            return {"ok": False}
+
+    @asynccontextmanager
+    async def _conn_cm():
+        yield _Conn()
+
+    monkeypatch.setattr("mcp_telegram.daemon_client.daemon_connection", _conn_cm)
+
+    instructions = await server._build_server_instructions()
+
+    assert "Identity model" in instructions
+    assert "out=true" in instructions
+    assert "sender_id" in instructions
+    assert "effective_sender_id" in instructions
+
+
 def test_posture_covers_all_registered_tools() -> None:
     """Every registered tool must have a posture classification."""
     from mcp_telegram.tools import TOOL_REGISTRY
@@ -450,8 +467,6 @@ def test_posture_get_entity_info_classified_as_primary() -> None:
     from mcp_telegram.tools import TOOL_REGISTRY
 
     assert TOOL_REGISTRY["get_entity_info"][1] == "primary", "get_entity_info should be a primary user-task tool"
-    tool = server.tool_by_name["get_entity_info"]
-    assert tool.description.startswith("[primary]"), "get_entity_info missing [primary] prefix"
 
 
 def test_primary_tools_have_core_read_search_schema() -> None:
@@ -501,9 +516,9 @@ def test_helper_tools_remain_available_not_hidden() -> None:
         assert tool_name in server.tool_by_name, f"{tool_name} not registered in server"
         tool = server.tool_by_name[tool_name]
 
-        # Must be marked as secondary in description
-        assert tool.description.startswith("[secondary/helper]"), (
-            f"{tool_name} description missing [secondary/helper] prefix"
+        # Posture is internal metadata; agent-facing descriptions stay natural.
+        assert not tool.description.startswith("[secondary/helper]"), (
+            f"{tool_name} leaks helper posture into its description"
         )
 
 

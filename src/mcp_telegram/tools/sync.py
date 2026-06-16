@@ -228,7 +228,12 @@ class MarkDialogForSync(ToolArgs):
 @mcp_tool(
     name="mark_dialog_for_sync",
     title="Mark Sync",
-    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True),
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
     output_schema=MARK_DIALOG_FOR_SYNC_OUTPUT_SCHEMA,
 )
 async def mark_dialog_for_sync(args: MarkDialogForSync) -> ToolResult:
@@ -269,7 +274,12 @@ class GetSyncStatus(ToolArgs):
     name="get_sync_status",
     title="Sync Status",
     posture="secondary/helper",
-    annotations=ToolAnnotations(readOnlyHint=True),
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
     output_schema=GET_SYNC_STATUS_OUTPUT_SCHEMA,
 )
 async def get_sync_status(args: GetSyncStatus) -> ToolResult:
@@ -345,7 +355,12 @@ def _alert_timestamp(alert: dict[str, object]) -> tuple[int, int, int, str]:
     name="get_sync_alerts",
     title="Sync Alerts",
     posture="secondary/helper",
-    annotations=ToolAnnotations(readOnlyHint=True),
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
     output_schema=GET_SYNC_ALERTS_OUTPUT_SCHEMA,
 )
 async def get_sync_alerts(args: GetSyncAlerts) -> ToolResult:

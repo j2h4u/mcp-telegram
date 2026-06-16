@@ -922,47 +922,18 @@ class ListMessages(ToolArgs):
     """
     List messages in one dialog.
 
-    Provide either dialog= for the ambiguity-safe natural-name flow or exact_dialog_id= when the
-    target dialog is already known. This tool does not support a global "latest messages across all
-    dialogs" mode.
+    Provide dialog= for fuzzy/name/link resolution or exact_dialog_id= when known.
+    This is not a global latest-across-all-dialogs tool.
 
-    Returns structured messages with stable ids, timestamps, sender metadata, content fields,
-    read-state metadata, coverage, filters, limits, truncation, and pagination metadata in
-    structuredContent. Successful MCP responses intentionally leave text content empty.
+    Omit navigation or use navigation="latest" for the recent tail; use
+    navigation="start" for the beginning; pass next_navigation to continue.
+    Every page is chronological (oldest-to-newest). Use anchor_message_id from
+    search_messages to read context around a hit; that path requires a synced
+    dialog and exact_dialog_id.
 
-    Omit navigation or set navigation="latest" to start from the latest message page.
-    The returned page is always presented chronologically (oldest-to-newest within the page)
-    so agents can read the conversation top-to-bottom while still getting the recent tail.
-    Use navigation="start" to start from the oldest messages in the dialog.
-    Use navigation= with the next_navigation token from a previous response to continue paging.
-    To read an entire channel or chat history: call this tool repeatedly, passing the next_navigation
-    token from each response as navigation= in the next call. Stop when next_navigation is absent.
-
-    dialog= accepts: fuzzy name, @username, numeric id, or https://t.me/username links directly.
-    Use sender= to filter messages from a specific person (name string, resolved via fuzzy match).
-    Use topic= to filter messages to one forum topic after the dialog has been resolved.
-    Use exact_topic_id= when the forum topic is already known and you want the direct-read path
-    without defaulting to full topic discovery first.
-    In forum dialogs, omitting topic= returns a cross-topic page and each message is labeled inline.
-    Use unread=True to show only messages you haven't read yet.
-    Default limit=50; set limit explicitly if you want a smaller MCP response.
-    Use anchor_message_id= with a msg_id: value from SearchMessages to read context around a hit.
-    anchor_message_id requires the dialog to be synced; use exact_dialog_id= on this path.
-
-    If response is ambiguous (multiple matches), retry with one exact selector instead of leaving
-    both fuzzy and exact selectors in the same request.
-
-    **Read-state annotations** (DMs only):
-    structuredContent.read_state.header_lines carries `[read-state: all caught up]` or
-    `[inbox: ...]` / `[outbox: ...]` status lines (`all read`, `N unread ...`, or `unknown`).
-    structuredContent.messages[].inline_markers carries page-local read cursor markers:
-    `[I read up to here]`, `[unread by me]`, `[peer read up to here]`, `[unread by peer]`.
-    Check read_state first for triage, then inspect inline_markers if reading the full history.
-
-    When this tool is called with `context_message_id` on a dialog that has not been fully
-    synced ("fragment" dialog), the daemon performs a targeted message fetch. In that case,
-    structuredContent.coverage.state is `fragment`; treat the returned messages as a snippet,
-    NOT the full chat history.
+    Supports sender, topic/exact_topic_id, and unread filters. DM rows include
+    read_state plus inline read markers. Fragment coverage means a targeted
+    snippet, not full chat history.
     """
 
     dialog: str | None = Field(
@@ -1095,7 +1066,12 @@ async def _resolve_topic_id(
 @mcp_tool(
     name="list_messages",
     title="List Messages",
-    annotations=ToolAnnotations(readOnlyHint=True),
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
     output_schema=LIST_MESSAGES_OUTPUT_SCHEMA,
 )
 async def list_messages(args: ListMessages) -> ToolResult:
@@ -1273,7 +1249,12 @@ class SearchMessages(ToolArgs):
 @mcp_tool(
     name="search_messages",
     title="Search Messages",
-    annotations=ToolAnnotations(readOnlyHint=True),
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
     output_schema=SEARCH_MESSAGES_OUTPUT_SCHEMA,
 )
 async def search_messages(args: SearchMessages) -> ToolResult:

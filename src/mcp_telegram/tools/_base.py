@@ -205,8 +205,8 @@ def mcp_tool(
 ) -> t.Callable[[ToolRunnerFunc[ToolArgT]], ToolRunnerFunc[ToolArgT]]:
     """Register runner with singledispatch + telemetry + tool registry.
 
-    ``posture`` is a free-form label prepended to the tool description so the
-    LLM can gauge how central the tool is.  Current values used in the codebase:
+    ``posture`` is a free-form internal label used for audits and documentation.
+    Current values used in the codebase:
 
     * ``"primary"`` — core tools the LLM should reach for first.
     * ``"secondary/helper"`` — supporting tools (e.g. analytics, diagnostics).
@@ -264,12 +264,10 @@ def mcp_tool(
 def tool_description(exported_name: str, cls: type[ToolArgs], entry: ToolRegistryEntry) -> Tool:
     """Build an MCP Tool descriptor from registry metadata."""
     schema = _sanitize_tool_schema(cls.model_json_schema())
-    posture = entry.posture
-    prefix = f"[{posture}] " if posture else ""
     return Tool(
         name=exported_name,
         title=entry.title,
-        description=f"{prefix}{cls.__doc__}",
+        description=cls.__doc__,
         inputSchema=schema,
         outputSchema=entry.output_schema,
         annotations=entry.annotations,

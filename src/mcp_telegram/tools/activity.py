@@ -113,23 +113,13 @@ GET_MY_RECENT_ACTIVITY_OUTPUT_SCHEMA = {
 
 
 class GetMyRecentActivity(ToolArgs):
-    """[primary] Show messages you sent in recent non-DM chats by default.
+    """Show messages the connected account sent in recent non-DM chats by default.
 
-    Reads from the local own-message archive populated by the daemon's
-    activity_sync loop — zero Telegram API calls in the hot path.
-
-    Per-comment granularity: if you sent 3 messages in the same group,
-    the response contains 3 separate blocks (not one collapsed entry).
-    Each comment includes dialog_type/dialog_category plus aggregate
-    reply_count and reactions for prioritising follow-up.
-
-    By default, dialog_kinds=["group", "forum"] excludes personal DMs so
-    group follow-up audits are not drowned by one-to-one chat noise. Pass
-    dialog_kinds=["user", "bot"] for DMs, ["channel"] for channels, or
-    ["all"] to disable the dialog-kind filter.
-
-    Use `scan_status` to distinguish `never_run` (archive empty — backfill
-    has not completed yet) from `complete` + empty result (you were quiet).
+    Reads the local own-message archive, not Telegram. Returns one block per
+    sent message with dialog kind/category, reply_count, reactions, and
+    navigation arguments for list_messages. Default dialog_kinds=["group",
+    "forum"] excludes DMs; pass ["user","bot"], ["channel"], or ["all"] when
+    needed. Use scan_status to distinguish an empty archive from no activity.
     """
 
     since_hours: int = Field(
@@ -229,7 +219,12 @@ def _chronological_comments(comments: list[dict[str, Any]]) -> list[dict[str, An
 @mcp_tool(
     name="get_my_recent_activity",
     title="Recent Activity",
-    annotations=ToolAnnotations(readOnlyHint=True),
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
     output_schema=GET_MY_RECENT_ACTIVITY_OUTPUT_SCHEMA,
 )
 async def get_my_recent_activity(args: GetMyRecentActivity) -> ToolResult:
