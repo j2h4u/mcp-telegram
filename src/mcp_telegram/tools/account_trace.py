@@ -262,7 +262,7 @@ def _trace_evidence_count(data: dict) -> int:
 
 def _trace_preview(data: dict, *, evidence_count: int) -> dict[str, object]:
     gaps = data.get("gaps", [])
-    gap_summary = []
+    gap_summary: list[dict[str, object]] = []
     if isinstance(gaps, list):
         gap_summary.extend(
             {"kind": gap.get("kind"), "severity": gap.get("severity")} for gap in gaps[:5] if isinstance(gap, dict)

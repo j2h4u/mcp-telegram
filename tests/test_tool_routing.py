@@ -2101,13 +2101,13 @@ def test_no_sqlite3_or_cache_in_tools():
     violations = []
     for py_file in tools_dir.glob("*.py"):
         content = py_file.read_text()
-        for pattern in forbidden:
-            if pattern in content:
-                violations.append(f"{py_file.name}: contains '{pattern}'")
+        violations.extend(f"{py_file.name}: contains '{pattern}'" for pattern in forbidden if pattern in content)
         # Check analytics imports more carefully
-        for line in content.splitlines():
-            if "from ..analytics import" in line and allowed_analytics not in line:
-                violations.append(f"{py_file.name}: imports from analytics beyond format_usage_summary")
+        violations.extend(
+            f"{py_file.name}: imports from analytics beyond format_usage_summary"
+            for line in content.splitlines()
+            if "from ..analytics import" in line and allowed_analytics not in line
+        )
     assert not violations, "CONSOLIDATE-03 violations:\n" + "\n".join(violations)
 
 

@@ -140,11 +140,11 @@ async def test_backfill_respects_shutdown(conn):
 async def test_backfill_floodwait_recovers(conn):
     from telethon.errors import FloodWaitError
 
-    class _FW(FloodWaitError):
+    class _FWError(FloodWaitError):
         def __init__(self):
             self.seconds = 0
 
-    client = _FakeClient(batches=[_FW(), FakeSearchResult(messages=[])])
+    client = _FakeClient(batches=[_FWError(), FakeSearchResult(messages=[])])
     shutdown = asyncio.Event()
     await _run_backfill(client, conn, shutdown)
     state = dict(conn.execute("SELECT key, value FROM activity_sync_state").fetchall())

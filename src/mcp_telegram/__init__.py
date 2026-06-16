@@ -154,7 +154,8 @@ def feedback_list(
     attention. Use --all to include `done` and `dismissed` history.
     """
     import sqlite3
-    from datetime import UTC, datetime as _dt
+    from datetime import UTC
+    from datetime import datetime as _dt
 
     from .feedback_db import get_feedback_db_path
 

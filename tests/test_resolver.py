@@ -405,7 +405,7 @@ def test_no_collision_single_exact_single_word_with_no_other_hits() -> None:
 
 def test_collision_preserves_all_entity_ids_in_matches() -> None:
     """5 entities sharing 'Name' — all 5 entity_ids must appear in matches."""
-    choices = {i: "Name" for i in range(1, 6)}
+    choices = dict.fromkeys(range(1, 6), "Name")
     result = resolve("Name", choices)
     assert isinstance(result, Candidates), f"Expected Candidates, got {result!r}"
     ids = {m["entity_id"] for m in result.matches}

@@ -64,13 +64,15 @@ def test_no_capitalized_dialog_type_literals_outside_models():
     offenders: list[str] = []
     for path in _iter_py_files():
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        for node in ast.walk(tree):
+        offenders.extend(
+            f'{path.relative_to(SRC)}:{node.lineno}  "{node.value}"'
+            for node in ast.walk(tree)
             if (
                 isinstance(node, ast.Constant)
                 and isinstance(node.value, str)
                 and node.value in CAPITALIZED_TYPE_LITERALS
-            ):
-                offenders.append(f'{path.relative_to(SRC)}:{node.lineno}  "{node.value}"')
+            )
+        )
     assert not offenders, (
         "Raw capitalized dialog-type literals found — use models.DialogType instead:\n  " + "\n  ".join(offenders)
     )
@@ -92,9 +94,11 @@ def test_no_lowercase_dialog_type_comparison_literals_outside_models():
                     consts = [op]
                 elif isinstance(op, (ast.Tuple, ast.List, ast.Set)):
                     consts = [e for e in op.elts if isinstance(e, ast.Constant)]
-                for c in consts:
-                    if isinstance(c.value, str) and c.value in LOWERCASE_TYPE_LITERALS:
-                        offenders.append(f'{path.relative_to(SRC)}:{c.lineno}  compare vs "{c.value}"')
+                offenders.extend(
+                    f'{path.relative_to(SRC)}:{c.lineno}  compare vs "{c.value}"'
+                    for c in consts
+                    if isinstance(c.value, str) and c.value in LOWERCASE_TYPE_LITERALS
+                )
     assert not offenders, (
         "Raw lowercase dialog-type comparison literals found — use models.DialogType:\n  " + "\n  ".join(offenders)
     )

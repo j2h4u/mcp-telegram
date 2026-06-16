@@ -1031,12 +1031,7 @@ def test_migration_v26_remarks_known_channel_and_chat_forwards(tmp_path: Path) -
     ensure_sync_schema(db_path)
 
     with _sync_db_connection(db_path) as conn:
-        got = {
-            mid: peer
-            for mid, peer in conn.execute(
-                "SELECT message_id, fwd_from_peer_id FROM message_forwards WHERE dialog_id = 100"
-            )
-        }
+        got = dict(conn.execute("SELECT message_id, fwd_from_peer_id FROM message_forwards WHERE dialog_id = 100"))
         assert got[1] == known_channel, f"known channel must be remarked, got {got[1]}"
         assert got[2] == known_chat, f"known chat must be remarked, got {got[2]}"
         assert got[3] == 429356, f"unknown user-shaped peer must stay bare, got {got[3]}"

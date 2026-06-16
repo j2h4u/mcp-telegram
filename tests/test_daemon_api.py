@@ -4266,8 +4266,7 @@ def test_reaction_analytics_most_reacted_messages() -> None:
 
 def _make_db_for_dialog_stats() -> sqlite3.Connection:
     """Return in-memory DB with all tables needed by _get_dialog_stats."""
-    conn = _make_db_with_normalized_tables()
-    return conn
+    return _make_db_with_normalized_tables()
 
 
 @pytest.mark.asyncio

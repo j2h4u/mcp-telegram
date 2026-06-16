@@ -1547,21 +1547,21 @@ def _minimal_msg(**overrides: Any) -> SimpleNamespace:
     """Build a minimal Telethon-like Message for extract_message_row tests."""
     from datetime import datetime
 
-    base = dict(
-        id=1,
-        date=datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC),
-        message="hi",
-        sender_id=1,
-        sender=SimpleNamespace(first_name="Alice"),
-        media=None,
-        reply_to=None,
-        reactions=None,
-        edit_date=None,
-        grouped_id=None,
-        fwd_from=None,
-        entities=None,
-        out=False,
-    )
+    base = {
+        "id": 1,
+        "date": datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC),
+        "message": "hi",
+        "sender_id": 1,
+        "sender": SimpleNamespace(first_name="Alice"),
+        "media": None,
+        "reply_to": None,
+        "reactions": None,
+        "edit_date": None,
+        "grouped_id": None,
+        "fwd_from": None,
+        "entities": None,
+        "out": False,
+    }
     base.update(overrides)
     return SimpleNamespace(**base)
 
