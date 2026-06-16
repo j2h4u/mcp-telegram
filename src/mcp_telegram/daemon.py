@@ -433,7 +433,7 @@ async def sync_main() -> None:
         )
     finally:
         os.umask(old_umask)
-    os.chmod(socket_path, 0o600)
+        socket_path.chmod(0o600)
     logger.info("daemon API listening on %s (not ready yet)", socket_path)
 
     # FTS backfill runs in a thread pool (stemming is CPU-bound) so it doesn't

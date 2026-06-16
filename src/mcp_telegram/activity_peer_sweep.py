@@ -367,8 +367,7 @@ async def build_working_set(client: Any, conn: sqlite3.Connection) -> int:
     working_set: dict[int, int | None] = {}  # peer_id → last_activity_at
 
     # Enroll supergroups directly
-    for dialog_id, last_message_at in supergroup_rows:
-        working_set[dialog_id] = last_message_at
+    working_set = {dialog_id: last_message_at for dialog_id, last_message_at in supergroup_rows}
 
     # Step 3: resolve broadcast channels to their discussion groups
     for channel_id, channel_last_message_at in channel_rows:

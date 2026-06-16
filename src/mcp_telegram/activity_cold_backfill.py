@@ -135,7 +135,7 @@ async def run_cold_backfill_pass(
 
     # offset_id=0 means "start from newest and walk down"; thereafter use the
     # stored cold_offset_id which shrinks toward the history floor each pass.
-    offset_id = cold_offset_id if cold_offset_id else 0
+    offset_id = cold_offset_id or 0
 
     logger.debug(
         "activity_cold_backfill_pass_start dialog_id=%r offset_id=%d",

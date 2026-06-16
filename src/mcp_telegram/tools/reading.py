@@ -1126,7 +1126,7 @@ async def list_messages(args: ListMessages) -> ToolResult:
     if topic_id is None and args.topic is not None:
         resolved = await _resolve_topic_id(
             args.topic,
-            dialog_id=dialog_id if dialog_id else 0,
+            dialog_id=dialog_id or 0,
             dialog_name=args.dialog if not dialog_id else None,
         )
         if isinstance(resolved, ToolResult):

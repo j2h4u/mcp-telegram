@@ -781,22 +781,21 @@ class DialogReconciliationWorker:
         # Forums with >100 topics will silently drop topics beyond the first 100.
         # This matches the pre-existing _list_topics limit=100 behaviour.
         now = int(time.time())
-        rows = []
-        for t in topics:
-            rows.append(
-                {
-                    "dialog_id": dialog_id,
-                    "topic_id": int(t.id),
-                    "title": getattr(t, "title", None) or "",
-                    "is_general": int(getattr(t, "is_general", False) or (int(t.id) == 1)),
-                    "icon_emoji_id": getattr(t, "icon_emoji_id", None),
-                    "updated_at": now,
-                    "snapshot_at": now,
-                    "date": int(t.date.timestamp())
-                    if hasattr(getattr(t, "date", None), "timestamp")
-                    else getattr(t, "date", None),
-                }
-            )
+        rows = [
+            {
+                "dialog_id": dialog_id,
+                "topic_id": int(t.id),
+                "title": getattr(t, "title", None) or "",
+                "is_general": int(getattr(t, "is_general", False) or (int(t.id) == 1)),
+                "icon_emoji_id": getattr(t, "icon_emoji_id", None),
+                "updated_at": now,
+                "snapshot_at": now,
+                "date": int(t.date.timestamp())
+                if hasattr(getattr(t, "date", None), "timestamp")
+                else getattr(t, "date", None),
+            }
+            for t in topics
+        ]
         # Batch all upserts in a single transaction for atomicity and performance.
         with self._conn:
             for row in rows:

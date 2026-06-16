@@ -264,9 +264,9 @@ def _trace_preview(data: dict, *, evidence_count: int) -> dict[str, object]:
     gaps = data.get("gaps", [])
     gap_summary = []
     if isinstance(gaps, list):
-        for gap in gaps[:5]:
-            if isinstance(gap, dict):
-                gap_summary.append({"kind": gap.get("kind"), "severity": gap.get("severity")})
+        gap_summary.extend(
+            {"kind": gap.get("kind"), "severity": gap.get("severity")} for gap in gaps[:5] if isinstance(gap, dict)
+        )
     shown_count = min(evidence_count, 5)
     return {
         "shown_count": shown_count,

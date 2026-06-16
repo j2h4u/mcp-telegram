@@ -154,7 +154,7 @@ def feedback_list(
     attention. Use --all to include `done` and `dismissed` history.
     """
     import sqlite3
-    from datetime import datetime as _dt
+    from datetime import UTC, datetime as _dt
 
     from .feedback_db import get_feedback_db_path
 
@@ -211,10 +211,10 @@ def feedback_list(
     ) in rows:
         sev_tag = f"[{sev}]" if sev else "[?]"
         status_tag = f"[{status}]"
-        ts_human = _dt.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+        ts_human = _dt.fromtimestamp(ts, tz=UTC).strftime("%Y-%m-%d %H:%M")
         metadata_parts = [f"id={rid}", sev_tag, status_tag, ts_human]
         if status_changed_at:
-            changed_human = _dt.fromtimestamp(status_changed_at).strftime("%Y-%m-%d %H:%M")
+            changed_human = _dt.fromtimestamp(status_changed_at, tz=UTC).strftime("%Y-%m-%d %H:%M")
             metadata_parts.append(f"changed={changed_human}")
         if mdl:
             metadata_parts.append(f"model={mdl}")

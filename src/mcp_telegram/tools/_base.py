@@ -142,8 +142,7 @@ def _track_tool_telemetry(tool_name: str) -> t.Callable[[ToolRunnerFunc[ToolArgT
             error_type = None
             tool_result: ToolResult | None = None
             try:
-                tool_result = await fn(args)
-                return tool_result
+                return await fn(args)
             except Exception as exc:
                 error_type = type(exc).__name__
                 raise

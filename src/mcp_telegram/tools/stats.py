@@ -235,7 +235,7 @@ async def get_usage_stats(args: GetUsageStats) -> ToolResult:
         return structured_result(_usage_structured_content(stats, summary=summary, empty=True))
 
     summary = format_usage_summary(stats)
-    summary_text = summary if summary else no_usage_data_text()
+    summary_text = summary or no_usage_data_text()
     return structured_result(_usage_structured_content(stats, summary=summary_text, empty=False))
 
 
