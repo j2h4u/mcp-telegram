@@ -184,6 +184,7 @@ def _build_matches(
     hits: list[tuple[str, float, int]],
     norm_map: dict[str, list[tuple[int, str]]],
     entity_cache: Any | None,
+    *,
     exact_first_id: int | None = None,
     collision_query: str | None = None,
     collision_count: int | None = None,

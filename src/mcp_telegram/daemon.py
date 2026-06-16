@@ -317,6 +317,7 @@ async def _maybe_heartbeat_and_gap_scan(
     conn: sqlite3.Connection,
     client: Any,
     handler_manager: EventHandlerManager,
+    *,
     sync_start: float,
     last_heartbeat: float,
     last_gap_scan: float,
@@ -370,11 +371,11 @@ async def _run_sync_loop(
             conn,
             client,
             handler_manager,
-            sync_start,
-            last_heartbeat,
-            last_gap_scan,
-            last_hb_msg_count,
-            last_hb_mono,
+            sync_start=sync_start,
+            last_heartbeat=last_heartbeat,
+            last_gap_scan=last_gap_scan,
+            last_hb_msg_count=last_hb_msg_count,
+            last_hb_mono=last_hb_mono,
         )
 
         if all_synced:
@@ -392,11 +393,11 @@ async def _run_sync_loop(
                     conn,
                     client,
                     handler_manager,
-                    sync_start,
-                    last_heartbeat,
-                    last_gap_scan,
-                    last_hb_msg_count,
-                    last_hb_mono,
+                    sync_start=sync_start,
+                    last_heartbeat=last_heartbeat,
+                    last_gap_scan=last_gap_scan,
+                    last_hb_msg_count=last_hb_msg_count,
+                    last_hb_mono=last_hb_mono,
                 )
         elif was_idle:
             logger.info("sync_resume — work appeared, exiting idle")
