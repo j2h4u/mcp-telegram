@@ -1008,15 +1008,15 @@ def _build_trace_gaps(
 
     hidden_rows = conn.execute("SELECT dialog_id FROM dialogs WHERE hidden = 1").fetchall()
     hidden_dialogs = {int(row[0]) for row in hidden_rows}
-    for dialog_id in sorted(considered_dialogs & hidden_dialogs):
-        gaps.append(
-            _trace_gap(
-                "hidden_dialog",
-                "warning",
-                "Dialog is hidden in the local mirror.",
-                dialog_id=dialog_id,
-            )
+    gaps.extend(
+        _trace_gap(
+            "hidden_dialog",
+            "warning",
+            "Dialog is hidden in the local mirror.",
+            dialog_id=dialog_id,
         )
+        for dialog_id in sorted(considered_dialogs & hidden_dialogs)
+    )
 
     for fragment in fragment_rows:
         dialog_id = int(fragment["dialog_id"])
@@ -1994,7 +1994,7 @@ class DaemonAPIServer:
             if stripped.isdigit():
                 return int(stripped)
             try:
-                return int(datetime.fromisoformat(stripped.replace("Z", "+00:00")).timestamp())
+                return int(datetime.fromisoformat(stripped).timestamp())
             except ValueError as exc:
                 raise ValueError("invalid_updated_after") from exc
         raise ValueError("invalid_updated_after")
@@ -3568,8 +3568,12 @@ class DaemonAPIServer:
 
         messages: list[dict] = []
         try:
-            async for msg in self._client.iter_messages(dialog_id, **iter_kwargs):
-                messages.append(self._msg_to_dict(msg, dialog_id=dialog_id, self_id=self.self_id))
+            messages.extend(
+                [
+                    self._msg_to_dict(msg, dialog_id=dialog_id, self_id=self.self_id)
+                    async for msg in self._client.iter_messages(dialog_id, **iter_kwargs)
+                ]
+            )
         except Exception as exc:
             logger.warning(
                 "list_messages_telegram_error dialog_id=%d error=%s%s",
@@ -4563,14 +4567,13 @@ class DaemonAPIServer:
                 }
             raw_bot_info = getattr(user_full, "bot_info", None)
             if raw_bot_info is not None:
-                commands = []
-                for cmd in getattr(raw_bot_info, "commands", None) or []:
-                    commands.append(
-                        {
-                            "command": getattr(cmd, "command", ""),
-                            "description": getattr(cmd, "description", ""),
-                        }
-                    )
+                commands = [
+                    {
+                        "command": getattr(cmd, "command", ""),
+                        "description": getattr(cmd, "description", ""),
+                    }
+                    for cmd in getattr(raw_bot_info, "commands", None) or []
+                ]
                 bot_info = {
                     "description": getattr(raw_bot_info, "description", None) or None,
                     "commands": commands,
@@ -4634,15 +4637,14 @@ class DaemonAPIServer:
         emoji_status_id: int | None = None
         if emoji_status is not None:
             emoji_status_id = getattr(emoji_status, "document_id", None)
-        restriction_reason: list[dict] = []
-        for rr in getattr(user, "restriction_reason", None) or []:
-            restriction_reason.append(
-                {
-                    "platform": getattr(rr, "platform", None),
-                    "reason": getattr(rr, "reason", None),
-                    "text": getattr(rr, "text", None),
-                }
-            )
+        restriction_reason = [
+            {
+                "platform": getattr(rr, "platform", None),
+                "reason": getattr(rr, "reason", None),
+                "text": getattr(rr, "text", None),
+            }
+            for rr in getattr(user, "restriction_reason", None) or []
+        ]
 
         # --- avatar_history + avatar_count (rename from `photos`; SPEC Req 10 —
         #     no file_id / file_reference / download_*) ---
@@ -4913,15 +4915,14 @@ class DaemonAPIServer:
             )
 
         # ----- restrictions (from the channel entity itself, mirrors User path) -----
-        restrictions: list[dict] = []
-        for rr in getattr(channel, "restriction_reason", None) or []:
-            restrictions.append(
-                {
-                    "platform": getattr(rr, "platform", None),
-                    "reason": getattr(rr, "reason", None),
-                    "text": getattr(rr, "text", None),
-                }
-            )
+        restrictions = [
+            {
+                "platform": getattr(rr, "platform", None),
+                "reason": getattr(rr, "reason", None),
+                "text": getattr(rr, "text", None),
+            }
+            for rr in getattr(channel, "restriction_reason", None) or []
+        ]
 
         # ----- my_membership: is_admin derived from channel flags -----
         is_creator = bool(getattr(channel, "creator", False))
@@ -5086,8 +5087,7 @@ class DaemonAPIServer:
         # the count still matches; LLM sees the gap and can re-resolve later.
         seen = {row[0] for row in rows}
         out = [{"id": row[0], "name": row[1], "username": row[2]} for row in rows]
-        for missing_id in ids - seen:
-            out.append({"id": missing_id, "name": None, "username": None})
+        out.extend({"id": missing_id, "name": None, "username": None} for missing_id in ids - seen)
         return sorted(out, key=lambda d: ((d["name"] or ""), d["id"]))
 
     async def _fetch_supergroup_detail(self, channel: Any) -> dict[str, Any]:
@@ -5144,15 +5144,14 @@ class DaemonAPIServer:
             )
 
         # ----- restrictions -----
-        restrictions: list[dict] = []
-        for rr in getattr(channel, "restriction_reason", None) or []:
-            restrictions.append(
-                {
-                    "platform": getattr(rr, "platform", None),
-                    "reason": getattr(rr, "reason", None),
-                    "text": getattr(rr, "text", None),
-                }
-            )
+        restrictions = [
+            {
+                "platform": getattr(rr, "platform", None),
+                "reason": getattr(rr, "reason", None),
+                "text": getattr(rr, "text", None),
+            }
+            for rr in getattr(channel, "restriction_reason", None) or []
+        ]
 
         # ----- my_membership -----
         is_creator = bool(getattr(channel, "creator", False))
@@ -5357,15 +5356,14 @@ class DaemonAPIServer:
             )
 
         # ----- restrictions -----
-        restrictions: list[dict] = []
-        for rr in getattr(chat, "restriction_reason", None) or []:
-            restrictions.append(
-                {
-                    "platform": getattr(rr, "platform", None),
-                    "reason": getattr(rr, "reason", None),
-                    "text": getattr(rr, "text", None),
-                }
-            )
+        restrictions = [
+            {
+                "platform": getattr(rr, "platform", None),
+                "reason": getattr(rr, "reason", None),
+                "text": getattr(rr, "text", None),
+            }
+            for rr in getattr(chat, "restriction_reason", None) or []
+        ]
 
         # ----- my_membership: legacy chats have a creator flag and admin_rights -----
         is_creator = bool(getattr(chat, "creator", False))
@@ -5554,7 +5552,7 @@ class DaemonAPIServer:
                 }
             )
         # date is last_event_at (int unix timestamp) after Plan 38-02 rewrite — not datetime
-        entries.sort(key=lambda e: (e["tier"], -(e["date"] if e["date"] else 0)))
+        entries.sort(key=lambda e: (e["tier"], -(e["date"] or 0)))
 
     async def _fetch_unread_groups(self, entries: list[dict], allocation: dict[int, int]) -> list[dict]:
         """Fetch unread message bodies from sync.db. Zero Telegram API calls."""
@@ -6147,7 +6145,7 @@ class DaemonAPIServer:
                 "message_id": r[1],
                 "sent_at": r[2],
                 "text": r[3],
-                "dialog_name": r[4] if r[4] else str(r[0]),
+                "dialog_name": r[4] or str(r[0]),
                 "dialog_type": r[5],
                 "dialog_category": r[8],
                 "reply_count": r[6],
