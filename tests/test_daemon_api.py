@@ -11,7 +11,7 @@ import json
 import sqlite3
 import time
 from datetime import UTC
-from typing import Any
+from typing import Any, Final
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -19,6 +19,28 @@ import pytest
 from mcp_telegram.daemon_api import DaemonAPIServer, _classify_dialog_type, get_daemon_socket_path
 from mcp_telegram.fts import MESSAGES_FTS_DDL, stem_text
 from mcp_telegram.models import DialogType
+
+# Track sqlite connections created by module helpers and close them after each test.
+_TRACKED_SQLITE_CONN_CLEANUP: Final[list[sqlite3.Connection]] = []
+
+
+def _register_sqlite_connection(conn: sqlite3.Connection) -> sqlite3.Connection:
+    _TRACKED_SQLITE_CONN_CLEANUP.append(conn)
+    return conn
+
+
+@pytest.fixture(autouse=True)
+def _close_tracked_sqlite_connections() -> None:
+    try:
+        yield
+    finally:
+        while _TRACKED_SQLITE_CONN_CLEANUP:
+            conn = _TRACKED_SQLITE_CONN_CLEANUP.pop()
+            try:
+                conn.close()
+            except Exception:
+                pass
+
 
 # ---------------------------------------------------------------------------
 # Module-wide patch: telethon_utils.get_peer_id returns entity.id for mocks
@@ -52,7 +74,7 @@ def make_server(
         client = MagicMock()
     if feedback_conn is None:
         # In-memory feedback.db with the canonical schema applied.
-        feedback_conn = sqlite3.connect(":memory:")
+        feedback_conn = _register_sqlite_connection(sqlite3.connect(":memory:"))
         feedback_conn.execute(
             "CREATE TABLE feedback ("
             "id INTEGER PRIMARY KEY AUTOINCREMENT, submitted_at INTEGER NOT NULL, "
@@ -66,7 +88,7 @@ def make_server(
 
 def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.Connection:
     """Return an in-memory SQLite connection with the required schema."""
-    conn = sqlite3.connect(":memory:")
+    conn = _register_sqlite_connection(sqlite3.connect(":memory:"))
     conn.execute(
         """
         CREATE TABLE synced_dialogs (
@@ -5354,7 +5376,7 @@ def _make_trace_db() -> sqlite3.Connection:
                                             entity_details)
     - enroll_activity_dialog               (activity_dialog_state, synced_dialogs)
     """
-    conn = sqlite3.connect(":memory:")
+    conn = _register_sqlite_connection(sqlite3.connect(":memory:"))
     conn.row_factory = sqlite3.Row
     conn.executescript(
         """
