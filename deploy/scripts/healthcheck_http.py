@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import http
 import json
 import os
 import sys
@@ -17,7 +18,7 @@ def main() -> int:
 
     try:
         with urllib.request.urlopen(url, timeout=5) as response:
-            if response.status != 200:
+            if response.status != http.HTTPStatus.OK:
                 print(f"HTTP healthcheck failed: status={response.status}", file=sys.stderr)
                 return 1
             payload = json.loads(response.read().decode("utf-8"))
