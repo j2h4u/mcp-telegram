@@ -176,12 +176,14 @@ async def test_request_eof_raises(tmp_path: Path) -> None:
         """Accept connection and close without writing a response (triggers EOF or reset)."""
         try:
             await reader.read(1024)  # consume incoming data
-        except Exception:
+        except OSError:
             pass
         writer.close()
         try:
             await writer.wait_closed()
-        except Exception:
+        except OSError:
+            pass
+        except RuntimeError:
             pass
 
     server = await asyncio.start_unix_server(_close_immediately, path=str(sock_path))

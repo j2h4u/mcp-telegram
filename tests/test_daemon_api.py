@@ -38,7 +38,7 @@ def _close_tracked_sqlite_connections() -> None:
             conn = _TRACKED_SQLITE_CONN_CLEANUP.pop()
             try:
                 conn.close()
-            except Exception:
+            except Exception:  # noqa: BLE001 - best-effort fixture cleanup to preserve test teardown behavior
                 pass
 
 

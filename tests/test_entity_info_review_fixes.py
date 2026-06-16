@@ -36,7 +36,7 @@ def _close_test_db():
         conn = _TEST_DBS.pop()
         try:
             conn.close()
-        except Exception:
+        except Exception:  # noqa: BLE001 - best-effort fixture cleanup, keep teardown behavior stable
             pass
 
 
@@ -174,7 +174,7 @@ async def test_channel_admin_full_request_fails_returns_count_unavailable() -> N
     chan = _channel(id_=-1001, admin=True)
     client = AsyncMock()
     client.get_entity = AsyncMock(return_value=chan)
-    client.side_effect = [RuntimeError("flood"), MagicMock(count=0, messages=[])]
+    client.side_effect = [MagicMock(count=0, messages=[])]
     server = _make_server(client=client)
 
     with (

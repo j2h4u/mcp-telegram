@@ -31,7 +31,7 @@ def _close_test_db():
         conn = _TEST_DBS.pop()
         try:
             conn.close()
-        except Exception:
+        except Exception:  # noqa: BLE001 - best-effort fixture cleanup, preserve old teardown semantics
             pass
 
 

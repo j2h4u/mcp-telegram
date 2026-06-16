@@ -16,6 +16,7 @@ from datetime import UTC
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from telethon.errors import RPCError
 
 # HIGH-2 from 47-REVIEWS.md cycle 3 (codex 2026-04-25): Module-level import
 # of `TelethonChannel` so that tests appended by Plan 03 Task 3 (broadcast
@@ -36,7 +37,7 @@ def _close_test_db():
         conn = _TEST_DBS.pop()
         try:
             conn.close()
-        except Exception:
+        except Exception:  # noqa: BLE001 - best-effort fixture cleanup, keep old teardown behavior
             pass
 
 
@@ -281,7 +282,7 @@ async def test_get_entity_info_channel_avatar_search_fails_d20_fallback() -> Non
     full.full_chat.chat_photo = chat_photo
 
     # messages.Search(ChatPhotos) RAISES — search_failed branch.
-    search_exc = RuntimeError("flood wait simulated")
+    search_exc = RPCError(None, "flood wait simulated")
 
     client = _mock_client(full, search_exc)
     client.get_entity = AsyncMock(return_value=chan)
@@ -339,7 +340,7 @@ async def test_get_entity_info_channel_admin_enumerates_subscribers_small() -> N
     # GetFullChannelRequest returns subscribers_count=42 (≤1000 path).
     full = MagicMock()
     full.full_chat = _full_broadcast_channel(participants_count=42)
-    client = _mock_client(full)  # one MTProto call before iter_participants
+    client = _mock_client(full, MagicMock(count=0, messages=[]))  # full_fetch + photo history search
     client.get_entity = AsyncMock(return_value=ch)
 
     # iter_participants yields 3 participant objects with ids 111, 222, 333.
@@ -405,7 +406,7 @@ async def test_get_entity_info_channel_admin_enumerates_subscribers_large() -> N
     u2 = MagicMock()
     u2.id = 222
     gp_result.users = [u1, u2]
-    client = _mock_client(full, gp_result)
+    client = _mock_client(full, gp_result, MagicMock(count=0, messages=[]))
     client.get_entity = AsyncMock(return_value=ch)
 
     # iter_participants MUST NOT be called on the >1000 path.
@@ -453,7 +454,7 @@ async def test_get_entity_info_channel_admin_chat_admin_required_falls_back_to_n
     ch.restriction_reason = None
     full = MagicMock()
     full.full_chat = _full_broadcast_channel(participants_count=42)
-    client = _mock_client(full, RuntimeError("avatar search unavailable"))
+    client = _mock_client(full, RPCError(None, "avatar search unavailable"))
     client.get_entity = AsyncMock(return_value=ch)
 
     async def _iter_raises(*args, **kwargs):
