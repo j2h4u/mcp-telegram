@@ -6,6 +6,8 @@ Covers v11: message_reactions_freshness side-table.
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -18,10 +20,27 @@ def db_path(tmp_path: Path) -> Path:
     return tmp_path / "sync.db"
 
 
-def test_migration_v11_creates_freshness_table(db_path: Path) -> None:
-    ensure_sync_schema(db_path)
+@contextmanager
+def _sync_db_connection(db_path: Path) -> Iterator[sqlite3.Connection]:
     conn = _open_sync_db(db_path)
     try:
+        yield conn
+    finally:
+        conn.close()
+
+
+@contextmanager
+def _sqlite_connection(db_path: Path) -> Iterator[sqlite3.Connection]:
+    conn = sqlite3.connect(db_path)
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def test_migration_v11_creates_freshness_table(db_path: Path) -> None:
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
         rows = list(
             conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='message_reactions_freshness'")
         )
@@ -32,52 +51,38 @@ def test_migration_v11_creates_freshness_table(db_path: Path) -> None:
         assert col_map["dialog_id"] == ("INTEGER", 1, 1)
         assert col_map["message_id"] == ("INTEGER", 1, 2)
         assert col_map["checked_at"] == ("INTEGER", 1, 0)
-    finally:
-        conn.close()
 
 
 def test_migration_v11_idempotent(db_path: Path) -> None:
     ensure_sync_schema(db_path)
     ensure_sync_schema(db_path)  # second call: must not raise
-    conn = _open_sync_db(db_path)
-    try:
+    with _sync_db_connection(db_path) as conn:
         cols_before = list(conn.execute("PRAGMA table_info(message_reactions_freshness)"))
         assert len(cols_before) == 3
-    finally:
-        conn.close()
 
 
 def test_migration_v11_without_rowid(db_path: Path) -> None:
     ensure_sync_schema(db_path)
-    conn = _open_sync_db(db_path)
-    try:
+    with _sync_db_connection(db_path) as conn:
         row = conn.execute(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='message_reactions_freshness'"
         ).fetchone()
         assert row is not None
         assert "WITHOUT ROWID" in row[0].upper()
-    finally:
-        conn.close()
 
 
 def test_migration_v11_does_not_touch_synced_dialogs(db_path: Path) -> None:
     ensure_sync_schema(db_path)
-    conn = _open_sync_db(db_path)
-    try:
+    with _sync_db_connection(db_path) as conn:
         cols = [c[1] for c in conn.execute("PRAGMA table_info(synced_dialogs)")]
         assert "reactions_reconciled_at" not in cols
-    finally:
-        conn.close()
 
 
 def test_schema_version_records_current_v11(db_path: Path) -> None:
     ensure_sync_schema(db_path)
-    conn = _open_sync_db(db_path)
-    try:
+    with _sync_db_connection(db_path) as conn:
         row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
         assert row[0] == _CURRENT_SCHEMA_VERSION
-    finally:
-        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -92,16 +97,13 @@ def _col_info(conn: sqlite3.Connection, table: str) -> dict[str, tuple]:
 
 def test_migration_v12_adds_outbox_column(db_path: Path) -> None:
     ensure_sync_schema(db_path)
-    conn = _open_sync_db(db_path)
-    try:
+    with _sync_db_connection(db_path) as conn:
         cols = _col_info(conn, "synced_dialogs")
         assert "read_outbox_max_id" in cols
         # (cid, name, type, notnull, dflt_value, pk)
         _, _, col_type, notnull, _, _ = cols["read_outbox_max_id"]
         assert col_type == "INTEGER"
         assert notnull == 0  # nullable
-    finally:
-        conn.close()
 
 
 def test_migration_v12_existing_rows_have_null_outbox(db_path: Path, tmp_path: Path) -> None:
@@ -111,8 +113,7 @@ def test_migration_v12_existing_rows_have_null_outbox(db_path: Path, tmp_path: P
     # instead we exercise the "pre-existing row after migration" scenario:
     # insert a row after schema exists and confirm NULL is the default state.
     ensure_sync_schema(db_path)
-    conn = _open_sync_db(db_path)
-    try:
+    with _sync_db_connection(db_path) as conn:
         conn.execute(
             "INSERT INTO synced_dialogs (dialog_id, status, read_inbox_max_id) VALUES (?, 'synced', ?)",
             (4242, 5),
@@ -120,8 +121,6 @@ def test_migration_v12_existing_rows_have_null_outbox(db_path: Path, tmp_path: P
         conn.commit()
         row = conn.execute("SELECT read_outbox_max_id FROM synced_dialogs WHERE dialog_id=?", (4242,)).fetchone()
         assert row[0] is None, "new rows default read_outbox_max_id to NULL"
-    finally:
-        conn.close()
 
 
 def test_migration_v12_idempotent(db_path: Path) -> None:
@@ -130,31 +129,24 @@ def test_migration_v12_idempotent(db_path: Path) -> None:
     # fail with 'duplicate column name'; the _migrate framework guards via
     # schema_version and must skip already-applied versions).
     ensure_sync_schema(db_path)
-    conn = _open_sync_db(db_path)
-    try:
+    with _sync_db_connection(db_path) as conn:
         cols = _col_info(conn, "synced_dialogs")
         assert "read_outbox_max_id" in cols
         row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
         assert row[0] == _CURRENT_SCHEMA_VERSION
-    finally:
-        conn.close()
 
 
 def test_schema_version_records_current_v12(db_path: Path) -> None:
     ensure_sync_schema(db_path)
-    conn = _open_sync_db(db_path)
-    try:
+    with _sync_db_connection(db_path) as conn:
         row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
         assert row[0] == _CURRENT_SCHEMA_VERSION
-    finally:
-        conn.close()
 
 
 def test_migration_v12_does_not_drop_inbox_column(db_path: Path) -> None:
     """Regression guard: v12 adds the outbox column without touching inbox."""
     ensure_sync_schema(db_path)
-    conn = _open_sync_db(db_path)
-    try:
+    with _sync_db_connection(db_path) as conn:
         cols = _col_info(conn, "synced_dialogs")
         assert "read_inbox_max_id" in cols
         # Inbox column is still writable via the existing monotonic primitive.
@@ -165,8 +157,6 @@ def test_migration_v12_does_not_drop_inbox_column(db_path: Path) -> None:
         conn.commit()
         row = conn.execute("SELECT read_inbox_max_id FROM synced_dialogs WHERE dialog_id=?", (7777,)).fetchone()
         assert row[0] == 123
-    finally:
-        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -178,7 +168,7 @@ def test_schema_v16_creates_entity_details(tmp_path: Path) -> None:
     """v16 creates the entity_details sibling table per CONTEXT D-01."""
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
-    with sqlite3.connect(db_path) as conn:
+    with _sqlite_connection(db_path) as conn:
         cols = {(r[1], r[2]) for r in conn.execute("PRAGMA table_info(entity_details)").fetchall()}
     assert cols == {
         ("entity_id", "INTEGER"),
@@ -191,7 +181,7 @@ def test_schema_v16_creates_fetched_at_index(tmp_path: Path) -> None:
     """v16 adds an index on entity_details.fetched_at for future eviction sweeps (D-04)."""
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
-    with sqlite3.connect(db_path) as conn:
+    with _sqlite_connection(db_path) as conn:
         idx = {
             r[0]
             for r in conn.execute(
@@ -205,7 +195,7 @@ def test_migration_v16_fk_cascade_deletes_detail_row(tmp_path: Path) -> None:
     """Deleting an entities row CASCADES to delete the matching entity_details row."""
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
-    with sqlite3.connect(db_path) as conn:
+    with _sqlite_connection(db_path) as conn:
         conn.execute("PRAGMA foreign_keys = ON")  # SQLite defaults FKs OFF per connection
         conn.execute(
             "INSERT INTO entities (id, type, name, updated_at) VALUES (?, ?, ?, ?)",
@@ -229,7 +219,7 @@ def test_migration_v16_idempotent(tmp_path: Path) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     ensure_sync_schema(db_path)  # second call must be a no-op
-    with sqlite3.connect(db_path) as conn:
+    with _sqlite_connection(db_path) as conn:
         count = conn.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0]
         max_v = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
     assert count == _CURRENT_SCHEMA_VERSION
@@ -243,7 +233,7 @@ def test_migration_v16_does_not_touch_entities_columns(tmp_path: Path) -> None:
     """
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
-    with sqlite3.connect(db_path) as conn:
+    with _sqlite_connection(db_path) as conn:
         cols = {r[1] for r in conn.execute("PRAGMA table_info(entities)").fetchall()}
     assert cols == {"id", "type", "name", "username", "name_normalized", "updated_at"}, (
         f"entities columns must not change in v16; got {cols}"
@@ -258,8 +248,7 @@ def test_migration_v16_does_not_touch_entities_columns(tmp_path: Path) -> None:
 def test_migration_v18_creates_daemon_state_table(tmp_path: Path) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
-    conn = _open_sync_db(db_path)
-    try:
+    with _sync_db_connection(db_path) as conn:
         rows = list(conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='daemon_state'"))
         assert rows == [("daemon_state",)]
         cols = list(conn.execute("PRAGMA table_info(daemon_state)"))
@@ -267,53 +256,39 @@ def test_migration_v18_creates_daemon_state_table(tmp_path: Path) -> None:
         # name -> (type, notnull, pk)
         assert col_map["key"] == ("TEXT", 0, 1)
         assert col_map["value"] == ("TEXT", 0, 0)
-    finally:
-        conn.close()
 
 
 def test_migration_v18_daemon_state_empty_after_migration(tmp_path: Path) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
-    conn = _open_sync_db(db_path)
-    try:
+    with _sync_db_connection(db_path) as conn:
         count = conn.execute("SELECT COUNT(*) FROM daemon_state").fetchone()[0]
         assert count == 0
-    finally:
-        conn.close()
 
 
 def test_migration_v18_idempotent(tmp_path: Path) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
-    conn = _open_sync_db(db_path)
-    try:
+    with _sync_db_connection(db_path) as conn:
         conn.execute("INSERT INTO daemon_state(key, value) VALUES ('probe', 'value')")
         conn.commit()
-    finally:
-        conn.close()
 
     ensure_sync_schema(db_path)  # second call: must not raise or wipe data
 
-    conn = _open_sync_db(db_path)
-    try:
+    with _sync_db_connection(db_path) as conn:
         row = conn.execute("SELECT value FROM daemon_state WHERE key = 'probe'").fetchone()
         assert row == ("value",)
-    finally:
-        conn.close()
 
 
 def test_schema_version_records_current_v18(tmp_path: Path) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
-    conn = _open_sync_db(db_path)
-    try:
+    with _sync_db_connection(db_path) as conn:
         max_version = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
         assert max_version == _CURRENT_SCHEMA_VERSION
         assert (
             _CURRENT_SCHEMA_VERSION == 26
         )  # v26 fwd_from_peer_id marked-id normalisation — flips when next migration ships
-    finally:
-        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -323,8 +298,7 @@ def test_schema_version_records_current_v18(tmp_path: Path) -> None:
 
 def test_migration_v19_adds_v1_6_columns_to_topic_metadata(db_path: Path) -> None:
     ensure_sync_schema(db_path)
-    conn = _open_sync_db(db_path)
-    try:
+    with _sync_db_connection(db_path) as conn:
         cols = {c[1] for c in conn.execute("PRAGMA table_info(topic_metadata)")}
         # Legacy v4 columns retained:
         assert {
@@ -340,14 +314,11 @@ def test_migration_v19_adds_v1_6_columns_to_topic_metadata(db_path: Path) -> Non
         }.issubset(cols)
         # New v19 columns:
         assert {"icon_emoji_id", "pinned", "hidden", "snapshot_at", "date"}.issubset(cols)
-    finally:
-        conn.close()
 
 
 def test_migration_v19_preserves_legacy_topic_metadata_columns(db_path: Path) -> None:
     ensure_sync_schema(db_path)
-    conn = _open_sync_db(db_path)
-    try:
+    with _sync_db_connection(db_path) as conn:
         # Insert a legacy-shaped row (only legacy columns set explicitly).
         conn.execute(
             "INSERT INTO topic_metadata "
@@ -366,25 +337,19 @@ def test_migration_v19_preserves_legacy_topic_metadata_columns(db_path: Path) ->
         # New columns default to 0 (NOT NULL DEFAULT 0):
         assert row[3] == 0
         assert row[4] == 0
-    finally:
-        conn.close()
 
 
 def test_migration_v19_idempotent(db_path: Path) -> None:
     ensure_sync_schema(db_path)
     ensure_sync_schema(db_path)  # second call must not raise
-    conn = _open_sync_db(db_path)
-    try:
+    with _sync_db_connection(db_path) as conn:
         cols = {c[1] for c in conn.execute("PRAGMA table_info(topic_metadata)")}
         assert {"icon_emoji_id", "pinned", "hidden", "snapshot_at", "date"}.issubset(cols)
-    finally:
-        conn.close()
 
 
 def test_migration_v19_pinned_default_zero(db_path: Path) -> None:
     ensure_sync_schema(db_path)
-    conn = _open_sync_db(db_path)
-    try:
+    with _sync_db_connection(db_path) as conn:
         conn.execute(
             "INSERT INTO topic_metadata "
             "(dialog_id, topic_id, title, is_general, is_deleted, updated_at) "
@@ -396,14 +361,11 @@ def test_migration_v19_pinned_default_zero(db_path: Path) -> None:
             "SELECT pinned, hidden FROM topic_metadata WHERE dialog_id=-1009999 AND topic_id=1"
         ).fetchone()
         assert row == (0, 0)
-    finally:
-        conn.close()
 
 
 def test_migration_v19_does_not_break_existing_left_join(db_path: Path) -> None:
     ensure_sync_schema(db_path)
-    conn = _open_sync_db(db_path)
-    try:
+    with _sync_db_connection(db_path) as conn:
         conn.execute(
             "INSERT INTO topic_metadata "
             "(dialog_id, topic_id, title, is_general, is_deleted, updated_at) "
@@ -417,19 +379,14 @@ def test_migration_v19_does_not_break_existing_left_join(db_path: Path) -> None:
             (-1001234, 5),
         ).fetchone()
         assert row[0] == "General Discussion"
-    finally:
-        conn.close()
 
 
 def test_schema_version_records_v19(db_path: Path) -> None:
     ensure_sync_schema(db_path)
-    conn = _open_sync_db(db_path)
-    try:
+    with _sync_db_connection(db_path) as conn:
         # v19 must be present in the version history (migration ran).
         row = conn.execute("SELECT version FROM schema_version WHERE version = 19").fetchone()
         assert row is not None, "v19 migration did not run"
-    finally:
-        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -439,8 +396,7 @@ def test_schema_version_records_v19(db_path: Path) -> None:
 
 def test_migration_v21_creates_trace_coverage_fragments(db_path: Path) -> None:
     ensure_sync_schema(db_path)
-    conn = _open_sync_db(db_path)
-    try:
+    with _sync_db_connection(db_path) as conn:
         rows = list(
             conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='trace_coverage_fragments'")
         )
@@ -454,14 +410,11 @@ def test_migration_v21_creates_trace_coverage_fragments(db_path: Path) -> None:
         assert col_map["status"] == ("TEXT", 1, None, 0)
         assert col_map["created_at"] == ("INTEGER", 1, None, 0)
         assert col_map["updated_at"] == ("INTEGER", 1, None, 0)
-    finally:
-        conn.close()
 
 
 def test_migration_v21_creates_target_status_index(db_path: Path) -> None:
     ensure_sync_schema(db_path)
-    conn = _open_sync_db(db_path)
-    try:
+    with _sync_db_connection(db_path) as conn:
         indexes = {
             row[0]
             for row in conn.execute(
@@ -469,14 +422,11 @@ def test_migration_v21_creates_target_status_index(db_path: Path) -> None:
             )
         }
         assert "idx_trace_coverage_target_status" in indexes
-    finally:
-        conn.close()
 
 
 def test_migration_v21_accepts_dialog_level_trace_fragment(db_path: Path) -> None:
     ensure_sync_schema(db_path)
-    conn = _open_sync_db(db_path)
-    try:
+    with _sync_db_connection(db_path) as conn:
         conn.execute(
             """
             INSERT INTO trace_coverage_fragments
@@ -494,14 +444,11 @@ def test_migration_v21_accepts_dialog_level_trace_fragment(db_path: Path) -> Non
             """
         ).fetchone()
         assert row == (101, -100123, 0, "pending", 1700000000, 1700000001)
-    finally:
-        conn.close()
 
 
 def test_migration_v21_topic_zero_reserved_for_dialog_level(db_path: Path) -> None:
     ensure_sync_schema(db_path)
-    conn = _open_sync_db(db_path)
-    try:
+    with _sync_db_connection(db_path) as conn:
         conn.execute(
             "INSERT INTO topic_metadata "
             "(dialog_id, topic_id, title, is_general, is_deleted, updated_at) "
@@ -512,13 +459,11 @@ def test_migration_v21_topic_zero_reserved_for_dialog_level(db_path: Path) -> No
         topic_ids = [row[0] for row in conn.execute("SELECT topic_id FROM topic_metadata WHERE dialog_id = -100123")]
         assert topic_ids == [1]
         assert 0 not in topic_ids
-    finally:
-        conn.close()
 
 
 def test_migration_v21_runs_from_v20_database(tmp_path: Path) -> None:
     db_path = tmp_path / "sync.db"
-    with sqlite3.connect(db_path) as conn:
+    with _sqlite_connection(db_path) as conn:
         conn.execute(
             """
             CREATE TABLE schema_version (
@@ -589,8 +534,7 @@ def test_migration_v21_runs_from_v20_database(tmp_path: Path) -> None:
 
     ensure_sync_schema(db_path)
 
-    conn = _open_sync_db(db_path)
-    try:
+    with _sync_db_connection(db_path) as conn:
         assert conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='trace_coverage_fragments'"
         ).fetchone() == ("trace_coverage_fragments",)
@@ -598,8 +542,6 @@ def test_migration_v21_runs_from_v20_database(tmp_path: Path) -> None:
         assert "reply_count" in columns
         max_version = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
         assert max_version >= 23
-    finally:
-        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -609,18 +551,14 @@ def test_migration_v21_runs_from_v20_database(tmp_path: Path) -> None:
 
 def test_migration_v23_schema_version(db_path: Path) -> None:
     ensure_sync_schema(db_path)
-    conn = _open_sync_db(db_path)
-    try:
+    with _sync_db_connection(db_path) as conn:
         row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
         assert row[0] >= 23, f"expected schema version >= 23, got {row[0]}"
-    finally:
-        conn.close()
 
 
 def test_migration_v23_creates_activity_dialog_state(db_path: Path) -> None:
     ensure_sync_schema(db_path)
-    conn = _open_sync_db(db_path)
-    try:
+    with _sync_db_connection(db_path) as conn:
         row = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='activity_dialog_state'"
         ).fetchone()
@@ -650,27 +588,21 @@ def test_migration_v23_creates_activity_dialog_state(db_path: Path) -> None:
         assert cols["cold_status"][4] == "'pending'", (
             f"cold_status default must be 'pending', got {cols['cold_status'][4]}"
         )
-    finally:
-        conn.close()
 
 
 def test_migration_v23_per_tier_retry_columns_no_shared(db_path: Path) -> None:
     """Both hot_next_retry_at and cold_next_retry_at exist; no bare next_retry_at column."""
     ensure_sync_schema(db_path)
-    conn = _open_sync_db(db_path)
-    try:
+    with _sync_db_connection(db_path) as conn:
         col_names = {c[1] for c in conn.execute("PRAGMA table_info(activity_dialog_state)")}
         assert "hot_next_retry_at" in col_names, "hot_next_retry_at must exist (Tier-A retry)"
         assert "cold_next_retry_at" in col_names, "cold_next_retry_at must exist (Tier-B retry)"
         assert "next_retry_at" not in col_names, "bare next_retry_at must NOT exist (tier coupling)"
-    finally:
-        conn.close()
 
 
 def test_migration_v23_creates_per_tier_indexes(db_path: Path) -> None:
     ensure_sync_schema(db_path)
-    conn = _open_sync_db(db_path)
-    try:
+    with _sync_db_connection(db_path) as conn:
         indexes = {
             row[0]
             for row in conn.execute(
@@ -679,38 +611,30 @@ def test_migration_v23_creates_per_tier_indexes(db_path: Path) -> None:
         }
         assert "idx_activity_dialog_state_hot" in indexes, "Tier-A hot index missing"
         assert "idx_activity_dialog_state_cold" in indexes, "Tier-B cold index missing"
-    finally:
-        conn.close()
 
 
 def test_migration_v23_activity_dialog_state_without_rowid(db_path: Path) -> None:
     ensure_sync_schema(db_path)
-    conn = _open_sync_db(db_path)
-    try:
+    with _sync_db_connection(db_path) as conn:
         row = conn.execute(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='activity_dialog_state'"
         ).fetchone()
         assert row is not None
         assert "WITHOUT ROWID" in row[0].upper()
-    finally:
-        conn.close()
 
 
 def test_migration_v23_idempotent(db_path: Path) -> None:
     ensure_sync_schema(db_path)
     ensure_sync_schema(db_path)  # second call must not raise
-    conn = _open_sync_db(db_path)
-    try:
+    with _sync_db_connection(db_path) as conn:
         row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
         assert row[0] >= 23
-    finally:
-        conn.close()
 
 
 def test_migration_v23_runs_from_v22_database(tmp_path: Path) -> None:
     """v22 → current upgrade path creates activity_dialog_state; activity_channel_resolution is absent after v24."""
     db_path = tmp_path / "sync.db"
-    with sqlite3.connect(db_path) as conn:
+    with _sqlite_connection(db_path) as conn:
         conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL, applied_at INTEGER NOT NULL)")
         conn.execute(
             """
@@ -775,8 +699,7 @@ def test_migration_v23_runs_from_v22_database(tmp_path: Path) -> None:
 
     ensure_sync_schema(db_path)
 
-    conn = _open_sync_db(db_path)
-    try:
+    with _sync_db_connection(db_path) as conn:
         # activity_dialog_state survives v24
         assert conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='activity_dialog_state'"
@@ -790,8 +713,6 @@ def test_migration_v23_runs_from_v22_database(tmp_path: Path) -> None:
         ), "activity_channel_resolution must be absent after v24"
         max_version = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
         assert max_version >= 23
-    finally:
-        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -802,24 +723,18 @@ def test_migration_v23_runs_from_v22_database(tmp_path: Path) -> None:
 
 def test_migration_v24_schema_version(db_path: Path) -> None:
     ensure_sync_schema(db_path)
-    conn = _open_sync_db(db_path)
-    try:
+    with _sync_db_connection(db_path) as conn:
         row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
         assert row[0] == _CURRENT_SCHEMA_VERSION, f"expected schema version {_CURRENT_SCHEMA_VERSION}, got {row[0]}"
-    finally:
-        conn.close()
 
 
 def test_migration_v24_columns_exist(db_path: Path) -> None:
     """dialogs table has linked_chat_id and linked_chat_resolved_at columns after v24."""
     ensure_sync_schema(db_path)
-    conn = _open_sync_db(db_path)
-    try:
+    with _sync_db_connection(db_path) as conn:
         cols = {c[1] for c in conn.execute("PRAGMA table_info(dialogs)")}
         assert "linked_chat_id" in cols, "linked_chat_id column missing from dialogs"
         assert "linked_chat_resolved_at" in cols, "linked_chat_resolved_at column missing from dialogs"
-    finally:
-        conn.close()
 
 
 def _seed_v24_fixtures(conn: sqlite3.Connection) -> None:
@@ -869,7 +784,7 @@ def test_migration_v24_backfill_three_shapes(tmp_path: Path) -> None:
     """Full v24 migration: three channel shapes produce correct post-migration dialogs state."""
     db_path = tmp_path / "sync.db"
     # Open at v23 to seed data before v24 runs
-    with sqlite3.connect(db_path) as pre_conn:
+    with _sqlite_connection(db_path) as pre_conn:
         pre_conn.execute("PRAGMA journal_mode=WAL")
         pre_conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL, applied_at INTEGER NOT NULL)")
         # Minimal tables required by the migration path up to v23
@@ -928,8 +843,7 @@ def test_migration_v24_backfill_three_shapes(tmp_path: Path) -> None:
 
     ensure_sync_schema(db_path)
 
-    conn = _open_sync_db(db_path)
-    try:
+    with _sync_db_connection(db_path) as conn:
         # Schema version (v24 columns exist; MAX will be _CURRENT_SCHEMA_VERSION as later migrations run too)
         row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
         assert row[0] == _CURRENT_SCHEMA_VERSION, f"expected v{_CURRENT_SCHEMA_VERSION}, got {row[0]}"
@@ -981,27 +895,21 @@ def test_migration_v24_backfill_three_shapes(tmp_path: Path) -> None:
             ).fetchone()
             is None
         ), "activity_channel_resolution must be absent after v24"
-    finally:
-        conn.close()
 
 
 def test_migration_v24_idempotent(db_path: Path) -> None:
     """Running ensure_sync_schema twice is a no-op (no exception, version stays at current)."""
     ensure_sync_schema(db_path)
     ensure_sync_schema(db_path)
-    conn = _open_sync_db(db_path)
-    try:
+    with _sync_db_connection(db_path) as conn:
         row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
         assert row[0] == _CURRENT_SCHEMA_VERSION
-    finally:
-        conn.close()
 
 
 def test_migration_v24_channel_c_not_stripped(db_path: Path) -> None:
     """Channel C (no linked_chat_id key) is unaffected by the strip — json_type still NULL."""
     ensure_sync_schema(db_path)
-    conn = _open_sync_db(db_path)
-    try:
+    with _sync_db_connection(db_path) as conn:
         # No entity_details row was seeded for this db_path, so the strip is vacuously safe.
         # Insert a channel row post-migration to verify json_type on fresh rows behaves.
         conn.execute(
@@ -1019,8 +927,6 @@ def test_migration_v24_channel_c_not_stripped(db_path: Path) -> None:
             "SELECT json_extract(detail_json, '$.subscribers_count') FROM entity_details WHERE entity_id = 9999"
         ).fetchone()
         assert row2[0] == 5, "subscribers_count should be preserved"
-    finally:
-        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1039,7 +945,7 @@ def test_migration_v24_channel_c_not_stripped(db_path: Path) -> None:
 def _make_v24_db(tmp_path: Path) -> Path:
     """Create a minimal v24 database (pre-v25) for migration tests."""
     db_path = tmp_path / "sync.db"
-    with sqlite3.connect(db_path) as conn:
+    with _sqlite_connection(db_path) as conn:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL, applied_at INTEGER NOT NULL)")
         # Minimal dialogs table as it exists post-v24 (includes linked_chat columns)
@@ -1092,13 +998,10 @@ def test_migration_schema_version_is_current(tmp_path: Path) -> None:
     """After all migrations, MAX(schema_version) == _CURRENT_SCHEMA_VERSION (26)."""
     db_path = _make_v24_db(tmp_path)
     ensure_sync_schema(db_path)
-    conn = _open_sync_db(db_path)
-    try:
+    with _sync_db_connection(db_path) as conn:
         row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
         assert row[0] == _CURRENT_SCHEMA_VERSION, f"expected {_CURRENT_SCHEMA_VERSION}, got {row[0]}"
         assert _CURRENT_SCHEMA_VERSION == 26
-    finally:
-        conn.close()
 
 
 def test_migration_v26_remarks_known_channel_and_chat_forwards(tmp_path: Path) -> None:
@@ -1107,7 +1010,7 @@ def test_migration_v26_remarks_known_channel_and_chat_forwards(tmp_path: Path) -
     db_path = _make_v24_db(tmp_path)
     known_channel = -1001579759981  # marked; bare source = 1579759981
     known_chat = -4276001234  # marked legacy chat; bare source = 4276001234
-    with sqlite3.connect(db_path) as pre:
+    with _sqlite_connection(db_path) as pre:
         for did in (known_channel, known_chat):
             pre.execute("INSERT INTO dialogs (dialog_id) VALUES (?)", (did,))
         rows = [
@@ -1127,8 +1030,7 @@ def test_migration_v26_remarks_known_channel_and_chat_forwards(tmp_path: Path) -
 
     ensure_sync_schema(db_path)
 
-    conn = _open_sync_db(db_path)
-    try:
+    with _sync_db_connection(db_path) as conn:
         got = {
             mid: peer
             for mid, peer in conn.execute(
@@ -1140,8 +1042,6 @@ def test_migration_v26_remarks_known_channel_and_chat_forwards(tmp_path: Path) -
         assert got[3] == 429356, f"unknown user-shaped peer must stay bare, got {got[3]}"
         assert got[4] == known_channel, f"already-marked row must be untouched, got {got[4]}"
         assert got[5] is None, f"null peer must stay null, got {got[5]}"
-    finally:
-        conn.close()
 
 
 def test_migration_v25_backfills_orphan_own_only(tmp_path: Path) -> None:
@@ -1150,7 +1050,7 @@ def test_migration_v25_backfills_orphan_own_only(tmp_path: Path) -> None:
     db_path = _make_v24_db(tmp_path)
     orphan_id = -100888000001
 
-    with sqlite3.connect(db_path) as pre_conn:
+    with _sqlite_connection(db_path) as pre_conn:
         pre_conn.execute(
             "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'own_only')",
             (orphan_id,),
@@ -1159,8 +1059,7 @@ def test_migration_v25_backfills_orphan_own_only(tmp_path: Path) -> None:
 
     ensure_sync_schema(db_path)
 
-    conn = _open_sync_db(db_path)
-    try:
+    with _sync_db_connection(db_path) as conn:
         row = conn.execute(
             "SELECT needs_refresh, name FROM dialogs WHERE dialog_id = ?",
             (orphan_id,),
@@ -1168,8 +1067,6 @@ def test_migration_v25_backfills_orphan_own_only(tmp_path: Path) -> None:
         assert row is not None, "v25 backfill must create a thin dialogs row for orphan own_only peer"
         assert row[0] == 1, f"needs_refresh must be 1 after backfill, got {row[0]!r}"
         assert row[1] is None, f"name must remain NULL until reconciliation fills it, got {row[1]!r}"
-    finally:
-        conn.close()
 
 
 def test_migration_v25_leaves_resolved_own_only_untouched(tmp_path: Path) -> None:
@@ -1178,7 +1075,7 @@ def test_migration_v25_leaves_resolved_own_only_untouched(tmp_path: Path) -> Non
     db_path = _make_v24_db(tmp_path)
     peer_id = -100888000002
 
-    with sqlite3.connect(db_path) as pre_conn:
+    with _sqlite_connection(db_path) as pre_conn:
         pre_conn.execute(
             "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'own_only')",
             (peer_id,),
@@ -1193,8 +1090,7 @@ def test_migration_v25_leaves_resolved_own_only_untouched(tmp_path: Path) -> Non
 
     ensure_sync_schema(db_path)
 
-    conn = _open_sync_db(db_path)
-    try:
+    with _sync_db_connection(db_path) as conn:
         row = conn.execute(
             "SELECT name, type, needs_refresh FROM dialogs WHERE dialog_id = ?",
             (peer_id,),
@@ -1203,8 +1099,6 @@ def test_migration_v25_leaves_resolved_own_only_untouched(tmp_path: Path) -> Non
         assert row[0] == "Already Resolved", f"name must not be clobbered, got {row[0]!r}"
         assert row[1] == "user", f"type must not be clobbered, got {row[1]!r}"
         assert row[2] == 0, f"needs_refresh must stay 0 (already resolved), got {row[2]!r}"
-    finally:
-        conn.close()
 
 
 def test_migration_v25_ignores_non_own_only(tmp_path: Path) -> None:
@@ -1214,7 +1108,7 @@ def test_migration_v25_ignores_non_own_only(tmp_path: Path) -> None:
     synced_id = -100888000003
     pending_id = -100888000004
 
-    with sqlite3.connect(db_path) as pre_conn:
+    with _sqlite_connection(db_path) as pre_conn:
         pre_conn.execute(
             "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')",
             (synced_id,),
@@ -1227,12 +1121,9 @@ def test_migration_v25_ignores_non_own_only(tmp_path: Path) -> None:
 
     ensure_sync_schema(db_path)
 
-    conn = _open_sync_db(db_path)
-    try:
+    with _sync_db_connection(db_path) as conn:
         row_synced = conn.execute("SELECT dialog_id FROM dialogs WHERE dialog_id = ?", (synced_id,)).fetchone()
         assert row_synced is None, "non-own_only 'synced' peer must NOT get a thin dialogs row"
 
         row_pending = conn.execute("SELECT dialog_id FROM dialogs WHERE dialog_id = ?", (pending_id,)).fetchone()
         assert row_pending is None, "non-own_only 'pending' peer must NOT get a thin dialogs row"
-    finally:
-        conn.close()
