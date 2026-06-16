@@ -24,6 +24,19 @@ from telethon.tl.types import User  # type: ignore[import-untyped]
 
 from mcp_telegram.daemon_api import DaemonAPIServer
 
+_TEST_DBS: list[sqlite3.Connection] = []
+
+
+@pytest.fixture(autouse=True)
+def _close_test_db():
+    yield
+    while _TEST_DBS:
+        conn = _TEST_DBS.pop()
+        try:
+            conn.close()
+        except Exception:
+            pass
+
 
 @pytest.fixture(autouse=True)
 def _patch_get_peer_id():
@@ -58,6 +71,7 @@ def _make_db() -> sqlite3.Connection:
         CREATE INDEX idx_entity_details_fetched_at ON entity_details(fetched_at);
         """
     )
+    _TEST_DBS.append(conn)
     return conn
 
 
