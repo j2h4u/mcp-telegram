@@ -39,7 +39,7 @@ target-version = "py314"
 # ruff-specific (RUF), bugbear-adjacent simplifications (SIM). Excluding
 # stylistic/annotation/docstring/strictness categories that would flag the
 # entire codebase without changing correctness.
-select = ["E", "F", "I", "W", "B", "UP", "RUF", "SIM", "PIE", "ISC", "RSE", "FLY", "PGH", "LOG", "PLE", "C4", "DTZ", "N818", "PTH", "RET", "FURB", "PERF"]
+select = ["E", "F", "I", "W", "B", "UP", "RUF", "SIM", "PIE", "ISC", "RSE", "FLY", "PGH", "LOG", "PLE", "C4", "DTZ", "N818", "PTH", "RET", "FURB", "PERF", "PLR0916", "PLR1702"]
 ignore = [
   "E501",   # line length — formatter handles this
   "B008",   # Typer default values
@@ -52,6 +52,9 @@ ignore = [
   "UP007",  # Optional[X] vs X | None
   "UP045",  # typing.Optional still fine
 ]
+
+preview = true
+explicit-preview-rules = true
 
 # Allow fix for all enabled rules (when `--fix`) is provided.
 fixable = ["ALL"]

@@ -344,92 +344,124 @@ class EventHandlerManager:
                 # events. UPDATE matches 0 rows when the dialog is not yet bootstrapped
                 # (no dialogs row) — silent no-op; bootstrap is the sole row creator.
                 msg_date = getattr(msg, "date", None)
-                if msg_date is not None:
-                    new_ts = int(msg_date.timestamp())
-                    self._conn.execute(
-                        _UPDATE_DIALOG_LAST_MESSAGE_AT_SQL,
-                        (new_ts, now, dialog_id),
-                    )
-                self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
-
-                # Phase 42 EVENTS-05: forum topic mutations carried in service
-                # messages. The upstream _synced_dialog_ids gate at line 273
-                # already filters unenrolled dialogs — no duplicate check needed
-                # here. Only MessageActionTopicCreate and MessageActionTopicEdit
-                # trigger writes; all other action types (or action=None) fall
-                # through silently.
-                action = getattr(msg, "action", None)
-                if isinstance(action, MessageActionTopicCreate):
-                    topic_id = int(getattr(msg, "id", 0))
-                    if topic_id > 0:
-                        title = getattr(action, "title", None) or "Topic"
-                        self._conn.execute(
-                            _UPSERT_TOPIC_METADATA_SQL,
-                            {
-                                "dialog_id": dialog_id,
-                                "topic_id": topic_id,
-                                "title": title,
-                                "icon_emoji_id": getattr(action, "icon_emoji_id", None),
-                                "updated_at": now,
-                                "snapshot_at": now,
-                                "date": int(msg_date.timestamp()) if msg_date is not None else now,
-                            },
-                        )
-                        logger.info(
-                            "event_topic_create dialog_id=%d topic_id=%d",
-                            dialog_id,
-                            topic_id,
-                        )
-                elif isinstance(action, MessageActionTopicEdit):
-                    reply_to = getattr(msg, "reply_to", None)
-                    if reply_to is None:
-                        # Defensive: some MessageActionTopicEdit events carry no
-                        # reply_to; without it we cannot identify the target topic.
-                        logger.debug(
-                            "event_topic_edit_skipped reason=no_reply_to dialog_id=%d",
-                            dialog_id,
-                        )
-                    else:
-                        topic_id_raw = getattr(reply_to, "reply_to_msg_id", None)
-                        if topic_id_raw is None:
-                            logger.debug(
-                                "event_topic_edit_skipped reason=no_reply_to_msg_id dialog_id=%d",
-                                dialog_id,
-                            )
-                        else:
-                            topic_id = int(topic_id_raw)
-                            if bool(getattr(action, "hidden", False)):
-                                self._conn.execute(
-                                    _UPDATE_TOPIC_METADATA_HIDDEN_SQL,
-                                    (now, now, dialog_id, topic_id),
-                                )
-                                logger.info(
-                                    "event_topic_hidden dialog_id=%d topic_id=%d",
-                                    dialog_id,
-                                    topic_id,
-                                )
-                            else:
-                                # Non-hidden edits use an UPDATE-only path.
-                                # COALESCE(?, existing) preserves fields when the
-                                # edit omits them (action.title / icon_emoji_id may
-                                # be None). UPDATE matches 0 rows for unknown topics
-                                # — silent no-op; on_new_message UPSERT is the sole
-                                # row-creation path.
-                                edit_title = getattr(action, "title", None)
-                                edit_icon = getattr(action, "icon_emoji_id", None)
-                                self._conn.execute(
-                                    _UPDATE_TOPIC_METADATA_EDIT_SQL,
-                                    (edit_title, edit_icon, now, now, dialog_id, topic_id, now),
-                                )
-                                logger.info(
-                                    "event_topic_edit dialog_id=%d topic_id=%d",
-                                    dialog_id,
-                                    topic_id,
-                                )
+                self._update_last_message_timestamp(dialog_id, now, msg_date)
+                self._handle_topic_message_action(dialog_id, msg, now)
 
             logger.info("event_new dialog_id=%d message_id=%d", dialog_id, msg.id)
         except Exception:
             logger.exception("event_new_failed dialog_id=%s", dialog_id)
+
+    def _update_last_message_timestamp(
+        self,
+        dialog_id: int,
+        now: int,
+        msg_date: Any,
+    ) -> None:
+        if msg_date is not None:
+            self._conn.execute(
+                _UPDATE_DIALOG_LAST_MESSAGE_AT_SQL,
+                (int(msg_date.timestamp()), now, dialog_id),
+            )
+        self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
+
+    def _handle_topic_message_action(
+        self,
+        dialog_id: int,
+        msg: Any,
+        now: int,
+    ) -> None:
+        action = getattr(msg, "action", None)
+        if isinstance(action, MessageActionTopicCreate):
+            self._handle_topic_create_action(dialog_id, msg, now, action)
+            return
+        if isinstance(action, MessageActionTopicEdit):
+            self._handle_topic_edit_action(dialog_id, msg, now, action)
+
+    def _handle_topic_create_action(
+        self,
+        dialog_id: int,
+        msg: Any,
+        now: int,
+        action: MessageActionTopicCreate,
+    ) -> None:
+        topic_id = int(getattr(msg, "id", 0))
+        if topic_id <= 0:
+            return
+        msg_date = getattr(msg, "date", None)
+        topic_timestamp = int(msg_date.timestamp()) if msg_date is not None else now
+        self._conn.execute(
+            _UPSERT_TOPIC_METADATA_SQL,
+            {
+                "dialog_id": dialog_id,
+                "topic_id": topic_id,
+                "title": getattr(action, "title", None) or "Topic",
+                "icon_emoji_id": getattr(action, "icon_emoji_id", None),
+                "updated_at": now,
+                "snapshot_at": now,
+                "date": topic_timestamp,
+            },
+        )
+        logger.info(
+            "event_topic_create dialog_id=%d topic_id=%d",
+            dialog_id,
+            topic_id,
+        )
+
+    def _handle_topic_edit_action(
+        self,
+        dialog_id: int,
+        msg: Any,
+        now: int,
+        action: MessageActionTopicEdit,
+    ) -> None:
+        reply_to = getattr(msg, "reply_to", None)
+        if reply_to is None:
+            # Defensive: some MessageActionTopicEdit events carry no
+            # reply_to; without it we cannot identify the target topic.
+            logger.debug(
+                "event_topic_edit_skipped reason=no_reply_to dialog_id=%d",
+                dialog_id,
+            )
+            return
+
+        topic_id_raw = getattr(reply_to, "reply_to_msg_id", None)
+        if topic_id_raw is None:
+            logger.debug(
+                "event_topic_edit_skipped reason=no_reply_to_msg_id dialog_id=%d",
+                dialog_id,
+            )
+            return
+
+        topic_id = int(topic_id_raw)
+        if bool(getattr(action, "hidden", False)):
+            self._conn.execute(
+                _UPDATE_TOPIC_METADATA_HIDDEN_SQL,
+                (now, now, dialog_id, topic_id),
+            )
+            logger.info(
+                "event_topic_hidden dialog_id=%d topic_id=%d",
+                dialog_id,
+                topic_id,
+            )
+            return
+
+        # Non-hidden edits use an UPDATE-only path.
+        # COALESCE(?, existing) preserves fields when the
+        # edit omits them (action.title / icon_emoji_id may
+        # be None). UPDATE matches 0 rows for unknown topics
+        # — silent no-op; on_new_message UPSERT is the sole
+        # row-creation path.
+        edit_title = getattr(action, "title", None)
+        edit_icon = getattr(action, "icon_emoji_id", None)
+        self._conn.execute(
+            _UPDATE_TOPIC_METADATA_EDIT_SQL,
+            (edit_title, edit_icon, now, now, dialog_id, topic_id, now),
+        )
+        logger.info(
+            "event_topic_edit dialog_id=%d topic_id=%d",
+            dialog_id,
+            topic_id,
+        )
 
     async def on_message_edited(self, event: Any) -> None:
         """Handle a MessageEdited event: version old text, update messages row.
@@ -1055,27 +1087,7 @@ class EventHandlerManager:
 
         for dialog_id in dialog_ids:
             try:
-                message_ids = [
-                    int(row[0])
-                    for row in self._conn.execute(
-                        _SELECT_UNDELETED_MESSAGES_SQL, (dialog_id, scan_started_at)
-                    ).fetchall()
-                ]
-
-                if not message_ids:
-                    continue
-
-                # Batch in groups of 100 (Telegram API limit)
-                for batch_start in range(0, len(message_ids), 100):
-                    batch = message_ids[batch_start : batch_start + 100]
-                    results = await self._client.get_messages(dialog_id, ids=batch)
-
-                    now = int(time.time())
-                    with self._conn:  # atomic per-dialog batch
-                        for queried_id, returned_msg in zip(batch, results, strict=False):
-                            if returned_msg is None:
-                                self._conn.execute(_MARK_DELETED_SQL, (now, dialog_id, queried_id))
-                                total_marked += 1
+                total_marked += await self._scan_dm_gap_dialog(dialog_id, scan_started_at)
             except Exception:
                 logger.warning(
                     "dm_gap_scan_dialog_failed dialog_id=%d",
@@ -1085,3 +1097,28 @@ class EventHandlerManager:
 
         logger.info("dm_gap_scan marked_deleted=%d", total_marked)
         return total_marked
+
+    async def _scan_dm_gap_dialog(self, dialog_id: int, scan_started_at: int) -> int:
+        message_ids = [
+            int(row[0])
+            for row in self._conn.execute(
+                _SELECT_UNDELETED_MESSAGES_SQL,
+                (dialog_id, scan_started_at),
+            ).fetchall()
+        ]
+        if not message_ids:
+            return 0
+
+        marked = 0
+        # Batch in groups of 100 (Telegram API limit)
+        for batch_start in range(0, len(message_ids), 100):
+            batch = message_ids[batch_start : batch_start + 100]
+            results = await self._client.get_messages(dialog_id, ids=batch)
+
+            now = int(time.time())
+            with self._conn:  # atomic per-dialog batch
+                for queried_id, returned_msg in zip(batch, results, strict=False):
+                    if returned_msg is None:
+                        self._conn.execute(_MARK_DELETED_SQL, (now, dialog_id, queried_id))
+                        marked += 1
+        return marked

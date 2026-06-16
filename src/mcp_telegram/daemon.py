@@ -171,38 +171,16 @@ async def _initialize_read_positions(
         if shutdown_event.is_set():
             break
         batch_ids = dialog_ids[i : i + _BOOTSTRAP_BATCH_SIZE]
+        input_peers = await _build_read_position_input_peers(client, batch_ids)
+        if not input_peers:
+            if not await _sleep_read_pos_batch(shutdown_event):
+                break
+            continue
+
         try:
-            input_peers = []
-            for did in batch_ids:
-                try:
-                    peer = await client.get_input_entity(did)
-                    input_peers.append(InputDialogPeer(peer=peer))
-                except Exception as exc:
-                    logger.debug("read_pos_bootstrap skip dialog_id=%d error=%s", did, exc)
-            if input_peers:
-                result = await client(GetPeerDialogsRequest(peers=input_peers))
-                for d in result.dialogs:
-                    chat_id = telethon_utils.get_peer_id(d.peer)
-                    # D-03 LOCKED: None → skip (preserve NULL). NEVER fold
-                    # None → 0; that would lie with [all read] during the
-                    # bootstrap window. The DB cursor stays NULL and Plan 03
-                    # renders [unknown (sync pending)]. 0 is a legitimate
-                    # distinct value (peer/me has read nothing) — writes 0.
-                    inbox_max = getattr(d, "read_inbox_max_id", None)
-                    outbox_max = getattr(d, "read_outbox_max_id", None)
-                    wrote_any = False
-                    if inbox_max is not None:
-                        # Monotonic via shared primitive — see read_state.py.
-                        rowcount = apply_read_cursor(conn, chat_id, "inbox", inbox_max)
-                        if rowcount > 0:
-                            wrote_any = True
-                    if outbox_max is not None:
-                        rowcount = apply_read_cursor(conn, chat_id, "outbox", outbox_max)
-                        if rowcount > 0:
-                            wrote_any = True
-                    if wrote_any:
-                        filled += 1
-                conn.commit()
+            result = await client(GetPeerDialogsRequest(peers=input_peers))
+            filled += _apply_read_positions_from_dialogs(conn, result)
+            conn.commit()
         except FloodWaitError as exc:
             logger.warning("read_pos_bootstrap flood_wait seconds=%d", exc.seconds)
             if await sleep_through_flood(shutdown_event, flood_seconds(exc)):
@@ -210,15 +188,54 @@ async def _initialize_read_positions(
         except Exception as exc:
             logger.debug("read_pos_bootstrap batch_failed error=%s", exc)
 
-        # Inter-batch pause: 1.5s, SIGTERM-responsive
-        try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=1.5)
+        if not await _sleep_read_pos_batch(shutdown_event):
             break
-        except TimeoutError:
-            pass
 
     logger.info("initialize_read_positions filled=%d/%d", filled, len(dialog_ids))
     return filled
+
+
+async def _build_read_position_input_peers(client: Any, batch_ids: list[int]) -> list[InputDialogPeer]:
+    input_peers: list[InputDialogPeer] = []
+    for dialog_id in batch_ids:
+        try:
+            peer = await client.get_input_entity(dialog_id)
+            input_peers.append(InputDialogPeer(peer=peer))
+        except Exception as exc:
+            logger.debug("read_pos_bootstrap skip dialog_id=%d error=%s", dialog_id, exc)
+    return input_peers
+
+
+def _apply_read_positions_from_dialogs(conn: sqlite3.Connection, result: Any) -> int:
+    """Apply read cursors from a GetPeerDialogsRequest result."""
+    filled = 0
+    for dialog in result.dialogs:
+        chat_id = telethon_utils.get_peer_id(dialog.peer)
+        # D-03 LOCKED: None → skip (preserve NULL). NEVER fold
+        # None → 0; that would lie with [all read] during the
+        # bootstrap window. The DB cursor stays NULL and Plan 03
+        # renders [unknown (sync pending)]. 0 is a legitimate
+        # distinct value (peer/me has read nothing) — writes 0.
+        inbox_max = getattr(dialog, "read_inbox_max_id", None)
+        outbox_max = getattr(dialog, "read_outbox_max_id", None)
+        wrote_any = False
+        if inbox_max is not None and apply_read_cursor(conn, chat_id, "inbox", inbox_max) > 0:
+            # Monotonic via shared primitive — see read_state.py.
+            wrote_any = True
+        if outbox_max is not None and apply_read_cursor(conn, chat_id, "outbox", outbox_max) > 0:
+            wrote_any = True
+        if wrote_any:
+            filled += 1
+    return filled
+
+
+async def _sleep_read_pos_batch(shutdown_event: asyncio.Event) -> bool:
+    # Inter-batch pause: 1.5s, SIGTERM-responsive
+    try:
+        await asyncio.wait_for(shutdown_event.wait(), timeout=1.5)
+        return False
+    except TimeoutError:
+        return True
 
 
 # ---------------------------------------------------------------------------
