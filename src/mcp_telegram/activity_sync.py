@@ -134,7 +134,7 @@ def _upsert_entities_from_search(conn: sqlite3.Connection, result: Any) -> None:
             continue
         try:
             pid = get_peer_id(c)  # yields -100XXXXX for Channel
-        except Exception:
+        except TypeError:
             continue
         name = getattr(c, "title", None) or None
         username = getattr(c, "username", None)

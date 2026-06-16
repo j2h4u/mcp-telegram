@@ -41,7 +41,7 @@ import time
 from typing import Any
 
 from telethon import utils as telethon_utils  # type: ignore[import-untyped]
-from telethon.errors.rpcerrorlist import FloodWaitError  # type: ignore[import-untyped]
+from telethon.errors.rpcerrorlist import FloodWaitError, RPCError  # type: ignore[import-untyped]
 from telethon.tl.functions.messages import GetPeerDialogsRequest  # type: ignore[import-untyped]
 from telethon.tl.types import InputDialogPeer  # type: ignore[import-untyped]
 
@@ -78,6 +78,12 @@ GAP_SCAN_INTERVAL_S: float = 7 * 24 * 3600.0
 # documented in Plan 39.3-02 (R4) and the _initialize_read_positions docstring.
 # Paired with a 1.5s inter-batch pause in the loop body.
 _BOOTSTRAP_BATCH_SIZE: int = 15
+
+_BACKFILL_TOTAL_MESSAGES_SKIP_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    RPCError,
+    sqlite3.DatabaseError,
+    Exception,
+)
 
 _SELECT_NULL_TOTAL_SQL = "SELECT dialog_id FROM synced_dialogs WHERE total_messages IS NULL AND status != 'not_synced'"
 
@@ -120,9 +126,9 @@ async def _backfill_total_messages(
             if await sleep_through_flood(shutdown_event, flood_seconds(exc)):
                 return filled  # shutdown during flood wait
             # flood wait elapsed normally — fall through to next dialog
-        except Exception as exc:
+        except _BACKFILL_TOTAL_MESSAGES_SKIP_EXCEPTIONS as exc:
             logger.debug("backfill_total skip dialog_id=%d error=%s", dialog_id, exc)
-        await asyncio.sleep(1.0)
+            await asyncio.sleep(1.0)
 
     logger.info("backfill_total_messages filled=%d/%d", filled, len(rows))
     return filled
@@ -185,7 +191,7 @@ async def _initialize_read_positions(
             logger.warning("read_pos_bootstrap flood_wait seconds=%d", exc.seconds)
             if await sleep_through_flood(shutdown_event, flood_seconds(exc)):
                 return filled
-        except Exception as exc:
+        except (RPCError, sqlite3.DatabaseError) as exc:
             logger.debug("read_pos_bootstrap batch_failed error=%s", exc)
 
         if not await _sleep_read_pos_batch(shutdown_event):
@@ -201,7 +207,7 @@ async def _build_read_position_input_peers(client: Any, batch_ids: list[int]) ->
         try:
             peer = await client.get_input_entity(dialog_id)
             input_peers.append(InputDialogPeer(peer=peer))
-        except Exception as exc:
+        except (RPCError, TypeError, ValueError) as exc:
             logger.debug("read_pos_bootstrap skip dialog_id=%d error=%s", dialog_id, exc)
     return input_peers
 
@@ -262,7 +268,7 @@ def _log_heartbeat(
     try:
         stats = dict(conn.execute("SELECT status, COUNT(*) FROM synced_dialogs GROUP BY status").fetchall())
         msg_count = int(conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0])
-    except Exception:
+    except sqlite3.DatabaseError:
         logger.warning("heartbeat_stats_failed", exc_info=True)
         stats = {}
         msg_count = 0
@@ -351,7 +357,7 @@ async def _run_sync_loop(
     # rate sample reflects the first interval, not a divide-by-zero.
     try:
         last_hb_msg_count = int(conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0])
-    except Exception:
+    except sqlite3.DatabaseError:
         last_hb_msg_count = 0
     last_hb_mono = sync_start
     was_idle = False  # log idle transition once, not every cycle

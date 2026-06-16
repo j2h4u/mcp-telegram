@@ -551,7 +551,7 @@ def extract_fwd_row(
     if fwd_date_raw is not None:
         try:
             fwd_date = int(fwd_date_raw.timestamp())
-        except Exception:
+        except AttributeError, OverflowError, TypeError, ValueError:
             fwd_date = None
     fwd_channel_post = getattr(fwd, "channel_post", None)
     if fwd_channel_post is not None:

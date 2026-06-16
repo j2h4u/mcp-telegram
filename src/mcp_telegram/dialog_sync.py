@@ -768,7 +768,7 @@ class DialogReconciliationWorker:
             )
             await sleep_through_flood(self._shutdown_event, wait_s)
             return 0
-        except Exception as exc:
+        except (RPCError, TypeError) as exc:
             logger.warning(
                 "recon_forum_topics_fetch_failed dialog_id=%d error=%s",
                 dialog_id,

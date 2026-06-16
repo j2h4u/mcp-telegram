@@ -25,7 +25,7 @@ import time
 from typing import Any
 
 from telethon import events  # type: ignore[import-untyped]
-from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
+from telethon.errors import FloodWaitError, RPCError  # type: ignore[import-untyped]
 from telethon.tl.types import (  # type: ignore[import-untyped]
     MessageActionTopicCreate,
     MessageActionTopicEdit,
@@ -57,6 +57,11 @@ from .sync_worker import (
 )
 
 logger = logging.getLogger(__name__)
+
+_DM_AUTO_ENROLL_SENDER_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    RPCError,
+    Exception,
+)
 
 # ---------------------------------------------------------------------------
 # SQL constants
@@ -326,7 +331,7 @@ class EventHandlerManager:
                 sender = None
                 try:
                     sender = await event.get_sender()
-                except Exception:
+                except _DM_AUTO_ENROLL_SENDER_EXCEPTIONS:
                     logger.debug("dm_auto_enroll_sender_fetch_failed dialog_id=%d", dialog_id)
                 self._auto_enroll_dm(dialog_id, sender=sender)
             return
@@ -698,7 +703,7 @@ class EventHandlerManager:
                 )
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
+        except (RuntimeError, sqlite3.DatabaseError) as exc:
             logger.error(
                 "event_outbox_read_failed dialog_id=%s max_id=%s error=%r",
                 dialog_id,
@@ -728,7 +733,7 @@ class EventHandlerManager:
             return
         try:
             dialog_id = int(get_peer_id(peer))
-        except Exception:
+        except TypeError, ValueError:
             logger.debug("raw_reaction_update_unparseable_peer peer=%r", peer)
             return
 
@@ -751,7 +756,7 @@ class EventHandlerManager:
                 wait,
             )
             return
-        except Exception:
+        except RPCError, RuntimeError:
             logger.exception(
                 "event_raw_reaction_failed dialog_id=%d message_id=%d",
                 dialog_id,
@@ -835,7 +840,7 @@ class EventHandlerManager:
                     inner = getattr(dp, "peer", dp)
                     try:
                         did = int(get_peer_id(inner))
-                    except Exception:
+                    except TypeError, ValueError:
                         continue
                     if did in self._synced_dialog_ids:
                         pinned_ids.append(did)
