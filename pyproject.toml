@@ -39,6 +39,11 @@ dev = [
 mcp-telegram = "mcp_telegram:app"
 
 [tool.pytest.ini_options]
+# Leave no /tmp residue on green runs (shared host): passed tests' tmp_path dirs are
+# removed at session end; only failing tests keep their dir, and only the latest run.
+# Flip policy to "none" for zero retention even on failures.
+tmp_path_retention_policy = "failed"
+tmp_path_retention_count = 1
 testpaths = ["tests"]
 pythonpath = ["tests"]
 asyncio_mode = "auto"
