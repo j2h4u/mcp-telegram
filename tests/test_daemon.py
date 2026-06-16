@@ -963,6 +963,7 @@ async def test_backfill_total_messages_returns_early_when_shutdown_during_flood_
 
     conn = sqlite3.connect(":memory:")
     from mcp_telegram.sync_db import _apply_migrations
+
     try:
         _apply_migrations(conn)
         conn.execute(
