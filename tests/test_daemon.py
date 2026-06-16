@@ -909,6 +909,8 @@ def test_sync_main_cleans_socket_on_shutdown(
     """Socket file does not exist after sync_main() exits (cleanup in finally block)."""
     fake_socket_path = tmp_path / "mcp_telegram.sock"
     mocks = _make_standard_mocks(instant_shutdown_event)
+    bootstrap_worker = MagicMock()
+    bootstrap_worker.run = AsyncMock(return_value=0)
 
     mock_unix_server = MagicMock()
     mock_unix_server.close = MagicMock()
@@ -923,6 +925,7 @@ def test_sync_main_cleans_socket_on_shutdown(
         patch("mcp_telegram.daemon.get_daemon_socket_path", return_value=fake_socket_path),
         patch("mcp_telegram.daemon.FullSyncWorker", return_value=mocks["worker"]),
         patch("mcp_telegram.daemon.DeltaSyncWorker", return_value=mocks["delta"]),
+        patch("mcp_telegram.daemon.DialogsBootstrapWorker", return_value=bootstrap_worker),
         patch("mcp_telegram.daemon.EventHandlerManager", return_value=mocks["handler"]),
         patch("mcp_telegram.daemon.asyncio.start_unix_server", new=AsyncMock(return_value=mock_unix_server)),
         patch("mcp_telegram.daemon.os.chmod"),
