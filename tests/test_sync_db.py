@@ -390,28 +390,30 @@ def test_sigterm_checkpoint(tmp_sync_db_path: Path) -> None:
     """Write data, invoke shutdown callback directly, reopen DB, verify integrity."""
     ensure_sync_schema(tmp_sync_db_path)
     conn = _open_sync_db(tmp_sync_db_path)
-
-    # Write some committed data
-    conn.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (1, 'synced')")
-    conn.commit()
-
-    # Use a mock loop to capture the callback passed to add_signal_handler
-    mock_loop = MagicMock()
-    register_shutdown_handler(conn, mock_loop)
-
-    mock_loop.add_signal_handler.assert_called_once()
-    sigterm_callback = mock_loop.add_signal_handler.call_args[0][1]
-    sigterm_callback()
-
-    # Reopen DB and verify data is intact
-    reopen = sqlite3.connect(str(tmp_sync_db_path), timeout=10.0)
+    reopen = None
     try:
+        # Write some committed data
+        conn.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (1, 'synced')")
+        conn.commit()
+
+        # Use a mock loop to capture the callback passed to add_signal_handler
+        mock_loop = MagicMock()
+        register_shutdown_handler(conn, mock_loop)
+
+        mock_loop.add_signal_handler.assert_called_once()
+        sigterm_callback = mock_loop.add_signal_handler.call_args[0][1]
+        sigterm_callback()
+
+        # Reopen DB and verify data is intact
+        reopen = sqlite3.connect(str(tmp_sync_db_path), timeout=10.0)
         integrity = reopen.execute("PRAGMA integrity_check").fetchone()
         assert integrity is not None and str(integrity[0]).lower() == "ok", f"integrity_check failed: {integrity}"
         row = reopen.execute("SELECT status FROM synced_dialogs WHERE dialog_id=1").fetchone()
         assert row is not None and row[0] == "synced", f"Data not preserved after shutdown: {row}"
     finally:
-        reopen.close()
+        if reopen is not None:
+            reopen.close()
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
