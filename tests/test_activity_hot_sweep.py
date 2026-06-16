@@ -41,6 +41,7 @@ from mcp_telegram.sync_db import _apply_migrations
 # DB and enrollment helpers
 # ---------------------------------------------------------------------------
 
+
 @contextmanager
 def _make_db() -> sqlite3.Connection:
     conn = sqlite3.connect(":memory:")
@@ -445,7 +446,9 @@ async def test_access_skip_does_not_advance_cursor(monkeypatch):
         )
 
         # Transient retry must be set (short backoff, but non-zero)
-        assert state["hot_next_retry_at"] is not None, "hot_next_retry_at must be set for transient backoff on ACCESS_SKIP"
+        assert state["hot_next_retry_at"] is not None, (
+            "hot_next_retry_at must be set for transient backoff on ACCESS_SKIP"
+        )
         assert state["hot_next_retry_at"] > now, "hot_next_retry_at must be in the future"
 
         # No cold_* fields touched
@@ -486,7 +489,9 @@ async def test_hot_sweep_never_writes_cold_columns(monkeypatch):
         for did in [fresh_id, flood_id, skip_id]:
             state = _get_state(conn, did)
             assert state.get("cold_offset_id") is None, f"dialog {did}: cold_offset_id must not be set by HotSweep"
-            assert state.get("cold_next_retry_at") is None, f"dialog {did}: cold_next_retry_at must not be set by HotSweep"
+            assert state.get("cold_next_retry_at") is None, (
+                f"dialog {did}: cold_next_retry_at must not be set by HotSweep"
+            )
             # cold_status is 'pending' from enrollment — must remain unchanged
             assert state.get("cold_status") == "pending", (
                 f"dialog {did}: cold_status must remain 'pending' (unchanged by HotSweep), got {state.get('cold_status')}"

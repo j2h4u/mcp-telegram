@@ -252,6 +252,7 @@ async def test_submit_feedback_db_error_returns_internal(tmp_path) -> None:
     sync_conn = sqlite3.connect(":memory:")
     mock_feedback_conn = MagicMock(spec=sqlite3.Connection)
     try:
+
         def _raise(*args, **kwargs):
             if args and "INSERT" in str(args[0]):
                 raise sqlite3.OperationalError("disk full")
