@@ -1204,27 +1204,36 @@ def test_schema_v15_drops_activity_comments(tmp_path: Path) -> None:
     """After full migration to v15, activity_comments table must not exist."""
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
-    with sqlite3.connect(db_path) as conn:
+    conn = sqlite3.connect(db_path)
+    try:
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
         assert "activity_comments" not in tables, f"activity_comments must be dropped in v15. Tables: {sorted(tables)}"
         idx = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='index'").fetchall()}
         assert "idx_activity_comments_sent_at" not in idx
+    finally:
+        conn.close()
 
 
 def test_schema_v15_drops_message_cache_permanently(tmp_path: Path) -> None:
     """message_cache was dropped in v7 but its DDL resurrected it until v15."""
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
-    with sqlite3.connect(db_path) as conn:
+    conn = sqlite3.connect(db_path)
+    try:
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
         assert "message_cache" not in tables
+    finally:
+        conn.close()
 
 
 def test_messages_table_has_reply_count(tmp_sync_db_path: Path) -> None:
     """v22 adds messages.reply_count for Telegram reply/comment counters."""
     ensure_sync_schema(tmp_sync_db_path)
-    with sqlite3.connect(tmp_sync_db_path) as conn:
+    conn = sqlite3.connect(tmp_sync_db_path)
+    try:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()}
+    finally:
+        conn.close()
     assert "reply_count" in columns
 
 
@@ -1235,7 +1244,8 @@ def test_migration_v15_copies_own_only_into_messages(tmp_path: Path) -> None:
     # then artificially re-insert activity_comments rows — tests exercise
     # the data-migration SQL even though v15 would normally have no rows).
     ensure_sync_schema(db_path)
-    with sqlite3.connect(db_path) as conn:
+    conn = sqlite3.connect(db_path)
+    try:
         # Recreate activity_comments (it was dropped by v15) to simulate
         # a DB that was at v14 when the user upgraded.
         conn.execute("""
@@ -1253,13 +1263,18 @@ def test_migration_v15_copies_own_only_into_messages(tmp_path: Path) -> None:
         # and the migration framework re-runs from v14.
         conn.execute("DELETE FROM schema_version WHERE version >= 15")
         conn.commit()
+    finally:
+        conn.close()
     # Re-run migrations → v15 re-applies the data migration.
     ensure_sync_schema(db_path)
-    with sqlite3.connect(db_path) as conn:
+    conn = sqlite3.connect(db_path)
+    try:
         rows = conn.execute(
             "SELECT dialog_id, message_id, text, out, is_service, is_deleted "
             "FROM messages WHERE dialog_id = 100 ORDER BY message_id"
         ).fetchall()
+    finally:
+        conn.close()
     assert rows == [(100, 1, "hello", 1, 0, 0), (100, 2, "world", 1, 0, 0)]
 
 
@@ -1267,7 +1282,8 @@ def test_migration_v15_preserves_existing_messages(tmp_path: Path) -> None:
     """If (dialog_id, message_id) already exists in messages, activity_comments copy does NOT overwrite."""
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
-    with sqlite3.connect(db_path) as conn:
+    conn = sqlite3.connect(db_path)
+    try:
         # Seed messages with the authoritative row first
         conn.execute(
             "INSERT INTO messages (dialog_id, message_id, sent_at, text, out, is_service) "
@@ -1288,11 +1304,16 @@ def test_migration_v15_preserves_existing_messages(tmp_path: Path) -> None:
         # and the migration framework re-runs from v14.
         conn.execute("DELETE FROM schema_version WHERE version >= 15")
         conn.commit()
+    finally:
+        conn.close()
     ensure_sync_schema(db_path)
-    with sqlite3.connect(db_path) as conn:
+    conn = sqlite3.connect(db_path)
+    try:
         text, sent_at = conn.execute(
             "SELECT text, sent_at FROM messages WHERE dialog_id=200 AND message_id=5"
         ).fetchone()
+    finally:
+        conn.close()
     assert text == "authoritative"
     assert sent_at == 5000
 
@@ -1301,7 +1322,8 @@ def test_migration_v15_enrolls_own_only_but_preserves_higher_status(tmp_path: Pa
     """Orphan activity_comments dialogs get status='own_only'; existing 'syncing'/'synced' rows are preserved."""
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
-    with sqlite3.connect(db_path) as conn:
+    conn = sqlite3.connect(db_path)
+    try:
         # Seed synced_dialogs with an already-synced dialog
         conn.execute(
             "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')",
@@ -1323,10 +1345,15 @@ def test_migration_v15_enrolls_own_only_but_preserves_higher_status(tmp_path: Pa
         # and the migration framework re-runs from v14.
         conn.execute("DELETE FROM schema_version WHERE version >= 15")
         conn.commit()
+    finally:
+        conn.close()
     ensure_sync_schema(db_path)
-    with sqlite3.connect(db_path) as conn:
+    conn = sqlite3.connect(db_path)
+    try:
         status_300 = conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id=300").fetchone()[0]
         status_400 = conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id=400").fetchone()[0]
+    finally:
+        conn.close()
     assert status_300 == "synced", "higher-status row must not downgrade"
     assert status_400 == "own_only"
 
@@ -1335,8 +1362,11 @@ def test_migration_v14_activity_sync_state_seeded(tmp_path: Path) -> None:
     """After migration, activity_sync_state contains exactly 3 seeded rows with correct values."""
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
-    with sqlite3.connect(db_path) as conn:
+    conn = sqlite3.connect(db_path)
+    try:
         rows = conn.execute("SELECT key, value FROM activity_sync_state ORDER BY key").fetchall()
+    finally:
+        conn.close()
     assert rows == [
         ("backfill_complete", "0"),
         ("backfill_offset_id", "0"),
@@ -1349,9 +1379,12 @@ def test_migration_v14_idempotent(tmp_path: Path) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     ensure_sync_schema(db_path)  # second run must be a no-op
-    with sqlite3.connect(db_path) as conn:
+    conn = sqlite3.connect(db_path)
+    try:
         version = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
         count = conn.execute("SELECT COUNT(*) FROM activity_sync_state").fetchone()[0]
+    finally:
+        conn.close()
     assert version == _CURRENT_SCHEMA_VERSION
     assert count == 3
 
@@ -1360,16 +1393,22 @@ def test_migration_v14_preserves_existing_data(tmp_path: Path) -> None:
     """v14 migration on a DB that already has synced_dialogs rows preserves those rows."""
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)  # migrate fresh to v14
-    with sqlite3.connect(db_path) as conn:
+    conn = sqlite3.connect(db_path)
+    try:
         conn.execute(
             "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, ?)",
             (12345, "synced"),
         )
         conn.commit()
+    finally:
+        conn.close()
     # Re-run migration (simulating daemon restart)
     ensure_sync_schema(db_path)
-    with sqlite3.connect(db_path) as conn:
+    conn = sqlite3.connect(db_path)
+    try:
         row = conn.execute("SELECT dialog_id, status FROM synced_dialogs WHERE dialog_id = 12345").fetchone()
+    finally:
+        conn.close()
     assert row == (12345, "synced")
 
 
