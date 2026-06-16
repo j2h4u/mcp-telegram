@@ -73,8 +73,6 @@ dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
 ]
 "src/mcp_telegram/daemon_api.py" = ["E402"]
 "src/mcp_telegram/tools/discovery.py" = ["E402"]
-"src/mcp_telegram/activity_peer_sweep.py" = ["C416"]
-
 [format]
 # Like Black, use double quotes for strings.
 quote-style = "double"
