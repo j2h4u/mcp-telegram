@@ -39,7 +39,7 @@ target-version = "py314"
 # ruff-specific (RUF), bugbear-adjacent simplifications (SIM). Excluding
 # stylistic/annotation/docstring/strictness categories that would flag the
 # entire codebase without changing correctness.
-select = ["E", "F", "I", "W", "B", "UP", "RUF", "SIM"]
+select = ["E", "F", "I", "W", "B", "UP", "RUF", "SIM", "PIE", "ISC", "RSE", "FLY", "PGH", "LOG", "PLE"]
 ignore = [
   "E501",   # line length — formatter handles this
   "B008",   # Typer default values
