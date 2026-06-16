@@ -35,10 +35,14 @@ def test_ensure_feedback_schema_idempotent(tmp_path: Path) -> None:
     db_path = tmp_path / "feedback_idem.db"
     conn1 = ensure_feedback_schema(db_path)
     conn2 = ensure_feedback_schema(db_path)
-    # After two calls, schema_version contains exactly one row per applied version.
-    # Idempotency: the second call adds no new rows.
-    count = conn2.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0]
-    assert count == _FEEDBACK_SCHEMA_VERSION
+    try:
+        # After two calls, schema_version contains exactly one row per applied version.
+        # Idempotency: the second call adds no new rows.
+        count = conn2.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0]
+        assert count == _FEEDBACK_SCHEMA_VERSION
+    finally:
+        conn2.close()
+        conn1.close()
 
 
 def test_ensure_feedback_schema_wal_mode(make_feedback_db) -> None:

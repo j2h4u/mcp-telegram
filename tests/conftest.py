@@ -284,12 +284,19 @@ def mock_client() -> AsyncMock:
 @pytest.fixture
 def make_feedback_db(tmp_path):
     """Factory: returns (conn, db_path) for a freshly-migrated feedback.db."""
+    connections = []
 
     def _factory():
         from mcp_telegram.feedback_db import ensure_feedback_schema
 
         db_path = tmp_path / "feedback.db"
         conn = ensure_feedback_schema(db_path)
+        connections.append(conn)
         return conn, db_path
 
-    return _factory
+    try:
+        yield _factory
+    finally:
+        for conn in connections:
+            conn.close()
+        connections.clear()

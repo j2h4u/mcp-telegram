@@ -6,6 +6,7 @@ Tests are ordered: unit tests first, then integration tests.
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -33,12 +34,15 @@ def tmp_sync_db_path(tmp_path: Path) -> Path:
 
 
 @pytest.fixture()
-def fts_conn() -> sqlite3.Connection:
+def fts_conn() -> Iterator[sqlite3.Connection]:
     """Return an in-memory SQLite connection with messages_fts table ready."""
     conn = sqlite3.connect(":memory:")
     conn.execute(MESSAGES_FTS_DDL)
     conn.commit()
-    return conn
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
