@@ -25,6 +25,21 @@ from mcp_telegram.daemon_api import (
     _read_state_for_dialog,
 )
 
+
+_open_db_connections = set()
+
+
+@pytest.fixture(autouse=True)
+def _cleanup_db_connections():
+    yield
+    for conn in list(_open_db_connections):
+        try:
+            conn.close()
+        except Exception:
+            pass
+    _open_db_connections.clear()
+
+
 # ---------------------------------------------------------------------------
 # Module-wide patch: telethon_utils.get_peer_id returns entity.id for mocks
 # ---------------------------------------------------------------------------
@@ -46,6 +61,7 @@ def _patch_get_peer_id():
 
 def _make_db() -> sqlite3.Connection:
     conn = sqlite3.connect(":memory:")
+    _open_db_connections.add(conn)
     conn.execute(
         """
         CREATE TABLE synced_dialogs (
