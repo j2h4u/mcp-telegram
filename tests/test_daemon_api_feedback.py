@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import contextmanager
 import sqlite3
 import time
+from contextlib import contextmanager
 from unittest.mock import MagicMock
 
 import pytest

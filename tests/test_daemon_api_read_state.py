@@ -12,9 +12,9 @@ Uses in-memory SQLite; telethon client mocked. Zero real Telegram calls.
 from __future__ import annotations
 
 import asyncio
-from contextlib import contextmanager
 import sqlite3
 from collections.abc import Iterator
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -26,7 +26,6 @@ from mcp_telegram.daemon_api import (
     _dialog_type_from_db,
     _read_state_for_dialog,
 )
-
 
 # ---------------------------------------------------------------------------
 # Module-wide patch: telethon_utils.get_peer_id returns entity.id for mocks
