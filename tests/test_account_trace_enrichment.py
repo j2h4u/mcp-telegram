@@ -144,7 +144,7 @@ def test_trace_candidate_dialogs_are_bounded_visible_and_strategy_labeled(trace_
             (-1003, "Chat"),
             (-1004, "Channel"),
         ]
-        ):
+    ):
         seed_dialog(conn, dialog_id=dialog_id, name=f"Dialog {offset}", dialog_type=dialog_type)
         seed_synced_dialog(conn, dialog_id=dialog_id)
     conn.commit()
@@ -233,27 +233,38 @@ def test_messages_row_equal_covers_base_and_child_tables(trace_enrichment_server
     assert _messages_row_equal(existing, same) is True
     assert _messages_row_equal(existing, candidate_message(text="changed")) is False
     assert _messages_row_equal(existing, candidate_message(edit_date=123)) is False
-    assert _messages_row_equal(
-        existing,
-        candidate_message(reactions=[ReactionRecord(dialog_id=222, message_id=1, emoji="👍", count=3)]),
-    ) is False
-    assert _messages_row_equal(
-        existing,
-        candidate_message(entities=[EntityRecord(dialog_id=222, message_id=1, offset=0, length=5, type="hashtag", value="#tag")]),
-    ) is False
-    assert _messages_row_equal(
-        existing,
-        candidate_message(
-            forward=ForwardRecord(
-                dialog_id=222,
-                message_id=1,
-                fwd_from_peer_id=334,
-                fwd_from_name="Source",
-                fwd_date=1_700_000_010,
-                fwd_channel_post=5,
-            )
-        ),
-    ) is False
+    assert (
+        _messages_row_equal(
+            existing,
+            candidate_message(reactions=[ReactionRecord(dialog_id=222, message_id=1, emoji="👍", count=3)]),
+        )
+        is False
+    )
+    assert (
+        _messages_row_equal(
+            existing,
+            candidate_message(
+                entities=[EntityRecord(dialog_id=222, message_id=1, offset=0, length=5, type="hashtag", value="#tag")]
+            ),
+        )
+        is False
+    )
+    assert (
+        _messages_row_equal(
+            existing,
+            candidate_message(
+                forward=ForwardRecord(
+                    dialog_id=222,
+                    message_id=1,
+                    fwd_from_peer_id=334,
+                    fwd_from_name="Source",
+                    fwd_date=1_700_000_010,
+                    fwd_channel_post=5,
+                )
+            ),
+        )
+        is False
+    )
     conn.execute("UPDATE messages SET is_deleted = 1 WHERE dialog_id = 222 AND message_id = 1")
     conn.commit()
     assert _messages_row_equal(_trace_existing_message_bundle(conn, dialog_id=222, message_id=1), same) is False
@@ -358,9 +369,7 @@ async def test_trace_enrichment_channel_is_unsupported_without_search(trace_enri
         [{"dialog_id": -100123, "strategy": "signature_only", "topic_id": None}],
     )
 
-    fragment = conn.execute(
-        "SELECT status FROM trace_coverage_fragments WHERE target_user_id = 101"
-    ).fetchone()
+    fragment = conn.execute("SELECT status FROM trace_coverage_fragments WHERE target_user_id = 101").fetchone()
     assert result["fragment_status_counts"]["unsupported"] == 1
     assert fragment[0] == "unsupported"
     assert client.calls == []
@@ -404,7 +413,9 @@ async def test_trace_account_observed_mode_does_not_call_enrichment(trace_enrich
 
 
 @pytest.mark.asyncio
-async def test_trace_account_best_effort_calls_enrichment_and_reruns_db_query(trace_enrichment_server, monkeypatch) -> None:
+async def test_trace_account_best_effort_calls_enrichment_and_reruns_db_query(
+    trace_enrichment_server, monkeypatch
+) -> None:
     server, conn, _client = trace_enrichment_server
     seed_entity(conn, entity_id=101, name="Me", username="me")
     seed_dialog(conn, dialog_id=222, name="Alice", dialog_type="User")

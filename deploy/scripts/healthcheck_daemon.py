@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Healthcheck: verify sync daemon is alive and responding on its Unix socket."""
+
 from __future__ import annotations
 
 import json

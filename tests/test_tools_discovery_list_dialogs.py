@@ -6,6 +6,7 @@ Phase 44 Plan 02 — covers:
 - bootstrap_pending banner when dialogs snapshot is empty (Plan 01 contract)
 - draft_text with embedded double quotes (cosmetic acceptance T-44-07)
 """
+
 from __future__ import annotations
 
 from contextlib import asynccontextmanager

@@ -172,6 +172,7 @@ async def test_extract_reactions_rows(
 
     # message fields must not contain any JSON reactions blob
     import dataclasses
+
     for item in dataclasses.astuple(result.message):
         assert not isinstance(item, str) or not item.startswith("{"), (
             f"message should not contain JSON reactions, got: {item!r}"
@@ -1813,7 +1814,9 @@ def test_insert_messages_with_fts_edit_idempotency_entities(sync_db: sqlite3.Con
 
     em2 = ExtractedMessage(
         message=_stored(dialog_id, message_id, "new"),
-        entities=[EntityRecord(dialog_id=dialog_id, message_id=message_id, offset=0, length=4, type="hashtag", value="#new")],
+        entities=[
+            EntityRecord(dialog_id=dialog_id, message_id=message_id, offset=0, length=4, type="hashtag", value="#new")
+        ],
     )
     with sync_db:
         insert_messages_with_fts(sync_db, [em2])

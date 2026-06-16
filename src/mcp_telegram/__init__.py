@@ -177,9 +177,7 @@ def feedback_list(
             rows = conn.execute(base_select + order_limit, (limit,)).fetchall()
         else:
             rows = conn.execute(
-                base_select
-                + " WHERE status IN ('open','in_progress')"
-                + order_limit,
+                base_select + " WHERE status IN ('open','in_progress')" + order_limit,
                 (limit,),
             ).fetchall()
 
@@ -194,17 +192,22 @@ def feedback_list(
             if total == 0:
                 print("No feedback recorded yet.")
             else:
-                print(
-                    "No open or in-progress feedback. "
-                    "Use --all to show history."
-                )
+                print("No open or in-progress feedback. Use --all to show history.")
             return
     finally:
         conn.close()
 
     for (
-        rid, ts, sev, status, status_changed_at, status_comment,
-        msg, ctx, mdl, harn,
+        rid,
+        ts,
+        sev,
+        status,
+        status_changed_at,
+        status_comment,
+        msg,
+        ctx,
+        mdl,
+        harn,
     ) in rows:
         sev_tag = f"[{sev}]" if sev else "[?]"
         status_tag = f"[{status}]"

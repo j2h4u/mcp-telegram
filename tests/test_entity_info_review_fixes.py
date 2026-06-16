@@ -26,6 +26,7 @@ from mcp_telegram.tools.entity_info import _format_relative_ymd
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture(autouse=True)
 def _patch_get_peer_id():
     with patch(
@@ -124,6 +125,7 @@ def _user_entity(id_=99):
 # WR-01: _format_relative_ymd future-date and today branches
 # ---------------------------------------------------------------------------
 
+
 def test_format_relative_ymd_future_date() -> None:
     """WR-01: negative delta_days (future date) → 'future date', not 'today'."""
     now = datetime(2026, 4, 25, 12, 0, 0, tzinfo=UTC)
@@ -149,6 +151,7 @@ def test_format_relative_ymd_future_does_not_return_today() -> None:
 # CR-01: count=None → contacts_reason="count_unavailable"
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_channel_admin_full_request_fails_returns_count_unavailable() -> None:
     """CR-01: when GetFullChannelRequest raises, admin channel returns
@@ -160,9 +163,10 @@ async def test_channel_admin_full_request_fails_returns_count_unavailable() -> N
     client.side_effect = [RuntimeError("flood"), MagicMock(count=0, messages=[])]
     server = _make_server(client=client)
 
-    with patch("mcp_telegram.daemon_api.GetFullChannelRequest",
-               side_effect=RuntimeError("simulated flood")), \
-         patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
+    with (
+        patch("mcp_telegram.daemon_api.GetFullChannelRequest", side_effect=RuntimeError("simulated flood")),
+        patch("mcp_telegram.daemon_api.MessagesSearchRequest"),
+    ):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": -1001})
 
     assert r["ok"] is True, f"expected ok=True, got {r}"
@@ -184,9 +188,10 @@ async def test_supergroup_admin_full_request_fails_returns_count_unavailable() -
     client.side_effect = [MagicMock(count=0, messages=[])]
     server = _make_server(client=client)
 
-    with patch("mcp_telegram.daemon_api.GetFullChannelRequest",
-               side_effect=RuntimeError("simulated flood")), \
-         patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
+    with (
+        patch("mcp_telegram.daemon_api.GetFullChannelRequest", side_effect=RuntimeError("simulated flood")),
+        patch("mcp_telegram.daemon_api.MessagesSearchRequest"),
+    ):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": -2001})
 
     assert r["ok"] is True, f"expected ok=True, got {r}"
@@ -202,6 +207,7 @@ async def test_supergroup_admin_full_request_fails_returns_count_unavailable() -
 # WR-05: degraded full fetch skips entity_details cache write
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_user_degraded_full_fetch_skips_entity_details_cache() -> None:
     """WR-05: GetFullUserRequest raises → full_user_ok=False →
@@ -213,12 +219,11 @@ async def test_user_degraded_full_fetch_skips_entity_details_cache() -> None:
 
     server = _make_server(conn=conn, client=client)
 
-    with patch("mcp_telegram.daemon_api.GetFullUserRequest",
-               side_effect=RuntimeError("simulated FloodWait")), \
-         patch("mcp_telegram.daemon_api.GetCommonChatsRequest",
-               return_value=MagicMock(chats=[])), \
-         patch("mcp_telegram.daemon_api.GetUserPhotosRequest",
-               return_value=MagicMock(count=0, photos=[])):
+    with (
+        patch("mcp_telegram.daemon_api.GetFullUserRequest", side_effect=RuntimeError("simulated FloodWait")),
+        patch("mcp_telegram.daemon_api.GetCommonChatsRequest", return_value=MagicMock(chats=[])),
+        patch("mcp_telegram.daemon_api.GetUserPhotosRequest", return_value=MagicMock(count=0, photos=[])),
+    ):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": 77})
 
     assert r["ok"] is True, f"expected ok=True despite degraded fetch, got {r}"
@@ -228,12 +233,8 @@ async def test_user_degraded_full_fetch_skips_entity_details_cache() -> None:
     assert ent is not None, "entities row should be written even on degraded fetch"
 
     # entity_details row NOT written (degraded response must not be cached)
-    detail = conn.execute(
-        "SELECT entity_id FROM entity_details WHERE entity_id = 77"
-    ).fetchone()
-    assert detail is None, (
-        "entity_details must NOT be written when GetFullUserRequest fails"
-    )
+    detail = conn.execute("SELECT entity_id FROM entity_details WHERE entity_id = 77").fetchone()
+    assert detail is None, "entity_details must NOT be written when GetFullUserRequest fails"
 
 
 @pytest.mark.asyncio
@@ -248,16 +249,13 @@ async def test_channel_degraded_full_fetch_skips_entity_details_cache() -> None:
 
     server = _make_server(conn=conn, client=client)
 
-    with patch("mcp_telegram.daemon_api.GetFullChannelRequest",
-               side_effect=RuntimeError("simulated flood")), \
-         patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
+    with (
+        patch("mcp_telegram.daemon_api.GetFullChannelRequest", side_effect=RuntimeError("simulated flood")),
+        patch("mcp_telegram.daemon_api.MessagesSearchRequest"),
+    ):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": -3001})
 
     assert r["ok"] is True, f"expected ok=True despite degraded fetch, got {r}"
 
-    detail = conn.execute(
-        "SELECT entity_id FROM entity_details WHERE entity_id = -3001"
-    ).fetchone()
-    assert detail is None, (
-        "entity_details must NOT be written when GetFullChannelRequest fails"
-    )
+    detail = conn.execute("SELECT entity_id FROM entity_details WHERE entity_id = -3001").fetchone()
+    assert detail is None, "entity_details must NOT be written when GetFullChannelRequest fails"

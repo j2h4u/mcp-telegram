@@ -30,6 +30,7 @@ QR_BORDER = 4
 QR_REFRESH_MARGIN_SECONDS = 20
 QR_PROGRESS_BAR_WIDTH = 28
 
+
 def qr_to_terminal(data: str) -> str:
     """Render QR data as terminal text."""
     qr = qrcode.QRCode(
@@ -49,21 +50,17 @@ def qr_to_terminal(data: str) -> str:
     left_padding = " " * max(len(QR_LEFT_PADDING), (terminal_width - qr_visible_width) // 2)
     return "\n".join(f"{left_padding}{line}" for line in qr_ascii)
 
+
 def clear_screen() -> None:
     """Clear the terminal screen."""
-    os.system('clear' if os.name == 'posix' else 'cls')
+    os.system("clear" if os.name == "posix" else "cls")
 
 
 def _qr_lifetime(qr_login: Any) -> int:
     """Return seconds until qr_login expires (minimum 1)."""
     return max(
         1,
-        int(
-            (
-                qr_login.expires.astimezone(datetime.UTC)
-                - datetime.datetime.now(tz=datetime.UTC)
-            ).total_seconds()
-        ),
+        int((qr_login.expires.astimezone(datetime.UTC) - datetime.datetime.now(tz=datetime.UTC)).total_seconds()),
     )
 
 
@@ -116,8 +113,7 @@ async def complete_2fa_login(client: TelegramClient, two_fa_password: str) -> No
             password = getpass.getpass("Enter Telegram cloud 2FA password: ")
         except EOFError as e:
             raise RuntimeError(
-                "Could not read the 2FA password from the terminal. "
-                "Run this script in an interactive console."
+                "Could not read the 2FA password from the terminal. Run this script in an interactive console."
             ) from e
 
         if not password:
@@ -221,6 +217,7 @@ async def main() -> None:
         traceback.print_exc()
     finally:
         await client.disconnect()
+
 
 if __name__ == "__main__":
     try:

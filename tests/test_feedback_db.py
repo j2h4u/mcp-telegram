@@ -49,9 +49,7 @@ def test_ensure_feedback_schema_wal_mode(make_feedback_db) -> None:
     assert str(row[0]).lower() == "wal"
 
 
-def test_get_feedback_db_path_under_xdg_state(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_get_feedback_db_path_under_xdg_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """get_feedback_db_path() returns a path ending in mcp-telegram/feedback.db."""
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
     path = get_feedback_db_path()
@@ -74,8 +72,16 @@ def test_feedback_table_columns_match_spec(make_feedback_db) -> None:
     col_map = {row[1]: row for row in rows}
 
     expected_columns = {
-        "id", "submitted_at", "message", "severity", "context", "model", "harness",
-        "status", "status_changed_at", "status_comment",
+        "id",
+        "submitted_at",
+        "message",
+        "severity",
+        "context",
+        "model",
+        "harness",
+        "status",
+        "status_changed_at",
+        "status_comment",
     }
     assert set(col_map.keys()) == expected_columns
 
@@ -146,10 +152,7 @@ def test_feedback_schema_v1_to_v2_preserves_rows(tmp_path: Path) -> None:
     # Build a v1-only schema by hand (mirror the v1 DDL in feedback_db.py)
     conn = sqlite3.connect(str(db_path))
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute(
-        "CREATE TABLE schema_version ("
-        "version INTEGER NOT NULL, applied_at INTEGER NOT NULL)"
-    )
+    conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL, applied_at INTEGER NOT NULL)")
     conn.execute(
         "CREATE TABLE feedback ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT, "
@@ -176,7 +179,7 @@ def test_feedback_schema_v1_to_v2_preserves_rows(tmp_path: Path) -> None:
         assert row[0] == 1700000000
         assert row[1] == "legacy row"
         assert row[2] == "bug"
-        assert row[3] == "open"   # default applied by ALTER TABLE
+        assert row[3] == "open"  # default applied by ALTER TABLE
         assert row[4] is None
         assert row[5] is None
 

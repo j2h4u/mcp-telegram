@@ -236,7 +236,9 @@ def format_messages(
     header_lines = (
         [] if suppress_header else _render_read_state_header(read_state, dialog_type, resolved_now, effective_tz)
     )
-    inline_markers = _compute_inline_markers(messages, read_state) if DialogType.parse(dialog_type) == DialogType.USER else {}
+    inline_markers = (
+        _compute_inline_markers(messages, read_state) if DialogType.parse(dialog_type) == DialogType.USER else {}
+    )
 
     lines: list[str] = list(header_lines)
     prev_date_str: str | None = None

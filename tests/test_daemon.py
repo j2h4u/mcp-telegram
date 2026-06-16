@@ -1330,17 +1330,11 @@ async def test_daemon_api_keeps_connection_open_for_sequential_requests(tmp_path
     )
     try:
         reader, writer = await asyncio.open_unix_connection(str(sock_path))
-        writer.write(
-            json.dumps({"method": "describe_source", "request_id": "one"}).encode()
-            + b"\n"
-        )
+        writer.write(json.dumps({"method": "describe_source", "request_id": "one"}).encode() + b"\n")
         await writer.drain()
         first = json.loads((await reader.readline()).decode())
 
-        writer.write(
-            json.dumps({"method": "describe_source", "request_id": "two"}).encode()
-            + b"\n"
-        )
+        writer.write(json.dumps({"method": "describe_source", "request_id": "two"}).encode() + b"\n")
         await writer.drain()
         second = json.loads((await reader.readline()).decode())
 

@@ -127,5 +127,3 @@ class TestDecodeValidation:
         token = _encode_payload({"kind": "history", "value": 1, "dialog_id": 1, "direction": "sideways"})
         with pytest.raises(ValueError, match="direction must be newest or oldest"):
             decode_navigation_token(token)
-
-

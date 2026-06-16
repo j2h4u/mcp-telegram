@@ -90,10 +90,20 @@ def _user(id_=42):
 def _trio_results():
     common, full, photos = MagicMock(), MagicMock(), MagicMock()
     common.chats = []
-    full.full_user = MagicMock(about=None, personal_channel_id=None, birthday=None,
-                                blocked=False, ttl_period=None, private_forward_name=None,
-                                bot_info=None, business_location=None, business_intro=None,
-                                business_work_hours=None, note=None, folder_id=None)
+    full.full_user = MagicMock(
+        about=None,
+        personal_channel_id=None,
+        birthday=None,
+        blocked=False,
+        ttl_period=None,
+        private_forward_name=None,
+        bot_info=None,
+        business_location=None,
+        business_intro=None,
+        business_work_hours=None,
+        note=None,
+        folder_id=None,
+    )
     photos.count = 0
     photos.photos = []
     return common, full, photos
@@ -109,9 +119,11 @@ async def test_get_entity_info_serves_from_db_within_ttl(monkeypatch) -> None:
 
     base = 1_000_000
     monkeypatch.setattr("mcp_telegram.daemon_api.time.time", lambda: base)
-    with patch("mcp_telegram.daemon_api.GetCommonChatsRequest"), \
-         patch("mcp_telegram.daemon_api.GetFullUserRequest"), \
-         patch("mcp_telegram.daemon_api.GetUserPhotosRequest"):
+    with (
+        patch("mcp_telegram.daemon_api.GetCommonChatsRequest"),
+        patch("mcp_telegram.daemon_api.GetFullUserRequest"),
+        patch("mcp_telegram.daemon_api.GetUserPhotosRequest"),
+    ):
         r1 = await server._dispatch({"method": "get_entity_info", "entity_id": 42})
     assert r1["ok"]
     first_call_count = client.get_entity.call_count
@@ -125,9 +137,11 @@ async def test_get_entity_info_serves_from_db_within_ttl(monkeypatch) -> None:
 
     # After TTL → fresh fetch
     monkeypatch.setattr("mcp_telegram.daemon_api.time.time", lambda: base + 400)
-    with patch("mcp_telegram.daemon_api.GetCommonChatsRequest"), \
-         patch("mcp_telegram.daemon_api.GetFullUserRequest"), \
-         patch("mcp_telegram.daemon_api.GetUserPhotosRequest"):
+    with (
+        patch("mcp_telegram.daemon_api.GetCommonChatsRequest"),
+        patch("mcp_telegram.daemon_api.GetFullUserRequest"),
+        patch("mcp_telegram.daemon_api.GetUserPhotosRequest"),
+    ):
         r3 = await server._dispatch({"method": "get_entity_info", "entity_id": 42})
     assert r3["ok"]
     assert client.get_entity.call_count == first_call_count + 1
@@ -146,26 +160,25 @@ async def test_get_entity_info_auto_resolve_writes_both_rows(monkeypatch) -> Non
     client.side_effect = _trio_results()
     server = make_server(conn=conn, client=client)
     monkeypatch.setattr("mcp_telegram.daemon_api.time.time", lambda: 5_000_000)
-    with patch("mcp_telegram.daemon_api.GetCommonChatsRequest"), \
-         patch("mcp_telegram.daemon_api.GetFullUserRequest"), \
-         patch("mcp_telegram.daemon_api.GetUserPhotosRequest"):
+    with (
+        patch("mcp_telegram.daemon_api.GetCommonChatsRequest"),
+        patch("mcp_telegram.daemon_api.GetFullUserRequest"),
+        patch("mcp_telegram.daemon_api.GetUserPhotosRequest"),
+    ):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": 100})
 
     assert r["ok"]
     # Post-condition: BOTH rows now exist
     # conn.row_factory is set to sqlite3.Row by DaemonAPIServer.__init__,
     # so compare using tuple() to avoid Row vs tuple mismatch.
-    ent_row = conn.execute(
-        "SELECT id, type, username FROM entities WHERE id=100"
-    ).fetchone()
+    ent_row = conn.execute("SELECT id, type, username FROM entities WHERE id=100").fetchone()
     assert tuple(ent_row) == (100, "user", "cache")
-    det_row = conn.execute(
-        "SELECT detail_json, fetched_at FROM entity_details WHERE entity_id=100"
-    ).fetchone()
+    det_row = conn.execute("SELECT detail_json, fetched_at FROM entity_details WHERE entity_id=100").fetchone()
     assert det_row is not None
     assert det_row[1] == 5_000_000
     # detail_json carries embedded schema discriminator
     import json as _json
+
     payload = _json.loads(det_row[0])
     assert payload["schema"] == 1
     assert payload["type"] == "user"

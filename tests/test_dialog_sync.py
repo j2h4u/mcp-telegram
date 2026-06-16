@@ -189,9 +189,7 @@ class TestDialogsBootstrapWorker:
         conn = _open_sync_db(db_path)
         try:
             assert _get_state(conn, "bootstrap_sweep_status") == "complete"
-            rows = list(
-                conn.execute("SELECT dialog_id, name, type FROM dialogs ORDER BY dialog_id")
-            )
+            rows = list(conn.execute("SELECT dialog_id, name, type FROM dialogs ORDER BY dialog_id"))
             assert len(rows) == 3
             types_by_id = {r[0]: r[2] for r in rows}
             assert types_by_id[111] == "user"
@@ -227,9 +225,7 @@ class TestDialogsBootstrapWorker:
             raise FloodWaitError(request=None, capture=2)  # type: ignore[call-arg]
 
         client = MagicMock()
-        client.iter_dialogs = MagicMock(
-            side_effect=lambda **kw: flooding_gen(dialogs_before_flood)
-        )
+        client.iter_dialogs = MagicMock(side_effect=lambda **kw: flooding_gen(dialogs_before_flood))
         shutdown_event = asyncio.Event()
         worker = DialogsBootstrapWorker(client, db_path, shutdown_event)
 
@@ -288,18 +284,14 @@ class TestDialogsBootstrapWorker:
         assert captured_kwargs.get("offset_peer") is not None
 
     @pytest.mark.asyncio
-    async def test_corrupt_cursor_recovers_by_clearing_and_restarting(
-        self, db_path, caplog
-    ):
+    async def test_corrupt_cursor_recovers_by_clearing_and_restarting(self, db_path, caplog):
         # Review MEDIUM: malformed offset_date must NOT brick the daemon —
         # worker logs a WARNING, clears cursor keys, restarts from scratch.
         seed_conn = _open_sync_db(db_path)
         try:
             with seed_conn:
                 _set_state(seed_conn, "bootstrap_sweep_status", "in_progress")
-                _set_state(
-                    seed_conn, "bootstrap_sweep_offset_date", "NOT-AN-ISO-DATE"
-                )
+                _set_state(seed_conn, "bootstrap_sweep_offset_date", "NOT-AN-ISO-DATE")
                 _set_state(seed_conn, "bootstrap_sweep_offset_id", "22")
                 _set_state(
                     seed_conn,
@@ -310,11 +302,7 @@ class TestDialogsBootstrapWorker:
             seed_conn.close()
 
         client = MagicMock()
-        client.iter_dialogs = MagicMock(
-            side_effect=lambda **kw: _async_gen(
-                [_make_dialog(99, _make_user_entity(99))]
-            )
-        )
+        client.iter_dialogs = MagicMock(side_effect=lambda **kw: _async_gen([_make_dialog(99, _make_user_entity(99))]))
         shutdown_event = asyncio.Event()
         worker = DialogsBootstrapWorker(client, db_path, shutdown_event)
 
@@ -343,11 +331,7 @@ class TestDialogsBootstrapWorker:
             seed_conn.close()
 
         client = MagicMock()
-        client.iter_dialogs = MagicMock(
-            side_effect=lambda **kw: _async_gen(
-                [_make_dialog(1, _make_user_entity(1))]
-            )
-        )
+        client.iter_dialogs = MagicMock(side_effect=lambda **kw: _async_gen([_make_dialog(1, _make_user_entity(1))]))
         shutdown_event = asyncio.Event()
         worker = DialogsBootstrapWorker(client, db_path, shutdown_event)
         with caplog.at_level(logging.WARNING, logger="mcp_telegram.dialog_sync"):
@@ -378,9 +362,7 @@ class TestDialogsBootstrapWorker:
 
         conn = _open_sync_db(db_path)
         try:
-            row = conn.execute(
-                "SELECT name FROM dialogs WHERE dialog_id = ?", (555,)
-            ).fetchone()
+            row = conn.execute("SELECT name FROM dialogs WHERE dialog_id = ?", (555,)).fetchone()
             assert row[0] == "FromEvent"  # not overwritten
         finally:
             conn.close()
@@ -397,9 +379,7 @@ class TestDialogsBootstrapWorker:
 
         client = MagicMock()
         client.iter_dialogs = MagicMock(
-            side_effect=lambda **kw: slow_flooding_gen(
-                [_make_dialog(1, _make_user_entity(1))]
-            )
+            side_effect=lambda **kw: slow_flooding_gen([_make_dialog(1, _make_user_entity(1))])
         )
         shutdown_event = asyncio.Event()
         worker = DialogsBootstrapWorker(client, db_path, shutdown_event)
@@ -415,9 +395,7 @@ class TestDialogsBootstrapWorker:
         assert elapsed < 5.0
 
     @pytest.mark.asyncio
-    async def test_rpcerror_aborts_without_complete_and_surfaces_via_startup_detail(
-        self, db_path
-    ):
+    async def test_rpcerror_aborts_without_complete_and_surfaces_via_startup_detail(self, db_path):
         # Review MEDIUM: RPCError must surface via startup_detail_setter so the
         # operator sees the stall via /health rather than scanning logs.
         from telethon.errors import RPCError
@@ -428,11 +406,7 @@ class TestDialogsBootstrapWorker:
             raise RPCError(request=None, message="TEST_RPC_ERROR", code=400)  # type: ignore[call-arg]
 
         client = MagicMock()
-        client.iter_dialogs = MagicMock(
-            side_effect=lambda **kw: err_gen(
-                [_make_dialog(7, _make_user_entity(7))]
-            )
-        )
+        client.iter_dialogs = MagicMock(side_effect=lambda **kw: err_gen([_make_dialog(7, _make_user_entity(7))]))
         shutdown_event = asyncio.Event()
         captured_detail: list[str] = []
         worker = DialogsBootstrapWorker(
@@ -475,9 +449,7 @@ class TestDialogsBootstrapWorker:
 
         conn = _open_sync_db(db_path)
         try:
-            row = conn.execute(
-                "SELECT hidden, name FROM dialogs WHERE dialog_id = ?", (888,)
-            ).fetchone()
+            row = conn.execute("SELECT hidden, name FROM dialogs WHERE dialog_id = ?", (888,)).fetchone()
             assert row[0] == 1
             assert row[1] == "New"
         finally:
@@ -488,11 +460,7 @@ class TestDialogsBootstrapWorker:
         # Review HIGH: worker must NOT receive a pre-opened conn — it opens
         # its own via _open_sync_db(db_path). Verifies isolation contract.
         client = MagicMock()
-        client.iter_dialogs = MagicMock(
-            side_effect=lambda **kw: _async_gen(
-                [_make_dialog(1, _make_user_entity(1))]
-            )
-        )
+        client.iter_dialogs = MagicMock(side_effect=lambda **kw: _async_gen([_make_dialog(1, _make_user_entity(1))]))
         shutdown_event = asyncio.Event()
         worker = DialogsBootstrapWorker(client, db_path, shutdown_event)
         # Worker has its own connection attribute pointing to a real sqlite3.Connection.
@@ -504,19 +472,13 @@ class TestDialogsBootstrapWorker:
 
     @pytest.mark.asyncio
     async def test_startup_detail_setter_is_optional(self, db_path):
-        worker, _, _ = _make_worker(
-            db_path, [_make_dialog(1, _make_user_entity(1))]
-        )
+        worker, _, _ = _make_worker(db_path, [_make_dialog(1, _make_user_entity(1))])
         await worker.run()  # must not raise
 
     @pytest.mark.asyncio
     async def test_startup_detail_setter_invoked_on_complete(self, db_path):
         client = MagicMock()
-        client.iter_dialogs = MagicMock(
-            side_effect=lambda **kw: _async_gen(
-                [_make_dialog(1, _make_user_entity(1))]
-            )
-        )
+        client.iter_dialogs = MagicMock(side_effect=lambda **kw: _async_gen([_make_dialog(1, _make_user_entity(1))]))
         shutdown_event = asyncio.Event()
         captured: list[str] = []
         worker = DialogsBootstrapWorker(
@@ -629,8 +591,7 @@ def test_set_access_lost_atomic(db_path: Path) -> None:
         # Seed both tables so we can observe the UPDATEs land.
         with conn:
             conn.execute(
-                "INSERT INTO synced_dialogs (dialog_id, status) "
-                "VALUES (?, 'syncing')",
+                "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'syncing')",
                 (dialog_id,),
             )
             conn.execute(

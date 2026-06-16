@@ -190,8 +190,7 @@ def test_trace_fragment_fixture_uses_dialog_level_topic_sentinel(tmp_path) -> No
         conn.commit()
 
         real_topic_ids = [
-            row[0]
-            for row in conn.execute("SELECT topic_id FROM topic_metadata WHERE dialog_id = -100123")
+            row[0] for row in conn.execute("SELECT topic_id FROM topic_metadata WHERE dialog_id = -100123")
         ]
         fragment = conn.execute(
             """
@@ -510,9 +509,7 @@ async def test_trace_access_lost_dialog_gap_has_no_sync_action(trace_server) -> 
     seed_synced_dialog(conn, dialog_id=-100123, status="access_lost")
     conn.commit()
 
-    result = await server._trace_account_messages(
-        {"exact_account_id": 101, "exact_dialog_id": -100123}
-    )
+    result = await server._trace_account_messages({"exact_account_id": 101, "exact_dialog_id": -100123})
 
     gaps = result["data"]["gaps"]
     access_lost = next(gap for gap in gaps if gap["kind"] == "access_lost")
@@ -628,9 +625,7 @@ async def test_trace_dialog_grouping_uses_current_page_and_topic_key(trace_serve
     seed_message(conn, dialog_id=-100222, message_id=2, sent_at=2, sender_id=101, forum_topic_id=5)
     conn.commit()
 
-    result = await server._trace_account_messages(
-        {"exact_account_id": 101, "group_by": "dialog", "limit": 1}
-    )
+    result = await server._trace_account_messages({"exact_account_id": 101, "group_by": "dialog", "limit": 1})
 
     groups = result["data"]["groups"]
     assert len(groups) == 1

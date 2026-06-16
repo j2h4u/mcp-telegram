@@ -28,10 +28,10 @@ class DialogType(StrEnum):
 
     USER = "user"
     BOT = "bot"
-    CHANNEL = "channel"        # broadcast channel (Channel, megagroup=False)
+    CHANNEL = "channel"  # broadcast channel (Channel, megagroup=False)
     SUPERGROUP = "supergroup"  # megagroup (Channel, megagroup=True, forum=False)
-    FORUM = "forum"            # forum supergroup (Channel, megagroup=True, forum=True)
-    GROUP = "group"            # legacy basic group (Chat)
+    FORUM = "forum"  # forum supergroup (Channel, megagroup=True, forum=True)
+    GROUP = "group"  # legacy basic group (Chat)
     UNKNOWN = "unknown"
 
     @classmethod
@@ -79,15 +79,21 @@ class DialogType(StrEnum):
 # the legacy `_classify_dialog_type` vocabulary. Note "Group"->SUPERGROUP (megagroup)
 # vs "group"->GROUP (legacy), and "Chat"->GROUP — these inversions are intentional.
 _DIALOG_TYPE_ALIASES: dict[str, DialogType] = {
-    "user": DialogType.USER, "User": DialogType.USER,
-    "bot": DialogType.BOT, "Bot": DialogType.BOT,
-    "channel": DialogType.CHANNEL, "Channel": DialogType.CHANNEL,
-    "supergroup": DialogType.SUPERGROUP, "megagroup": DialogType.SUPERGROUP,
-    "Group": DialogType.SUPERGROUP,        # capitalized "Group" = megagroup
-    "forum": DialogType.FORUM, "Forum": DialogType.FORUM,
-    "group": DialogType.GROUP,             # lowercase "group" = legacy basic group
-    "Chat": DialogType.GROUP,              # capitalized "Chat" = legacy basic group
-    "unknown": DialogType.UNKNOWN, "Unknown": DialogType.UNKNOWN,
+    "user": DialogType.USER,
+    "User": DialogType.USER,
+    "bot": DialogType.BOT,
+    "Bot": DialogType.BOT,
+    "channel": DialogType.CHANNEL,
+    "Channel": DialogType.CHANNEL,
+    "supergroup": DialogType.SUPERGROUP,
+    "megagroup": DialogType.SUPERGROUP,
+    "Group": DialogType.SUPERGROUP,  # capitalized "Group" = megagroup
+    "forum": DialogType.FORUM,
+    "Forum": DialogType.FORUM,
+    "group": DialogType.GROUP,  # lowercase "group" = legacy basic group
+    "Chat": DialogType.GROUP,  # capitalized "Chat" = legacy basic group
+    "unknown": DialogType.UNKNOWN,
+    "Unknown": DialogType.UNKNOWN,
 }
 
 TraceGapSeverity = Literal["info", "warning", "action_required"]

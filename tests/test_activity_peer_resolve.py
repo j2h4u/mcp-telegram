@@ -16,6 +16,7 @@ Covers:
       returns LinkedChatResolution(linked_chat_id=None, flood_wait_seconds=N)
       WITHOUT sleeping, WITHOUT raising, and WITHOUT touching dialogs.
 """
+
 from __future__ import annotations
 
 import json
@@ -37,6 +38,7 @@ from mcp_telegram.sync_db import _apply_migrations
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _make_db() -> sqlite3.Connection:
     conn = sqlite3.connect(":memory:")
@@ -71,9 +73,7 @@ def _write_entity_details(
 
 
 def _read_entity_details(conn: sqlite3.Connection, entity_id: int) -> dict | None:
-    row = conn.execute(
-        "SELECT detail_json FROM entity_details WHERE entity_id = ?", (entity_id,)
-    ).fetchone()
+    row = conn.execute("SELECT detail_json FROM entity_details WHERE entity_id = ?", (entity_id,)).fetchone()
     if row is None:
         return None
     return json.loads(row[0])
@@ -120,6 +120,7 @@ def _read_dialogs_row(conn: sqlite3.Connection, dialog_id: int) -> dict | None:
 # ---------------------------------------------------------------------------
 # Fake client
 # ---------------------------------------------------------------------------
+
 
 class _FakeClient:
     """Minimal fake TelegramClient."""
@@ -168,6 +169,7 @@ def _fake_full_channel_result(linked_chat_id: int | None, **kwargs: Any) -> Any:
 # (a) resolve_input_peer: returns input entity for a known dialog_id
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_resolve_input_peer_returns_entity():
     fake_peer = MagicMock(name="InputPeerChannel")
@@ -180,6 +182,7 @@ async def test_resolve_input_peer_returns_entity():
 # ---------------------------------------------------------------------------
 # (b) resolve_input_peer: returns None on access-loss, never raises
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 async def test_resolve_input_peer_returns_none_on_access_loss():
@@ -200,6 +203,7 @@ async def test_resolve_input_peer_returns_none_on_key_error():
 # (c) resolve_linked_chat_id: dialogs cache hit — no GetFullChannel call
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_resolve_linked_chat_id_cache_hit_no_live_call():
     """A dialogs row with non-NULL linked_chat_resolved_at serves the answer
@@ -211,7 +215,8 @@ async def test_resolve_linked_chat_id_cache_hit_no_live_call():
     # Seed the authoritative answer into dialogs (not entity_details).
     # Any non-NULL linked_chat_resolved_at is the authority signal.
     _write_dialogs_row(
-        conn, channel_id,
+        conn,
+        channel_id,
         linked_chat_id=linked_id,
         linked_chat_resolved_at=int(time.time()) - 99999,  # deliberately old — no TTL
     )
@@ -222,14 +227,13 @@ async def test_resolve_linked_chat_id_cache_hit_no_live_call():
     assert result.linked_chat_id == linked_id
     assert result.flood_wait_seconds is None
     # GetFullChannel was NOT called
-    assert len(client.call_calls) == 0, (
-        f"Cache hit must not call GetFullChannel, got {len(client.call_calls)} calls"
-    )
+    assert len(client.call_calls) == 0, f"Cache hit must not call GetFullChannel, got {len(client.call_calls)} calls"
 
 
 # ---------------------------------------------------------------------------
 # (d) resolve_linked_chat_id: cache miss — calls GetFullChannel once, merges blob
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 async def test_resolve_linked_chat_id_cache_miss_calls_once_and_merges():
@@ -241,7 +245,8 @@ async def test_resolve_linked_chat_id_cache_miss_calls_once_and_merges():
 
     # Pre-existing blob with an 'about' key that must survive the merge
     _write_entity_details(
-        conn, channel_id,
+        conn,
+        channel_id,
         {"about": "original about text", "subscribers_count": 9999},
         fetched_at=0,  # expired (age = now - 0 >> TTL)
     )
@@ -260,9 +265,7 @@ async def test_resolve_linked_chat_id_cache_miss_calls_once_and_merges():
 
     # Normalized to -100… form
     assert result.linked_chat_id is not None
-    assert str(result.linked_chat_id).startswith("-100"), (
-        f"Expected -100… form, got {result.linked_chat_id}"
-    )
+    assert str(result.linked_chat_id).startswith("-100"), f"Expected -100… form, got {result.linked_chat_id}"
     assert result.flood_wait_seconds is None
 
     # entity_details blob was written back with sibling fields preserved.
@@ -270,9 +273,7 @@ async def test_resolve_linked_chat_id_cache_miss_calls_once_and_merges():
     # in entity_details.detail_json.
     written = _read_entity_details(conn, channel_id)
     assert written is not None
-    assert "linked_chat_id" not in written, (
-        "linked_chat_id must NOT be written into entity_details (Phase 54 contract)"
-    )
+    assert "linked_chat_id" not in written, "linked_chat_id must NOT be written into entity_details (Phase 54 contract)"
     # The merge preserved the about field (updated from the fresh result)
     assert "about" in written
     # The live result wrote its row into dialogs instead
@@ -290,7 +291,8 @@ async def test_resolve_linked_chat_id_preserves_existing_keys():
 
     # Pre-existing blob with a custom key
     _write_entity_details(
-        conn, channel_id,
+        conn,
+        channel_id,
         {"subscribers_count": 1234, "some_extra_key": "preserved"},
         fetched_at=0,  # expired
     )
@@ -308,6 +310,7 @@ async def test_resolve_linked_chat_id_preserves_existing_keys():
 # ---------------------------------------------------------------------------
 # (e) Channel with no discussion group → linked_chat_id=None, flood_wait=None
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 async def test_resolve_linked_chat_id_no_discussion_group():
@@ -328,6 +331,7 @@ async def test_resolve_linked_chat_id_no_discussion_group():
 # (f) FloodWaitError → returns flood_wait_seconds, no sleep, no raise
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_resolve_linked_chat_id_flood_wait_no_sleep():
     """FloodWaitError returns flood_wait_seconds set, does NOT sleep, does NOT raise."""
@@ -347,9 +351,7 @@ async def test_resolve_linked_chat_id_flood_wait_no_sleep():
     result = await resolve_linked_chat_id(client, conn, channel_id)
 
     assert result.linked_chat_id is None
-    assert result.flood_wait_seconds == 120, (
-        f"Expected flood_wait_seconds=120, got {result.flood_wait_seconds}"
-    )
+    assert result.flood_wait_seconds == 120, f"Expected flood_wait_seconds=120, got {result.flood_wait_seconds}"
 
 
 @pytest.mark.asyncio
@@ -381,6 +383,7 @@ async def test_resolve_linked_chat_id_flood_wait_distinct_from_no_group():
 # LinkedChatResolution dataclass
 # ---------------------------------------------------------------------------
 
+
 def test_linked_chat_resolution_fields():
     r = LinkedChatResolution(linked_chat_id=-100123, flood_wait_seconds=None)
     assert r.linked_chat_id == -100123
@@ -395,6 +398,7 @@ def test_linked_chat_resolution_fields():
 # TTL constant
 # ---------------------------------------------------------------------------
 
+
 def test_entity_detail_ttl_constant():
     assert isinstance(_ENTITY_DETAIL_TTL_SECONDS, int)
     assert _ENTITY_DETAIL_TTL_SECONDS > 0
@@ -407,6 +411,7 @@ def test_entity_detail_ttl_constant():
 # Task 4: dialogs cache hit does NOT call GetFullChannelRequest
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_resolve_linked_chat_id_dialogs_cache_hit_returns_without_telethon_call():
     """Pre-resolved channel: resolver returns the dialogs row without any Telethon call."""
@@ -415,7 +420,8 @@ async def test_resolve_linked_chat_id_dialogs_cache_hit_returns_without_telethon
     expected_linked = -1009876543210
 
     _write_dialogs_row(
-        conn, channel_id,
+        conn,
+        channel_id,
         linked_chat_id=expected_linked,
         linked_chat_resolved_at=int(time.time()) - 99999,  # deliberately old — no TTL
     )
@@ -425,15 +431,9 @@ async def test_resolve_linked_chat_id_dialogs_cache_hit_returns_without_telethon
 
     result = await resolve_linked_chat_id(client, conn, channel_id)
 
-    assert result == LinkedChatResolution(
-        linked_chat_id=expected_linked, flood_wait_seconds=None
-    )
-    assert len(client.get_input_entity_calls) == 0, (
-        "get_input_entity must not be called on a dialogs cache hit"
-    )
-    assert len(client.call_calls) == 0, (
-        "GetFullChannelRequest must not be called on a dialogs cache hit"
-    )
+    assert result == LinkedChatResolution(linked_chat_id=expected_linked, flood_wait_seconds=None)
+    assert len(client.get_input_entity_calls) == 0, "get_input_entity must not be called on a dialogs cache hit"
+    assert len(client.call_calls) == 0, "GetFullChannelRequest must not be called on a dialogs cache hit"
 
 
 @pytest.mark.asyncio
@@ -446,7 +446,8 @@ async def test_resolve_linked_chat_id_dialogs_cache_hit_null_linked_chat():
 
     # NULL linked_chat_id + NOT-NULL resolved_at = "we asked, no linked chat exists"
     _write_dialogs_row(
-        conn, channel_id,
+        conn,
+        channel_id,
         linked_chat_id=None,
         linked_chat_resolved_at=int(time.time()) - 50,
     )
@@ -456,16 +457,13 @@ async def test_resolve_linked_chat_id_dialogs_cache_hit_null_linked_chat():
     result = await resolve_linked_chat_id(client, conn, channel_id)
 
     assert result == LinkedChatResolution(linked_chat_id=None, flood_wait_seconds=None)
-    assert len(client.get_input_entity_calls) == 0, (
-        "get_input_entity must not be called on a dialogs cache hit"
-    )
-    assert len(client.call_calls) == 0, (
-        "GetFullChannelRequest must not be called on a dialogs cache hit"
-    )
+    assert len(client.get_input_entity_calls) == 0, "get_input_entity must not be called on a dialogs cache hit"
+    assert len(client.call_calls) == 0, "GetFullChannelRequest must not be called on a dialogs cache hit"
 
 
 # Task 5: cold path UPSERTs into dialogs and does not pollute detail_json
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 async def test_resolve_linked_chat_id_cold_path_upserts_dialogs():
@@ -511,9 +509,7 @@ async def test_resolve_linked_chat_id_cold_path_upserts_dialogs():
     # entity_details: sibling fields present, linked_chat_id absent
     ed = _read_entity_details(conn, channel_id)
     assert ed is not None
-    assert "linked_chat_id" not in ed, (
-        "linked_chat_id must NOT appear in entity_details (Phase 54 contract)"
-    )
+    assert "linked_chat_id" not in ed, "linked_chat_id must NOT appear in entity_details (Phase 54 contract)"
     assert "subscribers_count" in ed
     assert "about" in ed
     assert "pinned_msg_id" in ed
@@ -529,6 +525,7 @@ async def test_resolve_linked_chat_id_cold_path_upserts_dialogs():
 
 # Task 6: schema-floor assertion raises RuntimeError on sub-v24 connections
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 async def test_resolve_linked_chat_id_schema_floor_raises_on_v23():
@@ -560,7 +557,8 @@ async def test_resolve_linked_chat_id_schema_floor_passes_on_v24():
     channel_id = -1005555555555
     # Seed a resolved dialogs row so the resolver returns without a Telethon call
     _write_dialogs_row(
-        conn, channel_id,
+        conn,
+        channel_id,
         linked_chat_id=-1006666666666,
         linked_chat_resolved_at=int(time.time()),
     )
@@ -576,6 +574,7 @@ async def test_resolve_linked_chat_id_schema_floor_passes_on_v24():
 # Task 7: FloodWait leaves dialogs untouched (retry signal preserved)
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_resolve_linked_chat_id_flood_wait_leaves_dialogs_untouched():
     """FloodWaitError must NOT touch dialogs; resolved_at stays NULL so the next
@@ -587,7 +586,8 @@ async def test_resolve_linked_chat_id_flood_wait_leaves_dialogs_untouched():
 
     # Seed a dialogs row in "never asked" state (NULL, NULL)
     _write_dialogs_row(
-        conn, channel_id,
+        conn,
+        channel_id,
         linked_chat_id=None,
         linked_chat_resolved_at=None,
     )
@@ -607,15 +607,9 @@ async def test_resolve_linked_chat_id_flood_wait_leaves_dialogs_untouched():
     # dialogs row UNCHANGED — resolved_at still NULL (the retry signal)
     dr = _read_dialogs_row(conn, channel_id)
     assert dr is not None
-    assert dr["linked_chat_id"] is None, (
-        "FloodWait must NOT write linked_chat_id into dialogs"
-    )
-    assert dr["linked_chat_resolved_at"] is None, (
-        "FloodWait must NOT set resolved_at — NULL IS the retry signal (D-08)"
-    )
+    assert dr["linked_chat_id"] is None, "FloodWait must NOT write linked_chat_id into dialogs"
+    assert dr["linked_chat_resolved_at"] is None, "FloodWait must NOT set resolved_at — NULL IS the retry signal (D-08)"
 
     # No additional rows inserted
-    row_count = conn.execute(
-        "SELECT COUNT(*) FROM dialogs WHERE dialog_id = ?", (channel_id,)
-    ).fetchone()[0]
+    row_count = conn.execute("SELECT COUNT(*) FROM dialogs WHERE dialog_id = ?", (channel_id,)).fetchone()[0]
     assert row_count == 1, "exactly one dialogs row for this channel"

@@ -4,6 +4,7 @@ Populates own-message rows (out=1) in the unified messages table
 via messages.Search(InputPeerEmpty, from_id=InputPeerSelf).
 Runs as a named daemon background task alongside run_access_probe_loop.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -41,25 +42,18 @@ _SEARCH_RPC_TIMEOUT_S: float = 120.0
 # Mirrors sync_worker.UPSERT_ENTITY_SQL (verified line 239).
 # NOTE: `type` and `updated_at` are NOT NULL with no DEFAULT — both MUST be supplied.
 UPSERT_ENTITY_SQL = (
-    "INSERT OR REPLACE INTO entities "
-    "(id, type, name, username, name_normalized, updated_at) "
-    "VALUES (?, ?, ?, ?, ?, ?)"
+    "INSERT OR REPLACE INTO entities (id, type, name, username, name_normalized, updated_at) VALUES (?, ?, ?, ?, ?, ?)"
 )
 
 # Activity-sync dialog enrollment: 'own_only' is the lowest non-empty
 # coverage status (D-2). INSERT OR IGNORE preserves higher-status rows
 # already enrolled by FullSyncWorker (syncing/synced) or probe loops
 # (fragment/access_lost). Status only escalates.
-INSERT_OWN_ONLY_DIALOG_SQL = (
-    "INSERT OR IGNORE INTO synced_dialogs (dialog_id, status) "
-    "VALUES (?, 'own_only')"
-)
+INSERT_OWN_ONLY_DIALOG_SQL = "INSERT OR IGNORE INTO synced_dialogs (dialog_id, status) VALUES (?, 'own_only')"
 
 
 def _load_state(conn: sqlite3.Connection) -> dict[str, str | None]:
-    rows = conn.execute(
-        "SELECT key, value FROM activity_sync_state"
-    ).fetchall()
+    rows = conn.execute("SELECT key, value FROM activity_sync_state").fetchall()
     return {r[0]: r[1] for r in rows}
 
 
@@ -82,6 +76,7 @@ def extract_dialog_id(msg: Any) -> int | None:
         return None
     # telethon.utils.get_peer_id handles User/Chat/Channel variants
     from telethon.utils import get_peer_id
+
     try:
         return get_peer_id(peer)
     except Exception:
@@ -127,9 +122,9 @@ def _upsert_entities_from_search(conn: sqlite3.Connection, result: Any) -> None:
         etype = _classify_entity(u)
         if etype is None:
             continue
-        name = " ".join(
-            p for p in (getattr(u, "first_name", None), getattr(u, "last_name", None)) if p
-        ) or (getattr(u, "username", None) or None)
+        name = " ".join(p for p in (getattr(u, "first_name", None), getattr(u, "last_name", None)) if p) or (
+            getattr(u, "username", None) or None
+        )
         username = getattr(u, "username", None)
         rows.append((int(u.id), etype, name, username, _normalize(name), now))
 
@@ -238,7 +233,8 @@ async def _run_backfill(
         except FloodWaitError as exc:
             logger.warning(
                 "activity_sync_floodwait seconds=%d total_fetched=%d",
-                exc.seconds, total_fetched,
+                exc.seconds,
+                total_fetched,
             )
             if await sleep_through_flood(shutdown_event, flood_seconds(exc)):
                 return
@@ -261,7 +257,8 @@ async def _run_backfill(
             _set_state(conn, "backfill_complete", "1")
             _set_state(conn, "last_sync_at", str(int(time.time())))
             logger.info(
-                "activity_sync_backfill_complete total_fetched=%d", total_fetched,
+                "activity_sync_backfill_complete total_fetched=%d",
+                total_fetched,
             )
             return
 
@@ -303,16 +300,23 @@ async def _run_backfill(
             eta_s = int(remaining / rate) if rate > 0 else None
             eta_str = _fmt_duration(eta_s) if eta_s is not None else "?"
             logger.info(
-                "activity_sync_backfill_batch batch=%d fetched=%d total=%d/%d"
-                " rate=%.0f/s eta=%s offset_id=%d",
-                batch_num, len(batch), total_fetched, total_known,
-                rate, eta_str, checkpoint,
+                "activity_sync_backfill_batch batch=%d fetched=%d total=%d/%d rate=%.0f/s eta=%s offset_id=%d",
+                batch_num,
+                len(batch),
+                total_fetched,
+                total_known,
+                rate,
+                eta_str,
+                checkpoint,
             )
         else:
             logger.info(
-                "activity_sync_backfill_batch batch=%d fetched=%d total=%d"
-                " rate=%.0f/s offset_id=%d",
-                batch_num, len(batch), total_fetched, rate, checkpoint,
+                "activity_sync_backfill_batch batch=%d fetched=%d total=%d rate=%.0f/s offset_id=%d",
+                batch_num,
+                len(batch),
+                total_fetched,
+                rate,
+                checkpoint,
             )
 
         try:
@@ -434,8 +438,13 @@ async def _run_incremental(
         logger.info(
             "activity_sync_incremental_batch batch=%d fetched=%d in_window=%d "
             "extracted=%d total_inserted=%d next_offset_id=%d past_window=%s",
-            batch_num, len(batch), len(in_window), len(extracted),
-            inserted, offset_id, past_window,
+            batch_num,
+            len(batch),
+            len(in_window),
+            len(extracted),
+            inserted,
+            offset_id,
+            past_window,
         )
 
         if past_window:
@@ -448,9 +457,7 @@ async def _run_incremental(
             pass
 
     _set_state(conn, "last_sync_at", str(int(time.time())))
-    logger.info(
-        "activity_sync_incremental_done batches=%d inserted=%d", batch_num, inserted
-    )
+    logger.info("activity_sync_incremental_done batches=%d inserted=%d", batch_num, inserted)
 
 
 async def run_activity_sync_loop(

@@ -119,7 +119,7 @@ async def test_call_tool_passthrough_recoverable_error_text_contract(monkeypatch
     expected = [
         TextContent(
             type="text",
-            text='Could not fetch entity info for \'Iris\' (boom).\nAction: Retry get_entity_info later.',
+            text="Could not fetch entity info for 'Iris' (boom).\nAction: Retry get_entity_info later.",
         )
     ]
 
@@ -210,9 +210,7 @@ def test_phase_52_tool_output_inventory_covers_registered_tools() -> None:
 
     missing_tools = sorted(set(server.tool_by_name) - inventory_tools)
 
-    assert not missing_tools, (
-        f"{INVENTORY_PATH.name} is missing registered tool(s): {', '.join(missing_tools)}"
-    )
+    assert not missing_tools, f"{INVENTORY_PATH.name} is missing registered tool(s): {', '.join(missing_tools)}"
 
 
 def test_phase_52_tool_output_inventory_marks_baseline_columns() -> None:
@@ -341,11 +339,13 @@ def test_list_tools_exposes_account_trace_schema_and_title() -> None:
     assert "limits" in tool.outputSchema["properties"]
     assert "navigation" in tool.outputSchema["properties"]
     assert "coverage_bounds" in tool.outputSchema["properties"]["provenance"]["properties"]
-    assert "authorship_basis" in (
-        tool.outputSchema["properties"]["groups"]["items"]["properties"]["evidence"]["items"]["properties"]
+    assert (
+        "authorship_basis"
+        in (tool.outputSchema["properties"]["groups"]["items"]["properties"]["evidence"]["items"]["properties"])
     )
-    assert "content" in (
-        tool.outputSchema["properties"]["groups"]["items"]["properties"]["evidence"]["items"]["properties"]
+    assert (
+        "content"
+        in (tool.outputSchema["properties"]["groups"]["items"]["properties"]["evidence"]["items"]["properties"])
     )
     assert tool.inputSchema["properties"]["exact_topic_id"]["type"] == "integer"
 

@@ -153,11 +153,7 @@ def _restriction_payloads(restrictions: list[dict] | None, *, base_path: str) ->
                 "platform": restriction.get("platform"),
                 "reason": restriction.get("reason"),
                 "text": text,
-                "content": (
-                    _content_field(f"{base_path}.{idx}.text", text, "restriction_reason")
-                    if text
-                    else None
-                ),
+                "content": (_content_field(f"{base_path}.{idx}.text", text, "restriction_reason") if text else None),
             }
         )
     return payloads

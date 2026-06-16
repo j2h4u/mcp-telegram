@@ -141,9 +141,7 @@ async def test_submit_feedback_tool_daemon_not_running() -> None:
 async def test_submit_feedback_tool_daemon_error_response() -> None:
     """Daemon ok=False → content[0].text starts with 'Error:' and contains detail."""
     mock_conn = AsyncMock()
-    mock_conn.submit_feedback = AsyncMock(
-        return_value={"ok": False, "message": "internal error"}
-    )
+    mock_conn.submit_feedback = AsyncMock(return_value={"ok": False, "message": "internal error"})
 
     @asynccontextmanager
     async def fake_dc():

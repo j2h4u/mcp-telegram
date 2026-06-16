@@ -491,7 +491,9 @@ def _list_messages_structured_messages(
         return []
     messages = [ReadMessage(**row) for row in rows]
     reply_map: dict[int, ReadMessage] = {message.id: message for message in messages}
-    marker_by_message = _compute_inline_markers(messages, read_state) if DialogType.parse(dialog_type) == DialogType.USER else {}
+    marker_by_message = (
+        _compute_inline_markers(messages, read_state) if DialogType.parse(dialog_type) == DialogType.USER else {}
+    )
 
     structured: list[dict[str, object]] = []
     for message in messages:
@@ -789,7 +791,7 @@ def _search_read_state_per_dialog(data: dict) -> dict[str, object]:
     for raw_dialog_id, read_state in read_state_per_dialog.items():
         try:
             dialog_id = int(raw_dialog_id)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             continue
         structured[str(dialog_id)] = {
             "dialog_id": dialog_id,
@@ -997,6 +999,7 @@ class ListMessages(ToolArgs):
         le=50,
         description="Number of messages to return around anchor_message_id (default 10).",
     )
+
     @model_validator(mode="after")
     def validate_direct_read_selectors(self) -> ListMessages:
         """Reject missing or conflicting selector combinations."""

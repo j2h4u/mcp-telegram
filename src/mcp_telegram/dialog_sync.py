@@ -145,18 +145,11 @@ _ACCESS_LOST_ERRORS = (
     ChannelBannedError,
 )
 
-_SET_ACCESS_LOST_SQL = (
-    "UPDATE synced_dialogs SET status = 'access_lost', access_lost_at = ? "
-    "WHERE dialog_id = ?"
-)
-_SET_DIALOGS_HIDDEN_SQL = (
-    "UPDATE dialogs SET hidden = 1, snapshot_at = ? WHERE dialog_id = ?"
-)
+_SET_ACCESS_LOST_SQL = "UPDATE synced_dialogs SET status = 'access_lost', access_lost_at = ? WHERE dialog_id = ?"
+_SET_DIALOGS_HIDDEN_SQL = "UPDATE dialogs SET hidden = 1, snapshot_at = ? WHERE dialog_id = ?"
 
 
-def _set_access_lost(
-    conn: sqlite3.Connection, dialog_id: int, now: int
-) -> None:
+def _set_access_lost(conn: sqlite3.Connection, dialog_id: int, now: int) -> None:
     """Atomic access-loss transition (RECON-04).
 
     Writes synced_dialogs.status='access_lost' and dialogs.hidden=1 in a
@@ -172,9 +165,7 @@ def _set_access_lost(
 # Reconciliation SQL (Phase 43)
 # ---------------------------------------------------------------------------
 
-_SELECT_DIRTY_DIALOGS_SQL = (
-    "SELECT dialog_id FROM dialogs WHERE needs_refresh = 1 AND hidden = 0"
-)
+_SELECT_DIRTY_DIALOGS_SQL = "SELECT dialog_id FROM dialogs WHERE needs_refresh = 1 AND hidden = 0"
 
 _UPSERT_TOPIC_FROM_RECON_SQL = """
 INSERT INTO topic_metadata
@@ -196,16 +187,10 @@ WHERE topic_metadata.snapshot_at IS NULL
    OR topic_metadata.snapshot_at < excluded.snapshot_at
 """
 _UPDATE_DIALOG_ENTITY_SQL = (
-    "UPDATE dialogs "
-    "SET name=?, type=?, members=?, created=?, needs_refresh=0, snapshot_at=? "
-    "WHERE dialog_id=?"
+    "UPDATE dialogs SET name=?, type=?, members=?, created=?, needs_refresh=0, snapshot_at=? WHERE dialog_id=?"
 )
-_HIDE_DIALOG_SQL = (
-    "UPDATE dialogs SET hidden=1, snapshot_at=? WHERE dialog_id=? AND hidden=0"
-)
-_SELECT_VISIBLE_DIALOG_IDS_SQL = (
-    "SELECT dialog_id FROM dialogs WHERE hidden = 0"
-)
+_HIDE_DIALOG_SQL = "UPDATE dialogs SET hidden=1, snapshot_at=? WHERE dialog_id=? AND hidden=0"
+_SELECT_VISIBLE_DIALOG_IDS_SQL = "SELECT dialog_id FROM dialogs WHERE hidden = 0"
 
 # ---------------------------------------------------------------------------
 # State helpers
@@ -240,15 +225,11 @@ def _encode_offset_peer(entity: Any) -> str | None:
     privacy-restricted entities — guard with `or 0`.
     """
     if isinstance(entity, types.User):
-        return json.dumps(
-            {"type": "user", "id": entity.id, "access_hash": entity.access_hash or 0}
-        )
+        return json.dumps({"type": "user", "id": entity.id, "access_hash": entity.access_hash or 0})
     if isinstance(entity, types.Chat):
         return json.dumps({"type": "chat", "id": entity.id, "access_hash": 0})
     if isinstance(entity, types.Channel):
-        return json.dumps(
-            {"type": "channel", "id": entity.id, "access_hash": entity.access_hash or 0}
-        )
+        return json.dumps({"type": "channel", "id": entity.id, "access_hash": entity.access_hash or 0})
     # Unknown entity type — log and refuse to fabricate a cursor (review LOW).
     logger.warning(
         "bootstrap_sweep unknown entity type=%s — offset_peer not encoded",
@@ -438,13 +419,9 @@ class DialogsBootstrapWorker:
         offset_peer_str = _get_state(self._conn, _KEY_OFFSET_PEER)
 
         try:
-            offset_date = (
-                datetime.fromisoformat(offset_date_str) if offset_date_str else None
-            )
+            offset_date = datetime.fromisoformat(offset_date_str) if offset_date_str else None
             offset_id = int(offset_id_str) if offset_id_str else 0
-            offset_peer = (
-                _decode_offset_peer(offset_peer_str) if offset_peer_str else None
-            )
+            offset_peer = _decode_offset_peer(offset_peer_str) if offset_peer_str else None
             return offset_date, offset_id, offset_peer
         except (ValueError, TypeError, json.JSONDecodeError) as exc:
             logger.warning(
@@ -513,9 +490,7 @@ class DialogsBootstrapWorker:
 
                     count += 1
                     if count % _PROGRESS_REPORT_EVERY == 0:
-                        self._set_detail(
-                            f"bootstrap sweep: {count} dialogs processed"
-                        )
+                        self._set_detail(f"bootstrap sweep: {count} dialogs processed")
 
             except FloodWaitError as exc:
                 wait_s = flood_seconds(exc)
@@ -524,9 +499,7 @@ class DialogsBootstrapWorker:
                     wait_s,
                     count,
                 )
-                self._set_detail(
-                    f"bootstrap sweep: flood_wait {wait_s}s (processed {count})"
-                )
+                self._set_detail(f"bootstrap sweep: flood_wait {wait_s}s (processed {count})")
                 await sleep_through_flood(self._shutdown_event, wait_s)
                 # Return without writing 'complete'. iter_dialogs() is an async
                 # generator and is not restartable mid-stream after FloodWait — the
@@ -632,7 +605,8 @@ class DialogReconciliationWorker:
         for (dialog_id,) in rows:
             if self._shutdown_event.is_set():
                 logger.info(
-                    "recon_light_pass_complete count=%d (shutdown)", count,
+                    "recon_light_pass_complete count=%d (shutdown)",
+                    count,
                 )
                 return count
             try:
@@ -656,13 +630,15 @@ class DialogReconciliationWorker:
                     topic_count = await self._refresh_forum_topics(dialog_id, entity)
                     logger.debug(
                         "recon_light_pass_forum_topics dialog_id=%d count=%d",
-                        dialog_id, topic_count,
+                        dialog_id,
+                        topic_count,
                     )
             except FloodWaitError as exc:
                 wait_s = flood_seconds(exc)
                 logger.warning(
                     "recon_light_flood_wait dialog_id=%d wait=%ds",
-                    dialog_id, wait_s,
+                    dialog_id,
+                    wait_s,
                 )
                 if await sleep_through_flood(self._shutdown_event, wait_s):
                     logger.info(
@@ -676,7 +652,8 @@ class DialogReconciliationWorker:
             except _ACCESS_LOST_ERRORS as exc:
                 logger.warning(
                     "recon_light_access_lost dialog_id=%d — %s",
-                    dialog_id, type(exc).__name__,
+                    dialog_id,
+                    type(exc).__name__,
                 )
                 _set_access_lost(self._conn, dialog_id, int(time.time()))
                 # do not increment count — refresh did not succeed
@@ -686,14 +663,14 @@ class DialogReconciliationWorker:
                 # reset). Leave needs_refresh=1 — the next iter_dialogs
                 # sweep (full pass or bootstrap) will repopulate the cache.
                 logger.warning(
-                    "recon_light_pass_peer_invalid dialog_id=%s "
-                    "(session cache miss; will retry next cycle)",
+                    "recon_light_pass_peer_invalid dialog_id=%s (session cache miss; will retry next cycle)",
                     dialog_id,
                 )
             except RPCError as exc:
                 logger.warning(
                     "recon_light_rpc_error dialog_id=%d error=%s",
-                    dialog_id, exc,
+                    dialog_id,
+                    exc,
                 )
                 # leave needs_refresh=1 for next cycle
         logger.info("recon_light_pass_complete count=%d", count)
@@ -715,10 +692,7 @@ class DialogReconciliationWorker:
         last_full_pass when completed=True, so the next hourly tick retries
         the full pass instead of waiting a full day.
         """
-        pre_pass_ids = {
-            row[0]
-            for row in self._conn.execute(_SELECT_VISIBLE_DIALOG_IDS_SQL).fetchall()
-        }
+        pre_pass_ids = {row[0] for row in self._conn.execute(_SELECT_VISIBLE_DIALOG_IDS_SQL).fetchall()}
         seen_ids: set[int] = set()
         count = 0
         try:
@@ -732,17 +706,18 @@ class DialogReconciliationWorker:
                 seen_ids.add(int(dialog.id))
                 count += 1
                 if getattr(dialog.entity, "forum", False):
-                    topic_count = await self._refresh_forum_topics(
-                        int(dialog.id), dialog.entity
-                    )
+                    topic_count = await self._refresh_forum_topics(int(dialog.id), dialog.entity)
                     logger.debug(
                         "recon_full_pass_forum_topics dialog_id=%d count=%d",
-                        int(dialog.id), topic_count,
+                        int(dialog.id),
+                        topic_count,
                     )
         except FloodWaitError as exc:
             wait_s = flood_seconds(exc)
             logger.warning(
-                "recon_full_flood_wait wait=%ds processed=%d", wait_s, count,
+                "recon_full_flood_wait wait=%ds processed=%d",
+                wait_s,
+                count,
             )
             await sleep_through_flood(self._shutdown_event, wait_s)
             return count, False  # cannot resume mid-stream; next cycle retries
@@ -755,7 +730,8 @@ class DialogReconciliationWorker:
                 self._conn.execute(_HIDE_DIALOG_SQL, (now, dialog_id))
         logger.info(
             "recon_full_pass_complete count=%d hidden=%d",
-            count, len(missing),
+            count,
+            len(missing),
         )
         return count, True
 
@@ -787,14 +763,16 @@ class DialogReconciliationWorker:
             wait_s = flood_seconds(exc)
             logger.warning(
                 "recon_forum_topics_flood_wait dialog_id=%d wait=%ds",
-                dialog_id, wait_s,
+                dialog_id,
+                wait_s,
             )
             await sleep_through_flood(self._shutdown_event, wait_s)
             return 0
         except Exception as exc:
             logger.warning(
                 "recon_forum_topics_fetch_failed dialog_id=%d error=%s",
-                dialog_id, exc,
+                dialog_id,
+                exc,
             )
             return 0
 
@@ -805,26 +783,26 @@ class DialogReconciliationWorker:
         now = int(time.time())
         rows = []
         for t in topics:
-            rows.append({
-                "dialog_id": dialog_id,
-                "topic_id": int(t.id),
-                "title": getattr(t, "title", None) or "",
-                "is_general": int(getattr(t, "is_general", False) or (int(t.id) == 1)),
-                "icon_emoji_id": getattr(t, "icon_emoji_id", None),
-                "updated_at": now,
-                "snapshot_at": now,
-                "date": int(t.date.timestamp())
-                if hasattr(getattr(t, "date", None), "timestamp")
-                else getattr(t, "date", None),
-            })
+            rows.append(
+                {
+                    "dialog_id": dialog_id,
+                    "topic_id": int(t.id),
+                    "title": getattr(t, "title", None) or "",
+                    "is_general": int(getattr(t, "is_general", False) or (int(t.id) == 1)),
+                    "icon_emoji_id": getattr(t, "icon_emoji_id", None),
+                    "updated_at": now,
+                    "snapshot_at": now,
+                    "date": int(t.date.timestamp())
+                    if hasattr(getattr(t, "date", None), "timestamp")
+                    else getattr(t, "date", None),
+                }
+            )
         # Batch all upserts in a single transaction for atomicity and performance.
         with self._conn:
             for row in rows:
                 self._conn.execute(_UPSERT_TOPIC_FROM_RECON_SQL, row)
         count = len(rows)
-        logger.info(
-            "recon_forum_topics_complete dialog_id=%d count=%d", dialog_id, count
-        )
+        logger.info("recon_forum_topics_complete dialog_id=%d count=%d", dialog_id, count)
         return count
 
 
@@ -876,9 +854,7 @@ async def run_reconciliation_loop(
             except Exception:
                 logger.warning("recon_full_pass_error", exc_info=True)
         try:
-            await asyncio.wait_for(
-                shutdown_event.wait(), timeout=hourly_interval
-            )
+            await asyncio.wait_for(shutdown_event.wait(), timeout=hourly_interval)
             return  # shutdown
         except TimeoutError:
             pass

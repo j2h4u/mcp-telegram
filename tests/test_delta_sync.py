@@ -919,7 +919,7 @@ async def test_fetch_delta_stamps_last_synced_at_on_success(
     ).fetchone()
     assert row is not None
     assert row[0] is not None, "last_synced_at must be set on success"
-    assert before <= row[0] <= after + 2, f"last_synced_at={row[0]} not in [{before}, {after+2}]"
+    assert before <= row[0] <= after + 2, f"last_synced_at={row[0]} not in [{before}, {after + 2}]"
 
 
 @pytest.mark.asyncio
@@ -1051,6 +1051,7 @@ async def test_checkpoint_skip_emits_log(
 
     worker = make_worker(mock_client, sync_db, shutdown_event)
     import logging
+
     with caplog.at_level(logging.DEBUG, logger="mcp_telegram.delta_sync"):
         await worker.run_delta_catch_up()
 

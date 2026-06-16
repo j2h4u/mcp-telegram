@@ -4,6 +4,7 @@ Locks the semantic trap that caused divergent vocabularies before unification:
 capitalized "Group" = MEGAGROUP (supergroup), but lowercase "group" = LEGACY BASIC
 GROUP — opposites. parse() must map both casings explicitly, never via .lower().
 """
+
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -14,6 +15,7 @@ from mcp_telegram.models import DialogType
 
 # --- parse(): trap-aware string parsing -------------------------------------
 
+
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
@@ -21,14 +23,14 @@ from mcp_telegram.models import DialogType
         ("channel", DialogType.CHANNEL),
         ("supergroup", DialogType.SUPERGROUP),
         ("forum", DialogType.FORUM),
-        ("group", DialogType.GROUP),       # lowercase group = legacy basic group
+        ("group", DialogType.GROUP),  # lowercase group = legacy basic group
         ("user", DialogType.USER),
         ("bot", DialogType.BOT),
         ("unknown", DialogType.UNKNOWN),
         # capitalized legacy vocabulary
         ("Channel", DialogType.CHANNEL),
         ("Group", DialogType.SUPERGROUP),  # TRAP: capitalized Group = megagroup
-        ("Chat", DialogType.GROUP),        # TRAP: Chat = legacy basic group
+        ("Chat", DialogType.GROUP),  # TRAP: Chat = legacy basic group
         ("Forum", DialogType.FORUM),
         ("User", DialogType.USER),
         ("Bot", DialogType.BOT),
@@ -61,6 +63,7 @@ def test_strenum_binds_as_lowercase_value():
 
 
 # --- from_entity(): the sole Telethon-flag reader ---------------------------
+
 
 class _FakeChannel:
     """Stand-in matching telethon.tl.types.Channel via isinstance is not possible

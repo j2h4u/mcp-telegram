@@ -64,9 +64,7 @@ async def test_submit_feedback_all_optional_fields(tmp_path) -> None:
     )
 
     assert response["ok"] is True
-    row = feedback_conn.execute(
-        "SELECT message, severity, context, model, harness FROM feedback"
-    ).fetchone()
+    row = feedback_conn.execute("SELECT message, severity, context, model, harness FROM feedback").fetchone()
     assert row is not None
     assert row[1] == "bug"
     assert row[2] == "ListMessages limit=50 returned no rows"
@@ -302,9 +300,7 @@ async def test_update_feedback_status_happy_path(tmp_path) -> None:
 
     assert response["ok"] is True
     assert "set to 'done'" in response["data"]["message"]
-    row = feedback_conn.execute(
-        "SELECT status, status_changed_at FROM feedback WHERE id=?", (rid,)
-    ).fetchone()
+    row = feedback_conn.execute("SELECT status, status_changed_at FROM feedback WHERE id=?", (rid,)).fetchone()
     assert row[0] == "done"
     assert isinstance(row[1], int) and row[1] > 0
 
@@ -362,9 +358,7 @@ async def test_update_feedback_status_invalid_reason_type(tmp_path) -> None:
     rid = feedback_conn.execute("SELECT id FROM feedback").fetchone()[0]
 
     for bad_reason in ([1, 2, 3], {"x": 1}, 42):
-        response = await server._update_feedback_status(
-            {"id": rid, "status": "done", "reason": bad_reason}
-        )
+        response = await server._update_feedback_status({"id": rid, "status": "done", "reason": bad_reason})
         assert response["ok"] is False, f"bad_reason={bad_reason!r} should fail"
         assert response.get("error") == "invalid_input"
         assert "reason" in response.get("message", "").lower()
@@ -383,13 +377,9 @@ async def test_update_feedback_status_with_reason(tmp_path) -> None:
     feedback_conn.commit()
     rid = feedback_conn.execute("SELECT id FROM feedback").fetchone()[0]
 
-    response = await server._update_feedback_status(
-        {"id": rid, "status": "dismissed", "reason": "noise"}
-    )
+    response = await server._update_feedback_status({"id": rid, "status": "dismissed", "reason": "noise"})
     assert response["ok"] is True
-    row = feedback_conn.execute(
-        "SELECT status, status_comment FROM feedback WHERE id=?", (rid,)
-    ).fetchone()
+    row = feedback_conn.execute("SELECT status, status_comment FROM feedback WHERE id=?", (rid,)).fetchone()
     assert row[0] == "dismissed"
     assert row[1] == "noise"
 
@@ -406,15 +396,11 @@ async def test_update_feedback_status_omitting_reason_clears_it(tmp_path) -> Non
     rid = feedback_conn.execute("SELECT id FROM feedback").fetchone()[0]
 
     # First transition with reason
-    await server._update_feedback_status(
-        {"id": rid, "status": "in_progress", "reason": "starting"}
-    )
+    await server._update_feedback_status({"id": rid, "status": "in_progress", "reason": "starting"})
     # Second transition without reason
     await server._update_feedback_status({"id": rid, "status": "done"})
 
-    row = feedback_conn.execute(
-        "SELECT status, status_comment FROM feedback WHERE id=?", (rid,)
-    ).fetchone()
+    row = feedback_conn.execute("SELECT status, status_comment FROM feedback WHERE id=?", (rid,)).fetchone()
     assert row[0] == "done"
     assert row[1] is None  # reason omitted → NULL
 
@@ -429,8 +415,6 @@ async def test_update_feedback_status_dispatch_route(tmp_path) -> None:
     feedback_conn.commit()
     rid = feedback_conn.execute("SELECT id FROM feedback").fetchone()[0]
 
-    response = await server._dispatch(
-        {"method": "update_feedback_status", "id": rid, "status": "done"}
-    )
+    response = await server._dispatch({"method": "update_feedback_status", "id": rid, "status": "done"})
     assert response.get("error") != "unknown_method"
     assert response["ok"] is True

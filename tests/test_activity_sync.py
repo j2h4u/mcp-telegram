@@ -1,4 +1,5 @@
 """Unit tests for activity_sync.py."""
+
 from __future__ import annotations
 
 import asyncio
@@ -18,6 +19,7 @@ from mcp_telegram.activity_sync import (
 from mcp_telegram.sync_db import ensure_sync_schema
 
 # -- Fakes --------------------------------------------------------
+
 
 @dataclass
 class FakeReplies:
@@ -90,21 +92,23 @@ def _msg(msg_id: int, user_id: int, ts: int, text: str = "hi", replies: int = 0,
 
 # -- Tests --------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_backfill_inserts_rows(tmp_path):
     conn = _make_db(tmp_path)
     m1 = _msg(100, 42, 1_700_000_100, replies=2)
     m2 = _msg(99, 42, 1_700_000_090)
-    client = _FakeClient(batches=[
-        FakeSearchResult(messages=[m1, m2]),
-        FakeSearchResult(messages=[]),
-    ])
+    client = _FakeClient(
+        batches=[
+            FakeSearchResult(messages=[m1, m2]),
+            FakeSearchResult(messages=[]),
+        ]
+    )
     shutdown = asyncio.Event()
     await _run_backfill(client, conn, shutdown)
 
     rows = conn.execute(
-        "SELECT message_id, dialog_id, sent_at, out, reply_count FROM messages "
-        "WHERE out = 1 ORDER BY message_id"
+        "SELECT message_id, dialog_id, sent_at, out, reply_count FROM messages WHERE out = 1 ORDER BY message_id"
     ).fetchall()
     assert rows == [(99, 42, 1_700_000_090, 1, 0), (100, 42, 1_700_000_100, 1, 2)]
     state = dict(conn.execute("SELECT key, value FROM activity_sync_state").fetchall())
@@ -148,8 +152,9 @@ async def test_incremental_only_new_messages(tmp_path):
     anchor_ts = 1_700_000_000
     with conn:
         conn.execute("UPDATE activity_sync_state SET value='1' WHERE key='backfill_complete'")
-        conn.execute("INSERT OR REPLACE INTO activity_sync_state (key, value) VALUES ('last_sync_at', ?)",
-                     (str(anchor_ts),))
+        conn.execute(
+            "INSERT OR REPLACE INTO activity_sync_state (key, value) VALUES ('last_sync_at', ?)", (str(anchor_ts),)
+        )
         conn.execute(
             "INSERT INTO messages (dialog_id, message_id, sent_at, text, out, is_service, is_deleted) "
             "VALUES (?, ?, ?, ?, 1, 0, 0)",
@@ -159,18 +164,16 @@ async def test_incremental_only_new_messages(tmp_path):
     # Incremental uses SearchRequest(min_date=anchor_ts-60) — message sent_at=anchor_ts+100
     # is newer and must be returned. First batch: id=51. Second batch: empty → done.
     new_msg = _msg(51, 42, anchor_ts + 100, text="new")
-    client = _FakeClient(batches=[
-        FakeSearchResult(messages=[new_msg]),
-        FakeSearchResult(messages=[]),
-    ])
+    client = _FakeClient(
+        batches=[
+            FakeSearchResult(messages=[new_msg]),
+            FakeSearchResult(messages=[]),
+        ]
+    )
     shutdown = asyncio.Event()
     await _run_incremental(client, conn, shutdown)
 
-    ids = [
-        r[0] for r in conn.execute(
-            "SELECT message_id FROM messages WHERE out = 1 ORDER BY message_id"
-        ).fetchall()
-    ]
+    ids = [r[0] for r in conn.execute("SELECT message_id FROM messages WHERE out = 1 ORDER BY message_id").fetchall()]
     assert ids == [50, 51]
 
 
@@ -181,9 +184,7 @@ async def test_incremental_skipped_before_backfill_complete(tmp_path):
     client = _FakeClient(batches=[FakeSearchResult(messages=[_msg(100, 42, 1_700_000_000)])])
     shutdown = asyncio.Event()
     await _run_incremental(client, conn, shutdown)
-    count = conn.execute(
-        "SELECT COUNT(*) FROM messages WHERE out = 1"
-    ).fetchone()[0]
+    count = conn.execute("SELECT COUNT(*) FROM messages WHERE out = 1").fetchone()[0]
     assert count == 0
     assert client.calls == 0
 
@@ -198,9 +199,7 @@ async def test_incremental_skipped_when_messages_empty(tmp_path):
     client = _FakeClient(batches=[FakeSearchResult(messages=[_msg(100, 42, 1_700_000_000)])])
     shutdown = asyncio.Event()
     await _run_incremental(client, conn, shutdown)
-    count = conn.execute(
-        "SELECT COUNT(*) FROM messages WHERE out = 1"
-    ).fetchone()[0]
+    count = conn.execute("SELECT COUNT(*) FROM messages WHERE out = 1").fetchone()[0]
     assert count == 0
     assert client.calls == 0
 
@@ -227,15 +226,15 @@ async def test_backfill_enrolls_dialog_as_own_only(tmp_path):
     """After backfill writes a message in dialog 42, synced_dialogs has (42, 'own_only')."""
     conn = _make_db(tmp_path)
     m1 = _msg(100, 42, 1_700_000_100)
-    client = _FakeClient(batches=[
-        FakeSearchResult(messages=[m1]),
-        FakeSearchResult(messages=[]),
-    ])
+    client = _FakeClient(
+        batches=[
+            FakeSearchResult(messages=[m1]),
+            FakeSearchResult(messages=[]),
+        ]
+    )
     shutdown = asyncio.Event()
     await _run_backfill(client, conn, shutdown)
-    status = conn.execute(
-        "SELECT status FROM synced_dialogs WHERE dialog_id = 42"
-    ).fetchone()
+    status = conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id = 42").fetchone()
     assert status is not None, "dialog 42 must be enrolled after backfill"
     assert status[0] == "own_only"
 
@@ -250,18 +249,16 @@ async def test_backfill_does_not_downgrade_synced_dialog(tmp_path):
             (42,),
         )
     m1 = _msg(100, 42, 1_700_000_100)
-    client = _FakeClient(batches=[
-        FakeSearchResult(messages=[m1]),
-        FakeSearchResult(messages=[]),
-    ])
+    client = _FakeClient(
+        batches=[
+            FakeSearchResult(messages=[m1]),
+            FakeSearchResult(messages=[]),
+        ]
+    )
     shutdown = asyncio.Event()
     await _run_backfill(client, conn, shutdown)
-    status = conn.execute(
-        "SELECT status FROM synced_dialogs WHERE dialog_id = 42"
-    ).fetchone()[0]
-    assert status == "synced", (
-        "INSERT OR IGNORE must preserve higher-status row — never downgrade to 'own_only'"
-    )
+    status = conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id = 42").fetchone()[0]
+    assert status == "synced", "INSERT OR IGNORE must preserve higher-status row — never downgrade to 'own_only'"
 
 
 @pytest.mark.asyncio
@@ -288,8 +285,9 @@ async def test_incremental_anchor_ignores_higher_id_out0_row(tmp_path):
     conn = _make_db(tmp_path)
     with conn:
         conn.execute("UPDATE activity_sync_state SET value='1' WHERE key='backfill_complete'")
-        conn.execute("INSERT OR REPLACE INTO activity_sync_state (key, value) VALUES ('last_sync_at', ?)",
-                     (str(anchor_ts),))
+        conn.execute(
+            "INSERT OR REPLACE INTO activity_sync_state (key, value) VALUES ('last_sync_at', ?)", (str(anchor_ts),)
+        )
         # Seed an old own-message in dialog 42.
         conn.execute(
             "INSERT INTO messages "
@@ -306,29 +304,22 @@ async def test_incremental_anchor_ignores_higher_id_out0_row(tmp_path):
         )
     # New own-message in dialog 99 with message_id=3 (low per-chat id, newer by date).
     # Old min_id logic would skip it (3 < 50). Timestamp logic must find it.
-    client = _FakeClient(batches=[
-        FakeSearchResult(messages=[_msg(3, 99, anchor_ts + 100)]),
-        FakeSearchResult(messages=[]),
-    ])
+    client = _FakeClient(
+        batches=[
+            FakeSearchResult(messages=[_msg(3, 99, anchor_ts + 100)]),
+            FakeSearchResult(messages=[]),
+        ]
+    )
     shutdown = asyncio.Event()
     await _run_incremental(client, conn, shutdown)
-    own_ids = sorted(
-        r[0] for r in conn.execute(
-            "SELECT message_id FROM messages WHERE out = 1"
-        ).fetchall()
-    )
-    assert own_ids == [3, 50], (
-        f"Incremental must capture id=3 from dialog 99 despite low per-chat id; got {own_ids}"
-    )
-    decoy_still_present = conn.execute(
-        "SELECT out FROM messages WHERE dialog_id=42 AND message_id=99999"
-    ).fetchone()
-    assert decoy_still_present is not None and decoy_still_present[0] == 0, (
-        "Incoming row must remain unchanged"
-    )
+    own_ids = sorted(r[0] for r in conn.execute("SELECT message_id FROM messages WHERE out = 1").fetchall())
+    assert own_ids == [3, 50], f"Incremental must capture id=3 from dialog 99 despite low per-chat id; got {own_ids}"
+    decoy_still_present = conn.execute("SELECT out FROM messages WHERE dialog_id=42 AND message_id=99999").fetchone()
+    assert decoy_still_present is not None and decoy_still_present[0] == 0, "Incoming row must remain unchanged"
 
 
 # -- D-02: SearchRequest RPC timeout tests -----------------------------------
+
 
 @pytest.mark.asyncio
 async def test_run_incremental_search_request_timeout(tmp_path, caplog):
@@ -364,9 +355,7 @@ async def test_run_incremental_search_request_timeout(tmp_path, caplog):
 
     # last_sync_at must have been advanced
     state = dict(conn.execute("SELECT key, value FROM activity_sync_state").fetchall())
-    assert state["last_sync_at"] != str(anchor_ts), (
-        "last_sync_at must be advanced after RPC timeout"
-    )
+    assert state["last_sync_at"] != str(anchor_ts), "last_sync_at must be advanced after RPC timeout"
 
     timeout_logs = [r for r in caplog.records if "activity_sync_rpc_timeout" in r.getMessage()]
     assert len(timeout_logs) >= 1, (
@@ -399,13 +388,9 @@ async def test_run_backfill_search_request_timeout(tmp_path, caplog):
 
     # backfill_offset_id must not be corrupted (still 0 / initial value)
     state = dict(conn.execute("SELECT key, value FROM activity_sync_state").fetchall())
-    assert state.get("backfill_complete") != "1", (
-        "backfill must NOT be marked complete after a timeout"
-    )
+    assert state.get("backfill_complete") != "1", "backfill must NOT be marked complete after a timeout"
 
-    timeout_logs = [
-        r for r in caplog.records if "activity_sync_backfill_rpc_timeout" in r.getMessage()
-    ]
+    timeout_logs = [r for r in caplog.records if "activity_sync_backfill_rpc_timeout" in r.getMessage()]
     assert len(timeout_logs) >= 1, (
         f"Expected 'activity_sync_backfill_rpc_timeout' log; got: {[r.getMessage() for r in caplog.records]}"
     )

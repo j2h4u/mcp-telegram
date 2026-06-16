@@ -561,7 +561,7 @@ _FETCH_UNREAD_MESSAGES_SQL = (
     f"{EFFECTIVE_SENDER_ID_SQL}, m.is_service, m.out, m.dialog_id "
     f"FROM messages m "
     f"{_SENDER_ENTITY_JOINS_SQL}"
-    f'WHERE m.dialog_id = :dialog_id AND m.message_id > :after_msg_id AND m.is_deleted = 0 '
+    f"WHERE m.dialog_id = :dialog_id AND m.message_id > :after_msg_id AND m.is_deleted = 0 "
     f'AND m."out" = 0 AND m.is_service = 0 '
     f"ORDER BY m.message_id ASC LIMIT :limit"
 )
@@ -586,13 +586,8 @@ _ALL_ENTITY_NAMES_NORMALIZED_SQL = (
     "AND ((type IN ('User', 'Bot') AND updated_at >= ?) "  # PascalCase per ListDialogs type vocabulary
     "OR (type NOT IN ('User', 'Bot') AND updated_at >= ?))"
 )
-_ENTITY_BY_USERNAME_SQL = (
-    "SELECT id, name, username, name_normalized FROM entities "
-    "WHERE username = ? COLLATE NOCASE"
-)
-_TRACE_ACCOUNT_BY_ID_SQL = (
-    "SELECT id, name, username, name_normalized FROM entities WHERE id = ?"
-)
+_ENTITY_BY_USERNAME_SQL = "SELECT id, name, username, name_normalized FROM entities WHERE username = ? COLLATE NOCASE"
+_TRACE_ACCOUNT_BY_ID_SQL = "SELECT id, name, username, name_normalized FROM entities WHERE id = ?"
 _TRACE_ACCOUNT_NAMES_SQL = (
     "SELECT id, name FROM entities "
     "WHERE id > 0 AND name IS NOT NULL "
@@ -876,9 +871,7 @@ def _build_trace_coverage(
     else:
         access_lost_dialogs = {
             int(row[0])
-            for row in conn.execute(
-                "SELECT dialog_id FROM synced_dialogs WHERE status = 'access_lost'"
-            ).fetchall()
+            for row in conn.execute("SELECT dialog_id FROM synced_dialogs WHERE status = 'access_lost'").fetchall()
         }
         considered_dialogs = observed_dialogs | fragment_dialogs | access_lost_dialogs
         basis = "evidence_or_fragments_or_access_lost" if considered_dialogs else "none"
@@ -962,9 +955,7 @@ def _build_trace_gaps(
     elif coverage.get("dialogs_considered", 0):
         considered_dialogs.update(
             int(row[0])
-            for row in conn.execute(
-                "SELECT dialog_id FROM synced_dialogs WHERE status = 'access_lost'"
-            ).fetchall()
+            for row in conn.execute("SELECT dialog_id FROM synced_dialogs WHERE status = 'access_lost'").fetchall()
         )
 
     status_by_dialog = _dialog_status_map(conn, considered_dialogs)
@@ -1176,7 +1167,7 @@ def _trace_common_chat_ids(conn: sqlite3.Connection, target_user_id: int) -> lis
             continue
         try:
             ids.append(int(raw_id))
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             continue
     return ids
 
@@ -1302,10 +1293,7 @@ def _trace_existing_message_bundle(
     if row is None:
         return None
     return {
-        "message": {
-            field: row[index]
-            for index, field in enumerate(_TRACE_MESSAGE_COMPARE_FIELDS)
-        },
+        "message": {field: row[index] for index, field in enumerate(_TRACE_MESSAGE_COMPARE_FIELDS)},
         "reactions": sorted(
             tuple(item)
             for item in conn.execute(
@@ -1359,17 +1347,11 @@ def _messages_row_equal(existing: dict | None, candidate: ExtractedMessage) -> b
         if existing_message.get(field) != candidate_message.get(field):
             return False
 
-    candidate_reactions = sorted(
-        (item.emoji, item.count)
-        for item in candidate.reactions
-    )
+    candidate_reactions = sorted((item.emoji, item.count) for item in candidate.reactions)
     if existing.get("reactions", []) != candidate_reactions:
         return False
 
-    candidate_entities = sorted(
-        (item.offset, item.length, item.type, item.value)
-        for item in candidate.entities
-    )
+    candidate_entities = sorted((item.offset, item.length, item.type, item.value) for item in candidate.entities)
     if existing.get("entities", []) != candidate_entities:
         return False
 
@@ -1482,19 +1464,14 @@ def _assert_select_columns_match_read_message() -> None:
     ReadMessage fields except the two injected post-query fields."""
     from dataclasses import fields as dc_fields
 
-    expected = frozenset(
-        f.name for f in dc_fields(ReadMessage)
-        if f.name not in {"reactions_display", "dialog_name"}
-    )
+    expected = frozenset(f.name for f in dc_fields(ReadMessage) if f.name not in {"reactions_display", "dialog_name"})
     # Match both `... AS alias` forms and bare table-qualified refs (`m.col`, `mf.col`)
     aliases = frozenset(re.findall(r"\bAS\s+(\w+)", _LIST_MESSAGES_BASE_SQL))
     bare = frozenset(re.findall(r"\b(?:m|mf)\.(\w+)\b", _LIST_MESSAGES_BASE_SQL))
     found = aliases | bare
     missing = expected - found
     extra = found - expected
-    assert not missing and not extra, (
-        f"SELECT/ReadMessage field mismatch — missing: {missing}, extra: {extra}"
-    )
+    assert not missing and not extra, f"SELECT/ReadMessage field mismatch — missing: {missing}, extra: {extra}"
 
 
 _assert_select_columns_match_read_message()
@@ -1817,8 +1794,7 @@ class DaemonAPIServer:
         _fetch_group_detail in Plan 03 to compute contacts_subscribed.
         """
         rows = self._conn.execute(
-            "SELECT dialog_id FROM synced_dialogs "
-            "WHERE dialog_id > 0 AND status != 'access_lost'"
+            "SELECT dialog_id FROM synced_dialogs WHERE dialog_id > 0 AND status != 'access_lost'"
         ).fetchall()
         return {row[0] for row in rows}
 
@@ -1888,7 +1864,7 @@ class DaemonAPIServer:
                 encoded = json.dumps(response).encode() + b"\n"
                 writer.write(encoded)
                 await writer.drain()
-        except (ConnectionResetError, BrokenPipeError):
+        except ConnectionResetError, BrokenPipeError:
             # MCP client (or healthcheck) disconnected before we finished
             # writing the response — expected on tool-call timeouts and
             # short-lived health probes. Don't log a stack trace.
@@ -2226,7 +2202,7 @@ class DaemonAPIServer:
 
         try:
             limit = _clamp(int(req.get("limit", 100)), 1, 500)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             limit = 100
 
         identity_rows, has_more_identity = self._source_rows_after_identity_cursor(cursor_key, limit)
@@ -2299,11 +2275,11 @@ class DaemonAPIServer:
 
         try:
             before = _clamp(int(req.get("before", 0)), 0, 50)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             before = 0
         try:
             after = _clamp(int(req.get("after", 0)), 0, 50)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             after = 0
 
         target = self._conn.execute(
@@ -2404,7 +2380,7 @@ class DaemonAPIServer:
         try:
             entity = await self._client.get_entity(dialog)
             return int(telethon_utils.get_peer_id(entity))
-        except (ValueError, KeyError):
+        except ValueError, KeyError:
             pass
         except Exception:
             logger.debug("get_entity failed for %r, falling back to entities DB", dialog, exc_info=True)
@@ -2572,11 +2548,7 @@ class DaemonAPIServer:
             }
         if isinstance(result, Candidates):
             candidate_ids = [int(match["entity_id"]) for match in result.matches]
-            display_aliases = [
-                str(match["display_name"])
-                for match in result.matches
-                if match.get("display_name")
-            ]
+            display_aliases = [str(match["display_name"]) for match in result.matches if match.get("display_name")]
             return _unresolved_trace_account(
                 query=query,
                 resolution_source="entities_fuzzy_candidates",
@@ -2888,16 +2860,16 @@ class DaemonAPIServer:
         messages = [
             ReadMessage(
                 **dict(r),
-                reactions_display=format_reaction_counts(reaction_map[r["message_id"]]) if r["message_id"] in reaction_map else "",
+                reactions_display=format_reaction_counts(reaction_map[r["message_id"]])
+                if r["message_id"] in reaction_map
+                else "",
             )
             for r in rows
         ]
         # Phase 39: observability counter. Emit ONCE on the sync.db success path.
         # Non-sync.db branches (Telegram fallback/error) intentionally do not emit this line.
         null_sender_rows = sum(1 for m in messages if m.sender_id is None)
-        unresolved_entity_rows = sum(
-            1 for m in messages if m.sender_id is not None and m.sender_first_name is None
-        )
+        unresolved_entity_rows = sum(1 for m in messages if m.sender_id is not None and m.sender_first_name is None)
         logger.info(
             "list_messages rendered",
             extra={
@@ -2916,7 +2888,11 @@ class DaemonAPIServer:
         )
         return {
             "ok": True,
-            "data": {"messages": [dataclasses.asdict(m) for m in messages], "source": "sync_db", "next_navigation": next_nav},
+            "data": {
+                "messages": [dataclasses.asdict(m) for m in messages],
+                "source": "sync_db",
+                "next_navigation": next_nav,
+            },
         }
 
     @staticmethod
@@ -3346,9 +3322,10 @@ class DaemonAPIServer:
         linked_chat_map: dict[int, int] = {}
         if exact_dialog_id is not None:
             meta = _trace_dialog_metadata(self._conn, exact_dialog_id)
-            if _trace_strategy_for_dialog(
-                meta["dialog_type"], status=meta["status"], hidden=bool(meta["hidden"])
-            ) == "signature_only":
+            if (
+                _trace_strategy_for_dialog(meta["dialog_type"], status=meta["status"], hidden=bool(meta["hidden"]))
+                == "signature_only"
+            ):
                 resolution = await resolve_linked_chat_id(self._client, self._conn, exact_dialog_id)
                 if resolution.flood_wait_seconds is None and resolution.linked_chat_id is not None:
                     linked_chat_id_resolved = resolution.linked_chat_id
@@ -3525,15 +3502,15 @@ class DaemonAPIServer:
         messages = [
             ReadMessage(
                 **dict(r),
-                reactions_display=format_reaction_counts(reaction_map[r["message_id"]]) if r["message_id"] in reaction_map else "",
+                reactions_display=format_reaction_counts(reaction_map[r["message_id"]])
+                if r["message_id"] in reaction_map
+                else "",
             )
             for r in rows
         ]
         # Phase 39: observability counter — mirror main path so anchor branch is not a blind spot.
         null_sender_rows = sum(1 for m in messages if m.sender_id is None)
-        unresolved_entity_rows = sum(
-            1 for m in messages if m.sender_id is not None and m.sender_first_name is None
-        )
+        unresolved_entity_rows = sum(1 for m in messages if m.sender_id is not None and m.sender_first_name is None)
         logger.info(
             "list_messages rendered",
             extra={
@@ -3871,7 +3848,12 @@ class DaemonAPIServer:
                     await self._freshen_reactions_if_stale(dialog_id, dialog_id, msg_ids)
                 reaction_map = _fetch_reaction_counts(self._conn, dialog_id, msg_ids)
                 messages = [
-                    ReadMessage(**dict(r), reactions_display=format_reaction_counts(reaction_map[r["message_id"]]) if r["message_id"] in reaction_map else "")
+                    ReadMessage(
+                        **dict(r),
+                        reactions_display=format_reaction_counts(reaction_map[r["message_id"]])
+                        if r["message_id"] in reaction_map
+                        else "",
+                    )
                     for r in rows
                 ]
             else:
@@ -3964,12 +3946,7 @@ class DaemonAPIServer:
                 filter_norm = latinize(stripped)
                 if stripped.isascii():
                     # Escape LIKE-special chars before wrapping in %...%
-                    esc = (
-                        stripped.lower()
-                        .replace("\\", "\\\\")
-                        .replace("%", "\\%")
-                        .replace("_", "\\_")
-                    )
+                    esc = stripped.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
                     name_pat = f"%{esc}%"
                 # else: Cyrillic — leave name_pat=None, Python pass handles it
 
@@ -4009,16 +3986,22 @@ class DaemonAPIServer:
         if not sql_rows:
             count_total = self._conn.execute("SELECT COUNT(*) FROM dialogs").fetchone()[0]
             if count_total == 0:
-                return {"ok": True, "data": {
+                return {
+                    "ok": True,
+                    "data": {
+                        "dialogs": [],
+                        "snapshot_age_h": None,
+                        "bootstrap_pending": True,
+                    },
+                }
+            return {
+                "ok": True,
+                "data": {
                     "dialogs": [],
                     "snapshot_age_h": None,
-                    "bootstrap_pending": True,
-                }}
-            return {"ok": True, "data": {
-                "dialogs": [],
-                "snapshot_age_h": None,
-                "bootstrap_pending": False,
-            }}
+                    "bootstrap_pending": False,
+                },
+            }
 
         # -- build result list ------------------------------------------------
         dialogs: list[dict] = []
@@ -4026,10 +4009,21 @@ class DaemonAPIServer:
 
         for sql_row in sql_rows:
             (
-                d_id, d_name, d_type, _d_archived, _d_pinned,
-                d_members, d_created, d_last_at, d_snapshot_at,
-                d_mentions, d_reactions, d_draft,
-                sd_status, sd_total, sd_access_lost,
+                d_id,
+                d_name,
+                d_type,
+                _d_archived,
+                _d_pinned,
+                d_members,
+                d_created,
+                d_last_at,
+                d_snapshot_at,
+                d_mentions,
+                d_reactions,
+                d_draft,
+                sd_status,
+                sd_total,
+                sd_access_lost,
             ) = sql_row
 
             # -- Python fuzzy filter (Pass 2) ---------------------------------
@@ -4050,9 +4044,7 @@ class DaemonAPIServer:
                 elif 2 <= len(filter_raw_lc) <= 4 and filter_raw_lc in name_initials_raw:
                     pass  # acronym hit ("ЖС" -> "жс" ⊆ "kxжс")
                 elif (
-                    len(filter_norm) >= 4
-                    and len(name_norm) >= 4
-                    and _fuzz.partial_ratio(filter_norm, name_norm) >= 75
+                    len(filter_norm) >= 4 and len(name_norm) >= 4 and _fuzz.partial_ratio(filter_norm, name_norm) >= 75
                 ):
                     pass  # typo-tolerant fuzzy hit
                 else:
@@ -4093,11 +4085,14 @@ class DaemonAPIServer:
             dialogs.append(row)
 
         snapshot_age_h = _compute_snapshot_age_h(max_snapshot)
-        return {"ok": True, "data": {
-            "dialogs": dialogs,
-            "snapshot_age_h": snapshot_age_h,
-            "bootstrap_pending": False,
-        }}
+        return {
+            "ok": True,
+            "data": {
+                "dialogs": dialogs,
+                "snapshot_age_h": snapshot_age_h,
+                "bootstrap_pending": False,
+            },
+        }
 
     # ------------------------------------------------------------------
     # list_topics
@@ -4362,7 +4357,9 @@ class DaemonAPIServer:
         except sqlite3.OperationalError as exc:
             logger.warning(
                 "entity_info db_read_failed entity_id=%r error=%s%s",
-                entity_id, exc, _rid(),
+                entity_id,
+                exc,
+                _rid(),
             )
             return {
                 "ok": False,
@@ -4380,7 +4377,8 @@ class DaemonAPIServer:
                 except json.JSONDecodeError:
                     logger.warning(
                         "entity_info detail_json_corrupt entity_id=%r%s — treating as cache miss",
-                        entity_id, _rid(),
+                        entity_id,
+                        _rid(),
                     )
                     detail = None
                 if detail is not None and detail.get("schema") == _ENTITY_DETAIL_SCHEMA_VERSION:
@@ -4393,7 +4391,9 @@ class DaemonAPIServer:
         except (ValueError, KeyError) as exc:
             logger.warning(
                 "entity_info entity_not_found entity_id=%r error=%s%s",
-                entity_id, exc, _rid(),
+                entity_id,
+                exc,
+                _rid(),
             )
             return {
                 "ok": False,
@@ -4404,7 +4404,10 @@ class DaemonAPIServer:
         except Exception as exc:
             logger.warning(
                 "entity_info get_entity_failed entity_id=%r error=%s%s",
-                entity_id, exc, _rid(), exc_info=True,
+                entity_id,
+                exc,
+                _rid(),
+                exc_info=True,
             )
             return {
                 "ok": False,
@@ -4446,8 +4449,7 @@ class DaemonAPIServer:
         full_fetch_ok = detail.pop("_full_fetch_ok", True)
         try:
             self._conn.execute(
-                "INSERT OR IGNORE INTO entities (id, type, name, username, updated_at) "
-                "VALUES (?, ?, ?, ?, ?)",
+                "INSERT OR IGNORE INTO entities (id, type, name, username, updated_at) VALUES (?, ?, ?, ?, ?)",
                 (
                     entity_id,
                     detail.get("type", "unknown"),
@@ -4459,15 +4461,17 @@ class DaemonAPIServer:
             if full_fetch_ok:
                 payload_with_schema = {"schema": _ENTITY_DETAIL_SCHEMA_VERSION, **detail}
                 self._conn.execute(
-                    "INSERT OR REPLACE INTO entity_details (entity_id, detail_json, fetched_at) "
-                    "VALUES (?, ?, ?)",
+                    "INSERT OR REPLACE INTO entity_details (entity_id, detail_json, fetched_at) VALUES (?, ?, ?)",
                     (entity_id, json.dumps(payload_with_schema), now),
                 )
             self._conn.commit()
         except sqlite3.OperationalError as exc:
             logger.warning(
                 "entity_info db_writeback_failed entity_id=%r error=%s%s",
-                entity_id, exc, _rid(), exc_info=True,
+                entity_id,
+                exc,
+                _rid(),
+                exc_info=True,
             )
             # Continue: still return the live data even if cache write failed.
 
@@ -4510,15 +4514,20 @@ class DaemonAPIServer:
                     chat_type = "group"
                 else:
                     chat_type = "user"
-                common_chats.append({
-                    "id": int(telethon_utils.get_peer_id(chat)),
-                    "name": getattr(chat, "title", None) or str(chat.id),
-                    "type": chat_type,
-                })
+                common_chats.append(
+                    {
+                        "id": int(telethon_utils.get_peer_id(chat)),
+                        "name": getattr(chat, "title", None) or str(chat.id),
+                        "type": chat_type,
+                    }
+                )
         except Exception as exc:
             logger.warning(
                 "entity_info user common_chats_failed user_id=%r error=%s%s",
-                user_id, exc, _rid(), exc_info=True,
+                user_id,
+                exc,
+                _rid(),
+                exc_info=True,
             )
 
         # --- GetFullUserRequest body — verbatim from old _fetch_user_detail ---
@@ -4556,10 +4565,12 @@ class DaemonAPIServer:
             if raw_bot_info is not None:
                 commands = []
                 for cmd in getattr(raw_bot_info, "commands", None) or []:
-                    commands.append({
-                        "command": getattr(cmd, "command", ""),
-                        "description": getattr(cmd, "description", ""),
-                    })
+                    commands.append(
+                        {
+                            "command": getattr(cmd, "command", ""),
+                            "description": getattr(cmd, "description", ""),
+                        }
+                    )
                 bot_info = {
                     "description": getattr(raw_bot_info, "description", None) or None,
                     "commands": commands,
@@ -4588,7 +4599,10 @@ class DaemonAPIServer:
         except Exception as exc:
             logger.warning(
                 "entity_info user full_user_failed user_id=%r error=%s%s",
-                user_id, exc, _rid(), exc_info=True,
+                user_id,
+                exc,
+                _rid(),
+                exc_info=True,
             )
 
         # --- folder name resolution (verbatim from old _fetch_user_detail) ---
@@ -4604,7 +4618,10 @@ class DaemonAPIServer:
             except Exception as exc:
                 logger.warning(
                     "entity_info user folder_resolve_failed folder_id=%r error=%s%s",
-                    folder_id, exc, _rid(), exc_info=True,
+                    folder_id,
+                    exc,
+                    _rid(),
+                    exc_info=True,
                 )
 
         # --- extra usernames + emoji status + restriction reason (verbatim) ---
@@ -4619,34 +4636,39 @@ class DaemonAPIServer:
             emoji_status_id = getattr(emoji_status, "document_id", None)
         restriction_reason: list[dict] = []
         for rr in getattr(user, "restriction_reason", None) or []:
-            restriction_reason.append({
-                "platform": getattr(rr, "platform", None),
-                "reason": getattr(rr, "reason", None),
-                "text": getattr(rr, "text", None),
-            })
+            restriction_reason.append(
+                {
+                    "platform": getattr(rr, "platform", None),
+                    "reason": getattr(rr, "reason", None),
+                    "text": getattr(rr, "text", None),
+                }
+            )
 
         # --- avatar_history + avatar_count (rename from `photos`; SPEC Req 10 —
         #     no file_id / file_reference / download_*) ---
         avatar_history: list[dict] = []
         avatar_count: int = 0
         try:
-            photos_result = await self._client(
-                GetUserPhotosRequest(user_id=user, offset=0, max_id=0, limit=100)
-            )
+            photos_result = await self._client(GetUserPhotosRequest(user_id=user, offset=0, max_id=0, limit=100))
             avatar_count = int(getattr(photos_result, "count", len(getattr(photos_result, "photos", []))))
             for photo in getattr(photos_result, "photos", []):
                 photo_id = getattr(photo, "id", None)
                 photo_date = getattr(photo, "date", None)
                 if photo_id is None or photo_date is None:
                     continue
-                avatar_history.append({
-                    "photo_id": int(photo_id),
-                    "date": photo_date.isoformat(),
-                })
+                avatar_history.append(
+                    {
+                        "photo_id": int(photo_id),
+                        "date": photo_date.isoformat(),
+                    }
+                )
         except Exception as exc:
             logger.warning(
                 "entity_info user photos_failed user_id=%r error=%s%s",
-                user_id, exc, _rid(), exc_info=True,
+                user_id,
+                exc,
+                _rid(),
+                exc_info=True,
             )
 
         # --- common-envelope fields (D-06) ---
@@ -4742,15 +4764,22 @@ class DaemonAPIServer:
         # being short-circuited by it.
         search_failed = False
         try:
-            search_result = await self._client(MessagesSearchRequest(
-                peer=peer,
-                q="",
-                filter=InputMessagesFilterChatPhotos(),
-                min_date=None, max_date=None,
-                offset_id=0, add_offset=0, limit=100,
-                max_id=0, min_id=0, hash=0,
-                from_id=None,
-            ))
+            search_result = await self._client(
+                MessagesSearchRequest(
+                    peer=peer,
+                    q="",
+                    filter=InputMessagesFilterChatPhotos(),
+                    min_date=None,
+                    max_date=None,
+                    offset_id=0,
+                    add_offset=0,
+                    limit=100,
+                    max_id=0,
+                    min_id=0,
+                    hash=0,
+                    from_id=None,
+                )
+            )
             avatar_count = int(getattr(search_result, "count", len(getattr(search_result, "messages", []))))
             for msg in getattr(search_result, "messages", []):
                 action = getattr(msg, "action", None)
@@ -4758,28 +4787,33 @@ class DaemonAPIServer:
                     photo = getattr(action, "photo", None)
                     photo_date = getattr(msg, "date", None)
                     if photo is not None and photo_date is not None and getattr(photo, "id", None) is not None:
-                        avatar_history.append({
-                            "photo_id": int(photo.id),
-                            "date": photo_date.isoformat(),
-                        })
+                        avatar_history.append(
+                            {
+                                "photo_id": int(photo.id),
+                                "date": photo_date.isoformat(),
+                            }
+                        )
         except Exception as exc:
             search_failed = True
             logger.warning(
                 "entity_info avatar_search_failed peer_id=%r error=%s%s",
-                peer_id, exc, _rid(),
+                peer_id,
+                exc,
+                _rid(),
             )
 
         # D-19 reconciliation: prepend full.chat_photo if it's missing from search.
         chat_photo = getattr(full_chat, "chat_photo", None) if full_chat is not None else None
         current_photo_id = getattr(chat_photo, "id", None) if chat_photo is not None else None
-        if current_photo_id is not None and not any(
-            p["photo_id"] == int(current_photo_id) for p in avatar_history
-        ):
+        if current_photo_id is not None and not any(p["photo_id"] == int(current_photo_id) for p in avatar_history):
             chat_photo_date = getattr(chat_photo, "date", None)
-            avatar_history.insert(0, {
-                "photo_id": int(current_photo_id),
-                "date": chat_photo_date.isoformat() if chat_photo_date is not None else None,
-            })
+            avatar_history.insert(
+                0,
+                {
+                    "photo_id": int(current_photo_id),
+                    "date": chat_photo_date.isoformat() if chat_photo_date is not None else None,
+                },
+            )
 
         # D-20 fallback (HIGH-3 from 47-REVIEWS.md cycle 3 — re-ordered): runs
         # whenever the search raised, regardless of whether D-19 just inserted
@@ -4799,10 +4833,12 @@ class DaemonAPIServer:
         # Same surface as before the fix.
         if not avatar_history and current_photo_id is not None:
             chat_photo_date = getattr(chat_photo, "date", None)
-            avatar_history = [{
-                "photo_id": int(current_photo_id),
-                "date": chat_photo_date.isoformat() if chat_photo_date is not None else None,
-            }]
+            avatar_history = [
+                {
+                    "photo_id": int(current_photo_id),
+                    "date": chat_photo_date.isoformat() if chat_photo_date is not None else None,
+                }
+            ]
             avatar_count = max(avatar_count, 1)
 
         return avatar_history, avatar_count
@@ -4845,6 +4881,7 @@ class DaemonAPIServer:
                 # Telethon ever returns a peer-form id directly. The util handles both.
                 if linked_chat_id_raw > 0:
                     from telethon.tl.types import PeerChannel  # type: ignore[import-untyped]
+
                     linked_chat_id = int(telethon_utils.get_peer_id(PeerChannel(linked_chat_id_raw)))
                 else:
                     # Already in peer-id form — pass through.
@@ -4869,17 +4906,22 @@ class DaemonAPIServer:
         except Exception as exc:
             logger.warning(
                 "entity_info channel full_channel_failed channel_id=%r error=%s%s",
-                channel_id, exc, _rid(), exc_info=True,
+                channel_id,
+                exc,
+                _rid(),
+                exc_info=True,
             )
 
         # ----- restrictions (from the channel entity itself, mirrors User path) -----
         restrictions: list[dict] = []
         for rr in getattr(channel, "restriction_reason", None) or []:
-            restrictions.append({
-                "platform": getattr(rr, "platform", None),
-                "reason": getattr(rr, "reason", None),
-                "text": getattr(rr, "text", None),
-            })
+            restrictions.append(
+                {
+                    "platform": getattr(rr, "platform", None),
+                    "reason": getattr(rr, "reason", None),
+                    "text": getattr(rr, "text", None),
+                }
+            )
 
         # ----- my_membership: is_admin derived from channel flags -----
         is_creator = bool(getattr(channel, "creator", False))
@@ -4892,14 +4934,25 @@ class DaemonAPIServer:
                 {
                     field: bool(getattr(admin_rights_obj, field, False))
                     for field in (
-                        "change_info", "post_messages", "edit_messages",
-                        "delete_messages", "ban_users", "invite_users",
-                        "pin_messages", "add_admins", "anonymous", "manage_call",
-                        "other", "manage_topics", "post_stories", "edit_stories",
+                        "change_info",
+                        "post_messages",
+                        "edit_messages",
+                        "delete_messages",
+                        "ban_users",
+                        "invite_users",
+                        "pin_messages",
+                        "add_admins",
+                        "anonymous",
+                        "manage_call",
+                        "other",
+                        "manage_topics",
+                        "post_stories",
+                        "edit_stories",
                         "delete_stories",
                     )
                 }
-                if admin_rights_obj is not None else None
+                if admin_rights_obj is not None
+                else None
             ),
         }
 
@@ -4925,11 +4978,15 @@ class DaemonAPIServer:
             # D-15 above-threshold: phone-contacts intersection only.
             # Same pattern as _fetch_supergroup_detail's >1000 branch.
             try:
-                gp_result = await self._client(GetParticipantsRequest(
-                    channel=channel,
-                    filter=ChannelParticipantsContacts(q=""),
-                    offset=0, limit=200, hash=0,
-                ))
+                gp_result = await self._client(
+                    GetParticipantsRequest(
+                        channel=channel,
+                        filter=ChannelParticipantsContacts(q=""),
+                        offset=0,
+                        limit=200,
+                        hash=0,
+                    )
+                )
                 contact_ids = {int(u.id) for u in getattr(gp_result, "users", []) if hasattr(u, "id")}
                 dm_peers = self._dm_peer_ids()
                 intersect_ids = contact_ids & dm_peers
@@ -4943,7 +5000,9 @@ class DaemonAPIServer:
             except Exception as exc:
                 logger.warning(
                     "entity_info channel contacts_enumeration_failed channel_id=%r error=%s%s",
-                    channel_id, exc, _rid(),
+                    channel_id,
+                    exc,
+                    _rid(),
                 )
                 contacts_subscribed = None
                 contacts_reason = "enumeration_failed"
@@ -4968,7 +5027,9 @@ class DaemonAPIServer:
             except Exception as exc:
                 logger.warning(
                     "entity_info channel contacts_enumeration_failed channel_id=%r error=%s%s",
-                    channel_id, exc, _rid(),
+                    channel_id,
+                    exc,
+                    _rid(),
                 )
                 contacts_subscribed = None
                 contacts_reason = "enumeration_failed"
@@ -5065,6 +5126,7 @@ class DaemonAPIServer:
                 # `_fetch_channel_detail`. The string form is brittle.
                 if linked_chat_raw > 0:
                     from telethon.tl.types import PeerChannel  # type: ignore[import-untyped]
+
                     linked_broadcast_id = int(telethon_utils.get_peer_id(PeerChannel(linked_chat_raw)))
                 else:
                     # Already in peer-id form — pass through.
@@ -5075,17 +5137,22 @@ class DaemonAPIServer:
         except Exception as exc:
             logger.warning(
                 "entity_info supergroup full_channel_failed channel_id=%r error=%s%s",
-                channel_id, exc, _rid(), exc_info=True,
+                channel_id,
+                exc,
+                _rid(),
+                exc_info=True,
             )
 
         # ----- restrictions -----
         restrictions: list[dict] = []
         for rr in getattr(channel, "restriction_reason", None) or []:
-            restrictions.append({
-                "platform": getattr(rr, "platform", None),
-                "reason": getattr(rr, "reason", None),
-                "text": getattr(rr, "text", None),
-            })
+            restrictions.append(
+                {
+                    "platform": getattr(rr, "platform", None),
+                    "reason": getattr(rr, "reason", None),
+                    "text": getattr(rr, "text", None),
+                }
+            )
 
         # ----- my_membership -----
         is_creator = bool(getattr(channel, "creator", False))
@@ -5098,14 +5165,25 @@ class DaemonAPIServer:
                 {
                     field: bool(getattr(admin_rights_obj, field, False))
                     for field in (
-                        "change_info", "post_messages", "edit_messages",
-                        "delete_messages", "ban_users", "invite_users",
-                        "pin_messages", "add_admins", "anonymous", "manage_call",
-                        "other", "manage_topics", "post_stories", "edit_stories",
+                        "change_info",
+                        "post_messages",
+                        "edit_messages",
+                        "delete_messages",
+                        "ban_users",
+                        "invite_users",
+                        "pin_messages",
+                        "add_admins",
+                        "anonymous",
+                        "manage_call",
+                        "other",
+                        "manage_topics",
+                        "post_stories",
+                        "edit_stories",
                         "delete_stories",
                     )
                 }
-                if admin_rights_obj is not None else None
+                if admin_rights_obj is not None
+                else None
             ),
         }
 
@@ -5137,11 +5215,15 @@ class DaemonAPIServer:
         elif members_count > 1000:
             # D-15 above-threshold: phone-contacts intersection only.
             try:
-                gp_result = await self._client(GetParticipantsRequest(
-                    channel=channel,
-                    filter=ChannelParticipantsContacts(q=""),
-                    offset=0, limit=200, hash=0,
-                ))
+                gp_result = await self._client(
+                    GetParticipantsRequest(
+                        channel=channel,
+                        filter=ChannelParticipantsContacts(q=""),
+                        offset=0,
+                        limit=200,
+                        hash=0,
+                    )
+                )
                 contact_ids = {int(u.id) for u in getattr(gp_result, "users", []) if hasattr(u, "id")}
                 dm_peers = self._dm_peer_ids()
                 intersect_ids = contact_ids & dm_peers
@@ -5155,7 +5237,10 @@ class DaemonAPIServer:
             except Exception as exc:
                 logger.warning(
                     "entity_info supergroup contacts_filter_failed channel_id=%r error=%s%s",
-                    channel_id, exc, _rid(), exc_info=True,
+                    channel_id,
+                    exc,
+                    _rid(),
+                    exc_info=True,
                 )
                 contacts_subscribed = None
                 contacts_reason = "enumeration_failed"
@@ -5178,7 +5263,10 @@ class DaemonAPIServer:
             except Exception as exc:
                 logger.warning(
                     "entity_info supergroup iter_participants_failed channel_id=%r error=%s%s",
-                    channel_id, exc, _rid(), exc_info=True,
+                    channel_id,
+                    exc,
+                    _rid(),
+                    exc_info=True,
                 )
                 contacts_subscribed = None
                 contacts_reason = "enumeration_failed"
@@ -5234,7 +5322,9 @@ class DaemonAPIServer:
             except Exception as exc:
                 logger.warning(
                     "entity_info group migrated_to_normalize_failed chat_id=%r error=%s%s",
-                    chat_id, exc, _rid(),
+                    chat_id,
+                    exc,
+                    _rid(),
                 )
 
         # ----- GetFullChatRequest -----
@@ -5260,17 +5350,22 @@ class DaemonAPIServer:
         except Exception as exc:
             logger.warning(
                 "entity_info group full_chat_failed chat_id=%r error=%s%s",
-                chat_id, exc, _rid(), exc_info=True,
+                chat_id,
+                exc,
+                _rid(),
+                exc_info=True,
             )
 
         # ----- restrictions -----
         restrictions: list[dict] = []
         for rr in getattr(chat, "restriction_reason", None) or []:
-            restrictions.append({
-                "platform": getattr(rr, "platform", None),
-                "reason": getattr(rr, "reason", None),
-                "text": getattr(rr, "text", None),
-            })
+            restrictions.append(
+                {
+                    "platform": getattr(rr, "platform", None),
+                    "reason": getattr(rr, "reason", None),
+                    "text": getattr(rr, "text", None),
+                }
+            )
 
         # ----- my_membership: legacy chats have a creator flag and admin_rights -----
         is_creator = bool(getattr(chat, "creator", False))
@@ -5283,14 +5378,25 @@ class DaemonAPIServer:
                 {
                     field: bool(getattr(admin_rights_obj, field, False))
                     for field in (
-                        "change_info", "post_messages", "edit_messages",
-                        "delete_messages", "ban_users", "invite_users",
-                        "pin_messages", "add_admins", "anonymous", "manage_call",
-                        "other", "manage_topics", "post_stories", "edit_stories",
+                        "change_info",
+                        "post_messages",
+                        "edit_messages",
+                        "delete_messages",
+                        "ban_users",
+                        "invite_users",
+                        "pin_messages",
+                        "add_admins",
+                        "anonymous",
+                        "manage_call",
+                        "other",
+                        "manage_topics",
+                        "post_stories",
+                        "edit_stories",
                         "delete_stories",
                     )
                 }
-                if admin_rights_obj is not None else None
+                if admin_rights_obj is not None
+                else None
             ),
         }
 
@@ -5302,8 +5408,7 @@ class DaemonAPIServer:
             participant_ids = {
                 int(p_user_id)
                 for p in participants_objs
-                if (p_user_id := getattr(p, "user_id", None)) is not None
-                and int(p_user_id) != 0
+                if (p_user_id := getattr(p, "user_id", None)) is not None and int(p_user_id) != 0
             }
             dm_peers = self._dm_peer_ids()
             intersect_ids = participant_ids & dm_peers
@@ -5311,7 +5416,9 @@ class DaemonAPIServer:
         except Exception as exc:
             logger.warning(
                 "entity_info group contacts_intersect_failed chat_id=%r error=%s%s",
-                chat_id, exc, _rid(),
+                chat_id,
+                exc,
+                _rid(),
             )
             contacts_subscribed = None
             contacts_reason = "enumeration_failed"
@@ -5381,9 +5488,11 @@ class DaemonAPIServer:
         dt = DialogType.parse(category)
         if dt == DialogType.CHANNEL:
             return False
-        if dt in (DialogType.SUPERGROUP, DialogType.GROUP, DialogType.FORUM) and participants_count is not None and participants_count > group_size_threshold:  # noqa: SIM103
-            return False
-        return True
+        return not (
+            dt in (DialogType.SUPERGROUP, DialogType.GROUP, DialogType.FORUM)
+            and participants_count is not None
+            and participants_count > group_size_threshold
+        )
 
     async def _collect_unread_dialogs(self, scope: str, group_size_threshold: int) -> tuple[list[dict], dict[int, int]]:
         """Return unread dialog entries from sync.db. Zero Telegram API calls.
@@ -5487,7 +5596,12 @@ class DaemonAPIServer:
                 await self._freshen_reactions_if_stale(chat_id, chat_id, msg_ids)
                 reaction_map = _fetch_reaction_counts(self._conn, chat_id, msg_ids)
                 group_messages = [
-                    ReadMessage(**dict(r), reactions_display=format_reaction_counts(reaction_map[r["message_id"]]) if r["message_id"] in reaction_map else "")
+                    ReadMessage(
+                        **dict(r),
+                        reactions_display=format_reaction_counts(reaction_map[r["message_id"]])
+                        if r["message_id"] in reaction_map
+                        else "",
+                    )
                     for r in rows
                 ]
             else:
@@ -5674,8 +5788,7 @@ class DaemonAPIServer:
 
         try:
             cur = self._feedback_conn.execute(
-                "UPDATE feedback SET status = ?, status_changed_at = ?, "
-                "status_comment = ? WHERE id = ?",
+                "UPDATE feedback SET status = ?, status_changed_at = ?, status_comment = ? WHERE id = ?",
                 (status, int(time.time()), reason, feedback_id),
             )
             if cur.rowcount == 0:
@@ -5694,9 +5807,7 @@ class DaemonAPIServer:
             # status` UX needs to echo the canonical row state.
             return {
                 "ok": True,
-                "data": {
-                    "message": f"Feedback {feedback_id} status set to '{status}'."
-                },
+                "data": {"message": f"Feedback {feedback_id} status set to '{status}'."},
             }
         except Exception as exc:
             logger.error("update_feedback_status failed: %s", exc, exc_info=True)
@@ -5793,9 +5904,7 @@ class DaemonAPIServer:
     # _fetch_fragment_context (helper for _list_messages fragment branch)
     # ------------------------------------------------------------------
 
-    async def _fetch_fragment_context(
-        self, dialog_id: int, anchor_message_id: int
-    ) -> bool:
+    async def _fetch_fragment_context(self, dialog_id: int, anchor_message_id: int) -> bool:
         """Targeted getMessages around an anchor; caches into messages table.
 
         Per D-08: default context window is 5 messages AFTER the anchor.
@@ -5815,7 +5924,9 @@ class DaemonAPIServer:
         except Exception:
             logger.warning(
                 "fragment_fetch_failed dialog_id=%s anchor=%s",
-                dialog_id, anchor_message_id, exc_info=True,
+                dialog_id,
+                anchor_message_id,
+                exc_info=True,
             )
             return False
 
@@ -5914,14 +6025,14 @@ class DaemonAPIServer:
         since_hours_raw = req.get("since_hours", 168)
         try:
             since_hours = int(since_hours_raw)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             since_hours = 168
         since_hours = max(1, min(8760, since_hours))
 
         limit_raw = req.get("limit", 500)
         try:
             limit = int(limit_raw)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             limit = 500
         limit = max(1, min(2000, limit))
 
@@ -6003,9 +6114,7 @@ class DaemonAPIServer:
             query_params,
         ).fetchall()
 
-        state_rows = dict(
-            self._conn.execute("SELECT key, value FROM activity_sync_state").fetchall()
-        )
+        state_rows = dict(self._conn.execute("SELECT key, value FROM activity_sync_state").fetchall())
         backfill_complete = state_rows.get("backfill_complete") == "1"
         backfill_started = state_rows.get("backfill_started_at") is not None
         last_sync_at_str = state_rows.get("last_sync_at")
@@ -6030,9 +6139,7 @@ class DaemonAPIServer:
                 f"ORDER BY count DESC",
                 rx_params,
             ).fetchall():
-                reactions_by_msg.setdefault((rx[0], rx[1]), []).append(
-                    {"emoji": rx[2], "count": rx[3]}
-                )
+                reactions_by_msg.setdefault((rx[0], rx[1]), []).append({"emoji": rx[2], "count": rx[3]})
 
         comments = [
             {

@@ -312,9 +312,20 @@ def _seed_dialog_row(
         "last_message_at, snapshot_at, hidden, needs_refresh, unread_mentions_count, "
         "unread_reactions_count, draft_text) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
-            dialog_id, name, type_, archived, pinned, members, created,
-            last_message_at, snapshot_at, hidden, needs_refresh,
-            unread_mentions_count, unread_reactions_count, draft_text,
+            dialog_id,
+            name,
+            type_,
+            archived,
+            pinned,
+            members,
+            created,
+            last_message_at,
+            snapshot_at,
+            hidden,
+            needs_refresh,
+            unread_mentions_count,
+            unread_reactions_count,
+            draft_text,
         ),
     )
     conn.commit()
@@ -1012,12 +1023,22 @@ async def test_list_dialogs_diff04_fields_present_in_data() -> None:
     """Test G: per-row unread_mentions_count, unread_reactions_count, draft_text fields."""
     conn = _make_db_with_dialogs()
     _seed_dialog_row(
-        conn, 1, name="Active Chat", type_="Chat",
-        unread_mentions_count=2, unread_reactions_count=1, draft_text="WIP",
+        conn,
+        1,
+        name="Active Chat",
+        type_="Chat",
+        unread_mentions_count=2,
+        unread_reactions_count=1,
+        draft_text="WIP",
     )
     _seed_dialog_row(
-        conn, 2, name="Quiet Chat", type_="Chat",
-        unread_mentions_count=0, unread_reactions_count=0, draft_text=None,
+        conn,
+        2,
+        name="Quiet Chat",
+        type_="Chat",
+        unread_mentions_count=0,
+        unread_reactions_count=0,
+        draft_text=None,
     )
 
     client = MagicMock()
@@ -1142,9 +1163,7 @@ async def test_list_dialogs_ignore_pinned_filters_via_sql() -> None:
 async def test_list_topics_through_daemon() -> None:
     """list_topics reads from topic_metadata snapshot — zero Telegram API calls."""
     conn = _make_db_with_topics()
-    conn.execute(
-        "INSERT INTO topic_metadata (dialog_id, topic_id, title, updated_at) VALUES (123, 1, 'General', 0)"
-    )
+    conn.execute("INSERT INTO topic_metadata (dialog_id, topic_id, title, updated_at) VALUES (123, 1, 'General', 0)")
     conn.commit()
 
     client = MagicMock()
@@ -1180,8 +1199,7 @@ async def test_list_topics_hidden_excluded() -> None:
     """_list_topics excludes rows with hidden=1."""
     conn = _make_db_with_topics()
     conn.execute(
-        "INSERT INTO topic_metadata (dialog_id, topic_id, title, updated_at, hidden) "
-        "VALUES (789, 1, 'Visible', 0, 0)"
+        "INSERT INTO topic_metadata (dialog_id, topic_id, title, updated_at, hidden) VALUES (789, 1, 'Visible', 0, 0)"
     )
     conn.execute(
         "INSERT INTO topic_metadata (dialog_id, topic_id, title, updated_at, hidden) "
@@ -1524,7 +1542,6 @@ async def test_get_sync_alerts_respects_limit() -> None:
 # test_entity_info_channel.py, test_entity_info_supergroup.py, test_entity_info_group.py,
 # and test_entity_info_ttl.py (Plans 02–03).
 # ---------------------------------------------------------------------------
-
 
 
 # ---------------------------------------------------------------------------
@@ -2028,9 +2045,7 @@ async def test_list_unread_messages_excludes_outgoing_and_service_messages() -> 
     groups = result["data"]["groups"]
     assert len(groups) == 1, f"Expected 1 dialog group, got {len(groups)}"
     group = groups[0]
-    assert group["unread_count"] == 1, (
-        f"Expected unread_count=1 (only incoming), got {group['unread_count']}"
-    )
+    assert group["unread_count"] == 1, f"Expected unread_count=1 (only incoming), got {group['unread_count']}"
     returned_ids = [m["message_id"] for m in group["messages"]]
     assert 11 in returned_ids, "Incoming message (id=11) must appear in results"
     assert 12 not in returned_ids, "Outgoing message (id=12) must NOT appear in inbox"
@@ -4634,6 +4649,7 @@ async def test_fallback_path_does_not_emit_counter(caplog: pytest.LogCaptureFixt
     conn = _make_db()
     # No synced_dialogs row — triggers live Telegram fallback
     server = make_server(conn)
+
     # Mock telegram client to return empty list (avoid real API call)
     async def _empty_iter_messages(*args: Any, **kwargs: Any):  # type: ignore[misc]
         return
@@ -4864,9 +4880,7 @@ async def test_get_my_recent_activity_filters_by_since_hours() -> None:
         )
         server._conn.execute("UPDATE activity_sync_state SET value='1' WHERE key='backfill_complete'")
         server._conn.execute(f"UPDATE activity_sync_state SET value='{now}' WHERE key='last_sync_at'")
-    resp = await server._dispatch(
-        {"method": "get_my_recent_activity", "since_hours": 1, "dialog_kinds": ["all"]}
-    )
+    resp = await server._dispatch({"method": "get_my_recent_activity", "since_hours": 1, "dialog_kinds": ["all"]})
     texts = [c["text"] for c in resp["data"]["comments"]]
     assert texts == ["recent"]
     assert resp["data"]["scan_status"] == "complete"
@@ -4981,9 +4995,7 @@ async def test_get_my_recent_activity_default_filters_dms_before_limit() -> None
     server = make_server(_make_db_with_activity())
     now = int(time.time())
     with server._conn:
-        server._conn.execute(
-            "INSERT OR REPLACE INTO dialogs (dialog_id, name, type) VALUES (42, 'Alice', 'user')"
-        )
+        server._conn.execute("INSERT OR REPLACE INTO dialogs (dialog_id, name, type) VALUES (42, 'Alice', 'user')")
         server._conn.execute(
             "INSERT OR REPLACE INTO dialogs (dialog_id, name, type) VALUES (-1001, 'Group', 'supergroup')"
         )
@@ -5040,9 +5052,7 @@ async def test_get_my_recent_activity_forum_kind_uses_topic_metadata() -> None:
         server._conn.execute("UPDATE activity_sync_state SET value='1' WHERE key='backfill_complete'")
         server._conn.execute(f"UPDATE activity_sync_state SET value='{now}' WHERE key='last_sync_at'")
 
-    resp = await server._dispatch(
-        {"method": "get_my_recent_activity", "since_hours": 1, "dialog_kinds": ["forum"]}
-    )
+    resp = await server._dispatch({"method": "get_my_recent_activity", "since_hours": 1, "dialog_kinds": ["forum"]})
     assert [(c["dialog_id"], c["dialog_category"], c["text"]) for c in resp["data"]["comments"]] == [
         (-1002, "forum", "forum-message")
     ]
@@ -5144,6 +5154,7 @@ def test_search_messages_finds_migrated_own_message() -> None:
     # _make_db() creates messages_fts only with with_fts=True (default False).
     # Create the FTS table here to simulate the daemon startup environment.
     from mcp_telegram.fts import MESSAGES_FTS_DDL
+
     conn.execute(MESSAGES_FTS_DDL)
     conn.commit()
 
@@ -5165,6 +5176,7 @@ def test_search_messages_finds_migrated_own_message() -> None:
     # FTS5 MATCH must target stemmed_text column and use the stemmed query form
     # (same as daemon_api._search_messages via stem_query()).
     from mcp_telegram.fts import stem_query
+
     stemmed = stem_query("unique-search-needle")
     hits = conn.execute(
         "SELECT m.dialog_id, m.message_id, m.text "
@@ -5174,8 +5186,7 @@ def test_search_messages_finds_migrated_own_message() -> None:
         (stemmed,),
     ).fetchall()
     assert len(hits) == 1, (
-        f"D-5 violated: migrated own message must be FTS-searchable after "
-        f"backfill_fts_index(). Hits: {hits}"
+        f"D-5 violated: migrated own message must be FTS-searchable after backfill_fts_index(). Hits: {hits}"
     )
     assert hits[0] == (42, 7, "unique-search-needle alpha")
 
@@ -5193,9 +5204,7 @@ async def test_resolve_dialog_name_dialogs_snapshot_exact_match() -> None:
 
     client = MagicMock()
     client.get_entity = AsyncMock(side_effect=ValueError("force fallthrough from step 1"))
-    client.iter_dialogs = MagicMock(
-        side_effect=AssertionError("step 2.5 must hit; iter_dialogs forbidden")
-    )
+    client.iter_dialogs = MagicMock(side_effect=AssertionError("step 2.5 must hit; iter_dialogs forbidden"))
 
     server = make_server(conn, client)
     result = await server._resolve_dialog_name("Project Foo")
@@ -5545,6 +5554,7 @@ def _insert_own_message(
 
 # -------- (0) Strategy classifier case-insensitivity (regression) --------
 
+
 def test_trace_strategy_for_dialog_is_case_insensitive() -> None:
     """Live `dialogs.type` is lowercase — the classifier must not require capitals.
 
@@ -5573,6 +5583,7 @@ def test_trace_strategy_for_dialog_is_case_insensitive() -> None:
 
 
 # -------- (a) Enrollment --------
+
 
 def test_linked_group_enrolled_in_activity_dialog_state() -> None:
     """(a) enroll_activity_dialog writes activity_dialog_state + synced_dialogs."""
@@ -5626,6 +5637,7 @@ def test_linked_group_enrolled_in_activity_dialog_state() -> None:
 
 # -------- (b) Candidate set expansion --------
 
+
 def test_trace_candidate_includes_linked_group_as_author_search() -> None:
     """(b) _trace_candidate_dialogs adds linked supergroup as author_search candidate."""
     from mcp_telegram.daemon_api import _trace_candidate_dialogs
@@ -5661,6 +5673,7 @@ def test_trace_candidate_includes_linked_group_as_author_search() -> None:
 
 # -------- (c) Query-side proof: evidence contains linked-chat messages --------
 
+
 def test_trace_query_returns_messages_under_linked_chat_id() -> None:
     """(c) A channel-scoped trace with scope_dialog_ids=[channel, linked] returns
     messages stored under linked_chat_id — not just the channel's dialog_id.
@@ -5685,12 +5698,12 @@ def test_trace_query_returns_messages_under_linked_chat_id() -> None:
     rows = conn.execute(sql, params).fetchall()
     message_ids = [int(r["message_id"]) for r in rows]
     assert 42 in message_ids, (
-        "own-message stored under linked_chat_id not returned by channel-scoped trace; "
-        f"rows={message_ids}"
+        f"own-message stored under linked_chat_id not returned by channel-scoped trace; rows={message_ids}"
     )
 
 
 # -------- (d) SQL uses IN(...) --------
+
 
 def test_trace_query_uses_in_filter_for_scope_dialog_ids() -> None:
     """(d) When scope_dialog_ids is set, the built SQL contains 'IN' not '= :exact_dialog_id'."""
@@ -5721,6 +5734,7 @@ def test_trace_query_uses_in_filter_for_scope_dialog_ids() -> None:
 
 
 # -------- (e) Authorship is bounded (from_id predicate present) --------
+
 
 def test_trace_query_authorship_predicate_unchanged() -> None:
     """(e) scope_dialog_ids does not widen authorship — target_user_id still filters sender."""
@@ -5754,12 +5768,11 @@ def test_trace_query_authorship_predicate_unchanged() -> None:
     # Own message (sender_id == _TARGET_USER_ID) must be present.
     assert 10 in returned_ids, "own message missing from result"
     # Foreign sender must be absent (authorship filter still applies).
-    assert 11 not in returned_ids, (
-        "foreign-sender message returned — authorship widened unexpectedly"
-    )
+    assert 11 not in returned_ids, "foreign-sender message returned — authorship widened unexpectedly"
 
 
 # -------- (f) Pagination: second page carries scope_dialog_ids in token --------
+
 
 def test_trace_navigation_token_carries_scope_dialog_ids() -> None:
     """(f) encode → decode round-trip preserves scope_dialog_ids without a live API call."""
@@ -5816,6 +5829,7 @@ def test_trace_navigation_token_carries_scope_dialog_ids() -> None:
 
 # -------- (g) No-discussion-group channel: scalar behavior unchanged --------
 
+
 def test_trace_query_scalar_filter_when_no_scope_dialog_ids() -> None:
     """(g) When scope_dialog_ids is absent, the scalar m.dialog_id = :exact_dialog_id is used."""
     from mcp_telegram.daemon_api import _build_trace_account_messages_query
@@ -5866,6 +5880,4 @@ def test_trace_candidate_no_discussion_group_stays_signature_only() -> None:
         f"bare channel strategy should be signature_only, got {strategies[_CHANNEL_ID]!r}"
     )
     # No linked-chat candidate must appear.
-    assert _LINKED_CHAT_ID not in dialog_ids, (
-        "linked group appeared in candidates despite no discussion group"
-    )
+    assert _LINKED_CHAT_ID not in dialog_ids, "linked group appeared in candidates despite no discussion group"

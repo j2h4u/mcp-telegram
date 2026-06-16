@@ -306,9 +306,7 @@ async def _maybe_heartbeat_and_gap_scan(
     now_mono = time.monotonic()
 
     if now_mono - last_heartbeat >= HEARTBEAT_INTERVAL_S:
-        last_hb_msg_count, last_hb_mono = _log_heartbeat(
-            conn, client, sync_start, last_hb_msg_count, last_hb_mono
-        )
+        last_hb_msg_count, last_hb_mono = _log_heartbeat(conn, client, sync_start, last_hb_msg_count, last_hb_mono)
         handler_manager.refresh_synced_dialogs()
         last_heartbeat = now_mono
 
@@ -344,17 +342,15 @@ async def _run_sync_loop(
         all_synced = await worker.process_one_batch()
         await asyncio.sleep(0)
 
-        last_heartbeat, last_gap_scan, last_hb_msg_count, last_hb_mono = (
-            await _maybe_heartbeat_and_gap_scan(
-                conn,
-                client,
-                handler_manager,
-                sync_start,
-                last_heartbeat,
-                last_gap_scan,
-                last_hb_msg_count,
-                last_hb_mono,
-            )
+        last_heartbeat, last_gap_scan, last_hb_msg_count, last_hb_mono = await _maybe_heartbeat_and_gap_scan(
+            conn,
+            client,
+            handler_manager,
+            sync_start,
+            last_heartbeat,
+            last_gap_scan,
+            last_hb_msg_count,
+            last_hb_mono,
         )
 
         if all_synced:
@@ -368,17 +364,15 @@ async def _run_sync_loop(
                 )
                 break
             except TimeoutError:
-                last_heartbeat, last_gap_scan, last_hb_msg_count, last_hb_mono = (
-                    await _maybe_heartbeat_and_gap_scan(
-                        conn,
-                        client,
-                        handler_manager,
-                        sync_start,
-                        last_heartbeat,
-                        last_gap_scan,
-                        last_hb_msg_count,
-                        last_hb_mono,
-                    )
+                last_heartbeat, last_gap_scan, last_hb_msg_count, last_hb_mono = await _maybe_heartbeat_and_gap_scan(
+                    conn,
+                    client,
+                    handler_manager,
+                    sync_start,
+                    last_heartbeat,
+                    last_gap_scan,
+                    last_hb_msg_count,
+                    last_hb_mono,
                 )
         elif was_idle:
             logger.info("sync_resume — work appeared, exiting idle")
@@ -597,7 +591,10 @@ async def sync_main() -> None:
         _recon_hourly = float(os.environ.get("RECON_HOURLY_SECONDS", "3600"))
         _create_tracked_task(
             run_reconciliation_loop(
-                client, conn, shutdown_event, hourly_interval=_recon_hourly,
+                client,
+                conn,
+                shutdown_event,
+                hourly_interval=_recon_hourly,
             ),
             name="reconciliation_loop",
         )

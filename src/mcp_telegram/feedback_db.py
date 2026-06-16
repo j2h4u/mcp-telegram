@@ -89,11 +89,7 @@ def ensure_feedback_schema(db_path: Path) -> sqlite3.Connection:
     """
     conn = _open_feedback_db(db_path)
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS schema_version ("
-        "version INTEGER NOT NULL, "
-        "applied_at INTEGER NOT NULL)"
-    )
+    conn.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL, applied_at INTEGER NOT NULL)")
     row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
     current = row[0] if row and row[0] is not None else 0
     if current < 1:
@@ -101,17 +97,9 @@ def ensure_feedback_schema(db_path: Path) -> sqlite3.Connection:
         conn.execute("INSERT INTO schema_version VALUES (1, strftime('%s', 'now'))")
         conn.commit()
     if current < 2:
-        conn.execute(
-            "ALTER TABLE feedback ADD COLUMN status TEXT NOT NULL DEFAULT 'open'"
-        )
-        conn.execute(
-            "ALTER TABLE feedback ADD COLUMN status_changed_at INTEGER"
-        )
-        conn.execute(
-            "ALTER TABLE feedback ADD COLUMN status_comment TEXT"
-        )
-        conn.execute(
-            "INSERT INTO schema_version VALUES (2, strftime('%s', 'now'))"
-        )
+        conn.execute("ALTER TABLE feedback ADD COLUMN status TEXT NOT NULL DEFAULT 'open'")
+        conn.execute("ALTER TABLE feedback ADD COLUMN status_changed_at INTEGER")
+        conn.execute("ALTER TABLE feedback ADD COLUMN status_comment TEXT")
+        conn.execute("INSERT INTO schema_version VALUES (2, strftime('%s', 'now'))")
         conn.commit()
     return conn

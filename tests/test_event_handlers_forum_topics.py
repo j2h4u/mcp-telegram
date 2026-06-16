@@ -95,16 +95,14 @@ def _insert_topic_metadata(
         "(dialog_id, topic_id, title, top_message_id, is_general, is_deleted, "
         " updated_at, icon_emoji_id, pinned, hidden, snapshot_at, date) "
         "VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, NULL)",
-        (dialog_id, topic_id, title, is_general, is_deleted, updated_at,
-         icon_emoji_id, pinned, hidden, snapshot_at),
+        (dialog_id, topic_id, title, is_general, is_deleted, updated_at, icon_emoji_id, pinned, hidden, snapshot_at),
     )
     conn.commit()
 
 
 def _topic_row(conn: sqlite3.Connection, dialog_id: int, topic_id: int) -> dict | None:
     row = conn.execute(
-        "SELECT title, icon_emoji_id, pinned, hidden, snapshot_at "
-        "FROM topic_metadata WHERE dialog_id=? AND topic_id=?",
+        "SELECT title, icon_emoji_id, pinned, hidden, snapshot_at FROM topic_metadata WHERE dialog_id=? AND topic_id=?",
         (dialog_id, topic_id),
     ).fetchone()
     if row is None:
@@ -271,16 +269,23 @@ async def test_topic_edit_updates_title_and_icon(mock_client, sync_db, shutdown_
     dialog_id = 12345
     _enroll_synced(sync_db, dialog_id)
     _insert_topic_metadata(
-        sync_db, dialog_id, 100,
-        title="Old", icon_emoji_id=11, snapshot_at=1,
+        sync_db,
+        dialog_id,
+        100,
+        title="Old",
+        icon_emoji_id=11,
+        snapshot_at=1,
     )
 
     mgr = _make_manager(mock_client, sync_db, shutdown_event)
     mgr._synced_dialog_ids.add(dialog_id)
 
     event = _make_topic_edit_event(
-        dialog_id, msg_id=200, target_topic_id=100,
-        title="New", icon_emoji_id=99,
+        dialog_id,
+        msg_id=200,
+        target_topic_id=100,
+        title="New",
+        icon_emoji_id=99,
     )
     await mgr.on_new_message(event)
 
@@ -295,21 +300,28 @@ async def test_topic_edit_partial_preserves_existing_fields(mock_client, sync_db
     dialog_id = 12345
     _enroll_synced(sync_db, dialog_id)
     _insert_topic_metadata(
-        sync_db, dialog_id, 100,
-        title="Old", icon_emoji_id=11, snapshot_at=1,
+        sync_db,
+        dialog_id,
+        100,
+        title="Old",
+        icon_emoji_id=11,
+        snapshot_at=1,
     )
 
     mgr = _make_manager(mock_client, sync_db, shutdown_event)
     mgr._synced_dialog_ids.add(dialog_id)
 
     event = _make_topic_edit_event(
-        dialog_id, msg_id=200, target_topic_id=100,
-        title=None, icon_emoji_id=99,
+        dialog_id,
+        msg_id=200,
+        target_topic_id=100,
+        title=None,
+        icon_emoji_id=99,
     )
     await mgr.on_new_message(event)
 
     row = _topic_row(sync_db, dialog_id, 100)
-    assert row["title"] == "Old"   # COALESCE preserved
+    assert row["title"] == "Old"  # COALESCE preserved
     assert row["icon_emoji_id"] == 99
 
 
@@ -319,8 +331,12 @@ async def test_topic_edit_with_no_reply_to_is_noop(mock_client, sync_db, shutdow
     dialog_id = 12345
     _enroll_synced(sync_db, dialog_id)
     _insert_topic_metadata(
-        sync_db, dialog_id, 100,
-        title="Unchanged", icon_emoji_id=11, snapshot_at=1,
+        sync_db,
+        dialog_id,
+        100,
+        title="Unchanged",
+        icon_emoji_id=11,
+        snapshot_at=1,
     )
 
     mgr = _make_manager(mock_client, sync_db, shutdown_event)
@@ -328,14 +344,17 @@ async def test_topic_edit_with_no_reply_to_is_noop(mock_client, sync_db, shutdow
 
     # Explicit reply_to=None — the defensive guard must prevent AttributeError
     event = _make_topic_edit_event(
-        dialog_id, msg_id=200, target_topic_id=None,
-        title="X", icon_emoji_id=None,
+        dialog_id,
+        msg_id=200,
+        target_topic_id=None,
+        title="X",
+        icon_emoji_id=None,
         reply_to=None,
     )
     await mgr.on_new_message(event)  # must not raise
 
     row = _topic_row(sync_db, dialog_id, 100)
-    assert row["title"] == "Unchanged"   # unchanged
+    assert row["title"] == "Unchanged"  # unchanged
 
 
 @pytest.mark.asyncio
@@ -344,8 +363,12 @@ async def test_topic_edit_with_reply_to_missing_id_is_noop(mock_client, sync_db,
     dialog_id = 12345
     _enroll_synced(sync_db, dialog_id)
     _insert_topic_metadata(
-        sync_db, dialog_id, 100,
-        title="Unchanged", icon_emoji_id=11, snapshot_at=1,
+        sync_db,
+        dialog_id,
+        100,
+        title="Unchanged",
+        icon_emoji_id=11,
+        snapshot_at=1,
     )
 
     mgr = _make_manager(mock_client, sync_db, shutdown_event)
@@ -355,8 +378,11 @@ async def test_topic_edit_with_reply_to_missing_id_is_noop(mock_client, sync_db,
         pass  # no reply_to_msg_id attribute
 
     event = _make_topic_edit_event(
-        dialog_id, msg_id=200, target_topic_id=None,
-        title="X", icon_emoji_id=None,
+        dialog_id,
+        msg_id=200,
+        target_topic_id=None,
+        title="X",
+        icon_emoji_id=None,
         reply_to=_NoMsgId(),
     )
     await mgr.on_new_message(event)  # must not raise
@@ -376,15 +402,21 @@ async def test_topic_edit_hidden_sets_hidden_flag(mock_client, sync_db, shutdown
     dialog_id = 12345
     _enroll_synced(sync_db, dialog_id)
     _insert_topic_metadata(
-        sync_db, dialog_id, 100,
-        title="Topic", hidden=0, snapshot_at=1,
+        sync_db,
+        dialog_id,
+        100,
+        title="Topic",
+        hidden=0,
+        snapshot_at=1,
     )
 
     mgr = _make_manager(mock_client, sync_db, shutdown_event)
     mgr._synced_dialog_ids.add(dialog_id)
 
     event = _make_topic_edit_event(
-        dialog_id, msg_id=200, target_topic_id=100,
+        dialog_id,
+        msg_id=200,
+        target_topic_id=100,
         hidden=True,
     )
     await mgr.on_new_message(event)
@@ -404,7 +436,9 @@ async def test_topic_edit_hidden_on_missing_row_is_noop(mock_client, sync_db, sh
     mgr._synced_dialog_ids.add(dialog_id)
 
     event = _make_topic_edit_event(
-        dialog_id, msg_id=200, target_topic_id=100,
+        dialog_id,
+        msg_id=200,
+        target_topic_id=100,
         hidden=True,
     )
     await mgr.on_new_message(event)  # must not raise
@@ -502,8 +536,8 @@ async def test_update_pinned_forum_topic_skips_unenrolled_dialog(mock_client, sy
     await mgr.on_raw_forum_topic_pinned(update)
 
     row = _topic_row(sync_db, dialog_id, 100)
-    assert row["pinned"] == 0          # unchanged
-    assert row["snapshot_at"] == 5    # unchanged
+    assert row["pinned"] == 0  # unchanged
+    assert row["snapshot_at"] == 5  # unchanged
 
 
 @pytest.mark.asyncio
@@ -563,6 +597,7 @@ async def test_non_forum_message_does_not_write_topic_metadata(mock_client, sync
     msg.action = None
 
     from types import SimpleNamespace
+
     event = SimpleNamespace(
         chat_id=dialog_id,
         is_private=False,
@@ -595,18 +630,10 @@ async def test_no_get_forum_topics_request_called(mock_client, sync_db, shutdown
     mgr._synced_dialog_ids.add(channel_dialog_id)
 
     # Exercise all handlers
-    await mgr.on_new_message(
-        _make_topic_create_event(dialog_id, msg_id=200, title="T", icon_emoji_id=None)
-    )
-    await mgr.on_new_message(
-        _make_topic_edit_event(dialog_id, msg_id=201, target_topic_id=100, title="New")
-    )
-    await mgr.on_new_message(
-        _make_topic_edit_event(dialog_id, msg_id=202, target_topic_id=100, hidden=True)
-    )
-    await mgr.on_raw_forum_topic_pinned(
-        UpdatePinnedForumTopic(peer=PeerChannel(channel_id), topic_id=100, pinned=True)
-    )
+    await mgr.on_new_message(_make_topic_create_event(dialog_id, msg_id=200, title="T", icon_emoji_id=None))
+    await mgr.on_new_message(_make_topic_edit_event(dialog_id, msg_id=201, target_topic_id=100, title="New"))
+    await mgr.on_new_message(_make_topic_edit_event(dialog_id, msg_id=202, target_topic_id=100, hidden=True))
+    await mgr.on_raw_forum_topic_pinned(UpdatePinnedForumTopic(peer=PeerChannel(channel_id), topic_id=100, pinned=True))
 
     # Assert mock_client was never called with any forum-topics RPC request.
     # GetForumTopicsRequest may not exist in all Telethon builds, so we check
@@ -614,9 +641,7 @@ async def test_no_get_forum_topics_request_called(mock_client, sync_db, shutdown
     for call in mock_client.call_args_list:
         args, kwargs = call
         for a in args:
-            assert type(a).__name__ != "GetForumTopicsRequest", (
-                f"GetForumTopicsRequest unexpectedly invoked: {call}"
-            )
+            assert type(a).__name__ != "GetForumTopicsRequest", f"GetForumTopicsRequest unexpectedly invoked: {call}"
 
 
 # ---------------------------------------------------------------------------
@@ -660,14 +685,16 @@ def test_daemon_api_topic_title_left_join_still_works(sync_db):
     dialog_id = 12345
     topic_id = 100
     _insert_topic_metadata(
-        sync_db, dialog_id, topic_id,
-        title="My Topic", snapshot_at=9999,
+        sync_db,
+        dialog_id,
+        topic_id,
+        title="My Topic",
+        snapshot_at=9999,
     )
 
     # Mirror the LEFT JOIN query used in daemon_api._LIST_MESSAGES_BASE_SQL
     row = sync_db.execute(
-        "SELECT tm.title FROM topic_metadata tm "
-        "WHERE tm.dialog_id = ? AND tm.topic_id = ?",
+        "SELECT tm.title FROM topic_metadata tm WHERE tm.dialog_id = ? AND tm.topic_id = ?",
         (dialog_id, topic_id),
     ).fetchone()
 

@@ -11,6 +11,7 @@ Covers:
       matches each scenario (cycle-4 MEDIUM — idle vs zero-write distinction).
   (g) FloodWait tier isolation: no hot_* column written by Tier B (concern 5).
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -35,6 +36,7 @@ from mcp_telegram.sync_db import _apply_migrations
 # ---------------------------------------------------------------------------
 # DB helpers
 # ---------------------------------------------------------------------------
+
 
 def _make_db() -> sqlite3.Connection:
     conn = sqlite3.connect(":memory:")
@@ -70,6 +72,7 @@ def _get_state(conn: sqlite3.Connection, dialog_id: int) -> dict:
 # ---------------------------------------------------------------------------
 # Fake SweepResult builders
 # ---------------------------------------------------------------------------
+
 
 def _normal_result(ids: list[int], persisted: int | None = None) -> SweepResult:
     """A normal non-empty batch (SkipReason.NONE)."""
@@ -120,6 +123,7 @@ def _flood_result(seconds: int) -> SweepResult:
 # Patch helper
 # ---------------------------------------------------------------------------
 
+
 def _patch_sweep(monkeypatch, scripted: dict[int, list[SweepResult]]) -> dict:
     """Patch sweep_peer_once to return scripted results per dialog_id.
 
@@ -145,6 +149,7 @@ def _patch_sweep(monkeypatch, scripted: dict[int, list[SweepResult]]) -> dict:
 def _patch_build_working_set(monkeypatch) -> None:
     async def _noop(client, conn):
         return 0
+
     monkeypatch.setattr(
         "mcp_telegram.activity_cold_backfill.build_working_set",
         _noop,
@@ -154,6 +159,7 @@ def _patch_build_working_set(monkeypatch) -> None:
 # ---------------------------------------------------------------------------
 # (f/idle) NO_DUE_PEER when no peer enrolled
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 async def test_no_due_peer_when_none_enrolled(monkeypatch):
@@ -192,6 +198,7 @@ async def test_no_due_peer_when_retry_not_due(monkeypatch):
 # (a) cold_offset_id decreases across passes (backward walk, concern 2)
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_backward_walk_cold_offset_id_decreases(monkeypatch):
     """Each non-empty batch sets cold_offset_id = result.min_id (walks backward)."""
@@ -202,8 +209,8 @@ async def test_backward_walk_cold_offset_id_decreases(monkeypatch):
     # Two passes: first returns ids 100-200, second returns ids 50-99
     scripted = {
         dialog_id: [
-            _normal_result(list(range(100, 201))),   # pass 1: min_id=100
-            _normal_result(list(range(50, 100))),    # pass 2: min_id=50
+            _normal_result(list(range(100, 201))),  # pass 1: min_id=100
+            _normal_result(list(range(50, 100))),  # pass 2: min_id=50
         ]
     }
     _patch_sweep(monkeypatch, scripted)
@@ -215,18 +222,14 @@ async def test_backward_walk_cold_offset_id_decreases(monkeypatch):
     assert r1.persisted > 0
     state1 = _get_state(conn, dialog_id)
     offset_after_pass1 = state1["cold_offset_id"]
-    assert offset_after_pass1 == 100, (
-        f"After pass 1, cold_offset_id should be min_id=100, got {offset_after_pass1}"
-    )
+    assert offset_after_pass1 == 100, f"After pass 1, cold_offset_id should be min_id=100, got {offset_after_pass1}"
 
     # Pass 2
     r2 = await run_cold_backfill_pass(None, conn, shutdown)
     assert r2.outcome == ColdPassOutcome.WROTE
     state2 = _get_state(conn, dialog_id)
     offset_after_pass2 = state2["cold_offset_id"]
-    assert offset_after_pass2 == 50, (
-        f"After pass 2, cold_offset_id should be min_id=50, got {offset_after_pass2}"
-    )
+    assert offset_after_pass2 == 50, f"After pass 2, cold_offset_id should be min_id=50, got {offset_after_pass2}"
     # Confirm offset decreased (walked backward)
     assert offset_after_pass2 < offset_after_pass1
 
@@ -234,6 +237,7 @@ async def test_backward_walk_cold_offset_id_decreases(monkeypatch):
 # ---------------------------------------------------------------------------
 # (b) HISTORY_FLOOR sets cold_status='complete'; peer no longer selected
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 async def test_history_floor_completes_peer(monkeypatch):
@@ -262,9 +266,7 @@ async def test_history_floor_completes_peer(monkeypatch):
 
     # On next pass the peer must NOT be selected (cold_status='complete')
     r2 = await run_cold_backfill_pass(None, conn, shutdown)
-    assert r2.outcome == ColdPassOutcome.NO_DUE_PEER, (
-        "Completed peer must not be selected on next pass"
-    )
+    assert r2.outcome == ColdPassOutcome.NO_DUE_PEER, "Completed peer must not be selected on next pass"
     # sweep_peer_once was called only once (for the HISTORY_FLOOR pass)
     assert len(call_log.get(dialog_id, [])) == 1
 
@@ -272,6 +274,7 @@ async def test_history_floor_completes_peer(monkeypatch):
 # ---------------------------------------------------------------------------
 # (c) ACCESS_SKIP — concern 3: transient miss never completes backfill
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 async def test_access_skip_does_not_complete(monkeypatch):
@@ -297,24 +300,19 @@ async def test_access_skip_does_not_complete(monkeypatch):
     state = _get_state(conn, dialog_id)
 
     # Must NOT complete — concern 3
-    assert state["cold_status"] != "complete", (
-        "ACCESS_SKIP must NEVER set cold_status='complete' (concern 3)"
-    )
+    assert state["cold_status"] != "complete", "ACCESS_SKIP must NEVER set cold_status='complete' (concern 3)"
     assert state["cold_status"] == "pending"
 
     # cold_offset_id must remain unchanged (resume from same point on retry)
     assert state["cold_offset_id"] == prior_offset, (
-        f"cold_offset_id must be unchanged after ACCESS_SKIP, "
-        f"expected {prior_offset}, got {state['cold_offset_id']}"
+        f"cold_offset_id must be unchanged after ACCESS_SKIP, expected {prior_offset}, got {state['cold_offset_id']}"
     )
 
     # cold_next_retry_at must be set in the future
     assert state["cold_next_retry_at"] is not None, (
         "cold_next_retry_at must be set for transient backoff on ACCESS_SKIP"
     )
-    assert state["cold_next_retry_at"] > before, (
-        "cold_next_retry_at must be in the future"
-    )
+    assert state["cold_next_retry_at"] > before, "cold_next_retry_at must be in the future"
 
     # Peer must remain re-selectable (next_retry_at is in the future now,
     # but the field is set — a later pass after the backoff will re-select it)
@@ -323,6 +321,7 @@ async def test_access_skip_does_not_complete(monkeypatch):
 # ---------------------------------------------------------------------------
 # (d) Old messages (>30 days) ARE collected — no time ceiling
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 async def test_no_time_ceiling_old_messages_collected(monkeypatch):
@@ -360,6 +359,7 @@ async def test_no_time_ceiling_old_messages_collected(monkeypatch):
 # (e) FloodWait: cold_next_retry_at set; NO hot_* column touched (concern 5)
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_flood_wait_sets_cold_retry_not_hot(monkeypatch):
     """FloodWait sets cold_next_retry_at and NEVER writes any hot_* column."""
@@ -383,9 +383,7 @@ async def test_flood_wait_sets_cold_retry_not_hot(monkeypatch):
     state = _get_state(conn, dialog_id)
 
     # cold_next_retry_at set in the future
-    assert state["cold_next_retry_at"] is not None, (
-        "cold_next_retry_at must be set on FloodWait"
-    )
+    assert state["cold_next_retry_at"] is not None, "cold_next_retry_at must be set on FloodWait"
     assert state["cold_next_retry_at"] >= before + flood_seconds, (
         f"cold_next_retry_at should be at least now+{flood_seconds}"
     )
@@ -394,9 +392,7 @@ async def test_flood_wait_sets_cold_retry_not_hot(monkeypatch):
     assert state["cold_status"] == "pending"
 
     # Tier isolation (concern 5): NO hot_* column must be written
-    assert state.get("hot_cursor") is None, (
-        "FloodWait must NOT write hot_cursor (tier isolation — concern 5)"
-    )
+    assert state.get("hot_cursor") is None, "FloodWait must NOT write hot_cursor (tier isolation — concern 5)"
     assert state.get("hot_next_retry_at") is None, (
         "FloodWait must NOT write hot_next_retry_at (tier isolation — concern 5)"
     )
@@ -408,6 +404,7 @@ async def test_flood_wait_sets_cold_retry_not_hot(monkeypatch):
 # ---------------------------------------------------------------------------
 # (g) Comprehensive tier isolation — FloodWait + normal pass leave hot_* clean
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 async def test_cold_pass_never_writes_hot_columns(monkeypatch):
@@ -432,6 +429,7 @@ async def test_cold_pass_never_writes_hot_columns(monkeypatch):
 # ---------------------------------------------------------------------------
 # (f) ColdPassResult structured outcomes — full scenario matrix
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 async def test_cold_pass_result_outcomes_matrix(monkeypatch):

@@ -195,14 +195,16 @@ def test_mcp_test_client_redacts_printed_script_output(tmp_path, capsys) -> None
         encoding="utf-8",
     )
 
-    exit_code = main([
-        "script",
-        "--redact",
-        "--file",
-        str(script_path),
-        "--",
-        *_fake_server_command(),
-    ])
+    exit_code = main(
+        [
+            "script",
+            "--redact",
+            "--file",
+            str(script_path),
+            "--",
+            *_fake_server_command(),
+        ]
+    )
     captured = capsys.readouterr()
 
     assert exit_code == 0
@@ -287,9 +289,7 @@ def test_smoke_scripts_use_snake_case_tool_names() -> None:
 
 
 def test_no_daemon_smoke_expects_all_registered_tools_and_output_schemas() -> None:
-    script = json.loads(
-        (_repo_root() / "devtools/mcp_client/smoke-no-daemon.json").read_text(encoding="utf-8")
-    )
+    script = json.loads((_repo_root() / "devtools/mcp_client/smoke-no-daemon.json").read_text(encoding="utf-8"))
     list_tools_expect = script["steps"][0]["expect"]
     registered_tools = set(server.tool_by_name)
 
@@ -333,9 +333,7 @@ def test_successful_smoke_steps_assert_structured_content_paths_not_text_parsing
 
 
 def test_no_daemon_smoke_expects_backend_errors() -> None:
-    script = json.loads(
-        (_repo_root() / "devtools/mcp_client/smoke-no-daemon.json").read_text(encoding="utf-8")
-    )
+    script = json.loads((_repo_root() / "devtools/mcp_client/smoke-no-daemon.json").read_text(encoding="utf-8"))
     backend_tools = set(server.tool_by_name)
 
     assert "get_dialog_stats" in script["steps"][0]["expect"]["tool_names_include"]

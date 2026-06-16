@@ -238,9 +238,7 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
                 "unread_mentions_count": int(d.get("unread_mentions_count", 0) or 0),
                 "unread_reactions_count": int(d.get("unread_reactions_count", 0) or 0),
                 "draft_text": draft_text,
-                "draft_content": telegram_content(str(draft_text), "message_text")
-                if draft_text is not None
-                else None,
+                "draft_content": telegram_content(str(draft_text), "message_text") if draft_text is not None else None,
             }
         )
     structured_content = {

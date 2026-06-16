@@ -346,9 +346,7 @@ ON activity_dialog_state(cold_status, cold_next_retry_at)
 
 _DIALOGS_V24_ADD_LINKED_CHAT_ID = "ALTER TABLE dialogs ADD COLUMN linked_chat_id INTEGER"
 
-_DIALOGS_V24_ADD_LINKED_CHAT_RESOLVED_AT = (
-    "ALTER TABLE dialogs ADD COLUMN linked_chat_resolved_at INTEGER"
-)
+_DIALOGS_V24_ADD_LINKED_CHAT_RESOLVED_AT = "ALTER TABLE dialogs ADD COLUMN linked_chat_resolved_at INTEGER"
 
 _DIALOGS_V24_BACKFILL_LINKED_CHAT = """
 UPDATE dialogs
@@ -511,9 +509,7 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
                         conn.execute(stmt)
                     except sqlite3.OperationalError as exc:
                         if "duplicate column name" in str(exc).lower():
-                            logger.debug(
-                                "sync_db v%d: column already exists, skipping: %s", version, exc
-                            )
+                            logger.debug("sync_db v%d: column already exists, skipping: %s", version, exc)
                         else:
                             raise
                 else:

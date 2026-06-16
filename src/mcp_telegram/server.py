@@ -58,10 +58,7 @@ _HTTP_LOOPBACK_ALLOWED_ORIGINS = (
 @cache
 def enumerate_available_tools() -> list[tuple[str, Tool]]:
     tools.verify_tool_registry()
-    return [
-        (name, tools.tool_description(name, entry.cls, entry))
-        for name, entry in tools.TOOL_REGISTRY.items()
-    ]
+    return [(name, tools.tool_description(name, entry.cls, entry)) for name, entry in tools.TOOL_REGISTRY.items()]
 
 
 tool_by_name: dict[str, Tool] = dict(enumerate_available_tools())

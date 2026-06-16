@@ -22,7 +22,9 @@ from mcp_telegram.daemon_api import DaemonAPIServer
 def _patch_get_peer_id():
     with patch(
         "mcp_telegram.daemon_api.telethon_utils.get_peer_id",
-        side_effect=lambda entity: int(getattr(entity, "id", 0)) if not isinstance(entity, MagicMock) or hasattr(entity, "id") else 0,
+        side_effect=lambda entity: (
+            int(getattr(entity, "id", 0)) if not isinstance(entity, MagicMock) or hasattr(entity, "id") else 0
+        ),
     ):
         yield
 
@@ -65,8 +67,9 @@ def make_server(conn=None, client=None) -> DaemonAPIServer:
 
 def _legacy_chat(id_=-12345, **kwargs):
     from telethon.tl.types import Chat as TelethonChat  # type: ignore[import-untyped]
+
     c = MagicMock(spec=TelethonChat)
-    c.id = abs(id_) if id_ < 0 else id_   # Chat.id is bare positive in Telethon; peer-id form is negative
+    c.id = abs(id_) if id_ < 0 else id_  # Chat.id is bare positive in Telethon; peer-id form is negative
     c.title = kwargs.get("title", "Legacy Group")
     c.creator = kwargs.get("creator", True)
     c.left = False
@@ -112,8 +115,10 @@ async def test_get_entity_info_group_type() -> None:
         client.get_entity = AsyncMock(return_value=chat)
         client.side_effect = [_full_chat_result(), _empty_search()]
         server = make_server(client=client)
-        with patch("mcp_telegram.daemon_api.GetFullChatRequest"), \
-             patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
+        with (
+            patch("mcp_telegram.daemon_api.GetFullChatRequest"),
+            patch("mcp_telegram.daemon_api.MessagesSearchRequest"),
+        ):
             r = await server._dispatch({"method": "get_entity_info", "entity_id": -100})
     assert r["ok"] is True, r
     assert r["data"]["type"] == "group"
@@ -130,13 +135,14 @@ async def test_get_entity_info_group_field_surface() -> None:
         client = AsyncMock()
         client.get_entity = AsyncMock(return_value=chat)
         client.side_effect = [
-            _full_chat_result(participant_user_ids=(1, 2, 3),
-                              invite_link="https://t.me/+abcdef"),
+            _full_chat_result(participant_user_ids=(1, 2, 3), invite_link="https://t.me/+abcdef"),
             _empty_search(),
         ]
         server = make_server(client=client)
-        with patch("mcp_telegram.daemon_api.GetFullChatRequest"), \
-             patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
+        with (
+            patch("mcp_telegram.daemon_api.GetFullChatRequest"),
+            patch("mcp_telegram.daemon_api.MessagesSearchRequest"),
+        ):
             r = await server._dispatch({"method": "get_entity_info", "entity_id": -101})
     d = r["data"]
     for key in ("members_count", "migrated_to", "invite_link", "contacts_subscribed"):
@@ -170,8 +176,10 @@ async def test_get_entity_info_group_dm_intersection() -> None:
             _empty_search(),
         ]
         server = make_server(conn=conn, client=client)
-        with patch("mcp_telegram.daemon_api.GetFullChatRequest"), \
-             patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
+        with (
+            patch("mcp_telegram.daemon_api.GetFullChatRequest"),
+            patch("mcp_telegram.daemon_api.MessagesSearchRequest"),
+        ):
             r = await server._dispatch({"method": "get_entity_info", "entity_id": -102})
     d = r["data"]
     ids = {entry["id"] for entry in d["contacts_subscribed"]}
@@ -197,7 +205,7 @@ async def test_get_entity_info_group_migrated_to_verbatim() -> None:
         if e is chat:
             return -103
         if e is migrated:
-            return -1002005000000   # canonical peer-id form for channel
+            return -1002005000000  # canonical peer-id form for channel
         return int(getattr(e, "id", 0))
 
     with patch(
@@ -208,8 +216,10 @@ async def test_get_entity_info_group_migrated_to_verbatim() -> None:
         client.get_entity = AsyncMock(return_value=chat)
         client.side_effect = [_full_chat_result(), _empty_search()]
         server = make_server(client=client)
-        with patch("mcp_telegram.daemon_api.GetFullChatRequest"), \
-             patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
+        with (
+            patch("mcp_telegram.daemon_api.GetFullChatRequest"),
+            patch("mcp_telegram.daemon_api.MessagesSearchRequest"),
+        ):
             r = await server._dispatch({"method": "get_entity_info", "entity_id": -103})
     assert r["data"]["type"] == "group"
     assert r["data"]["migrated_to"] == -1002005000000
@@ -217,7 +227,10 @@ async def test_get_entity_info_group_migrated_to_verbatim() -> None:
     import inspect
 
     from mcp_telegram import daemon_api as da
-    src = inspect.getsource(da._fetch_group_detail if hasattr(da, "_fetch_group_detail") else da.DaemonAPIServer._fetch_group_detail)
+
+    src = inspect.getsource(
+        da._fetch_group_detail if hasattr(da, "_fetch_group_detail") else da.DaemonAPIServer._fetch_group_detail
+    )
     # No "follow" or "redirect" or recursive call to _get_entity_info inside the helper
     assert "follow_migrated" not in src
     assert "_get_entity_info(" not in src
@@ -236,8 +249,10 @@ async def test_get_entity_info_no_download_keys_group() -> None:
         client.get_entity = AsyncMock(return_value=chat)
         client.side_effect = [_full_chat_result(), _empty_search()]
         server = make_server(client=client)
-        with patch("mcp_telegram.daemon_api.GetFullChatRequest"), \
-             patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
+        with (
+            patch("mcp_telegram.daemon_api.GetFullChatRequest"),
+            patch("mcp_telegram.daemon_api.MessagesSearchRequest"),
+        ):
             r = await server._dispatch({"method": "get_entity_info", "entity_id": -104})
 
     def _walk(o):

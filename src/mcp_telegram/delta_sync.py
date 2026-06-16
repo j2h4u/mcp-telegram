@@ -43,9 +43,7 @@ logger = logging.getLogger(__name__)
 # the user's account hasn't received meaningful new traffic worth probing.
 RECENT_SYNC_SKIP_THRESHOLD_S: int = 3600
 
-_SELECT_SYNCED_DIALOGS_FOR_DELTA_SQL = (
-    "SELECT dialog_id, last_synced_at FROM synced_dialogs WHERE status = 'synced'"
-)
+_SELECT_SYNCED_DIALOGS_FOR_DELTA_SQL = "SELECT dialog_id, last_synced_at FROM synced_dialogs WHERE status = 'synced'"
 # Backward-compat alias (no external importers, kept for safety)
 _SELECT_SYNCED_DIALOG_IDS_SQL = _SELECT_SYNCED_DIALOGS_FOR_DELTA_SQL
 
@@ -53,9 +51,7 @@ _SELECT_MAX_MESSAGE_ID_SQL = "SELECT COALESCE(MAX(message_id), 0) FROM messages 
 
 # Stamp last_synced_at on successful delta completion.
 # Distinct from FullSyncWorker's _UPDATE_PROGRESS_DONE_SQL (different column set).
-_UPDATE_DELTA_LAST_SYNCED_AT_SQL = (
-    "UPDATE synced_dialogs SET last_synced_at = ? WHERE dialog_id = ?"
-)
+_UPDATE_DELTA_LAST_SYNCED_AT_SQL = "UPDATE synced_dialogs SET last_synced_at = ? WHERE dialog_id = ?"
 
 _SELECT_ACCESS_LOST_SQL = "SELECT dialog_id FROM synced_dialogs WHERE status = 'access_lost'"
 
@@ -112,13 +108,10 @@ class DeltaSyncWorker:
         total_new = 0
         skipped = 0
         probed = 0
-        for (dialog_id, last_synced_at) in rows:
+        for dialog_id, last_synced_at in rows:
             if self._shutdown_event.is_set():
                 break
-            if (
-                last_synced_at is not None
-                and (now - last_synced_at) < RECENT_SYNC_SKIP_THRESHOLD_S
-            ):
+            if last_synced_at is not None and (now - last_synced_at) < RECENT_SYNC_SKIP_THRESHOLD_S:
                 age_s = now - last_synced_at
                 # DEBUG, not INFO — with 300+ skipped dialogs this floods the
                 # log and obscures real signal. The aggregate count lives in

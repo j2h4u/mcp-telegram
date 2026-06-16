@@ -17,6 +17,7 @@ backoff helpers — see activity_peer_resolve.resolve_linked_chat_id.
 
 No scheduling loops live here — those are plans 03 and 04.
 """
+
 from __future__ import annotations
 
 import logging
@@ -50,6 +51,7 @@ _INSERT_THIN_DIALOG_SQL = (
 # SkipReason: load-bearing enum — ONLY HISTORY_FLOOR authorises cold complete
 # ---------------------------------------------------------------------------
 
+
 class SkipReason(StrEnum):
     NONE = "none"
     ACCESS_SKIP = "access_skip"
@@ -68,13 +70,15 @@ class SkipReason(StrEnum):
 # SweepResult
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class SweepResult:
     """Result of a single sweep_peer_once call."""
+
     fetched_ids: list[int]
     persisted: int
-    min_id: int | None        # min of batch — Tier-B downward cursor
-    max_id: int | None        # max of batch — Tier-A high-water
+    min_id: int | None  # min of batch — Tier-B downward cursor
+    max_id: int | None  # max of batch — Tier-A high-water
     skip_reason: SkipReason = SkipReason.NONE
     flood_wait_seconds: int | None = None
 
@@ -92,6 +96,7 @@ class SweepResult:
 # ---------------------------------------------------------------------------
 # sweep_peer_once: FloodWait-neutral per-peer self-search primitive
 # ---------------------------------------------------------------------------
+
 
 async def sweep_peer_once(
     client: Any,
@@ -123,9 +128,7 @@ async def sweep_peer_once(
     # Step 1: entity-type-aware peer resolution from session
     peer = await resolve_input_peer(client, dialog_id)
     if peer is None:
-        logger.debug(
-            "sweep_peer_once_access_skip dialog_id=%r reason=resolve_none", dialog_id
-        )
+        logger.debug("sweep_peer_once_access_skip dialog_id=%r reason=resolve_none", dialog_id)
         return SweepResult(
             fetched_ids=[],
             persisted=0,
@@ -156,7 +159,8 @@ async def sweep_peer_once(
     except FloodWaitError as exc:
         logger.warning(
             "sweep_peer_once_flood dialog_id=%r flood_wait_seconds=%d",
-            dialog_id, exc.seconds,
+            dialog_id,
+            exc.seconds,
         )
         # FloodWait-NEUTRAL: surface the wait, do not sleep
         return SweepResult(
@@ -168,9 +172,7 @@ async def sweep_peer_once(
             flood_wait_seconds=int(exc.seconds),
         )
     except TimeoutError:
-        logger.warning(
-            "sweep_peer_once_timeout dialog_id=%r offset_id=%r", dialog_id, offset_id
-        )
+        logger.warning("sweep_peer_once_timeout dialog_id=%r offset_id=%r", dialog_id, offset_id)
         # Wedged RPC is transient — ACCESS_SKIP, never HISTORY_FLOOR
         return SweepResult(
             fetched_ids=[],
@@ -219,6 +221,7 @@ async def sweep_peer_once(
 # ---------------------------------------------------------------------------
 # Shared enrollment helper — reused by build_working_set AND plan 05
 # ---------------------------------------------------------------------------
+
 
 def enroll_activity_dialog(
     conn: sqlite3.Connection,
@@ -269,16 +272,18 @@ def enroll_activity_dialog(
 # Cursor helpers over activity_dialog_state
 # ---------------------------------------------------------------------------
 
-_DIALOG_STATE_COLUMNS = frozenset({
-    "hot_cursor",
-    "hot_last_sync_at",
-    "hot_next_retry_at",
-    "hot_last_error",
-    "cold_offset_id",
-    "cold_status",
-    "cold_next_retry_at",
-    "cold_last_error",
-})
+_DIALOG_STATE_COLUMNS = frozenset(
+    {
+        "hot_cursor",
+        "hot_last_sync_at",
+        "hot_next_retry_at",
+        "hot_last_error",
+        "cold_offset_id",
+        "cold_status",
+        "cold_next_retry_at",
+        "cold_last_error",
+    }
+)
 
 
 def _load_dialog_state(conn: sqlite3.Connection, dialog_id: int) -> dict:
@@ -295,8 +300,14 @@ def _load_dialog_state(conn: sqlite3.Connection, dialog_id: int) -> dict:
     if row is None:
         return {}
     keys = [
-        "hot_cursor", "hot_last_sync_at", "hot_next_retry_at", "hot_last_error",
-        "cold_offset_id", "cold_status", "cold_next_retry_at", "cold_last_error",
+        "hot_cursor",
+        "hot_last_sync_at",
+        "hot_next_retry_at",
+        "hot_last_error",
+        "cold_offset_id",
+        "cold_status",
+        "cold_next_retry_at",
+        "cold_last_error",
     ]
     return dict(zip(keys, row, strict=True))
 
@@ -330,6 +341,7 @@ def _save_dialog_state(
 # ---------------------------------------------------------------------------
 # Working-set builder
 # ---------------------------------------------------------------------------
+
 
 async def build_working_set(client: Any, conn: sqlite3.Connection) -> int:
     """Build the per-peer self-search working set and enroll peers.
@@ -367,7 +379,8 @@ async def build_working_set(client: Any, conn: sqlite3.Connection) -> int:
                 "build_working_set_channel_flood channel_id=%r flood_wait_seconds=%d"
                 " — halting resolution pass (FloodWait from GetFullChannelRequest is"
                 " account-global; remaining channels stay due for next sweep cycle)",
-                channel_id, res.flood_wait_seconds,
+                channel_id,
+                res.flood_wait_seconds,
             )
             break
 

@@ -1,4 +1,5 @@
 """GetMyRecentActivity MCP tool — Phase 999.1."""
+
 from __future__ import annotations
 
 from typing import Any

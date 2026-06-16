@@ -100,8 +100,7 @@ def _insert_dialog(
 
 def _dialog_row(conn: sqlite3.Connection, dialog_id: int) -> dict | None:
     row = conn.execute(
-        "SELECT pinned, needs_refresh, last_message_at, snapshot_at "
-        "FROM dialogs WHERE dialog_id=?",
+        "SELECT pinned, needs_refresh, last_message_at, snapshot_at FROM dialogs WHERE dialog_id=?",
         (dialog_id,),
     ).fetchone()
     if row is None:
@@ -119,9 +118,7 @@ def _dialogs_count(conn: sqlite3.Connection) -> int:
 
 
 def _last_event_at(conn: sqlite3.Connection, dialog_id: int) -> int | None:
-    row = conn.execute(
-        "SELECT last_event_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)
-    ).fetchone()
+    row = conn.execute("SELECT last_event_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone()
     return None if row is None or row[0] is None else int(row[0])
 
 
@@ -325,9 +322,7 @@ async def test_update_dialog_unread_mark_sets_needs_refresh(mock_client, sync_db
 
 
 @pytest.mark.asyncio
-async def test_update_read_history_inbox_logs_still_unread_count(
-    mock_client, sync_db, shutdown_event, caplog
-):
+async def test_update_read_history_inbox_logs_still_unread_count(mock_client, sync_db, shutdown_event, caplog):
     """EVENTS-02: UpdateReadHistoryInbox logs still_unread_count via structured log."""
     # UpdateReadHistoryInbox.peer is TypePeer directly (not DialogPeer wrapper).
     dialog_id = get_peer_id(PeerChannel(channel_id=9999))
@@ -383,9 +378,7 @@ async def test_update_read_channel_inbox_extracts_dialog_id_via_peer_channel(
 
 
 @pytest.mark.asyncio
-async def test_update_read_history_inbox_skips_unenrolled_dialog(
-    mock_client, sync_db, shutdown_event, caplog
-):
+async def test_update_read_history_inbox_skips_unenrolled_dialog(mock_client, sync_db, shutdown_event, caplog):
     """EVENTS-02: unenrolled dialog — handler returns early, no log line emitted."""
     dialog_id = get_peer_id(PeerChannel(channel_id=88888))
     # NOT enrolled
@@ -486,6 +479,7 @@ async def test_update_channel_missing_dialogs_row_is_noop(mock_client, sync_db, 
 async def test_on_new_message_advances_last_message_at(mock_client, sync_db, shutdown_event):
     """EVENTS-04: on_new_message sets dialogs.last_message_at from msg.date."""
     from datetime import UTC, datetime
+
     dialog_id = 268071163
     _enroll_synced(sync_db, dialog_id)
     _insert_dialog(sync_db, dialog_id, last_message_at=None, snapshot_at=1)
@@ -502,8 +496,11 @@ async def test_on_new_message_advances_last_message_at(mock_client, sync_db, shu
 
     # Mock _build_fwd_entity_map and extract_message_row helpers
     import unittest.mock as mock
-    with mock.patch("mcp_telegram.event_handlers._build_fwd_entity_map", return_value={}), \
-         mock.patch("mcp_telegram.event_handlers.insert_messages_with_fts"):
+
+    with (
+        mock.patch("mcp_telegram.event_handlers._build_fwd_entity_map", return_value={}),
+        mock.patch("mcp_telegram.event_handlers.insert_messages_with_fts"),
+    ):
         mgr = _make_manager(mock_client, sync_db, shutdown_event)
         mgr._synced_dialog_ids.add(dialog_id)
         await mgr.on_new_message(event)
@@ -529,8 +526,11 @@ async def test_on_new_message_does_not_regress_last_message_at(mock_client, sync
     )
 
     import unittest.mock as mock
-    with mock.patch("mcp_telegram.event_handlers._build_fwd_entity_map", return_value={}), \
-         mock.patch("mcp_telegram.event_handlers.insert_messages_with_fts"):
+
+    with (
+        mock.patch("mcp_telegram.event_handlers._build_fwd_entity_map", return_value={}),
+        mock.patch("mcp_telegram.event_handlers.insert_messages_with_fts"),
+    ):
         mgr = _make_manager(mock_client, sync_db, shutdown_event)
         mgr._synced_dialog_ids.add(dialog_id)
         await mgr.on_new_message(event)
@@ -555,8 +555,11 @@ async def test_on_new_message_missing_dialogs_row_is_noop(mock_client, sync_db, 
     )
 
     import unittest.mock as mock
-    with mock.patch("mcp_telegram.event_handlers._build_fwd_entity_map", return_value={}), \
-         mock.patch("mcp_telegram.event_handlers.insert_messages_with_fts"):
+
+    with (
+        mock.patch("mcp_telegram.event_handlers._build_fwd_entity_map", return_value={}),
+        mock.patch("mcp_telegram.event_handlers.insert_messages_with_fts"),
+    ):
         mgr = _make_manager(mock_client, sync_db, shutdown_event)
         mgr._synced_dialog_ids.add(dialog_id)
         await mgr.on_new_message(event)  # must not raise
@@ -641,8 +644,11 @@ async def test_no_handler_inserts_into_dialogs_table(mock_client, sync_db, shutd
     event = SimpleNamespace(chat_id=dialog_id, message=msg, is_private=False)
 
     import unittest.mock as mock
-    with mock.patch("mcp_telegram.event_handlers._build_fwd_entity_map", return_value={}), \
-         mock.patch("mcp_telegram.event_handlers.insert_messages_with_fts"):
+
+    with (
+        mock.patch("mcp_telegram.event_handlers._build_fwd_entity_map", return_value={}),
+        mock.patch("mcp_telegram.event_handlers.insert_messages_with_fts"),
+    ):
         await mgr.on_new_message(event)
 
     assert _dialogs_count(sync_db) == 0  # bootstrap is the sole dialogs-row creator

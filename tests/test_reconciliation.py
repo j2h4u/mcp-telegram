@@ -1,4 +1,5 @@
 """Tests for DialogReconciliationWorker — Phase 43 (RECON-01..05)."""
+
 from __future__ import annotations
 
 import asyncio
@@ -71,9 +72,7 @@ def _seed_dialog_row(
         )
 
 
-def _seed_synced_dialog(
-    conn: sqlite3.Connection, dialog_id: int, status: str = "syncing"
-) -> None:
+def _seed_synced_dialog(conn: sqlite3.Connection, dialog_id: int, status: str = "syncing") -> None:
     with conn:
         conn.execute(
             "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, ?)",
@@ -103,6 +102,7 @@ def _async_iter(items: list[Any]):
     async def _gen():
         for item in items:
             yield item
+
     return _gen()
 
 
@@ -132,9 +132,7 @@ async def test_recon_light_pass_resets_needs_refresh(
     count = await worker.run_light_pass()
 
     assert count == 1
-    row = sync_db.execute(
-        "SELECT name, needs_refresh FROM dialogs WHERE dialog_id=?", (100,)
-    ).fetchone()
+    row = sync_db.execute("SELECT name, needs_refresh FROM dialogs WHERE dialog_id=?", (100,)).fetchone()
     assert row[0] == "NewName"
     assert row[1] == 0
 
@@ -177,12 +175,11 @@ async def test_recon_light_pass_never_calls_iter_dialogs(
     _seed_dialog_row(sync_db, 100, needs_refresh=1)
     _seed_dialog_row(sync_db, 200, needs_refresh=1)
     mock_client.get_entity.side_effect = [
-        _make_user(100), _make_user(200),
+        _make_user(100),
+        _make_user(200),
     ]
     # Make iter_dialogs explosive — any call should fail the test loudly.
-    mock_client.iter_dialogs = MagicMock(
-        side_effect=AssertionError("light pass must not call iter_dialogs")
-    )
+    mock_client.iter_dialogs = MagicMock(side_effect=AssertionError("light pass must not call iter_dialogs"))
 
     worker = DialogReconciliationWorker(mock_client, sync_db, shutdown_event)
     await worker.run_light_pass()
@@ -214,12 +211,7 @@ async def test_recon_light_pass_flood_wait_advances_to_next_dialog(
     # Only the second dialog was refreshed (count=1, not 2).
     assert count == 1
     # Dialog 100 still dirty (will retry next cycle); dialog 200 clean.
-    rows = {
-        r[0]: r[1]
-        for r in sync_db.execute(
-            "SELECT dialog_id, needs_refresh FROM dialogs"
-        ).fetchall()
-    }
+    rows = {r[0]: r[1] for r in sync_db.execute("SELECT dialog_id, needs_refresh FROM dialogs").fetchall()}
     assert rows[100] == 1  # NOT cleared — FloodWait advanced past it
     assert rows[200] == 0  # cleared
 
@@ -240,9 +232,7 @@ async def test_recon_light_pass_flood_wait_returns_on_shutdown(
     count = await worker.run_light_pass()
 
     assert count == 0
-    row = sync_db.execute(
-        "SELECT needs_refresh FROM dialogs WHERE dialog_id=?", (100,)
-    ).fetchone()
+    row = sync_db.execute("SELECT needs_refresh FROM dialogs WHERE dialog_id=?", (100,)).fetchone()
     assert row[0] == 1  # still dirty — no UPDATE happened
 
 
@@ -261,13 +251,9 @@ async def test_recon_light_pass_access_lost_sets_hidden(
     worker = DialogReconciliationWorker(mock_client, sync_db, shutdown_event)
     await worker.run_light_pass()
 
-    synced = sync_db.execute(
-        "SELECT status FROM synced_dialogs WHERE dialog_id=?", (100,)
-    ).fetchone()
+    synced = sync_db.execute("SELECT status FROM synced_dialogs WHERE dialog_id=?", (100,)).fetchone()
     assert synced[0] == "access_lost"
-    dialog = sync_db.execute(
-        "SELECT hidden FROM dialogs WHERE dialog_id=?", (100,)
-    ).fetchone()
+    dialog = sync_db.execute("SELECT hidden FROM dialogs WHERE dialog_id=?", (100,)).fetchone()
     assert dialog[0] == 1
 
 
@@ -287,9 +273,7 @@ async def test_recon_light_pass_peer_invalid_leaves_dirty(
         count = await worker.run_light_pass()
 
     assert count == 0
-    row = sync_db.execute(
-        "SELECT needs_refresh, hidden FROM dialogs WHERE dialog_id=?", (100,)
-    ).fetchone()
+    row = sync_db.execute("SELECT needs_refresh, hidden FROM dialogs WHERE dialog_id=?", (100,)).fetchone()
     assert row[0] == 1  # still dirty
     assert row[1] == 0  # NOT hidden (this is not access loss)
     assert any("recon_light_pass_peer_invalid" in r.message for r in caplog.records)
@@ -310,9 +294,9 @@ async def test_recon_light_pass_emits_complete_log(
     with caplog.at_level(logging.INFO):
         await worker.run_light_pass()
 
-    assert any(
-        "recon_light_pass_complete count=" in r.message for r in caplog.records
-    ), f"missing recon_light_pass_complete log; saw: {[r.message for r in caplog.records]}"
+    assert any("recon_light_pass_complete count=" in r.message for r in caplog.records), (
+        f"missing recon_light_pass_complete log; saw: {[r.message for r in caplog.records]}"
+    )
 
 
 # --- full pass tests --------------------------------------------------------
@@ -335,9 +319,7 @@ async def test_recon_full_pass_upserts_returned(
 
     assert count == 2
     assert completed is True
-    rows = sync_db.execute(
-        "SELECT dialog_id, name, hidden FROM dialogs ORDER BY dialog_id"
-    ).fetchall()
+    rows = sync_db.execute("SELECT dialog_id, name, hidden FROM dialogs ORDER BY dialog_id").fetchall()
     assert rows[0][1] == "A_new" and rows[0][2] == 0
     assert rows[1][1] == "B_new" and rows[1][2] == 0
 
@@ -352,17 +334,12 @@ async def test_recon_full_pass_hides_missing(
     _seed_dialog_row(sync_db, 200)
     _seed_dialog_row(sync_db, 300)
     # iter_dialogs returns only 100 and 200; 300 must be soft-deleted.
-    mock_client.iter_dialogs = MagicMock(
-        return_value=_async_iter([_make_dialog(100), _make_dialog(200)])
-    )
+    mock_client.iter_dialogs = MagicMock(return_value=_async_iter([_make_dialog(100), _make_dialog(200)]))
 
     worker = DialogReconciliationWorker(mock_client, sync_db, shutdown_event)
     await worker.run_full_pass()
 
-    hidden = {
-        row[0]: row[1]
-        for row in sync_db.execute("SELECT dialog_id, hidden FROM dialogs").fetchall()
-    }
+    hidden = {row[0]: row[1] for row in sync_db.execute("SELECT dialog_id, hidden FROM dialogs").fetchall()}
     assert hidden[100] == 0
     assert hidden[200] == 0
     assert hidden[300] == 1
@@ -402,10 +379,7 @@ async def test_recon_full_pass_flood_wait_skips_soft_delete(
     # 1 row UPSERTed before flood; soft-delete branch did NOT run.
     assert count == 1
     assert completed is False
-    hidden = {
-        row[0]: row[1]
-        for row in sync_db.execute("SELECT dialog_id, hidden FROM dialogs").fetchall()
-    }
+    hidden = {row[0]: row[1] for row in sync_db.execute("SELECT dialog_id, hidden FROM dialogs").fetchall()}
     assert hidden[200] == 0  # NOT hidden — soft-delete branch never ran
 
 
@@ -449,8 +423,11 @@ async def test_run_reconciliation_loop_runs_full_pass_first(
     # Run the loop; short hourly interval so the first full pass fires promptly.
     task = asyncio.create_task(
         run_reconciliation_loop(
-            mock_client, sync_db, event,
-            hourly_interval=0.01, daily_interval=86400.0,
+            mock_client,
+            sync_db,
+            event,
+            hourly_interval=0.01,
+            daily_interval=86400.0,
         )
     )
     await asyncio.wait_for(iter_called.wait(), timeout=2.0)
@@ -484,12 +461,8 @@ async def test_recon_loop_full_pass_failure_does_not_advance_last_full_pass(
         light_call_count += 1
         return 0
 
-    monkeypatch.setattr(
-        dialog_sync.DialogReconciliationWorker, "run_full_pass", _fake_full
-    )
-    monkeypatch.setattr(
-        dialog_sync.DialogReconciliationWorker, "run_light_pass", _fake_light
-    )
+    monkeypatch.setattr(dialog_sync.DialogReconciliationWorker, "run_full_pass", _fake_full)
+    monkeypatch.setattr(dialog_sync.DialogReconciliationWorker, "run_light_pass", _fake_light)
 
     event = asyncio.Event()
     # Use small interval so we get multiple iterations quickly, but daily
@@ -497,8 +470,11 @@ async def test_recon_loop_full_pass_failure_does_not_advance_last_full_pass(
     # check will still trigger run_full_pass.
     task = asyncio.create_task(
         run_reconciliation_loop(
-            mock_client, sync_db, event,
-            hourly_interval=0.01, daily_interval=0.01,
+            mock_client,
+            sync_db,
+            event,
+            hourly_interval=0.01,
+            daily_interval=0.01,
         )
     )
     await asyncio.sleep(0.1)  # enough for several iterations
@@ -508,8 +484,7 @@ async def test_recon_loop_full_pass_failure_does_not_advance_last_full_pass(
     # Full pass should have been attempted MORE THAN ONCE — proves
     # last_full_pass did not advance after the first (failed) attempt.
     assert full_call_count >= 2, (
-        f"run_full_pass attempted only {full_call_count} time(s) — "
-        "last_full_pass advanced despite the failure"
+        f"run_full_pass attempted only {full_call_count} time(s) — last_full_pass advanced despite the failure"
     )
     # Light pass also runs every iteration.
     assert light_call_count >= 2
@@ -548,9 +523,7 @@ async def test_refresh_forum_topics_upserts(
     count = await worker._refresh_forum_topics(dialog_id=999, entity=entity)
 
     assert count == 1
-    row = sync_db.execute(
-        "SELECT title FROM topic_metadata WHERE dialog_id=999 AND topic_id=1"
-    ).fetchone()
+    row = sync_db.execute("SELECT title FROM topic_metadata WHERE dialog_id=999 AND topic_id=1").fetchone()
     assert row is not None, "topic_metadata row must exist after refresh"
     assert row[0] == "General"
 
@@ -583,9 +556,7 @@ async def test_light_pass_refreshes_forum_topics(
     mock_client.side_effect = None
 
     worker = DialogReconciliationWorker(mock_client, sync_db, shutdown_event)
-    with patch.object(
-        worker, "_refresh_forum_topics", wraps=worker._refresh_forum_topics
-    ) as spy:
+    with patch.object(worker, "_refresh_forum_topics", wraps=worker._refresh_forum_topics) as spy:
         await worker.run_light_pass()
 
     spy.assert_called_once_with(777, forum_entity)

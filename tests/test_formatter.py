@@ -603,10 +603,6 @@ def test_structured_read_markers_match_formatter_marker_positions() -> None:
     expected = _compute_inline_markers(messages, read_state)
 
     structured = _list_messages_structured_messages(rows, read_state=read_state, dialog_type="User")
-    actual = {
-        item["msg_id"]: item["read_markers"][0]["label"]
-        for item in structured
-        if item["read_markers"]
-    }
+    actual = {item["msg_id"]: item["read_markers"][0]["label"] for item in structured if item["read_markers"]}
 
     assert actual == expected

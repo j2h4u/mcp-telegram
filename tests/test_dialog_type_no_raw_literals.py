@@ -11,6 +11,7 @@ unification removed (phase-53).
 If this test fails: replace the flagged literal with a ``DialogType`` member, or
 route the value through ``DialogType.from_entity`` / ``DialogType.parse``.
 """
+
 from __future__ import annotations
 
 import ast
@@ -24,7 +25,14 @@ ALLOWED_FILES = {"models.py"}
 # Capitalized vocabulary — these quoted strings are almost always a dialog/entity
 # type and must never appear as literals outside models.py.
 CAPITALIZED_TYPE_LITERALS = {
-    "User", "Bot", "Channel", "Supergroup", "Megagroup", "Group", "Forum", "Chat",
+    "User",
+    "Bot",
+    "Channel",
+    "Supergroup",
+    "Megagroup",
+    "Group",
+    "Forum",
+    "Chat",
 }
 # Lowercase vocabulary — flagged only when used as a comparison operand (== / != / in),
 # the high-signal "branching on a raw dialog-type string" pattern. We list only the
@@ -38,7 +46,9 @@ CAPITALIZED_TYPE_LITERALS = {
 #   - "user"/"bot"/"group" collide with common words and other vocabularies, so they
 #     are covered by the capitalized guard + the from_entity/parse funnel, not here.
 LOWERCASE_TYPE_LITERALS = {
-    "supergroup", "megagroup", "forum",
+    "supergroup",
+    "megagroup",
+    "forum",
 }
 
 
@@ -60,10 +70,9 @@ def test_no_capitalized_dialog_type_literals_outside_models():
                 and isinstance(node.value, str)
                 and node.value in CAPITALIZED_TYPE_LITERALS
             ):
-                offenders.append(f"{path.relative_to(SRC)}:{node.lineno}  \"{node.value}\"")
+                offenders.append(f'{path.relative_to(SRC)}:{node.lineno}  "{node.value}"')
     assert not offenders, (
-        "Raw capitalized dialog-type literals found — use models.DialogType instead:\n  "
-        + "\n  ".join(offenders)
+        "Raw capitalized dialog-type literals found — use models.DialogType instead:\n  " + "\n  ".join(offenders)
     )
 
 
@@ -85,10 +94,7 @@ def test_no_lowercase_dialog_type_comparison_literals_outside_models():
                     consts = [e for e in op.elts if isinstance(e, ast.Constant)]
                 for c in consts:
                     if isinstance(c.value, str) and c.value in LOWERCASE_TYPE_LITERALS:
-                        offenders.append(
-                            f"{path.relative_to(SRC)}:{c.lineno}  compare vs \"{c.value}\""
-                        )
+                        offenders.append(f'{path.relative_to(SRC)}:{c.lineno}  compare vs "{c.value}"')
     assert not offenders, (
-        "Raw lowercase dialog-type comparison literals found — use models.DialogType:\n  "
-        + "\n  ".join(offenders)
+        "Raw lowercase dialog-type comparison literals found — use models.DialogType:\n  " + "\n  ".join(offenders)
     )

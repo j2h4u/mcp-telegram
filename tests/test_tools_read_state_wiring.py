@@ -173,9 +173,7 @@ async def test_list_messages_tool_renders_inline_marker_in_output() -> None:
     assert result.content == ()
     assert result.structured_content is not None
     markers = [
-        marker["label"]
-        for message in result.structured_content["messages"]
-        for marker in message["inline_markers"]
+        marker["label"] for message in result.structured_content["messages"] for marker in message["inline_markers"]
     ]
     assert any(
         marker in markers

@@ -18,6 +18,7 @@ Key design constraints (from plan reviews):
 - run_cold_backfill_pass returns a structured ColdPassResult (cycle-4 MEDIUM) so the
   loop can distinguish idle (NO_DUE_PEER) from zero-write work (ZERO_PERSISTED).
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -42,25 +43,17 @@ logger = logging.getLogger(__name__)
 # Module-level constants (all env-overridable for operator tuning / UAT)
 # ---------------------------------------------------------------------------
 
-_COLD_BACKFILL_INTERVAL_S = float(
-    os.environ.get("ACTIVITY_COLD_BACKFILL_SECONDS", "300")
-)
+_COLD_BACKFILL_INTERVAL_S = float(os.environ.get("ACTIVITY_COLD_BACKFILL_SECONDS", "300"))
 # Minimum pause between batches even when work exists — prevents request-rate spikes.
 # _COLD_BACKFILL_BATCH_PAUSE_S is intentionally short (5s) so deep-history peers
 # do not stall more-recently-active peers indefinitely.
-_COLD_BACKFILL_BATCH_PAUSE_S = float(
-    os.environ.get("ACTIVITY_COLD_BACKFILL_BATCH_PAUSE", "5")
-)
+_COLD_BACKFILL_BATCH_PAUSE_S = float(os.environ.get("ACTIVITY_COLD_BACKFILL_BATCH_PAUSE", "5"))
 # Throttled enrollment cadence — Tier B calls build_working_set no more often than
 # this so it can enroll/select peers without depending on Tier A having run.
-_COLD_ENROLL_EVERY_S = float(
-    os.environ.get("ACTIVITY_COLD_ENROLL_SECONDS", "1800")
-)
+_COLD_ENROLL_EVERY_S = float(os.environ.get("ACTIVITY_COLD_ENROLL_SECONDS", "1800"))
 # Transient backoff for ACCESS_SKIP: resolve_input_peer returned None or a timeout.
 # A bounded retry ensures the peer is re-selectable without permanently completing.
-_COLD_ACCESS_RETRY_S = float(
-    os.environ.get("ACTIVITY_COLD_ACCESS_RETRY_SECONDS", "3600")
-)
+_COLD_ACCESS_RETRY_S = float(os.environ.get("ACTIVITY_COLD_ACCESS_RETRY_SECONDS", "3600"))
 
 _BACKFILL_BATCH_LIMIT = 100
 
@@ -68,6 +61,7 @@ _BACKFILL_BATCH_LIMIT = 100
 # ---------------------------------------------------------------------------
 # Structured result — cycle-4 MEDIUM: NOT a bare int
 # ---------------------------------------------------------------------------
+
 
 class ColdPassOutcome(StrEnum):
     NO_DUE_PEER = "no_due_peer"
@@ -84,6 +78,7 @@ class ColdPassOutcome(StrEnum):
 @dataclass
 class ColdPassResult:
     """Structured result from run_cold_backfill_pass."""
+
     outcome: ColdPassOutcome
     persisted: int  # count of rows written this pass; 0 unless outcome==WROTE
 
@@ -91,6 +86,7 @@ class ColdPassResult:
 # ---------------------------------------------------------------------------
 # Single-pass implementation
 # ---------------------------------------------------------------------------
+
 
 async def run_cold_backfill_pass(
     client: Any,
@@ -143,7 +139,8 @@ async def run_cold_backfill_pass(
 
     logger.debug(
         "activity_cold_backfill_pass_start dialog_id=%r offset_id=%d",
-        dialog_id, offset_id,
+        dialog_id,
+        offset_id,
     )
 
     result = await sweep_peer_once(
@@ -163,14 +160,16 @@ async def run_cold_backfill_pass(
         # NEVER touch any hot_* field.
         next_retry_at = now + (result.flood_wait_seconds or 0)
         _save_dialog_state(
-            conn, dialog_id,
+            conn,
+            dialog_id,
             cold_status="pending",
             cold_next_retry_at=next_retry_at,
         )
         logger.warning(
-            "activity_cold_backfill_flood dialog_id=%r flood_wait_seconds=%d"
-            " cold_next_retry_at=%d",
-            dialog_id, result.flood_wait_seconds, next_retry_at,
+            "activity_cold_backfill_flood dialog_id=%r flood_wait_seconds=%d cold_next_retry_at=%d",
+            dialog_id,
+            result.flood_wait_seconds,
+            next_retry_at,
         )
         return ColdPassResult(outcome=ColdPassOutcome.FLOOD_WAIT, persisted=0)
 
@@ -180,14 +179,16 @@ async def run_cold_backfill_pass(
         # cold_offset_id is left UNCHANGED so the walk resumes from the same point.
         next_retry_at = int(now + _COLD_ACCESS_RETRY_S)
         _save_dialog_state(
-            conn, dialog_id,
+            conn,
+            dialog_id,
             cold_status="pending",
             cold_next_retry_at=next_retry_at,
             cold_last_error="access_skip",
         )
         logger.debug(
             "activity_cold_backfill_access_skip dialog_id=%r cold_next_retry_at=%d",
-            dialog_id, next_retry_at,
+            dialog_id,
+            next_retry_at,
         )
         # A peer WAS processed — return ZERO_PERSISTED so loop does not idle
         return ColdPassResult(outcome=ColdPassOutcome.ZERO_PERSISTED, persisted=0)
@@ -196,13 +197,15 @@ async def run_cold_backfill_pass(
         # Genuine empty batch from a reachable peer — the ONLY path that completes.
         # hit_floor is True only here (see SweepResult.hit_floor property).
         _save_dialog_state(
-            conn, dialog_id,
+            conn,
+            dialog_id,
             cold_status="complete",
             cold_next_retry_at=None,
         )
         logger.info(
             "activity_cold_backfill_complete dialog_id=%r offset_id=%d",
-            dialog_id, offset_id,
+            dialog_id,
+            offset_id,
         )
         # Peer was processed; return ZERO_PERSISTED (not NO_DUE_PEER)
         return ColdPassResult(outcome=ColdPassOutcome.ZERO_PERSISTED, persisted=0)
@@ -211,15 +214,18 @@ async def run_cold_backfill_pass(
     # Advance cold_offset_id downward to result.min_id (backward walk — concern 2)
     new_offset = result.min_id
     _save_dialog_state(
-        conn, dialog_id,
+        conn,
+        dialog_id,
         cold_offset_id=new_offset,
         cold_status="pending",
         cold_next_retry_at=None,
     )
     logger.debug(
-        "activity_cold_backfill_batch dialog_id=%r old_offset=%d new_offset=%r"
-        " persisted=%d",
-        dialog_id, offset_id, new_offset, result.persisted,
+        "activity_cold_backfill_batch dialog_id=%r old_offset=%d new_offset=%r persisted=%d",
+        dialog_id,
+        offset_id,
+        new_offset,
+        result.persisted,
     )
 
     if result.persisted and result.persisted > 0:
@@ -232,6 +238,7 @@ async def run_cold_backfill_pass(
 # ---------------------------------------------------------------------------
 # Low-priority loop wrapper
 # ---------------------------------------------------------------------------
+
 
 async def run_cold_backfill_loop(
     client: Any,
@@ -262,9 +269,7 @@ async def run_cold_backfill_loop(
         if now_mono - last_enroll_at >= _COLD_ENROLL_EVERY_S:
             try:
                 enrolled = await build_working_set(client, conn)
-                logger.debug(
-                    "activity_cold_backfill_enroll enrolled=%d", enrolled
-                )
+                logger.debug("activity_cold_backfill_enroll enrolled=%d", enrolled)
             except Exception:
                 logger.warning("activity_cold_backfill_enroll_error", exc_info=True)
             last_enroll_at = asyncio.get_running_loop().time()
@@ -274,22 +279,19 @@ async def run_cold_backfill_loop(
         except Exception:
             logger.warning("activity_cold_backfill_error", exc_info=True)
             # Treat as NO_DUE_PEER for sleep purposes to avoid tight error loops
-            pass_result = ColdPassResult(
-                outcome=ColdPassOutcome.NO_DUE_PEER, persisted=0
-            )
+            pass_result = ColdPassResult(outcome=ColdPassOutcome.NO_DUE_PEER, persisted=0)
 
         # Sleep policy: long idle only on NO_DUE_PEER; short batch pause otherwise
         if pass_result.outcome is ColdPassOutcome.NO_DUE_PEER:
             sleep_s = idle_interval
-            logger.debug(
-                "activity_cold_backfill_idle sleeping=%.0fs", sleep_s
-            )
+            logger.debug("activity_cold_backfill_idle sleeping=%.0fs", sleep_s)
         else:
             sleep_s = _COLD_BACKFILL_BATCH_PAUSE_S
             logger.debug(
-                "activity_cold_backfill_loop outcome=%s persisted=%d"
-                " sleeping=%.0fs",
-                pass_result.outcome, pass_result.persisted, sleep_s,
+                "activity_cold_backfill_loop outcome=%s persisted=%d sleeping=%.0fs",
+                pass_result.outcome,
+                pass_result.persisted,
+                sleep_s,
             )
 
         try:

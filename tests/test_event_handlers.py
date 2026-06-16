@@ -1295,13 +1295,12 @@ async def test_linked_chat_refresh_updates_dialogs(
 
     # Row reflects the new linked_chat_id (6666666666 normalised to -1006666666666)
     row = sync_db.execute(
-        "SELECT linked_chat_id, linked_chat_resolved_at, type, hidden, needs_refresh "
-        "FROM dialogs WHERE dialog_id = ?",
+        "SELECT linked_chat_id, linked_chat_resolved_at, type, hidden, needs_refresh FROM dialogs WHERE dialog_id = ?",
         (dialog_id,),
     ).fetchone()
     assert row is not None
     assert row[0] == -1006666666666, f"Expected -1006666666666, got {row[0]}"
-    assert before <= row[1] <= after + 1, f"resolved_at={row[1]} not within [{before}, {after+1}]"
+    assert before <= row[1] <= after + 1, f"resolved_at={row[1]} not within [{before}, {after + 1}]"
     # Unrelated columns unchanged
     assert row[2] == "channel"
     assert row[3] == 0
@@ -1346,8 +1345,7 @@ async def test_linked_chat_refresh_skips_never_resolved(
     await manager.on_raw_channel_chat_update(update)  # must not raise
 
     row = sync_db.execute(
-        "SELECT linked_chat_id, linked_chat_resolved_at, needs_refresh "
-        "FROM dialogs WHERE dialog_id = ?",
+        "SELECT linked_chat_id, linked_chat_resolved_at, needs_refresh FROM dialogs WHERE dialog_id = ?",
         (dialog_id,),
     ).fetchone()
     assert row is not None
@@ -1401,8 +1399,7 @@ async def test_linked_chat_refresh_flood_no_op(
     await manager.on_raw_channel_chat_update(update)  # must not raise
 
     row = sync_db.execute(
-        "SELECT linked_chat_id, linked_chat_resolved_at, needs_refresh "
-        "FROM dialogs WHERE dialog_id = ?",
+        "SELECT linked_chat_id, linked_chat_resolved_at, needs_refresh FROM dialogs WHERE dialog_id = ?",
         (dialog_id,),
     ).fetchone()
     assert row is not None

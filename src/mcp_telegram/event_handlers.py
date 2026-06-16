@@ -89,31 +89,21 @@ _SELECT_UNDELETED_MESSAGES_SQL = "SELECT message_id FROM messages WHERE dialog_i
 # per inter-phase contract documented in dialog_sync.py:23-27.)
 # ---------------------------------------------------------------------------
 
-_UPDATE_DIALOG_PINNED_SQL = (
-    "UPDATE dialogs SET pinned=?, snapshot_at=? WHERE dialog_id=?"
-)
+_UPDATE_DIALOG_PINNED_SQL = "UPDATE dialogs SET pinned=?, snapshot_at=? WHERE dialog_id=?"
 
-_UPDATE_DIALOG_NEEDS_REFRESH_SQL = (
-    "UPDATE dialogs SET needs_refresh=1, snapshot_at=? WHERE dialog_id=?"
-)
+_UPDATE_DIALOG_NEEDS_REFRESH_SQL = "UPDATE dialogs SET needs_refresh=1, snapshot_at=? WHERE dialog_id=?"
 
 _UPDATE_DIALOG_LAST_MESSAGE_AT_SQL = (
-    "UPDATE dialogs "
-    "SET last_message_at = MAX(COALESCE(last_message_at, 0), ?), "
-    "    snapshot_at = ? "
-    "WHERE dialog_id = ?"
+    "UPDATE dialogs SET last_message_at = MAX(COALESCE(last_message_at, 0), ?),     snapshot_at = ? WHERE dialog_id = ?"
 )
 
 # IN-list rewrite — placeholder count substituted at call site:
 _CLEAR_PINS_NOT_IN_SQL_TEMPLATE = (
-    "UPDATE dialogs SET pinned=0, snapshot_at=? "
-    "WHERE pinned=1 AND dialog_id NOT IN ({placeholders})"
+    "UPDATE dialogs SET pinned=0, snapshot_at=? WHERE pinned=1 AND dialog_id NOT IN ({placeholders})"
 )
 
 # Empty-list fast path (NOT IN () is invalid SQLite — see review):
-_CLEAR_ALL_PINS_SQL = (
-    "UPDATE dialogs SET pinned=0, snapshot_at=? WHERE pinned=1"
-)
+_CLEAR_ALL_PINS_SQL = "UPDATE dialogs SET pinned=0, snapshot_at=? WHERE pinned=1"
 
 # ---------------------------------------------------------------------------
 # Phase 42 SQL — topic_metadata event writes (target table extended by
@@ -153,13 +143,11 @@ _UPDATE_TOPIC_METADATA_EDIT_SQL = (
 )
 
 _UPDATE_TOPIC_METADATA_HIDDEN_SQL = (
-    "UPDATE topic_metadata SET hidden=1, snapshot_at=?, updated_at=? "
-    "WHERE dialog_id=? AND topic_id=?"
+    "UPDATE topic_metadata SET hidden=1, snapshot_at=?, updated_at=? WHERE dialog_id=? AND topic_id=?"
 )
 
 _UPDATE_TOPIC_METADATA_PINNED_SQL = (
-    "UPDATE topic_metadata SET pinned=?, snapshot_at=?, updated_at=? "
-    "WHERE dialog_id=? AND topic_id=?"
+    "UPDATE topic_metadata SET pinned=?, snapshot_at=?, updated_at=? WHERE dialog_id=? AND topic_id=?"
 )
 
 
@@ -375,18 +363,22 @@ class EventHandlerManager:
                     topic_id = int(getattr(msg, "id", 0))
                     if topic_id > 0:
                         title = getattr(action, "title", None) or "Topic"
-                        self._conn.execute(_UPSERT_TOPIC_METADATA_SQL, {
-                            "dialog_id": dialog_id,
-                            "topic_id": topic_id,
-                            "title": title,
-                            "icon_emoji_id": getattr(action, "icon_emoji_id", None),
-                            "updated_at": now,
-                            "snapshot_at": now,
-                            "date": int(msg_date.timestamp()) if msg_date is not None else now,
-                        })
+                        self._conn.execute(
+                            _UPSERT_TOPIC_METADATA_SQL,
+                            {
+                                "dialog_id": dialog_id,
+                                "topic_id": topic_id,
+                                "title": title,
+                                "icon_emoji_id": getattr(action, "icon_emoji_id", None),
+                                "updated_at": now,
+                                "snapshot_at": now,
+                                "date": int(msg_date.timestamp()) if msg_date is not None else now,
+                            },
+                        )
                         logger.info(
                             "event_topic_create dialog_id=%d topic_id=%d",
-                            dialog_id, topic_id,
+                            dialog_id,
+                            topic_id,
                         )
                 elif isinstance(action, MessageActionTopicEdit):
                     reply_to = getattr(msg, "reply_to", None)
@@ -401,8 +393,8 @@ class EventHandlerManager:
                         topic_id_raw = getattr(reply_to, "reply_to_msg_id", None)
                         if topic_id_raw is None:
                             logger.debug(
-                                "event_topic_edit_skipped reason=no_reply_to_msg_id "
-                                "dialog_id=%d", dialog_id,
+                                "event_topic_edit_skipped reason=no_reply_to_msg_id dialog_id=%d",
+                                dialog_id,
                             )
                         else:
                             topic_id = int(topic_id_raw)
@@ -413,7 +405,8 @@ class EventHandlerManager:
                                 )
                                 logger.info(
                                     "event_topic_hidden dialog_id=%d topic_id=%d",
-                                    dialog_id, topic_id,
+                                    dialog_id,
+                                    topic_id,
                                 )
                             else:
                                 # Non-hidden edits use an UPDATE-only path.
@@ -426,12 +419,12 @@ class EventHandlerManager:
                                 edit_icon = getattr(action, "icon_emoji_id", None)
                                 self._conn.execute(
                                     _UPDATE_TOPIC_METADATA_EDIT_SQL,
-                                    (edit_title, edit_icon, now, now,
-                                     dialog_id, topic_id, now),
+                                    (edit_title, edit_icon, now, now, dialog_id, topic_id, now),
                                 )
                                 logger.info(
                                     "event_topic_edit dialog_id=%d topic_id=%d",
-                                    dialog_id, topic_id,
+                                    dialog_id,
+                                    topic_id,
                                 )
 
             logger.info("event_new dialog_id=%d message_id=%d", dialog_id, msg.id)
@@ -461,9 +454,7 @@ class EventHandlerManager:
             # Resolve async data BEFORE opening transaction — SQLite's synchronous
             # driver cannot safely suspend inside a `with self._conn:` block while
             # another coroutine may call into the same connection.
-            existing = self._conn.execute(
-                _SELECT_MESSAGE_TEXT_SQL, (dialog_id, message_id)
-            ).fetchone()
+            existing = self._conn.execute(_SELECT_MESSAGE_TEXT_SQL, (dialog_id, message_id)).fetchone()
 
             if existing is None:
                 # Message not yet in sync.db: resolve entity map then insert.
@@ -508,9 +499,7 @@ class EventHandlerManager:
             extracted = extract_message_row(dialog_id, msg, entity_name_map=entity_name_map)
 
             with self._conn:
-                next_ver = self._conn.execute(
-                    _NEXT_VERSION_SQL, (dialog_id, message_id)
-                ).fetchone()[0]
+                next_ver = self._conn.execute(_NEXT_VERSION_SQL, (dialog_id, message_id)).fetchone()[0]
                 self._conn.execute(
                     _INSERT_VERSION_SQL,
                     (dialog_id, message_id, next_ver, old_text, edit_date_unix),
@@ -821,7 +810,8 @@ class EventHandlerManager:
                 with self._conn:
                     for did in pinned_ids:
                         self._conn.execute(
-                            _UPDATE_DIALOG_PINNED_SQL, (1, now, did),
+                            _UPDATE_DIALOG_PINNED_SQL,
+                            (1, now, did),
                         )
                     if folder_id is None:
                         # Main list: rewrite the full pin set — the update is
@@ -855,7 +845,8 @@ class EventHandlerManager:
                     return
                 with self._conn:
                     self._conn.execute(
-                        _UPDATE_DIALOG_NEEDS_REFRESH_SQL, (now, dialog_id),
+                        _UPDATE_DIALOG_NEEDS_REFRESH_SQL,
+                        (now, dialog_id),
                     )
                 logger.info(
                     "event_dialog_unread_mark dialog_id=%d needs_refresh=1",
@@ -863,7 +854,8 @@ class EventHandlerManager:
                 )
         except Exception:
             logger.exception(
-                "event_dialog_pinned_failed update=%r", type(update).__name__,
+                "event_dialog_pinned_failed update=%r",
+                type(update).__name__,
             )
 
     async def on_raw_channel_chat_update(self, update: Any) -> None:
@@ -894,7 +886,8 @@ class EventHandlerManager:
             logger.info("event_channel_chat_dirty dialog_id=%d", dialog_id)
         except Exception:
             logger.exception(
-                "event_channel_chat_update_failed update=%r", type(update).__name__,
+                "event_channel_chat_update_failed update=%r",
+                type(update).__name__,
             )
             return
 
@@ -903,12 +896,7 @@ class EventHandlerManager:
         # sweep's cold path (D-11) — we must not amplify bursts into resolution storms.
         # This await is deliberately OUTSIDE the with self._conn: block above to avoid
         # holding a write transaction open across an async round-trip.
-        if (
-            isinstance(update, UpdateChannel)
-            and row is not None
-            and row[0] == "channel"
-            and row[1] is not None
-        ):
+        if isinstance(update, UpdateChannel) and row is not None and row[0] == "channel" and row[1] is not None:
             await self._refresh_linked_chat_id(dialog_id)
 
     async def _refresh_linked_chat_id(self, dialog_id: int) -> None:
@@ -928,9 +916,7 @@ class EventHandlerManager:
 
         input_channel = await resolve_input_peer(self._client, dialog_id)
         if input_channel is None:
-            logger.debug(
-                "event_linked_chat_refresh_no_input_peer dialog_id=%d", dialog_id
-            )
+            logger.debug("event_linked_chat_refresh_no_input_peer dialog_id=%d", dialog_id)
             return
 
         try:
@@ -938,13 +924,12 @@ class EventHandlerManager:
         except FloodWaitError as exc:
             logger.warning(
                 "event_linked_chat_refresh_flood dialog_id=%d flood_wait_seconds=%d",
-                dialog_id, int(exc.seconds),
+                dialog_id,
+                int(exc.seconds),
             )
             return
         except Exception:
-            logger.debug(
-                "event_linked_chat_refresh_failed dialog_id=%d", dialog_id, exc_info=True
-            )
+            logger.debug("event_linked_chat_refresh_failed dialog_id=%d", dialog_id, exc_info=True)
             return
 
         raw = getattr(full_result.full_chat, "linked_chat_id", None)
@@ -967,7 +952,8 @@ class EventHandlerManager:
             )
         logger.info(
             "event_linked_chat_refresh dialog_id=%d linked_chat_id=%r",
-            dialog_id, normalised,
+            dialog_id,
+            normalised,
         )
 
     async def on_raw_inbox_read(self, update: Any) -> None:
@@ -998,11 +984,14 @@ class EventHandlerManager:
                 self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
             logger.info(
                 "event_raw_inbox_read dialog_id=%d max_id=%d still_unread_count=%d",
-                dialog_id, max_id, still_unread,
+                dialog_id,
+                max_id,
+                still_unread,
             )
         except Exception:
             logger.exception(
-                "event_raw_inbox_read_failed update=%r", type(update).__name__,
+                "event_raw_inbox_read_failed update=%r",
+                type(update).__name__,
             )
 
     async def on_raw_forum_topic_pinned(self, update: Any) -> None:
@@ -1032,7 +1021,9 @@ class EventHandlerManager:
                 )
             logger.info(
                 "event_forum_topic_pinned dialog_id=%d topic_id=%d pinned=%d",
-                dialog_id, topic_id, pinned,
+                dialog_id,
+                topic_id,
+                pinned,
             )
         except Exception:
             logger.exception(

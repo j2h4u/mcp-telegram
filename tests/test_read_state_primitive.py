@@ -199,5 +199,3 @@ def testapply_read_cursor_caller_controls_transaction(file_db_path: Path) -> Non
     finally:
         conn_a.close()
         conn_b.close()
-
-

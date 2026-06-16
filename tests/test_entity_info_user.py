@@ -109,17 +109,29 @@ async def test_get_entity_info_user_type() -> None:
     client.get_entity = AsyncMock(return_value=user)
     common, full, photos = MagicMock(), MagicMock(), MagicMock()
     common.chats = []
-    full.full_user = MagicMock(about=None, personal_channel_id=None, birthday=None,
-                                blocked=False, ttl_period=None, private_forward_name=None,
-                                bot_info=None, business_location=None, business_intro=None,
-                                business_work_hours=None, note=None, folder_id=None)
+    full.full_user = MagicMock(
+        about=None,
+        personal_channel_id=None,
+        birthday=None,
+        blocked=False,
+        ttl_period=None,
+        private_forward_name=None,
+        bot_info=None,
+        business_location=None,
+        business_intro=None,
+        business_work_hours=None,
+        note=None,
+        folder_id=None,
+    )
     photos.count = 0
     photos.photos = []
     client.side_effect = [common, full, photos]
     server = make_server(client=client)
-    with patch("mcp_telegram.daemon_api.GetCommonChatsRequest"), \
-         patch("mcp_telegram.daemon_api.GetFullUserRequest"), \
-         patch("mcp_telegram.daemon_api.GetUserPhotosRequest"):
+    with (
+        patch("mcp_telegram.daemon_api.GetCommonChatsRequest"),
+        patch("mcp_telegram.daemon_api.GetFullUserRequest"),
+        patch("mcp_telegram.daemon_api.GetUserPhotosRequest"),
+    ):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": 1})
     assert r["ok"] is True, f"got {r}"
     assert r["data"]["type"] == "user"
@@ -133,17 +145,29 @@ async def test_get_entity_info_bot_type() -> None:
     client.get_entity = AsyncMock(return_value=bot)
     common, full, photos = MagicMock(), MagicMock(), MagicMock()
     common.chats = []
-    full.full_user = MagicMock(about=None, personal_channel_id=None, birthday=None,
-                                blocked=False, ttl_period=None, private_forward_name=None,
-                                bot_info=None, business_location=None, business_intro=None,
-                                business_work_hours=None, note=None, folder_id=None)
+    full.full_user = MagicMock(
+        about=None,
+        personal_channel_id=None,
+        birthday=None,
+        blocked=False,
+        ttl_period=None,
+        private_forward_name=None,
+        bot_info=None,
+        business_location=None,
+        business_intro=None,
+        business_work_hours=None,
+        note=None,
+        folder_id=None,
+    )
     photos.count = 0
     photos.photos = []
     client.side_effect = [common, full, photos]
     server = make_server(client=client)
-    with patch("mcp_telegram.daemon_api.GetCommonChatsRequest"), \
-         patch("mcp_telegram.daemon_api.GetFullUserRequest"), \
-         patch("mcp_telegram.daemon_api.GetUserPhotosRequest"):
+    with (
+        patch("mcp_telegram.daemon_api.GetCommonChatsRequest"),
+        patch("mcp_telegram.daemon_api.GetFullUserRequest"),
+        patch("mcp_telegram.daemon_api.GetUserPhotosRequest"),
+    ):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": 2})
     assert r["ok"] is True
     assert r["data"]["type"] == "bot"
@@ -158,22 +182,33 @@ async def test_get_entity_info_common_envelope_user() -> None:
     client.get_entity = AsyncMock(return_value=user)
     common, full, photos = MagicMock(), MagicMock(), MagicMock()
     common.chats = []
-    full.full_user = MagicMock(about="bio text", personal_channel_id=None, birthday=None,
-                                blocked=False, ttl_period=None, private_forward_name=None,
-                                bot_info=None, business_location=None, business_intro=None,
-                                business_work_hours=None, note=None, folder_id=None)
+    full.full_user = MagicMock(
+        about="bio text",
+        personal_channel_id=None,
+        birthday=None,
+        blocked=False,
+        ttl_period=None,
+        private_forward_name=None,
+        bot_info=None,
+        business_location=None,
+        business_intro=None,
+        business_work_hours=None,
+        note=None,
+        folder_id=None,
+    )
     photos.count = 0
     photos.photos = []
     client.side_effect = [common, full, photos]
     server = make_server(client=client)
-    with patch("mcp_telegram.daemon_api.GetCommonChatsRequest"), \
-         patch("mcp_telegram.daemon_api.GetFullUserRequest"), \
-         patch("mcp_telegram.daemon_api.GetUserPhotosRequest"):
+    with (
+        patch("mcp_telegram.daemon_api.GetCommonChatsRequest"),
+        patch("mcp_telegram.daemon_api.GetFullUserRequest"),
+        patch("mcp_telegram.daemon_api.GetUserPhotosRequest"),
+    ):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": 3})
     assert r["ok"] is True
     d = r["data"]
-    for key in ("id", "type", "name", "username", "about", "my_membership",
-                "avatar_history", "avatar_count"):
+    for key in ("id", "type", "name", "username", "about", "my_membership", "avatar_history", "avatar_count"):
         assert key in d, f"missing common envelope key: {key}"
     assert d["about"] == "bio text"
     assert isinstance(d["my_membership"], dict)
@@ -187,28 +222,65 @@ async def test_get_entity_info_user_field_surface_preserved() -> None:
     client.get_entity = AsyncMock(return_value=user)
     common, full, photos = MagicMock(), MagicMock(), MagicMock()
     common.chats = []
-    full.full_user = MagicMock(about=None, personal_channel_id=999, birthday=None,
-                                blocked=False, ttl_period=86400, private_forward_name=None,
-                                bot_info=None, business_location=None, business_intro=None,
-                                business_work_hours=None, note=None, folder_id=None)
+    full.full_user = MagicMock(
+        about=None,
+        personal_channel_id=999,
+        birthday=None,
+        blocked=False,
+        ttl_period=86400,
+        private_forward_name=None,
+        bot_info=None,
+        business_location=None,
+        business_intro=None,
+        business_work_hours=None,
+        note=None,
+        folder_id=None,
+    )
     photos.count = 0
     photos.photos = []
     client.side_effect = [common, full, photos]
     server = make_server(client=client)
-    with patch("mcp_telegram.daemon_api.GetCommonChatsRequest"), \
-         patch("mcp_telegram.daemon_api.GetFullUserRequest"), \
-         patch("mcp_telegram.daemon_api.GetUserPhotosRequest"):
+    with (
+        patch("mcp_telegram.daemon_api.GetCommonChatsRequest"),
+        patch("mcp_telegram.daemon_api.GetFullUserRequest"),
+        patch("mcp_telegram.daemon_api.GetUserPhotosRequest"),
+    ):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": 4})
     d = r["data"]
     # Every field the prior user-info data dict carried — see daemon_api.py history.
-    for key in ("first_name", "last_name", "extra_usernames", "emoji_status_id",
-                "status", "phone", "lang_code", "contact", "mutual_contact",
-                "close_friend", "send_paid_messages_stars", "personal_channel_id",
-                "birthday", "verified", "premium", "bot", "scam", "fake",
-                "restricted", "restriction_reason", "blocked", "ttl_period",
-                "private_forward_name", "bot_info", "business_location",
-                "business_intro", "business_work_hours", "note", "folder_id",
-                "folder_name", "common_chats"):
+    for key in (
+        "first_name",
+        "last_name",
+        "extra_usernames",
+        "emoji_status_id",
+        "status",
+        "phone",
+        "lang_code",
+        "contact",
+        "mutual_contact",
+        "close_friend",
+        "send_paid_messages_stars",
+        "personal_channel_id",
+        "birthday",
+        "verified",
+        "premium",
+        "bot",
+        "scam",
+        "fake",
+        "restricted",
+        "restriction_reason",
+        "blocked",
+        "ttl_period",
+        "private_forward_name",
+        "bot_info",
+        "business_location",
+        "business_intro",
+        "business_work_hours",
+        "note",
+        "folder_id",
+        "folder_name",
+        "common_chats",
+    ):
         assert key in d, f"User field surface regression: missing {key}"
     assert d["phone"] == "+12025551234"
     assert d["lang_code"] == "en"
@@ -224,10 +296,20 @@ async def test_get_entity_info_no_download_keys_user() -> None:
     client.get_entity = AsyncMock(return_value=user)
     common, full, photos = MagicMock(), MagicMock(), MagicMock()
     common.chats = []
-    full.full_user = MagicMock(about=None, personal_channel_id=None, birthday=None,
-                                blocked=False, ttl_period=None, private_forward_name=None,
-                                bot_info=None, business_location=None, business_intro=None,
-                                business_work_hours=None, note=None, folder_id=None)
+    full.full_user = MagicMock(
+        about=None,
+        personal_channel_id=None,
+        birthday=None,
+        blocked=False,
+        ttl_period=None,
+        private_forward_name=None,
+        bot_info=None,
+        business_location=None,
+        business_intro=None,
+        business_work_hours=None,
+        note=None,
+        folder_id=None,
+    )
     # Photo mock with id+date AND additional bytes-like attrs that must NOT leak.
     photo = MagicMock()
     photo.id = 10001
@@ -236,9 +318,11 @@ async def test_get_entity_info_no_download_keys_user() -> None:
     photos.photos = [photo]
     client.side_effect = [common, full, photos]
     server = make_server(client=client)
-    with patch("mcp_telegram.daemon_api.GetCommonChatsRequest"), \
-         patch("mcp_telegram.daemon_api.GetFullUserRequest"), \
-         patch("mcp_telegram.daemon_api.GetUserPhotosRequest"):
+    with (
+        patch("mcp_telegram.daemon_api.GetCommonChatsRequest"),
+        patch("mcp_telegram.daemon_api.GetFullUserRequest"),
+        patch("mcp_telegram.daemon_api.GetUserPhotosRequest"),
+    ):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": 5})
 
     def _walk_keys(o):
@@ -309,19 +393,10 @@ def test_dm_peer_ids_excludes_access_lost() -> None:
     """
     server = make_server()
     # Insert two DM peers: one synced, one access_lost.
-    server._conn.execute(
-        "INSERT INTO synced_dialogs (dialog_id, status) "
-        "VALUES (?, 'synced')", (111,)
-    )
-    server._conn.execute(
-        "INSERT INTO synced_dialogs (dialog_id, status) "
-        "VALUES (?, 'access_lost')", (222,)
-    )
+    server._conn.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')", (111,))
+    server._conn.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'access_lost')", (222,))
     # Negative dialog_id (group/channel) must also stay excluded by the
     # dialog_id > 0 clause regardless of status — sanity check.
-    server._conn.execute(
-        "INSERT INTO synced_dialogs (dialog_id, status) "
-        "VALUES (?, 'synced')", (-1001,)
-    )
+    server._conn.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')", (-1001,))
     peers = server._dm_peer_ids()
     assert peers == {111}, f"expected only the synced DM peer, got {peers}"

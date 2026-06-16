@@ -425,6 +425,7 @@ async def test_registered_tools_return_structured_content_and_text(tool_name: st
 
     assert_structured_success_payload(result)
 
+
 # ---------------------------------------------------------------------------
 # Daemon mock helpers
 # ---------------------------------------------------------------------------
@@ -809,8 +810,6 @@ async def test_list_topics_dialog_not_found():
         result = await list_topics(ListTopics(dialog="nonexistent"))
 
     assert "not found" in result.content[0].text.lower()
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -1329,7 +1328,6 @@ async def test_list_topics_daemon_not_running():
     assert "not running" in text.lower() or "mcp-telegram sync" in text.lower()
 
 
-
 # ---------------------------------------------------------------------------
 # Architectural invariant: no Telegram imports in tools/
 # ---------------------------------------------------------------------------
@@ -1639,21 +1637,42 @@ async def test_get_entity_info_resolves_via_daemon():
         return_value={
             "ok": True,
             "data": {
-                "id": 12345, "type": "user", "name": "Alice Smith",
-                "username": "alice", "about": None,
+                "id": 12345,
+                "type": "user",
+                "name": "Alice Smith",
+                "username": "alice",
+                "about": None,
                 "my_membership": {"is_member": True, "is_admin": False},
-                "avatar_history": [], "avatar_count": 0,
+                "avatar_history": [],
+                "avatar_count": 0,
                 "common_chats": [{"id": -1001234, "name": "Dev Chat", "type": "supergroup"}],
-                "contact": False, "mutual_contact": False, "close_friend": False,
-                "blocked": False, "verified": False, "premium": False, "bot": False,
-                "scam": False, "fake": False, "restricted": False,
-                "restriction_reason": [], "phone": None, "lang_code": None,
-                "status": None, "emoji_status_id": None, "personal_channel_id": None,
-                "birthday": None, "folder_id": None, "folder_name": None,
-                "send_paid_messages_stars": None, "ttl_period": None,
-                "private_forward_name": None, "bot_info": None,
-                "business_location": None, "business_intro": None,
-                "business_work_hours": None, "note": None,
+                "contact": False,
+                "mutual_contact": False,
+                "close_friend": False,
+                "blocked": False,
+                "verified": False,
+                "premium": False,
+                "bot": False,
+                "scam": False,
+                "fake": False,
+                "restricted": False,
+                "restriction_reason": [],
+                "phone": None,
+                "lang_code": None,
+                "status": None,
+                "emoji_status_id": None,
+                "personal_channel_id": None,
+                "birthday": None,
+                "folder_id": None,
+                "folder_name": None,
+                "send_paid_messages_stars": None,
+                "ttl_period": None,
+                "private_forward_name": None,
+                "bot_info": None,
+                "business_location": None,
+                "business_intro": None,
+                "business_work_hours": None,
+                "note": None,
             },
         }
     )

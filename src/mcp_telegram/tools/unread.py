@@ -307,7 +307,9 @@ def _read_state_payload(read_state: ReadState | dict | None, dialog_type: str | 
     }
 
 
-def _structured_messages(rows: list[dict], *, read_state: dict | None, dialog_type: str | None) -> list[dict[str, object]]:
+def _structured_messages(
+    rows: list[dict], *, read_state: dict | None, dialog_type: str | None
+) -> list[dict[str, object]]:
     if not rows:
         return []
     ordered_rows = sorted(
@@ -318,7 +320,9 @@ def _structured_messages(rows: list[dict], *, read_state: dict | None, dialog_ty
         ),
     )
     messages = [ReadMessage(**row) for row in ordered_rows]
-    marker_by_message = _compute_inline_markers(messages, read_state) if DialogType.parse(dialog_type) == DialogType.USER else {}
+    marker_by_message = (
+        _compute_inline_markers(messages, read_state) if DialogType.parse(dialog_type) == DialogType.USER else {}
+    )
     structured: list[dict[str, object]] = []
     for row, message in zip(ordered_rows, messages, strict=False):
         marker_label = marker_by_message.get(message.id)
@@ -404,7 +408,9 @@ async def get_inbox(args: GetInbox) -> ToolResult:
         hidden_count = max(0, total_in_chat - len(message_rows))
         result_message_count += len(message_rows)
         if hidden_count:
-            hidden_count_by_dialog.append({"dialog_id": int(group.get("dialog_id", 0) or 0), "hidden_count": hidden_count})
+            hidden_count_by_dialog.append(
+                {"dialog_id": int(group.get("dialog_id", 0) or 0), "hidden_count": hidden_count}
+            )
         read_state_payload = read_state if isinstance(read_state, dict) else None
         messages = _structured_messages(
             message_rows,

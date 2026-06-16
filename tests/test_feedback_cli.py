@@ -42,8 +42,7 @@ def _insert(
     conn = sqlite3.connect(str(path))
     try:
         cur = conn.execute(
-            "INSERT INTO feedback (submitted_at, message, severity, context, model, harness) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO feedback (submitted_at, message, severity, context, model, harness) VALUES (?, ?, ?, ?, ?, ?)",
             (int(time.time()), message, severity, context, model, harness),
         )
         conn.commit()
@@ -119,9 +118,7 @@ def _patched_daemon(mock_response: dict):
     async_cm.__aenter__ = AsyncMock(return_value=mock_conn)
     async_cm.__aexit__ = AsyncMock(return_value=False)
 
-    patcher = patch(
-        "mcp_telegram.daemon_client.daemon_connection", return_value=async_cm
-    )
+    patcher = patch("mcp_telegram.daemon_client.daemon_connection", return_value=async_cm)
     return patcher, mock_conn
 
 
@@ -132,9 +129,7 @@ def test_feedback_status_sets_status(feedback_db):
     with patcher:
         result = runner.invoke(app, ["feedback", "status", "1", "done"])
     assert result.exit_code == 0, result.stdout
-    mock_conn.update_feedback_status.assert_called_once_with(
-        feedback_id=1, status="done", reason=None
-    )
+    mock_conn.update_feedback_status.assert_called_once_with(feedback_id=1, status="done", reason=None)
 
 
 def test_feedback_status_with_reason(feedback_db):
@@ -142,13 +137,9 @@ def test_feedback_status_with_reason(feedback_db):
     ok_response = {"ok": True, "data": {"message": "Feedback 2 status set to 'dismissed'."}}
     patcher, mock_conn = _patched_daemon(ok_response)
     with patcher:
-        result = runner.invoke(
-            app, ["feedback", "status", "2", "dismissed", "--reason", "noise"]
-        )
+        result = runner.invoke(app, ["feedback", "status", "2", "dismissed", "--reason", "noise"])
     assert result.exit_code == 0, result.stdout
-    mock_conn.update_feedback_status.assert_called_once_with(
-        feedback_id=2, status="dismissed", reason="noise"
-    )
+    mock_conn.update_feedback_status.assert_called_once_with(feedback_id=2, status="dismissed", reason="noise")
 
 
 def test_feedback_status_invalid_enum(feedback_db):
@@ -175,6 +166,7 @@ def test_feedback_status_daemon_error(feedback_db):
 def _set_status_direct(db_path, rid: int, status: str) -> None:
     """Test helper — directly UPDATE feedback.db (test-only; bypasses daemon)."""
     import sqlite3
+
     conn = sqlite3.connect(str(db_path))
     try:
         conn.execute("UPDATE feedback SET status=? WHERE id=?", (status, rid))

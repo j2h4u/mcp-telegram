@@ -7,6 +7,7 @@ the window drains.
 
 No scheduling state from Tier B (cold_*) is touched here.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -66,9 +67,7 @@ async def run_hot_sweep_pass(
         {"cutoff": cutoff, "now": now},
     ).fetchall()
 
-    logger.info(
-        "activity_hot_sweep_pass_start peers_selected=%d", len(rows)
-    )
+    logger.info("activity_hot_sweep_pass_start peers_selected=%d", len(rows))
 
     total_written = 0
     # FloodWait from Telegram is account-global. Once we hit one, every further
@@ -122,7 +121,10 @@ async def run_hot_sweep_pass(
                 logger.warning(
                     "activity_hot_sweep_flood dialog_id=%r flood_wait_seconds=%d"
                     " max_seen=%d pages_fetched=%d — halting pass (account-global wait)",
-                    dialog_id, result.flood_wait_seconds, max_seen, pages_fetched,
+                    dialog_id,
+                    result.flood_wait_seconds,
+                    max_seen,
+                    pages_fetched,
                 )
                 pass_flooded = True
                 break  # Stop this peer; pass_flooded halts the whole pass below
@@ -131,13 +133,15 @@ async def run_hot_sweep_pass(
             if result.skip_reason is SkipReason.ACCESS_SKIP:
                 transient_retry_at = int(time.time()) + _ACCESS_SKIP_RETRY_S
                 _save_dialog_state(
-                    conn, dialog_id,
+                    conn,
+                    dialog_id,
                     hot_next_retry_at=transient_retry_at,
                 )
                 logger.debug(
-                    "activity_hot_sweep_access_skip dialog_id=%r"
-                    " retry_at=%d pages_fetched=%d",
-                    dialog_id, transient_retry_at, pages_fetched,
+                    "activity_hot_sweep_access_skip dialog_id=%r retry_at=%d pages_fetched=%d",
+                    dialog_id,
+                    transient_retry_at,
+                    pages_fetched,
                 )
                 break  # Transient — retry next pass
 
@@ -164,9 +168,11 @@ async def run_hot_sweep_pass(
                     hot_next_retry_at=None,
                 )
                 logger.debug(
-                    "activity_hot_sweep_peer_done dialog_id=%r hot_cursor=%d"
-                    " pages_fetched=%d written=%d",
-                    dialog_id, max_seen, pages_fetched, result.persisted,
+                    "activity_hot_sweep_peer_done dialog_id=%r hot_cursor=%d pages_fetched=%d written=%d",
+                    dialog_id,
+                    max_seen,
+                    pages_fetched,
+                    result.persisted,
                 )
                 break
 
@@ -192,7 +198,8 @@ async def run_hot_sweep_pass(
 
     logger.info(
         "activity_hot_sweep_pass_done peers=%d total_written=%d",
-        len(rows), total_written,
+        len(rows),
+        total_written,
     )
     return total_written
 
@@ -212,14 +219,10 @@ async def run_hot_sweep_loop(
         logger.info("activity_hot_sweep_loop_start")
         try:
             written = await run_hot_sweep_pass(client, conn, shutdown_event)
-            logger.info(
-                "activity_hot_sweep_loop_done total_written=%d", written
-            )
+            logger.info("activity_hot_sweep_loop_done total_written=%d", written)
         except Exception:
             logger.warning("activity_hot_sweep_error", exc_info=True)
-        logger.info(
-            "activity_hot_sweep_loop_sleeping interval=%.0fs", interval
-        )
+        logger.info("activity_hot_sweep_loop_sleeping interval=%.0fs", interval)
         try:
             await asyncio.wait_for(shutdown_event.wait(), timeout=interval)
             return

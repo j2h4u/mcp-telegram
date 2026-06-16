@@ -8,14 +8,13 @@ default:
     @just --list
 
 # Run all local source checks.
-check: lint typecheck actionlint compile deadcode
+check: fmt-check lint typecheck actionlint compile deadcode
 
 # Run ruff over source, tests, and deploy helpers.
 lint:
     uv run ruff check src tests deploy
 
-# Check formatting without writing. Not yet part of `check`; the current tree
-# needs a separate formatting migration.
+# Check formatting without writing.
 fmt-check:
     uv run ruff format --check src tests deploy
 

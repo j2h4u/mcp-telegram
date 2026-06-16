@@ -126,8 +126,7 @@ class _CountingClient:
         self.call_count += 1
         if not self._call_responses:
             raise AssertionError(
-                f"unexpected client(...) call #{self.call_count} — "
-                f"no more responses queued for request {request!r}"
+                f"unexpected client(...) call #{self.call_count} — no more responses queued for request {request!r}"
             )
         return self._call_responses.pop(0)
 
@@ -244,9 +243,11 @@ async def test_get_entity_info_supergroup_small_rpc_count_le_9() -> None:
     # iter_participants yields 1000 participants => 5 pages at 200/page.
     client.set_iter_participants(list(range(1, 1001)))
 
-    with patch("mcp_telegram.daemon_api.GetFullChannelRequest"), \
-         patch("mcp_telegram.daemon_api.MessagesSearchRequest"), \
-         patch("mcp_telegram.daemon_api.InputMessagesFilterChatPhotos"):
+    with (
+        patch("mcp_telegram.daemon_api.GetFullChannelRequest"),
+        patch("mcp_telegram.daemon_api.MessagesSearchRequest"),
+        patch("mcp_telegram.daemon_api.InputMessagesFilterChatPhotos"),
+    ):
         server = _make_server(client=client)
         r = await server._dispatch({"method": "get_entity_info", "entity_id": -1001000000001})
 
@@ -257,10 +258,7 @@ async def test_get_entity_info_supergroup_small_rpc_count_le_9() -> None:
         "SPEC bound is <=9."
     )
     # iter_participants MUST have been called on the <=1000 path.
-    assert client.iter_pages > 0, (
-        "small-group path must call iter_participants "
-        f"(got iter_pages={client.iter_pages})"
-    )
+    assert client.iter_pages > 0, f"small-group path must call iter_participants (got iter_pages={client.iter_pages})"
 
 
 @pytest.mark.asyncio
@@ -290,18 +288,19 @@ async def test_get_entity_info_supergroup_large_rpc_count_le_4() -> None:
     # iter_participants must NOT be invoked on the >1000 path.
     client.set_iter_participants([])
 
-    with patch("mcp_telegram.daemon_api.GetFullChannelRequest"), \
-         patch("mcp_telegram.daemon_api.GetParticipantsRequest"), \
-         patch("mcp_telegram.daemon_api.ChannelParticipantsContacts"), \
-         patch("mcp_telegram.daemon_api.MessagesSearchRequest"), \
-         patch("mcp_telegram.daemon_api.InputMessagesFilterChatPhotos"):
+    with (
+        patch("mcp_telegram.daemon_api.GetFullChannelRequest"),
+        patch("mcp_telegram.daemon_api.GetParticipantsRequest"),
+        patch("mcp_telegram.daemon_api.ChannelParticipantsContacts"),
+        patch("mcp_telegram.daemon_api.MessagesSearchRequest"),
+        patch("mcp_telegram.daemon_api.InputMessagesFilterChatPhotos"),
+    ):
         server = _make_server(client=client)
         r = await server._dispatch({"method": "get_entity_info", "entity_id": -1001000000002})
 
     assert r["ok"] is True, f"expected ok=True, got {r!r}"
     assert client.iter_pages == 0, (
-        "HIGH-C: iter_participants must not run on the >1000 path "
-        f"(observed iter_pages={client.iter_pages})"
+        f"HIGH-C: iter_participants must not run on the >1000 path (observed iter_pages={client.iter_pages})"
     )
     assert client.total_rpc_count <= 4, (
         f"HIGH-C budget violation: above-threshold path made {client.total_rpc_count} RPCs "
@@ -332,14 +331,15 @@ async def test_get_entity_info_broadcast_channel_small_rpc_count_le_9() -> None:
     client.set_call_responses([full, _empty_search()])
     client.set_iter_participants(list(range(1, 1001)))
 
-    with patch("mcp_telegram.daemon_api.GetFullChannelRequest"), \
-         patch("mcp_telegram.daemon_api.MessagesSearchRequest"), \
-         patch("mcp_telegram.daemon_api.InputMessagesFilterChatPhotos"):
+    with (
+        patch("mcp_telegram.daemon_api.GetFullChannelRequest"),
+        patch("mcp_telegram.daemon_api.MessagesSearchRequest"),
+        patch("mcp_telegram.daemon_api.InputMessagesFilterChatPhotos"),
+    ):
         server = _make_server(client=client)
         r = await server._dispatch({"method": "get_entity_info", "entity_id": -1009999999999})
 
     assert r["ok"] is True, f"expected ok=True, got {r!r}"
     assert client.total_rpc_count <= 9, (
-        f"HIGH-C: broadcast Channel admin small-group path made "
-        f"{client.total_rpc_count} RPCs; SPEC bound is <=9."
+        f"HIGH-C: broadcast Channel admin small-group path made {client.total_rpc_count} RPCs; SPEC bound is <=9."
     )

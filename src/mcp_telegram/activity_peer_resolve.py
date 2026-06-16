@@ -9,6 +9,7 @@ This module owns:
   - LinkedChatResolution: typed result dataclass
   - _ENTITY_DETAIL_TTL_SECONDS: canonical TTL constant
 """
+
 from __future__ import annotations
 
 import json
@@ -41,6 +42,7 @@ class LinkedChatResolution:
         Set to the flood wait duration when GetFullChannelRequest was rate-
         limited. None on a clean resolution (with or without a linked chat).
     """
+
     linked_chat_id: int | None
     flood_wait_seconds: int | None
 
@@ -59,9 +61,7 @@ async def resolve_input_peer(client: Any, dialog_id: int) -> Any:
     try:
         return await client.get_input_entity(dialog_id)
     except Exception:
-        logger.debug(
-            "activity_peer_resolve_input_peer_miss dialog_id=%r", dialog_id, exc_info=True
-        )
+        logger.debug("activity_peer_resolve_input_peer_miss dialog_id=%r", dialog_id, exc_info=True)
         return None
 
 
@@ -168,6 +168,7 @@ async def resolve_linked_chat_id(
         if linked_chat_id_raw is not None:
             # Normalize to -100… canonical form via Telethon's get_peer_id helper
             from telethon.tl.types import PeerChannel
+
             if linked_chat_id_raw > 0:
                 linked_chat_id = int(get_peer_id(PeerChannel(linked_chat_id_raw)))
             else:
@@ -214,7 +215,7 @@ async def resolve_linked_chat_id(
                     channel_name = getattr(chat, "title", None)
                     channel_username = getattr(chat, "username", None)
                     break
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 continue
         try:
             with conn:
@@ -240,18 +241,16 @@ async def resolve_linked_chat_id(
                 )
                 # Write sibling fields into entity_details only if there is something
                 # to write (avoid persisting an empty {} payload).
-                has_sibling_fields = any(
-                    k in existing_blob for k in ("subscribers_count", "pinned_msg_id", "about")
-                )
+                has_sibling_fields = any(k in existing_blob for k in ("subscribers_count", "pinned_msg_id", "about"))
                 if existing_detail_row is not None or has_sibling_fields:
                     conn.execute(
-                        "INSERT OR REPLACE INTO entity_details (entity_id, detail_json, fetched_at) "
-                        "VALUES (?, ?, ?)",
+                        "INSERT OR REPLACE INTO entity_details (entity_id, detail_json, fetched_at) VALUES (?, ?, ?)",
                         (channel_id, json.dumps(existing_blob), now),
                     )
         except sqlite3.Error:
             logger.debug(
-                "activity_peer_resolve_linked_cache_write_error channel_id=%r", channel_id,
+                "activity_peer_resolve_linked_cache_write_error channel_id=%r",
+                channel_id,
                 exc_info=True,
             )
             # Continue: still return the live data
@@ -261,16 +260,15 @@ async def resolve_linked_chat_id(
     except FloodWaitError as exc:
         logger.warning(
             "activity_peer_resolve_linked_flood channel_id=%r flood_wait_seconds=%d",
-            channel_id, exc.seconds,
+            channel_id,
+            exc.seconds,
         )
         # FloodWait-NEUTRAL: do NOT sleep — surface wait to calling tier.
         # D-08: do NOT touch dialogs — resolved_at stays NULL, which IS the retry
         # signal. The next sweep cycle will re-attempt naturally.
         return LinkedChatResolution(linked_chat_id=None, flood_wait_seconds=int(exc.seconds))
     except Exception:
-        logger.debug(
-            "activity_peer_resolve_linked_error channel_id=%r", channel_id, exc_info=True
-        )
+        logger.debug("activity_peer_resolve_linked_error channel_id=%r", channel_id, exc_info=True)
         # D-08 (generic error path): do NOT touch dialogs — resolved_at stays NULL
         # so the next sweep pass retries naturally.
         return LinkedChatResolution(linked_chat_id=None, flood_wait_seconds=None)

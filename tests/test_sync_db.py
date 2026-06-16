@@ -486,14 +486,10 @@ def test_schema_v4_topic_metadata_table(tmp_sync_db_path: Path) -> None:
             "inaccessible_at",
             "updated_at",
         }
-        assert legacy_cols.issubset(columns), (
-            f"Legacy v4 columns missing after v19 migration. Got: {columns}"
-        )
+        assert legacy_cols.issubset(columns), f"Legacy v4 columns missing after v19 migration. Got: {columns}"
         # v19 columns must also be present:
         v19_cols = {"icon_emoji_id", "pinned", "hidden", "snapshot_at", "date"}
-        assert v19_cols.issubset(columns), (
-            f"v19 columns missing after migration. Got: {columns}"
-        )
+        assert v19_cols.issubset(columns), f"v19 columns missing after migration. Got: {columns}"
     finally:
         conn.close()
 
@@ -1207,15 +1203,9 @@ def test_schema_v15_drops_activity_comments(tmp_path: Path) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     with sqlite3.connect(db_path) as conn:
-        tables = {r[0] for r in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        ).fetchall()}
-        assert "activity_comments" not in tables, (
-            f"activity_comments must be dropped in v15. Tables: {sorted(tables)}"
-        )
-        idx = {r[0] for r in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='index'"
-        ).fetchall()}
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        assert "activity_comments" not in tables, f"activity_comments must be dropped in v15. Tables: {sorted(tables)}"
+        idx = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='index'").fetchall()}
         assert "idx_activity_comments_sent_at" not in idx
 
 
@@ -1224,9 +1214,7 @@ def test_schema_v15_drops_message_cache_permanently(tmp_path: Path) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     with sqlite3.connect(db_path) as conn:
-        tables = {r[0] for r in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        ).fetchall()}
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
         assert "message_cache" not in tables
 
 
@@ -1270,7 +1258,7 @@ def test_migration_v15_copies_own_only_into_messages(tmp_path: Path) -> None:
             "SELECT dialog_id, message_id, text, out, is_service, is_deleted "
             "FROM messages WHERE dialog_id = 100 ORDER BY message_id"
         ).fetchall()
-    assert rows == [(100, 1, 'hello', 1, 0, 0), (100, 2, 'world', 1, 0, 0)]
+    assert rows == [(100, 1, "hello", 1, 0, 0), (100, 2, "world", 1, 0, 0)]
 
 
 def test_migration_v15_preserves_existing_messages(tmp_path: Path) -> None:
@@ -1292,8 +1280,7 @@ def test_migration_v15_preserves_existing_messages(tmp_path: Path) -> None:
                 PRIMARY KEY (dialog_id, message_id))
         """)
         conn.execute(
-            "INSERT INTO activity_comments (dialog_id, message_id, sent_at, text) "
-            "VALUES (200, 5, 9999, 'stale-copy')"
+            "INSERT INTO activity_comments (dialog_id, message_id, sent_at, text) VALUES (200, 5, 9999, 'stale-copy')"
         )
         # Delete v15 AND any higher versions so _schema_ready returns False
         # and the migration framework re-runs from v14.
@@ -1304,7 +1291,7 @@ def test_migration_v15_preserves_existing_messages(tmp_path: Path) -> None:
         text, sent_at = conn.execute(
             "SELECT text, sent_at FROM messages WHERE dialog_id=200 AND message_id=5"
         ).fetchone()
-    assert text == 'authoritative'
+    assert text == "authoritative"
     assert sent_at == 5000
 
 
@@ -1336,14 +1323,10 @@ def test_migration_v15_enrolls_own_only_but_preserves_higher_status(tmp_path: Pa
         conn.commit()
     ensure_sync_schema(db_path)
     with sqlite3.connect(db_path) as conn:
-        status_300 = conn.execute(
-            "SELECT status FROM synced_dialogs WHERE dialog_id=300"
-        ).fetchone()[0]
-        status_400 = conn.execute(
-            "SELECT status FROM synced_dialogs WHERE dialog_id=400"
-        ).fetchone()[0]
-    assert status_300 == 'synced', "higher-status row must not downgrade"
-    assert status_400 == 'own_only'
+        status_300 = conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id=300").fetchone()[0]
+        status_400 = conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id=400").fetchone()[0]
+    assert status_300 == "synced", "higher-status row must not downgrade"
+    assert status_400 == "own_only"
 
 
 def test_migration_v14_activity_sync_state_seeded(tmp_path: Path) -> None:
@@ -1351,9 +1334,7 @@ def test_migration_v14_activity_sync_state_seeded(tmp_path: Path) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     with sqlite3.connect(db_path) as conn:
-        rows = conn.execute(
-            "SELECT key, value FROM activity_sync_state ORDER BY key"
-        ).fetchall()
+        rows = conn.execute("SELECT key, value FROM activity_sync_state ORDER BY key").fetchall()
     assert rows == [
         ("backfill_complete", "0"),
         ("backfill_offset_id", "0"),
@@ -1386,9 +1367,7 @@ def test_migration_v14_preserves_existing_data(tmp_path: Path) -> None:
     # Re-run migration (simulating daemon restart)
     ensure_sync_schema(db_path)
     with sqlite3.connect(db_path) as conn:
-        row = conn.execute(
-            "SELECT dialog_id, status FROM synced_dialogs WHERE dialog_id = 12345"
-        ).fetchone()
+        row = conn.execute("SELECT dialog_id, status FROM synced_dialogs WHERE dialog_id = 12345").fetchone()
     assert row == (12345, "synced")
 
 
@@ -1440,27 +1419,25 @@ def test_v16_fk_cascade_works_through_production_factory(tmp_path: Path) -> None
     try:
         conn.execute(
             "INSERT INTO entities (id, type, name, username, name_normalized, updated_at) "
-            "VALUES (?, 'User', 'Alice', 'alice', 'alice', 0)", (12345,)
+            "VALUES (?, 'User', 'Alice', 'alice', 'alice', 0)",
+            (12345,),
         )
         conn.execute(
-            "INSERT INTO entity_details (entity_id, detail_json, fetched_at) "
-            "VALUES (?, '{}', 1700000000)", (12345,)
+            "INSERT INTO entity_details (entity_id, detail_json, fetched_at) VALUES (?, '{}', 1700000000)", (12345,)
         )
         conn.commit()
 
         # Sanity: detail row exists.
-        assert conn.execute(
-            "SELECT COUNT(*) FROM entity_details WHERE entity_id = ?", (12345,)
-        ).fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM entity_details WHERE entity_id = ?", (12345,)).fetchone()[0] == 1
 
         # Delete the parent entities row.
         conn.execute("DELETE FROM entities WHERE id = ?", (12345,))
         conn.commit()
 
         # Cascade must have removed the detail row.
-        assert conn.execute(
-            "SELECT COUNT(*) FROM entity_details WHERE entity_id = ?", (12345,)
-        ).fetchone()[0] == 0, "FK CASCADE did not fire — PRAGMA foreign_keys is OFF on production factory"
+        assert conn.execute("SELECT COUNT(*) FROM entity_details WHERE entity_id = ?", (12345,)).fetchone()[0] == 0, (
+            "FK CASCADE did not fire — PRAGMA foreign_keys is OFF on production factory"
+        )
     finally:
         conn.close()
 
@@ -1490,12 +1467,23 @@ def test_schema_v17_dialogs_columns(tmp_sync_db_path: Path) -> None:
         columns = {str(row[1]): row for row in rows}
 
         required = {
-            "dialog_id", "name", "type", "archived", "pinned",
-            "members", "created", "last_message_at", "snapshot_at",
-            "hidden", "needs_refresh", "unread_mentions_count",
-            "unread_reactions_count", "draft_text",
+            "dialog_id",
+            "name",
+            "type",
+            "archived",
+            "pinned",
+            "members",
+            "created",
+            "last_message_at",
+            "snapshot_at",
+            "hidden",
+            "needs_refresh",
+            "unread_mentions_count",
+            "unread_reactions_count",
+            "draft_text",
             # v24 (Phase 54): linked-chat resolution columns
-            "linked_chat_id", "linked_chat_resolved_at",
+            "linked_chat_id",
+            "linked_chat_resolved_at",
         }
         assert required == set(columns.keys()), (
             f"Column mismatch.\nExpected: {sorted(required)}\nGot: {sorted(columns.keys())}"
@@ -1503,16 +1491,30 @@ def test_schema_v17_dialogs_columns(tmp_sync_db_path: Path) -> None:
 
         assert "unread_count" not in columns, "unread_count must not be stored in dialogs (MIRROR-05)"
 
-        for col_name in ("archived", "pinned", "hidden", "needs_refresh",
-                         "unread_mentions_count", "unread_reactions_count"):
+        for col_name in (
+            "archived",
+            "pinned",
+            "hidden",
+            "needs_refresh",
+            "unread_mentions_count",
+            "unread_reactions_count",
+        ):
             col = columns[col_name]
             assert col[2] == "INTEGER", f"{col_name} must be INTEGER, got {col[2]}"
             assert col[3] == 1, f"{col_name} must be NOT NULL"
             assert str(col[4]) == "0", f"{col_name} default must be 0, got {col[4]!r}"
 
-        for col_name in ("name", "type", "members", "created",
-                         "last_message_at", "snapshot_at", "draft_text",
-                         "linked_chat_id", "linked_chat_resolved_at"):
+        for col_name in (
+            "name",
+            "type",
+            "members",
+            "created",
+            "last_message_at",
+            "snapshot_at",
+            "draft_text",
+            "linked_chat_id",
+            "linked_chat_resolved_at",
+        ):
             col = columns[col_name]
             assert col[3] == 0, f"{col_name} must be nullable (NOT NULL=0), got notnull={col[3]}"
     finally:
@@ -1547,17 +1549,13 @@ def test_schema_v17_dialogs_indexes(tmp_sync_db_path: Path) -> None:
         conn.close()
 
 
-
-
 def test_dialogs_no_fk_to_synced_dialogs(tmp_sync_db_path: Path) -> None:
     """dialogs table has no FOREIGN KEY constraints (MIRROR-03: independent evolution)."""
     ensure_sync_schema(tmp_sync_db_path)
     conn = _open_sync_db(tmp_sync_db_path)
     try:
         rows = conn.execute("PRAGMA foreign_key_list(dialogs)").fetchall()
-        assert rows == [], (
-            f"dialogs must have no FK constraints (MIRROR-03). Got: {rows}"
-        )
+        assert rows == [], f"dialogs must have no FK constraints (MIRROR-03). Got: {rows}"
     finally:
         conn.close()
 
@@ -1586,9 +1584,7 @@ def test_schema_version_is_current(tmp_sync_db_path: Path) -> None:
         assert row is not None and int(row[0]) == _CURRENT_SCHEMA_VERSION, (
             f"Expected schema version {_CURRENT_SCHEMA_VERSION}, got {row}"
         )
-        assert _CURRENT_SCHEMA_VERSION == 26, (
-            f"_CURRENT_SCHEMA_VERSION must be 26, got {_CURRENT_SCHEMA_VERSION}"
-        )
+        assert _CURRENT_SCHEMA_VERSION == 26, f"_CURRENT_SCHEMA_VERSION must be 26, got {_CURRENT_SCHEMA_VERSION}"
     finally:
         conn.close()
 
@@ -1602,8 +1598,7 @@ def test_v20_adds_needs_refresh_index(tmp_path: Path) -> None:
     conn = _open_sync_db(db_path)
     try:
         row = conn.execute(
-            "SELECT name FROM sqlite_master "
-            "WHERE type='index' AND name='idx_dialogs_needs_refresh_hidden'"
+            "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_dialogs_needs_refresh_hidden'"
         ).fetchone()
         assert row is not None, (
             "idx_dialogs_needs_refresh_hidden missing — Plan 02 SELECT will "
@@ -1611,14 +1606,10 @@ def test_v20_adds_needs_refresh_index(tmp_path: Path) -> None:
         )
         # Confirm SQLite uses the new index for the planned light-pass query.
         plan = conn.execute(
-            "EXPLAIN QUERY PLAN "
-            "SELECT dialog_id FROM dialogs "
-            "WHERE needs_refresh = 1 AND hidden = 0"
+            "EXPLAIN QUERY PLAN SELECT dialog_id FROM dialogs WHERE needs_refresh = 1 AND hidden = 0"
         ).fetchall()
         plan_text = " ".join(str(r) for r in plan)
-        assert "idx_dialogs_needs_refresh_hidden" in plan_text, (
-            f"Query planner ignored the index. EXPLAIN: {plan_text}"
-        )
+        assert "idx_dialogs_needs_refresh_hidden" in plan_text, f"Query planner ignored the index. EXPLAIN: {plan_text}"
     finally:
         conn.close()
 

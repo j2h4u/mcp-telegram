@@ -131,10 +131,7 @@ class ExtractedMessage:
 def _insert_sql(table: str, dc_type: type) -> str:
     """Return INSERT OR REPLACE SQL with named params derived from a dataclass."""
     col_names = tuple(f.name for f in fields(dc_type))
-    return (
-        f"INSERT OR REPLACE INTO {table} ({', '.join(col_names)}) "
-        f"VALUES ({', '.join(':' + n for n in col_names)})"
-    )
+    return f"INSERT OR REPLACE INTO {table} ({', '.join(col_names)}) VALUES ({', '.join(':' + n for n in col_names)})"
 
 
 _SM_FIELDS = tuple(f.name for f in fields(StoredMessage))
@@ -292,12 +289,14 @@ def extract_reactions_rows(dialog_id: int, message_id: int, reactions: Any | Non
         emoticon = getattr(reaction, "emoticon", None) if reaction is not None else None
         count = getattr(item, "count", 0)
         if emoticon is not None:
-            rows.append(ReactionRecord(
-                dialog_id=dialog_id,
-                message_id=message_id,
-                emoji=emoticon,
-                count=int(count),
-            ))
+            rows.append(
+                ReactionRecord(
+                    dialog_id=dialog_id,
+                    message_id=message_id,
+                    emoji=emoticon,
+                    count=int(count),
+                )
+            )
     return rows
 
 
@@ -351,7 +350,7 @@ def _utf16_slice(text: str, offset: int, length: int) -> str | None:
         byte_offset = offset * 2
         byte_length = length * 2
         return encoded[byte_offset : byte_offset + byte_length].decode("utf-16-le")
-    except (UnicodeDecodeError, IndexError):
+    except UnicodeDecodeError, IndexError:
         return None
 
 
@@ -418,14 +417,16 @@ def extract_entity_rows(dialog_id: int, message_id: int, msg: Any) -> list[Entit
         elif entity_type == "text_url":
             # Hyperlink URL from entity attribute (display text is different)
             value = getattr(e, "url", None)
-        rows.append(EntityRecord(
-            dialog_id=dialog_id,
-            message_id=message_id,
-            offset=offset,
-            length=length,
-            type=entity_type,
-            value=value,
-        ))
+        rows.append(
+            EntityRecord(
+                dialog_id=dialog_id,
+                message_id=message_id,
+                offset=offset,
+                length=length,
+                type=entity_type,
+                value=value,
+            )
+        )
     return rows
 
 
