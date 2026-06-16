@@ -39,7 +39,7 @@ target-version = "py314"
 # ruff-specific (RUF), bugbear-adjacent simplifications (SIM). Excluding
 # stylistic/annotation/docstring/strictness categories that would flag the
 # entire codebase without changing correctness.
-select = ["E", "F", "I", "W", "B", "UP", "RUF", "SIM", "PIE", "ISC", "RSE", "FLY", "PGH", "LOG", "PLE", "C4", "DTZ", "N818", "PTH", "RET", "FURB", "PERF", "PLR0916", "PLR0917", "PLR1702", "BLE"]
+select = ["E", "F", "I", "W", "B", "UP", "RUF", "SIM", "PIE", "ISC", "RSE", "FLY", "PGH", "LOG", "PLE", "C4", "DTZ", "N818", "PTH", "RET", "FURB", "PERF", "PLR0916", "PLR0917", "PLR1702", "PLR2004", "BLE"]
 ignore = [
   "E501",   # line length — formatter handles this
   "B008",   # Typer default values
@@ -74,6 +74,7 @@ dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
   "B007",    # unused loop vars in warmup/iteration patterns
   "RUF015",  # list slicing in one-off assertions
   "PLR0917", # too many positional arguments accepted in test helpers by design
+  "PLR2004", # test magic-value comparisons
 ]
 "src/mcp_telegram/daemon_api.py" = ["E402"]
 "src/mcp_telegram/tools/discovery.py" = ["E402"]
