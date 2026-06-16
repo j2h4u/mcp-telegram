@@ -90,12 +90,20 @@ def _msg(msg_id: int, user_id: int, ts: int, text: str = "hi", replies: int = 0,
     )
 
 
+@pytest.fixture
+def conn(tmp_path):
+    connection = _make_db(tmp_path)
+    try:
+        yield connection
+    finally:
+        connection.close()
+
+
 # -- Tests --------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_backfill_inserts_rows(tmp_path):
-    conn = _make_db(tmp_path)
+async def test_backfill_inserts_rows(conn):
     m1 = _msg(100, 42, 1_700_000_100, replies=2)
     m2 = _msg(99, 42, 1_700_000_090)
     client = _FakeClient(
@@ -117,8 +125,7 @@ async def test_backfill_inserts_rows(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_backfill_respects_shutdown(tmp_path):
-    conn = _make_db(tmp_path)
+async def test_backfill_respects_shutdown(conn):
     client = _FakeClient(batches=[FakeSearchResult(messages=[_msg(100, 42, 1_700_000_000)])])
     shutdown = asyncio.Event()
     shutdown.set()
@@ -130,10 +137,8 @@ async def test_backfill_respects_shutdown(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_backfill_floodwait_recovers(tmp_path):
+async def test_backfill_floodwait_recovers(conn):
     from telethon.errors import FloodWaitError
-
-    conn = _make_db(tmp_path)
 
     class _FW(FloodWaitError):
         def __init__(self):
@@ -147,8 +152,7 @@ async def test_backfill_floodwait_recovers(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_incremental_only_new_messages(tmp_path):
-    conn = _make_db(tmp_path)
+async def test_incremental_only_new_messages(conn):
     anchor_ts = 1_700_000_000
     with conn:
         conn.execute("UPDATE activity_sync_state SET value='1' WHERE key='backfill_complete'")
@@ -178,8 +182,7 @@ async def test_incremental_only_new_messages(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_incremental_skipped_before_backfill_complete(tmp_path):
-    conn = _make_db(tmp_path)
+async def test_incremental_skipped_before_backfill_complete(conn):
     # Client should never be called — backfill not complete.
     client = _FakeClient(batches=[FakeSearchResult(messages=[_msg(100, 42, 1_700_000_000)])])
     shutdown = asyncio.Event()
@@ -190,9 +193,8 @@ async def test_incremental_skipped_before_backfill_complete(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_incremental_skipped_when_messages_empty(tmp_path):
+async def test_incremental_skipped_when_messages_empty(conn):
     """W5: backfill complete but last_sync_at not set — incremental must no-op."""
-    conn = _make_db(tmp_path)
     with conn:
         conn.execute("UPDATE activity_sync_state SET value='1' WHERE key='backfill_complete'")
     # Client should never be called — last_sync_at == 0.
@@ -205,9 +207,8 @@ async def test_incremental_skipped_when_messages_empty(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_loop_shutdown_between_passes(tmp_path):
+async def test_loop_shutdown_between_passes(conn):
     """run_activity_sync_loop returns when shutdown fires during interval sleep."""
-    conn = _make_db(tmp_path)
     client = _FakeClient(batches=[FakeSearchResult(messages=[])])  # empty → backfill completes
     shutdown = asyncio.Event()
 
@@ -222,9 +223,8 @@ async def test_loop_shutdown_between_passes(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_backfill_enrolls_dialog_as_own_only(tmp_path):
+async def test_backfill_enrolls_dialog_as_own_only(conn):
     """After backfill writes a message in dialog 42, synced_dialogs has (42, 'own_only')."""
-    conn = _make_db(tmp_path)
     m1 = _msg(100, 42, 1_700_000_100)
     client = _FakeClient(
         batches=[
@@ -240,9 +240,8 @@ async def test_backfill_enrolls_dialog_as_own_only(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_backfill_does_not_downgrade_synced_dialog(tmp_path):
+async def test_backfill_does_not_downgrade_synced_dialog(conn):
     """If dialog 42 is already status='synced', backfill must NOT downgrade it to 'own_only'."""
-    conn = _make_db(tmp_path)
     with conn:
         conn.execute(
             "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')",
@@ -262,7 +261,7 @@ async def test_backfill_does_not_downgrade_synced_dialog(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_incremental_anchor_ignores_higher_id_out0_row(tmp_path):
+async def test_incremental_anchor_ignores_higher_id_out0_row(conn):
     """Resolves the cross-AI review divergence on the shared-table anchor.
 
     Concern (Codex HIGH): once full-sync rows coexist with activity-sync
@@ -282,7 +281,6 @@ async def test_incremental_anchor_ignores_higher_id_out0_row(tmp_path):
     # different dialog with a low per-chat message_id but a recent sent_at
     # must be captured — this was the original failure mode.
     anchor_ts = 1_700_000_000
-    conn = _make_db(tmp_path)
     with conn:
         conn.execute("UPDATE activity_sync_state SET value='1' WHERE key='backfill_complete'")
         conn.execute(
@@ -322,12 +320,11 @@ async def test_incremental_anchor_ignores_higher_id_out0_row(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_run_incremental_search_request_timeout(tmp_path, caplog):
+async def test_run_incremental_search_request_timeout(conn, caplog):
     """_run_incremental exits and advances last_sync_at when SearchRequest hangs."""
     import logging
     from unittest.mock import patch
 
-    conn = _make_db(tmp_path)
     anchor_ts = 1_700_000_000
     with conn:
         conn.execute("UPDATE activity_sync_state SET value='1' WHERE key='backfill_complete'")
@@ -364,12 +361,11 @@ async def test_run_incremental_search_request_timeout(tmp_path, caplog):
 
 
 @pytest.mark.asyncio
-async def test_run_backfill_search_request_timeout(tmp_path, caplog):
+async def test_run_backfill_search_request_timeout(conn, caplog):
     """_run_backfill returns and logs when SearchRequest hangs."""
     import logging
     from unittest.mock import patch
 
-    conn = _make_db(tmp_path)
     # backfill not complete — will attempt to run
 
     class _HangingClient:
