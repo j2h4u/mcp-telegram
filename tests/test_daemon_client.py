@@ -10,7 +10,7 @@ import asyncio
 import json
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -62,6 +62,34 @@ async def test_daemon_not_running_connection_refused(tmp_path: Path) -> None:
                 pass  # pragma: no cover
 
     assert "mcp-telegram sync" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_daemon_connection_timeout_raises(tmp_path: Path) -> None:
+    """daemon_connection wraps connect timeout into DaemonNotRunningError."""
+    sock_path = tmp_path / "timeout.sock"
+
+    with (
+        patch("mcp_telegram.daemon_client.get_daemon_socket_path", return_value=sock_path),
+        patch("asyncio.open_unix_connection", side_effect=TimeoutError("connect timeout")),
+    ):
+        with pytest.raises(DaemonNotRunningError) as exc_info:
+            async with daemon_connection():
+                pass  # pragma: no cover
+
+    assert "timed out while connecting" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_daemon_connection_handles_missing_reader_writer() -> None:
+    """daemon_connection validates open_unix_connection returned pair."""
+    with (
+        patch("mcp_telegram.daemon_client.get_daemon_socket_path", return_value=Path("/tmp/missing.sock")),
+        patch("asyncio.open_unix_connection", return_value=(None, None)),
+    ):
+        with pytest.raises(DaemonNotRunningError, match="connection was not established"):
+            async with daemon_connection():
+                pass  # pragma: no cover
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +217,47 @@ async def test_request_timeout_raises_daemon_not_running(tmp_path: Path) -> None
     finally:
         server.close()
         await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_request_send_timeout_raises_daemon_not_running() -> None:
+    """Timeout while draining writer turns into DaemonNotRunningError."""
+    reader = AsyncMock(spec=asyncio.StreamReader)
+    writer = AsyncMock(spec=asyncio.StreamWriter)
+    writer.drain = AsyncMock(side_effect=TimeoutError("writer stall"))
+
+    conn = DaemonConnection(reader, writer)
+
+    with pytest.raises(DaemonNotRunningError, match="timed out while sending request"):
+        await conn.request({"method": "get_me"})
+
+
+@pytest.mark.asyncio
+async def test_request_read_connection_reset_raises_daemon_not_running() -> None:
+    """Connection reset while reading response is surfaced as daemon-not-running."""
+    reader = AsyncMock(spec=asyncio.StreamReader)
+    reader.readline = AsyncMock(side_effect=ConnectionResetError("reset"))
+    writer = AsyncMock(spec=asyncio.StreamWriter)
+    writer.drain = AsyncMock()
+
+    conn = DaemonConnection(reader, writer)
+
+    with pytest.raises(DaemonNotRunningError, match="closed the connection unexpectedly"):
+        await conn.request({"method": "get_me"})
+
+
+@pytest.mark.asyncio
+async def test_request_malformed_json_raises_daemon_not_running() -> None:
+    """Malformed daemon payload is surfaced as DaemonNotRunningError."""
+    reader = AsyncMock(spec=asyncio.StreamReader)
+    reader.readline = AsyncMock(return_value=b"{not-json}")
+    writer = AsyncMock(spec=asyncio.StreamWriter)
+    writer.drain = AsyncMock()
+
+    conn = DaemonConnection(reader, writer)
+
+    with pytest.raises(DaemonNotRunningError, match="malformed JSON"):
+        await conn.request({"method": "get_me"})
 
 
 # ---------------------------------------------------------------------------
@@ -543,3 +612,276 @@ async def test_get_inbox_convenience_defaults() -> None:
     assert req["scope"] == "personal"
     assert req["limit"] == 100
     assert req["group_size_threshold"] == 100
+
+
+@pytest.mark.asyncio
+async def test_describe_source_convenience() -> None:
+    """describe_source sends expected method payload."""
+    reader = MagicMock(spec=asyncio.StreamReader)
+    writer = MagicMock(spec=asyncio.StreamWriter)
+    conn = DaemonConnection(reader, writer)
+
+    captured: list[dict] = []
+
+    async def _mock_request(payload: dict) -> dict:
+        captured.append(payload)
+        return {"ok": True, "data": {"source_id": "telegram"}}
+
+    conn.request = _mock_request  # type: ignore[method-assign]
+
+    await conn.describe_source()
+
+    req = captured[0]
+    assert req["method"] == "describe_source"
+
+
+@pytest.mark.asyncio
+async def test_export_source_changes_convenience_with_optionals() -> None:
+    """export_source_changes includes optional fields when provided."""
+    reader = MagicMock(spec=asyncio.StreamReader)
+    writer = MagicMock(spec=asyncio.StreamWriter)
+    conn = DaemonConnection(reader, writer)
+
+    captured: list[dict] = []
+
+    async def _mock_request(payload: dict) -> dict:
+        captured.append(payload)
+        return {"ok": True, "data": {"changes": []}}
+
+    conn.request = _mock_request  # type: ignore[method-assign]
+
+    await conn.export_source_changes(
+        cursor="abc",
+        limit=50,
+        updated_after="2026-01-01T00:00:00Z",
+        updated_after_cursor="last",
+    )
+
+    req = captured[0]
+    assert req["method"] == "export_source_changes"
+    assert req["cursor"] == "abc"
+    assert req["limit"] == 50
+    assert req["updated_after"] == "2026-01-01T00:00:00Z"
+    assert req["updated_after_cursor"] == "last"
+
+
+@pytest.mark.asyncio
+async def test_export_source_changes_omits_optional_fields() -> None:
+    """export_source_changes omits optional fields by default."""
+    reader = MagicMock(spec=asyncio.StreamReader)
+    writer = MagicMock(spec=asyncio.StreamWriter)
+    conn = DaemonConnection(reader, writer)
+
+    captured: list[dict] = []
+
+    async def _mock_request(payload: dict) -> dict:
+        captured.append(payload)
+        return {"ok": True, "data": {"changes": []}}
+
+    conn.request = _mock_request  # type: ignore[method-assign]
+
+    await conn.export_source_changes()
+
+    req = captured[0]
+    assert req["method"] == "export_source_changes"
+    assert req["limit"] == 100
+    assert "updated_after" not in req
+    assert "updated_after_cursor" not in req
+
+
+@pytest.mark.asyncio
+async def test_read_source_unit_window_convenience() -> None:
+    """read_source_unit_window forwards unit_ref and framing parameters."""
+    reader = MagicMock(spec=asyncio.StreamReader)
+    writer = MagicMock(spec=asyncio.StreamWriter)
+    conn = DaemonConnection(reader, writer)
+
+    captured: list[dict] = []
+
+    async def _mock_request(payload: dict) -> dict:
+        captured.append(payload)
+        return {"ok": True, "data": {"unit_ref": "u1"}}
+
+    conn.request = _mock_request  # type: ignore[method-assign]
+
+    await conn.read_source_unit_window(unit_ref="u1", before=2, after=3)
+
+    req = captured[0]
+    assert req["method"] == "read_source_unit_window"
+    assert req["unit_ref"] == "u1"
+    assert req["before"] == 2
+    assert req["after"] == 3
+
+
+@pytest.mark.asyncio
+async def test_get_sync_status_convenience() -> None:
+    """get_sync_status forwards dialog_id exactly."""
+    reader = MagicMock(spec=asyncio.StreamReader)
+    writer = MagicMock(spec=asyncio.StreamWriter)
+    conn = DaemonConnection(reader, writer)
+
+    captured: list[dict] = []
+
+    async def _mock_request(payload: dict) -> dict:
+        captured.append(payload)
+        return {"ok": True, "data": {"status": "synced"}}
+
+    conn.request = _mock_request  # type: ignore[method-assign]
+
+    await conn.get_sync_status(dialog_id=228055330)
+
+    req = captured[0]
+    assert req["method"] == "get_sync_status"
+    assert req["dialog_id"] == 228055330
+
+
+@pytest.mark.asyncio
+async def test_get_sync_alerts_convenience_defaults() -> None:
+    """get_sync_alerts sends defaults when params are omitted."""
+    reader = MagicMock(spec=asyncio.StreamReader)
+    writer = MagicMock(spec=asyncio.StreamWriter)
+    conn = DaemonConnection(reader, writer)
+
+    captured: list[dict] = []
+
+    async def _mock_request(payload: dict) -> dict:
+        captured.append(payload)
+        return {"ok": True, "data": {"alerts": []}}
+
+    conn.request = _mock_request  # type: ignore[method-assign]
+
+    await conn.get_sync_alerts()
+
+    req = captured[0]
+    assert req["method"] == "get_sync_alerts"
+    assert req["since"] == 0
+    assert req["limit"] == 50
+
+
+@pytest.mark.asyncio
+async def test_get_sync_alerts_convenience_custom_params() -> None:
+    """get_sync_alerts forwards custom since/limit values."""
+    reader = MagicMock(spec=asyncio.StreamReader)
+    writer = MagicMock(spec=asyncio.StreamWriter)
+    conn = DaemonConnection(reader, writer)
+
+    captured: list[dict] = []
+
+    async def _mock_request(payload: dict) -> dict:
+        captured.append(payload)
+        return {"ok": True, "data": {"alerts": []}}
+
+    conn.request = _mock_request  # type: ignore[method-assign]
+
+    await conn.get_sync_alerts(since=10, limit=5)
+
+    req = captured[0]
+    assert req["method"] == "get_sync_alerts"
+    assert req["since"] == 10
+    assert req["limit"] == 5
+
+
+@pytest.mark.asyncio
+async def test_submit_feedback_convenience_with_optional_fields() -> None:
+    """submit_feedback forwards optional context and status metadata."""
+    reader = MagicMock(spec=asyncio.StreamReader)
+    writer = MagicMock(spec=asyncio.StreamWriter)
+    conn = DaemonConnection(reader, writer)
+
+    captured: list[dict] = []
+
+    async def _mock_request(payload: dict) -> dict:
+        captured.append(payload)
+        return {"ok": True}
+
+    conn.request = _mock_request  # type: ignore[method-assign]
+
+    await conn.submit_feedback(
+        message="text",
+        severity="high",
+        context="ctx",
+        model="mcp",
+        harness="tests",
+    )
+
+    req = captured[0]
+    assert req["method"] == "submit_feedback"
+    assert req["message"] == "text"
+    assert req["severity"] == "high"
+    assert req["context"] == "ctx"
+    assert req["model"] == "mcp"
+    assert req["harness"] == "tests"
+
+
+@pytest.mark.asyncio
+async def test_submit_feedback_omits_optional_fields() -> None:
+    """submit_feedback requires only message when optional args are omitted."""
+    reader = MagicMock(spec=asyncio.StreamReader)
+    writer = MagicMock(spec=asyncio.StreamWriter)
+    conn = DaemonConnection(reader, writer)
+
+    captured: list[dict] = []
+
+    async def _mock_request(payload: dict) -> dict:
+        captured.append(payload)
+        return {"ok": True}
+
+    conn.request = _mock_request  # type: ignore[method-assign]
+
+    await conn.submit_feedback(message="just text")
+
+    req = captured[0]
+    assert req["method"] == "submit_feedback"
+    assert req["message"] == "just text"
+    assert "severity" not in req
+    assert "context" not in req
+    assert "model" not in req
+    assert "harness" not in req
+
+
+@pytest.mark.asyncio
+async def test_update_feedback_status_convenience_with_reason() -> None:
+    """update_feedback_status includes optional reason when provided."""
+    reader = MagicMock(spec=asyncio.StreamReader)
+    writer = MagicMock(spec=asyncio.StreamWriter)
+    conn = DaemonConnection(reader, writer)
+
+    captured: list[dict] = []
+
+    async def _mock_request(payload: dict) -> dict:
+        captured.append(payload)
+        return {"ok": True}
+
+    conn.request = _mock_request  # type: ignore[method-assign]
+
+    await conn.update_feedback_status(feedback_id=77, status="done", reason="repro accepted")
+
+    req = captured[0]
+    assert req["method"] == "update_feedback_status"
+    assert req["id"] == 77
+    assert req["status"] == "done"
+    assert req["reason"] == "repro accepted"
+
+
+@pytest.mark.asyncio
+async def test_update_feedback_status_omits_optional_reason() -> None:
+    """update_feedback_status omits reason when not provided."""
+    reader = MagicMock(spec=asyncio.StreamReader)
+    writer = MagicMock(spec=asyncio.StreamWriter)
+    conn = DaemonConnection(reader, writer)
+
+    captured: list[dict] = []
+
+    async def _mock_request(payload: dict) -> dict:
+        captured.append(payload)
+        return {"ok": True}
+
+    conn.request = _mock_request  # type: ignore[method-assign]
+
+    await conn.update_feedback_status(feedback_id=77, status="done")
+
+    req = captured[0]
+    assert req["method"] == "update_feedback_status"
+    assert req["id"] == 77
+    assert req["status"] == "done"
+    assert "reason" not in req
