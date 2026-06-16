@@ -278,7 +278,9 @@ async def test_resolve_linked_chat_id_cache_miss_calls_once_and_merges():
         # in entity_details.detail_json.
         written = _read_entity_details(conn, channel_id)
         assert written is not None
-        assert "linked_chat_id" not in written, "linked_chat_id must NOT be written into entity_details (Phase 54 contract)"
+        assert "linked_chat_id" not in written, (
+            "linked_chat_id must NOT be written into entity_details (Phase 54 contract)"
+        )
         # The merge preserved the about field (updated from the fresh result)
         assert "about" in written
         # The live result wrote its row into dialogs instead
@@ -613,7 +615,9 @@ async def test_resolve_linked_chat_id_flood_wait_leaves_dialogs_untouched():
         dr = _read_dialogs_row(conn, channel_id)
         assert dr is not None
         assert dr["linked_chat_id"] is None, "FloodWait must NOT write linked_chat_id into dialogs"
-        assert dr["linked_chat_resolved_at"] is None, "FloodWait must NOT set resolved_at — NULL IS the retry signal (D-08)"
+        assert dr["linked_chat_resolved_at"] is None, (
+            "FloodWait must NOT set resolved_at — NULL IS the retry signal (D-08)"
+        )
 
         # No additional rows inserted
         row_count = conn.execute("SELECT COUNT(*) FROM dialogs WHERE dialog_id = ?", (channel_id,)).fetchone()[0]

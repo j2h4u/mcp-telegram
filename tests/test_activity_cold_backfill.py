@@ -214,8 +214,12 @@ async def test_backward_walk_cold_offset_id_decreases(monkeypatch):
         # Two passes: first returns ids 100-200, second returns ids 50-99
         scripted = {
             dialog_id: [
-                _normal_result(list(range(100, 201)), ),  # pass 1: min_id=100
-                _normal_result(list(range(50, 100)), ),  # pass 2: min_id=50
+                _normal_result(
+                    list(range(100, 201)),
+                ),  # pass 1: min_id=100
+                _normal_result(
+                    list(range(50, 100)),
+                ),  # pass 2: min_id=50
             ]
         }
         _patch_sweep(monkeypatch, scripted)
