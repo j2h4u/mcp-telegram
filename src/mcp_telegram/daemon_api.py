@@ -73,7 +73,14 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
     InputMessagesFilterChatPhotos,
     MessageActionChatEditPhoto,
 )
-from xdg_base_dirs import xdg_state_home  # type: ignore[import-error]
+
+from .daemon_ipc import get_daemon_socket_path as _get_daemon_socket_path
+
+
+def get_daemon_socket_path() -> Path:
+    """Return the canonical path for the daemon Unix socket."""
+    return _get_daemon_socket_path()
+
 
 # Per CONTEXT D-01 / SPEC Req 8: GetEntityInfo cache TTL is uniform 5 minutes.
 # Single value — per-field TTL tiers are explicitly out of scope (see CONTEXT
@@ -313,16 +320,6 @@ def _build_access_metadata(
                 meta["archived_message_count"] = local_count
 
     return meta
-
-
-# ---------------------------------------------------------------------------
-# Path helper
-# ---------------------------------------------------------------------------
-
-
-def get_daemon_socket_path() -> Path:
-    """Return the canonical path for the daemon Unix socket."""
-    return xdg_state_home() / "mcp-telegram" / "daemon.sock"
 
 
 # ---------------------------------------------------------------------------

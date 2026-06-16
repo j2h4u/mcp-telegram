@@ -26,7 +26,7 @@ import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from .daemon_api import get_daemon_socket_path
+from .daemon_ipc import get_daemon_socket_path
 
 logger = logging.getLogger(__name__)
 DEFAULT_DAEMON_TIMEOUT_SECONDS = 30.0

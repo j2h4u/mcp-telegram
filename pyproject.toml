@@ -151,6 +151,34 @@ forbidden_modules = [
 ]
 
 [[tool.importlinter.contracts]]
+name = "Core persistence contracts stay below transport/runtime layers"
+type = "forbidden"
+source_modules = [
+  "mcp_telegram.read_state",
+  "mcp_telegram.feedback_db",
+  "mcp_telegram.sync_db",
+  "mcp_telegram.fts",
+]
+forbidden_modules = [
+  "mcp_telegram.server",
+  "mcp_telegram.tools",
+  "mcp_telegram.__init__",
+  "mcp_telegram.daemon",
+  "mcp_telegram.daemon_api",
+  "mcp_telegram.daemon_client",
+  "mcp_telegram.activity_cold_backfill",
+  "mcp_telegram.activity_hot_sweep",
+  "mcp_telegram.activity_peer_resolve",
+  "mcp_telegram.activity_peer_sweep",
+  "mcp_telegram.activity_sync",
+  "mcp_telegram.dialog_sync",
+  "mcp_telegram.delta_sync",
+  "mcp_telegram.event_handlers",
+  "mcp_telegram.sync_worker",
+  "mcp_telegram.telegram",
+]
+
+[[tool.importlinter.contracts]]
 name = "Daemon process should not import MCP transport/tooling surface"
 type = "forbidden"
 source_modules = ["mcp_telegram.daemon"]
@@ -166,4 +194,10 @@ forbidden_modules = ["mcp_telegram.server", "mcp_telegram.tools", "mcp_telegram.
 name = "Daemon client is transport-only"
 type = "forbidden"
 source_modules = ["mcp_telegram.daemon_client"]
-forbidden_modules = ["mcp_telegram.server", "mcp_telegram.__init__", "mcp_telegram.tools"]
+forbidden_modules = ["mcp_telegram.server", "mcp_telegram.__init__", "mcp_telegram.tools", "mcp_telegram.daemon_api"]
+
+[[tool.importlinter.contracts]]
+name = "daemon_client does not import daemon_api"
+type = "forbidden"
+source_modules = ["mcp_telegram.daemon_client"]
+forbidden_modules = ["mcp_telegram.daemon_api"]

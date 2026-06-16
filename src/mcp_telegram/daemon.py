@@ -48,7 +48,8 @@ from telethon.tl.types import InputDialogPeer  # type: ignore[import-untyped]
 from .activity_cold_backfill import run_cold_backfill_loop
 from .activity_hot_sweep import run_hot_sweep_loop
 from .activity_sync import run_activity_sync_loop
-from .daemon_api import DaemonAPIServer, get_daemon_socket_path
+from .daemon_api import DaemonAPIServer
+from .daemon_ipc import get_daemon_socket_path
 from .delta_sync import DeltaSyncWorker, run_access_probe_loop
 from .dialog_sync import DialogsBootstrapWorker, run_reconciliation_loop
 from .event_handlers import EventHandlerManager
