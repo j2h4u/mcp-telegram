@@ -63,7 +63,7 @@ deadcode:
 
 # Test coverage report.
 coverage:
-    uv run pytest --cov=src/mcp_telegram --cov-report=term-missing
+    uv run pytest -W error::ResourceWarning --cov=src/mcp_telegram --cov-report=term-missing
 
 # Rebuild and restart the live Docker container.
 runtime-build:
