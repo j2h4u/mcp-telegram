@@ -13,6 +13,10 @@ logger = logging.getLogger(__name__)
 # 60 min balances readability (avoids clutter in active chats) with context
 # (flags meaningful pauses in conversation flow).
 SESSION_BREAK_MINUTES = 60
+SECONDS_PER_MINUTE = 60
+MINUTES_PER_HOUR = 60
+HOURS_PER_DAY = 24
+DAYS_PER_WEEK = 7
 
 # Label for outgoing DM messages. Bracketed form signals "role marker" to LLMs
 # (ChatML/OpenAI convention: [user], [assistant], [system]), avoiding the
@@ -59,16 +63,16 @@ def _format_relative_delta(now_unix: int, then_unix: int) -> str:
             int(then_unix),
         )
     delta = max(0, delta_raw)
-    minutes_total = delta // 60
-    if minutes_total < 60:
+    minutes_total = delta // SECONDS_PER_MINUTE
+    if minutes_total < MINUTES_PER_HOUR:
         return f"{minutes_total}m"
-    hours_total = minutes_total // 60
-    if hours_total < 24:
-        return f"{hours_total}h {minutes_total % 60}m"
-    days_total = hours_total // 24
-    if days_total < 7:
+    hours_total = minutes_total // MINUTES_PER_HOUR
+    if hours_total < HOURS_PER_DAY:
+        return f"{hours_total}h {minutes_total % MINUTES_PER_HOUR}m"
+    days_total = hours_total // HOURS_PER_DAY
+    if days_total < DAYS_PER_WEEK:
         return f"{days_total}d"
-    return f"{days_total // 7}w"
+    return f"{days_total // DAYS_PER_WEEK}w"
 
 
 def _render_read_state_header(

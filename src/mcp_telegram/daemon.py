@@ -71,6 +71,8 @@ logger = logging.getLogger(__name__)
 
 HEARTBEAT_INTERVAL_S: float = 60.0
 GAP_SCAN_INTERVAL_S: float = 7 * 24 * 3600.0
+SECONDS_PER_MINUTE = 60
+SECONDS_PER_HOUR = 60 * SECONDS_PER_MINUTE
 
 # Bootstrap sweep batch size for GetPeerDialogsRequest. Telethon's per-call
 # limit is 100; we intentionally stay in the 10-20 range to avoid the
@@ -287,10 +289,10 @@ def _log_heartbeat(
         elapsed = now_mono - sync_start
         secs_per_dialog = elapsed / synced
         eta_secs = int(remaining * secs_per_dialog)
-        if eta_secs >= 3600:
-            eta_str = f" eta={eta_secs // 3600}h{(eta_secs % 3600) // 60}m"
-        elif eta_secs >= 60:
-            eta_str = f" eta={eta_secs // 60}m{eta_secs % 60}s"
+        if eta_secs >= SECONDS_PER_HOUR:
+            eta_str = f" eta={eta_secs // SECONDS_PER_HOUR}h{(eta_secs % SECONDS_PER_HOUR) // SECONDS_PER_MINUTE}m"
+        elif eta_secs >= SECONDS_PER_MINUTE:
+            eta_str = f" eta={eta_secs // SECONDS_PER_MINUTE}m{eta_secs % SECONDS_PER_MINUTE}s"
         else:
             eta_str = f" eta={eta_secs}s"
     elif synced >= total:

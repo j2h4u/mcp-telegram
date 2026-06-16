@@ -34,6 +34,8 @@ logger = logging.getLogger(__name__)
 _DEFAULT_INTERVAL_S = 3600.0
 _BACKFILL_BATCH_LIMIT = 100
 _BACKFILL_INTER_BATCH_PAUSE_S = 0.5
+_SECONDS_PER_MINUTE = 60
+_SECONDS_PER_HOUR = 60 * _SECONDS_PER_MINUTE
 # Upper bound on a single SearchRequest await. Prevents a wedged MTProto
 # socket after startup FloodWait from hanging the incremental loop
 # indefinitely (D-02 expert panel).
@@ -147,11 +149,11 @@ def _upsert_entities_from_search(conn: sqlite3.Connection, result: Any) -> None:
 
 
 def _fmt_duration(seconds: int) -> str:
-    if seconds < 60:
+    if seconds < _SECONDS_PER_MINUTE:
         return f"{seconds}s"
-    if seconds < 3600:
-        return f"{seconds // 60}m{seconds % 60:02d}s"
-    return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
+    if seconds < _SECONDS_PER_HOUR:
+        return f"{seconds // _SECONDS_PER_MINUTE}m{seconds % _SECONDS_PER_MINUTE:02d}s"
+    return f"{seconds // _SECONDS_PER_HOUR}h{(seconds % _SECONDS_PER_HOUR) // _SECONDS_PER_MINUTE:02d}m"
 
 
 async def call_with_timeout(client: Any, request: Any) -> Any:
