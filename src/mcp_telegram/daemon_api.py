@@ -2571,7 +2571,7 @@ class DaemonAPIServer:
         """Resolve an explicit username with one daemon-owned Telegram lookup."""
         try:
             result = await self._client(ResolveUsernameRequest(username=username))
-        except (RPCError, TypeError, AttributeError, ValueError) as exc:
+        except (RPCError, RuntimeError, TypeError, AttributeError, ValueError) as exc:
             logger.info(
                 "trace_account username_lookup_failed username=%r error_type=%s%s",
                 username,
@@ -3130,7 +3130,7 @@ class DaemonAPIServer:
             )
             result["status"] = "partial"
             return result
-        except (TypeError, AttributeError, ValueError, sqlite3.Error) as exc:
+        except (RuntimeError, TypeError, AttributeError, ValueError, sqlite3.Error) as exc:
             _upsert_trace_coverage_fragment(
                 self._conn,
                 target_user_id=target_user_id,
