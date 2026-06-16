@@ -280,6 +280,215 @@ def test_http_transport_security_allows_loopback_and_configured_hosts(monkeypatc
     assert "http://gateway.local" in origins
 
 
+def test_safe_boundary_error_text_validation_uses_sanitized_detail() -> None:
+    text = server._safe_boundary_error_text(
+        tool_name="list_dialogs",
+        stage="validation",
+        exc=ValueError("   dialog  \tis\n   blank   "),
+    )
+
+    assert text == (
+        "Tool list_dialogs argument validation failed: dialog is blank. "
+        "Action: Check the tool arguments against the exported schema and retry."
+    )
+
+
+def test_safe_boundary_error_text_runtime_falls_back_to_exception_type_when_detail_is_empty_or_traceback() -> None:
+    empty = server._safe_boundary_error_text(tool_name="get_entity_info", stage="runtime", exc=RuntimeError(""))
+
+    assert "Tool get_entity_info runtime execution failed: RuntimeError." in empty
+
+    tb = server._safe_boundary_error_text(
+        tool_name="search_messages", stage="runtime", exc=RuntimeError("Traceback: boom")
+    )
+
+    assert "Tool search_messages runtime execution failed: RuntimeError." in tb
+
+
+def test_safe_boundary_error_text_truncates_verbose_error() -> None:
+    long_error = "x" * 220
+    text = server._safe_boundary_error_text(
+        tool_name="list_messages",
+        stage="runtime",
+        exc=RuntimeError(long_error),
+    )
+
+    assert text.startswith("Tool list_messages runtime execution failed: ")
+    assert "..." in text
+    assert text.count("...") == 1
+
+
+def test_normalize_bind_host_strips_brackets_and_lowercases() -> None:
+    assert server._normalize_bind_host(" [::1] ") == "::1"
+    assert server._normalize_bind_host("LOCALHOST") == "localhost"
+    assert server._normalize_bind_host("127.0.0.1") == "127.0.0.1"
+
+
+def test_is_loopback_http_host_recognizes_loopbacks_and_rejects_public_host() -> None:
+    assert server._is_loopback_http_host("LOCALHOST") is True
+    assert server._is_loopback_http_host("[::1]") is True
+    assert server._is_loopback_http_host("::1") is True
+    assert server._is_loopback_http_host("127.0.0.1") is True
+    assert server._is_loopback_http_host("192.168.1.1") is False
+
+
+def test_assert_http_exposure_allowed_allows_loopback_like_hosts_without_opt_in(monkeypatch) -> None:
+    monkeypatch.delenv("MCP_TELEGRAM_HTTP_ALLOW_UNSAFE", raising=False)
+
+    server._assert_http_exposure_allowed("127.0.0.1")
+    server._assert_http_exposure_allowed("localhost")
+    server._assert_http_exposure_allowed("[::1]")
+
+
+def test_http_allowed_hosts_ignores_unsafebind_placeholders_and_dedupes(monkeypatch) -> None:
+    monkeypatch.setenv("MCP_TELEGRAM_HTTP_ALLOWED_HOSTS", "0.0.0.0, 0.0.0.0, ::, mcp-telegram:3100")
+
+    hosts = server._http_allowed_hosts(host="0.0.0.0", port=3100)
+
+    assert "0.0.0.0" in hosts
+    assert "::" in hosts
+    assert "mcp-telegram:3100" in hosts
+    assert "127.0.0.1" in hosts
+    assert hosts.count("mcp-telegram:3100") == 1
+
+
+def test_http_allowed_hosts_includes_ipv6_bind_host_and_port_variant() -> None:
+    hosts = server._http_allowed_hosts(host="[::1]", port=4100)
+
+    assert "[::1]" in hosts
+    assert "[::1]:4100" in hosts
+    assert "[::1]:*" in hosts
+
+
+def test_list_prompts_resources_tools_and_progress_routes_exist() -> None:
+    import asyncio
+
+    async def runner() -> tuple[list, list, list, list]:
+        prompts = await server.list_prompts()
+        resources = await server.list_resources()
+        tools = await server.list_tools()
+        templates = await server.list_resource_templates()
+        await server.progress_notification(0, 0.0, None)
+        return prompts, resources, tools, templates
+
+    prompts, resources, tools, templates = asyncio.run(runner())
+
+    assert prompts == []
+    assert resources == []
+    assert isinstance(tools, list)
+    assert templates == []
+
+
+@pytest.mark.asyncio
+async def test_run_mcp_server_invokes_stdio_transport(monkeypatch) -> None:
+    from contextlib import asynccontextmanager
+
+    calls = {"enter": 0, "exit": 0, "run": 0}
+
+    @asynccontextmanager
+    async def fake_stdio_server():
+        calls["enter"] += 1
+        yield object(), object()
+        calls["exit"] += 1
+
+    async def fake_run(*_args, **_kwargs) -> None:
+        calls["run"] += 1
+
+    monkeypatch.setattr("mcp.server.stdio.stdio_server", fake_stdio_server)
+    monkeypatch.setattr(server.app, "run", fake_run)
+    monkeypatch.setattr(server.app, "create_initialization_options", lambda: "INIT")
+    monkeypatch.setattr("logging.basicConfig", lambda *args, **kwargs: None)
+    monkeypatch.setattr("mcp_telegram.server._build_server_instructions", AsyncMock(return_value="Built"))
+
+    await server.run_mcp_server()
+
+    assert calls["enter"] == 1
+    assert calls["exit"] == 1
+    assert calls["run"] == 1
+    assert server.app.instructions == "Built"
+
+
+@pytest.mark.asyncio
+async def test_run_mcp_http_server_normalizes_mount_and_builds_transport(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeTransportSecuritySettings:
+        def __init__(self, **kwargs) -> None:
+            captured["security"] = kwargs
+
+    class FakeSessionManager:
+        def __init__(self, app, security_settings) -> None:
+            captured["session_manager"] = {"app": app, "security_settings": security_settings}
+
+        @asynccontextmanager
+        async def run(self):
+            captured["session_manager_entered"] = True
+            yield
+            captured["session_manager_exited"] = True
+
+    class FakeRoute:
+        def __init__(self, path: str, endpoint, methods: list[str] | None = None) -> None:
+            captured.setdefault("routes", []).append(("route", path, methods))
+
+    class FakeMount:
+        def __init__(self, path: str, app: object) -> None:
+            captured.setdefault("routes", []).append(("mount", path, app))
+
+    class FakeStarlette:
+        def __init__(self, *, debug: bool, routes: list[object], lifespan: object) -> None:
+            captured["starlette"] = {"debug": debug, "routes": routes, "lifespan": lifespan}
+
+    class FakeConfig:
+        def __init__(self, asgi_app, *, host: str, port: int, log_level: str, access_log: bool) -> None:
+            captured["config"] = {"host": host, "port": port, "log_level": log_level, "asgi_app": asgi_app}
+
+    class FakeServer:
+        def __init__(self, config: object) -> None:
+            captured["server"] = config
+
+        async def serve(self) -> None:
+            captured["serve"] = True
+
+    fake_calls = {"assert": 0}
+
+    async def _fake_build_server_instructions() -> str:
+        return "Built"
+
+    monkeypatch.setattr("mcp.server.transport_security.TransportSecuritySettings", FakeTransportSecuritySettings)
+    monkeypatch.setattr("mcp.server.streamable_http_manager.StreamableHTTPSessionManager", FakeSessionManager)
+    monkeypatch.setattr("starlette.applications.Starlette", FakeStarlette)
+    monkeypatch.setattr("starlette.routing.Route", FakeRoute)
+    monkeypatch.setattr("starlette.routing.Mount", FakeMount)
+    monkeypatch.setattr("uvicorn.Config", FakeConfig)
+    monkeypatch.setattr("uvicorn.Server", FakeServer)
+    monkeypatch.setattr("logging.basicConfig", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "_http_allowed_hosts", lambda host, port: [f"{host}:{port}"])
+    monkeypatch.setattr(server, "_http_allowed_origins", lambda: ["https://example.com"])
+    monkeypatch.setattr("mcp_telegram.server._build_server_instructions", _fake_build_server_instructions)
+
+    def _fake_assert_exposure_allowed(host: str) -> None:
+        fake_calls["assert"] += 1
+        assert host == "127.0.0.1"
+
+    monkeypatch.setattr(server, "_assert_http_exposure_allowed", _fake_assert_exposure_allowed)
+
+    await server.run_mcp_http_server(host="127.0.0.1", port=4100, mount_path="mcp")
+
+    assert fake_calls["assert"] == 1
+    assert captured["security"] == {
+        "enable_dns_rebinding_protection": True,
+        "allowed_hosts": ["127.0.0.1:4100"],
+        "allowed_origins": ["https://example.com"],
+    }
+    assert captured["server"]
+    routes = captured.get("routes", [])
+    assert routes[0][0] == "mount"
+    assert routes[0][1] == "/mcp"
+    assert routes[1][0] == "route"
+    assert routes[1][1] == "/health"
+    assert server.app.instructions == "Built"
+
+
 def test_list_tools_exposes_list_dialogs_output_schema() -> None:
     tool = server.tool_by_name["list_dialogs"]
 
@@ -450,6 +659,31 @@ async def test_server_instructions_describe_identity_model(monkeypatch) -> None:
     assert "out=true" in instructions
     assert "sender_id" in instructions
     assert "effective_sender_id" in instructions
+
+
+@pytest.mark.asyncio
+async def test_server_instructions_successfully_enriches_account_identity(monkeypatch) -> None:
+    class _Conn:
+        async def get_me(self) -> dict:
+            return {
+                "ok": True,
+                "data": {
+                    "id": 777,
+                    "first_name": "Ilya",
+                    "last_name": "Petrov",
+                    "username": "i_petrov",
+                },
+            }
+
+    @asynccontextmanager
+    async def _conn_cm():
+        yield _Conn()
+
+    monkeypatch.setattr("mcp_telegram.daemon_client.daemon_connection", _conn_cm)
+
+    instructions = await server._build_server_instructions()
+
+    assert 'Connected account: id=777, name="Ilya Petrov", @i_petrov.' in instructions
 
 
 def test_posture_covers_all_registered_tools() -> None:
