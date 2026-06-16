@@ -116,7 +116,7 @@ async def _send_telemetry_event(event_dict: dict[str, t.Any]) -> None:
     try:
         async with daemon_connection() as conn:
             await conn.record_telemetry(event=event_dict)
-    except Exception as exc:
+    except (DaemonNotRunningError, RuntimeError) as exc:
         logger.debug("telemetry_send_failed: %s", exc)
 
 
@@ -166,7 +166,7 @@ def _track_tool_telemetry(tool_name: str) -> t.Callable[[ToolRunnerFunc[ToolArgT
                     _background_tasks.add(task)
                     task.add_done_callback(_background_tasks.discard)
                     task.add_done_callback(_telemetry_done_callback)
-                except Exception as e:
+                except RuntimeError as e:
                     logger.debug("telemetry_send_skipped: %s", e)
 
         return wrapper

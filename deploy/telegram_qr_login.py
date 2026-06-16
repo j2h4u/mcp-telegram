@@ -21,7 +21,7 @@ from typing import Any
 import qrcode
 from dotenv import load_dotenv
 from telethon import TelegramClient
-from telethon.errors import PasswordHashInvalidError, SessionPasswordNeededError
+from telethon.errors import PasswordHashInvalidError, RPCError, SessionPasswordNeededError
 
 load_dotenv()
 
@@ -212,7 +212,7 @@ async def main() -> None:
         print(f"\n{e}")
     except PasswordHashInvalidError:
         print("\nInvalid 2FA password. Authorization was not completed.")
-    except Exception as e:
+    except (AttributeError, OSError, RPCError, RuntimeError, TypeError, ValueError) as e:
         print(f"\nError: {e}")
         traceback.print_exc()
     finally:

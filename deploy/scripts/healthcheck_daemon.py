@@ -48,13 +48,13 @@ def main() -> int:
     except TimeoutError:
         print("daemon did not respond within timeout", file=sys.stderr)
         return 1
-    except Exception as error:
+    except (AttributeError, KeyError, OSError, RuntimeError, TypeError, json.JSONDecodeError) as error:
         print(f"healthcheck failed: {error}", file=sys.stderr)
         return 1
     finally:
         try:
             sock.close()
-        except Exception:
+        except OSError:
             pass
 
 

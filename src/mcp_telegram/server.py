@@ -266,7 +266,7 @@ async def _build_server_instructions() -> str:
             name = " ".join(filter(None, [data.get("first_name"), data.get("last_name")]))
             username = data.get("username") or "none"
             base += f' Connected account: id={data["id"]}, name="{name}", @{username}.'
-    except (DaemonNotRunningError, Exception) as exc:
+    except (AttributeError, DaemonNotRunningError, KeyError, TypeError, ValueError) as exc:
         logger.debug("server_instructions: could not fetch account info: %s", exc)
     return base
 

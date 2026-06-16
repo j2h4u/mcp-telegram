@@ -1287,7 +1287,7 @@ async def search_messages(args: SearchMessages) -> ToolResult:
                     has_cursor=True,
                 )
             offset = nav.value
-        except Exception as exc:
+        except ValueError as exc:
             return error_result(
                 invalid_navigation_text(str(exc), retry_tool="SearchMessages"),
                 has_cursor=True,

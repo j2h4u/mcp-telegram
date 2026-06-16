@@ -227,7 +227,9 @@ def _message_date(sent_at: object) -> str | None:
         return None
     try:
         return str(sent_at)
-    except Exception:
+    except TypeError:
+        return None
+    except ValueError:
         return None
 
 
