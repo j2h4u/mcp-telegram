@@ -1150,7 +1150,7 @@ def _trace_common_chat_ids(conn: sqlite3.Connection, target_user_id: int) -> lis
         return []
     try:
         detail = json.loads(row[0])
-    except Exception:
+    except TypeError, json.JSONDecodeError:
         return []
     common_chats = detail.get("common_chats", [])
     if not isinstance(common_chats, list):
@@ -2559,7 +2559,7 @@ class DaemonAPIServer:
         """Resolve an explicit username with one daemon-owned Telegram lookup."""
         try:
             result = await self._client(ResolveUsernameRequest(username=username))
-        except Exception as exc:
+        except (RPCError, TypeError, AttributeError, ValueError) as exc:
             logger.info(
                 "trace_account username_lookup_failed username=%r error_type=%s%s",
                 username,
@@ -2666,7 +2666,7 @@ class DaemonAPIServer:
         if edit_date_raw is not None:
             try:
                 edit_date = int(edit_date_raw.timestamp())
-            except Exception:
+            except TypeError, ValueError, AttributeError:
                 edit_date = None
 
         # Phase 39.1-02: mirror the SQL EFFECTIVE_SENDER_ID_SQL CASE tree in
@@ -3118,7 +3118,7 @@ class DaemonAPIServer:
             )
             result["status"] = "partial"
             return result
-        except Exception as exc:
+        except (TypeError, AttributeError, ValueError, sqlite3.Error) as exc:
             _upsert_trace_coverage_fragment(
                 self._conn,
                 target_user_id=target_user_id,
@@ -4792,7 +4792,7 @@ class DaemonAPIServer:
                                 "date": photo_date.isoformat(),
                             }
                         )
-        except Exception as exc:
+        except (RPCError, TypeError, AttributeError, ValueError) as exc:
             search_failed = True
             logger.warning(
                 "entity_info avatar_search_failed peer_id=%r error=%s%s",
@@ -4995,7 +4995,7 @@ class DaemonAPIServer:
                 # Defensive: admin rights revoked between cache and call.
                 contacts_subscribed = None
                 contacts_reason = "not_an_admin"
-            except Exception as exc:
+            except (RPCError, TypeError, AttributeError, ValueError) as exc:
                 logger.warning(
                     "entity_info channel contacts_enumeration_failed channel_id=%r error=%s%s",
                     channel_id,
@@ -5022,7 +5022,7 @@ class DaemonAPIServer:
                 # Defensive: admin rights revoked between cache and call.
                 contacts_subscribed = None
                 contacts_reason = "not_an_admin"
-            except Exception as exc:
+            except (RPCError, TypeError, AttributeError, ValueError) as exc:
                 logger.warning(
                     "entity_info channel contacts_enumeration_failed channel_id=%r error=%s%s",
                     channel_id,
@@ -5315,7 +5315,7 @@ class DaemonAPIServer:
         if migrated_to_obj is not None:
             try:
                 migrated_to = int(telethon_utils.get_peer_id(migrated_to_obj))
-            except Exception as exc:
+            except (TypeError, ValueError) as exc:
                 logger.warning(
                     "entity_info group migrated_to_normalize_failed chat_id=%r error=%s%s",
                     chat_id,
@@ -5408,7 +5408,7 @@ class DaemonAPIServer:
             dm_peers = self._dm_peer_ids()
             intersect_ids = participant_ids & dm_peers
             contacts_subscribed = self._enrich_contact_ids_with_names(intersect_ids)
-        except Exception as exc:
+        except (TypeError, AttributeError, ValueError, sqlite3.Error) as exc:
             logger.warning(
                 "entity_info group contacts_intersect_failed chat_id=%r error=%s%s",
                 chat_id,
