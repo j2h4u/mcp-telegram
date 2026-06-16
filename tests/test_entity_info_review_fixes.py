@@ -39,6 +39,7 @@ def _close_test_db():
         except Exception:
             pass
 
+
 @pytest.fixture(autouse=True)
 def _patch_get_peer_id():
     with patch(
