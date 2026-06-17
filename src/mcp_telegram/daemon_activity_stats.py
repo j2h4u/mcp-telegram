@@ -4,68 +4,19 @@ import sqlite3
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from types import TracebackType
 from typing import Protocol, cast
-
-type _ExcInfoType = (
-    bool
-    | BaseException
-    | tuple[type[BaseException], BaseException, TracebackType | None]
-    | tuple[None, None, None]
-    | None
-)
 
 
 class _LoggerLike(Protocol):
-    def debug(
-        self,
-        msg: str,
-        *args: object,
-        exc_info: _ExcInfoType = None,
-        stack_info: bool = False,
-        stacklevel: int = 1,
-        extra: Mapping[str, object] | None = None,
-    ) -> None: ...
+    def debug(self, msg: str, *_args: object, **_kwargs: object) -> None: ...
 
-    def info(
-        self,
-        msg: str,
-        *args: object,
-        exc_info: _ExcInfoType = None,
-        stack_info: bool = False,
-        stacklevel: int = 1,
-        extra: Mapping[str, object] | None = None,
-    ) -> None: ...
+    def info(self, msg: str, *_args: object, **_kwargs: object) -> None: ...
 
-    def warning(
-        self,
-        msg: str,
-        *args: object,
-        exc_info: _ExcInfoType = None,
-        stack_info: bool = False,
-        stacklevel: int = 1,
-        extra: Mapping[str, object] | None = None,
-    ) -> None: ...
+    def warning(self, msg: str, *_args: object, **_kwargs: object) -> None: ...
 
-    def error(
-        self,
-        msg: str,
-        *args: object,
-        exc_info: _ExcInfoType = None,
-        stack_info: bool = False,
-        stacklevel: int = 1,
-        extra: Mapping[str, object] | None = None,
-    ) -> None: ...
+    def error(self, msg: str, *_args: object, **_kwargs: object) -> None: ...
 
-    def exception(
-        self,
-        msg: str,
-        *args: object,
-        exc_info: _ExcInfoType = None,
-        stack_info: bool = False,
-        stacklevel: int = 1,
-        extra: Mapping[str, object] | None = None,
-    ) -> None: ...
+    def exception(self, msg: str, *_args: object, **_kwargs: object) -> None: ...
 
 
 DEFAULT_ACTIVITY_DIALOG_KINDS = ("group", "forum")

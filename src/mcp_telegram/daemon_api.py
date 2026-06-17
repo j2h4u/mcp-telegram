@@ -45,7 +45,6 @@ import sqlite3
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
-from types import TracebackType
 from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 from telethon import utils as telethon_utils  # type: ignore[import-untyped]
@@ -266,65 +265,17 @@ from .formatter import format_reaction_counts
 from .models import DialogType, ReadMessage, ReadState
 from .sync_worker import extract_reactions_rows
 
-type _ExcInfoType = (
-    bool
-    | BaseException
-    | tuple[type[BaseException], BaseException, TracebackType | None]
-    | tuple[None, None, None]
-    | None
-)
-
 
 class _LoggerLike(Protocol):
-    def debug(
-        self,
-        msg: str,
-        *args: object,
-        exc_info: _ExcInfoType = None,
-        stack_info: bool = False,
-        stacklevel: int = 1,
-        extra: Mapping[str, object] | None = None,
-    ) -> None: ...
+    def debug(self, msg: str, *_args: object, **_kwargs: object) -> None: ...
 
-    def info(
-        self,
-        msg: str,
-        *args: object,
-        exc_info: _ExcInfoType = None,
-        stack_info: bool = False,
-        stacklevel: int = 1,
-        extra: Mapping[str, object] | None = None,
-    ) -> None: ...
+    def info(self, msg: str, *_args: object, **_kwargs: object) -> None: ...
 
-    def warning(
-        self,
-        msg: str,
-        *args: object,
-        exc_info: _ExcInfoType = None,
-        stack_info: bool = False,
-        stacklevel: int = 1,
-        extra: Mapping[str, object] | None = None,
-    ) -> None: ...
+    def warning(self, msg: str, *_args: object, **_kwargs: object) -> None: ...
 
-    def error(
-        self,
-        msg: str,
-        *args: object,
-        exc_info: _ExcInfoType = None,
-        stack_info: bool = False,
-        stacklevel: int = 1,
-        extra: Mapping[str, object] | None = None,
-    ) -> None: ...
+    def error(self, msg: str, *_args: object, **_kwargs: object) -> None: ...
 
-    def exception(
-        self,
-        msg: str,
-        *args: object,
-        exc_info: _ExcInfoType = None,
-        stack_info: bool = False,
-        stacklevel: int = 1,
-        extra: Mapping[str, object] | None = None,
-    ) -> None: ...
+    def exception(self, msg: str, *_args: object, **_kwargs: object) -> None: ...
 
 
 class _DaemonClientLike(Protocol):
@@ -372,6 +323,13 @@ if TYPE_CHECKING:
     from .daemon_reading import _LoggerLike as ReadingLoggerLike
     from .daemon_reading import _TelegramClientLike as ReadingTelegramClientLike
     from .pagination import HistoryDirection
+else:
+    _AccountTraceClientLike = object
+    AccountTraceLoggerLike = object
+    ReadingListMessagesDbRequest = object
+    ReadingListMessagesTelegramRequest = object
+    ReadingLoggerLike = object
+    ReadingTelegramClientLike = object
 
 # Phase 39.2 §Key technical decisions: per-message TTL for JIT reactions freshen-on-read.
 # Amortizes rapid paginated reads on the same ids; live events catch most mutations.
@@ -947,11 +905,11 @@ class DaemonAPIServer:
             self._reading_service = DaemonReadingService(
                 DaemonReadingDeps(
                     conn=self._conn,
-                    client=cast("ReadingTelegramClientLike", self._client),
+                    client=cast(ReadingTelegramClientLike, self._client),
                     self_id=self.self_id,
                     resolve_dialog_id=self._resolve_dialog_id,
                     fetch_fragment_context=self._fetch_fragment_context,
-                    logger=cast("ReadingLoggerLike", logger),
+                    logger=cast(ReadingLoggerLike, logger),
                     rid=_rid,
                 )
             )
@@ -1286,10 +1244,10 @@ class DaemonAPIServer:
         return DaemonAccountTraceService(
             DaemonAccountTraceDeps(
                 conn=self._conn,
-                client=cast("_AccountTraceClientLike", self._client),
+                client=cast(_AccountTraceClientLike, self._client),
                 resolve_dialog_id=self._resolve_dialog_id,
                 self_id=self.self_id,
-                logger=cast("AccountTraceLoggerLike", logger),
+                logger=cast(AccountTraceLoggerLike, logger),
                 rid=_rid,
             )
         )
@@ -1316,7 +1274,7 @@ class DaemonAPIServer:
     async def _list_messages_from_telegram(self, req: object) -> dict:
         """Delegate Telegram fallback reads to the reading service."""
         return await self._get_reading_service()._list_messages_from_telegram(
-            cast("ReadingListMessagesTelegramRequest", req)
+            cast(ReadingListMessagesTelegramRequest, req)
         )
 
     # ------------------------------------------------------------------
@@ -1341,7 +1299,7 @@ class DaemonAPIServer:
                 dialog_id=dialog_id,
                 direction=direction,
                 direction_enum=direction_enum,
-                logger=cast("ReadingLoggerLike", logger),
+                logger=cast(ReadingLoggerLike, logger),
                 request_id=_rid,
             ),
         )
@@ -1366,7 +1324,7 @@ class DaemonAPIServer:
     async def _list_messages_from_db(self, req: dict[str, object]) -> dict:
         """Delegate sync.db reads to the reading service."""
         # "list_messages rendered"
-        return await self._get_reading_service()._list_messages_from_db(cast("ReadingListMessagesDbRequest", req))
+        return await self._get_reading_service()._list_messages_from_db(cast(ReadingListMessagesDbRequest, req))
 
     # ------------------------------------------------------------------
     # list_messages — navigation decoding
