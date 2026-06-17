@@ -18,13 +18,13 @@ from account_trace_fixtures import (
     seed_trace_fragment,
 )
 
-from mcp_telegram.daemon_api import (
-    DaemonAPIServer,
+from mcp_telegram.daemon_account_trace import (
     _build_trace_account_messages_query,
     _build_trace_coverage,
     _get_trace_coverage_fragments,
     _upsert_trace_coverage_fragment,
 )
+from mcp_telegram.daemon_api import DaemonAPIServer
 from mcp_telegram.models import (
     TraceCoverageGap,
     TraceCoverageSummary,

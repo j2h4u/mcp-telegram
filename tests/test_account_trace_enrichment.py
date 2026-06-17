@@ -17,12 +17,12 @@ from account_trace_fixtures import (
 )
 from telethon.errors import FloodWaitError
 
-from mcp_telegram.daemon_api import (
-    DaemonAPIServer,
+from mcp_telegram.daemon_account_trace import (
     _messages_row_equal,
     _trace_candidate_dialogs,
     _trace_existing_message_bundle,
 )
+from mcp_telegram.daemon_api import DaemonAPIServer
 from mcp_telegram.sync_worker import (
     EntityRecord,
     ExtractedMessage,
