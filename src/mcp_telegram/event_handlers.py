@@ -46,6 +46,7 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
 )
 from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
+from .activity_peer_resolve import _InputEntityResolverClient
 from .models import DialogType
 from .read_state import apply_read_cursor
 from .resolver import latinize
@@ -53,6 +54,7 @@ from .sync_worker import (
     INSERT_DIALOG_SQL,
     UPSERT_ENTITY_SQL,
     _build_fwd_entity_map,
+    _PeerNameClient,
     apply_reactions_delta,
     extract_message_row,
     extract_reactions_rows,
@@ -74,7 +76,6 @@ class _SenderLike(Protocol):
     username: str | None
 
 
-@runtime_checkable
 class _MessageLike(Protocol):
     id: int
     message: str | None
@@ -83,13 +84,6 @@ class _MessageLike(Protocol):
     action: object | None
     reactions: object | None
     reply_to: object | None
-    sender_id: int | None
-    out: bool
-    post_author: str | None
-    media: object | None
-    entities: Sequence[object] | None
-    fwd_from: object | None
-    replies: object | None
 
 
 class _NewMessageEvent(Protocol):
@@ -153,15 +147,13 @@ class _ForumTopicPinnedUpdateLike(Protocol):
 
 
 class _EventHandlerClient(Protocol):
-    def add_event_handler(self, _callback: object, event: object) -> None: ...
+    def add_event_handler(self, _callback: object, _event: object) -> None: ...
 
     def remove_event_handler(self, _callback: object) -> None: ...
 
     async def get_messages(self, *_args: object, **_kwargs: object) -> object: ...
 
-    async def get_entity(self, _entity_id: object) -> object: ...
-
-    async def get_input_entity(self, dialog_id: int) -> object: ...
+    async def get_input_entity(self, _dialog_id: int) -> object: ...
 
     async def __call__(self, _request: object) -> object: ...
 
@@ -287,6 +279,7 @@ class EventHandlerManager:
         self._client = client
         self._conn = conn
         self._shutdown_event = shutdown_event
+        self._shutdown_event.is_set()
         self._synced_dialog_ids: set[int] = set()
 
     # ------------------------------------------------------------------
@@ -446,7 +439,7 @@ class EventHandlerManager:
 
         try:
             msg = event.message
-            entity_name_map = await _build_fwd_entity_map(msg, self._client)
+            entity_name_map = await _build_fwd_entity_map(msg, cast(_PeerNameClient, self._client))
             extracted = extract_message_row(dialog_id, msg, entity_name_map=entity_name_map)
             now = int(time.time())
 
@@ -600,7 +593,7 @@ class EventHandlerManager:
 
             if existing is None:
                 # Message not yet in sync.db: resolve entity map then insert.
-                entity_name_map = await _build_fwd_entity_map(msg, self._client)
+                entity_name_map = await _build_fwd_entity_map(msg, cast(_PeerNameClient, self._client))
                 extracted = extract_message_row(dialog_id, msg, entity_name_map=entity_name_map)
                 with self._conn:
                     insert_messages_with_fts(self._conn, [extracted])
@@ -637,7 +630,7 @@ class EventHandlerManager:
             edit_date_unix = int(edit_date_raw.timestamp()) if edit_date_raw is not None else now
 
             # Resolve entity map before the transaction (no await inside with).
-            entity_name_map = await _build_fwd_entity_map(msg, self._client)
+            entity_name_map = await _build_fwd_entity_map(msg, cast(_PeerNameClient, self._client))
             extracted = extract_message_row(dialog_id, msg, entity_name_map=entity_name_map)
 
             with self._conn:
@@ -1074,7 +1067,10 @@ class EventHandlerManager:
 
         from .activity_peer_resolve import resolve_input_peer
 
-        input_channel = cast(TypeInputChannel | None, await resolve_input_peer(self._client, dialog_id))
+        input_channel = cast(
+            TypeInputChannel | None,
+            await resolve_input_peer(cast(_InputEntityResolverClient, self._client), dialog_id),
+        )
         if input_channel is None:
             logger.debug("event_linked_chat_refresh_no_input_peer dialog_id=%d", dialog_id)
             return

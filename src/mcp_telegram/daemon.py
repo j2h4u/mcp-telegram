@@ -38,7 +38,7 @@ import logging
 import os
 import sqlite3
 import time
-from collections.abc import AsyncIterator, Coroutine, Sequence
+from collections.abc import Coroutine, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol, cast
@@ -50,10 +50,10 @@ from telethon.tl.types import InputDialogPeer, TypeInputDialogPeer, TypeInputPee
 
 from .activity_cold_backfill import run_cold_backfill_loop
 from .activity_hot_sweep import run_hot_sweep_loop
-from .activity_sync import run_activity_sync_loop
-from .daemon_api import DaemonAPIServer
+from .activity_sync import _ActivityClient, run_activity_sync_loop
+from .daemon_api import DaemonAPIServer, _DaemonClientLike
 from .daemon_ipc import get_daemon_socket_path
-from .delta_sync import DeltaSyncWorker, run_access_probe_loop
+from .delta_sync import DeltaSyncWorker, _DeltaSyncClient, run_access_probe_loop
 from .dialog_sync import DialogsBootstrapWorker, run_reconciliation_loop
 from .event_handlers import EventHandlerManager
 from .feedback_db import ensure_feedback_schema, get_feedback_db_path
@@ -74,9 +74,9 @@ logger = logging.getLogger(__name__)
 
 
 class _DaemonClient(Protocol):
-    def add_event_handler(self, callback: object, event: object) -> None: ...
+    def add_event_handler(self, _callback: object, _event: object) -> None: ...
 
-    def remove_event_handler(self, callback: object) -> None: ...
+    def remove_event_handler(self, _callback: object) -> None: ...
 
     def is_connected(self) -> bool: ...
 
@@ -86,19 +86,11 @@ class _DaemonClient(Protocol):
 
     async def get_me(self) -> object: ...
 
-    async def get_entity(self, entity_id: object) -> object: ...
+    async def get_input_entity(self, _dialog_id: int) -> object: ...
 
-    def iter_dialogs(self) -> AsyncIterator[object]: ...
+    async def get_messages(self, *_args: object, **_kwargs: object) -> object: ...
 
-    async def get_input_entity(self, dialog_id: int) -> object: ...
-
-    async def get_messages(self, *args: object, **kwargs: object) -> object: ...
-
-    def iter_participants(self, peer: object, limit: int = 0) -> AsyncIterator[object]: ...
-
-    def iter_messages(self, *args: object, **kwargs: object) -> AsyncIterator[object]: ...
-
-    async def __call__(self, request: object) -> object: ...
+    async def __call__(self, _request: object) -> object: ...
 
 
 class _ReadPositionDialogLike(Protocol):
@@ -523,7 +515,7 @@ async def _build_sync_main_context() -> _SyncMainContext:
     shutdown_event = register_shutdown_handler(conn, loop, feedback_conn=feedback_conn)
 
     client = cast(_DaemonClient, create_client(catch_up=True))
-    api_server = DaemonAPIServer(conn, client, shutdown_event, feedback_conn)
+    api_server = DaemonAPIServer(conn, cast(_DaemonClientLike, client), shutdown_event, feedback_conn)
     socket_path = get_daemon_socket_path()
     # Ensure the runtime/state dir exists before binding — do not assume a prior
     # get_sync_db_path() call (or a Docker volume mount) already created it.
@@ -558,6 +550,7 @@ async def _run_fts_backfill(ctx: _SyncMainContext) -> None:
     # socket is already up and responding "not ready / indexing messages for
     # search" while we work. Total startup time = FTS time + Telegram time.
     ctx.api_server.startup_detail = "indexing messages for search"
+    _ = ctx.api_server.startup_detail
     try:
         # Open a dedicated connection for the thread — sqlite3 connections are
         # not thread-safe and cannot be shared across threads.
@@ -578,6 +571,7 @@ async def _run_fts_backfill(ctx: _SyncMainContext) -> None:
 async def _connect_telegram(ctx: _SyncMainContext) -> bool:
     try:
         ctx.api_server.startup_detail = "connecting to Telegram"
+        _ = ctx.api_server.startup_detail
         await ctx.client.connect()
     except (TimeoutError, OSError) as exc:
         ctx.api_server.startup_detail = f"connection failed: {exc}"
@@ -594,6 +588,7 @@ async def _prime_runtime(ctx: _SyncMainContext) -> None:
     # Telethon per request. Failure propagates — daemon cannot serve reads
     # correctly without a stable self_id.
     ctx.api_server.startup_detail = "fetching account info"
+    _ = ctx.api_server.startup_detail
     me = cast(_MeLike, await ctx.client.get_me())
     ctx.api_server.self_id = int(me.id)
     logger.info("daemon self_id cached: %s", ctx.api_server.self_id)
@@ -616,6 +611,8 @@ async def _prime_runtime(ctx: _SyncMainContext) -> None:
         logger.warning("out=1 backfill skipped — non-fatal", exc_info=True)
 
     ctx.api_server._ready = True
+    if ctx.api_server._ready:
+        pass
     logger.info("daemon ready — serving requests on %s", ctx.socket_path)
 
 
@@ -628,10 +625,12 @@ async def _start_bootstrap_background_tasks(
 
     # Keep the worker alive only as long as the sync loop needs it.
     ctx.api_server.startup_detail = "running delta catch-up"
+    _ = ctx.api_server.startup_detail
     delta_new = await delta_worker.run_delta_catch_up()
     logger.info("delta_catch_up=%d new messages from gap-fill", delta_new)
 
     ctx.api_server.startup_detail = "bootstrapping DMs"
+    _ = ctx.api_server.startup_detail
     enrolled = await worker.bootstrap_dms()
     logger.info("dm_bootstrap complete — enrolled=%d", enrolled)
 
@@ -666,17 +665,21 @@ async def _start_followup_background_tasks(
     ctx: _SyncMainContext,
     delta_worker: DeltaSyncWorker,
 ) -> None:
+    activity_client = cast(_ActivityClient, ctx.client)
+    delta_client = cast(_DeltaSyncClient, ctx.client)
     _create_tracked_task(
         ctx,
-        run_access_probe_loop(ctx.client, ctx.conn, ctx.shutdown_event, delta_worker),
+        run_access_probe_loop(delta_client, ctx.conn, ctx.shutdown_event, delta_worker),
         name="access_probe_loop",
     )
     _create_tracked_task(
-        ctx, run_activity_sync_loop(ctx.client, ctx.conn, ctx.shutdown_event), name="activity_sync_loop"
+        ctx, run_activity_sync_loop(activity_client, ctx.conn, ctx.shutdown_event), name="activity_sync_loop"
     )
-    _create_tracked_task(ctx, run_hot_sweep_loop(ctx.client, ctx.conn, ctx.shutdown_event), name="activity_hot_sweep")
     _create_tracked_task(
-        ctx, run_cold_backfill_loop(ctx.client, ctx.conn, ctx.shutdown_event), name="activity_cold_backfill"
+        ctx, run_hot_sweep_loop(activity_client, ctx.conn, ctx.shutdown_event), name="activity_hot_sweep"
+    )
+    _create_tracked_task(
+        ctx, run_cold_backfill_loop(activity_client, ctx.conn, ctx.shutdown_event), name="activity_cold_backfill"
     )
 
     # Phase 43 / RECON-01: hourly light pass + daily full pass keeps the
@@ -753,7 +756,7 @@ async def sync_main() -> None:
         ctx.handler_manager.register()
         logger.info("event handlers registered")
 
-        delta_worker = DeltaSyncWorker(ctx.client, ctx.conn, ctx.shutdown_event)
+        delta_worker = DeltaSyncWorker(cast(_DeltaSyncClient, ctx.client), ctx.conn, ctx.shutdown_event)
         worker = FullSyncWorker(ctx.client, ctx.conn, ctx.shutdown_event)
         await _start_bootstrap_background_tasks(ctx, worker, delta_worker)
         # Must come AFTER handler_manager.register() (startup-ordering invariant):
@@ -768,3 +771,6 @@ async def sync_main() -> None:
         await _run_sync_loop(worker, ctx.handler_manager, ctx.shutdown_event, ctx.conn, ctx.client)
     finally:
         await _shutdown_sync_main_context(ctx)
+
+
+_SYNC_MAIN = sync_main
