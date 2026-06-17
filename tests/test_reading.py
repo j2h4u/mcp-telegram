@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from typing import cast
 
 from mcp_telegram.tools.reading import (
     ListMessages,
@@ -28,12 +29,18 @@ class _RowOptions:
     effective_sender_id: object = None
 
 
-def _row(sender_id, sender_first_name, *, opts: _RowOptions | None = None, **kwargs) -> dict:
+def _row(
+    sender_id: int | None,
+    sender_first_name: str | None,
+    *,
+    opts: _RowOptions | None = None,
+    **kwargs: object,
+) -> dict[str, object]:
     if opts is None:
         opts = _RowOptions()
     if kwargs:
         opts = replace(opts, **kwargs)
-    r: dict = {
+    r: dict[str, object] = {
         "message_id": opts.message_id,
         "sent_at": opts.sent_at,
         "text": opts.text,
@@ -195,20 +202,28 @@ def test_search_messages_structured_payload_includes_dialog_anchor_read_state_wa
         )
     )
 
+    payload = cast(dict[str, object], payload)
+    coverage = cast(dict[str, object], payload["coverage"])
+    warnings = cast(list[dict[str, object]], payload["warnings"])
+    read_state_per_dialog = cast(dict[str, dict[str, object]], payload["read_state_per_dialog"])
+    navigation = cast(dict[str, object], payload["navigation"])
+    limits = cast(dict[str, object], payload["limits"])
+    anchor_call = cast(dict[str, object], payload["anchor_call"])
+    result = cast(dict[str, object], cast(list[dict[str, object]], payload["results"])[0])
+
     assert payload["dialog_name"] == "Alice"
     assert payload["source"] == "sync_db"
-    assert payload["coverage"]["kind"] == "archived"
-    assert payload["warnings"][0]["kind"] == "archived_dialog"
-    assert payload["read_state_per_dialog"]["123"]["header_lines"] == ["[read-state: all caught up]"]
-    assert payload["navigation"] == {
+    assert coverage["kind"] == "archived"
+    assert warnings[0]["kind"] == "archived_dialog"
+    assert read_state_per_dialog["123"]["header_lines"] == ["[read-state: all caught up]"]
+    assert navigation == {
         "next_navigation": "next-search-token",
         "has_more": True,
         "source_cursor": "search-token",
         "offset": 20,
     }
-    assert payload["limits"] == {"requested_limit": 5, "applied_limit": 1, "offset": 20}
-    assert payload["anchor_call"]["arguments_template"]["anchor_message_id"] == "<result.msg_id>"
-    result = payload["results"][0]
+    assert limits == {"requested_limit": 5, "applied_limit": 1, "offset": 20}
+    assert cast(dict[str, object], anchor_call["arguments_template"])["anchor_message_id"] == "<result.msg_id>"
     assert result["dialog_name"] == "Alice"
     assert result["content"] == {
         "text": "needle in Telegram text",
@@ -253,16 +268,21 @@ def test_list_messages_structured_page_metadata_preserves_navigation_warning_cov
         )
     )
 
+    coverage = cast(dict[str, object], payload["coverage"])
+    warnings = cast(list[dict[str, object]], payload["warnings"])
+    navigation = cast(dict[str, object], payload["navigation"])
+    presentation = cast(dict[str, object], payload["presentation"])
+    read_state = cast(dict[str, object], payload["read_state"])
     assert payload["dialog_id"] == 123
-    assert payload["coverage"]["kind"] == "fragment"
-    assert payload["coverage"]["fragment_coverage"] is True
-    assert payload["warnings"][0]["kind"] == "archived_dialog"
-    assert "No current access" in payload["warnings"][0]["message"]
-    assert payload["navigation"]["next_navigation"] == "history-token"
-    assert payload["navigation"]["anchor_message_id"] == 50
-    assert payload["navigation"]["direction"] == "around"
-    assert payload["presentation"]["messages_order"] == "chronological"
-    assert payload["presentation"]["is_chronological"] is True
+    assert coverage["kind"] == "fragment"
+    assert coverage["fragment_coverage"] is True
+    assert warnings[0]["kind"] == "archived_dialog"
+    assert "No current access" in cast(str, warnings[0]["message"])
+    assert navigation["next_navigation"] == "history-token"
+    assert navigation["anchor_message_id"] == 50
+    assert navigation["direction"] == "around"
+    assert presentation["messages_order"] == "chronological"
+    assert presentation["is_chronological"] is True
     assert payload["limits"] == {
         "requested_limit": 10,
         "applied_limit": 0,
@@ -271,7 +291,7 @@ def test_list_messages_structured_page_metadata_preserves_navigation_warning_cov
     }
     assert payload["count"] == 0
     assert payload["result_count_semantics"] == "count is the number of message rows returned in this response page"
-    assert payload["read_state"]["header_lines"] == ["[read-state: all caught up]"]
+    assert cast(dict[str, object], read_state)["header_lines"] == ["[read-state: all caught up]"]
 
 
 def test_list_messages_always_presents_selected_page_chronologically_with_reply_refs():
@@ -317,10 +337,12 @@ def test_list_messages_always_presents_selected_page_chronologically_with_reply_
         )
     )
 
-    assert [message["msg_id"] for message in payload["messages"]] == [1, 2, 3]
-    assert payload["presentation"]["messages_order"] == "chronological"
-    assert payload["presentation"]["is_chronological"] is True
-    reply = payload["messages"][2]
+    messages = cast(list[dict[str, object]], payload["messages"])
+    presentation = cast(dict[str, object], payload["presentation"])
+    assert [message["msg_id"] for message in messages] == [1, 2, 3]
+    assert presentation["messages_order"] == "chronological"
+    assert presentation["is_chronological"] is True
+    reply = messages[2]
     assert reply["reply_to_msg_id"] == 2
     assert reply["reply_context_ref"] == {"msg_id": 2, "in_page": True, "context_included": False}
     assert reply["reply_context"] is None
@@ -380,7 +402,9 @@ def test_list_messages_structured_messages_include_content_metadata_and_all_read
 
     messages = _list_messages_structured_messages(rows, read_state=read_state, dialog_type="User")
 
-    marker_by_id = {message["msg_id"]: message["read_markers"][0] for message in messages}
+    marker_by_id = {
+        cast(int, message["msg_id"]): cast(list[dict[str, object]], message["read_markers"])[0] for message in messages
+    }
     assert marker_by_id[1]["kind"] == "i_read_up_to_here"
     assert marker_by_id[2]["kind"] == "unread_by_me"
     assert marker_by_id[10]["kind"] == "peer_read_up_to_here"
@@ -434,10 +458,15 @@ def test_list_messages_structured_messages_cover_media_reply_forward_reaction_to
     }
     assert second["reply_context_ref"] == {"msg_id": 1, "in_page": True, "context_included": False}
     assert second["reply_context"] is None
-    assert second["forward"]["from_name"] == "Forward Source"
-    assert second["forward"]["content"]["content_kind"] == "forward_snippet"
+    assert cast(dict[str, object], second["forward"])["from_name"] == "Forward Source"
+    assert (
+        cast(dict[str, object], cast(dict[str, object], second["forward"])["content"])["content_kind"]
+        == "forward_snippet"
+    )
     assert second["post_author"] == "Channel Author"
     assert second["edit_date"] == 1_700_000_120
-    assert second["reactions"]["display"] == "[👍×2]"
-    assert second["reactions"]["content"]["content_kind"] == "reaction"
+    assert cast(dict[str, object], second["reactions"])["display"] == "[👍×2]"
+    assert (
+        cast(dict[str, object], cast(dict[str, object], second["reactions"])["content"])["content_kind"] == "reaction"
+    )
     assert second["read_markers"] == []

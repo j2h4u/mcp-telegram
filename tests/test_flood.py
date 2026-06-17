@@ -1,7 +1,8 @@
 """Unit tests for the shared FloodWait helpers (mcp_telegram.flood)."""
 
+from __future__ import annotations
+
 import asyncio
-from types import SimpleNamespace
 
 import pytest
 
@@ -11,39 +12,46 @@ from mcp_telegram.flood import (
     sleep_through_flood,
 )
 
+
+class _FloodWaitError(Exception):
+    def __init__(self, seconds: object | None = None) -> None:
+        super().__init__()
+        self.seconds = seconds
+
+
 # ---------------------------------------------------------------------------
 # flood_seconds
 # ---------------------------------------------------------------------------
 
 
 def test_flood_seconds_reads_seconds_attribute() -> None:
-    exc = SimpleNamespace(seconds=27)
+    exc = _FloodWaitError(27)
     assert flood_seconds(exc) == 27
 
 
 def test_flood_seconds_coerces_to_int() -> None:
-    exc = SimpleNamespace(seconds=12.9)
+    exc = _FloodWaitError(12.9)
     assert flood_seconds(exc) == 12
 
 
 def test_flood_seconds_missing_attribute_uses_default() -> None:
-    exc = SimpleNamespace()  # no `seconds`
+    exc = _FloodWaitError()  # no `seconds`
     assert flood_seconds(exc) == DEFAULT_FLOOD_WAIT_SECONDS
 
 
 def test_flood_seconds_none_uses_default() -> None:
-    exc = SimpleNamespace(seconds=None)
+    exc = _FloodWaitError(None)
     assert flood_seconds(exc) == DEFAULT_FLOOD_WAIT_SECONDS
 
 
 def test_flood_seconds_zero_uses_default() -> None:
     # 0s would be a no-op sleep — fall back so callers never busy-spin.
-    exc = SimpleNamespace(seconds=0)
+    exc = _FloodWaitError(0)
     assert flood_seconds(exc) == DEFAULT_FLOOD_WAIT_SECONDS
 
 
 def test_flood_seconds_custom_default() -> None:
-    exc = SimpleNamespace(seconds=0)
+    exc = _FloodWaitError(0)
     assert flood_seconds(exc, default=5) == 5
 
 

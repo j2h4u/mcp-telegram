@@ -34,7 +34,7 @@ class _ReadMessageOptions:
     sent_at_dt: datetime | None = None
 
 
-def _make_msg(mid: int, *, opts: _ReadMessageOptions | None = None, **kwargs) -> ReadMessage:
+def _make_msg(mid: int, *, opts: _ReadMessageOptions | None = None, **kwargs: object) -> ReadMessage:
     """Create a ReadMessage for formatter tests with sensible defaults."""
     if opts is None:
         opts = _ReadMessageOptions()

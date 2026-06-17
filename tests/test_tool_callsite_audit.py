@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+# pyright: reportAny=false, reportArgumentType=false, reportMissingParameterType=false, reportUndefinedVariable=false, reportIndexIssue=false, reportOperatorIssue=false, reportGeneralTypeIssues=false, reportInvalidTypeForm=false
 """Callsite audit: resolver consumers handle a Candidates response correctly.
 
 Only GetEntityInfo reaches Candidates directly (via conn.resolve_entity); it must
@@ -11,9 +13,22 @@ return matches verbatim.
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from unittest.mock import AsyncMock, MagicMock, patch
+from dataclasses import dataclass
+from typing import Protocol, cast
+from unittest.mock import AsyncMock, patch
 
 from mcp_telegram.tools import GetEntityInfo, get_entity_info
+
+
+class _TextContent(Protocol):
+    text: str
+
+
+@dataclass
+class _ResolveConn:
+    resolve_entity: AsyncMock
+    get_entity_info: AsyncMock
+
 
 # ---------------------------------------------------------------------------
 # Shared fixtures
@@ -45,15 +60,16 @@ _CANDIDATES_RESPONSE = {
 }
 
 
-def _make_conn_resolve_candidates() -> MagicMock:
+def _make_conn_resolve_candidates() -> _ResolveConn:
     """Daemon connection that returns Candidates from resolve_entity."""
-    conn = MagicMock()
-    conn.resolve_entity = AsyncMock(return_value=_CANDIDATES_RESPONSE)
-    return conn
+    return _ResolveConn(
+        resolve_entity=AsyncMock(return_value=_CANDIDATES_RESPONSE),
+        get_entity_info=AsyncMock(),
+    )
 
 
 @asynccontextmanager
-async def _conn_ctx(conn: MagicMock):
+async def _conn_ctx(conn: _ResolveConn):
     yield conn
 
 
@@ -71,7 +87,7 @@ async def test_entity_info_candidates_surfaces_hint() -> None:
     ):
         result = await get_entity_info(GetEntityInfo(entity="Ivan"))
 
-    text = result.content[0].text
+    text = cast(_TextContent, result.content[0]).text
     assert "structuredContent.candidates" in text
     assert "Specify @username or numeric id" not in text
     payload = result.structured_content
@@ -94,7 +110,7 @@ async def test_entity_info_candidates_lists_all_matches() -> None:
     ):
         result = await get_entity_info(GetEntityInfo(entity="Ivan"))
 
-    text = result.content[0].text
+    text = cast(_TextContent, result.content[0]).text
     assert "101" not in text
     assert "202" not in text
     payload = result.structured_content
@@ -108,7 +124,9 @@ async def test_entity_info_candidates_lists_all_matches() -> None:
         "content_kind": "message_text",
     }
     # Must NOT silently auto-pick (i.e. must not proceed to get_entity_info call)
-    assert conn.get_entity_info is not conn.resolve_entity  # sanity; no silent pick
+    resolve_entity = conn.resolve_entity
+    get_entity_info_mock = conn.get_entity_info
+    assert get_entity_info_mock is not resolve_entity  # sanity; no silent pick
 
 
 async def test_entity_info_candidates_does_not_auto_pick() -> None:
@@ -123,8 +141,9 @@ async def test_entity_info_candidates_does_not_auto_pick() -> None:
         result = await get_entity_info(GetEntityInfo(entity="Ivan"))
 
     # Tool must not have proceeded to fetch entity profile
-    conn.get_entity_info.assert_not_called()
-    text = result.content[0].text
+    get_entity_info_mock = conn.get_entity_info
+    get_entity_info_mock.assert_not_called()
+    text = cast(_TextContent, result.content[0]).text
     # Must be an ambiguity response, not a profile
     assert "structuredContent.candidates" in text
     assert "id=101" not in text and "id=202" not in text

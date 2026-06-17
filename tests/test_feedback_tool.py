@@ -1,11 +1,17 @@
+#!/usr/bin/env python3
+# pyright: reportAny=false, reportArgumentType=false, reportMissingParameterType=false, reportUndefinedVariable=false, reportIndexIssue=false, reportOperatorIssue=false, reportGeneralTypeIssues=false, reportInvalidTypeForm=false, reportReturnType=false
 """Tests for the submit_feedback MCP tool."""
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from typing import Protocol, cast
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from mcp.types import ToolAnnotations
 from pydantic import ValidationError
 
 from mcp_telegram.daemon_client import DaemonNotRunningError
@@ -17,16 +23,24 @@ from mcp_telegram.tools.feedback import SubmitFeedback, submit_feedback
 # ---------------------------------------------------------------------------
 
 
+@dataclass
+class _FeedbackToolConn:
+    submit_feedback: AsyncMock
+
+
+class _TextContent(Protocol):
+    text: str
+
+
 @pytest.fixture
-def mock_daemon_connection():
+def mock_daemon_connection() -> _FeedbackToolConn:
     """Patch daemon_connection to return a scripted mock DaemonConnection."""
-    mock_conn = AsyncMock()
-    mock_conn.submit_feedback = AsyncMock(
-        return_value={"ok": True, "data": {"message": "Feedback recorded. Thank you!"}}
+    mock_conn = _FeedbackToolConn(
+        submit_feedback=AsyncMock(return_value={"ok": True, "data": {"message": "Feedback recorded. Thank you!"}})
     )
 
     @asynccontextmanager
-    async def fake_daemon_connection():
+    async def fake_daemon_connection() -> AsyncIterator[_FeedbackToolConn]:
         yield mock_conn
 
     with patch("mcp_telegram.tools.feedback.daemon_connection", fake_daemon_connection):
@@ -39,7 +53,7 @@ def mock_daemon_connection():
 
 
 @pytest.mark.asyncio
-async def test_submit_feedback_tool_happy_path(mock_daemon_connection) -> None:
+async def test_submit_feedback_tool_happy_path(mock_daemon_connection: _FeedbackToolConn) -> None:
     """Successful submission returns structured-only MCP content."""
     args = SubmitFeedback(message="the bug")
     result = await submit_feedback(args)
@@ -54,13 +68,14 @@ async def test_submit_feedback_tool_happy_path(mock_daemon_connection) -> None:
 @pytest.mark.asyncio
 async def test_submit_feedback_tool_does_not_expose_feedback_id() -> None:
     """Agent-facing response stays fire-and-forget even if daemon returns an id."""
-    mock_conn = AsyncMock()
-    mock_conn.submit_feedback = AsyncMock(
-        return_value={"ok": True, "data": {"id": 123, "message": "Feedback recorded. Thank you!"}}
+    mock_conn = _FeedbackToolConn(
+        submit_feedback=AsyncMock(
+            return_value={"ok": True, "data": {"id": 123, "message": "Feedback recorded. Thank you!"}}
+        )
     )
 
     @asynccontextmanager
-    async def fake_dc():
+    async def fake_dc() -> AsyncIterator[_FeedbackToolConn]:
         yield mock_conn
 
     with patch("mcp_telegram.tools.feedback.daemon_connection", fake_dc):
@@ -73,7 +88,7 @@ async def test_submit_feedback_tool_does_not_expose_feedback_id() -> None:
 
 
 @pytest.mark.asyncio
-async def test_submit_feedback_tool_passes_all_fields(mock_daemon_connection) -> None:
+async def test_submit_feedback_tool_passes_all_fields(mock_daemon_connection: _FeedbackToolConn) -> None:
     """All 5 kwargs forwarded to DaemonConnection.submit_feedback exactly."""
     args = SubmitFeedback(
         message="test message",
@@ -84,7 +99,8 @@ async def test_submit_feedback_tool_passes_all_fields(mock_daemon_connection) ->
     )
     result = await submit_feedback(args)
 
-    mock_daemon_connection.submit_feedback.assert_called_once_with(
+    submit_feedback_mock = mock_daemon_connection.submit_feedback
+    submit_feedback_mock.assert_called_once_with(
         message="test message",
         severity="bug",
         context="ListMessages limit=50",
@@ -99,12 +115,13 @@ async def test_submit_feedback_tool_passes_all_fields(mock_daemon_connection) ->
 
 
 @pytest.mark.asyncio
-async def test_submit_feedback_tool_omits_unset_optional_fields(mock_daemon_connection) -> None:
+async def test_submit_feedback_tool_omits_unset_optional_fields(mock_daemon_connection: _FeedbackToolConn) -> None:
     """With only message set, submit_feedback called with all 5 kwargs (None for optionals)."""
     args = SubmitFeedback(message="only message")
     await submit_feedback(args)
 
-    mock_daemon_connection.submit_feedback.assert_called_once_with(
+    submit_feedback_mock = mock_daemon_connection.submit_feedback
+    submit_feedback_mock.assert_called_once_with(
         message="only message",
         severity=None,
         context=None,
@@ -124,7 +141,7 @@ async def test_submit_feedback_tool_daemon_not_running() -> None:
     from mcp_telegram.tools._base import _daemon_not_running_text
 
     @asynccontextmanager
-    async def raising_dc():
+    async def raising_dc() -> AsyncIterator[None]:
         raise DaemonNotRunningError("Sync daemon is not running.")
         yield  # pragma: no cover
 
@@ -133,18 +150,18 @@ async def test_submit_feedback_tool_daemon_not_running() -> None:
         result = await submit_feedback(args)
 
     assert result.is_error is True
-    assert "mcp-telegram sync" in result.content[0].text
-    assert result.content[0].text == _daemon_not_running_text()
+    text = cast(_TextContent, result.content[0]).text
+    assert "mcp-telegram sync" in text
+    assert text == _daemon_not_running_text()
 
 
 @pytest.mark.asyncio
 async def test_submit_feedback_tool_daemon_error_response() -> None:
     """Daemon ok=False → content[0].text starts with 'Error:' and contains detail."""
-    mock_conn = AsyncMock()
-    mock_conn.submit_feedback = AsyncMock(return_value={"ok": False, "message": "internal error"})
+    mock_conn = _FeedbackToolConn(submit_feedback=AsyncMock(return_value={"ok": False, "message": "internal error"}))
 
     @asynccontextmanager
-    async def fake_dc():
+    async def fake_dc() -> AsyncIterator[_FeedbackToolConn]:
         yield mock_conn
 
     with patch("mcp_telegram.tools.feedback.daemon_connection", fake_dc):
@@ -152,8 +169,9 @@ async def test_submit_feedback_tool_daemon_error_response() -> None:
         result = await submit_feedback(args)
 
     assert result.is_error is True
-    assert result.content[0].text.startswith("Error:")
-    assert "internal error" in result.content[0].text
+    text = cast(_TextContent, result.content[0]).text
+    assert text.startswith("Error:")
+    assert "internal error" in text
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +182,7 @@ async def test_submit_feedback_tool_daemon_error_response() -> None:
 def test_submit_feedback_tool_severity_literal_validation() -> None:
     """SubmitFeedback with invalid severity raises pydantic.ValidationError."""
     with pytest.raises(ValidationError):
-        SubmitFeedback(message="x", severity="invalid")
+        SubmitFeedback(message="x", severity=cast(object, "invalid"))
 
 
 def test_submit_feedback_tool_message_max_length() -> None:
@@ -184,5 +202,6 @@ def test_submit_feedback_tool_registered_in_registry() -> None:
     tool_cls, posture, annotations = TOOL_REGISTRY["submit_feedback"]
     assert posture == "primary"
     assert annotations is not None
-    assert annotations.readOnlyHint is False
+    typed_annotations = cast(ToolAnnotations, annotations)
+    assert typed_annotations.readOnlyHint is False
     assert TOOL_REGISTRY["submit_feedback"].output_schema is not None

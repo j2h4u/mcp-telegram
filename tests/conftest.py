@@ -12,9 +12,11 @@ if sys.platform != "win32":
     _soft, _hard = resource.getrlimit(resource.RLIMIT_AS)
     resource.setrlimit(resource.RLIMIT_AS, (_MAX_AS_BYTES, _hard))
 
+from collections.abc import AsyncIterator, Callable, Iterable
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -51,16 +53,22 @@ class _MockEntityCache:
         self._conn.commit()
 
     def get(self, entity_id: int, ttl_seconds: int = 300) -> dict | None:
-        row = self._conn.execute("SELECT type, name, username FROM entities WHERE id = ?", (entity_id,)).fetchone()
+        row = cast(
+            tuple[str, str, str | None] | None,
+            self._conn.execute("SELECT type, name, username FROM entities WHERE id = ?", (entity_id,)).fetchone(),
+        )
         if row is None:
             return None
         return {"type": row[0], "name": row[1], "username": row[2]}
 
     def get_by_username(self, username: str) -> tuple[int, str] | None:
-        row = self._conn.execute(
-            "SELECT id, name FROM entities WHERE username = ? COLLATE NOCASE",
-            (username,),
-        ).fetchone()
+        row = cast(
+            tuple[int, str] | None,
+            self._conn.execute(
+                "SELECT id, name FROM entities WHERE username = ? COLLATE NOCASE",
+                (username,),
+            ).fetchone(),
+        )
         if row is None:
             return None
         return (row[0], row[1])
@@ -73,7 +81,8 @@ class _MockEntityCache:
             "SELECT id, name FROM entities WHERE (type='user' AND updated_at > ?) OR (type!='user' AND updated_at > ?)",
             (now - user_ttl, now - group_ttl),
         ).fetchall()
-        return {row[0]: row[1] for row in rows}
+        typed_rows = cast(list[tuple[int, str]], rows)
+        return {row[0]: row[1] for row in typed_rows}
 
     def close(self) -> None:
         self._conn.close()
@@ -96,7 +105,7 @@ def sample_entities() -> dict[int, str]:
     }
 
 
-async def async_iter(items):
+async def async_iter(items: Iterable[object]) -> AsyncIterator[object]:
     """Async generator that yields items from a list."""
     for item in items:
         yield item
@@ -182,7 +191,7 @@ def make_mock_topic():
 
 
 @pytest.fixture()
-def make_deleted_topic(make_mock_topic):
+def make_deleted_topic(make_mock_topic: Callable[..., dict[str, int | str | bool | None]]):
     """Return a factory for tombstoned topic metadata rows."""
 
     def _make(
@@ -202,7 +211,7 @@ def make_deleted_topic(make_mock_topic):
 
 
 @pytest.fixture()
-def make_general_topic_message(make_mock_message):
+def make_general_topic_message(make_mock_message: Callable[..., MagicMock]):
     """Return a factory for General topic messages without thread reply headers."""
 
     def _make(
@@ -282,11 +291,11 @@ def mock_client() -> AsyncMock:
 
 
 @pytest.fixture
-def make_feedback_db(tmp_path):
+def make_feedback_db(tmp_path: Path):
     """Factory: returns (conn, db_path) for a freshly-migrated feedback.db."""
     connections = []
 
-    def _factory():
+    def _factory() -> tuple[sqlite3.Connection, Path]:
         from mcp_telegram.feedback_db import ensure_feedback_schema
 
         db_path = tmp_path / "feedback.db"

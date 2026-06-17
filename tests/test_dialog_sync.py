@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+# pyright: reportAny=false, reportArgumentType=false, reportMissingParameterType=false, reportUndefinedVariable=false, reportIndexIssue=false, reportOperatorIssue=false, reportGeneralTypeIssues=false, reportInvalidTypeForm=false, reportAttributeAccessIssue=false
 """Tests for DialogsBootstrapWorker — Phase 41 Bootstrap Sweep.
 
 Covers BOOTSTRAP-01..06 + Phase 41 review findings:
@@ -19,12 +21,13 @@ import json
 import logging
 import sqlite3
 import time
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
-from unittest.mock import MagicMock
+from typing import cast
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -49,12 +52,12 @@ class _ChannelEntityOptions:
     broadcast: bool = True
     participants_count: int | None = 100
     access_hash: int = 9999
-    date: Any | None = None
+    date: object | None = None
 
 
 @dataclass(frozen=True)
 class _DialogOptions:
-    message_date: Any | None = None
+    message_date: object | None = None
     pinned: bool = False
     folder_id: int | None = None
     unread_mentions_count: int = 0
@@ -69,7 +72,7 @@ def _make_user_entity(
     last_name: str = "",
     access_hash: int = 12345,
     bot: bool = False,
-) -> Any:
+) -> object:
     from telethon.tl.types import User
 
     return User(
@@ -86,15 +89,15 @@ def _make_chat_entity(
     *,
     title: str = "Group",
     participants_count: int | None = 5,
-) -> Any:
+) -> object:
     from datetime import datetime
 
-    from telethon.tl.types import Chat
+    from telethon.tl.types import Chat, ChatPhotoEmpty
 
     return Chat(
         id=cid,
         title=title,
-        photo=None,
+        photo=ChatPhotoEmpty(),
         participants_count=participants_count or 0,
         date=datetime(2024, 1, 1, tzinfo=UTC),
         version=1,
@@ -105,8 +108,8 @@ def _make_channel_entity(
     cid: int,
     *,
     opts: _ChannelEntityOptions | None = None,
-    **kwargs: Any,
-) -> Any:
+    **kwargs: object,
+) -> object:
     from datetime import datetime
 
     from telethon.tl.types import Channel
@@ -115,10 +118,12 @@ def _make_channel_entity(
         opts = _ChannelEntityOptions()
     if kwargs:
         opts = replace(opts, **kwargs)
+    from telethon.tl.types import ChatPhotoEmpty
+
     return Channel(
         id=cid,
         title=opts.title,
-        photo=None,
+        photo=ChatPhotoEmpty(),
         date=opts.date if opts.date is not None else datetime(2024, 1, 1, tzinfo=UTC),
         broadcast=opts.broadcast,
         megagroup=not opts.broadcast,
@@ -129,10 +134,10 @@ def _make_channel_entity(
 
 def _make_dialog(
     dialog_id: int,
-    entity: Any,
+    entity: object,
     *,
     opts: _DialogOptions | None = None,
-    **kwargs: Any,
+    **kwargs: object,
 ) -> SimpleNamespace:
     from datetime import datetime
 
@@ -158,7 +163,7 @@ def _make_dialog(
     )
 
 
-async def _async_gen(items):
+async def _async_gen(items: Sequence[object]) -> AsyncIterator[object]:
     for item in items:
         yield item
 
@@ -176,13 +181,24 @@ def db_path(tmp_path: Path) -> Path:
     return p
 
 
+class _FakeBootstrapClient:
+    iter_dialogs: MagicMock
+    get_input_entity: AsyncMock
+
+    def __init__(self, dialogs: Sequence[object]) -> None:
+        self.iter_dialogs = MagicMock(side_effect=lambda **kw: _async_gen(dialogs))
+        self.get_input_entity = AsyncMock()
+
+    async def __call__(self, req: object) -> SimpleNamespace:
+        return SimpleNamespace(dialogs=[])
+
+
 def _make_worker(
     db_path: Path,
-    dialogs: list[Any],
+    dialogs: Sequence[object],
     shutdown_event: asyncio.Event | None = None,
-) -> tuple[DialogsBootstrapWorker, MagicMock, asyncio.Event]:
-    client = MagicMock()
-    client.iter_dialogs = MagicMock(side_effect=lambda **kw: _async_gen(dialogs))
+) -> tuple[DialogsBootstrapWorker, _FakeBootstrapClient, asyncio.Event]:
+    client = _FakeBootstrapClient(dialogs)
     if shutdown_event is None:
         shutdown_event = asyncio.Event()
     worker = DialogsBootstrapWorker(client, db_path, shutdown_event)
@@ -196,7 +212,7 @@ def _make_worker(
 
 class TestDialogsBootstrapWorker:
     @pytest.mark.asyncio
-    async def test_fresh_start_populates_dialogs_and_writes_complete(self, db_path):
+    async def test_fresh_start_populates_dialogs_and_writes_complete(self, db_path: Path) -> None:
         # D-08: each entity branch (User/Chat/Channel) yields the right `type`.
         # D-09/D-10: unread/draft fields written from Dialog object directly.
         dialogs = [
@@ -213,7 +229,8 @@ class TestDialogsBootstrapWorker:
             assert _get_state(conn, "bootstrap_sweep_status") == "complete"
             rows = list(conn.execute("SELECT dialog_id, name, type FROM dialogs ORDER BY dialog_id"))
             assert len(rows) == 3
-            types_by_id = {r[0]: r[2] for r in rows}
+            typed_rows = cast(list[tuple[int, str, str]], rows)
+            types_by_id = {r[0]: r[2] for r in typed_rows}
             assert types_by_id[111] == "user"
             assert types_by_id[-2002] == "group"
             assert types_by_id[-1001234567890] == "channel"
@@ -221,7 +238,7 @@ class TestDialogsBootstrapWorker:
             conn.close()
 
     @pytest.mark.asyncio
-    async def test_second_run_after_complete_skips(self, db_path):
+    async def test_second_run_after_complete_skips(self, db_path: Path) -> None:
         dialogs = [_make_dialog(7, _make_user_entity(7))]
         worker1, _, _ = _make_worker(db_path, dialogs)
         await worker1.run()
@@ -233,7 +250,7 @@ class TestDialogsBootstrapWorker:
         client2.iter_dialogs.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_floodwait_mid_sweep_checkpoints_and_returns_partial(self, db_path):
+    async def test_floodwait_mid_sweep_checkpoints_and_returns_partial(self, db_path: Path) -> None:
         from telethon.errors import FloodWaitError
 
         dialogs_before_flood = [
@@ -241,7 +258,7 @@ class TestDialogsBootstrapWorker:
             _make_dialog(22, _make_user_entity(22, first_name="B")),
         ]
 
-        async def flooding_gen(items):
+        async def flooding_gen(items: Sequence[object]) -> AsyncIterator[object]:
             for it in items:
                 yield it
             raise FloodWaitError(request=None, capture=2)  # type: ignore[call-arg]
@@ -269,7 +286,7 @@ class TestDialogsBootstrapWorker:
             conn.close()
 
     @pytest.mark.asyncio
-    async def test_resume_passes_saved_offsets_to_iter_dialogs(self, db_path):
+    async def test_resume_passes_saved_offsets_to_iter_dialogs(self, db_path: Path) -> None:
         # Pre-seed daemon_state with a saved cursor.
         seed_conn = _open_sync_db(db_path)
         try:
@@ -289,10 +306,10 @@ class TestDialogsBootstrapWorker:
         finally:
             seed_conn.close()
 
-        captured_kwargs: dict[str, Any] = {}
+        captured_kwargs: dict[str, object] = {}
         client = MagicMock()
 
-        def _capture(**kw):
+        def _capture(**kw: object) -> AsyncIterator[object]:
             captured_kwargs.update(kw)
             return _async_gen([_make_dialog(33, _make_user_entity(33))])
 
@@ -306,7 +323,11 @@ class TestDialogsBootstrapWorker:
         assert captured_kwargs.get("offset_peer") is not None
 
     @pytest.mark.asyncio
-    async def test_corrupt_cursor_recovers_by_clearing_and_restarting(self, db_path, caplog):
+    async def test_corrupt_cursor_recovers_by_clearing_and_restarting(
+        self,
+        db_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
         # Review MEDIUM: malformed offset_date must NOT brick the daemon —
         # worker logs a WARNING, clears cursor keys, restarts from scratch.
         seed_conn = _open_sync_db(db_path)
@@ -343,7 +364,11 @@ class TestDialogsBootstrapWorker:
             conn.close()
 
     @pytest.mark.asyncio
-    async def test_corrupt_offset_peer_json_recovers(self, db_path, caplog):
+    async def test_corrupt_offset_peer_json_recovers(
+        self,
+        db_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
         # Same recovery path triggered by JSONDecodeError on offset_peer.
         seed_conn = _open_sync_db(db_path)
         try:
@@ -362,7 +387,7 @@ class TestDialogsBootstrapWorker:
         assert any("cursor corrupt" in rec.message for rec in caplog.records)
 
     @pytest.mark.asyncio
-    async def test_upsert_recency_guard_preserves_newer_row(self, db_path):
+    async def test_upsert_recency_guard_preserves_newer_row(self, db_path: Path) -> None:
         # D-12: UPSERT WHERE dialogs.snapshot_at < excluded.snapshot_at —
         # bootstrap data must NOT clobber a row with a fresher snapshot_at.
         seed_conn = _open_sync_db(db_path)
@@ -384,17 +409,17 @@ class TestDialogsBootstrapWorker:
 
         conn = _open_sync_db(db_path)
         try:
-            row = conn.execute("SELECT name FROM dialogs WHERE dialog_id = ?", (555,)).fetchone()
+            row = cast(tuple[str], conn.execute("SELECT name FROM dialogs WHERE dialog_id = ?", (555,)).fetchone())
             assert row[0] == "FromEvent"  # not overwritten
         finally:
             conn.close()
 
     @pytest.mark.asyncio
-    async def test_floodwait_sleep_is_interruptible(self, db_path):
+    async def test_floodwait_sleep_is_interruptible(self, db_path: Path) -> None:
         # D-13: shutdown_event wakes the worker before the full FloodWait elapses.
         from telethon.errors import FloodWaitError
 
-        async def slow_flooding_gen(items):
+        async def slow_flooding_gen(items: Sequence[object]) -> AsyncIterator[object]:
             for it in items:
                 yield it
             raise FloodWaitError(request=None, capture=120)  # type: ignore[call-arg]
@@ -417,12 +442,15 @@ class TestDialogsBootstrapWorker:
         assert elapsed < 5.0
 
     @pytest.mark.asyncio
-    async def test_rpcerror_aborts_without_complete_and_surfaces_via_startup_detail(self, db_path):
+    async def test_rpcerror_aborts_without_complete_and_surfaces_via_startup_detail(
+        self,
+        db_path: Path,
+    ) -> None:
         # Review MEDIUM: RPCError must surface via startup_detail_setter so the
         # operator sees the stall via /health rather than scanning logs.
         from telethon.errors import RPCError
 
-        async def err_gen(items):
+        async def err_gen(items: Sequence[object]) -> AsyncIterator[object]:
             for it in items:
                 yield it
             raise RPCError(request=None, message="TEST_RPC_ERROR", code=400)  # type: ignore[call-arg]
@@ -449,7 +477,7 @@ class TestDialogsBootstrapWorker:
         assert any("stalled" in s and "RPCError" in s for s in captured_detail)
 
     @pytest.mark.asyncio
-    async def test_hidden_column_preserved(self, db_path):
+    async def test_hidden_column_preserved(self, db_path: Path) -> None:
         # D-11: hidden is NEVER touched in the UPDATE clause —
         # a Phase 42 handler that sets hidden=1 must survive any bootstrap pass.
         seed_conn = _open_sync_db(db_path)
@@ -471,14 +499,16 @@ class TestDialogsBootstrapWorker:
 
         conn = _open_sync_db(db_path)
         try:
-            row = conn.execute("SELECT hidden, name FROM dialogs WHERE dialog_id = ?", (888,)).fetchone()
+            row = cast(
+                tuple[int, str], conn.execute("SELECT hidden, name FROM dialogs WHERE dialog_id = ?", (888,)).fetchone()
+            )
             assert row[0] == 1
             assert row[1] == "New"
         finally:
             conn.close()
 
     @pytest.mark.asyncio
-    async def test_worker_opens_its_own_dedicated_connection(self, db_path):
+    async def test_worker_opens_its_own_dedicated_connection(self, db_path: Path) -> None:
         # Review HIGH: worker must NOT receive a pre-opened conn — it opens
         # its own via _open_sync_db(db_path). Verifies isolation contract.
         client = MagicMock()
@@ -493,12 +523,12 @@ class TestDialogsBootstrapWorker:
             worker._conn.execute("SELECT 1")
 
     @pytest.mark.asyncio
-    async def test_startup_detail_setter_is_optional(self, db_path):
+    async def test_startup_detail_setter_is_optional(self, db_path: Path) -> None:
         worker, _, _ = _make_worker(db_path, [_make_dialog(1, _make_user_entity(1))])
         await worker.run()  # must not raise
 
     @pytest.mark.asyncio
-    async def test_startup_detail_setter_invoked_on_complete(self, db_path):
+    async def test_startup_detail_setter_invoked_on_complete(self, db_path: Path) -> None:
         client = MagicMock()
         client.iter_dialogs = MagicMock(side_effect=lambda **kw: _async_gen([_make_dialog(1, _make_user_entity(1))]))
         shutdown_event = asyncio.Event()

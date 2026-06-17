@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import sqlite3
+from collections.abc import Callable
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -14,20 +17,25 @@ from mcp_telegram.feedback_db import (
 )
 
 
-def test_ensure_feedback_schema_creates_table(make_feedback_db) -> None:
+def test_ensure_feedback_schema_creates_table(
+    make_feedback_db: Callable[[], tuple[sqlite3.Connection, Path]],
+) -> None:
     """ensure_feedback_schema creates the feedback table with zero rows."""
     conn, _ = make_feedback_db()
-    row = conn.execute("SELECT 1 FROM feedback").fetchone()
+    row = cast(tuple[int] | None, conn.execute("SELECT 1 FROM feedback").fetchone())
     # Table exists; no rows yet
     assert row is None
 
 
-def test_ensure_feedback_schema_records_version(make_feedback_db) -> None:
+def test_ensure_feedback_schema_records_version(
+    make_feedback_db: Callable[[], tuple[sqlite3.Connection, Path]],
+) -> None:
     """After ensure_feedback_schema, schema_version table has MAX(version) == 1."""
     conn, _ = make_feedback_db()
-    row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
+    row = cast(tuple[int] | None, conn.execute("SELECT MAX(version) FROM schema_version").fetchone())
     assert row is not None
-    assert row[0] == _FEEDBACK_SCHEMA_VERSION
+    typed_row = cast(tuple[int], row)
+    assert typed_row[0] == _FEEDBACK_SCHEMA_VERSION
 
 
 def test_ensure_feedback_schema_idempotent(tmp_path: Path) -> None:
@@ -38,19 +46,23 @@ def test_ensure_feedback_schema_idempotent(tmp_path: Path) -> None:
     try:
         # After two calls, schema_version contains exactly one row per applied version.
         # Idempotency: the second call adds no new rows.
-        count = conn2.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0]
+        row = cast(tuple[int] | None, conn2.execute("SELECT COUNT(*) FROM schema_version").fetchone())
+        assert row is not None
+        count = cast(tuple[int], row)[0]
         assert count == _FEEDBACK_SCHEMA_VERSION
     finally:
         conn2.close()
         conn1.close()
 
 
-def test_ensure_feedback_schema_wal_mode(make_feedback_db) -> None:
+def test_ensure_feedback_schema_wal_mode(
+    make_feedback_db: Callable[[], tuple[sqlite3.Connection, Path]],
+) -> None:
     """After ensure_feedback_schema, PRAGMA journal_mode returns 'wal'."""
     conn, _ = make_feedback_db()
-    row = conn.execute("PRAGMA journal_mode").fetchone()
+    row = cast(tuple[str] | None, conn.execute("PRAGMA journal_mode").fetchone())
     assert row is not None
-    assert str(row[0]).lower() == "wal"
+    assert str(cast(tuple[str], row)[0]).lower() == "wal"
 
 
 def test_get_feedback_db_path_under_xdg_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -68,12 +80,14 @@ def test_valid_severities_constant() -> None:
     assert isinstance(VALID_SEVERITIES, frozenset)
 
 
-def test_feedback_table_columns_match_spec(make_feedback_db) -> None:
+def test_feedback_table_columns_match_spec(
+    make_feedback_db: Callable[[], tuple[sqlite3.Connection, Path]],
+) -> None:
     """PRAGMA table_info(feedback) returns exactly the specified columns."""
     conn, _ = make_feedback_db()
-    rows = conn.execute("PRAGMA table_info(feedback)").fetchall()
+    rows = cast(list[tuple[int, str, str, int, object, int]], conn.execute("PRAGMA table_info(feedback)").fetchall())
     # columns: cid, name, type, notnull, dflt_value, pk
-    col_map = {row[1]: row for row in rows}
+    col_map: dict[str, tuple[int, str, str, int, object, int]] = {row[1]: row for row in rows}
 
     expected_columns = {
         "id",
@@ -136,10 +150,14 @@ def test_feedback_schema_v2_migration(tmp_path: Path) -> None:
     db_path = tmp_path / "feedback_v2.db"
     conn = ensure_feedback_schema(db_path)
     try:
-        row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
-        assert row[0] == 2
+        row = cast(tuple[int] | None, conn.execute("SELECT MAX(version) FROM schema_version").fetchone())
+        assert row is not None
+        assert cast(tuple[int], row)[0] == 2
 
-        cols = {r[1] for r in conn.execute("PRAGMA table_info(feedback)").fetchall()}
+        table_info = cast(
+            list[tuple[int, str, str, int, object, int]], conn.execute("PRAGMA table_info(feedback)").fetchall()
+        )
+        cols = {row[1] for row in table_info}
         assert "status" in cols
         assert "status_changed_at" in cols
         assert "status_comment" in cols
@@ -175,10 +193,13 @@ def test_feedback_schema_v1_to_v2_preserves_rows(tmp_path: Path) -> None:
     # Now run the real migration
     conn = ensure_feedback_schema(db_path)
     try:
-        row = conn.execute(
-            "SELECT submitted_at, message, severity, status, status_changed_at, status_comment "
-            "FROM feedback WHERE message='legacy row'"
-        ).fetchone()
+        row = cast(
+            tuple[int, str, str, str, int | None, str | None] | None,
+            conn.execute(
+                "SELECT submitted_at, message, severity, status, status_changed_at, status_comment "
+                "FROM feedback WHERE message='legacy row'"
+            ).fetchone(),
+        )
         assert row is not None
         assert row[0] == 1700000000
         assert row[1] == "legacy row"
@@ -188,7 +209,8 @@ def test_feedback_schema_v1_to_v2_preserves_rows(tmp_path: Path) -> None:
         assert row[5] is None
 
         # schema_version reflects v2
-        max_v = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
-        assert max_v == 2
+        max_v_row = cast(tuple[int] | None, conn.execute("SELECT MAX(version) FROM schema_version").fetchone())
+        assert max_v_row is not None
+        assert max_v_row[0] == 2
     finally:
         conn.close()

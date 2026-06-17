@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
-from typing import Any
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -49,9 +49,6 @@ async def test_daemon_not_running_file_not_found(tmp_path: Path) -> None:
 async def test_daemon_not_running_connection_refused(tmp_path: Path) -> None:
     """daemon_connection raises DaemonNotRunningError on ConnectionRefusedError."""
     sock_path = tmp_path / "refused.sock"
-
-    async def _raise_refused(path: str) -> Any:
-        raise ConnectionRefusedError("Connection refused")
 
     with (
         patch("mcp_telegram.daemon_client.get_daemon_socket_path", return_value=sock_path),
@@ -110,7 +107,7 @@ async def test_request_round_trip(tmp_path: Path) -> None:
     ) -> None:
         """Echo server: reads one line, responds with {"ok": true, "echo": <request>}."""
         line = await reader.readline()
-        req = json.loads(line.decode())
+        req = cast(dict[str, object], json.loads(line.decode()))
         response = {"ok": True, "echo": req}
         writer.write(json.dumps(response).encode() + b"\n")
         await writer.drain()
@@ -120,10 +117,10 @@ async def test_request_round_trip(tmp_path: Path) -> None:
     try:
         with patch("mcp_telegram.daemon_client.get_daemon_socket_path", return_value=sock_path):
             async with daemon_connection() as conn:
-                result = await conn.request({"method": "get_me"})
+                result = cast(dict[str, object], await conn.request({"method": "get_me"}))
 
         assert result["ok"] is True
-        assert result["echo"]["method"] == "get_me"
+        assert cast(dict[str, object], result["echo"])["method"] == "get_me"
     finally:
         server.close()
         await server.wait_closed()
@@ -139,7 +136,7 @@ async def test_request_supports_multiple_calls_in_one_connection(tmp_path: Path)
         writer: asyncio.StreamWriter,
     ) -> None:
         while line := await reader.readline():
-            req = json.loads(line.decode())
+            req = cast(dict[str, object], json.loads(line.decode()))
             response = {"ok": True, "method": req["method"]}
             writer.write(json.dumps(response).encode() + b"\n")
             await writer.drain()
@@ -149,8 +146,8 @@ async def test_request_supports_multiple_calls_in_one_connection(tmp_path: Path)
     try:
         with patch("mcp_telegram.daemon_client.get_daemon_socket_path", return_value=sock_path):
             async with daemon_connection() as conn:
-                first = await conn.request({"method": "get_me"})
-                second = await conn.request({"method": "describe_source"})
+                first = cast(dict[str, object], await conn.request({"method": "get_me"}))
+                second = cast(dict[str, object], await conn.request({"method": "describe_source"}))
 
         assert first["method"] == "get_me"
         assert second["method"] == "describe_source"

@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+# pyright: reportAny=false, reportArgumentType=false, reportMissingParameterType=false, reportUndefinedVariable=false, reportIndexIssue=false, reportOperatorIssue=false, reportGeneralTypeIssues=false, reportInvalidTypeForm=false
 from __future__ import annotations
 
 import asyncio

@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+from typing import cast
 from unittest.mock import MagicMock
+
+import pytest
 
 from mcp_telegram.resolver import (
     Candidates,
     NotFound,
     Resolved,
+    _EntityCache,
     _parse_tme_link,
     latinize,
     resolve,
@@ -24,14 +28,14 @@ def test_latinize_mixed() -> None:
     assert latinize("Café résumé") == "cafe resume"
 
 
-def test_resolve_exact_match(sample_entities: dict) -> None:
+def test_resolve_exact_match(sample_entities: dict[int, str]) -> None:
     result = resolve("Иван Петров", sample_entities)
     assert isinstance(result, Resolved)
     assert result.entity_id == 101
     assert result.display_name == "Иван Петров"
 
 
-def test_numeric_query(sample_entities: dict) -> None:
+def test_numeric_query(sample_entities: dict[int, str]) -> None:
     result = resolve("101", sample_entities)
     assert isinstance(result, Resolved)
     assert result.entity_id == 101
@@ -50,7 +54,7 @@ def test_negative_numeric_query() -> None:
     assert result.display_name == "Studio Robots and Inbox"
 
 
-def test_ambiguity(sample_entities: dict) -> None:
+def test_ambiguity(sample_entities: dict[int, str]) -> None:
     choices = {201: "Ivan Petrov", 202: "Ivan's Team Chat"}
     result = resolve("Ivan", choices)
     assert isinstance(result, Candidates)
@@ -58,7 +62,7 @@ def test_ambiguity(sample_entities: dict) -> None:
     assert len(result.matches) >= 2
 
 
-def test_sender_resolution(sample_entities: dict) -> None:
+def test_sender_resolution(sample_entities: dict[int, str]) -> None:
     sender_map = {501: "Иван Петров", 502: "Анна Иванова"}
     result = resolve("Анна Иванова", sender_map)
     assert isinstance(result, Resolved)
@@ -66,13 +70,13 @@ def test_sender_resolution(sample_entities: dict) -> None:
     assert result.display_name == "Анна Иванова"
 
 
-def test_not_found(sample_entities: dict) -> None:
+def test_not_found(sample_entities: dict[int, str]) -> None:
     result = resolve("xyz_nomatch_zzz", sample_entities)
     assert isinstance(result, NotFound)
     assert result.query == "xyz_nomatch_zzz"
 
 
-def test_below_candidate_threshold(sample_entities: dict) -> None:
+def test_below_candidate_threshold(sample_entities: dict[int, str]) -> None:
     result = resolve("qqqqzzzz", sample_entities)
     assert isinstance(result, NotFound)
     assert result.query == "qqqqzzzz"
@@ -155,7 +159,7 @@ def test_numeric_id_not_found() -> None:
     assert result.query == "99999"
 
 
-def test_username_query_resolves_via_cache(mock_cache) -> None:
+def test_username_query_resolves_via_cache(mock_cache: _EntityCache) -> None:
     choices = {101: "Иван Петров", 102: "Anna"}
     result = resolve("@ivan", choices, entity_cache=mock_cache)
     assert isinstance(result, Resolved)
@@ -163,7 +167,7 @@ def test_username_query_resolves_via_cache(mock_cache) -> None:
     assert result.display_name == "Иван Петров"
 
 
-def test_username_query_not_found(mock_cache) -> None:
+def test_username_query_not_found(mock_cache: _EntityCache) -> None:
     choices = {101: "Иван Петров"}
     result = resolve("@notfound", choices, entity_cache=mock_cache)
     assert isinstance(result, NotFound)
@@ -241,7 +245,7 @@ def test_cyrillic_normalization_prefers_exact_over_fuzzy_candidates() -> None:
     assert result.entity_id == 10
 
 
-def test_candidates_include_metadata_from_cache(mock_cache) -> None:
+def test_candidates_include_metadata_from_cache(mock_cache: _EntityCache) -> None:
     choices = {101: "Иван Петров", 102: "Another User"}
     result = resolve("иван", choices, entity_cache=mock_cache)
     assert isinstance(result, Candidates)
@@ -471,18 +475,20 @@ def test_numeric_query_bypasses_collision_logic() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _make_cache_with_types(entity_types: dict[int, str]):
+def _make_cache_with_types(entity_types: dict[int, str]) -> _EntityCache:
     """Build a mock entity_cache that returns entity_type for given ids."""
     cache = MagicMock()
 
-    def get_side_effect(entity_id, ttl_seconds=300):
+    def get_side_effect(entity_id: int, ttl_seconds: int = 300) -> dict[str, str | None] | None:
         if entity_id in entity_types:
             return {"type": entity_types[entity_id], "username": None}
         return None
 
-    cache.get.side_effect = get_side_effect
-    cache.get_by_username.return_value = None
-    return cache
+    get_mock = cast(MagicMock, cache.get)
+    get_by_username_mock = cast(MagicMock, cache.get_by_username)
+    get_mock.side_effect = get_side_effect
+    get_by_username_mock.return_value = None
+    return cast(_EntityCache, cache)
 
 
 def test_candidates_match_has_disambiguation_hint_on_collision() -> None:
@@ -554,7 +560,7 @@ def test_make_match_info_without_hint_context_has_no_hint_key_or_none() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_collision_emits_debug_log(caplog) -> None:
+def test_collision_emits_debug_log(caplog: pytest.LogCaptureFixture) -> None:
     """Collision case → one log record with text matching 'resolver_collision'."""
     import logging
 
@@ -565,7 +571,7 @@ def test_collision_emits_debug_log(caplog) -> None:
     assert len(collision_records) == 1
 
 
-def test_collision_log_contains_query_and_count(caplog) -> None:
+def test_collision_log_contains_query_and_count(caplog: pytest.LogCaptureFixture) -> None:
     """Log record has query and n_entities=2 in its formatted message."""
     import logging
 
@@ -579,7 +585,7 @@ def test_collision_log_contains_query_and_count(caplog) -> None:
     assert "2" in msg
 
 
-def test_collision_log_contains_entity_types(caplog) -> None:
+def test_collision_log_contains_entity_types(caplog: pytest.LogCaptureFixture) -> None:
     """Log record args include entity types list."""
     import logging
 
@@ -591,7 +597,7 @@ def test_collision_log_contains_entity_types(caplog) -> None:
     assert len(collision_records) >= 1
 
 
-def test_no_log_when_no_collision(caplog) -> None:
+def test_no_log_when_no_collision(caplog: pytest.LogCaptureFixture) -> None:
     """Resolved path → zero resolver_collision log records."""
     import logging
 
@@ -603,7 +609,7 @@ def test_no_log_when_no_collision(caplog) -> None:
     assert len(collision_records) == 0
 
 
-def test_not_found_no_collision_log(caplog) -> None:
+def test_not_found_no_collision_log(caplog: pytest.LogCaptureFixture) -> None:
     """NotFound path → zero collision log records."""
     import logging
 
@@ -615,7 +621,7 @@ def test_not_found_no_collision_log(caplog) -> None:
     assert len(collision_records) == 0
 
 
-def test_log_level_is_debug_not_info(caplog) -> None:
+def test_log_level_is_debug_not_info(caplog: pytest.LogCaptureFixture) -> None:
     """Collision log must be DEBUG level, not INFO."""
     import logging
 

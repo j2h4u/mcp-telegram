@@ -4,31 +4,41 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from unittest.mock import AsyncMock, MagicMock, patch
+from dataclasses import dataclass
+from typing import Protocol, cast
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from mcp_telegram.tools._base import DaemonNotRunningError
 from mcp_telegram.tools.stats import GetDialogStats, get_dialog_stats
 
+
+class _TextContent(Protocol):
+    text: str
+
+
+@dataclass
+class _StatsConn:
+    get_dialog_stats: AsyncMock
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
-def _make_conn(response: dict) -> MagicMock:
+def _make_conn(response: dict) -> _StatsConn:
     """Return a mock DaemonConnection whose get_dialog_stats returns response."""
-    conn = MagicMock()
-    conn.get_dialog_stats = AsyncMock(return_value=response)
-    return conn
+    return _StatsConn(get_dialog_stats=AsyncMock(return_value=response))
 
 
 @asynccontextmanager
-async def _patched_connection(conn: MagicMock) -> AsyncIterator[MagicMock]:
+async def _patched_connection(conn: _StatsConn) -> AsyncIterator[_StatsConn]:
     yield conn
 
 
-def _patch_daemon(conn: MagicMock):
+def _patch_daemon(conn: _StatsConn):
     """Return a context manager that patches daemon_connection in stats module."""
     return patch(
         "mcp_telegram.tools.stats.daemon_connection",
@@ -69,21 +79,21 @@ async def test_get_dialog_stats_structures_sections() -> None:
         content = await get_dialog_stats(GetDialogStats(dialog="Chat Foo"))
 
     assert content.content == ()
-    assert content.structured_content is not None
-    assert content.structured_content["dialog"] == "Chat Foo"
-    assert content.structured_content["dialog_id"] == 1
-    assert content.structured_content["top_n"] == 5
-    assert content.structured_content["top_reactions"] == data["top_reactions"]
-    assert content.structured_content["top_mentions"] == data["top_mentions"]
-    assert content.structured_content["top_hashtags"] == data["top_hashtags"]
-    assert content.structured_content["top_forwards"] == data["top_forwards"]
-    assert content.structured_content["section_counts"] == {
+    structured = cast(dict[str, object], content.structured_content)
+    assert structured["dialog"] == "Chat Foo"
+    assert structured["dialog_id"] == 1
+    assert structured["top_n"] == 5
+    assert structured["top_reactions"] == data["top_reactions"]
+    assert structured["top_mentions"] == data["top_mentions"]
+    assert structured["top_hashtags"] == data["top_hashtags"]
+    assert structured["top_forwards"] == data["top_forwards"]
+    assert structured["section_counts"] == {
         "top_reactions": 2,
         "top_mentions": 2,
         "top_hashtags": 2,
         "top_forwards": 2,
     }
-    assert content.structured_content["count"] == 8
+    assert structured["count"] == 8
 
 
 @pytest.mark.asyncio
@@ -101,7 +111,7 @@ async def test_get_dialog_stats_not_synced_error() -> None:
         content = await get_dialog_stats(GetDialogStats(dialog="Unknown Chat"))
 
     assert content.is_error is True
-    text = content.content[0].text
+    text = cast(_TextContent, content.content[0]).text
     assert "MarkDialogForSync" in text
 
 
@@ -125,12 +135,12 @@ async def test_get_dialog_stats_empty_sections() -> None:
         content = await get_dialog_stats(GetDialogStats(dialog="Empty Chat"))
 
     assert content.content == ()
-    assert content.structured_content is not None
-    assert content.structured_content["top_reactions"] == []
-    assert content.structured_content["top_mentions"] == []
-    assert content.structured_content["top_hashtags"] == []
-    assert content.structured_content["top_forwards"] == []
-    assert content.structured_content["count"] == 0
+    structured = cast(dict[str, object], content.structured_content)
+    assert structured["top_reactions"] == []
+    assert structured["top_mentions"] == []
+    assert structured["top_hashtags"] == []
+    assert structured["top_forwards"] == []
+    assert structured["count"] == 0
 
 
 @pytest.mark.asyncio
@@ -147,5 +157,5 @@ async def test_get_dialog_stats_daemon_not_running() -> None:
         content = await get_dialog_stats(GetDialogStats(dialog="Any Chat"))
 
     assert content.is_error is True
-    text = content.content[0].text
+    text = cast(_TextContent, content.content[0]).text
     assert "mcp-telegram sync" in text or "not running" in text.lower()

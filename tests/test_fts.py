@@ -8,6 +8,7 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Iterator
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -173,10 +174,13 @@ def test_fts_dialog_scope(fts_conn: sqlite3.Connection) -> None:
     fts_conn.commit()
 
     query = stem_query("написал")
-    rows = fts_conn.execute(
-        "SELECT dialog_id, message_id FROM messages_fts WHERE messages_fts MATCH ? AND dialog_id = ?",
-        (query, 1),
-    ).fetchall()
+    rows = cast(
+        list[tuple[int, int]],
+        fts_conn.execute(
+            "SELECT dialog_id, message_id FROM messages_fts WHERE messages_fts MATCH ? AND dialog_id = ?",
+            (query, 1),
+        ).fetchall(),
+    )
     dialog_ids = {row[0] for row in rows}
     assert 2 not in dialog_ids, f"FTS scoped to dialog_id=1 must not return dialog_id=2 rows, got {rows!r}"
     assert 1 in dialog_ids, "FTS must return the matching row for dialog_id=1"
@@ -231,15 +235,18 @@ def test_backfill_fts_index(tmp_sync_db_path: Path) -> None:
         assert count == 3, f"backfill_fts_index must return count=3, got {count}"
 
         # Verify FTS table has 3 rows
-        rows = conn.execute("SELECT COUNT(*) FROM messages_fts").fetchone()
-        assert rows is not None and rows[0] == 3, f"Expected 3 rows in messages_fts, got {rows}"
+        row = cast(tuple[int] | None, conn.execute("SELECT COUNT(*) FROM messages_fts").fetchone())
+        assert row is not None and row[0] == 3, f"Expected 3 rows in messages_fts, got {row}"
 
         # Verify FTS search finds Russian content via morphology
         query = stem_query("написал")
-        results = conn.execute(
-            "SELECT message_id FROM messages_fts WHERE messages_fts MATCH ? AND dialog_id = ?",
-            (query, 1),
-        ).fetchall()
+        results = cast(
+            list[tuple[int]],
+            conn.execute(
+                "SELECT message_id FROM messages_fts WHERE messages_fts MATCH ? AND dialog_id = ?",
+                (query, 1),
+            ).fetchall(),
+        )
         assert len(results) >= 1, f"FTS must find message with 'написал' via stem query {query!r}"
         assert results[0][0] == 100
     finally:

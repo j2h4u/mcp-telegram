@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+# pyright: reportAny=false, reportArgumentType=false, reportMissingParameterType=false, reportUndefinedVariable=false, reportIndexIssue=false, reportOperatorIssue=false, reportGeneralTypeIssues=false, reportInvalidTypeForm=false
 """Tests for Phase 39.3-02 Task 3 — _initialize_read_positions outbox bootstrap.
 
 Covers AC-4 (tightened): bootstrap fills BOTH read cursors from the SAME
@@ -23,9 +25,10 @@ from __future__ import annotations
 import asyncio
 import math
 import sqlite3
+from collections.abc import Iterable
 from contextlib import contextmanager
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -46,7 +49,7 @@ def _make_conn():
         conn.close()
 
 
-def _seed(conn: sqlite3.Connection, rows):
+def _seed(conn: sqlite3.Connection, rows: Iterable[tuple[int, int | None, int | None, str]]) -> None:
     """rows: iterable of (dialog_id, inbox_max_id, outbox_max_id, status)."""
     for dialog_id, inbox_max, outbox_max, status in rows:
         conn.execute(
@@ -56,7 +59,7 @@ def _seed(conn: sqlite3.Connection, rows):
     conn.commit()
 
 
-def _read_cursors(conn: sqlite3.Connection, dialog_id: int):
+def _read_cursors(conn: sqlite3.Connection, dialog_id: int) -> tuple[int | None, int | None] | None:
     row = conn.execute(
         "SELECT read_inbox_max_id, read_outbox_max_id FROM synced_dialogs WHERE dialog_id=?",
         (dialog_id,),
@@ -64,7 +67,7 @@ def _read_cursors(conn: sqlite3.Connection, dialog_id: int):
     return row if row is None else (row[0], row[1])
 
 
-def _patch_get_peer_id(mapping):
+def _patch_get_peer_id(mapping: Iterable[int]):
     """Patch telethon_utils.get_peer_id to return mapping[peer] per call order.
 
     Tests usually pass a dict keyed by an identity-free SimpleNamespace and rely
@@ -72,41 +75,32 @@ def _patch_get_peer_id(mapping):
     """
     iterator = iter(mapping)
 
-    def _side_effect(peer):
+    def _side_effect(peer: object) -> int:
         return next(iterator)
 
     return patch("mcp_telegram.daemon.telethon_utils.get_peer_id", side_effect=_side_effect)
 
 
-def _fake_client_with_dialogs(dialogs_per_call):
-    """Build a mock client where calling it (for GetPeerDialogsRequest) returns
-    the next per-batch list of Dialog objects.
+class _FakeClient:
+    _call_count: SimpleNamespace
 
-    dialogs_per_call: list[list[SimpleNamespace]] — one entry per expected
-    batch call. Each inner list is the .dialogs attribute of the response.
-    """
-    client = MagicMock()
+    def __init__(self, dialogs_per_call: list[list[SimpleNamespace]]) -> None:
+        self._dialogs_per_call = dialogs_per_call
+        self._call_count = SimpleNamespace(n=0)
 
-    input_peer_counter = {"n": 0}
-
-    async def _get_input_entity(did):
-        input_peer_counter["n"] += 1
+    async def get_input_entity(self, did: int) -> SimpleNamespace:
         return SimpleNamespace(_did=did)
 
-    client.get_input_entity = _get_input_entity
-
-    call_count = {"n": 0}
-
-    async def _call(req):
-        idx = call_count["n"]
-        call_count["n"] += 1
-        batch = dialogs_per_call[idx] if idx < len(dialogs_per_call) else []
+    async def __call__(self, req: object) -> SimpleNamespace:
+        idx = self._call_count.n
+        self._call_count.n += 1
+        batch = self._dialogs_per_call[idx] if idx < len(self._dialogs_per_call) else []
         return SimpleNamespace(dialogs=batch)
 
-    # Make the client callable (client(request) in daemon.py).
-    client.side_effect = _call
-    client._call_count = call_count
-    return client
+
+def _fake_client_with_dialogs(dialogs_per_call: list[list[SimpleNamespace]]) -> _FakeClient:
+    """Build a typed fake client for the bootstrap sweep tests."""
+    return _FakeClient(dialogs_per_call)
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +164,7 @@ async def test_bootstrap_call_count_equals_ceil_n_over_15():
         _seed(conn, [(1000 + i, None, None, "synced") for i in range(N)])
 
         # Build 3 batches of Dialog objects (15 + 15 + 7).
-        def _dialogs(start, count):
+        def _dialogs(start: int, count: int) -> list[SimpleNamespace]:
             return [
                 SimpleNamespace(
                     peer=SimpleNamespace(),
@@ -189,8 +183,8 @@ async def test_bootstrap_call_count_equals_ceil_n_over_15():
             await _initialize_read_positions(client, conn, asyncio.Event())
 
         expected = math.ceil(N / 15)
-        assert client._call_count["n"] == expected, (
-            f"Expected {expected} GetPeerDialogsRequest calls, got {client._call_count['n']}"
+        assert client._call_count.n == expected, (
+            f"Expected {expected} GetPeerDialogsRequest calls, got {client._call_count.n}"
         )
 
 
@@ -206,7 +200,7 @@ async def test_bootstrap_skips_when_both_cursors_populated():
         filled = await _initialize_read_positions(client, conn, asyncio.Event())
 
         assert filled == 0
-        assert client._call_count["n"] == 0
+        assert client._call_count.n == 0
 
 
 @pytest.mark.asyncio
@@ -349,7 +343,7 @@ async def test_bootstrap_v12_upgrade_scenario():
 
         # Telethon returns inbox matching (so monotonic keeps existing) + outbox
         # ranging over 1000..1019.
-        def _batch(start_idx, count):
+        def _batch(start_idx: int, count: int) -> list[SimpleNamespace]:
             return [
                 SimpleNamespace(
                     peer=SimpleNamespace(),
@@ -367,9 +361,9 @@ async def test_bootstrap_v12_upgrade_scenario():
             await _initialize_read_positions(client, conn, asyncio.Event())
 
         expected_calls = math.ceil(N / 15)
-        assert client._call_count["n"] == expected_calls, (
+        assert client._call_count.n == expected_calls, (
             f"Expected {expected_calls} batched GetPeerDialogsRequest calls for "
-            f"v12 upgrade re-bootstrap of N={N}; got {client._call_count['n']}"
+            f"v12 upgrade re-bootstrap of N={N}; got {client._call_count.n}"
         )
 
         # Every row must now have both cursors populated; inbox preserved (they
@@ -398,7 +392,7 @@ async def test_bootstrap_live_event_race_newer_wins():
         # Slow/interruptible client: when called with GetPeerDialogsRequest,
         # simulate a concurrent live event landing BEFORE we return the stale
         # Dialog(500).
-        async def _slow_call(req):
+        async def _slow_call(req: object) -> SimpleNamespace:
             # Concurrent live event landed first.
             apply_read_cursor(conn, 1001, "outbox", 999)
             conn.commit()
@@ -412,13 +406,14 @@ async def test_bootstrap_live_event_race_newer_wins():
                 ]
             )
 
-        client = MagicMock()
+        class _RaceClient:
+            async def get_input_entity(self, did: int) -> SimpleNamespace:
+                return SimpleNamespace(_did=did)
 
-        async def _get_input_entity(did):
-            return SimpleNamespace(_did=did)
+            async def __call__(self, req: object) -> SimpleNamespace:
+                return await _slow_call(req)
 
-        client.get_input_entity = _get_input_entity
-        client.side_effect = _slow_call
+        client = _RaceClient()
 
         with _patch_get_peer_id([1001]):
             await _initialize_read_positions(client, conn, asyncio.Event())

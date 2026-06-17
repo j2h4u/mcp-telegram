@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from typing import cast
 
 from mcp_telegram.models import ReadMessage
 
@@ -21,7 +22,7 @@ def _make_msg(
     dt: datetime,
     *,
     opts: _MessageOptions | None = None,
-    **kwargs,
+    **kwargs: object,
 ) -> ReadMessage:
     if opts is None:
         opts = _MessageOptions()
@@ -419,7 +420,7 @@ class _ResolveSenderOptions:
     effective_sender_id: object = None
 
 
-def _rsn_msg(*, opts: _ResolveSenderOptions | None = None, **kwargs):
+def _rsn_msg(*, opts: _ResolveSenderOptions | None = None, **kwargs: object) -> ReadMessage:
     """Build a minimal message-like object for resolve_sender_label / _resolve_sender_name.
 
     Uses sender_first_name directly (flat field) as ReadMessage does.
@@ -429,13 +430,16 @@ def _rsn_msg(*, opts: _ResolveSenderOptions | None = None, **kwargs):
     if kwargs:
         opts = replace(opts, **kwargs)
     first_name = None if opts.sender_first_name is ... else opts.sender_first_name
-    return SimpleNamespace(
-        sender_id=opts.sender_id,
-        sender_first_name=first_name,
-        is_service=opts.is_service,
-        out=opts.out,
-        dialog_id=opts.dialog_id,
-        effective_sender_id=opts.effective_sender_id,
+    return cast(
+        ReadMessage,
+        SimpleNamespace(
+            sender_id=opts.sender_id,
+            sender_first_name=first_name,
+            is_service=opts.is_service,
+            out=opts.out,
+            dialog_id=opts.dialog_id,
+            effective_sender_id=opts.effective_sender_id,
+        ),
     )
 
 
@@ -620,7 +624,13 @@ def test_structured_read_markers_match_formatter_marker_positions() -> None:
     messages = [ReadMessage(**row) for row in rows]
     expected = _compute_inline_markers(messages, read_state)
 
-    structured = _list_messages_structured_messages(rows, read_state=read_state, dialog_type="User")
-    actual = {item["msg_id"]: item["read_markers"][0]["label"] for item in structured if item["read_markers"]}
+    structured = cast(
+        list[dict[str, object]], _list_messages_structured_messages(rows, read_state=read_state, dialog_type="User")
+    )
+    actual = {
+        cast(int, item["msg_id"]): cast(list[dict[str, object]], item["read_markers"])[0]["label"]
+        for item in structured
+        if item["read_markers"]
+    }
 
     assert actual == expected

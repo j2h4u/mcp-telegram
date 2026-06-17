@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -29,7 +30,7 @@ class _DialogDictOptions:
     sync_status: str = "synced"
 
 
-def _make_dialog_dict(*, opts: _DialogDictOptions | None = None, **kwargs) -> dict:
+def _make_dialog_dict(*, opts: _DialogDictOptions | None = None, **kwargs: object) -> dict[str, object]:
     if opts is None:
         opts = _DialogDictOptions()
     if kwargs:
@@ -51,7 +52,7 @@ def _make_dialog_dict(*, opts: _DialogDictOptions | None = None, **kwargs) -> di
     }
 
 
-def _patched_daemon(response: dict):
+def _patched_daemon(response: dict[str, object]):
     conn = MagicMock()
     conn.list_dialogs = AsyncMock(return_value=response)
     conn.upsert_entities = AsyncMock(return_value={"ok": True, "upserted": 0})
@@ -76,9 +77,10 @@ async def test_list_dialogs_renders_mentions_token() -> None:
     with _patched_daemon(response):
         result = await list_dialogs(ListDialogs())
     assert result.content == ()
-    assert result.structured_content is not None
-    assert result.structured_content["dialogs"][0]["unread_mentions_count"] == 3
-    assert result.structured_content["dialogs"][0]["unread_reactions_count"] == 0
+    structured = cast(dict[str, object], result.structured_content)
+    dialogs = cast(list[dict[str, object]], structured["dialogs"])
+    assert dialogs[0]["unread_mentions_count"] == 3
+    assert dialogs[0]["unread_reactions_count"] == 0
 
 
 @pytest.mark.asyncio
@@ -94,9 +96,10 @@ async def test_list_dialogs_renders_reactions_token() -> None:
     with _patched_daemon(response):
         result = await list_dialogs(ListDialogs())
     assert result.content == ()
-    assert result.structured_content is not None
-    assert result.structured_content["dialogs"][0]["unread_reactions_count"] == 2
-    assert result.structured_content["dialogs"][0]["unread_mentions_count"] == 0
+    structured = cast(dict[str, object], result.structured_content)
+    dialogs = cast(list[dict[str, object]], structured["dialogs"])
+    assert dialogs[0]["unread_reactions_count"] == 2
+    assert dialogs[0]["unread_mentions_count"] == 0
 
 
 @pytest.mark.asyncio
@@ -112,8 +115,8 @@ async def test_list_dialogs_renders_draft_token() -> None:
     with _patched_daemon(response):
         result = await list_dialogs(ListDialogs())
     assert result.content == ()
-    assert result.structured_content is not None
-    dialog = result.structured_content["dialogs"][0]
+    structured = cast(dict[str, object], result.structured_content)
+    dialog = cast(dict[str, object], cast(list[dict[str, object]], structured["dialogs"])[0])
     assert dialog["draft_text"] == "Hi all"
     assert dialog["draft_content"] == {
         "text": "Hi all",
@@ -141,10 +144,11 @@ async def test_list_dialogs_omits_zero_diff_tokens() -> None:
     with _patched_daemon(response):
         result = await list_dialogs(ListDialogs())
     assert result.content == ()
-    assert result.structured_content is not None
-    assert result.structured_content["dialogs"][0]["draft_content"] is None
-    assert result.structured_content["dialogs"][0]["unread_mentions_count"] == 0
-    assert result.structured_content["dialogs"][0]["unread_reactions_count"] == 0
+    structured = cast(dict[str, object], result.structured_content)
+    dialogs = cast(list[dict[str, object]], structured["dialogs"])
+    assert dialogs[0]["draft_content"] is None
+    assert dialogs[0]["unread_mentions_count"] == 0
+    assert dialogs[0]["unread_reactions_count"] == 0
 
 
 @pytest.mark.asyncio
@@ -166,8 +170,8 @@ async def test_list_dialogs_renders_all_three_diff_tokens_together() -> None:
     with _patched_daemon(response):
         result = await list_dialogs(ListDialogs())
     assert result.content == ()
-    assert result.structured_content is not None
-    dialog = result.structured_content["dialogs"][0]
+    structured = cast(dict[str, object], result.structured_content)
+    dialog = cast(dict[str, object], cast(list[dict[str, object]], structured["dialogs"])[0])
     assert dialog["unread_mentions_count"] == 1
     assert dialog["unread_reactions_count"] == 2
     assert dialog["draft_text"] == "WIP"
@@ -186,8 +190,8 @@ async def test_list_dialogs_renders_snapshot_age_trailing_line_when_stale() -> N
     with _patched_daemon(response):
         result = await list_dialogs(ListDialogs())
     assert result.content == ()
-    assert result.structured_content is not None
-    assert result.structured_content["snapshot_age_h"] == 18
+    structured = cast(dict[str, object], result.structured_content)
+    assert structured["snapshot_age_h"] == 18
 
 
 @pytest.mark.asyncio
@@ -203,8 +207,8 @@ async def test_list_dialogs_omits_snapshot_age_line_when_fresh() -> None:
     with _patched_daemon(response):
         result = await list_dialogs(ListDialogs())
     assert result.content == ()
-    assert result.structured_content is not None
-    assert result.structured_content["snapshot_age_h"] is None
+    structured = cast(dict[str, object], result.structured_content)
+    assert structured["snapshot_age_h"] is None
 
 
 @pytest.mark.asyncio
@@ -220,8 +224,8 @@ async def test_list_dialogs_renders_bootstrap_pending_line_when_true() -> None:
     with _patched_daemon(response):
         result = await list_dialogs(ListDialogs())
     assert result.content == ()
-    assert result.structured_content is not None
-    assert result.structured_content["bootstrap_pending"] is True
+    structured = cast(dict[str, object], result.structured_content)
+    assert structured["bootstrap_pending"] is True
     # result_count=0 is set on the ToolResult internally; the MCP wrapper
     # returns .content (a list), so result_count is not accessible here.
     # The implementation passes result_count=0 explicitly — verified by code review.
@@ -244,10 +248,10 @@ async def test_list_dialogs_renders_no_dialogs_when_empty_and_not_bootstrap() ->
     with _patched_daemon(response):
         result = await list_dialogs(ListDialogs())
     assert result.content == ()
-    assert result.structured_content is not None
-    assert result.structured_content["dialogs"] == []
-    assert result.structured_content["count"] == 0
-    assert result.structured_content["bootstrap_pending"] is False
+    structured = cast(dict[str, object], result.structured_content)
+    assert structured["dialogs"] == []
+    assert structured["count"] == 0
+    assert structured["bootstrap_pending"] is False
 
 
 @pytest.mark.asyncio
@@ -268,7 +272,7 @@ async def test_list_dialogs_renders_draft_with_double_quotes() -> None:
     with _patched_daemon(response):
         result = await list_dialogs(ListDialogs())
     assert result.content == ()
-    assert result.structured_content is not None
-    dialog = result.structured_content["dialogs"][0]
+    structured = cast(dict[str, object], result.structured_content)
+    dialog = cast(dict[str, object], cast(list[dict[str, object]], structured["dialogs"])[0])
     assert dialog["draft_text"] == 'Say "hi" to Bob'
-    assert dialog["draft_content"]["text"] == 'Say "hi" to Bob'
+    assert cast(dict[str, object], dialog["draft_content"])["text"] == 'Say "hi" to Bob'

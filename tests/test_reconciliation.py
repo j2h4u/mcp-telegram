@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+# pyright: reportAny=false, reportArgumentType=false, reportMissingParameterType=false, reportUndefinedVariable=false, reportIndexIssue=false, reportOperatorIssue=false, reportGeneralTypeIssues=false, reportInvalidTypeForm=false
 """Tests for DialogReconciliationWorker — Phase 43 (RECON-01..05)."""
 
 from __future__ import annotations
@@ -5,9 +7,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
+from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -16,7 +20,6 @@ from telethon.errors import (
     FloodWaitError,
     PeerIdInvalidError,
 )
-from telethon.tl import types
 
 from mcp_telegram.dialog_sync import (
     DialogReconciliationWorker,
@@ -28,7 +31,7 @@ from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 
 
 @pytest.fixture()
-def sync_db(tmp_path: Path) -> sqlite3.Connection:
+def sync_db(tmp_path: Path) -> Iterator[sqlite3.Connection]:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     conn = _open_sync_db(db_path)
@@ -43,12 +46,20 @@ def shutdown_event() -> asyncio.Event:
     return asyncio.Event()
 
 
+class _MockClient:
+    is_connected: MagicMock
+    get_entity: AsyncMock
+    iter_dialogs: MagicMock
+
+    def __init__(self) -> None:
+        self.is_connected = MagicMock(return_value=True)
+        self.get_entity = AsyncMock()
+        self.iter_dialogs = MagicMock()
+
+
 @pytest.fixture()
-def mock_client() -> MagicMock:
-    client = MagicMock()
-    client.is_connected.return_value = True
-    client.get_entity = AsyncMock()
-    return client
+def mock_client() -> _MockClient:
+    return _MockClient()
 
 
 # --- helpers ----------------------------------------------------------------
@@ -64,7 +75,7 @@ class _DialogSeedOptions:
 
 
 def _seed_dialog_row(
-    conn: sqlite3.Connection, dialog_id: int, *, opts: _DialogSeedOptions | None = None, **kwargs
+    conn: sqlite3.Connection, dialog_id: int, *, opts: _DialogSeedOptions | None = None, **kwargs: object
 ) -> None:
     if opts is None:
         opts = _DialogSeedOptions()
@@ -87,11 +98,11 @@ def _seed_synced_dialog(conn: sqlite3.Connection, dialog_id: int, status: str = 
         )
 
 
-def _make_user(uid: int, *, first_name: str = "Alice") -> Any:
-    return types.User(id=uid, access_hash=1, first_name=first_name)
+def _make_user(uid: int, *, first_name: str = "Alice") -> object:
+    return SimpleNamespace(id=uid, access_hash=1, first_name=first_name, forum=False)
 
 
-def _make_dialog(uid: int, *, name: str = "Alice") -> Any:
+def _make_dialog(uid: int, *, name: str = "Alice") -> MagicMock:
     # Minimal Dialog-like object compatible with _extract_dialog_row.
     d = MagicMock()
     d.id = uid
@@ -105,7 +116,7 @@ def _make_dialog(uid: int, *, name: str = "Alice") -> Any:
     return d
 
 
-def _async_iter(items: list[Any]):
+def _async_iter(items: list[object]):
     async def _gen():
         for item in items:
             yield item
@@ -139,7 +150,9 @@ async def test_recon_light_pass_resets_needs_refresh(
     count = await worker.run_light_pass()
 
     assert count == 1
-    row = sync_db.execute("SELECT name, needs_refresh FROM dialogs WHERE dialog_id=?", (100,)).fetchone()
+    row = cast(
+        tuple[str, int], sync_db.execute("SELECT name, needs_refresh FROM dialogs WHERE dialog_id=?", (100,)).fetchone()
+    )
     assert row[0] == "NewName"
     assert row[1] == 0
 
@@ -218,7 +231,10 @@ async def test_recon_light_pass_flood_wait_advances_to_next_dialog(
     # Only the second dialog was refreshed (count=1, not 2).
     assert count == 1
     # Dialog 100 still dirty (will retry next cycle); dialog 200 clean.
-    rows = {r[0]: r[1] for r in sync_db.execute("SELECT dialog_id, needs_refresh FROM dialogs").fetchall()}
+    rows = {
+        r[0]: r[1]
+        for r in cast(list[tuple[int, int]], sync_db.execute("SELECT dialog_id, needs_refresh FROM dialogs").fetchall())
+    }
     assert rows[100] == 1  # NOT cleared — FloodWait advanced past it
     assert rows[200] == 0  # cleared
 
@@ -239,7 +255,7 @@ async def test_recon_light_pass_flood_wait_returns_on_shutdown(
     count = await worker.run_light_pass()
 
     assert count == 0
-    row = sync_db.execute("SELECT needs_refresh FROM dialogs WHERE dialog_id=?", (100,)).fetchone()
+    row = cast(tuple[int], sync_db.execute("SELECT needs_refresh FROM dialogs WHERE dialog_id=?", (100,)).fetchone())
     assert row[0] == 1  # still dirty — no UPDATE happened
 
 
@@ -258,9 +274,9 @@ async def test_recon_light_pass_access_lost_sets_hidden(
     worker = DialogReconciliationWorker(mock_client, sync_db, shutdown_event)
     await worker.run_light_pass()
 
-    synced = sync_db.execute("SELECT status FROM synced_dialogs WHERE dialog_id=?", (100,)).fetchone()
+    synced = cast(tuple[str], sync_db.execute("SELECT status FROM synced_dialogs WHERE dialog_id=?", (100,)).fetchone())
     assert synced[0] == "access_lost"
-    dialog = sync_db.execute("SELECT hidden FROM dialogs WHERE dialog_id=?", (100,)).fetchone()
+    dialog = cast(tuple[int], sync_db.execute("SELECT hidden FROM dialogs WHERE dialog_id=?", (100,)).fetchone())
     assert dialog[0] == 1
 
 
@@ -280,7 +296,10 @@ async def test_recon_light_pass_peer_invalid_leaves_dirty(
         count = await worker.run_light_pass()
 
     assert count == 0
-    row = sync_db.execute("SELECT needs_refresh, hidden FROM dialogs WHERE dialog_id=?", (100,)).fetchone()
+    row = cast(
+        tuple[int, int],
+        sync_db.execute("SELECT needs_refresh, hidden FROM dialogs WHERE dialog_id=?", (100,)).fetchone(),
+    )
     assert row[0] == 1  # still dirty
     assert row[1] == 0  # NOT hidden (this is not access loss)
     assert any("recon_light_pass_peer_invalid" in r.message for r in caplog.records)
@@ -326,7 +345,10 @@ async def test_recon_full_pass_upserts_returned(
 
     assert count == 2
     assert completed is True
-    rows = sync_db.execute("SELECT dialog_id, name, hidden FROM dialogs ORDER BY dialog_id").fetchall()
+    rows = cast(
+        list[tuple[int, str, int]],
+        sync_db.execute("SELECT dialog_id, name, hidden FROM dialogs ORDER BY dialog_id").fetchall(),
+    )
     assert rows[0][1] == "A_new" and rows[0][2] == 0
     assert rows[1][1] == "B_new" and rows[1][2] == 0
 
@@ -346,7 +368,10 @@ async def test_recon_full_pass_hides_missing(
     worker = DialogReconciliationWorker(mock_client, sync_db, shutdown_event)
     await worker.run_full_pass()
 
-    hidden = {row[0]: row[1] for row in sync_db.execute("SELECT dialog_id, hidden FROM dialogs").fetchall()}
+    hidden = {
+        row[0]: row[1]
+        for row in cast(list[tuple[int, int]], sync_db.execute("SELECT dialog_id, hidden FROM dialogs").fetchall())
+    }
     assert hidden[100] == 0
     assert hidden[200] == 0
     assert hidden[300] == 1
@@ -386,7 +411,10 @@ async def test_recon_full_pass_flood_wait_skips_soft_delete(
     # 1 row UPSERTed before flood; soft-delete branch did NOT run.
     assert count == 1
     assert completed is False
-    hidden = {row[0]: row[1] for row in sync_db.execute("SELECT dialog_id, hidden FROM dialogs").fetchall()}
+    hidden = {
+        row[0]: row[1]
+        for row in cast(list[tuple[int, int]], sync_db.execute("SELECT dialog_id, hidden FROM dialogs").fetchall())
+    }
     assert hidden[200] == 0  # NOT hidden — soft-delete branch never ran
 
 
@@ -419,7 +447,7 @@ async def test_run_reconciliation_loop_runs_full_pass_first(
     # a fixed sleep (which flaked on slow CI runners).
     iter_called = asyncio.Event()
 
-    def _iter_dialogs(*args, **kwargs):
+    def _iter_dialogs(*args: object, **kwargs: object):
         iter_called.set()
         return _async_iter([])
 
@@ -458,12 +486,12 @@ async def test_recon_loop_full_pass_failure_does_not_advance_last_full_pass(
     full_call_count = 0
     light_call_count = 0
 
-    async def _fake_full(self) -> tuple[int, bool]:
+    async def _fake_full(self: object) -> tuple[int, bool]:
         nonlocal full_call_count
         full_call_count += 1
         raise RuntimeError("simulated full pass failure")
 
-    async def _fake_light(self):
+    async def _fake_light(self: object) -> int:
         nonlocal light_call_count
         light_call_count += 1
         return 0
@@ -530,7 +558,9 @@ async def test_refresh_forum_topics_upserts(
     count = await worker._refresh_forum_topics(dialog_id=999, entity=entity)
 
     assert count == 1
-    row = sync_db.execute("SELECT title FROM topic_metadata WHERE dialog_id=999 AND topic_id=1").fetchone()
+    row = cast(
+        tuple[str], sync_db.execute("SELECT title FROM topic_metadata WHERE dialog_id=999 AND topic_id=1").fetchone()
+    )
     assert row is not None, "topic_metadata row must exist after refresh"
     assert row[0] == "General"
 

@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+# pyright: reportAny=false, reportArgumentType=false, reportMissingParameterType=false, reportUndefinedVariable=false, reportIndexIssue=false, reportOperatorIssue=false, reportGeneralTypeIssues=false, reportInvalidTypeForm=false
 """CLI tests for the `mcp-telegram feedback` sub-app (Phase 48/49)."""
 
 from __future__ import annotations
@@ -6,6 +8,7 @@ import sqlite3
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -25,8 +28,13 @@ class _FeedbackRowOptions:
     harness: str | None = None
 
 
+@dataclass
+class _FeedbackStatusConn:
+    update_feedback_status: AsyncMock
+
+
 @pytest.fixture
-def feedback_db(tmp_path, monkeypatch) -> Path:
+def feedback_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Redirect get_feedback_db_path() to a tmp dir; return the path (file may or may not exist)."""
     target = tmp_path / "feedback.db"
     monkeypatch.setattr(
@@ -42,7 +50,7 @@ def _insert(
     message: str,
     *,
     opts: _FeedbackRowOptions | None = None,
-    **kwargs,
+    **kwargs: object,
 ) -> int:
     """Insert one feedback row directly; return the autoincrement id."""
     if opts is None:
@@ -58,7 +66,9 @@ def _insert(
             (int(time.time()), message, opts.severity, opts.context, opts.model, opts.harness),
         )
         conn.commit()
-        return cur.lastrowid
+        lastrowid = cur.lastrowid
+        assert lastrowid is not None
+        return lastrowid
     finally:
         conn.close()
 
@@ -118,12 +128,12 @@ def test_feedback_delete_removed(feedback_db):
     assert result.exit_code == 2
 
 
-def _patched_daemon(mock_response: dict):
+def _patched_daemon(mock_response: dict[str, object]):
     """Build a patch context for daemon_connection used by feedback_status.
 
     Returns (patcher, mock_conn). Caller starts patcher in a `with` block.
     """
-    mock_conn = AsyncMock()
+    mock_conn = cast(_FeedbackStatusConn, AsyncMock())
     mock_conn.update_feedback_status.return_value = mock_response
 
     async_cm = MagicMock()
@@ -134,38 +144,41 @@ def _patched_daemon(mock_response: dict):
     return patcher, mock_conn
 
 
-def test_feedback_status_sets_status(feedback_db):
+def test_feedback_status_sets_status(feedback_db: Path) -> None:
     """Valid id+status -> daemon client called, exit 0."""
     ok_response = {"ok": True, "data": {"message": "Feedback 1 status set to 'done'."}}
     patcher, mock_conn = _patched_daemon(ok_response)
     with patcher:
         result = runner.invoke(app, ["feedback", "status", "1", "done"])
     assert result.exit_code == 0, result.stdout
-    mock_conn.update_feedback_status.assert_called_once_with(feedback_id=1, status="done", reason=None)
+    update_feedback_status = mock_conn.update_feedback_status
+    update_feedback_status.assert_called_once_with(feedback_id=1, status="done", reason=None)
 
 
-def test_feedback_status_with_reason(feedback_db):
+def test_feedback_status_with_reason(feedback_db: Path) -> None:
     """--reason is forwarded to the daemon client."""
     ok_response = {"ok": True, "data": {"message": "Feedback 2 status set to 'dismissed'."}}
     patcher, mock_conn = _patched_daemon(ok_response)
     with patcher:
         result = runner.invoke(app, ["feedback", "status", "2", "dismissed", "--reason", "noise"])
     assert result.exit_code == 0, result.stdout
-    mock_conn.update_feedback_status.assert_called_once_with(feedback_id=2, status="dismissed", reason="noise")
+    update_feedback_status = mock_conn.update_feedback_status
+    update_feedback_status.assert_called_once_with(feedback_id=2, status="dismissed", reason="noise")
 
 
-def test_feedback_status_invalid_enum(feedback_db):
+def test_feedback_status_invalid_enum(feedback_db: Path) -> None:
     """Invalid status string -> exit 1 BEFORE any socket call."""
     patcher, mock_conn = _patched_daemon({"ok": True})
     with patcher:
         result = runner.invoke(app, ["feedback", "status", "1", "wontfix"])
     assert result.exit_code == 1
     # Critical: the socket was never opened
-    mock_conn.update_feedback_status.assert_not_called()
+    update_feedback_status = mock_conn.update_feedback_status
+    update_feedback_status.assert_not_called()
     assert "Invalid status" in result.stdout
 
 
-def test_feedback_status_daemon_error(feedback_db):
+def test_feedback_status_daemon_error(feedback_db: Path) -> None:
     """Daemon returns ok=False -> CLI exits 1 with the error message."""
     err_response = {"ok": False, "error": "not_found", "message": "Feedback id 99 not found."}
     patcher, mock_conn = _patched_daemon(err_response)
@@ -175,7 +188,7 @@ def test_feedback_status_daemon_error(feedback_db):
     assert "not found" in result.stdout.lower()
 
 
-def _set_status_direct(db_path, rid: int, status: str) -> None:
+def _set_status_direct(db_path: Path, rid: int, status: str) -> None:
     """Test helper — directly UPDATE feedback.db (test-only; bypasses daemon)."""
     import sqlite3
 
@@ -187,7 +200,7 @@ def _set_status_direct(db_path, rid: int, status: str) -> None:
         conn.close()
 
 
-def test_feedback_list_default_hides_done(feedback_db):
+def test_feedback_list_default_hides_done(feedback_db: Path) -> None:
     rid = _insert(feedback_db, "completed work")
     _set_status_direct(feedback_db, rid, "done")
     result = runner.invoke(app, ["feedback", "list"])
@@ -198,7 +211,7 @@ def test_feedback_list_default_hides_done(feedback_db):
     assert "--all" in result.stdout
 
 
-def test_feedback_list_all_shows_done(feedback_db):
+def test_feedback_list_all_shows_done(feedback_db: Path) -> None:
     rid = _insert(feedback_db, "completed work")
     _set_status_direct(feedback_db, rid, "done")
     result = runner.invoke(app, ["feedback", "list", "--all"])
@@ -207,14 +220,14 @@ def test_feedback_list_all_shows_done(feedback_db):
     assert "[done]" in result.stdout
 
 
-def test_feedback_list_shows_status_column(feedback_db):
+def test_feedback_list_shows_status_column(feedback_db: Path) -> None:
     _insert(feedback_db, "open bug")
     result = runner.invoke(app, ["feedback", "list"])
     assert result.exit_code == 0, result.stdout
     assert "[open]" in result.stdout
 
 
-def test_feedback_list_truly_empty(feedback_db):
+def test_feedback_list_truly_empty(feedback_db: Path) -> None:
     """Table with zero rows -> 'No feedback recorded yet.', NOT the filter-hint message."""
     ensure_feedback_schema(feedback_db).close()
     result = runner.invoke(app, ["feedback", "list"])
