@@ -55,6 +55,7 @@ class _ListMessagesRequest:
 class _ListMessagesDbRequest:
     dialog_id: int
     limit: int
+    self_id: int | None
     direction: str
     direction_enum: HistoryDirection
     anchor_msg_id: int | None
@@ -341,6 +342,7 @@ class DaemonReadingService:
                 _ListMessagesDbRequest(
                     dialog_id=dialog_id,
                     limit=request.limit,
+                    self_id=self._deps.self_id,
                     direction=direction,
                     direction_enum=direction_enum,
                     anchor_msg_id=anchor_msg_id,
@@ -683,17 +685,7 @@ class DaemonReadingService:
 
     async def _list_messages_from_db(self, req: _ListMessagesDbRequest) -> dict:
         """Read messages from sync.db using the dynamic query builder."""
-        sql, params = api._build_list_messages_query(
-            dialog_id=req.dialog_id,
-            limit=req.limit,
-            self_id=self._deps.self_id,
-            direction=req.direction,
-            anchor_msg_id=req.anchor_msg_id,
-            sender_id=req.sender_id,
-            sender_name=req.sender_name,
-            topic_id=req.topic_id,
-            unread_after_id=req.unread_after_id,
-        )
+        sql, params = api._build_list_messages_query(req)
         rows = self._conn.execute(sql, params).fetchall()
         messages = await self._build_read_messages_from_rows(req.dialog_id, rows, log_rendered=True)
         next_nav = self._maybe_encode_next_nav(

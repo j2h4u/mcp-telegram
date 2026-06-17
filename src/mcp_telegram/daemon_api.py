@@ -220,6 +220,76 @@ _FEEDBACK_CONTEXT_MAX_LEN = 2000
 _FEEDBACK_MODEL_MAX_LEN = 200
 _FEEDBACK_HARNESS_MAX_LEN = 200
 _UPSERT_ENTITIES_MAX_LEN = 10000
+
+
+@dataclasses.dataclass(frozen=True)
+class _SubmitFeedbackRequest:
+    message: str
+    severity: str | None
+    context: str | None
+    model: str | None
+    harness: str | None
+
+    @classmethod
+    def parse(cls, req: dict) -> _SubmitFeedbackRequest:
+        message = req.get("message", "")
+        if not isinstance(message, str):
+            raise ValueError("message must be a string")
+
+        stripped = message.strip()
+        if not stripped:
+            raise ValueError("message is required")
+        if len(message) > _FEEDBACK_MESSAGE_MAX_LEN:
+            raise ValueError("message too long (max 10000 chars)")
+
+        severity = req.get("severity")
+        if severity is not None and severity not in VALID_SEVERITIES:
+            valid_list = ", ".join(sorted(VALID_SEVERITIES))
+            raise ValueError(f"severity must be one of: {valid_list}")
+
+        context = req.get("context")
+        model = req.get("model")
+        harness = req.get("harness")
+        if context is not None and len(str(context)) > _FEEDBACK_CONTEXT_MAX_LEN:
+            raise ValueError("context too long (max 2000 chars)")
+        if model is not None and len(str(model)) > _FEEDBACK_MODEL_MAX_LEN:
+            raise ValueError("model too long (max 200 chars)")
+        if harness is not None and len(str(harness)) > _FEEDBACK_HARNESS_MAX_LEN:
+            raise ValueError("harness too long (max 200 chars)")
+
+        return cls(
+            message=stripped,
+            severity=severity,
+            context=context,
+            model=model,
+            harness=harness,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class _UpdateFeedbackStatusRequest:
+    feedback_id: int
+    status: str
+    reason: str | None
+
+    @classmethod
+    def parse(cls, req: dict) -> _UpdateFeedbackStatusRequest:
+        feedback_id = req.get("id")
+        if not isinstance(feedback_id, int) or feedback_id <= 0:
+            raise ValueError("id must be a positive integer")
+
+        status = req.get("status")
+        if status not in VALID_STATUSES:
+            valid_list = ", ".join(sorted(VALID_STATUSES))
+            raise ValueError(f"status must be one of: {valid_list}")
+
+        reason = req.get("reason")
+        if reason is not None and not isinstance(reason, str):
+            raise ValueError("reason must be a string or null")
+
+        return cls(feedback_id=feedback_id, status=status, reason=reason)
+
+
 from .resolver import (
     Candidates,
     Resolved,
@@ -587,28 +657,27 @@ def _assert_select_columns_match_read_message() -> None:
 _assert_select_columns_match_read_message()
 
 
-def _build_list_messages_query(
-    *,
-    dialog_id: int,
-    limit: int,
-    self_id: int | None = None,
-    direction: str = "newest",
-    anchor_msg_id: int | None = None,
-    sender_id: int | None = None,
-    sender_name: str | None = None,
-    topic_id: int | None = None,
-    unread_after_id: int | None = None,
-) -> tuple[str, dict]:
+def _build_list_messages_query(req: Any) -> tuple[str, dict]:
     """Build a parameterized SELECT for list_messages against sync.db.
 
     Returns (sql_string, params_dict).  Column names in the SELECT match
     ReadMessage field names; rows are fetched via conn.row_factory = sqlite3.Row
     and converted to ReadMessage objects by _list_messages_from_db.
 
-    self_id is bound to :self_id (used by the EFFECTIVE_SENDER_ID_SQL CASE
+    self_id is bound to `req.self_id` (used by the EFFECTIVE_SENDER_ID_SQL CASE
     expression to collapse DM direction). If not set, DM outgoing rows will
     project effective_sender_id=NULL instead of the authenticated user id.
     """
+    dialog_id = req.dialog_id
+    limit = req.limit
+    self_id = getattr(req, "self_id", None)
+    direction = req.direction
+    anchor_msg_id = req.anchor_msg_id
+    sender_id = req.sender_id
+    sender_name = req.sender_name
+    topic_id = req.topic_id
+    unread_after_id = req.unread_after_id
+
     params: dict = {"dialog_id": dialog_id, "limit": limit, "self_id": self_id}
     sql = _LIST_MESSAGES_BASE_SQL
 
@@ -762,6 +831,64 @@ class DaemonAPIServer:
     # Connection handler
     # ------------------------------------------------------------------
 
+    async def _handle_client_line(
+        self, line: bytes, method: str, request_id: str | None
+    ) -> tuple[dict, str, str | None]:
+        try:
+            req = json.loads(line.decode())
+        except json.JSONDecodeError as exc:
+            logger.warning("daemon_api invalid JSON: %s", exc)
+            return (
+                {
+                    "ok": False,
+                    "error": "invalid_json",
+                    "message": "invalid JSON",
+                },
+                method,
+                request_id,
+            )
+
+        request_id = req.get("request_id")
+        method = req.get("method", "")
+        if not self._ready:
+            return (
+                {
+                    "ok": False,
+                    "error": "daemon_not_ready",
+                    "detail": self.startup_detail,
+                },
+                method,
+                request_id,
+            )
+
+        if request_id:
+            logger.debug(
+                "daemon_api_request method=%s request_id=%s",
+                method,
+                request_id,
+            )
+
+        token = _current_request_id.set(request_id)
+        try:
+            response = await self._dispatch(req)
+        except Exception:
+            logger.exception(
+                "daemon_api_dispatch_error method=%s request_id=%s",
+                method,
+                request_id,
+            )
+            response = {
+                "ok": False,
+                "error": "internal",
+                "message": "internal error",
+            }
+        finally:
+            _current_request_id.reset(token)
+
+        if request_id:
+            response = {**response, "request_id": request_id}
+        return response, method, request_id
+
     async def handle_client(
         self,
         reader: asyncio.StreamReader,
@@ -777,50 +904,7 @@ class DaemonAPIServer:
         request_id: str | None = None
         try:
             while line := await reader.readline():
-                try:
-                    req = json.loads(line.decode())
-                except json.JSONDecodeError as exc:
-                    logger.warning("daemon_api invalid JSON: %s", exc)
-                    response = {
-                        "ok": False,
-                        "error": "invalid_json",
-                        "message": "invalid JSON",
-                    }
-                else:
-                    request_id = req.get("request_id")
-                    method = req.get("method", "")
-                    if not self._ready:
-                        response = {
-                            "ok": False,
-                            "error": "daemon_not_ready",
-                            "detail": self.startup_detail,
-                        }
-                    else:
-                        if request_id:
-                            logger.debug(
-                                "daemon_api_request method=%s request_id=%s",
-                                method,
-                                request_id,
-                            )
-                        token = _current_request_id.set(request_id)
-                        try:
-                            response = await self._dispatch(req)
-                        except Exception:
-                            logger.exception(
-                                "daemon_api_dispatch_error method=%s request_id=%s",
-                                method,
-                                request_id,
-                            )
-                            response = {
-                                "ok": False,
-                                "error": "internal",
-                                "message": "internal error",
-                            }
-                        finally:
-                            _current_request_id.reset(token)
-                        if request_id:
-                            response = {**response, "request_id": request_id}
-
+                response, method, request_id = await self._handle_client_line(line, method, request_id)
                 encoded = json.dumps(response).encode() + b"\n"
                 writer.write(encoded)
                 await writer.drain()
@@ -850,54 +934,43 @@ class DaemonAPIServer:
     # Dispatcher
     # ------------------------------------------------------------------
 
+    def _dispatch_handlers(self) -> dict[str, Any]:
+        return {
+            "list_messages": self._list_messages,
+            "describe_source": _describe_source,
+            "export_source_changes": lambda req: _export_source_changes(self._conn, req),
+            "read_source_unit_window": lambda req: _read_source_unit_window(self._conn, req),
+            "search_messages": self._search_messages,
+            "trace_account_messages": self._trace_account_messages,
+            "list_dialogs": self._list_dialogs,
+            "list_topics": self._list_topics,
+            "get_me": self._get_me,
+            "mark_dialog_for_sync": self._mark_dialog_for_sync,
+            "get_sync_status": self._get_sync_status,
+            "get_sync_alerts": self._get_sync_alerts,
+            "get_entity_info": self._get_entity_info,
+            "get_inbox": self._list_unread_messages,
+            "record_telemetry": self._record_telemetry,
+            "get_usage_stats": self._get_usage_stats,
+            "upsert_entities": self._upsert_entities,
+            "resolve_entity": self._resolve_entity,
+            "get_dialog_stats": self._get_dialog_stats,
+            "get_my_recent_activity": self._get_my_recent_activity,
+            "submit_feedback": self._submit_feedback,
+            "update_feedback_status": self._update_feedback_status,
+        }
+
     async def _dispatch(self, req: dict) -> dict:
         """Route request to the appropriate handler by method name."""
         method = req.get("method", "")
-        if method == "list_messages":
-            return await self._list_messages(req)
-        if method == "describe_source":
-            return _describe_source(req)
-        if method == "export_source_changes":
-            return _export_source_changes(self._conn, req)
-        if method == "read_source_unit_window":
-            return _read_source_unit_window(self._conn, req)
-        if method == "search_messages":
-            return await self._search_messages(req)
-        if method == "trace_account_messages":
-            return await self._trace_account_messages(req)
-        if method == "list_dialogs":
-            return await self._list_dialogs(req)
-        if method == "list_topics":
-            return await self._list_topics(req)
-        if method == "get_me":
-            return await self._get_me(req)
-        if method == "mark_dialog_for_sync":
-            return await self._mark_dialog_for_sync(req)
-        if method == "get_sync_status":
-            return await self._get_sync_status(req)
-        if method == "get_sync_alerts":
-            return await self._get_sync_alerts(req)
-        if method == "get_entity_info":
-            return await self._get_entity_info(req)
-        if method == "get_inbox":
-            return await self._list_unread_messages(req)
-        if method == "record_telemetry":
-            return await self._record_telemetry(req)
-        if method == "get_usage_stats":
-            return await self._get_usage_stats(req)
-        if method == "upsert_entities":
-            return await self._upsert_entities(req)
-        if method == "resolve_entity":
-            return await self._resolve_entity(req)
-        if method == "get_dialog_stats":
-            return await self._get_dialog_stats(req)
-        if method == "get_my_recent_activity":
-            return await self._get_my_recent_activity(req)
-        if method == "submit_feedback":
-            return await self._submit_feedback(req)
-        if method == "update_feedback_status":
-            return await self._update_feedback_status(req)
-        return {"ok": False, "error": "unknown_method"}
+        handler = self._dispatch_handlers().get(method)
+        if handler is None:
+            return {"ok": False, "error": "unknown_method"}
+
+        result = handler(req)
+        if asyncio.iscoroutine(result):
+            return await result
+        return result
 
     # (dotMD source-export helpers are defined in daemon_source_export.py)
 
@@ -1053,33 +1126,9 @@ class DaemonAPIServer:
             context_size=context_size,
         )
 
-    async def _list_messages_from_telegram(
-        self,
-        *,
-        dialog_id: int,
-        limit: int,
-        direction: str,
-        direction_enum: HistoryDirection,
-        anchor_msg_id: int | None,
-        sender_id: int | None,
-        topic_id: int | None,
-        unread_after_id: int | None,
-    ) -> dict:
+    async def _list_messages_from_telegram(self, req: Any) -> dict:
         """Delegate Telegram fallback reads to the reading service."""
-        from .daemon_reading import _ListMessagesTelegramRequest
-
-        return await self._get_reading_service()._list_messages_from_telegram(
-            _ListMessagesTelegramRequest(
-                dialog_id=dialog_id,
-                limit=limit,
-                direction=direction,
-                direction_enum=direction_enum,
-                anchor_msg_id=anchor_msg_id,
-                sender_id=sender_id,
-                topic_id=topic_id,
-                unread_after_id=unread_after_id,
-            )
-        )
+        return await self._get_reading_service()._list_messages_from_telegram(req)
 
     # ------------------------------------------------------------------
     # list_messages — helpers
@@ -1125,36 +1174,10 @@ class DaemonAPIServer:
         """Delegate unread-position resolution to the reading service."""
         return await self._get_reading_service()._resolve_unread_position(dialog_id, unread_after_id)
 
-    async def _list_messages_from_db(
-        self,
-        *,
-        dialog_id: int,
-        limit: int,
-        direction: str,
-        direction_enum: HistoryDirection,
-        anchor_msg_id: int | None,
-        sender_id: int | None,
-        sender_name: str | None,
-        topic_id: int | None,
-        unread_after_id: int | None,
-    ) -> dict:
+    async def _list_messages_from_db(self, req: Any) -> dict:
         """Delegate sync.db reads to the reading service."""
-        from .daemon_reading import _ListMessagesDbRequest
-
         # "list_messages rendered"
-        return await self._get_reading_service()._list_messages_from_db(
-            _ListMessagesDbRequest(
-                dialog_id=dialog_id,
-                limit=limit,
-                direction=direction,
-                direction_enum=direction_enum,
-                anchor_msg_id=anchor_msg_id,
-                sender_id=sender_id,
-                sender_name=sender_name,
-                topic_id=topic_id,
-                unread_after_id=unread_after_id,
-            )
-        )
+        return await self._get_reading_service()._list_messages_from_db(req)
 
     # ------------------------------------------------------------------
     # list_messages — navigation decoding
@@ -1654,43 +1677,13 @@ class DaemonAPIServer:
         NOTE: the user-supplied message text is intentionally NOT logged at any
         level to avoid accidental disclosure of sensitive context.
         """
+        try:
+            request = _SubmitFeedbackRequest.parse(req)
+        except ValueError as exc:
+            return {"ok": False, "error": "invalid_input", "message": str(exc)}
+
         if self._feedback_conn is None:
-            return {
-                "ok": False,
-                "error": "internal",
-                "message": "feedback database not initialised",
-            }
-        message = req.get("message", "")
-        if not isinstance(message, str):
-            return {"ok": False, "error": "invalid_input", "message": "message must be a string"}
-        stripped = message.strip()
-        if not stripped:
-            return {"ok": False, "error": "invalid_input", "message": "message is required"}
-        if len(message) > _FEEDBACK_MESSAGE_MAX_LEN:
-            return {"ok": False, "error": "invalid_input", "message": "message too long (max 10000 chars)"}
-
-        severity = req.get("severity")
-        if severity is not None and severity not in VALID_SEVERITIES:
-            valid_list = ", ".join(sorted(VALID_SEVERITIES))
-            return {
-                "ok": False,
-                "error": "invalid_input",
-                "message": f"severity must be one of: {valid_list}",
-            }
-
-        # Defense-in-depth: cap optional fields at the daemon layer too.
-        # Pydantic max_length on SubmitFeedback (48-03) blocks oversize payloads
-        # from MCP clients, but a direct socket caller could bypass the tool —
-        # daemon is the canonical trust boundary, so it enforces the same caps.
-        context = req.get("context")
-        model = req.get("model")
-        harness = req.get("harness")
-        if context is not None and len(str(context)) > _FEEDBACK_CONTEXT_MAX_LEN:
-            return {"ok": False, "error": "invalid_input", "message": "context too long (max 2000 chars)"}
-        if model is not None and len(str(model)) > _FEEDBACK_MODEL_MAX_LEN:
-            return {"ok": False, "error": "invalid_input", "message": "model too long (max 200 chars)"}
-        if harness is not None and len(str(harness)) > _FEEDBACK_HARNESS_MAX_LEN:
-            return {"ok": False, "error": "invalid_input", "message": "harness too long (max 200 chars)"}
+            return {"ok": False, "error": "internal", "message": "feedback database not initialised"}
 
         try:
             cur = self._feedback_conn.execute(
@@ -1698,11 +1691,11 @@ class DaemonAPIServer:
                 "VALUES (?, ?, ?, ?, ?, ?)",
                 (
                     int(time.time()),
-                    stripped,
-                    severity,
-                    context,
-                    model,
-                    harness,
+                    request.message,
+                    request.severity,
+                    request.context,
+                    request.model,
+                    request.harness,
                 ),
             )
             self._feedback_conn.commit()
@@ -1734,57 +1727,26 @@ class DaemonAPIServer:
 
         NOTE: row contents (message text, reason text) are never logged.
         """
-        feedback_id = req.get("id")
-        if not isinstance(feedback_id, int) or feedback_id <= 0:
-            return {
-                "ok": False,
-                "error": "invalid_input",
-                "message": "id must be a positive integer",
-            }
-
-        status = req.get("status")
-        if status not in VALID_STATUSES:
-            valid_list = ", ".join(sorted(VALID_STATUSES))
-            return {
-                "ok": False,
-                "error": "invalid_input",
-                "message": f"status must be one of: {valid_list}",
-            }
-
-        reason = req.get("reason")  # may be None or a string
-        # Type-check reason BEFORE binding into SQL. A direct socket caller
-        # could send a list/dict and trigger a sqlite3 binding error which
-        # would surface as 'internal' instead of 'invalid_input'.
-        if reason is not None and not isinstance(reason, str):
-            return {
-                "ok": False,
-                "error": "invalid_input",
-                "message": "reason must be a string or null",
-            }
+        try:
+            request = _UpdateFeedbackStatusRequest.parse(req)
+        except ValueError as exc:
+            return {"ok": False, "error": "invalid_input", "message": str(exc)}
 
         # T-49-11: no length cap on status_comment by design (single-operator
         # low-volume queue; SQLite handles multi-MB TEXT comfortably).
 
         if self._feedback_conn is None:
-            return {
-                "ok": False,
-                "error": "internal",
-                "message": "feedback database not initialised",
-            }
+            return {"ok": False, "error": "internal", "message": "feedback database not initialised"}
 
         try:
             cur = self._feedback_conn.execute(
                 "UPDATE feedback SET status = ?, status_changed_at = ?, status_comment = ? WHERE id = ?",
-                (status, int(time.time()), reason, feedback_id),
+                (request.status, int(time.time()), request.reason, request.feedback_id),
             )
             if cur.rowcount == 0:
                 # No row matched — do NOT commit (nothing to persist anyway,
                 # but explicit ordering keeps the success/no-op paths clean).
-                return {
-                    "ok": False,
-                    "error": "not_found",
-                    "message": f"Feedback id {feedback_id} not found.",
-                }
+                return {"ok": False, "error": "not_found", "message": f"Feedback id {request.feedback_id} not found."}
             self._feedback_conn.commit()
             # NOTE: response intentionally returns only a confirmation message,
             # not the full updated row. CLI prints the message string. Both
@@ -1793,15 +1755,11 @@ class DaemonAPIServer:
             # status` UX needs to echo the canonical row state.
             return {
                 "ok": True,
-                "data": {"message": f"Feedback {feedback_id} status set to '{status}'."},
+                "data": {"message": f"Feedback {request.feedback_id} status set to '{request.status}'."},
             }
         except Exception as exc:
             logger.error("update_feedback_status failed: %s", exc, exc_info=True)
-            return {
-                "ok": False,
-                "error": "internal",
-                "message": "internal error",
-            }
+            return {"ok": False, "error": "internal", "message": "internal error"}
 
     # ------------------------------------------------------------------
     # get_usage_stats

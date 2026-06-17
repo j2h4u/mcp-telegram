@@ -11,6 +11,7 @@ import json
 import sqlite3
 import time
 from datetime import UTC
+from types import SimpleNamespace
 from typing import Any, Final
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -61,6 +62,22 @@ def _patch_get_peer_id():
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _build_list_messages_query_req(**overrides: Any) -> SimpleNamespace:
+    data: dict[str, Any] = {
+        "dialog_id": 1,
+        "limit": 10,
+        "self_id": None,
+        "direction": "newest",
+        "anchor_msg_id": None,
+        "sender_id": None,
+        "sender_name": None,
+        "topic_id": None,
+        "unread_after_id": None,
+    }
+    data.update(overrides)
+    return SimpleNamespace(**data)
 
 
 def make_server(
@@ -2663,7 +2680,7 @@ def test_build_list_messages_query_basic_shape() -> None:
     """_build_list_messages_query returns (sql, params) with edit_date and topic_title columns."""
     from mcp_telegram.daemon_api import _build_list_messages_query
 
-    sql, params = _build_list_messages_query(dialog_id=1, limit=10)
+    sql, params = _build_list_messages_query(_build_list_messages_query_req())
     assert "edit_date" in sql
     assert "topic_title" in sql or "tm.title" in sql
     assert "topic_metadata" in sql
@@ -2677,7 +2694,7 @@ def test_build_list_messages_query_direction_newest() -> None:
     """_build_list_messages_query with direction=newest uses DESC order."""
     from mcp_telegram.daemon_api import _build_list_messages_query
 
-    sql, _ = _build_list_messages_query(dialog_id=1, limit=10, direction="newest")
+    sql, _ = _build_list_messages_query(_build_list_messages_query_req(direction="newest"))
     assert "DESC" in sql.upper()
 
 
@@ -2685,7 +2702,7 @@ def test_build_list_messages_query_direction_oldest() -> None:
     """_build_list_messages_query with direction=oldest uses ASC order."""
     from mcp_telegram.daemon_api import _build_list_messages_query
 
-    sql, _ = _build_list_messages_query(dialog_id=1, limit=10, direction="oldest")
+    sql, _ = _build_list_messages_query(_build_list_messages_query_req(direction="oldest"))
     assert "ASC" in sql.upper()
 
 
@@ -2693,7 +2710,7 @@ def test_build_list_messages_query_sender_id_filter() -> None:
     """_build_list_messages_query with sender_id adds AND m.sender_id = :filter_sender_id clause."""
     from mcp_telegram.daemon_api import _build_list_messages_query
 
-    sql, params = _build_list_messages_query(dialog_id=1, limit=10, sender_id=42)
+    sql, params = _build_list_messages_query(_build_list_messages_query_req(sender_id=42))
     assert "sender_id" in sql
     assert 42 in params.values()
 
@@ -2702,7 +2719,7 @@ def test_build_list_messages_query_sender_name_filter() -> None:
     """_build_list_messages_query with sender_name adds LIKE clause."""
     from mcp_telegram.daemon_api import _build_list_messages_query
 
-    sql, params = _build_list_messages_query(dialog_id=1, limit=10, sender_name="Alice")
+    sql, params = _build_list_messages_query(_build_list_messages_query_req(sender_name="Alice"))
     assert "LIKE" in sql.upper()
     assert any("Alice" in str(p) for p in params.values())
 
@@ -2711,7 +2728,7 @@ def test_build_list_messages_query_topic_filter() -> None:
     """_build_list_messages_query with topic_id adds forum_topic_id filter."""
     from mcp_telegram.daemon_api import _build_list_messages_query
 
-    sql, params = _build_list_messages_query(dialog_id=1, limit=10, topic_id=5)
+    sql, params = _build_list_messages_query(_build_list_messages_query_req(topic_id=5))
     assert "forum_topic_id" in sql
     assert 5 in params.values()
 
@@ -2720,7 +2737,7 @@ def test_build_list_messages_query_unread_filter() -> None:
     """_build_list_messages_query with unread_after_id adds message_id > :unread_after_id clause."""
     from mcp_telegram.daemon_api import _build_list_messages_query
 
-    sql, params = _build_list_messages_query(dialog_id=1, limit=10, unread_after_id=100)
+    sql, params = _build_list_messages_query(_build_list_messages_query_req(unread_after_id=100))
     assert "message_id" in sql
     assert 100 in params.values()
 
@@ -2729,7 +2746,7 @@ def test_build_list_messages_query_cursor_newest() -> None:
     """_build_list_messages_query with cursor and direction=newest uses message_id < :anchor."""
     from mcp_telegram.daemon_api import _build_list_messages_query
 
-    sql, params = _build_list_messages_query(dialog_id=1, limit=10, anchor_msg_id=500, direction="newest")
+    sql, params = _build_list_messages_query(_build_list_messages_query_req(anchor_msg_id=500, direction="newest"))
     assert "<" in sql
     assert 500 in params.values()
 
@@ -2738,7 +2755,7 @@ def test_build_list_messages_query_cursor_oldest() -> None:
     """_build_list_messages_query with cursor and direction=oldest uses message_id > :anchor."""
     from mcp_telegram.daemon_api import _build_list_messages_query
 
-    sql, params = _build_list_messages_query(dialog_id=1, limit=10, anchor_msg_id=500, direction="oldest")
+    sql, params = _build_list_messages_query(_build_list_messages_query_req(anchor_msg_id=500, direction="oldest"))
     assert ">" in sql
     assert 500 in params.values()
 
