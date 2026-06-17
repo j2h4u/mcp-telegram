@@ -65,8 +65,8 @@ class _PeerLookupClient:
         self._should_raise = should_raise
         self.passed_peer: _PeerLike | None = None
 
-    async def get_entity(self, entity_id: object) -> object:
-        self.passed_peer = cast(_PeerLike, entity_id)
+    async def get_entity(self, _entity_id: object) -> object:
+        self.passed_peer = cast(_PeerLike, _entity_id)
         if self._should_raise:
             raise ValueError("Could not find the input entity")
         return SimpleNamespace(title="Private meme collection")
