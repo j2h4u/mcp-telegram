@@ -44,10 +44,9 @@ import re
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from telethon import utils as telethon_utils  # type: ignore[import-untyped]
-from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
 from telethon.tl.functions.channels import (
     GetFullChannelRequest,  # type: ignore[import-untyped]
     GetParticipantsRequest,  # type: ignore[import-untyped]
@@ -181,10 +180,9 @@ def _read_state_for_dialog(conn: sqlite3.Connection, dialog_id: int, dialog_type
 USER_TTL: int = 2_592_000  # 30 days
 GROUP_TTL: int = 604_800  # 7 days
 
-from rapidfuzz import fuzz as _fuzz
 
 from .budget import allocate_message_budget_proportional, unread_chat_tier
-from .daemon_message import fetch_reaction_counts, message_to_dict
+from .daemon_message import fetch_reaction_counts
 from .daemon_source_export import (
     _describe_source,
     _export_source_changes,
@@ -192,15 +190,12 @@ from .daemon_source_export import (
 )
 from .feedback_db import VALID_SEVERITIES, VALID_STATUSES
 from .formatter import format_reaction_counts
-from .fts import stem_query
 from .models import DialogType, ReadMessage, ReadState
-from .pagination import (
-    HistoryDirection,
-    decode_navigation_token,
-    encode_history_navigation,
-    encode_search_navigation,
-)
-from .sync_worker import apply_reactions_delta, extract_reactions_rows
+from .sync_worker import extract_reactions_rows
+
+if TYPE_CHECKING:
+    from .daemon_reading import DaemonReadingService
+    from .pagination import HistoryDirection
 
 # Phase 39.2 §Key technical decisions: per-message TTL for JIT reactions freshen-on-read.
 # Amortizes rapid paginated reads on the same ids; live events catch most mutations.
@@ -795,6 +790,25 @@ class DaemonAPIServer:
         # While False, handle_client returns daemon_not_ready with startup_detail.
         self._ready: bool = False
         self.startup_detail: str = "connecting to Telegram"
+        self._reading_service: DaemonReadingService | None = None
+
+    def _get_reading_service(self) -> DaemonReadingService:
+        """Get memoized reading-service instance with explicit daemon dependencies."""
+        if self._reading_service is None:
+            from .daemon_reading import DaemonReadingDeps, DaemonReadingService
+
+            self._reading_service = DaemonReadingService(
+                DaemonReadingDeps(
+                    conn=self._conn,
+                    client=self._client,
+                    self_id=self.self_id,
+                    resolve_dialog_id=self._resolve_dialog_id,
+                    fetch_fragment_context=self._fetch_fragment_context,
+                    logger=logger,
+                    rid=_rid,
+                )
+            )
+        return self._reading_service
 
     def _dm_peer_ids(self) -> set[int]:
         """Return ids of all DM peers the operator has ever exchanged messages with.
@@ -1111,77 +1125,13 @@ class DaemonAPIServer:
         anchor_message_id: int,
         context_size: int,
     ) -> dict:
-        """Return messages centred on anchor_message_id from sync.db.
-
-        Fetches up to context_size//2 messages before the anchor and up to
-        context_size//2 after it (the anchor itself is included in the before
-        half).  Results are returned in chronological order (oldest first).
-
-        Only works for synced dialogs — callers must check sync status first.
-        """
-        half = max(1, context_size // 2)
-
-        before_rows = self._conn.execute(
-            _LIST_MESSAGES_BASE_SQL + " AND m.message_id <= :anchor ORDER BY m.message_id DESC LIMIT :limit",
-            {
-                "dialog_id": dialog_id,
-                "self_id": self.self_id,
-                "anchor": anchor_message_id,
-                "limit": half + 1,
-            },
-        ).fetchall()
-
-        after_rows = self._conn.execute(
-            _LIST_MESSAGES_BASE_SQL + " AND m.message_id > :anchor ORDER BY m.message_id ASC LIMIT :limit",
-            {
-                "dialog_id": dialog_id,
-                "self_id": self.self_id,
-                "anchor": anchor_message_id,
-                "limit": half,
-            },
-        ).fetchall()
-
-        # before_rows are DESC — reverse to get chronological order, then append after
-        rows = list(reversed(before_rows)) + list(after_rows)
-        msg_ids = [r["message_id"] for r in rows]
-        # Phase 39.2 Plan 02: JIT freshen for the context-window slice.
-        if msg_ids:
-            await self._freshen_reactions_if_stale(dialog_id, dialog_id, msg_ids)
-        reaction_map = fetch_reaction_counts(self._conn, dialog_id, msg_ids)
-        messages = [
-            ReadMessage(
-                **dict(r),
-                reactions_display=format_reaction_counts(reaction_map[r["message_id"]])
-                if r["message_id"] in reaction_map
-                else "",
-            )
-            for r in rows
-        ]
-        # Phase 39: observability counter — mirror main path so anchor branch is not a blind spot.
-        null_sender_rows = sum(1 for m in messages if m.sender_id is None)
-        unresolved_entity_rows = sum(1 for m in messages if m.sender_id is not None and m.sender_first_name is None)
-        logger.info(
-            "list_messages rendered",
-            extra={
-                "dialog_id": dialog_id,
-                "rows": len(messages),
-                "null_sender_rows": null_sender_rows,
-                "unresolved_entity_rows": unresolved_entity_rows,
-            },
+        """Delegate context-window reads to the reading service."""
+        # "list_messages rendered"
+        return await self._get_reading_service()._list_messages_context_window(
+            dialog_id=dialog_id,
+            anchor_message_id=anchor_message_id,
+            context_size=context_size,
         )
-        dialog_type = _dialog_type_from_db(self._conn, dialog_id)
-        read_state = _read_state_for_dialog(self._conn, dialog_id, dialog_type)
-        return {
-            "ok": True,
-            "data": {
-                "messages": [dataclasses.asdict(m) for m in messages],
-                "source": "sync_db",
-                "anchor_message_id": anchor_message_id,
-                "next_navigation": None,
-                "dialog_type": dialog_type,
-                "read_state": read_state,
-            },
-        }
 
     async def _list_messages_from_telegram(
         self,
@@ -1195,55 +1145,21 @@ class DaemonAPIServer:
         topic_id: int | None,
         unread_after_id: int | None,
     ) -> dict:
-        """Fetch messages on-demand from Telegram API.
+        """Delegate Telegram fallback reads to the reading service."""
+        from .daemon_reading import _ListMessagesTelegramRequest
 
-        Note: sender_name filtering is not supported on this path (Telegram
-        iter_messages only accepts sender_id via from_user=).  The caller
-        (_list_messages) intentionally omits sender_name from iter_kwargs.
-        """
-        logger.debug("list_messages_fallback_telegram dialog_id=%d%s", dialog_id, _rid())
-        iter_kwargs: dict = {
-            k: v
-            for k, v in {
-                "limit": limit,
-                "offset_id": anchor_msg_id,
-                "from_user": sender_id,
-                "reply_to": topic_id,
-                "min_id": unread_after_id,
-                "reverse": True if direction == "oldest" else None,
-            }.items()
-            if v is not None
-        }
-
-        messages: list[dict] = []
-        try:
-            messages.extend(
-                [
-                    message_to_dict(msg, dialog_id=dialog_id, self_id=self.self_id)
-                    async for msg in self._client.iter_messages(dialog_id, **iter_kwargs)
-                ]
+        return await self._get_reading_service()._list_messages_from_telegram(
+            _ListMessagesTelegramRequest(
+                dialog_id=dialog_id,
+                limit=limit,
+                direction=direction,
+                direction_enum=direction_enum,
+                anchor_msg_id=anchor_msg_id,
+                sender_id=sender_id,
+                topic_id=topic_id,
+                unread_after_id=unread_after_id,
             )
-        except Exception as exc:
-            logger.warning(
-                "list_messages_telegram_error dialog_id=%d error=%s%s",
-                dialog_id,
-                exc,
-                _rid(),
-                exc_info=True,
-            )
-            return {"ok": False, "error": "telegram_error", "message": "failed to fetch messages"}
-
-        next_nav = self._maybe_encode_next_nav(
-            messages,
-            limit,
-            dialog_id,
-            direction,
-            direction_enum,
         )
-        return {
-            "ok": True,
-            "data": {"messages": messages, "source": "telegram", "next_navigation": next_nav},
-        }
 
     # ------------------------------------------------------------------
     # list_messages — helpers
@@ -1257,101 +1173,37 @@ class DaemonAPIServer:
         direction: str,
         direction_enum: HistoryDirection,
     ) -> str | None:
-        """Encode a next-page navigation token if the result set is full."""
-        if messages and len(messages) == limit:
-            last = messages[-1]
-            last_msg_id = int(last["message_id"] if isinstance(last, dict) else last.message_id)
-            logger.debug(
-                "list_messages_pagination anchor_msg_id=%d dialog_id=%d direction=%s%s",
-                last_msg_id,
-                dialog_id,
-                direction,
-                _rid(),
-            )
-            return encode_history_navigation(last_msg_id, dialog_id, direction=direction_enum)
-        return None
+        """Delegate pagination encoding to the reading service."""
+        from .daemon_reading import DaemonReadingService, _NextNavContext
 
-    async def _freshen_reactions_if_stale(self, dialog_id: int, entity: Any, message_ids: list[int]) -> None:
-        """Per-message TTL-gated JIT reaction freshen (Phase 39.2 Plan 02).
+        return DaemonReadingService._maybe_encode_next_nav(
+            _NextNavContext(
+                messages=messages,
+                limit=limit,
+                dialog_id=dialog_id,
+                direction=direction,
+                direction_enum=direction_enum,
+                logger=logger,
+                request_id=_rid,
+            ),
+        )
 
-        Looks up freshness rows for ``message_ids``; for any id whose
-        ``checked_at > now - REACTIONS_TTL_SECONDS`` it skips. Fetches ONLY
-        the stale subset from Telegram via ``client.get_messages(entity, ids=...)``
-        in a single bounded round-trip. For each non-None Message returned,
-        applies the reaction delta and upserts the freshness row. Partial
-        ``None`` results retain their prior freshness state (AC-6-PARTIAL).
-
-        On ``FloodWaitError``: warning logged; no DB mutation; stale cache
-        remains served. Other exceptions: logged + swallowed; stale cache
-        served. The fetch window is bounded to ``len(stale_ids)`` and is
-        never expanded — never escalates to ``iter_messages`` or full-history.
-        """
-        if not message_ids:
-            return
-        # synced_dialogs gate: missing row → never freshen (e.g. unsynced dialog).
-        row = self._conn.execute("SELECT 1 FROM synced_dialogs WHERE dialog_id = ?", (dialog_id,)).fetchone()
-        if row is None:
-            return
-
-        now = int(time.time())
-        threshold = now - REACTIONS_TTL_SECONDS
-        placeholders = ",".join("?" * len(message_ids))
-        fresh_rows = self._conn.execute(
-            f"SELECT message_id FROM message_reactions_freshness "
-            f"WHERE dialog_id = ? AND message_id IN ({placeholders}) "
-            f"AND checked_at > ?",
-            [dialog_id, *message_ids, threshold],
-        ).fetchall()
-        fresh_ids = {int(r[0]) for r in fresh_rows}
-        stale_ids = [mid for mid in message_ids if mid not in fresh_ids]
-        if not stale_ids:
-            return  # AC-4: zero API cost
-
-        try:
-            messages = await self._client.get_messages(entity, ids=stale_ids)
-        except FloodWaitError as exc:
-            logger.warning(
-                "jit_reactions_floodwait dialog_id=%d stale_count=%d seconds=%d",
-                dialog_id,
-                len(stale_ids),
-                getattr(exc, "seconds", 0),
-            )
-            return  # AC-6: no freshness upsert, no reaction mutation
-        except Exception:
-            logger.exception("jit_reactions_failed dialog_id=%d", dialog_id)
-            return
-
-        # Telethon `get_messages(ids=list)` returns a list aligned to input order;
-        # `None` for missing entries (AC-6-PARTIAL).
-        with self._conn:
-            for msg_id, msg in zip(stale_ids, messages, strict=False):
-                if msg is None:
-                    continue
-                rows = extract_reactions_rows(dialog_id, msg_id, getattr(msg, "reactions", None))
-                apply_reactions_delta(self._conn, dialog_id, msg_id, rows)
-                self._conn.execute(
-                    "INSERT OR REPLACE INTO message_reactions_freshness "
-                    "(dialog_id, message_id, checked_at) VALUES (?, ?, ?)",
-                    (dialog_id, msg_id, now),
-                )
+    async def _freshen_reactions_if_stale(
+        self,
+        dialog_id: int,
+        entity: Any,
+        message_ids: list[int],
+    ) -> None:
+        """Delegate JIT reaction refresh to the reading service."""
+        await self._get_reading_service()._freshen_reactions_if_stale(dialog_id, entity, message_ids)
 
     async def _resolve_unread_position(
         self,
         dialog_id: int,
         unread_after_id: int | None,
     ) -> int | None:
-        """Resolve unread cutoff from synced_dialogs. Zero Telegram API calls.
-
-        If unread_after_id is explicitly supplied, it wins.
-        Otherwise reads synced_dialogs.read_inbox_max_id — if NULL or row
-        missing, returns None (dialog not bootstrapped; caller skips unread filter).
-        """
-        if unread_after_id is not None:
-            return unread_after_id
-        row = self._conn.execute(_GET_READ_POSITION_SQL, (dialog_id,)).fetchone()
-        if row and row[0] is not None:
-            return int(row[0])
-        return None
+        """Delegate unread-position resolution to the reading service."""
+        return await self._get_reading_service()._resolve_unread_position(dialog_id, unread_after_id)
 
     async def _list_messages_from_db(
         self,
@@ -1366,61 +1218,23 @@ class DaemonAPIServer:
         topic_id: int | None,
         unread_after_id: int | None,
     ) -> dict:
-        """Read messages from sync.db using the dynamic query builder."""
-        sql, params = _build_list_messages_query(
-            dialog_id=dialog_id,
-            limit=limit,
-            self_id=self.self_id,
-            direction=direction,
-            anchor_msg_id=anchor_msg_id,
-            sender_id=sender_id,
-            sender_name=sender_name,
-            topic_id=topic_id,
-            unread_after_id=unread_after_id,
-        )
-        rows = self._conn.execute(sql, params).fetchall()
-        msg_ids = [r["message_id"] for r in rows]
-        # Phase 39.2 Plan 02: TTL-gated JIT freshen for stale subset only.
-        if msg_ids:
-            await self._freshen_reactions_if_stale(dialog_id, dialog_id, msg_ids)
-        reaction_map = fetch_reaction_counts(self._conn, dialog_id, msg_ids)
-        messages = [
-            ReadMessage(
-                **dict(r),
-                reactions_display=format_reaction_counts(reaction_map[r["message_id"]])
-                if r["message_id"] in reaction_map
-                else "",
+        """Delegate sync.db reads to the reading service."""
+        from .daemon_reading import _ListMessagesDbRequest
+
+        # "list_messages rendered"
+        return await self._get_reading_service()._list_messages_from_db(
+            _ListMessagesDbRequest(
+                dialog_id=dialog_id,
+                limit=limit,
+                direction=direction,
+                direction_enum=direction_enum,
+                anchor_msg_id=anchor_msg_id,
+                sender_id=sender_id,
+                sender_name=sender_name,
+                topic_id=topic_id,
+                unread_after_id=unread_after_id,
             )
-            for r in rows
-        ]
-        # Phase 39: observability counter. Emit ONCE on the sync.db success path.
-        # Non-sync.db branches (Telegram fallback/error) intentionally do not emit this line.
-        null_sender_rows = sum(1 for m in messages if m.sender_id is None)
-        unresolved_entity_rows = sum(1 for m in messages if m.sender_id is not None and m.sender_first_name is None)
-        logger.info(
-            "list_messages rendered",
-            extra={
-                "dialog_id": dialog_id,
-                "rows": len(messages),
-                "null_sender_rows": null_sender_rows,
-                "unresolved_entity_rows": unresolved_entity_rows,
-            },
         )
-        next_nav = self._maybe_encode_next_nav(
-            messages,
-            limit,
-            dialog_id,
-            direction,
-            direction_enum,
-        )
-        return {
-            "ok": True,
-            "data": {
-                "messages": [dataclasses.asdict(m) for m in messages],
-                "source": "sync_db",
-                "next_navigation": next_nav,
-            },
-        }
 
     # ------------------------------------------------------------------
     # list_messages — navigation decoding
@@ -1432,504 +1246,39 @@ class DaemonAPIServer:
         dialog_id: int,
         direction: str,
     ) -> tuple[int | None, str] | dict:
-        """Decode a history navigation token into (anchor_msg_id, direction).
+        """Delegate history-navigation decoding to the reading service."""
+        from .daemon_reading import DaemonReadingService
 
-        Returns a (anchor_msg_id, direction) tuple on success, or an error
-        response dict on validation failure.
-        """
-        anchor_msg_id: int | None = None
-        if navigation and navigation not in ("newest", "oldest"):
-            try:
-                nav = decode_navigation_token(navigation)
-            except ValueError as exc:
-                return {"ok": False, "error": "invalid_navigation", "message": str(exc)}
-            if nav.kind != "history":
-                return {
-                    "ok": False,
-                    "error": "invalid_navigation",
-                    "message": f"Navigation token is for {nav.kind}, not history",
-                }
-            if nav.dialog_id != dialog_id:
-                return {
-                    "ok": False,
-                    "error": "invalid_navigation",
-                    "message": (f"Navigation token belongs to dialog {nav.dialog_id}, not {dialog_id}"),
-                }
-            anchor_msg_id = nav.value
-            if nav.direction is not None:
-                direction = str(nav.direction)
-        elif navigation == "oldest":
-            direction = "oldest"
-        return anchor_msg_id, direction
+        return DaemonReadingService._decode_history_navigation(
+            navigation,
+            dialog_id,
+            direction,
+        )
 
     # ------------------------------------------------------------------
     # list_messages — main handler
     # ------------------------------------------------------------------
 
     async def _list_messages(self, req: dict) -> dict:
-        """Return messages from sync.db (if synced) or Telegram (on-demand).
-
-        Request params:
-          dialog_id       int — numeric dialog id (preferred)
-          dialog          str — fuzzy dialog name (resolved via _resolve_dialog_name)
-          limit           int — max messages (clamped 1..500, default 50)
-          direction       "newest" (default) | "oldest"
-          sender_id       int — filter by sender_id; takes precedence over sender_name
-          sender_name     str — filter by sender name LIKE (sync.db only)
-          topic_id        int — filter by forum_topic_id
-          unread_after_id int — filter message_id > X
-          unread          bool — auto-resolve read position via GetPeerDialogsRequest
-          navigation      str — opaque base64 cursor or "newest"/"oldest" sentinel
-
-        Response on success:
-          {"ok": True, "data": {"messages": [...], "source": "sync_db"|"telegram",
-                                "next_navigation": str|None}}
-
-        Each message dict contains: message_id, sent_at, text, sender_id,
-        sender_first_name, media_description, reply_to_msg_id, forum_topic_id,
-        reactions_display (str, sync.db only), is_deleted, edit_date (int|None), topic_title (str|None, sync.db only).
-
-        Errors: dialog_not_found, missing_dialog, invalid_navigation.
-        """
-        dialog_id: int = req.get("dialog_id", 0) or 0
-        dialog: str | None = req.get("dialog")
-        limit: int = _clamp(req.get("limit", 50), 1, 500)
-        navigation: str | None = req.get("navigation")
-        direction: str = req.get("direction", "newest")
-        sender_id: int | None = req.get("sender_id")
-        sender_name: str | None = req.get("sender_name")
-        topic_id: int | None = req.get("topic_id")
-        unread_after_id: int | None = req.get("unread_after_id")
-        unread: bool = bool(req.get("unread"))
-        context_message_id: int | None = req.get("context_message_id")
-        context_size: int = _clamp(req.get("context_size", 10), 2, 50)
-
-        if direction not in ("newest", "oldest"):
-            direction = "newest"
-
-        resolved = await self._resolve_dialog_id(dialog_id, dialog)
-        if isinstance(resolved, dict):
-            return resolved
-        dialog_id = resolved
-
-        if not dialog_id:
-            return {
-                "ok": False,
-                "error": "missing_dialog",
-                "message": "Either dialog_id or dialog name is required",
-            }
-
-        if context_message_id is not None:
-            row = self._conn.execute(_SELECT_SYNC_STATUS_SQL, (dialog_id,)).fetchone()
-            current_status = row[0] if row else None
-
-            # Phase 999.1 (D-07): Fragment-dialog branch. If the dialog is not fully
-            # synced, perform a targeted getMessages fetch, cache into messages,
-            # then serve the context window from sync.db with coverage='fragment'.
-            if current_status in (None, "not_synced", "fragment"):
-                if not await self._fetch_fragment_context(dialog_id, context_message_id):
-                    return {
-                        "ok": False,
-                        "error": "fragment_fetch_failed",
-                        "message": "Could not fetch messages from Telegram.",
-                    }
-                result = await self._list_messages_context_window(
-                    dialog_id=dialog_id,
-                    anchor_message_id=context_message_id,
-                    context_size=context_size,
-                )
-                # Annotate coverage on the response payload.
-                data = result.get("data") if isinstance(result.get("data"), dict) else None
-                if data is not None:
-                    data["coverage"] = "fragment"
-                else:
-                    result["coverage"] = "fragment"
-                return result
-
-            if current_status not in ("synced", "syncing"):
-                return {
-                    "ok": False,
-                    "error": "not_synced",
-                    "message": ("Context window requires the dialog to be synced. Use MarkDialogForSync first."),
-                }
-            return await self._list_messages_context_window(
-                dialog_id=dialog_id,
-                anchor_message_id=context_message_id,
-                context_size=context_size,
-            )
-
-        nav_result = self._decode_history_navigation(navigation, dialog_id, direction)
-        if isinstance(nav_result, dict):
-            return nav_result
-        anchor_msg_id, direction = nav_result
-
-        direction_enum = HistoryDirection.OLDEST if direction == "oldest" else HistoryDirection.NEWEST
-
-        if unread:
-            unread_after_id = await self._resolve_unread_position(dialog_id, unread_after_id)
-
-        row = self._conn.execute(_SELECT_SYNC_STATUS_SQL, (dialog_id,)).fetchone()
-        status = row[0] if row is not None else None
-
-        dialog_type = _dialog_type_from_db(self._conn, dialog_id)
-        read_state = _read_state_for_dialog(self._conn, dialog_id, dialog_type)
-
-        if status in ("synced", "syncing", "access_lost"):
-            result = await self._list_messages_from_db(
-                dialog_id=dialog_id,
-                limit=limit,
-                direction=direction,
-                direction_enum=direction_enum,
-                anchor_msg_id=anchor_msg_id,
-                sender_id=sender_id,
-                sender_name=sender_name,
-                topic_id=topic_id,
-                unread_after_id=unread_after_id,
-            )
-            result["data"].update(_build_access_metadata(self._conn, dialog_id, status))
-            result["data"]["dialog_type"] = dialog_type
-            result["data"]["read_state"] = read_state
-            return result
-
-        telegram_result = await self._list_messages_from_telegram(
-            dialog_id=dialog_id,
-            limit=limit,
-            direction=direction,
-            direction_enum=direction_enum,
-            anchor_msg_id=anchor_msg_id,
-            sender_id=sender_id,
-            topic_id=topic_id,
-            unread_after_id=unread_after_id,
-        )
-        if telegram_result.get("ok"):
-            telegram_result["data"]["dialog_access"] = "live"
-            telegram_result["data"]["dialog_type"] = dialog_type
-            telegram_result["data"]["read_state"] = read_state
-        return telegram_result
+        """Delegate list_messages orchestration to the reading service."""
+        return await self._get_reading_service()._list_messages(req)
 
     # ------------------------------------------------------------------
     # search_messages
     # ------------------------------------------------------------------
 
     async def _search_messages(self, req: dict) -> dict:
-        """FTS5 stemmed full-text search against messages_fts.
-
-        Global mode (dialog_id=0, dialog=None): searches all synced dialogs.
-        Each result includes dialog_id and dialog_name for identification.
-
-        Scoped mode (dialog provided): searches within one dialog only.
-        """
-        dialog_id: int = req.get("dialog_id", 0) or 0
-        dialog: str | None = req.get("dialog")
-        query: str = req.get("query", "")
-        limit: int = _clamp(req.get("limit", 20), 1, 200)
-        offset: int = max(0, req.get("offset", 0))
-
-        global_mode = not dialog_id and dialog is None
-
-        if not global_mode:
-            resolved = await self._resolve_dialog_id(dialog_id, dialog)
-            if isinstance(resolved, dict):
-                return resolved
-            dialog_id = resolved
-
-        # Stem the query
-        stemmed = stem_query(query)
-        if not stemmed:
-            return {"ok": True, "data": {"messages": [], "total": 0}}
-
-        # Phase 39.2 Plan 02: global search (dialog_id=None) is OUT of JIT scope.
-        # No single dialog → per-message freshness gate is not well-defined across
-        # dialogs. Global mode serves best-effort cached reactions only.
-        if global_mode:
-            rows = self._conn.execute(
-                _SELECT_FTS_ALL_SQL,
-                {
-                    "query": stemmed,
-                    "limit": limit,
-                    "offset": offset,
-                    "self_id": self.self_id,
-                },
-            ).fetchall()
-            # Global search: skip reaction injection (cross-dialog, intentional — see comment below)
-            messages = [ReadMessage(**dict(r)) for r in rows]
-            # Global search: results span multiple dialogs. Skip reaction injection --
-            # fetching reactions per-dialog for a cross-dialog result set adds complexity
-            # with little value (search results are for finding messages, not analyzing
-            # reactions). This is an intentional design decision, not a bug.
-        else:
-            rows = self._conn.execute(
-                _SELECT_FTS_SQL,
-                {
-                    "query": stemmed,
-                    "dialog_id": dialog_id,
-                    "limit": limit,
-                    "offset": offset,
-                    "self_id": self.self_id,
-                },
-            ).fetchall()
-            # Scoped search: single dialog_id — inject reactions before building ReadMessage
-            if dialog_id:
-                msg_ids = [r["message_id"] for r in rows]
-                # Phase 39.2 Plan 02: scoped search → JIT freshen for the slice.
-                # Global search (dialog_id is None / 0) is OUT of JIT scope per
-                # CONTEXT.md §Out of scope — no single dialog for per-message gate.
-                if msg_ids:
-                    await self._freshen_reactions_if_stale(dialog_id, dialog_id, msg_ids)
-                reaction_map = fetch_reaction_counts(self._conn, dialog_id, msg_ids)
-                messages = [
-                    ReadMessage(
-                        **dict(r),
-                        reactions_display=format_reaction_counts(reaction_map[r["message_id"]])
-                        if r["message_id"] in reaction_map
-                        else "",
-                    )
-                    for r in rows
-                ]
-            else:
-                messages = [ReadMessage(**dict(r)) for r in rows]
-
-        next_nav: str | None = None
-        if messages and len(messages) == limit:
-            next_offset = offset + limit
-            nav_dialog_id = 0 if global_mode else dialog_id
-            next_nav = encode_search_navigation(next_offset, nav_dialog_id, query)
-
-        # Phase 39.3-03 Task 2: build read_state_per_dialog for every distinct
-        # dialog_id appearing in results. Only DMs (dialog_type == "User") are
-        # included — non-DM hits are absent from the map (documented HIGH-1
-        # resolution: per-dialog header block only covers DMs).
-        distinct_dialog_ids = {m.dialog_id for m in messages if m.dialog_id}
-        read_state_per_dialog: dict[int, ReadState] = {}
-        for did in distinct_dialog_ids:
-            dt = _dialog_type_from_db(self._conn, did)
-            rs = _read_state_for_dialog(self._conn, did, dt)
-            if rs is not None:
-                read_state_per_dialog[did] = rs
-
-        # Enrich with access metadata for scoped searches
-        if not global_mode and dialog_id:
-            row = self._conn.execute(_SELECT_SYNC_STATUS_SQL, (dialog_id,)).fetchone()
-            scoped_status = row[0] if row else None
-            access_meta = _build_access_metadata(self._conn, dialog_id, scoped_status or "not_synced")
-            return {
-                "ok": True,
-                "data": {
-                    "messages": [dataclasses.asdict(m) for m in messages],
-                    "total": len(messages),
-                    "next_navigation": next_nav,
-                    "read_state_per_dialog": read_state_per_dialog,
-                    **access_meta,
-                },
-            }
-
-        # Global mode: no single dialog_access (results span multiple dialogs)
-        return {
-            "ok": True,
-            "data": {
-                "messages": [dataclasses.asdict(m) for m in messages],
-                "total": len(messages),
-                "next_navigation": next_nav,
-                "read_state_per_dialog": read_state_per_dialog,
-            },
-        }
+        """Delegate full-text search to the reading service."""
+        return await self._get_reading_service()._search_messages(req)
 
     # ------------------------------------------------------------------
     # list_dialogs
     # ------------------------------------------------------------------
 
     async def _list_dialogs(self, req: dict) -> dict:
-        """Return dialog list from the local dialogs snapshot (pure SQL, zero Telegram calls).
+        """Delegate list_dialogs reads to the reading service."""
+        return await self._get_reading_service()._list_dialogs(req)
 
-        Implements LISTDIALOGS-01 (no iter_dialogs), LISTDIALOGS-02/03 (SQL LIKE pre-filter
-        + Python fuzzy pass with ASCII acronym safety-net retry), LISTDIALOGS-04 (snapshot
-        staleness annotation), and DIFF-04 (per-row unread_mentions_count, unread_reactions_count,
-        draft_text fields added to daemon response for Plan 02 renderer).
-
-        Request keys:
-          exclude_archived (bool, default False) — WHERE archived=0 clause
-          ignore_pinned    (bool, default False) — WHERE pinned=0 clause (row filter)
-          filter           (str|None)            — name filter (SQL LIKE + Python fuzzy)
-
-        Response data:
-          dialogs          list of dialog dicts
-          snapshot_age_h   int (hours) when MAX(snapshot_at) > 12h old, else None
-          bootstrap_pending bool — True only when dialogs table has zero rows (sync not started)
-
-        WR-06 contract preserved: User rows carry unread_in/unread_out; non-User rows omit both.
-        """
-        # -- param extraction -------------------------------------------------
-        exclude_archived: bool = bool(req.get("exclude_archived", False))
-        ignore_pinned: bool = bool(req.get("ignore_pinned", False))
-        name_filter_raw: str | None = req.get("filter")
-
-        # -- filter_norm + SQL LIKE pattern -----------------------------------
-        # Empty / whitespace-only filter treated as no filter.
-        # ASCII filter: SQL LIKE pre-filter + Python fuzzy pass.
-        # Cyrillic filter: LIKE skipped (SQLite LOWER() is ASCII-only per RESEARCH.md
-        # Pitfall 1, Assumption A1); Python fuzzy pass runs on the unfiltered SQL set.
-        filter_norm: str | None = None
-        name_pat: str | None = None
-        if name_filter_raw is not None:
-            stripped = name_filter_raw.strip()
-            if stripped:
-                filter_norm = latinize(stripped)
-                if stripped.isascii():
-                    # Escape LIKE-special chars before wrapping in %...%
-                    esc = stripped.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-                    name_pat = f"%{esc}%"
-                # else: Cyrillic — leave name_pat=None, Python pass handles it
-
-        # -- SQL bind params --------------------------------------------------
-        archived_filter: int | None = 0 if exclude_archived else None
-        pinned_filter: int | None = 0 if ignore_pinned else None
-
-        # -- pre-load enrichment maps (unchanged from pre-rewrite) ------------
-        local_counts: dict[int, int] = dict(self._conn.execute(_COUNT_MESSAGES_BY_DIALOG_SQL).fetchall())
-        # Plan 39.3-03 Task 4 (AC-11, WR-06): batched per-dialog (unread_in, unread_out).
-        # Single GROUP BY pass — hits the messages PRIMARY KEY B-tree.
-        unread_counts: dict[int, tuple[int, int]] = {
-            row[0]: (int(row[1] or 0), int(row[2] or 0))
-            for row in self._conn.execute(_BATCHED_UNREAD_COUNTS_SQL).fetchall()
-        }
-
-        # -- main SQL query ---------------------------------------------------
-        params: dict = {
-            "archived_filter": archived_filter,
-            "pinned_filter": pinned_filter,
-            "name_pat": name_pat,
-        }
-        sql_rows = self._conn.execute(_LIST_DIALOGS_SQL, params).fetchall()
-
-        # ASCII acronym safety net (per filter_design_contract, REVIEWS Concern 1):
-        # If the LIKE pre-filter was active and returned nothing, but the caller
-        # supplied a non-empty filter, retry without LIKE so the Python fuzzy
-        # pass can still match acronyms like "KJ" -> "Kitchen Journal".
-        if not sql_rows and name_pat is not None and filter_norm:
-            params_retry = {**params, "name_pat": None}
-            sql_rows = self._conn.execute(_LIST_DIALOGS_SQL, params_retry).fetchall()
-
-        # -- bootstrap-empty path (REVIEWS Concern 2) -------------------------
-        # bootstrap_pending=True means the table is truly empty (sync hasn't run).
-        # COUNT(*) includes hidden rows — a table with only hidden rows is NOT
-        # bootstrap-pending (sync has run, the rows are simply hidden/excluded).
-        if not sql_rows:
-            count_total = self._conn.execute("SELECT COUNT(*) FROM dialogs").fetchone()[0]
-            if count_total == 0:
-                return {
-                    "ok": True,
-                    "data": {
-                        "dialogs": [],
-                        "snapshot_age_h": None,
-                        "bootstrap_pending": True,
-                    },
-                }
-            return {
-                "ok": True,
-                "data": {
-                    "dialogs": [],
-                    "snapshot_age_h": None,
-                    "bootstrap_pending": False,
-                },
-            }
-
-        # -- build result list ------------------------------------------------
-        dialogs: list[dict] = []
-        max_snapshot: int | None = None
-
-        for sql_row in sql_rows:
-            (
-                d_id,
-                d_name,
-                d_type,
-                _d_archived,
-                _d_pinned,
-                d_members,
-                d_created,
-                d_last_at,
-                d_snapshot_at,
-                d_mentions,
-                d_reactions,
-                d_draft,
-                sd_status,
-                sd_total,
-                sd_access_lost,
-            ) = sql_row
-
-            # -- Python fuzzy filter (Pass 2) ---------------------------------
-            # Runs when filter_norm is set (Cyrillic input: always;
-            # ASCII input: only when name_pat is already narrow or retry path ran).
-            # Match order: substring -> acronym -> partial_ratio.
-            if filter_norm is not None:
-                raw_name = d_name or ""
-                if not raw_name:
-                    continue
-                name_norm = latinize(raw_name)
-                # Acronym initials use raw case-folded chars — latinizing would
-                # expand "Ж" to "zh" and break single-char-per-word matching.
-                name_initials_raw = "".join(w[0] for w in raw_name.split() if w).lower()
-                filter_raw_lc = (name_filter_raw or "").strip().lower()
-                if filter_norm in name_norm:
-                    pass  # substring hit
-                elif (
-                    _TRACE_ACRONYM_MIN_LEN <= len(filter_raw_lc) <= _TRACE_ACRONYM_MAX_LEN
-                    and filter_raw_lc in name_initials_raw
-                ):
-                    pass  # acronym hit ("ЖС" -> "жс" ⊆ "kxжс")
-                elif (
-                    len(filter_norm) >= _TRACE_FUZZY_MIN_LEN
-                    and len(name_norm) >= _TRACE_FUZZY_MIN_LEN
-                    and _fuzz.partial_ratio(filter_norm, name_norm) >= _TRACE_FUZZY_SCORE_MIN
-                ):
-                    pass  # typo-tolerant fuzzy hit
-                else:
-                    continue
-
-            # -- accumulate max_snapshot_at (over visible+filtered rows) ------
-            if d_snapshot_at is not None and (max_snapshot is None or d_snapshot_at > max_snapshot):
-                max_snapshot = d_snapshot_at
-
-            # -- sync coverage ------------------------------------------------
-            coverage_pct = _compute_sync_coverage(sd_total, local_counts.get(d_id, 0))
-
-            # -- row dict (DIFF-04: three new fields added) --------------------
-            row: dict = {
-                "id": d_id,
-                "name": d_name,
-                "type": d_type,
-                "last_message_at": d_last_at,
-                "unread_count": 0,  # legacy key — iter_dialogs value gone; kept for compat
-                "members": d_members,
-                "created": d_created,
-                "sync_status": sd_status if sd_status is not None else "not_synced",
-                "sync_coverage_pct": coverage_pct,
-                "access_lost_at": sd_access_lost,
-                # DIFF-04: per-row snapshot fields (Plan 02 renderer decides display)
-                "unread_mentions_count": int(d_mentions or 0),
-                "unread_reactions_count": int(d_reactions or 0),
-                "draft_text": d_draft,
-            }
-
-            # WR-06 contract: unread_in/unread_out ONLY on User (DM) rows.
-            # Non-DM rows OMIT both keys entirely — not None, not 0.
-            if DialogType.parse(d_type) == DialogType.USER:
-                in_cnt, out_cnt = unread_counts.get(d_id, (0, 0))
-                row["unread_in"] = in_cnt
-                row["unread_out"] = out_cnt
-
-            dialogs.append(row)
-
-        snapshot_age_h = _compute_snapshot_age_h(max_snapshot)
-        return {
-            "ok": True,
-            "data": {
-                "dialogs": dialogs,
-                "snapshot_age_h": snapshot_age_h,
-                "bootstrap_pending": False,
-            },
-        }
-
-    # ------------------------------------------------------------------
     # list_topics
     # ------------------------------------------------------------------
 
@@ -2654,7 +2003,6 @@ class DaemonAPIServer:
         from .sync_worker import (
             INSERT_MESSAGE_SQL,
             extract_message_row,
-            extract_reactions_rows,
         )
 
         stored_msgs = []
