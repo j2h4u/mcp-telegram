@@ -44,7 +44,7 @@ import re
 import sqlite3
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Literal
 
 from telethon import utils as telethon_utils  # type: ignore[import-untyped]
 from telethon.tl.functions.channels import (
@@ -86,6 +86,13 @@ _GET_DIALOG_TOP_HASHTAGS_SQL = _activity_stats._GET_DIALOG_TOP_HASHTAGS_SQL
 _GET_DIALOG_TOP_MENTIONS_SQL = _activity_stats._GET_DIALOG_TOP_MENTIONS_SQL
 _GET_DIALOG_TOP_REACTIONS_SQL = _activity_stats._GET_DIALOG_TOP_REACTIONS_SQL
 _SELECT_SYNC_STATUS_SQL = _activity_stats._SELECT_SYNC_STATUS_SQL
+
+
+def _attr(obj: object, name: str, default: object | None = None) -> object | None:
+    try:
+        return object.__getattribute__(obj, name)
+    except AttributeError:
+        return default
 
 
 def get_daemon_socket_path() -> Path:
@@ -657,7 +664,7 @@ def _assert_select_columns_match_read_message() -> None:
 _assert_select_columns_match_read_message()
 
 
-def _build_list_messages_query(req: Any) -> tuple[str, dict]:
+def _build_list_messages_query(req: object) -> tuple[str, dict]:
     """Build a parameterized SELECT for list_messages against sync.db.
 
     Returns (sql_string, params_dict).  Column names in the SELECT match
@@ -670,7 +677,7 @@ def _build_list_messages_query(req: Any) -> tuple[str, dict]:
     """
     dialog_id = req.dialog_id
     limit = req.limit
-    self_id = getattr(req, "self_id", None)
+    self_id = _attr(req, "self_id", None)
     direction = req.direction
     anchor_msg_id = req.anchor_msg_id
     sender_id = req.sender_id
@@ -747,7 +754,7 @@ class DaemonAPIServer:
     def __init__(
         self,
         conn: sqlite3.Connection,
-        client: Any,
+        client: object,
         shutdown_event: asyncio.Event,
         feedback_conn: sqlite3.Connection | None = None,
     ) -> None:
@@ -934,7 +941,7 @@ class DaemonAPIServer:
     # Dispatcher
     # ------------------------------------------------------------------
 
-    def _dispatch_handlers(self) -> dict[str, Any]:
+    def _dispatch_handlers(self) -> dict[str, object]:
         return {
             "list_messages": self._list_messages,
             "describe_source": _describe_source,
@@ -995,7 +1002,7 @@ class DaemonAPIServer:
         try:
             entity = await self._client.get_entity(dialog)
             return int(telethon_utils.get_peer_id(entity))
-        except ValueError, KeyError:
+        except (ValueError, KeyError):
             pass
         except Exception:
             logger.debug("get_entity failed for %r, falling back to entities DB", dialog, exc_info=True)
@@ -1064,9 +1071,9 @@ class DaemonAPIServer:
 
         # Slow path: iterate dialogs via Telegram API (catches dialogs not yet in entities).
         logger.debug("resolve_dialog_fallback_iter_dialogs query=%r", dialog)
-        matched_dialog: Any | None = None
+        matched_dialog: object | None = None
         async for d in self._client.iter_dialogs():
-            name = getattr(d, "name", "") or ""
+            name = _attr(d, "name", "") or ""
             if name.lower() == dialog.lower():
                 matched_dialog = d
                 break
@@ -1126,7 +1133,7 @@ class DaemonAPIServer:
             context_size=context_size,
         )
 
-    async def _list_messages_from_telegram(self, req: Any) -> dict:
+    async def _list_messages_from_telegram(self, req: object) -> dict:
         """Delegate Telegram fallback reads to the reading service."""
         return await self._get_reading_service()._list_messages_from_telegram(req)
 
@@ -1160,7 +1167,7 @@ class DaemonAPIServer:
     async def _freshen_reactions_if_stale(
         self,
         dialog_id: int,
-        entity: Any,
+        entity: object,
         message_ids: list[int],
     ) -> None:
         """Delegate JIT reaction refresh to the reading service."""
@@ -1174,7 +1181,7 @@ class DaemonAPIServer:
         """Delegate unread-position resolution to the reading service."""
         return await self._get_reading_service()._resolve_unread_position(dialog_id, unread_after_id)
 
-    async def _list_messages_from_db(self, req: Any) -> dict:
+    async def _list_messages_from_db(self, req: object) -> dict:
         """Delegate sync.db reads to the reading service."""
         # "list_messages rendered"
         return await self._get_reading_service()._list_messages_from_db(req)
@@ -1824,7 +1831,7 @@ class DaemonAPIServer:
                 continue
             # Use .message field (StoredMessage dataclass), not the deprecated .row attribute.
             stored_msgs.append(extracted.message)
-            reactions = extract_reactions_rows(dialog_id, msg.id, getattr(msg, "reactions", None))
+            reactions = extract_reactions_rows(dialog_id, msg.id, _attr(msg, "reactions", None))
             reaction_rows_all.extend(reactions)
 
         if not stored_msgs:
