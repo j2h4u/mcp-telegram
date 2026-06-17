@@ -5,12 +5,11 @@ via messages.Search(InputPeerEmpty, from_id=InputPeerSelf).
 Runs as a named daemon background task alongside run_access_probe_loop.
 """
 
-from __future__ import annotations
-
 import asyncio
 import logging
 import sqlite3
 import time
+from dataclasses import dataclass
 from typing import Any
 
 from telethon.errors import FloodWaitError
@@ -54,6 +53,43 @@ UPSERT_ENTITY_SQL = (
 INSERT_OWN_ONLY_DIALOG_SQL = "INSERT OR IGNORE INTO synced_dialogs (dialog_id, status) VALUES (?, 'own_only')"
 
 
+@dataclass
+class _BackfillState:
+    """Mutable state for a single backfill pass."""
+
+    checkpoint: int
+    total_fetched: int = 0
+    total_known: int | None = None
+    batch_num: int = 0
+    loop_start: float = 0.0
+
+
+@dataclass
+class _IncrementalState:
+    """Mutable state for a single incremental pass."""
+
+    min_date: int
+    inserted: int = 0
+    batch_num: int = 0
+    offset_id: int = 0
+
+
+@dataclass
+class _IncrementalBatchLog:
+    """Structured log payload for one incremental batch."""
+
+    fetched: int
+    in_window: int
+    extracted: int
+    inserted: int
+    next_offset_id: int
+    past_window: bool
+
+
+_SEARCH_BATCH_RETRY = object()
+_SEARCH_BATCH_STOP = object()
+
+
 def _load_state(conn: sqlite3.Connection) -> dict[str, str | None]:
     rows = conn.execute("SELECT key, value FROM activity_sync_state").fetchall()
     return {r[0]: r[1] for r in rows}
@@ -65,6 +101,11 @@ def _set_state(conn: sqlite3.Connection, key: str, value: str | None) -> None:
             "INSERT OR REPLACE INTO activity_sync_state (key, value) VALUES (?, ?)",
             (key, value),
         )
+
+
+def _stamp_last_sync_at(conn: sqlite3.Connection) -> None:
+    """Record the sync completion timestamp in activity_sync_state."""
+    _set_state(conn, "last_sync_at", str(int(time.time())))
 
 
 def extract_dialog_id(msg: Any) -> int | None:
@@ -156,6 +197,178 @@ def _fmt_duration(seconds: int) -> str:
     return f"{seconds // _SECONDS_PER_HOUR}h{(seconds % _SECONDS_PER_HOUR) // _SECONDS_PER_MINUTE:02d}m"
 
 
+async def _wait_for_shutdown(shutdown_event: asyncio.Event, timeout: float) -> bool:
+    """Sleep until shutdown or timeout; return True when shutdown fired."""
+    try:
+        await asyncio.wait_for(shutdown_event.wait(), timeout=timeout)
+        return True
+    except TimeoutError:
+        return False
+
+
+def _extract_own_message_rows(batch: list[Any]) -> list[ExtractedMessage]:
+    """Extract canonical own-message rows from a Telegram batch."""
+    extracted: list[ExtractedMessage] = []
+    for m in batch:
+        dialog_id = _extract_dialog_id(m)
+        if dialog_id is None:
+            continue
+        extracted.append(extract_message_row(dialog_id, m))
+    return extracted
+
+
+def _persist_own_message_rows(conn: sqlite3.Connection, extracted: list[ExtractedMessage]) -> None:
+    """Persist extracted own-message rows and enroll their dialogs."""
+    if not extracted:
+        return
+    with conn:
+        insert_messages_with_fts(conn, extracted)
+        dialog_ids = {em.message.dialog_id for em in extracted}
+        conn.executemany(
+            INSERT_OWN_ONLY_DIALOG_SQL,
+            [(did,) for did in dialog_ids],
+        )
+
+
+async def _search_backfill_batch(
+    client: Any,
+    checkpoint: int,
+    shutdown_event: asyncio.Event,
+    *,
+    total_fetched: int,
+) -> Any:
+    """Run the backfill SearchRequest and translate control-flow exceptions."""
+    try:
+        return await _call_with_timeout(
+            client,
+            SearchRequest(
+                peer=InputPeerEmpty(),
+                q="",
+                filter=InputMessagesFilterEmpty(),
+                min_date=None,
+                max_date=None,
+                offset_id=checkpoint,
+                add_offset=0,
+                limit=_BACKFILL_BATCH_LIMIT,
+                max_id=0,
+                min_id=0,
+                hash=0,
+                from_id=InputPeerSelf(),
+            ),
+        )
+    except FloodWaitError as exc:
+        logger.warning(
+            "activity_sync_floodwait seconds=%d total_fetched=%d",
+            exc.seconds,
+            total_fetched,
+        )
+        if await sleep_through_flood(shutdown_event, flood_seconds(exc)):
+            return _SEARCH_BATCH_STOP
+        return _SEARCH_BATCH_RETRY
+    except TimeoutError:
+        logger.warning(
+            "activity_sync_backfill_rpc_timeout offset_id=%d total_fetched=%d",
+            checkpoint,
+            total_fetched,
+        )
+        return _SEARCH_BATCH_STOP
+
+
+async def _search_incremental_batch(
+    client: Any,
+    min_date: int,
+    offset_id: int,
+    shutdown_event: asyncio.Event,
+    *,
+    inserted: int,
+) -> Any:
+    """Run the incremental SearchRequest and translate control-flow exceptions."""
+    try:
+        return await _call_with_timeout(
+            client,
+            SearchRequest(
+                peer=InputPeerEmpty(),
+                q="",
+                filter=InputMessagesFilterEmpty(),
+                min_date=min_date,
+                max_date=None,
+                offset_id=offset_id,
+                add_offset=0,
+                limit=_BACKFILL_BATCH_LIMIT,
+                max_id=0,
+                min_id=0,
+                hash=0,
+                from_id=InputPeerSelf(),
+            ),
+        )
+    except FloodWaitError as exc:
+        logger.warning("activity_sync_incremental_floodwait seconds=%d", exc.seconds)
+        if await sleep_through_flood(shutdown_event, flood_seconds(exc)):
+            return _SEARCH_BATCH_STOP
+        return _SEARCH_BATCH_RETRY
+    except TimeoutError:
+        logger.warning("activity_sync_rpc_timeout offset_id=%d inserted=%d", offset_id, inserted)
+        return _SEARCH_BATCH_STOP
+
+
+def _trim_incremental_batch(batch: list[Any], min_date: int) -> tuple[list[Any], bool]:
+    """Apply the client-side min_date filter used by the incremental loop."""
+    in_window: list[Any] = []
+    past_window = False
+    for m in batch:
+        m_ts = int(m.date.timestamp()) if getattr(m, "date", None) else 0
+        if m_ts >= min_date:
+            in_window.append(m)
+        else:
+            past_window = True
+            break
+    return in_window, past_window
+
+
+def _log_backfill_batch(progress: _BackfillState, fetched: int) -> None:
+    """Emit the per-batch backfill progress log."""
+    elapsed = time.monotonic() - progress.loop_start
+    rate = progress.total_fetched / elapsed if elapsed > 0 else 0.0
+    if progress.total_known is not None:
+        remaining = progress.total_known - progress.total_fetched
+        eta_s = int(remaining / rate) if rate > 0 else None
+        eta_str = _fmt_duration(eta_s) if eta_s is not None else "?"
+        logger.info(
+            "activity_sync_backfill_batch batch=%d fetched=%d total=%d/%d rate=%.0f/s eta=%s offset_id=%d",
+            progress.batch_num,
+            fetched,
+            progress.total_fetched,
+            progress.total_known,
+            rate,
+            eta_str,
+            progress.checkpoint,
+        )
+        return
+    logger.info(
+        "activity_sync_backfill_batch batch=%d fetched=%d total=%d rate=%.0f/s offset_id=%d",
+        progress.batch_num,
+        fetched,
+        progress.total_fetched,
+        rate,
+        progress.checkpoint,
+    )
+
+
+def _log_incremental_batch(progress: _IncrementalState, batch_log: _IncrementalBatchLog) -> None:
+    """Emit the per-batch incremental progress log."""
+    logger.info(
+        "activity_sync_incremental_batch batch=%d fetched=%d in_window=%d "
+        "extracted=%d total_inserted=%d next_offset_id=%d past_window=%s",
+        progress.batch_num,
+        batch_log.fetched,
+        batch_log.in_window,
+        batch_log.extracted,
+        batch_log.inserted,
+        batch_log.next_offset_id,
+        batch_log.past_window,
+    )
+
+
 async def call_with_timeout(client: Any, request: Any) -> Any:
     """Invoke a Telethon RPC with a hard timeout and abandon on overrun.
 
@@ -196,7 +409,10 @@ async def _run_backfill(
         logger.debug("activity_sync_backfill_skip reason=already_complete")
         return
 
-    checkpoint = int(state.get("backfill_offset_id") or 0)
+    progress = _BackfillState(
+        checkpoint=int(state.get("backfill_offset_id") or 0),
+        loop_start=time.monotonic(),
+    )
 
     # Mark that backfill has started so scan_status can distinguish
     # "never touched" from "running but not yet done".
@@ -206,126 +422,48 @@ async def _run_backfill(
             (str(int(time.time())),),
         )
 
-    logger.info("activity_sync_backfill_start offset_id=%d", checkpoint)
-
-    total_fetched = 0
-    total_known: int | None = None  # filled from result.count on first batch
-    batch_num = 0
-    loop_start = time.monotonic()
+    logger.info("activity_sync_backfill_start offset_id=%d", progress.checkpoint)
 
     while not shutdown_event.is_set():
-        try:
-            result = await _call_with_timeout(
-                client,
-                SearchRequest(
-                    peer=InputPeerEmpty(),
-                    q="",
-                    filter=InputMessagesFilterEmpty(),
-                    min_date=None,
-                    max_date=None,
-                    offset_id=checkpoint,
-                    add_offset=0,
-                    limit=_BACKFILL_BATCH_LIMIT,
-                    max_id=0,
-                    min_id=0,
-                    hash=0,
-                    from_id=InputPeerSelf(),
-                ),
-            )
-        except FloodWaitError as exc:
-            logger.warning(
-                "activity_sync_floodwait seconds=%d total_fetched=%d",
-                exc.seconds,
-                total_fetched,
-            )
-            if await sleep_through_flood(shutdown_event, flood_seconds(exc)):
-                return
+        result = await _search_backfill_batch(
+            client,
+            progress.checkpoint,
+            shutdown_event,
+            total_fetched=progress.total_fetched,
+        )
+        if result is _SEARCH_BATCH_STOP:
+            return
+        if result is _SEARCH_BATCH_RETRY:
             continue
-        except TimeoutError:
-            logger.warning(
-                "activity_sync_backfill_rpc_timeout offset_id=%d total_fetched=%d",
-                checkpoint,
-                total_fetched,
-            )
-            return  # outer run_activity_sync_loop re-enters after interval
-
-        if total_known is None:
-            total_known = getattr(result, "count", None)
-            if total_known is not None:
-                logger.info("activity_sync_backfill_total total=%d", total_known)
 
         batch = list(getattr(result, "messages", []) or [])
+        if progress.total_known is None:
+            progress.total_known = getattr(result, "count", None)
+            if progress.total_known is not None:
+                logger.info("activity_sync_backfill_total total=%d", progress.total_known)
+
         if not batch:
             _set_state(conn, "backfill_complete", "1")
-            _set_state(conn, "last_sync_at", str(int(time.time())))
+            _stamp_last_sync_at(conn)
             logger.info(
                 "activity_sync_backfill_complete total_fetched=%d",
-                total_fetched,
+                progress.total_fetched,
             )
             return
 
-        batch_num += 1
-        extracted: list[ExtractedMessage] = []
-        for m in batch:
-            # Step 1: resolve dialog_id from the Telethon message's peer.
-            #   _extract_dialog_id returns None if the peer cannot be
-            #   mapped (malformed / unexpected shape). Skip such rows —
-            #   the canonical pipeline requires a concrete int dialog_id.
-            dialog_id = _extract_dialog_id(m)
-            if dialog_id is None:
-                continue
-            # Step 2: feed the resolved (dialog_id, msg) to the canonical
-            #   extractor. extract_message_row builds a full StoredMessage
-            #   plus reactions/entities/forward side-tables.
-            extracted.append(extract_message_row(dialog_id, m))
-
-        with conn:
-            if extracted:
-                insert_messages_with_fts(conn, extracted)
-                dialog_ids = {em.message.dialog_id for em in extracted}
-                conn.executemany(
-                    INSERT_OWN_ONLY_DIALOG_SQL,
-                    [(did,) for did in dialog_ids],
-                )
+        progress.batch_num += 1
+        extracted = _extract_own_message_rows(batch)
+        _persist_own_message_rows(conn, extracted)
 
         _upsert_entities_from_search(conn, result)
 
-        total_fetched += len(batch)
-        new_checkpoint = min(m.id for m in batch if getattr(m, "id", None) is not None)
-        _set_state(conn, "backfill_offset_id", str(new_checkpoint))
-        checkpoint = new_checkpoint
+        progress.total_fetched += len(batch)
+        progress.checkpoint = min(m.id for m in batch if getattr(m, "id", None) is not None)
+        _set_state(conn, "backfill_offset_id", str(progress.checkpoint))
+        _log_backfill_batch(progress, len(batch))
 
-        elapsed = time.monotonic() - loop_start
-        rate = total_fetched / elapsed if elapsed > 0 else 0.0
-        if total_known is not None:
-            remaining = total_known - total_fetched
-            eta_s = int(remaining / rate) if rate > 0 else None
-            eta_str = _fmt_duration(eta_s) if eta_s is not None else "?"
-            logger.info(
-                "activity_sync_backfill_batch batch=%d fetched=%d total=%d/%d rate=%.0f/s eta=%s offset_id=%d",
-                batch_num,
-                len(batch),
-                total_fetched,
-                total_known,
-                rate,
-                eta_str,
-                checkpoint,
-            )
-        else:
-            logger.info(
-                "activity_sync_backfill_batch batch=%d fetched=%d total=%d rate=%.0f/s offset_id=%d",
-                batch_num,
-                len(batch),
-                total_fetched,
-                rate,
-                checkpoint,
-            )
-
-        try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=_BACKFILL_INTER_BATCH_PAUSE_S)
+        if await _wait_for_shutdown(shutdown_event, timeout=_BACKFILL_INTER_BATCH_PAUSE_S):
             return
-        except TimeoutError:
-            pass
 
 
 async def _run_incremental(
@@ -348,48 +486,26 @@ async def _run_incremental(
 
     # 60-second buffer guards against messages at the exact boundary being
     # missed when the previous sync finished mid-second.
-    min_date = max(0, last_sync_at - 60)
+    progress = _IncrementalState(min_date=max(0, last_sync_at - 60))
     logger.info(
         "activity_sync_incremental_start min_date=%d window_s=%d",
-        min_date,
-        int(time.time()) - min_date,
+        progress.min_date,
+        int(time.time()) - progress.min_date,
     )
 
-    inserted = 0
-    batch_num = 0
-    offset_id = 0  # start from newest
     while not shutdown_event.is_set():
-        try:
-            result = await _call_with_timeout(
-                client,
-                SearchRequest(
-                    peer=InputPeerEmpty(),
-                    q="",
-                    filter=InputMessagesFilterEmpty(),
-                    min_date=min_date,
-                    max_date=None,
-                    offset_id=offset_id,
-                    add_offset=0,
-                    limit=_BACKFILL_BATCH_LIMIT,
-                    max_id=0,
-                    min_id=0,
-                    hash=0,
-                    from_id=InputPeerSelf(),
-                ),
-            )
-        except FloodWaitError as exc:
-            logger.warning("activity_sync_incremental_floodwait seconds=%d", exc.seconds)
-            if await sleep_through_flood(shutdown_event, flood_seconds(exc)):
-                return  # shutdown fired during flood wait — exit cleanly
-            continue
-        except TimeoutError:
-            logger.warning(
-                "activity_sync_rpc_timeout offset_id=%d inserted=%d",
-                offset_id,
-                inserted,
-            )
-            _set_state(conn, "last_sync_at", str(int(time.time())))
+        result = await _search_incremental_batch(
+            client,
+            progress.min_date,
+            progress.offset_id,
+            shutdown_event,
+            inserted=progress.inserted,
+        )
+        if result is _SEARCH_BATCH_STOP:
+            _stamp_last_sync_at(conn)
             break
+        if result is _SEARCH_BATCH_RETRY:
+            continue
 
         batch = list(getattr(result, "messages", []) or [])
         if not batch:
@@ -400,66 +516,41 @@ async def _run_incremental(
         # client-side. Batch is ordered newest-first by offset_id, so dates
         # are monotonically decreasing: once we hit one older than min_date,
         # every later batch will be older too — break the outer loop.
-        in_window: list[Any] = []
-        past_window = False
-        for m in batch:
-            m_ts = int(m.date.timestamp()) if getattr(m, "date", None) else 0
-            if m_ts >= min_date:
-                in_window.append(m)
-            else:
-                past_window = True
-                break
-
-        extracted: list[ExtractedMessage] = []
-        for m in in_window:
-            dialog_id = _extract_dialog_id(m)
-            if dialog_id is None:
-                continue
-            extracted.append(extract_message_row(dialog_id, m))
-
-        with conn:
-            if extracted:
-                insert_messages_with_fts(conn, extracted)
-                dialog_ids = {em.message.dialog_id for em in extracted}
-                conn.executemany(
-                    INSERT_OWN_ONLY_DIALOG_SQL,
-                    [(did,) for did in dialog_ids],
-                )
+        in_window, past_window = _trim_incremental_batch(batch, progress.min_date)
+        extracted = _extract_own_message_rows(in_window)
+        _persist_own_message_rows(conn, extracted)
 
         _upsert_entities_from_search(conn, result)
-        inserted += len(in_window)
-        batch_num += 1
+        progress.inserted += len(in_window)
+        progress.batch_num += 1
         # Always advance offset_id by the full batch — even messages outside
         # the window must be skipped past so we don't re-fetch them.
-        offset_id = min(m.id for m in batch if getattr(m, "id", None) is not None)
+        progress.offset_id = min(m.id for m in batch if getattr(m, "id", None) is not None)
 
         # last_sync_at is stamped once at end-of-loop, not per batch:
         # with the client-side min_date filter the loop terminates within
         # a few iterations anyway, and a mid-loop shutdown just means the
         # next incremental re-fetches the in-progress window (UPSERT no-op).
-        logger.info(
-            "activity_sync_incremental_batch batch=%d fetched=%d in_window=%d "
-            "extracted=%d total_inserted=%d next_offset_id=%d past_window=%s",
-            batch_num,
-            len(batch),
-            len(in_window),
-            len(extracted),
-            inserted,
-            offset_id,
-            past_window,
+        _log_incremental_batch(
+            progress,
+            _IncrementalBatchLog(
+                fetched=len(batch),
+                in_window=len(in_window),
+                extracted=len(extracted),
+                inserted=progress.inserted,
+                next_offset_id=progress.offset_id,
+                past_window=past_window,
+            ),
         )
 
         if past_window:
             break
 
-        try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=_BACKFILL_INTER_BATCH_PAUSE_S)
+        if await _wait_for_shutdown(shutdown_event, timeout=_BACKFILL_INTER_BATCH_PAUSE_S):
             return
-        except TimeoutError:
-            pass
 
-    _set_state(conn, "last_sync_at", str(int(time.time())))
-    logger.info("activity_sync_incremental_done batches=%d inserted=%d", batch_num, inserted)
+    _stamp_last_sync_at(conn)
+    logger.info("activity_sync_incremental_done batches=%d inserted=%d", progress.batch_num, progress.inserted)
 
 
 async def run_activity_sync_loop(

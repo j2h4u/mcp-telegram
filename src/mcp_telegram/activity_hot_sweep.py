@@ -8,13 +8,12 @@ the window drains.
 No scheduling state from Tier B (cold_*) is touched here.
 """
 
-from __future__ import annotations
-
 import asyncio
 import logging
 import os
 import sqlite3
 import time
+from dataclasses import dataclass
 from typing import Any
 
 from .activity_peer_sweep import (
@@ -31,6 +30,168 @@ _HOT_SWEEP_INTERVAL_S = float(os.environ.get("ACTIVITY_HOT_SWEEP_SECONDS", "3600
 _BACKFILL_BATCH_LIMIT = 100
 # Short transient backoff for ACCESS_SKIP (peer unresolved / timeout).
 _ACCESS_SKIP_RETRY_S = 300  # 5 minutes
+
+
+@dataclass
+class _HotSweepPeerOutcome:
+    """Outcome for one peer within a hot sweep pass."""
+
+    written: int
+    flooded: bool
+
+
+@dataclass
+class _HotSweepPeerContext:
+    """Context for processing a single peer in HotSweep."""
+
+    client: Any
+    conn: sqlite3.Connection
+    dialog_id: int
+    old_hot_cursor: int | None
+    now: int
+    shutdown_event: asyncio.Event
+
+
+def _is_hot_page_drained(result: SweepResult) -> bool:
+    """Return True when the current page fully drained the newest-side window."""
+    return (
+        result.hit_floor
+        or result.skip_reason is SkipReason.HISTORY_FLOOR
+        or len(result.fetched_ids) < _BACKFILL_BATCH_LIMIT
+    )
+
+
+def _save_hot_flood_state(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    *,
+    old_hot_cursor: int,
+    max_seen: int,
+    next_retry_at: int,
+) -> None:
+    """Persist hot-state after a FloodWait and keep already-drained progress."""
+    save_fields: dict[str, Any] = {"hot_next_retry_at": next_retry_at}
+    if max_seen > old_hot_cursor:
+        save_fields["hot_cursor"] = max_seen
+    _save_dialog_state(conn, dialog_id, **save_fields)
+
+
+def _save_hot_access_skip_state(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    *,
+    retry_at: int,
+) -> None:
+    """Persist a transient retry window for ACCESS_SKIP."""
+    _save_dialog_state(conn, dialog_id, hot_next_retry_at=retry_at)
+
+
+def _save_hot_drained_state(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    *,
+    hot_cursor: int,
+    now: int,
+) -> None:
+    """Persist the committed hot cursor after the window has fully drained."""
+    _save_dialog_state(
+        conn,
+        dialog_id,
+        hot_cursor=hot_cursor,
+        hot_last_sync_at=now,
+        hot_next_retry_at=None,
+    )
+
+
+def _save_hot_min_id_gap_state(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    *,
+    hot_cursor: int,
+    now: int,
+) -> None:
+    """Persist an empty-but-non-drained page without logging a completion event."""
+    _save_dialog_state(
+        conn,
+        dialog_id,
+        hot_cursor=hot_cursor,
+        hot_last_sync_at=now,
+        hot_next_retry_at=None,
+    )
+
+
+async def _run_hot_sweep_peer(ctx: _HotSweepPeerContext) -> _HotSweepPeerOutcome:
+    """Process one peer across all needed pages for the current hot sweep pass."""
+    pass_min_id = (ctx.old_hot_cursor + 1) if ctx.old_hot_cursor else 0
+    max_seen = ctx.old_hot_cursor or 0
+    page_offset = 0
+    pages_fetched = 0
+    total_written = 0
+
+    while not ctx.shutdown_event.is_set():
+        result: SweepResult = await sweep_peer_once(
+            ctx.client,
+            ctx.conn,
+            ctx.dialog_id,
+            offset_id=page_offset,
+            min_id=pass_min_id,
+            limit=_BACKFILL_BATCH_LIMIT,
+        )
+        pages_fetched += 1
+
+        if result.flood_wait_seconds is not None:
+            next_retry_at = int(time.time()) + result.flood_wait_seconds
+            _save_hot_flood_state(
+                ctx.conn,
+                ctx.dialog_id,
+                old_hot_cursor=ctx.old_hot_cursor or 0,
+                max_seen=max_seen,
+                next_retry_at=next_retry_at,
+            )
+            logger.warning(
+                "activity_hot_sweep_flood dialog_id=%r flood_wait_seconds=%d"
+                " max_seen=%d pages_fetched=%d — halting pass (account-global wait)",
+                ctx.dialog_id,
+                result.flood_wait_seconds,
+                max_seen,
+                pages_fetched,
+            )
+            return _HotSweepPeerOutcome(written=total_written, flooded=True)
+
+        if result.skip_reason is SkipReason.ACCESS_SKIP:
+            transient_retry_at = int(time.time()) + _ACCESS_SKIP_RETRY_S
+            _save_hot_access_skip_state(ctx.conn, ctx.dialog_id, retry_at=transient_retry_at)
+            logger.debug(
+                "activity_hot_sweep_access_skip dialog_id=%r retry_at=%d pages_fetched=%d",
+                ctx.dialog_id,
+                transient_retry_at,
+                pages_fetched,
+            )
+            return _HotSweepPeerOutcome(written=total_written, flooded=False)
+
+        if result.max_id is not None:
+            max_seen = max(max_seen, result.max_id)
+
+        total_written += result.persisted
+
+        if _is_hot_page_drained(result):
+            _save_hot_drained_state(ctx.conn, ctx.dialog_id, hot_cursor=max_seen, now=ctx.now)
+            logger.debug(
+                "activity_hot_sweep_peer_done dialog_id=%r hot_cursor=%d pages_fetched=%d written=%d",
+                ctx.dialog_id,
+                max_seen,
+                pages_fetched,
+                result.persisted,
+            )
+            return _HotSweepPeerOutcome(written=total_written, flooded=False)
+
+        if result.min_id is None:
+            _save_hot_min_id_gap_state(ctx.conn, ctx.dialog_id, hot_cursor=max_seen, now=ctx.now)
+            return _HotSweepPeerOutcome(written=total_written, flooded=False)
+
+        page_offset = result.min_id
+
+    return _HotSweepPeerOutcome(written=total_written, flooded=False)
 
 
 async def run_hot_sweep_pass(
@@ -70,130 +231,26 @@ async def run_hot_sweep_pass(
     logger.info("activity_hot_sweep_pass_start peers_selected=%d", len(rows))
 
     total_written = 0
-    # FloodWait from Telegram is account-global. Once we hit one, every further
-    # SearchRequest this pass is sent during the wait window — exactly what
-    # escalates rate-limiting toward a ban. Stop the whole pass on the first flood
-    # and let the per-peer hot_next_retry_at backoff resume work next pass.
-    pass_flooded = False
 
     for dialog_id, old_hot_cursor in rows:
         if shutdown_event.is_set():
             break
 
-        # Inclusive-cursor fix (concern 2): MTProto min_id is inclusive, so
-        # anchoring on old_hot_cursor re-fetches that message every pass.
-        # Use old_hot_cursor + 1 to fetch strictly-newer messages.
-        pass_min_id = (old_hot_cursor + 1) if old_hot_cursor else 0
-
-        # Local accumulator — NOT persisted until the window fully drains
-        max_seen: int = old_hot_cursor or 0
-
-        # page_offset starts at 0 (newest), advances to result.min_id each page
-        page_offset = 0
-        pages_fetched = 0
-
-        while not shutdown_event.is_set():
-            result: SweepResult = await sweep_peer_once(
-                client,
-                conn,
-                dialog_id,
-                offset_id=page_offset,
-                min_id=pass_min_id,
-                limit=_BACKFILL_BATCH_LIMIT,
+        peer_result = await _run_hot_sweep_peer(
+            _HotSweepPeerContext(
+                client=client,
+                conn=conn,
+                dialog_id=dialog_id,
+                old_hot_cursor=old_hot_cursor,
+                now=now,
+                shutdown_event=shutdown_event,
             )
-
-            pages_fetched += 1
-
-            # --- FloodWait (concern 5): Tier A owns hot_next_retry_at ---
-            if result.flood_wait_seconds is not None:
-                # Read the clock at the event, not the pass-start snapshot: a long
-                # multi-peer pass would otherwise back-date next_retry_at into the
-                # past and grant the peer zero effective backoff.
-                next_retry_at = int(time.time()) + result.flood_wait_seconds
-                # Persist any already-drained progress first (do not lose pages
-                # drained so far this pass)
-                save_fields: dict[str, Any] = {
-                    "hot_next_retry_at": next_retry_at,
-                }
-                if max_seen > (old_hot_cursor or 0):
-                    save_fields["hot_cursor"] = max_seen
-                _save_dialog_state(conn, dialog_id, **save_fields)
-                logger.warning(
-                    "activity_hot_sweep_flood dialog_id=%r flood_wait_seconds=%d"
-                    " max_seen=%d pages_fetched=%d — halting pass (account-global wait)",
-                    dialog_id,
-                    result.flood_wait_seconds,
-                    max_seen,
-                    pages_fetched,
-                )
-                pass_flooded = True
-                break  # Stop this peer; pass_flooded halts the whole pass below
-
-            # --- ACCESS_SKIP (concern 3): transient miss, do NOT advance cursor ---
-            if result.skip_reason is SkipReason.ACCESS_SKIP:
-                transient_retry_at = int(time.time()) + _ACCESS_SKIP_RETRY_S
-                _save_dialog_state(
-                    conn,
-                    dialog_id,
-                    hot_next_retry_at=transient_retry_at,
-                )
-                logger.debug(
-                    "activity_hot_sweep_access_skip dialog_id=%r retry_at=%d pages_fetched=%d",
-                    dialog_id,
-                    transient_retry_at,
-                    pages_fetched,
-                )
-                break  # Transient — retry next pass
-
-            # --- Update running max seen across pages ---
-            if result.max_id is not None:
-                max_seen = max(max_seen, result.max_id)
-
-            total_written += result.persisted
-
-            # --- Drain check: window exhausted when page < limit or hit floor ---
-            page_drained = (
-                result.hit_floor
-                or result.skip_reason is SkipReason.HISTORY_FLOOR
-                or len(result.fetched_ids) < _BACKFILL_BATCH_LIMIT
-            )
-
-            if page_drained:
-                # Window fully drained — commit hot_cursor ONCE (concern 2)
-                _save_dialog_state(
-                    conn,
-                    dialog_id,
-                    hot_cursor=max_seen,
-                    hot_last_sync_at=now,
-                    hot_next_retry_at=None,
-                )
-                logger.debug(
-                    "activity_hot_sweep_peer_done dialog_id=%r hot_cursor=%d pages_fetched=%d written=%d",
-                    dialog_id,
-                    max_seen,
-                    pages_fetched,
-                    result.persisted,
-                )
-                break
-
-            # --- More pages remain: advance offset_id downward within window ---
-            # result.min_id is the smallest id on this page; next page starts below it
-            if result.min_id is None:
-                # No min_id means batch was empty — treat as drained
-                _save_dialog_state(
-                    conn,
-                    dialog_id,
-                    hot_cursor=max_seen,
-                    hot_last_sync_at=now,
-                    hot_next_retry_at=None,
-                )
-                break
-
-            page_offset = result.min_id  # Walk down within [pass_min_id, page_offset)
+        )
+        total_written += peer_result.written
 
         # Account-global FloodWait hit on this peer — do not advance to the next
         # peer (that would send another request during the wait window).
-        if pass_flooded:
+        if peer_result.flooded:
             break
 
     logger.info(

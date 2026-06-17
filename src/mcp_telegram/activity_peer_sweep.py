@@ -18,8 +18,6 @@ backoff helpers — see activity_peer_resolve.resolve_linked_chat_id.
 No scheduling loops live here — those are plans 03 and 04.
 """
 
-from __future__ import annotations
-
 import logging
 import sqlite3
 import time
@@ -93,20 +91,55 @@ class SweepResult:
         return self.skip_reason is SkipReason.HISTORY_FLOOR
 
 
+@dataclass
+class PeerSweepRequest:
+    """Request context for a single per-peer self-search sweep."""
+
+    client: Any
+    conn: sqlite3.Connection
+    dialog_id: int
+    offset_id: int
+    min_id: int
+    limit: int
+
+
+_LEGACY_PEER_SWEEP_POSITIONAL_ARGS = 3
+
+
+def _coerce_peer_sweep_request(*args: Any, **kwargs: Any) -> PeerSweepRequest:
+    """Normalize legacy call shapes into a single request record."""
+    if len(args) == 1 and isinstance(args[0], PeerSweepRequest) and not kwargs:
+        return args[0]
+
+    if len(args) == _LEGACY_PEER_SWEEP_POSITIONAL_ARGS:
+        client, conn, dialog_id = args
+    else:
+        client = kwargs.pop("client")
+        conn = kwargs.pop("conn")
+        dialog_id = kwargs.pop("dialog_id")
+
+    offset_id = kwargs.pop("offset_id")
+    min_id = kwargs.pop("min_id")
+    limit = kwargs.pop("limit")
+    if kwargs:
+        raise TypeError(f"sweep_peer_once: unexpected keyword arguments {sorted(kwargs)!r}")
+
+    return PeerSweepRequest(
+        client=client,
+        conn=conn,
+        dialog_id=dialog_id,
+        offset_id=offset_id,
+        min_id=min_id,
+        limit=limit,
+    )
+
+
 # ---------------------------------------------------------------------------
 # sweep_peer_once: FloodWait-neutral per-peer self-search primitive
 # ---------------------------------------------------------------------------
 
 
-async def sweep_peer_once(
-    client: Any,
-    conn: sqlite3.Connection,
-    dialog_id: int,
-    *,
-    offset_id: int,
-    min_id: int,
-    limit: int,
-) -> SweepResult:
+async def sweep_peer_once(*args: Any, **kwargs: Any) -> SweepResult:
     """Search for self-authored messages in a single peer and persist them.
 
     Direction-agnostic: takes explicit offset_id + min_id, reports both
@@ -121,14 +154,15 @@ async def sweep_peer_once(
     TimeoutError (wedged RPC): treated as ACCESS_SKIP — a transient fault,
     not history-floor completion.
     """
+    request = _coerce_peer_sweep_request(*args, **kwargs)
     from telethon.errors import FloodWaitError
     from telethon.tl.functions.messages import SearchRequest
     from telethon.tl.types import InputMessagesFilterEmpty, InputPeerSelf
 
     # Step 1: entity-type-aware peer resolution from session
-    peer = await resolve_input_peer(client, dialog_id)
+    peer = await resolve_input_peer(request.client, request.dialog_id)
     if peer is None:
-        logger.debug("sweep_peer_once_access_skip dialog_id=%r reason=resolve_none", dialog_id)
+        logger.debug("sweep_peer_once_access_skip dialog_id=%r reason=resolve_none", request.dialog_id)
         return SweepResult(
             fetched_ids=[],
             persisted=0,
@@ -140,17 +174,17 @@ async def sweep_peer_once(
     # Step 2: issue per-peer self-search with concrete peer (not InputPeerEmpty)
     try:
         result = await call_with_timeout(
-            client,
+            request.client,
             SearchRequest(
                 peer=peer,
                 q="",
                 filter=InputMessagesFilterEmpty(),
                 from_id=InputPeerSelf(),
-                offset_id=offset_id,
+                offset_id=request.offset_id,
                 add_offset=0,
-                limit=limit,
+                limit=request.limit,
                 max_id=0,
-                min_id=min_id,
+                min_id=request.min_id,
                 hash=0,
                 min_date=None,
                 max_date=None,
@@ -159,7 +193,7 @@ async def sweep_peer_once(
     except FloodWaitError as exc:
         logger.warning(
             "sweep_peer_once_flood dialog_id=%r flood_wait_seconds=%d",
-            dialog_id,
+            request.dialog_id,
             exc.seconds,
         )
         # FloodWait-NEUTRAL: surface the wait, do not sleep
@@ -172,7 +206,7 @@ async def sweep_peer_once(
             flood_wait_seconds=int(exc.seconds),
         )
     except TimeoutError:
-        logger.warning("sweep_peer_once_timeout dialog_id=%r offset_id=%r", dialog_id, offset_id)
+        logger.warning("sweep_peer_once_timeout dialog_id=%r offset_id=%r", request.dialog_id, request.offset_id)
         # Wedged RPC is transient — ACCESS_SKIP, never HISTORY_FLOOR
         return SweepResult(
             fetched_ids=[],
@@ -203,9 +237,9 @@ async def sweep_peer_once(
         extracted.append(extract_message_row(did, m))
 
     persisted = 0
-    with conn:
+    with request.conn:
         if extracted:
-            insert_messages_with_fts(conn, extracted)
+            insert_messages_with_fts(request.conn, extracted)
             persisted = len(extracted)
 
     msg_ids = [m.id for m in batch if getattr(m, "id", None) is not None]
