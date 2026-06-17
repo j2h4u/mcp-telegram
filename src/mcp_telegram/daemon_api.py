@@ -70,12 +70,22 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
     MessageActionChatEditPhoto,
 )
 
+from . import daemon_activity_stats as _activity_stats
 from .daemon_account_trace import (
     DaemonAccountTraceDeps,
     DaemonAccountTraceService,
 )
 from .daemon_entity_info import DaemonEntityInfoService, EntityInfoDeps
 from .daemon_ipc import get_daemon_socket_path as _get_daemon_socket_path
+
+DEFAULT_ACTIVITY_DIALOG_KINDS = _activity_stats.DEFAULT_ACTIVITY_DIALOG_KINDS
+_ACTIVITY_DIALOG_KIND_ALIASES = _activity_stats._ACTIVITY_DIALOG_KIND_ALIASES
+_ALLOWED_ACTIVITY_DIALOG_KINDS = _activity_stats._ALLOWED_ACTIVITY_DIALOG_KINDS
+_GET_DIALOG_TOP_FORWARDS_SQL = _activity_stats._GET_DIALOG_TOP_FORWARDS_SQL
+_GET_DIALOG_TOP_HASHTAGS_SQL = _activity_stats._GET_DIALOG_TOP_HASHTAGS_SQL
+_GET_DIALOG_TOP_MENTIONS_SQL = _activity_stats._GET_DIALOG_TOP_MENTIONS_SQL
+_GET_DIALOG_TOP_REACTIONS_SQL = _activity_stats._GET_DIALOG_TOP_REACTIONS_SQL
+_SELECT_SYNC_STATUS_SQL = _activity_stats._SELECT_SYNC_STATUS_SQL
 
 
 def get_daemon_socket_path() -> Path:
@@ -227,22 +237,6 @@ _current_request_id: contextvars.ContextVar[str | None] = contextvars.ContextVar
     default=None,
 )
 
-DEFAULT_ACTIVITY_DIALOG_KINDS = ("group", "forum")
-_ALLOWED_ACTIVITY_DIALOG_KINDS = {"all", "user", "bot", "group", "forum", "channel", "unknown"}
-_ACTIVITY_DIALOG_KIND_ALIASES = {
-    "dm": ("user", "bot"),
-    "dms": ("user", "bot"),
-    "private": ("user", "bot"),
-    "personal": ("user", "bot"),
-    "direct": ("user", "bot"),
-    "groups": ("group", "forum"),
-    "supergroup": ("group",),
-    "supergroups": ("group",),
-    "chat": ("group",),
-    "chats": ("group",),
-    "forums": ("forum",),
-}
-
 
 def _rid() -> str:
     """Return ' request_id=X' suffix for log lines, or empty string."""
@@ -300,8 +294,6 @@ def _build_access_metadata(
 # ---------------------------------------------------------------------------
 # SQL constants
 # ---------------------------------------------------------------------------
-
-_SELECT_SYNC_STATUS_SQL = "SELECT status FROM synced_dialogs WHERE dialog_id = ?"
 
 # Phase 39.1-02: effective_sender_id collapses DM direction into a concrete user id.
 # For DM outgoing rows (sender_id IS NULL, out=1) → self_id (from :self_id parameter).
@@ -485,29 +477,6 @@ _GET_ACCESS_LOST_ALERTS_SQL = (
     "SELECT dialog_id, access_lost_at FROM synced_dialogs WHERE status = 'access_lost' AND access_lost_at > ?"
 )
 
-# Dialog stats SQL (get_dialog_stats)
-_GET_DIALOG_TOP_REACTIONS_SQL = (
-    "SELECT emoji, SUM(count) AS total "
-    "FROM message_reactions WHERE dialog_id = ? "
-    "GROUP BY emoji ORDER BY total DESC LIMIT ?"
-)
-_GET_DIALOG_TOP_MENTIONS_SQL = (
-    "SELECT value, COUNT(*) AS cnt FROM message_entities "
-    "WHERE dialog_id = ? AND type = 'mention' AND value IS NOT NULL "
-    "GROUP BY value ORDER BY cnt DESC LIMIT ?"
-)
-_GET_DIALOG_TOP_HASHTAGS_SQL = (
-    "SELECT value, COUNT(*) AS cnt FROM message_entities "
-    "WHERE dialog_id = ? AND type = 'hashtag' AND value IS NOT NULL "
-    "GROUP BY value ORDER BY cnt DESC LIMIT ?"
-)
-_GET_DIALOG_TOP_FORWARDS_SQL = (
-    "SELECT fwd_from_peer_id, fwd_from_name, COUNT(*) AS cnt "
-    "FROM message_forwards "
-    "WHERE dialog_id = ? AND (fwd_from_peer_id IS NOT NULL OR fwd_from_name IS NOT NULL) "
-    "GROUP BY fwd_from_peer_id, fwd_from_name ORDER BY cnt DESC LIMIT ?"
-)
-
 # Unread SQL — zero Telegram API calls (Plan 38-02)
 # Single grouped query: scalar subquery provides per-dialog unread_count in ONE round trip,
 # replacing the N+1 COUNT(*)-per-dialog pattern. Uses idx_synced_dialogs_status_read_position
@@ -559,68 +528,6 @@ _ALL_ENTITY_NAMES_NORMALIZED_SQL = (
     "OR (type NOT IN ('User', 'Bot') AND updated_at >= ?))"
 )
 _ENTITY_BY_USERNAME_SQL = "SELECT id, name, username, name_normalized FROM entities WHERE username = ? COLLATE NOCASE"
-
-
-# ---------------------------------------------------------------------------
-# Usage stats query
-# ---------------------------------------------------------------------------
-
-
-def _query_usage_stats(cursor: sqlite3.Cursor, since: int) -> dict:
-    """Run all analytics queries and return the raw stats dict."""
-    tool_dist = dict(
-        cursor.execute(
-            "SELECT tool_name, COUNT(*) FROM telemetry_events "
-            "WHERE timestamp >= ? GROUP BY tool_name ORDER BY COUNT(*) DESC",
-            (since,),
-        ).fetchall()
-    )
-
-    error_dist = dict(
-        cursor.execute(
-            "SELECT error_type, COUNT(*) FROM telemetry_events "
-            "WHERE timestamp >= ? AND error_type IS NOT NULL "
-            "GROUP BY error_type ORDER BY COUNT(*) DESC",
-            (since,),
-        ).fetchall()
-    )
-
-    def _scalar(sql: str, params: tuple = (since,), default: int = 0) -> int:
-        row = cursor.execute(sql, params).fetchone()
-        return row[0] if row and row[0] is not None else default
-
-    max_depth = _scalar(
-        "SELECT MAX(page_depth) FROM telemetry_events WHERE timestamp >= ?",
-    )
-    filter_count = _scalar(
-        "SELECT COUNT(*) FROM telemetry_events WHERE timestamp >= ? AND has_filter = 1",
-    )
-    total_calls = _scalar(
-        "SELECT COUNT(*) FROM telemetry_events WHERE timestamp >= ?",
-    )
-
-    latencies = cursor.execute(
-        "SELECT duration_ms FROM telemetry_events WHERE timestamp >= ? ORDER BY duration_ms",
-        (since,),
-    ).fetchall()
-
-    latency_median_ms = 0
-    latency_p95_ms = 0
-    if latencies:
-        latency_values_ms = [lat[0] for lat in latencies]
-        latency_median_ms = latency_values_ms[len(latency_values_ms) // 2]
-        p95_idx = int(len(latency_values_ms) * 0.95)
-        latency_p95_ms = latency_values_ms[p95_idx] if p95_idx < len(latency_values_ms) else latency_values_ms[-1]
-
-    return {
-        "tool_distribution": tool_dist,
-        "error_distribution": error_dist,
-        "max_page_depth": max_depth,
-        "total_calls": total_calls,
-        "filter_count": filter_count,
-        "latency_median_ms": latency_median_ms,
-        "latency_p95_ms": latency_p95_ms,
-    }
 
 
 # list_topics — read from topic_metadata snapshot (Phase 45)
@@ -791,6 +698,7 @@ class DaemonAPIServer:
         self._ready: bool = False
         self.startup_detail: str = "connecting to Telegram"
         self._reading_service: DaemonReadingService | None = None
+        self._activity_stats_service: _activity_stats.DaemonActivityStatsService | None = None
 
     def _get_reading_service(self) -> DaemonReadingService:
         """Get memoized reading-service instance with explicit daemon dependencies."""
@@ -809,6 +717,18 @@ class DaemonAPIServer:
                 )
             )
         return self._reading_service
+
+    def _get_activity_stats_service(self) -> _activity_stats.DaemonActivityStatsService:
+        """Get memoized activity/stats service with explicit daemon dependencies."""
+        if self._activity_stats_service is None:
+            self._activity_stats_service = _activity_stats.DaemonActivityStatsService(
+                _activity_stats.DaemonActivityStatsDeps(
+                    conn=self._conn,
+                    resolve_dialog_id=self._resolve_dialog_id,
+                    logger=logger,
+                )
+            )
+        return self._activity_stats_service
 
     def _dm_peer_ids(self) -> set[int]:
         """Return ids of all DM peers the operator has ever exchanged messages with.
@@ -1888,83 +1808,14 @@ class DaemonAPIServer:
     # ------------------------------------------------------------------
 
     async def _get_usage_stats(self, req: dict) -> dict:
-        """Return usage statistics from sync.db telemetry_events.
-
-        Request: since (int, unix timestamp; default 30 days ago).
-        Response data: {"tool_distribution", "error_distribution",
-        "max_page_depth", "total_calls", "filter_count",
-        "latency_median_ms", "latency_p95_ms"}.
-        """
-        since: int = req.get("since", int(time.time()) - 30 * 86400)
-        try:
-            stats = _query_usage_stats(self._conn.cursor(), since)
-            return {"ok": True, "data": stats}
-        except Exception as exc:
-            logger.error("get_usage_stats failed: %s", exc, exc_info=True)
-            return {"ok": False, "error": "internal", "message": "internal error"}
+        return await self._get_activity_stats_service().get_usage_stats(req)
 
     # ------------------------------------------------------------------
     # get_dialog_stats
     # ------------------------------------------------------------------
 
     async def _get_dialog_stats(self, req: dict) -> dict:
-        """Return aggregate analytics for one synced dialog.
-
-        Request: dialog_id (int) OR dialog (str fuzzy name), limit (int 1-20, default 5).
-        Response data: {"dialog_id", "top_reactions", "top_mentions", "top_hashtags",
-        "top_forwards"} — each a list of dicts sorted by count DESC.
-        Errors: not_synced (dialog not in scope), missing_dialog, dialog_not_found.
-        access_lost dialogs are allowed — archived analytics remain useful.
-        """
-        dialog_id: int = req.get("dialog_id", 0) or 0
-        dialog: str | None = req.get("dialog")
-        limit: int = _clamp(req.get("limit", 5), 1, 20)
-
-        resolved = await self._resolve_dialog_id(dialog_id, dialog)
-        if isinstance(resolved, dict):
-            return resolved
-        dialog_id = resolved
-        if not dialog_id:
-            return {
-                "ok": False,
-                "error": "missing_dialog",
-                "message": "Either dialog_id or dialog name is required for get_dialog_stats",
-            }
-
-        row = self._conn.execute(_SELECT_SYNC_STATUS_SQL, (dialog_id,)).fetchone()
-        if row is None or row[0] not in ("synced", "syncing", "access_lost"):
-            return {
-                "ok": False,
-                "error": "not_synced",
-                "message": "GetDialogStats requires a synced dialog. Use MarkDialogForSync first.",
-            }
-
-        reactions = [
-            {"emoji": r[0], "count": int(r[1])}
-            for r in self._conn.execute(_GET_DIALOG_TOP_REACTIONS_SQL, (dialog_id, limit)).fetchall()
-        ]
-        mentions = [
-            {"value": r[0], "count": int(r[1])}
-            for r in self._conn.execute(_GET_DIALOG_TOP_MENTIONS_SQL, (dialog_id, limit)).fetchall()
-        ]
-        hashtags = [
-            {"value": r[0], "count": int(r[1])}
-            for r in self._conn.execute(_GET_DIALOG_TOP_HASHTAGS_SQL, (dialog_id, limit)).fetchall()
-        ]
-        forwards = [
-            {"peer_id": r[0], "name": r[1], "count": int(r[2])}
-            for r in self._conn.execute(_GET_DIALOG_TOP_FORWARDS_SQL, (dialog_id, limit)).fetchall()
-        ]
-        return {
-            "ok": True,
-            "data": {
-                "dialog_id": dialog_id,
-                "top_reactions": reactions,
-                "top_mentions": mentions,
-                "top_hashtags": hashtags,
-                "top_forwards": forwards,
-            },
-        }
+        return await self._get_activity_stats_service().get_dialog_stats(req)
 
     # ------------------------------------------------------------------
     # _fetch_fragment_context (helper for _list_messages fragment branch)
@@ -2040,197 +1891,8 @@ class DaemonAPIServer:
     # get_my_recent_activity
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _normalize_activity_dialog_kinds(value: object) -> tuple[list[str] | None, str | None]:
-        if value is None:
-            return list(DEFAULT_ACTIVITY_DIALOG_KINDS), None
-        if isinstance(value, str):
-            raw_values: list[object] = [value]
-        elif isinstance(value, list | tuple | set):
-            raw_values = list(value)
-        else:
-            return None, "dialog_kinds must be a list of strings"
-
-        normalized_values: list[str] = []
-        for raw in raw_values:
-            if not isinstance(raw, str):
-                return None, "dialog_kinds entries must be strings"
-            normalized = raw.strip().lower()
-            if not normalized:
-                continue
-            expanded = _ACTIVITY_DIALOG_KIND_ALIASES.get(normalized, (normalized,))
-            for kind in expanded:
-                if kind not in _ALLOWED_ACTIVITY_DIALOG_KINDS:
-                    allowed = ", ".join(sorted(_ALLOWED_ACTIVITY_DIALOG_KINDS))
-                    return None, f"dialog_kinds entries must be one of: {allowed}"
-                if kind not in normalized_values:
-                    normalized_values.append(kind)
-
-        if "all" in normalized_values:
-            return ["all"], None
-        if not normalized_values:
-            return None, "dialog_kinds must include at least one kind"
-        return normalized_values, None
-
     async def _get_my_recent_activity(self, req: dict) -> dict:
-        """Read own outgoing messages (out=1, non-service, non-deleted) with scan_status context.
-
-        D-05: per-comment blocks, scan_status from activity_sync_state.
-
-        Request: since_hours (int, 1–8760, default 168), limit (int, 1–2000, default 500).
-        Optional dialog_kinds defaults to ["group", "forum"] to exclude DMs.
-        Response: {"ok": True, "data": {"comments": [...], "scan_status": str, "scanned_at": int|None}}
-        Each comment includes dialog identity/type, message identity/time/text,
-        sync status, reply_count, and reaction counters.
-        dialog_name falls back to str(dialog_id) when no entities row exists.
-        scan_status: "never_run" if backfill_started_at IS NULL (daemon never ran the loop),
-                     "in_progress" if backfill_started_at IS NOT NULL but backfill_complete != '1',
-                     "complete" if backfill_complete == '1'.
-        """
-        since_hours_raw = req.get("since_hours", 168)
-        try:
-            since_hours = int(since_hours_raw)
-        except TypeError, ValueError:
-            since_hours = 168
-        since_hours = max(1, min(8760, since_hours))
-
-        limit_raw = req.get("limit", 500)
-        try:
-            limit = int(limit_raw)
-        except TypeError, ValueError:
-            limit = 500
-        limit = max(1, min(2000, limit))
-
-        dialog_kinds, dialog_kind_error = self._normalize_activity_dialog_kinds(
-            req.get("dialog_kinds", list(DEFAULT_ACTIVITY_DIALOG_KINDS))
-        )
-        if dialog_kind_error is not None or dialog_kinds is None:
-            return {
-                "ok": False,
-                "error": "invalid_dialog_kinds",
-                "message": dialog_kind_error or "invalid dialog_kinds",
-            }
-
-        since_ts = int(time.time()) - since_hours * 3600
-        dialog_kind_filter_sql = ""
-        query_params: list[object] = [since_ts]
-        if dialog_kinds != ["all"]:
-            dialog_kind_placeholders = ",".join("?" for _ in dialog_kinds)
-            dialog_kind_filter_sql = f"WHERE dialog_kind IN ({dialog_kind_placeholders}) "
-            query_params.extend(dialog_kinds)
-        query_params.append(limit)
-
-        rows = self._conn.execute(
-            "WITH typed_activity AS ("
-            "SELECT m.dialog_id AS dialog_id, m.message_id AS message_id, "
-            "       m.sent_at AS sent_at, m.text AS text, "
-            "       e.name AS dialog_name, "
-            "       CASE "
-            "         WHEN lower(COALESCE(e.type, '')) = 'bot' THEN 'bot' "
-            "         WHEN d.type IS NOT NULL AND d.type != '' THEN d.type "
-            "         WHEN e.type IS NOT NULL AND e.type != '' THEN e.type "
-            "         ELSE 'unknown' "
-            "       END AS dialog_type, "
-            "       CASE "
-            "         WHEN COALESCE(m.reply_count, 0) >= COALESCE(dr.direct_reply_count, 0) "
-            "         THEN COALESCE(m.reply_count, 0) "
-            "         ELSE COALESCE(dr.direct_reply_count, 0) "
-            "       END AS reply_count, "
-            "       sd.status AS sync_status "
-            "FROM messages m "
-            "LEFT JOIN ("
-            "  SELECT dialog_id, reply_to_msg_id AS message_id, COUNT(*) AS direct_reply_count "
-            "  FROM messages "
-            "  WHERE reply_to_msg_id IS NOT NULL AND is_service = 0 AND is_deleted = 0 "
-            "  GROUP BY dialog_id, reply_to_msg_id"
-            ") dr ON dr.dialog_id = m.dialog_id AND dr.message_id = m.message_id "
-            "LEFT JOIN entities e ON e.id = m.dialog_id "
-            "LEFT JOIN dialogs d ON d.dialog_id = m.dialog_id "
-            "LEFT JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id "
-            # out=1: authored by the account owner.
-            # is_service=0: exclude join/leave/group-created system events
-            #   — activity_comments never held these rows, so the read
-            #   path must not start surfacing them after unification.
-            # is_deleted=0: exclude tombstones for messages the user
-            #   deleted — same pre-v15 behavior preservation rationale.
-            "WHERE m.out = 1 AND m.is_service = 0 AND m.is_deleted = 0 "
-            "  AND m.sent_at >= ? "
-            "), kinded_activity AS ("
-            "SELECT ta.*, "
-            "       CASE "
-            "         WHEN lower(ta.dialog_type) = 'bot' THEN 'bot' "
-            "         WHEN lower(ta.dialog_type) = 'user' THEN 'user' "
-            "         WHEN lower(ta.dialog_type) = 'forum' THEN 'forum' "
-            "         WHEN EXISTS (SELECT 1 FROM topic_metadata tm WHERE tm.dialog_id = ta.dialog_id) THEN 'forum' "
-            "         WHEN lower(ta.dialog_type) IN ('group', 'supergroup', 'chat') THEN 'group' "
-            "         WHEN lower(ta.dialog_type) = 'channel' THEN 'channel' "
-            "         WHEN lower(ta.dialog_type) = 'unknown' AND ta.dialog_id > 0 THEN 'user' "
-            "         WHEN lower(ta.dialog_type) = 'unknown' AND ta.dialog_id < 0 THEN 'group' "
-            "         ELSE 'unknown' "
-            "       END AS dialog_kind "
-            "FROM typed_activity ta"
-            ") "
-            "SELECT * FROM ("
-            "SELECT * FROM kinded_activity "
-            f"{dialog_kind_filter_sql}"
-            "ORDER BY sent_at DESC, dialog_id DESC, message_id DESC "
-            "LIMIT ?"
-            ") ORDER BY sent_at ASC, dialog_id ASC, message_id ASC",
-            query_params,
-        ).fetchall()
-
-        state_rows = dict(self._conn.execute("SELECT key, value FROM activity_sync_state").fetchall())
-        backfill_complete = state_rows.get("backfill_complete") == "1"
-        backfill_started = state_rows.get("backfill_started_at") is not None
-        last_sync_at_str = state_rows.get("last_sync_at")
-        last_sync_at: int | None = int(last_sync_at_str) if last_sync_at_str else None
-
-        if backfill_complete:
-            scan_status = "complete"
-        elif backfill_started:
-            scan_status = "in_progress"
-        else:
-            scan_status = "never_run"
-
-        reactions_by_msg: dict[tuple[int, int], list[dict]] = {}
-        if rows:
-            rx_params: list[int] = []
-            for r in rows:
-                rx_params.extend([r[0], r[1]])
-            rx_placeholders = ",".join("(?,?)" for _ in rows)
-            for rx in self._conn.execute(
-                f"SELECT dialog_id, message_id, emoji, count FROM message_reactions "
-                f"WHERE (dialog_id, message_id) IN (VALUES {rx_placeholders}) "
-                f"ORDER BY count DESC",
-                rx_params,
-            ).fetchall():
-                reactions_by_msg.setdefault((rx[0], rx[1]), []).append({"emoji": rx[2], "count": rx[3]})
-
-        comments = [
-            {
-                "dialog_id": r[0],
-                "message_id": r[1],
-                "sent_at": r[2],
-                "text": r[3],
-                "dialog_name": r[4] or str(r[0]),
-                "dialog_type": r[5],
-                "dialog_category": r[8],
-                "reply_count": r[6],
-                "sync_status": r[7],
-                "reactions": reactions_by_msg.get((r[0], r[1]), []),
-            }
-            for r in rows
-        ]
-
-        return {
-            "ok": True,
-            "data": {
-                "comments": comments,
-                "dialog_kinds": dialog_kinds,
-                "scan_status": scan_status,
-                "scanned_at": last_sync_at,
-            },
-        }
+        return await self._get_activity_stats_service().get_my_recent_activity(req)
 
     # ------------------------------------------------------------------
     # upsert_entities
