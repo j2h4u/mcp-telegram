@@ -25,6 +25,7 @@ import logging
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import NotRequired, TypedDict, Unpack
 
 from .daemon_ipc import get_daemon_socket_path
 
@@ -35,6 +36,44 @@ DEFAULT_DAEMON_TIMEOUT_SECONDS = 30.0
 # server.py sets a fresh list before running the tool; request() appends to it.
 # This enables cross-process log correlation without passing rid through tool signatures.
 _request_ids: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar("_request_ids", default=None)
+
+
+class _ListMessagesKwargs(TypedDict, total=False):
+    dialog_id: int
+    dialog: str | None
+    limit: int
+    navigation: str | None
+    direction: str | None
+    sender_id: int | None
+    sender_name: str | None
+    topic_id: int | None
+    unread_after_id: int | None
+    unread: bool | None
+    context_message_id: int | None
+    context_size: int | None
+
+
+class _SearchMessagesKwargs(TypedDict):
+    query: str
+    dialog_id: NotRequired[int]
+    dialog: NotRequired[str | None]
+    limit: NotRequired[int]
+    offset: NotRequired[int]
+
+
+class _TraceAccountMessagesKwargs(TypedDict, total=False):
+    account: str | None
+    exact_account_id: int | None
+    group_by: str
+    dialog: str | None
+    exact_dialog_id: int | None
+    exact_topic_id: int | None
+    sent_after: str | None
+    sent_before: str | None
+    limit: int
+    navigation: str | None
+    coverage_goal: str
+
 
 __all__ = [
     "DaemonConnection",
@@ -136,22 +175,7 @@ class DaemonConnection:
     # Convenience wrappers for the daemon API methods
     # ------------------------------------------------------------------
 
-    async def list_messages(
-        self,
-        *,
-        dialog_id: int = 0,
-        dialog: str | None = None,
-        limit: int = 50,
-        navigation: str | None = None,
-        direction: str | None = None,
-        sender_id: int | None = None,
-        sender_name: str | None = None,
-        topic_id: int | None = None,
-        unread_after_id: int | None = None,
-        unread: bool | None = None,
-        context_message_id: int | None = None,
-        context_size: int | None = None,
-    ) -> dict:
+    async def list_messages(self, **kwargs: Unpack[_ListMessagesKwargs]) -> dict:
         """Send list_messages request to the daemon.
 
         Args:
@@ -170,87 +194,65 @@ class DaemonConnection:
         """
         payload: dict = {
             "method": "list_messages",
-            "dialog_id": dialog_id,
-            "dialog": dialog,
-            "limit": limit,
-            "navigation": navigation,
+            "dialog_id": kwargs.get("dialog_id", 0),
+            "dialog": kwargs.get("dialog"),
+            "limit": kwargs.get("limit", 50),
+            "navigation": kwargs.get("navigation"),
         }
-        if direction is not None:
+        if (direction := kwargs.get("direction")) is not None:
             payload["direction"] = direction
-        if sender_id is not None:
+        if (sender_id := kwargs.get("sender_id")) is not None:
             payload["sender_id"] = sender_id
-        if sender_name is not None:
+        if (sender_name := kwargs.get("sender_name")) is not None:
             payload["sender_name"] = sender_name
-        if topic_id is not None:
+        if (topic_id := kwargs.get("topic_id")) is not None:
             payload["topic_id"] = topic_id
-        if unread_after_id is not None:
+        if (unread_after_id := kwargs.get("unread_after_id")) is not None:
             payload["unread_after_id"] = unread_after_id
-        if unread is not None:
+        if (unread := kwargs.get("unread")) is not None:
             payload["unread"] = unread
-        if context_message_id is not None:
+        if (context_message_id := kwargs.get("context_message_id")) is not None:
             payload["context_message_id"] = context_message_id
-        if context_size is not None:
+        if (context_size := kwargs.get("context_size")) is not None:
             payload["context_size"] = context_size
         return await self.request(payload)
 
-    async def search_messages(
-        self,
-        *,
-        dialog_id: int = 0,
-        dialog: str | None = None,
-        query: str,
-        limit: int = 20,
-        offset: int = 0,
-    ) -> dict:
+    async def search_messages(self, **kwargs: Unpack[_SearchMessagesKwargs]) -> dict:
         """Send search_messages request. Accepts dialog name or numeric id."""
         return await self.request(
             {
                 "method": "search_messages",
-                "dialog_id": dialog_id,
-                "dialog": dialog,
-                "query": query,
-                "limit": limit,
-                "offset": offset,
+                "dialog_id": kwargs.get("dialog_id", 0),
+                "dialog": kwargs.get("dialog"),
+                "query": kwargs["query"],
+                "limit": kwargs.get("limit", 20),
+                "offset": kwargs.get("offset", 0),
             }
         )
 
-    async def trace_account_messages(
-        self,
-        *,
-        account: str | None = None,
-        exact_account_id: int | None = None,
-        group_by: str = "timeline",
-        dialog: str | None = None,
-        exact_dialog_id: int | None = None,
-        exact_topic_id: int | None = None,
-        sent_after: str | None = None,
-        sent_before: str | None = None,
-        limit: int = 50,
-        navigation: str | None = None,
-        coverage_goal: str = "observed",
-    ) -> dict:
+    async def trace_account_messages(self, **kwargs: Unpack[_TraceAccountMessagesKwargs]) -> dict:
         """Send trace_account_messages request to the daemon."""
         payload: dict = {
             "method": "trace_account_messages",
-            "group_by": group_by,
-            "limit": limit,
-            "coverage_goal": coverage_goal,
+            "group_by": kwargs.get("group_by", "timeline"),
+            "limit": kwargs.get("limit", 50),
+            "coverage_goal": kwargs.get("coverage_goal", "observed"),
         }
-        if account is not None:
+        if (account := kwargs.get("account")) is not None:
             payload["account"] = account
-        if exact_account_id is not None:
+        if (exact_account_id := kwargs.get("exact_account_id")) is not None:
             payload["exact_account_id"] = exact_account_id
-        if dialog is not None:
+        if (dialog := kwargs.get("dialog")) is not None:
             payload["dialog"] = dialog
-        if exact_dialog_id is not None:
+        if (exact_dialog_id := kwargs.get("exact_dialog_id")) is not None:
             payload["exact_dialog_id"] = exact_dialog_id
-        if exact_topic_id is not None:
+        if (exact_topic_id := kwargs.get("exact_topic_id")) is not None:
             payload["exact_topic_id"] = exact_topic_id
-        if sent_after is not None:
+        if (sent_after := kwargs.get("sent_after")) is not None:
             payload["sent_after"] = sent_after
-        if sent_before is not None:
+        if (sent_before := kwargs.get("sent_before")) is not None:
             payload["sent_before"] = sent_before
-        if navigation is not None:
+        if (navigation := kwargs.get("navigation")) is not None:
             payload["navigation"] = navigation
         return await self.request(payload)
 

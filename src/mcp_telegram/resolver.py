@@ -57,6 +57,13 @@ class NotFound:
 ResolveResult = Resolved | ResolvedWithMessage | Candidates | NotFound
 
 
+@dataclass(frozen=True)
+class _BuildMatchesOptions:
+    exact_first_id: int | None = None
+    collision_query: str | None = None
+    collision_count: int | None = None
+
+
 def _parse_numeric_query(query: str) -> int | None:
     normalized = query.strip()
     if not normalized:
@@ -151,7 +158,12 @@ def _fuzzy_resolve(
             break
 
     if is_single_word and len(hits) >= _MIN_HIT_COLLISION_COUNT:
-        matches = _build_matches(hits, norm_map, entity_cache, exact_first_id=exact_entity_id)
+        matches = _build_matches(
+            hits,
+            norm_map,
+            entity_cache,
+            options=_BuildMatchesOptions(exact_first_id=exact_entity_id),
+        )
         return Candidates(query=query, matches=matches)
 
     if exact_entity_id is not None:
@@ -170,9 +182,11 @@ def _fuzzy_resolve(
                 hits,
                 norm_map,
                 entity_cache,
-                exact_first_id=exact_entity_id,
-                collision_query=query,
-                collision_count=len(exact_entries),
+                options=_BuildMatchesOptions(
+                    exact_first_id=exact_entity_id,
+                    collision_query=query,
+                    collision_count=len(exact_entries),
+                ),
             )
             return Candidates(query=query, matches=matches)
         return Resolved(entity_id=exact_entity_id, display_name=exact_display_name)
@@ -186,9 +200,7 @@ def _build_matches(
     norm_map: dict[str, list[tuple[int, str]]],
     entity_cache: Any | None,
     *,
-    exact_first_id: int | None = None,
-    collision_query: str | None = None,
-    collision_count: int | None = None,
+    options: _BuildMatchesOptions | None = None,
 ) -> list[dict]:
     """Build match dicts from rapidfuzz hits, optionally putting exact_first_id first.
 
@@ -200,14 +212,31 @@ def _build_matches(
     """
     matches: list[dict] = []
     seen_ids: set[int] = set()
+    effective_options = options or _BuildMatchesOptions()
 
-    if exact_first_id is not None:
+    if effective_options.exact_first_id is not None:
         for norm_name, score, _idx in hits:
             for entity_id, original_name in norm_map.get(norm_name, []):
-                if entity_id == exact_first_id and entity_id not in seen_ids:
+                if entity_id == effective_options.exact_first_id and entity_id not in seen_ids:
                     seen_ids.add(entity_id)
                     matches.append(_make_match_info(entity_id, original_name, int(score), entity_cache))
 
+    _append_remaining_matches(matches, seen_ids, hits, norm_map, entity_cache)
+    _apply_disambiguation_hint(
+        matches,
+        collision_query=effective_options.collision_query,
+        collision_count=effective_options.collision_count,
+    )
+    return matches
+
+
+def _append_remaining_matches(
+    matches: list[dict],
+    seen_ids: set[int],
+    hits: list[tuple[str, float, int]],
+    norm_map: dict[str, list[tuple[int, str]]],
+    entity_cache: Any | None,
+) -> None:
     for norm_name, score, _idx in hits:
         for entity_id, original_name in norm_map.get(norm_name, []):
             if entity_id in seen_ids:
@@ -215,18 +244,24 @@ def _build_matches(
             seen_ids.add(entity_id)
             matches.append(_make_match_info(entity_id, original_name, int(score), entity_cache))
 
-    if collision_query is not None:
-        n = collision_count if collision_count is not None else len(matches)
-        scope = matches[:n] if collision_count is not None else matches
-        types = sorted({m["entity_type"] or "Unknown" for m in scope})
-        hint = f'{n} entities match "{collision_query}": {", ".join(types)}. Specify @username or numeric id.'
-        for m in matches:
-            m["disambiguation_hint"] = hint
-    else:
-        for m in matches:
-            m["disambiguation_hint"] = None
 
-    return matches
+def _apply_disambiguation_hint(
+    matches: list[dict],
+    *,
+    collision_query: str | None,
+    collision_count: int | None,
+) -> None:
+    if collision_query is None:
+        for match in matches:
+            match["disambiguation_hint"] = None
+        return
+
+    n = collision_count if collision_count is not None else len(matches)
+    scope = matches[:n] if collision_count is not None else matches
+    types = sorted({match["entity_type"] or "Unknown" for match in scope})
+    hint = f'{n} entities match "{collision_query}": {", ".join(types)}. Specify @username or numeric id.'
+    for match in matches:
+        match["disambiguation_hint"] = hint
 
 
 def _make_match_info(entity_id: int, display_name: str, score: int, entity_cache: Any | None) -> dict:
