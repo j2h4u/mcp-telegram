@@ -41,23 +41,24 @@ class DialogType(StrEnum):
         This is the SINGLE place allowed to read Telethon's class/flags. Branch order
         matters: forum implies megagroup, so it must be checked first.
         """
-        if entity is None:
-            return cls.UNKNOWN
-        # Lazy import keeps models.py import-light; matches the codebase's pattern.
-        from telethon.tl.types import Channel, Chat  # type: ignore[import-untyped]
+        kind = cls.UNKNOWN
+        if entity is not None:
+            # Lazy import keeps models.py import-light; matches the codebase's pattern.
+            from telethon.tl.types import Channel, Chat  # type: ignore[import-untyped]
 
-        if isinstance(entity, Channel):
-            if getattr(entity, "forum", False):
-                return cls.FORUM
-            if getattr(entity, "megagroup", False):
-                return cls.SUPERGROUP
-            return cls.CHANNEL
-        if isinstance(entity, Chat):
-            return cls.GROUP
-        # Duck-typed user detection (avoids importing User); bots are Users with bot=True.
-        if hasattr(entity, "first_name"):
-            return cls.BOT if getattr(entity, "bot", False) else cls.USER
-        return cls.UNKNOWN
+            if isinstance(entity, Channel):
+                if getattr(entity, "forum", False):
+                    kind = cls.FORUM
+                elif getattr(entity, "megagroup", False):
+                    kind = cls.SUPERGROUP
+                else:
+                    kind = cls.CHANNEL
+            elif isinstance(entity, Chat):
+                kind = cls.GROUP
+            # Duck-typed user detection (avoids importing User); bots are Users with bot=True.
+            elif hasattr(entity, "first_name"):
+                kind = cls.BOT if getattr(entity, "bot", False) else cls.USER
+        return kind
 
     @classmethod
     def parse(cls, raw: str | DialogType | None) -> DialogType:

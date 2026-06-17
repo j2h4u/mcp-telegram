@@ -1,7 +1,5 @@
 """GetMyRecentActivity MCP tool — Phase 999.1."""
 
-from __future__ import annotations
-
 from typing import Any
 
 from mcp.types import ToolAnnotations
@@ -148,35 +146,41 @@ class GetMyRecentActivity(ToolArgs):
     @field_validator("dialog_kinds", mode="before")
     @classmethod
     def _normalize_dialog_kinds(cls, value: object) -> list[str]:
-        if value is None:
-            return list(DEFAULT_ACTIVITY_DIALOG_KINDS)
-        if isinstance(value, str):
-            raw_values: list[object] = [value]
-        elif isinstance(value, list | tuple | set):
-            raw_values = list(value)
-        else:
-            raise ValueError("dialog_kinds must be a list of strings")
-
+        raw_values = _coerce_dialog_kind_values(value)
         normalized_values: list[str] = []
         for raw in raw_values:
-            if not isinstance(raw, str):
-                raise ValueError("dialog_kinds entries must be strings")
-            normalized = raw.strip().lower()
-            if not normalized:
-                continue
-            expanded = _ACTIVITY_DIALOG_KIND_ALIASES.get(normalized, (normalized,))
-            for kind in expanded:
-                if kind not in _ALLOWED_ACTIVITY_DIALOG_KINDS:
-                    allowed = ", ".join(sorted(_ALLOWED_ACTIVITY_DIALOG_KINDS))
-                    raise ValueError(f"dialog_kinds entries must be one of: {allowed}")
-                if kind not in normalized_values:
-                    normalized_values.append(kind)
+            _append_normalized_dialog_kinds(raw, normalized_values)
 
         if "all" in normalized_values:
             return ["all"]
         if not normalized_values:
             raise ValueError("dialog_kinds must include at least one kind")
         return normalized_values
+
+
+def _coerce_dialog_kind_values(value: object) -> list[object]:
+    if value is None:
+        return list(DEFAULT_ACTIVITY_DIALOG_KINDS)
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list | tuple | set):
+        return list(value)
+    raise ValueError("dialog_kinds must be a list of strings")
+
+
+def _append_normalized_dialog_kinds(raw: object, normalized_values: list[str]) -> None:
+    if not isinstance(raw, str):
+        raise ValueError("dialog_kinds entries must be strings")
+    normalized = raw.strip().lower()
+    if not normalized:
+        return
+
+    for kind in _ACTIVITY_DIALOG_KIND_ALIASES.get(normalized, (normalized,)):
+        if kind not in _ALLOWED_ACTIVITY_DIALOG_KINDS:
+            allowed = ", ".join(sorted(_ALLOWED_ACTIVITY_DIALOG_KINDS))
+            raise ValueError(f"dialog_kinds entries must be one of: {allowed}")
+        if kind not in normalized_values:
+            normalized_values.append(kind)
 
 
 def _structured_comment(comment: dict[str, Any]) -> dict[str, object]:

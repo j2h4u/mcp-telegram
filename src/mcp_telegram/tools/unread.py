@@ -21,7 +21,7 @@ from ._base import (
     mcp_tool,
     structured_result,
 )
-from .structured import TelegramContent, TelegramContentKind, structured_warning, telegram_content
+from .structured import StructuredWarning, TelegramContent, TelegramContentKind, structured_warning, telegram_content
 
 GET_INBOX_OUTPUT_SCHEMA = {
     "type": "object",
@@ -309,6 +309,71 @@ def _read_state_payload(read_state: ReadState | dict | None, dialog_type: str | 
     }
 
 
+def _bootstrap_pending_warnings(bootstrap_pending: int) -> list[StructuredWarning]:
+    if bootstrap_pending <= 0:
+        return []
+
+    warning_message = (
+        f"bootstrap_pending={bootstrap_pending} dialog(s) are still being seeded by the sync daemon. "
+        "Results may be incomplete until bootstrap completes."
+    )
+    return [
+        structured_warning(
+            "bootstrap_pending",
+            warning_message,
+            severity="warning",
+            action="Retry shortly once the sync daemon finishes read-state bootstrap.",
+        )
+    ]
+
+
+def _structured_inbox_group(group: dict) -> tuple[dict[str, object], dict[str, int] | None, int]:
+    message_rows = group.get("messages", [])
+    total_in_chat = int(group.get("total_in_chat", group.get("unread_count", 0)) or 0)
+    hidden_count = max(0, total_in_chat - len(message_rows))
+    read_state = group.get("read_state")
+    read_state_payload = read_state if isinstance(read_state, dict) else None
+    dialog = {
+        "dialog_id": group.get("dialog_id", 0),
+        "name": group.get("display_name", ""),
+        "category": group.get("category"),
+        "dialog_type": group.get("dialog_type"),
+        "unread_count": group.get("unread_count", 0),
+        "unread_mentions_count": group.get("unread_mentions_count", 0),
+        "total_in_chat": total_in_chat,
+        "is_channel": DialogType.parse(group.get("category")) == DialogType.CHANNEL,
+        "is_bot": DialogType.parse(group.get("category")) == DialogType.BOT,
+        "read_state": _read_state_payload(read_state_payload, group.get("dialog_type")),
+        "budget": {
+            "shown_count": len(message_rows),
+            "total_in_chat": total_in_chat,
+            "hidden_count": hidden_count,
+        },
+        "messages": _structured_messages(
+            message_rows,
+            read_state=read_state_payload,
+            dialog_type=group.get("dialog_type"),
+        ),
+    }
+    hidden_entry = (
+        {"dialog_id": int(group.get("dialog_id", 0) or 0), "hidden_count": hidden_count} if hidden_count else None
+    )
+    return dialog, hidden_entry, len(message_rows)
+
+
+def _structured_inbox_groups(groups: list[dict]) -> tuple[list[dict[str, object]], list[dict[str, int]], int]:
+    structured_dialogs: list[dict[str, object]] = []
+    hidden_count_by_dialog: list[dict[str, int]] = []
+    result_message_count = 0
+    for group in groups:
+        dialog, hidden_entry, message_count = _structured_inbox_group(group)
+        structured_dialogs.append(dialog)
+        result_message_count += message_count
+        if hidden_entry is not None:
+            hidden_count_by_dialog.append(hidden_entry)
+    return structured_dialogs, hidden_count_by_dialog, result_message_count
+
+
 def _structured_messages(
     rows: list[dict], *, read_state: dict | None, dialog_type: str | None
 ) -> list[dict[str, object]]:
@@ -382,63 +447,8 @@ async def get_inbox(args: GetInbox) -> ToolResult:
     # Defensive: older daemon responses or test mocks may omit bootstrap_pending.
     # Treat missing as 0 (full coverage assumed). Also guard against explicit None.
     bootstrap_pending = int(data.get("bootstrap_pending", 0) or 0)
-    warning_message = (
-        f"bootstrap_pending={bootstrap_pending} dialog(s) are still being seeded by the sync daemon. "
-        "Results may be incomplete until bootstrap completes."
-    )
-    warnings = (
-        [
-            structured_warning(
-                "bootstrap_pending",
-                warning_message,
-                severity="warning",
-                action="Retry shortly once the sync daemon finishes read-state bootstrap.",
-            )
-        ]
-        if bootstrap_pending > 0
-        else []
-    )
-    structured_dialogs: list[dict[str, object]] = []
-    hidden_count_by_dialog: list[dict[str, int]] = []
-    result_message_count = 0
-    for group in groups:
-        message_rows = group.get("messages", [])
-        category = group.get("category")
-        dialog_type = group.get("dialog_type")
-        read_state = group.get("read_state")
-        total_in_chat = int(group.get("total_in_chat", group.get("unread_count", 0)) or 0)
-        hidden_count = max(0, total_in_chat - len(message_rows))
-        result_message_count += len(message_rows)
-        if hidden_count:
-            hidden_count_by_dialog.append(
-                {"dialog_id": int(group.get("dialog_id", 0) or 0), "hidden_count": hidden_count}
-            )
-        read_state_payload = read_state if isinstance(read_state, dict) else None
-        messages = _structured_messages(
-            message_rows,
-            read_state=read_state_payload,
-            dialog_type=dialog_type,
-        )
-        structured_dialogs.append(
-            {
-                "dialog_id": group.get("dialog_id", 0),
-                "name": group.get("display_name", ""),
-                "category": category,
-                "dialog_type": dialog_type,
-                "unread_count": group.get("unread_count", 0),
-                "unread_mentions_count": group.get("unread_mentions_count", 0),
-                "total_in_chat": total_in_chat,
-                "is_channel": DialogType.parse(category) == DialogType.CHANNEL,
-                "is_bot": DialogType.parse(category) == DialogType.BOT,
-                "read_state": _read_state_payload(read_state_payload, dialog_type),
-                "budget": {
-                    "shown_count": len(message_rows),
-                    "total_in_chat": total_in_chat,
-                    "hidden_count": hidden_count,
-                },
-                "messages": messages,
-            }
-        )
+    warnings = _bootstrap_pending_warnings(bootstrap_pending)
+    structured_dialogs, hidden_count_by_dialog, result_message_count = _structured_inbox_groups(groups)
     structured_content = {
         "scope": args.scope,
         "limit": args.limit,
