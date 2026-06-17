@@ -1,6 +1,7 @@
 import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from typing import TypedDict, Unpack
 from zoneinfo import ZoneInfo
 
 import telethon.tl.types as tl  # type: ignore[import-untyped]
@@ -24,6 +25,45 @@ DAYS_PER_WEEK = 7
 SELF_SENDER_LABEL = "[me]"
 TELEGRAM_CONTENT_OPEN = "[Telegram content]"
 TELEGRAM_CONTENT_CLOSE = "[/Telegram content]"
+
+
+class _FormatMessagesKwargs(TypedDict, total=False):
+    tz: ZoneInfo | None
+    topic_name_getter: TopicNameGetter | None
+    line_prefix_getter: LinePrefixGetter | None
+    read_state: ReadState | dict | None
+    dialog_type: str | None
+    now_unix: int
+    suppress_header: bool
+
+
+@dataclass(slots=True)
+class _MessageFormatOptions:
+    tz: ZoneInfo
+    topic_name_getter: TopicNameGetter | None
+    line_prefix_getter: LinePrefixGetter | None
+    read_state: ReadState | dict | None
+    dialog_type: str | None
+    now_unix: int
+    suppress_header: bool
+
+
+@dataclass(slots=True)
+class _ReadStateSide:
+    side_label: str
+    direction_word: str
+    read_word: str
+    state: str | None
+    count: int
+    oldest: int | None
+
+
+@dataclass(slots=True)
+class _MessageRenderContext:
+    effective_tz: ZoneInfo
+    reply_map: dict[int, ReadMessage]
+    topic_name_getter: TopicNameGetter | None
+    line_prefix_getter: LinePrefixGetter | None
 
 
 def frame_telegram_content(text: str) -> str:
@@ -103,46 +143,49 @@ def _render_read_state_header(
         return ["[read-state: all caught up]"]
 
     effective_tz = tz if tz is not None else ZoneInfo("UTC")
-
-    def _side(
-        *,
-        side_label: str,  # "inbox" or "outbox"
-        direction_word: str,  # "from peer" or "by peer"
-        read_word: str,  # "all read" or "all read by peer"
-        state: str | None,
-        count: int,
-        oldest: int | None,
-    ) -> str:
-        if state == "null":
-            return f"[{side_label}: unknown (sync pending)]"
-        if count == 0:
-            return f"[{side_label}: {read_word}]"
-        # populated with count > 0
-        if oldest is None:
-            # Defensive: no timestamp but count > 0 — render without Δ
-            return f"[{side_label}: {count} unread {direction_word}]"
-        dt_local = datetime.fromtimestamp(int(oldest), tz=UTC).astimezone(effective_tz)
-        hh_mm = dt_local.strftime("%H:%M")
-        delta = _format_relative_delta(now_unix, oldest)
-        return f"[{side_label}: {count} unread {direction_word}, oldest {hh_mm} ({delta} ago)]"
-
-    inbox_line = _side(
-        side_label="inbox",
-        direction_word="from peer",
-        read_word="all read",
-        state=inbox_state,
-        count=inbox_count,
-        oldest=read_state.get("inbox_oldest_unread_date"),
+    inbox_line = _render_read_state_side(
+        _ReadStateSide(
+            side_label="inbox",
+            direction_word="from peer",
+            read_word="all read",
+            state=inbox_state,
+            count=inbox_count,
+            oldest=read_state.get("inbox_oldest_unread_date"),
+        ),
+        now_unix=now_unix,
+        effective_tz=effective_tz,
     )
-    outbox_line = _side(
-        side_label="outbox",
-        direction_word="by peer",
-        read_word="all read by peer",
-        state=outbox_state,
-        count=outbox_count,
-        oldest=read_state.get("outbox_oldest_unread_date"),
+    outbox_line = _render_read_state_side(
+        _ReadStateSide(
+            side_label="outbox",
+            direction_word="by peer",
+            read_word="all read by peer",
+            state=outbox_state,
+            count=outbox_count,
+            oldest=read_state.get("outbox_oldest_unread_date"),
+        ),
+        now_unix=now_unix,
+        effective_tz=effective_tz,
     )
     return [inbox_line, outbox_line]
+
+
+def _render_read_state_side(
+    side: _ReadStateSide,
+    *,
+    now_unix: int,
+    effective_tz: ZoneInfo,
+) -> str:
+    if side.state == "null":
+        return f"[{side.side_label}: unknown (sync pending)]"
+    if side.count == 0:
+        return f"[{side.side_label}: {side.read_word}]"
+    if side.oldest is None:
+        return f"[{side.side_label}: {side.count} unread {side.direction_word}]"
+    dt_local = datetime.fromtimestamp(int(side.oldest), tz=UTC).astimezone(effective_tz)
+    hh_mm = dt_local.strftime("%H:%M")
+    delta = _format_relative_delta(now_unix, side.oldest)
+    return f"[{side.side_label}: {side.count} unread {side.direction_word}, oldest {hh_mm} ({delta} ago)]"
 
 
 def _compute_inline_markers(
@@ -206,17 +249,86 @@ def _compute_inline_markers(
     return markers
 
 
+def _resolve_message_format_options(kwargs: _FormatMessagesKwargs) -> _MessageFormatOptions:
+    tz = kwargs.get("tz")
+    now_unix = kwargs.get("now_unix")
+    return _MessageFormatOptions(
+        tz=tz if tz is not None else ZoneInfo("UTC"),
+        topic_name_getter=kwargs.get("topic_name_getter"),
+        line_prefix_getter=kwargs.get("line_prefix_getter"),
+        read_state=kwargs.get("read_state"),
+        dialog_type=kwargs.get("dialog_type"),
+        now_unix=now_unix if now_unix is not None else int(datetime.now(tz=UTC).timestamp()),
+        suppress_header=bool(kwargs.get("suppress_header", False)),
+    )
+
+
+def _format_message_body(msg: ReadMessage, effective_tz: ZoneInfo) -> str:
+    text = frame_telegram_content(msg.text) if msg.text else _render_text(msg)
+    if msg.edit_date is not None:
+        ed_dt = datetime.fromtimestamp(msg.edit_date, tz=UTC).astimezone(effective_tz)
+        text = f"{text} [edited {ed_dt.strftime('%H:%M')}]"
+    reactions_str = _format_reactions(msg)
+    if reactions_str:
+        text = f"{text} {reactions_str}" if text else reactions_str
+    return text
+
+
+def _format_message_prefix(
+    msg: ReadMessage,
+    *,
+    sender_name: str,
+    context: _MessageRenderContext,
+) -> str:
+    author_prefix = f"[by {msg.post_author}] " if msg.post_author else ""
+    fwd_prefix = f"[↪ fwd: {msg.fwd_from_name}] " if msg.fwd_from_name else ""
+    reply_prefix = ""
+    if msg.reply_to_msg_id and msg.reply_to_msg_id in context.reply_map:
+        orig = context.reply_map[msg.reply_to_msg_id]
+        orig_sender = _resolve_sender_name(orig)
+        orig_dt = orig.date.astimezone(context.effective_tz)
+        reply_prefix = f"[↑ {orig_sender} {orig_dt.strftime('%H:%M')}] "
+
+    topic_prefix = ""
+    if context.topic_name_getter is not None:
+        topic_name = context.topic_name_getter(msg)
+        if topic_name:
+            topic_prefix = f"[topic: {topic_name}] "
+
+    line_prefix = ""
+    if context.line_prefix_getter is not None:
+        resolved_prefix = context.line_prefix_getter(msg)
+        if resolved_prefix:
+            line_prefix = f"{resolved_prefix} "
+
+    return (
+        f"{line_prefix}{topic_prefix}{msg.date.astimezone(context.effective_tz).strftime('%H:%M')} "
+        f"{sender_name}: {author_prefix}{fwd_prefix}{reply_prefix}"
+    )
+
+
+def _format_message_line(
+    msg: ReadMessage,
+    context: _MessageRenderContext,
+    inline_marker: str | None,
+) -> str:
+    sender_name = _resolve_sender_name(msg)
+    message_prefix = _format_message_prefix(
+        msg,
+        sender_name=sender_name,
+        context=context,
+    )
+    text = _format_message_body(msg, context.effective_tz)
+    line = f"{message_prefix.rstrip()}\n{text}" if msg.text else f"{message_prefix}{text}"
+    if inline_marker:
+        line = f"{line} {inline_marker}"
+    return line
+
+
 def format_messages(
     messages: list[ReadMessage],
     reply_map: dict[int, ReadMessage],
-    tz: ZoneInfo | None = None,
-    topic_name_getter: TopicNameGetter | None = None,
-    line_prefix_getter: LinePrefixGetter | None = None,
-    *,
-    read_state: ReadState | dict | None = None,
-    dialog_type: str | None = None,
-    now_unix: int | None = None,
-    suppress_header: bool = False,
+    **kwargs: Unpack[_FormatMessagesKwargs],
 ) -> str:
     """Format a list of ReadMessage objects into human-readable text.
 
@@ -230,26 +342,35 @@ def format_messages(
     if not messages:
         return ""
 
-    effective_tz = tz if tz is not None else ZoneInfo("UTC")
+    options = _resolve_message_format_options(kwargs)
 
     # Phase 39.3: header + inline markers (only emit on DMs; AC-7).
     # WR-02: ``suppress_header`` lets callers (e.g. format_unread_messages_grouped)
     # emit the header themselves and reuse format_messages purely for the body,
     # avoiding fragile post-hoc header-dedup by string comparison.
-    resolved_now = now_unix if now_unix is not None else int(datetime.now(tz=UTC).timestamp())
     header_lines = (
-        [] if suppress_header else _render_read_state_header(read_state, dialog_type, resolved_now, effective_tz)
+        []
+        if options.suppress_header
+        else _render_read_state_header(options.read_state, options.dialog_type, options.now_unix, options.tz)
+    )
+    render_context = _MessageRenderContext(
+        effective_tz=options.tz,
+        reply_map=reply_map,
+        topic_name_getter=options.topic_name_getter,
+        line_prefix_getter=options.line_prefix_getter,
     )
     inline_markers = (
-        _compute_inline_markers(messages, read_state) if DialogType.parse(dialog_type) == DialogType.USER else {}
+        _compute_inline_markers(messages, options.read_state)
+        if DialogType.parse(options.dialog_type) == DialogType.USER
+        else {}
     )
 
     lines: list[str] = list(header_lines)
     prev_date_str: str | None = None
-    prev_dt = None
+    prev_dt: datetime | None = None
 
     for msg in reversed(messages):
-        dt = msg.date.astimezone(effective_tz)
+        dt = msg.date.astimezone(options.tz)
         date_str = dt.strftime("%Y-%m-%d")
 
         if date_str != prev_date_str:
@@ -262,50 +383,14 @@ def format_messages(
             if gap_minutes > SESSION_BREAK_MINUTES:
                 lines.append(f"--- {gap_minutes} мин ---")
 
-        sender_name = _resolve_sender_name(msg)
-        has_telegram_body = bool(msg.text)
-        text = _render_text(msg)
-        if msg.text:
-            text = frame_telegram_content(msg.text)
-        if msg.edit_date is not None:
-            ed_dt = datetime.fromtimestamp(msg.edit_date, tz=UTC).astimezone(effective_tz)
-            text = f"{text} [edited {ed_dt.strftime('%H:%M')}]"
-        reactions_str = _format_reactions(msg)
-        if reactions_str:
-            text = f"{text} {reactions_str}" if text else reactions_str
-
-        author_prefix = ""
-        if msg.post_author:
-            author_prefix = f"[by {msg.post_author}] "
-
-        fwd_prefix = ""
-        if msg.fwd_from_name:
-            fwd_prefix = f"[↪ fwd: {msg.fwd_from_name}] "
-
-        reply_prefix = ""
-        if msg.reply_to_msg_id and msg.reply_to_msg_id in reply_map:
-            orig = reply_map[msg.reply_to_msg_id]
-            orig_sender = _resolve_sender_name(orig)
-            orig_dt = orig.date.astimezone(effective_tz)
-            reply_prefix = f"[↑ {orig_sender} {orig_dt.strftime('%H:%M')}] "
-
-        topic_prefix = ""
-        if topic_name_getter is not None:
-            topic_name = topic_name_getter(msg)
-            if topic_name:
-                topic_prefix = f"[topic: {topic_name}] "
-
-        line_prefix = ""
-        if line_prefix_getter is not None:
-            resolved_prefix = line_prefix_getter(msg)
-            if resolved_prefix:
-                line_prefix = f"{resolved_prefix} "
-
-        message_prefix = f"{line_prefix}{topic_prefix}{dt.strftime('%H:%M')} {sender_name}: {author_prefix}{fwd_prefix}{reply_prefix}"
-        line = f"{message_prefix.rstrip()}\n{text}" if has_telegram_body else f"{message_prefix}{text}"
-        if inline_markers and msg.id in inline_markers:
-            line = f"{line} {inline_markers[msg.id]}"
-        lines.append(line)
+        inline_marker = inline_markers.get(msg.id)
+        lines.append(
+            _format_message_line(
+                msg,
+                render_context,
+                inline_marker=inline_marker,
+            )
+        )
 
         prev_dt = dt
 
@@ -465,6 +550,93 @@ def _safe_attr_chain(obj: object, *attrs: str) -> object | None:
     return obj
 
 
+def _describe_poll(media: object) -> str:
+    question = _safe_attr_chain(media, "poll", "question")
+    if question is None:
+        return "[опрос]"
+    q_text = getattr(question, "text", None) or str(question)
+    return f"[опрос: «{q_text}»]" if q_text else "[опрос]"
+
+
+def _describe_geo(media: object) -> str:
+    lat = _safe_attr_chain(media, "geo", "lat")
+    lon = _safe_attr_chain(media, "geo", "long")
+    if lat is not None and lon is not None:
+        return f"[геолокация: {lat:.4f}, {lon:.4f}]"
+    return "[геолокация]"
+
+
+def _describe_venue(media: object) -> str:
+    title = getattr(media, "title", None)
+    address = getattr(media, "address", None)
+    info = ", ".join(filter(None, [title, address]))
+    return f"[место: {info}]" if info else "[место]"
+
+
+def _describe_contact(media: object) -> str:
+    first = getattr(media, "first_name", "") or ""
+    last = getattr(media, "last_name", "") or ""
+    name = " ".join(filter(None, [first, last]))
+    phone = getattr(media, "phone_number", "") or ""
+    info = ", ".join(filter(None, [name, phone]))
+    return f"[контакт: {info}]" if info else "[контакт]"
+
+
+def _describe_dice(media: object) -> str:
+    emoticon = getattr(media, "emoticon", "🎲") or "🎲"
+    value = getattr(media, "value", None)
+    return f"[{emoticon} {value}]" if value is not None else f"[{emoticon}]"
+
+
+def _describe_game(media: object) -> str:
+    title = _safe_attr_chain(media, "game", "title")
+    return f"[игра: {title}]" if title else "[игра]"
+
+
+def _describe_invoice(media: object) -> str:
+    title = getattr(media, "title", None)
+    return f"[счёт: {title}]" if title else "[счёт]"
+
+
+def _describe_web_page(media: object) -> str:
+    url = _safe_attr_chain(media, "webpage", "url")
+    return f"[ссылка: {url}]" if url else "[ссылка]"
+
+
+def _describe_document_sticker(attr: object) -> str:
+    alt = getattr(attr, "alt", "") or ""
+    return f"[стикер: {alt}]" if alt else "[стикер]"
+
+
+def _describe_document_round_video(attr: object) -> str:
+    dur = getattr(attr, "duration", 0) or 0
+    m, s = divmod(int(dur), 60)
+    return f"[кружок: {m}:{s:02d}]"
+
+
+def _describe_document_audio(attr: object) -> str:
+    dur = getattr(attr, "duration", 0) or 0
+    m, s = divmod(int(dur), 60)
+    if getattr(attr, "voice", False):
+        return f"[голосовое: {m}:{s:02d}]"
+    title = getattr(attr, "title", None)
+    performer = getattr(attr, "performer", None)
+    info = " — ".join(filter(None, [performer, title]))
+    return f"[аудио: {info}, {m}:{s:02d}]" if info else f"[аудио: {m}:{s:02d}]"
+
+
+def _describe_document_video(attr: object) -> str:
+    dur = getattr(attr, "duration", 0) or 0
+    m, s = divmod(int(dur), 60)
+    return f"[видео: {m}:{s:02d}]"
+
+
+def _describe_document_filename(doc: object, attr: tl.DocumentAttributeFilename) -> str:
+    size = getattr(doc, "size", None)
+    size_str = f", {size // 1024}KB" if size else ""
+    return f"[документ: {attr.file_name}{size_str}]"
+
+
 def _describe_media(media: object) -> str:
     """Return a human-readable placeholder for a media attachment.
 
@@ -474,63 +646,26 @@ def _describe_media(media: object) -> str:
     if isinstance(media, tl.MessageMediaEmpty):
         return ""
 
-    if isinstance(media, tl.MessageMediaPhoto):
-        return "[фото]"
-
     if isinstance(media, tl.MessageMediaDocument):
         return _describe_document(media)
 
-    if isinstance(media, tl.MessageMediaPoll):
-        question = _safe_attr_chain(media, "poll", "question")
-        q_text = getattr(question, "text", None) or str(question) if question is not None else None
-        return f"[опрос: «{q_text}»]" if q_text else "[опрос]"
-
-    if isinstance(media, tl.MessageMediaGeoLive):
-        return "[геолокация live]"
-
-    if isinstance(media, tl.MessageMediaGeo):
-        lat = _safe_attr_chain(media, "geo", "lat")
-        lon = _safe_attr_chain(media, "geo", "long")
-        if lat is not None and lon is not None:
-            return f"[геолокация: {lat:.4f}, {lon:.4f}]"
-        return "[геолокация]"
-
-    if isinstance(media, tl.MessageMediaVenue):
-        title = getattr(media, "title", None)
-        address = getattr(media, "address", None)
-        info = ", ".join(filter(None, [title, address]))
-        return f"[место: {info}]" if info else "[место]"
-
-    if isinstance(media, tl.MessageMediaContact):
-        first = getattr(media, "first_name", "") or ""
-        last = getattr(media, "last_name", "") or ""
-        name = " ".join(filter(None, [first, last]))
-        phone = getattr(media, "phone_number", "") or ""
-        info = ", ".join(filter(None, [name, phone]))
-        return f"[контакт: {info}]" if info else "[контакт]"
-
-    if isinstance(media, tl.MessageMediaDice):
-        emoticon = getattr(media, "emoticon", "🎲") or "🎲"
-        value = getattr(media, "value", None)
-        return f"[{emoticon} {value}]" if value is not None else f"[{emoticon}]"
-
-    if isinstance(media, tl.MessageMediaGame):
-        title = _safe_attr_chain(media, "game", "title")
-        return f"[игра: {title}]" if title else "[игра]"
-
-    if isinstance(media, tl.MessageMediaStory):
-        return "[история]"
-
-    if isinstance(media, tl.MessageMediaInvoice):
-        title = getattr(media, "title", None)
-        return f"[счёт: {title}]" if title else "[счёт]"
-
-    if isinstance(media, tl.MessageMediaWebPage):
-        url = _safe_attr_chain(media, "webpage", "url")
-        return f"[ссылка: {url}]" if url else "[ссылка]"
-
-    if isinstance(media, tl.MessageMediaUnsupported):
-        return "[неподдерживаемый тип]"
+    handlers = (
+        (tl.MessageMediaPhoto, lambda _: "[фото]"),
+        (tl.MessageMediaPoll, _describe_poll),
+        (tl.MessageMediaGeoLive, lambda _: "[геолокация live]"),
+        (tl.MessageMediaGeo, _describe_geo),
+        (tl.MessageMediaVenue, _describe_venue),
+        (tl.MessageMediaContact, _describe_contact),
+        (tl.MessageMediaDice, _describe_dice),
+        (tl.MessageMediaGame, _describe_game),
+        (tl.MessageMediaStory, lambda _: "[история]"),
+        (tl.MessageMediaInvoice, _describe_invoice),
+        (tl.MessageMediaWebPage, _describe_web_page),
+        (tl.MessageMediaUnsupported, lambda _: "[неподдерживаемый тип]"),
+    )
+    for media_type, handler in handlers:
+        if isinstance(media, media_type):
+            return handler(media)
 
     return f"[медиа: {type(media).__name__}]"
 
@@ -545,53 +680,34 @@ def _describe_document(media: object) -> str:
     if doc is None:
         return "[документ]"
     attrs = getattr(doc, "attributes", []) or []
+    description = "[документ]"
+    sticker_attr = next((attr for attr in attrs if isinstance(attr, tl.DocumentAttributeSticker)), None)
+    round_video_attr = next(
+        (
+            attr
+            for attr in attrs
+            if isinstance(attr, tl.DocumentAttributeVideo) and getattr(attr, "round_message", False)
+        ),
+        None,
+    )
+    audio_attr = next((attr for attr in attrs if isinstance(attr, tl.DocumentAttributeAudio)), None)
+    video_attr = next((attr for attr in attrs if isinstance(attr, tl.DocumentAttributeVideo)), None)
+    filename_attr = next((attr for attr in attrs if isinstance(attr, tl.DocumentAttributeFilename)), None)
 
-    has_animated = False
-    video_attr = None
-    audio_attr = None
-    filename_attr = None
+    if sticker_attr is not None:
+        description = _describe_document_sticker(sticker_attr)
+    elif round_video_attr is not None:
+        description = _describe_document_round_video(round_video_attr)
+    elif any(isinstance(attr, tl.DocumentAttributeAnimated) for attr in attrs):
+        description = "[анимация]"
+    elif audio_attr is not None:
+        description = _describe_document_audio(audio_attr)
+    elif video_attr is not None:
+        description = _describe_document_video(video_attr)
+    elif filename_attr is not None:
+        description = _describe_document_filename(doc, filename_attr)
 
-    for attr in attrs:
-        if isinstance(attr, tl.DocumentAttributeSticker):
-            alt = getattr(attr, "alt", "") or ""
-            return f"[стикер: {alt}]" if alt else "[стикер]"
-        if isinstance(attr, tl.DocumentAttributeVideo):
-            if getattr(attr, "round_message", False):
-                dur = getattr(attr, "duration", 0) or 0
-                m, s = divmod(int(dur), 60)
-                return f"[кружок: {m}:{s:02d}]"
-            video_attr = attr
-        elif isinstance(attr, tl.DocumentAttributeAnimated):
-            has_animated = True
-        elif isinstance(attr, tl.DocumentAttributeAudio):
-            audio_attr = attr
-        elif isinstance(attr, tl.DocumentAttributeFilename):
-            filename_attr = attr
-
-    if has_animated:
-        return "[анимация]"
-
-    if audio_attr is not None:
-        dur = getattr(audio_attr, "duration", 0) or 0
-        m, s = divmod(int(dur), 60)
-        if getattr(audio_attr, "voice", False):
-            return f"[голосовое: {m}:{s:02d}]"
-        title = getattr(audio_attr, "title", None)
-        performer = getattr(audio_attr, "performer", None)
-        info = " — ".join(filter(None, [performer, title]))
-        return f"[аудио: {info}, {m}:{s:02d}]" if info else f"[аудио: {m}:{s:02d}]"
-
-    if video_attr is not None:
-        dur = getattr(video_attr, "duration", 0) or 0
-        m, s = divmod(int(dur), 60)
-        return f"[видео: {m}:{s:02d}]"
-
-    if filename_attr is not None:
-        size = getattr(doc, "size", None)
-        size_str = f", {size // 1024}KB" if size else ""
-        return f"[документ: {filename_attr.file_name}{size_str}]"
-
-    return "[документ]"
+    return description
 
 
 # ---------------------------------------------------------------------------
