@@ -15,13 +15,17 @@ All writes target the `topic_metadata` table (extended by Plan 01 v19 ALTER).
 No parallel `forum_topics` table is used.
 """
 
+# pyright: reportAny=false, reportArgumentType=false, reportOptionalSubscript=false, reportOperatorIssue=false, reportUndefinedVariable=false, reportMissingParameterType=false, reportReturnType=false, reportInvalidTypeForm=false, reportGeneralTypeIssues=false
+
 from __future__ import annotations
 
 import asyncio
 import sqlite3
+from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TypedDict, cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -34,8 +38,23 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
 )
 from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
-from mcp_telegram.event_handlers import EventHandlerManager
+from mcp_telegram.event_handlers import (
+    EventHandlerManager,
+    _ForumTopicPinnedUpdateLike,
+    _NewMessageEvent,
+)
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
+
+_SQLiteConnection = sqlite3.Connection
+
+
+class _TopicRow(TypedDict):
+    title: str
+    icon_emoji_id: int | None
+    pinned: int
+    hidden: int
+    snapshot_at: int
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -43,10 +62,10 @@ from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 
 
 @pytest.fixture()
-def sync_db(tmp_path: Path) -> sqlite3.Connection:
+def sync_db(tmp_path: Path) -> Iterator[_SQLiteConnection]:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
-    conn = _open_sync_db(db_path)
+    conn = cast(_SQLiteConnection, _open_sync_db(db_path))
     yield conn
     conn.close()
 
@@ -69,7 +88,7 @@ def shutdown_event() -> asyncio.Event:
 # ---------------------------------------------------------------------------
 
 
-def _enroll_synced(conn: sqlite3.Connection, dialog_id: int) -> None:
+def _enroll_synced(conn: _SQLiteConnection, dialog_id: int) -> None:
     conn.execute(
         "INSERT OR IGNORE INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')",
         (dialog_id,),
@@ -99,12 +118,12 @@ class _TopicEditEventOptions:
 
 
 def _insert_topic_metadata(
-    conn: sqlite3.Connection,
+    conn: _SQLiteConnection,
     dialog_id: int,
     topic_id: int,
     *,
     opts: _TopicMetadataOptions | None = None,
-    **kwargs,
+    **kwargs: object,
 ) -> None:
     if opts is None:
         opts = _TopicMetadataOptions()
@@ -131,27 +150,35 @@ def _insert_topic_metadata(
     conn.commit()
 
 
-def _topic_row(conn: sqlite3.Connection, dialog_id: int, topic_id: int) -> dict | None:
-    row = conn.execute(
-        "SELECT title, icon_emoji_id, pinned, hidden, snapshot_at FROM topic_metadata WHERE dialog_id=? AND topic_id=?",
-        (dialog_id, topic_id),
-    ).fetchone()
+def _topic_row(conn: _SQLiteConnection, dialog_id: int, topic_id: int) -> _TopicRow | None:
+    row = cast(
+        tuple[object, ...] | None,
+        conn.execute(
+            "SELECT title, icon_emoji_id, pinned, hidden, snapshot_at FROM topic_metadata WHERE dialog_id=? AND topic_id=?",
+            (dialog_id, topic_id),
+        ).fetchone(),
+    )
     if row is None:
         return None
-    return {
-        "title": row[0],
-        "icon_emoji_id": row[1],
-        "pinned": row[2],
-        "hidden": row[3],
-        "snapshot_at": row[4],
-    }
+    return cast(
+        _TopicRow,
+        {
+            "title": row[0],
+            "icon_emoji_id": row[1],
+            "pinned": row[2],
+            "hidden": row[3],
+            "snapshot_at": row[4],
+        },
+    )
 
 
-def _topic_count(conn: sqlite3.Connection) -> int:
-    return conn.execute("SELECT COUNT(*) FROM topic_metadata").fetchone()[0]
+def _topic_count(conn: _SQLiteConnection) -> int:
+    row = cast(tuple[object, ...] | None, conn.execute("SELECT COUNT(*) FROM topic_metadata").fetchone())
+    assert row is not None
+    return int(tuple(row)[0])
 
 
-def _make_manager(client: MagicMock, conn: sqlite3.Connection, ev: asyncio.Event) -> EventHandlerManager:
+def _make_manager(client: MagicMock, conn: _SQLiteConnection, ev: asyncio.Event) -> EventHandlerManager:
     m = EventHandlerManager(client, conn, ev)
     m.register()
     return m
@@ -185,7 +212,7 @@ def _make_topic_create_event(
     msg_id: int,
     title: str,
     icon_emoji_id: int | None = None,
-) -> MagicMock:
+) -> _NewMessageEvent:
     action = MessageActionTopicCreate(
         title=title,
         icon_color=0,
@@ -197,7 +224,7 @@ def _make_topic_create_event(
     event.chat_id = dialog_id
     event.is_private = False
     event.message = msg
-    return event
+    return cast(_NewMessageEvent, event)
 
 
 def _make_topic_edit_event(
@@ -207,7 +234,7 @@ def _make_topic_edit_event(
     *,
     opts: _TopicEditEventOptions | None = None,
     **kwargs,
-) -> MagicMock:
+) -> _NewMessageEvent:
     if opts is None:
         opts = _TopicEditEventOptions()
     if kwargs:
@@ -228,7 +255,7 @@ def _make_topic_edit_event(
     event.chat_id = dialog_id
     event.is_private = False
     event.message = msg
-    return event
+    return cast(_NewMessageEvent, event)
 
 
 # ---------------------------------------------------------------------------
@@ -237,7 +264,11 @@ def _make_topic_edit_event(
 
 
 @pytest.mark.asyncio
-async def test_topic_create_inserts_topic_metadata_row(mock_client, sync_db, shutdown_event):
+async def test_topic_create_inserts_topic_metadata_row(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
     """MessageActionTopicCreate in enrolled dialog inserts row with correct fields."""
     dialog_id = 12345
     _enroll_synced(sync_db, dialog_id)
@@ -258,7 +289,11 @@ async def test_topic_create_inserts_topic_metadata_row(mock_client, sync_db, shu
 
 
 @pytest.mark.asyncio
-async def test_topic_create_idempotent(mock_client, sync_db, shutdown_event):
+async def test_topic_create_idempotent(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
     """Replaying the same NewMessage create event twice produces only one row."""
     dialog_id = 12345
     _enroll_synced(sync_db, dialog_id)
@@ -277,7 +312,11 @@ async def test_topic_create_idempotent(mock_client, sync_db, shutdown_event):
 
 
 @pytest.mark.asyncio
-async def test_topic_create_skipped_for_unenrolled_dialog(mock_client, sync_db, shutdown_event):
+async def test_topic_create_skipped_for_unenrolled_dialog(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
     """NewMessage for unenrolled dialog does NOT produce a topic_metadata row."""
     dialog_id = 99999
     # Do NOT enroll
@@ -296,7 +335,11 @@ async def test_topic_create_skipped_for_unenrolled_dialog(mock_client, sync_db, 
 
 
 @pytest.mark.asyncio
-async def test_topic_edit_updates_title_and_icon(mock_client, sync_db, shutdown_event):
+async def test_topic_edit_updates_title_and_icon(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
     """MessageActionTopicEdit with title and icon_emoji_id updates both fields."""
     dialog_id = 12345
     _enroll_synced(sync_db, dialog_id)
@@ -327,7 +370,11 @@ async def test_topic_edit_updates_title_and_icon(mock_client, sync_db, shutdown_
 
 
 @pytest.mark.asyncio
-async def test_topic_edit_partial_preserves_existing_fields(mock_client, sync_db, shutdown_event):
+async def test_topic_edit_partial_preserves_existing_fields(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
     """Edit with title=None preserves existing title; icon_emoji_id updated."""
     dialog_id = 12345
     _enroll_synced(sync_db, dialog_id)
@@ -358,7 +405,11 @@ async def test_topic_edit_partial_preserves_existing_fields(mock_client, sync_db
 
 
 @pytest.mark.asyncio
-async def test_topic_edit_with_no_reply_to_is_noop(mock_client, sync_db, shutdown_event):
+async def test_topic_edit_with_no_reply_to_is_noop(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
     """MessageActionTopicEdit with msg.reply_to=None is a silent no-op (defensive guard)."""
     dialog_id = 12345
     _enroll_synced(sync_db, dialog_id)
@@ -390,7 +441,11 @@ async def test_topic_edit_with_no_reply_to_is_noop(mock_client, sync_db, shutdow
 
 
 @pytest.mark.asyncio
-async def test_topic_edit_with_reply_to_missing_id_is_noop(mock_client, sync_db, shutdown_event):
+async def test_topic_edit_with_reply_to_missing_id_is_noop(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
     """reply_to object without reply_to_msg_id attribute → getattr fallback → skip."""
     dialog_id = 12345
     _enroll_synced(sync_db, dialog_id)
@@ -429,7 +484,11 @@ async def test_topic_edit_with_reply_to_missing_id_is_noop(mock_client, sync_db,
 
 
 @pytest.mark.asyncio
-async def test_topic_edit_hidden_sets_hidden_flag(mock_client, sync_db, shutdown_event):
+async def test_topic_edit_hidden_sets_hidden_flag(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
     """MessageActionTopicEdit(hidden=True) sets topic_metadata.hidden=1."""
     dialog_id = 12345
     _enroll_synced(sync_db, dialog_id)
@@ -458,7 +517,11 @@ async def test_topic_edit_hidden_sets_hidden_flag(mock_client, sync_db, shutdown
 
 
 @pytest.mark.asyncio
-async def test_topic_edit_hidden_on_missing_row_is_noop(mock_client, sync_db, shutdown_event):
+async def test_topic_edit_hidden_on_missing_row_is_noop(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
     """hidden=True UPDATE on absent row is silent no-op; no INSERT performed."""
     dialog_id = 12345
     _enroll_synced(sync_db, dialog_id)
@@ -484,7 +547,11 @@ async def test_topic_edit_hidden_on_missing_row_is_noop(mock_client, sync_db, sh
 
 
 @pytest.mark.asyncio
-async def test_update_pinned_forum_topic_sets_pinned_true(mock_client, sync_db, shutdown_event):
+async def test_update_pinned_forum_topic_sets_pinned_true(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
     """UpdatePinnedForumTopic(pinned=True) sets topic_metadata.pinned=1."""
     channel_id = 12345
     dialog_id = get_peer_id(PeerChannel(channel_id))
@@ -499,14 +566,18 @@ async def test_update_pinned_forum_topic_sets_pinned_true(mock_client, sync_db, 
         topic_id=100,
         pinned=True,
     )
-    await mgr.on_raw_forum_topic_pinned(update)
+    await mgr.on_raw_forum_topic_pinned(cast(_ForumTopicPinnedUpdateLike, update))
 
     row = _topic_row(sync_db, dialog_id, 100)
     assert row["pinned"] == 1
 
 
 @pytest.mark.asyncio
-async def test_update_pinned_forum_topic_unsets_when_pinned_false(mock_client, sync_db, shutdown_event):
+async def test_update_pinned_forum_topic_unsets_when_pinned_false(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
     """UpdatePinnedForumTopic(pinned=False) sets topic_metadata.pinned=0."""
     channel_id = 12345
     dialog_id = get_peer_id(PeerChannel(channel_id))
@@ -521,14 +592,18 @@ async def test_update_pinned_forum_topic_unsets_when_pinned_false(mock_client, s
         topic_id=100,
         pinned=False,
     )
-    await mgr.on_raw_forum_topic_pinned(update)
+    await mgr.on_raw_forum_topic_pinned(cast(_ForumTopicPinnedUpdateLike, update))
 
     row = _topic_row(sync_db, dialog_id, 100)
     assert row["pinned"] == 0
 
 
 @pytest.mark.asyncio
-async def test_update_pinned_forum_topic_unsets_when_pinned_none(mock_client, sync_db, shutdown_event):
+async def test_update_pinned_forum_topic_unsets_when_pinned_none(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
     """UpdatePinnedForumTopic(pinned=None) treats as falsy → pinned=0."""
     channel_id = 12345
     dialog_id = get_peer_id(PeerChannel(channel_id))
@@ -543,14 +618,18 @@ async def test_update_pinned_forum_topic_unsets_when_pinned_none(mock_client, sy
         topic_id=100,
         pinned=None,
     )
-    await mgr.on_raw_forum_topic_pinned(update)
+    await mgr.on_raw_forum_topic_pinned(cast(_ForumTopicPinnedUpdateLike, update))
 
     row = _topic_row(sync_db, dialog_id, 100)
     assert row["pinned"] == 0
 
 
 @pytest.mark.asyncio
-async def test_update_pinned_forum_topic_skips_unenrolled_dialog(mock_client, sync_db, shutdown_event):
+async def test_update_pinned_forum_topic_skips_unenrolled_dialog(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
     """Unenrolled dialog: pinned/snapshot_at remain at seed values."""
     channel_id = 12345
     dialog_id = get_peer_id(PeerChannel(channel_id))
@@ -565,7 +644,7 @@ async def test_update_pinned_forum_topic_skips_unenrolled_dialog(mock_client, sy
         topic_id=100,
         pinned=True,
     )
-    await mgr.on_raw_forum_topic_pinned(update)
+    await mgr.on_raw_forum_topic_pinned(cast(_ForumTopicPinnedUpdateLike, update))
 
     row = _topic_row(sync_db, dialog_id, 100)
     assert row["pinned"] == 0  # unchanged
@@ -573,7 +652,11 @@ async def test_update_pinned_forum_topic_skips_unenrolled_dialog(mock_client, sy
 
 
 @pytest.mark.asyncio
-async def test_update_pinned_forum_topic_unknown_topic_is_noop(mock_client, sync_db, shutdown_event):
+async def test_update_pinned_forum_topic_unknown_topic_is_noop(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
     """Enrolled dialog, no seed row → UPDATE matches 0 rows, no exception, no INSERT."""
     channel_id = 12345
     dialog_id = get_peer_id(PeerChannel(channel_id))
@@ -588,13 +671,17 @@ async def test_update_pinned_forum_topic_unknown_topic_is_noop(mock_client, sync
         topic_id=100,
         pinned=True,
     )
-    await mgr.on_raw_forum_topic_pinned(update)  # must not raise
+    await mgr.on_raw_forum_topic_pinned(cast(_ForumTopicPinnedUpdateLike, update))  # must not raise
 
     assert _topic_count(sync_db) == 0
 
 
 @pytest.mark.asyncio
-async def test_update_pinned_forum_topic_missing_peer_is_noop(mock_client, sync_db, shutdown_event):
+async def test_update_pinned_forum_topic_missing_peer_is_noop(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
     """UpdatePinnedForumTopic with peer=None returns silently without crashing."""
     mgr = _make_manager(mock_client, sync_db, shutdown_event)
 
@@ -604,7 +691,7 @@ async def test_update_pinned_forum_topic_missing_peer_is_noop(mock_client, sync_
         topic_id = 100
         pinned = True
 
-    await mgr.on_raw_forum_topic_pinned(_FakeUpdate())  # must not raise
+    await mgr.on_raw_forum_topic_pinned(cast(_ForumTopicPinnedUpdateLike, _FakeUpdate()))  # must not raise
 
     assert _topic_count(sync_db) == 0
 
@@ -615,7 +702,11 @@ async def test_update_pinned_forum_topic_missing_peer_is_noop(mock_client, sync_
 
 
 @pytest.mark.asyncio
-async def test_non_forum_message_does_not_write_topic_metadata(mock_client, sync_db, shutdown_event):
+async def test_non_forum_message_does_not_write_topic_metadata(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
     """Regular NewMessage (action=None) in enrolled dialog produces no topic_metadata row."""
     dialog_id = 12345
     _enroll_synced(sync_db, dialog_id)
@@ -630,10 +721,9 @@ async def test_non_forum_message_does_not_write_topic_metadata(mock_client, sync
 
     from types import SimpleNamespace
 
-    event = SimpleNamespace(
-        chat_id=dialog_id,
-        is_private=False,
-        message=msg,
+    event = cast(
+        _NewMessageEvent,
+        SimpleNamespace(chat_id=dialog_id, is_private=False, message=msg),
     )
     await mgr.on_new_message(event)
 
@@ -646,7 +736,11 @@ async def test_non_forum_message_does_not_write_topic_metadata(mock_client, sync
 
 
 @pytest.mark.asyncio
-async def test_no_get_forum_topics_request_called(mock_client, sync_db, shutdown_event):
+async def test_no_get_forum_topics_request_called(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
     """GetForumTopicsRequest must never be invoked by any forum topic handler."""
     dialog_id = 12345
     _enroll_synced(sync_db, dialog_id)
@@ -665,7 +759,12 @@ async def test_no_get_forum_topics_request_called(mock_client, sync_db, shutdown
     await mgr.on_new_message(_make_topic_create_event(dialog_id, msg_id=200, title="T", icon_emoji_id=None))
     await mgr.on_new_message(_make_topic_edit_event(dialog_id, msg_id=201, target_topic_id=100, title="New"))
     await mgr.on_new_message(_make_topic_edit_event(dialog_id, msg_id=202, target_topic_id=100, hidden=True))
-    await mgr.on_raw_forum_topic_pinned(UpdatePinnedForumTopic(peer=PeerChannel(channel_id), topic_id=100, pinned=True))
+    await mgr.on_raw_forum_topic_pinned(
+        cast(
+            _ForumTopicPinnedUpdateLike,
+            UpdatePinnedForumTopic(peer=PeerChannel(channel_id), topic_id=100, pinned=True),
+        )
+    )
 
     # Assert mock_client was never called with any forum-topics RPC request.
     # GetForumTopicsRequest may not exist in all Telethon builds, so we check
@@ -681,7 +780,11 @@ async def test_no_get_forum_topics_request_called(mock_client, sync_db, shutdown
 # ---------------------------------------------------------------------------
 
 
-def test_register_attaches_forum_topic_pinned_handler(mock_client, sync_db, shutdown_event):
+def test_register_attaches_forum_topic_pinned_handler(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
     """register() adds on_raw_forum_topic_pinned as an event handler."""
     mgr = EventHandlerManager(mock_client, sync_db, shutdown_event)
     mgr.register()
@@ -691,7 +794,11 @@ def test_register_attaches_forum_topic_pinned_handler(mock_client, sync_db, shut
     assert mgr.on_raw_forum_topic_pinned in handler_fns
 
 
-def test_unregister_detaches_forum_topic_pinned_handler(mock_client, sync_db, shutdown_event):
+def test_unregister_detaches_forum_topic_pinned_handler(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
     """unregister() removes on_raw_forum_topic_pinned."""
     mgr = EventHandlerManager(mock_client, sync_db, shutdown_event)
     mgr.register()
@@ -707,7 +814,7 @@ def test_unregister_detaches_forum_topic_pinned_handler(mock_client, sync_db, sh
 # ---------------------------------------------------------------------------
 
 
-def test_daemon_api_topic_title_left_join_still_works(sync_db):
+def test_daemon_api_topic_title_left_join_still_works(sync_db: _SQLiteConnection) -> None:
     """UPSERT-written topic_metadata row is readable by the daemon_api LEFT JOIN pattern.
 
     Mirrors daemon_api.py:573 LEFT JOIN expression in isolation to confirm that

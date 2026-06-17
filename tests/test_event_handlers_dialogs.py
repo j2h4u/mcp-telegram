@@ -9,15 +9,19 @@ invariant as the five existing handlers (event_handlers.py:214, 249, 337,
 376, 441, 502).
 """
 
+# pyright: reportAny=false, reportArgumentType=false, reportOptionalSubscript=false, reportOperatorIssue=false, reportUndefinedVariable=false, reportMissingParameterType=false, reportReturnType=false, reportInvalidTypeForm=false, reportGeneralTypeIssues=false
+
 from __future__ import annotations
 
 import asyncio
 import logging
 import sqlite3
+from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from typing import TypedDict, cast
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from helpers import build_mock_message
@@ -36,8 +40,25 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
 )
 from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
-from mcp_telegram.event_handlers import EventHandlerManager
+from mcp_telegram.event_handlers import (
+    EventHandlerManager,
+    _ChannelChatUpdateLike,
+    _ChannelInboxReadUpdateLike,
+    _ChatUpdateLike,
+    _InboxReadUpdateLike,
+    _NewMessageEvent,
+)
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
+
+_SQLiteConnection = sqlite3.Connection
+
+
+class _DialogRow(TypedDict):
+    pinned: int
+    needs_refresh: int
+    last_message_at: int | None
+    snapshot_at: int
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -45,10 +66,10 @@ from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 
 
 @pytest.fixture()
-def sync_db(tmp_path: Path) -> sqlite3.Connection:
+def sync_db(tmp_path: Path) -> Iterator[_SQLiteConnection]:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
-    conn = _open_sync_db(db_path)
+    conn = cast(_SQLiteConnection, _open_sync_db(db_path))
     yield conn
     conn.close()
 
@@ -71,7 +92,7 @@ def shutdown_event() -> asyncio.Event:
 # ---------------------------------------------------------------------------
 
 
-def _enroll_synced(conn: sqlite3.Connection, dialog_id: int) -> None:
+def _enroll_synced(conn: _SQLiteConnection, dialog_id: int) -> None:
     conn.execute(
         "INSERT OR IGNORE INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')",
         (dialog_id,),
@@ -88,11 +109,11 @@ class _DialogRowOptions:
 
 
 def _insert_dialog(
-    conn: sqlite3.Connection,
+    conn: _SQLiteConnection,
     dialog_id: int,
     *,
     opts: _DialogRowOptions | None = None,
-    **kwargs,
+    **kwargs: object,
 ) -> None:
     if opts is None:
         opts = _DialogRowOptions()
@@ -109,31 +130,42 @@ def _insert_dialog(
     conn.commit()
 
 
-def _dialog_row(conn: sqlite3.Connection, dialog_id: int) -> dict | None:
-    row = conn.execute(
-        "SELECT pinned, needs_refresh, last_message_at, snapshot_at FROM dialogs WHERE dialog_id=?",
-        (dialog_id,),
-    ).fetchone()
+def _dialog_row(conn: _SQLiteConnection, dialog_id: int) -> _DialogRow | None:
+    row = cast(
+        tuple[object, ...] | None,
+        conn.execute(
+            "SELECT pinned, needs_refresh, last_message_at, snapshot_at FROM dialogs WHERE dialog_id=?",
+            (dialog_id,),
+        ).fetchone(),
+    )
     if row is None:
         return None
-    return {
-        "pinned": row[0],
-        "needs_refresh": row[1],
-        "last_message_at": row[2],
-        "snapshot_at": row[3],
-    }
+    return cast(
+        _DialogRow,
+        {
+            "pinned": row[0],
+            "needs_refresh": row[1],
+            "last_message_at": row[2],
+            "snapshot_at": row[3],
+        },
+    )
 
 
-def _dialogs_count(conn: sqlite3.Connection) -> int:
-    return conn.execute("SELECT COUNT(*) FROM dialogs").fetchone()[0]
+def _dialogs_count(conn: _SQLiteConnection) -> int:
+    row = cast(tuple[object, ...] | None, conn.execute("SELECT COUNT(*) FROM dialogs").fetchone())
+    assert row is not None
+    return int(tuple(row)[0])
 
 
-def _last_event_at(conn: sqlite3.Connection, dialog_id: int) -> int | None:
-    row = conn.execute("SELECT last_event_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone()
+def _last_event_at(conn: _SQLiteConnection, dialog_id: int) -> int | None:
+    row = cast(
+        tuple[object, ...] | None,
+        conn.execute("SELECT last_event_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone(),
+    )
     return None if row is None or row[0] is None else int(row[0])
 
 
-def _make_manager(client: MagicMock, conn: sqlite3.Connection, ev: asyncio.Event) -> EventHandlerManager:
+def _make_manager(client: MagicMock, conn: _SQLiteConnection, ev: asyncio.Event) -> EventHandlerManager:
     m = EventHandlerManager(client, conn, ev)
     m.register()
     return m
@@ -146,7 +178,11 @@ def _make_manager(client: MagicMock, conn: sqlite3.Connection, ev: asyncio.Event
 
 
 @pytest.mark.asyncio
-async def test_update_dialog_pinned_sets_pinned_true(mock_client, sync_db, shutdown_event):
+async def test_update_dialog_pinned_sets_pinned_true(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
     """EVENTS-01: single dialog pin sets dialogs.pinned=1 and advances snapshot_at."""
     channel_id = 12345
     dialog_id = get_peer_id(PeerChannel(channel_id))  # -1000000012345
@@ -169,7 +205,11 @@ async def test_update_dialog_pinned_sets_pinned_true(mock_client, sync_db, shutd
 
 
 @pytest.mark.asyncio
-async def test_update_dialog_pinned_with_pinned_false_unsets(mock_client, sync_db, shutdown_event):
+async def test_update_dialog_pinned_with_pinned_false_unsets(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
     """EVENTS-01: UpdateDialogPinned(pinned=False) sets dialogs.pinned=0."""
     channel_id = 12345
     dialog_id = get_peer_id(PeerChannel(channel_id))
@@ -191,7 +231,11 @@ async def test_update_dialog_pinned_with_pinned_false_unsets(mock_client, sync_d
 
 
 @pytest.mark.asyncio
-async def test_update_dialog_pinned_skips_unenrolled_dialog(mock_client, sync_db, shutdown_event):
+async def test_update_dialog_pinned_skips_unenrolled_dialog(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
     """EVENTS-01: unenrolled dialog — no UPDATE issued (snapshot_at stays at seeded=1)."""
     channel_id = 99999
     dialog_id = get_peer_id(PeerChannel(channel_id))
@@ -214,7 +258,11 @@ async def test_update_dialog_pinned_skips_unenrolled_dialog(mock_client, sync_db
 
 
 @pytest.mark.asyncio
-async def test_update_dialog_pinned_missing_dialogs_row_is_noop(mock_client, sync_db, shutdown_event):
+async def test_update_dialog_pinned_missing_dialogs_row_is_noop(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
     """EVENTS-01: enrolled in _synced_dialog_ids but NO dialogs row — no exception, no INSERT."""
     channel_id = 77777
     dialog_id = get_peer_id(PeerChannel(channel_id))
@@ -234,7 +282,11 @@ async def test_update_dialog_pinned_missing_dialogs_row_is_noop(mock_client, syn
 
 
 @pytest.mark.asyncio
-async def test_update_pinned_dialogs_with_order_rewrites_full_set(mock_client, sync_db, shutdown_event):
+async def test_update_pinned_dialogs_with_order_rewrites_full_set(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
     """EVENTS-01: non-empty order list pins listed dialogs and unpins others."""
     # Three dialogs: A and B pinned, C not pinned
     id_a = get_peer_id(PeerUser(user_id=111))
@@ -266,7 +318,11 @@ async def test_update_pinned_dialogs_with_order_rewrites_full_set(mock_client, s
 
 
 @pytest.mark.asyncio
-async def test_update_pinned_dialogs_with_empty_order_clears_all_pins(mock_client, sync_db, shutdown_event):
+async def test_update_pinned_dialogs_with_empty_order_clears_all_pins(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
     """EVENTS-01: empty order list unpins all — uses _CLEAR_ALL_PINS_SQL (no NOT IN ())."""
     id_a = get_peer_id(PeerChannel(channel_id=444))
     id_b = get_peer_id(PeerChannel(channel_id=555))
@@ -286,7 +342,11 @@ async def test_update_pinned_dialogs_with_empty_order_clears_all_pins(mock_clien
 
 
 @pytest.mark.asyncio
-async def test_update_pinned_dialogs_with_order_none_is_noop(mock_client, sync_db, shutdown_event):
+async def test_update_pinned_dialogs_with_order_none_is_noop(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
     """EVENTS-01: order=None means no actionable data — row state preserved."""
     dialog_id = get_peer_id(PeerChannel(channel_id=666))
     _enroll_synced(sync_db, dialog_id)
@@ -303,7 +363,11 @@ async def test_update_pinned_dialogs_with_order_none_is_noop(mock_client, sync_d
 
 
 @pytest.mark.asyncio
-async def test_update_dialog_unread_mark_sets_needs_refresh(mock_client, sync_db, shutdown_event):
+async def test_update_dialog_unread_mark_sets_needs_refresh(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
     """EVENTS-01: UpdateDialogUnreadMark sets needs_refresh=1."""
     user_id = 12345
     dialog_id = get_peer_id(PeerUser(user_id=user_id))  # positive int for DM
@@ -333,7 +397,12 @@ async def test_update_dialog_unread_mark_sets_needs_refresh(mock_client, sync_db
 
 
 @pytest.mark.asyncio
-async def test_update_read_history_inbox_logs_still_unread_count(mock_client, sync_db, shutdown_event, caplog):
+async def test_update_read_history_inbox_logs_still_unread_count(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """EVENTS-02: UpdateReadHistoryInbox logs still_unread_count via structured log."""
     # UpdateReadHistoryInbox.peer is TypePeer directly (not DialogPeer wrapper).
     dialog_id = get_peer_id(PeerChannel(channel_id=9999))
@@ -351,7 +420,7 @@ async def test_update_read_history_inbox_logs_still_unread_count(mock_client, sy
     mgr._synced_dialog_ids.add(dialog_id)
 
     with caplog.at_level(logging.INFO, logger="mcp_telegram.event_handlers"):
-        await mgr.on_raw_inbox_read(upd)
+        await mgr.on_raw_inbox_read(cast(_InboxReadUpdateLike, upd))
 
     assert any("still_unread_count=7" in r.message for r in caplog.records)
     # last_event_at should be advanced
@@ -360,8 +429,11 @@ async def test_update_read_history_inbox_logs_still_unread_count(mock_client, sy
 
 @pytest.mark.asyncio
 async def test_update_read_channel_inbox_extracts_dialog_id_via_peer_channel(
-    mock_client, sync_db, shutdown_event, caplog
-):
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """EVENTS-02: UpdateReadChannelInbox derives dialog_id via PeerChannel.
 
     Effective dialog_id must match -100XXXXXXXXX form.
@@ -383,13 +455,18 @@ async def test_update_read_channel_inbox_extracts_dialog_id_via_peer_channel(
     mgr._synced_dialog_ids.add(dialog_id)
 
     with caplog.at_level(logging.INFO, logger="mcp_telegram.event_handlers"):
-        await mgr.on_raw_inbox_read(upd)
+        await mgr.on_raw_inbox_read(cast(_ChannelInboxReadUpdateLike, upd))
 
     assert any("still_unread_count=3" in r.message for r in caplog.records)
 
 
 @pytest.mark.asyncio
-async def test_update_read_history_inbox_skips_unenrolled_dialog(mock_client, sync_db, shutdown_event, caplog):
+async def test_update_read_history_inbox_skips_unenrolled_dialog(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """EVENTS-02: unenrolled dialog — handler returns early, no log line emitted."""
     dialog_id = get_peer_id(PeerChannel(channel_id=88888))
     # NOT enrolled
@@ -405,7 +482,7 @@ async def test_update_read_history_inbox_skips_unenrolled_dialog(mock_client, sy
     mgr = _make_manager(mock_client, sync_db, shutdown_event)
 
     with caplog.at_level(logging.INFO, logger="mcp_telegram.event_handlers"):
-        await mgr.on_raw_inbox_read(upd)
+        await mgr.on_raw_inbox_read(cast(_InboxReadUpdateLike, upd))
 
     assert not any("still_unread_count" in r.message for r in caplog.records)
 
@@ -416,7 +493,11 @@ async def test_update_read_history_inbox_skips_unenrolled_dialog(mock_client, sy
 
 
 @pytest.mark.asyncio
-async def test_update_channel_sets_needs_refresh(mock_client, sync_db, shutdown_event):
+async def test_update_channel_sets_needs_refresh(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
     """EVENTS-03: UpdateChannel sets dialogs.needs_refresh=1 and advances snapshot_at."""
     channel_id = 123456789
     dialog_id = get_peer_id(PeerChannel(channel_id))
@@ -426,7 +507,7 @@ async def test_update_channel_sets_needs_refresh(mock_client, sync_db, shutdown_
     upd = UpdateChannel(channel_id=channel_id)
     mgr = _make_manager(mock_client, sync_db, shutdown_event)
     mgr._synced_dialog_ids.add(dialog_id)
-    await mgr.on_raw_channel_chat_update(upd)
+    await mgr.on_raw_channel_chat_update(cast(_ChannelChatUpdateLike, upd))
 
     row = _dialog_row(sync_db, dialog_id)
     assert row["needs_refresh"] == 1
@@ -434,7 +515,11 @@ async def test_update_channel_sets_needs_refresh(mock_client, sync_db, shutdown_
 
 
 @pytest.mark.asyncio
-async def test_update_chat_sets_needs_refresh(mock_client, sync_db, shutdown_event):
+async def test_update_chat_sets_needs_refresh(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
     """EVENTS-03: UpdateChat sets dialogs.needs_refresh=1 via PeerChat(chat_id)."""
     chat_id = 678
     dialog_id = get_peer_id(PeerChat(chat_id))
@@ -446,14 +531,18 @@ async def test_update_chat_sets_needs_refresh(mock_client, sync_db, shutdown_eve
     upd = UpdateChat(chat_id=chat_id)
     mgr = _make_manager(mock_client, sync_db, shutdown_event)
     mgr._synced_dialog_ids.add(dialog_id)
-    await mgr.on_raw_channel_chat_update(upd)
+    await mgr.on_raw_channel_chat_update(cast(_ChatUpdateLike, upd))
 
     row = _dialog_row(sync_db, dialog_id)
     assert row["needs_refresh"] == 1
 
 
 @pytest.mark.asyncio
-async def test_update_channel_unknown_dialog_is_noop(mock_client, sync_db, shutdown_event):
+async def test_update_channel_unknown_dialog_is_noop(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
     """EVENTS-03: unenrolled dialog — handler runs without exception, no SQL UPDATE."""
     channel_id = 55555
     dialog_id = get_peer_id(PeerChannel(channel_id))
@@ -461,11 +550,15 @@ async def test_update_channel_unknown_dialog_is_noop(mock_client, sync_db, shutd
 
     upd = UpdateChannel(channel_id=channel_id)
     mgr = _make_manager(mock_client, sync_db, shutdown_event)
-    await mgr.on_raw_channel_chat_update(upd)  # must not raise
+    await mgr.on_raw_channel_chat_update(cast(_ChannelChatUpdateLike, upd))  # must not raise
 
 
 @pytest.mark.asyncio
-async def test_update_channel_missing_dialogs_row_is_noop(mock_client, sync_db, shutdown_event):
+async def test_update_channel_missing_dialogs_row_is_noop(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
     """EVENTS-03: enrolled but NO dialogs row — handler runs without exception, no INSERT."""
     channel_id = 66666
     dialog_id = get_peer_id(PeerChannel(channel_id))
@@ -476,7 +569,7 @@ async def test_update_channel_missing_dialogs_row_is_noop(mock_client, sync_db, 
     upd = UpdateChannel(channel_id=channel_id)
     mgr = _make_manager(mock_client, sync_db, shutdown_event)
     mgr._synced_dialog_ids.add(dialog_id)
-    await mgr.on_raw_channel_chat_update(upd)  # must not raise
+    await mgr.on_raw_channel_chat_update(cast(_ChannelChatUpdateLike, upd))  # must not raise
 
     assert _dialogs_count(sync_db) == count_before  # no INSERT
 
@@ -487,7 +580,11 @@ async def test_update_channel_missing_dialogs_row_is_noop(mock_client, sync_db, 
 
 
 @pytest.mark.asyncio
-async def test_on_new_message_advances_last_message_at(mock_client, sync_db, shutdown_event):
+async def test_on_new_message_advances_last_message_at(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
     """EVENTS-04: on_new_message sets dialogs.last_message_at from msg.date."""
     from datetime import UTC, datetime
 
@@ -499,10 +596,14 @@ async def test_on_new_message_advances_last_message_at(mock_client, sync_db, shu
     # = 1704110400
     expected_ts = int(datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC).timestamp())
     msg = build_mock_message(id=1, text="hello")
-    event = SimpleNamespace(
-        chat_id=dialog_id,
-        message=msg,
-        is_private=False,
+    event = cast(
+        _NewMessageEvent,
+        SimpleNamespace(
+            chat_id=dialog_id,
+            message=msg,
+            is_private=False,
+            get_sender=AsyncMock(return_value=None),
+        ),
     )
 
     # Mock _build_fwd_entity_map and extract_message_row helpers
@@ -521,7 +622,11 @@ async def test_on_new_message_advances_last_message_at(mock_client, sync_db, shu
 
 
 @pytest.mark.asyncio
-async def test_on_new_message_does_not_regress_last_message_at(mock_client, sync_db, shutdown_event):
+async def test_on_new_message_does_not_regress_last_message_at(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
     """EVENTS-04: older msg.date does NOT decrease dialogs.last_message_at."""
     dialog_id = 268071163
     future_ts = 2_000_000_000
@@ -530,10 +635,9 @@ async def test_on_new_message_does_not_regress_last_message_at(mock_client, sync
 
     # build_mock_message has date=2024-01-01 which is < future_ts
     msg = build_mock_message(id=2, text="old")
-    event = SimpleNamespace(
-        chat_id=dialog_id,
-        message=msg,
-        is_private=False,
+    event = cast(
+        _NewMessageEvent,
+        SimpleNamespace(chat_id=dialog_id, message=msg, is_private=False, get_sender=AsyncMock(return_value=None)),
     )
 
     import unittest.mock as mock
@@ -551,7 +655,11 @@ async def test_on_new_message_does_not_regress_last_message_at(mock_client, sync
 
 
 @pytest.mark.asyncio
-async def test_on_new_message_missing_dialogs_row_is_noop(mock_client, sync_db, shutdown_event):
+async def test_on_new_message_missing_dialogs_row_is_noop(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
     """EVENTS-04: synced_dialogs row exists but NO dialogs row — no INSERT into dialogs."""
     dialog_id = 268071163
     _enroll_synced(sync_db, dialog_id)
@@ -559,10 +667,9 @@ async def test_on_new_message_missing_dialogs_row_is_noop(mock_client, sync_db, 
 
     count_before = _dialogs_count(sync_db)
     msg = build_mock_message(id=3, text="new")
-    event = SimpleNamespace(
-        chat_id=dialog_id,
-        message=msg,
-        is_private=False,
+    event = cast(
+        _NewMessageEvent,
+        SimpleNamespace(chat_id=dialog_id, message=msg, is_private=False, get_sender=AsyncMock(return_value=None)),
     )
 
     import unittest.mock as mock
@@ -583,14 +690,22 @@ async def test_on_new_message_missing_dialogs_row_is_noop(mock_client, sync_db, 
 # ---------------------------------------------------------------------------
 
 
-def test_register_attaches_three_new_handlers(mock_client, sync_db, shutdown_event):
+def test_register_attaches_three_new_handlers(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
     """Three new Phase 42 Plan 01 handlers (+ one Plan 02 handler) bring total to 10."""
     mgr = EventHandlerManager(mock_client, sync_db, shutdown_event)
     mgr.register()
     assert mock_client.add_event_handler.call_count == 10
 
 
-def test_unregister_detaches_all_new_handlers(mock_client, sync_db, shutdown_event):
+def test_unregister_detaches_all_new_handlers(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
     """Every handler attached by register() is detached by unregister()."""
     mgr = EventHandlerManager(mock_client, sync_db, shutdown_event)
     mgr.register()
@@ -607,7 +722,11 @@ def test_unregister_detaches_all_new_handlers(mock_client, sync_db, shutdown_eve
 
 
 @pytest.mark.asyncio
-async def test_no_handler_inserts_into_dialogs_table(mock_client, sync_db, shutdown_event):
+async def test_no_handler_inserts_into_dialogs_table(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
     """Across all dialog-handler calls for non-bootstrapped dialog_ids, count never increases.
 
     This test covers:
@@ -633,7 +752,7 @@ async def test_no_handler_inserts_into_dialogs_table(mock_client, sync_db, shutd
 
     # Test 2: UpdateChannel — unenrolled
     upd_ch = UpdateChannel(channel_id=channel_id)
-    await mgr.on_raw_channel_chat_update(upd_ch)
+    await mgr.on_raw_channel_chat_update(cast(_ChannelChatUpdateLike, upd_ch))
     assert _dialogs_count(sync_db) == 0
 
     # Test 3: UpdateReadHistoryInbox — unenrolled
@@ -645,14 +764,17 @@ async def test_no_handler_inserts_into_dialogs_table(mock_client, sync_db, shutd
         pts_count=1,
         folder_id=None,
     )
-    await mgr.on_raw_inbox_read(upd_read)
+    await mgr.on_raw_inbox_read(cast(_InboxReadUpdateLike, upd_read))
     assert _dialogs_count(sync_db) == 0
 
     # Test 4: on_new_message — enrolled in synced_dialogs but NO dialogs row
     _enroll_synced(sync_db, dialog_id)
     mgr._synced_dialog_ids.add(dialog_id)
     msg = build_mock_message(id=1, text="hello")
-    event = SimpleNamespace(chat_id=dialog_id, message=msg, is_private=False)
+    event = cast(
+        _NewMessageEvent,
+        SimpleNamespace(chat_id=dialog_id, message=msg, is_private=False, get_sender=None),
+    )
 
     import unittest.mock as mock
 

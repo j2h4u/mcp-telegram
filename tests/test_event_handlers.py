@@ -5,48 +5,60 @@ DAEMON-09 (channel/supergroup MessageDeleted), and DAEMON-10
 (DM gap scan) behaviors.
 """
 
+# pyright: reportAny=false, reportArgumentType=false, reportOptionalSubscript=false, reportOperatorIssue=false, reportUndefinedVariable=false, reportMissingParameterType=false, reportReturnType=false, reportInvalidTypeForm=false, reportGeneralTypeIssues=false
+
 from __future__ import annotations
 
 import asyncio
 import sqlite3
+from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from helpers import build_mock_message
 
-from mcp_telegram.event_handlers import EventHandlerManager
+from mcp_telegram.event_handlers import (
+    EventHandlerManager,
+    _DeletedMessagesEvent,
+    _EditedMessageEvent,
+    _NewMessageEvent,
+    _ReadMessageEvent,
+)
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
+
+_SQLiteConnection = sqlite3.Connection
 
 
 def make_new_message_event(
     chat_id: int | None,
     message: SimpleNamespace,
     is_private: bool = False,
-) -> SimpleNamespace:
+) -> _NewMessageEvent:
     """Build a minimal NewMessage.Event-like object."""
-    return SimpleNamespace(chat_id=chat_id, message=message, is_private=is_private)
+    return cast(_NewMessageEvent, SimpleNamespace(chat_id=chat_id, message=message, is_private=is_private))
 
 
-def make_message_edited_event(chat_id: int | None, message: SimpleNamespace) -> SimpleNamespace:
+def make_message_edited_event(chat_id: int | None, message: SimpleNamespace) -> _EditedMessageEvent:
     """Build a minimal MessageEdited.Event-like object.
 
     The message should have .edit_date set to a datetime to signal an edit.
     """
-    return SimpleNamespace(chat_id=chat_id, message=message)
+    return cast(_EditedMessageEvent, SimpleNamespace(chat_id=chat_id, message=message))
 
 
-def make_message_deleted_event(chat_id: int | None, deleted_ids: list[int]) -> SimpleNamespace:
+def make_message_deleted_event(chat_id: int | None, deleted_ids: list[int]) -> _DeletedMessagesEvent:
     """Build a minimal MessageDeleted.Event-like object."""
-    return SimpleNamespace(chat_id=chat_id, deleted_ids=deleted_ids)
+    return cast(_DeletedMessagesEvent, SimpleNamespace(chat_id=chat_id, deleted_ids=deleted_ids))
 
 
-def make_message_read_event(chat_id: int | None, max_id: int) -> SimpleNamespace:
+def make_message_read_event(chat_id: int | None, max_id: int) -> _ReadMessageEvent:
     """Build a minimal MessageRead.Event-like object."""
-    return SimpleNamespace(chat_id=chat_id, max_id=max_id)
+    return cast(_ReadMessageEvent, SimpleNamespace(chat_id=chat_id, max_id=max_id))
 
 
 # ---------------------------------------------------------------------------
@@ -55,7 +67,7 @@ def make_message_read_event(chat_id: int | None, max_id: int) -> SimpleNamespace
 
 
 @pytest.fixture()
-def sync_db(tmp_path: Any) -> sqlite3.Connection:
+def sync_db(tmp_path: Path) -> Iterator[_SQLiteConnection]:
     """Create a real sync.db in tmp_path and return an open connection."""
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
@@ -81,13 +93,13 @@ def shutdown_event() -> asyncio.Event:
 
 def make_manager(
     mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> EventHandlerManager:
     return EventHandlerManager(mock_client, sync_db, shutdown_event)
 
 
-def insert_synced_dialog(conn: sqlite3.Connection, dialog_id: int) -> None:
+def insert_synced_dialog(conn: _SQLiteConnection, dialog_id: int) -> None:
     """Insert a dialog into synced_dialogs so the manager treats it as synced."""
     conn.execute(
         "INSERT OR IGNORE INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')",
@@ -104,12 +116,12 @@ class _MessageRowOptions:
 
 
 def insert_message(
-    conn: sqlite3.Connection,
+    conn: _SQLiteConnection,
     dialog_id: int,
     message_id: int,
     *,
     opts: _MessageRowOptions | None = None,
-    **kwargs: Any,
+    **kwargs: object,
 ) -> None:
     """Insert a message row directly for test setup."""
     if opts is None:
@@ -134,7 +146,7 @@ def insert_message(
 @pytest.mark.asyncio
 async def test_on_new_message_inserts_row(
     mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """New message in a synced dialog is inserted into messages table."""
@@ -161,7 +173,7 @@ async def test_on_new_message_inserts_row(
 @pytest.mark.asyncio
 async def test_on_new_message_ignores_unsynced(
     mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """New message for an unsynced dialog produces no DB row."""
@@ -173,14 +185,16 @@ async def test_on_new_message_ignores_unsynced(
     event = make_new_message_event(chat_id=9999, message=msg)
     await manager.on_new_message(event)
 
-    count = sync_db.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+    count_row = sync_db.execute("SELECT COUNT(*) FROM messages").fetchone()
+    assert count_row is not None
+    count = int(tuple(count_row)[0])
     assert count == 0
 
 
 @pytest.mark.asyncio
 async def test_on_new_message_auto_enrolls_private_dialog(
     mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """Private message from an unknown dialog enrolls it into synced_dialogs."""
@@ -206,7 +220,7 @@ async def test_on_new_message_auto_enrolls_private_dialog(
 @pytest.mark.asyncio
 async def test_on_new_message_auto_enroll_idempotent(
     mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """Auto-enroll is idempotent — two private messages from the same new dialog don't duplicate."""
@@ -220,17 +234,18 @@ async def test_on_new_message_auto_enroll_idempotent(
         event = make_new_message_event(chat_id=dialog_id, message=msg, is_private=True)
         await manager.on_new_message(event)
 
-    count = sync_db.execute(
+    count_row = sync_db.execute(
         "SELECT COUNT(*) FROM synced_dialogs WHERE dialog_id=?",
         (dialog_id,),
-    ).fetchone()[0]
-    assert count == 1, "synced_dialogs must have exactly one row for the dialog"
+    ).fetchone()
+    assert count_row is not None
+    assert int(tuple(count_row)[0]) == 1, "synced_dialogs must have exactly one row for the dialog"
 
 
 @pytest.mark.asyncio
 async def test_on_new_message_ignores_unsynced_non_private(
     mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """New message from an unknown non-private (group) dialog is ignored — no enrollment."""
@@ -243,18 +258,19 @@ async def test_on_new_message_ignores_unsynced_non_private(
     event = make_new_message_event(chat_id=dialog_id, message=msg, is_private=False)
     await manager.on_new_message(event)
 
-    count = sync_db.execute(
+    count_row = sync_db.execute(
         "SELECT COUNT(*) FROM synced_dialogs WHERE dialog_id=?",
         (dialog_id,),
-    ).fetchone()[0]
-    assert count == 0, "non-private unknown dialog must not be enrolled"
+    ).fetchone()
+    assert count_row is not None
+    assert int(tuple(count_row)[0]) == 0, "non-private unknown dialog must not be enrolled"
     assert dialog_id not in manager._synced_dialog_ids
 
 
 @pytest.mark.asyncio
 async def test_auto_enroll_writes_entity_when_sender_available(
     mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """Auto-enroll writes an entities row when get_sender() returns a User."""
@@ -262,11 +278,14 @@ async def test_auto_enroll_writes_entity_when_sender_available(
     sender = SimpleNamespace(first_name="Ivan", last_name="Zakazov", username="ivan_z")
 
     msg = build_mock_message(id=1, text="hey")
-    event = SimpleNamespace(
-        chat_id=dialog_id,
-        message=msg,
-        is_private=True,
-        get_sender=AsyncMock(return_value=sender),
+    event = cast(
+        _NewMessageEvent,
+        SimpleNamespace(
+            chat_id=dialog_id,
+            message=msg,
+            is_private=True,
+            get_sender=AsyncMock(return_value=sender),
+        ),
     )
 
     manager = make_manager(mock_client, sync_db, shutdown_event)
@@ -287,7 +306,7 @@ async def test_auto_enroll_writes_entity_when_sender_available(
 @pytest.mark.asyncio
 async def test_auto_enroll_entity_write_fails_gracefully(
     mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """Enrollment succeeds even if entity write fails (independent failure domains)."""
@@ -295,11 +314,14 @@ async def test_auto_enroll_entity_write_fails_gracefully(
     sender = SimpleNamespace(first_name="Broken", last_name="User", username=None)
 
     msg = build_mock_message(id=1, text="hi")
-    event = SimpleNamespace(
-        chat_id=dialog_id,
-        message=msg,
-        is_private=True,
-        get_sender=AsyncMock(return_value=sender),
+    event = cast(
+        _NewMessageEvent,
+        SimpleNamespace(
+            chat_id=dialog_id,
+            message=msg,
+            is_private=True,
+            get_sender=AsyncMock(return_value=sender),
+        ),
     )
 
     # Drop entities table to force entity write to fail
@@ -323,18 +345,21 @@ async def test_auto_enroll_entity_write_fails_gracefully(
 @pytest.mark.asyncio
 async def test_auto_enroll_no_entity_when_sender_unavailable(
     mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """When get_sender() fails, dialog is enrolled but no entity row is written."""
     dialog_id = 7012
 
     msg = build_mock_message(id=1, text="hello")
-    event = SimpleNamespace(
-        chat_id=dialog_id,
-        message=msg,
-        is_private=True,
-        get_sender=AsyncMock(side_effect=Exception("Telegram unreachable")),
+    event = cast(
+        _NewMessageEvent,
+        SimpleNamespace(
+            chat_id=dialog_id,
+            message=msg,
+            is_private=True,
+            get_sender=AsyncMock(side_effect=Exception("Telegram unreachable")),
+        ),
     )
 
     manager = make_manager(mock_client, sync_db, shutdown_event)
@@ -357,7 +382,7 @@ async def test_auto_enroll_no_entity_when_sender_unavailable(
 @pytest.mark.asyncio
 async def test_auto_enroll_writes_tombstone_for_nameless_sender(
     mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """Auto-enroll writes entity row with name=NULL when sender has no display name."""
@@ -365,11 +390,14 @@ async def test_auto_enroll_writes_tombstone_for_nameless_sender(
     sender = SimpleNamespace(first_name=None, last_name=None, username="ghost_bot")
 
     msg = build_mock_message(id=1, text="beep")
-    event = SimpleNamespace(
-        chat_id=dialog_id,
-        message=msg,
-        is_private=True,
-        get_sender=AsyncMock(return_value=sender),
+    event = cast(
+        _NewMessageEvent,
+        SimpleNamespace(
+            chat_id=dialog_id,
+            message=msg,
+            is_private=True,
+            get_sender=AsyncMock(return_value=sender),
+        ),
     )
 
     manager = make_manager(mock_client, sync_db, shutdown_event)
@@ -385,7 +413,7 @@ async def test_auto_enroll_writes_tombstone_for_nameless_sender(
 @pytest.mark.asyncio
 async def test_on_new_message_updates_last_event_at(
     mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """Firing on_new_message sets synced_dialogs.last_event_at."""
@@ -393,7 +421,9 @@ async def test_on_new_message_updates_last_event_at(
     insert_synced_dialog(sync_db, dialog_id)
 
     # Verify last_event_at starts as None
-    before = sync_db.execute("SELECT last_event_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone()[0]
+    before_row = sync_db.execute("SELECT last_event_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone()
+    assert before_row is not None
+    before = tuple(before_row)[0]
     assert before is None
 
     manager = make_manager(mock_client, sync_db, shutdown_event)
@@ -403,14 +433,16 @@ async def test_on_new_message_updates_last_event_at(
     event = make_new_message_event(chat_id=dialog_id, message=msg)
     await manager.on_new_message(event)
 
-    after = sync_db.execute("SELECT last_event_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone()[0]
+    after_row = sync_db.execute("SELECT last_event_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone()
+    assert after_row is not None
+    after = tuple(after_row)[0]
     assert after is not None
 
 
 @pytest.mark.asyncio
 async def test_burst_50_messages(
     mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """Burst of 50 on_new_message events all insert without drops."""
@@ -425,7 +457,9 @@ async def test_burst_50_messages(
         event = make_new_message_event(chat_id=dialog_id, message=msg)
         await manager.on_new_message(event)
 
-    count = sync_db.execute("SELECT COUNT(*) FROM messages WHERE dialog_id=?", (dialog_id,)).fetchone()[0]
+    count_row = sync_db.execute("SELECT COUNT(*) FROM messages WHERE dialog_id=?", (dialog_id,)).fetchone()
+    assert count_row is not None
+    count = int(tuple(count_row)[0])
     assert count == 50
 
 
@@ -437,7 +471,7 @@ async def test_burst_50_messages(
 @pytest.mark.asyncio
 async def test_on_message_edited_creates_version(
     mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """Editing a message with changed text creates a message_versions row."""
@@ -463,17 +497,18 @@ async def test_on_message_edited_creates_version(
     assert ver_row[1] == 1
 
     # messages row updated with new text
-    new_text = sync_db.execute(
+    new_text_row = sync_db.execute(
         "SELECT text FROM messages WHERE dialog_id=? AND message_id=?",
         (dialog_id, 100),
-    ).fetchone()[0]
-    assert new_text == "new text"
+    ).fetchone()
+    assert new_text_row is not None
+    assert new_text_row[0] == "new text"
 
 
 @pytest.mark.asyncio
 async def test_on_message_edited_no_version_if_same(
     mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """Editing a message with same text does NOT create a message_versions row."""
@@ -489,14 +524,16 @@ async def test_on_message_edited_no_version_if_same(
     event = make_message_edited_event(chat_id=dialog_id, message=msg)
     await manager.on_message_edited(event)
 
-    count = sync_db.execute("SELECT COUNT(*) FROM message_versions").fetchone()[0]
+    count_row = sync_db.execute("SELECT COUNT(*) FROM message_versions").fetchone()
+    assert count_row is not None
+    count = int(tuple(count_row)[0])
     assert count == 0
 
 
 @pytest.mark.asyncio
 async def test_on_message_edited_unknown_message(
     mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """Edit to a message not in sync.db inserts the row but creates no version history."""
@@ -520,14 +557,16 @@ async def test_on_message_edited_unknown_message(
     assert row is not None
 
     # No version row (no old text to track)
-    count = sync_db.execute("SELECT COUNT(*) FROM message_versions").fetchone()[0]
+    count_row = sync_db.execute("SELECT COUNT(*) FROM message_versions").fetchone()
+    assert count_row is not None
+    count = int(tuple(count_row)[0])
     assert count == 0
 
 
 @pytest.mark.asyncio
 async def test_on_message_edited_increments_version(
     mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """Two sequential edits with different text produce version=1 and version=2."""
@@ -563,7 +602,7 @@ async def test_on_message_edited_increments_version(
 @pytest.mark.asyncio
 async def test_on_message_deleted_channel(
     mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """Deleted channel message gets is_deleted=1 with a deleted_at timestamp."""
@@ -589,7 +628,7 @@ async def test_on_message_deleted_channel(
 @pytest.mark.asyncio
 async def test_on_message_deleted_preserves_text(
     mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """Deleting a message preserves its text column (does not clear it)."""
@@ -603,17 +642,18 @@ async def test_on_message_deleted_preserves_text(
     event = make_message_deleted_event(chat_id=dialog_id, deleted_ids=[201])
     await manager.on_message_deleted(event)
 
-    text = sync_db.execute(
+    text_row = sync_db.execute(
         "SELECT text FROM messages WHERE dialog_id=? AND message_id=?",
         (dialog_id, 201),
-    ).fetchone()[0]
-    assert text == "will be deleted"
+    ).fetchone()
+    assert text_row is not None
+    assert text_row[0] == "will be deleted"
 
 
 @pytest.mark.asyncio
 async def test_on_message_deleted_already_deleted(
     mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """Firing delete again on an already-deleted message does not re-stamp deleted_at."""
@@ -635,17 +675,18 @@ async def test_on_message_deleted_already_deleted(
     event = make_message_deleted_event(chat_id=dialog_id, deleted_ids=[202])
     await manager.on_message_deleted(event)
 
-    deleted_at = sync_db.execute(
+    deleted_at_row = sync_db.execute(
         "SELECT deleted_at FROM messages WHERE dialog_id=? AND message_id=?",
         (dialog_id, 202),
-    ).fetchone()[0]
-    assert deleted_at == original_deleted_at
+    ).fetchone()
+    assert deleted_at_row is not None
+    assert deleted_at_row[0] == original_deleted_at
 
 
 @pytest.mark.asyncio
 async def test_on_message_deleted_updates_last_event_at(
     mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """Deleting a message in a synced dialog updates synced_dialogs.last_event_at."""
@@ -656,13 +697,17 @@ async def test_on_message_deleted_updates_last_event_at(
     manager = make_manager(mock_client, sync_db, shutdown_event)
     manager.register()
 
-    before = sync_db.execute("SELECT last_event_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone()[0]
+    before_row = sync_db.execute("SELECT last_event_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone()
+    assert before_row is not None
+    before = tuple(before_row)[0]
     assert before is None
 
     event = make_message_deleted_event(chat_id=dialog_id, deleted_ids=[203])
     await manager.on_message_deleted(event)
 
-    after = sync_db.execute("SELECT last_event_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone()[0]
+    after_row = sync_db.execute("SELECT last_event_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone()
+    assert after_row is not None
+    after = tuple(after_row)[0]
     assert after is not None
 
 
@@ -674,9 +719,9 @@ async def test_on_message_deleted_updates_last_event_at(
 @pytest.mark.asyncio
 async def test_on_message_deleted_dm_logs_debug(
     mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
-    caplog: Any,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """MessageDeleted with chat_id=None logs DEBUG and makes no DB changes."""
     import logging
@@ -689,7 +734,9 @@ async def test_on_message_deleted_dm_logs_debug(
     with caplog.at_level(logging.DEBUG, logger="mcp_telegram.event_handlers"):
         await manager.on_message_deleted(event)
 
-    count = sync_db.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+    count_row = sync_db.execute("SELECT COUNT(*) FROM messages").fetchone()
+    assert count_row is not None
+    count = int(tuple(count_row)[0])
     assert count == 0
 
     # Log should mention the MTProto limitation
@@ -699,7 +746,7 @@ async def test_on_message_deleted_dm_logs_debug(
 @pytest.mark.asyncio
 async def test_gap_scan_marks_deleted(
     mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """Gap scan marks message absent in Telegram (None returned) as is_deleted=1."""
@@ -730,7 +777,7 @@ async def test_gap_scan_marks_deleted(
 @pytest.mark.asyncio
 async def test_gap_scan_skips_unsynced_messages(
     mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """Gap scan does not mark messages whose sent_at >= scan_start as deleted."""
@@ -772,7 +819,7 @@ async def test_gap_scan_skips_unsynced_messages(
 
 def test_register_adds_handlers(
     mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """register() calls client.add_event_handler exactly 10 times (6 prior + 3 Phase 42 Plan 01 + 1 Plan 02)."""
@@ -784,7 +831,7 @@ def test_register_adds_handlers(
 
 def test_unregister_removes_handlers(
     mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """unregister() calls client.remove_event_handler exactly 10 times (6 prior + 3 Phase 42 Plan 01 + 1 Plan 02)."""
@@ -797,7 +844,7 @@ def test_unregister_removes_handlers(
 
 def test_refresh_synced_dialogs(
     mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """refresh_synced_dialogs() picks up dialogs inserted after manager creation."""
@@ -825,7 +872,7 @@ def test_refresh_synced_dialogs(
 
 def test_refresh_excludes_access_lost(
     mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """Dialog with status='access_lost' is NOT in _synced_dialog_ids after refresh."""
@@ -848,7 +895,7 @@ def test_refresh_excludes_access_lost(
 
 def test_refresh_includes_syncing(
     mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """Dialog with status='syncing' IS in _synced_dialog_ids after refresh (only access_lost excluded)."""
@@ -866,7 +913,7 @@ def test_refresh_includes_syncing(
 @pytest.mark.asyncio
 async def test_gap_scan_excludes_syncing_dialogs(
     mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """Dialog with status='syncing' is NOT scanned by run_dm_gap_scan."""
@@ -882,9 +929,9 @@ async def test_gap_scan_excludes_syncing_dialogs(
         )
     sync_db.commit()
 
-    get_messages_calls: list[Any] = []
+    get_messages_calls: list[object] = []
 
-    async def _get_messages(entity: Any, ids: Any) -> list[Any]:
+    async def _get_messages(entity: object, ids: object) -> list[object]:
         get_messages_calls.append(entity)
         return []
 
@@ -901,7 +948,7 @@ async def test_gap_scan_excludes_syncing_dialogs(
 @pytest.mark.asyncio
 async def test_gap_scan_excludes_access_lost_dialogs(
     mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """Dialog with status='access_lost' is NOT scanned by run_dm_gap_scan."""
@@ -917,9 +964,9 @@ async def test_gap_scan_excludes_access_lost_dialogs(
         )
     sync_db.commit()
 
-    get_messages_calls: list[Any] = []
+    get_messages_calls: list[object] = []
 
-    async def _get_messages(entity: Any, ids: Any) -> list[Any]:
+    async def _get_messages(entity: object, ids: object) -> list[object]:
         get_messages_calls.append(entity)
         return []
 
@@ -936,7 +983,7 @@ async def test_gap_scan_excludes_access_lost_dialogs(
 @pytest.mark.asyncio
 async def test_gap_scan_only_synced(
     mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """Only dialogs with status='synced' are scanned by run_dm_gap_scan."""
@@ -963,9 +1010,9 @@ async def test_gap_scan_only_synced(
     )
     sync_db.commit()
 
-    scanned: list[Any] = []
+    scanned: list[object] = []
 
-    async def _get_messages(entity: Any, ids: Any) -> list[Any]:
+    async def _get_messages(entity: object, ids: object) -> list[object]:
         scanned.append(entity)
         return [None] * len(ids)  # return Nones (all "deleted") — not relevant to test
 
@@ -989,7 +1036,7 @@ async def test_gap_scan_only_synced(
 @pytest.mark.asyncio
 async def test_on_new_message_populates_fts(
     mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """on_new_message() inserts a corresponding row into messages_fts."""
@@ -1016,7 +1063,7 @@ async def test_on_new_message_populates_fts(
 @pytest.mark.asyncio
 async def test_on_message_edited_updates_fts(
     mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """on_message_edited() updates the FTS entry with the new stemmed text."""
@@ -1055,7 +1102,7 @@ async def test_on_message_edited_updates_fts(
 @pytest.mark.asyncio
 async def test_on_message_read_updates_read_inbox_max_id(
     mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """on_message_read updates read_inbox_max_id and last_event_at for a synced dialog."""
@@ -1079,7 +1126,7 @@ async def test_on_message_read_updates_read_inbox_max_id(
 @pytest.mark.asyncio
 async def test_on_message_read_is_monotonic_against_out_of_order_events(
     mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """Review-mandated: stored value must never decrease, even if an older
@@ -1111,7 +1158,7 @@ async def test_on_message_read_is_monotonic_against_out_of_order_events(
 @pytest.mark.asyncio
 async def test_on_message_read_updates_null_baseline(
     mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """COALESCE path: NULL existing value should be replaced by event.max_id."""
@@ -1140,7 +1187,7 @@ async def test_on_message_read_updates_null_baseline(
 @pytest.mark.asyncio
 async def test_on_message_read_ignores_unknown_dialog(
     mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """on_message_read with a dialog_id not in _synced_dialog_ids is a no-op."""
@@ -1160,9 +1207,9 @@ async def test_on_message_read_ignores_unknown_dialog(
 @pytest.mark.asyncio
 async def test_on_message_read_logs_warning_on_null_chat_id(
     mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
-    caplog: Any,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Review-mandated: NULL chat_id (PM read events on some Telethon versions)
     must log WARNING so ops can see PM read staleness — NOT silently swallowed.
@@ -1183,7 +1230,7 @@ async def test_on_message_read_logs_warning_on_null_chat_id(
 
 def test_register_adds_message_read_handler(
     mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """register() calls client.add_event_handler 10 times; on_message_read is the 4th."""
@@ -1196,7 +1243,7 @@ def test_register_adds_message_read_handler(
 
 def test_unregister_removes_message_read_handler(
     mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """unregister() calls client.remove_event_handler 10 times (6 prior + 3 Phase 42 Plan 01 + 1 Plan 02)."""
@@ -1221,8 +1268,8 @@ class _LinkedChatFakeClient:
     def __init__(
         self,
         *,
-        input_entity: Any = None,
-        full_channel_result: Any = None,
+        input_entity: object | None = None,
+        full_channel_result: object | None = None,
         full_channel_error: Exception | None = None,
         forbid_call: bool = False,
     ):
@@ -1233,14 +1280,14 @@ class _LinkedChatFakeClient:
         # Attributes expected by EventHandlerManager constructor
         self.add_event_handler = MagicMock()
         self.remove_event_handler = MagicMock()
-        self.call_args_list: list[Any] = []
+        self.call_args_list: list[object] = []
 
-    async def get_input_entity(self, dialog_id: Any) -> Any:
+    async def get_input_entity(self, dialog_id: object) -> object:
         if self._forbid_call:
             raise AssertionError("get_input_entity must not be called")
         return self._input_entity
 
-    async def __call__(self, request: Any) -> Any:
+    async def __call__(self, request: object) -> object:
         if self._forbid_call:
             raise AssertionError("client() must not be called")
         self.call_args_list.append(request)
@@ -1251,7 +1298,7 @@ class _LinkedChatFakeClient:
 
 @pytest.mark.asyncio
 async def test_linked_chat_refresh_updates_dialogs(
-    sync_db: sqlite3.Connection,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """UpdateChannel for a previously-resolved broadcast channel refreshes linked_chat_id.
@@ -1322,7 +1369,7 @@ async def test_linked_chat_refresh_updates_dialogs(
 
 @pytest.mark.asyncio
 async def test_linked_chat_refresh_skips_never_resolved(
-    sync_db: sqlite3.Connection,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """UpdateChannel for a never-resolved channel does NOT call GetFullChannelRequest (D-11).
@@ -1368,7 +1415,7 @@ async def test_linked_chat_refresh_skips_never_resolved(
 
 @pytest.mark.asyncio
 async def test_linked_chat_refresh_flood_no_op(
-    sync_db: sqlite3.Connection,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """FloodWait inside _refresh_linked_chat_id leaves dialogs unchanged.
