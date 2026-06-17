@@ -1,6 +1,7 @@
 """Reading-domain service for daemon read/search/list handlers."""
 
 import dataclasses
+import inspect
 import sqlite3
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
@@ -11,6 +12,7 @@ from rapidfuzz import fuzz as _fuzz
 from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
 
 from . import daemon_api as api
+from .daemon_message import _MessageLike as _DaemonMessageLike
 from .daemon_message import fetch_reaction_counts, message_to_dict
 from .formatter import format_reaction_counts
 from .fts import stem_query
@@ -67,7 +69,7 @@ class _ListMessagesRequest:
     context_size: int
 
 
-@dataclass(frozen=True)
+@dataclass
 class _ListMessagesDbRequest:
     dialog_id: int
     limit: int
@@ -145,6 +147,13 @@ def _fetchall_rows(cursor: sqlite3.Cursor) -> list[object]:
     return [cast(object, row) for row in rows]
 
 
+def _row_value(row: object, key: str, default: object | None = None) -> object | None:
+    try:
+        return cast(object | None, row[key])  # type: ignore[index]
+    except (AttributeError, IndexError, KeyError, TypeError):
+        return default
+
+
 def _object_to_int(value: object | None, default: int = 0) -> int:
     if isinstance(value, int):
         return value
@@ -175,31 +184,35 @@ def _message_id_from_item(item: object) -> int:
     if isinstance(item, Mapping):
         row = _row_mapping(item)
         return _object_to_int(row["message_id"])
+    row_message_id = _row_value(item, "message_id")
+    if row_message_id is not None:
+        return _object_to_int(row_message_id)
     return _object_to_int(getattr(item, "message_id", None))
 
 
 def _read_message_from_row(row: object) -> api.ReadMessage:
-    mapping = _row_mapping(row)
     return api.ReadMessage(
-        message_id=_object_to_int(mapping["message_id"]),
-        sent_at=_object_to_int(mapping["sent_at"]),
-        dialog_id=_object_to_int(mapping["dialog_id"]),
-        text=_object_to_str_or_none(mapping.get("text")),
-        sender_id=_object_to_int_or_none(mapping.get("sender_id")),
-        sender_first_name=_object_to_str_or_none(mapping.get("sender_first_name")),
-        media_description=_object_to_str_or_none(mapping.get("media_description")),
-        reply_to_msg_id=_object_to_int_or_none(mapping.get("reply_to_msg_id")),
-        forum_topic_id=_object_to_int_or_none(mapping.get("forum_topic_id")),
-        is_deleted=_object_to_int(mapping.get("is_deleted"), 0),
-        deleted_at=_object_to_int_or_none(mapping.get("deleted_at")),
-        edit_date=_object_to_int_or_none(mapping.get("edit_date")),
-        topic_title=_object_to_str_or_none(mapping.get("topic_title")),
-        effective_sender_id=_object_to_int_or_none(mapping.get("effective_sender_id")),
-        is_service=_object_to_int(mapping.get("is_service"), 0),
-        out=_object_to_int(mapping.get("out"), 0),
-        fwd_from_name=_object_to_str_or_none(mapping.get("fwd_from_name")),
-        post_author=_object_to_str_or_none(mapping.get("post_author")),
-        dialog_name=_object_to_str_or_none(mapping.get("dialog_name")),
+        message_id=_object_to_int(cast(object | None, _row_value(row, "message_id"))),
+        sent_at=_object_to_int(cast(object | None, _row_value(row, "sent_at"))),
+        dialog_id=_object_to_int(cast(object | None, _row_value(row, "dialog_id"))),
+        text=_object_to_str_or_none(cast(object | None, _row_value(row, "text"))),
+        sender_id=_object_to_int_or_none(cast(object | None, _row_value(row, "sender_id"))),
+        sender_first_name=_object_to_str_or_none(cast(object | None, _row_value(row, "sender_first_name"))),
+        media_description=_object_to_str_or_none(cast(object | None, _row_value(row, "media_description"))),
+        reply_to_msg_id=_object_to_int_or_none(cast(object | None, _row_value(row, "reply_to_msg_id"))),
+        forum_topic_id=_object_to_int_or_none(cast(object | None, _row_value(row, "forum_topic_id"))),
+        is_deleted=_object_to_int(cast(object | None, _row_value(row, "is_deleted")), 0),
+        deleted_at=_object_to_int_or_none(cast(object | None, _row_value(row, "deleted_at"))),
+        edit_date=_object_to_int_or_none(cast(object | None, _row_value(row, "edit_date"))),
+        topic_title=_object_to_str_or_none(cast(object | None, _row_value(row, "topic_title"))),
+        effective_sender_id=_object_to_int_or_none(
+            cast(object | None, _row_value(row, "effective_sender_id"))
+        ),
+        is_service=_object_to_int(cast(object | None, _row_value(row, "is_service")), 0),
+        out=_object_to_int(cast(object | None, _row_value(row, "out")), 0),
+        fwd_from_name=_object_to_str_or_none(cast(object | None, _row_value(row, "fwd_from_name"))),
+        post_author=_object_to_str_or_none(cast(object | None, _row_value(row, "post_author"))),
+        dialog_name=_object_to_str_or_none(cast(object | None, _row_value(row, "dialog_name"))),
     )
 
 
@@ -655,7 +668,10 @@ class DaemonReadingService:
             return
 
         try:
-            messages = cast(Sequence[object], await self._deps.client.get_messages(entity, ids=stale_ids))
+            messages_result = self._deps.client.get_messages(entity, ids=stale_ids)
+            if not inspect.isawaitable(messages_result):
+                return
+            messages = cast(Sequence[object], await cast(Awaitable[object], messages_result))
         except FloodWaitError as exc:
             self._logger.warning(
                 "jit_reactions_floodwait dialog_id=%d stale_count=%d seconds=%d",
@@ -768,7 +784,11 @@ class DaemonReadingService:
         try:
             messages.extend(
                 [
-                    message_to_dict(msg, dialog_id=req.dialog_id, self_id=self._deps.self_id)
+                    message_to_dict(
+                        cast(_DaemonMessageLike, msg),
+                        dialog_id=req.dialog_id,
+                        self_id=self._deps.self_id,
+                    )
                     async for msg in self._deps.client.iter_messages(req.dialog_id, **iter_kwargs)
                 ]
             )

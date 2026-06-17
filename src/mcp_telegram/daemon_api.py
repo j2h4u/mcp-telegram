@@ -105,6 +105,13 @@ def _row_mapping(row: object) -> Mapping[str, object]:
     return cast(Mapping[str, object], row)
 
 
+def _row_value(row: object, key: str, default: object | None = None) -> object | None:
+    try:
+        return cast(object | None, row[key])  # type: ignore[index]
+    except (AttributeError, IndexError, KeyError, TypeError):
+        return default
+
+
 def _coerce_int(value: object, default: int) -> int:
     try:
         return int(cast(int | str, value))
@@ -117,23 +124,23 @@ def _read_message_from_row(row: Mapping[str, object], *, reactions_display: str 
         message_id=_coerce_int(row["message_id"], 0),
         sent_at=_coerce_int(row["sent_at"], 0),
         dialog_id=_coerce_int(row["dialog_id"], 0),
-        text=cast(str | None, row.get("text")),
-        sender_id=cast(int | None, row.get("sender_id")),
-        sender_first_name=cast(str | None, row.get("sender_first_name")),
-        media_description=cast(str | None, row.get("media_description")),
-        reply_to_msg_id=cast(int | None, row.get("reply_to_msg_id")),
-        forum_topic_id=cast(int | None, row.get("forum_topic_id")),
-        is_deleted=_coerce_int(row.get("is_deleted", 0), 0),
-        deleted_at=cast(int | None, row.get("deleted_at")),
-        edit_date=cast(int | None, row.get("edit_date")),
-        topic_title=cast(str | None, row.get("topic_title")),
-        effective_sender_id=cast(int | None, row.get("effective_sender_id")),
-        is_service=_coerce_int(row.get("is_service", 0), 0),
-        out=_coerce_int(row.get("out", 0), 0),
-        fwd_from_name=cast(str | None, row.get("fwd_from_name")),
-        post_author=cast(str | None, row.get("post_author")),
+        text=cast(str | None, _row_value(row, "text")),
+        sender_id=cast(int | None, _row_value(row, "sender_id")),
+        sender_first_name=cast(str | None, _row_value(row, "sender_first_name")),
+        media_description=cast(str | None, _row_value(row, "media_description")),
+        reply_to_msg_id=cast(int | None, _row_value(row, "reply_to_msg_id")),
+        forum_topic_id=cast(int | None, _row_value(row, "forum_topic_id")),
+        is_deleted=_coerce_int(cast(object, _row_value(row, "is_deleted", 0)), 0),
+        deleted_at=cast(int | None, _row_value(row, "deleted_at")),
+        edit_date=cast(int | None, _row_value(row, "edit_date")),
+        topic_title=cast(str | None, _row_value(row, "topic_title")),
+        effective_sender_id=cast(int | None, _row_value(row, "effective_sender_id")),
+        is_service=_coerce_int(cast(object, _row_value(row, "is_service", 0)), 0),
+        out=_coerce_int(cast(object, _row_value(row, "out", 0)), 0),
+        fwd_from_name=cast(str | None, _row_value(row, "fwd_from_name")),
+        post_author=cast(str | None, _row_value(row, "post_author")),
         reactions_display=reactions_display,
-        dialog_name=cast(str | None, row.get("dialog_name")),
+        dialog_name=cast(str | None, _row_value(row, "dialog_name")),
     )
 
 
