@@ -23,6 +23,7 @@ from mcp.types import (
     TextContent,
     Tool,
 )
+from starlette.types import Receive, Scope, Send
 
 from . import tools
 from .daemon_client import _request_ids
@@ -30,7 +31,7 @@ from .daemon_client import _request_ids
 logger = logging.getLogger(__name__)
 app = Server("mcp-telegram")
 _MAX_ERROR_DETAIL_LENGTH = 160
-_HTTP_LOOPBACK_ALLOWED_HOSTS = (
+_HTTP_LOOPBACK_ALLOWED_HOSTS: list[str] = [
     "127.0.0.1",
     "127.0.0.1:*",
     "localhost",
@@ -38,8 +39,8 @@ _HTTP_LOOPBACK_ALLOWED_HOSTS = (
     "::1",
     "[::1]",
     "[::1]:*",
-)
-_HTTP_LOOPBACK_ALLOWED_ORIGINS = (
+]
+_HTTP_LOOPBACK_ALLOWED_ORIGINS: list[str] = [
     "http://127.0.0.1",
     "http://127.0.0.1:*",
     "https://127.0.0.1",
@@ -52,7 +53,7 @@ _HTTP_LOOPBACK_ALLOWED_ORIGINS = (
     "http://[::1]:*",
     "https://[::1]",
     "https://[::1]:*",
-)
+]
 
 
 @cache
@@ -136,9 +137,9 @@ def _http_allowed_hosts(*, host: str, port: int) -> list[str]:
     normalized = _normalize_bind_host(host)
     if normalized and normalized not in {"0.0.0.0", "::"}:
         if normalized == "::1":
-            allowed.extend(("[::1]", f"[::1]:{port}", "[::1]:*"))
+            allowed.extend(["[::1]", f"[::1]:{port}", "[::1]:*"])
         else:
-            allowed.extend((normalized, f"{normalized}:{port}", f"{normalized}:*"))
+            allowed.extend([normalized, f"{normalized}:{port}", f"{normalized}:*"])
     allowed.extend(_split_csv_env("MCP_TELEGRAM_HTTP_ALLOWED_HOSTS"))
     return _dedupe(allowed)
 
@@ -169,12 +170,13 @@ async def list_resource_templates() -> list[ResourceTemplate]:
 
 
 @app.progress_notification()
-async def progress_notification(progress: str | int, p: float, s: float | None) -> None:
+async def progress_notification(progress: str | int, p: float, s: float | None, message: str | None = None) -> None:
     """No-op handler required by MCP protocol."""
+    _ = (progress, p, s, message)
 
 
 @app.call_tool()
-async def call_tool(name: str, arguments: t.Any) -> CallToolResult:
+async def call_tool(name: str, arguments: dict[str, object]) -> CallToolResult:
     """Handle tool calls for command line run."""
 
     if not isinstance(arguments, dict):
@@ -334,7 +336,7 @@ async def run_mcp_http_server(
         ),
     )
 
-    async def handle_mcp(scope: t.Any, receive: t.Any, send: t.Any) -> None:
+    async def handle_mcp(scope: Scope, receive: Receive, send: Send) -> None:
         await session_manager.handle_request(scope, receive, send)
 
     async def handle_health(_: Request) -> JSONResponse:

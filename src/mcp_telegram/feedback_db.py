@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
+from typing import cast
 
 from xdg_base_dirs import xdg_state_home  # type: ignore[import-error]
 
@@ -74,6 +75,17 @@ def _open_feedback_db(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
+def _row_first_int(row: tuple[object | None, ...] | None) -> int:
+    if row is None:
+        return 0
+    value = row[0]
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.isdecimal():
+        return int(value)
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Schema bootstrap
 # ---------------------------------------------------------------------------
@@ -90,8 +102,8 @@ def ensure_feedback_schema(db_path: Path) -> sqlite3.Connection:
     conn = _open_feedback_db(db_path)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL, applied_at INTEGER NOT NULL)")
-    row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
-    current = row[0] if row and row[0] is not None else 0
+    row = cast(tuple[object | None, ...] | None, conn.execute("SELECT MAX(version) FROM schema_version").fetchone())
+    current = _row_first_int(row)
     if current < 1:
         conn.execute(_FEEDBACK_DDL)
         conn.execute("INSERT INTO schema_version VALUES (1, strftime('%s', 'now'))")

@@ -1,6 +1,6 @@
 """GetMyRecentActivity MCP tool — Phase 999.1."""
 
-from typing import Any
+from collections.abc import Mapping
 
 from mcp.types import ToolAnnotations
 from pydantic import Field, field_validator
@@ -183,10 +183,19 @@ def _append_normalized_dialog_kinds(raw: object, normalized_values: list[str]) -
             normalized_values.append(kind)
 
 
-def _structured_comment(comment: dict[str, Any]) -> dict[str, object]:
-    dialog_id = int(comment.get("dialog_id") or 0)
-    message_id = int(comment.get("message_id") or 0)
-    text = comment.get("text") or ""
+def _comment_int(comment: Mapping[str, object], key: str) -> int:
+    value = comment.get(key)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.isdecimal():
+        return int(value)
+    return 0
+
+
+def _structured_comment(comment: Mapping[str, object]) -> dict[str, object]:
+    dialog_id = _comment_int(comment, "dialog_id")
+    message_id = _comment_int(comment, "message_id")
+    text = str(comment.get("text") or "")
     return {
         "dialog_id": dialog_id,
         "dialog_name": comment.get("dialog_name"),
@@ -197,7 +206,7 @@ def _structured_comment(comment: dict[str, Any]) -> dict[str, object]:
         "text": text,
         "content": telegram_content(text, "message_text"),
         "sync_status": comment.get("sync_status"),
-        "reply_count": int(comment.get("reply_count") or 0),
+        "reply_count": _comment_int(comment, "reply_count"),
         "reactions": comment.get("reactions") or [],
         "navigation": {
             "text": f"nav: dialog_id={dialog_id} message_id={message_id}",
@@ -210,13 +219,13 @@ def _structured_comment(comment: dict[str, Any]) -> dict[str, object]:
     }
 
 
-def _chronological_comments(comments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _chronological_comments(comments: list[Mapping[str, object]]) -> list[Mapping[str, object]]:
     return sorted(
         comments,
         key=lambda comment: (
-            int(comment.get("sent_at") or 0),
-            int(comment.get("dialog_id") or 0),
-            int(comment.get("message_id") or 0),
+            _comment_int(comment, "sent_at"),
+            _comment_int(comment, "dialog_id"),
+            _comment_int(comment, "message_id"),
         ),
     )
 

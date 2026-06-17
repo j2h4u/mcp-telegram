@@ -1,11 +1,16 @@
 import logging
 from functools import cache
+from typing import cast
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from telethon import TelegramClient  # type: ignore[import-untyped]
 from xdg_base_dirs import xdg_state_home  # type: ignore[import-error]
 
 logger = logging.getLogger(__name__)
+
+
+def _load_settings() -> TelegramSettings:
+    return cast(TelegramSettings, TelegramSettings())  # type: ignore[call-arg]
 
 
 class TelegramSettings(BaseSettings):
@@ -53,13 +58,13 @@ def create_client(
     if api_id is not None and api_hash is not None:
         settings = TelegramSettings(api_id=api_id, api_hash=api_hash)
     else:
-        settings = TelegramSettings()
+        settings = _load_settings()
     state_home = xdg_state_home() / "mcp-telegram"
     state_home.mkdir(parents=True, exist_ok=True, mode=0o700)
     return TelegramClient(
         state_home / session_name,
-        settings.api_id,
-        settings.api_hash,
+        cast(int, settings.api_id),
+        cast(str, settings.api_hash),
         base_logger="telethon",
         catch_up=catch_up,
         # flood_sleep_threshold is intentionally NOT set — we inherit Telethon's

@@ -125,7 +125,7 @@ def _decode_payload(token: str) -> dict[str, object]:
     if not hmac.compare_digest(mac, expected_mac):
         raise ValueError("Invalid navigation token: signature mismatch")
     try:
-        result = json.loads(data)
+        result = cast(dict[str, object], json.loads(data))
     except json.JSONDecodeError as exc:
         raise ValueError(f"Invalid navigation token: {exc}") from exc
     if not isinstance(result, dict):

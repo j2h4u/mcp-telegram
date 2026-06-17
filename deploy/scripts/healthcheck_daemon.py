@@ -6,13 +6,21 @@ from __future__ import annotations
 import json
 import socket
 import sys
+from typing import TypedDict, cast
 
 SOCKET_PATH = "/root/.local/state/mcp-telegram/daemon.sock"
 TIMEOUT_SECONDS = 5.0
 
 
+class _HealthcheckResponse(TypedDict, total=False):
+    ok: bool
+    error: str
+    detail: str
+
+
 def main() -> int:
     """Send get_sync_status via newline-delimited JSON (matching daemon_client protocol)."""
+    sock: socket.socket | None = None
     try:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(TIMEOUT_SECONDS)
@@ -29,7 +37,7 @@ def main() -> int:
                 raise RuntimeError("daemon closed connection before sending response")
             buf += chunk
 
-        response = json.loads(buf.strip())
+        response = cast(_HealthcheckResponse, json.loads(buf.strip()))
         if not response.get("ok"):
             error = response.get("error", "unknown")
             detail = response.get("detail", "")
@@ -52,10 +60,11 @@ def main() -> int:
         print(f"healthcheck failed: {error}", file=sys.stderr)
         return 1
     finally:
-        try:
-            sock.close()
-        except OSError:
-            pass
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":

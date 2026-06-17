@@ -19,6 +19,7 @@ Design:
 
 import re
 import sqlite3
+from typing import cast
 
 import snowballstemmer  # type: ignore[import-untyped]
 
@@ -86,6 +87,17 @@ def stem_query(query: str) -> str:
     return " ".join(quoted)
 
 
+def _row_first_int(row: tuple[object | None, ...] | None) -> int:
+    if row is None:
+        return 0
+    value = row[0]
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.isdecimal():
+        return int(value)
+    return 0
+
+
 def backfill_fts_index(conn: sqlite3.Connection) -> int:
     """Index messages that are missing from messages_fts.
 
@@ -98,8 +110,10 @@ def backfill_fts_index(conn: sqlite3.Connection) -> int:
 
     Returns the number of rows inserted.
     """
-    msg_count = conn.execute("SELECT COUNT(*) FROM messages WHERE is_deleted = 0").fetchone()[0]
-    fts_count = conn.execute("SELECT COUNT(*) FROM messages_fts").fetchone()[0]
+    msg_row = cast(tuple[object | None, ...] | None, conn.execute("SELECT COUNT(*) FROM messages WHERE is_deleted = 0").fetchone())
+    fts_row = cast(tuple[object | None, ...] | None, conn.execute("SELECT COUNT(*) FROM messages_fts").fetchone())
+    msg_count = _row_first_int(msg_row)
+    fts_count = _row_first_int(fts_row)
 
     if msg_count == 0 or fts_count >= msg_count:
         return 0
@@ -107,8 +121,8 @@ def backfill_fts_index(conn: sqlite3.Connection) -> int:
     # Avoid LEFT JOIN against FTS5 — the FTS virtual table has no B-tree index
     # for the planner, making a JOIN O(n*m). Instead: fetch both key sets into
     # Python, compute the difference, then load text only for missing rows.
-    fts_keys: set[tuple[int, int]] = set(conn.execute("SELECT dialog_id, message_id FROM messages_fts").fetchall())
-    all_rows = conn.execute("SELECT dialog_id, message_id, text FROM messages WHERE is_deleted = 0").fetchall()
+    fts_keys = cast(set[tuple[int, int]], set(conn.execute("SELECT dialog_id, message_id FROM messages_fts").fetchall()))
+    all_rows = cast(list[tuple[int, int, str | None]], conn.execute("SELECT dialog_id, message_id, text FROM messages WHERE is_deleted = 0").fetchall())
     rows = [(d, m, t) for d, m, t in all_rows if (d, m) not in fts_keys]
 
     if not rows:

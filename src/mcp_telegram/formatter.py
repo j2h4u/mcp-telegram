@@ -1,7 +1,8 @@
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import TypedDict, Unpack
+from typing import Protocol, TypedDict, Unpack, cast
 from zoneinfo import ZoneInfo
 
 import telethon.tl.types as tl  # type: ignore[import-untyped]
@@ -637,6 +638,11 @@ def _describe_document_filename(doc: object, attr: tl.DocumentAttributeFilename)
     return f"[документ: {attr.file_name}{size_str}]"
 
 
+class _DocumentLike(Protocol):
+    attributes: Sequence[object]
+    size: int | None
+
+
 def _describe_media(media: object) -> str:
     """Return a human-readable placeholder for a media attachment.
 
@@ -676,17 +682,17 @@ def _describe_document(media: object) -> str:
     Priority order: sticker > round video > animation > audio > regular video > filename.
     Sticker checked first because sticker packs can carry a duration attribute.
     """
-    doc = getattr(media, "document", None)
+    doc = cast(object | None, getattr(media, "document", None))
     if doc is None:
         return "[документ]"
-    attrs = getattr(doc, "attributes", []) or []
+    attrs = list(cast(Sequence[object], getattr(doc, "attributes", [])) or [])
     description = "[документ]"
     sticker_attr = next((attr for attr in attrs if isinstance(attr, tl.DocumentAttributeSticker)), None)
     round_video_attr = next(
         (
             attr
             for attr in attrs
-            if isinstance(attr, tl.DocumentAttributeVideo) and getattr(attr, "round_message", False)
+            if isinstance(attr, tl.DocumentAttributeVideo) and cast(bool, getattr(attr, "round_message", False))
         ),
         None,
     )

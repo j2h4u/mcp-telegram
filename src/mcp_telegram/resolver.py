@@ -1,8 +1,9 @@
 import logging
 import re
 import sqlite3
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Protocol, TypedDict
 
 from anyascii import anyascii
 from rapidfuzz import fuzz, process, utils
@@ -43,7 +44,7 @@ class Candidates:
     """Multiple matches found — caller should disambiguate."""
 
     query: str
-    matches: list[dict]
+    matches: list[MatchInfo]
     """Each dict: {entity_id: int, display_name: str, score: float, username: str|None, entity_type: str}."""
 
 
@@ -62,6 +63,21 @@ class _BuildMatchesOptions:
     exact_first_id: int | None = None
     collision_query: str | None = None
     collision_count: int | None = None
+
+
+class _EntityCache(Protocol):
+    def get(self, entity_id: int, ttl_seconds: int = 300) -> Mapping[str, object] | None: ...
+
+    def get_by_username(self, username: str) -> tuple[int, str] | None: ...
+
+
+class MatchInfo(TypedDict):
+    entity_id: int
+    display_name: str
+    score: int
+    username: str | None
+    entity_type: str | None
+    disambiguation_hint: str | None
 
 
 def _parse_numeric_query(query: str) -> int | None:
@@ -119,7 +135,7 @@ def _build_norm_map(
 def _fuzzy_resolve(
     query: str,
     display_name_map: dict[int, str],
-    entity_cache: Any | None = None,
+    entity_cache: _EntityCache | None = None,
     *,
     normalized_name_map: dict[int, str] | None = None,
 ) -> ResolveResult:
@@ -198,10 +214,10 @@ def _fuzzy_resolve(
 def _build_matches(
     hits: list[tuple[str, float, int]],
     norm_map: dict[str, list[tuple[int, str]]],
-    entity_cache: Any | None,
+    entity_cache: _EntityCache | None,
     *,
     options: _BuildMatchesOptions | None = None,
-) -> list[dict]:
+) -> list[MatchInfo]:
     """Build match dicts from rapidfuzz hits, optionally putting exact_first_id first.
 
     When collision_query is provided (≥2 entities share the same normalized name),
@@ -210,7 +226,7 @@ def _build_matches(
     fuzzy match list, and restricts the type list to the first ``collision_count`` entries
     (the exact-match leaders), which are the actual ambiguous candidates.
     """
-    matches: list[dict] = []
+    matches: list[MatchInfo] = []
     seen_ids: set[int] = set()
     effective_options = options or _BuildMatchesOptions()
 
@@ -231,11 +247,11 @@ def _build_matches(
 
 
 def _append_remaining_matches(
-    matches: list[dict],
+    matches: list[MatchInfo],
     seen_ids: set[int],
     hits: list[tuple[str, float, int]],
     norm_map: dict[str, list[tuple[int, str]]],
-    entity_cache: Any | None,
+    entity_cache: _EntityCache | None,
 ) -> None:
     for norm_name, score, _idx in hits:
         for entity_id, original_name in norm_map.get(norm_name, []):
@@ -246,7 +262,7 @@ def _append_remaining_matches(
 
 
 def _apply_disambiguation_hint(
-    matches: list[dict],
+    matches: list[MatchInfo],
     *,
     collision_query: str | None,
     collision_count: int | None,
@@ -258,14 +274,14 @@ def _apply_disambiguation_hint(
 
     n = collision_count if collision_count is not None else len(matches)
     scope = matches[:n] if collision_count is not None else matches
-    types = sorted({match["entity_type"] or "Unknown" for match in scope})
+    types = sorted({str(match["entity_type"]) if match["entity_type"] is not None else "Unknown" for match in scope})
     hint = f'{n} entities match "{collision_query}": {", ".join(types)}. Specify @username or numeric id.'
     for match in matches:
         match["disambiguation_hint"] = hint
 
 
-def _make_match_info(entity_id: int, display_name: str, score: int, entity_cache: Any | None) -> dict:
-    entity_info: dict = {
+def _make_match_info(entity_id: int, display_name: str, score: int, entity_cache: _EntityCache | None) -> MatchInfo:
+    entity_info: MatchInfo = {
         "entity_id": entity_id,
         "display_name": display_name,
         "score": score,
@@ -277,9 +293,13 @@ def _make_match_info(entity_id: int, display_name: str, score: int, entity_cache
         try:
             entity_cached = entity_cache.get(entity_id, ttl_seconds=300)
             if entity_cached:
-                entity_info["username"] = entity_cached.get("username")
-                entity_info["entity_type"] = entity_cached.get("type")
-        except sqlite3.OperationalError, sqlite3.DatabaseError, OSError:
+                username = entity_cached.get("username")
+                if isinstance(username, str):
+                    entity_info["username"] = username
+                entity_type = entity_cached.get("type")
+                if isinstance(entity_type, str):
+                    entity_info["entity_type"] = entity_type
+        except (sqlite3.OperationalError, sqlite3.DatabaseError, OSError):
             pass  # cache unavailable; proceed without enrichment
         except Exception:
             logger.warning("unexpected entity_cache error in fuzzy resolve for entity_id=%r", entity_id, exc_info=True)
@@ -297,7 +317,7 @@ def _make_match_info(entity_id: int, display_name: str, score: int, entity_cache
 def resolve(
     query: str,
     display_name_map: dict[int, str],
-    entity_cache: Any | None = None,
+    entity_cache: _EntityCache | None = None,
     *,
     normalized_name_map: dict[int, str] | None = None,
 ) -> ResolveResult:
@@ -323,7 +343,7 @@ def resolve(
             if result:
                 entity_id, name = result
                 return Resolved(entity_id=entity_id, display_name=name)
-        except sqlite3.OperationalError, sqlite3.DatabaseError, OSError:
+        except (sqlite3.OperationalError, sqlite3.DatabaseError, OSError):
             pass  # cache unavailable; fall through to NotFound
         except Exception:
             logger.warning("unexpected entity_cache error in @username resolve for query=%r", query, exc_info=True)

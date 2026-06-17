@@ -4,6 +4,7 @@ import logging
 import signal
 import sqlite3
 from pathlib import Path
+from typing import cast
 
 from xdg_base_dirs import xdg_state_home  # type: ignore[import-error]
 
@@ -443,6 +444,17 @@ def _open_sync_db(db_path: Path, *, read_only: bool = False) -> sqlite3.Connecti
     return conn
 
 
+def _row_first_int(row: tuple[object | None, ...] | None) -> int:
+    if row is None:
+        return 0
+    value = row[0]
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.isdecimal():
+        return int(value)
+    return 0
+
+
 def open_sync_db_reader(db_path: Path) -> sqlite3.Connection:
     """Open sync.db read-only for MCP server process.
 
@@ -459,12 +471,12 @@ def open_sync_db_reader(db_path: Path) -> sqlite3.Connection:
 
 def _schema_ready(conn: sqlite3.Connection) -> bool:
     """Return True if sync.db schema is at current version and WAL mode is active."""
-    row = conn.execute("PRAGMA journal_mode").fetchone()
+    row = cast(tuple[object | None, ...] | None, conn.execute("PRAGMA journal_mode").fetchone())
     if row is None or str(row[0]).lower() != "wal":
         return False
     try:
-        row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
-        return row is not None and row[0] is not None and int(row[0]) >= _CURRENT_SCHEMA_VERSION
+        row = cast(tuple[object | None, ...] | None, conn.execute("SELECT MAX(version) FROM schema_version").fetchone())
+        return _row_first_int(row) >= _CURRENT_SCHEMA_VERSION
     except sqlite3.OperationalError:
         return False
 
@@ -1060,8 +1072,8 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
         """
     )
 
-    row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
-    current = row[0] if row is not None and row[0] is not None else 0
+    row = cast(tuple[object | None, ...] | None, conn.execute("SELECT MAX(version) FROM schema_version").fetchone())
+    current = _row_first_int(row)
     current = _apply_migrations_1_to_5(conn, current)
     current = _apply_migrations_6_to_10(conn, current)
     current = _apply_migrations_11_to_15(conn, current)

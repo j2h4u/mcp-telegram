@@ -1,7 +1,7 @@
 import asyncio
 import os
 import sqlite3
-from typing import Annotated
+from typing import Annotated, cast
 
 from typer import Argument, BadParameter, Context, Option, Typer
 
@@ -36,6 +36,17 @@ def _resolve_http_port(port: int | None) -> int:
     return resolved
 
 
+def _row_first_int(row: tuple[object | None, ...] | None) -> int:
+    if row is None:
+        return 0
+    value = row[0]
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.isdecimal():
+        return int(value)
+    return 0
+
+
 @app.callback(invoke_without_command=True)
 def _run(ctx: Context) -> None:
     if ctx.invoked_subcommand is None:
@@ -46,9 +57,9 @@ def _run(ctx: Context) -> None:
 @app.command()
 def run() -> None:
     """Run the mcp-telegram server."""
-    from .server import run_mcp_server
+    from . import server as _server
 
-    asyncio.run(run_mcp_server())
+    asyncio.run(_server.run_mcp_server())
 
 
 @app.command()
@@ -102,8 +113,8 @@ def serve(
     import os
     import sys
 
+    from . import server as _server
     from .daemon import sync_main
-    from .server import run_mcp_http_server
 
     resolved_host = _resolve_http_host(host)
     resolved_port = _resolve_http_port(port)
@@ -118,7 +129,7 @@ def serve(
     async def _run() -> None:
         sync_task = asyncio.create_task(sync_main(), name="sync-daemon")
         http_task = asyncio.create_task(
-            run_mcp_http_server(host=resolved_host, port=resolved_port),
+            _server.run_mcp_http_server(host=resolved_host, port=resolved_port),
             name="mcp-http",
         )
         tasks = {sync_task, http_task}
@@ -163,7 +174,8 @@ def _feedback_list_select_rows(conn: sqlite3.Connection, limit: int, show_all: b
 def _feedback_list_empty_message(conn: sqlite3.Connection, show_all: bool) -> str:
     if show_all:
         return "No feedback recorded yet."
-    total = conn.execute("SELECT COUNT(*) FROM feedback").fetchone()[0]
+    row = cast(tuple[object | None, ...] | None, conn.execute("SELECT COUNT(*) FROM feedback").fetchone())
+    total = _row_first_int(row)
     if total == 0:
         return "No feedback recorded yet."
     return "No open or in-progress feedback. Use --all to show history."

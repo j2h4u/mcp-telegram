@@ -16,7 +16,8 @@ import asyncio
 import logging
 import sqlite3
 import time
-from typing import Any, TypedDict, Unpack
+from collections.abc import AsyncIterator
+from typing import Protocol, TypedDict, Unpack, cast
 
 from telethon.errors import (
     FloodWaitError,  # type: ignore[import-untyped]
@@ -65,6 +66,30 @@ class AccessProbeLoopOptions(TypedDict, total=False):
     interval: float
 
 
+class _DeltaSyncClient(Protocol):
+    def iter_messages(
+        self,
+        *,
+        entity: int,
+        min_id: int,
+        reverse: bool,
+        limit: int | None,
+    ) -> AsyncIterator[object]: ...
+
+    async def get_messages(self, *, entity: int, limit: int) -> object: ...
+
+
+def _row_first_int(row: tuple[object | None, ...] | None) -> int:
+    if row is None:
+        return 0
+    value = row[0]
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.isdecimal():
+        return int(value)
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # DeltaSyncWorker
 # ---------------------------------------------------------------------------
@@ -86,7 +111,7 @@ class DeltaSyncWorker:
 
     def __init__(
         self,
-        client: Any,
+        client: _DeltaSyncClient,
         conn: sqlite3.Connection,
         shutdown_event: asyncio.Event,
     ) -> None:
@@ -108,7 +133,7 @@ class DeltaSyncWorker:
         RECENT_SYNC_SKIP_THRESHOLD_S are skipped to prevent a
         GetHistoryRequest storm after a rapid daemon restart (D-01).
         """
-        rows = self._conn.execute(_SELECT_SYNCED_DIALOGS_FOR_DELTA_SQL).fetchall()
+        rows = cast(list[tuple[int, int | None]], self._conn.execute(_SELECT_SYNCED_DIALOGS_FOR_DELTA_SQL).fetchall())
         now = int(time.time())
         total_new = 0
         skipped = 0
@@ -149,8 +174,8 @@ class DeltaSyncWorker:
         Returns:
             Count of new messages stored. 0 if no gap, no baseline, or error.
         """
-        row = self._conn.execute(_SELECT_MAX_MESSAGE_ID_SQL, (dialog_id,)).fetchone()
-        max_known_id = row[0] if row else 0
+        row = cast(tuple[object | None, ...] | None, self._conn.execute(_SELECT_MAX_MESSAGE_ID_SQL, (dialog_id,)).fetchone())
+        max_known_id = _row_first_int(row)
         if max_known_id == 0:
             # No baseline yet — FullSyncWorker handles this dialog
             return 0
@@ -222,7 +247,7 @@ class DeltaSyncWorker:
 
 
 async def _probe_access_lost_dialogs(
-    client: Any,
+    client: _DeltaSyncClient,
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,
     delta_worker: DeltaSyncWorker,
@@ -232,7 +257,7 @@ async def _probe_access_lost_dialogs(
     Recovery sequence: probe -> gap-fill -> THEN reset status.
     If gap-fill fails, status stays access_lost (safe rollback).
     """
-    rows = conn.execute(_SELECT_ACCESS_LOST_SQL).fetchall()
+    rows = cast(list[tuple[int]], conn.execute(_SELECT_ACCESS_LOST_SQL).fetchall())
     if not rows:
         return 0
 
@@ -241,7 +266,7 @@ async def _probe_access_lost_dialogs(
         try:
             result = await client.get_messages(entity=dialog_id, limit=1)
             # Success — access restored. Capture total before gap-fill.
-            total = getattr(result, "total", None)
+            total = cast(int | None, getattr(result, "total", None))
 
             # Gap-fill FIRST, while status is still access_lost.
             # If this fails, we skip the dialog — status stays access_lost.
@@ -274,7 +299,7 @@ async def _probe_access_lost_dialogs(
 
 
 async def run_access_probe_loop(
-    client: Any,
+    client: _DeltaSyncClient,
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,
     delta_worker: DeltaSyncWorker,

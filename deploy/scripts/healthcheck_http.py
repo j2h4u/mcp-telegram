@@ -9,6 +9,12 @@ import os
 import sys
 import urllib.error
 import urllib.request
+from http.client import HTTPResponse
+from typing import TypedDict, cast
+
+
+class _HealthcheckPayload(TypedDict, total=False):
+    ok: bool
 
 
 def main() -> int:
@@ -17,11 +23,11 @@ def main() -> int:
     url = f"http://{host}:{port}/health"
 
     try:
-        with urllib.request.urlopen(url, timeout=5) as response:
+        with cast(HTTPResponse, urllib.request.urlopen(url, timeout=5)) as response:
             if response.status != http.HTTPStatus.OK:
                 print(f"HTTP healthcheck failed: status={response.status}", file=sys.stderr)
                 return 1
-            payload = json.loads(response.read().decode("utf-8"))
+            payload = cast(_HealthcheckPayload, json.loads(response.read().decode("utf-8")))
     except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
         print(f"HTTP healthcheck failed: {exc}", file=sys.stderr)
         return 1

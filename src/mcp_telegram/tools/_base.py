@@ -7,6 +7,7 @@ import typing as t
 from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import singledispatch
+from typing import TypedDict, Unpack
 
 from mcp.types import (
     EmbeddedResource,
@@ -30,6 +31,13 @@ class ToolArgs(BaseModel):
     model_config = ConfigDict()
 
 
+class ToolResultMetadata(TypedDict, total=False):
+    result_count: int
+    has_cursor: bool
+    page_depth: int
+    has_filter: bool
+
+
 def _text_response(text: str) -> list[TextContent]:
     """Wrap a plain string in the MCP TextContent envelope."""
     return [TextContent(type="text", text=text)]
@@ -41,18 +49,20 @@ def _daemon_not_running_text() -> str:
 
 
 def _check_daemon_response(
-    response: dict,
+    response: Mapping[str, object],
     *,
     action: str = "Retry with corrected arguments or inspect the relevant status/list tool for valid ids.",
-    **extra_kwargs: t.Any,
+    **extra_kwargs: Unpack[ToolResultMetadata],
 ) -> ToolResult | None:
     """Return a ToolResult with error text if response is not ok, else None.
 
     Callers use: ``if err := _check_daemon_response(response): return err``
     """
-    if response.get("ok"):
+    if response.get("ok") is True:
         return None
     error_detail = response.get("message", "Request failed.")
+    if not isinstance(error_detail, str):
+        error_detail = str(error_detail)
     error_code = response.get("error")
     if isinstance(error_code, str) and error_code and error_code not in str(error_detail):
         text = f"Error: {error_code}: {error_detail}"
@@ -69,7 +79,7 @@ class ToolResult:
 
     content: t.Sequence[TextContent | ImageContent | EmbeddedResource] = ()
     is_error: bool = False
-    structured_content: dict[str, t.Any] | None = None
+    structured_content: dict[str, object] | None = None
     result_count: int = 0
     has_cursor: bool = False
     page_depth: int = 1
@@ -77,7 +87,7 @@ class ToolResult:
 
 
 ToolArgT = t.TypeVar("ToolArgT", bound=ToolArgs)
-type ToolRunnerFunc[TToolArg: ToolArgs] = t.Callable[[TToolArg], t.Coroutine[t.Any, t.Any, ToolResult]]
+type ToolRunnerFunc[TToolArg: ToolArgs] = t.Callable[[TToolArg], t.Awaitable[ToolResult]]
 
 
 @dataclass(frozen=True)
@@ -87,7 +97,7 @@ class ToolRegistryEntry:
     annotations: ToolAnnotations | None
     exported_name: str
     title: str
-    output_schema: dict[str, t.Any] | None = None
+    output_schema: dict[str, object] | None = None
 
     def __iter__(self) -> t.Iterator[object]:
         """Preserve tuple-unpack compatibility while callers migrate."""
@@ -99,12 +109,12 @@ class ToolRegistryEntry:
         return (self.cls, self.posture, self.annotations)[index]
 
 
-def structured_result(structured_content: Mapping[str, t.Any], **metadata: t.Any) -> ToolResult:
+def structured_result(structured_content: Mapping[str, object], **metadata: Unpack[ToolResultMetadata]) -> ToolResult:
     """Return a successful structured-only tool result."""
     return ToolResult(content=(), structured_content=dict(structured_content), **metadata)
 
 
-def error_result(text: str, **metadata: t.Any) -> ToolResult:
+def error_result(text: str, **metadata: Unpack[ToolResultMetadata]) -> ToolResult:
     """Return recoverable error text as an MCP tool result."""
     return ToolResult(content=_text_response(text), is_error=True, **metadata)
 
@@ -113,7 +123,7 @@ def error_result(text: str, **metadata: t.Any) -> ToolResult:
 _background_tasks: set[asyncio.Task[None]] = set()
 
 
-async def _send_telemetry_event(event_dict: dict[str, t.Any]) -> None:
+async def _send_telemetry_event(event_dict: dict[str, object]) -> None:
     """Fire-and-forget: send telemetry to daemon. Never raises."""
     try:
         async with daemon_connection() as conn:
@@ -144,7 +154,8 @@ def _track_tool_telemetry(tool_name: str) -> t.Callable[[ToolRunnerFunc[ToolArgT
             error_type = None
             tool_result: ToolResult | None = None
             try:
-                return await fn(args)
+                tool_result = await fn(args)
+                return tool_result  # noqa: RET504
             except Exception as exc:
                 error_type = type(exc).__name__
                 raise
@@ -177,9 +188,9 @@ def _track_tool_telemetry(tool_name: str) -> t.Callable[[ToolRunnerFunc[ToolArgT
 
 
 @singledispatch
-async def tool_runner(
+def tool_runner(
     args: ToolArgs,
-) -> ToolResult:
+) -> t.Awaitable[ToolResult]:
     """Dispatch a ToolArgs instance to its registered async handler."""
     raise NotImplementedError(f"Unsupported type: {type(args)}")
 
@@ -202,7 +213,7 @@ def mcp_tool(
     *,
     posture: str = "primary",
     annotations: ToolAnnotations | None = None,
-    output_schema: dict[str, t.Any] | None = None,
+    output_schema: dict[str, object] | None = None,
 ) -> t.Callable[[ToolRunnerFunc[ToolArgT]], ToolRunnerFunc[ToolArgT]]:
     """Register runner with singledispatch + telemetry + tool registry.
 
@@ -233,7 +244,7 @@ def mcp_tool(
 
     def decorator(fn: ToolRunnerFunc[ToolArgT]) -> ToolRunnerFunc[ToolArgT]:
         hints = t.get_type_hints(fn)
-        cls_obj = hints["args"]
+        cls_obj = t.cast(type[ToolArgs], hints["args"])
         if not isinstance(cls_obj, type) or not issubclass(cls_obj, ToolArgs):
             raise TypeError("@mcp_tool runner must annotate args with a ToolArgs subclass")
         cls: type[ToolArgs] = cls_obj
@@ -264,7 +275,7 @@ def mcp_tool(
 
 def tool_description(exported_name: str, cls: type[ToolArgs], entry: ToolRegistryEntry) -> Tool:
     """Build an MCP Tool descriptor from registry metadata."""
-    schema = _sanitize_tool_schema(cls.model_json_schema())
+    schema = t.cast(dict[str, t.Any], _sanitize_tool_schema(cls.model_json_schema()))
     return Tool(
         name=exported_name,
         title=entry.title,
@@ -275,7 +286,7 @@ def tool_description(exported_name: str, cls: type[ToolArgs], entry: ToolRegistr
     )
 
 
-def _sanitize_tool_schema(value: t.Any) -> t.Any:
+def _sanitize_tool_schema(value: object) -> object:
     """Return MCP-friendly JSON schema without explicit null unions.
 
     Why: Claude Desktop and other MCP clients reject or misrender ``anyOf``
@@ -312,13 +323,13 @@ def _sanitize_tool_schema(value: t.Any) -> t.Any:
     return value
 
 
-def tool_args(tool: Tool, *args: t.Any, **kwargs: t.Any) -> ToolArgs:
+def tool_args(tool: Tool, *args: object, **kwargs: object) -> ToolArgs:
     """Instantiate the ToolArgs subclass registered for *tool*."""
     entry = TOOL_REGISTRY.get(tool.name)
     if entry is None:
         raise ValueError(f"Unknown tool: {tool.name}")
     cls = entry.cls
-    return cls(*args, **kwargs)
+    return t.cast(ToolArgs, cls(*args, **kwargs))
 
 
 def verify_tool_registry() -> None:

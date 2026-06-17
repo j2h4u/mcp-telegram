@@ -10,15 +10,16 @@
 import asyncio
 import datetime
 import getpass
+import importlib
 import os
 import shutil
 import sys
 import traceback
+from collections.abc import Awaitable
 from io import StringIO
 from pathlib import Path
-from typing import Any
+from typing import Protocol, cast
 
-import qrcode
 from dotenv import load_dotenv
 from telethon import TelegramClient
 from telethon.errors import PasswordHashInvalidError, RPCError, SessionPasswordNeededError
@@ -29,6 +30,52 @@ QR_LEFT_PADDING = " " * 6
 QR_BORDER = 4
 QR_REFRESH_MARGIN_SECONDS = 20
 QR_PROGRESS_BAR_WIDTH = 28
+
+
+class _QrCodeConstants(Protocol):
+    ERROR_CORRECT_L: object
+
+
+class _QrCode(Protocol):
+    def add_data(self, data: str) -> None: ...
+
+    def make(self, *, fit: bool = ...) -> None: ...
+
+    def print_ascii(self, *, invert: bool = ..., out: StringIO) -> None: ...
+
+
+class _QrCodeFactory(Protocol):
+    def __call__(
+        self,
+        *,
+        version: int | None,
+        error_correction: object,
+        box_size: int,
+        border: int,
+    ) -> _QrCode: ...
+
+
+class _QrCodeModule(Protocol):
+    QRCode: _QrCodeFactory
+    constants: _QrCodeConstants
+
+
+class _QrLogin(Protocol):
+    @property
+    def expires(self) -> datetime.datetime: ...
+
+    @property
+    def url(self) -> str: ...
+
+    def wait(self, timeout: float) -> Awaitable[None]: ...
+
+
+class _TelegramUser(Protocol):
+    phone: str | None
+    first_name: str | None
+
+
+qrcode = cast(_QrCodeModule, importlib.import_module("qrcode"))
 
 
 def _load_telegram_credentials() -> tuple[int, str, str]:
@@ -72,7 +119,7 @@ def clear_screen() -> None:
     os.system("clear" if os.name == "posix" else "cls")
 
 
-def _qr_lifetime(qr_login: Any) -> int:
+def _qr_lifetime(qr_login: _QrLogin) -> int:
     """Return seconds until qr_login expires (minimum 1)."""
     return max(
         1,
@@ -93,7 +140,7 @@ def build_countdown_bar(remaining_seconds: int, total_seconds: int) -> str:
 
 async def _show_account_summary(client: TelegramClient, session_file: Path | None = None) -> None:
     """Print account details for the current authenticated session."""
-    me = await client.get_me()
+    me = cast(_TelegramUser, await client.get_me())
     print(f"Phone: {me.phone}")
     print(f"Name: {me.first_name}")
     if session_file is not None:
@@ -157,7 +204,7 @@ async def complete_2fa_login(client: TelegramClient, two_fa_password: str) -> No
 
 async def _run_qr_login(client: TelegramClient, two_fa_password: str, session_file: Path) -> None:
     """Run the QR login loop until authorization completes."""
-    qr_login = await client.qr_login()
+    qr_login = cast(_QrLogin, await client.qr_login())
     qr_total_seconds = _qr_lifetime(qr_login)
 
     while True:
@@ -168,7 +215,7 @@ async def _run_qr_login(client: TelegramClient, two_fa_password: str, session_fi
         )
 
         if remaining_seconds <= QR_REFRESH_MARGIN_SECONDS:
-            qr_login = await client.qr_login()
+            qr_login = cast(_QrLogin, await client.qr_login())
             qr_total_seconds = _qr_lifetime(qr_login)
             continue
 
@@ -191,7 +238,7 @@ async def _run_qr_login(client: TelegramClient, two_fa_password: str, session_fi
             await qr_login.wait(timeout=wait_timeout)
         except TimeoutError:
             if datetime.datetime.now(tz=datetime.UTC) >= expires_at:
-                qr_login = await client.qr_login()
+                qr_login = cast(_QrLogin, await client.qr_login())
                 qr_total_seconds = _qr_lifetime(qr_login)
             continue
         except SessionPasswordNeededError:
@@ -229,7 +276,7 @@ async def main() -> None:
         print(f"\nError: {e}")
         traceback.print_exc()
     finally:
-        await client.disconnect()
+        await cast(Awaitable[None], client.disconnect())
 
 
 if __name__ == "__main__":
