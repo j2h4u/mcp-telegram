@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 import time
+from collections.abc import Callable
 from pathlib import Path
-from unittest.mock import MagicMock
+from typing import cast
 
 import pytest
 
@@ -17,6 +19,38 @@ from mcp_telegram.sync_db import (
     open_sync_db_reader,
     register_shutdown_handler,
 )
+
+
+TableInfoRow = tuple[int, str, str, int, object, int]
+Row = tuple[object, ...]
+
+
+def _open_db(db_path: Path) -> sqlite3.Connection:
+    return cast(sqlite3.Connection, _open_sync_db(db_path))
+
+
+def _fetchone_row(conn: sqlite3.Connection, sql: str, parameters: tuple[object, ...] = ()) -> Row | None:
+    return cast(Row | None, conn.execute(sql, parameters).fetchone())
+
+
+def _fetchall_rows(conn: sqlite3.Connection, sql: str, parameters: tuple[object, ...] = ()) -> list[Row]:
+    return cast(list[Row], conn.execute(sql, parameters).fetchall())
+
+
+def _table_info(conn: sqlite3.Connection, table: str) -> list[TableInfoRow]:
+    return cast(list[TableInfoRow], _fetchall_rows(conn, f"PRAGMA table_info({table})"))
+
+
+def _fetchone_int(conn: sqlite3.Connection, sql: str, parameters: tuple[object, ...] = ()) -> int:
+    row = _fetchone_row(conn, sql, parameters)
+    assert row is not None
+    return int(cast(int, row[0]))
+
+
+def _fetchone_text(conn: sqlite3.Connection, sql: str, parameters: tuple[object, ...] = ()) -> str:
+    row = _fetchone_row(conn, sql, parameters)
+    assert row is not None
+    return str(row[0])
 
 
 @pytest.fixture()
@@ -46,9 +80,9 @@ def test_db_path_is_separate() -> None:
 def test_wal_mode_active(tmp_sync_db_path: Path) -> None:
     """After ensure_sync_schema, PRAGMA journal_mode returns 'wal'."""
     ensure_sync_schema(tmp_sync_db_path)
-    conn = _open_sync_db(tmp_sync_db_path)
+    conn = _open_db(tmp_sync_db_path)
     try:
-        row = conn.execute("PRAGMA journal_mode").fetchone()
+        row = _fetchone_row(conn, "PRAGMA journal_mode")
         assert row is not None
         assert str(row[0]).lower() == "wal", f"Expected WAL mode, got {row[0]}"
     finally:
@@ -63,11 +97,11 @@ def test_wal_mode_active(tmp_sync_db_path: Path) -> None:
 def test_synced_dialogs_schema(tmp_sync_db_path: Path) -> None:
     """After ensure_sync_schema, synced_dialogs table exists with expected columns."""
     ensure_sync_schema(tmp_sync_db_path)
-    conn = _open_sync_db(tmp_sync_db_path)
+    conn = _open_db(tmp_sync_db_path)
     try:
-        rows = conn.execute("PRAGMA table_info(synced_dialogs)").fetchall()
+        rows = _table_info(conn, "synced_dialogs")
         # rows: (cid, name, type, notnull, dflt_value, pk)
-        columns = {str(row[1]): row for row in rows}
+        columns = {row[1]: row for row in rows}
         expected = {
             "dialog_id",
             "status",
@@ -99,10 +133,10 @@ def test_synced_dialogs_schema(tmp_sync_db_path: Path) -> None:
 def test_messages_schema(tmp_sync_db_path: Path) -> None:
     """messages table exists with all required columns and composite PK (dialog_id, message_id)."""
     ensure_sync_schema(tmp_sync_db_path)
-    conn = _open_sync_db(tmp_sync_db_path)
+    conn = _open_db(tmp_sync_db_path)
     try:
-        rows = conn.execute("PRAGMA table_info(messages)").fetchall()
-        columns = {str(row[1]): row for row in rows}
+        rows = _table_info(conn, "messages")
+        columns = {row[1]: row for row in rows}
         expected = {
             "dialog_id",
             "message_id",
@@ -139,10 +173,10 @@ def test_messages_schema(tmp_sync_db_path: Path) -> None:
 def test_message_versions_schema(tmp_sync_db_path: Path) -> None:
     """message_versions table exists with expected columns and composite PK."""
     ensure_sync_schema(tmp_sync_db_path)
-    conn = _open_sync_db(tmp_sync_db_path)
+    conn = _open_db(tmp_sync_db_path)
     try:
-        rows = conn.execute("PRAGMA table_info(message_versions)").fetchall()
-        columns = {str(row[1]): row for row in rows}
+        rows = _table_info(conn, "message_versions")
+        columns = {row[1]: row for row in rows}
         expected = {"dialog_id", "message_id", "version", "old_text", "edit_date"}
         assert expected == set(columns.keys()), f"Unexpected columns. Got: {set(columns.keys())}, expected: {expected}"
         # dialog_id, message_id, version are all part of composite PK
@@ -161,13 +195,11 @@ def test_message_versions_schema(tmp_sync_db_path: Path) -> None:
 def test_is_deleted_columns(tmp_sync_db_path: Path) -> None:
     """Insert a message row with only required fields; is_deleted defaults to 0, deleted_at is NULL."""
     ensure_sync_schema(tmp_sync_db_path)
-    conn = _open_sync_db(tmp_sync_db_path)
+    conn = _open_db(tmp_sync_db_path)
     try:
         conn.execute("INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (1, 100, 1700000000)")
         conn.commit()
-        row = conn.execute(
-            "SELECT is_deleted, deleted_at FROM messages WHERE dialog_id=1 AND message_id=100"
-        ).fetchone()
+        row = _fetchone_row(conn, "SELECT is_deleted, deleted_at FROM messages WHERE dialog_id=1 AND message_id=100")
         assert row is not None, "Inserted row not found"
         is_deleted, deleted_at = row
         assert is_deleted == 0, f"is_deleted should default to 0, got {is_deleted}"
@@ -189,9 +221,9 @@ def test_migration_idempotent(tmp_sync_db_path: Path) -> None:
     """
     ensure_sync_schema(tmp_sync_db_path)
     ensure_sync_schema(tmp_sync_db_path)  # second call must be a no-op
-    conn = _open_sync_db(tmp_sync_db_path)
+    conn = _open_db(tmp_sync_db_path)
     try:
-        rows = conn.execute("SELECT * FROM schema_version ORDER BY version").fetchall()
+        rows = _fetchall_rows(conn, "SELECT * FROM schema_version ORDER BY version")
         # Schema v2 has 2 version rows (v1 + v2); second ensure_sync_schema adds 0
         assert len(rows) == _CURRENT_SCHEMA_VERSION, (
             f"Expected {_CURRENT_SCHEMA_VERSION} schema_version rows, got {len(rows)}"
@@ -203,11 +235,10 @@ def test_migration_idempotent(tmp_sync_db_path: Path) -> None:
 def test_schema_version_value(tmp_sync_db_path: Path) -> None:
     """After first migration, MAX(version) in schema_version equals _CURRENT_SCHEMA_VERSION (2)."""
     ensure_sync_schema(tmp_sync_db_path)
-    conn = _open_sync_db(tmp_sync_db_path)
+    conn = _open_db(tmp_sync_db_path)
     try:
-        row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
-        assert row is not None and row[0] is not None, "schema_version has no rows"
-        assert int(row[0]) == _CURRENT_SCHEMA_VERSION, f"Expected version {_CURRENT_SCHEMA_VERSION}, got {row[0]}"
+        version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
+        assert version == _CURRENT_SCHEMA_VERSION, f"Expected version {_CURRENT_SCHEMA_VERSION}, got {version}"
     finally:
         conn.close()
 
@@ -220,10 +251,10 @@ def test_schema_version_value(tmp_sync_db_path: Path) -> None:
 def test_schema_v2_migration_adds_access_lost_at(tmp_sync_db_path: Path) -> None:
     """After ensure_sync_schema(), PRAGMA table_info(synced_dialogs) includes access_lost_at INTEGER."""
     ensure_sync_schema(tmp_sync_db_path)
-    conn = _open_sync_db(tmp_sync_db_path)
+    conn = _open_db(tmp_sync_db_path)
     try:
-        rows = conn.execute("PRAGMA table_info(synced_dialogs)").fetchall()
-        columns = {str(row[1]): row for row in rows}
+        rows = _table_info(conn, "synced_dialogs")
+        columns = {row[1]: row for row in rows}
         assert "access_lost_at" in columns, f"access_lost_at missing. Got: {set(columns.keys())}"
         assert columns["access_lost_at"][2] == "INTEGER"
     finally:
@@ -234,9 +265,9 @@ def test_schema_migration_idempotent_v2(tmp_sync_db_path: Path) -> None:
     """Calling ensure_sync_schema() twice produces exactly _CURRENT_SCHEMA_VERSION rows in schema_version."""
     ensure_sync_schema(tmp_sync_db_path)
     ensure_sync_schema(tmp_sync_db_path)  # must not raise
-    conn = _open_sync_db(tmp_sync_db_path)
+    conn = _open_db(tmp_sync_db_path)
     try:
-        rows = conn.execute("SELECT * FROM schema_version ORDER BY version").fetchall()
+        rows = _fetchall_rows(conn, "SELECT * FROM schema_version ORDER BY version")
         assert len(rows) == _CURRENT_SCHEMA_VERSION
         assert rows[0][0] == 1
         assert rows[1][0] == 2
@@ -263,9 +294,9 @@ def test_migration_v9_adds_out_and_is_service_columns(tmp_sync_db_path: Path) ->
     share the same default posture.
     """
     ensure_sync_schema(tmp_sync_db_path)
-    conn = _open_sync_db(tmp_sync_db_path)
+    conn = _open_db(tmp_sync_db_path)
     try:
-        rows = conn.execute("PRAGMA table_info(messages)").fetchall()
+        rows = _table_info(conn, "messages")
         # PRAGMA table_info: (cid, name, type, notnull, dflt_value, pk)
         columns = {str(row[1]): row for row in rows}
         assert "out" in columns, f"`out` column missing. Got: {set(columns.keys())}"
@@ -281,8 +312,8 @@ def test_migration_v9_adds_out_and_is_service_columns(tmp_sync_db_path: Path) ->
         assert svc_col[3] == 1, "is_service must be NOT NULL"
         assert str(svc_col[4]) == "0", f"is_service default must be 0, got {svc_col[4]!r}"
 
-        version = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
-        assert version is not None and int(version[0]) == _CURRENT_SCHEMA_VERSION
+        version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
+        assert version == _CURRENT_SCHEMA_VERSION
     finally:
         conn.close()
 
@@ -291,10 +322,10 @@ def test_migration_v9_is_idempotent(tmp_sync_db_path: Path) -> None:
     """Running ensure_sync_schema() twice keeps schema_version stable with no error."""
     ensure_sync_schema(tmp_sync_db_path)
     ensure_sync_schema(tmp_sync_db_path)
-    conn = _open_sync_db(tmp_sync_db_path)
+    conn = _open_db(tmp_sync_db_path)
     try:
-        rows = conn.execute("SELECT version FROM schema_version ORDER BY version").fetchall()
-        versions = [int(r[0]) for r in rows]
+        rows = _fetchall_rows(conn, "SELECT version FROM schema_version ORDER BY version")
+        versions = [int(cast(int, row[0])) for row in rows]
         expected = list(range(1, _CURRENT_SCHEMA_VERSION + 1))
         assert versions == expected, f"Expected versions {expected}, got {versions}"
     finally:
@@ -309,7 +340,7 @@ def test_migration_v9_is_idempotent(tmp_sync_db_path: Path) -> None:
 def test_migration_v10_backfills_out_for_dm_null_sender(tmp_sync_db_path: Path) -> None:
     """Historical DM rows with sender_id IS NULL get out=1; others untouched."""
     ensure_sync_schema(tmp_sync_db_path)
-    conn = _open_sync_db(tmp_sync_db_path)
+    conn = _open_db(tmp_sync_db_path)
     try:
         # Simulate pre-v10 state: all rows at out=0 (v9 DEFAULT). We bypass
         # the normal writer path and insert minimal rows.
@@ -329,7 +360,7 @@ def test_migration_v10_backfills_out_for_dm_null_sender(tmp_sync_db_path: Path) 
         conn.execute("UPDATE messages SET out = 1 WHERE out = 0 AND dialog_id > 0 AND sender_id IS NULL")
         conn.commit()
 
-        rows = conn.execute("SELECT dialog_id, message_id, sender_id, out FROM messages ORDER BY message_id").fetchall()
+        rows = _fetchall_rows(conn, "SELECT dialog_id, message_id, sender_id, out FROM messages ORDER BY message_id")
         # Row 1: DM + NULL sender → out=1
         assert rows[0][3] == 1, f"DM NULL-sender row should backfill to out=1, got {rows[0]}"
         # Row 2: DM + peer sender → out stays 0
@@ -345,10 +376,10 @@ def test_migration_v10_is_idempotent(tmp_sync_db_path: Path) -> None:
     """Running ensure_sync_schema() twice is safe — v10 backfill applies once."""
     ensure_sync_schema(tmp_sync_db_path)
     ensure_sync_schema(tmp_sync_db_path)
-    conn = _open_sync_db(tmp_sync_db_path)
+    conn = _open_db(tmp_sync_db_path)
     try:
-        version = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
-        assert version is not None and int(version[0]) == _CURRENT_SCHEMA_VERSION
+        version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
+        assert version == _CURRENT_SCHEMA_VERSION
     finally:
         conn.close()
 
@@ -362,7 +393,7 @@ def test_concurrent_read_during_write(tmp_sync_db_path: Path) -> None:
     """Reader connection (mode=ro) can query synced_dialogs while writer holds BEGIN IMMEDIATE."""
     ensure_sync_schema(tmp_sync_db_path)
 
-    writer = _open_sync_db(tmp_sync_db_path)
+    writer = _open_db(tmp_sync_db_path)
     try:
         writer.execute("BEGIN IMMEDIATE")
         writer.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (42, 'syncing')")
@@ -370,7 +401,7 @@ def test_concurrent_read_during_write(tmp_sync_db_path: Path) -> None:
         reader = sqlite3.connect(f"file:{tmp_sync_db_path}?mode=ro", uri=True, timeout=5.0)
         try:
             # Should succeed — reads committed snapshot, not seeing the uncommitted INSERT
-            rows = reader.execute("SELECT * FROM synced_dialogs").fetchall()
+            rows = _fetchall_rows(reader, "SELECT * FROM synced_dialogs")
             # No OperationalError raised — concurrent read works
             assert isinstance(rows, list)
         finally:
@@ -389,27 +420,33 @@ def test_concurrent_read_during_write(tmp_sync_db_path: Path) -> None:
 def test_sigterm_checkpoint(tmp_sync_db_path: Path) -> None:
     """Write data, invoke shutdown callback directly, reopen DB, verify integrity."""
     ensure_sync_schema(tmp_sync_db_path)
-    conn = _open_sync_db(tmp_sync_db_path)
+    conn = _open_db(tmp_sync_db_path)
     reopen = None
     try:
         # Write some committed data
         conn.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (1, 'synced')")
         conn.commit()
 
-        # Use a mock loop to capture the callback passed to add_signal_handler
-        mock_loop = MagicMock()
-        register_shutdown_handler(conn, mock_loop)
+        # Use a tiny loop stub to capture the callback passed to add_signal_handler.
+        class _LoopStub:
+            def __init__(self) -> None:
+                self.call_args: tuple[object, object] | None = None
 
-        mock_loop.add_signal_handler.assert_called_once()
-        sigterm_callback = mock_loop.add_signal_handler.call_args[0][1]
+            def add_signal_handler(self, signal_num: int, callback: object) -> None:
+                self.call_args = (signal_num, callback)
+
+        mock_loop = _LoopStub()
+        register_shutdown_handler(conn, cast(asyncio.AbstractEventLoop, mock_loop))
+        assert mock_loop.call_args is not None
+        sigterm_callback = cast(Callable[[], None], mock_loop.call_args[1])
         sigterm_callback()
 
         # Reopen DB and verify data is intact
         reopen = sqlite3.connect(str(tmp_sync_db_path), timeout=10.0)
-        integrity = reopen.execute("PRAGMA integrity_check").fetchone()
+        integrity = _fetchone_row(reopen, "PRAGMA integrity_check")
         assert integrity is not None and str(integrity[0]).lower() == "ok", f"integrity_check failed: {integrity}"
-        row = reopen.execute("SELECT status FROM synced_dialogs WHERE dialog_id=1").fetchone()
-        assert row is not None and row[0] == "synced", f"Data not preserved after shutdown: {row}"
+        row = _fetchone_text(reopen, "SELECT status FROM synced_dialogs WHERE dialog_id=1")
+        assert row == "synced", f"Data not preserved after shutdown: {row}"
     finally:
         if reopen is not None:
             reopen.close()
@@ -427,7 +464,7 @@ def test_open_sync_db_reader_readonly(tmp_sync_db_path: Path) -> None:
     reader = open_sync_db_reader(tmp_sync_db_path)
     try:
         # SELECT must succeed
-        rows = reader.execute("SELECT * FROM synced_dialogs").fetchall()
+        rows = _fetchall_rows(reader, "SELECT * FROM synced_dialogs")
         assert isinstance(rows, list)
         # INSERT must fail with OperationalError
         with pytest.raises(sqlite3.OperationalError):
@@ -444,10 +481,10 @@ def test_open_sync_db_reader_readonly(tmp_sync_db_path: Path) -> None:
 def test_schema_v4_entities_table(tmp_sync_db_path: Path) -> None:
     """After ensure_sync_schema(), entities table exists with all expected columns."""
     ensure_sync_schema(tmp_sync_db_path)
-    conn = _open_sync_db(tmp_sync_db_path)
+    conn = _open_db(tmp_sync_db_path)
     try:
-        rows = conn.execute("PRAGMA table_info(entities)").fetchall()
-        columns = {str(row[1]) for row in rows}
+        rows = _table_info(conn, "entities")
+        columns = {row[1] for row in rows}
         expected = {"id", "type", "name", "username", "name_normalized", "updated_at"}
         assert expected == columns, f"Got: {columns}, expected: {expected}"
     finally:
@@ -457,9 +494,9 @@ def test_schema_v4_entities_table(tmp_sync_db_path: Path) -> None:
 def test_schema_v7_drops_reaction_metadata(tmp_sync_db_path: Path) -> None:
     """After ensure_sync_schema() v7, reaction_metadata table does NOT exist."""
     ensure_sync_schema(tmp_sync_db_path)
-    conn = _open_sync_db(tmp_sync_db_path)
+    conn = _open_db(tmp_sync_db_path)
     try:
-        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        tables = {str(row[0]) for row in _fetchall_rows(conn, "SELECT name FROM sqlite_master WHERE type='table'")}
         assert "reaction_metadata" not in tables, f"reaction_metadata should be dropped in v7. Tables: {tables}"
     finally:
         conn.close()
@@ -472,10 +509,10 @@ def test_schema_v4_topic_metadata_table(tmp_sync_db_path: Path) -> None:
     legacy v4 columns must remain present (issubset, not equality).
     """
     ensure_sync_schema(tmp_sync_db_path)
-    conn = _open_sync_db(tmp_sync_db_path)
+    conn = _open_db(tmp_sync_db_path)
     try:
-        rows = conn.execute("PRAGMA table_info(topic_metadata)").fetchall()
-        columns = {str(row[1]) for row in rows}
+        rows = _table_info(conn, "topic_metadata")
+        columns = {row[1] for row in rows}
         # Legacy v4 columns must all still be present:
         legacy_cols = {
             "dialog_id",
@@ -499,9 +536,9 @@ def test_schema_v4_topic_metadata_table(tmp_sync_db_path: Path) -> None:
 def test_schema_v7_drops_message_cache(tmp_sync_db_path: Path) -> None:
     """After ensure_sync_schema() v7, message_cache table does NOT exist."""
     ensure_sync_schema(tmp_sync_db_path)
-    conn = _open_sync_db(tmp_sync_db_path)
+    conn = _open_db(tmp_sync_db_path)
     try:
-        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        tables = {str(row[0]) for row in _fetchall_rows(conn, "SELECT name FROM sqlite_master WHERE type='table'")}
         assert "message_cache" not in tables, f"message_cache should be dropped in v7. Tables: {tables}"
     finally:
         conn.close()
@@ -510,10 +547,10 @@ def test_schema_v7_drops_message_cache(tmp_sync_db_path: Path) -> None:
 def test_schema_v4_indexes_exist(tmp_sync_db_path: Path) -> None:
     """After ensure_sync_schema() v7, expected indexes exist and dropped indexes are gone."""
     ensure_sync_schema(tmp_sync_db_path)
-    conn = _open_sync_db(tmp_sync_db_path)
+    conn = _open_db(tmp_sync_db_path)
     try:
-        rows = conn.execute("SELECT name FROM sqlite_master WHERE type='index'").fetchall()
-        index_names = {str(r[0]) for r in rows}
+        rows = _fetchall_rows(conn, "SELECT name FROM sqlite_master WHERE type='index'")
+        index_names = {str(row[0]) for row in rows}
         # Indexes that must still exist after v7
         expected_indexes = {
             "idx_entities_type_updated",
@@ -542,10 +579,10 @@ def test_schema_v4_indexes_exist(tmp_sync_db_path: Path) -> None:
 def test_schema_v5_telemetry_events_table(tmp_sync_db_path: Path) -> None:
     """After ensure_sync_schema(), telemetry_events table exists with all expected columns."""
     ensure_sync_schema(tmp_sync_db_path)
-    conn = _open_sync_db(tmp_sync_db_path)
+    conn = _open_db(tmp_sync_db_path)
     try:
-        rows = conn.execute("PRAGMA table_info(telemetry_events)").fetchall()
-        columns = {str(row[1]) for row in rows}
+        rows = _table_info(conn, "telemetry_events")
+        columns = {row[1] for row in rows}
         expected = {
             "id",
             "tool_name",
@@ -565,11 +602,11 @@ def test_schema_v5_telemetry_events_table(tmp_sync_db_path: Path) -> None:
 def test_schema_v5_telemetry_index_exists(tmp_sync_db_path: Path) -> None:
     """After ensure_sync_schema(), idx_telemetry_tool_timestamp index exists."""
     ensure_sync_schema(tmp_sync_db_path)
-    conn = _open_sync_db(tmp_sync_db_path)
+    conn = _open_db(tmp_sync_db_path)
     try:
-        row = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_telemetry_tool_timestamp'"
-        ).fetchone()
+        row = _fetchone_row(
+            conn, "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_telemetry_tool_timestamp'"
+        )
         assert row is not None, "idx_telemetry_tool_timestamp index missing"
     finally:
         conn.close()
@@ -578,12 +615,10 @@ def test_schema_v5_telemetry_index_exists(tmp_sync_db_path: Path) -> None:
 def test_schema_version_is_7(tmp_sync_db_path: Path) -> None:
     """After ensure_sync_schema(), MAX(version) in schema_version is _CURRENT_SCHEMA_VERSION."""
     ensure_sync_schema(tmp_sync_db_path)
-    conn = _open_sync_db(tmp_sync_db_path)
+    conn = _open_db(tmp_sync_db_path)
     try:
-        row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
-        assert row is not None and row[0] == _CURRENT_SCHEMA_VERSION, (
-            f"Expected version {_CURRENT_SCHEMA_VERSION}, got {row[0]}"
-        )
+        version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
+        assert version == _CURRENT_SCHEMA_VERSION, f"Expected version {_CURRENT_SCHEMA_VERSION}, got {version}"
     finally:
         conn.close()
 
@@ -592,11 +627,11 @@ def test_ensure_sync_schema_twice_idempotent_v7(tmp_sync_db_path: Path) -> None:
     """Running ensure_sync_schema twice is idempotent — no errors, version stays at _CURRENT_SCHEMA_VERSION."""
     ensure_sync_schema(tmp_sync_db_path)
     ensure_sync_schema(tmp_sync_db_path)
-    conn = _open_sync_db(tmp_sync_db_path)
+    conn = _open_db(tmp_sync_db_path)
     try:
-        row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
-        assert row is not None and row[0] == _CURRENT_SCHEMA_VERSION
-        rows = conn.execute("SELECT * FROM schema_version ORDER BY version").fetchall()
+        version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
+        assert version == _CURRENT_SCHEMA_VERSION
+        rows = _fetchall_rows(conn, "SELECT * FROM schema_version ORDER BY version")
         assert len(rows) == _CURRENT_SCHEMA_VERSION, (
             f"Expected {_CURRENT_SCHEMA_VERSION} schema_version rows, got {len(rows)}"
         )
@@ -654,7 +689,7 @@ def test_migrate_from_legacy_db_copies_entities(tmp_path: Path) -> None:
     """_migrate_from_legacy_db copies 3 entity rows from entity_cache.db into sync.db entities table."""
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
-    conn = _open_sync_db(db_path)
+    conn = _open_db(db_path)
 
     legacy_path = tmp_path / "entity_cache.db"
     _make_entity_cache_db(
@@ -674,7 +709,7 @@ def test_migrate_from_legacy_db_copies_entities(tmp_path: Path) -> None:
         count = _migrate_from_legacy_db(conn, legacy_path, copy_stmts)
         assert count == 3, f"Expected 3 rows copied, got {count}"
 
-        rows = conn.execute("SELECT id, name FROM entities ORDER BY id").fetchall()
+        rows = _fetchall_rows(conn, "SELECT id, name FROM entities ORDER BY id")
         assert len(rows) == 3
         assert rows[0] == (1, "Alice")
         assert rows[1] == (2, "Bob")
@@ -687,12 +722,12 @@ def test_migrate_from_legacy_db_noop_when_missing(tmp_path: Path) -> None:
     """_migrate_from_legacy_db is a no-op when legacy path does not exist."""
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
-    conn = _open_sync_db(db_path)
+    conn = _open_db(db_path)
     try:
         missing = tmp_path / "nonexistent.db"
         count = _migrate_from_legacy_db(conn, missing, [])
         assert count == 0
-        rows = conn.execute("SELECT * FROM entities").fetchall()
+        rows = _fetchall_rows(conn, "SELECT * FROM entities")
         assert rows == []
     finally:
         conn.close()
@@ -702,7 +737,7 @@ def test_migrate_from_legacy_db_insert_or_ignore_on_pk_conflict(tmp_path: Path) 
     """_migrate_from_legacy_db with overlapping PKs uses INSERT OR IGNORE — sync.db row wins."""
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
-    conn = _open_sync_db(db_path)
+    conn = _open_db(db_path)
 
     # Pre-insert entity id=1 into sync.db
     conn.execute(
@@ -725,10 +760,10 @@ def test_migrate_from_legacy_db_insert_or_ignore_on_pk_conflict(tmp_path: Path) 
     ]
     try:
         _migrate_from_legacy_db(conn, legacy_path, copy_stmts)
-        row = conn.execute("SELECT name FROM entities WHERE id=1").fetchone()
-        assert row is not None and row[0] == "SyncName", f"sync.db row should win on conflict, got {row[0]}"
-        row2 = conn.execute("SELECT name FROM entities WHERE id=2").fetchone()
-        assert row2 is not None and row2[0] == "NewUser"
+        row = _fetchone_text(conn, "SELECT name FROM entities WHERE id=1")
+        assert row == "SyncName", f"sync.db row should win on conflict, got {row}"
+        row2 = _fetchone_text(conn, "SELECT name FROM entities WHERE id=2")
+        assert row2 == "NewUser"
     finally:
         conn.close()
 
@@ -737,7 +772,7 @@ def test_migrate_from_legacy_db_telemetry_30day_filter(tmp_path: Path) -> None:
     """_migrate_from_legacy_db copies only telemetry rows within last 30 days."""
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
-    conn = _open_sync_db(db_path)
+    conn = _open_db(db_path)
 
     now = time.time()
     recent = now - 86400  # 1 day ago — should be copied
@@ -762,8 +797,8 @@ def test_migrate_from_legacy_db_telemetry_30day_filter(tmp_path: Path) -> None:
     try:
         count = _migrate_from_legacy_db(conn, analytics_path, copy_stmts)
         # Only the recent row should be copied (rowcount may report differently per driver)
-        rows = conn.execute("SELECT tool_name FROM telemetry_events").fetchall()
-        tool_names = [r[0] for r in rows]
+        rows = _fetchall_rows(conn, "SELECT tool_name FROM telemetry_events")
+        tool_names = [str(row[0]) for row in rows]
         assert "ListMessages" in tool_names, "Recent event should be migrated"
         assert "ListDialogs" not in tool_names, "Old event should be excluded"
     finally:
@@ -779,7 +814,7 @@ def test_migrate_legacy_databases_deletes_legacy_files(tmp_path: Path) -> None:
     """migrate_legacy_databases deletes entity_cache.db, .bootstrap.lock, and analytics.db after migration."""
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
-    conn = _open_sync_db(db_path)
+    conn = _open_db(db_path)
 
     entity_cache = tmp_path / "entity_cache.db"
     lock_file = tmp_path / "entity_cache.db.bootstrap.lock"
@@ -802,7 +837,7 @@ def test_migrate_legacy_databases_noop_when_files_missing(tmp_path: Path) -> Non
     """migrate_legacy_databases does not raise when legacy files don't exist."""
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
-    conn = _open_sync_db(db_path)
+    conn = _open_db(db_path)
     try:
         # No legacy files — must not raise
         migrate_legacy_databases(conn, tmp_path)
@@ -821,10 +856,10 @@ def test_ensure_sync_schema_idempotent(tmp_path: Path) -> None:
     ensure_sync_schema(db_path)
     ensure_sync_schema(db_path)
 
-    conn = _open_sync_db(db_path)
+    conn = _open_db(db_path)
     try:
-        row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
-        assert row[0] >= 5, "schema should be at current version"
+        version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
+        assert version >= 5, "schema should be at current version"
     finally:
         conn.close()
 
@@ -834,9 +869,12 @@ def test_schema_version_records_all_versions(tmp_path: Path) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
 
-    conn = _open_sync_db(db_path)
+    conn = _open_db(db_path)
     try:
-        versions = [row[0] for row in conn.execute("SELECT version FROM schema_version ORDER BY version").fetchall()]
+        versions = [
+            int(cast(int, row[0]))
+            for row in _fetchall_rows(conn, "SELECT version FROM schema_version ORDER BY version")
+        ]
         expected = list(range(1, _CURRENT_SCHEMA_VERSION + 1))
         assert versions == expected, f"expected versions {expected}, got {versions}"
     finally:
@@ -851,10 +889,10 @@ def test_schema_version_records_all_versions(tmp_path: Path) -> None:
 def test_message_reactions_table_exists(tmp_sync_db_path: Path) -> None:
     """After ensure_sync_schema() v7, message_reactions table exists with correct columns."""
     ensure_sync_schema(tmp_sync_db_path)
-    conn = _open_sync_db(tmp_sync_db_path)
+    conn = _open_db(tmp_sync_db_path)
     try:
-        rows = conn.execute("PRAGMA table_info(message_reactions)").fetchall()
-        columns = {str(row[1]) for row in rows}
+        rows = _table_info(conn, "message_reactions")
+        columns = {row[1] for row in rows}
         expected = {"dialog_id", "message_id", "emoji", "count"}
         assert expected == columns, f"Got: {columns}, expected: {expected}"
     finally:
@@ -864,10 +902,10 @@ def test_message_reactions_table_exists(tmp_sync_db_path: Path) -> None:
 def test_message_entities_table_exists(tmp_sync_db_path: Path) -> None:
     """After ensure_sync_schema() v7, message_entities table exists with correct columns."""
     ensure_sync_schema(tmp_sync_db_path)
-    conn = _open_sync_db(tmp_sync_db_path)
+    conn = _open_db(tmp_sync_db_path)
     try:
-        rows = conn.execute("PRAGMA table_info(message_entities)").fetchall()
-        columns = {str(row[1]) for row in rows}
+        rows = _table_info(conn, "message_entities")
+        columns = {row[1] for row in rows}
         expected = {"dialog_id", "message_id", "offset", "length", "type", "value"}
         assert expected == columns, f"Got: {columns}, expected: {expected}"
     finally:
@@ -877,10 +915,10 @@ def test_message_entities_table_exists(tmp_sync_db_path: Path) -> None:
 def test_message_forwards_table_exists(tmp_sync_db_path: Path) -> None:
     """After ensure_sync_schema() v7, message_forwards table exists with correct columns."""
     ensure_sync_schema(tmp_sync_db_path)
-    conn = _open_sync_db(tmp_sync_db_path)
+    conn = _open_db(tmp_sync_db_path)
     try:
-        rows = conn.execute("PRAGMA table_info(message_forwards)").fetchall()
-        columns = {str(row[1]) for row in rows}
+        rows = _table_info(conn, "message_forwards")
+        columns = {row[1] for row in rows}
         expected = {
             "dialog_id",
             "message_id",
@@ -897,10 +935,10 @@ def test_message_forwards_table_exists(tmp_sync_db_path: Path) -> None:
 def test_messages_has_new_v7_columns(tmp_sync_db_path: Path) -> None:
     """After v7, messages table has edit_date, grouped_id, reply_to_peer_id (all INTEGER, nullable)."""
     ensure_sync_schema(tmp_sync_db_path)
-    conn = _open_sync_db(tmp_sync_db_path)
+    conn = _open_db(tmp_sync_db_path)
     try:
-        rows = conn.execute("PRAGMA table_info(messages)").fetchall()
-        col_map = {str(row[1]): row for row in rows}
+        rows = _table_info(conn, "messages")
+        col_map = {row[1]: row for row in rows}
         for col in ("edit_date", "grouped_id", "reply_to_peer_id"):
             assert col in col_map, f"Column {col!r} missing from messages table"
             assert col_map[col][2].upper() == "INTEGER", f"Column {col!r} type should be INTEGER, got {col_map[col][2]}"
@@ -912,15 +950,15 @@ def test_messages_has_new_v7_columns(tmp_sync_db_path: Path) -> None:
 def test_idx_messages_reply_exists(tmp_sync_db_path: Path) -> None:
     """After v7, idx_messages_reply index exists on messages(dialog_id, reply_to_msg_id)."""
     ensure_sync_schema(tmp_sync_db_path)
-    conn = _open_sync_db(tmp_sync_db_path)
+    conn = _open_db(tmp_sync_db_path)
     try:
-        row = conn.execute("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_messages_reply'").fetchone()
+        row = _fetchone_row(conn, "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_messages_reply'")
         assert row is not None, "idx_messages_reply index missing after v7 migration"
     finally:
         conn.close()
 
 
-def _seed_v6_reaction_backfill_db(conn) -> None:
+def _seed_v6_reaction_backfill_db(conn: sqlite3.Connection) -> None:
     import json
 
     conn.execute("PRAGMA journal_mode=WAL")
@@ -1021,18 +1059,18 @@ def _seed_v6_reaction_backfill_db(conn) -> None:
     conn.commit()
 
 
-def _assert_v7_reaction_backfill_results(conn) -> None:
-    col_names = {r[1] for r in conn.execute("PRAGMA table_info(messages)").fetchall()}
+def _assert_v7_reaction_backfill_results(conn: sqlite3.Connection) -> None:
+    col_names = {row[1] for row in _table_info(conn, "messages")}
     assert "reactions" not in col_names, "reactions column must be dropped after v7"
-    reaction_rows = conn.execute(
-        "SELECT emoji, count FROM message_reactions WHERE dialog_id=1 AND message_id=10 ORDER BY emoji"
-    ).fetchall()
-    reaction_dict = {r[0]: r[1] for r in reaction_rows}
+    reaction_rows = _fetchall_rows(
+        conn, "SELECT emoji, count FROM message_reactions WHERE dialog_id=1 AND message_id=10 ORDER BY emoji"
+    )
+    reaction_dict = {str(row[0]): int(cast(int, row[1])) for row in reaction_rows}
     assert reaction_dict == {"👍": 3, "❤": 1}, f"Valid JSON reactions should be backfilled. Got: {reaction_dict}"
-    assert conn.execute("SELECT COUNT(*) FROM message_reactions WHERE dialog_id=1 AND message_id=20").fetchone()[0] == 0
-    assert conn.execute("SELECT COUNT(*) FROM message_reactions WHERE dialog_id=1 AND message_id=30").fetchone()[0] == 0
-    assert conn.execute("SELECT COUNT(*) FROM message_reactions WHERE dialog_id=1 AND message_id=40").fetchone()[0] == 0
-    assert conn.execute("SELECT COUNT(*) FROM message_reactions WHERE dialog_id=1 AND message_id=50").fetchone()[0] == 0
+    assert _fetchone_int(conn, "SELECT COUNT(*) FROM message_reactions WHERE dialog_id=1 AND message_id=20") == 0
+    assert _fetchone_int(conn, "SELECT COUNT(*) FROM message_reactions WHERE dialog_id=1 AND message_id=30") == 0
+    assert _fetchone_int(conn, "SELECT COUNT(*) FROM message_reactions WHERE dialog_id=1 AND message_id=40") == 0
+    assert _fetchone_int(conn, "SELECT COUNT(*) FROM message_reactions WHERE dialog_id=1 AND message_id=50") == 0
 
 
 def test_v7_backfill_reactions_from_json(tmp_path: Path) -> None:
@@ -1045,7 +1083,7 @@ def test_v7_backfill_reactions_from_json(tmp_path: Path) -> None:
     - reactions column is gone after migration.
     """
     db_path = tmp_path / "sync.db"
-    conn = _open_sync_db(db_path)
+    conn = _open_db(db_path)
     try:
         _seed_v6_reaction_backfill_db(conn)
     finally:
@@ -1055,7 +1093,7 @@ def test_v7_backfill_reactions_from_json(tmp_path: Path) -> None:
     ensure_sync_schema(db_path)
 
     # Verify results
-    conn = _open_sync_db(db_path)
+    conn = _open_db(db_path)
     try:
         _assert_v7_reaction_backfill_results(conn)
     finally:
@@ -1070,12 +1108,10 @@ def test_v7_backfill_reactions_from_json(tmp_path: Path) -> None:
 def test_schema_version_matches_current(tmp_sync_db_path: Path) -> None:
     """After ensure_sync_schema(), MAX(version) equals _CURRENT_SCHEMA_VERSION."""
     ensure_sync_schema(tmp_sync_db_path)
-    conn = _open_sync_db(tmp_sync_db_path)
+    conn = _open_db(tmp_sync_db_path)
     try:
-        row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
-        assert row is not None and row[0] == _CURRENT_SCHEMA_VERSION, (
-            f"Expected version {_CURRENT_SCHEMA_VERSION}, got {row[0]}"
-        )
+        version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
+        assert version == _CURRENT_SCHEMA_VERSION, f"Expected version {_CURRENT_SCHEMA_VERSION}, got {version}"
     finally:
         conn.close()
 
@@ -1083,9 +1119,9 @@ def test_schema_version_matches_current(tmp_sync_db_path: Path) -> None:
 def test_synced_dialogs_has_read_inbox_max_id_column(tmp_sync_db_path: Path) -> None:
     """After ensure_sync_schema(), synced_dialogs has read_inbox_max_id INTEGER column."""
     ensure_sync_schema(tmp_sync_db_path)
-    conn = _open_sync_db(tmp_sync_db_path)
+    conn = _open_db(tmp_sync_db_path)
     try:
-        cols = {row[1]: row[2] for row in conn.execute("PRAGMA table_info(synced_dialogs)").fetchall()}
+        cols = {row[1]: row[2] for row in _table_info(conn, "synced_dialogs")}
         assert "read_inbox_max_id" in cols, f"Column missing; got {sorted(cols)}"
         assert cols["read_inbox_max_id"] == "INTEGER", f"Wrong type: {cols['read_inbox_max_id']}"
     finally:
@@ -1095,11 +1131,11 @@ def test_synced_dialogs_has_read_inbox_max_id_column(tmp_sync_db_path: Path) -> 
 def test_read_inbox_max_id_defaults_to_null_for_existing_rows(tmp_sync_db_path: Path) -> None:
     """New rows in synced_dialogs have read_inbox_max_id = NULL (no default, not 0)."""
     ensure_sync_schema(tmp_sync_db_path)
-    conn = _open_sync_db(tmp_sync_db_path)
+    conn = _open_db(tmp_sync_db_path)
     try:
         conn.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')", (12345,))
         conn.commit()
-        row = conn.execute("SELECT read_inbox_max_id FROM synced_dialogs WHERE dialog_id = ?", (12345,)).fetchone()
+        row = _fetchone_row(conn, "SELECT read_inbox_max_id FROM synced_dialogs WHERE dialog_id = ?", (12345,))
         assert row is not None
         assert row[0] is None, f"Expected NULL, got {row[0]!r}"
     finally:
@@ -1111,12 +1147,10 @@ def test_v8_index_on_status_and_read_position_exists(tmp_sync_db_path: Path) -> 
     (status, read_inbox_max_id) for efficient filtering.
     """
     ensure_sync_schema(tmp_sync_db_path)
-    conn = _open_sync_db(tmp_sync_db_path)
+    conn = _open_db(tmp_sync_db_path)
     try:
-        rows = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='synced_dialogs'"
-        ).fetchall()
-        index_names = {row[0] for row in rows}
+        rows = _fetchall_rows(conn, "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='synced_dialogs'")
+        index_names = {str(row[0]) for row in rows}
         assert "idx_synced_dialogs_status_read_position" in index_names, f"Index missing; found: {sorted(index_names)}"
     finally:
         conn.close()
@@ -1125,7 +1159,7 @@ def test_v8_index_on_status_and_read_position_exists(tmp_sync_db_path: Path) -> 
 def test_message_entities_pk_allows_same_offset_different_type(tmp_sync_db_path: Path) -> None:
     """5-column PK: two entities at the same (offset, length) but different type both stored."""
     ensure_sync_schema(tmp_sync_db_path)
-    conn = _open_sync_db(tmp_sync_db_path)
+    conn = _open_db(tmp_sync_db_path)
     try:
         # Insert two entity rows with same (dialog_id, message_id, offset, length) but different type
         conn.execute(
@@ -1138,11 +1172,11 @@ def test_message_entities_pk_allows_same_offset_different_type(tmp_sync_db_path:
         )
         conn.commit()
 
-        rows = conn.execute(
-            "SELECT type, value FROM message_entities WHERE dialog_id=1 AND message_id=100 ORDER BY type"
-        ).fetchall()
+        rows = _fetchall_rows(
+            conn, "SELECT type, value FROM message_entities WHERE dialog_id=1 AND message_id=100 ORDER BY type"
+        )
         assert len(rows) == 2, f"Both entity rows must be retained with 5-column PK. Got: {rows}"
-        types = {r[0] for r in rows}
+        types = {str(row[0]) for row in rows}
         assert types == {"mention", "hashtag"}
     finally:
         conn.close()
@@ -1159,9 +1193,9 @@ def test_schema_v15_drops_activity_comments(tmp_path: Path) -> None:
     ensure_sync_schema(db_path)
     conn = sqlite3.connect(db_path)
     try:
-        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        tables = {str(row[0]) for row in _fetchall_rows(conn, "SELECT name FROM sqlite_master WHERE type='table'")}
         assert "activity_comments" not in tables, f"activity_comments must be dropped in v15. Tables: {sorted(tables)}"
-        idx = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='index'").fetchall()}
+        idx = {str(row[0]) for row in _fetchall_rows(conn, "SELECT name FROM sqlite_master WHERE type='index'")}
         assert "idx_activity_comments_sent_at" not in idx
     finally:
         conn.close()
@@ -1173,7 +1207,7 @@ def test_schema_v15_drops_message_cache_permanently(tmp_path: Path) -> None:
     ensure_sync_schema(db_path)
     conn = sqlite3.connect(db_path)
     try:
-        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        tables = {str(row[0]) for row in _fetchall_rows(conn, "SELECT name FROM sqlite_master WHERE type='table'")}
         assert "message_cache" not in tables
     finally:
         conn.close()
@@ -1184,7 +1218,7 @@ def test_messages_table_has_reply_count(tmp_sync_db_path: Path) -> None:
     ensure_sync_schema(tmp_sync_db_path)
     conn = sqlite3.connect(tmp_sync_db_path)
     try:
-        columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()}
+        columns = {row[1] for row in _table_info(conn, "messages")}
     finally:
         conn.close()
     assert "reply_count" in columns
@@ -1222,10 +1256,11 @@ def test_migration_v15_copies_own_only_into_messages(tmp_path: Path) -> None:
     ensure_sync_schema(db_path)
     conn = sqlite3.connect(db_path)
     try:
-        rows = conn.execute(
+        rows = _fetchall_rows(
+            conn,
             "SELECT dialog_id, message_id, text, out, is_service, is_deleted "
-            "FROM messages WHERE dialog_id = 100 ORDER BY message_id"
-        ).fetchall()
+            "FROM messages WHERE dialog_id = 100 ORDER BY message_id",
+        )
     finally:
         conn.close()
     assert rows == [(100, 1, "hello", 1, 0, 0), (100, 2, "world", 1, 0, 0)]
@@ -1262,11 +1297,12 @@ def test_migration_v15_preserves_existing_messages(tmp_path: Path) -> None:
     ensure_sync_schema(db_path)
     conn = sqlite3.connect(db_path)
     try:
-        text, sent_at = conn.execute(
-            "SELECT text, sent_at FROM messages WHERE dialog_id=200 AND message_id=5"
-        ).fetchone()
+        row = _fetchone_row(conn, "SELECT text, sent_at FROM messages WHERE dialog_id=200 AND message_id=5")
     finally:
         conn.close()
+    assert row is not None
+    text = cast(str, row[0])
+    sent_at = cast(int, row[1])
     assert text == "authoritative"
     assert sent_at == 5000
 
@@ -1303,8 +1339,8 @@ def test_migration_v15_enrolls_own_only_but_preserves_higher_status(tmp_path: Pa
     ensure_sync_schema(db_path)
     conn = sqlite3.connect(db_path)
     try:
-        status_300 = conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id=300").fetchone()[0]
-        status_400 = conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id=400").fetchone()[0]
+        status_300 = _fetchone_text(conn, "SELECT status FROM synced_dialogs WHERE dialog_id=300")
+        status_400 = _fetchone_text(conn, "SELECT status FROM synced_dialogs WHERE dialog_id=400")
     finally:
         conn.close()
     assert status_300 == "synced", "higher-status row must not downgrade"
@@ -1317,7 +1353,7 @@ def test_migration_v14_activity_sync_state_seeded(tmp_path: Path) -> None:
     ensure_sync_schema(db_path)
     conn = sqlite3.connect(db_path)
     try:
-        rows = conn.execute("SELECT key, value FROM activity_sync_state ORDER BY key").fetchall()
+        rows = _fetchall_rows(conn, "SELECT key, value FROM activity_sync_state ORDER BY key")
     finally:
         conn.close()
     assert rows == [
@@ -1334,8 +1370,8 @@ def test_migration_v14_idempotent(tmp_path: Path) -> None:
     ensure_sync_schema(db_path)  # second run must be a no-op
     conn = sqlite3.connect(db_path)
     try:
-        version = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
-        count = conn.execute("SELECT COUNT(*) FROM activity_sync_state").fetchone()[0]
+        version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
+        count = _fetchone_int(conn, "SELECT COUNT(*) FROM activity_sync_state")
     finally:
         conn.close()
     assert version == _CURRENT_SCHEMA_VERSION
@@ -1359,7 +1395,7 @@ def test_migration_v14_preserves_existing_data(tmp_path: Path) -> None:
     ensure_sync_schema(db_path)
     conn = sqlite3.connect(db_path)
     try:
-        row = conn.execute("SELECT dialog_id, status FROM synced_dialogs WHERE dialog_id = 12345").fetchone()
+        row = _fetchone_row(conn, "SELECT dialog_id, status FROM synced_dialogs WHERE dialog_id = 12345")
     finally:
         conn.close()
     assert row == (12345, "synced")
@@ -1382,10 +1418,10 @@ def test_open_sync_db_enables_foreign_keys(tmp_path: Path) -> None:
     ensure_sync_schema(db_path)
 
     # Writable factory must enable FKs.
-    conn = _open_sync_db(db_path)
+    conn = _open_db(db_path)
     try:
-        row = conn.execute("PRAGMA foreign_keys").fetchone()
-        assert row[0] == 1, f"_open_sync_db must enable foreign_keys (got {row[0]})"
+        row = _fetchone_int(conn, "PRAGMA foreign_keys")
+        assert row == 1, f"_open_sync_db must enable foreign_keys (got {row})"
     finally:
         conn.close()
 
@@ -1393,15 +1429,15 @@ def test_open_sync_db_enables_foreign_keys(tmp_path: Path) -> None:
     # observe FK state (e.g., no orphan rows post-cascade).
     conn = open_sync_db_reader(db_path)
     try:
-        row = conn.execute("PRAGMA foreign_keys").fetchone()
-        assert row[0] == 1, f"open_sync_db_reader must enable foreign_keys (got {row[0]})"
+        row = _fetchone_int(conn, "PRAGMA foreign_keys")
+        assert row == 1, f"open_sync_db_reader must enable foreign_keys (got {row})"
     finally:
         conn.close()
 
 
 def test_v16_fk_cascade_works_through_production_factory(tmp_path: Path) -> None:
     """End-to-end variant of test_migration_v16_fk_cascade_deletes_detail_row
-    but using the production _open_sync_db() factory (not a hand-built
+    but using the production _open_db() factory (not a hand-built
     sqlite3.connect with manual PRAGMA). Confirms the FK cascade fires
     through the real production code path. MEDIUM from 47-REVIEWS.md
     cycle 2 (codex).
@@ -1409,7 +1445,7 @@ def test_v16_fk_cascade_works_through_production_factory(tmp_path: Path) -> None
     db_path = tmp_path / "cascade.db"
     ensure_sync_schema(db_path)
 
-    conn = _open_sync_db(db_path)
+    conn = _open_db(db_path)
     try:
         conn.execute(
             "INSERT INTO entities (id, type, name, username, name_normalized, updated_at) "
@@ -1422,14 +1458,14 @@ def test_v16_fk_cascade_works_through_production_factory(tmp_path: Path) -> None
         conn.commit()
 
         # Sanity: detail row exists.
-        assert conn.execute("SELECT COUNT(*) FROM entity_details WHERE entity_id = ?", (12345,)).fetchone()[0] == 1
+        assert _fetchone_int(conn, "SELECT COUNT(*) FROM entity_details WHERE entity_id = ?", (12345,)) == 1
 
         # Delete the parent entities row.
         conn.execute("DELETE FROM entities WHERE id = ?", (12345,))
         conn.commit()
 
         # Cascade must have removed the detail row.
-        assert conn.execute("SELECT COUNT(*) FROM entity_details WHERE entity_id = ?", (12345,)).fetchone()[0] == 0, (
+        assert _fetchone_int(conn, "SELECT COUNT(*) FROM entity_details WHERE entity_id = ?", (12345,)) == 0, (
             "FK CASCADE did not fire — PRAGMA foreign_keys is OFF on production factory"
         )
     finally:
@@ -1444,10 +1480,10 @@ def test_v16_fk_cascade_works_through_production_factory(tmp_path: Path) -> None
 def test_schema_v17_dialogs_table_exists(tmp_sync_db_path: Path) -> None:
     """After ensure_sync_schema(), dialogs table exists and is queryable."""
     ensure_sync_schema(tmp_sync_db_path)
-    conn = _open_sync_db(tmp_sync_db_path)
+    conn = _open_db(tmp_sync_db_path)
     try:
         # Should not raise — table exists
-        conn.execute("SELECT * FROM dialogs LIMIT 0").fetchall()
+        _fetchall_rows(conn, "SELECT * FROM dialogs LIMIT 0")
     finally:
         conn.close()
 
@@ -1455,10 +1491,10 @@ def test_schema_v17_dialogs_table_exists(tmp_sync_db_path: Path) -> None:
 def test_schema_v17_dialogs_columns(tmp_sync_db_path: Path) -> None:
     """dialogs table has all 14 required columns with correct types and constraints."""
     ensure_sync_schema(tmp_sync_db_path)
-    conn = _open_sync_db(tmp_sync_db_path)
+    conn = _open_db(tmp_sync_db_path)
     try:
-        rows = conn.execute("PRAGMA table_info(dialogs)").fetchall()
-        columns = {str(row[1]): row for row in rows}
+        rows = _table_info(conn, "dialogs")
+        columns = {row[1]: row for row in rows}
 
         required = {
             "dialog_id",
@@ -1523,12 +1559,12 @@ def test_schema_v17_dialogs_indexes(tmp_sync_db_path: Path) -> None:
     separately by test_v20_adds_needs_refresh_index.
     """
     ensure_sync_schema(tmp_sync_db_path)
-    conn = _open_sync_db(tmp_sync_db_path)
+    conn = _open_db(tmp_sync_db_path)
     try:
-        rows = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='dialogs' ORDER BY name"
-        ).fetchall()
-        index_names = {r[0] for r in rows}
+        rows = _fetchall_rows(
+            conn, "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='dialogs' ORDER BY name"
+        )
+        index_names = {str(row[0]) for row in rows}
         expected_v17_indexes = {
             "idx_dialogs_hidden_pinned",
             "idx_dialogs_type",
@@ -1546,9 +1582,9 @@ def test_schema_v17_dialogs_indexes(tmp_sync_db_path: Path) -> None:
 def test_dialogs_no_fk_to_synced_dialogs(tmp_sync_db_path: Path) -> None:
     """dialogs table has no FOREIGN KEY constraints (MIRROR-03: independent evolution)."""
     ensure_sync_schema(tmp_sync_db_path)
-    conn = _open_sync_db(tmp_sync_db_path)
+    conn = _open_db(tmp_sync_db_path)
     try:
-        rows = conn.execute("PRAGMA foreign_key_list(dialogs)").fetchall()
+        rows = _fetchall_rows(conn, "PRAGMA foreign_key_list(dialogs)")
         assert rows == [], f"dialogs must have no FK constraints (MIRROR-03). Got: {rows}"
     finally:
         conn.close()
@@ -1558,13 +1594,13 @@ def test_schema_v17_idempotent(tmp_sync_db_path: Path) -> None:
     """Running ensure_sync_schema() twice produces exactly _CURRENT_SCHEMA_VERSION rows in schema_version."""
     ensure_sync_schema(tmp_sync_db_path)
     ensure_sync_schema(tmp_sync_db_path)
-    conn = _open_sync_db(tmp_sync_db_path)
+    conn = _open_db(tmp_sync_db_path)
     try:
-        rows = conn.execute("SELECT version FROM schema_version ORDER BY version").fetchall()
-        versions = [int(r[0]) for r in rows]
+        rows = _fetchall_rows(conn, "SELECT version FROM schema_version ORDER BY version")
+        versions = [int(cast(int, row[0])) for row in rows]
         expected = list(range(1, _CURRENT_SCHEMA_VERSION + 1))
         assert versions == expected, f"Expected versions {expected}, got {versions}"
-        conn.execute("SELECT * FROM dialogs LIMIT 0").fetchall()
+        _fetchall_rows(conn, "SELECT * FROM dialogs LIMIT 0")
     finally:
         conn.close()
 
@@ -1572,12 +1608,10 @@ def test_schema_v17_idempotent(tmp_sync_db_path: Path) -> None:
 def test_schema_version_is_current(tmp_sync_db_path: Path) -> None:
     """After ensure_sync_schema(), MAX(version) in schema_version equals _CURRENT_SCHEMA_VERSION."""
     ensure_sync_schema(tmp_sync_db_path)
-    conn = _open_sync_db(tmp_sync_db_path)
+    conn = _open_db(tmp_sync_db_path)
     try:
-        row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
-        assert row is not None and int(row[0]) == _CURRENT_SCHEMA_VERSION, (
-            f"Expected schema version {_CURRENT_SCHEMA_VERSION}, got {row}"
-        )
+        version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
+        assert version == _CURRENT_SCHEMA_VERSION, f"Expected schema version {_CURRENT_SCHEMA_VERSION}, got {version}"
         assert _CURRENT_SCHEMA_VERSION == 26, f"_CURRENT_SCHEMA_VERSION must be 26, got {_CURRENT_SCHEMA_VERSION}"
     finally:
         conn.close()
@@ -1585,24 +1619,24 @@ def test_schema_version_is_current(tmp_sync_db_path: Path) -> None:
 
 def test_v20_adds_needs_refresh_index(tmp_path: Path) -> None:
     """Phase 43 RECON-02: composite index covers needs_refresh + hidden."""
-    from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
+    from mcp_telegram.sync_db import ensure_sync_schema
 
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
-    conn = _open_sync_db(db_path)
+    conn = _open_db(db_path)
     try:
-        row = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_dialogs_needs_refresh_hidden'"
-        ).fetchone()
+        row = _fetchone_row(
+            conn, "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_dialogs_needs_refresh_hidden'"
+        )
         assert row is not None, (
             "idx_dialogs_needs_refresh_hidden missing — Plan 02 SELECT will "
             "trigger a full table scan every hourly cycle"
         )
         # Confirm SQLite uses the new index for the planned light-pass query.
-        plan = conn.execute(
-            "EXPLAIN QUERY PLAN SELECT dialog_id FROM dialogs WHERE needs_refresh = 1 AND hidden = 0"
-        ).fetchall()
-        plan_text = " ".join(str(r) for r in plan)
+        plan = _fetchall_rows(
+            conn, "EXPLAIN QUERY PLAN SELECT dialog_id FROM dialogs WHERE needs_refresh = 1 AND hidden = 0"
+        )
+        plan_text = " ".join(str(row) for row in plan)
         assert "idx_dialogs_needs_refresh_hidden" in plan_text, f"Query planner ignored the index. EXPLAIN: {plan_text}"
     finally:
         conn.close()
