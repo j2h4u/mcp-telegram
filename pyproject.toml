@@ -38,6 +38,7 @@ dev = [
     "basedpyright>=1.39.8",
     "import-linter>=2.11",
     "pytest-crap>=0.3.0",
+    "radon>=6.0.1",
 ]
 
 [project.scripts]

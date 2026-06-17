@@ -541,6 +541,7 @@ dev = [
     { name = "pytest-cov" },
     { name = "pytest-crap" },
     { name = "pytest-xdist" },
+    { name = "radon" },
     { name = "ruff" },
     { name = "vulture" },
 ]
@@ -573,6 +574,7 @@ dev = [
     { name = "pytest-cov", specifier = ">=7" },
     { name = "pytest-crap", specifier = ">=0.3.0" },
     { name = "pytest-xdist", specifier = ">=3.8.0" },
+    { name = "radon", specifier = ">=6.0.1" },
     { name = "ruff", specifier = ">=0.15.17" },
     { name = "vulture", specifier = ">=2.14" },
 ]

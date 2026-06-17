@@ -1,14 +1,74 @@
 import argparse
 import json
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Protocol, TypedDict, TypeGuard, cast
 
 from radon.complexity import cc_visit
 
 DEFAULT_THRESHOLD = 30.0
 DEFAULT_EPSILON = 0.01
 DEFAULT_SOURCE_ROOT = Path("src/mcp_telegram")
+
+
+class _FunctionSummary(TypedDict):
+    covered_lines: int
+    num_statements: int
+
+
+class _CoverageFunctionEntry(TypedDict):
+    summary: _FunctionSummary
+
+
+class _CoverageFileEntry(TypedDict):
+    functions: dict[str, _CoverageFunctionEntry]
+
+
+class _CoverageReport(TypedDict):
+    files: dict[str, _CoverageFileEntry]
+
+
+class _BaselineFunctionEntry(TypedDict, total=False):
+    path: str
+    qualname: str
+    start_line: int
+    end_line: int
+    complexity: int
+    coverage_fraction: float
+    crap: float
+
+
+class _BaselineReport(TypedDict):
+    version: int
+    source_root: str
+    threshold: float
+    functions: dict[str, _BaselineFunctionEntry]
+
+
+class _RadonBlock(Protocol):
+    name: str
+    lineno: int
+    endline: int
+    complexity: int
+
+
+class _RadonFunctionBlock(_RadonBlock, Protocol):
+    closures: Sequence[_RadonFunctionBlock]
+
+
+class _RadonClassBlock(_RadonBlock, Protocol):
+    inner_classes: Sequence[_RadonClassBlock]
+    methods: Sequence[_RadonFunctionBlock]
+
+
+class _RatchetArgs(Protocol):
+    coverage: Path
+    baseline: Path
+    src: Path
+    threshold: float
+    epsilon: float
+    write_baseline: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,37 +92,75 @@ class RatchetIssue:
     delta: float | None
 
 
+RadonVisit = Callable[[str], Sequence[_RadonBlock]]
+_CC_VISIT: RadonVisit = cast(RadonVisit, cc_visit)
+
+
 def _round_metric(value: float) -> float:
     return round(value, 6)
 
 
-def _qualname_from_block(block: Any, prefix: tuple[str, ...] = ()) -> list[tuple[str, Any]]:
-    if hasattr(block, "methods"):
-        class_prefix = prefix + (block.name,)
-        items: list[tuple[str, Any]] = []
+def _expect_dict(value: object, context: str) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise ValueError(context)
+    return cast(dict[str, object], value)
+
+
+def _expect_str(value: object, context: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(context)
+    return value
+
+
+def _expect_int(value: object, context: str) -> int:
+    if not isinstance(value, int):
+        raise ValueError(context)
+    return value
+
+
+def _expect_float(value: object, context: str) -> float:
+    if not isinstance(value, (int, float)):
+        raise ValueError(context)
+    return float(value)
+
+
+def _is_class_block(block: _RadonBlock) -> TypeGuard[_RadonClassBlock]:
+    return hasattr(block, "methods") and hasattr(block, "inner_classes")
+
+
+def _qualname_from_block(
+    block: _RadonBlock,
+    prefix: tuple[str, ...] = (),
+) -> list[tuple[str, _RadonBlock]]:
+    if _is_class_block(block):
+        class_prefix = (*prefix, block.name)
+        items: list[tuple[str, _RadonBlock]] = []
         for inner_class in block.inner_classes:
             items.extend(_qualname_from_block(inner_class, class_prefix))
         for method in block.methods:
             items.extend(_qualname_from_block(method, class_prefix))
         return items
 
-    qualname = ".".join((*prefix, block.name))
-    items = [(qualname, block)]
-    for closure in block.closures:
-        items.extend(_qualname_from_block(closure, prefix + (block.name,)))
+    function_block = cast(_RadonFunctionBlock, block)
+    qualname = ".".join((*prefix, function_block.name))
+    items = [(qualname, function_block)]
+    for closure in function_block.closures:
+        items.extend(_qualname_from_block(closure, (*prefix, function_block.name)))
     return items
 
 
-def _load_coverage_report(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8"))
+def _load_coverage_report(path: Path) -> _CoverageReport:
+    raw_report = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
+    files = _expect_dict(raw_report.get("files"), "coverage report does not contain an object at 'files'")
+    return cast(_CoverageReport, {"files": files})
 
 
-def _load_baseline(path: Path) -> dict[str, dict[str, Any]]:
-    data = json.loads(path.read_text(encoding="utf-8"))
-    entries = data.get("functions", {})
+def _load_baseline(path: Path) -> dict[str, _BaselineFunctionEntry]:
+    raw_report = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
+    entries = raw_report.get("functions", {})
     if not isinstance(entries, dict):
         raise ValueError("baseline file does not contain an object at 'functions'")
-    return entries
+    return cast(dict[str, _BaselineFunctionEntry], entries)
 
 
 def _save_baseline(path: Path, source_root: Path, threshold: float, metrics: list[FunctionMetric]) -> None:
@@ -88,38 +186,37 @@ def _save_baseline(path: Path, source_root: Path, threshold: float, metrics: lis
 
 
 def _function_metrics_from_report(
-    coverage_report: dict[str, Any],
+    coverage_report: _CoverageReport,
     source_root: Path,
 ) -> list[FunctionMetric]:
     source_root = source_root.resolve()
-    files = coverage_report.get("files", {})
-    if not isinstance(files, dict):
-        raise ValueError("coverage report does not contain an object at 'files'")
+    files = coverage_report["files"]
 
     metrics: list[FunctionMetric] = []
     for raw_path, file_data in files.items():
+        raw_path = _expect_str(raw_path, "coverage report file path is invalid")
         file_path = Path(raw_path).resolve()
         if source_root not in file_path.parents and file_path != source_root:
             continue
 
         relative_path = file_path.relative_to(source_root).as_posix()
         source_text = file_path.read_text(encoding="utf-8")
-        blocks = cc_visit(source_text)
-        functions = file_data.get("functions", {})
-        if not isinstance(functions, dict):
-            raise ValueError(f"coverage report for {raw_path} does not contain function data")
+        blocks = _CC_VISIT(source_text)
+        functions = file_data["functions"]
 
         for qualname, block in _qualname_from_block_list(blocks):
             if qualname not in functions:
                 continue
             coverage_entry = functions[qualname]
-            if not isinstance(coverage_entry, dict):
-                raise ValueError(f"coverage report entry for {raw_path}::{qualname} is invalid")
-            summary = coverage_entry.get("summary", {})
-            if not isinstance(summary, dict):
-                raise ValueError(f"coverage summary for {raw_path}::{qualname} is invalid")
-            num_statements = int(summary.get("num_statements", 0))
-            covered_lines = int(summary.get("covered_lines", 0))
+            summary = coverage_entry["summary"]
+            num_statements = _expect_int(
+                summary["num_statements"],
+                f"coverage summary for {raw_path}::{qualname} has invalid num_statements",
+            )
+            covered_lines = _expect_int(
+                summary["covered_lines"],
+                f"coverage summary for {raw_path}::{qualname} has invalid covered_lines",
+            )
             coverage_fraction = 1.0 if num_statements <= 0 else covered_lines / num_statements
             crap = (block.complexity**2) * ((1 - coverage_fraction) ** 3) + block.complexity
             metrics.append(
@@ -137,8 +234,8 @@ def _function_metrics_from_report(
     return metrics
 
 
-def _qualname_from_block_list(blocks: list[Any]) -> list[tuple[str, Any]]:
-    items: list[tuple[str, Any]] = []
+def _qualname_from_block_list(blocks: Sequence[_RadonBlock]) -> list[tuple[str, _RadonBlock]]:
+    items: list[tuple[str, _RadonBlock]] = []
     for block in blocks:
         items.extend(_qualname_from_block(block))
     return items
@@ -146,7 +243,7 @@ def _qualname_from_block_list(blocks: list[Any]) -> list[tuple[str, Any]]:
 
 def _compare_metrics(
     current: list[FunctionMetric],
-    baseline: dict[str, dict[str, Any]],
+    baseline: dict[str, _BaselineFunctionEntry],
     threshold: float,
     epsilon: float,
 ) -> list[RatchetIssue]:
@@ -166,7 +263,10 @@ def _compare_metrics(
                 )
             continue
 
-        baseline_crap = float(baseline_entry.get("crap", 0.0))
+        baseline_crap = _expect_float(
+            baseline_entry.get("crap", 0.0),
+            f"baseline entry for {metric.key} has invalid crap",
+        )
         delta = metric.crap - baseline_crap
         if delta > epsilon:
             issues.append(
@@ -192,10 +292,7 @@ def _compare_metrics(
 
 def _format_issue(issue: RatchetIssue) -> str:
     if issue.kind == "regression":
-        return (
-            f"{issue.key} CRAP {issue.baseline_crap:.2f} -> {issue.current_crap:.2f} "
-            f"(+{issue.delta:.2f})"
-        )
+        return f"{issue.key} CRAP {issue.baseline_crap:.2f} -> {issue.current_crap:.2f} (+{issue.delta:.2f})"
     return f"{issue.key} CRAP {issue.current_crap:.2f} exceeds threshold"
 
 
@@ -234,9 +331,13 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
+def _parse_args(argv: list[str] | None) -> _RatchetArgs:
     parser = _build_parser()
-    args = parser.parse_args(argv)
+    return cast(_RatchetArgs, parser.parse_args(argv))
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv)
 
     coverage_report = _load_coverage_report(args.coverage)
     source_root = args.src.resolve()
