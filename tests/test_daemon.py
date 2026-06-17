@@ -137,6 +137,46 @@ def test_sync_main_connects_and_heartbeats(
     assert any("heartbeat" in record.message for record in caplog.records)
 
 
+def test_sync_main_runs_fts_backfill_before_connect(
+    mock_client: AsyncMock,
+    instant_shutdown_event: asyncio.Event,
+) -> None:
+    """Startup order keeps FTS backfill ahead of Telegram connect."""
+    call_order: list[str] = []
+
+    async def _fake_fts_backfill(ctx) -> None:
+        call_order.append("fts")
+
+    async def _fake_connect_telegram(ctx) -> bool:
+        call_order.append("connect")
+        return True
+
+    async def _noop(*args, **kwargs) -> None:
+        return None
+
+    mock_handler_manager = MagicMock()
+    mock_handler_manager.register = MagicMock()
+    mock_handler_manager.unregister = MagicMock()
+
+    with (
+        patch("mcp_telegram.daemon.create_client", return_value=mock_client),
+        patch("mcp_telegram.daemon.ensure_sync_schema"),
+        patch("mcp_telegram.daemon.register_shutdown_handler", return_value=instant_shutdown_event),
+        patch("mcp_telegram.daemon._open_sync_db"),
+        patch("mcp_telegram.daemon.backfill_fts_index", return_value=0),
+        patch("mcp_telegram.daemon._run_fts_backfill", side_effect=_fake_fts_backfill),
+        patch("mcp_telegram.daemon._connect_telegram", side_effect=_fake_connect_telegram),
+        patch("mcp_telegram.daemon._prime_runtime", side_effect=_noop),
+        patch("mcp_telegram.daemon.EventHandlerManager", return_value=mock_handler_manager),
+        patch("mcp_telegram.daemon._start_bootstrap_background_tasks", side_effect=_noop),
+        patch("mcp_telegram.daemon._start_followup_background_tasks", side_effect=_noop),
+        patch("mcp_telegram.daemon._run_sync_loop", side_effect=_noop),
+    ):
+        asyncio.run(sync_main())
+
+    assert call_order == ["fts", "connect"], call_order
+
+
 def test_sync_main_ensures_schema(
     mock_client: AsyncMock,
     instant_shutdown_event: asyncio.Event,

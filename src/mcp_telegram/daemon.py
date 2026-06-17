@@ -670,14 +670,16 @@ async def _shutdown_sync_main_context(ctx: _SyncMainContext) -> None:
 async def sync_main() -> None:
     """Main entry point for the sync daemon process.
 
-    Orchestrates: DB init → Telegram connect → wire services → sync loop → cleanup.
+    Orchestrates: DB init → FTS backfill → Telegram connect → wire services →
+    sync loop → cleanup.
     """
     ctx = await _build_sync_main_context()
     try:
+        await _run_fts_backfill(ctx)
+
         if not await _connect_telegram(ctx):
             return
 
-        await _run_fts_backfill(ctx)
         await _prime_runtime(ctx)
 
         ctx.handler_manager = EventHandlerManager(ctx.client, ctx.conn, ctx.shutdown_event)
