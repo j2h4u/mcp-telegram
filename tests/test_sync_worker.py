@@ -1689,7 +1689,6 @@ def _stored(dialog_id: int, message_id: int, text: str = "hello") -> StoredMessa
         sender_first_name="Alice",
         media_description=None,
         reply_to_msg_id=None,
-        reply_count=0,
         forum_topic_id=None,
         edit_date=None,
         grouped_id=None,
@@ -1711,6 +1710,7 @@ def test_insert_messages_with_fts_writes_reactions(sync_db: sqlite3.Connection) 
 
     em = ExtractedMessage(
         message=_stored(dialog_id, message_id, "hello"),
+        reply_count=0,
         reactions=[
             ReactionRecord(dialog_id=dialog_id, message_id=message_id, emoji="👍", count=5),
             ReactionRecord(dialog_id=dialog_id, message_id=message_id, emoji="❤", count=2),
@@ -1738,6 +1738,7 @@ def test_insert_messages_with_fts_writes_forwards(sync_db: sqlite3.Connection) -
 
     em = ExtractedMessage(
         message=_stored(dialog_id, message_id, "forwarded"),
+        reply_count=0,
         forward=ForwardRecord(
             dialog_id=dialog_id,
             message_id=message_id,
@@ -1770,6 +1771,7 @@ def test_insert_messages_with_fts_edit_idempotency_reactions(sync_db: sqlite3.Co
 
     em1 = ExtractedMessage(
         message=_stored(dialog_id, message_id, "v1"),
+        reply_count=0,
         reactions=[
             ReactionRecord(dialog_id=dialog_id, message_id=message_id, emoji="👍", count=3),
             ReactionRecord(dialog_id=dialog_id, message_id=message_id, emoji="❤", count=1),
@@ -1780,6 +1782,7 @@ def test_insert_messages_with_fts_edit_idempotency_reactions(sync_db: sqlite3.Co
 
     em2 = ExtractedMessage(
         message=_stored(dialog_id, message_id, "v2"),
+        reply_count=0,
         reactions=[ReactionRecord(dialog_id=dialog_id, message_id=message_id, emoji="🔥", count=7)],
     )
     with sync_db:
@@ -1804,6 +1807,7 @@ def test_insert_messages_with_fts_edit_idempotency_entities(sync_db: sqlite3.Con
 
     em1 = ExtractedMessage(
         message=_stored(dialog_id, message_id, "old"),
+        reply_count=0,
         entities=[
             EntityRecord(dialog_id=dialog_id, message_id=message_id, offset=0, length=5, type="mention", value="@old1"),
             EntityRecord(dialog_id=dialog_id, message_id=message_id, offset=6, length=5, type="mention", value="@old2"),
@@ -1814,6 +1818,7 @@ def test_insert_messages_with_fts_edit_idempotency_entities(sync_db: sqlite3.Con
 
     em2 = ExtractedMessage(
         message=_stored(dialog_id, message_id, "new"),
+        reply_count=0,
         entities=[
             EntityRecord(dialog_id=dialog_id, message_id=message_id, offset=0, length=4, type="hashtag", value="#new")
         ],
@@ -1840,6 +1845,7 @@ def test_insert_messages_with_fts_edit_idempotency_forwards(sync_db: sqlite3.Con
 
     em1 = ExtractedMessage(
         message=_stored(dialog_id, message_id, "fwd msg"),
+        reply_count=0,
         forward=ForwardRecord(
             dialog_id=dialog_id,
             message_id=message_id,
@@ -1860,6 +1866,7 @@ def test_insert_messages_with_fts_edit_idempotency_forwards(sync_db: sqlite3.Con
 
     em2 = ExtractedMessage(
         message=_stored(dialog_id, message_id, "edited msg"),
+        reply_count=0,
         forward=None,
     )
     with sync_db:

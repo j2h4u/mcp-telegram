@@ -110,6 +110,7 @@ def candidate_message(
     *,
     text: str = "same",
     edit_date: int | None = None,
+    reply_count: int = 0,
     reactions: list[ReactionRecord] | None = None,
     entities: list[EntityRecord] | None = None,
     forward: ForwardRecord | None = None,
@@ -124,7 +125,6 @@ def candidate_message(
             sender_first_name=None,
             media_description=None,
             reply_to_msg_id=None,
-            reply_count=0,
             forum_topic_id=None,
             edit_date=edit_date,
             grouped_id=None,
@@ -133,6 +133,7 @@ def candidate_message(
             is_service=0,
             post_author=None,
         ),
+        reply_count=reply_count,
         reactions=reactions or [],
         entities=entities or [],
         forward=forward,
@@ -252,6 +253,7 @@ def test_messages_row_equal_covers_base_and_child_tables(trace_enrichment_server
     conn.commit()
     existing = _trace_existing_message_bundle(conn, dialog_id=222, message_id=1)
     same = candidate_message(
+        reply_count=0,
         reactions=[ReactionRecord(dialog_id=222, message_id=1, emoji="👍", count=2)],
         entities=[EntityRecord(dialog_id=222, message_id=1, offset=0, length=4, type="hashtag", value="#tag")],
         forward=ForwardRecord(
@@ -267,6 +269,7 @@ def test_messages_row_equal_covers_base_and_child_tables(trace_enrichment_server
     assert _messages_row_equal(existing, same) is True
     assert _messages_row_equal(existing, candidate_message(text="changed")) is False
     assert _messages_row_equal(existing, candidate_message(edit_date=123)) is False
+    assert _messages_row_equal(existing, candidate_message(reply_count=1)) is False
     assert (
         _messages_row_equal(
             existing,

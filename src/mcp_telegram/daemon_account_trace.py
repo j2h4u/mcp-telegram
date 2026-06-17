@@ -2154,6 +2154,10 @@ def _messages_row_equal(existing: dict | None, candidate: ExtractedMessage) -> b
     candidate_message = dataclasses.asdict(candidate.message)
     candidate_message["is_deleted"] = 0
     for field in _TRACE_MESSAGE_COMPARE_FIELDS:
+        if field == "reply_count":
+            if existing_message.get(field, 0) != candidate.reply_count:
+                return False
+            continue
         if existing_message.get(field) != candidate_message.get(field):
             return False
 
