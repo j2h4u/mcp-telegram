@@ -66,7 +66,7 @@ def test_check_daemon_response_passes_extra_kwargs():
 @pytest.mark.asyncio
 async def test_maybe_heartbeat_fires_when_interval_elapsed():
     """Heartbeat fires when enough time has passed."""
-    from mcp_telegram.daemon import HEARTBEAT_INTERVAL_S, _maybe_heartbeat_and_gap_scan
+    from mcp_telegram.daemon import HEARTBEAT_INTERVAL_S, _maybe_heartbeat_and_gap_scan, _SyncLoopState
 
     conn = MagicMock(spec=sqlite3.Connection)
     # Make the stats query return something
@@ -89,10 +89,7 @@ async def test_maybe_heartbeat_fires_when_interval_elapsed():
     old_heartbeat = sync_start - HEARTBEAT_INTERVAL_S - 1
     old_gap_scan = sync_start  # gap scan should NOT fire
 
-    new_hb, new_gs, _hb_count, _hb_mono = await _maybe_heartbeat_and_gap_scan(
-        conn,
-        client,
-        handler_manager,
+    state = _SyncLoopState(
         sync_start=sync_start,
         last_heartbeat=old_heartbeat,
         last_gap_scan=old_gap_scan,
@@ -100,14 +97,23 @@ async def test_maybe_heartbeat_fires_when_interval_elapsed():
         last_hb_mono=old_heartbeat,
     )
 
-    assert new_hb > old_heartbeat, "heartbeat timestamp should be updated"
+    new_state = await _maybe_heartbeat_and_gap_scan(
+        conn,
+        client,
+        handler_manager,
+        state,
+    )
+
+    assert new_state is state
+    assert state.last_heartbeat > old_heartbeat, "heartbeat timestamp should be updated"
+    assert state.last_gap_scan == old_gap_scan
     handler_manager.refresh_synced_dialogs.assert_called_once()
 
 
 @pytest.mark.asyncio
 async def test_maybe_heartbeat_skips_when_recent():
     """Heartbeat does NOT fire when interval hasn't elapsed."""
-    from mcp_telegram.daemon import _maybe_heartbeat_and_gap_scan
+    from mcp_telegram.daemon import _maybe_heartbeat_and_gap_scan, _SyncLoopState
 
     conn = MagicMock(spec=sqlite3.Connection)
     client = MagicMock()
@@ -117,10 +123,7 @@ async def test_maybe_heartbeat_skips_when_recent():
 
     now = time.monotonic()
 
-    new_hb, new_gs, _hb_count, _hb_mono = await _maybe_heartbeat_and_gap_scan(
-        conn,
-        client,
-        handler_manager,
+    state = _SyncLoopState(
         sync_start=now,
         last_heartbeat=now,
         last_gap_scan=now,
@@ -128,7 +131,16 @@ async def test_maybe_heartbeat_skips_when_recent():
         last_hb_mono=now,
     )
 
-    assert new_hb == now, "heartbeat timestamp should not change"
+    new_state = await _maybe_heartbeat_and_gap_scan(
+        conn,
+        client,
+        handler_manager,
+        state,
+    )
+
+    assert new_state is state
+    assert state.last_heartbeat == now, "heartbeat timestamp should not change"
+    assert state.last_gap_scan == now
     handler_manager.refresh_synced_dialogs.assert_not_called()
 
 

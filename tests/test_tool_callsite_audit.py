@@ -153,12 +153,17 @@ def test_daemon_api_resolve_entity_passes_through_hint() -> None:
     contains disambiguation_hint. The passthrough is verbatim (result.matches),
     so disambiguation_hint propagates with zero code changes.
     """
-    from mcp_telegram.resolver import Candidates, _build_matches
+    from mcp_telegram.resolver import Candidates, _build_matches, _BuildMatchesOptions
 
     # Build matches with collision_query so hints are present
     hits = [("ivan", 100.0, 0)]
     norm_map = {"ivan": [(101, "Ivan Petrov"), (202, "Ivan Channel")]}
-    matches = _build_matches(hits, norm_map, None, collision_query="Ivan")
+    matches = _build_matches(
+        hits,
+        norm_map,
+        None,
+        options=_BuildMatchesOptions(collision_query="Ivan", collision_count=2),
+    )
 
     # Simulate what daemon_api._resolve_entity returns
     result = Candidates(query="Ivan", matches=matches)
