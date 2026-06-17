@@ -355,6 +355,28 @@ def _utf16_slice(text: str, offset: int, length: int) -> str | None:
         return None
 
 
+def _analytics_entity_type(entity: Any) -> str | None:
+    """Return the analytics entity type name for a Telethon entity."""
+    for cls, type_name in _ANALYTICS_ENTITY_TYPES.items():
+        if isinstance(entity, cls):
+            return type_name
+    return None
+
+
+def _extract_entity_value(entity_type: str, text: str, entity: Any, offset: int, length: int) -> tuple[bool, str | None]:
+    """Return (should_keep_row, value) for an analytics entity."""
+    if entity_type in {"mention", "hashtag", "url"}:
+        if not text:
+            return True, None
+        value = _utf16_slice(text, offset, length)
+        return value is not None, value
+    if entity_type == "mention_name":
+        return True, str(getattr(entity, "user_id", ""))
+    if entity_type == "text_url":
+        return True, getattr(entity, "url", None)
+    return False, None
+
+
 def extract_entity_rows(dialog_id: int, message_id: int, msg: Any) -> list[EntityRecord]:
     """Extract analytics-valuable entity rows from a Telethon message.
 
@@ -386,38 +408,15 @@ def extract_entity_rows(dialog_id: int, message_id: int, msg: Any) -> list[Entit
         return []  # Telethon not available (test env)
     text = getattr(msg, "message", "") or ""
     rows: list[EntityRecord] = []
-    for e in entities:
-        entity_type: str | None = None
-        for cls, type_name in _ANALYTICS_ENTITY_TYPES.items():
-            if isinstance(e, cls):
-                entity_type = type_name
-                break
+    for entity in entities:
+        entity_type = _analytics_entity_type(entity)
         if entity_type is None:
             continue
-        offset = getattr(e, "offset", 0)
-        length = getattr(e, "length", 0)
-        value: str | None = None
-        if entity_type == "mention":
-            # @username text span (peer_id not available on MessageEntityMention)
-            value = _utf16_slice(text, offset, length) if text else None
-            if value is None and text:
-                continue  # Skip row on decode error (Priority Action #4)
-        elif entity_type == "mention_name":
-            # user_id from entity attribute (not from text)
-            value = str(getattr(e, "user_id", ""))
-        elif entity_type == "hashtag":
-            # #topic text span
-            value = _utf16_slice(text, offset, length) if text else None
-            if value is None and text:
-                continue  # Skip row on decode error (Priority Action #4)
-        elif entity_type == "url":
-            # URL text span
-            value = _utf16_slice(text, offset, length) if text else None
-            if value is None and text:
-                continue  # Skip row on decode error (Priority Action #4)
-        elif entity_type == "text_url":
-            # Hyperlink URL from entity attribute (display text is different)
-            value = getattr(e, "url", None)
+        offset = getattr(entity, "offset", 0)
+        length = getattr(entity, "length", 0)
+        should_keep_row, value = _extract_entity_value(entity_type, text, entity, offset, length)
+        if not should_keep_row:
+            continue
         rows.append(
             EntityRecord(
                 dialog_id=dialog_id,
@@ -525,6 +524,43 @@ async def _build_fwd_entity_map(msg: Any, client: Any) -> dict[int, str]:
     return {peer_id: name} if name else {}
 
 
+def _extract_sent_at(msg: Any) -> int:
+    date = getattr(msg, "date", None)
+    return int(date.timestamp()) if isinstance(date, datetime) else 0
+
+
+def _extract_sender_first_name(msg: Any) -> str | None:
+    sender = getattr(msg, "sender", None)
+    return getattr(sender, "first_name", None) if sender is not None else None
+
+
+def _extract_media_description(msg: Any) -> str | None:
+    media = getattr(msg, "media", None)
+    return type(media).__name__ if media is not None else None
+
+
+def _extract_edit_date(msg: Any) -> int | None:
+    edit_date_raw = getattr(msg, "edit_date", None)
+    return int(edit_date_raw.timestamp()) if edit_date_raw is not None else None
+
+
+def _extract_grouped_id(msg: Any) -> int | None:
+    grouped_id_raw = getattr(msg, "grouped_id", None)
+    return int(grouped_id_raw) if grouped_id_raw is not None else None
+
+
+def _extract_reply_to_peer_id(msg: Any) -> int | None:
+    reply_to = getattr(msg, "reply_to", None)
+    reply_to_peer_raw = getattr(reply_to, "reply_to_peer_id", None) if reply_to is not None else None
+    if reply_to_peer_raw is None:
+        return None
+    for attr in ("user_id", "channel_id", "chat_id"):
+        pid = getattr(reply_to_peer_raw, attr, None)
+        if pid is not None:
+            return int(pid)
+    return None
+
+
 def extract_fwd_row(
     dialog_id: int,
     message_id: int,
@@ -575,62 +611,25 @@ def extract_message_row(dialog_id: int, msg: Any, entity_name_map: dict[int, str
     """
     message_id = int(getattr(msg, "id", 0))
 
-    date = getattr(msg, "date", None)
-    sent_at = int(date.timestamp()) if isinstance(date, datetime) else 0
-
-    text = getattr(msg, "message", None)
-
-    sender_id = getattr(msg, "sender_id", None)
-    sender = getattr(msg, "sender", None)
-    sender_first_name = getattr(sender, "first_name", None) if sender is not None else None
-
-    media = getattr(msg, "media", None)
-    media_description: str | None = type(media).__name__ if media is not None else None
-
     reply_to_msg_id, forum_topic_id = extract_reply_and_topic(msg)
-    reply_count = extract_reply_count(msg)
-
-    # -- New v7 columns --
-    edit_date_raw = getattr(msg, "edit_date", None)
-    edit_date: int | None = int(edit_date_raw.timestamp()) if edit_date_raw is not None else None
-    grouped_id_raw = getattr(msg, "grouped_id", None)
-    grouped_id: int | None = int(grouped_id_raw) if grouped_id_raw is not None else None
-
-    reply_to = getattr(msg, "reply_to", None)
-    reply_to_peer_raw = getattr(reply_to, "reply_to_peer_id", None) if reply_to is not None else None
-    reply_to_peer_id: int | None = None
-    if reply_to_peer_raw is not None:
-        for attr in ("user_id", "channel_id", "chat_id"):
-            pid = getattr(reply_to_peer_raw, attr, None)
-            if pid is not None:
-                reply_to_peer_id = int(pid)
-                break
-
-    # -- Phase 39.1 v9 columns: DM sender discriminators --
-    # `out` carries direction for DMs (sender is implicit — either self or peer).
-    # `is_service` flags MessageService rows (chat events) so "System" rendering
-    # is reserved for them rather than any row with sender_id IS NULL.
-    is_service = 1 if isinstance(msg, types.MessageService) else 0
-    out = 1 if getattr(msg, "out", False) else 0
-    post_author: str | None = getattr(msg, "post_author", None)
 
     stored = StoredMessage(
         dialog_id=dialog_id,
         message_id=message_id,
-        sent_at=sent_at,
-        text=text,
-        sender_id=sender_id,
-        sender_first_name=sender_first_name,
-        media_description=media_description,
+        sent_at=_extract_sent_at(msg),
+        text=getattr(msg, "message", None),
+        sender_id=getattr(msg, "sender_id", None),
+        sender_first_name=_extract_sender_first_name(msg),
+        media_description=_extract_media_description(msg),
         reply_to_msg_id=reply_to_msg_id,
-        reply_count=reply_count,
+        reply_count=extract_reply_count(msg),
         forum_topic_id=forum_topic_id,
-        edit_date=edit_date,
-        grouped_id=grouped_id,
-        reply_to_peer_id=reply_to_peer_id,
-        out=out,
-        is_service=is_service,
-        post_author=post_author,
+        edit_date=_extract_edit_date(msg),
+        grouped_id=_extract_grouped_id(msg),
+        reply_to_peer_id=_extract_reply_to_peer_id(msg),
+        out=1 if getattr(msg, "out", False) else 0,
+        is_service=1 if isinstance(msg, types.MessageService) else 0,
+        post_author=getattr(msg, "post_author", None),
     )
     reactions = extract_reactions_rows(dialog_id, message_id, getattr(msg, "reactions", None))
     entities = extract_entity_rows(dialog_id, message_id, msg)
@@ -811,9 +810,35 @@ class FullSyncWorker:
                 exc_info=True,
             )
             return sync_progress, False  # leave dialog in-progress for retry
+        return await self._store_batch_page(dialog_id, sync_progress, total_messages, batch)
 
+    async def _resolve_batch_entity_name_map(self, batch: list[Any]) -> dict[int, str]:
+        """Resolve forward source names for messages in a fetched batch."""
+        fwd_peers: dict[int, Any] = {}
+        for msg in batch:
+            fwd = getattr(msg, "fwd_from", None)
+            if fwd and getattr(fwd, "from_name", None) is None:
+                from_id = getattr(fwd, "from_id", None)
+                if from_id is not None:
+                    peer_id = _marked_peer_id(from_id)
+                    if peer_id is not None:
+                        fwd_peers.setdefault(peer_id, from_id)
+        entity_name_map: dict[int, str] = {}
+        for peer_id, from_id in fwd_peers.items():
+            name = await _resolve_peer_name(self._client, from_id)
+            if name:
+                entity_name_map[peer_id] = name
+        return entity_name_map
+
+    async def _store_batch_page(
+        self,
+        dialog_id: int,
+        sync_progress: int,
+        total_messages: int,
+        batch: list[Any],
+    ) -> tuple[int, bool]:
+        """Persist one fetched batch and update sync progress."""
         if not batch:
-            # No more messages — dialog fully synced
             now = int(time.time())
             with self._conn:
                 self._conn.execute(
@@ -827,24 +852,11 @@ class FullSyncWorker:
         # Telegram includes users/chats for forward sources in the same
         # GetHistory response, so get_entity() hits the local cache — no
         # extra API round-trips in the common case.
-        fwd_peers: dict[int, Any] = {}  # marked peer_id -> typed from_id Peer
-        for msg in batch:
-            fwd = getattr(msg, "fwd_from", None)
-            if fwd and getattr(fwd, "from_name", None) is None:
-                from_id = getattr(fwd, "from_id", None)
-                if from_id is not None:
-                    pid = _marked_peer_id(from_id)
-                    if pid is not None:
-                        fwd_peers.setdefault(pid, from_id)
-        entity_name_map: dict[int, str] = {}
-        for peer_id, from_id in fwd_peers.items():
-            name = await _resolve_peer_name(self._client, from_id)
-            if name:
-                entity_name_map[peer_id] = name
+        entity_name_map = await self._resolve_batch_entity_name_map(batch)
 
         rows = [extract_message_row(dialog_id, msg, entity_name_map=entity_name_map) for msg in batch]
         new_progress = min(int(getattr(msg, "id", 0)) for msg in batch)
-        is_done = len(batch) < _BATCH_SIZE  # partial batch = last batch
+        is_done = len(batch) < _BATCH_SIZE
         new_status = "synced" if is_done else "syncing"
 
         # Single atomic transaction: messages + FTS + progress update
