@@ -47,6 +47,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from telethon import utils as telethon_utils  # type: ignore[import-untyped]
+from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
 from telethon.tl.functions.channels import (
     GetFullChannelRequest,  # type: ignore[import-untyped]
     GetParticipantsRequest,  # type: ignore[import-untyped]
@@ -196,8 +197,10 @@ from .models import DialogType, ReadMessage, ReadState
 from .pagination import (
     HistoryDirection,
     decode_navigation_token,
+    encode_history_navigation,
     encode_search_navigation,
 )
+from .sync_worker import apply_reactions_delta, extract_reactions_rows
 
 # Phase 39.2 §Key technical decisions: per-message TTL for JIT reactions freshen-on-read.
 # Amortizes rapid paginated reads on the same ids; live events catch most mutations.
@@ -1240,6 +1243,183 @@ class DaemonAPIServer:
         return {
             "ok": True,
             "data": {"messages": messages, "source": "telegram", "next_navigation": next_nav},
+        }
+
+    # ------------------------------------------------------------------
+    # list_messages — helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _maybe_encode_next_nav(
+        messages: list[ReadMessage] | list[dict],
+        limit: int,
+        dialog_id: int,
+        direction: str,
+        direction_enum: HistoryDirection,
+    ) -> str | None:
+        """Encode a next-page navigation token if the result set is full."""
+        if messages and len(messages) == limit:
+            last = messages[-1]
+            last_msg_id = int(last["message_id"] if isinstance(last, dict) else last.message_id)
+            logger.debug(
+                "list_messages_pagination anchor_msg_id=%d dialog_id=%d direction=%s%s",
+                last_msg_id,
+                dialog_id,
+                direction,
+                _rid(),
+            )
+            return encode_history_navigation(last_msg_id, dialog_id, direction=direction_enum)
+        return None
+
+    async def _freshen_reactions_if_stale(self, dialog_id: int, entity: Any, message_ids: list[int]) -> None:
+        """Per-message TTL-gated JIT reaction freshen (Phase 39.2 Plan 02).
+
+        Looks up freshness rows for ``message_ids``; for any id whose
+        ``checked_at > now - REACTIONS_TTL_SECONDS`` it skips. Fetches ONLY
+        the stale subset from Telegram via ``client.get_messages(entity, ids=...)``
+        in a single bounded round-trip. For each non-None Message returned,
+        applies the reaction delta and upserts the freshness row. Partial
+        ``None`` results retain their prior freshness state (AC-6-PARTIAL).
+
+        On ``FloodWaitError``: warning logged; no DB mutation; stale cache
+        remains served. Other exceptions: logged + swallowed; stale cache
+        served. The fetch window is bounded to ``len(stale_ids)`` and is
+        never expanded — never escalates to ``iter_messages`` or full-history.
+        """
+        if not message_ids:
+            return
+        # synced_dialogs gate: missing row → never freshen (e.g. unsynced dialog).
+        row = self._conn.execute("SELECT 1 FROM synced_dialogs WHERE dialog_id = ?", (dialog_id,)).fetchone()
+        if row is None:
+            return
+
+        now = int(time.time())
+        threshold = now - REACTIONS_TTL_SECONDS
+        placeholders = ",".join("?" * len(message_ids))
+        fresh_rows = self._conn.execute(
+            f"SELECT message_id FROM message_reactions_freshness "
+            f"WHERE dialog_id = ? AND message_id IN ({placeholders}) "
+            f"AND checked_at > ?",
+            [dialog_id, *message_ids, threshold],
+        ).fetchall()
+        fresh_ids = {int(r[0]) for r in fresh_rows}
+        stale_ids = [mid for mid in message_ids if mid not in fresh_ids]
+        if not stale_ids:
+            return  # AC-4: zero API cost
+
+        try:
+            messages = await self._client.get_messages(entity, ids=stale_ids)
+        except FloodWaitError as exc:
+            logger.warning(
+                "jit_reactions_floodwait dialog_id=%d stale_count=%d seconds=%d",
+                dialog_id,
+                len(stale_ids),
+                getattr(exc, "seconds", 0),
+            )
+            return  # AC-6: no freshness upsert, no reaction mutation
+        except Exception:
+            logger.exception("jit_reactions_failed dialog_id=%d", dialog_id)
+            return
+
+        # Telethon `get_messages(ids=list)` returns a list aligned to input order;
+        # `None` for missing entries (AC-6-PARTIAL).
+        with self._conn:
+            for msg_id, msg in zip(stale_ids, messages, strict=False):
+                if msg is None:
+                    continue
+                rows = extract_reactions_rows(dialog_id, msg_id, getattr(msg, "reactions", None))
+                apply_reactions_delta(self._conn, dialog_id, msg_id, rows)
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO message_reactions_freshness "
+                    "(dialog_id, message_id, checked_at) VALUES (?, ?, ?)",
+                    (dialog_id, msg_id, now),
+                )
+
+    async def _resolve_unread_position(
+        self,
+        dialog_id: int,
+        unread_after_id: int | None,
+    ) -> int | None:
+        """Resolve unread cutoff from synced_dialogs. Zero Telegram API calls.
+
+        If unread_after_id is explicitly supplied, it wins.
+        Otherwise reads synced_dialogs.read_inbox_max_id — if NULL or row
+        missing, returns None (dialog not bootstrapped; caller skips unread filter).
+        """
+        if unread_after_id is not None:
+            return unread_after_id
+        row = self._conn.execute(_GET_READ_POSITION_SQL, (dialog_id,)).fetchone()
+        if row and row[0] is not None:
+            return int(row[0])
+        return None
+
+    async def _list_messages_from_db(
+        self,
+        *,
+        dialog_id: int,
+        limit: int,
+        direction: str,
+        direction_enum: HistoryDirection,
+        anchor_msg_id: int | None,
+        sender_id: int | None,
+        sender_name: str | None,
+        topic_id: int | None,
+        unread_after_id: int | None,
+    ) -> dict:
+        """Read messages from sync.db using the dynamic query builder."""
+        sql, params = _build_list_messages_query(
+            dialog_id=dialog_id,
+            limit=limit,
+            self_id=self.self_id,
+            direction=direction,
+            anchor_msg_id=anchor_msg_id,
+            sender_id=sender_id,
+            sender_name=sender_name,
+            topic_id=topic_id,
+            unread_after_id=unread_after_id,
+        )
+        rows = self._conn.execute(sql, params).fetchall()
+        msg_ids = [r["message_id"] for r in rows]
+        # Phase 39.2 Plan 02: TTL-gated JIT freshen for stale subset only.
+        if msg_ids:
+            await self._freshen_reactions_if_stale(dialog_id, dialog_id, msg_ids)
+        reaction_map = fetch_reaction_counts(self._conn, dialog_id, msg_ids)
+        messages = [
+            ReadMessage(
+                **dict(r),
+                reactions_display=format_reaction_counts(reaction_map[r["message_id"]])
+                if r["message_id"] in reaction_map
+                else "",
+            )
+            for r in rows
+        ]
+        # Phase 39: observability counter. Emit ONCE on the sync.db success path.
+        # Non-sync.db branches (Telegram fallback/error) intentionally do not emit this line.
+        null_sender_rows = sum(1 for m in messages if m.sender_id is None)
+        unresolved_entity_rows = sum(1 for m in messages if m.sender_id is not None and m.sender_first_name is None)
+        logger.info(
+            "list_messages rendered",
+            extra={
+                "dialog_id": dialog_id,
+                "rows": len(messages),
+                "null_sender_rows": null_sender_rows,
+                "unresolved_entity_rows": unresolved_entity_rows,
+            },
+        )
+        next_nav = self._maybe_encode_next_nav(
+            messages,
+            limit,
+            dialog_id,
+            direction,
+            direction_enum,
+        )
+        return {
+            "ok": True,
+            "data": {
+                "messages": [dataclasses.asdict(m) for m in messages],
+                "source": "sync_db",
+                "next_navigation": next_nav,
+            },
         }
 
     # ------------------------------------------------------------------
