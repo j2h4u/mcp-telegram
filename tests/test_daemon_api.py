@@ -5822,27 +5822,33 @@ def test_trace_query_authorship_predicate_unchanged() -> None:
 def test_trace_navigation_token_carries_scope_dialog_ids() -> None:
     """(f) encode → decode round-trip preserves scope_dialog_ids without a live API call."""
     from mcp_telegram.pagination import (
+        AccountTraceNavigationContext,
+        AccountTraceNavigationRequest,
         decode_account_trace_navigation,
         encode_account_trace_navigation,
     )
 
     scope_dialog_ids = [_CHANNEL_ID, _LINKED_CHAT_ID]
     token = encode_account_trace_navigation(
-        target_user_id=_TARGET_USER_ID,
-        sent_at=1700000001,
-        dialog_id=_LINKED_CHAT_ID,
-        message_id=42,
-        group_by="timeline",
-        exact_dialog_id=_CHANNEL_ID,
-        scope_dialog_ids=scope_dialog_ids,
+        AccountTraceNavigationRequest(
+            target_user_id=_TARGET_USER_ID,
+            sent_at=1700000001,
+            dialog_id=_LINKED_CHAT_ID,
+            message_id=42,
+            group_by="timeline",
+            exact_dialog_id=_CHANNEL_ID,
+            scope_dialog_ids=scope_dialog_ids,
+        )
     )
 
     # Decode — no live API call possible (pure token decode).
     decoded = decode_account_trace_navigation(
         token,
-        expected_target_user_id=_TARGET_USER_ID,
-        expected_group_by="timeline",
-        expected_exact_dialog_id=_CHANNEL_ID,
+        AccountTraceNavigationContext(
+            expected_target_user_id=_TARGET_USER_ID,
+            expected_group_by="timeline",
+            expected_exact_dialog_id=_CHANNEL_ID,
+        ),
     )
 
     assert decoded.scope_dialog_ids == scope_dialog_ids, (

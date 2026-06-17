@@ -78,6 +78,34 @@ class AccountTraceNavigationToken:
     scope_dialog_ids: list[int] | None = None
 
 
+@dataclass(frozen=True)
+class AccountTraceNavigationRequest:
+    """Input parameters for encoding an Account Trace continuation cursor."""
+
+    target_user_id: int
+    sent_at: int
+    dialog_id: int
+    message_id: int
+    group_by: AccountTraceGroupBy
+    exact_dialog_id: int | None = None
+    exact_topic_id: int | None = None
+    sent_after: str | None = None
+    sent_before: str | None = None
+    scope_dialog_ids: list[int] | None = None
+
+
+@dataclass(frozen=True)
+class AccountTraceNavigationContext:
+    """Expected context for decoding an Account Trace continuation cursor."""
+
+    expected_target_user_id: int
+    expected_group_by: AccountTraceGroupBy
+    expected_exact_dialog_id: int | None = None
+    expected_exact_topic_id: int | None = None
+    expected_sent_after: str | None = None
+    expected_sent_before: str | None = None
+
+
 def _encode_payload(payload: dict[str, object]) -> str:
     data = json.dumps(payload, separators=(",", ":")).encode()
     encoded = base64.urlsafe_b64encode(data).decode()
@@ -193,19 +221,7 @@ def encode_search_navigation(offset: int, dialog_id: int, query: str) -> str:
     )
 
 
-def encode_account_trace_navigation(
-    *,
-    target_user_id: int,
-    sent_at: int,
-    dialog_id: int,
-    message_id: int,
-    group_by: AccountTraceGroupBy,
-    exact_dialog_id: int | None = None,
-    exact_topic_id: int | None = None,
-    sent_after: str | None = None,
-    sent_before: str | None = None,
-    scope_dialog_ids: list[int] | None = None,
-) -> str:
+def encode_account_trace_navigation(request: AccountTraceNavigationRequest) -> str:
     """Encode an Account Trace keyset continuation cursor.
 
     ``scope_dialog_ids`` encodes the effective dialog-id set so the next page
@@ -214,118 +230,136 @@ def encode_account_trace_navigation(
     """
     payload: dict[str, object] = {
         "kind": "account_trace",
-        "target_user_id": target_user_id,
-        "sent_at": sent_at,
-        "dialog_id": dialog_id,
-        "message_id": message_id,
-        "group_by": group_by,
+        "target_user_id": request.target_user_id,
+        "sent_at": request.sent_at,
+        "dialog_id": request.dialog_id,
+        "message_id": request.message_id,
+        "group_by": request.group_by,
     }
-    if exact_dialog_id is not None:
-        payload["exact_dialog_id"] = exact_dialog_id
-    if exact_topic_id is not None:
-        payload["exact_topic_id"] = exact_topic_id
-    if sent_after is not None:
-        payload["sent_after"] = sent_after
-    if sent_before is not None:
-        payload["sent_before"] = sent_before
-    if scope_dialog_ids is not None:
-        payload["scope_dialog_ids"] = scope_dialog_ids
+    if request.exact_dialog_id is not None:
+        payload["exact_dialog_id"] = request.exact_dialog_id
+    if request.exact_topic_id is not None:
+        payload["exact_topic_id"] = request.exact_topic_id
+    if request.sent_after is not None:
+        payload["sent_after"] = request.sent_after
+    if request.sent_before is not None:
+        payload["sent_before"] = request.sent_before
+    if request.scope_dialog_ids is not None:
+        payload["scope_dialog_ids"] = request.scope_dialog_ids
     return _encode_payload(payload)
+
+
+def _require_navigation_int_field(data: dict[str, object], field_name: str) -> int:
+    value = data.get(field_name)
+    if not isinstance(value, int):
+        raise ValueError(f"Invalid navigation token: {field_name} must be an integer")
+    return value
+
+
+def _require_navigation_optional_int_field(data: dict[str, object], field_name: str) -> int | None:
+    value = data.get(field_name)
+    if value is not None and not isinstance(value, int):
+        raise ValueError(f"Invalid navigation token: {field_name} must be an integer when present")
+    return cast("int | None", value)
+
+
+def _require_navigation_optional_str_field(data: dict[str, object], field_name: str) -> str | None:
+    value = data.get(field_name)
+    if value is not None and not isinstance(value, str):
+        raise ValueError(f"Invalid navigation token: {field_name} must be a string when present")
+    return cast("str | None", value)
+
+
+def _require_navigation_value_matches(actual: object, expected: object, message: str) -> None:
+    if actual != expected:
+        raise ValueError(message)
+
+
+def _require_account_trace_group_by(value: object) -> AccountTraceGroupBy:
+    if value not in {"timeline", "dialog"}:
+        raise ValueError("Invalid navigation token: group_by must be timeline or dialog")
+    return cast("AccountTraceGroupBy", value)
+
+
+def _require_scope_dialog_ids(value: object) -> list[int] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise ValueError("Invalid navigation token: scope_dialog_ids must be a list when present")
+    if len(value) > _MAX_SCOPE_DIALOG_IDS:
+        raise ValueError(
+            f"Invalid navigation token: scope_dialog_ids must have at most {_MAX_SCOPE_DIALOG_IDS} elements"
+        )
+    for item in value:
+        if not isinstance(item, int):
+            raise ValueError("Invalid navigation token: all scope_dialog_ids elements must be integers")
+    return [int(item) for item in value]
 
 
 def decode_account_trace_navigation(
     token: str,
-    *,
-    expected_target_user_id: int,
-    expected_group_by: AccountTraceGroupBy,
-    expected_exact_dialog_id: int | None = None,
-    expected_exact_topic_id: int | None = None,
-    expected_sent_after: str | None = None,
-    expected_sent_before: str | None = None,
+    context: AccountTraceNavigationContext,
 ) -> AccountTraceNavigationToken:
     """Decode an Account Trace cursor and reject context mismatches."""
     data = _decode_payload(token)
-
     kind = data.get("kind")
     if kind != "account_trace":
         raise ValueError(f"Navigation token is for {kind}, not account_trace")
 
-    target_user_id = data.get("target_user_id")
-    if not isinstance(target_user_id, int):
-        raise ValueError("Invalid navigation token: target_user_id must be an integer")
-    if target_user_id != expected_target_user_id:
-        msg = f"Navigation token belongs to account {target_user_id}, not {expected_target_user_id}"
-        raise ValueError(msg)
+    target_user_id = _require_navigation_int_field(data, "target_user_id")
+    _require_navigation_value_matches(
+        target_user_id,
+        context.expected_target_user_id,
+        f"Navigation token belongs to account {target_user_id}, not {context.expected_target_user_id}",
+    )
 
-    group_by = data.get("group_by")
-    if group_by not in {"timeline", "dialog"}:
-        raise ValueError("Invalid navigation token: group_by must be timeline or dialog")
-    if group_by != expected_group_by:
-        msg = f"Navigation token belongs to group_by {group_by}, not {expected_group_by}"
-        raise ValueError(msg)
+    group_by = _require_account_trace_group_by(data.get("group_by"))
+    _require_navigation_value_matches(
+        group_by,
+        context.expected_group_by,
+        f"Navigation token belongs to group_by {group_by}, not {context.expected_group_by}",
+    )
 
-    sent_at = data.get("sent_at")
-    if not isinstance(sent_at, int):
-        raise ValueError("Invalid navigation token: sent_at must be an integer")
+    sent_at = _require_navigation_int_field(data, "sent_at")
+    dialog_id = _require_navigation_int_field(data, "dialog_id")
+    message_id = _require_navigation_int_field(data, "message_id")
 
-    dialog_id = data.get("dialog_id")
-    if not isinstance(dialog_id, int):
-        raise ValueError("Invalid navigation token: dialog_id must be an integer")
+    exact_dialog_id = _require_navigation_optional_int_field(data, "exact_dialog_id")
+    _require_navigation_value_matches(
+        exact_dialog_id,
+        context.expected_exact_dialog_id,
+        f"Navigation token belongs to dialog scope {exact_dialog_id}, not {context.expected_exact_dialog_id}",
+    )
 
-    message_id = data.get("message_id")
-    if not isinstance(message_id, int):
-        raise ValueError("Invalid navigation token: message_id must be an integer")
+    exact_topic_id = _require_navigation_optional_int_field(data, "exact_topic_id")
+    _require_navigation_value_matches(
+        exact_topic_id,
+        context.expected_exact_topic_id,
+        f"Navigation token belongs to topic scope {exact_topic_id}, not {context.expected_exact_topic_id}",
+    )
 
-    exact_dialog_id = data.get("exact_dialog_id")
-    if exact_dialog_id is not None and not isinstance(exact_dialog_id, int):
-        raise ValueError("Invalid navigation token: exact_dialog_id must be an integer when present")
-    if exact_dialog_id != expected_exact_dialog_id:
-        msg = f"Navigation token belongs to dialog scope {exact_dialog_id}, not {expected_exact_dialog_id}"
-        raise ValueError(msg)
+    sent_after = _require_navigation_optional_str_field(data, "sent_after")
+    _require_navigation_value_matches(
+        sent_after,
+        context.expected_sent_after,
+        f"Navigation token belongs to sent_after {sent_after}, not {context.expected_sent_after}",
+    )
 
-    exact_topic_id = data.get("exact_topic_id")
-    if exact_topic_id is not None and not isinstance(exact_topic_id, int):
-        raise ValueError("Invalid navigation token: exact_topic_id must be an integer when present")
-    if exact_topic_id != expected_exact_topic_id:
-        msg = f"Navigation token belongs to topic scope {exact_topic_id}, not {expected_exact_topic_id}"
-        raise ValueError(msg)
+    sent_before = _require_navigation_optional_str_field(data, "sent_before")
+    _require_navigation_value_matches(
+        sent_before,
+        context.expected_sent_before,
+        f"Navigation token belongs to sent_before {sent_before}, not {context.expected_sent_before}",
+    )
 
-    sent_after = data.get("sent_after")
-    if sent_after is not None and not isinstance(sent_after, str):
-        raise ValueError("Invalid navigation token: sent_after must be a string when present")
-    if sent_after != expected_sent_after:
-        msg = f"Navigation token belongs to sent_after {sent_after}, not {expected_sent_after}"
-        raise ValueError(msg)
-
-    sent_before = data.get("sent_before")
-    if sent_before is not None and not isinstance(sent_before, str):
-        raise ValueError("Invalid navigation token: sent_before must be a string when present")
-    if sent_before != expected_sent_before:
-        msg = f"Navigation token belongs to sent_before {sent_before}, not {expected_sent_before}"
-        raise ValueError(msg)
-
-    # scope_dialog_ids is optional (absent in legacy/non-channel tokens).
-    # When present it must be a list of ints bounded at ≤2 ids.
-    scope_dialog_ids_raw = data.get("scope_dialog_ids")
-    scope_dialog_ids: list[int] | None = None
-    if scope_dialog_ids_raw is not None:
-        if not isinstance(scope_dialog_ids_raw, list):
-            raise ValueError("Invalid navigation token: scope_dialog_ids must be a list when present")
-        if len(scope_dialog_ids_raw) > _MAX_SCOPE_DIALOG_IDS:
-            raise ValueError(
-                f"Invalid navigation token: scope_dialog_ids must have at most {_MAX_SCOPE_DIALOG_IDS} elements"
-            )
-        for item in scope_dialog_ids_raw:
-            if not isinstance(item, int):
-                raise ValueError("Invalid navigation token: all scope_dialog_ids elements must be integers")
-        scope_dialog_ids = [int(x) for x in scope_dialog_ids_raw]
+    scope_dialog_ids = _require_scope_dialog_ids(data.get("scope_dialog_ids"))
 
     return AccountTraceNavigationToken(
         target_user_id=target_user_id,
         sent_at=sent_at,
         dialog_id=dialog_id,
         message_id=message_id,
-        group_by=cast("AccountTraceGroupBy", group_by),
+        group_by=group_by,
         exact_dialog_id=exact_dialog_id,
         exact_topic_id=exact_topic_id,
         sent_after=sent_after,

@@ -37,6 +37,8 @@ from mcp_telegram.models import (
     TraceResolvedAccount,
 )
 from mcp_telegram.pagination import (
+    AccountTraceNavigationContext,
+    AccountTraceNavigationRequest,
     AccountTraceNavigationToken,
     decode_account_trace_navigation,
     encode_account_trace_navigation,
@@ -107,25 +109,29 @@ def test_trace_typed_dict_contracts_are_importable() -> None:
 
 def test_account_trace_navigation_roundtrip() -> None:
     token = encode_account_trace_navigation(
-        target_user_id=101,
-        sent_at=1_700_000_001,
-        dialog_id=-100123,
-        message_id=55,
-        group_by="timeline",
-        exact_dialog_id=-100123,
-        exact_topic_id=7,
-        sent_after="2024-01-01T00:00:00Z",
-        sent_before="2024-02-01T00:00:00Z",
+        AccountTraceNavigationRequest(
+            target_user_id=101,
+            sent_at=1_700_000_001,
+            dialog_id=-100123,
+            message_id=55,
+            group_by="timeline",
+            exact_dialog_id=-100123,
+            exact_topic_id=7,
+            sent_after="2024-01-01T00:00:00Z",
+            sent_before="2024-02-01T00:00:00Z",
+        )
     )
 
     decoded = decode_account_trace_navigation(
         token,
-        expected_target_user_id=101,
-        expected_group_by="timeline",
-        expected_exact_dialog_id=-100123,
-        expected_exact_topic_id=7,
-        expected_sent_after="2024-01-01T00:00:00Z",
-        expected_sent_before="2024-02-01T00:00:00Z",
+        AccountTraceNavigationContext(
+            expected_target_user_id=101,
+            expected_group_by="timeline",
+            expected_exact_dialog_id=-100123,
+            expected_exact_topic_id=7,
+            expected_sent_after="2024-01-01T00:00:00Z",
+            expected_sent_before="2024-02-01T00:00:00Z",
+        ),
     )
 
     assert decoded == AccountTraceNavigationToken(
@@ -143,56 +149,68 @@ def test_account_trace_navigation_roundtrip() -> None:
 
 def test_account_trace_navigation_rejects_target_mismatch() -> None:
     token = encode_account_trace_navigation(
-        target_user_id=101,
-        sent_at=1,
-        dialog_id=2,
-        message_id=3,
-        group_by="dialog",
+        AccountTraceNavigationRequest(
+            target_user_id=101,
+            sent_at=1,
+            dialog_id=2,
+            message_id=3,
+            group_by="dialog",
+        )
     )
 
     with pytest.raises(ValueError, match="account 101, not 202"):
         decode_account_trace_navigation(
             token,
-            expected_target_user_id=202,
-            expected_group_by="dialog",
+            AccountTraceNavigationContext(
+                expected_target_user_id=202,
+                expected_group_by="dialog",
+            ),
         )
 
 
 def test_account_trace_navigation_rejects_topic_scope_mismatch() -> None:
     token = encode_account_trace_navigation(
-        target_user_id=101,
-        sent_at=1,
-        dialog_id=2,
-        message_id=3,
-        group_by="timeline",
-        exact_topic_id=8,
+        AccountTraceNavigationRequest(
+            target_user_id=101,
+            sent_at=1,
+            dialog_id=2,
+            message_id=3,
+            group_by="timeline",
+            exact_topic_id=8,
+        )
     )
 
     with pytest.raises(ValueError, match="topic scope 8, not 9"):
         decode_account_trace_navigation(
             token,
-            expected_target_user_id=101,
-            expected_group_by="timeline",
-            expected_exact_topic_id=9,
+            AccountTraceNavigationContext(
+                expected_target_user_id=101,
+                expected_group_by="timeline",
+                expected_exact_topic_id=9,
+            ),
         )
 
 
 def test_account_trace_navigation_rejects_time_bound_mismatch() -> None:
     token = encode_account_trace_navigation(
-        target_user_id=101,
-        sent_at=1,
-        dialog_id=2,
-        message_id=3,
-        group_by="timeline",
-        sent_after="2024-01-01T00:00:00Z",
+        AccountTraceNavigationRequest(
+            target_user_id=101,
+            sent_at=1,
+            dialog_id=2,
+            message_id=3,
+            group_by="timeline",
+            sent_after="2024-01-01T00:00:00Z",
+        )
     )
 
     with pytest.raises(ValueError, match="sent_after"):
         decode_account_trace_navigation(
             token,
-            expected_target_user_id=101,
-            expected_group_by="timeline",
-            expected_sent_after="2024-01-02T00:00:00Z",
+            AccountTraceNavigationContext(
+                expected_target_user_id=101,
+                expected_group_by="timeline",
+                expected_sent_after="2024-01-02T00:00:00Z",
+            ),
         )
 
 

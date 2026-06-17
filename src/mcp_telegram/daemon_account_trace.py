@@ -288,7 +288,7 @@ class DaemonAccountTraceService:
         self,
         request: _TraceAccountQueryContext,
     ) -> _TraceAccountQueryResult:
-        from .pagination import encode_account_trace_navigation
+        from .pagination import AccountTraceNavigationRequest, encode_account_trace_navigation
 
         limit = request.request.limit
         scope = request.scope
@@ -317,16 +317,18 @@ class DaemonAccountTraceService:
             if request.request.group_by == "dialog":
                 group_by = "dialog"
             next_navigation = encode_account_trace_navigation(
-                target_user_id=request.target_user_id,
-                sent_at=int(last["sent_at"]),
-                dialog_id=int(last["dialog_id"]),
-                message_id=int(last["message_id"]),
-                group_by=group_by,
-                exact_dialog_id=scope.exact_dialog_id,
-                exact_topic_id=scope.exact_topic_id,
-                sent_after=cast("str | None", request.request.sent_after),
-                sent_before=cast("str | None", request.request.sent_before),
-                scope_dialog_ids=scope.scope_dialog_ids,
+                AccountTraceNavigationRequest(
+                    target_user_id=request.target_user_id,
+                    sent_at=int(last["sent_at"]),
+                    dialog_id=int(last["dialog_id"]),
+                    message_id=int(last["message_id"]),
+                    group_by=group_by,
+                    exact_dialog_id=scope.exact_dialog_id,
+                    exact_topic_id=scope.exact_topic_id,
+                    sent_after=cast("str | None", request.request.sent_after),
+                    sent_before=cast("str | None", request.request.sent_before),
+                    scope_dialog_ids=scope.scope_dialog_ids,
+                )
             )
         return _TraceAccountQueryResult(
             selected_rows=selected_rows,
@@ -1053,7 +1055,7 @@ def _parse_trace_account_navigation_scope(
     exact_topic_id: int | None,
     decode_navigation: object,
 ) -> _TraceNavigationScopeResult:
-    from .pagination import decode_account_trace_navigation
+    from .pagination import AccountTraceNavigationContext, decode_account_trace_navigation
 
     if not isinstance(decode_navigation, str) or not decode_navigation:
         return _TraceNavigationScopeResult(None, None, None, None)
@@ -1064,12 +1066,14 @@ def _parse_trace_account_navigation_scope(
             expected_group_by = "dialog"
         decoded = decode_account_trace_navigation(
             decode_navigation,
-            expected_target_user_id=request.target_user_id,
-            expected_group_by=expected_group_by,
-            expected_exact_dialog_id=exact_dialog_id,
-            expected_exact_topic_id=exact_topic_id,
-            expected_sent_after=cast("str | None", request.request.sent_after),
-            expected_sent_before=cast("str | None", request.request.sent_before),
+            AccountTraceNavigationContext(
+                expected_target_user_id=request.target_user_id,
+                expected_group_by=expected_group_by,
+                expected_exact_dialog_id=exact_dialog_id,
+                expected_exact_topic_id=exact_topic_id,
+                expected_sent_after=cast("str | None", request.request.sent_after),
+                expected_sent_before=cast("str | None", request.request.sent_before),
+            ),
         )
     except ValueError as exc:
         return _TraceNavigationScopeResult(
