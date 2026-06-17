@@ -70,7 +70,6 @@ class StoredMessage:
     sender_first_name: str | None
     media_description: str | None
     reply_to_msg_id: int | None
-    reply_count: int
     forum_topic_id: int | None
     edit_date: int | None
     grouped_id: int | None
@@ -119,6 +118,7 @@ class ExtractedMessage:
     """Bundle of extracted rows for atomic multi-table insert."""
 
     message: StoredMessage
+    reply_count: int
     reactions: list[ReactionRecord] = field(default_factory=list)
     entities: list[EntityRecord] = field(default_factory=list)
     forward: ForwardRecord | None = None
@@ -137,8 +137,8 @@ def _insert_sql(table: str, dc_type: type) -> str:
 
 _SM_FIELDS = tuple(f.name for f in fields(StoredMessage))
 INSERT_MESSAGE_SQL = (
-    f"INSERT OR REPLACE INTO messages ({', '.join(_SM_FIELDS)}, is_deleted) "
-    f"VALUES ({', '.join(':' + n for n in _SM_FIELDS)}, 0)"
+    f"INSERT OR REPLACE INTO messages ({', '.join(_SM_FIELDS)}, reply_count, is_deleted) "
+    f"VALUES ({', '.join(':' + n for n in _SM_FIELDS)}, :reply_count, 0)"
 )
 
 INSERT_REACTION_SQL = _insert_sql("message_reactions", ReactionRecord)
@@ -192,7 +192,10 @@ def insert_messages_with_fts(
     message would accumulate stale child rows from prior versions.
     """
     msgs = [em.message for em in extracted]
-    conn.executemany(INSERT_MESSAGE_SQL, [asdict(m) for m in msgs])
+    conn.executemany(
+        INSERT_MESSAGE_SQL,
+        [{**asdict(em.message), "reply_count": em.reply_count} for em in extracted],
+    )
     conn.executemany(DELETE_FTS_SQL, ((m.dialog_id, m.message_id) for m in msgs))
     conn.executemany(
         INSERT_FTS_SQL,
@@ -624,7 +627,6 @@ def extract_message_row(dialog_id: int, msg: Any, entity_name_map: dict[int, str
         sender_first_name=_extract_sender_first_name(msg),
         media_description=_extract_media_description(msg),
         reply_to_msg_id=reply_to_msg_id,
-        reply_count=extract_reply_count(msg),
         forum_topic_id=forum_topic_id,
         edit_date=_extract_edit_date(msg),
         grouped_id=_extract_grouped_id(msg),
@@ -633,11 +635,18 @@ def extract_message_row(dialog_id: int, msg: Any, entity_name_map: dict[int, str
         is_service=1 if isinstance(msg, types.MessageService) else 0,
         post_author=getattr(msg, "post_author", None),
     )
+    reply_count = extract_reply_count(msg)
     reactions = extract_reactions_rows(dialog_id, message_id, getattr(msg, "reactions", None))
     entities = extract_entity_rows(dialog_id, message_id, msg)
     forward = extract_fwd_row(dialog_id, message_id, msg, entity_name_map=entity_name_map)
 
-    return ExtractedMessage(message=stored, reactions=reactions, entities=entities, forward=forward)
+    return ExtractedMessage(
+        message=stored,
+        reply_count=reply_count,
+        reactions=reactions,
+        entities=entities,
+        forward=forward,
+    )
 
 
 # ---------------------------------------------------------------------------
