@@ -37,6 +37,7 @@ dev = [
     "actionlint-py>=1.7.12.24",
     "basedpyright>=1.39.8",
     "import-linter>=2.11",
+    "pytest-crap>=0.3.0",
 ]
 
 [project.scripts]

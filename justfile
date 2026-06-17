@@ -63,6 +63,10 @@ deadcode:
 coverage:
     uv run pytest -W error::ResourceWarning --cov=src/mcp_telegram --cov-report=term-missing
 
+# Run pytest with CRAP reporting over the full suite.
+crap:
+    uv run pytest --cov=src/mcp_telegram --cov-report=term-missing --crap --crap-threshold=30 --crap-top-n=30
+
 # Rebuild and restart the live Docker container.
 runtime-build:
     docker compose -f {{compose_file}} up -d --build {{container}}
