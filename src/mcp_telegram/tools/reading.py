@@ -1145,9 +1145,13 @@ async def _resolve_topic_id(
         exact_matches = [t for t in fuzzy_matches if (t.get("title") or "").lower() == query]
         if len(exact_matches) == 1:
             return exact_matches[0]["id"]
-        return error_result(
+        err = error_result(
             "Multiple topics matched.\n"
             "Action: Retry list_messages with one numeric exact_topic_id from structuredContent.candidates.",
+        )
+        return ToolResult(
+            content=err.content,
+            is_error=True,
             structured_content={
                 "error": "ambiguous_topic",
                 "candidates": [_topic_candidate_payload(topic) for topic in fuzzy_matches[:5]],

@@ -25,7 +25,7 @@ import logging
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import NotRequired, TypedDict, Unpack
+from typing import NotRequired, TypedDict, Unpack, cast
 
 from .daemon_ipc import get_daemon_socket_path
 
@@ -75,6 +75,21 @@ class _TraceAccountMessagesKwargs(TypedDict, total=False):
     coverage_goal: str
 
 
+class _DaemonResponse(TypedDict, total=False):
+    ok: bool
+    request_id: str
+    message: object
+    error: object
+    data: dict[str, object]
+
+
+def _parse_response_line(line: bytes) -> _DaemonResponse:
+    response_obj = cast(object, json.loads(line.decode()))
+    if not isinstance(response_obj, dict):
+        raise DaemonNotRunningError("Daemon returned malformed JSON: response must be a JSON object")
+    return cast(_DaemonResponse, response_obj)
+
+
 __all__ = [
     "DaemonConnection",
     "DaemonNotRunningError",
@@ -114,7 +129,7 @@ class DaemonConnection:
         self._writer = writer
         self._timeout_seconds = timeout_seconds
 
-    async def request(self, payload: dict) -> dict:
+    async def request(self, payload: dict) -> dict[str, object]:
         """Send *payload* as a JSON line, read one JSON response line, return dict.
 
         A request_id (8 hex chars) is added to every outgoing payload for
@@ -160,7 +175,7 @@ class DaemonConnection:
                 "Sync daemon closed the connection unexpectedly. Restart it with: mcp-telegram sync"
             )
         try:
-            response = json.loads(line.decode())
+            response = _parse_response_line(line)
         except json.JSONDecodeError as exc:
             raise DaemonNotRunningError(f"Daemon returned malformed JSON: {exc}") from exc
         logger.debug(
@@ -169,7 +184,7 @@ class DaemonConnection:
             response.get("request_id", rid),
             response.get("ok"),
         )
-        return response
+        return dict(response)
 
     # ------------------------------------------------------------------
     # Convenience wrappers for the daemon API methods

@@ -564,9 +564,13 @@ async def _resolve_entity_lookup(args: GetEntityInfo) -> ToolResult | _EntityLoo
 
     if resolve_status == "candidates":
         matches = resolve_data.get("matches", [])
-        return error_result(
+        err = error_result(
             "Multiple entities matched.\n"
             "Action: Retry get_entity_info with one numeric entity_id from structuredContent.candidates.",
+        )
+        return ToolResult(
+            content=err.content,
+            is_error=True,
             structured_content={
                 "error": "ambiguous_entity",
                 "candidates": [_entity_candidate_payload(match) for match in matches if isinstance(match, dict)],

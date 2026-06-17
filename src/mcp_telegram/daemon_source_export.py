@@ -2,11 +2,14 @@
 
 import hashlib
 import sqlite3
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import cast
 
 _SOURCE_CURSOR_PREFIX = "telegram:v1:dialog:"
 _SOURCE_UNIT_PREFIX = "dialog:"
+SourceRow = Mapping[str, object]
 
 
 def _source_cursor(dialog_id: int, message_id: int) -> str:
@@ -71,6 +74,26 @@ def _source_iso(epoch_seconds: int | None) -> str | None:
     return datetime.fromtimestamp(int(epoch_seconds), tz=UTC).strftime("%Y-%m-%dT%H:%M:%S.000000Z")
 
 
+def _row_int(row: SourceRow, key: str) -> int:
+    value = row[key]
+    return int(cast(int | float | str, value))
+
+
+def _row_optional_int(row: SourceRow, key: str) -> int | None:
+    value = row[key]
+    return None if value is None else int(cast(int | float | str, value))
+
+
+def _row_text(row: SourceRow, key: str) -> str:
+    value = row[key]
+    return "" if value is None else str(value)
+
+
+def _row_optional_text(row: SourceRow, key: str) -> str | None:
+    value = row[key]
+    return None if value is None else str(value)
+
+
 @dataclass(frozen=True)
 class _SourceExportRequest:
     cursor_key: tuple[int, int] | None
@@ -108,44 +131,44 @@ class _SourceExportRequest:
 
 
 def _collect_unit_changes(
-    identity_rows: list[sqlite3.Row],
-    update_rows: list[sqlite3.Row],
+    identity_rows: list[SourceRow],
+    update_rows: list[SourceRow],
 ) -> list[dict]:
     return [_source_row_to_change(row) for row in [*identity_rows, *update_rows]]
 
 
 def _resolve_checkpoint_cursor(
     request: _SourceExportRequest,
-    identity_rows: list[sqlite3.Row],
+    identity_rows: list[SourceRow],
 ) -> str | None:
     if identity_rows:
         last_identity = identity_rows[-1]
-        return _source_cursor(int(last_identity["dialog_id"]), int(last_identity["message_id"]))
+        return _source_cursor(_row_int(last_identity, "dialog_id"), _row_int(last_identity, "message_id"))
     return request.cursor_value
 
 
 def _resolve_export_watermark(
     request: _SourceExportRequest,
-    update_rows: list[sqlite3.Row],
+    update_rows: list[SourceRow],
 ) -> tuple[str | None, str | None]:
     if not update_rows:
         return request.updated_after_value, request.updated_after_cursor_value
 
-    max_update_epoch = max(int(row["unit_updated_epoch"]) for row in update_rows)
+    max_update_epoch = max(_row_int(row, "unit_updated_epoch") for row in update_rows)
     updated_after = _source_iso(max_update_epoch)
-    latest = [row for row in update_rows if int(row["unit_updated_epoch"]) == max_update_epoch][-1]
-    updated_after_cursor = _source_cursor(int(latest["dialog_id"]), int(latest["message_id"]))
+    latest = [row for row in update_rows if _row_int(row, "unit_updated_epoch") == max_update_epoch][-1]
+    updated_after_cursor = _source_cursor(_row_int(latest, "dialog_id"), _row_int(latest, "message_id"))
     return updated_after, updated_after_cursor
 
 
 def _resolve_next_cursor(
-    identity_rows: list[sqlite3.Row],
+    identity_rows: list[SourceRow],
     has_more_identity: bool,
 ) -> str | None:
     if not (identity_rows and has_more_identity):
         return None
     last_identity = identity_rows[-1]
-    return _source_cursor(int(last_identity["dialog_id"]), int(last_identity["message_id"]))
+    return _source_cursor(_row_int(last_identity, "dialog_id"), _row_int(last_identity, "message_id"))
 
 
 def _source_fingerprint(*parts: object) -> str:
@@ -153,15 +176,15 @@ def _source_fingerprint(*parts: object) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def _source_row_to_change(row: sqlite3.Row) -> dict:
-    dialog_id = int(row["dialog_id"])
-    message_id = int(row["message_id"])
+def _source_row_to_change(row: SourceRow) -> dict[str, object]:
+    dialog_id = _row_int(row, "dialog_id")
+    message_id = _row_int(row, "message_id")
     document_ref = f"dialog:{dialog_id}"
     unit_ref = _unit_ref(dialog_id, message_id)
-    unit_updated_at = _source_iso(int(row["unit_updated_epoch"]))
-    text = row["text"] or row["media_description"] or ""
-    dialog_name = row["dialog_name"] or str(dialog_id)
-    dialog_type = row["dialog_type"] or "Unknown"
+    unit_updated_at = _source_iso(_row_int(row, "unit_updated_epoch"))
+    text = _row_text(row, "text") or _row_text(row, "media_description")
+    dialog_name = _row_optional_text(row, "dialog_name") or str(dialog_id)
+    dialog_type = _row_optional_text(row, "dialog_type") or "Unknown"
     username = row["username"]
     edit_date = row["edit_date"]
 
@@ -174,14 +197,14 @@ def _source_row_to_change(row: sqlite3.Row) -> dict:
     unit_metadata = {
         "dialog_id": dialog_id,
         "message_id": message_id,
-        "sent_at": _source_iso(int(row["sent_at"])),
+        "sent_at": _source_iso(_row_int(row, "sent_at")),
         "sender_id": row["sender_id"],
         "sender_name": row["sender_first_name"],
         "topic_id": row["forum_topic_id"],
         "topic_title": row["topic_title"],
         "reply_to_msg_id": row["reply_to_msg_id"],
-        "edit_date": _source_iso(int(edit_date)) if edit_date is not None else None,
-        "deleted_at": _source_iso(int(row["deleted_at"])) if row["deleted_at"] is not None else None,
+        "edit_date": _source_iso(_row_optional_int(row, "edit_date")) if edit_date is not None else None,
+        "deleted_at": _source_iso(_row_optional_int(row, "deleted_at")) if row["deleted_at"] is not None else None,
         "is_deleted": bool(row["is_deleted"]),
         "unit_updated_at": unit_updated_at,
     }
@@ -233,9 +256,11 @@ def _source_rows_after_identity_cursor(
     conn: sqlite3.Connection,
     cursor_key: tuple[int, int] | None,
     limit: int,
-) -> tuple[list[sqlite3.Row], bool]:
+) -> tuple[list[SourceRow], bool]:
     dialog_cursor, message_cursor = cursor_key if cursor_key is not None else (-9223372036854775808, -1)
-    rows = conn.execute(
+    rows = cast(
+        list[SourceRow],
+        conn.execute(
         """
         SELECT
           m.dialog_id, m.message_id, m.sent_at, m.text, m.sender_id,
@@ -268,7 +293,8 @@ def _source_rows_after_identity_cursor(
             "message_cursor": message_cursor,
             "limit_plus_one": limit + 1,
         },
-    ).fetchall()
+        ).fetchall(),
+    )
     return rows[:limit], len(rows) > limit
 
 
@@ -278,11 +304,13 @@ def _source_rows_after_update_watermark(
     updated_after_cursor: tuple[int, int] | None,
     limit: int,
     excluded_keys: set[tuple[int, int]],
-) -> list[sqlite3.Row]:
+) -> list[SourceRow]:
     cursor_dialog, cursor_message = (
         updated_after_cursor if updated_after_cursor is not None else (-9223372036854775808, -1)
     )
-    rows = conn.execute(
+    rows = cast(
+        list[SourceRow],
+        conn.execute(
         """
         SELECT
           m.dialog_id, m.message_id, m.sent_at, m.text, m.sender_id,
@@ -322,8 +350,9 @@ def _source_rows_after_update_watermark(
             "cursor_message": cursor_message,
             "limit": limit + len(excluded_keys),
         },
-    ).fetchall()
-    return [row for row in rows if (int(row["dialog_id"]), int(row["message_id"])) not in excluded_keys][:limit]
+        ).fetchall(),
+    )
+    return [row for row in rows if (_row_int(row, "dialog_id"), _row_int(row, "message_id")) not in excluded_keys][:limit]
 
 
 def _describe_source(req: dict) -> dict:
@@ -348,7 +377,7 @@ def _export_source_changes(conn: sqlite3.Connection, req: dict) -> dict:
     identity_rows, has_more_identity = _source_rows_after_identity_cursor(conn, request.cursor_key, request.limit)
     identity_rows = identity_rows[: request.limit]
     remaining = max(0, request.limit - len(identity_rows))
-    identity_keys = {(int(row["dialog_id"]), int(row["message_id"])) for row in identity_rows}
+    identity_keys = {(_row_int(row, "dialog_id"), _row_int(row, "message_id")) for row in identity_rows}
 
     update_rows = (
         _source_rows_after_update_watermark(
@@ -394,7 +423,9 @@ def _read_source_unit_window(conn: sqlite3.Connection, req: dict) -> dict:
     except TypeError, ValueError:
         after = 0
 
-    target = conn.execute(
+    target = cast(
+        object | None,
+        conn.execute(
         """
         SELECT 1
         FROM messages m
@@ -403,11 +434,14 @@ def _read_source_unit_window(conn: sqlite3.Connection, req: dict) -> dict:
           AND sd.status IN ('synced', 'syncing', 'access_lost')
         """,
         (dialog_id, message_id),
-    ).fetchone()
+        ).fetchone(),
+    )
     if target is None:
         return {"ok": False, "error": "not_found"}
 
-    rows = conn.execute(
+    rows = cast(
+        list[SourceRow],
+        conn.execute(
         """
         WITH selected AS (
           SELECT dialog_id, message_id FROM (
@@ -458,7 +492,8 @@ def _read_source_unit_window(conn: sqlite3.Connection, req: dict) -> dict:
             "before": before,
             "after": after,
         },
-    ).fetchall()
+        ).fetchall(),
+    )
 
     return {
         "ok": True,
