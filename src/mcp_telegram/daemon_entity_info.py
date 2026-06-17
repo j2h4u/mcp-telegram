@@ -7,7 +7,7 @@ helpers for user/bot/channel/supergroup/group entity details.
 import json
 import logging
 import sqlite3
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol, cast, runtime_checkable
 
@@ -40,9 +40,9 @@ _ADMIN_RIGHT_FIELDS = (
 
 
 class _EntityInfoClient(Protocol):
-    async def get_entity(self, entity_id: int) -> object: ...
+    def get_entity(self, entity_id: int) -> Awaitable[object]: ...
 
-    def __call__(self, request: object) -> object: ...
+    def __call__(self, request: object) -> Awaitable[object]: ...
 
     def iter_participants(self, peer: object, limit: int = 0) -> AsyncIterator[object]: ...
 
@@ -78,6 +78,11 @@ class _FullChatResult(Protocol):
     full_chat: object
 
 
+class _MessagesSearchResult(Protocol):
+    count: int
+    messages: Sequence[object]
+
+
 @runtime_checkable
 class _SupportsIsoformat(Protocol):
     def isoformat(self) -> str: ...
@@ -85,7 +90,7 @@ class _SupportsIsoformat(Protocol):
 
 def _attr(obj: object, name: str, default: object | None = None) -> object | None:
     try:
-        return object.__getattribute__(obj, name)
+        return cast(object | None, object.__getattribute__(obj, name))
     except AttributeError:
         return default
 
@@ -108,7 +113,7 @@ def _isoformat_or_none(value: object | None) -> str | None:
     if value is None:
         return None
     if isinstance(value, _SupportsIsoformat):
-        return value.isoformat()
+        return cast(_SupportsIsoformat, value).isoformat()
     return None
 
 
@@ -119,6 +124,24 @@ def _text_or_none(value: object | None) -> str | None:
         return value
     text = _attr(value, "text", None)
     return text if isinstance(text, str) else None
+
+
+def _row_sequence(row: object) -> Sequence[object]:
+    return cast(Sequence[object], row)
+
+
+def _row_mapping(row: object) -> Mapping[str, object]:
+    return cast(Mapping[str, object], row)
+
+
+def _row_int_or_none(row: Mapping[str, object], key: str) -> int | None:
+    value = row.get(key)
+    return value if isinstance(value, int) else None
+
+
+def _row_str_or_none(row: Mapping[str, object], key: str) -> str | None:
+    value = row.get(key)
+    return value if isinstance(value, str) else None
 
 
 @dataclass(frozen=True)
@@ -188,10 +211,13 @@ class DaemonEntityInfoService:
 
     def _load_cached_detail(self, entity_id: int, now: int) -> dict[str, object] | None:
         try:
-            row = self._deps.conn.execute(
-                "SELECT detail_json, fetched_at FROM entity_details WHERE entity_id = ?",
-                (entity_id,),
-            ).fetchone()
+            row = cast(
+                tuple[str, int] | None,
+                self._deps.conn.execute(
+                    "SELECT detail_json, fetched_at FROM entity_details WHERE entity_id = ?",
+                    (entity_id,),
+                ).fetchone(),
+            )
         except sqlite3.OperationalError as exc:
             self._deps.logger.warning(
                 "entity_info db_read_failed entity_id=%r error=%s%s",
@@ -205,7 +231,7 @@ class DaemonEntityInfoService:
             detail_json, fetched_at = row
             if now - fetched_at < _ENTITY_DETAIL_TTL_SECONDS:
                 try:
-                    detail = json.loads(detail_json)
+                    detail = cast(dict[str, object], json.loads(detail_json))
                 except json.JSONDecodeError:
                     self._deps.logger.warning(
                         "entity_info detail_json_corrupt entity_id=%r%s — treating as cache miss",
@@ -290,7 +316,7 @@ class DaemonEntityInfoService:
         }
 
     @staticmethod
-    def _strip_envelope_schema(detail: dict[str, object]) -> dict[str, object]:
+    def _strip_envelope_schema(detail: Mapping[str, object]) -> dict[str, object]:
         return {k: v for k, v in detail.items() if k != "schema"}
 
     @staticmethod
@@ -315,17 +341,21 @@ class DaemonEntityInfoService:
         return None
 
     async def _fetch_user_detail(self, user: object) -> dict[str, object]:
-        user_id = int(user.id)
+        user_id = _opt_int_attr(user, "id")
+        if user_id is None:
+            raise ValueError("user id missing")
 
         common_chats = await self._collect_common_chats(user_id)
         profile = await self._collect_user_profile(user_id)
-        profile["folder_name"] = await self._resolve_folder_name(profile["folder_id"])
+        profile["folder_name"] = await self._resolve_folder_name(cast(int | None, profile["folder_id"]))
         extra_usernames = self._collect_extra_usernames(user)
         emoji_status_id = self._collect_emoji_status_id(user)
         avatar_history, avatar_count = await self._collect_user_avatar_history(user)
-        my_membership = self._build_user_membership(user, profile["blocked"])
+        my_membership = self._build_user_membership(user, cast(bool, profile["blocked"]))
 
-        name = " ".join(part for part in (_attr(user, "first_name", None), _attr(user, "last_name", None)) if part)
+        first_name = _opt_str_attr(user, "first_name")
+        last_name = _opt_str_attr(user, "last_name")
+        name = " ".join(part for part in (first_name, last_name) if part)
         return {
             "id": user_id,
             "type": "bot" if bool(_attr(user, "bot", False)) else "user",
@@ -374,9 +404,7 @@ class DaemonEntityInfoService:
         try:
             common_result = cast(
                 _CommonChatsResult,
-                await self._deps.client(
-                self._deps.get_common_chats_request(user_id=user_id, max_id=0, limit=100),
-                ),
+                await self._deps.client(self._deps.get_common_chats_request(user_id=user_id, max_id=0, limit=100)),
             )
             chats.extend(
                 {
@@ -421,7 +449,10 @@ class DaemonEntityInfoService:
             "full_user_ok": False,
         }
         try:
-            full_result = cast(_FullUserResult, await self._deps.client(self._deps.get_full_user_request(id=user_id)))
+            full_result = cast(
+                _FullUserResult,
+                await self._deps.client(self._deps.get_full_user_request(id=user_id)),
+            )
             user_full = full_result.full_user
             profile["about"] = _opt_str_attr(user_full, "about")
             profile["personal_channel_id"] = _opt_int_attr(user_full, "personal_channel_id")
@@ -504,7 +535,10 @@ class DaemonEntityInfoService:
         if folder_id is None:
             return None
         try:
-            filters = cast(_DialogFiltersResult, await self._deps.client(self._deps.get_dialog_filters_request()))
+            filters = cast(
+                _DialogFiltersResult,
+                await self._deps.client(self._deps.get_dialog_filters_request()),
+            )
             for item in filters.filters:
                 if _opt_int_attr(item, "id") != folder_id:
                     continue
@@ -547,13 +581,11 @@ class DaemonEntityInfoService:
                 photo_date = _attr(photo, "date", None)
                 if photo_id is None or photo_date is None:
                     continue
-                avatar_history.append(
-                    {"photo_id": int(photo_id), "date": _isoformat_or_none(photo_date)},
-                )
+                avatar_history.append({"photo_id": int(photo_id), "date": _isoformat_or_none(photo_date)})
         except Exception as exc:
             self._deps.logger.warning(
                 "entity_info user photos_failed user_id=%r error=%s%s",
-                int(self._deps.get_peer_id(user)),
+                int(cast(int, self._deps.get_peer_id(user))),
                 exc,
                 self._deps.rid(),
                 exc_info=True,
@@ -594,22 +626,22 @@ class DaemonEntityInfoService:
         search_failed = False
         try:
             search_result = cast(
-                _ParticipantsResult,
+                _MessagesSearchResult,
                 await self._deps.client(
-                self._deps.get_messages_search_request(
-                    peer=peer,
-                    q="",
-                    filter=self._deps.input_messages_filter_chat_photos(),
-                    min_date=None,
-                    max_date=None,
-                    offset_id=0,
-                    add_offset=0,
-                    limit=100,
-                    max_id=0,
-                    min_id=0,
-                    hash=0,
-                    from_id=None,
-                )
+                    self._deps.get_messages_search_request(
+                        peer=peer,
+                        q="",
+                        filter=self._deps.input_messages_filter_chat_photos(),
+                        min_date=None,
+                        max_date=None,
+                        offset_id=0,
+                        add_offset=0,
+                        limit=100,
+                        max_id=0,
+                        min_id=0,
+                        hash=0,
+                        from_id=None,
+                    )
                 ),
             )
             avatar_count = search_result.count
@@ -634,14 +666,14 @@ class DaemonEntityInfoService:
             )
 
         chat_photo = _attr(full_chat, "chat_photo", None) if full_chat is not None else None
-        current_photo_id = _attr(chat_photo, "id", None) if chat_photo is not None else None
+        current_photo_id = _opt_int_attr(chat_photo, "id") if chat_photo is not None else None
         if current_photo_id is not None and not any(p["photo_id"] == int(current_photo_id) for p in avatar_history):
             chat_photo_date = _attr(chat_photo, "date", None)
             avatar_history.insert(
                 0,
                 {
                     "photo_id": int(current_photo_id),
-                    "date": chat_photo_date.isoformat() if chat_photo_date is not None else None,
+                    "date": _isoformat_or_none(chat_photo_date),
                 },
             )
         if search_failed and current_photo_id is not None:
@@ -651,7 +683,7 @@ class DaemonEntityInfoService:
             avatar_history = [
                 {
                     "photo_id": int(current_photo_id),
-                    "date": chat_photo_date.isoformat() if chat_photo_date is not None else None,
+                    "date": _isoformat_or_none(chat_photo_date),
                 }
             ]
             avatar_count = max(avatar_count, 1)
@@ -663,8 +695,8 @@ class DaemonEntityInfoService:
         memberships = self._build_chat_membership(channel)
         contacts_subscribed, contacts_subscribed_partial, contacts_reason = await self._collect_channel_contacts(
             channel,
-            is_admin=memberships["is_admin"],
-            subscribers_count=full_context["subscribers_count"],
+            is_admin=cast(bool, memberships["is_admin"]),
+            subscribers_count=cast(int | None, full_context["subscribers_count"]),
         )
         avatar_history, avatar_count = await self._search_chat_photo_history(channel, full_context["full_chat"])
 
@@ -701,7 +733,10 @@ class DaemonEntityInfoService:
             "full_channel_ok": False,
         }
         try:
-            full_result = cast(_FullChannelResult, await self._deps.client(self._deps.get_full_channel_request(channel=channel)))
+            full_result = cast(
+                _FullChannelResult,
+                await self._deps.client(self._deps.get_full_channel_request(channel=channel)),
+            )
             full_chat = full_result.full_chat
             context["full_chat"] = full_chat
             context["subscribers_count"] = _opt_int_attr(full_chat, "participants_count")
@@ -792,7 +827,7 @@ class DaemonEntityInfoService:
             async for p in self._deps.client.iter_participants(channel, limit=1000):
                 pid = _attr(p, "id", None)
                 if pid is not None:
-                    participant_ids.add(int(pid))
+                    participant_ids.add(int(cast(int | str, pid)))
             intersect_ids = participant_ids & self._deps.dm_peer_ids()
             return self._enrich_contact_ids_with_names(intersect_ids), False, None
         except ChatAdminRequiredError:
@@ -800,7 +835,7 @@ class DaemonEntityInfoService:
         except (RPCError, TypeError, AttributeError, ValueError) as exc:
             self._deps.logger.warning(
                 small_error_log,
-                int(self._deps.get_peer_id(channel)),
+                int(cast(int, self._deps.get_peer_id(channel))),
                 exc,
                 self._deps.rid(),
             )
@@ -823,7 +858,11 @@ class DaemonEntityInfoService:
                     hash=0,
                 )
             )
-            contact_ids = {int(_attr(u, "id", 0)) for u in cast(Sequence[object], _attr(gp_result, "users", []) or []) if _attr(u, "id", None) is not None}
+            contact_ids = {
+                int(cast(int, _opt_int_attr(u, "id")))
+                for u in cast(Sequence[object], _attr(gp_result, "users", []) or [])
+                if _opt_int_attr(u, "id") is not None
+            }
             intersect_ids = contact_ids & self._deps.dm_peer_ids()
             return self._enrich_contact_ids_with_names(intersect_ids), True, "too_large"
         except ChatAdminRequiredError:
@@ -844,9 +883,9 @@ class DaemonEntityInfoService:
         rows = cast(
             Sequence[tuple[object, object, object]],
             self._deps.conn.execute(
-            f"SELECT id, name, username FROM entities WHERE id IN ({placeholders})",
-            tuple(ids),
-        ).fetchall(),
+                f"SELECT id, name, username FROM entities WHERE id IN ({placeholders})",
+                tuple(ids),
+            ).fetchall(),
         )
         seen = {row[0] for row in rows}
         out = [{"id": row[0], "name": row[1], "username": row[2]} for row in rows]
@@ -860,8 +899,8 @@ class DaemonEntityInfoService:
         hidden_members = bool(_attr(channel, "hidden_members", False)) and not memberships["is_admin"]
         contacts_subscribed, contacts_subscribed_partial, contacts_reason = await self._collect_supergroup_contacts(
             channel,
-            is_admin=memberships["is_admin"],
-            members_count=full_context["subscribers_count"],
+            is_admin=cast(bool, memberships["is_admin"]),
+            members_count=cast(int | None, full_context["subscribers_count"]),
             hidden_members=hidden_members,
         )
         avatar_history, avatar_count = await self._search_chat_photo_history(channel, full_context["full_chat"])
@@ -909,7 +948,7 @@ class DaemonEntityInfoService:
             async for participant in self._deps.client.iter_participants(channel, limit=1000):
                 pid = _attr(participant, "id", None)
                 if pid is not None:
-                    participant_ids.add(int(pid))
+                    participant_ids.add(int(cast(int | str, pid)))
             intersect_ids = participant_ids & self._deps.dm_peer_ids()
             return self._enrich_contact_ids_with_names(intersect_ids), False, None
         except ChatAdminRequiredError:
@@ -917,7 +956,7 @@ class DaemonEntityInfoService:
         except (RPCError, TypeError, AttributeError, ValueError) as exc:
             self._deps.logger.warning(
                 "entity_info supergroup iter_participants_failed channel_id=%r error=%s%s",
-                int(self._deps.get_peer_id(channel)),
+                int(cast(int, self._deps.get_peer_id(channel))),
                 exc,
                 self._deps.rid(),
             )
@@ -932,7 +971,7 @@ class DaemonEntityInfoService:
         contacts_subscribed: list[dict[str, object]] | None = []
         contacts_reason: str | None = None
         try:
-            participant_ids = self._extract_group_participants(group_meta["participants"])
+            participant_ids = self._extract_group_participants(cast(Sequence[object], group_meta["participants"]))
             intersect_ids = participant_ids & self._deps.dm_peer_ids()
             contacts_subscribed = self._enrich_contact_ids_with_names(intersect_ids)
         except (TypeError, AttributeError, ValueError, sqlite3.Error) as exc:
@@ -990,7 +1029,10 @@ class DaemonEntityInfoService:
             "members_count": None,
         }
         try:
-            full_result = cast(_FullChatResult, await self._deps.client(self._deps.get_full_chat_request(chat_id=int(_attr(chat, "id", 0)))))
+            chat_id = _opt_int_attr(chat, "id")
+            if chat_id is None:
+                raise ValueError("chat id missing")
+            full_result = cast(_FullChatResult, await self._deps.client(self._deps.get_full_chat_request(chat_id=chat_id)))
             full_chat = full_result.full_chat
             group_meta["full_chat"] = full_chat
             group_meta["about"] = _attr(full_chat, "about", None) or None

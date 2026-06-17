@@ -2,9 +2,70 @@
 
 import sqlite3
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from typing import Any
+from types import TracebackType
+from typing import Protocol, cast
+
+type _ExcInfoType = (
+    bool
+    | BaseException
+    | tuple[type[BaseException], BaseException, TracebackType | None]
+    | tuple[None, None, None]
+    | None
+)
+
+
+class _LoggerLike(Protocol):
+    def debug(
+        self,
+        msg: str,
+        *args: object,
+        exc_info: _ExcInfoType = None,
+        stack_info: bool = False,
+        stacklevel: int = 1,
+        extra: Mapping[str, object] | None = None,
+    ) -> None: ...
+
+    def info(
+        self,
+        msg: str,
+        *args: object,
+        exc_info: _ExcInfoType = None,
+        stack_info: bool = False,
+        stacklevel: int = 1,
+        extra: Mapping[str, object] | None = None,
+    ) -> None: ...
+
+    def warning(
+        self,
+        msg: str,
+        *args: object,
+        exc_info: _ExcInfoType = None,
+        stack_info: bool = False,
+        stacklevel: int = 1,
+        extra: Mapping[str, object] | None = None,
+    ) -> None: ...
+
+    def error(
+        self,
+        msg: str,
+        *args: object,
+        exc_info: _ExcInfoType = None,
+        stack_info: bool = False,
+        stacklevel: int = 1,
+        extra: Mapping[str, object] | None = None,
+    ) -> None: ...
+
+    def exception(
+        self,
+        msg: str,
+        *args: object,
+        exc_info: _ExcInfoType = None,
+        stack_info: bool = False,
+        stacklevel: int = 1,
+        extra: Mapping[str, object] | None = None,
+    ) -> None: ...
 
 DEFAULT_ACTIVITY_DIALOG_KINDS = ("group", "forum")
 _ALLOWED_ACTIVITY_DIALOG_KINDS = {"all", "user", "bot", "group", "forum", "channel", "unknown"}
@@ -52,7 +113,7 @@ class DaemonActivityStatsDeps:
 
     conn: sqlite3.Connection
     resolve_dialog_id: Callable[[int, str | None], Awaitable[int | dict]]
-    logger: Any
+    logger: _LoggerLike
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,7 +130,14 @@ def _clamp(value: int, low: int, high: int) -> int:
     return max(low, min(value, high))
 
 
-def _query_usage_stats(cursor: sqlite3.Cursor, since: int) -> dict:
+def _coerce_int(value: object, default: int) -> int:
+    try:
+        return int(cast(int | str, value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _query_usage_stats(cursor: sqlite3.Cursor, since: int) -> dict[str, object]:
     tool_dist = dict(
         cursor.execute(
             "SELECT tool_name, COUNT(*) FROM telemetry_events "
@@ -87,9 +155,9 @@ def _query_usage_stats(cursor: sqlite3.Cursor, since: int) -> dict:
         ).fetchall()
     )
 
-    def _scalar(sql: str, params: tuple = (since,), default: int = 0) -> int:
-        row = cursor.execute(sql, params).fetchone()
-        return row[0] if row and row[0] is not None else default
+    def _scalar(sql: str, params: tuple[object, ...] = (since,), default: int = 0) -> int:
+        row = cast(tuple[object] | None, cursor.execute(sql, params).fetchone())
+        return default if row is None or row[0] is None else int(cast(int | str, row[0]))
 
     max_depth = _scalar(
         "SELECT MAX(page_depth) FROM telemetry_events WHERE timestamp >= ?",
@@ -101,10 +169,13 @@ def _query_usage_stats(cursor: sqlite3.Cursor, since: int) -> dict:
         "SELECT COUNT(*) FROM telemetry_events WHERE timestamp >= ?",
     )
 
-    latencies = cursor.execute(
-        "SELECT duration_ms FROM telemetry_events WHERE timestamp >= ? ORDER BY duration_ms",
-        (since,),
-    ).fetchall()
+    latencies = cast(
+        list[tuple[int]],
+        cursor.execute(
+            "SELECT duration_ms FROM telemetry_events WHERE timestamp >= ? ORDER BY duration_ms",
+            (since,),
+        ).fetchall(),
+    )
 
     latency_median_ms = 0
     latency_p95_ms = 0
@@ -130,7 +201,7 @@ def _coerce_activity_dialog_kind_values(value: object) -> tuple[list[object] | N
         return list(DEFAULT_ACTIVITY_DIALOG_KINDS), None
     if isinstance(value, str):
         raw_values: list[object] = [value]
-    elif isinstance(value, list | tuple | set):
+    elif isinstance(value, (list, tuple, set)):
         raw_values = list(value)
     else:
         return None, "dialog_kinds must be a list of strings"
@@ -168,19 +239,11 @@ def _normalize_activity_dialog_kinds(value: object) -> tuple[list[str] | None, s
     return _normalize_activity_dialog_kind_values(raw_values)
 
 
-def _parse_recent_activity_request(req: dict) -> tuple[_RecentActivityRequest | None, dict | None]:
-    since_hours_raw = req.get("since_hours", 168)
-    try:
-        since_hours = int(since_hours_raw)
-    except TypeError, ValueError:
-        since_hours = 168
+def _parse_recent_activity_request(req: Mapping[str, object]) -> tuple[_RecentActivityRequest | None, dict | None]:
+    since_hours = _coerce_int(req.get("since_hours", 168), 168)
     since_hours = _clamp(since_hours, 1, 8760)
 
-    limit_raw = req.get("limit", 500)
-    try:
-        limit = int(limit_raw)
-    except TypeError, ValueError:
-        limit = 500
+    limit = _coerce_int(req.get("limit", 500), 500)
     limit = _clamp(limit, 1, 2000)
 
     dialog_kinds, dialog_kind_error = _normalize_activity_dialog_kinds(
@@ -281,8 +344,8 @@ class DaemonActivityStatsService:
     def __init__(self, deps: DaemonActivityStatsDeps) -> None:
         self._deps = deps
 
-    async def get_usage_stats(self, req: dict) -> dict:
-        since: int = req.get("since", int(time.time()) - 30 * 86400)
+    async def get_usage_stats(self, req: Mapping[str, object]) -> dict[str, object]:
+        since = _coerce_int(req.get("since", int(time.time()) - 30 * 86400), int(time.time()) - 30 * 86400)
         try:
             stats = _query_usage_stats(self._deps.conn.cursor(), since)
             return {"ok": True, "data": stats}
@@ -290,10 +353,11 @@ class DaemonActivityStatsService:
             self._deps.logger.error("get_usage_stats failed: %s", exc, exc_info=True)
             return {"ok": False, "error": "internal", "message": "internal error"}
 
-    async def get_dialog_stats(self, req: dict) -> dict:
-        dialog_id: int = req.get("dialog_id", 0) or 0
-        dialog: str | None = req.get("dialog")
-        limit: int = _clamp(req.get("limit", 5), 1, 20)
+    async def get_dialog_stats(self, req: Mapping[str, object]) -> dict[str, object]:
+        dialog_id = _coerce_int(req.get("dialog_id", 0), 0)
+        dialog_obj = req.get("dialog")
+        dialog = dialog_obj if isinstance(dialog_obj, str) else None
+        limit = _clamp(_coerce_int(req.get("limit", 5), 5), 1, 20)
 
         resolved = await self._deps.resolve_dialog_id(dialog_id, dialog)
         if isinstance(resolved, dict):
@@ -306,7 +370,7 @@ class DaemonActivityStatsService:
                 "message": "Either dialog_id or dialog name is required for get_dialog_stats",
             }
 
-        row = self._deps.conn.execute(_SELECT_SYNC_STATUS_SQL, (dialog_id,)).fetchone()
+        row = cast(tuple[object] | None, self._deps.conn.execute(_SELECT_SYNC_STATUS_SQL, (dialog_id,)).fetchone())
         if row is None or row[0] not in ("synced", "syncing", "access_lost"):
             return {
                 "ok": False,
@@ -315,20 +379,20 @@ class DaemonActivityStatsService:
             }
 
         reactions = [
-            {"emoji": r[0], "count": int(r[1])}
-            for r in self._deps.conn.execute(_GET_DIALOG_TOP_REACTIONS_SQL, (dialog_id, limit)).fetchall()
+            {"emoji": r[0], "count": int(cast(int | str, r[1]))}
+            for r in cast(list[tuple[object, object]], self._deps.conn.execute(_GET_DIALOG_TOP_REACTIONS_SQL, (dialog_id, limit)).fetchall())
         ]
         mentions = [
-            {"value": r[0], "count": int(r[1])}
-            for r in self._deps.conn.execute(_GET_DIALOG_TOP_MENTIONS_SQL, (dialog_id, limit)).fetchall()
+            {"value": r[0], "count": int(cast(int | str, r[1]))}
+            for r in cast(list[tuple[object, object]], self._deps.conn.execute(_GET_DIALOG_TOP_MENTIONS_SQL, (dialog_id, limit)).fetchall())
         ]
         hashtags = [
-            {"value": r[0], "count": int(r[1])}
-            for r in self._deps.conn.execute(_GET_DIALOG_TOP_HASHTAGS_SQL, (dialog_id, limit)).fetchall()
+            {"value": r[0], "count": int(cast(int | str, r[1]))}
+            for r in cast(list[tuple[object, object]], self._deps.conn.execute(_GET_DIALOG_TOP_HASHTAGS_SQL, (dialog_id, limit)).fetchall())
         ]
         forwards = [
-            {"peer_id": r[0], "name": r[1], "count": int(r[2])}
-            for r in self._deps.conn.execute(_GET_DIALOG_TOP_FORWARDS_SQL, (dialog_id, limit)).fetchall()
+            {"peer_id": r[0], "name": r[1], "count": int(cast(int | str, r[2]))}
+            for r in cast(list[tuple[object, object, object]], self._deps.conn.execute(_GET_DIALOG_TOP_FORWARDS_SQL, (dialog_id, limit)).fetchall())
         ]
         return {
             "ok": True,
@@ -341,21 +405,24 @@ class DaemonActivityStatsService:
             },
         }
 
-    async def get_my_recent_activity(self, req: dict) -> dict:
+    async def get_my_recent_activity(self, req: Mapping[str, object]) -> dict[str, object]:
         parsed, error = _parse_recent_activity_request(req)
         if error is not None or parsed is None:
             return error or {"ok": False, "error": "internal", "message": "internal error"}
 
-        rows = self._deps.conn.execute(
-            _build_recent_activity_rows_query(parsed.dialog_kind_filter_sql),
-            parsed.query_params,
-        ).fetchall()
+        rows = cast(
+            list[tuple[object, object, object, object, object, object, object, object, object]],
+            self._deps.conn.execute(
+                _build_recent_activity_rows_query(parsed.dialog_kind_filter_sql),
+                parsed.query_params,
+            ).fetchall(),
+        )
 
-        state_rows = dict(self._deps.conn.execute("SELECT key, value FROM activity_sync_state").fetchall())
+        state_rows = dict(cast(list[tuple[str, str]], self._deps.conn.execute("SELECT key, value FROM activity_sync_state").fetchall()))
         backfill_complete = state_rows.get("backfill_complete") == "1"
         backfill_started = state_rows.get("backfill_started_at") is not None
         last_sync_at_str = state_rows.get("last_sync_at")
-        last_sync_at: int | None = int(last_sync_at_str) if last_sync_at_str else None
+        last_sync_at: int | None = _coerce_int(last_sync_at_str, 0) if last_sync_at_str else None
 
         if backfill_complete:
             scan_status = "complete"
@@ -368,28 +435,31 @@ class DaemonActivityStatsService:
         if rows:
             rx_params: list[int] = []
             for row in rows:
-                rx_params.extend([row[0], row[1]])
+                rx_params.extend([int(cast(int | str, row[0])), int(cast(int | str, row[1]))])
             rx_placeholders = ",".join("(?,?)" for _ in rows)
-            for rx in self._deps.conn.execute(
+            for rx in cast(
+                list[tuple[object, object, object, object]],
+                self._deps.conn.execute(
                 f"SELECT dialog_id, message_id, emoji, count FROM message_reactions "
                 f"WHERE (dialog_id, message_id) IN (VALUES {rx_placeholders}) "
                 f"ORDER BY count DESC",
                 rx_params,
-            ).fetchall():
-                reactions_by_msg.setdefault((rx[0], rx[1]), []).append({"emoji": rx[2], "count": rx[3]})
+                ).fetchall(),
+            ):
+                reactions_by_msg.setdefault((int(cast(int | str, rx[0])), int(cast(int | str, rx[1]))), []).append({"emoji": rx[2], "count": int(cast(int | str, rx[3]))})
 
         comments = [
             {
-                "dialog_id": row[0],
-                "message_id": row[1],
-                "sent_at": row[2],
+                "dialog_id": int(cast(int | str, row[0])),
+                "message_id": int(cast(int | str, row[1])),
+                "sent_at": int(cast(int | str, row[2])),
                 "text": row[3],
                 "dialog_name": row[4] or str(row[0]),
                 "dialog_type": row[5],
                 "dialog_category": row[8],
-                "reply_count": row[6],
+                "reply_count": int(cast(int | str, row[6])),
                 "sync_status": row[7],
-                "reactions": reactions_by_msg.get((row[0], row[1]), []),
+                "reactions": reactions_by_msg.get((int(cast(int | str, row[0])), int(cast(int | str, row[1]))), []),
             }
             for row in rows
         ]
