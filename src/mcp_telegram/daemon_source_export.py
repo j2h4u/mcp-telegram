@@ -1,9 +1,8 @@
 """Source-export helper functions for the daemon API."""
 
-from __future__ import annotations
-
 import hashlib
 import sqlite3
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 _SOURCE_CURSOR_PREFIX = "telegram:v1:dialog:"
@@ -70,6 +69,83 @@ def _source_iso(epoch_seconds: int | None) -> str | None:
     if epoch_seconds is None:
         return None
     return datetime.fromtimestamp(int(epoch_seconds), tz=UTC).strftime("%Y-%m-%dT%H:%M:%S.000000Z")
+
+
+@dataclass(frozen=True)
+class _SourceExportRequest:
+    cursor_key: tuple[int, int] | None
+    updated_after_cursor: tuple[int, int] | None
+    updated_after_epoch: int | None
+    limit: int
+    cursor_value: str | None
+    updated_after_value: str | None
+    updated_after_cursor_value: str | None
+
+    @classmethod
+    def parse(cls, req: dict) -> _SourceExportRequest:
+        try:
+            cursor_key = _parse_source_cursor(req.get("cursor"))
+            updated_after_cursor = _parse_source_cursor(req.get("updated_after_cursor"))
+            updated_after_epoch = _parse_source_watermark(req.get("updated_after"))
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+        try:
+            limit = _clamp(int(req.get("limit", 100)), 1, 500)
+        except TypeError, ValueError:
+            limit = 100
+
+        return cls(
+            cursor_key=cursor_key,
+            updated_after_cursor=updated_after_cursor,
+            updated_after_epoch=updated_after_epoch,
+            limit=limit,
+            cursor_value=req.get("cursor") if isinstance(req.get("cursor"), str) else None,
+            updated_after_value=req.get("updated_after") if isinstance(req.get("updated_after"), str) else None,
+            updated_after_cursor_value=req.get("updated_after_cursor")
+            if isinstance(req.get("updated_after_cursor"), str)
+            else None,
+        )
+
+
+def _collect_unit_changes(
+    identity_rows: list[sqlite3.Row],
+    update_rows: list[sqlite3.Row],
+) -> list[dict]:
+    return [_source_row_to_change(row) for row in [*identity_rows, *update_rows]]
+
+
+def _resolve_checkpoint_cursor(
+    request: _SourceExportRequest,
+    identity_rows: list[sqlite3.Row],
+) -> str | None:
+    if identity_rows:
+        last_identity = identity_rows[-1]
+        return _source_cursor(int(last_identity["dialog_id"]), int(last_identity["message_id"]))
+    return request.cursor_value
+
+
+def _resolve_export_watermark(
+    request: _SourceExportRequest,
+    update_rows: list[sqlite3.Row],
+) -> tuple[str | None, str | None]:
+    if not update_rows:
+        return request.updated_after_value, request.updated_after_cursor_value
+
+    max_update_epoch = max(int(row["unit_updated_epoch"]) for row in update_rows)
+    updated_after = _source_iso(max_update_epoch)
+    latest = [row for row in update_rows if int(row["unit_updated_epoch"]) == max_update_epoch][-1]
+    updated_after_cursor = _source_cursor(int(latest["dialog_id"]), int(latest["message_id"]))
+    return updated_after, updated_after_cursor
+
+
+def _resolve_next_cursor(
+    identity_rows: list[sqlite3.Row],
+    has_more_identity: bool,
+) -> str | None:
+    if not (identity_rows and has_more_identity):
+        return None
+    last_identity = identity_rows[-1]
+    return _source_cursor(int(last_identity["dialog_id"]), int(last_identity["message_id"]))
 
 
 def _source_fingerprint(*parts: object) -> str:
@@ -265,66 +341,31 @@ def _describe_source(req: dict) -> dict:
 
 def _export_source_changes(conn: sqlite3.Connection, req: dict) -> dict:
     try:
-        cursor_key = _parse_source_cursor(req.get("cursor"))
-        updated_after_cursor = _parse_source_cursor(req.get("updated_after_cursor"))
-        updated_after_epoch = _parse_source_watermark(req.get("updated_after"))
+        request = _SourceExportRequest.parse(req)
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
 
-    try:
-        limit = _clamp(int(req.get("limit", 100)), 1, 500)
-    except TypeError, ValueError:
-        limit = 100
-
-    identity_rows, has_more_identity = _source_rows_after_identity_cursor(conn, cursor_key, limit)
-    identity_rows = identity_rows[:limit]
-    remaining = max(0, limit - len(identity_rows))
+    identity_rows, has_more_identity = _source_rows_after_identity_cursor(conn, request.cursor_key, request.limit)
+    identity_rows = identity_rows[: request.limit]
+    remaining = max(0, request.limit - len(identity_rows))
     identity_keys = {(int(row["dialog_id"]), int(row["message_id"])) for row in identity_rows}
 
-    update_rows: list[sqlite3.Row] = []
-    if updated_after_epoch is not None and remaining > 0:
-        update_rows = _source_rows_after_update_watermark(
+    update_rows = (
+        _source_rows_after_update_watermark(
             conn,
-            updated_after_epoch,
-            updated_after_cursor,
+            request.updated_after_epoch,
+            request.updated_after_cursor,
             remaining,
             identity_keys,
         )
+        if request.updated_after_epoch is not None and remaining > 0
+        else []
+    )
 
-    changes = [_source_row_to_change(row) for row in [*identity_rows, *update_rows]]
-
-    checkpoint_cursor: str | None
-    if identity_rows:
-        checkpoint_cursor = _source_cursor(
-            int(identity_rows[-1]["dialog_id"]),
-            int(identity_rows[-1]["message_id"]),
-        )
-    else:
-        cursor_value = req.get("cursor")
-        checkpoint_cursor = cursor_value if isinstance(cursor_value, str) else None
-
-    updated_after: str | None
-    updated_after_cursor_out: str | None
-    if update_rows:
-        max_update_epoch = max(int(row["unit_updated_epoch"]) for row in update_rows)
-        updated_after = _source_iso(max_update_epoch)
-        last_at_watermark = [row for row in update_rows if int(row["unit_updated_epoch"]) == max_update_epoch][-1]
-        updated_after_cursor_out = _source_cursor(
-            int(last_at_watermark["dialog_id"]),
-            int(last_at_watermark["message_id"]),
-        )
-    else:
-        updated_after_value = req.get("updated_after")
-        updated_after = updated_after_value if isinstance(updated_after_value, str) else None
-        updated_after_cursor_value = req.get("updated_after_cursor")
-        updated_after_cursor_out = updated_after_cursor_value if isinstance(updated_after_cursor_value, str) else None
-
-    next_cursor: str | None = None
-    if identity_rows and has_more_identity:
-        next_cursor = _source_cursor(
-            int(identity_rows[-1]["dialog_id"]),
-            int(identity_rows[-1]["message_id"]),
-        )
+    changes = _collect_unit_changes(identity_rows, update_rows)
+    checkpoint_cursor = _resolve_checkpoint_cursor(request, identity_rows)
+    updated_after, updated_after_cursor_out = _resolve_export_watermark(request, update_rows)
+    next_cursor = _resolve_next_cursor(identity_rows, has_more_identity)
 
     return {
         "ok": True,
