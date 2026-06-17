@@ -2154,11 +2154,9 @@ def _messages_row_equal(existing: dict | None, candidate: ExtractedMessage) -> b
     candidate_message = dataclasses.asdict(candidate.message)
     candidate_message["is_deleted"] = 0
     for field in _TRACE_MESSAGE_COMPARE_FIELDS:
-        if field == "reply_count":
-            if existing_message.get(field, 0) != candidate.reply_count:
-                return False
-            continue
-        if existing_message.get(field) != candidate_message.get(field):
+        existing_value = existing_message.get(field, 0 if field == "reply_count" else None)
+        candidate_value = candidate.reply_count if field == "reply_count" else candidate_message.get(field)
+        if existing_value != candidate_value:
             return False
 
     candidate_reactions = sorted((item.emoji, item.count) for item in candidate.reactions)
@@ -2169,15 +2167,16 @@ def _messages_row_equal(existing: dict | None, candidate: ExtractedMessage) -> b
     if existing.get("entities", []) != candidate_entities:
         return False
 
-    if candidate.forward is None:
-        candidate_forward = None
-    else:
-        candidate_forward = (
+    candidate_forward = (
+        None
+        if candidate.forward is None
+        else (
             candidate.forward.fwd_from_peer_id,
             candidate.forward.fwd_from_name,
             candidate.forward.fwd_date,
             candidate.forward.fwd_channel_post,
         )
+    )
     return existing.get("forward") == candidate_forward
 
 
