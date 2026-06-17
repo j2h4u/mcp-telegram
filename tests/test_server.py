@@ -5,16 +5,44 @@ import re
 from contextlib import asynccontextmanager
 from functools import partial
 from pathlib import Path
+from typing import Protocol, cast
 from unittest.mock import AsyncMock
 
 import pytest
-from mcp.types import TextContent, Tool
+from mcp.types import CallToolResult, TextContent, Tool
 
 from mcp_telegram import server
 from mcp_telegram.tools._base import ToolRegistryEntry, ToolResult, tool_description
 from mcp_telegram.tools.discovery import ListDialogs
 
 INVENTORY_PATH = Path(__file__).parent / "fixtures" / "52-TOOL-OUTPUT-INVENTORY.md"
+
+
+def _tool_input_schema(tool: Tool) -> dict[str, object]:
+    return cast(dict[str, object], tool.inputSchema)
+
+
+def _tool_output_schema(tool: Tool) -> dict[str, object]:
+    assert tool.outputSchema is not None
+    return cast(dict[str, object], tool.outputSchema)
+
+
+class _HasContent(Protocol):
+    content: list[object]
+
+
+def _call_tool_text(result: object) -> str:
+    content = cast(_HasContent, result).content
+    assert content
+    first_content = content[0]
+    assert isinstance(first_content, TextContent)
+    return first_content.text
+
+
+def _call_tool_result(result: object) -> CallToolResult:
+    assert hasattr(result, "content")
+    assert hasattr(result, "isError")
+    return cast(CallToolResult, result)
 
 
 def _tool(name: str) -> Tool:
@@ -28,8 +56,8 @@ def _tool(name: str) -> Tool:
 
 def test_list_messages_reflection_exposes_shared_navigation_schema() -> None:
     tool = server.tool_by_name["list_messages"]
-    properties = tool.inputSchema["properties"]
-    required = tool.inputSchema.get("required", [])
+    properties = cast(dict[str, object], _tool_input_schema(tool)["properties"])
+    required = cast(list[str], _tool_input_schema(tool).get("required", []))
 
     assert "navigation" in properties
     assert "exact_dialog_id" in properties
@@ -38,23 +66,26 @@ def test_list_messages_reflection_exposes_shared_navigation_schema() -> None:
     assert "from_beginning" not in properties
     assert "response_order" not in properties
     assert "reply_context_mode" not in properties
-    assert properties["navigation"]["type"] == "string"
-    assert properties["exact_dialog_id"]["type"] == "integer"
-    assert properties["exact_topic_id"]["type"] == "integer"
-    assert '"latest"' in properties["navigation"]["description"]
-    assert '"start"' in properties["navigation"]["description"]
-    assert "already known" in properties["exact_dialog_id"]["description"]
-    assert "Mutually exclusive with dialog" in properties["exact_dialog_id"]["description"]
-    assert "full topic catalog" in properties["exact_topic_id"]["description"]
+    navigation = cast(dict[str, object], properties["navigation"])
+    exact_dialog_id = cast(dict[str, object], properties["exact_dialog_id"])
+    exact_topic_id = cast(dict[str, object], properties["exact_topic_id"])
+    assert navigation["type"] == "string"
+    assert exact_dialog_id["type"] == "integer"
+    assert exact_topic_id["type"] == "integer"
+    assert '"latest"' in cast(str, navigation["description"])
+    assert '"start"' in cast(str, navigation["description"])
+    assert "already known" in cast(str, exact_dialog_id["description"])
+    assert "Mutually exclusive with dialog" in cast(str, exact_dialog_id["description"])
+    assert "full topic catalog" in cast(str, exact_topic_id["description"])
     assert "dialog" not in required
 
 
 @pytest.mark.asyncio
 async def test_call_tool_validation_rejects_conflicting_list_messages_selectors() -> None:
-    result = await server.call_tool("list_messages", {"dialog": "Backend", "exact_dialog_id": 701})
+    result = _call_tool_result(await server.call_tool("list_messages", {"dialog": "Backend", "exact_dialog_id": 701}))
 
     assert result.isError is True
-    message = result.content[0].text
+    message = _call_tool_text(result)
     assert "validation" in message.lower()
     assert "mutually exclusive" in message.lower()
     assert "exact_dialog_id" in message
@@ -62,32 +93,36 @@ async def test_call_tool_validation_rejects_conflicting_list_messages_selectors(
 
 def test_search_messages_reflection_exposes_shared_navigation_schema() -> None:
     tool = server.tool_by_name["search_messages"]
-    properties = tool.inputSchema["properties"]
+    properties = cast(dict[str, object], _tool_input_schema(tool)["properties"])
 
     assert "dialog" in properties
     assert "navigation" in properties
     assert "offset" not in properties
     assert "exact_dialog_id" not in properties
-    assert properties["dialog"]["type"] == "string"
-    assert "exact numeric dialog id" in properties["dialog"]["description"]
-    assert properties["navigation"]["type"] == "string"
-    assert "first search page" in properties["navigation"]["description"]
-    assert "next_navigation" in properties["navigation"]["description"]
+    dialog = cast(dict[str, object], properties["dialog"])
+    navigation = cast(dict[str, object], properties["navigation"])
+    assert dialog["type"] == "string"
+    assert "exact numeric dialog id" in cast(str, dialog["description"])
+    assert navigation["type"] == "string"
+    assert "first search page" in cast(str, navigation["description"])
+    assert "next_navigation" in cast(str, navigation["description"])
 
 
 @pytest.mark.asyncio
-async def test_call_tool_validation_failure_escaped_error_includes_actionable_guidance(monkeypatch) -> None:
+async def test_call_tool_validation_failure_escaped_error_includes_actionable_guidance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setitem(server.tool_by_name, "list_dialogs", _tool("list_dialogs"))
 
-    def _raise_validation_error(tool: Tool, **kwargs) -> object:
+    def _raise_validation_error(tool: Tool, **kwargs: object) -> object:
         raise ValueError("dialog must be a string")
 
     monkeypatch.setattr("mcp_telegram.server.tools.tool_args", _raise_validation_error)
 
-    result = await server.call_tool("list_dialogs", {"dialog": 123})
+    result = _call_tool_result(await server.call_tool("list_dialogs", {"dialog": 123}))
 
     assert result.isError is True
-    message = result.content[0].text
+    message = _call_tool_text(result)
     assert "validation" in message.lower() or "argument" in message.lower()
     assert "dialog" in message.lower()
     assert "action:" in message.lower() or "retry" in message.lower() or "check" in message.lower()
@@ -95,7 +130,9 @@ async def test_call_tool_validation_failure_escaped_error_includes_actionable_gu
 
 
 @pytest.mark.asyncio
-async def test_call_tool_runtime_failure_escaped_error_includes_actionable_guidance(monkeypatch) -> None:
+async def test_call_tool_runtime_failure_escaped_error_includes_actionable_guidance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setitem(server.tool_by_name, "list_dialogs", _tool("list_dialogs"))
     monkeypatch.setattr("mcp_telegram.server.tools.tool_args", lambda tool, **kwargs: object())
     monkeypatch.setattr(
@@ -103,10 +140,10 @@ async def test_call_tool_runtime_failure_escaped_error_includes_actionable_guida
         AsyncMock(side_effect=RuntimeError("telegram backend timed out")),
     )
 
-    result = await server.call_tool("list_dialogs", {})
+    result = _call_tool_result(await server.call_tool("list_dialogs", {}))
 
     assert result.isError is True
-    message = result.content[0].text
+    message = _call_tool_text(result)
     assert "runtime" in message.lower() or "execution" in message.lower()
     assert "timed out" in message.lower() or "timeout" in message.lower()
     assert "action:" in message.lower() or "retry" in message.lower() or "check" in message.lower()
@@ -114,7 +151,9 @@ async def test_call_tool_runtime_failure_escaped_error_includes_actionable_guida
 
 
 @pytest.mark.asyncio
-async def test_call_tool_passthrough_recoverable_error_text_contract(monkeypatch) -> None:
+async def test_call_tool_passthrough_recoverable_error_text_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setitem(server.tool_by_name, "get_entity_info", _tool("get_entity_info"))
 
     expected = [
@@ -130,13 +169,13 @@ async def test_call_tool_passthrough_recoverable_error_text_contract(monkeypatch
         AsyncMock(return_value=ToolResult(content=expected, is_error=True)),
     )
 
-    result = await server.call_tool("get_entity_info", {"entity": "Iris"})
+    result = _call_tool_result(await server.call_tool("get_entity_info", {"entity": "Iris"}))
 
     assert result.content == expected
     assert result.isError is True
-    assert result.content[0].text == expected[0].text
-    assert "Action:" in result.content[0].text
-    assert "failed" not in result.content[0].text
+    assert _call_tool_text(result) == expected[0].text
+    assert "Action:" in _call_tool_text(result)
+    assert "failed" not in _call_tool_text(result)
 
 
 @pytest.mark.asyncio
@@ -154,8 +193,10 @@ async def test_call_tool_non_dict_arguments_control_contract() -> None:
 def test_posture_tags_are_not_reflected_in_descriptions() -> None:
     """Posture is internal metadata and must not consume agent-facing description budget."""
     for tool in server.tool_by_name.values():
-        assert not tool.description.startswith("[primary]"), f"{tool.name} leaks primary posture"
-        assert not tool.description.startswith("[secondary/helper]"), f"{tool.name} leaks helper posture"
+        description = tool.description
+        assert description is not None
+        assert not description.startswith("[primary]"), f"{tool.name} leaks primary posture"
+        assert not description.startswith("[secondary/helper]"), f"{tool.name} leaks helper posture"
 
 
 def test_list_tools_exposes_snake_case_names_titles_and_annotations() -> None:
@@ -180,23 +221,34 @@ def test_list_tools_exposes_snake_case_names_titles_and_annotations() -> None:
     for name, tool in server.tool_by_name.items():
         assert re.match(r"^[a-z][a-z0-9_]{0,63}$", tool.name)
         assert tool.name == name
-        assert 1 <= len(tool.title.split()) <= 3
-        assert tool.annotations is not None
-        assert tool.annotations.readOnlyHint is not None
-        assert tool.annotations.destructiveHint is not None
-        assert tool.annotations.idempotentHint is not None
-        assert tool.annotations.openWorldHint is not None
+        title = tool.title
+        assert title is not None
+        assert 1 <= len(title.split()) <= 3
+        annotations = tool.annotations
+        assert annotations is not None
+        assert annotations.readOnlyHint is not None
+        assert annotations.destructiveHint is not None
+        assert annotations.idempotentHint is not None
+        assert annotations.openWorldHint is not None
     for name, title in expected_titles.items():
         assert server.tool_by_name[name].title == title
 
-    assert server.tool_by_name["list_messages"].annotations.readOnlyHint is True
-    assert server.tool_by_name["mark_dialog_for_sync"].annotations.readOnlyHint is False
-    assert server.tool_by_name["mark_dialog_for_sync"].annotations.idempotentHint is True
-    assert server.tool_by_name["submit_feedback"].annotations.readOnlyHint is False
-    assert server.tool_by_name["submit_feedback"].annotations.destructiveHint is False
-    assert server.tool_by_name["trace_account_messages"].annotations.readOnlyHint is False
-    assert server.tool_by_name["trace_account_messages"].annotations.destructiveHint is False
-    assert server.tool_by_name["trace_account_messages"].annotations.idempotentHint is True
+    list_messages_annotations = server.tool_by_name["list_messages"].annotations
+    mark_annotations = server.tool_by_name["mark_dialog_for_sync"].annotations
+    submit_annotations = server.tool_by_name["submit_feedback"].annotations
+    trace_annotations = server.tool_by_name["trace_account_messages"].annotations
+    assert list_messages_annotations is not None
+    assert mark_annotations is not None
+    assert submit_annotations is not None
+    assert trace_annotations is not None
+    assert list_messages_annotations.readOnlyHint is True
+    assert mark_annotations.readOnlyHint is False
+    assert mark_annotations.idempotentHint is True
+    assert submit_annotations.readOnlyHint is False
+    assert submit_annotations.destructiveHint is False
+    assert trace_annotations.readOnlyHint is False
+    assert trace_annotations.destructiveHint is False
+    assert trace_annotations.idempotentHint is True
     assert all(not any(part[:1].isupper() for part in name.split("_")) for name in server.tool_by_name)
 
 
@@ -243,7 +295,7 @@ def test_tool_descriptor_preserves_registry_output_schema() -> None:
 
     tool = tool_description("list_dialogs", ListDialogs, entry)
 
-    assert tool.inputSchema["type"] == "object"
+    assert cast(dict[str, object], tool.inputSchema)["type"] == "object"
     assert tool.outputSchema == output_schema
     assert tool.title == "List Dialogs"
 
@@ -251,23 +303,30 @@ def test_tool_descriptor_preserves_registry_output_schema() -> None:
 def test_http_server_defaults_to_loopback_bind() -> None:
     signature = inspect.signature(server.run_mcp_http_server)
 
-    assert signature.parameters["host"].default == "127.0.0.1"
+    default = cast(object, signature.parameters["host"].default)
+    assert default == "127.0.0.1"
 
 
-def test_http_server_rejects_non_loopback_bind_without_explicit_opt_in(monkeypatch) -> None:
+def test_http_server_rejects_non_loopback_bind_without_explicit_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.delenv("MCP_TELEGRAM_HTTP_ALLOW_UNSAFE", raising=False)
 
     with pytest.raises(RuntimeError, match="Refusing to bind MCP HTTP transport"):
         server._assert_http_exposure_allowed("0.0.0.0")
 
 
-def test_http_server_allows_non_loopback_bind_with_explicit_opt_in(monkeypatch) -> None:
+def test_http_server_allows_non_loopback_bind_with_explicit_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("MCP_TELEGRAM_HTTP_ALLOW_UNSAFE", "1")
 
     server._assert_http_exposure_allowed("0.0.0.0")
 
 
-def test_http_transport_security_allows_loopback_and_configured_hosts(monkeypatch) -> None:
+def test_http_transport_security_allows_loopback_and_configured_hosts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("MCP_TELEGRAM_HTTP_ALLOWED_HOSTS", "mcp-telegram:3100")
     monkeypatch.setenv("MCP_TELEGRAM_HTTP_ALLOWED_ORIGINS", "http://gateway.local")
 
@@ -333,7 +392,9 @@ def test_is_loopback_http_host_recognizes_loopbacks_and_rejects_public_host() ->
     assert server._is_loopback_http_host("192.168.1.1") is False
 
 
-def test_assert_http_exposure_allowed_allows_loopback_like_hosts_without_opt_in(monkeypatch) -> None:
+def test_assert_http_exposure_allowed_allows_loopback_like_hosts_without_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.delenv("MCP_TELEGRAM_HTTP_ALLOW_UNSAFE", raising=False)
 
     server._assert_http_exposure_allowed("127.0.0.1")
@@ -341,7 +402,9 @@ def test_assert_http_exposure_allowed_allows_loopback_like_hosts_without_opt_in(
     server._assert_http_exposure_allowed("[::1]")
 
 
-def test_http_allowed_hosts_ignores_unsafebind_placeholders_and_dedupes(monkeypatch) -> None:
+def test_http_allowed_hosts_ignores_unsafebind_placeholders_and_dedupes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("MCP_TELEGRAM_HTTP_ALLOWED_HOSTS", "0.0.0.0, 0.0.0.0, ::, mcp-telegram:3100")
 
     hosts = server._http_allowed_hosts(host="0.0.0.0", port=3100)
@@ -363,13 +426,18 @@ def test_http_allowed_hosts_includes_ipv6_bind_host_and_port_variant() -> None:
 
 def test_list_prompts_resources_tools_and_progress_routes_exist() -> None:
     import asyncio
+    from collections.abc import Awaitable, Callable
 
-    async def runner() -> tuple[list, list, list, list]:
-        prompts = await server.list_prompts()
-        resources = await server.list_resources()
-        tools = await server.list_tools()
-        templates = await server.list_resource_templates()
-        await server.progress_notification(0, 0.0, None)
+    async def runner() -> tuple[object, object, object, object]:
+        list_prompts = cast(Callable[[], Awaitable[object]], server.list_prompts)
+        list_resources = cast(Callable[[], Awaitable[object]], server.list_resources)
+        list_tools = cast(Callable[[], Awaitable[object]], server.list_tools)
+        list_resource_templates = cast(Callable[[], Awaitable[object]], server.list_resource_templates)
+        prompts = await list_prompts()
+        resources = await list_resources()
+        tools = await list_tools()
+        templates = await list_resource_templates()
+        await server.progress_notification(0, 0.0, None, None)
         return prompts, resources, tools, templates
 
     prompts, resources, tools, templates = asyncio.run(runner())
@@ -381,7 +449,7 @@ def test_list_prompts_resources_tools_and_progress_routes_exist() -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_mcp_server_invokes_stdio_transport(monkeypatch) -> None:
+async def test_run_mcp_server_invokes_stdio_transport(monkeypatch: pytest.MonkeyPatch) -> None:
     from contextlib import asynccontextmanager
 
     calls = {"enter": 0, "exit": 0, "run": 0}
@@ -392,7 +460,7 @@ async def test_run_mcp_server_invokes_stdio_transport(monkeypatch) -> None:
         yield object(), object()
         calls["exit"] += 1
 
-    async def fake_run(*_args, **_kwargs) -> None:
+    async def fake_run(*_args: object, **_kwargs: object) -> None:
         calls["run"] += 1
 
     monkeypatch.setattr("mcp.server.stdio.stdio_server", fake_stdio_server)
@@ -410,12 +478,12 @@ async def test_run_mcp_server_invokes_stdio_transport(monkeypatch) -> None:
 
 
 class _FakeTransportSecuritySettings:
-    def __init__(self, captured: dict[str, object], **kwargs) -> None:
+    def __init__(self, captured: dict[str, object], **kwargs: object) -> None:
         captured["security"] = kwargs
 
 
 class _FakeSessionManager:
-    def __init__(self, captured: dict[str, object], app, security_settings) -> None:
+    def __init__(self, captured: dict[str, object], app: object, security_settings: object) -> None:
         captured["session_manager"] = {"app": app, "security_settings": security_settings}
         self._captured = captured
 
@@ -427,13 +495,21 @@ class _FakeSessionManager:
 
 
 class _FakeRoute:
-    def __init__(self, captured: dict[str, object], path: str, endpoint, methods: list[str] | None = None) -> None:
-        captured.setdefault("routes", []).append(("route", path, methods))
+    def __init__(
+        self,
+        captured: dict[str, object],
+        path: str,
+        endpoint: object,
+        methods: list[str] | None = None,
+    ) -> None:
+        routes = cast(list[tuple[str, str, list[str] | None]], captured.setdefault("routes", []))
+        routes.append(("route", path, methods))
 
 
 class _FakeMount:
     def __init__(self, captured: dict[str, object], path: str, app: object) -> None:
-        captured.setdefault("routes", []).append(("mount", path, app))
+        routes = cast(list[tuple[str, str, object]], captured.setdefault("routes", []))
+        routes.append(("mount", path, app))
 
 
 class _FakeStarlette:
@@ -442,7 +518,7 @@ class _FakeStarlette:
 
 
 class _FakeConfig:
-    def __init__(self, captured: dict[str, object], asgi_app, *args, **kwargs) -> None:
+    def __init__(self, captured: dict[str, object], asgi_app: object, *args: object, **kwargs: object) -> None:
         captured["config"] = {
             "asgi_app": asgi_app,
             "host": kwargs["host"],
@@ -477,7 +553,9 @@ def _fake_assert_exposure_allowed(captured: dict[str, object], host: str) -> Non
 
 
 @pytest.mark.asyncio
-async def test_run_mcp_http_server_normalizes_mount_and_builds_transport(monkeypatch) -> None:
+async def test_run_mcp_http_server_normalizes_mount_and_builds_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     captured: dict[str, object] = {}
     monkeypatch.setattr(
         "mcp.server.transport_security.TransportSecuritySettings", partial(_FakeTransportSecuritySettings, captured)
@@ -505,7 +583,7 @@ async def test_run_mcp_http_server_normalizes_mount_and_builds_transport(monkeyp
         "allowed_origins": ["https://example.com"],
     }
     assert captured["server"]
-    routes = captured.get("routes", [])
+    routes = cast(list[tuple[str, str]], captured.get("routes", []))
     assert routes[0][0] == "mount"
     assert routes[0][1] == "/mcp"
     assert routes[1][0] == "route"
@@ -517,8 +595,9 @@ def test_list_tools_exposes_list_dialogs_output_schema() -> None:
     tool = server.tool_by_name["list_dialogs"]
 
     assert tool.outputSchema is not None
-    assert "dialogs" in tool.outputSchema["properties"]
-    assert "count" in tool.outputSchema["required"]
+    properties = cast(dict[str, object], _tool_output_schema(tool)["properties"])
+    assert "dialogs" in properties
+    assert "count" in cast(list[str], cast(dict[str, object], tool.outputSchema)["required"])
 
 
 def test_all_registered_tools_declare_output_schema() -> None:
@@ -528,36 +607,61 @@ def test_all_registered_tools_declare_output_schema() -> None:
 
 
 def test_phase_52_agent_metadata_fields_are_in_output_schemas() -> None:
+    def assert_nested_item_fields(
+        output_schema: object,
+        *,
+        collection_name: str,
+        required_fields: tuple[str, ...],
+        property_fields: tuple[str, ...] = (),
+    ) -> None:
+        schema = cast(dict[str, object], output_schema)
+        items = cast(
+            dict[str, object],
+            cast(dict[str, object], cast(dict[str, object], schema["properties"])[collection_name])["items"],
+        )
+        item_required = cast(list[str], items["required"])
+        item_properties = cast(dict[str, object], items["properties"])
+        for field in required_fields:
+            assert field in item_required
+        for field in property_fields:
+            assert field in item_properties
+
     list_messages_schema = server.tool_by_name["list_messages"].outputSchema
     assert list_messages_schema is not None
-    assert "presentation" in list_messages_schema["required"]
-    message_item = list_messages_schema["properties"]["messages"]["items"]
-    assert "reply_context_ref" in message_item["required"]
-    assert "reply_context_ref" in message_item["properties"]
+    list_messages_dict = cast(dict[str, object], list_messages_schema)
+    assert "presentation" in cast(list[str], list_messages_dict["required"])
+    assert_nested_item_fields(
+        list_messages_schema,
+        collection_name="messages",
+        required_fields=("reply_context_ref",),
+        property_fields=("reply_context_ref",),
+    )
 
     list_dialogs_schema = server.tool_by_name["list_dialogs"].outputSchema
     assert list_dialogs_schema is not None
-    dialog_item = list_dialogs_schema["properties"]["dialogs"]["items"]
-    assert "draft_content" in dialog_item["required"]
-    assert "draft_content" in dialog_item["properties"]
+    assert_nested_item_fields(
+        list_dialogs_schema,
+        collection_name="dialogs",
+        required_fields=("draft_content",),
+        property_fields=("draft_content",),
+    )
 
     list_topics_schema = server.tool_by_name["list_topics"].outputSchema
     assert list_topics_schema is not None
-    topic_item = list_topics_schema["properties"]["topics"]["items"]
-    assert "title_content" in topic_item["required"]
-    assert "title_content" in topic_item["properties"]
+    assert_nested_item_fields(
+        list_topics_schema,
+        collection_name="topics",
+        required_fields=("title_content",),
+        property_fields=("title_content",),
+    )
 
     sync_alerts_schema = server.tool_by_name["get_sync_alerts"].outputSchema
     assert sync_alerts_schema is not None
-    alert_item = sync_alerts_schema["properties"]["alerts"]["items"]
-    assert {
-        "kind",
-        "message_id",
-        "deleted_at",
-        "version",
-        "edit_date",
-        "access_lost_at",
-    }.issubset(alert_item["required"])
+    assert_nested_item_fields(
+        sync_alerts_schema,
+        collection_name="alerts",
+        required_fields=("kind", "message_id", "deleted_at", "version", "edit_date", "access_lost_at"),
+    )
 
 
 def test_list_tools_exposes_account_trace_schema_and_title() -> None:
@@ -565,22 +669,26 @@ def test_list_tools_exposes_account_trace_schema_and_title() -> None:
 
     assert tool.title == "Account Trace"
     assert tool.outputSchema is not None
-    assert "coverage" in tool.outputSchema["required"]
-    assert "result_count_semantics" in tool.outputSchema["required"]
-    assert "preview" in tool.outputSchema["properties"]
-    assert "warnings" in tool.outputSchema["properties"]
-    assert "limits" in tool.outputSchema["properties"]
-    assert "navigation" in tool.outputSchema["properties"]
-    assert "coverage_bounds" in tool.outputSchema["properties"]["provenance"]["properties"]
-    assert (
-        "authorship_basis"
-        in (tool.outputSchema["properties"]["groups"]["items"]["properties"]["evidence"]["items"]["properties"])
+    output_schema = _tool_output_schema(tool)
+    assert "coverage" in cast(list[str], output_schema["required"])
+    assert "result_count_semantics" in cast(list[str], output_schema["required"])
+    properties = cast(dict[str, object], output_schema["properties"])
+    assert "preview" in properties
+    assert "warnings" in properties
+    assert "limits" in properties
+    assert "navigation" in properties
+    provenance = cast(dict[str, object], properties["provenance"])
+    assert "coverage_bounds" in cast(dict[str, object], provenance["properties"])
+    groups_item = cast(dict[str, object], cast(dict[str, object], properties["groups"])["items"])
+    evidence_item = cast(dict[str, object], cast(dict[str, object], groups_item["properties"])["evidence"])["items"]
+    evidence_properties = cast(dict[str, object], cast(dict[str, object], evidence_item)["properties"])
+    assert "authorship_basis" in evidence_properties
+    assert "content" in evidence_properties
+    assert cast(dict[str, object], _tool_input_schema(tool)["properties"])["exact_topic_id"] is not None
+    exact_topic_id = cast(
+        dict[str, object], cast(dict[str, object], _tool_input_schema(tool)["properties"])["exact_topic_id"]
     )
-    assert (
-        "content"
-        in (tool.outputSchema["properties"]["groups"]["items"]["properties"]["evidence"]["items"]["properties"])
-    )
-    assert tool.inputSchema["properties"]["exact_topic_id"]["type"] == "integer"
+    assert exact_topic_id["type"] == "integer"
 
 
 def test_list_tools_exposes_feedback_and_entity_info_output_schemas() -> None:
@@ -588,15 +696,18 @@ def test_list_tools_exposes_feedback_and_entity_info_output_schemas() -> None:
     entity_tool = server.tool_by_name["get_entity_info"]
 
     assert feedback_tool.outputSchema is not None
-    assert "accepted" in feedback_tool.outputSchema["required"]
-    assert "tracking_id" in feedback_tool.outputSchema["required"]
-    assert entity_tool.outputSchema is not None
-    assert "type_specific" in entity_tool.outputSchema["required"]
-    assert "content_fields" in entity_tool.outputSchema["required"]
+    feedback_schema = cast(dict[str, object], feedback_tool.outputSchema)
+    entity_schema = cast(dict[str, object], entity_tool.outputSchema)
+    assert "accepted" in cast(list[str], feedback_schema["required"])
+    assert "tracking_id" in cast(list[str], feedback_schema["required"])
+    assert "type_specific" in cast(list[str], entity_schema["required"])
+    assert "content_fields" in cast(list[str], entity_schema["required"])
 
 
 @pytest.mark.asyncio
-async def test_call_tool_returns_structuredContent_with_empty_success_content(monkeypatch) -> None:
+async def test_call_tool_returns_structuredContent_with_empty_success_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setitem(server.tool_by_name, "list_dialogs", _tool("list_dialogs"))
     monkeypatch.setattr("mcp_telegram.server.tools.tool_args", lambda tool, **kwargs: object())
     monkeypatch.setattr(
@@ -609,7 +720,7 @@ async def test_call_tool_returns_structuredContent_with_empty_success_content(mo
         ),
     )
 
-    result = await server.call_tool("list_dialogs", {})
+    result = _call_tool_result(await server.call_tool("list_dialogs", {}))
 
     assert result.isError is False
     assert result.structuredContent == {"dialogs": [{"id": 1, "name": "Alice"}], "count": 1}
@@ -618,14 +729,16 @@ async def test_call_tool_returns_structuredContent_with_empty_success_content(mo
 
 @pytest.mark.asyncio
 async def test_call_tool_validation_rejects_trace_topic_without_dialog_scope() -> None:
-    result = await server.call_tool("trace_account_messages", {"account": "@alice", "exact_topic_id": 7})
+    result = _call_tool_result(
+        await server.call_tool("trace_account_messages", {"account": "@alice", "exact_topic_id": 7})
+    )
 
     assert result.isError is True
-    assert "exact_topic_id requires" in result.content[0].text
+    assert "exact_topic_id requires" in _call_tool_text(result)
 
 
 @pytest.mark.asyncio
-async def test_server_instructions_mention_account_trace(monkeypatch) -> None:
+async def test_server_instructions_mention_account_trace(monkeypatch: pytest.MonkeyPatch) -> None:
     class _Conn:
         async def get_me(self) -> dict:
             return {"ok": False}
@@ -644,7 +757,9 @@ async def test_server_instructions_mention_account_trace(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_server_instructions_describe_structured_only_response_contract(monkeypatch) -> None:
+async def test_server_instructions_describe_structured_only_response_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     class _Conn:
         async def get_me(self) -> dict:
             return {"ok": False}
@@ -666,7 +781,7 @@ async def test_server_instructions_describe_structured_only_response_contract(mo
 
 
 @pytest.mark.asyncio
-async def test_server_instructions_describe_identity_model(monkeypatch) -> None:
+async def test_server_instructions_describe_identity_model(monkeypatch: pytest.MonkeyPatch) -> None:
     class _Conn:
         async def get_me(self) -> dict:
             return {"ok": False}
@@ -686,7 +801,9 @@ async def test_server_instructions_describe_identity_model(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_server_instructions_successfully_enriches_account_identity(monkeypatch) -> None:
+async def test_server_instructions_successfully_enriches_account_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     class _Conn:
         async def get_me(self) -> dict:
             return {
@@ -731,25 +848,25 @@ def test_primary_tools_have_core_read_search_schema() -> None:
     """Primary read and search tools expose the direct-access schema patterns from Phase 17."""
     # list_messages: must have exact_dialog_id for direct reads
     list_messages = server.tool_by_name["list_messages"]
-    lm_props = list_messages.inputSchema["properties"]
+    lm_props = cast(dict[str, object], _tool_input_schema(list_messages)["properties"])
     assert "exact_dialog_id" in lm_props, "list_messages missing exact_dialog_id for direct dialog access"
     assert "exact_topic_id" in lm_props, "list_messages missing exact_topic_id for direct topic access"
     assert "navigation" in lm_props, "list_messages missing shared navigation field"
 
     # search_messages: must keep dialog + query shape for direct scoping
     search_messages = server.tool_by_name["search_messages"]
-    sm_props = search_messages.inputSchema["properties"]
+    sm_props = cast(dict[str, object], _tool_input_schema(search_messages)["properties"])
     assert "dialog" in sm_props, "search_messages missing dialog for exact numeric ID pattern"
     assert "query" in sm_props, "search_messages missing query"
     assert "navigation" in sm_props, "search_messages missing shared navigation field"
 
     # get_entity_info: must have entity field for universal entity lookup
     get_entity_info = server.tool_by_name["get_entity_info"]
-    gei_props = get_entity_info.inputSchema["properties"]
+    gei_props = cast(dict[str, object], _tool_input_schema(get_entity_info)["properties"])
     assert "entity" in gei_props, "get_entity_info missing entity field for direct lookup"
 
     trace_account = server.tool_by_name["trace_account_messages"]
-    trace_props = trace_account.inputSchema["properties"]
+    trace_props = cast(dict[str, object], _tool_input_schema(trace_account)["properties"])
     assert "exact_account_id" in trace_props, "trace_account_messages missing exact_account_id"
     assert "exact_topic_id" in trace_props, "trace_account_messages missing exact_topic_id"
     assert "coverage_goal" in trace_props, "trace_account_messages missing coverage_goal"
@@ -795,7 +912,7 @@ def _make_mock_conn(list_messages_response: dict):
 
 
 @pytest.mark.asyncio
-async def test_list_messages_tool_archived_warning_with_coverage(monkeypatch):
+async def test_list_messages_tool_archived_warning_with_coverage(monkeypatch: pytest.MonkeyPatch):
     """list_messages tool output includes archived warning with coverage pct."""
     mock_conn = _make_mock_conn(
         {
@@ -814,17 +931,19 @@ async def test_list_messages_tool_archived_warning_with_coverage(monkeypatch):
     )
     monkeypatch.setattr("mcp_telegram.tools.reading.daemon_connection", lambda: mock_conn)
 
-    result = await server.call_tool("list_messages", {"exact_dialog_id": 123})
+    result = _call_tool_result(await server.call_tool("list_messages", {"exact_dialog_id": 123}))
     assert result.content == []
-    warning = result.structuredContent["warnings"][0]
+    payload = cast(dict[str, object], result.structuredContent)
+    warning = cast(dict[str, object], cast(list[object], payload["warnings"])[0])
+    message = cast(str, warning["message"])
     assert warning["kind"] == "archived_dialog"
-    assert "archive" in warning["message"].lower()
-    assert "2023-11-14" in warning["message"]
-    assert "80%" in warning["message"]
+    assert "archive" in message.lower()
+    assert "2023-11-14" in message
+    assert "80%" in message
 
 
 @pytest.mark.asyncio
-async def test_list_messages_tool_archived_warning_unknown_coverage(monkeypatch):
+async def test_list_messages_tool_archived_warning_unknown_coverage(monkeypatch: pytest.MonkeyPatch):
     """list_messages tool output shows 'N messages archived locally' when coverage unknown."""
     mock_conn = _make_mock_conn(
         {
@@ -844,14 +963,18 @@ async def test_list_messages_tool_archived_warning_unknown_coverage(monkeypatch)
     )
     monkeypatch.setattr("mcp_telegram.tools.reading.daemon_connection", lambda: mock_conn)
 
-    result = await server.call_tool("list_messages", {"exact_dialog_id": 123})
+    result = _call_tool_result(await server.call_tool("list_messages", {"exact_dialog_id": 123}))
     assert result.content == []
-    warning = result.structuredContent["warnings"][0]
-    assert "150 messages archived locally" in warning["message"]
+    payload = cast(dict[str, object], result.structuredContent)
+    warning = cast(dict[str, object], cast(list[object], payload["warnings"])[0])
+    message = cast(str, warning["message"])
+    assert "150 messages archived locally" in message
 
 
 @pytest.mark.asyncio
-async def test_list_messages_tool_uses_last_synced_at_not_access_lost_at(monkeypatch):
+async def test_list_messages_tool_uses_last_synced_at_not_access_lost_at(
+    monkeypatch: pytest.MonkeyPatch,
+):
     """Verify tool uses last_synced_at for the archive date, NOT access_lost_at."""
     mock_conn = _make_mock_conn(
         {
@@ -870,8 +993,10 @@ async def test_list_messages_tool_uses_last_synced_at_not_access_lost_at(monkeyp
     )
     monkeypatch.setattr("mcp_telegram.tools.reading.daemon_connection", lambda: mock_conn)
 
-    result = await server.call_tool("list_messages", {"exact_dialog_id": 123})
-    warning = result.structuredContent["warnings"][0]
+    result = _call_tool_result(await server.call_tool("list_messages", {"exact_dialog_id": 123}))
+    payload = cast(dict[str, object], result.structuredContent)
+    warning = cast(dict[str, object], cast(list[object], payload["warnings"])[0])
     # Must show 2023-11-14 (last_synced_at), NOT 2024-01-01 (access_lost_at)
-    assert "2023-11-14" in warning["message"]
-    assert "2024-01-01" not in warning["message"]
+    message = cast(str, warning["message"])
+    assert "2023-11-14" in message
+    assert "2024-01-01" not in message

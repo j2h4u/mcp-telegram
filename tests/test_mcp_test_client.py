@@ -4,6 +4,7 @@ import json
 import re
 import sys
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -174,7 +175,7 @@ async def test_mcp_test_client_script_one_of_fails_when_no_branch_matches() -> N
             await execute_script_steps(client, steps)
 
 
-def test_mcp_test_client_redacts_printed_script_output(tmp_path, capsys) -> None:
+def test_mcp_test_client_redacts_printed_script_output(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     script_path = tmp_path / "script.json"
     script_path.write_text(
         """
@@ -232,7 +233,7 @@ def test_mcp_test_client_redacts_structured_content() -> None:
         }
     ]
 
-    redacted = redact_script_output(payload)
+    redacted = cast(list[dict[str, object]], redact_script_output(payload))
 
     rendered = json.dumps(redacted, ensure_ascii=False)
     assert "[REDACTED " in rendered
@@ -242,7 +243,7 @@ def test_mcp_test_client_redacts_structured_content() -> None:
     assert "Sensitive structured text" not in rendered
 
 
-def test_mcp_test_client_expands_env_placeholders(tmp_path, monkeypatch) -> None:
+def test_mcp_test_client_expands_env_placeholders(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     script_path = tmp_path / "script.json"
     script_path.write_text(
         json.dumps(
@@ -265,7 +266,7 @@ def test_mcp_test_client_expands_env_placeholders(tmp_path, monkeypatch) -> None
     assert steps[0]["arguments"]["account"] == "12345"
 
 
-def test_mcp_test_client_missing_env_placeholder_fails(tmp_path, monkeypatch) -> None:
+def test_mcp_test_client_missing_env_placeholder_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     script_path = tmp_path / "script.json"
     script_path.write_text(
         json.dumps({"steps": [{"action": "call_tool", "name": "x", "arguments": {"account": "${MISSING_VAR}"}}]}),
@@ -289,21 +290,27 @@ def test_smoke_scripts_use_snake_case_tool_names() -> None:
 
 
 def test_no_daemon_smoke_expects_all_registered_tools_and_output_schemas() -> None:
-    script = json.loads((_repo_root() / "devtools/mcp_client/smoke-no-daemon.json").read_text(encoding="utf-8"))
-    list_tools_expect = script["steps"][0]["expect"]
+    script = cast(
+        dict[str, object],
+        json.loads((_repo_root() / "devtools/mcp_client/smoke-no-daemon.json").read_text(encoding="utf-8")),
+    )
+    steps = cast(list[dict[str, object]], script["steps"])
+    list_tools_expect = cast(dict[str, object], steps[0]["expect"])
     registered_tools = set(server.tool_by_name)
 
-    assert set(list_tools_expect["tool_names_include"]) == registered_tools
-    assert set(list_tools_expect["tool_expectations"]) == registered_tools
-    for tool_name, path_map in list_tools_expect["tool_expectations"].items():
+    assert set(cast(list[str], list_tools_expect["tool_names_include"])) == registered_tools
+    tool_expectations = cast(dict[str, dict[str, object]], list_tools_expect["tool_expectations"])
+    assert set(tool_expectations) == registered_tools
+    for tool_name, path_map in tool_expectations.items():
         assert path_map["outputSchema.type"] == "object", tool_name
 
 
-def _expectation_branches(expect: dict) -> list[dict]:
+def _expectation_branches(expect: dict[str, object]) -> list[dict[str, object]]:
     one_of = expect.get("one_of")
     if one_of is None:
         return [expect]
-    return [branch for branch in one_of if isinstance(branch, dict)]
+    branches = cast(list[object], one_of)
+    return [branch for branch in branches if isinstance(branch, dict)]
 
 
 def test_successful_smoke_steps_assert_structured_content_paths_not_text_parsing() -> None:
@@ -312,17 +319,17 @@ def test_successful_smoke_steps_assert_structured_content_paths_not_text_parsing
         "devtools/mcp_client/smoke-integration.json",
         "devtools/mcp_client/smoke-account-trace.json",
     ):
-        script = json.loads((_repo_root() / relative_path).read_text(encoding="utf-8"))
-        for step in script["steps"]:
+        script = cast(dict[str, object], json.loads((_repo_root() / relative_path).read_text(encoding="utf-8")))
+        for step in cast(list[dict[str, object]], script["steps"]):
             if step.get("action") != "call_tool":
                 continue
-            for expect in _expectation_branches(step.get("expect", {})):
+            for expect in _expectation_branches(cast(dict[str, object], step.get("expect", {}))):
                 if expect.get("is_error") is not False:
                     continue
                 structured_paths = [
                     path
                     for key in ("path_exists", "path_nonempty")
-                    for path in expect.get(key, [])
+                    for path in cast(list[object], expect.get(key, []))
                     if isinstance(path, str)
                 ]
                 assert any(path.startswith("structuredContent") for path in structured_paths), (
@@ -333,10 +340,14 @@ def test_successful_smoke_steps_assert_structured_content_paths_not_text_parsing
 
 
 def test_no_daemon_smoke_expects_backend_errors() -> None:
-    script = json.loads((_repo_root() / "devtools/mcp_client/smoke-no-daemon.json").read_text(encoding="utf-8"))
+    script = cast(
+        dict[str, object],
+        json.loads((_repo_root() / "devtools/mcp_client/smoke-no-daemon.json").read_text(encoding="utf-8")),
+    )
     backend_tools = set(server.tool_by_name)
 
-    assert "get_dialog_stats" in script["steps"][0]["expect"]["tool_names_include"]
-    for step in script["steps"]:
+    steps = cast(list[dict[str, object]], script["steps"])
+    assert "get_dialog_stats" in cast(list[str], cast(dict[str, object], steps[0]["expect"])["tool_names_include"])
+    for step in steps:
         if step.get("action") == "call_tool" and step.get("name") in backend_tools:
-            assert step["expect"]["is_error"] is True
+            assert cast(dict[str, object], step["expect"])["is_error"] is True

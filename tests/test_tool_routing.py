@@ -12,12 +12,14 @@ instead of directly connecting to Telegram. These tests verify:
 from __future__ import annotations
 
 import pathlib
+from asyncio import StreamReader, StreamWriter
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, replace
-from unittest.mock import AsyncMock, MagicMock, patch
+from dataclasses import dataclass, field, replace
+from typing import cast
+from unittest.mock import patch
 
 import pytest
-from mcp.types import CallToolResult, TextContent
+from mcp.types import CallToolResult
 
 from mcp_telegram import server
 from mcp_telegram.tools import (
@@ -53,6 +55,60 @@ from mcp_telegram.tools.stats import GetDialogStats, GetUsageStats, get_dialog_s
 StructuredResult = ToolResult | CallToolResult
 
 
+@dataclass
+class _AsyncMethodMock:
+    return_value: object = None
+    call_args: tuple[tuple[object, ...], dict[str, object]] | None = None
+    call_count: int = 0
+
+    async def __call__(self, *args: object, **kwargs: object) -> object:
+        self.call_count += 1
+        self.call_args = (args, dict(kwargs))
+        return self.return_value
+
+    def assert_called_once(self) -> None:
+        assert self.call_count == 1
+
+    def assert_called_once_with(self, *args: object, **kwargs: object) -> None:
+        assert self.call_count == 1
+        assert self.call_args == (args, dict(kwargs))
+
+    def assert_not_called(self) -> None:
+        assert self.call_count == 0
+
+    def assert_awaited_once_with(self, *args: object, **kwargs: object) -> None:
+        self.assert_called_once_with(*args, **kwargs)
+
+
+def _json_dict(value: object) -> dict[str, object]:
+    assert isinstance(value, dict)
+    return cast(dict[str, object], value)
+
+
+def _json_list(value: object) -> list[object]:
+    assert isinstance(value, list)
+    return value
+
+
+def _json_text(value: object) -> str:
+    assert isinstance(value, str)
+    return value
+
+
+def _result_text(result: StructuredResult) -> str:
+    assert result.content
+    first_content = result.content[0]
+    text = getattr(first_content, "text", None)
+    assert isinstance(text, str)
+    return text
+
+
+def _call_kwargs(mock: _AsyncMethodMock) -> dict[str, object]:
+    assert mock.call_args is not None
+    _, kwargs = mock.call_args
+    return kwargs
+
+
 def _structured_payload(result: StructuredResult) -> dict[str, object] | None:
     if isinstance(result, ToolResult):
         return result.structured_content
@@ -66,11 +122,29 @@ def _is_error(result: StructuredResult) -> bool | None:
 
 
 def _text_content(result: StructuredResult) -> str:
-    assert result.content
-    first_content = result.content[0]
-    assert isinstance(first_content, TextContent)
-    assert first_content.text
-    return first_content.text
+    return _result_text(result)
+
+
+@dataclass
+class _DaemonConnStub:
+    list_messages: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
+    search_messages: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
+    list_dialogs: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
+    list_topics: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
+    get_me: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
+    mark_dialog_for_sync: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
+    get_sync_status: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
+    get_sync_alerts: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
+    get_entity_info: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
+    get_inbox: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
+    record_telemetry: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
+    get_usage_stats: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
+    get_dialog_stats: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
+    trace_account_messages: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
+    submit_feedback: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
+    upsert_entities: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
+    resolve_entity: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
+    get_my_recent_activity: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
 
 
 def assert_structured_success_payload(result: StructuredResult) -> dict[str, object]:
@@ -432,40 +506,40 @@ async def test_registered_tools_return_structured_content_and_text(tool_name: st
 # ---------------------------------------------------------------------------
 
 
-def _make_daemon_conn(response: dict | None = None) -> MagicMock:
+def _make_daemon_conn(response: dict | None = None) -> _DaemonConnStub:
     """Return a mock DaemonConnection that returns *response* for any method."""
-    conn = MagicMock()
+    conn = _DaemonConnStub()
     r = response or {"ok": True, "data": {}}
-    conn.list_messages = AsyncMock(return_value=r)
-    conn.search_messages = AsyncMock(return_value=r)
-    conn.list_dialogs = AsyncMock(return_value=r)
-    conn.list_topics = AsyncMock(return_value=r)
-    conn.get_me = AsyncMock(return_value=r)
-    conn.mark_dialog_for_sync = AsyncMock(return_value=r)
-    conn.get_sync_status = AsyncMock(return_value=r)
-    conn.get_sync_alerts = AsyncMock(return_value=r)
-    conn.get_entity_info = AsyncMock(return_value=r)
-    conn.get_inbox = AsyncMock(return_value=r)
-    conn.record_telemetry = AsyncMock(return_value={"ok": True})
-    conn.get_usage_stats = AsyncMock(return_value=r)
-    conn.get_dialog_stats = AsyncMock(return_value=r)
-    conn.trace_account_messages = AsyncMock(return_value=r)
-    conn.submit_feedback = AsyncMock(return_value=r)
-    conn.upsert_entities = AsyncMock(return_value={"ok": True, "upserted": 0})
-    conn.resolve_entity = AsyncMock(return_value=r)
-    conn.get_my_recent_activity = AsyncMock(return_value=r)  # Phase 999.1 (B4b)
+    conn.list_messages = _AsyncMethodMock(return_value=r)
+    conn.search_messages = _AsyncMethodMock(return_value=r)
+    conn.list_dialogs = _AsyncMethodMock(return_value=r)
+    conn.list_topics = _AsyncMethodMock(return_value=r)
+    conn.get_me = _AsyncMethodMock(return_value=r)
+    conn.mark_dialog_for_sync = _AsyncMethodMock(return_value=r)
+    conn.get_sync_status = _AsyncMethodMock(return_value=r)
+    conn.get_sync_alerts = _AsyncMethodMock(return_value=r)
+    conn.get_entity_info = _AsyncMethodMock(return_value=r)
+    conn.get_inbox = _AsyncMethodMock(return_value=r)
+    conn.record_telemetry = _AsyncMethodMock(return_value={"ok": True})
+    conn.get_usage_stats = _AsyncMethodMock(return_value=r)
+    conn.get_dialog_stats = _AsyncMethodMock(return_value=r)
+    conn.trace_account_messages = _AsyncMethodMock(return_value=r)
+    conn.submit_feedback = _AsyncMethodMock(return_value=r)
+    conn.upsert_entities = _AsyncMethodMock(return_value={"ok": True, "upserted": 0})
+    conn.resolve_entity = _AsyncMethodMock(return_value=r)
+    conn.get_my_recent_activity = _AsyncMethodMock(return_value=r)  # Phase 999.1 (B4b)
     return conn
 
 
 @asynccontextmanager
-async def _fake_daemon_cm(conn):
+async def _fake_daemon_cm(conn: _DaemonConnStub):
     yield conn
 
 
 class _patch_daemon:
     """Context manager that patches daemon_connection in all tool modules."""
 
-    def __init__(self, conn):
+    def __init__(self, conn: _DaemonConnStub):
         self._conn = conn
         self._patches = []
 
@@ -487,7 +561,7 @@ class _patch_daemon:
             self._patches.append(p)
         return self
 
-    def __exit__(self, *args):
+    def __exit__(self, *args: object):
         for p in self._patches:
             p.stop()
 
@@ -520,7 +594,7 @@ class _patch_daemon_not_running:
             self._patches.append(p)
         return self
 
-    def __exit__(self, *args):
+    def __exit__(self, *args: object):
         for p in self._patches:
             p.stop()
 
@@ -562,15 +636,17 @@ async def test_list_dialogs_via_daemon():
 
     assert result.content == ()
     assert result.structured_content is not None
-    assert result.structured_content["count"] == len(result.structured_content["dialogs"])
-    assert result.structured_content["snapshot_age_h"] is None
-    assert result.structured_content["bootstrap_pending"] is False
-    assert result.structured_content["filters"] == {
+    payload = _json_dict(result.structured_content)
+    dialogs = _json_list(payload["dialogs"])
+    assert payload["count"] == len(dialogs)
+    assert payload["snapshot_age_h"] is None
+    assert payload["bootstrap_pending"] is False
+    assert payload["filters"] == {
         "exclude_archived": False,
         "ignore_pinned": False,
         "filter": None,
     }
-    first_dialog = result.structured_content["dialogs"][0]
+    first_dialog = _json_dict(dialogs[0])
     assert first_dialog["id"] == 123
     assert first_dialog["name"] == "Alice"
     assert first_dialog["type"] == "User"
@@ -580,7 +656,7 @@ async def test_list_dialogs_via_daemon():
     assert "last_message_at" in first_dialog
     assert "sync_coverage_pct" in first_dialog
     assert "access_lost_at" in first_dialog
-    assert result.structured_content["dialogs"][1]["synced"] is False
+    assert _json_dict(dialogs[1])["synced"] is False
     conn.list_dialogs.assert_called_once()
 
 
@@ -607,10 +683,14 @@ async def test_list_dialogs_structured_output_allows_null_name():
         result = await list_dialogs(ListDialogs())
 
     assert TOOL_REGISTRY["list_dialogs"].output_schema is not None
-    name_schema = TOOL_REGISTRY["list_dialogs"].output_schema["properties"]["dialogs"]["items"]["properties"]["name"]
+    output_schema = cast(dict[str, object], TOOL_REGISTRY["list_dialogs"].output_schema)
+    properties = cast(dict[str, object], output_schema["properties"])
+    dialogs_schema = cast(dict[str, object], properties["dialogs"])
+    items_schema = cast(dict[str, object], dialogs_schema["items"])
+    name_schema = cast(dict[str, object], cast(dict[str, object], items_schema["properties"])["name"])
     assert name_schema == {"type": ["string", "null"]}
     assert result.structured_content is not None
-    assert result.structured_content["dialogs"][0]["name"] is None
+    assert _json_dict(_json_list(_json_dict(result.structured_content)["dialogs"])[0])["name"] is None
 
 
 async def test_list_dialogs_sync_status_in_output():
@@ -637,7 +717,7 @@ async def test_list_dialogs_sync_status_in_output():
 
     assert result.content == ()
     assert result.structured_content is not None
-    assert result.structured_content["dialogs"][0]["sync_status"] == "synced"
+    assert _json_dict(_json_list(_json_dict(result.structured_content)["dialogs"])[0])["sync_status"] == "synced"
 
 
 async def test_list_dialogs_empty_via_daemon():
@@ -648,8 +728,9 @@ async def test_list_dialogs_empty_via_daemon():
 
     assert result.content == ()
     assert result.structured_content is not None
-    assert result.structured_content["dialogs"] == []
-    assert result.structured_content["count"] == 0
+    payload = _json_dict(result.structured_content)
+    assert payload["dialogs"] == []
+    assert payload["count"] == 0
 
 
 async def test_list_dialogs_upserts_entities_via_daemon():
@@ -688,7 +769,7 @@ async def test_list_dialogs_upserts_entities_via_daemon():
         await list_dialogs(ListDialogs())
 
     upsert_conn.upsert_entities.assert_called_once()
-    entities = upsert_conn.upsert_entities.call_args[1]["entities"]
+    entities = cast(list[dict[str, object]], _call_kwargs(upsert_conn.upsert_entities)["entities"])
     assert len(entities) == 1
     assert entities[0]["id"] == 100
     assert entities[0]["name"] == "TestChat"
@@ -719,11 +800,13 @@ async def test_list_topics_via_daemon():
 
     assert result.content == ()
     assert result.structured_content is not None
-    assert result.structured_content["dialog"] == "MyGroup"
-    assert result.structured_content["dialog_id"] == 123
-    assert result.structured_content["count"] == 2
-    assert result.structured_content["empty_reason"] is None
-    assert result.structured_content["topics"][0] == {
+    payload = _json_dict(result.structured_content)
+    topics = _json_list(payload["topics"])
+    assert payload["dialog"] == "MyGroup"
+    assert payload["dialog_id"] == 123
+    assert payload["count"] == 2
+    assert payload["empty_reason"] is None
+    assert _json_dict(topics[0]) == {
         "topic_id": 1,
         "title": "General",
         "title_content": {
@@ -741,7 +824,7 @@ async def test_list_topics_passes_dialog_name():
     with _patch_daemon(conn):
         await list_topics(ListTopics(dialog="Some Group"))
 
-    call_kwargs = conn.list_topics.call_args[1]
+    call_kwargs = _call_kwargs(conn.list_topics)
     assert call_kwargs.get("dialog") == "Some Group"
 
 
@@ -784,7 +867,8 @@ async def test_list_topics_structures_optional_topic_metadata():
         result = await list_topics(ListTopics(dialog="-100"))
 
     assert result.structured_content is not None
-    assert result.structured_content["topics"][0] == {
+    topics = _json_list(_json_dict(result.structured_content)["topics"])
+    assert _json_dict(topics[0]) == {
         "topic_id": 10,
         "title": "Pinned",
         "title_content": {
@@ -810,7 +894,7 @@ async def test_list_topics_dialog_not_found():
     with _patch_daemon(conn):
         result = await list_topics(ListTopics(dialog="nonexistent"))
 
-    assert "not found" in result.content[0].text.lower()
+    assert "not found" in _result_text(result).lower()
 
 
 # ---------------------------------------------------------------------------
@@ -847,10 +931,12 @@ async def test_list_messages_via_daemon():
 
     assert result.content == ()
     assert result.structured_content is not None
-    assert result.structured_content["source"] == "sync_db"
-    assert result.structured_content["count"] == 1
-    assert result.structured_content["limits"]["requested_limit"] == 50
-    assert result.structured_content["limits"]["applied_limit"] == 1
+    payload = _json_dict(result.structured_content)
+    limits = _json_dict(payload["limits"])
+    assert payload["source"] == "sync_db"
+    assert payload["count"] == 1
+    assert limits["requested_limit"] == 50
+    assert limits["applied_limit"] == 1
     conn.list_messages.assert_called_once()
 
 
@@ -861,7 +947,7 @@ async def test_list_messages_passes_dialog_name_to_daemon():
     with _patch_daemon(conn):
         await list_messages(ListMessages(dialog="Unknown Chat"))
 
-    call_kwargs = conn.list_messages.call_args[1]
+    call_kwargs = _call_kwargs(conn.list_messages)
     assert call_kwargs.get("dialog") == "Unknown Chat"
 
 
@@ -872,7 +958,7 @@ async def test_list_messages_uses_exact_dialog_id():
     with _patch_daemon(conn):
         await list_messages(ListMessages(exact_dialog_id=42))
 
-    call_kwargs = conn.list_messages.call_args[1]
+    call_kwargs = _call_kwargs(conn.list_messages)
     assert call_kwargs.get("dialog_id") == 42
 
 
@@ -888,7 +974,7 @@ async def test_list_messages_dialog_not_found():
     with _patch_daemon(conn):
         result = await list_messages(ListMessages(dialog="ghost"))
 
-    assert "not found" in result.content[0].text.lower()
+    assert "not found" in _result_text(result).lower()
 
 
 # ---------------------------------------------------------------------------
@@ -924,14 +1010,17 @@ async def test_search_messages_via_daemon():
     assert_structured_text_parity(result, "results.0.snippet", "Found this result")
     assert result.content == ()
     assert result.structured_content is not None
-    assert result.structured_content["query"] == "result"
-    assert result.structured_content["count"] == 1
-    assert result.structured_content["results"][0]["dialog_id"] == 123
-    assert result.structured_content["results"][0]["dialog_name"] == "Search Chat"
-    assert result.structured_content["results"][0]["msg_id"] == 5
-    assert result.structured_content["results"][0]["snippet"] == "Found this result"
-    assert result.structured_content["results"][0]["content"]["content_kind"] == "snippet"
-    assert result.structured_content["results"][0]["anchor_call"] == {
+    payload = _json_dict(result.structured_content)
+    results = _json_list(payload["results"])
+    first_result = _json_dict(results[0])
+    assert payload["query"] == "result"
+    assert payload["count"] == 1
+    assert first_result["dialog_id"] == 123
+    assert first_result["dialog_name"] == "Search Chat"
+    assert first_result["msg_id"] == 5
+    assert first_result["snippet"] == "Found this result"
+    assert _json_dict(first_result["content"])["content_kind"] == "snippet"
+    assert first_result["anchor_call"] == {
         "tool": "list_messages",
         "arguments": {"exact_dialog_id": 123, "anchor_message_id": 5},
     }
@@ -965,7 +1054,7 @@ async def test_search_messages_frames_adversarial_snippet():
 
     assert result.content == ()
     assert result.structured_content is not None
-    content = result.structured_content["results"][0]["content"]
+    content = _json_dict(_json_dict(_json_list(_json_dict(result.structured_content)["results"])[0])["content"])
     assert content == {
         "text": adversarial,
         "is_telegram_content": True,
@@ -980,7 +1069,7 @@ async def test_search_messages_passes_dialog_name():
     with _patch_daemon(conn):
         await search_messages(SearchMessages(dialog="My Chat", query="test"))
 
-    call_kwargs = conn.search_messages.call_args[1]
+    call_kwargs = _call_kwargs(conn.search_messages)
     assert call_kwargs.get("dialog") == "My Chat"
 
 
@@ -992,13 +1081,17 @@ async def test_search_messages_no_hits():
 
     assert result.content == ()
     assert result.structured_content is not None
-    assert result.structured_content["query"] == "nonexistent"
-    assert result.structured_content["results"] == []
-    assert result.structured_content["count"] == 0
-    assert result.structured_content["next_navigation"] is None
-    assert result.structured_content["navigation"]["next_navigation"] is None
-    assert result.structured_content["limits"]["requested_limit"] == 20
-    assert result.structured_content["anchor_call"]["tool"] == "list_messages"
+    payload = _json_dict(result.structured_content)
+    navigation = _json_dict(payload["navigation"])
+    limits = _json_dict(payload["limits"])
+    anchor_call = _json_dict(payload["anchor_call"])
+    assert payload["query"] == "nonexistent"
+    assert payload["results"] == []
+    assert payload["count"] == 0
+    assert payload["next_navigation"] is None
+    assert navigation["next_navigation"] is None
+    assert limits["requested_limit"] == 20
+    assert anchor_call["tool"] == "list_messages"
 
 
 async def test_search_messages_rejects_history_navigation_token():
@@ -1012,7 +1105,7 @@ async def test_search_messages_rejects_history_navigation_token():
         result = await search_messages(SearchMessages(dialog="123", query="needle", navigation=token))
 
     assert result.is_error is True
-    assert "not search" in result.content[0].text
+    assert "not search" in _result_text(result)
     conn.search_messages.assert_not_called()
 
 
@@ -1031,7 +1124,7 @@ class _TraceDaemonPayloadOptions:
     local_cache_writes: int = 0
 
 
-def _trace_daemon_payload(*, opts: _TraceDaemonPayloadOptions | None = None, **kwargs) -> dict:
+def _trace_daemon_payload(*, opts: _TraceDaemonPayloadOptions | None = None, **kwargs: object) -> dict:
     if opts is None:
         opts = _TraceDaemonPayloadOptions()
     if kwargs:
@@ -1138,30 +1231,33 @@ async def test_trace_account_messages_routes_flat_arguments_and_counts_evidence_
 
     assert result.is_error is False
     assert result.structured_content is not None
-    assert result.structured_content["coverage"]["state"] == "complete"
-    evidence = result.structured_content["groups"][0]["evidence"]
-    assert evidence[0]["content"] == {
+    payload = _json_dict(result.structured_content)
+    coverage = _json_dict(payload["coverage"])
+    groups = _json_list(payload["groups"])
+    evidence = _json_list(_json_dict(groups[0])["evidence"])
+    assert coverage["state"] == "complete"
+    assert _json_dict(evidence[0])["content"] == {
         "text": "first trace hit",
         "is_telegram_content": True,
         "content_kind": "message_text",
     }
-    assert evidence[0]["untrusted_content"] is True
-    assert evidence[1]["media_content"] == {
+    assert _json_dict(evidence[0])["untrusted_content"] is True
+    assert _json_dict(evidence[1])["media_content"] == {
         "text": "photo attachment",
         "is_telegram_content": True,
         "content_kind": "media_description",
     }
-    assert result.structured_content["preview"] == {
+    assert payload["preview"] == {
         "shown_count": 2,
         "hidden_count": 0,
         "gap_summary": [],
     }
-    assert result.structured_content["limits"]["requested_limit"] == 50
-    assert result.structured_content["navigation"]["has_more"] is False
+    assert _json_dict(payload["limits"])["requested_limit"] == 50
+    assert _json_dict(payload["navigation"])["has_more"] is False
     assert result.result_count == 2
     assert result.content == ()
     conn.trace_account_messages.assert_called_once()
-    call_kwargs = conn.trace_account_messages.call_args[1]
+    call_kwargs = _call_kwargs(conn.trace_account_messages)
     assert call_kwargs["account"] == "@alice"
     assert call_kwargs["dialog"] == "Forum"
     assert call_kwargs["exact_topic_id"] == 7
@@ -1186,8 +1282,9 @@ async def test_trace_account_messages_unresolved_is_structured_non_error() -> No
 
     assert result.is_error is False
     assert result.structured_content is not None
-    assert result.structured_content["gaps"][0]["kind"] == "account_unresolved"
-    assert result.structured_content["warnings"][0]["kind"] == "account_unresolved"
+    payload = _json_dict(result.structured_content)
+    assert _json_dict(_json_list(payload["gaps"])[0])["kind"] == "account_unresolved"
+    assert _json_dict(_json_list(payload["warnings"])[0])["kind"] == "account_unresolved"
 
 
 async def test_trace_account_messages_ambiguous_is_structured_non_error() -> None:
@@ -1210,7 +1307,10 @@ async def test_trace_account_messages_ambiguous_is_structured_non_error() -> Non
 
     assert result.is_error is False
     assert result.structured_content is not None
-    assert result.structured_content["gaps"][0]["next_action"]["candidate_ids"] == [101, 202]
+    payload = _json_dict(result.structured_content)
+    gaps = _json_list(payload["gaps"])
+    next_action = _json_dict(_json_dict(gaps[0])["next_action"])
+    assert next_action["candidate_ids"] == [101, 202]
 
 
 async def test_trace_account_messages_observed_zero_is_structured_non_error() -> None:
@@ -1231,7 +1331,7 @@ async def test_trace_account_messages_observed_zero_is_structured_non_error() ->
     assert result.is_error is False
     assert result.result_count == 0
     assert result.structured_content is not None
-    assert result.structured_content["gaps"][0]["kind"] == "observed_zero"
+    assert _json_dict(_json_list(_json_dict(result.structured_content)["gaps"])[0])["kind"] == "observed_zero"
 
 
 async def test_trace_account_messages_best_effort_provenance_keeps_cache_writes() -> None:
@@ -1248,7 +1348,7 @@ async def test_trace_account_messages_best_effort_provenance_keeps_cache_writes(
         )
 
     assert result.structured_content is not None
-    provenance = result.structured_content["provenance"]
+    provenance = _json_dict(_json_dict(result.structured_content)["provenance"])
     assert provenance["coverage_goal"] == "best_effort_visible"
     assert provenance["local_cache_writes"] == 3
     assert "coverage_bounds" in provenance
@@ -1261,7 +1361,7 @@ async def test_trace_account_messages_daemon_error_is_tool_error() -> None:
         result = await trace_account_messages(TraceAccountMessages(exact_account_id=101))
 
     assert result.is_error is True
-    assert "invalid_time_bound" in result.content[0].text
+    assert "invalid_time_bound" in _result_text(result)
 
 
 def test_trace_account_messages_rejects_topic_without_dialog_scope() -> None:
@@ -1294,7 +1394,7 @@ async def test_list_dialogs_daemon_not_running():
     with _patch_daemon_not_running():
         result = await list_dialogs(ListDialogs())
 
-    text = result.content[0].text
+    text = _result_text(result)
     assert "not running" in text.lower() or "mcp-telegram sync" in text.lower()
 
 
@@ -1303,7 +1403,7 @@ async def test_list_messages_daemon_not_running():
     with _patch_daemon_not_running():
         result = await list_messages(ListMessages(exact_dialog_id=123))
 
-    text = result.content[0].text
+    text = _result_text(result)
     assert "not running" in text.lower() or "mcp-telegram sync" in text.lower()
 
 
@@ -1312,7 +1412,7 @@ async def test_search_messages_daemon_not_running():
     with _patch_daemon_not_running():
         result = await search_messages(SearchMessages(dialog="123", query="test"))
 
-    text = result.content[0].text
+    text = _result_text(result)
     assert "not running" in text.lower() or "mcp-telegram sync" in text.lower()
 
 
@@ -1322,7 +1422,7 @@ async def test_trace_account_messages_daemon_not_running():
         result = await trace_account_messages(TraceAccountMessages(exact_account_id=101))
 
     assert result.is_error is True
-    text = result.content[0].text
+    text = _result_text(result)
     assert "not running" in text.lower() or "mcp-telegram sync" in text.lower()
 
 
@@ -1331,7 +1431,7 @@ async def test_list_topics_daemon_not_running():
     with _patch_daemon_not_running():
         result = await list_topics(ListTopics(dialog="group"))
 
-    text = result.content[0].text
+    text = _result_text(result)
     assert "not running" in text.lower() or "mcp-telegram sync" in text.lower()
 
 
@@ -1396,7 +1496,8 @@ async def test_mark_dialog_for_sync_daemon_not_running():
     """MarkDialogForSync returns actionable error when daemon is not running."""
     with _patch_daemon_not_running():
         result = await mark_dialog_for_sync(MarkDialogForSync(dialog_id=42))
-    assert "not running" in result.content[0].text.lower() or "mcp-telegram sync" in result.content[0].text.lower()
+    text = _result_text(result)
+    assert "not running" in text.lower() or "mcp-telegram sync" in text.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -1446,7 +1547,8 @@ async def test_get_sync_status_daemon_not_running():
     """GetSyncStatus returns actionable error when daemon is not running."""
     with _patch_daemon_not_running():
         result = await get_sync_status(GetSyncStatus(dialog_id=123))
-    assert "not running" in result.content[0].text.lower() or "mcp-telegram sync" in result.content[0].text.lower()
+    text = _result_text(result)
+    assert "not running" in text.lower() or "mcp-telegram sync" in text.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -1476,8 +1578,10 @@ async def test_get_sync_alerts_via_daemon():
         result = await get_sync_alerts(GetSyncAlerts(since=0, limit=50))
     assert result.content == ()
     assert result.structured_content is not None
-    assert result.structured_content["count"] == 3
-    assert result.structured_content["alerts"][0] == {
+    payload = _json_dict(result.structured_content)
+    alerts = _json_list(payload["alerts"])
+    assert payload["count"] == 3
+    assert _json_dict(alerts[0]) == {
         "kind": "edit",
         "dialog_id": 1,
         "message_id": 200,
@@ -1489,7 +1593,7 @@ async def test_get_sync_alerts_via_daemon():
         "message": "Edited message msg=200 v1 edit_date=1700000600",
         "action": "Treat cached text as versioned; inspect edit history before relying on older wording.",
     }
-    assert result.structured_content["alerts"][1] == {
+    assert _json_dict(alerts[1]) == {
         "kind": "access_lost",
         "dialog_id": 2,
         "message_id": None,
@@ -1501,7 +1605,7 @@ async def test_get_sync_alerts_via_daemon():
         "message": "Access lost at 1700000700",
         "action": "Use get_sync_status for coverage details.",
     }
-    assert result.structured_content["alerts"][2] == {
+    assert _json_dict(alerts[2]) == {
         "kind": "deleted_message",
         "dialog_id": 1,
         "message_id": 100,
@@ -1513,7 +1617,7 @@ async def test_get_sync_alerts_via_daemon():
         "message": "Deleted message msg=100 deleted_at=1700000800",
         "action": "Inspect the dialog history around this message id if surrounding context is needed.",
     }
-    assert result.structured_content["deleted_messages"] == [
+    assert payload["deleted_messages"] == [
         {
             "dialog_id": 1,
             "message_id": 100,
@@ -1521,7 +1625,7 @@ async def test_get_sync_alerts_via_daemon():
             "action": "Inspect the dialog history around this message id if surrounding context is needed.",
         }
     ]
-    assert result.structured_content["edits"] == [
+    assert payload["edits"] == [
         {
             "dialog_id": 1,
             "message_id": 200,
@@ -1530,16 +1634,16 @@ async def test_get_sync_alerts_via_daemon():
             "action": "Treat cached text as versioned; inspect edit history before relying on older wording.",
         }
     ]
-    assert result.structured_content["access_lost"] == [
+    assert payload["access_lost"] == [
         {
             "dialog_id": 2,
             "access_lost_at": 1700000700,
             "action": "Use get_sync_status for coverage details.",
         }
     ]
-    assert result.structured_content["since"] == 0
-    assert result.structured_content["limit"] == 50
-    assert result.structured_content["limited_by"]["deleted_messages"] == {"since": 0, "limit": 50}
+    assert payload["since"] == 0
+    assert payload["limit"] == 50
+    assert _json_dict(_json_dict(payload["limited_by"])["deleted_messages"]) == {"since": 0, "limit": 50}
     conn.get_sync_alerts.assert_called_once_with(since=0, limit=50)
 
 
@@ -1613,7 +1717,8 @@ async def test_get_sync_alerts_daemon_not_running():
     """GetSyncAlerts returns actionable error when daemon is not running."""
     with _patch_daemon_not_running():
         result = await get_sync_alerts(GetSyncAlerts())
-    assert "not running" in result.content[0].text.lower() or "mcp-telegram sync" in result.content[0].text.lower()
+    text = _result_text(result)
+    assert "not running" in text.lower() or "mcp-telegram sync" in text.lower()
 
 
 def test_no_connected_client_in_tools():
@@ -1633,14 +1738,14 @@ def test_no_connected_client_in_tools():
 
 async def test_get_entity_info_resolves_via_daemon():
     """GetEntityInfo resolves entity via daemon resolve_entity then fetches typed profile."""
-    conn = MagicMock()
-    conn.resolve_entity = AsyncMock(
+    conn = _DaemonConnStub()
+    conn.resolve_entity = _AsyncMethodMock(
         return_value={
             "ok": True,
             "data": {"result": "match", "entity_id": 12345, "display_name": "Alice"},
         }
     )
-    conn.get_entity_info = AsyncMock(
+    conn.get_entity_info = _AsyncMethodMock(
         return_value={
             "ok": True,
             "data": {
@@ -1683,16 +1788,20 @@ async def test_get_entity_info_resolves_via_daemon():
             },
         }
     )
-    conn.record_telemetry = AsyncMock(return_value={"ok": True})
+    conn.record_telemetry = _AsyncMethodMock(return_value={"ok": True})
 
     with _patch_daemon(conn):
         result = await get_entity_info(GetEntityInfo(entity="Alice"))
 
     assert result.content == ()
     assert result.structured_content is not None
-    assert result.structured_content["resolved_query"]["display_name"] == "Alice"
-    assert result.structured_content["entity_id"] == 12345
-    assert result.structured_content["relationships"]["common_chats"][0]["name"] == "Dev Chat"
+    payload = _json_dict(result.structured_content)
+    resolved_query = _json_dict(payload["resolved_query"])
+    relationships = _json_dict(payload["relationships"])
+    common_chats = _json_list(relationships["common_chats"])
+    assert resolved_query["display_name"] == "Alice"
+    assert payload["entity_id"] == 12345
+    assert _json_dict(common_chats[0])["name"] == "Dev Chat"
     conn.resolve_entity.assert_called_once_with(query="Alice")
     conn.get_entity_info.assert_called_once_with(entity_id=12345)
 
@@ -1702,7 +1811,8 @@ async def test_get_entity_info_daemon_not_running():
     with _patch_daemon_not_running():
         result = await get_entity_info(GetEntityInfo(entity="Alice"))
 
-    assert "not running" in result.content[0].text.lower() or "mcp-telegram sync" in result.content[0].text.lower()
+    text = _result_text(result)
+    assert "not running" in text.lower() or "mcp-telegram sync" in text.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -1753,27 +1863,38 @@ async def test_get_inbox_via_daemon():
     assert result.structured_content is not None
     schema = TOOL_REGISTRY["get_inbox"].output_schema
     assert schema is not None
-    assert "bootstrap_pending" in schema["properties"]
-    assert "read_state" in schema["properties"]["dialogs"]["items"]["properties"]
-    assert result.structured_content["scope"] == "personal"
-    assert result.structured_content["limit"] == 100
-    assert result.structured_content["group_size_threshold"] == 100
-    assert result.structured_content["bootstrap_pending"] == 0
-    assert result.structured_content["coverage"]["complete"] is True
-    assert result.structured_content["budget"]["result_message_count"] == 1
-    assert result.structured_content["count"] == 1
-    dialog = result.structured_content["dialogs"][0]
+    schema_dict = cast(dict[str, object], schema)
+    properties = cast(dict[str, object], schema_dict["properties"])
+    dialogs = cast(dict[str, object], cast(dict[str, object], properties["dialogs"])["items"])
+    assert "bootstrap_pending" in properties
+    assert "read_state" in cast(dict[str, object], dialogs["properties"])
+    payload = _json_dict(result.structured_content)
+    coverage = _json_dict(payload["coverage"])
+    budget = _json_dict(payload["budget"])
+    dialogs = _json_list(payload["dialogs"])
+    assert payload["scope"] == "personal"
+    assert payload["limit"] == 100
+    assert payload["group_size_threshold"] == 100
+    assert payload["bootstrap_pending"] == 0
+    assert coverage["complete"] is True
+    assert budget["result_message_count"] == 1
+    assert payload["count"] == 1
+    dialog = _json_dict(dialogs[0])
     assert dialog["dialog_id"] == 123
     assert dialog["category"] == "user"
     assert dialog["dialog_type"] == "User"
     assert dialog["unread_mentions_count"] == 0
     assert dialog["total_in_chat"] == 2
-    assert dialog["read_state"]["header_lines"] == ["[read-state: all caught up]"]
-    assert dialog["budget"]["hidden_count"] == 1
-    assert dialog["messages"][0]["msg_id"] == 1
-    assert dialog["messages"][0]["text"] == "Hello there"
-    assert dialog["messages"][0]["content"]["is_telegram_content"] is True
-    assert dialog["messages"][0]["content"]["content_kind"] == "message_text"
+    read_state = _json_dict(dialog["read_state"])
+    budget = _json_dict(dialog["budget"])
+    assert read_state["header_lines"] == ["[read-state: all caught up]"]
+    assert budget["hidden_count"] == 1
+    messages = _json_list(dialog["messages"])
+    first_message = _json_dict(messages[0])
+    assert first_message["msg_id"] == 1
+    assert first_message["text"] == "Hello there"
+    assert _json_dict(first_message["content"])["is_telegram_content"] is True
+    assert _json_dict(first_message["content"])["content_kind"] == "message_text"
     conn.get_inbox.assert_called_once()
 
 
@@ -1815,8 +1936,9 @@ async def test_get_inbox_presents_each_dialog_chronologically():
     with _patch_daemon(conn):
         result = await get_inbox(GetInbox())
 
-    dialog = result.structured_content["dialogs"][0]
-    assert [message["msg_id"] for message in dialog["messages"]] == [1, 2]
+    dialog = _json_dict(_json_list(_json_dict(result.structured_content)["dialogs"])[0])
+    messages = _json_list(dialog["messages"])
+    assert [_json_dict(message)["msg_id"] for message in messages] == [1, 2]
 
 
 async def test_get_inbox_frames_adversarial_body_without_framing_group_header():
@@ -1853,7 +1975,9 @@ async def test_get_inbox_frames_adversarial_body_without_framing_group_header():
 
     assert result.content == ()
     assert result.structured_content is not None
-    content = result.structured_content["dialogs"][0]["messages"][0]["content"]
+    dialog = _json_dict(_json_list(_json_dict(result.structured_content)["dialogs"])[0])
+    messages = _json_list(dialog["messages"])
+    content = _json_dict(_json_dict(messages[0])["content"])
     assert content == {
         "text": adversarial,
         "is_telegram_content": True,
@@ -1869,8 +1993,9 @@ async def test_get_inbox_empty():
 
     assert result.content == ()
     assert result.structured_content is not None
-    assert result.structured_content["dialogs"] == []
-    assert result.structured_content["count"] == 0
+    payload = _json_dict(result.structured_content)
+    assert payload["dialogs"] == []
+    assert payload["count"] == 0
 
 
 async def test_get_inbox_daemon_not_running():
@@ -1878,7 +2003,8 @@ async def test_get_inbox_daemon_not_running():
     with _patch_daemon_not_running():
         result = await get_inbox(GetInbox())
 
-    assert "not running" in result.content[0].text.lower() or "mcp-telegram sync" in result.content[0].text.lower()
+    text = _result_text(result)
+    assert "not running" in text.lower() or "mcp-telegram sync" in text.lower()
 
 
 async def test_get_inbox_passes_params():
@@ -1887,7 +2013,7 @@ async def test_get_inbox_passes_params():
     with _patch_daemon(conn):
         await get_inbox(GetInbox(scope="all", limit=200, group_size_threshold=50))
 
-    call_kwargs = conn.get_inbox.call_args[1]
+    call_kwargs = _call_kwargs(conn.get_inbox)
     assert call_kwargs["scope"] == "all"
     assert call_kwargs["limit"] == 200
     assert call_kwargs["group_size_threshold"] == 50
@@ -1910,13 +2036,14 @@ async def test_get_inbox_empty_with_bootstrap_pending():
     assert result.content == ()
     assert result.is_error is False
     assert result.structured_content is not None
-    assert result.structured_content["bootstrap_pending"] == 329
-    assert result.structured_content["coverage"] == {
+    payload = _json_dict(result.structured_content)
+    assert payload["bootstrap_pending"] == 329
+    assert payload["coverage"] == {
         "complete": False,
         "state": "partial",
         "bootstrap_pending_count": 329,
     }
-    assert result.structured_content["warnings"][0]["kind"] == "bootstrap_pending"
+    assert _json_dict(_json_list(payload["warnings"])[0])["kind"] == "bootstrap_pending"
 
 
 async def test_get_inbox_empty_with_no_bootstrap_pending():
@@ -1934,8 +2061,9 @@ async def test_get_inbox_empty_with_no_bootstrap_pending():
 
     assert result.content == ()
     assert result.structured_content is not None
-    assert result.structured_content["dialogs"] == []
-    assert result.structured_content["coverage"]["complete"] is True
+    payload = _json_dict(result.structured_content)
+    assert payload["dialogs"] == []
+    assert _json_dict(payload["coverage"])["complete"] is True
 
 
 async def test_get_inbox_non_empty_with_bootstrap_pending():
@@ -1976,9 +2104,10 @@ async def test_get_inbox_non_empty_with_bootstrap_pending():
 
     assert result.content == ()
     assert result.structured_content is not None
-    assert result.structured_content["bootstrap_pending"] == 5
-    assert result.structured_content["coverage"]["complete"] is False
-    assert result.structured_content["warnings"][0]["kind"] == "bootstrap_pending"
+    payload = _json_dict(result.structured_content)
+    assert payload["bootstrap_pending"] == 5
+    assert _json_dict(payload["coverage"])["complete"] is False
+    assert _json_dict(_json_list(payload["warnings"])[0])["kind"] == "bootstrap_pending"
 
 
 async def test_get_inbox_non_empty_with_no_bootstrap_pending():
@@ -2018,8 +2147,9 @@ async def test_get_inbox_non_empty_with_no_bootstrap_pending():
 
     assert result.content == ()
     assert result.structured_content is not None
-    assert result.structured_content["bootstrap_pending"] == 0
-    assert result.structured_content["coverage"]["complete"] is True
+    payload = _json_dict(result.structured_content)
+    assert payload["bootstrap_pending"] == 0
+    assert _json_dict(payload["coverage"])["complete"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -2049,14 +2179,15 @@ async def test_get_usage_stats_via_daemon():
 
     assert result.content == ()
     assert result.structured_content is not None
-    assert result.structured_content["empty"] is False
-    assert result.structured_content["total_calls"] == 15
-    assert result.structured_content["tool_distribution"] == {"list_dialogs": 10, "list_messages": 5}
-    assert result.structured_content["error_distribution"] == {}
-    assert result.structured_content["max_page_depth"] == 2
-    assert result.structured_content["filter_count"] == 3
-    assert result.structured_content["latency_median_ms"] == 120
-    assert result.structured_content["latency_p95_ms"] == 350
+    payload = _json_dict(result.structured_content)
+    assert payload["empty"] is False
+    assert payload["total_calls"] == 15
+    assert payload["tool_distribution"] == {"list_dialogs": 10, "list_messages": 5}
+    assert payload["error_distribution"] == {}
+    assert payload["max_page_depth"] == 2
+    assert payload["filter_count"] == 3
+    assert payload["latency_median_ms"] == 120
+    assert payload["latency_p95_ms"] == 350
     conn.get_usage_stats.assert_called_once()
 
 
@@ -2065,7 +2196,7 @@ async def test_get_usage_stats_daemon_not_running():
     with _patch_daemon_not_running():
         result = await get_usage_stats(GetUsageStats())
 
-    text = result.content[0].text
+    text = _result_text(result)
     assert "not running" in text.lower() or "mcp-telegram sync" in text.lower()
 
 
@@ -2082,9 +2213,10 @@ async def test_get_usage_stats_empty_data():
 
     assert result.content == ()
     assert result.structured_content is not None
-    assert result.structured_content["empty"] is True
-    assert result.structured_content["total_calls"] == 0
-    assert result.structured_content["tool_distribution"] == {}
+    payload = _json_dict(result.structured_content)
+    assert payload["empty"] is True
+    assert payload["total_calls"] == 0
+    assert payload["tool_distribution"] == {}
 
 
 # ---------------------------------------------------------------------------
@@ -2129,12 +2261,12 @@ async def test_daemon_connection_list_messages_passes_sender_id():
 
     from mcp_telegram.daemon_client import DaemonConnection
 
-    sent_payload = {}
+    sent_payload: dict[str, object] = {}
 
     class _FakeWriter:
         def write(self, data: bytes) -> None:
             nonlocal sent_payload
-            sent_payload = json.loads(data.strip())
+            sent_payload = cast(dict[str, object], json.loads(data.strip()))
 
         async def drain(self) -> None:
             pass
@@ -2143,7 +2275,7 @@ async def test_daemon_connection_list_messages_passes_sender_id():
         async def readline(self) -> bytes:
             return json.dumps({"ok": True, "data": {}}).encode() + b"\n"
 
-    conn = DaemonConnection(_FakeReader(), _FakeWriter())
+    conn = DaemonConnection(cast(StreamReader, _FakeReader()), cast(StreamWriter, _FakeWriter()))
     await conn.list_messages(dialog_id=1, sender_id=42)
     assert sent_payload.get("sender_id") == 42
 
@@ -2154,12 +2286,12 @@ async def test_daemon_connection_list_messages_passes_sender_name():
 
     from mcp_telegram.daemon_client import DaemonConnection
 
-    sent_payload = {}
+    sent_payload: dict[str, object] = {}
 
     class _FakeWriter:
         def write(self, data: bytes) -> None:
             nonlocal sent_payload
-            sent_payload = json.loads(data.strip())
+            sent_payload = cast(dict[str, object], json.loads(data.strip()))
 
         async def drain(self) -> None:
             pass
@@ -2168,7 +2300,7 @@ async def test_daemon_connection_list_messages_passes_sender_name():
         async def readline(self) -> bytes:
             return json.dumps({"ok": True, "data": {}}).encode() + b"\n"
 
-    conn = DaemonConnection(_FakeReader(), _FakeWriter())
+    conn = DaemonConnection(cast(StreamReader, _FakeReader()), cast(StreamWriter, _FakeWriter()))
     await conn.list_messages(dialog_id=1, sender_name="Alice")
     assert sent_payload.get("sender_name") == "Alice"
 
@@ -2179,12 +2311,12 @@ async def test_daemon_connection_list_messages_passes_topic_id():
 
     from mcp_telegram.daemon_client import DaemonConnection
 
-    sent_payload = {}
+    sent_payload: dict[str, object] = {}
 
     class _FakeWriter:
         def write(self, data: bytes) -> None:
             nonlocal sent_payload
-            sent_payload = json.loads(data.strip())
+            sent_payload = cast(dict[str, object], json.loads(data.strip()))
 
         async def drain(self) -> None:
             pass
@@ -2193,7 +2325,7 @@ async def test_daemon_connection_list_messages_passes_topic_id():
         async def readline(self) -> bytes:
             return json.dumps({"ok": True, "data": {}}).encode() + b"\n"
 
-    conn = DaemonConnection(_FakeReader(), _FakeWriter())
+    conn = DaemonConnection(cast(StreamReader, _FakeReader()), cast(StreamWriter, _FakeWriter()))
     await conn.list_messages(dialog_id=1, topic_id=5)
     assert sent_payload.get("topic_id") == 5
 
@@ -2204,12 +2336,12 @@ async def test_daemon_connection_list_messages_passes_unread_after_id():
 
     from mcp_telegram.daemon_client import DaemonConnection
 
-    sent_payload = {}
+    sent_payload: dict[str, object] = {}
 
     class _FakeWriter:
         def write(self, data: bytes) -> None:
             nonlocal sent_payload
-            sent_payload = json.loads(data.strip())
+            sent_payload = cast(dict[str, object], json.loads(data.strip()))
 
         async def drain(self) -> None:
             pass
@@ -2218,7 +2350,7 @@ async def test_daemon_connection_list_messages_passes_unread_after_id():
         async def readline(self) -> bytes:
             return json.dumps({"ok": True, "data": {}}).encode() + b"\n"
 
-    conn = DaemonConnection(_FakeReader(), _FakeWriter())
+    conn = DaemonConnection(cast(StreamReader, _FakeReader()), cast(StreamWriter, _FakeWriter()))
     await conn.list_messages(dialog_id=1, unread_after_id=100)
     assert sent_payload.get("unread_after_id") == 100
 
@@ -2229,12 +2361,12 @@ async def test_daemon_connection_list_messages_passes_direction():
 
     from mcp_telegram.daemon_client import DaemonConnection
 
-    sent_payload = {}
+    sent_payload: dict[str, object] = {}
 
     class _FakeWriter:
         def write(self, data: bytes) -> None:
             nonlocal sent_payload
-            sent_payload = json.loads(data.strip())
+            sent_payload = cast(dict[str, object], json.loads(data.strip()))
 
         async def drain(self) -> None:
             pass
@@ -2243,7 +2375,7 @@ async def test_daemon_connection_list_messages_passes_direction():
         async def readline(self) -> bytes:
             return json.dumps({"ok": True, "data": {}}).encode() + b"\n"
 
-    conn = DaemonConnection(_FakeReader(), _FakeWriter())
+    conn = DaemonConnection(cast(StreamReader, _FakeReader()), cast(StreamWriter, _FakeWriter()))
     await conn.list_messages(dialog_id=1, direction="oldest")
     assert sent_payload.get("direction") == "oldest"
 
@@ -2254,12 +2386,12 @@ async def test_daemon_connection_list_messages_passes_unread_flag():
 
     from mcp_telegram.daemon_client import DaemonConnection
 
-    sent_payload = {}
+    sent_payload: dict[str, object] = {}
 
     class _FakeWriter:
         def write(self, data: bytes) -> None:
             nonlocal sent_payload
-            sent_payload = json.loads(data.strip())
+            sent_payload = cast(dict[str, object], json.loads(data.strip()))
 
         async def drain(self) -> None:
             pass
@@ -2268,7 +2400,7 @@ async def test_daemon_connection_list_messages_passes_unread_flag():
         async def readline(self) -> bytes:
             return json.dumps({"ok": True, "data": {}}).encode() + b"\n"
 
-    conn = DaemonConnection(_FakeReader(), _FakeWriter())
+    conn = DaemonConnection(cast(StreamReader, _FakeReader()), cast(StreamWriter, _FakeWriter()))
     await conn.list_messages(dialog_id=1, unread=True)
     assert sent_payload.get("unread") is True
 
@@ -2279,12 +2411,12 @@ async def test_daemon_connection_list_messages_omits_none_params():
 
     from mcp_telegram.daemon_client import DaemonConnection
 
-    sent_payload = {}
+    sent_payload: dict[str, object] = {}
 
     class _FakeWriter:
         def write(self, data: bytes) -> None:
             nonlocal sent_payload
-            sent_payload = json.loads(data.strip())
+            sent_payload = cast(dict[str, object], json.loads(data.strip()))
 
         async def drain(self) -> None:
             pass
@@ -2293,7 +2425,7 @@ async def test_daemon_connection_list_messages_omits_none_params():
         async def readline(self) -> bytes:
             return json.dumps({"ok": True, "data": {}}).encode() + b"\n"
 
-    conn = DaemonConnection(_FakeReader(), _FakeWriter())
+    conn = DaemonConnection(cast(StreamReader, _FakeReader()), cast(StreamWriter, _FakeWriter()))
     await conn.list_messages(dialog_id=1)
     assert "sender_id" not in sent_payload
     assert "sender_name" not in sent_payload
@@ -2360,7 +2492,7 @@ def test_format_daemon_messages_passes_topic_name_getter():
 
     captured_kwargs = {}
 
-    def _fake_format_messages(messages, reply_map, **kwargs):
+    def _fake_format_messages(messages: object, reply_map: object, **kwargs: object):
         captured_kwargs.update(kwargs)
         return "formatted"
 
@@ -2394,7 +2526,7 @@ def test_format_daemon_messages_no_topic_name_getter_when_no_topics():
 
     captured_kwargs = {}
 
-    def _fake_format_messages(messages, reply_map, **kwargs):
+    def _fake_format_messages(messages: object, reply_map: object, **kwargs: object):
         captured_kwargs.update(kwargs)
         return "formatted"
 
@@ -2434,7 +2566,7 @@ async def test_list_messages_sends_sender():
     with _patch_daemon(conn):
         await list_messages(ListMessages(exact_dialog_id=1, sender="Alice"))
 
-    call_kwargs = conn.list_messages.call_args[1]
+    call_kwargs = _call_kwargs(conn.list_messages)
     assert call_kwargs.get("sender_name") == "Alice"
 
 
@@ -2444,7 +2576,7 @@ async def test_list_messages_sends_topic_id():
     with _patch_daemon(conn):
         await list_messages(ListMessages(exact_dialog_id=1, exact_topic_id=5))
 
-    call_kwargs = conn.list_messages.call_args[1]
+    call_kwargs = _call_kwargs(conn.list_messages)
     assert call_kwargs.get("topic_id") == 5
 
 
@@ -2454,7 +2586,7 @@ async def test_list_messages_sends_direction_newest():
     with _patch_daemon(conn):
         await list_messages(ListMessages(exact_dialog_id=1))
 
-    call_kwargs = conn.list_messages.call_args[1]
+    call_kwargs = _call_kwargs(conn.list_messages)
     assert call_kwargs.get("direction") == "newest"
 
 
@@ -2464,7 +2596,7 @@ async def test_list_messages_sends_direction_oldest():
     with _patch_daemon(conn):
         await list_messages(ListMessages(exact_dialog_id=1, navigation="start"))
 
-    call_kwargs = conn.list_messages.call_args[1]
+    call_kwargs = _call_kwargs(conn.list_messages)
     assert call_kwargs.get("direction") == "oldest"
     assert call_kwargs.get("navigation") is None
 
@@ -2475,8 +2607,9 @@ async def test_list_messages_rejects_legacy_navigation_selectors():
         result = await list_messages(ListMessages(exact_dialog_id=1, navigation="oldest"))
 
     assert result.is_error is True
-    assert "latest" in result.content[0].text
-    assert "start" in result.content[0].text
+    text = _result_text(result)
+    assert "latest" in text
+    assert "start" in text
     conn.list_messages.assert_not_called()
 
 
@@ -2486,7 +2619,7 @@ async def test_list_messages_sends_unread():
     with _patch_daemon(conn):
         await list_messages(ListMessages(exact_dialog_id=1, unread=True))
 
-    call_kwargs = conn.list_messages.call_args[1]
+    call_kwargs = _call_kwargs(conn.list_messages)
     assert call_kwargs.get("unread") is True
 
 
@@ -2503,11 +2636,11 @@ async def test_list_messages_topic_fuzzy_resolves_via_list_topics():
         },
     }
     conn = _make_daemon_conn({"ok": True, "data": {"messages": [], "source": "sync_db"}})
-    conn.list_topics = AsyncMock(return_value=list_topics_response)
+    conn.list_topics = _AsyncMethodMock(return_value=list_topics_response)
     with _patch_daemon(conn):
         await list_messages(ListMessages(exact_dialog_id=1, topic="General"))
 
-    call_kwargs = conn.list_messages.call_args[1]
+    call_kwargs = _call_kwargs(conn.list_messages)
     assert call_kwargs.get("topic_id") == 7
 
 
@@ -2524,19 +2657,18 @@ async def test_list_messages_topic_fuzzy_ambiguous_returns_error():
         },
     }
     conn = _make_daemon_conn({"ok": True, "data": {"messages": [], "source": "sync_db"}})
-    conn.list_topics = AsyncMock(return_value=list_topics_response)
+    conn.list_topics = _AsyncMethodMock(return_value=list_topics_response)
     with _patch_daemon(conn):
         result = await list_messages(ListMessages(exact_dialog_id=1, topic="General"))
 
-    text = result.content[0].text
+    text = _result_text(result)
     assert result.is_error is True
     assert "Multiple topics matched" in text
     assert "structuredContent.candidates" in text
     assert "exact_topic_id" in text
     assert "General Chat" not in text
     assert "General Topics" not in text
-    payload = result.structured_content
-    assert payload is not None
+    payload = _json_dict(result.structured_content)
     assert payload["error"] == "ambiguous_topic"
     candidates = payload["candidates"]
     assert isinstance(candidates, list)
@@ -2562,11 +2694,11 @@ async def test_list_messages_topic_not_found_returns_error():
         },
     }
     conn = _make_daemon_conn({"ok": True, "data": {"messages": [], "source": "sync_db"}})
-    conn.list_topics = AsyncMock(return_value=list_topics_response)
+    conn.list_topics = _AsyncMethodMock(return_value=list_topics_response)
     with _patch_daemon(conn):
         result = await list_messages(ListMessages(exact_dialog_id=1, topic="nonexistent"))
 
-    text = result.content[0].text
+    text = _result_text(result)
     assert "not found" in text.lower() or "nonexistent" in text.lower()
 
 
@@ -2576,7 +2708,7 @@ async def test_list_messages_no_optional_params_not_sent():
     with _patch_daemon(conn):
         await list_messages(ListMessages(exact_dialog_id=1))
 
-    call_kwargs = conn.list_messages.call_args[1]
+    call_kwargs = _call_kwargs(conn.list_messages)
     assert call_kwargs.get("sender_name") is None
     assert call_kwargs.get("topic_id") is None
     assert call_kwargs.get("unread") is None
@@ -2628,20 +2760,23 @@ async def test_get_my_recent_activity_routes_primary():
         result = await get_my_recent_activity(GetMyRecentActivity(since_hours=168, limit=500))
     assert result.content == ()
     assert result.structured_content is not None
-    assert result.structured_content["since_hours"] == 168
-    assert result.structured_content["limit"] == 500
-    assert result.structured_content["dialog_kinds"] == ["group", "forum"]
-    assert result.structured_content["scan_status"] == "complete"
-    assert result.structured_content["scanned_at"] == 1_700_003_600
-    assert result.structured_content["count"] == 2
-    first_comment = result.structured_content["comments"][0]
+    payload = _json_dict(result.structured_content)
+    comments = _json_list(payload["comments"])
+    assert payload["since_hours"] == 168
+    assert payload["limit"] == 500
+    assert payload["dialog_kinds"] == ["group", "forum"]
+    assert payload["scan_status"] == "complete"
+    assert payload["scanned_at"] == 1_700_003_600
+    assert payload["count"] == 2
+    first_comment = _json_dict(comments[0])
     assert first_comment["dialog_id"] == 42
     assert first_comment["dialog_type"] == "supergroup"
     assert first_comment["dialog_category"] == "group"
     assert first_comment["message_id"] == 100
     assert first_comment["reply_count"] == 0
-    assert first_comment["content"]["is_telegram_content"] is True
-    assert first_comment["content"]["content_kind"] == "message_text"
+    content = _json_dict(first_comment["content"])
+    assert content["is_telegram_content"] is True
+    assert content["content_kind"] == "message_text"
     assert first_comment["navigation"] == {
         "text": "nav: dialog_id=42 message_id=100",
         "tool": "list_messages",
@@ -2668,7 +2803,7 @@ async def test_get_my_recent_activity_accepts_dm_alias():
         result = await get_my_recent_activity(GetMyRecentActivity(dialog_kinds=["dm"]))
 
     assert result.structured_content is not None
-    assert result.structured_content["dialog_kinds"] == ["user", "bot"]
+    assert _json_dict(result.structured_content)["dialog_kinds"] == ["user", "bot"]
     conn.get_my_recent_activity.assert_awaited_once_with(
         since_hours=168,
         limit=500,
@@ -2704,13 +2839,14 @@ async def test_get_my_recent_activity_frames_adversarial_text():
 
     assert result.content == ()
     assert result.structured_content is not None
-    comment = result.structured_content["comments"][0]
+    comment = _json_dict(_json_list(_json_dict(result.structured_content)["comments"])[0])
     assert comment["content"] == {
         "text": adversarial,
         "is_telegram_content": True,
         "content_kind": "message_text",
     }
-    assert comment["navigation"]["arguments"] == {"exact_dialog_id": 42, "anchor_message_id": 100}
+    navigation = _json_dict(comment["navigation"])
+    assert navigation["arguments"] == {"exact_dialog_id": 42, "anchor_message_id": 100}
 
 
 async def test_get_my_recent_activity_never_run_header():
@@ -2727,9 +2863,10 @@ async def test_get_my_recent_activity_never_run_header():
         result = await get_my_recent_activity(GetMyRecentActivity())
     assert result.content == ()
     assert result.structured_content is not None
-    assert result.structured_content["scan_status"] == "never_run"
-    assert result.structured_content["comments"] == []
-    assert result.structured_content["count"] == 0
+    payload = _json_dict(result.structured_content)
+    assert payload["scan_status"] == "never_run"
+    assert payload["comments"] == []
+    assert payload["count"] == 0
 
 
 async def test_get_my_recent_activity_in_progress_header():
@@ -2750,7 +2887,7 @@ async def test_get_my_recent_activity_in_progress_header():
         result = await get_my_recent_activity(GetMyRecentActivity())
     assert result.content == ()
     assert result.structured_content is not None
-    assert result.structured_content["scan_status"] == "in_progress"
+    assert _json_dict(result.structured_content)["scan_status"] == "in_progress"
 
 
 async def test_get_my_recent_activity_formats_comment_block():
@@ -2779,10 +2916,11 @@ async def test_get_my_recent_activity_formats_comment_block():
         result = await get_my_recent_activity(GetMyRecentActivity())
     assert result.content == ()
     assert result.structured_content is not None
-    comment = result.structured_content["comments"][0]
+    comment = _json_dict(_json_list(_json_dict(result.structured_content)["comments"])[0])
     assert comment["dialog_name"] == "X"
     assert comment["text"] == "hi"
-    assert comment["navigation"]["arguments"] == {"exact_dialog_id": 42, "anchor_message_id": 100}
+    navigation = _json_dict(comment["navigation"])
+    assert navigation["arguments"] == {"exact_dialog_id": 42, "anchor_message_id": 100}
     assert comment["reactions"] == []
 
 
@@ -2816,7 +2954,8 @@ async def test_get_my_recent_activity_renders_reactions():
         result = await get_my_recent_activity(GetMyRecentActivity())
     assert result.content == ()
     assert result.structured_content is not None
-    assert result.structured_content["comments"][0]["reactions"] == [
+    comments = _json_list(_json_dict(result.structured_content)["comments"])
+    assert _json_dict(comments[0])["reactions"] == [
         {"emoji": "🔥", "count": 3},
         {"emoji": "❤", "count": 1},
     ]
@@ -2833,7 +2972,7 @@ async def test_list_messages_fragment_coverage_header():
     with _patch_daemon(conn):
         result = await list_messages(ListMessages(exact_dialog_id=42))
     assert result.content == ()
-    assert result.structured_content["coverage"]["fragment_coverage"] is True
+    assert _json_dict(_json_dict(result.structured_content)["coverage"])["fragment_coverage"] is True
 
 
 async def test_list_messages_no_fragment_no_header():
@@ -2842,4 +2981,4 @@ async def test_list_messages_no_fragment_no_header():
     with _patch_daemon(conn):
         result = await list_messages(ListMessages(exact_dialog_id=42))
     assert result.content == ()
-    assert result.structured_content["coverage"]["fragment_coverage"] is False
+    assert _json_dict(_json_dict(result.structured_content)["coverage"])["fragment_coverage"] is False

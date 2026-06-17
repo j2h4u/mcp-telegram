@@ -2,6 +2,14 @@ from __future__ import annotations
 
 import json
 import sys
+from typing import TypedDict, cast
+
+
+class _JsonRpcRequest(TypedDict, total=False):
+    id: int | str | None
+    method: str
+    params: dict[str, object]
+
 
 TOOLS = [
     {
@@ -32,17 +40,19 @@ def main() -> int:
     for raw_line in sys.stdin:
         if not raw_line.strip():
             continue
-        payload = json.loads(raw_line)
+        payload = cast(_JsonRpcRequest, json.loads(raw_line))
         request_id = payload.get("id")
         method = payload.get("method")
 
         if method == "initialize":
+            params = cast(dict[str, object], payload.get("params", {}))
+            protocol_version = cast(str, params["protocolVersion"])
             send(
                 {
                     "jsonrpc": "2.0",
                     "id": request_id,
                     "result": {
-                        "protocolVersion": payload["params"]["protocolVersion"],
+                        "protocolVersion": protocol_version,
                         "capabilities": {"tools": {}},
                         "serverInfo": {"name": "fake-mcp", "version": "1.0"},
                     },
@@ -64,9 +74,10 @@ def main() -> int:
             continue
 
         if method == "tools/call":
-            params = payload.get("params", {})
-            name = params.get("name")
+            params = cast(dict[str, object], payload.get("params", {}))
+            name = cast(str | None, params.get("name"))
             if name == "Echo":
+                arguments = cast(dict[str, object], params.get("arguments", {}))
                 send(
                     {
                         "jsonrpc": "2.0",
@@ -75,7 +86,7 @@ def main() -> int:
                             "content": [
                                 {
                                     "type": "text",
-                                    "text": json.dumps(params.get("arguments", {}), ensure_ascii=False, sort_keys=True),
+                                    "text": json.dumps(arguments, ensure_ascii=False, sort_keys=True),
                                 }
                             ],
                             "isError": False,
