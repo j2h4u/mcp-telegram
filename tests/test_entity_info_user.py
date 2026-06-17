@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import re
 import sqlite3
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -22,9 +23,20 @@ import pytest
 # cheap (no per-test imports).
 from telethon.tl.types import User  # type: ignore[import-untyped]
 
-from mcp_telegram.daemon_api import DaemonAPIServer
+from mcp_telegram.daemon_api import DaemonAPIServer, _DaemonClientLike
 
 _TEST_DBS: list[sqlite3.Connection] = []
+
+
+def _dict(value: object) -> dict[str, object]:
+    return cast(dict[str, object], value)
+
+
+def _dict_at(value: object, *keys: str) -> dict[str, object]:
+    current = _dict(value)
+    for key in keys:
+        current = _dict(current[key])
+    return current
 
 
 @pytest.fixture(autouse=True)
@@ -75,18 +87,18 @@ def _make_db() -> sqlite3.Connection:
     return conn
 
 
-def make_server(conn=None, client=None) -> DaemonAPIServer:
+def make_server(conn: sqlite3.Connection | None = None, client: _DaemonClientLike | None = None) -> DaemonAPIServer:
     if conn is None:
         conn = _make_db()
     if client is None:
         client = MagicMock()
     shutdown_event = asyncio.Event()
-    server = DaemonAPIServer(conn, client, shutdown_event)
+    server = DaemonAPIServer(conn, cast(_DaemonClientLike, client), shutdown_event)
     server._ready = True
     return server
 
 
-def _make_user_mock(**kwargs) -> MagicMock:
+def _make_user_mock(**kwargs: object) -> MagicMock:
     # HIGH-1 from 47-REVIEWS.md cycle 3 (codex 2026-04-25): spec=User makes
     # `isinstance(u, User)` return True so `_classify_dialog_type()` actually
     # routes through the User branch. Plain MagicMock() (the cycle-3 bug)
@@ -148,7 +160,7 @@ async def test_get_entity_info_user_type() -> None:
     ):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": 1})
     assert r["ok"] is True, f"got {r}"
-    assert r["data"]["type"] == "user"
+    assert _dict(r["data"])["type"] == "user"
 
 
 @pytest.mark.asyncio
@@ -184,8 +196,9 @@ async def test_get_entity_info_bot_type() -> None:
     ):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": 2})
     assert r["ok"] is True
-    assert r["data"]["type"] == "bot"
-    assert r["data"]["bot"] is True
+    d = _dict(r["data"])
+    assert d["type"] == "bot"
+    assert d["bot"] is True
 
 
 @pytest.mark.asyncio
@@ -221,7 +234,7 @@ async def test_get_entity_info_common_envelope_user() -> None:
     ):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": 3})
     assert r["ok"] is True
-    d = r["data"]
+    d = _dict(r["data"])
     for key in ("id", "type", "name", "username", "about", "my_membership", "avatar_history", "avatar_count"):
         assert key in d, f"missing common envelope key: {key}"
     assert d["about"] == "bio text"
@@ -260,7 +273,7 @@ async def test_get_entity_info_user_field_surface_preserved() -> None:
         patch("mcp_telegram.daemon_api.GetUserPhotosRequest"),
     ):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": 4})
-    d = r["data"]
+    d = _dict(r["data"])
     # Every field the prior user-info data dict carried — see daemon_api.py history.
     for key in (
         "first_name",
@@ -339,7 +352,7 @@ async def test_get_entity_info_no_download_keys_user() -> None:
     ):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": 5})
 
-    def _walk_keys(o):
+    def _walk_keys(o: object):
         if isinstance(o, dict):
             for k in o:
                 yield k
@@ -349,10 +362,11 @@ async def test_get_entity_info_no_download_keys_user() -> None:
                 yield from _walk_keys(it)
 
     forbidden = re.compile(r"^(file_id|file_reference|download_)")
-    bad = [k for k in _walk_keys(r["data"]) if forbidden.match(str(k))]
+    bad = [k for k in _walk_keys(_dict(r["data"])) if forbidden.match(str(k))]
     assert not bad, f"forbidden download-related keys present: {bad}"
-    assert r["data"]["avatar_history"] == [{"photo_id": 10001, "date": "2024-01-01T00:00:00"}]
-    assert r["data"]["avatar_count"] == 1
+    d = _dict(r["data"])
+    assert d["avatar_history"] == [{"photo_id": 10001, "date": "2024-01-01T00:00:00"}]
+    assert d["avatar_count"] == 1
 
 
 @pytest.mark.asyncio

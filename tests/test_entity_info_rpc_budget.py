@@ -32,12 +32,14 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from collections.abc import AsyncIterator
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from telethon.tl.types import Channel as TelethonChannel  # type: ignore[import-untyped]
 
-from mcp_telegram.daemon_api import DaemonAPIServer
+from mcp_telegram.daemon_api import DaemonAPIServer, _DaemonClientLike
 
 _TEST_DBS: list[sqlite3.Connection] = []
 
@@ -100,18 +102,18 @@ class _CountingClient:
     """
 
     def __init__(self) -> None:
-        self._get_entity_mock = AsyncMock()
+        self.get_entity = AsyncMock()
         self.call_count = 0
         self.iter_pages = 0
-        self._call_responses: list = []
+        self._call_responses: list[object] = []
         self._iter_participants_yields: list[int] = []
 
     # --- configuration helpers ---
 
-    def set_entity(self, entity) -> None:
-        self._get_entity_mock.return_value = entity
+    def set_entity(self, entity: object) -> None:
+        self.get_entity.return_value = entity
 
-    def set_call_responses(self, responses: list) -> None:
+    def set_call_responses(self, responses: list[object]) -> None:
         self._call_responses = list(responses)
 
     def set_iter_participants(self, ids: list[int]) -> None:
@@ -119,23 +121,7 @@ class _CountingClient:
 
     # --- protocol ---
 
-    @property
-    def get_entity(self) -> AsyncMock:
-        """Return the AsyncMock so that ``await client.get_entity(id)`` works.
-
-        We wrap it to count the call.
-        """
-        original = self._get_entity_mock
-
-        async def _counted(*args, **kwargs):
-            self.call_count += 1
-            return await original(*args, **kwargs)
-
-        # Return a plain coroutine function that the caller can await.
-        # Bind it as an attribute so repeated access returns the same wrapper.
-        return _counted  # type: ignore[return-value]
-
-    async def __call__(self, request):
+    async def __call__(self, request: object) -> object:
         """Count every ``await client(<Request>)`` call."""
         self.call_count += 1
         if not self._call_responses:
@@ -144,7 +130,7 @@ class _CountingClient:
             )
         return self._call_responses.pop(0)
 
-    def iter_participants(self, *args, **kwargs):
+    def iter_participants(self, *args: object, **kwargs: object) -> AsyncIterator[object]:
         """Return an async generator; count pages as ceil(yields / 200)."""
         ids = self._iter_participants_yields
         self.iter_pages = (len(ids) + 199) // 200 if ids else 0
@@ -222,13 +208,13 @@ def _empty_search() -> MagicMock:
     return s
 
 
-def _make_server(conn=None, client=None) -> DaemonAPIServer:
+def _make_server(conn: sqlite3.Connection | None = None, client: object | None = None) -> DaemonAPIServer:
     if conn is None:
         conn = _make_db()
     if client is None:
         client = MagicMock()
     shutdown_event = asyncio.Event()
-    server = DaemonAPIServer(conn, client, shutdown_event)
+    server = DaemonAPIServer(conn, cast(_DaemonClientLike, client), shutdown_event)
     server._ready = True
     return server
 

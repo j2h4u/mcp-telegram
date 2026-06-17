@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
 import time
+from collections.abc import Iterator
+from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import AsyncMock
 
 import pytest
@@ -25,6 +29,7 @@ from mcp_telegram.daemon_account_trace import (
     _build_trace_account_messages_query,
     _build_trace_coverage,
     _get_trace_coverage_fragments,
+    _LoggerLike,
     _TraceCoverageFragmentUpsertRequest,
     _TraceMessageQueryRequest,
     _upsert_trace_coverage_fragment,
@@ -47,7 +52,7 @@ from mcp_telegram.tools import TOOL_REGISTRY
 
 
 @pytest.fixture()
-def trace_server(tmp_path):
+def trace_server(tmp_path: Path) -> Iterator[tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock]]:
     conn = open_trace_db(tmp_path)
     client = AsyncMock()
     server = DaemonAPIServer(conn, client, asyncio.Event())
@@ -59,7 +64,9 @@ def trace_server(tmp_path):
 
 
 @pytest.fixture()
-def trace_service(trace_server):
+def trace_service(
+    trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
+) -> DaemonAccountTraceService:
     server, conn, client = trace_server
     return DaemonAccountTraceService(
         DaemonAccountTraceDeps(
@@ -67,10 +74,14 @@ def trace_service(trace_server):
             client=client,
             resolve_dialog_id=server._resolve_dialog_id,
             self_id=server.self_id,
-            logger=logging.getLogger("test"),
+            logger=cast(_LoggerLike, logging.getLogger("test")),
             rid=lambda: "",
         ),
     )
+
+
+def _dict(value: object) -> dict[str, object]:
+    return cast(dict[str, object], value)
 
 
 def test_trace_typed_dict_contracts_are_importable() -> None:
@@ -83,7 +94,7 @@ def test_trace_typed_dict_contracts_are_importable() -> None:
         "display_aliases": ["Alice Example", "alice"],
         "resolution_source": "entities",
     }
-    evidence: TraceEvidenceItem = make_channel_signature_evidence()  # type: ignore[assignment]
+    evidence = cast(TraceEvidenceItem, make_channel_signature_evidence())
     coverage: TraceCoverageSummary = {
         "state": "partial",
         "observed_message_count": 1,
@@ -214,7 +225,7 @@ def test_account_trace_navigation_rejects_time_bound_mismatch() -> None:
         )
 
 
-def test_trace_fragment_fixture_uses_dialog_level_topic_sentinel(tmp_path) -> None:
+def test_trace_fragment_fixture_uses_dialog_level_topic_sentinel(tmp_path: Path) -> None:
     conn = open_trace_db(tmp_path)
     try:
         seed_topic(conn, dialog_id=-100123, topic_id=1, title="General")
@@ -227,16 +238,20 @@ def test_trace_fragment_fixture_uses_dialog_level_topic_sentinel(tmp_path) -> No
         )
         conn.commit()
 
-        real_topic_ids = [
-            row[0] for row in conn.execute("SELECT topic_id FROM topic_metadata WHERE dialog_id = -100123")
-        ]
-        fragment = conn.execute(
-            """
+        topic_rows = cast(
+            list[tuple[int]], conn.execute("SELECT topic_id FROM topic_metadata WHERE dialog_id = -100123").fetchall()
+        )
+        real_topic_ids = [row[0] for row in topic_rows]
+        fragment = cast(
+            tuple[int, str, int, int] | None,
+            conn.execute(
+                """
             SELECT topic_id, status, created_at, updated_at
             FROM trace_coverage_fragments
             WHERE target_user_id = 101 AND dialog_id = -100123
             """
-        ).fetchone()
+            ).fetchone(),
+        )
 
         assert real_topic_ids == [1]
         assert 0 not in real_topic_ids
@@ -245,7 +260,10 @@ def test_trace_fragment_fixture_uses_dialog_level_topic_sentinel(tmp_path) -> No
         conn.close()
 
 
-def test_trace_coverage_counts_access_lost_as_gap(trace_server, trace_service) -> None:
+def test_trace_coverage_counts_access_lost_as_gap(
+    trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
+    trace_service: DaemonAccountTraceService,
+) -> None:
     _server, conn, _client = trace_server
     seed_synced_dialog(conn, dialog_id=-100123, status="access_lost")
     conn.commit()
@@ -258,7 +276,10 @@ def test_trace_coverage_counts_access_lost_as_gap(trace_server, trace_service) -
     assert coverage["dialogs_with_gaps"] == 1
 
 
-def test_trace_coverage_marks_fragment_and_own_only_partial(trace_server, trace_service) -> None:
+def test_trace_coverage_marks_fragment_and_own_only_partial(
+    trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
+    trace_service: DaemonAccountTraceService,
+) -> None:
     _server, conn, _client = trace_server
     seed_synced_dialog(conn, dialog_id=-100123, status="fragment")
     seed_synced_dialog(conn, dialog_id=-100124, status="own_only")
@@ -273,7 +294,10 @@ def test_trace_coverage_marks_fragment_and_own_only_partial(trace_server, trace_
     assert own_only_coverage["dialogs_considered"] == 1
 
 
-def test_trace_coverage_exact_dialog_scope_counts_only_that_dialog(trace_server, trace_service) -> None:
+def test_trace_coverage_exact_dialog_scope_counts_only_that_dialog(
+    trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
+    trace_service: DaemonAccountTraceService,
+) -> None:
     _server, conn, _client = trace_server
     seed_synced_dialog(conn, dialog_id=-100123, status="synced")
     seed_synced_dialog(conn, dialog_id=-100124, status="synced")
@@ -286,7 +310,10 @@ def test_trace_coverage_exact_dialog_scope_counts_only_that_dialog(trace_server,
     assert coverage["dialogs_considered_basis"] == "exact_dialog_scope"
 
 
-def test_trace_coverage_unscoped_zero_hit_does_not_count_every_synced_dialog(trace_server, trace_service) -> None:
+def test_trace_coverage_unscoped_zero_hit_does_not_count_every_synced_dialog(
+    trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
+    trace_service: DaemonAccountTraceService,
+) -> None:
     _server, conn, _client = trace_server
     seed_synced_dialog(conn, dialog_id=-100123, status="synced")
     seed_synced_dialog(conn, dialog_id=-100124, status="synced")
@@ -299,7 +326,10 @@ def test_trace_coverage_unscoped_zero_hit_does_not_count_every_synced_dialog(tra
     assert coverage["dialogs_considered_basis"] == "none"
 
 
-def test_trace_fragment_helpers_preserve_created_at_and_store_retry(trace_server, trace_service) -> None:
+def test_trace_fragment_helpers_preserve_created_at_and_store_retry(
+    trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
+    trace_service: DaemonAccountTraceService,
+) -> None:
     _server, conn, _client = trace_server
 
     _upsert_trace_coverage_fragment(
@@ -338,7 +368,10 @@ def test_mark_dialog_for_sync_tool_exists_for_trace_gap_action() -> None:
 
 
 @pytest.mark.asyncio
-async def test_resolve_trace_exact_account_id_from_entities(trace_server, trace_service) -> None:
+async def test_resolve_trace_exact_account_id_from_entities(
+    trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
+    trace_service: DaemonAccountTraceService,
+) -> None:
     server, conn, _client = trace_server
     seed_entity(conn, entity_id=123, name="Alice Example", username="alice")
     conn.commit()
@@ -352,7 +385,10 @@ async def test_resolve_trace_exact_account_id_from_entities(trace_server, trace_
 
 
 @pytest.mark.asyncio
-async def test_resolve_trace_unknown_numeric_does_not_call_client(trace_server, trace_service) -> None:
+async def test_resolve_trace_unknown_numeric_does_not_call_client(
+    trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
+    trace_service: DaemonAccountTraceService,
+) -> None:
     server, _conn, client = trace_server
 
     result = await trace_service._resolve_trace_account({"account": "123"})
@@ -363,7 +399,10 @@ async def test_resolve_trace_unknown_numeric_does_not_call_client(trace_server, 
 
 
 @pytest.mark.asyncio
-async def test_resolve_trace_username_local_entity_path(trace_server, trace_service) -> None:
+async def test_resolve_trace_username_local_entity_path(
+    trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
+    trace_service: DaemonAccountTraceService,
+) -> None:
     server, conn, client = trace_server
     seed_entity(conn, entity_id=123, name="Alice Example", username="alice")
     conn.commit()
@@ -377,7 +416,10 @@ async def test_resolve_trace_username_local_entity_path(trace_server, trace_serv
 
 
 @pytest.mark.asyncio
-async def test_resolve_trace_username_lookup_upserts_user(trace_server, trace_service) -> None:
+async def test_resolve_trace_username_lookup_upserts_user(
+    trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
+    trace_service: DaemonAccountTraceService,
+) -> None:
     server, conn, client = trace_server
     client.return_value = SimpleNamespace(
         users=[
@@ -397,12 +439,18 @@ async def test_resolve_trace_username_lookup_upserts_user(trace_server, trace_se
     assert result["account_id"] == 123
     assert result["resolution_source"] == "telegram_username_lookup"
     assert client.await_count == 1
-    row = conn.execute("SELECT id, name, username FROM entities WHERE id = 123").fetchone()
+    row = cast(
+        tuple[int, str, str] | None, conn.execute("SELECT id, name, username FROM entities WHERE id = 123").fetchone()
+    )
+    assert row is not None
     assert tuple(row) == (123, "Alice Example", "alice")
 
 
 @pytest.mark.asyncio
-async def test_resolve_trace_username_lookup_failure_is_structured(trace_server, trace_service) -> None:
+async def test_resolve_trace_username_lookup_failure_is_structured(
+    trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
+    trace_service: DaemonAccountTraceService,
+) -> None:
     server, _conn, client = trace_server
     client.side_effect = RuntimeError("not visible")
 
@@ -414,7 +462,10 @@ async def test_resolve_trace_username_lookup_failure_is_structured(trace_server,
 
 
 @pytest.mark.asyncio
-async def test_resolve_trace_fuzzy_ambiguous_returns_candidate_ids(trace_server, trace_service) -> None:
+async def test_resolve_trace_fuzzy_ambiguous_returns_candidate_ids(
+    trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
+    trace_service: DaemonAccountTraceService,
+) -> None:
     server, conn, _client = trace_server
     now = int(time.time())
     seed_entity(conn, entity_id=123, name="Alex One", username="alex1", updated_at=now)
@@ -429,30 +480,39 @@ async def test_resolve_trace_fuzzy_ambiguous_returns_candidate_ids(trace_server,
 
 
 @pytest.mark.asyncio
-async def test_trace_unresolved_account_returns_structured_gap(trace_server, trace_service) -> None:
+async def test_trace_unresolved_account_returns_structured_gap(
+    trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
+    trace_service: DaemonAccountTraceService,
+) -> None:
     server, _conn, _client = trace_server
 
-    result = await trace_service._trace_account_messages({"account": "123"})
+    result = _dict(await trace_service._trace_account_messages({"account": "123"}))
+    data = _dict(result["data"])
 
     assert result["ok"] is True
-    assert result["data"]["gaps"][0]["kind"] == "account_unresolved"
-    assert result["data"]["provenance"]["query_basis"] == "effective_sender_id_or_post_author_signature"
+    assert cast(list[dict[str, object]], data["gaps"])[0]["kind"] == "account_unresolved"
+    assert _dict(data["provenance"])["query_basis"] == "effective_sender_id_or_post_author_signature"
 
 
 @pytest.mark.asyncio
-async def test_trace_ambiguous_account_gap_has_candidate_ids(trace_server, trace_service) -> None:
+async def test_trace_ambiguous_account_gap_has_candidate_ids(
+    trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
+    trace_service: DaemonAccountTraceService,
+) -> None:
     server, conn, _client = trace_server
     now = int(time.time())
     seed_entity(conn, entity_id=123, name="Alex One", username="alex1", updated_at=now)
     seed_entity(conn, entity_id=124, name="Alex Two", username="alex2", updated_at=now)
     conn.commit()
 
-    result = await trace_service._trace_account_messages({"account": "Alex"})
+    result = _dict(await trace_service._trace_account_messages({"account": "Alex"}))
+    data = _dict(result["data"])
 
-    gap = result["data"]["gaps"][0]
+    gap = cast(dict[str, object], cast(list[dict[str, object]], data["gaps"])[0])
     assert gap["kind"] == "account_ambiguous"
-    assert gap["next_action"]["argument"] == "exact_account_id"
-    assert set(gap["next_action"]["candidate_ids"]) == {123, 124}
+    next_action = cast(dict[str, object], gap["next_action"])
+    assert next_action["argument"] == "exact_account_id"
+    assert set(cast(list[int], next_action["candidate_ids"])) == {123, 124}
 
 
 def test_trace_query_uses_effective_sender_topic_and_signature_params() -> None:
@@ -485,19 +545,26 @@ def test_trace_query_uses_effective_sender_topic_and_signature_params() -> None:
 
 
 @pytest.mark.asyncio
-async def test_dispatch_routes_trace_account_messages(trace_server, trace_service) -> None:
+async def test_dispatch_routes_trace_account_messages(
+    trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
+    trace_service: DaemonAccountTraceService,
+) -> None:
     server, conn, _client = trace_server
     seed_entity(conn, entity_id=101, name="Me", username="me")
     conn.commit()
 
-    result = await server._dispatch({"method": "trace_account_messages", "exact_account_id": 101})
+    result = _dict(await server._dispatch({"method": "trace_account_messages", "exact_account_id": 101}))
+    data = _dict(result["data"])
 
     assert result["ok"] is True
-    assert result["data"]["resolved_account"]["account_id"] == 101
+    assert _dict(data["resolved_account"])["account_id"] == 101
 
 
 @pytest.mark.asyncio
-async def test_trace_includes_outgoing_dm_effective_sender(trace_server, trace_service) -> None:
+async def test_trace_includes_outgoing_dm_effective_sender(
+    trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
+    trace_service: DaemonAccountTraceService,
+) -> None:
     server, conn, _client = trace_server
     seed_entity(conn, entity_id=101, name="Me", username="me")
     seed_dialog(conn, dialog_id=222, name="Alice", dialog_type="User")
@@ -513,16 +580,20 @@ async def test_trace_includes_outgoing_dm_effective_sender(trace_server, trace_s
     )
     conn.commit()
 
-    result = await trace_service._trace_account_messages({"exact_account_id": 101, "limit": 10})
+    result = _dict(await trace_service._trace_account_messages({"exact_account_id": 101, "limit": 10}))
+    data = _dict(result["data"])
 
-    evidence = result["data"]["groups"][0]["evidence"]
+    evidence = cast(list[dict[str, object]], cast(list[dict[str, object]], data["groups"])[0]["evidence"])
     assert evidence[0]["message_id"] == 10
     assert evidence[0]["effective_sender_id"] == 101
     assert evidence[0]["authorship_basis"] == "effective_sender_id"
 
 
 @pytest.mark.asyncio
-async def test_trace_includes_channel_signature_without_numeric_identity_claim(trace_server, trace_service) -> None:
+async def test_trace_includes_channel_signature_without_numeric_identity_claim(
+    trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
+    trace_service: DaemonAccountTraceService,
+) -> None:
     server, conn, _client = trace_server
     seed_entity(conn, entity_id=101, name="Alice Example", username="alice")
     seed_dialog(conn, dialog_id=-100123, name="Channel", dialog_type="Channel")
@@ -536,62 +607,80 @@ async def test_trace_includes_channel_signature_without_numeric_identity_claim(t
     )
     conn.commit()
 
-    result = await trace_service._trace_account_messages({"exact_account_id": 101, "limit": 10})
+    result = _dict(await trace_service._trace_account_messages({"exact_account_id": 101, "limit": 10}))
+    data = _dict(result["data"])
 
-    evidence = result["data"]["groups"][0]["evidence"]
+    evidence = cast(list[dict[str, object]], cast(list[dict[str, object]], data["groups"])[0]["evidence"])
     assert evidence[0]["message_id"] == 42
     assert evidence[0]["authorship_basis"] == "post_author_signature"
     assert evidence[0]["effective_sender_id"] == -100123
     assert evidence[0]["author_signature"] == "Alice Example"
-    assert any(gap["kind"] == "channel_signature_ambiguous" for gap in result["data"]["gaps"])
+    assert any(gap["kind"] == "channel_signature_ambiguous" for gap in cast(list[dict[str, object]], data["gaps"]))
 
 
 @pytest.mark.asyncio
-async def test_trace_access_lost_dialog_gap_has_no_sync_action(trace_server, trace_service) -> None:
+async def test_trace_access_lost_dialog_gap_has_no_sync_action(
+    trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
+    trace_service: DaemonAccountTraceService,
+) -> None:
     server, conn, _client = trace_server
     seed_entity(conn, entity_id=101, name="Me", username="me")
     seed_synced_dialog(conn, dialog_id=-100123, status="access_lost")
     conn.commit()
 
-    result = await trace_service._trace_account_messages({"exact_account_id": 101, "exact_dialog_id": -100123})
+    result = _dict(await trace_service._trace_account_messages({"exact_account_id": 101, "exact_dialog_id": -100123}))
+    data = _dict(result["data"])
 
-    gaps = result["data"]["gaps"]
+    gaps = cast(list[dict[str, object]], data["gaps"])
     access_lost = next(gap for gap in gaps if gap["kind"] == "access_lost")
     assert access_lost["severity"] == "warning"
     assert "action" not in access_lost
 
 
 @pytest.mark.asyncio
-async def test_trace_not_synced_dialog_gap_includes_sync_action(trace_server, trace_service) -> None:
+async def test_trace_not_synced_dialog_gap_includes_sync_action(
+    trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
+    trace_service: DaemonAccountTraceService,
+) -> None:
     server, conn, _client = trace_server
     seed_entity(conn, entity_id=101, name="Me", username="me")
     conn.commit()
 
-    result = await trace_service._trace_account_messages({"exact_account_id": 101, "exact_dialog_id": -100123})
-
-    gap = next(item for item in result["data"]["gaps"] if item["kind"] == "dialog_not_synced")
+    result = _dict(await trace_service._trace_account_messages({"exact_account_id": 101, "exact_dialog_id": -100123}))
+    data = _dict(result["data"])
+    gap = next(item for item in cast(list[dict[str, object]], data["gaps"]) if item["kind"] == "dialog_not_synced")
     assert gap["severity"] == "action_required"
-    assert gap["action"]["tool"] == "mark_dialog_for_sync"
-    assert gap["action"]["arguments"] == {"dialog_id": -100123}
+    action = cast(dict[str, object], gap["action"])
+    assert action["tool"] == "mark_dialog_for_sync"
+    assert action["arguments"] == {"dialog_id": -100123}
 
 
 @pytest.mark.asyncio
-async def test_trace_zero_hit_resolved_account_returns_observed_zero_gap(trace_server, trace_service) -> None:
+async def test_trace_zero_hit_resolved_account_returns_observed_zero_gap(
+    trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
+    trace_service: DaemonAccountTraceService,
+) -> None:
     server, conn, _client = trace_server
     seed_entity(conn, entity_id=101, name="Me", username="me")
     conn.commit()
 
-    result = await trace_service._trace_account_messages({"exact_account_id": 101})
+    result = _dict(await trace_service._trace_account_messages({"exact_account_id": 101}))
+    data = _dict(result["data"])
+    coverage = _dict(data["coverage"])
 
     assert result["ok"] is True
-    assert result["data"]["coverage"]["state"] == "unknown"
-    assert result["data"]["coverage"]["observed_message_count"] == 0
-    assert result["data"]["gaps"][0]["kind"] == "observed_zero"
-    assert result["data"]["gaps"][0]["severity"] == "info"
+    assert coverage["state"] == "unknown"
+    assert coverage["observed_message_count"] == 0
+    gaps = cast(list[dict[str, object]], data["gaps"])
+    assert gaps[0]["kind"] == "observed_zero"
+    assert gaps[0]["severity"] == "info"
 
 
 @pytest.mark.asyncio
-async def test_trace_provenance_includes_basis_counts_and_coverage_bounds(trace_server, trace_service) -> None:
+async def test_trace_provenance_includes_basis_counts_and_coverage_bounds(
+    trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
+    trace_service: DaemonAccountTraceService,
+) -> None:
     server, conn, _client = trace_server
     seed_entity(conn, entity_id=101, name="Me", username="me")
     seed_dialog(conn, dialog_id=222, name="Alice", dialog_type="User")
@@ -599,18 +688,21 @@ async def test_trace_provenance_includes_basis_counts_and_coverage_bounds(trace_
     seed_message(conn, dialog_id=222, message_id=1, sent_at=1, sender_id=101)
     conn.commit()
 
-    result = await trace_service._trace_account_messages({"exact_account_id": 101, "exact_dialog_id": 222})
-
-    provenance = result["data"]["provenance"]
+    result = _dict(await trace_service._trace_account_messages({"exact_account_id": 101, "exact_dialog_id": 222}))
+    data = _dict(result["data"])
+    provenance = _dict(data["provenance"])
     assert provenance["query_basis"] == "effective_sender_id_or_post_author_signature"
     assert provenance["authorship_basis_counts"] == {"effective_sender_id": 1}
     assert provenance["dialogs_considered_basis"] == "exact_dialog_scope"
     assert provenance["local_cache_writes"] == 0
-    assert provenance["coverage_bounds"]["exact_dialog_id"] == 222
+    assert _dict(provenance["coverage_bounds"])["exact_dialog_id"] == 222
 
 
 @pytest.mark.asyncio
-async def test_trace_exact_topic_scope_filters_rows(trace_server, trace_service) -> None:
+async def test_trace_exact_topic_scope_filters_rows(
+    trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
+    trace_service: DaemonAccountTraceService,
+) -> None:
     server, conn, _client = trace_server
     seed_entity(conn, entity_id=101, name="Me", username="me")
     seed_dialog(conn, dialog_id=-100222, name="Forum", dialog_type="Forum")
@@ -635,32 +727,41 @@ async def test_trace_exact_topic_scope_filters_rows(trace_server, trace_service)
     )
     conn.commit()
 
-    result = await trace_service._trace_account_messages(
-        {"exact_account_id": 101, "exact_dialog_id": -100222, "exact_topic_id": 5}
+    result = _dict(
+        await trace_service._trace_account_messages(
+            {"exact_account_id": 101, "exact_dialog_id": -100222, "exact_topic_id": 5}
+        )
     )
-
-    evidence = result["data"]["groups"][0]["evidence"]
+    data = _dict(result["data"])
+    evidence = cast(list[dict[str, object]], cast(list[dict[str, object]], data["groups"])[0]["evidence"])
     assert [item["message_id"] for item in evidence] == [50]
     assert evidence[0]["topic_id"] == 5
     assert evidence[0]["topic_title"] == "Five"
 
 
 @pytest.mark.asyncio
-async def test_trace_excludes_service_rows(trace_server, trace_service) -> None:
+async def test_trace_excludes_service_rows(
+    trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
+    trace_service: DaemonAccountTraceService,
+) -> None:
     server, conn, _client = trace_server
     seed_entity(conn, entity_id=101, name="Me", username="me")
     seed_dialog(conn, dialog_id=222, name="Alice", dialog_type="User")
     seed_message(conn, dialog_id=222, message_id=1, sent_at=1, sender_id=101, is_service=1)
     conn.commit()
 
-    result = await trace_service._trace_account_messages({"exact_account_id": 101})
+    result = _dict(await trace_service._trace_account_messages({"exact_account_id": 101}))
+    data = _dict(result["data"])
 
-    assert result["data"]["groups"] == []
-    assert result["data"]["next_navigation"] is None
+    assert data["groups"] == []
+    assert data["next_navigation"] is None
 
 
 @pytest.mark.asyncio
-async def test_trace_dialog_grouping_uses_current_page_and_topic_key(trace_server, trace_service) -> None:
+async def test_trace_dialog_grouping_uses_current_page_and_topic_key(
+    trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
+    trace_service: DaemonAccountTraceService,
+) -> None:
     server, conn, _client = trace_server
     seed_entity(conn, entity_id=101, name="Me", username="me")
     seed_dialog(conn, dialog_id=-100222, name="Forum", dialog_type="Forum")
@@ -669,23 +770,31 @@ async def test_trace_dialog_grouping_uses_current_page_and_topic_key(trace_serve
     seed_message(conn, dialog_id=-100222, message_id=2, sent_at=2, sender_id=101, forum_topic_id=5)
     conn.commit()
 
-    result = await trace_service._trace_account_messages({"exact_account_id": 101, "group_by": "dialog", "limit": 1})
-
-    groups = result["data"]["groups"]
+    result = _dict(
+        await trace_service._trace_account_messages({"exact_account_id": 101, "group_by": "dialog", "limit": 1})
+    )
+    data = _dict(result["data"])
+    groups = cast(list[dict[str, object]], data["groups"])
     assert len(groups) == 1
     assert groups[0]["group_key"] == "dialog:-100222:topic:5"
-    assert [item["message_id"] for item in groups[0]["evidence"]] == [2]
-    assert result["data"]["next_navigation"] is not None
+    evidence = cast(list[dict[str, object]], groups[0]["evidence"])
+    assert [item["message_id"] for item in evidence] == [2]
+    assert data["next_navigation"] is not None
 
 
 @pytest.mark.asyncio
-async def test_trace_exact_limit_without_extra_row_has_no_next_navigation(trace_server, trace_service) -> None:
+async def test_trace_exact_limit_without_extra_row_has_no_next_navigation(
+    trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
+    trace_service: DaemonAccountTraceService,
+) -> None:
     server, conn, _client = trace_server
     seed_entity(conn, entity_id=101, name="Me", username="me")
     seed_message(conn, dialog_id=222, message_id=1, sent_at=1, sender_id=101)
     conn.commit()
 
-    result = await trace_service._trace_account_messages({"exact_account_id": 101, "limit": 1})
+    result = _dict(await trace_service._trace_account_messages({"exact_account_id": 101, "limit": 1}))
+    data = _dict(result["data"])
+    coverage = _dict(data["coverage"])
 
-    assert result["data"]["coverage"]["observed_message_count"] == 1
-    assert result["data"]["next_navigation"] is None
+    assert coverage["observed_message_count"] == 1
+    assert data["next_navigation"] is None

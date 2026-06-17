@@ -11,13 +11,18 @@ from __future__ import annotations
 import asyncio
 import re
 import sqlite3
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from mcp_telegram.daemon_api import DaemonAPIServer
+from mcp_telegram.daemon_api import DaemonAPIServer, _DaemonClientLike
 
 _TEST_DBS: list[sqlite3.Connection] = []
+
+
+def _dict(value: object) -> dict[str, object]:
+    return cast(dict[str, object], value)
 
 
 @pytest.fixture(autouse=True)
@@ -68,18 +73,18 @@ def _make_db() -> sqlite3.Connection:
     return conn
 
 
-def make_server(conn=None, client=None) -> DaemonAPIServer:
+def make_server(conn: sqlite3.Connection | None = None, client: _DaemonClientLike | None = None) -> DaemonAPIServer:
     if conn is None:
         conn = _make_db()
     if client is None:
         client = MagicMock()
     shutdown_event = asyncio.Event()
-    server = DaemonAPIServer(conn, client, shutdown_event)
+    server = DaemonAPIServer(conn, cast(_DaemonClientLike, client), shutdown_event)
     server._ready = True
     return server
 
 
-def _legacy_chat(id_=-12345, **kwargs):
+def _legacy_chat(id_: int = -12345, **kwargs: object) -> MagicMock:
     from telethon.tl.types import Chat as TelethonChat  # type: ignore[import-untyped]
 
     c = MagicMock(spec=TelethonChat)
@@ -94,7 +99,11 @@ def _legacy_chat(id_=-12345, **kwargs):
     return c
 
 
-def _full_chat_result(participant_user_ids=(), invite_link=None, about=None):
+def _full_chat_result(
+    participant_user_ids: tuple[int, ...] = (),
+    invite_link: str | None = None,
+    about: str | None = None,
+) -> MagicMock:
     full = MagicMock()
     ps = []
     for uid in participant_user_ids:
@@ -112,7 +121,7 @@ def _full_chat_result(participant_user_ids=(), invite_link=None, about=None):
     return full
 
 
-def _empty_search():
+def _empty_search() -> MagicMock:
     return MagicMock(count=0, messages=[])
 
 
@@ -135,7 +144,7 @@ async def test_get_entity_info_group_type() -> None:
         ):
             r = await server._dispatch({"method": "get_entity_info", "entity_id": -100})
     assert r["ok"] is True, r
-    assert r["data"]["type"] == "group"
+    assert _dict(r["data"])["type"] == "group"
 
 
 @pytest.mark.asyncio
@@ -158,7 +167,7 @@ async def test_get_entity_info_group_field_surface() -> None:
             patch("mcp_telegram.daemon_api.MessagesSearchRequest"),
         ):
             r = await server._dispatch({"method": "get_entity_info", "entity_id": -101})
-    d = r["data"]
+    d = _dict(r["data"])
     for key in ("members_count", "migrated_to", "invite_link", "contacts_subscribed"):
         assert key in d, f"missing group key: {key}"
     assert d["members_count"] == 3
@@ -195,8 +204,9 @@ async def test_get_entity_info_group_dm_intersection() -> None:
             patch("mcp_telegram.daemon_api.MessagesSearchRequest"),
         ):
             r = await server._dispatch({"method": "get_entity_info", "entity_id": -102})
-    d = r["data"]
-    ids = {entry["id"] for entry in d["contacts_subscribed"]}
+    d = _dict(r["data"])
+    contacts = cast(list[dict[str, object]], d["contacts_subscribed"])
+    ids = {entry["id"] for entry in contacts}
     assert ids == {1, 3}
     assert d["contacts_subscribed_partial"] is False
 
@@ -215,7 +225,7 @@ async def test_get_entity_info_group_migrated_to_verbatim() -> None:
     chat = _legacy_chat(id_=-103, migrated_to=migrated)
 
     # get_peer_id needs to return -103 for the chat and -100200500 for the migrated InputChannel
-    def fake_get_peer_id(e):
+    def fake_get_peer_id(e: object) -> int:
         if e is chat:
             return -103
         if e is migrated:
@@ -235,8 +245,9 @@ async def test_get_entity_info_group_migrated_to_verbatim() -> None:
             patch("mcp_telegram.daemon_api.MessagesSearchRequest"),
         ):
             r = await server._dispatch({"method": "get_entity_info", "entity_id": -103})
-    assert r["data"]["type"] == "group"
-    assert r["data"]["migrated_to"] == -1002005000000
+    d = _dict(r["data"])
+    assert d["type"] == "group"
+    assert d["migrated_to"] == -1002005000000
     # SPEC Req 12 + RESEARCH: no auto-follow code path. Verify by source-grep:
     import inspect
 
@@ -267,7 +278,7 @@ async def test_get_entity_info_no_download_keys_group() -> None:
         ):
             r = await server._dispatch({"method": "get_entity_info", "entity_id": -104})
 
-    def _walk(o):
+    def _walk(o: object):
         if isinstance(o, dict):
             for k in o:
                 yield k
@@ -277,5 +288,5 @@ async def test_get_entity_info_no_download_keys_group() -> None:
                 yield from _walk(it)
 
     forbidden = re.compile(r"^(file_id|file_reference|download_)")
-    bad = [k for k in _walk(r["data"]) if forbidden.match(str(k))]
+    bad = [k for k in _walk(_dict(r["data"])) if forbidden.match(str(k))]
     assert not bad

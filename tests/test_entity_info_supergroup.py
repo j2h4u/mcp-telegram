@@ -11,13 +11,25 @@ from __future__ import annotations
 import asyncio
 import re
 import sqlite3
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from mcp_telegram.daemon_api import DaemonAPIServer
+from mcp_telegram.daemon_api import DaemonAPIServer, _DaemonClientLike
 
 _TEST_DBS: list[sqlite3.Connection] = []
+
+
+def _dict(value: object) -> dict[str, object]:
+    return cast(dict[str, object], value)
+
+
+def _dict_at(value: object, *keys: str) -> dict[str, object]:
+    current = _dict(value)
+    for key in keys:
+        current = _dict(current[key])
+    return current
 
 
 @pytest.fixture(autouse=True)
@@ -66,18 +78,18 @@ def _make_db() -> sqlite3.Connection:
     return conn
 
 
-def make_server(conn=None, client=None) -> DaemonAPIServer:
+def make_server(conn: sqlite3.Connection | None = None, client: _DaemonClientLike | None = None) -> DaemonAPIServer:
     if conn is None:
         conn = _make_db()
     if client is None:
         client = MagicMock()
     shutdown_event = asyncio.Event()
-    server = DaemonAPIServer(conn, client, shutdown_event)
+    server = DaemonAPIServer(conn, cast(_DaemonClientLike, client), shutdown_event)
     server._ready = True
     return server
 
 
-def _supergroup(id_=-1001, **kwargs):
+def _supergroup(id_: int = -1001, **kwargs: object) -> MagicMock:
     from telethon.tl.types import Channel as TelethonChannel  # type: ignore[import-untyped]
 
     c = MagicMock(spec=TelethonChannel)
@@ -96,7 +108,7 @@ def _supergroup(id_=-1001, **kwargs):
     return c
 
 
-def _full_supergroup(**kwargs):
+def _full_supergroup(**kwargs: object) -> MagicMock:
     from telethon.tl.types import ChatReactionsNone  # type: ignore[import-untyped]
 
     full = MagicMock()
@@ -122,7 +134,7 @@ async def test_get_entity_info_supergroup_type() -> None:
     client = AsyncMock()
     client.get_entity = AsyncMock(return_value=sg)
 
-    async def empty_iter(*args, **kwargs):
+    async def empty_iter(*args: object, **kwargs: object):
         if False:
             yield None  # make this a generator
 
@@ -132,7 +144,7 @@ async def test_get_entity_info_supergroup_type() -> None:
     with patch("mcp_telegram.daemon_api.GetFullChannelRequest"), patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": -1001})
     assert r["ok"] is True, r
-    assert r["data"]["type"] == "supergroup"
+    assert _dict(r["data"])["type"] == "supergroup"
 
 
 @pytest.mark.asyncio
@@ -142,7 +154,7 @@ async def test_get_entity_info_supergroup_field_surface() -> None:
     client = AsyncMock()
     client.get_entity = AsyncMock(return_value=sg)
 
-    async def empty_iter(*args, **kwargs):
+    async def empty_iter(*args: object, **kwargs: object):
         if False:
             yield None
 
@@ -154,7 +166,7 @@ async def test_get_entity_info_supergroup_field_surface() -> None:
     server = make_server(client=client)
     with patch("mcp_telegram.daemon_api.GetFullChannelRequest"), patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": -1002})
-    d = r["data"]
+    d = _dict(r["data"])
     for key in (
         "members_count",
         "linked_broadcast_id",
@@ -188,7 +200,7 @@ async def test_get_entity_info_forum_supergroup_has_topics() -> None:
     client = AsyncMock()
     client.get_entity = AsyncMock(return_value=sg)
 
-    async def empty_iter(*args, **kwargs):
+    async def empty_iter(*args: object, **kwargs: object):
         if False:
             yield None
 
@@ -198,8 +210,8 @@ async def test_get_entity_info_forum_supergroup_has_topics() -> None:
     with patch("mcp_telegram.daemon_api.GetFullChannelRequest"), patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": -1003})
     assert r["ok"] is True
-    assert r["data"]["type"] == "supergroup"
-    assert r["data"]["has_topics"] is True
+    assert _dict(r["data"])["type"] == "supergroup"
+    assert _dict(r["data"])["has_topics"] is True
 
 
 @pytest.mark.asyncio
@@ -222,7 +234,7 @@ async def test_get_entity_info_supergroup_small_enumerates_dm_intersection() -> 
 
     sg = _supergroup(id_=-1004, creator=True)  # creator → is_admin=True
 
-    async def iter_three(*args, **kwargs):
+    async def iter_three(*args: object, **kwargs: object):
         for pid in (10, 20, 30):
             p = MagicMock()
             p.id = pid
@@ -235,12 +247,13 @@ async def test_get_entity_info_supergroup_small_enumerates_dm_intersection() -> 
     server = make_server(conn=conn, client=client)
     with patch("mcp_telegram.daemon_api.GetFullChannelRequest"), patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": -1004})
-    d = r["data"]
+    d = _dict(r["data"])
     assert d["contacts_subscribed_partial"] is False
-    ids = {entry["id"] for entry in d["contacts_subscribed"]}
+    contacts = cast(list[dict[str, object]], d["contacts_subscribed"])
+    ids = {entry["id"] for entry in contacts}
     assert ids == {10, 30}, f"expected {{10,30}}, got {ids}"
     # Names enriched from entities table
-    names = {entry["id"]: entry["name"] for entry in d["contacts_subscribed"]}
+    names = {entry["id"]: entry["name"] for entry in contacts}
     assert names == {10: "Alice", 30: "Charlie"}
 
 
@@ -281,10 +294,11 @@ async def test_get_entity_info_supergroup_large_uses_contact_filter() -> None:
         patch("mcp_telegram.daemon_api.MessagesSearchRequest"),
     ):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": -1005})
-    d = r["data"]
+    d = _dict(r["data"])
     assert d["contacts_subscribed_partial"] is True
     assert d["contacts_reason"] == "too_large"
-    ids = {entry["id"] for entry in d["contacts_subscribed"]}
+    contacts = cast(list[dict[str, object]], d["contacts_subscribed"])
+    ids = {entry["id"] for entry in contacts}
     assert ids == {50, 60}
 
 
@@ -295,7 +309,7 @@ async def test_get_entity_info_supergroup_hidden_members_null() -> None:
     client = AsyncMock()
     client.get_entity = AsyncMock(return_value=sg)
 
-    async def must_not_iter(*args, **kwargs):
+    async def must_not_iter(*args: object, **kwargs: object):
         raise AssertionError("must not enumerate when hidden_members and non-admin")
 
     client.iter_participants = MagicMock(side_effect=must_not_iter)
@@ -304,8 +318,9 @@ async def test_get_entity_info_supergroup_hidden_members_null() -> None:
     with patch("mcp_telegram.daemon_api.GetFullChannelRequest"), patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": -1006})
     assert r["ok"]
-    assert r["data"]["contacts_subscribed"] is None
-    assert r["data"]["contacts_reason"] == "hidden_by_admin"
+    d = _dict(r["data"])
+    assert d["contacts_subscribed"] is None
+    assert d["contacts_reason"] == "hidden_by_admin"
 
 
 @pytest.mark.asyncio
@@ -323,7 +338,7 @@ async def test_get_entity_info_supergroup_chat_admin_required_treated_as_hidden(
     client = AsyncMock()
     client.get_entity = AsyncMock(return_value=sg)
 
-    async def raise_admin_required(*args, **kwargs):
+    async def raise_admin_required(*args: object, **kwargs: object):
         raise ChatAdminRequiredError(request=None)
         yield None  # pragma: no cover — make this an async generator
 
@@ -333,8 +348,9 @@ async def test_get_entity_info_supergroup_chat_admin_required_treated_as_hidden(
     with patch("mcp_telegram.daemon_api.GetFullChannelRequest"), patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": -1011})
     assert r["ok"]
-    assert r["data"]["contacts_subscribed"] is None
-    assert r["data"]["contacts_reason"] == "hidden_by_admin"
+    d = _dict(r["data"])
+    assert d["contacts_subscribed"] is None
+    assert d["contacts_reason"] == "hidden_by_admin"
 
 
 @pytest.mark.asyncio
@@ -344,7 +360,7 @@ async def test_get_entity_info_no_download_keys_supergroup() -> None:
     client = AsyncMock()
     client.get_entity = AsyncMock(return_value=sg)
 
-    async def empty_iter(*args, **kwargs):
+    async def empty_iter(*args: object, **kwargs: object):
         if False:
             yield None
 
@@ -354,7 +370,7 @@ async def test_get_entity_info_no_download_keys_supergroup() -> None:
     with patch("mcp_telegram.daemon_api.GetFullChannelRequest"), patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": -1007})
 
-    def _walk(o):
+    def _walk(o: object):
         if isinstance(o, dict):
             for k in o:
                 yield k
@@ -364,5 +380,5 @@ async def test_get_entity_info_no_download_keys_supergroup() -> None:
                 yield from _walk(it)
 
     forbidden = re.compile(r"^(file_id|file_reference|download_)")
-    bad = [k for k in _walk(r["data"]) if forbidden.match(str(k))]
+    bad = [k for k in _walk(_dict(r["data"])) if forbidden.match(str(k))]
     assert not bad

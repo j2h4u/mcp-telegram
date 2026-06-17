@@ -7,6 +7,7 @@ envelope), 4-7 (per-type fields), and end-to-end resolver behavior.
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from typing import Protocol, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -14,7 +15,11 @@ import pytest
 from mcp_telegram.tools.entity_info import GetEntityInfo, get_entity_info
 
 
-def _resolve_ok(entity_id=42, display_name="Alice"):
+class _TextContent(Protocol):
+    text: str
+
+
+def _resolve_ok(entity_id: int = 42, display_name: str = "Alice") -> dict[str, object]:
     return {
         "ok": True,
         "data": {
@@ -25,7 +30,7 @@ def _resolve_ok(entity_id=42, display_name="Alice"):
     }
 
 
-def _patch_daemon(resolve_response, get_entity_info_response):
+def _patch_daemon(resolve_response: dict[str, object], get_entity_info_response: dict[str, object]):
     """Patch daemon_connection so the tool sees scripted responses."""
     conn1 = MagicMock()
     conn1.resolve_entity = AsyncMock(return_value=resolve_response)
@@ -42,6 +47,21 @@ def _patch_daemon(resolve_response, get_entity_info_response):
             raise AssertionError("more daemon_connection calls than scripted") from None
 
     return patch("mcp_telegram.tools.entity_info.daemon_connection", fake_daemon_connection)
+
+
+def _dict(value: object) -> dict[str, object]:
+    return cast(dict[str, object], value)
+
+
+def _dict_at(value: object, *keys: str) -> dict[str, object]:
+    current = _dict(value)
+    for key in keys:
+        current = _dict(current[key])
+    return current
+
+
+def _list(value: object) -> list[object]:
+    return cast(list[object], value)
 
 
 @pytest.mark.asyncio
@@ -93,31 +113,32 @@ async def test_get_entity_info_user_renders() -> None:
     with _patch_daemon(_resolve_ok(42, "Alice Smith"), get_resp):
         result = await get_entity_info(GetEntityInfo(entity="Alice"))
     assert result.content == ()
-    payload = result.structured_content
+    payload = _dict(result.structured_content)
     assert payload is not None
     assert payload["type"] == "user"
-    assert payload["resolved_query"] == {
+    assert _dict_at(payload, "resolved_query") == {
         "input": "Alice",
         "resolution": "resolver_match",
         "entity_id": 42,
         "display_name": "Alice Smith",
     }
-    assert payload["common"]["about"]["content"] == {
+    assert _dict_at(payload, "common", "about", "content") == {
         "text": "QA engineer",
         "is_telegram_content": True,
         "content_kind": "about",
     }
-    assert payload["type_specific"]["kind"] == "user"
-    assert payload["type_specific"]["identity"]["first_name"] == "Alice"
-    assert payload["type_specific"]["identity"]["personal_channel_id"] is None
-    assert payload["type_specific"]["phone"] == {
+    assert _dict_at(payload, "type_specific")["kind"] == "user"
+    assert _dict_at(payload, "type_specific", "identity")["first_name"] == "Alice"
+    assert _dict_at(payload, "type_specific", "identity")["personal_channel_id"] is None
+    assert _dict_at(payload, "type_specific", "phone") == {
         "value": "+12025551234",
         "country": "US",
         "visibility": "visible_to_operator",
     }
-    assert payload["type_specific"]["bot_info"] is None
-    assert payload["privacy_or_access"]["phone"]["visibility"] == "visible_to_operator"
-    assert payload["content_fields"][0]["untrusted_content"] is True
+    assert _dict_at(payload, "type_specific")["bot_info"] is None
+    assert _dict_at(payload, "privacy_or_access", "phone")["visibility"] == "visible_to_operator"
+    content_fields = cast(list[dict[str, object]], payload["content_fields"])
+    assert content_fields[0]["untrusted_content"] is True
 
 
 @pytest.mark.asyncio
@@ -174,17 +195,18 @@ async def test_get_entity_info_bot_renders_type_bot() -> None:
     with _patch_daemon(_resolve_ok(1, "MyBot"), get_resp):
         result = await get_entity_info(GetEntityInfo(entity="MyBot"))
     assert result.content == ()
-    payload = result.structured_content
+    payload = _dict(result.structured_content)
     assert payload is not None
     assert payload["type"] == "bot"
-    assert payload["type_specific"]["kind"] == "bot"
-    assert payload["type_specific"]["flags"]["bot"] is True
-    assert payload["type_specific"]["bot_info"]["description_content"]["content"] == {
+    assert _dict_at(payload, "type_specific")["kind"] == "bot"
+    assert _dict_at(payload, "type_specific", "flags")["bot"] is True
+    assert _dict_at(payload, "type_specific", "bot_info", "description_content", "content") == {
         "text": "A test bot",
         "is_telegram_content": True,
         "content_kind": "bot_description",
     }
-    assert payload["type_specific"]["bot_info"]["commands"][0]["description_content"]["content"] == {
+    commands = cast(list[dict[str, object]], _dict_at(payload, "type_specific", "bot_info")["commands"])
+    assert _dict_at(commands[0], "description_content", "content") == {
         "text": "Start",
         "is_telegram_content": True,
         "content_kind": "bot_command_description",
@@ -218,23 +240,24 @@ async def test_get_entity_info_channel_renders() -> None:
     with _patch_daemon(_resolve_ok(-1001, "News"), get_resp):
         result = await get_entity_info(GetEntityInfo(entity="News"))
     assert result.content == ()
-    payload = result.structured_content
+    payload = _dict(result.structured_content)
     assert payload is not None
     assert payload["type"] == "channel"
-    assert payload["common"]["about"]["content"]["content_kind"] == "about"
-    assert payload["type_specific"]["classification"] == {"broadcast": True, "megagroup": False}
-    assert payload["type_specific"]["subscribers_count"] == 12345
-    assert payload["type_specific"]["pinned_msg_id"] == 999
-    assert payload["type_specific"]["slow_mode_seconds"] == 30
-    assert payload["type_specific"]["available_reactions"] == {"kind": "some", "emojis": ["👍", "❤"]}
-    assert payload["type_specific"]["restrictions"][0]["content"]["content"]["content_kind"] == "restriction_reason"
-    assert payload["type_specific"]["contacts_subscribed"] == {
+    assert _dict_at(payload, "common", "about", "content")["content_kind"] == "about"
+    assert _dict_at(payload, "type_specific", "classification") == {"broadcast": True, "megagroup": False}
+    assert _dict_at(payload, "type_specific")["subscribers_count"] == 12345
+    assert _dict_at(payload, "type_specific")["pinned_msg_id"] == 999
+    assert _dict_at(payload, "type_specific")["slow_mode_seconds"] == 30
+    assert _dict_at(payload, "type_specific")["available_reactions"] == {"kind": "some", "emojis": ["👍", "❤"]}
+    restrictions = cast(list[dict[str, object]], _dict_at(payload, "type_specific")["restrictions"])
+    assert _dict_at(restrictions[0], "content", "content")["content_kind"] == "restriction_reason"
+    assert _dict_at(payload, "type_specific", "contacts_subscribed") == {
         "items": None,
         "available": False,
         "partial": False,
         "reason": "not_an_admin",
     }
-    assert payload["privacy_or_access"]["contacts_subscribed"]["is_gated"] is True
+    assert _dict_at(payload, "privacy_or_access", "contacts_subscribed")["is_gated"] is True
 
 
 @pytest.mark.asyncio
@@ -263,23 +286,24 @@ async def test_get_entity_info_supergroup_renders() -> None:
     with _patch_daemon(_resolve_ok(-1002, "DevChat"), get_resp):
         result = await get_entity_info(GetEntityInfo(entity="DevChat"))
     assert result.content == ()
-    payload = result.structured_content
+    payload = _dict(result.structured_content)
     assert payload is not None
     assert payload["type"] == "supergroup"
-    assert payload["common"]["about"]["content"] == {
+    assert _dict_at(payload, "common", "about", "content") == {
         "text": "Group rules",
         "is_telegram_content": True,
         "content_kind": "about",
     }
-    assert payload["type_specific"]["classification"] == {
+    assert _dict_at(payload, "type_specific", "classification") == {
         "broadcast": False,
         "megagroup": True,
         "forum": True,
     }
-    assert payload["type_specific"]["members_count"] == 42
-    assert payload["type_specific"]["has_topics"] is True
-    assert payload["type_specific"]["contacts_subscribed"]["items"] == [{"id": 10, "name": "Anna", "username": "anna"}]
-    assert payload["type_specific"]["contacts_subscribed"]["available"] is True
+    assert _dict_at(payload, "type_specific")["members_count"] == 42
+    assert _dict_at(payload, "type_specific")["has_topics"] is True
+    contacts = _dict_at(payload, "type_specific", "contacts_subscribed")
+    assert contacts["items"] == [{"id": 10, "name": "Anna", "username": "anna"}]
+    assert contacts["available"] is True
 
 
 @pytest.mark.asyncio
@@ -307,15 +331,15 @@ async def test_get_entity_info_group_renders_migrated_to() -> None:
     with _patch_daemon(_resolve_ok(-100, "Old Chat"), get_resp):
         result = await get_entity_info(GetEntityInfo(entity="Old Chat"))
     assert result.content == ()
-    payload = result.structured_content
+    payload = _dict(result.structured_content)
     assert payload is not None
     assert payload["type"] == "group"
-    assert payload["common"]["about"]["untrusted_content"] is True
-    assert payload["type_specific"]["classification"] == {"broadcast": False, "megagroup": False}
-    assert payload["type_specific"]["members_count"] == 5
-    assert payload["type_specific"]["migrated_to"] == -1002005000000
-    assert "linked_chat_id" not in payload["type_specific"]
-    assert "available_reactions" in payload["type_specific"]["omitted_type_specific_fields"]
+    assert _dict_at(payload, "common", "about")["untrusted_content"] is True
+    assert _dict_at(payload, "type_specific", "classification") == {"broadcast": False, "megagroup": False}
+    assert _dict_at(payload, "type_specific")["members_count"] == 5
+    assert _dict_at(payload, "type_specific")["migrated_to"] == -1002005000000
+    assert "linked_chat_id" not in _dict_at(payload, "type_specific")
+    assert "available_reactions" in _dict_at(payload, "type_specific", "omitted_type_specific_fields")
 
 
 @pytest.mark.asyncio
@@ -339,23 +363,23 @@ async def test_get_entity_info_resolver_ambiguous() -> None:
 
     with patch("mcp_telegram.tools.entity_info.daemon_connection", fake_dc):
         result = await get_entity_info(GetEntityInfo(entity="Alice"))
-    text = result.content[0].text
+    text = cast(_TextContent, result.content[0]).text
     assert result.is_error is True
     assert "Multiple entities matched" in text
     assert "structuredContent.candidates" in text
     assert "Alice A" not in text and "Alice B" not in text
-    payload = result.structured_content
+    payload = _dict(result.structured_content)
     assert payload is not None
     assert payload["error"] == "ambiguous_entity"
-    candidates = payload["candidates"]
+    candidates = cast(list[dict[str, object]], payload["candidates"])
     assert isinstance(candidates, list)
     assert [candidate["entity_id"] for candidate in candidates] == [1, 2]
-    assert candidates[0]["display_name_content"] == {
+    assert _dict_at(candidates[0], "display_name_content") == {
         "text": "Alice A",
         "is_telegram_content": True,
         "content_kind": "message_text",
     }
-    assert candidates[0]["username_content"] == {
+    assert _dict_at(candidates[0], "username_content") == {
         "text": "alicea",
         "is_telegram_content": True,
         "content_kind": "message_text",
@@ -376,7 +400,7 @@ async def test_get_entity_info_resolver_not_found() -> None:
 
     with patch("mcp_telegram.tools.entity_info.daemon_connection", fake_dc):
         result = await get_entity_info(GetEntityInfo(entity="Nobody"))
-    text = result.content[0].text
+    text = cast(_TextContent, result.content[0]).text
     assert "No entity matches 'Nobody'" in text
     assert "GetEntityInfo" in text
 
@@ -392,7 +416,7 @@ async def test_get_entity_info_daemon_not_running() -> None:
 
     with patch("mcp_telegram.tools.entity_info.daemon_connection", raising_dc):
         result = await get_entity_info(GetEntityInfo(entity="Anyone"))
-    text = result.content[0].text
+    text = cast(_TextContent, result.content[0]).text
     assert "Telegram backend is not running" in text
 
 
@@ -449,11 +473,12 @@ async def test_get_entity_info_frames_adversarial_profile_fields() -> None:
         result = await get_entity_info(GetEntityInfo(entity="Alice"))
 
     assert result.content == ()
-    payload = result.structured_content
+    payload = _dict(result.structured_content)
     assert payload is not None
-    content_texts = [field["content"]["text"] for field in payload["content_fields"]]
+    content_fields = cast(list[dict[str, object]], payload["content_fields"])
+    content_texts = [cast(str, _dict_at(field, "content")["text"]) for field in content_fields]
     assert adversarial in content_texts
-    assert all(field["untrusted_content"] is True for field in payload["content_fields"])
+    assert all(cast(bool, field["untrusted_content"]) is True for field in content_fields)
 
 
 @pytest.mark.asyncio
@@ -496,10 +521,10 @@ async def test_get_entity_info_numeric_id_uses_resolved_name() -> None:
         result = await get_entity_info(GetEntityInfo(entity="-1001079568001"))
 
     assert result.content == ()
-    payload = result.structured_content
+    payload = _dict(result.structured_content)
     assert payload is not None
-    assert payload["resolved_query"]["resolution"] == "numeric_id"
-    assert payload["resolved_query"]["entity_id"] == -1001079568001
+    assert _dict_at(payload, "resolved_query")["resolution"] == "numeric_id"
+    assert _dict_at(payload, "resolved_query")["entity_id"] == -1001079568001
     # The fix: display_name must be the resolved title, not the numeric string.
     assert payload["display_name"] == "Дзен-мани чатик"
-    assert payload["resolved_query"]["input"] == "-1001079568001"
+    assert _dict_at(payload, "resolved_query")["input"] == "-1001079568001"

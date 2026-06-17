@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -19,7 +20,7 @@ import pytest
 # silently — use spec=User on the resolved entity mock.
 from telethon.tl.types import User  # type: ignore[import-untyped]
 
-from mcp_telegram.daemon_api import DaemonAPIServer
+from mcp_telegram.daemon_api import DaemonAPIServer, _DaemonClientLike
 
 _TEST_DBS: list[sqlite3.Connection] = []
 
@@ -70,18 +71,18 @@ def _make_db() -> sqlite3.Connection:
     return conn
 
 
-def make_server(conn=None, client=None) -> DaemonAPIServer:
+def make_server(conn: sqlite3.Connection | None = None, client: _DaemonClientLike | None = None) -> DaemonAPIServer:
     if conn is None:
         conn = _make_db()
     if client is None:
         client = MagicMock()
     shutdown_event = asyncio.Event()
-    server = DaemonAPIServer(conn, client, shutdown_event)
+    server = DaemonAPIServer(conn, cast(_DaemonClientLike, client), shutdown_event)
     server._ready = True
     return server
 
 
-def _user(id_=42):
+def _user(id_: int = 42) -> MagicMock:
     # HIGH-1 from 47-REVIEWS.md cycle 3: spec=User so the User branch in
     # `_classify_dialog_type()` actually runs. See module-level import.
     u = MagicMock(spec=User)
@@ -101,7 +102,7 @@ def _user(id_=42):
     return u
 
 
-def _trio_results():
+def _trio_results() -> tuple[MagicMock, MagicMock, MagicMock]:
     common, full, photos = MagicMock(), MagicMock(), MagicMock()
     common.chats = []
     full.full_user = MagicMock(
@@ -124,10 +125,11 @@ def _trio_results():
 
 
 @pytest.mark.asyncio
-async def test_get_entity_info_serves_from_db_within_ttl(monkeypatch) -> None:
+async def test_get_entity_info_serves_from_db_within_ttl(monkeypatch: pytest.MonkeyPatch) -> None:
     """SPEC Req 8: two consecutive calls within 5 min → exactly one MTProto round-trip."""
     client = AsyncMock()
-    client.get_entity = AsyncMock(return_value=_user(42))
+    get_entity = AsyncMock(return_value=_user(42))
+    client.get_entity = get_entity
     client.side_effect = _trio_results() + _trio_results()  # 6 items in case both calls fetch
     server = make_server(client=client)
 
@@ -140,14 +142,14 @@ async def test_get_entity_info_serves_from_db_within_ttl(monkeypatch) -> None:
     ):
         r1 = await server._dispatch({"method": "get_entity_info", "entity_id": 42})
     assert r1["ok"]
-    first_call_count = client.get_entity.call_count
+    first_call_count = get_entity.call_count
     assert first_call_count == 1
 
     # Within TTL window
     monkeypatch.setattr("mcp_telegram.daemon_api.time.time", lambda: base + 250)
     r2 = await server._dispatch({"method": "get_entity_info", "entity_id": 42})
     assert r2["ok"]
-    assert client.get_entity.call_count == first_call_count, "must serve from DB; no new fetch"
+    assert get_entity.call_count == first_call_count, "must serve from DB; no new fetch"
 
     # After TTL → fresh fetch
     monkeypatch.setattr("mcp_telegram.daemon_api.time.time", lambda: base + 400)
@@ -158,11 +160,11 @@ async def test_get_entity_info_serves_from_db_within_ttl(monkeypatch) -> None:
     ):
         r3 = await server._dispatch({"method": "get_entity_info", "entity_id": 42})
     assert r3["ok"]
-    assert client.get_entity.call_count == first_call_count + 1
+    assert get_entity.call_count == first_call_count + 1
 
 
 @pytest.mark.asyncio
-async def test_get_entity_info_auto_resolve_writes_both_rows(monkeypatch) -> None:
+async def test_get_entity_info_auto_resolve_writes_both_rows(monkeypatch: pytest.MonkeyPatch) -> None:
     """SPEC Req 11: first call on unknown id writes entities AND entity_details rows."""
     conn = _make_db()
     # Pre-condition: no rows in either table for entity 100
@@ -185,15 +187,21 @@ async def test_get_entity_info_auto_resolve_writes_both_rows(monkeypatch) -> Non
     # Post-condition: BOTH rows now exist
     # conn.row_factory is set to sqlite3.Row by DaemonAPIServer.__init__,
     # so compare using tuple() to avoid Row vs tuple mismatch.
-    ent_row = conn.execute("SELECT id, type, username FROM entities WHERE id=100").fetchone()
+    ent_row = cast(
+        tuple[int, str, str] | None, conn.execute("SELECT id, type, username FROM entities WHERE id=100").fetchone()
+    )
+    assert ent_row is not None
     assert tuple(ent_row) == (100, "user", "cache")
-    det_row = conn.execute("SELECT detail_json, fetched_at FROM entity_details WHERE entity_id=100").fetchone()
+    det_row = cast(
+        tuple[str, int] | None,
+        conn.execute("SELECT detail_json, fetched_at FROM entity_details WHERE entity_id=100").fetchone(),
+    )
     assert det_row is not None
     assert det_row[1] == 5_000_000
     # detail_json carries embedded schema discriminator
     import json as _json
 
-    payload = _json.loads(det_row[0])
+    payload = cast(dict[str, object], _json.loads(det_row[0]))
     assert payload["schema"] == 1
     assert payload["type"] == "user"
     assert payload["id"] == 100

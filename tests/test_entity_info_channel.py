@@ -13,6 +13,7 @@ import asyncio
 import re
 import sqlite3
 from datetime import UTC
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -25,9 +26,20 @@ from telethon.errors import RPCError
 # NameError. The `_broadcast_channel()` helper below also uses this name.
 from telethon.tl.types import Channel as TelethonChannel  # type: ignore[import-untyped]
 
-from mcp_telegram.daemon_api import DaemonAPIServer
+from mcp_telegram.daemon_api import DaemonAPIServer, _DaemonClientLike
 
 _TEST_DBS: list[sqlite3.Connection] = []
+
+
+def _dict(value: object) -> dict[str, object]:
+    return cast(dict[str, object], value)
+
+
+def _dict_at(value: object, *keys: str) -> dict[str, object]:
+    current = _dict(value)
+    for key in keys:
+        current = _dict(current[key])
+    return current
 
 
 @pytest.fixture(autouse=True)
@@ -76,22 +88,22 @@ def _make_db() -> sqlite3.Connection:
     return conn
 
 
-def make_server(conn=None, client=None) -> DaemonAPIServer:
+def make_server(conn: sqlite3.Connection | None = None, client: _DaemonClientLike | None = None) -> DaemonAPIServer:
     if conn is None:
         conn = _make_db()
     if client is None:
         client = MagicMock()
     shutdown_event = asyncio.Event()
-    server = DaemonAPIServer(conn, client, shutdown_event)
+    server = DaemonAPIServer(conn, cast(_DaemonClientLike, client), shutdown_event)
     server._ready = True
     return server
 
 
-def _mock_client(*call_results):
+def _mock_client(*call_results: object) -> MagicMock:
     client = MagicMock()
     results = list(call_results)
 
-    async def _call_client(*args, **kwargs):
+    async def _call_client(*args: object, **kwargs: object) -> object:
         if not results:
             raise RuntimeError("unexpected Telegram client request")
         result = results.pop(0)
@@ -103,7 +115,7 @@ def _mock_client(*call_results):
     return client
 
 
-def _broadcast_channel(id_=-1001, **kwargs):
+def _broadcast_channel(id_: int = -1001, **kwargs: object) -> MagicMock:
     # `TelethonChannel` is now imported at module scope (see top of file)
     # per HIGH-2 from 47-REVIEWS.md cycle 3 — Plan 03 Task 3 appends
     # broadcast-admin tests that reference this name in their bodies.
@@ -121,7 +133,7 @@ def _broadcast_channel(id_=-1001, **kwargs):
     return c
 
 
-def _full_channel(**kwargs):
+def _full_channel(**kwargs: object) -> MagicMock:
     from telethon.tl.types import ChatReactionsNone  # type: ignore[import-untyped]
 
     full = MagicMock()
@@ -149,7 +161,7 @@ async def test_get_entity_info_channel_type() -> None:
     with patch("mcp_telegram.daemon_api.GetFullChannelRequest"), patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": -1001})
     assert r["ok"] is True, f"got {r}"
-    assert r["data"]["type"] == "channel"
+    assert _dict(r["data"])["type"] == "channel"
 
 
 @pytest.mark.asyncio
@@ -163,7 +175,7 @@ async def test_get_entity_info_channel_common_envelope() -> None:
     server = make_server(client=client)
     with patch("mcp_telegram.daemon_api.GetFullChannelRequest"), patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": -1002})
-    d = r["data"]
+    d = _dict(r["data"])
     for key in ("id", "type", "name", "username", "about", "my_membership", "avatar_history", "avatar_count"):
         assert key in d
     assert d["name"] == "News"
@@ -182,7 +194,7 @@ async def test_get_entity_info_channel_field_surface() -> None:
     server = make_server(client=client)
     with patch("mcp_telegram.daemon_api.GetFullChannelRequest"), patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": -1003})
-    d = r["data"]
+    d = _dict(r["data"])
     for key in (
         "subscribers_count",
         "linked_chat_id",
@@ -209,7 +221,7 @@ async def test_get_entity_info_channel_non_admin_contacts_null() -> None:
     server = make_server(client=client)
     with patch("mcp_telegram.daemon_api.GetFullChannelRequest"), patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": -1004})
-    d = r["data"]
+    d = _dict(r["data"])
     assert d["contacts_subscribed"] is None
     assert d["contacts_reason"] == "not_an_admin"
 
@@ -230,7 +242,7 @@ async def test_get_entity_info_channel_available_reactions_some() -> None:
     server = make_server(client=client)
     with patch("mcp_telegram.daemon_api.GetFullChannelRequest"), patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": -1005})
-    ar = r["data"]["available_reactions"]
+    ar = _dict(r["data"])["available_reactions"]
     assert ar == {"kind": "some", "emojis": ["👍"]}
 
 
@@ -246,7 +258,7 @@ async def test_get_entity_info_no_download_keys_channel() -> None:
     with patch("mcp_telegram.daemon_api.GetFullChannelRequest"), patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": -1006})
 
-    def _walk_keys(o):
+    def _walk_keys(o: object):
         if isinstance(o, dict):
             for k in o:
                 yield k
@@ -256,7 +268,7 @@ async def test_get_entity_info_no_download_keys_channel() -> None:
                 yield from _walk_keys(it)
 
     forbidden = re.compile(r"^(file_id|file_reference|download_)")
-    bad = [k for k in _walk_keys(r["data"]) if forbidden.match(str(k))]
+    bad = [k for k in _walk_keys(_dict(r["data"])) if forbidden.match(str(k))]
     assert not bad, f"forbidden download keys present: {bad}"
 
 
@@ -279,7 +291,8 @@ async def test_get_entity_info_channel_avatar_search_fails_d20_fallback() -> Non
     chat_photo.id = 99999
     chat_photo.date = datetime(2024, 6, 1, 12, 0, 0, tzinfo=UTC)
     full = _full_channel()
-    full.full_chat.chat_photo = chat_photo
+    full_chat = cast(MagicMock, full.full_chat)
+    full_chat.chat_photo = chat_photo
 
     # messages.Search(ChatPhotos) RAISES — search_failed branch.
     search_exc = RPCError(None, "flood wait simulated")
@@ -290,10 +303,11 @@ async def test_get_entity_info_channel_avatar_search_fails_d20_fallback() -> Non
     with patch("mcp_telegram.daemon_api.GetFullChannelRequest"), patch("mcp_telegram.daemon_api.MessagesSearchRequest"):
         r = await server._dispatch({"method": "get_entity_info", "entity_id": -1007})
 
-    d = r["data"]
+    d = _dict(r["data"])
     # D-19 still places the current photo in avatar_history.
-    assert len(d["avatar_history"]) == 1
-    assert d["avatar_history"][0]["photo_id"] == 99999
+    avatar_history = cast(list[dict[str, object]], d["avatar_history"])
+    assert len(avatar_history) == 1
+    assert avatar_history[0]["photo_id"] == 99999
     # D-20 contract: avatar_count = 1 even though Search raised — this is
     # the bug HIGH-3 fixes (was 0 before the search_failed flag).
     assert d["avatar_count"] == 1, (
@@ -344,7 +358,7 @@ async def test_get_entity_info_channel_admin_enumerates_subscribers_small() -> N
     client.get_entity = AsyncMock(return_value=ch)
 
     # iter_participants yields 3 participant objects with ids 111, 222, 333.
-    async def _iter(*args, **kwargs):
+    async def _iter(*args: object, **kwargs: object):
         for pid in (111, 222, 333):
             p = MagicMock()
             p.id = pid
@@ -369,12 +383,13 @@ async def test_get_entity_info_channel_admin_enumerates_subscribers_small() -> N
     )
 
     r = await server._dispatch({"method": "get_entity_info", "entity_id": -1001234567890})
-    d = r["data"]
+    d = _dict(r["data"])
     assert d["type"] == "channel"
     assert d["contacts_subscribed_partial"] is False
     assert d["contacts_reason"] is None
     # Real enumeration result — must be {111, 333} (222 is not a DM peer).
-    ids = sorted(c["id"] for c in d["contacts_subscribed"])
+    contacts = cast(list[dict[str, object]], d["contacts_subscribed"])
+    ids = sorted(cast(int, c["id"]) for c in contacts)
     assert ids == [111, 333], f"expected [111, 333], got {ids}"
     # The Plan 02 stub MUST NOT survive into production responses.
     assert d.get("contacts_reason") != "enumeration_owned_by_plan_03"
@@ -410,7 +425,7 @@ async def test_get_entity_info_channel_admin_enumerates_subscribers_large() -> N
     client.get_entity = AsyncMock(return_value=ch)
 
     # iter_participants MUST NOT be called on the >1000 path.
-    async def _iter_should_not_be_called(*args, **kwargs):
+    async def _iter_should_not_be_called(*args: object, **kwargs: object):
         raise AssertionError("iter_participants must not run on >1000 broadcast path")
         yield  # pragma: no cover
 
@@ -425,10 +440,11 @@ async def test_get_entity_info_channel_admin_enumerates_subscribers_large() -> N
     )
 
     r = await server._dispatch({"method": "get_entity_info", "entity_id": -1009876543210})
-    d = r["data"]
+    d = _dict(r["data"])
     assert d["contacts_subscribed_partial"] is True
     assert d["contacts_reason"] == "too_large"
-    ids = sorted(c["id"] for c in d["contacts_subscribed"])
+    contacts = cast(list[dict[str, object]], d["contacts_subscribed"])
+    ids = sorted(cast(int, c["id"]) for c in contacts)
     assert ids == [111]
 
 
@@ -457,7 +473,7 @@ async def test_get_entity_info_channel_admin_chat_admin_required_falls_back_to_n
     client = _mock_client(full, RPCError(None, "avatar search unavailable"))
     client.get_entity = AsyncMock(return_value=ch)
 
-    async def _iter_raises(*args, **kwargs):
+    async def _iter_raises(*args: object, **kwargs: object):
         raise ChatAdminRequiredError(request=None)
         yield  # pragma: no cover
 
@@ -465,6 +481,6 @@ async def test_get_entity_info_channel_admin_chat_admin_required_falls_back_to_n
 
     server = make_server(client=client)
     r = await server._dispatch({"method": "get_entity_info", "entity_id": -1001112223334})
-    d = r["data"]
+    d = _dict(r["data"])
     assert d["contacts_subscribed"] is None
     assert d["contacts_reason"] == "not_an_admin"

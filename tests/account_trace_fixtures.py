@@ -2,42 +2,8 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
-from typing import TypedDict, Unpack
 
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
-
-
-class _SeedEntityKwargs(TypedDict, total=False):
-    entity_type: str
-    name: str
-    username: str | None
-    updated_at: int
-
-
-class _SeedDialogKwargs(TypedDict, total=False):
-    dialog_type: str
-    hidden: int
-    name: str
-    snapshot_at: int
-
-
-class _SeedSyncedDialogKwargs(TypedDict, total=False):
-    status: str
-    total_messages: int | None
-
-
-class _SeedMessageKwargs(TypedDict, total=False):
-    text: str | None
-    sender_id: int | None
-    out: int
-    is_service: int
-    forum_topic_id: int | None
-    post_author: str | None
-
-
-class _SeedChannelSignatureMessageKwargs(TypedDict, total=False):
-    signature: str
-    text: str
 
 
 def open_trace_db(tmp_path: Path) -> sqlite3.Connection:
@@ -47,16 +13,15 @@ def open_trace_db(tmp_path: Path) -> sqlite3.Connection:
     return _open_sync_db(db_path)
 
 
-def seed_entity(
+def seed_entity(  # noqa: PLR0913
     conn: sqlite3.Connection,
     *,
     entity_id: int,
-    **kwargs: Unpack[_SeedEntityKwargs],
+    entity_type: str = "User",
+    name: str = "Alice Example",
+    username: str | None = "alice",
+    updated_at: int = 1_700_000_000,
 ) -> None:
-    entity_type = kwargs.get("entity_type", "User")
-    name = kwargs.get("name", "Alice Example")
-    username = kwargs.get("username", "alice")
-    updated_at = kwargs.get("updated_at", 1_700_000_000)
     conn.execute(
         """
         INSERT OR REPLACE INTO entities
@@ -67,16 +32,15 @@ def seed_entity(
     )
 
 
-def seed_dialog(
+def seed_dialog(  # noqa: PLR0913
     conn: sqlite3.Connection,
     *,
     dialog_id: int,
     name: str,
-    **kwargs: Unpack[_SeedDialogKwargs],
+    dialog_type: str = "User",
+    hidden: int = 0,
+    snapshot_at: int = 1_700_000_000,
 ) -> None:
-    dialog_type = kwargs.get("dialog_type", "User")
-    hidden = kwargs.get("hidden", 0)
-    snapshot_at = kwargs.get("snapshot_at", 1_700_000_000)
     conn.execute(
         """
         INSERT OR REPLACE INTO dialogs
@@ -91,10 +55,9 @@ def seed_synced_dialog(
     conn: sqlite3.Connection,
     *,
     dialog_id: int,
-    **kwargs: Unpack[_SeedSyncedDialogKwargs],
+    status: str = "synced",
+    total_messages: int | None = 10,
 ) -> None:
-    status = kwargs.get("status", "synced")
-    total_messages = kwargs.get("total_messages", 10)
     conn.execute(
         """
         INSERT OR REPLACE INTO synced_dialogs
@@ -123,20 +86,19 @@ def seed_topic(
     )
 
 
-def seed_message(
+def seed_message(  # noqa: PLR0913
     conn: sqlite3.Connection,
     *,
     dialog_id: int,
     message_id: int,
     sent_at: int,
-    **kwargs: Unpack[_SeedMessageKwargs],
+    text: str | None = "hello",
+    sender_id: int | None = None,
+    out: int = 0,
+    is_service: int = 0,
+    forum_topic_id: int | None = None,
+    post_author: str | None = None,
 ) -> None:
-    text = kwargs.get("text", "hello")
-    sender_id = kwargs.get("sender_id")
-    out = kwargs.get("out", 0)
-    is_service = kwargs.get("is_service", 0)
-    forum_topic_id = kwargs.get("forum_topic_id")
-    post_author = kwargs.get("post_author")
     conn.execute(
         """
         INSERT OR REPLACE INTO messages
@@ -158,16 +120,15 @@ def seed_message(
     )
 
 
-def seed_channel_signature_message(
+def seed_channel_signature_message(  # noqa: PLR0913
     conn: sqlite3.Connection,
     *,
     dialog_id: int,
     message_id: int,
     sent_at: int,
-    **kwargs: Unpack[_SeedChannelSignatureMessageKwargs],
+    signature: str,
+    text: str = "signed channel post",
 ) -> None:
-    signature = kwargs["signature"]
-    text = kwargs.get("text", "signed channel post")
     seed_message(
         conn,
         dialog_id=dialog_id,
@@ -179,38 +140,21 @@ def seed_channel_signature_message(
     )
 
 
-def seed_trace_fragment(
+def seed_trace_fragment(  # noqa: PLR0913
     conn: sqlite3.Connection,
     *,
     target_user_id: int,
     dialog_id: int,
-    **kwargs: Unpack[
-        TypedDict(
-            "_SeedTraceFragmentKwargs",
-            {
-                "topic_id": int,
-                "coverage_kind": str,
-                "status": str,
-                "fetched_at": int | None,
-                "checkpoint": str | None,
-                "last_error": str | None,
-                "next_retry_at": int | None,
-                "created_at": int,
-                "updated_at": int,
-            },
-            total=False,
-        )
-    ],
+    topic_id: int = 0,
+    coverage_kind: str = "authored_message",
+    status: str = "pending",
+    fetched_at: int | None = None,
+    checkpoint: str | None = None,
+    last_error: str | None = None,
+    next_retry_at: int | None = None,
+    created_at: int = 1_700_000_000,
+    updated_at: int = 1_700_000_000,
 ) -> None:
-    topic_id = kwargs.get("topic_id", 0)
-    coverage_kind = kwargs.get("coverage_kind", "authored_message")
-    status = kwargs.get("status", "pending")
-    fetched_at = kwargs.get("fetched_at")
-    checkpoint = kwargs.get("checkpoint")
-    last_error = kwargs.get("last_error")
-    next_retry_at = kwargs.get("next_retry_at")
-    created_at = kwargs.get("created_at", 1_700_000_000)
-    updated_at = kwargs.get("updated_at", 1_700_000_000)
     conn.execute(
         """
         INSERT OR REPLACE INTO trace_coverage_fragments

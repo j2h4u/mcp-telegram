@@ -13,13 +13,14 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from datetime import UTC, datetime
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from telethon.tl.types import Channel as TelethonChannel  # type: ignore[import-untyped]
 from telethon.tl.types import User  # type: ignore[import-untyped]
 
-from mcp_telegram.daemon_api import DaemonAPIServer
+from mcp_telegram.daemon_api import DaemonAPIServer, _DaemonClientLike
 from mcp_telegram.tools.entity_info import _format_relative_ymd
 
 # ---------------------------------------------------------------------------
@@ -75,17 +76,17 @@ def _make_db() -> sqlite3.Connection:
     return conn
 
 
-def _make_server(conn=None, client=None) -> DaemonAPIServer:
+def _make_server(conn: sqlite3.Connection | None = None, client: _DaemonClientLike | None = None) -> DaemonAPIServer:
     if conn is None:
         conn = _make_db()
     if client is None:
         client = MagicMock()
-    server = DaemonAPIServer(conn, client, asyncio.Event())
+    server = DaemonAPIServer(conn, cast(_DaemonClientLike, client), asyncio.Event())
     server._ready = True
     return server
 
 
-def _channel(id_=-1001, admin=True, **kw):
+def _channel(id_: int = -1001, admin: bool = True, **kw: object) -> MagicMock:
     c = MagicMock(spec=TelethonChannel)
     c.id = id_
     c.title = kw.get("title", "Chan")
@@ -100,7 +101,7 @@ def _channel(id_=-1001, admin=True, **kw):
     return c
 
 
-def _supergroup(id_=-2001, admin=True, **kw):
+def _supergroup(id_: int = -2001, admin: bool = True, **kw: object) -> MagicMock:
     c = MagicMock(spec=TelethonChannel)
     c.id = id_
     c.title = kw.get("title", "SG")
@@ -117,7 +118,7 @@ def _supergroup(id_=-2001, admin=True, **kw):
     return c
 
 
-def _user_entity(id_=99):
+def _user_entity(id_: int = 99) -> MagicMock:
     u = MagicMock(spec=User)
     u.id = id_
     u.first_name = "Test"
@@ -175,6 +176,8 @@ async def test_channel_admin_full_request_fails_returns_count_unavailable() -> N
     client = AsyncMock()
     client.get_entity = AsyncMock(return_value=chan)
     client.side_effect = [MagicMock(count=0, messages=[])]
+    iter_participants = MagicMock()
+    client.iter_participants = iter_participants
     server = _make_server(client=client)
 
     with (
@@ -184,12 +187,12 @@ async def test_channel_admin_full_request_fails_returns_count_unavailable() -> N
         r = await server._dispatch({"method": "get_entity_info", "entity_id": -1001})
 
     assert r["ok"] is True, f"expected ok=True, got {r}"
-    d = r["data"]
+    d = cast(dict[str, object], r["data"])
     assert d["contacts_subscribed"] is None
     assert d["contacts_reason"] == "count_unavailable", (
         f"expected 'count_unavailable', got {d.get('contacts_reason')!r}"
     )
-    client.iter_participants.assert_not_called()
+    iter_participants.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -200,6 +203,8 @@ async def test_supergroup_admin_full_request_fails_returns_count_unavailable() -
     client = AsyncMock()
     client.get_entity = AsyncMock(return_value=sg)
     client.side_effect = [MagicMock(count=0, messages=[])]
+    iter_participants = MagicMock()
+    client.iter_participants = iter_participants
     server = _make_server(client=client)
 
     with (
@@ -209,12 +214,12 @@ async def test_supergroup_admin_full_request_fails_returns_count_unavailable() -
         r = await server._dispatch({"method": "get_entity_info", "entity_id": -2001})
 
     assert r["ok"] is True, f"expected ok=True, got {r}"
-    d = r["data"]
+    d = cast(dict[str, object], r["data"])
     assert d["contacts_subscribed"] is None
     assert d["contacts_reason"] == "count_unavailable", (
         f"expected 'count_unavailable', got {d.get('contacts_reason')!r}"
     )
-    client.iter_participants.assert_not_called()
+    iter_participants.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -243,11 +248,13 @@ async def test_user_degraded_full_fetch_skips_entity_details_cache() -> None:
     assert r["ok"] is True, f"expected ok=True despite degraded fetch, got {r}"
 
     # entities row written (auto-resolve still works)
-    ent = conn.execute("SELECT id FROM entities WHERE id = 77").fetchone()
+    ent = cast(tuple[int] | None, conn.execute("SELECT id FROM entities WHERE id = 77").fetchone())
     assert ent is not None, "entities row should be written even on degraded fetch"
 
     # entity_details row NOT written (degraded response must not be cached)
-    detail = conn.execute("SELECT entity_id FROM entity_details WHERE entity_id = 77").fetchone()
+    detail = cast(
+        tuple[int] | None, conn.execute("SELECT entity_id FROM entity_details WHERE entity_id = 77").fetchone()
+    )
     assert detail is None, "entity_details must NOT be written when GetFullUserRequest fails"
 
 
@@ -271,5 +278,7 @@ async def test_channel_degraded_full_fetch_skips_entity_details_cache() -> None:
 
     assert r["ok"] is True, f"expected ok=True despite degraded fetch, got {r}"
 
-    detail = conn.execute("SELECT entity_id FROM entity_details WHERE entity_id = -3001").fetchone()
+    detail = cast(
+        tuple[int] | None, conn.execute("SELECT entity_id FROM entity_details WHERE entity_id = -3001").fetchone()
+    )
     assert detail is None, "entity_details must NOT be written when GetFullChannelRequest fails"

@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sqlite3
+from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TypedDict, Unpack
+from typing import TypedDict, cast
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -22,6 +24,7 @@ from telethon.errors import FloodWaitError
 from mcp_telegram.daemon_account_trace import (
     DaemonAccountTraceDeps,
     DaemonAccountTraceService,
+    _LoggerLike,
     _messages_row_equal,
     _trace_candidate_dialogs,
     _trace_existing_message_bundle,
@@ -38,12 +41,47 @@ from mcp_telegram.sync_worker import (
 
 
 class FakeTraceClient:
-    def __init__(self, messages_by_dialog: dict[int, list[object]] | None = None, exc: Exception | None = None):
+    def __init__(
+        self,
+        messages_by_dialog: Mapping[int, Sequence[object]] | None = None,
+        exc: Exception | None = None,
+    ) -> None:
         self.messages_by_dialog = messages_by_dialog or {}
         self.exc = exc
-        self.calls: list[tuple[int, dict]] = []
+        self.calls: list[tuple[int, dict[str, object]]] = []
 
-    def iter_messages(self, dialog_id: int, **kwargs):
+    async def get_entity(self, *args: object, **kwargs: object) -> object:
+        raise AssertionError("unexpected get_entity call in trace enrichment tests")
+
+    def iter_dialogs(self, *args: object, **kwargs: object) -> AsyncIterator[object]:
+        async def _gen() -> AsyncIterator[object]:
+            raise AssertionError("unexpected iter_dialogs call in trace enrichment tests")
+            if False:  # pragma: no cover
+                yield None
+
+        return _gen()
+
+    async def get_me(self, *args: object, **kwargs: object) -> object:
+        raise AssertionError("unexpected iter_dialogs call in trace enrichment tests")
+
+    async def get_input_entity(self, *args: object, **kwargs: object) -> object:
+        raise AssertionError("unexpected get_input_entity call in trace enrichment tests")
+
+    async def get_messages(self, *args: object, **kwargs: object) -> object:
+        raise AssertionError("unexpected get_messages call in trace enrichment tests")
+
+    def iter_participants(self, *args: object, **kwargs: object) -> AsyncIterator[object]:
+        async def _gen() -> AsyncIterator[object]:
+            raise AssertionError("unexpected iter_participants call in trace enrichment tests")
+            if False:  # pragma: no cover
+                yield None
+
+        return _gen()
+
+    async def __call__(self, *args: object, **kwargs: object) -> object:
+        raise AssertionError("unexpected iter_participants call in trace enrichment tests")
+
+    def iter_messages(self, dialog_id: int, **kwargs: object) -> AsyncIterator[object]:
         self.calls.append((dialog_id, kwargs))
 
         async def _gen():
@@ -69,8 +107,12 @@ class _SeedExistingMessageBundleKwargs(TypedDict, total=False):
     edit_date: int | None
 
 
+def _dict(value: object) -> dict[str, object]:
+    return cast(dict[str, object], value)
+
+
 @pytest.fixture()
-def trace_enrichment_server(tmp_path):
+def trace_enrichment_server(tmp_path: Path) -> Iterator[tuple[DaemonAPIServer, sqlite3.Connection, FakeTraceClient]]:
     conn = open_trace_db(tmp_path)
     client = FakeTraceClient()
     server = DaemonAPIServer(conn, client, asyncio.Event())
@@ -82,7 +124,9 @@ def trace_enrichment_server(tmp_path):
 
 
 @pytest.fixture()
-def trace_service(trace_enrichment_server):
+def trace_service(
+    trace_enrichment_server: tuple[DaemonAPIServer, sqlite3.Connection, FakeTraceClient],
+) -> DaemonAccountTraceService:
     server, conn, client = trace_enrichment_server
     return DaemonAccountTraceService(
         DaemonAccountTraceDeps(
@@ -90,7 +134,7 @@ def trace_service(trace_enrichment_server):
             client=client,
             resolve_dialog_id=server._resolve_dialog_id,
             self_id=server.self_id,
-            logger=logging.getLogger("test"),
+            logger=cast(_LoggerLike, logging.getLogger("test")),
             rid=lambda: "",
         )
     )
@@ -121,15 +165,15 @@ def fake_message(
     )
 
 
-def candidate_message(
-    **kwargs: Unpack[_CandidateMessageKwargs],
+def candidate_message(  # noqa: PLR0913
+    *,
+    text: str = "same",
+    edit_date: int | None = None,
+    reply_count: int = 0,
+    reactions: list[ReactionRecord] | None = None,
+    entities: list[EntityRecord] | None = None,
+    forward: ForwardRecord | None = None,
 ) -> ExtractedMessage:
-    text = kwargs.get("text", "same")
-    edit_date = kwargs.get("edit_date")
-    reply_count = kwargs.get("reply_count", 0)
-    reactions = kwargs.get("reactions")
-    entities = kwargs.get("entities")
-    forward = kwargs.get("forward")
     return ExtractedMessage(
         message=StoredMessage(
             dialog_id=222,
@@ -155,7 +199,7 @@ def candidate_message(
     )
 
 
-def seed_existing_message_bundle(conn, *, text: str = "same", edit_date: int | None = None) -> None:
+def seed_existing_message_bundle(conn: sqlite3.Connection, *, text: str = "same", edit_date: int | None = None) -> None:
     conn.execute(
         """
         INSERT OR REPLACE INTO messages (
@@ -170,7 +214,8 @@ def seed_existing_message_bundle(conn, *, text: str = "same", edit_date: int | N
 
 
 def test_trace_candidate_dialogs_are_bounded_visible_and_strategy_labeled(
-    trace_enrichment_server, trace_service
+    trace_enrichment_server: tuple[DaemonAPIServer, sqlite3.Connection, FakeTraceClient],
+    trace_service: DaemonAccountTraceService,
 ) -> None:
     _server, conn, _client = trace_enrichment_server
     for offset, (dialog_id, dialog_type) in enumerate(
@@ -219,7 +264,10 @@ def test_trace_candidate_dialogs_are_bounded_visible_and_strategy_labeled(
     )
 
 
-def test_trace_candidate_dialogs_include_cached_common_chats(trace_enrichment_server, trace_service) -> None:
+def test_trace_candidate_dialogs_include_cached_common_chats(
+    trace_enrichment_server: tuple[DaemonAPIServer, sqlite3.Connection, FakeTraceClient],
+    trace_service: DaemonAccountTraceService,
+) -> None:
     _server, conn, _client = trace_enrichment_server
     seed_entity(conn, entity_id=101, name="Alice", username="alice")
     seed_dialog(conn, dialog_id=-5001, name="Common", dialog_type="Group")
@@ -243,7 +291,10 @@ def test_trace_candidate_dialogs_include_cached_common_chats(trace_enrichment_se
     assert candidates[0]["origin"] == "cached_common_chat"
 
 
-def test_messages_row_equal_covers_base_and_child_tables(trace_enrichment_server, trace_service) -> None:
+def test_messages_row_equal_covers_base_and_child_tables(
+    trace_enrichment_server: tuple[DaemonAPIServer, sqlite3.Connection, FakeTraceClient],
+    trace_service: DaemonAccountTraceService,
+) -> None:
     _server, conn, _client = trace_enrichment_server
     seed_existing_message_bundle(conn)
     conn.execute(
@@ -323,7 +374,10 @@ def test_messages_row_equal_covers_base_and_child_tables(trace_enrichment_server
 
 
 @pytest.mark.asyncio
-async def test_trace_enrichment_uses_canonical_insert_for_new_messages(trace_enrichment_server, trace_service) -> None:
+async def test_trace_enrichment_uses_canonical_insert_for_new_messages(
+    trace_enrichment_server: tuple[DaemonAPIServer, sqlite3.Connection, FakeTraceClient],
+    trace_service: DaemonAccountTraceService,
+) -> None:
     server, conn, client = trace_enrichment_server
     client.messages_by_dialog = {222: [fake_message(message_id=1)]}
     seed_dialog(conn, dialog_id=222, name="Alice", dialog_type="User")
@@ -343,7 +397,10 @@ async def test_trace_enrichment_uses_canonical_insert_for_new_messages(trace_enr
 
 
 @pytest.mark.asyncio
-async def test_trace_enrichment_skips_unchanged_duplicates(trace_enrichment_server, trace_service) -> None:
+async def test_trace_enrichment_skips_unchanged_duplicates(
+    trace_enrichment_server: tuple[DaemonAPIServer, sqlite3.Connection, FakeTraceClient],
+    trace_service: DaemonAccountTraceService,
+) -> None:
     server, conn, client = trace_enrichment_server
     seed_existing_message_bundle(conn)
     client.messages_by_dialog = {222: [fake_message(message_id=1, text="same")]}
@@ -361,7 +418,10 @@ async def test_trace_enrichment_skips_unchanged_duplicates(trace_enrichment_serv
 
 
 @pytest.mark.asyncio
-async def test_trace_enrichment_changed_existing_uses_canonical_insert(trace_enrichment_server, trace_service) -> None:
+async def test_trace_enrichment_changed_existing_uses_canonical_insert(
+    trace_enrichment_server: tuple[DaemonAPIServer, sqlite3.Connection, FakeTraceClient],
+    trace_service: DaemonAccountTraceService,
+) -> None:
     server, conn, client = trace_enrichment_server
     seed_existing_message_bundle(conn, text="old")
     client.messages_by_dialog = {222: [fake_message(message_id=1, text="new")]}
@@ -377,7 +437,10 @@ async def test_trace_enrichment_changed_existing_uses_canonical_insert(trace_enr
 
 
 @pytest.mark.asyncio
-async def test_trace_enrichment_floodwait_persists_retry_fragment(trace_enrichment_server, trace_service) -> None:
+async def test_trace_enrichment_floodwait_persists_retry_fragment(
+    trace_enrichment_server: tuple[DaemonAPIServer, sqlite3.Connection, FakeTraceClient],
+    trace_service: DaemonAccountTraceService,
+) -> None:
     server, conn, client = trace_enrichment_server
     client.exc = FloodWaitError(None, 120)
 
@@ -386,9 +449,13 @@ async def test_trace_enrichment_floodwait_persists_retry_fragment(trace_enrichme
         [{"dialog_id": 222, "strategy": "dialog_scan", "topic_id": None}],
     )
 
-    fragment = conn.execute(
-        "SELECT status, last_error, next_retry_at FROM trace_coverage_fragments WHERE target_user_id = 101"
-    ).fetchone()
+    fragment = cast(
+        tuple[str, str, int] | None,
+        conn.execute(
+            "SELECT status, last_error, next_retry_at FROM trace_coverage_fragments WHERE target_user_id = 101"
+        ).fetchone(),
+    )
+    assert fragment is not None
     assert result["fragment_status_counts"]["flood_wait"] == 1
     assert fragment[0] == "flood_wait"
     assert fragment[1] == "FloodWaitError:120"
@@ -396,7 +463,10 @@ async def test_trace_enrichment_floodwait_persists_retry_fragment(trace_enrichme
 
 
 @pytest.mark.asyncio
-async def test_trace_enrichment_deadline_exhaustion_persists_budget_gap(trace_enrichment_server, trace_service) -> None:
+async def test_trace_enrichment_deadline_exhaustion_persists_budget_gap(
+    trace_enrichment_server: tuple[DaemonAPIServer, sqlite3.Connection, FakeTraceClient],
+    trace_service: DaemonAccountTraceService,
+) -> None:
     server, conn, _client = trace_enrichment_server
 
     result = await trace_service._trace_enrich_visible_dialogs(
@@ -405,15 +475,20 @@ async def test_trace_enrichment_deadline_exhaustion_persists_budget_gap(trace_en
         deadline_ms=0,
     )
 
-    fragment = conn.execute(
-        "SELECT status, last_error FROM trace_coverage_fragments WHERE target_user_id = 101"
-    ).fetchone()
+    fragment = cast(
+        tuple[str, str] | None,
+        conn.execute("SELECT status, last_error FROM trace_coverage_fragments WHERE target_user_id = 101").fetchone(),
+    )
+    assert fragment is not None
     assert result["fragment_status_counts"]["budget_exceeded"] == 1
     assert tuple(fragment) == ("budget_exceeded", "BudgetExceeded:0")
 
 
 @pytest.mark.asyncio
-async def test_trace_enrichment_channel_is_unsupported_without_search(trace_enrichment_server, trace_service) -> None:
+async def test_trace_enrichment_channel_is_unsupported_without_search(
+    trace_enrichment_server: tuple[DaemonAPIServer, sqlite3.Connection, FakeTraceClient],
+    trace_service: DaemonAccountTraceService,
+) -> None:
     server, conn, client = trace_enrichment_server
 
     result = await trace_service._trace_enrich_visible_dialogs(
@@ -421,14 +496,21 @@ async def test_trace_enrichment_channel_is_unsupported_without_search(trace_enri
         [{"dialog_id": -100123, "strategy": "signature_only", "topic_id": None}],
     )
 
-    fragment = conn.execute("SELECT status FROM trace_coverage_fragments WHERE target_user_id = 101").fetchone()
+    fragment = cast(
+        tuple[str] | None,
+        conn.execute("SELECT status FROM trace_coverage_fragments WHERE target_user_id = 101").fetchone(),
+    )
+    assert fragment is not None
     assert result["fragment_status_counts"]["unsupported"] == 1
     assert fragment[0] == "unsupported"
     assert client.calls == []
 
 
 @pytest.mark.asyncio
-async def test_trace_enrichment_generic_error_does_not_escape(trace_enrichment_server, trace_service) -> None:
+async def test_trace_enrichment_generic_error_does_not_escape(
+    trace_enrichment_server: tuple[DaemonAPIServer, sqlite3.Connection, FakeTraceClient],
+    trace_service: DaemonAccountTraceService,
+) -> None:
     server, conn, client = trace_enrichment_server
     client.exc = RuntimeError("boom")
 
@@ -437,9 +519,11 @@ async def test_trace_enrichment_generic_error_does_not_escape(trace_enrichment_s
         [{"dialog_id": 222, "strategy": "dialog_scan", "topic_id": None}],
     )
 
-    fragment = conn.execute(
-        "SELECT status, last_error FROM trace_coverage_fragments WHERE target_user_id = 101"
-    ).fetchone()
+    fragment = cast(
+        tuple[str, str] | None,
+        conn.execute("SELECT status, last_error FROM trace_coverage_fragments WHERE target_user_id = 101").fetchone(),
+    )
+    assert fragment is not None
     assert result["fragment_status_counts"]["partial"] == 1
     assert tuple(fragment) == ("partial", "RuntimeError")
 
@@ -451,7 +535,9 @@ def test_trace_enrichment_path_has_no_direct_messages_insert_string() -> None:
 
 @pytest.mark.asyncio
 async def test_trace_account_observed_mode_does_not_call_enrichment(
-    trace_enrichment_server, trace_service, monkeypatch
+    trace_enrichment_server: tuple[DaemonAPIServer, sqlite3.Connection, FakeTraceClient],
+    trace_service: DaemonAccountTraceService,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     server, conn, _client = trace_enrichment_server
     seed_entity(conn, entity_id=101, name="Me", username="me")
@@ -459,16 +545,19 @@ async def test_trace_account_observed_mode_does_not_call_enrichment(
     enrich = AsyncMock()
     monkeypatch.setattr(DaemonAccountTraceService, "_trace_enrich_visible_dialogs", enrich)
 
-    result = await trace_service._trace_account_messages({"exact_account_id": 101, "coverage_goal": "observed"})
+    result = _dict(await trace_service._trace_account_messages({"exact_account_id": 101, "coverage_goal": "observed"}))
 
     assert result["ok"] is True
     enrich.assert_not_called()
-    assert result["data"]["provenance"]["local_cache_writes"] == 0
+    provenance = _dict(_dict(result["data"])["provenance"])
+    assert provenance["local_cache_writes"] == 0
 
 
 @pytest.mark.asyncio
 async def test_trace_account_best_effort_calls_enrichment_and_reruns_db_query(
-    trace_enrichment_server, trace_service, monkeypatch
+    trace_enrichment_server: tuple[DaemonAPIServer, sqlite3.Connection, FakeTraceClient],
+    trace_service: DaemonAccountTraceService,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     server, conn, _client = trace_enrichment_server
     seed_entity(conn, entity_id=101, name="Me", username="me")
@@ -479,9 +568,9 @@ async def test_trace_account_best_effort_calls_enrichment_and_reruns_db_query(
     async def fake_enrich(
         _self: object,
         _target_user_id: int,
-        _candidates: list[dict],
+        _candidates: list[dict[str, object]],
         **_kwargs: object,
-    ) -> dict:
+    ) -> dict[str, object]:
         seed_message(conn, dialog_id=222, message_id=1, sent_at=1_700_000_000, text="from enrichment", sender_id=101)
         conn.commit()
         return {
@@ -503,9 +592,14 @@ async def test_trace_account_best_effort_calls_enrichment_and_reruns_db_query(
     )
 
     assert result["ok"] is True
-    data = result["data"]
-    assert data["groups"][0]["evidence"][0]["text"] == "from enrichment"
-    assert data["provenance"]["local_cache_writes"] == 1
-    assert data["provenance"]["enrichment"]["coverage_bounds"]["max_dialogs"] == 10
-    assert data["provenance"]["enrichment"]["coverage_bounds"]["max_per_dialog"] == 100
-    assert data["provenance"]["enrichment"]["coverage_bounds"]["deadline_ms"] == 15_000
+    data = _dict(_dict(result)["data"])
+    groups = cast(list[dict[str, object]], data["groups"])
+    evidence = cast(list[dict[str, object]], groups[0]["evidence"])
+    provenance = _dict(data["provenance"])
+    enrichment = _dict(provenance["enrichment"])
+    coverage_bounds = _dict(enrichment["coverage_bounds"])
+    assert evidence[0]["text"] == "from enrichment"
+    assert provenance["local_cache_writes"] == 1
+    assert coverage_bounds["max_dialogs"] == 10
+    assert coverage_bounds["max_per_dialog"] == 100
+    assert coverage_bounds["deadline_ms"] == 15_000
