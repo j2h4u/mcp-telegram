@@ -23,8 +23,9 @@ import contextlib
 import json
 import sqlite3
 import time
-from typing import Any, TypedDict, Unpack
-from unittest.mock import MagicMock
+from collections.abc import Iterator
+from dataclasses import dataclass
+from typing import TypedDict, cast
 
 import pytest
 
@@ -41,8 +42,24 @@ from mcp_telegram.sync_db import _apply_migrations
 # ---------------------------------------------------------------------------
 
 
+class _DialogRow(TypedDict):
+    dialog_id: int
+    linked_chat_id: int | None
+    linked_chat_resolved_at: int | None
+    name: str | None
+    type: str | None
+    hidden: int | None
+
+
+class _DialogRowSeed(TypedDict, total=False):
+    linked_chat_id: int | None
+    linked_chat_resolved_at: int | None
+    name: str | None
+    type_: str | None
+
+
 @contextlib.contextmanager
-def _make_db() -> sqlite3.Connection:
+def _make_db() -> Iterator[sqlite3.Connection]:
     conn = sqlite3.connect(":memory:")
     try:
         _apply_migrations(conn)
@@ -63,7 +80,7 @@ def _insert_entity(conn: sqlite3.Connection, entity_id: int) -> None:
 def _write_entity_details(
     conn: sqlite3.Connection,
     entity_id: int,
-    blob: dict,
+    blob: dict[str, object],
     fetched_at: int | None = None,
 ) -> None:
     """Write a row to entity_details for the given entity_id."""
@@ -77,30 +94,28 @@ def _write_entity_details(
     conn.commit()
 
 
-def _read_entity_details(conn: sqlite3.Connection, entity_id: int) -> dict | None:
-    row = conn.execute("SELECT detail_json FROM entity_details WHERE entity_id = ?", (entity_id,)).fetchone()
+def _read_entity_details(conn: sqlite3.Connection, entity_id: int) -> dict[str, object] | None:
+    row = cast(
+        tuple[str] | None,
+        conn.execute("SELECT detail_json FROM entity_details WHERE entity_id = ?", (entity_id,)).fetchone(),
+    )
     if row is None:
         return None
-    return json.loads(row[0])
-
-
-class _WriteDialogsRowKwargs(TypedDict, total=False):
-    linked_chat_id: int | None
-    linked_chat_resolved_at: int | None
-    name: str | None
-    type_: str | None
+    blob = cast(object, json.loads(row[0]))
+    assert isinstance(blob, dict), f"Expected JSON object, got {type(blob)}"
+    return cast(dict[str, object], blob)
 
 
 def _write_dialogs_row(
     conn: sqlite3.Connection,
     dialog_id: int,
-    **kwargs: Unpack[_WriteDialogsRowKwargs],
+    row: _DialogRowSeed,
 ) -> None:
     """Insert a minimal dialogs row for resolver tests."""
-    linked_chat_id = kwargs.get("linked_chat_id")
-    linked_chat_resolved_at = kwargs.get("linked_chat_resolved_at")
-    name = kwargs.get("name")
-    type_ = kwargs.get("type_")
+    linked_chat_id = row.get("linked_chat_id")
+    linked_chat_resolved_at = row.get("linked_chat_resolved_at")
+    name = row.get("name")
+    type_ = row.get("type_")
     conn.execute(
         "INSERT OR REPLACE INTO dialogs "
         "(dialog_id, name, type, linked_chat_id, linked_chat_resolved_at) "
@@ -110,28 +125,55 @@ def _write_dialogs_row(
     conn.commit()
 
 
-def _read_dialogs_row(conn: sqlite3.Connection, dialog_id: int) -> dict | None:
+def _read_dialogs_row(conn: sqlite3.Connection, dialog_id: int) -> _DialogRow | None:
     """Read a dialogs row as a dict, or None if absent."""
-    row = conn.execute(
-        "SELECT dialog_id, linked_chat_id, linked_chat_resolved_at, name, type, hidden "
-        "FROM dialogs WHERE dialog_id = ?",
-        (dialog_id,),
-    ).fetchone()
+    row = cast(
+        tuple[int, int | None, int | None, str | None, str | None, int | None] | None,
+        conn.execute(
+            "SELECT dialog_id, linked_chat_id, linked_chat_resolved_at, name, type, hidden "
+            "FROM dialogs WHERE dialog_id = ?",
+            (dialog_id,),
+        ).fetchone(),
+    )
     if row is None:
         return None
-    return {
-        "dialog_id": row[0],
-        "linked_chat_id": row[1],
-        "linked_chat_resolved_at": row[2],
-        "name": row[3],
-        "type": row[4],
-        "hidden": row[5],
-    }
+    return cast(
+        _DialogRow,
+        {
+            "dialog_id": row[0],
+            "linked_chat_id": row[1],
+            "linked_chat_resolved_at": row[2],
+            "name": row[3],
+            "type": row[4],
+            "hidden": row[5],
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
 # Fake client
 # ---------------------------------------------------------------------------
+
+
+@dataclass
+class _FakeFullChat:
+    linked_chat_id: int | None
+    participants_count: int | None = None
+    pinned_msg_id: int | None = None
+    about: str | None = None
+
+
+@dataclass
+class _FakeChat:
+    id: int
+    title: str | None = None
+    username: str | None = None
+
+
+@dataclass
+class _FakeFullResult:
+    full_chat: _FakeFullChat
+    chats: list[_FakeChat] | None = None
 
 
 class _FakeClient:
@@ -140,41 +182,41 @@ class _FakeClient:
     def __init__(
         self,
         *,
-        input_entity: Any = None,
+        input_entity: object = object(),
         input_entity_error: Exception | None = None,
-        full_channel_result: Any = None,
+        full_channel_result: _FakeFullResult | None = None,
         full_channel_error: Exception | None = None,
-    ):
+    ) -> None:
         self._input_entity = input_entity
         self._input_entity_error = input_entity_error
         self._full_channel_result = full_channel_result
         self._full_channel_error = full_channel_error
-        self.get_input_entity_calls: list[Any] = []
-        self.call_calls: list[Any] = []
+        self.get_input_entity_calls: list[int] = []
+        self.call_calls: list[object] = []
 
-    async def get_input_entity(self, dialog_id: Any) -> Any:
+    async def get_input_entity(self, dialog_id: int) -> object:
         self.get_input_entity_calls.append(dialog_id)
         if self._input_entity_error is not None:
             raise self._input_entity_error
         return self._input_entity
 
-    async def __call__(self, request: Any) -> Any:
+    async def __call__(self, request: object) -> object:
         self.call_calls.append(request)
         if self._full_channel_error is not None:
             raise self._full_channel_error
+        assert self._full_channel_result is not None
         return self._full_channel_result
 
 
-def _fake_full_channel_result(linked_chat_id: int | None, **kwargs: Any) -> Any:
+def _fake_full_channel_result(linked_chat_id: int | None, **kwargs: object) -> _FakeFullResult:
     """Build a fake GetFullChannelRequest result."""
-    full_chat = MagicMock()
-    full_chat.linked_chat_id = linked_chat_id
-    full_chat.participants_count = kwargs.get("participants_count")
-    full_chat.pinned_msg_id = kwargs.get("pinned_msg_id")
-    full_chat.about = kwargs.get("about")
-    result = MagicMock()
-    result.full_chat = full_chat
-    return result
+    full_chat = _FakeFullChat(
+        linked_chat_id=linked_chat_id,
+        participants_count=cast(int | None, kwargs.get("participants_count")),
+        pinned_msg_id=cast(int | None, kwargs.get("pinned_msg_id")),
+        about=cast(str | None, kwargs.get("about")),
+    )
+    return _FakeFullResult(full_chat=full_chat)
 
 
 # ---------------------------------------------------------------------------
@@ -183,8 +225,8 @@ def _fake_full_channel_result(linked_chat_id: int | None, **kwargs: Any) -> Any:
 
 
 @pytest.mark.asyncio
-async def test_resolve_input_peer_returns_entity():
-    fake_peer = MagicMock(name="InputPeerChannel")
+async def test_resolve_input_peer_returns_entity() -> None:
+    fake_peer = object()
     client = _FakeClient(input_entity=fake_peer)
     result = await resolve_input_peer(client, -100123456789)
     assert result is fake_peer
@@ -197,14 +239,14 @@ async def test_resolve_input_peer_returns_entity():
 
 
 @pytest.mark.asyncio
-async def test_resolve_input_peer_returns_none_on_access_loss():
+async def test_resolve_input_peer_returns_none_on_access_loss() -> None:
     client = _FakeClient(input_entity_error=ValueError("No user has id=-100123"))
     result = await resolve_input_peer(client, -100123456789)
     assert result is None, "Expected None on access-loss, got a value"
 
 
 @pytest.mark.asyncio
-async def test_resolve_input_peer_returns_none_on_key_error():
+async def test_resolve_input_peer_returns_none_on_key_error() -> None:
     """Any exception from get_input_entity must return None, not propagate."""
     client = _FakeClient(input_entity_error=KeyError("session miss"))
     result = await resolve_input_peer(client, -100111111111)
@@ -217,7 +259,7 @@ async def test_resolve_input_peer_returns_none_on_key_error():
 
 
 @pytest.mark.asyncio
-async def test_resolve_linked_chat_id_cache_hit_no_live_call():
+async def test_resolve_linked_chat_id_cache_hit_no_live_call() -> None:
     """A dialogs row with non-NULL linked_chat_resolved_at serves the answer
     without calling GetFullChannel (Phase 54: dialogs-first cache substrate)."""
     channel_id = -100200000001
@@ -229,11 +271,10 @@ async def test_resolve_linked_chat_id_cache_hit_no_live_call():
         _write_dialogs_row(
             conn,
             channel_id,
-            linked_chat_id=linked_id,
-            linked_chat_resolved_at=int(time.time()) - 99999,  # deliberately old — no TTL
+            {"linked_chat_id": linked_id, "linked_chat_resolved_at": int(time.time()) - 99999},
         )
 
-        client = _FakeClient(input_entity=MagicMock())
+        client = _FakeClient(input_entity=object())
         result = await resolve_linked_chat_id(client, conn, channel_id)
 
     assert result.linked_chat_id == linked_id
@@ -248,7 +289,7 @@ async def test_resolve_linked_chat_id_cache_hit_no_live_call():
 
 
 @pytest.mark.asyncio
-async def test_resolve_linked_chat_id_cache_miss_calls_once_and_merges():
+async def test_resolve_linked_chat_id_cache_miss_calls_once_and_merges() -> None:
     """On cache miss: GetFullChannel called once, result merged into existing blob."""
     channel_id = -100200000002
     raw_linked = 555666777  # positive bare id
@@ -268,7 +309,7 @@ async def test_resolve_linked_chat_id_cache_miss_calls_once_and_merges():
             about="updated about",
             participants_count=10000,
         )
-        client = _FakeClient(input_entity=MagicMock(), full_channel_result=full_result)
+        client = _FakeClient(input_entity=object(), full_channel_result=full_result)
 
         result = await resolve_linked_chat_id(client, conn, channel_id)
 
@@ -312,7 +353,7 @@ async def test_resolve_linked_chat_id_preserves_existing_keys():
         )
 
         full_result = _fake_full_channel_result(linked_chat_id=None)
-        client = _FakeClient(input_entity=MagicMock(), full_channel_result=full_result)
+        client = _FakeClient(input_entity=object(), full_channel_result=full_result)
         await resolve_linked_chat_id(client, conn, channel_id)
 
         written = _read_entity_details(conn, channel_id)
@@ -333,7 +374,7 @@ async def test_resolve_linked_chat_id_no_discussion_group():
 
     with _make_db() as conn:
         full_result = _fake_full_channel_result(linked_chat_id=None)
-        client = _FakeClient(input_entity=MagicMock(), full_channel_result=full_result)
+        client = _FakeClient(input_entity=object(), full_channel_result=full_result)
 
         result = await resolve_linked_chat_id(client, conn, channel_id)
 
@@ -356,7 +397,7 @@ async def test_resolve_linked_chat_id_flood_wait_no_sleep():
     with _make_db() as conn:
         flood_error = FloodWaitError(request=None, capture=120)
         client = _FakeClient(
-            input_entity=MagicMock(),
+            input_entity=object(),
             full_channel_error=flood_error,
         )
 
@@ -376,14 +417,14 @@ async def test_resolve_linked_chat_id_flood_wait_distinct_from_no_group():
     with _make_db() as conn:
         channel_id = -100200000006
         flood_error = FloodWaitError(request=None, capture=60)
-        client = _FakeClient(input_entity=MagicMock(), full_channel_error=flood_error)
+        client = _FakeClient(input_entity=object(), full_channel_error=flood_error)
 
         flood_result = await resolve_linked_chat_id(client, conn, channel_id)
 
         # No-discussion-group result
         channel_id2 = -100200000007
         full_result = _fake_full_channel_result(linked_chat_id=None)
-        client2 = _FakeClient(input_entity=MagicMock(), full_channel_result=full_result)
+        client2 = _FakeClient(input_entity=object(), full_channel_result=full_result)
         no_group_result = await resolve_linked_chat_id(client2, conn, channel_id2)
 
     assert flood_result.flood_wait_seconds is not None
@@ -436,12 +477,11 @@ async def test_resolve_linked_chat_id_dialogs_cache_hit_returns_without_telethon
         _write_dialogs_row(
             conn,
             channel_id,
-            linked_chat_id=expected_linked,
-            linked_chat_resolved_at=int(time.time()) - 99999,  # deliberately old — no TTL
+            {"linked_chat_id": expected_linked, "linked_chat_resolved_at": int(time.time()) - 99999},
         )
 
         # _FakeClient records all calls; on a cache hit, none should be made
-        client = _FakeClient(input_entity=MagicMock())
+        client = _FakeClient(input_entity=object())
 
         result = await resolve_linked_chat_id(client, conn, channel_id)
 
@@ -462,11 +502,10 @@ async def test_resolve_linked_chat_id_dialogs_cache_hit_null_linked_chat():
         _write_dialogs_row(
             conn,
             channel_id,
-            linked_chat_id=None,
-            linked_chat_resolved_at=int(time.time()) - 50,
+            {"linked_chat_id": None, "linked_chat_resolved_at": int(time.time()) - 50},
         )
 
-        client = _FakeClient(input_entity=MagicMock())
+        client = _FakeClient(input_entity=object())
 
         result = await resolve_linked_chat_id(client, conn, channel_id)
 
@@ -496,7 +535,7 @@ async def test_resolve_linked_chat_id_cold_path_upserts_dialogs():
         # No chats list → no title/username lookup for entities row
         full_result.chats = []
 
-        client = _FakeClient(input_entity=MagicMock(), full_channel_result=full_result)
+        client = _FakeClient(input_entity=object(), full_channel_result=full_result)
 
         before_call = int(time.time())
         result = await resolve_linked_chat_id(client, conn, channel_id)
@@ -553,7 +592,7 @@ async def test_resolve_linked_chat_id_schema_floor_raises_on_v23():
         raw_conn.commit()
 
         # The assertion fires before any Telethon call — client is never touched
-        client = _FakeClient(input_entity=MagicMock())
+        client = _FakeClient(input_entity=object())
 
         with pytest.raises(RuntimeError, match=r"requires schema v24\+"):
             await resolve_linked_chat_id(client, raw_conn, -1004444444444)
@@ -573,11 +612,10 @@ async def test_resolve_linked_chat_id_schema_floor_passes_on_v24():
         _write_dialogs_row(
             conn,
             channel_id,
-            linked_chat_id=-1006666666666,
-            linked_chat_resolved_at=int(time.time()),
+            {"linked_chat_id": -1006666666666, "linked_chat_resolved_at": int(time.time())},
         )
 
-        client = _FakeClient(input_entity=MagicMock())
+        client = _FakeClient(input_entity=object())
 
         # Must not raise
         result = await resolve_linked_chat_id(client, conn, channel_id)
@@ -602,13 +640,12 @@ async def test_resolve_linked_chat_id_flood_wait_leaves_dialogs_untouched():
         _write_dialogs_row(
             conn,
             channel_id,
-            linked_chat_id=None,
-            linked_chat_resolved_at=None,
+            {"linked_chat_id": None, "linked_chat_resolved_at": None},
         )
 
         flood_error = FloodWaitError(request=None, capture=42)
         client = _FakeClient(
-            input_entity=MagicMock(),
+            input_entity=object(),
             full_channel_error=flood_error,
         )
 
@@ -627,5 +664,10 @@ async def test_resolve_linked_chat_id_flood_wait_leaves_dialogs_untouched():
         )
 
         # No additional rows inserted
-        row_count = conn.execute("SELECT COUNT(*) FROM dialogs WHERE dialog_id = ?", (channel_id,)).fetchone()[0]
+        row_count_row = cast(
+            tuple[int] | None,
+            conn.execute("SELECT COUNT(*) FROM dialogs WHERE dialog_id = ?", (channel_id,)).fetchone(),
+        )
+        assert row_count_row is not None
+        row_count = row_count_row[0]
         assert row_count == 1, "exactly one dialogs row for this channel"

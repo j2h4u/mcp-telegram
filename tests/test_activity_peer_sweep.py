@@ -22,8 +22,7 @@ import asyncio
 import sqlite3
 import time
 from contextlib import closing
-from typing import Any
-from unittest.mock import MagicMock
+from typing import TypedDict, cast
 
 import pytest
 
@@ -44,6 +43,13 @@ from mcp_telegram.sync_db import _apply_migrations
 # ---------------------------------------------------------------------------
 
 
+class _ActivityRow(TypedDict):
+    dialog_id: int
+    source: str
+    last_activity_at: int | None
+    cold_status: str
+
+
 def _make_db() -> sqlite3.Connection:
     conn = sqlite3.connect(":memory:")
     _apply_migrations(conn)
@@ -59,18 +65,28 @@ def _insert_dialog(conn: sqlite3.Connection, dialog_id: int, dtype: str, last_me
     conn.commit()
 
 
-def _get_activity_row(conn: sqlite3.Connection, dialog_id: int) -> dict | None:
-    row = conn.execute(
-        "SELECT dialog_id, source, last_activity_at, cold_status FROM activity_dialog_state WHERE dialog_id = ?",
-        (dialog_id,),
-    ).fetchone()
+def _get_activity_row(conn: sqlite3.Connection, dialog_id: int) -> _ActivityRow | None:
+    row = cast(
+        tuple[int, str, int | None, str] | None,
+        conn.execute(
+            "SELECT dialog_id, source, last_activity_at, cold_status FROM activity_dialog_state WHERE dialog_id = ?",
+            (dialog_id,),
+        ).fetchone(),
+    )
     if row is None:
         return None
-    return {"dialog_id": row[0], "source": row[1], "last_activity_at": row[2], "cold_status": row[3]}
+    return {
+        "dialog_id": row[0],
+        "source": row[1],
+        "last_activity_at": row[2],
+        "cold_status": row[3],
+    }
 
 
 def _count_activity_rows(conn: sqlite3.Connection) -> int:
-    return conn.execute("SELECT COUNT(*) FROM activity_dialog_state").fetchone()[0]
+    row = cast(tuple[int] | None, conn.execute("SELECT COUNT(*) FROM activity_dialog_state").fetchone())
+    assert row is not None
+    return int(row[0])
 
 
 # ---------------------------------------------------------------------------
@@ -81,10 +97,12 @@ def _count_activity_rows(conn: sqlite3.Connection) -> int:
 class _FakeClient:
     """Minimal fake client; sweep_peer_once won't be called in builder tests."""
 
-    async def get_input_entity(self, dialog_id: int) -> Any:
-        return MagicMock()
+    async def get_input_entity(self, dialog_id: int) -> object:
+        del dialog_id
+        return object()
 
-    async def __call__(self, request: Any) -> Any:
+    async def __call__(self, request: object) -> object:
+        del request
         raise AssertionError("_FakeClient.__call__ should not be invoked in builder tests")
 
 
@@ -96,7 +114,8 @@ class _FakeResolver:
         self.call_count = 0
         self.called_with: list[int] = []
 
-    async def __call__(self, client: Any, conn: Any, channel_id: int) -> LinkedChatResolution:
+    async def __call__(self, client: object, conn: sqlite3.Connection, channel_id: int) -> LinkedChatResolution:
+        del client, conn
         self.call_count += 1
         self.called_with.append(channel_id)
         return self._mapping.get(channel_id, LinkedChatResolution(linked_chat_id=None, flood_wait_seconds=None))
@@ -107,7 +126,7 @@ class _FakeResolver:
 # ---------------------------------------------------------------------------
 
 
-def test_supergroup_type_selected_not_group(monkeypatch):
+def test_supergroup_type_selected_not_group(monkeypatch: pytest.MonkeyPatch) -> None:
     """dialogs.type='supergroup' IS enrolled; type='group' is NOT."""
     with closing(_make_db()) as conn:
         supergroup_id = -100100000001
@@ -135,7 +154,7 @@ def test_supergroup_type_selected_not_group(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_last_activity_at_from_dialogs(monkeypatch):
+def test_last_activity_at_from_dialogs(monkeypatch: pytest.MonkeyPatch) -> None:
     """build_working_set populates last_activity_at from dialogs.last_message_at."""
     with closing(_make_db()) as conn:
         peer_id = -100111111111
@@ -165,7 +184,7 @@ def test_last_activity_at_from_dialogs(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_channel_no_discussion_group_not_enrolled(monkeypatch):
+def test_channel_no_discussion_group_not_enrolled(monkeypatch: pytest.MonkeyPatch) -> None:
     """A broadcast channel with no linked_chat_id must not appear in activity_dialog_state."""
     with closing(_make_db()) as conn:
         channel_id = -100200000001
@@ -193,7 +212,7 @@ def test_channel_no_discussion_group_not_enrolled(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_dedup_supergroup_and_linked_chat(monkeypatch):
+def test_dedup_supergroup_and_linked_chat(monkeypatch: pytest.MonkeyPatch) -> None:
     """A peer that is both a supergroup and a channel's linked_chat appears exactly once."""
     with closing(_make_db()) as conn:
         supergroup_id = -100300000001
@@ -226,7 +245,7 @@ def test_dedup_supergroup_and_linked_chat(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_build_working_set_floodwait_halts_pass(monkeypatch):
+def test_build_working_set_floodwait_halts_pass(monkeypatch: pytest.MonkeyPatch) -> None:
     """FloodWait on the 2nd of 3 channels must halt the pass (break, not continue).
 
     Verifies the account-global FloodWait invariant: once Telegram issues a
@@ -250,7 +269,8 @@ def test_build_working_set_floodwait_halts_pass(monkeypatch):
         all_channel_ids = {channel_a, channel_b, channel_c}
         call_log: list[int] = []
 
-        async def mock_resolver(client: Any, conn: Any, channel_id: int) -> LinkedChatResolution:
+        async def mock_resolver(client: object, conn: sqlite3.Connection, channel_id: int) -> LinkedChatResolution:
+            del client, conn
             call_log.append(channel_id)
             if len(call_log) == 1:
                 # First channel visited → clean resolution with a linked chat
@@ -280,10 +300,13 @@ def test_build_working_set_floodwait_halts_pass(monkeypatch):
 
         # flood_channel's dialogs.linked_chat_resolved_at stays NULL (resolver's FloodWait
         # branch did not write to it — plan 02 task 3 guarantee)
-        row = conn.execute(
-            "SELECT linked_chat_resolved_at FROM dialogs WHERE dialog_id = ?",
-            (flood_channel,),
-        ).fetchone()
+        row = cast(
+            tuple[int | None] | None,
+            conn.execute(
+                "SELECT linked_chat_resolved_at FROM dialogs WHERE dialog_id = ?",
+                (flood_channel,),
+            ).fetchone(),
+        )
         assert row is not None
         assert row[0] is None, f"flood_channel linked_chat_resolved_at must stay NULL after FloodWait, got {row[0]!r}"
 
@@ -311,10 +334,13 @@ def test_enroll_does_not_overwrite_cursors():
         # Re-enroll (as happens on every build_working_set pass)
         enroll_activity_dialog(conn, peer_id, "supergroup", last_activity_at=2000)
 
-        row = conn.execute(
-            "SELECT hot_cursor, cold_status FROM activity_dialog_state WHERE dialog_id = ?",
-            (peer_id,),
-        ).fetchone()
+        row = cast(
+            tuple[int, str] | None,
+            conn.execute(
+                "SELECT hot_cursor, cold_status FROM activity_dialog_state WHERE dialog_id = ?",
+                (peer_id,),
+            ).fetchone(),
+        )
         assert row is not None
         assert row[0] == 999, "hot_cursor must be preserved across re-enrollment"
         assert row[1] == "running", "cold_status must be preserved across re-enrollment"
@@ -339,7 +365,10 @@ def test_enroll_never_downgrades_synced_dialogs():
 
         enroll_activity_dialog(conn, peer_id, "supergroup", last_activity_at=1000)
 
-        row = conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id = ?", (peer_id,)).fetchone()
+        row = cast(
+            tuple[str] | None,
+            conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id = ?", (peer_id,)).fetchone(),
+        )
         assert row is not None
         assert row[0] == "synced", f"Status must not be downgraded from 'synced' to 'own_only', got {row[0]!r}"
 
@@ -397,7 +426,13 @@ def test_dialog_state_column_allowlist_matches_table():
     updating an identity/bookkeeping column. Guard both directions.
     """
     with closing(_make_db()) as conn:
-        real_cols = {row[1] for row in conn.execute("PRAGMA table_info(activity_dialog_state)").fetchall()}
+        real_cols = {
+            row[1]
+            for row in cast(
+                list[tuple[int, str, str, int, str | None, int]],
+                conn.execute("PRAGMA table_info(activity_dialog_state)").fetchall(),
+            )
+        }
         # Every allowlisted column must exist in the table.
         missing = _DIALOG_STATE_COLUMNS - real_cols
         assert not missing, f"allowlist references non-existent columns: {missing}"
@@ -438,7 +473,10 @@ def test_enroll_does_not_downgrade_supergroup_source():
 
 
 def _source_of(conn: sqlite3.Connection, dialog_id: int) -> str | None:
-    row = conn.execute("SELECT source FROM activity_dialog_state WHERE dialog_id = ?", (dialog_id,)).fetchone()
+    row = cast(
+        tuple[str] | None,
+        conn.execute("SELECT source FROM activity_dialog_state WHERE dialog_id = ?", (dialog_id,)).fetchone(),
+    )
     return row[0] if row else None
 
 
@@ -455,10 +493,13 @@ def test_enroll_creates_thin_dialogs_row():
 
         enroll_activity_dialog(conn, peer_id, "supergroup", last_activity_at=1000)
 
-        row = conn.execute(
-            "SELECT needs_refresh, hidden, name FROM dialogs WHERE dialog_id = ?",
-            (peer_id,),
-        ).fetchone()
+        row = cast(
+            tuple[int, int, str | None] | None,
+            conn.execute(
+                "SELECT needs_refresh, hidden, name FROM dialogs WHERE dialog_id = ?",
+                (peer_id,),
+            ).fetchone(),
+        )
         assert row is not None, "enroll_activity_dialog must create a dialogs row"
         assert row[0] == 1, f"needs_refresh must be 1, got {row[0]!r}"
         assert row[1] == 0, f"hidden must be 0, got {row[1]!r}"
@@ -482,10 +523,13 @@ def test_enroll_does_not_clobber_resolved_dialog():
 
         enroll_activity_dialog(conn, peer_id, "supergroup", last_activity_at=1000)
 
-        row = conn.execute(
-            "SELECT name, type, needs_refresh FROM dialogs WHERE dialog_id = ?",
-            (peer_id,),
-        ).fetchone()
+        row = cast(
+            tuple[str, str, int] | None,
+            conn.execute(
+                "SELECT name, type, needs_refresh FROM dialogs WHERE dialog_id = ?",
+                (peer_id,),
+            ).fetchone(),
+        )
         assert row is not None
         assert row[0] == "Resolved Chat", f"name must not be clobbered, got {row[0]!r}"
         assert row[1] == "user", f"type must not be clobbered, got {row[1]!r}"

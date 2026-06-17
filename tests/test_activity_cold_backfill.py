@@ -18,11 +18,14 @@ import asyncio
 import contextlib
 import sqlite3
 import time
+from collections.abc import Iterator
+from typing import cast
 
 import pytest
 
 from mcp_telegram.activity_cold_backfill import (
     ColdPassOutcome,
+    ColdPassResult,
     run_cold_backfill_pass,
 )
 from mcp_telegram.activity_peer_sweep import (
@@ -39,8 +42,11 @@ from mcp_telegram.sync_db import _apply_migrations
 # ---------------------------------------------------------------------------
 
 
+_DialogState = dict[str, int | str | None]
+
+
 @contextlib.contextmanager
-def _make_db() -> contextlib.AbstractContextManager[sqlite3.Connection]:
+def _make_db() -> Iterator[sqlite3.Connection]:
     conn = sqlite3.connect(":memory:")
     try:
         _apply_migrations(conn)
@@ -59,7 +65,7 @@ def _enroll(
 ) -> None:
     """Enroll a peer in activity_dialog_state and optionally set cold fields."""
     enroll_activity_dialog(conn, dialog_id, "supergroup", last_activity_at=int(time.time()))
-    fields: dict = {}
+    fields: dict[str, int | str] = {}
     if cold_offset_id is not None:
         fields["cold_offset_id"] = cold_offset_id
     if cold_status != "pending":
@@ -70,8 +76,18 @@ def _enroll(
         _save_dialog_state(conn, dialog_id, **fields)
 
 
-def _get_state(conn: sqlite3.Connection, dialog_id: int) -> dict:
-    return _load_dialog_state(conn, dialog_id)
+def _get_state(conn: sqlite3.Connection, dialog_id: int) -> _DialogState:
+    return cast(_DialogState, _load_dialog_state(conn, dialog_id))
+
+
+class _FakeClient:
+    async def __call__(self, request: object) -> object:
+        del request
+        return object()
+
+    async def get_input_entity(self, dialog_id: int) -> object:
+        del dialog_id
+        return object()
 
 
 # ---------------------------------------------------------------------------
@@ -129,15 +145,18 @@ def _flood_result(seconds: int) -> SweepResult:
 # ---------------------------------------------------------------------------
 
 
-def _patch_sweep(monkeypatch, scripted: dict[int, list[SweepResult]]) -> dict:
+def _patch_sweep(
+    monkeypatch: pytest.MonkeyPatch, scripted: dict[int, list[SweepResult]]
+) -> dict[int, list[tuple[int, int]]]:
     """Patch sweep_peer_once to return scripted results per dialog_id.
 
     Returns a call_log: {dialog_id: [(offset_id, min_id), ...]}
     """
     call_log: dict[int, list[tuple[int, int]]] = {}
 
-    async def _fake(*args, offset_id, min_id, limit):
-        _client, _conn, dialog_id = args
+    async def _fake(*args: object, offset_id: int, min_id: int, limit: int) -> SweepResult:
+        del limit
+        _client, _conn, dialog_id = cast(tuple[object, object, int], args)
         call_log.setdefault(dialog_id, []).append((offset_id, min_id))
         queue = scripted.get(dialog_id, [])
         if queue:
@@ -152,8 +171,9 @@ def _patch_sweep(monkeypatch, scripted: dict[int, list[SweepResult]]) -> dict:
     return call_log
 
 
-def _patch_build_working_set(monkeypatch) -> None:
-    async def _noop(client, conn):
+def _patch_build_working_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def _noop(client: object, conn: sqlite3.Connection) -> int:
+        del client, conn
         return 0
 
     monkeypatch.setattr(
@@ -168,35 +188,35 @@ def _patch_build_working_set(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_no_due_peer_when_none_enrolled(monkeypatch):
+async def test_no_due_peer_when_none_enrolled(monkeypatch: pytest.MonkeyPatch) -> None:
     """With no enrolled peers, run_cold_backfill_pass returns NO_DUE_PEER."""
     with _make_db() as conn:
         shutdown = asyncio.Event()
-        result = await run_cold_backfill_pass(None, conn, shutdown)
+        result = await run_cold_backfill_pass(_FakeClient(), conn, shutdown)
         assert result.outcome == ColdPassOutcome.NO_DUE_PEER
         assert result.persisted == 0
 
 
 @pytest.mark.asyncio
-async def test_no_due_peer_when_all_complete(monkeypatch):
+async def test_no_due_peer_when_all_complete(monkeypatch: pytest.MonkeyPatch) -> None:
     """With all peers cold_status='complete', returns NO_DUE_PEER."""
     with _make_db() as conn:
         _enroll(conn, -100100000001, cold_status="complete")
         _patch_sweep(monkeypatch, {})
         shutdown = asyncio.Event()
-        result = await run_cold_backfill_pass(None, conn, shutdown)
+        result = await run_cold_backfill_pass(_FakeClient(), conn, shutdown)
         assert result.outcome == ColdPassOutcome.NO_DUE_PEER
 
 
 @pytest.mark.asyncio
-async def test_no_due_peer_when_retry_not_due(monkeypatch):
+async def test_no_due_peer_when_retry_not_due(monkeypatch: pytest.MonkeyPatch) -> None:
     """With cold_next_retry_at in the future, peer is not selected."""
     with _make_db() as conn:
         future = int(time.time()) + 7200
         _enroll(conn, -100100000002, cold_next_retry_at=future)
         _patch_sweep(monkeypatch, {})
         shutdown = asyncio.Event()
-        result = await run_cold_backfill_pass(None, conn, shutdown)
+        result = await run_cold_backfill_pass(_FakeClient(), conn, shutdown)
         assert result.outcome == ColdPassOutcome.NO_DUE_PEER
 
 
@@ -206,7 +226,7 @@ async def test_no_due_peer_when_retry_not_due(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_backward_walk_cold_offset_id_decreases(monkeypatch):
+async def test_backward_walk_cold_offset_id_decreases(monkeypatch: pytest.MonkeyPatch) -> None:
     """Each non-empty batch sets cold_offset_id = result.min_id (walks backward)."""
     with _make_db() as conn:
         dialog_id = -100200000001
@@ -227,18 +247,18 @@ async def test_backward_walk_cold_offset_id_decreases(monkeypatch):
         shutdown = asyncio.Event()
 
         # Pass 1
-        r1 = await run_cold_backfill_pass(None, conn, shutdown)
+        r1 = await run_cold_backfill_pass(_FakeClient(), conn, shutdown)
         assert r1.outcome == ColdPassOutcome.WROTE
         assert r1.persisted > 0
         state1 = _get_state(conn, dialog_id)
-        offset_after_pass1 = state1["cold_offset_id"]
+        offset_after_pass1 = cast(int, state1["cold_offset_id"])
         assert offset_after_pass1 == 100, f"After pass 1, cold_offset_id should be min_id=100, got {offset_after_pass1}"
 
         # Pass 2
-        r2 = await run_cold_backfill_pass(None, conn, shutdown)
+        r2 = await run_cold_backfill_pass(_FakeClient(), conn, shutdown)
         assert r2.outcome == ColdPassOutcome.WROTE
         state2 = _get_state(conn, dialog_id)
-        offset_after_pass2 = state2["cold_offset_id"]
+        offset_after_pass2 = cast(int, state2["cold_offset_id"])
         assert offset_after_pass2 == 50, f"After pass 2, cold_offset_id should be min_id=50, got {offset_after_pass2}"
         # Confirm offset decreased (walked backward)
         assert offset_after_pass2 < offset_after_pass1
@@ -250,7 +270,7 @@ async def test_backward_walk_cold_offset_id_decreases(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_history_floor_completes_peer(monkeypatch):
+async def test_history_floor_completes_peer(monkeypatch: pytest.MonkeyPatch) -> None:
     """SkipReason.HISTORY_FLOOR is the ONLY path that sets cold_status='complete'."""
     with _make_db() as conn:
         dialog_id = -100200000002
@@ -260,7 +280,7 @@ async def test_history_floor_completes_peer(monkeypatch):
         call_log = _patch_sweep(monkeypatch, scripted)
         shutdown = asyncio.Event()
 
-        result = await run_cold_backfill_pass(None, conn, shutdown)
+        result = await run_cold_backfill_pass(_FakeClient(), conn, shutdown)
 
         # Returns ZERO_PERSISTED (a peer was processed, just wrote 0 rows)
         assert result.outcome == ColdPassOutcome.ZERO_PERSISTED, (
@@ -275,7 +295,7 @@ async def test_history_floor_completes_peer(monkeypatch):
         assert state["cold_next_retry_at"] is None
 
         # On next pass the peer must NOT be selected (cold_status='complete')
-        r2 = await run_cold_backfill_pass(None, conn, shutdown)
+        r2 = await run_cold_backfill_pass(_FakeClient(), conn, shutdown)
         assert r2.outcome == ColdPassOutcome.NO_DUE_PEER, "Completed peer must not be selected on next pass"
         # sweep_peer_once was called only once (for the HISTORY_FLOOR pass)
         assert len(call_log.get(dialog_id, [])) == 1
@@ -287,7 +307,7 @@ async def test_history_floor_completes_peer(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_access_skip_does_not_complete(monkeypatch):
+async def test_access_skip_does_not_complete(monkeypatch: pytest.MonkeyPatch) -> None:
     """ACCESS_SKIP sets cold_next_retry_at+pending, leaves cold_offset_id unchanged."""
     with _make_db() as conn:
         dialog_id = -100200000003
@@ -299,7 +319,7 @@ async def test_access_skip_does_not_complete(monkeypatch):
         shutdown = asyncio.Event()
 
         before = int(time.time())
-        result = await run_cold_backfill_pass(None, conn, shutdown)
+        result = await run_cold_backfill_pass(_FakeClient(), conn, shutdown)
 
         # Returns ZERO_PERSISTED (a peer was processed)
         assert result.outcome == ColdPassOutcome.ZERO_PERSISTED, (
@@ -322,7 +342,7 @@ async def test_access_skip_does_not_complete(monkeypatch):
         assert state["cold_next_retry_at"] is not None, (
             "cold_next_retry_at must be set for transient backoff on ACCESS_SKIP"
         )
-        assert state["cold_next_retry_at"] > before, "cold_next_retry_at must be in the future"
+        assert cast(int, state["cold_next_retry_at"]) > before, "cold_next_retry_at must be in the future"
 
         # Peer must remain re-selectable (next_retry_at is in the future now,
         # but the field is set — a later pass after the backoff will re-select it)
@@ -334,7 +354,7 @@ async def test_access_skip_does_not_complete(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_no_time_ceiling_old_messages_collected(monkeypatch):
+async def test_no_time_ceiling_old_messages_collected(monkeypatch: pytest.MonkeyPatch) -> None:
     """Messages well beyond 30 days are collected — Tier B has NO time ceiling."""
     with _make_db() as conn:
         dialog_id = -100200000004
@@ -349,7 +369,7 @@ async def test_no_time_ceiling_old_messages_collected(monkeypatch):
         _patch_sweep(monkeypatch, scripted)
         shutdown = asyncio.Event()
 
-        result = await run_cold_backfill_pass(None, conn, shutdown)
+        result = await run_cold_backfill_pass(_FakeClient(), conn, shutdown)
 
         assert result.outcome == ColdPassOutcome.WROTE, (
             f"Old messages should be collected (no time ceiling), got {result.outcome}"
@@ -371,7 +391,7 @@ async def test_no_time_ceiling_old_messages_collected(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_flood_wait_sets_cold_retry_not_hot(monkeypatch):
+async def test_flood_wait_sets_cold_retry_not_hot(monkeypatch: pytest.MonkeyPatch) -> None:
     """FloodWait sets cold_next_retry_at and NEVER writes any hot_* column."""
     with _make_db() as conn:
         dialog_id = -100200000005
@@ -383,7 +403,7 @@ async def test_flood_wait_sets_cold_retry_not_hot(monkeypatch):
         shutdown = asyncio.Event()
 
         before = int(time.time())
-        result = await run_cold_backfill_pass(None, conn, shutdown)
+        result = await run_cold_backfill_pass(_FakeClient(), conn, shutdown)
 
         assert result.outcome == ColdPassOutcome.FLOOD_WAIT, (
             f"FloodWait should return FLOOD_WAIT outcome, got {result.outcome}"
@@ -394,7 +414,7 @@ async def test_flood_wait_sets_cold_retry_not_hot(monkeypatch):
 
         # cold_next_retry_at set in the future
         assert state["cold_next_retry_at"] is not None, "cold_next_retry_at must be set on FloodWait"
-        assert state["cold_next_retry_at"] >= before + flood_seconds, (
+        assert cast(int, state["cold_next_retry_at"]) >= before + flood_seconds, (
             f"cold_next_retry_at should be at least now+{flood_seconds}"
         )
 
@@ -417,7 +437,7 @@ async def test_flood_wait_sets_cold_retry_not_hot(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_cold_pass_never_writes_hot_columns(monkeypatch):
+async def test_cold_pass_never_writes_hot_columns(monkeypatch: pytest.MonkeyPatch) -> None:
     """A normal Tier B pass must NEVER write any hot_* column."""
     with _make_db() as conn:
         dialog_id = -100200000006
@@ -427,7 +447,7 @@ async def test_cold_pass_never_writes_hot_columns(monkeypatch):
         _patch_sweep(monkeypatch, scripted)
         shutdown = asyncio.Event()
 
-        await run_cold_backfill_pass(None, conn, shutdown)
+        await run_cold_backfill_pass(_FakeClient(), conn, shutdown)
 
         state = _get_state(conn, dialog_id)
         assert state.get("hot_cursor") is None, "Normal cold pass must NOT write hot_cursor"
@@ -442,7 +462,7 @@ async def test_cold_pass_never_writes_hot_columns(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_cold_pass_result_outcomes_matrix(monkeypatch):
+async def test_cold_pass_result_outcomes_matrix(monkeypatch: pytest.MonkeyPatch) -> None:
     """run_cold_backfill_pass returns the correct ColdPassResult for each scenario."""
     with _make_db() as conn:
         # Enroll four peers for the four scenarios
@@ -464,12 +484,12 @@ async def test_cold_pass_result_outcomes_matrix(monkeypatch):
         shutdown = asyncio.Event()
 
         # Collect all four pass results (each pass picks ONE peer; ORDER BY updated_at ASC)
-        outcomes: dict[str, ColdPassOutcome] = {}
+        outcomes: dict[ColdPassOutcome, ColdPassResult] = {}
         for _ in range(4):
-            r = await run_cold_backfill_pass(None, conn, shutdown)
+            r = await run_cold_backfill_pass(_FakeClient(), conn, shutdown)
             # Re-enable any access/flood peers so they are selectable on the next pass
             # (we just want one result per pass — this is a matrix, not chained state)
-            outcomes[r.outcome] = r  # type: ignore[assignment]
+            outcomes[r.outcome] = r
 
         # All four distinct outcomes must appear across the four passes
         assert ColdPassOutcome.WROTE in outcomes, "WROTE outcome missing"
@@ -486,7 +506,7 @@ async def test_cold_pass_result_outcomes_matrix(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_no_due_peer_outcome_when_all_gated(monkeypatch):
+async def test_no_due_peer_outcome_when_all_gated(monkeypatch: pytest.MonkeyPatch) -> None:
     """NO_DUE_PEER is returned when all enrolled peers are either complete or in future retry."""
     with _make_db() as conn:
         future = int(time.time()) + 3600
@@ -496,6 +516,6 @@ async def test_no_due_peer_outcome_when_all_gated(monkeypatch):
         _patch_sweep(monkeypatch, {})
         shutdown = asyncio.Event()
 
-        result = await run_cold_backfill_pass(None, conn, shutdown)
+        result = await run_cold_backfill_pass(_FakeClient(), conn, shutdown)
         assert result.outcome == ColdPassOutcome.NO_DUE_PEER
         assert result.persisted == 0

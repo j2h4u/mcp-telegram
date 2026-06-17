@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any, TypedDict, Unpack
+from pathlib import Path
+from typing import Protocol, TypedDict, Unpack, cast
 
 import pytest
 from telethon.tl.types import PeerUser
@@ -31,17 +33,25 @@ class FakeMessage:
     id: int
     date: datetime
     message: str
-    peer_id: Any
-    replies: Any = None
-    reactions: Any = None
+    peer_id: object
+    replies: object | None = None
+    reactions: object | None = None
     out: bool = True
+
+
+class _SearchEntityLike(Protocol):
+    id: int
+    first_name: str | None
+    last_name: str | None
+    title: str | None
+    username: str | None
 
 
 @dataclass
 class FakeSearchResult:
     messages: list[FakeMessage]
-    users: list[Any] = field(default_factory=list)
-    chats: list[Any] = field(default_factory=list)
+    users: list[_SearchEntityLike] = field(default_factory=list)
+    chats: list[_SearchEntityLike] = field(default_factory=list)
 
 
 class _MsgKwargs(TypedDict, total=False):
@@ -54,12 +64,12 @@ class _FakeClient:
     """Drives _run_backfill by returning scripted SearchRequest results,
     and drives _run_incremental via iter_messages async generator."""
 
-    def __init__(self, batches: list[Any], iter_msgs: list[FakeMessage] | None = None):
-        self._batches = list(batches)
-        self._iter_msgs = list(iter_msgs or [])
+    def __init__(self, batches: list[FakeSearchResult | Exception], iter_msgs: list[FakeMessage] | None = None):
+        self._batches: list[FakeSearchResult | Exception] = list(batches)
+        self._iter_msgs: list[FakeMessage] = list(iter_msgs or [])
         self.calls = 0
 
-    async def __call__(self, request: Any) -> Any:
+    async def __call__(self, request: object) -> FakeSearchResult:
         self.calls += 1
         if not self._batches:
             return FakeSearchResult(messages=[])
@@ -68,17 +78,24 @@ class _FakeClient:
             raise item
         return item
 
-    def iter_messages(self, *, entity=None, from_user=None):
+    async def get_input_entity(self, dialog_id: int) -> object:
+        del dialog_id
+        return object()
+
+    def iter_messages(
+        self, *, entity: object | None = None, from_user: object | None = None
+    ) -> AsyncIterator[FakeMessage]:
+        del entity, from_user
         msgs = self._iter_msgs
 
-        async def _gen():
+        async def _gen() -> AsyncIterator[FakeMessage]:
             for m in msgs:
                 yield m
 
         return _gen()
 
 
-def _make_db(tmp_path) -> sqlite3.Connection:
+def _make_db(tmp_path: Path) -> sqlite3.Connection:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     return sqlite3.connect(db_path)
@@ -100,7 +117,7 @@ def _msg(msg_id: int, user_id: int, ts: int, **kwargs: Unpack[_MsgKwargs]) -> Fa
 
 
 @pytest.fixture
-def conn(tmp_path):
+def conn(tmp_path: Path) -> Iterator[sqlite3.Connection]:
     connection = _make_db(tmp_path)
     try:
         yield connection
@@ -112,7 +129,7 @@ def conn(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_backfill_inserts_rows(conn):
+async def test_backfill_inserts_rows(conn: sqlite3.Connection) -> None:
     m1 = _msg(100, 42, 1_700_000_100, replies=2)
     m2 = _msg(99, 42, 1_700_000_090)
     client = _FakeClient(
@@ -128,25 +145,29 @@ async def test_backfill_inserts_rows(conn):
         "SELECT message_id, dialog_id, sent_at, out, reply_count FROM messages WHERE out = 1 ORDER BY message_id"
     ).fetchall()
     assert rows == [(99, 42, 1_700_000_090, 1, 0), (100, 42, 1_700_000_100, 1, 2)]
-    state = dict(conn.execute("SELECT key, value FROM activity_sync_state").fetchall())
+    state = dict(
+        cast(list[tuple[str, str | None]], conn.execute("SELECT key, value FROM activity_sync_state").fetchall())
+    )
     assert state["backfill_complete"] == "1"
     assert state["last_sync_at"] is not None
 
 
 @pytest.mark.asyncio
-async def test_backfill_respects_shutdown(conn):
+async def test_backfill_respects_shutdown(conn: sqlite3.Connection) -> None:
     client = _FakeClient(batches=[FakeSearchResult(messages=[_msg(100, 42, 1_700_000_000)])])
     shutdown = asyncio.Event()
     shutdown.set()
     await _run_backfill(client, conn, shutdown)
     # No iteration: loop condition is_set() returns immediately
-    state = dict(conn.execute("SELECT key, value FROM activity_sync_state").fetchall())
+    state = dict(
+        cast(list[tuple[str, str | None]], conn.execute("SELECT key, value FROM activity_sync_state").fetchall())
+    )
     assert state["backfill_complete"] == "0"
     assert client.calls == 0
 
 
 @pytest.mark.asyncio
-async def test_backfill_floodwait_recovers(conn):
+async def test_backfill_floodwait_recovers(conn: sqlite3.Connection) -> None:
     from telethon.errors import FloodWaitError
 
     class _FWError(FloodWaitError):
@@ -156,12 +177,14 @@ async def test_backfill_floodwait_recovers(conn):
     client = _FakeClient(batches=[_FWError(), FakeSearchResult(messages=[])])
     shutdown = asyncio.Event()
     await _run_backfill(client, conn, shutdown)
-    state = dict(conn.execute("SELECT key, value FROM activity_sync_state").fetchall())
+    state = dict(
+        cast(list[tuple[str, str | None]], conn.execute("SELECT key, value FROM activity_sync_state").fetchall())
+    )
     assert state["backfill_complete"] == "1"
 
 
 @pytest.mark.asyncio
-async def test_incremental_only_new_messages(conn):
+async def test_incremental_only_new_messages(conn: sqlite3.Connection) -> None:
     anchor_ts = 1_700_000_000
     with conn:
         conn.execute("UPDATE activity_sync_state SET value='1' WHERE key='backfill_complete'")
@@ -186,23 +209,31 @@ async def test_incremental_only_new_messages(conn):
     shutdown = asyncio.Event()
     await _run_incremental(client, conn, shutdown)
 
-    ids = [r[0] for r in conn.execute("SELECT message_id FROM messages WHERE out = 1 ORDER BY message_id").fetchall()]
+    ids = [
+        r[0]
+        for r in cast(
+            list[tuple[int]],
+            conn.execute("SELECT message_id FROM messages WHERE out = 1 ORDER BY message_id").fetchall(),
+        )
+    ]
     assert ids == [50, 51]
 
 
 @pytest.mark.asyncio
-async def test_incremental_skipped_before_backfill_complete(conn):
+async def test_incremental_skipped_before_backfill_complete(conn: sqlite3.Connection) -> None:
     # Client should never be called — backfill not complete.
     client = _FakeClient(batches=[FakeSearchResult(messages=[_msg(100, 42, 1_700_000_000)])])
     shutdown = asyncio.Event()
     await _run_incremental(client, conn, shutdown)
-    count = conn.execute("SELECT COUNT(*) FROM messages WHERE out = 1").fetchone()[0]
+    count_row = cast(tuple[int] | None, conn.execute("SELECT COUNT(*) FROM messages WHERE out = 1").fetchone())
+    assert count_row is not None
+    count = count_row[0]
     assert count == 0
     assert client.calls == 0
 
 
 @pytest.mark.asyncio
-async def test_incremental_skipped_when_messages_empty(conn):
+async def test_incremental_skipped_when_messages_empty(conn: sqlite3.Connection) -> None:
     """W5: backfill complete but last_sync_at not set — incremental must no-op."""
     with conn:
         conn.execute("UPDATE activity_sync_state SET value='1' WHERE key='backfill_complete'")
@@ -210,13 +241,15 @@ async def test_incremental_skipped_when_messages_empty(conn):
     client = _FakeClient(batches=[FakeSearchResult(messages=[_msg(100, 42, 1_700_000_000)])])
     shutdown = asyncio.Event()
     await _run_incremental(client, conn, shutdown)
-    count = conn.execute("SELECT COUNT(*) FROM messages WHERE out = 1").fetchone()[0]
+    count_row = cast(tuple[int] | None, conn.execute("SELECT COUNT(*) FROM messages WHERE out = 1").fetchone())
+    assert count_row is not None
+    count = count_row[0]
     assert count == 0
     assert client.calls == 0
 
 
 @pytest.mark.asyncio
-async def test_loop_shutdown_between_passes(conn):
+async def test_loop_shutdown_between_passes(conn: sqlite3.Connection) -> None:
     """run_activity_sync_loop returns when shutdown fires during interval sleep."""
     client = _FakeClient(batches=[FakeSearchResult(messages=[])])  # empty → backfill completes
     shutdown = asyncio.Event()
@@ -232,7 +265,7 @@ async def test_loop_shutdown_between_passes(conn):
 
 
 @pytest.mark.asyncio
-async def test_backfill_enrolls_dialog_as_own_only(conn):
+async def test_backfill_enrolls_dialog_as_own_only(conn: sqlite3.Connection) -> None:
     """After backfill writes a message in dialog 42, synced_dialogs has (42, 'own_only')."""
     m1 = _msg(100, 42, 1_700_000_100)
     client = _FakeClient(
@@ -243,13 +276,15 @@ async def test_backfill_enrolls_dialog_as_own_only(conn):
     )
     shutdown = asyncio.Event()
     await _run_backfill(client, conn, shutdown)
-    status = conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id = 42").fetchone()
-    assert status is not None, "dialog 42 must be enrolled after backfill"
-    assert status[0] == "own_only"
+    status_row = cast(
+        tuple[str] | None, conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id = 42").fetchone()
+    )
+    assert status_row is not None, "dialog 42 must be enrolled after backfill"
+    assert status_row[0] == "own_only"
 
 
 @pytest.mark.asyncio
-async def test_backfill_does_not_downgrade_synced_dialog(conn):
+async def test_backfill_does_not_downgrade_synced_dialog(conn: sqlite3.Connection) -> None:
     """If dialog 42 is already status='synced', backfill must NOT downgrade it to 'own_only'."""
     with conn:
         conn.execute(
@@ -265,12 +300,16 @@ async def test_backfill_does_not_downgrade_synced_dialog(conn):
     )
     shutdown = asyncio.Event()
     await _run_backfill(client, conn, shutdown)
-    status = conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id = 42").fetchone()[0]
+    status_row = cast(
+        tuple[str] | None, conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id = 42").fetchone()
+    )
+    assert status_row is not None
+    status = status_row[0]
     assert status == "synced", "INSERT OR IGNORE must preserve higher-status row — never downgrade to 'own_only'"
 
 
 @pytest.mark.asyncio
-async def test_incremental_anchor_ignores_higher_id_out0_row(conn):
+async def test_incremental_anchor_ignores_higher_id_out0_row(conn: sqlite3.Connection) -> None:
     """Resolves the cross-AI review divergence on the shared-table anchor.
 
     Concern (Codex HIGH): once full-sync rows coexist with activity-sync
@@ -319,17 +358,23 @@ async def test_incremental_anchor_ignores_higher_id_out0_row(conn):
     )
     shutdown = asyncio.Event()
     await _run_incremental(client, conn, shutdown)
-    own_ids = sorted(r[0] for r in conn.execute("SELECT message_id FROM messages WHERE out = 1").fetchall())
+    own_rows = cast(list[tuple[int]], conn.execute("SELECT message_id FROM messages WHERE out = 1").fetchall())
+    own_ids = sorted(r[0] for r in own_rows)
     assert own_ids == [3, 50], f"Incremental must capture id=3 from dialog 99 despite low per-chat id; got {own_ids}"
-    decoy_still_present = conn.execute("SELECT out FROM messages WHERE dialog_id=42 AND message_id=99999").fetchone()
-    assert decoy_still_present is not None and decoy_still_present[0] == 0, "Incoming row must remain unchanged"
+    decoy_row = cast(
+        tuple[int] | None, conn.execute("SELECT out FROM messages WHERE dialog_id=42 AND message_id=99999").fetchone()
+    )
+    assert decoy_row is not None and decoy_row[0] == 0, "Incoming row must remain unchanged"
 
 
 # -- D-02: SearchRequest RPC timeout tests -----------------------------------
 
 
 @pytest.mark.asyncio
-async def test_run_incremental_search_request_timeout(conn, caplog):
+async def test_run_incremental_search_request_timeout(
+    conn: sqlite3.Connection,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """_run_incremental exits and advances last_sync_at when SearchRequest hangs."""
     import logging
     from unittest.mock import patch
@@ -344,8 +389,13 @@ async def test_run_incremental_search_request_timeout(conn, caplog):
 
     # Client that hangs forever on __call__
     class _HangingClient:
-        async def __call__(self, request):
+        async def __call__(self, request: object) -> object:
+            del request
             await asyncio.Event().wait()  # hangs indefinitely
+
+        async def get_input_entity(self, dialog_id: int) -> object:
+            del dialog_id
+            return object()
 
     client = _HangingClient()
     shutdown = asyncio.Event()
@@ -360,7 +410,9 @@ async def test_run_incremental_search_request_timeout(conn, caplog):
             )
 
     # last_sync_at must have been advanced
-    state = dict(conn.execute("SELECT key, value FROM activity_sync_state").fetchall())
+    state = dict(
+        cast(list[tuple[str, str | None]], conn.execute("SELECT key, value FROM activity_sync_state").fetchall())
+    )
     assert state["last_sync_at"] != str(anchor_ts), "last_sync_at must be advanced after RPC timeout"
 
     timeout_logs = [r for r in caplog.records if "activity_sync_rpc_timeout" in r.getMessage()]
@@ -370,7 +422,10 @@ async def test_run_incremental_search_request_timeout(conn, caplog):
 
 
 @pytest.mark.asyncio
-async def test_run_backfill_search_request_timeout(conn, caplog):
+async def test_run_backfill_search_request_timeout(
+    conn: sqlite3.Connection,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """_run_backfill returns and logs when SearchRequest hangs."""
     import logging
     from unittest.mock import patch
@@ -378,8 +433,13 @@ async def test_run_backfill_search_request_timeout(conn, caplog):
     # backfill not complete — will attempt to run
 
     class _HangingClient:
-        async def __call__(self, request):
+        async def __call__(self, request: object) -> object:
+            del request
             await asyncio.Event().wait()
+
+        async def get_input_entity(self, dialog_id: int) -> object:
+            del dialog_id
+            return object()
 
     client = _HangingClient()
     shutdown = asyncio.Event()
@@ -392,7 +452,9 @@ async def test_run_backfill_search_request_timeout(conn, caplog):
             )
 
     # backfill_offset_id must not be corrupted (still 0 / initial value)
-    state = dict(conn.execute("SELECT key, value FROM activity_sync_state").fetchall())
+    state = dict(
+        cast(list[tuple[str, str | None]], conn.execute("SELECT key, value FROM activity_sync_state").fetchall())
+    )
     assert state.get("backfill_complete") != "1", "backfill must NOT be marked complete after a timeout"
 
     timeout_logs = [r for r in caplog.records if "activity_sync_backfill_rpc_timeout" in r.getMessage()]

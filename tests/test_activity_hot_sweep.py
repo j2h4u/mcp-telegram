@@ -23,7 +23,9 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
+from typing import cast
 
 import pytest
 
@@ -42,8 +44,11 @@ from mcp_telegram.sync_db import _apply_migrations
 # ---------------------------------------------------------------------------
 
 
+_DialogState = dict[str, int | str | None]
+
+
 @contextmanager
-def _make_db() -> sqlite3.Connection:
+def _make_db() -> Iterator[sqlite3.Connection]:
     conn = sqlite3.connect(":memory:")
     _apply_migrations(conn)
     try:
@@ -65,8 +70,18 @@ def _enroll(
         _save_dialog_state(conn, dialog_id, hot_cursor=hot_cursor)
 
 
-def _get_state(conn: sqlite3.Connection, dialog_id: int) -> dict:
-    return _load_dialog_state(conn, dialog_id)
+def _get_state(conn: sqlite3.Connection, dialog_id: int) -> _DialogState:
+    return cast(_DialogState, _load_dialog_state(conn, dialog_id))
+
+
+class _FakeClient:
+    async def __call__(self, request: object) -> object:
+        del request
+        return object()
+
+    async def get_input_entity(self, dialog_id: int) -> object:
+        del dialog_id
+        return object()
 
 
 def _get_messages(conn: sqlite3.Connection) -> list[tuple[int, int, int]]:
@@ -124,7 +139,10 @@ def _access_skip_result() -> SweepResult:
 # ---------------------------------------------------------------------------
 
 
-def _patch_sweep(monkeypatch, results_by_dialog: dict[int, list[SweepResult]]) -> dict:
+def _patch_sweep(
+    monkeypatch: pytest.MonkeyPatch,
+    results_by_dialog: dict[int, list[SweepResult]],
+) -> dict[int, list[tuple[int, int]]]:
     """Patch sweep_peer_once to return scripted results per dialog_id.
 
     results_by_dialog: {dialog_id: [result1, result2, ...]}
@@ -134,8 +152,9 @@ def _patch_sweep(monkeypatch, results_by_dialog: dict[int, list[SweepResult]]) -
     """
     call_log: dict[int, list[tuple[int, int]]] = {}
 
-    async def _fake_sweep(*args, offset_id, min_id, limit):
-        _client, _conn, dialog_id = args
+    async def _fake_sweep(*args: object, offset_id: int, min_id: int, limit: int) -> SweepResult:
+        del limit
+        _client, _conn, dialog_id = cast(tuple[object, object, int], args)
         call_log.setdefault(dialog_id, []).append((offset_id, min_id))
         queue = results_by_dialog.get(dialog_id, [])
         if queue:
@@ -150,10 +169,11 @@ def _patch_sweep(monkeypatch, results_by_dialog: dict[int, list[SweepResult]]) -
     return call_log
 
 
-def _patch_build_working_set(monkeypatch, enrolled_count: int = 0) -> None:
+def _patch_build_working_set(monkeypatch: pytest.MonkeyPatch, enrolled_count: int = 0) -> None:
     """Patch build_working_set to a no-op (enrollment already done in test)."""
 
-    async def _noop(client, conn):
+    async def _noop(client: object, conn: sqlite3.Connection) -> int:
+        del client, conn
         return enrolled_count
 
     monkeypatch.setattr(
@@ -168,7 +188,7 @@ def _patch_build_working_set(monkeypatch, enrolled_count: int = 0) -> None:
 
 
 @pytest.mark.asyncio
-async def test_stale_peer_not_selected(monkeypatch):
+async def test_stale_peer_not_selected(monkeypatch: pytest.MonkeyPatch) -> None:
     """A peer with last_activity_at > 30 days ago must not be swept."""
     with _make_db() as conn:
         stale_dialog_id = -100100000001
@@ -179,7 +199,7 @@ async def test_stale_peer_not_selected(monkeypatch):
         call_log = _patch_sweep(monkeypatch, {stale_dialog_id: []})
 
         shutdown = asyncio.Event()
-        written = await run_hot_sweep_pass(None, conn, shutdown)
+        written = await run_hot_sweep_pass(_FakeClient(), conn, shutdown)
 
         assert written == 0
         assert stale_dialog_id not in call_log, "Stale peer must not be swept — it is outside the 30-day window"
@@ -191,7 +211,7 @@ async def test_stale_peer_not_selected(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_first_pass_null_cursor(monkeypatch):
+async def test_first_pass_null_cursor(monkeypatch: pytest.MonkeyPatch) -> None:
     """First-ever sweep (hot_cursor IS NULL) uses min_id=0; hot_cursor = max msg_id."""
     with _make_db() as conn:
         dialog_id = -100100000002
@@ -207,7 +227,7 @@ async def test_first_pass_null_cursor(monkeypatch):
         call_log = _patch_sweep(monkeypatch, results)
 
         shutdown = asyncio.Event()
-        await run_hot_sweep_pass(None, conn, shutdown)
+        await run_hot_sweep_pass(_FakeClient(), conn, shutdown)
 
         # min_id on first call must be 0 (hot_cursor was NULL)
         assert dialog_id in call_log, "Active peer must be swept"
@@ -216,7 +236,9 @@ async def test_first_pass_null_cursor(monkeypatch):
 
         # hot_cursor must be the max seen message_id
         state = _get_state(conn, dialog_id)
-        assert state["hot_cursor"] == 30, f"hot_cursor should be 30 (max of batch), got {state['hot_cursor']}"
+        assert cast(int, state["hot_cursor"]) == 30, (
+            f"hot_cursor should be 30 (max of batch), got {state['hot_cursor']}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -225,7 +247,7 @@ async def test_first_pass_null_cursor(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_second_pass_inclusive_cursor_fix(monkeypatch):
+async def test_second_pass_inclusive_cursor_fix(monkeypatch: pytest.MonkeyPatch) -> None:
     """Second pass passes min_id = prior_hot_cursor + 1 (not prior_hot_cursor)."""
     with _make_db() as conn:
         dialog_id = -100100000003
@@ -242,7 +264,7 @@ async def test_second_pass_inclusive_cursor_fix(monkeypatch):
         call_log = _patch_sweep(monkeypatch, results)
 
         shutdown = asyncio.Event()
-        await run_hot_sweep_pass(None, conn, shutdown)
+        await run_hot_sweep_pass(_FakeClient(), conn, shutdown)
 
         assert dialog_id in call_log
         _, min_id_used = call_log[dialog_id][0]
@@ -251,10 +273,12 @@ async def test_second_pass_inclusive_cursor_fix(monkeypatch):
         )
 
         state = _get_state(conn, dialog_id)
-        assert state["hot_cursor"] == 70, f"hot_cursor should advance to 70 (max seen), got {state['hot_cursor']}"
+        assert cast(int, state["hot_cursor"]) == 70, (
+            f"hot_cursor should advance to 70 (max seen), got {state['hot_cursor']}"
+        )
 
         # hot_cursor must never go backward
-        assert state["hot_cursor"] >= prior_cursor
+        assert cast(int, state["hot_cursor"]) >= prior_cursor
 
 
 # ---------------------------------------------------------------------------
@@ -263,7 +287,7 @@ async def test_second_pass_inclusive_cursor_fix(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_multi_batch_window_paging(monkeypatch):
+async def test_multi_batch_window_paging(monkeypatch: pytest.MonkeyPatch) -> None:
     """When the new-message delta spans >1 page, a second SearchRequest is issued.
 
     The committed hot_cursor equals max_id across BOTH pages — messages from
@@ -302,7 +326,7 @@ async def test_multi_batch_window_paging(monkeypatch):
         call_log = _patch_sweep(monkeypatch, results)
 
         shutdown = asyncio.Event()
-        written = await run_hot_sweep_pass(None, conn, shutdown)
+        written = await run_hot_sweep_pass(_FakeClient(), conn, shutdown)
 
         # Two requests must have been issued
         assert len(call_log[dialog_id]) == 2, (
@@ -318,7 +342,7 @@ async def test_multi_batch_window_paging(monkeypatch):
 
         # hot_cursor committed ONCE after both pages drain — must equal global max
         state = _get_state(conn, dialog_id)
-        assert state["hot_cursor"] == max(page1_ids), (
+        assert cast(int, state["hot_cursor"]) == max(page1_ids), (
             f"hot_cursor should be global max={max(page1_ids)}, got {state['hot_cursor']}"
         )
 
@@ -332,7 +356,7 @@ async def test_multi_batch_window_paging(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_own_messages_persisted_with_out_flag(monkeypatch):
+async def test_own_messages_persisted_with_out_flag(monkeypatch: pytest.MonkeyPatch) -> None:
     """Messages swept by HotSweep are written via canonical pipeline (out=1)."""
     with _make_db() as conn:
         dialog_id = -100100000005
@@ -349,14 +373,14 @@ async def test_own_messages_persisted_with_out_flag(monkeypatch):
         _patch_sweep(monkeypatch, results)
 
         shutdown = asyncio.Event()
-        written = await run_hot_sweep_pass(None, conn, shutdown)
+        written = await run_hot_sweep_pass(_FakeClient(), conn, shutdown)
 
         # The sweep primitive itself inserts; we verify it was called and reported persisted=3
         assert written == 3, f"Expected 3 messages written, got {written}"
 
         # hot_cursor must advance
         state = _get_state(conn, dialog_id)
-        assert state["hot_cursor"] == 33
+        assert cast(int, state["hot_cursor"]) == 33
 
 
 # ---------------------------------------------------------------------------
@@ -365,7 +389,7 @@ async def test_own_messages_persisted_with_out_flag(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_flood_wait_sets_retry_at_and_persists_progress(monkeypatch):
+async def test_flood_wait_sets_retry_at_and_persists_progress(monkeypatch: pytest.MonkeyPatch) -> None:
     """On FloodWait: hot_next_retry_at is set, already-drained progress kept, no raise."""
     with _make_db() as conn:
         dialog_id = -100100000006
@@ -394,13 +418,13 @@ async def test_flood_wait_sets_retry_at_and_persists_progress(monkeypatch):
 
         before = int(time.time())
         shutdown = asyncio.Event()
-        written = await run_hot_sweep_pass(None, conn, shutdown)  # must NOT raise
+        written = await run_hot_sweep_pass(_FakeClient(), conn, shutdown)  # must NOT raise
 
         state = _get_state(conn, dialog_id)
 
         # hot_next_retry_at must be set in the future
         assert state["hot_next_retry_at"] is not None, "hot_next_retry_at must be set on FloodWait"
-        assert state["hot_next_retry_at"] >= before + flood_seconds, (
+        assert cast(int, state["hot_next_retry_at"]) >= before + flood_seconds, (
             f"hot_next_retry_at should be at least now+{flood_seconds}, got {state['hot_next_retry_at']}"
         )
 
@@ -410,7 +434,7 @@ async def test_flood_wait_sets_retry_at_and_persists_progress(monkeypatch):
 
         # Already-drained page 1 progress must be persisted (hot_cursor advanced past prior_cursor)
         assert state["hot_cursor"] is not None, "hot_cursor should be persisted for drained page 1"
-        assert state["hot_cursor"] == max(page1_ids), (
+        assert cast(int, state["hot_cursor"]) == max(page1_ids), (
             f"Drained page 1 max={max(page1_ids)} should be persisted, got {state['hot_cursor']}"
         )
 
@@ -424,7 +448,7 @@ async def test_flood_wait_sets_retry_at_and_persists_progress(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_access_skip_does_not_advance_cursor(monkeypatch):
+async def test_access_skip_does_not_advance_cursor(monkeypatch: pytest.MonkeyPatch) -> None:
     """On ACCESS_SKIP: hot_cursor stays unchanged, transient hot_next_retry_at set."""
     with _make_db() as conn:
         dialog_id = -100100000007
@@ -437,12 +461,12 @@ async def test_access_skip_does_not_advance_cursor(monkeypatch):
         _patch_sweep(monkeypatch, results)
 
         shutdown = asyncio.Event()
-        await run_hot_sweep_pass(None, conn, shutdown)
+        await run_hot_sweep_pass(_FakeClient(), conn, shutdown)
 
         state = _get_state(conn, dialog_id)
 
         # hot_cursor must NOT advance
-        assert state["hot_cursor"] == prior_cursor, (
+        assert cast(int, state["hot_cursor"]) == prior_cursor, (
             f"hot_cursor must stay at {prior_cursor} on ACCESS_SKIP, got {state['hot_cursor']}"
         )
 
@@ -450,7 +474,7 @@ async def test_access_skip_does_not_advance_cursor(monkeypatch):
         assert state["hot_next_retry_at"] is not None, (
             "hot_next_retry_at must be set for transient backoff on ACCESS_SKIP"
         )
-        assert state["hot_next_retry_at"] > now, "hot_next_retry_at must be in the future"
+        assert cast(int, state["hot_next_retry_at"]) > now, "hot_next_retry_at must be in the future"
 
         # No cold_* fields touched
         assert state.get("cold_offset_id") is None
@@ -463,7 +487,7 @@ async def test_access_skip_does_not_advance_cursor(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_hot_sweep_never_writes_cold_columns(monkeypatch):
+async def test_hot_sweep_never_writes_cold_columns(monkeypatch: pytest.MonkeyPatch) -> None:
     """The HotSweep pass must never touch cold_offset_id, cold_status, cold_next_retry_at."""
     with _make_db() as conn:
         now = int(time.time())
@@ -485,7 +509,7 @@ async def test_hot_sweep_never_writes_cold_columns(monkeypatch):
         _patch_sweep(monkeypatch, results)
 
         shutdown = asyncio.Event()
-        await run_hot_sweep_pass(None, conn, shutdown)
+        await run_hot_sweep_pass(_FakeClient(), conn, shutdown)
 
         for did in [fresh_id, flood_id, skip_id]:
             state = _get_state(conn, did)
@@ -499,7 +523,8 @@ async def test_hot_sweep_never_writes_cold_columns(monkeypatch):
             )
 
 
-async def test_flood_halts_whole_pass_account_safety(monkeypatch):
+@pytest.mark.asyncio
+async def test_flood_halts_whole_pass_account_safety(monkeypatch: pytest.MonkeyPatch) -> None:
     """ACCOUNT SAFETY: a FloodWait halts the ENTIRE pass, not just the current peer.
 
     FloodWait is account-global. Advancing to the next peer and issuing another
@@ -522,7 +547,7 @@ async def test_flood_halts_whole_pass_account_safety(monkeypatch):
         call_log = _patch_sweep(monkeypatch, {flood_first: [_flood_result(26)]})
 
         shutdown = asyncio.Event()
-        await run_hot_sweep_pass(None, conn, shutdown)
+        await run_hot_sweep_pass(_FakeClient(), conn, shutdown)
 
         # Only the first peer was swept; the pass halted on its FloodWait.
         assert set(call_log.keys()) == {flood_first}, (
