@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from mcp_telegram.daemon_api import DaemonAPIServer, _classify_dialog_type, get_daemon_socket_path
+from mcp_telegram.daemon_message import fetch_reaction_counts, message_to_dict
 from mcp_telegram.fts import MESSAGES_FTS_DDL, stem_text
 from mcp_telegram.models import DialogType
 
@@ -3264,8 +3265,6 @@ def test_msg_to_dict_edit_date() -> None:
     """_msg_to_dict includes edit_date as unix timestamp from msg.edit_date."""
     from datetime import datetime
 
-    from mcp_telegram.daemon_api import DaemonAPIServer
-
     mock_msg = MagicMock()
     mock_msg.id = 300
     mock_msg.date = MagicMock()
@@ -3280,7 +3279,7 @@ def test_msg_to_dict_edit_date() -> None:
     edit_dt = datetime(2023, 11, 14, 12, 0, 0, tzinfo=UTC)
     mock_msg.edit_date = edit_dt
 
-    result = DaemonAPIServer._msg_to_dict(mock_msg)
+    result = message_to_dict(mock_msg)
 
     assert "edit_date" in result, "edit_date key must be present in _msg_to_dict output"
     assert result["edit_date"] == int(edit_dt.timestamp())
@@ -3288,8 +3287,6 @@ def test_msg_to_dict_edit_date() -> None:
 
 def test_msg_to_dict_no_edit_date_is_none() -> None:
     """_msg_to_dict returns edit_date=None when msg.edit_date is None."""
-    from mcp_telegram.daemon_api import DaemonAPIServer
-
     mock_msg = MagicMock()
     mock_msg.id = 301
     mock_msg.date = MagicMock()
@@ -3302,7 +3299,7 @@ def test_msg_to_dict_no_edit_date_is_none() -> None:
     mock_msg.reactions = None
     mock_msg.edit_date = None
 
-    result = DaemonAPIServer._msg_to_dict(mock_msg)
+    result = message_to_dict(mock_msg)
 
     assert result.get("edit_date") is None
 
@@ -3731,17 +3728,13 @@ async def test_search_messages_global_omits_dialog_access():
 
 def test_fetch_reaction_counts_empty_list() -> None:
     """_fetch_reaction_counts returns {} for empty message_ids without hitting DB."""
-    from mcp_telegram.daemon_api import _fetch_reaction_counts
-
     conn = _make_db()
-    result = _fetch_reaction_counts(conn, dialog_id=1, message_ids=[])
+    result = fetch_reaction_counts(conn, dialog_id=1, message_ids=[])
     assert result == {}
 
 
 def test_fetch_reaction_counts_returns_grouped_by_message() -> None:
     """_fetch_reaction_counts groups reactions by message_id in DESC count order."""
-    from mcp_telegram.daemon_api import _fetch_reaction_counts
-
     conn = _make_db()
     _insert_synced_dialog(conn, 1)
     _insert_message(conn, 1, 10)
@@ -3760,7 +3753,7 @@ def test_fetch_reaction_counts_returns_grouped_by_message() -> None:
     )
     conn.commit()
 
-    result = _fetch_reaction_counts(conn, dialog_id=1, message_ids=[10, 20])
+    result = fetch_reaction_counts(conn, dialog_id=1, message_ids=[10, 20])
 
     assert 10 in result
     assert 20 in result
@@ -3772,8 +3765,6 @@ def test_fetch_reaction_counts_returns_grouped_by_message() -> None:
 
 def test_fetch_reaction_counts_missing_messages_omitted() -> None:
     """_fetch_reaction_counts omits message_ids that have no reactions."""
-    from mcp_telegram.daemon_api import _fetch_reaction_counts
-
     conn = _make_db()
     _insert_synced_dialog(conn, 1)
     _insert_message(conn, 1, 10)
@@ -3783,7 +3774,7 @@ def test_fetch_reaction_counts_missing_messages_omitted() -> None:
     )
     conn.commit()
 
-    result = _fetch_reaction_counts(conn, dialog_id=1, message_ids=[10, 99])
+    result = fetch_reaction_counts(conn, dialog_id=1, message_ids=[10, 99])
 
     assert 10 in result
     assert 99 not in result
@@ -3899,8 +3890,6 @@ async def test_global_search_returns_empty_reactions_display() -> None:
 
 def test_msg_to_dict_formats_reactions_display() -> None:
     """_msg_to_dict extracts reactions from Telethon message and formats display string."""
-    from mcp_telegram.daemon_api import DaemonAPIServer
-
     mock_reaction = MagicMock()
     mock_reaction.emoticon = "👍"
     mock_rc = MagicMock()
@@ -3924,7 +3913,7 @@ def test_msg_to_dict_formats_reactions_display() -> None:
     mock_msg.reactions = mock_reactions_obj
     mock_msg.edit_date = None
 
-    result = DaemonAPIServer._msg_to_dict(mock_msg)
+    result = message_to_dict(mock_msg)
 
     assert "reactions_display" in result
     assert "reactions" not in result  # bare 'reactions' key must not exist
@@ -3934,8 +3923,6 @@ def test_msg_to_dict_formats_reactions_display() -> None:
 
 def test_msg_to_dict_no_reactions_returns_empty_display() -> None:
     """_msg_to_dict returns reactions_display='' when msg.reactions is None."""
-    from mcp_telegram.daemon_api import DaemonAPIServer
-
     mock_msg = MagicMock()
     mock_msg.id = 1
     mock_msg.date = MagicMock()
@@ -3950,7 +3937,7 @@ def test_msg_to_dict_no_reactions_returns_empty_display() -> None:
     mock_msg.reactions = None
     mock_msg.edit_date = None
 
-    result = DaemonAPIServer._msg_to_dict(mock_msg)
+    result = message_to_dict(mock_msg)
 
     assert result["reactions_display"] == ""
     assert "reactions" not in result
@@ -4798,7 +4785,7 @@ def test_msg_to_dict_telethon_fallback_computes_effective_sender() -> None:
         edit_date=None,
         out=True,
     )
-    result = DaemonAPIServer._msg_to_dict(mock_msg, dialog_id=268071163, self_id=99999)
+    result = message_to_dict(mock_msg, dialog_id=268071163, self_id=99999)
     assert result["effective_sender_id"] == 99999
     assert result["is_service"] == 0
     assert result["out"] == 1
@@ -4823,7 +4810,7 @@ def test_msg_to_dict_telethon_fallback_dm_incoming() -> None:
         edit_date=None,
         out=False,
     )
-    result = DaemonAPIServer._msg_to_dict(mock_msg, dialog_id=268071163, self_id=99999)
+    result = message_to_dict(mock_msg, dialog_id=268071163, self_id=99999)
     assert result["effective_sender_id"] == 268071163
     assert result["is_service"] == 0
 
