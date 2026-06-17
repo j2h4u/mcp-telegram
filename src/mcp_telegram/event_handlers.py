@@ -188,6 +188,7 @@ class _EventHandlerClient(Protocol):
 
     async def __call__(self, request: object) -> object: ...
 
+
 _DM_AUTO_ENROLL_SENDER_EXCEPTIONS: tuple[type[BaseException], ...] = (
     RPCError,
     Exception,
@@ -663,7 +664,9 @@ class EventHandlerManager:
             extracted = extract_message_row(dialog_id, msg, entity_name_map=entity_name_map)
 
             with self._conn:
-                version_row = cast(tuple[int], self._conn.execute(_NEXT_VERSION_SQL, (dialog_id, message_id)).fetchone())
+                version_row = cast(
+                    tuple[int], self._conn.execute(_NEXT_VERSION_SQL, (dialog_id, message_id)).fetchone()
+                )
                 next_ver = int(version_row[0])
                 self._conn.execute(
                     _INSERT_VERSION_SQL,
@@ -864,7 +867,7 @@ class EventHandlerManager:
             return
         try:
             dialog_id = int(cast(int, get_peer_id(peer)))
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             logger.debug("raw_reaction_update_unparseable_peer peer=%r", peer)
             return
 
@@ -887,7 +890,7 @@ class EventHandlerManager:
                 wait,
             )
             return
-        except (RPCError, RuntimeError):
+        except RPCError, RuntimeError:
             logger.exception(
                 "event_raw_reaction_failed dialog_id=%d message_id=%d",
                 dialog_id,
@@ -939,7 +942,7 @@ class EventHandlerManager:
             inner_peer = dialog_peer.peer if isinstance(dialog_peer, _PeerContainer) else dialog_peer
             try:
                 dialog_id = int(cast(int, get_peer_id(inner_peer)))
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 continue
             if dialog_id in self._synced_dialog_ids:
                 pinned_ids.append(dialog_id)

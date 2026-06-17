@@ -220,7 +220,7 @@ async def run_hot_sweep_pass(
     rows = cast(
         list[tuple[int, int | None]],
         conn.execute(
-        """
+            """
         SELECT dialog_id, hot_cursor
         FROM activity_dialog_state
         WHERE last_activity_at IS NOT NULL
@@ -228,7 +228,7 @@ async def run_hot_sweep_pass(
           AND (hot_next_retry_at IS NULL OR hot_next_retry_at <= :now)
         ORDER BY last_activity_at DESC
         """,
-        {"cutoff": cutoff, "now": now},
+            {"cutoff": cutoff, "now": now},
         ).fetchall(),
     )
 

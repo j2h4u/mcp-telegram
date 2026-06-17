@@ -67,6 +67,7 @@ class _LoggerLike(Protocol):
         extra: Mapping[str, object] | None = None,
     ) -> None: ...
 
+
 DEFAULT_ACTIVITY_DIALOG_KINDS = ("group", "forum")
 _ALLOWED_ACTIVITY_DIALOG_KINDS = {"all", "user", "bot", "group", "forum", "channel", "unknown"}
 _ACTIVITY_DIALOG_KIND_ALIASES = {
@@ -133,7 +134,7 @@ def _clamp(value: int, low: int, high: int) -> int:
 def _coerce_int(value: object, default: int) -> int:
     try:
         return int(cast(int | str, value))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return default
 
 
@@ -380,19 +381,31 @@ class DaemonActivityStatsService:
 
         reactions = [
             {"emoji": r[0], "count": int(cast(int | str, r[1]))}
-            for r in cast(list[tuple[object, object]], self._deps.conn.execute(_GET_DIALOG_TOP_REACTIONS_SQL, (dialog_id, limit)).fetchall())
+            for r in cast(
+                list[tuple[object, object]],
+                self._deps.conn.execute(_GET_DIALOG_TOP_REACTIONS_SQL, (dialog_id, limit)).fetchall(),
+            )
         ]
         mentions = [
             {"value": r[0], "count": int(cast(int | str, r[1]))}
-            for r in cast(list[tuple[object, object]], self._deps.conn.execute(_GET_DIALOG_TOP_MENTIONS_SQL, (dialog_id, limit)).fetchall())
+            for r in cast(
+                list[tuple[object, object]],
+                self._deps.conn.execute(_GET_DIALOG_TOP_MENTIONS_SQL, (dialog_id, limit)).fetchall(),
+            )
         ]
         hashtags = [
             {"value": r[0], "count": int(cast(int | str, r[1]))}
-            for r in cast(list[tuple[object, object]], self._deps.conn.execute(_GET_DIALOG_TOP_HASHTAGS_SQL, (dialog_id, limit)).fetchall())
+            for r in cast(
+                list[tuple[object, object]],
+                self._deps.conn.execute(_GET_DIALOG_TOP_HASHTAGS_SQL, (dialog_id, limit)).fetchall(),
+            )
         ]
         forwards = [
             {"peer_id": r[0], "name": r[1], "count": int(cast(int | str, r[2]))}
-            for r in cast(list[tuple[object, object, object]], self._deps.conn.execute(_GET_DIALOG_TOP_FORWARDS_SQL, (dialog_id, limit)).fetchall())
+            for r in cast(
+                list[tuple[object, object, object]],
+                self._deps.conn.execute(_GET_DIALOG_TOP_FORWARDS_SQL, (dialog_id, limit)).fetchall(),
+            )
         ]
         return {
             "ok": True,
@@ -418,7 +431,11 @@ class DaemonActivityStatsService:
             ).fetchall(),
         )
 
-        state_rows = dict(cast(list[tuple[str, str]], self._deps.conn.execute("SELECT key, value FROM activity_sync_state").fetchall()))
+        state_rows = dict(
+            cast(
+                list[tuple[str, str]], self._deps.conn.execute("SELECT key, value FROM activity_sync_state").fetchall()
+            )
+        )
         backfill_complete = state_rows.get("backfill_complete") == "1"
         backfill_started = state_rows.get("backfill_started_at") is not None
         last_sync_at_str = state_rows.get("last_sync_at")
@@ -440,13 +457,15 @@ class DaemonActivityStatsService:
             for rx in cast(
                 list[tuple[object, object, object, object]],
                 self._deps.conn.execute(
-                f"SELECT dialog_id, message_id, emoji, count FROM message_reactions "
-                f"WHERE (dialog_id, message_id) IN (VALUES {rx_placeholders}) "
-                f"ORDER BY count DESC",
-                rx_params,
+                    f"SELECT dialog_id, message_id, emoji, count FROM message_reactions "
+                    f"WHERE (dialog_id, message_id) IN (VALUES {rx_placeholders}) "
+                    f"ORDER BY count DESC",
+                    rx_params,
                 ).fetchall(),
             ):
-                reactions_by_msg.setdefault((int(cast(int | str, rx[0])), int(cast(int | str, rx[1]))), []).append({"emoji": rx[2], "count": int(cast(int | str, rx[3]))})
+                reactions_by_msg.setdefault((int(cast(int | str, rx[0])), int(cast(int | str, rx[1]))), []).append(
+                    {"emoji": rx[2], "count": int(cast(int | str, rx[3]))}
+                )
 
         comments = [
             {

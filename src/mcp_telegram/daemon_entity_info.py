@@ -573,7 +573,9 @@ class DaemonEntityInfoService:
         try:
             photos_result = cast(
                 _UserPhotosResult,
-                await self._deps.client(self._deps.get_user_photos_request(user_id=user, offset=0, max_id=0, limit=100)),
+                await self._deps.client(
+                    self._deps.get_user_photos_request(user_id=user, offset=0, max_id=0, limit=100)
+                ),
             )
             avatar_count = int(photos_result.count)
             for photo in photos_result.photos:
@@ -763,7 +765,10 @@ class DaemonEntityInfoService:
         if isinstance(raw_reactions, self._deps.chat_reactions_all):
             return {"kind": "all", "emojis": []}
         if isinstance(raw_reactions, self._deps.chat_reactions_some):
-            emojis = [_opt_str_attr(r, "emoticon") for r in cast(Sequence[object], _attr(raw_reactions, "reactions", []) or [])]
+            emojis = [
+                _opt_str_attr(r, "emoticon")
+                for r in cast(Sequence[object], _attr(raw_reactions, "reactions", []) or [])
+            ]
             return {"kind": "some", "emojis": [emoji for emoji in emojis if emoji]}
         if isinstance(raw_reactions, self._deps.chat_reactions_none) or raw_reactions is None:
             return {"kind": "none", "emojis": []}
@@ -1032,7 +1037,9 @@ class DaemonEntityInfoService:
             chat_id = _opt_int_attr(chat, "id")
             if chat_id is None:
                 raise ValueError("chat id missing")
-            full_result = cast(_FullChatResult, await self._deps.client(self._deps.get_full_chat_request(chat_id=chat_id)))
+            full_result = cast(
+                _FullChatResult, await self._deps.client(self._deps.get_full_chat_request(chat_id=chat_id))
+            )
             full_chat = full_result.full_chat
             group_meta["full_chat"] = full_chat
             group_meta["about"] = _attr(full_chat, "about", None) or None

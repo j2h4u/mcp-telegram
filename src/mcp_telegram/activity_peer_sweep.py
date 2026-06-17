@@ -338,13 +338,13 @@ def _load_dialog_state(conn: sqlite3.Connection, dialog_id: int) -> dict[str, in
     row = cast(
         _DialogStateRow | None,
         conn.execute(
-        """
+            """
         SELECT hot_cursor, hot_last_sync_at, hot_next_retry_at, hot_last_error,
                cold_offset_id, cold_status, cold_next_retry_at, cold_last_error
         FROM activity_dialog_state
         WHERE dialog_id = ?
         """,
-        (dialog_id,),
+            (dialog_id,),
         ).fetchone(),
     )
     if row is None:
@@ -405,14 +405,18 @@ async def build_working_set(client: _ActivityClient, conn: sqlite3.Connection) -
     Returns the count of peers enrolled in the working set.
     """
     # Step 1: standalone supergroups (directly self-searchable)
-    supergroup_rows = cast(list[tuple[int, int | None]], conn.execute(
-        "SELECT dialog_id, last_message_at FROM dialogs WHERE type = 'supergroup' AND hidden = 0"
-    ).fetchall())
+    supergroup_rows = cast(
+        list[tuple[int, int | None]],
+        conn.execute(
+            "SELECT dialog_id, last_message_at FROM dialogs WHERE type = 'supergroup' AND hidden = 0"
+        ).fetchall(),
+    )
 
     # Step 2: broadcast channels (need linked_chat resolution)
-    channel_rows = cast(list[tuple[int, int | None]], conn.execute(
-        "SELECT dialog_id, last_message_at FROM dialogs WHERE type = 'channel' AND hidden = 0"
-    ).fetchall())
+    channel_rows = cast(
+        list[tuple[int, int | None]],
+        conn.execute("SELECT dialog_id, last_message_at FROM dialogs WHERE type = 'channel' AND hidden = 0").fetchall(),
+    )
 
     working_set: dict[int, int | None] = {}  # peer_id → last_activity_at
 

@@ -92,7 +92,7 @@ def _to_unix_timestamp_or_none(value: _SupportsTimestamp | None) -> int | None:
         return None
     try:
         return int(value.timestamp())
-    except (TypeError, ValueError, AttributeError):
+    except TypeError, ValueError, AttributeError:
         return None
 
 
@@ -181,10 +181,10 @@ def fetch_reaction_counts(
     rows = cast(
         list[tuple[int | float | str, object, int | float | str]],
         conn.execute(
-        f"SELECT message_id, emoji, count FROM message_reactions "
-        f"WHERE dialog_id = ? AND message_id IN ({placeholders}) "
-        f"ORDER BY count DESC, emoji",
-        [dialog_id, *message_ids],
+            f"SELECT message_id, emoji, count FROM message_reactions "
+            f"WHERE dialog_id = ? AND message_id IN ({placeholders}) "
+            f"ORDER BY count DESC, emoji",
+            [dialog_id, *message_ids],
         ).fetchall(),
     )
     result: dict[int, list[tuple[str, int]]] = {}

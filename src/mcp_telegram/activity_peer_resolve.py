@@ -195,7 +195,7 @@ def _extract_channel_identity(full_result: _FullResultLike, channel_id: int) -> 
         try:
             if int(cast(int | str, get_peer_id(chat))) == int(channel_id):
                 return chat.title, chat.username
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             continue
     return None, None
 

@@ -261,7 +261,7 @@ def _source_rows_after_identity_cursor(
     rows = cast(
         list[SourceRow],
         conn.execute(
-        """
+            """
         SELECT
           m.dialog_id, m.message_id, m.sent_at, m.text, m.sender_id,
           COALESCE(sender.name, m.sender_first_name) AS sender_first_name,
@@ -288,11 +288,11 @@ def _source_rows_after_identity_cursor(
         ORDER BY m.dialog_id ASC, m.message_id ASC
         LIMIT :limit_plus_one
         """,
-        {
-            "dialog_cursor": dialog_cursor,
-            "message_cursor": message_cursor,
-            "limit_plus_one": limit + 1,
-        },
+            {
+                "dialog_cursor": dialog_cursor,
+                "message_cursor": message_cursor,
+                "limit_plus_one": limit + 1,
+            },
         ).fetchall(),
     )
     return rows[:limit], len(rows) > limit
@@ -311,7 +311,7 @@ def _source_rows_after_update_watermark(
     rows = cast(
         list[SourceRow],
         conn.execute(
-        """
+            """
         SELECT
           m.dialog_id, m.message_id, m.sent_at, m.text, m.sender_id,
           COALESCE(sender.name, m.sender_first_name) AS sender_first_name,
@@ -344,15 +344,17 @@ def _source_rows_after_update_watermark(
         ORDER BY unit_updated_epoch ASC, m.dialog_id ASC, m.message_id ASC
         LIMIT :limit
         """,
-        {
-            "updated_after": updated_after_epoch,
-            "cursor_dialog": cursor_dialog,
-            "cursor_message": cursor_message,
-            "limit": limit + len(excluded_keys),
-        },
+            {
+                "updated_after": updated_after_epoch,
+                "cursor_dialog": cursor_dialog,
+                "cursor_message": cursor_message,
+                "limit": limit + len(excluded_keys),
+            },
         ).fetchall(),
     )
-    return [row for row in rows if (_row_int(row, "dialog_id"), _row_int(row, "message_id")) not in excluded_keys][:limit]
+    return [row for row in rows if (_row_int(row, "dialog_id"), _row_int(row, "message_id")) not in excluded_keys][
+        :limit
+    ]
 
 
 def _describe_source(req: dict) -> dict:
@@ -426,14 +428,14 @@ def _read_source_unit_window(conn: sqlite3.Connection, req: dict) -> dict:
     target = cast(
         object | None,
         conn.execute(
-        """
+            """
         SELECT 1
         FROM messages m
         JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id
         WHERE m.dialog_id = ? AND m.message_id = ? AND m.is_deleted = 0
           AND sd.status IN ('synced', 'syncing', 'access_lost')
         """,
-        (dialog_id, message_id),
+            (dialog_id, message_id),
         ).fetchone(),
     )
     if target is None:
@@ -442,7 +444,7 @@ def _read_source_unit_window(conn: sqlite3.Connection, req: dict) -> dict:
     rows = cast(
         list[SourceRow],
         conn.execute(
-        """
+            """
         WITH selected AS (
           SELECT dialog_id, message_id FROM (
             SELECT m.dialog_id, m.message_id
@@ -486,12 +488,12 @@ def _read_source_unit_window(conn: sqlite3.Connection, req: dict) -> dict:
         WHERE sd.status IN ('synced', 'syncing', 'access_lost')
         ORDER BY m.message_id ASC
         """,
-        {
-            "dialog_id": dialog_id,
-            "message_id": message_id,
-            "before": before,
-            "after": after,
-        },
+            {
+                "dialog_id": dialog_id,
+                "message_id": message_id,
+                "before": before,
+                "after": after,
+            },
         ).fetchall(),
     )
 

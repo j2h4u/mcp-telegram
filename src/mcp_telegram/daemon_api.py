@@ -108,14 +108,14 @@ def _row_mapping(row: object) -> Mapping[str, object]:
 def _row_value(row: object, key: str, default: object | None = None) -> object | None:
     try:
         return cast(object | None, row[key])  # type: ignore[index]
-    except (AttributeError, IndexError, KeyError, TypeError):
+    except AttributeError, IndexError, KeyError, TypeError:
         return default
 
 
 def _coerce_int(value: object, default: int) -> int:
     try:
         return int(cast(int | str, value))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return default
 
 
@@ -193,7 +193,7 @@ def _read_state_for_dialog(conn: sqlite3.Connection, dialog_id: int, dialog_type
     row = cast(
         tuple[object, object, object, object, object, object] | None,
         conn.execute(
-        """
+            """
         WITH sd AS (
           SELECT read_inbox_max_id AS in_c, read_outbox_max_id AS out_c
           FROM synced_dialogs WHERE dialog_id = :dialog_id
@@ -208,7 +208,7 @@ def _read_state_for_dialog(conn: sqlite3.Connection, dialog_id: int, dialog_type
         FROM messages m
         WHERE m.dialog_id = :dialog_id AND m.is_deleted = 0 AND m.is_service = 0
         """,
-        {"dialog_id": dialog_id},
+            {"dialog_id": dialog_id},
         ).fetchone(),
     )
     # ``row`` is always a single aggregate row (SUM/MIN with no FROM rows yield NULL).
@@ -216,7 +216,11 @@ def _read_state_for_dialog(conn: sqlite3.Connection, dialog_id: int, dialog_type
     # identical to the previous two-query behaviour.
     read_inbox_max_id = cast(int | None, row[0]) if row is not None else None
     read_outbox_max_id = cast(int | None, row[1]) if row is not None else None
-    agg_row = cast(tuple[int | None, int | None, int | None, int | None], (row[2], row[3], row[4], row[5])) if row is not None else (None, None, None, None)
+    agg_row = (
+        cast(tuple[int | None, int | None, int | None, int | None], (row[2], row[3], row[4], row[5]))
+        if row is not None
+        else (None, None, None, None)
+    )
     in_cnt = int(agg_row[0] or 0)
     out_cnt = int(agg_row[1] or 0)
     in_min = cast(int | None, agg_row[2])
@@ -357,6 +361,7 @@ class _ListMessagesDbRequest(Protocol):
     sender_name: str | None
     topic_id: int | None
     unread_after_id: int | None
+
 
 if TYPE_CHECKING:
     from .daemon_account_trace import _AccountTraceClientLike
@@ -506,7 +511,10 @@ def _build_access_metadata(
     meta: dict = {"dialog_access": "archived" if status == "access_lost" else "live"}
 
     if status == "access_lost":
-        row = cast(tuple[object, object, object, object, object] | None, conn.execute(_SELECT_DIALOG_ACCESS_META_SQL, (dialog_id,)).fetchone())
+        row = cast(
+            tuple[object, object, object, object, object] | None,
+            conn.execute(_SELECT_DIALOG_ACCESS_META_SQL, (dialog_id,)).fetchone(),
+        )
         if row:
             _, total_messages, access_lost_at, last_synced_at, last_event_at = row
             total_messages_i = cast(int | None, total_messages)
@@ -987,7 +995,7 @@ class DaemonAPIServer:
         rows = cast(
             list[tuple[int]],
             self._conn.execute(
-            "SELECT dialog_id FROM synced_dialogs WHERE dialog_id > 0 AND status != 'access_lost'"
+                "SELECT dialog_id FROM synced_dialogs WHERE dialog_id > 0 AND status != 'access_lost'"
             ).fetchall(),
         )
         return {row[0] for row in rows}
@@ -1163,7 +1171,7 @@ class DaemonAPIServer:
         try:
             entity = await self._client.get_entity(dialog)
             return int(cast(int, telethon_utils.get_peer_id(entity)))
-        except (ValueError, KeyError):
+        except ValueError, KeyError:
             pass
         except Exception:
             logger.debug("get_entity failed for %r, falling back to entities DB", dialog, exc_info=True)
@@ -1250,7 +1258,9 @@ class DaemonAPIServer:
         if matched_dialog is not None:
             entity = _attr(matched_dialog, "entity", None)
             if entity is None:
-                raise ValueError(f"Dialog {dialog!r} not found. Check the dialog name or use dialog_id from ListDialogs.")
+                raise ValueError(
+                    f"Dialog {dialog!r} not found. Check the dialog name or use dialog_id from ListDialogs."
+                )
             return int(cast(int, telethon_utils.get_peer_id(entity)))
 
         raise ValueError(f"Dialog {dialog!r} not found. Check the dialog name or use dialog_id from ListDialogs.")
@@ -1432,7 +1442,9 @@ class DaemonAPIServer:
                 "message": "Either dialog_id or dialog name is required for list_topics",
             }
 
-        rows = cast(list[tuple[object, object, object, object]], self._conn.execute(_LIST_TOPICS_SQL, (dialog_id,)).fetchall())
+        rows = cast(
+            list[tuple[object, object, object, object]], self._conn.execute(_LIST_TOPICS_SQL, (dialog_id,)).fetchall()
+        )
         topics = [
             {
                 "id": int(cast(int | str, row[0])),
@@ -1510,7 +1522,10 @@ class DaemonAPIServer:
         - Positive → DM/small group → "best-effort weekly (DM)"
         """
         dialog_id = _coerce_int(req.get("dialog_id", 0), 0)
-        row = cast(tuple[object, object, object, object, object, object] | None, self._conn.execute(_GET_SYNC_STATUS_SQL, (dialog_id,)).fetchone())
+        row = cast(
+            tuple[object, object, object, object, object, object] | None,
+            self._conn.execute(_GET_SYNC_STATUS_SQL, (dialog_id,)).fetchone(),
+        )
 
         if row is not None:
             status = str(row[0])
@@ -1562,7 +1577,10 @@ class DaemonAPIServer:
         since = _coerce_int(req.get("since", 0), 0)
         limit = _clamp(_coerce_int(req.get("limit", 50), 50), 1, 500)
 
-        deleted_rows = cast(list[tuple[object, object, object, object]], self._conn.execute(_GET_DELETED_ALERTS_SQL, (since, limit)).fetchall())
+        deleted_rows = cast(
+            list[tuple[object, object, object, object]],
+            self._conn.execute(_GET_DELETED_ALERTS_SQL, (since, limit)).fetchall(),
+        )
         deleted_messages = [
             {
                 "dialog_id": r[0],
@@ -1573,7 +1591,10 @@ class DaemonAPIServer:
             for r in deleted_rows
         ]
 
-        edit_rows = cast(list[tuple[object, object, object, object, object]], self._conn.execute(_GET_EDIT_ALERTS_SQL, (since, limit)).fetchall())
+        edit_rows = cast(
+            list[tuple[object, object, object, object, object]],
+            self._conn.execute(_GET_EDIT_ALERTS_SQL, (since, limit)).fetchall(),
+        )
         edits = [
             {
                 "dialog_id": r[0],
@@ -1585,7 +1606,9 @@ class DaemonAPIServer:
             for r in edit_rows
         ]
 
-        access_lost_rows = cast(list[tuple[object, object]], self._conn.execute(_GET_ACCESS_LOST_ALERTS_SQL, (since,)).fetchall())
+        access_lost_rows = cast(
+            list[tuple[object, object]], self._conn.execute(_GET_ACCESS_LOST_ALERTS_SQL, (since,)).fetchall()
+        )
         access_lost = [
             {
                 "dialog_id": r[0],
@@ -1779,13 +1802,13 @@ class DaemonAPIServer:
             rows = cast(
                 list[Mapping[str, object]],
                 self._conn.execute(
-                _FETCH_UNREAD_MESSAGES_SQL,
-                {
-                    "dialog_id": chat_id,
-                    "after_msg_id": entry["read_inbox_max_id"],
-                    "limit": budget,
-                    "self_id": self.self_id,
-                },
+                    _FETCH_UNREAD_MESSAGES_SQL,
+                    {
+                        "dialog_id": chat_id,
+                        "after_msg_id": entry["read_inbox_max_id"],
+                        "limit": budget,
+                        "self_id": self.self_id,
+                    },
                 ).fetchall(),
             )
             msg_ids = [int(cast(int | str, r["message_id"])) for r in rows]
@@ -2113,7 +2136,10 @@ class DaemonAPIServer:
         # @username lookup
         if query.startswith("@"):
             username_query = query[1:]
-            row = cast(tuple[object, object, object, object] | None, self._conn.execute(_ENTITY_BY_USERNAME_SQL, (username_query,)).fetchone())
+            row = cast(
+                tuple[object, object, object, object] | None,
+                self._conn.execute(_ENTITY_BY_USERNAME_SQL, (username_query,)).fetchone(),
+            )
             if row:
                 return {
                     "ok": True,
@@ -2126,8 +2152,18 @@ class DaemonAPIServer:
             return {"ok": True, "data": {"result": "not_found", "query": query}}
 
         now = int(time.time())
-        display_name_map = dict(cast(list[tuple[int, str]], self._conn.execute(_ALL_ENTITY_NAMES_SQL, (now - USER_TTL, now - GROUP_TTL)).fetchall()))
-        normalized = dict(cast(list[tuple[int, str]], self._conn.execute(_ALL_ENTITY_NAMES_NORMALIZED_SQL, (now - USER_TTL, now - GROUP_TTL)).fetchall()))
+        display_name_map = dict(
+            cast(
+                list[tuple[int, str]],
+                self._conn.execute(_ALL_ENTITY_NAMES_SQL, (now - USER_TTL, now - GROUP_TTL)).fetchall(),
+            )
+        )
+        normalized = dict(
+            cast(
+                list[tuple[int, str]],
+                self._conn.execute(_ALL_ENTITY_NAMES_NORMALIZED_SQL, (now - USER_TTL, now - GROUP_TTL)).fetchall(),
+            )
+        )
 
         result = resolve_entity_sync(query, display_name_map, None, normalized_name_map=normalized)
 

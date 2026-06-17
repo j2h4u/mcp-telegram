@@ -376,7 +376,9 @@ class DaemonAccountTraceService:
                 query=f"@{username}",
                 resolution_source="telegram_username_lookup_write_failed",
             )
-        return _trace_account_from_entity_row(cast(Mapping[str, object], row), resolution_source="telegram_username_lookup")
+        return _trace_account_from_entity_row(
+            cast(Mapping[str, object], row), resolution_source="telegram_username_lookup"
+        )
 
     @staticmethod
     def _build_trace_account_unresolved_payload(
@@ -522,7 +524,9 @@ class DaemonAccountTraceService:
                 if item.get("topic_title"):
                     label = f"{label} / {item['topic_title']}"
             else:
-                day = datetime.fromtimestamp(_row_int(cast(Mapping[str, object], item), "sent_at"), tz=UTC).strftime("%Y-%m-%d")
+                day = datetime.fromtimestamp(_row_int(cast(Mapping[str, object], item), "sent_at"), tz=UTC).strftime(
+                    "%Y-%m-%d"
+                )
                 key = f"day:{day}"
                 label = day
             if key not in groups:
@@ -897,7 +901,10 @@ async def _run_trace_visible_candidates(
                 deadline_at=request.deadline_at,
             )
 
-    return cast(list[_TraceCandidateEnrichmentResult], await asyncio.gather(*(run_candidate(candidate) for candidate in request.candidates)))
+    return cast(
+        list[_TraceCandidateEnrichmentResult],
+        await asyncio.gather(*(run_candidate(candidate) for candidate in request.candidates)),
+    )
 
 
 def _trace_post_author_aliases(resolved_account: dict) -> list[str]:
@@ -1704,7 +1711,10 @@ def _dialog_status_map(conn: sqlite3.Connection, dialog_ids: set[int]) -> dict[i
         )
     )
     result: dict[int, str | None] = {
-        _row_int(cast(Mapping[str, object], {"dialog_id": _row_sequence(row)[0], "status": _row_sequence(row)[1]}), "dialog_id"): str(_row_sequence(row)[1])
+        _row_int(
+            cast(Mapping[str, object], {"dialog_id": _row_sequence(row)[0], "status": _row_sequence(row)[1]}),
+            "dialog_id",
+        ): str(_row_sequence(row)[1])
         for row in rows
     }
     for dialog_id in dialog_ids:
@@ -2061,7 +2071,7 @@ def _trace_common_chat_ids(conn: sqlite3.Connection, target_user_id: int) -> lis
         return []
     try:
         detail = cast(dict[str, object], json.loads(str(_row_sequence(row)[0])))
-    except (TypeError, json.JSONDecodeError):
+    except TypeError, json.JSONDecodeError:
         return []
     common_chats = detail.get("common_chats", [])
     if not isinstance(common_chats, list):
@@ -2075,7 +2085,7 @@ def _trace_common_chat_ids(conn: sqlite3.Connection, target_user_id: int) -> lis
             continue
         try:
             ids.append(int(raw_id))
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             continue
     return ids
 

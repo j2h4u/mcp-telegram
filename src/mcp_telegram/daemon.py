@@ -118,6 +118,7 @@ class _MessagesTotalLike(Protocol):
 class _MeLike(Protocol):
     id: int
 
+
 HEARTBEAT_INTERVAL_S: float = 60.0
 GAP_SCAN_INTERVAL_S: float = 7 * 24 * 3600.0
 SECONDS_PER_MINUTE = 60

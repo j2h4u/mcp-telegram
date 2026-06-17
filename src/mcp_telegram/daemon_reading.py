@@ -150,7 +150,7 @@ def _fetchall_rows(cursor: sqlite3.Cursor) -> list[object]:
 def _row_value(row: object, key: str, default: object | None = None) -> object | None:
     try:
         return cast(object | None, row[key])  # type: ignore[index]
-    except (AttributeError, IndexError, KeyError, TypeError):
+    except AttributeError, IndexError, KeyError, TypeError:
         return default
 
 
@@ -205,9 +205,7 @@ def _read_message_from_row(row: object) -> api.ReadMessage:
         deleted_at=_object_to_int_or_none(cast(object | None, _row_value(row, "deleted_at"))),
         edit_date=_object_to_int_or_none(cast(object | None, _row_value(row, "edit_date"))),
         topic_title=_object_to_str_or_none(cast(object | None, _row_value(row, "topic_title"))),
-        effective_sender_id=_object_to_int_or_none(
-            cast(object | None, _row_value(row, "effective_sender_id"))
-        ),
+        effective_sender_id=_object_to_int_or_none(cast(object | None, _row_value(row, "effective_sender_id"))),
         is_service=_object_to_int(cast(object | None, _row_value(row, "is_service")), 0),
         out=_object_to_int(cast(object | None, _row_value(row, "out")), 0),
         fwd_from_name=_object_to_str_or_none(cast(object | None, _row_value(row, "fwd_from_name"))),
@@ -497,15 +495,17 @@ class DaemonReadingService:
         request: _SearchMessagesRequest,
         stemmed: str,
     ) -> dict:
-        rows = _fetchall_rows(self._conn.execute(
-            api._SELECT_FTS_ALL_SQL,
-            {
-                "query": stemmed,
-                "limit": request.limit,
-                "offset": request.offset,
-                "self_id": self._deps.self_id,
-            },
-        ))
+        rows = _fetchall_rows(
+            self._conn.execute(
+                api._SELECT_FTS_ALL_SQL,
+                {
+                    "query": stemmed,
+                    "limit": request.limit,
+                    "offset": request.offset,
+                    "self_id": self._deps.self_id,
+                },
+            )
+        )
         messages = [_read_message_from_row(r) for r in rows]
         next_nav = self._search_next_navigation(request, messages, global_mode=True)
         return {
@@ -523,16 +523,18 @@ class DaemonReadingService:
         request: _SearchMessagesRequest,
         stemmed: str,
     ) -> dict:
-        rows = _fetchall_rows(self._conn.execute(
-            api._SELECT_FTS_SQL,
-            {
-                "query": stemmed,
-                "dialog_id": request.dialog_id,
-                "limit": request.limit,
-                "offset": request.offset,
-                "self_id": self._deps.self_id,
-            },
-        ))
+        rows = _fetchall_rows(
+            self._conn.execute(
+                api._SELECT_FTS_SQL,
+                {
+                    "query": stemmed,
+                    "dialog_id": request.dialog_id,
+                    "limit": request.limit,
+                    "offset": request.offset,
+                    "self_id": self._deps.self_id,
+                },
+            )
+        )
         messages = await self._build_read_messages_from_rows(request.dialog_id, rows, log_rendered=False)
         next_nav = self._search_next_navigation(request, messages, global_mode=False)
         row = _fetchone_row(self._conn.execute(api._SELECT_SYNC_STATUS_SQL, (request.dialog_id,)))
@@ -656,10 +658,10 @@ class DaemonReadingService:
         placeholders = ",".join("?" * len(message_ids))
         fresh_rows = _fetchall_rows(
             self._conn.execute(
-            f"SELECT message_id FROM message_reactions_freshness "
-            f"WHERE dialog_id = ? AND message_id IN ({placeholders}) "
-            f"AND checked_at > ?",
-            [dialog_id, *message_ids, threshold],
+                f"SELECT message_id FROM message_reactions_freshness "
+                f"WHERE dialog_id = ? AND message_id IN ({placeholders}) "
+                f"AND checked_at > ?",
+                [dialog_id, *message_ids, threshold],
             )
         )
         fresh_ids = {_object_to_int(_row_sequence(r)[0]) for r in fresh_rows}
@@ -723,25 +725,25 @@ class DaemonReadingService:
         half = max(1, context_size // 2)
         before_rows = _fetchall_rows(
             self._conn.execute(
-            api._LIST_MESSAGES_BASE_SQL + " AND m.message_id <= :anchor ORDER BY m.message_id DESC LIMIT :limit",
-            {
-                "dialog_id": dialog_id,
-                "self_id": self._deps.self_id,
-                "anchor": anchor_message_id,
-                "limit": half + 1,
-            },
+                api._LIST_MESSAGES_BASE_SQL + " AND m.message_id <= :anchor ORDER BY m.message_id DESC LIMIT :limit",
+                {
+                    "dialog_id": dialog_id,
+                    "self_id": self._deps.self_id,
+                    "anchor": anchor_message_id,
+                    "limit": half + 1,
+                },
             )
         )
 
         after_rows = _fetchall_rows(
             self._conn.execute(
-            api._LIST_MESSAGES_BASE_SQL + " AND m.message_id > :anchor ORDER BY m.message_id ASC LIMIT :limit",
-            {
-                "dialog_id": dialog_id,
-                "self_id": self._deps.self_id,
-                "anchor": anchor_message_id,
-                "limit": half,
-            },
+                api._LIST_MESSAGES_BASE_SQL + " AND m.message_id > :anchor ORDER BY m.message_id ASC LIMIT :limit",
+                {
+                    "dialog_id": dialog_id,
+                    "self_id": self._deps.self_id,
+                    "anchor": anchor_message_id,
+                    "limit": half,
+                },
             )
         )
 

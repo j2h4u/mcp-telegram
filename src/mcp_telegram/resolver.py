@@ -299,7 +299,7 @@ def _make_match_info(entity_id: int, display_name: str, score: int, entity_cache
                 entity_type = entity_cached.get("type")
                 if isinstance(entity_type, str):
                     entity_info["entity_type"] = entity_type
-        except (sqlite3.OperationalError, sqlite3.DatabaseError, OSError):
+        except sqlite3.OperationalError, sqlite3.DatabaseError, OSError:
             pass  # cache unavailable; proceed without enrichment
         except Exception:
             logger.warning("unexpected entity_cache error in fuzzy resolve for entity_id=%r", entity_id, exc_info=True)
@@ -343,7 +343,7 @@ def resolve(
             if result:
                 entity_id, name = result
                 return Resolved(entity_id=entity_id, display_name=name)
-        except (sqlite3.OperationalError, sqlite3.DatabaseError, OSError):
+        except sqlite3.OperationalError, sqlite3.DatabaseError, OSError:
             pass  # cache unavailable; fall through to NotFound
         except Exception:
             logger.warning("unexpected entity_cache error in @username resolve for query=%r", query, exc_info=True)

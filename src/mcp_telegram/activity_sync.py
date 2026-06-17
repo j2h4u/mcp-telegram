@@ -341,7 +341,9 @@ async def _search_incremental_batch(
         return _SEARCH_BATCH_STOP
 
 
-def _trim_incremental_batch(batch: Sequence[_SearchMessageLike], min_date: int) -> tuple[list[_SearchMessageLike], bool]:
+def _trim_incremental_batch(
+    batch: Sequence[_SearchMessageLike], min_date: int
+) -> tuple[list[_SearchMessageLike], bool]:
     """Apply the client-side min_date filter used by the incremental loop."""
     in_window: list[_SearchMessageLike] = []
     past_window = False

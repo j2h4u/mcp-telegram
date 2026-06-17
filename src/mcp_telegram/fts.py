@@ -110,7 +110,9 @@ def backfill_fts_index(conn: sqlite3.Connection) -> int:
 
     Returns the number of rows inserted.
     """
-    msg_row = cast(tuple[object | None, ...] | None, conn.execute("SELECT COUNT(*) FROM messages WHERE is_deleted = 0").fetchone())
+    msg_row = cast(
+        tuple[object | None, ...] | None, conn.execute("SELECT COUNT(*) FROM messages WHERE is_deleted = 0").fetchone()
+    )
     fts_row = cast(tuple[object | None, ...] | None, conn.execute("SELECT COUNT(*) FROM messages_fts").fetchone())
     msg_count = _row_first_int(msg_row)
     fts_count = _row_first_int(fts_row)
@@ -121,8 +123,13 @@ def backfill_fts_index(conn: sqlite3.Connection) -> int:
     # Avoid LEFT JOIN against FTS5 — the FTS virtual table has no B-tree index
     # for the planner, making a JOIN O(n*m). Instead: fetch both key sets into
     # Python, compute the difference, then load text only for missing rows.
-    fts_keys = cast(set[tuple[int, int]], set(conn.execute("SELECT dialog_id, message_id FROM messages_fts").fetchall()))
-    all_rows = cast(list[tuple[int, int, str | None]], conn.execute("SELECT dialog_id, message_id, text FROM messages WHERE is_deleted = 0").fetchall())
+    fts_keys = cast(
+        set[tuple[int, int]], set(conn.execute("SELECT dialog_id, message_id FROM messages_fts").fetchall())
+    )
+    all_rows = cast(
+        list[tuple[int, int, str | None]],
+        conn.execute("SELECT dialog_id, message_id, text FROM messages WHERE is_deleted = 0").fetchall(),
+    )
     rows = [(d, m, t) for d, m, t in all_rows if (d, m) not in fts_keys]
 
     if not rows:

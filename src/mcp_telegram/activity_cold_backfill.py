@@ -116,7 +116,7 @@ async def run_cold_backfill_pass(
     row = cast(
         tuple[int, int | None] | None,
         conn.execute(
-        """
+            """
         SELECT dialog_id, cold_offset_id
         FROM activity_dialog_state
         WHERE cold_status != 'complete'
@@ -124,7 +124,7 @@ async def run_cold_backfill_pass(
         ORDER BY updated_at ASC, dialog_id ASC
         LIMIT 1
         """,
-        {"now": now},
+            {"now": now},
         ).fetchone(),
     )
 

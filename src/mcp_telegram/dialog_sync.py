@@ -153,6 +153,7 @@ class _DialogSyncClient(Protocol):
 def _attr[T](obj: object, name: str, default: T) -> T:
     return cast(T, getattr(obj, name, default))
 
+
 # ---------------------------------------------------------------------------
 # SQL constants
 # ---------------------------------------------------------------------------
@@ -776,7 +777,9 @@ class DialogReconciliationWorker:
         last_full_pass when completed=True, so the next hourly tick retries
         the full pass instead of waiting a full day.
         """
-        pre_pass_ids = {row[0] for row in cast(list[tuple[int]], self._conn.execute(_SELECT_VISIBLE_DIALOG_IDS_SQL).fetchall())}
+        pre_pass_ids = {
+            row[0] for row in cast(list[tuple[int]], self._conn.execute(_SELECT_VISIBLE_DIALOG_IDS_SQL).fetchall())
+        }
         seen_ids: set[int] = set()
         count = 0
         try:

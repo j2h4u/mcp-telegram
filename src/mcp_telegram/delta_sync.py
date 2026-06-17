@@ -174,7 +174,9 @@ class DeltaSyncWorker:
         Returns:
             Count of new messages stored. 0 if no gap, no baseline, or error.
         """
-        row = cast(tuple[object | None, ...] | None, self._conn.execute(_SELECT_MAX_MESSAGE_ID_SQL, (dialog_id,)).fetchone())
+        row = cast(
+            tuple[object | None, ...] | None, self._conn.execute(_SELECT_MAX_MESSAGE_ID_SQL, (dialog_id,)).fetchone()
+        )
         max_known_id = _row_first_int(row)
         if max_known_id == 0:
             # No baseline yet — FullSyncWorker handles this dialog
