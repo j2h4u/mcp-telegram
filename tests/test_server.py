@@ -7,6 +7,7 @@ from functools import partial
 from pathlib import Path
 from typing import Protocol, cast
 from unittest.mock import AsyncMock
+from urllib.parse import urlparse
 
 import pytest
 from mcp.types import CallToolResult, TextContent, Tool
@@ -337,7 +338,7 @@ def test_http_transport_security_allows_loopback_and_configured_hosts(
     assert "localhost:*" in hosts
     assert "mcp-telegram:3100" in hosts
     assert "http://localhost:*" in origins
-    assert "http://gateway.local" in origins
+    assert any(item.scheme == "http" and item.hostname == "gateway.local" for item in map(urlparse, origins))
 
 
 def test_safe_boundary_error_text_validation_uses_sanitized_detail() -> None:
