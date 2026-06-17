@@ -1,7 +1,5 @@
 """Message serialization helpers for daemon API responses."""
 
-from __future__ import annotations
-
 import logging
 import sqlite3
 from typing import Any
@@ -12,82 +10,112 @@ from .sync_worker import extract_reply_and_topic
 logger = logging.getLogger(__name__)
 
 
+def _extract_sender_first_name(msg: Any) -> str | None:
+    sender = getattr(msg, "sender", None)
+    return getattr(sender, "first_name", None) if sender is not None else None
+
+
+def _timestamp_to_int(value: Any, *, msg_id: Any = None) -> int:
+    if value is None:
+        return 0
+    try:
+        return int(value.timestamp())
+    except Exception:
+        logger.debug(
+            "message_to_dict timestamp conversion failed msg_id=%s",
+            msg_id if msg_id is not None else "?",
+            exc_info=True,
+        )
+        return 0
+
+
+def _get_media_description(msg: Any) -> str | None:
+    media = getattr(msg, "media", None)
+    if media is None:
+        return None
+    from .formatter import _describe_media
+
+    return _describe_media(media)
+
+
+def _extract_reactions_display(msg: Any) -> str:
+    reactions_obj = getattr(msg, "reactions", None)
+    if reactions_obj is None:
+        return ""
+
+    results_list = getattr(reactions_obj, "results", None) or []
+    counts: list[tuple[str, int]] = []
+    for item in results_list:
+        reaction = getattr(item, "reaction", None)
+        emoticon = getattr(reaction, "emoticon", None) if reaction else None
+        if emoticon is not None:
+            counts.append((emoticon, int(getattr(item, "count", 0))))
+
+    return format_reaction_counts(counts)
+
+
+def _to_unix_timestamp_or_none(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value.timestamp())
+    except TypeError, ValueError, AttributeError:
+        return None
+
+
+def _is_service_message(msg: Any) -> int:
+    try:
+        from telethon.tl import types as _tl_types  # type: ignore[import-untyped]
+
+        return 1 if isinstance(msg, _tl_types.MessageService) else 0
+    except Exception:
+        logger.debug(
+            "message_to_dict: telethon MessageService isinstance check failed",
+            exc_info=True,
+        )
+        return 0
+
+
+def _resolve_effective_sender_id(
+    raw_sender_id: int | None,
+    dialog_id: int | None,
+    self_id: int | None,
+    is_service_flag: int,
+    out_flag: int,
+) -> int | None:
+    if raw_sender_id is not None:
+        return raw_sender_id
+    if is_service_flag == 1:
+        return None
+    if dialog_id is not None and dialog_id > 0 and out_flag == 1 and self_id is not None:
+        return self_id
+    if dialog_id is not None and dialog_id > 0 and out_flag == 0:
+        return dialog_id
+    return None
+
+
 def message_to_dict(
     msg: Any,
     dialog_id: int | None = None,
     self_id: int | None = None,
 ) -> dict[str, Any]:
     """Convert a Telethon message object to the standard message dict."""
-    sender_first_name: str | None = None
-    if getattr(msg, "sender", None) is not None:
-        sender_first_name = getattr(msg.sender, "first_name", None)
-    sent_at = 0
-    if getattr(msg, "date", None) is not None:
-        try:
-            sent_at = int(msg.date.timestamp())
-        except Exception:
-            logger.debug(
-                "message_to_dict timestamp conversion failed msg_id=%s",
-                getattr(msg, "id", "?"),
-                exc_info=True,
-            )
-            sent_at = 0
-
-    media = getattr(msg, "media", None)
-    media_description: str | None = None
-    if media is not None:
-        from .formatter import _describe_media
-
-        media_description = _describe_media(media)
-
-    reactions_obj = getattr(msg, "reactions", None)
-    reactions_display = ""
-    if reactions_obj is not None:
-        results_list = getattr(reactions_obj, "results", None) or []
-        counts: list[tuple[str, int]] = []
-        for item in results_list:
-            reaction = getattr(item, "reaction", None)
-            emoticon = getattr(reaction, "emoticon", None) if reaction else None
-            count = getattr(item, "count", 0)
-            if emoticon is not None:
-                counts.append((emoticon, int(count)))
-        reactions_display = format_reaction_counts(counts)
-
+    sender_first_name = _extract_sender_first_name(msg)
+    sent_at = _timestamp_to_int(getattr(msg, "date", None), msg_id=getattr(msg, "id", None))
+    media_description = _get_media_description(msg)
+    reactions_display = _extract_reactions_display(msg)
     reply_to_msg_id, forum_topic_id = extract_reply_and_topic(msg)
-
-    edit_date_raw = getattr(msg, "edit_date", None)
-    edit_date: int | None = None
-    if edit_date_raw is not None:
-        try:
-            edit_date = int(edit_date_raw.timestamp())
-        except TypeError, ValueError, AttributeError:
-            edit_date = None
-
-    # Mirror the SQL EFFECTIVE_SENDER_ID_SQL CASE tree in Python so fallback
-    # rows keep the same discriminator behavior.
-    is_service_flag = 0
-    try:
-        from telethon.tl import types as _tl_types  # type: ignore[import-untyped]
-
-        if isinstance(msg, _tl_types.MessageService):
-            is_service_flag = 1
-    except Exception:
-        logger.debug("message_to_dict: telethon MessageService isinstance check failed", exc_info=True)
-
+    edit_date = _to_unix_timestamp_or_none(getattr(msg, "edit_date", None))
+    is_service_flag = _is_service_message(msg)
     out_flag = 1 if getattr(msg, "out", False) else 0
-
     raw_sender_id = getattr(msg, "sender_id", None)
-    effective_sender_id: int | None
-    if raw_sender_id is not None:
-        effective_sender_id = raw_sender_id
-    elif is_service_flag == 1:
-        effective_sender_id = None
-    elif dialog_id is not None and dialog_id > 0 and out_flag == 1 and self_id is not None:
-        effective_sender_id = self_id
-    elif dialog_id is not None and dialog_id > 0 and out_flag == 0:
-        effective_sender_id = dialog_id
-    else:
-        effective_sender_id = None
+    effective_sender_id = _resolve_effective_sender_id(
+        raw_sender_id=raw_sender_id,
+        dialog_id=dialog_id,
+        self_id=self_id,
+        is_service_flag=is_service_flag,
+        out_flag=out_flag,
+    )
 
     return {
         "message_id": msg.id,
