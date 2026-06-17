@@ -16,7 +16,7 @@ import asyncio
 import logging
 import sqlite3
 import time
-from typing import Any
+from typing import Any, TypedDict, Unpack
 
 from telethon.errors import (
     FloodWaitError,  # type: ignore[import-untyped]
@@ -58,6 +58,11 @@ _SELECT_ACCESS_LOST_SQL = "SELECT dialog_id FROM synced_dialogs WHERE status = '
 _RESTORE_ACCESS_SQL = "UPDATE synced_dialogs SET status = 'syncing', access_lost_at = NULL WHERE dialog_id = ?"
 
 _UPDATE_TOTAL_MESSAGES_SQL = "UPDATE synced_dialogs SET total_messages = ? WHERE dialog_id = ?"
+
+
+class AccessProbeLoopOptions(TypedDict, total=False):
+    initial_delay: float
+    interval: float
 
 
 # ---------------------------------------------------------------------------
@@ -273,14 +278,14 @@ async def run_access_probe_loop(
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,
     delta_worker: DeltaSyncWorker,
-    *,
-    initial_delay: float = 0.0,
-    interval: float = 86400.0,
+    **options: Unpack[AccessProbeLoopOptions],
 ) -> None:
     """Daily probe of access_lost dialogs. Restores access and triggers gap-fill.
 
     Runs immediately at startup (initial_delay=0), then every 24h.
     """
+    initial_delay = options.get("initial_delay", 0.0)
+    interval = options.get("interval", 86400.0)
     if initial_delay > 0:
         try:
             await asyncio.wait_for(shutdown_event.wait(), timeout=initial_delay)
