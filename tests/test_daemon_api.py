@@ -12,7 +12,7 @@ import sqlite3
 import time
 from datetime import UTC
 from types import SimpleNamespace
-from typing import Any, Final
+from typing import Any, Final, TypedDict, Unpack
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -62,6 +62,89 @@ def _patch_get_peer_id():
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+class _InsertSyncedDialogKwargs(TypedDict, total=False):
+    status: str
+    last_synced_at: int | None
+    last_event_at: int | None
+    sync_progress: int | None
+    total_messages: int | None
+    access_lost_at: int | None
+
+
+class _SeedDialogRowKwargs(TypedDict, total=False):
+    name: str
+    type_: str
+    archived: int
+    pinned: int
+    members: int | None
+    created: int | None
+    last_message_at: int | None
+    snapshot_at: int | None
+    hidden: int
+    needs_refresh: int
+    unread_mentions_count: int
+    unread_reactions_count: int
+    draft_text: str | None
+
+
+class _InsertMessageVersionKwargs(TypedDict, total=False):
+    old_text: str
+    edit_date: int
+
+
+class _InsertMessageKwargs(TypedDict, total=False):
+    text: str
+    sent_at: int
+    sender_first_name: str
+    sender_id: int | None
+    forum_topic_id: int | None
+
+
+class _MakeDialogMockKwargs(TypedDict, total=False):
+    is_user: bool
+    is_group: bool
+    is_channel: bool
+    is_bot: bool
+    participants_count: int | None
+    unread_mentions_count: int
+    read_inbox_max_id: int
+    timestamp: float
+
+
+class _SeedUnreadStateKwargs(TypedDict, total=False):
+    entity_type: str
+    entity_name: str
+    last_event_at: int | None
+    status: str
+
+
+class _SeedMessageKwargs(TypedDict, total=False):
+    text: str
+    sender_id: int
+    sender_first_name: str
+    sent_at: int | None
+    is_deleted: int
+
+
+class _InsertEntityKwargs(TypedDict, total=False):
+    entity_type: str
+    name: str
+    username: str | None
+    name_normalized: str | None
+    updated_at: int | None
+
+
+class _InsertTelemetryKwargs(TypedDict, total=False):
+    tool_name: str
+    timestamp: float | None
+    duration_ms: float
+    result_count: int
+    has_cursor: bool
+    page_depth: int
+    has_filter: bool
+    error_type: str | None
 
 
 def _build_list_messages_query_req(**overrides: Any) -> SimpleNamespace:
@@ -311,14 +394,14 @@ def _make_db_with_activity() -> sqlite3.Connection:
 def _insert_synced_dialog(
     conn: sqlite3.Connection,
     dialog_id: int,
-    status: str = "synced",
-    *,
-    last_synced_at: int | None = None,
-    last_event_at: int | None = None,
-    sync_progress: int | None = None,
-    total_messages: int | None = None,
-    access_lost_at: int | None = None,
+    **kwargs: Unpack[_InsertSyncedDialogKwargs],
 ) -> None:
+    status = kwargs.get("status", "synced")
+    last_synced_at = kwargs.get("last_synced_at")
+    last_event_at = kwargs.get("last_event_at")
+    sync_progress = kwargs.get("sync_progress")
+    total_messages = kwargs.get("total_messages")
+    access_lost_at = kwargs.get("access_lost_at")
     conn.execute(
         "INSERT INTO synced_dialogs "
         "(dialog_id, status, last_synced_at, last_event_at, sync_progress, total_messages, access_lost_at) "
@@ -331,22 +414,22 @@ def _insert_synced_dialog(
 def _seed_dialog_row(
     conn: sqlite3.Connection,
     dialog_id: int,
-    *,
-    name: str = "Dialog",
-    type_: str = "user",
-    archived: int = 0,
-    pinned: int = 0,
-    members: int | None = None,
-    created: int | None = None,
-    last_message_at: int | None = None,
-    snapshot_at: int | None = 1700000000,
-    hidden: int = 0,
-    needs_refresh: int = 0,
-    unread_mentions_count: int = 0,
-    unread_reactions_count: int = 0,
-    draft_text: str | None = None,
+    **kwargs: Unpack[_SeedDialogRowKwargs],
 ) -> None:
     """Insert a row into the dialogs table (Phase 44 test helper)."""
+    name = kwargs.get("name", "Dialog")
+    type_ = kwargs.get("type_", "user")
+    archived = kwargs.get("archived", 0)
+    pinned = kwargs.get("pinned", 0)
+    members = kwargs.get("members")
+    created = kwargs.get("created")
+    last_message_at = kwargs.get("last_message_at")
+    snapshot_at = kwargs.get("snapshot_at", 1700000000)
+    hidden = kwargs.get("hidden", 0)
+    needs_refresh = kwargs.get("needs_refresh", 0)
+    unread_mentions_count = kwargs.get("unread_mentions_count", 0)
+    unread_reactions_count = kwargs.get("unread_reactions_count", 0)
+    draft_text = kwargs.get("draft_text")
     conn.execute(
         "INSERT INTO dialogs (dialog_id, name, type, archived, pinned, members, created, "
         "last_message_at, snapshot_at, hidden, needs_refresh, unread_mentions_count, "
@@ -376,9 +459,10 @@ def _insert_message_version(
     dialog_id: int,
     message_id: int,
     version: int,
-    old_text: str = "old text",
-    edit_date: int = 1700000000,
+    **kwargs: Unpack[_InsertMessageVersionKwargs],
 ) -> None:
+    old_text = kwargs.get("old_text", "old text")
+    edit_date = kwargs.get("edit_date", 1700000000)
     conn.execute(
         "INSERT INTO message_versions (dialog_id, message_id, version, old_text, edit_date) VALUES (?, ?, ?, ?, ?)",
         (dialog_id, message_id, version, old_text, edit_date),
@@ -390,12 +474,13 @@ def _insert_message(
     conn: sqlite3.Connection,
     dialog_id: int,
     message_id: int,
-    text: str = "test message",
-    sent_at: int = 1700000000,
-    sender_first_name: str = "Alice",
-    sender_id: int | None = None,
-    forum_topic_id: int | None = None,
+    **kwargs: Unpack[_InsertMessageKwargs],
 ) -> None:
+    text = kwargs.get("text", "test message")
+    sent_at = kwargs.get("sent_at", 1700000000)
+    sender_first_name = kwargs.get("sender_first_name", "Alice")
+    sender_id = kwargs.get("sender_id")
+    forum_topic_id = kwargs.get("forum_topic_id")
     conn.execute(
         "INSERT INTO messages "
         "(dialog_id, message_id, sent_at, text, sender_first_name, sender_id, forum_topic_id) "
@@ -1590,20 +1675,20 @@ async def test_get_sync_alerts_respects_limit() -> None:
 
 
 def _make_dialog_mock(
-    *,
     chat_id: int,
     name: str,
     unread_count: int,
-    is_user: bool = False,
-    is_group: bool = False,
-    is_channel: bool = False,
-    is_bot: bool = False,
-    participants_count: int | None = None,
-    unread_mentions_count: int = 0,
-    read_inbox_max_id: int = 0,
-    timestamp: float = 1700000000.0,
+    **kwargs: Unpack[_MakeDialogMockKwargs],
 ) -> MagicMock:
     """Build a mock dialog object matching the attributes _list_unread_messages reads."""
+    is_user = kwargs.get("is_user", False)
+    is_group = kwargs.get("is_group", False)
+    is_channel = kwargs.get("is_channel", False)
+    is_bot = kwargs.get("is_bot", False)
+    participants_count = kwargs.get("participants_count")
+    unread_mentions_count = kwargs.get("unread_mentions_count", 0)
+    read_inbox_max_id = kwargs.get("read_inbox_max_id", 0)
+    timestamp = kwargs.get("timestamp", 1700000000.0)
     dialog = MagicMock()
     dialog.id = chat_id
     dialog.name = name
@@ -1661,14 +1746,15 @@ def _seed_unread_state(
     conn: sqlite3.Connection,
     dialog_id: int,
     read_inbox_max_id: int | None,
-    *,
-    entity_type: str = "User",
-    entity_name: str = "Alice",
-    last_event_at: int | None = None,
-    status: str = "synced",
+    **kwargs: Unpack[_SeedUnreadStateKwargs],
 ) -> None:
     """Seed synced_dialogs (with read_inbox_max_id + status) + entities row."""
     import time as _time
+
+    entity_type = kwargs.get("entity_type", "User")
+    entity_name = kwargs.get("entity_name", "Alice")
+    last_event_at = kwargs.get("last_event_at")
+    status = kwargs.get("status", "synced")
 
     conn.execute(
         "INSERT OR IGNORE INTO synced_dialogs (dialog_id, status) VALUES (?, ?)",
@@ -1690,15 +1776,16 @@ def _seed_message(
     conn: sqlite3.Connection,
     dialog_id: int,
     message_id: int,
-    *,
-    text: str = "hello",
-    sender_id: int = 99,
-    sender_first_name: str = "Alice",
-    sent_at: int | None = None,
-    is_deleted: int = 0,
+    **kwargs: Unpack[_SeedMessageKwargs],
 ) -> None:
     """Seed a single message row."""
     import time as _time
+
+    text = kwargs.get("text", "hello")
+    sender_id = kwargs.get("sender_id", 99)
+    sender_first_name = kwargs.get("sender_first_name", "Alice")
+    sent_at = kwargs.get("sent_at")
+    is_deleted = kwargs.get("is_deleted", 0)
 
     conn.execute(
         "INSERT INTO messages "
@@ -2126,13 +2213,15 @@ def _make_db_with_entities(*, with_fts: bool = False) -> sqlite3.Connection:
 def _insert_entity(
     conn: sqlite3.Connection,
     entity_id: int,
-    entity_type: str = "user",
-    name: str = "Test User",
-    username: str | None = None,
-    name_normalized: str | None = None,
-    updated_at: int | None = None,
+    **kwargs: Unpack[_InsertEntityKwargs],
 ) -> None:
     import time as _time
+
+    entity_type = kwargs.get("entity_type", "user")
+    name = kwargs.get("name", "Test User")
+    username = kwargs.get("username")
+    name_normalized = kwargs.get("name_normalized")
+    updated_at = kwargs.get("updated_at")
 
     if updated_at is None:
         updated_at = int(_time.time())
@@ -2146,16 +2235,18 @@ def _insert_entity(
 
 def _insert_telemetry(
     conn: sqlite3.Connection,
-    tool_name: str = "ListDialogs",
-    timestamp: float | None = None,
-    duration_ms: float = 50.0,
-    result_count: int = 10,
-    has_cursor: bool = False,
-    page_depth: int = 1,
-    has_filter: bool = False,
-    error_type: str | None = None,
+    **kwargs: Unpack[_InsertTelemetryKwargs],
 ) -> None:
     import time as _time
+
+    tool_name = kwargs.get("tool_name", "ListDialogs")
+    timestamp = kwargs.get("timestamp")
+    duration_ms = kwargs.get("duration_ms", 50.0)
+    result_count = kwargs.get("result_count", 10)
+    has_cursor = kwargs.get("has_cursor", False)
+    page_depth = kwargs.get("page_depth", 1)
+    has_filter = kwargs.get("has_filter", False)
+    error_type = kwargs.get("error_type")
 
     if timestamp is None:
         timestamp = _time.time()
@@ -4455,10 +4546,11 @@ def _seed_message_p39(
     message_id: int,
     sender_id: int | None,
     sender_first_name: str | None,
-    text: str = "hi",
-    out: int = 0,
-    is_service: int = 0,
+    **kwargs: Unpack[TypedDict("_SeedMessageP39Kwargs", {"text": str, "out": int, "is_service": int}, total=False)],
 ) -> None:
+    text = kwargs.get("text", "hi")
+    out = kwargs.get("out", 0)
+    is_service = kwargs.get("is_service", 0)
     conn.execute(
         "INSERT INTO messages "
         "(dialog_id, message_id, sent_at, text, sender_id, sender_first_name, is_deleted, out, is_service) "

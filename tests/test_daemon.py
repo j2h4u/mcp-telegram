@@ -5,6 +5,7 @@ import json
 import logging
 import sqlite3
 from pathlib import Path
+from typing import TypedDict, Unpack
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -1301,17 +1302,33 @@ def _source_export_seed_message(
     conn: sqlite3.Connection,
     dialog_id: int,
     message_id: int,
-    *,
-    text: str = "Deployment checklist is ready",
-    sent_at: int = 1770000000,
-    sender_id: int | None = 111,
-    sender_first_name: str | None = "Alice",
-    reply_to_msg_id: int | None = None,
-    forum_topic_id: int | None = None,
-    edit_date: int | None = None,
-    is_deleted: int = 0,
-    topic_title: str | None = None,
+    **kwargs: Unpack[
+        TypedDict(
+            "_SourceExportSeedMessageKwargs",
+            {
+                "text": str,
+                "sent_at": int,
+                "sender_id": int | None,
+                "sender_first_name": str | None,
+                "reply_to_msg_id": int | None,
+                "forum_topic_id": int | None,
+                "edit_date": int | None,
+                "is_deleted": int,
+                "topic_title": str | None,
+            },
+            total=False,
+        )
+    ],
 ) -> None:
+    text = kwargs.get("text", "Deployment checklist is ready")
+    sent_at = kwargs.get("sent_at", 1770000000)
+    sender_id = kwargs.get("sender_id", 111)
+    sender_first_name = kwargs.get("sender_first_name", "Alice")
+    reply_to_msg_id = kwargs.get("reply_to_msg_id")
+    forum_topic_id = kwargs.get("forum_topic_id")
+    edit_date = kwargs.get("edit_date")
+    is_deleted = kwargs.get("is_deleted", 0)
+    topic_title = kwargs.get("topic_title")
     conn.execute(
         "INSERT INTO messages "
         "(dialog_id, message_id, sent_at, text, sender_id, sender_first_name, "

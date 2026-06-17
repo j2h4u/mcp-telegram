@@ -16,6 +16,7 @@ import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 from types import SimpleNamespace
+from typing import TypedDict, Unpack
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -173,12 +174,23 @@ def _make_db() -> Iterator[sqlite3.Connection]:
 def _insert_synced_dialog(
     conn: sqlite3.Connection,
     dialog_id: int,
-    *,
-    status: str = "synced",
-    read_inbox_max_id: int | None = None,
-    read_outbox_max_id: int | None = None,
-    total_messages: int | None = None,
+    **kwargs: Unpack[
+        TypedDict(
+            "_InsertSyncedDialogKwargs",
+            {
+                "status": str,
+                "read_inbox_max_id": int | None,
+                "read_outbox_max_id": int | None,
+                "total_messages": int | None,
+            },
+            total=False,
+        )
+    ],
 ) -> None:
+    status = kwargs.get("status", "synced")
+    read_inbox_max_id = kwargs.get("read_inbox_max_id")
+    read_outbox_max_id = kwargs.get("read_outbox_max_id")
+    total_messages = kwargs.get("total_messages")
     conn.execute(
         "INSERT INTO synced_dialogs "
         "(dialog_id, status, read_inbox_max_id, read_outbox_max_id, total_messages) "
@@ -200,11 +212,11 @@ def _insert_message(
     conn: sqlite3.Connection,
     dialog_id: int,
     message_id: int,
-    *,
-    out: int = 0,
-    sent_at: int = 1_700_000_000,
-    text: str = "hi",
+    **kwargs: Unpack[TypedDict("_InsertMessageKwargs", {"out": int, "sent_at": int, "text": str}, total=False)],
 ) -> None:
+    out = kwargs.get("out", 0)
+    sent_at = kwargs.get("sent_at", 1_700_000_000)
+    text = kwargs.get("text", "hi")
     conn.execute(
         "INSERT INTO messages (dialog_id, message_id, sent_at, text, out) VALUES (?, ?, ?, ?, ?)",
         (dialog_id, message_id, sent_at, text, out),

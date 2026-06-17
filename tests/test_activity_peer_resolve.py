@@ -23,7 +23,7 @@ import contextlib
 import json
 import sqlite3
 import time
-from typing import Any
+from typing import Any, TypedDict, Unpack
 from unittest.mock import MagicMock
 
 import pytest
@@ -84,16 +84,23 @@ def _read_entity_details(conn: sqlite3.Connection, entity_id: int) -> dict | Non
     return json.loads(row[0])
 
 
+class _WriteDialogsRowKwargs(TypedDict, total=False):
+    linked_chat_id: int | None
+    linked_chat_resolved_at: int | None
+    name: str | None
+    type_: str | None
+
+
 def _write_dialogs_row(
     conn: sqlite3.Connection,
     dialog_id: int,
-    *,
-    linked_chat_id: int | None = None,
-    linked_chat_resolved_at: int | None = None,
-    name: str | None = None,
-    type_: str | None = None,
+    **kwargs: Unpack[_WriteDialogsRowKwargs],
 ) -> None:
     """Insert a minimal dialogs row for resolver tests."""
+    linked_chat_id = kwargs.get("linked_chat_id")
+    linked_chat_resolved_at = kwargs.get("linked_chat_resolved_at")
+    name = kwargs.get("name")
+    type_ = kwargs.get("type_")
     conn.execute(
         "INSERT OR REPLACE INTO dialogs "
         "(dialog_id, name, type, linked_chat_id, linked_chat_resolved_at) "

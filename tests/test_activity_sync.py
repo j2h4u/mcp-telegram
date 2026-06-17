@@ -6,7 +6,7 @@ import asyncio
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, TypedDict, Unpack
 
 import pytest
 from telethon.tl.types import PeerUser
@@ -44,6 +44,12 @@ class FakeSearchResult:
     chats: list[Any] = field(default_factory=list)
 
 
+class _MsgKwargs(TypedDict, total=False):
+    text: str
+    replies: int
+    out: bool
+
+
 class _FakeClient:
     """Drives _run_backfill by returning scripted SearchRequest results,
     and drives _run_incremental via iter_messages async generator."""
@@ -78,7 +84,10 @@ def _make_db(tmp_path) -> sqlite3.Connection:
     return sqlite3.connect(db_path)
 
 
-def _msg(msg_id: int, user_id: int, ts: int, text: str = "hi", replies: int = 0, out: bool = True) -> FakeMessage:
+def _msg(msg_id: int, user_id: int, ts: int, **kwargs: Unpack[_MsgKwargs]) -> FakeMessage:
+    text = kwargs.get("text", "hi")
+    replies = kwargs.get("replies", 0)
+    out = kwargs.get("out", True)
     return FakeMessage(
         id=msg_id,
         date=datetime.fromtimestamp(ts, tz=UTC),

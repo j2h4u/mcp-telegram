@@ -136,7 +136,8 @@ def _patch_sweep(monkeypatch, scripted: dict[int, list[SweepResult]]) -> dict:
     """
     call_log: dict[int, list[tuple[int, int]]] = {}
 
-    async def _fake(client, conn, dialog_id, *, offset_id, min_id, limit):
+    async def _fake(*args, offset_id, min_id, limit):
+        _client, _conn, dialog_id = args
         call_log.setdefault(dialog_id, []).append((offset_id, min_id))
         queue = scripted.get(dialog_id, [])
         if queue:

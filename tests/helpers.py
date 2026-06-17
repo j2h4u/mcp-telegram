@@ -4,22 +4,37 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from types import SimpleNamespace
+from typing import TypedDict, Unpack
+
+
+class _BuildMockMessageKwargs(TypedDict, total=False):
+    text: str | None
+    sender_id: int | None
+    sender_first_name: str | None
+    media: object | None
+    reply_to_msg_id: int | None
+    forum_topic: bool
+    reply_to_top_id: int | None
+    reply_count: int
+    reactions: object | None
+    edit_date: datetime | None
 
 
 def build_mock_message(
     id: int,
-    text: str | None = "hello",
-    sender_id: int | None = 42,
-    sender_first_name: str | None = "Alice",
-    media: object | None = None,
-    reply_to_msg_id: int | None = None,
-    forum_topic: bool = False,
-    reply_to_top_id: int | None = None,
-    reply_count: int = 0,
-    reactions: object | None = None,
-    edit_date: datetime | None = None,
+    **kwargs: Unpack[_BuildMockMessageKwargs],
 ) -> SimpleNamespace:
     """Build a minimal Telethon-like message object."""
+    text = kwargs.get("text", "hello")
+    sender_id = kwargs.get("sender_id", 42)
+    sender_first_name = kwargs.get("sender_first_name", "Alice")
+    media = kwargs.get("media")
+    reply_to_msg_id = kwargs.get("reply_to_msg_id")
+    forum_topic = kwargs.get("forum_topic", False)
+    reply_to_top_id = kwargs.get("reply_to_top_id")
+    reply_count = kwargs.get("reply_count", 0)
+    reactions = kwargs.get("reactions")
+    edit_date = kwargs.get("edit_date")
     sender = SimpleNamespace(first_name=sender_first_name) if sender_first_name is not None else None
 
     reply_to_obj: SimpleNamespace | None = None

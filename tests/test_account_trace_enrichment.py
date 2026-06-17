@@ -6,6 +6,7 @@ import logging
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
+from typing import TypedDict, Unpack
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -52,6 +53,20 @@ class FakeTraceClient:
                 yield message
 
         return _gen()
+
+
+class _CandidateMessageKwargs(TypedDict, total=False):
+    text: str
+    edit_date: int | None
+    reply_count: int
+    reactions: list[ReactionRecord] | None
+    entities: list[EntityRecord] | None
+    forward: ForwardRecord | None
+
+
+class _SeedExistingMessageBundleKwargs(TypedDict, total=False):
+    text: str
+    edit_date: int | None
 
 
 @pytest.fixture()
@@ -107,14 +122,14 @@ def fake_message(
 
 
 def candidate_message(
-    *,
-    text: str = "same",
-    edit_date: int | None = None,
-    reply_count: int = 0,
-    reactions: list[ReactionRecord] | None = None,
-    entities: list[EntityRecord] | None = None,
-    forward: ForwardRecord | None = None,
+    **kwargs: Unpack[_CandidateMessageKwargs],
 ) -> ExtractedMessage:
+    text = kwargs.get("text", "same")
+    edit_date = kwargs.get("edit_date")
+    reply_count = kwargs.get("reply_count", 0)
+    reactions = kwargs.get("reactions")
+    entities = kwargs.get("entities")
+    forward = kwargs.get("forward")
     return ExtractedMessage(
         message=StoredMessage(
             dialog_id=222,
