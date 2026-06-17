@@ -8,7 +8,9 @@ from mcp_telegram.tools.reading import (
     _format_search_results,
     _list_messages_structured_content,
     _list_messages_structured_messages,
+    _ListMessagesStructuredContentContext,
     _search_structured_content,
+    _SearchStructuredContentContext,
 )
 
 
@@ -138,14 +140,38 @@ def test_search_snippet_no_raw_question_mark_sender_fallback_in_source():
 
 def test_search_messages_structured_payload_includes_dialog_anchor_read_state_warning_and_limits():
     payload = _search_structured_content(
-        args=SearchMessages(
-            dialog="123",
-            query="needle",
-            limit=5,
-            navigation="search-token",
-        ),
-        data={
-            "messages": [
+        _SearchStructuredContentContext(
+            args=SearchMessages(
+                dialog="123",
+                query="needle",
+                limit=5,
+                navigation="search-token",
+            ),
+            data={
+                "messages": [
+                    {
+                        "dialog_id": 123,
+                        "dialog_name": "Alice",
+                        "message_id": 9,
+                        "sent_at": 1_700_000_000,
+                        "text": "needle in Telegram text",
+                        "sender_first_name": "Alice",
+                    }
+                ],
+                "dialog_access": "archived",
+                "last_synced_at": 1_699_990_000,
+                "last_event_at": 1_699_999_000,
+                "sync_coverage_pct": 80,
+                "read_state_per_dialog": {
+                    123: {
+                        "inbox_unread_count": 0,
+                        "inbox_cursor_state": "populated",
+                        "outbox_unread_count": 0,
+                        "outbox_cursor_state": "populated",
+                    }
+                },
+            },
+            rows=[
                 {
                     "dialog_id": 123,
                     "dialog_name": "Alice",
@@ -155,34 +181,12 @@ def test_search_messages_structured_payload_includes_dialog_anchor_read_state_wa
                     "sender_first_name": "Alice",
                 }
             ],
-            "dialog_access": "archived",
-            "last_synced_at": 1_699_990_000,
-            "last_event_at": 1_699_999_000,
-            "sync_coverage_pct": 80,
-            "read_state_per_dialog": {
-                123: {
-                    "inbox_unread_count": 0,
-                    "inbox_cursor_state": "populated",
-                    "outbox_unread_count": 0,
-                    "outbox_cursor_state": "populated",
-                }
-            },
-        },
-        rows=[
-            {
-                "dialog_id": 123,
-                "dialog_name": "Alice",
-                "message_id": 9,
-                "sent_at": 1_700_000_000,
-                "text": "needle in Telegram text",
-                "sender_first_name": "Alice",
-            }
-        ],
-        dialog_id=123,
-        dialog_label="123",
-        global_mode=False,
-        offset=20,
-        next_navigation="next-search-token",
+            dialog_id=123,
+            dialog_label="123",
+            global_mode=False,
+            offset=20,
+            next_navigation="next-search-token",
+        )
     )
 
     assert payload["dialog_name"] == "Alice"
@@ -214,31 +218,33 @@ def test_search_messages_structured_payload_includes_dialog_anchor_read_state_wa
 
 def test_list_messages_structured_page_metadata_preserves_navigation_warning_coverage_and_limits():
     payload = _list_messages_structured_content(
-        args=ListMessages(exact_dialog_id=123, limit=10, navigation="start", anchor_message_id=50),
-        data={
-            "messages": [],
-            "source": "sync_db",
-            "next_navigation": "history-token",
-            "coverage": "fragment",
-            "dialog_access": "archived",
-            "last_synced_at": 1_699_990_000,
-            "last_event_at": 1_699_999_000,
-            "sync_coverage_pct": 80,
-            "dialog_type": "User",
-            "read_state": {
-                "inbox_unread_count": 0,
-                "inbox_cursor_state": "populated",
-                "outbox_unread_count": 0,
-                "outbox_cursor_state": "populated",
+        _ListMessagesStructuredContentContext(
+            args=ListMessages(exact_dialog_id=123, limit=10, navigation="start", anchor_message_id=50),
+            data={
+                "messages": [],
+                "source": "sync_db",
+                "next_navigation": "history-token",
+                "coverage": "fragment",
+                "dialog_access": "archived",
+                "last_synced_at": 1_699_990_000,
+                "last_event_at": 1_699_999_000,
+                "sync_coverage_pct": 80,
+                "dialog_type": "User",
+                "read_state": {
+                    "inbox_unread_count": 0,
+                    "inbox_cursor_state": "populated",
+                    "outbox_unread_count": 0,
+                    "outbox_cursor_state": "populated",
+                },
             },
-        },
-        rows=[],
-        dialog_id=123,
-        sender_id=None,
-        sender_name=None,
-        topic_id=None,
-        direction="oldest",
-        next_navigation="history-token",
+            rows=[],
+            dialog_id=123,
+            sender_id=None,
+            sender_name=None,
+            topic_id=None,
+            direction="oldest",
+            next_navigation="history-token",
+        )
     )
 
     assert payload["dialog_id"] == 123
@@ -292,15 +298,17 @@ def test_list_messages_always_presents_selected_page_chronologically_with_reply_
     ]
 
     payload = _list_messages_structured_content(
-        args=ListMessages(exact_dialog_id=123, navigation="latest"),
-        data={"messages": rows, "source": "sync_db", "next_navigation": "history-token"},
-        rows=rows,
-        dialog_id=123,
-        sender_id=None,
-        sender_name=None,
-        topic_id=None,
-        direction="newest",
-        next_navigation="history-token",
+        _ListMessagesStructuredContentContext(
+            args=ListMessages(exact_dialog_id=123, navigation="latest"),
+            data={"messages": rows, "source": "sync_db", "next_navigation": "history-token"},
+            rows=rows,
+            dialog_id=123,
+            sender_id=None,
+            sender_name=None,
+            topic_id=None,
+            direction="newest",
+            next_navigation="history-token",
+        )
     )
 
     assert [message["msg_id"] for message in payload["messages"]] == [1, 2, 3]

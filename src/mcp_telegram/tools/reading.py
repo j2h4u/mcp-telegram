@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from pydantic import Field, model_validator
@@ -90,6 +91,54 @@ def _format_daemon_messages(
         read_state=read_state,
         dialog_type=dialog_type,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class _ListMessagesStructuredContentContext:
+    args: ListMessages
+    data: dict
+    rows: list[dict]
+    dialog_id: int | None
+    sender_id: int | None
+    sender_name: str | None
+    topic_id: int | None
+    direction: str
+    next_navigation: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _SearchStructuredContentContext:
+    args: SearchMessages
+    data: dict
+    rows: list[dict]
+    dialog_id: int | None
+    dialog_label: str | None
+    global_mode: bool
+    offset: int
+    next_navigation: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _ListMessagesRequestContext:
+    args: ListMessages
+    dialog_id: int | None
+    dialog_label: str
+    has_filter: bool
+    has_cursor: bool
+    direction: str
+    daemon_navigation: str | None
+    sender_id: int | None
+    sender_name: str | None
+    unread_flag: bool | None
+
+
+@dataclass(frozen=True, slots=True)
+class _SearchMessagesRequestContext:
+    args: SearchMessages
+    dialog_id: int | None
+    dialog_label: str | None
+    global_mode: bool
+    offset: int
 
 
 # ---------------------------------------------------------------------------
@@ -549,19 +598,11 @@ def _chronological_message_rows(rows: list[dict]) -> list[dict]:
     )
 
 
-def _list_messages_structured_content(
-    *,
-    args: ListMessages,
-    data: dict,
-    rows: list[dict],
-    dialog_id: int | None,
-    sender_id: int | None,
-    sender_name: str | None,
-    topic_id: int | None,
-    direction: str,
-    next_navigation: str | None,
-) -> dict[str, object]:
-    resolved_dialog_id = _list_messages_resolved_dialog_id(data, rows, dialog_id)
+def _list_messages_structured_content(ctx: _ListMessagesStructuredContentContext) -> dict[str, object]:
+    args = ctx.args
+    data = ctx.data
+    rows = ctx.rows
+    resolved_dialog_id = _list_messages_resolved_dialog_id(data, rows, ctx.dialog_id)
     dialog_type = data.get("dialog_type")
     read_state = data.get("read_state")
     header_lines = _render_read_state_header(
@@ -592,11 +633,11 @@ def _list_messages_structured_content(
             "dialog": args.dialog,
             "exact_dialog_id": args.exact_dialog_id,
             "sender": args.sender,
-            "sender_id": sender_id,
-            "sender_name": sender_name,
+            "sender_id": ctx.sender_id,
+            "sender_name": ctx.sender_name,
             "topic": args.topic,
             "exact_topic_id": args.exact_topic_id,
-            "applied_topic_id": topic_id,
+            "applied_topic_id": ctx.topic_id,
             "unread": args.unread,
             "anchor_message_id": args.anchor_message_id,
         },
@@ -607,10 +648,10 @@ def _list_messages_structured_content(
             "applied_context_size": args.context_size if args.anchor_message_id is not None else None,
         },
         "navigation": {
-            "next_navigation": next_navigation,
-            "has_more": next_navigation is not None,
+            "next_navigation": ctx.next_navigation,
+            "has_more": ctx.next_navigation is not None,
             "source_cursor": args.navigation,
-            "direction": _navigation_direction_for_structured(direction, args.anchor_message_id),
+            "direction": _navigation_direction_for_structured(ctx.direction, args.anchor_message_id),
             "anchor_message_id": args.anchor_message_id,
         },
         "presentation": {
@@ -819,42 +860,92 @@ def _search_dialog_name(rows: list[dict], global_mode: bool, dialog_label: str |
     return dialog_label
 
 
-def _search_structured_content(
+def _search_messages_request_context(args: SearchMessages) -> _SearchMessagesRequestContext | ToolResult:
+    global_mode = args.dialog is None
+    dialog_id: int | None = None
+    if args.dialog is not None:
+        exact_id = parse_exact_dialog_id(args.dialog)
+        if exact_id is not None:
+            dialog_id = exact_id
+
+    offset = 0
+    if args.navigation and args.navigation not in {"newest", "oldest"}:
+        try:
+            from ..pagination import decode_navigation_token
+
+            nav = decode_navigation_token(args.navigation)
+            if nav.kind != "search":
+                return error_result(
+                    invalid_navigation_text(
+                        f"Navigation token is for {nav.kind}, not search",
+                        retry_tool="SearchMessages",
+                    ),
+                    has_cursor=True,
+                )
+            offset = nav.value
+        except ValueError as exc:
+            return error_result(
+                invalid_navigation_text(str(exc), retry_tool="SearchMessages"),
+                has_cursor=True,
+            )
+
+    return _SearchMessagesRequestContext(
+        args=args,
+        dialog_id=dialog_id,
+        dialog_label=str(dialog_id) if dialog_id else args.dialog,
+        global_mode=global_mode,
+        offset=offset,
+    )
+
+
+def _search_messages_error_result(
     *,
-    args: SearchMessages,
-    data: dict,
-    rows: list[dict],
-    dialog_id: int | None,
+    error: str,
+    error_detail: str,
     dialog_label: str | None,
-    global_mode: bool,
-    offset: int,
-    next_navigation: str | None,
-) -> dict[str, object]:
-    structured_results = _search_result_structured_rows(rows, args.query)
+    has_cursor: bool,
+) -> ToolResult:
+    if error == "dialog_not_found":
+        return error_result(
+            dialog_not_found_text(dialog_label or "?", retry_tool="SearchMessages"),
+            has_filter=True,
+            has_cursor=has_cursor,
+        )
+    return error_result(
+        f"Error: {error}: {error_detail}\n"
+        "Action: Retry search_messages with corrected arguments, or call list_dialogs first to discover a valid dialog id.",
+        has_filter=True,
+        has_cursor=has_cursor,
+    )
+
+
+def _search_structured_content(ctx: _SearchStructuredContentContext) -> dict[str, object]:
+    structured_results = _search_result_structured_rows(ctx.rows, ctx.args.query)
+    data = ctx.data
     source = data.get("source", "sync_db")
     data_with_source = {**data, "source": source}
     return {
-        "query": args.query,
-        "dialog_name": _search_dialog_name(rows, global_mode, dialog_label),
+        "query": ctx.args.query,
+        "dialog_name": _search_dialog_name(ctx.rows, ctx.global_mode, ctx.dialog_label),
         "scope": {
-            "dialog": args.dialog,
-            "dialog_id": dialog_id,
-            "global": global_mode,
+            "dialog": ctx.args.dialog,
+            "dialog_id": ctx.dialog_id,
+            "global": ctx.global_mode,
         },
         "source": source,
         "coverage": _list_messages_coverage(data_with_source),
         "warnings": _list_messages_warnings(data),
         "read_state_per_dialog": _search_read_state_per_dialog(data),
         "navigation": {
-            "next_navigation": next_navigation,
-            "has_more": next_navigation is not None,
-            "source_cursor": args.navigation,
-            "offset": offset,
+            "next_navigation": ctx.next_navigation,
+            "has_more": ctx.next_navigation is not None,
+            "source_cursor": ctx.args.navigation,
+            "offset": ctx.offset,
         },
         "limits": {
-            "requested_limit": args.limit,
-            "applied_limit": len(rows),
-            "offset": offset,
+            "requested_limit": ctx.args.limit,
+            "applied_limit": len(ctx.rows),
+            "offset": ctx.offset,
         },
         "anchor_call": {
             "tool": "list_messages",
@@ -865,7 +956,7 @@ def _search_structured_content(
         },
         "results": structured_results,
         "count": len(structured_results),
-        "next_navigation": next_navigation,
+        "next_navigation": ctx.next_navigation,
         "result_count_semantics": "count is the number of search hits returned in this response page",
     }
 
@@ -1069,6 +1160,79 @@ async def _resolve_topic_id(
     )
 
 
+def _list_messages_request_context(args: ListMessages) -> _ListMessagesRequestContext | ToolResult:
+    navigation_sentinels = {"latest", "start"}
+    has_filter = bool(args.sender or args.topic or args.exact_topic_id is not None or args.unread)
+    has_cursor = args.navigation is not None and args.navigation not in navigation_sentinels
+    if args.navigation in {"newest", "oldest"}:
+        return error_result(
+            'Unsupported navigation selector. Use navigation="latest", navigation="start", '
+            "or an opaque next_navigation token returned by list_messages.\n"
+            "Action: Retry list_messages with latest/start page navigation.",
+            has_filter=has_filter,
+            has_cursor=False,
+        )
+
+    dialog_id: int | None = args.exact_dialog_id
+    if dialog_id is None and args.dialog is not None:
+        exact_id = parse_exact_dialog_id(args.dialog)
+        if exact_id is not None:
+            dialog_id = exact_id
+
+    direction = "oldest" if args.navigation in {"start", "oldest"} else "newest"
+    daemon_navigation = None if args.navigation in navigation_sentinels else args.navigation
+
+    sender_id: int | None = None
+    sender_name: str | None = None
+    if args.sender is not None:
+        try:
+            sender_id = int(args.sender)
+        except ValueError:
+            sender_name = args.sender
+
+    return _ListMessagesRequestContext(
+        args=args,
+        dialog_id=dialog_id,
+        dialog_label=str(dialog_id) if dialog_id is not None else (args.dialog or ""),
+        has_filter=has_filter,
+        has_cursor=has_cursor,
+        direction=direction,
+        daemon_navigation=daemon_navigation,
+        sender_id=sender_id,
+        sender_name=sender_name,
+        unread_flag=True if args.unread else None,
+    )
+
+
+def _list_messages_error_result(
+    *,
+    error: str,
+    error_detail: str,
+    dialog_label: str,
+    has_filter: bool,
+    has_cursor: bool,
+) -> ToolResult:
+    if error == "dialog_not_found":
+        return error_result(
+            dialog_not_found_text(dialog_label, retry_tool="ListMessages"),
+            has_filter=has_filter,
+            has_cursor=has_cursor,
+        )
+    if error == "not_synced":
+        return error_result(
+            "Error: dialog is not synced. "
+            "Action: Use MarkDialogForSync to enable sync, then wait for syncing to complete.",
+            has_filter=has_filter,
+            has_cursor=has_cursor,
+        )
+    return error_result(
+        f"Error: {error}: {error_detail}\n"
+        "Action: Retry list_messages with corrected arguments, or call list_dialogs/list_topics first to discover valid ids.",
+        has_filter=has_filter,
+        has_cursor=has_cursor,
+    )
+
+
 @mcp_tool(
     name="list_messages",
     title="List Messages",
@@ -1081,79 +1245,39 @@ async def _resolve_topic_id(
     output_schema=LIST_MESSAGES_OUTPUT_SCHEMA,
 )
 async def list_messages(args: ListMessages) -> ToolResult:
-    has_filter = bool(args.sender or args.topic or args.exact_topic_id is not None or args.unread)
-    navigation_sentinels = {"latest", "start"}
-    has_cursor = args.navigation is not None and args.navigation not in navigation_sentinels
-    if args.navigation in {"newest", "oldest"}:
-        return error_result(
-            'Unsupported navigation selector. Use navigation="latest", navigation="start", '
-            "or an opaque next_navigation token returned by list_messages.\n"
-            "Action: Retry list_messages with latest/start page navigation.",
-            has_filter=has_filter,
-            has_cursor=False,
-        )
+    request_context = _list_messages_request_context(args)
+    if isinstance(request_context, ToolResult):
+        return request_context
 
-    # Resolve dialog_id locally if possible (numeric string / @username / entity cache)
-    dialog_id: int | None = args.exact_dialog_id
-    if dialog_id is None and args.dialog is not None:
-        exact_id = parse_exact_dialog_id(args.dialog)
-        if exact_id is not None:
-            dialog_id = exact_id
-        # If still None, dialog name goes to daemon for server-side resolution
-
-    # Derive page-selection direction from navigation sentinel; response order is always chronological.
-    direction: str
-    if args.navigation in {"start", "oldest"}:
-        direction = "oldest"
-    else:
-        direction = "newest"
-    # If navigation is an opaque token, direction is encoded in it (daemon handles it)
-    daemon_navigation = None if args.navigation in navigation_sentinels else args.navigation
-
-    # Sender passthrough: numeric string → sender_id (works on live Telegram path via from_user=)
-    sender_id: int | None = None
-    sender_name: str | None = None
-    if args.sender is not None:
-        try:
-            sender_id = int(args.sender)
-        except ValueError:
-            sender_name = args.sender
-
-    # Unread flag
-    unread_flag: bool | None = True if args.unread else None
-
-    # Topic resolution: exact_topic_id takes priority over fuzzy topic name.
-    # Uses a separate daemon connection because the daemon handles one request
-    # per connection — topic resolution must complete before list_messages.
     topic_id: int | None = args.exact_topic_id
     if topic_id is None and args.topic is not None:
         resolved = await _resolve_topic_id(
             args.topic,
-            dialog_id=dialog_id or 0,
-            dialog_name=args.dialog if not dialog_id else None,
+            dialog_id=request_context.dialog_id or 0,
+            dialog_name=args.dialog if request_context.dialog_id is None else None,
         )
         if isinstance(resolved, ToolResult):
             return ToolResult(
                 content=resolved.content,
                 is_error=resolved.is_error,
                 structured_content=resolved.structured_content,
-                has_filter=has_filter,
-                has_cursor=has_cursor,
+                has_filter=request_context.has_filter,
+                has_cursor=request_context.has_cursor,
             )
         topic_id = resolved
 
-    id_kwarg: dict = {"dialog_id": dialog_id} if dialog_id else {"dialog": args.dialog}
+    id_kwarg: dict = {"dialog_id": request_context.dialog_id} if request_context.dialog_id else {"dialog": args.dialog}
     try:
         async with daemon_connection() as conn:
             response = await conn.list_messages(
                 **id_kwarg,
                 limit=args.limit,
-                navigation=daemon_navigation,
-                direction=direction,
-                sender_id=sender_id,
-                sender_name=sender_name,
+                navigation=request_context.daemon_navigation,
+                direction=request_context.direction,
+                sender_id=request_context.sender_id,
+                sender_name=request_context.sender_name,
                 topic_id=topic_id,
-                unread=unread_flag,
+                unread=request_context.unread_flag,
                 context_message_id=args.anchor_message_id,
                 context_size=args.context_size if args.anchor_message_id else None,
             )
@@ -1161,27 +1285,12 @@ async def list_messages(args: ListMessages) -> ToolResult:
         return error_result(_daemon_not_running_text())
 
     if not response.get("ok"):
-        error = response.get("error", "unknown")
-        error_detail = response.get("message", "")
-        if error == "dialog_not_found":
-            dialog_label = str(dialog_id) if dialog_id else (args.dialog or "")
-            return error_result(
-                dialog_not_found_text(dialog_label, retry_tool="ListMessages"),
-                has_filter=has_filter,
-                has_cursor=has_cursor,
-            )
-        if error == "not_synced":
-            return error_result(
-                "Error: dialog is not synced. "
-                "Action: Use MarkDialogForSync to enable sync, then wait for syncing to complete.",
-                has_filter=has_filter,
-                has_cursor=has_cursor,
-            )
-        return error_result(
-            f"Error: {error}: {error_detail}\n"
-            "Action: Retry list_messages with corrected arguments, or call list_dialogs/list_topics first to discover valid ids.",
-            has_filter=has_filter,
-            has_cursor=has_cursor,
+        return _list_messages_error_result(
+            error=response.get("error", "unknown"),
+            error_detail=response.get("message", ""),
+            dialog_label=request_context.dialog_label,
+            has_filter=request_context.has_filter,
+            has_cursor=request_context.has_cursor,
         )
 
     data = response.get("data", {})
@@ -1189,21 +1298,23 @@ async def list_messages(args: ListMessages) -> ToolResult:
     next_nav = data.get("next_navigation")
 
     structured_content = _list_messages_structured_content(
-        args=args,
-        data=data,
-        rows=rows,
-        dialog_id=dialog_id,
-        sender_id=sender_id,
-        sender_name=sender_name,
-        topic_id=topic_id,
-        direction=direction,
-        next_navigation=next_nav,
+        _ListMessagesStructuredContentContext(
+            args=args,
+            data=data,
+            rows=rows,
+            dialog_id=request_context.dialog_id,
+            sender_id=request_context.sender_id,
+            sender_name=request_context.sender_name,
+            topic_id=topic_id,
+            direction=request_context.direction,
+            next_navigation=next_nav,
+        )
     )
     return structured_result(
         structured_content,
         result_count=len(rows),
-        has_filter=has_filter,
-        has_cursor=has_cursor or bool(next_nav),
+        has_filter=request_context.has_filter,
+        has_cursor=request_context.has_cursor or bool(next_nav),
     )
 
 
@@ -1264,43 +1375,15 @@ class SearchMessages(ToolArgs):
     output_schema=SEARCH_MESSAGES_OUTPUT_SCHEMA,
 )
 async def search_messages(args: SearchMessages) -> ToolResult:
-    global_mode = args.dialog is None
-
-    # Resolve dialog_id locally if possible (numeric string / @username)
-    dialog_id: int | None = None
-    if args.dialog is not None:
-        exact_id = parse_exact_dialog_id(args.dialog)
-        if exact_id is not None:
-            dialog_id = exact_id
-        # If still None, dialog name goes to daemon for server-side resolution
-
-    # Decode offset from navigation token if provided
-    offset = 0
-    if args.navigation and args.navigation not in {"newest", "oldest"}:
-        try:
-            from ..pagination import decode_navigation_token
-
-            nav = decode_navigation_token(args.navigation)
-            if nav.kind != "search":
-                return error_result(
-                    invalid_navigation_text(
-                        f"Navigation token is for {nav.kind}, not search",
-                        retry_tool="SearchMessages",
-                    ),
-                    has_cursor=True,
-                )
-            offset = nav.value
-        except ValueError as exc:
-            return error_result(
-                invalid_navigation_text(str(exc), retry_tool="SearchMessages"),
-                has_cursor=True,
-            )
+    request_context = _search_messages_request_context(args)
+    if isinstance(request_context, ToolResult):
+        return request_context
 
     try:
-        if global_mode:
+        if request_context.global_mode:
             id_kwarg: dict = {}
-        elif dialog_id:
-            id_kwarg = {"dialog_id": dialog_id}
+        elif request_context.dialog_id:
+            id_kwarg = {"dialog_id": request_context.dialog_id}
         else:
             id_kwarg = {"dialog": args.dialog}
         async with daemon_connection() as conn:
@@ -1308,26 +1391,16 @@ async def search_messages(args: SearchMessages) -> ToolResult:
                 **id_kwarg,
                 query=args.query,
                 limit=args.limit,
-                offset=offset,
+                offset=request_context.offset,
             )
     except DaemonNotRunningError:
         return error_result(_daemon_not_running_text())
 
-    dialog_label: str | None = str(dialog_id) if dialog_id else args.dialog
-
     if not response.get("ok"):
-        error = response.get("error", "unknown")
-        error_detail = response.get("message", "")
-        if error == "dialog_not_found":
-            return error_result(
-                dialog_not_found_text(dialog_label or "?", retry_tool="SearchMessages"),
-                has_filter=True,
-                has_cursor=args.navigation is not None,
-            )
-        return error_result(
-            f"Error: {error}: {error_detail}\n"
-            "Action: Retry search_messages with corrected arguments, or call list_dialogs first to discover a valid dialog id.",
-            has_filter=True,
+        return _search_messages_error_result(
+            error=response.get("error", "unknown"),
+            error_detail=response.get("message", ""),
+            dialog_label=request_context.dialog_label,
             has_cursor=args.navigation is not None,
         )
 
@@ -1335,14 +1408,16 @@ async def search_messages(args: SearchMessages) -> ToolResult:
     rows = data.get("messages", [])
     next_nav = data.get("next_navigation")
     structured_content = _search_structured_content(
-        args=args,
-        data=data,
-        rows=rows,
-        dialog_id=dialog_id,
-        dialog_label=dialog_label,
-        global_mode=global_mode,
-        offset=offset,
-        next_navigation=next_nav,
+        _SearchStructuredContentContext(
+            args=args,
+            data=data,
+            rows=rows,
+            dialog_id=request_context.dialog_id,
+            dialog_label=request_context.dialog_label,
+            global_mode=request_context.global_mode,
+            offset=request_context.offset,
+            next_navigation=next_nav,
+        )
     )
 
     if not rows:
