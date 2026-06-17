@@ -201,3 +201,63 @@ name = "daemon_client does not import daemon_api"
 type = "forbidden"
 source_modules = ["mcp_telegram.daemon_client"]
 forbidden_modules = ["mcp_telegram.daemon_api"]
+
+[[tool.importlinter.contracts]]
+name = "MCP tools stay behind daemon client boundary"
+type = "forbidden"
+source_modules = [
+  "mcp_telegram.tools._base",
+  "mcp_telegram.tools.account_trace",
+  "mcp_telegram.tools.activity",
+  "mcp_telegram.tools.discovery",
+  "mcp_telegram.tools.entity_info",
+  "mcp_telegram.tools.feedback",
+  "mcp_telegram.tools.reading",
+  "mcp_telegram.tools.stats",
+  "mcp_telegram.tools.structured",
+  "mcp_telegram.tools.sync",
+  "mcp_telegram.tools.unread",
+]
+forbidden_modules = [
+  "mcp_telegram.daemon",
+  "mcp_telegram.daemon_api",
+  "mcp_telegram.daemon_account_trace",
+  "mcp_telegram.daemon_activity_stats",
+  "mcp_telegram.daemon_entity_info",
+  "mcp_telegram.daemon_message",
+  "mcp_telegram.daemon_reading",
+  "mcp_telegram.daemon_source_export",
+  "mcp_telegram.sync_worker",
+  "mcp_telegram.delta_sync",
+  "mcp_telegram.dialog_sync",
+  "mcp_telegram.event_handlers",
+  "mcp_telegram.activity_sync",
+  "mcp_telegram.activity_peer_sweep",
+  "mcp_telegram.activity_hot_sweep",
+  "mcp_telegram.activity_cold_backfill",
+  "mcp_telegram.activity_peer_resolve",
+]
+
+[[tool.importlinter.contracts]]
+name = "Sync and activity workers stay off MCP transport and daemon API"
+type = "forbidden"
+source_modules = [
+  "mcp_telegram.activity_sync",
+  "mcp_telegram.activity_peer_sweep",
+  "mcp_telegram.activity_hot_sweep",
+  "mcp_telegram.activity_cold_backfill",
+  "mcp_telegram.activity_peer_resolve",
+  "mcp_telegram.sync_worker",
+  "mcp_telegram.delta_sync",
+  "mcp_telegram.dialog_sync",
+  "mcp_telegram.event_handlers",
+  "mcp_telegram.flood",
+  "mcp_telegram.telegram",
+]
+forbidden_modules = [
+  "mcp_telegram.server",
+  "mcp_telegram.tools",
+  "mcp_telegram.__init__",
+  "mcp_telegram.daemon_api",
+  "mcp_telegram.daemon_client",
+]
