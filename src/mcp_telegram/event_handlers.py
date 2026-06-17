@@ -796,6 +796,87 @@ class EventHandlerManager:
     # Phase 42: dialog metadata Raw handlers (EVENTS-01, EVENTS-02, EVENTS-03)
     # ------------------------------------------------------------------
 
+    def _dialog_id_from_peer(self, peer: Any | None) -> int | None:
+        inner_peer = getattr(peer, "peer", peer)
+        if inner_peer is None:
+            return None
+        return int(get_peer_id(inner_peer))
+
+    def _collect_synced_pinned_dialog_ids(self, order: Any) -> list[int]:
+        pinned_ids: list[int] = []
+        for dialog_peer in order:
+            inner_peer = getattr(dialog_peer, "peer", dialog_peer)
+            try:
+                dialog_id = int(get_peer_id(inner_peer))
+            except (TypeError, ValueError):
+                continue
+            if dialog_id in self._synced_dialog_ids:
+                pinned_ids.append(dialog_id)
+        return pinned_ids
+
+    def _update_dialog_pinned(self, update: UpdateDialogPinned, now: int) -> None:
+        dialog_id = self._dialog_id_from_peer(getattr(update, "peer", None))
+        if dialog_id is None or dialog_id not in self._synced_dialog_ids:
+            return
+        pinned = 1 if getattr(update, "pinned", False) else 0
+        with self._conn:
+            self._conn.execute(_UPDATE_DIALOG_PINNED_SQL, (pinned, now, dialog_id))
+        logger.info("event_dialog_pinned dialog_id=%d pinned=%d", dialog_id, pinned)
+
+    def _rewrite_pinned_dialogs(self, update: UpdatePinnedDialogs, now: int) -> None:
+        order = getattr(update, "order", None)
+        if order is None:
+            logger.debug("event_pinned_dialogs_order_none — skip")
+            return
+        # folder_id=None means the main list; folder_id=1 means Archived, etc.
+        # A folder-scoped update carries only pins *within* that folder, so we
+        # must not use it to clear pins in other folders.
+        folder_id = getattr(update, "folder_id", None)
+        # Decode peers; gate by _synced_dialog_ids so we never UPDATE
+        # rows for dialogs the daemon does not own.
+        pinned_ids = self._collect_synced_pinned_dialog_ids(order)
+        with self._conn:
+            for dialog_id in pinned_ids:
+                self._conn.execute(
+                    _UPDATE_DIALOG_PINNED_SQL,
+                    (1, now, dialog_id),
+                )
+            if folder_id is None:
+                # Main list: rewrite the full pin set — the update is
+                # authoritative for all main-list pins.
+                if pinned_ids:
+                    placeholders = ",".join("?" * len(pinned_ids))
+                    sql = _CLEAR_PINS_NOT_IN_SQL_TEMPLATE.format(
+                        placeholders=placeholders,
+                    )
+                    self._conn.execute(sql, (now, *pinned_ids))
+                else:
+                    # Empty order list → all dialogs unpinned in main list.
+                    # NOT IN () is invalid SQLite — use the dedicated SQL.
+                    self._conn.execute(_CLEAR_ALL_PINS_SQL, (now,))
+            # For folder-scoped updates (folder_id != None) we only set the
+            # pinned=1 rows above; we do not clear other dialogs because the
+            # update does not describe pins outside that folder.
+        logger.info(
+            "event_pinned_dialogs_rewrote pinned_count=%d folder_id=%s",
+            len(pinned_ids),
+            folder_id,
+        )
+
+    def _update_dialog_unread_mark(self, update: UpdateDialogUnreadMark, now: int) -> None:
+        dialog_id = self._dialog_id_from_peer(getattr(update, "peer", None))
+        if dialog_id is None or dialog_id not in self._synced_dialog_ids:
+            return
+        with self._conn:
+            self._conn.execute(
+                _UPDATE_DIALOG_NEEDS_REFRESH_SQL,
+                (now, dialog_id),
+            )
+        logger.info(
+            "event_dialog_unread_mark dialog_id=%d needs_refresh=1",
+            dialog_id,
+        )
+
     async def on_raw_dialog_pinned(self, update: Any) -> None:
         """Phase 42 EVENTS-01: dialogs.pinned + needs_refresh from raw updates.
 
@@ -812,83 +893,11 @@ class EventHandlerManager:
         try:
             now = int(time.time())
             if isinstance(update, UpdateDialogPinned):
-                peer = getattr(update, "peer", None)
-                inner_peer = getattr(peer, "peer", peer)  # DialogPeer.peer → TypePeer
-                if inner_peer is None:
-                    return
-                dialog_id = int(get_peer_id(inner_peer))
-                if dialog_id not in self._synced_dialog_ids:
-                    return
-                pinned = 1 if getattr(update, "pinned", False) else 0
-                with self._conn:
-                    self._conn.execute(_UPDATE_DIALOG_PINNED_SQL, (pinned, now, dialog_id))
-                logger.info("event_dialog_pinned dialog_id=%d pinned=%d", dialog_id, pinned)
-
+                self._update_dialog_pinned(update, now)
             elif isinstance(update, UpdatePinnedDialogs):
-                order = getattr(update, "order", None)
-                if order is None:
-                    logger.debug("event_pinned_dialogs_order_none — skip")
-                    return
-                # folder_id=None means the main list; folder_id=1 means Archived, etc.
-                # A folder-scoped update carries only pins *within* that folder, so we
-                # must not use it to clear pins in other folders.
-                folder_id = getattr(update, "folder_id", None)
-                # Decode peers; gate by _synced_dialog_ids so we never UPDATE
-                # rows for dialogs the daemon does not own.
-                pinned_ids: list[int] = []
-                for dp in order:
-                    inner = getattr(dp, "peer", dp)
-                    try:
-                        did = int(get_peer_id(inner))
-                    except TypeError, ValueError:
-                        continue
-                    if did in self._synced_dialog_ids:
-                        pinned_ids.append(did)
-                with self._conn:
-                    for did in pinned_ids:
-                        self._conn.execute(
-                            _UPDATE_DIALOG_PINNED_SQL,
-                            (1, now, did),
-                        )
-                    if folder_id is None:
-                        # Main list: rewrite the full pin set — the update is
-                        # authoritative for all main-list pins.
-                        if pinned_ids:
-                            placeholders = ",".join("?" * len(pinned_ids))
-                            sql = _CLEAR_PINS_NOT_IN_SQL_TEMPLATE.format(
-                                placeholders=placeholders,
-                            )
-                            self._conn.execute(sql, (now, *pinned_ids))
-                        else:
-                            # Empty order list → all dialogs unpinned in main list.
-                            # NOT IN () is invalid SQLite — use the dedicated SQL.
-                            self._conn.execute(_CLEAR_ALL_PINS_SQL, (now,))
-                    # For folder-scoped updates (folder_id != None) we only set the
-                    # pinned=1 rows above; we do not clear other dialogs because the
-                    # update does not describe pins outside that folder.
-                logger.info(
-                    "event_pinned_dialogs_rewrote pinned_count=%d folder_id=%s",
-                    len(pinned_ids),
-                    folder_id,
-                )
-
+                self._rewrite_pinned_dialogs(update, now)
             elif isinstance(update, UpdateDialogUnreadMark):
-                peer = getattr(update, "peer", None)
-                inner_peer = getattr(peer, "peer", peer)
-                if inner_peer is None:
-                    return
-                dialog_id = int(get_peer_id(inner_peer))
-                if dialog_id not in self._synced_dialog_ids:
-                    return
-                with self._conn:
-                    self._conn.execute(
-                        _UPDATE_DIALOG_NEEDS_REFRESH_SQL,
-                        (now, dialog_id),
-                    )
-                logger.info(
-                    "event_dialog_unread_mark dialog_id=%d needs_refresh=1",
-                    dialog_id,
-                )
+                self._update_dialog_unread_mark(update, now)
         except Exception:
             logger.exception(
                 "event_dialog_pinned_failed update=%r",
