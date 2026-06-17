@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from mcp_telegram.daemon_api import DaemonAPIServer, _classify_dialog_type, get_daemon_socket_path
+from mcp_telegram.daemon_api import DaemonAPIServer, get_daemon_socket_path
 from mcp_telegram.daemon_message import fetch_reaction_counts, message_to_dict
 from mcp_telegram.fts import MESSAGES_FTS_DDL, stem_text
 from mcp_telegram.models import DialogType
@@ -755,7 +755,7 @@ def test_classify_dialog_type_forum() -> None:
     entity.megagroup = True
     entity.forum = True
     entity.broadcast = False
-    assert _classify_dialog_type(entity) == DialogType.FORUM
+    assert DialogType.from_entity(entity) == DialogType.FORUM
 
 
 def test_classify_dialog_type_group() -> None:
@@ -767,7 +767,7 @@ def test_classify_dialog_type_group() -> None:
     entity.forum = False
     entity.broadcast = False
     # megagroup (not forum) → SUPERGROUP under the canonical vocabulary
-    assert _classify_dialog_type(entity) == DialogType.SUPERGROUP
+    assert DialogType.from_entity(entity) == DialogType.SUPERGROUP
 
 
 def test_classify_dialog_type_channel_broadcast() -> None:
@@ -778,21 +778,21 @@ def test_classify_dialog_type_channel_broadcast() -> None:
     entity.broadcast = True
     entity.megagroup = False
     entity.forum = False
-    assert _classify_dialog_type(entity) == DialogType.CHANNEL
+    assert DialogType.from_entity(entity) == DialogType.CHANNEL
 
 
 def test_classify_dialog_type_bot() -> None:
     entity = MagicMock()
     entity.first_name = "BotFather"
     entity.bot = True
-    assert _classify_dialog_type(entity) == DialogType.BOT
+    assert DialogType.from_entity(entity) == DialogType.BOT
 
 
 def test_classify_dialog_type_user() -> None:
     entity = MagicMock()
     entity.first_name = "Alice"
     entity.bot = False
-    assert _classify_dialog_type(entity) == DialogType.USER
+    assert DialogType.from_entity(entity) == DialogType.USER
 
 
 def test_classify_dialog_type_chat() -> None:
@@ -801,11 +801,11 @@ def test_classify_dialog_type_chat() -> None:
     entity = MagicMock()
     entity.__class__ = Chat
     # legacy basic group (Chat) → GROUP under the canonical vocabulary
-    assert _classify_dialog_type(entity) == DialogType.GROUP
+    assert DialogType.from_entity(entity) == DialogType.GROUP
 
 
 def test_classify_dialog_type_none() -> None:
-    assert _classify_dialog_type(None) == DialogType.UNKNOWN
+    assert DialogType.from_entity(None) == DialogType.UNKNOWN
 
 
 # ---------------------------------------------------------------------------

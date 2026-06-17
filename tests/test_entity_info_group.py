@@ -240,11 +240,9 @@ async def test_get_entity_info_group_migrated_to_verbatim() -> None:
     # SPEC Req 12 + RESEARCH: no auto-follow code path. Verify by source-grep:
     import inspect
 
-    from mcp_telegram import daemon_api as da
+    from mcp_telegram import daemon_entity_info as di
 
-    src = inspect.getsource(
-        da._fetch_group_detail if hasattr(da, "_fetch_group_detail") else da.DaemonAPIServer._fetch_group_detail
-    )
+    src = inspect.getsource(di.DaemonEntityInfoService._fetch_group_detail)
     # No "follow" or "redirect" or recursive call to _get_entity_info inside the helper
     assert "follow_migrated" not in src
     assert "_get_entity_info(" not in src
