@@ -11,11 +11,15 @@ from pathlib import Path
 from typing import Protocol, TypedDict, Unpack, cast
 
 import pytest
+from telethon import utils as telethon_utils
 from telethon.tl.types import PeerUser
 
+from mcp_telegram import activity_sync
 from mcp_telegram.activity_sync import (
     _run_backfill,
     _run_incremental,
+    _SearchResultLike,
+    _upsert_entities_from_search,
     run_activity_sync_loop,
 )
 from mcp_telegram.sync_db import ensure_sync_schema
@@ -52,6 +56,21 @@ class FakeSearchResult:
     messages: list[FakeMessage]
     users: list[_SearchEntityLike] = field(default_factory=list)
     chats: list[_SearchEntityLike] = field(default_factory=list)
+    count: int | None = None
+
+
+@dataclass
+class _UnknownSearchEntity:
+    pass
+
+
+@dataclass
+class _SearchEntity:
+    id: int
+    first_name: str | None = None
+    last_name: str | None = None
+    title: str | None = None
+    username: str | None = None
 
 
 class _MsgKwargs(TypedDict, total=False):
@@ -306,6 +325,83 @@ async def test_backfill_does_not_downgrade_synced_dialog(conn: sqlite3.Connectio
     assert status_row is not None
     status = status_row[0]
     assert status == "synced", "INSERT OR IGNORE must preserve higher-status row — never downgrade to 'own_only'"
+
+
+def test_upsert_entities_from_search_inserts_users_and_chats(
+    conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(activity_sync.time, "time", lambda: 1_700_000_123)
+
+    user_one = _SearchEntity(id=7, first_name="Ada", last_name="Lovelace", username="ada")
+    user_two = _SearchEntity(id=8, username="no-name")
+    channel = _SearchEntity(id=11, title="Research", username="research")
+
+    result = FakeSearchResult(
+        messages=[],
+        users=[user_one, user_two],
+        chats=[channel],
+    )
+
+    monkeypatch.setattr(
+        activity_sync,
+        "_classify_entity",
+        lambda obj: "channel" if obj is channel else "user" if obj is user_one or obj is user_two else None,
+    )
+
+    original_get_peer_id = telethon_utils.get_peer_id
+
+    def _fake_get_peer_id(peer: object) -> int:
+        if peer is channel:
+            return -1000000000011
+        return original_get_peer_id(peer)
+
+    monkeypatch.setattr(telethon_utils, "get_peer_id", _fake_get_peer_id)
+
+    _upsert_entities_from_search(conn, cast(_SearchResultLike, result))
+
+    rows = cast(
+        list[tuple[int, str, str | None, str | None, str | None, int]],
+        conn.execute(
+            "SELECT id, type, name, username, name_normalized, updated_at FROM entities ORDER BY id"
+        ).fetchall(),
+    )
+    assert rows == [
+        (-1000000000011, "channel", "Research", "research", "research", 1_700_000_123),
+        (7, "user", "Ada Lovelace", "ada", "ada lovelace", 1_700_000_123),
+        (8, "user", "no-name", "no-name", "no-name", 1_700_000_123),
+    ]
+
+
+def test_upsert_entities_from_search_skips_unclassified_and_peer_id_failures(
+    conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bad_channel = _SearchEntity(id=12, title="Broken", username="broken")
+    original_get_peer_id = telethon_utils.get_peer_id
+
+    def _fake_get_peer_id(peer: object) -> int:
+        if peer is bad_channel:
+            raise TypeError("cannot resolve peer id")
+        return original_get_peer_id(peer)
+
+    monkeypatch.setattr(telethon_utils, "get_peer_id", _fake_get_peer_id)
+
+    result = FakeSearchResult(
+        messages=[],
+        users=[cast(_SearchEntityLike, _UnknownSearchEntity())],
+        chats=[bad_channel],
+    )
+
+    monkeypatch.setattr(
+        activity_sync,
+        "_classify_entity",
+        lambda obj: "channel" if obj is bad_channel else None,
+    )
+
+    _upsert_entities_from_search(conn, cast(_SearchResultLike, result))
+
+    count_row = cast(tuple[int] | None, conn.execute("SELECT COUNT(*) FROM entities").fetchone())
+    assert count_row is not None
+    assert count_row[0] == 0
 
 
 @pytest.mark.asyncio
