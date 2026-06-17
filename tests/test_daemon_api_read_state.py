@@ -16,13 +16,14 @@ import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 from types import SimpleNamespace
-from typing import TypedDict, Unpack
+from typing import TypedDict, Unpack, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from mcp_telegram.daemon_api import (
     DaemonAPIServer,
+    _DaemonClientLike,
     _dialog_type_from_db,
     _read_state_for_dialog,
 )
@@ -45,6 +46,19 @@ def _patch_get_peer_id():
 # ---------------------------------------------------------------------------
 # Schema helper (includes read_outbox_max_id — Phase 39.3 v12)
 # ---------------------------------------------------------------------------
+
+
+class _InsertSyncedDialogKwargs(TypedDict, total=False):
+    status: str
+    read_inbox_max_id: int | None
+    read_outbox_max_id: int | None
+    total_messages: int | None
+
+
+class _InsertMessageKwargs(TypedDict, total=False):
+    out: int
+    sent_at: int
+    text: str
 
 
 @contextmanager
@@ -174,18 +188,7 @@ def _make_db() -> Iterator[sqlite3.Connection]:
 def _insert_synced_dialog(
     conn: sqlite3.Connection,
     dialog_id: int,
-    **kwargs: Unpack[
-        TypedDict(
-            "_InsertSyncedDialogKwargs",
-            {
-                "status": str,
-                "read_inbox_max_id": int | None,
-                "read_outbox_max_id": int | None,
-                "total_messages": int | None,
-            },
-            total=False,
-        )
-    ],
+    **kwargs: Unpack[_InsertSyncedDialogKwargs],
 ) -> None:
     status = kwargs.get("status", "synced")
     read_inbox_max_id = kwargs.get("read_inbox_max_id")
@@ -212,7 +215,7 @@ def _insert_message(
     conn: sqlite3.Connection,
     dialog_id: int,
     message_id: int,
-    **kwargs: Unpack[TypedDict("_InsertMessageKwargs", {"out": int, "sent_at": int, "text": str}, total=False)],
+    **kwargs: Unpack[_InsertMessageKwargs],
 ) -> None:
     out = kwargs.get("out", 0)
     sent_at = kwargs.get("sent_at", 1_700_000_000)
@@ -231,7 +234,7 @@ def make_server(
     if client is None:
         client = MagicMock()
     shutdown_event = asyncio.Event()
-    return DaemonAPIServer(conn, client, shutdown_event)
+    return DaemonAPIServer(conn, cast(_DaemonClientLike, client), shutdown_event)
 
 
 # ---------------------------------------------------------------------------
@@ -319,6 +322,8 @@ def test_read_state_for_dialog_dm_populated() -> None:
         assert rs["outbox_unread_count"] == 1
         assert rs["inbox_cursor_state"] == "populated"
         assert rs["outbox_cursor_state"] == "populated"
+        assert "inbox_max_id_anchor" in rs
+        assert "outbox_max_id_anchor" in rs
         assert rs["inbox_max_id_anchor"] == 5
         assert rs["outbox_max_id_anchor"] == 10
 
@@ -385,6 +390,7 @@ def test_read_state_for_dialog_oldest_unread_date_inbox() -> None:
 
         rs = _read_state_for_dialog(conn, 1, "User")
         assert rs is not None
+        assert "inbox_oldest_unread_date" in rs
         assert rs["inbox_oldest_unread_date"] == 1400
         assert "outbox_oldest_unread_date" not in rs  # outbox caught up
 
@@ -398,6 +404,7 @@ def test_read_state_for_dialog_oldest_unread_date_outbox() -> None:
 
         rs = _read_state_for_dialog(conn, 1, "User")
         assert rs is not None
+        assert "outbox_oldest_unread_date" in rs
         assert rs["outbox_oldest_unread_date"] == 2400
         assert "inbox_oldest_unread_date" not in rs
 

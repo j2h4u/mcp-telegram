@@ -19,12 +19,14 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from collections.abc import Iterator
 from contextlib import asynccontextmanager, contextmanager
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from mcp_telegram.daemon_api import DaemonAPIServer
+from mcp_telegram.daemon_api import DaemonAPIServer, _DaemonClientLike
 
 # ---------------------------------------------------------------------------
 # get_peer_id patch (daemon_api imports telethon_utils.get_peer_id; tests
@@ -47,7 +49,7 @@ def _patch_get_peer_id():
 
 
 @contextmanager
-def _make_db() -> sqlite3.Connection:
+def _make_db() -> Iterator[sqlite3.Connection]:
     """In-memory DB with full Phase 44 schema: synced_dialogs, messages,
     entities, message_forwards, and the dialogs snapshot table + 4 indexes."""
     conn = sqlite3.connect(":memory:")
@@ -191,9 +193,24 @@ def _insert_message(
 
 
 def _make_server(conn: sqlite3.Connection, client: object) -> DaemonAPIServer:
-    server = DaemonAPIServer(conn, client, asyncio.Event())
+    server = DaemonAPIServer(conn, cast(_DaemonClientLike, client), asyncio.Event())
     server._ready = True
     return server
+
+
+class _TestClient(MagicMock):
+    iter_dialogs: object
+    get_entity: object
+    send_message: object
+
+
+def _dialog_rows(result: dict[str, object]) -> list[dict[str, object]]:
+    data = cast(dict[str, object], result["data"])
+    return cast(list[dict[str, object]], data["dialogs"])
+
+
+def _assert_not_called(mock: object) -> None:
+    cast(MagicMock, mock).assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -212,12 +229,12 @@ async def test_list_dialogs_dm_row_has_unread_in_and_unread_out() -> None:
         _insert_message(conn, 1, 3, out=0)  # read
         _insert_message(conn, 1, 9, out=1)  # read
 
-        client = MagicMock()
+        client = _TestClient()
         server = _make_server(conn, client)
 
         result = await server._list_dialogs({})
         assert result["ok"] is True
-        row = result["data"]["dialogs"][0]
+        row = _dialog_rows(result)[0]
         assert row["unread_in"] == 2
         assert row["unread_out"] == 1
 
@@ -229,10 +246,10 @@ async def test_list_dialogs_dm_row_unread_zero_when_caught_up() -> None:
         _insert_message(conn, 2, 50, out=0)
         _insert_message(conn, 2, 150, out=1)
 
-        client = MagicMock()
+        client = _TestClient()
         server = _make_server(conn, client)
 
-        row = (await server._list_dialogs({}))["data"]["dialogs"][0]
+        row = _dialog_rows(await server._list_dialogs({}))[0]
         assert row["unread_in"] == 0
         assert row["unread_out"] == 0
 
@@ -244,10 +261,10 @@ async def test_list_dialogs_dm_row_unread_in_only() -> None:
         _insert_message(conn, 3, 5, out=0)
         _insert_message(conn, 3, 50, out=1)
 
-        client = MagicMock()
+        client = _TestClient()
         server = _make_server(conn, client)
 
-        row = (await server._list_dialogs({}))["data"]["dialogs"][0]
+        row = _dialog_rows(await server._list_dialogs({}))[0]
         assert row["unread_in"] == 1
         assert row["unread_out"] == 0
 
@@ -259,10 +276,10 @@ async def test_list_dialogs_dm_row_unread_out_only() -> None:
         _insert_message(conn, 4, 50, out=0)
         _insert_message(conn, 4, 5, out=1)
 
-        client = MagicMock()
+        client = _TestClient()
         server = _make_server(conn, client)
 
-        row = (await server._list_dialogs({}))["data"]["dialogs"][0]
+        row = _dialog_rows(await server._list_dialogs({}))[0]
         assert row["unread_in"] == 0
         assert row["unread_out"] == 1
 
@@ -273,7 +290,7 @@ async def test_list_dialogs_non_dm_row_omits_unread_fields() -> None:
         _insert_synced_dialog(conn, 7, read_inbox_max_id=0, read_outbox_max_id=0)
         _insert_message(conn, 7, 1, out=0)
 
-        client = MagicMock()
+        client = _TestClient()
         server = _make_server(conn, client)
 
         row = (await server._list_dialogs({}))["data"]["dialogs"][0]
@@ -290,7 +307,7 @@ async def test_list_dialogs_null_inbox_cursor_treats_all_incoming_as_unread() ->
         _insert_message(conn, 8, 2, out=0)
         _insert_message(conn, 8, 3, out=0)
 
-        client = MagicMock()
+        client = _TestClient()
         server = _make_server(conn, client)
 
         row = (await server._list_dialogs({}))["data"]["dialogs"][0]
@@ -305,7 +322,7 @@ async def test_list_dialogs_null_outbox_cursor_treats_all_outgoing_as_unread() -
         _insert_message(conn, 9, 1, out=1)
         _insert_message(conn, 9, 2, out=1)
 
-        client = MagicMock()
+        client = _TestClient()
         server = _make_server(conn, client)
 
         row = (await server._list_dialogs({}))["data"]["dialogs"][0]
@@ -319,14 +336,14 @@ async def test_list_dialogs_zero_telegram_api_calls_for_unread_query() -> None:
         _insert_synced_dialog(conn, 10, read_inbox_max_id=1, read_outbox_max_id=1)
         _insert_message(conn, 10, 2, out=0)
 
-        client = MagicMock()
+        client = _TestClient()
         server = _make_server(conn, client)
         await server._list_dialogs({})
 
     # No Telegram API calls: iter_dialogs, get_entity, send_message etc all absent.
-    client.iter_dialogs.assert_not_called()
-    client.get_entity.assert_not_called()
-    client.send_message.assert_not_called()
+    cast(MagicMock, client.iter_dialogs).assert_not_called()
+    cast(MagicMock, client.get_entity).assert_not_called()
+    cast(MagicMock, client.send_message).assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -357,8 +374,8 @@ async def test_list_dialogs_query_uses_messages_pk_index() -> None:
             "WHERE sd.status = 'synced' "
             "GROUP BY m.dialog_id"
         )
-        plan_rows = conn.execute("EXPLAIN QUERY PLAN " + sql).fetchall()
-        plan_text = " | ".join(row[3] for row in plan_rows)
+        plan_rows = cast(list[tuple[object, ...]], conn.execute("EXPLAIN QUERY PLAN " + sql).fetchall())
+        plan_text = " | ".join(cast(str, row[3]) for row in plan_rows)
         # HARD guard: reject if any row hints at an unintended redundant index path
         # (e.g. a covering secondary index that shadows the PK). The canonical
         # plans are "SCAN m" or "SEARCH ... USING PRIMARY KEY". Accept either.
@@ -410,7 +427,7 @@ async def test_list_dialogs_unread_columns_scales_to_200_dialogs() -> None:
                 channel_ids.add(d)
         conn.commit()
 
-        client = MagicMock()
+        client = _TestClient()
         server = _make_server(conn, client)
         result = await server._list_dialogs({})
         assert result["ok"] is True
@@ -429,7 +446,7 @@ async def test_list_dialogs_unread_columns_scales_to_200_dialogs() -> None:
                 assert "unread_out" not in row, f"Channel row {row['id']} should not have unread_out"
 
         # iter_dialogs is never called in the SQL path
-        client.iter_dialogs.assert_not_called()
+        cast(MagicMock, client.iter_dialogs).assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -492,10 +509,11 @@ async def test_list_dialogs_structured_output_includes_unread_values_and_channel
 
     assert result.content == ()
     assert result.structured_content is not None
-    dm_row = result.structured_content["dialogs"][0]
+    dialogs = cast(list[dict[str, object]], cast(dict[str, object], result.structured_content)["dialogs"])
+    dm_row = dialogs[0]
     assert dm_row["unread_in"] == 3
     assert dm_row["unread_out"] == 1
 
-    channel_row = result.structured_content["dialogs"][1]
+    channel_row = dialogs[1]
     assert channel_row["unread_in"] is None
     assert channel_row["unread_out"] is None

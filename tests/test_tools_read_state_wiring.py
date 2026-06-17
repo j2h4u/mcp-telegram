@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
+from typing import TypedDict, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -83,12 +84,18 @@ class _DMRowOptions:
     sender_first_name: str | None = "Alice"
 
 
-def _dm_row(*, opts: _DMRowOptions | None = None, **kwargs) -> dict:
+class _ReadStateHeader(TypedDict):
+    header_lines: list[str]
+    state: dict[str, object] | None
+    dialog_type: str | None
+
+
+def _dm_row(*, opts: _DMRowOptions | None = None, **kwargs: object) -> dict[str, object]:
     if opts is None:
         opts = _DMRowOptions()
     if kwargs:
         opts = replace(opts, **kwargs)
-    r: dict = {
+    r: dict[str, object] = {
         "message_id": opts.message_id,
         "out": opts.out,
         "sent_at": opts.sent_at,
@@ -120,7 +127,7 @@ def test_format_daemon_messages_passes_read_state_and_dialog_type_to_format_mess
             dialog_type="User",
         )
         assert mock_fmt.called
-        kwargs = mock_fmt.call_args.kwargs
+        kwargs = cast(dict[str, object], mock_fmt.call_args.kwargs)
         assert kwargs.get("read_state") == rs
         assert kwargs.get("dialog_type") == "User"
 
@@ -147,7 +154,9 @@ async def test_list_messages_tool_renders_header_in_output() -> None:
         result = await list_messages(ListMessages(exact_dialog_id=111))
     assert result.content == ()
     assert result.structured_content is not None
-    assert result.structured_content["read_state"]["header_lines"][0].startswith("[inbox: 2 unread from peer")
+    structured = cast(dict[str, object], result.structured_content)
+    read_state = cast(_ReadStateHeader, structured["read_state"])
+    assert read_state["header_lines"][0].startswith("[inbox: 2 unread from peer")
 
 
 @pytest.mark.asyncio
@@ -179,8 +188,11 @@ async def test_list_messages_tool_renders_inline_marker_in_output() -> None:
         result = await list_messages(ListMessages(exact_dialog_id=111))
     assert result.content == ()
     assert result.structured_content is not None
+    structured = cast(dict[str, object], result.structured_content)
     markers = [
-        marker["label"] for message in result.structured_content["messages"] for marker in message["inline_markers"]
+        cast(dict[str, object], marker)["label"]
+        for message in cast(list[dict[str, object]], structured["messages"])
+        for marker in cast(list[dict[str, object]], message["inline_markers"])
     ]
     assert any(
         marker in markers
@@ -210,7 +222,9 @@ async def test_list_messages_tool_non_dm_omits_header() -> None:
         result = await list_messages(ListMessages(exact_dialog_id=-100500))
     assert result.content == ()
     assert result.structured_content is not None
-    assert result.structured_content["read_state"]["header_lines"] == []
+    structured = cast(dict[str, object], result.structured_content)
+    read_state = cast(_ReadStateHeader, structured["read_state"])
+    assert read_state["header_lines"] == []
 
 
 @pytest.mark.asyncio
@@ -228,7 +242,8 @@ async def test_list_messages_tool_backward_compat_no_read_state_in_response() ->
         result = await list_messages(ListMessages(exact_dialog_id=111))
     assert result.content == ()
     assert result.structured_content is not None
-    assert result.structured_content["read_state"] is None
+    structured = cast(dict[str, object], result.structured_content)
+    assert structured["read_state"] is None
 
 
 @pytest.mark.asyncio
@@ -248,8 +263,10 @@ async def test_list_messages_structures_dialog_type_read_state() -> None:
         result = await list_messages(ListMessages(exact_dialog_id=111))
     assert result.content == ()
     assert result.structured_content is not None
-    assert result.structured_content["read_state"]["dialog_type"] == "User"
-    assert result.structured_content["read_state"]["state"] == _collapsed_rs()
+    structured = cast(dict[str, object], result.structured_content)
+    read_state = cast(_ReadStateHeader, structured["read_state"])
+    assert read_state["dialog_type"] == "User"
+    assert read_state["state"] == _collapsed_rs()
 
 
 # ---------------------------------------------------------------------------
@@ -352,7 +369,9 @@ async def test_search_tool_renders_per_dialog_header_block() -> None:
         result = await search_messages(SearchMessages(query="ping"))
     assert result.content == ()
     assert result.structured_content is not None
-    read_state = result.structured_content["read_state_per_dialog"]
+    read_state = cast(
+        dict[str, _ReadStateHeader], cast(dict[str, object], result.structured_content)["read_state_per_dialog"]
+    )
     assert read_state["111"]["header_lines"][0].startswith("[inbox: 2 unread from peer")
     assert read_state["222"]["header_lines"] == ["[read-state: all caught up]"]
 
@@ -367,7 +386,7 @@ async def test_search_tool_backward_compat_no_read_state_per_dialog() -> None:
         result = await search_messages(SearchMessages(query="ping"))
     assert result.content == ()
     assert result.structured_content is not None
-    assert result.structured_content["read_state_per_dialog"] == {}
+    assert cast(dict[str, object], result.structured_content)["read_state_per_dialog"] == {}
 
 
 # ---------------------------------------------------------------------------
@@ -386,12 +405,12 @@ class _UnreadGroupOptions:
     msg_id: int = 1
 
 
-def _unread_group(*, opts: _UnreadGroupOptions | None = None, **kwargs) -> dict:
+def _unread_group(*, opts: _UnreadGroupOptions | None = None, **kwargs: object) -> dict[str, object]:
     if opts is None:
         opts = _UnreadGroupOptions(dialog_id=0, display_name="", read_state=None, dialog_type=None)
     if kwargs:
         opts = replace(opts, **kwargs)
-    g: dict = {
+    g: dict[str, object] = {
         "dialog_id": opts.dialog_id,
         "display_name": opts.display_name,
         "unread_count": 1,
@@ -444,9 +463,11 @@ async def test_unread_tool_renders_per_chat_header() -> None:
         result = await get_inbox(GetInbox())
     assert result.content == ()
     assert result.structured_content is not None
-    dialogs = result.structured_content["dialogs"]
-    assert dialogs[0]["read_state"]["header_lines"][0].startswith("[inbox: 2 unread from peer")
-    assert dialogs[1]["read_state"]["header_lines"] == ["[read-state: all caught up]"]
+    dialogs = cast(list[dict[str, object]], cast(dict[str, object], result.structured_content)["dialogs"])
+    first_read_state = cast(_ReadStateHeader, dialogs[0]["read_state"])
+    second_read_state = cast(_ReadStateHeader, dialogs[1]["read_state"])
+    assert first_read_state["header_lines"][0].startswith("[inbox: 2 unread from peer")
+    assert second_read_state["header_lines"] == ["[read-state: all caught up]"]
 
 
 @pytest.mark.asyncio
@@ -465,7 +486,8 @@ async def test_unread_tool_renders_collapsed_header_when_chat_caught_up() -> Non
     with _patch_daemon("mcp_telegram.tools.unread.daemon_connection", conn):
         result = await get_inbox(GetInbox())
     assert result.content == ()
-    assert result.structured_content["dialogs"][0]["read_state"]["header_lines"] == ["[read-state: all caught up]"]
+    structured = cast(list[dict[str, object]], cast(dict[str, object], result.structured_content)["dialogs"])
+    assert cast(_ReadStateHeader, structured[0]["read_state"])["header_lines"] == ["[read-state: all caught up]"]
 
 
 @pytest.mark.asyncio
@@ -484,7 +506,8 @@ async def test_unread_tool_renders_split_header_when_inbox_unread() -> None:
     with _patch_daemon("mcp_telegram.tools.unread.daemon_connection", conn):
         result = await get_inbox(GetInbox())
     assert result.content == ()
-    header_lines = result.structured_content["dialogs"][0]["read_state"]["header_lines"]
+    dialogs = cast(list[dict[str, object]], cast(dict[str, object], result.structured_content)["dialogs"])
+    header_lines = cast(_ReadStateHeader, dialogs[0]["read_state"])["header_lines"]
     assert header_lines[0].startswith("[inbox: 2 unread from peer")
     assert header_lines[1] == "[outbox: all read by peer]"
 
@@ -506,7 +529,8 @@ async def test_unread_tool_no_header_for_non_dm_group() -> None:
     with _patch_daemon("mcp_telegram.tools.unread.daemon_connection", conn):
         result = await get_inbox(GetInbox())
     assert result.content == ()
-    assert result.structured_content["dialogs"][0]["read_state"]["header_lines"] == []
+    dialogs = cast(list[dict[str, object]], cast(dict[str, object], result.structured_content)["dialogs"])
+    assert cast(_ReadStateHeader, dialogs[0]["read_state"])["header_lines"] == []
 
 
 @pytest.mark.asyncio
@@ -525,4 +549,5 @@ async def test_unread_tool_backward_compat_no_read_state() -> None:
     with _patch_daemon("mcp_telegram.tools.unread.daemon_connection", conn):
         result = await get_inbox(GetInbox())
     assert result.content == ()
-    assert result.structured_content["dialogs"][0]["read_state"] is None
+    dialogs = cast(list[dict[str, object]], cast(dict[str, object], result.structured_content)["dialogs"])
+    assert dialogs[0]["read_state"] is None

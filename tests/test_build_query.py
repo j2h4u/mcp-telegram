@@ -9,12 +9,26 @@ and optional filter keys). SQL uses :name placeholders.
 
 from __future__ import annotations
 
-from types import SimpleNamespace
+from dataclasses import dataclass
+from typing import cast
 
-from mcp_telegram.daemon_api import _build_list_messages_query
+from mcp_telegram.daemon_api import _build_list_messages_query, _ListMessagesDbRequest
 
 
-def _build_list_messages_query_req(**overrides: object) -> SimpleNamespace:
+@dataclass(frozen=True, slots=True)
+class _ListMessagesQueryReq:
+    dialog_id: int
+    limit: int
+    self_id: int | None
+    direction: str
+    anchor_msg_id: int | None
+    sender_id: int | None
+    sender_name: str | None
+    topic_id: int | None
+    unread_after_id: int | None
+
+
+def _build_list_messages_query_req(**overrides: object) -> _ListMessagesDbRequest:
     data: dict[str, object] = {
         "dialog_id": 100,
         "limit": 20,
@@ -26,8 +40,21 @@ def _build_list_messages_query_req(**overrides: object) -> SimpleNamespace:
         "topic_id": None,
         "unread_after_id": None,
     }
-    data.update(overrides)
-    return SimpleNamespace(**data)
+    data.update(cast(dict[str, object], overrides))
+    return cast(
+        _ListMessagesDbRequest,
+        _ListMessagesQueryReq(
+            dialog_id=int(cast(int | str, data["dialog_id"])),
+            limit=int(cast(int | str, data["limit"])),
+            self_id=None if data["self_id"] is None else int(cast(int | str, data["self_id"])),
+            direction=str(data["direction"]),
+            anchor_msg_id=None if data["anchor_msg_id"] is None else int(cast(int | str, data["anchor_msg_id"])),
+            sender_id=None if data["sender_id"] is None else int(cast(int | str, data["sender_id"])),
+            sender_name=data["sender_name"] if data["sender_name"] is None else str(data["sender_name"]),
+            topic_id=None if data["topic_id"] is None else int(cast(int | str, data["topic_id"])),
+            unread_after_id=None if data["unread_after_id"] is None else int(cast(int | str, data["unread_after_id"])),
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------

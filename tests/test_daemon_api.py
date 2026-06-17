@@ -10,15 +10,17 @@ import asyncio
 import json
 import sqlite3
 import time
+from collections.abc import Iterator
+from dataclasses import dataclass
 from datetime import UTC
 from types import SimpleNamespace
-from typing import Any, Final, TypedDict, Unpack
+from typing import Final, Protocol, TypedDict, Unpack, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from mcp_telegram.daemon_api import DaemonAPIServer, get_daemon_socket_path
-from mcp_telegram.daemon_message import fetch_reaction_counts, message_to_dict
+from mcp_telegram.daemon_api import DaemonAPIServer, _DaemonClientLike, _ListMessagesDbRequest, get_daemon_socket_path
+from mcp_telegram.daemon_message import _MessageLike, fetch_reaction_counts, message_to_dict
 from mcp_telegram.fts import MESSAGES_FTS_DDL, stem_text
 from mcp_telegram.models import DialogType
 
@@ -32,7 +34,7 @@ def _register_sqlite_connection(conn: sqlite3.Connection) -> sqlite3.Connection:
 
 
 @pytest.fixture(autouse=True)
-def _close_tracked_sqlite_connections() -> None:
+def _close_tracked_sqlite_connections() -> Iterator[None]:
     try:
         yield
     finally:
@@ -147,8 +149,56 @@ class _InsertTelemetryKwargs(TypedDict, total=False):
     error_type: str | None
 
 
-def _build_list_messages_query_req(**overrides: Any) -> SimpleNamespace:
-    data: dict[str, Any] = {
+class _SeedMessageP39Kwargs(TypedDict, total=False):
+    text: str
+    out: int
+    is_service: int
+
+
+class _TestClient(MagicMock):
+    iter_messages: object
+    get_entity: object
+    iter_dialogs: object
+    get_me: object
+    get_input_entity: object
+    get_messages: object
+    send_message: object
+
+
+class _RenderedListMessagesLogRecord(Protocol):
+    dialog_id: int
+    rows: int
+    null_sender_rows: int
+    unresolved_entity_rows: int
+
+
+class _BuildListMessagesQueryReq(TypedDict, total=False):
+    dialog_id: int
+    limit: int
+    self_id: int | None
+    direction: str
+    anchor_msg_id: int | None
+    sender_id: int | None
+    sender_name: str | None
+    topic_id: int | None
+    unread_after_id: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class _ListMessagesQueryReq:
+    dialog_id: int
+    limit: int
+    self_id: int | None
+    direction: str
+    anchor_msg_id: int | None
+    sender_id: int | None
+    sender_name: str | None
+    topic_id: int | None
+    unread_after_id: int | None
+
+
+def _build_list_messages_query_req(**overrides: object) -> _ListMessagesDbRequest:
+    data: dict[str, object] = {
         "dialog_id": 1,
         "limit": 10,
         "self_id": None,
@@ -159,20 +209,75 @@ def _build_list_messages_query_req(**overrides: Any) -> SimpleNamespace:
         "topic_id": None,
         "unread_after_id": None,
     }
-    data.update(overrides)
-    return SimpleNamespace(**data)
+    data.update(cast(dict[str, object], overrides))
+    return cast(
+        _ListMessagesDbRequest,
+        _ListMessagesQueryReq(
+            dialog_id=int(cast(int | str, data["dialog_id"])),
+            limit=int(cast(int | str, data["limit"])),
+            self_id=None if data["self_id"] is None else int(cast(int | str, data["self_id"])),
+            direction=str(data["direction"]),
+            anchor_msg_id=None if data["anchor_msg_id"] is None else int(cast(int | str, data["anchor_msg_id"])),
+            sender_id=None if data["sender_id"] is None else int(cast(int | str, data["sender_id"])),
+            sender_name=None if data["sender_name"] is None else str(data["sender_name"]),
+            topic_id=None if data["topic_id"] is None else int(cast(int | str, data["topic_id"])),
+            unread_after_id=None if data["unread_after_id"] is None else int(cast(int | str, data["unread_after_id"])),
+        ),
+    )
+
+
+def _assert_not_called(mock: object) -> None:
+    cast(MagicMock, mock).assert_not_called()
+
+
+def _assert_called_once(mock: object) -> None:
+    cast(MagicMock, mock).assert_called_once()
+
+
+def _assert_called_once_with(mock: object, *args: object, **kwargs: object) -> None:
+    cast(MagicMock, mock).assert_called_once_with(*args, **kwargs)
+
+
+def _call_args_kwargs(mock: object) -> dict[str, object]:
+    call_args = cast(AsyncMock, mock).call_args
+    assert call_args is not None
+    return cast(dict[str, object], call_args.kwargs)
+
+
+def _call_count(mock: MagicMock | AsyncMock) -> int:
+    return cast(int, mock.call_count)
+
+
+def _response_data(result: dict[str, object]) -> dict[str, object]:
+    return cast(dict[str, object], result["data"])
+
+
+def _response_groups(result: dict[str, object]) -> list[dict[str, object]]:
+    return cast(list[dict[str, object]], _response_data(result)["groups"])
+
+
+def _response_messages(result: dict[str, object]) -> list[dict[str, object]]:
+    return cast(list[dict[str, object]], _response_data(result)["messages"])
+
+
+def _group_messages(group: dict[str, object]) -> list[dict[str, object]]:
+    return cast(list[dict[str, object]], group["messages"])
+
+
+def _activity_data(resp: dict[str, object]) -> dict[str, object]:
+    return cast(dict[str, object], resp["data"])
 
 
 def make_server(
     conn: sqlite3.Connection | None = None,
-    client: Any | None = None,
+    client: object | None = None,
     feedback_conn: sqlite3.Connection | None = None,
 ) -> DaemonAPIServer:
     """Return a DaemonAPIServer wired to in-memory DB and mock client."""
     if conn is None:
         conn = _make_db()
     if client is None:
-        client = MagicMock()
+        client = _TestClient()
     if feedback_conn is None:
         # In-memory feedback.db with the canonical schema applied.
         feedback_conn = _register_sqlite_connection(sqlite3.connect(":memory:"))
@@ -182,7 +287,7 @@ def make_server(
             "message TEXT NOT NULL, severity TEXT, context TEXT, model TEXT, harness TEXT)"
         )
     shutdown_event = asyncio.Event()
-    server = DaemonAPIServer(conn, client, shutdown_event, feedback_conn)
+    server = DaemonAPIServer(conn, cast(_DaemonClientLike, client), shutdown_event, feedback_conn)
     server._ready = True
     return server
 
@@ -558,7 +663,7 @@ async def test_list_messages_from_db() -> None:
     _insert_synced_dialog(conn, 1, status="synced")
     _insert_message(conn, 1, 100, text="Hello from DB")
 
-    client = MagicMock()
+    client = _TestClient()
     client.iter_messages = AsyncMock()
     server = make_server(conn, client)
 
@@ -566,12 +671,12 @@ async def test_list_messages_from_db() -> None:
 
     assert result["ok"] is True, f"Expected ok=True, got {result}"
     assert result["data"]["source"] == "sync_db"
-    messages = result["data"]["messages"]
+    messages = _response_messages(result)
     assert len(messages) == 1
     assert messages[0]["message_id"] == 100
     assert messages[0]["text"] == "Hello from DB"
     # Client must NOT be called for synced dialogs
-    client.iter_messages.assert_not_called()
+    _assert_not_called(client.iter_messages)
 
 
 # ---------------------------------------------------------------------------
@@ -588,23 +693,20 @@ async def test_list_messages_on_demand() -> None:
     # Mock message object
     mock_msg = MagicMock()
     mock_msg.id = 200
-    mock_msg.date = MagicMock()
-    mock_msg.date.timestamp.return_value = 1700000001.0
+    mock_msg.date = SimpleNamespace(timestamp=lambda: 1700000001.0)
     mock_msg.message = "On-demand message"
     mock_msg.sender_id = None
-    sender = MagicMock()
-    sender.first_name = "Bob"
-    mock_msg.sender = sender
+    mock_msg.sender = SimpleNamespace(first_name="Bob")
     mock_msg.media = None
     mock_msg.reply_to = None
     mock_msg.reactions = None
     mock_msg.reply_to_msg_id = None
     mock_msg.forum_topic_id = None
 
-    async def _fake_iter_messages(*args: Any, **kwargs: Any):  # type: ignore[misc]
+    async def _fake_iter_messages(*args: object, **kwargs: object):  # type: ignore[misc]
         yield mock_msg
 
-    client = MagicMock()
+    client = _TestClient()
     client.iter_messages = _fake_iter_messages
     server = make_server(conn, client)
 
@@ -612,7 +714,7 @@ async def test_list_messages_on_demand() -> None:
 
     assert result["ok"] is True, f"Expected ok=True, got {result}"
     assert result["data"]["source"] == "telegram"
-    messages = result["data"]["messages"]
+    messages = _response_messages(result)
     assert len(messages) == 1
     assert messages[0]["message_id"] == 200
 
@@ -631,10 +733,10 @@ async def test_list_messages_name_resolution() -> None:
     entity = MagicMock()
     entity.id = 123
 
-    client = MagicMock()
+    client = _TestClient()
     client.get_entity = AsyncMock(return_value=entity)
 
-    async def _fake_iter(*args: Any, **kwargs: Any):  # type: ignore[misc]
+    async def _fake_iter(*args: object, **kwargs: object):  # type: ignore[misc]
         return
         yield  # make it an async generator
 
@@ -644,7 +746,7 @@ async def test_list_messages_name_resolution() -> None:
     result = await server._list_messages({"dialog": "Alice", "limit": 10})
 
     assert result["ok"] is True, f"Expected ok=True, got {result}"
-    client.get_entity.assert_called_once_with("Alice")
+    cast(AsyncMock, client.get_entity).assert_called_once_with("Alice")
 
 
 # ---------------------------------------------------------------------------
@@ -659,11 +761,11 @@ async def test_list_messages_name_resolution_not_found() -> None:
     # and is always present in production. Step 2.5 queries this table.
     conn = _make_db_with_dialogs()
 
-    client = MagicMock()
+    client = _TestClient()
     client.get_entity = AsyncMock(side_effect=ValueError("Not found"))
 
     # iter_dialogs returns nothing
-    async def _no_dialogs(*args: Any, **kwargs: Any):  # type: ignore[misc]
+    async def _no_dialogs(*args: object, **kwargs: object):  # type: ignore[misc]
         return
         yield
 
@@ -716,7 +818,7 @@ async def test_search_messages_fts() -> None:
     result = await server._search_messages({"dialog_id": 1, "query": "написали", "limit": 10})
 
     assert result["ok"] is True, f"Expected ok=True, got {result}"
-    messages = result["data"]["messages"]
+    messages = _response_messages(result)
     assert len(messages) >= 1, "FTS must find morphological match"
     assert messages[0]["message_id"] == 100
 
@@ -733,7 +835,7 @@ async def test_search_messages_empty_query() -> None:
     result = await server._search_messages({"dialog_id": 1, "query": "", "limit": 10})
 
     assert result["ok"] is True
-    assert result["data"]["messages"] == []
+    assert _response_messages(result) == []
     assert result["data"]["total"] == 0
 
 
@@ -749,14 +851,14 @@ async def test_search_messages_name_resolution() -> None:
 
     entity = MagicMock()
     entity.id = 123
-    client = MagicMock()
+    client = _TestClient()
     client.get_entity = AsyncMock(return_value=entity)
     server = make_server(conn, client)
 
     result = await server._search_messages({"dialog": "Alice", "query": "hello"})
 
     assert result["ok"] is True
-    client.get_entity.assert_called_once_with("Alice")
+    cast(AsyncMock, client.get_entity).assert_called_once_with("Alice")
 
 
 # ---------------------------------------------------------------------------
@@ -787,7 +889,7 @@ async def test_search_messages_global_searches_all_dialogs() -> None:
     result = await server._search_messages({"query": "написали", "limit": 10})
 
     assert result["ok"] is True
-    messages = result["data"]["messages"]
+    messages = _response_messages(result)
     assert len(messages) == 2
     dialog_ids = {m["dialog_id"] for m in messages}
     assert dialog_ids == {1, 2}
@@ -813,7 +915,7 @@ async def test_search_messages_global_dialog_name_fallback() -> None:
     result = await server._search_messages({"query": "тест", "limit": 10})
 
     assert result["ok"] is True
-    messages = result["data"]["messages"]
+    messages = _response_messages(result)
     assert len(messages) == 1
     assert messages[0]["dialog_name"] == "99"
     assert messages[0]["dialog_id"] == 99
@@ -852,8 +954,7 @@ async def test_search_messages_global_navigation_token_uses_dialog_id_zero() -> 
 def test_classify_dialog_type_forum() -> None:
     from telethon.tl.types import Channel  # type: ignore[import-untyped]
 
-    entity = MagicMock()
-    entity.__class__ = Channel
+    entity = Channel.__new__(Channel)
     entity.megagroup = True
     entity.forum = True
     entity.broadcast = False
@@ -863,8 +964,7 @@ def test_classify_dialog_type_forum() -> None:
 def test_classify_dialog_type_group() -> None:
     from telethon.tl.types import Channel  # type: ignore[import-untyped]
 
-    entity = MagicMock()
-    entity.__class__ = Channel
+    entity = Channel.__new__(Channel)
     entity.megagroup = True
     entity.forum = False
     entity.broadcast = False
@@ -875,8 +975,7 @@ def test_classify_dialog_type_group() -> None:
 def test_classify_dialog_type_channel_broadcast() -> None:
     from telethon.tl.types import Channel  # type: ignore[import-untyped]
 
-    entity = MagicMock()
-    entity.__class__ = Channel
+    entity = Channel.__new__(Channel)
     entity.broadcast = True
     entity.megagroup = False
     entity.forum = False
@@ -900,8 +999,7 @@ def test_classify_dialog_type_user() -> None:
 def test_classify_dialog_type_chat() -> None:
     from telethon.tl.types import Chat  # type: ignore[import-untyped]
 
-    entity = MagicMock()
-    entity.__class__ = Chat
+    entity = Chat.__new__(Chat)
     # legacy basic group (Chat) → GROUP under the canonical vocabulary
     assert DialogType.from_entity(entity) == DialogType.GROUP
 
@@ -924,7 +1022,7 @@ async def test_list_dialogs_sync_status_via_sql() -> None:
     _insert_synced_dialog(conn, 1, status="synced")
     # dialog_id=2 not in synced_dialogs — should default to "not_synced"
 
-    client = MagicMock()
+    client = _TestClient()
     client.iter_dialogs = MagicMock(side_effect=AssertionError("SQL path must not call iter_dialogs"))
     server = make_server(conn, client)
 
@@ -937,7 +1035,7 @@ async def test_list_dialogs_sync_status_via_sql() -> None:
     by_id = {d["id"]: d for d in dialogs}
     assert by_id[1]["sync_status"] == "synced"
     assert by_id[2]["sync_status"] == "not_synced"
-    client.iter_dialogs.assert_not_called()
+    cast(MagicMock, client.iter_dialogs).assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -948,7 +1046,7 @@ async def test_list_dialogs_filter_substring_latinized_sql() -> None:
     _seed_dialog_row(conn, 2, name="Random Chat", type_="Chat")
     _seed_dialog_row(conn, 3, name="Golang Дайджест", type_="Chat")
 
-    client = MagicMock()
+    client = _TestClient()
     client.iter_dialogs = MagicMock(side_effect=AssertionError("SQL path must not call iter_dialogs"))
     server = make_server(conn, client)
 
@@ -956,7 +1054,7 @@ async def test_list_dialogs_filter_substring_latinized_sql() -> None:
     names = {d["name"] for d in out["data"]["dialogs"]}
     assert "KS x Женские сезоны" in names
     assert "Random Chat" not in names
-    client.iter_dialogs.assert_not_called()
+    cast(MagicMock, client.iter_dialogs).assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -966,14 +1064,14 @@ async def test_list_dialogs_filter_acronym_sql() -> None:
     _seed_dialog_row(conn, 1, name="KS x Женские Сезоны", type_="Chat")
     _seed_dialog_row(conn, 2, name="Random Channel", type_="Channel")
 
-    client = MagicMock()
+    client = _TestClient()
     client.iter_dialogs = MagicMock(side_effect=AssertionError("SQL path must not call iter_dialogs"))
     server = make_server(conn, client)
 
     out = await server._list_dialogs({"filter": "ЖС"})
     names = {d["name"] for d in out["data"]["dialogs"]}
     assert names == {"KS x Женские Сезоны"}
-    client.iter_dialogs.assert_not_called()
+    cast(MagicMock, client.iter_dialogs).assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -983,14 +1081,14 @@ async def test_list_dialogs_filter_empty_and_none_are_noop_sql() -> None:
     _seed_dialog_row(conn, 1, name="Alpha", type_="Chat")
     _seed_dialog_row(conn, 2, name="Beta", type_="Chat")
 
-    client = MagicMock()
+    client = _TestClient()
     client.iter_dialogs = MagicMock(side_effect=AssertionError("SQL path must not call iter_dialogs"))
 
     for req in ({}, {"filter": None}, {"filter": "   "}):
         server = make_server(conn, client)
-        out = await server._list_dialogs(req)
+        out = await server._list_dialogs(cast(dict[str, object], req))
         assert len(out["data"]["dialogs"]) == 2, req
-    client.iter_dialogs.assert_not_called()
+    cast(MagicMock, client.iter_dialogs).assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -1005,14 +1103,14 @@ async def test_list_dialogs_sql_only_no_iter_dialogs() -> None:
     _seed_dialog_row(conn, 1, name="User Chat", type_="User")
     _seed_dialog_row(conn, 2, name="My Channel", type_="Channel")
 
-    client = MagicMock()
+    client = _TestClient()
     client.iter_dialogs = MagicMock(side_effect=AssertionError("SQL path must not call iter_dialogs"))
     server = make_server(conn, client)
 
     result = await server._list_dialogs({})
     assert result["ok"] is True
     assert len(result["data"]["dialogs"]) == 2
-    client.iter_dialogs.assert_not_called()
+    cast(MagicMock, client.iter_dialogs).assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1023,7 +1121,7 @@ async def test_list_dialogs_filter_substring_sql_pushdown() -> None:
     _seed_dialog_row(conn, 2, name="Random Chat", type_="Chat")
     _seed_dialog_row(conn, 3, name="Golang Дайджест", type_="Chat")
 
-    client = MagicMock()
+    client = _TestClient()
     client.iter_dialogs = MagicMock(side_effect=AssertionError("SQL path must not call iter_dialogs"))
     server = make_server(conn, client)
 
@@ -1031,7 +1129,7 @@ async def test_list_dialogs_filter_substring_sql_pushdown() -> None:
     assert out["ok"] is True
     names = {d["name"] for d in out["data"]["dialogs"]}
     assert names == {"KS x Женские сезоны"}
-    client.iter_dialogs.assert_not_called()
+    cast(MagicMock, client.iter_dialogs).assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1041,7 +1139,7 @@ async def test_list_dialogs_filter_cyrillic_acronym_on_full_set() -> None:
     _seed_dialog_row(conn, 1, name="KS x Женские Сезоны", type_="Chat")
     _seed_dialog_row(conn, 2, name="Random Channel", type_="Channel")
 
-    client = MagicMock()
+    client = _TestClient()
     client.iter_dialogs = MagicMock(side_effect=AssertionError("SQL path must not call iter_dialogs"))
     server = make_server(conn, client)
 
@@ -1049,7 +1147,7 @@ async def test_list_dialogs_filter_cyrillic_acronym_on_full_set() -> None:
     assert out["ok"] is True
     names = {d["name"] for d in out["data"]["dialogs"]}
     assert names == {"KS x Женские Сезоны"}
-    client.iter_dialogs.assert_not_called()
+    cast(MagicMock, client.iter_dialogs).assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1059,7 +1157,7 @@ async def test_list_dialogs_filter_ascii_acronym_falls_back_when_like_empty() ->
     _seed_dialog_row(conn, 1, name="Kitchen Journal", type_="Chat")
     _seed_dialog_row(conn, 2, name="Random Channel", type_="Channel")
 
-    client = MagicMock()
+    client = _TestClient()
     client.iter_dialogs = MagicMock(side_effect=AssertionError("SQL path must not call iter_dialogs"))
     server = make_server(conn, client)
 
@@ -1069,7 +1167,7 @@ async def test_list_dialogs_filter_ascii_acronym_falls_back_when_like_empty() ->
     assert out["ok"] is True
     names = {d["name"] for d in out["data"]["dialogs"]}
     assert names == {"Kitchen Journal"}
-    client.iter_dialogs.assert_not_called()
+    cast(MagicMock, client.iter_dialogs).assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1079,14 +1177,14 @@ async def test_list_dialogs_snapshot_age_annotation_when_stale() -> None:
     stale_at = int(time.time()) - 13 * 3600
     _seed_dialog_row(conn, 1, name="Old Chat", type_="Chat", snapshot_at=stale_at)
 
-    client = MagicMock()
+    client = _TestClient()
     client.iter_dialogs = MagicMock(side_effect=AssertionError("SQL path must not call iter_dialogs"))
     server = make_server(conn, client)
 
     result = await server._list_dialogs({})
     assert result["ok"] is True
     assert result["data"]["snapshot_age_h"] == 13
-    client.iter_dialogs.assert_not_called()
+    cast(MagicMock, client.iter_dialogs).assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1096,14 +1194,14 @@ async def test_list_dialogs_snapshot_age_annotation_when_fresh() -> None:
     fresh_at = int(time.time())
     _seed_dialog_row(conn, 1, name="Fresh Chat", type_="Chat", snapshot_at=fresh_at)
 
-    client = MagicMock()
+    client = _TestClient()
     client.iter_dialogs = MagicMock(side_effect=AssertionError("SQL path must not call iter_dialogs"))
     server = make_server(conn, client)
 
     result = await server._list_dialogs({})
     assert result["ok"] is True
     assert result["data"]["snapshot_age_h"] is None
-    client.iter_dialogs.assert_not_called()
+    cast(MagicMock, client.iter_dialogs).assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1112,7 +1210,7 @@ async def test_list_dialogs_bootstrap_pending_when_table_truly_empty() -> None:
     conn = _make_db_with_dialogs()
     # No rows inserted at all.
 
-    client = MagicMock()
+    client = _TestClient()
     client.iter_dialogs = MagicMock(side_effect=AssertionError("SQL path must not call iter_dialogs"))
     server = make_server(conn, client)
 
@@ -1121,7 +1219,7 @@ async def test_list_dialogs_bootstrap_pending_when_table_truly_empty() -> None:
     assert result["data"]["dialogs"] == []
     assert result["data"]["bootstrap_pending"] is True
     assert result["data"]["snapshot_age_h"] is None
-    client.iter_dialogs.assert_not_called()
+    cast(MagicMock, client.iter_dialogs).assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1131,7 +1229,7 @@ async def test_list_dialogs_bootstrap_false_when_only_hidden_rows() -> None:
     # One hidden row — table is NOT empty, sync has run, rows are just hidden.
     _seed_dialog_row(conn, 1, name="Hidden Chat", type_="Chat", hidden=1)
 
-    client = MagicMock()
+    client = _TestClient()
     client.iter_dialogs = MagicMock(side_effect=AssertionError("SQL path must not call iter_dialogs"))
     server = make_server(conn, client)
 
@@ -1140,7 +1238,7 @@ async def test_list_dialogs_bootstrap_false_when_only_hidden_rows() -> None:
     assert result["data"]["dialogs"] == []
     assert result["data"]["bootstrap_pending"] is False
     assert result["data"]["snapshot_age_h"] is None
-    client.iter_dialogs.assert_not_called()
+    cast(MagicMock, client.iter_dialogs).assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1166,7 +1264,7 @@ async def test_list_dialogs_diff04_fields_present_in_data() -> None:
         draft_text=None,
     )
 
-    client = MagicMock()
+    client = _TestClient()
     client.iter_dialogs = MagicMock(side_effect=AssertionError("SQL path must not call iter_dialogs"))
     server = make_server(conn, client)
 
@@ -1179,7 +1277,7 @@ async def test_list_dialogs_diff04_fields_present_in_data() -> None:
     assert by_id[2]["unread_mentions_count"] == 0
     assert by_id[2]["unread_reactions_count"] == 0
     assert by_id[2]["draft_text"] is None
-    client.iter_dialogs.assert_not_called()
+    cast(MagicMock, client.iter_dialogs).assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1205,7 +1303,7 @@ async def test_list_dialogs_dm_unread_in_out_preserved() -> None:
     # Channel row — no synced_dialogs entry
     _seed_dialog_row(conn, 20, name="News Channel", type_="Channel")
 
-    client = MagicMock()
+    client = _TestClient()
     client.iter_dialogs = MagicMock(side_effect=AssertionError("SQL path must not call iter_dialogs"))
     server = make_server(conn, client)
 
@@ -1222,7 +1320,7 @@ async def test_list_dialogs_dm_unread_in_out_preserved() -> None:
     # Channel row omits both
     assert "unread_in" not in by_id[20]
     assert "unread_out" not in by_id[20]
-    client.iter_dialogs.assert_not_called()
+    cast(MagicMock, client.iter_dialogs).assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1233,7 +1331,7 @@ async def test_list_dialogs_exclude_archived_filters_via_sql() -> None:
     _seed_dialog_row(conn, 2, name="Archived Chat", type_="Chat", archived=1)
     _seed_dialog_row(conn, 3, name="Another Active", type_="Chat", archived=0)
 
-    client = MagicMock()
+    client = _TestClient()
     client.iter_dialogs = MagicMock(side_effect=AssertionError("SQL path must not call iter_dialogs"))
     server = make_server(conn, client)
 
@@ -1247,7 +1345,7 @@ async def test_list_dialogs_exclude_archived_filters_via_sql() -> None:
     # Default (exclude_archived=False) returns all three
     out_all = await server._list_dialogs({})
     assert len(out_all["data"]["dialogs"]) == 3
-    client.iter_dialogs.assert_not_called()
+    cast(MagicMock, client.iter_dialogs).assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1258,7 +1356,7 @@ async def test_list_dialogs_ignore_pinned_filters_via_sql() -> None:
     _seed_dialog_row(conn, 2, name="Unpinned B", type_="Chat", pinned=0, last_message_at=1700000020)
     _seed_dialog_row(conn, 3, name="Pinned C", type_="Chat", pinned=1, last_message_at=1700000005)
 
-    client = MagicMock()
+    client = _TestClient()
     client.iter_dialogs = MagicMock(side_effect=AssertionError("SQL path must not call iter_dialogs"))
     server = make_server(conn, client)
 
@@ -1276,7 +1374,7 @@ async def test_list_dialogs_ignore_pinned_filters_via_sql() -> None:
     pinned_positions = [i for i, d in enumerate(out_all["data"]["dialogs"]) if d["id"] in {1, 3}]
     unpinned_positions = [i for i, d in enumerate(out_all["data"]["dialogs"]) if d["id"] == 2]
     assert max(pinned_positions) < min(unpinned_positions)
-    client.iter_dialogs.assert_not_called()
+    cast(MagicMock, client.iter_dialogs).assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -1291,7 +1389,7 @@ async def test_list_topics_through_daemon() -> None:
     conn.execute("INSERT INTO topic_metadata (dialog_id, topic_id, title, updated_at) VALUES (123, 1, 'General', 0)")
     conn.commit()
 
-    client = MagicMock()
+    client = _TestClient()
     server = make_server(conn, client)
 
     result = await server._list_topics({"dialog_id": 123})
@@ -1301,14 +1399,14 @@ async def test_list_topics_through_daemon() -> None:
     assert len(result["data"]["topics"]) == 1
     assert result["data"]["topics"][0]["id"] == 1
     assert result["data"]["topics"][0]["title"] == "General"
-    client.get_entity.assert_not_called()
+    cast(AsyncMock, client.get_entity).assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_list_topics_empty_snapshot() -> None:
     """_list_topics returns empty list when no topic_metadata rows exist."""
     conn = _make_db_with_topics()
-    client = MagicMock()
+    client = _TestClient()
     server = make_server(conn, client)
 
     result = await server._list_topics({"dialog_id": 456})
@@ -1316,7 +1414,7 @@ async def test_list_topics_empty_snapshot() -> None:
     assert result["ok"] is True
     assert result["data"]["topics"] == []
     assert result["data"]["dialog_id"] == 456
-    client.get_entity.assert_not_called()
+    cast(AsyncMock, client.get_entity).assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1331,7 +1429,7 @@ async def test_list_topics_hidden_excluded() -> None:
         "VALUES (789, 2, 'HiddenTopic', 0, 1)"
     )
     conn.commit()
-    client = MagicMock()
+    client = _TestClient()
     server = make_server(conn, client)
 
     result = await server._list_topics({"dialog_id": 789})
@@ -1355,7 +1453,7 @@ async def test_list_topics_deleted_excluded() -> None:
         "VALUES (101, 2, 'Deleted', 0, 1)"
     )
     conn.commit()
-    client = MagicMock()
+    client = _TestClient()
     server = make_server(conn, client)
 
     result = await server._list_topics({"dialog_id": 101})
@@ -1381,7 +1479,7 @@ async def test_get_me_through_daemon() -> None:
     me.username = "testuser"
     me.phone = "+1234567890"
 
-    client = MagicMock()
+    client = _TestClient()
     client.get_me = AsyncMock(return_value=me)
     server = make_server(client=client)
 
@@ -1391,7 +1489,7 @@ async def test_get_me_through_daemon() -> None:
     assert result["data"]["id"] == 12345
     assert result["data"]["first_name"] == "Test"
     assert result["data"]["username"] == "testuser"
-    client.get_me.assert_called_once()
+    cast(AsyncMock, client.get_me).assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -1444,7 +1542,7 @@ async def test_handle_client_exception() -> None:
     # Verify error response was written
     assert len(written) > 0
     response_data = b"".join(written)
-    parsed = json.loads(response_data.decode().strip())
+    parsed = cast(dict[str, object], json.loads(response_data.decode().strip()))
     assert parsed["ok"] is False
 
 
@@ -1483,9 +1581,10 @@ async def test_handle_client_round_trip() -> None:
     await server.handle_client(reader, writer)
 
     response_data = b"".join(written)
-    parsed = json.loads(response_data.decode().strip())
+    parsed = cast(dict[str, object], json.loads(response_data.decode().strip()))
     assert parsed["ok"] is True
-    assert parsed["data"]["id"] == 42
+    data = cast(dict[str, object], parsed["data"])
+    assert data["id"] == 42
 
 
 # ---------------------------------------------------------------------------
@@ -1500,7 +1599,9 @@ async def test_mark_dialog_for_sync_enable() -> None:
     server = make_server(conn)
     result = await server._dispatch({"method": "mark_dialog_for_sync", "dialog_id": 42, "enable": True})
     assert result["ok"] is True
-    row = conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id = 42").fetchone()
+    row = cast(
+        tuple[object, ...] | None, conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id = 42").fetchone()
+    )
     assert row is not None
     assert row[0] == "not_synced"
 
@@ -1513,7 +1614,10 @@ async def test_mark_dialog_for_sync_ignores_existing() -> None:
     server = make_server(conn)
     result = await server._dispatch({"method": "mark_dialog_for_sync", "dialog_id": 42, "enable": True})
     assert result["ok"] is True
-    row = conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id = 42").fetchone()
+    row = cast(
+        tuple[object, ...] | None, conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id = 42").fetchone()
+    )
+    assert row is not None
     assert row[0] == "synced"  # NOT overwritten
 
 
@@ -1525,7 +1629,10 @@ async def test_mark_dialog_for_sync_disable() -> None:
     server = make_server(conn)
     result = await server._dispatch({"method": "mark_dialog_for_sync", "dialog_id": 42, "enable": False})
     assert result["ok"] is True
-    row = conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id = 42").fetchone()
+    row = cast(
+        tuple[object, ...] | None, conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id = 42").fetchone()
+    )
+    assert row is not None
     assert row[0] == "not_synced"
 
 
@@ -1552,7 +1659,7 @@ async def test_get_sync_status_synced_dialog() -> None:
     server = make_server(conn)
     result = await server._dispatch({"method": "get_sync_status", "dialog_id": -1001234567890})
     assert result["ok"] is True
-    data = result["data"]
+    data = cast(dict[str, object], result["data"])
     assert data["status"] == "synced"
     assert data["message_count"] == 2
     assert data["last_synced_at"] == 1700000000
@@ -1568,7 +1675,8 @@ async def test_get_sync_status_dm_delete_detection() -> None:
     server = make_server(conn)
     result = await server._dispatch({"method": "get_sync_status", "dialog_id": 12345})
     assert result["ok"] is True
-    assert result["data"]["delete_detection"] == "best-effort weekly (DM)"
+    data = cast(dict[str, object], result["data"])
+    assert data["delete_detection"] == "best-effort weekly (DM)"
 
 
 @pytest.mark.asyncio
@@ -1578,7 +1686,7 @@ async def test_get_sync_status_non_synced() -> None:
     server = make_server(conn)
     result = await server._dispatch({"method": "get_sync_status", "dialog_id": 99999})
     assert result["ok"] is True
-    data = result["data"]
+    data = cast(dict[str, object], result["data"])
     assert data["status"] == "not_synced"
     assert data["message_count"] == 0
 
@@ -1599,7 +1707,7 @@ async def test_get_sync_alerts_deleted_messages() -> None:
     server = make_server(conn)
     result = await server._dispatch({"method": "get_sync_alerts", "since": 0, "limit": 50})
     assert result["ok"] is True
-    deleted = result["data"]["deleted_messages"]
+    deleted = cast(list[dict[str, object]], cast(dict[str, object], result["data"])["deleted_messages"])
     assert len(deleted) == 1
     assert deleted[0]["text"] == "deleted msg"
     assert deleted[0]["deleted_at"] == 1700000500
@@ -1613,7 +1721,7 @@ async def test_get_sync_alerts_edits() -> None:
     server = make_server(conn)
     result = await server._dispatch({"method": "get_sync_alerts", "since": 0, "limit": 50})
     assert result["ok"] is True
-    edits = result["data"]["edits"]
+    edits = cast(list[dict[str, object]], cast(dict[str, object], result["data"])["edits"])
     assert len(edits) == 1
     assert edits[0]["old_text"] == "before edit"
 
@@ -1626,7 +1734,7 @@ async def test_get_sync_alerts_access_lost() -> None:
     server = make_server(conn)
     result = await server._dispatch({"method": "get_sync_alerts", "since": 0, "limit": 50})
     assert result["ok"] is True
-    lost = result["data"]["access_lost"]
+    lost = cast(list[dict[str, object]], cast(dict[str, object], result["data"])["access_lost"])
     assert len(lost) == 1
     assert lost[0]["dialog_id"] == 1
 
@@ -1643,7 +1751,7 @@ async def test_get_sync_alerts_since_filters() -> None:
     conn.commit()
     server = make_server(conn)
     result = await server._dispatch({"method": "get_sync_alerts", "since": 1700000500, "limit": 50})
-    deleted = result["data"]["deleted_messages"]
+    deleted = cast(list[dict[str, object]], cast(dict[str, object], result["data"])["deleted_messages"])
     assert len(deleted) == 1
     assert deleted[0]["message_id"] == 200
 
@@ -1659,7 +1767,7 @@ async def test_get_sync_alerts_respects_limit() -> None:
     conn.commit()
     server = make_server(conn)
     result = await server._dispatch({"method": "get_sync_alerts", "since": 0, "limit": 3})
-    assert len(result["data"]["deleted_messages"]) == 3
+    assert len(cast(list[dict[str, object]], cast(dict[str, object], result["data"])["deleted_messages"])) == 3
 
 
 # ---------------------------------------------------------------------------
@@ -1707,9 +1815,7 @@ def _make_dialog_mock(
     raw_dialog.read_inbox_max_id = read_inbox_max_id
     dialog.dialog = raw_dialog
 
-    date_mock = MagicMock()
-    date_mock.timestamp.return_value = timestamp
-    dialog.date = date_mock
+    dialog.date = SimpleNamespace(timestamp=lambda: timestamp)
 
     return dialog
 
@@ -1726,13 +1832,8 @@ def _make_msg_mock(
     msg.message = text
     msg.sender_id = sender_id
 
-    date_mock = MagicMock()
-    date_mock.timestamp.return_value = timestamp
-    msg.date = date_mock
-
-    sender = MagicMock()
-    sender.first_name = sender_first_name
-    msg.sender = sender
+    msg.date = SimpleNamespace(timestamp=lambda: timestamp)
+    msg.sender = SimpleNamespace(first_name=sender_first_name)
 
     return msg
 
@@ -1820,7 +1921,7 @@ async def test_list_unread_messages_basic() -> None:
     _seed_message(conn, 1001, message_id=12, text="Hey", sender_first_name="Alice")
     _seed_message(conn, 1001, message_id=13, text="Bye", sender_first_name="Alice")
 
-    client = MagicMock()
+    client = _TestClient()
     server = make_server(conn, client)
 
     result = await server._dispatch(
@@ -1833,25 +1934,25 @@ async def test_list_unread_messages_basic() -> None:
     )
 
     assert result["ok"] is True, f"Expected ok=True, got {result}"
-    groups = result["data"]["groups"]
+    groups = _response_groups(result)
     assert len(groups) == 1
     group = groups[0]
     assert group["dialog_id"] == 1001
     assert group["display_name"] == "Alice"
     assert group["category"] == "user"
     assert group["unread_count"] == 3
-    msgs = group["messages"]
+    msgs = _group_messages(group)
     assert [m["message_id"] for m in msgs] == [11, 12, 13]
 
-    client.get_input_entity.assert_not_called()
-    client.assert_not_called()
+    cast(AsyncMock, client.get_input_entity).assert_not_called()
+    cast(MagicMock, client).assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_list_unread_messages_empty() -> None:
     """list_unread_messages returns empty groups when synced_dialogs is empty."""
     conn = _make_db()
-    client = MagicMock()
+    client = _TestClient()
     server = make_server(conn, client)
 
     result = await server._dispatch(
@@ -1864,9 +1965,9 @@ async def test_list_unread_messages_empty() -> None:
     )
 
     assert result["ok"] is True
-    assert result["data"]["groups"] == []
-    client.get_input_entity.assert_not_called()
-    client.assert_not_called()
+    assert _response_groups(result) == []
+    cast(AsyncMock, client.get_input_entity).assert_not_called()
+    cast(MagicMock, client).assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1878,7 +1979,7 @@ async def test_list_unread_messages_filters_channels_in_personal_scope() -> None
     _seed_unread_state(conn, 201, read_inbox_max_id=0, entity_type="User", entity_name="Bob")
     _seed_message(conn, 201, message_id=1)
 
-    client = MagicMock()
+    client = _TestClient()
     server = make_server(conn, client)
 
     result = await server._dispatch(
@@ -1891,10 +1992,10 @@ async def test_list_unread_messages_filters_channels_in_personal_scope() -> None
     )
 
     assert result["ok"] is True
-    ids = [g["dialog_id"] for g in result["data"]["groups"]]
+    ids = [g["dialog_id"] for g in _response_groups(result)]
     assert 200 not in ids, "Channel should be filtered in personal scope"
     assert 201 in ids
-    client.assert_not_called()
+    cast(MagicMock, client).assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1908,7 +2009,7 @@ async def test_list_unread_messages_includes_groups_in_personal_scope() -> None:
     _seed_unread_state(conn, 1001, read_inbox_max_id=10, entity_type="Group", entity_name="BigGroup")
     _seed_message(conn, 1001, message_id=11)
 
-    client = MagicMock()
+    client = _TestClient()
     server = make_server(conn, client)
 
     result = await server._dispatch(
@@ -1921,13 +2022,13 @@ async def test_list_unread_messages_includes_groups_in_personal_scope() -> None:
     )
 
     assert result["ok"] is True
-    groups = result["data"]["groups"]
+    groups = _response_groups(result)
     assert len(groups) == 1
     # Seeded entity_type "Group" (capitalized) is the legacy megagroup marker, which
     # parses to the canonical SUPERGROUP. Still group-tier, still included in personal
     # scope — only the category label sharpened from the old flat "group".
     assert groups[0]["category"] == "supergroup"
-    client.assert_not_called()
+    cast(MagicMock, client).assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1940,7 +2041,7 @@ async def test_list_unread_messages_budget_limits_messages() -> None:
         for msg_id in range(1, 51):
             _seed_message(conn, dialog_id, message_id=msg_id)
 
-    client = MagicMock()
+    client = _TestClient()
     server = make_server(conn, client)
 
     result = await server._dispatch(
@@ -1953,22 +2054,22 @@ async def test_list_unread_messages_budget_limits_messages() -> None:
     )
 
     assert result["ok"] is True
-    total_messages = sum(len(g["messages"]) for g in result["data"]["groups"])
+    total_messages = sum(len(_group_messages(g)) for g in _response_groups(result))
     assert total_messages <= 10, f"Budget exceeded: {total_messages} messages returned"
-    client.assert_not_called()
+    cast(MagicMock, client).assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_list_unread_messages_dispatch_routing() -> None:
     """_dispatch routes 'list_unread_messages' to _list_unread_messages; empty DB → ok=True."""
     conn = _make_db()
-    client = MagicMock()
+    client = _TestClient()
     server = make_server(conn, client)
 
     result = await server._dispatch({"method": "get_inbox"})
 
     assert result["ok"] is True, f"list_unread_messages dispatch failed: {result}"
-    client.assert_not_called()
+    cast(MagicMock, client).assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1982,7 +2083,7 @@ async def test_list_unread_messages_skips_non_synced_or_null() -> None:
     _seed_unread_state(conn, 1003, read_inbox_max_id=None, status="synced")
     _seed_message(conn, 1003, message_id=11)
 
-    client = MagicMock()
+    client = _TestClient()
     server = make_server(conn, client)
 
     result = await server._dispatch(
@@ -1994,10 +2095,10 @@ async def test_list_unread_messages_skips_non_synced_or_null() -> None:
         }
     )
 
-    groups = result["data"]["groups"]
+    groups = _response_groups(result)
     assert len(groups) == 1
     assert groups[0]["dialog_id"] == 1001
-    client.assert_not_called()
+    cast(MagicMock, client).assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -2011,7 +2112,7 @@ async def test_list_unread_messages_read_inbox_max_id_zero_returns_all() -> None
     _seed_message(conn, 1001, message_id=2)
     _seed_message(conn, 1001, message_id=3)
 
-    client = MagicMock()
+    client = _TestClient()
     server = make_server(conn, client)
 
     result = await server._dispatch(
@@ -2023,11 +2124,11 @@ async def test_list_unread_messages_read_inbox_max_id_zero_returns_all() -> None
         }
     )
 
-    groups = result["data"]["groups"]
+    groups = _response_groups(result)
     assert len(groups) == 1
     assert groups[0]["unread_count"] == 3
-    assert [m["message_id"] for m in groups[0]["messages"]] == [1, 2, 3]
-    client.assert_not_called()
+    assert [m["message_id"] for m in _group_messages(groups[0])] == [1, 2, 3]
+    cast(MagicMock, client).assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -2041,7 +2142,7 @@ async def test_list_unread_messages_excludes_deleted_messages() -> None:
     _seed_message(conn, 1001, message_id=12, is_deleted=1)
     _seed_message(conn, 1001, message_id=13, is_deleted=0)
 
-    client = MagicMock()
+    client = _TestClient()
     server = make_server(conn, client)
 
     result = await server._dispatch(
@@ -2053,13 +2154,13 @@ async def test_list_unread_messages_excludes_deleted_messages() -> None:
         }
     )
 
-    groups = result["data"]["groups"]
+    groups = _response_groups(result)
     assert len(groups) == 1
     assert groups[0]["unread_count"] == 2
-    returned_ids = [m["message_id"] for m in groups[0]["messages"]]
+    returned_ids = [m["message_id"] for m in _group_messages(groups[0])]
     assert 12 not in returned_ids
-    assert sorted(returned_ids) == [11, 13]
-    client.assert_not_called()
+    assert sorted(cast(list[int], returned_ids)) == [11, 13]
+    cast(MagicMock, client).assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -2072,7 +2173,7 @@ async def test_list_unread_messages_filter_excludes_ids_below_read_position() ->
     _seed_message(conn, 1001, message_id=11)  # above — included
     _seed_message(conn, 1001, message_id=12)  # above — included
 
-    client = MagicMock()
+    client = _TestClient()
     server = make_server(conn, client)
 
     result = await server._dispatch(
@@ -2084,11 +2185,11 @@ async def test_list_unread_messages_filter_excludes_ids_below_read_position() ->
         }
     )
 
-    groups = result["data"]["groups"]
+    groups = _response_groups(result)
     assert len(groups) == 1
     assert groups[0]["unread_count"] == 2
-    assert [m["message_id"] for m in groups[0]["messages"]] == [11, 12]
-    client.assert_not_called()
+    assert [m["message_id"] for m in _group_messages(groups[0])] == [11, 12]
+    cast(MagicMock, client).assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -2102,7 +2203,7 @@ async def test_list_unread_messages_response_reports_bootstrap_pending() -> None
     _seed_unread_state(conn, 1002, read_inbox_max_id=None)
     _seed_unread_state(conn, 1003, read_inbox_max_id=None)
 
-    client = MagicMock()
+    client = _TestClient()
     server = make_server(conn, client)
 
     result = await server._dispatch(
@@ -2115,11 +2216,10 @@ async def test_list_unread_messages_response_reports_bootstrap_pending() -> None
     )
 
     assert result["ok"] is True
-    assert len(result["data"]["groups"]) == 1
-    assert result["data"]["bootstrap_pending"] == 2, (
-        f"Expected bootstrap_pending=2, got {result['data'].get('bootstrap_pending')}"
-    )
-    client.assert_not_called()
+    data = _response_data(result)
+    assert len(cast(list[dict[str, object]], data["groups"])) == 1
+    assert data["bootstrap_pending"] == 2, f"Expected bootstrap_pending=2, got {data.get('bootstrap_pending')}"
+    cast(MagicMock, client).assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -2156,7 +2256,7 @@ async def test_list_unread_messages_excludes_outgoing_and_service_messages() -> 
     )
     conn.commit()
 
-    client = MagicMock()
+    client = _TestClient()
     server = make_server(conn, client)
 
     result = await server._dispatch(
@@ -2169,15 +2269,15 @@ async def test_list_unread_messages_excludes_outgoing_and_service_messages() -> 
     )
 
     assert result["ok"] is True, f"Expected ok=True, got {result}"
-    groups = result["data"]["groups"]
+    groups = _response_groups(result)
     assert len(groups) == 1, f"Expected 1 dialog group, got {len(groups)}"
     group = groups[0]
     assert group["unread_count"] == 1, f"Expected unread_count=1 (only incoming), got {group['unread_count']}"
-    returned_ids = [m["message_id"] for m in group["messages"]]
+    returned_ids = [m["message_id"] for m in _group_messages(group)]
     assert 11 in returned_ids, "Incoming message (id=11) must appear in results"
     assert 12 not in returned_ids, "Outgoing message (id=12) must NOT appear in inbox"
     assert 13 not in returned_ids, "Service message (id=13) must NOT appear in inbox"
-    client.assert_not_called()
+    cast(MagicMock, client).assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -2285,7 +2385,10 @@ async def test_record_telemetry_inserts_row() -> None:
         }
     )
     assert result["ok"] is True
-    row = conn.execute("SELECT tool_name, duration_ms, has_filter FROM telemetry_events").fetchone()
+    row = cast(
+        tuple[object, ...] | None,
+        conn.execute("SELECT tool_name, duration_ms, has_filter FROM telemetry_events").fetchone(),
+    )
     assert row is not None
     assert row[0] == "ListDialogs"
     assert row[1] == 123.4
@@ -2357,10 +2460,11 @@ async def test_get_usage_stats_returns_stats() -> None:
     server = make_server(conn)
     result = await server._dispatch({"method": "get_usage_stats"})
     assert result["ok"] is True
-    data = result["data"]
+    data = cast(dict[str, object], result["data"])
+    tool_distribution = cast(dict[str, int], data["tool_distribution"])
     assert data["total_calls"] == 3
-    assert data["tool_distribution"]["ListDialogs"] == 2
-    assert data["tool_distribution"]["SearchMessages"] == 1
+    assert tool_distribution["ListDialogs"] == 2
+    assert tool_distribution["SearchMessages"] == 1
 
 
 @pytest.mark.asyncio
@@ -2370,7 +2474,7 @@ async def test_get_usage_stats_empty_table() -> None:
     server = make_server(conn)
     result = await server._dispatch({"method": "get_usage_stats"})
     assert result["ok"] is True
-    data = result["data"]
+    data = cast(dict[str, object], result["data"])
     assert data["total_calls"] == 0
     assert data["tool_distribution"] == {}
 
@@ -2390,9 +2494,11 @@ async def test_get_usage_stats_respects_since() -> None:
     since = int(_time.time()) - 7 * 86400  # last 7 days
     result = await server._dispatch({"method": "get_usage_stats", "since": since})
     assert result["ok"] is True
-    assert result["data"]["total_calls"] == 1
-    assert "New" in result["data"]["tool_distribution"]
-    assert "Old" not in result["data"]["tool_distribution"]
+    data = cast(dict[str, object], result["data"])
+    tool_distribution = cast(dict[str, int], data["tool_distribution"])
+    assert data["total_calls"] == 1
+    assert "New" in tool_distribution
+    assert "Old" not in tool_distribution
 
 
 # ---------------------------------------------------------------------------
@@ -2416,7 +2522,7 @@ async def test_upsert_entities_inserts_rows() -> None:
     )
     assert result["ok"] is True
     assert result["upserted"] == 2
-    rows = conn.execute("SELECT id, name FROM entities ORDER BY id").fetchall()
+    rows = cast(list[tuple[object, ...]], conn.execute("SELECT id, name FROM entities ORDER BY id").fetchall())
     assert len(rows) == 2
     assert tuple(rows[0]) == (100, "Alice")
     assert tuple(rows[1]) == (200, "Dev Chat")
@@ -2435,12 +2541,15 @@ async def test_upsert_entities_computes_name_normalized() -> None:
             ],
         }
     )
-    row = conn.execute("SELECT name_normalized FROM entities WHERE id = 300").fetchone()
+    row = cast(
+        tuple[object, ...] | None, conn.execute("SELECT name_normalized FROM entities WHERE id = 300").fetchone()
+    )
     assert row is not None
     assert row[0] is not None
     # latinize("Николай") should produce a Latin string
-    assert row[0] == row[0].lower()
-    assert all(c.isalnum() or c == " " for c in row[0])
+    name = cast(str, row[0])
+    assert name == name.lower()
+    assert all(c.isalnum() or c == " " for c in name)
 
 
 @pytest.mark.asyncio
@@ -2464,7 +2573,8 @@ async def test_upsert_entities_replaces_on_conflict() -> None:
             "entities": [{"id": 100, "type": "user", "name": "New Name"}],
         }
     )
-    row = conn.execute("SELECT name FROM entities WHERE id = 100").fetchone()
+    row = cast(tuple[object, ...] | None, conn.execute("SELECT name FROM entities WHERE id = 100").fetchone())
+    assert row is not None
     assert row[0] == "New Name"
 
 
@@ -2484,10 +2594,11 @@ async def test_resolve_entity_exact_name() -> None:
 
     server = make_server(conn)
     result = await server._dispatch({"method": "resolve_entity", "query": "Alice Smith"})
+    data = cast(dict[str, object], result["data"])
     assert result["ok"] is True
-    assert result["data"]["result"] == "resolved"
-    assert result["data"]["entity_id"] == 101
-    assert result["data"]["display_name"] == "Alice Smith"
+    assert data["result"] == "resolved"
+    assert data["entity_id"] == 101
+    assert data["display_name"] == "Alice Smith"
 
 
 @pytest.mark.asyncio
@@ -2501,10 +2612,11 @@ async def test_resolve_entity_username_lookup() -> None:
 
     server = make_server(conn)
     result = await server._dispatch({"method": "resolve_entity", "query": "@bobby"})
+    data = cast(dict[str, object], result["data"])
     assert result["ok"] is True
-    assert result["data"]["result"] == "resolved"
-    assert result["data"]["entity_id"] == 102
-    assert result["data"]["display_name"] == "Bob"
+    assert data["result"] == "resolved"
+    assert data["entity_id"] == 102
+    assert data["display_name"] == "Bob"
 
 
 @pytest.mark.asyncio
@@ -2514,7 +2626,7 @@ async def test_resolve_entity_not_found() -> None:
     server = make_server(conn)
     result = await server._dispatch({"method": "resolve_entity", "query": "Nobody"})
     assert result["ok"] is True
-    assert result["data"]["result"] == "not_found"
+    assert cast(dict[str, object], result["data"])["result"] == "not_found"
 
 
 @pytest.mark.asyncio
@@ -2524,7 +2636,7 @@ async def test_resolve_entity_username_not_found() -> None:
     server = make_server(conn)
     result = await server._dispatch({"method": "resolve_entity", "query": "@nobody"})
     assert result["ok"] is True
-    assert result["data"]["result"] == "not_found"
+    assert cast(dict[str, object], result["data"])["result"] == "not_found"
 
 
 @pytest.mark.asyncio
@@ -2551,7 +2663,7 @@ async def test_resolve_entity_fuzzy_candidates() -> None:
     result = await server._dispatch({"method": "resolve_entity", "query": "Alex"})
     assert result["ok"] is True
     # With two similar single-word matches, resolver returns candidates
-    assert result["data"]["result"] in ("resolved", "candidates")
+    assert cast(dict[str, object], result["data"])["result"] in ("resolved", "candidates")
 
 
 @pytest.mark.asyncio
@@ -2565,9 +2677,10 @@ async def test_resolve_entity_pascalcase_type_forward_compat() -> None:
 
     server = make_server(conn)
     result = await server._dispatch({"method": "resolve_entity", "query": "Carlos New"})
+    data = cast(dict[str, object], result["data"])
     assert result["ok"] is True
-    assert result["data"]["result"] == "resolved"
-    assert result["data"]["entity_id"] == 201
+    assert data["result"] == "resolved"
+    assert data["entity_id"] == 201
 
 
 # ---------------------------------------------------------------------------
@@ -2650,7 +2763,7 @@ async def test_daemon_connection_record_telemetry_payload() -> None:
     event = {"tool_name": "X", "timestamp": 1.0}
     await conn.record_telemetry(event=event)
 
-    payload = json.loads(sent_data[0].decode().strip())
+    payload = cast(dict[str, object], json.loads(sent_data[0].decode().strip()))
     assert payload["method"] == "record_telemetry"
     assert payload["event"] == event
 
@@ -2672,7 +2785,7 @@ async def test_daemon_connection_get_usage_stats_payload() -> None:
 
     await conn.get_usage_stats()
 
-    payload = json.loads(sent_data[0].decode().strip())
+    payload = cast(dict[str, object], json.loads(sent_data[0].decode().strip()))
     assert payload["method"] == "get_usage_stats"
     assert "since" not in payload  # default: no since param
 
@@ -2694,7 +2807,7 @@ async def test_daemon_connection_get_usage_stats_with_since() -> None:
 
     await conn.get_usage_stats(since=1000)
 
-    payload = json.loads(sent_data[0].decode().strip())
+    payload = cast(dict[str, object], json.loads(sent_data[0].decode().strip()))
     assert payload["since"] == 1000
 
 
@@ -2716,7 +2829,7 @@ async def test_daemon_connection_upsert_entities_payload() -> None:
     entities = [{"id": 1, "type": "user", "name": "A"}]
     await conn.upsert_entities(entities=entities)
 
-    payload = json.loads(sent_data[0].decode().strip())
+    payload = cast(dict[str, object], json.loads(sent_data[0].decode().strip()))
     assert payload["method"] == "upsert_entities"
     assert payload["entities"] == entities
 
@@ -2738,7 +2851,7 @@ async def test_daemon_connection_resolve_entity_payload() -> None:
 
     await conn.resolve_entity(query="Alice")
 
-    payload = json.loads(sent_data[0].decode().strip())
+    payload = cast(dict[str, object], json.loads(sent_data[0].decode().strip()))
     assert payload["method"] == "resolve_entity"
     assert payload["query"] == "Alice"
 
@@ -2895,9 +3008,9 @@ async def test_list_messages_pagination_cursor_continues() -> None:
     result = await server._list_messages({"dialog_id": DIALOG_ID, "limit": 2, "navigation": token})
 
     assert result["ok"] is True, f"Unexpected error: {result}"
-    messages = result["data"]["messages"]
+    messages = _response_messages(result)
     # cursor=103 with direction=newest → message_id < 103 → returns 102, 101
-    assert all(m["message_id"] < 103 for m in messages), (
+    assert all(cast(int, m["message_id"]) < 103 for m in messages), (
         f"Expected messages before 103, got: {[m['message_id'] for m in messages]}"
     )
 
@@ -2942,8 +3055,8 @@ async def test_list_messages_direction_oldest() -> None:
     result = await server._list_messages({"dialog_id": DIALOG_ID, "limit": 10, "direction": "oldest"})
 
     assert result["ok"] is True, f"Unexpected error: {result}"
-    messages = result["data"]["messages"]
-    ids = [m["message_id"] for m in messages]
+    messages = _response_messages(result)
+    ids = [cast(int, m["message_id"]) for m in messages]
     assert ids == sorted(ids), f"Expected ascending order, got: {ids}"
 
 
@@ -2961,8 +3074,8 @@ async def test_list_messages_direction_newest() -> None:
     result = await server._list_messages({"dialog_id": DIALOG_ID, "limit": 10, "direction": "newest"})
 
     assert result["ok"] is True, f"Unexpected error: {result}"
-    messages = result["data"]["messages"]
-    ids = [m["message_id"] for m in messages]
+    messages = _response_messages(result)
+    ids = [cast(int, m["message_id"]) for m in messages]
     assert ids == sorted(ids, reverse=True), f"Expected descending order, got: {ids}"
 
 
@@ -2984,7 +3097,7 @@ async def test_list_messages_sender_filter() -> None:
     result = await server._list_messages({"dialog_id": DIALOG_ID, "limit": 10, "sender_id": 42})
 
     assert result["ok"] is True, f"Unexpected error: {result}"
-    messages = result["data"]["messages"]
+    messages = _response_messages(result)
     assert len(messages) == 1
     assert messages[0]["message_id"] == 101
     assert messages[0]["sender_id"] == 42
@@ -3003,7 +3116,7 @@ async def test_list_messages_sender_name_filter() -> None:
     result = await server._list_messages({"dialog_id": DIALOG_ID, "limit": 10, "sender_name": "alice"})
 
     assert result["ok"] is True, f"Unexpected error: {result}"
-    messages = result["data"]["messages"]
+    messages = _response_messages(result)
     assert len(messages) == 1
     assert messages[0]["message_id"] == 101
 
@@ -3027,7 +3140,7 @@ async def test_list_messages_topic_filter() -> None:
     result = await server._list_messages({"dialog_id": DIALOG_ID, "limit": 10, "topic_id": 5})
 
     assert result["ok"] is True, f"Unexpected error: {result}"
-    messages = result["data"]["messages"]
+    messages = _response_messages(result)
     assert len(messages) == 1
     assert messages[0]["message_id"] == 101
     assert messages[0]["forum_topic_id"] == 5
@@ -3053,7 +3166,7 @@ async def test_list_messages_unread_filter() -> None:
     result = await server._list_messages({"dialog_id": DIALOG_ID, "limit": 10, "unread_after_id": 100})
 
     assert result["ok"] is True, f"Unexpected error: {result}"
-    messages = result["data"]["messages"]
+    messages = _response_messages(result)
     msg_ids = {m["message_id"] for m in messages}
     assert 99 not in msg_ids
     assert 100 not in msg_ids
@@ -3081,7 +3194,7 @@ async def test_list_messages_edit_date_sync_db() -> None:
     result = await server._list_messages({"dialog_id": DIALOG_ID, "limit": 10})
 
     assert result["ok"] is True, f"Unexpected error: {result}"
-    messages = result["data"]["messages"]
+    messages = _response_messages(result)
     msgs_by_id = {m["message_id"]: m for m in messages}
 
     # Edited message should have edit_date = MAX(1700001000, 1700002000) = 1700002000
@@ -3104,7 +3217,7 @@ async def test_list_messages_no_edit_date_is_none() -> None:
     result = await server._list_messages({"dialog_id": DIALOG_ID, "limit": 10})
 
     assert result["ok"] is True
-    messages = result["data"]["messages"]
+    messages = _response_messages(result)
     assert messages[0]["edit_date"] is None
 
 
@@ -3127,7 +3240,7 @@ async def test_list_messages_topic_label() -> None:
     result = await server._list_messages({"dialog_id": DIALOG_ID, "limit": 10})
 
     assert result["ok"] is True, f"Unexpected error: {result}"
-    messages = result["data"]["messages"]
+    messages = _response_messages(result)
     msgs_by_id = {m["message_id"]: m for m in messages}
 
     assert "topic_title" in msgs_by_id[101], "topic_title key must be present"
@@ -3149,14 +3262,14 @@ async def test_list_messages_on_demand_navigation_offset_id() -> None:
 
     captured_kwargs: dict = {}
 
-    async def _fake_iter_messages(*args: Any, **kwargs: Any):  # type: ignore[misc]
+    async def _fake_iter_messages(*args: object, **kwargs: object):  # type: ignore[misc]
         captured_kwargs.update(kwargs)
         return
         yield  # make it an async generator
 
     conn = _make_db()
     # No synced_dialog row → on-demand path
-    client = MagicMock()
+    client = _TestClient()
     client.iter_messages = _fake_iter_messages
     server = make_server(conn, client)
 
@@ -3176,13 +3289,13 @@ async def test_list_messages_on_demand_direction_oldest_reverse() -> None:
 
     captured_kwargs: dict = {}
 
-    async def _fake_iter_messages(*args: Any, **kwargs: Any):  # type: ignore[misc]
+    async def _fake_iter_messages(*args: object, **kwargs: object):  # type: ignore[misc]
         captured_kwargs.update(kwargs)
         return
         yield  # make it an async generator
 
     conn = _make_db()
-    client = MagicMock()
+    client = _TestClient()
     client.iter_messages = _fake_iter_messages
     server = make_server(conn, client)
 
@@ -3206,13 +3319,13 @@ async def test_list_messages_on_demand_sender_id_from_user() -> None:
 
     captured_kwargs: dict = {}
 
-    async def _fake_iter_messages(*args: Any, **kwargs: Any):  # type: ignore[misc]
+    async def _fake_iter_messages(*args: object, **kwargs: object):  # type: ignore[misc]
         captured_kwargs.update(kwargs)
         return
         yield
 
     conn = _make_db()
-    client = MagicMock()
+    client = _TestClient()
     client.iter_messages = _fake_iter_messages
     server = make_server(conn, client)
 
@@ -3231,13 +3344,13 @@ async def test_list_messages_on_demand_topic_id_reply_to() -> None:
 
     captured_kwargs: dict = {}
 
-    async def _fake_iter_messages(*args: Any, **kwargs: Any):  # type: ignore[misc]
+    async def _fake_iter_messages(*args: object, **kwargs: object):  # type: ignore[misc]
         captured_kwargs.update(kwargs)
         return
         yield
 
     conn = _make_db()
-    client = MagicMock()
+    client = _TestClient()
     client.iter_messages = _fake_iter_messages
     server = make_server(conn, client)
 
@@ -3254,13 +3367,13 @@ async def test_list_messages_on_demand_unread_after_id_min_id() -> None:
 
     captured_kwargs: dict = {}
 
-    async def _fake_iter_messages(*args: Any, **kwargs: Any):  # type: ignore[misc]
+    async def _fake_iter_messages(*args: object, **kwargs: object):  # type: ignore[misc]
         captured_kwargs.update(kwargs)
         return
         yield
 
     conn = _make_db()
-    client = MagicMock()
+    client = _TestClient()
     client.iter_messages = _fake_iter_messages
     server = make_server(conn, client)
 
@@ -3289,7 +3402,7 @@ async def test_list_messages_context_window_centred() -> None:
     result = await server._list_messages({"dialog_id": DIALOG_ID, "context_message_id": 5, "context_size": 4})
 
     assert result["ok"] is True, f"Unexpected error: {result}"
-    messages = result["data"]["messages"]
+    messages = _response_messages(result)
     ids = [m["message_id"] for m in messages]
     # context_size=4 → half=2, so: ids <= 5 DESC LIMIT 3 → [5,4,3] → reversed [3,4,5]
     # ids > 5 ASC LIMIT 2 → [6,7]
@@ -3312,7 +3425,7 @@ async def test_list_messages_context_window_near_start() -> None:
     result = await server._list_messages({"dialog_id": DIALOG_ID, "context_message_id": 2, "context_size": 6})
 
     assert result["ok"] is True, f"Unexpected error: {result}"
-    messages = result["data"]["messages"]
+    messages = _response_messages(result)
     ids = [m["message_id"] for m in messages]
     # half=3; before: ids <= 2 DESC LIMIT 4 → [2,1]; after: ids > 2 ASC LIMIT 3 → [3,4,5]
     assert ids == [1, 2, 3, 4, 5]
@@ -3358,8 +3471,8 @@ async def test_list_messages_context_window_reactions_injected() -> None:
     result = await server._list_messages({"dialog_id": DIALOG_ID, "context_message_id": 20, "context_size": 4})
 
     assert result["ok"] is True
-    by_id = {m["message_id"]: m for m in result["data"]["messages"]}
-    assert "👍" in by_id[20]["reactions_display"]
+    by_id = {cast(int, m["message_id"]): m for m in _response_messages(result)}
+    assert "👍" in cast(str, by_id[20]["reactions_display"])
     assert by_id[10]["reactions_display"] == ""
     assert by_id[30]["reactions_display"] == ""
 
@@ -3375,19 +3488,17 @@ def test_msg_to_dict_edit_date() -> None:
 
     mock_msg = MagicMock()
     mock_msg.id = 300
-    mock_msg.date = MagicMock()
-    mock_msg.date.timestamp.return_value = 1700000000.0
+    mock_msg.date = SimpleNamespace(timestamp=lambda: 1700000000.0)
     mock_msg.message = "edited message"
     mock_msg.sender_id = 42
-    mock_msg.sender = MagicMock()
-    mock_msg.sender.first_name = "Alice"
+    mock_msg.sender = SimpleNamespace(first_name="Alice")
     mock_msg.media = None
     mock_msg.reply_to = None
     mock_msg.reactions = None
     edit_dt = datetime(2023, 11, 14, 12, 0, 0, tzinfo=UTC)
     mock_msg.edit_date = edit_dt
 
-    result = message_to_dict(mock_msg)
+    result = message_to_dict(cast(_MessageLike, mock_msg))
 
     assert "edit_date" in result, "edit_date key must be present in _msg_to_dict output"
     assert result["edit_date"] == int(edit_dt.timestamp())
@@ -3397,8 +3508,7 @@ def test_msg_to_dict_no_edit_date_is_none() -> None:
     """_msg_to_dict returns edit_date=None when msg.edit_date is None."""
     mock_msg = MagicMock()
     mock_msg.id = 301
-    mock_msg.date = MagicMock()
-    mock_msg.date.timestamp.return_value = 1700000000.0
+    mock_msg.date = SimpleNamespace(timestamp=lambda: 1700000000.0)
     mock_msg.message = "unedited"
     mock_msg.sender_id = None
     mock_msg.sender = None
@@ -3407,7 +3517,7 @@ def test_msg_to_dict_no_edit_date_is_none() -> None:
     mock_msg.reactions = None
     mock_msg.edit_date = None
 
-    result = message_to_dict(mock_msg)
+    result = message_to_dict(cast(_MessageLike, mock_msg))
 
     assert result.get("edit_date") is None
 
@@ -3603,7 +3713,7 @@ async def test_list_dialogs_includes_coverage():
         )
     conn.commit()
 
-    mock_client = MagicMock()
+    mock_client = _TestClient()
     mock_client.iter_dialogs = MagicMock(side_effect=AssertionError("SQL path must not call iter_dialogs"))
 
     server = make_server(conn, mock_client)
@@ -3614,7 +3724,7 @@ async def test_list_dialogs_includes_coverage():
     assert dialogs[0]["sync_coverage_pct"] == 50
     assert dialogs[0]["access_lost_at"] is None
     assert dialogs[0]["type"] == "User"
-    mock_client.iter_dialogs.assert_not_called()
+    cast(MagicMock, mock_client.iter_dialogs).assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -3624,7 +3734,7 @@ async def test_list_dialogs_classifies_forum() -> None:
     # Forum type is stored directly in the dialogs.type column by the bootstrap sweep.
     _seed_dialog_row(conn, 6001, name="Forum Group", type_="Forum")
 
-    mock_client = MagicMock()
+    mock_client = _TestClient()
     mock_client.iter_dialogs = MagicMock(side_effect=AssertionError("SQL path must not call iter_dialogs"))
 
     server = make_server(conn, mock_client)
@@ -3633,7 +3743,7 @@ async def test_list_dialogs_classifies_forum() -> None:
     dialogs = result["data"]["dialogs"]
     assert len(dialogs) == 1
     assert dialogs[0]["type"] == "Forum"
-    mock_client.iter_dialogs.assert_not_called()
+    cast(MagicMock, mock_client.iter_dialogs).assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -3666,7 +3776,7 @@ async def test_list_messages_access_lost_returns_archived():
     assert result["data"]["access_lost_at"] == 1700000000
     assert result["data"]["last_synced_at"] == 1699990000
     assert result["data"]["last_event_at"] == 1699999000
-    assert len(result["data"]["messages"]) == 1
+    assert len(_response_messages(result)) == 1
 
 
 @pytest.mark.asyncio
@@ -3909,13 +4019,14 @@ async def test_list_messages_from_db_includes_reactions_display() -> None:
     result = await server._list_messages({"dialog_id": 1, "limit": 10})
 
     assert result["ok"] is True
-    messages = result["data"]["messages"]
+    messages = _response_messages(result)
     assert len(messages) == 1
     msg = messages[0]
     assert "reactions_display" in msg
     assert "reactions" not in msg  # bare reactions key must not exist
-    assert "👍" in msg["reactions_display"]
-    assert "\u00d7" in msg["reactions_display"]  # × (U+00D7)
+    reactions_display = cast(str, msg["reactions_display"])
+    assert "👍" in reactions_display
+    assert "\u00d7" in reactions_display  # × (U+00D7)
 
 
 @pytest.mark.asyncio
@@ -3930,7 +4041,7 @@ async def test_list_messages_from_db_no_reactions_empty_display() -> None:
     result = await server._list_messages({"dialog_id": 1, "limit": 10})
 
     assert result["ok"] is True
-    messages = result["data"]["messages"]
+    messages = _response_messages(result)
     assert messages[0]["reactions_display"] == ""
 
 
@@ -3958,10 +4069,10 @@ async def test_scoped_search_includes_reactions_display() -> None:
     result = await server._search_messages({"query": "fire", "dialog_id": 1})
 
     assert result["ok"] is True
-    messages = result["data"]["messages"]
+    messages = _response_messages(result)
     assert len(messages) == 1
     assert "reactions_display" in messages[0]
-    assert "🔥" in messages[0]["reactions_display"]
+    assert "🔥" in cast(str, messages[0]["reactions_display"])
 
 
 @pytest.mark.asyncio
@@ -3984,7 +4095,7 @@ async def test_global_search_returns_empty_reactions_display() -> None:
     result = await server._search_messages({"query": "global"})
 
     assert result["ok"] is True
-    messages = result["data"]["messages"]
+    messages = _response_messages(result)
     assert len(messages) == 1
     # Global search: reactions_display must be present but empty
     assert "reactions_display" in messages[0]
@@ -4009,8 +4120,7 @@ def test_msg_to_dict_formats_reactions_display() -> None:
 
     mock_msg = MagicMock()
     mock_msg.id = 999
-    mock_msg.date = MagicMock()
-    mock_msg.date.timestamp.return_value = 1700000000.0
+    mock_msg.date = SimpleNamespace(timestamp=lambda: 1700000000.0)
     mock_msg.message = "hello"
     mock_msg.sender_id = 42
     mock_msg.sender = None
@@ -4021,20 +4131,20 @@ def test_msg_to_dict_formats_reactions_display() -> None:
     mock_msg.reactions = mock_reactions_obj
     mock_msg.edit_date = None
 
-    result = message_to_dict(mock_msg)
+    result = message_to_dict(cast(_MessageLike, mock_msg))
 
     assert "reactions_display" in result
     assert "reactions" not in result  # bare 'reactions' key must not exist
-    assert "👍" in result["reactions_display"]
-    assert "\u00d7" in result["reactions_display"]  # × U+00D7
+    reactions_display = cast(str, result["reactions_display"])
+    assert "👍" in reactions_display
+    assert "\u00d7" in reactions_display  # × U+00D7
 
 
 def test_msg_to_dict_no_reactions_returns_empty_display() -> None:
     """_msg_to_dict returns reactions_display='' when msg.reactions is None."""
     mock_msg = MagicMock()
     mock_msg.id = 1
-    mock_msg.date = MagicMock()
-    mock_msg.date.timestamp.return_value = 1700000000.0
+    mock_msg.date = SimpleNamespace(timestamp=lambda: 1700000000.0)
     mock_msg.message = "no reactions"
     mock_msg.sender_id = None
     mock_msg.sender = None
@@ -4045,7 +4155,7 @@ def test_msg_to_dict_no_reactions_returns_empty_display() -> None:
     mock_msg.reactions = None
     mock_msg.edit_date = None
 
-    result = message_to_dict(mock_msg)
+    result = message_to_dict(cast(_MessageLike, mock_msg))
 
     assert result["reactions_display"] == ""
     assert "reactions" not in result
@@ -4063,7 +4173,7 @@ async def test_no_remaining_reactions_key_in_responses() -> None:
     result = await server._list_messages({"dialog_id": 1, "limit": 10})
 
     assert result["ok"] is True
-    for msg in result["data"]["messages"]:
+    for msg in _response_messages(result):
         assert "reactions" not in msg, f"bare 'reactions' key found: {msg}"
         assert "reactions_display" in msg
 
@@ -4208,14 +4318,17 @@ def test_entity_read_path_mention_query() -> None:
     )
     conn.commit()
 
-    rows = conn.execute(
-        "SELECT type, value, COUNT(*) as cnt FROM message_entities "
-        "WHERE dialog_id = ? GROUP BY type, value ORDER BY cnt DESC",
-        (1,),
-    ).fetchall()
+    rows = cast(
+        list[tuple[object, ...]],
+        conn.execute(
+            "SELECT type, value, COUNT(*) as cnt FROM message_entities "
+            "WHERE dialog_id = ? GROUP BY type, value ORDER BY cnt DESC",
+            (1,),
+        ).fetchall(),
+    )
 
     assert len(rows) == 2
-    values = {row[1] for row in rows}
+    values = {cast(str, row[1]) for row in rows}
     assert "@alice" in values
     assert "#python" in values
     # All values populated (not NULL) -- proves Priority Action #1
@@ -4509,7 +4622,7 @@ async def test_get_dialog_stats_resolves_fuzzy_dialog_name() -> None:
 
     entity = MagicMock()
     entity.id = 1
-    client = MagicMock()
+    client = _TestClient()
     client.get_entity = AsyncMock(return_value=entity)
 
     server = make_server(conn, client)
@@ -4517,7 +4630,7 @@ async def test_get_dialog_stats_resolves_fuzzy_dialog_name() -> None:
 
     assert result["ok"] is True
     assert result["data"]["dialog_id"] == 1
-    client.get_entity.assert_called_once_with("Chat Foo")
+    cast(AsyncMock, client.get_entity).assert_called_once_with("Chat Foo")
 
 
 # - Simplify _format_reactions to only handle count-only display path
@@ -4546,7 +4659,7 @@ def _seed_message_p39(
     message_id: int,
     sender_id: int | None,
     sender_first_name: str | None,
-    **kwargs: Unpack[TypedDict("_SeedMessageP39Kwargs", {"text": str, "out": int, "is_service": int}, total=False)],
+    **kwargs: Unpack[_SeedMessageP39Kwargs],
 ) -> None:
     text = kwargs.get("text", "hi")
     out = kwargs.get("out", 0)
@@ -4580,7 +4693,7 @@ async def test_list_messages_uses_entity_name_when_sender_first_name_is_null() -
     server = make_server(conn)
     resp = await server._list_messages({"dialog_id": 555, "limit": 10})
     assert resp["ok"] is True
-    assert resp["data"]["messages"][0]["sender_first_name"] == "Konstantin"
+    assert _response_messages(resp)[0]["sender_first_name"] == "Konstantin"
 
 
 @pytest.mark.asyncio
@@ -4592,7 +4705,7 @@ async def test_list_messages_falls_back_to_denormalized_column_when_no_entity() 
     conn.commit()
     server = make_server(conn)
     resp = await server._list_messages({"dialog_id": 555, "limit": 10})
-    assert resp["data"]["messages"][0]["sender_first_name"] == "Old Name"
+    assert _response_messages(resp)[0]["sender_first_name"] == "Old Name"
 
 
 @pytest.mark.asyncio
@@ -4604,7 +4717,7 @@ async def test_list_messages_returns_none_when_both_sources_missing() -> None:
     conn.commit()
     server = make_server(conn)
     resp = await server._list_messages({"dialog_id": 555, "limit": 10})
-    assert resp["data"]["messages"][0]["sender_first_name"] is None
+    assert _response_messages(resp)[0]["sender_first_name"] is None
 
 
 @pytest.mark.asyncio
@@ -4617,7 +4730,7 @@ async def test_list_messages_entity_name_wins_over_stale_column() -> None:
     conn.commit()
     server = make_server(conn)
     resp = await server._list_messages({"dialog_id": 555, "limit": 10})
-    assert resp["data"]["messages"][0]["sender_first_name"] == "New"
+    assert _response_messages(resp)[0]["sender_first_name"] == "New"
 
 
 @pytest.mark.asyncio
@@ -4641,11 +4754,12 @@ async def test_list_unread_messages_uses_entity_name() -> None:
         }
     )
     assert result["ok"] is True
-    groups = result["data"]["groups"]
+    groups = _response_groups(result)
     dialog_group = next((g for g in groups if g["dialog_id"] == 555), None)
     assert dialog_group is not None
-    assert len(dialog_group["messages"]) == 1
-    assert dialog_group["messages"][0]["sender_first_name"] == "Konstantin"
+    messages = cast(list[dict[str, object]], dialog_group["messages"])
+    assert len(messages) == 1
+    assert messages[0]["sender_first_name"] == "Konstantin"
 
 
 # --- Task 1: SQL invariant tests (MANDATORY, no skip) ---
@@ -4685,7 +4799,7 @@ def test_all_sql_constants_contain_entity_join_and_coalesce() -> None:
         "_FETCH_UNREAD_MESSAGES_SQL",
         "_LIST_MESSAGES_BASE_SQL",
     ):
-        sql = getattr(d, name)
+        sql = cast(str, getattr(d, name))
         assert "LEFT JOIN entities" in sql, f"{name} missing LEFT JOIN entities"
         assert "COALESCE(" in sql, f"{name} missing COALESCE"
         # Phase 39.1-02: every read-path SELECT projects effective_sender_id
@@ -4724,7 +4838,7 @@ async def test_list_messages_emits_structured_log_on_sync_db_success(caplog: pyt
     assert resp["ok"] is True
     records = [r for r in caplog.records if r.message == "list_messages rendered"]
     assert len(records) == 1, f"Expected 1 log record, got: {[r.message for r in caplog.records]}"
-    rec = records[0]
+    rec = cast(_RenderedListMessagesLogRecord, records[0])
     assert rec.dialog_id == 555
     assert rec.rows == 3
     assert rec.null_sender_rows == 1
@@ -4743,7 +4857,7 @@ async def test_list_messages_logs_zero_counters_when_empty(caplog: pytest.LogCap
         await server._list_messages({"dialog_id": 777, "limit": 50})
     records = [r for r in caplog.records if r.message == "list_messages rendered"]
     assert len(records) == 1
-    rec = records[0]
+    rec = cast(_RenderedListMessagesLogRecord, records[0])
     assert rec.rows == 0
     assert rec.null_sender_rows == 0
     assert rec.unresolved_entity_rows == 0
@@ -4768,7 +4882,7 @@ async def test_fallback_path_does_not_emit_counter(caplog: pytest.LogCaptureFixt
     server = make_server(conn)
 
     # Mock telegram client to return empty list (avoid real API call)
-    async def _empty_iter_messages(*args: Any, **kwargs: Any):  # type: ignore[misc]
+    async def _empty_iter_messages(*args: object, **kwargs: object):  # type: ignore[misc]
         return
         yield  # make it an async generator
 
@@ -4804,7 +4918,7 @@ async def test_list_messages_effective_sender_dm_outgoing() -> None:
     server.self_id = 99999
     resp = await server._list_messages({"dialog_id": 268071163, "limit": 10})
     assert resp["ok"] is True
-    assert resp["data"]["messages"][0]["effective_sender_id"] == 99999
+    assert _response_messages(resp)[0]["effective_sender_id"] == 99999
 
 
 @pytest.mark.asyncio
@@ -4826,7 +4940,7 @@ async def test_list_messages_effective_sender_dm_incoming() -> None:
     server.self_id = 99999
     resp = await server._list_messages({"dialog_id": 268071163, "limit": 10})
     assert resp["ok"] is True
-    assert resp["data"]["messages"][0]["effective_sender_id"] == 268071163
+    assert _response_messages(resp)[0]["effective_sender_id"] == 268071163
 
 
 @pytest.mark.asyncio
@@ -4848,8 +4962,8 @@ async def test_list_messages_effective_sender_service_message_is_null() -> None:
     server.self_id = 99999
     resp = await server._list_messages({"dialog_id": 268071163, "limit": 10})
     assert resp["ok"] is True
-    assert resp["data"]["messages"][0]["effective_sender_id"] is None
-    assert resp["data"]["messages"][0]["is_service"] == 1
+    assert _response_messages(resp)[0]["effective_sender_id"] is None
+    assert _response_messages(resp)[0]["is_service"] == 1
 
 
 @pytest.mark.asyncio
@@ -4871,7 +4985,7 @@ async def test_list_messages_effective_sender_group_unknown_is_null() -> None:
     server.self_id = 99999
     resp = await server._list_messages({"dialog_id": -100123, "limit": 10})
     assert resp["ok"] is True
-    assert resp["data"]["messages"][0]["effective_sender_id"] is None
+    assert _response_messages(resp)[0]["effective_sender_id"] is None
 
 
 def test_msg_to_dict_telethon_fallback_computes_effective_sender() -> None:
@@ -4894,7 +5008,7 @@ def test_msg_to_dict_telethon_fallback_computes_effective_sender() -> None:
         edit_date=None,
         out=True,
     )
-    result = message_to_dict(mock_msg, dialog_id=268071163, self_id=99999)
+    result = message_to_dict(cast(_MessageLike, mock_msg), dialog_id=268071163, self_id=99999)
     assert result["effective_sender_id"] == 99999
     assert result["is_service"] == 0
     assert result["out"] == 1
@@ -4919,7 +5033,7 @@ def test_msg_to_dict_telethon_fallback_dm_incoming() -> None:
         edit_date=None,
         out=False,
     )
-    result = message_to_dict(mock_msg, dialog_id=268071163, self_id=99999)
+    result = message_to_dict(cast(_MessageLike, mock_msg), dialog_id=268071163, self_id=99999)
     assert result["effective_sender_id"] == 268071163
     assert result["is_service"] == 0
 
@@ -4944,7 +5058,7 @@ async def test_list_messages_dm_outgoing_resolves_sender_first_name_via_e_eff() 
     server.self_id = 99999
     resp = await server._list_messages({"dialog_id": 268071163, "limit": 10})
     assert resp["ok"] is True
-    assert resp["data"]["messages"][0]["sender_first_name"] == "Me"
+    assert _response_messages(resp)[0]["sender_first_name"] == "Me"
 
 
 # --- Phase 999.1: get_my_recent_activity ----------------------------
@@ -4957,7 +5071,7 @@ async def test_get_my_recent_activity_never_run() -> None:
     req = {"method": "get_my_recent_activity", "since_hours": 168, "limit": 100}
     resp = await server._dispatch(req)
     assert resp["ok"] is True
-    data = resp["data"]
+    data = _activity_data(resp)
     assert data["comments"] == []
     assert data["scan_status"] == "never_run"
     assert data["scanned_at"] is None
@@ -4973,8 +5087,9 @@ async def test_get_my_recent_activity_in_progress() -> None:
         )
         # backfill_complete stays '0', last_sync_at stays NULL
     resp = await server._dispatch({"method": "get_my_recent_activity"})
-    assert resp["data"]["scan_status"] == "in_progress"
-    assert resp["data"]["scanned_at"] is None
+    data = _activity_data(resp)
+    assert data["scan_status"] == "in_progress"
+    assert data["scanned_at"] is None
 
 
 @pytest.mark.asyncio
@@ -4998,9 +5113,9 @@ async def test_get_my_recent_activity_filters_by_since_hours() -> None:
         server._conn.execute("UPDATE activity_sync_state SET value='1' WHERE key='backfill_complete'")
         server._conn.execute(f"UPDATE activity_sync_state SET value='{now}' WHERE key='last_sync_at'")
     resp = await server._dispatch({"method": "get_my_recent_activity", "since_hours": 1, "dialog_kinds": ["all"]})
-    texts = [c["text"] for c in resp["data"]["comments"]]
+    texts = [c["text"] for c in cast(list[dict[str, object]], _activity_data(resp)["comments"])]
     assert texts == ["recent"]
-    assert resp["data"]["scan_status"] == "complete"
+    assert _activity_data(resp)["scan_status"] == "complete"
 
 
 @pytest.mark.asyncio
@@ -5023,7 +5138,10 @@ async def test_get_my_recent_activity_returns_latest_page_chronologically() -> N
         {"method": "get_my_recent_activity", "since_hours": 1, "limit": 2, "dialog_kinds": ["all"]}
     )
 
-    assert [comment["message_id"] for comment in resp["data"]["comments"]] == [2, 3]
+    assert [comment["message_id"] for comment in cast(list[dict[str, object]], _activity_data(resp)["comments"])] == [
+        2,
+        3,
+    ]
 
 
 @pytest.mark.asyncio
@@ -5049,7 +5167,7 @@ async def test_get_my_recent_activity_joins_dialog_name() -> None:
         server._conn.execute("UPDATE activity_sync_state SET value='1' WHERE key='backfill_complete'")
         server._conn.execute(f"UPDATE activity_sync_state SET value='{now}' WHERE key='last_sync_at'")
     resp = await server._dispatch({"method": "get_my_recent_activity"})
-    comment = resp["data"]["comments"][0]
+    comment = cast(dict[str, object], cast(list[dict[str, object]], _activity_data(resp)["comments"])[0])
     assert comment["dialog_name"] == "My Group"
     assert comment["dialog_type"] == "supergroup"
     assert comment["dialog_category"] == "group"
@@ -5084,8 +5202,9 @@ async def test_get_my_recent_activity_counts_local_direct_replies() -> None:
 
     resp = await server._dispatch({"method": "get_my_recent_activity"})
 
-    assert resp["data"]["comments"][0]["message_id"] == 10
-    assert resp["data"]["comments"][0]["reply_count"] == 1
+    first_comment = cast(dict[str, object], cast(list[dict[str, object]], _activity_data(resp)["comments"])[0])
+    assert first_comment["message_id"] == 10
+    assert first_comment["reply_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -5103,7 +5222,10 @@ async def test_get_my_recent_activity_falls_back_to_str_dialog_id() -> None:
         server._conn.execute("UPDATE activity_sync_state SET value='1' WHERE key='backfill_complete'")
         server._conn.execute(f"UPDATE activity_sync_state SET value='{now}' WHERE key='last_sync_at'")
     resp = await server._dispatch({"method": "get_my_recent_activity", "dialog_kinds": ["all"]})
-    assert resp["data"]["comments"][0]["dialog_name"] == "999"
+    assert (
+        cast(dict[str, object], cast(list[dict[str, object]], _activity_data(resp)["comments"])[0])["dialog_name"]
+        == "999"
+    )
 
 
 @pytest.mark.asyncio
@@ -5132,17 +5254,19 @@ async def test_get_my_recent_activity_default_filters_dms_before_limit() -> None
         server._conn.execute(f"UPDATE activity_sync_state SET value='{now}' WHERE key='last_sync_at'")
 
     resp = await server._dispatch({"method": "get_my_recent_activity", "since_hours": 1, "limit": 1})
-    assert resp["data"]["dialog_kinds"] == ["group", "forum"]
-    assert [(c["dialog_id"], c["dialog_category"], c["text"]) for c in resp["data"]["comments"]] == [
-        (-1001, "group", "group-older")
-    ]
+    assert _activity_data(resp)["dialog_kinds"] == ["group", "forum"]
+    assert [
+        (c["dialog_id"], c["dialog_category"], c["text"])
+        for c in cast(list[dict[str, object]], _activity_data(resp)["comments"])
+    ] == [(-1001, "group", "group-older")]
 
     dm_resp = await server._dispatch(
         {"method": "get_my_recent_activity", "since_hours": 1, "limit": 1, "dialog_kinds": ["user"]}
     )
-    assert [(c["dialog_id"], c["dialog_category"], c["text"]) for c in dm_resp["data"]["comments"]] == [
-        (42, "user", "dm-recent")
-    ]
+    assert [
+        (c["dialog_id"], c["dialog_category"], c["text"])
+        for c in cast(list[dict[str, object]], _activity_data(dm_resp)["comments"])
+    ] == [(42, "user", "dm-recent")]
 
 
 @pytest.mark.asyncio
@@ -5170,9 +5294,10 @@ async def test_get_my_recent_activity_forum_kind_uses_topic_metadata() -> None:
         server._conn.execute(f"UPDATE activity_sync_state SET value='{now}' WHERE key='last_sync_at'")
 
     resp = await server._dispatch({"method": "get_my_recent_activity", "since_hours": 1, "dialog_kinds": ["forum"]})
-    assert [(c["dialog_id"], c["dialog_category"], c["text"]) for c in resp["data"]["comments"]] == [
-        (-1002, "forum", "forum-message")
-    ]
+    assert [
+        (c["dialog_id"], c["dialog_category"], c["text"])
+        for c in cast(list[dict[str, object]], _activity_data(resp)["comments"])
+    ] == [(-1002, "forum", "forum-message")]
 
 
 @pytest.mark.asyncio
@@ -5182,7 +5307,7 @@ async def test_get_my_recent_activity_rejects_invalid_dialog_kinds() -> None:
     resp = await server._dispatch({"method": "get_my_recent_activity", "dialog_kinds": ["spaceship"]})
     assert resp["ok"] is False
     assert resp["error"] == "invalid_dialog_kinds"
-    assert "dialog_kinds entries" in resp["message"]
+    assert "dialog_kinds entries" in cast(str, resp["message"])
 
 
 @pytest.mark.asyncio
@@ -5192,7 +5317,7 @@ async def test_get_my_recent_activity_clamps_since_hours() -> None:
     # Request wildly out-of-range since_hours — must not crash or error out
     resp = await server._dispatch({"method": "get_my_recent_activity", "since_hours": 999_999})
     assert resp["ok"] is True
-    assert resp["data"]["scan_status"] == "never_run"
+    assert _activity_data(resp)["scan_status"] == "never_run"
 
 
 @pytest.mark.asyncio
@@ -5243,7 +5368,7 @@ async def test_get_my_recent_activity_filters_incoming_messages() -> None:
         server._conn.execute("UPDATE activity_sync_state SET value='1' WHERE key='backfill_complete'")
         server._conn.execute(f"UPDATE activity_sync_state SET value='{now}' WHERE key='last_sync_at'")
     resp = await server._dispatch({"method": "get_my_recent_activity", "dialog_kinds": ["all"]})
-    texts = sorted(c["text"] for c in resp["data"]["comments"])
+    texts = sorted(cast(str, c["text"]) for c in cast(list[dict[str, object]], _activity_data(resp)["comments"]))
     assert texts == ["mine"], (
         f"Expected exactly the (out=1, is_service=0, is_deleted=0) row 'mine'; "
         f"got {texts}. Did the SQL predicate omit is_service/is_deleted filters?"
@@ -5319,7 +5444,7 @@ async def test_resolve_dialog_name_dialogs_snapshot_exact_match() -> None:
     conn = _make_db_with_dialogs()
     _seed_dialog_row(conn, 12345, name="Project Foo", type_="user")
 
-    client = MagicMock()
+    client = _TestClient()
     client.get_entity = AsyncMock(side_effect=ValueError("force fallthrough from step 1"))
     client.iter_dialogs = MagicMock(side_effect=AssertionError("step 2.5 must hit; iter_dialogs forbidden"))
 
@@ -5327,7 +5452,7 @@ async def test_resolve_dialog_name_dialogs_snapshot_exact_match() -> None:
     result = await server._resolve_dialog_name("Project Foo")
 
     assert result == 12345
-    client.iter_dialogs.assert_not_called()
+    cast(MagicMock, client.iter_dialogs).assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -5336,7 +5461,7 @@ async def test_resolve_dialog_name_dialogs_snapshot_substring() -> None:
     conn = _make_db_with_dialogs()
     _seed_dialog_row(conn, 777, name="Acme Corp Discussion", type_="supergroup")
 
-    client = MagicMock()
+    client = _TestClient()
     client.get_entity = AsyncMock(side_effect=ValueError(""))
     client.iter_dialogs = MagicMock(side_effect=AssertionError("forbidden"))
 
@@ -5344,7 +5469,7 @@ async def test_resolve_dialog_name_dialogs_snapshot_substring() -> None:
     result = await server._resolve_dialog_name("acme corp")
 
     assert result == 777
-    client.iter_dialogs.assert_not_called()
+    cast(MagicMock, client.iter_dialogs).assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -5360,10 +5485,10 @@ async def test_resolve_dialog_name_dialogs_snapshot_skips_hidden() -> None:
     fake_dialog.name = "Old Group"
     fake_dialog.entity = fake_entity
 
-    client = MagicMock()
+    client = _TestClient()
     client.get_entity = AsyncMock(side_effect=ValueError(""))
 
-    async def fake_iter(*args: Any, **kwargs: Any):  # type: ignore[misc]
+    async def fake_iter(*args: object, **kwargs: object):  # type: ignore[misc]
         yield fake_dialog
 
     client.iter_dialogs = MagicMock(return_value=fake_iter())
@@ -5373,7 +5498,7 @@ async def test_resolve_dialog_name_dialogs_snapshot_skips_hidden() -> None:
 
     # Came from iter_dialogs — proves step 2.5 correctly skipped hidden=1
     assert result == 999
-    client.iter_dialogs.assert_called_once()
+    cast(MagicMock, client.iter_dialogs).assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -5387,7 +5512,7 @@ async def test_resolve_dialog_name_entities_wins_over_dialogs() -> None:
     conn.commit()
     _seed_dialog_row(conn, 222, name="Same Name", type_="user")
 
-    client = MagicMock()
+    client = _TestClient()
     client.get_entity = AsyncMock(side_effect=ValueError(""))
     client.iter_dialogs = MagicMock(side_effect=AssertionError("forbidden"))
 
@@ -5395,7 +5520,7 @@ async def test_resolve_dialog_name_entities_wins_over_dialogs() -> None:
     result = await server._resolve_dialog_name("Same Name")
 
     assert result == 111  # entities (step 2) wins over dialogs (step 2.5)
-    client.iter_dialogs.assert_not_called()
+    cast(MagicMock, client.iter_dialogs).assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -5411,10 +5536,10 @@ async def test_resolve_dialog_name_falls_through_to_iter_dialogs_when_miss() -> 
     fake_dialog.name = "Brand New Chat"
     fake_dialog.entity = fake_entity
 
-    client = MagicMock()
+    client = _TestClient()
     client.get_entity = AsyncMock(side_effect=ValueError(""))
 
-    async def fake_iter(*args: Any, **kwargs: Any):  # type: ignore[misc]
+    async def fake_iter(*args: object, **kwargs: object):  # type: ignore[misc]
         yield fake_dialog
 
     client.iter_dialogs = MagicMock(return_value=fake_iter())
@@ -5424,7 +5549,7 @@ async def test_resolve_dialog_name_falls_through_to_iter_dialogs_when_miss() -> 
 
     # Came from iter_dialogs — step 3 fallback is still functional
     assert result == 42
-    client.iter_dialogs.assert_called_once()
+    cast(MagicMock, client.iter_dialogs).assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -5433,7 +5558,7 @@ async def test_resolve_dialog_name_dialogs_snapshot_case_insensitive() -> None:
     conn = _make_db_with_dialogs()
     _seed_dialog_row(conn, 555, name="Project Foo", type_="user")
 
-    client = MagicMock()
+    client = _TestClient()
     client.get_entity = AsyncMock(side_effect=ValueError(""))
     client.iter_dialogs = MagicMock(side_effect=AssertionError("forbidden"))
 
@@ -5441,7 +5566,7 @@ async def test_resolve_dialog_name_dialogs_snapshot_case_insensitive() -> None:
     result = await server._resolve_dialog_name("PROJECT FOO")
 
     assert result == 555
-    client.iter_dialogs.assert_not_called()
+    cast(MagicMock, client.iter_dialogs).assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -5722,20 +5847,26 @@ def test_linked_group_enrolled_in_activity_dialog_state() -> None:
     enroll_activity_dialog(conn, _LINKED_CHAT_ID, source="linked_chat")
 
     # activity_dialog_state row must exist
-    row = conn.execute(
-        "SELECT source FROM activity_dialog_state WHERE dialog_id = ?",
-        (_LINKED_CHAT_ID,),
-    ).fetchone()
+    row = cast(
+        tuple[object, ...] | None,
+        conn.execute(
+            "SELECT source FROM activity_dialog_state WHERE dialog_id = ?",
+            (_LINKED_CHAT_ID,),
+        ).fetchone(),
+    )
     assert row is not None, "linked group not in activity_dialog_state"
-    assert row[0] == "linked_chat"
+    assert cast(tuple[object, ...], row)[0] == "linked_chat"
 
     # synced_dialogs must have own_only status (net-new enrollment)
-    sd_row = conn.execute(
-        "SELECT status FROM synced_dialogs WHERE dialog_id = ?",
-        (_LINKED_CHAT_ID,),
-    ).fetchone()
+    sd_row = cast(
+        tuple[object, ...] | None,
+        conn.execute(
+            "SELECT status FROM synced_dialogs WHERE dialog_id = ?",
+            (_LINKED_CHAT_ID,),
+        ).fetchone(),
+    )
     assert sd_row is not None, "linked group not in synced_dialogs"
-    assert sd_row[0] == "own_only"
+    assert cast(tuple[object, ...], sd_row)[0] == "own_only"
 
     # Non-downgrade guard: re-enrolling a peer already 'synced' must NOT
     # demote it to 'own_only' (coverage must never shrink).
@@ -5745,11 +5876,15 @@ def test_linked_group_enrolled_in_activity_dialog_state() -> None:
     )
     conn.commit()
     enroll_activity_dialog(conn, _LINKED_CHAT_ID, source="linked_chat")
-    sd_row2 = conn.execute(
-        "SELECT status FROM synced_dialogs WHERE dialog_id = ?",
-        (_LINKED_CHAT_ID,),
-    ).fetchone()
-    assert sd_row2[0] == "synced", "enrollment must not downgrade a synced dialog"
+    sd_row2 = cast(
+        tuple[object, ...] | None,
+        conn.execute(
+            "SELECT status FROM synced_dialogs WHERE dialog_id = ?",
+            (_LINKED_CHAT_ID,),
+        ).fetchone(),
+    )
+    assert sd_row2 is not None
+    assert cast(tuple[object, ...], sd_row2)[0] == "synced", "enrollment must not downgrade a synced dialog"
 
 
 # -------- (b) Candidate set expansion --------
@@ -5822,8 +5957,8 @@ def test_trace_query_returns_messages_under_linked_chat_id() -> None:
         )
     )
 
-    rows = conn.execute(sql, params).fetchall()
-    message_ids = [int(r["message_id"]) for r in rows]
+    rows = cast(list[dict[str, object]], conn.execute(sql, params).fetchall())
+    message_ids = [cast(int, r["message_id"]) for r in rows]
     assert 42 in message_ids, (
         f"own-message stored under linked_chat_id not returned by channel-scoped trace; rows={message_ids}"
     )
@@ -5899,8 +6034,8 @@ def test_trace_query_authorship_predicate_unchanged() -> None:
         )
     )
 
-    rows = conn.execute(sql, params).fetchall()
-    returned_ids = {int(r["message_id"]) for r in rows}
+    rows = cast(list[dict[str, object]], conn.execute(sql, params).fetchall())
+    returned_ids = {cast(int, r["message_id"]) for r in rows}
 
     # Own message (sender_id == _TARGET_USER_ID) must be present.
     assert 10 in returned_ids, "own message missing from result"
@@ -5969,8 +6104,8 @@ def test_trace_navigation_token_carries_scope_dialog_ids() -> None:
     )
 
     assert "IN (" in sql, "second-page query does not use IN(...) from token-carried scope"
-    rows = conn.execute(sql, params).fetchall()
-    assert any(int(r["message_id"]) == 43 for r in rows), (
+    rows = cast(list[dict[str, object]], conn.execute(sql, params).fetchall())
+    assert any(cast(int, r["message_id"]) == 43 for r in rows), (
         "second-page query misses linked-chat message — scope not restored from token"
     )
 
