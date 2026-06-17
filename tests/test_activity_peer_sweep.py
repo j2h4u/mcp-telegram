@@ -29,12 +29,14 @@ import pytest
 from mcp_telegram.activity_peer_resolve import LinkedChatResolution
 from mcp_telegram.activity_peer_sweep import (
     _DIALOG_STATE_COLUMNS,
+    PeerSweepRequest,
     SkipReason,
     SweepResult,
     _load_dialog_state,
     _save_dialog_state,
     build_working_set,
     enroll_activity_dialog,
+    sweep_peer_once,
 )
 from mcp_telegram.sync_db import _apply_migrations
 
@@ -119,6 +121,17 @@ class _FakeResolver:
         self.call_count += 1
         self.called_with.append(channel_id)
         return self._mapping.get(channel_id, LinkedChatResolution(linked_chat_id=None, flood_wait_seconds=None))
+
+
+class _FakeSweepMessage:
+    def __init__(self, msg_id: int, peer_id: object | None) -> None:
+        self.id = msg_id
+        self.peer_id = peer_id
+
+
+class _FakeSweepResult:
+    def __init__(self, messages: object) -> None:
+        self.messages = messages
 
 
 # ---------------------------------------------------------------------------
@@ -309,6 +322,220 @@ def test_build_working_set_floodwait_halts_pass(monkeypatch: pytest.MonkeyPatch)
         )
         assert row is not None
         assert row[0] is None, f"flood_channel linked_chat_resolved_at must stay NULL after FloodWait, got {row[0]!r}"
+
+
+# ---------------------------------------------------------------------------
+# sweep_peer_once: exit-path coverage and persistence gating
+# ---------------------------------------------------------------------------
+
+
+def test_sweep_peer_once_resolve_none_returns_access_skip(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A missing peer resolution returns ACCESS_SKIP and never calls SearchRequest."""
+    with closing(_make_db()) as conn:
+        calls: list[object] = []
+
+        async def fake_resolve_input_peer(client: object, dialog_id: int) -> object | None:
+            del client, dialog_id
+            return None
+
+        async def fake_call_with_timeout(client: object, request: object) -> object:
+            del client, request
+            calls.append(object())
+            raise AssertionError("call_with_timeout must not be called when resolve_input_peer returns None")
+
+        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.resolve_input_peer", fake_resolve_input_peer)
+        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.call_with_timeout", fake_call_with_timeout)
+
+        result = asyncio.run(
+            sweep_peer_once(
+                PeerSweepRequest(client=_FakeClient(), conn=conn, dialog_id=123, offset_id=7, min_id=3, limit=25)
+            )
+        )
+
+        assert calls == []
+        assert result == SweepResult(
+            fetched_ids=[],
+            persisted=0,
+            min_id=None,
+            max_id=None,
+            skip_reason=SkipReason.ACCESS_SKIP,
+        )
+
+
+def test_sweep_peer_once_floodwait_reports_seconds(monkeypatch: pytest.MonkeyPatch) -> None:
+    """FloodWait becomes a non-sleeping FLOOD_WAIT result with seconds preserved."""
+    from telethon.errors import FloodWaitError
+    from telethon.tl.functions.messages import SearchRequest
+
+    with closing(_make_db()) as conn:
+        captured: dict[str, object] = {}
+
+        async def fake_resolve_input_peer(client: object, dialog_id: int) -> object:
+            del client, dialog_id
+            return object()
+
+        async def fake_call_with_timeout(client: object, request: object) -> object:
+            del client
+            captured["request"] = request
+            raise FloodWaitError(request=None, capture=37)
+
+        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.resolve_input_peer", fake_resolve_input_peer)
+        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.call_with_timeout", fake_call_with_timeout)
+
+        result = asyncio.run(
+            sweep_peer_once(
+                client=_FakeClient(),
+                conn=conn,
+                dialog_id=456,
+                offset_id=11,
+                min_id=5,
+                limit=50,
+            )
+        )
+
+        assert "request" in captured
+        request = cast(SearchRequest, captured["request"])
+        assert request.offset_id == 11
+        assert request.min_id == 5
+        assert request.limit == 50
+        assert result == SweepResult(
+            fetched_ids=[],
+            persisted=0,
+            min_id=None,
+            max_id=None,
+            skip_reason=SkipReason.FLOOD_WAIT,
+            flood_wait_seconds=37,
+        )
+
+
+def test_sweep_peer_once_timeout_returns_access_skip(monkeypatch: pytest.MonkeyPatch) -> None:
+    """TimeoutError is treated as ACCESS_SKIP, not history-floor completion."""
+    with closing(_make_db()) as conn:
+        called = False
+
+        async def fake_resolve_input_peer(client: object, dialog_id: int) -> object:
+            del client, dialog_id
+            return object()
+
+        async def fake_call_with_timeout(client: object, request: object) -> object:
+            nonlocal called
+            del client, request
+            called = True
+            raise TimeoutError
+
+        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.resolve_input_peer", fake_resolve_input_peer)
+        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.call_with_timeout", fake_call_with_timeout)
+
+        result = asyncio.run(
+            sweep_peer_once(
+                client=_FakeClient(),
+                conn=conn,
+                dialog_id=789,
+                offset_id=4,
+                min_id=2,
+                limit=10,
+            )
+        )
+
+        assert called is True
+        assert result == SweepResult(
+            fetched_ids=[],
+            persisted=0,
+            min_id=None,
+            max_id=None,
+            skip_reason=SkipReason.ACCESS_SKIP,
+        )
+
+
+def test_sweep_peer_once_empty_batch_is_history_floor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A reachable peer with no messages returns HISTORY_FLOOR."""
+    with closing(_make_db()) as conn:
+
+        async def fake_resolve_input_peer(client: object, dialog_id: int) -> object:
+            del client, dialog_id
+            return object()
+
+        async def fake_call_with_timeout(client: object, request: object) -> _FakeSweepResult:
+            del client, request
+            return _FakeSweepResult(messages=[])
+
+        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.resolve_input_peer", fake_resolve_input_peer)
+        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.call_with_timeout", fake_call_with_timeout)
+
+        result = asyncio.run(
+            sweep_peer_once(
+                client=_FakeClient(),
+                conn=conn,
+                dialog_id=111,
+                offset_id=9,
+                min_id=1,
+                limit=20,
+            )
+        )
+
+        assert result == SweepResult(
+            fetched_ids=[],
+            persisted=0,
+            min_id=None,
+            max_id=None,
+            skip_reason=SkipReason.HISTORY_FLOOR,
+        )
+
+
+def test_sweep_peer_once_persists_only_extractable_messages(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only messages with a resolvable dialog_id are extracted and persisted."""
+    with closing(_make_db()) as conn:
+        inserted: list[list[tuple[int, str]]] = []
+
+        async def fake_resolve_input_peer(client: object, dialog_id: int) -> object:
+            del client, dialog_id
+            return object()
+
+        async def fake_call_with_timeout(client: object, request: object) -> _FakeSweepResult:
+            del client, request
+            return _FakeSweepResult(
+                messages=[
+                    _FakeSweepMessage(8, peer_id="keep"),
+                    _FakeSweepMessage(3, peer_id="drop"),
+                    _FakeSweepMessage(5, peer_id="keep"),
+                ]
+            )
+
+        def fake_extract_dialog_id(message: _FakeSweepMessage) -> int | None:
+            return 101 if message.peer_id == "keep" else None
+
+        def fake_extract_message_row(dialog_id: int, message: _FakeSweepMessage) -> tuple[int, str]:
+            return (dialog_id, f"msg-{message.id}")
+
+        def fake_insert_messages_with_fts(conn: sqlite3.Connection, rows: list[tuple[int, str]]) -> None:
+            del conn
+            inserted.append(rows)
+
+        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.resolve_input_peer", fake_resolve_input_peer)
+        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.call_with_timeout", fake_call_with_timeout)
+        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.extract_dialog_id", fake_extract_dialog_id)
+        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.extract_message_row", fake_extract_message_row)
+        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.insert_messages_with_fts", fake_insert_messages_with_fts)
+
+        result = asyncio.run(
+            sweep_peer_once(
+                client=_FakeClient(),
+                conn=conn,
+                dialog_id=222,
+                offset_id=13,
+                min_id=6,
+                limit=30,
+            )
+        )
+
+        assert inserted == [[(101, "msg-8"), (101, "msg-5")]]
+        assert result == SweepResult(
+            fetched_ids=[8, 3, 5],
+            persisted=2,
+            min_id=3,
+            max_id=8,
+            skip_reason=SkipReason.NONE,
+        )
 
 
 # ---------------------------------------------------------------------------
