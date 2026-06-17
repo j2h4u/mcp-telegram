@@ -21,9 +21,10 @@ import asyncio
 import logging
 import sqlite3
 import time
+from collections.abc import AsyncIterator, Iterator, Sequence
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
-from typing import Any
+from typing import Protocol, TypedDict, TypeVar, cast
 
 from telethon import utils as tl_utils  # type: ignore[import-untyped]
 from telethon.errors import (  # type: ignore[import-untyped]
@@ -47,6 +48,7 @@ from .resolver import latinize
 
 logger = logging.getLogger(__name__)
 _BATCH_SIZE = 100
+T = TypeVar("T")
 
 
 # ---------------------------------------------------------------------------
@@ -111,6 +113,132 @@ class ForwardRecord:
     fwd_from_name: str | None
     fwd_date: int | None
     fwd_channel_post: int | None
+
+
+class _PeerLike(Protocol):
+    channel_id: int | None
+    chat_id: int | None
+    user_id: int | None
+
+
+class _ReactionKindLike(Protocol):
+    emoticon: str | None
+
+
+class _ReactionItemLike(Protocol):
+    reaction: _ReactionKindLike | None
+    count: int
+
+
+class _ReactionsLike(Protocol):
+    results: Sequence[_ReactionItemLike]
+
+
+class _ReplyToLike(Protocol):
+    reply_to_msg_id: int | None
+    forum_topic: bool
+    reply_to_reply_top_id: int | None
+
+
+class _RepliesLike(Protocol):
+    replies: int | None
+
+
+class _ForwardLike(Protocol):
+    from_name: str | None
+    from_id: _PeerLike | None
+    date: datetime | None
+    channel_post: int | None
+
+
+class _EntityLike(Protocol):
+    id: int
+    title: str | None
+    first_name: str | None
+    last_name: str | None
+    username: str | None
+    access_hash: int | None
+    bot: bool
+    broadcast: bool
+    participants_count: int | None
+    date: datetime | None
+    forum: bool
+
+
+class _DraftLike(Protocol):
+    message: str | None
+
+
+class _MessageLike(Protocol):
+    id: int
+    date: datetime | None
+    message: str | None
+    sender_id: int | None
+    sender: _EntityLike | None
+    edit_date: datetime | None
+    grouped_id: int | None
+    reply_to: _ReplyToLike | None
+    out: bool
+    post_author: str | None
+    replies: _RepliesLike | None
+    reactions: _ReactionsLike | None
+    entities: Sequence[object] | None
+    fwd_from: _ForwardLike | None
+
+
+class _DialogLike(Protocol):
+    id: int
+    entity: _EntityLike
+    message: _MessageLike | None
+    unread_mentions_count: int | None
+    unread_reactions_count: int | None
+    draft: _DraftLike | None
+    date: datetime | None
+    pinned: bool
+    folder_id: int | None
+
+
+class _ForumTopicLike(Protocol):
+    id: int
+    title: str | None
+    is_general: bool
+    icon_emoji_id: int | None
+    date: datetime | None
+
+
+class _ForumTopicsResultLike(Protocol):
+    topics: Sequence[_ForumTopicLike]
+
+
+class _MessagesPageLike(Protocol):
+    total: int
+
+    def __iter__(self) -> Iterator[_MessageLike]: ...
+
+
+class _SyncWorkerClient(Protocol):
+    def iter_dialogs(self, **kwargs: object) -> AsyncIterator[_DialogLike]: ...
+
+    async def get_messages(self, **kwargs: object) -> _MessagesPageLike: ...
+
+    async def get_entity(self, peer: object) -> _EntityLike: ...
+
+    async def __call__(self, request: object) -> _ForumTopicsResultLike: ...
+
+
+class _DialogRow(TypedDict):
+    dialog_id: int
+    name: str | None
+    type: str
+    archived: int
+    pinned: int
+    members: int | None
+    created: int | None
+    last_message_at: int | None
+    snapshot_at: int
+    unread_mentions_count: int
+    unread_reactions_count: int
+    draft_text: str | None
 
 
 @dataclass
@@ -246,7 +374,11 @@ UPSERT_ENTITY_SQL = (
 # ---------------------------------------------------------------------------
 
 
-def extract_reply_and_topic(msg: Any) -> tuple[int | None, int | None]:
+def _attr[T](obj: object, name: str, default: T) -> T:
+    return cast(T, getattr(obj, name, default))
+
+
+def extract_reply_and_topic(msg: object) -> tuple[int | None, int | None]:
     """Extract reply_to_msg_id and forum_topic_id from a Telethon message.
 
     Shared between extract_message_row (sync path) and _msg_to_dict (API path)
@@ -254,44 +386,48 @@ def extract_reply_and_topic(msg: Any) -> tuple[int | None, int | None]:
 
     Returns (reply_to_msg_id, forum_topic_id).
     """
-    reply_to = getattr(msg, "reply_to", None)
+    reply_to = _attr(msg, "reply_to", None)
     if reply_to is None:
         return None, None
-    raw_reply_msg_id = getattr(reply_to, "reply_to_msg_id", None)
+    raw_reply_msg_id = _attr(reply_to, "reply_to_msg_id", None)
     reply_to_msg_id = int(raw_reply_msg_id) if raw_reply_msg_id is not None else None
     forum_topic_id: int | None = None
-    if getattr(reply_to, "forum_topic", False):
-        reply_top_id = getattr(reply_to, "reply_to_reply_top_id", None)
+    if _attr(reply_to, "forum_topic", False):
+        reply_top_id = _attr(reply_to, "reply_to_reply_top_id", None)
         forum_topic_id = int(reply_top_id) if reply_top_id is not None else 1
     return reply_to_msg_id, forum_topic_id
 
 
-def extract_reply_count(msg: Any) -> int:
+def extract_reply_count(msg: object) -> int:
     """Extract Telegram's aggregate reply/comment count from a message."""
-    replies = getattr(msg, "replies", None)
+    replies = _attr(msg, "replies", None)
     if replies is None:
         return 0
-    raw_count = getattr(replies, "replies", None)
+    raw_count = _attr(replies, "replies", None)
     if isinstance(raw_count, int) and not isinstance(raw_count, bool):
         return max(0, raw_count)
     return 0
 
 
-def extract_reactions_rows(dialog_id: int, message_id: int, reactions: Any | None) -> list[ReactionRecord]:
+def extract_reactions_rows(
+    dialog_id: int,
+    message_id: int,
+    reactions: _ReactionsLike | None,
+) -> list[ReactionRecord]:
     """Extract reaction rows from a Telethon MessageReactions object.
 
     Returns empty list if reactions is None or has no results.
     """
     if reactions is None:
         return []
-    results = getattr(reactions, "results", None)
+    results = reactions.results
     if not results:
         return []
     rows: list[ReactionRecord] = []
     for item in results:
-        reaction = getattr(item, "reaction", None)
-        emoticon = getattr(reaction, "emoticon", None) if reaction is not None else None
-        count = getattr(item, "count", 0)
+        reaction = item.reaction
+        emoticon = reaction.emoticon if reaction is not None else None
+        count = item.count
         if emoticon is not None:
             rows.append(
                 ReactionRecord(
@@ -358,7 +494,7 @@ def _utf16_slice(text: str, offset: int, length: int) -> str | None:
         return None
 
 
-def _analytics_entity_type(entity: Any) -> str | None:
+def _analytics_entity_type(entity: object) -> str | None:
     """Return the analytics entity type name for a Telethon entity."""
     for cls, type_name in _ANALYTICS_ENTITY_TYPES.items():
         if isinstance(entity, cls):
@@ -367,7 +503,7 @@ def _analytics_entity_type(entity: Any) -> str | None:
 
 
 def _extract_entity_value(
-    entity_type: str, text: str, entity: Any, offset: int, length: int
+    entity_type: str, text: str, entity: object, offset: int, length: int
 ) -> tuple[bool, str | None]:
     """Return (should_keep_row, value) for an analytics entity."""
     if entity_type in {"mention", "hashtag", "url"}:
@@ -376,13 +512,13 @@ def _extract_entity_value(
         value = _utf16_slice(text, offset, length)
         return value is not None, value
     if entity_type == "mention_name":
-        return True, str(getattr(entity, "user_id", ""))
+        return True, str(_attr(entity, "user_id", ""))
     if entity_type == "text_url":
-        return True, getattr(entity, "url", None)
+        return True, _attr(entity, "url", None)
     return False, None
 
 
-def extract_entity_rows(dialog_id: int, message_id: int, msg: Any) -> list[EntityRecord]:
+def extract_entity_rows(dialog_id: int, message_id: int, msg: object) -> list[EntityRecord]:
     """Extract analytics-valuable entity rows from a Telethon message.
 
     Captures: mention, mention_name, hashtag, url, text_url.
@@ -405,20 +541,20 @@ def extract_entity_rows(dialog_id: int, message_id: int, msg: Any) -> list[Entit
     Uses _utf16_slice for correct Unicode handling. Skips entity on decode
     error (Priority Action #4) -- does NOT fallback to naive slicing.
     """
-    entities = getattr(msg, "entities", None)
+    entities: Sequence[object] | None = _attr(msg, "entities", None)
     if not entities:
         return []
     _init_entity_types()
     if not _ANALYTICS_ENTITY_TYPES:
         return []  # Telethon not available (test env)
-    text = getattr(msg, "message", "") or ""
+    text = _attr(msg, "message", "") or ""
     rows: list[EntityRecord] = []
     for entity in entities:
         entity_type = _analytics_entity_type(entity)
         if entity_type is None:
             continue
-        offset = getattr(entity, "offset", 0)
-        length = getattr(entity, "length", 0)
+        offset = _attr(entity, "offset", 0)
+        length = _attr(entity, "length", 0)
         should_keep_row, value = _extract_entity_value(entity_type, text, entity, offset, length)
         if not should_keep_row:
             continue
@@ -435,7 +571,7 @@ def extract_entity_rows(dialog_id: int, message_id: int, msg: Any) -> list[Entit
     return rows
 
 
-def _marked_peer_id(from_id: Any) -> int | None:
+def _marked_peer_id(from_id: object) -> int | None:
     """Marked id from a Telethon Peer (PeerUser/PeerChannel/PeerChat).
 
     Returns the *marked* id (e.g. -1001579759981 for a channel, -id for a legacy
@@ -448,19 +584,19 @@ def _marked_peer_id(from_id: Any) -> int | None:
     the original Peer object, not this int (see _resolve_peer_name): get_entity
     treats a bare int as a user_id regardless of sign-stripping.
     """
-    channel_id = getattr(from_id, "channel_id", None)
+    channel_id = _attr(from_id, "channel_id", None)
     if channel_id is not None:
         return -1000000000000 - int(channel_id)
-    chat_id = getattr(from_id, "chat_id", None)
+    chat_id = _attr(from_id, "chat_id", None)
     if chat_id is not None:
         return -int(chat_id)
-    user_id = getattr(from_id, "user_id", None)
+    user_id = _attr(from_id, "user_id", None)
     if user_id is not None:
         return int(user_id)
     return None
 
 
-async def _resolve_peer_name(client: Any, peer: Any) -> str | None:
+async def _resolve_peer_name(client: _SyncWorkerClient, peer: _PeerLike) -> str | None:
     """Return display name for a Telegram peer.
 
     `peer` must be a Telethon Peer (PeerUser/PeerChannel/PeerChat), NOT a bare
@@ -475,8 +611,9 @@ async def _resolve_peer_name(client: Any, peer: Any) -> str | None:
     log_id = tl_utils.get_peer_id(peer)
     try:
         entity = await client.get_entity(peer)
-        name = getattr(entity, "title", None) or getattr(entity, "first_name", None) or ""
-        last = getattr(entity, "last_name", None)
+        title = _attr(entity, "title", None)
+        name = title or _attr(entity, "first_name", None) or ""
+        last = _attr(entity, "last_name", None)
         if last:
             name = f"{name} {last}".strip()
         return name or None
@@ -509,16 +646,16 @@ async def _resolve_peer_name(client: Any, peer: Any) -> str | None:
         return None
 
 
-async def _build_fwd_entity_map(msg: Any, client: Any) -> dict[int, str]:
+async def _build_fwd_entity_map(msg: _MessageLike, client: _SyncWorkerClient) -> dict[int, str]:
     """Return {peer_id: name} for the forward source of a single message.
 
     Returns an empty dict when the message is not a forward, already has
     fwd_from.from_name, or the peer cannot be resolved.
     """
-    fwd = getattr(msg, "fwd_from", None)
-    if not fwd or getattr(fwd, "from_name", None) is not None:
+    fwd = _attr(msg, "fwd_from", None)
+    if not fwd or fwd.from_name is not None:
         return {}
-    from_id = getattr(fwd, "from_id", None)
+    from_id = fwd.from_id
     if from_id is None:
         return {}
     peer_id = _marked_peer_id(from_id)
@@ -529,38 +666,38 @@ async def _build_fwd_entity_map(msg: Any, client: Any) -> dict[int, str]:
     return {peer_id: name} if name else {}
 
 
-def _extract_sent_at(msg: Any) -> int:
-    date = getattr(msg, "date", None)
+def _extract_sent_at(msg: object) -> int:
+    date = _attr(msg, "date", None)
     return int(date.timestamp()) if isinstance(date, datetime) else 0
 
 
-def _extract_sender_first_name(msg: Any) -> str | None:
-    sender = getattr(msg, "sender", None)
-    return getattr(sender, "first_name", None) if sender is not None else None
+def _extract_sender_first_name(msg: object) -> str | None:
+    sender = _attr(msg, "sender", None)
+    return sender.first_name if sender is not None else None
 
 
-def _extract_media_description(msg: Any) -> str | None:
-    media = getattr(msg, "media", None)
+def _extract_media_description(msg: object) -> str | None:
+    media = _attr(msg, "media", None)
     return type(media).__name__ if media is not None else None
 
 
-def _extract_edit_date(msg: Any) -> int | None:
-    edit_date_raw = getattr(msg, "edit_date", None)
+def _extract_edit_date(msg: object) -> int | None:
+    edit_date_raw = _attr(msg, "edit_date", None)
     return int(edit_date_raw.timestamp()) if edit_date_raw is not None else None
 
 
-def _extract_grouped_id(msg: Any) -> int | None:
-    grouped_id_raw = getattr(msg, "grouped_id", None)
+def _extract_grouped_id(msg: object) -> int | None:
+    grouped_id_raw = _attr(msg, "grouped_id", None)
     return int(grouped_id_raw) if grouped_id_raw is not None else None
 
 
-def _extract_reply_to_peer_id(msg: Any) -> int | None:
-    reply_to = getattr(msg, "reply_to", None)
-    reply_to_peer_raw = getattr(reply_to, "reply_to_peer_id", None) if reply_to is not None else None
+def _extract_reply_to_peer_id(msg: object) -> int | None:
+    reply_to = _attr(msg, "reply_to", None)
+    reply_to_peer_raw = _attr(reply_to, "reply_to_peer_id", None) if reply_to is not None else None
     if reply_to_peer_raw is None:
         return None
     for attr in ("user_id", "channel_id", "chat_id"):
-        pid = getattr(reply_to_peer_raw, attr, None)
+        pid = _attr(reply_to_peer_raw, attr, None)
         if pid is not None:
             return int(pid)
     return None
@@ -569,7 +706,7 @@ def _extract_reply_to_peer_id(msg: Any) -> int | None:
 def extract_fwd_row(
     dialog_id: int,
     message_id: int,
-    msg: Any,
+    msg: object,
     entity_name_map: dict[int, str] | None = None,
 ) -> ForwardRecord | None:
     """Extract forward metadata from a Telethon message.
@@ -580,22 +717,22 @@ def extract_fwd_row(
 
     Returns ForwardRecord or None if not a forward.
     """
-    fwd = getattr(msg, "fwd_from", None)
+    fwd = _attr(msg, "fwd_from", None)
     if fwd is None:
         return None
-    from_id = getattr(fwd, "from_id", None)
+    from_id = _attr(fwd, "from_id", None)
     fwd_from_peer_id = _marked_peer_id(from_id) if from_id is not None else None
-    fwd_from_name = getattr(fwd, "from_name", None)
+    fwd_from_name = _attr(fwd, "from_name", None)
     if fwd_from_name is None and fwd_from_peer_id is not None and entity_name_map:
         fwd_from_name = entity_name_map.get(fwd_from_peer_id)
-    fwd_date_raw = getattr(fwd, "date", None)
+    fwd_date_raw = _attr(fwd, "date", None)
     fwd_date: int | None = None
     if fwd_date_raw is not None:
         try:
             fwd_date = int(fwd_date_raw.timestamp())
-        except AttributeError, OverflowError, TypeError, ValueError:
+        except (AttributeError, OverflowError, TypeError, ValueError):
             fwd_date = None
-    fwd_channel_post = getattr(fwd, "channel_post", None)
+    fwd_channel_post = _attr(fwd, "channel_post", None)
     if fwd_channel_post is not None:
         fwd_channel_post = int(fwd_channel_post)
     return ForwardRecord(
@@ -608,13 +745,17 @@ def extract_fwd_row(
     )
 
 
-def extract_message_row(dialog_id: int, msg: Any, entity_name_map: dict[int, str] | None = None) -> ExtractedMessage:
+def extract_message_row(
+    dialog_id: int,
+    msg: object,
+    entity_name_map: dict[int, str] | None = None,
+) -> ExtractedMessage:
     """Extract sync.db row bundle from a Telethon message object.
 
     Returns an ExtractedMessage with a typed StoredMessage plus typed satellite
     records for atomic multi-table insert.
     """
-    message_id = int(getattr(msg, "id", 0))
+    message_id = int(_attr(msg, "id", 0))
 
     reply_to_msg_id, forum_topic_id = extract_reply_and_topic(msg)
 
@@ -622,8 +763,8 @@ def extract_message_row(dialog_id: int, msg: Any, entity_name_map: dict[int, str
         dialog_id=dialog_id,
         message_id=message_id,
         sent_at=_extract_sent_at(msg),
-        text=getattr(msg, "message", None),
-        sender_id=getattr(msg, "sender_id", None),
+        text=_attr(msg, "message", None),
+        sender_id=_attr(msg, "sender_id", None),
         sender_first_name=_extract_sender_first_name(msg),
         media_description=_extract_media_description(msg),
         reply_to_msg_id=reply_to_msg_id,
@@ -631,12 +772,12 @@ def extract_message_row(dialog_id: int, msg: Any, entity_name_map: dict[int, str
         edit_date=_extract_edit_date(msg),
         grouped_id=_extract_grouped_id(msg),
         reply_to_peer_id=_extract_reply_to_peer_id(msg),
-        out=1 if getattr(msg, "out", False) else 0,
+        out=1 if _attr(msg, "out", False) else 0,
         is_service=1 if isinstance(msg, types.MessageService) else 0,
-        post_author=getattr(msg, "post_author", None),
+        post_author=_attr(msg, "post_author", None),
     )
     reply_count = extract_reply_count(msg)
-    reactions = extract_reactions_rows(dialog_id, message_id, getattr(msg, "reactions", None))
+    reactions = extract_reactions_rows(dialog_id, message_id, _attr(msg, "reactions", None))
     entities = extract_entity_rows(dialog_id, message_id, msg)
     forward = extract_fwd_row(dialog_id, message_id, msg, entity_name_map=entity_name_map)
 
@@ -670,11 +811,11 @@ class FullSyncWorker:
 
     def __init__(
         self,
-        client: Any,
+        client: object,
         conn: sqlite3.Connection,
         shutdown_event: asyncio.Event,
     ) -> None:
-        self._client = client
+        self._client = cast(_SyncWorkerClient, client)
         self._conn = conn
         self._shutdown_event = shutdown_event
 
@@ -775,7 +916,7 @@ class FullSyncWorker:
         Selects in rowid (insertion) order — no prioritization.
         Returns None when no dialogs have status in ('syncing', 'not_synced').
         """
-        row = self._conn.execute(_NEXT_PENDING_SQL).fetchone()
+        row = cast(tuple[int, int | None] | None, self._conn.execute(_NEXT_PENDING_SQL).fetchone())
         if row is None:
             return None
         return int(row[0]), int(row[1]) if row[1] is not None else 0
@@ -823,13 +964,13 @@ class FullSyncWorker:
             return sync_progress, False  # leave dialog in-progress for retry
         return await self._store_batch_page(dialog_id, sync_progress, total_messages, batch)
 
-    async def _resolve_batch_entity_name_map(self, batch: list[Any]) -> dict[int, str]:
+    async def _resolve_batch_entity_name_map(self, batch: Sequence[_MessageLike]) -> dict[int, str]:
         """Resolve forward source names for messages in a fetched batch."""
-        fwd_peers: dict[int, Any] = {}
+        fwd_peers: dict[int, _PeerLike] = {}
         for msg in batch:
-            fwd = getattr(msg, "fwd_from", None)
-            if fwd and getattr(fwd, "from_name", None) is None:
-                from_id = getattr(fwd, "from_id", None)
+            fwd = _attr(msg, "fwd_from", None)
+            if fwd and fwd.from_name is None:
+                from_id = fwd.from_id
                 if from_id is not None:
                     peer_id = _marked_peer_id(from_id)
                     if peer_id is not None:
@@ -846,7 +987,7 @@ class FullSyncWorker:
         dialog_id: int,
         sync_progress: int,
         total_messages: int,
-        batch: list[Any],
+        batch: Sequence[_MessageLike],
     ) -> tuple[int, bool]:
         """Persist one fetched batch and update sync progress."""
         if not batch:
@@ -866,7 +1007,7 @@ class FullSyncWorker:
         entity_name_map = await self._resolve_batch_entity_name_map(batch)
 
         rows = [extract_message_row(dialog_id, msg, entity_name_map=entity_name_map) for msg in batch]
-        new_progress = min(int(getattr(msg, "id", 0)) for msg in batch)
+        new_progress = min(msg.id for msg in batch)
         is_done = len(batch) < _BATCH_SIZE
         new_status = "synced" if is_done else "syncing"
 

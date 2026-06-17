@@ -42,10 +42,10 @@ import json
 import logging
 import sqlite3
 import time
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Protocol, TypedDict, TypeVar, cast
 
 from telethon.errors import (  # type: ignore[import-untyped]
     ChannelBannedError,
@@ -64,12 +64,94 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
     InputPeerChannel,
     InputPeerChat,
     InputPeerUser,
+    TypeInputPeer,
 )
 
 from .flood import flood_seconds, sleep_through_flood
 from .sync_db import _open_sync_db
 
 logger = logging.getLogger(__name__)
+T = TypeVar("T")
+
+
+class _EntityLike(Protocol):
+    id: int
+    title: str | None
+    first_name: str | None
+    last_name: str | None
+    username: str | None
+    access_hash: int | None
+    bot: bool
+    broadcast: bool
+    participants_count: int | None
+    date: datetime | None
+    forum: bool
+
+
+class _DraftLike(Protocol):
+    message: str | None
+
+
+class _MessageLike(Protocol):
+    date: datetime | None
+
+
+class _DialogLike(Protocol):
+    id: int
+    entity: _EntityLike
+    message: _MessageLike | None
+    pinned: bool
+    folder_id: int | None
+    unread_mentions_count: int | None
+    unread_reactions_count: int | None
+    draft: _DraftLike | None
+    date: datetime | None
+
+
+class _ForumTopicLike(Protocol):
+    id: int
+    title: str | None
+    is_general: bool
+    icon_emoji_id: int | None
+    date: datetime | None
+
+
+class _ForumTopicsResultLike(Protocol):
+    topics: list[_ForumTopicLike]
+
+
+class _BootstrapRow(TypedDict):
+    dialog_id: int
+    name: str | None
+    type: str
+    archived: int
+    pinned: int
+    members: int | None
+    created: int | None
+    last_message_at: int | None
+    snapshot_at: int
+    unread_mentions_count: int
+    unread_reactions_count: int
+    draft_text: str | None
+
+
+class _EntityFields(TypedDict):
+    name: str | None
+    type: str
+    members: int | None
+    created: int | None
+
+
+class _DialogSyncClient(Protocol):
+    def iter_dialogs(self, **kwargs: object) -> AsyncIterator[_DialogLike]: ...
+
+    async def get_entity(self, peer: object) -> _EntityLike: ...
+
+    async def __call__(self, request: object) -> _ForumTopicsResultLike: ...
+
+
+def _attr[T](obj: object, name: str, default: T) -> T:
+    return cast(T, getattr(obj, name, default))
 
 # ---------------------------------------------------------------------------
 # SQL constants
@@ -198,7 +280,7 @@ _SELECT_VISIBLE_DIALOG_IDS_SQL = "SELECT dialog_id FROM dialogs WHERE hidden = 0
 
 
 def _get_state(conn: sqlite3.Connection, key: str) -> str | None:
-    row = conn.execute(_GET_STATE_SQL, (key,)).fetchone()
+    row = cast(tuple[str | None] | None, conn.execute(_GET_STATE_SQL, (key,)).fetchone())
     return row[0] if row else None
 
 
@@ -217,7 +299,7 @@ def _clear_cursor(conn: sqlite3.Connection) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _encode_offset_peer(entity: Any) -> str | None:
+def _encode_offset_peer(entity: _EntityLike) -> str | None:
     """Serialize a Telethon entity to a JSON cursor record.
 
     Returns None for unknown entity types — caller writes NULL for offset_peer
@@ -238,16 +320,16 @@ def _encode_offset_peer(entity: Any) -> str | None:
     return None
 
 
-def _decode_offset_peer(json_str: str) -> Any:
+def _decode_offset_peer(json_str: str) -> object:
     """Reconstruct a Telethon InputPeer from the JSON cursor record.
 
     Raises ValueError on malformed JSON or missing keys — caller catches and
     triggers cursor reset (corrupt-state recovery).
     """
-    d = json.loads(json_str)
+    d = cast(dict[str, object], json.loads(json_str))
     t = d["type"]
-    peer_id = int(d["id"])
-    ah = int(d.get("access_hash", 0) or 0)
+    peer_id = int(cast(int | str, d["id"]))
+    ah = int(cast(int | str, d.get("access_hash", 0) or 0))
     if t == "user":
         return InputPeerUser(peer_id, ah)
     if t == "chat":
@@ -262,7 +344,7 @@ def _decode_offset_peer(json_str: str) -> Any:
 # ---------------------------------------------------------------------------
 
 
-def _extract_entity_fields(entity: Any) -> dict[str, Any]:
+def _extract_entity_fields(entity: _EntityLike) -> _EntityFields:
     """Return {name, type, members, created} from a bare entity (User/Chat/Channel).
 
     Single source of truth for entity-type dispatch (RECON-02 + 43-REVIEWS.md
@@ -271,17 +353,17 @@ def _extract_entity_fields(entity: Any) -> dict[str, Any]:
       - DialogReconciliationWorker.run_light_pass (no Dialog wrapper — get_entity result)
     """
     if isinstance(entity, types.User):
-        dialog_type = "bot" if getattr(entity, "bot", False) else "user"
+        dialog_type = "bot" if entity.bot else "user"
         members = None
         created = None
     elif isinstance(entity, types.Chat):
         dialog_type = "group"
-        members = getattr(entity, "participants_count", None)
+        members = _attr(entity, "participants_count", None)
         created = None
     elif isinstance(entity, types.Channel):
-        dialog_type = "channel" if getattr(entity, "broadcast", False) else "supergroup"
-        members = getattr(entity, "participants_count", None)
-        date = getattr(entity, "date", None)
+        dialog_type = "channel" if entity.broadcast else "supergroup"
+        members = _attr(entity, "participants_count", None)
+        date = entity.date
         created = int(date.timestamp()) if date else None
     else:
         dialog_type = "unknown"
@@ -295,18 +377,18 @@ def _extract_entity_fields(entity: Any) -> dict[str, Any]:
     }
 
 
-def _extract_name(entity: Any) -> str | None:
+def _extract_name(entity: _EntityLike) -> str | None:
     """Build a display name from a Telethon entity (User/Chat/Channel)."""
-    title = getattr(entity, "title", None)
+    title = _attr(entity, "title", None)
     if title:
         return title
-    first = getattr(entity, "first_name", None) or ""
-    last = getattr(entity, "last_name", None) or ""
+    first = _attr(entity, "first_name", None) or ""
+    last = _attr(entity, "last_name", None) or ""
     name = f"{first} {last}".strip()
     return name or None
 
 
-def _extract_dialog_row(dialog: Any, snapshot_at: int) -> dict[str, Any]:
+def _extract_dialog_row(dialog: _DialogLike, snapshot_at: int) -> _BootstrapRow:
     """Build the dict bound to _UPSERT_DIALOG_SQL for one Dialog object.
 
     All values come from the Dialog object and dialog.entity directly — no
@@ -323,20 +405,22 @@ def _extract_dialog_row(dialog: Any, snapshot_at: int) -> dict[str, Any]:
     members = fields["members"]
     created = fields["created"]
 
-    last_msg = getattr(dialog, "message", None)
+    last_msg = dialog.message
     last_message_at: int | None = None
-    if last_msg is not None and getattr(last_msg, "date", None) is not None:
-        last_message_at = int(last_msg.date.timestamp())
+    if last_msg is not None:
+        last_message_date = last_msg.date
+        if last_message_date is not None:
+            last_message_at = int(last_message_date.timestamp())
 
     # D-09: unread_mentions / unread_reactions from Dialog object directly.
-    unread_mentions = int(getattr(dialog, "unread_mentions_count", 0) or 0)
-    unread_reactions = int(getattr(dialog, "unread_reactions_count", 0) or 0)
+    unread_mentions = int(dialog.unread_mentions_count or 0)
+    unread_reactions = int(dialog.unread_reactions_count or 0)
 
     # D-10: draft_text = dialog.draft.message[:80] if present, else NULL.
-    draft = getattr(dialog, "draft", None)
+    draft = dialog.draft
     draft_text: str | None = None
     if draft is not None:
-        msg = getattr(draft, "message", None)
+        msg = draft.message
         if msg:
             draft_text = msg[:80]  # DIFF-03
 
@@ -345,8 +429,8 @@ def _extract_dialog_row(dialog: Any, snapshot_at: int) -> dict[str, Any]:
         "name": name,
         "type": dialog_type,
         # `archived` is True iff dialog.folder_id is not None
-        "archived": int(getattr(dialog, "folder_id", None) is not None),
-        "pinned": int(bool(getattr(dialog, "pinned", False))),
+        "archived": int(dialog.folder_id is not None),
+        "pinned": int(bool(dialog.pinned)),
         "members": members,
         "created": created,
         "last_message_at": last_message_at,
@@ -384,13 +468,13 @@ class DialogsBootstrapWorker:
 
     def __init__(
         self,
-        client: Any,
+        client: object,
         db_path: Path,
         shutdown_event: asyncio.Event,
         *,
         startup_detail_setter: Callable[[str], None] | None = None,
     ) -> None:
-        self._client = client
+        self._client = cast(_DialogSyncClient, client)
         # Open a dedicated connection — NOT shared with the daemon's main conn.
         # See module docstring "Connection ownership". Same pattern as
         # _backfill_in_thread() at daemon.py:449-456.
@@ -403,7 +487,7 @@ class DialogsBootstrapWorker:
         if self._startup_detail_setter is not None:
             self._startup_detail_setter(msg)
 
-    def _reconstruct_cursor(self) -> tuple[Any | None, int, Any | None]:
+    def _reconstruct_cursor(self) -> tuple[datetime | None, int, object | None]:
         """Read offset_date / offset_id / offset_peer from daemon_state.
 
         Returns (offset_date, offset_id, offset_peer) — any may be None/0
@@ -477,11 +561,11 @@ class DialogsBootstrapWorker:
                     # inconsistent state.
                     with self._conn:
                         self._conn.execute(_UPSERT_DIALOG_SQL, row)
-                        dialog_date = getattr(dialog, "date", None)
+                        dialog_date = dialog.date
                         _set_state(
                             self._conn,
                             _KEY_OFFSET_DATE,
-                            dialog_date.isoformat() if dialog_date else None,
+                            dialog_date.isoformat() if dialog_date is not None else None,
                         )
                         _set_state(self._conn, _KEY_OFFSET_ID, str(int(dialog.id)))
                         encoded_peer = _encode_offset_peer(dialog.entity)
@@ -573,11 +657,11 @@ class DialogReconciliationWorker:
 
     def __init__(
         self,
-        client: Any,
+        client: object,
         conn: sqlite3.Connection,
         shutdown_event: asyncio.Event,
     ) -> None:
-        self._client = client
+        self._client = cast(_DialogSyncClient, client)
         self._conn = conn
         self._shutdown_event = shutdown_event
 
@@ -600,7 +684,7 @@ class DialogReconciliationWorker:
         PeerIdInvalidError — we log distinctly so the issue is observable
         and leave needs_refresh=1 for retry once the cache is warm again.
         """
-        rows = self._conn.execute(_SELECT_DIRTY_DIALOGS_SQL).fetchall()
+        rows = cast(list[tuple[int]], self._conn.execute(_SELECT_DIRTY_DIALOGS_SQL).fetchall())
         count = 0
         for (dialog_id,) in rows:
             if self._shutdown_event.is_set():
@@ -626,7 +710,7 @@ class DialogReconciliationWorker:
                         ),
                     )
                 count += 1
-                if getattr(entity, "forum", False):
+                if entity.forum:
                     topic_count = await self._refresh_forum_topics(dialog_id, entity)
                     logger.debug(
                         "recon_light_pass_forum_topics dialog_id=%d count=%d",
@@ -692,7 +776,7 @@ class DialogReconciliationWorker:
         last_full_pass when completed=True, so the next hourly tick retries
         the full pass instead of waiting a full day.
         """
-        pre_pass_ids = {row[0] for row in self._conn.execute(_SELECT_VISIBLE_DIALOG_IDS_SQL).fetchall()}
+        pre_pass_ids = {row[0] for row in cast(list[tuple[int]], self._conn.execute(_SELECT_VISIBLE_DIALOG_IDS_SQL).fetchall())}
         seen_ids: set[int] = set()
         count = 0
         try:
@@ -705,7 +789,7 @@ class DialogReconciliationWorker:
                     self._conn.execute(_UPSERT_DIALOG_SQL, row)
                 seen_ids.add(int(dialog.id))
                 count += 1
-                if getattr(dialog.entity, "forum", False):
+                if dialog.entity.forum:
                     topic_count = await self._refresh_forum_topics(int(dialog.id), dialog.entity)
                     logger.debug(
                         "recon_full_pass_forum_topics dialog_id=%d count=%d",
@@ -738,7 +822,7 @@ class DialogReconciliationWorker:
     async def _refresh_forum_topics(
         self,
         dialog_id: int,
-        entity: Any,
+        entity: _EntityLike,
     ) -> int:
         """Fetch topics for a forum supergroup and upsert into topic_metadata.
 
@@ -752,7 +836,7 @@ class DialogReconciliationWorker:
         try:
             result = await self._client(
                 GetForumTopicsRequest(
-                    peer=entity,
+                    peer=cast(TypeInputPeer, entity),
                     offset_date=None,
                     offset_id=0,
                     offset_topic=0,
@@ -776,7 +860,7 @@ class DialogReconciliationWorker:
             )
             return 0
 
-        topics = getattr(result, "topics", []) or []
+        topics = result.topics or []
         # NOTE: hard cap of 100 topics per GetForumTopicsRequest (Telegram limit).
         # Forums with >100 topics will silently drop topics beyond the first 100.
         # This matches the pre-existing _list_topics limit=100 behaviour.
@@ -785,14 +869,12 @@ class DialogReconciliationWorker:
             {
                 "dialog_id": dialog_id,
                 "topic_id": int(t.id),
-                "title": getattr(t, "title", None) or "",
-                "is_general": int(getattr(t, "is_general", False) or (int(t.id) == 1)),
-                "icon_emoji_id": getattr(t, "icon_emoji_id", None),
+                "title": t.title or "",
+                "is_general": int(t.is_general or (int(t.id) == 1)),
+                "icon_emoji_id": t.icon_emoji_id,
                 "updated_at": now,
                 "snapshot_at": now,
-                "date": int(t.date.timestamp())
-                if hasattr(getattr(t, "date", None), "timestamp")
-                else getattr(t, "date", None),
+                "date": int(t.date.timestamp()) if t.date is not None else None,
             }
             for t in topics
         ]
@@ -806,7 +888,7 @@ class DialogReconciliationWorker:
 
 
 async def run_reconciliation_loop(
-    client: Any,
+    client: object,
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,
     *,
