@@ -70,10 +70,6 @@ class _FullChannelResult(Protocol):
     full_chat: object
 
 
-class _ParticipantsResult(Protocol):
-    users: Sequence[object]
-
-
 class _FullChatResult(Protocol):
     full_chat: object
 

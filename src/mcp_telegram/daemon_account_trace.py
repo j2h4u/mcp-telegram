@@ -210,25 +210,33 @@ class _TraceVisibleCandidatesContext:
     concurrency: int
 
 
-class _TraceVisibleEnrichmentResult(TypedDict):
-    dialogs_attempted: int
-    dialogs_skipped: int
-    messages_seen: int
-    messages_persisted: int
-    duplicates_skipped: int
-    deadline_ms: int
-    concurrency: int
-    coverage_bounds: dict[str, int]
-    fragment_status_counts: dict[str, int]
+_TraceVisibleEnrichmentResult = TypedDict(  # noqa: UP013
+    "_TraceVisibleEnrichmentResult",
+    {
+        "dialogs_attempted": int,
+        "dialogs_skipped": int,
+        "messages_seen": int,
+        "messages_persisted": int,
+        "duplicates_skipped": int,
+        "deadline_ms": int,
+        "concurrency": int,
+        "coverage_bounds": dict[str, int],
+        "fragment_status_counts": dict[str, int],
+    },
+)
 
 
-class _TraceCandidateEnrichmentResult(TypedDict):
-    status: str
-    attempted: int
-    skipped: int
-    messages_seen: int
-    messages_persisted: int
-    duplicates_skipped: int
+_TraceCandidateEnrichmentResult = TypedDict(  # noqa: UP013
+    "_TraceCandidateEnrichmentResult",
+    {
+        "status": str,
+        "attempted": int,
+        "skipped": int,
+        "messages_seen": int,
+        "messages_persisted": int,
+        "duplicates_skipped": int,
+    },
+)
 
 
 class _TraceDialogMetadata(TypedDict):

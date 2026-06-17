@@ -66,18 +66,22 @@ class _BuildMatchesOptions:
 
 
 class _EntityCache(Protocol):
-    def get(self, entity_id: int, ttl_seconds: int = 300) -> Mapping[str, object] | None: ...
+    def get(self, entity_id: int, _ttl_seconds: int = 300) -> Mapping[str, object] | None: ...
 
     def get_by_username(self, username: str) -> tuple[int, str] | None: ...
 
 
-class MatchInfo(TypedDict):
-    entity_id: int
-    display_name: str
-    score: int
-    username: str | None
-    entity_type: str | None
-    disambiguation_hint: str | None
+MatchInfo = TypedDict(  # noqa: UP013
+    "MatchInfo",
+    {
+        "entity_id": int,
+        "display_name": str,
+        "score": int,
+        "username": str | None,
+        "entity_type": str | None,
+        "disambiguation_hint": str | None,
+    },
+)
 
 
 def _parse_numeric_query(query: str) -> int | None:
@@ -291,7 +295,7 @@ def _make_match_info(entity_id: int, display_name: str, score: int, entity_cache
     }
     if entity_cache:
         try:
-            entity_cached = entity_cache.get(entity_id, ttl_seconds=300)
+            entity_cached = entity_cache.get(entity_id, 300)
             if entity_cached:
                 username = entity_cached.get("username")
                 if isinstance(username, str):

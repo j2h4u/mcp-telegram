@@ -75,12 +75,17 @@ class _TraceAccountMessagesKwargs(TypedDict, total=False):
     coverage_goal: str
 
 
-class _DaemonResponse(TypedDict, total=False):
-    ok: bool
-    request_id: str
-    message: object
-    error: object
-    data: dict[str, object]
+_DaemonResponse = TypedDict(  # noqa: UP013
+    "_DaemonResponse",
+    {
+        "ok": bool,
+        "request_id": str,
+        "message": object,
+        "error": object,
+        "data": dict[str, object],
+    },
+    total=False,
+)
 
 
 def _parse_response_line(line: bytes) -> _DaemonResponse:

@@ -2,7 +2,7 @@ import logging
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Protocol, TypedDict, Unpack, cast
+from typing import TypedDict, Unpack, cast
 from zoneinfo import ZoneInfo
 
 import telethon.tl.types as tl  # type: ignore[import-untyped]
@@ -636,11 +636,6 @@ def _describe_document_filename(doc: object, attr: tl.DocumentAttributeFilename)
     size = getattr(doc, "size", None)
     size_str = f", {size // 1024}KB" if size else ""
     return f"[документ: {attr.file_name}{size_str}]"
-
-
-class _DocumentLike(Protocol):
-    attributes: Sequence[object]
-    size: int | None
 
 
 def _describe_media(media: object) -> str:
