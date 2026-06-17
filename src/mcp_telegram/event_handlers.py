@@ -22,7 +22,9 @@ import asyncio
 import logging
 import sqlite3
 import time
-from typing import Any
+from collections.abc import Sequence
+from datetime import datetime
+from typing import Protocol, cast, runtime_checkable
 
 from telethon import events  # type: ignore[import-untyped]
 from telethon.errors import FloodWaitError, RPCError  # type: ignore[import-untyped]
@@ -31,6 +33,7 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
     MessageActionTopicEdit,
     PeerChannel,
     PeerChat,
+    TypeInputChannel,
     UpdateChannel,
     UpdateChat,
     UpdateDialogPinned,
@@ -57,6 +60,131 @@ from .sync_worker import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@runtime_checkable
+class _PeerContainer(Protocol):
+    peer: object
+
+
+@runtime_checkable
+class _SenderLike(Protocol):
+    first_name: str | None
+    last_name: str | None
+    username: str | None
+
+
+@runtime_checkable
+class _MessageLike(Protocol):
+    id: int
+    message: str | None
+    date: datetime | None
+    edit_date: datetime | None
+    action: object | None
+    reactions: object | None
+    reply_to: object | None
+    sender_id: int | None
+    out: bool
+    post_author: str | None
+    media: object | None
+    entities: Sequence[object] | None
+    fwd_from: object | None
+    replies: object | None
+
+
+class _NewMessageEvent(Protocol):
+    chat_id: int | None
+    is_private: bool
+    message: _MessageLike
+
+    async def get_sender(self) -> _SenderLike | None: ...
+
+
+class _EditedMessageEvent(Protocol):
+    chat_id: int | None
+    message: _MessageLike
+
+
+class _DeletedMessagesEvent(Protocol):
+    chat_id: int | None
+    deleted_ids: Sequence[int]
+
+
+class _ReadMessageEvent(Protocol):
+    chat_id: int | None
+    max_id: int | None
+
+
+class _OutboxReadEvent(Protocol):
+    chat_id: int | None
+    is_private: bool | None
+    max_id: int | None
+
+
+class _RawReactionUpdate(Protocol):
+    peer: object | None
+    msg_id: int | None
+
+
+class _DialogPinnedUpdateLike(Protocol):
+    peer: object | None
+    pinned: bool
+
+
+class _PinnedDialogsUpdateLike(Protocol):
+    order: Sequence[object] | None
+    folder_id: int | None
+
+
+class _UnreadMarkUpdateLike(Protocol):
+    peer: object | None
+
+
+class _ChannelChatUpdateLike(Protocol):
+    channel_id: int
+
+
+class _ChatUpdateLike(Protocol):
+    chat_id: int
+
+
+class _InboxReadUpdateLike(Protocol):
+    peer: object
+    max_id: int | None
+    still_unread_count: int | None
+
+
+class _ChannelInboxReadUpdateLike(Protocol):
+    channel_id: int
+    max_id: int | None
+    still_unread_count: int | None
+
+
+class _ForumTopicPinnedUpdateLike(Protocol):
+    peer: object | None
+    topic_id: int | None
+    pinned: bool
+
+
+class _FullChatLike(Protocol):
+    linked_chat_id: int | None
+
+
+class _FullChannelResultLike(Protocol):
+    full_chat: _FullChatLike
+    chats: Sequence[object]
+
+
+class _EventHandlerClient(Protocol):
+    def add_event_handler(self, callback: object, event: object) -> None: ...
+
+    def remove_event_handler(self, callback: object) -> None: ...
+
+    async def get_messages(self, *args: object, **kwargs: object) -> object: ...
+
+    async def get_input_entity(self, dialog_id: int) -> object: ...
+
+    async def __call__(self, request: object) -> object: ...
 
 _DM_AUTO_ENROLL_SENDER_EXCEPTIONS: tuple[type[BaseException], ...] = (
     RPCError,
@@ -172,7 +300,7 @@ class EventHandlerManager:
 
     def __init__(
         self,
-        client: Any,
+        client: _EventHandlerClient,
         conn: sqlite3.Connection,
         shutdown_event: asyncio.Event,
     ) -> None:
@@ -256,10 +384,10 @@ class EventHandlerManager:
         self._refresh_synced_dialogs()
 
     def _refresh_synced_dialogs(self) -> None:
-        rows = self._conn.execute(_SELECT_SYNCED_DIALOGS_SQL).fetchall()
-        self._synced_dialog_ids = {int(row[0]) for row in rows}
+        rows = cast(list[tuple[int]], self._conn.execute(_SELECT_SYNCED_DIALOGS_SQL).fetchall())
+        self._synced_dialog_ids = {int(dialog_id) for (dialog_id,) in rows}
 
-    def _auto_enroll_dm(self, dialog_id: int, sender: Any | None = None) -> None:
+    def _auto_enroll_dm(self, dialog_id: int, sender: _SenderLike | None = None) -> None:
         """Enroll a new DM dialog into synced_dialogs on first incoming message.
 
         Called from on_new_message when a private message arrives from a dialog
@@ -291,8 +419,8 @@ class EventHandlerManager:
         if sender is None:
             return
         try:
-            first = getattr(sender, "first_name", None) or ""
-            last = getattr(sender, "last_name", None) or ""
+            first = sender.first_name or ""
+            last = sender.last_name or ""
             name: str | None = f"{first} {last}".strip() or None
             entity_type_str = DialogType.from_entity(sender).value
             with self._conn:
@@ -302,7 +430,7 @@ class EventHandlerManager:
                         dialog_id,
                         entity_type_str,
                         name,
-                        getattr(sender, "username", None),
+                        sender.username,
                         latinize(name) if name else None,
                         int(time.time()),
                     ),
@@ -315,7 +443,7 @@ class EventHandlerManager:
     # Event handlers
     # ------------------------------------------------------------------
 
-    async def on_new_message(self, event: Any) -> None:
+    async def on_new_message(self, event: _NewMessageEvent) -> None:
         """Handle a NewMessage event: INSERT OR REPLACE into messages table.
 
         For enrolled dialogs: writes the message to sync.db immediately.
@@ -348,20 +476,14 @@ class EventHandlerManager:
                 # MAX(COALESCE(..., 0), new_ts) ensures no regression on out-of-order
                 # events. UPDATE matches 0 rows when the dialog is not yet bootstrapped
                 # (no dialogs row) — silent no-op; bootstrap is the sole row creator.
-                msg_date = getattr(msg, "date", None)
-                self._update_last_message_timestamp(dialog_id, now, msg_date)
+                self._update_last_message_timestamp(dialog_id, now, msg.date)
                 self._handle_topic_message_action(dialog_id, msg, now)
 
             logger.info("event_new dialog_id=%d message_id=%d", dialog_id, msg.id)
         except Exception:
             logger.exception("event_new_failed dialog_id=%s", dialog_id)
 
-    def _update_last_message_timestamp(
-        self,
-        dialog_id: int,
-        now: int,
-        msg_date: Any,
-    ) -> None:
+    def _update_last_message_timestamp(self, dialog_id: int, now: int, msg_date: datetime | None) -> None:
         if msg_date is not None:
             self._conn.execute(
                 _UPDATE_DIALOG_LAST_MESSAGE_AT_SQL,
@@ -372,10 +494,10 @@ class EventHandlerManager:
     def _handle_topic_message_action(
         self,
         dialog_id: int,
-        msg: Any,
+        msg: _MessageLike,
         now: int,
     ) -> None:
-        action = getattr(msg, "action", None)
+        action = cast(object | None, getattr(msg, "action", None))
         if isinstance(action, MessageActionTopicCreate):
             self._handle_topic_create_action(dialog_id, msg, now, action)
             return
@@ -385,22 +507,22 @@ class EventHandlerManager:
     def _handle_topic_create_action(
         self,
         dialog_id: int,
-        msg: Any,
+        msg: _MessageLike,
         now: int,
         action: MessageActionTopicCreate,
     ) -> None:
-        topic_id = int(getattr(msg, "id", 0))
+        topic_id = int(msg.id)
         if topic_id <= 0:
             return
-        msg_date = getattr(msg, "date", None)
+        msg_date = msg.date
         topic_timestamp = int(msg_date.timestamp()) if msg_date is not None else now
         self._conn.execute(
             _UPSERT_TOPIC_METADATA_SQL,
             {
                 "dialog_id": dialog_id,
                 "topic_id": topic_id,
-                "title": getattr(action, "title", None) or "Topic",
-                "icon_emoji_id": getattr(action, "icon_emoji_id", None),
+                "title": action.title or "Topic",
+                "icon_emoji_id": action.icon_emoji_id,
                 "updated_at": now,
                 "snapshot_at": now,
                 "date": topic_timestamp,
@@ -415,11 +537,11 @@ class EventHandlerManager:
     def _handle_topic_edit_action(
         self,
         dialog_id: int,
-        msg: Any,
+        msg: _MessageLike,
         now: int,
         action: MessageActionTopicEdit,
     ) -> None:
-        reply_to = getattr(msg, "reply_to", None)
+        reply_to = msg.reply_to
         if reply_to is None:
             # Defensive: some MessageActionTopicEdit events carry no
             # reply_to; without it we cannot identify the target topic.
@@ -429,7 +551,7 @@ class EventHandlerManager:
             )
             return
 
-        topic_id_raw = getattr(reply_to, "reply_to_msg_id", None)
+        topic_id_raw = cast(int | None, getattr(reply_to, "reply_to_msg_id", None))
         if topic_id_raw is None:
             logger.debug(
                 "event_topic_edit_skipped reason=no_reply_to_msg_id dialog_id=%d",
@@ -438,7 +560,7 @@ class EventHandlerManager:
             return
 
         topic_id = int(topic_id_raw)
-        if bool(getattr(action, "hidden", False)):
+        if action.hidden:
             self._conn.execute(
                 _UPDATE_TOPIC_METADATA_HIDDEN_SQL,
                 (now, now, dialog_id, topic_id),
@@ -456,8 +578,8 @@ class EventHandlerManager:
         # be None). UPDATE matches 0 rows for unknown topics
         # — silent no-op; on_new_message UPSERT is the sole
         # row-creation path.
-        edit_title = getattr(action, "title", None)
-        edit_icon = getattr(action, "icon_emoji_id", None)
+        edit_title = action.title
+        edit_icon = action.icon_emoji_id
         self._conn.execute(
             _UPDATE_TOPIC_METADATA_EDIT_SQL,
             (edit_title, edit_icon, now, now, dialog_id, topic_id, now),
@@ -468,7 +590,7 @@ class EventHandlerManager:
             topic_id,
         )
 
-    async def on_message_edited(self, event: Any) -> None:
+    async def on_message_edited(self, event: _EditedMessageEvent) -> None:
         """Handle a MessageEdited event: version old text, update messages row.
 
         Three cases:
@@ -484,14 +606,17 @@ class EventHandlerManager:
 
         try:
             msg = event.message
-            message_id = int(getattr(msg, "id", 0))
-            new_text = getattr(msg, "message", None)
+            message_id = int(msg.id)
+            new_text = msg.message
             now = int(time.time())
 
             # Resolve async data BEFORE opening transaction — SQLite's synchronous
             # driver cannot safely suspend inside a `with self._conn:` block while
             # another coroutine may call into the same connection.
-            existing = self._conn.execute(_SELECT_MESSAGE_TEXT_SQL, (dialog_id, message_id)).fetchone()
+            existing = cast(
+                tuple[str | None] | None,
+                self._conn.execute(_SELECT_MESSAGE_TEXT_SQL, (dialog_id, message_id)).fetchone(),
+            )
 
             if existing is None:
                 # Message not yet in sync.db: resolve entity map then insert.
@@ -514,7 +639,7 @@ class EventHandlerManager:
                 #    (Phase 39.2-01 AC-1 via edited path, AC-2 removal via empty results).
                 # 2. msg.reactions is None -> service edit / media caption etc.; no-op
                 #    (regression guard AC-8).
-                reactions_obj = getattr(msg, "reactions", None)
+                reactions_obj = msg.reactions
                 if reactions_obj is not None:
                     rows = extract_reactions_rows(dialog_id, message_id, reactions_obj)
                     with self._conn:
@@ -528,7 +653,7 @@ class EventHandlerManager:
                     )
                 return
 
-            edit_date_raw = getattr(msg, "edit_date", None)
+            edit_date_raw = msg.edit_date
             edit_date_unix = int(edit_date_raw.timestamp()) if edit_date_raw is not None else now
 
             # Resolve entity map before the transaction (no await inside with).
@@ -536,7 +661,8 @@ class EventHandlerManager:
             extracted = extract_message_row(dialog_id, msg, entity_name_map=entity_name_map)
 
             with self._conn:
-                next_ver = self._conn.execute(_NEXT_VERSION_SQL, (dialog_id, message_id)).fetchone()[0]
+                version_row = cast(tuple[int], self._conn.execute(_NEXT_VERSION_SQL, (dialog_id, message_id)).fetchone())
+                next_ver = int(version_row[0])
                 self._conn.execute(
                     _INSERT_VERSION_SQL,
                     (dialog_id, message_id, next_ver, old_text, edit_date_unix),
@@ -555,7 +681,7 @@ class EventHandlerManager:
         except Exception:
             logger.exception("event_edit_failed dialog_id=%s", dialog_id)
 
-    async def on_message_deleted(self, event: Any) -> None:
+    async def on_message_deleted(self, event: _DeletedMessagesEvent) -> None:
         """Handle a MessageDeleted event: mark channel messages as is_deleted=1.
 
         chat_id is None for DMs and small groups (MTProto limitation).
@@ -587,7 +713,7 @@ class EventHandlerManager:
         except Exception:
             logger.exception("event_delete_failed dialog_id=%s", dialog_id)
 
-    async def on_message_read(self, event: Any) -> None:
+    async def on_message_read(self, event: _ReadMessageEvent) -> None:
         """Handle MessageRead(inbox=True): update read_inbox_max_id monotonically.
 
         Monotonic write via `MAX(COALESCE(existing, 0), incoming)` ensures the
@@ -607,7 +733,7 @@ class EventHandlerManager:
                 "event_read_null_chat_id max_id=%s — PM read position not tracked "
                 "in real-time (MTProto/Telethon normalization); bootstrap on next "
                 "daemon restart will reconcile",
-                getattr(event, "max_id", "?"),
+                event.max_id,
             )
             return
 
@@ -617,20 +743,23 @@ class EventHandlerManager:
         try:
             now = int(time.time())
             with self._conn:
-                rowcount = apply_read_cursor(self._conn, dialog_id, "inbox", event.max_id)
+                max_id = event.max_id
+                if max_id is None:
+                    return
+                rowcount = apply_read_cursor(self._conn, dialog_id, "inbox", max_id)
                 self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
             if rowcount > 0:
-                logger.info("event_read dialog_id=%d max_id=%d", dialog_id, event.max_id)
+                logger.info("event_read dialog_id=%d max_id=%d", dialog_id, max_id)
             else:
                 logger.warning(
                     "event_read_no_row dialog_id=%d max_id=%d — UPDATE matched 0 rows",
                     dialog_id,
-                    event.max_id,
+                    max_id,
                 )
         except Exception:
             logger.exception("event_read_failed dialog_id=%s", dialog_id)
 
-    async def on_outbox_read(self, event: Any) -> None:
+    async def on_outbox_read(self, event: _OutboxReadEvent) -> None:
         """Handle MessageRead(inbox=False): update read_outbox_max_id monotonically.
 
         Path A dispatch (LOCKED). Verified against
@@ -664,7 +793,7 @@ class EventHandlerManager:
                 "event_outbox_read_null_chat_id max_id=%s — PM outbox read "
                 "position not tracked in real-time; bootstrap on next daemon "
                 "restart will reconcile",
-                getattr(event, "max_id", "?"),
+                event.max_id,
             )
             return
 
@@ -672,7 +801,7 @@ class EventHandlerManager:
         # use it; otherwise rely on the synced_dialog_ids check below (non-DM
         # synced dialogs aren't tracked for outbox cursors — the read paths
         # that consume this surface are DM-only).
-        is_private = getattr(event, "is_private", None)
+        is_private = cast(bool | None, getattr(event, "is_private", None))
         if is_private is False:
             return
 
@@ -680,11 +809,11 @@ class EventHandlerManager:
             logger.debug(
                 "event_outbox_read_unsynced dialog_id=%d max_id=%s",
                 dialog_id,
-                getattr(event, "max_id", "?"),
+                event.max_id,
             )
             return
 
-        max_id = getattr(event, "max_id", None)
+        max_id = event.max_id
         if max_id is None:
             return
 
@@ -711,7 +840,7 @@ class EventHandlerManager:
                 exc,
             )
 
-    async def on_raw_reaction_update(self, update: Any) -> None:
+    async def on_raw_reaction_update(self, update: _RawReactionUpdate) -> None:
         """Handle raw UpdateMessageReactions for synced dialogs.
 
         Telethon contract (verified against
@@ -727,13 +856,13 @@ class EventHandlerManager:
         delta. FloodWait is logged + dropped (next JIT read repairs).
         Phase 39.2-01: AC-1 / AC-2 / AC-2-RAW / AC-UPD-USER / AC-UPD-CHANNEL.
         """
-        peer = getattr(update, "peer", None)
-        msg_id = getattr(update, "msg_id", None)
+        peer = update.peer
+        msg_id = update.msg_id
         if peer is None or msg_id is None:
             return
         try:
-            dialog_id = int(get_peer_id(peer))
-        except TypeError, ValueError:
+            dialog_id = int(cast(int, get_peer_id(peer)))
+        except (TypeError, ValueError):
             logger.debug("raw_reaction_update_unparseable_peer peer=%r", peer)
             return
 
@@ -746,9 +875,9 @@ class EventHandlerManager:
             return
 
         try:
-            result = await self._client.get_messages(dialog_id, ids=[msg_id])
+            result = cast(Sequence[_MessageLike | None], await self._client.get_messages(dialog_id, ids=[msg_id]))
         except FloodWaitError as exc:
-            wait = getattr(exc, "seconds", 0)
+            wait = int(exc.seconds)
             logger.warning(
                 "raw_reaction_floodwait dialog_id=%d message_id=%d seconds=%d",
                 dialog_id,
@@ -756,7 +885,7 @@ class EventHandlerManager:
                 wait,
             )
             return
-        except RPCError, RuntimeError:
+        except (RPCError, RuntimeError):
             logger.exception(
                 "event_raw_reaction_failed dialog_id=%d message_id=%d",
                 dialog_id,
@@ -774,7 +903,7 @@ class EventHandlerManager:
             return
 
         try:
-            rows = extract_reactions_rows(dialog_id, msg_id, getattr(msg, "reactions", None))
+            rows = extract_reactions_rows(dialog_id, msg_id, msg.reactions)
             now = int(time.time())
             with self._conn:
                 apply_reactions_delta(self._conn, dialog_id, msg_id, rows)
@@ -796,45 +925,45 @@ class EventHandlerManager:
     # Phase 42: dialog metadata Raw handlers (EVENTS-01, EVENTS-02, EVENTS-03)
     # ------------------------------------------------------------------
 
-    def _dialog_id_from_peer(self, peer: Any | None) -> int | None:
-        inner_peer = getattr(peer, "peer", peer)
+    def _dialog_id_from_peer(self, peer: object | _PeerContainer | None) -> int | None:
+        inner_peer = peer.peer if isinstance(peer, _PeerContainer) else peer
         if inner_peer is None:
             return None
-        return int(get_peer_id(inner_peer))
+        return int(cast(int, get_peer_id(inner_peer)))
 
-    def _collect_synced_pinned_dialog_ids(self, order: Any) -> list[int]:
+    def _collect_synced_pinned_dialog_ids(self, order: Sequence[object]) -> list[int]:
         pinned_ids: list[int] = []
         for dialog_peer in order:
-            inner_peer = getattr(dialog_peer, "peer", dialog_peer)
+            inner_peer = dialog_peer.peer if isinstance(dialog_peer, _PeerContainer) else dialog_peer
             try:
-                dialog_id = int(get_peer_id(inner_peer))
-            except TypeError, ValueError:
+                dialog_id = int(cast(int, get_peer_id(inner_peer)))
+            except (TypeError, ValueError):
                 continue
             if dialog_id in self._synced_dialog_ids:
                 pinned_ids.append(dialog_id)
         return pinned_ids
 
     def _update_dialog_pinned(self, update: UpdateDialogPinned, now: int) -> None:
-        dialog_id = self._dialog_id_from_peer(getattr(update, "peer", None))
+        dialog_id = self._dialog_id_from_peer(update.peer)
         if dialog_id is None or dialog_id not in self._synced_dialog_ids:
             return
-        pinned = 1 if getattr(update, "pinned", False) else 0
+        pinned = 1 if update.pinned else 0
         with self._conn:
             self._conn.execute(_UPDATE_DIALOG_PINNED_SQL, (pinned, now, dialog_id))
         logger.info("event_dialog_pinned dialog_id=%d pinned=%d", dialog_id, pinned)
 
     def _rewrite_pinned_dialogs(self, update: UpdatePinnedDialogs, now: int) -> None:
-        order = getattr(update, "order", None)
+        order = update.order
         if order is None:
             logger.debug("event_pinned_dialogs_order_none — skip")
             return
         # folder_id=None means the main list; folder_id=1 means Archived, etc.
         # A folder-scoped update carries only pins *within* that folder, so we
         # must not use it to clear pins in other folders.
-        folder_id = getattr(update, "folder_id", None)
+        folder_id = update.folder_id
         # Decode peers; gate by _synced_dialog_ids so we never UPDATE
         # rows for dialogs the daemon does not own.
-        pinned_ids = self._collect_synced_pinned_dialog_ids(order)
+        pinned_ids = self._collect_synced_pinned_dialog_ids(cast(Sequence[object], order))
         with self._conn:
             for dialog_id in pinned_ids:
                 self._conn.execute(
@@ -864,7 +993,7 @@ class EventHandlerManager:
         )
 
     def _update_dialog_unread_mark(self, update: UpdateDialogUnreadMark, now: int) -> None:
-        dialog_id = self._dialog_id_from_peer(getattr(update, "peer", None))
+        dialog_id = self._dialog_id_from_peer(update.peer)
         if dialog_id is None or dialog_id not in self._synced_dialog_ids:
             return
         with self._conn:
@@ -877,7 +1006,7 @@ class EventHandlerManager:
             dialog_id,
         )
 
-    async def on_raw_dialog_pinned(self, update: Any) -> None:
+    async def on_raw_dialog_pinned(self, update: object) -> None:
         """Phase 42 EVENTS-01: dialogs.pinned + needs_refresh from raw updates.
 
         Handles three update types:
@@ -904,7 +1033,7 @@ class EventHandlerManager:
                 type(update).__name__,
             )
 
-    async def on_raw_channel_chat_update(self, update: Any) -> None:
+    async def on_raw_channel_chat_update(self, update: _ChannelChatUpdateLike | _ChatUpdateLike) -> None:
         """Phase 42 EVENTS-03: UpdateChannel / UpdateChat → dialogs.needs_refresh=1.
 
         Phase 54 EVENTS-03 extension: UpdateChannel for a broadcast channel with
@@ -925,10 +1054,13 @@ class EventHandlerManager:
             now = int(time.time())
             with self._conn:
                 self._conn.execute(_UPDATE_DIALOG_NEEDS_REFRESH_SQL, (now, dialog_id))
-                row = self._conn.execute(
-                    "SELECT type, linked_chat_resolved_at FROM dialogs WHERE dialog_id = ?",
-                    (dialog_id,),
-                ).fetchone()
+                row = cast(
+                    tuple[str | None, int | None] | None,
+                    self._conn.execute(
+                        "SELECT type, linked_chat_resolved_at FROM dialogs WHERE dialog_id = ?",
+                        (dialog_id,),
+                    ).fetchone(),
+                )
             logger.info("event_channel_chat_dirty dialog_id=%d", dialog_id)
         except Exception:
             logger.exception(
@@ -960,13 +1092,16 @@ class EventHandlerManager:
 
         from .activity_peer_resolve import resolve_input_peer
 
-        input_channel = await resolve_input_peer(self._client, dialog_id)
+        input_channel = cast(TypeInputChannel | None, await resolve_input_peer(self._client, dialog_id))
         if input_channel is None:
             logger.debug("event_linked_chat_refresh_no_input_peer dialog_id=%d", dialog_id)
             return
 
         try:
-            full_result = await self._client(GetFullChannelRequest(channel=input_channel))
+            full_result = cast(
+                "_FullChannelResultLike",
+                await self._client(GetFullChannelRequest(channel=input_channel)),
+            )
         except FloodWaitError as exc:
             logger.warning(
                 "event_linked_chat_refresh_flood dialog_id=%d flood_wait_seconds=%d",
@@ -978,11 +1113,11 @@ class EventHandlerManager:
             logger.debug("event_linked_chat_refresh_failed dialog_id=%d", dialog_id, exc_info=True)
             return
 
-        raw = getattr(full_result.full_chat, "linked_chat_id", None)
+        raw = full_result.full_chat.linked_chat_id
         normalised: int | None = None
         if raw is not None:
             if raw > 0:
-                normalised = int(_get_peer_id(_PeerChannel(raw)))
+                normalised = int(cast(int, _get_peer_id(_PeerChannel(raw))))
             else:
                 normalised = int(raw)
 
@@ -1002,7 +1137,7 @@ class EventHandlerManager:
             normalised,
         )
 
-    async def on_raw_inbox_read(self, update: Any) -> None:
+    async def on_raw_inbox_read(self, update: _InboxReadUpdateLike | _ChannelInboxReadUpdateLike) -> None:
         """Phase 42 EVENTS-02: UpdateReadHistoryInbox / UpdateReadChannelInbox.
 
         Captures still_unread_count via structured log (the high-level
@@ -1023,8 +1158,8 @@ class EventHandlerManager:
                 return
             if dialog_id not in self._synced_dialog_ids:
                 return
-            still_unread = int(getattr(update, "still_unread_count", 0))
-            max_id = int(getattr(update, "max_id", 0))
+            still_unread = int(update.still_unread_count or 0)
+            max_id = int(update.max_id or 0)
             now = int(time.time())
             with self._conn:
                 self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
@@ -1040,7 +1175,7 @@ class EventHandlerManager:
                 type(update).__name__,
             )
 
-    async def on_raw_forum_topic_pinned(self, update: Any) -> None:
+    async def on_raw_forum_topic_pinned(self, update: _ForumTopicPinnedUpdateLike) -> None:
         """Phase 42 EVENTS-05: UpdatePinnedForumTopic → topic_metadata.pinned.
 
         Gated on _synced_dialog_ids; UPDATE-only. Missing-row UPDATE matches
@@ -1050,15 +1185,15 @@ class EventHandlerManager:
         try:
             if not isinstance(update, UpdatePinnedForumTopic):
                 return
-            peer = getattr(update, "peer", None)
-            topic_id_raw = getattr(update, "topic_id", None)
+            peer = update.peer
+            topic_id_raw = update.topic_id
             if peer is None or topic_id_raw is None:
                 return
-            dialog_id = int(get_peer_id(peer))
+            dialog_id = int(cast(int, get_peer_id(peer)))
             if dialog_id not in self._synced_dialog_ids:
                 return
             topic_id = int(topic_id_raw)
-            pinned = 1 if getattr(update, "pinned", False) else 0
+            pinned = 1 if update.pinned else 0
             now = int(time.time())
             with self._conn:
                 self._conn.execute(
@@ -1097,7 +1232,8 @@ class EventHandlerManager:
         scan_started_at = int(time.time())
         total_marked = 0
 
-        dialog_ids = [int(row[0]) for row in self._conn.execute(_SELECT_SYNCED_ONLY_SQL).fetchall()]
+        dialog_rows = cast(list[tuple[int]], self._conn.execute(_SELECT_SYNCED_ONLY_SQL).fetchall())
+        dialog_ids = [int(dialog_id) for (dialog_id,) in dialog_rows]
 
         for dialog_id in dialog_ids:
             try:
@@ -1113,13 +1249,14 @@ class EventHandlerManager:
         return total_marked
 
     async def _scan_dm_gap_dialog(self, dialog_id: int, scan_started_at: int) -> int:
-        message_ids = [
-            int(row[0])
-            for row in self._conn.execute(
+        message_rows = cast(
+            list[tuple[int]],
+            self._conn.execute(
                 _SELECT_UNDELETED_MESSAGES_SQL,
                 (dialog_id, scan_started_at),
-            ).fetchall()
-        ]
+            ).fetchall(),
+        )
+        message_ids = [int(message_id) for (message_id,) in message_rows]
         if not message_ids:
             return 0
 
@@ -1127,7 +1264,10 @@ class EventHandlerManager:
         # Batch in groups of 100 (Telegram API limit)
         for batch_start in range(0, len(message_ids), 100):
             batch = message_ids[batch_start : batch_start + 100]
-            results = await self._client.get_messages(dialog_id, ids=batch)
+            results = cast(
+                "Sequence[_MessageLike | None]",
+                await self._client.get_messages(dialog_id, ids=batch),
+            )
 
             now = int(time.time())
             with self._conn:  # atomic per-dialog batch

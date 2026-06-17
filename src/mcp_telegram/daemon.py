@@ -38,14 +38,15 @@ import logging
 import os
 import sqlite3
 import time
+from collections.abc import Coroutine, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Protocol, cast
 
 from telethon import utils as telethon_utils  # type: ignore[import-untyped]
 from telethon.errors.rpcerrorlist import FloodWaitError, RPCError  # type: ignore[import-untyped]
 from telethon.tl.functions.messages import GetPeerDialogsRequest  # type: ignore[import-untyped]
-from telethon.tl.types import InputDialogPeer  # type: ignore[import-untyped]
+from telethon.tl.types import InputDialogPeer, TypeInputDialogPeer, TypeInputPeer  # type: ignore[import-untyped]
 
 from .activity_cold_backfill import run_cold_backfill_loop
 from .activity_hot_sweep import run_hot_sweep_loop
@@ -70,6 +71,44 @@ from .sync_worker import FullSyncWorker
 from .telegram import create_client
 
 logger = logging.getLogger(__name__)
+
+
+class _DaemonClient(Protocol):
+    def add_event_handler(self, callback: object, event: object) -> None: ...
+
+    def remove_event_handler(self, callback: object) -> None: ...
+
+    def is_connected(self) -> bool: ...
+
+    async def connect(self) -> None: ...
+
+    async def disconnect(self) -> None: ...
+
+    async def get_me(self) -> object: ...
+
+    async def get_messages(self, *args: object, **kwargs: object) -> object: ...
+
+    async def get_input_entity(self, dialog_id: int) -> object: ...
+
+    async def __call__(self, request: object) -> object: ...
+
+
+class _ReadPositionDialogLike(Protocol):
+    peer: object
+    read_inbox_max_id: int | None
+    read_outbox_max_id: int | None
+
+
+class _ReadPositionsResultLike(Protocol):
+    dialogs: Sequence[_ReadPositionDialogLike]
+
+
+class _MessagesTotalLike(Protocol):
+    total: int | None
+
+
+class _MeLike(Protocol):
+    id: int
 
 HEARTBEAT_INTERVAL_S: float = 60.0
 GAP_SCAN_INTERVAL_S: float = 7 * 24 * 3600.0
@@ -119,21 +158,21 @@ class _SyncMainContext:
     conn: sqlite3.Connection
     feedback_conn: sqlite3.Connection
     shutdown_event: asyncio.Event
-    client: Any
+    client: _DaemonClient
     api_server: DaemonAPIServer
     socket_path: Path
     unix_server: asyncio.AbstractServer | None = None
     handler_manager: EventHandlerManager | None = None
-    background_tasks: set[asyncio.Task[Any]] = field(default_factory=set)
+    background_tasks: set[asyncio.Task[object]] = field(default_factory=set)
 
 
 async def _backfill_total_messages(
-    client: Any,
+    client: _DaemonClient,
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,
 ) -> int:
     """One-time sweep to populate total_messages for dialogs with NULL."""
-    rows = conn.execute(_SELECT_NULL_TOTAL_SQL).fetchall()
+    rows = cast(list[tuple[int]], conn.execute(_SELECT_NULL_TOTAL_SQL).fetchall())
     if not rows:
         logger.info("backfill_total_messages — no NULL rows, skipping")
         return 0
@@ -143,8 +182,8 @@ async def _backfill_total_messages(
         if shutdown_event.is_set():
             break
         try:
-            result = await client.get_messages(entity=dialog_id, limit=1)
-            total = getattr(result, "total", None)
+            result = cast(_MessagesTotalLike, await client.get_messages(entity=dialog_id, limit=1))
+            total = result.total
             if total is not None:
                 conn.execute(_UPDATE_TOTAL_SQL, (total, dialog_id))
                 conn.commit()
@@ -163,7 +202,7 @@ async def _backfill_total_messages(
 
 
 async def _initialize_read_positions(
-    client: Any,
+    client: _DaemonClient,
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,
 ) -> int:
@@ -193,12 +232,12 @@ async def _initialize_read_positions(
     that arrives during the bootstrap window cannot be overwritten by a
     stale bootstrap reply (designed race safety, not accidental).
     """
-    rows = conn.execute(_SELECT_NULL_READ_CURSORS_SQL).fetchall()
+    rows = cast(list[tuple[int]], conn.execute(_SELECT_NULL_READ_CURSORS_SQL).fetchall())
     if not rows:
         logger.info("initialize_read_positions — no NULL rows, skipping")
         return 0
 
-    dialog_ids = [row[0] for row in rows]
+    dialog_ids = [dialog_id for (dialog_id,) in rows]
     filled = 0
 
     for i in range(0, len(dialog_ids), _BOOTSTRAP_BATCH_SIZE):
@@ -212,7 +251,7 @@ async def _initialize_read_positions(
             continue
 
         try:
-            result = await client(GetPeerDialogsRequest(peers=input_peers))
+            result = cast(_ReadPositionsResultLike, await client(GetPeerDialogsRequest(peers=input_peers)))
             filled += _apply_read_positions_from_dialogs(conn, result)
             conn.commit()
         except FloodWaitError as exc:
@@ -229,29 +268,29 @@ async def _initialize_read_positions(
     return filled
 
 
-async def _build_read_position_input_peers(client: Any, batch_ids: list[int]) -> list[InputDialogPeer]:
-    input_peers: list[InputDialogPeer] = []
+async def _build_read_position_input_peers(client: _DaemonClient, batch_ids: list[int]) -> list[TypeInputDialogPeer]:
+    input_peers: list[TypeInputDialogPeer] = []
     for dialog_id in batch_ids:
         try:
-            peer = await client.get_input_entity(dialog_id)
+            peer = cast(TypeInputPeer, await client.get_input_entity(dialog_id))
             input_peers.append(InputDialogPeer(peer=peer))
         except (RPCError, TypeError, ValueError) as exc:
             logger.debug("read_pos_bootstrap skip dialog_id=%d error=%s", dialog_id, exc)
     return input_peers
 
 
-def _apply_read_positions_from_dialogs(conn: sqlite3.Connection, result: Any) -> int:
+def _apply_read_positions_from_dialogs(conn: sqlite3.Connection, result: _ReadPositionsResultLike) -> int:
     """Apply read cursors from a GetPeerDialogsRequest result."""
     filled = 0
     for dialog in result.dialogs:
-        chat_id = telethon_utils.get_peer_id(dialog.peer)
+        chat_id = int(cast(int, telethon_utils.get_peer_id(dialog.peer)))
         # D-03 LOCKED: None → skip (preserve NULL). NEVER fold
         # None → 0; that would lie with [all read] during the
         # bootstrap window. The DB cursor stays NULL and Plan 03
         # renders [unknown (sync pending)]. 0 is a legitimate
         # distinct value (peer/me has read nothing) — writes 0.
-        inbox_max = getattr(dialog, "read_inbox_max_id", None)
-        outbox_max = getattr(dialog, "read_outbox_max_id", None)
+        inbox_max = cast(int | None, getattr(dialog, "read_inbox_max_id", None))
+        outbox_max = cast(int | None, getattr(dialog, "read_outbox_max_id", None))
         wrote_any = False
         if inbox_max is not None and apply_read_cursor(conn, chat_id, "inbox", inbox_max) > 0:
             # Monotonic via shared primitive — see read_state.py.
@@ -277,9 +316,34 @@ async def _sleep_read_pos_batch(shutdown_event: asyncio.Event) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _fetch_heartbeat_stats(conn: sqlite3.Connection) -> tuple[dict[str, int], int]:
+    stats_rows = cast(
+        list[tuple[str, int]],
+        conn.execute("SELECT status, COUNT(*) FROM synced_dialogs GROUP BY status").fetchall(),
+    )
+    stats = dict(stats_rows)
+    msg_count_row = cast(tuple[int], conn.execute("SELECT COUNT(*) FROM messages").fetchone())
+    return stats, int(msg_count_row[0])
+
+
+def _format_heartbeat_eta(sync_start: float, synced: int, total: int, now_mono: float) -> str:
+    if synced <= 0 or synced >= total:
+        return " eta=done" if synced >= total else ""
+
+    remaining = total - synced
+    elapsed = now_mono - sync_start
+    secs_per_dialog = elapsed / synced
+    eta_secs = int(remaining * secs_per_dialog)
+    if eta_secs >= SECONDS_PER_HOUR:
+        return f" eta={eta_secs // SECONDS_PER_HOUR}h{(eta_secs % SECONDS_PER_HOUR) // SECONDS_PER_MINUTE}m"
+    if eta_secs >= SECONDS_PER_MINUTE:
+        return f" eta={eta_secs // SECONDS_PER_MINUTE}m{eta_secs % SECONDS_PER_MINUTE}s"
+    return f" eta={eta_secs}s"
+
+
 def _log_heartbeat(
     conn: sqlite3.Connection,
-    client: Any,
+    client: _DaemonClient,
     sync_start: float,
     prev_msg_count: int,
     prev_mono: float,
@@ -294,8 +358,7 @@ def _log_heartbeat(
     next invocation.
     """
     try:
-        stats = dict(conn.execute("SELECT status, COUNT(*) FROM synced_dialogs GROUP BY status").fetchall())
-        msg_count = int(conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0])
+        stats, msg_count = _fetch_heartbeat_stats(conn)
     except sqlite3.DatabaseError:
         logger.warning("heartbeat_stats_failed", exc_info=True)
         stats = {}
@@ -309,21 +372,6 @@ def _log_heartbeat(
     delta = max(0, msg_count - int(prev_msg_count or 0))
     rate = delta / interval if interval > 0 else 0.0
 
-    eta_str = ""
-    if synced > 0 and synced < total:
-        remaining = total - synced
-        elapsed = now_mono - sync_start
-        secs_per_dialog = elapsed / synced
-        eta_secs = int(remaining * secs_per_dialog)
-        if eta_secs >= SECONDS_PER_HOUR:
-            eta_str = f" eta={eta_secs // SECONDS_PER_HOUR}h{(eta_secs % SECONDS_PER_HOUR) // SECONDS_PER_MINUTE}m"
-        elif eta_secs >= SECONDS_PER_MINUTE:
-            eta_str = f" eta={eta_secs // SECONDS_PER_MINUTE}m{eta_secs % SECONDS_PER_MINUTE}s"
-        else:
-            eta_str = f" eta={eta_secs}s"
-    elif synced >= total:
-        eta_str = " eta=done"
-
     logger.info(
         "heartbeat — connected=%s dialogs=%d/%d messages=%d rate=%.0fmsg/s%s",
         client.is_connected(),
@@ -331,7 +379,7 @@ def _log_heartbeat(
         total,
         msg_count,
         rate,
-        eta_str,
+        _format_heartbeat_eta(sync_start, synced, total, now_mono),
     )
     return msg_count, now_mono
 
@@ -343,7 +391,7 @@ def _log_heartbeat(
 
 async def _maybe_heartbeat_and_gap_scan(
     conn: sqlite3.Connection,
-    client: Any,
+    client: _DaemonClient,
     handler_manager: EventHandlerManager,
     state: _SyncLoopState,
 ) -> _SyncLoopState:
@@ -377,12 +425,13 @@ async def _run_sync_loop(
     handler_manager: EventHandlerManager,
     shutdown_event: asyncio.Event,
     conn: sqlite3.Connection,
-    client: Any,
+    client: _DaemonClient,
 ) -> None:
     """Run the batch-sync loop with periodic heartbeat and gap scan."""
     sync_start = time.monotonic()
     try:
-        last_hb_msg_count = int(conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0])
+        last_hb_row = cast(tuple[int], conn.execute("SELECT COUNT(*) FROM messages").fetchone())
+        last_hb_msg_count = int(last_hb_row[0])
     except sqlite3.DatabaseError:
         last_hb_msg_count = 0
     state = _SyncLoopState(
@@ -426,12 +475,17 @@ async def _run_sync_loop(
             state.was_idle = False
 
 
-def _create_tracked_task(ctx: _SyncMainContext, coro: Any, *, name: str | None = None) -> asyncio.Task:
+def _create_tracked_task(
+    ctx: _SyncMainContext,
+    coro: Coroutine[object, object, object],
+    *,
+    name: str | None = None,
+) -> asyncio.Task[object]:
     """Create an asyncio task and track it for shutdown cancellation."""
     task = asyncio.create_task(coro, name=name)
     ctx.background_tasks.add(task)
 
-    def _on_done(t: asyncio.Task) -> None:
+    def _on_done(t: asyncio.Task[object]) -> None:
         ctx.background_tasks.discard(t)
         exc = t.exception() if not t.cancelled() else None
         if exc is not None:
@@ -459,7 +513,7 @@ async def _build_sync_main_context() -> _SyncMainContext:
     loop = asyncio.get_running_loop()
     shutdown_event = register_shutdown_handler(conn, loop, feedback_conn=feedback_conn)
 
-    client = create_client(catch_up=True)
+    client = cast(_DaemonClient, create_client(catch_up=True))
     api_server = DaemonAPIServer(conn, client, shutdown_event, feedback_conn)
     socket_path = get_daemon_socket_path()
     # Ensure the runtime/state dir exists before binding — do not assume a prior
@@ -531,7 +585,7 @@ async def _prime_runtime(ctx: _SyncMainContext) -> None:
     # Telethon per request. Failure propagates — daemon cannot serve reads
     # correctly without a stable self_id.
     ctx.api_server.startup_detail = "fetching account info"
-    me = await ctx.client.get_me()
+    me = cast(_MeLike, await ctx.client.get_me())
     ctx.api_server.self_id = int(me.id)
     logger.info("daemon self_id cached: %s", ctx.api_server.self_id)
 
@@ -583,7 +637,7 @@ async def _start_bootstrap_background_tasks(
     # Phase 41 review HIGH: pass db_path (NOT conn) — the worker opens its own
     # dedicated SQLite connection inside __init__, isolating it from the
     # daemon's main conn used by the other background tasks.
-    task_specs: list[tuple[Any, str]] = [
+    task_specs: list[tuple[Coroutine[object, object, object], str]] = [
         (
             DialogsBootstrapWorker(
                 ctx.client,
