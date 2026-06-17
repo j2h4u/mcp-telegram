@@ -5,6 +5,7 @@ LegacyChat. DB-first cache with 5-minute TTL on the daemon side; tool itself
 maps daemon data into the structured MCP response.
 """
 
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 import phonenumbers
@@ -526,6 +527,71 @@ def _entity_structured_content(
     }
 
 
+@dataclass(frozen=True, slots=True)
+class _EntityLookup:
+    entity_id: int
+    display_name: str
+    resolution: str
+
+
+def _numeric_entity_lookup(args: GetEntityInfo) -> _EntityLookup | None:
+    try:
+        entity_id = int(args.entity)
+    except ValueError:
+        return None
+    return _EntityLookup(entity_id=entity_id, display_name=args.entity, resolution="numeric_id")
+
+
+async def _resolve_entity_lookup(args: GetEntityInfo) -> ToolResult | _EntityLookup:
+    # Two daemon connections: daemon handles one request per connection.
+    # Accepted race: entity_id obtained from resolve_entity could theoretically
+    # become stale if the entities table is modified between the two calls, but
+    # this window is negligible in practice (entities are stable once synced).
+    try:
+        async with daemon_connection() as conn:
+            resolve_response = await conn.resolve_entity(query=args.entity)
+    except DaemonNotRunningError:
+        return error_result(_daemon_not_running_text())
+
+    if not resolve_response.get("ok"):
+        return error_result(entity_not_found_text(args.entity, retry_tool="GetEntityInfo"))
+
+    resolve_data = resolve_response.get("data", {})
+    resolve_status = resolve_data.get("result", "not_found")
+
+    if resolve_status == "not_found":
+        return error_result(entity_not_found_text(args.entity, retry_tool="GetEntityInfo"))
+
+    if resolve_status == "candidates":
+        matches = resolve_data.get("matches", [])
+        return error_result(
+            "Multiple entities matched.\n"
+            "Action: Retry get_entity_info with one numeric entity_id from structuredContent.candidates.",
+            structured_content={
+                "error": "ambiguous_entity",
+                "candidates": [_entity_candidate_payload(match) for match in matches if isinstance(match, dict)],
+            },
+        )
+
+    return _EntityLookup(
+        entity_id=resolve_data["entity_id"],
+        display_name=resolve_data["display_name"],
+        resolution="resolver_match",
+    )
+
+
+def _entity_info_fetch_error(args: GetEntityInfo, response: dict) -> ToolResult | None:
+    if response.get("ok"):
+        return None
+
+    error_code = response.get("error", "")
+    if error_code == "entity_not_found":
+        return error_result(entity_not_found_text(args.entity, retry_tool="GetEntityInfo"))
+
+    error_msg = response.get("message", "Request failed.")
+    return error_result(fetch_entity_info_error_text(args.entity, error_msg))
+
+
 # ---------------------------------------------------------------------------
 # Tool definition
 # ---------------------------------------------------------------------------
@@ -572,61 +638,21 @@ class GetEntityInfo(ToolArgs):
     output_schema=GET_ENTITY_INFO_OUTPUT_SCHEMA,
 )
 async def get_entity_info(args: GetEntityInfo) -> ToolResult:
-    # Numeric ID shortcut: skip resolver entirely and go straight to daemon.
-    try:
-        entity_id = int(args.entity)
-        display_name = args.entity
-        resolution = "numeric_id"
-    except ValueError:
-        entity_id = None
-
-    if entity_id is None:
-        # Two daemon connections: daemon handles one request per connection.
-        # Accepted race: entity_id obtained from resolve_entity could theoretically
-        # become stale if the entities table is modified between the two calls, but
-        # this window is negligible in practice (entities are stable once synced).
-        try:
-            async with daemon_connection() as conn:
-                resolve_response = await conn.resolve_entity(query=args.entity)
-        except DaemonNotRunningError:
-            return error_result(_daemon_not_running_text())
-
-        if not resolve_response.get("ok"):
-            return error_result(entity_not_found_text(args.entity, retry_tool="GetEntityInfo"))
-
-        resolve_data = resolve_response.get("data", {})
-        resolve_status = resolve_data.get("result", "not_found")
-
-        if resolve_status == "not_found":
-            return error_result(entity_not_found_text(args.entity, retry_tool="GetEntityInfo"))
-
-        if resolve_status == "candidates":
-            matches = resolve_data.get("matches", [])
-            return error_result(
-                "Multiple entities matched.\n"
-                "Action: Retry get_entity_info with one numeric entity_id from structuredContent.candidates.",
-                structured_content={
-                    "error": "ambiguous_entity",
-                    "candidates": [_entity_candidate_payload(match) for match in matches if isinstance(match, dict)],
-                },
-            )
-
-        entity_id = resolve_data["entity_id"]
-        display_name = resolve_data["display_name"]
-        resolution = "resolver_match"
+    lookup = _numeric_entity_lookup(args)
+    if lookup is None:
+        resolved = await _resolve_entity_lookup(args)
+        if isinstance(resolved, ToolResult):
+            return resolved
+        lookup = resolved
 
     try:
         async with daemon_connection() as conn:
-            response = await conn.get_entity_info(entity_id=entity_id)
+            response = await conn.get_entity_info(entity_id=lookup.entity_id)
     except DaemonNotRunningError:
         return error_result(_daemon_not_running_text())
 
-    if not response.get("ok"):
-        error_code = response.get("error", "")
-        if error_code == "entity_not_found":
-            return error_result(entity_not_found_text(args.entity, retry_tool="GetEntityInfo"))
-        error_msg = response.get("message", "Request failed.")
-        return error_result(fetch_entity_info_error_text(args.entity, error_msg))
+    if err := _entity_info_fetch_error(args, response):
+        return err
 
     data = response.get("data", {})
     # Numeric-id path only: we initially stored the numeric string itself as
@@ -635,15 +661,16 @@ async def get_entity_info(args: GetEntityInfo) -> ToolResult:
     # display_name is intentionally kept as whatever the fuzzy resolver
     # matched (so the caller can verify the match they got), even if the
     # canonical title from data["name"] is slightly different.
-    if resolution == "numeric_id":
+    display_name = lookup.display_name
+    if lookup.resolution == "numeric_id":
         resolved_name = data.get("name")
         if resolved_name:
             display_name = resolved_name
     structured_content = _entity_structured_content(
         args=args,
         data=data,
-        entity_id=entity_id,
+        entity_id=lookup.entity_id,
         display_name=display_name,
-        resolution=resolution,
+        resolution=lookup.resolution,
     )
     return structured_result(structured_content, result_count=1)
