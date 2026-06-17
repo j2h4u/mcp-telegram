@@ -67,6 +67,20 @@ coverage:
 crap:
     uv run pytest --cov=src/mcp_telegram --cov-report=term-missing --crap --crap-threshold=30 --crap-top-n=30
 
+# Regenerate the tracked CRAP baseline from the current coverage state.
+crap-baseline:
+    coverage_file="$(mktemp /tmp/mcp-telegram-crap-coverage.XXXXXX.json)"; \
+    trap 'rm -f "$coverage_file"' EXIT; \
+    uv run pytest --cov=src/mcp_telegram --cov-report=json:"$coverage_file"; \
+    uv run python -m devtools.crap_ratchet --coverage "$coverage_file" --baseline reports/crap-baseline.json --src src/mcp_telegram --threshold 30 --write-baseline
+
+# Enforce the CRAP ratchet against the tracked baseline.
+crap-ratchet:
+    coverage_file="$(mktemp /tmp/mcp-telegram-crap-coverage.XXXXXX.json)"; \
+    trap 'rm -f "$coverage_file"' EXIT; \
+    uv run pytest --cov=src/mcp_telegram --cov-report=json:"$coverage_file"; \
+    uv run python -m devtools.crap_ratchet --coverage "$coverage_file" --baseline reports/crap-baseline.json --src src/mcp_telegram --threshold 30
+
 # Rebuild and restart the live Docker container.
 runtime-build:
     docker compose -f {{compose_file}} up -d --build {{container}}
