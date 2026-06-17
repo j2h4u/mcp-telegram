@@ -77,6 +77,14 @@ crap-baseline:
     uv run pytest --cov=src/mcp_telegram --cov-report=json:"$coverage_file"; \
     uv run python -m devtools.crap_ratchet --coverage "$coverage_file" --baseline reports/crap-baseline.json --src src/mcp_telegram --threshold 30 --write-baseline
 
+# Tighten the tracked CRAP baseline by clamping existing entries downward and adding
+# only new entries that are at/below threshold.
+crap-tighten:
+    coverage_file="$(mktemp /tmp/mcp-telegram-crap-coverage.XXXXXX.json)"; \
+    trap 'rm -f "$coverage_file"' EXIT; \
+    uv run pytest --cov=src/mcp_telegram --cov-report=json:"$coverage_file"; \
+    uv run python -m devtools.crap_ratchet --coverage "$coverage_file" --baseline reports/crap-baseline.json --src src/mcp_telegram --threshold 30 --tighten-baseline
+
 # Enforce the CRAP ratchet against the tracked baseline.
 crap-ratchet:
     coverage_file="$(mktemp /tmp/mcp-telegram-crap-coverage.XXXXXX.json)"; \

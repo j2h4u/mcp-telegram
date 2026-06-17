@@ -69,6 +69,7 @@ class _RatchetArgs(Protocol):
     threshold: float
     epsilon: float
     write_baseline: bool
+    tighten_baseline: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -290,6 +291,79 @@ def _compare_metrics(
     return issues
 
 
+def _tighten_baseline(
+    current: list[FunctionMetric],
+    baseline: dict[str, _BaselineFunctionEntry],
+    threshold: float,
+    epsilon: float,
+) -> tuple[list[FunctionMetric], list[RatchetIssue]]:
+    issues: list[RatchetIssue] = []
+    tightened_metrics: list[FunctionMetric] = []
+
+    for metric in current:
+        baseline_entry = baseline.get(metric.key)
+        if baseline_entry is None:
+            if metric.crap > threshold + epsilon:
+                issues.append(
+                    RatchetIssue(
+                        key=metric.key,
+                        kind="new-offender",
+                        current_crap=metric.crap,
+                        baseline_crap=None,
+                        delta=None,
+                    )
+                )
+                continue
+
+            tightened_metrics.append(metric)
+            continue
+
+        baseline_crap = _expect_float(
+            baseline_entry.get("crap", 0.0),
+            f"baseline entry for {metric.key} has invalid crap",
+        )
+        if metric.crap > baseline_crap + epsilon:
+            issues.append(
+                RatchetIssue(
+                    key=metric.key,
+                    kind="regression",
+                    current_crap=metric.crap,
+                    baseline_crap=baseline_crap,
+                    delta=metric.crap - baseline_crap,
+                )
+            )
+            continue
+
+        if metric.crap < baseline_crap:
+            tightened_metric = FunctionMetric(
+                key=metric.key,
+                path=metric.path,
+                qualname=metric.qualname,
+                start_line=metric.start_line,
+                end_line=metric.end_line,
+                complexity=metric.complexity,
+                coverage_fraction=metric.coverage_fraction,
+                crap=metric.crap,
+            )
+            tightened_metrics.append(tightened_metric)
+            continue
+
+        tightened_metrics.append(
+            FunctionMetric(
+                key=metric.key,
+                path=metric.path,
+                qualname=metric.qualname,
+                start_line=metric.start_line,
+                end_line=metric.end_line,
+                complexity=metric.complexity,
+                coverage_fraction=metric.coverage_fraction,
+                crap=baseline_crap,
+            )
+        )
+
+    return tightened_metrics, issues
+
+
 def _format_issue(issue: RatchetIssue) -> str:
     if issue.kind == "regression":
         return f"{issue.key} CRAP {issue.baseline_crap:.2f} -> {issue.current_crap:.2f} (+{issue.delta:.2f})"
@@ -323,10 +397,16 @@ def _build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_EPSILON,
         help="allowed drift above baseline",
     )
-    parser.add_argument(
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument(
         "--write-baseline",
         action="store_true",
         help="regenerate the baseline from the current report",
+    )
+    modes.add_argument(
+        "--tighten-baseline",
+        action="store_true",
+        help="clamp existing baseline entries downward to current CRAP and add only non-offending new functions",
     )
     return parser
 
@@ -346,6 +426,24 @@ def main(argv: list[str] | None = None) -> int:
     if args.write_baseline:
         _save_baseline(args.baseline, source_root, args.threshold, metrics)
         print(f"Wrote {len(metrics)} CRAP baseline entries to {args.baseline}")
+        return 0
+
+    if args.tighten_baseline:
+        baseline = _load_baseline(args.baseline)
+        tightened_metrics, issues = _tighten_baseline(
+            metrics,
+            baseline,
+            args.threshold,
+            args.epsilon,
+        )
+        if issues:
+            print(f"CRAP ratchet failed: {len(issues)} issue(s)")
+            for issue in issues[:20]:
+                print(f"  {_format_issue(issue)}")
+            return 1
+
+        _save_baseline(args.baseline, source_root, args.threshold, tightened_metrics)
+        print(f"Wrote {len(tightened_metrics)} CRAP baseline entries to {args.baseline}")
         return 0
 
     baseline = _load_baseline(args.baseline)
