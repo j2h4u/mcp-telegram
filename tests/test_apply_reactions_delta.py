@@ -8,7 +8,9 @@ path is intentionally NOT refactored.
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Iterator
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -17,10 +19,10 @@ from mcp_telegram.sync_worker import ReactionRecord, apply_reactions_delta
 
 
 @pytest.fixture()
-def conn(tmp_path: Path) -> sqlite3.Connection:
+def conn(tmp_path: Path) -> Iterator[sqlite3.Connection]:
     db = tmp_path / "sync.db"
     ensure_sync_schema(db)
-    c = _open_sync_db(db)
+    c = cast(sqlite3.Connection, _open_sync_db(db))
     c.execute(
         "INSERT OR IGNORE INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')",
         (12345,),
@@ -30,12 +32,13 @@ def conn(tmp_path: Path) -> sqlite3.Connection:
     c.close()
 
 
-def _rows(conn: sqlite3.Connection, dialog_id: int, message_id: int) -> list[tuple]:
-    return list(
+def _rows(conn: sqlite3.Connection, dialog_id: int, message_id: int) -> list[tuple[str, int]]:
+    return cast(
+        list[tuple[str, int]],
         conn.execute(
             "SELECT emoji, count FROM message_reactions WHERE dialog_id=? AND message_id=? ORDER BY emoji",
             (dialog_id, message_id),
-        )
+        ).fetchall(),
     )
 
 

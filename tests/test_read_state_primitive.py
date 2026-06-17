@@ -12,6 +12,7 @@ import sqlite3
 import tempfile
 from collections.abc import Iterator
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -37,7 +38,7 @@ def _create_synced_dialogs(conn: sqlite3.Connection) -> None:
 
 @pytest.fixture()
 def mem_conn() -> Iterator[sqlite3.Connection]:
-    conn = sqlite3.connect(":memory:")
+    conn = cast(sqlite3.Connection, sqlite3.connect(":memory:"))
     _create_synced_dialogs(conn)
     try:
         yield conn
@@ -59,12 +60,15 @@ def file_db_path() -> Iterator[Path]:
             pass
 
 
-def _read_cursors(conn: sqlite3.Connection, dialog_id: int) -> tuple[object, object]:
-    row = conn.execute(
-        "SELECT read_inbox_max_id, read_outbox_max_id FROM synced_dialogs WHERE dialog_id=?",
-        (dialog_id,),
-    ).fetchone()
-    return (row[0], row[1]) if row is not None else (None, None)
+def _read_cursors(conn: sqlite3.Connection, dialog_id: int) -> tuple[int | None, int | None]:
+    row = cast(
+        tuple[int | None, int | None] | None,
+        conn.execute(
+            "SELECT read_inbox_max_id, read_outbox_max_id FROM synced_dialogs WHERE dialog_id=?",
+            (dialog_id,),
+        ).fetchone(),
+    )
+    return row if row is not None else (None, None)
 
 
 def testapply_read_cursor_inbox_writes_value(mem_conn: sqlite3.Connection) -> None:
@@ -137,10 +141,10 @@ def testapply_read_cursor_null_then_value_inbox(mem_conn: sqlite3.Connection) ->
 
 
 def testapply_read_cursor_bad_kind_raises(mem_conn: sqlite3.Connection) -> None:
-    from mcp_telegram.read_state import apply_read_cursor
+    from mcp_telegram.read_state import ReadCursorKind, apply_read_cursor
 
     with pytest.raises(KeyError):
-        apply_read_cursor(mem_conn, 111, "garbage", 1)  # type: ignore[arg-type]
+        apply_read_cursor(mem_conn, 111, cast(ReadCursorKind, "garbage"), 1)
 
 
 def testapply_read_cursor_unknown_dialog_id_is_noop(mem_conn: sqlite3.Connection) -> None:
@@ -149,7 +153,10 @@ def testapply_read_cursor_unknown_dialog_id_is_noop(mem_conn: sqlite3.Connection
     # UPDATE on missing row: affects 0 rows, no exception.
     apply_read_cursor(mem_conn, 999_999, "inbox", 10)
     mem_conn.commit()
-    row = mem_conn.execute("SELECT dialog_id FROM synced_dialogs WHERE dialog_id=?", (999_999,)).fetchone()
+    row = cast(
+        tuple[int] | None,
+        mem_conn.execute("SELECT dialog_id FROM synced_dialogs WHERE dialog_id=?", (999_999,)).fetchone(),
+    )
     assert row is None
 
 
@@ -181,20 +188,28 @@ def testapply_read_cursor_caller_controls_transaction(file_db_path: Path) -> Non
         apply_read_cursor(conn_a, 111, "inbox", 77)
 
         # Connection B sees the OLD value (uncommitted write is invisible).
-        row = conn_b.execute(
-            "SELECT read_inbox_max_id FROM synced_dialogs WHERE dialog_id=?",
-            (111,),
-        ).fetchone()
+        row = cast(
+            tuple[int] | None,
+            conn_b.execute(
+                "SELECT read_inbox_max_id FROM synced_dialogs WHERE dialog_id=?",
+                (111,),
+            ).fetchone(),
+        )
+        assert row is not None
         assert row[0] == 10, "helper must not auto-commit — B should see old value"
 
         # Now A commits — B sees the new value on a fresh read.
         conn_a.commit()
         # Start a new read txn on B to force re-read.
         conn_b.rollback()
-        row = conn_b.execute(
-            "SELECT read_inbox_max_id FROM synced_dialogs WHERE dialog_id=?",
-            (111,),
-        ).fetchone()
+        row = cast(
+            tuple[int] | None,
+            conn_b.execute(
+                "SELECT read_inbox_max_id FROM synced_dialogs WHERE dialog_id=?",
+                (111,),
+            ).fetchone(),
+        )
+        assert row is not None
         assert row[0] == 77
     finally:
         conn_a.close()
