@@ -20,7 +20,6 @@ from mcp_telegram.sync_db import (
     register_shutdown_handler,
 )
 
-
 TableInfoRow = tuple[int, str, str, int, object, int]
 Row = tuple[object, ...]
 
