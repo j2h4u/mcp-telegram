@@ -226,6 +226,10 @@ class _SyncWorkerClient(Protocol):
     async def __call__(self, request: object) -> _ForumTopicsResultLike: ...
 
 
+class _PeerNameClient(Protocol):
+    async def get_entity(self, peer: object) -> object: ...
+
+
 class _DialogRow(TypedDict):
     dialog_id: int
     name: str | None
@@ -412,7 +416,7 @@ def extract_reply_count(msg: object) -> int:
 def extract_reactions_rows(
     dialog_id: int,
     message_id: int,
-    reactions: _ReactionsLike | None,
+    reactions: object | None,
 ) -> list[ReactionRecord]:
     """Extract reaction rows from a Telethon MessageReactions object.
 
@@ -420,14 +424,14 @@ def extract_reactions_rows(
     """
     if reactions is None:
         return []
-    results = reactions.results
+    results = cast(Sequence[object], _attr(reactions, "results", ()))
     if not results:
         return []
     rows: list[ReactionRecord] = []
     for item in results:
-        reaction = item.reaction
-        emoticon = reaction.emoticon if reaction is not None else None
-        count = item.count
+        reaction = _attr(item, "reaction", None)
+        emoticon = _attr(reaction, "emoticon", None) if reaction is not None else None
+        count = _attr(item, "count", 0)
         if emoticon is not None:
             rows.append(
                 ReactionRecord(
@@ -596,7 +600,7 @@ def _marked_peer_id(from_id: object) -> int | None:
     return None
 
 
-async def _resolve_peer_name(client: _SyncWorkerClient, peer: _PeerLike) -> str | None:
+async def _resolve_peer_name(client: _PeerNameClient, peer: _PeerLike) -> str | None:
     """Return display name for a Telegram peer.
 
     `peer` must be a Telethon Peer (PeerUser/PeerChannel/PeerChat), NOT a bare
@@ -646,7 +650,7 @@ async def _resolve_peer_name(client: _SyncWorkerClient, peer: _PeerLike) -> str 
         return None
 
 
-async def _build_fwd_entity_map(msg: _MessageLike, client: _SyncWorkerClient) -> dict[int, str]:
+async def _build_fwd_entity_map(msg: object, client: _PeerNameClient) -> dict[int, str]:
     """Return {peer_id: name} for the forward source of a single message.
 
     Returns an empty dict when the message is not a forward, already has
