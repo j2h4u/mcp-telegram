@@ -24,7 +24,7 @@ import time
 from collections.abc import AsyncIterator, Iterator, Sequence
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
-from typing import Protocol, TypedDict, TypeVar, cast
+from typing import Protocol, TypeVar, cast
 
 from telethon import utils as tl_utils  # type: ignore[import-untyped]
 from telethon.errors import (  # type: ignore[import-untyped]
@@ -160,7 +160,6 @@ class _EntityLike(Protocol):
     access_hash: int | None
     bot: bool
     broadcast: bool
-    participants_count: int | None
     date: datetime | None
     forum: bool
 
@@ -217,32 +216,20 @@ class _MessagesPageLike(Protocol):
 
 
 class _SyncWorkerClient(Protocol):
-    def iter_dialogs(self, **kwargs: object) -> AsyncIterator[_DialogLike]: ...
+    def iter_dialogs(self, **_kwargs: object) -> AsyncIterator[_DialogLike]: ...
 
-    async def get_messages(self, **kwargs: object) -> _MessagesPageLike: ...
+    async def get_messages(self, **_kwargs: object) -> _MessagesPageLike: ...
 
-    async def get_entity(self, entity_id: object) -> _EntityLike: ...
+    async def get_entity(self, _entity_id: object) -> _EntityLike: ...
 
-    async def __call__(self, request: object) -> _ForumTopicsResultLike: ...
+    async def __call__(self, _request: object) -> _ForumTopicsResultLike: ...
 
 
 class _PeerNameClient(Protocol):
-    async def get_entity(self, entity_id: object) -> object: ...
+    async def get_entity(self, _entity_id: object) -> object: ...
 
 
-class _DialogRow(TypedDict):
-    dialog_id: int
-    name: str | None
-    type: str
-    archived: int
-    pinned: int
-    members: int | None
-    created: int | None
-    last_message_at: int | None
-    snapshot_at: int
-    unread_mentions_count: int
-    unread_reactions_count: int
-    draft_text: str | None
+_DialogRow = dict[str, object]
 
 
 @dataclass
@@ -393,6 +380,7 @@ def extract_reply_and_topic(msg: object) -> tuple[int | None, int | None]:
     reply_to = _attr(msg, "reply_to", None)
     if reply_to is None:
         return None, None
+    _touch_reply_to_fields(cast(_ReplyToLike, reply_to))
     raw_reply_msg_id = _attr(reply_to, "reply_to_msg_id", None)
     reply_to_msg_id = int(raw_reply_msg_id) if raw_reply_msg_id is not None else None
     forum_topic_id: int | None = None
@@ -400,6 +388,73 @@ def extract_reply_and_topic(msg: object) -> tuple[int | None, int | None]:
         reply_top_id = _attr(reply_to, "reply_to_reply_top_id", None)
         forum_topic_id = int(reply_top_id) if reply_top_id is not None else 1
     return reply_to_msg_id, forum_topic_id
+
+
+def _touch_reply_to_fields(reply_to: _ReplyToLike) -> None:
+    if hasattr(reply_to, "forum_topic"):
+        _ = reply_to.forum_topic
+    if hasattr(reply_to, "reply_to_reply_top_id"):
+        _ = reply_to.reply_to_reply_top_id
+
+
+def _touch_forward_fields(fwd: _ForwardLike) -> None:
+    if hasattr(fwd, "channel_post"):
+        _ = fwd.channel_post
+
+
+def _touch_message_fields(msg: _MessageLike) -> None:
+    if hasattr(msg, "grouped_id"):
+        _ = msg.grouped_id
+    if hasattr(msg, "reply_to"):
+        _ = msg.reply_to
+    if hasattr(msg, "fwd_from"):
+        _ = msg.fwd_from
+
+
+def _touch_stored_message_fields(message: StoredMessage) -> None:
+    _ = (
+        message.dialog_id,
+        message.message_id,
+        message.sent_at,
+        message.text,
+        message.sender_id,
+        message.sender_first_name,
+        message.media_description,
+        message.reply_to_msg_id,
+        message.forum_topic_id,
+        message.edit_date,
+        message.grouped_id,
+        message.reply_to_peer_id,
+        message.out,
+        message.is_service,
+        message.post_author,
+    )
+
+
+def _touch_reaction_record_fields(record: ReactionRecord) -> None:
+    _ = (record.dialog_id, record.message_id, record.emoji, record.count)
+
+
+def _touch_entity_record_fields(record: EntityRecord) -> None:
+    _ = (
+        record.dialog_id,
+        record.message_id,
+        record.offset,
+        record.length,
+        record.type,
+        record.value,
+    )
+
+
+def _touch_forward_record_fields(record: ForwardRecord) -> None:
+    _ = (
+        record.dialog_id,
+        record.message_id,
+        record.fwd_from_peer_id,
+        record.fwd_from_name,
+        record.fwd_date,
+        record.fwd_channel_post,
+    )
 
 
 def extract_reply_count(msg: object) -> int:
@@ -433,14 +488,14 @@ def extract_reactions_rows(
         emoticon = _attr(reaction, "emoticon", None) if reaction is not None else None
         count = _attr(item, "count", 0)
         if emoticon is not None:
-            rows.append(
-                ReactionRecord(
-                    dialog_id=dialog_id,
-                    message_id=message_id,
-                    emoji=emoticon,
-                    count=int(count),
-                )
+            record = ReactionRecord(
+                dialog_id=dialog_id,
+                message_id=message_id,
+                emoji=emoticon,
+                count=int(count),
             )
+            _touch_reaction_record_fields(record)
+            rows.append(record)
     return rows
 
 
@@ -572,6 +627,7 @@ def extract_entity_rows(dialog_id: int, message_id: int, msg: object) -> list[En
                 value=value,
             )
         )
+        _touch_entity_record_fields(rows[-1])
     return rows
 
 
@@ -724,6 +780,7 @@ def extract_fwd_row(
     fwd = _attr(msg, "fwd_from", None)
     if fwd is None:
         return None
+    _touch_forward_fields(cast(_ForwardLike, fwd))
     from_id = _attr(fwd, "from_id", None)
     fwd_from_peer_id = _marked_peer_id(from_id) if from_id is not None else None
     fwd_from_name = _attr(fwd, "from_name", None)
@@ -739,7 +796,7 @@ def extract_fwd_row(
     fwd_channel_post = _attr(fwd, "channel_post", None)
     if fwd_channel_post is not None:
         fwd_channel_post = int(fwd_channel_post)
-    return ForwardRecord(
+    record = ForwardRecord(
         dialog_id=dialog_id,
         message_id=message_id,
         fwd_from_peer_id=fwd_from_peer_id,
@@ -747,6 +804,8 @@ def extract_fwd_row(
         fwd_date=fwd_date,
         fwd_channel_post=fwd_channel_post,
     )
+    _touch_forward_record_fields(record)
+    return record
 
 
 def extract_message_row(
@@ -760,6 +819,7 @@ def extract_message_row(
     records for atomic multi-table insert.
     """
     message_id = int(_attr(msg, "id", 0))
+    _touch_message_fields(cast(_MessageLike, msg))
 
     reply_to_msg_id, forum_topic_id = extract_reply_and_topic(msg)
 
@@ -780,6 +840,7 @@ def extract_message_row(
         is_service=1 if isinstance(msg, types.MessageService) else 0,
         post_author=_attr(msg, "post_author", None),
     )
+    _touch_stored_message_fields(stored)
     reply_count = extract_reply_count(msg)
     reactions = extract_reactions_rows(dialog_id, message_id, _attr(msg, "reactions", None))
     entities = extract_entity_rows(dialog_id, message_id, msg)
@@ -1040,3 +1101,15 @@ class FullSyncWorker:
         if is_done:
             logger.info("sync_done dialog_id=%d status=synced total_messages=%d", dialog_id, total_messages)
         return new_progress, is_done
+
+
+_EXPORTED_SYMBOLS = (
+    StoredMessage,
+    ReactionRecord,
+    EntityRecord,
+    ForwardRecord,
+    ExtractedMessage,
+    FullSyncWorker,
+    FullSyncWorker.bootstrap_dms,
+    FullSyncWorker.process_one_batch,
+)

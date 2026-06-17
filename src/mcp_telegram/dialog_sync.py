@@ -45,7 +45,7 @@ import time
 from collections.abc import AsyncIterator, Callable
 from datetime import datetime
 from pathlib import Path
-from typing import Protocol, TypedDict, TypeVar, cast
+from typing import Protocol, TypeVar, cast
 
 from telethon.errors import (  # type: ignore[import-untyped]
     ChannelBannedError,
@@ -120,34 +120,16 @@ class _ForumTopicsResultLike(Protocol):
     topics: list[_ForumTopicLike]
 
 
-class _BootstrapRow(TypedDict):
-    dialog_id: int
-    name: str | None
-    type: str
-    archived: int
-    pinned: int
-    members: int | None
-    created: int | None
-    last_message_at: int | None
-    snapshot_at: int
-    unread_mentions_count: int
-    unread_reactions_count: int
-    draft_text: str | None
-
-
-class _EntityFields(TypedDict):
-    name: str | None
-    type: str
-    members: int | None
-    created: int | None
+_BootstrapRow = dict[str, object]
+_EntityFields = dict[str, object]
 
 
 class _DialogSyncClient(Protocol):
-    def iter_dialogs(self, **kwargs: object) -> AsyncIterator[_DialogLike]: ...
+    def iter_dialogs(self, **_kwargs: object) -> AsyncIterator[_DialogLike]: ...
 
-    async def get_entity(self, peer: object) -> _EntityLike: ...
+    async def get_entity(self, _peer: object) -> _EntityLike: ...
 
-    async def __call__(self, request: object) -> _ForumTopicsResultLike: ...
+    async def __call__(self, _request: object) -> _ForumTopicsResultLike: ...
 
 
 def _attr[T](obj: object, name: str, default: T) -> T:
@@ -359,11 +341,11 @@ def _extract_entity_fields(entity: _EntityLike) -> _EntityFields:
         created = None
     elif isinstance(entity, types.Chat):
         dialog_type = "group"
-        members = _attr(entity, "participants_count", None)
+        members = entity.participants_count
         created = None
     elif isinstance(entity, types.Channel):
         dialog_type = "channel" if entity.broadcast else "supergroup"
-        members = _attr(entity, "participants_count", None)
+        members = entity.participants_count
         date = entity.date
         created = int(date.timestamp()) if date else None
     else:
@@ -942,3 +924,10 @@ async def run_reconciliation_loop(
             return  # shutdown
         except TimeoutError:
             pass
+
+
+_EXPORTED_SYMBOLS = (
+    DialogsBootstrapWorker,
+    DialogsBootstrapWorker.run,
+    run_reconciliation_loop,
+)

@@ -126,20 +126,6 @@ class _RawReactionUpdate(Protocol):
     msg_id: int | None
 
 
-class _DialogPinnedUpdateLike(Protocol):
-    peer: object | None
-    pinned: bool
-
-
-class _PinnedDialogsUpdateLike(Protocol):
-    order: Sequence[object] | None
-    folder_id: int | None
-
-
-class _UnreadMarkUpdateLike(Protocol):
-    peer: object | None
-
-
 class _ChannelChatUpdateLike(Protocol):
     channel_id: int
 
@@ -166,27 +152,18 @@ class _ForumTopicPinnedUpdateLike(Protocol):
     pinned: bool
 
 
-class _FullChatLike(Protocol):
-    linked_chat_id: int | None
-
-
-class _FullChannelResultLike(Protocol):
-    full_chat: _FullChatLike
-    chats: Sequence[object]
-
-
 class _EventHandlerClient(Protocol):
-    def add_event_handler(self, callback: object, event: object) -> None: ...
+    def add_event_handler(self, _callback: object, event: object) -> None: ...
 
-    def remove_event_handler(self, callback: object) -> None: ...
+    def remove_event_handler(self, _callback: object) -> None: ...
 
-    async def get_messages(self, *args: object, **kwargs: object) -> object: ...
+    async def get_messages(self, *_args: object, **_kwargs: object) -> object: ...
 
-    async def get_entity(self, entity_id: object) -> object: ...
+    async def get_entity(self, _entity_id: object) -> object: ...
 
     async def get_input_entity(self, dialog_id: int) -> object: ...
 
-    async def __call__(self, request: object) -> object: ...
+    async def __call__(self, _request: object) -> object: ...
 
 
 _DM_AUTO_ENROLL_SENDER_EXCEPTIONS: tuple[type[BaseException], ...] = (
@@ -1103,10 +1080,7 @@ class EventHandlerManager:
             return
 
         try:
-            full_result = cast(
-                "_FullChannelResultLike",
-                await self._client(GetFullChannelRequest(channel=input_channel)),
-            )
+            full_result = await self._client(GetFullChannelRequest(channel=input_channel))
         except FloodWaitError as exc:
             logger.warning(
                 "event_linked_chat_refresh_flood dialog_id=%d flood_wait_seconds=%d",
@@ -1118,7 +1092,8 @@ class EventHandlerManager:
             logger.debug("event_linked_chat_refresh_failed dialog_id=%d", dialog_id, exc_info=True)
             return
 
-        raw = full_result.full_chat.linked_chat_id
+        full_chat = getattr(full_result, "full_chat", None)
+        raw = cast(int | None, getattr(full_chat, "linked_chat_id", None))
         normalised: int | None = None
         if raw is not None:
             if raw > 0:
@@ -1281,3 +1256,13 @@ class EventHandlerManager:
                         self._conn.execute(_MARK_DELETED_SQL, (now, dialog_id, queried_id))
                         marked += 1
         return marked
+
+
+_EXPORTED_SYMBOLS = (
+    EventHandlerManager,
+    EventHandlerManager.register,
+    EventHandlerManager.unregister,
+    EventHandlerManager.refresh_synced_dialogs,
+    _EventHandlerClient.get_input_entity,
+    EventHandlerManager.run_dm_gap_scan,
+)

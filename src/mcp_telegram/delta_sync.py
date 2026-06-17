@@ -67,16 +67,9 @@ class AccessProbeLoopOptions(TypedDict, total=False):
 
 
 class _DeltaSyncClient(Protocol):
-    def iter_messages(
-        self,
-        *,
-        entity: int,
-        min_id: int,
-        reverse: bool,
-        limit: int | None,
-    ) -> AsyncIterator[object]: ...
+    def iter_messages(self, **_kwargs: object) -> AsyncIterator[object]: ...
 
-    async def get_messages(self, *, entity: int, limit: int) -> object: ...
+    async def get_messages(self, **_kwargs: object) -> object: ...
 
 
 def _row_first_int(row: tuple[object | None, ...] | None) -> int:
@@ -330,3 +323,10 @@ async def run_access_probe_loop(
             return  # shutdown during sleep
         except TimeoutError:
             pass  # interval elapsed, run again
+
+
+_EXPORTED_SYMBOLS = (
+    DeltaSyncWorker,
+    DeltaSyncWorker.run_delta_catch_up,
+    run_access_probe_loop,
+)
