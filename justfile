@@ -63,9 +63,12 @@ deadcode:
 coverage:
     uv run pytest -W error::ResourceWarning --cov=src/mcp_telegram --cov-report=term-missing
 
-# Run pytest with CRAP reporting over the full suite.
+# Human CRAP report over the full suite.
 crap:
     uv run pytest --cov=src/mcp_telegram --cov-report=term-missing --crap --crap-threshold=30 --crap-top-n=30
+
+# CI/regression CRAP gate that checks the tracked baseline.
+crap-check: crap-ratchet
 
 # Regenerate the tracked CRAP baseline from the current coverage state.
 crap-baseline:
@@ -115,8 +118,8 @@ fix:
     uv run ruff check --fix src tests deploy
     uv run ruff format src tests deploy
 
-# Run local checks, unit tests, rebuild the runtime, and smoke-test live MCP behavior.
-verify: check typecheck-tests unit runtime-verify
+# Run local checks, CRAP ratchet, rebuild the runtime, and smoke-test live MCP behavior.
+verify: check crap-ratchet runtime-verify
 
 # Show live Docker container state.
 runtime-status:
