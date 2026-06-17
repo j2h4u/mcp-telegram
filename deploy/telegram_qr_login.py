@@ -31,6 +31,22 @@ QR_REFRESH_MARGIN_SECONDS = 20
 QR_PROGRESS_BAR_WIDTH = 28
 
 
+def _load_telegram_credentials() -> tuple[int, str, str]:
+    """Load and validate Telegram auth settings from the environment."""
+    api_id_raw = os.getenv("TELEGRAM_API_ID", "").strip()
+    api_hash = os.getenv("TELEGRAM_API_HASH", "").strip()
+    two_fa_password = os.getenv("TELEGRAM_2FA_PASSWORD", "")
+
+    if not api_id_raw or not api_hash:
+        print("TELEGRAM_API_ID or TELEGRAM_API_HASH is not set in .env")
+        sys.exit(1)
+    if not api_id_raw.isdecimal():
+        print("TELEGRAM_API_ID must be an integer")
+        sys.exit(1)
+
+    return int(api_id_raw), api_hash, two_fa_password
+
+
 def qr_to_terminal(data: str) -> str:
     """Render QR data as terminal text."""
     qr = qrcode.QRCode(
@@ -73,6 +89,15 @@ def build_countdown_bar(remaining_seconds: int, total_seconds: int) -> str:
     filled_width = max(0, min(QR_PROGRESS_BAR_WIDTH, filled_width))
     empty_width = QR_PROGRESS_BAR_WIDTH - filled_width
     return f"[{'#' * filled_width}{'-' * empty_width}]"
+
+
+async def _show_account_summary(client: TelegramClient, session_file: Path | None = None) -> None:
+    """Print account details for the current authenticated session."""
+    me = await client.get_me()
+    print(f"Phone: {me.phone}")
+    print(f"Name: {me.first_name}")
+    if session_file is not None:
+        print(f"Session saved to: {session_file}")
 
 
 def show_2fa_screen(using_env_password: bool) -> None:
@@ -130,18 +155,55 @@ async def complete_2fa_login(client: TelegramClient, two_fa_password: str) -> No
             print(f"Invalid 2FA password. Attempts remaining: {remaining_attempts}")
 
 
-async def main() -> None:
-    api_id_raw = os.getenv("TELEGRAM_API_ID", "").strip()
-    api_hash = os.getenv("TELEGRAM_API_HASH", "").strip()
-    two_fa_password = os.getenv("TELEGRAM_2FA_PASSWORD", "")
+async def _run_qr_login(client: TelegramClient, two_fa_password: str, session_file: Path) -> None:
+    """Run the QR login loop until authorization completes."""
+    qr_login = await client.qr_login()
+    qr_total_seconds = _qr_lifetime(qr_login)
 
-    if not api_id_raw or not api_hash:
-        print("TELEGRAM_API_ID or TELEGRAM_API_HASH is not set in .env")
-        sys.exit(1)
-    if not api_id_raw.isdecimal():
-        print("TELEGRAM_API_ID must be an integer")
-        sys.exit(1)
-    api_id = int(api_id_raw)
+    while True:
+        expires_at = qr_login.expires.astimezone(datetime.UTC)
+        remaining_seconds = max(
+            0,
+            int((expires_at - datetime.datetime.now(tz=datetime.UTC)).total_seconds()),
+        )
+
+        if remaining_seconds <= QR_REFRESH_MARGIN_SECONDS:
+            qr_login = await client.qr_login()
+            qr_total_seconds = _qr_lifetime(qr_login)
+            continue
+
+        qr_ascii = qr_to_terminal(qr_login.url)
+        countdown_bar = build_countdown_bar(remaining_seconds, qr_total_seconds)
+
+        clear_screen()
+        print("=" * 50)
+        print("TELEGRAM QR LOGIN".center(50))
+        print("=" * 50)
+        print(f"\nQR expires in: {remaining_seconds}s\n")
+        print(f"{countdown_bar}\n")
+        print(qr_ascii)
+        print("\nScan this QR code with Telegram on your phone.")
+        print("Waiting for confirmation...\n")
+        print("=" * 50)
+
+        try:
+            wait_timeout = min(10, max(1, remaining_seconds))
+            await qr_login.wait(timeout=wait_timeout)
+        except TimeoutError:
+            if datetime.datetime.now(tz=datetime.UTC) >= expires_at:
+                qr_login = await client.qr_login()
+                qr_total_seconds = _qr_lifetime(qr_login)
+            continue
+        except SessionPasswordNeededError:
+            await complete_2fa_login(client, two_fa_password)
+
+        print("\nAuthorization successful.")
+        await _show_account_summary(client, session_file)
+        return
+
+
+async def main() -> None:
+    api_id, api_hash, two_fa_password = _load_telegram_credentials()
 
     session_file = Path("database") / "mcp_telegram_session"
     session_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -152,60 +214,11 @@ async def main() -> None:
     try:
         if await client.is_user_authorized():
             print("Already authorized.")
-            me = await client.get_me()
-            print(f"Phone: {me.phone}")
-            print(f"Name: {me.first_name}")
-            await client.disconnect()
+            await _show_account_summary(client)
             return
 
         print("Requesting a Telegram QR login code...\n")
-
-        qr_login = await client.qr_login()
-        qr_total_seconds = _qr_lifetime(qr_login)
-
-        while True:
-            expires_at = qr_login.expires.astimezone(datetime.UTC)
-            now = datetime.datetime.now(tz=datetime.UTC)
-            remaining_seconds = max(0, int((expires_at - now).total_seconds()))
-
-            if remaining_seconds <= QR_REFRESH_MARGIN_SECONDS:
-                qr_login = await client.qr_login()
-                qr_total_seconds = _qr_lifetime(qr_login)
-                continue
-
-            qr_ascii = qr_to_terminal(qr_login.url)
-            countdown_bar = build_countdown_bar(remaining_seconds, qr_total_seconds)
-
-            clear_screen()
-            print("=" * 50)
-            print("TELEGRAM QR LOGIN".center(50))
-            print("=" * 50)
-            print(f"\nQR expires in: {remaining_seconds}s\n")
-            print(f"{countdown_bar}\n")
-            print(qr_ascii)
-            print("\nScan this QR code with Telegram on your phone.")
-            print("Waiting for confirmation...\n")
-            print("=" * 50)
-
-            try:
-                wait_timeout = min(10, max(1, remaining_seconds))
-                await qr_login.wait(timeout=wait_timeout)
-            except TimeoutError:
-                if datetime.datetime.now(tz=datetime.UTC) >= expires_at:
-                    qr_login = await client.qr_login()
-                    qr_total_seconds = _qr_lifetime(qr_login)
-                continue
-            except SessionPasswordNeededError:
-                await complete_2fa_login(client, two_fa_password)
-
-            print("\nAuthorization successful.")
-            me = await client.get_me()
-            print(f"Phone: {me.phone}")
-            print(f"Name: {me.first_name}")
-            print(f"Session saved to: {session_file}")
-            await client.disconnect()
-            return
-
+        await _run_qr_login(client, two_fa_password, session_file)
     except asyncio.CancelledError:
         print("\nCancelled by user.")
     except TimeoutError as e:
