@@ -14,6 +14,7 @@ import json
 import logging
 import sqlite3
 import time
+from collections.abc import Coroutine
 from dataclasses import dataclass
 from typing import Protocol, cast
 
@@ -61,7 +62,11 @@ class _LinkedChatCacheWrite:
     now: int
 
 
-async def resolve_input_peer(client: _ActivityClient, dialog_id: int) -> TypeInputPeer | None:
+class _InputEntityResolverClient(Protocol):
+    def get_input_entity(self, dialog_id: int) -> Coroutine[object, object, object]: ...
+
+
+async def resolve_input_peer(client: _InputEntityResolverClient, dialog_id: int) -> TypeInputPeer | None:
     """Resolve a bare dialog_id to a concrete InputPeer via the Telethon session.
 
     Uses client.get_input_entity() which is entity-type-aware: it resolves

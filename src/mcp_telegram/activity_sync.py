@@ -16,12 +16,7 @@ from typing import Protocol, cast
 
 from telethon.errors import FloodWaitError
 from telethon.tl.functions.messages import SearchRequest
-from telethon.tl.types import (
-    InputMessagesFilterEmpty,
-    InputPeerEmpty,
-    InputPeerSelf,
-    TypeInputPeer,
-)
+from telethon.tl.types import InputMessagesFilterEmpty, InputPeerEmpty, InputPeerSelf
 
 from .flood import flood_seconds, sleep_through_flood
 from .models import DialogType
@@ -96,7 +91,7 @@ _SEARCH_BATCH_STOP = object()
 class _ActivityClient(Protocol):
     def __call__(self, request: object) -> Coroutine[object, object, object]: ...
 
-    def get_input_entity(self, dialog_id: int) -> Coroutine[object, object, TypeInputPeer]: ...
+    def get_input_entity(self, dialog_id: int) -> Coroutine[object, object, object]: ...
 
 
 class _HasPeerIdLike(Protocol):
