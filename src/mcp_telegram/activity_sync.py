@@ -9,8 +9,10 @@ import asyncio
 import logging
 import sqlite3
 import time
+from collections.abc import Coroutine, Sequence
 from dataclasses import dataclass
-from typing import Any
+from datetime import UTC, datetime
+from typing import Protocol, cast
 
 from telethon.errors import FloodWaitError
 from telethon.tl.functions.messages import SearchRequest
@@ -18,6 +20,7 @@ from telethon.tl.types import (
     InputMessagesFilterEmpty,
     InputPeerEmpty,
     InputPeerSelf,
+    TypeInputPeer,
 )
 
 from .flood import flood_seconds, sleep_through_flood
@@ -90,9 +93,43 @@ _SEARCH_BATCH_RETRY = object()
 _SEARCH_BATCH_STOP = object()
 
 
+class _ActivityClient(Protocol):
+    def __call__(self, request: object) -> Coroutine[object, object, object]: ...
+
+    def get_input_entity(self, dialog_id: int) -> Coroutine[object, object, TypeInputPeer]: ...
+
+
+class _HasPeerIdLike(Protocol):
+    peer_id: object | None
+
+
+class _SearchEntityLike(Protocol):
+    id: int
+    first_name: str | None
+    last_name: str | None
+    title: str | None
+    username: str | None
+
+
+class _SearchMessageLike(_HasPeerIdLike, Protocol):
+    id: int
+    date: datetime | None
+
+
+class _SearchResultLike(Protocol):
+    users: Sequence[_SearchEntityLike] | None
+    chats: Sequence[_SearchEntityLike] | None
+    messages: Sequence[_SearchMessageLike] | None
+    count: int | None
+
+
+_SyncStateRow = tuple[str, str | None]
+_DialogStateRow = tuple[int | None, int | None, int | None, str | None, int | None, str | None, int | None, str | None]
+
+
 def _load_state(conn: sqlite3.Connection) -> dict[str, str | None]:
-    rows = conn.execute("SELECT key, value FROM activity_sync_state").fetchall()
-    return {r[0]: r[1] for r in rows}
+    rows = cast(list[_SyncStateRow], conn.execute("SELECT key, value FROM activity_sync_state").fetchall())
+    return dict(rows)
 
 
 def _set_state(conn: sqlite3.Connection, key: str, value: str | None) -> None:
@@ -108,20 +145,20 @@ def _stamp_last_sync_at(conn: sqlite3.Connection) -> None:
     _set_state(conn, "last_sync_at", str(int(time.time())))
 
 
-def extract_dialog_id(msg: Any) -> int | None:
+def extract_dialog_id(msg: _HasPeerIdLike) -> int | None:
     """Resolve dialog_id from a Telethon message's peer_id field.
 
     Public name so activity_peer_sweep can import it without relying on the
     module-private underscore convention.
     """
-    peer = getattr(msg, "peer_id", None)
+    peer = msg.peer_id
     if peer is None:
         return None
     # telethon.utils.get_peer_id handles User/Chat/Channel variants
     from telethon.utils import get_peer_id
 
     try:
-        return get_peer_id(peer)
+        return int(cast(int | str, get_peer_id(peer)))
     except Exception:
         logger.warning("activity_sync_peer_id_unresolvable", exc_info=True)
         return None
@@ -138,7 +175,7 @@ def _normalize(text: str | None) -> str | None:
     return text.strip().lower() or None
 
 
-def _classify_entity(obj: Any) -> str | None:
+def _classify_entity(obj: object) -> str | None:
     """Infer entities.type from a Telethon object via the single source of truth.
 
     Returns the canonical DialogType value string, or None for an unclassifiable
@@ -149,7 +186,7 @@ def _classify_entity(obj: Any) -> str | None:
     return None if dt is DialogType.UNKNOWN else dt.value
 
 
-def _upsert_entities_from_search(conn: sqlite3.Connection, result: Any) -> None:
+def _upsert_entities_from_search(conn: sqlite3.Connection, result: _SearchResultLike) -> None:
     """Upsert users/chats from SearchRequest response into entities table.
 
     Uses the FULL column set (id, type, name, username, name_normalized, updated_at).
@@ -161,27 +198,25 @@ def _upsert_entities_from_search(conn: sqlite3.Connection, result: Any) -> None:
     now = int(time.time())
     rows: list[tuple[int, str, str | None, str | None, str | None, int]] = []
 
-    for u in getattr(result, "users", []) or []:
+    for u in result.users or ():
         etype = _classify_entity(u)
         if etype is None:
             continue
-        name = " ".join(p for p in (getattr(u, "first_name", None), getattr(u, "last_name", None)) if p) or (
-            getattr(u, "username", None) or None
-        )
-        username = getattr(u, "username", None)
+        name = " ".join(p for p in (u.first_name, u.last_name) if p) or (u.username or None)
+        username = u.username
         rows.append((int(u.id), etype, name, username, _normalize(name), now))
 
-    for c in getattr(result, "chats", []) or []:
+    for c in result.chats or ():
         etype = _classify_entity(c)
         if etype is None:
             continue
         try:
-            pid = get_peer_id(c)  # yields -100XXXXX for Channel
+            pid = int(cast(int | str, get_peer_id(c)))  # yields -100XXXXX for Channel
         except TypeError:
             continue
-        name = getattr(c, "title", None) or None
-        username = getattr(c, "username", None)
-        rows.append((int(pid), etype, name, username, _normalize(name), now))
+        name = c.title or None
+        username = c.username
+        rows.append((pid, etype, name, username, _normalize(name), now))
 
     if not rows:
         return
@@ -206,7 +241,7 @@ async def _wait_for_shutdown(shutdown_event: asyncio.Event, timeout: float) -> b
         return False
 
 
-def _extract_own_message_rows(batch: list[Any]) -> list[ExtractedMessage]:
+def _extract_own_message_rows(batch: Sequence[_SearchMessageLike]) -> list[ExtractedMessage]:
     """Extract canonical own-message rows from a Telegram batch."""
     extracted: list[ExtractedMessage] = []
     for m in batch:
@@ -231,12 +266,12 @@ def _persist_own_message_rows(conn: sqlite3.Connection, extracted: list[Extracte
 
 
 async def _search_backfill_batch(
-    client: Any,
+    client: _ActivityClient,
     checkpoint: int,
     shutdown_event: asyncio.Event,
     *,
     total_fetched: int,
-) -> Any:
+) -> object:
     """Run the backfill SearchRequest and translate control-flow exceptions."""
     try:
         return await _call_with_timeout(
@@ -275,13 +310,13 @@ async def _search_backfill_batch(
 
 
 async def _search_incremental_batch(
-    client: Any,
+    client: _ActivityClient,
     min_date: int,
     offset_id: int,
     shutdown_event: asyncio.Event,
     *,
     inserted: int,
-) -> Any:
+) -> object:
     """Run the incremental SearchRequest and translate control-flow exceptions."""
     try:
         return await _call_with_timeout(
@@ -290,7 +325,7 @@ async def _search_incremental_batch(
                 peer=InputPeerEmpty(),
                 q="",
                 filter=InputMessagesFilterEmpty(),
-                min_date=min_date,
+                min_date=datetime.fromtimestamp(min_date, tz=UTC),
                 max_date=None,
                 offset_id=offset_id,
                 add_offset=0,
@@ -311,12 +346,12 @@ async def _search_incremental_batch(
         return _SEARCH_BATCH_STOP
 
 
-def _trim_incremental_batch(batch: list[Any], min_date: int) -> tuple[list[Any], bool]:
+def _trim_incremental_batch(batch: Sequence[_SearchMessageLike], min_date: int) -> tuple[list[_SearchMessageLike], bool]:
     """Apply the client-side min_date filter used by the incremental loop."""
-    in_window: list[Any] = []
+    in_window: list[_SearchMessageLike] = []
     past_window = False
     for m in batch:
-        m_ts = int(m.date.timestamp()) if getattr(m, "date", None) else 0
+        m_ts = int(m.date.timestamp()) if m.date is not None else 0
         if m_ts >= min_date:
             in_window.append(m)
         else:
@@ -369,7 +404,7 @@ def _log_incremental_batch(progress: _IncrementalState, batch_log: _IncrementalB
     )
 
 
-async def call_with_timeout(client: Any, request: Any) -> Any:
+async def call_with_timeout(client: _ActivityClient, request: object) -> object:
     """Invoke a Telethon RPC with a hard timeout and abandon on overrun.
 
     asyncio.wait_for awaits the wrapped task to actually finish after
@@ -400,7 +435,7 @@ _call_with_timeout = call_with_timeout
 
 
 async def _run_backfill(
-    client: Any,
+    client: _ActivityClient,
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,
 ) -> None:
@@ -436,9 +471,10 @@ async def _run_backfill(
         if result is _SEARCH_BATCH_RETRY:
             continue
 
-        batch = list(getattr(result, "messages", []) or [])
+        search_result = cast(_SearchResultLike, result)
+        batch = list(search_result.messages or [])
         if progress.total_known is None:
-            progress.total_known = getattr(result, "count", None)
+            progress.total_known = cast(int | None, getattr(search_result, "count", None))
             if progress.total_known is not None:
                 logger.info("activity_sync_backfill_total total=%d", progress.total_known)
 
@@ -455,10 +491,10 @@ async def _run_backfill(
         extracted = _extract_own_message_rows(batch)
         _persist_own_message_rows(conn, extracted)
 
-        _upsert_entities_from_search(conn, result)
+        _upsert_entities_from_search(conn, search_result)
 
         progress.total_fetched += len(batch)
-        progress.checkpoint = min(m.id for m in batch if getattr(m, "id", None) is not None)
+        progress.checkpoint = min(m.id for m in batch)
         _set_state(conn, "backfill_offset_id", str(progress.checkpoint))
         _log_backfill_batch(progress, len(batch))
 
@@ -467,7 +503,7 @@ async def _run_backfill(
 
 
 async def _run_incremental(
-    client: Any,
+    client: _ActivityClient,
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,
 ) -> None:
@@ -507,7 +543,8 @@ async def _run_incremental(
         if result is _SEARCH_BATCH_RETRY:
             continue
 
-        batch = list(getattr(result, "messages", []) or [])
+        search_result = cast(_SearchResultLike, result)
+        batch = list(search_result.messages or [])
         if not batch:
             break
 
@@ -520,12 +557,12 @@ async def _run_incremental(
         extracted = _extract_own_message_rows(in_window)
         _persist_own_message_rows(conn, extracted)
 
-        _upsert_entities_from_search(conn, result)
+        _upsert_entities_from_search(conn, search_result)
         progress.inserted += len(in_window)
         progress.batch_num += 1
         # Always advance offset_id by the full batch — even messages outside
         # the window must be skipped past so we don't re-fetch them.
-        progress.offset_id = min(m.id for m in batch if getattr(m, "id", None) is not None)
+        progress.offset_id = min(m.id for m in batch)
 
         # last_sync_at is stamped once at end-of-loop, not per batch:
         # with the client-side min_date filter the loop terminates within
@@ -554,7 +591,7 @@ async def _run_incremental(
 
 
 async def run_activity_sync_loop(
-    client: Any,
+    client: _ActivityClient,
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,
     *,

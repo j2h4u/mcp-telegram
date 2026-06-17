@@ -28,7 +28,7 @@ import sqlite3
 import time
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any
+from typing import cast
 
 from .activity_peer_sweep import (
     SkipReason,
@@ -36,6 +36,7 @@ from .activity_peer_sweep import (
     build_working_set,
     sweep_peer_once,
 )
+from .activity_sync import _ActivityClient
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +90,7 @@ class ColdPassResult:
 
 
 async def run_cold_backfill_pass(
-    client: Any,
+    client: _ActivityClient,
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,
 ) -> ColdPassResult:
@@ -112,7 +113,9 @@ async def run_cold_backfill_pass(
     now = int(time.time())
 
     # Select ONE due peer — oldest-updated first (round-robin anti-starvation)
-    row = conn.execute(
+    row = cast(
+        tuple[int, int | None] | None,
+        conn.execute(
         """
         SELECT dialog_id, cold_offset_id
         FROM activity_dialog_state
@@ -122,7 +125,8 @@ async def run_cold_backfill_pass(
         LIMIT 1
         """,
         {"now": now},
-    ).fetchone()
+        ).fetchone(),
+    )
 
     if row is None:
         logger.debug("activity_cold_backfill_pass_no_due_peer")
@@ -241,7 +245,7 @@ async def run_cold_backfill_pass(
 
 
 async def run_cold_backfill_loop(
-    client: Any,
+    client: _ActivityClient,
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,
     *,

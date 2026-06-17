@@ -21,12 +21,13 @@ No scheduling loops live here — those are plans 03 and 04.
 import logging
 import sqlite3
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any
+from typing import Protocol, cast
 
 from .activity_peer_resolve import LinkedChatResolution, resolve_input_peer, resolve_linked_chat_id
-from .activity_sync import INSERT_OWN_ONLY_DIALOG_SQL, call_with_timeout, extract_dialog_id
+from .activity_sync import INSERT_OWN_ONLY_DIALOG_SQL, _ActivityClient, call_with_timeout, extract_dialog_id
 from .sync_worker import ExtractedMessage, extract_message_row, insert_messages_with_fts
 
 logger = logging.getLogger(__name__)
@@ -95,7 +96,7 @@ class SweepResult:
 class PeerSweepRequest:
     """Request context for a single per-peer self-search sweep."""
 
-    client: Any
+    client: _ActivityClient
     conn: sqlite3.Connection
     dialog_id: int
     offset_id: int
@@ -106,21 +107,30 @@ class PeerSweepRequest:
 _LEGACY_PEER_SWEEP_POSITIONAL_ARGS = 3
 
 
-def _coerce_peer_sweep_request(*args: Any, **kwargs: Any) -> PeerSweepRequest:
+class _SweepMessageLike(Protocol):
+    id: int
+    peer_id: object | None
+
+
+class _SweepResultLike(Protocol):
+    messages: Sequence[_SweepMessageLike] | None
+
+
+def _coerce_peer_sweep_request(*args: object, **kwargs: object) -> PeerSweepRequest:
     """Normalize legacy call shapes into a single request record."""
     if len(args) == 1 and isinstance(args[0], PeerSweepRequest) and not kwargs:
         return args[0]
 
     if len(args) == _LEGACY_PEER_SWEEP_POSITIONAL_ARGS:
-        client, conn, dialog_id = args
+        client, conn, dialog_id = cast(tuple[_ActivityClient, sqlite3.Connection, int], args)
     else:
-        client = kwargs.pop("client")
-        conn = kwargs.pop("conn")
-        dialog_id = kwargs.pop("dialog_id")
+        client = cast(_ActivityClient, kwargs.pop("client"))
+        conn = cast(sqlite3.Connection, kwargs.pop("conn"))
+        dialog_id = cast(int, kwargs.pop("dialog_id"))
 
-    offset_id = kwargs.pop("offset_id")
-    min_id = kwargs.pop("min_id")
-    limit = kwargs.pop("limit")
+    offset_id = cast(int, kwargs.pop("offset_id"))
+    min_id = cast(int, kwargs.pop("min_id"))
+    limit = cast(int, kwargs.pop("limit"))
     if kwargs:
         raise TypeError(f"sweep_peer_once: unexpected keyword arguments {sorted(kwargs)!r}")
 
@@ -139,7 +149,7 @@ def _coerce_peer_sweep_request(*args: Any, **kwargs: Any) -> PeerSweepRequest:
 # ---------------------------------------------------------------------------
 
 
-async def sweep_peer_once(*args: Any, **kwargs: Any) -> SweepResult:
+async def sweep_peer_once(*args: object, **kwargs: object) -> SweepResult:
     """Search for self-authored messages in a single peer and persist them.
 
     Direction-agnostic: takes explicit offset_id + min_id, reports both
@@ -216,7 +226,7 @@ async def sweep_peer_once(*args: Any, **kwargs: Any) -> SweepResult:
             skip_reason=SkipReason.ACCESS_SKIP,
         )
 
-    batch = list(getattr(result, "messages", []) or [])
+    batch = list(cast(_SweepResultLike, result).messages or [])
 
     # Step 5: genuinely empty batch from a reachable peer → history floor
     if not batch:
@@ -242,7 +252,7 @@ async def sweep_peer_once(*args: Any, **kwargs: Any) -> SweepResult:
             insert_messages_with_fts(request.conn, extracted)
             persisted = len(extracted)
 
-    msg_ids = [m.id for m in batch if getattr(m, "id", None) is not None]
+    msg_ids = [m.id for m in batch]
     return SweepResult(
         fetched_ids=msg_ids,
         persisted=persisted,
@@ -320,9 +330,14 @@ _DIALOG_STATE_COLUMNS = frozenset(
 )
 
 
-def _load_dialog_state(conn: sqlite3.Connection, dialog_id: int) -> dict:
+_DialogStateRow = tuple[int | None, int | None, int | None, str | None, int | None, str | None, int | None, str | None]
+
+
+def _load_dialog_state(conn: sqlite3.Connection, dialog_id: int) -> dict[str, int | None | str]:
     """Return the per-tier cursor/retry fields for a peer, or {} if absent."""
-    row = conn.execute(
+    row = cast(
+        _DialogStateRow | None,
+        conn.execute(
         """
         SELECT hot_cursor, hot_last_sync_at, hot_next_retry_at, hot_last_error,
                cold_offset_id, cold_status, cold_next_retry_at, cold_last_error
@@ -330,7 +345,8 @@ def _load_dialog_state(conn: sqlite3.Connection, dialog_id: int) -> dict:
         WHERE dialog_id = ?
         """,
         (dialog_id,),
-    ).fetchone()
+        ).fetchone(),
+    )
     if row is None:
         return {}
     keys = [
@@ -349,7 +365,7 @@ def _load_dialog_state(conn: sqlite3.Connection, dialog_id: int) -> dict:
 def _save_dialog_state(
     conn: sqlite3.Connection,
     dialog_id: int,
-    **fields: Any,
+    **fields: object,
 ) -> None:
     """Update whitelisted per-tier cursor/retry fields for a peer.
 
@@ -377,7 +393,7 @@ def _save_dialog_state(
 # ---------------------------------------------------------------------------
 
 
-async def build_working_set(client: Any, conn: sqlite3.Connection) -> int:
+async def build_working_set(client: _ActivityClient, conn: sqlite3.Connection) -> int:
     """Build the per-peer self-search working set and enroll peers.
 
     Source: dialogs.type='supergroup' (megagroups) and dialogs.type='channel'
@@ -389,19 +405,20 @@ async def build_working_set(client: Any, conn: sqlite3.Connection) -> int:
     Returns the count of peers enrolled in the working set.
     """
     # Step 1: standalone supergroups (directly self-searchable)
-    supergroup_rows = conn.execute(
+    supergroup_rows = cast(list[tuple[int, int | None]], conn.execute(
         "SELECT dialog_id, last_message_at FROM dialogs WHERE type = 'supergroup' AND hidden = 0"
-    ).fetchall()
+    ).fetchall())
 
     # Step 2: broadcast channels (need linked_chat resolution)
-    channel_rows = conn.execute(
+    channel_rows = cast(list[tuple[int, int | None]], conn.execute(
         "SELECT dialog_id, last_message_at FROM dialogs WHERE type = 'channel' AND hidden = 0"
-    ).fetchall()
+    ).fetchall())
 
     working_set: dict[int, int | None] = {}  # peer_id → last_activity_at
 
     # Enroll supergroups directly
     working_set = dict(supergroup_rows)
+    supergroup_ids = {dialog_id for dialog_id, _ in supergroup_rows}
 
     # Step 3: resolve broadcast channels to their discussion groups
     for channel_id, channel_last_message_at in channel_rows:
@@ -425,7 +442,7 @@ async def build_working_set(client: Any, conn: sqlite3.Connection) -> int:
 
     # Step 4-5: enroll all peers via shared helper
     for peer_id, last_activity_at in working_set.items():
-        source = "supergroup" if peer_id in {r[0] for r in supergroup_rows} else "linked_chat"
+        source = "supergroup" if peer_id in supergroup_ids else "linked_chat"
         enroll_activity_dialog(conn, peer_id, source, last_activity_at=last_activity_at)
 
     return len(working_set)

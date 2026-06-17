@@ -14,7 +14,7 @@ import os
 import sqlite3
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import cast
 
 from .activity_peer_sweep import (
     SkipReason,
@@ -23,6 +23,7 @@ from .activity_peer_sweep import (
     build_working_set,
     sweep_peer_once,
 )
+from .activity_sync import _ActivityClient
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +45,7 @@ class _HotSweepPeerOutcome:
 class _HotSweepPeerContext:
     """Context for processing a single peer in HotSweep."""
 
-    client: Any
+    client: _ActivityClient
     conn: sqlite3.Connection
     dialog_id: int
     old_hot_cursor: int | None
@@ -70,7 +71,7 @@ def _save_hot_flood_state(
     next_retry_at: int,
 ) -> None:
     """Persist hot-state after a FloodWait and keep already-drained progress."""
-    save_fields: dict[str, Any] = {"hot_next_retry_at": next_retry_at}
+    save_fields: dict[str, object] = {"hot_next_retry_at": next_retry_at}
     if max_seen > old_hot_cursor:
         save_fields["hot_cursor"] = max_seen
     _save_dialog_state(conn, dialog_id, **save_fields)
@@ -195,7 +196,7 @@ async def _run_hot_sweep_peer(ctx: _HotSweepPeerContext) -> _HotSweepPeerOutcome
 
 
 async def run_hot_sweep_pass(
-    client: Any,
+    client: _ActivityClient,
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,
 ) -> int:
@@ -216,7 +217,9 @@ async def run_hot_sweep_pass(
 
     # Step 2: select hot, due peers — recency-bounded to 30 days
     cutoff = now - 30 * 86400
-    rows = conn.execute(
+    rows = cast(
+        list[tuple[int, int | None]],
+        conn.execute(
         """
         SELECT dialog_id, hot_cursor
         FROM activity_dialog_state
@@ -226,7 +229,8 @@ async def run_hot_sweep_pass(
         ORDER BY last_activity_at DESC
         """,
         {"cutoff": cutoff, "now": now},
-    ).fetchall()
+        ).fetchall(),
+    )
 
     logger.info("activity_hot_sweep_pass_start peers_selected=%d", len(rows))
 
@@ -262,7 +266,7 @@ async def run_hot_sweep_pass(
 
 
 async def run_hot_sweep_loop(
-    client: Any,
+    client: _ActivityClient,
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,
     *,

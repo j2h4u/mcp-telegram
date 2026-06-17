@@ -15,7 +15,11 @@ import logging
 import sqlite3
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Protocol, cast
+
+from telethon.tl.types import TypeInputChannel, TypeInputPeer
+
+from .activity_sync import _ActivityClient
 
 logger = logging.getLogger(__name__)
 
@@ -50,14 +54,14 @@ class _LinkedChatCacheWrite:
     conn: sqlite3.Connection
     channel_id: int
     linked_chat_id: int | None
-    existing_blob: dict[str, Any]
-    existing_detail_row: tuple[Any, ...] | None
+    existing_blob: dict[str, object]
+    existing_detail_row: tuple[str] | None
     channel_name: str | None
     channel_username: str | None
     now: int
 
 
-async def resolve_input_peer(client: Any, dialog_id: int) -> Any:
+async def resolve_input_peer(client: _ActivityClient, dialog_id: int) -> TypeInputPeer | None:
     """Resolve a bare dialog_id to a concrete InputPeer via the Telethon session.
 
     Uses client.get_input_entity() which is entity-type-aware: it resolves
@@ -69,7 +73,7 @@ async def resolve_input_peer(client: Any, dialog_id: int) -> Any:
     the caller can skip-and-retry rather than crash.  Never raises.
     """
     try:
-        return await client.get_input_entity(dialog_id)
+        return cast(TypeInputPeer, await client.get_input_entity(dialog_id))
     except Exception:
         logger.debug("activity_peer_resolve_input_peer_miss dialog_id=%r", dialog_id, exc_info=True)
         return None
@@ -78,8 +82,11 @@ async def resolve_input_peer(client: Any, dialog_id: int) -> Any:
 def _assert_linked_chat_schema(conn: sqlite3.Connection) -> None:
     """Raise when the connection is older than the linked-chat schema floor."""
     try:
-        ver_row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
-        schema_version = ver_row[0] if ver_row is not None and ver_row[0] is not None else 0
+        version_row = cast(
+            tuple[int | None] | None,
+            conn.execute("SELECT MAX(version) FROM schema_version").fetchone(),
+        )
+        schema_version = version_row[0] if version_row is not None and version_row[0] is not None else 0
     except sqlite3.OperationalError:
         schema_version = 0
     if schema_version < _MIN_LINKED_CHAT_SCHEMA_VERSION:
@@ -96,19 +103,22 @@ def _assert_linked_chat_schema(conn: sqlite3.Connection) -> None:
 
 def _read_cached_linked_chat(conn: sqlite3.Connection, channel_id: int) -> LinkedChatResolution | None:
     """Return the cached linked-chat answer when dialogs already has one."""
-    row = conn.execute(
-        "SELECT linked_chat_id, linked_chat_resolved_at FROM dialogs WHERE dialog_id = ?",
-        (channel_id,),
-    ).fetchone()
+    row = cast(
+        tuple[int | None, int | None] | None,
+        conn.execute(
+            "SELECT linked_chat_id, linked_chat_resolved_at FROM dialogs WHERE dialog_id = ?",
+            (channel_id,),
+        ).fetchone(),
+    )
     if row is None:
         return None
-    linked_chat_id, linked_chat_resolved_at = row
+    linked_chat_id, linked_chat_resolved_at = cast(tuple[int | None, int | None], row)
     if linked_chat_resolved_at is None:
         return None
     return LinkedChatResolution(linked_chat_id=linked_chat_id, flood_wait_seconds=None)
 
 
-def _normalize_linked_chat_id(linked_chat_id_raw: Any) -> int | None:
+def _normalize_linked_chat_id(linked_chat_id_raw: int | None) -> int | None:
     """Normalize Telethon's linked-chat id into the canonical peer id form."""
     if linked_chat_id_raw is None:
         return None
@@ -122,21 +132,43 @@ def _normalize_linked_chat_id(linked_chat_id_raw: Any) -> int | None:
 
 def _load_existing_detail_blob(
     conn: sqlite3.Connection, channel_id: int
-) -> tuple[dict[str, Any], tuple[Any, ...] | None]:
+) -> tuple[dict[str, object], tuple[str] | None]:
     """Load the current entity_details JSON payload, if any."""
-    existing_detail_row = conn.execute(
-        "SELECT detail_json FROM entity_details WHERE entity_id = ?",
-        (channel_id,),
-    ).fetchone()
+    existing_detail_row = cast(
+        tuple[str] | None,
+        conn.execute(
+            "SELECT detail_json FROM entity_details WHERE entity_id = ?",
+            (channel_id,),
+        ).fetchone(),
+    )
     if existing_detail_row is None:
         return {}, None
     try:
-        return json.loads(existing_detail_row[0]), existing_detail_row
+        detail_row = cast(tuple[str], existing_detail_row)
+        return cast(dict[str, object], json.loads(detail_row[0])), detail_row
     except json.JSONDecodeError:
-        return {}, existing_detail_row
+        return {}, cast(tuple[str], existing_detail_row)
 
 
-def _merge_sibling_linked_chat_fields(full_chat: Any, existing_blob: dict[str, Any]) -> dict[str, Any]:
+class _FullChatLike(Protocol):
+    participants_count: int | None
+    pinned_msg_id: int | None
+    about: str | None
+    linked_chat_id: int | None
+
+
+class _FullResultChatLike(Protocol):
+    id: int
+    title: str | None
+    username: str | None
+
+
+class _FullResultLike(Protocol):
+    full_chat: _FullChatLike
+    chats: list[_FullResultChatLike] | None
+
+
+def _merge_sibling_linked_chat_fields(full_chat: _FullChatLike, existing_blob: dict[str, object]) -> dict[str, object]:
     """Overlay sibling fields from GetFullChannel into the cached detail blob."""
     subscribers_count = getattr(full_chat, "participants_count", None)
     if subscribers_count is not None:
@@ -150,15 +182,15 @@ def _merge_sibling_linked_chat_fields(full_chat: Any, existing_blob: dict[str, A
     return existing_blob
 
 
-def _extract_channel_identity(full_result: Any, channel_id: int) -> tuple[str | None, str | None]:
+def _extract_channel_identity(full_result: _FullResultLike, channel_id: int) -> tuple[str | None, str | None]:
     """Extract the channel title and username from the live result, if present."""
     from telethon.utils import get_peer_id
 
-    for chat in getattr(full_result, "chats", None) or []:
+    for chat in full_result.chats or []:
         try:
-            if int(get_peer_id(chat)) == int(channel_id):
-                return getattr(chat, "title", None), getattr(chat, "username", None)
-        except TypeError, ValueError:
+            if int(cast(int | str, get_peer_id(chat))) == int(channel_id):
+                return chat.title, chat.username
+        except (TypeError, ValueError):
             continue
     return None, None
 
@@ -194,7 +226,7 @@ def _write_linked_chat_resolution(payload: _LinkedChatCacheWrite) -> None:
 
 
 async def _resolve_linked_chat_live(
-    client: Any,
+    client: _ActivityClient,
     conn: sqlite3.Connection,
     channel_id: int,
     now: int,
@@ -202,13 +234,13 @@ async def _resolve_linked_chat_live(
     """Run the live Telethon fetch and persist the linked-chat cache."""
     from telethon.tl.functions.channels import GetFullChannelRequest
 
-    input_channel = await resolve_input_peer(client, channel_id)
+    input_channel = cast(TypeInputChannel | None, await resolve_input_peer(client, channel_id))
     if input_channel is None:
         return LinkedChatResolution(linked_chat_id=None, flood_wait_seconds=None)
 
-    full_result = await client(GetFullChannelRequest(channel=input_channel))
+    full_result = cast(_FullResultLike, await client(GetFullChannelRequest(channel=input_channel)))
     full_chat = full_result.full_chat
-    linked_chat_id = _normalize_linked_chat_id(getattr(full_chat, "linked_chat_id", None))
+    linked_chat_id = _normalize_linked_chat_id(full_chat.linked_chat_id)
     existing_blob, existing_detail_row = _load_existing_detail_blob(conn, channel_id)
     merged_blob = _merge_sibling_linked_chat_fields(full_chat, existing_blob)
     channel_name, channel_username = _extract_channel_identity(full_result, channel_id)
@@ -228,7 +260,7 @@ async def _resolve_linked_chat_live(
 
 
 async def resolve_linked_chat_id(
-    client: Any,
+    client: _ActivityClient,
     conn: sqlite3.Connection,
     channel_id: int,
 ) -> LinkedChatResolution:
