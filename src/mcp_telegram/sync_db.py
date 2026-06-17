@@ -469,73 +469,63 @@ def _schema_ready(conn: sqlite3.Connection) -> bool:
         return False
 
 
-def _apply_migrations(conn: sqlite3.Connection) -> None:
-    """Apply WAL mode and all pending schema migrations in version order."""
+def _apply_migration(
+    conn: sqlite3.Connection,
+    current: int,
+    version: int,
+    stmts: list[str],
+    *,
+    ignore_duplicate_column: bool = False,
+) -> int:
+    """Apply one migration version atomically and record it.
+
+    When `ignore_duplicate_column=True`, each statement is executed
+    individually and `OperationalError: duplicate column name` is
+    silently swallowed. This is necessary for ALTER TABLE ADD COLUMN
+    migrations that may re-run after a manual `DELETE FROM schema_version`
+    in tests, or on databases where a partial migration already added the
+    column. All other errors still propagate and roll back.
+    """
+    if current >= version:
+        return current
     try:
-        conn.execute("PRAGMA journal_mode=WAL")
-    except sqlite3.OperationalError as exc:
-        if "locked" not in str(exc).lower():
-            raise
-        logger.debug("sync_db WAL pragma skipped (DB locked), will retry next open")
-
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS schema_version (
-            version    INTEGER NOT NULL,
-            applied_at INTEGER NOT NULL
-        )
-        """
-    )
-
-    row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
-    current = row[0] if row is not None and row[0] is not None else 0
-
-    def _migrate(version: int, stmts: list[str], *, ignore_duplicate_column: bool = False) -> None:
-        """Apply one migration version atomically and record it.
-
-        When `ignore_duplicate_column=True`, each statement is executed
-        individually and `OperationalError: duplicate column name` is
-        silently swallowed. This is necessary for ALTER TABLE ADD COLUMN
-        migrations that may re-run after a manual `DELETE FROM schema_version`
-        in tests, or on databases where a partial migration already added the
-        column. All other errors still propagate and roll back.
-        """
-        nonlocal current
-        if current >= version:
-            return
-        try:
-            for stmt in stmts:
-                if ignore_duplicate_column:
-                    try:
-                        conn.execute(stmt)
-                    except sqlite3.OperationalError as exc:
-                        if "duplicate column name" in str(exc).lower():
-                            logger.debug("sync_db v%d: column already exists, skipping: %s", version, exc)
-                        else:
-                            raise
-                else:
+        for stmt in stmts:
+            if ignore_duplicate_column:
+                try:
                     conn.execute(stmt)
-            conn.execute(
-                "INSERT INTO schema_version VALUES (?, strftime('%s', 'now'))",
-                (version,),
-            )
-            conn.commit()
-            current = version
-        except Exception:
-            conn.rollback()
-            logger.error("sync_db migration to version %d failed", version, exc_info=True)
-            raise
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column name" in str(exc).lower():
+                        logger.debug("sync_db v%d: column already exists, skipping: %s", version, exc)
+                    else:
+                        raise
+            else:
+                conn.execute(stmt)
+        conn.execute(
+            "INSERT INTO schema_version VALUES (?, strftime('%s', 'now'))",
+            (version,),
+        )
+        conn.commit()
+        return version
+    except Exception:
+        conn.rollback()
+        logger.error("sync_db migration to version %d failed", version, exc_info=True)
+        raise
 
-    _migrate(1, [_SYNCED_DIALOGS_DDL, _MESSAGES_DDL, _MESSAGES_INDEX_DDL, _MESSAGE_VERSIONS_DDL])
 
-    _migrate(2, ["ALTER TABLE synced_dialogs ADD COLUMN access_lost_at INTEGER"])
+def _apply_migrations_1_to_5(conn: sqlite3.Connection, current: int) -> int:
+    current = _apply_migration(
+        conn, current, 1, [_SYNCED_DIALOGS_DDL, _MESSAGES_DDL, _MESSAGES_INDEX_DDL, _MESSAGE_VERSIONS_DDL]
+    )
+    current = _apply_migration(conn, current, 2, ["ALTER TABLE synced_dialogs ADD COLUMN access_lost_at INTEGER"])
 
     if current < _SCHEMA_VERSION_WITH_FTS:
         from .fts import MESSAGES_FTS_DDL
 
-        _migrate(3, [MESSAGES_FTS_DDL])
+        current = _apply_migration(conn, current, 3, [MESSAGES_FTS_DDL])
 
-    _migrate(
+    current = _apply_migration(
+        conn,
+        current,
         4,
         [
             _ENTITY_TABLE_DDL,
@@ -555,10 +545,13 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             "CREATE INDEX IF NOT EXISTS idx_message_cache_dialog_sent ON message_cache(dialog_id, sent_at DESC)",
         ],
     )
+    return _apply_migration(conn, current, 5, [_TELEMETRY_EVENTS_DDL, _TELEMETRY_EVENTS_INDEX_DDL])
 
-    _migrate(5, [_TELEMETRY_EVENTS_DDL, _TELEMETRY_EVENTS_INDEX_DDL])
 
-    _migrate(
+def _apply_migrations_6_to_10(conn: sqlite3.Connection, current: int) -> int:
+    current = _apply_migration(
+        conn,
+        current,
         6,
         [
             # SQLite cannot ALTER COLUMN to drop NOT NULL — recreate with nullable name.
@@ -585,7 +578,9 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
         ],
     )
 
-    _migrate(
+    current = _apply_migration(
+        conn,
+        current,
         7,
         [
             # 1. Drop dead tables
@@ -642,7 +637,9 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
         ],
     )
 
-    _migrate(
+    current = _apply_migration(
+        conn,
+        current,
         8,
         [
             "ALTER TABLE synced_dialogs ADD COLUMN read_inbox_max_id INTEGER",
@@ -656,7 +653,9 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     # these columns let the read path distinguish outgoing DMs (out=1) from
     # true service messages (is_service=1). ADD COLUMN with DEFAULT is O(1)
     # metadata in SQLite — no row rewrite on large messages tables.
-    _migrate(
+    current = _apply_migration(
+        conn,
+        current,
         9,
         [
             "ALTER TABLE messages ADD COLUMN out INTEGER NOT NULL DEFAULT 0",
@@ -670,19 +669,25 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     # sender_id IS NULL". Incoming DM rows always carry sender_id=peer_id, so
     # NULL sender_id in a DM is a reliable marker for outgoing. Idempotent:
     # subsequent runs find no matching rows (already out=1 or already labelled).
-    _migrate(
+    return _apply_migration(
+        conn,
+        current,
         10,
         [
             "UPDATE messages SET out = 1 WHERE out = 0 AND dialog_id > 0 AND sender_id IS NULL",
         ],
     )
 
+
+def _apply_migrations_11_to_15(conn: sqlite3.Connection, current: int) -> int:
     # v11 per CONTEXT.md §Scope#4: per-message freshness side-table chosen
     # over dialog-level timestamp (Codex HIGH: slice-bounded refresh +
     # dialog-level TTL = false freshness) and over column-on-messages
     # (keeps row width stable; separation of concerns). Missing row =
     # "never freshened" — Plan 02 JIT path triggers naturally.
-    _migrate(
+    current = _apply_migration(
+        conn,
+        current,
         11,
         [
             "CREATE TABLE IF NOT EXISTS message_reactions_freshness ("
@@ -702,7 +707,9 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     # surrounding _migrate framework checking schema_version first. No
     # companion index — synced_dialogs is small (a few hundred rows); add
     # idx_synced_dialogs_status_outbox_null if it grows past a few thousand.
-    _migrate(
+    current = _apply_migration(
+        conn,
+        current,
         12,
         [
             "ALTER TABLE synced_dialogs ADD COLUMN read_outbox_max_id INTEGER",
@@ -712,7 +719,9 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     # v13: store channel post author signature. Message.post_author is set when
     # a channel allows authors to sign their posts (multiple contributors). NULL
     # for all other message types. ADD COLUMN is O(1) metadata in SQLite.
-    _migrate(
+    current = _apply_migration(
+        conn,
+        current,
         13,
         [
             "ALTER TABLE messages ADD COLUMN post_author TEXT",
@@ -727,7 +736,9 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     #   backfill_complete — '1' when full history scan is done, '0' otherwise
     #   backfill_offset_id — Telegram message_id pagination anchor (exclusive upper bound)
     #   last_sync_at — Unix timestamp of most recent sync run (NULL = never run)
-    _migrate(
+    current = _apply_migration(
+        conn,
+        current,
         14,
         [
             (
@@ -774,7 +785,9 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     # activity_comments are dropped (no destination column in messages;
     # message_reactions child table is populated only for rows ingested via
     # the canonical pipeline going forward).
-    _migrate(
+    return _apply_migration(
+        conn,
+        current,
         15,
         [
             # 1. Bring over own-only messages that are not already in messages.
@@ -808,6 +821,8 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
         ],
     )
 
+
+def _apply_migrations_16_to_20(conn: sqlite3.Connection, current: int) -> int:
     # v16 (Phase 47): entity_details sibling table for the new GetEntityInfo
     # tool. Per CONTEXT D-01: a JSON-blob cache keyed on entity_id with a
     # FETCHED_AT TTL stamp, foreign-keyed to entities(id) with ON DELETE
@@ -827,7 +842,9 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     #
     # FETCHED_AT INDEX (D-04): cheap to add at table creation; lets a future
     # phase implement cache eviction sweeps without a schema bump.
-    _migrate(
+    current = _apply_migration(
+        conn,
+        current,
         16,
         [
             (
@@ -846,7 +863,9 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     # Separate from synced_dialogs (sync machinery) and entities (sender data) — MIRROR-03.
     # unread_count is intentionally absent — computed from local read cursor (MIRROR-05).
     # Phase 41 bootstrap populates rows; Phase 42 event handlers update them in real time.
-    _migrate(
+    current = _apply_migration(
+        conn,
+        current,
         17,
         [
             _DIALOGS_DDL,
@@ -860,27 +879,31 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     # Bootstrap sweep cursor (D-02: offset_date / offset_id / offset_peer) and
     # completion flag (D-03: bootstrap_sweep_status) live here. No seed rows —
     # absence of bootstrap_sweep_status is the canonical "not run yet" state (D-04).
-    _migrate(18, [_DAEMON_STATE_DDL])
+    current = _apply_migration(conn, current, 18, [_DAEMON_STATE_DDL])
 
     # v19 (Phase 42): augment topic_metadata with v1.6 forum_topics columns.
     # Plan 02 event handlers UPSERT title / icon_emoji_id / hidden here; the
     # dedicated UpdatePinnedForumTopic handler toggles pinned. Phase 45
     # ListTopics reads from this same table.
-    _migrate(19, _TOPIC_METADATA_V19_ALTERS, ignore_duplicate_column=True)
+    current = _apply_migration(conn, current, 19, _TOPIC_METADATA_V19_ALTERS, ignore_duplicate_column=True)
 
     # v20 (Phase 43 / RECON-02): composite index gating the hourly light pass.
     # Plan 02's _SELECT_DIRTY_DIALOGS_SQL filters
     # `WHERE needs_refresh = 1 AND hidden = 0`. Without this index it is a full
     # table scan every hour; with it, the planner uses the index leftmost-prefix
     # on needs_refresh and drops the dialog count to roughly the dirty set size.
-    _migrate(20, [_DIALOGS_NEEDS_REFRESH_INDEX_DDL])
+    return _apply_migration(conn, current, 20, [_DIALOGS_NEEDS_REFRESH_INDEX_DDL])
 
+
+def _apply_migrations_21_to_26(conn: sqlite3.Connection, current: int) -> int:
     # v21 (Phase 51): target-specific trace coverage. synced_dialogs.status
     # describes broad dialog lifecycle; account traces need per-target,
     # per-dialog/topic coverage attempts to avoid false completeness claims.
     # topic_id=0 is reserved as the dialog-level sentinel; real forum topic ids
     # in topic_metadata are >= 1.
-    _migrate(
+    current = _apply_migration(
+        conn,
+        current,
         21,
         [
             _TRACE_COVERAGE_FRAGMENTS_DDL,
@@ -891,7 +914,9 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     # v22: persist Telegram's aggregate reply/comment counter on message rows.
     # Telethon exposes this as Message.replies.replies. It is a count of replies,
     # not a unique replier count; historical rows default to 0 until refreshed.
-    _migrate(
+    current = _apply_migration(
+        conn,
+        current,
         22,
         [
             "ALTER TABLE messages ADD COLUMN reply_count INTEGER NOT NULL DEFAULT 0",
@@ -905,7 +930,9 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     # NOTE: activity_channel_resolution was originally created here but is dropped
     # by v24. Its DDL constant has been removed; a fresh install on v24 never creates
     # the table, and existing v23 deployments have it removed by the v24 DROP.
-    _migrate(
+    current = _apply_migration(
+        conn,
+        current,
         23,
         [
             _ACTIVITY_DIALOG_STATE_DDL,
@@ -935,7 +962,9 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     # (iv) Forward-compat: removing _ACTIVITY_CHANNEL_RESOLUTION_DDL from the v23
     #      list means a fresh install on v24 never creates the table; existing v23
     #      deployments have it removed by the DROP below.
-    _migrate(
+    current = _apply_migration(
+        conn,
+        current,
         24,
         [
             _DIALOGS_V24_ADD_LINKED_CHAT_ID,
@@ -962,7 +991,9 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     #      un-capped per operator decision — observe the backfill catch-up logs for a
     #      sustained burst. The cap/stagger mitigation (needs_refresh tier) is DEFERRED
     #      to a follow-up only if observation shows it is needed.
-    _migrate(
+    current = _apply_migration(
+        conn,
+        current,
         25,
         [
             _DIALOGS_V25_BACKFILL_ORPHAN_OWN_ONLY,
@@ -983,7 +1014,9 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     #
     # Order matters: the channel UPDATE turns matched rows negative; the chat UPDATE then
     # only sees still-positive rows. No row can match both (distinct dialog_ids).
-    _migrate(
+    return _apply_migration(
+        conn,
+        current,
         26,
         [
             # Defensive no-op in real DBs (message_forwards exists since v7); guarantees the
@@ -1007,6 +1040,33 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             "WHERE d.dialog_id = -message_forwards.fwd_from_peer_id)",
         ],
     )
+
+
+def _apply_migrations(conn: sqlite3.Connection) -> None:
+    """Apply WAL mode and all pending schema migrations in version order."""
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.OperationalError as exc:
+        if "locked" not in str(exc).lower():
+            raise
+        logger.debug("sync_db WAL pragma skipped (DB locked), will retry next open")
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS schema_version (
+            version    INTEGER NOT NULL,
+            applied_at INTEGER NOT NULL
+        )
+        """
+    )
+
+    row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
+    current = row[0] if row is not None and row[0] is not None else 0
+    current = _apply_migrations_1_to_5(conn, current)
+    current = _apply_migrations_6_to_10(conn, current)
+    current = _apply_migrations_11_to_15(conn, current)
+    current = _apply_migrations_16_to_20(conn, current)
+    current = _apply_migrations_21_to_26(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 
