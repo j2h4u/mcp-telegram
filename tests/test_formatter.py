@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import cast
 
 from mcp_telegram.models import ReadMessage
@@ -39,6 +40,10 @@ def _make_msg(
         reactions_display=opts.reactions_display,
         reply_to_msg_id=opts.reply_to_msg_id,
     )
+
+
+def _make_document_media(*attrs: object, size: int | None = None) -> object:
+    return SimpleNamespace(document=SimpleNamespace(attributes=list(attrs), size=size))
 
 
 # ---------------------------------------------------------------------------
@@ -186,6 +191,57 @@ def test_media_fallback() -> None:
     msg = _make_msg(1, dt, text="", first_name="Carol", media_description="[медиа: SomeType]")
     result = format_messages([msg], {})
     assert "[медиа:" in result
+
+
+def test_describe_document_priority_and_fallbacks() -> None:
+    import telethon.tl.types as tl
+
+    from mcp_telegram.formatter import _describe_document
+
+    sticker = _make_document_media(
+        tl.DocumentAttributeSticker(alt="🙂", stickerset=tl.InputStickerSetEmpty()),
+        tl.DocumentAttributeAudio(duration=12, voice=True),
+        tl.DocumentAttributeFilename(file_name="ignored.txt"),
+    )
+    empty_sticker = _make_document_media(
+        tl.DocumentAttributeSticker(alt="", stickerset=tl.InputStickerSetEmpty()),
+    )
+    round_video = _make_document_media(tl.DocumentAttributeVideo(duration=65, w=320, h=320, round_message=True))
+    animation = _make_document_media(tl.DocumentAttributeAnimated())
+    voice = _make_document_media(tl.DocumentAttributeAudio(duration=125, voice=True))
+    audio = _make_document_media(tl.DocumentAttributeAudio(duration=184, title="Song", performer="Artist"))
+    video = _make_document_media(tl.DocumentAttributeVideo(duration=541, w=640, h=480))
+    filename = _make_document_media(tl.DocumentAttributeFilename(file_name="report.pdf"), size=2048)
+    filename_no_size = _make_document_media(tl.DocumentAttributeFilename(file_name="plain.txt"))
+    no_attrs = _make_document_media()
+    no_document = SimpleNamespace(document=None)
+
+    cases = [
+        (no_document, "[документ]"),
+        (sticker, "[стикер: 🙂]"),
+        (empty_sticker, "[стикер]"),
+        (round_video, "[кружок: 1:05]"),
+        (animation, "[анимация]"),
+        (voice, "[голосовое: 2:05]"),
+        (audio, "[аудио: Artist — Song, 3:04]"),
+        (video, "[видео: 9:01]"),
+        (filename, "[документ: report.pdf, 2KB]"),
+        (filename_no_size, "[документ: plain.txt]"),
+        (no_attrs, "[документ]"),
+    ]
+
+    for media, expected in cases:
+        assert _describe_document(media) == expected
+
+
+def test_describe_document_audio_without_metadata() -> None:
+    import telethon.tl.types as tl
+
+    from mcp_telegram.formatter import _describe_document
+
+    media = _make_document_media(tl.DocumentAttributeAudio(duration=30))
+
+    assert _describe_document(media) == "[аудио: 0:30]"
 
 
 def test_format_messages_frames_adversarial_body_without_framing_headers() -> None:
@@ -406,8 +462,6 @@ def test_edited_marker_before_reactions() -> None:
 # ---------------------------------------------------------------------------
 # _resolve_sender_name five-branch tests (Phase 39.1-02)
 # ---------------------------------------------------------------------------
-
-from types import SimpleNamespace
 
 
 @dataclass(frozen=True)

@@ -695,6 +695,7 @@ def _describe_document(media: object) -> str:
     video_attr = next((attr for attr in attrs if isinstance(attr, tl.DocumentAttributeVideo)), None)
     filename_attr = next((attr for attr in attrs if isinstance(attr, tl.DocumentAttributeFilename)), None)
 
+    description = "[документ]"
     if sticker_attr is not None:
         description = _describe_document_sticker(sticker_attr)
     elif round_video_attr is not None:
