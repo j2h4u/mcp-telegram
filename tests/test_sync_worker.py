@@ -8,16 +8,69 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from collections.abc import AsyncIterator, Iterator
 from datetime import UTC
+from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Protocol, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from helpers import MockTotalList, build_mock_message, build_mock_reactions
 
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
-from mcp_telegram.sync_worker import FullSyncWorker, StoredMessage
+from mcp_telegram.sync_worker import FullSyncWorker, StoredMessage, _PeerLike
+
+
+class _SQLiteCursor(Protocol):
+    def fetchone(self) -> tuple[object | None, ...] | None: ...
+
+    def fetchall(self) -> list[tuple[object | None, ...]]: ...
+
+
+class _SQLiteConnection(Protocol):
+    def execute(self, sql: str, parameters: tuple[object, ...] = ()) -> _SQLiteCursor: ...
+
+    def commit(self) -> None: ...
+
+    def close(self) -> None: ...
+
+    def __enter__(self) -> _SQLiteConnection: ...
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None: ...
+
+
+class _Closable(Protocol):
+    def close(self) -> None: ...
+
+
+async def _empty_async_iter() -> AsyncIterator[object]:
+    if False:
+        yield None
+
+
+class _MockClient:
+    def __init__(self) -> None:
+        self.add_event_handler = MagicMock()
+        self.remove_event_handler = MagicMock()
+        self.get_messages: AsyncMock = AsyncMock()
+        self.get_entity: AsyncMock = AsyncMock()
+        self.iter_messages = _empty_async_iter
+        self.iter_dialogs = _empty_async_iter
+        self.is_connected = MagicMock(return_value=True)
+
+
+class _PeerLookupClient:
+    def __init__(self, *, should_raise: bool = False) -> None:
+        self._should_raise = should_raise
+        self.passed_peer: _PeerLike | None = None
+
+    async def get_entity(self, entity_id: object) -> object:
+        self.passed_peer = cast(_PeerLike, entity_id)
+        if self._should_raise:
+            raise ValueError("Could not find the input entity")
+        return SimpleNamespace(title="Private meme collection")
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -25,21 +78,19 @@ from mcp_telegram.sync_worker import FullSyncWorker, StoredMessage
 
 
 @pytest.fixture()
-def sync_db(tmp_path: Any) -> sqlite3.Connection:
+def sync_db(tmp_path: Path) -> Iterator[_SQLiteConnection]:
     """Create a real sync.db in tmp_path and return an open connection."""
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
-    conn = _open_sync_db(db_path)
+    conn = cast(_SQLiteConnection, _open_sync_db(db_path))
     yield conn
     conn.close()
 
 
 @pytest.fixture()
-def mock_client() -> MagicMock:
+def mock_client() -> _MockClient:
     """Return a mock TelegramClient with async iter_messages/iter_dialogs."""
-    client = MagicMock()
-    client.is_connected.return_value = True
-    return client
+    return _MockClient()
 
 
 @pytest.fixture()
@@ -49,11 +100,11 @@ def shutdown_event() -> asyncio.Event:
 
 
 def make_worker(
-    mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    mock_client: _MockClient,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> FullSyncWorker:
-    return FullSyncWorker(mock_client, sync_db, shutdown_event)
+    return FullSyncWorker(mock_client, cast(sqlite3.Connection, sync_db), shutdown_event)
 
 
 # ---------------------------------------------------------------------------
@@ -63,8 +114,8 @@ def make_worker(
 
 @pytest.mark.asyncio
 async def test_full_sync_stores_all_messages(
-    mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    mock_client: _MockClient,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """process_one_batch() stores all 3 messages in sync.db messages table."""
@@ -99,8 +150,8 @@ async def test_full_sync_stores_all_messages(
 
 @pytest.mark.asyncio
 async def test_message_fields_extracted_correctly(
-    mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    mock_client: _MockClient,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """Message with media, reply_to, forum_topic — all fields stored correctly."""
@@ -130,11 +181,14 @@ async def test_message_fields_extracted_correctly(
     worker = make_worker(mock_client, sync_db, shutdown_event)
     await worker.process_one_batch()
 
-    row = sync_db.execute(
-        "SELECT message_id, sender_id, sender_first_name, media_description, "
-        "reply_to_msg_id, forum_topic_id FROM messages WHERE dialog_id = ?",
-        (dialog_id,),
-    ).fetchone()
+    row = cast(
+        tuple[object | None, ...] | None,
+        sync_db.execute(
+            "SELECT message_id, sender_id, sender_first_name, media_description, "
+            "reply_to_msg_id, forum_topic_id FROM messages WHERE dialog_id = ?",
+            (dialog_id,),
+        ).fetchone(),
+    )
     assert row is not None
     assert row[0] == 500
     assert row[1] == 99
@@ -146,8 +200,8 @@ async def test_message_fields_extracted_correctly(
 
 @pytest.mark.asyncio
 async def test_extract_reactions_rows(
-    mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    mock_client: _MockClient,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """Reactions are stored as rows in message_reactions table (not JSON blob)."""
@@ -173,7 +227,7 @@ async def test_extract_reactions_rows(
     # message fields must not contain any JSON reactions blob
     import dataclasses
 
-    for item in dataclasses.astuple(result.message):
+    for item in cast(tuple[object, ...], dataclasses.astuple(result.message)):
         assert not isinstance(item, str) or not item.startswith("{"), (
             f"message should not contain JSON reactions, got: {item!r}"
         )
@@ -186,8 +240,8 @@ async def test_extract_reactions_rows(
 
 @pytest.mark.asyncio
 async def test_resume_from_checkpoint(
-    mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    mock_client: _MockClient,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """process_one_batch() passes offset_id=sync_progress to iter_messages."""
@@ -208,8 +262,8 @@ async def test_resume_from_checkpoint(
 
 @pytest.mark.asyncio
 async def test_progress_atomic_commit(
-    mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    mock_client: _MockClient,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """After batch of ids [300, 200, 100], sync_progress equals 100 (min id)."""
@@ -246,8 +300,8 @@ async def test_progress_atomic_commit(
 
 @pytest.mark.asyncio
 async def test_floodwait_sleep_continues(
-    mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    mock_client: _MockClient,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """FloodWaitError causes interruptible sleep and returns (progress, False)."""
@@ -267,7 +321,7 @@ async def test_floodwait_sleep_continues(
 
     slept_for: list[float] = []
 
-    async def _mock_wait_for(coro: Any, timeout: float) -> None:
+    async def _mock_wait_for(coro: _Closable, timeout: float) -> None:
         slept_for.append(timeout)
         coro.close()
         raise TimeoutError
@@ -286,8 +340,8 @@ async def test_floodwait_sleep_continues(
 
 @pytest.mark.asyncio
 async def test_floodwait_no_progress_loss(
-    mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    mock_client: _MockClient,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """sync_progress in DB has NOT changed after a FloodWait."""
@@ -306,7 +360,7 @@ async def test_floodwait_no_progress_loss(
 
     mock_client.get_messages = AsyncMock(side_effect=err)
 
-    async def _mock_wait_for(coro: Any, timeout: float) -> None:
+    async def _mock_wait_for(coro: _Closable, timeout: float) -> None:
         coro.close()
         raise TimeoutError
 
@@ -330,8 +384,8 @@ async def test_floodwait_no_progress_loss(
 
 @pytest.mark.asyncio
 async def test_dm_bootstrap_enrolls_users(
-    mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    mock_client: _MockClient,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """bootstrap_dms() enrolls exactly 2 User dialogs (not channels)."""
@@ -364,8 +418,8 @@ async def test_dm_bootstrap_enrolls_users(
 
 @pytest.mark.asyncio
 async def test_dm_bootstrap_skips_groups(
-    mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    mock_client: _MockClient,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """bootstrap_dms() skips Chat and Channel entities — 0 rows inserted."""
@@ -388,13 +442,14 @@ async def test_dm_bootstrap_skips_groups(
 
     assert count == 0
     rows = sync_db.execute("SELECT COUNT(*) FROM synced_dialogs").fetchone()
+    assert rows is not None
     assert rows[0] == 0
 
 
 @pytest.mark.asyncio
 async def test_dm_bootstrap_idempotent(
-    mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    mock_client: _MockClient,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """bootstrap_dms() does NOT overwrite existing synced_dialogs rows."""
@@ -438,8 +493,8 @@ async def test_dm_bootstrap_idempotent(
 
 @pytest.mark.asyncio
 async def test_dm_bootstrap_populates_entities(
-    mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    mock_client: _MockClient,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """bootstrap_dms() writes an entities row for each User dialog."""
@@ -472,8 +527,8 @@ async def test_dm_bootstrap_populates_entities(
 
 @pytest.mark.asyncio
 async def test_dm_bootstrap_populates_entities_bot(
-    mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    mock_client: _MockClient,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """bootstrap_dms() writes type='bot' for a user entity with bot=True."""
@@ -504,8 +559,8 @@ async def test_dm_bootstrap_populates_entities_bot(
 
 @pytest.mark.asyncio
 async def test_dm_bootstrap_entity_backfills_existing_enrollment(
-    mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    mock_client: _MockClient,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """bootstrap_dms() writes entity even for already-enrolled dialogs (fixes existing gap)."""
@@ -545,8 +600,8 @@ async def test_dm_bootstrap_entity_backfills_existing_enrollment(
 
 @pytest.mark.asyncio
 async def test_dm_bootstrap_writes_tombstone_for_nameless_user(
-    mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    mock_client: _MockClient,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """bootstrap_dms() writes entity row with name=NULL when user has no display name.
@@ -579,8 +634,8 @@ async def test_dm_bootstrap_writes_tombstone_for_nameless_user(
 
 @pytest.mark.asyncio
 async def test_dm_bootstrap_invariant_every_enrolled_dialog_has_entity(
-    mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    mock_client: _MockClient,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """After bootstrap_dms(), every enrolled dialog must have an entity row — named or not."""
@@ -620,8 +675,8 @@ async def test_dm_bootstrap_invariant_every_enrolled_dialog_has_entity(
 
 @pytest.mark.asyncio
 async def test_empty_batch_marks_synced(
-    mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    mock_client: _MockClient,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """Empty iter_messages result marks dialog as 'synced' and returns True."""
@@ -649,8 +704,8 @@ async def test_empty_batch_marks_synced(
 
 @pytest.mark.asyncio
 async def test_partial_batch_marks_synced(
-    mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    mock_client: _MockClient,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """Batch of 50 messages (< 100) marks dialog as 'synced' after commit."""
@@ -680,8 +735,8 @@ async def test_partial_batch_marks_synced(
 
 @pytest.mark.asyncio
 async def test_full_batch_not_marked_synced(
-    mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    mock_client: _MockClient,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """Batch of exactly 100 messages keeps dialog status as 'syncing'."""
@@ -711,8 +766,8 @@ async def test_full_batch_not_marked_synced(
 
 @pytest.mark.asyncio
 async def test_no_pending_dialogs_returns_true(
-    mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    mock_client: _MockClient,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """process_one_batch() returns True when no dialogs have pending status."""
@@ -735,8 +790,8 @@ async def test_no_pending_dialogs_returns_true(
 
 @pytest.mark.asyncio
 async def test_access_lost_channel_private(
-    mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    mock_client: _MockClient,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """ChannelPrivateError sets status='access_lost' and access_lost_at != NULL, returns True."""
@@ -768,8 +823,8 @@ async def test_access_lost_channel_private(
 
 @pytest.mark.asyncio
 async def test_access_lost_chat_forbidden(
-    mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    mock_client: _MockClient,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """ChatForbiddenError sets status='access_lost' and access_lost_at != NULL."""
@@ -801,8 +856,8 @@ async def test_access_lost_chat_forbidden(
 
 @pytest.mark.asyncio
 async def test_access_lost_user_banned(
-    mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    mock_client: _MockClient,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """UserBannedInChannelError sets status='access_lost' and access_lost_at != NULL."""
@@ -834,8 +889,8 @@ async def test_access_lost_user_banned(
 
 @pytest.mark.asyncio
 async def test_access_lost_preserves_messages(
-    mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    mock_client: _MockClient,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """After access_lost, messages table rows for dialog still exist (not deleted)."""
@@ -861,14 +916,16 @@ async def test_access_lost_preserves_messages(
     worker = make_worker(mock_client, sync_db, shutdown_event)
     await worker.process_one_batch()
 
-    count = sync_db.execute("SELECT COUNT(*) FROM messages WHERE dialog_id=?", (dialog_id,)).fetchone()[0]
+    row = sync_db.execute("SELECT COUNT(*) FROM messages WHERE dialog_id=?", (dialog_id,)).fetchone()
+    assert row is not None
+    count = row[0]
     assert count == 3, f"Expected 3 messages preserved, got {count}"
 
 
 @pytest.mark.asyncio
 async def test_generic_rpc_error_still_skips(
-    mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    mock_client: _MockClient,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """Non-access-loss RPCError leaves dialog in-progress (is_done=False) without setting access_lost status."""
@@ -905,8 +962,8 @@ async def test_generic_rpc_error_still_skips(
 
 @pytest.mark.asyncio
 async def test_process_one_batch_populates_fts(
-    mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    mock_client: _MockClient,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """After process_one_batch(), messages_fts has matching rows with non-empty stemmed_text."""
@@ -940,8 +997,8 @@ async def test_process_one_batch_populates_fts(
 
 @pytest.mark.asyncio
 async def test_process_one_batch_fts_matches_message_ids(
-    mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    mock_client: _MockClient,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """FTS rows have message_ids matching those in the messages table."""
@@ -973,8 +1030,8 @@ async def test_process_one_batch_fts_matches_message_ids(
 
 @pytest.mark.asyncio
 async def test_dm_bootstrap_handles_flood_wait(
-    mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    mock_client: _MockClient,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """bootstrap_dms() catches FloodWaitError and commits partial progress."""
@@ -1004,8 +1061,8 @@ async def test_dm_bootstrap_handles_flood_wait(
 
 @pytest.mark.asyncio
 async def test_dm_bootstrap_handles_rpc_error(
-    mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    mock_client: _MockClient,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """bootstrap_dms() catches RPCError and commits partial progress."""
@@ -1026,8 +1083,8 @@ async def test_dm_bootstrap_handles_rpc_error(
 
 @pytest.mark.asyncio
 async def test_dm_bootstrap_handles_network_error(
-    mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    mock_client: _MockClient,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """bootstrap_dms() catches OSError and doesn't crash."""
@@ -1108,8 +1165,8 @@ def test_extract_reply_and_topic_forum_general():
 
 @pytest.mark.asyncio
 async def test_total_messages_written_on_batch(
-    mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    mock_client: _MockClient,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """_fetch_batch writes total_messages from result.total to synced_dialogs."""
@@ -1124,13 +1181,14 @@ async def test_total_messages_written_on_batch(
     worker = make_worker(mock_client, sync_db, shutdown_event)
     await worker.process_one_batch()
     row = sync_db.execute("SELECT total_messages FROM synced_dialogs WHERE dialog_id = ?", (dialog_id,)).fetchone()
+    assert row is not None
     assert row[0] == 9999
 
 
 @pytest.mark.asyncio
 async def test_last_synced_at_set_on_empty_batch(
-    mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    mock_client: _MockClient,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """When _fetch_batch gets empty batch (is_done=True), last_synced_at is set."""
@@ -1146,14 +1204,15 @@ async def test_last_synced_at_set_on_empty_batch(
     row = sync_db.execute(
         "SELECT last_synced_at, status FROM synced_dialogs WHERE dialog_id = ?", (dialog_id,)
     ).fetchone()
+    assert row is not None
     assert row[0] is not None  # last_synced_at is set
     assert row[1] == "synced"
 
 
 @pytest.mark.asyncio
 async def test_last_synced_at_set_on_partial_batch(
-    mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    mock_client: _MockClient,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """When _fetch_batch gets partial batch (< 100 msgs), last_synced_at is set."""
@@ -1170,14 +1229,15 @@ async def test_last_synced_at_set_on_partial_batch(
     row = sync_db.execute(
         "SELECT last_synced_at, status FROM synced_dialogs WHERE dialog_id = ?", (dialog_id,)
     ).fetchone()
+    assert row is not None
     assert row[0] is not None  # last_synced_at is set
     assert row[1] == "synced"
 
 
 @pytest.mark.asyncio
 async def test_total_messages_written_on_completion(
-    mock_client: MagicMock,
-    sync_db: sqlite3.Connection,
+    mock_client: _MockClient,
+    sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
     """total_messages is written even on the completion (empty) batch."""
@@ -1191,6 +1251,7 @@ async def test_total_messages_written_on_completion(
     worker = make_worker(mock_client, sync_db, shutdown_event)
     await worker.process_one_batch()
     row = sync_db.execute("SELECT total_messages FROM synced_dialogs WHERE dialog_id = ?", (dialog_id,)).fetchone()
+    assert row is not None
     assert row[0] == 5000
 
 
@@ -1206,7 +1267,7 @@ def test_extract_reactions_rows_returns_empty_for_none() -> None:
     assert extract_reactions_rows(1, 1, None) == []
 
 
-def test_extract_entity_rows_mention_and_bold(monkeypatch: Any) -> None:
+def test_extract_entity_rows_mention_and_bold(monkeypatch: pytest.MonkeyPatch) -> None:
     """Only mention is extracted; bold is skipped (not in analytics types)."""
     from mcp_telegram.sync_worker import _ANALYTICS_ENTITY_TYPES, extract_entity_rows
 
@@ -1235,7 +1296,7 @@ def test_extract_entity_rows_mention_and_bold(monkeypatch: Any) -> None:
     assert all(r.type != "bold" for r in rows), "bold must not be extracted"
 
 
-def test_extract_entity_rows_hashtag_populates_value(monkeypatch: Any) -> None:
+def test_extract_entity_rows_hashtag_populates_value(monkeypatch: pytest.MonkeyPatch) -> None:
     """Hashtag entity value is the text span (not None). Priority Action #1."""
     from mcp_telegram.sync_worker import _ANALYTICS_ENTITY_TYPES, extract_entity_rows
 
@@ -1256,7 +1317,7 @@ def test_extract_entity_rows_hashtag_populates_value(monkeypatch: Any) -> None:
     assert rows[0].value == "#python", f"hashtag value should be text span '#python', got {rows[0].value!r}"
 
 
-def test_extract_entity_rows_url_populates_value(monkeypatch: Any) -> None:
+def test_extract_entity_rows_url_populates_value(monkeypatch: pytest.MonkeyPatch) -> None:
     """URL entity value is the text span (not None). Priority Action #1."""
     from mcp_telegram.sync_worker import _ANALYTICS_ENTITY_TYPES, extract_entity_rows
 
@@ -1277,7 +1338,7 @@ def test_extract_entity_rows_url_populates_value(monkeypatch: Any) -> None:
     assert rows[0].value == "https://example.com", f"url value should be text span, got {rows[0].value!r}"
 
 
-def test_extract_entity_rows_text_url(monkeypatch: Any) -> None:
+def test_extract_entity_rows_text_url(monkeypatch: pytest.MonkeyPatch) -> None:
     """text_url entity value is from entity.url attribute (not text span)."""
     from mcp_telegram.sync_worker import _ANALYTICS_ENTITY_TYPES, extract_entity_rows
 
@@ -1299,7 +1360,7 @@ def test_extract_entity_rows_text_url(monkeypatch: Any) -> None:
     assert rows[0].value == "https://real-url.example.com"
 
 
-def test_extract_entity_rows_mention_name(monkeypatch: Any) -> None:
+def test_extract_entity_rows_mention_name(monkeypatch: pytest.MonkeyPatch) -> None:
     """mention_name entity value is str(user_id)."""
     from mcp_telegram.sync_worker import _ANALYTICS_ENTITY_TYPES, extract_entity_rows
 
@@ -1321,7 +1382,7 @@ def test_extract_entity_rows_mention_name(monkeypatch: Any) -> None:
     assert rows[0].value == "12345"
 
 
-def test_extract_entity_rows_mention_stores_username_text_span(monkeypatch: Any) -> None:
+def test_extract_entity_rows_mention_stores_username_text_span(monkeypatch: pytest.MonkeyPatch) -> None:
     """Mention entity value is @username text span.
 
     CONTEXT.md specified value=peer_id for mention, but MessageEntityMention
@@ -1347,7 +1408,7 @@ def test_extract_entity_rows_mention_stores_username_text_span(monkeypatch: Any)
     assert rows[0].value == "@alice", f"mention value should be '@alice' text span, got {rows[0].value!r}"
 
 
-def test_extract_entity_rows_uses_isinstance(monkeypatch: Any) -> None:
+def test_extract_entity_rows_uses_isinstance(monkeypatch: pytest.MonkeyPatch) -> None:
     """isinstance() dispatch matches subclasses of tracked entity types."""
     from mcp_telegram.sync_worker import _ANALYTICS_ENTITY_TYPES, extract_entity_rows
 
@@ -1410,7 +1471,7 @@ def test_utf16_slice_returns_none_on_decode_error() -> None:
     assert result is None, f"Expected None for half-surrogate slice, got {result!r}"
 
 
-def test_extract_entity_rows_skips_on_utf16_decode_error(monkeypatch: Any) -> None:
+def test_extract_entity_rows_skips_on_utf16_decode_error(monkeypatch: pytest.MonkeyPatch) -> None:
     """Entity row is SKIPPED (not stored) when _utf16_slice returns None. Priority Action #4."""
     from mcp_telegram import sync_worker
     from mcp_telegram.sync_worker import _ANALYTICS_ENTITY_TYPES, extract_entity_rows
@@ -1543,7 +1604,7 @@ def test_extract_message_row_populates_v7_columns() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _minimal_msg(**overrides: Any) -> SimpleNamespace:
+def _minimal_msg(**overrides: object) -> SimpleNamespace:
     """Build a minimal Telethon-like Message for extract_message_row tests."""
     from datetime import datetime
 
@@ -1632,7 +1693,7 @@ def test_extract_message_row_regular_message_is_service_zero() -> None:
 
 
 def test_extract_message_row_insert_roundtrip_preserves_out_and_is_service(
-    sync_db: sqlite3.Connection,
+    sync_db: _SQLiteConnection,
 ) -> None:
     """End-to-end: extract -> insert -> SELECT returns correct out/is_service."""
     from mcp_telegram.sync_worker import extract_message_row, insert_messages_with_fts
@@ -1646,8 +1707,8 @@ def test_extract_message_row_insert_roundtrip_preserves_out_and_is_service(
 
     msg = _minimal_msg(id=777, out=True)
     em = extract_message_row(dialog_id, msg)
-    with sync_db:
-        insert_messages_with_fts(sync_db, [em])
+    with cast(sqlite3.Connection, sync_db):
+        insert_messages_with_fts(cast(sqlite3.Connection, sync_db), [em])
 
     row = sync_db.execute(
         "SELECT out, is_service FROM messages WHERE dialog_id=? AND message_id=?",
@@ -1656,7 +1717,7 @@ def test_extract_message_row_insert_roundtrip_preserves_out_and_is_service(
     assert row == (1, 0)
 
 
-def test_extract_message_row_persists_reply_count(sync_db: sqlite3.Connection) -> None:
+def test_extract_message_row_persists_reply_count(sync_db: _SQLiteConnection) -> None:
     """Telegram Message.replies.replies is stored as messages.reply_count."""
     from mcp_telegram.sync_worker import extract_message_row, insert_messages_with_fts
 
@@ -1669,8 +1730,8 @@ def test_extract_message_row_persists_reply_count(sync_db: sqlite3.Connection) -
 
     msg = build_mock_message(id=778, reply_count=3)
     em = extract_message_row(dialog_id, msg)
-    with sync_db:
-        insert_messages_with_fts(sync_db, [em])
+    with cast(sqlite3.Connection, sync_db):
+        insert_messages_with_fts(cast(sqlite3.Connection, sync_db), [em])
 
     row = sync_db.execute(
         "SELECT reply_count FROM messages WHERE dialog_id=? AND message_id=?",
@@ -1699,7 +1760,7 @@ def _stored(dialog_id: int, message_id: int, text: str = "hello") -> StoredMessa
     )
 
 
-def test_insert_messages_with_fts_writes_reactions(sync_db: sqlite3.Connection) -> None:
+def test_insert_messages_with_fts_writes_reactions(sync_db: _SQLiteConnection) -> None:
     """insert_messages_with_fts writes reaction rows to message_reactions table."""
     from mcp_telegram.sync_worker import ExtractedMessage, ReactionRecord, insert_messages_with_fts
 
@@ -1716,8 +1777,8 @@ def test_insert_messages_with_fts_writes_reactions(sync_db: sqlite3.Connection) 
             ReactionRecord(dialog_id=dialog_id, message_id=message_id, emoji="❤", count=2),
         ],
     )
-    with sync_db:
-        insert_messages_with_fts(sync_db, [em])
+    with cast(sqlite3.Connection, sync_db):
+        insert_messages_with_fts(cast(sqlite3.Connection, sync_db), [em])
 
     rows = sync_db.execute(
         "SELECT emoji, count FROM message_reactions WHERE dialog_id=? AND message_id=? ORDER BY emoji",
@@ -1727,7 +1788,7 @@ def test_insert_messages_with_fts_writes_reactions(sync_db: sqlite3.Connection) 
     assert reaction_dict == {"👍": 5, "❤": 2}
 
 
-def test_insert_messages_with_fts_writes_forwards(sync_db: sqlite3.Connection) -> None:
+def test_insert_messages_with_fts_writes_forwards(sync_db: _SQLiteConnection) -> None:
     """insert_messages_with_fts writes forward metadata to message_forwards table."""
     from mcp_telegram.sync_worker import ExtractedMessage, ForwardRecord, insert_messages_with_fts
 
@@ -1748,8 +1809,8 @@ def test_insert_messages_with_fts_writes_forwards(sync_db: sqlite3.Connection) -
             fwd_channel_post=None,
         ),
     )
-    with sync_db:
-        insert_messages_with_fts(sync_db, [em])
+    with cast(sqlite3.Connection, sync_db):
+        insert_messages_with_fts(cast(sqlite3.Connection, sync_db), [em])
 
     row = sync_db.execute(
         "SELECT fwd_from_peer_id, fwd_from_name FROM message_forwards WHERE dialog_id=? AND message_id=?",
@@ -1760,7 +1821,7 @@ def test_insert_messages_with_fts_writes_forwards(sync_db: sqlite3.Connection) -
     assert row[1] == "Original Author"
 
 
-def test_insert_messages_with_fts_edit_idempotency_reactions(sync_db: sqlite3.Connection) -> None:
+def test_insert_messages_with_fts_edit_idempotency_reactions(sync_db: _SQLiteConnection) -> None:
     """Inserting same message_id twice replaces reactions (DELETE-before-INSERT)."""
     from mcp_telegram.sync_worker import ExtractedMessage, ReactionRecord, insert_messages_with_fts
 
@@ -1777,16 +1838,16 @@ def test_insert_messages_with_fts_edit_idempotency_reactions(sync_db: sqlite3.Co
             ReactionRecord(dialog_id=dialog_id, message_id=message_id, emoji="❤", count=1),
         ],
     )
-    with sync_db:
-        insert_messages_with_fts(sync_db, [em1])
+    with cast(sqlite3.Connection, sync_db):
+        insert_messages_with_fts(cast(sqlite3.Connection, sync_db), [em1])
 
     em2 = ExtractedMessage(
         message=_stored(dialog_id, message_id, "v2"),
         reply_count=0,
         reactions=[ReactionRecord(dialog_id=dialog_id, message_id=message_id, emoji="🔥", count=7)],
     )
-    with sync_db:
-        insert_messages_with_fts(sync_db, [em2])
+    with cast(sqlite3.Connection, sync_db):
+        insert_messages_with_fts(cast(sqlite3.Connection, sync_db), [em2])
 
     rows = sync_db.execute(
         "SELECT emoji, count FROM message_reactions WHERE dialog_id=? AND message_id=?",
@@ -1796,7 +1857,7 @@ def test_insert_messages_with_fts_edit_idempotency_reactions(sync_db: sqlite3.Co
     assert rows[0] == ("🔥", 7)
 
 
-def test_insert_messages_with_fts_edit_idempotency_entities(sync_db: sqlite3.Connection) -> None:
+def test_insert_messages_with_fts_edit_idempotency_entities(sync_db: _SQLiteConnection) -> None:
     """Inserting same message_id twice replaces entities (DELETE-before-INSERT)."""
     from mcp_telegram.sync_worker import EntityRecord, ExtractedMessage, insert_messages_with_fts
 
@@ -1813,8 +1874,8 @@ def test_insert_messages_with_fts_edit_idempotency_entities(sync_db: sqlite3.Con
             EntityRecord(dialog_id=dialog_id, message_id=message_id, offset=6, length=5, type="mention", value="@old2"),
         ],
     )
-    with sync_db:
-        insert_messages_with_fts(sync_db, [em1])
+    with cast(sqlite3.Connection, sync_db):
+        insert_messages_with_fts(cast(sqlite3.Connection, sync_db), [em1])
 
     em2 = ExtractedMessage(
         message=_stored(dialog_id, message_id, "new"),
@@ -1823,8 +1884,8 @@ def test_insert_messages_with_fts_edit_idempotency_entities(sync_db: sqlite3.Con
             EntityRecord(dialog_id=dialog_id, message_id=message_id, offset=0, length=4, type="hashtag", value="#new")
         ],
     )
-    with sync_db:
-        insert_messages_with_fts(sync_db, [em2])
+    with cast(sqlite3.Connection, sync_db):
+        insert_messages_with_fts(cast(sqlite3.Connection, sync_db), [em2])
 
     rows = sync_db.execute(
         "SELECT type, value FROM message_entities WHERE dialog_id=? AND message_id=?",
@@ -1834,7 +1895,7 @@ def test_insert_messages_with_fts_edit_idempotency_entities(sync_db: sqlite3.Con
     assert rows[0] == ("hashtag", "#new")
 
 
-def test_insert_messages_with_fts_edit_idempotency_forwards(sync_db: sqlite3.Connection) -> None:
+def test_insert_messages_with_fts_edit_idempotency_forwards(sync_db: _SQLiteConnection) -> None:
     """Inserting same message_id with no forward clears forward row."""
     from mcp_telegram.sync_worker import ExtractedMessage, ForwardRecord, insert_messages_with_fts
 
@@ -1855,13 +1916,15 @@ def test_insert_messages_with_fts_edit_idempotency_forwards(sync_db: sqlite3.Con
             fwd_channel_post=None,
         ),
     )
-    with sync_db:
-        insert_messages_with_fts(sync_db, [em1])
+    with cast(sqlite3.Connection, sync_db):
+        insert_messages_with_fts(cast(sqlite3.Connection, sync_db), [em1])
 
-    fwd = sync_db.execute(
+    row = sync_db.execute(
         "SELECT COUNT(*) FROM message_forwards WHERE dialog_id=? AND message_id=?",
         (dialog_id, message_id),
-    ).fetchone()[0]
+    ).fetchone()
+    assert row is not None
+    fwd = row[0]
     assert fwd == 1
 
     em2 = ExtractedMessage(
@@ -1869,13 +1932,15 @@ def test_insert_messages_with_fts_edit_idempotency_forwards(sync_db: sqlite3.Con
         reply_count=0,
         forward=None,
     )
-    with sync_db:
-        insert_messages_with_fts(sync_db, [em2])
+    with cast(sqlite3.Connection, sync_db):
+        insert_messages_with_fts(cast(sqlite3.Connection, sync_db), [em2])
 
-    fwd_after = sync_db.execute(
+    row = sync_db.execute(
         "SELECT COUNT(*) FROM message_forwards WHERE dialog_id=? AND message_id=?",
         (dialog_id, message_id),
-    ).fetchone()[0]
+    ).fetchone()
+    assert row is not None
+    fwd_after = row[0]
     assert fwd_after == 0, "Forward row must be cleared when re-inserted without forward"
 
 
@@ -1900,23 +1965,22 @@ from telethon.tl.types import PeerUser as _PeerUser
     ],
     ids=["channel", "user"],
 )
-async def test_resolve_peer_name_passes_typed_peer_to_get_entity(peer: Any) -> None:
+async def test_resolve_peer_name_passes_typed_peer_to_get_entity(peer: object) -> None:
     """get_entity receives the typed Peer object, never a type-erased bare int."""
     from mcp_telegram.sync_worker import _resolve_peer_name
 
-    client = MagicMock()
-    client.get_entity = AsyncMock(return_value=SimpleNamespace(title="Private meme collection"))
+    client = _PeerLookupClient()
+    typed_peer = cast(_PeerLike, peer)
 
-    name = await _resolve_peer_name(client, peer)
+    name = await _resolve_peer_name(client, typed_peer)
 
     assert name == "Private meme collection"
-    passed = client.get_entity.await_args.args[0]
-    assert passed is peer, "resolver must hand get_entity the typed Peer, not a bare int"
+    assert client.passed_peer is peer, "resolver must hand get_entity the typed Peer, not a bare int"
 
 
 @pytest.mark.asyncio
 async def test_resolve_peer_name_uncacheable_logs_marked_id_without_raising(
-    caplog: Any,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """ValueError → single warning with the marked id, returns None, no stacktrace/raise."""
     import logging
@@ -1926,11 +1990,11 @@ async def test_resolve_peer_name_uncacheable_logs_marked_id_without_raising(
     from mcp_telegram.sync_worker import _resolve_peer_name
 
     peer = types.PeerChannel(channel_id=1579759981)
-    client = MagicMock()
-    client.get_entity = AsyncMock(side_effect=ValueError("Could not find the input entity"))
+    client = _PeerLookupClient(should_raise=True)
+    typed_peer = cast(_PeerLike, peer)
 
     with caplog.at_level(logging.WARNING):
-        name = await _resolve_peer_name(client, peer)
+        name = await _resolve_peer_name(client, typed_peer)
 
     assert name is None
     assert "resolve_peer_name_uncacheable" in caplog.text
@@ -1945,16 +2009,15 @@ async def test_build_fwd_entity_map_resolves_channel_keyed_by_marked_id() -> Non
 
     from mcp_telegram.sync_worker import _build_fwd_entity_map
 
-    peer = types.PeerChannel(channel_id=1579759981)
+    peer = cast(_PeerLike, types.PeerChannel(channel_id=1579759981))
     fwd = SimpleNamespace(from_id=peer, from_name=None, date=None, channel_post=None)
     msg = SimpleNamespace(fwd_from=fwd)
-    client = MagicMock()
-    client.get_entity = AsyncMock(return_value=SimpleNamespace(title="Private meme collection"))
+    client = _PeerLookupClient()
 
     result = await _build_fwd_entity_map(msg, client)
 
     # Resolution used the typed Peer...
-    assert isinstance(client.get_entity.await_args.args[0], types.PeerChannel)
+    assert isinstance(client.passed_peer, types.PeerChannel)
     # ...and the map key is the MARKED id (JOINable, kind-unambiguous storage contract).
     assert result == {-1001579759981: "Private meme collection"}
 
