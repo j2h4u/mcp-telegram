@@ -924,9 +924,7 @@ def _seed_v6_reaction_backfill_db(conn) -> None:
     import json
 
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL, applied_at INTEGER NOT NULL)"
-    )
+    conn.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL, applied_at INTEGER NOT NULL)")
     conn.execute(
         """CREATE TABLE IF NOT EXISTS messages (
             dialog_id       INTEGER NOT NULL,
@@ -945,8 +943,7 @@ def _seed_v6_reaction_backfill_db(conn) -> None:
         ) WITHOUT ROWID"""
     )
     conn.execute(
-        "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts "
-        "USING fts5(dialog_id UNINDEXED, message_id UNINDEXED, text)"
+        "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(dialog_id UNINDEXED, message_id UNINDEXED, text)"
     )
     conn.execute(
         """CREATE TABLE IF NOT EXISTS synced_dialogs (

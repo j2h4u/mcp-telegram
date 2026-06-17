@@ -63,7 +63,9 @@ class _DialogSeedOptions:
     snapshot_at: int = 1700000000
 
 
-def _seed_dialog_row(conn: sqlite3.Connection, dialog_id: int, *, opts: _DialogSeedOptions | None = None, **kwargs) -> None:
+def _seed_dialog_row(
+    conn: sqlite3.Connection, dialog_id: int, *, opts: _DialogSeedOptions | None = None, **kwargs
+) -> None:
     if opts is None:
         opts = _DialogSeedOptions()
     if kwargs:

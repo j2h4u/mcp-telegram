@@ -479,8 +479,12 @@ def _fake_assert_exposure_allowed(captured: dict[str, object], host: str) -> Non
 @pytest.mark.asyncio
 async def test_run_mcp_http_server_normalizes_mount_and_builds_transport(monkeypatch) -> None:
     captured: dict[str, object] = {}
-    monkeypatch.setattr("mcp.server.transport_security.TransportSecuritySettings", partial(_FakeTransportSecuritySettings, captured))
-    monkeypatch.setattr("mcp.server.streamable_http_manager.StreamableHTTPSessionManager", partial(_FakeSessionManager, captured))
+    monkeypatch.setattr(
+        "mcp.server.transport_security.TransportSecuritySettings", partial(_FakeTransportSecuritySettings, captured)
+    )
+    monkeypatch.setattr(
+        "mcp.server.streamable_http_manager.StreamableHTTPSessionManager", partial(_FakeSessionManager, captured)
+    )
     monkeypatch.setattr("starlette.applications.Starlette", partial(_FakeStarlette, captured))
     monkeypatch.setattr("starlette.routing.Route", partial(_FakeRoute, captured))
     monkeypatch.setattr("starlette.routing.Mount", partial(_FakeMount, captured))

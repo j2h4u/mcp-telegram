@@ -184,17 +184,23 @@ def seed_trace_fragment(
     *,
     target_user_id: int,
     dialog_id: int,
-    **kwargs: Unpack[TypedDict("_SeedTraceFragmentKwargs", {
-        "topic_id": int,
-        "coverage_kind": str,
-        "status": str,
-        "fetched_at": int | None,
-        "checkpoint": str | None,
-        "last_error": str | None,
-        "next_retry_at": int | None,
-        "created_at": int,
-        "updated_at": int,
-    }, total=False)],
+    **kwargs: Unpack[
+        TypedDict(
+            "_SeedTraceFragmentKwargs",
+            {
+                "topic_id": int,
+                "coverage_kind": str,
+                "status": str,
+                "fetched_at": int | None,
+                "checkpoint": str | None,
+                "last_error": str | None,
+                "next_retry_at": int | None,
+                "created_at": int,
+                "updated_at": int,
+            },
+            total=False,
+        )
+    ],
 ) -> None:
     topic_id = kwargs.get("topic_id", 0)
     coverage_kind = kwargs.get("coverage_kind", "authored_message")
