@@ -363,7 +363,9 @@ def _analytics_entity_type(entity: Any) -> str | None:
     return None
 
 
-def _extract_entity_value(entity_type: str, text: str, entity: Any, offset: int, length: int) -> tuple[bool, str | None]:
+def _extract_entity_value(
+    entity_type: str, text: str, entity: Any, offset: int, length: int
+) -> tuple[bool, str | None]:
     """Return (should_keep_row, value) for an analytics entity."""
     if entity_type in {"mention", "hashtag", "url"}:
         if not text:

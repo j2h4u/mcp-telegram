@@ -808,7 +808,7 @@ class EventHandlerManager:
             inner_peer = getattr(dialog_peer, "peer", dialog_peer)
             try:
                 dialog_id = int(get_peer_id(inner_peer))
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 continue
             if dialog_id in self._synced_dialog_ids:
                 pinned_ids.append(dialog_id)

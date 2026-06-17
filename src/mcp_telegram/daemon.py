@@ -608,9 +608,13 @@ async def _start_followup_background_tasks(
         run_access_probe_loop(ctx.client, ctx.conn, ctx.shutdown_event, delta_worker),
         name="access_probe_loop",
     )
-    _create_tracked_task(ctx, run_activity_sync_loop(ctx.client, ctx.conn, ctx.shutdown_event), name="activity_sync_loop")
+    _create_tracked_task(
+        ctx, run_activity_sync_loop(ctx.client, ctx.conn, ctx.shutdown_event), name="activity_sync_loop"
+    )
     _create_tracked_task(ctx, run_hot_sweep_loop(ctx.client, ctx.conn, ctx.shutdown_event), name="activity_hot_sweep")
-    _create_tracked_task(ctx, run_cold_backfill_loop(ctx.client, ctx.conn, ctx.shutdown_event), name="activity_cold_backfill")
+    _create_tracked_task(
+        ctx, run_cold_backfill_loop(ctx.client, ctx.conn, ctx.shutdown_event), name="activity_cold_backfill"
+    )
 
     # Phase 43 / RECON-01: hourly light pass + daily full pass keeps the
     # `dialogs` snapshot fresh; processes needs_refresh=1 rows written by
