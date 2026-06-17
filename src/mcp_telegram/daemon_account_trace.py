@@ -8,7 +8,7 @@ import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Literal, Protocol, cast
+from typing import Literal, Protocol, TypedDict, cast
 
 from telethon.errors import FloodWaitError, RPCError  # type: ignore[import-untyped]
 from telethon.tl.functions.contacts import ResolveUsernameRequest  # type: ignore[import-untyped]
@@ -42,6 +42,8 @@ class _LoggerLike(Protocol):
 class _AccountTraceClientLike(Protocol):
     async def __call__(self, request: object) -> object: ...
 
+    async def get_input_entity(self, dialog_id: int) -> object: ...
+
     def iter_messages(self, dialog_id: int, **kwargs: object) -> AsyncIterator[object]: ...
 
 
@@ -54,7 +56,7 @@ class _TraceEnrichmentServiceLike(Protocol):
         max_per_dialog: int,
         deadline_ms: int,
         deadline_at: float,
-    ) -> dict[str, object]: ...
+    ) -> _TraceCandidateEnrichmentResult: ...
 
 
 def _clamp(value: int, low: int, high: int) -> int:
@@ -124,7 +126,7 @@ class _TraceAccountMessagesScope:
 
 @dataclass(frozen=True, slots=True)
 class _TraceAccountQueryResult:
-    selected_rows: list[sqlite3.Row]
+    selected_rows: list[Mapping[str, object]]
     evidence: list[dict[str, object]]
     next_navigation: str | None
 
@@ -154,7 +156,7 @@ class _TraceAccountPayloadContext:
     query_result: _TraceAccountQueryResult
     coverage: dict[str, object]
     gaps: list[dict[str, object]]
-    enrichment: dict[str, object] | None
+    enrichment: _TraceVisibleEnrichmentResult | None
     post_author_aliases: list[str]
 
 
@@ -194,7 +196,7 @@ class _TraceVisibleBudgetContext:
     target_user_id: int
     deadline_ms: int
     now: int
-    result: dict[str, object]
+    result: _TraceVisibleEnrichmentResult
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -206,6 +208,33 @@ class _TraceVisibleCandidatesContext:
     deadline_ms: int
     deadline_at: float
     concurrency: int
+
+
+class _TraceVisibleEnrichmentResult(TypedDict):
+    dialogs_attempted: int
+    dialogs_skipped: int
+    messages_seen: int
+    messages_persisted: int
+    duplicates_skipped: int
+    deadline_ms: int
+    concurrency: int
+    coverage_bounds: dict[str, int]
+    fragment_status_counts: dict[str, int]
+
+
+class _TraceCandidateEnrichmentResult(TypedDict):
+    status: str
+    attempted: int
+    skipped: int
+    messages_seen: int
+    messages_persisted: int
+    duplicates_skipped: int
+
+
+class _TraceDialogMetadata(TypedDict):
+    dialog_type: str
+    status: str
+    hidden: bool
 
 
 def _attr(obj: object, name: str, default: object | None = None) -> object | None:
@@ -221,6 +250,20 @@ def _row_mapping(row: object) -> Mapping[str, object]:
 
 def _row_sequence(row: object) -> Sequence[object]:
     return cast(Sequence[object], row)
+
+
+def _fetchone_row(cursor: sqlite3.Cursor) -> object | None:
+    return cast(object | None, cursor.fetchone())
+
+
+def _fetchall_rows(cursor: sqlite3.Cursor) -> list[object]:
+    rows = cast(Sequence[object], cursor.fetchall())
+    return [cast(object, row) for row in rows]
+
+
+def _fetchall_mapping_rows(cursor: sqlite3.Cursor) -> list[Mapping[str, object]]:
+    rows = cast(Sequence[object], cursor.fetchall())
+    return [cast(Mapping[str, object], row) for row in rows]
 
 
 def _row_int_or_none(row: Mapping[str, object], key: str) -> int | None:
@@ -327,7 +370,7 @@ class DaemonAccountTraceService:
             ),
         )
         self._deps.conn.commit()
-        row = self._deps.conn.execute(_TRACE_ACCOUNT_BY_ID_SQL, (user_id,)).fetchone()
+        row = _fetchone_row(self._deps.conn.execute(_TRACE_ACCOUNT_BY_ID_SQL, (user_id,)))
         if row is None:
             return _unresolved_trace_account(
                 query=f"@{username}",
@@ -374,21 +417,21 @@ class DaemonAccountTraceService:
                 scope_dialog_ids=scope.scope_dialog_ids,
             )
         )
-        rows = cast(list[sqlite3.Row], conn.execute(sql, params).fetchall())
+        rows = _fetchall_mapping_rows(conn.execute(sql, params))
         selected_rows = rows[:limit]
-        evidence = [DaemonAccountTraceService._trace_row_to_evidence(cast(Mapping[str, object], row)) for row in selected_rows]
+        evidence = [DaemonAccountTraceService._trace_row_to_evidence(row) for row in selected_rows]
         next_navigation: str | None = None
         if len(rows) > limit and selected_rows:
-            last = cast(Mapping[str, object], selected_rows[-1])
+            last = selected_rows[-1]
             group_by: Literal["timeline", "dialog"] = "timeline"
             if request.request.group_by == "dialog":
                 group_by = "dialog"
             next_navigation = encode_account_trace_navigation(
                 AccountTraceNavigationRequest(
                     target_user_id=request.target_user_id,
-                    sent_at=int(last["sent_at"]),
-                    dialog_id=int(last["dialog_id"]),
-                    message_id=int(last["message_id"]),
+                    sent_at=_row_int(last, "sent_at"),
+                    dialog_id=_row_int(last, "dialog_id"),
+                    message_id=_row_int(last, "message_id"),
                     group_by=group_by,
                     exact_dialog_id=scope.exact_dialog_id,
                     exact_topic_id=scope.exact_topic_id,
@@ -433,7 +476,8 @@ class DaemonAccountTraceService:
             "next_navigation": request.query_result.next_navigation,
         }
         if request.enrichment is not None:
-            data["provenance"]["enrichment"] = request.enrichment
+            provenance = cast(dict[str, object], data["provenance"])
+            provenance["enrichment"] = request.enrichment
         return {"ok": True, "data": data}
 
     @staticmethod
@@ -464,9 +508,9 @@ class DaemonAccountTraceService:
         ordered_evidence = sorted(
             evidence,
             key=lambda item: (
-                int(item.get("sent_at") or 0),
-                int(item.get("dialog_id") or 0),
-                int(item.get("message_id") or 0),
+                _row_int(cast(Mapping[str, object], {"sent_at": item.get("sent_at")}), "sent_at"),
+                _row_int(cast(Mapping[str, object], {"dialog_id": item.get("dialog_id")}), "dialog_id"),
+                _row_int(cast(Mapping[str, object], {"message_id": item.get("message_id")}), "message_id"),
             ),
         )
         for item in ordered_evidence:
@@ -478,7 +522,7 @@ class DaemonAccountTraceService:
                 if item.get("topic_title"):
                     label = f"{label} / {item['topic_title']}"
             else:
-                day = datetime.fromtimestamp(int(item["sent_at"]), tz=UTC).strftime("%Y-%m-%d")
+                day = datetime.fromtimestamp(_row_int(cast(Mapping[str, object], item), "sent_at"), tz=UTC).strftime("%Y-%m-%d")
                 key = f"day:{day}"
                 label = day
             if key not in groups:
@@ -549,13 +593,12 @@ class DaemonAccountTraceService:
         max_per_dialog: int,
         deadline_ms: int,
         deadline_at: float,
-    ) -> dict[str, object]:
+    ) -> _TraceCandidateEnrichmentResult:
         """Fetch and persist one bounded Account Trace enrichment candidate."""
         dialog_id = _row_int(cast(Mapping[str, object], candidate), "dialog_id")
-        topic_id = candidate.get("topic_id")
-        topic_id = topic_id if isinstance(topic_id, int) else None
+        topic_id = _row_int_or_none(candidate, "topic_id")
         strategy = str(candidate.get("strategy", "unsupported"))
-        result: dict[str, object] = {
+        result: _TraceCandidateEnrichmentResult = {
             "status": "complete",
             "attempted": 0,
             "skipped": 0,
@@ -645,7 +688,7 @@ class DaemonAccountTraceService:
         *,
         request: _TraceVisibleEnrichmentRequest | None = None,
         **legacy_kwargs: int,
-    ) -> dict[str, object]:
+    ) -> _TraceVisibleEnrichmentResult:
         """Bounded best-effort visible Account Trace enrichment."""
         request = _resolve_trace_visible_enrichment_request(request, legacy_kwargs)
         result = _trace_enrichment_result(
@@ -743,7 +786,7 @@ class DaemonAccountTraceService:
         )
 
         selected_rows = query_result.selected_rows
-        enrichment: dict[str, object] | None = None
+        enrichment: _TraceVisibleEnrichmentResult | None = None
         if request.coverage_goal == "best_effort_visible":
             candidates = _trace_candidate_dialogs(
                 _TraceCandidateBuildRequest(
@@ -829,7 +872,7 @@ def _mark_budget_exceeded_candidates(
                 conn=conn,
                 target_user_id=request.target_user_id,
                 dialog_id=_row_int(cast(Mapping[str, object], candidate), "dialog_id"),
-                topic_id=candidate.get("topic_id"),
+                topic_id=_row_int_or_none(candidate, "topic_id"),
                 status="budget_exceeded",
                 last_error=f"BudgetExceeded:{request.deadline_ms}",
                 now=request.now,
@@ -841,10 +884,10 @@ def _mark_budget_exceeded_candidates(
 
 async def _run_trace_visible_candidates(
     request: _TraceVisibleCandidatesContext,
-) -> list[dict[str, object]]:
+) -> list[_TraceCandidateEnrichmentResult]:
     semaphore = asyncio.Semaphore(max(1, request.concurrency))
 
-    async def run_candidate(candidate: dict[str, object]) -> dict[str, object]:
+    async def run_candidate(candidate: dict[str, object]) -> _TraceCandidateEnrichmentResult:
         async with semaphore:
             return await request.service._trace_enrich_one_candidate(
                 target_user_id=request.target_user_id,
@@ -854,7 +897,7 @@ async def _run_trace_visible_candidates(
                 deadline_at=request.deadline_at,
             )
 
-    return await asyncio.gather(*(run_candidate(candidate) for candidate in request.candidates))
+    return cast(list[_TraceCandidateEnrichmentResult], await asyncio.gather(*(run_candidate(candidate) for candidate in request.candidates)))
 
 
 def _trace_post_author_aliases(resolved_account: dict) -> list[str]:
@@ -897,14 +940,14 @@ def _resolve_trace_account_by_id(
     resolution_source: str,
     unresolved_source: str,
 ) -> dict:
-    row = conn.execute(_TRACE_ACCOUNT_BY_ID_SQL, (account_id,)).fetchone()
+    row = _fetchone_row(conn.execute(_TRACE_ACCOUNT_BY_ID_SQL, (account_id,)))
     if row is None:
         return _unresolved_trace_account(query=account_id, resolution_source=unresolved_source)
     return _trace_account_from_entity_row(cast(Mapping[str, object], row), resolution_source=resolution_source)
 
 
 def _resolve_trace_account_by_username(conn: sqlite3.Connection, username: str) -> dict | None:
-    row = conn.execute(_ENTITY_BY_USERNAME_SQL, (username,)).fetchone()
+    row = _fetchone_row(conn.execute(_ENTITY_BY_USERNAME_SQL, (username,)))
     if row is None:
         return None
     return _trace_account_from_entity_row(cast(Mapping[str, object], row), resolution_source="entities_username")
@@ -912,18 +955,17 @@ def _resolve_trace_account_by_username(conn: sqlite3.Connection, username: str) 
 
 def _resolve_trace_account_by_fuzzy(conn: sqlite3.Connection, query: str) -> dict:
     now = int(time.time())
-    display_name_map = dict(
-        cast(list[tuple[object, object]], conn.execute(_TRACE_ACCOUNT_NAMES_SQL, (now - USER_TTL, now - GROUP_TTL)).fetchall())
-    )
-    normalized = dict(
-        cast(
-            list[tuple[object, object]],
-            conn.execute(_TRACE_ACCOUNT_NAMES_NORMALIZED_SQL, (now - USER_TTL, now - GROUP_TTL)).fetchall(),
-        )
-    )
+    display_name_map: dict[int, str] = {}
+    for row in _fetchall_rows(conn.execute(_TRACE_ACCOUNT_NAMES_SQL, (now - USER_TTL, now - GROUP_TTL))):
+        values = _row_sequence(row)
+        display_name_map[_row_int(cast(Mapping[str, object], {"entity_id": values[0]}), "entity_id")] = str(values[1])
+    normalized: dict[int, str] = {}
+    for row in _fetchall_rows(conn.execute(_TRACE_ACCOUNT_NAMES_NORMALIZED_SQL, (now - USER_TTL, now - GROUP_TTL))):
+        values = _row_sequence(row)
+        normalized[_row_int(cast(Mapping[str, object], {"entity_id": values[0]}), "entity_id")] = str(values[1])
     result = resolve(query, display_name_map, None, normalized_name_map=normalized)
     if isinstance(result, Resolved):
-        row = conn.execute(_TRACE_ACCOUNT_BY_ID_SQL, (result.entity_id,)).fetchone()
+        row = _fetchone_row(conn.execute(_TRACE_ACCOUNT_BY_ID_SQL, (result.entity_id,)))
         if row is not None:
             return _trace_account_from_entity_row(cast(Mapping[str, object], row), resolution_source="entities_fuzzy")
         return {
@@ -1180,27 +1222,37 @@ def _parse_trace_account_navigation_scope(
 
 
 def _trace_enrich_candidate_precheck(request: _TraceEnrichPrecheckContext) -> str | None:
-    fragment = request.conn.execute(
-        """
-        SELECT next_retry_at FROM trace_coverage_fragments
-        WHERE target_user_id = ? AND dialog_id = ? AND topic_id = ? AND coverage_kind = 'authored_message'
-        """,
-        (request.target_user_id, request.dialog_id, 0 if request.topic_id is None else int(request.topic_id)),
-    ).fetchone()
-    if fragment is not None and fragment[0] is not None and int(fragment[0]) > request.now:
-        _upsert_trace_coverage_fragment(
-            _TraceCoverageFragmentUpsertRequest(
-                conn=request.conn,
-                target_user_id=request.target_user_id,
-                dialog_id=request.dialog_id,
-                topic_id=request.topic_id,
-                status="pending",
-                fetched_at=request.now,
-                last_error=None,
-                now=request.now,
-            )
+    fragment = _fetchone_row(
+        request.conn.execute(
+            """
+            SELECT next_retry_at FROM trace_coverage_fragments
+            WHERE target_user_id = ? AND dialog_id = ? AND topic_id = ? AND coverage_kind = 'authored_message'
+            """,
+            (request.target_user_id, request.dialog_id, 0 if request.topic_id is None else int(request.topic_id)),
         )
-        return "pending"
+    )
+    if fragment is not None:
+        fragment_values = _row_sequence(fragment)
+        next_retry_at = fragment_values[0]
+        next_retry_at_int = (
+            _row_int_or_none(cast(Mapping[str, object], {"next_retry_at": next_retry_at}), "next_retry_at")
+            if next_retry_at is not None
+            else None
+        )
+        if next_retry_at_int is not None and next_retry_at_int > request.now:
+            _upsert_trace_coverage_fragment(
+                _TraceCoverageFragmentUpsertRequest(
+                    conn=request.conn,
+                    target_user_id=request.target_user_id,
+                    dialog_id=request.dialog_id,
+                    topic_id=request.topic_id,
+                    status="pending",
+                    fetched_at=request.now,
+                    last_error=None,
+                    now=request.now,
+                )
+            )
+            return "pending"
 
     if request.strategy in {"hidden", "access_lost", "unsupported", "signature_only"}:
         status = {
@@ -1431,7 +1483,7 @@ class _TraceGapBuildRequest:
 class _TraceCandidateBuildRequest:
     conn: sqlite3.Connection
     target_user_id: int
-    observed_rows: list[sqlite3.Row] | list[dict[str, object]]
+    observed_rows: list[Mapping[str, object]] | list[dict[str, object]]
     exact_dialog_id: int | None = None
     exact_topic_id: int | None = None
     max_dialogs: int = _TRACE_ENRICHMENT_MAX_DIALOGS
@@ -1571,8 +1623,7 @@ def _get_trace_coverage_fragments(
     if exact_topic_id is not None:
         sql += " AND topic_id = :exact_topic_id"
         params["exact_topic_id"] = exact_topic_id
-    rows = conn.execute(sql, params).fetchall()
-    return [cast(dict[str, object], dict(row)) for row in rows]
+    return [_row_dict(row) for row in _fetchall_rows(conn.execute(sql, params))]
 
 
 def _sanitize_trace_last_error(last_error: str | None) -> str | None:
@@ -1623,9 +1674,9 @@ def _upsert_trace_coverage_fragment(
 
 def _row_value(row: Mapping[str, object] | Sequence[object], key: str) -> object:
     if isinstance(row, Mapping):
-        return row[key]
+        return cast(object, row[key])
     if isinstance(row, sqlite3.Row):
-        return row[key]
+        return cast(object, row[key])
     raise TypeError("row must be a mapping")
 
 
@@ -1638,16 +1689,22 @@ def _row_int(row: Mapping[str, object] | Sequence[object], key: str) -> int:
     return int(cast(int | str, value))
 
 
+def _row_dict(row: object) -> dict[str, object]:
+    return dict(_row_mapping(row))
+
+
 def _dialog_status_map(conn: sqlite3.Connection, dialog_ids: set[int]) -> dict[int, str | None]:
     if not dialog_ids:
         return {}
     placeholders = ",".join("?" * len(dialog_ids))
-    rows = conn.execute(
-        f"SELECT dialog_id, status FROM synced_dialogs WHERE dialog_id IN ({placeholders})",
-        tuple(dialog_ids),
-    ).fetchall()
+    rows = _fetchall_rows(
+        conn.execute(
+            f"SELECT dialog_id, status FROM synced_dialogs WHERE dialog_id IN ({placeholders})",
+            tuple(dialog_ids),
+        )
+    )
     result: dict[int, str | None] = {
-        _row_int(cast(Mapping[str, object], {"dialog_id": row[0], "status": row[1]}), "dialog_id"): str(row[1])
+        _row_int(cast(Mapping[str, object], {"dialog_id": _row_sequence(row)[0], "status": _row_sequence(row)[1]}), "dialog_id"): str(_row_sequence(row)[1])
         for row in rows
     }
     for dialog_id in dialog_ids:
@@ -1658,7 +1715,7 @@ def _dialog_status_map(conn: sqlite3.Connection, dialog_ids: set[int]) -> dict[i
 def _build_trace_coverage(
     conn: sqlite3.Connection,
     target_user_id: int,
-    rows: list[sqlite3.Row] | list[dict[str, object]],
+    rows: list[Mapping[str, object]] | list[dict[str, object]],
     *,
     exact_dialog_id: int | None = None,
     exact_topic_id: int | None = None,
@@ -1678,8 +1735,8 @@ def _build_trace_coverage(
         basis = "exact_dialog_scope"
     else:
         access_lost_dialogs = {
-            _row_int(cast(Mapping[str, object], {"dialog_id": row[0]}), "dialog_id")
-            for row in conn.execute("SELECT dialog_id FROM synced_dialogs WHERE status = 'access_lost'").fetchall()
+            _row_int(cast(Mapping[str, object], {"dialog_id": _row_sequence(row)[0]}), "dialog_id")
+            for row in _fetchall_rows(conn.execute("SELECT dialog_id FROM synced_dialogs WHERE status = 'access_lost'"))
         }
         considered_dialogs = observed_dialogs | fragment_dialogs | access_lost_dialogs
         basis = "evidence_or_fragments_or_access_lost" if considered_dialogs else "none"
@@ -1691,7 +1748,7 @@ def _build_trace_coverage(
             gap_dialogs.add(dialog_id)
     for fragment in fragments:
         if str(fragment["status"]) in _TRACE_PARTIAL_FRAGMENT_STATUSES:
-            gap_dialogs.add(int(fragment["dialog_id"]))
+            gap_dialogs.add(_row_int(fragment, "dialog_id"))
 
     if not considered_dialogs:
         state = "unknown"
@@ -1844,10 +1901,10 @@ def _collect_trace_gap_dialogs(
         dialog_ids.add(request.exact_dialog_id)
     elif request.coverage.get("dialogs_considered", 0):
         dialog_ids.update(
-            _row_int(cast(Mapping[str, object], {"dialog_id": row[0]}), "dialog_id")
-            for row in request.conn.execute(
-                "SELECT dialog_id FROM synced_dialogs WHERE status = 'access_lost'"
-            ).fetchall()
+            _row_int(cast(Mapping[str, object], {"dialog_id": _row_sequence(row)[0]}), "dialog_id")
+            for row in _fetchall_rows(
+                request.conn.execute("SELECT dialog_id FROM synced_dialogs WHERE status = 'access_lost'")
+            )
         )
     return dialog_ids
 
@@ -1876,8 +1933,10 @@ def _collect_trace_gaps_for_hidden_dialogs(
     *,
     considered_dialogs: set[int],
 ) -> list[dict[str, object]]:
-    hidden_rows = request.conn.execute("SELECT dialog_id FROM dialogs WHERE hidden = 1").fetchall()
-    hidden_dialogs = {_row_int(cast(Mapping[str, object], {"dialog_id": row[0]}), "dialog_id") for row in hidden_rows}
+    hidden_dialogs = {
+        _row_int(cast(Mapping[str, object], {"dialog_id": _row_sequence(row)[0]}), "dialog_id")
+        for row in _fetchall_rows(request.conn.execute("SELECT dialog_id FROM dialogs WHERE hidden = 1"))
+    }
     return [
         _trace_gap(
             _TraceGapCandidate(
@@ -1967,20 +2026,22 @@ def _trace_strategy_for_dialog(dialog_type: str, *, status: str | None, hidden: 
     return "unsupported"
 
 
-def _trace_dialog_metadata(conn: sqlite3.Connection, dialog_id: int) -> dict[str, object]:
-    row = conn.execute(
-        """
-        SELECT
-            COALESCE(d.type, e.type, 'Unknown') AS dialog_type,
-            COALESCE(sd.status, 'not_synced') AS status,
-            COALESCE(d.hidden, 0) AS hidden
-        FROM (SELECT ? AS dialog_id) x
-        LEFT JOIN dialogs d ON d.dialog_id = x.dialog_id
-        LEFT JOIN entities e ON e.id = x.dialog_id
-        LEFT JOIN synced_dialogs sd ON sd.dialog_id = x.dialog_id
-        """,
-        (dialog_id,),
-    ).fetchone()
+def _trace_dialog_metadata(conn: sqlite3.Connection, dialog_id: int) -> _TraceDialogMetadata:
+    row = _fetchone_row(
+        conn.execute(
+            """
+            SELECT
+                COALESCE(d.type, e.type, 'Unknown') AS dialog_type,
+                COALESCE(sd.status, 'not_synced') AS status,
+                COALESCE(d.hidden, 0) AS hidden
+            FROM (SELECT ? AS dialog_id) x
+            LEFT JOIN dialogs d ON d.dialog_id = x.dialog_id
+            LEFT JOIN entities e ON e.id = x.dialog_id
+            LEFT JOIN synced_dialogs sd ON sd.dialog_id = x.dialog_id
+            """,
+            (dialog_id,),
+        )
+    )
     row_values = _row_sequence(row) if row is not None else None
     return {
         "dialog_type": str(row_values[0]) if row_values is not None else "Unknown",
@@ -1990,15 +2051,17 @@ def _trace_dialog_metadata(conn: sqlite3.Connection, dialog_id: int) -> dict[str
 
 
 def _trace_common_chat_ids(conn: sqlite3.Connection, target_user_id: int) -> list[int]:
-    row = conn.execute(
-        "SELECT detail_json FROM entity_details WHERE entity_id = ?",
-        (target_user_id,),
-    ).fetchone()
+    row = _fetchone_row(
+        conn.execute(
+            "SELECT detail_json FROM entity_details WHERE entity_id = ?",
+            (target_user_id,),
+        )
+    )
     if row is None:
         return []
     try:
-        detail = json.loads(str(row[0]))
-    except TypeError, json.JSONDecodeError:
+        detail = cast(dict[str, object], json.loads(str(_row_sequence(row)[0])))
+    except (TypeError, json.JSONDecodeError):
         return []
     common_chats = detail.get("common_chats", [])
     if not isinstance(common_chats, list):
@@ -2012,7 +2075,7 @@ def _trace_common_chat_ids(conn: sqlite3.Connection, target_user_id: int) -> lis
             continue
         try:
             ids.append(int(raw_id))
-        except TypeError, ValueError:
+        except (TypeError, ValueError):
             continue
     return ids
 
@@ -2115,21 +2178,22 @@ def _add_trace_candidate_fragments(
     now: int,
 ) -> None:
     request = state.request
-    fragment_rows = request.conn.execute(
-        """
-        SELECT dialog_id
-        FROM trace_coverage_fragments
-        WHERE target_user_id = ?
-          AND status != 'complete'
-          AND (next_retry_at IS NULL OR next_retry_at <= ?)
-        ORDER BY updated_at ASC, dialog_id ASC
-        """,
-        (request.target_user_id, now),
-    ).fetchall()
-    for row in fragment_rows:
+    for row in _fetchall_rows(
+        request.conn.execute(
+            """
+            SELECT dialog_id
+            FROM trace_coverage_fragments
+            WHERE target_user_id = ?
+              AND status != 'complete'
+              AND (next_retry_at IS NULL OR next_retry_at <= ?)
+            ORDER BY updated_at ASC, dialog_id ASC
+            """,
+            (request.target_user_id, now),
+        )
+    ):
         _add_trace_candidate_dialog(
             state=state,
-            dialog_id=_row_int(cast(Mapping[str, object], {"dialog_id": row[0]}), "dialog_id"),
+            dialog_id=_row_int(cast(Mapping[str, object], {"dialog_id": _row_sequence(row)[0]}), "dialog_id"),
             origin="trace_fragment_retry",
         )
 
@@ -2150,20 +2214,21 @@ def _add_trace_candidate_visible_synced(
     state: _TraceCandidateBuildState,
 ) -> None:
     request = state.request
-    visible_rows = request.conn.execute(
-        """
-        SELECT sd.dialog_id
-        FROM synced_dialogs sd
-        LEFT JOIN dialogs d ON d.dialog_id = sd.dialog_id
-        WHERE sd.status != 'access_lost'
-          AND COALESCE(d.hidden, 0) = 0
-        ORDER BY sd.dialog_id ASC
-        """
-    ).fetchall()
-    for row in visible_rows:
+    for row in _fetchall_rows(
+        request.conn.execute(
+            """
+            SELECT sd.dialog_id
+            FROM synced_dialogs sd
+            LEFT JOIN dialogs d ON d.dialog_id = sd.dialog_id
+            WHERE sd.status != 'access_lost'
+              AND COALESCE(d.hidden, 0) = 0
+            ORDER BY sd.dialog_id ASC
+            """
+        )
+    ):
         _add_trace_candidate_dialog(
             state=state,
-            dialog_id=_row_int(cast(Mapping[str, object], {"dialog_id": row[0]}), "dialog_id"),
+            dialog_id=_row_int(cast(Mapping[str, object], {"dialog_id": _row_sequence(row)[0]}), "dialog_id"),
             origin="visible_synced",
         )
 
@@ -2175,47 +2240,55 @@ def _trace_existing_message_bundle(
     message_id: int,
 ) -> dict | None:
     columns = ", ".join(_TRACE_MESSAGE_COMPARE_FIELDS)
-    row = conn.execute(
-        f"SELECT {columns} FROM messages WHERE dialog_id = ? AND message_id = ?",
-        (dialog_id, message_id),
-    ).fetchone()
+    row = _fetchone_row(
+        conn.execute(
+            f"SELECT {columns} FROM messages WHERE dialog_id = ? AND message_id = ?",
+            (dialog_id, message_id),
+        )
+    )
     if row is None:
         return None
     return {
-        "message": {field: row[index] for index, field in enumerate(_TRACE_MESSAGE_COMPARE_FIELDS)},
+        "message": {field: _row_sequence(row)[index] for index, field in enumerate(_TRACE_MESSAGE_COMPARE_FIELDS)},
         "reactions": sorted(
-            tuple(item)
-            for item in conn.execute(
-                """
-                SELECT emoji, count FROM message_reactions
-                WHERE dialog_id = ? AND message_id = ?
-                ORDER BY emoji, count
-                """,
-                (dialog_id, message_id),
-            ).fetchall()
-        ),
-        "entities": sorted(
-            tuple(item)
-            for item in conn.execute(
-                """
-                SELECT offset, length, type, value FROM message_entities
-                WHERE dialog_id = ? AND message_id = ?
-                ORDER BY offset, length, type, value
-                """,
-                (dialog_id, message_id),
-            ).fetchall()
-        ),
-        "forward": (
-            tuple(forward_row)
-            if (
-                forward_row := conn.execute(
+            tuple(_row_sequence(item))
+            for item in _fetchall_rows(
+                conn.execute(
                     """
-                    SELECT fwd_from_peer_id, fwd_from_name, fwd_date, fwd_channel_post
-                    FROM message_forwards
+                    SELECT emoji, count FROM message_reactions
                     WHERE dialog_id = ? AND message_id = ?
+                    ORDER BY emoji, count
                     """,
                     (dialog_id, message_id),
-                ).fetchone()
+                )
+            )
+        ),
+        "entities": sorted(
+            tuple(_row_sequence(item))
+            for item in _fetchall_rows(
+                conn.execute(
+                    """
+                    SELECT offset, length, type, value FROM message_entities
+                    WHERE dialog_id = ? AND message_id = ?
+                    ORDER BY offset, length, type, value
+                    """,
+                    (dialog_id, message_id),
+                )
+            )
+        ),
+        "forward": (
+            tuple(_row_sequence(forward_row))
+            if (
+                forward_row := _fetchone_row(
+                    conn.execute(
+                        """
+                        SELECT fwd_from_peer_id, fwd_from_name, fwd_date, fwd_channel_post
+                        FROM message_forwards
+                        WHERE dialog_id = ? AND message_id = ?
+                        """,
+                        (dialog_id, message_id),
+                    )
+                )
             )
             else None
         ),
@@ -2266,7 +2339,7 @@ def _trace_enrichment_result(
     concurrency: int,
     max_dialogs: int,
     max_per_dialog: int,
-) -> dict[str, object]:
+) -> _TraceVisibleEnrichmentResult:
     return {
         "dialogs_attempted": 0,
         "dialogs_skipped": 0,
@@ -2284,7 +2357,7 @@ def _trace_enrichment_result(
     }
 
 
-def _trace_increment_status(result: dict[str, object], status: str) -> None:
+def _trace_increment_status(result: _TraceVisibleEnrichmentResult, status: str) -> None:
     counts = cast(dict[str, int], result.setdefault("fragment_status_counts", {}))
     counts[status] = counts.get(status, 0) + 1
 
