@@ -1,14 +1,800 @@
 """Pure Account Trace helpers extracted from the daemon API server."""
 
+import asyncio
 import dataclasses
 import json
 import sqlite3
 import time
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Any
 
+from telethon.errors import FloodWaitError, RPCError  # type: ignore[import-untyped]
+from telethon.tl.functions.contacts import ResolveUsernameRequest  # type: ignore[import-untyped]
+
+from .activity_peer_resolve import resolve_linked_chat_id
 from .activity_peer_sweep import enroll_activity_dialog
+from .dialog_sync import _ACCESS_LOST_ERRORS
 from .models import DialogType
-from .sync_worker import ExtractedMessage
+from .resolver import Candidates, Resolved, _parse_tme_link, latinize, resolve
+from .sync_worker import ExtractedMessage, extract_message_row, insert_messages_with_fts
+
+_TRACE_SCOPE_DIALOG_IDS_LEN = 2
+USER_TTL = 2_592_000  # 30 days
+GROUP_TTL = 604_800  # 7 days
+_TRACE_ENRICHMENT_MAX_DIALOGS = 10
+_TRACE_ENRICHMENT_MAX_PER_DIALOG = 100
+_TRACE_ENRICHMENT_DEADLINE_MS = 15_000
+_TRACE_ENRICHMENT_CONCURRENCY = 2
+
+
+def _clamp(value: int, low: int, high: int) -> int:
+    """Clamp integer values for safe request parameter handling."""
+    return max(low, min(value, high))
+
+
+_UPSERT_ENTITY_SQL = (
+    "INSERT OR REPLACE INTO entities (id, type, name, username, name_normalized, updated_at) VALUES (?, ?, ?, ?, ?, ?)"
+)
+_ENTITY_BY_USERNAME_SQL = "SELECT id, name, username, name_normalized FROM entities WHERE username = ? COLLATE NOCASE"
+_TRACE_ACCOUNT_BY_ID_SQL = "SELECT id, name, username, name_normalized FROM entities WHERE id = ?"
+_TRACE_ACCOUNT_NAMES_SQL = (
+    "SELECT id, name FROM entities "
+    "WHERE id > 0 AND name IS NOT NULL "
+    "AND ((type IN ('User', 'Bot', 'user', 'bot') AND updated_at >= ?) "
+    "OR (type NOT IN ('User', 'Bot', 'user', 'bot') AND updated_at >= ?))"
+)
+_TRACE_ACCOUNT_NAMES_NORMALIZED_SQL = (
+    "SELECT id, name_normalized FROM entities "
+    "WHERE id > 0 AND name_normalized IS NOT NULL "
+    "AND ((type IN ('User', 'Bot', 'user', 'bot') AND updated_at >= ?) "
+    "OR (type NOT IN ('User', 'Bot', 'user', 'bot') AND updated_at >= ?))"
+)
+
+
+@dataclass(frozen=True)
+class DaemonAccountTraceDeps:
+    """Dependency container for account-trace orchestration."""
+
+    conn: sqlite3.Connection
+    client: Any
+    resolve_dialog_id: Callable[[int, str | None], Awaitable[int | dict]]
+    self_id: int | None
+    logger: Any
+    rid: Callable[[], str]
+
+
+class DaemonAccountTraceService:
+    """Account Trace orchestration for daemon-side enrichment and evidence extraction."""
+
+    def __init__(self, deps: DaemonAccountTraceDeps) -> None:
+        self._deps = deps
+
+    async def _resolve_trace_account(self, req: dict) -> dict:
+        """Resolve an Account Trace target without probing arbitrary numeric ids."""
+        exact_account_id = _parse_trace_int(req.get("exact_account_id"))
+        account = req.get("account")
+        if exact_account_id is not None:
+            row = self._deps.conn.execute(_TRACE_ACCOUNT_BY_ID_SQL, (exact_account_id,)).fetchone()
+            if row is not None:
+                return _trace_account_from_entity_row(row, resolution_source="entities_exact_id")
+            return _unresolved_trace_account(
+                query=exact_account_id,
+                resolution_source="unresolved_numeric_id",
+            )
+
+        numeric_account_id = _parse_trace_int(account)
+        if numeric_account_id is not None:
+            row = self._deps.conn.execute(_TRACE_ACCOUNT_BY_ID_SQL, (numeric_account_id,)).fetchone()
+            if row is not None:
+                return _trace_account_from_entity_row(row, resolution_source="entities_numeric_account")
+            return _unresolved_trace_account(
+                query=numeric_account_id,
+                resolution_source="unresolved_numeric_id",
+            )
+
+        if not isinstance(account, str) or not account.strip():
+            return _unresolved_trace_account(query=account, resolution_source="missing_account")
+
+        query = account.strip()
+        tme = _parse_tme_link(query)
+        explicit_username = False
+        if tme is not None:
+            query = f"@{tme[0]}"
+            explicit_username = True
+        elif query.startswith("@"):
+            explicit_username = True
+
+        if explicit_username:
+            username_query = query[1:]
+            row = self._deps.conn.execute(_ENTITY_BY_USERNAME_SQL, (username_query,)).fetchone()
+            if row is not None:
+                return _trace_account_from_entity_row(row, resolution_source="entities_username")
+            return await self._resolve_trace_username(username_query)
+
+        now = int(time.time())
+        display_name_map = dict(
+            self._deps.conn.execute(_TRACE_ACCOUNT_NAMES_SQL, (now - USER_TTL, now - GROUP_TTL)).fetchall()
+        )
+        normalized = dict(
+            self._deps.conn.execute(
+                _TRACE_ACCOUNT_NAMES_NORMALIZED_SQL,
+                (now - USER_TTL, now - GROUP_TTL),
+            ).fetchall()
+        )
+        result = resolve(query, display_name_map, None, normalized_name_map=normalized)
+        if isinstance(result, Resolved):
+            row = self._deps.conn.execute(_TRACE_ACCOUNT_BY_ID_SQL, (result.entity_id,)).fetchone()
+            if row is not None:
+                return _trace_account_from_entity_row(row, resolution_source="entities_fuzzy")
+            return {
+                "confidence": "resolved",
+                "account_id": result.entity_id,
+                "display_name": result.display_name,
+                "username": None,
+                "candidate_ids": [],
+                "display_aliases": _unique_trace_aliases(result.display_name, latinize(result.display_name)),
+                "resolution_source": "entities_fuzzy",
+            }
+        if isinstance(result, Candidates):
+            candidate_ids = [int(match["entity_id"]) for match in result.matches]
+            display_aliases = [str(match["display_name"]) for match in result.matches if match.get("display_name")]
+            return _unresolved_trace_account(
+                query=query,
+                resolution_source="entities_fuzzy_candidates",
+                candidate_ids=candidate_ids,
+                display_aliases=display_aliases,
+                confidence="ambiguous",
+            )
+        return _unresolved_trace_account(query=query, resolution_source="entities_fuzzy_not_found")
+
+    async def _resolve_trace_username(self, username: str) -> dict:
+        """Resolve an explicit username with one daemon-owned Telegram lookup."""
+        try:
+            result = await self._deps.client(ResolveUsernameRequest(username=username))
+        except (RPCError, RuntimeError, TypeError, AttributeError, ValueError) as exc:
+            self._deps.logger.info(
+                "trace_account username_lookup_failed username=%r error_type=%s%s",
+                username,
+                type(exc).__name__,
+                self._deps.rid(),
+            )
+            return _unresolved_trace_account(
+                query=f"@{username}",
+                resolution_source="telegram_username_lookup_failed",
+            )
+
+        users = list(getattr(result, "users", []) or [])
+        if not users:
+            return _unresolved_trace_account(
+                query=f"@{username}",
+                resolution_source="telegram_username_lookup_empty",
+            )
+
+        user = users[0]
+        user_id = int(user.id)
+        first_name = getattr(user, "first_name", None)
+        last_name = getattr(user, "last_name", None)
+        display_name = " ".join(part for part in (first_name, last_name) if part) or username
+        resolved_username = getattr(user, "username", None) or username
+        entity_type = DialogType.from_entity(user).value
+        now = int(time.time())
+        self._deps.conn.execute(
+            _UPSERT_ENTITY_SQL,
+            (
+                user_id,
+                entity_type,
+                display_name,
+                resolved_username,
+                latinize(display_name),
+                now,
+            ),
+        )
+        self._deps.conn.commit()
+        row = self._deps.conn.execute(_TRACE_ACCOUNT_BY_ID_SQL, (user_id,)).fetchone()
+        if row is None:
+            return _unresolved_trace_account(
+                query=f"@{username}",
+                resolution_source="telegram_username_lookup_write_failed",
+            )
+        return _trace_account_from_entity_row(row, resolution_source="telegram_username_lookup")
+
+    @staticmethod
+    def _trace_row_to_evidence(row: sqlite3.Row) -> dict:
+        """Convert one trace SQL row into a structured evidence item."""
+        return {
+            "source": "sync_db",
+            "evidence_kind": "authored_message",
+            "dialog_id": row["dialog_id"],
+            "dialog_title": row["dialog_title"],
+            "dialog_type": row["dialog_type"],
+            "topic_id": row["topic_id"],
+            "topic_title": row["topic_title"],
+            "message_id": row["message_id"],
+            "sent_at": row["sent_at"],
+            "sender_id": row["sender_id"],
+            "effective_sender_id": row["effective_sender_id"],
+            "authorship_basis": row["authorship_basis"],
+            "author_signature": row["author_signature"],
+            "text": row["text"],
+            "media_description": row["media_description"],
+        }
+
+    @staticmethod
+    def _group_trace_evidence(evidence: list[dict], group_by: str) -> list[dict]:
+        """Group the already-selected Account Trace page for presentation."""
+        groups: dict[str, dict] = {}
+        ordered_evidence = sorted(
+            evidence,
+            key=lambda item: (
+                int(item.get("sent_at") or 0),
+                int(item.get("dialog_id") or 0),
+                int(item.get("message_id") or 0),
+            ),
+        )
+        for item in ordered_evidence:
+            if group_by == "dialog":
+                topic_id = item.get("topic_id")
+                topic_suffix = f":topic:{topic_id}" if topic_id is not None else ""
+                key = f"dialog:{item['dialog_id']}{topic_suffix}"
+                label = str(item.get("dialog_title") or item["dialog_id"])
+                if item.get("topic_title"):
+                    label = f"{label} / {item['topic_title']}"
+            else:
+                day = datetime.fromtimestamp(int(item["sent_at"]), tz=UTC).strftime("%Y-%m-%d")
+                key = f"day:{day}"
+                label = day
+            if key not in groups:
+                groups[key] = {"group_key": key, "group_label": label, "evidence": []}
+            groups[key]["evidence"].append(item)
+        return list(groups.values())
+
+    @staticmethod
+    def _trace_account_resolution_gap(resolved_account: dict) -> dict:
+        """Build the baseline gap for unresolved or ambiguous trace targets."""
+        if resolved_account.get("confidence") == "ambiguous":
+            return {
+                "kind": "account_ambiguous",
+                "severity": "action_required",
+                "detail": "Multiple visible accounts match this reference.",
+                "next_action": {
+                    "field": "exact_account_id",
+                    "argument": "exact_account_id",
+                    "candidate_ids": resolved_account.get("candidate_ids", []),
+                },
+            }
+        return {
+            "kind": "account_unresolved",
+            "severity": "action_required",
+            "detail": "No visible account matched this reference.",
+        }
+
+    @staticmethod
+    def _empty_trace_result(
+        resolved_account: dict,
+        *,
+        gaps: list[dict] | None = None,
+        coverage_goal: str = "observed",
+        coverage_bounds: dict | None = None,
+    ) -> dict:
+        """Return a structurally complete empty Account Trace payload."""
+        as_of = int(time.time())
+        return {
+            "resolved_account": resolved_account,
+            "groups": [],
+            "coverage": {
+                "state": "unknown",
+                "observed_message_count": 0,
+                "dialogs_considered": 0,
+                "dialogs_considered_basis": "no_resolved_account",
+                "dialogs_with_hits": 0,
+                "dialogs_with_gaps": 0,
+                "as_of": as_of,
+            },
+            "gaps": gaps or [],
+            "provenance": {
+                "source": "sync_db",
+                "query_basis": "effective_sender_id_or_post_author_signature",
+                "coverage_goal": coverage_goal,
+                "coverage_bounds": coverage_bounds or {},
+                "authorship_basis_counts": {},
+                "dialogs_considered_basis": "no_resolved_account",
+                "local_cache_writes": 0,
+            },
+            "next_navigation": None,
+        }
+
+    async def _trace_enrich_one_candidate(
+        self,
+        *,
+        target_user_id: int,
+        candidate: dict,
+        max_per_dialog: int,
+        deadline_ms: int,
+        deadline_at: float,
+    ) -> dict:
+        """Fetch and persist one bounded Account Trace enrichment candidate."""
+        dialog_id = int(candidate["dialog_id"])
+        topic_id = candidate.get("topic_id")
+        strategy = str(candidate.get("strategy", "unsupported"))
+        result: dict[str, Any] = {
+            "status": "complete",
+            "attempted": 0,
+            "skipped": 0,
+            "messages_seen": 0,
+            "messages_persisted": 0,
+            "duplicates_skipped": 0,
+        }
+
+        now = int(time.time())
+        fragment = self._deps.conn.execute(
+            """
+            SELECT next_retry_at FROM trace_coverage_fragments
+            WHERE target_user_id = ? AND dialog_id = ? AND topic_id = ? AND coverage_kind = 'authored_message'
+            """,
+            (target_user_id, dialog_id, 0 if topic_id is None else int(topic_id)),
+        ).fetchone()
+        if fragment is not None and fragment[0] is not None and int(fragment[0]) > now:
+            result["status"] = "pending"
+            result["skipped"] = 1
+            return result
+
+        if strategy in {"hidden", "access_lost", "unsupported", "signature_only"}:
+            status = {
+                "hidden": "unsupported",
+                "access_lost": "access_lost",
+                "unsupported": "unsupported",
+                "signature_only": "unsupported",
+            }[strategy]
+            _upsert_trace_coverage_fragment(
+                _TraceCoverageFragmentUpsertRequest(
+                    conn=self._deps.conn,
+                    target_user_id=target_user_id,
+                    dialog_id=dialog_id,
+                    topic_id=topic_id,
+                    status=status,
+                    fetched_at=now,
+                    last_error=f"{strategy}:no_author_search",
+                    now=now,
+                )
+            )
+            result["status"] = status
+            result["skipped"] = 1
+            return result
+
+        if time.monotonic() >= deadline_at:
+            _upsert_trace_coverage_fragment(
+                _TraceCoverageFragmentUpsertRequest(
+                    conn=self._deps.conn,
+                    target_user_id=target_user_id,
+                    dialog_id=dialog_id,
+                    topic_id=topic_id,
+                    status="budget_exceeded",
+                    last_error=f"BudgetExceeded:{deadline_ms}",
+                    now=now,
+                )
+            )
+            result["status"] = "budget_exceeded"
+            result["skipped"] = 1
+            return result
+
+        iter_kwargs: dict[str, object] = {"limit": max_per_dialog}
+        if topic_id is not None:
+            iter_kwargs["reply_to"] = int(topic_id)
+        if strategy == "author_search":
+            iter_kwargs["from_user"] = target_user_id
+
+        fetched: list[ExtractedMessage] = []
+        result["attempted"] = 1
+        try:
+            async for msg in self._deps.client.iter_messages(dialog_id, **iter_kwargs):
+                if time.monotonic() >= deadline_at:
+                    break
+                fetched.append(extract_message_row(dialog_id, msg, entity_name_map={}))
+        except FloodWaitError as exc:
+            seconds = int(getattr(exc, "seconds", 0))
+            _upsert_trace_coverage_fragment(
+                _TraceCoverageFragmentUpsertRequest(
+                    conn=self._deps.conn,
+                    target_user_id=target_user_id,
+                    dialog_id=dialog_id,
+                    topic_id=topic_id,
+                    status="flood_wait",
+                    last_error=f"FloodWaitError:{seconds}",
+                    next_retry_at=now + seconds,
+                    now=now,
+                )
+            )
+            result["status"] = "flood_wait"
+            return result
+        except _ACCESS_LOST_ERRORS as exc:
+            _upsert_trace_coverage_fragment(
+                _TraceCoverageFragmentUpsertRequest(
+                    conn=self._deps.conn,
+                    target_user_id=target_user_id,
+                    dialog_id=dialog_id,
+                    topic_id=topic_id,
+                    status="access_lost",
+                    last_error=type(exc).__name__,
+                    now=now,
+                )
+            )
+            result["status"] = "access_lost"
+            return result
+        except RPCError as exc:
+            _upsert_trace_coverage_fragment(
+                _TraceCoverageFragmentUpsertRequest(
+                    conn=self._deps.conn,
+                    target_user_id=target_user_id,
+                    dialog_id=dialog_id,
+                    topic_id=topic_id,
+                    status="partial",
+                    last_error=type(exc).__name__,
+                    now=now,
+                )
+            )
+            result["status"] = "partial"
+            return result
+        except (RuntimeError, TypeError, AttributeError, ValueError, sqlite3.Error) as exc:
+            _upsert_trace_coverage_fragment(
+                _TraceCoverageFragmentUpsertRequest(
+                    conn=self._deps.conn,
+                    target_user_id=target_user_id,
+                    dialog_id=dialog_id,
+                    topic_id=topic_id,
+                    status="partial",
+                    last_error=type(exc).__name__,
+                    now=now,
+                )
+            )
+            result["status"] = "partial"
+            return result
+
+        result["messages_seen"] = len(fetched)
+        unique: dict[tuple[int, int], ExtractedMessage] = {}
+        for extracted in fetched:
+            key = (extracted.message.dialog_id, extracted.message.message_id)
+            unique[key] = extracted
+        result["duplicates_skipped"] += len(fetched) - len(unique)
+
+        changed: list[ExtractedMessage] = []
+        for key, extracted in unique.items():
+            existing = _trace_existing_message_bundle(
+                self._deps.conn,
+                dialog_id=key[0],
+                message_id=key[1],
+            )
+            if _messages_row_equal(existing, extracted):
+                result["duplicates_skipped"] += 1
+            else:
+                changed.append(extracted)
+
+        if changed:
+            with self._deps.conn:
+                insert_messages_with_fts(self._deps.conn, changed)
+            result["messages_persisted"] = len(changed)
+
+        status = "partial" if len(fetched) >= max_per_dialog else "complete"
+        if time.monotonic() >= deadline_at:
+            status = "budget_exceeded"
+        _upsert_trace_coverage_fragment(
+            _TraceCoverageFragmentUpsertRequest(
+                conn=self._deps.conn,
+                target_user_id=target_user_id,
+                dialog_id=dialog_id,
+                topic_id=topic_id,
+                status=status,
+                fetched_at=now,
+                last_error=f"BudgetExceeded:{deadline_ms}" if status == "budget_exceeded" else None,
+                now=now,
+            )
+        )
+        result["status"] = status
+        return result
+
+    async def _trace_enrich_visible_dialogs(
+        self,
+        target_user_id: int,
+        candidate_dialogs: list[dict],
+        *,
+        max_per_dialog: int = _TRACE_ENRICHMENT_MAX_PER_DIALOG,
+        max_dialogs: int = _TRACE_ENRICHMENT_MAX_DIALOGS,
+        deadline_ms: int = _TRACE_ENRICHMENT_DEADLINE_MS,
+        concurrency: int = _TRACE_ENRICHMENT_CONCURRENCY,
+    ) -> dict:
+        """Bounded best-effort visible Account Trace enrichment."""
+        result = _trace_enrichment_result(
+            deadline_ms=deadline_ms,
+            concurrency=concurrency,
+            max_dialogs=max_dialogs,
+            max_per_dialog=max_per_dialog,
+        )
+        now = int(time.time())
+        selected = candidate_dialogs[:max_dialogs]
+        overflow = candidate_dialogs[max_dialogs:]
+        for candidate in overflow:
+            _upsert_trace_coverage_fragment(
+                _TraceCoverageFragmentUpsertRequest(
+                    conn=self._deps.conn,
+                    target_user_id=target_user_id,
+                    dialog_id=int(candidate["dialog_id"]),
+                    topic_id=candidate.get("topic_id"),
+                    status="budget_exceeded",
+                    last_error=f"BudgetExceeded:{deadline_ms}",
+                    now=now,
+                )
+            )
+            result["dialogs_skipped"] += 1
+            _trace_increment_status(result, "budget_exceeded")
+
+        if not selected:
+            self._deps.conn.commit()
+            return result
+
+        if deadline_ms <= 0:
+            for candidate in selected:
+                _upsert_trace_coverage_fragment(
+                    _TraceCoverageFragmentUpsertRequest(
+                        conn=self._deps.conn,
+                        target_user_id=target_user_id,
+                        dialog_id=int(candidate["dialog_id"]),
+                        topic_id=candidate.get("topic_id"),
+                        status="budget_exceeded",
+                        last_error=f"BudgetExceeded:{deadline_ms}",
+                        now=now,
+                    )
+                )
+                result["dialogs_skipped"] += 1
+                _trace_increment_status(result, "budget_exceeded")
+            self._deps.conn.commit()
+            return result
+
+        deadline_at = time.monotonic() + (deadline_ms / 1000)
+        semaphore = asyncio.Semaphore(max(1, concurrency))
+
+        async def run_candidate(candidate: dict) -> dict:
+            async with semaphore:
+                return await self._trace_enrich_one_candidate(
+                    target_user_id=target_user_id,
+                    candidate=candidate,
+                    max_per_dialog=max_per_dialog,
+                    deadline_ms=deadline_ms,
+                    deadline_at=deadline_at,
+                )
+
+        for item in await asyncio.gather(*(run_candidate(candidate) for candidate in selected)):
+            result["dialogs_attempted"] += int(item["attempted"])
+            result["dialogs_skipped"] += int(item["skipped"])
+            result["messages_seen"] += int(item["messages_seen"])
+            result["messages_persisted"] += int(item["messages_persisted"])
+            result["duplicates_skipped"] += int(item["duplicates_skipped"])
+            _trace_increment_status(result, str(item["status"]))
+        self._deps.conn.commit()
+        return result
+
+    async def _trace_account_messages(self, req: dict) -> dict:
+        from .pagination import decode_account_trace_navigation, encode_account_trace_navigation
+
+        group_by = req.get("group_by", "timeline")
+        if group_by not in ("timeline", "dialog"):
+            return {"ok": False, "error": "invalid_group_by", "message": "group_by must be timeline or dialog"}
+
+        coverage_goal = req.get("coverage_goal", "observed")
+        if coverage_goal not in ("observed", "best_effort_visible"):
+            return {
+                "ok": False,
+                "error": "invalid_coverage_goal",
+                "message": "coverage_goal must be observed or best_effort_visible",
+            }
+
+        exact_dialog_id = _parse_trace_int(req.get("exact_dialog_id"))
+        dialog = req.get("dialog")
+        if exact_dialog_id is None and isinstance(dialog, str) and dialog.strip():
+            resolved_dialog = await self._deps.resolve_dialog_id(0, dialog)
+            if isinstance(resolved_dialog, dict):
+                return resolved_dialog
+            exact_dialog_id = resolved_dialog
+
+        exact_topic_id = _parse_trace_int(req.get("exact_topic_id"))
+        if exact_topic_id is not None and exact_dialog_id is None:
+            return {
+                "ok": False,
+                "error": "invalid_topic_scope",
+                "message": "exact_topic_id requires exact_dialog_id or dialog",
+            }
+
+        limit = _clamp(int(req.get("limit", 50)), 1, 200)
+        sent_after = req.get("sent_after")
+        sent_before = req.get("sent_before")
+        sent_after_ts = _parse_trace_time_bound(sent_after)
+        sent_before_ts = _parse_trace_time_bound(sent_before)
+        if sent_after is not None and sent_after_ts is None:
+            return {"ok": False, "error": "invalid_time_bound", "message": "sent_after is invalid"}
+        if sent_before is not None and sent_before_ts is None:
+            return {"ok": False, "error": "invalid_time_bound", "message": "sent_before is invalid"}
+
+        coverage_bounds = {
+            "limit": limit,
+            "exact_dialog_id": exact_dialog_id,
+            "exact_topic_id": exact_topic_id,
+            "sent_after": sent_after,
+            "sent_before": sent_before,
+        }
+        resolved_account = await self._resolve_trace_account(req)
+        if resolved_account.get("confidence") != "resolved" or resolved_account.get("account_id") is None:
+            gap = self._trace_account_resolution_gap(resolved_account)
+            return {
+                "ok": True,
+                "data": self._empty_trace_result(
+                    resolved_account,
+                    gaps=[gap],
+                    coverage_goal=coverage_goal,
+                    coverage_bounds=coverage_bounds,
+                ),
+            }
+
+        target_user_id = int(resolved_account["account_id"])
+
+        # --- Pre-resolve linked-chat scope for a channel exact_dialog_id (concern 6 / cycle-3).
+        # Resolve once here; reused by both the query builder and _trace_candidate_dialogs so
+        # we never issue a second live GetFullChannelRequest in the same call.
+        # scope_dialog_ids is the token-carried field: [channel_id, linked_chat_id] when the
+        # channel has a discussion group, or None otherwise. The recompute fork is intentionally
+        # dropped — see AccountTraceNavigationToken.scope_dialog_ids docstring.
+        scope_dialog_ids: list[int] | None = None
+        linked_chat_map: dict[int, int] = {}
+        if exact_dialog_id is not None:
+            meta = _trace_dialog_metadata(self._deps.conn, exact_dialog_id)
+            if (
+                _trace_strategy_for_dialog(meta["dialog_type"], status=meta["status"], hidden=bool(meta["hidden"]))
+                == "signature_only"
+            ):
+                resolution = await resolve_linked_chat_id(self._deps.client, self._deps.conn, exact_dialog_id)
+                if resolution.flood_wait_seconds is None and resolution.linked_chat_id is not None:
+                    linked_chat_id_resolved = resolution.linked_chat_id
+                    linked_chat_map[exact_dialog_id] = linked_chat_id_resolved
+                    scope_dialog_ids = [exact_dialog_id, linked_chat_id_resolved]
+                    # Enroll the linked chat as own_only so the sweep schedulers cover it.
+                    enroll_activity_dialog(self._deps.conn, linked_chat_id_resolved, source="linked_chat")
+
+        navigation_payload: dict[str, int] | None = None
+        navigation = req.get("navigation")
+        if isinstance(navigation, str) and navigation:
+            try:
+                decoded = decode_account_trace_navigation(
+                    navigation,
+                    expected_target_user_id=target_user_id,
+                    expected_group_by=group_by,
+                    expected_exact_dialog_id=exact_dialog_id,
+                    expected_exact_topic_id=exact_topic_id,
+                    expected_sent_after=sent_after,
+                    expected_sent_before=sent_before,
+                )
+            except ValueError as exc:
+                return {"ok": False, "error": "invalid_navigation", "message": str(exc)}
+            navigation_payload = {
+                "sent_at": decoded.sent_at,
+                "dialog_id": decoded.dialog_id,
+                "message_id": decoded.message_id,
+            }
+            # Restore the token-carried scope so cross-page queries use the same
+            # m.dialog_id IN (...) filter without a live re-resolution (cycle-4 MEDIUM).
+            if decoded.scope_dialog_ids is not None:
+                scope_dialog_ids = decoded.scope_dialog_ids
+                # Also repopulate linked_chat_map for _trace_candidate_dialogs.
+                if exact_dialog_id is not None and len(scope_dialog_ids) == _TRACE_SCOPE_DIALOG_IDS_LEN:
+                    channel_id_from_token = scope_dialog_ids[0]
+                    linked_id_from_token = scope_dialog_ids[1]
+                    if channel_id_from_token == exact_dialog_id:
+                        linked_chat_map[exact_dialog_id] = linked_id_from_token
+
+        post_author_aliases = _trace_post_author_aliases(resolved_account)
+        sql, params = _build_trace_account_messages_query(
+            _TraceMessageQueryRequest(
+                target_user_id=target_user_id,
+                self_id=self._deps.self_id,
+                limit=limit + 1,
+                post_author_aliases=post_author_aliases,
+                exact_dialog_id=exact_dialog_id,
+                exact_topic_id=exact_topic_id,
+                sent_after_ts=sent_after_ts,
+                sent_before_ts=sent_before_ts,
+                navigation=navigation_payload,
+                scope_dialog_ids=scope_dialog_ids,
+            )
+        )
+
+        def run_trace_query() -> tuple[list[sqlite3.Row], list[sqlite3.Row], list[dict], str | None]:
+            rows = self._deps.conn.execute(sql, params).fetchall()
+            selected_rows = rows[:limit]
+            evidence = [self._trace_row_to_evidence(row) for row in selected_rows]
+            next_navigation: str | None = None
+            if len(rows) > limit and selected_rows:
+                last = selected_rows[-1]
+                next_navigation = encode_account_trace_navigation(
+                    target_user_id=target_user_id,
+                    sent_at=int(last["sent_at"]),
+                    dialog_id=int(last["dialog_id"]),
+                    message_id=int(last["message_id"]),
+                    group_by=group_by,
+                    exact_dialog_id=exact_dialog_id,
+                    exact_topic_id=exact_topic_id,
+                    sent_after=sent_after,
+                    sent_before=sent_before,
+                    scope_dialog_ids=scope_dialog_ids,
+                )
+            return rows, selected_rows, evidence, next_navigation
+
+        _, selected_rows, evidence, next_navigation = run_trace_query()
+        enrichment: dict | None = None
+        if coverage_goal == "best_effort_visible":
+            candidates = _trace_candidate_dialogs(
+                _TraceCandidateBuildRequest(
+                    conn=self._deps.conn,
+                    target_user_id=target_user_id,
+                    observed_rows=selected_rows,
+                    exact_dialog_id=exact_dialog_id,
+                    exact_topic_id=exact_topic_id,
+                    linked_chat_map=linked_chat_map,
+                )
+            )
+            enrichment = await self._trace_enrich_visible_dialogs(target_user_id, candidates)
+            _, selected_rows, evidence, next_navigation = run_trace_query()
+
+        basis_counts: dict[str, int] = {}
+        for item in evidence:
+            basis = str(item["authorship_basis"])
+            basis_counts[basis] = basis_counts.get(basis, 0) + 1
+
+        coverage = _build_trace_coverage(
+            self._deps.conn,
+            target_user_id,
+            selected_rows,
+            exact_dialog_id=exact_dialog_id,
+            exact_topic_id=exact_topic_id,
+        )
+        gaps = _build_trace_gaps(
+            _TraceGapBuildRequest(
+                conn=self._deps.conn,
+                target_user_id=target_user_id,
+                evidence=evidence,
+                coverage=coverage,
+                exact_dialog_id=exact_dialog_id,
+                exact_topic_id=exact_topic_id,
+            )
+        )
+        data: dict[str, Any] = {
+            "resolved_account": resolved_account,
+            "groups": self._group_trace_evidence(evidence, group_by),
+            "coverage": coverage,
+            "gaps": gaps,
+            "provenance": {
+                "source": "sync_db",
+                "query_basis": "effective_sender_id_or_post_author_signature",
+                "coverage_goal": coverage_goal,
+                "coverage_bounds": coverage_bounds,
+                "authorship_basis_counts": basis_counts,
+                "dialogs_considered_basis": coverage["dialogs_considered_basis"],
+                "post_author_aliases_considered": post_author_aliases,
+                "local_cache_writes": enrichment["messages_persisted"] if enrichment else 0,
+            },
+            "next_navigation": next_navigation,
+        }
+        if enrichment is not None:
+            data["provenance"]["enrichment"] = enrichment
+        return {"ok": True, "data": data}
+
+
+def _trace_post_author_aliases(resolved_account: dict) -> list[str]:
+    """Return post_author aliases for lower-confidence channel signature evidence."""
+    return _unique_trace_aliases(
+        resolved_account.get("username"),
+        f"@{resolved_account.get('username')}" if resolved_account.get("username") else None,
+        resolved_account.get("display_name"),
+        *resolved_account.get("display_aliases", []),
+    )
+
 
 _TRACE_FRAGMENT_STATUSES = {
     "pending",
@@ -29,11 +815,6 @@ _TRACE_PARTIAL_FRAGMENT_STATUSES = {
     "budget_exceeded",
 }
 _TRACE_GAP_SEVERITIES = {"info", "warning", "action_required"}
-
-_TRACE_ENRICHMENT_MAX_DIALOGS = 10
-_TRACE_ENRICHMENT_MAX_PER_DIALOG = 100
-_TRACE_ENRICHMENT_DEADLINE_MS = 15_000
-_TRACE_ENRICHMENT_CONCURRENCY = 2
 
 _TRACE_MESSAGE_BASE_FIELDS = (
     "dialog_id",

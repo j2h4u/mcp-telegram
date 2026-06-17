@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -19,6 +20,8 @@ from account_trace_fixtures import (
 )
 
 from mcp_telegram.daemon_account_trace import (
+    DaemonAccountTraceDeps,
+    DaemonAccountTraceService,
     _build_trace_account_messages_query,
     _build_trace_coverage,
     _get_trace_coverage_fragments,
@@ -51,6 +54,21 @@ def trace_server(tmp_path):
         yield server, conn, client
     finally:
         conn.close()
+
+
+@pytest.fixture()
+def trace_service(trace_server):
+    server, conn, client = trace_server
+    return DaemonAccountTraceService(
+        DaemonAccountTraceDeps(
+            conn=conn,
+            client=client,
+            resolve_dialog_id=server._resolve_dialog_id,
+            self_id=server.self_id,
+            logger=logging.getLogger("test"),
+            rid=lambda: "",
+        ),
+    )
 
 
 def test_trace_typed_dict_contracts_are_importable() -> None:
@@ -209,7 +227,7 @@ def test_trace_fragment_fixture_uses_dialog_level_topic_sentinel(tmp_path) -> No
         conn.close()
 
 
-def test_trace_coverage_counts_access_lost_as_gap(trace_server) -> None:
+def test_trace_coverage_counts_access_lost_as_gap(trace_server, trace_service) -> None:
     _server, conn, _client = trace_server
     seed_synced_dialog(conn, dialog_id=-100123, status="access_lost")
     conn.commit()
@@ -222,7 +240,7 @@ def test_trace_coverage_counts_access_lost_as_gap(trace_server) -> None:
     assert coverage["dialogs_with_gaps"] == 1
 
 
-def test_trace_coverage_marks_fragment_and_own_only_partial(trace_server) -> None:
+def test_trace_coverage_marks_fragment_and_own_only_partial(trace_server, trace_service) -> None:
     _server, conn, _client = trace_server
     seed_synced_dialog(conn, dialog_id=-100123, status="fragment")
     seed_synced_dialog(conn, dialog_id=-100124, status="own_only")
@@ -237,7 +255,7 @@ def test_trace_coverage_marks_fragment_and_own_only_partial(trace_server) -> Non
     assert own_only_coverage["dialogs_considered"] == 1
 
 
-def test_trace_coverage_exact_dialog_scope_counts_only_that_dialog(trace_server) -> None:
+def test_trace_coverage_exact_dialog_scope_counts_only_that_dialog(trace_server, trace_service) -> None:
     _server, conn, _client = trace_server
     seed_synced_dialog(conn, dialog_id=-100123, status="synced")
     seed_synced_dialog(conn, dialog_id=-100124, status="synced")
@@ -250,7 +268,7 @@ def test_trace_coverage_exact_dialog_scope_counts_only_that_dialog(trace_server)
     assert coverage["dialogs_considered_basis"] == "exact_dialog_scope"
 
 
-def test_trace_coverage_unscoped_zero_hit_does_not_count_every_synced_dialog(trace_server) -> None:
+def test_trace_coverage_unscoped_zero_hit_does_not_count_every_synced_dialog(trace_server, trace_service) -> None:
     _server, conn, _client = trace_server
     seed_synced_dialog(conn, dialog_id=-100123, status="synced")
     seed_synced_dialog(conn, dialog_id=-100124, status="synced")
@@ -263,7 +281,7 @@ def test_trace_coverage_unscoped_zero_hit_does_not_count_every_synced_dialog(tra
     assert coverage["dialogs_considered_basis"] == "none"
 
 
-def test_trace_fragment_helpers_preserve_created_at_and_store_retry(trace_server) -> None:
+def test_trace_fragment_helpers_preserve_created_at_and_store_retry(trace_server, trace_service) -> None:
     _server, conn, _client = trace_server
 
     _upsert_trace_coverage_fragment(
@@ -302,12 +320,12 @@ def test_mark_dialog_for_sync_tool_exists_for_trace_gap_action() -> None:
 
 
 @pytest.mark.asyncio
-async def test_resolve_trace_exact_account_id_from_entities(trace_server) -> None:
+async def test_resolve_trace_exact_account_id_from_entities(trace_server, trace_service) -> None:
     server, conn, _client = trace_server
     seed_entity(conn, entity_id=123, name="Alice Example", username="alice")
     conn.commit()
 
-    result = await server._resolve_trace_account({"exact_account_id": 123})
+    result = await trace_service._resolve_trace_account({"exact_account_id": 123})
 
     assert result["confidence"] == "resolved"
     assert result["account_id"] == 123
@@ -316,10 +334,10 @@ async def test_resolve_trace_exact_account_id_from_entities(trace_server) -> Non
 
 
 @pytest.mark.asyncio
-async def test_resolve_trace_unknown_numeric_does_not_call_client(trace_server) -> None:
+async def test_resolve_trace_unknown_numeric_does_not_call_client(trace_server, trace_service) -> None:
     server, _conn, client = trace_server
 
-    result = await server._resolve_trace_account({"account": "123"})
+    result = await trace_service._resolve_trace_account({"account": "123"})
 
     assert result["confidence"] == "unresolved"
     assert result["resolution_source"] == "unresolved_numeric_id"
@@ -327,12 +345,12 @@ async def test_resolve_trace_unknown_numeric_does_not_call_client(trace_server) 
 
 
 @pytest.mark.asyncio
-async def test_resolve_trace_username_local_entity_path(trace_server) -> None:
+async def test_resolve_trace_username_local_entity_path(trace_server, trace_service) -> None:
     server, conn, client = trace_server
     seed_entity(conn, entity_id=123, name="Alice Example", username="alice")
     conn.commit()
 
-    result = await server._resolve_trace_account({"account": "@alice"})
+    result = await trace_service._resolve_trace_account({"account": "@alice"})
 
     assert result["confidence"] == "resolved"
     assert result["account_id"] == 123
@@ -341,7 +359,7 @@ async def test_resolve_trace_username_local_entity_path(trace_server) -> None:
 
 
 @pytest.mark.asyncio
-async def test_resolve_trace_username_lookup_upserts_user(trace_server) -> None:
+async def test_resolve_trace_username_lookup_upserts_user(trace_server, trace_service) -> None:
     server, conn, client = trace_server
     client.return_value = SimpleNamespace(
         users=[
@@ -355,7 +373,7 @@ async def test_resolve_trace_username_lookup_upserts_user(trace_server) -> None:
         ]
     )
 
-    result = await server._resolve_trace_account({"account": "@alice"})
+    result = await trace_service._resolve_trace_account({"account": "@alice"})
 
     assert result["confidence"] == "resolved"
     assert result["account_id"] == 123
@@ -366,11 +384,11 @@ async def test_resolve_trace_username_lookup_upserts_user(trace_server) -> None:
 
 
 @pytest.mark.asyncio
-async def test_resolve_trace_username_lookup_failure_is_structured(trace_server) -> None:
+async def test_resolve_trace_username_lookup_failure_is_structured(trace_server, trace_service) -> None:
     server, _conn, client = trace_server
     client.side_effect = RuntimeError("not visible")
 
-    result = await server._resolve_trace_account({"account": "https://t.me/alice"})
+    result = await trace_service._resolve_trace_account({"account": "https://t.me/alice"})
 
     assert result["confidence"] == "unresolved"
     assert result["resolution_source"] == "telegram_username_lookup_failed"
@@ -378,14 +396,14 @@ async def test_resolve_trace_username_lookup_failure_is_structured(trace_server)
 
 
 @pytest.mark.asyncio
-async def test_resolve_trace_fuzzy_ambiguous_returns_candidate_ids(trace_server) -> None:
+async def test_resolve_trace_fuzzy_ambiguous_returns_candidate_ids(trace_server, trace_service) -> None:
     server, conn, _client = trace_server
     now = int(time.time())
     seed_entity(conn, entity_id=123, name="Alex One", username="alex1", updated_at=now)
     seed_entity(conn, entity_id=124, name="Alex Two", username="alex2", updated_at=now)
     conn.commit()
 
-    result = await server._resolve_trace_account({"account": "Alex"})
+    result = await trace_service._resolve_trace_account({"account": "Alex"})
 
     assert result["confidence"] == "ambiguous"
     assert result["resolution_source"] == "entities_fuzzy_candidates"
@@ -393,10 +411,10 @@ async def test_resolve_trace_fuzzy_ambiguous_returns_candidate_ids(trace_server)
 
 
 @pytest.mark.asyncio
-async def test_trace_unresolved_account_returns_structured_gap(trace_server) -> None:
+async def test_trace_unresolved_account_returns_structured_gap(trace_server, trace_service) -> None:
     server, _conn, _client = trace_server
 
-    result = await server._trace_account_messages({"account": "123"})
+    result = await trace_service._trace_account_messages({"account": "123"})
 
     assert result["ok"] is True
     assert result["data"]["gaps"][0]["kind"] == "account_unresolved"
@@ -404,14 +422,14 @@ async def test_trace_unresolved_account_returns_structured_gap(trace_server) -> 
 
 
 @pytest.mark.asyncio
-async def test_trace_ambiguous_account_gap_has_candidate_ids(trace_server) -> None:
+async def test_trace_ambiguous_account_gap_has_candidate_ids(trace_server, trace_service) -> None:
     server, conn, _client = trace_server
     now = int(time.time())
     seed_entity(conn, entity_id=123, name="Alex One", username="alex1", updated_at=now)
     seed_entity(conn, entity_id=124, name="Alex Two", username="alex2", updated_at=now)
     conn.commit()
 
-    result = await server._trace_account_messages({"account": "Alex"})
+    result = await trace_service._trace_account_messages({"account": "Alex"})
 
     gap = result["data"]["gaps"][0]
     assert gap["kind"] == "account_ambiguous"
@@ -449,7 +467,7 @@ def test_trace_query_uses_effective_sender_topic_and_signature_params() -> None:
 
 
 @pytest.mark.asyncio
-async def test_dispatch_routes_trace_account_messages(trace_server) -> None:
+async def test_dispatch_routes_trace_account_messages(trace_server, trace_service) -> None:
     server, conn, _client = trace_server
     seed_entity(conn, entity_id=101, name="Me", username="me")
     conn.commit()
@@ -461,7 +479,7 @@ async def test_dispatch_routes_trace_account_messages(trace_server) -> None:
 
 
 @pytest.mark.asyncio
-async def test_trace_includes_outgoing_dm_effective_sender(trace_server) -> None:
+async def test_trace_includes_outgoing_dm_effective_sender(trace_server, trace_service) -> None:
     server, conn, _client = trace_server
     seed_entity(conn, entity_id=101, name="Me", username="me")
     seed_dialog(conn, dialog_id=222, name="Alice", dialog_type="User")
@@ -477,7 +495,7 @@ async def test_trace_includes_outgoing_dm_effective_sender(trace_server) -> None
     )
     conn.commit()
 
-    result = await server._trace_account_messages({"exact_account_id": 101, "limit": 10})
+    result = await trace_service._trace_account_messages({"exact_account_id": 101, "limit": 10})
 
     evidence = result["data"]["groups"][0]["evidence"]
     assert evidence[0]["message_id"] == 10
@@ -486,7 +504,7 @@ async def test_trace_includes_outgoing_dm_effective_sender(trace_server) -> None
 
 
 @pytest.mark.asyncio
-async def test_trace_includes_channel_signature_without_numeric_identity_claim(trace_server) -> None:
+async def test_trace_includes_channel_signature_without_numeric_identity_claim(trace_server, trace_service) -> None:
     server, conn, _client = trace_server
     seed_entity(conn, entity_id=101, name="Alice Example", username="alice")
     seed_dialog(conn, dialog_id=-100123, name="Channel", dialog_type="Channel")
@@ -500,7 +518,7 @@ async def test_trace_includes_channel_signature_without_numeric_identity_claim(t
     )
     conn.commit()
 
-    result = await server._trace_account_messages({"exact_account_id": 101, "limit": 10})
+    result = await trace_service._trace_account_messages({"exact_account_id": 101, "limit": 10})
 
     evidence = result["data"]["groups"][0]["evidence"]
     assert evidence[0]["message_id"] == 42
@@ -511,13 +529,13 @@ async def test_trace_includes_channel_signature_without_numeric_identity_claim(t
 
 
 @pytest.mark.asyncio
-async def test_trace_access_lost_dialog_gap_has_no_sync_action(trace_server) -> None:
+async def test_trace_access_lost_dialog_gap_has_no_sync_action(trace_server, trace_service) -> None:
     server, conn, _client = trace_server
     seed_entity(conn, entity_id=101, name="Me", username="me")
     seed_synced_dialog(conn, dialog_id=-100123, status="access_lost")
     conn.commit()
 
-    result = await server._trace_account_messages({"exact_account_id": 101, "exact_dialog_id": -100123})
+    result = await trace_service._trace_account_messages({"exact_account_id": 101, "exact_dialog_id": -100123})
 
     gaps = result["data"]["gaps"]
     access_lost = next(gap for gap in gaps if gap["kind"] == "access_lost")
@@ -526,12 +544,12 @@ async def test_trace_access_lost_dialog_gap_has_no_sync_action(trace_server) -> 
 
 
 @pytest.mark.asyncio
-async def test_trace_not_synced_dialog_gap_includes_sync_action(trace_server) -> None:
+async def test_trace_not_synced_dialog_gap_includes_sync_action(trace_server, trace_service) -> None:
     server, conn, _client = trace_server
     seed_entity(conn, entity_id=101, name="Me", username="me")
     conn.commit()
 
-    result = await server._trace_account_messages({"exact_account_id": 101, "exact_dialog_id": -100123})
+    result = await trace_service._trace_account_messages({"exact_account_id": 101, "exact_dialog_id": -100123})
 
     gap = next(item for item in result["data"]["gaps"] if item["kind"] == "dialog_not_synced")
     assert gap["severity"] == "action_required"
@@ -540,12 +558,12 @@ async def test_trace_not_synced_dialog_gap_includes_sync_action(trace_server) ->
 
 
 @pytest.mark.asyncio
-async def test_trace_zero_hit_resolved_account_returns_observed_zero_gap(trace_server) -> None:
+async def test_trace_zero_hit_resolved_account_returns_observed_zero_gap(trace_server, trace_service) -> None:
     server, conn, _client = trace_server
     seed_entity(conn, entity_id=101, name="Me", username="me")
     conn.commit()
 
-    result = await server._trace_account_messages({"exact_account_id": 101})
+    result = await trace_service._trace_account_messages({"exact_account_id": 101})
 
     assert result["ok"] is True
     assert result["data"]["coverage"]["state"] == "unknown"
@@ -555,7 +573,7 @@ async def test_trace_zero_hit_resolved_account_returns_observed_zero_gap(trace_s
 
 
 @pytest.mark.asyncio
-async def test_trace_provenance_includes_basis_counts_and_coverage_bounds(trace_server) -> None:
+async def test_trace_provenance_includes_basis_counts_and_coverage_bounds(trace_server, trace_service) -> None:
     server, conn, _client = trace_server
     seed_entity(conn, entity_id=101, name="Me", username="me")
     seed_dialog(conn, dialog_id=222, name="Alice", dialog_type="User")
@@ -563,7 +581,7 @@ async def test_trace_provenance_includes_basis_counts_and_coverage_bounds(trace_
     seed_message(conn, dialog_id=222, message_id=1, sent_at=1, sender_id=101)
     conn.commit()
 
-    result = await server._trace_account_messages({"exact_account_id": 101, "exact_dialog_id": 222})
+    result = await trace_service._trace_account_messages({"exact_account_id": 101, "exact_dialog_id": 222})
 
     provenance = result["data"]["provenance"]
     assert provenance["query_basis"] == "effective_sender_id_or_post_author_signature"
@@ -574,7 +592,7 @@ async def test_trace_provenance_includes_basis_counts_and_coverage_bounds(trace_
 
 
 @pytest.mark.asyncio
-async def test_trace_exact_topic_scope_filters_rows(trace_server) -> None:
+async def test_trace_exact_topic_scope_filters_rows(trace_server, trace_service) -> None:
     server, conn, _client = trace_server
     seed_entity(conn, entity_id=101, name="Me", username="me")
     seed_dialog(conn, dialog_id=-100222, name="Forum", dialog_type="Forum")
@@ -599,7 +617,7 @@ async def test_trace_exact_topic_scope_filters_rows(trace_server) -> None:
     )
     conn.commit()
 
-    result = await server._trace_account_messages(
+    result = await trace_service._trace_account_messages(
         {"exact_account_id": 101, "exact_dialog_id": -100222, "exact_topic_id": 5}
     )
 
@@ -610,21 +628,21 @@ async def test_trace_exact_topic_scope_filters_rows(trace_server) -> None:
 
 
 @pytest.mark.asyncio
-async def test_trace_excludes_service_rows(trace_server) -> None:
+async def test_trace_excludes_service_rows(trace_server, trace_service) -> None:
     server, conn, _client = trace_server
     seed_entity(conn, entity_id=101, name="Me", username="me")
     seed_dialog(conn, dialog_id=222, name="Alice", dialog_type="User")
     seed_message(conn, dialog_id=222, message_id=1, sent_at=1, sender_id=101, is_service=1)
     conn.commit()
 
-    result = await server._trace_account_messages({"exact_account_id": 101})
+    result = await trace_service._trace_account_messages({"exact_account_id": 101})
 
     assert result["data"]["groups"] == []
     assert result["data"]["next_navigation"] is None
 
 
 @pytest.mark.asyncio
-async def test_trace_dialog_grouping_uses_current_page_and_topic_key(trace_server) -> None:
+async def test_trace_dialog_grouping_uses_current_page_and_topic_key(trace_server, trace_service) -> None:
     server, conn, _client = trace_server
     seed_entity(conn, entity_id=101, name="Me", username="me")
     seed_dialog(conn, dialog_id=-100222, name="Forum", dialog_type="Forum")
@@ -633,7 +651,7 @@ async def test_trace_dialog_grouping_uses_current_page_and_topic_key(trace_serve
     seed_message(conn, dialog_id=-100222, message_id=2, sent_at=2, sender_id=101, forum_topic_id=5)
     conn.commit()
 
-    result = await server._trace_account_messages({"exact_account_id": 101, "group_by": "dialog", "limit": 1})
+    result = await trace_service._trace_account_messages({"exact_account_id": 101, "group_by": "dialog", "limit": 1})
 
     groups = result["data"]["groups"]
     assert len(groups) == 1
@@ -643,13 +661,13 @@ async def test_trace_dialog_grouping_uses_current_page_and_topic_key(trace_serve
 
 
 @pytest.mark.asyncio
-async def test_trace_exact_limit_without_extra_row_has_no_next_navigation(trace_server) -> None:
+async def test_trace_exact_limit_without_extra_row_has_no_next_navigation(trace_server, trace_service) -> None:
     server, conn, _client = trace_server
     seed_entity(conn, entity_id=101, name="Me", username="me")
     seed_message(conn, dialog_id=222, message_id=1, sent_at=1, sender_id=101)
     conn.commit()
 
-    result = await server._trace_account_messages({"exact_account_id": 101, "limit": 1})
+    result = await trace_service._trace_account_messages({"exact_account_id": 101, "limit": 1})
 
     assert result["data"]["coverage"]["observed_message_count"] == 1
     assert result["data"]["next_navigation"] is None

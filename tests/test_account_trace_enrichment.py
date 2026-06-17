@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,6 +19,8 @@ from account_trace_fixtures import (
 from telethon.errors import FloodWaitError
 
 from mcp_telegram.daemon_account_trace import (
+    DaemonAccountTraceDeps,
+    DaemonAccountTraceService,
     _messages_row_equal,
     _trace_candidate_dialogs,
     _trace_existing_message_bundle,
@@ -61,6 +64,21 @@ def trace_enrichment_server(tmp_path):
         yield server, conn, client
     finally:
         conn.close()
+
+
+@pytest.fixture()
+def trace_service(trace_enrichment_server):
+    server, conn, client = trace_enrichment_server
+    return DaemonAccountTraceService(
+        DaemonAccountTraceDeps(
+            conn=conn,
+            client=client,
+            resolve_dialog_id=server._resolve_dialog_id,
+            self_id=server.self_id,
+            logger=logging.getLogger("test"),
+            rid=lambda: "",
+        )
+    )
 
 
 def fake_message(
@@ -135,7 +153,9 @@ def seed_existing_message_bundle(conn, *, text: str = "same", edit_date: int | N
     conn.commit()
 
 
-def test_trace_candidate_dialogs_are_bounded_visible_and_strategy_labeled(trace_enrichment_server) -> None:
+def test_trace_candidate_dialogs_are_bounded_visible_and_strategy_labeled(
+    trace_enrichment_server, trace_service
+) -> None:
     _server, conn, _client = trace_enrichment_server
     for offset, (dialog_id, dialog_type) in enumerate(
         [
@@ -183,7 +203,7 @@ def test_trace_candidate_dialogs_are_bounded_visible_and_strategy_labeled(trace_
     )
 
 
-def test_trace_candidate_dialogs_include_cached_common_chats(trace_enrichment_server) -> None:
+def test_trace_candidate_dialogs_include_cached_common_chats(trace_enrichment_server, trace_service) -> None:
     _server, conn, _client = trace_enrichment_server
     seed_entity(conn, entity_id=101, name="Alice", username="alice")
     seed_dialog(conn, dialog_id=-5001, name="Common", dialog_type="Group")
@@ -207,7 +227,7 @@ def test_trace_candidate_dialogs_include_cached_common_chats(trace_enrichment_se
     assert candidates[0]["origin"] == "cached_common_chat"
 
 
-def test_messages_row_equal_covers_base_and_child_tables(trace_enrichment_server) -> None:
+def test_messages_row_equal_covers_base_and_child_tables(trace_enrichment_server, trace_service) -> None:
     _server, conn, _client = trace_enrichment_server
     seed_existing_message_bundle(conn)
     conn.execute(
@@ -285,15 +305,15 @@ def test_messages_row_equal_covers_base_and_child_tables(trace_enrichment_server
 
 
 @pytest.mark.asyncio
-async def test_trace_enrichment_uses_canonical_insert_for_new_messages(trace_enrichment_server) -> None:
+async def test_trace_enrichment_uses_canonical_insert_for_new_messages(trace_enrichment_server, trace_service) -> None:
     server, conn, client = trace_enrichment_server
     client.messages_by_dialog = {222: [fake_message(message_id=1)]}
     seed_dialog(conn, dialog_id=222, name="Alice", dialog_type="User")
     seed_synced_dialog(conn, dialog_id=222)
     conn.commit()
 
-    with patch("mcp_telegram.daemon_api.insert_messages_with_fts") as insert_mock:
-        result = await server._trace_enrich_visible_dialogs(
+    with patch("mcp_telegram.daemon_account_trace.insert_messages_with_fts") as insert_mock:
+        result = await trace_service._trace_enrich_visible_dialogs(
             101,
             [{"dialog_id": 222, "strategy": "dialog_scan", "topic_id": None}],
         )
@@ -305,13 +325,13 @@ async def test_trace_enrichment_uses_canonical_insert_for_new_messages(trace_enr
 
 
 @pytest.mark.asyncio
-async def test_trace_enrichment_skips_unchanged_duplicates(trace_enrichment_server) -> None:
+async def test_trace_enrichment_skips_unchanged_duplicates(trace_enrichment_server, trace_service) -> None:
     server, conn, client = trace_enrichment_server
     seed_existing_message_bundle(conn)
     client.messages_by_dialog = {222: [fake_message(message_id=1, text="same")]}
 
-    with patch("mcp_telegram.daemon_api.insert_messages_with_fts") as insert_mock:
-        result = await server._trace_enrich_visible_dialogs(
+    with patch("mcp_telegram.daemon_account_trace.insert_messages_with_fts") as insert_mock:
+        result = await trace_service._trace_enrich_visible_dialogs(
             101,
             [{"dialog_id": 222, "strategy": "dialog_scan", "topic_id": None}],
         )
@@ -323,13 +343,13 @@ async def test_trace_enrichment_skips_unchanged_duplicates(trace_enrichment_serv
 
 
 @pytest.mark.asyncio
-async def test_trace_enrichment_changed_existing_uses_canonical_insert(trace_enrichment_server) -> None:
+async def test_trace_enrichment_changed_existing_uses_canonical_insert(trace_enrichment_server, trace_service) -> None:
     server, conn, client = trace_enrichment_server
     seed_existing_message_bundle(conn, text="old")
     client.messages_by_dialog = {222: [fake_message(message_id=1, text="new")]}
 
-    with patch("mcp_telegram.daemon_api.insert_messages_with_fts") as insert_mock:
-        result = await server._trace_enrich_visible_dialogs(
+    with patch("mcp_telegram.daemon_account_trace.insert_messages_with_fts") as insert_mock:
+        result = await trace_service._trace_enrich_visible_dialogs(
             101,
             [{"dialog_id": 222, "strategy": "dialog_scan", "topic_id": None}],
         )
@@ -339,11 +359,11 @@ async def test_trace_enrichment_changed_existing_uses_canonical_insert(trace_enr
 
 
 @pytest.mark.asyncio
-async def test_trace_enrichment_floodwait_persists_retry_fragment(trace_enrichment_server) -> None:
+async def test_trace_enrichment_floodwait_persists_retry_fragment(trace_enrichment_server, trace_service) -> None:
     server, conn, client = trace_enrichment_server
     client.exc = FloodWaitError(None, 120)
 
-    result = await server._trace_enrich_visible_dialogs(
+    result = await trace_service._trace_enrich_visible_dialogs(
         101,
         [{"dialog_id": 222, "strategy": "dialog_scan", "topic_id": None}],
     )
@@ -358,10 +378,10 @@ async def test_trace_enrichment_floodwait_persists_retry_fragment(trace_enrichme
 
 
 @pytest.mark.asyncio
-async def test_trace_enrichment_deadline_exhaustion_persists_budget_gap(trace_enrichment_server) -> None:
+async def test_trace_enrichment_deadline_exhaustion_persists_budget_gap(trace_enrichment_server, trace_service) -> None:
     server, conn, _client = trace_enrichment_server
 
-    result = await server._trace_enrich_visible_dialogs(
+    result = await trace_service._trace_enrich_visible_dialogs(
         101,
         [{"dialog_id": 222, "strategy": "dialog_scan", "topic_id": None}],
         deadline_ms=0,
@@ -375,10 +395,10 @@ async def test_trace_enrichment_deadline_exhaustion_persists_budget_gap(trace_en
 
 
 @pytest.mark.asyncio
-async def test_trace_enrichment_channel_is_unsupported_without_search(trace_enrichment_server) -> None:
+async def test_trace_enrichment_channel_is_unsupported_without_search(trace_enrichment_server, trace_service) -> None:
     server, conn, client = trace_enrichment_server
 
-    result = await server._trace_enrich_visible_dialogs(
+    result = await trace_service._trace_enrich_visible_dialogs(
         101,
         [{"dialog_id": -100123, "strategy": "signature_only", "topic_id": None}],
     )
@@ -390,11 +410,11 @@ async def test_trace_enrichment_channel_is_unsupported_without_search(trace_enri
 
 
 @pytest.mark.asyncio
-async def test_trace_enrichment_generic_error_does_not_escape(trace_enrichment_server) -> None:
+async def test_trace_enrichment_generic_error_does_not_escape(trace_enrichment_server, trace_service) -> None:
     server, conn, client = trace_enrichment_server
     client.exc = RuntimeError("boom")
 
-    result = await server._trace_enrich_visible_dialogs(
+    result = await trace_service._trace_enrich_visible_dialogs(
         101,
         [{"dialog_id": 222, "strategy": "dialog_scan", "topic_id": None}],
     )
@@ -412,14 +432,16 @@ def test_trace_enrichment_path_has_no_direct_messages_insert_string() -> None:
 
 
 @pytest.mark.asyncio
-async def test_trace_account_observed_mode_does_not_call_enrichment(trace_enrichment_server, monkeypatch) -> None:
+async def test_trace_account_observed_mode_does_not_call_enrichment(
+    trace_enrichment_server, trace_service, monkeypatch
+) -> None:
     server, conn, _client = trace_enrichment_server
     seed_entity(conn, entity_id=101, name="Me", username="me")
     conn.commit()
     enrich = AsyncMock()
-    monkeypatch.setattr(server, "_trace_enrich_visible_dialogs", enrich)
+    monkeypatch.setattr(DaemonAccountTraceService, "_trace_enrich_visible_dialogs", enrich)
 
-    result = await server._trace_account_messages({"exact_account_id": 101, "coverage_goal": "observed"})
+    result = await trace_service._trace_account_messages({"exact_account_id": 101, "coverage_goal": "observed"})
 
     assert result["ok"] is True
     enrich.assert_not_called()
@@ -428,7 +450,7 @@ async def test_trace_account_observed_mode_does_not_call_enrichment(trace_enrich
 
 @pytest.mark.asyncio
 async def test_trace_account_best_effort_calls_enrichment_and_reruns_db_query(
-    trace_enrichment_server, monkeypatch
+    trace_enrichment_server, trace_service, monkeypatch
 ) -> None:
     server, conn, _client = trace_enrichment_server
     seed_entity(conn, entity_id=101, name="Me", username="me")
@@ -436,7 +458,12 @@ async def test_trace_account_best_effort_calls_enrichment_and_reruns_db_query(
     seed_synced_dialog(conn, dialog_id=222)
     conn.commit()
 
-    async def fake_enrich(_target_user_id: int, _candidates: list[dict]) -> dict:
+    async def fake_enrich(
+        _self: object,
+        _target_user_id: int,
+        _candidates: list[dict],
+        **_kwargs: object,
+    ) -> dict:
         seed_message(conn, dialog_id=222, message_id=1, sent_at=1_700_000_000, text="from enrichment", sender_id=101)
         conn.commit()
         return {
@@ -451,9 +478,9 @@ async def test_trace_account_best_effort_calls_enrichment_and_reruns_db_query(
             "fragment_status_counts": {"complete": 1},
         }
 
-    monkeypatch.setattr(server, "_trace_enrich_visible_dialogs", fake_enrich)
+    monkeypatch.setattr(DaemonAccountTraceService, "_trace_enrich_visible_dialogs", fake_enrich)
 
-    result = await server._trace_account_messages(
+    result = await trace_service._trace_account_messages(
         {"exact_account_id": 101, "coverage_goal": "best_effort_visible", "exact_dialog_id": 222}
     )
 
