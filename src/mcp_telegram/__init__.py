@@ -1,5 +1,6 @@
 import asyncio
 import os
+import sqlite3
 from typing import Annotated
 
 from typer import Argument, BadParameter, Context, Option, Typer
@@ -145,6 +146,68 @@ feedback_app = Typer(help="Inspect and manage agent feedback queue.")
 app.add_typer(feedback_app, name="feedback")
 
 
+def _feedback_list_select_rows(conn: sqlite3.Connection, limit: int, show_all: bool) -> list[tuple]:
+    base_select = (
+        "SELECT id, submitted_at, severity, status, status_changed_at, "
+        "status_comment, message, context, model, harness FROM feedback"
+    )
+    order_limit = " ORDER BY submitted_at DESC, id DESC LIMIT ?"
+    if show_all:
+        return conn.execute(base_select + order_limit, (limit,)).fetchall()
+    return conn.execute(
+        base_select + " WHERE status IN ('open','in_progress')" + order_limit,
+        (limit,),
+    ).fetchall()
+
+
+def _feedback_list_empty_message(conn: sqlite3.Connection, show_all: bool) -> str:
+    if show_all:
+        return "No feedback recorded yet."
+    total = conn.execute("SELECT COUNT(*) FROM feedback").fetchone()[0]
+    if total == 0:
+        return "No feedback recorded yet."
+    return "No open or in-progress feedback. Use --all to show history."
+
+
+def _feedback_list_print_row(
+    row: tuple[int, int, str | None, str, int | None, str | None, str, str | None, str | None, str | None],
+) -> None:
+    from datetime import UTC
+    from datetime import datetime as _dt
+
+    (
+        rid,
+        ts,
+        sev,
+        status,
+        status_changed_at,
+        status_comment,
+        msg,
+        ctx,
+        mdl,
+        harn,
+    ) = row
+
+    sev_tag = f"[{sev}]" if sev else "[?]"
+    status_tag = f"[{status}]"
+    ts_human = _dt.fromtimestamp(ts, tz=UTC).strftime("%Y-%m-%d %H:%M")
+    metadata_parts = [f"id={rid}", sev_tag, status_tag, ts_human]
+    if status_changed_at:
+        changed_human = _dt.fromtimestamp(status_changed_at, tz=UTC).strftime("%Y-%m-%d %H:%M")
+        metadata_parts.append(f"changed={changed_human}")
+    if mdl:
+        metadata_parts.append(f"model={mdl}")
+    if harn:
+        metadata_parts.append(f"harness={harn}")
+    print(" ".join(metadata_parts))
+    print(f"  message: {msg}")
+    if ctx:
+        print(f"  context: {ctx}")
+    if status_comment:
+        print(f"  status_comment: {status_comment}")
+    print()  # blank line between rows
+
+
 @feedback_app.command("list")
 def feedback_list(
     limit: Annotated[int, Option(help="Max rows to display (default 50).")] = 50,
@@ -155,10 +218,6 @@ def feedback_list(
     Default view shows only `open` and `in_progress` items -- what needs
     attention. Use --all to include `done` and `dismissed` history.
     """
-    import sqlite3
-    from datetime import UTC
-    from datetime import datetime as _dt
-
     from .feedback_db import get_feedback_db_path
 
     path = get_feedback_db_path()
@@ -171,65 +230,15 @@ def feedback_list(
     conn = sqlite3.connect(str(path), timeout=5.0)
     try:
         conn.execute("PRAGMA busy_timeout=5000")
-        base_select = (
-            "SELECT id, submitted_at, severity, status, status_changed_at, "
-            "status_comment, message, context, model, harness FROM feedback"
-        )
-        order_limit = " ORDER BY submitted_at DESC, id DESC LIMIT ?"
-        if show_all:
-            rows = conn.execute(base_select + order_limit, (limit,)).fetchall()
-        else:
-            rows = conn.execute(
-                base_select + " WHERE status IN ('open','in_progress')" + order_limit,
-                (limit,),
-            ).fetchall()
-
+        rows = _feedback_list_select_rows(conn, limit, show_all)
         if not rows:
-            if show_all:
-                # --all is set and we still got nothing -> table is empty.
-                print("No feedback recorded yet.")
-                return
-            # Default filter empty — distinguish "queue empty" from
-            # "all open work cleared, history exists".
-            total = conn.execute("SELECT COUNT(*) FROM feedback").fetchone()[0]
-            if total == 0:
-                print("No feedback recorded yet.")
-            else:
-                print("No open or in-progress feedback. Use --all to show history.")
+            print(_feedback_list_empty_message(conn, show_all))
             return
     finally:
         conn.close()
 
-    for (
-        rid,
-        ts,
-        sev,
-        status,
-        status_changed_at,
-        status_comment,
-        msg,
-        ctx,
-        mdl,
-        harn,
-    ) in rows:
-        sev_tag = f"[{sev}]" if sev else "[?]"
-        status_tag = f"[{status}]"
-        ts_human = _dt.fromtimestamp(ts, tz=UTC).strftime("%Y-%m-%d %H:%M")
-        metadata_parts = [f"id={rid}", sev_tag, status_tag, ts_human]
-        if status_changed_at:
-            changed_human = _dt.fromtimestamp(status_changed_at, tz=UTC).strftime("%Y-%m-%d %H:%M")
-            metadata_parts.append(f"changed={changed_human}")
-        if mdl:
-            metadata_parts.append(f"model={mdl}")
-        if harn:
-            metadata_parts.append(f"harness={harn}")
-        print(" ".join(metadata_parts))
-        print(f"  message: {msg}")
-        if ctx:
-            print(f"  context: {ctx}")
-        if status_comment:
-            print(f"  status_comment: {status_comment}")
-        print()  # blank line between rows
+    for row in rows:
+        _feedback_list_print_row(row)
 
 
 @feedback_app.command("status")
