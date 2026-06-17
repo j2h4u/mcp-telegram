@@ -3,9 +3,9 @@
 import dataclasses
 import sqlite3
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Protocol, cast
 
 from rapidfuzz import fuzz as _fuzz
 from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
@@ -22,16 +22,32 @@ from .pagination import (
 )
 
 
+class _LoggerLike(Protocol):
+    def debug(self, msg: str, *args: object, **kwargs: object) -> None: ...
+
+    def info(self, msg: str, *args: object, **kwargs: object) -> None: ...
+
+    def warning(self, msg: str, *args: object, **kwargs: object) -> None: ...
+
+    def exception(self, msg: str, *args: object, **kwargs: object) -> None: ...
+
+
+class _TelegramClientLike(Protocol):
+    async def get_messages(self, entity: object, ids: list[int]) -> object: ...
+
+    def iter_messages(self, dialog_id: int, **kwargs: object) -> AsyncIterator[object]: ...
+
+
 @dataclass(frozen=True)
 class DaemonReadingDeps:
     """Dependencies for ``DaemonReadingService``."""
 
     conn: sqlite3.Connection
-    client: Any
+    client: _TelegramClientLike
     self_id: int | None
     resolve_dialog_id: Callable[[int, str | None], Awaitable[int | dict]]
     fetch_fragment_context: Callable[[int, int], Awaitable[bool]]
-    logger: Any
+    logger: _LoggerLike
     rid: Callable[[], str]
 
 
@@ -103,13 +119,89 @@ class _ListDialogsFilter:
 
 @dataclass(frozen=True)
 class _NextNavContext:
-    messages: list[api.ReadMessage] | list[dict]
+    messages: Sequence[object]
     limit: int
     dialog_id: int
     direction: str
     direction_enum: HistoryDirection
-    logger: Any
+    logger: _LoggerLike
     request_id: Callable[[], str]
+
+
+def _row_mapping(row: object) -> Mapping[str, object]:
+    return cast(Mapping[str, object], row)
+
+
+def _row_sequence(row: object) -> Sequence[object]:
+    return cast(Sequence[object], row)
+
+
+def _object_to_int(value: object | None, default: int = 0) -> int:
+    if isinstance(value, int):
+        return value
+    if value is None:
+        return default
+    return int(value)
+
+
+def _object_to_int_or_none(value: object | None) -> int | None:
+    if isinstance(value, int):
+        return value
+    if value is None:
+        return None
+    return int(value)
+
+
+def _object_to_str_or_none(value: object | None) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
+def _message_id_from_item(item: object) -> int:
+    if isinstance(item, api.ReadMessage):
+        return item.message_id
+    if isinstance(item, Mapping):
+        row = _row_mapping(item)
+        return _object_to_int(row["message_id"])
+    return _object_to_int(getattr(item, "message_id", None))
+
+
+def _read_message_from_row(row: object) -> api.ReadMessage:
+    mapping = _row_mapping(row)
+    return api.ReadMessage(
+        message_id=_object_to_int(mapping["message_id"]),
+        sent_at=_object_to_int(mapping["sent_at"]),
+        dialog_id=_object_to_int(mapping["dialog_id"]),
+        text=_object_to_str_or_none(mapping.get("text")),
+        sender_id=_object_to_int_or_none(mapping.get("sender_id")),
+        sender_first_name=_object_to_str_or_none(mapping.get("sender_first_name")),
+        media_description=_object_to_str_or_none(mapping.get("media_description")),
+        reply_to_msg_id=_object_to_int_or_none(mapping.get("reply_to_msg_id")),
+        forum_topic_id=_object_to_int_or_none(mapping.get("forum_topic_id")),
+        is_deleted=_object_to_int(mapping.get("is_deleted"), 0),
+        deleted_at=_object_to_int_or_none(mapping.get("deleted_at")),
+        edit_date=_object_to_int_or_none(mapping.get("edit_date")),
+        topic_title=_object_to_str_or_none(mapping.get("topic_title")),
+        effective_sender_id=_object_to_int_or_none(mapping.get("effective_sender_id")),
+        is_service=_object_to_int(mapping.get("is_service"), 0),
+        out=_object_to_int(mapping.get("out"), 0),
+        fwd_from_name=_object_to_str_or_none(mapping.get("fwd_from_name")),
+        post_author=_object_to_str_or_none(mapping.get("post_author")),
+        dialog_name=_object_to_str_or_none(mapping.get("dialog_name")),
+    )
+
+
+def _status_from_row(row: object | None) -> str | None:
+    if row is None:
+        return None
+    values = _row_sequence(row)
+    if not values:
+        return None
+    value = values[0]
+    return None if value is None else str(value)
 
 
 class DaemonReadingService:
@@ -123,7 +215,7 @@ class DaemonReadingService:
         return self._deps.conn
 
     @property
-    def _logger(self) -> Any:
+    def _logger(self) -> _LoggerLike:
         return self._deps.logger
 
     @staticmethod
@@ -238,23 +330,26 @@ class DaemonReadingService:
     async def _build_read_messages_from_rows(
         self,
         dialog_id: int,
-        rows: list[Any],
+        rows: Sequence[object],
         *,
         log_rendered: bool,
     ) -> list[api.ReadMessage]:
-        msg_ids = [r["message_id"] for r in rows]
+        msg_ids = [_message_id_from_item(r) for r in rows]
         if msg_ids:
             await self._freshen_reactions_if_stale(dialog_id, dialog_id, msg_ids)
         reaction_map = fetch_reaction_counts(self._conn, dialog_id, msg_ids)
-        messages = [
-            api.ReadMessage(
-                **dict(r),
-                reactions_display=format_reaction_counts(reaction_map[r["message_id"]])
-                if r["message_id"] in reaction_map
-                else "",
+        messages: list[api.ReadMessage] = []
+        for r in rows:
+            message = _read_message_from_row(r)
+            reaction_key = message.message_id
+            messages.append(
+                dataclasses.replace(
+                    message,
+                    reactions_display=format_reaction_counts(reaction_map[reaction_key])
+                    if reaction_key in reaction_map
+                    else "",
+                )
             )
-            for r in rows
-        ]
         if log_rendered:
             null_sender_rows = sum(1 for m in messages if m.sender_id is None)
             unresolved_entity_rows = sum(1 for m in messages if m.sender_id is not None and m.sender_first_name is None)
@@ -284,7 +379,7 @@ class DaemonReadingService:
         request: _ListMessagesRequest,
     ) -> dict:
         row = self._conn.execute(api._SELECT_SYNC_STATUS_SQL, (dialog_id,)).fetchone()
-        current_status = row[0] if row else None
+        current_status = _status_from_row(row)
         if current_status in (None, "not_synced", "fragment"):
             if not await self._deps.fetch_fragment_context(dialog_id, request.context_message_id or 0):
                 return {
@@ -332,7 +427,7 @@ class DaemonReadingService:
             unread_after_id = await self._resolve_unread_position(dialog_id, request.unread_after_id)
 
         row = self._conn.execute(api._SELECT_SYNC_STATUS_SQL, (dialog_id,)).fetchone()
-        status = row[0] if row is not None else None
+        status = _status_from_row(row)
 
         dialog_type = api._dialog_type_from_db(self._conn, dialog_id)
         read_state = api._read_state_for_dialog(self._conn, dialog_id, dialog_type)
@@ -389,7 +484,7 @@ class DaemonReadingService:
                 "self_id": self._deps.self_id,
             },
         ).fetchall()
-        messages = [api.ReadMessage(**dict(r)) for r in rows]
+        messages = [_read_message_from_row(r) for r in rows]
         next_nav = self._search_next_navigation(request, messages, global_mode=True)
         return {
             "ok": True,
@@ -419,7 +514,7 @@ class DaemonReadingService:
         messages = await self._build_read_messages_from_rows(request.dialog_id, rows, log_rendered=False)
         next_nav = self._search_next_navigation(request, messages, global_mode=False)
         row = self._conn.execute(api._SELECT_SYNC_STATUS_SQL, (request.dialog_id,)).fetchone()
-        scoped_status = row[0] if row else None
+        scoped_status = _status_from_row(row)
         access_meta = api._build_access_metadata(self._conn, request.dialog_id, scoped_status or "not_synced")
         return {
             "ok": True,
@@ -449,7 +544,7 @@ class DaemonReadingService:
         self,
         request: _ListDialogsRequest,
         dialog_filter: _ListDialogsFilter,
-    ) -> list[tuple[Any, ...]]:
+    ) -> list[Mapping[str, object]]:
         params = {
             "archived_filter": 0 if request.exclude_archived else None,
             "pinned_filter": 0 if request.ignore_pinned else None,
@@ -458,7 +553,7 @@ class DaemonReadingService:
         rows = self._conn.execute(api._LIST_DIALOGS_SQL, params).fetchall()
         if not rows and dialog_filter.name_pat is not None and dialog_filter.normalized:
             rows = self._conn.execute(api._LIST_DIALOGS_SQL, {**params, "name_pat": None}).fetchall()
-        return rows
+        return [cast(Mapping[str, object], row) for row in rows]
 
     def _dialog_row_matches_filter(
         self,
@@ -488,16 +583,16 @@ class DaemonReadingService:
 
     def _shape_dialog_row(
         self,
-        row: Any,
+        row: Mapping[str, object],
         local_counts: dict[int, int],
         unread_counts: dict[int, tuple[int, int]],
         dialog_filter: _ListDialogsFilter,
-    ) -> tuple[dict[str, Any] | None, int | None]:
-        d_id = row["dialog_id"]
-        if not self._dialog_row_matches_filter(dialog_filter, row["name"]):
+    ) -> tuple[dict[str, object] | None, int | None]:
+        d_id = _object_to_int(row["dialog_id"])
+        if not self._dialog_row_matches_filter(dialog_filter, _object_to_str_or_none(row["name"])):
             return None, None
 
-        row_data: dict[str, Any] = {
+        row_data: dict[str, object] = {
             "id": d_id,
             "name": row["name"],
             "type": row["type"],
@@ -508,11 +603,11 @@ class DaemonReadingService:
             "sync_status": row["sync_status"] if row["sync_status"] is not None else "not_synced",
             "sync_coverage_pct": api._compute_sync_coverage(row["total_messages"], local_counts.get(d_id, 0)),
             "access_lost_at": row["access_lost_at"],
-            "unread_mentions_count": int(row["unread_mentions_count"] or 0),
-            "unread_reactions_count": int(row["unread_reactions_count"] or 0),
+            "unread_mentions_count": _object_to_int(row["unread_mentions_count"], 0),
+            "unread_reactions_count": _object_to_int(row["unread_reactions_count"], 0),
             "draft_text": row["draft_text"],
         }
-        if api.DialogType.parse(row["type"]) == api.DialogType.USER:
+        if api.DialogType.parse(_object_to_str_or_none(row["type"])) == api.DialogType.USER:
             in_cnt, out_cnt = unread_counts.get(d_id, (0, 0))
             row_data["unread_in"] = in_cnt
             row_data["unread_out"] = out_cnt
@@ -521,7 +616,7 @@ class DaemonReadingService:
     async def _freshen_reactions_if_stale(
         self,
         dialog_id: int,
-        entity: Any,
+        entity: object,
         message_ids: list[int],
     ) -> None:
         """Per-message TTL-gated JIT reaction freshen from Telegram."""
@@ -540,13 +635,13 @@ class DaemonReadingService:
             f"AND checked_at > ?",
             [dialog_id, *message_ids, threshold],
         ).fetchall()
-        fresh_ids = {int(r[0]) for r in fresh_rows}
+        fresh_ids = {_object_to_int(_row_sequence(r)[0]) for r in fresh_rows}
         stale_ids = [mid for mid in message_ids if mid not in fresh_ids]
         if not stale_ids:
             return
 
         try:
-            messages = await self._deps.client.get_messages(entity, ids=stale_ids)
+            messages = cast(Sequence[object], await self._deps.client.get_messages(entity, ids=stale_ids))
         except FloodWaitError as exc:
             self._logger.warning(
                 "jit_reactions_floodwait dialog_id=%d stale_count=%d seconds=%d",
@@ -582,8 +677,10 @@ class DaemonReadingService:
         if unread_after_id is not None:
             return unread_after_id
         row = self._conn.execute(api._GET_READ_POSITION_SQL, (dialog_id,)).fetchone()
-        if row and row[0] is not None:
-            return int(row[0])
+        if row is not None:
+            values = _row_sequence(row)
+            if values and values[0] is not None:
+                return _object_to_int(values[0])
         return None
 
     async def _list_messages_context_window(
@@ -637,7 +734,7 @@ class DaemonReadingService:
     ) -> dict:
         """Fetch messages on-demand from Telegram API."""
         self._logger.debug("list_messages_fallback_telegram dialog_id=%d%s", req.dialog_id, self._deps.rid())
-        iter_kwargs: dict = {
+        iter_kwargs: dict[str, object] = {
             k: v
             for k, v in {
                 "limit": req.limit,
@@ -649,7 +746,7 @@ class DaemonReadingService:
             }.items()
             if v is not None
         }
-        messages: list[dict] = []
+        messages: list[dict[str, object]] = []
         try:
             messages.extend(
                 [
@@ -755,14 +852,21 @@ class DaemonReadingService:
         """Return dialog list from the local dialogs snapshot (pure SQL)."""
         request = self._parse_list_dialogs_request(req)
         dialog_filter = self._prepare_list_dialogs_filter(request.filter_raw)
-        local_counts = dict(self._conn.execute(api._COUNT_MESSAGES_BY_DIALOG_SQL).fetchall())
+        local_counts = {
+            _object_to_int(_row_sequence(row)[0]): _object_to_int(_row_sequence(row)[1], 0)
+            for row in self._conn.execute(api._COUNT_MESSAGES_BY_DIALOG_SQL).fetchall()
+        }
         unread_counts = {
-            row[0]: (int(row[1] or 0), int(row[2] or 0))
+            _object_to_int(_row_sequence(row)[0]): (
+                _object_to_int(_row_sequence(row)[1], 0),
+                _object_to_int(_row_sequence(row)[2], 0),
+            )
             for row in self._conn.execute(api._BATCHED_UNREAD_COUNTS_SQL).fetchall()
         }
         sql_rows = self._fetch_list_dialog_rows(request, dialog_filter)
         if not sql_rows:
-            count_total = self._conn.execute("SELECT COUNT(*) FROM dialogs").fetchone()[0]
+            count_row = self._conn.execute("SELECT COUNT(*) FROM dialogs").fetchone()
+            count_total = _object_to_int(_row_sequence(count_row)[0]) if count_row is not None else 0
             return {
                 "ok": True,
                 "data": {
