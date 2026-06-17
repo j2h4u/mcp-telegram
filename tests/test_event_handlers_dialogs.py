@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -78,22 +79,32 @@ def _enroll_synced(conn: sqlite3.Connection, dialog_id: int) -> None:
     conn.commit()
 
 
+@dataclass(frozen=True)
+class _DialogRowOptions:
+    pinned: int = 0
+    needs_refresh: int = 0
+    last_message_at: int | None = None
+    snapshot_at: int = 1
+
+
 def _insert_dialog(
     conn: sqlite3.Connection,
     dialog_id: int,
     *,
-    pinned: int = 0,
-    needs_refresh: int = 0,
-    last_message_at: int | None = None,
-    snapshot_at: int = 1,
+    opts: _DialogRowOptions | None = None,
+    **kwargs,
 ) -> None:
+    if opts is None:
+        opts = _DialogRowOptions()
+    if kwargs:
+        opts = replace(opts, **kwargs)
     conn.execute(
         "INSERT OR REPLACE INTO dialogs "
         "(dialog_id, name, type, archived, pinned, members, created, "
         " last_message_at, snapshot_at, hidden, needs_refresh, "
         " unread_mentions_count, unread_reactions_count, draft_text) "
         "VALUES (?, 'X', 'channel', 0, ?, NULL, NULL, ?, ?, 0, ?, 0, 0, NULL)",
-        (dialog_id, pinned, last_message_at, snapshot_at, needs_refresh),
+        (dialog_id, opts.pinned, opts.last_message_at, opts.snapshot_at, opts.needs_refresh),
     )
     conn.commit()
 

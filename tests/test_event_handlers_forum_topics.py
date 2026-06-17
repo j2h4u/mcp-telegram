@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -76,26 +77,56 @@ def _enroll_synced(conn: sqlite3.Connection, dialog_id: int) -> None:
     conn.commit()
 
 
+@dataclass(frozen=True)
+class _TopicMetadataOptions:
+    title: str = "General"
+    icon_emoji_id: int | None = None
+    pinned: int = 0
+    hidden: int = 0
+    snapshot_at: int = 1
+    is_general: int = 0
+    is_deleted: int = 0
+    updated_at: int = 1
+
+
+@dataclass(frozen=True)
+class _TopicEditEventOptions:
+    title: str | None = None
+    icon_emoji_id: int | None = None
+    hidden: bool | None = None
+    closed: bool | None = None
+    reply_to: object = ...
+
+
 def _insert_topic_metadata(
     conn: sqlite3.Connection,
     dialog_id: int,
     topic_id: int,
     *,
-    title: str = "General",
-    icon_emoji_id: int | None = None,
-    pinned: int = 0,
-    hidden: int = 0,
-    snapshot_at: int = 1,
-    is_general: int = 0,
-    is_deleted: int = 0,
-    updated_at: int = 1,
+    opts: _TopicMetadataOptions | None = None,
+    **kwargs,
 ) -> None:
+    if opts is None:
+        opts = _TopicMetadataOptions()
+    if kwargs:
+        opts = replace(opts, **kwargs)
     conn.execute(
         "INSERT OR REPLACE INTO topic_metadata "
         "(dialog_id, topic_id, title, top_message_id, is_general, is_deleted, "
         " updated_at, icon_emoji_id, pinned, hidden, snapshot_at, date) "
         "VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, NULL)",
-        (dialog_id, topic_id, title, is_general, is_deleted, updated_at, icon_emoji_id, pinned, hidden, snapshot_at),
+        (
+            dialog_id,
+            topic_id,
+            opts.title,
+            opts.is_general,
+            opts.is_deleted,
+            opts.updated_at,
+            opts.icon_emoji_id,
+            opts.pinned,
+            opts.hidden,
+            opts.snapshot_at,
+        ),
     )
     conn.commit()
 
@@ -174,23 +205,24 @@ def _make_topic_edit_event(
     msg_id: int,
     target_topic_id: int | None,
     *,
-    title: str | None = None,
-    icon_emoji_id: int | None = None,
-    hidden: bool | None = None,
-    closed: bool | None = None,
-    reply_to: object = ...,  # ... = build default; None = explicit no reply_to
+    opts: _TopicEditEventOptions | None = None,
+    **kwargs,
 ) -> MagicMock:
+    if opts is None:
+        opts = _TopicEditEventOptions()
+    if kwargs:
+        opts = replace(opts, **kwargs)
     action = MessageActionTopicEdit(
-        title=title,
-        icon_emoji_id=icon_emoji_id,
-        closed=closed,
-        hidden=hidden,
+        title=opts.title,
+        icon_emoji_id=opts.icon_emoji_id,
+        closed=opts.closed,
+        hidden=opts.hidden,
     )
-    if reply_to is ...:
+    if opts.reply_to is ...:
         reply_to_obj = MagicMock()
         reply_to_obj.reply_to_msg_id = target_topic_id
     else:
-        reply_to_obj = reply_to  # caller-supplied; can be None
+        reply_to_obj = opts.reply_to  # caller-supplied; can be None
     msg = _make_service_msg(msg_id, action, reply_to_obj)
     event = MagicMock()
     event.chat_id = dialog_id

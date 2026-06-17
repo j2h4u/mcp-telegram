@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, replace
+
 from mcp_telegram.tools.reading import (
     ListMessages,
     SearchMessages,
@@ -14,32 +16,36 @@ from mcp_telegram.tools.reading import (
 )
 
 
-def _row(
-    sender_id,
-    sender_first_name,
-    *,
-    message_id: int = 1,
-    sent_at: int = 1_700_000_000,
-    text: str = "hello world",
-    dialog_name: str | None = None,
-    is_service: int = 0,
-    out: int = 0,
-    dialog_id: int = 0,
-    effective_sender_id=None,
-) -> dict:
+@dataclass(frozen=True)
+class _RowOptions:
+    message_id: int = 1
+    sent_at: int = 1_700_000_000
+    text: str = "hello world"
+    dialog_name: str | None = None
+    is_service: int = 0
+    out: int = 0
+    dialog_id: int = 0
+    effective_sender_id: object = None
+
+
+def _row(sender_id, sender_first_name, *, opts: _RowOptions | None = None, **kwargs) -> dict:
+    if opts is None:
+        opts = _RowOptions()
+    if kwargs:
+        opts = replace(opts, **kwargs)
     r: dict = {
-        "message_id": message_id,
-        "sent_at": sent_at,
-        "text": text,
+        "message_id": opts.message_id,
+        "sent_at": opts.sent_at,
+        "text": opts.text,
         "sender_id": sender_id,
         "sender_first_name": sender_first_name,
-        "is_service": is_service,
-        "out": out,
-        "dialog_id": dialog_id,
-        "effective_sender_id": effective_sender_id,
+        "is_service": opts.is_service,
+        "out": opts.out,
+        "dialog_id": opts.dialog_id,
+        "effective_sender_id": opts.effective_sender_id,
     }
-    if dialog_name is not None:
-        r["dialog_name"] = dialog_name
+    if opts.dialog_name is not None:
+        r["dialog_name"] = opts.dialog_name
     return r
 
 

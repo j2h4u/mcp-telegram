@@ -14,6 +14,7 @@ descending-render-order test (codex MEDIUM).
 
 from __future__ import annotations
 
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 
 from mcp_telegram.models import ReadMessage
@@ -23,31 +24,37 @@ from mcp_telegram.models import ReadMessage
 # ---------------------------------------------------------------------------
 
 
-def _make_msg(
-    mid: int,
-    *,
-    text: str = "hi",
-    out: int = 0,
-    dialog_id: int = 12345,
-    edit_date: datetime | int | None = None,
-    sender_first_name: str | None = "Alice",
-    sent_at_dt: datetime | None = None,
-) -> ReadMessage:
+@dataclass(frozen=True)
+class _ReadMessageOptions:
+    text: str = "hi"
+    out: int = 0
+    dialog_id: int = 12345
+    edit_date: datetime | int | None = None
+    sender_first_name: str | None = "Alice"
+    sent_at_dt: datetime | None = None
+
+
+def _make_msg(mid: int, *, opts: _ReadMessageOptions | None = None, **kwargs) -> ReadMessage:
     """Create a ReadMessage for formatter tests with sensible defaults."""
+    if opts is None:
+        opts = _ReadMessageOptions()
+    if kwargs:
+        opts = replace(opts, **kwargs)
+    sent_at_dt = opts.sent_at_dt
     if sent_at_dt is None:
         sent_at_dt = _dt(12, 0)
     edit_date_int: int | None = None
-    if isinstance(edit_date, datetime):
-        edit_date_int = int(edit_date.timestamp())
-    elif isinstance(edit_date, int):
-        edit_date_int = edit_date
+    if isinstance(opts.edit_date, datetime):
+        edit_date_int = int(opts.edit_date.timestamp())
+    elif isinstance(opts.edit_date, int):
+        edit_date_int = opts.edit_date
     return ReadMessage(
         message_id=mid,
         sent_at=int(sent_at_dt.timestamp()),
-        dialog_id=dialog_id,
-        text=text,
-        out=out,
-        sender_first_name=sender_first_name,
+        dialog_id=opts.dialog_id,
+        text=opts.text,
+        out=opts.out,
+        sender_first_name=opts.sender_first_name,
         sender_id=11,
         edit_date=edit_date_int,
     )

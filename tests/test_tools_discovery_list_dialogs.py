@@ -10,6 +10,7 @@ Phase 44 Plan 02 — covers:
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, replace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -17,30 +18,36 @@ import pytest
 from mcp_telegram.tools.discovery import ListDialogs, list_dialogs
 
 
-def _make_dialog_dict(
-    *,
-    dialog_id: int = 100,
-    name: str = "Alice",
-    type_: str = "User",
-    unread_mentions_count: int = 0,
-    unread_reactions_count: int = 0,
-    draft_text: str | None = None,
-    sync_status: str = "synced",
-) -> dict:
+@dataclass(frozen=True)
+class _DialogDictOptions:
+    dialog_id: int = 100
+    name: str = "Alice"
+    type_: str = "User"
+    unread_mentions_count: int = 0
+    unread_reactions_count: int = 0
+    draft_text: str | None = None
+    sync_status: str = "synced"
+
+
+def _make_dialog_dict(*, opts: _DialogDictOptions | None = None, **kwargs) -> dict:
+    if opts is None:
+        opts = _DialogDictOptions()
+    if kwargs:
+        opts = replace(opts, **kwargs)
     return {
-        "id": dialog_id,
-        "name": name,
-        "type": type_,
+        "id": opts.dialog_id,
+        "name": opts.name,
+        "type": opts.type_,
         "last_message_at": 1700000000,
         "unread_count": 0,
         "members": None,
         "created": None,
-        "sync_status": sync_status,
+        "sync_status": opts.sync_status,
         "sync_coverage_pct": None,
         "access_lost_at": None,
-        "unread_mentions_count": unread_mentions_count,
-        "unread_reactions_count": unread_reactions_count,
-        "draft_text": draft_text,
+        "unread_mentions_count": opts.unread_mentions_count,
+        "unread_reactions_count": opts.unread_reactions_count,
+        "draft_text": opts.draft_text,
     }
 
 

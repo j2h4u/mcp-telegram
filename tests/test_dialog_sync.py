@@ -19,6 +19,7 @@ import json
 import logging
 import sqlite3
 import time
+from dataclasses import dataclass, replace
 from datetime import UTC
 from pathlib import Path
 from types import SimpleNamespace
@@ -40,6 +41,25 @@ from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 # ---------------------------------------------------------------------------
 # Entity + dialog factories
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _ChannelEntityOptions:
+    title: str = "Channel"
+    broadcast: bool = True
+    participants_count: int | None = 100
+    access_hash: int = 9999
+    date: Any | None = None
+
+
+@dataclass(frozen=True)
+class _DialogOptions:
+    message_date: Any | None = None
+    pinned: bool = False
+    folder_id: int | None = None
+    unread_mentions_count: int = 0
+    unread_reactions_count: int = 0
+    draft_message: str | None = None
 
 
 def _make_user_entity(
@@ -84,25 +104,26 @@ def _make_chat_entity(
 def _make_channel_entity(
     cid: int,
     *,
-    title: str = "Channel",
-    broadcast: bool = True,
-    participants_count: int | None = 100,
-    access_hash: int = 9999,
-    date: Any | None = None,
+    opts: _ChannelEntityOptions | None = None,
+    **kwargs: Any,
 ) -> Any:
     from datetime import datetime
 
     from telethon.tl.types import Channel
 
+    if opts is None:
+        opts = _ChannelEntityOptions()
+    if kwargs:
+        opts = replace(opts, **kwargs)
     return Channel(
         id=cid,
-        title=title,
+        title=opts.title,
         photo=None,
-        date=date if date is not None else datetime(2024, 1, 1, tzinfo=UTC),
-        broadcast=broadcast,
-        megagroup=not broadcast,
-        access_hash=access_hash,
-        participants_count=participants_count,
+        date=opts.date if opts.date is not None else datetime(2024, 1, 1, tzinfo=UTC),
+        broadcast=opts.broadcast,
+        megagroup=not opts.broadcast,
+        access_hash=opts.access_hash,
+        participants_count=opts.participants_count,
     )
 
 
@@ -110,28 +131,29 @@ def _make_dialog(
     dialog_id: int,
     entity: Any,
     *,
-    message_date: Any | None = None,
-    pinned: bool = False,
-    folder_id: int | None = None,
-    unread_mentions_count: int = 0,
-    unread_reactions_count: int = 0,
-    draft_message: str | None = None,
+    opts: _DialogOptions | None = None,
+    **kwargs: Any,
 ) -> SimpleNamespace:
     from datetime import datetime
 
+    if opts is None:
+        opts = _DialogOptions()
+    if kwargs:
+        opts = replace(opts, **kwargs)
+    message_date = opts.message_date
     if message_date is None:
         message_date = datetime(2024, 6, 1, 12, 0, tzinfo=UTC)
     msg = SimpleNamespace(date=message_date)
-    draft = SimpleNamespace(message=draft_message) if draft_message is not None else None
+    draft = SimpleNamespace(message=opts.draft_message) if opts.draft_message is not None else None
     return SimpleNamespace(
         id=dialog_id,
         entity=entity,
         date=message_date,
         message=msg,
-        pinned=pinned,
-        folder_id=folder_id,
-        unread_mentions_count=unread_mentions_count,
-        unread_reactions_count=unread_reactions_count,
+        pinned=opts.pinned,
+        folder_id=opts.folder_id,
+        unread_mentions_count=opts.unread_mentions_count,
+        unread_reactions_count=opts.unread_reactions_count,
         draft=draft,
     )
 

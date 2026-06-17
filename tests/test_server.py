@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import re
 from contextlib import asynccontextmanager
+from functools import partial
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -408,73 +409,92 @@ async def test_run_mcp_server_invokes_stdio_transport(monkeypatch) -> None:
     assert server.app.instructions == "Built"
 
 
+class _FakeTransportSecuritySettings:
+    def __init__(self, captured: dict[str, object], **kwargs) -> None:
+        captured["security"] = kwargs
+
+
+class _FakeSessionManager:
+    def __init__(self, captured: dict[str, object], app, security_settings) -> None:
+        captured["session_manager"] = {"app": app, "security_settings": security_settings}
+        self._captured = captured
+
+    @asynccontextmanager
+    async def run(self):
+        self._captured["session_manager_entered"] = True
+        yield
+        self._captured["session_manager_exited"] = True
+
+
+class _FakeRoute:
+    def __init__(self, captured: dict[str, object], path: str, endpoint, methods: list[str] | None = None) -> None:
+        captured.setdefault("routes", []).append(("route", path, methods))
+
+
+class _FakeMount:
+    def __init__(self, captured: dict[str, object], path: str, app: object) -> None:
+        captured.setdefault("routes", []).append(("mount", path, app))
+
+
+class _FakeStarlette:
+    def __init__(self, captured: dict[str, object], *, debug: bool, routes: list[object], lifespan: object) -> None:
+        captured["starlette"] = {"debug": debug, "routes": routes, "lifespan": lifespan}
+
+
+class _FakeConfig:
+    def __init__(self, captured: dict[str, object], asgi_app, *args, **kwargs) -> None:
+        captured["config"] = {
+            "asgi_app": asgi_app,
+            "host": kwargs["host"],
+            "port": kwargs["port"],
+            "log_level": kwargs["log_level"],
+        }
+
+
+class _FakeServer:
+    def __init__(self, captured: dict[str, object], config: object) -> None:
+        captured["server"] = config
+        self._captured = captured
+
+    async def serve(self) -> None:
+        self._captured["serve"] = True
+
+
+def _make_fake_uvicorn_server(captured: dict[str, object]):
+    class FakeServer(_FakeServer):
+        def __init__(self, config: object) -> None:
+            super().__init__(captured, config)
+
+    return FakeServer
+
+
+async def _fake_build_server_instructions() -> str:
+    return "Built"
+
+
+def _fake_assert_exposure_allowed(captured: dict[str, object], host: str) -> None:
+    captured["assert"] = host
+
+
 @pytest.mark.asyncio
 async def test_run_mcp_http_server_normalizes_mount_and_builds_transport(monkeypatch) -> None:
     captured: dict[str, object] = {}
-
-    class FakeTransportSecuritySettings:
-        def __init__(self, **kwargs) -> None:
-            captured["security"] = kwargs
-
-    class FakeSessionManager:
-        def __init__(self, app, security_settings) -> None:
-            captured["session_manager"] = {"app": app, "security_settings": security_settings}
-
-        @asynccontextmanager
-        async def run(self):
-            captured["session_manager_entered"] = True
-            yield
-            captured["session_manager_exited"] = True
-
-    class FakeRoute:
-        def __init__(self, path: str, endpoint, methods: list[str] | None = None) -> None:
-            captured.setdefault("routes", []).append(("route", path, methods))
-
-    class FakeMount:
-        def __init__(self, path: str, app: object) -> None:
-            captured.setdefault("routes", []).append(("mount", path, app))
-
-    class FakeStarlette:
-        def __init__(self, *, debug: bool, routes: list[object], lifespan: object) -> None:
-            captured["starlette"] = {"debug": debug, "routes": routes, "lifespan": lifespan}
-
-    class FakeConfig:
-        def __init__(self, asgi_app, *, host: str, port: int, log_level: str, access_log: bool) -> None:
-            captured["config"] = {"host": host, "port": port, "log_level": log_level, "asgi_app": asgi_app}
-
-    class FakeServer:
-        def __init__(self, config: object) -> None:
-            captured["server"] = config
-
-        async def serve(self) -> None:
-            captured["serve"] = True
-
-    fake_calls = {"assert": 0}
-
-    async def _fake_build_server_instructions() -> str:
-        return "Built"
-
-    monkeypatch.setattr("mcp.server.transport_security.TransportSecuritySettings", FakeTransportSecuritySettings)
-    monkeypatch.setattr("mcp.server.streamable_http_manager.StreamableHTTPSessionManager", FakeSessionManager)
-    monkeypatch.setattr("starlette.applications.Starlette", FakeStarlette)
-    monkeypatch.setattr("starlette.routing.Route", FakeRoute)
-    monkeypatch.setattr("starlette.routing.Mount", FakeMount)
-    monkeypatch.setattr("uvicorn.Config", FakeConfig)
-    monkeypatch.setattr("uvicorn.Server", FakeServer)
+    monkeypatch.setattr("mcp.server.transport_security.TransportSecuritySettings", partial(_FakeTransportSecuritySettings, captured))
+    monkeypatch.setattr("mcp.server.streamable_http_manager.StreamableHTTPSessionManager", partial(_FakeSessionManager, captured))
+    monkeypatch.setattr("starlette.applications.Starlette", partial(_FakeStarlette, captured))
+    monkeypatch.setattr("starlette.routing.Route", partial(_FakeRoute, captured))
+    monkeypatch.setattr("starlette.routing.Mount", partial(_FakeMount, captured))
+    monkeypatch.setattr("uvicorn.Config", partial(_FakeConfig, captured))
+    monkeypatch.setattr("uvicorn.Server", _make_fake_uvicorn_server(captured))
     monkeypatch.setattr("logging.basicConfig", lambda *args, **kwargs: None)
     monkeypatch.setattr(server, "_http_allowed_hosts", lambda host, port: [f"{host}:{port}"])
     monkeypatch.setattr(server, "_http_allowed_origins", lambda: ["https://example.com"])
     monkeypatch.setattr("mcp_telegram.server._build_server_instructions", _fake_build_server_instructions)
-
-    def _fake_assert_exposure_allowed(host: str) -> None:
-        fake_calls["assert"] += 1
-        assert host == "127.0.0.1"
-
-    monkeypatch.setattr(server, "_assert_http_exposure_allowed", _fake_assert_exposure_allowed)
+    monkeypatch.setattr(server, "_assert_http_exposure_allowed", partial(_fake_assert_exposure_allowed, captured))
 
     await server.run_mcp_http_server(host="127.0.0.1", port=4100, mount_path="mcp")
 
-    assert fake_calls["assert"] == 1
+    assert captured["assert"] == "127.0.0.1"
     assert captured["security"] == {
         "enable_dns_rebinding_protection": True,
         "allowed_hosts": ["127.0.0.1:4100"],

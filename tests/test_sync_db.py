@@ -920,6 +920,124 @@ def test_idx_messages_reply_exists(tmp_sync_db_path: Path) -> None:
         conn.close()
 
 
+def _seed_v6_reaction_backfill_db(conn) -> None:
+    import json
+
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL, applied_at INTEGER NOT NULL)"
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS messages (
+            dialog_id       INTEGER NOT NULL,
+            message_id      INTEGER NOT NULL,
+            sent_at         INTEGER NOT NULL,
+            text            TEXT,
+            sender_id       INTEGER,
+            sender_first_name TEXT,
+            media_description TEXT,
+            reply_to_msg_id INTEGER,
+            forum_topic_id  INTEGER,
+            reactions       TEXT,
+            is_deleted      INTEGER NOT NULL DEFAULT 0,
+            deleted_at      INTEGER,
+            PRIMARY KEY (dialog_id, message_id)
+        ) WITHOUT ROWID"""
+    )
+    conn.execute(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts "
+        "USING fts5(dialog_id UNINDEXED, message_id UNINDEXED, text)"
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS synced_dialogs (
+            dialog_id      INTEGER PRIMARY KEY,
+            status         TEXT NOT NULL DEFAULT 'not_synced',
+            last_synced_at INTEGER,
+            last_event_at  INTEGER,
+            sync_progress  INTEGER DEFAULT 0,
+            total_messages INTEGER,
+            access_lost_at INTEGER
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS message_versions (
+            dialog_id  INTEGER NOT NULL,
+            message_id INTEGER NOT NULL,
+            version    INTEGER NOT NULL,
+            old_text   TEXT,
+            edit_date  INTEGER,
+            PRIMARY KEY (dialog_id, message_id, version)
+        ) WITHOUT ROWID"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS entities (
+            id              INTEGER PRIMARY KEY,
+            type            TEXT NOT NULL,
+            name            TEXT,
+            username        TEXT,
+            name_normalized TEXT,
+            updated_at      INTEGER NOT NULL
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS topic_metadata (
+            dialog_id      INTEGER NOT NULL,
+            topic_id       INTEGER NOT NULL,
+            title          TEXT NOT NULL,
+            top_message_id INTEGER,
+            is_general     INTEGER NOT NULL,
+            is_deleted     INTEGER NOT NULL,
+            inaccessible_error TEXT,
+            inaccessible_at INTEGER,
+            updated_at     INTEGER NOT NULL,
+            PRIMARY KEY (dialog_id, topic_id)
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS telemetry_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tool_name TEXT NOT NULL,
+            timestamp REAL NOT NULL,
+            duration_ms REAL NOT NULL,
+            result_count INTEGER NOT NULL,
+            has_cursor BOOLEAN NOT NULL,
+            page_depth INTEGER NOT NULL,
+            has_filter BOOLEAN NOT NULL,
+            error_type TEXT
+        )"""
+    )
+    for v in range(1, 7):
+        conn.execute("INSERT INTO schema_version VALUES (?, strftime('%s', 'now'))", (v,))
+
+    rows = [
+        (1, 10, 1, json.dumps({"👍": 3, "❤": 1})),
+        (1, 20, 2, "not json"),
+        (1, 30, 3, "[1, 2, 3]"),
+        (1, 40, 4, '"hello"'),
+        (1, 50, 5, None),
+    ]
+    for dialog_id, message_id, sent_at, reactions in rows:
+        conn.execute(
+            "INSERT INTO messages (dialog_id, message_id, sent_at, reactions) VALUES (?, ?, ?, ?)",
+            (dialog_id, message_id, sent_at, reactions),
+        )
+    conn.commit()
+
+
+def _assert_v7_reaction_backfill_results(conn) -> None:
+    col_names = {r[1] for r in conn.execute("PRAGMA table_info(messages)").fetchall()}
+    assert "reactions" not in col_names, "reactions column must be dropped after v7"
+    reaction_rows = conn.execute(
+        "SELECT emoji, count FROM message_reactions WHERE dialog_id=1 AND message_id=10 ORDER BY emoji"
+    ).fetchall()
+    reaction_dict = {r[0]: r[1] for r in reaction_rows}
+    assert reaction_dict == {"👍": 3, "❤": 1}, f"Valid JSON reactions should be backfilled. Got: {reaction_dict}"
+    assert conn.execute("SELECT COUNT(*) FROM message_reactions WHERE dialog_id=1 AND message_id=20").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM message_reactions WHERE dialog_id=1 AND message_id=30").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM message_reactions WHERE dialog_id=1 AND message_id=40").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM message_reactions WHERE dialog_id=1 AND message_id=50").fetchone()[0] == 0
+
+
 def test_v7_backfill_reactions_from_json(tmp_path: Path) -> None:
     """v7 migration backfills message_reactions from reactions JSON blob.
 
@@ -929,139 +1047,10 @@ def test_v7_backfill_reactions_from_json(tmp_path: Path) -> None:
     - Non-object JSON (array, scalar) is skipped due to json_type='object' guard.
     - reactions column is gone after migration.
     """
-    import json
-
     db_path = tmp_path / "sync.db"
-
-    # Bootstrap to v6 manually: create schema up to v6, then inject reactions data,
-    # then run ensure_sync_schema to apply v7.
-    # We use a fresh DB, apply migrations 1-6, insert test rows, then complete to v7.
-
-    # Build a v6 DB by running ensure_sync_schema on a patched version.
-    # Since we can't easily stop at v6, we instead:
-    # 1. Apply ensure_sync_schema (goes to v7), verify backfill happened.
-    # We test backfill by using a FRESH DB where we manually inject v6-like data
-    # before the v7 migration runs. We do this by creating a DB with just the
-    # v6 schema (messages with reactions column) and then importing the migration.
-    from mcp_telegram.sync_db import _open_sync_db
-
     conn = _open_sync_db(db_path)
     try:
-        # Apply migrations manually, stopping before v7 by using internal state.
-        # We create a minimal v6-like schema directly.
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL, applied_at INTEGER NOT NULL)"
-        )
-        conn.execute(
-            """CREATE TABLE IF NOT EXISTS messages (
-                dialog_id       INTEGER NOT NULL,
-                message_id      INTEGER NOT NULL,
-                sent_at         INTEGER NOT NULL,
-                text            TEXT,
-                sender_id       INTEGER,
-                sender_first_name TEXT,
-                media_description TEXT,
-                reply_to_msg_id INTEGER,
-                forum_topic_id  INTEGER,
-                reactions       TEXT,
-                is_deleted      INTEGER NOT NULL DEFAULT 0,
-                deleted_at      INTEGER,
-                PRIMARY KEY (dialog_id, message_id)
-            ) WITHOUT ROWID"""
-        )
-        conn.execute(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts "
-            "USING fts5(dialog_id UNINDEXED, message_id UNINDEXED, text)"
-        )
-        conn.execute(
-            """CREATE TABLE IF NOT EXISTS synced_dialogs (
-                dialog_id      INTEGER PRIMARY KEY,
-                status         TEXT NOT NULL DEFAULT 'not_synced',
-                last_synced_at INTEGER,
-                last_event_at  INTEGER,
-                sync_progress  INTEGER DEFAULT 0,
-                total_messages INTEGER,
-                access_lost_at INTEGER
-            )"""
-        )
-        conn.execute(
-            """CREATE TABLE IF NOT EXISTS message_versions (
-                dialog_id  INTEGER NOT NULL,
-                message_id INTEGER NOT NULL,
-                version    INTEGER NOT NULL,
-                old_text   TEXT,
-                edit_date  INTEGER,
-                PRIMARY KEY (dialog_id, message_id, version)
-            ) WITHOUT ROWID"""
-        )
-        conn.execute(
-            """CREATE TABLE IF NOT EXISTS entities (
-                id              INTEGER PRIMARY KEY,
-                type            TEXT NOT NULL,
-                name            TEXT,
-                username        TEXT,
-                name_normalized TEXT,
-                updated_at      INTEGER NOT NULL
-            )"""
-        )
-        conn.execute(
-            """CREATE TABLE IF NOT EXISTS topic_metadata (
-                dialog_id      INTEGER NOT NULL,
-                topic_id       INTEGER NOT NULL,
-                title          TEXT NOT NULL,
-                top_message_id INTEGER,
-                is_general     INTEGER NOT NULL,
-                is_deleted     INTEGER NOT NULL,
-                inaccessible_error TEXT,
-                inaccessible_at INTEGER,
-                updated_at     INTEGER NOT NULL,
-                PRIMARY KEY (dialog_id, topic_id)
-            )"""
-        )
-        conn.execute(
-            """CREATE TABLE IF NOT EXISTS telemetry_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                tool_name TEXT NOT NULL,
-                timestamp REAL NOT NULL,
-                duration_ms REAL NOT NULL,
-                result_count INTEGER NOT NULL,
-                has_cursor BOOLEAN NOT NULL,
-                page_depth INTEGER NOT NULL,
-                has_filter BOOLEAN NOT NULL,
-                error_type TEXT
-            )"""
-        )
-        # Mark versions 1-6 as applied
-        for v in range(1, 7):
-            conn.execute("INSERT INTO schema_version VALUES (?, strftime('%s', 'now'))", (v,))
-
-        # Insert test rows with various reactions values
-        valid_json = json.dumps({"👍": 3, "❤": 1})
-        malformed_json = "not json"
-        array_json = "[1, 2, 3]"  # valid JSON but not an object
-        scalar_json = '"hello"'  # valid JSON but not an object
-
-        conn.execute(
-            "INSERT INTO messages (dialog_id, message_id, sent_at, reactions) VALUES (1, 10, 1, ?)",
-            (valid_json,),
-        )
-        conn.execute(
-            "INSERT INTO messages (dialog_id, message_id, sent_at, reactions) VALUES (1, 20, 2, ?)",
-            (malformed_json,),
-        )
-        conn.execute(
-            "INSERT INTO messages (dialog_id, message_id, sent_at, reactions) VALUES (1, 30, 3, ?)",
-            (array_json,),
-        )
-        conn.execute(
-            "INSERT INTO messages (dialog_id, message_id, sent_at, reactions) VALUES (1, 40, 4, ?)",
-            (scalar_json,),
-        )
-        conn.execute(
-            "INSERT INTO messages (dialog_id, message_id, sent_at, reactions) VALUES (1, 50, 5, NULL)",
-        )
-        conn.commit()
+        _seed_v6_reaction_backfill_db(conn)
     finally:
         conn.close()
 
@@ -1071,40 +1060,7 @@ def test_v7_backfill_reactions_from_json(tmp_path: Path) -> None:
     # Verify results
     conn = _open_sync_db(db_path)
     try:
-        # reactions column must be gone
-        col_names = {r[1] for r in conn.execute("PRAGMA table_info(messages)").fetchall()}
-        assert "reactions" not in col_names, "reactions column must be dropped after v7"
-
-        # Valid JSON reactions backfilled
-        reaction_rows = conn.execute(
-            "SELECT emoji, count FROM message_reactions WHERE dialog_id=1 AND message_id=10 ORDER BY emoji"
-        ).fetchall()
-        reaction_dict = {r[0]: r[1] for r in reaction_rows}
-        assert reaction_dict == {"👍": 3, "❤": 1}, f"Valid JSON reactions should be backfilled. Got: {reaction_dict}"
-
-        # Malformed JSON row: no reactions backfilled (json_valid() guard)
-        malformed_rows = conn.execute(
-            "SELECT COUNT(*) FROM message_reactions WHERE dialog_id=1 AND message_id=20"
-        ).fetchone()[0]
-        assert malformed_rows == 0, "Malformed JSON must produce no reaction rows"
-
-        # Array JSON row: no reactions backfilled (json_type='object' guard)
-        array_rows = conn.execute(
-            "SELECT COUNT(*) FROM message_reactions WHERE dialog_id=1 AND message_id=30"
-        ).fetchone()[0]
-        assert array_rows == 0, "Array JSON must produce no reaction rows (not an object)"
-
-        # Scalar JSON row: no reactions backfilled (json_type='object' guard)
-        scalar_rows = conn.execute(
-            "SELECT COUNT(*) FROM message_reactions WHERE dialog_id=1 AND message_id=40"
-        ).fetchone()[0]
-        assert scalar_rows == 0, "Scalar JSON must produce no reaction rows (not an object)"
-
-        # NULL reactions: no rows
-        null_rows = conn.execute(
-            "SELECT COUNT(*) FROM message_reactions WHERE dialog_id=1 AND message_id=50"
-        ).fetchone()[0]
-        assert null_rows == 0, "NULL reactions must produce no reaction rows"
+        _assert_v7_reaction_backfill_results(conn)
     finally:
         conn.close()
 

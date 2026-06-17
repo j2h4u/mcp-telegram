@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
+from dataclasses import dataclass, replace
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -14,6 +15,14 @@ from mcp_telegram import app
 from mcp_telegram.feedback_db import ensure_feedback_schema
 
 runner = CliRunner()
+
+
+@dataclass(frozen=True)
+class _FeedbackRowOptions:
+    severity: str | None = None
+    context: str | None = None
+    model: str | None = None
+    harness: str | None = None
 
 
 @pytest.fixture
@@ -31,19 +40,22 @@ def feedback_db(tmp_path, monkeypatch) -> Path:
 def _insert(
     path: Path,
     message: str,
-    severity: str | None = None,
-    context: str | None = None,
-    model: str | None = None,
-    harness: str | None = None,
+    *,
+    opts: _FeedbackRowOptions | None = None,
+    **kwargs,
 ) -> int:
     """Insert one feedback row directly; return the autoincrement id."""
+    if opts is None:
+        opts = _FeedbackRowOptions()
+    if kwargs:
+        opts = replace(opts, **kwargs)
     if not path.exists():
         ensure_feedback_schema(path).close()
     conn = sqlite3.connect(str(path))
     try:
         cur = conn.execute(
             "INSERT INTO feedback (submitted_at, message, severity, context, model, harness) VALUES (?, ?, ?, ?, ?, ?)",
-            (int(time.time()), message, severity, context, model, harness),
+            (int(time.time()), message, opts.severity, opts.context, opts.model, opts.harness),
         )
         conn.commit()
         return cur.lastrowid

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
@@ -95,21 +96,32 @@ def insert_synced_dialog(conn: sqlite3.Connection, dialog_id: int) -> None:
     conn.commit()
 
 
+@dataclass(frozen=True)
+class _MessageRowOptions:
+    text: str | None = "some text"
+    is_deleted: int = 0
+    deleted_at: int | None = None
+
+
 def insert_message(
     conn: sqlite3.Connection,
     dialog_id: int,
     message_id: int,
-    text: str | None = "some text",
-    is_deleted: int = 0,
-    deleted_at: int | None = None,
+    *,
+    opts: _MessageRowOptions | None = None,
+    **kwargs: Any,
 ) -> None:
     """Insert a message row directly for test setup."""
+    if opts is None:
+        opts = _MessageRowOptions()
+    if kwargs:
+        opts = replace(opts, **kwargs)
     conn.execute(
         "INSERT OR REPLACE INTO messages "
         "(dialog_id, message_id, sent_at, text, sender_id, sender_first_name, "
         "media_description, reply_to_msg_id, forum_topic_id, is_deleted, deleted_at) "
         "VALUES (?, ?, 1704067200, ?, 42, 'Alice', NULL, NULL, NULL, ?, ?)",
-        (dialog_id, message_id, text, is_deleted, deleted_at),
+        (dialog_id, message_id, opts.text, opts.is_deleted, opts.deleted_at),
     )
     conn.commit()
 

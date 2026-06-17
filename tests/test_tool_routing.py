@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import pathlib
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, replace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -1020,42 +1021,48 @@ async def test_search_messages_rejects_history_navigation_token():
 # ---------------------------------------------------------------------------
 
 
-def _trace_daemon_payload(
-    *,
-    groups: list[dict] | None = None,
-    gaps: list[dict] | None = None,
-    confidence: str = "resolved",
-    account_id: int | None = 101,
-    coverage_goal: str = "observed",
-    local_cache_writes: int = 0,
-) -> dict:
+@dataclass(frozen=True)
+class _TraceDaemonPayloadOptions:
+    groups: list[dict] | None = None
+    gaps: list[dict] | None = None
+    confidence: str = "resolved"
+    account_id: int | None = 101
+    coverage_goal: str = "observed"
+    local_cache_writes: int = 0
+
+
+def _trace_daemon_payload(*, opts: _TraceDaemonPayloadOptions | None = None, **kwargs) -> dict:
+    if opts is None:
+        opts = _TraceDaemonPayloadOptions()
+    if kwargs:
+        opts = replace(opts, **kwargs)
     return {
         "ok": True,
         "data": {
             "resolved_account": {
-                "confidence": confidence,
-                "account_id": account_id,
-                "display_name": "Alice Example" if account_id is not None else None,
-                "username": "alice" if account_id is not None else None,
-                "candidate_ids": [101, 202] if confidence == "ambiguous" else [],
-                "display_aliases": ["Alice Example", "alice"] if account_id is not None else [],
+                "confidence": opts.confidence,
+                "account_id": opts.account_id,
+                "display_name": "Alice Example" if opts.account_id is not None else None,
+                "username": "alice" if opts.account_id is not None else None,
+                "candidate_ids": [101, 202] if opts.confidence == "ambiguous" else [],
+                "display_aliases": ["Alice Example", "alice"] if opts.account_id is not None else [],
                 "resolution_source": "entities_exact_id",
             },
-            "groups": groups or [],
+            "groups": opts.groups or [],
             "coverage": {
-                "state": "complete" if groups else "unknown",
-                "observed_message_count": sum(len(group.get("evidence", [])) for group in groups or []),
-                "dialogs_considered": 1 if groups else 0,
-                "dialogs_considered_basis": "exact_dialog_scope" if groups else "none",
-                "dialogs_with_hits": 1 if groups else 0,
+                "state": "complete" if opts.groups else "unknown",
+                "observed_message_count": sum(len(group.get("evidence", [])) for group in opts.groups or []),
+                "dialogs_considered": 1 if opts.groups else 0,
+                "dialogs_considered_basis": "exact_dialog_scope" if opts.groups else "none",
+                "dialogs_with_hits": 1 if opts.groups else 0,
                 "dialogs_with_gaps": 0,
                 "as_of": 1_700_000_100,
             },
-            "gaps": gaps or [],
+            "gaps": opts.gaps or [],
             "provenance": {
                 "source": "sync_db",
                 "query_basis": "effective_sender_id_or_post_author_signature",
-                "coverage_goal": coverage_goal,
+                "coverage_goal": opts.coverage_goal,
                 "coverage_bounds": {
                     "limit": 50,
                     "exact_dialog_id": -100123,
@@ -1063,9 +1070,9 @@ def _trace_daemon_payload(
                     "sent_after": None,
                     "sent_before": None,
                 },
-                "authorship_basis_counts": {"effective_sender_id": 2} if groups else {},
-                "dialogs_considered_basis": "exact_dialog_scope" if groups else "none",
-                "local_cache_writes": local_cache_writes,
+                "authorship_basis_counts": {"effective_sender_id": 2} if opts.groups else {},
+                "dialogs_considered_basis": "exact_dialog_scope" if opts.groups else "none",
+                "local_cache_writes": opts.local_cache_writes,
             },
             "next_navigation": None,
         },

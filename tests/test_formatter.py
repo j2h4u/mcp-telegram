@@ -1,30 +1,42 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 
 from mcp_telegram.models import ReadMessage
 
 
+@dataclass(frozen=True)
+class _MessageOptions:
+    text: str = "hello"
+    first_name: str = "Alice"
+    media_description: str | None = None
+    reactions_display: str = ""
+    reply_to_msg_id: int | None = None
+    sender_id: int = 1
+
+
 def _make_msg(
     id: int,
     dt: datetime,
-    text: str = "hello",
-    first_name: str = "Alice",
-    media_description: str | None = None,
-    reactions_display: str = "",
-    reply_to_msg_id: int | None = None,
-    sender_id: int = 1,
+    *,
+    opts: _MessageOptions | None = None,
+    **kwargs,
 ) -> ReadMessage:
+    if opts is None:
+        opts = _MessageOptions()
+    if kwargs:
+        opts = replace(opts, **kwargs)
     return ReadMessage(
         message_id=id,
         sent_at=int(dt.timestamp()),
         dialog_id=0,
-        text=text,
-        sender_first_name=first_name,
-        sender_id=sender_id,
-        media_description=media_description,
-        reactions_display=reactions_display,
-        reply_to_msg_id=reply_to_msg_id,
+        text=opts.text,
+        sender_first_name=opts.first_name,
+        sender_id=opts.sender_id,
+        media_description=opts.media_description,
+        reactions_display=opts.reactions_display,
+        reply_to_msg_id=opts.reply_to_msg_id,
     )
 
 
@@ -397,27 +409,33 @@ def test_edited_marker_before_reactions() -> None:
 from types import SimpleNamespace
 
 
-def _rsn_msg(
-    sender_id=None,
-    sender_first_name=...,
-    *,
-    is_service=0,
-    out=0,
-    dialog_id=0,
-    effective_sender_id=None,
-):
+@dataclass(frozen=True)
+class _ResolveSenderOptions:
+    sender_id: object = None
+    sender_first_name: object = ...
+    is_service: int = 0
+    out: int = 0
+    dialog_id: int = 0
+    effective_sender_id: object = None
+
+
+def _rsn_msg(*, opts: _ResolveSenderOptions | None = None, **kwargs):
     """Build a minimal message-like object for resolve_sender_label / _resolve_sender_name.
 
     Uses sender_first_name directly (flat field) as ReadMessage does.
     """
-    first_name = None if sender_first_name is ... else sender_first_name
+    if opts is None:
+        opts = _ResolveSenderOptions()
+    if kwargs:
+        opts = replace(opts, **kwargs)
+    first_name = None if opts.sender_first_name is ... else opts.sender_first_name
     return SimpleNamespace(
-        sender_id=sender_id,
+        sender_id=opts.sender_id,
         sender_first_name=first_name,
-        is_service=is_service,
-        out=out,
-        dialog_id=dialog_id,
-        effective_sender_id=effective_sender_id,
+        is_service=opts.is_service,
+        out=opts.out,
+        dialog_id=opts.dialog_id,
+        effective_sender_id=opts.effective_sender_id,
     )
 
 

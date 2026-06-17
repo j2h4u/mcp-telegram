@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, replace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -70,30 +71,36 @@ def _split_rs_inbox_unread() -> dict:
     }
 
 
-def _dm_row(
-    *,
-    message_id: int = 1,
-    out: int = 0,
-    sent_at: int = 1_776_000_000,
-    text: str = "hello",
-    dialog_id: int = 111,
-    dialog_name: str | None = None,
-    sender_id: int | None = 111,
-    sender_first_name: str | None = "Alice",
-) -> dict:
+@dataclass(frozen=True)
+class _DMRowOptions:
+    message_id: int = 1
+    out: int = 0
+    sent_at: int = 1_776_000_000
+    text: str = "hello"
+    dialog_id: int = 111
+    dialog_name: str | None = None
+    sender_id: int | None = 111
+    sender_first_name: str | None = "Alice"
+
+
+def _dm_row(*, opts: _DMRowOptions | None = None, **kwargs) -> dict:
+    if opts is None:
+        opts = _DMRowOptions()
+    if kwargs:
+        opts = replace(opts, **kwargs)
     r: dict = {
-        "message_id": message_id,
-        "out": out,
-        "sent_at": sent_at,
-        "text": text,
-        "sender_id": sender_id,
-        "sender_first_name": sender_first_name,
+        "message_id": opts.message_id,
+        "out": opts.out,
+        "sent_at": opts.sent_at,
+        "text": opts.text,
+        "sender_id": opts.sender_id,
+        "sender_first_name": opts.sender_first_name,
         "is_service": 0,
-        "dialog_id": dialog_id,
-        "effective_sender_id": sender_id,
+        "dialog_id": opts.dialog_id,
+        "effective_sender_id": opts.sender_id,
     }
-    if dialog_name is not None:
-        r["dialog_name"] = dialog_name
+    if opts.dialog_name is not None:
+        r["dialog_name"] = opts.dialog_name
     return r
 
 
@@ -368,40 +375,46 @@ async def test_search_tool_backward_compat_no_read_state_per_dialog() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _unread_group(
-    *,
-    dialog_id: int,
-    display_name: str,
-    read_state: dict | None,
-    dialog_type: str | None,
-    category: str = "human",
-    msg_text: str = "hey",
-    msg_id: int = 1,
-) -> dict:
+@dataclass(frozen=True)
+class _UnreadGroupOptions:
+    dialog_id: int
+    display_name: str
+    read_state: dict | None
+    dialog_type: str | None
+    category: str = "human"
+    msg_text: str = "hey"
+    msg_id: int = 1
+
+
+def _unread_group(*, opts: _UnreadGroupOptions | None = None, **kwargs) -> dict:
+    if opts is None:
+        opts = _UnreadGroupOptions(dialog_id=0, display_name="", read_state=None, dialog_type=None)
+    if kwargs:
+        opts = replace(opts, **kwargs)
     g: dict = {
-        "dialog_id": dialog_id,
-        "display_name": display_name,
+        "dialog_id": opts.dialog_id,
+        "display_name": opts.display_name,
         "unread_count": 1,
         "unread_mentions_count": 0,
-        "category": category,
+        "category": opts.category,
         "messages": [
             {
-                "message_id": msg_id,
+                "message_id": opts.msg_id,
                 "out": 0,
                 "sent_at": 1_776_000_000,
-                "text": msg_text,
-                "sender_id": dialog_id,
-                "sender_first_name": display_name,
+                "text": opts.msg_text,
+                "sender_id": opts.dialog_id,
+                "sender_first_name": opts.display_name,
                 "is_service": 0,
-                "dialog_id": dialog_id,
-                "effective_sender_id": dialog_id,
+                "dialog_id": opts.dialog_id,
+                "effective_sender_id": opts.dialog_id,
             }
         ],
     }
-    if read_state is not None:
-        g["read_state"] = read_state
-    if dialog_type is not None:
-        g["dialog_type"] = dialog_type
+    if opts.read_state is not None:
+        g["read_state"] = opts.read_state
+    if opts.dialog_type is not None:
+        g["dialog_type"] = opts.dialog_type
     return g
 
 

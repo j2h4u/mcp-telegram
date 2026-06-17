@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -53,22 +54,26 @@ def mock_client() -> MagicMock:
 # --- helpers ----------------------------------------------------------------
 
 
-def _seed_dialog_row(
-    conn: sqlite3.Connection,
-    dialog_id: int,
-    *,
-    name: str = "Old",
-    type_: str = "user",
-    needs_refresh: int = 0,
-    hidden: int = 0,
-    snapshot_at: int = 1700000000,
-) -> None:
+@dataclass(frozen=True)
+class _DialogSeedOptions:
+    name: str = "Old"
+    type_: str = "user"
+    needs_refresh: int = 0
+    hidden: int = 0
+    snapshot_at: int = 1700000000
+
+
+def _seed_dialog_row(conn: sqlite3.Connection, dialog_id: int, *, opts: _DialogSeedOptions | None = None, **kwargs) -> None:
+    if opts is None:
+        opts = _DialogSeedOptions()
+    if kwargs:
+        opts = replace(opts, **kwargs)
     with conn:
         conn.execute(
             "INSERT INTO dialogs (dialog_id, name, type, archived, pinned, "
             "snapshot_at, hidden, needs_refresh) "
             "VALUES (?, ?, ?, 0, 0, ?, ?, ?)",
-            (dialog_id, name, type_, snapshot_at, hidden, needs_refresh),
+            (dialog_id, opts.name, opts.type_, opts.snapshot_at, opts.hidden, opts.needs_refresh),
         )
 
 
