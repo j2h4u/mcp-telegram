@@ -35,11 +35,10 @@ indent-width = 4
 target-version = "py314"
 
 [lint]
-# Pragmatic set: correctness (F, E, W, B), imports (I), modernization (UP),
-# ruff-specific (RUF), bugbear-adjacent simplifications (SIM). Excluding
-# stylistic/annotation/docstring/strictness categories that would flag the
-# entire codebase without changing correctness.
-select = ["E", "F", "I", "W", "B", "UP", "RUF", "SIM", "PIE", "ISC", "RSE", "FLY", "PGH", "LOG", "PLE", "C4", "DTZ", "N818", "PTH", "RET", "FURB", "PERF", "PLR0916", "PLR0917", "PLR1702", "PLR2004", "BLE"]
+# Strict quality gate, adapted from the sibling repo and widened for the
+# Telegram daemon shape: correctness, imports, modernization, bugbear-style
+# simplifications, pathlib/date discipline, and explicit complexity ratchets.
+select = ["E", "F", "I", "W", "B", "UP", "RUF", "SIM", "PIE", "ISC", "RSE", "FLY", "PGH", "LOG", "PLE", "C4", "DTZ", "N818", "PTH", "RET", "FURB", "PERF", "BLE", "PLR2004", "C901", "PLR0911", "PLR0912", "PLR0913", "PLR0914", "PLR0915", "PLR0916", "PLR0917", "PLR1702"]
 ignore = [
   "E501",   # line length — formatter handles this
   "B008",   # Typer default values
@@ -62,6 +61,10 @@ unfixable = []
 
 # Allow unused variables when underscore-prefixed.
 dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
+
+[lint.pylint]
+max-branches = 11
+max-statements = 45
 
 [lint.per-file-ignores]
 "tests/**" = [

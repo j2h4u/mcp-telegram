@@ -8,7 +8,7 @@ default:
     @just --list
 
 # Run all local source checks.
-check: fmt-check lint typecheck actionlint compile deadcode
+check: fmt-check lint typecheck-pyright typecheck-tests import-contracts actionlint compile deadcode
 
 # Run ruff over source, tests, and deploy helpers.
 lint:
@@ -22,17 +22,15 @@ fmt-check:
 typecheck:
     uv run mypy src/mcp_telegram deploy
 
-# Run basedpyright. Advisory for now; mypy remains the canonical type gate until
-# the basedpyright backlog is burned down.
+# Run basedpyright over the package and deploy helpers.
 typecheck-pyright:
     uv run basedpyright src/mcp_telegram deploy --warnings
 
-# Type-check tests with basedpyright. Advisory for now.
+# Type-check tests with basedpyright.
 typecheck-tests:
     uv run basedpyright tests --warnings
 
-# Check import-layer architecture contracts. Contract definitions will be added
-# incrementally once the package boundaries are explicit enough to ratchet.
+# Check import-layer architecture contracts.
 import-contracts:
     uv run lint-imports
 
@@ -100,7 +98,7 @@ fix:
     uv run ruff format src tests deploy
 
 # Run local checks, unit tests, rebuild the runtime, and smoke-test live MCP behavior.
-verify: check unit runtime-verify
+verify: check typecheck-tests unit runtime-verify
 
 # Show live Docker container state.
 runtime-status:
