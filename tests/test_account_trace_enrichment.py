@@ -21,6 +21,7 @@ from mcp_telegram.daemon_account_trace import (
     _messages_row_equal,
     _trace_candidate_dialogs,
     _trace_existing_message_bundle,
+    _TraceCandidateBuildRequest,
 )
 from mcp_telegram.daemon_api import DaemonAPIServer
 from mcp_telegram.sync_worker import (
@@ -149,7 +150,9 @@ def test_trace_candidate_dialogs_are_bounded_visible_and_strategy_labeled(trace_
         seed_synced_dialog(conn, dialog_id=dialog_id)
     conn.commit()
 
-    base_candidates = _trace_candidate_dialogs(conn, 101, [], max_dialogs=10)
+    base_candidates = _trace_candidate_dialogs(
+        _TraceCandidateBuildRequest(conn=conn, target_user_id=101, observed_rows=[], max_dialogs=10)
+    )
     strategies = {candidate["dialog_type"]: candidate["strategy"] for candidate in base_candidates}
     assert strategies["User"] == "dialog_scan"
     assert strategies["Group"] == "author_search"
@@ -167,13 +170,17 @@ def test_trace_candidate_dialogs_are_bounded_visible_and_strategy_labeled(trace_
         seed_synced_dialog(conn, dialog_id=dialog_id)
     conn.commit()
 
-    candidates = _trace_candidate_dialogs(conn, 101, [], max_dialogs=10)
+    candidates = _trace_candidate_dialogs(
+        _TraceCandidateBuildRequest(conn=conn, target_user_id=101, observed_rows=[], max_dialogs=10)
+    )
 
     ids = [candidate["dialog_id"] for candidate in candidates]
     assert -2001 not in ids
     assert -2002 not in ids
     assert len(candidates) == 10
-    assert candidates == _trace_candidate_dialogs(conn, 101, [], max_dialogs=10)
+    assert candidates == _trace_candidate_dialogs(
+        _TraceCandidateBuildRequest(conn=conn, target_user_id=101, observed_rows=[], max_dialogs=10)
+    )
 
 
 def test_trace_candidate_dialogs_include_cached_common_chats(trace_enrichment_server) -> None:
@@ -187,7 +194,14 @@ def test_trace_candidate_dialogs_include_cached_common_chats(trace_enrichment_se
     )
     conn.commit()
 
-    candidates = _trace_candidate_dialogs(conn, 101, [], max_dialogs=10)
+    candidates = _trace_candidate_dialogs(
+        _TraceCandidateBuildRequest(
+            conn=conn,
+            target_user_id=101,
+            observed_rows=[],
+            max_dialogs=10,
+        )
+    )
 
     assert candidates[0]["dialog_id"] == -5001
     assert candidates[0]["origin"] == "cached_common_chat"

@@ -5648,18 +5648,23 @@ def test_linked_group_enrolled_in_activity_dialog_state() -> None:
 
 def test_trace_candidate_includes_linked_group_as_author_search() -> None:
     """(b) _trace_candidate_dialogs adds linked supergroup as author_search candidate."""
-    from mcp_telegram.daemon_account_trace import _trace_candidate_dialogs
+    from mcp_telegram.daemon_account_trace import (
+        _trace_candidate_dialogs,
+        _TraceCandidateBuildRequest,
+    )
 
     conn = _make_trace_db()
     _seed_channel_with_linked_chat(conn)
 
     linked_chat_map = {_CHANNEL_ID: _LINKED_CHAT_ID}
     candidates = _trace_candidate_dialogs(
-        conn,
-        _TARGET_USER_ID,
-        [],
-        exact_dialog_id=_CHANNEL_ID,
-        linked_chat_map=linked_chat_map,
+        _TraceCandidateBuildRequest(
+            conn=conn,
+            target_user_id=_TARGET_USER_ID,
+            observed_rows=[],
+            exact_dialog_id=_CHANNEL_ID,
+            linked_chat_map=linked_chat_map,
+        )
     )
 
     strategies = {c["dialog_id"]: c["strategy"] for c in candidates}
@@ -5686,7 +5691,10 @@ def test_trace_query_returns_messages_under_linked_chat_id() -> None:
     """(c) A channel-scoped trace with scope_dialog_ids=[channel, linked] returns
     messages stored under linked_chat_id — not just the channel's dialog_id.
     """
-    from mcp_telegram.daemon_account_trace import _build_trace_account_messages_query
+    from mcp_telegram.daemon_account_trace import (
+        _build_trace_account_messages_query,
+        _TraceMessageQueryRequest,
+    )
 
     conn = _make_trace_db()
     _seed_channel_with_linked_chat(conn)
@@ -5696,11 +5704,13 @@ def test_trace_query_returns_messages_under_linked_chat_id() -> None:
 
     scope_dialog_ids = [_CHANNEL_ID, _LINKED_CHAT_ID]
     sql, params = _build_trace_account_messages_query(
-        target_user_id=_TARGET_USER_ID,
-        self_id=_TARGET_USER_ID,
-        limit=50,
-        exact_dialog_id=_CHANNEL_ID,
-        scope_dialog_ids=scope_dialog_ids,
+        _TraceMessageQueryRequest(
+            target_user_id=_TARGET_USER_ID,
+            self_id=_TARGET_USER_ID,
+            limit=50,
+            exact_dialog_id=_CHANNEL_ID,
+            scope_dialog_ids=scope_dialog_ids,
+        )
     )
 
     rows = conn.execute(sql, params).fetchall()
@@ -5715,15 +5725,20 @@ def test_trace_query_returns_messages_under_linked_chat_id() -> None:
 
 def test_trace_query_uses_in_filter_for_scope_dialog_ids() -> None:
     """(d) When scope_dialog_ids is set, the built SQL contains 'IN' not '= :exact_dialog_id'."""
-    from mcp_telegram.daemon_account_trace import _build_trace_account_messages_query
+    from mcp_telegram.daemon_account_trace import (
+        _build_trace_account_messages_query,
+        _TraceMessageQueryRequest,
+    )
 
     scope_dialog_ids = [_CHANNEL_ID, _LINKED_CHAT_ID]
     sql, params = _build_trace_account_messages_query(
-        target_user_id=_TARGET_USER_ID,
-        self_id=_TARGET_USER_ID,
-        limit=50,
-        exact_dialog_id=_CHANNEL_ID,
-        scope_dialog_ids=scope_dialog_ids,
+        _TraceMessageQueryRequest(
+            target_user_id=_TARGET_USER_ID,
+            self_id=_TARGET_USER_ID,
+            limit=50,
+            exact_dialog_id=_CHANNEL_ID,
+            scope_dialog_ids=scope_dialog_ids,
+        )
     )
 
     # SQL must use IN(...) parameterized form.
@@ -5746,7 +5761,10 @@ def test_trace_query_uses_in_filter_for_scope_dialog_ids() -> None:
 
 def test_trace_query_authorship_predicate_unchanged() -> None:
     """(e) scope_dialog_ids does not widen authorship — target_user_id still filters sender."""
-    from mcp_telegram.daemon_account_trace import _build_trace_account_messages_query
+    from mcp_telegram.daemon_account_trace import (
+        _build_trace_account_messages_query,
+        _TraceMessageQueryRequest,
+    )
 
     conn = _make_trace_db()
     _seed_channel_with_linked_chat(conn)
@@ -5763,11 +5781,13 @@ def test_trace_query_authorship_predicate_unchanged() -> None:
 
     scope_dialog_ids = [_CHANNEL_ID, _LINKED_CHAT_ID]
     sql, params = _build_trace_account_messages_query(
-        target_user_id=_TARGET_USER_ID,
-        self_id=_TARGET_USER_ID,
-        limit=50,
-        exact_dialog_id=_CHANNEL_ID,
-        scope_dialog_ids=scope_dialog_ids,
+        _TraceMessageQueryRequest(
+            target_user_id=_TARGET_USER_ID,
+            self_id=_TARGET_USER_ID,
+            limit=50,
+            exact_dialog_id=_CHANNEL_ID,
+            scope_dialog_ids=scope_dialog_ids,
+        )
     )
 
     rows = conn.execute(sql, params).fetchall()
@@ -5814,18 +5834,23 @@ def test_trace_navigation_token_carries_scope_dialog_ids() -> None:
     assert decoded.exact_dialog_id == _CHANNEL_ID
 
     # Feeding the decoded scope back into the query builder must produce IN(...).
-    from mcp_telegram.daemon_account_trace import _build_trace_account_messages_query
+    from mcp_telegram.daemon_account_trace import (
+        _build_trace_account_messages_query,
+        _TraceMessageQueryRequest,
+    )
 
     conn = _make_trace_db()
     _seed_channel_with_linked_chat(conn)
     _insert_own_message(conn, _LINKED_CHAT_ID, message_id=43, sender_id=_TARGET_USER_ID)
 
     sql, params = _build_trace_account_messages_query(
-        target_user_id=_TARGET_USER_ID,
-        self_id=_TARGET_USER_ID,
-        limit=50,
-        exact_dialog_id=_CHANNEL_ID,
-        scope_dialog_ids=decoded.scope_dialog_ids,
+        _TraceMessageQueryRequest(
+            target_user_id=_TARGET_USER_ID,
+            self_id=_TARGET_USER_ID,
+            limit=50,
+            exact_dialog_id=_CHANNEL_ID,
+            scope_dialog_ids=decoded.scope_dialog_ids,
+        )
     )
 
     assert "IN (" in sql, "second-page query does not use IN(...) from token-carried scope"
@@ -5840,14 +5865,19 @@ def test_trace_navigation_token_carries_scope_dialog_ids() -> None:
 
 def test_trace_query_scalar_filter_when_no_scope_dialog_ids() -> None:
     """(g) When scope_dialog_ids is absent, the scalar m.dialog_id = :exact_dialog_id is used."""
-    from mcp_telegram.daemon_account_trace import _build_trace_account_messages_query
+    from mcp_telegram.daemon_account_trace import (
+        _build_trace_account_messages_query,
+        _TraceMessageQueryRequest,
+    )
 
     sql, params = _build_trace_account_messages_query(
-        target_user_id=_TARGET_USER_ID,
-        self_id=_TARGET_USER_ID,
-        limit=50,
-        exact_dialog_id=_CHANNEL_ID,
-        scope_dialog_ids=None,
+        _TraceMessageQueryRequest(
+            target_user_id=_TARGET_USER_ID,
+            self_id=_TARGET_USER_ID,
+            limit=50,
+            exact_dialog_id=_CHANNEL_ID,
+            scope_dialog_ids=None,
+        )
     )
 
     assert "= :exact_dialog_id" in sql, "scalar filter missing when scope_dialog_ids=None"
@@ -5857,7 +5887,10 @@ def test_trace_query_scalar_filter_when_no_scope_dialog_ids() -> None:
 
 def test_trace_candidate_no_discussion_group_stays_signature_only() -> None:
     """(g) A channel with no linked_chat_map entry stays signature_only; no expansion."""
-    from mcp_telegram.daemon_account_trace import _trace_candidate_dialogs
+    from mcp_telegram.daemon_account_trace import (
+        _trace_candidate_dialogs,
+        _TraceCandidateBuildRequest,
+    )
 
     conn = _make_trace_db()
     # Register a plain broadcast channel — no linked chat.
@@ -5873,11 +5906,13 @@ def test_trace_candidate_no_discussion_group_stays_signature_only() -> None:
 
     # Pass an EMPTY linked_chat_map (no discussion group resolved).
     candidates = _trace_candidate_dialogs(
-        conn,
-        _TARGET_USER_ID,
-        [],
-        exact_dialog_id=_CHANNEL_ID,
-        linked_chat_map={},
+        _TraceCandidateBuildRequest(
+            conn=conn,
+            target_user_id=_TARGET_USER_ID,
+            observed_rows=[],
+            exact_dialog_id=_CHANNEL_ID,
+            linked_chat_map={},
+        )
     )
 
     dialog_ids = {c["dialog_id"] for c in candidates}

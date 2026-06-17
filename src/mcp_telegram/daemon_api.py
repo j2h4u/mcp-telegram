@@ -90,6 +90,10 @@ from .daemon_account_trace import (
     _trace_existing_message_bundle,
     _trace_increment_status,
     _trace_strategy_for_dialog,
+    _TraceCandidateBuildRequest,
+    _TraceCoverageFragmentUpsertRequest,
+    _TraceGapBuildRequest,
+    _TraceMessageQueryRequest,
     _unique_trace_aliases,
     _unresolved_trace_account,
     _upsert_trace_coverage_fragment,
@@ -1597,14 +1601,16 @@ class DaemonAPIServer:
                 "signature_only": "unsupported",
             }[strategy]
             _upsert_trace_coverage_fragment(
-                self._conn,
-                target_user_id=target_user_id,
-                dialog_id=dialog_id,
-                topic_id=topic_id,
-                status=status,
-                fetched_at=now,
-                last_error=f"{strategy}:no_author_search",
-                now=now,
+                _TraceCoverageFragmentUpsertRequest(
+                    conn=self._conn,
+                    target_user_id=target_user_id,
+                    dialog_id=dialog_id,
+                    topic_id=topic_id,
+                    status=status,
+                    fetched_at=now,
+                    last_error=f"{strategy}:no_author_search",
+                    now=now,
+                )
             )
             result["status"] = status
             result["skipped"] = 1
@@ -1612,13 +1618,15 @@ class DaemonAPIServer:
 
         if time.monotonic() >= deadline_at:
             _upsert_trace_coverage_fragment(
-                self._conn,
-                target_user_id=target_user_id,
-                dialog_id=dialog_id,
-                topic_id=topic_id,
-                status="budget_exceeded",
-                last_error=f"BudgetExceeded:{deadline_ms}",
-                now=now,
+                _TraceCoverageFragmentUpsertRequest(
+                    conn=self._conn,
+                    target_user_id=target_user_id,
+                    dialog_id=dialog_id,
+                    topic_id=topic_id,
+                    status="budget_exceeded",
+                    last_error=f"BudgetExceeded:{deadline_ms}",
+                    now=now,
+                )
             )
             result["status"] = "budget_exceeded"
             result["skipped"] = 1
@@ -1640,50 +1648,58 @@ class DaemonAPIServer:
         except FloodWaitError as exc:
             seconds = int(getattr(exc, "seconds", 0))
             _upsert_trace_coverage_fragment(
-                self._conn,
-                target_user_id=target_user_id,
-                dialog_id=dialog_id,
-                topic_id=topic_id,
-                status="flood_wait",
-                last_error=f"FloodWaitError:{seconds}",
-                next_retry_at=now + seconds,
-                now=now,
+                _TraceCoverageFragmentUpsertRequest(
+                    conn=self._conn,
+                    target_user_id=target_user_id,
+                    dialog_id=dialog_id,
+                    topic_id=topic_id,
+                    status="flood_wait",
+                    last_error=f"FloodWaitError:{seconds}",
+                    next_retry_at=now + seconds,
+                    now=now,
+                )
             )
             result["status"] = "flood_wait"
             return result
         except _ACCESS_LOST_ERRORS as exc:
             _upsert_trace_coverage_fragment(
-                self._conn,
-                target_user_id=target_user_id,
-                dialog_id=dialog_id,
-                topic_id=topic_id,
-                status="access_lost",
-                last_error=type(exc).__name__,
-                now=now,
+                _TraceCoverageFragmentUpsertRequest(
+                    conn=self._conn,
+                    target_user_id=target_user_id,
+                    dialog_id=dialog_id,
+                    topic_id=topic_id,
+                    status="access_lost",
+                    last_error=type(exc).__name__,
+                    now=now,
+                )
             )
             result["status"] = "access_lost"
             return result
         except RPCError as exc:
             _upsert_trace_coverage_fragment(
-                self._conn,
-                target_user_id=target_user_id,
-                dialog_id=dialog_id,
-                topic_id=topic_id,
-                status="partial",
-                last_error=type(exc).__name__,
-                now=now,
+                _TraceCoverageFragmentUpsertRequest(
+                    conn=self._conn,
+                    target_user_id=target_user_id,
+                    dialog_id=dialog_id,
+                    topic_id=topic_id,
+                    status="partial",
+                    last_error=type(exc).__name__,
+                    now=now,
+                )
             )
             result["status"] = "partial"
             return result
         except (RuntimeError, TypeError, AttributeError, ValueError, sqlite3.Error) as exc:
             _upsert_trace_coverage_fragment(
-                self._conn,
-                target_user_id=target_user_id,
-                dialog_id=dialog_id,
-                topic_id=topic_id,
-                status="partial",
-                last_error=type(exc).__name__,
-                now=now,
+                _TraceCoverageFragmentUpsertRequest(
+                    conn=self._conn,
+                    target_user_id=target_user_id,
+                    dialog_id=dialog_id,
+                    topic_id=topic_id,
+                    status="partial",
+                    last_error=type(exc).__name__,
+                    now=now,
+                )
             )
             result["status"] = "partial"
             return result
@@ -1716,14 +1732,16 @@ class DaemonAPIServer:
         if time.monotonic() >= deadline_at:
             status = "budget_exceeded"
         _upsert_trace_coverage_fragment(
-            self._conn,
-            target_user_id=target_user_id,
-            dialog_id=dialog_id,
-            topic_id=topic_id,
-            status=status,
-            fetched_at=now,
-            last_error=f"BudgetExceeded:{deadline_ms}" if status == "budget_exceeded" else None,
-            now=now,
+            _TraceCoverageFragmentUpsertRequest(
+                conn=self._conn,
+                target_user_id=target_user_id,
+                dialog_id=dialog_id,
+                topic_id=topic_id,
+                status=status,
+                fetched_at=now,
+                last_error=f"BudgetExceeded:{deadline_ms}" if status == "budget_exceeded" else None,
+                now=now,
+            )
         )
         result["status"] = status
         return result
@@ -1750,13 +1768,15 @@ class DaemonAPIServer:
         overflow = candidate_dialogs[max_dialogs:]
         for candidate in overflow:
             _upsert_trace_coverage_fragment(
-                self._conn,
-                target_user_id=target_user_id,
-                dialog_id=int(candidate["dialog_id"]),
-                topic_id=candidate.get("topic_id"),
-                status="budget_exceeded",
-                last_error=f"BudgetExceeded:{deadline_ms}",
-                now=now,
+                _TraceCoverageFragmentUpsertRequest(
+                    conn=self._conn,
+                    target_user_id=target_user_id,
+                    dialog_id=int(candidate["dialog_id"]),
+                    topic_id=candidate.get("topic_id"),
+                    status="budget_exceeded",
+                    last_error=f"BudgetExceeded:{deadline_ms}",
+                    now=now,
+                )
             )
             result["dialogs_skipped"] += 1
             _trace_increment_status(result, "budget_exceeded")
@@ -1768,13 +1788,15 @@ class DaemonAPIServer:
         if deadline_ms <= 0:
             for candidate in selected:
                 _upsert_trace_coverage_fragment(
-                    self._conn,
-                    target_user_id=target_user_id,
-                    dialog_id=int(candidate["dialog_id"]),
-                    topic_id=candidate.get("topic_id"),
-                    status="budget_exceeded",
-                    last_error=f"BudgetExceeded:{deadline_ms}",
-                    now=now,
+                    _TraceCoverageFragmentUpsertRequest(
+                        conn=self._conn,
+                        target_user_id=target_user_id,
+                        dialog_id=int(candidate["dialog_id"]),
+                        topic_id=candidate.get("topic_id"),
+                        status="budget_exceeded",
+                        last_error=f"BudgetExceeded:{deadline_ms}",
+                        now=now,
+                    )
                 )
                 result["dialogs_skipped"] += 1
                 _trace_increment_status(result, "budget_exceeded")
@@ -1921,16 +1943,18 @@ class DaemonAPIServer:
 
         post_author_aliases = _trace_post_author_aliases(resolved_account)
         sql, params = _build_trace_account_messages_query(
-            target_user_id=target_user_id,
-            self_id=self.self_id,
-            limit=limit + 1,
-            post_author_aliases=post_author_aliases,
-            exact_dialog_id=exact_dialog_id,
-            exact_topic_id=exact_topic_id,
-            sent_after_ts=sent_after_ts,
-            sent_before_ts=sent_before_ts,
-            navigation=navigation_payload,
-            scope_dialog_ids=scope_dialog_ids,
+            _TraceMessageQueryRequest(
+                target_user_id=target_user_id,
+                self_id=self.self_id,
+                limit=limit + 1,
+                post_author_aliases=post_author_aliases,
+                exact_dialog_id=exact_dialog_id,
+                exact_topic_id=exact_topic_id,
+                sent_after_ts=sent_after_ts,
+                sent_before_ts=sent_before_ts,
+                navigation=navigation_payload,
+                scope_dialog_ids=scope_dialog_ids,
+            )
         )
 
         def run_trace_query() -> tuple[list[sqlite3.Row], list[sqlite3.Row], list[dict], str | None]:
@@ -1958,12 +1982,14 @@ class DaemonAPIServer:
         enrichment: dict | None = None
         if coverage_goal == "best_effort_visible":
             candidates = _trace_candidate_dialogs(
-                self._conn,
-                target_user_id,
-                selected_rows,
-                exact_dialog_id=exact_dialog_id,
-                exact_topic_id=exact_topic_id,
-                linked_chat_map=linked_chat_map,
+                _TraceCandidateBuildRequest(
+                    conn=self._conn,
+                    target_user_id=target_user_id,
+                    observed_rows=selected_rows,
+                    exact_dialog_id=exact_dialog_id,
+                    exact_topic_id=exact_topic_id,
+                    linked_chat_map=linked_chat_map,
+                )
             )
             enrichment = await self._trace_enrich_visible_dialogs(target_user_id, candidates)
             _, selected_rows, evidence, next_navigation = run_trace_query()
@@ -1981,12 +2007,14 @@ class DaemonAPIServer:
             exact_topic_id=exact_topic_id,
         )
         gaps = _build_trace_gaps(
-            self._conn,
-            target_user_id=target_user_id,
-            evidence=evidence,
-            coverage=coverage,
-            exact_dialog_id=exact_dialog_id,
-            exact_topic_id=exact_topic_id,
+            _TraceGapBuildRequest(
+                conn=self._conn,
+                target_user_id=target_user_id,
+                evidence=evidence,
+                coverage=coverage,
+                exact_dialog_id=exact_dialog_id,
+                exact_topic_id=exact_topic_id,
+            )
         )
         data: dict[str, Any] = {
             "resolved_account": resolved_account,

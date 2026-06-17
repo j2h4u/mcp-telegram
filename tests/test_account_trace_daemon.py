@@ -22,6 +22,8 @@ from mcp_telegram.daemon_account_trace import (
     _build_trace_account_messages_query,
     _build_trace_coverage,
     _get_trace_coverage_fragments,
+    _TraceCoverageFragmentUpsertRequest,
+    _TraceMessageQueryRequest,
     _upsert_trace_coverage_fragment,
 )
 from mcp_telegram.daemon_api import DaemonAPIServer
@@ -265,20 +267,24 @@ def test_trace_fragment_helpers_preserve_created_at_and_store_retry(trace_server
     _server, conn, _client = trace_server
 
     _upsert_trace_coverage_fragment(
-        conn,
-        target_user_id=101,
-        dialog_id=-100123,
-        status="flood_wait",
-        next_retry_at=1_700_000_120,
-        last_error="FloodWaitError:120",
-        now=1_700_000_000,
+        _TraceCoverageFragmentUpsertRequest(
+            conn=conn,
+            target_user_id=101,
+            dialog_id=-100123,
+            status="flood_wait",
+            next_retry_at=1_700_000_120,
+            last_error="FloodWaitError:120",
+            now=1_700_000_000,
+        )
     )
     _upsert_trace_coverage_fragment(
-        conn,
-        target_user_id=101,
-        dialog_id=-100123,
-        status="complete",
-        now=1_700_000_060,
+        _TraceCoverageFragmentUpsertRequest(
+            conn=conn,
+            target_user_id=101,
+            dialog_id=-100123,
+            status="complete",
+            now=1_700_000_060,
+        )
     )
     conn.commit()
 
@@ -415,14 +421,16 @@ async def test_trace_ambiguous_account_gap_has_candidate_ids(trace_server) -> No
 
 def test_trace_query_uses_effective_sender_topic_and_signature_params() -> None:
     sql, params = _build_trace_account_messages_query(
-        target_user_id=101,
-        self_id=101,
-        limit=51,
-        post_author_aliases=["Alice Example", "alice"],
-        exact_dialog_id=-100123,
-        exact_topic_id=5,
-        sent_after_ts=1_700_000_000,
-        sent_before_ts=1_700_100_000,
+        _TraceMessageQueryRequest(
+            target_user_id=101,
+            self_id=101,
+            limit=51,
+            post_author_aliases=["Alice Example", "alice"],
+            exact_dialog_id=-100123,
+            exact_topic_id=5,
+            sent_after_ts=1_700_000_000,
+            sent_before_ts=1_700_100_000,
+        )
     )
 
     assert "CASE WHEN m.is_service = 1 THEN NULL" in sql
