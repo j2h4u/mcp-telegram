@@ -411,6 +411,74 @@ async def test_auto_enroll_writes_tombstone_for_nameless_sender(
 
 
 @pytest.mark.asyncio
+async def test_auto_enroll_handles_sender_without_name_attrs(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """Auto-enroll tolerates sender objects missing first_name and last_name."""
+    dialog_id = 7014
+    sender = SimpleNamespace(username="channel_like")
+
+    msg = build_mock_message(id=1, text="beep")
+    event = cast(
+        _NewMessageEvent,
+        SimpleNamespace(
+            chat_id=dialog_id,
+            message=msg,
+            is_private=True,
+            get_sender=AsyncMock(return_value=sender),
+        ),
+    )
+
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+    manager.register()
+    await manager.on_new_message(event)
+
+    row = sync_db.execute(
+        "SELECT name, username FROM entities WHERE id=?",
+        (dialog_id,),
+    ).fetchone()
+    assert row is not None, "entity row must be written even when sender lacks name attrs"
+    assert row[0] is None
+    assert row[1] == "channel_like"
+
+
+@pytest.mark.asyncio
+async def test_auto_enroll_handles_non_string_sender_name_fields(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """Auto-enroll ignores non-string first_name/last_name/username values."""
+    dialog_id = 7015
+    sender = SimpleNamespace(first_name=123, last_name=[], username={"u": "bad"})
+
+    msg = build_mock_message(id=1, text="beep")
+    event = cast(
+        _NewMessageEvent,
+        SimpleNamespace(
+            chat_id=dialog_id,
+            message=msg,
+            is_private=True,
+            get_sender=AsyncMock(return_value=sender),
+        ),
+    )
+
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+    manager.register()
+    await manager.on_new_message(event)
+
+    row = sync_db.execute(
+        "SELECT name, username FROM entities WHERE id=?",
+        (dialog_id,),
+    ).fetchone()
+    assert row is not None, "entity row must be written with non-string sender fields"
+    assert row[0] is None
+    assert row[1] is None
+
+
+@pytest.mark.asyncio
 async def test_on_new_message_updates_last_event_at(
     mock_client: MagicMock,
     sync_db: _SQLiteConnection,

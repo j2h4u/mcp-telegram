@@ -43,9 +43,18 @@ class _MessageLike(Protocol):
     reactions: _ReactionResult | None
 
 
+def _first_non_empty_str(*values: object) -> str | None:
+    for value in values:
+        if isinstance(value, str) and value != "":
+            return value
+    return None
+
+
 def _extract_sender_first_name(msg: _MessageLike) -> str | None:
     sender = msg.sender
-    return sender.first_name if sender is not None else None
+    if sender is None:
+        return None
+    return _first_non_empty_str(getattr(sender, "first_name", None), getattr(sender, "title", None))
 
 
 def _timestamp_to_int(value: _SupportsTimestamp | None, *, msg_id: object = None) -> int:

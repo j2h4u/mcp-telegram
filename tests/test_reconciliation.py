@@ -566,6 +566,48 @@ async def test_refresh_forum_topics_upserts(
 
 
 @pytest.mark.asyncio
+async def test_refresh_forum_topics_topic_without_is_general_defaults_to_id_check(
+    sync_db: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """Missing topic.is_general attribute should not crash and still infer general topic by id."""
+    entity = MagicMock()
+    entity.forum = True
+
+    topic_without_is_general = SimpleNamespace(
+        id=1,
+        title="General",
+        icon_emoji_id=123,
+        date=None,
+    )
+
+    topic_without_is_general_or_id = SimpleNamespace(
+        id=22,
+        title="Side",
+        icon_emoji_id=456,
+        date=None,
+    )
+
+    mock_result = MagicMock()
+    mock_result.topics = [topic_without_is_general, topic_without_is_general_or_id]
+
+    client = AsyncMock()
+    client.return_value = mock_result
+
+    worker = DialogReconciliationWorker(client, sync_db, shutdown_event)
+    count = await worker._refresh_forum_topics(dialog_id=1001, entity=entity)
+
+    assert count == 2
+    rows = cast(
+        list[tuple[int, int]],
+        sync_db.execute(
+            "SELECT topic_id, is_general FROM topic_metadata WHERE dialog_id=1001 ORDER BY topic_id"
+        ).fetchall(),
+    )
+    assert rows == [(1, 1), (22, 0)]
+
+
+@pytest.mark.asyncio
 async def test_light_pass_refreshes_forum_topics(
     sync_db: sqlite3.Connection,
     mock_client: MagicMock,

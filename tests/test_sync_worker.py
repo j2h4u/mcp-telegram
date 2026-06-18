@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from collections.abc import AsyncIterator, Iterator
-from datetime import UTC
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Protocol, cast
@@ -1597,6 +1597,76 @@ def test_extract_message_row_populates_v7_columns() -> None:
     assert result_none.message.edit_date is None
     assert result_none.message.grouped_id is None
     assert result_none.message.reply_to_peer_id is None
+
+
+def test_extract_message_row_prefers_channel_title_when_first_name_missing() -> None:
+    """Channel/chat-like sender uses title if first_name is unavailable."""
+    from mcp_telegram.sync_worker import extract_message_row
+
+    msg = SimpleNamespace(
+        id=700,
+        date=datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC),
+        message="channel message",
+        sender_id=123,
+        sender=SimpleNamespace(title="Channel title"),
+        media=None,
+        reply_to=None,
+        reactions=None,
+        edit_date=None,
+        grouped_id=None,
+        fwd_from=None,
+        entities=None,
+    )
+    result = extract_message_row(1, msg)
+
+    assert result.message.sender_first_name == "Channel title"
+
+
+def test_extract_message_row_prefers_channel_title_when_first_name_is_non_string() -> None:
+    """Non-string first_name should be ignored and title used as fallback."""
+    from mcp_telegram.sync_worker import extract_message_row
+
+    msg = SimpleNamespace(
+        id=702,
+        date=datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC),
+        message="channel message",
+        sender_id=123,
+        sender=SimpleNamespace(first_name=123, title="Channel title"),
+        media=None,
+        reply_to=None,
+        reactions=None,
+        edit_date=None,
+        grouped_id=None,
+        fwd_from=None,
+        entities=None,
+    )
+    result = extract_message_row(1, msg)
+
+    assert result.message.sender_first_name == "Channel title"
+
+
+def test_extract_message_row_returns_none_when_sender_has_no_name_fields() -> None:
+    """Missing first_name/title should not raise and should return None."""
+    from mcp_telegram.sync_worker import extract_message_row
+
+    sender = SimpleNamespace(other_field="X")
+    msg = SimpleNamespace(
+        id=701,
+        date=datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC),
+        message="no name",
+        sender_id=456,
+        sender=sender,
+        media=None,
+        reply_to=None,
+        reactions=None,
+        edit_date=None,
+        grouped_id=None,
+        fwd_from=None,
+        entities=None,
+    )
+    result = extract_message_row(1, msg)
+
+    assert result.message.sender_first_name is None
 
 
 # ---------------------------------------------------------------------------

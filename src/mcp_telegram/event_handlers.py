@@ -163,6 +163,14 @@ _DM_AUTO_ENROLL_SENDER_EXCEPTIONS: tuple[type[BaseException], ...] = (
     Exception,
 )
 
+
+def _first_non_empty_str(*values: object) -> str | None:
+    for value in values:
+        if isinstance(value, str) and value != "":
+            return value
+    return None
+
+
 # ---------------------------------------------------------------------------
 # SQL constants
 # ---------------------------------------------------------------------------
@@ -392,8 +400,9 @@ class EventHandlerManager:
         if sender is None:
             return
         try:
-            first = sender.first_name or ""
-            last = sender.last_name or ""
+            first = _first_non_empty_str(getattr(sender, "first_name", None)) or ""
+            last = _first_non_empty_str(getattr(sender, "last_name", None)) or ""
+            username = _first_non_empty_str(getattr(sender, "username", None))
             name: str | None = f"{first} {last}".strip() or None
             entity_type_str = DialogType.from_entity(sender).value
             with self._conn:
@@ -403,7 +412,7 @@ class EventHandlerManager:
                         dialog_id,
                         entity_type_str,
                         name,
-                        sender.username,
+                        username,
                         latinize(name) if name else None,
                         int(time.time()),
                     ),

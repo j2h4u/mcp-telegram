@@ -200,7 +200,6 @@ class _DialogLike(Protocol):
 class _ForumTopicLike(Protocol):
     id: int
     title: str | None
-    is_general: bool
     icon_emoji_id: int | None
     date: datetime | None
 
@@ -367,6 +366,13 @@ UPSERT_ENTITY_SQL = (
 
 def _attr[T](obj: object, name: str, default: T) -> T:
     return cast(T, getattr(obj, name, default))
+
+
+def _first_non_empty_str(*values: object) -> str | None:
+    for value in values:
+        if isinstance(value, str) and value != "":
+            return value
+    return None
 
 
 def extract_reply_and_topic(msg: object) -> tuple[int | None, int | None]:
@@ -733,7 +739,9 @@ def _extract_sent_at(msg: object) -> int:
 
 def _extract_sender_first_name(msg: object) -> str | None:
     sender = _attr(msg, "sender", None)
-    return sender.first_name if sender is not None else None
+    if sender is None:
+        return None
+    return _first_non_empty_str(_attr(sender, "first_name", None), _attr(sender, "title", None))
 
 
 def _extract_media_description(msg: object) -> str | None:

@@ -92,6 +92,17 @@ class _DraftLike(Protocol):
     message: str | None
 
 
+def _extract_draft_text(draft: object) -> str | None:
+    if draft is None:
+        return None
+
+    for field in ("message", "text", "message_text"):
+        value = getattr(draft, field, None)
+        if isinstance(value, str):
+            return value[:80] if value else None
+    return None
+
+
 class _MessageLike(Protocol):
     date: datetime | None
 
@@ -111,7 +122,6 @@ class _DialogLike(Protocol):
 class _ForumTopicLike(Protocol):
     id: int
     title: str | None
-    is_general: bool
     icon_emoji_id: int | None
     date: datetime | None
 
@@ -378,7 +388,7 @@ def _extract_dialog_row(dialog: _DialogLike, snapshot_at: int) -> _BootstrapRow:
     extra RPCs:
     - D-08: members/created from dialog.entity (Channel/Chat); NULL for User.
     - D-09: unread_mentions/reactions from dialog directly.
-    - D-10: draft_text = dialog.draft.message[:80] (DIFF-03 truncation).
+    - D-10: draft_text = normalized dialog.draft text (DIFF-03 truncation).
     - D-11: needs_refresh = 0 for all bootstrap rows (handled in INSERT clause).
     """
     entity = dialog.entity
@@ -399,13 +409,8 @@ def _extract_dialog_row(dialog: _DialogLike, snapshot_at: int) -> _BootstrapRow:
     unread_mentions = int(dialog.unread_mentions_count or 0)
     unread_reactions = int(dialog.unread_reactions_count or 0)
 
-    # D-10: draft_text = dialog.draft.message[:80] if present, else NULL.
-    draft = dialog.draft
-    draft_text: str | None = None
-    if draft is not None:
-        msg = draft.message
-        if msg:
-            draft_text = msg[:80]  # DIFF-03
+    # D-10: draft_text = best available draft text truncated to 80 chars.
+    draft_text = _extract_draft_text(dialog.draft)  # DIFF-03
 
     return {
         "dialog_id": int(dialog.id),
@@ -855,7 +860,7 @@ class DialogReconciliationWorker:
                 "dialog_id": dialog_id,
                 "topic_id": int(t.id),
                 "title": t.title or "",
-                "is_general": int(t.is_general or (int(t.id) == 1)),
+                "is_general": int(bool(_attr(t, "is_general", False)) or (int(t.id) == 1)),
                 "icon_emoji_id": t.icon_emoji_id,
                 "updated_at": now,
                 "snapshot_at": now,

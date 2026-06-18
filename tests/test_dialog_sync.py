@@ -36,6 +36,7 @@ from mcp_telegram.dialog_sync import (
     _clear_cursor,
     _decode_offset_peer,
     _encode_offset_peer,
+    _extract_dialog_row,
     _get_state,
     _set_state,
 )
@@ -63,6 +64,7 @@ class _DialogOptions:
     unread_mentions_count: int = 0
     unread_reactions_count: int = 0
     draft_message: str | None = None
+    draft_text: str | None = None
 
 
 def _make_user_entity(
@@ -149,7 +151,12 @@ def _make_dialog(
     if message_date is None:
         message_date = datetime(2024, 6, 1, 12, 0, tzinfo=UTC)
     msg = SimpleNamespace(date=message_date)
-    draft = SimpleNamespace(message=opts.draft_message) if opts.draft_message is not None else None
+    if opts.draft_message is not None:
+        draft = SimpleNamespace(message=opts.draft_message)
+    elif opts.draft_text is not None:
+        draft = SimpleNamespace(text=opts.draft_text)
+    else:
+        draft = None
     return SimpleNamespace(
         id=dialog_id,
         entity=entity,
@@ -541,6 +548,25 @@ class TestDialogsBootstrapWorker:
         )
         await worker.run()
         assert any("complete" in s for s in captured)
+
+
+def test_extract_dialog_row_with_draft_missing_message_prefers_text_field() -> None:
+    dialog = _make_dialog(1, _make_user_entity(1), opts=_DialogOptions(draft_text="hello from text field"))
+    row = _extract_dialog_row(dialog, 123)
+    assert row["draft_text"] == "hello from text field"
+
+
+def test_extract_dialog_row_with_long_draft_text_is_truncated() -> None:
+    long_text = "x" * 90
+    dialog = _make_dialog(3, _make_user_entity(3), opts=_DialogOptions(draft_text=long_text))
+    row = _extract_dialog_row(dialog, 123)
+    assert row["draft_text"] == long_text[:80]
+
+
+def test_extract_dialog_row_with_no_draft_text_keeps_none() -> None:
+    dialog = _make_dialog(2, _make_user_entity(2), opts=_DialogOptions(draft_message=None, draft_text=None))
+    row = _extract_dialog_row(dialog, 123)
+    assert row["draft_text"] is None
 
 
 # ---------------------------------------------------------------------------

@@ -3522,6 +3522,46 @@ def test_msg_to_dict_no_edit_date_is_none() -> None:
     assert result.get("edit_date") is None
 
 
+def test_msg_to_dict_uses_sender_title_when_first_name_missing() -> None:
+    """_msg_to_dict prefers first_name, then title, then None for sender name."""
+    mock_msg = MagicMock()
+    mock_msg.id = 302
+    mock_msg.date = SimpleNamespace(timestamp=lambda: 1700000000.0)
+    mock_msg.message = "channel message"
+    mock_msg.sender_id = 99
+    mock_msg.sender = SimpleNamespace(first_name=None, title="Channel title")
+    mock_msg.media = None
+    mock_msg.reply_to = None
+    mock_msg.reply_to_msg_id = None
+    mock_msg.forum_topic_id = None
+    mock_msg.reactions = None
+    mock_msg.edit_date = None
+
+    result = message_to_dict(cast(_MessageLike, mock_msg))
+
+    assert result["sender_first_name"] == "Channel title"
+
+
+def test_msg_to_dict_sender_without_name_attrs_returns_none() -> None:
+    """_msg_to_dict tolerates sender objects missing first_name/title attributes."""
+    mock_msg = MagicMock()
+    mock_msg.id = 303
+    mock_msg.date = SimpleNamespace(timestamp=lambda: 1700000000.0)
+    mock_msg.message = "no-name sender"
+    mock_msg.sender_id = 100
+    mock_msg.sender = SimpleNamespace()
+    mock_msg.media = None
+    mock_msg.reply_to = None
+    mock_msg.reply_to_msg_id = None
+    mock_msg.forum_topic_id = None
+    mock_msg.reactions = None
+    mock_msg.edit_date = None
+
+    result = message_to_dict(cast(_MessageLike, mock_msg))
+
+    assert result["sender_first_name"] is None
+
+
 # ---------------------------------------------------------------------------
 # _decode_history_navigation error paths (M-12)
 # ---------------------------------------------------------------------------
