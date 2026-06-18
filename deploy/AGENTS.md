@@ -6,18 +6,18 @@ This directory is the live deployment workspace, not the source checkout.
 
 - `docker-compose.yml` is the operative compose file for the running service.
 - `.env` contains Telegram API credentials and must stay private.
-- `database/` is bind-mounted to `/root/.local/state/mcp-telegram` inside the container.
-- `database/sync.db` is the live Telegram mirror.
-- `database/feedback.db` stores agent-submitted feedback.
-- `database/mcp_telegram_session.session` is the active Telegram account session.
-- `database/*-wal` and `database/*-shm` are normal SQLite WAL-mode sidecar files.
+- `/srv/mcp-telegram/database/` is bind-mounted to `/root/.local/state/mcp-telegram` inside the container.
+- `/srv/mcp-telegram/database/sync.db` is the live Telegram mirror.
+- `/srv/mcp-telegram/database/feedback.db` stores agent-submitted feedback.
+- `/srv/mcp-telegram/database/mcp_telegram_session.session` is the active Telegram account session.
+- `/srv/mcp-telegram/database/*-wal` and `/srv/mcp-telegram/database/*-shm` are normal SQLite WAL-mode sidecar files.
 - `backups/` contains point-in-time operator backups only; it is not mounted into the container.
 
 ## Downstream Consumers
 
 - dotMD is the external Telegram indexer/search engine. It reaches this
   deployment through dotMD's Telegram adapter/source integration.
-- On this machine dotMD mounts `database/` read-only. If this deployment path
+- On this machine dotMD mounts `/srv/mcp-telegram/database/` read-only. If this deployment path
   changes, update `/opt/docker/dotmd/docker-compose.override.yml` as well.
 
 ## Operations
@@ -39,6 +39,7 @@ This directory is the live deployment workspace, not the source checkout.
 ## Auth
 
 Run `telegram_qr_login.py` from this directory. It writes
-`database/mcp_telegram_session.session`, which is the same path the container
-uses. The retired Telegram-message/SMS login-code path is intentionally not
-used because repeated setup attempts did not receive codes.
+`/srv/mcp-telegram/database/mcp_telegram_session.session` by default, which is the
+same state directory the container uses. Set `MCP_TELEGRAM_STATE_DIR` only if this
+host uses a different durable data root. The retired Telegram-message/SMS login-code
+path is intentionally not used because repeated setup attempts did not receive codes.

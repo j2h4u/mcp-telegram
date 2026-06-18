@@ -18,8 +18,8 @@ Default Docker runtime is one container process:
   default Docker command.
 
 State lives in the XDG state directory: `sync.db`, `feedback.db`, and the Telegram session file.
-In Docker this is bind-mounted from `/opt/docker/mcp-telegram/database`. The daemon is the only
-writer; MCP serving code uses daemon APIs and read-only DB access for lightweight queries.
+In Docker this is bind-mounted from `/srv/mcp-telegram/database`. The daemon is the only writer;
+MCP serving code uses daemon APIs and read-only DB access for lightweight queries.
 
 ### Downstream consumers
 
@@ -68,7 +68,7 @@ writer; MCP serving code uses daemon APIs and read-only DB access for lightweigh
 - `scripts/healthcheck_daemon.py` — Unix socket healthcheck (copied into image)
 - `scripts/healthcheck_http.py` — Streamable HTTP healthcheck (copied into image)
 - `scripts/healthcheck_all.sh` — healthcheck entrypoint (copied into image)
-- `telegram_qr_login.py` — QR-based auth helper; copy from `deploy/` and run from deploy dir to produce `database/mcp_telegram_session.session`
+- `telegram_qr_login.py` — QR-based auth helper; copy from `deploy/` and run from deploy dir to produce `/srv/mcp-telegram/database/mcp_telegram_session.session` by default
 - `AGENTS.md` — deployment-local agent notes for `/opt/docker/mcp-telegram`
 
 ### Tools Package (`tools/`)

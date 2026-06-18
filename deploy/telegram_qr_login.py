@@ -252,7 +252,8 @@ async def _run_qr_login(client: TelegramClient, two_fa_password: str, session_fi
 async def main() -> None:
     api_id, api_hash, two_fa_password = _load_telegram_credentials()
 
-    session_file = Path("database") / "mcp_telegram_session"
+    state_dir = Path(os.environ.get("MCP_TELEGRAM_STATE_DIR", "/srv/mcp-telegram/database"))
+    session_file = state_dir / "mcp_telegram_session"
     session_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
 
     client = TelegramClient(str(session_file), api_id, api_hash)
