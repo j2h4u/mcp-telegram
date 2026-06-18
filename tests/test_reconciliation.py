@@ -102,11 +102,30 @@ def _make_user(uid: int, *, first_name: str = "Alice") -> object:
     return SimpleNamespace(id=uid, access_hash=1, first_name=first_name, forum=False)
 
 
+def _make_user_without_forum(uid: int, *, first_name: str = "Alice") -> object:
+    return SimpleNamespace(id=uid, access_hash=1, first_name=first_name)
+
+
 def _make_dialog(uid: int, *, name: str = "Alice") -> MagicMock:
     # Minimal Dialog-like object compatible with _extract_dialog_row.
     d = MagicMock()
     d.id = uid
     d.entity = _make_user(uid, first_name=name)
+    d.message = None
+    d.draft = None
+    d.folder_id = None
+    d.pinned = False
+    d.unread_mentions_count = 0
+    d.unread_reactions_count = 0
+    return d
+
+
+def _make_dialog_without_forum(uid: int, *, name: str = "Alice") -> MagicMock:
+    # Minimal dialog entity without a `.forum` attribute to cover Telethon entity
+    # variants surfaced by reconciliation logs.
+    d = MagicMock()
+    d.id = uid
+    d.entity = _make_user_without_forum(uid, first_name=name)
     d.message = None
     d.draft = None
     d.folder_id = None
@@ -205,6 +224,27 @@ async def test_recon_light_pass_never_calls_iter_dialogs(
     await worker.run_light_pass()
 
     mock_client.iter_dialogs.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_recon_light_pass_works_without_entity_forum(
+    sync_db: sqlite3.Connection,
+    mock_client: MagicMock,
+    shutdown_event: asyncio.Event,
+) -> None:
+    _seed_dialog_row(sync_db, 100, name="Old", needs_refresh=1)
+    mock_client.get_entity.return_value = _make_user_without_forum(100, first_name="NewName")
+
+    worker = DialogReconciliationWorker(mock_client, sync_db, shutdown_event)
+    with patch.object(worker, "_refresh_forum_topics", wraps=worker._refresh_forum_topics) as spy:
+        await worker.run_light_pass()
+
+    spy.assert_not_called()
+    row = cast(
+        tuple[str, int], sync_db.execute("SELECT name, needs_refresh FROM dialogs WHERE dialog_id=?", (100,)).fetchone()
+    )
+    assert row[0] == "NewName"
+    assert row[1] == 0
 
 
 @pytest.mark.asyncio
@@ -351,6 +391,28 @@ async def test_recon_full_pass_upserts_returned(
     )
     assert rows[0][1] == "A_new" and rows[0][2] == 0
     assert rows[1][1] == "B_new" and rows[1][2] == 0
+
+
+@pytest.mark.asyncio
+async def test_recon_full_pass_works_without_entity_forum(
+    sync_db: sqlite3.Connection,
+    mock_client: MagicMock,
+    shutdown_event: asyncio.Event,
+) -> None:
+    mock_client.iter_dialogs = MagicMock(
+        return_value=_async_iter([_make_dialog_without_forum(100, name="ForumFallback")])
+    )
+
+    worker = DialogReconciliationWorker(mock_client, sync_db, shutdown_event)
+    with patch.object(worker, "_refresh_forum_topics", wraps=worker._refresh_forum_topics) as spy:
+        count, completed = await worker.run_full_pass()
+
+    assert count == 1
+    assert completed is True
+    spy.assert_not_called()
+    row = cast(tuple[str], sync_db.execute("SELECT name FROM dialogs WHERE dialog_id=?", (100,)).fetchone())
+    assert row is not None
+    assert row[0] == "ForumFallback"
 
 
 @pytest.mark.asyncio

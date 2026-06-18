@@ -85,7 +85,6 @@ class _EntityLike(Protocol):
     broadcast: bool
     participants_count: int | None
     date: datetime | None
-    forum: bool
 
 
 class _DraftLike(Protocol):
@@ -698,7 +697,7 @@ class DialogReconciliationWorker:
                         ),
                     )
                 count += 1
-                if entity.forum:
+                if _attr(entity, "forum", False):
                     topic_count = await self._refresh_forum_topics(dialog_id, entity)
                     logger.debug(
                         "recon_light_pass_forum_topics dialog_id=%d count=%d",
@@ -779,7 +778,7 @@ class DialogReconciliationWorker:
                     self._conn.execute(_UPSERT_DIALOG_SQL, row)
                 seen_ids.add(int(dialog.id))
                 count += 1
-                if dialog.entity.forum:
+                if _attr(dialog.entity, "forum", False):
                     topic_count = await self._refresh_forum_topics(int(dialog.id), dialog.entity)
                     logger.debug(
                         "recon_full_pass_forum_topics dialog_id=%d count=%d",

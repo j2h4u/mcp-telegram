@@ -161,7 +161,6 @@ class _EntityLike(Protocol):
     bot: bool
     broadcast: bool
     date: datetime | None
-    forum: bool
 
 
 class _DraftLike(Protocol):
