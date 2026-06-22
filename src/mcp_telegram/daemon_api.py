@@ -1986,7 +1986,7 @@ class DaemonAPIServer:
         )
 
         fetched_rows = cast(Sequence[object | None], fetched)
-        stored_msgs = []
+        extracted_messages = []
         reaction_rows_all = []
         for msg in fetched_rows:
             if msg is None:
@@ -1995,21 +1995,21 @@ class DaemonAPIServer:
             if extracted is None:
                 continue
             # Use .message field (StoredMessage dataclass), not the deprecated .row attribute.
-            stored_msgs.append(extracted.message)
+            extracted_messages.append(extracted)
             msg_id = getattr(msg, "id", None)
             if not isinstance(msg_id, int):
                 continue
             reactions = extract_reactions_rows(dialog_id, msg_id, _attr(msg, "reactions", None))
             reaction_rows_all.extend(reactions)
 
-        if not stored_msgs:
+        if not extracted_messages:
             return True
 
         with self._conn:
             # INSERT_MESSAGE_SQL uses named params bound to StoredMessage field names.
             self._conn.executemany(
                 INSERT_MESSAGE_SQL,
-                [asdict(m) for m in stored_msgs],
+                [{**asdict(item.message), "reply_count": item.reply_count} for item in extracted_messages],
             )
             # message_reactions upsert: mirror sync_worker pattern exactly.
             if reaction_rows_all:

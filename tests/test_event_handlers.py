@@ -890,11 +890,11 @@ def test_register_adds_handlers(
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
-    """register() calls client.add_event_handler exactly 10 times (6 prior + 3 Phase 42 Plan 01 + 1 Plan 02)."""
+    """register() calls client.add_event_handler exactly 11 times (6 prior + 3 Phase 42 Plan 01 + 1 Plan 02 + transcription)."""
     manager = make_manager(mock_client, sync_db, shutdown_event)
     manager.register()
 
-    assert mock_client.add_event_handler.call_count == 10
+    assert mock_client.add_event_handler.call_count == 11
 
 
 def test_unregister_removes_handlers(
@@ -902,12 +902,12 @@ def test_unregister_removes_handlers(
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
-    """unregister() calls client.remove_event_handler exactly 10 times (6 prior + 3 Phase 42 Plan 01 + 1 Plan 02)."""
+    """unregister() calls client.remove_event_handler exactly 11 times (6 prior + 3 Phase 42 Plan 01 + 1 Plan 02 + transcription)."""
     manager = make_manager(mock_client, sync_db, shutdown_event)
     manager.register()
     manager.unregister()
 
-    assert mock_client.remove_event_handler.call_count == 10
+    assert mock_client.remove_event_handler.call_count == 11
 
 
 def test_refresh_synced_dialogs(
@@ -1301,10 +1301,10 @@ def test_register_adds_message_read_handler(
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
-    """register() calls client.add_event_handler 10 times; on_message_read is the 4th."""
+    """register() calls client.add_event_handler 11 times; on_message_read is the 4th."""
     manager = make_manager(mock_client, sync_db, shutdown_event)
     manager.register()
-    assert mock_client.add_event_handler.call_count == 10
+    assert mock_client.add_event_handler.call_count == 11
     fourth_call = mock_client.add_event_handler.call_args_list[3]
     assert fourth_call.args[0] == manager.on_message_read
 
@@ -1314,11 +1314,11 @@ def test_unregister_removes_message_read_handler(
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
-    """unregister() calls client.remove_event_handler 10 times (6 prior + 3 Phase 42 Plan 01 + 1 Plan 02)."""
+    """unregister() calls client.remove_event_handler 11 times (6 prior + 3 Phase 42 Plan 01 + 1 Plan 02 + transcription)."""
     manager = make_manager(mock_client, sync_db, shutdown_event)
     manager.register()
     manager.unregister()
-    assert mock_client.remove_event_handler.call_count == 10
+    assert mock_client.remove_event_handler.call_count == 11
 
 
 # ---------------------------------------------------------------------------

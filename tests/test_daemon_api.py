@@ -12,7 +12,7 @@ import sqlite3
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
-from datetime import UTC
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Final, Protocol, TypedDict, Unpack, cast
@@ -199,6 +199,9 @@ class _ListMessagesQueryReq:
     unread_after_id: int | None
 
 
+_SqlRow = tuple[object, ...]
+
+
 def _build_list_messages_query_req(**overrides: object) -> _ListMessagesDbRequest:
     data: dict[str, object] = {
         "dialog_id": 1,
@@ -264,6 +267,20 @@ def _response_messages(result: dict[str, object]) -> list[dict[str, object]]:
 
 def _group_messages(group: dict[str, object]) -> list[dict[str, object]]:
     return cast(list[dict[str, object]], group["messages"])
+
+
+def _fetchone_row(conn: sqlite3.Connection, sql: str, parameters: tuple[object, ...] = ()) -> _SqlRow | None:
+    return cast(_SqlRow | None, conn.execute(sql, parameters).fetchone())
+
+
+def _fetchall_rows(conn: sqlite3.Connection, sql: str, parameters: tuple[object, ...] = ()) -> list[_SqlRow]:
+    return cast(list[_SqlRow], conn.execute(sql, parameters).fetchall())
+
+
+def _fetchone_int(conn: sqlite3.Connection, sql: str, parameters: tuple[object, ...] = ()) -> int:
+    row = _fetchone_row(conn, sql, parameters)
+    assert row is not None
+    return int(cast(int, row[0]))
 
 
 def _activity_data(resp: dict[str, object]) -> dict[str, object]:
@@ -496,6 +513,33 @@ def _make_db_with_activity() -> sqlite3.Connection:
     )
     conn.commit()
     return conn
+
+
+def _make_db_for_fragment_context() -> sqlite3.Connection:
+    """Return test DB shape compatible with sync_worker.INSERT_MESSAGE_SQL."""
+    conn = _make_db()
+    conn.execute("ALTER TABLE messages ADD COLUMN grouped_id INTEGER")
+    conn.execute("ALTER TABLE messages ADD COLUMN reply_to_peer_id INTEGER")
+    conn.commit()
+    return conn
+
+
+def _fragment_message(message_id: int, text: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=message_id,
+        date=datetime.fromtimestamp(1_700_000_000 + message_id, tz=UTC),
+        message=text,
+        sender_id=101,
+        sender=SimpleNamespace(first_name="Alice"),
+        media=None,
+        reply_to=None,
+        reactions=None,
+        edit_date=None,
+        grouped_id=None,
+        out=False,
+        fwd_from=None,
+        post_author=None,
+    )
 
 
 def _insert_synced_dialog(
@@ -742,6 +786,66 @@ async def test_list_messages_on_demand() -> None:
     messages = _response_messages(result)
     assert len(messages) == 1
     assert messages[0]["message_id"] == 200
+
+
+@pytest.mark.asyncio
+async def test_fetch_fragment_context_caches_anchor_window() -> None:
+    """Fragment fetch inserts anchor+tail messages and marks dialog as fragment."""
+    conn = _make_db_for_fragment_context()
+    client = _TestClient()
+    entity = object()
+    client.get_input_entity = AsyncMock(return_value=entity)
+    client.get_messages = AsyncMock(
+        return_value=[
+            _fragment_message(10, "anchor"),
+            None,
+            _fragment_message(12, "tail"),
+        ]
+    )
+    server = make_server(conn, client)
+
+    ok = await server._fetch_fragment_context(dialog_id=42, anchor_message_id=10)
+
+    assert ok is True
+    client.get_input_entity.assert_awaited_once_with(42)
+    client.get_messages.assert_awaited_once_with(entity, ids=[10, 11, 12, 13, 14, 15])
+    assert _fetchone_row(conn, "SELECT status FROM synced_dialogs WHERE dialog_id = 42") == ("fragment",)
+    assert _fetchall_rows(conn, "SELECT message_id, text FROM messages ORDER BY message_id") == [
+        (10, "anchor"),
+        (12, "tail"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fetch_fragment_context_empty_fetch_still_succeeds() -> None:
+    """No returned messages is a valid fragment fetch with no cache insert."""
+    conn = _make_db_for_fragment_context()
+    client = _TestClient()
+    client.get_input_entity = AsyncMock(return_value=object())
+    client.get_messages = AsyncMock(return_value=[None])
+    server = make_server(conn, client)
+
+    ok = await server._fetch_fragment_context(dialog_id=43, anchor_message_id=20)
+
+    assert ok is True
+    assert _fetchone_row(conn, "SELECT status FROM synced_dialogs WHERE dialog_id = 43") == ("fragment",)
+    assert _fetchone_int(conn, "SELECT COUNT(*) FROM messages") == 0
+
+
+@pytest.mark.asyncio
+async def test_fetch_fragment_context_client_failure_returns_false() -> None:
+    """Telegram lookup failure leaves the fragment marker but reports failure."""
+    conn = _make_db_for_fragment_context()
+    client = _TestClient()
+    client.get_input_entity = AsyncMock(side_effect=RuntimeError("telegram unavailable"))
+    client.get_messages = AsyncMock()
+    server = make_server(conn, client)
+
+    ok = await server._fetch_fragment_context(dialog_id=44, anchor_message_id=30)
+
+    assert ok is False
+    client.get_messages.assert_not_called()
+    assert _fetchone_row(conn, "SELECT status FROM synced_dialogs WHERE dialog_id = 44") == ("fragment",)
 
 
 # ---------------------------------------------------------------------------

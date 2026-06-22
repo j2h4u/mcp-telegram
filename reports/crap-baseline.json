@@ -418,19 +418,19 @@
       "complexity": 3,
       "coverage_fraction": 0.857143,
       "crap": 3.026239,
-      "end_line": 247,
+      "end_line": 254,
       "path": "activity_sync.py",
       "qualname": "_extract_own_message_rows",
-      "start_line": 239
+      "start_line": 246
     },
     "activity_sync.py::_fmt_duration": {
       "complexity": 3,
       "coverage_fraction": 0.0,
       "crap": 12.0,
-      "end_line": 227,
+      "end_line": 234,
       "path": "activity_sync.py",
       "qualname": "_fmt_duration",
-      "start_line": 222
+      "start_line": 229
     },
     "activity_sync.py::_load_state": {
       "complexity": 1,
@@ -445,19 +445,19 @@
       "complexity": 5,
       "coverage_fraction": 0.444444,
       "crap": 9.286694,
-      "end_line": 385,
+      "end_line": 392,
       "path": "activity_sync.py",
       "qualname": "_log_backfill_batch",
-      "start_line": 360
+      "start_line": 367
     },
     "activity_sync.py::_log_incremental_batch": {
       "complexity": 1,
       "coverage_fraction": 1.0,
       "crap": 1.0,
-      "end_line": 400,
+      "end_line": 407,
       "path": "activity_sync.py",
       "qualname": "_log_incremental_batch",
-      "start_line": 389
+      "start_line": 396
     },
     "activity_sync.py::_normalize": {
       "complexity": 3,
@@ -468,50 +468,59 @@
       "qualname": "_normalize",
       "start_line": 166
     },
+    "activity_sync.py::_optional_entity_attr": {
+      "complexity": 3,
+      "coverage_fraction": 1.0,
+      "crap": 3.0,
+      "end_line": 186,
+      "path": "activity_sync.py",
+      "qualname": "_optional_entity_attr",
+      "start_line": 184
+    },
     "activity_sync.py::_persist_own_message_rows": {
       "complexity": 4,
       "coverage_fraction": 0.833333,
       "crap": 4.074074,
-      "end_line": 259,
+      "end_line": 266,
       "path": "activity_sync.py",
       "qualname": "_persist_own_message_rows",
-      "start_line": 250
+      "start_line": 257
     },
     "activity_sync.py::_run_backfill": {
       "complexity": 12,
       "coverage_fraction": 0.885714,
       "crap": 12.21495,
-      "end_line": 499,
+      "end_line": 506,
       "path": "activity_sync.py",
       "qualname": "_run_backfill",
-      "start_line": 434
+      "start_line": 441
     },
     "activity_sync.py::_run_incremental": {
       "complexity": 12,
       "coverage_fraction": 0.909091,
       "crap": 12.108189,
-      "end_line": 587,
+      "end_line": 594,
       "path": "activity_sync.py",
       "qualname": "_run_incremental",
-      "start_line": 502
+      "start_line": 509
     },
     "activity_sync.py::_search_backfill_batch": {
       "complexity": 4,
       "coverage_fraction": 0.9,
       "crap": 4.016,
-      "end_line": 304,
+      "end_line": 311,
       "path": "activity_sync.py",
       "qualname": "_search_backfill_batch",
-      "start_line": 263
+      "start_line": 270
     },
     "activity_sync.py::_search_incremental_batch": {
       "complexity": 4,
       "coverage_fraction": 0.6,
       "crap": 5.024,
-      "end_line": 341,
+      "end_line": 348,
       "path": "activity_sync.py",
       "qualname": "_search_incremental_batch",
-      "start_line": 307
+      "start_line": 314
     },
     "activity_sync.py::_set_state": {
       "complexity": 1,
@@ -535,37 +544,37 @@
       "complexity": 4,
       "coverage_fraction": 0.777778,
       "crap": 4.175583,
-      "end_line": 357,
+      "end_line": 364,
       "path": "activity_sync.py",
       "qualname": "_trim_incremental_batch",
-      "start_line": 344
+      "start_line": 351
     },
     "activity_sync.py::_upsert_entities_from_search": {
-      "complexity": 14,
-      "coverage_fraction": 0.96,
-      "crap": 14.012544,
-      "end_line": 219,
+      "complexity": 12,
+      "coverage_fraction": 0.962963,
+      "crap": 12.007316,
+      "end_line": 226,
       "path": "activity_sync.py",
       "qualname": "_upsert_entities_from_search",
-      "start_line": 184
+      "start_line": 189
     },
     "activity_sync.py::_wait_for_shutdown": {
       "complexity": 2,
       "coverage_fraction": 0.8,
       "crap": 2.032,
-      "end_line": 236,
+      "end_line": 243,
       "path": "activity_sync.py",
       "qualname": "_wait_for_shutdown",
-      "start_line": 230
+      "start_line": 237
     },
     "activity_sync.py::call_with_timeout": {
       "complexity": 2,
       "coverage_fraction": 1.0,
       "crap": 2.0,
-      "end_line": 427,
+      "end_line": 434,
       "path": "activity_sync.py",
       "qualname": "call_with_timeout",
-      "start_line": 404
+      "start_line": 411
     },
     "activity_sync.py::extract_dialog_id": {
       "complexity": 3,
@@ -580,10 +589,10 @@
       "complexity": 4,
       "coverage_fraction": 0.923077,
       "crap": 4.007283,
-      "end_line": 614,
+      "end_line": 621,
       "path": "activity_sync.py",
       "qualname": "run_activity_sync_loop",
-      "start_line": 590
+      "start_line": 597
     },
     "budget.py::allocate_message_budget_proportional": {
       "complexity": 11,
@@ -602,6 +611,33 @@
       "path": "budget.py",
       "qualname": "unread_chat_tier",
       "start_line": 13
+    },
+    "config.py::_read_config": {
+      "complexity": 2,
+      "coverage_fraction": 1.0,
+      "crap": 2.0,
+      "end_line": 29,
+      "path": "config.py",
+      "qualname": "_read_config",
+      "start_line": 21
+    },
+    "config.py::get_config_path": {
+      "complexity": 1,
+      "coverage_fraction": 1.0,
+      "crap": 1.0,
+      "end_line": 18,
+      "path": "config.py",
+      "qualname": "get_config_path",
+      "start_line": 16
+    },
+    "config.py::get_configured_state_dir": {
+      "complexity": 4,
+      "coverage_fraction": 0.714286,
+      "crap": 4.373178,
+      "end_line": 40,
+      "path": "config.py",
+      "qualname": "get_configured_state_dir",
+      "start_line": 32
     },
     "daemon.py::_DaemonClient.__call__": {
       "complexity": 1,
@@ -1901,8 +1937,8 @@
     },
     "daemon_api.py::DaemonAPIServer._fetch_fragment_context": {
       "complexity": 10,
-      "coverage_fraction": 0.0,
-      "crap": 110.0,
+      "coverage_fraction": 0.909091,
+      "crap": 10.075131,
       "end_line": 2021,
       "path": "daemon_api.py",
       "qualname": "DaemonAPIServer._fetch_fragment_context",
@@ -3289,82 +3325,91 @@
       "complexity": 6,
       "coverage_fraction": 1.0,
       "crap": 6.0,
-      "end_line": 87,
+      "end_line": 96,
       "path": "daemon_message.py",
       "qualname": "_extract_reactions_display",
-      "start_line": 74
+      "start_line": 83
     },
     "daemon_message.py::_extract_sender_first_name": {
       "complexity": 2,
       "coverage_fraction": 1.0,
       "crap": 2.0,
-      "end_line": 48,
+      "end_line": 57,
       "path": "daemon_message.py",
       "qualname": "_extract_sender_first_name",
+      "start_line": 53
+    },
+    "daemon_message.py::_first_non_empty_str": {
+      "complexity": 4,
+      "coverage_fraction": 1.0,
+      "crap": 4.0,
+      "end_line": 50,
+      "path": "daemon_message.py",
+      "qualname": "_first_non_empty_str",
       "start_line": 46
     },
     "daemon_message.py::_get_media_description": {
       "complexity": 2,
       "coverage_fraction": 0.6,
       "crap": 2.256,
-      "end_line": 71,
+      "end_line": 80,
       "path": "daemon_message.py",
       "qualname": "_get_media_description",
-      "start_line": 65
+      "start_line": 74
     },
     "daemon_message.py::_is_service_message": {
       "complexity": 3,
       "coverage_fraction": 0.5,
       "crap": 4.125,
-      "end_line": 109,
+      "end_line": 118,
       "path": "daemon_message.py",
       "qualname": "_is_service_message",
-      "start_line": 99
+      "start_line": 108
     },
     "daemon_message.py::_resolve_effective_sender_id": {
       "complexity": 10,
       "coverage_fraction": 0.888889,
       "crap": 10.137174,
-      "end_line": 127,
+      "end_line": 136,
       "path": "daemon_message.py",
       "qualname": "_resolve_effective_sender_id",
-      "start_line": 112
+      "start_line": 121
     },
     "daemon_message.py::_timestamp_to_int": {
       "complexity": 4,
       "coverage_fraction": 0.428571,
       "crap": 6.985423,
-      "end_line": 62,
+      "end_line": 71,
       "path": "daemon_message.py",
       "qualname": "_timestamp_to_int",
-      "start_line": 51
+      "start_line": 60
     },
     "daemon_message.py::_to_unix_timestamp_or_none": {
       "complexity": 3,
       "coverage_fraction": 0.666667,
       "crap": 3.333333,
-      "end_line": 96,
+      "end_line": 105,
       "path": "daemon_message.py",
       "qualname": "_to_unix_timestamp_or_none",
-      "start_line": 90
+      "start_line": 99
     },
     "daemon_message.py::fetch_reaction_counts": {
       "complexity": 3,
       "coverage_fraction": 1.0,
       "crap": 3.0,
-      "end_line": 193,
+      "end_line": 202,
       "path": "daemon_message.py",
       "qualname": "fetch_reaction_counts",
-      "start_line": 172
+      "start_line": 181
     },
     "daemon_message.py::message_to_dict": {
       "complexity": 2,
       "coverage_fraction": 1.0,
       "crap": 2.0,
-      "end_line": 168,
+      "end_line": 177,
       "path": "daemon_message.py",
       "qualname": "message_to_dict",
-      "start_line": 130
+      "start_line": 139
     },
     "daemon_reading.py::DaemonReadingService.__init__": {
       "complexity": 1,
@@ -4045,199 +4090,208 @@
       "complexity": 1,
       "coverage_fraction": 1.0,
       "crap": 1.0,
-      "end_line": 649,
+      "end_line": 653,
       "path": "dialog_sync.py",
       "qualname": "DialogReconciliationWorker.__init__",
-      "start_line": 641
+      "start_line": 645
     },
     "dialog_sync.py::DialogReconciliationWorker._refresh_forum_topics": {
       "complexity": 9,
       "coverage_fraction": 0.789474,
       "crap": 9.755795,
-      "end_line": 872,
+      "end_line": 876,
       "path": "dialog_sync.py",
       "qualname": "DialogReconciliationWorker._refresh_forum_topics",
-      "start_line": 807
+      "start_line": 811
     },
     "dialog_sync.py::DialogReconciliationWorker.run_full_pass": {
       "complexity": 7,
       "coverage_fraction": 0.892857,
       "crap": 7.060268,
-      "end_line": 805,
+      "end_line": 809,
       "path": "dialog_sync.py",
       "qualname": "DialogReconciliationWorker.run_full_pass",
-      "start_line": 746
+      "start_line": 750
     },
     "dialog_sync.py::DialogReconciliationWorker.run_light_pass": {
       "complexity": 9,
       "coverage_fraction": 0.870968,
       "crap": 9.174012,
-      "end_line": 744,
+      "end_line": 748,
       "path": "dialog_sync.py",
       "qualname": "DialogReconciliationWorker.run_light_pass",
-      "start_line": 651
+      "start_line": 655
     },
     "dialog_sync.py::DialogsBootstrapWorker.__init__": {
       "complexity": 1,
       "coverage_fraction": 1.0,
       "crap": 1.0,
-      "end_line": 466,
+      "end_line": 470,
       "path": "dialog_sync.py",
       "qualname": "DialogsBootstrapWorker.__init__",
-      "start_line": 452
+      "start_line": 456
     },
     "dialog_sync.py::DialogsBootstrapWorker._reconstruct_cursor": {
       "complexity": 5,
       "coverage_fraction": 1.0,
       "crap": 5.0,
-      "end_line": 500,
+      "end_line": 504,
       "path": "dialog_sync.py",
       "qualname": "DialogsBootstrapWorker._reconstruct_cursor",
-      "start_line": 473
+      "start_line": 477
     },
     "dialog_sync.py::DialogsBootstrapWorker._set_detail": {
       "complexity": 2,
       "coverage_fraction": 1.0,
       "crap": 2.0,
-      "end_line": 471,
+      "end_line": 475,
       "path": "dialog_sync.py",
       "qualname": "DialogsBootstrapWorker._set_detail",
-      "start_line": 468
+      "start_line": 472
     },
     "dialog_sync.py::DialogsBootstrapWorker.run": {
       "complexity": 10,
       "coverage_fraction": 0.891304,
       "crap": 10.128421,
-      "end_line": 600,
+      "end_line": 604,
       "path": "dialog_sync.py",
       "qualname": "DialogsBootstrapWorker.run",
-      "start_line": 502
+      "start_line": 506
     },
     "dialog_sync.py::_DialogSyncClient.__call__": {
       "complexity": 1,
       "coverage_fraction": 1.0,
       "crap": 1.0,
-      "end_line": 132,
+      "end_line": 141,
       "path": "dialog_sync.py",
       "qualname": "_DialogSyncClient.__call__",
-      "start_line": 132
+      "start_line": 141
     },
     "dialog_sync.py::_DialogSyncClient.get_entity": {
       "complexity": 1,
       "coverage_fraction": 1.0,
       "crap": 1.0,
-      "end_line": 130,
+      "end_line": 139,
       "path": "dialog_sync.py",
       "qualname": "_DialogSyncClient.get_entity",
-      "start_line": 130
+      "start_line": 139
     },
     "dialog_sync.py::_DialogSyncClient.iter_dialogs": {
       "complexity": 1,
       "coverage_fraction": 1.0,
       "crap": 1.0,
-      "end_line": 128,
+      "end_line": 137,
       "path": "dialog_sync.py",
       "qualname": "_DialogSyncClient.iter_dialogs",
-      "start_line": 128
+      "start_line": 137
     },
     "dialog_sync.py::_attr": {
       "complexity": 1,
       "coverage_fraction": 1.0,
       "crap": 1.0,
-      "end_line": 136,
+      "end_line": 145,
       "path": "dialog_sync.py",
       "qualname": "_attr",
-      "start_line": 135
+      "start_line": 144
     },
     "dialog_sync.py::_clear_cursor": {
       "complexity": 2,
       "coverage_fraction": 1.0,
       "crap": 2.0,
-      "end_line": 277,
+      "end_line": 286,
       "path": "dialog_sync.py",
       "qualname": "_clear_cursor",
-      "start_line": 274
+      "start_line": 283
     },
     "dialog_sync.py::_decode_offset_peer": {
       "complexity": 5,
       "coverage_fraction": 0.909091,
       "crap": 5.018783,
-      "end_line": 322,
+      "end_line": 331,
       "path": "dialog_sync.py",
       "qualname": "_decode_offset_peer",
-      "start_line": 306
+      "start_line": 315
     },
     "dialog_sync.py::_encode_offset_peer": {
       "complexity": 6,
       "coverage_fraction": 1.0,
       "crap": 6.0,
-      "end_line": 303,
+      "end_line": 312,
       "path": "dialog_sync.py",
       "qualname": "_encode_offset_peer",
-      "start_line": 285
+      "start_line": 294
     },
     "dialog_sync.py::_extract_dialog_row": {
-      "complexity": 7,
-      "coverage_fraction": 0.857143,
-      "crap": 7.142857,
-      "end_line": 423,
+      "complexity": 5,
+      "coverage_fraction": 1.0,
+      "crap": 5.0,
+      "end_line": 427,
       "path": "dialog_sync.py",
       "qualname": "_extract_dialog_row",
-      "start_line": 374
+      "start_line": 383
+    },
+    "dialog_sync.py::_extract_draft_text": {
+      "complexity": 5,
+      "coverage_fraction": 0.857143,
+      "crap": 5.072886,
+      "end_line": 102,
+      "path": "dialog_sync.py",
+      "qualname": "_extract_draft_text",
+      "start_line": 94
     },
     "dialog_sync.py::_extract_entity_fields": {
       "complexity": 7,
       "coverage_fraction": 1.0,
       "crap": 7.0,
-      "end_line": 359,
+      "end_line": 368,
       "path": "dialog_sync.py",
       "qualname": "_extract_entity_fields",
-      "start_line": 330
+      "start_line": 339
     },
     "dialog_sync.py::_extract_name": {
       "complexity": 5,
       "coverage_fraction": 1.0,
       "crap": 5.0,
-      "end_line": 371,
+      "end_line": 380,
       "path": "dialog_sync.py",
       "qualname": "_extract_name",
-      "start_line": 363
+      "start_line": 372
     },
     "dialog_sync.py::_get_state": {
       "complexity": 2,
       "coverage_fraction": 1.0,
       "crap": 2.0,
-      "end_line": 267,
+      "end_line": 276,
       "path": "dialog_sync.py",
       "qualname": "_get_state",
-      "start_line": 265
+      "start_line": 274
     },
     "dialog_sync.py::_set_access_lost": {
       "complexity": 1,
       "coverage_fraction": 1.0,
       "crap": 1.0,
-      "end_line": 226,
+      "end_line": 235,
       "path": "dialog_sync.py",
       "qualname": "_set_access_lost",
-      "start_line": 217
+      "start_line": 226
     },
     "dialog_sync.py::_set_state": {
       "complexity": 1,
       "coverage_fraction": 1.0,
       "crap": 1.0,
-      "end_line": 271,
+      "end_line": 280,
       "path": "dialog_sync.py",
       "qualname": "_set_state",
-      "start_line": 270
+      "start_line": 279
     },
     "dialog_sync.py::run_reconciliation_loop": {
       "complexity": 8,
       "coverage_fraction": 0.9,
       "crap": 8.064,
-      "end_line": 926,
+      "end_line": 930,
       "path": "dialog_sync.py",
       "qualname": "run_reconciliation_loop",
-      "start_line": 875
+      "start_line": 879
     },
     "errors.py::action_text": {
       "complexity": 1,
@@ -4477,340 +4531,358 @@
       "complexity": 1,
       "coverage_fraction": 1.0,
       "crap": 1.0,
-      "end_line": 283,
+      "end_line": 293,
       "path": "event_handlers.py",
       "qualname": "EventHandlerManager.__init__",
-      "start_line": 273
+      "start_line": 283
     },
     "event_handlers.py::EventHandlerManager._auto_enroll_dm": {
       "complexity": 9,
-      "coverage_fraction": 0.857143,
-      "crap": 9.236152,
-      "end_line": 413,
+      "coverage_fraction": 0.863636,
+      "crap": 9.205391,
+      "end_line": 429,
       "path": "event_handlers.py",
       "qualname": "EventHandlerManager._auto_enroll_dm",
-      "start_line": 363
+      "start_line": 378
     },
     "event_handlers.py::EventHandlerManager._collect_synced_pinned_dialog_ids": {
       "complexity": 5,
       "coverage_fraction": 0.8,
       "crap": 5.2,
-      "end_line": 919,
+      "end_line": 1017,
       "path": "event_handlers.py",
       "qualname": "EventHandlerManager._collect_synced_pinned_dialog_ids",
-      "start_line": 909
+      "start_line": 1007
     },
     "event_handlers.py::EventHandlerManager._dialog_id_from_peer": {
       "complexity": 3,
       "coverage_fraction": 0.75,
       "crap": 3.140625,
-      "end_line": 907,
+      "end_line": 1005,
       "path": "event_handlers.py",
       "qualname": "EventHandlerManager._dialog_id_from_peer",
-      "start_line": 903
+      "start_line": 1001
     },
     "event_handlers.py::EventHandlerManager._handle_topic_create_action": {
       "complexity": 4,
       "coverage_fraction": 0.857143,
       "crap": 4.046647,
-      "end_line": 507,
+      "end_line": 523,
       "path": "event_handlers.py",
       "qualname": "EventHandlerManager._handle_topic_create_action",
-      "start_line": 480
+      "start_line": 496
     },
     "event_handlers.py::EventHandlerManager._handle_topic_edit_action": {
       "complexity": 4,
       "coverage_fraction": 1.0,
       "crap": 4.0,
-      "end_line": 563,
+      "end_line": 579,
       "path": "event_handlers.py",
       "qualname": "EventHandlerManager._handle_topic_edit_action",
-      "start_line": 510
+      "start_line": 526
     },
     "event_handlers.py::EventHandlerManager._handle_topic_message_action": {
       "complexity": 3,
       "coverage_fraction": 1.0,
       "crap": 3.0,
-      "end_line": 478,
+      "end_line": 494,
       "path": "event_handlers.py",
       "qualname": "EventHandlerManager._handle_topic_message_action",
-      "start_line": 467
+      "start_line": 483
     },
     "event_handlers.py::EventHandlerManager._refresh_linked_chat_id": {
       "complexity": 6,
       "coverage_fraction": 0.785714,
       "crap": 6.354227,
-      "end_line": 1113,
+      "end_line": 1211,
       "path": "event_handlers.py",
       "qualname": "EventHandlerManager._refresh_linked_chat_id",
-      "start_line": 1055
+      "start_line": 1153
     },
     "event_handlers.py::EventHandlerManager._refresh_synced_dialogs": {
       "complexity": 2,
       "coverage_fraction": 1.0,
       "crap": 2.0,
-      "end_line": 361,
+      "end_line": 376,
       "path": "event_handlers.py",
       "qualname": "EventHandlerManager._refresh_synced_dialogs",
-      "start_line": 359
+      "start_line": 374
     },
     "event_handlers.py::EventHandlerManager._rewrite_pinned_dialogs": {
       "complexity": 5,
       "coverage_fraction": 1.0,
       "crap": 5.0,
-      "end_line": 967,
+      "end_line": 1065,
       "path": "event_handlers.py",
       "qualname": "EventHandlerManager._rewrite_pinned_dialogs",
-      "start_line": 930
+      "start_line": 1028
     },
     "event_handlers.py::EventHandlerManager._scan_dm_gap_dialog": {
       "complexity": 6,
       "coverage_fraction": 1.0,
       "crap": 6.0,
-      "end_line": 1254,
+      "end_line": 1352,
       "path": "event_handlers.py",
       "qualname": "EventHandlerManager._scan_dm_gap_dialog",
-      "start_line": 1227
+      "start_line": 1325
     },
     "event_handlers.py::EventHandlerManager._update_dialog_pinned": {
       "complexity": 4,
       "coverage_fraction": 1.0,
       "crap": 4.0,
-      "end_line": 928,
+      "end_line": 1026,
       "path": "event_handlers.py",
       "qualname": "EventHandlerManager._update_dialog_pinned",
-      "start_line": 921
+      "start_line": 1019
     },
     "event_handlers.py::EventHandlerManager._update_dialog_unread_mark": {
       "complexity": 3,
       "coverage_fraction": 0.833333,
       "crap": 3.041667,
-      "end_line": 981,
+      "end_line": 1079,
       "path": "event_handlers.py",
       "qualname": "EventHandlerManager._update_dialog_unread_mark",
-      "start_line": 970
+      "start_line": 1068
     },
     "event_handlers.py::EventHandlerManager._update_last_message_timestamp": {
       "complexity": 2,
       "coverage_fraction": 1.0,
       "crap": 2.0,
-      "end_line": 465,
+      "end_line": 481,
       "path": "event_handlers.py",
       "qualname": "EventHandlerManager._update_last_message_timestamp",
-      "start_line": 459
+      "start_line": 475
     },
     "event_handlers.py::EventHandlerManager.on_message_deleted": {
       "complexity": 5,
       "coverage_fraction": 0.8,
       "crap": 5.2,
-      "end_line": 689,
+      "end_line": 705,
       "path": "event_handlers.py",
       "qualname": "EventHandlerManager.on_message_deleted",
-      "start_line": 659
+      "start_line": 675
     },
     "event_handlers.py::EventHandlerManager.on_message_edited": {
       "complexity": 8,
       "coverage_fraction": 0.925,
       "crap": 8.027,
-      "end_line": 657,
+      "end_line": 673,
       "path": "event_handlers.py",
       "qualname": "EventHandlerManager.on_message_edited",
-      "start_line": 566
+      "start_line": 582
     },
     "event_handlers.py::EventHandlerManager.on_message_read": {
       "complexity": 6,
       "coverage_fraction": 0.789474,
       "crap": 6.335909,
-      "end_line": 735,
+      "end_line": 751,
       "path": "event_handlers.py",
       "qualname": "EventHandlerManager.on_message_read",
-      "start_line": 691
+      "start_line": 707
     },
     "event_handlers.py::EventHandlerManager.on_new_message": {
       "complexity": 6,
       "coverage_fraction": 0.875,
       "crap": 6.070312,
-      "end_line": 457,
+      "end_line": 473,
       "path": "event_handlers.py",
       "qualname": "EventHandlerManager.on_new_message",
-      "start_line": 419
+      "start_line": 435
     },
     "event_handlers.py::EventHandlerManager.on_outbox_read": {
       "complexity": 8,
       "coverage_fraction": 0.88,
       "crap": 8.110592,
-      "end_line": 815,
+      "end_line": 831,
       "path": "event_handlers.py",
       "qualname": "EventHandlerManager.on_outbox_read",
-      "start_line": 737
+      "start_line": 753
     },
     "event_handlers.py::EventHandlerManager.on_raw_channel_chat_update": {
       "complexity": 9,
       "coverage_fraction": 0.777778,
       "crap": 9.888889,
-      "end_line": 1053,
+      "end_line": 1151,
       "path": "event_handlers.py",
       "qualname": "EventHandlerManager.on_raw_channel_chat_update",
-      "start_line": 1011
+      "start_line": 1109
     },
     "event_handlers.py::EventHandlerManager.on_raw_dialog_pinned": {
       "complexity": 5,
       "coverage_fraction": 0.8,
       "crap": 5.2,
-      "end_line": 1008,
+      "end_line": 1106,
       "path": "event_handlers.py",
       "qualname": "EventHandlerManager.on_raw_dialog_pinned",
-      "start_line": 984
+      "start_line": 1082
     },
     "event_handlers.py::EventHandlerManager.on_raw_forum_topic_pinned": {
       "complexity": 7,
       "coverage_fraction": 0.833333,
       "crap": 7.226852,
-      "end_line": 1188,
+      "end_line": 1286,
       "path": "event_handlers.py",
       "qualname": "EventHandlerManager.on_raw_forum_topic_pinned",
-      "start_line": 1154
+      "start_line": 1252
     },
     "event_handlers.py::EventHandlerManager.on_raw_inbox_read": {
       "complexity": 7,
       "coverage_fraction": 0.8125,
       "crap": 7.322998,
-      "end_line": 1151,
+      "end_line": 1249,
       "path": "event_handlers.py",
       "qualname": "EventHandlerManager.on_raw_inbox_read",
-      "start_line": 1116
+      "start_line": 1214
     },
     "event_handlers.py::EventHandlerManager.on_raw_reaction_update": {
       "complexity": 10,
       "coverage_fraction": 0.735294,
       "crap": 11.854773,
-      "end_line": 896,
+      "end_line": 912,
       "path": "event_handlers.py",
       "qualname": "EventHandlerManager.on_raw_reaction_update",
-      "start_line": 818
+      "start_line": 834
+    },
+    "event_handlers.py::EventHandlerManager.on_raw_transcribed_audio": {
+      "complexity": 10,
+      "coverage_fraction": 0.75,
+      "crap": 11.5625,
+      "end_line": 994,
+      "path": "event_handlers.py",
+      "qualname": "EventHandlerManager.on_raw_transcribed_audio",
+      "start_line": 915
     },
     "event_handlers.py::EventHandlerManager.refresh_synced_dialogs": {
       "complexity": 1,
       "coverage_fraction": 1.0,
       "crap": 1.0,
-      "end_line": 357,
+      "end_line": 372,
       "path": "event_handlers.py",
       "qualname": "EventHandlerManager.refresh_synced_dialogs",
-      "start_line": 350
+      "start_line": 365
     },
     "event_handlers.py::EventHandlerManager.register": {
       "complexity": 1,
       "coverage_fraction": 1.0,
       "crap": 1.0,
-      "end_line": 334,
+      "end_line": 348,
       "path": "event_handlers.py",
       "qualname": "EventHandlerManager.register",
-      "start_line": 289
+      "start_line": 299
     },
     "event_handlers.py::EventHandlerManager.run_dm_gap_scan": {
       "complexity": 4,
       "coverage_fraction": 0.818182,
       "crap": 4.096168,
-      "end_line": 1225,
+      "end_line": 1323,
       "path": "event_handlers.py",
       "qualname": "EventHandlerManager.run_dm_gap_scan",
-      "start_line": 1195
+      "start_line": 1293
     },
     "event_handlers.py::EventHandlerManager.unregister": {
       "complexity": 1,
       "coverage_fraction": 1.0,
       "crap": 1.0,
-      "end_line": 348,
+      "end_line": 363,
       "path": "event_handlers.py",
       "qualname": "EventHandlerManager.unregister",
-      "start_line": 337
+      "start_line": 351
     },
     "event_handlers.py::_EventHandlerClient.__call__": {
       "complexity": 1,
       "coverage_fraction": 1.0,
       "crap": 1.0,
-      "end_line": 158,
+      "end_line": 160,
       "path": "event_handlers.py",
       "qualname": "_EventHandlerClient.__call__",
-      "start_line": 158
+      "start_line": 160
     },
     "event_handlers.py::_EventHandlerClient.add_event_handler": {
       "complexity": 1,
       "coverage_fraction": 1.0,
       "crap": 1.0,
-      "end_line": 150,
+      "end_line": 152,
       "path": "event_handlers.py",
       "qualname": "_EventHandlerClient.add_event_handler",
-      "start_line": 150
+      "start_line": 152
     },
     "event_handlers.py::_EventHandlerClient.get_input_entity": {
       "complexity": 1,
       "coverage_fraction": 1.0,
       "crap": 1.0,
-      "end_line": 156,
+      "end_line": 158,
       "path": "event_handlers.py",
       "qualname": "_EventHandlerClient.get_input_entity",
-      "start_line": 156
+      "start_line": 158
     },
     "event_handlers.py::_EventHandlerClient.get_messages": {
       "complexity": 1,
       "coverage_fraction": 1.0,
       "crap": 1.0,
-      "end_line": 154,
+      "end_line": 156,
       "path": "event_handlers.py",
       "qualname": "_EventHandlerClient.get_messages",
-      "start_line": 154
+      "start_line": 156
     },
     "event_handlers.py::_EventHandlerClient.remove_event_handler": {
       "complexity": 1,
       "coverage_fraction": 1.0,
       "crap": 1.0,
-      "end_line": 152,
+      "end_line": 154,
       "path": "event_handlers.py",
       "qualname": "_EventHandlerClient.remove_event_handler",
-      "start_line": 152
+      "start_line": 154
     },
     "event_handlers.py::_NewMessageEvent.get_sender": {
       "complexity": 1,
       "coverage_fraction": 1.0,
       "crap": 1.0,
-      "end_line": 94,
+      "end_line": 96,
       "path": "event_handlers.py",
       "qualname": "_NewMessageEvent.get_sender",
-      "start_line": 94
+      "start_line": 96
+    },
+    "event_handlers.py::_first_non_empty_str": {
+      "complexity": 4,
+      "coverage_fraction": 1.0,
+      "crap": 4.0,
+      "end_line": 173,
+      "path": "event_handlers.py",
+      "qualname": "_first_non_empty_str",
+      "start_line": 169
     },
     "feedback_db.py::_open_feedback_db": {
       "complexity": 1,
       "coverage_fraction": 1.0,
       "crap": 1.0,
-      "end_line": 75,
+      "end_line": 73,
       "path": "feedback_db.py",
       "qualname": "_open_feedback_db",
-      "start_line": 68
+      "start_line": 66
     },
     "feedback_db.py::_row_first_int": {
       "complexity": 5,
       "coverage_fraction": 0.75,
       "crap": 5.390625,
-      "end_line": 86,
+      "end_line": 84,
       "path": "feedback_db.py",
       "qualname": "_row_first_int",
-      "start_line": 78
+      "start_line": 76
     },
     "feedback_db.py::ensure_feedback_schema": {
       "complexity": 3,
       "coverage_fraction": 1.0,
       "crap": 3.0,
-      "end_line": 117,
+      "end_line": 115,
       "path": "feedback_db.py",
       "qualname": "ensure_feedback_schema",
-      "start_line": 94
+      "start_line": 92
     },
     "feedback_db.py::get_feedback_db_path": {
       "complexity": 1,
       "coverage_fraction": 1.0,
       "crap": 1.0,
-      "end_line": 60,
+      "end_line": 58,
       "path": "feedback_db.py",
       "qualname": "get_feedback_db_path",
       "start_line": 56
@@ -5706,119 +5778,128 @@
       "qualname": "run_mcp_server",
       "start_line": 276
     },
+    "state.py::get_state_dir": {
+      "complexity": 1,
+      "coverage_fraction": 1.0,
+      "crap": 1.0,
+      "end_line": 18,
+      "path": "state.py",
+      "qualname": "get_state_dir",
+      "start_line": 10
+    },
     "sync_db.py::_apply_migration": {
       "complexity": 7,
       "coverage_fraction": 0.736842,
       "crap": 7.892987,
-      "end_line": 524,
+      "end_line": 522,
       "path": "sync_db.py",
       "qualname": "_apply_migration",
-      "start_line": 484
+      "start_line": 482
     },
     "sync_db.py::_apply_migrations": {
       "complexity": 3,
       "coverage_fraction": 0.733333,
       "crap": 3.170667,
-      "end_line": 1083,
+      "end_line": 1081,
       "path": "sync_db.py",
       "qualname": "_apply_migrations",
-      "start_line": 1057
+      "start_line": 1055
     },
     "sync_db.py::_apply_migrations_11_to_15": {
       "complexity": 1,
       "coverage_fraction": 1.0,
       "crap": 1.0,
-      "end_line": 832,
+      "end_line": 830,
       "path": "sync_db.py",
       "qualname": "_apply_migrations_11_to_15",
-      "start_line": 694
+      "start_line": 692
     },
     "sync_db.py::_apply_migrations_16_to_20": {
       "complexity": 1,
       "coverage_fraction": 1.0,
       "crap": 1.0,
-      "end_line": 907,
+      "end_line": 905,
       "path": "sync_db.py",
       "qualname": "_apply_migrations_16_to_20",
-      "start_line": 837
+      "start_line": 835
     },
     "sync_db.py::_apply_migrations_1_to_5": {
       "complexity": 2,
       "coverage_fraction": 1.0,
       "crap": 2.0,
-      "end_line": 560,
+      "end_line": 558,
       "path": "sync_db.py",
       "qualname": "_apply_migrations_1_to_5",
-      "start_line": 527
+      "start_line": 525
     },
     "sync_db.py::_apply_migrations_21_to_26": {
       "complexity": 1,
       "coverage_fraction": 1.0,
       "crap": 1.0,
-      "end_line": 1050,
+      "end_line": 1048,
       "path": "sync_db.py",
       "qualname": "_apply_migrations_21_to_26",
-      "start_line": 910
+      "start_line": 908
     },
     "sync_db.py::_apply_migrations_6_to_10": {
       "complexity": 1,
       "coverage_fraction": 1.0,
       "crap": 1.0,
-      "end_line": 689,
+      "end_line": 687,
       "path": "sync_db.py",
       "qualname": "_apply_migrations_6_to_10",
-      "start_line": 563
+      "start_line": 561
     },
     "sync_db.py::_migrate_from_legacy_db": {
       "complexity": 3,
       "coverage_fraction": 1.0,
       "crap": 3.0,
-      "end_line": 1134,
+      "end_line": 1132,
       "path": "sync_db.py",
       "qualname": "_migrate_from_legacy_db",
-      "start_line": 1117
+      "start_line": 1115
     },
     "sync_db.py::_open_sync_db": {
       "complexity": 2,
       "coverage_fraction": 1.0,
       "crap": 2.0,
-      "end_line": 444,
+      "end_line": 442,
       "path": "sync_db.py",
       "qualname": "_open_sync_db",
-      "start_line": 433
+      "start_line": 431
     },
     "sync_db.py::_row_first_int": {
       "complexity": 5,
       "coverage_fraction": 0.75,
       "crap": 5.390625,
-      "end_line": 455,
+      "end_line": 453,
       "path": "sync_db.py",
       "qualname": "_row_first_int",
-      "start_line": 447
+      "start_line": 445
     },
     "sync_db.py::_schema_ready": {
       "complexity": 4,
       "coverage_fraction": 0.75,
       "crap": 4.25,
-      "end_line": 481,
+      "end_line": 479,
       "path": "sync_db.py",
       "qualname": "_schema_ready",
-      "start_line": 472
+      "start_line": 470
     },
     "sync_db.py::ensure_sync_schema": {
       "complexity": 4,
       "coverage_fraction": 1.0,
       "crap": 4.0,
-      "end_line": 1109,
+      "end_line": 1107,
       "path": "sync_db.py",
       "qualname": "ensure_sync_schema",
-      "start_line": 1086
+      "start_line": 1084
     },
     "sync_db.py::get_sync_db_path": {
       "complexity": 1,
       "coverage_fraction": 1.0,
       "crap": 1.0,
-      "end_line": 425,
+      "end_line": 423,
       "path": "sync_db.py",
       "qualname": "get_sync_db_path",
       "start_line": 421
@@ -5827,433 +5908,442 @@
       "complexity": 5,
       "coverage_fraction": 0.933333,
       "crap": 5.007407,
-      "end_line": 1173,
+      "end_line": 1171,
       "path": "sync_db.py",
       "qualname": "migrate_legacy_databases",
-      "start_line": 1137
+      "start_line": 1135
     },
     "sync_db.py::open_sync_db_reader": {
       "complexity": 1,
       "coverage_fraction": 1.0,
       "crap": 1.0,
-      "end_line": 464,
+      "end_line": 462,
       "path": "sync_db.py",
       "qualname": "open_sync_db_reader",
-      "start_line": 458
+      "start_line": 456
     },
     "sync_db.py::register_shutdown_handler": {
       "complexity": 1,
       "coverage_fraction": 1.0,
       "crap": 1.0,
-      "end_line": 1220,
+      "end_line": 1218,
       "path": "sync_db.py",
       "qualname": "register_shutdown_handler",
-      "start_line": 1181
+      "start_line": 1179
     },
     "sync_db.py::register_shutdown_handler._on_sigterm": {
       "complexity": 4,
       "coverage_fraction": 0.461538,
       "crap": 6.497952,
-      "end_line": 1217,
+      "end_line": 1215,
       "path": "sync_db.py",
       "qualname": "register_shutdown_handler._on_sigterm",
-      "start_line": 1199
+      "start_line": 1197
     },
     "sync_worker.py::FullSyncWorker.__init__": {
       "complexity": 1,
       "coverage_fraction": 1.0,
       "crap": 1.0,
-      "end_line": 885,
+      "end_line": 892,
       "path": "sync_worker.py",
       "qualname": "FullSyncWorker.__init__",
-      "start_line": 877
+      "start_line": 884
     },
     "sync_worker.py::FullSyncWorker._fetch_batch": {
       "complexity": 5,
       "coverage_fraction": 1.0,
       "crap": 5.0,
-      "end_line": 1030,
+      "end_line": 1037,
       "path": "sync_worker.py",
       "qualname": "FullSyncWorker._fetch_batch",
-      "start_line": 989
+      "start_line": 996
     },
     "sync_worker.py::FullSyncWorker._next_pending_dialog": {
       "complexity": 3,
       "coverage_fraction": 1.0,
       "crap": 3.0,
-      "end_line": 987,
+      "end_line": 994,
       "path": "sync_worker.py",
       "qualname": "FullSyncWorker._next_pending_dialog",
-      "start_line": 978
+      "start_line": 985
     },
     "sync_worker.py::FullSyncWorker._resolve_batch_entity_name_map": {
       "complexity": 8,
       "coverage_fraction": 0.466667,
       "crap": 17.709037,
-      "end_line": 1048,
+      "end_line": 1055,
       "path": "sync_worker.py",
       "qualname": "FullSyncWorker._resolve_batch_entity_name_map",
-      "start_line": 1032
+      "start_line": 1039
     },
     "sync_worker.py::FullSyncWorker._store_batch_page": {
       "complexity": 7,
       "coverage_fraction": 1.0,
       "crap": 7.0,
-      "end_line": 1103,
+      "end_line": 1110,
       "path": "sync_worker.py",
       "qualname": "FullSyncWorker._store_batch_page",
-      "start_line": 1050
+      "start_line": 1057
     },
     "sync_worker.py::FullSyncWorker.bootstrap_dms": {
       "complexity": 11,
       "coverage_fraction": 1.0,
       "crap": 11.0,
-      "end_line": 950,
+      "end_line": 957,
       "path": "sync_worker.py",
       "qualname": "FullSyncWorker.bootstrap_dms",
-      "start_line": 891
+      "start_line": 898
     },
     "sync_worker.py::FullSyncWorker.process_one_batch": {
       "complexity": 3,
       "coverage_fraction": 1.0,
       "crap": 3.0,
-      "end_line": 972,
+      "end_line": 979,
       "path": "sync_worker.py",
       "qualname": "FullSyncWorker.process_one_batch",
-      "start_line": 952
+      "start_line": 959
     },
     "sync_worker.py::_MessagesPageLike.__iter__": {
       "complexity": 1,
       "coverage_fraction": 1.0,
       "crap": 1.0,
-      "end_line": 215,
+      "end_line": 213,
       "path": "sync_worker.py",
       "qualname": "_MessagesPageLike.__iter__",
-      "start_line": 215
+      "start_line": 213
     },
     "sync_worker.py::_PeerNameClient.get_entity": {
       "complexity": 1,
       "coverage_fraction": 1.0,
       "crap": 1.0,
-      "end_line": 229,
+      "end_line": 227,
       "path": "sync_worker.py",
       "qualname": "_PeerNameClient.get_entity",
-      "start_line": 229
+      "start_line": 227
     },
     "sync_worker.py::_SyncWorkerClient.__call__": {
       "complexity": 1,
       "coverage_fraction": 1.0,
       "crap": 1.0,
-      "end_line": 225,
+      "end_line": 223,
       "path": "sync_worker.py",
       "qualname": "_SyncWorkerClient.__call__",
-      "start_line": 225
+      "start_line": 223
     },
     "sync_worker.py::_SyncWorkerClient.get_entity": {
       "complexity": 1,
       "coverage_fraction": 1.0,
       "crap": 1.0,
-      "end_line": 223,
+      "end_line": 221,
       "path": "sync_worker.py",
       "qualname": "_SyncWorkerClient.get_entity",
-      "start_line": 223
+      "start_line": 221
     },
     "sync_worker.py::_SyncWorkerClient.get_messages": {
       "complexity": 1,
       "coverage_fraction": 1.0,
       "crap": 1.0,
-      "end_line": 221,
+      "end_line": 219,
       "path": "sync_worker.py",
       "qualname": "_SyncWorkerClient.get_messages",
-      "start_line": 221
+      "start_line": 219
     },
     "sync_worker.py::_SyncWorkerClient.iter_dialogs": {
       "complexity": 1,
       "coverage_fraction": 1.0,
       "crap": 1.0,
-      "end_line": 219,
+      "end_line": 217,
       "path": "sync_worker.py",
       "qualname": "_SyncWorkerClient.iter_dialogs",
-      "start_line": 219
+      "start_line": 217
     },
     "sync_worker.py::_analytics_entity_type": {
       "complexity": 3,
       "coverage_fraction": 1.0,
       "crap": 3.0,
-      "end_line": 561,
+      "end_line": 566,
       "path": "sync_worker.py",
       "qualname": "_analytics_entity_type",
-      "start_line": 556
+      "start_line": 561
     },
     "sync_worker.py::_attr": {
       "complexity": 1,
       "coverage_fraction": 1.0,
       "crap": 1.0,
-      "end_line": 369,
+      "end_line": 367,
       "path": "sync_worker.py",
       "qualname": "_attr",
-      "start_line": 368
+      "start_line": 366
     },
     "sync_worker.py::_build_fwd_entity_map": {
       "complexity": 6,
       "coverage_fraction": 0.818182,
       "crap": 6.216379,
-      "end_line": 726,
+      "end_line": 731,
       "path": "sync_worker.py",
       "qualname": "_build_fwd_entity_map",
-      "start_line": 709
+      "start_line": 714
     },
     "sync_worker.py::_extract_edit_date": {
       "complexity": 2,
       "coverage_fraction": 1.0,
       "crap": 2.0,
-      "end_line": 746,
+      "end_line": 753,
       "path": "sync_worker.py",
       "qualname": "_extract_edit_date",
-      "start_line": 744
+      "start_line": 751
     },
     "sync_worker.py::_extract_entity_value": {
       "complexity": 5,
       "coverage_fraction": 0.8,
       "crap": 5.2,
-      "end_line": 577,
+      "end_line": 582,
       "path": "sync_worker.py",
       "qualname": "_extract_entity_value",
-      "start_line": 564
+      "start_line": 569
     },
     "sync_worker.py::_extract_grouped_id": {
       "complexity": 2,
       "coverage_fraction": 1.0,
       "crap": 2.0,
-      "end_line": 751,
+      "end_line": 758,
       "path": "sync_worker.py",
       "qualname": "_extract_grouped_id",
-      "start_line": 749
+      "start_line": 756
     },
     "sync_worker.py::_extract_media_description": {
       "complexity": 2,
       "coverage_fraction": 1.0,
       "crap": 2.0,
-      "end_line": 741,
+      "end_line": 748,
       "path": "sync_worker.py",
       "qualname": "_extract_media_description",
-      "start_line": 739
+      "start_line": 746
     },
     "sync_worker.py::_extract_reply_to_peer_id": {
       "complexity": 5,
       "coverage_fraction": 0.888889,
       "crap": 5.034294,
-      "end_line": 763,
+      "end_line": 770,
       "path": "sync_worker.py",
       "qualname": "_extract_reply_to_peer_id",
-      "start_line": 754
+      "start_line": 761
     },
     "sync_worker.py::_extract_sender_first_name": {
       "complexity": 2,
       "coverage_fraction": 1.0,
       "crap": 2.0,
-      "end_line": 736,
+      "end_line": 743,
       "path": "sync_worker.py",
       "qualname": "_extract_sender_first_name",
-      "start_line": 734
+      "start_line": 739
     },
     "sync_worker.py::_extract_sent_at": {
       "complexity": 2,
       "coverage_fraction": 1.0,
       "crap": 2.0,
-      "end_line": 731,
+      "end_line": 736,
       "path": "sync_worker.py",
       "qualname": "_extract_sent_at",
-      "start_line": 729
+      "start_line": 734
+    },
+    "sync_worker.py::_first_non_empty_str": {
+      "complexity": 4,
+      "coverage_fraction": 1.0,
+      "crap": 4.0,
+      "end_line": 374,
+      "path": "sync_worker.py",
+      "qualname": "_first_non_empty_str",
+      "start_line": 370
     },
     "sync_worker.py::_init_entity_types": {
       "complexity": 3,
       "coverage_fraction": 0.714286,
       "crap": 3.209913,
-      "end_line": 528,
+      "end_line": 533,
       "path": "sync_worker.py",
       "qualname": "_init_entity_types",
-      "start_line": 507
+      "start_line": 512
     },
     "sync_worker.py::_insert_sql": {
       "complexity": 3,
       "coverage_fraction": 1.0,
       "crap": 3.0,
-      "end_line": 254,
+      "end_line": 252,
       "path": "sync_worker.py",
       "qualname": "_insert_sql",
-      "start_line": 251
+      "start_line": 249
     },
     "sync_worker.py::_marked_peer_id": {
       "complexity": 4,
       "coverage_fraction": 1.0,
       "crap": 4.0,
-      "end_line": 656,
+      "end_line": 661,
       "path": "sync_worker.py",
       "qualname": "_marked_peer_id",
-      "start_line": 634
+      "start_line": 639
     },
     "sync_worker.py::_resolve_peer_name": {
       "complexity": 10,
       "coverage_fraction": 0.583333,
       "crap": 17.233796,
-      "end_line": 706,
+      "end_line": 711,
       "path": "sync_worker.py",
       "qualname": "_resolve_peer_name",
-      "start_line": 659
+      "start_line": 664
     },
     "sync_worker.py::_touch_entity_record_fields": {
       "complexity": 1,
       "coverage_fraction": 1.0,
       "crap": 1.0,
-      "end_line": 445,
+      "end_line": 450,
       "path": "sync_worker.py",
       "qualname": "_touch_entity_record_fields",
-      "start_line": 438
+      "start_line": 443
     },
     "sync_worker.py::_touch_forward_fields": {
       "complexity": 2,
       "coverage_fraction": 1.0,
       "crap": 2.0,
-      "end_line": 402,
+      "end_line": 407,
       "path": "sync_worker.py",
       "qualname": "_touch_forward_fields",
-      "start_line": 400
+      "start_line": 405
     },
     "sync_worker.py::_touch_forward_record_fields": {
       "complexity": 1,
       "coverage_fraction": 1.0,
       "crap": 1.0,
-      "end_line": 456,
+      "end_line": 461,
       "path": "sync_worker.py",
       "qualname": "_touch_forward_record_fields",
-      "start_line": 449
+      "start_line": 454
     },
     "sync_worker.py::_touch_message_fields": {
       "complexity": 4,
       "coverage_fraction": 1.0,
       "crap": 4.0,
-      "end_line": 411,
+      "end_line": 416,
       "path": "sync_worker.py",
       "qualname": "_touch_message_fields",
-      "start_line": 405
+      "start_line": 410
     },
     "sync_worker.py::_touch_reaction_record_fields": {
       "complexity": 1,
       "coverage_fraction": 1.0,
       "crap": 1.0,
-      "end_line": 435,
+      "end_line": 440,
       "path": "sync_worker.py",
       "qualname": "_touch_reaction_record_fields",
-      "start_line": 434
+      "start_line": 439
     },
     "sync_worker.py::_touch_reply_to_fields": {
       "complexity": 3,
       "coverage_fraction": 1.0,
       "crap": 3.0,
-      "end_line": 397,
+      "end_line": 402,
       "path": "sync_worker.py",
       "qualname": "_touch_reply_to_fields",
-      "start_line": 393
+      "start_line": 398
     },
     "sync_worker.py::_touch_stored_message_fields": {
       "complexity": 1,
       "coverage_fraction": 1.0,
       "crap": 1.0,
-      "end_line": 430,
+      "end_line": 435,
       "path": "sync_worker.py",
       "qualname": "_touch_stored_message_fields",
-      "start_line": 414
+      "start_line": 419
     },
     "sync_worker.py::_utf16_slice": {
       "complexity": 2,
       "coverage_fraction": 1.0,
       "crap": 2.0,
-      "end_line": 553,
+      "end_line": 558,
       "path": "sync_worker.py",
       "qualname": "_utf16_slice",
-      "start_line": 531
+      "start_line": 536
     },
     "sync_worker.py::apply_reactions_delta": {
       "complexity": 3,
       "coverage_fraction": 1.0,
       "crap": 3.0,
-      "end_line": 292,
+      "end_line": 290,
       "path": "sync_worker.py",
       "qualname": "apply_reactions_delta",
-      "start_line": 270
+      "start_line": 268
     },
     "sync_worker.py::extract_entity_rows": {
       "complexity": 7,
       "coverage_fraction": 0.95,
       "crap": 7.006125,
-      "end_line": 631,
+      "end_line": 636,
       "path": "sync_worker.py",
       "qualname": "extract_entity_rows",
-      "start_line": 580
+      "start_line": 585
     },
     "sync_worker.py::extract_fwd_row": {
       "complexity": 9,
       "coverage_fraction": 0.863636,
       "crap": 9.205391,
-      "end_line": 808,
+      "end_line": 815,
       "path": "sync_worker.py",
       "qualname": "extract_fwd_row",
-      "start_line": 766
+      "start_line": 773
     },
     "sync_worker.py::extract_message_row": {
       "complexity": 3,
       "coverage_fraction": 1.0,
       "crap": 3.0,
-      "end_line": 854,
+      "end_line": 861,
       "path": "sync_worker.py",
       "qualname": "extract_message_row",
-      "start_line": 811
+      "start_line": 818
     },
     "sync_worker.py::extract_reactions_rows": {
       "complexity": 6,
       "coverage_fraction": 1.0,
       "crap": 6.0,
-      "end_line": 499,
+      "end_line": 504,
       "path": "sync_worker.py",
       "qualname": "extract_reactions_rows",
-      "start_line": 471
+      "start_line": 476
     },
     "sync_worker.py::extract_reply_and_topic": {
       "complexity": 5,
       "coverage_fraction": 1.0,
       "crap": 5.0,
-      "end_line": 390,
+      "end_line": 395,
       "path": "sync_worker.py",
       "qualname": "extract_reply_and_topic",
-      "start_line": 372
+      "start_line": 377
     },
     "sync_worker.py::extract_reply_count": {
       "complexity": 4,
       "coverage_fraction": 1.0,
       "crap": 4.0,
-      "end_line": 468,
+      "end_line": 473,
       "path": "sync_worker.py",
       "qualname": "extract_reply_count",
-      "start_line": 460
+      "start_line": 465
     },
     "sync_worker.py::insert_messages_with_fts": {
       "complexity": 18,
       "coverage_fraction": 1.0,
       "crap": 18.0,
-      "end_line": 339,
+      "end_line": 337,
       "path": "sync_worker.py",
       "qualname": "insert_messages_with_fts",
-      "start_line": 300
+      "start_line": 298
     },
     "telegram.py::_load_settings": {
       "complexity": 1,
       "coverage_fraction": 0.0,
       "crap": 2.0,
-      "end_line": 13,
+      "end_line": 14,
       "path": "telegram.py",
       "qualname": "_load_settings",
-      "start_line": 12
+      "start_line": 13
     },
     "telegram.py::create_client": {
       "complexity": 3,
@@ -6262,16 +6352,16 @@
       "end_line": 69,
       "path": "telegram.py",
       "qualname": "create_client",
-      "start_line": 34
+      "start_line": 35
     },
     "telegram.py::logout_from_telegram": {
       "complexity": 1,
       "coverage_fraction": 0.0,
       "crap": 2.0,
-      "end_line": 30,
+      "end_line": 31,
       "path": "telegram.py",
       "qualname": "logout_from_telegram",
-      "start_line": 25
+      "start_line": 26
     },
     "tools/_base.py::ToolRegistryEntry.__getitem__": {
       "complexity": 1,
