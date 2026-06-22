@@ -9,6 +9,7 @@ from typing import cast
 
 import pytest
 
+from mcp_telegram.config import ConfigError
 from mcp_telegram.sync_db import (
     _CURRENT_SCHEMA_VERSION,
     _migrate_from_legacy_db,
@@ -68,13 +69,24 @@ def test_db_path_is_separate() -> None:
     path = get_sync_db_path()
     assert path.name == "sync.db", f"Expected sync.db, got {path.name}"
     assert "entity_cache" not in str(path), "sync.db must not share name with entity_cache.db"
-    assert "mcp-telegram" in str(path), "path must be under mcp-telegram state dir"
 
 
-def test_db_path_honours_state_dir_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """MCP_TELEGRAM_STATE_DIR overrides XDG for deployed host-side commands."""
+def test_db_path_missing_config_fails_fast(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """get_sync_db_path fails when config.toml is missing."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "missing-config"))
+
+    with pytest.raises(ConfigError, match="Missing mcp-telegram config"):
+        get_sync_db_path()
+
+
+def test_db_path_honours_config_state_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """config.toml controls the sync.db state directory."""
     state_dir = tmp_path / "state"
-    monkeypatch.setenv("MCP_TELEGRAM_STATE_DIR", str(state_dir))
+    config_home = tmp_path / "custom-config"
+    config_dir = config_home / "mcp-telegram"
+    config_dir.mkdir(parents=True)
+    (config_dir / "config.toml").write_text(f'[state]\ndir = "{state_dir}"\n', encoding="utf-8")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config_home))
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg"))
 
     path = get_sync_db_path()

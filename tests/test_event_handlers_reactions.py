@@ -32,7 +32,11 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
     PeerUser,
 )
 
-from mcp_telegram.event_handlers import EventHandlerManager, _EditedMessageEvent, _RawReactionUpdate
+from mcp_telegram.event_handlers import (
+    EventHandlerManager,
+    _EditedMessageEvent,
+    _RawReactionUpdate,
+)
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 
 _SQLiteConnection = sqlite3.Connection
@@ -108,6 +112,36 @@ def _last_event_at(conn: _SQLiteConnection, dialog_id: int) -> int | None:
         conn.execute("SELECT last_event_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone(),
     )
     return None if row is None or row[0] is None else int(row[0])
+
+
+def _message_text(conn: _SQLiteConnection, dialog_id: int, message_id: int) -> str | None:
+    row = cast(
+        tuple[object, ...] | None,
+        conn.execute(
+            "SELECT text FROM messages WHERE dialog_id=? AND message_id=?",
+            (dialog_id, message_id),
+        ).fetchone(),
+    )
+    return None if row is None or row[0] is None else str(row[0])
+
+
+def _message_version_count(conn: _SQLiteConnection, dialog_id: int, message_id: int) -> int:
+    return _count(
+        conn,
+        "SELECT COUNT(*) FROM message_versions WHERE dialog_id=? AND message_id=?",
+        (dialog_id, message_id),
+    )
+
+
+def _fts_text(conn: _SQLiteConnection, dialog_id: int, message_id: int) -> str | None:
+    row = cast(
+        tuple[object, ...] | None,
+        conn.execute(
+            "SELECT stemmed_text FROM messages_fts WHERE dialog_id=? AND message_id=?",
+            (dialog_id, message_id),
+        ).fetchone(),
+    )
+    return None if row is None or row[0] is None else str(row[0])
 
 
 def _count(conn: _SQLiteConnection, sql: str, parameters: tuple[object, ...] = ()) -> int:
@@ -391,3 +425,54 @@ def test_register_unregister_register_no_double_handler(
     raw_rms = [c for c in rm_calls if c.args and c.args[0] == mgr.on_raw_reaction_update]
     assert len(raw_adds) == 2
     assert len(raw_rms) == 1
+
+
+# ---------------------------------------------------------------------------
+# Raw transcribed audio update
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_on_raw_transcribed_audio_updates_text_and_fts(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """Premium voice transcription update rewrites stored text for synced rows."""
+    from telethon.tl.types import PeerUser  # type: ignore[import-untyped]
+
+    dialog_id = 268071163
+    message_id = 901
+    _enroll(sync_db, dialog_id)
+    _insert_msg(sync_db, dialog_id, message_id, text="")
+
+    update = SimpleNamespace(peer=PeerUser(user_id=dialog_id), msg_id=message_id, text="speech to text", pending=False)
+
+    mgr = _make_manager(mock_client, sync_db, shutdown_event)
+    await mgr.on_raw_transcribed_audio(update)
+
+    assert _message_text(sync_db, dialog_id, message_id) == "speech to text"
+    assert _message_version_count(sync_db, dialog_id, message_id) == 1
+    assert _fts_text(sync_db, dialog_id, message_id)
+    assert _last_event_at(sync_db, dialog_id) is not None
+
+
+@pytest.mark.asyncio
+async def test_on_raw_transcribed_audio_missing_row_is_noop(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """Unseen transcription update does not create phantom rows."""
+    from telethon.tl.types import PeerUser  # type: ignore[import-untyped]
+
+    dialog_id = 268071163
+    _enroll(sync_db, dialog_id)
+
+    update = SimpleNamespace(peer=PeerUser(user_id=dialog_id), msg_id=999, text="speech to text", pending=False)
+
+    mgr = _make_manager(mock_client, sync_db, shutdown_event)
+    await mgr.on_raw_transcribed_audio(update)
+
+    assert _message_version_count(sync_db, dialog_id, 999) == 0
+    assert _message_text(sync_db, dialog_id, 999) is None

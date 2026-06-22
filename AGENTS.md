@@ -17,8 +17,8 @@ Default Docker runtime is one container process:
 - **Daemon-only mode** (`mcp-telegram sync`) — useful for split-mode debugging, but it is not the
   default Docker command.
 
-State lives in the XDG state directory: `sync.db`, `feedback.db`, and the Telegram session file.
-In Docker this is bind-mounted from `/srv/mcp-telegram/database`. The daemon is the only writer;
+State location is explicit in `config.toml`. In Docker it is `/srv/mcp-telegram/database`,
+mounted at the same path inside the container. The daemon is the only writer;
 MCP serving code uses daemon APIs and read-only DB access for lightweight queries.
 
 ### Downstream consumers
@@ -120,7 +120,7 @@ async def new_tool(args: NewTool) -> ToolResult:
 ## Feedback queue
 
 Agents submit feedback via the `submit_feedback` MCP tool; the daemon
-persists rows in `feedback.db` (XDG state dir, alongside `sync.db`).
+persists rows in `feedback.db` (configured state dir, alongside `sync.db`).
 Operator manages the queue with:
 
 - `mcp-telegram feedback list [--limit N]` — print recent entries (most-recent-first)

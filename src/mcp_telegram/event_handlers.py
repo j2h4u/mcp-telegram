@@ -43,10 +43,12 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
     UpdatePinnedForumTopic,
     UpdateReadChannelInbox,
     UpdateReadHistoryInbox,
+    UpdateTranscribedAudio,
 )
 from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
 from .activity_peer_resolve import _InputEntityResolverClient
+from .fts import DELETE_FTS_SQL, INSERT_FTS_SQL, stem_text
 from .models import DialogType
 from .read_state import apply_read_cursor
 from .resolver import latinize
@@ -323,6 +325,10 @@ class EventHandlerManager:
             self.on_raw_reaction_update,
             events.Raw(types=[UpdateMessageReactions]),
         )
+        self._client.add_event_handler(
+            self.on_raw_transcribed_audio,
+            events.Raw(types=[UpdateTranscribedAudio]),
+        )
         # Phase 42: three new Raw handlers for dialog metadata events.
         self._client.add_event_handler(
             self.on_raw_dialog_pinned,
@@ -350,6 +356,7 @@ class EventHandlerManager:
         self._client.remove_event_handler(self.on_message_read)
         self._client.remove_event_handler(self.on_outbox_read)
         self._client.remove_event_handler(self.on_raw_reaction_update)
+        self._client.remove_event_handler(self.on_raw_transcribed_audio)
         self._client.remove_event_handler(self.on_raw_dialog_pinned)
         self._client.remove_event_handler(self.on_raw_channel_chat_update)
         self._client.remove_event_handler(self.on_raw_inbox_read)
@@ -901,6 +908,88 @@ class EventHandlerManager:
         except Exception:
             logger.exception(
                 "event_raw_reaction_apply_failed dialog_id=%d message_id=%d",
+                dialog_id,
+                msg_id,
+            )
+
+    async def on_raw_transcribed_audio(self, update: UpdateTranscribedAudio) -> None:
+        """Handle transcribed voice updates by materializing the new text.
+
+        Telethon emits UpdateTranscribedAudio for premium voice transcription
+        replies. The update carries the target peer, message id, and final text;
+        the underlying message row stays the same, so we rewrite messages.text
+        and refresh FTS if the synced row already exists.
+        """
+        peer: object = getattr(update, "peer", None)
+        msg_id_value: object = getattr(update, "msg_id", None)
+        text_value: object = getattr(update, "text", None)
+        if (
+            peer is None
+            or not isinstance(msg_id_value, int)
+            or not isinstance(text_value, str)
+            or not text_value.strip()
+        ):
+            return
+        try:
+            peer_id: object = get_peer_id(peer)
+            dialog_id = int(cast(int, peer_id))
+        except TypeError, ValueError:
+            logger.debug("raw_transcribed_audio_unparseable_peer peer=%r", peer)
+            return
+        msg_id = msg_id_value
+
+        if dialog_id not in self._synced_dialog_ids:
+            logger.debug(
+                "raw_transcribed_audio_skipped_unsynced dialog_id=%d message_id=%d",
+                dialog_id,
+                msg_id,
+            )
+            return
+
+        try:
+            row = cast(
+                tuple[str | None] | None,
+                self._conn.execute(_SELECT_MESSAGE_TEXT_SQL, (dialog_id, int(msg_id))).fetchone(),
+            )
+            if row is None:
+                logger.debug(
+                    "raw_transcribed_audio_missing_message dialog_id=%d message_id=%d",
+                    dialog_id,
+                    msg_id,
+                )
+                return
+
+            new_text = text_value.strip()
+            old_text = row[0]
+            if old_text == new_text:
+                return
+
+            now = int(time.time())
+            with self._conn:
+                version_row = cast(
+                    tuple[int],
+                    self._conn.execute(_NEXT_VERSION_SQL, (dialog_id, int(msg_id))).fetchone(),
+                )
+                next_ver = int(version_row[0])
+                self._conn.execute(
+                    _INSERT_VERSION_SQL,
+                    (dialog_id, int(msg_id), next_ver, old_text, now),
+                )
+                self._conn.execute(
+                    _UPDATE_MESSAGE_TEXT_SQL,
+                    (new_text, dialog_id, int(msg_id)),
+                )
+                self._conn.execute(DELETE_FTS_SQL, (dialog_id, int(msg_id)))
+                self._conn.execute(INSERT_FTS_SQL, (dialog_id, int(msg_id), stem_text(new_text)))
+                self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
+            logger.info(
+                "event_raw_transcribed_audio dialog_id=%d message_id=%d",
+                dialog_id,
+                msg_id,
+            )
+        except Exception:
+            logger.exception(
+                "event_raw_transcribed_audio_failed dialog_id=%d message_id=%d",
                 dialog_id,
                 msg_id,
             )

@@ -9,6 +9,7 @@ from typing import cast
 
 import pytest
 
+from mcp_telegram.config import ConfigError
 from mcp_telegram.feedback_db import (
     _FEEDBACK_SCHEMA_VERSION,
     VALID_SEVERITIES,
@@ -65,20 +66,23 @@ def test_ensure_feedback_schema_wal_mode(
     assert str(cast(tuple[str], row)[0]).lower() == "wal"
 
 
-def test_get_feedback_db_path_under_xdg_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """get_feedback_db_path() returns a path ending in mcp-telegram/feedback.db."""
-    monkeypatch.delenv("MCP_TELEGRAM_STATE_DIR", raising=False)
+def test_get_feedback_db_path_missing_config_fails_fast(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """get_feedback_db_path() fails when config.toml is missing."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "missing-config"))
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
-    path = get_feedback_db_path()
-    assert path.name == "feedback.db"
-    assert path.parent.name == "mcp-telegram"
-    assert path.parent.exists()
+
+    with pytest.raises(ConfigError, match="Missing mcp-telegram config"):
+        get_feedback_db_path()
 
 
-def test_get_feedback_db_path_honours_state_dir_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """MCP_TELEGRAM_STATE_DIR points host-side operator CLI at deployed state."""
+def test_get_feedback_db_path_honours_config_state_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """config.toml points feedback.db helpers at the configured state directory."""
     state_dir = tmp_path / "deployed-state"
-    monkeypatch.setenv("MCP_TELEGRAM_STATE_DIR", str(state_dir))
+    config_home = tmp_path / "custom-config"
+    config_dir = config_home / "mcp-telegram"
+    config_dir.mkdir(parents=True)
+    (config_dir / "config.toml").write_text(f'[state]\ndir = "{state_dir}"\n', encoding="utf-8")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config_home))
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg"))
 
     path = get_feedback_db_path()

@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from mcp_telegram.config import ConfigError
 from mcp_telegram.daemon_api import DaemonAPIServer, _DaemonClientLike, _ListMessagesDbRequest, get_daemon_socket_path
 from mcp_telegram.daemon_message import _MessageLike, fetch_reaction_counts, message_to_dict
 from mcp_telegram.fts import MESSAGES_FTS_DDL, stem_text
@@ -649,13 +650,24 @@ def test_get_daemon_socket_path() -> None:
     """get_daemon_socket_path returns a path ending in daemon.sock."""
     path = get_daemon_socket_path()
     assert path.name == "daemon.sock", f"Expected daemon.sock, got {path.name}"
-    assert "mcp-telegram" in str(path)
 
 
-def test_get_daemon_socket_path_honours_state_dir_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Daemon socket path follows MCP_TELEGRAM_STATE_DIR for host CLI access."""
+def test_get_daemon_socket_path_missing_config_fails_fast(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """get_daemon_socket_path fails when config.toml is missing."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "missing-config"))
+
+    with pytest.raises(ConfigError, match="Missing mcp-telegram config"):
+        get_daemon_socket_path()
+
+
+def test_get_daemon_socket_path_honours_config_state_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Daemon socket path follows config.toml."""
     state_dir = tmp_path / "state"
-    monkeypatch.setenv("MCP_TELEGRAM_STATE_DIR", str(state_dir))
+    config_home = tmp_path / "custom-config"
+    config_dir = config_home / "mcp-telegram"
+    config_dir.mkdir(parents=True)
+    (config_dir / "config.toml").write_text(f'[state]\ndir = "{state_dir}"\n', encoding="utf-8")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config_home))
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg"))
 
     path = get_daemon_socket_path()

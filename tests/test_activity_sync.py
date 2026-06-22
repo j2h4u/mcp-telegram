@@ -372,6 +372,38 @@ def test_upsert_entities_from_search_inserts_users_and_chats(
     ]
 
 
+def test_upsert_entities_from_search_handles_missing_username_attrs(
+    conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(activity_sync.time, "time", lambda: 1_700_000_456)
+
+    class _ChatWithoutUsername:
+        id = 12
+        title = "Legacy Chat"
+
+    chat = _ChatWithoutUsername()
+    result = FakeSearchResult(messages=[], chats=[cast(_SearchEntityLike, chat)])
+
+    monkeypatch.setattr(activity_sync, "_classify_entity", lambda obj: "chat" if obj is chat else None)
+
+    original_get_peer_id = telethon_utils.get_peer_id
+
+    def _fake_get_peer_id(peer: object) -> int:
+        if peer is chat:
+            return -12
+        return original_get_peer_id(peer)
+
+    monkeypatch.setattr(telethon_utils, "get_peer_id", _fake_get_peer_id)
+
+    _upsert_entities_from_search(conn, cast(_SearchResultLike, result))
+
+    row = cast(
+        tuple[int, str, str | None, str | None, str | None, int] | None,
+        conn.execute("SELECT id, type, name, username, name_normalized, updated_at FROM entities").fetchone(),
+    )
+    assert row == (-12, "chat", "Legacy Chat", None, "legacy chat", 1_700_000_456)
+
+
 def test_upsert_entities_from_search_skips_unclassified_and_peer_id_failures(
     conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
 ) -> None:

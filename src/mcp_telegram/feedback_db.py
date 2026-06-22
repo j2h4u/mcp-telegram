@@ -54,7 +54,7 @@ CREATE TABLE IF NOT EXISTS feedback (
 
 
 def get_feedback_db_path() -> Path:
-    """Return the canonical path for feedback.db under XDG state home."""
+    """Return the canonical path for feedback.db under configured state."""
     return get_state_dir() / "feedback.db"
 
 

@@ -14,6 +14,7 @@ import importlib
 import os
 import shutil
 import sys
+import tomllib
 import traceback
 from collections.abc import Awaitable
 from io import StringIO
@@ -92,6 +93,26 @@ def _load_telegram_credentials() -> tuple[int, str, str]:
         sys.exit(1)
 
     return int(api_id_raw), api_hash, two_fa_password
+
+
+def _config_path() -> Path:
+    return Path.cwd() / "config.toml"
+
+
+def _load_state_dir() -> Path:
+    """Load required state.dir from the operator config."""
+    path = _config_path()
+    if not path.exists():
+        raise SystemExit(f'Missing deploy config: {path}. Create it with:\n[state]\ndir = "/srv/mcp-telegram/database"')
+    with path.open("rb") as config_file:
+        config = tomllib.load(config_file)
+    state_config = config.get("state")
+    if not isinstance(state_config, dict):
+        raise SystemExit(f"Missing [state] section in {path}")
+    value = state_config.get("dir")
+    if not isinstance(value, str) or value.strip() == "":
+        raise SystemExit(f"Missing non-empty state.dir in {path}")
+    return Path(value).expanduser()
 
 
 def qr_to_terminal(data: str) -> str:
@@ -252,7 +273,7 @@ async def _run_qr_login(client: TelegramClient, two_fa_password: str, session_fi
 async def main() -> None:
     api_id, api_hash, two_fa_password = _load_telegram_credentials()
 
-    state_dir = Path(os.environ.get("MCP_TELEGRAM_STATE_DIR", "/srv/mcp-telegram/database"))
+    state_dir = _load_state_dir()
     session_file = state_dir / "mcp_telegram_session"
     session_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
 

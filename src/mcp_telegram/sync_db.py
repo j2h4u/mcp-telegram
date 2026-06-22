@@ -419,7 +419,7 @@ WHERE s.status = 'own_only' AND d.dialog_id IS NULL
 
 
 def get_sync_db_path() -> Path:
-    """Return the canonical path for sync.db under XDG state home."""
+    """Return the canonical path for sync.db under configured state."""
     return get_state_dir() / "sync.db"
 
 

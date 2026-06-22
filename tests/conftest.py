@@ -23,6 +23,17 @@ import pytest
 from telethon.errors import RPCError
 
 
+@pytest.fixture(autouse=True)
+def _mcp_telegram_test_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give tests an explicit state-dir config; production fails fast without one."""
+    config_home = tmp_path / "config"
+    state_dir = tmp_path / "state"
+    config_dir = config_home / "mcp-telegram"
+    config_dir.mkdir(parents=True)
+    (config_dir / "config.toml").write_text(f'[state]\ndir = "{state_dir}"\n', encoding="utf-8")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config_home))
+
+
 class _MockEntityCache:
     """Minimal stand-in for deleted EntityCache — used by resolver tests."""
 

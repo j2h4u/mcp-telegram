@@ -149,7 +149,7 @@ get_sync_status(dialog_id=<dialog_id>)
 
    ```bash
    mkdir -p /opt/docker/mcp-telegram /srv/mcp-telegram/database
-   cp deploy/docker-compose.yml deploy/telegram_qr_login.py deploy/AGENTS.md /opt/docker/mcp-telegram/
+   cp deploy/docker-compose.yml deploy/config.toml deploy/telegram_qr_login.py deploy/AGENTS.md /opt/docker/mcp-telegram/
    ```
 
 3. Edit `/opt/docker/mcp-telegram/docker-compose.yml` and set
@@ -175,9 +175,8 @@ get_sync_status(dialog_id=<dialog_id>)
    prints a QR code in the terminal, and waits for you to approve that login
    from an already logged-in Telegram mobile or desktop app. After approval, it
    writes `/srv/mcp-telegram/database/mcp_telegram_session.session`. The
-   compose file mounts `/srv/mcp-telegram/database/` into the container as the
-   MCP server's persistent state directory. Override `MCP_TELEGRAM_STATE_DIR`
-   only if this host uses a different durable data root.
+   deploy `config.toml` explicitly sets that persistent state directory; the
+   compose file mounts the same directory into the container.
 
    ```bash
    cd /opt/docker/mcp-telegram
@@ -283,11 +282,10 @@ uv run python -m devtools.mcp_client.cli call-tool \
   file on this machine. `deploy/docker-compose.yml` is the repository template;
   the deployed file can have local-only values such as the absolute repository
   path and extra Docker networks.
-- Runtime state lives under the XDG state directory inside the container:
-  `/root/.local/state/mcp-telegram`. In Docker, that directory is backed by the
-  host directory `/srv/mcp-telegram/database`.
+- Runtime state location is explicit in `config.toml`: `/srv/mcp-telegram/database`.
+  The Docker container mounts the same host directory at the same path.
 - The live Telegram mirror is `/srv/mcp-telegram/database/sync.db` on the
-  host and `/root/.local/state/mcp-telegram/sync.db` inside the container. Its
+  host and inside the container. Its
   `sync.db-wal` and `sync.db-shm` siblings are normal SQLite WAL-mode sidecar
   files, not separate databases.
 - `feedback.db` in the same directory stores agent-submitted feedback.

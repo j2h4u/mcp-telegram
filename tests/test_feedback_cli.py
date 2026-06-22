@@ -112,6 +112,25 @@ def test_feedback_list_shows_rows(feedback_db):
         assert tag in result.stdout
 
 
+def test_feedback_list_uses_config_state_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """config.toml lets feedback commands read the configured feedback.db."""
+    state_dir = tmp_path / "state"
+    config_home = tmp_path / "custom-config"
+    config_dir = config_home / "mcp-telegram"
+    config_dir.mkdir(parents=True)
+    (config_dir / "config.toml").write_text(f'[state]\ndir = "{state_dir}"\n', encoding="utf-8")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config_home))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg"))
+    state_dir.mkdir()
+    db_path = state_dir / "feedback.db"
+    _insert(db_path, "deployed state row", severity="bug")
+
+    result = runner.invoke(app, ["feedback", "list"])
+
+    assert result.exit_code == 0, result.stdout
+    assert "deployed state row" in result.stdout
+
+
 def test_feedback_list_respects_limit(feedback_db):
     ids = [_insert(feedback_db, f"row {i}") for i in range(5)]
     result = runner.invoke(app, ["feedback", "list", "--limit", "2"])

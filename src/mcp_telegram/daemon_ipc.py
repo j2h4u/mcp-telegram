@@ -12,5 +12,5 @@ from .state import get_state_dir
 
 
 def get_daemon_socket_path() -> Path:
-    """Return the canonical daemon Unix socket path under XDG state home."""
+    """Return the canonical daemon Unix socket path under configured state."""
     return get_state_dir() / "daemon.sock"

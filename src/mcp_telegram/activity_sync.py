@@ -181,6 +181,11 @@ def _classify_entity(obj: object) -> str | None:
     return None if dt is DialogType.UNKNOWN else dt.value
 
 
+def _optional_entity_attr(obj: object, attr: str) -> str | None:
+    value = getattr(obj, attr, None)
+    return value if isinstance(value, str) and value else None
+
+
 def _upsert_entities_from_search(conn: sqlite3.Connection, result: _SearchResultLike) -> None:
     """Upsert users/chats from SearchRequest response into entities table.
 
@@ -197,8 +202,10 @@ def _upsert_entities_from_search(conn: sqlite3.Connection, result: _SearchResult
         etype = _classify_entity(u)
         if etype is None:
             continue
-        name = " ".join(p for p in (u.first_name, u.last_name) if p) or (u.username or None)
-        username = u.username
+        first_name = _optional_entity_attr(u, "first_name")
+        last_name = _optional_entity_attr(u, "last_name")
+        username = _optional_entity_attr(u, "username")
+        name = " ".join(p for p in (first_name, last_name) if p) or username
         rows.append((int(u.id), etype, name, username, _normalize(name), now))
 
     for c in result.chats or ():
@@ -209,8 +216,8 @@ def _upsert_entities_from_search(conn: sqlite3.Connection, result: _SearchResult
             pid = int(cast(int | str, get_peer_id(c)))  # yields -100XXXXX for Channel
         except TypeError:
             continue
-        name = c.title or None
-        username = c.username
+        name = _optional_entity_attr(c, "title")
+        username = _optional_entity_attr(c, "username")
         rows.append((pid, etype, name, username, _normalize(name), now))
 
     if not rows:
