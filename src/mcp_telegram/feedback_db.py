@@ -21,7 +21,7 @@ import sqlite3
 from pathlib import Path
 from typing import cast
 
-from xdg_base_dirs import xdg_state_home  # type: ignore[import-error]
+from .state import get_state_dir
 
 __all__ = [
     "VALID_SEVERITIES",
@@ -55,9 +55,7 @@ CREATE TABLE IF NOT EXISTS feedback (
 
 def get_feedback_db_path() -> Path:
     """Return the canonical path for feedback.db under XDG state home."""
-    db_dir = xdg_state_home() / "mcp-telegram"
-    db_dir.mkdir(parents=True, exist_ok=True)
-    return db_dir / "feedback.db"
+    return get_state_dir() / "feedback.db"
 
 
 # ---------------------------------------------------------------------------

@@ -13,6 +13,7 @@ import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Final, Protocol, TypedDict, Unpack, cast
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -649,6 +650,18 @@ def test_get_daemon_socket_path() -> None:
     path = get_daemon_socket_path()
     assert path.name == "daemon.sock", f"Expected daemon.sock, got {path.name}"
     assert "mcp-telegram" in str(path)
+
+
+def test_get_daemon_socket_path_honours_state_dir_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Daemon socket path follows MCP_TELEGRAM_STATE_DIR for host CLI access."""
+    state_dir = tmp_path / "state"
+    monkeypatch.setenv("MCP_TELEGRAM_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg"))
+
+    path = get_daemon_socket_path()
+
+    assert path == state_dir / "daemon.sock"
+    assert state_dir.exists()
 
 
 # ---------------------------------------------------------------------------

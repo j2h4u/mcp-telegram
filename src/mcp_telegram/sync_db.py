@@ -6,7 +6,7 @@ import sqlite3
 from pathlib import Path
 from typing import cast
 
-from xdg_base_dirs import xdg_state_home  # type: ignore[import-error]
+from .state import get_state_dir
 
 _CURRENT_SCHEMA_VERSION = 26
 _SCHEMA_VERSION_WITH_FTS = 3
@@ -420,9 +420,7 @@ WHERE s.status = 'own_only' AND d.dialog_id IS NULL
 
 def get_sync_db_path() -> Path:
     """Return the canonical path for sync.db under XDG state home."""
-    db_dir = xdg_state_home() / "mcp-telegram"
-    db_dir.mkdir(parents=True, exist_ok=True)
-    return db_dir / "sync.db"
+    return get_state_dir() / "sync.db"
 
 
 # ---------------------------------------------------------------------------

@@ -4,7 +4,8 @@ from typing import cast
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from telethon import TelegramClient  # type: ignore[import-untyped]
-from xdg_base_dirs import xdg_state_home  # type: ignore[import-error]
+
+from .state import get_state_dir
 
 logger = logging.getLogger(__name__)
 
@@ -59,8 +60,7 @@ def create_client(
         settings = TelegramSettings(api_id=api_id, api_hash=api_hash)
     else:
         settings = _load_settings()
-    state_home = xdg_state_home() / "mcp-telegram"
-    state_home.mkdir(parents=True, exist_ok=True, mode=0o700)
+    state_home = get_state_dir(mode=0o700)
     return TelegramClient(
         state_home / session_name,
         cast(int, settings.api_id),

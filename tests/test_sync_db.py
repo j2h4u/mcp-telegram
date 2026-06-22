@@ -71,6 +71,18 @@ def test_db_path_is_separate() -> None:
     assert "mcp-telegram" in str(path), "path must be under mcp-telegram state dir"
 
 
+def test_db_path_honours_state_dir_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """MCP_TELEGRAM_STATE_DIR overrides XDG for deployed host-side commands."""
+    state_dir = tmp_path / "state"
+    monkeypatch.setenv("MCP_TELEGRAM_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg"))
+
+    path = get_sync_db_path()
+
+    assert path == state_dir / "sync.db"
+    assert state_dir.exists()
+
+
 # ---------------------------------------------------------------------------
 # SYNC-01: WAL mode
 # ---------------------------------------------------------------------------

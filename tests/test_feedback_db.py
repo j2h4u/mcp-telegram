@@ -67,11 +67,24 @@ def test_ensure_feedback_schema_wal_mode(
 
 def test_get_feedback_db_path_under_xdg_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """get_feedback_db_path() returns a path ending in mcp-telegram/feedback.db."""
+    monkeypatch.delenv("MCP_TELEGRAM_STATE_DIR", raising=False)
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
     path = get_feedback_db_path()
     assert path.name == "feedback.db"
     assert path.parent.name == "mcp-telegram"
     assert path.parent.exists()
+
+
+def test_get_feedback_db_path_honours_state_dir_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """MCP_TELEGRAM_STATE_DIR points host-side operator CLI at deployed state."""
+    state_dir = tmp_path / "deployed-state"
+    monkeypatch.setenv("MCP_TELEGRAM_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg"))
+
+    path = get_feedback_db_path()
+
+    assert path == state_dir / "feedback.db"
+    assert state_dir.exists()
 
 
 def test_valid_severities_constant() -> None:

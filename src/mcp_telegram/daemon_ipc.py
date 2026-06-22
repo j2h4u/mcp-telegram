@@ -8,9 +8,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from xdg_base_dirs import xdg_state_home  # type: ignore[import-error]
+from .state import get_state_dir
 
 
 def get_daemon_socket_path() -> Path:
     """Return the canonical daemon Unix socket path under XDG state home."""
-    return xdg_state_home() / "mcp-telegram" / "daemon.sock"
+    return get_state_dir() / "daemon.sock"
