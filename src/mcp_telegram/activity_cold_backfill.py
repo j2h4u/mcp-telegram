@@ -108,11 +108,11 @@ async def _run_cold_backfill_pass_safe(
 
 def _cold_backfill_sleep_seconds(pass_result: ColdPassResult, idle_interval: float) -> float:
     if pass_result.outcome is ColdPassOutcome.NO_DUE_PEER:
-        logger.debug("activity_cold_backfill_idle sleeping=%.0fs", idle_interval)
+        logger.debug("activity_cold_backfill_idle next_sleep_s=%.3f", idle_interval)
         return idle_interval
 
     logger.debug(
-        "activity_cold_backfill_loop outcome=%s persisted=%d sleeping=%.0fs",
+        "activity_cold_backfill_loop outcome=%s persisted=%d next_sleep_s=%.3f",
         pass_result.outcome,
         pass_result.persisted,
         _PACING.history.batch_s,
@@ -158,6 +158,7 @@ async def run_cold_backfill_pass(
 
     Only cold_* columns are written — hot_* columns are never touched.
     """
+    started_at = time.monotonic()
     now = int(time.time())
 
     # Select ONE due peer — oldest-updated first (round-robin anti-starvation)
@@ -218,10 +219,13 @@ async def run_cold_backfill_pass(
             cold_next_retry_at=next_retry_at,
         )
         logger.warning(
-            "activity_cold_backfill_flood dialog_id=%r flood_wait_seconds=%d cold_next_retry_at=%d",
+            "activity_cold_backfill_flood dialog_id=%r flood_wait_seconds=%d retry_delay_s=%d"
+            " cold_next_retry_at=%d duration_s=%.3f",
             dialog_id,
             result.flood_wait_seconds,
+            result.flood_wait_seconds or 0,
             next_retry_at,
+            time.monotonic() - started_at,
         )
         return ColdPassResult(outcome=ColdPassOutcome.FLOOD_WAIT, persisted=0)
 
@@ -238,9 +242,11 @@ async def run_cold_backfill_pass(
             cold_last_error="access_skip",
         )
         logger.debug(
-            "activity_cold_backfill_access_skip dialog_id=%r cold_next_retry_at=%d",
+            "activity_cold_backfill_access_skip dialog_id=%r retry_delay_s=%.3f cold_next_retry_at=%d duration_s=%.3f",
             dialog_id,
+            _PACING.history.access_retry_s,
             next_retry_at,
+            time.monotonic() - started_at,
         )
         # A peer WAS processed — return ZERO_PERSISTED so loop does not idle
         return ColdPassResult(outcome=ColdPassOutcome.ZERO_PERSISTED, persisted=0)
@@ -255,9 +261,10 @@ async def run_cold_backfill_pass(
             cold_next_retry_at=None,
         )
         logger.info(
-            "activity_cold_backfill_complete dialog_id=%r offset_id=%d",
+            "activity_cold_backfill_complete dialog_id=%r offset_id=%d duration_s=%.3f",
             dialog_id,
             offset_id,
+            time.monotonic() - started_at,
         )
         # Peer was processed; return ZERO_PERSISTED (not NO_DUE_PEER)
         return ColdPassResult(outcome=ColdPassOutcome.ZERO_PERSISTED, persisted=0)
@@ -273,11 +280,12 @@ async def run_cold_backfill_pass(
         cold_next_retry_at=None,
     )
     logger.debug(
-        "activity_cold_backfill_batch dialog_id=%r old_offset=%d new_offset=%r persisted=%d",
+        "activity_cold_backfill_batch dialog_id=%r old_offset=%d new_offset=%r persisted=%d duration_s=%.3f",
         dialog_id,
         offset_id,
         new_offset,
         result.persisted,
+        time.monotonic() - started_at,
     )
 
     if result.persisted and result.persisted > 0:

@@ -123,6 +123,7 @@ def _save_hot_min_id_gap_state(
 
 async def _run_hot_sweep_peer(ctx: _HotSweepPeerContext) -> _HotSweepPeerOutcome:
     """Process one peer across all needed pages for the current hot sweep pass."""
+    started_at = time.monotonic()
     pass_min_id = (ctx.old_hot_cursor + 1) if ctx.old_hot_cursor else 0
     max_seen = ctx.old_hot_cursor or 0
     page_offset = 0
@@ -151,11 +152,15 @@ async def _run_hot_sweep_peer(ctx: _HotSweepPeerContext) -> _HotSweepPeerOutcome
             )
             logger.warning(
                 "activity_hot_sweep_flood dialog_id=%r flood_wait_seconds=%d"
-                " max_seen=%d pages_fetched=%d — halting pass (account-global wait)",
+                " retry_delay_s=%d max_seen=%d pages_fetched=%d written=%d duration_s=%.3f"
+                " — halting pass (account-global wait)",
                 ctx.dialog_id,
+                result.flood_wait_seconds,
                 result.flood_wait_seconds,
                 max_seen,
                 pages_fetched,
+                total_written,
+                time.monotonic() - started_at,
             )
             return _HotSweepPeerOutcome(written=total_written, flooded=True)
 
@@ -163,10 +168,14 @@ async def _run_hot_sweep_peer(ctx: _HotSweepPeerContext) -> _HotSweepPeerOutcome
             transient_retry_at = int(time.time()) + _ACCESS_SKIP_RETRY_S
             _save_hot_access_skip_state(ctx.conn, ctx.dialog_id, retry_at=transient_retry_at)
             logger.debug(
-                "activity_hot_sweep_access_skip dialog_id=%r retry_at=%d pages_fetched=%d",
+                "activity_hot_sweep_access_skip dialog_id=%r retry_at=%d pages_fetched=%d"
+                " written=%d retry_delay_s=%d duration_s=%.3f",
                 ctx.dialog_id,
                 transient_retry_at,
                 pages_fetched,
+                total_written,
+                _ACCESS_SKIP_RETRY_S,
+                time.monotonic() - started_at,
             )
             return _HotSweepPeerOutcome(written=total_written, flooded=False)
 
@@ -178,20 +187,36 @@ async def _run_hot_sweep_peer(ctx: _HotSweepPeerContext) -> _HotSweepPeerOutcome
         if _is_hot_page_drained(result):
             _save_hot_drained_state(ctx.conn, ctx.dialog_id, hot_cursor=max_seen, now=ctx.now)
             logger.debug(
-                "activity_hot_sweep_peer_done dialog_id=%r hot_cursor=%d pages_fetched=%d written=%d",
+                "activity_hot_sweep_peer_done dialog_id=%r hot_cursor=%d pages_fetched=%d written=%d duration_s=%.3f",
                 ctx.dialog_id,
                 max_seen,
                 pages_fetched,
-                result.persisted,
+                total_written,
+                time.monotonic() - started_at,
             )
             return _HotSweepPeerOutcome(written=total_written, flooded=False)
 
         if result.min_id is None:
             _save_hot_min_id_gap_state(ctx.conn, ctx.dialog_id, hot_cursor=max_seen, now=ctx.now)
+            logger.debug(
+                "activity_hot_sweep_min_id_gap dialog_id=%r hot_cursor=%d pages_fetched=%d written=%d duration_s=%.3f",
+                ctx.dialog_id,
+                max_seen,
+                pages_fetched,
+                total_written,
+                time.monotonic() - started_at,
+            )
             return _HotSweepPeerOutcome(written=total_written, flooded=False)
 
         page_offset = result.min_id
 
+    logger.debug(
+        "activity_hot_sweep_peer_shutdown dialog_id=%r pages_fetched=%d written=%d duration_s=%.3f",
+        ctx.dialog_id,
+        pages_fetched,
+        total_written,
+        time.monotonic() - started_at,
+    )
     return _HotSweepPeerOutcome(written=total_written, flooded=False)
 
 
@@ -210,6 +235,7 @@ async def run_hot_sweep_pass(
 
     Returns total messages written this pass.
     """
+    started_at = time.monotonic()
     now = int(time.time())
 
     # Step 1: cheap working-set refresh — also refreshes last_activity_at
@@ -235,6 +261,8 @@ async def run_hot_sweep_pass(
     logger.info("activity_hot_sweep_pass_start peers_selected=%d", len(rows))
 
     total_written = 0
+    peers_processed = 0
+    flooded = False
 
     for dialog_id, old_hot_cursor in rows:
         if shutdown_event.is_set():
@@ -250,17 +278,22 @@ async def run_hot_sweep_pass(
                 shutdown_event=shutdown_event,
             )
         )
+        peers_processed += 1
         total_written += peer_result.written
 
         # Account-global FloodWait hit on this peer — do not advance to the next
         # peer (that would send another request during the wait window).
         if peer_result.flooded:
+            flooded = True
             break
 
     logger.info(
-        "activity_hot_sweep_pass_done peers=%d total_written=%d",
+        "activity_hot_sweep_pass_done peers_selected=%d peers_processed=%d total_written=%d flooded=%s duration_s=%.3f",
         len(rows),
+        peers_processed,
         total_written,
+        flooded,
+        time.monotonic() - started_at,
     )
     return total_written
 

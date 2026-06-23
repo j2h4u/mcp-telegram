@@ -135,6 +135,10 @@ async def _pace_successful_search_request() -> None:
     await asyncio.sleep(_PACING.search.success_s)
 
 
+def _elapsed_s(started_at: float) -> float:
+    return time.monotonic() - started_at
+
+
 def _coerce_peer_sweep_request(*args: object, **kwargs: object) -> PeerSweepRequest:
     """Normalize legacy call shapes into a single request record."""
     if len(args) == 1 and isinstance(args[0], PeerSweepRequest) and not kwargs:
@@ -201,6 +205,7 @@ async def sweep_peer_once(*args: object, **kwargs: object) -> SweepResult:
         )
 
     # Step 2: issue per-peer self-search with concrete peer (not InputPeerEmpty)
+    search_started_at = time.monotonic()
     try:
         result = await call_with_timeout(
             request.client,
@@ -221,9 +226,10 @@ async def sweep_peer_once(*args: object, **kwargs: object) -> SweepResult:
         )
     except FloodWaitError as exc:
         logger.warning(
-            "sweep_peer_once_flood dialog_id=%r flood_wait_seconds=%d",
+            "sweep_peer_once_flood dialog_id=%r flood_wait_seconds=%d rpc_duration_s=%.3f",
             request.dialog_id,
             exc.seconds,
+            _elapsed_s(search_started_at),
         )
         # FloodWait-NEUTRAL: surface the wait, do not sleep
         return SweepResult(
@@ -235,7 +241,12 @@ async def sweep_peer_once(*args: object, **kwargs: object) -> SweepResult:
             flood_wait_seconds=int(exc.seconds),
         )
     except TimeoutError:
-        logger.warning("sweep_peer_once_timeout dialog_id=%r offset_id=%r", request.dialog_id, request.offset_id)
+        logger.warning(
+            "sweep_peer_once_timeout dialog_id=%r offset_id=%r rpc_duration_s=%.3f",
+            request.dialog_id,
+            request.offset_id,
+            _elapsed_s(search_started_at),
+        )
         # Wedged RPC is transient — ACCESS_SKIP, never HISTORY_FLOOR
         return SweepResult(
             fetched_ids=[],
@@ -245,11 +256,21 @@ async def sweep_peer_once(*args: object, **kwargs: object) -> SweepResult:
             skip_reason=SkipReason.ACCESS_SKIP,
         )
 
+    rpc_duration_s = _elapsed_s(search_started_at)
     await _pace_successful_search_request()
     batch = list(cast(_SweepResultLike, result).messages or [])
 
     # Step 5: genuinely empty batch from a reachable peer → history floor
     if not batch:
+        logger.debug(
+            "sweep_peer_once_done dialog_id=%r outcome=%s fetched=%d persisted=%d rpc_duration_s=%.3f pacing_s=%.3f",
+            request.dialog_id,
+            SkipReason.HISTORY_FLOOR,
+            0,
+            0,
+            rpc_duration_s,
+            _PACING.search.success_s,
+        )
         return SweepResult(
             fetched_ids=[],
             persisted=0,
@@ -273,6 +294,15 @@ async def sweep_peer_once(*args: object, **kwargs: object) -> SweepResult:
             persisted = len(extracted)
 
     msg_ids = [m.id for m in batch]
+    logger.debug(
+        "sweep_peer_once_done dialog_id=%r outcome=%s fetched=%d persisted=%d rpc_duration_s=%.3f pacing_s=%.3f",
+        request.dialog_id,
+        SkipReason.NONE,
+        len(msg_ids),
+        persisted,
+        rpc_duration_s,
+        _PACING.search.success_s,
+    )
     return SweepResult(
         fetched_ids=msg_ids,
         persisted=persisted,

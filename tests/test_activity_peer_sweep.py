@@ -19,6 +19,7 @@ Phase 54 plan 02–04 test suite.
 from __future__ import annotations
 
 import asyncio
+import logging
 import sqlite3
 import time
 from contextlib import closing
@@ -409,7 +410,10 @@ def test_sweep_peer_once_floodwait_reports_seconds(monkeypatch: pytest.MonkeyPat
         )
 
 
-def test_sweep_peer_once_success_invokes_pacing_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_sweep_peer_once_success_invokes_pacing_sleep(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """A successful SearchRequest should apply the fixed post-RPC pause."""
     with closing(_make_db()) as conn:
         sleep_calls: list[float] = []
@@ -441,18 +445,25 @@ def test_sweep_peer_once_success_invokes_pacing_sleep(monkeypatch: pytest.Monkey
         monkeypatch.setattr("mcp_telegram.activity_peer_sweep.extract_message_row", fake_extract_message_row)
         monkeypatch.setattr("mcp_telegram.activity_peer_sweep.insert_messages_with_fts", fake_insert_messages_with_fts)
 
-        result = asyncio.run(
-            sweep_peer_once(
-                client=_FakeClient(),
-                conn=conn,
-                dialog_id=333,
-                offset_id=13,
-                min_id=6,
-                limit=30,
+        with caplog.at_level(logging.DEBUG, logger="mcp_telegram.activity_peer_sweep"):
+            result = asyncio.run(
+                sweep_peer_once(
+                    client=_FakeClient(),
+                    conn=conn,
+                    dialog_id=333,
+                    offset_id=13,
+                    min_id=6,
+                    limit=30,
+                )
             )
-        )
 
         assert sleep_calls == [_PACING.search.success_s]
+        assert any(
+            "sweep_peer_once_done" in record.message
+            and "rpc_duration_s=" in record.message
+            and f"pacing_s={_PACING.search.success_s:.3f}" in record.message
+            for record in caplog.records
+        )
         assert result == SweepResult(
             fetched_ids=[8],
             persisted=1,
