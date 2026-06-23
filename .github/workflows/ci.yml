@@ -38,6 +38,9 @@ jobs:
       - name: Static quality gate
         run: just check
 
+      - name: Type check
+        run: just typecheck
+
   unit:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -64,7 +67,7 @@ jobs:
 
   coverage:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
 
@@ -83,8 +86,8 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked
 
-      - name: Coverage gate
-        run: just coverage
+      - name: CRAP ratchet
+        run: just crap-ratchet
 
   ci:
     if: always()

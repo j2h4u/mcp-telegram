@@ -507,7 +507,7 @@ def _entity_structured_content(
     display_name: str,
     resolution: str,
 ) -> dict[str, object]:
-    input_value = args.entity if args.entity is not None else str(args.exact_entity_id)
+    input_value = _entity_input_label(args)
     return {
         "resolved_query": {
             "input": input_value,
@@ -528,6 +528,10 @@ def _entity_structured_content(
     }
 
 
+def _entity_input_label(args: GetEntityInfo) -> str:
+    return args.entity if args.entity is not None else str(args.exact_entity_id)
+
+
 @dataclass(frozen=True, slots=True)
 class _EntityLookup:
     entity_id: int
@@ -535,18 +539,15 @@ class _EntityLookup:
     resolution: str
 
 
-def _numeric_entity_lookup(args: GetEntityInfo) -> _EntityLookup | None:
-    assert args.entity is not None
+def _numeric_entity_lookup(entity: str) -> _EntityLookup | None:
     try:
-        entity_id = int(args.entity)
+        entity_id = int(entity)
     except ValueError:
         return None
-    return _EntityLookup(entity_id=entity_id, display_name=args.entity, resolution="numeric_id")
+    return _EntityLookup(entity_id=entity_id, display_name=entity, resolution="numeric_id")
 
 
-async def _resolve_entity_lookup(args: GetEntityInfo) -> ToolResult | _EntityLookup:
-    assert args.entity is not None
-    entity = args.entity
+async def _resolve_entity_lookup(entity: str) -> ToolResult | _EntityLookup:
     # Two daemon connections: daemon handles one request per connection.
     # Accepted race: entity_id obtained from resolve_entity could theoretically
     # become stale if the entities table is modified between the two calls, but
@@ -660,6 +661,26 @@ class GetEntityInfo(ToolArgs):
         return self
 
 
+def _resolve_entity_lookup_sync(args: GetEntityInfo) -> _EntityLookup | None:
+    if args.exact_entity_id is not None:
+        return _EntityLookup(
+            entity_id=args.exact_entity_id, display_name=str(args.exact_entity_id), resolution="exact_entity_id"
+        )
+    assert args.entity is not None
+    lookup = _numeric_entity_lookup(args.entity)
+    if lookup is not None:
+        return lookup
+    return None
+
+
+async def _get_entity_lookup(args: GetEntityInfo) -> ToolResult | _EntityLookup:
+    lookup = _resolve_entity_lookup_sync(args)
+    if lookup is not None:
+        return lookup
+    assert args.entity is not None
+    return await _resolve_entity_lookup(args.entity)
+
+
 @mcp_tool(
     name="get_entity_info",
     title="Entity Info",
@@ -672,18 +693,10 @@ class GetEntityInfo(ToolArgs):
     output_schema=GET_ENTITY_INFO_OUTPUT_SCHEMA,
 )
 async def get_entity_info(args: GetEntityInfo) -> ToolResult:
-    if args.exact_entity_id is not None:
-        lookup = _EntityLookup(
-            entity_id=args.exact_entity_id, display_name=str(args.exact_entity_id), resolution="exact_entity_id"
-        )
-    else:
-        assert args.entity is not None
-        lookup = _numeric_entity_lookup(args)
-        if lookup is None:
-            resolved = await _resolve_entity_lookup(args)
-            if isinstance(resolved, ToolResult):
-                return resolved
-            lookup = resolved
+    resolved = await _get_entity_lookup(args)
+    if isinstance(resolved, ToolResult):
+        return resolved
+    lookup = resolved
 
     try:
         async with daemon_connection() as conn:

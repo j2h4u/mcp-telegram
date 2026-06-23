@@ -5616,6 +5616,75 @@ async def test_get_my_recent_activity_rejects_invalid_dialog_kinds() -> None:
 
 
 @pytest.mark.asyncio
+async def test_get_my_recent_activity_rejects_invalid_time_and_text_bounds() -> None:
+    """Invalid time bounds and non-string text_query should be rejected before SQL."""
+    server = make_server(_make_db_with_activity())
+    resp = await server._dispatch(
+        {
+            "method": "get_my_recent_activity",
+            "sent_after": 123,
+            "sent_before": "not-a-timestamp",
+            "text_query": 456,
+        }
+    )
+    assert resp["ok"] is False
+    assert resp["error"] in {"invalid_time_bound", "invalid_text_query"}
+
+
+def test_parse_recent_activity_request_rejects_invalid_sent_before() -> None:
+    from mcp_telegram.daemon_activity_stats import _parse_recent_activity_request
+
+    parsed, error = _parse_recent_activity_request({"sent_before": 123})
+    assert parsed is None
+    assert error == {"ok": False, "error": "invalid_time_bound", "message": "sent_before is invalid"}
+
+
+def test_parse_recent_activity_request_accepts_z_and_naive_bounds_and_blank_text_query() -> None:
+    from mcp_telegram.daemon_activity_stats import _parse_recent_activity_request
+
+    parsed, error = _parse_recent_activity_request(
+        {
+            "sent_after": "2026-01-01T00:00:00Z",
+            "sent_before": "2026-01-02T00:00:00",
+            "text_query": "   ",
+        }
+    )
+    assert error is None
+    assert parsed is not None
+    assert parsed.sent_after_ts is not None
+    assert parsed.sent_before_ts is not None
+    assert parsed.text_query is None
+
+
+def test_parse_recent_activity_request_rejects_non_string_text_query() -> None:
+    from mcp_telegram.daemon_activity_stats import _parse_recent_activity_request
+
+    parsed, error = _parse_recent_activity_request({"text_query": 123})
+    assert parsed is None
+    assert error == {"ok": False, "error": "invalid_text_query", "message": "text_query must be a string"}
+
+
+def test_parse_recent_activity_request_normalizes_dialog_kinds_aliases() -> None:
+    from mcp_telegram.daemon_activity_stats import _parse_recent_activity_request
+
+    parsed, error = _parse_recent_activity_request({"dialog_kinds": ["dm", "forums", "unknown"]})
+    assert error is None
+    assert parsed is not None
+    assert parsed.dialog_kinds == ["user", "bot", "forum", "unknown"]
+
+
+def test_build_recent_activity_rows_query_wraps_filters() -> None:
+    from mcp_telegram.daemon_activity_stats import _build_recent_activity_rows_query, _where_clause
+
+    sql = _build_recent_activity_rows_query("m.out = 1", "dialog_kind IN (?)")
+    assert "WHERE m.out = 1" in sql
+    assert "WHERE dialog_kind IN (?)" in sql
+    assert _build_recent_activity_rows_query("", "").startswith("WITH typed_activity AS (SELECT")
+    assert _where_clause("m.out = 1") == "WHERE m.out = 1"
+    assert _where_clause("") == ""
+
+
+@pytest.mark.asyncio
 async def test_get_my_recent_activity_clamps_since_hours() -> None:
     """Wildly out-of-range since_hours must not crash — clamped to 8760."""
     server = make_server(_make_db_with_activity())

@@ -13,7 +13,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from pydantic import ValidationError
 
-from mcp_telegram.tools.entity_info import GetEntityInfo, get_entity_info
+from mcp_telegram.tools._base import ToolResult
+from mcp_telegram.tools.entity_info import (
+    GetEntityInfo,
+    _entity_structured_content,
+    _numeric_entity_lookup,
+    _resolve_entity_lookup,
+    get_entity_info,
+)
 
 
 @runtime_checkable
@@ -408,6 +415,50 @@ async def test_get_entity_info_resolver_not_found() -> None:
 
 
 @pytest.mark.asyncio
+async def test_get_entity_info_resolver_candidates() -> None:
+    candidates_resp = {
+        "ok": True,
+        "data": {
+            "result": "candidates",
+            "matches": [
+                {"entity_id": 1, "display_name": "Alice A", "username": "alicea", "entity_type": "User"},
+                {"entity_id": 2, "display_name": "Alice B", "username": "aliceb", "entity_type": "User"},
+            ],
+        },
+    }
+    conn = MagicMock()
+    conn.resolve_entity = AsyncMock(return_value=candidates_resp)
+
+    @asynccontextmanager
+    async def fake_dc():
+        yield conn
+
+    with patch("mcp_telegram.tools.entity_info.daemon_connection", fake_dc):
+        result = await get_entity_info(GetEntityInfo(entity="Alice"))
+
+    assert result.is_error is True
+    payload = _dict(result.structured_content)
+    assert payload["error"] == "ambiguous_entity"
+    assert [candidate["entity_id"] for candidate in cast(list[dict[str, object]], payload["candidates"])] == [1, 2]
+
+
+def test_entity_structured_content_uses_entity_input_when_present() -> None:
+    payload = _entity_structured_content(
+        args=GetEntityInfo(entity="Alice"),
+        data={"type": "unknown"},
+        entity_id=7,
+        display_name="Alice Smith",
+        resolution="resolver_match",
+    )
+    assert payload["resolved_query"] == {
+        "input": "Alice",
+        "resolution": "resolver_match",
+        "entity_id": 7,
+        "display_name": "Alice Smith",
+    }
+
+
+@pytest.mark.asyncio
 async def test_get_entity_info_daemon_not_running() -> None:
     from mcp_telegram.tools._base import DaemonNotRunningError
 
@@ -565,3 +616,83 @@ def test_get_entity_info_validation_requires_exactly_one_selector() -> None:
 
     with pytest.raises(ValidationError):
         GetEntityInfo(entity="Alice", exact_entity_id=123)
+
+
+def test_numeric_entity_lookup_parses_numeric_string() -> None:
+    lookup = _numeric_entity_lookup("-1001079568001")
+    assert lookup is not None
+    assert lookup.entity_id == -1001079568001
+    assert lookup.display_name == "-1001079568001"
+    assert lookup.resolution == "numeric_id"
+
+
+def test_numeric_entity_lookup_rejects_non_numeric_string() -> None:
+    assert _numeric_entity_lookup("Alice") is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_entity_lookup_returns_resolver_match() -> None:
+    resolve_resp = {"ok": True, "data": {"result": "match", "entity_id": 123, "display_name": "Alice"}}
+    conn = MagicMock()
+    conn.resolve_entity = AsyncMock(return_value=resolve_resp)
+
+    @asynccontextmanager
+    async def fake_dc():
+        yield conn
+
+    with patch("mcp_telegram.tools.entity_info.daemon_connection", fake_dc):
+        lookup = await _resolve_entity_lookup("Alice")
+
+    assert not isinstance(lookup, ToolResult)
+    assert lookup.entity_id == 123
+    assert lookup.display_name == "Alice"
+    assert lookup.resolution == "resolver_match"
+
+
+@pytest.mark.asyncio
+async def test_resolve_entity_lookup_not_found_returns_error_result() -> None:
+    conn = MagicMock()
+    conn.resolve_entity = AsyncMock(return_value={"ok": True, "data": {"result": "not_found"}})
+
+    @asynccontextmanager
+    async def fake_dc():
+        yield conn
+
+    with patch("mcp_telegram.tools.entity_info.daemon_connection", fake_dc):
+        result = await _resolve_entity_lookup("Nobody")
+
+    assert isinstance(result, ToolResult)
+    assert result.is_error is True
+    assert "No entity matches 'Nobody'" in cast(_TextContent, result.content[0]).text
+
+
+@pytest.mark.asyncio
+async def test_resolve_entity_lookup_daemon_not_running_returns_error_result() -> None:
+    from mcp_telegram.tools._base import DaemonNotRunningError
+
+    @asynccontextmanager
+    async def raising_dc():
+        raise DaemonNotRunningError("Sync daemon is not running.")
+        yield  # pragma: no cover
+
+    with patch("mcp_telegram.tools.entity_info.daemon_connection", raising_dc):
+        result = await _resolve_entity_lookup("Anyone")
+
+    assert isinstance(result, ToolResult)
+    assert result.is_error is True
+
+
+def test_entity_structured_content_uses_exact_input_for_numeric_lookup() -> None:
+    payload = _entity_structured_content(
+        args=GetEntityInfo(exact_entity_id=7),
+        data={"type": "unknown"},
+        entity_id=7,
+        display_name="Seven",
+        resolution="exact_entity_id",
+    )
+    assert payload["resolved_query"] == {
+        "input": "7",
+        "resolution": "exact_entity_id",
+        "entity_id": 7,
+        "display_name": "Seven",
+    }

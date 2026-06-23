@@ -1247,6 +1247,18 @@ def _list_messages_error_result(
     )
 
 
+def _list_messages_structured_error_content(response: dict) -> dict[str, object] | None:
+    if response.get("error") not in {"fragment_fetch_failed", "not_synced"}:
+        return None
+    return {
+        "error": response.get("error", "unknown"),
+        "message": response.get("message", ""),
+        "required_action": response.get("required_action"),
+        "context_availability": response.get("context_availability"),
+        "dialog_status": response.get("dialog_status"),
+    }
+
+
 @mcp_tool(
     name="list_messages",
     title="List Messages",
@@ -1299,15 +1311,6 @@ async def list_messages(args: ListMessages) -> ToolResult:
         return error_result(_daemon_not_running_text())
 
     if not response.get("ok"):
-        structured_error_content: dict[str, object] | None = None
-        if response.get("error") in {"fragment_fetch_failed", "not_synced"}:
-            structured_error_content = {
-                "error": response.get("error", "unknown"),
-                "message": response.get("message", ""),
-                "required_action": response.get("required_action"),
-                "context_availability": response.get("context_availability"),
-                "dialog_status": response.get("dialog_status"),
-            }
         return _list_messages_error_result(
             _ListMessagesErrorContext(
                 error=response.get("error", "unknown"),
@@ -1315,7 +1318,7 @@ async def list_messages(args: ListMessages) -> ToolResult:
                 dialog_label=request_context.dialog_label,
                 has_filter=request_context.has_filter,
                 has_cursor=request_context.has_cursor,
-                structured_content=structured_error_content,
+                structured_content=_list_messages_structured_error_content(response),
             )
         )
 

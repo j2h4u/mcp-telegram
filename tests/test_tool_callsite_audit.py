@@ -18,6 +18,7 @@ from typing import Protocol, cast
 from unittest.mock import AsyncMock, patch
 
 from mcp_telegram.tools import GetEntityInfo, get_entity_info
+from mcp_telegram.tools.entity_info import _numeric_entity_lookup
 
 
 class _TextContent(Protocol):
@@ -149,6 +150,14 @@ async def test_entity_info_candidates_does_not_auto_pick() -> None:
     assert "id=101" not in text and "id=202" not in text
     assert result.structured_content is not None
     assert result.structured_content["error"] == "ambiguous_entity"
+
+
+def test_numeric_entity_lookup_accepts_string_entity() -> None:
+    lookup = _numeric_entity_lookup("123")
+    assert lookup is not None
+    assert lookup.entity_id == 123
+    assert lookup.display_name == "123"
+    assert lookup.resolution == "numeric_id"
 
 
 # ---------------------------------------------------------------------------

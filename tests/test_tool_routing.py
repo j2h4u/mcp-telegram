@@ -3088,3 +3088,23 @@ async def test_list_messages_fragment_fetch_failure_exposes_context_metadata():
     assert payload["error"] == "fragment_fetch_failed"
     assert payload["context_availability"] == "fragment_unavailable"
     assert payload["dialog_status"] == "own_only"
+
+
+async def test_list_messages_not_synced_failure_exposes_context_metadata():
+    """not_synced errors should preserve the same structured error envelope."""
+    conn = _make_daemon_conn(
+        {
+            "ok": False,
+            "error": "not_synced",
+            "message": "Dialog has not been synced yet.",
+            "required_action": "Mark the dialog for sync and retry.",
+            "context_availability": "unavailable",
+            "dialog_status": "not_synced",
+        }
+    )
+    with _patch_daemon(conn):
+        result = await list_messages(ListMessages(exact_dialog_id=42))
+    assert result.content
+    payload = _json_dict(result.structured_content)
+    assert payload["error"] == "not_synced"
+    assert payload["required_action"] == "Mark the dialog for sync and retry."

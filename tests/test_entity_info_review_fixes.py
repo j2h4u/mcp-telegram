@@ -21,7 +21,7 @@ from telethon.tl.types import Channel as TelethonChannel  # type: ignore[import-
 from telethon.tl.types import User  # type: ignore[import-untyped]
 
 from mcp_telegram.daemon_api import DaemonAPIServer, _DaemonClientLike
-from mcp_telegram.tools.entity_info import _format_relative_ymd
+from mcp_telegram.tools.entity_info import _entity_input_label, _format_relative_ymd
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -160,6 +160,13 @@ def test_format_relative_ymd_future_does_not_return_today() -> None:
     now = datetime(2026, 4, 25, 12, 0, 0, tzinfo=UTC)
     assert _format_relative_ymd("2030-01-01", now=now) == "future date"
     assert _format_relative_ymd("2026-04-26", now=now) == "future date"
+
+
+def test_entity_input_label_prefers_entity_string() -> None:
+    from mcp_telegram.tools.entity_info import GetEntityInfo
+
+    assert _entity_input_label(GetEntityInfo(entity="Alice")) == "Alice"
+    assert _entity_input_label(GetEntityInfo(exact_entity_id=42)) == "42"
 
 
 # ---------------------------------------------------------------------------

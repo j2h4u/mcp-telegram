@@ -554,6 +554,72 @@ async def test_get_entity_info_convenience() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Convenience method: get_my_recent_activity
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_my_recent_activity_convenience_defaults() -> None:
+    """get_my_recent_activity sends daemon defaults when no optional filters are given."""
+    reader = MagicMock(spec=asyncio.StreamReader)
+    writer = MagicMock(spec=asyncio.StreamWriter)
+    conn = DaemonConnection(reader, writer)
+
+    captured: list[dict] = []
+
+    async def _mock_request(payload: dict) -> dict:
+        captured.append(payload)
+        return {"ok": True, "data": {"comments": []}}
+
+    conn.request = _mock_request  # type: ignore[method-assign]
+
+    await conn.get_my_recent_activity()
+
+    req = captured[0]
+    assert req["method"] == "get_my_recent_activity"
+    assert req["since_hours"] == 168
+    assert req["limit"] == 500
+    assert "dialog_kinds" not in req
+    assert "sent_after" not in req
+    assert "sent_before" not in req
+    assert "text_query" not in req
+
+
+@pytest.mark.asyncio
+async def test_get_my_recent_activity_convenience_with_filters() -> None:
+    """get_my_recent_activity forwards explicit filters unchanged."""
+    reader = MagicMock(spec=asyncio.StreamReader)
+    writer = MagicMock(spec=asyncio.StreamWriter)
+    conn = DaemonConnection(reader, writer)
+
+    captured: list[dict] = []
+
+    async def _mock_request(payload: dict) -> dict:
+        captured.append(payload)
+        return {"ok": True, "data": {"comments": []}}
+
+    conn.request = _mock_request  # type: ignore[method-assign]
+
+    await conn.get_my_recent_activity(
+        since_hours=12,
+        limit=25,
+        dialog_kinds=["group", "forum"],
+        sent_after="2024-01-01T00:00:00Z",
+        sent_before="2024-01-02T00:00:00Z",
+        text_query="hello",
+    )
+
+    req = captured[0]
+    assert req["method"] == "get_my_recent_activity"
+    assert req["since_hours"] == 12
+    assert req["limit"] == 25
+    assert req["dialog_kinds"] == ["group", "forum"]
+    assert req["sent_after"] == "2024-01-01T00:00:00Z"
+    assert req["sent_before"] == "2024-01-02T00:00:00Z"
+    assert req["text_query"] == "hello"
+
+
+# ---------------------------------------------------------------------------
 # Convenience method: get_inbox with explicit params
 # ---------------------------------------------------------------------------
 
