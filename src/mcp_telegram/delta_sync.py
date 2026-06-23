@@ -17,6 +17,7 @@ import logging
 import sqlite3
 import time
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from typing import Protocol, TypedDict, Unpack, cast
 
 from telethon.errors import (
@@ -37,6 +38,19 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # SQL constants
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class DeltaHistoryPacing:
+    probe_s: float = 1.0
+
+
+@dataclass(frozen=True, slots=True)
+class DeltaSyncPacing:
+    history: DeltaHistoryPacing = DeltaHistoryPacing()
+
+
+_PACING = DeltaSyncPacing()
 
 # Skip delta probe for dialogs fully synced within this window — prevents
 # GetHistoryRequest storm on quick restarts (D-01 expert panel).
@@ -287,7 +301,7 @@ async def _probe_access_lost_dialogs(
         except (TimeoutError, OSError) as exc:
             logger.warning("probe_network_error dialog_id=%d error=%s", dialog_id, exc)
 
-        await asyncio.sleep(1.0)  # rate limit between probes
+        await asyncio.sleep(_PACING.history.probe_s)
 
     logger.info("access_probe complete — checked=%d restored=%d", len(rows), restored)
     return restored

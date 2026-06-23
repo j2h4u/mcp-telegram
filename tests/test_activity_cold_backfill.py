@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import sqlite3
 import time
 from collections.abc import Iterator
@@ -24,8 +25,11 @@ from typing import cast
 import pytest
 
 from mcp_telegram.activity_cold_backfill import (
+    _PACING,
     ColdPassOutcome,
     ColdPassResult,
+    _cold_backfill_sleep_seconds,
+    _run_cold_backfill_pass_safe,
     run_cold_backfill_pass,
 )
 from mcp_telegram.activity_peer_sweep import (
@@ -519,3 +523,46 @@ async def test_no_due_peer_outcome_when_all_gated(monkeypatch: pytest.MonkeyPatc
         result = await run_cold_backfill_pass(_FakeClient(), conn, shutdown)
         assert result.outcome == ColdPassOutcome.NO_DUE_PEER
         assert result.persisted == 0
+
+
+@pytest.mark.asyncio
+async def test_safe_pass_wrapper_falls_back_to_no_due_peer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Loop-level exception handling falls back to NO_DUE_PEER."""
+    with _make_db() as conn:
+        shutdown = asyncio.Event()
+
+        async def _boom(*args: object, **kwargs: object) -> ColdPassResult:
+            del args, kwargs
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr("mcp_telegram.activity_cold_backfill.run_cold_backfill_pass", _boom)
+
+        result = await _run_cold_backfill_pass_safe(_FakeClient(), conn, shutdown)
+        assert result.outcome == ColdPassOutcome.NO_DUE_PEER
+        assert result.persisted == 0
+
+
+def test_sleep_seconds_for_outcomes(caplog: pytest.LogCaptureFixture) -> None:
+    """Sleep policy distinguishes idle from processed work."""
+    with caplog.at_level(logging.DEBUG, logger="mcp_telegram.activity_cold_backfill"):
+        assert (
+            _cold_backfill_sleep_seconds(
+                ColdPassResult(outcome=ColdPassOutcome.NO_DUE_PEER, persisted=0),
+                idle_interval=123.0,
+            )
+            == 123.0
+        )
+        assert (
+            _cold_backfill_sleep_seconds(
+                ColdPassResult(outcome=ColdPassOutcome.WROTE, persisted=5),
+                idle_interval=123.0,
+            )
+            == _PACING.history.batch_s
+        )
+
+    assert any("activity_cold_backfill_idle next_sleep_s=123.000" in record.message for record in caplog.records)
+    assert any(
+        "activity_cold_backfill_loop" in record.message
+        and f"next_sleep_s={_PACING.history.batch_s:.3f}" in record.message
+        for record in caplog.records
+    )

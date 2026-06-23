@@ -1039,6 +1039,113 @@ async def test_backfill_total_messages_returns_early_when_shutdown_during_flood_
         conn.close()
 
 
+@pytest.mark.asyncio
+async def test_backfill_total_messages_uses_named_skip_pacing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Non-FloodWait skips use the daemon pacing config rather than a literal sleep."""
+    import inspect
+    import sqlite3
+    from unittest.mock import patch
+
+    from mcp_telegram.daemon import _PACING, _backfill_total_messages
+
+    conn = sqlite3.connect(":memory:")
+    from mcp_telegram.sync_db import _apply_migrations
+
+    try:
+        _apply_migrations(conn)
+        conn.execute(
+            "INSERT INTO synced_dialogs (dialog_id, status, total_messages) VALUES (?, 'synced', NULL)",
+            (2001,),
+        )
+        conn.commit()
+
+        shutdown_event = asyncio.Event()
+        client = MagicMock()
+        client.get_messages = AsyncMock(side_effect=OSError("temporary failure"))
+        wait_calls: list[float] = []
+
+        async def _fake_wait_for(coro: object, timeout: float) -> None:
+            if inspect.iscoroutine(coro):
+                coro.close()
+            wait_calls.append(timeout)
+
+        with patch("mcp_telegram.daemon.asyncio.wait_for", side_effect=_fake_wait_for):
+            filled = await _backfill_total_messages(client, conn, shutdown_event)
+
+        assert filled == 0
+        assert wait_calls == [_PACING.history.backfill_skip_s]
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_backfill_total_messages_floodwait_elapsed_skips_small_pause(monkeypatch: pytest.MonkeyPatch) -> None:
+    """FloodWait that completes normally should not trigger the small between-dialog pause."""
+    import inspect
+    import sqlite3
+    from unittest.mock import patch
+
+    from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
+
+    from mcp_telegram.daemon import _backfill_total_messages
+
+    conn = sqlite3.connect(":memory:")
+    from mcp_telegram.sync_db import _apply_migrations
+
+    try:
+        _apply_migrations(conn)
+        conn.execute(
+            "INSERT INTO synced_dialogs (dialog_id, status, total_messages) VALUES (?, 'synced', NULL)",
+            (2002,),
+        )
+        conn.commit()
+
+        shutdown_event = asyncio.Event()
+        client = MagicMock()
+        err = FloodWaitError(request=None)
+        err.seconds = 3
+        client.get_messages = AsyncMock(side_effect=err)
+        wait_calls: list[float] = []
+
+        async def _fake_wait_for(coro: object, timeout: float) -> None:
+            if inspect.iscoroutine(coro):
+                coro.close()
+            wait_calls.append(timeout)
+
+        with patch("mcp_telegram.daemon.sleep_through_flood", new=AsyncMock(return_value=False)):
+            with patch("mcp_telegram.daemon.asyncio.wait_for", side_effect=_fake_wait_for):
+                filled = await _backfill_total_messages(client, conn, shutdown_event)
+
+        assert filled == 0
+        assert wait_calls == []
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_sleep_between_backfill_total_dialogs_contract() -> None:
+    """Backfill-total pause returns False on shutdown and True on timeout."""
+    import inspect
+    from unittest.mock import patch
+
+    from mcp_telegram.daemon import _PACING, _sleep_between_backfill_total_dialogs
+
+    shutdown_event = asyncio.Event()
+    wait_calls: list[float] = []
+
+    async def _fake_wait_for(coro: object, timeout: float) -> None:
+        if inspect.iscoroutine(coro):
+            coro.close()
+        wait_calls.append(timeout)
+        raise TimeoutError
+
+    with patch("mcp_telegram.daemon.asyncio.wait_for", side_effect=_fake_wait_for):
+        continue_loop = await _sleep_between_backfill_total_dialogs(shutdown_event)
+
+    assert continue_loop is True
+    assert wait_calls == [_PACING.history.backfill_skip_s]
+
+
 # ---------------------------------------------------------------------------
 # _initialize_read_positions — bootstrap task tests
 # ---------------------------------------------------------------------------
@@ -1190,6 +1297,81 @@ async def test_initialize_read_positions_returns_early_when_shutdown_during_floo
             filled = await _initialize_read_positions(client, conn, shutdown_event)
 
         assert filled == 0
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_sleep_read_pos_batch_contract() -> None:
+    """Read-position batch sleep returns False on shutdown and True on timeout."""
+    import inspect
+    from unittest.mock import patch
+
+    from mcp_telegram.daemon import _PACING, _sleep_read_pos_batch
+
+    shutdown_event = asyncio.Event()
+    wait_calls: list[float] = []
+
+    async def _fake_wait_for(coro: object, timeout: float) -> None:
+        if inspect.iscoroutine(coro):
+            coro.close()
+        wait_calls.append(timeout)
+        raise TimeoutError
+
+    with patch("mcp_telegram.daemon.asyncio.wait_for", side_effect=_fake_wait_for):
+        continue_loop = await _sleep_read_pos_batch(shutdown_event)
+
+    assert continue_loop is True
+    assert wait_calls == [_PACING.read.batch_s]
+
+
+@pytest.mark.asyncio
+async def test_initialize_read_positions_uses_named_batch_pacing(tmp_path):
+    """Read-position bootstrap uses the module read pacing config between batches."""
+    import inspect
+    import sqlite3
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from mcp_telegram.daemon import _PACING, _initialize_read_positions
+    from mcp_telegram.sync_db import _apply_migrations
+
+    conn = sqlite3.connect(":memory:")
+    _apply_migrations(conn)
+    try:
+        for dialog_id in (1001, 1002, 1003):
+            conn.execute(
+                "INSERT INTO synced_dialogs (dialog_id, status, read_inbox_max_id) VALUES (?, 'synced', NULL)",
+                (dialog_id,),
+            )
+        conn.commit()
+
+        shutdown_event = asyncio.Event()
+
+        class _Client:
+            async def get_input_entity(self, dialog_id: int) -> object:
+                del dialog_id
+                return object()
+
+            async def __call__(self, request: object) -> object:
+                del request
+                return SimpleNamespace(dialogs=[])
+
+        client = _Client()
+        wait_calls: list[float] = []
+
+        async def _fake_wait_for(coro: object, timeout: float):
+            if inspect.iscoroutine(coro):
+                coro.close()
+            wait_calls.append(timeout)
+            raise TimeoutError
+
+        with patch("mcp_telegram.daemon.asyncio.wait_for", side_effect=_fake_wait_for):
+            filled = await _initialize_read_positions(client, conn, shutdown_event)
+
+        assert filled == 0
+        assert wait_calls
+        assert wait_calls[0] == _PACING.read.batch_s
     finally:
         conn.close()
 

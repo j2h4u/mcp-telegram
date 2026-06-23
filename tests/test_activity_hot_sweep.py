@@ -481,6 +481,39 @@ async def test_access_skip_does_not_advance_cursor(monkeypatch: pytest.MonkeyPat
         assert state.get("cold_next_retry_at") is None
 
 
+@pytest.mark.asyncio
+async def test_full_page_without_min_id_persists_hot_cursor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A defensive min_id gap still commits max_seen and exits the peer cleanly."""
+    with _make_db() as conn:
+        dialog_id = -100100000017
+        now = int(time.time())
+        prior_cursor = 500
+        fetched_ids = list(range(501, 601))
+        _enroll(conn, dialog_id, last_activity_at=now - 500, hot_cursor=prior_cursor)
+
+        results = {
+            dialog_id: [
+                SweepResult(
+                    fetched_ids=fetched_ids,
+                    persisted=len(fetched_ids),
+                    min_id=None,
+                    max_id=max(fetched_ids),
+                    skip_reason=SkipReason.NONE,
+                )
+            ]
+        }
+        _patch_build_working_set(monkeypatch)
+        _patch_sweep(monkeypatch, results)
+
+        shutdown = asyncio.Event()
+        written = await run_hot_sweep_pass(_FakeClient(), conn, shutdown)
+
+        state = _get_state(conn, dialog_id)
+        assert written == len(fetched_ids)
+        assert state["hot_cursor"] == max(fetched_ids)
+        assert state["hot_next_retry_at"] is None
+
+
 # ---------------------------------------------------------------------------
 # (h) No cold_* column ever written
 # ---------------------------------------------------------------------------

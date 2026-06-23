@@ -111,6 +111,25 @@ class _MeLike(Protocol):
     id: int
 
 
+@dataclass(frozen=True, slots=True)
+class DaemonHistoryPacing:
+    backfill_skip_s: float = 1.0
+
+
+@dataclass(frozen=True, slots=True)
+class DaemonReadPacing:
+    batch_s: float = 1.5
+
+
+@dataclass(frozen=True, slots=True)
+class DaemonPacing:
+    history: DaemonHistoryPacing = DaemonHistoryPacing()
+    read: DaemonReadPacing = DaemonReadPacing()
+
+
+_PACING = DaemonPacing()
+
+
 HEARTBEAT_INTERVAL_S: float = 60.0
 GAP_SCAN_INTERVAL_S: float = 7 * 24 * 3600.0
 SECONDS_PER_MINUTE = 60
@@ -167,6 +186,13 @@ class _SyncMainContext:
     background_tasks: set[asyncio.Task[object]] = field(default_factory=set)
 
 
+@dataclass(frozen=True, slots=True)
+class _BackfillTotalDialogResult:
+    filled: int
+    pause_after: bool
+    stop: bool = False
+
+
 async def _backfill_total_messages(
     client: _DaemonClient,
     conn: sqlite3.Connection,
@@ -182,24 +208,49 @@ async def _backfill_total_messages(
     for (dialog_id,) in rows:
         if shutdown_event.is_set():
             break
-        try:
-            result = cast(_MessagesTotalLike, await client.get_messages(entity=dialog_id, limit=1))
-            total = result.total
-            if total is not None:
-                conn.execute(_UPDATE_TOTAL_SQL, (total, dialog_id))
-                conn.commit()
-                filled += 1
-        except FloodWaitError as exc:
-            logger.warning("backfill_total flood_wait dialog_id=%d seconds=%d", dialog_id, exc.seconds)
-            if await sleep_through_flood(shutdown_event, flood_seconds(exc)):
-                return filled  # shutdown during flood wait
-            # flood wait elapsed normally — fall through to next dialog
-        except _BACKFILL_TOTAL_MESSAGES_SKIP_EXCEPTIONS as exc:
-            logger.debug("backfill_total skip dialog_id=%d error=%s", dialog_id, exc)
-            await asyncio.sleep(1.0)
+        result = await _backfill_total_message_dialog(client, conn, shutdown_event, dialog_id)
+        filled += result.filled
+        if result.stop:
+            break
+        if result.pause_after and not await _sleep_between_backfill_total_dialogs(shutdown_event):
+            break
 
     logger.info("backfill_total_messages filled=%d/%d", filled, len(rows))
     return filled
+
+
+async def _backfill_total_message_dialog(
+    client: _DaemonClient,
+    conn: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+    dialog_id: int,
+) -> _BackfillTotalDialogResult:
+    """Fetch and persist one total_messages value, or handle a single skip/flood."""
+    try:
+        result = cast(_MessagesTotalLike, await client.get_messages(entity=dialog_id, limit=1))
+        total = result.total
+        if total is not None:
+            conn.execute(_UPDATE_TOTAL_SQL, (total, dialog_id))
+            conn.commit()
+            return _BackfillTotalDialogResult(filled=1, pause_after=True)
+        return _BackfillTotalDialogResult(filled=0, pause_after=True)
+    except FloodWaitError as exc:
+        logger.warning("backfill_total flood_wait dialog_id=%d seconds=%d", dialog_id, exc.seconds)
+        if await sleep_through_flood(shutdown_event, flood_seconds(exc)):
+            return _BackfillTotalDialogResult(filled=0, pause_after=False, stop=True)
+        return _BackfillTotalDialogResult(filled=0, pause_after=False)
+    except _BACKFILL_TOTAL_MESSAGES_SKIP_EXCEPTIONS as exc:
+        logger.debug("backfill_total skip dialog_id=%d error=%s", dialog_id, exc)
+        return _BackfillTotalDialogResult(filled=0, pause_after=True)
+
+
+async def _sleep_between_backfill_total_dialogs(shutdown_event: asyncio.Event) -> bool:
+    """Pause between backfill_total dialogs; return False when shutdown fires."""
+    try:
+        await asyncio.wait_for(shutdown_event.wait(), timeout=_PACING.history.backfill_skip_s)
+        return False
+    except TimeoutError:
+        return True
 
 
 async def _initialize_read_positions(
@@ -304,9 +355,9 @@ def _apply_read_positions_from_dialogs(conn: sqlite3.Connection, result: _ReadPo
 
 
 async def _sleep_read_pos_batch(shutdown_event: asyncio.Event) -> bool:
-    # Inter-batch pause: 1.5s, SIGTERM-responsive
+    # Inter-batch pause: SIGTERM-responsive
     try:
-        await asyncio.wait_for(shutdown_event.wait(), timeout=1.5)
+        await asyncio.wait_for(shutdown_event.wait(), timeout=_PACING.read.batch_s)
         return False
     except TimeoutError:
         return True

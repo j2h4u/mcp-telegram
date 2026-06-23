@@ -19,6 +19,7 @@ Phase 54 plan 02–04 test suite.
 from __future__ import annotations
 
 import asyncio
+import logging
 import sqlite3
 import time
 from contextlib import closing
@@ -29,6 +30,7 @@ import pytest
 from mcp_telegram.activity_peer_resolve import LinkedChatResolution
 from mcp_telegram.activity_peer_sweep import (
     _DIALOG_STATE_COLUMNS,
+    _PACING,
     PeerSweepRequest,
     SkipReason,
     SweepResult,
@@ -398,6 +400,113 @@ def test_sweep_peer_once_floodwait_reports_seconds(monkeypatch: pytest.MonkeyPat
         assert request.offset_id == 11
         assert request.min_id == 5
         assert request.limit == 50
+        assert result == SweepResult(
+            fetched_ids=[],
+            persisted=0,
+            min_id=None,
+            max_id=None,
+            skip_reason=SkipReason.FLOOD_WAIT,
+            flood_wait_seconds=37,
+        )
+
+
+def test_sweep_peer_once_success_invokes_pacing_sleep(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A successful SearchRequest should apply the fixed post-RPC pause."""
+    with closing(_make_db()) as conn:
+        sleep_calls: list[float] = []
+
+        async def fake_resolve_input_peer(client: object, dialog_id: int) -> object:
+            del client, dialog_id
+            return object()
+
+        async def fake_call_with_timeout(client: object, request: object) -> _FakeSweepResult:
+            del client, request
+            return _FakeSweepResult(messages=[_FakeSweepMessage(8, peer_id="keep")])
+
+        async def fake_sleep(seconds: float) -> None:
+            sleep_calls.append(seconds)
+
+        def fake_extract_dialog_id(message: _FakeSweepMessage) -> int | None:
+            return 101 if message.peer_id == "keep" else None
+
+        def fake_extract_message_row(dialog_id: int, message: _FakeSweepMessage) -> tuple[int, str]:
+            return (dialog_id, f"msg-{message.id}")
+
+        def fake_insert_messages_with_fts(conn: sqlite3.Connection, rows: list[tuple[int, str]]) -> None:
+            del conn, rows
+
+        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.resolve_input_peer", fake_resolve_input_peer)
+        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.call_with_timeout", fake_call_with_timeout)
+        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.asyncio.sleep", fake_sleep)
+        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.extract_dialog_id", fake_extract_dialog_id)
+        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.extract_message_row", fake_extract_message_row)
+        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.insert_messages_with_fts", fake_insert_messages_with_fts)
+
+        with caplog.at_level(logging.DEBUG, logger="mcp_telegram.activity_peer_sweep"):
+            result = asyncio.run(
+                sweep_peer_once(
+                    client=_FakeClient(),
+                    conn=conn,
+                    dialog_id=333,
+                    offset_id=13,
+                    min_id=6,
+                    limit=30,
+                )
+            )
+
+        assert sleep_calls == [_PACING.search.success_s]
+        assert any(
+            "sweep_peer_once_done" in record.message
+            and "rpc_duration_s=" in record.message
+            and f"pacing_s={_PACING.search.success_s:.3f}" in record.message
+            for record in caplog.records
+        )
+        assert result == SweepResult(
+            fetched_ids=[8],
+            persisted=1,
+            min_id=8,
+            max_id=8,
+            skip_reason=SkipReason.NONE,
+        )
+
+
+def test_sweep_peer_once_floodwait_does_not_invoke_pacing_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
+    """FloodWait should return immediately without the success pacing sleep."""
+    from telethon.errors import FloodWaitError
+
+    with closing(_make_db()) as conn:
+        sleep_calls: list[float] = []
+
+        async def fake_resolve_input_peer(client: object, dialog_id: int) -> object:
+            del client, dialog_id
+            return object()
+
+        async def fake_call_with_timeout(client: object, request: object) -> object:
+            del client, request
+            raise FloodWaitError(request=None, capture=37)
+
+        async def fake_sleep(seconds: float) -> None:
+            sleep_calls.append(seconds)
+
+        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.resolve_input_peer", fake_resolve_input_peer)
+        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.call_with_timeout", fake_call_with_timeout)
+        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.asyncio.sleep", fake_sleep)
+
+        result = asyncio.run(
+            sweep_peer_once(
+                client=_FakeClient(),
+                conn=conn,
+                dialog_id=444,
+                offset_id=11,
+                min_id=5,
+                limit=50,
+            )
+        )
+
+        assert sleep_calls == []
         assert result == SweepResult(
             fetched_ids=[],
             persisted=0,

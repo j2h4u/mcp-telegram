@@ -712,6 +712,39 @@ async def test_probe_loop_runs_immediately_then_shutdown(shutdown_event: asyncio
 
 
 @pytest.mark.asyncio
+async def test_probe_access_lost_uses_named_probe_pacing(shutdown_event: asyncio.Event) -> None:
+    """Access-loss probes sleep via the module pacing config after each dialog."""
+    from unittest.mock import AsyncMock, patch
+
+    from mcp_telegram.delta_sync import _PACING, DeltaSyncWorker, _probe_access_lost_dialogs
+
+    class _ProbeClient:
+        def __init__(self) -> None:
+            self.get_messages = AsyncMock(side_effect=OSError("temporary failure"))
+            self.iter_messages = _empty_async_iter
+
+    client = _ProbeClient()
+    conn = MagicMock()
+    conn.execute = MagicMock(return_value=MagicMock(fetchall=MagicMock(return_value=[(9101,)])))
+    delta_worker = MagicMock(spec=DeltaSyncWorker)
+    sleep_calls: list[float] = []
+
+    async def _fake_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+
+    with patch("mcp_telegram.delta_sync.asyncio.sleep", side_effect=_fake_sleep):
+        restored = await _probe_access_lost_dialogs(
+            cast(_DeltaSyncClient, client),
+            cast(sqlite3.Connection, conn),
+            shutdown_event,
+            delta_worker,
+        )
+
+    assert restored == 0
+    assert sleep_calls == [_PACING.history.probe_s]
+
+
+@pytest.mark.asyncio
 async def test_probe_loop_shutdown_during_initial_delay(shutdown_event: asyncio.Event) -> None:
     """Probe loop exits cleanly when shutdown fires during non-zero initial delay."""
     from unittest.mock import AsyncMock, MagicMock

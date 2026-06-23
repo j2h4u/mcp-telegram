@@ -30,9 +30,23 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_INTERVAL_S = 3600.0
 _BACKFILL_BATCH_LIMIT = 100
-_BACKFILL_INTER_BATCH_PAUSE_S = 0.5
 _SECONDS_PER_MINUTE = 60
 _SECONDS_PER_HOUR = 60 * _SECONDS_PER_MINUTE
+
+
+@dataclass(frozen=True, slots=True)
+class ActivitySyncSearchPacing:
+    batch_s: float = 0.5
+
+
+@dataclass(frozen=True, slots=True)
+class ActivitySyncPacing:
+    search: ActivitySyncSearchPacing = ActivitySyncSearchPacing()
+
+
+_PACING = ActivitySyncPacing()
+
+
 # Upper bound on a single SearchRequest await. Prevents a wedged MTProto
 # socket after startup FloodWait from hanging the incremental loop
 # indefinitely (D-02 expert panel).
@@ -70,6 +84,7 @@ class _IncrementalState:
     inserted: int = 0
     batch_num: int = 0
     offset_id: int = 0
+    loop_start: float = 0.0
 
 
 @dataclass
@@ -364,16 +379,17 @@ def _trim_incremental_batch(
     return in_window, past_window
 
 
-def _log_backfill_batch(progress: _BackfillState, fetched: int) -> None:
+def _log_backfill_batch(progress: _BackfillState, fetched: int, batch_duration_s: float) -> None:
     """Emit the per-batch backfill progress log."""
-    elapsed = time.monotonic() - progress.loop_start
-    rate = progress.total_fetched / elapsed if elapsed > 0 else 0.0
+    pass_elapsed_s = time.monotonic() - progress.loop_start
+    rate = progress.total_fetched / pass_elapsed_s if pass_elapsed_s > 0 else 0.0
     if progress.total_known is not None:
         remaining = progress.total_known - progress.total_fetched
         eta_s = int(remaining / rate) if rate > 0 else None
         eta_str = _fmt_duration(eta_s) if eta_s is not None else "?"
         logger.info(
-            "activity_sync_backfill_batch batch=%d fetched=%d total=%d/%d rate=%.0f/s eta=%s offset_id=%d",
+            "activity_sync_backfill_batch batch=%d fetched=%d total=%d/%d rate=%.0f/s eta=%s"
+            " offset_id=%d batch_duration_s=%.3f pass_elapsed_s=%.3f next_sleep_s=%.3f",
             progress.batch_num,
             fetched,
             progress.total_fetched,
@@ -381,23 +397,33 @@ def _log_backfill_batch(progress: _BackfillState, fetched: int) -> None:
             rate,
             eta_str,
             progress.checkpoint,
+            batch_duration_s,
+            pass_elapsed_s,
+            _PACING.search.batch_s,
         )
         return
     logger.info(
-        "activity_sync_backfill_batch batch=%d fetched=%d total=%d rate=%.0f/s offset_id=%d",
+        "activity_sync_backfill_batch batch=%d fetched=%d total=%d rate=%.0f/s offset_id=%d"
+        " batch_duration_s=%.3f pass_elapsed_s=%.3f next_sleep_s=%.3f",
         progress.batch_num,
         fetched,
         progress.total_fetched,
         rate,
         progress.checkpoint,
+        batch_duration_s,
+        pass_elapsed_s,
+        _PACING.search.batch_s,
     )
 
 
-def _log_incremental_batch(progress: _IncrementalState, batch_log: _IncrementalBatchLog) -> None:
+def _log_incremental_batch(
+    progress: _IncrementalState, batch_log: _IncrementalBatchLog, batch_duration_s: float
+) -> None:
     """Emit the per-batch incremental progress log."""
     logger.info(
         "activity_sync_incremental_batch batch=%d fetched=%d in_window=%d "
-        "extracted=%d total_inserted=%d next_offset_id=%d past_window=%s",
+        "extracted=%d total_inserted=%d next_offset_id=%d past_window=%s"
+        " batch_duration_s=%.3f pass_elapsed_s=%.3f next_sleep_s=%.3f",
         progress.batch_num,
         batch_log.fetched,
         batch_log.in_window,
@@ -405,6 +431,9 @@ def _log_incremental_batch(progress: _IncrementalState, batch_log: _IncrementalB
         batch_log.inserted,
         batch_log.next_offset_id,
         batch_log.past_window,
+        batch_duration_s,
+        time.monotonic() - progress.loop_start,
+        _PACING.search.batch_s,
     )
 
 
@@ -464,6 +493,7 @@ async def _run_backfill(
     logger.info("activity_sync_backfill_start offset_id=%d", progress.checkpoint)
 
     while not shutdown_event.is_set():
+        batch_started_at = time.monotonic()
         result = await _search_backfill_batch(
             client,
             progress.checkpoint,
@@ -486,8 +516,10 @@ async def _run_backfill(
             _set_state(conn, "backfill_complete", "1")
             _stamp_last_sync_at(conn)
             logger.info(
-                "activity_sync_backfill_complete total_fetched=%d",
+                "activity_sync_backfill_complete total_fetched=%d batches=%d duration_s=%.3f",
                 progress.total_fetched,
+                progress.batch_num,
+                time.monotonic() - progress.loop_start,
             )
             return
 
@@ -500,9 +532,9 @@ async def _run_backfill(
         progress.total_fetched += len(batch)
         progress.checkpoint = min(m.id for m in batch)
         _set_state(conn, "backfill_offset_id", str(progress.checkpoint))
-        _log_backfill_batch(progress, len(batch))
+        _log_backfill_batch(progress, len(batch), time.monotonic() - batch_started_at)
 
-        if await _wait_for_shutdown(shutdown_event, timeout=_BACKFILL_INTER_BATCH_PAUSE_S):
+        if await _wait_for_shutdown(shutdown_event, timeout=_PACING.search.batch_s):
             return
 
 
@@ -526,7 +558,7 @@ async def _run_incremental(
 
     # 60-second buffer guards against messages at the exact boundary being
     # missed when the previous sync finished mid-second.
-    progress = _IncrementalState(min_date=max(0, last_sync_at - 60))
+    progress = _IncrementalState(min_date=max(0, last_sync_at - 60), loop_start=time.monotonic())
     logger.info(
         "activity_sync_incremental_start min_date=%d window_s=%d",
         progress.min_date,
@@ -534,6 +566,7 @@ async def _run_incremental(
     )
 
     while not shutdown_event.is_set():
+        batch_started_at = time.monotonic()
         result = await _search_incremental_batch(
             client,
             progress.min_date,
@@ -582,16 +615,22 @@ async def _run_incremental(
                 next_offset_id=progress.offset_id,
                 past_window=past_window,
             ),
+            time.monotonic() - batch_started_at,
         )
 
         if past_window:
             break
 
-        if await _wait_for_shutdown(shutdown_event, timeout=_BACKFILL_INTER_BATCH_PAUSE_S):
+        if await _wait_for_shutdown(shutdown_event, timeout=_PACING.search.batch_s):
             return
 
     _stamp_last_sync_at(conn)
-    logger.info("activity_sync_incremental_done batches=%d inserted=%d", progress.batch_num, progress.inserted)
+    logger.info(
+        "activity_sync_incremental_done batches=%d inserted=%d duration_s=%.3f",
+        progress.batch_num,
+        progress.inserted,
+        time.monotonic() - progress.loop_start,
+    )
 
 
 async def run_activity_sync_loop(
