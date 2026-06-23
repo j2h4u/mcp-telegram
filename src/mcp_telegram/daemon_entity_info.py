@@ -573,8 +573,9 @@ class DaemonEntityInfoService:
                     self._deps.get_user_photos_request(user_id=user, offset=0, max_id=0, limit=100)
                 ),
             )
-            avatar_count = int(photos_result.count)
-            for photo in photos_result.photos:
+            photos = list(photos_result.photos)
+            avatar_count = int(getattr(photos_result, "count", len(photos)))
+            for photo in photos:
                 photo_id = _opt_int_attr(photo, "id")
                 photo_date = _attr(photo, "date", None)
                 if photo_id is None or photo_date is None:

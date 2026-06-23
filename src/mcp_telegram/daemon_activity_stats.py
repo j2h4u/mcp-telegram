@@ -4,6 +4,7 @@ import sqlite3
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Protocol, cast
 
 
@@ -73,9 +74,15 @@ class _RecentActivityRequest:
     since_hours: int
     limit: int
     dialog_kinds: list[str]
+    sent_after: str | None
+    sent_before: str | None
+    text_query: str | None
+    sent_after_ts: int | None
+    sent_before_ts: int | None
     since_ts: int
     query_params: list[object]
-    dialog_kind_filter_sql: str
+    typed_activity_filter_sql: str
+    kinded_activity_filter_sql: str
 
 
 def _clamp(value: int, low: int, high: int) -> int:
@@ -191,6 +198,23 @@ def _normalize_activity_dialog_kinds(value: object) -> tuple[list[str] | None, s
     return _normalize_activity_dialog_kind_values(raw_values)
 
 
+def _parse_recent_activity_time_bound(value: object) -> int | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return None
+    try:
+        if value.endswith("Z"):
+            parsed = datetime.fromisoformat(value[:-1]).replace(tzinfo=UTC)
+        else:
+            parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return int(parsed.timestamp())
+
+
 def _parse_recent_activity_request(req: Mapping[str, object]) -> tuple[_RecentActivityRequest | None, dict | None]:
     since_hours = _coerce_int(req.get("since_hours", 168), 168)
     since_hours = _clamp(since_hours, 1, 8760)
@@ -208,12 +232,37 @@ def _parse_recent_activity_request(req: Mapping[str, object]) -> tuple[_RecentAc
             "message": dialog_kind_error or "invalid dialog_kinds",
         }
 
+    sent_after = req.get("sent_after")
+    sent_before = req.get("sent_before")
+    text_query = req.get("text_query")
+    sent_after_ts = _parse_recent_activity_time_bound(sent_after)
+    if sent_after is not None and sent_after_ts is None:
+        return None, {"ok": False, "error": "invalid_time_bound", "message": "sent_after is invalid"}
+    sent_before_ts = _parse_recent_activity_time_bound(sent_before)
+    if sent_before is not None and sent_before_ts is None:
+        return None, {"ok": False, "error": "invalid_time_bound", "message": "sent_before is invalid"}
+    if text_query is not None and not isinstance(text_query, str):
+        return None, {"ok": False, "error": "invalid_text_query", "message": "text_query must be a string"}
+    normalized_text_query = text_query.strip().lower() if isinstance(text_query, str) else None
+    if normalized_text_query == "":
+        normalized_text_query = None
+
     since_ts = int(time.time()) - since_hours * 3600
-    dialog_kind_filter_sql = ""
+    typed_activity_filters = ["m.out = 1", "m.is_service = 0", "m.is_deleted = 0", "m.sent_at >= ?"]
+    kinded_activity_filters: list[str] = []
     query_params: list[object] = [since_ts]
+    if sent_after_ts is not None:
+        typed_activity_filters.append("m.sent_at >= ?")
+        query_params.append(sent_after_ts)
+    if sent_before_ts is not None:
+        typed_activity_filters.append("m.sent_at <= ?")
+        query_params.append(sent_before_ts)
+    if normalized_text_query is not None:
+        typed_activity_filters.append("instr(lower(COALESCE(m.text, '')), ?) > 0")
+        query_params.append(normalized_text_query)
     if dialog_kinds != ["all"]:
         dialog_kind_placeholders = ",".join("?" for _ in dialog_kinds)
-        dialog_kind_filter_sql = f"WHERE dialog_kind IN ({dialog_kind_placeholders}) "
+        kinded_activity_filters.append(f"dialog_kind IN ({dialog_kind_placeholders})")
         query_params.extend(dialog_kinds)
     query_params.append(limit)
 
@@ -222,20 +271,28 @@ def _parse_recent_activity_request(req: Mapping[str, object]) -> tuple[_RecentAc
             since_hours=since_hours,
             limit=limit,
             dialog_kinds=dialog_kinds,
+            sent_after=sent_after if isinstance(sent_after, str) else None,
+            sent_before=sent_before if isinstance(sent_before, str) else None,
+            text_query=normalized_text_query,
+            sent_after_ts=sent_after_ts,
+            sent_before_ts=sent_before_ts,
             since_ts=since_ts,
             query_params=query_params,
-            dialog_kind_filter_sql=dialog_kind_filter_sql,
+            typed_activity_filter_sql=" AND ".join(typed_activity_filters),
+            kinded_activity_filter_sql=" AND ".join(kinded_activity_filters),
         ),
         None,
     )
 
 
-def _build_recent_activity_rows_query(dialog_kind_filter_sql: str) -> str:
+def _build_recent_activity_rows_query(typed_activity_filter_sql: str, kinded_activity_filter_sql: str) -> str:
+    typed_activity_where = f"WHERE {typed_activity_filter_sql}" if typed_activity_filter_sql else ""
+    kinded_activity_where = f"WHERE {kinded_activity_filter_sql}" if kinded_activity_filter_sql else ""
     return (
         "WITH typed_activity AS ("
         "SELECT m.dialog_id AS dialog_id, m.message_id AS message_id, "
         "       m.sent_at AS sent_at, m.text AS text, "
-        "       e.name AS dialog_name, "
+        "       COALESCE(e.name, d.name, CAST(m.dialog_id AS TEXT)) AS dialog_name, "
         "       CASE "
         "         WHEN lower(COALESCE(e.type, '')) = 'bot' THEN 'bot' "
         "         WHEN d.type IS NOT NULL AND d.type != '' THEN d.type "
@@ -264,8 +321,7 @@ def _build_recent_activity_rows_query(dialog_kind_filter_sql: str) -> str:
         #   path must not start surfacing them after unification.
         # is_deleted=0: exclude tombstones for messages the user
         #   deleted — same pre-v15 behavior preservation rationale.
-        "WHERE m.out = 1 AND m.is_service = 0 AND m.is_deleted = 0 "
-        "  AND m.sent_at >= ? "
+        f"{typed_activity_where} "
         "), kinded_activity AS ("
         "SELECT ta.*, "
         "       CASE "
@@ -283,7 +339,7 @@ def _build_recent_activity_rows_query(dialog_kind_filter_sql: str) -> str:
         ") "
         "SELECT * FROM ("
         "SELECT * FROM kinded_activity "
-        f"{dialog_kind_filter_sql}"
+        f"{kinded_activity_where} "
         "ORDER BY sent_at DESC, dialog_id DESC, message_id DESC "
         "LIMIT ?"
         ") ORDER BY sent_at ASC, dialog_id ASC, message_id ASC"
@@ -377,7 +433,10 @@ class DaemonActivityStatsService:
         rows = cast(
             list[tuple[object, object, object, object, object, object, object, object, object]],
             self._deps.conn.execute(
-                _build_recent_activity_rows_query(parsed.dialog_kind_filter_sql),
+                _build_recent_activity_rows_query(
+                    parsed.typed_activity_filter_sql,
+                    parsed.kinded_activity_filter_sql,
+                ),
                 parsed.query_params,
             ).fetchall(),
         )
@@ -439,6 +498,9 @@ class DaemonActivityStatsService:
             "data": {
                 "comments": comments,
                 "dialog_kinds": parsed.dialog_kinds,
+                "sent_after": parsed.sent_after,
+                "sent_before": parsed.sent_before,
+                "text_query": parsed.text_query,
                 "scan_status": scan_status,
                 "scanned_at": last_sync_at,
             },

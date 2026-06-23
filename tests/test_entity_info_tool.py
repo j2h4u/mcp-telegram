@@ -7,14 +7,16 @@ envelope), 4-7 (per-type fields), and end-to-end resolver behavior.
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from typing import Protocol, cast
+from typing import Protocol, cast, runtime_checkable
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from pydantic import ValidationError
 
 from mcp_telegram.tools.entity_info import GetEntityInfo, get_entity_info
 
 
+@runtime_checkable
 class _TextContent(Protocol):
     text: str
 
@@ -518,13 +520,48 @@ async def test_get_entity_info_numeric_id_uses_resolved_name() -> None:
         yield conn
 
     with patch("mcp_telegram.tools.entity_info.daemon_connection", fake_daemon_connection):
-        result = await get_entity_info(GetEntityInfo(entity="-1001079568001"))
+        result = await get_entity_info(GetEntityInfo(exact_entity_id=-1001079568001))
 
     assert result.content == ()
     payload = _dict(result.structured_content)
     assert payload is not None
-    assert _dict_at(payload, "resolved_query")["resolution"] == "numeric_id"
+    assert _dict_at(payload, "resolved_query")["resolution"] == "exact_entity_id"
     assert _dict_at(payload, "resolved_query")["entity_id"] == -1001079568001
     # The fix: display_name must be the resolved title, not the numeric string.
     assert payload["display_name"] == "Дзен-мани чатик"
     assert _dict_at(payload, "resolved_query")["input"] == "-1001079568001"
+
+
+@pytest.mark.asyncio
+async def test_get_entity_info_exact_entity_id_daemon_error_returns_tool_error() -> None:
+    conn = MagicMock()
+    get_entity_info_mock: AsyncMock = AsyncMock(
+        return_value={
+            "ok": False,
+            "error": "request_failed",
+            "message": "daemon side failure",
+        }
+    )
+    conn.get_entity_info = get_entity_info_mock
+
+    @asynccontextmanager
+    async def fake_daemon_connection():
+        yield conn
+
+    with patch("mcp_telegram.tools.entity_info.daemon_connection", fake_daemon_connection):
+        result = await get_entity_info(GetEntityInfo(exact_entity_id=-1001079568001))
+
+    assert result.is_error is True
+    assert result.content
+    first_content = result.content[0]
+    assert isinstance(first_content, _TextContent)
+    assert "daemon side failure" in first_content.text
+    get_entity_info_mock.assert_awaited_once_with(entity_id=-1001079568001)
+
+
+def test_get_entity_info_validation_requires_exactly_one_selector() -> None:
+    with pytest.raises(ValidationError):
+        GetEntityInfo()
+
+    with pytest.raises(ValidationError):
+        GetEntityInfo(entity="Alice", exact_entity_id=123)

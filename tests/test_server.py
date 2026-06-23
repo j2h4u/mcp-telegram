@@ -863,8 +863,11 @@ def test_primary_tools_have_core_read_search_schema() -> None:
 
     # get_entity_info: must have entity field for universal entity lookup
     get_entity_info = server.tool_by_name["get_entity_info"]
-    gei_props = cast(dict[str, object], _tool_input_schema(get_entity_info)["properties"])
+    gei_schema = _tool_input_schema(get_entity_info)
+    gei_props = cast(dict[str, object], gei_schema["properties"])
     assert "entity" in gei_props, "get_entity_info missing entity field for direct lookup"
+    assert "exact_entity_id" in gei_props, "get_entity_info missing exact_entity_id for direct numeric lookup"
+    assert "oneOf" in gei_schema, "get_entity_info missing mutual-exclusion schema"
 
     trace_account = server.tool_by_name["trace_account_messages"]
     trace_props = cast(dict[str, object], _tool_input_schema(trace_account)["properties"])

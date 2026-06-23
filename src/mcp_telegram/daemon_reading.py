@@ -400,12 +400,15 @@ class DaemonReadingService:
     ) -> dict:
         row = _fetchone_row(self._conn.execute(api._SELECT_SYNC_STATUS_SQL, (dialog_id,)))
         current_status = _status_from_row(row)
-        if current_status in (None, "not_synced", "fragment"):
+        if current_status in (None, "not_synced", "fragment", "own_only"):
             if not await self._deps.fetch_fragment_context(dialog_id, request.context_message_id or 0):
                 return {
                     "ok": False,
                     "error": "fragment_fetch_failed",
-                    "message": "Could not fetch messages from Telegram.",
+                    "message": "Could not fetch bounded context from Telegram.",
+                    "required_action": "Retry with a valid anchor_message_id, or mark the dialog for sync if broader history is needed.",
+                    "context_availability": "fragment_unavailable",
+                    "dialog_status": current_status or "not_synced",
                 }
             result = await self._list_messages_context_window(
                 dialog_id=dialog_id,
@@ -422,7 +425,10 @@ class DaemonReadingService:
             return {
                 "ok": False,
                 "error": "not_synced",
-                "message": ("Context window requires the dialog to be synced. Use MarkDialogForSync first."),
+                "message": "Context window is unavailable for this dialog state.",
+                "required_action": "Mark the dialog for sync to read broader history, or retry with an anchor_message_id for bounded fragment context.",
+                "context_availability": "context_window_unavailable",
+                "dialog_status": current_status or "not_synced",
             }
         return await self._list_messages_context_window(
             dialog_id=dialog_id,

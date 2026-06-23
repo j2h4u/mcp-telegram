@@ -1806,6 +1806,47 @@ async def test_get_entity_info_resolves_via_daemon():
     conn.get_entity_info.assert_called_once_with(entity_id=12345)
 
 
+async def test_get_entity_info_accepts_exact_entity_id_without_resolve():
+    """Exact numeric ids should skip resolver and call daemon directly."""
+    conn = _DaemonConnStub()
+    conn.get_entity_info = _AsyncMethodMock(
+        return_value={
+            "ok": True,
+            "data": {
+                "id": -10012345,
+                "type": "channel",
+                "name": "News",
+                "username": "news",
+                "about": None,
+                "my_membership": {"is_member": True, "is_admin": False},
+                "avatar_history": [],
+                "avatar_count": 0,
+                "contacts_subscribed": None,
+                "contacts_subscribed_partial": False,
+                "contacts_reason": None,
+                "subscribers_count": 10,
+                "linked_chat_id": None,
+                "pinned_msg_id": None,
+                "slow_mode_seconds": None,
+                "available_reactions": None,
+                "restrictions": [],
+            },
+        }
+    )
+    conn.record_telemetry = _AsyncMethodMock(return_value={"ok": True})
+
+    with _patch_daemon(conn):
+        result = await get_entity_info(GetEntityInfo(exact_entity_id=-10012345))
+
+    assert result.content == ()
+    assert result.structured_content is not None
+    payload = _json_dict(result.structured_content)
+    assert payload["entity_id"] == -10012345
+    assert _json_dict(payload["resolved_query"])["resolution"] == "exact_entity_id"
+    assert conn.resolve_entity.call_count == 0
+    conn.get_entity_info.assert_called_once_with(entity_id=-10012345)
+
+
 async def test_get_entity_info_daemon_not_running():
     """GetEntityInfo returns actionable error when daemon is not running."""
     with _patch_daemon_not_running():
@@ -2765,6 +2806,9 @@ async def test_get_my_recent_activity_routes_primary():
     assert payload["since_hours"] == 168
     assert payload["limit"] == 500
     assert payload["dialog_kinds"] == ["group", "forum"]
+    assert payload["sent_after"] is None
+    assert payload["sent_before"] is None
+    assert payload["text_query"] is None
     assert payload["scan_status"] == "complete"
     assert payload["scanned_at"] == 1_700_003_600
     assert payload["count"] == 2
@@ -2786,6 +2830,43 @@ async def test_get_my_recent_activity_routes_primary():
         since_hours=168,
         limit=500,
         dialog_kinds=["group", "forum"],
+        sent_after=None,
+        sent_before=None,
+        text_query=None,
+    )
+
+
+async def test_get_my_recent_activity_passes_filter_args():
+    """GetMyRecentActivity forwards time/text filters to the daemon."""
+    from mcp_telegram.tools.activity import GetMyRecentActivity, get_my_recent_activity
+
+    conn = _make_daemon_conn(
+        {
+            "ok": True,
+            "data": {"comments": [], "scan_status": "complete", "scanned_at": None},
+        }
+    )
+    with _patch_daemon(conn):
+        result = await get_my_recent_activity(
+            GetMyRecentActivity(
+                sent_after="2024-01-01T00:00:00Z",
+                sent_before="2024-01-02T00:00:00Z",
+                text_query="hello",
+            )
+        )
+
+    assert result.structured_content is not None
+    payload = _json_dict(result.structured_content)
+    assert payload["sent_after"] == "2024-01-01T00:00:00Z"
+    assert payload["sent_before"] == "2024-01-02T00:00:00Z"
+    assert payload["text_query"] == "hello"
+    conn.get_my_recent_activity.assert_awaited_once_with(
+        since_hours=168,
+        limit=500,
+        dialog_kinds=["group", "forum"],
+        sent_after="2024-01-01T00:00:00Z",
+        sent_before="2024-01-02T00:00:00Z",
+        text_query="hello",
     )
 
 
@@ -2808,6 +2889,9 @@ async def test_get_my_recent_activity_accepts_dm_alias():
         since_hours=168,
         limit=500,
         dialog_kinds=["user", "bot"],
+        sent_after=None,
+        sent_before=None,
+        text_query=None,
     )
 
 
@@ -2982,3 +3066,25 @@ async def test_list_messages_no_fragment_no_header():
         result = await list_messages(ListMessages(exact_dialog_id=42))
     assert result.content == ()
     assert _json_dict(_json_dict(result.structured_content)["coverage"])["fragment_coverage"] is False
+
+
+async def test_list_messages_fragment_fetch_failure_exposes_context_metadata():
+    """Fragment fetch failures should surface actionable structured metadata."""
+    conn = _make_daemon_conn(
+        {
+            "ok": False,
+            "error": "fragment_fetch_failed",
+            "message": "Could not fetch bounded context from Telegram.",
+            "required_action": "Retry with a valid anchor_message_id, or mark the dialog for sync if broader history is needed.",
+            "context_availability": "fragment_unavailable",
+            "dialog_status": "own_only",
+        }
+    )
+    with _patch_daemon(conn):
+        result = await list_messages(ListMessages(exact_dialog_id=42, anchor_message_id=100, context_size=4))
+    assert result.content
+    assert result.is_error is True
+    payload = _json_dict(result.structured_content)
+    assert payload["error"] == "fragment_fetch_failed"
+    assert payload["context_availability"] == "fragment_unavailable"
+    assert payload["dialog_status"] == "own_only"

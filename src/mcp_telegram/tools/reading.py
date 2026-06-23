@@ -19,6 +19,7 @@ from ._base import (
     ToolArgs,
     ToolResult,
     _daemon_not_running_text,
+    _text_response,
     daemon_connection,
     error_result,
     mcp_tool,
@@ -130,6 +131,16 @@ class _ListMessagesRequestContext:
     sender_id: int | None
     sender_name: str | None
     unread_flag: bool | None
+
+
+@dataclass(frozen=True, slots=True)
+class _ListMessagesErrorContext:
+    error: str
+    error_detail: str
+    dialog_label: str
+    has_filter: bool
+    has_cursor: bool
+    structured_content: dict[str, object] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1209,31 +1220,30 @@ def _list_messages_request_context(args: ListMessages) -> _ListMessagesRequestCo
 
 
 def _list_messages_error_result(
-    *,
-    error: str,
-    error_detail: str,
-    dialog_label: str,
-    has_filter: bool,
-    has_cursor: bool,
+    ctx: _ListMessagesErrorContext,
 ) -> ToolResult:
-    if error == "dialog_not_found":
+    if ctx.error == "dialog_not_found":
         return error_result(
-            dialog_not_found_text(dialog_label, retry_tool="ListMessages"),
-            has_filter=has_filter,
-            has_cursor=has_cursor,
+            dialog_not_found_text(ctx.dialog_label, retry_tool="ListMessages"),
+            has_filter=ctx.has_filter,
+            has_cursor=ctx.has_cursor,
         )
-    if error == "not_synced":
-        return error_result(
-            "Error: dialog is not synced. "
-            "Action: Use MarkDialogForSync to enable sync, then wait for syncing to complete.",
-            has_filter=has_filter,
-            has_cursor=has_cursor,
+    if ctx.structured_content is not None:
+        return ToolResult(
+            content=_text_response(
+                f"Error: {ctx.error}: {ctx.error_detail}\n"
+                f"Action: {ctx.structured_content.get('required_action') or 'Retry list_messages with corrected arguments.'}"
+            ),
+            is_error=True,
+            structured_content=ctx.structured_content,
+            has_filter=ctx.has_filter,
+            has_cursor=ctx.has_cursor,
         )
     return error_result(
-        f"Error: {error}: {error_detail}\n"
+        f"Error: {ctx.error}: {ctx.error_detail}\n"
         "Action: Retry list_messages with corrected arguments, or call list_dialogs/list_topics first to discover valid ids.",
-        has_filter=has_filter,
-        has_cursor=has_cursor,
+        has_filter=ctx.has_filter,
+        has_cursor=ctx.has_cursor,
     )
 
 
@@ -1289,12 +1299,24 @@ async def list_messages(args: ListMessages) -> ToolResult:
         return error_result(_daemon_not_running_text())
 
     if not response.get("ok"):
+        structured_error_content: dict[str, object] | None = None
+        if response.get("error") in {"fragment_fetch_failed", "not_synced"}:
+            structured_error_content = {
+                "error": response.get("error", "unknown"),
+                "message": response.get("message", ""),
+                "required_action": response.get("required_action"),
+                "context_availability": response.get("context_availability"),
+                "dialog_status": response.get("dialog_status"),
+            }
         return _list_messages_error_result(
-            error=response.get("error", "unknown"),
-            error_detail=response.get("message", ""),
-            dialog_label=request_context.dialog_label,
-            has_filter=request_context.has_filter,
-            has_cursor=request_context.has_cursor,
+            _ListMessagesErrorContext(
+                error=response.get("error", "unknown"),
+                error_detail=response.get("message", ""),
+                dialog_label=request_context.dialog_label,
+                has_filter=request_context.has_filter,
+                has_cursor=request_context.has_cursor,
+                structured_content=structured_error_content,
+            )
         )
 
     data = response.get("data", {})

@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 import phonenumbers
-from pydantic import Field
+from pydantic import ConfigDict, Field, model_validator
 
 from ..errors import (
     entity_not_found_text,
@@ -507,9 +507,10 @@ def _entity_structured_content(
     display_name: str,
     resolution: str,
 ) -> dict[str, object]:
+    input_value = args.entity if args.entity is not None else str(args.exact_entity_id)
     return {
         "resolved_query": {
-            "input": args.entity,
+            "input": input_value,
             "resolution": resolution,
             "entity_id": entity_id,
             "display_name": display_name,
@@ -535,6 +536,7 @@ class _EntityLookup:
 
 
 def _numeric_entity_lookup(args: GetEntityInfo) -> _EntityLookup | None:
+    assert args.entity is not None
     try:
         entity_id = int(args.entity)
     except ValueError:
@@ -543,24 +545,26 @@ def _numeric_entity_lookup(args: GetEntityInfo) -> _EntityLookup | None:
 
 
 async def _resolve_entity_lookup(args: GetEntityInfo) -> ToolResult | _EntityLookup:
+    assert args.entity is not None
+    entity = args.entity
     # Two daemon connections: daemon handles one request per connection.
     # Accepted race: entity_id obtained from resolve_entity could theoretically
     # become stale if the entities table is modified between the two calls, but
     # this window is negligible in practice (entities are stable once synced).
     try:
         async with daemon_connection() as conn:
-            resolve_response = await conn.resolve_entity(query=args.entity)
+            resolve_response = await conn.resolve_entity(query=entity)
     except DaemonNotRunningError:
         return error_result(_daemon_not_running_text())
 
     if not resolve_response.get("ok"):
-        return error_result(entity_not_found_text(args.entity, retry_tool="GetEntityInfo"))
+        return error_result(entity_not_found_text(entity, retry_tool="GetEntityInfo"))
 
     resolve_data = resolve_response.get("data", {})
     resolve_status = resolve_data.get("result", "not_found")
 
     if resolve_status == "not_found":
-        return error_result(entity_not_found_text(args.entity, retry_tool="GetEntityInfo"))
+        return error_result(entity_not_found_text(entity, retry_tool="GetEntityInfo"))
 
     if resolve_status == "candidates":
         matches = resolve_data.get("matches", [])
@@ -588,12 +592,13 @@ def _entity_info_fetch_error(args: GetEntityInfo, response: dict) -> ToolResult 
     if response.get("ok"):
         return None
 
+    entity = args.entity if args.entity is not None else str(args.exact_entity_id)
     error_code = response.get("error", "")
     if error_code == "entity_not_found":
-        return error_result(entity_not_found_text(args.entity, retry_tool="GetEntityInfo"))
+        return error_result(entity_not_found_text(entity, retry_tool="GetEntityInfo"))
 
     error_msg = response.get("message", "Request failed.")
-    return error_result(fetch_entity_info_error_text(args.entity, error_msg))
+    return error_result(fetch_entity_info_error_text(entity, error_msg))
 
 
 # ---------------------------------------------------------------------------
@@ -602,9 +607,8 @@ def _entity_info_fetch_error(args: GetEntityInfo, response: dict) -> ToolResult 
 
 
 class GetEntityInfo(ToolArgs):
-    """
-    Look up a Telegram entity by name (user, bot, channel, supergroup, or
-    legacy basic group). Returns a type-tagged profile:
+    """Look up a Telegram entity by name or exact numeric id (user, bot, channel,
+    supergroup, or legacy basic group). Returns a type-tagged profile:
 
       - user / bot:    id, name, usernames, bio, phone (with country),
                        language, online status, relationship
@@ -625,9 +629,35 @@ class GetEntityInfo(ToolArgs):
     no download capability. The `type` field tells you which kind was
     resolved; non-applicable per-type fields are simply absent.
     Resolves the name via fuzzy match — returns candidates if ambiguous.
-    """
+    Provide either `entity` for fuzzy/name lookup or `exact_entity_id` for a
+    direct numeric lookup; the two inputs are mutually exclusive."""
 
-    entity: str = Field(max_length=500)
+    model_config = ConfigDict(
+        json_schema_extra={
+            "oneOf": [
+                {"required": ["entity"], "not": {"required": ["exact_entity_id"]}},
+                {"required": ["exact_entity_id"], "not": {"required": ["entity"]}},
+            ]
+        }
+    )
+
+    entity: str | None = Field(
+        default=None,
+        max_length=500,
+        description="Natural name or handle for fuzzy resolution. Mutually exclusive with exact_entity_id.",
+    )
+    exact_entity_id: int | None = Field(
+        default=None,
+        description="Exact numeric Telegram entity id for direct lookup. Mutually exclusive with entity.",
+    )
+
+    @model_validator(mode="after")
+    def _validate_entity_selector(self) -> GetEntityInfo:
+        if self.entity is None and self.exact_entity_id is None:
+            raise ValueError("Provide either entity or exact_entity_id.")
+        if self.entity is not None and self.exact_entity_id is not None:
+            raise ValueError("entity and exact_entity_id are mutually exclusive.")
+        return self
 
 
 @mcp_tool(
@@ -642,12 +672,18 @@ class GetEntityInfo(ToolArgs):
     output_schema=GET_ENTITY_INFO_OUTPUT_SCHEMA,
 )
 async def get_entity_info(args: GetEntityInfo) -> ToolResult:
-    lookup = _numeric_entity_lookup(args)
-    if lookup is None:
-        resolved = await _resolve_entity_lookup(args)
-        if isinstance(resolved, ToolResult):
-            return resolved
-        lookup = resolved
+    if args.exact_entity_id is not None:
+        lookup = _EntityLookup(
+            entity_id=args.exact_entity_id, display_name=str(args.exact_entity_id), resolution="exact_entity_id"
+        )
+    else:
+        assert args.entity is not None
+        lookup = _numeric_entity_lookup(args)
+        if lookup is None:
+            resolved = await _resolve_entity_lookup(args)
+            if isinstance(resolved, ToolResult):
+                return resolved
+            lookup = resolved
 
     try:
         async with daemon_connection() as conn:
@@ -659,14 +695,10 @@ async def get_entity_info(args: GetEntityInfo) -> ToolResult:
         return err
 
     data = response.get("data", {})
-    # Numeric-id path only: we initially stored the numeric string itself as
-    # display_name (no resolver run). Now that the daemon has resolved the
-    # entity we have a real title — prefer it. For the resolver path,
-    # display_name is intentionally kept as whatever the fuzzy resolver
-    # matched (so the caller can verify the match they got), even if the
-    # canonical title from data["name"] is slightly different.
+    # Numeric-id path only: prefer the daemon-returned title, regardless of
+    # whether the lookup came from exact_entity_id or from parsing a numeric string.
     display_name = lookup.display_name
-    if lookup.resolution == "numeric_id":
+    if lookup.resolution in ("numeric_id", "exact_entity_id"):
         resolved_name = data.get("name")
         if resolved_name:
             display_name = resolved_name

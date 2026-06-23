@@ -434,12 +434,15 @@ class DaemonConnection:
             }
         )
 
-    async def get_my_recent_activity(
+    async def get_my_recent_activity(  # noqa: PLR0913
         self,
         *,
         since_hours: int = 168,
         limit: int = 500,
         dialog_kinds: list[str] | None = None,
+        sent_after: str | None = None,
+        sent_before: str | None = None,
+        text_query: str | None = None,
     ) -> dict:
         """Return recent activity_comments with scan_status from the daemon.
 
@@ -455,6 +458,12 @@ class DaemonConnection:
         }
         if dialog_kinds is not None:
             payload["dialog_kinds"] = dialog_kinds
+        if sent_after is not None:
+            payload["sent_after"] = sent_after
+        if sent_before is not None:
+            payload["sent_before"] = sent_before
+        if text_query is not None:
+            payload["text_query"] = text_query
         return await self.request(payload)
 
     async def submit_feedback(

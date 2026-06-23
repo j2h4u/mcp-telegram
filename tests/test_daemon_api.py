@@ -809,8 +809,12 @@ async def test_fetch_fragment_context_caches_anchor_window() -> None:
     assert ok is True
     client.get_input_entity.assert_awaited_once_with(42)
     client.get_messages.assert_awaited_once_with(entity, ids=[10, 11, 12, 13, 14, 15])
-    assert _fetchone_row(conn, "SELECT status FROM synced_dialogs WHERE dialog_id = 42") == ("fragment",)
-    assert _fetchall_rows(conn, "SELECT message_id, text FROM messages ORDER BY message_id") == [
+    row = _fetchone_row(conn, "SELECT status FROM synced_dialogs WHERE dialog_id = 42")
+    assert row is not None
+    assert row[0] == "fragment"
+    assert [
+        (row[0], row[1]) for row in _fetchall_rows(conn, "SELECT message_id, text FROM messages ORDER BY message_id")
+    ] == [
         (10, "anchor"),
         (12, "tail"),
     ]
@@ -828,7 +832,9 @@ async def test_fetch_fragment_context_empty_fetch_still_succeeds() -> None:
     ok = await server._fetch_fragment_context(dialog_id=43, anchor_message_id=20)
 
     assert ok is True
-    assert _fetchone_row(conn, "SELECT status FROM synced_dialogs WHERE dialog_id = 43") == ("fragment",)
+    row = _fetchone_row(conn, "SELECT status FROM synced_dialogs WHERE dialog_id = 43")
+    assert row is not None
+    assert row[0] == "fragment"
     assert _fetchone_int(conn, "SELECT COUNT(*) FROM messages") == 0
 
 
@@ -845,7 +851,37 @@ async def test_fetch_fragment_context_client_failure_returns_false() -> None:
 
     assert ok is False
     client.get_messages.assert_not_called()
-    assert _fetchone_row(conn, "SELECT status FROM synced_dialogs WHERE dialog_id = 44") == ("fragment",)
+    row = _fetchone_row(conn, "SELECT status FROM synced_dialogs WHERE dialog_id = 44")
+    assert row is not None
+    assert row[0] == "fragment"
+
+
+@pytest.mark.asyncio
+async def test_list_messages_context_window_own_only_uses_fragment_fetch() -> None:
+    """own_only dialogs should use bounded fragment fetch for anchor context."""
+    DIALOG_ID = 7005
+
+    conn = _make_db_for_fragment_context()
+    _insert_synced_dialog(conn, DIALOG_ID, status="own_only")
+    client = _TestClient()
+    entity = object()
+    client.get_input_entity = AsyncMock(return_value=entity)
+    client.get_messages = AsyncMock(
+        return_value=[
+            _fragment_message(10, "anchor"),
+            _fragment_message(11, "tail"),
+        ]
+    )
+    server = make_server(conn, client)
+
+    result = await server._list_messages({"dialog_id": DIALOG_ID, "context_message_id": 10, "context_size": 4})
+
+    assert result["ok"] is True, f"Unexpected error: {result}"
+    assert result["data"]["coverage"] == "fragment"
+    assert [m["message_id"] for m in _response_messages(result)] == [10, 11]
+    client.get_input_entity.assert_awaited_once_with(DIALOG_ID)
+    assert _call_count(client.get_messages) == 2
+    client.get_messages.assert_any_await(entity, ids=[10, 11, 12, 13, 14, 15])
 
 
 # ---------------------------------------------------------------------------
@@ -5314,6 +5350,82 @@ async def test_get_my_recent_activity_returns_latest_page_chronologically() -> N
 
 
 @pytest.mark.asyncio
+async def test_get_my_recent_activity_filters_by_time_and_text() -> None:
+    """sent_after/sent_before and text_query should narrow the own-message rows."""
+    server = make_server(_make_db_with_activity())
+    now = int(time.time())
+    with server._conn:
+        server._conn.execute(
+            "INSERT OR REPLACE INTO dialogs (dialog_id, name, type) VALUES (42, 'My Group', 'supergroup')"
+        )
+        server._conn.executemany(
+            "INSERT INTO messages "
+            "(dialog_id, message_id, sent_at, text, out, is_service, is_deleted) "
+            "VALUES (42, ?, ?, ?, 1, 0, 0)",
+            [
+                (1, now - 3600, "keep alpha"),
+                (2, now - 1800, "skip beta"),
+                (3, now - 600, "keep gamma"),
+            ],
+        )
+        server._conn.execute("UPDATE activity_sync_state SET value='1' WHERE key='backfill_complete'")
+        server._conn.execute(f"UPDATE activity_sync_state SET value='{now}' WHERE key='last_sync_at'")
+
+    resp = await server._dispatch(
+        {
+            "method": "get_my_recent_activity",
+            "dialog_kinds": ["all"],
+            "sent_after": "2024-01-01T00:00:00Z",
+            "sent_before": "2099-01-01T00:00:00Z",
+            "text_query": "keep",
+        }
+    )
+    comments = cast(list[dict[str, object]], _activity_data(resp)["comments"])
+    assert [comment["message_id"] for comment in comments] == [1, 3]
+    assert [comment["text"] for comment in comments] == ["keep alpha", "keep gamma"]
+
+
+@pytest.mark.asyncio
+async def test_get_my_recent_activity_filters_kinds_time_and_text_together() -> None:
+    """dialog_kinds + time bounds + text_query must combine on the same row set."""
+    server = make_server(_make_db_with_activity())
+    now = int(time.time())
+    before = datetime.fromtimestamp(now - 4000, tz=UTC).isoformat().replace("+00:00", "Z")
+    after = datetime.fromtimestamp(now - 100, tz=UTC).isoformat().replace("+00:00", "Z")
+    with server._conn:
+        server._conn.execute(
+            "INSERT OR REPLACE INTO dialogs (dialog_id, name, type) VALUES (42, 'My Group', 'supergroup')"
+        )
+        server._conn.execute("INSERT OR REPLACE INTO dialogs (dialog_id, name, type) VALUES (99, 'DM', 'user')")
+        server._conn.executemany(
+            "INSERT INTO messages "
+            "(dialog_id, message_id, sent_at, text, out, is_service, is_deleted) "
+            "VALUES (?, ?, ?, ?, 1, 0, 0)",
+            [
+                (42, 1, now - 3000, "keep group row"),
+                (42, 2, now - 3000, "skip group row"),
+                (99, 3, now - 3000, "keep dm row"),
+            ],
+        )
+        server._conn.execute("UPDATE activity_sync_state SET value='1' WHERE key='backfill_complete'")
+        server._conn.execute(f"UPDATE activity_sync_state SET value='{now}' WHERE key='last_sync_at'")
+
+    resp = await server._dispatch(
+        {
+            "method": "get_my_recent_activity",
+            "dialog_kinds": ["group"],
+            "sent_after": before,
+            "sent_before": after,
+            "text_query": "keep",
+        }
+    )
+    comments = cast(list[dict[str, object]], _activity_data(resp)["comments"])
+    assert [comment["message_id"] for comment in comments] == [1]
+    assert [comment["dialog_id"] for comment in comments] == [42]
+    assert [comment["text"] for comment in comments] == ["keep group row"]
+
+
+@pytest.mark.asyncio
 async def test_get_my_recent_activity_joins_dialog_name() -> None:
     """dialog_name/type/category/reply_count are populated for own-message activity."""
     server = make_server(_make_db_with_activity())
@@ -5341,6 +5453,30 @@ async def test_get_my_recent_activity_joins_dialog_name() -> None:
     assert comment["dialog_type"] == "supergroup"
     assert comment["dialog_category"] == "group"
     assert comment["reply_count"] == 4
+
+
+@pytest.mark.asyncio
+async def test_get_my_recent_activity_prefers_dialogs_name_for_own_only() -> None:
+    """When entities is absent, dialogs.name should populate dialog_name for own_only peers."""
+    server = make_server(_make_db_with_activity())
+    now = int(time.time())
+    with server._conn:
+        server._conn.execute(
+            "INSERT OR REPLACE INTO dialogs (dialog_id, name, type) VALUES (999, 'Resolved Dialog', 'supergroup')"
+        )
+        server._conn.execute(
+            "INSERT INTO messages "
+            "(dialog_id, message_id, sent_at, text, out, is_service, is_deleted) "
+            "VALUES (999, 1, ?, 'x', 1, 0, 0)",
+            (now - 60,),
+        )
+        server._conn.execute("UPDATE activity_sync_state SET value='1' WHERE key='backfill_complete'")
+        server._conn.execute(f"UPDATE activity_sync_state SET value='{now}' WHERE key='last_sync_at'")
+    resp = await server._dispatch({"method": "get_my_recent_activity", "dialog_kinds": ["all"]})
+    assert (
+        cast(dict[str, object], cast(list[dict[str, object]], _activity_data(resp)["comments"])[0])["dialog_name"]
+        == "Resolved Dialog"
+    )
 
 
 @pytest.mark.asyncio

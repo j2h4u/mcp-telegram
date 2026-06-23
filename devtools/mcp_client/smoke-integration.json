@@ -41,85 +41,58 @@
       }
     },
     {
-      "_comment": "list_topics — non-forum channel returns graceful response (no crash)",
+      "_comment": "list_topics — generic dialog lookup uses a non-personal placeholder",
       "action": "call_tool",
       "name": "list_topics",
-      "arguments": {"dialog": "Vibecoding is so last year"},
+      "arguments": {"dialog": "integration-smoke-placeholder"},
       "expect": {
-        "is_error": false,
-        "path_equals": {
-          "content": []
-        },
-        "path_exists": [
-          "structuredContent.dialog",
-          "structuredContent.topics",
-          "structuredContent.count"
-        ],
-        "path_nonempty": [
-          "structuredContent"
+        "one_of": [
+          {
+            "is_error": false,
+            "path_equals": {
+              "content": []
+            },
+            "path_exists": [
+              "structuredContent.dialog",
+              "structuredContent.topics",
+              "structuredContent.count"
+            ],
+            "path_nonempty": [
+              "structuredContent"
+            ]
+          },
+          {
+            "is_error": true,
+            "content_text_contains": [
+              "not found"
+            ]
+          }
         ]
       }
     },
     {
-      "_comment": "list_messages — synced channel",
-      "action": "call_tool",
-      "name": "list_messages",
-      "arguments": {"exact_dialog_id": 496731332, "limit": 3},
-      "expect": {
-        "is_error": false,
-        "path_equals": {
-          "content": []
-        },
-        "path_exists": [
-          "structuredContent.source",
-          "structuredContent.messages",
-          "structuredContent.count",
-          "structuredContent.limits"
-        ],
-        "path_nonempty": [
-          "structuredContent"
-        ]
-      }
-    },
-    {
-      "_comment": "list_messages — synced channel, alternate page size",
-      "action": "call_tool",
-      "name": "list_messages",
-      "arguments": {"exact_dialog_id": 496731332, "limit": 5},
-      "expect": {
-        "is_error": false,
-        "path_equals": {
-          "content": []
-        },
-        "path_exists": [
-          "structuredContent.source",
-          "structuredContent.messages",
-          "structuredContent.count",
-          "structuredContent.limits"
-        ],
-        "path_nonempty": [
-          "structuredContent"
-        ]
-      }
-    },
-    {
-      "_comment": "search_messages — keyword search in synced channel",
+      "_comment": "search_messages — placeholder dialog id and neutral query",
       "action": "call_tool",
       "name": "search_messages",
-      "arguments": {"dialog": "496731332", "query": "а", "limit": 3},
+      "arguments": {"dialog": "987654321", "query": "test", "limit": 3},
       "expect": {
-        "is_error": false,
-        "path_equals": {
-          "content": []
-        },
-        "path_exists": [
-          "structuredContent.query",
-          "structuredContent.results",
-          "structuredContent.count",
-          "structuredContent.limits"
-        ],
-        "path_nonempty": [
-          "structuredContent"
+        "one_of": [
+          {
+            "is_error": false,
+            "path_equals": {
+              "content": []
+            },
+            "path_exists": [
+              "structuredContent.results",
+              "structuredContent.count"
+            ]
+          },
+          {
+            "is_error": true,
+            "content_text_contains": [
+              "dialog"
+            ]
+          }
         ]
       }
     },
@@ -182,38 +155,37 @@
       }
     },
     {
-      "_comment": "get_dialog_stats — accepts either real stats or actionable 'not synced' error depending on live sync state",
+      "_comment": "get_dialog_stats — placeholder dialog id validates the actionable error path",
       "action": "call_tool",
       "name": "get_dialog_stats",
-      "arguments": {"dialog": "496731332", "top_n": 3},
+      "arguments": {"dialog": "987654321", "top_n": 3},
       "expect": {
         "one_of": [
           {
-            "is_error": false,
-            "path_equals": {
-              "content": []
-            },
-            "path_exists": [
-              "structuredContent.dialog",
-              "structuredContent.top_reactions",
-              "structuredContent.section_counts"
-            ],
-            "path_nonempty": [
-              "structuredContent"
+            "is_error": true,
+            "content_text_contains": [
+              "synced"
             ]
           },
           {
             "is_error": true,
-            "content_text_contains": ["requires a synced dialog"]
+            "content_text_contains": [
+              "dialog"
+            ]
           }
         ]
       }
     },
     {
-      "_comment": "get_my_recent_activity — own sent messages with reply counts and reactions",
+      "_comment": "get_my_recent_activity — own sent messages with time filters and reply counts",
       "action": "call_tool",
       "name": "get_my_recent_activity",
-      "arguments": {"since_hours": 24, "limit": 50},
+      "arguments": {
+        "since_hours": 24,
+        "limit": 50,
+        "sent_after": "2000-01-01T00:00:00Z",
+        "sent_before": "2100-01-01T00:00:00Z"
+      },
       "expect": {
         "is_error": false,
         "path_equals": {

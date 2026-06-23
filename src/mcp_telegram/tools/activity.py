@@ -40,6 +40,9 @@ GET_MY_RECENT_ACTIVITY_OUTPUT_SCHEMA = {
         "since_hours": {"type": "integer"},
         "limit": {"type": "integer"},
         "dialog_kinds": {"type": "array", "items": {"type": "string"}},
+        "sent_after": {"type": ["string", "null"]},
+        "sent_before": {"type": ["string", "null"]},
+        "text_query": {"type": ["string", "null"]},
         "scan_status": {"type": "string"},
         "scanned_at": {"type": ["integer", "null"]},
         "comments": {
@@ -101,6 +104,9 @@ GET_MY_RECENT_ACTIVITY_OUTPUT_SCHEMA = {
         "since_hours",
         "limit",
         "dialog_kinds",
+        "sent_after",
+        "sent_before",
+        "text_query",
         "scan_status",
         "scanned_at",
         "comments",
@@ -141,6 +147,18 @@ class GetMyRecentActivity(ToolArgs):
             "Dialog kinds to include. Default ['group','forum'] excludes DMs. "
             "Use ['user','bot'] for personal/bot DMs, ['channel'] for channels, or ['all'] for no filter."
         ),
+    )
+    sent_after: str | None = Field(
+        default=None,
+        description="Optional lower sent-time bound. ISO-8601 strings are accepted.",
+    )
+    sent_before: str | None = Field(
+        default=None,
+        description="Optional upper sent-time bound. ISO-8601 strings are accepted.",
+    )
+    text_query: str | None = Field(
+        default=None,
+        description="Optional case-insensitive substring filter applied to message text.",
     )
 
     @field_validator("dialog_kinds", mode="before")
@@ -248,6 +266,9 @@ async def get_my_recent_activity(args: GetMyRecentActivity) -> ToolResult:
                 since_hours=args.since_hours,
                 limit=args.limit,
                 dialog_kinds=args.dialog_kinds,
+                sent_after=args.sent_after,
+                sent_before=args.sent_before,
+                text_query=args.text_query,
             )
     except DaemonNotRunningError:
         return error_result(_daemon_not_running_text())
@@ -265,6 +286,9 @@ async def get_my_recent_activity(args: GetMyRecentActivity) -> ToolResult:
         "since_hours": args.since_hours,
         "limit": args.limit,
         "dialog_kinds": dialog_kinds,
+        "sent_after": data.get("sent_after", args.sent_after),
+        "sent_before": data.get("sent_before", args.sent_before),
+        "text_query": data.get("text_query", args.text_query),
         "scan_status": scan_status,
         "scanned_at": scanned_at,
         "comments": structured_comments,

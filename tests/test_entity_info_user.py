@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import re
 import sqlite3
+from datetime import UTC, datetime
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -161,6 +162,45 @@ async def test_get_entity_info_user_type() -> None:
         r = await server._dispatch({"method": "get_entity_info", "entity_id": 1})
     assert r["ok"] is True, f"got {r}"
     assert _dict(r["data"])["type"] == "user"
+
+
+@pytest.mark.asyncio
+async def test_get_entity_info_user_avatar_history_handles_photos_without_count() -> None:
+    """User avatar collection should tolerate Photos-like results without count."""
+    user = _make_user_mock(id=11, bot=False)
+    client = AsyncMock()
+    client.get_entity = AsyncMock(return_value=user)
+    common, full, photos = MagicMock(), MagicMock(), MagicMock()
+    common.chats = []
+    full.full_user = MagicMock(
+        about=None,
+        personal_channel_id=None,
+        birthday=None,
+        blocked=False,
+        ttl_period=None,
+        private_forward_name=None,
+        bot_info=None,
+        business_location=None,
+        business_intro=None,
+        business_work_hours=None,
+        note=None,
+        folder_id=None,
+    )
+    photo = MagicMock(id=77, date=datetime(2026, 6, 23, 12, 0, tzinfo=UTC))
+    del photos.count
+    photos.photos = [photo]
+    client.side_effect = [common, full, photos]
+    server = make_server(client=client)
+    with (
+        patch("mcp_telegram.daemon_api.GetCommonChatsRequest"),
+        patch("mcp_telegram.daemon_api.GetFullUserRequest"),
+        patch("mcp_telegram.daemon_api.GetUserPhotosRequest"),
+    ):
+        r = await server._dispatch({"method": "get_entity_info", "entity_id": 11})
+    assert r["ok"] is True, f"got {r}"
+    d = _dict(r["data"])
+    assert d["avatar_count"] == 1
+    assert d["avatar_history"] == [{"photo_id": 77, "date": "2026-06-23T12:00:00+00:00"}]
 
 
 @pytest.mark.asyncio
