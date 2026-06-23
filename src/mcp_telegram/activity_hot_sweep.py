@@ -53,6 +53,16 @@ class _HotSweepPeerContext:
     shutdown_event: asyncio.Event
 
 
+@dataclass(frozen=True, slots=True)
+class _HotPageContext:
+    peer: _HotSweepPeerContext
+    started_at: float
+    pages_fetched: int
+    total_written: int
+    max_seen: int
+    result: SweepResult
+
+
 def _is_hot_page_drained(result: SweepResult) -> bool:
     """Return True when the current page fully drained the newest-side window."""
     return (
@@ -121,6 +131,82 @@ def _save_hot_min_id_gap_state(
     )
 
 
+def _handle_hot_sweep_page_result(ctx: _HotPageContext) -> tuple[_HotSweepPeerOutcome, int | None, int, int]:
+    """Apply one fetched page result and emit the matching telemetry."""
+    result = ctx.result
+    peer = ctx.peer
+    max_seen = ctx.max_seen
+    total_written = ctx.total_written
+    if result.flood_wait_seconds is not None:
+        next_retry_at = int(time.time()) + result.flood_wait_seconds
+        _save_hot_flood_state(
+            peer.conn,
+            peer.dialog_id,
+            old_hot_cursor=peer.old_hot_cursor or 0,
+            max_seen=max_seen,
+            next_retry_at=next_retry_at,
+        )
+        logger.warning(
+            "activity_hot_sweep_flood dialog_id=%r flood_wait_seconds=%d"
+            " retry_delay_s=%d max_seen=%d pages_fetched=%d written=%d duration_s=%.3f"
+            " — halting pass (account-global wait)",
+            peer.dialog_id,
+            result.flood_wait_seconds,
+            result.flood_wait_seconds,
+            max_seen,
+            ctx.pages_fetched,
+            total_written,
+            time.monotonic() - ctx.started_at,
+        )
+        return _HotSweepPeerOutcome(written=total_written, flooded=True), None, max_seen, total_written
+
+    if result.skip_reason is SkipReason.ACCESS_SKIP:
+        transient_retry_at = int(time.time()) + _ACCESS_SKIP_RETRY_S
+        _save_hot_access_skip_state(peer.conn, peer.dialog_id, retry_at=transient_retry_at)
+        logger.debug(
+            "activity_hot_sweep_access_skip dialog_id=%r retry_at=%d pages_fetched=%d"
+            " written=%d retry_delay_s=%d duration_s=%.3f",
+            peer.dialog_id,
+            transient_retry_at,
+            ctx.pages_fetched,
+            total_written,
+            _ACCESS_SKIP_RETRY_S,
+            time.monotonic() - ctx.started_at,
+        )
+        return _HotSweepPeerOutcome(written=total_written, flooded=False), None, max_seen, total_written
+
+    if result.max_id is not None:
+        max_seen = max(max_seen, result.max_id)
+
+    total_written += result.persisted
+
+    if _is_hot_page_drained(result):
+        _save_hot_drained_state(peer.conn, peer.dialog_id, hot_cursor=max_seen, now=peer.now)
+        logger.debug(
+            "activity_hot_sweep_peer_done dialog_id=%r hot_cursor=%d pages_fetched=%d written=%d duration_s=%.3f",
+            peer.dialog_id,
+            max_seen,
+            ctx.pages_fetched,
+            total_written,
+            time.monotonic() - ctx.started_at,
+        )
+        return _HotSweepPeerOutcome(written=total_written, flooded=False), None, max_seen, total_written
+
+    if result.min_id is None:
+        _save_hot_min_id_gap_state(peer.conn, peer.dialog_id, hot_cursor=max_seen, now=peer.now)
+        logger.debug(
+            "activity_hot_sweep_min_id_gap dialog_id=%r hot_cursor=%d pages_fetched=%d written=%d duration_s=%.3f",
+            peer.dialog_id,
+            max_seen,
+            ctx.pages_fetched,
+            total_written,
+            time.monotonic() - ctx.started_at,
+        )
+        return _HotSweepPeerOutcome(written=total_written, flooded=False), None, max_seen, total_written
+
+    return _HotSweepPeerOutcome(written=total_written, flooded=False), result.min_id, max_seen, total_written
+
+
 async def _run_hot_sweep_peer(ctx: _HotSweepPeerContext) -> _HotSweepPeerOutcome:
     """Process one peer across all needed pages for the current hot sweep pass."""
     started_at = time.monotonic()
@@ -140,75 +226,19 @@ async def _run_hot_sweep_peer(ctx: _HotSweepPeerContext) -> _HotSweepPeerOutcome
             limit=_BACKFILL_BATCH_LIMIT,
         )
         pages_fetched += 1
-
-        if result.flood_wait_seconds is not None:
-            next_retry_at = int(time.time()) + result.flood_wait_seconds
-            _save_hot_flood_state(
-                ctx.conn,
-                ctx.dialog_id,
-                old_hot_cursor=ctx.old_hot_cursor or 0,
+        outcome, next_offset, max_seen, total_written = _handle_hot_sweep_page_result(
+            _HotPageContext(
+                peer=ctx,
+                started_at=started_at,
+                pages_fetched=pages_fetched,
+                total_written=total_written,
                 max_seen=max_seen,
-                next_retry_at=next_retry_at,
+                result=result,
             )
-            logger.warning(
-                "activity_hot_sweep_flood dialog_id=%r flood_wait_seconds=%d"
-                " retry_delay_s=%d max_seen=%d pages_fetched=%d written=%d duration_s=%.3f"
-                " — halting pass (account-global wait)",
-                ctx.dialog_id,
-                result.flood_wait_seconds,
-                result.flood_wait_seconds,
-                max_seen,
-                pages_fetched,
-                total_written,
-                time.monotonic() - started_at,
-            )
-            return _HotSweepPeerOutcome(written=total_written, flooded=True)
-
-        if result.skip_reason is SkipReason.ACCESS_SKIP:
-            transient_retry_at = int(time.time()) + _ACCESS_SKIP_RETRY_S
-            _save_hot_access_skip_state(ctx.conn, ctx.dialog_id, retry_at=transient_retry_at)
-            logger.debug(
-                "activity_hot_sweep_access_skip dialog_id=%r retry_at=%d pages_fetched=%d"
-                " written=%d retry_delay_s=%d duration_s=%.3f",
-                ctx.dialog_id,
-                transient_retry_at,
-                pages_fetched,
-                total_written,
-                _ACCESS_SKIP_RETRY_S,
-                time.monotonic() - started_at,
-            )
-            return _HotSweepPeerOutcome(written=total_written, flooded=False)
-
-        if result.max_id is not None:
-            max_seen = max(max_seen, result.max_id)
-
-        total_written += result.persisted
-
-        if _is_hot_page_drained(result):
-            _save_hot_drained_state(ctx.conn, ctx.dialog_id, hot_cursor=max_seen, now=ctx.now)
-            logger.debug(
-                "activity_hot_sweep_peer_done dialog_id=%r hot_cursor=%d pages_fetched=%d written=%d duration_s=%.3f",
-                ctx.dialog_id,
-                max_seen,
-                pages_fetched,
-                total_written,
-                time.monotonic() - started_at,
-            )
-            return _HotSweepPeerOutcome(written=total_written, flooded=False)
-
-        if result.min_id is None:
-            _save_hot_min_id_gap_state(ctx.conn, ctx.dialog_id, hot_cursor=max_seen, now=ctx.now)
-            logger.debug(
-                "activity_hot_sweep_min_id_gap dialog_id=%r hot_cursor=%d pages_fetched=%d written=%d duration_s=%.3f",
-                ctx.dialog_id,
-                max_seen,
-                pages_fetched,
-                total_written,
-                time.monotonic() - started_at,
-            )
-            return _HotSweepPeerOutcome(written=total_written, flooded=False)
-
-        page_offset = result.min_id
+        )
+        if next_offset is None:
+            return outcome
+        page_offset = next_offset
 
     logger.debug(
         "activity_hot_sweep_peer_shutdown dialog_id=%r pages_fetched=%d written=%d duration_s=%.3f",

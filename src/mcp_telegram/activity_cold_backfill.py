@@ -32,6 +32,7 @@ from typing import cast
 
 from .activity_peer_sweep import (
     SkipReason,
+    SweepResult,
     _save_dialog_state,
     build_working_set,
     sweep_peer_once,
@@ -88,6 +89,16 @@ class ColdPassResult:
     persisted: int  # count of rows written this pass; 0 unless outcome==WROTE
 
 
+@dataclass(frozen=True, slots=True)
+class _ColdPeerFinishContext:
+    conn: sqlite3.Connection
+    dialog_id: int
+    offset_id: int
+    started_at: float
+    now: int
+    result: SweepResult
+
+
 # ---------------------------------------------------------------------------
 # Single-pass implementation
 # ---------------------------------------------------------------------------
@@ -135,6 +146,83 @@ async def _maybe_enroll_activity_peers(
     except Exception:
         logger.warning("activity_cold_backfill_enroll_error", exc_info=True)
     return asyncio.get_running_loop().time()
+
+
+def _finish_cold_backfill_peer(ctx: _ColdPeerFinishContext) -> ColdPassResult:
+    """Apply one peer result and emit the matching telemetry."""
+    result = ctx.result
+    if result.skip_reason is SkipReason.FLOOD_WAIT:
+        flood_wait_seconds = cast(int, result.flood_wait_seconds)
+        next_retry_at = ctx.now + flood_wait_seconds
+        _save_dialog_state(
+            ctx.conn,
+            ctx.dialog_id,
+            cold_status="pending",
+            cold_next_retry_at=next_retry_at,
+        )
+        logger.warning(
+            "activity_cold_backfill_flood dialog_id=%r flood_wait_seconds=%d retry_delay_s=%d"
+            " cold_next_retry_at=%d duration_s=%.3f",
+            ctx.dialog_id,
+            flood_wait_seconds,
+            flood_wait_seconds,
+            next_retry_at,
+            time.monotonic() - ctx.started_at,
+        )
+        return ColdPassResult(outcome=ColdPassOutcome.FLOOD_WAIT, persisted=0)
+
+    if result.skip_reason is SkipReason.ACCESS_SKIP:
+        next_retry_at = int(ctx.now + _PACING.history.access_retry_s)
+        _save_dialog_state(
+            ctx.conn,
+            ctx.dialog_id,
+            cold_status="pending",
+            cold_next_retry_at=next_retry_at,
+            cold_last_error="access_skip",
+        )
+        logger.debug(
+            "activity_cold_backfill_access_skip dialog_id=%r retry_delay_s=%.3f cold_next_retry_at=%d duration_s=%.3f",
+            ctx.dialog_id,
+            _PACING.history.access_retry_s,
+            next_retry_at,
+            time.monotonic() - ctx.started_at,
+        )
+        return ColdPassResult(outcome=ColdPassOutcome.ZERO_PERSISTED, persisted=0)
+
+    if result.skip_reason is SkipReason.HISTORY_FLOOR:
+        _save_dialog_state(
+            ctx.conn,
+            ctx.dialog_id,
+            cold_status="complete",
+            cold_next_retry_at=None,
+        )
+        logger.info(
+            "activity_cold_backfill_complete dialog_id=%r offset_id=%d duration_s=%.3f",
+            ctx.dialog_id,
+            ctx.offset_id,
+            time.monotonic() - ctx.started_at,
+        )
+        return ColdPassResult(outcome=ColdPassOutcome.ZERO_PERSISTED, persisted=0)
+
+    new_offset = result.min_id
+    _save_dialog_state(
+        ctx.conn,
+        ctx.dialog_id,
+        cold_offset_id=new_offset,
+        cold_status="pending",
+        cold_next_retry_at=None,
+    )
+    logger.debug(
+        "activity_cold_backfill_batch dialog_id=%r old_offset=%d new_offset=%r persisted=%d duration_s=%.3f",
+        ctx.dialog_id,
+        ctx.offset_id,
+        new_offset,
+        result.persisted,
+        time.monotonic() - ctx.started_at,
+    )
+    if result.persisted and result.persisted > 0:
+        return ColdPassResult(outcome=ColdPassOutcome.WROTE, persisted=result.persisted)
+    return ColdPassResult(outcome=ColdPassOutcome.ZERO_PERSISTED, persisted=0)
 
 
 async def run_cold_backfill_pass(
@@ -205,94 +293,16 @@ async def run_cold_backfill_pass(
         limit=_BACKFILL_BATCH_LIMIT,
     )
 
-    # --- Branch STRICTLY on result.skip_reason (concern 3) ---
-
-    if result.skip_reason is SkipReason.FLOOD_WAIT:
-        # Tier B owns durable FloodWait retry — concern 5.
-        # Set cold_next_retry_at; mark pending so peer is re-selectable.
-        # NEVER touch any hot_* field.
-        next_retry_at = now + (result.flood_wait_seconds or 0)
-        _save_dialog_state(
-            conn,
-            dialog_id,
-            cold_status="pending",
-            cold_next_retry_at=next_retry_at,
+    return _finish_cold_backfill_peer(
+        _ColdPeerFinishContext(
+            conn=conn,
+            dialog_id=dialog_id,
+            offset_id=offset_id,
+            started_at=started_at,
+            now=now,
+            result=result,
         )
-        logger.warning(
-            "activity_cold_backfill_flood dialog_id=%r flood_wait_seconds=%d retry_delay_s=%d"
-            " cold_next_retry_at=%d duration_s=%.3f",
-            dialog_id,
-            result.flood_wait_seconds,
-            result.flood_wait_seconds or 0,
-            next_retry_at,
-            time.monotonic() - started_at,
-        )
-        return ColdPassResult(outcome=ColdPassOutcome.FLOOD_WAIT, persisted=0)
-
-    if result.skip_reason is SkipReason.ACCESS_SKIP:
-        # Transient miss — resolve_input_peer returned None or a timeout.
-        # Concern 3: ACCESS_SKIP must NEVER set cold_status='complete'.
-        # cold_offset_id is left UNCHANGED so the walk resumes from the same point.
-        next_retry_at = int(now + _PACING.history.access_retry_s)
-        _save_dialog_state(
-            conn,
-            dialog_id,
-            cold_status="pending",
-            cold_next_retry_at=next_retry_at,
-            cold_last_error="access_skip",
-        )
-        logger.debug(
-            "activity_cold_backfill_access_skip dialog_id=%r retry_delay_s=%.3f cold_next_retry_at=%d duration_s=%.3f",
-            dialog_id,
-            _PACING.history.access_retry_s,
-            next_retry_at,
-            time.monotonic() - started_at,
-        )
-        # A peer WAS processed — return ZERO_PERSISTED so loop does not idle
-        return ColdPassResult(outcome=ColdPassOutcome.ZERO_PERSISTED, persisted=0)
-
-    if result.skip_reason is SkipReason.HISTORY_FLOOR:
-        # Genuine empty batch from a reachable peer — the ONLY path that completes.
-        # hit_floor is True only here (see SweepResult.hit_floor property).
-        _save_dialog_state(
-            conn,
-            dialog_id,
-            cold_status="complete",
-            cold_next_retry_at=None,
-        )
-        logger.info(
-            "activity_cold_backfill_complete dialog_id=%r offset_id=%d duration_s=%.3f",
-            dialog_id,
-            offset_id,
-            time.monotonic() - started_at,
-        )
-        # Peer was processed; return ZERO_PERSISTED (not NO_DUE_PEER)
-        return ColdPassResult(outcome=ColdPassOutcome.ZERO_PERSISTED, persisted=0)
-
-    # SkipReason.NONE — normal non-empty batch
-    # Advance cold_offset_id downward to result.min_id (backward walk — concern 2)
-    new_offset = result.min_id
-    _save_dialog_state(
-        conn,
-        dialog_id,
-        cold_offset_id=new_offset,
-        cold_status="pending",
-        cold_next_retry_at=None,
     )
-    logger.debug(
-        "activity_cold_backfill_batch dialog_id=%r old_offset=%d new_offset=%r persisted=%d duration_s=%.3f",
-        dialog_id,
-        offset_id,
-        new_offset,
-        result.persisted,
-        time.monotonic() - started_at,
-    )
-
-    if result.persisted and result.persisted > 0:
-        return ColdPassResult(outcome=ColdPassOutcome.WROTE, persisted=result.persisted)
-    # NONE batch but persisted==0 (degenerate: fetched_ids non-empty but no rows
-    # extracted) — still a peer-processed outcome, not idle
-    return ColdPassResult(outcome=ColdPassOutcome.ZERO_PERSISTED, persisted=0)
 
 
 # ---------------------------------------------------------------------------
