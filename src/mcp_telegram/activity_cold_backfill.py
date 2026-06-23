@@ -89,6 +89,50 @@ class ColdPassResult:
 # ---------------------------------------------------------------------------
 
 
+async def _run_cold_backfill_pass_safe(
+    client: _ActivityClient,
+    conn: sqlite3.Connection,
+    shutdown_event: asyncio.Event,
+) -> ColdPassResult:
+    try:
+        return await run_cold_backfill_pass(client, conn, shutdown_event)
+    except Exception:
+        logger.warning("activity_cold_backfill_error", exc_info=True)
+        # Treat as NO_DUE_PEER for sleep purposes to avoid tight error loops.
+        return ColdPassResult(outcome=ColdPassOutcome.NO_DUE_PEER, persisted=0)
+
+
+def _cold_backfill_sleep_seconds(pass_result: ColdPassResult, idle_interval: float) -> float:
+    if pass_result.outcome is ColdPassOutcome.NO_DUE_PEER:
+        logger.debug("activity_cold_backfill_idle sleeping=%.0fs", idle_interval)
+        return idle_interval
+
+    logger.debug(
+        "activity_cold_backfill_loop outcome=%s persisted=%d sleeping=%.0fs",
+        pass_result.outcome,
+        pass_result.persisted,
+        _COLD_BACKFILL_BATCH_PAUSE_S,
+    )
+    return _COLD_BACKFILL_BATCH_PAUSE_S
+
+
+async def _maybe_enroll_activity_peers(
+    client: _ActivityClient,
+    conn: sqlite3.Connection,
+    last_enroll_at: float,
+) -> float:
+    now_mono = asyncio.get_running_loop().time()
+    if now_mono - last_enroll_at < _COLD_ENROLL_EVERY_S:
+        return last_enroll_at
+
+    try:
+        enrolled = await build_working_set(client, conn)
+        logger.debug("activity_cold_backfill_enroll enrolled=%d", enrolled)
+    except Exception:
+        logger.warning("activity_cold_backfill_enroll_error", exc_info=True)
+    return asyncio.get_running_loop().time()
+
+
 async def run_cold_backfill_pass(
     client: _ActivityClient,
     conn: sqlite3.Connection,
@@ -269,34 +313,11 @@ async def run_cold_backfill_loop(
     while not shutdown_event.is_set():
         # Throttled enrollment — call build_working_set no more than once per
         # _COLD_ENROLL_EVERY_S so peer set stays current without over-calling.
-        now_mono = asyncio.get_running_loop().time()
-        if now_mono - last_enroll_at >= _COLD_ENROLL_EVERY_S:
-            try:
-                enrolled = await build_working_set(client, conn)
-                logger.debug("activity_cold_backfill_enroll enrolled=%d", enrolled)
-            except Exception:
-                logger.warning("activity_cold_backfill_enroll_error", exc_info=True)
-            last_enroll_at = asyncio.get_running_loop().time()
+        last_enroll_at = await _maybe_enroll_activity_peers(client, conn, last_enroll_at)
 
-        try:
-            pass_result = await run_cold_backfill_pass(client, conn, shutdown_event)
-        except Exception:
-            logger.warning("activity_cold_backfill_error", exc_info=True)
-            # Treat as NO_DUE_PEER for sleep purposes to avoid tight error loops
-            pass_result = ColdPassResult(outcome=ColdPassOutcome.NO_DUE_PEER, persisted=0)
+        pass_result = await _run_cold_backfill_pass_safe(client, conn, shutdown_event)
 
-        # Sleep policy: long idle only on NO_DUE_PEER; short batch pause otherwise
-        if pass_result.outcome is ColdPassOutcome.NO_DUE_PEER:
-            sleep_s = idle_interval
-            logger.debug("activity_cold_backfill_idle sleeping=%.0fs", sleep_s)
-        else:
-            sleep_s = _COLD_BACKFILL_BATCH_PAUSE_S
-            logger.debug(
-                "activity_cold_backfill_loop outcome=%s persisted=%d sleeping=%.0fs",
-                pass_result.outcome,
-                pass_result.persisted,
-                sleep_s,
-            )
+        sleep_s = _cold_backfill_sleep_seconds(pass_result, idle_interval)
 
         try:
             await asyncio.wait_for(shutdown_event.wait(), timeout=sleep_s)
