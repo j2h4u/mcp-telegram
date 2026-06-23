@@ -23,6 +23,7 @@ import logging
 import sqlite3
 import time
 from collections.abc import Sequence
+from dataclasses import replace
 from datetime import datetime
 from typing import Protocol, cast, runtime_checkable
 
@@ -917,8 +918,9 @@ class EventHandlerManager:
 
         Telethon emits UpdateTranscribedAudio for premium voice transcription
         replies. The update carries the target peer, message id, and final text;
-        the underlying message row stays the same, so we rewrite messages.text
-        and refresh FTS if the synced row already exists.
+        if the row already exists we rewrite messages.text and refresh FTS.
+        If the message row has not been inserted yet, we fetch the current
+        message and upsert it so the transcription is not dropped on the floor.
         """
         peer: object = getattr(update, "peer", None)
         msg_id_value: object = getattr(update, "msg_id", None)
@@ -951,20 +953,21 @@ class EventHandlerManager:
                 tuple[str | None] | None,
                 self._conn.execute(_SELECT_MESSAGE_TEXT_SQL, (dialog_id, int(msg_id))).fetchone(),
             )
+            new_text = text_value.strip()
+            now = int(time.time())
             if row is None:
                 logger.debug(
                     "raw_transcribed_audio_missing_message dialog_id=%d message_id=%d",
                     dialog_id,
                     msg_id,
                 )
+                await self._insert_missing_transcribed_audio(dialog_id, int(msg_id), new_text, now)
                 return
 
-            new_text = text_value.strip()
             old_text = row[0]
             if old_text == new_text:
                 return
 
-            now = int(time.time())
             with self._conn:
                 version_row = cast(
                     tuple[int],
@@ -993,6 +996,28 @@ class EventHandlerManager:
                 dialog_id,
                 msg_id,
             )
+
+    async def _insert_missing_transcribed_audio(
+        self,
+        dialog_id: int,
+        msg_id: int,
+        new_text: str,
+        now: int,
+    ) -> None:
+        fetched = cast(Sequence[object], await self._client.get_messages(dialog_id, ids=[msg_id]))
+        msg = fetched[0] if fetched else None
+        if msg is None:
+            return
+        extracted = extract_message_row(dialog_id, msg, entity_name_map={})
+        extracted = replace(extracted, message=replace(extracted.message, text=new_text))
+        with self._conn:
+            insert_messages_with_fts(self._conn, [extracted])
+            self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
+        logger.info(
+            "event_raw_transcribed_audio dialog_id=%d message_id=%d inserted=true",
+            dialog_id,
+            msg_id,
+        )
 
     # ------------------------------------------------------------------
     # Phase 42: dialog metadata Raw handlers (EVENTS-01, EVENTS-02, EVENTS-03)

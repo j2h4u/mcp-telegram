@@ -1515,6 +1515,7 @@ async def test_get_sync_status_via_daemon():
                 "status": "synced",
                 "message_count": 100,
                 "sync_progress": 100,
+                "sync_progress_message_id": 100,
                 "total_messages": 100,
                 "last_synced_at": 1700000000,
                 "last_event_at": 1700001000,
@@ -1534,11 +1535,12 @@ async def test_get_sync_status_via_daemon():
         "last_event_at": 1700001000,
         "message_count": 100,
         "sync_progress": 100,
+        "sync_progress_message_id": 100,
         "total_messages": 100,
         "delete_detection": "reliable (channel)",
         "sync_coverage_pct": None,
         "access_lost_at": None,
-        "action": None,
+        "action": "sync_progress is a message_id offset, not a count. Treat sync_coverage_pct as an approximate local-vs-Telegram ratio.",
     }
     conn.get_sync_status.assert_called_once_with(dialog_id=-1001234567890)
 

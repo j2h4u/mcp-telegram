@@ -1830,6 +1830,31 @@ async def test_get_sync_status_synced_dialog() -> None:
     assert data["last_synced_at"] == 1700000000
     assert data["last_event_at"] == 1700001000
     assert data["delete_detection"] == "reliable (channel)"
+    assert data["sync_progress_message_id"] == 500
+
+
+@pytest.mark.asyncio
+async def test_get_sync_status_overcount_omits_impossible_coverage() -> None:
+    """get_sync_status does not report a fake 100% when local rows outrun Telegram total."""
+    conn = _make_db()
+    _insert_synced_dialog(
+        conn,
+        -1001234567890,
+        status="synced",
+        sync_progress=420,
+        total_messages=100,
+    )
+    for i in range(150):
+        _insert_message(conn, -1001234567890, i + 1, text=f"msg{i + 1}")
+    server = make_server(conn)
+    result = await server._dispatch({"method": "get_sync_status", "dialog_id": -1001234567890})
+    assert result["ok"] is True
+    data = cast(dict[str, object], result["data"])
+    assert data["message_count"] == 150
+    assert data["sync_progress"] == 420
+    assert data["sync_progress_message_id"] == 420
+    assert data["total_messages"] == 100
+    assert data["sync_coverage_pct"] is None
 
 
 @pytest.mark.asyncio
@@ -3413,6 +3438,23 @@ async def test_list_messages_topic_label() -> None:
     assert msgs_by_id[102].get("topic_title") is None
 
 
+@pytest.mark.asyncio
+async def test_list_messages_general_topic_title_fallback() -> None:
+    """Telegram's General topic id is readable before topic_metadata is refreshed."""
+    DIALOG_ID = 9061
+    conn = _make_db()
+    _insert_synced_dialog(conn, DIALOG_ID, status="synced")
+    _insert_message(conn, DIALOG_ID, 101, text="general topic msg", forum_topic_id=1)
+
+    server = make_server(conn)
+    result = await server._list_messages({"dialog_id": DIALOG_ID, "limit": 10})
+
+    assert result["ok"] is True, f"Unexpected error: {result}"
+    messages = _response_messages(result)
+    assert messages[0]["forum_topic_id"] == 1
+    assert messages[0]["topic_title"] == "General"
+
+
 # ---------------------------------------------------------------------------
 # Phase 35-01: list_messages — on-demand path: navigation token
 # ---------------------------------------------------------------------------
@@ -3810,10 +3852,10 @@ def test_compute_sync_coverage_complete():
     assert _compute_sync_coverage(1000, 1000) == 100
 
 
-def test_compute_sync_coverage_clamped_over_100():
+def test_compute_sync_coverage_returns_none_when_local_count_exceeds_total():
     from mcp_telegram.daemon_api import _compute_sync_coverage
 
-    assert _compute_sync_coverage(100, 150) == 100
+    assert _compute_sync_coverage(100, 150) is None
 
 
 def test_compute_sync_coverage_null_total():

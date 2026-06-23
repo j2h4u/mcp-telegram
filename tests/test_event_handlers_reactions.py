@@ -458,21 +458,26 @@ async def test_on_raw_transcribed_audio_updates_text_and_fts(
 
 
 @pytest.mark.asyncio
-async def test_on_raw_transcribed_audio_missing_row_is_noop(
+async def test_on_raw_transcribed_audio_missing_row_upserts_message(
     mock_client: MagicMock,
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
-    """Unseen transcription update does not create phantom rows."""
+    """If the row is not present yet, fetch and store the transcribed message."""
     from telethon.tl.types import PeerUser  # type: ignore[import-untyped]
 
     dialog_id = 268071163
+    message_id = 999
     _enroll(sync_db, dialog_id)
 
-    update = SimpleNamespace(peer=PeerUser(user_id=dialog_id), msg_id=999, text="speech to text", pending=False)
+    fetched_msg = build_mock_message(id=message_id, text="", media=SimpleNamespace())
+    mock_client.get_messages = AsyncMock(return_value=[fetched_msg])
+    update = SimpleNamespace(peer=PeerUser(user_id=dialog_id), msg_id=message_id, text="speech to text", pending=False)
 
     mgr = _make_manager(mock_client, sync_db, shutdown_event)
     await mgr.on_raw_transcribed_audio(update)
 
-    assert _message_version_count(sync_db, dialog_id, 999) == 0
-    assert _message_text(sync_db, dialog_id, 999) is None
+    mock_client.get_messages.assert_awaited_once()
+    assert _message_version_count(sync_db, dialog_id, message_id) == 0
+    assert _message_text(sync_db, dialog_id, message_id) == "speech to text"
+    assert _fts_text(sync_db, dialog_id, message_id) is not None

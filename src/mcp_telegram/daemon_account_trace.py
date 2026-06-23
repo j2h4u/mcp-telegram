@@ -2400,7 +2400,7 @@ def _build_trace_account_messages_query(
         "m.forum_topic_id AS topic_id, "
         "COALESCE(d.name, e_dialog.name, CAST(m.dialog_id AS TEXT)) AS dialog_title, "
         "COALESCE(d.type, e_dialog.type) AS dialog_type, "
-        "tm.title AS topic_title, "
+        "COALESCE(tm.title, CASE WHEN m.forum_topic_id = 1 THEN 'General' END) AS topic_title, "
         "m.post_author AS author_signature, "
         f"{EFFECTIVE_SENDER_ID_SQL}, "
         "CASE "

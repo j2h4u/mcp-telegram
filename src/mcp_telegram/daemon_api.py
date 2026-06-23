@@ -447,12 +447,21 @@ def _compute_sync_coverage(
     total_messages: int | None,
     local_count: int,
 ) -> int | None:
-    """Compute sync_coverage_pct. Returns int 0-100 or None if unknown."""
-    if total_messages is not None and total_messages > 0:
-        return min(100, round(local_count / total_messages * 100))
+    """Compute sync_coverage_pct.
+
+    Returns int 0-100 when local_count is comparable to the Telegram total.
+    Returns None when the total is unknown or the local row count exceeds the
+    Telegram-side total, because that is not a meaningful coverage ratio.
+    """
+    if _sync_coverage_unknown(total_messages, local_count):
+        return None
     if total_messages == 0:
-        return 100  # trivially complete
-    return None
+        return 100
+    return round(local_count / cast(int, total_messages) * 100)
+
+
+def _sync_coverage_unknown(total_messages: int | None, local_count: int) -> bool:
+    return total_messages is None or total_messages < 0 or local_count > total_messages
 
 
 def _build_access_metadata(
@@ -755,7 +764,7 @@ _LIST_MESSAGES_BASE_SQL = (
     f"   WHERE mv.dialog_id = m.dialog_id AND mv.message_id = m.message_id), "
     f"  m.edit_date"
     f") AS edit_date, "
-    f"tm.title AS topic_title, "
+    f"COALESCE(tm.title, CASE WHEN m.forum_topic_id = 1 THEN 'General' END) AS topic_title, "
     f"{EFFECTIVE_SENDER_ID_SQL}, m.is_service, m.out, m.dialog_id, "
     f"mf.fwd_from_name, m.post_author "
     f"FROM messages m "
@@ -1513,6 +1522,7 @@ class DaemonAPIServer:
             "last_synced_at": last_synced_at,
             "last_event_at": last_event_at,
             "sync_progress": sync_progress,
+            "sync_progress_message_id": sync_progress,
             "total_messages": total_messages,
             "delete_detection": delete_detection,
             "sync_coverage_pct": sync_coverage_pct,

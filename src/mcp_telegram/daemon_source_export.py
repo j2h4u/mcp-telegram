@@ -275,7 +275,7 @@ def _source_rows_after_identity_cursor(
           COALESCE(d.name, dialog_entity.name, CAST(m.dialog_id AS TEXT)) AS dialog_name,
           COALESCE(d.type, dialog_entity.type, 'Unknown') AS dialog_type,
           dialog_entity.username AS username,
-          tm.title AS topic_title
+          COALESCE(tm.title, CASE WHEN m.forum_topic_id = 1 THEN 'General' END) AS topic_title
         FROM messages m
         JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id
         LEFT JOIN entities dialog_entity ON dialog_entity.id = m.dialog_id
@@ -325,7 +325,7 @@ def _source_rows_after_update_watermark(
           COALESCE(d.name, dialog_entity.name, CAST(m.dialog_id AS TEXT)) AS dialog_name,
           COALESCE(d.type, dialog_entity.type, 'Unknown') AS dialog_type,
           dialog_entity.username AS username,
-          tm.title AS topic_title
+          COALESCE(tm.title, CASE WHEN m.forum_topic_id = 1 THEN 'General' END) AS topic_title
         FROM messages m
         JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id
         LEFT JOIN entities dialog_entity ON dialog_entity.id = m.dialog_id
@@ -477,7 +477,7 @@ def _read_source_unit_window(conn: sqlite3.Connection, req: dict) -> dict:
           COALESCE(d.name, dialog_entity.name, CAST(m.dialog_id AS TEXT)) AS dialog_name,
           COALESCE(d.type, dialog_entity.type, 'Unknown') AS dialog_type,
           dialog_entity.username AS username,
-          tm.title AS topic_title
+          COALESCE(tm.title, CASE WHEN m.forum_topic_id = 1 THEN 'General' END) AS topic_title
         FROM selected s
         JOIN messages m ON m.dialog_id = s.dialog_id AND m.message_id = s.message_id
         JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id

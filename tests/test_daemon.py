@@ -424,20 +424,25 @@ def test_sync_main_idles_when_all_synced(
 
     worker_class = MagicMock(return_value=worker_instance)
 
+    async def _noop_followups(*args, **kwargs) -> None:
+        return None
+
     with (
         patch("mcp_telegram.daemon.create_client", return_value=mock_client),
         patch("mcp_telegram.daemon.ensure_sync_schema"),
         patch("mcp_telegram.daemon.register_shutdown_handler", side_effect=mock_register_shutdown),
         patch("mcp_telegram.daemon._open_sync_db"),
         patch("mcp_telegram.daemon.backfill_fts_index", return_value=0),
-        patch("mcp_telegram.daemon.HEARTBEAT_INTERVAL_S", 0.01),
+        patch("mcp_telegram.daemon.HEARTBEAT_INTERVAL_S", 0.0),
         patch("mcp_telegram.daemon.FullSyncWorker", worker_class),
+        patch("mcp_telegram.daemon._start_followup_background_tasks", side_effect=_noop_followups),
         caplog.at_level(logging.INFO, logger="mcp_telegram.daemon"),
     ):
         asyncio.run(sync_main())
 
     heartbeat_logs = [r.message for r in caplog.records if "heartbeat" in r.message]
     assert heartbeat_logs, "Expected heartbeat log when daemon is in idle mode after all synced"
+    assert any("sync_idle" in r.message for r in caplog.records)
 
 
 def test_sync_main_logs_heartbeat_during_sync(
@@ -991,6 +996,81 @@ def test_sync_main_cleans_socket_on_shutdown(
 # ---------------------------------------------------------------------------
 # R-8: _backfill_total_messages — FloodWait shutdown interrupt
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_backfill_blank_unsupported_messages_materializes_text_and_fts() -> None:
+    """Startup backfill re-fetches blank unsupported rows and indexes recovered text."""
+    from helpers import build_mock_message
+
+    from mcp_telegram.daemon import _backfill_blank_unsupported_messages
+    from mcp_telegram.sync_db import _apply_migrations
+
+    conn = sqlite3.connect(":memory:")
+    try:
+        _apply_migrations(conn)
+        conn.execute(
+            "INSERT INTO messages (dialog_id, message_id, sent_at, text, media_description) "
+            "VALUES (?, ?, ?, '', 'MessageMediaUnsupported')",
+            (1001, 77, 1704067200),
+        )
+        conn.commit()
+
+        client = MagicMock()
+        client.get_messages = AsyncMock(return_value=[build_mock_message(id=77, text="speech to text")])
+        filled = await _backfill_blank_unsupported_messages(client, conn, asyncio.Event())
+
+        assert filled == 1
+        row = conn.execute("SELECT text FROM messages WHERE dialog_id=? AND message_id=?", (1001, 77)).fetchone()
+        assert row == ("speech to text",)
+        fts_row = conn.execute(
+            "SELECT stemmed_text FROM messages_fts WHERE dialog_id=? AND message_id=?",
+            (1001, 77),
+        ).fetchone()
+        assert fts_row is not None
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_backfill_blank_unsupported_messages_floodwait_skips_small_pause() -> None:
+    """FloodWait path delegates to flood handling and does not also sleep between batches."""
+    import inspect
+
+    from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
+
+    from mcp_telegram.daemon import _backfill_blank_unsupported_messages
+    from mcp_telegram.sync_db import _apply_migrations
+
+    conn = sqlite3.connect(":memory:")
+    try:
+        _apply_migrations(conn)
+        conn.execute(
+            "INSERT INTO messages (dialog_id, message_id, sent_at, text, media_description) "
+            "VALUES (?, ?, ?, '', 'MessageMediaUnsupported')",
+            (1002, 78, 1704067200),
+        )
+        conn.commit()
+
+        err = FloodWaitError(request=None)
+        err.seconds = 3
+        client = MagicMock()
+        client.get_messages = AsyncMock(side_effect=err)
+        wait_calls: list[float] = []
+
+        async def _fake_wait_for(coro: object, timeout: float) -> None:
+            if inspect.iscoroutine(coro):
+                coro.close()
+            wait_calls.append(timeout)
+
+        with patch("mcp_telegram.daemon.sleep_through_flood", new=AsyncMock(return_value=False)):
+            with patch("mcp_telegram.daemon.asyncio.wait_for", side_effect=_fake_wait_for):
+                filled = await _backfill_blank_unsupported_messages(client, conn, asyncio.Event())
+
+        assert filled == 0
+        assert wait_calls == []
+    finally:
+        conn.close()
 
 
 @pytest.mark.asyncio

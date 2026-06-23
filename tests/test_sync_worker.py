@@ -19,7 +19,13 @@ import pytest
 from helpers import MockTotalList, build_mock_message, build_mock_reactions
 
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
-from mcp_telegram.sync_worker import FullSyncWorker, StoredMessage, _PeerLike
+from mcp_telegram.sync_worker import (
+    FullSyncWorker,
+    StoredMessage,
+    _PeerLike,
+    extract_message_row,
+    insert_messages_with_fts,
+)
 
 
 class _SQLiteCursor(Protocol):
@@ -231,6 +237,108 @@ async def test_extract_reactions_rows(
         assert not isinstance(item, str) or not item.startswith("{"), (
             f"message should not contain JSON reactions, got: {item!r}"
         )
+
+
+@pytest.mark.asyncio
+async def test_extract_message_row_uses_rich_message_text_and_unsupported_placeholder(
+    mock_client: _MockClient,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """Rich-message text should survive unsupported media during extraction."""
+    import telethon.tl.types as tl
+
+    dialog_id = 1004
+    sync_db.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, sync_progress) VALUES (?, 'syncing', 0)",
+        (dialog_id,),
+    )
+    sync_db.commit()
+
+    msg = SimpleNamespace(
+        id=700,
+        date=datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC),
+        message="",
+        sender_id=10,
+        sender=SimpleNamespace(first_name="Bob"),
+        media=tl.MessageMediaUnsupported(),
+        rich_message=SimpleNamespace(blocks=[SimpleNamespace(text="speech to text")]),
+        reply_to=None,
+        reactions=None,
+        edit_date=None,
+        out=False,
+        grouped_id=None,
+        post_author=None,
+    )
+
+    extracted = extract_message_row(dialog_id, msg)
+
+    assert extracted.message.text == "speech to text"
+    assert extracted.message.media_description == "[неподдерживаемый тип]"
+
+
+@pytest.mark.asyncio
+async def test_insert_messages_with_fts_preserves_existing_transcribed_text(
+    mock_client: _MockClient,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """A later blank re-import must not erase already stored transcription text."""
+    import telethon.tl.types as tl
+
+    dialog_id = 1005
+    message_id = 701
+    sync_db.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, sync_progress) VALUES (?, 'syncing', 0)",
+        (dialog_id,),
+    )
+    sync_db.execute(
+        "INSERT INTO messages "
+        "(dialog_id, message_id, sent_at, text, sender_id, sender_first_name, media_description, "
+        "reply_to_msg_id, forum_topic_id, edit_date, grouped_id, reply_to_peer_id, out, is_service, post_author, reply_count, is_deleted) "
+        "VALUES (?, ?, 1704067200, ?, 10, 'Bob', '[неподдерживаемый тип]', NULL, NULL, NULL, NULL, NULL, 0, 0, NULL, 0, 0)",
+        (dialog_id, message_id, "speech to text"),
+    )
+    sync_db.commit()
+
+    msg = SimpleNamespace(
+        id=message_id,
+        date=datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC),
+        message="",
+        sender_id=10,
+        sender=SimpleNamespace(first_name="Bob"),
+        media=tl.MessageMediaUnsupported(),
+        reply_to=None,
+        reactions=None,
+        edit_date=None,
+        out=False,
+        grouped_id=None,
+        post_author=None,
+    )
+    extracted = [extract_message_row(dialog_id, msg)]
+
+    with sync_db:
+        insert_messages_with_fts(cast(sqlite3.Connection, sync_db), extracted)
+
+    row = cast(
+        tuple[object | None, ...] | None,
+        sync_db.execute(
+            "SELECT text FROM messages WHERE dialog_id=? AND message_id=?",
+            (dialog_id, message_id),
+        ).fetchone(),
+    )
+    assert row is not None
+    assert row[0] == "speech to text"
+
+    fts_row = cast(
+        tuple[object | None, ...] | None,
+        sync_db.execute(
+            "SELECT stemmed_text FROM messages_fts WHERE dialog_id=? AND message_id=?",
+            (dialog_id, message_id),
+        ).fetchone(),
+    )
+    assert fts_row is not None
+    assert fts_row[0] is not None
 
 
 # ---------------------------------------------------------------------------
@@ -1158,6 +1266,16 @@ def test_extract_reply_and_topic_forum_general():
     assert topic_id == 1
 
 
+def test_extract_reply_and_topic_uses_message_thread_id_when_reply_to_missing() -> None:
+    """Bot API-style topic metadata should still populate forum_topic_id."""
+    from mcp_telegram.sync_worker import extract_reply_and_topic
+
+    msg = SimpleNamespace(reply_to=None, message_thread_id=7, is_topic_message=True)
+    reply_id, topic_id = extract_reply_and_topic(msg)
+    assert reply_id is None
+    assert topic_id == 7
+
+
 # ---------------------------------------------------------------------------
 # Phase 36-01: total_messages and last_synced_at writes
 # ---------------------------------------------------------------------------
@@ -1808,6 +1926,15 @@ def test_extract_message_row_persists_reply_count(sync_db: _SQLiteConnection) ->
         (dialog_id, 778),
     ).fetchone()
     assert row == (3,)
+
+
+def test_extract_message_row_persists_message_thread_id_topic_id() -> None:
+    """message_thread_id should survive extraction as forum_topic_id."""
+    from mcp_telegram.sync_worker import extract_message_row
+
+    msg = _minimal_msg(id=779, reply_to=None, message_thread_id=11, is_topic_message=True)
+    result = extract_message_row(1, msg)
+    assert result.message.forum_topic_id == 11
 
 
 def _stored(dialog_id: int, message_id: int, text: str = "hello") -> StoredMessage:

@@ -15,6 +15,8 @@ class _BuildMockMessageKwargs(TypedDict, total=False):
     reply_to_msg_id: int | None
     forum_topic: bool
     reply_to_top_id: int | None
+    message_thread_id: int | None
+    is_topic_message: bool
     reply_count: int
     reactions: object | None
     edit_date: datetime | None
@@ -32,6 +34,8 @@ def build_mock_message(
     reply_to_msg_id = kwargs.get("reply_to_msg_id")
     forum_topic = kwargs.get("forum_topic", False)
     reply_to_top_id = kwargs.get("reply_to_top_id")
+    message_thread_id = kwargs.get("message_thread_id")
+    is_topic_message = kwargs.get("is_topic_message", False)
     reply_count = kwargs.get("reply_count", 0)
     reactions = kwargs.get("reactions")
     edit_date = kwargs.get("edit_date")
@@ -56,6 +60,8 @@ def build_mock_message(
         replies=SimpleNamespace(replies=reply_count) if reply_count else None,
         reactions=reactions,
         edit_date=edit_date,
+        message_thread_id=message_thread_id,
+        is_topic_message=is_topic_message,
     )
 
 

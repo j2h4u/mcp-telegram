@@ -171,6 +171,41 @@ async def test_on_new_message_inserts_row(
 
 
 @pytest.mark.asyncio
+async def test_on_new_message_preserves_message_thread_topic_id(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """Topic metadata without reply_to should still persist forum_topic_id."""
+    dialog_id = 1002
+    insert_synced_dialog(sync_db, dialog_id)
+    sync_db.execute(
+        "INSERT OR REPLACE INTO topic_metadata "
+        "(dialog_id, topic_id, title, is_general, is_deleted, updated_at) "
+        "VALUES (?, ?, ?, 0, 0, 1704067200)",
+        (dialog_id, 7, "Deployments"),
+    )
+    sync_db.commit()
+
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+    manager.register()
+
+    msg = build_mock_message(
+        id=501, text="topic hello", reply_to_msg_id=None, message_thread_id=7, is_topic_message=True
+    )
+    event = make_new_message_event(chat_id=dialog_id, message=msg)
+    await manager.on_new_message(event)
+
+    row = sync_db.execute(
+        "SELECT m.forum_topic_id, tm.title FROM messages m "
+        "LEFT JOIN topic_metadata tm ON tm.dialog_id = m.dialog_id AND tm.topic_id = m.forum_topic_id "
+        "WHERE m.dialog_id=? AND m.message_id=?",
+        (dialog_id, 501),
+    ).fetchone()
+    assert row == (7, "Deployments")
+
+
+@pytest.mark.asyncio
 async def test_on_new_message_ignores_unsynced(
     mock_client: MagicMock,
     sync_db: _SQLiteConnection,

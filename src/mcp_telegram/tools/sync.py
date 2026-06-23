@@ -51,6 +51,7 @@ GET_SYNC_STATUS_OUTPUT_SCHEMA = {
         "last_event_at": {"type": ["integer", "null"]},
         "message_count": {"type": ["integer", "null"]},
         "sync_progress": {"type": ["integer", "null"]},
+        "sync_progress_message_id": {"type": ["integer", "null"]},
         "total_messages": {"type": ["integer", "null"]},
         "delete_detection": {"type": ["string", "null"]},
         "sync_coverage_pct": {"type": ["integer", "null"]},
@@ -66,6 +67,7 @@ GET_SYNC_STATUS_OUTPUT_SCHEMA = {
         "last_event_at",
         "message_count",
         "sync_progress",
+        "sync_progress_message_id",
         "total_messages",
         "delete_detection",
         "sync_coverage_pct",
@@ -265,7 +267,8 @@ class GetSyncStatus(ToolArgs):
     """Get sync status for a dialog: message count, sync progress, last sync/event timestamps,
     and delete detection reliability. delete_detection is 'reliable (channel)' for channels/supergroups
     (real-time MTProto events) or 'best-effort weekly (DM)' for personal chats (periodic gap scan).
-    Works for any dialog — non-synced dialogs return status='not_synced' with zero counts."""
+    sync_progress is the raw message_id offset cursor, not a row count. Works for any dialog —
+    non-synced dialogs return status='not_synced' with zero counts."""
 
     dialog_id: int = Field(description="Numeric dialog ID from ListDialogs")
 
@@ -294,6 +297,9 @@ async def get_sync_status(args: GetSyncStatus) -> ToolResult:
 
     data = response.get("data", {})
     status = data.get("status") or "unknown"
+    message_count = data.get("message_count")
+    total_messages = data.get("total_messages")
+    sync_progress_message_id = data.get("sync_progress_message_id", data.get("sync_progress"))
     structured_content = {
         "dialog_id": data.get("dialog_id"),
         "status": status,
@@ -301,15 +307,32 @@ async def get_sync_status(args: GetSyncStatus) -> ToolResult:
         "is_syncing": status == "syncing",
         "last_synced_at": data.get("last_synced_at"),
         "last_event_at": data.get("last_event_at"),
-        "message_count": data.get("message_count"),
+        "message_count": message_count,
         "sync_progress": data.get("sync_progress"),
-        "total_messages": data.get("total_messages"),
+        "sync_progress_message_id": sync_progress_message_id,
+        "total_messages": total_messages,
         "delete_detection": data.get("delete_detection"),
         "sync_coverage_pct": data.get("sync_coverage_pct"),
         "access_lost_at": data.get("access_lost_at"),
-        "action": data.get("action"),
+        "action": _sync_status_action(message_count, total_messages),
     }
     return structured_result(structured_content, result_count=1)
+
+
+def _sync_status_action(message_count: object, total_messages: object) -> str:
+    parts = ["sync_progress is a message_id offset, not a count."]
+    parts.append(_sync_coverage_action(message_count, total_messages))
+    return " ".join(parts)
+
+
+def _sync_coverage_action(message_count: object, total_messages: object) -> str:
+    if total_messages is None:
+        return "Coverage is unknown without Telegram total_messages."
+    if isinstance(message_count, int) and isinstance(total_messages, int) and message_count > total_messages:
+        return "Local message_count exceeds Telegram total_messages, so coverage is not comparable."
+    if total_messages == 0:
+        return "Empty dialogs are complete; non-empty local counts would be inconsistent."
+    return "Treat sync_coverage_pct as an approximate local-vs-Telegram ratio."
 
 
 class GetSyncAlerts(ToolArgs):

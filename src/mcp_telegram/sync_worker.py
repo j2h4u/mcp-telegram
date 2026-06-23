@@ -22,7 +22,7 @@ import logging
 import sqlite3
 import time
 from collections.abc import AsyncIterator, Iterator, Sequence
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import datetime
 from typing import Protocol, TypeVar, cast
 
@@ -48,6 +48,7 @@ from .resolver import latinize
 
 logger = logging.getLogger(__name__)
 _BATCH_SIZE = 100
+_UNSUPPORTED_MEDIA_DESCRIPTION = "[неподдерживаемый тип]"
 T = TypeVar("T")
 
 
@@ -308,6 +309,8 @@ def insert_messages_with_fts(
     before INSERT to ensure edit idempotency. Without this, an edited
     message would accumulate stale child rows from prior versions.
     """
+    extracted = _preserve_transcribed_texts(conn, extracted)
+
     msgs = [em.message for em in extracted]
     conn.executemany(
         INSERT_MESSAGE_SQL,
@@ -335,6 +338,52 @@ def insert_messages_with_fts(
     all_forwards = [em.forward for em in extracted if em.forward is not None]
     if all_forwards:
         conn.executemany(INSERT_FORWARD_SQL, [asdict(f) for f in all_forwards])
+
+
+def _preserve_transcribed_texts(
+    conn: sqlite3.Connection,
+    extracted: list[ExtractedMessage],
+) -> list[ExtractedMessage]:
+    preserved_texts = _existing_transcribed_texts(conn, extracted)
+    if not preserved_texts:
+        return extracted
+    return [_with_preserved_text(em, preserved_texts) for em in extracted]
+
+
+def _existing_transcribed_texts(
+    conn: sqlite3.Connection,
+    extracted: Sequence[ExtractedMessage],
+) -> dict[tuple[int, int], str]:
+    preserved_texts: dict[tuple[int, int], str] = {}
+    for em in extracted:
+        preserved = _existing_text_for_blank_unsupported(conn, em)
+        if preserved:
+            preserved_texts[(em.message.dialog_id, em.message.message_id)] = preserved
+    return preserved_texts
+
+
+def _existing_text_for_blank_unsupported(conn: sqlite3.Connection, extracted: ExtractedMessage) -> str | None:
+    if extracted.message.text or extracted.message.media_description != _UNSUPPORTED_MEDIA_DESCRIPTION:
+        return None
+    row = cast(
+        tuple[str | None] | None,
+        conn.execute(
+            "SELECT text FROM messages WHERE dialog_id = ? AND message_id = ?",
+            (extracted.message.dialog_id, extracted.message.message_id),
+        ).fetchone(),
+    )
+    return row[0] if row is not None and row[0] else None
+
+
+def _with_preserved_text(
+    extracted: ExtractedMessage,
+    preserved_texts: dict[tuple[int, int], str],
+) -> ExtractedMessage:
+    key = (extracted.message.dialog_id, extracted.message.message_id)
+    text = preserved_texts.get(key)
+    if text is None:
+        return extracted
+    return replace(extracted, message=replace(extracted.message, text=text))
 
 
 _NEXT_PENDING_SQL = (
@@ -383,16 +432,33 @@ def extract_reply_and_topic(msg: object) -> tuple[int | None, int | None]:
     Returns (reply_to_msg_id, forum_topic_id).
     """
     reply_to = _attr(msg, "reply_to", None)
+    return _reply_message_id(reply_to), _reply_forum_topic_id(reply_to) or _message_thread_topic_id(msg)
+
+
+def _reply_message_id(reply_to: object | None) -> int | None:
     if reply_to is None:
-        return None, None
+        return None
     _touch_reply_to_fields(cast(_ReplyToLike, reply_to))
     raw_reply_msg_id = _attr(reply_to, "reply_to_msg_id", None)
-    reply_to_msg_id = int(raw_reply_msg_id) if raw_reply_msg_id is not None else None
-    forum_topic_id: int | None = None
-    if _attr(reply_to, "forum_topic", False):
-        reply_top_id = _attr(reply_to, "reply_to_reply_top_id", None)
-        forum_topic_id = int(reply_top_id) if reply_top_id is not None else 1
-    return reply_to_msg_id, forum_topic_id
+    return int(raw_reply_msg_id) if raw_reply_msg_id is not None else None
+
+
+def _reply_forum_topic_id(reply_to: object | None) -> int | None:
+    if reply_to is None or not _attr(reply_to, "forum_topic", False):
+        return None
+    reply_top_id = _attr(reply_to, "reply_to_reply_top_id", None)
+    return int(reply_top_id) if reply_top_id is not None else 1
+
+
+def _message_thread_topic_id(msg: object) -> int | None:
+    message_thread_id = _attr(msg, "message_thread_id", None)
+    if message_thread_id is not None:
+        return int(message_thread_id)
+    if _attr(msg, "is_topic_message", False):
+        # Bot API-style topic messages may surface only a topic flag when the
+        # thread id is absent. Telegram uses topic id 1 for the General topic.
+        return 1
+    return None
 
 
 def _touch_reply_to_fields(reply_to: _ReplyToLike) -> None:
@@ -743,9 +809,53 @@ def _extract_sender_first_name(msg: object) -> str | None:
     return _first_non_empty_str(_attr(sender, "first_name", None), _attr(sender, "title", None))
 
 
+def _concrete_attr(obj: object, name: str) -> object | None:
+    """Return an attribute only when it is already materialized on the object."""
+    if type(obj).__module__.startswith("unittest.mock"):
+        values = getattr(obj, "__dict__", {})
+        return values.get(name) if isinstance(values, dict) else None
+    try:
+        values = vars(obj)
+    except TypeError:
+        return getattr(obj, name, None)
+    return values.get(name)
+
+
+def _extract_rich_text(value: object) -> str:
+    """Best-effort plain-text extraction from Telegram rich-text objects."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return "".join(_extract_rich_text(item) for item in value)
+
+    parts: list[str] = []
+    for attr in ("text", "texts", "blocks", "items"):
+        child = _concrete_attr(value, attr)
+        if child is not None:
+            parts.append(_extract_rich_text(child))
+    return "".join(parts)
+
+
+def _extract_message_text(msg: object) -> str | None:
+    text = _attr(msg, "message", None)
+    if isinstance(text, str) and text != "":
+        return text
+    rich_message = _concrete_attr(msg, "rich_message")
+    if rich_message is None:
+        return text if isinstance(text, str) else None
+    rich_text = _extract_rich_text(rich_message).strip()
+    return rich_text or (text if isinstance(text, str) else None)
+
+
 def _extract_media_description(msg: object) -> str | None:
     media = _attr(msg, "media", None)
-    return type(media).__name__ if media is not None else None
+    if media is None:
+        return None
+    from .formatter import _describe_media
+
+    return _describe_media(media)
 
 
 def _extract_edit_date(msg: object) -> int | None:
@@ -834,7 +944,7 @@ def extract_message_row(
         dialog_id=dialog_id,
         message_id=message_id,
         sent_at=_extract_sent_at(msg),
-        text=_attr(msg, "message", None),
+        text=_extract_message_text(msg),
         sender_id=_attr(msg, "sender_id", None),
         sender_first_name=_extract_sender_first_name(msg),
         media_description=_extract_media_description(msg),
