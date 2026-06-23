@@ -18,6 +18,7 @@ backoff helpers — see activity_peer_resolve.resolve_linked_chat_id.
 No scheduling loops live here — those are plans 03 and 04.
 """
 
+import asyncio
 import logging
 import sqlite3
 import time
@@ -31,6 +32,8 @@ from .activity_sync import INSERT_OWN_ONLY_DIALOG_SQL, _ActivityClient, call_wit
 from .sync_worker import ExtractedMessage, extract_message_row, insert_messages_with_fts
 
 logger = logging.getLogger(__name__)
+
+_SEARCH_SUCCESS_PAUSE_S = 0.25
 
 # Thin dialogs row written alongside the own_only synced_dialogs insert so the
 # peer becomes visible to list_dialogs / get_my_recent_activity. INSERT OR IGNORE
@@ -114,6 +117,11 @@ class _SweepMessageLike(Protocol):
 
 class _SweepResultLike(Protocol):
     messages: Sequence[_SweepMessageLike] | None
+
+
+async def _pace_successful_search_request() -> None:
+    """Apply a tiny fixed pause after a successful SearchRequest."""
+    await asyncio.sleep(_SEARCH_SUCCESS_PAUSE_S)
 
 
 def _coerce_peer_sweep_request(*args: object, **kwargs: object) -> PeerSweepRequest:
@@ -226,6 +234,7 @@ async def sweep_peer_once(*args: object, **kwargs: object) -> SweepResult:
             skip_reason=SkipReason.ACCESS_SKIP,
         )
 
+    await _pace_successful_search_request()
     batch = list(cast(_SweepResultLike, result).messages or [])
 
     # Step 5: genuinely empty batch from a reachable peer → history floor
