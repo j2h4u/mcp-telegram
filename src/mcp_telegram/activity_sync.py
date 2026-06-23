@@ -30,9 +30,23 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_INTERVAL_S = 3600.0
 _BACKFILL_BATCH_LIMIT = 100
-_BACKFILL_INTER_BATCH_PAUSE_S = 0.5
 _SECONDS_PER_MINUTE = 60
 _SECONDS_PER_HOUR = 60 * _SECONDS_PER_MINUTE
+
+
+@dataclass(frozen=True, slots=True)
+class ActivitySyncSearchPacing:
+    batch_s: float = 0.5
+
+
+@dataclass(frozen=True, slots=True)
+class ActivitySyncPacing:
+    search: ActivitySyncSearchPacing = ActivitySyncSearchPacing()
+
+
+_PACING = ActivitySyncPacing()
+
+
 # Upper bound on a single SearchRequest await. Prevents a wedged MTProto
 # socket after startup FloodWait from hanging the incremental loop
 # indefinitely (D-02 expert panel).
@@ -502,7 +516,7 @@ async def _run_backfill(
         _set_state(conn, "backfill_offset_id", str(progress.checkpoint))
         _log_backfill_batch(progress, len(batch))
 
-        if await _wait_for_shutdown(shutdown_event, timeout=_BACKFILL_INTER_BATCH_PAUSE_S):
+        if await _wait_for_shutdown(shutdown_event, timeout=_PACING.search.batch_s):
             return
 
 
@@ -587,7 +601,7 @@ async def _run_incremental(
         if past_window:
             break
 
-        if await _wait_for_shutdown(shutdown_event, timeout=_BACKFILL_INTER_BATCH_PAUSE_S):
+        if await _wait_for_shutdown(shutdown_event, timeout=_PACING.search.batch_s):
             return
 
     _stamp_last_sync_at(conn)

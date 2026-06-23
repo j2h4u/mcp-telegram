@@ -44,17 +44,21 @@ logger = logging.getLogger(__name__)
 # Module-level constants (all env-overridable for operator tuning / UAT)
 # ---------------------------------------------------------------------------
 
-_COLD_BACKFILL_INTERVAL_S = float(os.environ.get("ACTIVITY_COLD_BACKFILL_SECONDS", "300"))
-# Minimum pause between batches even when work exists — prevents request-rate spikes.
-# _COLD_BACKFILL_BATCH_PAUSE_S is intentionally short (5s) so deep-history peers
-# do not stall more-recently-active peers indefinitely.
-_COLD_BACKFILL_BATCH_PAUSE_S = float(os.environ.get("ACTIVITY_COLD_BACKFILL_BATCH_PAUSE", "5"))
-# Throttled enrollment cadence — Tier B calls build_working_set no more often than
-# this so it can enroll/select peers without depending on Tier A having run.
-_COLD_ENROLL_EVERY_S = float(os.environ.get("ACTIVITY_COLD_ENROLL_SECONDS", "1800"))
-# Transient backoff for ACCESS_SKIP: resolve_input_peer returned None or a timeout.
-# A bounded retry ensures the peer is re-selectable without permanently completing.
-_COLD_ACCESS_RETRY_S = float(os.environ.get("ACTIVITY_COLD_ACCESS_RETRY_SECONDS", "3600"))
+
+@dataclass(frozen=True, slots=True)
+class ColdBackfillHistoryPacing:
+    batch_s: float = float(os.environ.get("ACTIVITY_COLD_BACKFILL_BATCH_PAUSE", "5"))
+    enroll_s: float = float(os.environ.get("ACTIVITY_COLD_ENROLL_SECONDS", "1800"))
+    access_retry_s: float = float(os.environ.get("ACTIVITY_COLD_ACCESS_RETRY_SECONDS", "3600"))
+
+
+@dataclass(frozen=True, slots=True)
+class ColdBackfillPacing:
+    idle_s: float = float(os.environ.get("ACTIVITY_COLD_BACKFILL_SECONDS", "300"))
+    history: ColdBackfillHistoryPacing = ColdBackfillHistoryPacing()
+
+
+_PACING = ColdBackfillPacing()
 
 _BACKFILL_BATCH_LIMIT = 100
 
@@ -111,9 +115,9 @@ def _cold_backfill_sleep_seconds(pass_result: ColdPassResult, idle_interval: flo
         "activity_cold_backfill_loop outcome=%s persisted=%d sleeping=%.0fs",
         pass_result.outcome,
         pass_result.persisted,
-        _COLD_BACKFILL_BATCH_PAUSE_S,
+        _PACING.history.batch_s,
     )
-    return _COLD_BACKFILL_BATCH_PAUSE_S
+    return _PACING.history.batch_s
 
 
 async def _maybe_enroll_activity_peers(
@@ -122,7 +126,7 @@ async def _maybe_enroll_activity_peers(
     last_enroll_at: float,
 ) -> float:
     now_mono = asyncio.get_running_loop().time()
-    if now_mono - last_enroll_at < _COLD_ENROLL_EVERY_S:
+    if now_mono - last_enroll_at < _PACING.history.enroll_s:
         return last_enroll_at
 
     try:
@@ -225,7 +229,7 @@ async def run_cold_backfill_pass(
         # Transient miss — resolve_input_peer returned None or a timeout.
         # Concern 3: ACCESS_SKIP must NEVER set cold_status='complete'.
         # cold_offset_id is left UNCHANGED so the walk resumes from the same point.
-        next_retry_at = int(now + _COLD_ACCESS_RETRY_S)
+        next_retry_at = int(now + _PACING.history.access_retry_s)
         _save_dialog_state(
             conn,
             dialog_id,
@@ -293,17 +297,17 @@ async def run_cold_backfill_loop(
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,
     *,
-    idle_interval: float = _COLD_BACKFILL_INTERVAL_S,
+    idle_interval: float = _PACING.idle_s,
 ) -> None:
     """Background task: run Tier-B ColdBackfill, low-priority, self-enrolling.
 
     Loop sleep policy (cycle-4 MEDIUM — must NOT idle 300s after zero-write work):
     - outcome == NO_DUE_PEER → sleep idle_interval (long: no work exists)
-    - outcome in {WROTE, ZERO_PERSISTED, FLOOD_WAIT} → sleep _COLD_BACKFILL_BATCH_PAUSE_S
+    - outcome in {WROTE, ZERO_PERSISTED, FLOOD_WAIT} → sleep _PACING.history.batch_s
       (short: a peer was processed, more may be due)
 
     Enrollment: build_working_set is called on entry and then no more often than
-    every _COLD_ENROLL_EVERY_S so Tier B is self-sufficient for enrollment and
+    every _PACING.history.enroll_s so Tier B is self-sufficient for enrollment and
     does not depend on Tier A having run (review MEDIUM).
 
     Logs use the activity_cold_backfill_* prefix.
@@ -312,7 +316,7 @@ async def run_cold_backfill_loop(
 
     while not shutdown_event.is_set():
         # Throttled enrollment — call build_working_set no more than once per
-        # _COLD_ENROLL_EVERY_S so peer set stays current without over-calling.
+        # _PACING.history.enroll_s so peer set stays current without over-calling.
         last_enroll_at = await _maybe_enroll_activity_peers(client, conn, last_enroll_at)
 
         pass_result = await _run_cold_backfill_pass_safe(client, conn, shutdown_event)

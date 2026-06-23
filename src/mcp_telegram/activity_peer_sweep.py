@@ -33,7 +33,18 @@ from .sync_worker import ExtractedMessage, extract_message_row, insert_messages_
 
 logger = logging.getLogger(__name__)
 
-_SEARCH_SUCCESS_PAUSE_S = 0.25
+
+@dataclass(frozen=True, slots=True)
+class PeerSweepSearchPacing:
+    success_s: float = 0.25
+
+
+@dataclass(frozen=True, slots=True)
+class PeerSweepPacing:
+    search: PeerSweepSearchPacing = PeerSweepSearchPacing()
+
+
+_PACING = PeerSweepPacing()
 
 # Thin dialogs row written alongside the own_only synced_dialogs insert so the
 # peer becomes visible to list_dialogs / get_my_recent_activity. INSERT OR IGNORE
@@ -121,7 +132,7 @@ class _SweepResultLike(Protocol):
 
 async def _pace_successful_search_request() -> None:
     """Apply a tiny fixed pause after a successful SearchRequest."""
-    await asyncio.sleep(_SEARCH_SUCCESS_PAUSE_S)
+    await asyncio.sleep(_PACING.search.success_s)
 
 
 def _coerce_peer_sweep_request(*args: object, **kwargs: object) -> PeerSweepRequest:

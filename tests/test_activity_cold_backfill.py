@@ -24,7 +24,7 @@ from typing import cast
 import pytest
 
 from mcp_telegram.activity_cold_backfill import (
-    _COLD_BACKFILL_BATCH_PAUSE_S,
+    _PACING,
     ColdPassOutcome,
     ColdPassResult,
     _cold_backfill_sleep_seconds,
@@ -555,5 +555,5 @@ def test_sleep_seconds_for_outcomes() -> None:
             ColdPassResult(outcome=ColdPassOutcome.WROTE, persisted=5),
             idle_interval=123.0,
         )
-        == _COLD_BACKFILL_BATCH_PAUSE_S
+        == _PACING.history.batch_s
     )

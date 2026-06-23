@@ -29,7 +29,7 @@ import pytest
 from mcp_telegram.activity_peer_resolve import LinkedChatResolution
 from mcp_telegram.activity_peer_sweep import (
     _DIALOG_STATE_COLUMNS,
-    _SEARCH_SUCCESS_PAUSE_S,
+    _PACING,
     PeerSweepRequest,
     SkipReason,
     SweepResult,
@@ -452,7 +452,7 @@ def test_sweep_peer_once_success_invokes_pacing_sleep(monkeypatch: pytest.Monkey
             )
         )
 
-        assert sleep_calls == [_SEARCH_SUCCESS_PAUSE_S]
+        assert sleep_calls == [_PACING.search.success_s]
         assert result == SweepResult(
             fetched_ids=[8],
             persisted=1,
