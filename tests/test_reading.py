@@ -343,9 +343,9 @@ def test_list_messages_always_presents_selected_page_chronologically_with_reply_
     assert presentation["messages_order"] == "chronological"
     assert presentation["is_chronological"] is True
     reply = messages[2]
-    assert reply["reply_to_msg_id"] == 2
     assert reply["reply_context_ref"] == {"msg_id": 2, "in_page": True, "context_included": False}
-    assert reply["reply_context"] is None
+    assert "reply_context" not in reply
+    assert "reply_to_msg_id" not in reply
 
 
 def test_list_messages_structured_messages_include_content_metadata_and_all_read_markers():
@@ -415,8 +415,10 @@ def test_list_messages_structured_messages_include_content_metadata_and_all_read
         "is_telegram_content": True,
         "content_kind": "message_text",
     }
+    assert "text" not in messages[0]
     assert messages[2]["sender"] == "[me]"
     assert messages[2]["out"] is True
+    assert messages[2]["effective_sender_id"] == 999
 
 
 def test_list_messages_structured_messages_cover_media_reply_forward_reaction_topic_and_edit_fields():
@@ -450,23 +452,17 @@ def test_list_messages_structured_messages_cover_media_reply_forward_reaction_to
     messages = _list_messages_structured_messages(rows, dialog_type="Forum")
     second = messages[1]
 
-    assert second["topic_id"] == 7
-    assert second["topic_title"] == "General"
+    assert second["topic"] == {"id": 7, "title": "General"}
     assert second["media"] == {
-        "description": "[фото]",
-        "content": {"text": "[фото]", "is_telegram_content": True, "content_kind": "media_description"},
+        "text": "[фото]",
+        "is_telegram_content": True,
+        "content_kind": "media_description",
     }
     assert second["reply_context_ref"] == {"msg_id": 1, "in_page": True, "context_included": False}
-    assert second["reply_context"] is None
+    assert "reply_context" not in second
     assert cast(dict[str, object], second["forward"])["from_name"] == "Forward Source"
-    assert (
-        cast(dict[str, object], cast(dict[str, object], second["forward"])["content"])["content_kind"]
-        == "forward_snippet"
-    )
     assert second["post_author"] == "Channel Author"
     assert second["edit_date"] == 1_700_000_120
     assert cast(dict[str, object], second["reactions"])["display"] == "[👍×2]"
-    assert (
-        cast(dict[str, object], cast(dict[str, object], second["reactions"])["content"])["content_kind"] == "reaction"
-    )
-    assert second["read_markers"] == []
+    assert "content" not in cast(dict[str, object], second["reactions"])
+    assert "read_markers" not in second

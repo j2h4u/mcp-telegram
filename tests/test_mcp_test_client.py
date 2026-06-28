@@ -8,7 +8,7 @@ from typing import cast
 
 import pytest
 
-from devtools.mcp_client.cli import main, redact_script_output
+from devtools.mcp_client.cli import main, print_json, redact_script_output
 from devtools.mcp_client.client import (
     McpClientError,
     StdioMcpClient,
@@ -26,6 +26,14 @@ def _fake_server_command() -> list[str]:
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
+
+
+def test_mcp_test_client_prints_utf8_without_json_ascii_escapes(capsys: pytest.CaptureFixture[str]) -> None:
+    print_json({"text": "Привет"}, compact=False)
+
+    captured = capsys.readouterr()
+    assert "Привет" in captured.out
+    assert "\\u041f" not in captured.out
 
 
 @pytest.mark.asyncio

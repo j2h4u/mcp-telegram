@@ -304,24 +304,18 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
                     "date": {"type": "string"},
                     "sender": {"type": "string"},
                     "sender_id": {"type": ["integer", "null"]},
-                    "effective_sender_id": {"type": ["integer", "null"]},
+                    "effective_sender_id": {"type": "integer"},
                     "out": {"type": "boolean"},
                     "is_service": {"type": "boolean"},
-                    "topic_id": {"type": ["integer", "null"]},
-                    "topic_title": {"type": ["string", "null"]},
-                    "text": {"type": ["string", "null"]},
-                    "content": {"type": ["object", "null"]},
-                    "media_description": {"type": ["string", "null"]},
-                    "media": {"type": ["object", "null"]},
-                    "reply_to_msg_id": {"type": ["integer", "null"]},
-                    "reply_context_ref": {"type": ["object", "null"]},
-                    "reply_context": {"type": ["object", "null"]},
-                    "forward": {"type": ["object", "null"]},
-                    "post_author": {"type": ["string", "null"]},
-                    "edit_date": {"type": ["integer", "null"]},
-                    "reactions": {"type": ["object", "null"]},
+                    "topic": {"type": "object"},
+                    "content": {"type": "object"},
+                    "media": {"type": "object"},
+                    "reply_context_ref": {"type": "object"},
+                    "forward": {"type": "object"},
+                    "post_author": {"type": "string"},
+                    "edit_date": {"type": "integer"},
+                    "reactions": {"type": "object"},
                     "read_markers": {"type": "array", "items": {"type": "object"}},
-                    "inline_markers": {"type": "array", "items": {"type": "object"}},
                 },
                 "required": [
                     "dialog_id",
@@ -330,24 +324,7 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
                     "date",
                     "sender",
                     "sender_id",
-                    "effective_sender_id",
                     "out",
-                    "is_service",
-                    "topic_id",
-                    "topic_title",
-                    "text",
-                    "content",
-                    "media_description",
-                    "media",
-                    "reply_to_msg_id",
-                    "reply_context_ref",
-                    "reply_context",
-                    "forward",
-                    "post_author",
-                    "edit_date",
-                    "reactions",
-                    "read_markers",
-                    "inline_markers",
                 ],
                 "additionalProperties": False,
             },
@@ -522,17 +499,13 @@ def _structured_forward(from_name: str | None) -> dict[str, object] | None:
         return None
     return {
         "from_name": from_name,
-        "content": _content_or_none(from_name, "forward_snippet"),
     }
 
 
-def _structured_media(description: str | None) -> dict[str, object] | None:
+def _structured_media(description: str | None) -> TelegramContent | None:
     if not description:
         return None
-    return {
-        "description": description,
-        "content": _content_or_none(description, "media_description"),
-    }
+    return telegram_content(description, "media_description")
 
 
 def _structured_reactions(display: str | None) -> dict[str, object] | None:
@@ -540,8 +513,66 @@ def _structured_reactions(display: str | None) -> dict[str, object] | None:
         return None
     return {
         "display": display,
-        "content": _content_or_none(display, "reaction"),
     }
+
+
+def _structured_topic(message: ReadMessage) -> dict[str, object] | None:
+    if message.forum_topic_id is None and not message.topic_title:
+        return None
+    return {
+        key: value
+        for key, value in {
+            "id": message.forum_topic_id,
+            "title": message.topic_title,
+        }.items()
+        if value is not None
+    }
+
+
+def _maybe_add(item: dict[str, object], key: str, value: object | None) -> None:
+    if value is not None:
+        item[key] = value
+
+
+def _list_message_structured_item(
+    message: ReadMessage,
+    *,
+    parent_in_page: bool,
+    read_markers: list[dict[str, object]],
+) -> dict[str, object]:
+    item: dict[str, object] = {
+        "dialog_id": message.dialog_id,
+        "msg_id": message.id,
+        "sent_at": message.sent_at,
+        "date": _message_date(message.sent_at),
+        "sender": resolve_sender_label(message),
+        "sender_id": message.sender_id,
+        "out": bool(message.out),
+    }
+    if message.effective_sender_id is not None and message.effective_sender_id != message.sender_id:
+        item["effective_sender_id"] = message.effective_sender_id
+    if message.is_service:
+        item["is_service"] = True
+
+    _maybe_add(item, "topic", _structured_topic(message))
+    _maybe_add(item, "content", _content_or_none(message.text, "message_text"))
+    _maybe_add(item, "media", _structured_media(message.media_description))
+    _maybe_add(
+        item,
+        "reply_context_ref",
+        _structured_reply_context_ref(
+            message.reply_to_msg_id,
+            parent_in_page=parent_in_page,
+            context_included=False,
+        ),
+    )
+    _maybe_add(item, "forward", _structured_forward(message.fwd_from_name))
+    _maybe_add(item, "post_author", message.post_author)
+    _maybe_add(item, "edit_date", message.edit_date)
+    _maybe_add(item, "reactions", _structured_reactions(message.reactions_display))
+    if read_markers:
+        item["read_markers"] = read_markers
+    return item
 
 
 def _list_messages_structured_messages(
@@ -565,36 +596,11 @@ def _list_messages_structured_messages(
         reply_parent = reply_map.get(message.reply_to_msg_id or -1)
         parent_in_page = reply_parent is not None
         structured.append(
-            {
-                "dialog_id": message.dialog_id,
-                "msg_id": message.id,
-                "sent_at": message.sent_at,
-                "date": _message_date(message.sent_at),
-                "sender": resolve_sender_label(message),
-                "sender_id": message.sender_id,
-                "effective_sender_id": message.effective_sender_id,
-                "out": bool(message.out),
-                "is_service": bool(message.is_service),
-                "topic_id": message.forum_topic_id,
-                "topic_title": message.topic_title,
-                "text": message.text,
-                "content": _content_or_none(message.text, "message_text"),
-                "media_description": message.media_description,
-                "media": _structured_media(message.media_description),
-                "reply_to_msg_id": message.reply_to_msg_id,
-                "reply_context_ref": _structured_reply_context_ref(
-                    message.reply_to_msg_id,
-                    parent_in_page=parent_in_page,
-                    context_included=False,
-                ),
-                "reply_context": None,
-                "forward": _structured_forward(message.fwd_from_name),
-                "post_author": message.post_author,
-                "edit_date": message.edit_date,
-                "reactions": _structured_reactions(message.reactions_display),
-                "read_markers": read_markers,
-                "inline_markers": read_markers,
-            }
+            _list_message_structured_item(
+                message,
+                parent_in_page=parent_in_page,
+                read_markers=read_markers,
+            )
         )
     return structured
 
@@ -750,11 +756,10 @@ SEARCH_MESSAGES_OUTPUT_SCHEMA = {
                     "msg_id": {"type": "integer"},
                     "date": {"type": ["string", "null"]},
                     "sender": {"type": ["string", "null"]},
-                    "snippet": {"type": "string"},
                     "content": {"type": "object"},
                     "anchor_call": {"type": "object"},
                 },
-                "required": ["dialog_id", "dialog_name", "msg_id", "snippet", "content", "anchor_call"],
+                "required": ["dialog_id", "dialog_name", "msg_id", "content", "anchor_call"],
                 "additionalProperties": False,
             },
         },
@@ -832,7 +837,6 @@ def _search_result_structured_rows(rows: list[dict], query: str) -> list[dict[st
                 "msg_id": row["message_id"],
                 "date": date,
                 "sender": resolve_sender_label(row),
-                "snippet": snippet,
                 "content": telegram_content(snippet, "snippet"),
                 "anchor_call": _search_anchor_call(dialog_id, row["message_id"]),
             }

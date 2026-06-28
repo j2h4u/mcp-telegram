@@ -634,7 +634,7 @@ def test_phase_52_agent_metadata_fields_are_in_output_schemas() -> None:
     assert_nested_item_fields(
         list_messages_schema,
         collection_name="messages",
-        required_fields=("reply_context_ref",),
+        required_fields=(),
         property_fields=("reply_context_ref",),
     )
 

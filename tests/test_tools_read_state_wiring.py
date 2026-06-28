@@ -192,7 +192,7 @@ async def test_list_messages_tool_renders_inline_marker_in_output() -> None:
     markers = [
         cast(dict[str, object], marker)["label"]
         for message in cast(list[dict[str, object]], structured["messages"])
-        for marker in cast(list[dict[str, object]], message["inline_markers"])
+        for marker in cast(list[dict[str, object]], message.get("read_markers", []))
     ]
     assert any(
         marker in markers

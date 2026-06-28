@@ -1007,7 +1007,7 @@ async def test_search_messages_via_daemon():
     with _patch_daemon(conn):
         result = await search_messages(SearchMessages(dialog="123", query="result"))
 
-    assert_structured_text_parity(result, "results.0.snippet", "Found this result")
+    assert_structured_text_parity(result, "results.0.content.text", "Found this result")
     assert result.content == ()
     assert result.structured_content is not None
     payload = _json_dict(result.structured_content)
@@ -1018,8 +1018,12 @@ async def test_search_messages_via_daemon():
     assert first_result["dialog_id"] == 123
     assert first_result["dialog_name"] == "Search Chat"
     assert first_result["msg_id"] == 5
-    assert first_result["snippet"] == "Found this result"
-    assert _json_dict(first_result["content"])["content_kind"] == "snippet"
+    assert "snippet" not in first_result
+    assert _json_dict(first_result["content"]) == {
+        "text": "Found this result",
+        "is_telegram_content": True,
+        "content_kind": "snippet",
+    }
     assert first_result["anchor_call"] == {
         "tool": "list_messages",
         "arguments": {"exact_dialog_id": 123, "anchor_message_id": 5},
