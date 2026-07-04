@@ -39,8 +39,15 @@ This directory is the live deployment workspace, not the source checkout.
 
 ## Auth
 
-Run `telegram_qr_login.py` from this directory. It writes
-`/srv/mcp-telegram/database/mcp_telegram_session.session` according to `config.toml`,
-which is the same state directory the container uses. The retired
-Telegram-message/SMS login-code path is intentionally not used because repeated
-setup attempts did not receive codes.
+Run the repository QR helper from this directory through the locked project
+environment, for example:
+
+```bash
+REPO=/absolute/path/to/mcp-telegram
+uv run --project "$REPO" --frozen python "$REPO/deploy/telegram_qr_login.py"
+```
+
+It writes `/srv/mcp-telegram/database/mcp_telegram_session.session` according
+to `config.toml`, which is the same state directory the container uses. The
+retired Telegram-message/SMS login-code path is intentionally not used because
+repeated setup attempts did not receive codes.

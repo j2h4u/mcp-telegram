@@ -144,12 +144,13 @@ get_sync_status(dialog_id=<dialog_id>)
    cd mcp-telegram
    ```
 
-2. Create a deploy directory and copy the compose template plus deployment
-   helper files.
+2. Create a deploy directory and copy the compose template plus deployment-local
+   files.
 
    ```bash
-   mkdir -p /opt/docker/mcp-telegram /srv/mcp-telegram/database
-   cp deploy/docker-compose.yml deploy/config.toml deploy/telegram_qr_login.py deploy/AGENTS.md /opt/docker/mcp-telegram/
+   mkdir -p /opt/docker/mcp-telegram
+   install -d -m 700 /srv/mcp-telegram/database
+   cp deploy/docker-compose.yml deploy/config.toml deploy/AGENTS.md /opt/docker/mcp-telegram/
    ```
 
 3. Edit `/opt/docker/mcp-telegram/docker-compose.yml` and set
@@ -180,7 +181,8 @@ get_sync_status(dialog_id=<dialog_id>)
 
    ```bash
    cd /opt/docker/mcp-telegram
-   uv run ./telegram_qr_login.py
+   REPO=/absolute/path/to/mcp-telegram
+   uv run --project "$REPO" --frozen python "$REPO/deploy/telegram_qr_login.py"
    ```
 
    The old login-code flow is intentionally not documented or exposed here. It

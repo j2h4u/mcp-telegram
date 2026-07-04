@@ -1,16 +1,7 @@
-#!/usr/bin/env -S uv run
-# /// script
-# requires-python = ">=3.11"
-# dependencies = [
-#   "qrcode",
-#   "python-dotenv",
-#   "telethon",
-# ]
-# ///
+#!/usr/bin/env python3
 import asyncio
 import datetime
 import getpass
-import importlib
 import os
 import shutil
 import sys
@@ -21,12 +12,15 @@ from io import StringIO
 from pathlib import Path
 from typing import Protocol, cast
 
+import qrcode as qrcode_module
 from dotenv import load_dotenv
 from telethon import TelegramClient
 from telethon.errors import PasswordHashInvalidError, RPCError, SessionPasswordNeededError
 
 load_dotenv()
 
+PRIVATE_STATE_DIR_MODE = 0o700
+PRIVATE_SESSION_FILE_MODE = 0o600
 QR_LEFT_PADDING = " " * 6
 QR_BORDER = 4
 QR_REFRESH_MARGIN_SECONDS = 20
@@ -76,7 +70,7 @@ class _TelegramUser(Protocol):
     first_name: str | None
 
 
-qrcode = cast(_QrCodeModule, importlib.import_module("qrcode"))
+qrcode = cast(_QrCodeModule, qrcode_module)
 
 
 def _load_telegram_credentials() -> tuple[int, str, str]:
@@ -113,6 +107,22 @@ def _load_state_dir() -> Path:
     if not isinstance(value, str) or value.strip() == "":
         raise SystemExit(f"Missing non-empty state.dir in {path}")
     return Path(value).expanduser()
+
+
+def _ensure_private_state_dir(path: Path) -> Path:
+    """Create or tighten the deploy state directory before writing session state."""
+    path.mkdir(mode=PRIVATE_STATE_DIR_MODE, parents=True, exist_ok=True)
+    path.chmod(PRIVATE_STATE_DIR_MODE)
+    if not path.is_dir():
+        raise NotADirectoryError(path)
+    return path
+
+
+def _protect_session_file(session_file: Path) -> None:
+    """Restrict the Telethon SQLite session file when it exists."""
+    sqlite_session_file = session_file.with_suffix(".session")
+    if sqlite_session_file.exists():
+        sqlite_session_file.chmod(PRIVATE_SESSION_FILE_MODE)
 
 
 def qr_to_terminal(data: str) -> str:
@@ -275,7 +285,7 @@ async def main() -> None:
 
     state_dir = _load_state_dir()
     session_file = state_dir / "mcp_telegram_session"
-    session_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _ensure_private_state_dir(session_file.parent)
 
     client = TelegramClient(str(session_file), api_id, api_hash)
     await client.connect()
@@ -299,6 +309,7 @@ async def main() -> None:
         traceback.print_exc()
     finally:
         await cast(Awaitable[None], client.disconnect())
+        _protect_session_file(session_file)
 
 
 if __name__ == "__main__":
