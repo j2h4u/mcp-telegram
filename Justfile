@@ -1,4 +1,5 @@
 set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
+export UV_LINK_MODE := "hardlink"
 
 compose_file := "/opt/docker/mcp-telegram/docker-compose.yml"
 container := "mcp-telegram"
@@ -8,11 +9,15 @@ default:
     @just --list
 
 # Run all local source checks.
-check: fmt-check lint typecheck-pyright typecheck-tests import-contracts actionlint compile deadcode
+check: fmt-check lint preview-complexity-lint typecheck-pyright typecheck-tests import-contracts actionlint compile deadcode
 
 # Run ruff over source, tests, and deploy helpers.
 lint:
     uv run ruff check src tests deploy
+
+# Check selected complexity/refactor rules from Ruff preview.
+preview-complexity-lint:
+    uv run ruff check --preview --select PLR0914,PLR0916,PLR0917 src tests deploy
 
 # Check formatting without writing.
 fmt-check:

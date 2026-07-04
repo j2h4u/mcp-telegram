@@ -44,6 +44,42 @@ dev = [
 [project.scripts]
 mcp-telegram = "mcp_telegram:app"
 
+[tool.ruff]
+src = ["src", "tests", "deploy"]
+line-length = 120
+target-version = "py314"
+extend-exclude = [".planning"]
+
+[tool.ruff.lint]
+explicit-preview-rules = true
+select = [
+    "E4",
+    "E7",
+    "E9",
+    "F",
+    "I",
+    "B",
+    "BLE",
+    "UP",
+    "C4",
+    "PIE",
+    "RET",
+    "ISC",
+    "RSE",
+    "FLY",
+    "FURB",
+    "PERF",
+    "PTH",
+    "DTZ",
+    "PGH",
+    "PLE",
+    "LOG",
+    "N818",
+    "C90",
+    "PLR09",
+    "PLR2004",
+]
+
 [tool.pytest.ini_options]
 # Leave no /tmp residue on green runs (shared host): passed tests' tmp_path dirs are
 # removed at session end; only failing tests keep their dir, and only the latest run.
