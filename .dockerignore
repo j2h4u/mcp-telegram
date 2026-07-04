@@ -1,18 +1,24 @@
-.git/
-.venv/
-.hypothesis/
-.mypy_cache/
-.opencode/
-.planning/
-.pytest_cache/
-.ruff_cache/
-__pycache__/
-build/
-dist/
-*.pyc
-*.session
-.env
-*.egg-info/
-graphify-out/
-deploy/database/
-deploy/backups/
+# Default deny: keep the Docker build context explicit and small.
+*
+
+# Package metadata needed by uv/setuptools during image builds.
+!pyproject.toml
+!uv.lock
+!README.md
+!LICENSE
+
+# Application package.
+!src/
+!src/**
+
+# Runtime healthcheck scripts copied by deploy/Dockerfile.
+!deploy/
+!deploy/scripts/
+!deploy/scripts/healthcheck_all.sh
+!deploy/scripts/healthcheck_daemon.py
+!deploy/scripts/healthcheck_http.py
+
+# Keep generated Python/build artifacts out even under allowed trees.
+**/__pycache__/
+**/*.py[cod]
+**/*.egg-info/
