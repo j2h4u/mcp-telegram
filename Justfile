@@ -43,6 +43,10 @@ import-contracts:
 actionlint:
     uv run actionlint
 
+# Build the production Docker image without running it.
+docker-build-check:
+    docker build -f deploy/Dockerfile -t mcp-telegram:ci-build-check .
+
 # Check declared dependencies against imports.
 deptry:
     uv run deptry src/mcp_telegram deploy tests devtools --known-first-party mcp_telegram --known-first-party devtools --known-first-party tests --known-first-party helpers --known-first-party account_trace_fixtures --per-rule-ignores DEP004=radon

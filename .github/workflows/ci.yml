@@ -95,10 +95,23 @@ jobs:
       - name: CRAP ratchet
         run: just crap-ratchet
 
+  docker-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
+      - name: Production Docker image build
+        run: just docker-build-check
+
   ci:
     if: always()
     runs-on: ubuntu-latest
-    needs: [quality, unit, coverage]
+    needs: [quality, unit, coverage, docker-build]
     steps:
       - name: Check required jobs
         run: |
