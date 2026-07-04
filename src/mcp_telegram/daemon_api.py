@@ -1840,7 +1840,7 @@ class DaemonAPIServer:
             self._conn.commit()
             return {"ok": True}
         except Exception as exc:
-            logger.error("record_telemetry failed: %s", exc, exc_info=True)
+            logger.exception("record_telemetry failed: %s", exc)
             return {"ok": False, "error": "internal", "message": "internal error"}
 
     # ------------------------------------------------------------------
@@ -1882,7 +1882,7 @@ class DaemonAPIServer:
             self._feedback_conn.commit()
             return {"ok": True, "data": {"message": "Feedback recorded. Thank you!", "id": cur.lastrowid}}
         except Exception as exc:
-            logger.error("submit_feedback failed: %s", exc, exc_info=True)
+            logger.exception("submit_feedback failed: %s", exc)
             return {"ok": False, "error": "internal", "message": "internal error"}
 
     # ------------------------------------------------------------------
@@ -1939,7 +1939,7 @@ class DaemonAPIServer:
                 "data": {"message": f"Feedback {request.feedback_id} status set to '{request.status}'."},
             }
         except Exception as exc:
-            logger.error("update_feedback_status failed: %s", exc, exc_info=True)
+            logger.exception("update_feedback_status failed: %s", exc)
             return {"ok": False, "error": "internal", "message": "internal error"}
 
     # ------------------------------------------------------------------
@@ -2075,7 +2075,7 @@ class DaemonAPIServer:
             self._conn.commit()
             return {"ok": True, "upserted": len(entities)}
         except Exception as exc:
-            logger.error("upsert_entities failed: %s", exc, exc_info=True)
+            logger.exception("upsert_entities failed: %s", exc)
             return {"ok": False, "error": "internal", "message": "internal error"}
 
     # ------------------------------------------------------------------

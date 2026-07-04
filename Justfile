@@ -9,7 +9,7 @@ default:
     @just --list
 
 # Run all local source checks.
-check: fmt-check lint preview-complexity-lint typecheck-pyright typecheck-tests import-contracts actionlint compile deadcode
+check: fmt-check lint preview-complexity-lint typecheck-pyright typecheck-tests import-contracts actionlint deptry compile deadcode
 
 # Run ruff over source, tests, and deploy helpers.
 lint:
@@ -42,6 +42,10 @@ import-contracts:
 # Check GitHub Actions workflow syntax and expressions.
 actionlint:
     uv run actionlint
+
+# Check declared dependencies against imports.
+deptry:
+    uv run deptry src/mcp_telegram deploy tests devtools --known-first-party mcp_telegram --known-first-party devtools --known-first-party tests --known-first-party helpers --known-first-party account_trace_fixtures --per-rule-ignores DEP004=radon
 
 # Compile Python sources for syntax errors.
 compile:

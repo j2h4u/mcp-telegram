@@ -8,13 +8,13 @@ COPY --from=ghcr.io/astral-sh/uv:0.11.17 /uv /usr/local/bin/uv
 COPY pyproject.toml uv.lock /src/mcp-telegram/
 RUN --mount=type=cache,target=/root/.cache/uv \
     UV_PROJECT_ENVIRONMENT=/opt/venv UV_LINK_MODE=copy \
-    uv sync --project /src/mcp-telegram --no-install-project
+    uv sync --project /src/mcp-telegram --frozen --no-dev --no-install-project
 
 # --- Source layer (invalidated when src/ changes) ---
 COPY . /src/mcp-telegram/
 RUN --mount=type=cache,target=/root/.cache/uv \
     UV_PROJECT_ENVIRONMENT=/opt/venv UV_LINK_MODE=copy \
-    uv sync --project /src/mcp-telegram --no-editable
+    uv sync --project /src/mcp-telegram --frozen --no-dev --no-editable
 
 RUN mkdir -p /root/.local/bin && \
     cp /opt/venv/bin/mcp-telegram /root/.local/bin/mcp-telegram

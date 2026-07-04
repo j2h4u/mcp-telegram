@@ -4,6 +4,8 @@ This module owns the full ``get_entity_info`` orchestration plus type-specific
 helpers for user/bot/channel/supergroup/group entity details.
 """
 
+# ruff: noqa: BLE001
+
 import json
 import logging
 import sqlite3
@@ -540,7 +542,7 @@ class DaemonEntityInfoService:
                     continue
                 raw_title = _attr(item, "title", None)
                 return _text_or_none(raw_title)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self._deps.logger.warning(
                 "entity_info user folder_resolve_failed folder_id=%r error=%s%s",
                 folder_id,

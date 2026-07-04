@@ -231,11 +231,10 @@ class DeltaSyncWorker:
             _set_access_lost(self._conn, dialog_id, now)
             return 0
         except RPCError as exc:
-            logger.error(
+            logger.exception(
                 "RPC error delta dialog_id=%d — skipping: %s",
                 dialog_id,
                 exc,
-                exc_info=True,
             )
             return 0
 

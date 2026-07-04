@@ -1137,11 +1137,10 @@ class FullSyncWorker:
             _set_access_lost(self._conn, dialog_id, now)
             return sync_progress, True
         except RPCError as exc:
-            logger.error(
+            logger.exception(
                 "sync_batch_rpc_error dialog_id=%d error=%s — dialog NOT marked synced, will retry",
                 dialog_id,
                 exc,
-                exc_info=True,
             )
             return sync_progress, False  # leave dialog in-progress for retry
         return await self._store_batch_page(dialog_id, sync_progress, total_messages, batch)

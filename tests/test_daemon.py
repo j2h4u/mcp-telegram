@@ -1279,7 +1279,6 @@ async def test_initialize_read_positions_is_monotonic_vs_live_event(tmp_path):
     """
     import sqlite3
 
-    from mcp_telegram.daemon import _initialize_read_positions  # noqa: F401
     from mcp_telegram.read_state import apply_read_cursor
     from mcp_telegram.sync_db import _apply_migrations
 

@@ -719,7 +719,7 @@ async def _connect_telegram(ctx: _SyncMainContext) -> bool:
         await ctx.client.connect()
     except (TimeoutError, OSError) as exc:
         ctx.api_server.startup_detail = f"connection failed: {exc}"
-        logger.error("sync-daemon connection failed: %s", exc, exc_info=True)
+        logger.exception("sync-daemon connection failed: %s", exc)
         return False
 
     logger.info("sync-daemon started — connected=%s", ctx.client.is_connected())

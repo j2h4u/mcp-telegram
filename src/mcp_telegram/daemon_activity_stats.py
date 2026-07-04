@@ -420,7 +420,7 @@ class DaemonActivityStatsService:
             stats = _query_usage_stats(self._deps.conn.cursor(), since)
             return {"ok": True, "data": stats}
         except Exception as exc:
-            self._deps.logger.error("get_usage_stats failed: %s", exc, exc_info=True)
+            self._deps.logger.exception("get_usage_stats failed: %s", exc)
             return {"ok": False, "error": "internal", "message": "internal error"}
 
     async def get_dialog_stats(self, req: Mapping[str, object]) -> dict[str, object]:

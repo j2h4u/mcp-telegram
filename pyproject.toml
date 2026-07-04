@@ -18,6 +18,7 @@ dependencies = [
   "phonenumbers>=9.0.33",
   "starlette>=1.3.1",
   "uvicorn>=0.49.0",
+  "python-dotenv>=1.2.2",
 ]
 
 [build-system]
@@ -39,46 +40,127 @@ dev = [
     "import-linter>=2.12",
     "pytest-crap>=0.3.0",
     "radon>=6.0.1",
+    "deptry>=0.25.1",
 ]
 
 [project.scripts]
 mcp-telegram = "mcp_telegram:app"
 
 [tool.ruff]
-src = ["src", "tests", "deploy"]
 line-length = 120
 target-version = "py314"
-extend-exclude = [".planning"]
+indent-width = 4
+exclude = [
+  ".bzr",
+  ".direnv",
+  ".eggs",
+  ".git",
+  ".git-rewrite",
+  ".hg",
+  ".ipynb_checkpoints",
+  ".mypy_cache",
+  ".nox",
+  ".pants.d",
+  ".pyenv",
+  ".pytest_cache",
+  ".pytype",
+  ".ruff_cache",
+  ".svn",
+  ".tox",
+  ".venv",
+  ".vscode",
+  "__pypackages__",
+  "_build",
+  "buck-out",
+  "build",
+  "dist",
+  "node_modules",
+  "site-packages",
+  "venv",
+]
 
 [tool.ruff.lint]
+preview = true
+ignore = [
+  "E501",   # line length — formatter handles this
+  "B008",   # Typer default values
+  "SIM105", # try/except/pass — explicit about best-effort intent
+  "SIM108", # ternary preference — case-by-case
+  "SIM117", # nested with — sometimes clearer
+  "RUF001", # ambiguous unicode — Cyrillic is intentional
+  "RUF002",
+  "RUF003",
+  "UP007",  # Optional[X] vs X | None
+  "UP045",  # typing.Optional still fine
+]
 explicit-preview-rules = true
 select = [
-    "E4",
-    "E7",
-    "E9",
+    "E",
     "F",
+    "W",
     "I",
     "B",
-    "BLE",
     "UP",
-    "C4",
+    "RUF",
+    "SIM",
     "PIE",
-    "RET",
     "ISC",
     "RSE",
     "FLY",
+    "PGH",
+    "G",
+    "LOG",
+    "PLE",
+    "C4",
+    "DTZ",
+    "N818",
+    "PTH",
+    "RET",
     "FURB",
     "PERF",
-    "PTH",
-    "DTZ",
-    "PGH",
-    "PLE",
-    "LOG",
-    "N818",
-    "C90",
-    "PLR09",
+    "BLE",
     "PLR2004",
+    "C901",
+    "PLR0911",
+    "PLR0912",
+    "PLR0913",
+    "PLR0914",
+    "PLR0915",
+    "PLR0916",
+    "PLR0917",
+    "PLR1702",
 ]
+fixable = ["ALL"]
+unfixable = []
+dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
+
+[tool.ruff.lint.pylint]
+max-branches = 11
+max-statements = 45
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = [
+  "E741",    # ambiguous `l` is fine in short test comprehensions
+  "F841",    # unused locals are common test scaffolding
+  "RUF059",  # unused tuple unpacks (common in test readability)
+  "SIM105",  # try/except/pass in tests is explicit about intent
+  "RUF043",  # regex meta chars in pytest match=
+  "E402",    # late imports in tests (coverage-driven placement)
+  "B007",    # unused loop vars in warmup/iteration patterns
+  "RUF015",  # list slicing in one-off assertions
+  "PLR0917", # too many positional arguments accepted in test helpers by design
+  "PLR2004", # test magic-value comparisons
+]
+"src/mcp_telegram/daemon_api.py" = ["E402"]
+"src/mcp_telegram/tools/discovery.py" = ["E402"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+docstring-code-format = false
+docstring-code-line-length = "dynamic"
 
 [tool.pytest.ini_options]
 # Leave no /tmp residue on green runs (shared host): passed tests' tmp_path dirs are

@@ -518,7 +518,7 @@ def _apply_migration(
         return version
     except Exception:
         conn.rollback()
-        logger.error("sync_db migration to version %d failed", version, exc_info=True)
+        logger.exception("sync_db migration to version %d failed", version)
         raise
 
 
