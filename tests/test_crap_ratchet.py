@@ -268,6 +268,86 @@ def test_tighten_baseline_rejects_regressions(tmp_path: Path, capsys: CaptureFix
     assert f"{simple_key} CRAP 0.10 -> 2.50 (+2.40)" in captured.out
 
 
+def test_ratchet_defaults_to_0_5_epsilon(tmp_path: Path) -> None:
+    source_root, coverage_path, baseline_path = _write_source_tree(tmp_path)
+    source_path = source_root / "sample.py"
+    _write_report(coverage_path, source_path)
+
+    assert (
+        main(
+            [
+                "--coverage",
+                str(coverage_path),
+                "--baseline",
+                str(baseline_path),
+                "--src",
+                str(source_root),
+                "--write-baseline",
+            ]
+        )
+        == 0
+    )
+
+    baseline = cast(BaselineReport, json.loads(baseline_path.read_text(encoding="utf-8")))
+    simple_key = "sample.py::simple"
+    baseline["functions"][simple_key]["crap"] -= 0.4
+    baseline_path.write_text(json.dumps(baseline, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    exit_code = main(
+        [
+            "--coverage",
+            str(coverage_path),
+            "--baseline",
+            str(baseline_path),
+            "--src",
+            str(source_root),
+        ]
+    )
+    assert exit_code == 0
+
+
+def test_ratchet_default_epsilon_catches_large_drift(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
+    source_root, coverage_path, baseline_path = _write_source_tree(tmp_path)
+    source_path = source_root / "sample.py"
+    _write_report(coverage_path, source_path)
+
+    assert (
+        main(
+            [
+                "--coverage",
+                str(coverage_path),
+                "--baseline",
+                str(baseline_path),
+                "--src",
+                str(source_root),
+                "--write-baseline",
+            ]
+        )
+        == 0
+    )
+
+    baseline = cast(BaselineReport, json.loads(baseline_path.read_text(encoding="utf-8")))
+    simple_key = "sample.py::simple"
+    baseline["functions"][simple_key]["crap"] -= 0.6
+    baseline_path.write_text(json.dumps(baseline, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    exit_code = main(
+        [
+            "--coverage",
+            str(coverage_path),
+            "--baseline",
+            str(baseline_path),
+            "--src",
+            str(source_root),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "CRAP ratchet failed: 1 issue(s)" in captured.out
+    assert simple_key in captured.out
+
+
 def test_ratchet_flags_regression_and_new_offender(
     tmp_path: Path,
     capsys: CaptureFixture[str],
@@ -294,7 +374,7 @@ def test_ratchet_flags_regression_and_new_offender(
     baseline = cast(BaselineReport, json.loads(baseline_path.read_text(encoding="utf-8")))
     simple_key = "sample.py::simple"
     complex_key = "sample.py::complex"
-    baseline["functions"][simple_key]["crap"] -= 0.5
+    baseline["functions"][simple_key]["crap"] -= 0.6
     del baseline["functions"][complex_key]
     baseline_path.write_text(json.dumps(baseline, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 

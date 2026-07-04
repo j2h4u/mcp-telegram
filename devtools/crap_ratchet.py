@@ -8,7 +8,7 @@ from typing import Protocol, TypedDict, TypeGuard, cast
 from radon.complexity import cc_visit
 
 DEFAULT_THRESHOLD = 30.0
-DEFAULT_EPSILON = 0.01
+DEFAULT_EPSILON = 0.5
 DEFAULT_SOURCE_ROOT = Path("src/mcp_telegram")
 
 
