@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
 import pytest
 
 from mcp_telegram.flood import (
     DEFAULT_FLOOD_WAIT_SECONDS,
+    FloodWaitAccumulator,
+    TelethonFloodWaitMetricsFilter,
     flood_seconds,
     sleep_through_flood,
 )
@@ -53,6 +56,66 @@ def test_flood_seconds_zero_uses_default() -> None:
 def test_flood_seconds_custom_default() -> None:
     exc = _FloodWaitError(0)
     assert flood_seconds(exc, default=5) == 5
+
+
+def test_flood_wait_accumulator_rollup_windows() -> None:
+    accumulator = FloodWaitAccumulator(log_interval_s=10)
+    accumulator.observe(source="test", seconds=5, now_mono=100.0)
+    accumulator.observe(source="test", seconds=7, now_mono=3_800.0)
+    accumulator.observe(source="test", seconds=11, now_mono=90_000.0)
+
+    rollup = accumulator.snapshot(now_mono=90_000.0)
+
+    assert rollup.events_1h == 1
+    assert rollup.wait_s_1h == 11
+    assert rollup.events_24h == 2
+    assert rollup.wait_s_24h == 18
+    assert rollup.events_7d == 3
+    assert rollup.wait_s_7d == 23
+
+
+def test_flood_wait_accumulator_daily_rollup_logs_only_when_due(caplog: pytest.LogCaptureFixture) -> None:
+    accumulator = FloodWaitAccumulator(log_interval_s=10)
+    accumulator._last_log_mono = 0.0
+    logger = logging.getLogger("tests.flood")
+    accumulator.observe(source="test", seconds=9, now_mono=1.0)
+
+    assert accumulator.maybe_log_rollup(logger, now_mono=5.0) is False
+    assert "flood_wait_rollup" not in caplog.text
+
+    with caplog.at_level(logging.INFO, logger="tests.flood"):
+        assert accumulator.maybe_log_rollup(logger, now_mono=12.0) is True
+
+    assert "flood_wait_rollup" in caplog.text
+    assert "events_1h=1" in caplog.text
+    assert "wait_s_1h=9" in caplog.text
+
+
+def test_telethon_flood_wait_filter_observes_auto_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
+    accumulator = FloodWaitAccumulator()
+
+    def _observe(*, source: str, seconds: int) -> None:
+        accumulator.observe(source=source, seconds=seconds, now_mono=100.0)
+
+    flood_filter = TelethonFloodWaitMetricsFilter()
+    record = logging.LogRecord(
+        name="telethon.client.users",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg="Sleeping for 23s (0:00:23) on GetHistoryRequest flood wait",
+        args=(),
+        exc_info=None,
+    )
+
+    from mcp_telegram import flood as flood_module
+
+    monkeypatch.setattr(flood_module, "observe_flood_wait", _observe)
+    assert flood_filter.filter(record) is True
+
+    rollup = accumulator.snapshot(now_mono=100.0)
+    assert rollup.events_1h == 1
+    assert rollup.wait_s_1h == 23
 
 
 # ---------------------------------------------------------------------------

@@ -9,7 +9,10 @@ from dataclasses import dataclass
 from typing import Protocol, cast
 
 from rapidfuzz import fuzz as _fuzz
-from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
+from telethon.errors import (
+    FloodWaitError,  # type: ignore[import-untyped]
+    RPCError,  # type: ignore[import-untyped]
+)
 
 from . import daemon_api as api
 from .daemon_message import _MessageLike as _DaemonMessageLike
@@ -32,6 +35,31 @@ class _LoggerLike(Protocol):
     def warning(self, msg: str, *args: object, **kwargs: object) -> None: ...
 
     def exception(self, msg: str, *args: object, **kwargs: object) -> None: ...
+
+
+def _safe_exception_message(exc: BaseException) -> str:
+    message = str(exc).replace("\n", "\\n")
+    if not message:
+        return type(exc).__name__
+    return message
+
+
+def _log_recoverable_telegram_error(
+    logger: _LoggerLike,
+    *,
+    event: str,
+    dialog_id: int,
+    exc: BaseException,
+    request_id: str,
+) -> None:
+    logger.warning(
+        "%s dialog_id=%d error_type=%s error_message=%s%s",
+        event,
+        dialog_id,
+        type(exc).__name__,
+        _safe_exception_message(exc),
+        request_id,
+    )
 
 
 class _TelegramClientLike(Protocol):
@@ -800,15 +828,8 @@ class DaemonReadingService:
                     async for msg in self._deps.client.iter_messages(req.dialog_id, **iter_kwargs)
                 ]
             )
-        except Exception as exc:
-            self._logger.warning(
-                "list_messages_telegram_error dialog_id=%d error=%s%s",
-                req.dialog_id,
-                exc,
-                self._deps.rid(),
-                exc_info=True,
-            )
-            return {"ok": False, "error": "telegram_error", "message": "failed to fetch messages"}
+        except Exception as exc:  # noqa: BLE001 - boundary helper logs expected vs unexpected Telegram failures.
+            return self._list_messages_telegram_error(req, exc)
 
         next_nav = self._maybe_encode_next_nav(
             _NextNavContext(
@@ -825,6 +846,33 @@ class DaemonReadingService:
             "ok": True,
             "data": {"messages": messages, "source": "telegram", "next_navigation": next_nav},
         }
+
+    def _list_messages_telegram_error(self, req: _ListMessagesTelegramRequest, exc: Exception) -> dict:
+        if isinstance(exc, (RPCError, ValueError)):
+            _log_recoverable_telegram_error(
+                self._logger,
+                event="list_messages_telegram_error",
+                dialog_id=req.dialog_id,
+                exc=exc,
+                request_id=self._deps.rid(),
+            )
+            return {
+                "ok": False,
+                "error": "telegram_error",
+                "message": "failed to fetch messages",
+                "detail": {
+                    "error_type": type(exc).__name__,
+                    "error_message": _safe_exception_message(exc),
+                    "retryable": False,
+                },
+            }
+
+        self._logger.exception(
+            "list_messages_telegram_unexpected dialog_id=%d%s",
+            req.dialog_id,
+            self._deps.rid(),
+        )
+        return {"ok": False, "error": "telegram_error", "message": "failed to fetch messages"}
 
     async def _list_messages_from_db(self, req: _ListMessagesDbRequest) -> dict:
         """Read messages from sync.db using the dynamic query builder."""

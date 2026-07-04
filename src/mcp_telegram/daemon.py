@@ -57,7 +57,12 @@ from .delta_sync import DeltaSyncWorker, _DeltaSyncClient, run_access_probe_loop
 from .dialog_sync import DialogsBootstrapWorker, run_reconciliation_loop
 from .event_handlers import EventHandlerManager
 from .feedback_db import ensure_feedback_schema, get_feedback_db_path
-from .flood import flood_seconds, sleep_through_flood
+from .flood import (
+    flood_seconds,
+    install_telethon_flood_wait_metrics_filter,
+    maybe_log_flood_wait_rollup,
+    sleep_through_flood,
+)
 from .fts import backfill_fts_index
 from .read_state import apply_read_cursor
 from .sync_db import (
@@ -520,6 +525,7 @@ def _log_heartbeat(
         rate,
         _format_heartbeat_eta(sync_start, synced, total, now_mono),
     )
+    maybe_log_flood_wait_rollup(logger)
     return msg_count, now_mono
 
 
@@ -886,6 +892,7 @@ async def sync_main() -> None:
     Orchestrates: DB init → FTS backfill → Telegram connect → wire services →
     sync loop → cleanup.
     """
+    install_telethon_flood_wait_metrics_filter()
     ctx = await _build_sync_main_context()
     try:
         await _run_fts_backfill(ctx)
