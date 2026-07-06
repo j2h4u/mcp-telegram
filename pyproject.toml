@@ -48,6 +48,7 @@ dev = [
 mcp-telegram = "mcp_telegram:app"
 
 [tool.ruff]
+src = ["src", "deploy", "devtools", "tests", "scripts"]
 line-length = 120
 target-version = "py314"
 indent-width = 4
@@ -62,6 +63,7 @@ exclude = [
   ".mypy_cache",
   ".nox",
   ".pants.d",
+  ".planning",
   ".pyenv",
   ".pytest_cache",
   ".pytype",
@@ -88,6 +90,7 @@ ignore = [
   "SIM105", # try/except/pass — explicit about best-effort intent
   "SIM108", # ternary preference — case-by-case
   "SIM117", # nested with — sometimes clearer
+  "ISC001", # formatter owns implicit string concatenation layout
   "RUF001", # ambiguous unicode — Cyrillic is intentional
   "RUF002",
   "RUF003",
@@ -172,6 +175,17 @@ tmp_path_retention_count = 1
 testpaths = ["tests"]
 pythonpath = ["tests"]
 asyncio_mode = "auto"
+addopts = [
+  "--strict-config",
+  "--strict-markers",
+  "-W",
+  "error",
+]
+xfail_strict = true
+markers = [
+  "integration: tests that cross process, service, container, or network boundaries",
+  "slow: tests that are too slow for the default unit gate",
+]
 
 [tool.mypy]
 plugins = ["pydantic.mypy"]
@@ -197,7 +211,7 @@ ignore_missing_imports = true
 # for schema fields and cannot see annotation-only type usage.
 # vulture_whitelist.py lists intentionally-retained symbols (text-rendering layer,
 # framework/dotMD false positives) so the advisory scan flags only NEW dead code.
-paths = ["src/mcp_telegram", "vulture_whitelist.py"]
+paths = ["src/mcp_telegram", "scripts", "vulture_whitelist.py"]
 exclude = ["src/mcp_telegram/models.py"]
 min_confidence = 60
 # Entrypoints/callbacks registered via decorators look "unused" to vulture's static
@@ -210,6 +224,7 @@ ignore_decorators = [
 [tool.coverage.run]
 source = ["src/mcp_telegram"]
 branch = true
+sigterm = true
 
 [tool.coverage.report]
 show_missing = true
@@ -217,7 +232,7 @@ skip_covered = true
 fail_under = 83
 
 [tool.pyright]
-include = ["src/mcp_telegram", "deploy", "tests"]
+include = ["src/mcp_telegram", "deploy", "scripts", "tests"]
 pythonVersion = "3.14"
 typeCheckingMode = "standard"
 reportAny = "error"

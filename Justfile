@@ -9,19 +9,23 @@ default:
     @just --list
 
 # Run all local source checks.
-check: fmt-check lint preview-complexity-lint typecheck-pyright typecheck-tests import-contracts actionlint deptry compile deadcode
+check: fmt-check lint preview-complexity-lint lock-check typecheck typecheck-pyright typecheck-tests import-contracts actionlint supply-chain-pins deptry compile deadcode package-smoke
+
+# Verify uv.lock is synchronized with pyproject.toml.
+lock-check:
+    uv lock --check
 
 # Run ruff over source, tests, and deploy helpers.
 lint:
-    uv run ruff check src tests deploy
+    uv run ruff check --preview src tests deploy scripts
 
 # Check selected complexity/refactor rules from Ruff preview.
 preview-complexity-lint:
-    uv run ruff check --preview --select PLR0914,PLR0916,PLR0917 src tests deploy
+    uv run ruff check --preview --select PLR0914,PLR0916,PLR0917 src tests deploy scripts
 
 # Check formatting without writing.
 fmt-check:
-    uv run ruff format --check src tests deploy
+    uv run ruff format --check src tests deploy devtools scripts
 
 # Run mypy over the package and deploy helpers.
 typecheck:
@@ -29,7 +33,7 @@ typecheck:
 
 # Run basedpyright over the package and deploy helpers.
 typecheck-pyright:
-    uv run basedpyright src/mcp_telegram deploy --warnings
+    uv run basedpyright src/mcp_telegram deploy scripts --warnings
 
 # Type-check tests with basedpyright.
 typecheck-tests:
@@ -43,17 +47,25 @@ import-contracts:
 actionlint:
     uv run actionlint
 
+# Guard obvious supply-chain drift in workflows and container image references.
+supply-chain-pins:
+    uv run python scripts/check_supply_chain_pins.py
+
 # Build the production Docker image without running it.
 docker-build-check:
     docker build -f deploy/Dockerfile -t mcp-telegram:ci-build-check .
 
 # Check declared dependencies against imports.
 deptry:
-    uv run deptry src/mcp_telegram deploy tests devtools --known-first-party mcp_telegram --known-first-party devtools --known-first-party tests --known-first-party helpers --known-first-party account_trace_fixtures --per-rule-ignores DEP004=radon
+    uv run deptry src/mcp_telegram deploy tests devtools scripts --known-first-party mcp_telegram --known-first-party devtools --known-first-party tests --known-first-party helpers --known-first-party account_trace_fixtures --per-rule-ignores DEP004=radon
 
 # Compile Python sources for syntax errors.
 compile:
-    uv run python -m compileall -q src tests deploy
+    uv run python -m compileall -q src tests deploy devtools scripts
+
+# Build and install the wheel in an isolated environment, then smoke safe CLI help paths.
+package-smoke:
+    uv run python scripts/check_packaging_smoke.py
 
 # Run pytest. Extra args are forwarded, e.g. `just test tests/test_daemon_api.py -q`.
 test *args:
@@ -75,6 +87,10 @@ deadcode:
 # Test coverage report.
 coverage:
     uv run pytest -W error::ResourceWarning --cov=src/mcp_telegram --cov-report=term-missing
+
+# Blocking coverage floor.
+coverage-check:
+    uv run pytest --cov=src/mcp_telegram --cov-report=term-missing --cov-fail-under=83
 
 # Human CRAP report over the full suite.
 crap:
@@ -136,8 +152,8 @@ runtime-verify: runtime-build runtime-wait runtime-smoke
 
 # Auto-fix ruff findings and formatting.
 fix:
-    uv run ruff check --fix src tests deploy
-    uv run ruff format src tests deploy
+    uv run ruff check --preview --fix src tests deploy scripts
+    uv run ruff format src tests deploy devtools scripts
 
 # Run local checks, CRAP ratchet, rebuild the runtime, and smoke-test live MCP behavior.
 verify: check crap-ratchet runtime-verify

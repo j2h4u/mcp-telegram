@@ -11,6 +11,7 @@ from typing import cast
 from unittest.mock import AsyncMock
 
 import pytest
+
 from account_trace_fixtures import (
     make_channel_signature_evidence,
     open_trace_db,
@@ -22,7 +23,6 @@ from account_trace_fixtures import (
     seed_topic,
     seed_trace_fragment,
 )
-
 from mcp_telegram.daemon_account_trace import (
     DaemonAccountTraceDeps,
     DaemonAccountTraceService,

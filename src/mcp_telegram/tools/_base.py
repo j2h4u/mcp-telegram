@@ -25,6 +25,21 @@ __all__ = ["DaemonConnection", "DaemonNotRunningError", "daemon_connection"]
 logger = logging.getLogger(__name__)
 _TOOL_TITLE_WORDS_MIN = 1
 _TOOL_TITLE_WORDS_MAX = 3
+_DAEMON_NOT_RUNNING_KIND = "not_running"
+_DAEMON_NOT_RUNNING_TEXT = "Telegram backend is not running.\nAction: Start it with: mcp-telegram sync"
+_DAEMON_TIMEOUT_TEXT = (
+    "Telegram backend did not respond before the IPC timeout.\n"
+    "Action: Retry the tool call. If this repeats, narrow the request scope and inspect service logs."
+)
+_DAEMON_CONNECTION_FAILURE_TEXT = (
+    "Telegram backend connection failed while handling the request.\n"
+    "Action: Retry the tool call. If this repeats, inspect service logs for daemon IPC errors."
+)
+_DAEMON_NOT_RUNNING_TEXT_BY_KIND = {
+    **dict.fromkeys(("connect_timeout", "send_timeout", "response_timeout"), _DAEMON_TIMEOUT_TEXT),
+    **dict.fromkeys(("connection_broken", "malformed_response"), _DAEMON_CONNECTION_FAILURE_TEXT),
+    _DAEMON_NOT_RUNNING_KIND: _DAEMON_NOT_RUNNING_TEXT,
+}
 
 
 class ToolArgs(BaseModel):
@@ -43,9 +58,15 @@ def _text_response(text: str) -> list[TextContent]:
     return [TextContent(type="text", text=text)]
 
 
-def _daemon_not_running_text() -> str:
-    """Return user-facing error message when the sync daemon is not running."""
-    return "Telegram backend is not running.\nAction: Start it with: mcp-telegram sync"
+def _daemon_not_running_text(exc: DaemonNotRunningError | None = None) -> str:
+    """Return user-facing error text for daemon IPC failures."""
+    return _DAEMON_NOT_RUNNING_TEXT_BY_KIND.get(_daemon_failure_kind(exc), _DAEMON_NOT_RUNNING_TEXT)
+
+
+def _daemon_failure_kind(exc: DaemonNotRunningError | None) -> str:
+    if exc is None:
+        return _DAEMON_NOT_RUNNING_KIND
+    return exc.kind
 
 
 def _check_daemon_response(

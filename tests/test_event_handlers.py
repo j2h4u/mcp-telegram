@@ -20,8 +20,8 @@ from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from helpers import build_mock_message
 
+from helpers import build_mock_message
 from mcp_telegram.event_handlers import (
     EventHandlerManager,
     _DeletedMessagesEvent,

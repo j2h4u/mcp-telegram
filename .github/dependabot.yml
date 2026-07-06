@@ -15,11 +15,16 @@ updates:
       - "dependencies"
     groups:
       python-minor-patch:
+        applies-to: "version-updates"
         patterns:
           - "*"
         update-types:
           - "minor"
           - "patch"
+      python-security:
+        applies-to: "security-updates"
+        patterns:
+          - "*"
 
   - package-ecosystem: "github-actions"
     directory: "/"
@@ -33,6 +38,11 @@ updates:
       - "dependencies"
     groups:
       github-actions:
+        applies-to: "version-updates"
+        patterns:
+          - "*"
+      github-actions-security:
+        applies-to: "security-updates"
         patterns:
           - "*"
 
@@ -47,3 +57,8 @@ updates:
     open-pull-requests-limit: 5
     labels:
       - "dependencies"
+    groups:
+      docker-images:
+        applies-to: "version-updates"
+        patterns:
+          - "*"

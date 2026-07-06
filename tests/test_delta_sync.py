@@ -21,8 +21,8 @@ from typing import Protocol, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
-from helpers import build_mock_message
 
+from helpers import build_mock_message
 from mcp_telegram.delta_sync import DeltaSyncWorker, _DeltaSyncClient
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 
@@ -521,7 +521,6 @@ async def test_probe_restores_access_after_gap_fill(
     from unittest.mock import AsyncMock
 
     from helpers import MockTotalList
-
     from mcp_telegram.delta_sync import DeltaSyncWorker, _probe_access_lost_dialogs
 
     dialog_id = 9001
@@ -581,7 +580,6 @@ async def test_probe_gap_fill_failure_keeps_access_lost(
     from unittest.mock import AsyncMock
 
     from helpers import MockTotalList
-
     from mcp_telegram.delta_sync import DeltaSyncWorker, _probe_access_lost_dialogs
 
     dialog_id = 9010

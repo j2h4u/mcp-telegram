@@ -4,7 +4,6 @@ import stat
 from pathlib import Path
 
 import pytest
-
 from deploy.telegram_qr_login import _ensure_private_state_dir, _protect_session_file
 
 

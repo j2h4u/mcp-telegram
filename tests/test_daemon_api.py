@@ -10,7 +10,7 @@ import asyncio
 import json
 import sqlite3
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -311,6 +311,20 @@ def make_server(
     return server
 
 
+def test_daemon_api_server_uses_explicit_sync_db_path(tmp_path: Path) -> None:
+    conn = _make_db()
+    sync_db_path = tmp_path / "sync.db"
+
+    server = DaemonAPIServer(
+        conn,
+        cast(_DaemonClientLike, _TestClient()),
+        asyncio.Event(),
+        sync_db_path=sync_db_path,
+    )
+
+    assert server._sync_db_path == sync_db_path
+
+
 def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.Connection:
     """Return an in-memory SQLite connection with the required schema."""
     conn = _register_sqlite_connection(sqlite3.connect(":memory:"))
@@ -461,6 +475,15 @@ def _make_db_with_dialogs(*, with_fts: bool = False, with_entities: bool = False
     conn.execute("CREATE INDEX IF NOT EXISTS idx_dialogs_needs_refresh_hidden ON dialogs(needs_refresh, hidden)")
     conn.commit()
     return conn
+
+
+def _make_file_db_with_dialogs(tmp_path: Path) -> tuple[sqlite3.Connection, Path]:
+    """Return a file-backed DB copied from the in-memory dialog test schema."""
+    source_conn = _make_db_with_dialogs()
+    db_path = tmp_path / "sync.db"
+    conn = _register_sqlite_connection(sqlite3.connect(db_path))
+    source_conn.backup(conn)
+    return conn, db_path
 
 
 def _make_db_with_activity() -> sqlite3.Connection:
@@ -1201,6 +1224,46 @@ async def test_list_dialogs_sync_status_via_sql() -> None:
     assert by_id[1]["sync_status"] == "synced"
     assert by_id[2]["sync_status"] == "not_synced"
     cast(MagicMock, client.iter_dialogs).assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_list_dialogs_file_db_uses_threaded_reader(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    conn, db_path = _make_file_db_with_dialogs(tmp_path)
+    _seed_dialog_row(conn, 101, name="Threaded", type_="user", last_message_at=100)
+    server = make_server(conn)
+
+    called = False
+
+    async def _same_thread_to_thread(func: object, *args: object, **kwargs: object) -> object:
+        nonlocal called
+        called = True
+        assert args[0] == db_path
+        return cast(Callable[..., object], func)(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", _same_thread_to_thread)
+
+    result = await server._list_dialogs({})
+
+    assert called is True
+    dialogs = cast(list[dict[str, object]], result["data"]["dialogs"])
+    assert dialogs[0]["name"] == "Threaded"
+
+
+@pytest.mark.asyncio
+async def test_list_dialogs_memory_db_uses_direct_connection(monkeypatch: pytest.MonkeyPatch) -> None:
+    conn = _make_db_with_dialogs()
+    _seed_dialog_row(conn, 101, name="Memory", type_="user", last_message_at=100)
+    server = make_server(conn)
+
+    async def _unexpected_to_thread(*args: object, **kwargs: object) -> object:
+        raise AssertionError("in-memory list_dialogs must not use asyncio.to_thread")
+
+    monkeypatch.setattr(asyncio, "to_thread", _unexpected_to_thread)
+
+    result = await server._list_dialogs({})
+
+    dialogs = cast(list[dict[str, object]], result["data"]["dialogs"])
+    assert dialogs[0]["name"] == "Memory"
 
 
 @pytest.mark.asyncio

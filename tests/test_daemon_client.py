@@ -75,6 +75,7 @@ async def test_daemon_connection_timeout_raises(tmp_path: Path) -> None:
                 pass  # pragma: no cover
 
     assert "timed out while connecting" in str(exc_info.value)
+    assert exc_info.value.kind == "connect_timeout"
 
 
 @pytest.mark.asyncio
@@ -211,8 +212,9 @@ async def test_request_timeout_raises_daemon_not_running(tmp_path: Path) -> None
     try:
         with patch("mcp_telegram.daemon_client.get_daemon_socket_path", return_value=sock_path):
             async with daemon_connection(timeout_seconds=0.01) as conn:
-                with pytest.raises(DaemonNotRunningError, match="timed out"):
+                with pytest.raises(DaemonNotRunningError, match="timed out") as exc_info:
                     await conn.request({"method": "get_me"})
+                assert exc_info.value.kind == "response_timeout"
     finally:
         server.close()
         await server.wait_closed()
@@ -227,8 +229,9 @@ async def test_request_send_timeout_raises_daemon_not_running() -> None:
 
     conn = DaemonConnection(reader, writer)
 
-    with pytest.raises(DaemonNotRunningError, match="timed out while sending request"):
+    with pytest.raises(DaemonNotRunningError, match="timed out while sending request") as exc_info:
         await conn.request({"method": "get_me"})
+    assert exc_info.value.kind == "send_timeout"
 
 
 @pytest.mark.asyncio
@@ -241,8 +244,9 @@ async def test_request_read_connection_reset_raises_daemon_not_running() -> None
 
     conn = DaemonConnection(reader, writer)
 
-    with pytest.raises(DaemonNotRunningError, match="closed the connection unexpectedly"):
+    with pytest.raises(DaemonNotRunningError, match="closed the connection unexpectedly") as exc_info:
         await conn.request({"method": "get_me"})
+    assert exc_info.value.kind == "connection_broken"
 
 
 @pytest.mark.asyncio
@@ -255,8 +259,9 @@ async def test_request_malformed_json_raises_daemon_not_running() -> None:
 
     conn = DaemonConnection(reader, writer)
 
-    with pytest.raises(DaemonNotRunningError, match="malformed JSON"):
+    with pytest.raises(DaemonNotRunningError, match="malformed JSON") as exc_info:
         await conn.request({"method": "get_me"})
+    assert exc_info.value.kind == "malformed_response"
 
 
 # ---------------------------------------------------------------------------

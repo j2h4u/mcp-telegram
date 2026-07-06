@@ -3,9 +3,8 @@ import textwrap
 from pathlib import Path
 from typing import TypedDict, cast
 
-from pytest import CaptureFixture
-
 from devtools.crap_ratchet import main
+from pytest import CaptureFixture
 
 
 class BaselineFunction(TypedDict):

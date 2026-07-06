@@ -49,7 +49,7 @@ from mcp_telegram.tools import (
     submit_feedback,
     trace_account_messages,
 )
-from mcp_telegram.tools._base import DaemonNotRunningError, ToolResult
+from mcp_telegram.tools._base import DaemonNotRunningError, ToolResult, _daemon_not_running_text
 from mcp_telegram.tools.stats import GetDialogStats, GetUsageStats, get_dialog_stats, get_usage_stats
 
 StructuredResult = ToolResult | CallToolResult
@@ -1393,6 +1393,28 @@ def test_trace_account_messages_schema_and_docstring_contract() -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_daemon_not_running_text_for_missing_daemon_mentions_start_command() -> None:
+    text = _daemon_not_running_text()
+
+    assert "not running" in text
+    assert "mcp-telegram sync" in text
+
+
+def test_daemon_not_running_text_for_timeout_mentions_retry_not_start_command() -> None:
+    text = _daemon_not_running_text(DaemonNotRunningError("timed out", kind="response_timeout"))
+
+    assert "did not respond before the IPC timeout" in text
+    assert "Retry the tool call" in text
+    assert "mcp-telegram sync" not in text
+
+
+def test_daemon_not_running_text_for_broken_connection_mentions_ipc_failure() -> None:
+    text = _daemon_not_running_text(DaemonNotRunningError("broken", kind="connection_broken"))
+
+    assert "connection failed while handling the request" in text
+    assert "inspect service logs for daemon IPC errors" in text
+
+
 async def test_list_dialogs_daemon_not_running():
     """ListDialogs returns actionable error when daemon is not running."""
     with _patch_daemon_not_running():
@@ -1400,6 +1422,22 @@ async def test_list_dialogs_daemon_not_running():
 
     text = _result_text(result)
     assert "not running" in text.lower() or "mcp-telegram sync" in text.lower()
+
+
+async def test_list_dialogs_daemon_response_timeout_is_not_reported_as_not_running():
+    """ListDialogs distinguishes daemon IPC stalls from a stopped daemon."""
+
+    @asynccontextmanager
+    async def raising_dc():
+        raise DaemonNotRunningError("Sync daemon timed out waiting for response.", kind="response_timeout")
+        yield  # pragma: no cover
+
+    with patch("mcp_telegram.tools.discovery.daemon_connection", raising_dc):
+        result = await list_dialogs(ListDialogs())
+
+    text = _result_text(result)
+    assert "did not respond" in text
+    assert "Start it with: mcp-telegram sync" not in text
 
 
 async def test_list_messages_daemon_not_running():

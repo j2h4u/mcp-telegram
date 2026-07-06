@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import cast
 
 import pytest
-
 from devtools.mcp_client.cli import main, print_json, redact_script_output
 from devtools.mcp_client.client import (
     McpClientError,
@@ -16,6 +15,7 @@ from devtools.mcp_client.client import (
     execute_script_steps,
     load_script_steps,
 )
+
 from mcp_telegram import server
 
 

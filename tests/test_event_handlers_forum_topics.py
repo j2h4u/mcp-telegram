@@ -29,7 +29,6 @@ from typing import TypedDict, cast
 from unittest.mock import MagicMock
 
 import pytest
-from helpers import build_mock_message
 from telethon.tl.types import (  # type: ignore[import-untyped]
     MessageActionTopicCreate,
     MessageActionTopicEdit,
@@ -38,6 +37,7 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
 )
 from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
+from helpers import build_mock_message
 from mcp_telegram.event_handlers import (
     EventHandlerManager,
     _ForumTopicPinnedUpdateLike,

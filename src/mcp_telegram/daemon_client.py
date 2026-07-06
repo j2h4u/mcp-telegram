@@ -25,12 +25,20 @@ import logging
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import NotRequired, TypedDict, Unpack, cast
+from typing import Literal, NotRequired, TypedDict, Unpack, cast
 
 from .daemon_ipc import get_daemon_socket_path
 
 logger = logging.getLogger(__name__)
 DEFAULT_DAEMON_TIMEOUT_SECONDS = 30.0
+type DaemonFailureKind = Literal[
+    "not_running",
+    "connect_timeout",
+    "send_timeout",
+    "response_timeout",
+    "connection_broken",
+    "malformed_response",
+]
 
 # ContextVar for collecting request_ids during a tool call.
 # server.py sets a fresh list before running the tool; request() appends to it.
@@ -91,7 +99,10 @@ _DaemonResponse = TypedDict(  # noqa: UP013
 def _parse_response_line(line: bytes) -> _DaemonResponse:
     response_obj = cast(object, json.loads(line.decode()))
     if not isinstance(response_obj, dict):
-        raise DaemonNotRunningError("Daemon returned malformed JSON: response must be a JSON object")
+        raise DaemonNotRunningError(
+            "Daemon returned malformed JSON: response must be a JSON object",
+            kind="malformed_response",
+        )
     return cast(_DaemonResponse, response_obj)
 
 
@@ -111,8 +122,13 @@ __all__ = [
 class DaemonNotRunningError(Exception):
     """Raised when the sync daemon is not reachable via its Unix socket.
 
-    The message is user-facing and includes the command to start the daemon.
+    ``kind`` distinguishes a truly absent daemon from transient IPC stalls so
+    MCP tools can return accurate recovery guidance.
     """
+
+    def __init__(self, message: str, *, kind: DaemonFailureKind = "not_running") -> None:
+        super().__init__(message)
+        self.kind = kind
 
 
 # ---------------------------------------------------------------------------
@@ -158,7 +174,8 @@ class DaemonConnection:
             )
         except TimeoutError as exc:
             raise DaemonNotRunningError(
-                "Sync daemon timed out while sending request. Restart it with: mcp-telegram sync"
+                "Sync daemon timed out while sending request. Restart it with: mcp-telegram sync",
+                kind="send_timeout",
             ) from exc
 
         try:
@@ -168,21 +185,24 @@ class DaemonConnection:
             )
         except TimeoutError as exc:
             raise DaemonNotRunningError(
-                "Sync daemon timed out waiting for response. Restart it with: mcp-telegram sync"
+                "Sync daemon timed out waiting for response. Restart it with: mcp-telegram sync",
+                kind="response_timeout",
             ) from exc
         except (ConnectionResetError, BrokenPipeError, OSError) as exc:
             raise DaemonNotRunningError(
-                "Sync daemon closed the connection unexpectedly. Restart it with: mcp-telegram sync"
+                "Sync daemon closed the connection unexpectedly. Restart it with: mcp-telegram sync",
+                kind="connection_broken",
             ) from exc
 
         if not line:
             raise DaemonNotRunningError(
-                "Sync daemon closed the connection unexpectedly. Restart it with: mcp-telegram sync"
+                "Sync daemon closed the connection unexpectedly. Restart it with: mcp-telegram sync",
+                kind="connection_broken",
             )
         try:
             response = _parse_response_line(line)
         except json.JSONDecodeError as exc:
-            raise DaemonNotRunningError(f"Daemon returned malformed JSON: {exc}") from exc
+            raise DaemonNotRunningError(f"Daemon returned malformed JSON: {exc}", kind="malformed_response") from exc
         logger.debug(
             "daemon_response method=%s request_id=%s ok=%s",
             payload.get("method"),
@@ -541,7 +561,8 @@ async def daemon_connection(
         )
     except TimeoutError as exc:
         raise DaemonNotRunningError(
-            "Sync daemon timed out while connecting. Restart it with: mcp-telegram sync"
+            "Sync daemon timed out while connecting. Restart it with: mcp-telegram sync",
+            kind="connect_timeout",
         ) from exc
     except OSError as exc:
         raise DaemonNotRunningError("Sync daemon is not running. Start it with: mcp-telegram sync") from exc

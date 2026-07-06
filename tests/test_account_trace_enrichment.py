@@ -12,6 +12,8 @@ from typing import TypedDict, cast
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from telethon.errors import FloodWaitError
+
 from account_trace_fixtures import (
     open_trace_db,
     seed_dialog,
@@ -19,8 +21,6 @@ from account_trace_fixtures import (
     seed_message,
     seed_synced_dialog,
 )
-from telethon.errors import FloodWaitError
-
 from mcp_telegram.daemon_account_trace import (
     DaemonAccountTraceDeps,
     DaemonAccountTraceService,

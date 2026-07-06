@@ -1,11 +1,13 @@
 """Reading-domain service for daemon read/search/list handlers."""
 
+import asyncio
 import dataclasses
 import inspect
 import sqlite3
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol, cast
 
 from rapidfuzz import fuzz as _fuzz
@@ -25,6 +27,7 @@ from .pagination import (
     encode_history_navigation,
     encode_search_navigation,
 )
+from .sync_db import open_sync_db_reader
 
 
 class _LoggerLike(Protocol):
@@ -73,6 +76,7 @@ class DaemonReadingDeps:
     """Dependencies for ``DaemonReadingService``."""
 
     conn: sqlite3.Connection
+    sync_db_path: Path | None
     client: _TelegramClientLike
     self_id: int | None
     resolve_dialog_id: Callable[[int, str | None], Awaitable[int | dict]]
@@ -600,6 +604,7 @@ class DaemonReadingService:
 
     def _fetch_list_dialog_rows(
         self,
+        conn: sqlite3.Connection,
         request: _ListDialogsRequest,
         dialog_filter: _ListDialogsFilter,
     ) -> list[Mapping[str, object]]:
@@ -608,9 +613,9 @@ class DaemonReadingService:
             "pinned_filter": 0 if request.ignore_pinned else None,
             "name_pat": dialog_filter.name_pat,
         }
-        rows = _fetchall_rows(self._conn.execute(api._LIST_DIALOGS_SQL, params))
+        rows = _fetchall_rows(conn.execute(api._LIST_DIALOGS_SQL, params))
         if not rows and dialog_filter.name_pat is not None and dialog_filter.normalized:
-            rows = _fetchall_rows(self._conn.execute(api._LIST_DIALOGS_SQL, {**params, "name_pat": None}))
+            rows = _fetchall_rows(conn.execute(api._LIST_DIALOGS_SQL, {**params, "name_pat": None}))
         return [cast(Mapping[str, object], row) for row in rows]
 
     def _dialog_row_matches_filter(
@@ -943,23 +948,49 @@ class DaemonReadingService:
         return await self._search_messages_global_result(request, stemmed)
 
     async def _list_dialogs(self, req: dict) -> dict:
+        """Return dialog list from the local dialogs snapshot.
+
+        Production file-backed databases use a dedicated read-only connection in
+        a worker thread. This keeps the combined ``mcp-telegram serve`` event
+        loop responsive while the query performs SQLite aggregation. In-memory
+        tests keep the direct connection path because there is no file to reopen.
+        """
+        db_path = self._deps.sync_db_path
+        if db_path is not None:
+            started = time.monotonic()
+            try:
+                return await asyncio.to_thread(self._list_dialogs_from_reader, db_path, req)
+            finally:
+                elapsed_ms = (time.monotonic() - started) * 1000
+                self._logger.info("list_dialogs_sql_reader completed in %.3fms%s", elapsed_ms, self._deps.rid())
+        return self._list_dialogs_sync(self._conn, req)
+
+    def _list_dialogs_from_reader(self, db_path: Path, req: dict) -> dict:
+        conn = open_sync_db_reader(db_path)
+        try:
+            conn.row_factory = sqlite3.Row
+            return self._list_dialogs_sync(conn, req)
+        finally:
+            conn.close()
+
+    def _list_dialogs_sync(self, conn: sqlite3.Connection, req: dict) -> dict:
         """Return dialog list from the local dialogs snapshot (pure SQL)."""
         request = self._parse_list_dialogs_request(req)
         dialog_filter = self._prepare_list_dialogs_filter(request.filter_raw)
         local_counts = {
             _object_to_int(_row_sequence(row)[0]): _object_to_int(_row_sequence(row)[1], 0)
-            for row in _fetchall_rows(self._conn.execute(api._COUNT_MESSAGES_BY_DIALOG_SQL))
+            for row in _fetchall_rows(conn.execute(api._COUNT_MESSAGES_BY_DIALOG_SQL))
         }
         unread_counts = {
             _object_to_int(_row_sequence(row)[0]): (
                 _object_to_int(_row_sequence(row)[1], 0),
                 _object_to_int(_row_sequence(row)[2], 0),
             )
-            for row in _fetchall_rows(self._conn.execute(api._BATCHED_UNREAD_COUNTS_SQL))
+            for row in _fetchall_rows(conn.execute(api._BATCHED_UNREAD_COUNTS_SQL))
         }
-        sql_rows = self._fetch_list_dialog_rows(request, dialog_filter)
+        sql_rows = self._fetch_list_dialog_rows(conn, request, dialog_filter)
         if not sql_rows:
-            count_row = _fetchone_row(self._conn.execute("SELECT COUNT(*) FROM dialogs"))
+            count_row = _fetchone_row(conn.execute("SELECT COUNT(*) FROM dialogs"))
             count_total = _object_to_int(_row_sequence(count_row)[0]) if count_row is not None else 0
             return {
                 "ok": True,

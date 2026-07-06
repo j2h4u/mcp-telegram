@@ -430,6 +430,8 @@ _current_request_id: contextvars.ContextVar[str | None] = contextvars.ContextVar
     "_current_request_id",
     default=None,
 )
+_DATABASE_LIST_NAME_INDEX = 1
+_DATABASE_LIST_PATH_INDEX = 2
 
 
 def _rid() -> str:
@@ -462,6 +464,22 @@ def _compute_sync_coverage(
 
 def _sync_coverage_unknown(total_messages: int | None, local_count: int) -> bool:
     return total_messages is None or total_messages < 0 or local_count > total_messages
+
+
+def _sync_db_path_from_connection(conn: sqlite3.Connection) -> Path | None:
+    rows = cast(Sequence[Sequence[object]], conn.execute("PRAGMA database_list").fetchall())
+    for values in rows:
+        if len(values) > _DATABASE_LIST_PATH_INDEX and values[_DATABASE_LIST_NAME_INDEX] == "main":
+            db_path = values[_DATABASE_LIST_PATH_INDEX]
+            if db_path:
+                return Path(str(db_path))
+    return None
+
+
+def _resolve_sync_db_path(conn: sqlite3.Connection, explicit_path: Path | None) -> Path | None:
+    if explicit_path is not None:
+        return explicit_path
+    return _sync_db_path_from_connection(conn)
 
 
 def _build_access_metadata(
@@ -887,9 +905,11 @@ class DaemonAPIServer:
         client: _DaemonClientLike,
         shutdown_event: asyncio.Event,
         feedback_conn: sqlite3.Connection | None = None,
+        sync_db_path: Path | None = None,
     ) -> None:
         conn.row_factory = sqlite3.Row
         self._conn = conn
+        self._sync_db_path = _resolve_sync_db_path(conn, sync_db_path)
         self._feedback_conn = feedback_conn  # feedback.db — daemon is sole writer
         self._client = client
         self._shutdown_event = shutdown_event
@@ -914,6 +934,7 @@ class DaemonAPIServer:
             self._reading_service = DaemonReadingService(
                 DaemonReadingDeps(
                     conn=self._conn,
+                    sync_db_path=self._sync_db_path,
                     client=cast(ReadingTelegramClientLike, self._client),
                     self_id=self.self_id,
                     resolve_dialog_id=self._resolve_dialog_id,

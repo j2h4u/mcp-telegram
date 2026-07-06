@@ -25,13 +25,13 @@ from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from helpers import build_mock_message, build_mock_reactions
 from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
 from telethon.tl.types import (  # type: ignore[import-untyped]
     PeerChannel,
     PeerUser,
 )
 
+from helpers import build_mock_message, build_mock_reactions
 from mcp_telegram.event_handlers import (
     EventHandlerManager,
     _EditedMessageEvent,

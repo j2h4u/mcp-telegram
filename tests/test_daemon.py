@@ -235,11 +235,12 @@ def test_self_id_cached_at_startup(
     captured: dict[str, object] = {}
 
     class _Capturing:
-        def __init__(self, conn, client, shutdown_event, feedback_conn):
+        def __init__(self, conn, client, shutdown_event, feedback_conn=None, sync_db_path=None):
             self._conn = conn
             self._client = client
             self._shutdown_event = shutdown_event
             self._feedback_conn = feedback_conn
+            self._sync_db_path = sync_db_path
             self.self_id = None
             captured["instance"] = self
 
@@ -1002,7 +1003,6 @@ def test_sync_main_cleans_socket_on_shutdown(
 async def test_backfill_blank_unsupported_messages_materializes_text_and_fts() -> None:
     """Startup backfill re-fetches blank unsupported rows and indexes recovered text."""
     from helpers import build_mock_message
-
     from mcp_telegram.daemon import _backfill_blank_unsupported_messages
     from mcp_telegram.sync_db import _apply_migrations
 

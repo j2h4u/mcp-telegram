@@ -16,8 +16,8 @@ from typing import Protocol, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from helpers import MockTotalList, build_mock_message, build_mock_reactions
 
+from helpers import MockTotalList, build_mock_message, build_mock_reactions
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.sync_worker import (
     FullSyncWorker,

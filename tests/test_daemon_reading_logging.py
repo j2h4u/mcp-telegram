@@ -54,9 +54,11 @@ class _TestLogger:
 @pytest.mark.asyncio
 async def test_list_messages_telegram_entity_miss_logs_structured_warning_without_traceback() -> None:
     logger = _TestLogger()
+    conn = sqlite3.connect(":memory:")
     service = DaemonReadingService(
         DaemonReadingDeps(
-            conn=sqlite3.connect(":memory:"),
+            conn=conn,
+            sync_db_path=None,
             client=_EntityMissingClient(),
             self_id=1,
             resolve_dialog_id=lambda _dialog_id, _dialog: asyncio.sleep(0, result=0),
@@ -66,18 +68,21 @@ async def test_list_messages_telegram_entity_miss_logs_structured_warning_withou
         )
     )
 
-    result = await service._list_messages_from_telegram(
-        _ListMessagesTelegramRequest(
-            dialog_id=123,
-            limit=10,
-            direction="newest",
-            direction_enum=HistoryDirection.NEWEST,
-            anchor_msg_id=None,
-            sender_id=None,
-            topic_id=None,
-            unread_after_id=None,
+    try:
+        result = await service._list_messages_from_telegram(
+            _ListMessagesTelegramRequest(
+                dialog_id=123,
+                limit=10,
+                direction="newest",
+                direction_enum=HistoryDirection.NEWEST,
+                anchor_msg_id=None,
+                sender_id=None,
+                topic_id=None,
+                unread_after_id=None,
+            )
         )
-    )
+    finally:
+        conn.close()
 
     assert result["ok"] is False
     assert result["error"] == "telegram_error"

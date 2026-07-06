@@ -225,11 +225,13 @@ async def execute_script_steps(client: StdioMcpClient, steps: list[dict[str, Any
         if action == "list_tools":
             result = await client.list_tools()
             _assert_step_expectations(index=index, action=action, result=result, expect=step.get("expect"))
-            results.append({
-                "step": index,
-                "action": action,
-                "result": result,
-            })
+            results.append(
+                {
+                    "step": index,
+                    "action": action,
+                    "result": result,
+                }
+            )
             continue
 
         if action == "call_tool":
@@ -243,12 +245,14 @@ async def execute_script_steps(client: StdioMcpClient, steps: list[dict[str, Any
 
             result = await client.call_tool(name, arguments)
             _assert_step_expectations(index=index, action=action, result=result, expect=step.get("expect"))
-            results.append({
-                "step": index,
-                "action": action,
-                "name": name,
-                "result": result,
-            })
+            results.append(
+                {
+                    "step": index,
+                    "action": action,
+                    "name": name,
+                    "result": result,
+                }
+            )
             continue
 
         raise ValueError(f"unsupported script action at step {index}: {action!r}")
@@ -279,9 +283,7 @@ def _assert_step_expectations(
                 return
             except McpClientError as exc:
                 errors.append(str(exc))
-        raise McpClientError(
-            f"script step {index} did not match any expect.one_of branch: {'; '.join(errors)}"
-        )
+        raise McpClientError(f"script step {index} did not match any expect.one_of branch: {'; '.join(errors)}")
 
     path_equals = expect.get("path_equals")
     if path_equals is not None:
@@ -324,18 +326,14 @@ def _assert_list_tools_expectations(*, index: int, result: Any, expect: dict[str
         raise ValueError(f"script step {index} field 'expect.tool_expectations' must be an object")
 
     tools_by_name = {
-        tool.get("name"): tool
-        for tool in result
-        if isinstance(tool, dict) and isinstance(tool.get("name"), str)
+        tool.get("name"): tool for tool in result if isinstance(tool, dict) and isinstance(tool.get("name"), str)
     }
     for tool_name, path_map in tool_expectations.items():
         tool_payload = tools_by_name.get(tool_name)
         if tool_payload is None:
             raise McpClientError(f"script step {index} expected tool {tool_name!r} to exist")
         if not isinstance(path_map, dict):
-            raise ValueError(
-                f"script step {index} field 'expect.tool_expectations.{tool_name}' must be an object"
-            )
+            raise ValueError(f"script step {index} field 'expect.tool_expectations.{tool_name}' must be an object")
         for path, expected_value in path_map.items():
             actual_value = _lookup_path(tool_payload, path)
             if actual_value != expected_value:
@@ -355,9 +353,7 @@ def _assert_call_tool_expectations(*, index: int, result: Any, expect: dict[str,
             raise ValueError(f"script step {index} field 'expect.is_error' must be a boolean")
         actual_is_error = result.get("isError")
         if actual_is_error != expected_is_error:
-            raise McpClientError(
-                f"script step {index} expected isError={expected_is_error!r}, got {actual_is_error!r}"
-            )
+            raise McpClientError(f"script step {index} expected isError={expected_is_error!r}, got {actual_is_error!r}")
 
     content_text = _extract_text_content(result)
     _assert_text_membership(

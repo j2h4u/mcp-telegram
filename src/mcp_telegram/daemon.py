@@ -659,7 +659,7 @@ async def _build_sync_main_context() -> _SyncMainContext:
     shutdown_event = register_shutdown_handler(conn, loop, feedback_conn=feedback_conn)
 
     client = cast(_DaemonClient, create_client(catch_up=True))
-    api_server = DaemonAPIServer(conn, cast(_DaemonClientLike, client), shutdown_event, feedback_conn)
+    api_server = DaemonAPIServer(conn, cast(_DaemonClientLike, client), shutdown_event, feedback_conn, db_path)
     socket_path = get_daemon_socket_path()
     # Ensure the runtime/state dir exists before binding — do not assume a prior
     # get_sync_db_path() call (or a Docker volume mount) already created it.
