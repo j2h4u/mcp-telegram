@@ -528,6 +528,10 @@ async def test_probe_restores_access_after_gap_fill(
         "INSERT INTO synced_dialogs (dialog_id, status, access_lost_at) VALUES (?, 'access_lost', 1000)",
         (dialog_id,),
     )
+    sync_db.execute(
+        "INSERT INTO dialogs (dialog_id, name, hidden, needs_refresh, snapshot_at) VALUES (?, 'lost', 1, 0, 1000)",
+        (dialog_id,),
+    )
     # Need a baseline message for delta worker
     sync_db.execute(
         "INSERT INTO messages (dialog_id, message_id, sent_at, text) VALUES (?, 100, 1000, 'old')",
@@ -557,6 +561,13 @@ async def test_probe_restores_access_after_gap_fill(
     )
 
     assert restored == 1
+    dialog_row = cast(
+        tuple[int, int, int | None] | None,
+        sync_db.execute(
+            "SELECT hidden, needs_refresh, snapshot_at FROM dialogs WHERE dialog_id = ?",
+            (dialog_id,),
+        ).fetchone(),
+    )
     row = cast(
         tuple[object | None, ...] | None,
         sync_db.execute(
@@ -568,6 +579,10 @@ async def test_probe_restores_access_after_gap_fill(
     assert row[0] == "syncing"
     assert row[1] is None  # access_lost_at cleared
     assert row[2] == 200  # total_messages set from probe
+    assert dialog_row is not None
+    assert dialog_row[0] == 0  # visible again after access recovery
+    assert dialog_row[1] == 1  # queued for reconciliation refresh
+    assert dialog_row[2] != 1000
 
 
 @pytest.mark.asyncio

@@ -71,6 +71,11 @@ _UPDATE_DELTA_LAST_SYNCED_AT_SQL = "UPDATE synced_dialogs SET last_synced_at = ?
 _SELECT_ACCESS_LOST_SQL = "SELECT dialog_id FROM synced_dialogs WHERE status = 'access_lost'"
 
 _RESTORE_ACCESS_SQL = "UPDATE synced_dialogs SET status = 'syncing', access_lost_at = NULL WHERE dialog_id = ?"
+_RESTORE_DIALOG_VISIBILITY_SQL = """
+UPDATE dialogs
+SET hidden = 0, needs_refresh = 1, snapshot_at = ?
+WHERE dialog_id = ?
+"""
 
 _UPDATE_TOTAL_MESSAGES_SQL = "UPDATE synced_dialogs SET total_messages = ? WHERE dialog_id = ?"
 
@@ -283,7 +288,9 @@ async def _probe_access_lost_dialogs(
 
             # Gap-fill succeeded — NOW reset status to syncing.
             with conn:
+                now = int(time.time())
                 conn.execute(_RESTORE_ACCESS_SQL, (dialog_id,))
+                conn.execute(_RESTORE_DIALOG_VISIBILITY_SQL, (now, dialog_id))
                 if total is not None:
                     conn.execute(_UPDATE_TOTAL_MESSAGES_SQL, (total, dialog_id))
             logger.info("access_restored dialog_id=%d total=%s", dialog_id, total)
