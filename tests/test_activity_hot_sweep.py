@@ -205,6 +205,29 @@ async def test_stale_peer_not_selected(monkeypatch: pytest.MonkeyPatch) -> None:
         assert stale_dialog_id not in call_log, "Stale peer must not be swept — it is outside the 30-day window"
 
 
+@pytest.mark.asyncio
+async def test_access_lost_peer_not_selected(monkeypatch: pytest.MonkeyPatch) -> None:
+    """HotSweep must not keep retrying dialogs already marked access_lost."""
+    with _make_db() as conn:
+        dialog_id = -100100000018
+        now = int(time.time())
+        _enroll(conn, dialog_id, last_activity_at=now - 60)
+        conn.execute(
+            "UPDATE synced_dialogs SET status = 'access_lost', access_lost_at = ? WHERE dialog_id = ?",
+            (now, dialog_id),
+        )
+        conn.commit()
+
+        _patch_build_working_set(monkeypatch)
+        call_log = _patch_sweep(monkeypatch, {dialog_id: [_make_sweep_result([10])]})
+
+        shutdown = asyncio.Event()
+        written = await run_hot_sweep_pass(_FakeClient(), conn, shutdown)
+
+        assert written == 0
+        assert dialog_id not in call_log
+
+
 # ---------------------------------------------------------------------------
 # (b) First pass with hot_cursor IS NULL — uses min_id=0, advances hot_cursor
 # ---------------------------------------------------------------------------

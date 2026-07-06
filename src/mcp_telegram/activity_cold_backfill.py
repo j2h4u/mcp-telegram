@@ -254,11 +254,13 @@ async def run_cold_backfill_pass(
         tuple[int, int | None] | None,
         conn.execute(
             """
-        SELECT dialog_id, cold_offset_id
-        FROM activity_dialog_state
-        WHERE cold_status != 'complete'
-          AND (cold_next_retry_at IS NULL OR cold_next_retry_at <= :now)
-        ORDER BY updated_at ASC, dialog_id ASC
+        SELECT ads.dialog_id, ads.cold_offset_id
+        FROM activity_dialog_state AS ads
+        LEFT JOIN synced_dialogs AS sd ON sd.dialog_id = ads.dialog_id
+        WHERE ads.cold_status != 'complete'
+          AND (ads.cold_next_retry_at IS NULL OR ads.cold_next_retry_at <= :now)
+          AND COALESCE(sd.status, '') != 'access_lost'
+        ORDER BY ads.updated_at ASC, ads.dialog_id ASC
         LIMIT 1
         """,
             {"now": now},

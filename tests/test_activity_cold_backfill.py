@@ -224,6 +224,27 @@ async def test_no_due_peer_when_retry_not_due(monkeypatch: pytest.MonkeyPatch) -
         assert result.outcome == ColdPassOutcome.NO_DUE_PEER
 
 
+@pytest.mark.asyncio
+async def test_no_due_peer_when_access_lost(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ColdBackfill must not keep retrying dialogs already marked access_lost."""
+    with _make_db() as conn:
+        dialog_id = -100100000003
+        now = int(time.time())
+        _enroll(conn, dialog_id)
+        conn.execute(
+            "UPDATE synced_dialogs SET status = 'access_lost', access_lost_at = ? WHERE dialog_id = ?",
+            (now, dialog_id),
+        )
+        conn.commit()
+        call_log = _patch_sweep(monkeypatch, {dialog_id: [_normal_result([10])]})
+        shutdown = asyncio.Event()
+
+        result = await run_cold_backfill_pass(_FakeClient(), conn, shutdown)
+
+        assert result.outcome == ColdPassOutcome.NO_DUE_PEER
+        assert call_log == {}
+
+
 # ---------------------------------------------------------------------------
 # (a) cold_offset_id decreases across passes (backward walk, concern 2)
 # ---------------------------------------------------------------------------

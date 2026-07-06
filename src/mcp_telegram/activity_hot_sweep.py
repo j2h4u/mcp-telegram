@@ -277,12 +277,14 @@ async def run_hot_sweep_pass(
         list[tuple[int, int | None]],
         conn.execute(
             """
-        SELECT dialog_id, hot_cursor
-        FROM activity_dialog_state
-        WHERE last_activity_at IS NOT NULL
-          AND last_activity_at >= :cutoff
-          AND (hot_next_retry_at IS NULL OR hot_next_retry_at <= :now)
-        ORDER BY last_activity_at DESC
+        SELECT ads.dialog_id, ads.hot_cursor
+        FROM activity_dialog_state AS ads
+        LEFT JOIN synced_dialogs AS sd ON sd.dialog_id = ads.dialog_id
+        WHERE ads.last_activity_at IS NOT NULL
+          AND ads.last_activity_at >= :cutoff
+          AND (ads.hot_next_retry_at IS NULL OR ads.hot_next_retry_at <= :now)
+          AND COALESCE(sd.status, '') != 'access_lost'
+        ORDER BY ads.last_activity_at DESC
         """,
             {"cutoff": cutoff, "now": now},
         ).fetchall(),

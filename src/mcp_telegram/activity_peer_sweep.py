@@ -27,8 +27,11 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol, cast
 
+from telethon.tl.types import TypeInputPeer
+
 from .activity_peer_resolve import LinkedChatResolution, resolve_input_peer, resolve_linked_chat_id
 from .activity_sync import INSERT_OWN_ONLY_DIALOG_SQL, _ActivityClient, call_with_timeout, extract_dialog_id
+from .dialog_sync import _ACCESS_LOST_ERRORS, _set_access_lost
 from .sync_worker import ExtractedMessage, extract_message_row, insert_messages_with_fts
 
 logger = logging.getLogger(__name__)
@@ -130,6 +133,13 @@ class _SweepResultLike(Protocol):
     messages: Sequence[_SweepMessageLike] | None
 
 
+@dataclass(frozen=True, slots=True)
+class _SearchOutcome:
+    result: _SweepResultLike | None
+    rpc_duration_s: float
+    early_result: SweepResult | None = None
+
+
 async def _pace_successful_search_request() -> None:
     """Apply a tiny fixed pause after a successful SearchRequest."""
     await asyncio.sleep(_PACING.search.success_s)
@@ -167,44 +177,32 @@ def _coerce_peer_sweep_request(*args: object, **kwargs: object) -> PeerSweepRequ
     )
 
 
-# ---------------------------------------------------------------------------
-# sweep_peer_once: FloodWait-neutral per-peer self-search primitive
-# ---------------------------------------------------------------------------
+def _access_skip_result() -> SweepResult:
+    return SweepResult(
+        fetched_ids=[],
+        persisted=0,
+        min_id=None,
+        max_id=None,
+        skip_reason=SkipReason.ACCESS_SKIP,
+    )
 
 
-async def sweep_peer_once(*args: object, **kwargs: object) -> SweepResult:
-    """Search for self-authored messages in a single peer and persist them.
+def _flood_wait_result(seconds: int) -> SweepResult:
+    return SweepResult(
+        fetched_ids=[],
+        persisted=0,
+        min_id=None,
+        max_id=None,
+        skip_reason=SkipReason.FLOOD_WAIT,
+        flood_wait_seconds=seconds,
+    )
 
-    Direction-agnostic: takes explicit offset_id + min_id, reports both
-    min_id and max_id of the batch.
-      - HotSweep (plan 03) reads max_id (forward/newest-side cursor).
-      - ColdBackfill (plan 04) reads min_id (backward cursor).
 
-    FloodWait-neutral: on FloodWaitError the function returns immediately with
-    skip_reason=FLOOD_WAIT and flood_wait_seconds set — it does NOT sleep.
-    The owning scheduler sets the per-tier *_next_retry_at.
-
-    TimeoutError (wedged RPC): treated as ACCESS_SKIP — a transient fault,
-    not history-floor completion.
-    """
-    request = _coerce_peer_sweep_request(*args, **kwargs)
+async def _search_self_messages(request: PeerSweepRequest, peer: TypeInputPeer) -> _SearchOutcome:
     from telethon.errors import FloodWaitError
     from telethon.tl.functions.messages import SearchRequest
     from telethon.tl.types import InputMessagesFilterEmpty, InputPeerSelf
 
-    # Step 1: entity-type-aware peer resolution from session
-    peer = await resolve_input_peer(request.client, request.dialog_id)
-    if peer is None:
-        logger.debug("sweep_peer_once_access_skip dialog_id=%r reason=resolve_none", request.dialog_id)
-        return SweepResult(
-            fetched_ids=[],
-            persisted=0,
-            min_id=None,
-            max_id=None,
-            skip_reason=SkipReason.ACCESS_SKIP,
-        )
-
-    # Step 2: issue per-peer self-search with concrete peer (not InputPeerEmpty)
     search_started_at = time.monotonic()
     try:
         result = await call_with_timeout(
@@ -231,14 +229,10 @@ async def sweep_peer_once(*args: object, **kwargs: object) -> SweepResult:
             exc.seconds,
             _elapsed_s(search_started_at),
         )
-        # FloodWait-NEUTRAL: surface the wait, do not sleep
-        return SweepResult(
-            fetched_ids=[],
-            persisted=0,
-            min_id=None,
-            max_id=None,
-            skip_reason=SkipReason.FLOOD_WAIT,
-            flood_wait_seconds=int(exc.seconds),
+        return _SearchOutcome(
+            result=None,
+            rpc_duration_s=_elapsed_s(search_started_at),
+            early_result=_flood_wait_result(int(exc.seconds)),
         )
     except TimeoutError:
         logger.warning(
@@ -247,18 +241,65 @@ async def sweep_peer_once(*args: object, **kwargs: object) -> SweepResult:
             request.offset_id,
             _elapsed_s(search_started_at),
         )
-        # Wedged RPC is transient — ACCESS_SKIP, never HISTORY_FLOOR
-        return SweepResult(
-            fetched_ids=[],
-            persisted=0,
-            min_id=None,
-            max_id=None,
-            skip_reason=SkipReason.ACCESS_SKIP,
+        return _SearchOutcome(
+            result=None,
+            rpc_duration_s=_elapsed_s(search_started_at),
+            early_result=_access_skip_result(),
+        )
+    except _ACCESS_LOST_ERRORS as exc:
+        _set_access_lost(request.conn, request.dialog_id, int(time.time()))
+        logger.info(
+            "sweep_peer_once_access_lost dialog_id=%r error_type=%s rpc_duration_s=%.3f",
+            request.dialog_id,
+            type(exc).__name__,
+            _elapsed_s(search_started_at),
+        )
+        return _SearchOutcome(
+            result=None,
+            rpc_duration_s=_elapsed_s(search_started_at),
+            early_result=_access_skip_result(),
         )
 
-    rpc_duration_s = _elapsed_s(search_started_at)
+    return _SearchOutcome(result=cast(_SweepResultLike, result), rpc_duration_s=_elapsed_s(search_started_at))
+
+
+# ---------------------------------------------------------------------------
+# sweep_peer_once: FloodWait-neutral per-peer self-search primitive
+# ---------------------------------------------------------------------------
+
+
+async def sweep_peer_once(*args: object, **kwargs: object) -> SweepResult:
+    """Search for self-authored messages in a single peer and persist them.
+
+    Direction-agnostic: takes explicit offset_id + min_id, reports both
+    min_id and max_id of the batch.
+      - HotSweep (plan 03) reads max_id (forward/newest-side cursor).
+      - ColdBackfill (plan 04) reads min_id (backward cursor).
+
+    FloodWait-neutral: on FloodWaitError the function returns immediately with
+    skip_reason=FLOOD_WAIT and flood_wait_seconds set — it does NOT sleep.
+    The owning scheduler sets the per-tier *_next_retry_at.
+
+    TimeoutError (wedged RPC): treated as ACCESS_SKIP — a transient fault,
+    not history-floor completion.
+    """
+    request = _coerce_peer_sweep_request(*args, **kwargs)
+
+    # Step 1: entity-type-aware peer resolution from session
+    peer = await resolve_input_peer(request.client, request.dialog_id)
+    if peer is None:
+        logger.debug("sweep_peer_once_access_skip dialog_id=%r reason=resolve_none", request.dialog_id)
+        return _access_skip_result()
+
+    # Step 2: issue per-peer self-search with concrete peer (not InputPeerEmpty)
+    search = await _search_self_messages(request, peer)
+    if search.early_result is not None:
+        return search.early_result
+
+    rpc_duration_s = search.rpc_duration_s
     await _pace_successful_search_request()
-    batch = list(cast(_SweepResultLike, result).messages or [])
+    search_result = cast(_SweepResultLike, search.result)
+    batch = list(search_result.messages or [])
 
     # Step 5: genuinely empty batch from a reachable peer → history floor
     if not batch:

@@ -556,6 +556,74 @@ def test_sweep_peer_once_timeout_returns_access_skip(monkeypatch: pytest.MonkeyP
         )
 
 
+def test_sweep_peer_once_access_lost_marks_dialog_without_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Permanent Telegram access loss is a structured ACCESS_SKIP, not a loop traceback."""
+    from telethon.errors import ChannelPrivateError
+
+    with closing(_make_db()) as conn:
+        dialog_id = -100789000001
+        enroll_activity_dialog(conn, dialog_id, "supergroup", last_activity_at=int(time.time()))
+        sleep_calls: list[float] = []
+
+        async def fake_resolve_input_peer(client: object, dialog_id: int) -> object:
+            del client, dialog_id
+            return object()
+
+        async def fake_call_with_timeout(client: object, request: object) -> object:
+            del client, request
+            raise ChannelPrivateError(request=None)
+
+        async def fake_sleep(seconds: float) -> None:
+            sleep_calls.append(seconds)
+
+        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.resolve_input_peer", fake_resolve_input_peer)
+        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.call_with_timeout", fake_call_with_timeout)
+        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.asyncio.sleep", fake_sleep)
+
+        with caplog.at_level(logging.INFO, logger="mcp_telegram.activity_peer_sweep"):
+            result = asyncio.run(
+                sweep_peer_once(
+                    client=_FakeClient(),
+                    conn=conn,
+                    dialog_id=dialog_id,
+                    offset_id=4,
+                    min_id=2,
+                    limit=10,
+                )
+            )
+
+        synced_row = cast(
+            tuple[str, int | None] | None,
+            conn.execute(
+                "SELECT status, access_lost_at FROM synced_dialogs WHERE dialog_id = ?",
+                (dialog_id,),
+            ).fetchone(),
+        )
+        dialog_row = cast(
+            tuple[int] | None,
+            conn.execute("SELECT hidden FROM dialogs WHERE dialog_id = ?", (dialog_id,)).fetchone(),
+        )
+        access_lost_logs = [record for record in caplog.records if "sweep_peer_once_access_lost" in record.message]
+
+        assert sleep_calls == []
+        assert result == SweepResult(
+            fetched_ids=[],
+            persisted=0,
+            min_id=None,
+            max_id=None,
+            skip_reason=SkipReason.ACCESS_SKIP,
+        )
+        assert synced_row is not None
+        assert synced_row[0] == "access_lost"
+        assert synced_row[1] is not None
+        assert dialog_row == (1,)
+        assert access_lost_logs
+        assert all(record.exc_info is None for record in access_lost_logs)
+
+
 def test_sweep_peer_once_empty_batch_is_history_floor(monkeypatch: pytest.MonkeyPatch) -> None:
     """A reachable peer with no messages returns HISTORY_FLOOR."""
     with closing(_make_db()) as conn:
