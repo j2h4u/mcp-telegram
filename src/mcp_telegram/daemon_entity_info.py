@@ -4,8 +4,6 @@ This module owns the full ``get_entity_info`` orchestration plus type-specific
 helpers for user/bot/channel/supergroup/group entity details.
 """
 
-# ruff: noqa: BLE001
-
 import json
 import logging
 import sqlite3
@@ -283,7 +281,7 @@ class DaemonEntityInfoService:
                 self._deps.rid(),
             )
             return None, self._error("entity_not_found", str(exc))
-        except Exception as exc:
+        except (RPCError, RuntimeError, TypeError, AttributeError) as exc:
             self._deps.logger.warning(
                 "entity_info get_entity_failed entity_id=%r error=%s%s",
                 entity_id,
@@ -444,7 +442,7 @@ class DaemonEntityInfoService:
                 }
                 for chat in common_result.chats
             )
-        except Exception as exc:
+        except (RPCError, RuntimeError, TypeError, AttributeError, ValueError) as exc:
             self._deps.logger.warning(
                 "entity_info user common_chats_failed user_id=%r error=%s%s",
                 user_id,
@@ -505,7 +503,7 @@ class DaemonEntityInfoService:
             profile["personal_channel"] = personal_channel
             profile["personal_channel_unavailable_reason"] = reason
             profile["full_user_ok"] = True
-        except Exception as exc:
+        except (RPCError, RuntimeError, TypeError, AttributeError, ValueError, KeyError) as exc:
             self._deps.logger.warning(
                 "entity_info user full_user_failed user_id=%r error=%s%s",
                 user_id,
@@ -799,7 +797,7 @@ class DaemonEntityInfoService:
                     continue
                 raw_title = _attr(item, "title", None)
                 return _text_or_none(raw_title)
-        except Exception as exc:
+        except (RPCError, RuntimeError, TypeError, AttributeError, ValueError) as exc:
             self._deps.logger.warning(
                 "entity_info user folder_resolve_failed folder_id=%r error=%s%s",
                 folder_id,
@@ -840,7 +838,7 @@ class DaemonEntityInfoService:
                 if photo_id is None or photo_date is None:
                     continue
                 avatar_history.append({"photo_id": int(photo_id), "date": _isoformat_or_none(photo_date)})
-        except Exception as exc:
+        except (RPCError, RuntimeError, TypeError, AttributeError, ValueError) as exc:
             self._deps.logger.warning(
                 "entity_info user photos_failed user_id=%r error=%s%s",
                 int(cast(int, self._deps.get_peer_id(user))),
@@ -1007,7 +1005,7 @@ class DaemonEntityInfoService:
                     _attr(full_chat, "available_reactions", None),
                 )
             context["full_channel_ok"] = True
-        except Exception as exc:
+        except (RPCError, RuntimeError, TypeError, AttributeError, ValueError) as exc:
             self._deps.logger.warning(
                 "entity_info channel full_channel_failed channel_id=%r error=%s%s",
                 int(self._deps.get_peer_id(channel)),
@@ -1309,7 +1307,7 @@ class DaemonEntityInfoService:
                 group_meta["members_count"] = len(participants)
             if group_meta["members_count"] is None:
                 group_meta["members_count"] = _attr(chat, "participants_count", None)
-        except Exception as exc:
+        except (RPCError, RuntimeError, TypeError, AttributeError, ValueError) as exc:
             self._deps.logger.warning(
                 "entity_info group full_chat_failed chat_id=%r error=%s%s",
                 int(self._deps.get_peer_id(chat)),

@@ -429,6 +429,16 @@ def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.
     )
     conn.execute(
         """
+        CREATE TABLE IF NOT EXISTS dialogs (
+            dialog_id   INTEGER PRIMARY KEY,
+            name        TEXT,
+            type        TEXT,
+            members     INTEGER
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS message_forwards (
             dialog_id           INTEGER NOT NULL,
             message_id          INTEGER NOT NULL,
@@ -449,6 +459,7 @@ def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.
 def _make_db_with_dialogs(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.Connection:
     """_make_db() + dialogs table + 4 indexes (Phase 40 schema v17)."""
     conn = _make_db(with_fts=with_fts, with_entities=with_entities)
+    conn.execute("DROP TABLE IF EXISTS dialogs")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS dialogs (
@@ -2184,6 +2195,22 @@ def _seed_unread_state(
     conn.commit()
 
 
+def _seed_unread_dialog(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    **kwargs: Unpack[_SeedDialogRowKwargs],
+) -> None:
+    """Seed the minimal dialogs row used by unread filtering."""
+    name = kwargs.get("name", "Dialog")
+    type_ = kwargs.get("type_", "Group")
+    members = kwargs.get("members")
+    conn.execute(
+        "INSERT OR REPLACE INTO dialogs (dialog_id, name, type, members) VALUES (?, ?, ?, ?)",
+        (dialog_id, name, type_, members),
+    )
+    conn.commit()
+
+
 def _seed_message(
     conn: sqlite3.Connection,
     dialog_id: int,
@@ -2310,12 +2337,8 @@ async def test_list_unread_messages_filters_channels_in_personal_scope() -> None
 
 
 @pytest.mark.asyncio
-async def test_list_unread_messages_includes_groups_in_personal_scope() -> None:
-    """SQL path has no participants_count column; _should_include_unread_dialog
-    with participants_count=None defaults to include groups. This is a documented
-    behaviour change vs the API path which used live participants_count to filter
-    large groups (see RESEARCH.md Pitfall 2).
-    """
+async def test_list_unread_messages_includes_groups_with_unknown_members_in_personal_scope() -> None:
+    """Unknown member counts stay permissive in personal scope."""
     conn = _make_db()
     _seed_unread_state(conn, 1001, read_inbox_max_id=10, entity_type="Group", entity_name="BigGroup")
     _seed_message(conn, 1001, message_id=11)
@@ -2339,6 +2362,59 @@ async def test_list_unread_messages_includes_groups_in_personal_scope() -> None:
     # parses to the canonical SUPERGROUP. Still group-tier, still included in personal
     # scope — only the category label sharpened from the old flat "group".
     assert groups[0]["category"] == "supergroup"
+    cast(MagicMock, client).assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_list_unread_messages_includes_groups_below_threshold_in_personal_scope() -> None:
+    """Groups at or below the threshold stay visible in personal scope."""
+    conn = _make_db()
+    _seed_unread_state(conn, 1002, read_inbox_max_id=10, entity_type="Group", entity_name="SmallGroup")
+    _seed_unread_dialog(conn, 1002, name="SmallGroup", type_="Group", members=99)
+    _seed_message(conn, 1002, message_id=11)
+
+    client = _TestClient()
+    server = make_server(conn, client)
+
+    result = await server._dispatch(
+        {
+            "method": "get_inbox",
+            "scope": "personal",
+            "limit": 100,
+            "group_size_threshold": 100,
+        }
+    )
+
+    assert result["ok"] is True
+    groups = _response_groups(result)
+    assert len(groups) == 1
+    assert groups[0]["dialog_id"] == 1002
+    assert groups[0]["unread_count"] == 1
+    cast(MagicMock, client).assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_list_unread_messages_excludes_groups_above_threshold_in_personal_scope() -> None:
+    """Large groups are excluded from personal scope when members are known."""
+    conn = _make_db()
+    _seed_unread_state(conn, 1003, read_inbox_max_id=10, entity_type="Group", entity_name="LargeGroup")
+    _seed_unread_dialog(conn, 1003, name="LargeGroup", type_="Group", members=101)
+    _seed_message(conn, 1003, message_id=11)
+
+    client = _TestClient()
+    server = make_server(conn, client)
+
+    result = await server._dispatch(
+        {
+            "method": "get_inbox",
+            "scope": "personal",
+            "limit": 100,
+            "group_size_threshold": 100,
+        }
+    )
+
+    assert result["ok"] is True
+    assert _response_groups(result) == []
     cast(MagicMock, client).assert_not_called()
 
 

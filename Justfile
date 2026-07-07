@@ -155,6 +155,16 @@ fix:
     uv run ruff check --preview --fix src tests deploy scripts
     uv run ruff format src tests deploy devtools scripts
 
+# Remove local Python/test/tool artifacts without touching runtime data.
+clean:
+    find . \
+      \( -path "./.venv" -o -path "./.planning" -o -path "./graphify-out" -o -path "./deploy/database" -o -path "./deploy/backups" \) -prune \
+      -o \
+      \( -type d \( -name "__pycache__" -o -name ".pytest_cache" -o -name ".ruff_cache" -o -name ".mypy_cache" -o -name ".import_linter_cache" \) \
+         -o -name ".coverage" -o -name "htmlcov" \) \
+      -exec rm -rf {} +
+    rm -rf .coverage htmlcov build dist
+
 # Run local checks, CRAP ratchet, rebuild the runtime, and smoke-test live MCP behavior.
 verify: check crap-ratchet runtime-verify
 

@@ -164,6 +164,16 @@ def _make_db() -> Iterator[sqlite3.Connection]:
     )
     conn.execute(
         """
+        CREATE TABLE IF NOT EXISTS dialogs (
+            dialog_id   INTEGER PRIMARY KEY,
+            name        TEXT,
+            type        TEXT,
+            members     INTEGER
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS message_forwards (
             dialog_id           INTEGER NOT NULL,
             message_id          INTEGER NOT NULL,

@@ -720,9 +720,10 @@ _GET_SYNC_STATUS_SQL = (
 )
 _COUNT_SYNCED_MESSAGES_SQL = "SELECT COUNT(*) FROM messages WHERE dialog_id = ? AND is_deleted = 0"
 
-# TODO: _COUNT_MESSAGES_BY_DIALOG_SQL scans the full messages table via GROUP BY.
-# For large datasets (millions of messages), consider adding a covering index
-# on messages(dialog_id, is_deleted) or caching counts in synced_dialogs.
+# NOTE: This scans all non-deleted rows once to compute per-dialog message
+# totals for list_dialogs. `messages` is WITHOUT ROWID with primary key
+# `(dialog_id, message_id)`, so add-on dialog/is_deleted indexes should be
+# treated as a performance experiment before any migration.
 _COUNT_MESSAGES_BY_DIALOG_SQL = "SELECT dialog_id, COUNT(*) FROM messages WHERE is_deleted = 0 GROUP BY dialog_id"
 
 _SELECT_DIALOG_ACCESS_META_SQL = (
@@ -751,7 +752,8 @@ _GET_ACCESS_LOST_ALERTS_SQL = (
 _COLLECT_UNREAD_DIALOGS_WITH_COUNTS_SQL = (
     "SELECT sd.dialog_id, sd.read_inbox_max_id, sd.last_event_at, "
     "COALESCE(e.name, CAST(sd.dialog_id AS TEXT)) AS display_name, "
-    "COALESCE(e.type, 'Unknown') AS entity_type, "
+    "COALESCE(e.type, d.type, 'Unknown') AS entity_type, "
+    "d.members AS participants_count, "
     "(SELECT COUNT(*) FROM messages m "
     " WHERE m.dialog_id = sd.dialog_id "
     "   AND m.message_id > sd.read_inbox_max_id "
@@ -760,6 +762,7 @@ _COLLECT_UNREAD_DIALOGS_WITH_COUNTS_SQL = (
     "   AND m.is_service = 0) AS unread_count "
     "FROM synced_dialogs sd "
     "LEFT JOIN entities e ON e.id = sd.dialog_id "
+    "LEFT JOIN dialogs d ON d.dialog_id = sd.dialog_id "
     "WHERE sd.status = 'synced' "
     "AND sd.read_inbox_max_id IS NOT NULL"
 )
@@ -1750,7 +1753,7 @@ class DaemonAPIServer:
         See _list_unread_messages for bootstrap_pending visibility.
         """
         rows = cast(
-            list[tuple[object, object, object, object, object, object]],
+            list[tuple[object, object, object, object, object, object, object]],
             self._conn.execute(_COLLECT_UNREAD_DIALOGS_WITH_COUNTS_SQL).fetchall(),
         )
 
@@ -1758,7 +1761,7 @@ class DaemonAPIServer:
         unread_counts: dict[int, int] = {}
 
         for row in rows:
-            dialog_id, read_max, last_event_at, display_name, entity_type, unread_count = row
+            dialog_id, read_max, last_event_at, display_name, entity_type, participants_count, unread_count = row
             dialog_id_i = int(cast(int | str, dialog_id))
             unread_count_i = int(cast(int | str, unread_count))
             if unread_count_i == 0:
@@ -1768,14 +1771,10 @@ class DaemonAPIServer:
             # mixed-case rows) instead of a bespoke capitalized→category map.
             category = DialogType.parse(str(entity_type))
 
-            # participants_count=None — not stored in sync.db, so group_size_threshold
-            # has no effect here. _should_include_unread_dialog treats None as permissive
-            # for groups (all groups pass regardless of size).
-            # TODO: persist participants_count in entities to enable threshold filtering.
             if not self._should_include_unread_dialog(
                 category,
                 scope,
-                None,
+                cast(int | None, participants_count),
                 group_size_threshold,
             ):
                 continue
