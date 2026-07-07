@@ -179,6 +179,10 @@ def _feedback_list_select_rows(conn: sqlite3.Connection, limit: int, show_all: b
 def _feedback_list_empty_message(conn: sqlite3.Connection, show_all: bool) -> str:
     if show_all:
         return "No feedback recorded yet."
+    return _feedback_list_default_empty_message(conn)
+
+
+def _feedback_list_default_empty_message(conn: sqlite3.Connection) -> str:
     row = cast(tuple[object | None, ...] | None, conn.execute("SELECT COUNT(*) FROM feedback").fetchone())
     total = _row_first_int(row)
     if total == 0:
