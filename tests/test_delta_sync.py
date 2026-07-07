@@ -688,6 +688,62 @@ async def test_probe_still_lost_unchanged(
 
 
 @pytest.mark.asyncio
+async def test_probe_restores_access_creates_missing_dialog_row(
+    sync_db: _SQLiteConnection,
+    mock_client: _MockClient,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """Restored access must create a visible dialogs row when none existed before."""
+    from unittest.mock import AsyncMock
+
+    from helpers import MockTotalList
+    from mcp_telegram.delta_sync import DeltaSyncWorker, _probe_access_lost_dialogs
+
+    dialog_id = 9011
+    sync_db.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, access_lost_at) VALUES (?, 'access_lost', 1000)",
+        (dialog_id,),
+    )
+    sync_db.execute(
+        "INSERT INTO messages (dialog_id, message_id, sent_at, text) VALUES (?, 100, 1000, 'old')",
+        (dialog_id,),
+    )
+    sync_db.commit()
+    mock_client.get_messages = AsyncMock(return_value=MockTotalList([], total=200))
+
+    async def _empty_iter(**kwargs: object):
+        return
+        yield
+
+    mock_client.iter_messages = _empty_iter
+
+    delta_worker = DeltaSyncWorker(
+        cast(_DeltaSyncClient, mock_client),
+        cast(sqlite3.Connection, sync_db),
+        shutdown_event,
+    )
+    restored = await _probe_access_lost_dialogs(
+        cast(_DeltaSyncClient, mock_client),
+        cast(sqlite3.Connection, sync_db),
+        shutdown_event,
+        delta_worker,
+    )
+
+    row = cast(
+        tuple[int, int, int | None] | None,
+        sync_db.execute(
+            "SELECT hidden, needs_refresh, snapshot_at FROM dialogs WHERE dialog_id = ?",
+            (dialog_id,),
+        ).fetchone(),
+    )
+    assert restored == 1
+    assert row is not None
+    assert row[0] == 0
+    assert row[1] == 1
+    assert row[2] is not None
+
+
+@pytest.mark.asyncio
 async def test_probe_loop_runs_immediately_then_shutdown(shutdown_event: asyncio.Event) -> None:
     """Probe loop runs immediately (initial_delay=0) then exits on shutdown."""
     from unittest.mock import AsyncMock, MagicMock, patch
