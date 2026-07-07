@@ -640,19 +640,61 @@ def _compute_snapshot_age_h(max_snapshot_at: int | None) -> int | None:
 # because SQLite LOWER() is ASCII-only — see RESEARCH.md Pitfall 1.
 # `:archived_filter` and `:pinned_filter` are 0 (filter rows where col=0)
 # or None (no filter). See filter_design_contract in 44-01-PLAN.md.
-_LIST_DIALOGS_SQL = (
-    "SELECT d.dialog_id, d.name, d.type, d.archived, d.pinned, "
-    "d.members, d.created, d.last_message_at, d.snapshot_at, "
-    "d.unread_mentions_count, d.unread_reactions_count, d.draft_text, "
-    "sd.status AS sync_status, sd.total_messages, sd.access_lost_at "
-    "FROM dialogs d "
-    "LEFT JOIN synced_dialogs sd USING(dialog_id) "
-    "WHERE d.hidden = 0 "
-    "AND (:archived_filter IS NULL OR d.archived = :archived_filter) "
-    "AND (:pinned_filter IS NULL OR d.pinned = :pinned_filter) "
-    "AND (:name_pat IS NULL OR LOWER(d.name) LIKE :name_pat ESCAPE '\\') "
-    "ORDER BY d.pinned DESC, d.last_message_at DESC"
+_LIST_DIALOGS_SQL = """
+WITH agent_visible_dialogs AS (
+    SELECT
+        d.dialog_id,
+        d.name,
+        d.type,
+        d.archived,
+        d.pinned,
+        d.members,
+        d.created,
+        COALESCE(d.last_message_at, sd.last_event_at, sd.last_synced_at, sd.access_lost_at) AS last_message_at,
+        d.snapshot_at,
+        d.unread_mentions_count,
+        d.unread_reactions_count,
+        d.draft_text,
+        sd.status AS sync_status,
+        sd.total_messages,
+        sd.access_lost_at
+    FROM dialogs d
+    LEFT JOIN synced_dialogs sd USING(dialog_id)
+    WHERE d.hidden = 0 OR sd.status = 'access_lost'
+
+    UNION ALL
+
+    SELECT
+        sd.dialog_id,
+        NULL AS name,
+        NULL AS type,
+        0 AS archived,
+        0 AS pinned,
+        NULL AS members,
+        NULL AS created,
+        COALESCE(sd.last_event_at, sd.last_synced_at, sd.access_lost_at) AS last_message_at,
+        NULL AS snapshot_at,
+        0 AS unread_mentions_count,
+        0 AS unread_reactions_count,
+        NULL AS draft_text,
+        sd.status AS sync_status,
+        sd.total_messages,
+        sd.access_lost_at
+    FROM synced_dialogs sd
+    LEFT JOIN dialogs d USING(dialog_id)
+    WHERE sd.status = 'access_lost' AND d.dialog_id IS NULL
 )
+SELECT
+    dialog_id, name, type, archived, pinned,
+    members, created, last_message_at, snapshot_at,
+    unread_mentions_count, unread_reactions_count, draft_text,
+    sync_status, total_messages, access_lost_at
+FROM agent_visible_dialogs
+WHERE (:archived_filter IS NULL OR archived = :archived_filter)
+AND (:pinned_filter IS NULL OR pinned = :pinned_filter)
+AND (:name_pat IS NULL OR LOWER(name) LIKE :name_pat ESCAPE '\\')
+ORDER BY pinned DESC, last_message_at DESC
+"""
 
 # Contract note (WR-06): results of this query are emitted on `list_dialogs`
 # rows as `unread_in` / `unread_out` ONLY for DMs (type == "User"). Non-DM
@@ -1189,8 +1231,9 @@ class DaemonAPIServer:
             logger.debug("resolve_dialog_entities_cache hit query=%r id=%d", dialog, row[0])
             return _coerce_int(row[0], 0)
 
-        # Step 2.5: dialogs snapshot table — name lookup with hidden=0 guard.
-        # Mirrors entities step 2 structure; uses hidden=0 (same as _LIST_DIALOGS_SQL).
+        # Step 2.5: dialogs snapshot table — name lookup with agent-visible guard.
+        # Hidden dialogs are skipped unless they are access_lost archives; those
+        # remain queryable by name even when Telegram no longer exposes them.
         # Phase 46 D-04: avoids live iter_dialogs() RPC for dialogs already in snapshot.
         #
         # Known limitation: the `dialogs` table has NO `name_normalized` column,
@@ -1215,12 +1258,14 @@ class DaemonAPIServer:
             tuple[object] | None,
             self._conn.execute(
                 """
-                SELECT dialog_id FROM dialogs
-                WHERE hidden = 0
-                  AND (LOWER(name) = LOWER(?)
-                       OR (? != '' AND LOWER(name) LIKE '%' || LOWER(?) || '%'))
+                SELECT d.dialog_id
+                FROM dialogs d
+                LEFT JOIN synced_dialogs sd USING(dialog_id)
+                WHERE (d.hidden = 0 OR sd.status = 'access_lost')
+                  AND (LOWER(d.name) = LOWER(?)
+                       OR (? != '' AND LOWER(d.name) LIKE '%' || LOWER(?) || '%'))
                 ORDER BY
-                  CASE WHEN LOWER(name) = LOWER(?) THEN 0
+                  CASE WHEN LOWER(d.name) = LOWER(?) THEN 0
                        ELSE 1
                   END
                 LIMIT 1

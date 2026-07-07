@@ -1470,6 +1470,64 @@ async def test_list_dialogs_bootstrap_false_when_only_hidden_rows() -> None:
 
 
 @pytest.mark.asyncio
+async def test_list_dialogs_includes_hidden_access_lost_archive() -> None:
+    """Hidden access_lost rows remain agent-visible as read-only archives."""
+    conn = _make_db_with_dialogs()
+    _seed_dialog_row(conn, 42, name="Lost Group", type_="Chat", hidden=1, last_message_at=1700000001)
+    _insert_synced_dialog(
+        conn,
+        42,
+        status="access_lost",
+        total_messages=100,
+        access_lost_at=1700000100,
+    )
+
+    client = _TestClient()
+    client.iter_dialogs = MagicMock(side_effect=AssertionError("SQL path must not call iter_dialogs"))
+    server = make_server(conn, client)
+
+    result = await server._list_dialogs({})
+
+    assert result["ok"] is True
+    by_id = {d["id"]: d for d in result["data"]["dialogs"]}
+    assert by_id[42]["name"] == "Lost Group"
+    assert by_id[42]["sync_status"] == "access_lost"
+    assert by_id[42]["access_lost_at"] == 1700000100
+    cast(MagicMock, client.iter_dialogs).assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_list_dialogs_includes_orphan_access_lost_archive() -> None:
+    """access_lost archives without a dialogs snapshot are still discoverable by id."""
+    conn = _make_db_with_dialogs()
+    _insert_synced_dialog(
+        conn,
+        84,
+        status="access_lost",
+        last_synced_at=1700000000,
+        last_event_at=1700000050,
+        access_lost_at=1700000100,
+    )
+
+    client = _TestClient()
+    client.iter_dialogs = MagicMock(side_effect=AssertionError("SQL path must not call iter_dialogs"))
+    server = make_server(conn, client)
+
+    result = await server._list_dialogs({})
+
+    assert result["ok"] is True
+    dialogs = result["data"]["dialogs"]
+    assert len(dialogs) == 1
+    assert dialogs[0]["id"] == 84
+    assert dialogs[0]["name"] is None
+    assert dialogs[0]["type"] is None
+    assert dialogs[0]["last_message_at"] == 1700000050
+    assert dialogs[0]["sync_status"] == "access_lost"
+    assert dialogs[0]["access_lost_at"] == 1700000100
+    cast(MagicMock, client.iter_dialogs).assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_list_dialogs_diff04_fields_present_in_data() -> None:
     """Test G: per-row unread_mentions_count, unread_reactions_count, draft_text fields."""
     conn = _make_db_with_dialogs()
@@ -5978,6 +6036,24 @@ async def test_resolve_dialog_name_dialogs_snapshot_skips_hidden() -> None:
     # Came from iter_dialogs — proves step 2.5 correctly skipped hidden=1
     assert result == 999
     cast(MagicMock, client.iter_dialogs).assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_resolve_dialog_name_dialogs_snapshot_matches_hidden_access_lost() -> None:
+    """Hidden access_lost archives remain resolvable by cached dialog name."""
+    conn = _make_db_with_dialogs()
+    _seed_dialog_row(conn, 1001, name="Lost Group", type_="supergroup", hidden=1)
+    _insert_synced_dialog(conn, 1001, status="access_lost", access_lost_at=1700000000)
+
+    client = _TestClient()
+    client.get_entity = AsyncMock(side_effect=ValueError(""))
+    client.iter_dialogs = MagicMock(side_effect=AssertionError("cached archive should resolve without Telegram"))
+
+    server = make_server(conn, client)
+    result = await server._resolve_dialog_name("Lost Group")
+
+    assert result == 1001
+    cast(MagicMock, client.iter_dialogs).assert_not_called()
 
 
 @pytest.mark.asyncio
