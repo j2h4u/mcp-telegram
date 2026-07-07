@@ -22,7 +22,7 @@ import pytest
 # MagicMock() never satisfies the isinstance check and the User branch is
 # silently not exercised. Module-level import keeps the spec= reference
 # cheap (no per-test imports).
-from telethon.tl.types import User  # type: ignore[import-untyped]
+from telethon.tl.types import Channel, User  # type: ignore[import-untyped]
 
 from mcp_telegram.daemon_api import DaemonAPIServer, _DaemonClientLike
 
@@ -126,6 +126,17 @@ def _make_user_mock(**kwargs: object) -> MagicMock:
     u.send_paid_messages_stars = None
     u.status = None
     return u
+
+
+def _make_channel_mock(**kwargs: object) -> MagicMock:
+    channel = MagicMock(spec=Channel)
+    channel.id = kwargs.get("id", 777)
+    channel.title = kwargs.get("title", "Personal Lab")
+    channel.username = kwargs.get("username", "personal_lab")
+    channel.megagroup = False
+    channel.broadcast = True
+    channel.forum = False
+    return channel
 
 
 @pytest.mark.asyncio
@@ -353,6 +364,147 @@ async def test_get_entity_info_user_field_surface_preserved() -> None:
     assert d["lang_code"] == "en"
     assert d["personal_channel_id"] == 999
     assert d["ttl_period"] == 86400
+
+
+@pytest.mark.asyncio
+async def test_get_entity_info_user_personal_channel_card_from_full_user_chats() -> None:
+    user = _make_user_mock(id=44)
+    channel = _make_channel_mock(id=777, title="Deep Reality Notes", username="deep_reality")
+    client = AsyncMock()
+    client.get_entity = AsyncMock(return_value=user)
+    long_text = "0123456789" * 12
+    attached_message = MagicMock()
+    attached_message.message = long_text
+    attached_message.date = datetime(2026, 6, 23, 12, 0, tzinfo=UTC)
+    get_messages = AsyncMock(return_value=[attached_message])
+    client.get_messages = get_messages
+    common, full, photos = MagicMock(), MagicMock(), MagicMock()
+    common.chats = []
+    full.full_user = MagicMock(
+        about=None,
+        personal_channel_id=777,
+        personal_channel_message=55,
+        birthday=None,
+        blocked=False,
+        ttl_period=None,
+        private_forward_name=None,
+        bot_info=None,
+        business_location=None,
+        business_intro=None,
+        business_work_hours=None,
+        note=None,
+        folder_id=None,
+    )
+    full.chats = [channel]
+    photos.count = 0
+    photos.photos = []
+    client.side_effect = [common, full, photos]
+    server = make_server(client=client)
+
+    with (
+        patch("mcp_telegram.daemon_api.GetCommonChatsRequest"),
+        patch("mcp_telegram.daemon_api.GetFullUserRequest"),
+        patch("mcp_telegram.daemon_api.GetUserPhotosRequest"),
+    ):
+        r = await server._dispatch({"method": "get_entity_info", "entity_id": 44})
+
+    d = _dict(r["data"])
+    personal_channel = _dict(d["personal_channel"])
+    assert personal_channel == {
+        "channel_id": 777,
+        "dialog_id": -1000000000777,
+        "title": "Deep Reality Notes",
+        "username": "deep_reality",
+        "url": "https://t.me/deep_reality",
+        "metadata_source": "user_full_chats",
+        "attached_message_id": 55,
+        "latest_or_attached_post": {
+            "source": "personal_channel_message",
+            "message_id": 55,
+            "sent_at": 1782216000,
+            "text_preview": long_text[:100],
+            "char_count": len(long_text),
+            "is_truncated": True,
+        },
+    }
+    get_messages.assert_awaited_once_with(channel, ids=[55])
+
+
+@pytest.mark.asyncio
+async def test_get_entity_info_user_personal_channel_falls_back_to_local_latest_post() -> None:
+    conn = _make_db()
+    conn.execute(
+        """CREATE TABLE messages (
+            dialog_id INTEGER,
+            message_id INTEGER,
+            sent_at INTEGER,
+            text TEXT,
+            is_deleted INTEGER DEFAULT 0,
+            is_service INTEGER DEFAULT 0
+        )"""
+    )
+    conn.execute(
+        "INSERT INTO entities (id, type, name, username, updated_at) VALUES (?, 'channel', ?, ?, 1700000000)",
+        (-1000000000777, "Local Channel", "local_channel"),
+    )
+    conn.execute(
+        "INSERT INTO messages (dialog_id, message_id, sent_at, text, is_deleted, is_service) VALUES (?, 10, 100, ?, 0, 0)",
+        (-1000000000777, "older local post"),
+    )
+    conn.execute(
+        "INSERT INTO messages (dialog_id, message_id, sent_at, text, is_deleted, is_service) VALUES (?, 11, 200, ?, 0, 0)",
+        (-1000000000777, "latest local post"),
+    )
+
+    user = _make_user_mock(id=45)
+    client = AsyncMock()
+    client.get_entity = AsyncMock(return_value=user)
+    get_messages = AsyncMock()
+    client.get_messages = get_messages
+    common, full, photos = MagicMock(), MagicMock(), MagicMock()
+    common.chats = []
+    full.full_user = MagicMock(
+        about=None,
+        personal_channel_id=777,
+        personal_channel_message=None,
+        birthday=None,
+        blocked=False,
+        ttl_period=None,
+        private_forward_name=None,
+        bot_info=None,
+        business_location=None,
+        business_intro=None,
+        business_work_hours=None,
+        note=None,
+        folder_id=None,
+    )
+    full.chats = []
+    photos.count = 0
+    photos.photos = []
+    client.side_effect = [common, full, photos]
+    server = make_server(conn=conn, client=client)
+
+    with (
+        patch("mcp_telegram.daemon_api.GetCommonChatsRequest"),
+        patch("mcp_telegram.daemon_api.GetFullUserRequest"),
+        patch("mcp_telegram.daemon_api.GetUserPhotosRequest"),
+    ):
+        r = await server._dispatch({"method": "get_entity_info", "entity_id": 45})
+
+    d = _dict(r["data"])
+    personal_channel = _dict(d["personal_channel"])
+    assert personal_channel["title"] == "Local Channel"
+    assert personal_channel["username"] == "local_channel"
+    assert personal_channel["metadata_source"] == "local_entities"
+    assert personal_channel["latest_or_attached_post"] == {
+        "source": "local_latest_message",
+        "message_id": 11,
+        "sent_at": 200,
+        "text_preview": "latest local post",
+        "char_count": 17,
+        "is_truncated": False,
+    }
+    assert get_messages.await_count == 0
 
 
 @pytest.mark.asyncio

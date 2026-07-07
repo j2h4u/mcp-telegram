@@ -11,6 +11,7 @@ import logging
 import sqlite3
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Protocol, cast, runtime_checkable
 
 from telethon.errors import ChatAdminRequiredError, RPCError  # type: ignore[import-untyped]
@@ -21,6 +22,8 @@ from .models import DialogType
 _ENTITY_DETAIL_TTL_SECONDS = 300
 _ENTITY_DETAIL_SCHEMA_VERSION = 1
 _MEMBERSHIP_THRESHOLD_LARGE = 1000
+_CHANNEL_DIALOG_ID_OFFSET = 1_000_000_000_000
+_PERSONAL_CHANNEL_PREVIEW_CHARS = 100
 
 _ADMIN_RIGHT_FIELDS = (
     "change_info",
@@ -44,6 +47,8 @@ _ADMIN_RIGHT_FIELDS = (
 class _EntityInfoClient(Protocol):
     def get_entity(self, entity_id: int) -> Awaitable[object]: ...
 
+    def get_messages(self, entity: object, ids: list[int]) -> Awaitable[object]: ...
+
     def __call__(self, request: object) -> Awaitable[object]: ...
 
     def iter_participants(self, peer: object, limit: int = 0) -> AsyncIterator[object]: ...
@@ -61,6 +66,7 @@ class _DialogFiltersResult(Protocol):
 
 class _FullUserResult(Protocol):
     full_user: object
+    chats: Sequence[object]
 
 
 class _UserPhotosResult(Protocol):
@@ -122,6 +128,30 @@ def _text_or_none(value: object | None) -> str | None:
         return value
     text = _attr(value, "text", None)
     return text if isinstance(text, str) else None
+
+
+def _sequence_attr(obj: object, name: str) -> Sequence[object]:
+    value = _attr(obj, name, None)
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
+        return value
+    return ()
+
+
+def _positive_int_attr(obj: object, name: str) -> int | None:
+    value = _opt_int_attr(obj, name)
+    if value is None or value <= 0:
+        return None
+    return value
+
+
+def _compact_dict(items: Mapping[str, object | None]) -> dict[str, object]:
+    return {key: value for key, value in items.items() if value is not None}
+
+
+def _timestamp_or_none(value: object | None) -> int | None:
+    if isinstance(value, datetime):
+        return int(value.timestamp())
+    return None
 
 
 def _row_sequence(row: object) -> Sequence[object]:
@@ -375,6 +405,8 @@ class DaemonEntityInfoService:
             "close_friend": bool(_attr(user, "close_friend", False)),
             "send_paid_messages_stars": _attr(user, "send_paid_messages_stars", None),
             "personal_channel_id": profile["personal_channel_id"],
+            "personal_channel": profile["personal_channel"],
+            "personal_channel_unavailable_reason": profile["personal_channel_unavailable_reason"],
             "birthday": profile["birthday"],
             "verified": bool(_attr(user, "verified", False)),
             "premium": bool(_attr(user, "premium", False)),
@@ -439,6 +471,8 @@ class DaemonEntityInfoService:
             "folder_id": None,
             "folder_name": None,
             "birthday": None,
+            "personal_channel": None,
+            "personal_channel_unavailable_reason": None,
             "bot_info": None,
             "business_location": None,
             "business_intro": None,
@@ -453,7 +487,7 @@ class DaemonEntityInfoService:
             )
             user_full = full_result.full_user
             profile["about"] = _opt_str_attr(user_full, "about")
-            profile["personal_channel_id"] = _opt_int_attr(user_full, "personal_channel_id")
+            profile["personal_channel_id"] = _positive_int_attr(user_full, "personal_channel_id")
             profile["blocked"] = _bool_attr(user_full, "blocked")
             profile["ttl_period"] = _opt_int_attr(user_full, "ttl_period")
             profile["private_forward_name"] = _opt_str_attr(user_full, "private_forward_name")
@@ -464,6 +498,12 @@ class DaemonEntityInfoService:
             profile["business_intro"] = self._extract_user_business_intro(user_full)
             profile["business_work_hours"] = self._extract_user_business_work_hours(user_full)
             profile["birthday"] = self._extract_user_birthday(user_full)
+            personal_channel, reason = await self._collect_personal_channel(
+                user_full,
+                _sequence_attr(full_result, "chats"),
+            )
+            profile["personal_channel"] = personal_channel
+            profile["personal_channel_unavailable_reason"] = reason
             profile["full_user_ok"] = True
         except Exception as exc:
             self._deps.logger.warning(
@@ -474,6 +514,223 @@ class DaemonEntityInfoService:
                 exc_info=True,
             )
         return profile
+
+    async def _collect_personal_channel(
+        self,
+        user_full: object,
+        chats: Sequence[object],
+    ) -> tuple[dict[str, object] | None, str | None]:
+        raw_channel_id = _positive_int_attr(user_full, "personal_channel_id")
+        if raw_channel_id is None:
+            return None, None
+
+        dialog_id = self._normalize_channel_dialog_id(raw_channel_id)
+        channel = self._find_personal_channel_chat(
+            chats,
+            raw_channel_id=raw_channel_id,
+            dialog_id=dialog_id,
+        )
+        metadata = self._personal_channel_metadata(channel, dialog_id=dialog_id)
+        metadata_source = "user_full_chats" if channel is not None else "local_entities"
+        if metadata is None:
+            return None, "channel_metadata_unavailable"
+
+        attached_message_id = _positive_int_attr(user_full, "personal_channel_message")
+        preview, preview_reason = await self._collect_personal_channel_post_preview(
+            channel,
+            dialog_id=dialog_id,
+            attached_message_id=attached_message_id,
+        )
+        card = _compact_dict(
+            {
+                "channel_id": raw_channel_id,
+                "dialog_id": dialog_id,
+                "title": metadata.get("title"),
+                "username": metadata.get("username"),
+                "url": self._tme_url(cast(str | None, metadata.get("username"))),
+                "metadata_source": metadata_source,
+                "attached_message_id": attached_message_id,
+                "latest_or_attached_post": preview,
+                "post_preview_unavailable_reason": preview_reason if preview is None else None,
+            }
+        )
+        return card, None
+
+    def _find_personal_channel_chat(
+        self,
+        chats: Sequence[object],
+        *,
+        raw_channel_id: int,
+        dialog_id: int,
+    ) -> object | None:
+        for chat in chats:
+            chat_id = _opt_int_attr(chat, "id")
+            if chat_id in (raw_channel_id, dialog_id):
+                return chat
+            try:
+                if int(self._deps.get_peer_id(chat)) == dialog_id:
+                    return chat
+            except TypeError, ValueError:
+                continue
+        return None
+
+    def _personal_channel_metadata(self, channel: object | None, *, dialog_id: int) -> dict[str, object] | None:
+        if channel is not None:
+            metadata = _compact_dict(
+                {
+                    "title": _opt_str_attr(channel, "title"),
+                    "username": _opt_str_attr(channel, "username"),
+                }
+            )
+            if metadata:
+                return metadata
+
+        row = cast(
+            tuple[object | None, object | None] | None,
+            self._deps.conn.execute("SELECT name, username FROM entities WHERE id = ?", (dialog_id,)).fetchone(),
+        )
+        if row is None:
+            return None
+        metadata = _compact_dict(
+            {
+                "title": row[0] if isinstance(row[0], str) else None,
+                "username": row[1] if isinstance(row[1], str) else None,
+            }
+        )
+        return metadata or None
+
+    async def _collect_personal_channel_post_preview(
+        self,
+        channel: object | None,
+        *,
+        dialog_id: int,
+        attached_message_id: int | None,
+    ) -> tuple[dict[str, object] | None, str | None]:
+        attached_failure: str | None = None
+        if channel is not None and attached_message_id is not None:
+            preview, attached_failure = await self._fetch_attached_personal_channel_post(
+                channel,
+                message_id=attached_message_id,
+            )
+            if preview is not None:
+                return preview, None
+
+        local_preview, local_failure = self._latest_local_personal_channel_post(dialog_id)
+        if local_preview is not None:
+            return local_preview, None
+        return None, attached_failure or local_failure
+
+    async def _fetch_attached_personal_channel_post(
+        self,
+        channel: object,
+        *,
+        message_id: int,
+    ) -> tuple[dict[str, object] | None, str]:
+        try:
+            fetched = await self._deps.client.get_messages(channel, ids=[message_id])
+        except (RPCError, TypeError, AttributeError, ValueError) as exc:
+            self._deps.logger.warning(
+                "entity_info personal_channel_message_failed channel_id=%r message_id=%r error=%s%s",
+                int(self._deps.get_peer_id(channel)),
+                message_id,
+                exc,
+                self._deps.rid(),
+            )
+            return None, "attached_message_fetch_failed"
+
+        message = self._first_message(fetched)
+        if message is None:
+            return None, "attached_message_not_found"
+        preview = self._post_preview_from_text(
+            source="personal_channel_message",
+            message_id=message_id,
+            sent_at=_timestamp_or_none(_attr(message, "date", None)),
+            text=self._message_text(message),
+        )
+        if preview is None:
+            return None, "attached_message_has_no_text"
+        return preview, ""
+
+    @staticmethod
+    def _first_message(fetched: object) -> object | None:
+        if fetched is None:
+            return None
+        if isinstance(fetched, Sequence) and not isinstance(fetched, str | bytes | bytearray):
+            return fetched[0] if fetched else None
+        return fetched
+
+    def _latest_local_personal_channel_post(self, dialog_id: int) -> tuple[dict[str, object] | None, str]:
+        try:
+            row = cast(
+                tuple[object, object, object] | None,
+                self._deps.conn.execute(
+                    """
+                    SELECT message_id, sent_at, text
+                    FROM messages
+                    WHERE dialog_id = ?
+                      AND is_deleted = 0
+                      AND is_service = 0
+                      AND text IS NOT NULL
+                      AND TRIM(text) != ''
+                    ORDER BY sent_at DESC, message_id DESC
+                    LIMIT 1
+                    """,
+                    (dialog_id,),
+                ).fetchone(),
+            )
+        except sqlite3.OperationalError:
+            return None, "local_messages_unavailable"
+
+        if row is None:
+            return None, "no_synced_text_posts"
+        preview = self._post_preview_from_text(
+            source="local_latest_message",
+            message_id=int(cast(int | str, row[0])),
+            sent_at=int(cast(int | str, row[1])),
+            text=row[2] if isinstance(row[2], str) else None,
+        )
+        return (preview, "") if preview is not None else (None, "local_latest_message_has_no_text")
+
+    @staticmethod
+    def _message_text(message: object) -> str | None:
+        return _opt_str_attr(message, "message") or _opt_str_attr(message, "text")
+
+    @staticmethod
+    def _post_preview_from_text(
+        *,
+        source: str,
+        message_id: int,
+        sent_at: int | None,
+        text: str | None,
+    ) -> dict[str, object] | None:
+        if text is None:
+            return None
+        stripped = text.strip()
+        if not stripped:
+            return None
+        preview = stripped[:_PERSONAL_CHANNEL_PREVIEW_CHARS]
+        return _compact_dict(
+            {
+                "source": source,
+                "message_id": message_id,
+                "sent_at": sent_at,
+                "text_preview": preview,
+                "char_count": len(stripped),
+                "is_truncated": len(stripped) > _PERSONAL_CHANNEL_PREVIEW_CHARS,
+            }
+        )
+
+    @staticmethod
+    def _normalize_channel_dialog_id(raw_channel_id: int) -> int:
+        if raw_channel_id > 0:
+            return -_CHANNEL_DIALOG_ID_OFFSET - raw_channel_id
+        return raw_channel_id
+
+    @staticmethod
+    def _tme_url(username: str | None) -> str | None:
+        if not username:
+            return None
+        return f"https://t.me/{username}"
 
     def _extract_user_note(self, user_full: object) -> str | None:
         return _text_or_none(_attr(user_full, "note", None))

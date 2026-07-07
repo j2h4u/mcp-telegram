@@ -238,7 +238,21 @@ def _entity_warnings(data: dict) -> list[StructuredWarning]:
                 severity="warning",
             )
         )
+    warnings.extend(_personal_channel_warnings(data))
     return warnings
+
+
+def _personal_channel_warnings(data: dict) -> list[StructuredWarning]:
+    personal_channel_reason = data.get("personal_channel_unavailable_reason")
+    if not personal_channel_reason:
+        return []
+    return [
+        structured_warning(
+            "personal_channel_enrichment_unavailable",
+            f"Personal channel metadata unavailable: {personal_channel_reason}",
+            severity="info",
+        )
+    ]
 
 
 def _content_fields(data: dict) -> list[dict[str, object]]:
@@ -274,6 +288,7 @@ def _content_fields(data: dict) -> list[dict[str, object]]:
     maybe_fields.append(
         _content_field("type_specific.business.location.address", business_location.get("address"), "business_location")
     )
+    maybe_fields.extend(_personal_channel_content_fields(data))
     for idx, restriction in enumerate(data.get("restriction_reason") or data.get("restrictions") or []):
         maybe_fields.append(
             _content_field(
@@ -283,6 +298,37 @@ def _content_fields(data: dict) -> list[dict[str, object]]:
             )
         )
     return [field for field in maybe_fields if field is not None]
+
+
+def _personal_channel_content_fields(data: dict) -> list[dict[str, object]]:
+    personal_channel = data.get("personal_channel")
+    if not isinstance(personal_channel, dict):
+        return []
+    personal_channel_post = personal_channel.get("latest_or_attached_post")
+    if not isinstance(personal_channel_post, dict):
+        return []
+    text_preview = personal_channel_post.get("text_preview")
+    if not isinstance(text_preview, str):
+        return []
+    field = _content_field(
+        "type_specific.personal_channel.latest_or_attached_post.text_preview",
+        text_preview,
+        "message_text",
+    )
+    return [] if field is None else [field]
+
+
+def _personal_channel_structured(data: object) -> dict[str, object] | None:
+    if not isinstance(data, dict):
+        return None
+    return {key: value for key, value in data.items() if value is not None}
+
+
+def _personal_channel_type_specific(data: dict) -> dict[str, object]:
+    personal_channel = _personal_channel_structured(data.get("personal_channel"))
+    if personal_channel is None:
+        return {}
+    return {"personal_channel": personal_channel}
 
 
 def _bot_info_structured(bot_info: dict | None) -> dict[str, object] | None:
@@ -354,7 +400,7 @@ def _business_structured(data: dict) -> dict[str, object]:
 
 def _user_or_bot_structured(data: dict) -> dict[str, object]:
     phone = data.get("phone")
-    return {
+    payload: dict[str, object] = {
         "kind": data.get("type"),
         "identity": {
             "first_name": data.get("first_name"),
@@ -408,6 +454,8 @@ def _user_or_bot_structured(data: dict) -> dict[str, object]:
         "note": data.get("note"),
         "note_content": _content_field("type_specific.note", data.get("note"), "note"),
     }
+    payload.update(_personal_channel_type_specific(data))
+    return payload
 
 
 def _contacts_subscribed_structured(data: dict) -> dict[str, object]:
@@ -614,7 +662,8 @@ class GetEntityInfo(ToolArgs):
       - user / bot:    id, name, usernames, bio, phone (with country),
                        language, online status, relationship
                        (contact/blocked), status flags (verified, premium,
-                       bot, scam, fake), emoji status, personal channel,
+                       bot, scam, fake), emoji status, personal channel
+                       card (title/username/url/preview when available),
                        birthday, folder, business info, common chats,
                        profile-photo history.
       - channel:       subscribers_count, linked_chat_id, pinned_msg_id,
