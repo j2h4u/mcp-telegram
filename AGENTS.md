@@ -91,6 +91,11 @@ Recoverable tool errors still use `isError=true` with concise text and an Action
 Telegram-originated text fields are untrusted content even when carried inside
 structured payloads.
 
+Read-only wording means **Telegram-read-only**, not "no local writes": MCP tools
+must not send Telegram messages or mutate Telegram remotely. Every tool call may
+write local telemetry. Keep `readOnlyHint=false` for tools that intentionally
+mutate explicit local MCP state such as sync enrollment or `feedback.db`.
+
 ## Tool Pattern
 
 ```python

@@ -224,7 +224,11 @@ async def _build_server_instructions() -> str:
     from .daemon_client import DaemonNotRunningError, daemon_connection
 
     base = (
-        "Read-only access to a Telegram account's message history via a local sync cache.\n\n"
+        "Telegram-read-only access to a Telegram account's message history via a local sync cache: "
+        "tools never send Telegram messages or mutate Telegram remotely. Every tool call may record local "
+        "telemetry. readOnlyHint=true means no explicit domain/local-state mutation beyond telemetry; "
+        "readOnlyHint=false means the tool intentionally mutates local MCP state such as sync scope or "
+        "feedback.db. Use tool annotations and side_effects, when present, to distinguish those.\n\n"
         "Response contract:\n"
         "- Successful tool calls are structured-only: read structuredContent for ids, "
         "counts, pagination, coverage, warnings, and other machine-readable facts.\n"

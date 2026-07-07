@@ -239,6 +239,36 @@ def test_feedback_list_all_shows_done(feedback_db: Path) -> None:
     assert "[done]" in result.stdout
 
 
+def test_feedback_list_default_hides_automated_smoke_rows(feedback_db: Path) -> None:
+    _insert(
+        feedback_db,
+        "Automated MCP smoke test -- please ignore",
+        context="smoke-integration.json automated test",
+        harness="devtools.mcp_client.cli",
+    )
+
+    result = runner.invoke(app, ["feedback", "list"])
+
+    assert result.exit_code == 0, result.stdout
+    assert "Automated MCP smoke test" not in result.stdout
+    assert "operator-actionable feedback" in result.stdout
+    assert "--all" in result.stdout
+
+
+def test_feedback_list_all_shows_automated_smoke_rows(feedback_db: Path) -> None:
+    _insert(
+        feedback_db,
+        "Automated MCP smoke test -- please ignore",
+        context="smoke-integration.json automated test",
+        harness="devtools.mcp_client.cli",
+    )
+
+    result = runner.invoke(app, ["feedback", "list", "--all"])
+
+    assert result.exit_code == 0, result.stdout
+    assert "Automated MCP smoke test" in result.stdout
+
+
 def test_feedback_list_shows_status_column(feedback_db: Path) -> None:
     _insert(feedback_db, "open bug")
     result = runner.invoke(app, ["feedback", "list"])

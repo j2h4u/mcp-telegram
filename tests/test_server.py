@@ -782,6 +782,28 @@ async def test_server_instructions_describe_structured_only_response_contract(
 
 
 @pytest.mark.asyncio
+async def test_server_instructions_clarify_read_only_scope(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Conn:
+        async def get_me(self) -> dict:
+            return {"ok": False}
+
+    @asynccontextmanager
+    async def _conn_cm():
+        yield _Conn()
+
+    monkeypatch.setattr("mcp_telegram.daemon_client.daemon_connection", _conn_cm)
+
+    instructions = await server._build_server_instructions()
+    normalized = instructions.lower()
+
+    assert "telegram-read-only" in normalized
+    assert "never send telegram messages" in normalized
+    assert "readOnlyHint=true means no explicit domain/local-state mutation beyond telemetry" in instructions
+    assert "local mcp state" in normalized
+    assert "feedback.db" in instructions
+
+
+@pytest.mark.asyncio
 async def test_server_instructions_describe_identity_model(monkeypatch: pytest.MonkeyPatch) -> None:
     class _Conn:
         async def get_me(self) -> dict:

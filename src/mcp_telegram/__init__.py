@@ -156,6 +156,11 @@ def serve(
 feedback_app = Typer(help="Inspect and manage agent feedback queue.")
 app.add_typer(feedback_app, name="feedback")
 
+_SMOKE_FEEDBACK_CONTEXT = "smoke-integration.json automated test"
+_SMOKE_FEEDBACK_HARNESS = "devtools.mcp_client.cli"
+_OPERATOR_FEEDBACK_SQL = "(context IS NULL OR context != ? OR harness IS NULL OR harness != ?)"
+_SMOKE_FEEDBACK_SQL = "context = ? AND harness = ?"
+
 
 def _feedback_list_select_rows(conn: sqlite3.Connection, limit: int, show_all: bool) -> list[tuple]:
     base_select = (
@@ -166,8 +171,8 @@ def _feedback_list_select_rows(conn: sqlite3.Connection, limit: int, show_all: b
     if show_all:
         return conn.execute(base_select + order_limit, (limit,)).fetchall()
     return conn.execute(
-        base_select + " WHERE status IN ('open','in_progress')" + order_limit,
-        (limit,),
+        base_select + " WHERE status IN ('open','in_progress')" + f" AND {_OPERATOR_FEEDBACK_SQL}" + order_limit,
+        (_SMOKE_FEEDBACK_CONTEXT, _SMOKE_FEEDBACK_HARNESS, limit),
     ).fetchall()
 
 
@@ -178,6 +183,24 @@ def _feedback_list_empty_message(conn: sqlite3.Connection, show_all: bool) -> st
     total = _row_first_int(row)
     if total == 0:
         return "No feedback recorded yet."
+    visible_open_row = cast(
+        tuple[object | None, ...] | None,
+        conn.execute(
+            f"SELECT COUNT(*) FROM feedback WHERE status IN ('open','in_progress') AND {_OPERATOR_FEEDBACK_SQL}",
+            (_SMOKE_FEEDBACK_CONTEXT, _SMOKE_FEEDBACK_HARNESS),
+        ).fetchone(),
+    )
+    if _row_first_int(visible_open_row) > 0:
+        return "No feedback shown. Increase --limit to display open feedback."
+    smoke_open_row = cast(
+        tuple[object | None, ...] | None,
+        conn.execute(
+            f"SELECT COUNT(*) FROM feedback WHERE status IN ('open','in_progress') AND {_SMOKE_FEEDBACK_SQL}",
+            (_SMOKE_FEEDBACK_CONTEXT, _SMOKE_FEEDBACK_HARNESS),
+        ).fetchone(),
+    )
+    if _row_first_int(smoke_open_row) > 0:
+        return "No operator-actionable feedback. Use --all to show automated smoke entries and history."
     return "No open or in-progress feedback. Use --all to show history."
 
 

@@ -25,6 +25,12 @@ coverage without taking over the Telegram client session.
 - Lets agents submit tool feedback into a local operator queue.
 - Does not provide a tool for sending Telegram messages.
 
+The server is **Telegram-read-only**, not immutable: it never sends Telegram
+messages or mutates Telegram remotely. Every tool call may write local telemetry.
+`readOnlyHint=true` means no explicit domain/local-state mutation beyond that;
+`readOnlyHint=false` marks tools that intentionally write local MCP state such as
+sync scope or `feedback.db`.
+
 ## Runtime Model
 
 The container runs a long-lived sync daemon that owns the Telegram MTProto
@@ -217,8 +223,8 @@ http://127.0.0.1:3100/mcp
 ```
 
 The server instructions returned during MCP initialization include the connected
-Telegram account ID and remind agents to treat Telegram-originated fields as
-untrusted content.
+Telegram account ID, clarify Telegram-read-only vs local MCP state writes, and
+remind agents to treat Telegram-originated fields as untrusted content.
 
 ## Operator Commands
 

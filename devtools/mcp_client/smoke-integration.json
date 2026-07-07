@@ -202,12 +202,12 @@
       }
     },
     {
-      "_comment": "submit_feedback — live round-trip into feedback.db",
+      "_comment": "submit_feedback — live round-trip into feedback.db; hidden from default operator queue by context/harness marker",
       "action": "call_tool",
       "name": "submit_feedback",
       "arguments": {
-        "message": "Phase 48 integration smoke — please ignore",
-        "severity": "bug",
+        "message": "Automated MCP smoke test — please ignore",
+        "severity": "question",
         "context": "smoke-integration.json automated test",
         "model": "claude-opus-4-7",
         "harness": "devtools.mcp_client.cli"
