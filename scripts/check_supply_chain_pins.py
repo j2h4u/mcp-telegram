@@ -1,12 +1,15 @@
 import re
 from pathlib import Path
 
-FLOATING_ACTION_REFS = {"main", "master", "trunk", "HEAD"}
-FLOATING_IMAGE_TAGS = {"latest", "stable", "edge", "main", "master"}
-WORKFLOW_USES_PATTERN = re.compile(r"^\s*uses:\s*([^@\s]+)@([^\s#]+)", re.MULTILINE)
-FROM_PATTERN = re.compile(r"^\s*FROM\s+(?:--platform=[^\s]+\s+)?(?P<image>[^\s]+)", re.MULTILINE)
+FULL_COMMIT_SHA_PATTERN = re.compile(r"[0-9a-f]{40}", re.IGNORECASE)
+WORKFLOW_USES_PATTERN = re.compile(r"^\s*(?:-\s*)?uses:\s*[\"']?(?P<uses>[^\"'\s#]+)", re.MULTILINE)
+FROM_PATTERN = re.compile(
+    r"^\s*FROM\s+(?:--platform=[^\s]+\s+)?(?P<image>[^\s]+)(?:\s+AS\s+(?P<alias>[^\s]+))?",
+    re.IGNORECASE | re.MULTILINE,
+)
 COPY_FROM_PATTERN = re.compile(r"^\s*COPY\s+--from=(?P<image>[^\s]+)", re.MULTILINE)
 IMAGE_PATTERN = re.compile(r"^\s*image:\s*(?P<image>[^\s#]+)", re.MULTILINE)
+RESERVED_IMAGES = {"scratch"}
 
 
 def _workflow_files(root: Path) -> list[Path]:
@@ -21,9 +24,19 @@ def _check_action_refs(root: Path) -> list[str]:
     for path in _workflow_files(root):
         text = path.read_text(encoding="utf-8")
         for match in WORKFLOW_USES_PATTERN.finditer(text):
-            action, ref = match.groups()
-            if ref in FLOATING_ACTION_REFS or re.fullmatch(r"v?\d+", ref) or re.fullmatch(r"v?\d+\.\d+", ref):
-                errors.append(f"{path.relative_to(root)} uses {action}@{ref}; pin actions to a full version or SHA")
+            uses = match.group("uses")
+            source = str(path.relative_to(root))
+            if uses.startswith("./"):
+                continue
+            if uses.startswith("docker://"):
+                errors.extend(_check_image_ref(uses, source))
+                continue
+            if "@" not in uses:
+                errors.append(f"{source} uses {uses}; pin actions to a full commit SHA")
+                continue
+            action, ref = uses.rsplit("@", maxsplit=1)
+            if FULL_COMMIT_SHA_PATTERN.fullmatch(ref) is None:
+                errors.append(f"{source} uses {action}@{ref}; pin actions to a full commit SHA")
     return errors
 
 
@@ -31,23 +44,20 @@ def _is_local_image(image: str) -> bool:
     return "/" not in image and image.endswith(":local")
 
 
-def _split_image_ref(image: str) -> tuple[str, str | None]:
-    if "@sha256:" in image:
-        return image, "sha256"
-    last_part = image.rsplit("/", maxsplit=1)[-1]
-    if ":" not in last_part:
-        return image, None
-    return image, last_part.rsplit(":", maxsplit=1)[1]
+def _copy_stage_aliases(text: str) -> set[str]:
+    return {alias for match in FROM_PATTERN.finditer(text) if (alias := match.group("alias")) is not None}
+
+
+def _is_copy_stage_alias(image: str, stage_aliases: set[str]) -> bool:
+    return image in stage_aliases or image.isdecimal()
 
 
 def _check_image_ref(image: str, source: str) -> list[str]:
-    if _is_local_image(image):
+    checked_image = image.removeprefix("docker://")
+    if checked_image in RESERVED_IMAGES or _is_local_image(checked_image):
         return []
-    _, tag = _split_image_ref(image)
-    if tag is None:
-        return [f"{source} uses {image}; pin container images to an explicit tag or digest"]
-    if tag in FLOATING_IMAGE_TAGS:
-        return [f"{source} uses {image}; floating image tags are not allowed"]
+    if "@sha256:" not in checked_image:
+        return [f"{source} uses {image}; pin container images to an immutable sha256 digest"]
     return []
 
 
@@ -66,11 +76,12 @@ def _check_container_refs(root: Path) -> list[str]:
     for dockerfile in _dockerfiles(root):
         text = dockerfile.read_text(encoding="utf-8")
         source = str(dockerfile.relative_to(root))
+        stage_aliases = _copy_stage_aliases(text)
         for match in FROM_PATTERN.finditer(text):
             errors.extend(_check_image_ref(match.group("image"), source))
         for match in COPY_FROM_PATTERN.finditer(text):
             image = match.group("image")
-            if image.isidentifier():
+            if _is_copy_stage_alias(image, stage_aliases):
                 continue
             errors.extend(_check_image_ref(image, source))
 
