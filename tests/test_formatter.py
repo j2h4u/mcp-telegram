@@ -688,3 +688,500 @@ def test_structured_read_markers_match_formatter_marker_positions() -> None:
     }
 
     assert actual == expected
+
+
+# ---------------------------------------------------------------------------
+# build_search_hit_window тесты — контекст поискового попадания
+# ---------------------------------------------------------------------------
+
+
+def test_build_search_hit_window_full_context() -> None:
+    """Попадание с полным контекстом: все сообщения до и после присутствуют."""
+    from mcp_telegram.formatter import build_search_hit_window
+
+    dt = datetime(2024, 6, 15, 12, 0, 0, tzinfo=UTC)
+    context: dict[int, ReadMessage] = {}
+    for i in range(4, 9):
+        dt_i = datetime(2024, 6, 15, 12, i, 0, tzinfo=UTC)
+        context[i] = _make_msg(i, dt_i, text=f"msg {i}", first_name="Alice")
+    for i in range(3, 0, -1):
+        dt_i = datetime(2024, 6, 15, 12, i, 0, tzinfo=UTC)
+        context[i] = _make_msg(i, dt_i, text=f"msg {i}", first_name="Alice")
+
+    hit = context[4]  # сообщение 4 — попадание
+    window = build_search_hit_window(
+        hit,
+        context_messages_by_id=context,
+        context_radius=3,
+    )
+    assert len(window) == 7
+    ids = {m.id for m in window}
+    assert ids == {1, 2, 3, 4, 5, 6, 7}
+    assert 4 in ids  # попадание в окне
+    assert all(m.id in context for m in window)
+
+
+def test_build_search_hit_window_sparse_context() -> None:
+    """Разреженный контекст: только некоторые сообщения вокруг попадания присутствуют."""
+    from mcp_telegram.formatter import build_search_hit_window
+
+    dt = datetime(2024, 6, 15, 12, 5, 0, tzinfo=UTC)
+    context: dict[int, ReadMessage] = {
+        10: _make_msg(10, dt, text="hit", first_name="Alice"),
+        8: _make_msg(8, dt, text="before", first_name="Alice"),
+        12: _make_msg(12, dt, text="after", first_name="Alice"),
+    }
+    hit = context[10]
+    window = build_search_hit_window(
+        hit,
+        context_messages_by_id=context,
+        context_radius=3,
+    )
+    ids = {m.id for m in window}
+    assert 10 in ids
+    assert 8 in ids
+    assert 12 in ids
+    assert len(window) == 3
+
+
+def test_build_search_hit_window_border_context() -> None:
+    """Попадание на границе: нет сообщений до (самое старое сообщение в контексте)."""
+    from mcp_telegram.formatter import build_search_hit_window
+
+    dt = datetime(2024, 6, 15, 12, 0, 0, tzinfo=UTC)
+    context: dict[int, ReadMessage] = {
+        1: _make_msg(1, dt, text="hit", first_name="Alice"),
+        2: _make_msg(2, dt, text="after1", first_name="Alice"),
+        3: _make_msg(3, dt, text="after2", first_name="Alice"),
+        4: _make_msg(4, dt, text="after3", first_name="Alice"),
+    }
+    hit = context[1]
+    window = build_search_hit_window(
+        hit,
+        context_messages_by_id=context,
+        context_radius=3,
+    )
+    ids = {m.id for m in window}
+    assert 1 in ids
+    assert len(window) == 4  # только попадание + 3 после
+    assert all(m.id >= 1 for m in window)
+
+
+def test_build_search_hit_window_zero_radius() -> None:
+    """Нулевой радиус контекста: только само попадание."""
+    from mcp_telegram.formatter import build_search_hit_window
+
+    dt = datetime(2024, 6, 15, 12, 0, 0, tzinfo=UTC)
+    context: dict[int, ReadMessage] = {
+        1: _make_msg(1, dt, text="before", first_name="Alice"),
+        5: _make_msg(5, dt, text="hit", first_name="Alice"),
+        9: _make_msg(9, dt, text="after", first_name="Alice"),
+    }
+    hit = context[5]
+    window = build_search_hit_window(
+        hit,
+        context_messages_by_id=context,
+        context_radius=0,
+    )
+    assert len(window) == 1
+    assert window[0].id == 5
+
+
+def test_build_search_hit_window_no_context() -> None:
+    """Попадание с полностью отсутствующим контекстом: только само попадание."""
+    from mcp_telegram.formatter import build_search_hit_window
+
+    dt = datetime(2024, 6, 15, 12, 0, 0, tzinfo=UTC)
+    hit = _make_msg(99, dt, text="lone hit", first_name="Alice")
+    context: dict[int, ReadMessage] = {99: hit}
+    window = build_search_hit_window(
+        hit,
+        context_messages_by_id=context,
+        context_radius=5,
+    )
+    assert len(window) == 1
+    assert window[0].id == 99
+
+
+def test_build_search_hit_window_highest_id_border() -> None:
+    """Попадание — самое новое сообщение: сообщения «после» отсутствуют."""
+    from mcp_telegram.formatter import build_search_hit_window
+
+    dt = datetime(2024, 6, 15, 12, 0, 0, tzinfo=UTC)
+    context: dict[int, ReadMessage] = {
+        95: _make_msg(95, dt, text="before2", first_name="Alice"),
+        96: _make_msg(96, dt, text="before1", first_name="Alice"),
+        100: _make_msg(100, dt, text="hit", first_name="Alice"),
+    }
+    hit = context[100]
+    window = build_search_hit_window(
+        hit,
+        context_messages_by_id=context,
+        context_radius=5,
+    )
+    assert window[0].id == 100
+    after_hit = [m.id for m in window if m.id > 100]
+    assert len(after_hit) == 0
+
+
+# ---------------------------------------------------------------------------
+# format_search_message_groups тесты — группировка поиска по нескольким попаданиям
+# ---------------------------------------------------------------------------
+
+
+def test_format_search_message_groups_empty() -> None:
+    """Пустой список попаданий возвращает пустую строку."""
+    from mcp_telegram.formatter import format_search_message_groups
+
+    result = format_search_message_groups([], context_messages_by_id={})
+    assert result == ""
+
+
+def test_format_search_message_groups_single_hit() -> None:
+    """Одно попадание с контекстом: содержит hit 1/1 и [HIT]."""
+    from mcp_telegram.formatter import format_search_message_groups
+
+    dt = datetime(2024, 6, 15, 12, 0, 0, tzinfo=UTC)
+    messages: dict[int, ReadMessage] = {
+        5: _make_msg(5, dt, text="hello search", first_name="Alice"),
+        4: _make_msg(4, dt, text="before", first_name="Alice"),
+        6: _make_msg(6, dt, text="after", first_name="Alice"),
+    }
+    hits = [messages[5]]
+    result = format_search_message_groups(
+        hits,
+        context_messages_by_id=messages,
+        context_radius=1,
+    )
+    assert "--- hit 1/1 ---" in result
+    assert "[HIT]" in result
+
+
+def test_format_search_message_groups_multiple_hits() -> None:
+    """Два попадания: содержит hit 1/2 и hit 2/2."""
+    from mcp_telegram.formatter import format_search_message_groups
+
+    dt = datetime(2024, 6, 15, 12, 0, 0, tzinfo=UTC)
+    messages: dict[int, ReadMessage] = {
+        10: _make_msg(10, dt, text="first hit", first_name="Alice"),
+        20: _make_msg(20, dt, text="second hit", first_name="Bob"),
+    }
+    hits = [messages[10], messages[20]]
+    result = format_search_message_groups(
+        hits,
+        context_messages_by_id=messages,
+        context_radius=0,
+    )
+    assert "--- hit 1/2 ---" in result
+    assert "--- hit 2/2 ---" in result
+
+
+def test_format_search_message_groups_hit_marker_only_on_hit() -> None:
+    """Маркер [HIT] присутствует только на строке с совпадением."""
+    from mcp_telegram.formatter import format_search_message_groups
+
+    dt = datetime(2024, 6, 15, 12, 0, 0, tzinfo=UTC)
+    messages: dict[int, ReadMessage] = {
+        5: _make_msg(5, dt, text="hit text", first_name="Alice"),
+        4: _make_msg(4, dt, text="nearby", first_name="Alice"),
+        6: _make_msg(6, dt, text="nearby", first_name="Alice"),
+    }
+    hits = [messages[5]]
+    result = format_search_message_groups(
+        hits,
+        context_messages_by_id=messages,
+        context_radius=1,
+    )
+    lines = result.splitlines()
+    hit_lines = [line for line in lines if line.startswith("[HIT]")]
+    assert len(hit_lines) == 1
+    assert "hit text" in result
+    assert "nearby" in result
+
+
+# ---------------------------------------------------------------------------
+# _describe_media тесты — типы медиа
+# ---------------------------------------------------------------------------
+
+
+def test_describe_media_poll_with_question() -> None:
+    """Опрос с текстом вопроса: '[опрос: «Вопрос?»]'."""
+    import telethon.tl.types as tl
+
+    from mcp_telegram.formatter import _describe_media
+
+    question = tl.TextWithEntities(text="Когда встреча?", entities=[])
+    poll = tl.Poll(id=1, question=question, answers=[], hash=0)
+    results = tl.PollResults()
+    media = tl.MessageMediaPoll(poll=poll, results=results)
+    result = _describe_media(media)
+    assert "опрос" in result
+    assert "Когда встреча?" in result
+
+
+def test_describe_media_poll_without_question() -> None:
+    """Опрос без текста вопроса: '[опрос]'."""
+    import telethon.tl.types as tl
+
+    from mcp_telegram.formatter import _describe_media
+
+    poll = tl.Poll(id=1, question=None, answers=[], hash=0)
+    results = tl.PollResults()
+    media = tl.MessageMediaPoll(poll=poll, results=results)
+    result = _describe_media(media)
+    assert result == "[опрос]"
+
+
+def test_describe_media_geo_with_coordinates() -> None:
+    """Геолокация с координатами: '[геолокация: 55.7558, 37.6173]'."""
+    import telethon.tl.types as tl
+
+    from mcp_telegram.formatter import _describe_media
+
+    geo = tl.GeoPoint(lat=55.7558, long=37.6173, access_hash=0)
+    media = tl.MessageMediaGeo(geo=geo)
+    result = _describe_media(media)
+    assert "геолокация" in result
+    assert "55.7558" in result
+    assert "37.6173" in result
+
+
+def test_describe_media_geo_without_coordinates() -> None:
+    """Геолокация без координат: '[геолокация]'."""
+    import telethon.tl.types as tl
+
+    from mcp_telegram.formatter import _describe_media
+
+    geo = tl.GeoPoint(lat=None, long=None, access_hash=0)
+    media = tl.MessageMediaGeo(geo=geo)
+    result = _describe_media(media)
+    assert result == "[геолокация]"
+
+
+def test_describe_media_contact_full() -> None:
+    """Контакт с полной информацией: '[контакт: Иван Петров, +79991234567]'."""
+    import telethon.tl.types as tl
+
+    from mcp_telegram.formatter import _describe_media
+
+    media = tl.MessageMediaContact(
+        phone_number="+79991234567",
+        first_name="Иван",
+        last_name="Петров",
+        vcard="",
+        user_id=0,
+    )
+    result = _describe_media(media)
+    assert "контакт" in result
+    assert "Иван Петров" in result
+    assert "+79991234567" in result
+
+
+def test_describe_media_contact_name_only() -> None:
+    """Контакт только с именем: '[контакт: Иван]'."""
+    import telethon.tl.types as tl
+
+    from mcp_telegram.formatter import _describe_media
+
+    media = tl.MessageMediaContact(phone_number="", first_name="Иван", last_name="", vcard="", user_id=0)
+    result = _describe_media(media)
+    assert "контакт" in result
+    assert "Иван" in result
+
+
+def test_describe_media_contact_no_info() -> None:
+    """Контакт без информации: '[контакт]'."""
+    import telethon.tl.types as tl
+
+    from mcp_telegram.formatter import _describe_media
+
+    media = tl.MessageMediaContact(phone_number="", first_name="", last_name="", vcard="", user_id=0)
+    result = _describe_media(media)
+    assert result == "[контакт]"
+
+
+def test_describe_media_dice_with_value() -> None:
+    """Кубик с значением: '[🎲 5]'."""
+    import telethon.tl.types as tl
+
+    from mcp_telegram.formatter import _describe_media
+
+    media = tl.MessageMediaDice(value=5, emoticon="🎲")
+    result = _describe_media(media)
+    assert "[🎲 5]" in result
+
+
+def test_describe_media_dice_without_value() -> None:
+    """Кубик со значением 0: '[🎲 0]'."""
+    import telethon.tl.types as tl
+
+    from mcp_telegram.formatter import _describe_media
+
+    media = tl.MessageMediaDice(value=0, emoticon="🎲")
+    result = _describe_media(media)
+    assert result == "[🎲 0]"
+
+
+def test_describe_media_game_with_title() -> None:
+    """Игра с названием: '[игра: Chess]'."""
+    import telethon.tl.types as tl
+
+    from mcp_telegram.formatter import _describe_media
+
+    game = tl.Game(
+        id=1,
+        access_hash=0,
+        short_name="chess",
+        title="Chess",
+        description="",
+        photo=tl.PhotoEmpty(id=0),
+    )
+    media = tl.MessageMediaGame(game=game)
+    result = _describe_media(media)
+    assert "игра" in result
+    assert "Chess" in result
+
+
+def test_describe_media_game_without_title() -> None:
+    """Игра без названия: '[игра]'."""
+    import telethon.tl.types as tl
+
+    from mcp_telegram.formatter import _describe_media
+
+    game = SimpleNamespace(title=None)
+    media = tl.MessageMediaGame(game=game)
+    result = _describe_media(media)
+    assert result == "[игра]"
+
+
+def test_describe_media_invoice_with_title() -> None:
+    """Счёт с названием: '[счёт: Подписка]'."""
+    import telethon.tl.types as tl
+
+    from mcp_telegram.formatter import _describe_media
+
+    media = tl.MessageMediaInvoice(
+        title="Подписка",
+        description="",
+        currency="RUB",
+        total_amount=100,
+        start_param="",
+    )
+    result = _describe_media(media)
+    assert "счёт" in result
+    assert "Подписка" in result
+
+
+def test_describe_media_invoice_without_title() -> None:
+    """Счёт без названия: '[счёт]'."""
+    import telethon.tl.types as tl
+
+    from mcp_telegram.formatter import _describe_media
+
+    media = tl.MessageMediaInvoice(
+        title="",
+        description="",
+        currency="RUB",
+        total_amount=100,
+        start_param="",
+    )
+    result = _describe_media(media)
+    assert result == "[счёт]"
+
+
+def test_describe_media_venue_with_title_and_address() -> None:
+    """Место с названием и адресом: '[место: Название, Адрес]'."""
+    import telethon.tl.types as tl
+
+    from mcp_telegram.formatter import _describe_media
+
+    geo = tl.GeoPoint(lat=55.75, long=37.61, access_hash=0)
+    media = tl.MessageMediaVenue(
+        geo=geo,
+        title="Кафе",
+        address="ул. Тверская, 1",
+        provider="",
+        venue_id="",
+        venue_type="",
+    )
+    result = _describe_media(media)
+    assert "место" in result
+    assert "Кафе" in result
+    assert "Тверская" in result
+
+
+def test_describe_media_venue_without_info() -> None:
+    """Место без информации: '[место]'."""
+    import telethon.tl.types as tl
+
+    from mcp_telegram.formatter import _describe_media
+
+    geo = tl.GeoPoint(lat=55.75, long=37.61, access_hash=0)
+    media = tl.MessageMediaVenue(geo=geo, title="", address="", provider="", venue_id="", venue_type="")
+    result = _describe_media(media)
+    assert result == "[место]"
+
+
+def test_describe_media_web_page_with_url() -> None:
+    """Веб-страница с URL: '[ссылка: https://example.com]'."""
+    import telethon.tl.types as tl
+
+    from mcp_telegram.formatter import _describe_media
+
+    webpage = tl.WebPage(
+        id=1,
+        url="https://example.com",
+        display_url="example.com",
+        hash=0,
+    )
+    media = tl.MessageMediaWebPage(webpage=webpage)
+    result = _describe_media(media)
+    assert "ссылка" in result
+    assert "https://example.com" in result
+
+
+def test_describe_media_web_page_without_url() -> None:
+    """Веб-страница без URL: '[ссылка]'."""
+    import telethon.tl.types as tl
+
+    from mcp_telegram.formatter import _describe_media
+
+    webpage = SimpleNamespace(url=None)
+    media = tl.MessageMediaWebPage(webpage=webpage)
+    result = _describe_media(media)
+    assert result == "[ссылка]"
+
+
+def test_describe_media_empty() -> None:
+    """Пустое медиа: пустая строка."""
+    import telethon.tl.types as tl
+
+    from mcp_telegram.formatter import _describe_media
+
+    media = tl.MessageMediaEmpty()
+    result = _describe_media(media)
+    assert result == ""
+
+
+def test_describe_media_photo() -> None:
+    """Фото: '[фото]'."""
+    import telethon.tl.types as tl
+
+    from mcp_telegram.formatter import _describe_media
+
+    media = tl.MessageMediaPhoto()
+    result = _describe_media(media)
+    assert result == "[фото]"
+
+
+def test_describe_media_unknown_type() -> None:
+    """Неизвестный тип медиа: '[медиа: ClassName]'."""
+    from mcp_telegram.formatter import _describe_media
+
+    class SomeUnknownMedia:
+        pass
+
+    media = SomeUnknownMedia()
+    result = _describe_media(media)
+    assert "медиа" in result
+    assert "SomeUnknownMedia" in result
