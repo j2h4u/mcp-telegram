@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from mcp_telegram.tools._base import DaemonNotRunningError
-from mcp_telegram.tools.stats import GetDialogStats, get_dialog_stats
+from mcp_telegram.tools.stats import GetDialogStats, format_usage_summary, get_dialog_stats
 
 
 class _TextContent(Protocol):
@@ -159,3 +159,68 @@ async def test_get_dialog_stats_daemon_not_running() -> None:
     assert content.is_error is True
     text = cast(_TextContent, content.content[0]).text
     assert "mcp-telegram sync" in text or "not running" in text.lower()
+
+
+# ---------------------------------------------------------------------------
+# format_usage_summary
+# ---------------------------------------------------------------------------
+
+
+def test_format_usage_summary_most_active_tool() -> None:
+    stats: dict[str, object] = {"total_calls": 100, "tool_distribution": {"list_messages": 60, "get_inbox": 40}}
+    result = format_usage_summary(stats)
+    assert "list_messages" in result
+    assert "60%" in result
+
+
+def test_format_usage_summary_deep_scrolling_detected() -> None:
+    stats: dict[str, object] = {"total_calls": 50, "tool_distribution": {}, "max_page_depth": 7}
+    result = format_usage_summary(stats)
+    assert "Deep scrolling detected" in result
+    assert "7" in result
+
+
+def test_format_usage_summary_no_deep_scrolling_below_threshold() -> None:
+    stats: dict[str, object] = {"total_calls": 50, "tool_distribution": {}, "max_page_depth": 4}
+    result = format_usage_summary(stats)
+    assert "Deep scrolling" not in result
+
+
+def test_format_usage_summary_errors() -> None:
+    stats: dict[str, object] = {"total_calls": 10, "error_distribution": {"ValueError": 3, "TimeoutError": 2}}
+    result = format_usage_summary(stats)
+    assert "ValueError (3)" in result
+    assert "TimeoutError (2)" in result
+
+
+def test_format_usage_summary_filtered_queries() -> None:
+    stats: dict[str, object] = {"total_calls": 100, "filter_count": 25, "tool_distribution": {}}
+    result = format_usage_summary(stats)
+    assert "Filtered queries: 25%" in result
+
+
+def test_format_usage_summary_latency() -> None:
+    stats: dict[str, object] = {"total_calls": 10, "latency_median_ms": 45.7, "latency_p95_ms": 120.3}
+    result = format_usage_summary(stats)
+    assert "46ms median" in result
+    assert "120ms p95" in result
+
+
+def test_format_usage_summary_handles_large_input_gracefully() -> None:
+    stats: dict[str, object] = {
+        "total_calls": 10000,
+        "tool_distribution": {f"tool_name_{i}": i for i in range(500)},
+        "error_distribution": {f"error_type_{i}": i for i in range(500)},
+        "max_page_depth": 20,
+        "filter_count": 5000,
+        "latency_median_ms": 100.0,
+        "latency_p95_ms": 500.0,
+    }
+    result = format_usage_summary(stats)
+    assert isinstance(result, str)
+    assert len(result) < 2000
+
+
+def test_format_usage_summary_empty_stats() -> None:
+    result = format_usage_summary({"total_calls": 0})
+    assert result == ""
