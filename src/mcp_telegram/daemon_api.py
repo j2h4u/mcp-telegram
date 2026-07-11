@@ -152,7 +152,7 @@ def _dialog_type_from_db(conn: sqlite3.Connection, dialog_id: int) -> str:
     """Return dialog type string from sync.db entities table.
 
     Zero Telegram API calls — pure sqlite lookup. Returns one of the values
-    produced by ``DialogType.from_entity()`` (same vocabulary). Returns "Unknown"
+    produced by the Telegram entity classifier (same vocabulary). Returns "Unknown"
     when no entity row exists yet (the row is populated by sync bootstrap and
     by live event handlers).
 

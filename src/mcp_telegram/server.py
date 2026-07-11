@@ -1,8 +1,8 @@
 """MCP server entrypoint — tool registration, request dispatch, transports.
 
 Wires tool_runner (singledispatch) to the MCP Server, tracks per-request IDs
-via _request_ids ContextVar for cross-process log correlation, and runs stdio
-or Streamable HTTP transport loops.
+via the public correlation context API for cross-process log correlation, and
+runs stdio or Streamable HTTP transport loops.
 """
 
 import contextlib
@@ -26,7 +26,7 @@ from mcp.types import (
 from starlette.types import Receive, Scope, Send
 
 from . import tools
-from .daemon_client import _request_ids
+from .correlation import correlation_context, current_correlation_ids
 
 logger = logging.getLogger(__name__)
 app = Server("mcp-telegram")
@@ -187,9 +187,7 @@ async def call_tool(name: str, arguments: dict[str, object]) -> CallToolResult:
         raise ValueError(f"Unknown tool: {name}")
 
     t0 = time.monotonic()
-    rids: list[str] = []
-    token = _request_ids.set(rids)
-    try:
+    with correlation_context():
         try:
             args = tools.tool_args(tool, **arguments)
         except Exception as exc:
@@ -205,15 +203,24 @@ async def call_tool(name: str, arguments: dict[str, object]) -> CallToolResult:
             return _error_call_result(_safe_boundary_error_text(tool_name=name, stage="runtime", exc=exc))
 
         elapsed = time.monotonic() - t0
-        rid_str = ",".join(rids) if rids else "-"
+        rid_str = ",".join(current_correlation_ids()) or "-"
         logger.info("call_tool[%s] completed in %.3fs rids=%s", name, elapsed, rid_str)
         return CallToolResult(
             content=list(result.content) if result.is_error else [],
             structuredContent=result.structured_content,
             isError=result.is_error,
         )
-    finally:
-        _request_ids.reset(token)
+
+
+def bootstrap_server() -> Server:
+    """Return the process-wide MCP server with handlers registered once.
+
+    Handler decorators execute when this module is imported.  Keeping the
+    bootstrap seam as an accessor avoids a second registration pass while
+    making the canonical server instance explicit to runtime composition and
+    tests.
+    """
+    return app
 
 
 async def _build_server_instructions() -> str:
@@ -291,10 +298,11 @@ async def run_mcp_server() -> None:
 
     logger.info("MCP server starting — routing through daemon API")
 
-    app.instructions = await _build_server_instructions()
+    mcp_server = bootstrap_server()
+    mcp_server.instructions = await _build_server_instructions()
 
     async with stdio_server() as (read_stream, write_stream):
-        await app.run(read_stream, write_stream, app.create_initialization_options())
+        await mcp_server.run(read_stream, write_stream, mcp_server.create_initialization_options())
 
 
 async def run_mcp_http_server(
@@ -330,9 +338,10 @@ async def run_mcp_http_server(
         normalized_mount_path,
     )
 
-    app.instructions = await _build_server_instructions()
+    mcp_server = bootstrap_server()
+    mcp_server.instructions = await _build_server_instructions()
     session_manager = StreamableHTTPSessionManager(
-        app=app,
+        app=mcp_server,
         security_settings=TransportSecuritySettings(
             enable_dns_rebinding_protection=True,
             allowed_hosts=_http_allowed_hosts(host=host, port=port),

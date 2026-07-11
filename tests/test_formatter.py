@@ -196,7 +196,7 @@ def test_media_fallback() -> None:
 def test_describe_document_priority_and_fallbacks() -> None:
     import telethon.tl.types as tl
 
-    from mcp_telegram.formatter import _describe_document
+    from mcp_telegram.telethon_media import describe_document
 
     sticker = _make_document_media(
         tl.DocumentAttributeSticker(alt="🙂", stickerset=tl.InputStickerSetEmpty()),
@@ -231,17 +231,17 @@ def test_describe_document_priority_and_fallbacks() -> None:
     ]
 
     for media, expected in cases:
-        assert _describe_document(media) == expected
+        assert describe_document(media) == expected
 
 
 def test_describe_document_audio_without_metadata() -> None:
     import telethon.tl.types as tl
 
-    from mcp_telegram.formatter import _describe_document
+    from mcp_telegram.telethon_media import describe_document
 
     media = _make_document_media(tl.DocumentAttributeAudio(duration=30))
 
-    assert _describe_document(media) == "[аудио: 0:30]"
+    assert describe_document(media) == "[аудио: 0:30]"
 
 
 def test_format_messages_frames_adversarial_body_without_framing_headers() -> None:

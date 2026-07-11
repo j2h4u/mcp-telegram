@@ -43,8 +43,10 @@ from telethon.tl import types  # type: ignore[import-untyped]
 from .dialog_sync import _ACCESS_LOST_ERRORS, _set_access_lost
 from .flood import flood_seconds, sleep_through_flood
 from .fts import DELETE_FTS_SQL, INSERT_FTS_SQL, stem_text
-from .models import DialogType
 from .resolver import latinize
+from .telethon_dialog import classify_dialog_type
+from .telethon_media import describe_media
+from .telethon_message import is_service_message
 
 logger = logging.getLogger(__name__)
 _BATCH_SIZE = 100
@@ -853,9 +855,7 @@ def _extract_media_description(msg: object) -> str | None:
     media = _attr(msg, "media", None)
     if media is None:
         return None
-    from .formatter import _describe_media
-
-    return _describe_media(media)
+    return describe_media(media)
 
 
 def _extract_edit_date(msg: object) -> int | None:
@@ -954,7 +954,7 @@ def extract_message_row(
         grouped_id=_extract_grouped_id(msg),
         reply_to_peer_id=_extract_reply_to_peer_id(msg),
         out=1 if _attr(msg, "out", False) else 0,
-        is_service=1 if isinstance(msg, types.MessageService) else 0,
+        is_service=1 if is_service_message(msg) else 0,
         post_author=_attr(msg, "post_author", None),
     )
     _touch_stored_message_fields(stored)
@@ -1031,7 +1031,7 @@ class FullSyncWorker:
                 first = getattr(entity, "first_name", None) or ""
                 last = getattr(entity, "last_name", None) or ""
                 name: str | None = f"{first} {last}".strip() or None
-                entity_type_str = DialogType.from_entity(entity).value
+                entity_type_str = classify_dialog_type(entity).value
                 self._conn.execute(
                     UPSERT_ENTITY_SQL,
                     (

@@ -1,6 +1,3 @@
-from telethon.errors import RPCError  # type: ignore[import-untyped]
-
-
 def action_text(summary: str, action: str) -> str:
     """Return a short action-oriented response body."""
     return f"{summary}\nAction: {action}"
@@ -32,13 +29,13 @@ def deleted_topic_text(topic_name: str, *, retry_tool: str) -> str:
     )
 
 
-def rpc_error_detail(exc: RPCError) -> str:
+def rpc_error_detail(exc: object) -> str:
     """Return the stable Telegram RPC detail for one exception."""
     detail = getattr(exc, "message", None) or str(exc)
     return str(detail)
 
 
-def inaccessible_topic_text(topic_name: str, exc: RPCError, *, resolved: bool, retry_tool: str) -> str:
+def inaccessible_topic_text(topic_name: str, exc: object, *, resolved: bool, retry_tool: str) -> str:
     """Return a readable user-facing message for inaccessible topics."""
     detail = rpc_error_detail(exc)
     if resolved:
@@ -81,7 +78,7 @@ def ambiguous_deleted_topic_text(topic_name: str, match_lines: list[str], *, ret
     )
 
 
-def dialog_topics_unavailable_text(dialog_name: str, exc: RPCError) -> str:
+def dialog_topics_unavailable_text(dialog_name: str, exc: object) -> str:
     """Return a readable message when one dialog cannot expose a topic catalog."""
     detail = rpc_error_detail(exc)
     return action_text(

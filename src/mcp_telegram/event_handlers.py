@@ -52,7 +52,6 @@ from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
 from .activity_peer_resolve import _InputEntityResolverClient
 from .fts import DELETE_FTS_SQL, INSERT_FTS_SQL, stem_text
-from .models import DialogType
 from .read_state import apply_read_cursor
 from .resolver import latinize
 from .scheduled_messages import (
@@ -72,6 +71,7 @@ from .sync_worker import (
     extract_reactions_rows,
     insert_messages_with_fts,
 )
+from .telethon_dialog import classify_dialog_type
 
 logger = logging.getLogger(__name__)
 
@@ -431,7 +431,7 @@ class EventHandlerManager:
             last = _first_non_empty_str(getattr(sender, "last_name", None)) or ""
             username = _first_non_empty_str(getattr(sender, "username", None))
             name: str | None = f"{first} {last}".strip() or None
-            entity_type_str = DialogType.from_entity(sender).value
+            entity_type_str = classify_dialog_type(sender).value
             with self._conn:
                 self._conn.execute(
                     UPSERT_ENTITY_SQL,

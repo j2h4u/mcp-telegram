@@ -27,7 +27,7 @@ from mcp_telegram.daemon_api import (
     _dialog_type_from_db,
     _read_state_for_dialog,
 )
-from mcp_telegram.models import DialogType
+from mcp_telegram.telethon_dialog import classify_dialog_type
 
 # ---------------------------------------------------------------------------
 # Module-wide patch: telethon_utils.get_peer_id returns entity.id for mocks
@@ -254,13 +254,13 @@ def make_server(
 
 def test_classify_dialog_type_user() -> None:
     user = SimpleNamespace(first_name="Alice", bot=False)
-    assert DialogType.from_entity(user) == "user"
+    assert classify_dialog_type(user) == "user"
 
 
 def test_classify_dialog_type_channel_group_bot_forum() -> None:
     # Bot
     bot = SimpleNamespace(first_name="Botty", bot=True)
-    assert DialogType.from_entity(bot) == "bot"
+    assert classify_dialog_type(bot) == "bot"
 
     # Channel / Group / Forum via the Channel telethon class.
     # Build via __new__ to avoid telethon-version-specific constructor signatures;
@@ -270,26 +270,26 @@ def test_classify_dialog_type_channel_group_bot_forum() -> None:
     channel = Channel.__new__(Channel)
     channel.megagroup = False
     channel.forum = False
-    assert DialogType.from_entity(channel) == "channel"
+    assert classify_dialog_type(channel) == "channel"
 
     # megagroup (non-forum) is a supergroup, NOT a legacy "group".
     group = Channel.__new__(Channel)
     group.megagroup = True
     group.forum = False
-    assert DialogType.from_entity(group) == "supergroup"
+    assert classify_dialog_type(group) == "supergroup"
 
     forum = Channel.__new__(Channel)
     forum.megagroup = True
     forum.forum = True
-    assert DialogType.from_entity(forum) == "forum"
+    assert classify_dialog_type(forum) == "forum"
 
     # Chat is detected via isinstance; constructor signature varies by telethon
     # version, so build a Chat by bypassing __init__ — isinstance is what matters.
     # A legacy basic Chat maps to "group" (NOT "chat").
     chat = Chat.__new__(Chat)
-    assert DialogType.from_entity(chat) == "group"
+    assert classify_dialog_type(chat) == "group"
 
-    assert DialogType.from_entity(None) == "unknown"
+    assert classify_dialog_type(None) == "unknown"
 
 
 # ---------------------------------------------------------------------------

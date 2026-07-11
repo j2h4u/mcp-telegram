@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-from typing import cast
 from unittest.mock import MagicMock
 
 import pytest
-from telethon.errors import RPCError
 
 from mcp_telegram.errors import (
     action_text,
@@ -121,7 +119,7 @@ def test_rpc_error_detail_falls_back_to_str() -> None:
         def __str__(self) -> str:
             return "some error"
 
-    assert rpc_error_detail(cast(RPCError, FakeExc())) == "some error"
+    assert rpc_error_detail(FakeExc()) == "some error"
 
 
 def test_inaccessible_topic_text_branches_on_resolved() -> None:

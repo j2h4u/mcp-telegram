@@ -16,6 +16,7 @@ from telethon.errors import ChatAdminRequiredError, RPCError  # type: ignore[imp
 from telethon.tl.types import PeerChannel  # type: ignore[import-untyped]
 
 from .models import DialogType
+from .telethon_dialog import classify_dialog_type
 
 _ENTITY_DETAIL_TTL_SECONDS = 300
 _ENTITY_DETAIL_SCHEMA_VERSION = 1
@@ -292,7 +293,7 @@ class DaemonEntityInfoService:
             return None, self._error("telegram_api_error", str(exc))
 
     async def _build_detail_by_type(self, entity: object) -> tuple[dict[str, object] | None, dict[str, object] | None]:
-        dispatch_kind = DialogType.from_entity(entity)
+        dispatch_kind = classify_dialog_type(entity)
         if dispatch_kind in (DialogType.USER, DialogType.BOT):
             return await self._fetch_user_detail(entity), None
         if dispatch_kind == DialogType.CHANNEL:

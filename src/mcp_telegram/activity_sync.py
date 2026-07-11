@@ -25,6 +25,7 @@ from .sync_worker import (
     extract_message_row,
     insert_messages_with_fts,
 )
+from .telethon_dialog import classify_dialog_type
 
 logger = logging.getLogger(__name__)
 
@@ -190,9 +191,9 @@ def _classify_entity(obj: object) -> str | None:
 
     Returns the canonical DialogType value string, or None for an unclassifiable
     object. (Previously this independently mapped megagroup -> 'group', which
-    diverged from dialogs.type's 'supergroup' — DialogType.from_entity fixes that.)
+    diverged from dialogs.type's 'supergroup' — classify_dialog_type fixes that.)
     """
-    dt = DialogType.from_entity(obj)
+    dt = classify_dialog_type(obj)
     return None if dt is DialogType.UNKNOWN else dt.value
 
 

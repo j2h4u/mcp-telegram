@@ -25,6 +25,7 @@ from mcp_telegram.daemon_api import DaemonAPIServer, _DaemonClientLike, _ListMes
 from mcp_telegram.daemon_message import _MessageLike, fetch_reaction_counts, message_to_dict
 from mcp_telegram.fts import MESSAGES_FTS_DDL, stem_text
 from mcp_telegram.models import DialogType
+from mcp_telegram.telethon_dialog import classify_dialog_type
 
 # Track sqlite connections created by module helpers and close them after each test.
 _TRACKED_SQLITE_CONN_CLEANUP: Final[list[sqlite3.Connection]] = []
@@ -1157,7 +1158,7 @@ def test_classify_dialog_type_forum() -> None:
     entity.megagroup = True
     entity.forum = True
     entity.broadcast = False
-    assert DialogType.from_entity(entity) == DialogType.FORUM
+    assert classify_dialog_type(entity) == DialogType.FORUM
 
 
 def test_classify_dialog_type_group() -> None:
@@ -1168,7 +1169,7 @@ def test_classify_dialog_type_group() -> None:
     entity.forum = False
     entity.broadcast = False
     # megagroup (not forum) → SUPERGROUP under the canonical vocabulary
-    assert DialogType.from_entity(entity) == DialogType.SUPERGROUP
+    assert classify_dialog_type(entity) == DialogType.SUPERGROUP
 
 
 def test_classify_dialog_type_channel_broadcast() -> None:
@@ -1178,21 +1179,21 @@ def test_classify_dialog_type_channel_broadcast() -> None:
     entity.broadcast = True
     entity.megagroup = False
     entity.forum = False
-    assert DialogType.from_entity(entity) == DialogType.CHANNEL
+    assert classify_dialog_type(entity) == DialogType.CHANNEL
 
 
 def test_classify_dialog_type_bot() -> None:
     entity = MagicMock()
     entity.first_name = "BotFather"
     entity.bot = True
-    assert DialogType.from_entity(entity) == DialogType.BOT
+    assert classify_dialog_type(entity) == DialogType.BOT
 
 
 def test_classify_dialog_type_user() -> None:
     entity = MagicMock()
     entity.first_name = "Alice"
     entity.bot = False
-    assert DialogType.from_entity(entity) == DialogType.USER
+    assert classify_dialog_type(entity) == DialogType.USER
 
 
 def test_classify_dialog_type_chat() -> None:
@@ -1200,11 +1201,11 @@ def test_classify_dialog_type_chat() -> None:
 
     entity = Chat.__new__(Chat)
     # legacy basic group (Chat) → GROUP under the canonical vocabulary
-    assert DialogType.from_entity(entity) == DialogType.GROUP
+    assert classify_dialog_type(entity) == DialogType.GROUP
 
 
 def test_classify_dialog_type_none() -> None:
-    assert DialogType.from_entity(None) == DialogType.UNKNOWN
+    assert classify_dialog_type(None) == DialogType.UNKNOWN
 
 
 # ---------------------------------------------------------------------------

@@ -6,6 +6,8 @@ from typing import Protocol, cast
 
 from .formatter import format_reaction_counts
 from .sync_worker import extract_reply_and_topic
+from .telethon_media import describe_media
+from .telethon_message import is_service_message
 
 logger = logging.getLogger(__name__)
 
@@ -75,9 +77,7 @@ def _get_media_description(msg: _MessageLike) -> str | None:
     media = msg.media
     if media is None:
         return None
-    from .formatter import _describe_media
-
-    return _describe_media(media)
+    return describe_media(media)
 
 
 def _extract_reactions_display(msg: _MessageLike) -> str:
@@ -106,16 +106,7 @@ def _to_unix_timestamp_or_none(value: _SupportsTimestamp | None) -> int | None:
 
 
 def _is_service_message(msg: _MessageLike) -> int:
-    try:
-        from telethon.tl import types as _tl_types  # type: ignore[import-untyped]
-
-        return 1 if isinstance(msg, _tl_types.MessageService) else 0
-    except Exception:
-        logger.debug(
-            "message_to_dict: telethon MessageService isinstance check failed",
-            exc_info=True,
-        )
-        return 0
+    return 1 if is_service_message(msg) else 0
 
 
 def _resolve_effective_sender_id(

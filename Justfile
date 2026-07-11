@@ -9,7 +9,7 @@ default:
     @just --list
 
 # Run all local source checks.
-check: fmt-check lint preview-complexity-lint lock-check typecheck typecheck-pyright typecheck-tests import-contracts actionlint supply-chain-pins deptry compile deadcode package-smoke
+check: fmt-check lint preview-complexity-lint lock-check typecheck typecheck-pyright typecheck-tests runtime-seams actionlint supply-chain-pins deptry compile deadcode package-smoke
 
 # Verify uv.lock is synchronized with pyproject.toml.
 lock-check:
@@ -42,6 +42,10 @@ typecheck-tests:
 # Check import-layer architecture contracts.
 import-contracts:
     uv run lint-imports
+
+# Check the public correlation/bootstrap seams and their stdlib import closure.
+runtime-seams: import-contracts
+    uv run python scripts/check_runtime_seams.py
 
 # Check GitHub Actions workflow syntax and expressions.
 actionlint:

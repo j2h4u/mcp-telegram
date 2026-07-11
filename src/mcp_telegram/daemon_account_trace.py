@@ -19,6 +19,7 @@ from .dialog_sync import _ACCESS_LOST_ERRORS
 from .models import DialogType
 from .resolver import Candidates, Resolved, _parse_tme_link, latinize, resolve
 from .sync_worker import ExtractedMessage, extract_message_row, insert_messages_with_fts
+from .telethon_dialog import classify_dialog_type
 
 _TRACE_SCOPE_DIALOG_IDS_LEN = 2
 USER_TTL = 2_592_000  # 30 days
@@ -364,7 +365,7 @@ class DaemonAccountTraceService:
         resolved_username = _attr(user, "username", None)
         if not isinstance(resolved_username, str) or not resolved_username:
             resolved_username = username
-        entity_type = DialogType.from_entity(user).value
+        entity_type = classify_dialog_type(user).value
         now = int(time.time())
         self._deps.conn.execute(
             _UPSERT_ENTITY_SQL,

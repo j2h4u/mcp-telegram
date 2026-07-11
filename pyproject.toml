@@ -262,6 +262,7 @@ source_modules = [
   "mcp_telegram.pagination",
   "mcp_telegram.budget",
   "mcp_telegram.errors",
+  "mcp_telegram.correlation",
 ]
 forbidden_modules = [
   "mcp_telegram.daemon",

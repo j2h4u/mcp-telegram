@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 from mcp_telegram.models import DialogType
+from mcp_telegram.telethon_dialog import classify_dialog_type
 
 # --- parse(): trap-aware string parsing -------------------------------------
 
@@ -63,7 +64,7 @@ def test_strenum_binds_as_lowercase_value() -> None:
     assert f"{DialogType.CHANNEL}" == "channel"
 
 
-# --- from_entity(): the sole Telethon-flag reader ---------------------------
+# --- classify_dialog_type(): the sole Telegram-entity flag reader ------------
 
 
 class _FakeChannel:
@@ -73,14 +74,14 @@ class _FakeChannel:
 
 
 def test_from_entity_none_is_unknown() -> None:
-    assert DialogType.from_entity(None) == DialogType.UNKNOWN
+    assert classify_dialog_type(None) == DialogType.UNKNOWN
 
 
 def test_from_entity_user_and_bot_ducktyped() -> None:
     user = SimpleNamespace(first_name="Max", bot=False)
     bot = SimpleNamespace(first_name="HelperBot", bot=True)
-    assert DialogType.from_entity(user) == DialogType.USER
-    assert DialogType.from_entity(bot) == DialogType.BOT
+    assert classify_dialog_type(user) == DialogType.USER
+    assert classify_dialog_type(bot) == DialogType.BOT
 
 
 def test_from_entity_real_telethon_types() -> None:
@@ -94,7 +95,7 @@ def test_from_entity_real_telethon_types() -> None:
     forum = Channel(id=3, title="f", photo=photo, date=now, megagroup=True, forum=True)
     legacy = Chat(id=4, title="g", photo=photo, participants_count=2, date=now, version=1)
 
-    assert DialogType.from_entity(broadcast) == DialogType.CHANNEL
-    assert DialogType.from_entity(supergroup) == DialogType.SUPERGROUP
-    assert DialogType.from_entity(forum) == DialogType.FORUM
-    assert DialogType.from_entity(legacy) == DialogType.GROUP
+    assert classify_dialog_type(broadcast) == DialogType.CHANNEL
+    assert classify_dialog_type(supergroup) == DialogType.SUPERGROUP
+    assert classify_dialog_type(forum) == DialogType.FORUM
+    assert classify_dialog_type(legacy) == DialogType.GROUP

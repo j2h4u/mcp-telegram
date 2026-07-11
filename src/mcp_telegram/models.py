@@ -13,12 +13,11 @@ GENERAL_TOPIC_TITLE = "General"
 class DialogType(StrEnum):
     """Canonical dialog/entity type — the single vocabulary for this project.
 
-    Telethon has no flat type: the kind is an entity class (``User`` / ``Chat`` /
-    ``Channel``) plus boolean flags (``megagroup`` / ``forum`` / ``bot``). This enum
-    is the one canonical flattening, derived from a live entity by
-    :meth:`from_entity` (the ONLY place that reads Telethon flags) and parsed from a
-    stored/legacy string by :meth:`parse`. Values are lowercase to match what the
-    ``dialogs.type`` column already stores (no data migration).
+    The Telegram API has no flat type: the kind is an entity class (``User`` /
+    ``Chat`` / ``Channel``) plus boolean flags (``megagroup`` / ``forum`` /
+    ``bot``). This enum is the canonical stored vocabulary and is parsed from a
+    stored/legacy string by :meth:`parse`. Values are lowercase to match what
+    the ``dialogs.type`` column already stores (no data migration).
 
     Historical hazard this replaces: the codebase previously flattened the type in
     three divergent ways, and a capitalized ``"Group"`` meant a MEGAGROUP while a
@@ -33,32 +32,6 @@ class DialogType(StrEnum):
     FORUM = "forum"  # forum supergroup (Channel, megagroup=True, forum=True)
     GROUP = "group"  # legacy basic group (Chat)
     UNKNOWN = "unknown"
-
-    @classmethod
-    def from_entity(cls, entity: object | None) -> DialogType:
-        """Derive the canonical type from a live Telethon entity (class + flags).
-
-        This is the SINGLE place allowed to read Telethon's class/flags. Branch order
-        matters: forum implies megagroup, so it must be checked first.
-        """
-        kind = cls.UNKNOWN
-        if entity is not None:
-            # Lazy import keeps models.py import-light; matches the codebase's pattern.
-            from telethon.tl.types import Channel, Chat  # type: ignore[import-untyped]
-
-            if isinstance(entity, Channel):
-                if getattr(entity, "forum", False):
-                    kind = cls.FORUM
-                elif getattr(entity, "megagroup", False):
-                    kind = cls.SUPERGROUP
-                else:
-                    kind = cls.CHANNEL
-            elif isinstance(entity, Chat):
-                kind = cls.GROUP
-            # Duck-typed user detection (avoids importing User); bots are Users with bot=True.
-            elif hasattr(entity, "first_name"):
-                kind = cls.BOT if getattr(entity, "bot", False) else cls.USER
-        return kind
 
     @classmethod
     def parse(cls, raw: str | DialogType | None) -> DialogType:

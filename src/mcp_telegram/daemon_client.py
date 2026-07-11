@@ -19,7 +19,6 @@ parameter to support name-based resolution by the daemon.
 """
 
 import asyncio
-import contextvars
 import json
 import logging
 import uuid
@@ -27,6 +26,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Literal, NotRequired, TypedDict, Unpack, cast
 
+from .correlation import record_correlation_id
 from .daemon_ipc import get_daemon_socket_path
 
 logger = logging.getLogger(__name__)
@@ -39,11 +39,6 @@ type DaemonFailureKind = Literal[
     "connection_broken",
     "malformed_response",
 ]
-
-# ContextVar for collecting request_ids during a tool call.
-# server.py sets a fresh list before running the tool; request() appends to it.
-# This enables cross-process log correlation without passing rid through tool signatures.
-_request_ids: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar("_request_ids", default=None)
 
 
 class _ListMessagesKwargs(TypedDict, total=False):
@@ -168,9 +163,7 @@ class DaemonConnection:
         without sending a response (empty read = EOF).
         """
         rid = uuid.uuid4().hex[:8]
-        rids = _request_ids.get(None)
-        if rids is not None:
-            rids.append(rid)
+        record_correlation_id(rid)
         payload = {**payload, "request_id": rid}
         encoded = json.dumps(payload).encode() + b"\n"
         logger.debug("daemon_request method=%s request_id=%s", payload.get("method"), rid)
