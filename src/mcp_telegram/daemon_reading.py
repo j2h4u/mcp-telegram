@@ -24,6 +24,7 @@ from .fts import stem_query
 from .own_only import own_only_basis_by_dialog
 from .pagination import (
     HistoryDirection,
+    NavigationToken,
     decode_navigation_token,
     encode_history_navigation,
     encode_search_navigation,
@@ -173,6 +174,7 @@ class _SearchMessagesRequest:
     query: str
     limit: int
     offset: int
+    navigation: str | None
     message_state: str
 
 
@@ -202,7 +204,8 @@ class _NextNavContext:
     direction_enum: HistoryDirection
     logger: _LoggerLike
     request_id: Callable[[], str]
-    message_state: str | None = None
+    topic_id: int | None = None
+    message_state: str = "sent"
 
 
 def _row_mapping(row: object) -> Mapping[str, object]:
@@ -339,6 +342,7 @@ class DaemonReadingService:
             query=req.get("query", ""),
             limit=api._clamp(req.get("limit", 20), 1, 200),
             offset=max(0, req.get("offset", 0)),
+            navigation=req.get("navigation"),
             message_state=req.get("message_state", "sent"),
         )
 
@@ -390,6 +394,7 @@ class DaemonReadingService:
             return encode_history_navigation(
                 last_msg_id,
                 context.dialog_id,
+                topic_id=context.topic_id,
                 direction=context.direction_enum,
                 sent_at=DaemonReadingService._navigation_sent_at(last),
                 message_state=context.message_state,
@@ -407,6 +412,8 @@ class DaemonReadingService:
         navigation: str | None,
         dialog_id: int,
         direction: str,
+        message_state: str,
+        topic_id: int | None,
     ) -> tuple[int | None, str] | dict:
         """Decode a history navigation token into (anchor_msg_id, direction)."""
         anchor_msg_id: int | None = None
@@ -415,24 +422,37 @@ class DaemonReadingService:
                 nav = decode_navigation_token(navigation)
             except ValueError as exc:
                 return {"ok": False, "error": "invalid_navigation", "message": str(exc)}
-            if nav.kind != "history":
-                return {
-                    "ok": False,
-                    "error": "invalid_navigation",
-                    "message": f"Navigation token is for {nav.kind}, not history",
-                }
-            if nav.dialog_id != dialog_id:
-                return {
-                    "ok": False,
-                    "error": "invalid_navigation",
-                    "message": f"Navigation token belongs to dialog {nav.dialog_id}, not {dialog_id}",
-                }
+            error_message = DaemonReadingService._history_navigation_error(
+                nav,
+                dialog_id,
+                message_state,
+                topic_id,
+            )
+            if error_message is not None:
+                return {"ok": False, "error": "invalid_navigation", "message": error_message}
             anchor_msg_id = nav.value
             if nav.direction is not None:
                 direction = str(nav.direction)
         elif navigation == "oldest":
             direction = "oldest"
         return anchor_msg_id, direction
+
+    @staticmethod
+    def _history_navigation_error(
+        navigation: NavigationToken,
+        dialog_id: int,
+        message_state: str,
+        topic_id: int | None,
+    ) -> str | None:
+        if navigation.kind != "history":
+            return f"Navigation token is for {navigation.kind}, not history"
+        if navigation.dialog_id != dialog_id:
+            return f"Navigation token belongs to dialog {navigation.dialog_id}, not {dialog_id}"
+        if navigation.message_state != message_state:
+            return f"Navigation token belongs to message_state {navigation.message_state!r}, not {message_state!r}"
+        if navigation.topic_id != topic_id:
+            return f"Navigation token belongs to topic {navigation.topic_id!r}, not {topic_id!r}"
+        return None
 
     async def _build_read_messages_from_rows(
         self,
@@ -529,7 +549,13 @@ class DaemonReadingService:
         request: _ListMessagesRequest,
         direction: str,
     ) -> dict:
-        nav_result = self._decode_history_navigation(request.navigation, dialog_id, direction)
+        nav_result = self._decode_history_navigation(
+            request.navigation,
+            dialog_id,
+            direction,
+            request.message_state,
+            request.topic_id,
+        )
         if isinstance(nav_result, dict):
             return nav_result
         anchor_msg_id, direction = nav_result
@@ -655,7 +681,7 @@ class DaemonReadingService:
         if messages and len(messages) == request.limit:
             next_offset = request.offset + request.limit
             nav_dialog_id = 0 if global_mode else request.dialog_id
-            return encode_search_navigation(next_offset, nav_dialog_id, request.query)
+            return encode_search_navigation(next_offset, nav_dialog_id, request.query, request.message_state)
         return None
 
     def _search_scheduled_messages(self, request: _SearchMessagesRequest) -> dict:
@@ -757,6 +783,7 @@ class DaemonReadingService:
                 request.offset + request.limit,
                 request.dialog_id,
                 request.query,
+                request.message_state,
             )
             if len(page) == request.limit
             else None
@@ -1029,8 +1056,10 @@ class DaemonReadingService:
                 dialog_id=req.dialog_id,
                 direction=req.direction,
                 direction_enum=req.direction_enum,
+                topic_id=req.topic_id,
                 logger=self._logger,
                 request_id=self._deps.rid,
+                message_state="sent",
             ),
         )
         return {
@@ -1077,8 +1106,10 @@ class DaemonReadingService:
                 dialog_id=req.dialog_id,
                 direction=req.direction,
                 direction_enum=req.direction_enum,
+                topic_id=req.topic_id,
                 logger=self._logger,
                 request_id=self._deps.rid,
+                message_state="sent",
             ),
         )
         return {
@@ -1186,6 +1217,7 @@ class DaemonReadingService:
                 dialog_id=req.dialog_id,
                 direction=req.direction,
                 direction_enum=req.direction_enum,
+                topic_id=req.topic_id,
                 logger=self._logger,
                 request_id=self._deps.rid,
                 message_state="scheduled",
@@ -1285,7 +1317,13 @@ class DaemonReadingService:
                 "error": "scheduled_context_unsupported",
                 "message": "Scheduled messages do not support sent-history context windows.",
             }
-        nav_result = self._decode_history_navigation(request.navigation, dialog_id, direction)
+        nav_result = self._decode_history_navigation(
+            request.navigation,
+            dialog_id,
+            direction,
+            request.message_state,
+            request.topic_id,
+        )
         if isinstance(nav_result, dict):
             return nav_result
         anchor_msg_id, direction = nav_result
@@ -1348,6 +1386,10 @@ class DaemonReadingService:
         if isinstance(resolved, dict):
             return resolved
         request = dataclasses.replace(request, dialog_id=resolved)
+        navigation_result = self._bind_search_navigation(request, resolved)
+        if isinstance(navigation_result, dict):
+            return navigation_result
+        request = navigation_result
         if request.message_state == "scheduled":
             return self._search_scheduled_messages(request)
         if request.message_state == "all":
@@ -1372,6 +1414,11 @@ class DaemonReadingService:
                 "message": "message_state must be sent, scheduled, or all",
             }
         global_mode = not request.dialog_id and request.dialog is None
+        if global_mode:
+            navigation_result = self._bind_search_navigation(request, 0)
+            if isinstance(navigation_result, dict):
+                return navigation_result
+            request = navigation_result
         if global_mode and request.message_state == "scheduled":
             return self._search_scheduled_messages(request)
         if global_mode and request.message_state == "all":
@@ -1388,6 +1435,34 @@ class DaemonReadingService:
         if not global_mode:
             return await self._search_messages_scoped_for_state(request, stemmed)
         return await self._search_messages_global_result(request, stemmed)
+
+    @staticmethod
+    def _bind_search_navigation(
+        request: _SearchMessagesRequest,
+        dialog_id: int,
+    ) -> _SearchMessagesRequest | dict:
+        """Validate a search cursor after its dialog scope has been resolved."""
+        if request.navigation is None:
+            return request
+        try:
+            navigation = decode_navigation_token(request.navigation)
+        except ValueError as exc:
+            return {"ok": False, "error": "invalid_navigation", "message": str(exc)}
+
+        error_message: str | None = None
+        if navigation.kind != "search":
+            error_message = f"Navigation token is for {navigation.kind}, not search"
+        elif navigation.query != request.query:
+            error_message = "Navigation token belongs to a different search query"
+        elif navigation.message_state != request.message_state:
+            error_message = (
+                f"Navigation token belongs to message_state {navigation.message_state!r}, not {request.message_state!r}"
+            )
+        elif navigation.dialog_id != dialog_id:
+            error_message = f"Navigation token belongs to dialog {navigation.dialog_id}, not {dialog_id}"
+        if error_message is not None:
+            return {"ok": False, "error": "invalid_navigation", "message": error_message}
+        return dataclasses.replace(request, offset=navigation.value)
 
     async def _search_messages(self, req: dict) -> dict:
         """FTS5 stemmed full-text search against messages_fts."""

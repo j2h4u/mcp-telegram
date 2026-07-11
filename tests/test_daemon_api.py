@@ -3389,7 +3389,7 @@ async def test_list_messages_pagination_cursor_continues() -> None:
     _insert_message(conn, DIALOG_ID, 104, text="msg 104", sent_at=1700000004)
 
     # Get first page, cursor at msg 103 (newest-first, so 104 and 103 returned)
-    token = encode_history_navigation(103, DIALOG_ID, direction=HistoryDirection.NEWEST)
+    token = encode_history_navigation(103, DIALOG_ID, direction=HistoryDirection.NEWEST, message_state="sent")
 
     server = make_server(conn)
     result = await server._list_messages({"dialog_id": DIALOG_ID, "limit": 2, "navigation": token})
@@ -3414,7 +3414,7 @@ async def test_list_messages_pagination_wrong_dialog_error() -> None:
     _insert_message(conn, DIALOG_ID, 101, text="msg 101", sent_at=1700000001)
 
     # Token for a different dialog
-    token = encode_history_navigation(101, OTHER_DIALOG, direction=HistoryDirection.NEWEST)
+    token = encode_history_navigation(101, OTHER_DIALOG, direction=HistoryDirection.NEWEST, message_state="sent")
 
     server = make_server(conn)
     result = await server._list_messages({"dialog_id": DIALOG_ID, "limit": 10, "navigation": token})
@@ -3677,7 +3677,7 @@ async def test_list_messages_on_demand_navigation_offset_id() -> None:
     client.iter_messages = _fake_iter_messages
     server = make_server(conn, client)
 
-    token = encode_history_navigation(200, DIALOG_ID, direction=HistoryDirection.NEWEST)
+    token = encode_history_navigation(200, DIALOG_ID, direction=HistoryDirection.NEWEST, message_state="sent")
     result = await server._list_messages({"dialog_id": DIALOG_ID, "limit": 10, "navigation": token})
 
     assert result["ok"] is True, f"Unexpected error: {result}"
@@ -3973,25 +3973,25 @@ def test_msg_to_dict_sender_without_name_attrs_returns_none() -> None:
 
 def test_decode_nav_returns_tuple_on_no_navigation() -> None:
     """No navigation → returns (None, direction) tuple."""
-    result = DaemonAPIServer._decode_history_navigation(None, 123, "newest")
+    result = DaemonAPIServer._decode_history_navigation(None, 123, "newest", "sent", None)
     assert result == (None, "newest")
 
 
 def test_decode_nav_sentinel_newest() -> None:
     """navigation="newest" → returns (None, "newest")."""
-    result = DaemonAPIServer._decode_history_navigation("newest", 123, "oldest")
+    result = DaemonAPIServer._decode_history_navigation("newest", 123, "oldest", "sent", None)
     assert result == (None, "oldest")
 
 
 def test_decode_nav_sentinel_oldest() -> None:
     """navigation="oldest" → overrides direction."""
-    result = DaemonAPIServer._decode_history_navigation("oldest", 123, "newest")
+    result = DaemonAPIServer._decode_history_navigation("oldest", 123, "newest", "sent", None)
     assert result == (None, "oldest")
 
 
 def test_decode_nav_invalid_token_returns_error_dict() -> None:
     """Garbage navigation token → error dict."""
-    result = DaemonAPIServer._decode_history_navigation("not-a-valid-token", 123, "newest")
+    result = DaemonAPIServer._decode_history_navigation("not-a-valid-token", 123, "newest", "sent", None)
     assert isinstance(result, dict)
     assert result["ok"] is False
     assert result["error"] == "invalid_navigation"
@@ -4001,8 +4001,8 @@ def test_decode_nav_wrong_dialog_returns_error_dict() -> None:
     """Navigation token for different dialog → error dict."""
     from mcp_telegram.pagination import HistoryDirection, encode_history_navigation
 
-    token = encode_history_navigation(100, dialog_id=999, direction=HistoryDirection.NEWEST)
-    result = DaemonAPIServer._decode_history_navigation(token, 123, "newest")
+    token = encode_history_navigation(100, dialog_id=999, direction=HistoryDirection.NEWEST, message_state="sent")
+    result = DaemonAPIServer._decode_history_navigation(token, 123, "newest", "sent", None)
     assert isinstance(result, dict)
     assert result["ok"] is False
     assert "999" in result["message"]
@@ -4012,8 +4012,8 @@ def test_decode_nav_valid_token_returns_anchor() -> None:
     """Valid history token → returns (anchor_msg_id, direction)."""
     from mcp_telegram.pagination import HistoryDirection, encode_history_navigation
 
-    token = encode_history_navigation(42, dialog_id=123, direction=HistoryDirection.NEWEST)
-    result = DaemonAPIServer._decode_history_navigation(token, 123, "oldest")
+    token = encode_history_navigation(42, dialog_id=123, direction=HistoryDirection.NEWEST, message_state="sent")
+    result = DaemonAPIServer._decode_history_navigation(token, 123, "oldest", "sent", None)
     assert isinstance(result, tuple)
     anchor, direction = result
     assert anchor == 42
@@ -4024,11 +4024,22 @@ def test_decode_nav_search_token_returns_error() -> None:
     """Search navigation token used in history context → error."""
     from mcp_telegram.pagination import encode_search_navigation
 
-    token = encode_search_navigation(20, dialog_id=123, query="test")
-    result = DaemonAPIServer._decode_history_navigation(token, 123, "newest")
+    token = encode_search_navigation(20, dialog_id=123, query="test", message_state="sent")
+    result = DaemonAPIServer._decode_history_navigation(token, 123, "newest", "sent", None)
     assert isinstance(result, dict)
     assert result["error"] == "invalid_navigation"
     assert "search" in result["message"]
+
+
+def test_decode_nav_rejects_wrong_message_state() -> None:
+    """History navigation cannot cross lifecycle scopes."""
+    from mcp_telegram.pagination import encode_history_navigation
+
+    token = encode_history_navigation(42, dialog_id=123, message_state="scheduled")
+    result = DaemonAPIServer._decode_history_navigation(token, 123, "newest", "all", None)
+    assert isinstance(result, dict)
+    assert result["error"] == "invalid_navigation"
+    assert "message_state" in result["message"]
 
 
 # ---------------------------------------------------------------------------

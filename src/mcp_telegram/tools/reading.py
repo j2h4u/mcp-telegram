@@ -14,6 +14,7 @@ from ..formatter import (
     resolve_sender_label,
 )
 from ..models import DialogType, ReadMessage
+from ..pagination import NavigationToken
 from ..resolver import parse_exact_dialog_id
 from ._base import (
     DaemonNotRunningError,
@@ -1009,6 +1010,24 @@ def _search_scope_payload(ctx: _SearchStructuredContentContext) -> dict[str, obj
     }
 
 
+def _search_navigation_error(
+    navigation: NavigationToken,
+    args: SearchMessages,
+    *,
+    global_mode: bool,
+    dialog_id: int | None,
+) -> str | None:
+    if navigation.kind != "search":
+        return f"Navigation token is for {navigation.kind}, not search"
+    if navigation.query != args.query:
+        return "Navigation token belongs to a different search query"
+    if navigation.message_state != args.message_state:
+        return f"Navigation token belongs to message_state {navigation.message_state!r}, not {args.message_state!r}"
+    if (global_mode and navigation.dialog_id != 0) or (dialog_id is not None and navigation.dialog_id != dialog_id):
+        return "Navigation token belongs to a different dialog scope"
+    return None
+
+
 def _search_messages_request_context(args: SearchMessages) -> _SearchMessagesRequestContext | ToolResult:
     global_mode = args.dialog is None
     dialog_id: int | None = None
@@ -1018,17 +1037,20 @@ def _search_messages_request_context(args: SearchMessages) -> _SearchMessagesReq
             dialog_id = exact_id
 
     offset = 0
-    if args.navigation and args.navigation not in {"newest", "oldest"}:
+    if args.navigation:
         try:
             from ..pagination import decode_navigation_token
 
             nav = decode_navigation_token(args.navigation)
-            if nav.kind != "search":
+            error_message = _search_navigation_error(
+                nav,
+                args,
+                global_mode=global_mode,
+                dialog_id=dialog_id,
+            )
+            if error_message is not None:
                 return error_result(
-                    invalid_navigation_text(
-                        f"Navigation token is for {nav.kind}, not search",
-                        retry_tool="SearchMessages",
-                    ),
+                    invalid_navigation_text(error_message, retry_tool="SearchMessages"),
                     has_cursor=True,
                 )
             offset = nav.value
@@ -1586,6 +1608,7 @@ async def search_messages(args: SearchMessages) -> ToolResult:
                 query=args.query,
                 limit=args.limit,
                 offset=request_context.offset,
+                navigation=args.navigation,
                 message_state=args.message_state,
             )
     except DaemonNotRunningError:

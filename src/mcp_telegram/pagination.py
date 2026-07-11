@@ -137,6 +137,7 @@ def _decode_payload(token: str) -> dict[str, object]:
 
 def encode_navigation_token(navigation: NavigationToken) -> str:
     """Encode a NavigationToken as a URL-safe base64 JSON string."""
+    _validate_navigation_shape(navigation)
     payload: dict[str, object] = {
         "kind": navigation.kind,
         "value": navigation.value,
@@ -180,8 +181,7 @@ def decode_navigation_token(token: str) -> NavigationToken:
         raise ValueError("Invalid navigation token: dialog_id must be an integer")
 
     topic_id, query, direction, sent_at, message_state = _decode_optional_navigation_fields(data)
-
-    return NavigationToken(
+    navigation = NavigationToken(
         kind=cast("NavigationKind", kind),
         value=value,
         dialog_id=dialog_id,
@@ -191,6 +191,22 @@ def decode_navigation_token(token: str) -> NavigationToken:
         sent_at=sent_at,
         message_state=cast("str | None", message_state),
     )
+    _validate_navigation_shape(navigation)
+    return navigation
+
+
+def _validate_navigation_shape(navigation: NavigationToken) -> None:
+    """Reject signed cursors that are not fully bound to their request state."""
+    if navigation.message_state not in {"sent", "scheduled", "all"}:
+        raise ValueError("Invalid navigation token: message_state must be sent, scheduled, or all")
+    if navigation.kind == "search":
+        if navigation.query is None:
+            raise ValueError("Invalid navigation token: search cursor requires query")
+        if any(value is not None for value in (navigation.topic_id, navigation.direction, navigation.sent_at)):
+            raise ValueError("Invalid navigation token: search cursor contains history-only state")
+        return
+    if navigation.query is not None:
+        raise ValueError("Invalid navigation token: history cursor contains search-only query state")
 
 
 def _decode_optional_navigation_fields(
@@ -232,7 +248,7 @@ def encode_history_navigation(  # noqa: PLR0913
     topic_id: int | None = None,
     direction: HistoryDirection = HistoryDirection.NEWEST,
     sent_at: int | None = None,
-    message_state: str | None = None,
+    message_state: str,
 ) -> str:
     """Encode a history continuation cursor as a base64 token."""
     return encode_navigation_token(
@@ -248,7 +264,12 @@ def encode_history_navigation(  # noqa: PLR0913
     )
 
 
-def encode_search_navigation(offset: int, dialog_id: int, query: str) -> str:
+def encode_search_navigation(
+    offset: int,
+    dialog_id: int,
+    query: str,
+    message_state: str,
+) -> str:
     """Encode a search continuation cursor as a base64 token."""
     return encode_navigation_token(
         NavigationToken(
@@ -256,6 +277,7 @@ def encode_search_navigation(offset: int, dialog_id: int, query: str) -> str:
             value=offset,
             dialog_id=dialog_id,
             query=query,
+            message_state=message_state,
         )
     )
 

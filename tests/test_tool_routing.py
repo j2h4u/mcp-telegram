@@ -1104,7 +1104,7 @@ async def test_search_messages_rejects_history_navigation_token():
     """SearchMessages must not silently restart when given a ListMessages token."""
     from mcp_telegram.pagination import HistoryDirection, encode_history_navigation
 
-    token = encode_history_navigation(5, dialog_id=123, direction=HistoryDirection.NEWEST)
+    token = encode_history_navigation(5, dialog_id=123, direction=HistoryDirection.NEWEST, message_state="sent")
     conn = _make_daemon_conn({"ok": True, "data": {"messages": [], "total": 0}})
 
     with _patch_daemon(conn):

@@ -68,6 +68,7 @@ class _SearchMessagesKwargs(TypedDict):
     dialog: NotRequired[str | None]
     limit: NotRequired[int]
     offset: NotRequired[int]
+    navigation: NotRequired[str | None]
     message_state: NotRequired[str]
 
 
@@ -275,6 +276,7 @@ class DaemonConnection:
                 "query": kwargs["query"],
                 "limit": kwargs.get("limit", 20),
                 "offset": kwargs.get("offset", 0),
+                "navigation": kwargs.get("navigation"),
                 "message_state": kwargs.get("message_state", "sent"),
             }
         )

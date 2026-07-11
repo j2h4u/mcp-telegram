@@ -14,7 +14,7 @@ from mcp_telegram.pagination import (
 
 class TestNavigationTokenRoundTrip:
     def test_history_token_roundtrip(self):
-        token = encode_history_navigation(12345, dialog_id=100, direction=HistoryDirection.NEWEST)
+        token = encode_history_navigation(12345, dialog_id=100, direction=HistoryDirection.NEWEST, message_state="sent")
         nav = decode_navigation_token(token)
         assert nav.kind == "history"
         assert nav.value == 12345
@@ -24,22 +24,23 @@ class TestNavigationTokenRoundTrip:
         assert nav.topic_id is None
 
     def test_history_oldest_direction(self):
-        token = encode_history_navigation(999, dialog_id=200, direction=HistoryDirection.OLDEST)
+        token = encode_history_navigation(999, dialog_id=200, direction=HistoryDirection.OLDEST, message_state="sent")
         nav = decode_navigation_token(token)
         assert nav.direction == "oldest"
 
     def test_history_with_topic(self):
-        token = encode_history_navigation(50, dialog_id=300, topic_id=42)
+        token = encode_history_navigation(50, dialog_id=300, topic_id=42, message_state="sent")
         nav = decode_navigation_token(token)
         assert nav.topic_id == 42
 
     def test_search_token_roundtrip(self):
-        token = encode_search_navigation(offset=20, dialog_id=100, query="hello world")
+        token = encode_search_navigation(offset=20, dialog_id=100, query="hello world", message_state="scheduled")
         nav = decode_navigation_token(token)
         assert nav.kind == "search"
         assert nav.value == 20
         assert nav.dialog_id == 100
         assert nav.query == "hello world"
+        assert nav.message_state == "scheduled"
 
     def test_encode_decode_preserves_all_fields(self):
         original = NavigationToken(
@@ -73,7 +74,7 @@ class TestDecodeValidation:
 
     def test_tampered_signature_raises(self):
         """Forged MAC is rejected."""
-        token = encode_history_navigation(1, dialog_id=100)
+        token = encode_history_navigation(1, dialog_id=100, message_state="sent")
         tampered = token[:-4] + "xxxx"
         with pytest.raises(ValueError, match="signature mismatch"):
             decode_navigation_token(tampered)
@@ -129,3 +130,16 @@ class TestDecodeValidation:
         token = _encode_payload({"kind": "history", "value": 1, "dialog_id": 1, "direction": "sideways"})
         with pytest.raises(ValueError, match="direction must be newest or oldest"):
             decode_navigation_token(token)
+
+    @pytest.mark.parametrize(
+        "payload, error",
+        [
+            ({"kind": "history", "value": 1, "dialog_id": 1}, "message_state"),
+            ({"kind": "search", "value": 1, "dialog_id": 1, "message_state": "sent"}, "requires query"),
+        ],
+    )
+    def test_unbound_signed_token_is_rejected(self, payload: dict[str, object], error: str) -> None:
+        from mcp_telegram.pagination import _encode_payload
+
+        with pytest.raises(ValueError, match=error):
+            decode_navigation_token(_encode_payload(payload))

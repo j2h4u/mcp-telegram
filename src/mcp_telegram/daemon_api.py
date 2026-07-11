@@ -1437,6 +1437,8 @@ class DaemonAPIServer:
         navigation: str | None,
         dialog_id: int,
         direction: str,
+        message_state: str,
+        topic_id: int | None,
     ) -> tuple[int | None, str] | dict:
         """Delegate history-navigation decoding to the reading service."""
         from .daemon_reading import DaemonReadingService
@@ -1445,6 +1447,8 @@ class DaemonAPIServer:
             navigation,
             dialog_id,
             direction,
+            message_state,
+            topic_id,
         )
 
     # ------------------------------------------------------------------
