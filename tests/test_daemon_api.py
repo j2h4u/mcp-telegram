@@ -5267,7 +5267,8 @@ def test_line_409_filter_has_documenting_comment() -> None:
     """Documents that sender_name filter intentionally uses the denormalized column."""
     import pathlib
 
-    src = pathlib.Path("src/mcp_telegram/daemon_api.py").read_text()
+    # _build_list_messages_query owns this filter (Slice 2a: extracted to daemon_message_queries).
+    src = pathlib.Path("src/mcp_telegram/daemon_message_queries.py").read_text()
     assert src.count("Filter uses denormalized column intentionally") == 1
 
 

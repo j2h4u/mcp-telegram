@@ -40,12 +40,11 @@ import contextvars
 import dataclasses
 import json
 import logging
-import re
 import sqlite3
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol, cast
+from typing import TYPE_CHECKING, Protocol, cast
 
 from telethon import utils as telethon_utils  # type: ignore[import-untyped]
 from telethon.tl.functions.channels import (
@@ -72,12 +71,67 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
 )
 
 from . import daemon_activity_stats as _activity_stats
+
+# NOTE: names carrying an F401-suppression comment below are Slice 2a TEMPORARY
+# re-exports — unused inside daemon_api, kept only so ``daemon_api.<name>`` keeps
+# resolving for not-yet-switched call sites (daemon_reading) and the golden/parity
+# tests. Delete them in Slice 2 once every call site imports from the owner module.
 from .daemon_account_trace import (
+    _TRACE_ACRONYM_MAX_LEN,  # noqa: F401
+    _TRACE_ACRONYM_MIN_LEN,  # noqa: F401
+    _TRACE_FUZZY_MIN_LEN,  # noqa: F401
+    _TRACE_FUZZY_SCORE_MIN,  # noqa: F401
+    GROUP_TTL,
+    USER_TTL,
     DaemonAccountTraceDeps,
     DaemonAccountTraceService,
 )
+from .daemon_dialog_queries import (
+    _BATCHED_UNREAD_COUNTS_SQL,  # noqa: F401
+    _COLLECT_UNREAD_DIALOGS_WITH_COUNTS_SQL,
+    _COUNT_BOOTSTRAP_PENDING_SQL,
+    _COUNT_MESSAGES_BY_DIALOG_SQL,  # noqa: F401
+    _COUNT_SYNCED_MESSAGES_SQL,
+    _GET_ACCESS_LOST_ALERTS_SQL,
+    _GET_DELETED_ALERTS_SQL,
+    _GET_EDIT_ALERTS_SQL,
+    _GET_READ_POSITION_SQL,  # noqa: F401
+    _GET_SYNC_STATUS_SQL,
+    _LIST_DIALOGS_SQL,  # noqa: F401
+    _LIST_TOPICS_SQL,
+    _MARK_FOR_SYNC_SQL,
+    _SELECT_DIALOG_ACCESS_META_SQL,  # noqa: F401
+    _SELECT_SYNCED_STATUSES_SQL,  # noqa: F401
+    _UNMARK_SYNC_SQL,
+    _build_access_metadata,  # noqa: F401
+    _compute_snapshot_age_h,  # noqa: F401
+    _compute_sync_coverage,
+)
 from .daemon_entity_info import DaemonEntityInfoService, EntityInfoDeps
 from .daemon_ipc import get_daemon_socket_path as _get_daemon_socket_path
+from .daemon_message_queries import (
+    _FETCH_UNREAD_MESSAGES_SQL,
+    _LIST_MESSAGES_BASE_SQL,  # noqa: F401
+    _SELECT_FTS_ALL_SQL,  # noqa: F401
+    _SELECT_FTS_SQL,  # noqa: F401
+    _SELECT_MESSAGES_SQL,  # noqa: F401
+    _SENDER_ENTITY_JOINS_SQL,  # noqa: F401
+    _SENDER_FIRST_NAME_SQL,  # noqa: F401
+    EFFECTIVE_SENDER_ID_SQL,  # noqa: F401
+    _assert_select_columns_match_read_message,  # noqa: F401
+    _build_list_messages_query,  # noqa: F401
+    _ListMessagesDbRequest,  # noqa: F401
+    _read_message_from_row,
+)
+from .daemon_read_state_queries import _dialog_type_from_db, _read_state_for_dialog
+from .models import DialogType, ReadMessage
+from .models import (
+    # Slice 2a TEMP re-export: daemon_reading still reads the ReadState type as
+    # ``daemon_api.ReadState``. Delete in Slice 2 once it imports from .models
+    # (or daemon_read_state_queries) directly. `X as X` marks the deliberate
+    # re-export for ruff.
+    ReadState as ReadState,
+)
 
 DEFAULT_ACTIVITY_DIALOG_KINDS = _activity_stats.DEFAULT_ACTIVITY_DIALOG_KINDS
 _ACTIVITY_DIALOG_KIND_ALIASES = _activity_stats._ACTIVITY_DIALOG_KIND_ALIASES
@@ -88,26 +142,29 @@ _GET_DIALOG_TOP_MENTIONS_SQL = _activity_stats._GET_DIALOG_TOP_MENTIONS_SQL
 _GET_DIALOG_TOP_REACTIONS_SQL = _activity_stats._GET_DIALOG_TOP_REACTIONS_SQL
 _SELECT_SYNC_STATUS_SQL = _activity_stats._SELECT_SYNC_STATUS_SQL
 
+# Entity / telemetry SQL
+_UPSERT_ENTITY_SQL = (
+    "INSERT OR REPLACE INTO entities (id, type, name, username, name_normalized, updated_at) VALUES (?, ?, ?, ?, ?, ?)"
+)
+_ALL_ENTITY_NAMES_SQL = (
+    "SELECT id, name FROM entities "
+    "WHERE name IS NOT NULL "
+    "AND ((type IN ('User', 'Bot') AND updated_at >= ?) "  # PascalCase per ListDialogs type vocabulary
+    "OR (type NOT IN ('User', 'Bot') AND updated_at >= ?))"
+)
+_ALL_ENTITY_NAMES_NORMALIZED_SQL = (
+    "SELECT id, name_normalized FROM entities "
+    "WHERE name_normalized IS NOT NULL "
+    "AND ((type IN ('User', 'Bot') AND updated_at >= ?) "  # PascalCase per ListDialogs type vocabulary
+    "OR (type NOT IN ('User', 'Bot') AND updated_at >= ?))"
+)
+_ENTITY_BY_USERNAME_SQL = "SELECT id, name, username, name_normalized FROM entities WHERE username = ? COLLATE NOCASE"
+
 
 def _attr(obj: object, name: str, default: object | None = None) -> object | None:
     try:
         return cast(object | None, object.__getattribute__(obj, name))
     except AttributeError:
-        return default
-
-
-def _row_sequence(row: object) -> Sequence[object]:
-    return cast(Sequence[object], row)
-
-
-def _row_mapping(row: object) -> Mapping[str, object]:
-    return cast(Mapping[str, object], row)
-
-
-def _row_value(row: object, key: str, default: object | None = None) -> object | None:
-    try:
-        return cast(object | None, row[key])  # type: ignore[index]
-    except AttributeError, IndexError, KeyError, TypeError:
         return default
 
 
@@ -118,143 +175,19 @@ def _coerce_int(value: object, default: int) -> int:
         return default
 
 
-def _read_message_from_row(row: Mapping[str, object], *, reactions_display: str = "") -> ReadMessage:
-    return ReadMessage(
-        message_id=_coerce_int(row["message_id"], 0),
-        sent_at=_coerce_int(row["sent_at"], 0),
-        dialog_id=_coerce_int(row["dialog_id"], 0),
-        text=cast(str | None, _row_value(row, "text")),
-        sender_id=cast(int | None, _row_value(row, "sender_id")),
-        sender_first_name=cast(str | None, _row_value(row, "sender_first_name")),
-        media_description=cast(str | None, _row_value(row, "media_description")),
-        reply_to_msg_id=cast(int | None, _row_value(row, "reply_to_msg_id")),
-        forum_topic_id=cast(int | None, _row_value(row, "forum_topic_id")),
-        is_deleted=_coerce_int(cast(object, _row_value(row, "is_deleted", 0)), 0),
-        deleted_at=cast(int | None, _row_value(row, "deleted_at")),
-        edit_date=cast(int | None, _row_value(row, "edit_date")),
-        topic_title=cast(str | None, _row_value(row, "topic_title")),
-        effective_sender_id=cast(int | None, _row_value(row, "effective_sender_id")),
-        is_service=_coerce_int(cast(object, _row_value(row, "is_service", 0)), 0),
-        out=_coerce_int(cast(object, _row_value(row, "out", 0)), 0),
-        fwd_from_name=cast(str | None, _row_value(row, "fwd_from_name")),
-        post_author=cast(str | None, _row_value(row, "post_author")),
-        reactions_display=reactions_display,
-        dialog_name=cast(str | None, _row_value(row, "dialog_name")),
-    )
-
-
 def get_daemon_socket_path() -> Path:
     """Return the canonical path for the daemon Unix socket."""
     return _get_daemon_socket_path()
 
 
-def _dialog_type_from_db(conn: sqlite3.Connection, dialog_id: int) -> str:
-    """Return dialog type string from sync.db entities table.
-
-    Zero Telegram API calls — pure sqlite lookup. Returns one of the values
-    produced by the Telegram entity classifier (same vocabulary). Returns "Unknown"
-    when no entity row exists yet (the row is populated by sync bootstrap and
-    by live event handlers).
-
-    This is the cheap daemon-side path for _list_messages / _search_messages /
-    _list_unread_messages where only the numeric dialog_id is available.
-    """
-    row = cast(tuple[object] | None, conn.execute("SELECT type FROM entities WHERE id = ?", (dialog_id,)).fetchone())
-    if row is None:
-        return "Unknown"
-    return str(row[0])
-
-
-def _read_state_for_dialog(conn: sqlite3.Connection, dialog_id: int, dialog_type: str) -> ReadState | None:
-    """Compute the bidirectional ReadState for a DM.
-
-    Returns None for non-DM dialog types (Channel/Group/Forum/Chat/Bot/Unknown).
-    For DMs (dialog_type == "User"):
-      * Reads read_inbox_max_id + read_outbox_max_id from synced_dialogs.
-      * Counts unread per side: incoming (out=0) above read_inbox_max_id,
-        outgoing (out=1) above read_outbox_max_id.
-      * Resolves cursor_state in {populated, null, all_read}.
-      * Fetches MIN(sent_at) of the unread tail per side when count > 0.
-
-    Zero Telegram API calls. Single pair of SQL queries (cursor row + one
-    GROUP BY count-and-min over messages). See Plan 39.3-03 / models.ReadState.
-    """
-    if DialogType.parse(dialog_type) != DialogType.USER:
-        return None
-
-    # WR-04 + WR-05: fold cursor lookup and count aggregation into a single
-    # statement (CTE) for atomic snapshot consistency. Without this, a
-    # concurrent on_message_read / on_outbox_read writer committing between
-    # the two reads could produce a mathematically inconsistent response
-    # (cursor at T0, count at T1). WR-05: exclude tombstoned messages
-    # (is_deleted = 0) so counts match _BATCHED_UNREAD_COUNTS_SQL used by
-    # list_dialogs.
-    row = cast(
-        tuple[object, object, object, object, object, object] | None,
-        conn.execute(
-            """
-        WITH sd AS (
-          SELECT read_inbox_max_id AS in_c, read_outbox_max_id AS out_c
-          FROM synced_dialogs WHERE dialog_id = :dialog_id
-        )
-        SELECT
-          (SELECT in_c FROM sd)  AS in_cursor,
-          (SELECT out_c FROM sd) AS out_cursor,
-          SUM(CASE WHEN m.out = 0 AND m.message_id > COALESCE((SELECT in_c FROM sd), -1)  THEN 1 ELSE 0 END) AS in_cnt,
-          SUM(CASE WHEN m.out = 1 AND m.message_id > COALESCE((SELECT out_c FROM sd), -1) THEN 1 ELSE 0 END) AS out_cnt,
-          MIN(CASE WHEN m.out = 0 AND m.message_id > COALESCE((SELECT in_c FROM sd), -1)  THEN m.sent_at END) AS in_min,
-          MIN(CASE WHEN m.out = 1 AND m.message_id > COALESCE((SELECT out_c FROM sd), -1) THEN m.sent_at END) AS out_min
-        FROM messages m
-        WHERE m.dialog_id = :dialog_id AND m.is_deleted = 0 AND m.is_service = 0
-        """,
-            {"dialog_id": dialog_id},
-        ).fetchone(),
-    )
-    # ``row`` is always a single aggregate row (SUM/MIN with no FROM rows yield NULL).
-    # Cursor subqueries resolve to NULL when synced_dialogs has no matching row —
-    # identical to the previous two-query behaviour.
-    read_inbox_max_id = cast(int | None, row[0]) if row is not None else None
-    read_outbox_max_id = cast(int | None, row[1]) if row is not None else None
-    agg_row = (
-        cast(tuple[int | None, int | None, int | None, int | None], (row[2], row[3], row[4], row[5]))
-        if row is not None
-        else (None, None, None, None)
-    )
-    in_cnt = int(agg_row[0] or 0)
-    out_cnt = int(agg_row[1] or 0)
-    in_min = cast(int | None, agg_row[2])
-    out_min = cast(int | None, agg_row[3])
-
-    def _state(cursor: int | None, unread_count: int) -> Literal["populated", "null", "all_read"]:
-        if cursor is None:
-            return "null"
-        if unread_count == 0:
-            return "all_read"
-        return "populated"
-
-    rs: ReadState = {
-        "inbox_unread_count": in_cnt,
-        "inbox_cursor_state": _state(read_inbox_max_id, in_cnt),
-        "outbox_unread_count": out_cnt,
-        "outbox_cursor_state": _state(read_outbox_max_id, out_cnt),
-    }
-    if read_inbox_max_id is not None:
-        rs["inbox_max_id_anchor"] = int(read_inbox_max_id)
-    if read_outbox_max_id is not None:
-        rs["outbox_max_id_anchor"] = int(read_outbox_max_id)
-    if in_cnt > 0 and in_min is not None:
-        rs["inbox_oldest_unread_date"] = int(in_min)
-    if out_cnt > 0 and out_min is not None:
-        rs["outbox_oldest_unread_date"] = int(out_min)
-    return rs
-
-
-USER_TTL: int = 2_592_000  # 30 days
-GROUP_TTL: int = 604_800  # 7 days
-
-
 from .budget import allocate_message_budget_proportional, unread_chat_tier
-from .daemon_message import fetch_reaction_counts
+
+# REACTIONS_TTL_SECONDS: Slice 2a TEMP re-export — daemon_reading + tests still read
+# ``daemon_api.REACTIONS_TTL_SECONDS``. Delete in Slice 2 once they switch.
+from .daemon_message import (
+    REACTIONS_TTL_SECONDS,  # noqa: F401
+    fetch_reaction_counts,
+)
 from .daemon_source_export import (
     _describe_source,
     _export_source_changes,
@@ -262,7 +195,6 @@ from .daemon_source_export import (
 )
 from .feedback_db import VALID_SEVERITIES, VALID_STATUSES
 from .formatter import format_reaction_counts
-from .models import DialogType, ReadMessage, ReadState
 from .sync_worker import extract_reactions_rows
 
 
@@ -302,19 +234,6 @@ type _DispatchHandler = Callable[
 ]
 
 
-class _ListMessagesDbRequest(Protocol):
-    dialog_id: int
-    limit: int
-    self_id: int | None
-    direction: str
-    anchor_msg_id: int | None
-    anchor_sent_at: int | None
-    sender_id: int | None
-    sender_name: str | None
-    topic_id: int | None
-    unread_after_id: int | None
-
-
 if TYPE_CHECKING:
     from .daemon_account_trace import _AccountTraceClientLike
     from .daemon_account_trace import _LoggerLike as AccountTraceLoggerLike
@@ -334,11 +253,6 @@ else:
 
 # Phase 39.2 §Key technical decisions: per-message TTL for JIT reactions freshen-on-read.
 # Amortizes rapid paginated reads on the same ids; live events catch most mutations.
-REACTIONS_TTL_SECONDS = 600
-_TRACE_ACRONYM_MIN_LEN = 2
-_TRACE_ACRONYM_MAX_LEN = 4
-_TRACE_FUZZY_MIN_LEN = 4
-_TRACE_FUZZY_SCORE_MIN = 75
 _TELEMETRY_TOOL_NAME_MAX_LEN = 200
 _FEEDBACK_MESSAGE_MAX_LEN = 10000
 _FEEDBACK_CONTEXT_MAX_LEN = 2000
@@ -446,27 +360,6 @@ def _clamp(value: int, low: int, high: int) -> int:
     return max(low, min(value, high))
 
 
-def _compute_sync_coverage(
-    total_messages: int | None,
-    local_count: int,
-) -> int | None:
-    """Compute sync_coverage_pct.
-
-    Returns int 0-100 when local_count is comparable to the Telegram total.
-    Returns None when the total is unknown or the local row count exceeds the
-    Telegram-side total, because that is not a meaningful coverage ratio.
-    """
-    if _sync_coverage_unknown(total_messages, local_count):
-        return None
-    if total_messages == 0:
-        return 100
-    return round(local_count / cast(int, total_messages) * 100)
-
-
-def _sync_coverage_unknown(total_messages: int | None, local_count: int) -> bool:
-    return total_messages is None or total_messages < 0 or local_count > total_messages
-
-
 def _sync_db_path_from_connection(conn: sqlite3.Connection) -> Path | None:
     rows = cast(Sequence[Sequence[object]], conn.execute("PRAGMA database_list").fetchall())
     for values in rows:
@@ -481,479 +374,6 @@ def _resolve_sync_db_path(conn: sqlite3.Connection, explicit_path: Path | None) 
     if explicit_path is not None:
         return explicit_path
     return _sync_db_path_from_connection(conn)
-
-
-def _build_access_metadata(
-    conn: sqlite3.Connection,
-    dialog_id: int,
-    status: str,
-) -> dict:
-    """Build consistent access metadata for list_messages / search_messages responses.
-
-    Returns dict with: dialog_access, and for access_lost dialogs: access_lost_at,
-    last_synced_at, last_event_at, sync_coverage_pct, and optionally
-    archived_message_count (when total_messages is None).
-    """
-    meta: dict = {"dialog_access": "archived" if status == "access_lost" else "live"}
-
-    if status == "access_lost":
-        row = cast(
-            tuple[object, object, object, object, object] | None,
-            conn.execute(_SELECT_DIALOG_ACCESS_META_SQL, (dialog_id,)).fetchone(),
-        )
-        if row:
-            _, total_messages, access_lost_at, last_synced_at, last_event_at = row
-            total_messages_i = cast(int | None, total_messages)
-            count_row = cast(tuple[object] | None, conn.execute(_COUNT_SYNCED_MESSAGES_SQL, (dialog_id,)).fetchone())
-            local_count = int(cast(int | str, count_row[0])) if count_row else 0
-
-            meta["access_lost_at"] = access_lost_at
-            meta["last_synced_at"] = last_synced_at
-            meta["last_event_at"] = last_event_at
-            meta["sync_coverage_pct"] = _compute_sync_coverage(total_messages_i, local_count)
-            if total_messages_i is None:
-                meta["archived_message_count"] = local_count
-
-    return meta
-
-
-# ---------------------------------------------------------------------------
-# SQL constants
-# ---------------------------------------------------------------------------
-
-# Phase 39.1-02: effective_sender_id collapses DM direction into a concrete user id.
-# For DM outgoing rows (sender_id IS NULL, out=1) → self_id (from :self_id parameter).
-# For DM incoming rows (sender_id IS NULL, out=0) → dialog_id (the peer).
-# For service messages (is_service=1) or group unknown senders → NULL (render as System/unknown).
-# Interpolated into every read-path SELECT; every caller MUST bind :self_id.
-_EFFECTIVE_SENDER_ID_EXPR = (
-    "COALESCE("
-    "m.sender_id, "
-    "CASE "
-    "WHEN m.is_service = 1 THEN NULL "
-    "WHEN m.dialog_id > 0 AND m.out = 1 THEN :self_id "
-    "WHEN m.dialog_id > 0 AND m.out = 0 THEN m.dialog_id "
-    "ELSE NULL "
-    "END"
-    ")"
-)
-EFFECTIVE_SENDER_ID_SQL = _EFFECTIVE_SENDER_ID_EXPR + " AS effective_sender_id"
-
-# Shared sender_first_name projection with dual JOINs: resolve name either from
-# the raw sender_id OR, when sender_id IS NULL, from the effective_sender_id (peer
-# first_name for DM incoming; self name for DM outgoing — though "Я" wins at render).
-_SENDER_FIRST_NAME_SQL = "COALESCE(e_raw.name, e_eff.name, m.sender_first_name) AS sender_first_name"
-_SENDER_ENTITY_JOINS_SQL = (
-    "LEFT JOIN entities e_raw ON e_raw.id = m.sender_id "
-    f"LEFT JOIN entities e_eff ON e_eff.id = {_EFFECTIVE_SENDER_ID_EXPR} "
-)
-
-_SELECT_MESSAGES_SQL = (
-    f"SELECT m.message_id, m.sent_at, m.text, m.sender_id, "
-    f"{_SENDER_FIRST_NAME_SQL}, "
-    f"m.media_description, m.reply_to_msg_id, m.forum_topic_id, "
-    f"m.is_deleted, m.deleted_at, "
-    f"{EFFECTIVE_SENDER_ID_SQL}, m.is_service, m.out, m.dialog_id "
-    f"FROM messages m "
-    f"{_SENDER_ENTITY_JOINS_SQL}"
-    f"WHERE m.dialog_id = :dialog_id AND m.is_deleted = 0 "
-    f"ORDER BY m.sent_at DESC LIMIT :limit"
-)
-
-_SELECT_FTS_SQL = (
-    f"SELECT f.message_id, m.text, "
-    f"{_SENDER_FIRST_NAME_SQL}, "
-    f"m.sent_at, m.media_description, m.reply_to_msg_id, m.sender_id, m.forum_topic_id, "
-    f"{EFFECTIVE_SENDER_ID_SQL}, m.is_service, m.out, m.dialog_id "
-    f"FROM messages_fts f "
-    f"JOIN messages m ON m.dialog_id = f.dialog_id AND m.message_id = f.message_id "
-    f"{_SENDER_ENTITY_JOINS_SQL}"
-    f"WHERE messages_fts MATCH :query AND f.dialog_id = :dialog_id "
-    f"ORDER BY rank LIMIT :limit OFFSET :offset"
-)
-
-# _SELECT_FTS_ALL_SQL uses aliases e_raw/e_eff for sender entity JOINs (matching the
-# shared helpers) and de for dialog name entity JOIN.
-_SELECT_FTS_ALL_SQL = (
-    f"SELECT f.message_id, m.text, "
-    f"{_SENDER_FIRST_NAME_SQL}, "
-    f"m.sent_at, m.media_description, m.reply_to_msg_id, m.sender_id, m.forum_topic_id, "
-    f"f.dialog_id, COALESCE(de.name, CAST(f.dialog_id AS TEXT)) AS dialog_name, "
-    f"{EFFECTIVE_SENDER_ID_SQL}, m.is_service, m.out "
-    f"FROM messages_fts f "
-    f"JOIN messages m ON m.dialog_id = f.dialog_id AND m.message_id = f.message_id "
-    f"LEFT JOIN entities de ON de.id = f.dialog_id "
-    f"{_SENDER_ENTITY_JOINS_SQL}"
-    f"WHERE messages_fts MATCH :query "
-    f"ORDER BY rank LIMIT :limit OFFSET :offset"
-)
-
-_SELECT_SYNCED_STATUSES_SQL = (
-    "SELECT dialog_id, status, total_messages, access_lost_at, "
-    "read_inbox_max_id, read_outbox_max_id FROM synced_dialogs"
-)
-
-# Plan 39.3-03 Task 4 (AC-11/AC-12): batched unread-count query.
-# One GROUP BY pass over `messages`; for WITHOUT ROWID messages the PK
-# (dialog_id, message_id) IS the table — scan traverses the PK B-tree.
-# NULL-cursor semantics: COALESCE(cursor, -1) treats a NULL cursor as
-# "everything is unread" on that side. This is a deliberate trade-off for
-# triage display during the bootstrap window (documented in 39.3-03 <interfaces>
-# MEDIUM-2 + <threat_model> T-39.3-15c). Header rendering separately maps
-# NULL cursor → "[inbox: unknown (sync pending)]" (D-03) — the two semantics
-# diverge intentionally.
-#
-# Phase 44 (LISTDIALOGS-04): stale-snapshot threshold. Computed against
-# MAX(dialogs.snapshot_at WHERE hidden=0). Returned in response.data as
-# snapshot_age_h: int (hours) when stale, None when fresh or unknown.
-#
-# NOTE (RESEARCH.md Assumption A2): MAX(snapshot_at) is OPTIMISTIC.
-# Even one recently-refreshed dialog will make the whole snapshot appear
-# fresh, hiding the case where the majority of rows are stale. This is
-# accepted in v1.6: the reconciliation watermark and per-row staleness
-# would be more accurate, but require additional schema and reconciliation
-# changes that are out of scope. The agent-facing UX is "if stale, surface
-# one number; otherwise stay quiet" and MAX is the simplest signal that
-# satisfies that contract. Revisit if user feedback shows the optimistic
-# bias misleads agents (track in beads, not here).
-_SNAPSHOT_STALE_THRESHOLD_S = 12 * 3600
-
-
-def _compute_snapshot_age_h(max_snapshot_at: int | None) -> int | None:
-    """Return integer hours since the freshest snapshot, or None when fresh/unknown.
-
-    Per Assumption A2 (RESEARCH.md): MAX(snapshot_at) is the freshest row's
-    timestamp, not a watermark. One refreshed row makes the whole snapshot
-    appear fresh — accepted trade-off for v1.6.
-    """
-    if max_snapshot_at is None:
-        return None
-    age_s = int(time.time()) - int(max_snapshot_at)
-    if age_s > _SNAPSHOT_STALE_THRESHOLD_S:
-        return age_s // 3600
-    return None
-
-
-# Phase 44 (LISTDIALOGS-01/02/04, DIFF-04): pure-SQL dialog list.
-# LEFT JOIN synced_dialogs to preserve sync_status/total_messages/access_lost_at.
-# `:name_pat` is a Python-lowered LIKE pattern (e.g. "%женск%") OR None for
-# no pre-filter. Cyrillic case-folding is delegated to the Python fuzzy pass
-# because SQLite LOWER() is ASCII-only — see RESEARCH.md Pitfall 1.
-# `:archived_filter` and `:pinned_filter` are 0 (filter rows where col=0)
-# or None (no filter). See filter_design_contract in 44-01-PLAN.md.
-_LIST_DIALOGS_SQL = """
-WITH agent_visible_dialogs AS (
-    SELECT
-        d.dialog_id,
-        d.name,
-        d.type,
-        d.archived,
-        d.pinned,
-        d.members,
-        d.created,
-        COALESCE(d.last_message_at, sd.last_event_at, sd.last_synced_at, sd.access_lost_at) AS last_message_at,
-        d.snapshot_at,
-        d.unread_mentions_count,
-        d.unread_reactions_count,
-        d.draft_text,
-        sd.status AS sync_status,
-        sd.total_messages,
-        sd.access_lost_at
-    FROM dialogs d
-    LEFT JOIN synced_dialogs sd USING(dialog_id)
-    WHERE d.hidden = 0 OR sd.status = 'access_lost'
-
-    UNION ALL
-
-    SELECT
-        sd.dialog_id,
-        NULL AS name,
-        NULL AS type,
-        0 AS archived,
-        0 AS pinned,
-        NULL AS members,
-        NULL AS created,
-        COALESCE(sd.last_event_at, sd.last_synced_at, sd.access_lost_at) AS last_message_at,
-        NULL AS snapshot_at,
-        0 AS unread_mentions_count,
-        0 AS unread_reactions_count,
-        NULL AS draft_text,
-        sd.status AS sync_status,
-        sd.total_messages,
-        sd.access_lost_at
-    FROM synced_dialogs sd
-    LEFT JOIN dialogs d USING(dialog_id)
-    WHERE sd.status = 'access_lost' AND d.dialog_id IS NULL
-)
-SELECT
-    dialog_id, name, type, archived, pinned,
-    members, created, last_message_at, snapshot_at,
-    unread_mentions_count, unread_reactions_count, draft_text,
-    sync_status, total_messages, access_lost_at
-FROM agent_visible_dialogs
-WHERE (:archived_filter IS NULL OR archived = :archived_filter)
-AND (:pinned_filter IS NULL OR pinned = :pinned_filter)
-AND (:name_pat IS NULL OR LOWER(name) LIKE :name_pat ESCAPE '\\')
-ORDER BY pinned DESC, last_message_at DESC
-"""
-
-# Contract note (WR-06): results of this query are emitted on `list_dialogs`
-# rows as `unread_in` / `unread_out` ONLY for DMs (type == "User"). Non-DM
-# rows OMIT both keys entirely. See the inline comment in `_list_dialogs`
-# where the keys are conditionally attached for the full contract text.
-_BATCHED_UNREAD_COUNTS_SQL = (
-    "SELECT m.dialog_id, "
-    'SUM(CASE WHEN m."out" = 0 AND m.message_id > COALESCE(sd.read_inbox_max_id, -1) '
-    "THEN 1 ELSE 0 END) AS unread_in, "
-    'SUM(CASE WHEN m."out" = 1 AND m.message_id > COALESCE(sd.read_outbox_max_id, -1) '
-    "THEN 1 ELSE 0 END) AS unread_out "
-    "FROM messages m JOIN synced_dialogs sd USING(dialog_id) "
-    "WHERE sd.status = 'synced' AND m.is_deleted = 0 AND m.is_service = 0 "
-    "GROUP BY m.dialog_id"
-)
-
-_MARK_FOR_SYNC_SQL = "INSERT OR IGNORE INTO synced_dialogs (dialog_id, status) VALUES (?, 'not_synced')"
-_UNMARK_SYNC_SQL = "UPDATE synced_dialogs SET status = 'not_synced', sync_progress = NULL WHERE dialog_id = ?"
-
-_GET_SYNC_STATUS_SQL = (
-    "SELECT status, last_synced_at, last_event_at, sync_progress, total_messages, access_lost_at "
-    "FROM synced_dialogs WHERE dialog_id = ?"
-)
-_COUNT_SYNCED_MESSAGES_SQL = "SELECT COUNT(*) FROM messages WHERE dialog_id = ? AND is_deleted = 0"
-
-# NOTE: This scans all non-deleted rows once to compute per-dialog message
-# totals for list_dialogs. `messages` is WITHOUT ROWID with primary key
-# `(dialog_id, message_id)`, so add-on dialog/is_deleted indexes should be
-# treated as a performance experiment before any migration.
-_COUNT_MESSAGES_BY_DIALOG_SQL = "SELECT dialog_id, COUNT(*) FROM messages WHERE is_deleted = 0 GROUP BY dialog_id"
-
-_SELECT_DIALOG_ACCESS_META_SQL = (
-    "SELECT status, total_messages, access_lost_at, last_synced_at, last_event_at "
-    "FROM synced_dialogs WHERE dialog_id = ?"
-)
-
-_GET_DELETED_ALERTS_SQL = (
-    "SELECT dialog_id, message_id, text, deleted_at "
-    "FROM messages WHERE is_deleted = 1 AND deleted_at > ? "
-    "ORDER BY deleted_at DESC LIMIT ?"
-)
-_GET_EDIT_ALERTS_SQL = (
-    "SELECT dialog_id, message_id, version, old_text, edit_date "
-    "FROM message_versions WHERE edit_date > ? "
-    "ORDER BY edit_date DESC LIMIT ?"
-)
-_GET_ACCESS_LOST_ALERTS_SQL = (
-    "SELECT dialog_id, access_lost_at FROM synced_dialogs WHERE status = 'access_lost' AND access_lost_at > ?"
-)
-
-# Unread SQL — zero Telegram API calls (Plan 38-02)
-# Single grouped query: scalar subquery provides per-dialog unread_count in ONE round trip,
-# replacing the N+1 COUNT(*)-per-dialog pattern. Uses idx_synced_dialogs_status_read_position
-# (schema v8) for the outer filter and messages PK (dialog_id, message_id) for range scans.
-_COLLECT_UNREAD_DIALOGS_WITH_COUNTS_SQL = (
-    "SELECT sd.dialog_id, sd.read_inbox_max_id, sd.last_event_at, "
-    "COALESCE(e.name, CAST(sd.dialog_id AS TEXT)) AS display_name, "
-    "COALESCE(e.type, d.type, 'Unknown') AS entity_type, "
-    "d.members AS participants_count, "
-    "(SELECT COUNT(*) FROM messages m "
-    " WHERE m.dialog_id = sd.dialog_id "
-    "   AND m.message_id > sd.read_inbox_max_id "
-    "   AND m.is_deleted = 0"
-    '   AND m."out" = 0'
-    "   AND m.is_service = 0) AS unread_count "
-    "FROM synced_dialogs sd "
-    "LEFT JOIN entities e ON e.id = sd.dialog_id "
-    "LEFT JOIN dialogs d ON d.dialog_id = sd.dialog_id "
-    "WHERE sd.status = 'synced' "
-    "AND sd.read_inbox_max_id IS NOT NULL"
-)
-_FETCH_UNREAD_MESSAGES_SQL = (
-    f"SELECT m.message_id, m.sent_at, m.text, m.sender_id, "
-    f"{_SENDER_FIRST_NAME_SQL}, "
-    f"{EFFECTIVE_SENDER_ID_SQL}, m.is_service, m.out, m.dialog_id "
-    f"FROM messages m "
-    f"{_SENDER_ENTITY_JOINS_SQL}"
-    f"WHERE m.dialog_id = :dialog_id AND m.message_id > :after_msg_id AND m.is_deleted = 0 "
-    f'AND m."out" = 0 AND m.is_service = 0 '
-    f"ORDER BY m.message_id ASC LIMIT :limit"
-)
-_GET_READ_POSITION_SQL = "SELECT read_inbox_max_id FROM synced_dialogs WHERE dialog_id = ?"
-_COUNT_BOOTSTRAP_PENDING_SQL = (
-    "SELECT COUNT(*) FROM synced_dialogs WHERE status = 'synced' AND read_inbox_max_id IS NULL"
-)
-
-# Entity / telemetry SQL
-_UPSERT_ENTITY_SQL = (
-    "INSERT OR REPLACE INTO entities (id, type, name, username, name_normalized, updated_at) VALUES (?, ?, ?, ?, ?, ?)"
-)
-_ALL_ENTITY_NAMES_SQL = (
-    "SELECT id, name FROM entities "
-    "WHERE name IS NOT NULL "
-    "AND ((type IN ('User', 'Bot') AND updated_at >= ?) "  # PascalCase per ListDialogs type vocabulary
-    "OR (type NOT IN ('User', 'Bot') AND updated_at >= ?))"
-)
-_ALL_ENTITY_NAMES_NORMALIZED_SQL = (
-    "SELECT id, name_normalized FROM entities "
-    "WHERE name_normalized IS NOT NULL "
-    "AND ((type IN ('User', 'Bot') AND updated_at >= ?) "  # PascalCase per ListDialogs type vocabulary
-    "OR (type NOT IN ('User', 'Bot') AND updated_at >= ?))"
-)
-_ENTITY_BY_USERNAME_SQL = "SELECT id, name, username, name_normalized FROM entities WHERE username = ? COLLATE NOCASE"
-
-
-# list_topics — read from topic_metadata snapshot (Phase 45)
-_LIST_TOPICS_SQL = (
-    "SELECT topic_id, title, icon_emoji_id, date "
-    "FROM topic_metadata "
-    "WHERE dialog_id = ? AND is_deleted = 0 AND hidden = 0 "
-    "ORDER BY topic_id ASC"
-)
-
-
-# ---------------------------------------------------------------------------
-# Dynamic SQL builder for list_messages
-# ---------------------------------------------------------------------------
-
-# Base SELECT shared by _build_list_messages_query and _list_messages_context_window.
-# Appends dialog_id=:dialog_id and is_deleted=0 guards; callers add further conditions
-# (appended as " AND ..." with named params or positional — see _build_list_messages_query).
-# Callers MUST bind :self_id (used by EFFECTIVE_SENDER_ID_SQL CASE expression).
-_LIST_MESSAGES_BASE_SQL = (
-    f"SELECT m.message_id, m.sent_at, m.text, m.sender_id, "
-    f"{_SENDER_FIRST_NAME_SQL}, "
-    f"m.media_description, m.reply_to_msg_id, m.forum_topic_id, "
-    f"m.is_deleted, m.deleted_at, "
-    f"COALESCE("
-    f"  (SELECT MAX(mv.edit_date) FROM message_versions mv "
-    f"   WHERE mv.dialog_id = m.dialog_id AND mv.message_id = m.message_id), "
-    f"  m.edit_date"
-    f") AS edit_date, "
-    f"COALESCE(tm.title, CASE WHEN m.forum_topic_id = 1 THEN 'General' END) AS topic_title, "
-    f"{EFFECTIVE_SENDER_ID_SQL}, m.is_service, m.out, m.dialog_id, "
-    f"mf.fwd_from_name, m.post_author "
-    f"FROM messages m "
-    f"LEFT JOIN topic_metadata tm "
-    f"  ON tm.dialog_id = m.dialog_id AND tm.topic_id = m.forum_topic_id "
-    f"{_SENDER_ENTITY_JOINS_SQL}"
-    f"LEFT JOIN message_forwards mf ON mf.dialog_id = m.dialog_id AND mf.message_id = m.message_id "
-    f"WHERE m.dialog_id = :dialog_id AND m.is_deleted = 0"
-)
-
-
-def _assert_select_columns_match_read_message() -> None:
-    """Verify SELECT aliases in _LIST_MESSAGES_BASE_SQL cover all
-    ReadMessage fields except the two injected post-query fields."""
-    from dataclasses import fields as dc_fields
-
-    expected = frozenset(f.name for f in dc_fields(ReadMessage) if f.name not in {"reactions_display", "dialog_name"})
-    # Match both `... AS alias` forms and bare table-qualified refs (`m.col`, `mf.col`)
-    aliases = frozenset(re.findall(r"\bAS\s+(\w+)", _LIST_MESSAGES_BASE_SQL))
-    bare = frozenset(re.findall(r"\b(?:m|mf)\.(\w+)\b", _LIST_MESSAGES_BASE_SQL))
-    found = aliases | bare
-    missing = expected - found
-    extra = found - expected
-    assert not missing and not extra, f"SELECT/ReadMessage field mismatch — missing: {missing}, extra: {extra}"
-
-
-_assert_select_columns_match_read_message()
-
-
-def _apply_list_messages_anchor_filter(
-    sql: str,
-    params: dict[str, object],
-    req: _ListMessagesDbRequest,
-) -> tuple[str, dict[str, object]]:
-    anchor_msg_id = req.anchor_msg_id
-    if anchor_msg_id is None:
-        return sql, params
-
-    anchor_sent_at = _attr(req, "anchor_sent_at", None)
-    if anchor_sent_at is not None:
-        if req.direction == "oldest":
-            sql += (
-                " AND (m.sent_at > :anchor_sent_at OR (m.sent_at = :anchor_sent_at AND m.message_id > :anchor_msg_id))"
-            )
-        else:
-            sql += (
-                " AND (m.sent_at < :anchor_sent_at OR (m.sent_at = :anchor_sent_at AND m.message_id < :anchor_msg_id))"
-            )
-        params["anchor_sent_at"] = anchor_sent_at
-    elif req.direction == "oldest":
-        sql += " AND m.message_id > :anchor_msg_id"
-    else:
-        sql += " AND m.message_id < :anchor_msg_id"
-    params["anchor_msg_id"] = anchor_msg_id
-    return sql, params
-
-
-def _build_list_messages_query(req: _ListMessagesDbRequest) -> tuple[str, dict[str, object]]:
-    """Build a parameterized SELECT for list_messages against sync.db.
-
-    Returns (sql_string, params_dict).  Column names in the SELECT match
-    ReadMessage field names; rows are fetched via conn.row_factory = sqlite3.Row
-    and converted to ReadMessage objects by _list_messages_from_db.
-
-    self_id is bound to `req.self_id` (used by the EFFECTIVE_SENDER_ID_SQL CASE
-    expression to collapse DM direction). If not set, DM outgoing rows will
-    project effective_sender_id=NULL instead of the authenticated user id.
-    """
-    dialog_id = req.dialog_id
-    limit = req.limit
-    self_id = _attr(req, "self_id", None)
-    direction = req.direction
-    anchor_msg_id = req.anchor_msg_id
-    sender_id = req.sender_id
-    sender_name = req.sender_name
-    topic_id = req.topic_id
-    unread_after_id = req.unread_after_id
-
-    params: dict[str, object] = {"dialog_id": dialog_id, "limit": limit, "self_id": self_id}
-    sql = _LIST_MESSAGES_BASE_SQL
-
-    if sender_id is not None:
-        sql += " AND m.sender_id = :filter_sender_id"
-        params["filter_sender_id"] = sender_id
-    elif sender_name is not None:
-        # Filter uses denormalized column intentionally — searches match historical names (name-at-send-time), while display COALESCEs against entities for current name.
-        sql += " AND m.sender_first_name LIKE :sender_name_pattern ESCAPE '\\' COLLATE NOCASE"
-        escaped = sender_name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        params["sender_name_pattern"] = f"%{escaped}%"
-
-    if topic_id is not None:
-        sql += " AND m.forum_topic_id = :topic_id"
-        params["topic_id"] = topic_id
-
-    if unread_after_id is not None:
-        sql += " AND m.message_id > :unread_after_id"
-        params["unread_after_id"] = unread_after_id
-
-    sql, params = _apply_list_messages_anchor_filter(sql, params, req)
-
-    if direction == "oldest":
-        sql += " ORDER BY m.message_id ASC"
-    else:
-        sql += " ORDER BY m.message_id DESC"
-
-    sql += " LIMIT :limit"
-
-    logger.debug(
-        "list_messages_query filters=%s param_count=%d direction=%s",
-        "+".join(
-            f
-            for f, v in [
-                ("sender_id", sender_id),
-                ("sender_name", sender_name),
-                ("topic_id", topic_id),
-                ("unread_after_id", unread_after_id),
-                ("anchor", anchor_msg_id),
-            ]
-            if v is not None
-        )
-        or "none",
-        len(params),
-        direction,
-    )
-    return sql, params
 
 
 # ---------------------------------------------------------------------------
