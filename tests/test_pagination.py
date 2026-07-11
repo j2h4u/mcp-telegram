@@ -49,6 +49,8 @@ class TestNavigationTokenRoundTrip:
             topic_id=7,
             query=None,
             direction=HistoryDirection.OLDEST,
+            sent_at=1_700_000_500,
+            message_state="all",
         )
         token = encode_navigation_token(original)
         decoded = decode_navigation_token(token)

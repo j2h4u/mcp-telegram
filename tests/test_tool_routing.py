@@ -645,6 +645,8 @@ async def test_list_dialogs_via_daemon():
         "exclude_archived": False,
         "ignore_pinned": False,
         "filter": None,
+        "message_state": "all",
+        "scope": "all",
     }
     first_dialog = _json_dict(dialogs[0])
     assert first_dialog["id"] == 123

@@ -22,6 +22,7 @@ class _ListMessagesQueryReq:
     self_id: int | None
     direction: str
     anchor_msg_id: int | None
+    anchor_sent_at: int | None
     sender_id: int | None
     sender_name: str | None
     topic_id: int | None
@@ -35,6 +36,7 @@ def _build_list_messages_query_req(**overrides: object) -> _ListMessagesDbReques
         "self_id": None,
         "direction": "newest",
         "anchor_msg_id": None,
+        "anchor_sent_at": None,
         "sender_id": None,
         "sender_name": None,
         "topic_id": None,
@@ -49,6 +51,7 @@ def _build_list_messages_query_req(**overrides: object) -> _ListMessagesDbReques
             self_id=None if data["self_id"] is None else int(cast(int | str, data["self_id"])),
             direction=str(data["direction"]),
             anchor_msg_id=None if data["anchor_msg_id"] is None else int(cast(int | str, data["anchor_msg_id"])),
+            anchor_sent_at=None if data["anchor_sent_at"] is None else int(cast(int | str, data["anchor_sent_at"])),
             sender_id=None if data["sender_id"] is None else int(cast(int | str, data["sender_id"])),
             sender_name=data["sender_name"] if data["sender_name"] is None else str(data["sender_name"]),
             topic_id=None if data["topic_id"] is None else int(cast(int | str, data["topic_id"])),
@@ -97,6 +100,26 @@ def test_anchor_oldest_uses_greater_than() -> None:
     sql, params = _build_list_messages_query(_build_list_messages_query_req(direction="oldest", anchor_msg_id=500))
     assert "m.message_id > :anchor_msg_id" in sql
     assert params["anchor_msg_id"] == 500
+
+
+def test_timestamp_anchor_oldest_breaks_message_id_ties() -> None:
+    """Chronological cursors compare sent_at first, then message_id."""
+    sql, params = _build_list_messages_query(
+        _build_list_messages_query_req(direction="oldest", anchor_msg_id=500, anchor_sent_at=1_700_000_500)
+    )
+    assert "m.sent_at > :anchor_sent_at" in sql
+    assert "m.message_id > :anchor_msg_id" in sql
+    assert params["anchor_sent_at"] == 1_700_000_500
+
+
+def test_timestamp_anchor_newest_breaks_message_id_ties() -> None:
+    """Newest chronological cursors use the inverse tie-breaker."""
+    sql, params = _build_list_messages_query(
+        _build_list_messages_query_req(anchor_msg_id=500, anchor_sent_at=1_700_000_500)
+    )
+    assert "m.sent_at < :anchor_sent_at" in sql
+    assert "m.message_id < :anchor_msg_id" in sql
+    assert params["anchor_sent_at"] == 1_700_000_500
 
 
 # ---------------------------------------------------------------------------

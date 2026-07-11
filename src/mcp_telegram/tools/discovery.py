@@ -1,4 +1,5 @@
 import logging
+from typing import Literal
 
 from pydantic import Field
 
@@ -62,6 +63,19 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
                     "unread_reactions_count": {"type": "integer"},
                     "draft_text": {"type": ["string", "null"]},
                     "draft_content": NULLABLE_TELEGRAM_CONTENT_OUTPUT_SCHEMA,
+                    "scheduled_count": {
+                        "type": "integer",
+                        "description": "Count of pending author-only scheduled messages in this dialog.",
+                    },
+                    "next_scheduled_at": {
+                        "type": ["integer", "null"],
+                        "description": "Earliest pending scheduled publication timestamp, if any.",
+                    },
+                    "inclusion_basis": {
+                        "type": ["array", "null"],
+                        "items": {"type": "string"},
+                        "description": "Stable own-only classifier basis when this row is in own scope.",
+                    },
                 },
                 "required": [
                     "id",
@@ -81,6 +95,9 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
                     "unread_reactions_count",
                     "draft_text",
                     "draft_content",
+                    "scheduled_count",
+                    "next_scheduled_at",
+                    "inclusion_basis",
                 ],
                 "additionalProperties": False,
             },
@@ -92,12 +109,19 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
                 "exclude_archived": {"type": "boolean"},
                 "ignore_pinned": {"type": "boolean"},
                 "filter": {"type": ["string", "null"]},
+                "message_state": {
+                    "type": "string",
+                    "enum": ["sent", "scheduled", "all"],
+                    "description": "Filter dialog summaries by pending scheduled lifecycle state.",
+                },
+                "scope": {"type": "string", "enum": ["all", "own_only"]},
             },
-            "required": ["exclude_archived", "ignore_pinned", "filter"],
+            "required": ["exclude_archived", "ignore_pinned", "filter", "message_state", "scope"],
             "additionalProperties": False,
         },
         "snapshot_age_h": {"type": ["integer", "null"]},
         "bootstrap_pending": {"type": "boolean"},
+        "scope": {"type": "string", "enum": ["all", "own_only"]},
         "warnings": {
             "type": "array",
             "items": {
@@ -113,9 +137,20 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
             },
         },
     },
-    "required": ["dialogs", "count", "filters", "snapshot_age_h", "bootstrap_pending", "warnings"],
+    "required": ["dialogs", "count", "filters", "snapshot_age_h", "bootstrap_pending", "scope", "warnings"],
     "additionalProperties": False,
 }
+
+
+def _structured_dialog_lifecycle_fields(dialog: dict) -> dict[str, object]:
+    draft_text = dialog.get("draft_text")
+    return {
+        "draft_text": draft_text,
+        "draft_content": telegram_content(str(draft_text), "message_text") if draft_text is not None else None,
+        "scheduled_count": int(dialog.get("scheduled_count", 0) or 0),
+        "next_scheduled_at": dialog.get("next_scheduled_at"),
+        "inclusion_basis": dialog.get("inclusion_basis"),
+    }
 
 
 LIST_TOPICS_OUTPUT_SCHEMA = {
@@ -162,6 +197,10 @@ class ListDialogs(ToolArgs):
     DM rows include integer 'unread_in' (incoming unread by me) and 'unread_out' (outgoing
     unread by peer); non-DM rows omit both fields.
 
+    Dialog rows include a local scheduled buffer summary. Use message_state="scheduled" to
+    return only dialogs with pending author-only scheduled messages; "all" is the default.
+    Use scope="own_only" to return only dialogs accepted by the own-message classifier.
+
     sync_status values:
       - 'not_synced'  — no bulk fetch attempted
       - 'syncing'     — bulk fetch in progress
@@ -174,6 +213,8 @@ class ListDialogs(ToolArgs):
     exclude_archived: bool = False
     ignore_pinned: bool = False
     filter: str | None = Field(default=None, max_length=200)
+    message_state: Literal["sent", "scheduled", "all"] = "all"
+    scope: Literal["all", "own_only"] = "all"
 
 
 @mcp_tool(
@@ -195,6 +236,8 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
                 exclude_archived=args.exclude_archived,
                 ignore_pinned=args.ignore_pinned,
                 filter=args.filter,
+                message_state=args.message_state,
+                scope=args.scope,
             )
     except DaemonNotRunningError as exc:
         return error_result(_daemon_not_running_text(exc))
@@ -219,7 +262,6 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
     structured_dialogs: list[dict[str, object]] = []
     for d in dialogs:
         sync_status = d.get("sync_status")
-        draft_text = d.get("draft_text")
         structured_dialogs.append(
             {
                 "id": d.get("id"),
@@ -237,8 +279,7 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
                 "unread_out": d.get("unread_out"),
                 "unread_mentions_count": int(d.get("unread_mentions_count", 0) or 0),
                 "unread_reactions_count": int(d.get("unread_reactions_count", 0) or 0),
-                "draft_text": draft_text,
-                "draft_content": telegram_content(str(draft_text), "message_text") if draft_text is not None else None,
+                **_structured_dialog_lifecycle_fields(d),
             }
         )
     structured_content = {
@@ -248,9 +289,12 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
             "exclude_archived": args.exclude_archived,
             "ignore_pinned": args.ignore_pinned,
             "filter": args.filter,
+            "message_state": args.message_state,
+            "scope": args.scope,
         },
         "snapshot_age_h": snapshot_age_h,
         "bootstrap_pending": bootstrap_pending,
+        "scope": data.get("scope", args.scope),
         "warnings": warnings,
     }
 

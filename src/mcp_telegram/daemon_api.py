@@ -308,6 +308,7 @@ class _ListMessagesDbRequest(Protocol):
     self_id: int | None
     direction: str
     anchor_msg_id: int | None
+    anchor_sent_at: int | None
     sender_id: int | None
     sender_name: str | None
     topic_id: int | None
@@ -857,6 +858,34 @@ def _assert_select_columns_match_read_message() -> None:
 _assert_select_columns_match_read_message()
 
 
+def _apply_list_messages_anchor_filter(
+    sql: str,
+    params: dict[str, object],
+    req: _ListMessagesDbRequest,
+) -> tuple[str, dict[str, object]]:
+    anchor_msg_id = req.anchor_msg_id
+    if anchor_msg_id is None:
+        return sql, params
+
+    anchor_sent_at = _attr(req, "anchor_sent_at", None)
+    if anchor_sent_at is not None:
+        if req.direction == "oldest":
+            sql += (
+                " AND (m.sent_at > :anchor_sent_at OR (m.sent_at = :anchor_sent_at AND m.message_id > :anchor_msg_id))"
+            )
+        else:
+            sql += (
+                " AND (m.sent_at < :anchor_sent_at OR (m.sent_at = :anchor_sent_at AND m.message_id < :anchor_msg_id))"
+            )
+        params["anchor_sent_at"] = anchor_sent_at
+    elif req.direction == "oldest":
+        sql += " AND m.message_id > :anchor_msg_id"
+    else:
+        sql += " AND m.message_id < :anchor_msg_id"
+    params["anchor_msg_id"] = anchor_msg_id
+    return sql, params
+
+
 def _build_list_messages_query(req: _ListMessagesDbRequest) -> tuple[str, dict[str, object]]:
     """Build a parameterized SELECT for list_messages against sync.db.
 
@@ -898,12 +927,7 @@ def _build_list_messages_query(req: _ListMessagesDbRequest) -> tuple[str, dict[s
         sql += " AND m.message_id > :unread_after_id"
         params["unread_after_id"] = unread_after_id
 
-    if anchor_msg_id is not None:
-        if direction == "oldest":
-            sql += " AND m.message_id > :anchor_msg_id"
-        else:
-            sql += " AND m.message_id < :anchor_msg_id"
-        params["anchor_msg_id"] = anchor_msg_id
+    sql, params = _apply_list_messages_anchor_filter(sql, params, req)
 
     if direction == "oldest":
         sql += " ORDER BY m.message_id ASC"

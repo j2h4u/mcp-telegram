@@ -698,7 +698,7 @@ def test_register_attaches_three_new_handlers(
     """Three new Phase 42 Plan 01 handlers (+ one Plan 02 handler) bring total to 11."""
     mgr = EventHandlerManager(mock_client, sync_db, shutdown_event)
     mgr.register()
-    assert mock_client.add_event_handler.call_count == 11
+    assert mock_client.add_event_handler.call_count == 13
 
 
 def test_unregister_detaches_all_new_handlers(

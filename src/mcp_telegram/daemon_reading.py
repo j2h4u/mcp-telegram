@@ -21,6 +21,7 @@ from .daemon_message import _MessageLike as _DaemonMessageLike
 from .daemon_message import fetch_reaction_counts, message_to_dict
 from .formatter import format_reaction_counts
 from .fts import stem_query
+from .own_only import own_only_basis_by_dialog
 from .pagination import (
     HistoryDirection,
     decode_navigation_token,
@@ -99,6 +100,7 @@ class _ListMessagesRequest:
     unread: bool
     context_message_id: int | None
     context_size: int
+    message_state: str
 
 
 @dataclass
@@ -109,10 +111,47 @@ class _ListMessagesDbRequest:
     direction: str
     direction_enum: HistoryDirection
     anchor_msg_id: int | None
+    anchor_sent_at: int | None
     sender_id: int | None
     sender_name: str | None
     topic_id: int | None
     unread_after_id: int | None
+
+
+_SCHEDULED_MESSAGES_TABLE_SQL = "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'scheduled_messages'"
+_SCHEDULED_MESSAGES_FTS_TABLE_SQL = (
+    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'scheduled_messages_fts'"
+)
+_OWN_ONLY_DIALOGS_TABLE_SQL = "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'own_only_dialogs'"
+
+_SCHEDULED_MESSAGES_SQL = """
+SELECT
+    sm.message_id AS message_id,
+    sm.scheduled_at AS sent_at,
+    sm.text,
+    sm.sender_id,
+    sm.sender_first_name,
+    sm.media_description,
+    sm.reply_to_msg_id,
+    sm.forum_topic_id,
+    0 AS is_deleted,
+    NULL AS deleted_at,
+    sm.edit_date AS edit_date,
+    NULL AS topic_title,
+    sm.sender_id AS effective_sender_id,
+    sm.is_service,
+    sm.out,
+    sm.dialog_id,
+    NULL AS fwd_from_name,
+    sm.post_author,
+    d.name AS dialog_name,
+    sm.scheduled_at AS scheduled_at,
+    sm.published_at AS published_at
+FROM scheduled_messages sm
+LEFT JOIN dialogs d ON d.dialog_id = sm.dialog_id
+WHERE sm.dialog_id = :dialog_id
+  AND sm.message_state = 'scheduled'
+"""
 
 
 @dataclass(frozen=True)
@@ -134,6 +173,7 @@ class _SearchMessagesRequest:
     query: str
     limit: int
     offset: int
+    message_state: str
 
 
 @dataclass(frozen=True)
@@ -141,6 +181,8 @@ class _ListDialogsRequest:
     exclude_archived: bool
     ignore_pinned: bool
     filter_raw: str | None
+    message_state: str
+    scope: str
 
 
 @dataclass(frozen=True)
@@ -160,6 +202,7 @@ class _NextNavContext:
     direction_enum: HistoryDirection
     logger: _LoggerLike
     request_id: Callable[[], str]
+    message_state: str | None = None
 
 
 def _row_mapping(row: object) -> Mapping[str, object]:
@@ -285,6 +328,7 @@ class DaemonReadingService:
             unread=bool(req.get("unread")),
             context_message_id=req.get("context_message_id"),
             context_size=api._clamp(req.get("context_size", 10), 2, 50),
+            message_state=req.get("message_state", "sent"),
         )
 
     @staticmethod
@@ -295,6 +339,7 @@ class DaemonReadingService:
             query=req.get("query", ""),
             limit=api._clamp(req.get("limit", 20), 1, 200),
             offset=max(0, req.get("offset", 0)),
+            message_state=req.get("message_state", "sent"),
         )
 
     @staticmethod
@@ -303,6 +348,8 @@ class DaemonReadingService:
             exclude_archived=bool(req.get("exclude_archived", False)),
             ignore_pinned=bool(req.get("ignore_pinned", False)),
             filter_raw=req.get("filter"),
+            message_state=req.get("message_state", "all"),
+            scope=req.get("scope", "all"),
         )
 
     @staticmethod
@@ -344,8 +391,16 @@ class DaemonReadingService:
                 last_msg_id,
                 context.dialog_id,
                 direction=context.direction_enum,
+                sent_at=DaemonReadingService._navigation_sent_at(last),
+                message_state=context.message_state,
             )
         return None
+
+    @staticmethod
+    def _navigation_sent_at(message: object) -> int | None:
+        if isinstance(message, api.ReadMessage):
+            return message.sent_at
+        return _object_to_int_or_none(_row_value(message, "sent_at"))
 
     @staticmethod
     def _decode_history_navigation(
@@ -499,6 +554,7 @@ class DaemonReadingService:
                     direction=direction,
                     direction_enum=direction_enum,
                     anchor_msg_id=anchor_msg_id,
+                    anchor_sent_at=None,
                     sender_id=request.sender_id,
                     sender_name=request.sender_name,
                     topic_id=request.topic_id,
@@ -602,6 +658,121 @@ class DaemonReadingService:
             return encode_search_navigation(next_offset, nav_dialog_id, request.query)
         return None
 
+    def _search_scheduled_messages(self, request: _SearchMessagesRequest) -> dict:
+        """Search pending scheduled text in its local mirror.
+
+        This is intentionally a separate source from ``messages_fts`` because
+        scheduled rows are mutable and must never enter sent-history FTS.
+        The returned rows still use the same ReadMessage envelope plus lifecycle
+        metadata as ordinary search results.
+        """
+        if not self._scheduled_messages_available():
+            return {
+                "ok": True,
+                "data": {"messages": [], "total": 0, "next_navigation": None, "source": "scheduled_messages"},
+            }
+        own_basis = self._own_only_basis_by_dialog()
+        if own_basis is not None and (
+            (request.dialog_id and request.dialog_id not in own_basis) or (not request.dialog_id and not own_basis)
+        ):
+            return {
+                "ok": True,
+                "data": {
+                    "messages": [],
+                    "total": 0,
+                    "next_navigation": None,
+                    "source": "scheduled_messages",
+                    "scope": "own_only",
+                },
+            }
+        sql = _SCHEDULED_MESSAGES_SQL.replace(
+            "WHERE sm.dialog_id = :dialog_id\n  AND sm.message_state = 'scheduled'",
+            "WHERE sm.message_state = 'scheduled'",
+        )
+        params: dict[str, object] = {
+            "limit": request.limit,
+            "offset": request.offset,
+            "scheduled_now": int(time.time()),
+        }
+        if request.dialog_id:
+            sql += " AND sm.dialog_id = :dialog_id"
+            params["dialog_id"] = request.dialog_id
+        elif own_basis is not None:
+            own_ids = sorted(own_basis)
+            placeholders = ", ".join(f":own_scope_{index}" for index in range(len(own_ids)))
+            sql += f" AND sm.dialog_id IN ({placeholders})"
+            params.update({f"own_scope_{index}": dialog_id for index, dialog_id in enumerate(own_ids)})
+        sql = sql.replace(
+            "FROM scheduled_messages sm",
+            "FROM scheduled_messages sm JOIN scheduled_messages_fts sf "
+            "ON sf.dialog_id = sm.dialog_id AND sf.message_id = sm.message_id",
+        )
+        sql += " AND scheduled_messages_fts MATCH :query AND sm.scheduled_at > :scheduled_now"
+        params["query"] = stem_query(request.query)
+        sql += " ORDER BY sm.scheduled_at ASC, sm.message_id ASC LIMIT :limit OFFSET :offset"
+        rows: list[dict[str, object]] = []
+        for raw_row in _fetchall_rows(self._conn.execute(sql, params)):
+            message = _read_message_from_row(raw_row)
+            item = dataclasses.asdict(message)
+            item.update(
+                {
+                    "message_state": "scheduled",
+                    "unpublished": True,
+                    "unseen": True,
+                    "scheduled_at": message.sent_at,
+                    "published_at": _object_to_int_or_none(_row_value(raw_row, "published_at")),
+                    "inclusion_basis": list(own_basis.get(message.dialog_id, ())) if own_basis is not None else [],
+                }
+            )
+            rows.append(item)
+        next_nav = self._search_next_navigation(
+            request,
+            [_read_message_from_row(row) for row in rows],
+            global_mode=not request.dialog_id,
+        )
+        return {
+            "ok": True,
+            "data": {
+                "messages": rows,
+                "total": len(rows),
+                "next_navigation": next_nav,
+                "source": "scheduled_messages",
+                "scope": "own_only",
+            },
+        }
+
+    @staticmethod
+    def _merge_search_results(
+        sent_result: dict,
+        scheduled_result: dict,
+        request: _SearchMessagesRequest,
+    ) -> dict:
+        sent_data = sent_result.get("data", {})
+        scheduled_data = scheduled_result.get("data", {})
+        rows = [*sent_data.get("messages", []), *scheduled_data.get("messages", [])]
+        rows.sort(key=lambda row: (int(row.get("sent_at") or 0), int(row.get("message_id") or 0)))
+        page = rows[request.offset : request.offset + request.limit]
+        next_navigation = (
+            encode_search_navigation(
+                request.offset + request.limit,
+                request.dialog_id,
+                request.query,
+            )
+            if len(page) == request.limit
+            else None
+        )
+        return {
+            "ok": True,
+            "data": {
+                "messages": page,
+                "total": len(page),
+                "next_navigation": next_navigation,
+                "source": "sync_db+scheduled_messages",
+                "read_state_per_dialog": sent_data.get("read_state_per_dialog", {}),
+                "scope": "all",
+            },
+        }
+
     def _fetch_list_dialog_rows(
         self,
         conn: sqlite3.Connection,
@@ -644,12 +815,14 @@ class DaemonReadingService:
         )
         return dialog_filter.normalized in name_norm or matches_acronym or matches_fuzzy
 
-    def _shape_dialog_row(
+    def _shape_dialog_row(  # noqa: PLR0913, PLR0917
         self,
         row: Mapping[str, object],
         local_counts: dict[int, int],
         unread_counts: dict[int, tuple[int, int]],
         dialog_filter: _ListDialogsFilter,
+        scheduled_summary: tuple[int, int | None] = (0, None),
+        inclusion_basis: tuple[str, ...] | None = None,
     ) -> tuple[dict[str, object] | None, int | None]:
         d_id = _object_to_int(row["dialog_id"])
         if not self._dialog_row_matches_filter(dialog_filter, _object_to_str_or_none(row["name"])):
@@ -671,13 +844,26 @@ class DaemonReadingService:
             "access_lost_at": row["access_lost_at"],
             "unread_mentions_count": _object_to_int(row["unread_mentions_count"], 0),
             "unread_reactions_count": _object_to_int(row["unread_reactions_count"], 0),
-            "draft_text": row["draft_text"],
+            **DaemonReadingService._dialog_lifecycle_fields(row, scheduled_summary, inclusion_basis),
         }
         if api.DialogType.parse(_object_to_str_or_none(row["type"])) == api.DialogType.USER:
             in_cnt, out_cnt = unread_counts.get(d_id, (0, 0))
             row_data["unread_in"] = in_cnt
             row_data["unread_out"] = out_cnt
         return row_data, _object_to_int_or_none(row["snapshot_at"])
+
+    @staticmethod
+    def _dialog_lifecycle_fields(
+        row: Mapping[str, object],
+        scheduled_summary: tuple[int, int | None],
+        inclusion_basis: tuple[str, ...] | None,
+    ) -> dict[str, object]:
+        return {
+            "draft_text": row["draft_text"],
+            "scheduled_count": scheduled_summary[0],
+            "next_scheduled_at": scheduled_summary[1],
+            "inclusion_basis": list(inclusion_basis) if inclusion_basis is not None else None,
+        }
 
     async def _freshen_reactions_if_stale(
         self,
@@ -904,6 +1090,236 @@ class DaemonReadingService:
             },
         }
 
+    def _scheduled_messages_available(self) -> bool:
+        return (
+            _fetchone_row(self._conn.execute(_SCHEDULED_MESSAGES_TABLE_SQL)) is not None
+            and _fetchone_row(self._conn.execute(_SCHEDULED_MESSAGES_FTS_TABLE_SQL)) is not None
+        )
+
+    def _own_only_basis_by_dialog(self, conn: sqlite3.Connection | None = None) -> dict[int, tuple[str, ...]] | None:
+        """Return the ownership cache, or None for pre-cache test databases."""
+        source = conn or self._conn
+        if _fetchone_row(source.execute(_OWN_ONLY_DIALOGS_TABLE_SQL)) is None:
+            return None
+        return own_only_basis_by_dialog(source)
+
+    def _list_scheduled_messages_from_db(  # noqa: C901, PLR0912, PLR0915
+        self, req: _ListMessagesDbRequest
+    ) -> dict:
+        """Read pending scheduled messages from the separate local mirror.
+
+        Scheduled messages deliberately do not use ``messages`` or any of its
+        derived tables.  This path is local-only: it never falls back to a
+        Telegram request when the mirror is empty or unavailable.
+        """
+        if not self._scheduled_messages_available():
+            rows: list[dict[str, object]] = []
+        else:
+            sql = _SCHEDULED_MESSAGES_SQL
+            own_basis = self._own_only_basis_by_dialog()
+            if own_basis is not None and req.dialog_id not in own_basis:
+                rows = []
+                own_basis = {}
+            else:
+                own_basis = own_basis or {}
+            params: dict[str, object] = {
+                "dialog_id": req.dialog_id,
+                "limit": req.limit,
+                "self_id": req.self_id,
+                "scheduled_now": int(time.time()),
+            }
+            if req.sender_id is not None:
+                sql += " AND sm.sender_id = :filter_sender_id"
+                params["filter_sender_id"] = req.sender_id
+            if req.sender_name is not None:
+                sql += " AND sm.sender_first_name LIKE :sender_name_pattern ESCAPE '\\' COLLATE NOCASE"
+                escaped = req.sender_name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                params["sender_name_pattern"] = f"%{escaped}%"
+            if req.topic_id is not None:
+                sql += " AND sm.forum_topic_id = :topic_id"
+                params["topic_id"] = req.topic_id
+            sql += " AND sm.scheduled_at > :scheduled_now"
+            if req.anchor_msg_id is not None:
+                anchor_row = _fetchone_row(
+                    self._conn.execute(
+                        "SELECT scheduled_at FROM scheduled_messages WHERE dialog_id = ? AND message_id = ?",
+                        (req.dialog_id, req.anchor_msg_id),
+                    )
+                )
+                anchor_at = req.anchor_sent_at
+                if anchor_at is None:
+                    anchor_at = _object_to_int_or_none(_row_value(anchor_row, "scheduled_at"))
+                if anchor_at is None:
+                    anchor_at = 0
+                operator = ">" if req.direction == "oldest" else "<"
+                sql += (
+                    f" AND (sm.scheduled_at {operator} :anchor_at OR "
+                    f"(sm.scheduled_at = :anchor_at AND sm.message_id {operator} :anchor_msg_id))"
+                )
+                params["anchor_at"] = anchor_at
+                params["anchor_msg_id"] = req.anchor_msg_id
+            if req.direction == "oldest":
+                sql += " ORDER BY sm.scheduled_at ASC, sm.message_id ASC"
+            else:
+                sql += " ORDER BY sm.scheduled_at DESC, sm.message_id DESC"
+            sql += " LIMIT :limit"
+            raw_rows = _fetchall_rows(self._conn.execute(sql, params))
+            rows = []
+            for raw_row in raw_rows:
+                message = _read_message_from_row(raw_row)
+                item = dataclasses.asdict(message)
+                item.update(
+                    {
+                        "message_state": "scheduled",
+                        "unpublished": True,
+                        "unseen": True,
+                        "scheduled_at": message.sent_at,
+                        "published_at": _object_to_int_or_none(_row_value(raw_row, "published_at")),
+                        "inclusion_basis": list(own_basis.get(message.dialog_id, ())),
+                    }
+                )
+                rows.append(item)
+        next_nav = self._maybe_encode_next_nav(
+            _NextNavContext(
+                messages=rows,
+                limit=req.limit,
+                dialog_id=req.dialog_id,
+                direction=req.direction,
+                direction_enum=req.direction_enum,
+                logger=self._logger,
+                request_id=self._deps.rid,
+                message_state="scheduled",
+            )
+        )
+        return {
+            "ok": True,
+            "data": {
+                "messages": rows,
+                "source": "scheduled_messages",
+                "next_navigation": next_nav,
+                "message_state": "scheduled",
+                "scope": "own_only",
+            },
+        }
+
+    async def _list_messages_local_state_result(  # noqa: PLR0913, PLR0917
+        self,
+        dialog_id: int,
+        request: _ListMessagesRequest,
+        direction: str,
+        status: str | None,
+        anchor_msg_id: int | None = None,
+        anchor_sent_at: int | None = None,
+    ) -> dict:
+        direction_enum = HistoryDirection.OLDEST if direction == "oldest" else HistoryDirection.NEWEST
+        db_request = _ListMessagesDbRequest(
+            dialog_id=dialog_id,
+            limit=request.limit + 1 if request.message_state == "all" else request.limit,
+            self_id=self._deps.self_id,
+            direction=direction,
+            direction_enum=direction_enum,
+            anchor_msg_id=anchor_msg_id,
+            anchor_sent_at=anchor_sent_at,
+            sender_id=request.sender_id,
+            sender_name=request.sender_name,
+            topic_id=request.topic_id,
+            unread_after_id=None,
+        )
+        scheduled_result = self._list_scheduled_messages_from_db(db_request)
+        if request.message_state == "scheduled":
+            scheduled_result["data"]["dialog_type"] = api._dialog_type_from_db(self._conn, dialog_id)
+            scheduled_result["data"]["read_state"] = None
+            return scheduled_result
+
+        if status in ("synced", "syncing", "access_lost"):
+            sent_result = await self._list_messages_from_db(db_request)
+            sent_rows = sent_result["data"]["messages"]
+        else:
+            sent_rows = []
+        scheduled_rows = scheduled_result["data"]["messages"]
+        combined = [*sent_rows, *scheduled_rows]
+        combined.sort(
+            key=lambda row: (int(row.get("sent_at") or 0), int(row.get("message_id") or 0)),
+            reverse=direction != "oldest",
+        )
+        has_more = len(combined) > request.limit
+        combined = combined[: request.limit]
+        next_nav = None
+        if has_more and combined:
+            last = combined[-1]
+            next_nav = encode_history_navigation(
+                _message_id_from_item(last),
+                dialog_id,
+                direction=HistoryDirection.OLDEST if direction == "oldest" else HistoryDirection.NEWEST,
+                sent_at=_object_to_int(last.get("sent_at")),
+                message_state="all",
+            )
+        return {
+            "ok": True,
+            "data": {
+                "messages": combined,
+                "source": "sync_db+scheduled_messages",
+                "next_navigation": next_nav,
+                "message_state": "all",
+                "dialog_type": api._dialog_type_from_db(self._conn, dialog_id),
+                "read_state": api._read_state_for_dialog(
+                    self._conn,
+                    dialog_id,
+                    api._dialog_type_from_db(self._conn, dialog_id),
+                ),
+                **api._build_access_metadata(self._conn, dialog_id, status or "not_synced"),
+            },
+        }
+
+    async def _list_messages_non_sent(
+        self,
+        dialog_id: int,
+        request: _ListMessagesRequest,
+        direction: str,
+    ) -> dict:
+        row = _fetchone_row(self._conn.execute(api._SELECT_SYNC_STATUS_SQL, (dialog_id,)))
+        status = _status_from_row(row)
+        if request.context_message_id is not None:
+            return {
+                "ok": False,
+                "error": "scheduled_context_unsupported",
+                "message": "Scheduled messages do not support sent-history context windows.",
+            }
+        nav_result = self._decode_history_navigation(request.navigation, dialog_id, direction)
+        if isinstance(nav_result, dict):
+            return nav_result
+        anchor_msg_id, direction = nav_result
+        anchor_sent_at = None
+        if request.message_state == "all" and request.navigation not in (None, "newest", "oldest"):
+            navigation = request.navigation
+            assert navigation is not None
+            try:
+                anchor_sent_at = decode_navigation_token(navigation).sent_at
+            except ValueError as exc:
+                return {"ok": False, "error": "invalid_navigation", "message": str(exc)}
+        return await self._list_messages_local_state_result(
+            dialog_id, request, direction, status, anchor_msg_id, anchor_sent_at
+        )
+
+    async def _list_messages_for_state(
+        self,
+        dialog_id: int,
+        request: _ListMessagesRequest,
+        direction: str,
+    ) -> dict:
+        if request.message_state not in {"sent", "scheduled", "all"}:
+            return {
+                "ok": False,
+                "error": "invalid_message_state",
+                "message": "message_state must be sent, scheduled, or all",
+            }
+        if request.message_state != "sent":
+            return await self._list_messages_non_sent(dialog_id, request, direction)
+
+        if request.context_message_id is not None:
+            return await self._list_messages_context_result(dialog_id, request)
+        return await self._list_messages_history_result(dialog_id, request, direction)
+
     async def _list_messages(self, req: dict) -> dict:
         """Return messages from sync.db (if synced) or Telegram (on-demand)."""
         request = self._parse_list_messages_request(req)
@@ -921,10 +1337,57 @@ class DaemonReadingService:
                 "error": "missing_dialog",
                 "message": "Either dialog_id or dialog name is required",
             }
+        return await self._list_messages_for_state(dialog_id, request, direction)
 
-        if request.context_message_id is not None:
-            return await self._list_messages_context_result(dialog_id, request)
-        return await self._list_messages_history_result(dialog_id, request, direction)
+    async def _search_messages_scoped_for_state(
+        self,
+        request: _SearchMessagesRequest,
+        stemmed: str,
+    ) -> dict:
+        resolved = await self._deps.resolve_dialog_id(request.dialog_id, request.dialog)
+        if isinstance(resolved, dict):
+            return resolved
+        request = dataclasses.replace(request, dialog_id=resolved)
+        if request.message_state == "scheduled":
+            return self._search_scheduled_messages(request)
+        if request.message_state == "all":
+            sent_result = await self._search_messages_scoped_result(
+                dataclasses.replace(request, message_state="sent", offset=0, limit=request.offset + request.limit),
+                stemmed,
+            )
+            return self._merge_search_results(
+                sent_result,
+                self._search_scheduled_messages(
+                    dataclasses.replace(request, offset=0, limit=request.offset + request.limit)
+                ),
+                request,
+            )
+        return await self._search_messages_scoped_result(request, stemmed)
+
+    async def _search_messages_for_state(self, request: _SearchMessagesRequest, stemmed: str) -> dict:
+        if request.message_state not in {"sent", "scheduled", "all"}:
+            return {
+                "ok": False,
+                "error": "invalid_message_state",
+                "message": "message_state must be sent, scheduled, or all",
+            }
+        global_mode = not request.dialog_id and request.dialog is None
+        if global_mode and request.message_state == "scheduled":
+            return self._search_scheduled_messages(request)
+        if global_mode and request.message_state == "all":
+            return self._merge_search_results(
+                await self._search_messages_global_result(
+                    dataclasses.replace(request, message_state="sent", offset=0, limit=request.offset + request.limit),
+                    stemmed,
+                ),
+                self._search_scheduled_messages(
+                    dataclasses.replace(request, offset=0, limit=request.offset + request.limit)
+                ),
+                request,
+            )
+        if not global_mode:
+            return await self._search_messages_scoped_for_state(request, stemmed)
+        return await self._search_messages_global_result(request, stemmed)
 
     async def _search_messages(self, req: dict) -> dict:
         """FTS5 stemmed full-text search against messages_fts."""
@@ -932,20 +1395,7 @@ class DaemonReadingService:
         stemmed = stem_query(request.query)
         if not stemmed:
             return {"ok": True, "data": {"messages": [], "total": 0}}
-        global_mode = not request.dialog_id and request.dialog is None
-        if not global_mode:
-            resolved = await self._deps.resolve_dialog_id(request.dialog_id, request.dialog)
-            if isinstance(resolved, dict):
-                return resolved
-            request = _SearchMessagesRequest(
-                dialog_id=resolved,
-                dialog=request.dialog,
-                query=request.query,
-                limit=request.limit,
-                offset=request.offset,
-            )
-            return await self._search_messages_scoped_result(request, stemmed)
-        return await self._search_messages_global_result(request, stemmed)
+        return await self._search_messages_for_state(request, stemmed)
 
     async def _list_dialogs(self, req: dict) -> dict:
         """Return dialog list from the local dialogs snapshot.
@@ -973,9 +1423,44 @@ class DaemonReadingService:
         finally:
             conn.close()
 
-    def _list_dialogs_sync(self, conn: sqlite3.Connection, req: dict) -> dict:
+    def _scheduled_summary_by_dialog(self, conn: sqlite3.Connection) -> dict[int, tuple[int, int | None]]:
+        """Summarize pending scheduled rows without reading sent history."""
+        if _fetchone_row(conn.execute(_SCHEDULED_MESSAGES_TABLE_SQL)) is None:
+            return {}
+        rows = _fetchall_rows(
+            conn.execute(
+                """
+                SELECT dialog_id, COUNT(*) AS scheduled_count, MIN(scheduled_at) AS next_scheduled_at
+                FROM scheduled_messages
+                WHERE message_state = 'scheduled' AND scheduled_at > :scheduled_now
+                GROUP BY dialog_id
+                """,
+                {"scheduled_now": int(time.time())},
+            )
+        )
+        return {
+            _object_to_int(_row_value(row, "dialog_id")): (
+                _object_to_int(_row_value(row, "scheduled_count")),
+                _object_to_int_or_none(_row_value(row, "next_scheduled_at")),
+            )
+            for row in rows
+        }
+
+    def _list_dialogs_sync(self, conn: sqlite3.Connection, req: dict) -> dict:  # noqa: PLR0914
         """Return dialog list from the local dialogs snapshot (pure SQL)."""
         request = self._parse_list_dialogs_request(req)
+        if request.message_state not in {"sent", "scheduled", "all"}:
+            return {
+                "ok": False,
+                "error": "invalid_message_state",
+                "message": "message_state must be sent, scheduled, or all",
+            }
+        if request.scope not in {"all", "own_only"}:
+            return {
+                "ok": False,
+                "error": "invalid_scope",
+                "message": "scope must be all or own_only",
+            }
         dialog_filter = self._prepare_list_dialogs_filter(request.filter_raw)
         local_counts = {
             _object_to_int(_row_sequence(row)[0]): _object_to_int(_row_sequence(row)[1], 0)
@@ -988,6 +1473,8 @@ class DaemonReadingService:
             )
             for row in _fetchall_rows(conn.execute(api._BATCHED_UNREAD_COUNTS_SQL))
         }
+        scheduled_summary = self._scheduled_summary_by_dialog(conn)
+        own_basis = self._own_only_basis_by_dialog(conn)
         sql_rows = self._fetch_list_dialog_rows(conn, request, dialog_filter)
         if not sql_rows:
             count_row = _fetchone_row(conn.execute("SELECT COUNT(*) FROM dialogs"))
@@ -998,13 +1485,32 @@ class DaemonReadingService:
                     "dialogs": [],
                     "snapshot_age_h": None,
                     "bootstrap_pending": count_total == 0,
+                    "scope": request.scope,
                 },
             }
 
         dialogs: list[dict] = []
         max_snapshot: int | None = None
         for row in sql_rows:
-            row_data, snapshot_at = self._shape_dialog_row(row, local_counts, unread_counts, dialog_filter)
+            dialog_id = _object_to_int(row["dialog_id"])
+            if request.scope == "own_only" and (
+                (own_basis is not None and dialog_id not in own_basis)
+                or (own_basis is None and str(row.get("sync_status") or "") != "own_only")
+            ):
+                continue
+            summary = scheduled_summary.get(dialog_id, (0, None))
+            if own_basis is not None and dialog_id not in own_basis:
+                summary = (0, None)
+            if request.message_state == "scheduled" and summary[0] == 0:
+                continue
+            row_data, snapshot_at = self._shape_dialog_row(
+                row,
+                local_counts,
+                unread_counts,
+                dialog_filter,
+                summary,
+                own_basis.get(dialog_id) if own_basis is not None else None,
+            )
             if row_data is None:
                 continue
             if snapshot_at is not None and (max_snapshot is None or snapshot_at > max_snapshot):
@@ -1018,5 +1524,6 @@ class DaemonReadingService:
                 "dialogs": dialogs,
                 "snapshot_age_h": snapshot_age_h,
                 "bootstrap_pending": False,
+                "scope": request.scope,
             },
         }

@@ -40,6 +40,8 @@ class NavigationToken:
     topic_id: int | None = None
     query: str | None = None
     direction: HistoryDirection | None = None
+    sent_at: int | None = None
+    message_state: str | None = None
 
 
 @dataclass(frozen=True)
@@ -140,13 +142,22 @@ def encode_navigation_token(navigation: NavigationToken) -> str:
         "value": navigation.value,
         "dialog_id": navigation.dialog_id,
     }
-    if navigation.topic_id is not None:
-        payload["topic_id"] = navigation.topic_id
-    if navigation.query is not None:
-        payload["query"] = navigation.query
-    if navigation.direction is not None:
-        payload["direction"] = navigation.direction
+    payload.update(_optional_navigation_fields(navigation))
     return _encode_payload(payload)
+
+
+def _optional_navigation_fields(navigation: NavigationToken) -> dict[str, object]:
+    return {
+        key: value
+        for key, value in {
+            "topic_id": navigation.topic_id,
+            "query": navigation.query,
+            "direction": navigation.direction,
+            "sent_at": navigation.sent_at,
+            "message_state": navigation.message_state,
+        }.items()
+        if value is not None
+    }
 
 
 def decode_navigation_token(token: str) -> NavigationToken:
@@ -168,6 +179,23 @@ def decode_navigation_token(token: str) -> NavigationToken:
     if not isinstance(dialog_id, int):
         raise ValueError("Invalid navigation token: dialog_id must be an integer")
 
+    topic_id, query, direction, sent_at, message_state = _decode_optional_navigation_fields(data)
+
+    return NavigationToken(
+        kind=cast("NavigationKind", kind),
+        value=value,
+        dialog_id=dialog_id,
+        topic_id=topic_id,
+        query=query,
+        direction=cast("HistoryDirection | None", direction),
+        sent_at=sent_at,
+        message_state=cast("str | None", message_state),
+    )
+
+
+def _decode_optional_navigation_fields(
+    data: dict[str, object],
+) -> tuple[int | None, str | None, str | None, int | None, str | None]:
     topic_id = data.get("topic_id")
     if topic_id is not None and not isinstance(topic_id, int):
         raise ValueError("Invalid navigation token: topic_id must be an integer when present")
@@ -180,22 +208,31 @@ def decode_navigation_token(token: str) -> NavigationToken:
     if direction is not None and direction not in {"newest", "oldest"}:
         raise ValueError("Invalid navigation token: direction must be newest or oldest when present")
 
-    return NavigationToken(
-        kind=cast("NavigationKind", kind),
-        value=value,
-        dialog_id=dialog_id,
-        topic_id=topic_id,
-        query=query,
-        direction=cast("HistoryDirection | None", direction),
+    sent_at = data.get("sent_at")
+    if sent_at is not None and not isinstance(sent_at, int):
+        raise ValueError("Invalid navigation token: sent_at must be an integer when present")
+
+    message_state = data.get("message_state")
+    if message_state is not None and message_state not in {"sent", "scheduled", "all"}:
+        raise ValueError("Invalid navigation token: message_state must be sent, scheduled, or all when present")
+
+    return (
+        cast(int | None, topic_id),
+        cast(str | None, query),
+        cast(str | None, direction),
+        cast(int | None, sent_at),
+        cast(str | None, message_state),
     )
 
 
-def encode_history_navigation(
+def encode_history_navigation(  # noqa: PLR0913
     message_id: int,
     dialog_id: int,
     *,
     topic_id: int | None = None,
     direction: HistoryDirection = HistoryDirection.NEWEST,
+    sent_at: int | None = None,
+    message_state: str | None = None,
 ) -> str:
     """Encode a history continuation cursor as a base64 token."""
     return encode_navigation_token(
@@ -205,6 +242,8 @@ def encode_history_navigation(
             dialog_id=dialog_id,
             topic_id=topic_id,
             direction=direction,
+            sent_at=sent_at,
+            message_state=message_state,
         )
     )
 

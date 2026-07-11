@@ -37,9 +37,11 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
     TypeInputChannel,
     UpdateChannel,
     UpdateChat,
+    UpdateDeleteScheduledMessages,
     UpdateDialogPinned,
     UpdateDialogUnreadMark,
     UpdateMessageReactions,
+    UpdateNewScheduledMessage,
     UpdatePinnedDialogs,
     UpdatePinnedForumTopic,
     UpdateReadChannelInbox,
@@ -53,6 +55,13 @@ from .fts import DELETE_FTS_SQL, INSERT_FTS_SQL, stem_text
 from .models import DialogType
 from .read_state import apply_read_cursor
 from .resolver import latinize
+from .scheduled_messages import (
+    mark_scheduled_messages_removed,
+    scheduled_dialog_id,
+    scheduled_message_dialog_id,
+    upsert_scheduled_message,
+    verify_scheduled_publication,
+)
 from .sync_worker import (
     INSERT_DIALOG_SQL,
     UPSERT_ENTITY_SQL,
@@ -330,6 +339,14 @@ class EventHandlerManager:
             self.on_raw_transcribed_audio,
             events.Raw(types=[UpdateTranscribedAudio]),
         )
+        self._client.add_event_handler(
+            self.on_raw_new_scheduled_message,
+            events.Raw(types=[UpdateNewScheduledMessage]),
+        )
+        self._client.add_event_handler(
+            self.on_raw_delete_scheduled_messages,
+            events.Raw(types=[UpdateDeleteScheduledMessages]),
+        )
         # Phase 42: three new Raw handlers for dialog metadata events.
         self._client.add_event_handler(
             self.on_raw_dialog_pinned,
@@ -358,6 +375,8 @@ class EventHandlerManager:
         self._client.remove_event_handler(self.on_outbox_read)
         self._client.remove_event_handler(self.on_raw_reaction_update)
         self._client.remove_event_handler(self.on_raw_transcribed_audio)
+        self._client.remove_event_handler(self.on_raw_new_scheduled_message)
+        self._client.remove_event_handler(self.on_raw_delete_scheduled_messages)
         self._client.remove_event_handler(self.on_raw_dialog_pinned)
         self._client.remove_event_handler(self.on_raw_channel_chat_update)
         self._client.remove_event_handler(self.on_raw_inbox_read)
@@ -433,6 +452,22 @@ class EventHandlerManager:
     # Event handlers
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _verify_scheduled_publication_if_needed(
+        conn: sqlite3.Connection,
+        dialog_id: int,
+        message: _MessageLike,
+        *,
+        now: int | None = None,
+    ) -> None:
+        if not bool(getattr(message, "from_scheduled", False)):
+            return
+        with conn:
+            if now is None:
+                verify_scheduled_publication(conn, dialog_id, int(message.id))
+            else:
+                verify_scheduled_publication(conn, dialog_id, int(message.id), now=now)
+
     async def on_new_message(self, event: _NewMessageEvent) -> None:
         """Handle a NewMessage event: INSERT OR REPLACE into messages table.
 
@@ -445,6 +480,7 @@ class EventHandlerManager:
         if dialog_id is None:
             return
         if dialog_id not in self._synced_dialog_ids:
+            self._verify_scheduled_publication_if_needed(self._conn, dialog_id, event.message)
             if event.is_private:
                 sender = None
                 try:
@@ -462,6 +498,10 @@ class EventHandlerManager:
 
             with self._conn:
                 insert_messages_with_fts(self._conn, [extracted])
+                # A normal message carrying from_scheduled is the verification
+                # point for the untrusted sent_messages hint retained by the
+                # scheduled-queue delete update.
+                self._verify_scheduled_publication_if_needed(self._conn, dialog_id, msg, now=now)
                 # Phase 42 EVENTS-04: advance dialogs.last_message_at monotonically.
                 # MAX(COALESCE(..., 0), new_ts) ensures no regression on out-of-order
                 # events. UPDATE matches 0 rows when the dialog is not yet bootstrapped
@@ -704,6 +744,40 @@ class EventHandlerManager:
             logger.info("event_delete dialog_id=%d count=%d", dialog_id, len(event.deleted_ids))
         except Exception:
             logger.exception("event_delete_failed dialog_id=%s", dialog_id)
+
+    async def on_raw_new_scheduled_message(self, update: object) -> None:
+        """Mirror create/edit/reschedule updates without touching sent history."""
+        message = cast(object | None, getattr(update, "message", None))
+        if message is None:
+            return
+        dialog_id = scheduled_message_dialog_id(message)
+        if dialog_id is None:
+            logger.warning("scheduled_new_missing_peer message_id=%s", cast(object, getattr(message, "id", None)))
+            return
+        try:
+            with self._conn:
+                upsert_scheduled_message(self._conn, dialog_id, message)
+            message_id_attr = "id"
+            logger.info(
+                "scheduled_new dialog_id=%d message_id=%d",
+                dialog_id,
+                int(cast(int, getattr(message, message_id_attr))),
+            )
+        except Exception:
+            logger.exception("scheduled_new_failed dialog_id=%s", dialog_id)
+
+    async def on_raw_delete_scheduled_messages(self, update: object) -> None:
+        """Retain cancellation/publication evidence from a queue-removal update."""
+        dialog_id = scheduled_dialog_id(getattr(update, "peer", None))
+        message_ids = cast(Sequence[int] | None, getattr(update, "messages", None))
+        if dialog_id is None or not message_ids:
+            return
+        sent_message_ids = cast(Sequence[int] | None, getattr(update, "sent_messages", None))
+        try:
+            mark_scheduled_messages_removed(self._conn, dialog_id, message_ids, sent_message_ids)
+            logger.info("scheduled_removed dialog_id=%d count=%d", dialog_id, len(message_ids))
+        except Exception:
+            logger.exception("scheduled_removed_failed dialog_id=%s", dialog_id)
 
     async def on_message_read(self, event: _ReadMessageEvent) -> None:
         """Handle MessageRead(inbox=True): update read_inbox_max_id monotonically.

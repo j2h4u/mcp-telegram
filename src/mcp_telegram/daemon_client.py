@@ -59,6 +59,7 @@ class _ListMessagesKwargs(TypedDict, total=False):
     unread: bool | None
     context_message_id: int | None
     context_size: int | None
+    message_state: str
 
 
 class _SearchMessagesKwargs(TypedDict):
@@ -67,6 +68,7 @@ class _SearchMessagesKwargs(TypedDict):
     dialog: NotRequired[str | None]
     limit: NotRequired[int]
     offset: NotRequired[int]
+    message_state: NotRequired[str]
 
 
 class _TraceAccountMessagesKwargs(TypedDict, total=False):
@@ -81,6 +83,11 @@ class _TraceAccountMessagesKwargs(TypedDict, total=False):
     limit: int
     navigation: str | None
     coverage_goal: str
+
+
+def _list_messages_state_payload(kwargs: _ListMessagesKwargs) -> dict[str, object]:
+    message_state = kwargs.get("message_state")
+    return {"message_state": message_state} if message_state is not None else {}
 
 
 _DaemonResponse = TypedDict(  # noqa: UP013
@@ -255,6 +262,7 @@ class DaemonConnection:
             payload["context_message_id"] = context_message_id
         if (context_size := kwargs.get("context_size")) is not None:
             payload["context_size"] = context_size
+        payload.update(_list_messages_state_payload(kwargs))
         return await self.request(payload)
 
     async def search_messages(self, **kwargs: Unpack[_SearchMessagesKwargs]) -> dict:
@@ -267,6 +275,7 @@ class DaemonConnection:
                 "query": kwargs["query"],
                 "limit": kwargs.get("limit", 20),
                 "offset": kwargs.get("offset", 0),
+                "message_state": kwargs.get("message_state", "sent"),
             }
         )
 
@@ -302,6 +311,8 @@ class DaemonConnection:
         exclude_archived: bool = False,
         ignore_pinned: bool = False,
         filter: str | None = None,
+        message_state: str = "all",
+        scope: str = "all",
     ) -> dict:
         """List dialogs with optional archive/pin/name filtering."""
         payload: dict = {
@@ -311,6 +322,8 @@ class DaemonConnection:
         }
         if filter is not None:
             payload["filter"] = filter
+        payload["message_state"] = message_state
+        payload["scope"] = scope
         return await self.request(payload)
 
     async def list_topics(

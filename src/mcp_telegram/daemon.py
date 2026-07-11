@@ -46,7 +46,13 @@ from typing import Protocol, cast
 from telethon import utils as telethon_utils  # type: ignore[import-untyped]
 from telethon.errors.rpcerrorlist import FloodWaitError, RPCError  # type: ignore[import-untyped]
 from telethon.tl.functions.messages import GetPeerDialogsRequest  # type: ignore[import-untyped]
-from telethon.tl.types import InputDialogPeer, TypeInputDialogPeer, TypeInputPeer  # type: ignore[import-untyped]
+from telethon.tl.functions.users import GetFullUserRequest  # type: ignore[import-untyped]
+from telethon.tl.types import (  # type: ignore[import-untyped]
+    InputDialogPeer,
+    TypeInputDialogPeer,
+    TypeInputPeer,
+    TypeInputUser,
+)
 
 from .activity_cold_backfill import run_cold_backfill_loop
 from .activity_hot_sweep import run_hot_sweep_loop
@@ -64,7 +70,9 @@ from .flood import (
     sleep_through_flood,
 )
 from .fts import backfill_fts_index
+from .own_only import OwnOnlyContext, ensure_own_only_schema
 from .read_state import apply_read_cursor
+from .scheduled_messages import run_scheduled_reconciliation_loop
 from .sync_db import (
     _open_sync_db,
     ensure_sync_schema,
@@ -92,6 +100,8 @@ class _DaemonClient(Protocol):
     async def get_me(self) -> object: ...
 
     async def get_input_entity(self, _dialog_id: int) -> object: ...
+
+    async def get_entity(self, _dialog_id: int) -> object: ...
 
     async def get_messages(self, *_args: object, **_kwargs: object) -> object: ...
 
@@ -198,6 +208,7 @@ class _SyncMainContext:
     socket_path: Path
     unix_server: asyncio.AbstractServer | None = None
     handler_manager: EventHandlerManager | None = None
+    own_only_context: OwnOnlyContext | None = None
     background_tasks: set[asyncio.Task[object]] = field(default_factory=set)
 
 
@@ -726,6 +737,20 @@ async def _connect_telegram(ctx: _SyncMainContext) -> bool:
     return True
 
 
+async def _load_own_only_context(client: _DaemonClient, account_id: int) -> OwnOnlyContext:
+    context = OwnOnlyContext(account_id=account_id)
+    try:
+        input_user = cast(TypeInputUser, await client.get_input_entity(account_id))
+        full_result = await client(GetFullUserRequest(id=input_user))
+        user_full = getattr(full_result, "full_user", None)
+        personal_channel_id = getattr(user_full, "personal_channel_id", None)
+        if isinstance(personal_channel_id, int) and personal_channel_id > 0:
+            return OwnOnlyContext(account_id=account_id, personal_channel_id=personal_channel_id)
+    except (FloodWaitError, RPCError, TypeError, AttributeError, ValueError) as exc:
+        logger.warning("own_only_account_facts_unavailable error=%s", exc)
+    return context
+
+
 async def _prime_runtime(ctx: _SyncMainContext) -> None:
     # Phase 39.1: cache authenticated user id once at startup so query-build
     # paths (Plan 39.1-02) can bind it as a SQL parameter without calling
@@ -735,6 +760,8 @@ async def _prime_runtime(ctx: _SyncMainContext) -> None:
     _ = ctx.api_server.startup_detail
     me = cast(_MeLike, await ctx.client.get_me())
     ctx.api_server.self_id = int(me.id)
+    ctx.own_only_context = await _load_own_only_context(ctx.client, ctx.api_server.self_id)
+    ensure_own_only_schema(ctx.conn)
     logger.info("daemon self_id cached: %s", ctx.api_server.self_id)
 
     # Post-v10 runtime backfill: mark historical outgoing DM rows as out=1
@@ -829,6 +856,18 @@ async def _start_followup_background_tasks(
     )
     _create_tracked_task(
         ctx, run_cold_backfill_loop(activity_client, ctx.conn, ctx.shutdown_event), name="activity_cold_backfill"
+    )
+    scheduled_interval = float(os.environ.get("SCHEDULED_RECONCILIATION_SECONDS", "900"))
+    _create_tracked_task(
+        ctx,
+        run_scheduled_reconciliation_loop(
+            ctx.client,
+            ctx.conn,
+            ctx.shutdown_event,
+            interval=scheduled_interval,
+            own_only_context=ctx.own_only_context,
+        ),
+        name="scheduled_message_reconciliation",
     )
 
     # Phase 43 / RECON-01: hourly light pass + daily full pass keeps the

@@ -8,7 +8,7 @@ from typing import cast
 
 from .state import get_state_dir
 
-_CURRENT_SCHEMA_VERSION = 26
+_CURRENT_SCHEMA_VERSION = 27
 _SCHEMA_VERSION_WITH_FTS = 3
 
 logger = logging.getLogger(__name__)
@@ -410,6 +410,81 @@ SELECT s.dialog_id, 1, strftime('%s','now'), 0, 0, 0, 0, 0
 FROM synced_dialogs s
 LEFT JOIN dialogs d ON d.dialog_id = s.dialog_id
 WHERE s.status = 'own_only' AND d.dialog_id IS NULL
+"""
+
+# ---------------------------------------------------------------------------
+# v27: scheduled-message mirror
+#
+# Scheduled message IDs belong to a queue-local sequence and must never share
+# the sent-history table.  The table intentionally has no FTS, unread, or
+# message-version companion.  Rows are retained after leaving the queue as
+# evidence; only message_state='scheduled' is visible to explicit scheduled
+# read paths.
+# ---------------------------------------------------------------------------
+
+_SCHEDULED_MESSAGES_DDL = """
+CREATE TABLE IF NOT EXISTS scheduled_messages (
+    dialog_id                   INTEGER NOT NULL,
+    message_id                  INTEGER NOT NULL,
+    scheduled_at                INTEGER,
+    text                        TEXT,
+    sender_id                   INTEGER,
+    sender_first_name           TEXT,
+    media_description           TEXT,
+    reply_to_msg_id             INTEGER,
+    forum_topic_id              INTEGER,
+    edit_date                   INTEGER,
+    grouped_id                  INTEGER,
+    reply_to_peer_id            INTEGER,
+    out                         INTEGER NOT NULL DEFAULT 1,
+    is_service                  INTEGER NOT NULL DEFAULT 0,
+    post_author                 TEXT,
+    schedule_repeat_period     INTEGER,
+    message_state               TEXT NOT NULL DEFAULT 'scheduled'
+                                CHECK (message_state IN ('scheduled', 'unknown_missing', 'cancelled', 'published')),
+    visibility                  TEXT NOT NULL DEFAULT 'author_only'
+                                CHECK (visibility IN ('author_only', 'chat_visible', 'unknown')),
+    unpublished                 INTEGER NOT NULL DEFAULT 1 CHECK (unpublished IN (0, 1)),
+    unseen                      INTEGER NOT NULL DEFAULT 1 CHECK (unseen IN (0, 1)),
+    publication_hint_message_id INTEGER,
+    published_message_id        INTEGER,
+    publication_verified_at     INTEGER,
+    published_at                INTEGER,
+    deleted_at                  INTEGER,
+    first_seen_at               INTEGER NOT NULL,
+    updated_at                  INTEGER NOT NULL,
+    PRIMARY KEY (dialog_id, message_id)
+) WITHOUT ROWID
+"""
+
+_SCHEDULED_MESSAGES_ACTIVE_INDEX_DDL = """
+CREATE INDEX IF NOT EXISTS idx_scheduled_messages_active
+ON scheduled_messages(dialog_id, scheduled_at)
+WHERE message_state = 'scheduled'
+"""
+
+_SCHEDULED_MESSAGES_STATE_INDEX_DDL = """
+CREATE INDEX IF NOT EXISTS idx_scheduled_messages_state_updated
+ON scheduled_messages(message_state, updated_at)
+"""
+
+_SCHEDULED_MESSAGES_FTS_DDL = (
+    "CREATE VIRTUAL TABLE IF NOT EXISTS scheduled_messages_fts "
+    "USING fts5(dialog_id UNINDEXED, message_id UNINDEXED, stemmed_text, "
+    "tokenize='unicode61')"
+)
+
+_SCHEDULED_SYNC_STATE_DDL = """
+CREATE TABLE IF NOT EXISTS scheduled_sync_state (
+    key             TEXT PRIMARY KEY,
+    next_retry_at   INTEGER,
+    last_snapshot_at INTEGER,
+    last_error      TEXT
+)
+"""
+
+_SCHEDULED_SYNC_STATE_SEED = """
+INSERT OR IGNORE INTO scheduled_sync_state (key) VALUES ('account')
 """
 
 
@@ -905,7 +980,7 @@ def _apply_migrations_16_to_20(conn: sqlite3.Connection, current: int) -> int:
     return _apply_migration(conn, current, 20, [_DIALOGS_NEEDS_REFRESH_INDEX_DDL])
 
 
-def _apply_migrations_21_to_26(conn: sqlite3.Connection, current: int) -> int:
+def _apply_migrations_21_to_27(conn: sqlite3.Connection, current: int) -> int:
     # v21 (Phase 51): target-specific trace coverage. synced_dialogs.status
     # describes broad dialog lifecycle; account traces need per-target,
     # per-dialog/topic coverage attempts to avoid false completeness claims.
@@ -1024,7 +1099,7 @@ def _apply_migrations_21_to_26(conn: sqlite3.Connection, current: int) -> int:
     #
     # Order matters: the channel UPDATE turns matched rows negative; the chat UPDATE then
     # only sees still-positive rows. No row can match both (distinct dialog_ids).
-    return _apply_migration(
+    current = _apply_migration(
         conn,
         current,
         26,
@@ -1048,6 +1123,24 @@ def _apply_migrations_21_to_26(conn: sqlite3.Connection, current: int) -> int:
             "UPDATE message_forwards SET fwd_from_peer_id = -fwd_from_peer_id "
             "WHERE fwd_from_peer_id > 0 AND EXISTS (SELECT 1 FROM dialogs d "
             "WHERE d.dialog_id = -message_forwards.fwd_from_peer_id)",
+        ],
+    )
+
+    # v27: scheduled-message mirror. Scheduled messages are queue-local,
+    # mutable future objects; keeping them out of messages/FTS/unread avoids
+    # presenting unpublished content as sent history. The sync-state row stores
+    # account-level FloodWait backoff for snapshot reconciliation.
+    return _apply_migration(
+        conn,
+        current,
+        27,
+        [
+            _SCHEDULED_MESSAGES_DDL,
+            _SCHEDULED_MESSAGES_ACTIVE_INDEX_DDL,
+            _SCHEDULED_MESSAGES_STATE_INDEX_DDL,
+            _SCHEDULED_MESSAGES_FTS_DDL,
+            _SCHEDULED_SYNC_STATE_DDL,
+            _SCHEDULED_SYNC_STATE_SEED,
         ],
     )
 
@@ -1076,9 +1169,38 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     current = _apply_migrations_6_to_10(conn, current)
     current = _apply_migrations_11_to_15(conn, current)
     current = _apply_migrations_16_to_20(conn, current)
-    current = _apply_migrations_21_to_26(conn, current)
+    current = _apply_migrations_21_to_27(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
+
+
+def _ensure_scheduled_messages_fts(conn: sqlite3.Connection) -> None:
+    """Repair the scheduled FTS companion if an earlier v27 rollout omitted it."""
+    if (
+        conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'scheduled_messages'").fetchone()
+        is None
+    ):
+        return
+
+    conn.execute(_SCHEDULED_MESSAGES_FTS_DDL)
+    from .fts import stem_text
+
+    rows = cast(
+        list[tuple[int, int, str | None]],
+        conn.execute(
+            "SELECT sm.dialog_id, sm.message_id, sm.text "
+            "FROM scheduled_messages sm "
+            "LEFT JOIN scheduled_messages_fts sf "
+            "  ON sf.dialog_id = sm.dialog_id AND sf.message_id = sm.message_id "
+            "WHERE sf.message_id IS NULL"
+        ).fetchall(),
+    )
+    if rows:
+        conn.executemany(
+            "INSERT INTO scheduled_messages_fts(dialog_id, message_id, stemmed_text) VALUES (?, ?, ?)",
+            ((dialog_id, message_id, stem_text(text)) for dialog_id, message_id, text in rows),
+        )
+    conn.commit()
 
 
 def ensure_sync_schema(db_path: Path) -> None:
@@ -1090,6 +1212,10 @@ def ensure_sync_schema(db_path: Path) -> None:
     probe_conn = _open_sync_db(db_path)
     try:
         if _schema_ready(probe_conn):
+            from .own_only import ensure_own_only_schema
+
+            ensure_own_only_schema(probe_conn)
+            _ensure_scheduled_messages_fts(probe_conn)
             return
     finally:
         probe_conn.close()
@@ -1102,6 +1228,10 @@ def ensure_sync_schema(db_path: Path) -> None:
             bootstrap_conn = _open_sync_db(db_path)
             if not _schema_ready(bootstrap_conn):
                 _apply_migrations(bootstrap_conn)
+            from .own_only import ensure_own_only_schema
+
+            ensure_own_only_schema(bootstrap_conn)
+            _ensure_scheduled_messages_fts(bootstrap_conn)
         finally:
             if bootstrap_conn is not None:
                 bootstrap_conn.close()

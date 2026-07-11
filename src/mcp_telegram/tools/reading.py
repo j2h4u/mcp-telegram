@@ -1,5 +1,7 @@
 from dataclasses import dataclass
+from dataclasses import fields as dataclass_fields
 from datetime import UTC, datetime
+from typing import Literal
 
 from pydantic import Field, model_validator
 
@@ -160,6 +162,7 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
     "type": "object",
     "properties": {
         "dialog_id": {"type": ["integer", "null"]},
+        "scope": {"type": "string", "enum": ["all", "own_only"]},
         "dialog": {
             "type": "object",
             "properties": {
@@ -225,6 +228,11 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
                 "applied_topic_id": {"type": ["integer", "null"]},
                 "unread": {"type": "boolean"},
                 "anchor_message_id": {"type": ["integer", "null"]},
+                "message_state": {
+                    "type": "string",
+                    "enum": ["sent", "scheduled", "all"],
+                    "description": "Lifecycle filter: published history, pending author-only outbox, or both.",
+                },
             },
             "required": [
                 "dialog",
@@ -237,6 +245,7 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
                 "applied_topic_id",
                 "unread",
                 "anchor_message_id",
+                "message_state",
             ],
             "additionalProperties": False,
         },
@@ -316,6 +325,17 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
                     "edit_date": {"type": "integer"},
                     "reactions": {"type": "object"},
                     "read_markers": {"type": "array", "items": {"type": "object"}},
+                    "message_state": {"type": "string", "enum": ["sent", "scheduled"]},
+                    "visibility": {
+                        "type": "string",
+                        "description": "author_only before publication, chat_visible after publication.",
+                    },
+                    "unpublished": {"type": "boolean"},
+                    "published": {"type": "boolean", "description": "Whether this message is visible in chat history."},
+                    "unseen": {"type": "boolean"},
+                    "scheduled_at": {"type": ["integer", "null"]},
+                    "published_at": {"type": ["integer", "null"]},
+                    "inclusion_basis": {"type": "array", "items": {"type": "string"}},
                 },
                 "required": [
                     "dialog_id",
@@ -325,6 +345,14 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
                     "sender",
                     "sender_id",
                     "out",
+                    "message_state",
+                    "visibility",
+                    "unpublished",
+                    "published",
+                    "unseen",
+                    "scheduled_at",
+                    "published_at",
+                    "inclusion_basis",
                 ],
                 "additionalProperties": False,
             },
@@ -343,6 +371,7 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
         "navigation",
         "presentation",
         "read_state",
+        "scope",
         "messages",
         "count",
         "result_count_semantics",
@@ -539,6 +568,7 @@ def _list_message_structured_item(
     *,
     parent_in_page: bool,
     read_markers: list[dict[str, object]],
+    lifecycle: dict[str, object],
 ) -> dict[str, object]:
     item: dict[str, object] = {
         "dialog_id": message.dialog_id,
@@ -548,6 +578,14 @@ def _list_message_structured_item(
         "sender": resolve_sender_label(message),
         "sender_id": message.sender_id,
         "out": bool(message.out),
+        "message_state": lifecycle["message_state"],
+        "visibility": lifecycle["visibility"],
+        "unpublished": lifecycle["unpublished"],
+        "published": lifecycle["published"],
+        "unseen": lifecycle["unseen"],
+        "scheduled_at": lifecycle["scheduled_at"],
+        "published_at": lifecycle["published_at"],
+        "inclusion_basis": lifecycle.get("inclusion_basis") or [],
     }
     if message.effective_sender_id is not None and message.effective_sender_id != message.sender_id:
         item["effective_sender_id"] = message.effective_sender_id
@@ -575,6 +613,32 @@ def _list_message_structured_item(
     return item
 
 
+def _list_message_render_metadata(
+    row: dict,
+    message: ReadMessage,
+    marker_by_message: dict[int, str],
+) -> tuple[str | None, dict[str, object]]:
+    is_scheduled = row.get("message_state") == "scheduled"
+    marker_label = None if is_scheduled else marker_by_message.get(message.id)
+    return marker_label, {
+        "message_state": "scheduled" if is_scheduled else "sent",
+        "visibility": "author_only" if is_scheduled else "chat_visible",
+        "unpublished": is_scheduled,
+        "published": not is_scheduled,
+        "unseen": is_scheduled,
+        "scheduled_at": row.get("scheduled_at") if is_scheduled else None,
+        "published_at": row.get("published_at")
+        if row.get("published_at") is not None
+        else (None if is_scheduled else message.sent_at),
+        "inclusion_basis": row.get("inclusion_basis") or [],
+    }
+
+
+def _read_messages_from_rows(rows: list[dict]) -> list[ReadMessage]:
+    read_message_fields = {field.name for field in dataclass_fields(ReadMessage)}
+    return [ReadMessage(**{key: value for key, value in row.items() if key in read_message_fields}) for row in rows]
+
+
 def _list_messages_structured_messages(
     rows: list[dict],
     *,
@@ -583,15 +647,15 @@ def _list_messages_structured_messages(
 ) -> list[dict[str, object]]:
     if not rows:
         return []
-    messages = [ReadMessage(**row) for row in rows]
+    messages = _read_messages_from_rows(rows)
     reply_map: dict[int, ReadMessage] = {message.id: message for message in messages}
     marker_by_message = (
         _compute_inline_markers(messages, read_state) if DialogType.parse(dialog_type) == DialogType.USER else {}
     )
 
     structured: list[dict[str, object]] = []
-    for message in messages:
-        marker_label = marker_by_message.get(message.id)
+    for row, message in zip(rows, messages, strict=True):
+        marker_label, lifecycle = _list_message_render_metadata(row, message, marker_by_message)
         read_markers = [_structured_read_marker(message.id, marker_label)] if marker_label else []
         reply_parent = reply_map.get(message.reply_to_msg_id or -1)
         parent_in_page = reply_parent is not None
@@ -600,6 +664,7 @@ def _list_messages_structured_messages(
                 message,
                 parent_in_page=parent_in_page,
                 read_markers=read_markers,
+                lifecycle=lifecycle,
             )
         )
     return structured
@@ -657,6 +722,7 @@ def _list_messages_structured_content(ctx: _ListMessagesStructuredContentContext
             "applied_topic_id": ctx.topic_id,
             "unread": args.unread,
             "anchor_message_id": args.anchor_message_id,
+            "message_state": args.message_state,
         },
         "limits": {
             "requested_limit": args.limit,
@@ -680,6 +746,7 @@ def _list_messages_structured_content(ctx: _ListMessagesStructuredContentContext
             ),
         },
         "read_state": structured_read_state,
+        "scope": str(data.get("scope", "all")),
         "messages": _list_messages_structured_messages(
             ordered_rows,
             read_state=read_state,
@@ -708,8 +775,10 @@ SEARCH_MESSAGES_OUTPUT_SCHEMA = {
                 "dialog": {"type": ["string", "null"]},
                 "dialog_id": {"type": ["integer", "null"]},
                 "global": {"type": "boolean"},
+                "message_state": {"type": "string", "enum": ["sent", "scheduled", "all"]},
+                "ownership": {"type": "string", "enum": ["all", "own_only"]},
             },
-            "required": ["dialog", "dialog_id", "global"],
+            "required": ["dialog", "dialog_id", "global", "message_state", "ownership"],
             "additionalProperties": False,
         },
         "source": {"type": "string"},
@@ -758,8 +827,33 @@ SEARCH_MESSAGES_OUTPUT_SCHEMA = {
                     "sender": {"type": ["string", "null"]},
                     "content": {"type": "object"},
                     "anchor_call": {"type": "object"},
+                    "message_state": {"type": "string", "enum": ["sent", "scheduled"]},
+                    "visibility": {
+                        "type": "string",
+                        "description": "author_only before publication, chat_visible after publication.",
+                    },
+                    "unpublished": {"type": "boolean"},
+                    "published": {"type": "boolean"},
+                    "unseen": {"type": "boolean"},
+                    "scheduled_at": {"type": ["integer", "null"]},
+                    "published_at": {"type": ["integer", "null"]},
+                    "inclusion_basis": {"type": "array", "items": {"type": "string"}},
                 },
-                "required": ["dialog_id", "dialog_name", "msg_id", "content", "anchor_call"],
+                "required": [
+                    "dialog_id",
+                    "dialog_name",
+                    "msg_id",
+                    "content",
+                    "anchor_call",
+                    "message_state",
+                    "visibility",
+                    "unpublished",
+                    "published",
+                    "unseen",
+                    "scheduled_at",
+                    "published_at",
+                    "inclusion_basis",
+                ],
                 "additionalProperties": False,
             },
         },
@@ -811,13 +905,43 @@ def _extract_snippet(text: str | None, query: str) -> str:
     return text[:_SNIPPET_MAX_LEN] + "..."
 
 
-def _search_anchor_call(dialog_id: int, msg_id: int) -> dict[str, object]:
+def _search_anchor_call(dialog_id: int, msg_id: int, message_state: str = "sent") -> dict[str, object]:
     return {
         "tool": "list_messages",
-        "arguments": {
-            "exact_dialog_id": dialog_id,
-            "anchor_message_id": msg_id,
-        },
+        "arguments": _search_anchor_arguments(dialog_id, msg_id, message_state),
+    }
+
+
+def _search_anchor_arguments(dialog_id: int, msg_id: int, message_state: str) -> dict[str, object]:
+    arguments: dict[str, object] = {"exact_dialog_id": dialog_id}
+    if message_state == "scheduled":
+        arguments["message_state"] = "scheduled"
+    else:
+        arguments["anchor_message_id"] = msg_id
+    return arguments
+
+
+def _search_result_lifecycle_fields(row: dict) -> dict[str, object]:
+    is_scheduled = row.get("message_state") == "scheduled"
+    return {
+        "message_state": "scheduled" if is_scheduled else "sent",
+        "visibility": "author_only" if is_scheduled else "chat_visible",
+        "unpublished": is_scheduled,
+        "published": not is_scheduled,
+        "unseen": is_scheduled,
+        "scheduled_at": row.get("scheduled_at") if is_scheduled else None,
+        "published_at": row.get("published_at")
+        if row.get("published_at") is not None
+        else (None if is_scheduled else row.get("sent_at")),
+        "inclusion_basis": row.get("inclusion_basis") or [],
+    }
+
+
+def _search_result_render_fields(row: dict, dialog_id: int) -> dict[str, object]:
+    lifecycle = _search_result_lifecycle_fields(row)
+    return {
+        "anchor_call": _search_anchor_call(dialog_id, row["message_id"], str(lifecycle["message_state"])),
+        **lifecycle,
     }
 
 
@@ -838,7 +962,7 @@ def _search_result_structured_rows(rows: list[dict], query: str) -> list[dict[st
                 "date": date,
                 "sender": resolve_sender_label(row),
                 "content": telegram_content(snippet, "snippet"),
-                "anchor_call": _search_anchor_call(dialog_id, row["message_id"]),
+                **_search_result_render_fields(row, dialog_id),
             }
         )
     return results
@@ -873,6 +997,16 @@ def _search_dialog_name(rows: list[dict], global_mode: bool, dialog_label: str |
         if isinstance(dialog_name, str):
             return dialog_name
     return dialog_label
+
+
+def _search_scope_payload(ctx: _SearchStructuredContentContext) -> dict[str, object]:
+    return {
+        "dialog": ctx.args.dialog,
+        "dialog_id": ctx.dialog_id,
+        "global": ctx.global_mode,
+        "message_state": ctx.args.message_state,
+        "ownership": "own_only" if ctx.args.message_state == "scheduled" else "all",
+    }
 
 
 def _search_messages_request_context(args: SearchMessages) -> _SearchMessagesRequestContext | ToolResult:
@@ -942,11 +1076,7 @@ def _search_structured_content(ctx: _SearchStructuredContentContext) -> dict[str
     return {
         "query": ctx.args.query,
         "dialog_name": _search_dialog_name(ctx.rows, ctx.global_mode, ctx.dialog_label),
-        "scope": {
-            "dialog": ctx.args.dialog,
-            "dialog_id": ctx.dialog_id,
-            "global": ctx.global_mode,
-        },
+        "scope": _search_scope_payload(ctx),
         "source": source,
         "coverage": _list_messages_coverage(data_with_source),
         "warnings": _list_messages_warnings(data),
@@ -1044,7 +1174,9 @@ class ListMessages(ToolArgs):
 
     Supports sender, topic/exact_topic_id, and unread filters. DM rows include
     read_state plus inline read markers. Fragment coverage means a targeted
-    snippet, not full chat history.
+    snippet, not full chat history. Use message_state="scheduled" for pending
+    future outbox rows or "all" to combine them with published history. Scheduled
+    rows are author_only, unpublished, and unseen by chat participants.
     """
 
     dialog: str | None = Field(
@@ -1108,6 +1240,13 @@ class ListMessages(ToolArgs):
         le=50,
         description="Number of messages to return around anchor_message_id (default 10).",
     )
+    message_state: Literal["sent", "scheduled", "all"] = Field(
+        default="sent",
+        description=(
+            "Lifecycle filter. sent returns published chat history (default), scheduled returns "
+            "pending future outbox rows, and all combines both in chronological order."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_direct_read_selectors(self) -> ListMessages:
@@ -1118,7 +1257,13 @@ class ListMessages(ToolArgs):
             raise ValueError("dialog and exact_dialog_id are mutually exclusive.")
         if self.topic is not None and self.exact_topic_id is not None:
             raise ValueError("topic and exact_topic_id are mutually exclusive.")
+        _validate_message_state_selector(self)
         return self
+
+
+def _validate_message_state_selector(args: ListMessages) -> None:
+    if args.message_state != "sent" and args.anchor_message_id is not None:
+        raise ValueError("anchor_message_id is only supported for published sent history.")
 
 
 async def _resolve_topic_id(
@@ -1181,7 +1326,7 @@ async def _resolve_topic_id(
 
 def _list_messages_request_context(args: ListMessages) -> _ListMessagesRequestContext | ToolResult:
     navigation_sentinels = {"latest", "start"}
-    has_filter = bool(args.sender or args.topic or args.exact_topic_id is not None or args.unread)
+    has_filter = _list_messages_has_filter(args)
     has_cursor = args.navigation is not None and args.navigation not in navigation_sentinels
     if args.navigation in {"newest", "oldest"}:
         return error_result(
@@ -1220,6 +1365,12 @@ def _list_messages_request_context(args: ListMessages) -> _ListMessagesRequestCo
         sender_id=sender_id,
         sender_name=sender_name,
         unread_flag=True if args.unread else None,
+    )
+
+
+def _list_messages_has_filter(args: ListMessages) -> bool:
+    return bool(
+        args.sender or args.topic or args.exact_topic_id is not None or args.unread or args.message_state != "sent"
     )
 
 
@@ -1310,6 +1461,7 @@ async def list_messages(args: ListMessages) -> ToolResult:
                 unread=request_context.unread_flag,
                 context_message_id=args.anchor_message_id,
                 context_size=args.context_size if args.anchor_message_id else None,
+                message_state=args.message_state,
             )
     except DaemonNotRunningError:
         return error_result(_daemon_not_running_text())
@@ -1359,6 +1511,8 @@ async def list_messages(args: ListMessages) -> ToolResult:
 class SearchMessages(ToolArgs):
     """
     Search messages by text query. Returns matching messages ranked by relevance.
+    The default searches published chat history. Use message_state="scheduled" or
+    "all" to search pending future author-only outbox text as well.
 
     - Without dialog: searches across all synced dialogs. Each result includes the dialog name.
     - With dialog: scoped to that dialog only.
@@ -1394,6 +1548,13 @@ class SearchMessages(ToolArgs):
             "response to continue."
         ),
     )
+    message_state: Literal["sent", "scheduled", "all"] = Field(
+        default="sent",
+        description=(
+            "Lifecycle filter. Search published chat history by default; use scheduled for "
+            "pending future author-only outbox rows or all for both."
+        ),
+    )
 
 
 @mcp_tool(
@@ -1425,6 +1586,7 @@ async def search_messages(args: SearchMessages) -> ToolResult:
                 query=args.query,
                 limit=args.limit,
                 offset=request_context.offset,
+                message_state=args.message_state,
             )
     except DaemonNotRunningError:
         return error_result(_daemon_not_running_text())

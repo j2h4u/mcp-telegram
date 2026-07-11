@@ -305,9 +305,39 @@ def test_schema_version_records_current_v18(tmp_path: Path) -> None:
     with _sync_db_connection(db_path) as conn:
         max_version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
         assert max_version == _CURRENT_SCHEMA_VERSION
+        assert _CURRENT_SCHEMA_VERSION == 27  # v27 scheduled-message mirror
+
+
+def test_current_schema_repairs_missing_scheduled_fts(tmp_path: Path) -> None:
+    """A v27 database missing its FTS companion is repaired on startup."""
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        conn.execute(
+            "INSERT INTO scheduled_messages "
+            "(dialog_id, message_id, scheduled_at, text, first_seen_at, updated_at) "
+            "VALUES (1, 1, 2000000000, 'future message', 1700000000, 1700000000)"
+        )
+        conn.execute("DROP TABLE scheduled_messages_fts")
+        conn.commit()
+
+    ensure_sync_schema(db_path)
+
+    with _sync_db_connection(db_path) as conn:
         assert (
-            _CURRENT_SCHEMA_VERSION == 26
-        )  # v26 fwd_from_peer_id marked-id normalisation — flips when next migration ships
+            _fetchone_int(
+                conn,
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='scheduled_messages_fts'",
+            )
+            == 1
+        )
+        assert (
+            _fetchone_int(
+                conn,
+                "SELECT COUNT(*) FROM scheduled_messages_fts WHERE scheduled_messages_fts MATCH 'future'",
+            )
+            == 1
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1009,12 +1039,12 @@ def _make_v24_db(tmp_path: Path) -> Path:
 
 
 def test_migration_schema_version_is_current(tmp_path: Path) -> None:
-    """After all migrations, MAX(schema_version) == _CURRENT_SCHEMA_VERSION (26)."""
+    """After all migrations, MAX(schema_version) == _CURRENT_SCHEMA_VERSION (27)."""
     db_path = _make_v24_db(tmp_path)
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
         assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 26
+        assert _CURRENT_SCHEMA_VERSION == 27
 
 
 def test_migration_v26_remarks_known_channel_and_chat_forwards(tmp_path: Path) -> None:
