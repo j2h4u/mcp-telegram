@@ -14,6 +14,9 @@ from mcp_telegram.daemon_reading import (
     _ListMessagesTelegramRequest,
 )
 from mcp_telegram.pagination import HistoryDirection
+from mcp_telegram.telegram_fragments import FragmentContextService, TelethonTelegramFragmentGateway
+from mcp_telegram.telegram_history import TelethonTelegramHistoryGateway
+from mcp_telegram.telegram_reactions import ReactionFreshener, TelethonTelegramReactionGateway
 
 
 class _EntityMissingClient:
@@ -59,10 +62,11 @@ async def test_list_messages_telegram_entity_miss_logs_structured_warning_withou
         DaemonReadingDeps(
             conn=conn,
             sync_db_path=None,
-            client=_EntityMissingClient(),
             self_id=1,
             resolve_dialog_id=lambda _dialog_id, _dialog: asyncio.sleep(0, result=0),
-            fetch_fragment_context=lambda _dialog_id, _message_id: asyncio.sleep(0, result=False),
+            fragment_context=FragmentContextService(conn, TelethonTelegramFragmentGateway(_EntityMissingClient())),
+            reaction_freshener=ReactionFreshener(conn, TelethonTelegramReactionGateway(_EntityMissingClient())),
+            history_gateway=TelethonTelegramHistoryGateway(_EntityMissingClient()),
             logger=logger,
             rid=lambda: " request_id=test-rid",
         )

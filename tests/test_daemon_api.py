@@ -826,7 +826,7 @@ async def test_list_messages_on_demand() -> None:
 
 
 @pytest.mark.asyncio
-async def test_fetch_fragment_context_caches_anchor_window() -> None:
+async def test_reading_service_injects_fragment_context_caches_anchor_window() -> None:
     """Fragment fetch inserts anchor+tail messages and marks dialog as fragment."""
     conn = _make_db_for_fragment_context()
     client = _TestClient()
@@ -841,7 +841,7 @@ async def test_fetch_fragment_context_caches_anchor_window() -> None:
     )
     server = make_server(conn, client)
 
-    ok = await server._fetch_fragment_context(dialog_id=42, anchor_message_id=10)
+    ok = (await server._get_reading_service()._deps.fragment_context.fetch(42, 10)).ok
 
     assert ok is True
     client.get_input_entity.assert_awaited_once_with(42)
@@ -858,7 +858,7 @@ async def test_fetch_fragment_context_caches_anchor_window() -> None:
 
 
 @pytest.mark.asyncio
-async def test_fetch_fragment_context_empty_fetch_still_succeeds() -> None:
+async def test_reading_service_injects_empty_fragment_context() -> None:
     """No returned messages is a valid fragment fetch with no cache insert."""
     conn = _make_db_for_fragment_context()
     client = _TestClient()
@@ -866,7 +866,7 @@ async def test_fetch_fragment_context_empty_fetch_still_succeeds() -> None:
     client.get_messages = AsyncMock(return_value=[None])
     server = make_server(conn, client)
 
-    ok = await server._fetch_fragment_context(dialog_id=43, anchor_message_id=20)
+    ok = (await server._get_reading_service()._deps.fragment_context.fetch(43, 20)).ok
 
     assert ok is True
     row = _fetchone_row(conn, "SELECT status FROM synced_dialogs WHERE dialog_id = 43")
@@ -876,7 +876,7 @@ async def test_fetch_fragment_context_empty_fetch_still_succeeds() -> None:
 
 
 @pytest.mark.asyncio
-async def test_fetch_fragment_context_client_failure_returns_false() -> None:
+async def test_reading_service_injects_fragment_failure() -> None:
     """Telegram lookup failure leaves the fragment marker but reports failure."""
     conn = _make_db_for_fragment_context()
     client = _TestClient()
@@ -884,7 +884,7 @@ async def test_fetch_fragment_context_client_failure_returns_false() -> None:
     client.get_messages = AsyncMock()
     server = make_server(conn, client)
 
-    ok = await server._fetch_fragment_context(dialog_id=44, anchor_message_id=30)
+    ok = (await server._get_reading_service()._deps.fragment_context.fetch(44, 30)).ok
 
     assert ok is False
     client.get_messages.assert_not_called()

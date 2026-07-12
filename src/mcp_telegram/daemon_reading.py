@@ -2,19 +2,14 @@
 
 import asyncio
 import dataclasses
-import inspect
 import sqlite3
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, cast
 
 from rapidfuzz import fuzz as _fuzz
-from telethon.errors import (
-    FloodWaitError,  # type: ignore[import-untyped]
-    RPCError,  # type: ignore[import-untyped]
-)
 
 from .daemon_account_trace import (
     _TRACE_ACRONYM_MAX_LEN,
@@ -32,8 +27,7 @@ from .daemon_dialog_queries import (
     _compute_snapshot_age_h,
     _compute_sync_coverage,
 )
-from .daemon_message import REACTIONS_TTL_SECONDS, fetch_reaction_counts, message_to_dict
-from .daemon_message import _MessageLike as _DaemonMessageLike
+from .daemon_message import fetch_reaction_counts
 from .daemon_message_queries import (
     _LIST_MESSAGES_BASE_SQL,
     _SELECT_FTS_ALL_SQL,
@@ -62,6 +56,9 @@ from .pagination import (
 )
 from .resolver import latinize
 from .sync_db import open_sync_db_reader
+from .telegram_fragments import FragmentContextService
+from .telegram_reactions import ReactionFreshener
+from .telegram_reading import GatewayFailure, ReactionFreshness, TelegramHistoryGateway
 
 
 class _LoggerLike(Protocol):
@@ -104,22 +101,17 @@ def _log_recoverable_telegram_error(
     )
 
 
-class _TelegramClientLike(Protocol):
-    async def get_messages(self, entity: object, ids: list[int]) -> object: ...
-
-    def iter_messages(self, dialog_id: int, **kwargs: object) -> AsyncIterator[object]: ...
-
-
 @dataclass(frozen=True)
 class DaemonReadingDeps:
     """Dependencies for ``DaemonReadingService``."""
 
     conn: sqlite3.Connection
     sync_db_path: Path | None
-    client: _TelegramClientLike
     self_id: int | None
     resolve_dialog_id: Callable[[int, str | None], Awaitable[int | dict]]
-    fetch_fragment_context: Callable[[int, int], Awaitable[bool]]
+    fragment_context: FragmentContextService
+    reaction_freshener: ReactionFreshener
+    history_gateway: TelegramHistoryGateway
     logger: _LoggerLike
     rid: Callable[[], str]
 
@@ -464,10 +456,9 @@ class DaemonReadingService:
         rows: Sequence[object],
         *,
         log_rendered: bool,
-    ) -> list[ReadMessage]:
+    ) -> tuple[list[ReadMessage], ReactionFreshness]:
         msg_ids = [_message_id_from_item(r) for r in rows]
-        if msg_ids:
-            await self._freshen_reactions_if_stale(dialog_id, dialog_id, msg_ids)
+        freshness = await self._deps.reaction_freshener.refresh(dialog_id, dialog_id, msg_ids)
         reaction_map = fetch_reaction_counts(self._conn, dialog_id, msg_ids)
         messages: list[ReadMessage] = []
         for r in rows:
@@ -493,7 +484,7 @@ class DaemonReadingService:
                     "unresolved_entity_rows": unresolved_entity_rows,
                 },
             )
-        return messages
+        return messages, freshness
 
     def _read_state_per_dialog(self, messages: list[ReadMessage]) -> dict[int, ReadState]:
         read_state_per_dialog: dict[int, ReadState] = {}
@@ -512,7 +503,10 @@ class DaemonReadingService:
         row = _fetchone_row(self._conn.execute(_SELECT_SYNC_STATUS_SQL, (dialog_id,)))
         current_status = _status_from_row(row)
         if current_status in (None, "not_synced", "fragment", "own_only"):
-            if not await self._deps.fetch_fragment_context(dialog_id, request.context_message_id or 0):
+            fragment_result = await self._deps.fragment_context.fetch(dialog_id, request.context_message_id or 0)
+            if not fragment_result.ok:
+                failure = fragment_result.failure
+                detail = failure.as_dict() if failure is not None else None
                 return {
                     "ok": False,
                     "error": "fragment_fetch_failed",
@@ -520,6 +514,7 @@ class DaemonReadingService:
                     "required_action": "Retry with a valid anchor_message_id, or mark the dialog for sync if broader history is needed.",
                     "context_availability": "fragment_unavailable",
                     "dialog_status": current_status or "not_synced",
+                    "fragment_failure": detail,
                 }
             result = await self._list_messages_context_window(
                 dialog_id=dialog_id,
@@ -659,7 +654,7 @@ class DaemonReadingService:
                 },
             )
         )
-        messages = await self._build_read_messages_from_rows(request.dialog_id, rows, log_rendered=False)
+        messages, freshness = await self._build_read_messages_from_rows(request.dialog_id, rows, log_rendered=False)
         next_nav = self._search_next_navigation(request, messages, global_mode=False)
         row = _fetchone_row(self._conn.execute(_SELECT_SYNC_STATUS_SQL, (request.dialog_id,)))
         scoped_status = _status_from_row(row)
@@ -671,6 +666,7 @@ class DaemonReadingService:
                 "total": len(messages),
                 "next_navigation": next_nav,
                 "read_state_per_dialog": self._read_state_per_dialog(messages),
+                "reaction_freshness": freshness.as_dict(),
                 **access_meta,
             },
         }
@@ -874,66 +870,6 @@ class DaemonReadingService:
             "inclusion_basis": list(inclusion_basis) if inclusion_basis is not None else None,
         }
 
-    async def _freshen_reactions_if_stale(
-        self,
-        dialog_id: int,
-        entity: object,
-        message_ids: list[int],
-    ) -> None:
-        """Per-message TTL-gated JIT reaction freshen from Telegram."""
-        if not message_ids:
-            return
-        row = _fetchone_row(self._conn.execute("SELECT 1 FROM synced_dialogs WHERE dialog_id = ?", (dialog_id,)))
-        if row is None:
-            return
-
-        now = int(time.time())
-        threshold = now - REACTIONS_TTL_SECONDS
-        placeholders = ",".join("?" * len(message_ids))
-        fresh_rows = _fetchall_rows(
-            self._conn.execute(
-                f"SELECT message_id FROM message_reactions_freshness "
-                f"WHERE dialog_id = ? AND message_id IN ({placeholders}) "
-                f"AND checked_at > ?",
-                [dialog_id, *message_ids, threshold],
-            )
-        )
-        fresh_ids = {_object_to_int(_row_sequence(r)[0]) for r in fresh_rows}
-        stale_ids = [mid for mid in message_ids if mid not in fresh_ids]
-        if not stale_ids:
-            return
-
-        try:
-            messages_result = self._deps.client.get_messages(entity, ids=stale_ids)
-            if not inspect.isawaitable(messages_result):
-                return
-            messages = cast(Sequence[object], await cast(Awaitable[object], messages_result))
-        except FloodWaitError as exc:
-            self._logger.warning(
-                "jit_reactions_floodwait dialog_id=%d stale_count=%d seconds=%d",
-                dialog_id,
-                len(stale_ids),
-                getattr(exc, "seconds", 0),
-            )
-            return
-        except Exception:
-            self._logger.exception("jit_reactions_failed dialog_id=%d", dialog_id)
-            return
-
-        from .sync_worker import apply_reactions_delta, extract_reactions_rows
-
-        with self._conn:
-            for msg_id, msg in zip(stale_ids, messages, strict=False):
-                if msg is None:
-                    continue
-                rows = extract_reactions_rows(dialog_id, msg_id, getattr(msg, "reactions", None))
-                apply_reactions_delta(self._conn, dialog_id, msg_id, rows)
-                self._conn.execute(
-                    "INSERT OR REPLACE INTO message_reactions_freshness "
-                    "(dialog_id, message_id, checked_at) VALUES (?, ?, ?)",
-                    (dialog_id, msg_id, now),
-                )
-
     async def _resolve_unread_position(
         self,
         dialog_id: int,
@@ -982,7 +918,7 @@ class DaemonReadingService:
         )
 
         rows = list(reversed(before_rows)) + list(after_rows)
-        messages = await self._build_read_messages_from_rows(dialog_id, rows, log_rendered=True)
+        messages, freshness = await self._build_read_messages_from_rows(dialog_id, rows, log_rendered=True)
 
         dialog_type = _dialog_type_from_db(self._conn, dialog_id)
         read_state = _read_state_for_dialog(self._conn, dialog_id, dialog_type)
@@ -995,6 +931,7 @@ class DaemonReadingService:
                 "next_navigation": None,
                 "dialog_type": dialog_type,
                 "read_state": read_state,
+                "reaction_freshness": freshness.as_dict(),
             },
         }
 
@@ -1016,20 +953,16 @@ class DaemonReadingService:
             }.items()
             if v is not None
         }
-        messages: list[dict[str, object]] = []
-        try:
-            messages.extend(
-                [
-                    message_to_dict(
-                        cast(_DaemonMessageLike, msg),
-                        dialog_id=req.dialog_id,
-                        self_id=self._deps.self_id,
-                    )
-                    async for msg in self._deps.client.iter_messages(req.dialog_id, **iter_kwargs)
-                ]
-            )
-        except Exception as exc:  # noqa: BLE001 - boundary helper logs expected vs unexpected Telegram failures.
-            return self._list_messages_telegram_error(req, exc)
+        history_result = await self._deps.history_gateway.fetch_history(
+            req.dialog_id,
+            iter_kwargs,
+            self._deps.self_id,
+        )
+        if not history_result.ok:
+            failure = history_result.failure
+            assert failure is not None
+            return self._list_messages_telegram_error(req, failure)
+        messages = list(history_result.messages)
 
         next_nav = self._maybe_encode_next_nav(
             _NextNavContext(
@@ -1049,24 +982,27 @@ class DaemonReadingService:
             "data": {"messages": messages, "source": "telegram", "next_navigation": next_nav},
         }
 
-    def _list_messages_telegram_error(self, req: _ListMessagesTelegramRequest, exc: Exception) -> dict:
-        if isinstance(exc, (RPCError, ValueError)):
+    def _list_messages_telegram_error(self, req: _ListMessagesTelegramRequest, failure: GatewayFailure) -> dict:
+        if not failure.retryable or failure.kind.value in {"flood_wait", "access_lost", "transient"}:
             _log_recoverable_telegram_error(
                 self._logger,
                 event="list_messages_telegram_error",
                 dialog_id=req.dialog_id,
-                exc=exc,
+                exc=RuntimeError(failure.error_message),
                 request_id=self._deps.rid(),
             )
+            detail: dict[str, object] = {
+                "error_type": failure.error_type,
+                "error_message": failure.error_message,
+                "retryable": failure.retryable,
+            }
+            if failure.retry_after is not None:
+                detail["retry_after"] = failure.retry_after
             return {
                 "ok": False,
                 "error": "telegram_error",
                 "message": "failed to fetch messages",
-                "detail": {
-                    "error_type": type(exc).__name__,
-                    "error_message": _safe_exception_message(exc),
-                    "retryable": False,
-                },
+                "detail": detail,
             }
 
         self._logger.exception(
@@ -1080,7 +1016,7 @@ class DaemonReadingService:
         """Read messages from sync.db using the dynamic query builder."""
         sql, params = _build_list_messages_query(req)
         rows = _fetchall_rows(self._conn.execute(sql, params))
-        messages = await self._build_read_messages_from_rows(req.dialog_id, rows, log_rendered=True)
+        messages, freshness = await self._build_read_messages_from_rows(req.dialog_id, rows, log_rendered=True)
         next_nav = self._maybe_encode_next_nav(
             _NextNavContext(
                 messages=messages,
@@ -1100,6 +1036,7 @@ class DaemonReadingService:
                 "messages": [dataclasses.asdict(m) for m in messages],
                 "source": "sync_db",
                 "next_navigation": next_nav,
+                "reaction_freshness": freshness.as_dict(),
             },
         }
 

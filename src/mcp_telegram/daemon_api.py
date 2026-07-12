@@ -146,7 +146,9 @@ from .daemon_source_export import (
 )
 from .feedback_db import VALID_SEVERITIES, VALID_STATUSES
 from .formatter import format_reaction_counts
-from .sync_worker import extract_reactions_rows
+from .telegram_fragments import FragmentContextService, TelethonTelegramFragmentGateway
+from .telegram_history import TelethonTelegramHistoryGateway
+from .telegram_reactions import ReactionFreshener, TelethonTelegramReactionGateway
 
 
 class _LoggerLike(Protocol):
@@ -192,7 +194,6 @@ if TYPE_CHECKING:
     from .daemon_reading import _ListMessagesDbRequest as ReadingListMessagesDbRequest
     from .daemon_reading import _ListMessagesTelegramRequest as ReadingListMessagesTelegramRequest
     from .daemon_reading import _LoggerLike as ReadingLoggerLike
-    from .daemon_reading import _TelegramClientLike as ReadingTelegramClientLike
     from .pagination import HistoryDirection
 else:
     _AccountTraceClientLike = object
@@ -200,7 +201,6 @@ else:
     ReadingListMessagesDbRequest = object
     ReadingListMessagesTelegramRequest = object
     ReadingLoggerLike = object
-    ReadingTelegramClientLike = object
 
 # Phase 39.2 §Key technical decisions: per-message TTL for JIT reactions freshen-on-read.
 # Amortizes rapid paginated reads on the same ids; live events catch most mutations.
@@ -364,6 +364,11 @@ class DaemonAPIServer:
         self._ready: bool = False
         self.startup_detail: str = "connecting to Telegram"
         self._reading_service: DaemonReadingService | None = None
+        self._reaction_freshener = ReactionFreshener(
+            self._conn,
+            TelethonTelegramReactionGateway(self._client),
+            log=logger,
+        )
         self._activity_stats_service: _activity_stats.DaemonActivityStatsService | None = None
 
     def _get_reading_service(self) -> DaemonReadingService:
@@ -375,10 +380,14 @@ class DaemonAPIServer:
                 DaemonReadingDeps(
                     conn=self._conn,
                     sync_db_path=self._sync_db_path,
-                    client=cast(ReadingTelegramClientLike, self._client),
                     self_id=self.self_id,
                     resolve_dialog_id=self._resolve_dialog_id,
-                    fetch_fragment_context=self._fetch_fragment_context,
+                    fragment_context=FragmentContextService(
+                        self._conn,
+                        TelethonTelegramFragmentGateway(self._client),
+                    ),
+                    reaction_freshener=self._reaction_freshener,
+                    history_gateway=TelethonTelegramHistoryGateway(self._client),
                     logger=cast(ReadingLoggerLike, logger),
                     rid=_rid,
                 )
@@ -776,15 +785,6 @@ class DaemonAPIServer:
                 request_id=_rid,
             ),
         )
-
-    async def _freshen_reactions_if_stale(
-        self,
-        dialog_id: int,
-        entity: object,
-        message_ids: list[int],
-    ) -> None:
-        """Delegate JIT reaction refresh to the reading service."""
-        await self._get_reading_service()._freshen_reactions_if_stale(dialog_id, entity, message_ids)
 
     async def _resolve_unread_position(
         self,
@@ -1246,7 +1246,7 @@ class DaemonAPIServer:
             msg_ids = [int(cast(int | str, r["message_id"])) for r in rows]
             # Phase 39.2 Plan 02: per-dialog JIT freshen + reactions injection.
             if msg_ids:
-                await self._freshen_reactions_if_stale(chat_id, chat_id, msg_ids)
+                freshness = await self._reaction_freshener.refresh(chat_id, chat_id, msg_ids)
                 reaction_map = fetch_reaction_counts(self._conn, chat_id, msg_ids)
                 group_messages = [
                     _read_message_from_row(
@@ -1258,8 +1258,11 @@ class DaemonAPIServer:
                     for r in rows
                 ]
             else:
+                freshness = None
                 group_messages = [_read_message_from_row(r) for r in rows]
             group["messages"] = [dataclasses.asdict(m) for m in group_messages]
+            if freshness is not None:
+                group["reaction_freshness"] = freshness.as_dict()
             groups.append(group)
 
         return groups
@@ -1419,80 +1422,6 @@ class DaemonAPIServer:
 
     async def _get_dialog_stats(self, req: dict[str, object]) -> dict:
         return await self._get_activity_stats_service().get_dialog_stats(req)
-
-    # ------------------------------------------------------------------
-    # _fetch_fragment_context (helper for _list_messages fragment branch)
-    # ------------------------------------------------------------------
-
-    async def _fetch_fragment_context(self, dialog_id: int, anchor_message_id: int) -> bool:
-        """Targeted getMessages around an anchor; caches into messages table.
-
-        Per D-08: default context window is 5 messages AFTER the anchor.
-        Fragment dialog row is INSERT OR IGNORE (never overwrites 'synced').
-        """
-        # Ensure synced_dialogs row exists with status='fragment' (idempotent).
-        with self._conn:
-            self._conn.execute(
-                "INSERT OR IGNORE INTO synced_dialogs (dialog_id, status) VALUES (?, 'fragment')",
-                (dialog_id,),
-            )
-
-        try:
-            ids = list(range(anchor_message_id, anchor_message_id + 6))  # anchor + 5 after
-            entity = await self._client.get_input_entity(dialog_id)
-            fetched = await self._client.get_messages(entity, ids=ids)
-        except Exception:
-            logger.warning(
-                "fragment_fetch_failed dialog_id=%s anchor=%s",
-                dialog_id,
-                anchor_message_id,
-                exc_info=True,
-            )
-            return False
-
-        # Upsert into messages using existing sync_worker helpers.
-        # ExtractedMessage.message is a StoredMessage dataclass — bind via asdict().
-        from dataclasses import asdict
-
-        from .sync_worker import (
-            INSERT_MESSAGE_SQL,
-            extract_message_row,
-        )
-
-        fetched_rows = cast(Sequence[object | None], fetched)
-        extracted_messages = []
-        reaction_rows_all = []
-        for msg in fetched_rows:
-            if msg is None:
-                continue
-            extracted = extract_message_row(dialog_id, msg)
-            if extracted is None:
-                continue
-            # Use .message field (StoredMessage dataclass), not the deprecated .row attribute.
-            extracted_messages.append(extracted)
-            msg_id = getattr(msg, "id", None)
-            if not isinstance(msg_id, int):
-                continue
-            reactions = extract_reactions_rows(dialog_id, msg_id, _attr(msg, "reactions", None))
-            reaction_rows_all.extend(reactions)
-
-        if not extracted_messages:
-            return True
-
-        with self._conn:
-            # INSERT_MESSAGE_SQL uses named params bound to StoredMessage field names.
-            self._conn.executemany(
-                INSERT_MESSAGE_SQL,
-                [{**asdict(item.message), "reply_count": item.reply_count} for item in extracted_messages],
-            )
-            # message_reactions upsert: mirror sync_worker pattern exactly.
-            if reaction_rows_all:
-                self._conn.executemany(
-                    "INSERT OR REPLACE INTO message_reactions "
-                    "(dialog_id, message_id, emoji, count) VALUES (?, ?, ?, ?)",
-                    [(r.dialog_id, r.message_id, r.emoji, r.count) for r in reaction_rows_all],
-                )
-        return True
 
     # ------------------------------------------------------------------
     # get_my_recent_activity
