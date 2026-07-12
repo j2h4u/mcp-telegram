@@ -3,18 +3,8 @@
 Slice 2a moved SQL text, row mappers, and pure helpers out of ``daemon_api`` into
 three focused owner modules (``daemon_message_queries``, ``daemon_dialog_queries``,
 ``daemon_read_state_queries``) plus a couple of constants that already lived in
-``daemon_account_trace`` / ``daemon_message``. For this first commit ``daemon_api``
-keeps *temporary* re-exports so not-yet-switched call sites and existing tests still
-resolve ``daemon_api.<name>``.
-
-These tests pin two properties so the Slice 2 call-site switch cannot silently drift:
-
-1. Every re-exported ``daemon_api.<name>`` is the *identical object* owned by the
-   extracted module — proving the old name and the new implementation are one and
-   the same (identical SQL / results / helpers by construction).
-2. Golden snapshots of the pure builder + helpers, exercised through the
-   ``daemon_api`` alias, lock the actual SQL string / result dicts the extraction
-   produces.
+``daemon_account_trace`` / ``daemon_message``. Golden snapshots of the pure
+builders and helpers lock the extracted behavior directly at each owner.
 """
 
 from __future__ import annotations
@@ -27,103 +17,16 @@ from typing import cast
 
 import pytest
 
-from mcp_telegram import (
-    daemon_account_trace,
-    daemon_api,
-    daemon_dialog_queries,
-    daemon_message,
-    daemon_message_queries,
-    daemon_read_state_queries,
-)
-from mcp_telegram.daemon_api import (
+from mcp_telegram.daemon_dialog_queries import _compute_snapshot_age_h, _compute_sync_coverage
+from mcp_telegram.daemon_message_queries import (
     _LIST_MESSAGES_BASE_SQL,
     _build_list_messages_query,
-    _compute_snapshot_age_h,
-    _compute_sync_coverage,
-    _dialog_type_from_db,
     _ListMessagesDbRequest,
-    _read_state_for_dialog,
 )
+from mcp_telegram.daemon_read_state_queries import _dialog_type_from_db, _read_state_for_dialog
 
 # ---------------------------------------------------------------------------
-# 1. Re-export identity parity
-# ---------------------------------------------------------------------------
-
-# name -> owner module. Covers every symbol daemon_api pulls from an extracted
-# query module (both the genuinely-used imports and the Slice 2a temp re-exports).
-_REEXPORTS: dict[str, object] = {}
-_REEXPORTS.update(
-    dict.fromkeys(
-        [
-            "_TRACE_ACRONYM_MAX_LEN",
-            "_TRACE_ACRONYM_MIN_LEN",
-            "_TRACE_FUZZY_MIN_LEN",
-            "_TRACE_FUZZY_SCORE_MIN",
-            "GROUP_TTL",
-            "USER_TTL",
-        ],
-        daemon_account_trace,
-    )
-)
-_REEXPORTS.update(
-    dict.fromkeys(
-        [
-            "_BATCHED_UNREAD_COUNTS_SQL",
-            "_COLLECT_UNREAD_DIALOGS_WITH_COUNTS_SQL",
-            "_COUNT_BOOTSTRAP_PENDING_SQL",
-            "_COUNT_MESSAGES_BY_DIALOG_SQL",
-            "_COUNT_SYNCED_MESSAGES_SQL",
-            "_GET_ACCESS_LOST_ALERTS_SQL",
-            "_GET_DELETED_ALERTS_SQL",
-            "_GET_EDIT_ALERTS_SQL",
-            "_GET_READ_POSITION_SQL",
-            "_GET_SYNC_STATUS_SQL",
-            "_LIST_DIALOGS_SQL",
-            "_LIST_TOPICS_SQL",
-            "_MARK_FOR_SYNC_SQL",
-            "_SELECT_DIALOG_ACCESS_META_SQL",
-            "_SELECT_SYNCED_STATUSES_SQL",
-            "_UNMARK_SYNC_SQL",
-            "_build_access_metadata",
-            "_compute_snapshot_age_h",
-            "_compute_sync_coverage",
-        ],
-        daemon_dialog_queries,
-    )
-)
-_REEXPORTS.update(
-    dict.fromkeys(
-        [
-            "EFFECTIVE_SENDER_ID_SQL",
-            "_FETCH_UNREAD_MESSAGES_SQL",
-            "_LIST_MESSAGES_BASE_SQL",
-            "_SELECT_FTS_ALL_SQL",
-            "_SELECT_FTS_SQL",
-            "_SELECT_MESSAGES_SQL",
-            "_SENDER_ENTITY_JOINS_SQL",
-            "_SENDER_FIRST_NAME_SQL",
-            "_ListMessagesDbRequest",
-            "_assert_select_columns_match_read_message",
-            "_build_list_messages_query",
-            "_read_message_from_row",
-        ],
-        daemon_message_queries,
-    )
-)
-_REEXPORTS.update(dict.fromkeys(["_dialog_type_from_db", "_read_state_for_dialog"], daemon_read_state_queries))
-_REEXPORTS.update(dict.fromkeys(["REACTIONS_TTL_SECONDS"], daemon_message))
-
-
-@pytest.mark.parametrize("name", sorted(_REEXPORTS), ids=sorted(_REEXPORTS))
-def test_daemon_api_reexport_is_owner_object(name: str) -> None:
-    """daemon_api.<name> is the *same object* the owner module exports."""
-    owner = _REEXPORTS[name]
-    assert hasattr(daemon_api, name), f"daemon_api lost re-export {name}"
-    assert getattr(daemon_api, name) is getattr(owner, name), f"daemon_api.{name} diverged from {owner.__name__}.{name}"
-
-
-# ---------------------------------------------------------------------------
-# 2. Golden SQL snapshot — _build_list_messages_query
+# 1. Golden SQL snapshot — _build_list_messages_query
 # ---------------------------------------------------------------------------
 
 
@@ -171,7 +74,7 @@ def test_build_list_messages_query_golden_stacked_filters() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 3. Golden pure-helper truth tables
+# 2. Golden pure-helper truth tables
 # ---------------------------------------------------------------------------
 
 
@@ -196,7 +99,7 @@ def test_compute_snapshot_age_h_fresh_is_none() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 4. Golden result parity — DB-backed read-state helpers via daemon_api alias
+# 3. Golden result parity — DB-backed read-state helpers via owner modules
 # ---------------------------------------------------------------------------
 
 

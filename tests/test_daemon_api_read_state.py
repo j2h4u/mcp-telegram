@@ -21,12 +21,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from mcp_telegram.daemon_api import (
-    DaemonAPIServer,
-    _DaemonClientLike,
-    _dialog_type_from_db,
-    _read_state_for_dialog,
-)
+from mcp_telegram.daemon_api import DaemonAPIServer, _DaemonClientLike
+from mcp_telegram.daemon_read_state_queries import _dialog_type_from_db, _read_state_for_dialog
 from mcp_telegram.telethon_dialog import classify_dialog_type
 
 # ---------------------------------------------------------------------------

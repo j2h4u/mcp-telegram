@@ -831,7 +831,7 @@ def test_daemon_api_topic_title_left_join_still_works(sync_db: _SQLiteConnection
         snapshot_at=9999,
     )
 
-    # Mirror the LEFT JOIN query used in daemon_api._LIST_MESSAGES_BASE_SQL
+    # Mirror the LEFT JOIN query used in daemon_message_queries._LIST_MESSAGES_BASE_SQL
     row = sync_db.execute(
         "SELECT tm.title FROM topic_metadata tm WHERE tm.dialog_id = ? AND tm.topic_id = ?",
         (dialog_id, topic_id),

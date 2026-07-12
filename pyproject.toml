@@ -328,6 +328,12 @@ source_modules = ["mcp_telegram.daemon_api"]
 forbidden_modules = ["mcp_telegram.server", "mcp_telegram.tools", "mcp_telegram.__init__"]
 
 [[tool.importlinter.contracts]]
+name = "Daemon reading stays off daemon API"
+type = "forbidden"
+source_modules = ["mcp_telegram.daemon_reading"]
+forbidden_modules = ["mcp_telegram.daemon_api"]
+
+[[tool.importlinter.contracts]]
 name = "Daemon client is transport-only"
 type = "forbidden"
 source_modules = ["mcp_telegram.daemon_client"]

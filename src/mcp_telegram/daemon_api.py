@@ -71,76 +71,33 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
 )
 
 from . import daemon_activity_stats as _activity_stats
-
-# NOTE: names carrying an F401-suppression comment below are Slice 2a TEMPORARY
-# re-exports — unused inside daemon_api, kept only so ``daemon_api.<name>`` keeps
-# resolving for not-yet-switched call sites (daemon_reading) and the golden/parity
-# tests. Delete them in Slice 2 once every call site imports from the owner module.
 from .daemon_account_trace import (
-    _TRACE_ACRONYM_MAX_LEN,  # noqa: F401
-    _TRACE_ACRONYM_MIN_LEN,  # noqa: F401
-    _TRACE_FUZZY_MIN_LEN,  # noqa: F401
-    _TRACE_FUZZY_SCORE_MIN,  # noqa: F401
     GROUP_TTL,
     USER_TTL,
     DaemonAccountTraceDeps,
     DaemonAccountTraceService,
 )
 from .daemon_dialog_queries import (
-    _BATCHED_UNREAD_COUNTS_SQL,  # noqa: F401
     _COLLECT_UNREAD_DIALOGS_WITH_COUNTS_SQL,
     _COUNT_BOOTSTRAP_PENDING_SQL,
-    _COUNT_MESSAGES_BY_DIALOG_SQL,  # noqa: F401
     _COUNT_SYNCED_MESSAGES_SQL,
     _GET_ACCESS_LOST_ALERTS_SQL,
     _GET_DELETED_ALERTS_SQL,
     _GET_EDIT_ALERTS_SQL,
-    _GET_READ_POSITION_SQL,  # noqa: F401
     _GET_SYNC_STATUS_SQL,
-    _LIST_DIALOGS_SQL,  # noqa: F401
     _LIST_TOPICS_SQL,
     _MARK_FOR_SYNC_SQL,
-    _SELECT_DIALOG_ACCESS_META_SQL,  # noqa: F401
-    _SELECT_SYNCED_STATUSES_SQL,  # noqa: F401
     _UNMARK_SYNC_SQL,
-    _build_access_metadata,  # noqa: F401
-    _compute_snapshot_age_h,  # noqa: F401
     _compute_sync_coverage,
 )
 from .daemon_entity_info import DaemonEntityInfoService, EntityInfoDeps
 from .daemon_ipc import get_daemon_socket_path as _get_daemon_socket_path
 from .daemon_message_queries import (
     _FETCH_UNREAD_MESSAGES_SQL,
-    _LIST_MESSAGES_BASE_SQL,  # noqa: F401
-    _SELECT_FTS_ALL_SQL,  # noqa: F401
-    _SELECT_FTS_SQL,  # noqa: F401
-    _SELECT_MESSAGES_SQL,  # noqa: F401
-    _SENDER_ENTITY_JOINS_SQL,  # noqa: F401
-    _SENDER_FIRST_NAME_SQL,  # noqa: F401
-    EFFECTIVE_SENDER_ID_SQL,  # noqa: F401
-    _assert_select_columns_match_read_message,  # noqa: F401
-    _build_list_messages_query,  # noqa: F401
-    _ListMessagesDbRequest,  # noqa: F401
     _read_message_from_row,
 )
 from .daemon_read_state_queries import _dialog_type_from_db, _read_state_for_dialog
 from .models import DialogType, ReadMessage
-from .models import (
-    # Slice 2a TEMP re-export: daemon_reading still reads the ReadState type as
-    # ``daemon_api.ReadState``. Delete in Slice 2 once it imports from .models
-    # (or daemon_read_state_queries) directly. `X as X` marks the deliberate
-    # re-export for ruff.
-    ReadState as ReadState,
-)
-
-DEFAULT_ACTIVITY_DIALOG_KINDS = _activity_stats.DEFAULT_ACTIVITY_DIALOG_KINDS
-_ACTIVITY_DIALOG_KIND_ALIASES = _activity_stats._ACTIVITY_DIALOG_KIND_ALIASES
-_ALLOWED_ACTIVITY_DIALOG_KINDS = _activity_stats._ALLOWED_ACTIVITY_DIALOG_KINDS
-_GET_DIALOG_TOP_FORWARDS_SQL = _activity_stats._GET_DIALOG_TOP_FORWARDS_SQL
-_GET_DIALOG_TOP_HASHTAGS_SQL = _activity_stats._GET_DIALOG_TOP_HASHTAGS_SQL
-_GET_DIALOG_TOP_MENTIONS_SQL = _activity_stats._GET_DIALOG_TOP_MENTIONS_SQL
-_GET_DIALOG_TOP_REACTIONS_SQL = _activity_stats._GET_DIALOG_TOP_REACTIONS_SQL
-_SELECT_SYNC_STATUS_SQL = _activity_stats._SELECT_SYNC_STATUS_SQL
 
 # Entity / telemetry SQL
 _UPSERT_ENTITY_SQL = (
@@ -181,13 +138,7 @@ def get_daemon_socket_path() -> Path:
 
 
 from .budget import allocate_message_budget_proportional, unread_chat_tier
-
-# REACTIONS_TTL_SECONDS: Slice 2a TEMP re-export — daemon_reading + tests still read
-# ``daemon_api.REACTIONS_TTL_SECONDS``. Delete in Slice 2 once they switch.
-from .daemon_message import (
-    REACTIONS_TTL_SECONDS,  # noqa: F401
-    fetch_reaction_counts,
-)
+from .daemon_message import fetch_reaction_counts
 from .daemon_source_export import (
     _describe_source,
     _export_source_changes,

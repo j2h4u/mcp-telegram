@@ -1,6 +1,6 @@
 """Invariant tests for data-layer contracts."""
 
-from mcp_telegram.daemon_api import _assert_select_columns_match_read_message
+from mcp_telegram.daemon_message_queries import _assert_select_columns_match_read_message
 
 
 def test_list_messages_columns_match_read_message() -> None:

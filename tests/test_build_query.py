@@ -12,7 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import cast
 
-from mcp_telegram.daemon_api import _build_list_messages_query, _ListMessagesDbRequest
+from mcp_telegram.daemon_message_queries import _build_list_messages_query, _ListMessagesDbRequest
 
 
 @dataclass(frozen=True, slots=True)

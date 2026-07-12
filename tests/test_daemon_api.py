@@ -21,8 +21,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from mcp_telegram.config import ConfigError
-from mcp_telegram.daemon_api import DaemonAPIServer, _DaemonClientLike, _ListMessagesDbRequest, get_daemon_socket_path
+from mcp_telegram.daemon_api import DaemonAPIServer, _DaemonClientLike, get_daemon_socket_path
+from mcp_telegram.daemon_dialog_queries import _compute_sync_coverage
 from mcp_telegram.daemon_message import _MessageLike, fetch_reaction_counts, message_to_dict
+from mcp_telegram.daemon_message_queries import _build_list_messages_query, _ListMessagesDbRequest
 from mcp_telegram.fts import MESSAGES_FTS_DDL, stem_text
 from mcp_telegram.models import DialogType
 from mcp_telegram.telethon_dialog import classify_dialog_type
@@ -3262,16 +3264,12 @@ def test_daemon_imports_migrate_legacy_databases() -> None:
 
 
 def test_build_list_messages_query_exists() -> None:
-    """_build_list_messages_query is exported from daemon_api."""
-    from mcp_telegram.daemon_api import _build_list_messages_query
-
+    """_build_list_messages_query is owned by daemon_message_queries."""
     assert callable(_build_list_messages_query)
 
 
 def test_build_list_messages_query_basic_shape() -> None:
     """_build_list_messages_query returns (sql, params) with edit_date and topic_title columns."""
-    from mcp_telegram.daemon_api import _build_list_messages_query
-
     sql, params = _build_list_messages_query(_build_list_messages_query_req())
     assert "edit_date" in sql
     assert "topic_title" in sql or "tm.title" in sql
@@ -3284,24 +3282,18 @@ def test_build_list_messages_query_basic_shape() -> None:
 
 def test_build_list_messages_query_direction_newest() -> None:
     """_build_list_messages_query with direction=newest uses DESC order."""
-    from mcp_telegram.daemon_api import _build_list_messages_query
-
     sql, _ = _build_list_messages_query(_build_list_messages_query_req(direction="newest"))
     assert "DESC" in sql.upper()
 
 
 def test_build_list_messages_query_direction_oldest() -> None:
     """_build_list_messages_query with direction=oldest uses ASC order."""
-    from mcp_telegram.daemon_api import _build_list_messages_query
-
     sql, _ = _build_list_messages_query(_build_list_messages_query_req(direction="oldest"))
     assert "ASC" in sql.upper()
 
 
 def test_build_list_messages_query_sender_id_filter() -> None:
     """_build_list_messages_query with sender_id adds AND m.sender_id = :filter_sender_id clause."""
-    from mcp_telegram.daemon_api import _build_list_messages_query
-
     sql, params = _build_list_messages_query(_build_list_messages_query_req(sender_id=42))
     assert "sender_id" in sql
     assert 42 in params.values()
@@ -3309,8 +3301,6 @@ def test_build_list_messages_query_sender_id_filter() -> None:
 
 def test_build_list_messages_query_sender_name_filter() -> None:
     """_build_list_messages_query with sender_name adds LIKE clause."""
-    from mcp_telegram.daemon_api import _build_list_messages_query
-
     sql, params = _build_list_messages_query(_build_list_messages_query_req(sender_name="Alice"))
     assert "LIKE" in sql.upper()
     assert any("Alice" in str(p) for p in params.values())
@@ -3318,8 +3308,6 @@ def test_build_list_messages_query_sender_name_filter() -> None:
 
 def test_build_list_messages_query_topic_filter() -> None:
     """_build_list_messages_query with topic_id adds forum_topic_id filter."""
-    from mcp_telegram.daemon_api import _build_list_messages_query
-
     sql, params = _build_list_messages_query(_build_list_messages_query_req(topic_id=5))
     assert "forum_topic_id" in sql
     assert 5 in params.values()
@@ -3327,8 +3315,6 @@ def test_build_list_messages_query_topic_filter() -> None:
 
 def test_build_list_messages_query_unread_filter() -> None:
     """_build_list_messages_query with unread_after_id adds message_id > :unread_after_id clause."""
-    from mcp_telegram.daemon_api import _build_list_messages_query
-
     sql, params = _build_list_messages_query(_build_list_messages_query_req(unread_after_id=100))
     assert "message_id" in sql
     assert 100 in params.values()
@@ -3336,8 +3322,6 @@ def test_build_list_messages_query_unread_filter() -> None:
 
 def test_build_list_messages_query_cursor_newest() -> None:
     """_build_list_messages_query with cursor and direction=newest uses message_id < :anchor."""
-    from mcp_telegram.daemon_api import _build_list_messages_query
-
     sql, params = _build_list_messages_query(_build_list_messages_query_req(anchor_msg_id=500, direction="newest"))
     assert "<" in sql
     assert 500 in params.values()
@@ -3345,8 +3329,6 @@ def test_build_list_messages_query_cursor_newest() -> None:
 
 def test_build_list_messages_query_cursor_oldest() -> None:
     """_build_list_messages_query with cursor and direction=oldest uses message_id > :anchor."""
-    from mcp_telegram.daemon_api import _build_list_messages_query
-
     sql, params = _build_list_messages_query(_build_list_messages_query_req(anchor_msg_id=500, direction="oldest"))
     assert ">" in sql
     assert 500 in params.values()
@@ -4050,32 +4032,22 @@ def test_decode_nav_rejects_wrong_message_state() -> None:
 
 
 def test_compute_sync_coverage_normal():
-    from mcp_telegram.daemon_api import _compute_sync_coverage
-
     assert _compute_sync_coverage(1000, 800) == 80
 
 
 def test_compute_sync_coverage_complete():
-    from mcp_telegram.daemon_api import _compute_sync_coverage
-
     assert _compute_sync_coverage(1000, 1000) == 100
 
 
 def test_compute_sync_coverage_returns_none_when_local_count_exceeds_total():
-    from mcp_telegram.daemon_api import _compute_sync_coverage
-
     assert _compute_sync_coverage(100, 150) is None
 
 
 def test_compute_sync_coverage_null_total():
-    from mcp_telegram.daemon_api import _compute_sync_coverage
-
     assert _compute_sync_coverage(None, 500) is None
 
 
 def test_compute_sync_coverage_zero_total():
-    from mcp_telegram.daemon_api import _compute_sync_coverage
-
     assert _compute_sync_coverage(0, 0) == 100
 
 
@@ -5223,7 +5195,7 @@ async def test_list_unread_messages_uses_entity_name() -> None:
 
 def test_fts_sql_invariants_mandatory() -> None:
     """MANDATORY — no skip clause. Locks FTS SQL-string contract (Phase 39.1-02 aliases)."""
-    from mcp_telegram import daemon_api as d
+    from mcp_telegram import daemon_message_queries as d
 
     # _SELECT_FTS_SQL: dual sender entity JOINs (e_raw + e_eff) for effective_sender_id lookup
     assert "LEFT JOIN entities e_raw ON e_raw.id = m.sender_id" in d._SELECT_FTS_SQL, (
@@ -5246,7 +5218,7 @@ def test_fts_sql_invariants_mandatory() -> None:
 
 
 def test_all_sql_constants_contain_entity_join_and_coalesce() -> None:
-    from mcp_telegram import daemon_api as d
+    from mcp_telegram import daemon_message_queries as d
 
     for name in (
         "_SELECT_MESSAGES_SQL",

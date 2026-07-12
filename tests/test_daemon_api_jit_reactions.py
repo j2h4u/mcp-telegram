@@ -18,11 +18,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
 
-from mcp_telegram.daemon_api import (
-    REACTIONS_TTL_SECONDS,
-    DaemonAPIServer,
-    _DaemonClientLike,
-)
+from mcp_telegram.daemon_api import DaemonAPIServer, _DaemonClientLike
+from mcp_telegram.daemon_message import REACTIONS_TTL_SECONDS
 
 # ---------------------------------------------------------------------------
 # Patch get_peer_id for MagicMock entities
