@@ -194,6 +194,21 @@ async def test_search_messages_scheduled_is_local_and_explicit() -> None:
     assert rows[0]["unseen"] is True
 
 
+@pytest.mark.asyncio
+async def test_list_and_search_scheduled_rows_have_identical_wire_shape() -> None:
+    conn = _make_db_with_dialogs()
+    server = make_server(conn)
+    _create_scheduled_table(conn)
+    _insert_scheduled(conn, 11, FUTURE_BASE + 200, "needle in future")
+
+    listed = await server._list_messages({"dialog_id": 1, "message_state": "scheduled", "direction": "oldest"})
+    searched = await server._search_messages(
+        {"dialog_id": 1, "query": "needle", "message_state": "scheduled", "limit": 20}
+    )
+
+    assert listed["data"]["messages"] == searched["data"]["messages"]
+
+
 @pytest.mark.parametrize(
     ("token_dialog", "token_query", "token_state", "dialog", "query", "state"),
     [

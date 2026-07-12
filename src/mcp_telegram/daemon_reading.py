@@ -41,6 +41,14 @@ from .daemon_message_queries import (
     _build_list_messages_query,
 )
 from .daemon_read_state_queries import _dialog_type_from_db, _read_state_for_dialog
+from .daemon_scheduled_queries import (
+    build_scheduled_list_query,
+    build_scheduled_search_query,
+    scheduled_message_time,
+    scheduled_messages_available,
+    scheduled_row_to_wire,
+    scheduled_summary_by_dialog,
+)
 from .formatter import format_reaction_counts
 from .fts import stem_query
 from .models import DialogType, ReadMessage, ReadState
@@ -148,40 +156,7 @@ class _ListMessagesDbRequest:
     unread_after_id: int | None
 
 
-_SCHEDULED_MESSAGES_TABLE_SQL = "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'scheduled_messages'"
-_SCHEDULED_MESSAGES_FTS_TABLE_SQL = (
-    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'scheduled_messages_fts'"
-)
 _OWN_ONLY_DIALOGS_TABLE_SQL = "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'own_only_dialogs'"
-
-_SCHEDULED_MESSAGES_SQL = """
-SELECT
-    sm.message_id AS message_id,
-    sm.scheduled_at AS sent_at,
-    sm.text,
-    sm.sender_id,
-    sm.sender_first_name,
-    sm.media_description,
-    sm.reply_to_msg_id,
-    sm.forum_topic_id,
-    0 AS is_deleted,
-    NULL AS deleted_at,
-    sm.edit_date AS edit_date,
-    NULL AS topic_title,
-    sm.sender_id AS effective_sender_id,
-    sm.is_service,
-    sm.out,
-    sm.dialog_id,
-    NULL AS fwd_from_name,
-    sm.post_author,
-    d.name AS dialog_name,
-    sm.scheduled_at AS scheduled_at,
-    sm.published_at AS published_at
-FROM scheduled_messages sm
-LEFT JOIN dialogs d ON d.dialog_id = sm.dialog_id
-WHERE sm.dialog_id = :dialog_id
-  AND sm.message_state = 'scheduled'
-"""
 
 
 @dataclass(frozen=True)
@@ -703,7 +678,7 @@ class DaemonReadingService:
     def _search_next_navigation(
         self,
         request: _SearchMessagesRequest,
-        messages: list[ReadMessage],
+        messages: Sequence[object],
         *,
         global_mode: bool,
     ) -> str | None:
@@ -721,7 +696,7 @@ class DaemonReadingService:
         The returned rows still use the same ReadMessage envelope plus lifecycle
         metadata as ordinary search results.
         """
-        if not self._scheduled_messages_available():
+        if not scheduled_messages_available(self._conn):
             return {
                 "ok": True,
                 "data": {"messages": [], "total": 0, "next_navigation": None, "source": "scheduled_messages"},
@@ -740,49 +715,27 @@ class DaemonReadingService:
                     "scope": "own_only",
                 },
             }
-        sql = _SCHEDULED_MESSAGES_SQL.replace(
-            "WHERE sm.dialog_id = :dialog_id\n  AND sm.message_state = 'scheduled'",
-            "WHERE sm.message_state = 'scheduled'",
+        own_dialog_ids = sorted(own_basis) if own_basis is not None else None
+        sql, params = build_scheduled_search_query(
+            dialog_id=request.dialog_id,
+            own_dialog_ids=own_dialog_ids,
+            query=stem_query(request.query),
+            limit=request.limit,
+            offset=request.offset,
+            scheduled_now=int(time.time()),
         )
-        params: dict[str, object] = {
-            "limit": request.limit,
-            "offset": request.offset,
-            "scheduled_now": int(time.time()),
-        }
-        if request.dialog_id:
-            sql += " AND sm.dialog_id = :dialog_id"
-            params["dialog_id"] = request.dialog_id
-        elif own_basis is not None:
-            own_ids = sorted(own_basis)
-            placeholders = ", ".join(f":own_scope_{index}" for index in range(len(own_ids)))
-            sql += f" AND sm.dialog_id IN ({placeholders})"
-            params.update({f"own_scope_{index}": dialog_id for index, dialog_id in enumerate(own_ids)})
-        sql = sql.replace(
-            "FROM scheduled_messages sm",
-            "FROM scheduled_messages sm JOIN scheduled_messages_fts sf "
-            "ON sf.dialog_id = sm.dialog_id AND sf.message_id = sm.message_id",
-        )
-        sql += " AND scheduled_messages_fts MATCH :query AND sm.scheduled_at > :scheduled_now"
-        params["query"] = stem_query(request.query)
-        sql += " ORDER BY sm.scheduled_at ASC, sm.message_id ASC LIMIT :limit OFFSET :offset"
-        rows: list[dict[str, object]] = []
-        for raw_row in _fetchall_rows(self._conn.execute(sql, params)):
-            message = _read_message_from_row(raw_row)
-            item = dataclasses.asdict(message)
-            item.update(
-                {
-                    "message_state": "scheduled",
-                    "unpublished": True,
-                    "unseen": True,
-                    "scheduled_at": message.sent_at,
-                    "published_at": _object_to_int_or_none(_row_value(raw_row, "published_at")),
-                    "inclusion_basis": list(own_basis.get(message.dialog_id, ())) if own_basis is not None else [],
-                }
+        rows = [
+            scheduled_row_to_wire(
+                cast(Mapping[str, object], raw_row),
+                inclusion_basis=own_basis.get(_object_to_int(_row_value(raw_row, "dialog_id")), ())
+                if own_basis is not None
+                else (),
             )
-            rows.append(item)
+            for raw_row in _fetchall_rows(self._conn.execute(sql, params))
+        ]
         next_nav = self._search_next_navigation(
             request,
-            [_read_message_from_row(row) for row in rows],
+            rows,
             global_mode=not request.dialog_id,
         )
         return {
@@ -1150,12 +1103,6 @@ class DaemonReadingService:
             },
         }
 
-    def _scheduled_messages_available(self) -> bool:
-        return (
-            _fetchone_row(self._conn.execute(_SCHEDULED_MESSAGES_TABLE_SQL)) is not None
-            and _fetchone_row(self._conn.execute(_SCHEDULED_MESSAGES_FTS_TABLE_SQL)) is not None
-        )
-
     def _own_only_basis_by_dialog(self, conn: sqlite3.Connection | None = None) -> dict[int, tuple[str, ...]] | None:
         """Return the ownership cache, or None for pre-cache test databases."""
         source = conn or self._conn
@@ -1163,82 +1110,38 @@ class DaemonReadingService:
             return None
         return own_only_basis_by_dialog(source)
 
-    def _list_scheduled_messages_from_db(  # noqa: C901, PLR0912, PLR0915
-        self, req: _ListMessagesDbRequest
-    ) -> dict:
+    def _list_scheduled_messages_from_db(self, req: _ListMessagesDbRequest) -> dict:
         """Read pending scheduled messages from the separate local mirror.
 
         Scheduled messages deliberately do not use ``messages`` or any of its
         derived tables.  This path is local-only: it never falls back to a
         Telegram request when the mirror is empty or unavailable.
         """
-        if not self._scheduled_messages_available():
+        if not scheduled_messages_available(self._conn):
             rows: list[dict[str, object]] = []
         else:
-            sql = _SCHEDULED_MESSAGES_SQL
             own_basis = self._own_only_basis_by_dialog()
             if own_basis is not None and req.dialog_id not in own_basis:
                 rows = []
                 own_basis = {}
             else:
                 own_basis = own_basis or {}
-            params: dict[str, object] = {
-                "dialog_id": req.dialog_id,
-                "limit": req.limit,
-                "self_id": req.self_id,
-                "scheduled_now": int(time.time()),
-            }
-            if req.sender_id is not None:
-                sql += " AND sm.sender_id = :filter_sender_id"
-                params["filter_sender_id"] = req.sender_id
-            if req.sender_name is not None:
-                sql += " AND sm.sender_first_name LIKE :sender_name_pattern ESCAPE '\\' COLLATE NOCASE"
-                escaped = req.sender_name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-                params["sender_name_pattern"] = f"%{escaped}%"
-            if req.topic_id is not None:
-                sql += " AND sm.forum_topic_id = :topic_id"
-                params["topic_id"] = req.topic_id
-            sql += " AND sm.scheduled_at > :scheduled_now"
-            if req.anchor_msg_id is not None:
-                anchor_row = _fetchone_row(
-                    self._conn.execute(
-                        "SELECT scheduled_at FROM scheduled_messages WHERE dialog_id = ? AND message_id = ?",
-                        (req.dialog_id, req.anchor_msg_id),
-                    )
-                )
-                anchor_at = req.anchor_sent_at
-                if anchor_at is None:
-                    anchor_at = _object_to_int_or_none(_row_value(anchor_row, "scheduled_at"))
-                if anchor_at is None:
-                    anchor_at = 0
-                operator = ">" if req.direction == "oldest" else "<"
-                sql += (
-                    f" AND (sm.scheduled_at {operator} :anchor_at OR "
-                    f"(sm.scheduled_at = :anchor_at AND sm.message_id {operator} :anchor_msg_id))"
-                )
-                params["anchor_at"] = anchor_at
-                params["anchor_msg_id"] = req.anchor_msg_id
-            if req.direction == "oldest":
-                sql += " ORDER BY sm.scheduled_at ASC, sm.message_id ASC"
-            else:
-                sql += " ORDER BY sm.scheduled_at DESC, sm.message_id DESC"
-            sql += " LIMIT :limit"
+            anchor_sent_at = req.anchor_sent_at
+            if req.anchor_msg_id is not None and anchor_sent_at is None:
+                anchor_sent_at = scheduled_message_time(self._conn, req.dialog_id, req.anchor_msg_id)
+            sql, params = build_scheduled_list_query(
+                req,
+                scheduled_now=int(time.time()),
+                anchor_sent_at=anchor_sent_at,
+            )
             raw_rows = _fetchall_rows(self._conn.execute(sql, params))
-            rows = []
-            for raw_row in raw_rows:
-                message = _read_message_from_row(raw_row)
-                item = dataclasses.asdict(message)
-                item.update(
-                    {
-                        "message_state": "scheduled",
-                        "unpublished": True,
-                        "unseen": True,
-                        "scheduled_at": message.sent_at,
-                        "published_at": _object_to_int_or_none(_row_value(raw_row, "published_at")),
-                        "inclusion_basis": list(own_basis.get(message.dialog_id, ())),
-                    }
+            rows = [
+                scheduled_row_to_wire(
+                    cast(Mapping[str, object], raw_row),
+                    inclusion_basis=own_basis.get(_object_to_int(_row_value(raw_row, "dialog_id")), ()),
                 )
-                rows.append(item)
+                for raw_row in raw_rows
+            ]
         next_nav = self._maybe_encode_next_nav(
             _NextNavContext(
                 messages=rows,
@@ -1527,29 +1430,6 @@ class DaemonReadingService:
         finally:
             conn.close()
 
-    def _scheduled_summary_by_dialog(self, conn: sqlite3.Connection) -> dict[int, tuple[int, int | None]]:
-        """Summarize pending scheduled rows without reading sent history."""
-        if _fetchone_row(conn.execute(_SCHEDULED_MESSAGES_TABLE_SQL)) is None:
-            return {}
-        rows = _fetchall_rows(
-            conn.execute(
-                """
-                SELECT dialog_id, COUNT(*) AS scheduled_count, MIN(scheduled_at) AS next_scheduled_at
-                FROM scheduled_messages
-                WHERE message_state = 'scheduled' AND scheduled_at > :scheduled_now
-                GROUP BY dialog_id
-                """,
-                {"scheduled_now": int(time.time())},
-            )
-        )
-        return {
-            _object_to_int(_row_value(row, "dialog_id")): (
-                _object_to_int(_row_value(row, "scheduled_count")),
-                _object_to_int_or_none(_row_value(row, "next_scheduled_at")),
-            )
-            for row in rows
-        }
-
     def _list_dialogs_sync(self, conn: sqlite3.Connection, req: dict) -> dict:  # noqa: PLR0914
         """Return dialog list from the local dialogs snapshot (pure SQL)."""
         request = self._parse_list_dialogs_request(req)
@@ -1577,7 +1457,7 @@ class DaemonReadingService:
             )
             for row in _fetchall_rows(conn.execute(_BATCHED_UNREAD_COUNTS_SQL))
         }
-        scheduled_summary = self._scheduled_summary_by_dialog(conn)
+        scheduled_summary = scheduled_summary_by_dialog(conn, scheduled_now=int(time.time()))
         own_basis = self._own_only_basis_by_dialog(conn)
         sql_rows = self._fetch_list_dialog_rows(conn, request, dialog_filter)
         if not sql_rows:
