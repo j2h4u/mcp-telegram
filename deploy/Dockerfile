@@ -16,22 +16,28 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     UV_PROJECT_ENVIRONMENT=/opt/venv UV_LINK_MODE=copy \
     uv sync --project /src/mcp-telegram --frozen --no-dev --no-editable
 
-RUN mkdir -p /root/.local/bin && \
-    cp /opt/venv/bin/mcp-telegram /root/.local/bin/mcp-telegram
-
 
 ### Stage 2: runtime ###
 FROM python:3.14-slim@sha256:b877e50bd90de10af8d82c57a022fc2e0dc731c5320d762a27986facfc3355c1
 
 COPY --from=builder /opt/venv /opt/venv
-COPY --from=builder /root/.local/bin/mcp-telegram /root/.local/bin/mcp-telegram
-ENV PATH="/root/.local/bin:$PATH"
+ENV HOME="/home/mcp-telegram" \
+    XDG_CONFIG_HOME="/home/mcp-telegram/.config" \
+    PATH="/opt/venv/bin:$PATH"
 
 COPY --chmod=755 deploy/scripts/healthcheck_daemon.py /usr/local/bin/healthcheck_daemon.py
 COPY --chmod=755 deploy/scripts/healthcheck_http.py /usr/local/bin/healthcheck_http.py
 COPY --chmod=755 deploy/scripts/healthcheck_all.sh /usr/local/bin/healthcheck_all.sh
 
+RUN groupadd --gid 10001 mcp-telegram && \
+    useradd --uid 10001 --gid mcp-telegram --create-home \
+      --home-dir /home/mcp-telegram --shell /usr/sbin/nologin mcp-telegram && \
+    install -d -o mcp-telegram -g mcp-telegram -m 700 /home/mcp-telegram/.config/mcp-telegram && \
+    install -d -o mcp-telegram -g mcp-telegram -m 700 /srv/mcp-telegram/database
+
 HEALTHCHECK --interval=30s --timeout=15s --start-period=30s --retries=3 \
   CMD ["/usr/local/bin/healthcheck_all.sh"]
+
+USER 10001:10001
 
 CMD ["mcp-telegram", "serve"]

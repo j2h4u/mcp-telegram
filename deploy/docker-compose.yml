@@ -21,4 +21,4 @@ services:
       - "127.0.0.1:3100:3100"
     volumes:
       - /srv/mcp-telegram/database:/srv/mcp-telegram/database
-      - /opt/docker/mcp-telegram/config.toml:/root/.config/mcp-telegram/config.toml:ro
+      - /opt/docker/mcp-telegram/config.toml:/home/mcp-telegram/.config/mcp-telegram/config.toml:ro
