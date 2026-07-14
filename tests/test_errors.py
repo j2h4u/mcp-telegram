@@ -13,6 +13,7 @@ from mcp_telegram.errors import (
     ambiguous_entity_text,
     ambiguous_sender_text,
     ambiguous_topic_text,
+    bootstrap_pending_text,
     deleted_topic_text,
     dialog_not_found_text,
     dialog_topics_unavailable_text,
@@ -129,3 +130,24 @@ def test_inaccessible_topic_text_branches_on_resolved() -> None:
     assert "resolved" in resolved.lower()
     assert "TOPIC_PRIVATE" in resolved
     assert "could not be loaded" in not_resolved.lower()
+
+
+def test_bootstrap_pending_text() -> None:
+    """bootstrap_pending_text returns the initial-sync progress message."""
+    text = bootstrap_pending_text()
+    assert "sync in progress" in text.lower()
+    assert "dialog list will grow" in text.lower()
+
+
+def test_search_no_hits_text_global_scope() -> None:
+    """search_no_hits_text with dialog_name=None uses global scope wording."""
+    text = search_no_hits_text(None, "hello")
+    assert "across all synced dialogs" in text.lower()
+    assert "broader query" in text.lower()
+
+
+def test_search_no_hits_text_dialog_scope_contains_name() -> None:
+    """search_no_hits_text with a dialog name includes the name in the response."""
+    text = search_no_hits_text("ChatName", "hello")
+    assert "ChatName" in text
+    assert "different dialog" in text.lower()

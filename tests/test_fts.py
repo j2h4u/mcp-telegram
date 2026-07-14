@@ -14,6 +14,7 @@ import pytest
 
 from mcp_telegram.fts import (
     MESSAGES_FTS_DDL,
+    _row_first_int,
     backfill_fts_index,
     stem_query,
     stem_text,
@@ -68,6 +69,13 @@ def test_stem_text_none_and_empty() -> None:
     """stem_text(None) and stem_text('') both return empty string."""
     assert stem_text(None) == "", "stem_text(None) must return ''"
     assert stem_text("") == "", "stem_text('') must return ''"
+
+
+def test_stem_text_punctuation_only() -> None:
+    """stem_text returns '' when input contains no word characters."""
+    assert stem_text("!!! ???") == "", "stem_text must return '' for punctuation-only input"
+    assert stem_text("... --- '''") == "", "stem_text must return '' when no words are found"
+    assert stem_text("   ") == "", "stem_text must return '' for whitespace-only input"
 
 
 # ---------------------------------------------------------------------------
@@ -281,3 +289,34 @@ def test_stem_query_mixed_languages():
     parts = result.split()
     for part in parts:
         assert part.startswith('"') and part.endswith('"')
+
+
+# ---------------------------------------------------------------------------
+# _row_first_int — helper for backfill_fts_index
+# ---------------------------------------------------------------------------
+
+
+def test_row_first_int_none_returns_zero():
+    assert _row_first_int(None) == 0
+
+
+def test_row_first_int_integer():
+    assert _row_first_int((42,)) == 42
+
+
+def test_row_first_int_string_integer():
+    """String decimal integer value is handled (defensive path)."""
+    assert _row_first_int(("42",)) == 42
+
+
+def test_row_first_int_string_decimal_returns_zero():
+    """String float value is not a valid count — returns 0."""
+    assert _row_first_int(("3.14",)) == 0
+
+
+def test_row_first_int_none_value_returns_zero():
+    assert _row_first_int((None,)) == 0
+
+
+def test_row_first_int_non_numeric_string_returns_zero():
+    assert _row_first_int(("abc",)) == 0
