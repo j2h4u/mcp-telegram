@@ -17,9 +17,10 @@ from .activity_peer_resolve import resolve_linked_chat_id
 from .activity_peer_sweep import enroll_activity_dialog
 from .dialog_sync import _ACCESS_LOST_ERRORS
 from .message_contracts import ExtractedMessage
+from .messages.sqlite_repository import insert_messages_with_fts
+from .messages.telegram_adapter import extract_message_row
 from .models import DialogType
 from .resolver import Candidates, Resolved, _parse_tme_link, latinize, resolve
-from .sync_worker import extract_message_row, insert_messages_with_fts
 from .telethon_dialog import classify_dialog_type
 
 _TRACE_SCOPE_DIALOG_IDS_LEN = 2

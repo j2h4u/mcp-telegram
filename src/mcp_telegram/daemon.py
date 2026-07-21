@@ -71,6 +71,8 @@ from .flood import (
     sleep_through_flood,
 )
 from .fts import backfill_fts_index
+from .messages.sqlite_repository import insert_messages_with_fts
+from .messages.telegram_adapter import extract_message_row
 from .own_only import OwnOnlyContext, ensure_own_only_schema
 from .reactions.refresh import ReactionFreshener
 from .reactions.sqlite_repository import SQLiteReactionSnapshotRepository
@@ -84,7 +86,7 @@ from .sync_db import (
     migrate_legacy_databases,
     register_shutdown_handler,
 )
-from .sync_worker import FullSyncWorker, extract_message_row, insert_messages_with_fts
+from .sync_worker import FullSyncWorker
 from .telegram import create_client
 
 logger = logging.getLogger(__name__)

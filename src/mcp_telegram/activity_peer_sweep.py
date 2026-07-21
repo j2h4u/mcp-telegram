@@ -33,7 +33,8 @@ from .activity_peer_resolve import LinkedChatResolution, resolve_input_peer, res
 from .activity_sync import INSERT_OWN_ONLY_DIALOG_SQL, _ActivityClient, call_with_timeout, extract_dialog_id
 from .dialog_sync import _ACCESS_LOST_ERRORS, _set_access_lost
 from .message_contracts import ExtractedMessage
-from .sync_worker import extract_message_row, insert_messages_with_fts
+from .messages.sqlite_repository import insert_messages_with_fts
+from .messages.telegram_adapter import extract_message_row
 
 logger = logging.getLogger(__name__)
 

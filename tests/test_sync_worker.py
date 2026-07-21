@@ -19,13 +19,10 @@ import pytest
 
 from helpers import MockTotalList, build_mock_message, build_mock_reactions
 from mcp_telegram.message_contracts import StoredMessage
+from mcp_telegram.messages.sqlite_repository import insert_messages_with_fts
+from mcp_telegram.messages.telegram_adapter import _PeerLike, extract_message_row
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
-from mcp_telegram.sync_worker import (
-    FullSyncWorker,
-    _PeerLike,
-    extract_message_row,
-    insert_messages_with_fts,
-)
+from mcp_telegram.sync_worker import FullSyncWorker
 
 
 class _SQLiteCursor(Protocol):
@@ -71,8 +68,8 @@ class _PeerLookupClient:
         self._should_raise = should_raise
         self.passed_peer: _PeerLike | None = None
 
-    async def get_entity(self, _entity_id: object) -> object:
-        self.passed_peer = cast(_PeerLike, _entity_id)
+    async def get_entity(self, peer: object) -> object:
+        self.passed_peer = cast(_PeerLike, peer)
         if self._should_raise:
             raise ValueError("Could not find the input entity")
         return SimpleNamespace(title="Private meme collection")
@@ -211,7 +208,7 @@ async def test_extract_reactions_rows(
     shutdown_event: asyncio.Event,
 ) -> None:
     """Reactions are stored as rows in message_reactions table (not JSON blob)."""
-    from mcp_telegram.sync_worker import extract_message_row
+    from mcp_telegram.messages.telegram_adapter import extract_message_row
 
     dialog_id = 1003
     sync_db.execute(
@@ -1215,7 +1212,7 @@ async def test_dm_bootstrap_handles_network_error(
 
 
 def test_extract_reply_and_topic_no_reply():
-    from mcp_telegram.sync_worker import extract_reply_and_topic
+    from mcp_telegram.messages.telegram_adapter import extract_reply_and_topic
 
     msg = SimpleNamespace(reply_to=None)
     reply_id, topic_id = extract_reply_and_topic(msg)
@@ -1224,7 +1221,7 @@ def test_extract_reply_and_topic_no_reply():
 
 
 def test_extract_reply_and_topic_simple_reply():
-    from mcp_telegram.sync_worker import extract_reply_and_topic
+    from mcp_telegram.messages.telegram_adapter import extract_reply_and_topic
 
     reply_to = SimpleNamespace(
         reply_to_msg_id=42,
@@ -1238,7 +1235,7 @@ def test_extract_reply_and_topic_simple_reply():
 
 
 def test_extract_reply_and_topic_forum_with_top_id():
-    from mcp_telegram.sync_worker import extract_reply_and_topic
+    from mcp_telegram.messages.telegram_adapter import extract_reply_and_topic
 
     reply_to = SimpleNamespace(
         reply_to_msg_id=100,
@@ -1253,7 +1250,7 @@ def test_extract_reply_and_topic_forum_with_top_id():
 
 def test_extract_reply_and_topic_forum_general():
     """forum_topic=True with no reply_to_reply_top_id → General topic (id=1)."""
-    from mcp_telegram.sync_worker import extract_reply_and_topic
+    from mcp_telegram.messages.telegram_adapter import extract_reply_and_topic
 
     reply_to = SimpleNamespace(
         reply_to_msg_id=200,
@@ -1268,7 +1265,7 @@ def test_extract_reply_and_topic_forum_general():
 
 def test_extract_reply_and_topic_uses_message_thread_id_when_reply_to_missing() -> None:
     """Bot API-style topic metadata should still populate forum_topic_id."""
-    from mcp_telegram.sync_worker import extract_reply_and_topic
+    from mcp_telegram.messages.telegram_adapter import extract_reply_and_topic
 
     msg = SimpleNamespace(reply_to=None, message_thread_id=7, is_topic_message=True)
     reply_id, topic_id = extract_reply_and_topic(msg)
@@ -1380,14 +1377,14 @@ async def test_total_messages_written_on_completion(
 
 def test_extract_reactions_rows_returns_empty_for_none() -> None:
     """extract_reactions_rows(1, 1, None) returns empty list."""
-    from mcp_telegram.sync_worker import extract_reactions_rows
+    from mcp_telegram.messages.telegram_adapter import extract_reactions_rows
 
     assert extract_reactions_rows(1, 1, None) == []
 
 
 def test_extract_entity_rows_mention_and_bold(monkeypatch: pytest.MonkeyPatch) -> None:
     """Only mention is extracted; bold is skipped (not in analytics types)."""
-    from mcp_telegram.sync_worker import _ANALYTICS_ENTITY_TYPES, extract_entity_rows
+    from mcp_telegram.messages.telegram_adapter import _ANALYTICS_ENTITY_TYPES, extract_entity_rows
 
     class FakeMention:
         offset = 0
@@ -1416,7 +1413,7 @@ def test_extract_entity_rows_mention_and_bold(monkeypatch: pytest.MonkeyPatch) -
 
 def test_extract_entity_rows_hashtag_populates_value(monkeypatch: pytest.MonkeyPatch) -> None:
     """Hashtag entity value is the text span (not None). Priority Action #1."""
-    from mcp_telegram.sync_worker import _ANALYTICS_ENTITY_TYPES, extract_entity_rows
+    from mcp_telegram.messages.telegram_adapter import _ANALYTICS_ENTITY_TYPES, extract_entity_rows
 
     class FakeHashtag:
         offset = 6
@@ -1437,7 +1434,7 @@ def test_extract_entity_rows_hashtag_populates_value(monkeypatch: pytest.MonkeyP
 
 def test_extract_entity_rows_url_populates_value(monkeypatch: pytest.MonkeyPatch) -> None:
     """URL entity value is the text span (not None). Priority Action #1."""
-    from mcp_telegram.sync_worker import _ANALYTICS_ENTITY_TYPES, extract_entity_rows
+    from mcp_telegram.messages.telegram_adapter import _ANALYTICS_ENTITY_TYPES, extract_entity_rows
 
     class FakeUrl:
         offset = 6
@@ -1458,7 +1455,7 @@ def test_extract_entity_rows_url_populates_value(monkeypatch: pytest.MonkeyPatch
 
 def test_extract_entity_rows_text_url(monkeypatch: pytest.MonkeyPatch) -> None:
     """text_url entity value is from entity.url attribute (not text span)."""
-    from mcp_telegram.sync_worker import _ANALYTICS_ENTITY_TYPES, extract_entity_rows
+    from mcp_telegram.messages.telegram_adapter import _ANALYTICS_ENTITY_TYPES, extract_entity_rows
 
     class FakeTextUrl:
         offset = 0
@@ -1480,7 +1477,7 @@ def test_extract_entity_rows_text_url(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_extract_entity_rows_mention_name(monkeypatch: pytest.MonkeyPatch) -> None:
     """mention_name entity value is str(user_id)."""
-    from mcp_telegram.sync_worker import _ANALYTICS_ENTITY_TYPES, extract_entity_rows
+    from mcp_telegram.messages.telegram_adapter import _ANALYTICS_ENTITY_TYPES, extract_entity_rows
 
     class FakeMentionName:
         offset = 0
@@ -1507,7 +1504,7 @@ def test_extract_entity_rows_mention_stores_username_text_span(monkeypatch: pyte
     has no peer_id. @username text span is the correct value -- enables
     'who is mentioned most' analytics via GROUP BY value.
     """
-    from mcp_telegram.sync_worker import _ANALYTICS_ENTITY_TYPES, extract_entity_rows
+    from mcp_telegram.messages.telegram_adapter import _ANALYTICS_ENTITY_TYPES, extract_entity_rows
 
     class FakeMention:
         offset = 6  # "@alice" starts at index 6 in "Hello @alice how are you"
@@ -1528,7 +1525,7 @@ def test_extract_entity_rows_mention_stores_username_text_span(monkeypatch: pyte
 
 def test_extract_entity_rows_uses_isinstance(monkeypatch: pytest.MonkeyPatch) -> None:
     """isinstance() dispatch matches subclasses of tracked entity types."""
-    from mcp_telegram.sync_worker import _ANALYTICS_ENTITY_TYPES, extract_entity_rows
+    from mcp_telegram.messages.telegram_adapter import _ANALYTICS_ENTITY_TYPES, extract_entity_rows
 
     class BaseHashtag:
         offset = 0
@@ -1551,7 +1548,7 @@ def test_extract_entity_rows_uses_isinstance(monkeypatch: pytest.MonkeyPatch) ->
 
 def test_utf16_slice_with_emoji() -> None:
     """_utf16_slice correctly handles non-BMP emoji (2 UTF-16 code units)."""
-    from mcp_telegram.sync_worker import _utf16_slice
+    from mcp_telegram.messages.telegram_adapter import _utf16_slice
 
     # Flag emoji "\U0001f1fa\U0001f1f8" (US flag) is 4 UTF-16 code units (2 surrogates each).
     # Text: "\U0001f1fa\U0001f1f8 #usa"
@@ -1564,7 +1561,7 @@ def test_utf16_slice_with_emoji() -> None:
 
 def test_utf16_slice_returns_none_on_decode_error() -> None:
     """_utf16_slice returns None (not a fallback string) on decode error."""
-    from mcp_telegram.sync_worker import _utf16_slice
+    from mcp_telegram.messages.telegram_adapter import _utf16_slice
 
     # Odd byte length will cause decode error (UTF-16-LE needs even number of bytes)
     # Use an offset that causes an uneven slice
@@ -1591,8 +1588,8 @@ def test_utf16_slice_returns_none_on_decode_error() -> None:
 
 def test_extract_entity_rows_skips_on_utf16_decode_error(monkeypatch: pytest.MonkeyPatch) -> None:
     """Entity row is SKIPPED (not stored) when _utf16_slice returns None. Priority Action #4."""
-    from mcp_telegram import sync_worker
-    from mcp_telegram.sync_worker import _ANALYTICS_ENTITY_TYPES, extract_entity_rows
+    from mcp_telegram.messages import telegram_adapter
+    from mcp_telegram.messages.telegram_adapter import _ANALYTICS_ENTITY_TYPES, extract_entity_rows
 
     class FakeMention:
         offset = 0
@@ -1600,7 +1597,7 @@ def test_extract_entity_rows_skips_on_utf16_decode_error(monkeypatch: pytest.Mon
 
     monkeypatch.setitem(_ANALYTICS_ENTITY_TYPES, FakeMention, "mention")
     # Force _utf16_slice to return None (simulates decode error)
-    monkeypatch.setattr(sync_worker, "_utf16_slice", lambda text, offset, length: None)
+    monkeypatch.setattr(telegram_adapter, "_utf16_slice", lambda text, offset, length: None)
 
     msg = SimpleNamespace(
         entities=[FakeMention()],
@@ -1615,7 +1612,7 @@ def test_extract_fwd_row() -> None:
     """extract_fwd_row extracts forward metadata from a message."""
     from datetime import datetime
 
-    from mcp_telegram.sync_worker import extract_fwd_row
+    from mcp_telegram.messages.telegram_adapter import extract_fwd_row
 
     fwd_date = datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC)
     fwd_from = SimpleNamespace(
@@ -1644,7 +1641,7 @@ def test_extract_fwd_row() -> None:
 def test_extract_message_row_returns_dataclass() -> None:
     """extract_message_row returns an ExtractedMessage with expected fields."""
     from mcp_telegram.message_contracts import ExtractedMessage
-    from mcp_telegram.sync_worker import extract_message_row
+    from mcp_telegram.messages.telegram_adapter import extract_message_row
 
     msg = build_mock_message(id=123, text="hello")
     result = extract_message_row(1, msg)
@@ -1662,7 +1659,7 @@ def test_extract_message_row_populates_v7_columns() -> None:
     """extract_message_row populates edit_date, grouped_id, reply_to_peer_id."""
     from datetime import datetime
 
-    from mcp_telegram.sync_worker import extract_message_row
+    from mcp_telegram.messages.telegram_adapter import extract_message_row
 
     edit_dt = datetime(2024, 6, 1, 10, 0, 0, tzinfo=UTC)
 
@@ -1720,7 +1717,7 @@ def test_extract_message_row_populates_v7_columns() -> None:
 
 def test_extract_message_row_prefers_channel_title_when_first_name_missing() -> None:
     """Channel/chat-like sender uses title if first_name is unavailable."""
-    from mcp_telegram.sync_worker import extract_message_row
+    from mcp_telegram.messages.telegram_adapter import extract_message_row
 
     msg = SimpleNamespace(
         id=700,
@@ -1743,7 +1740,7 @@ def test_extract_message_row_prefers_channel_title_when_first_name_missing() -> 
 
 def test_extract_message_row_prefers_channel_title_when_first_name_is_non_string() -> None:
     """Non-string first_name should be ignored and title used as fallback."""
-    from mcp_telegram.sync_worker import extract_message_row
+    from mcp_telegram.messages.telegram_adapter import extract_message_row
 
     msg = SimpleNamespace(
         id=702,
@@ -1766,7 +1763,7 @@ def test_extract_message_row_prefers_channel_title_when_first_name_is_non_string
 
 def test_extract_message_row_returns_none_when_sender_has_no_name_fields() -> None:
     """Missing first_name/title should not raise and should return None."""
-    from mcp_telegram.sync_worker import extract_message_row
+    from mcp_telegram.messages.telegram_adapter import extract_message_row
 
     sender = SimpleNamespace(other_field="X")
     msg = SimpleNamespace(
@@ -1818,7 +1815,7 @@ def _minimal_msg(**overrides: object) -> SimpleNamespace:
 
 def test_extract_message_row_captures_out_true() -> None:
     """`msg.out=True` -> message.out == 1."""
-    from mcp_telegram.sync_worker import extract_message_row
+    from mcp_telegram.messages.telegram_adapter import extract_message_row
 
     msg = _minimal_msg(out=True)
     result = extract_message_row(1, msg)
@@ -1828,7 +1825,7 @@ def test_extract_message_row_captures_out_true() -> None:
 
 def test_extract_message_row_captures_out_false_when_missing() -> None:
     """`msg.out=False` or attribute missing -> message.out == 0."""
-    from mcp_telegram.sync_worker import extract_message_row
+    from mcp_telegram.messages.telegram_adapter import extract_message_row
 
     msg_false = _minimal_msg(out=False)
     assert extract_message_row(1, msg_false).message.out == 0
@@ -1859,7 +1856,7 @@ def test_extract_message_row_flags_message_service_as_is_service() -> None:
 
     from telethon.tl import types as tl
 
-    from mcp_telegram.sync_worker import extract_message_row
+    from mcp_telegram.messages.telegram_adapter import extract_message_row
 
     svc = tl.MessageService(
         id=500,
@@ -1874,7 +1871,7 @@ def test_extract_message_row_flags_message_service_as_is_service() -> None:
 
 def test_extract_message_row_regular_message_is_service_zero() -> None:
     """Regular (non-service) Message -> message.is_service == 0."""
-    from mcp_telegram.sync_worker import extract_message_row
+    from mcp_telegram.messages.telegram_adapter import extract_message_row
 
     msg = _minimal_msg()
     result = extract_message_row(1, msg)
@@ -1885,7 +1882,8 @@ def test_extract_message_row_insert_roundtrip_preserves_out_and_is_service(
     sync_db: _SQLiteConnection,
 ) -> None:
     """End-to-end: extract -> insert -> SELECT returns correct out/is_service."""
-    from mcp_telegram.sync_worker import extract_message_row, insert_messages_with_fts
+    from mcp_telegram.messages.sqlite_repository import insert_messages_with_fts
+    from mcp_telegram.messages.telegram_adapter import extract_message_row
 
     dialog_id = 42
     sync_db.execute(
@@ -1908,7 +1906,8 @@ def test_extract_message_row_insert_roundtrip_preserves_out_and_is_service(
 
 def test_extract_message_row_persists_reply_count(sync_db: _SQLiteConnection) -> None:
     """Telegram Message.replies.replies is stored as messages.reply_count."""
-    from mcp_telegram.sync_worker import extract_message_row, insert_messages_with_fts
+    from mcp_telegram.messages.sqlite_repository import insert_messages_with_fts
+    from mcp_telegram.messages.telegram_adapter import extract_message_row
 
     dialog_id = 42
     sync_db.execute(
@@ -1931,7 +1930,7 @@ def test_extract_message_row_persists_reply_count(sync_db: _SQLiteConnection) ->
 
 def test_extract_message_row_persists_message_thread_id_topic_id() -> None:
     """message_thread_id should survive extraction as forum_topic_id."""
-    from mcp_telegram.sync_worker import extract_message_row
+    from mcp_telegram.messages.telegram_adapter import extract_message_row
 
     msg = _minimal_msg(id=779, reply_to=None, message_thread_id=11, is_topic_message=True)
     result = extract_message_row(1, msg)
@@ -1961,7 +1960,7 @@ def _stored(dialog_id: int, message_id: int, text: str = "hello") -> StoredMessa
 def test_insert_messages_with_fts_writes_reactions(sync_db: _SQLiteConnection) -> None:
     """insert_messages_with_fts writes reaction rows to message_reactions table."""
     from mcp_telegram.message_contracts import ExtractedMessage, ReactionRecord
-    from mcp_telegram.sync_worker import insert_messages_with_fts
+    from mcp_telegram.messages.sqlite_repository import insert_messages_with_fts
 
     dialog_id = 9001
     message_id = 1
@@ -1990,7 +1989,7 @@ def test_insert_messages_with_fts_writes_reactions(sync_db: _SQLiteConnection) -
 def test_insert_messages_with_fts_writes_forwards(sync_db: _SQLiteConnection) -> None:
     """insert_messages_with_fts writes forward metadata to message_forwards table."""
     from mcp_telegram.message_contracts import ExtractedMessage, ForwardRecord
-    from mcp_telegram.sync_worker import insert_messages_with_fts
+    from mcp_telegram.messages.sqlite_repository import insert_messages_with_fts
 
     dialog_id = 9002
     message_id = 2
@@ -2024,7 +2023,7 @@ def test_insert_messages_with_fts_writes_forwards(sync_db: _SQLiteConnection) ->
 def test_insert_messages_with_fts_edit_idempotency_reactions(sync_db: _SQLiteConnection) -> None:
     """Inserting same message_id twice replaces reactions (DELETE-before-INSERT)."""
     from mcp_telegram.message_contracts import ExtractedMessage, ReactionRecord
-    from mcp_telegram.sync_worker import insert_messages_with_fts
+    from mcp_telegram.messages.sqlite_repository import insert_messages_with_fts
 
     dialog_id = 9003
     message_id = 3
@@ -2061,7 +2060,7 @@ def test_insert_messages_with_fts_edit_idempotency_reactions(sync_db: _SQLiteCon
 def test_insert_messages_with_fts_edit_idempotency_entities(sync_db: _SQLiteConnection) -> None:
     """Inserting same message_id twice replaces entities (DELETE-before-INSERT)."""
     from mcp_telegram.message_contracts import EntityRecord, ExtractedMessage
-    from mcp_telegram.sync_worker import insert_messages_with_fts
+    from mcp_telegram.messages.sqlite_repository import insert_messages_with_fts
 
     dialog_id = 9004
     message_id = 4
@@ -2100,7 +2099,7 @@ def test_insert_messages_with_fts_edit_idempotency_entities(sync_db: _SQLiteConn
 def test_insert_messages_with_fts_edit_idempotency_forwards(sync_db: _SQLiteConnection) -> None:
     """Inserting same message_id with no forward clears forward row."""
     from mcp_telegram.message_contracts import ExtractedMessage, ForwardRecord
-    from mcp_telegram.sync_worker import insert_messages_with_fts
+    from mcp_telegram.messages.sqlite_repository import insert_messages_with_fts
 
     dialog_id = 9005
     message_id = 5
@@ -2170,7 +2169,7 @@ from telethon.tl.types import PeerUser as _PeerUser
 )
 async def test_resolve_peer_name_passes_typed_peer_to_get_entity(peer: object) -> None:
     """get_entity receives the typed Peer object, never a type-erased bare int."""
-    from mcp_telegram.sync_worker import _resolve_peer_name
+    from mcp_telegram.messages.telegram_adapter import _resolve_peer_name
 
     client = _PeerLookupClient()
     typed_peer = cast(_PeerLike, peer)
@@ -2190,7 +2189,7 @@ async def test_resolve_peer_name_uncacheable_logs_marked_id_without_raising(
 
     from telethon.tl import types
 
-    from mcp_telegram.sync_worker import _resolve_peer_name
+    from mcp_telegram.messages.telegram_adapter import _resolve_peer_name
 
     peer = types.PeerChannel(channel_id=1579759981)
     client = _PeerLookupClient(should_raise=True)
@@ -2210,7 +2209,7 @@ async def test_build_fwd_entity_map_resolves_channel_keyed_by_marked_id() -> Non
     """End-to-end: channel forward resolves via typed Peer; map keyed by marked id."""
     from telethon.tl import types
 
-    from mcp_telegram.sync_worker import _build_fwd_entity_map
+    from mcp_telegram.messages.telegram_adapter import _build_fwd_entity_map
 
     peer = cast(_PeerLike, types.PeerChannel(channel_id=1579759981))
     fwd = SimpleNamespace(from_id=peer, from_name=None, date=None, channel_post=None)
@@ -2230,7 +2229,7 @@ def test_marked_peer_id_matches_telethon_convention() -> None:
     from telethon import utils as tl_utils
     from telethon.tl import types
 
-    from mcp_telegram.sync_worker import _marked_peer_id
+    from mcp_telegram.messages.telegram_adapter import _marked_peer_id
 
     cases = [
         types.PeerChannel(channel_id=1579759981),

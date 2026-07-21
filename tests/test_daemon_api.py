@@ -562,8 +562,21 @@ def _make_db_with_activity() -> sqlite3.Connection:
 
 
 def _make_db_for_fragment_context() -> sqlite3.Connection:
-    """Return test DB shape compatible with sync_worker.INSERT_MESSAGE_SQL."""
-    conn = _make_db()
+    """Return test DB shape compatible with canonical message persistence."""
+    conn = _make_db(with_fts=True)
+    conn.execute(
+        """
+        CREATE TABLE message_entities (
+            dialog_id   INTEGER NOT NULL,
+            message_id  INTEGER NOT NULL,
+            offset      INTEGER NOT NULL,
+            length      INTEGER NOT NULL,
+            type        TEXT NOT NULL,
+            value       TEXT,
+            PRIMARY KEY (dialog_id, message_id, offset, length, type)
+        ) WITHOUT ROWID
+        """
+    )
     conn.execute("ALTER TABLE messages ADD COLUMN grouped_id INTEGER")
     conn.execute("ALTER TABLE messages ADD COLUMN reply_to_peer_id INTEGER")
     conn.commit()

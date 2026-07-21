@@ -52,6 +52,16 @@ from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
 from .activity_peer_resolve import _InputEntityResolverClient
 from .fts import DELETE_FTS_SQL, INSERT_FTS_SQL, stem_text
+from .messages.sqlite_repository import insert_messages_with_fts
+from .messages.telegram_adapter import (
+    PeerNameClient as _PeerNameClient,
+)
+from .messages.telegram_adapter import (
+    build_forward_entity_name_map as _build_fwd_entity_map,
+)
+from .messages.telegram_adapter import (
+    extract_message_row,
+)
 from .reactions.persistence import replace_reaction_aggregates
 from .reactions.projection import project_reaction_aggregates
 from .read_state import apply_read_cursor
@@ -66,10 +76,6 @@ from .scheduled_messages import (
 from .sync_worker import (
     INSERT_DIALOG_SQL,
     UPSERT_ENTITY_SQL,
-    _build_fwd_entity_map,
-    _PeerNameClient,
-    extract_message_row,
-    insert_messages_with_fts,
 )
 from .telethon_dialog import classify_dialog_type
 

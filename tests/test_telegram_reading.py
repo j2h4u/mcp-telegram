@@ -122,6 +122,10 @@ async def test_fragment_gateway_preserves_fixed_window_and_normalized_persistenc
         (10, "👍", 2),
         (12, "👍", 2),
     ]
+    assert conn.execute("SELECT dialog_id, message_id FROM messages_fts ORDER BY message_id").fetchall() == [
+        (42, 10),
+        (42, 12),
+    ]
 
 
 @pytest.mark.asyncio
