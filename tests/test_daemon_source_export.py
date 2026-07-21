@@ -20,9 +20,7 @@ from mcp_telegram.daemon_source_export import (
 class TestSourceCursor:
     def test_roundtrip_preserves_dialog_and_message_ids(self) -> None:
         cursor = _source_cursor(dialog_id=-100123, message_id=42)
-        dialog_id, message_id = _parse_source_cursor(cursor)
-        assert dialog_id == -100123
-        assert message_id == 42
+        assert _parse_source_cursor(cursor) == (-100123, 42)
 
     def test_parse_none_returns_none(self) -> None:
         assert _parse_source_cursor(None) is None
@@ -61,9 +59,7 @@ class TestParseSourceWatermark:
 
     def test_iso_format_parsed_to_timestamp(self) -> None:
         # 2024-01-15T12:30:00 UTC → 1705321800
-        result = _parse_source_watermark("2024-01-15T12:30:00")
-        assert isinstance(result, int)
-        assert result > 0
+        assert _parse_source_watermark("2024-01-15T12:30:00+00:00") == 1705321800
 
     def test_invalid_string_raises(self) -> None:
         with pytest.raises(ValueError, match="invalid_updated_after"):
@@ -76,10 +72,7 @@ class TestParseSourceWatermark:
 
 class TestSourceIso:
     def test_valid_epoch_returns_iso_format(self) -> None:
-        iso = _source_iso(1705321800)
-        assert iso is not None
-        assert "2024" in iso
-        assert iso.endswith("Z")
+        assert _source_iso(1705321800) == "2024-01-15T12:30:00.000000Z"
 
     def test_none_returns_none(self) -> None:
         assert _source_iso(None) is None
