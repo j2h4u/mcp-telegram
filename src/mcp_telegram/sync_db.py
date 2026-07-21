@@ -535,16 +535,6 @@ INSERT OR IGNORE INTO scheduled_sync_state (key) VALUES ('account')
 
 
 # ---------------------------------------------------------------------------
-# Path helper
-# ---------------------------------------------------------------------------
-
-
-def get_sync_db_path(state_dir: Path) -> Path:
-    """Return the sync database path below an explicit state directory."""
-    return state_dir / "sync.db"
-
-
-# ---------------------------------------------------------------------------
 # Connection helpers
 # ---------------------------------------------------------------------------
 

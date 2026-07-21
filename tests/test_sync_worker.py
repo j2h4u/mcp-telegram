@@ -1274,6 +1274,15 @@ def test_extract_reply_and_topic_uses_message_thread_id_when_reply_to_missing() 
     assert topic_id == 7
 
 
+def test_extract_reply_and_topic_uses_general_topic_for_flag_only_message() -> None:
+    """Flag-only Bot API topic metadata resolves to Telegram's General topic."""
+    from mcp_telegram.messages.telegram_adapter import extract_reply_and_topic
+
+    msg = SimpleNamespace(reply_to=None, message_thread_id=None, is_topic_message=True)
+
+    assert extract_reply_and_topic(msg) == (None, 1)
+
+
 # ---------------------------------------------------------------------------
 # Phase 36-01: total_messages and last_synced_at writes
 # ---------------------------------------------------------------------------

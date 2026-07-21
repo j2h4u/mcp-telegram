@@ -61,6 +61,10 @@ def _findings(source: str) -> set[tuple[str, str]]:
             ("policy_assignments", "src/mcp_telegram/capability.py:Cache.__init__:self.ttl_seconds"),
         ),
         (
+            "def fetch() -> None:\n    cache_ttl_seconds: int = 300\n",
+            ("policy_assignments", "src/mcp_telegram/capability.py:fetch:cache_ttl_seconds"),
+        ),
+        (
             "DEFAULT_TTL = 300\nsettings = {'ttl_seconds': DEFAULT_TTL}\n",
             ("policy_dict_values", "src/mcp_telegram/capability.py:<module>:ttl_seconds"),
         ),

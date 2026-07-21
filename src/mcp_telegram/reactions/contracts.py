@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 
 from ..telegram_reading import GatewayFailure
 
@@ -54,4 +54,11 @@ class ReactionFreshness:
     retry_after: int | None = None
 
     def as_dict(self) -> dict[str, object]:
-        return asdict(self)
+        return {
+            "requested_count": self.requested_count,
+            "fresh_count": self.fresh_count,
+            "stale_count": self.stale_count,
+            "refreshed_count": self.refreshed_count,
+            "status": self.status,
+            "retry_after": self.retry_after,
+        }

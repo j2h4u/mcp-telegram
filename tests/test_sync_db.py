@@ -14,7 +14,6 @@ from mcp_telegram.sync_db import (
     _migrate_from_legacy_db,
     _open_sync_db,
     ensure_sync_schema,
-    get_sync_db_path,
     migrate_legacy_databases,
     open_sync_db_reader,
     register_shutdown_handler,
@@ -56,25 +55,6 @@ def _fetchone_text(conn: sqlite3.Connection, sql: str, parameters: tuple[object,
 def tmp_sync_db_path(tmp_path: Path) -> Path:
     """Return a path to a temporary sync.db file (not yet created)."""
     return tmp_path / "sync.db"
-
-
-# ---------------------------------------------------------------------------
-# SYNC-01: Separate DB file at correct path
-# ---------------------------------------------------------------------------
-
-
-def test_db_path_is_separate(tmp_path: Path) -> None:
-    """get_sync_db_path returns a path ending in sync.db, not entity_cache.db."""
-    path = get_sync_db_path(tmp_path)
-    assert path.name == "sync.db", f"Expected sync.db, got {path.name}"
-    assert "entity_cache" not in str(path), "sync.db must not share name with entity_cache.db"
-
-
-def test_db_path_uses_explicit_state_dir(tmp_path: Path) -> None:
-    """The path helper is pure; composition roots provide the state directory."""
-    state_dir = tmp_path / "state"
-
-    assert get_sync_db_path(state_dir) == state_dir / "sync.db"
 
 
 # ---------------------------------------------------------------------------

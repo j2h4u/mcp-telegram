@@ -79,3 +79,11 @@ _format_relative_ymd  # tools/entity_info.py:79
 # Required-signature params / schema fields vulture can't tie to a reader:
 progress             # unused param of the no-op MCP progress_notification handler (server.py:175)
 is_telegram_content  # TypedDict field on TelegramContent, a structured-output shape (structured.py:27)
+
+# ast.NodeVisitor invokes this override through dynamic dispatch while walking
+# annotated assignments in the policy-placement gate.
+visit_AnnAssign
+
+# Telethon/Bot API field supplied by external message objects and read through
+# string-based getattr in the compatibility adapter (telegram_adapter.py:99,153).
+is_topic_message

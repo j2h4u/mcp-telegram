@@ -229,8 +229,3 @@ def load_config(path: Path | None = None) -> McpTelegramConfig:
     return McpTelegramConfig(
         state=StateConfig(dir=Path(state_dir).expanduser()), freshness=freshness, telemetry=telemetry
     )
-
-
-def get_configured_state_dir() -> Path:
-    """Return required state.dir from config.toml."""
-    return load_config().state.dir
