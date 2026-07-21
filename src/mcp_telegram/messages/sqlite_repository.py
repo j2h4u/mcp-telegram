@@ -45,10 +45,21 @@ def insert_messages_with_fts(
     state changes.
     """
     preserved = _preserve_transcribed_texts(conn, extracted)
-    messages = [item.message for item in preserved]
+    _write_message_rows_and_fts(conn, preserved)
+    _delete_entity_and_forward_projections(conn, preserved)
+    _replace_reaction_projections(conn, preserved)
+    _insert_entity_and_forward_projections(conn, preserved)
+
+
+def _write_message_rows_and_fts(
+    conn: sqlite3.Connection,
+    extracted: Sequence[_message_contracts.ExtractedMessage],
+) -> None:
+    """Replace canonical message and FTS rows for one extraction batch."""
+    messages = [item.message for item in extracted]
     conn.executemany(
         _INSERT_MESSAGE_SQL,
-        [{**asdict(item.message), "reply_count": item.reply_count} for item in preserved],
+        [{**asdict(item.message), "reply_count": item.reply_count} for item in extracted],
     )
     conn.executemany(DELETE_FTS_SQL, ((item.dialog_id, item.message_id) for item in messages))
     conn.executemany(
@@ -56,21 +67,40 @@ def insert_messages_with_fts(
         ((item.dialog_id, item.message_id, stem_text(item.text)) for item in messages),
     )
 
-    id_pairs = [(item.dialog_id, item.message_id) for item in messages]
+
+def _delete_entity_and_forward_projections(
+    conn: sqlite3.Connection,
+    extracted: Sequence[_message_contracts.ExtractedMessage],
+) -> None:
+    """Clear projections which are replaced by the current extraction batch."""
+    id_pairs = [(item.message.dialog_id, item.message.message_id) for item in extracted]
     conn.executemany(_DELETE_ENTITIES_SQL, id_pairs)
     conn.executemany(_DELETE_FORWARD_SQL, id_pairs)
 
-    for item in preserved:
+
+def _replace_reaction_projections(
+    conn: sqlite3.Connection,
+    extracted: Sequence[_message_contracts.ExtractedMessage],
+) -> None:
+    """Replace every reaction aggregate, including an intentionally empty one."""
+    for item in extracted:
         replace_reaction_aggregates(
             conn,
             item.message.dialog_id,
             item.message.message_id,
             tuple(ReactionAggregate(emoji=row.emoji, count=row.count) for row in item.reactions),
         )
-    entities = [entity for item in preserved for entity in item.entities]
+
+
+def _insert_entity_and_forward_projections(
+    conn: sqlite3.Connection,
+    extracted: Sequence[_message_contracts.ExtractedMessage],
+) -> None:
+    """Insert entity and forward projections after their replacement deletes."""
+    entities = [entity for item in extracted for entity in item.entities]
     if entities:
         conn.executemany(_INSERT_ENTITY_SQL, [asdict(entity) for entity in entities])
-    forwards = [item.forward for item in preserved if item.forward is not None]
+    forwards = [item.forward for item in extracted if item.forward is not None]
     if forwards:
         conn.executemany(_INSERT_FORWARD_SQL, [asdict(forward) for forward in forwards])
 

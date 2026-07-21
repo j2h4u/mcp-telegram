@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from helpers import MockTotalList, build_mock_message, build_mock_reactions
+from mcp_telegram.fts import stem_text
 from mcp_telegram.message_contracts import StoredMessage
 from mcp_telegram.messages.sqlite_repository import insert_messages_with_fts
 from mcp_telegram.messages.telegram_adapter import _PeerLike, extract_message_row
@@ -335,7 +336,7 @@ async def test_insert_messages_with_fts_preserves_existing_transcribed_text(
         ).fetchone(),
     )
     assert fts_row is not None
-    assert fts_row[0] is not None
+    assert fts_row[0] == stem_text("speech to text")
 
 
 # ---------------------------------------------------------------------------
@@ -2144,6 +2145,76 @@ def test_insert_messages_with_fts_edit_idempotency_forwards(sync_db: _SQLiteConn
     assert row is not None
     fwd_after = row[0]
     assert fwd_after == 0, "Forward row must be cleared when re-inserted without forward"
+
+
+def test_insert_messages_with_fts_clears_empty_child_projections(sync_db: _SQLiteConnection) -> None:
+    """A later extraction with empty children clears every replaceable projection."""
+    from mcp_telegram.message_contracts import EntityRecord, ExtractedMessage, ForwardRecord, ReactionRecord
+
+    dialog_id, message_id = 9006, 6
+    sync_db.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')", (dialog_id,))
+    sync_db.commit()
+    populated = ExtractedMessage(
+        message=_stored(dialog_id, message_id, "populated"),
+        reply_count=0,
+        entities=[
+            EntityRecord(dialog_id=dialog_id, message_id=message_id, offset=0, length=4, type="mention", value="@old")
+        ],
+        reactions=[ReactionRecord(dialog_id=dialog_id, message_id=message_id, emoji="👍", count=2)],
+        forward=ForwardRecord(
+            dialog_id=dialog_id,
+            message_id=message_id,
+            fwd_from_peer_id=123,
+            fwd_from_name="Source",
+            fwd_date=1700000000,
+            fwd_channel_post=None,
+        ),
+    )
+    with cast(sqlite3.Connection, sync_db):
+        insert_messages_with_fts(cast(sqlite3.Connection, sync_db), [populated])
+    empty = ExtractedMessage(message=_stored(dialog_id, message_id, "empty"), reply_count=0)
+    with cast(sqlite3.Connection, sync_db):
+        insert_messages_with_fts(cast(sqlite3.Connection, sync_db), [empty])
+
+    for table in ("message_entities", "message_reactions", "message_forwards"):
+        assert sync_db.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE dialog_id=? AND message_id=?", (dialog_id, message_id)
+        ).fetchone() == (0,)
+
+
+def test_insert_messages_with_fts_uses_callers_transaction_for_all_projections(sync_db: _SQLiteConnection) -> None:
+    """A caller rollback removes canonical, FTS, and child projection writes together."""
+    from mcp_telegram.message_contracts import EntityRecord, ExtractedMessage, ForwardRecord, ReactionRecord
+
+    dialog_id, message_id = 9007, 7
+    sync_db.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')", (dialog_id,))
+    sync_db.commit()
+    extracted = ExtractedMessage(
+        message=_stored(dialog_id, message_id, "atomic"),
+        reply_count=0,
+        entities=[
+            EntityRecord(dialog_id=dialog_id, message_id=message_id, offset=0, length=4, type="mention", value="@one")
+        ],
+        reactions=[ReactionRecord(dialog_id=dialog_id, message_id=message_id, emoji="👍", count=1)],
+        forward=ForwardRecord(
+            dialog_id=dialog_id,
+            message_id=message_id,
+            fwd_from_peer_id=123,
+            fwd_from_name="Source",
+            fwd_date=1700000000,
+            fwd_channel_post=None,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="rollback"):
+        with cast(sqlite3.Connection, sync_db):
+            insert_messages_with_fts(cast(sqlite3.Connection, sync_db), [extracted])
+            raise RuntimeError("rollback")
+
+    for table in ("messages", "messages_fts", "message_entities", "message_reactions", "message_forwards"):
+        assert sync_db.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE dialog_id=? AND message_id=?", (dialog_id, message_id)
+        ).fetchone() == (0,)
 
 
 # ---------------------------------------------------------------------------

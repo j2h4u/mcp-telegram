@@ -473,6 +473,65 @@ async def test_read_at_enrichment_only_probes_outgoing_user_dm_and_never_falls_b
     assert calls == [1]
 
 
+@pytest.mark.asyncio
+async def test_read_at_preserves_duplicate_eligible_ids_in_source_order(
+    make_synced_db: Callable[[], sqlite3.Connection],
+) -> None:
+    """Each eligible source row is probed and projected in its original order."""
+    conn = make_synced_db()
+    calls: list[int] = []
+
+    class Gateway:
+        async def fetch_outbox_read_date(
+            self,
+            entity: object,
+            message_id: int,
+        ) -> ReadDateFetchResult:
+            _ = entity
+            calls.append(message_id)
+            return ReadDateFetchResult(
+                read_at=1_700_000_000 + message_id,
+                status="complete",
+            )
+
+    messages = [
+        ReadMessage(message_id=3, sent_at=1_000, dialog_id=42, out=1),
+        ReadMessage(message_id=1, sent_at=1_001, dialog_id=42, out=1),
+        ReadMessage(message_id=3, sent_at=1_002, dialog_id=42, out=1),
+    ]
+    enriched = await enrich_read_at(
+        conn,
+        Gateway(),
+        42,
+        messages,
+        dialog_type="user",
+        read_at_ttl_seconds=600,
+        checked_at=3_000,
+    )
+
+    assert calls == [3, 1, 3]
+    assert [message.message_id for message in enriched] == [3, 1, 3]
+    assert [message.read_at for message in enriched] == [
+        1_700_000_003,
+        1_700_000_001,
+        1_700_000_003,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_read_at_rejects_boolean_ttl_before_shortcut(make_synced_db: Callable[[], sqlite3.Connection]) -> None:
+    """TTL validation applies even when no gateway or eligible dialog exists."""
+    with pytest.raises(ValueError, match="read_at_ttl_seconds"):
+        await enrich_read_at(
+            make_synced_db(),
+            None,
+            42,
+            [],
+            dialog_type="supergroup",
+            read_at_ttl_seconds=True,
+        )
+
+
 def test_read_receipt_at_exact_ttl_age_is_stale(make_synced_db: Callable[[], sqlite3.Connection]) -> None:
     """A read-receipt probe at exactly the cutoff is fetched again."""
     conn = make_synced_db()
@@ -538,6 +597,65 @@ async def test_read_at_unavailable_is_nullable_but_probe_status_is_persisted(
     assert conn.execute(
         "SELECT read_at, checked_at, status FROM message_read_facts WHERE dialog_id=42 AND message_id=7"
     ).fetchone() == (None, 3_000, "unavailable")
+
+
+@pytest.mark.asyncio
+async def test_read_at_stops_after_persistence_operational_error_with_prior_commits(
+    make_synced_db: Callable[[], sqlite3.Connection], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Earlier probe facts remain committed when a later local write cannot persist."""
+    import mcp_telegram.telegram_fact_queries as fact_queries
+
+    conn = make_synced_db()
+    calls: list[int] = []
+
+    class Gateway:
+        async def fetch_outbox_read_date(self, entity: object, message_id: int) -> ReadDateFetchResult:
+            _ = entity
+            calls.append(message_id)
+            return ReadDateFetchResult(read_at=1_700_000_000 + message_id, status="complete")
+
+    original_persist = fact_queries.persist_read_at
+
+    def fail_second_persist(  # noqa: PLR0913
+        connection: sqlite3.Connection,
+        current_dialog_id: int,
+        message_id: int,
+        *,
+        read_at: int | None,
+        checked_at: int,
+        status: str,
+    ) -> None:
+        if message_id == 2:
+            raise sqlite3.OperationalError("simulated missing table")
+        original_persist(
+            connection,
+            current_dialog_id,
+            message_id,
+            read_at=read_at,
+            checked_at=checked_at,
+            status=status,
+        )
+
+    monkeypatch.setattr(fact_queries, "persist_read_at", fail_second_persist)
+    messages = [
+        ReadMessage(message_id=1, sent_at=1_000, dialog_id=42, out=1),
+        ReadMessage(message_id=2, sent_at=1_001, dialog_id=42, out=1),
+        ReadMessage(message_id=3, sent_at=1_002, dialog_id=42, out=1),
+    ]
+
+    enriched = await enrich_read_at(
+        conn, Gateway(), 42, messages, dialog_type="user", read_at_ttl_seconds=600, checked_at=3_000
+    )
+
+    assert calls == [1, 2]
+    assert [message.read_at for message in enriched] == [1_700_000_001, None, None]
+    assert conn.execute(
+        "SELECT read_at, checked_at, status FROM message_read_facts WHERE dialog_id=42 AND message_id=1"
+    ).fetchone() == (1_700_000_001, 3_000, "complete")
+    assert conn.execute(
+        "SELECT COUNT(*) FROM message_read_facts WHERE dialog_id=42 AND message_id IN (2, 3)"
+    ).fetchone() == (0,)
 
 
 def test_v28_reaction_snapshot_projects_nullable_event_time_and_status_without_aggregate_time(
