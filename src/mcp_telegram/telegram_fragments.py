@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import AsyncIterator, Sequence
-from dataclasses import asdict
 from typing import Protocol, cast
 
-from .sync_worker import INSERT_MESSAGE_SQL, apply_reactions_delta, extract_message_row
+from .messages.sqlite_repository import insert_messages_with_fts
+from .messages.telegram_adapter import extract_message_row
 from .telegram_gateway import CATCHABLE_GATEWAY_FAILURES, translate_gateway_failure
 from .telegram_reading import FragmentFetchResult, TelegramFragmentGateway
 
@@ -36,12 +36,7 @@ class FragmentContextService:
         if not result.ok or not result.messages:
             return result
         with self._conn:
-            self._conn.executemany(
-                INSERT_MESSAGE_SQL,
-                [{**asdict(item.message), "reply_count": item.reply_count} for item in result.messages],
-            )
-            for item in result.messages:
-                apply_reactions_delta(self._conn, dialog_id, item.message.message_id, item.reactions)
+            insert_messages_with_fts(self._conn, result.messages)
         return result
 
 

@@ -1,0 +1,1 @@
+"""Reaction capability boundary."""

@@ -16,8 +16,6 @@ from .models import DialogType, ReadMessage, ReadReactionEvent
 from .telegram_gateway import CATCHABLE_GATEWAY_FAILURES
 from .telegram_reading import ReadDateFetchResult, TelegramReadReceiptGateway
 
-READ_AT_TTL_SECONDS = 600
-
 
 def reaction_event_projection(
     conn: sqlite3.Connection,
@@ -94,6 +92,7 @@ async def enrich_read_at(  # noqa: PLR0913
     messages: Sequence[ReadMessage],
     *,
     dialog_type: str | DialogType | None,
+    read_at_ttl_seconds: int,
     checked_at: int | None = None,
 ) -> list[ReadMessage]:
     """Best-effort enrich own outgoing User-DM messages with Telegram dates.
@@ -102,20 +101,47 @@ async def enrich_read_at(  # noqa: PLR0913
     kept in ``message_read_facts`` so missing/forbidden dates remain nullable
     and are not retried until the bounded TTL expires.
     """
-
+    _validate_read_at_ttl_seconds(read_at_ttl_seconds)
     if gateway is None or DialogType.parse(dialog_type) != DialogType.USER:
         return list(messages)
-    candidates = [message for message in messages if message.out == 1 and message.dialog_id == dialog_id]
-    if not candidates:
+    candidate_ids = _outgoing_candidate_ids(messages, dialog_id)
+    if not candidate_ids:
         return list(messages)
     now = int(checked_at if checked_at is not None else time.time())
-    stale_ids = stale_read_at_ids(
+    await _refresh_stale_read_at_facts(
         conn,
+        gateway,
         dialog_id,
-        [message.message_id for message in candidates],
-        now - READ_AT_TTL_SECONDS,
+        candidate_ids,
+        stale_before_utc=now - read_at_ttl_seconds,
+        checked_at=now,
     )
-    for message_id in stale_ids:
+    values = read_at_map(conn, dialog_id, candidate_ids)
+    return [dataclasses.replace(message, read_at=values.get(message.message_id)) for message in messages]
+
+
+def _validate_read_at_ttl_seconds(read_at_ttl_seconds: int) -> None:
+    """Reject invalid cache TTLs before the enrichment shortcut paths."""
+    if isinstance(read_at_ttl_seconds, bool) or not isinstance(read_at_ttl_seconds, int) or read_at_ttl_seconds < 1:
+        raise ValueError("read_at_ttl_seconds must be an integer >= 1")
+
+
+def _outgoing_candidate_ids(messages: Sequence[ReadMessage], dialog_id: int) -> list[int]:
+    """Return User-DM outgoing ids in their source-message order."""
+    return [message.message_id for message in messages if message.out == 1 and message.dialog_id == dialog_id]
+
+
+async def _refresh_stale_read_at_facts(  # noqa: PLR0913
+    conn: sqlite3.Connection,
+    gateway: TelegramReadReceiptGateway,
+    dialog_id: int,
+    message_ids: Sequence[int],
+    *,
+    stale_before_utc: int,
+    checked_at: int,
+) -> None:
+    """Refresh stale probes, retaining committed earlier facts on a later failure."""
+    for message_id in stale_read_at_ids(conn, dialog_id, message_ids, stale_before_utc):
         try:
             result = await gateway.fetch_outbox_read_date(dialog_id, message_id)
         except CATCHABLE_GATEWAY_FAILURES:
@@ -128,14 +154,12 @@ async def enrich_read_at(  # noqa: PLR0913
                 dialog_id,
                 message_id,
                 read_at=read_at,
-                checked_at=now,
+                checked_at=checked_at,
                 status=result.status,
             )
         except sqlite3.OperationalError:
             # Keep pre-v28 read paths usable while the daemon is upgrading.
             break
-    values = read_at_map(conn, dialog_id, [message.message_id for message in candidates])
-    return [dataclasses.replace(message, read_at=values.get(message.message_id)) for message in messages]
 
 
 def persist_read_at(  # noqa: PLR0913
@@ -189,7 +213,7 @@ def stale_read_at_ids(
     conn: sqlite3.Connection,
     dialog_id: int,
     message_ids: Sequence[int],
-    threshold: int,
+    stale_before_utc: int,
 ) -> list[int]:
     """Return message ids whose read-date probe is absent or older than TTL."""
 
@@ -202,7 +226,7 @@ def stale_read_at_ids(
             conn.execute(
                 f"SELECT message_id, checked_at FROM message_read_facts "
                 f"WHERE dialog_id = ? AND message_id IN ({placeholders}) AND checked_at > ?",
-                [dialog_id, *message_ids, threshold],
+                [dialog_id, *message_ids, stale_before_utc],
             ).fetchall(),
         )
     except sqlite3.OperationalError:

@@ -19,7 +19,8 @@ import pytest
 from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
 
 from mcp_telegram.daemon_api import DaemonAPIServer, _DaemonClientLike
-from mcp_telegram.daemon_message import REACTIONS_TTL_SECONDS
+from tests.daemon_api_policy import make_daemon_api_policy
+from tests.reaction_helpers import make_reaction_freshener
 
 # ---------------------------------------------------------------------------
 # Patch get_peer_id for MagicMock entities
@@ -113,7 +114,13 @@ def _fetchall_tuples(conn: sqlite3.Connection, sql: str, params: tuple[object, .
 
 def make_server(conn: sqlite3.Connection, client: object) -> DaemonAPIServer:
     shutdown_event = asyncio.Event()
-    return DaemonAPIServer(conn, cast(_DaemonClientLike, client), shutdown_event)
+    return DaemonAPIServer(
+        conn,
+        cast(_DaemonClientLike, client),
+        shutdown_event,
+        reaction_freshener=make_reaction_freshener(conn, client),
+        policy=make_daemon_api_policy(),
+    )
 
 
 def _call_kwargs(mock: object) -> dict[str, object]:
@@ -414,7 +421,7 @@ async def test_jit_fetch_window_never_expanded(make_synced_db: Callable[[], sqli
 
 @pytest.mark.asyncio
 async def test_jit_reactions_cleared_when_telegram_has_none(make_synced_db: Callable[[], sqlite3.Connection]) -> None:
-    """msg.reactions=None should clear cached rows (apply_reactions_delta with [])."""
+    """msg.reactions=None should clear cached rows through the repository."""
     conn = make_synced_db()
     dialog_id = 1001
     _seed_synced(conn, dialog_id)
@@ -439,15 +446,6 @@ async def test_jit_reactions_cleared_when_telegram_has_none(make_synced_db: Call
         ).fetchone(),
     )
     assert fr is not None
-
-
-# ---------------------------------------------------------------------------
-# Module sanity
-# ---------------------------------------------------------------------------
-
-
-def test_reactions_ttl_constant_is_600() -> None:
-    assert REACTIONS_TTL_SECONDS == 600
 
 
 # ---------------------------------------------------------------------------

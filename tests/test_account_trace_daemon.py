@@ -49,13 +49,21 @@ from mcp_telegram.pagination import (
     encode_account_trace_navigation,
 )
 from mcp_telegram.tools import TOOL_REGISTRY
+from tests.daemon_api_policy import make_daemon_api_policy
+from tests.reaction_helpers import make_reaction_freshener
 
 
 @pytest.fixture()
 def trace_server(tmp_path: Path) -> Iterator[tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock]]:
     conn = open_trace_db(tmp_path)
     client = AsyncMock()
-    server = DaemonAPIServer(conn, client, asyncio.Event())
+    server = DaemonAPIServer(
+        conn,
+        client,
+        asyncio.Event(),
+        reaction_freshener=make_reaction_freshener(conn, client),
+        policy=make_daemon_api_policy(),
+    )
     server.self_id = 101
     try:
         yield server, conn, client
@@ -76,6 +84,8 @@ def trace_service(
             self_id=server.self_id,
             logger=cast(_LoggerLike, logging.getLogger("test")),
             rid=lambda: "",
+            user_directory_ttl_seconds=server._policy.user_directory_ttl_seconds,
+            group_directory_ttl_seconds=server._policy.group_directory_ttl_seconds,
         ),
     )
 

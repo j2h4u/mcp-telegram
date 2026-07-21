@@ -29,12 +29,7 @@ from typing import TypedDict, cast
 
 import pytest
 
-from mcp_telegram.activity_peer_resolve import (
-    _ENTITY_DETAIL_TTL_SECONDS,
-    LinkedChatResolution,
-    resolve_input_peer,
-    resolve_linked_chat_id,
-)
+from mcp_telegram.activity_peer_resolve import LinkedChatResolution, resolve_input_peer, resolve_linked_chat_id
 from mcp_telegram.sync_db import _apply_migrations
 
 # ---------------------------------------------------------------------------
@@ -447,16 +442,6 @@ def test_linked_chat_resolution_fields():
     r2 = LinkedChatResolution(linked_chat_id=None, flood_wait_seconds=30)
     assert r2.linked_chat_id is None
     assert r2.flood_wait_seconds == 30
-
-
-# ---------------------------------------------------------------------------
-# TTL constant
-# ---------------------------------------------------------------------------
-
-
-def test_entity_detail_ttl_constant():
-    assert isinstance(_ENTITY_DETAIL_TTL_SECONDS, int)
-    assert _ENTITY_DETAIL_TTL_SECONDS > 0
 
 
 # ---------------------------------------------------------------------------

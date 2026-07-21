@@ -5,12 +5,11 @@ import sqlite3
 from typing import Protocol, cast
 
 from .formatter import format_reaction_counts
-from .sync_worker import extract_reply_and_topic
+from .messages.telegram_adapter import extract_reply_and_topic
 from .telethon_media import describe_media
 from .telethon_message import is_service_message
 
 logger = logging.getLogger(__name__)
-REACTIONS_TTL_SECONDS = 600
 
 
 class _SupportsTimestamp(Protocol):

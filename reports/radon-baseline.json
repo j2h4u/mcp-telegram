@@ -42,8 +42,6 @@
     "scheduled_messages.py::run_once": 17,
     "sync_worker.py::FullSyncWorker.bootstrap_dms": 11,
     "sync_worker.py::bootstrap_dms": 11,
-    "sync_worker.py::insert_messages_with_fts": 18,
-    "telegram_fact_queries.py::enrich_read_at": 15,
     "telethon_media.py::describe_document": 21,
     "temporal.py::_normalize_schema_node": 18,
     "temporal.py::_project": 14,

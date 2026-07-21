@@ -24,13 +24,13 @@ from .activity_peer_resolve import resolve_linked_chat_id
 from .activity_sync import _ActivityClient
 from .fts import stem_text
 from .message_contracts import ExtractedMessage
+from .messages.telegram_adapter import extract_message_row
 from .own_only import (
     OwnOnlyContext,
     classify_own_only_dialog,
     enroll_own_only_dialog,
     query_own_only_candidates,
 )
-from .sync_worker import extract_message_row
 
 logger = logging.getLogger(__name__)
 

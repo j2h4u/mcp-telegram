@@ -14,6 +14,9 @@ import pytest
 
 from mcp_telegram.daemon import _log_heartbeat, sync_main
 from mcp_telegram.daemon_api import DaemonAPIServer
+from mcp_telegram.state import StatePaths
+from tests.daemon_api_policy import make_daemon_api_policy
+from tests.reaction_helpers import make_reaction_freshener
 
 # ---------------------------------------------------------------------------
 # CLI registration
@@ -75,9 +78,15 @@ def sync_db_path(tmp_path: Path) -> Path:
 
 
 @pytest.fixture(autouse=True)
-def _patch_sync_db_path(sync_db_path: Path):
-    """Keep daemon startup tests from turning an unconfigured mock into a filename."""
-    with patch("mcp_telegram.daemon.get_sync_db_path", return_value=sync_db_path):
+def _patch_state_paths(sync_db_path: Path, tmp_path: Path):
+    """Keep daemon startup tests isolated from the configured state directory."""
+    paths = StatePaths(
+        state_dir=tmp_path,
+        sync_db_path=sync_db_path,
+        feedback_db_path=tmp_path / "feedback.db",
+        daemon_socket_path=tmp_path / "daemon.sock",
+    )
+    with patch("mcp_telegram.daemon.StatePaths.from_state_dir", return_value=paths):
         yield
 
 
@@ -85,14 +94,11 @@ def _patch_sync_db_path(sync_db_path: Path):
 def _patch_feedback_db(tmp_path: Path):
     """Patch feedback_db helpers in daemon so tests don't touch the filesystem.
 
-    sync_main() now calls ensure_feedback_schema() and get_feedback_db_path()
-    at startup.  Without this patch every daemon test would create a real
-    feedback.db under the test user's XDG state dir.  The returned mock
-    connection satisfies DaemonAPIServer.__init__'s type annotation.
+    The returned mock connection satisfies DaemonAPIServer.__init__'s type
+    annotation without opening a feedback database.
     """
     mock_conn = MagicMock()
     with (
-        patch("mcp_telegram.daemon.get_feedback_db_path", return_value=tmp_path / "feedback.db"),
         patch("mcp_telegram.daemon.ensure_feedback_schema", return_value=mock_conn),
     ):
         yield
@@ -235,12 +241,24 @@ def test_self_id_cached_at_startup(
     captured: dict[str, object] = {}
 
     class _Capturing:
-        def __init__(self, conn, client, shutdown_event, feedback_conn=None, sync_db_path=None):
+        def __init__(  # noqa: PLR0913
+            self,
+            conn,
+            client,
+            shutdown_event,
+            feedback_conn=None,
+            sync_db_path=None,
+            *,
+            reaction_freshener,
+            policy,
+        ):
             self._conn = conn
             self._client = client
             self._shutdown_event = shutdown_event
             self._feedback_conn = feedback_conn
             self._sync_db_path = sync_db_path
+            self._reaction_freshener = reaction_freshener
+            self._policy = policy
             self.self_id = None
             captured["instance"] = self
 
@@ -263,6 +281,9 @@ def test_self_id_cached_at_startup(
     assert instance.self_id == 12345, (  # type: ignore[attr-defined]
         f"expected self_id=12345, got {instance.self_id!r}"  # type: ignore[attr-defined]
     )
+    assert instance._policy.read_at_ttl_seconds == 600  # type: ignore[attr-defined]
+    assert instance._policy.entity_detail_ttl_seconds == 300  # type: ignore[attr-defined]
+    assert instance._policy.telemetry_retention_ttl_seconds == 2_592_000  # type: ignore[attr-defined]
     assert mock_client.get_me.call_count == 1, (
         f"get_me must be called exactly once at startup, got {mock_client.get_me.call_count}"
     )
@@ -981,7 +1002,15 @@ def test_sync_main_cleans_socket_on_shutdown(
         patch("mcp_telegram.daemon.register_shutdown_handler", return_value=instant_shutdown_event),
         patch("mcp_telegram.daemon._open_sync_db"),
         patch("mcp_telegram.daemon.backfill_fts_index", return_value=0),
-        patch("mcp_telegram.daemon.get_daemon_socket_path", return_value=fake_socket_path),
+        patch(
+            "mcp_telegram.daemon.StatePaths.from_state_dir",
+            return_value=StatePaths(
+                state_dir=tmp_path,
+                sync_db_path=tmp_path / "sync.db",
+                feedback_db_path=tmp_path / "feedback.db",
+                daemon_socket_path=fake_socket_path,
+            ),
+        ),
         patch("mcp_telegram.daemon.FullSyncWorker", return_value=mocks["worker"]),
         patch("mcp_telegram.daemon.DeltaSyncWorker", return_value=mocks["delta"]),
         patch("mcp_telegram.daemon.DialogsBootstrapWorker", return_value=bootstrap_worker),
@@ -1535,7 +1564,14 @@ def _make_source_export_server() -> tuple[DaemonAPIServer, sqlite3.Connection]:
 
     conn = sqlite3.connect(":memory:")
     _apply_migrations(conn)
-    server = DaemonAPIServer(conn, MagicMock(), asyncio.Event())
+    client = MagicMock()
+    server = DaemonAPIServer(
+        conn,
+        client,
+        asyncio.Event(),
+        reaction_freshener=make_reaction_freshener(conn, client),
+        policy=make_daemon_api_policy(),
+    )
     server._ready = True
     return server, conn
 

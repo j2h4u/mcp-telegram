@@ -57,12 +57,12 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
 from .activity_cold_backfill import run_cold_backfill_loop
 from .activity_hot_sweep import run_hot_sweep_loop
 from .activity_sync import _ActivityClient, run_activity_sync_loop
-from .daemon_api import DaemonAPIServer, _DaemonClientLike
-from .daemon_ipc import get_daemon_socket_path
+from .config import load_config
+from .daemon_api import DaemonApiPolicy, DaemonAPIServer, _DaemonClientLike
 from .delta_sync import DeltaSyncWorker, _DeltaSyncClient, run_access_probe_loop
 from .dialog_sync import DialogsBootstrapWorker, run_reconciliation_loop
 from .event_handlers import EventHandlerManager
-from .feedback_db import ensure_feedback_schema, get_feedback_db_path
+from .feedback_db import ensure_feedback_schema
 from .flood import (
     flood_seconds,
     install_telethon_flood_wait_metrics_filter,
@@ -70,17 +70,22 @@ from .flood import (
     sleep_through_flood,
 )
 from .fts import backfill_fts_index
+from .messages.sqlite_repository import insert_messages_with_fts
+from .messages.telegram_adapter import extract_message_row
 from .own_only import OwnOnlyContext, ensure_own_only_schema
+from .reactions.refresh import ReactionFreshener
+from .reactions.sqlite_repository import SQLiteReactionSnapshotRepository
+from .reactions.telegram_adapter import TelethonTelegramReactionGateway
 from .read_state import apply_read_cursor
 from .scheduled_messages import run_scheduled_reconciliation_loop
+from .state import StatePaths, ensure_private_state_dir
 from .sync_db import (
     _open_sync_db,
     ensure_sync_schema,
-    get_sync_db_path,
     migrate_legacy_databases,
     register_shutdown_handler,
 )
-from .sync_worker import FullSyncWorker, extract_message_row, insert_messages_with_fts
+from .sync_worker import FullSyncWorker
 from .telegram import create_client
 
 logger = logging.getLogger(__name__)
@@ -652,17 +657,23 @@ def _create_tracked_task(
 
 
 async def _build_sync_main_context() -> _SyncMainContext:
-    db_path = get_sync_db_path()
+    config = load_config()
+    state_paths = StatePaths.from_state_dir(ensure_private_state_dir(config.state.dir))
+    db_path = state_paths.sync_db_path
     ensure_sync_schema(db_path)
 
     conn = _open_sync_db(db_path)
-    migrate_legacy_databases(conn, db_path.parent)
+    migrate_legacy_databases(
+        conn,
+        state_paths.state_dir,
+        telemetry_retention_ttl_seconds=config.telemetry.retention_ttl_seconds,
+    )
 
     # Open feedback.db before registering the shutdown handler so the SIGTERM
     # handler can checkpoint it.  feedback_conn is opened on the asyncio thread
     # (sync_main coroutine) — the same thread the SIGTERM handler runs on via
     # loop.add_signal_handler — so no cross-thread SQLite sharing occurs.
-    feedback_db_path = get_feedback_db_path()
+    feedback_db_path = state_paths.feedback_db_path
     feedback_conn = ensure_feedback_schema(feedback_db_path)
     logger.info("feedback.db ready at %s", feedback_db_path)
 
@@ -670,11 +681,29 @@ async def _build_sync_main_context() -> _SyncMainContext:
     shutdown_event = register_shutdown_handler(conn, loop, feedback_conn=feedback_conn)
 
     client = cast(_DaemonClient, create_client(catch_up=True))
-    api_server = DaemonAPIServer(conn, cast(_DaemonClientLike, client), shutdown_event, feedback_conn, db_path)
-    socket_path = get_daemon_socket_path()
-    # Ensure the runtime/state dir exists before binding — do not assume a prior
-    # get_sync_db_path() call (or a Docker volume mount) already created it.
-    socket_path.parent.mkdir(parents=True, exist_ok=True)
+    reaction_freshener = ReactionFreshener(
+        SQLiteReactionSnapshotRepository(conn),
+        TelethonTelegramReactionGateway(client),
+        freshness_ttl_seconds=config.freshness.reactions.freshness_ttl_seconds,
+        log=logger,
+    )
+    api_server = DaemonAPIServer(
+        conn,
+        cast(_DaemonClientLike, client),
+        shutdown_event,
+        feedback_conn,
+        db_path,
+        reaction_freshener=reaction_freshener,
+        policy=DaemonApiPolicy(
+            read_at_ttl_seconds=config.freshness.read_receipts.read_at_ttl_seconds,
+            entity_detail_ttl_seconds=config.freshness.entities.detail_ttl_seconds,
+            user_directory_ttl_seconds=config.freshness.entities.user_directory_ttl_seconds,
+            group_directory_ttl_seconds=config.freshness.entities.group_directory_ttl_seconds,
+            resolver_enrichment_ttl_seconds=config.freshness.entities.resolver_enrichment_ttl_seconds,
+            telemetry_retention_ttl_seconds=config.telemetry.retention_ttl_seconds,
+        ),
+    )
+    socket_path = state_paths.daemon_socket_path
     socket_path.unlink(missing_ok=True)
     old_umask = os.umask(0o177)
     try:
@@ -897,7 +926,7 @@ async def _shutdown_sync_main_context(ctx: _SyncMainContext) -> None:
     if ctx.unix_server is not None:
         ctx.unix_server.close()
         await ctx.unix_server.wait_closed()
-    get_daemon_socket_path().unlink(missing_ok=True)
+    ctx.socket_path.unlink(missing_ok=True)
     if ctx.handler_manager is not None:
         ctx.handler_manager.unregister()
     # Cancel tracked background tasks

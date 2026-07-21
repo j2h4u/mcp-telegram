@@ -27,6 +27,8 @@ from telethon.errors import RPCError
 from telethon.tl.types import Channel as TelethonChannel  # type: ignore[import-untyped]
 
 from mcp_telegram.daemon_api import DaemonAPIServer, _DaemonClientLike
+from tests.daemon_api_policy import make_daemon_api_policy
+from tests.reaction_helpers import make_reaction_freshener
 
 _TEST_DBS: list[sqlite3.Connection] = []
 
@@ -94,7 +96,13 @@ def make_server(conn: sqlite3.Connection | None = None, client: _DaemonClientLik
     if client is None:
         client = MagicMock()
     shutdown_event = asyncio.Event()
-    server = DaemonAPIServer(conn, cast(_DaemonClientLike, client), shutdown_event)
+    server = DaemonAPIServer(
+        conn,
+        cast(_DaemonClientLike, client),
+        shutdown_event,
+        reaction_freshener=make_reaction_freshener(conn, client),
+        policy=make_daemon_api_policy(),
+    )
     server._ready = True
     return server
 

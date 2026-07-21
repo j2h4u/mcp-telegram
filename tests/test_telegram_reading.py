@@ -16,21 +16,20 @@ import pytest
 from telethon.errors import ChannelPrivateError, FloodWaitError
 from telethon.tl import types
 
-from mcp_telegram.message_contracts import ReactionRecord
 from mcp_telegram.models import ReadMessage
-from mcp_telegram.telegram_fact_queries import enrich_read_at
+from mcp_telegram.reactions.contracts import ReactionAggregate, ReactionEvent, ReactionFetchResult, ReactionSnapshot
+from mcp_telegram.reactions.ports import ReactionSnapshotRepository, TelegramReactionGateway
+from mcp_telegram.reactions.refresh import ReactionFreshener
+from mcp_telegram.reactions.sqlite_repository import SQLiteReactionSnapshotRepository
+from mcp_telegram.reactions.telegram_adapter import TelethonTelegramReactionGateway
+from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
+from mcp_telegram.telegram_fact_queries import enrich_read_at, stale_read_at_ids
 from mcp_telegram.telegram_fragments import FragmentContextService, TelethonTelegramFragmentGateway
-from mcp_telegram.telegram_reaction_queries import persist_reaction_snapshots
-from mcp_telegram.telegram_reactions import ReactionFreshener, TelethonTelegramReactionGateway
 from mcp_telegram.telegram_read_receipts import TelethonTelegramReadReceiptGateway
 from mcp_telegram.telegram_reading import (
     GatewayFailure,
     GatewayFailureKind,
-    ReactionEvent,
-    ReactionFetchResult,
-    ReactionMessage,
     ReadDateFetchResult,
-    TelegramReactionGateway,
 )
 
 
@@ -90,6 +89,16 @@ class _WarningLogger:
         self._warnings.append(args)
 
 
+@pytest.mark.parametrize("freshness_ttl_seconds", [0, -1, True, "600"])
+def test_reaction_freshener_requires_positive_integer_ttl(freshness_ttl_seconds: object) -> None:
+    with pytest.raises(ValueError, match="freshness_ttl_seconds"):
+        ReactionFreshener(
+            cast(ReactionSnapshotRepository, object()),
+            cast(TelegramReactionGateway, object()),
+            freshness_ttl_seconds=cast(int, freshness_ttl_seconds),
+        )
+
+
 @pytest.mark.asyncio
 async def test_fragment_gateway_preserves_fixed_window_and_normalized_persistence(
     make_synced_db: Callable[[], sqlite3.Connection],
@@ -112,6 +121,10 @@ async def test_fragment_gateway_preserves_fixed_window_and_normalized_persistenc
     assert conn.execute("SELECT message_id, emoji, count FROM message_reactions ORDER BY message_id").fetchall() == [
         (10, "👍", 2),
         (12, "👍", 2),
+    ]
+    assert conn.execute("SELECT dialog_id, message_id FROM messages_fts ORDER BY message_id").fetchall() == [
+        (42, 10),
+        (42, 12),
     ]
 
 
@@ -156,18 +169,20 @@ async def test_reaction_freshener_refreshes_only_stale_active_window(
     fetch_reactions = AsyncMock(
         return_value=ReactionFetchResult(
             messages=(
-                ReactionMessage(
+                ReactionSnapshot(
                     3,
-                    (ReactionRecord(dialog_id=0, message_id=3, emoji="🔥", count=4),),
+                    (ReactionAggregate(emoji="🔥", count=4),),
                 ),
             )
         )
     )
     gateway = SimpleNamespace(fetch_reactions=fetch_reactions)
 
-    freshness = await ReactionFreshener(conn, cast(TelegramReactionGateway, gateway)).refresh(
-        dialog_id, dialog_id, [1, 2, 3]
-    )
+    freshness = await ReactionFreshener(
+        SQLiteReactionSnapshotRepository(conn),
+        cast(TelegramReactionGateway, gateway),
+        freshness_ttl_seconds=600,
+    ).refresh(dialog_id, dialog_id, [1, 2, 3])
 
     assert freshness.status == "refreshed"
     assert freshness.fresh_count == 2
@@ -177,6 +192,105 @@ async def test_reaction_freshener_refreshes_only_stale_active_window(
     assert conn.execute(
         "SELECT message_id, emoji, count FROM message_reactions WHERE dialog_id=?", (dialog_id,)
     ).fetchall() == [(3, "🔥", 4)]
+
+
+def test_reaction_freshness_at_exact_ttl_age_is_stale(make_synced_db: Callable[[], sqlite3.Connection]) -> None:
+    """A reaction snapshot at exactly the cutoff is refreshed, never reused."""
+    conn = make_synced_db()
+    dialog_id, message_id, now, ttl = 1001, 1, 2_000, 600
+    _seed_synced(conn, dialog_id)
+    conn.execute(
+        "INSERT INTO message_reactions_freshness (dialog_id, message_id, checked_at) VALUES (?, ?, ?)",
+        (dialog_id, message_id, now - ttl),
+    )
+    conn.commit()
+
+    state, fresh_ids, stale_ids = SQLiteReactionSnapshotRepository(conn).stale_reaction_ids(
+        dialog_id, [message_id], now - ttl
+    )
+
+    assert (state, fresh_ids, stale_ids) == ("active", set(), [message_id])
+
+
+@pytest.mark.asyncio
+async def test_reaction_freshener_commits_successful_refresh_to_other_connection(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    writer = _open_sync_db(db_path)
+    reader = _open_sync_db(db_path)
+    try:
+        dialog_id = 1001
+        _seed_synced(writer, dialog_id)
+        gateway = SimpleNamespace(
+            fetch_reactions=AsyncMock(
+                return_value=ReactionFetchResult(
+                    messages=(ReactionSnapshot(3, (ReactionAggregate(emoji="🔥", count=4),)),)
+                )
+            )
+        )
+
+        freshness = await ReactionFreshener(
+            SQLiteReactionSnapshotRepository(writer),
+            cast(TelegramReactionGateway, gateway),
+            freshness_ttl_seconds=600,
+        ).refresh(dialog_id, dialog_id, [3])
+
+        assert freshness.status == "refreshed"
+        assert reader.execute(
+            "SELECT emoji, count FROM message_reactions WHERE dialog_id=? AND message_id=?", (dialog_id, 3)
+        ).fetchall() == [("🔥", 4)]
+        assert (
+            reader.execute(
+                "SELECT checked_at FROM message_reactions_freshness WHERE dialog_id=? AND message_id=?", (dialog_id, 3)
+            ).fetchone()
+            is not None
+        )
+    finally:
+        reader.close()
+        writer.close()
+
+
+@pytest.mark.asyncio
+async def test_reaction_freshener_rolls_back_failed_refresh_on_file_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    writer = _open_sync_db(db_path)
+    reader = _open_sync_db(db_path)
+    try:
+        dialog_id = 1001
+        _seed_synced(writer, dialog_id)
+        repository = SQLiteReactionSnapshotRepository(writer)
+
+        def fail_after_aggregate_write(*_args: object) -> None:
+            raise RuntimeError("event persistence failed")
+
+        monkeypatch.setattr(repository, "_replace_event_snapshot", fail_after_aggregate_write)
+        gateway = SimpleNamespace(
+            fetch_reactions=AsyncMock(
+                return_value=ReactionFetchResult(
+                    messages=(ReactionSnapshot(3, (ReactionAggregate(emoji="🔥", count=4),)),)
+                )
+            )
+        )
+
+        with pytest.raises(RuntimeError, match="event persistence failed"):
+            await ReactionFreshener(
+                repository,
+                cast(TelegramReactionGateway, gateway),
+                freshness_ttl_seconds=600,
+            ).refresh(dialog_id, dialog_id, [3])
+
+        assert reader.execute(
+            "SELECT COUNT(*) FROM message_reactions WHERE dialog_id=? AND message_id=?", (dialog_id, 3)
+        ).fetchone() == (0,)
+        assert reader.execute(
+            "SELECT COUNT(*) FROM message_reactions_freshness WHERE dialog_id=? AND message_id=?", (dialog_id, 3)
+        ).fetchone() == (0,)
+    finally:
+        reader.close()
+        writer.close()
 
 
 @pytest.mark.asyncio
@@ -200,9 +314,12 @@ async def test_reaction_freshener_access_lost_is_quiet_and_structured(
     warnings: list[tuple[object, ...]] = []
     log = _WarningLogger(warnings)
 
-    freshness = await ReactionFreshener(conn, cast(TelegramReactionGateway, gateway), log=log).refresh(
-        dialog_id, dialog_id, [1, 2]
-    )
+    freshness = await ReactionFreshener(
+        SQLiteReactionSnapshotRepository(conn),
+        cast(TelegramReactionGateway, gateway),
+        freshness_ttl_seconds=600,
+        log=log,
+    ).refresh(dialog_id, dialog_id, [1, 2])
 
     assert freshness.as_dict() == {
         "requested_count": 2,
@@ -242,9 +359,35 @@ async def test_reaction_detail_unavailable_keeps_aggregate_rows() -> None:
     assert result.failure is None
     detail = result.messages[0]
     assert detail is not None
-    assert [(row.emoji, row.count) for row in detail.rows] == [("👍", 2)]
+    assert [(row.emoji, row.count) for row in detail.aggregates] == [("👍", 2)]
     assert detail.events == ()
     assert detail.events_status == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_reaction_gateway_reads_only_reaction_fields() -> None:
+    """The Telegram adapter must not depend on general message extraction."""
+
+    class ReactionOnlyMessage:
+        reactions = SimpleNamespace(results=[SimpleNamespace(reaction=SimpleNamespace(emoticon="👍"), count=2)])
+
+        def __getattr__(self, name: str) -> object:
+            raise AssertionError(f"reaction adapter accessed unrelated field: {name}")
+
+    class Client:
+        async def get_messages(self, _entity: object, ids: list[int]) -> list[object]:
+            assert ids == [101]
+            return [ReactionOnlyMessage()]
+
+    result = await TelethonTelegramReactionGateway(Client()).fetch_reactions(123, [101])
+
+    assert result.ok is True
+    assert result.messages == (
+        ReactionSnapshot(
+            message_id=101,
+            aggregates=(ReactionAggregate(emoji="👍", count=2),),
+        ),
+    )
 
 
 @pytest.mark.asyncio
@@ -276,7 +419,7 @@ async def test_reaction_gateway_persists_individual_dates_without_affecting_aggr
     assert result.failure is None
     assert result.messages[0] is not None
     detail = result.messages[0]
-    assert detail.rows[0].count == 2
+    assert detail.aggregates[0].count == 2
     assert detail.events_status == "complete"
     assert detail.events == (
         ReactionEvent(reactor_id=77, emoji="👍", reacted_at=1_700_000_100),
@@ -313,7 +456,9 @@ async def test_read_at_enrichment_only_probes_outgoing_user_dm_and_never_falls_b
         ReadMessage(message_id=2, sent_at=1_001, dialog_id=42, out=0),
         ReadMessage(message_id=3, sent_at=1_002, dialog_id=99, out=1),
     ]
-    enriched = await enrich_read_at(conn, Gateway(), 42, messages, dialog_type="user", checked_at=2_000)
+    enriched = await enrich_read_at(
+        conn, Gateway(), 42, messages, dialog_type="user", read_at_ttl_seconds=600, checked_at=2_000
+    )
     assert [message.read_at for message in enriched] == [None, None, None]
     assert calls == [1]
     assert conn.execute(
@@ -322,8 +467,82 @@ async def test_read_at_enrichment_only_probes_outgoing_user_dm_and_never_falls_b
 
     # Group-shaped dialogs are outside the private User-DM contract and must
     # not trigger a Telegram RPC even when they contain an outgoing message.
-    await enrich_read_at(conn, Gateway(), 42, messages, dialog_type="supergroup", checked_at=2_001)
+    await enrich_read_at(
+        conn, Gateway(), 42, messages, dialog_type="supergroup", read_at_ttl_seconds=600, checked_at=2_001
+    )
     assert calls == [1]
+
+
+@pytest.mark.asyncio
+async def test_read_at_preserves_duplicate_eligible_ids_in_source_order(
+    make_synced_db: Callable[[], sqlite3.Connection],
+) -> None:
+    """Each eligible source row is probed and projected in its original order."""
+    conn = make_synced_db()
+    calls: list[int] = []
+
+    class Gateway:
+        async def fetch_outbox_read_date(
+            self,
+            entity: object,
+            message_id: int,
+        ) -> ReadDateFetchResult:
+            _ = entity
+            calls.append(message_id)
+            return ReadDateFetchResult(
+                read_at=1_700_000_000 + message_id,
+                status="complete",
+            )
+
+    messages = [
+        ReadMessage(message_id=3, sent_at=1_000, dialog_id=42, out=1),
+        ReadMessage(message_id=1, sent_at=1_001, dialog_id=42, out=1),
+        ReadMessage(message_id=3, sent_at=1_002, dialog_id=42, out=1),
+    ]
+    enriched = await enrich_read_at(
+        conn,
+        Gateway(),
+        42,
+        messages,
+        dialog_type="user",
+        read_at_ttl_seconds=600,
+        checked_at=3_000,
+    )
+
+    assert calls == [3, 1, 3]
+    assert [message.message_id for message in enriched] == [3, 1, 3]
+    assert [message.read_at for message in enriched] == [
+        1_700_000_003,
+        1_700_000_001,
+        1_700_000_003,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_read_at_rejects_boolean_ttl_before_shortcut(make_synced_db: Callable[[], sqlite3.Connection]) -> None:
+    """TTL validation applies even when no gateway or eligible dialog exists."""
+    with pytest.raises(ValueError, match="read_at_ttl_seconds"):
+        await enrich_read_at(
+            make_synced_db(),
+            None,
+            42,
+            [],
+            dialog_type="supergroup",
+            read_at_ttl_seconds=True,
+        )
+
+
+def test_read_receipt_at_exact_ttl_age_is_stale(make_synced_db: Callable[[], sqlite3.Connection]) -> None:
+    """A read-receipt probe at exactly the cutoff is fetched again."""
+    conn = make_synced_db()
+    dialog_id, message_id, now, ttl = 42, 1, 2_000, 600
+    conn.execute(
+        "INSERT INTO message_read_facts (dialog_id, message_id, read_at, checked_at, status) VALUES (?, ?, ?, ?, ?)",
+        (dialog_id, message_id, 1_700_000_000, now - ttl, "complete"),
+    )
+    conn.commit()
+
+    assert stale_read_at_ids(conn, dialog_id, [message_id], now - ttl) == [message_id]
 
 
 @pytest.mark.asyncio
@@ -343,7 +562,9 @@ async def test_read_at_projects_telegram_date_for_own_dm_only(
         ReadMessage(message_id=8, sent_at=1_000, dialog_id=42, out=1),
         ReadMessage(message_id=9, sent_at=1_001, dialog_id=42, out=0),
     ]
-    enriched = await enrich_read_at(conn, Gateway(), 42, messages, dialog_type="user", checked_at=3_100)
+    enriched = await enrich_read_at(
+        conn, Gateway(), 42, messages, dialog_type="user", read_at_ttl_seconds=600, checked_at=3_100
+    )
 
     assert calls == [8]
     assert [message.read_at for message in enriched] == [1_700_000_200, None]
@@ -366,7 +587,9 @@ async def test_read_at_unavailable_is_nullable_but_probe_status_is_persisted(
             return ReadDateFetchResult(status="unavailable")
 
     messages = [ReadMessage(message_id=7, sent_at=1_000, dialog_id=42, out=1)]
-    enriched = await enrich_read_at(conn, Gateway(), 42, messages, dialog_type="user", checked_at=3_000)
+    enriched = await enrich_read_at(
+        conn, Gateway(), 42, messages, dialog_type="user", read_at_ttl_seconds=600, checked_at=3_000
+    )
 
     assert calls == [7]
     assert enriched[0].read_at is None
@@ -376,17 +599,75 @@ async def test_read_at_unavailable_is_nullable_but_probe_status_is_persisted(
     ).fetchone() == (None, 3_000, "unavailable")
 
 
+@pytest.mark.asyncio
+async def test_read_at_stops_after_persistence_operational_error_with_prior_commits(
+    make_synced_db: Callable[[], sqlite3.Connection], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Earlier probe facts remain committed when a later local write cannot persist."""
+    import mcp_telegram.telegram_fact_queries as fact_queries
+
+    conn = make_synced_db()
+    calls: list[int] = []
+
+    class Gateway:
+        async def fetch_outbox_read_date(self, entity: object, message_id: int) -> ReadDateFetchResult:
+            _ = entity
+            calls.append(message_id)
+            return ReadDateFetchResult(read_at=1_700_000_000 + message_id, status="complete")
+
+    original_persist = fact_queries.persist_read_at
+
+    def fail_second_persist(  # noqa: PLR0913
+        connection: sqlite3.Connection,
+        current_dialog_id: int,
+        message_id: int,
+        *,
+        read_at: int | None,
+        checked_at: int,
+        status: str,
+    ) -> None:
+        if message_id == 2:
+            raise sqlite3.OperationalError("simulated missing table")
+        original_persist(
+            connection,
+            current_dialog_id,
+            message_id,
+            read_at=read_at,
+            checked_at=checked_at,
+            status=status,
+        )
+
+    monkeypatch.setattr(fact_queries, "persist_read_at", fail_second_persist)
+    messages = [
+        ReadMessage(message_id=1, sent_at=1_000, dialog_id=42, out=1),
+        ReadMessage(message_id=2, sent_at=1_001, dialog_id=42, out=1),
+        ReadMessage(message_id=3, sent_at=1_002, dialog_id=42, out=1),
+    ]
+
+    enriched = await enrich_read_at(
+        conn, Gateway(), 42, messages, dialog_type="user", read_at_ttl_seconds=600, checked_at=3_000
+    )
+
+    assert calls == [1, 2]
+    assert [message.read_at for message in enriched] == [1_700_000_001, None, None]
+    assert conn.execute(
+        "SELECT read_at, checked_at, status FROM message_read_facts WHERE dialog_id=42 AND message_id=1"
+    ).fetchone() == (1_700_000_001, 3_000, "complete")
+    assert conn.execute(
+        "SELECT COUNT(*) FROM message_read_facts WHERE dialog_id=42 AND message_id IN (2, 3)"
+    ).fetchone() == (0,)
+
+
 def test_v28_reaction_snapshot_projects_nullable_event_time_and_status_without_aggregate_time(
     make_synced_db: Callable[[], sqlite3.Connection],
 ) -> None:
     conn = make_synced_db()
-    persist_reaction_snapshots(
-        conn,
+    SQLiteReactionSnapshotRepository(conn).persist_reaction_snapshots(
         42,
         [
-            ReactionMessage(
+            ReactionSnapshot(
                 10,
-                (ReactionRecord(dialog_id=42, message_id=10, emoji="👍", count=2),),
+                (ReactionAggregate(emoji="👍", count=2),),
                 events=(
                     ReactionEvent(reactor_id=77, emoji="👍", reacted_at=1_700_000_100),
                     ReactionEvent(reactor_id=None, emoji="🔥", reacted_at=None),
@@ -417,7 +698,7 @@ def test_reading_query_modules_have_no_telethon_or_client_calls() -> None:
         Path("src/mcp_telegram/daemon_dialog_queries.py"),
         Path("src/mcp_telegram/daemon_read_state_queries.py"),
         Path("src/mcp_telegram/telegram_reading.py"),
-        Path("src/mcp_telegram/telegram_reaction_queries.py"),
+        Path("src/mcp_telegram/reactions/sqlite_repository.py"),
     ]
     for path in paths:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))

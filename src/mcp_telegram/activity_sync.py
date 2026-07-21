@@ -20,11 +20,9 @@ from telethon.tl.types import InputMessagesFilterEmpty, InputPeerEmpty, InputPee
 
 from .flood import flood_seconds, sleep_through_flood
 from .message_contracts import ExtractedMessage
+from .messages.sqlite_repository import insert_messages_with_fts
+from .messages.telegram_adapter import extract_message_row
 from .models import DialogType
-from .sync_worker import (
-    extract_message_row,
-    insert_messages_with_fts,
-)
 from .telethon_dialog import classify_dialog_type
 
 logger = logging.getLogger(__name__)

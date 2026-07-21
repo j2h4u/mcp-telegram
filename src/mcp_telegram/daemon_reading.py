@@ -55,14 +55,14 @@ from .pagination import (
     encode_history_navigation,
     encode_search_navigation,
 )
+from .reactions.contracts import ReactionFreshness
+from .reactions.refresh import ReactionFreshener
 from .resolver import latinize
 from .sync_db import open_sync_db_reader
 from .telegram_fact_queries import enrich_reaction_events, enrich_read_at, read_at_map
 from .telegram_fragments import FragmentContextService
-from .telegram_reactions import ReactionFreshener
 from .telegram_reading import (
     GatewayFailure,
-    ReactionFreshness,
     TelegramHistoryGateway,
     TelegramReadReceiptGateway,
 )
@@ -165,6 +165,7 @@ class DaemonReadingDeps:
     history_gateway: TelegramHistoryGateway
     logger: _LoggerLike
     rid: Callable[[], str]
+    read_at_ttl_seconds: int
     read_receipt_gateway: TelegramReadReceiptGateway | None = None
 
 
@@ -737,6 +738,7 @@ class DaemonReadingService:
             dialog_id,
             messages,
             dialog_type=_dialog_type_from_db(self._conn, dialog_id),
+            read_at_ttl_seconds=self._deps.read_at_ttl_seconds,
         )
         if log_rendered:
             _log_rendered_message_stats(self._logger, dialog_id, messages)

@@ -290,6 +290,7 @@ forbidden_modules = [
   "mcp_telegram.telegram",
   "mcp_telegram.tools",
   "mcp_telegram.server",
+  "mcp_telegram.messages",
 ]
 
 [[tool.importlinter.contracts]]
@@ -392,7 +393,7 @@ type = "forbidden"
 source_modules = ["mcp_telegram.tools"]
 forbidden_modules = [
   "mcp_telegram.telegram_fact_queries",
-  "mcp_telegram.telegram_reactions",
+  "mcp_telegram.reactions",
   "mcp_telegram.telegram_read_receipts",
   "mcp_telegram.telegram_history",
 ]
@@ -436,7 +437,7 @@ forbidden_modules = [
   "mcp_telegram.telegram_fragments",
   "mcp_telegram.telegram_gateway",
   "mcp_telegram.telegram_history",
-  "mcp_telegram.telegram_reactions",
+  "mcp_telegram.reactions",
   "mcp_telegram.telegram_read_receipts",
   "mcp_telegram.telegram_reading",
   "mcp_telegram.tools",
@@ -451,8 +452,7 @@ source_modules = [
   "mcp_telegram.telegram_fragments",
   "mcp_telegram.telegram_gateway",
   "mcp_telegram.telegram_history",
-  "mcp_telegram.telegram_reaction_queries",
-  "mcp_telegram.telegram_reactions",
+  "mcp_telegram.reactions",
   "mcp_telegram.telegram_read_receipts",
 ]
 forbidden_modules = [
@@ -463,6 +463,51 @@ forbidden_modules = [
   "mcp_telegram.tools",
   "mcp_telegram.__init__",
 ]
+
+[[tool.importlinter.contracts]]
+name = "Message capability stays below orchestration"
+type = "forbidden"
+source_modules = ["mcp_telegram.messages"]
+forbidden_modules = [
+  "mcp_telegram.daemon",
+  "mcp_telegram.daemon_api",
+  "mcp_telegram.daemon_client",
+  "mcp_telegram.server",
+  "mcp_telegram.sync_worker",
+  "mcp_telegram.tools",
+  "mcp_telegram.__init__",
+]
+
+[[tool.importlinter.contracts]]
+name = "Message Telegram adapter stays off SQLite repository"
+type = "forbidden"
+source_modules = ["mcp_telegram.messages.telegram_adapter"]
+forbidden_modules = ["mcp_telegram.messages.sqlite_repository"]
+
+[[tool.importlinter.contracts]]
+name = "Message SQLite repository stays off Telegram adapter"
+type = "forbidden"
+source_modules = ["mcp_telegram.messages.sqlite_repository"]
+forbidden_modules = ["mcp_telegram.messages.telegram_adapter"]
+
+[[tool.importlinter.contracts]]
+name = "Reaction application service stays off concrete adapters"
+type = "forbidden"
+source_modules = ["mcp_telegram.reactions.refresh"]
+forbidden_modules = [
+  "mcp_telegram.reactions.sqlite_repository",
+  "mcp_telegram.reactions.telegram_adapter",
+]
+
+[[tool.importlinter.contracts]]
+name = "Reaction aggregate consumers stay off the private SQLite adapter"
+type = "forbidden"
+source_modules = [
+  "mcp_telegram.sync_worker",
+  "mcp_telegram.event_handlers",
+  "mcp_telegram.telegram_fragments",
+]
+forbidden_modules = ["mcp_telegram.reactions.sqlite_repository"]
 
 [[tool.importlinter.contracts]]
 name = "Daemon query owners stay below orchestration"
@@ -483,3 +528,18 @@ forbidden_modules = [
   "mcp_telegram.tools",
   "mcp_telegram.__init__",
 ]
+
+[[tool.importlinter.contracts]]
+name = "Injected runtime policy stays independent of config loading"
+type = "forbidden"
+source_modules = [
+  "mcp_telegram.daemon_api",
+  "mcp_telegram.daemon_account_trace",
+  "mcp_telegram.daemon_entity_info",
+  "mcp_telegram.daemon_reading",
+  "mcp_telegram.resolver",
+  "mcp_telegram.telegram_fact_queries",
+  "mcp_telegram.state",
+]
+forbidden_modules = ["mcp_telegram.config"]
+allow_indirect_imports = false
