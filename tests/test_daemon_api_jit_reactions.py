@@ -649,6 +649,49 @@ async def test_list_unread_messages_injects_reactions(make_synced_db: Callable[[
     assert msgs
     assert all("reactions_display" in m for m in msgs)
     assert all(m["reactions_display"] for m in msgs)
+    freshness = cast(dict[str, object], groups[0]["reaction_freshness"])
+    assert freshness == {
+        "requested_count": 3,
+        "fresh_count": 3,
+        "stale_count": 0,
+        "refreshed_count": 0,
+        "status": "fresh",
+        "retry_after": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_unread_group_without_stored_messages_omits_freshness(
+    make_synced_db: Callable[[], sqlite3.Connection],
+) -> None:
+    """An allocated but empty group has no reaction-freshness claim."""
+    conn = make_synced_db()
+    dialog_id = 1001
+    _seed_synced(conn, dialog_id)
+
+    client = _TestClient()
+    client.get_messages = AsyncMock()
+    server = make_server(conn, client)
+    server.self_id = 99
+
+    groups = await server._fetch_unread_groups(
+        [
+            {
+                "chat_id": dialog_id,
+                "display_name": "Alice",
+                "tier": 1,
+                "category": "personal",
+                "unread_count": 1,
+                "unread_mentions_count": 0,
+                "read_inbox_max_id": 0,
+            }
+        ],
+        {dialog_id: 1},
+    )
+
+    assert groups[0]["messages"] == []
+    assert "reaction_freshness" not in groups[0]
+    assert cast(AsyncMock, client.get_messages).call_count == 0
 
 
 @pytest.mark.asyncio

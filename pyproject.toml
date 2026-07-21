@@ -206,13 +206,13 @@ ignore_missing_imports = true
 "*" = ["py.typed"]
 
 [tool.vulture]
-# models.py is excluded: it is a declarations-only schema module (TypedDict /
-# dataclass / StrEnum), where vulture only emits false "unused variable" findings
-# for schema fields and cannot see annotation-only type usage.
+# Declaration-only schema modules are excluded: vulture only emits false
+# "unused variable" findings for dataclass fields and cannot see annotation-only
+# type usage.
 # vulture_whitelist.py lists intentionally-retained symbols (text-rendering layer,
 # framework/dotMD false positives) so the advisory scan flags only NEW dead code.
 paths = ["src/mcp_telegram", "scripts", "vulture_whitelist.py"]
-exclude = ["src/mcp_telegram/models.py"]
+exclude = ["src/mcp_telegram/models.py", "src/mcp_telegram/telegram_reading.py"]
 min_confidence = 60
 # Entrypoints/callbacks registered via decorators look "unused" to vulture's static
 # scan; Pydantic validators are invoked by Pydantic, not called directly.

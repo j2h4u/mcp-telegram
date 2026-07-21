@@ -149,6 +149,7 @@ from .formatter import format_reaction_counts
 from .telegram_fragments import FragmentContextService, TelethonTelegramFragmentGateway
 from .telegram_history import TelethonTelegramHistoryGateway
 from .telegram_reactions import ReactionFreshener, TelethonTelegramReactionGateway
+from .telegram_reading import ReactionFreshness
 
 
 class _LoggerLike(Protocol):
@@ -1243,29 +1244,34 @@ class DaemonAPIServer:
                     },
                 ).fetchall(),
             )
-            msg_ids = [int(cast(int | str, r["message_id"])) for r in rows]
-            # Phase 39.2 Plan 02: per-dialog JIT freshen + reactions injection.
-            if msg_ids:
-                freshness = await self._reaction_freshener.refresh(chat_id, chat_id, msg_ids)
-                reaction_map = fetch_reaction_counts(self._conn, chat_id, msg_ids)
-                group_messages = [
-                    _read_message_from_row(
-                        r,
-                        reactions_display=format_reaction_counts(reaction_map[int(cast(int | str, r["message_id"]))])
-                        if int(cast(int | str, r["message_id"])) in reaction_map
-                        else "",
-                    )
-                    for r in rows
-                ]
-            else:
-                freshness = None
-                group_messages = [_read_message_from_row(r) for r in rows]
+            group_messages, freshness = await self._enrich_unread_rows(chat_id, rows)
             group["messages"] = [dataclasses.asdict(m) for m in group_messages]
             if freshness is not None:
                 group["reaction_freshness"] = freshness.as_dict()
             groups.append(group)
 
         return groups
+
+    async def _enrich_unread_rows(
+        self,
+        dialog_id: int,
+        rows: list[Mapping[str, object]],
+    ) -> tuple[list[ReadMessage], ReactionFreshness | None]:
+        """Freshen and render reactions for one unread group."""
+        message_ids = [int(cast(int | str, row["message_id"])) for row in rows]
+        if not message_ids:
+            return [_read_message_from_row(row) for row in rows], None
+
+        freshness = await self._reaction_freshener.refresh(dialog_id, dialog_id, message_ids)
+        reaction_map = fetch_reaction_counts(self._conn, dialog_id, message_ids)
+        messages = [
+            _read_message_from_row(
+                row,
+                reactions_display=format_reaction_counts(reaction_map.get(int(cast(int | str, row["message_id"])), [])),
+            )
+            for row in rows
+        ]
+        return messages, freshness
 
     # ------------------------------------------------------------------
     # record_telemetry
