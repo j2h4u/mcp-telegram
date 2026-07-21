@@ -2842,7 +2842,11 @@ async def test_record_telemetry_prunes_only_rows_older_than_retention_boundary()
         )
 
     assert result == {"ok": True}
-    assert [row[0] for row in conn.execute("SELECT tool_name FROM telemetry_events ORDER BY tool_name")] == [
+    tool_name_rows = cast(
+        list[tuple[str]],
+        conn.execute("SELECT tool_name FROM telemetry_events ORDER BY tool_name").fetchall(),
+    )
+    assert [row[0] for row in tool_name_rows] == [
         "AtBoundary",
         "Current",
     ]
