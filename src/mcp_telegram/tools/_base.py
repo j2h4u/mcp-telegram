@@ -16,9 +16,15 @@ from mcp.types import (
     Tool,
     ToolAnnotations,
 )
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ..daemon_client import DaemonConnection, DaemonNotRunningError, daemon_connection
+from ..temporal import (
+    normalize_temporal_output_schema,
+    project_temporal_response,
+    response_timezone,
+    validate_timezone,
+)
 
 __all__ = ["DaemonConnection", "DaemonNotRunningError", "daemon_connection"]
 
@@ -44,6 +50,19 @@ _DAEMON_NOT_RUNNING_TEXT_BY_KIND = {
 
 class ToolArgs(BaseModel):
     model_config = ConfigDict()
+
+    timezone: str = Field(
+        default="UTC",
+        description=(
+            "IANA timezone used only to render timestamps in this response. "
+            "Defaults to UTC and never changes UTC query boundaries."
+        ),
+    )
+
+    @field_validator("timezone")
+    @classmethod
+    def _validate_timezone(cls, value: str) -> str:
+        return validate_timezone(value)
 
 
 class ToolResultMetadata(TypedDict, total=False):
@@ -132,7 +151,8 @@ class ToolRegistryEntry:
 
 def structured_result(structured_content: Mapping[str, object], **metadata: Unpack[ToolResultMetadata]) -> ToolResult:
     """Return a successful structured-only tool result."""
-    return ToolResult(content=(), structured_content=dict(structured_content), **metadata)
+    content = project_temporal_response(dict(structured_content), response_timezone.get())
+    return ToolResult(content=(), structured_content=content, **metadata)
 
 
 def error_result(text: str, **metadata: Unpack[ToolResultMetadata]) -> ToolResult:
@@ -174,6 +194,7 @@ def _track_tool_telemetry(tool_name: str) -> t.Callable[[ToolRunnerFunc[ToolArgT
             start_time = time.monotonic()
             error_type = None
             tool_result: ToolResult | None = None
+            timezone_token = response_timezone.set(args.timezone)
             try:
                 tool_result = await fn(args)
                 return tool_result  # noqa: RET504
@@ -181,6 +202,7 @@ def _track_tool_telemetry(tool_name: str) -> t.Callable[[ToolRunnerFunc[ToolArgT
                 error_type = type(exc).__name__
                 raise
             finally:
+                response_timezone.reset(timezone_token)
                 duration_ms = (time.monotonic() - start_time) * 1000
                 try:
                     task = asyncio.create_task(
@@ -287,7 +309,7 @@ def mcp_tool(
             annotations=annotations,
             exported_name=exported_name,
             title=exported_title or cls.__name__,
-            output_schema=output_schema,
+            output_schema=normalize_temporal_output_schema(output_schema),
         )
         return wrapped
 

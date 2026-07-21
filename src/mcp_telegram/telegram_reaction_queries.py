@@ -48,6 +48,42 @@ def persist_reaction_snapshots(
                 item.message_id,
                 [replace(row, dialog_id=dialog_id, message_id=item.message_id) for row in item.rows],
             )
+            # Individual reaction details are a separate, best-effort fact
+            # stream.  Aggregate counters remain authoritative even when the
+            # details endpoint is private/too old/unavailable.
+            try:
+                # Replace the detail snapshot even for an unavailable probe:
+                # stale rows must not be presented as current Telegram facts.
+                conn.execute(
+                    "DELETE FROM message_reaction_events WHERE dialog_id = ? AND message_id = ?",
+                    (dialog_id, item.message_id),
+                )
+                if item.events_status != "unavailable":
+                    conn.executemany(
+                        "INSERT INTO message_reaction_events "
+                        "(dialog_id, message_id, reactor_id, emoji, reacted_at, fetched_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        [
+                            (
+                                dialog_id,
+                                item.message_id,
+                                event.reactor_id,
+                                event.emoji,
+                                event.reacted_at,
+                                checked_at,
+                            )
+                            for event in item.events
+                        ],
+                    )
+                conn.execute(
+                    "INSERT OR REPLACE INTO message_reaction_event_status "
+                    "(dialog_id, message_id, checked_at, status, returned_count) VALUES (?, ?, ?, ?, ?)",
+                    (dialog_id, item.message_id, checked_at, item.events_status, len(item.events)),
+                )
+            except sqlite3.OperationalError:
+                # Aggregate reaction freshness remains usable for lightweight
+                # pre-v28 databases that do not have the detail tables yet.
+                pass
             conn.execute(
                 "INSERT OR REPLACE INTO message_reactions_freshness (dialog_id, message_id, checked_at) VALUES (?, ?, ?)",
                 (dialog_id, item.message_id, checked_at),

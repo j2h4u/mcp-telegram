@@ -1,7 +1,8 @@
+from collections.abc import Mapping
 from dataclasses import dataclass
 from dataclasses import fields as dataclass_fields
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Literal, cast
 
 from pydantic import Field, model_validator
 
@@ -13,9 +14,10 @@ from ..formatter import (
     frame_telegram_snippet,
     resolve_sender_label,
 )
-from ..models import DialogType, ReadMessage
+from ..models import DialogType, ReadMessage, ReadReactionEvent
 from ..pagination import NavigationToken
 from ..resolver import parse_exact_dialog_id
+from ..temporal import parse_utc_boundary
 from ._base import (
     DaemonNotRunningError,
     ToolAnnotations,
@@ -234,6 +236,8 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
                     "enum": ["sent", "scheduled", "all"],
                     "description": "Lifecycle filter: published history, pending author-only outbox, or both.",
                 },
+                "since_utc": {"type": ["string", "null"]},
+                "until_utc": {"type": ["string", "null"]},
             },
             "required": [
                 "dialog",
@@ -247,6 +251,8 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
                 "unread",
                 "anchor_message_id",
                 "message_state",
+                "since_utc",
+                "until_utc",
             ],
             "additionalProperties": False,
         },
@@ -325,6 +331,21 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
                     "post_author": {"type": "string"},
                     "edit_date": {"type": "integer"},
                     "reactions": {"type": "object"},
+                    "reaction_events": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "reactor_id": {"type": ["integer", "null"]},
+                                "emoji": {"type": "string"},
+                                "reacted_at": {"type": ["integer", "null"]},
+                            },
+                            "required": ["reactor_id", "emoji", "reacted_at"],
+                            "additionalProperties": False,
+                        },
+                    },
+                    "reaction_events_status": {"type": "string"},
+                    "read_at": {"type": ["integer", "null"]},
                     "read_markers": {"type": "array", "items": {"type": "object"}},
                     "message_state": {"type": "string", "enum": ["sent", "scheduled"]},
                     "visibility": {
@@ -354,6 +375,9 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
                     "scheduled_at",
                     "published_at",
                     "inclusion_basis",
+                    "reaction_events",
+                    "reaction_events_status",
+                    "read_at",
                 ],
                 "additionalProperties": False,
             },
@@ -546,6 +570,25 @@ def _structured_reactions(display: str | None) -> dict[str, object] | None:
     }
 
 
+def _reaction_event_payload(event: object) -> dict[str, object]:
+    if isinstance(event, Mapping):
+        return {
+            "reactor_id": event.get("reactor_id"),
+            "emoji": event.get("emoji"),
+            "reacted_at": event.get("reacted_at"),
+        }
+    typed_event = cast("ReadReactionEvent", event)
+    return {
+        "reactor_id": typed_event.reactor_id,
+        "emoji": typed_event.emoji,
+        "reacted_at": typed_event.reacted_at,
+    }
+
+
+def _structured_reaction_events(message: ReadMessage) -> list[dict[str, object]]:
+    return [_reaction_event_payload(event) for event in message.reaction_events]
+
+
 def _structured_topic(message: ReadMessage) -> dict[str, object] | None:
     if message.forum_topic_id is None and not message.topic_title:
         return None
@@ -587,6 +630,9 @@ def _list_message_structured_item(
         "scheduled_at": lifecycle["scheduled_at"],
         "published_at": lifecycle["published_at"],
         "inclusion_basis": lifecycle.get("inclusion_basis") or [],
+        "reaction_events": _structured_reaction_events(message),
+        "reaction_events_status": message.reaction_events_status,
+        "read_at": message.read_at,
     }
     if message.effective_sender_id is not None and message.effective_sender_id != message.sender_id:
         item["effective_sender_id"] = message.effective_sender_id
@@ -724,6 +770,8 @@ def _list_messages_structured_content(ctx: _ListMessagesStructuredContentContext
             "unread": args.unread,
             "anchor_message_id": args.anchor_message_id,
             "message_state": args.message_state,
+            "since_utc": args.since_utc,
+            "until_utc": args.until_utc,
         },
         "limits": {
             "requested_limit": args.limit,
@@ -778,8 +826,10 @@ SEARCH_MESSAGES_OUTPUT_SCHEMA = {
                 "global": {"type": "boolean"},
                 "message_state": {"type": "string", "enum": ["sent", "scheduled", "all"]},
                 "ownership": {"type": "string", "enum": ["all", "own_only"]},
+                "since_utc": {"type": ["string", "null"]},
+                "until_utc": {"type": ["string", "null"]},
             },
-            "required": ["dialog", "dialog_id", "global", "message_state", "ownership"],
+            "required": ["dialog", "dialog_id", "global", "message_state", "ownership", "since_utc", "until_utc"],
             "additionalProperties": False,
         },
         "source": {"type": "string"},
@@ -824,7 +874,9 @@ SEARCH_MESSAGES_OUTPUT_SCHEMA = {
                     "dialog_id": {"type": "integer"},
                     "dialog_name": {"type": ["string", "null"]},
                     "msg_id": {"type": "integer"},
-                    "date": {"type": ["string", "null"]},
+                    # Keep the canonical Unix moment internally; the shared temporal
+                    # projection renders this as ISO-8601 in the requested timezone.
+                    "date": {"type": ["integer", "null"]},
                     "sender": {"type": ["string", "null"]},
                     "content": {"type": "object"},
                     "anchor_call": {"type": "object"},
@@ -839,6 +891,21 @@ SEARCH_MESSAGES_OUTPUT_SCHEMA = {
                     "scheduled_at": {"type": ["integer", "null"]},
                     "published_at": {"type": ["integer", "null"]},
                     "inclusion_basis": {"type": "array", "items": {"type": "string"}},
+                    "reaction_events": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "reactor_id": {"type": ["integer", "null"]},
+                                "emoji": {"type": "string"},
+                                "reacted_at": {"type": ["integer", "null"]},
+                            },
+                            "required": ["reactor_id", "emoji", "reacted_at"],
+                            "additionalProperties": False,
+                        },
+                    },
+                    "reaction_events_status": {"type": "string"},
+                    "read_at": {"type": ["integer", "null"]},
                 },
                 "required": [
                     "dialog_id",
@@ -854,6 +921,9 @@ SEARCH_MESSAGES_OUTPUT_SCHEMA = {
                     "scheduled_at",
                     "published_at",
                     "inclusion_basis",
+                    "reaction_events",
+                    "reaction_events_status",
+                    "read_at",
                 ],
                 "additionalProperties": False,
             },
@@ -946,13 +1016,18 @@ def _search_result_render_fields(row: dict, dialog_id: int) -> dict[str, object]
     }
 
 
+def _search_result_date(row: dict) -> int | None:
+    sent_at = row.get("sent_at")
+    return int(sent_at) if sent_at is not None else None
+
+
+def _search_result_reaction_events(row: dict) -> list[dict[str, object]]:
+    return [_reaction_event_payload(event) for event in (row.get("reaction_events") or ())]
+
+
 def _search_result_structured_rows(rows: list[dict], query: str) -> list[dict[str, object]]:
     results: list[dict[str, object]] = []
     for row in rows:
-        sent_at = row.get("sent_at")
-        date: str | None = None
-        if sent_at is not None:
-            date = datetime.fromtimestamp(int(sent_at), tz=UTC).strftime("%Y-%m-%d %H:%M")
         snippet = _extract_snippet(row.get("text"), query)
         dialog_id = int(row.get("dialog_id") or 0)
         results.append(
@@ -960,10 +1035,15 @@ def _search_result_structured_rows(rows: list[dict], query: str) -> list[dict[st
                 "dialog_id": dialog_id,
                 "dialog_name": row.get("dialog_name"),
                 "msg_id": row["message_id"],
-                "date": date,
+                # Leave the canonical epoch untouched until structured_result applies
+                # the request's timezone to every temporal field consistently.
+                "date": _search_result_date(row),
                 "sender": resolve_sender_label(row),
                 "content": telegram_content(snippet, "snippet"),
                 **_search_result_render_fields(row, dialog_id),
+                "reaction_events": _search_result_reaction_events(row),
+                "reaction_events_status": row.get("reaction_events_status", "unavailable"),
+                "read_at": row.get("read_at"),
             }
         )
     return results
@@ -1007,6 +1087,8 @@ def _search_scope_payload(ctx: _SearchStructuredContentContext) -> dict[str, obj
         "global": ctx.global_mode,
         "message_state": ctx.args.message_state,
         "ownership": "own_only" if ctx.args.message_state == "scheduled" else "all",
+        "since_utc": ctx.args.since_utc,
+        "until_utc": ctx.args.until_utc,
     }
 
 
@@ -1023,6 +1105,10 @@ def _search_navigation_error(
         return "Navigation token belongs to a different search query"
     if navigation.message_state != args.message_state:
         return f"Navigation token belongs to message_state {navigation.message_state!r}, not {args.message_state!r}"
+    since_utc = parse_utc_boundary(args.since_utc, field="since_utc")
+    until_utc = parse_utc_boundary(args.until_utc, field="until_utc")
+    if navigation.since_utc != since_utc or navigation.until_utc != until_utc:
+        return "Navigation token belongs to a different UTC time range"
     if (global_mode and navigation.dialog_id != 0) or (dialog_id is not None and navigation.dialog_id != dialog_id):
         return "Navigation token belongs to a different dialog scope"
     return None
@@ -1194,7 +1280,9 @@ class ListMessages(ToolArgs):
     search_messages to read context around a hit; that path requires a synced
     dialog and exact_dialog_id.
 
-    Supports sender, topic/exact_topic_id, and unread filters. DM rows include
+    Supports sender, topic/exact_topic_id, unread, and absolute UTC time-bound
+    filters. ``since_utc`` is inclusive and ``until_utc`` is exclusive; both
+    require RFC3339 timestamps with a UTC offset (``Z`` or ``+00:00``). DM rows include
     read_state plus inline read markers. Fragment coverage means a targeted
     snippet, not full chat history. Use message_state="scheduled" for pending
     future outbox rows or "all" to combine them with published history. Scheduled
@@ -1262,6 +1350,14 @@ class ListMessages(ToolArgs):
         le=50,
         description="Number of messages to return around anchor_message_id (default 10).",
     )
+    since_utc: str | None = Field(
+        default=None,
+        description="Inclusive RFC3339 UTC lower bound (Z or +00:00). Results use [since_utc, until_utc).",
+    )
+    until_utc: str | None = Field(
+        default=None,
+        description="Exclusive RFC3339 UTC upper bound (Z or +00:00). Results use [since_utc, until_utc).",
+    )
     message_state: Literal["sent", "scheduled", "all"] = Field(
         default="sent",
         description=(
@@ -1273,19 +1369,35 @@ class ListMessages(ToolArgs):
     @model_validator(mode="after")
     def validate_direct_read_selectors(self) -> ListMessages:
         """Reject missing or conflicting selector combinations."""
-        if self.dialog is None and self.exact_dialog_id is None:
-            raise ValueError("Provide either dialog or exact_dialog_id.")
-        if self.dialog is not None and self.exact_dialog_id is not None:
-            raise ValueError("dialog and exact_dialog_id are mutually exclusive.")
-        if self.topic is not None and self.exact_topic_id is not None:
-            raise ValueError("topic and exact_topic_id are mutually exclusive.")
+        _validate_dialog_selectors(self)
+        _validate_topic_selectors(self)
         _validate_message_state_selector(self)
+        _validate_utc_range(self)
         return self
+
+
+def _validate_dialog_selectors(args: ListMessages) -> None:
+    if args.dialog is None and args.exact_dialog_id is None:
+        raise ValueError("Provide either dialog or exact_dialog_id.")
+    if args.dialog is not None and args.exact_dialog_id is not None:
+        raise ValueError("dialog and exact_dialog_id are mutually exclusive.")
+
+
+def _validate_topic_selectors(args: ListMessages) -> None:
+    if args.topic is not None and args.exact_topic_id is not None:
+        raise ValueError("topic and exact_topic_id are mutually exclusive.")
 
 
 def _validate_message_state_selector(args: ListMessages) -> None:
     if args.message_state != "sent" and args.anchor_message_id is not None:
         raise ValueError("anchor_message_id is only supported for published sent history.")
+
+
+def _validate_utc_range(args: ListMessages) -> None:
+    since = parse_utc_boundary(args.since_utc, field="since_utc")
+    until = parse_utc_boundary(args.until_utc, field="until_utc")
+    if since is not None and until is not None and since >= until:
+        raise ValueError("since_utc must be earlier than until_utc.")
 
 
 async def _resolve_topic_id(
@@ -1392,7 +1504,13 @@ def _list_messages_request_context(args: ListMessages) -> _ListMessagesRequestCo
 
 def _list_messages_has_filter(args: ListMessages) -> bool:
     return bool(
-        args.sender or args.topic or args.exact_topic_id is not None or args.unread or args.message_state != "sent"
+        args.sender
+        or args.topic
+        or args.exact_topic_id is not None
+        or args.unread
+        or args.message_state != "sent"
+        or args.since_utc is not None
+        or args.until_utc is not None
     )
 
 
@@ -1484,6 +1602,8 @@ async def list_messages(args: ListMessages) -> ToolResult:
                 context_message_id=args.anchor_message_id,
                 context_size=args.context_size if args.anchor_message_id else None,
                 message_state=args.message_state,
+                since_utc=args.since_utc,
+                until_utc=args.until_utc,
             )
     except DaemonNotRunningError:
         return error_result(_daemon_not_running_text())
@@ -1539,6 +1659,9 @@ class SearchMessages(ToolArgs):
     - Without dialog: searches across all synced dialogs. Each result includes the dialog name.
     - With dialog: scoped to that dialog only.
 
+    Optional ``since_utc`` (inclusive) and ``until_utc`` (exclusive) filters
+    require RFC3339 timestamps with an explicit UTC offset (``Z`` or ``+00:00``).
+
     Each result is a compact one-liner with a msg_id: anchor:
       [Dialog] 2024-01-15 14:32 Ivan (msg_id:42): "...snippet..."
 
@@ -1577,6 +1700,22 @@ class SearchMessages(ToolArgs):
             "pending future author-only outbox rows or all for both."
         ),
     )
+    since_utc: str | None = Field(
+        default=None,
+        description="Inclusive RFC3339 UTC lower bound (Z or +00:00). Results use [since_utc, until_utc).",
+    )
+    until_utc: str | None = Field(
+        default=None,
+        description="Exclusive RFC3339 UTC upper bound (Z or +00:00). Results use [since_utc, until_utc).",
+    )
+
+    @model_validator(mode="after")
+    def validate_time_range(self) -> SearchMessages:
+        since = parse_utc_boundary(self.since_utc, field="since_utc")
+        until = parse_utc_boundary(self.until_utc, field="until_utc")
+        if since is not None and until is not None and since >= until:
+            raise ValueError("since_utc must be earlier than until_utc.")
+        return self
 
 
 @mcp_tool(
@@ -1610,6 +1749,8 @@ async def search_messages(args: SearchMessages) -> ToolResult:
                 offset=request_context.offset,
                 navigation=args.navigation,
                 message_state=args.message_state,
+                since_utc=args.since_utc,
+                until_utc=args.until_utc,
             )
     except DaemonNotRunningError:
         return error_result(_daemon_not_running_text())

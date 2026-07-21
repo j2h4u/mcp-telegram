@@ -1,5 +1,6 @@
 import time
 import typing as t
+from collections.abc import Mapping
 
 from pydantic import Field
 
@@ -129,7 +130,10 @@ GET_INBOX_OUTPUT_SCHEMA = {
                                 "sender_id": {"type": ["integer", "null"]},
                                 "effective_sender_id": {"type": ["integer", "null"]},
                                 "out": {"type": "boolean"},
-                                "date": {"type": ["string", "null"]},
+                                # Keep Unix seconds at the internal tool boundary so
+                                # the shared temporal presentation layer can render
+                                # the requested timezone in the MCP response.
+                                "date": {"type": ["integer", "null"]},
                                 "text": {"type": "string"},
                                 "content": {"type": ["object", "null"]},
                                 "media_description": {"type": ["string", "null"]},
@@ -137,6 +141,21 @@ GET_INBOX_OUTPUT_SCHEMA = {
                                 "reply_to_msg_id": {"type": ["integer", "null"]},
                                 "edit_date": {"type": ["integer", "null"]},
                                 "reactions": {"type": ["object", "null"]},
+                                "reaction_events": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "reactor_id": {"type": ["integer", "null"]},
+                                            "emoji": {"type": "string"},
+                                            "reacted_at": {"type": ["integer", "null"]},
+                                        },
+                                        "required": ["reactor_id", "emoji", "reacted_at"],
+                                        "additionalProperties": False,
+                                    },
+                                },
+                                "reaction_events_status": {"type": "string"},
+                                "read_at": {"type": ["integer", "null"]},
                                 "read_markers": {"type": "array", "items": {"type": "object"}},
                                 "inline_markers": {"type": "array", "items": {"type": "object"}},
                             },
@@ -154,6 +173,9 @@ GET_INBOX_OUTPUT_SCHEMA = {
                                 "reply_to_msg_id",
                                 "edit_date",
                                 "reactions",
+                                "reaction_events",
+                                "reaction_events_status",
+                                "read_at",
                                 "read_markers",
                                 "inline_markers",
                             ],
@@ -222,14 +244,14 @@ class GetInbox(ToolArgs):
     )
 
 
-def _message_date(sent_at: object) -> str | None:
-    if sent_at is None:
+def _message_date(sent_at: object) -> int | None:
+    if sent_at is None or isinstance(sent_at, bool):
+        return None
+    if not isinstance(sent_at, (int, float, str, bytes, bytearray)):
         return None
     try:
-        return str(sent_at)
-    except TypeError:
-        return None
-    except ValueError:
+        return int(sent_at)
+    except TypeError, ValueError, OverflowError:
         return None
 
 
@@ -286,6 +308,17 @@ def _structured_reactions(display: str | None) -> dict[str, object] | None:
         "display": display,
         "content": _content_or_none(display, "reaction"),
     }
+
+
+def _structured_reaction_events(message: ReadMessage) -> list[dict[str, object]]:
+    return [
+        {
+            "reactor_id": event.get("reactor_id") if isinstance(event, Mapping) else event.reactor_id,
+            "emoji": event.get("emoji") if isinstance(event, Mapping) else event.emoji,
+            "reacted_at": event.get("reacted_at") if isinstance(event, Mapping) else event.reacted_at,
+        }
+        for event in message.reaction_events
+    ]
 
 
 def _structured_read_marker(message_id: int, label: str) -> dict[str, object]:
@@ -410,6 +443,9 @@ def _structured_messages(
                 "reply_to_msg_id": message.reply_to_msg_id,
                 "edit_date": message.edit_date,
                 "reactions": _structured_reactions(message.reactions_display),
+                "reaction_events": _structured_reaction_events(message),
+                "reaction_events_status": message.reaction_events_status,
+                "read_at": message.read_at,
                 "read_markers": read_markers,
                 "inline_markers": read_markers,
             }

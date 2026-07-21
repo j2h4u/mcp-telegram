@@ -305,7 +305,7 @@ def test_schema_version_records_current_v18(tmp_path: Path) -> None:
     with _sync_db_connection(db_path) as conn:
         max_version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
         assert max_version == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 27  # v27 scheduled-message mirror
+        assert _CURRENT_SCHEMA_VERSION == 28  # v28 reaction/read event facts
 
 
 def test_current_schema_repairs_missing_scheduled_fts(tmp_path: Path) -> None:
@@ -1039,12 +1039,12 @@ def _make_v24_db(tmp_path: Path) -> Path:
 
 
 def test_migration_schema_version_is_current(tmp_path: Path) -> None:
-    """After all migrations, MAX(schema_version) == _CURRENT_SCHEMA_VERSION (27)."""
+    """After all migrations, MAX(schema_version) == _CURRENT_SCHEMA_VERSION (28)."""
     db_path = _make_v24_db(tmp_path)
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
         assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 27
+        assert _CURRENT_SCHEMA_VERSION == 28
 
 
 def test_migration_v26_remarks_known_channel_and_chat_forwards(tmp_path: Path) -> None:

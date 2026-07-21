@@ -23,6 +23,8 @@ class _ListMessagesDbRequest(Protocol):
     sender_name: str | None
     topic_id: int | None
     unread_after_id: int | None
+    since_utc: int | None
+    until_utc: int | None
 
 
 def _row_value(row: object, key: str, default: object | None = None) -> object | None:
@@ -59,6 +61,7 @@ def _read_message_from_row(row: Mapping[str, object], *, reactions_display: str 
         out=_coerce_int(cast(object, _row_value(row, "out", 0)), 0),
         fwd_from_name=cast(str | None, _row_value(row, "fwd_from_name")),
         post_author=cast(str | None, _row_value(row, "post_author")),
+        read_at=cast(int | None, _row_value(row, "read_at")),
         reactions_display=reactions_display,
         dialog_name=cast(str | None, _row_value(row, "dialog_name")),
     )
@@ -112,6 +115,8 @@ _SELECT_FTS_SQL = (
     f"JOIN messages m ON m.dialog_id = f.dialog_id AND m.message_id = f.message_id "
     f"{_SENDER_ENTITY_JOINS_SQL}"
     f"WHERE messages_fts MATCH :query AND f.dialog_id = :dialog_id "
+    f"AND (:since_utc IS NULL OR m.sent_at >= :since_utc) "
+    f"AND (:until_utc IS NULL OR m.sent_at < :until_utc) "
     f"ORDER BY rank LIMIT :limit OFFSET :offset"
 )
 
@@ -128,6 +133,8 @@ _SELECT_FTS_ALL_SQL = (
     f"LEFT JOIN entities de ON de.id = f.dialog_id "
     f"{_SENDER_ENTITY_JOINS_SQL}"
     f"WHERE messages_fts MATCH :query "
+    f"AND (:since_utc IS NULL OR m.sent_at >= :since_utc) "
+    f"AND (:until_utc IS NULL OR m.sent_at < :until_utc) "
     f"ORDER BY rank LIMIT :limit OFFSET :offset"
 )
 
@@ -172,7 +179,11 @@ def _assert_select_columns_match_read_message() -> None:
     """Verify SELECT aliases in _LIST_MESSAGES_BASE_SQL cover ReadMessage fields."""
     from dataclasses import fields as dc_fields
 
-    expected = frozenset(f.name for f in dc_fields(ReadMessage) if f.name not in {"reactions_display", "dialog_name"})
+    expected = frozenset(
+        f.name
+        for f in dc_fields(ReadMessage)
+        if f.name not in {"reactions_display", "dialog_name", "read_at", "reaction_events", "reaction_events_status"}
+    )
     aliases = frozenset(re.findall(r"\bAS\s+(\w+)", _LIST_MESSAGES_BASE_SQL))
     bare = frozenset(re.findall(r"\b(?:m|mf)\.(\w+)\b", _LIST_MESSAGES_BASE_SQL))
     found = aliases | bare
@@ -223,9 +234,22 @@ def _build_list_messages_query(req: _ListMessagesDbRequest) -> tuple[str, dict[s
     sender_name = req.sender_name
     topic_id = req.topic_id
     unread_after_id = req.unread_after_id
+    since_utc = getattr(req, "since_utc", None)
+    until_utc = getattr(req, "until_utc", None)
 
-    params: dict[str, object] = {"dialog_id": dialog_id, "limit": limit, "self_id": self_id}
+    params: dict[str, object] = {
+        "dialog_id": dialog_id,
+        "limit": limit,
+        "self_id": self_id,
+    }
     sql = _LIST_MESSAGES_BASE_SQL
+
+    if since_utc is not None:
+        sql += " AND m.sent_at >= :since_utc"
+        params["since_utc"] = since_utc
+    if until_utc is not None:
+        sql += " AND m.sent_at < :until_utc"
+        params["until_utc"] = until_utc
 
     if sender_id is not None:
         sql += " AND m.sender_id = :filter_sender_id"
@@ -263,6 +287,8 @@ def _build_list_messages_query(req: _ListMessagesDbRequest) -> tuple[str, dict[s
                 ("topic_id", topic_id),
                 ("unread_after_id", unread_after_id),
                 ("anchor", anchor_msg_id),
+                ("since_utc", since_utc),
+                ("until_utc", until_utc),
             ]
             if v is not None
         )

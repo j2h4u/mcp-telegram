@@ -76,8 +76,8 @@ and Telegram-originated content.
 | --- | --- |
 | `list_dialogs` | List dialogs with type, unread counters, sync status, draft text, and cached metadata. |
 | `list_topics` | List forum topics for a dialog. |
-| `list_messages` | Read one dialog in chronological order within each page, with pagination, topic/sender/unread filters, reply refs, reactions, read-state markers, and archive coverage. |
-| `search_messages` | Full-text search across synced dialogs or within one dialog; results include anchors for `list_messages`. |
+| `list_messages` | Read one dialog in chronological order within each page, with pagination, topic/sender/unread filters, UTC time bounds, reply refs, reactions, read-state markers, and archive coverage. |
+| `search_messages` | Full-text search across synced dialogs or within one dialog, with optional UTC time bounds; results include anchors for `list_messages`. |
 | `get_inbox` | Fetch unread messages from personal chats and small groups with budgeted per-dialog output. |
 | `get_entity_info` | Inspect a Telegram user, bot, channel, supergroup, or legacy chat. |
 | `get_my_recent_activity` | Show messages you sent recently; defaults to group/forum chats and includes dialog kind, reactions, and reply counts. |
@@ -97,6 +97,23 @@ Search, then read context:
 search_messages(query="contract")
 list_messages(exact_dialog_id=<hit.dialog_id>, anchor_message_id=<hit.msg_id>)
 ```
+
+Both reading tools accept optional absolute `since_utc` (inclusive) and
+`until_utc` (exclusive) boundaries. Values must be RFC3339 timestamps with an
+explicit UTC offset (`Z` or `+00:00`), for example:
+
+```text
+search_messages(
+    query="contract",
+    since_utc="2026-01-01T00:00:00Z",
+    until_utc="2026-02-01T00:00:00Z",
+)
+```
+
+Continuation tokens are bound to the time range that created them; reuse the
+same boundaries when requesting the next page. The selected lifecycle state's
+timestamp is filtered (`sent_at` for published messages and `scheduled_at` for
+scheduled messages), using the half-open interval `[since_utc, until_utc)`.
 
 Read the latest page of a chat:
 

@@ -8,7 +8,7 @@ from typing import cast
 
 from .state import get_state_dir
 
-_CURRENT_SCHEMA_VERSION = 27
+_CURRENT_SCHEMA_VERSION = 28
 _SCHEMA_VERSION_WITH_FTS = 3
 
 logger = logging.getLogger(__name__)
@@ -455,6 +455,54 @@ CREATE TABLE IF NOT EXISTS scheduled_messages (
     updated_at                  INTEGER NOT NULL,
     PRIMARY KEY (dialog_id, message_id)
 ) WITHOUT ROWID
+"""
+
+# v28: daemon-owned Telegram event facts. Aggregate reaction counters remain in
+# message_reactions; these side tables retain individual reaction observations
+# and the checked/available state of outbox read-date probes independently of
+# message rows, so legacy/custom read projections remain compatible.
+_MESSAGE_REACTION_EVENTS_DDL = """
+CREATE TABLE IF NOT EXISTS message_reaction_events (
+    event_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+    dialog_id   INTEGER NOT NULL,
+    message_id  INTEGER NOT NULL,
+    reactor_id  INTEGER,
+    emoji       TEXT NOT NULL,
+    reacted_at  INTEGER,
+    fetched_at  INTEGER NOT NULL
+)
+"""
+
+_MESSAGE_REACTION_EVENTS_INDEX_DDL = """
+CREATE INDEX IF NOT EXISTS idx_message_reaction_events_message
+ON message_reaction_events(dialog_id, message_id, fetched_at)
+"""
+
+_MESSAGE_REACTION_EVENT_STATUS_DDL = """
+CREATE TABLE IF NOT EXISTS message_reaction_event_status (
+    dialog_id     INTEGER NOT NULL,
+    message_id    INTEGER NOT NULL,
+    checked_at    INTEGER NOT NULL,
+    status        TEXT NOT NULL,
+    returned_count INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (dialog_id, message_id)
+) WITHOUT ROWID
+"""
+
+_MESSAGE_READ_FACTS_DDL = """
+CREATE TABLE IF NOT EXISTS message_read_facts (
+    dialog_id  INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    read_at    INTEGER,
+    checked_at INTEGER NOT NULL,
+    status     TEXT NOT NULL,
+    PRIMARY KEY (dialog_id, message_id)
+) WITHOUT ROWID
+"""
+
+_MESSAGE_READ_FACTS_INDEX_DDL = """
+CREATE INDEX IF NOT EXISTS idx_message_read_facts_checked
+ON message_read_facts(dialog_id, checked_at)
 """
 
 _SCHEDULED_MESSAGES_ACTIVE_INDEX_DDL = """
@@ -980,7 +1028,7 @@ def _apply_migrations_16_to_20(conn: sqlite3.Connection, current: int) -> int:
     return _apply_migration(conn, current, 20, [_DIALOGS_NEEDS_REFRESH_INDEX_DDL])
 
 
-def _apply_migrations_21_to_27(conn: sqlite3.Connection, current: int) -> int:
+def _apply_migrations_21_to_28(conn: sqlite3.Connection, current: int) -> int:
     # v21 (Phase 51): target-specific trace coverage. synced_dialogs.status
     # describes broad dialog lifecycle; account traces need per-target,
     # per-dialog/topic coverage attempts to avoid false completeness claims.
@@ -1130,7 +1178,7 @@ def _apply_migrations_21_to_27(conn: sqlite3.Connection, current: int) -> int:
     # mutable future objects; keeping them out of messages/FTS/unread avoids
     # presenting unpublished content as sent history. The sync-state row stores
     # account-level FloodWait backoff for snapshot reconciliation.
-    return _apply_migration(
+    current = _apply_migration(
         conn,
         current,
         27,
@@ -1141,6 +1189,22 @@ def _apply_migrations_21_to_27(conn: sqlite3.Connection, current: int) -> int:
             _SCHEDULED_MESSAGES_FTS_DDL,
             _SCHEDULED_SYNC_STATE_DDL,
             _SCHEDULED_SYNC_STATE_SEED,
+        ],
+    )
+
+    # v28: individual reaction events and outbox read-date probe cache. Event
+    # availability is explicit in companion status/read-fact rows; NULL event
+    # timestamps mean Telegram omitted the date, never a local fallback.
+    return _apply_migration(
+        conn,
+        current,
+        28,
+        [
+            _MESSAGE_REACTION_EVENTS_DDL,
+            _MESSAGE_REACTION_EVENTS_INDEX_DDL,
+            _MESSAGE_REACTION_EVENT_STATUS_DDL,
+            _MESSAGE_READ_FACTS_DDL,
+            _MESSAGE_READ_FACTS_INDEX_DDL,
         ],
     )
 
@@ -1169,7 +1233,7 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     current = _apply_migrations_6_to_10(conn, current)
     current = _apply_migrations_11_to_15(conn, current)
     current = _apply_migrations_16_to_20(conn, current)
-    current = _apply_migrations_21_to_27(conn, current)
+    current = _apply_migrations_21_to_28(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 

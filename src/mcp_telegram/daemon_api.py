@@ -98,6 +98,7 @@ from .daemon_message_queries import (
 )
 from .daemon_read_state_queries import _dialog_type_from_db, _read_state_for_dialog
 from .models import DialogType, ReadMessage
+from .telegram_fact_queries import enrich_reaction_events, enrich_read_at
 
 # Entity / telemetry SQL
 _UPSERT_ENTITY_SQL = (
@@ -149,6 +150,7 @@ from .formatter import format_reaction_counts
 from .telegram_fragments import FragmentContextService, TelethonTelegramFragmentGateway
 from .telegram_history import TelethonTelegramHistoryGateway
 from .telegram_reactions import ReactionFreshener, TelethonTelegramReactionGateway
+from .telegram_read_receipts import TelethonTelegramReadReceiptGateway
 from .telegram_reading import ReactionFreshness
 
 
@@ -370,6 +372,7 @@ class DaemonAPIServer:
             TelethonTelegramReactionGateway(self._client),
             log=logger,
         )
+        self._read_receipt_gateway = TelethonTelegramReadReceiptGateway(self._client)
         self._activity_stats_service: _activity_stats.DaemonActivityStatsService | None = None
 
     def _get_reading_service(self) -> DaemonReadingService:
@@ -389,6 +392,7 @@ class DaemonAPIServer:
                     ),
                     reaction_freshener=self._reaction_freshener,
                     history_gateway=TelethonTelegramHistoryGateway(self._client),
+                    read_receipt_gateway=self._read_receipt_gateway,
                     logger=cast(ReadingLoggerLike, logger),
                     rid=_rid,
                 )
@@ -1271,6 +1275,14 @@ class DaemonAPIServer:
             )
             for row in rows
         ]
+        messages = enrich_reaction_events(self._conn, dialog_id, messages)
+        messages = await enrich_read_at(
+            self._conn,
+            self._read_receipt_gateway,
+            dialog_id,
+            messages,
+            dialog_type=_dialog_type_from_db(self._conn, dialog_id),
+        )
         return messages, freshness
 
     # ------------------------------------------------------------------

@@ -4504,8 +4504,8 @@ async def test_scoped_search_includes_reactions_display() -> None:
 
 
 @pytest.mark.asyncio
-async def test_global_search_returns_empty_reactions_display() -> None:
-    """Global search returns reactions_display='' (intentional, cross-dialog result set)."""
+async def test_global_search_includes_reactions_display_and_unavailable_facts() -> None:
+    """Global search projects aggregate reactions and preserves unavailable facts."""
     from mcp_telegram.fts import INSERT_FTS_SQL, stem_text
 
     conn = _make_db(with_fts=True, with_entities=True)
@@ -4525,9 +4525,72 @@ async def test_global_search_returns_empty_reactions_display() -> None:
     assert result["ok"] is True
     messages = _response_messages(result)
     assert len(messages) == 1
-    # Global search: reactions_display must be present but empty
+    # Cached aggregate reactions are safe to project even across dialogs.
     assert "reactions_display" in messages[0]
-    assert messages[0]["reactions_display"] == ""
+    assert messages[0]["reactions_display"] == "[❤️×2]"
+    # Legacy/test databases without v28 fact tables remain a successful read.
+    assert messages[0]["reaction_events"] == ()
+    assert messages[0]["reaction_events_status"] == "unavailable"
+    assert messages[0]["read_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_global_search_projects_cached_reaction_events_and_read_at() -> None:
+    """Global search includes daemon-owned event and read-date facts."""
+    from mcp_telegram.fts import INSERT_FTS_SQL, stem_text
+
+    conn = _make_db(with_fts=True, with_entities=True)
+    _insert_synced_dialog(conn, 5)
+    _insert_message(conn, 5, 301, text="global cached facts")
+    conn.execute(INSERT_FTS_SQL, (5, 301, stem_text("global cached facts")))
+    conn.executescript(
+        """
+        CREATE TABLE message_reaction_events (
+            event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            dialog_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL,
+            reactor_id INTEGER,
+            emoji TEXT NOT NULL,
+            reacted_at INTEGER,
+            fetched_at INTEGER NOT NULL
+        );
+        CREATE TABLE message_reaction_event_status (
+            dialog_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL,
+            checked_at INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            returned_count INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (dialog_id, message_id)
+        );
+        CREATE TABLE message_read_facts (
+            dialog_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL,
+            read_at INTEGER,
+            checked_at INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            PRIMARY KEY (dialog_id, message_id)
+        );
+        INSERT INTO message_reaction_events
+            (dialog_id, message_id, reactor_id, emoji, reacted_at, fetched_at)
+        VALUES (5, 301, 42, '🔥', 1700000100, 1700000200);
+        INSERT INTO message_reaction_event_status
+            (dialog_id, message_id, checked_at, status, returned_count)
+        VALUES (5, 301, 1700000200, 'complete', 1);
+        INSERT INTO message_read_facts
+            (dialog_id, message_id, read_at, checked_at, status)
+        VALUES (5, 301, 1700000300, 1700000400, 'complete');
+        """
+    )
+    conn.commit()
+
+    result = await make_server(conn)._search_messages({"query": "cached"})
+
+    assert result["ok"] is True
+    messages = _response_messages(result)
+    assert len(messages) == 1
+    assert messages[0]["read_at"] == 1700000300
+    assert messages[0]["reaction_events"] == ({"reactor_id": 42, "emoji": "🔥", "reacted_at": 1700000100},)
+    assert messages[0]["reaction_events_status"] == "complete"
 
 
 # ---------------------------------------------------------------------------

@@ -22,7 +22,7 @@ import asyncio
 import json
 import logging
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from typing import Literal, NotRequired, TypedDict, Unpack, cast
 
@@ -55,6 +55,8 @@ class _ListMessagesKwargs(TypedDict, total=False):
     context_message_id: int | None
     context_size: int | None
     message_state: str
+    since_utc: str | None
+    until_utc: str | None
 
 
 class _SearchMessagesKwargs(TypedDict):
@@ -65,6 +67,8 @@ class _SearchMessagesKwargs(TypedDict):
     offset: NotRequired[int]
     navigation: NotRequired[str | None]
     message_state: NotRequired[str]
+    since_utc: NotRequired[str | None]
+    until_utc: NotRequired[str | None]
 
 
 class _TraceAccountMessagesKwargs(TypedDict, total=False):
@@ -84,6 +88,13 @@ class _TraceAccountMessagesKwargs(TypedDict, total=False):
 def _list_messages_state_payload(kwargs: _ListMessagesKwargs) -> dict[str, object]:
     message_state = kwargs.get("message_state")
     return {"message_state": message_state} if message_state is not None else {}
+
+
+def _add_time_bounds(payload: dict[str, object], kwargs: Mapping[str, object]) -> None:
+    """Add optional UTC bounds without emitting null-valued JSON fields."""
+    for field in ("since_utc", "until_utc"):
+        if (value := kwargs.get(field)) is not None:
+            payload[field] = value
 
 
 _DaemonResponse = TypedDict(  # noqa: UP013
@@ -230,6 +241,8 @@ class DaemonConnection:
             topic_id: Filter by forum topic id.
             unread_after_id: Return only messages with message_id > this value.
             unread: If True, daemon resolves read_inbox_max_id as unread_after_id.
+            since_utc: Inclusive RFC3339 UTC lower bound for the selected message timestamp.
+            until_utc: Exclusive RFC3339 UTC upper bound for the selected message timestamp.
 
         Optional params are omitted from the payload when None (backward compat).
         """
@@ -256,23 +269,28 @@ class DaemonConnection:
             payload["context_message_id"] = context_message_id
         if (context_size := kwargs.get("context_size")) is not None:
             payload["context_size"] = context_size
+        _add_time_bounds(payload, kwargs)
         payload.update(_list_messages_state_payload(kwargs))
         return await self.request(payload)
 
     async def search_messages(self, **kwargs: Unpack[_SearchMessagesKwargs]) -> dict:
-        """Send search_messages request. Accepts dialog name or numeric id."""
-        return await self.request(
-            {
-                "method": "search_messages",
-                "dialog_id": kwargs.get("dialog_id", 0),
-                "dialog": kwargs.get("dialog"),
-                "query": kwargs["query"],
-                "limit": kwargs.get("limit", 20),
-                "offset": kwargs.get("offset", 0),
-                "navigation": kwargs.get("navigation"),
-                "message_state": kwargs.get("message_state", "sent"),
-            }
-        )
+        """Send search_messages request with optional UTC bounds.
+
+        Accepts a dialog name or numeric id. ``since_utc`` is inclusive and
+        ``until_utc`` is exclusive; both must be RFC3339 timestamps in UTC.
+        """
+        payload: dict[str, object] = {
+            "method": "search_messages",
+            "dialog_id": kwargs.get("dialog_id", 0),
+            "dialog": kwargs.get("dialog"),
+            "query": kwargs["query"],
+            "limit": kwargs.get("limit", 20),
+            "offset": kwargs.get("offset", 0),
+            "navigation": kwargs.get("navigation"),
+            "message_state": kwargs.get("message_state", "sent"),
+        }
+        _add_time_bounds(payload, kwargs)
+        return await self.request(payload)
 
     async def trace_account_messages(self, **kwargs: Unpack[_TraceAccountMessagesKwargs]) -> dict:
         """Send trace_account_messages request to the daemon."""

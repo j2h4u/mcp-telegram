@@ -52,10 +52,25 @@ class TestNavigationTokenRoundTrip:
             direction=HistoryDirection.OLDEST,
             sent_at=1_700_000_500,
             message_state="all",
+            since_utc=1_700_000_000,
+            until_utc=1_700_001_000,
         )
         token = encode_navigation_token(original)
         decoded = decode_navigation_token(token)
         assert decoded == original
+
+    def test_search_token_roundtrip_preserves_utc_bounds(self):
+        token = encode_search_navigation(
+            offset=20,
+            dialog_id=100,
+            query="hello",
+            message_state="sent",
+            since_utc=1_700_000_000,
+            until_utc=1_700_001_000,
+        )
+        nav = decode_navigation_token(token)
+        assert nav.since_utc == 1_700_000_000
+        assert nav.until_utc == 1_700_001_000
 
 
 class TestDecodeValidation:
@@ -148,3 +163,13 @@ class TestDecodeValidation:
         token = "!!!!!!.aaaa1111bbbb2222"
         with pytest.raises(ValueError, match="Invalid navigation token"):
             decode_navigation_token(token)
+
+    def test_reversed_utc_bounds_are_rejected(self):
+        with pytest.raises(ValueError, match="since_utc must be earlier"):
+            encode_history_navigation(
+                1,
+                dialog_id=100,
+                message_state="sent",
+                since_utc=2,
+                until_utc=1,
+            )

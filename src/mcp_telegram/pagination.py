@@ -42,6 +42,8 @@ class NavigationToken:
     direction: HistoryDirection | None = None
     sent_at: int | None = None
     message_state: str | None = None
+    since_utc: int | None = None
+    until_utc: int | None = None
 
 
 @dataclass(frozen=True)
@@ -156,6 +158,8 @@ def _optional_navigation_fields(navigation: NavigationToken) -> dict[str, object
             "direction": navigation.direction,
             "sent_at": navigation.sent_at,
             "message_state": navigation.message_state,
+            "since_utc": navigation.since_utc,
+            "until_utc": navigation.until_utc,
         }.items()
         if value is not None
     }
@@ -180,7 +184,7 @@ def decode_navigation_token(token: str) -> NavigationToken:
     if not isinstance(dialog_id, int):
         raise ValueError("Invalid navigation token: dialog_id must be an integer")
 
-    topic_id, query, direction, sent_at, message_state = _decode_optional_navigation_fields(data)
+    topic_id, query, direction, sent_at, message_state, since_utc, until_utc = _decode_optional_navigation_fields(data)
     navigation = NavigationToken(
         kind=cast("NavigationKind", kind),
         value=value,
@@ -190,6 +194,8 @@ def decode_navigation_token(token: str) -> NavigationToken:
         direction=cast("HistoryDirection | None", direction),
         sent_at=sent_at,
         message_state=cast("str | None", message_state),
+        since_utc=since_utc,
+        until_utc=until_utc,
     )
     _validate_navigation_shape(navigation)
     return navigation
@@ -197,6 +203,12 @@ def decode_navigation_token(token: str) -> NavigationToken:
 
 def _validate_navigation_shape(navigation: NavigationToken) -> None:
     """Reject signed cursors that are not fully bound to their request state."""
+    if (
+        navigation.since_utc is not None
+        and navigation.until_utc is not None
+        and navigation.since_utc >= navigation.until_utc
+    ):
+        raise ValueError("Invalid navigation token: since_utc must be earlier than until_utc")
     if navigation.message_state not in {"sent", "scheduled", "all"}:
         raise ValueError("Invalid navigation token: message_state must be sent, scheduled, or all")
     if navigation.kind == "search":
@@ -211,7 +223,7 @@ def _validate_navigation_shape(navigation: NavigationToken) -> None:
 
 def _decode_optional_navigation_fields(
     data: dict[str, object],
-) -> tuple[int | None, str | None, str | None, int | None, str | None]:
+) -> tuple[int | None, str | None, str | None, int | None, str | None, int | None, int | None]:
     topic_id = data.get("topic_id")
     if topic_id is not None and not isinstance(topic_id, int):
         raise ValueError("Invalid navigation token: topic_id must be an integer when present")
@@ -232,12 +244,22 @@ def _decode_optional_navigation_fields(
     if message_state is not None and message_state not in {"sent", "scheduled", "all"}:
         raise ValueError("Invalid navigation token: message_state must be sent, scheduled, or all when present")
 
+    since_utc = data.get("since_utc")
+    if since_utc is not None and not isinstance(since_utc, int):
+        raise ValueError("Invalid navigation token: since_utc must be an integer when present")
+
+    until_utc = data.get("until_utc")
+    if until_utc is not None and not isinstance(until_utc, int):
+        raise ValueError("Invalid navigation token: until_utc must be an integer when present")
+
     return (
         cast(int | None, topic_id),
         cast(str | None, query),
         cast(str | None, direction),
         cast(int | None, sent_at),
         cast(str | None, message_state),
+        cast(int | None, since_utc),
+        cast(int | None, until_utc),
     )
 
 
@@ -249,6 +271,8 @@ def encode_history_navigation(  # noqa: PLR0913
     direction: HistoryDirection = HistoryDirection.NEWEST,
     sent_at: int | None = None,
     message_state: str,
+    since_utc: int | None = None,
+    until_utc: int | None = None,
 ) -> str:
     """Encode a history continuation cursor as a base64 token."""
     return encode_navigation_token(
@@ -260,15 +284,20 @@ def encode_history_navigation(  # noqa: PLR0913
             direction=direction,
             sent_at=sent_at,
             message_state=message_state,
+            since_utc=since_utc,
+            until_utc=until_utc,
         )
     )
 
 
-def encode_search_navigation(
+def encode_search_navigation(  # noqa: PLR0913
     offset: int,
     dialog_id: int,
     query: str,
     message_state: str,
+    *,
+    since_utc: int | None = None,
+    until_utc: int | None = None,
 ) -> str:
     """Encode a search continuation cursor as a base64 token."""
     return encode_navigation_token(
@@ -278,6 +307,8 @@ def encode_search_navigation(
             dialog_id=dialog_id,
             query=query,
             message_state=message_state,
+            since_utc=since_utc,
+            until_utc=until_utc,
         )
     )
 

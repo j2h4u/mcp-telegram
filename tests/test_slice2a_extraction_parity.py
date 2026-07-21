@@ -42,6 +42,8 @@ class _ListReq:
     sender_name: str | None
     topic_id: int | None
     unread_after_id: int | None
+    since_utc: int | None = None
+    until_utc: int | None = None
 
 
 def _make_req(**overrides: object) -> _ListMessagesDbRequest:
@@ -73,6 +75,15 @@ def test_build_list_messages_query_params() -> None:
     }
     assert "ORDER BY m.message_id ASC" in sql
     assert ":filter_sender_id" in sql and ":topic_id" in sql and ":unread_after_id" in sql
+
+
+def test_build_list_messages_query_uses_half_open_utc_bounds() -> None:
+    sql, params = _build_list_messages_query(_make_req(since_utc=1_700_000_000, until_utc=1_700_001_000))
+
+    assert "m.sent_at >= :since_utc" in sql
+    assert "m.sent_at < :until_utc" in sql
+    assert params["since_utc"] == 1_700_000_000
+    assert params["until_utc"] == 1_700_001_000
 
 
 def test_read_message_from_row_maps_fields() -> None:

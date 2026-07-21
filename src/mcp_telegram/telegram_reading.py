@@ -50,14 +50,42 @@ class HistoryFetchResult:
 
 
 @dataclass(frozen=True, slots=True)
+class ReactionEvent:
+    """One individual reaction as returned by Telegram.
+
+    ``reacted_at`` is nullable because Telegram may omit the event timestamp;
+    callers must never infer it from the message date or sync time.
+    """
+
+    reactor_id: int | None
+    emoji: str
+    reacted_at: int | None
+
+
+@dataclass(frozen=True, slots=True)
 class ReactionMessage:
     message_id: int
     rows: tuple[ReactionRecord, ...]
+    events: tuple[ReactionEvent, ...] = ()
+    events_status: str = "unavailable"
 
 
 @dataclass(frozen=True, slots=True)
 class ReactionFetchResult:
     messages: tuple[ReactionMessage | None, ...] = ()
+    failure: GatewayFailure | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.failure is None
+
+
+@dataclass(frozen=True, slots=True)
+class ReadDateFetchResult:
+    """One Telegram outbox read-date probe; ``read_at`` is never inferred."""
+
+    read_at: int | None = None
+    status: str = "unavailable"
     failure: GatewayFailure | None = None
 
     @property
@@ -90,3 +118,7 @@ class TelegramHistoryGateway(Protocol):
 
 class TelegramReactionGateway(Protocol):
     async def fetch_reactions(self, entity: object, message_ids: Sequence[int]) -> ReactionFetchResult: ...
+
+
+class TelegramReadReceiptGateway(Protocol):
+    async def fetch_outbox_read_date(self, entity: object, message_id: int) -> ReadDateFetchResult: ...

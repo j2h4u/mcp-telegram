@@ -695,6 +695,15 @@ async def test_list_dialogs_structured_output_allows_null_name():
     assert _json_dict(_json_list(_json_dict(result.structured_content)["dialogs"])[0])["name"] is None
 
 
+def test_search_messages_schema_exposes_rendered_date() -> None:
+    schema = cast(dict[str, object], TOOL_REGISTRY["search_messages"].output_schema)
+    properties = cast(dict[str, object], schema["properties"])
+    results = cast(dict[str, object], properties["results"])
+    items = cast(dict[str, object], results["items"])
+    item_properties = cast(dict[str, object], items["properties"])
+    assert item_properties["date"] == {"type": ["string", "null"]}
+
+
 async def test_list_dialogs_sync_status_in_output():
     """ListDialogs output includes sync_status field for every dialog."""
     conn = _make_daemon_conn(
@@ -880,7 +889,14 @@ async def test_list_topics_structures_optional_topic_metadata():
         },
         "pinned": True,
         "hidden": False,
-        "snapshot_at": 1700000000,
+        "snapshot_at": "2023-11-14T22:13:20+00:00",
+    }
+    assert _json_dict(result.structured_content)["time_context"] == {
+        "timezone": "UTC",
+        "canonical": "UTC",
+        "query_boundaries": "UTC",
+        "telegram_event_timestamps": "source_provided_only",
+        "technical_timestamps": "not_telegram_events",
     }
 
 
@@ -1575,8 +1591,8 @@ async def test_get_sync_status_via_daemon():
         "status": "synced",
         "raw_status": "synced",
         "is_syncing": False,
-        "last_synced_at": 1700000000,
-        "last_event_at": 1700001000,
+        "last_synced_at": "2023-11-14T22:13:20+00:00",
+        "last_event_at": "2023-11-14T22:30:00+00:00",
         "message_count": 100,
         "sync_progress": 100,
         "sync_progress_message_id": 100,
@@ -1585,6 +1601,13 @@ async def test_get_sync_status_via_daemon():
         "sync_coverage_pct": None,
         "access_lost_at": None,
         "action": "sync_progress is a message_id offset, not a count. Treat sync_coverage_pct as an approximate local-vs-Telegram ratio.",
+        "time_context": {
+            "timezone": "UTC",
+            "canonical": "UTC",
+            "query_boundaries": "UTC",
+            "telegram_event_timestamps": "source_provided_only",
+            "technical_timestamps": "not_telegram_events",
+        },
     }
     conn.get_sync_status.assert_called_once_with(dialog_id=-1001234567890)
 
@@ -1633,7 +1656,7 @@ async def test_get_sync_alerts_via_daemon():
         "message_id": 200,
         "deleted_at": None,
         "version": 1,
-        "edit_date": 1700000600,
+        "edit_date": "2023-11-14T22:23:20+00:00",
         "access_lost_at": None,
         "severity": "low",
         "message": "Edited message msg=200 v1 edit_date=1700000600",
@@ -1646,7 +1669,7 @@ async def test_get_sync_alerts_via_daemon():
         "deleted_at": None,
         "version": None,
         "edit_date": None,
-        "access_lost_at": 1700000700,
+        "access_lost_at": "2023-11-14T22:25:00+00:00",
         "severity": "high",
         "message": "Access lost at 1700000700",
         "action": "Use get_sync_status for coverage details.",
@@ -1655,7 +1678,7 @@ async def test_get_sync_alerts_via_daemon():
         "kind": "deleted_message",
         "dialog_id": 1,
         "message_id": 100,
-        "deleted_at": 1700000800,
+        "deleted_at": "2023-11-14T22:26:40+00:00",
         "version": None,
         "edit_date": None,
         "access_lost_at": None,
@@ -1667,7 +1690,7 @@ async def test_get_sync_alerts_via_daemon():
         {
             "dialog_id": 1,
             "message_id": 100,
-            "deleted_at": 1700000800,
+            "deleted_at": "2023-11-14T22:26:40+00:00",
             "action": "Inspect the dialog history around this message id if surrounding context is needed.",
         }
     ]
@@ -1676,17 +1699,24 @@ async def test_get_sync_alerts_via_daemon():
             "dialog_id": 1,
             "message_id": 200,
             "version": 1,
-            "edit_date": 1700000600,
+            "edit_date": "2023-11-14T22:23:20+00:00",
             "action": "Treat cached text as versioned; inspect edit history before relying on older wording.",
         }
     ]
     assert payload["access_lost"] == [
         {
             "dialog_id": 2,
-            "access_lost_at": 1700000700,
+            "access_lost_at": "2023-11-14T22:25:00+00:00",
             "action": "Use get_sync_status for coverage details.",
         }
     ]
+    assert payload["time_context"] == {
+        "timezone": "UTC",
+        "canonical": "UTC",
+        "query_boundaries": "UTC",
+        "telegram_event_timestamps": "source_provided_only",
+        "technical_timestamps": "not_telegram_events",
+    }
     assert payload["since"] == 0
     assert payload["limit"] == 50
     assert _json_dict(_json_dict(payload["limited_by"])["deleted_messages"]) == {"since": 0, "limit": 50}
@@ -1983,6 +2013,36 @@ async def test_get_inbox_via_daemon():
     assert _json_dict(first_message["content"])["is_telegram_content"] is True
     assert _json_dict(first_message["content"])["content_kind"] == "message_text"
     conn.get_inbox.assert_called_once()
+
+
+async def test_get_inbox_projects_date_in_requested_timezone():
+    conn = _make_daemon_conn(
+        {
+            "ok": True,
+            "data": {
+                "groups": [
+                    {
+                        "dialog_id": 123,
+                        "display_name": "Alice",
+                        "category": "user",
+                        "dialog_type": "User",
+                        "unread_count": 1,
+                        "messages": [
+                            {"message_id": 1, "sent_at": 1700000000, "dialog_id": 123, "text": "Hello"},
+                        ],
+                    },
+                ],
+            },
+        }
+    )
+    with _patch_daemon(conn):
+        result = await get_inbox(GetInbox(timezone="Asia/Almaty"))
+
+    payload = _json_dict(result.structured_content)
+    dialog = _json_dict(_json_list(payload["dialogs"])[0])
+    message = _json_dict(_json_list(dialog["messages"])[0])
+    assert message["date"] == "2023-11-15T04:13:20+06:00"
+    assert _json_dict(payload["time_context"])["timezone"] == "Asia/Almaty"
 
 
 async def test_get_inbox_presents_each_dialog_chronologically():
@@ -2856,13 +2916,21 @@ async def test_get_my_recent_activity_routes_primary():
     assert payload["sent_before"] is None
     assert payload["text_query"] is None
     assert payload["scan_status"] == "complete"
-    assert payload["scanned_at"] == 1_700_003_600
+    assert payload["scanned_at"] == "2023-11-14T23:13:20+00:00"
+    assert payload["time_context"] == {
+        "timezone": "UTC",
+        "canonical": "UTC",
+        "query_boundaries": "UTC",
+        "telegram_event_timestamps": "source_provided_only",
+        "technical_timestamps": "not_telegram_events",
+    }
     assert payload["count"] == 2
     first_comment = _json_dict(comments[0])
     assert first_comment["dialog_id"] == 42
     assert first_comment["dialog_type"] == "supergroup"
     assert first_comment["dialog_category"] == "group"
     assert first_comment["message_id"] == 100
+    assert first_comment["sent_at"] == "2023-11-14T22:13:20+00:00"
     assert first_comment["reply_count"] == 0
     content = _json_dict(first_comment["content"])
     assert content["is_telegram_content"] is True

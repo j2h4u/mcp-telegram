@@ -75,6 +75,12 @@ class _ScheduledListRequest(Protocol):
     @property
     def topic_id(self) -> int | None: ...
 
+    @property
+    def since_utc(self) -> int | None: ...
+
+    @property
+    def until_utc(self) -> int | None: ...
+
 
 def scheduled_messages_available(conn: sqlite3.Connection) -> bool:
     """Return whether both scheduled mirror tables are present."""
@@ -129,6 +135,14 @@ def build_scheduled_list_query(
     if request.topic_id is not None:
         clauses.append("sm.forum_topic_id = :topic_id")
         params["topic_id"] = request.topic_id
+    since_utc = getattr(request, "since_utc", None)
+    until_utc = getattr(request, "until_utc", None)
+    if since_utc is not None:
+        clauses.append("sm.scheduled_at >= :since_utc")
+        params["since_utc"] = since_utc
+    if until_utc is not None:
+        clauses.append("sm.scheduled_at < :until_utc")
+        params["until_utc"] = until_utc
     if request.anchor_msg_id is not None:
         anchor_at = 0 if anchor_sent_at is None else anchor_sent_at
         params["anchor_at"] = anchor_at
@@ -164,6 +178,8 @@ def build_scheduled_search_query(  # noqa: PLR0913
     limit: int,
     offset: int,
     scheduled_now: int,
+    since_utc: int | None = None,
+    until_utc: int | None = None,
 ) -> tuple[str, dict[str, object]]:
     """Build the complete, parameterized scheduled-message search query."""
     clauses = [
@@ -177,6 +193,12 @@ def build_scheduled_search_query(  # noqa: PLR0913
         "limit": limit,
         "offset": offset,
     }
+    if since_utc is not None:
+        clauses.append("sm.scheduled_at >= :since_utc")
+        params["since_utc"] = since_utc
+    if until_utc is not None:
+        clauses.append("sm.scheduled_at < :until_utc")
+        params["until_utc"] = until_utc
     if dialog_id:
         clauses.append("sm.dialog_id = :dialog_id")
         params["dialog_id"] = dialog_id

@@ -138,6 +138,20 @@ class TraceCoverageSummary(TypedDict):
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class ReadReactionEvent:
+    """One individual Telegram reaction fact projected to read surfaces.
+
+    ``reacted_at`` is Telegram's event timestamp and is intentionally nullable:
+    the API may omit it.  It must never be replaced with message, fetch, or
+    persistence time.
+    """
+
+    reactor_id: int | None
+    emoji: str
+    reacted_at: int | None
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class ReadMessage:
     """Message row as returned by list_messages and search queries.
 
@@ -167,6 +181,14 @@ class ReadMessage:
     fwd_from_name: str | None = None
     post_author: str | None = None
     # injected after DB query
+    # Telegram outbox read date, when available. This remains nullable for
+    # incoming/group messages and for privacy/retention-limited responses.
+    read_at: int | None = None
+    # Individual reaction facts are separate from aggregate counters.  The
+    # status reports whether Telegram detail retrieval was complete, partial,
+    # missing, or unavailable for this message.
+    reaction_events: tuple[ReadReactionEvent, ...] = ()
+    reaction_events_status: str = "unavailable"
     reactions_display: str = ""
     dialog_name: str | None = None
 

@@ -382,6 +382,17 @@ forbidden_modules = [
 ]
 
 [[tool.importlinter.contracts]]
+name = "MCP tools stay off Telegram fact adapters"
+type = "forbidden"
+source_modules = ["mcp_telegram.tools"]
+forbidden_modules = [
+  "mcp_telegram.telegram_fact_queries",
+  "mcp_telegram.telegram_reactions",
+  "mcp_telegram.telegram_read_receipts",
+  "mcp_telegram.telegram_history",
+]
+
+[[tool.importlinter.contracts]]
 name = "Sync and activity workers stay off MCP transport and daemon API"
 type = "forbidden"
 source_modules = [
@@ -403,4 +414,68 @@ forbidden_modules = [
   "mcp_telegram.__init__",
   "mcp_telegram.daemon_api",
   "mcp_telegram.daemon_client",
+]
+
+[[tool.importlinter.contracts]]
+name = "Temporal projection stays pure"
+type = "forbidden"
+source_modules = ["mcp_telegram.temporal"]
+forbidden_modules = [
+  "mcp_telegram.daemon",
+  "mcp_telegram.daemon_api",
+  "mcp_telegram.daemon_client",
+  "mcp_telegram.sync_db",
+  "mcp_telegram.sync_worker",
+  "mcp_telegram.telegram",
+  "mcp_telegram.telegram_fact_queries",
+  "mcp_telegram.telegram_fragments",
+  "mcp_telegram.telegram_gateway",
+  "mcp_telegram.telegram_history",
+  "mcp_telegram.telegram_reactions",
+  "mcp_telegram.telegram_read_receipts",
+  "mcp_telegram.telegram_reading",
+  "mcp_telegram.tools",
+  "mcp_telegram.server",
+]
+
+[[tool.importlinter.contracts]]
+name = "Telegram fact adapters stay below daemon orchestration"
+type = "forbidden"
+source_modules = [
+  "mcp_telegram.telegram_fact_queries",
+  "mcp_telegram.telegram_fragments",
+  "mcp_telegram.telegram_gateway",
+  "mcp_telegram.telegram_history",
+  "mcp_telegram.telegram_reaction_queries",
+  "mcp_telegram.telegram_reactions",
+  "mcp_telegram.telegram_read_receipts",
+  "mcp_telegram.telegram_reading",
+]
+forbidden_modules = [
+  "mcp_telegram.daemon",
+  "mcp_telegram.daemon_api",
+  "mcp_telegram.daemon_client",
+  "mcp_telegram.server",
+  "mcp_telegram.tools",
+  "mcp_telegram.__init__",
+]
+
+[[tool.importlinter.contracts]]
+name = "Daemon query owners stay below orchestration"
+type = "forbidden"
+source_modules = [
+  "mcp_telegram.daemon_account_trace",
+  "mcp_telegram.daemon_activity_stats",
+  "mcp_telegram.daemon_dialog_queries",
+  "mcp_telegram.daemon_message_queries",
+  "mcp_telegram.daemon_read_state_queries",
+  "mcp_telegram.daemon_scheduled_queries",
+]
+forbidden_modules = [
+  "mcp_telegram.daemon",
+  "mcp_telegram.daemon_api",
+  "mcp_telegram.daemon_client",
+  "mcp_telegram.server",
+  "mcp_telegram.tools",
+  "mcp_telegram.__init__",
 ]

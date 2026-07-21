@@ -5,6 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import cast
 
+import pytest
+from pydantic import ValidationError
+
+from mcp_telegram.models import ReadReactionEvent
 from mcp_telegram.tools.reading import (
     ListMessages,
     SearchMessages,
@@ -12,6 +16,7 @@ from mcp_telegram.tools.reading import (
     _list_messages_structured_content,
     _list_messages_structured_messages,
     _ListMessagesStructuredContentContext,
+    _search_result_structured_rows,
     _search_structured_content,
     _SearchStructuredContentContext,
 )
@@ -466,3 +471,101 @@ def test_list_messages_structured_messages_cover_media_reply_forward_reaction_to
     assert cast(dict[str, object], second["reactions"])["display"] == "[👍×2]"
     assert "content" not in cast(dict[str, object], second["reactions"])
     assert "read_markers" not in second
+
+
+def test_structured_read_surfaces_preserve_nullable_reaction_events_and_read_at():
+    row = {
+        "message_id": 10,
+        "sent_at": 1_700_000_000,
+        "dialog_id": 123,
+        "text": "outgoing",
+        "sender_id": 99,
+        "out": 1,
+        # Daemon responses are dataclass-asdict payloads at this boundary.
+        "reaction_events": (
+            {"reactor_id": 77, "emoji": "👍", "reacted_at": 1_700_000_100},
+            {"reactor_id": None, "emoji": "🔥", "reacted_at": None},
+        ),
+        "reaction_events_status": "partial",
+        "read_at": 1_700_000_200,
+    }
+
+    listed = _list_messages_structured_messages([row], dialog_type="User")
+    assert listed[0]["reaction_events"] == [
+        {"reactor_id": 77, "emoji": "👍", "reacted_at": 1_700_000_100},
+        {"reactor_id": None, "emoji": "🔥", "reacted_at": None},
+    ]
+    listed_events = cast(list[dict[str, object]], listed[0]["reaction_events"])
+    assert "checked_at" not in listed_events[0]
+    assert "fetched_at" not in listed_events[0]
+    assert listed[0]["reaction_events_status"] == "partial"
+    assert listed[0]["read_at"] == 1_700_000_200
+
+    searched = _search_result_structured_rows([row], "outgoing")
+    assert searched[0]["reaction_events"] == listed[0]["reaction_events"]
+    assert searched[0]["reaction_events_status"] == "partial"
+    assert searched[0]["read_at"] == 1_700_000_200
+
+    from mcp_telegram.tools.unread import _structured_messages
+
+    inbox = _structured_messages([row], read_state=None, dialog_type="User")
+    assert inbox[0]["reaction_events"] == listed[0]["reaction_events"]
+    assert inbox[0]["reaction_events_status"] == "partial"
+    assert inbox[0]["read_at"] == 1_700_000_200
+
+    object_event_row = {
+        **row,
+        "message_id": 11,
+        "sent_at": None,
+        "reaction_events": (ReadReactionEvent(reactor_id=88, emoji="🎯", reacted_at=1_700_000_300),),
+    }
+    object_event_result = _search_result_structured_rows([object_event_row], "outgoing")[0]
+    assert object_event_result["date"] is None
+    assert object_event_result["reaction_events"] == [{"reactor_id": 88, "emoji": "🎯", "reacted_at": 1_700_000_300}]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({}, "Provide either dialog or exact_dialog_id"),
+        ({"dialog": "alice", "exact_dialog_id": 17}, "dialog and exact_dialog_id are mutually exclusive"),
+        (
+            {"exact_dialog_id": 17, "topic": "general", "exact_topic_id": 3},
+            "topic and exact_topic_id are mutually exclusive",
+        ),
+        (
+            {"exact_dialog_id": 17, "message_state": "scheduled", "anchor_message_id": 10},
+            "anchor_message_id is only supported for published sent history",
+        ),
+        (
+            {
+                "exact_dialog_id": 17,
+                "since_utc": "2026-01-02T00:00:00Z",
+                "until_utc": "2026-01-01T00:00:00Z",
+            },
+            "since_utc must be earlier than until_utc",
+        ),
+    ],
+)
+def test_list_messages_rejects_invalid_selector_and_temporal_combinations(
+    kwargs: dict[str, object], message: str
+) -> None:
+    with pytest.raises(ValidationError, match=message):
+        ListMessages.model_validate(kwargs)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"exact_dialog_id": 17},
+        {"dialog": "alice"},
+        {"exact_dialog_id": 17, "topic": "general"},
+        {"exact_dialog_id": 17, "exact_topic_id": 3},
+        {"exact_dialog_id": 17, "since_utc": "2026-01-01T00:00:00Z"},
+        {"exact_dialog_id": 17, "until_utc": "2026-01-02T00:00:00Z"},
+    ],
+)
+def test_list_messages_accepts_non_conflicting_selector_and_boundary_combinations(
+    kwargs: dict[str, object],
+) -> None:
+    assert ListMessages.model_validate(kwargs)

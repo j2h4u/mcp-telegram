@@ -21,6 +21,8 @@ class _ListRequest:
     sender_id: int | None = None
     sender_name: str | None = None
     topic_id: int | None = None
+    since_utc: int | None = None
+    until_utc: int | None = None
 
 
 def test_scheduled_list_builder_has_explicit_clauses_and_bound_values() -> None:
@@ -59,6 +61,29 @@ def test_scheduled_search_builder_uses_conditional_scope_clause() -> None:
     assert "17" not in sql and "23" not in sql
     assert params["own_scope_0"] == 17
     assert params["own_scope_1"] == 23
+
+
+def test_scheduled_queries_use_half_open_utc_bounds() -> None:
+    list_sql, list_params = build_scheduled_list_query(
+        _ListRequest(since_utc=1_700_000_000, until_utc=1_700_001_000),
+        scheduled_now=1_600_000_000,
+    )
+    search_sql, search_params = build_scheduled_search_query(
+        dialog_id=17,
+        own_dialog_ids=None,
+        query="needle",
+        limit=5,
+        offset=0,
+        scheduled_now=1_600_000_000,
+        since_utc=1_700_000_000,
+        until_utc=1_700_001_000,
+    )
+
+    for sql, params in ((list_sql, list_params), (search_sql, search_params)):
+        assert "scheduled_at >= :since_utc" in sql
+        assert "scheduled_at < :until_utc" in sql
+        assert params["since_utc"] == 1_700_000_000
+        assert params["until_utc"] == 1_700_001_000
 
 
 def test_scheduled_row_mapper_is_the_lifecycle_wire_shape() -> None:
