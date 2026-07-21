@@ -113,7 +113,7 @@ async def enrich_read_at(  # noqa: PLR0913
         gateway,
         dialog_id,
         candidate_ids,
-        threshold=now - read_at_ttl_seconds,
+        stale_before_utc=now - read_at_ttl_seconds,
         checked_at=now,
     )
     values = read_at_map(conn, dialog_id, candidate_ids)
@@ -137,11 +137,11 @@ async def _refresh_stale_read_at_facts(  # noqa: PLR0913
     dialog_id: int,
     message_ids: Sequence[int],
     *,
-    threshold: int,
+    stale_before_utc: int,
     checked_at: int,
 ) -> None:
     """Refresh stale probes, retaining committed earlier facts on a later failure."""
-    for message_id in stale_read_at_ids(conn, dialog_id, message_ids, threshold):
+    for message_id in stale_read_at_ids(conn, dialog_id, message_ids, stale_before_utc):
         try:
             result = await gateway.fetch_outbox_read_date(dialog_id, message_id)
         except CATCHABLE_GATEWAY_FAILURES:
@@ -213,7 +213,7 @@ def stale_read_at_ids(
     conn: sqlite3.Connection,
     dialog_id: int,
     message_ids: Sequence[int],
-    threshold: int,
+    stale_before_utc: int,
 ) -> list[int]:
     """Return message ids whose read-date probe is absent or older than TTL."""
 
@@ -226,7 +226,7 @@ def stale_read_at_ids(
             conn.execute(
                 f"SELECT message_id, checked_at FROM message_read_facts "
                 f"WHERE dialog_id = ? AND message_id IN ({placeholders}) AND checked_at > ?",
-                [dialog_id, *message_ids, threshold],
+                [dialog_id, *message_ids, stale_before_utc],
             ).fetchall(),
         )
     except sqlite3.OperationalError:
