@@ -14,6 +14,7 @@ import pytest
 
 from mcp_telegram.daemon import _log_heartbeat, sync_main
 from mcp_telegram.daemon_api import DaemonAPIServer
+from tests.reaction_helpers import make_reaction_freshener
 
 # ---------------------------------------------------------------------------
 # CLI registration
@@ -235,12 +236,22 @@ def test_self_id_cached_at_startup(
     captured: dict[str, object] = {}
 
     class _Capturing:
-        def __init__(self, conn, client, shutdown_event, feedback_conn=None, sync_db_path=None):
+        def __init__(  # noqa: PLR0913
+            self,
+            conn,
+            client,
+            shutdown_event,
+            feedback_conn=None,
+            sync_db_path=None,
+            *,
+            reaction_freshener,
+        ):
             self._conn = conn
             self._client = client
             self._shutdown_event = shutdown_event
             self._feedback_conn = feedback_conn
             self._sync_db_path = sync_db_path
+            self._reaction_freshener = reaction_freshener
             self.self_id = None
             captured["instance"] = self
 
@@ -1535,7 +1546,13 @@ def _make_source_export_server() -> tuple[DaemonAPIServer, sqlite3.Connection]:
 
     conn = sqlite3.connect(":memory:")
     _apply_migrations(conn)
-    server = DaemonAPIServer(conn, MagicMock(), asyncio.Event())
+    client = MagicMock()
+    server = DaemonAPIServer(
+        conn,
+        client,
+        asyncio.Event(),
+        reaction_freshener=make_reaction_freshener(conn, client),
+    )
     server._ready = True
     return server, conn
 

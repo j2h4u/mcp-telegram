@@ -26,10 +26,13 @@ from mcp_telegram.daemon_reading import (
 )
 from mcp_telegram.models import ReadMessage
 from mcp_telegram.pagination import HistoryDirection, decode_navigation_token
+from mcp_telegram.reactions.contracts import ReactionFreshness
+from mcp_telegram.reactions.refresh import ReactionFreshener
+from mcp_telegram.reactions.sqlite_repository import SQLiteReactionSnapshotRepository
+from mcp_telegram.reactions.telegram_adapter import TelethonTelegramReactionGateway
 from mcp_telegram.telegram_fragments import FragmentContextService, TelethonTelegramFragmentGateway
 from mcp_telegram.telegram_history import TelethonTelegramHistoryGateway
-from mcp_telegram.telegram_reactions import ReactionFreshener, TelethonTelegramReactionGateway
-from mcp_telegram.telegram_reading import HistoryFetchResult, ReactionFreshness, TelegramHistoryGateway
+from mcp_telegram.telegram_reading import HistoryFetchResult, TelegramHistoryGateway
 
 
 class _EntityMissingClient:
@@ -385,7 +388,11 @@ async def test_list_messages_telegram_entity_miss_logs_structured_warning_withou
             self_id=1,
             resolve_dialog_id=lambda _dialog_id, _dialog: asyncio.sleep(0, result=0),
             fragment_context=FragmentContextService(conn, TelethonTelegramFragmentGateway(_EntityMissingClient())),
-            reaction_freshener=ReactionFreshener(conn, TelethonTelegramReactionGateway(_EntityMissingClient())),
+            reaction_freshener=ReactionFreshener(
+                SQLiteReactionSnapshotRepository(conn),
+                TelethonTelegramReactionGateway(_EntityMissingClient()),
+                freshness_ttl_seconds=600,
+            ),
             history_gateway=TelethonTelegramHistoryGateway(_EntityMissingClient()),
             logger=logger,
             rid=lambda: " request_id=test-rid",

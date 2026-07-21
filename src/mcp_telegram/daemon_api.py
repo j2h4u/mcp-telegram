@@ -147,11 +147,11 @@ from .daemon_source_export import (
 )
 from .feedback_db import VALID_SEVERITIES, VALID_STATUSES
 from .formatter import format_reaction_counts
+from .reactions.contracts import ReactionFreshness
+from .reactions.refresh import ReactionFreshener
 from .telegram_fragments import FragmentContextService, TelethonTelegramFragmentGateway
 from .telegram_history import TelethonTelegramHistoryGateway
-from .telegram_reactions import ReactionFreshener, TelethonTelegramReactionGateway
 from .telegram_read_receipts import TelethonTelegramReadReceiptGateway
-from .telegram_reading import ReactionFreshness
 
 
 class _LoggerLike(Protocol):
@@ -342,13 +342,15 @@ class DaemonAPIServer:
     passed to asyncio.start_unix_server() as the client connected callback.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         conn: sqlite3.Connection,
         client: _DaemonClientLike,
         shutdown_event: asyncio.Event,
         feedback_conn: sqlite3.Connection | None = None,
         sync_db_path: Path | None = None,
+        *,
+        reaction_freshener: ReactionFreshener,
     ) -> None:
         conn.row_factory = sqlite3.Row
         self._conn = conn
@@ -367,11 +369,7 @@ class DaemonAPIServer:
         self._ready: bool = False
         self.startup_detail: str = "connecting to Telegram"
         self._reading_service: DaemonReadingService | None = None
-        self._reaction_freshener = ReactionFreshener(
-            self._conn,
-            TelethonTelegramReactionGateway(self._client),
-            log=logger,
-        )
+        self._reaction_freshener = reaction_freshener
         self._read_receipt_gateway = TelethonTelegramReadReceiptGateway(self._client)
         self._activity_stats_service: _activity_stats.DaemonActivityStatsService | None = None
 

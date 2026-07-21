@@ -55,14 +55,14 @@ from .pagination import (
     encode_history_navigation,
     encode_search_navigation,
 )
+from .reactions.contracts import ReactionFreshness
+from .reactions.refresh import ReactionFreshener
 from .resolver import latinize
 from .sync_db import open_sync_db_reader
 from .telegram_fact_queries import enrich_reaction_events, enrich_read_at, read_at_map
 from .telegram_fragments import FragmentContextService
-from .telegram_reactions import ReactionFreshener
 from .telegram_reading import (
     GatewayFailure,
-    ReactionFreshness,
     TelegramHistoryGateway,
     TelegramReadReceiptGateway,
 )

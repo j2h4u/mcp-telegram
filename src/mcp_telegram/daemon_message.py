@@ -10,7 +10,6 @@ from .telethon_media import describe_media
 from .telethon_message import is_service_message
 
 logger = logging.getLogger(__name__)
-REACTIONS_TTL_SECONDS = 600
 
 
 class _SupportsTimestamp(Protocol):

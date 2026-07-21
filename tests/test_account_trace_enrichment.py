@@ -38,6 +38,7 @@ from mcp_telegram.message_contracts import (
     ReactionRecord,
     StoredMessage,
 )
+from tests.reaction_helpers import make_reaction_freshener
 
 
 class FakeTraceClient:
@@ -115,7 +116,7 @@ def _dict(value: object) -> dict[str, object]:
 def trace_enrichment_server(tmp_path: Path) -> Iterator[tuple[DaemonAPIServer, sqlite3.Connection, FakeTraceClient]]:
     conn = open_trace_db(tmp_path)
     client = FakeTraceClient()
-    server = DaemonAPIServer(conn, client, asyncio.Event())
+    server = DaemonAPIServer(conn, client, asyncio.Event(), reaction_freshener=make_reaction_freshener(conn, client))
     server.self_id = 101
     try:
         yield server, conn, client

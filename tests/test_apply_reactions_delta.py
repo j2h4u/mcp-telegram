@@ -1,9 +1,4 @@
-"""Tests for sync_worker.apply_reactions_delta — per-message reaction primitive.
-
-Per Phase 39.2-01 Task 1. Helper is the shared per-message primitive used by
-event handlers and JIT freshen path. FullSyncWorker's batched executemany
-path is intentionally NOT refactored.
-"""
+"""Tests for the reaction repository's per-message aggregate replacement."""
 
 from __future__ import annotations
 
@@ -14,9 +9,9 @@ from typing import cast
 
 import pytest
 
-from mcp_telegram.message_contracts import ReactionRecord
+from mcp_telegram.reactions.contracts import ReactionAggregate
+from mcp_telegram.reactions.persistence import replace_reaction_aggregates
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
-from mcp_telegram.sync_worker import apply_reactions_delta
 
 
 @pytest.fixture()
@@ -43,48 +38,55 @@ def _rows(conn: sqlite3.Connection, dialog_id: int, message_id: int) -> list[tup
     )
 
 
-def _r(dialog_id: int, message_id: int, emoji: str, count: int) -> ReactionRecord:
-    return ReactionRecord(dialog_id=dialog_id, message_id=message_id, emoji=emoji, count=count)
+def _r(emoji: str, count: int) -> ReactionAggregate:
+    return ReactionAggregate(emoji=emoji, count=count)
 
 
-def test_apply_reactions_delta_inserts_fresh_rows(conn: sqlite3.Connection) -> None:
-    rows = [_r(12345, 100, "👍", 3), _r(12345, 100, "❤", 1)]
+def test_replace_reaction_aggregates_inserts_fresh_rows(conn: sqlite3.Connection) -> None:
+    rows = [_r("👍", 3), _r("❤", 1)]
     with conn:
-        apply_reactions_delta(conn, 12345, 100, rows)
+        replace_reaction_aggregates(conn, 12345, 100, rows)
     assert _rows(conn, 12345, 100) == [("❤", 1), ("👍", 3)]
 
 
-def test_apply_reactions_delta_replaces_existing(conn: sqlite3.Connection) -> None:
+def test_replace_reaction_aggregates_replaces_existing(conn: sqlite3.Connection) -> None:
     with conn:
-        apply_reactions_delta(conn, 12345, 100, [_r(12345, 100, "👍", 3), _r(12345, 100, "❤", 1)])
+        replace_reaction_aggregates(conn, 12345, 100, [_r("👍", 3), _r("❤", 1)])
     with conn:
-        apply_reactions_delta(conn, 12345, 100, [_r(12345, 100, "🔥", 5)])
+        replace_reaction_aggregates(conn, 12345, 100, [_r("🔥", 5)])
     assert _rows(conn, 12345, 100) == [("🔥", 5)]
 
 
-def test_apply_reactions_delta_empty_rows_deletes_existing(conn: sqlite3.Connection) -> None:
+def test_replace_reaction_aggregates_empty_rows_deletes_existing(conn: sqlite3.Connection) -> None:
     with conn:
-        apply_reactions_delta(conn, 12345, 100, [_r(12345, 100, "👍", 3)])
+        replace_reaction_aggregates(conn, 12345, 100, [_r("👍", 3)])
     with conn:
-        apply_reactions_delta(conn, 12345, 100, [])
+        replace_reaction_aggregates(conn, 12345, 100, [])
     assert _rows(conn, 12345, 100) == []
 
 
-def test_apply_reactions_delta_idempotent(conn: sqlite3.Connection) -> None:
-    rows = [_r(12345, 100, "👍", 3), _r(12345, 100, "❤", 1)]
+def test_replace_reaction_aggregates_idempotent(conn: sqlite3.Connection) -> None:
+    rows = [_r("👍", 3), _r("❤", 1)]
     with conn:
-        apply_reactions_delta(conn, 12345, 100, rows)
+        replace_reaction_aggregates(conn, 12345, 100, rows)
     with conn:
-        apply_reactions_delta(conn, 12345, 100, rows)
+        replace_reaction_aggregates(conn, 12345, 100, rows)
     assert _rows(conn, 12345, 100) == [("❤", 1), ("👍", 3)]
 
 
-def test_apply_reactions_delta_scoped_to_message_id(conn: sqlite3.Connection) -> None:
+def test_replace_reaction_aggregates_scoped_to_message_id(conn: sqlite3.Connection) -> None:
     with conn:
-        apply_reactions_delta(conn, 12345, 100, [_r(12345, 100, "👍", 3)])
-        apply_reactions_delta(conn, 12345, 101, [_r(12345, 101, "❤", 7)])
+        replace_reaction_aggregates(conn, 12345, 100, [_r("👍", 3)])
+        replace_reaction_aggregates(conn, 12345, 101, [_r("❤", 7)])
     # Now mutate only msg 100; msg 101 must be untouched.
     with conn:
-        apply_reactions_delta(conn, 12345, 100, [_r(12345, 100, "🔥", 1)])
+        replace_reaction_aggregates(conn, 12345, 100, [_r("🔥", 1)])
     assert _rows(conn, 12345, 100) == [("🔥", 1)]
     assert _rows(conn, 12345, 101) == [("❤", 7)]
+
+
+def test_replace_reaction_aggregates_respects_caller_transaction(conn: sqlite3.Connection) -> None:
+    conn.execute("BEGIN")
+    replace_reaction_aggregates(conn, 12345, 100, [_r("👍", 3)])
+    conn.rollback()
+    assert _rows(conn, 12345, 100) == []

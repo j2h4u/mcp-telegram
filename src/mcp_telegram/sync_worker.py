@@ -44,6 +44,8 @@ from . import message_contracts as _message_contracts
 from .dialog_sync import _ACCESS_LOST_ERRORS, _set_access_lost
 from .flood import flood_seconds, sleep_through_flood
 from .fts import DELETE_FTS_SQL, INSERT_FTS_SQL, stem_text
+from .reactions.contracts import ReactionAggregate
+from .reactions.persistence import replace_reaction_aggregates
 from .resolver import latinize
 from .telethon_dialog import classify_dialog_type
 from .telethon_media import describe_media
@@ -187,37 +189,8 @@ INSERT_MESSAGE_SQL = (
     f"VALUES ({', '.join(':' + n for n in _SM_FIELDS)}, :reply_count, 0)"
 )
 
-INSERT_REACTION_SQL = _insert_sql("message_reactions", _message_contracts.ReactionRecord)
 INSERT_ENTITY_SQL = _insert_sql("message_entities", _message_contracts.EntityRecord)
 INSERT_FORWARD_SQL = _insert_sql("message_forwards", _message_contracts.ForwardRecord)
-
-_DELETE_REACTIONS_SQL = "DELETE FROM message_reactions WHERE dialog_id = ? AND message_id = ?"
-
-
-def apply_reactions_delta(
-    conn: sqlite3.Connection,
-    dialog_id: int,
-    message_id: int,
-    reaction_rows: list[_message_contracts.ReactionRecord],
-) -> None:
-    """Per-message reaction delta primitive.
-
-    DELETE existing rows for ``(dialog_id, message_id)`` then INSERT OR REPLACE
-    the supplied rows. Empty ``reaction_rows`` still performs the DELETE — this
-    is the reaction-removal path (Phase 39.2 AC-2 / AC-2-RAW).
-
-    The caller controls transaction boundary (e.g. ``with conn:``); this helper
-    does NOT open its own transaction.
-
-    Per-message primitive used by event handlers and JIT freshen path.
-    FullSyncWorker retains its own batched ``executemany`` insert path
-    (insert_messages_with_fts) for bulk history inserts; that code path is
-    intentionally NOT refactored to share this helper.
-    """
-    conn.execute(_DELETE_REACTIONS_SQL, (dialog_id, message_id))
-    if reaction_rows:
-        conn.executemany(INSERT_REACTION_SQL, [asdict(r) for r in reaction_rows])
-
 
 _DELETE_ENTITIES_SQL = "DELETE FROM message_entities WHERE dialog_id = ? AND message_id = ?"
 
@@ -252,14 +225,20 @@ def insert_messages_with_fts(
 
     # Delete existing child rows before re-inserting (edit idempotency).
     id_pairs = [(m.dialog_id, m.message_id) for m in msgs]
-    conn.executemany(_DELETE_REACTIONS_SQL, id_pairs)
     conn.executemany(_DELETE_ENTITIES_SQL, id_pairs)
     conn.executemany(_DELETE_FORWARD_SQL, id_pairs)
 
     # Insert fresh child rows
-    all_reactions = [r for em in extracted for r in em.reactions]
-    if all_reactions:
-        conn.executemany(INSERT_REACTION_SQL, [asdict(r) for r in all_reactions])
+    for extracted_message in extracted:
+        replace_reaction_aggregates(
+            conn,
+            extracted_message.message.dialog_id,
+            extracted_message.message.message_id,
+            tuple(
+                ReactionAggregate(emoji=reaction.emoji, count=reaction.count)
+                for reaction in extracted_message.reactions
+            ),
+        )
     all_entities = [e for em in extracted for e in em.entities]
     if all_entities:
         conn.executemany(INSERT_ENTITY_SQL, [asdict(e) for e in all_entities])

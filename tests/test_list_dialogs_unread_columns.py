@@ -27,6 +27,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from mcp_telegram.daemon_api import DaemonAPIServer, _DaemonClientLike
+from tests.reaction_helpers import make_reaction_freshener
 
 # ---------------------------------------------------------------------------
 # get_peer_id patch (daemon_api imports telethon_utils.get_peer_id; tests
@@ -193,7 +194,12 @@ def _insert_message(
 
 
 def _make_server(conn: sqlite3.Connection, client: object) -> DaemonAPIServer:
-    server = DaemonAPIServer(conn, cast(_DaemonClientLike, client), asyncio.Event())
+    server = DaemonAPIServer(
+        conn,
+        cast(_DaemonClientLike, client),
+        asyncio.Event(),
+        reaction_freshener=make_reaction_freshener(conn, client),
+    )
     server._ready = True
     return server
 

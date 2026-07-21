@@ -15,6 +15,7 @@ import pytest
 
 from mcp_telegram.daemon_api import DaemonAPIServer
 from mcp_telegram.feedback_db import VALID_SEVERITIES, ensure_feedback_schema
+from tests.reaction_helpers import make_reaction_freshener
 
 
 # ---------------------------------------------------------------------------
@@ -25,7 +26,13 @@ def _make_feedback_server(tmp_path: Path) -> Iterator[tuple[DaemonAPIServer, sql
     feedback_conn = ensure_feedback_schema(tmp_path / "feedback.db")
     client = MagicMock()
     shutdown_event = asyncio.Event()
-    server = DaemonAPIServer(sync_conn, client, shutdown_event, feedback_conn)
+    server = DaemonAPIServer(
+        sync_conn,
+        client,
+        shutdown_event,
+        feedback_conn,
+        reaction_freshener=make_reaction_freshener(sync_conn, client),
+    )
     server._ready = True
     try:
         yield server, feedback_conn
@@ -267,7 +274,13 @@ async def test_submit_feedback_db_error_returns_internal(tmp_path: Path) -> None
 
         client = MagicMock()
         shutdown_event = asyncio.Event()
-        server = DaemonAPIServer(sync_conn, client, shutdown_event, mock_feedback_conn)
+        server = DaemonAPIServer(
+            sync_conn,
+            client,
+            shutdown_event,
+            mock_feedback_conn,
+            reaction_freshener=make_reaction_freshener(sync_conn, client),
+        )
         server._ready = True
 
         response = await server._submit_feedback({"message": "trigger db error"})

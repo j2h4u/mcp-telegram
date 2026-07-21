@@ -28,6 +28,7 @@ from mcp_telegram.daemon_message_queries import _build_list_messages_query, _Lis
 from mcp_telegram.fts import MESSAGES_FTS_DDL, stem_text
 from mcp_telegram.models import DialogType
 from mcp_telegram.telethon_dialog import classify_dialog_type
+from tests.reaction_helpers import make_reaction_freshener
 
 # Track sqlite connections created by module helpers and close them after each test.
 _TRACKED_SQLITE_CONN_CLEANUP: Final[list[sqlite3.Connection]] = []
@@ -309,7 +310,13 @@ def make_server(
             "message TEXT NOT NULL, severity TEXT, context TEXT, model TEXT, harness TEXT)"
         )
     shutdown_event = asyncio.Event()
-    server = DaemonAPIServer(conn, cast(_DaemonClientLike, client), shutdown_event, feedback_conn)
+    server = DaemonAPIServer(
+        conn,
+        cast(_DaemonClientLike, client),
+        shutdown_event,
+        feedback_conn,
+        reaction_freshener=make_reaction_freshener(conn, client),
+    )
     server._ready = True
     return server
 
@@ -317,12 +324,14 @@ def make_server(
 def test_daemon_api_server_uses_explicit_sync_db_path(tmp_path: Path) -> None:
     conn = _make_db()
     sync_db_path = tmp_path / "sync.db"
+    client = _TestClient()
 
     server = DaemonAPIServer(
         conn,
-        cast(_DaemonClientLike, _TestClient()),
+        cast(_DaemonClientLike, client),
         asyncio.Event(),
         sync_db_path=sync_db_path,
+        reaction_freshener=make_reaction_freshener(conn, client),
     )
 
     assert server._sync_db_path == sync_db_path

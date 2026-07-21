@@ -52,6 +52,8 @@ from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
 from .activity_peer_resolve import _InputEntityResolverClient
 from .fts import DELETE_FTS_SQL, INSERT_FTS_SQL, stem_text
+from .reactions.persistence import replace_reaction_aggregates
+from .reactions.projection import project_reaction_aggregates
 from .read_state import apply_read_cursor
 from .resolver import latinize
 from .scheduled_messages import (
@@ -66,9 +68,7 @@ from .sync_worker import (
     UPSERT_ENTITY_SQL,
     _build_fwd_entity_map,
     _PeerNameClient,
-    apply_reactions_delta,
     extract_message_row,
-    extract_reactions_rows,
     insert_messages_with_fts,
 )
 from .telethon_dialog import classify_dialog_type
@@ -671,15 +671,15 @@ class EventHandlerManager:
                 #    (regression guard AC-8).
                 reactions_obj = msg.reactions
                 if reactions_obj is not None:
-                    rows = extract_reactions_rows(dialog_id, message_id, reactions_obj)
+                    aggregates = project_reaction_aggregates(reactions_obj)
                     with self._conn:
-                        apply_reactions_delta(self._conn, dialog_id, message_id, rows)
+                        replace_reaction_aggregates(self._conn, dialog_id, message_id, aggregates)
                         self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
                     logger.info(
                         "event_edit_reactions dialog_id=%d message_id=%d count=%d",
                         dialog_id,
                         message_id,
-                        len(rows),
+                        len(aggregates),
                     )
                 return
 
@@ -969,16 +969,16 @@ class EventHandlerManager:
             return
 
         try:
-            rows = extract_reactions_rows(dialog_id, msg_id, msg.reactions)
+            aggregates = project_reaction_aggregates(msg.reactions)
             now = int(time.time())
             with self._conn:
-                apply_reactions_delta(self._conn, dialog_id, msg_id, rows)
+                replace_reaction_aggregates(self._conn, dialog_id, msg_id, aggregates)
                 self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
             logger.info(
                 "event_raw_reaction dialog_id=%d message_id=%d count=%d",
                 dialog_id,
                 msg_id,
-                len(rows),
+                len(aggregates),
             )
         except Exception:
             logger.exception(

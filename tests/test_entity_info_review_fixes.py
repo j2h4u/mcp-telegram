@@ -22,6 +22,7 @@ from telethon.tl.types import User  # type: ignore[import-untyped]
 
 from mcp_telegram.daemon_api import DaemonAPIServer, _DaemonClientLike
 from mcp_telegram.tools.entity_info import _entity_input_label, _format_relative_ymd
+from tests.reaction_helpers import make_reaction_freshener
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -81,7 +82,12 @@ def _make_server(conn: sqlite3.Connection | None = None, client: _DaemonClientLi
         conn = _make_db()
     if client is None:
         client = MagicMock()
-    server = DaemonAPIServer(conn, cast(_DaemonClientLike, client), asyncio.Event())
+    server = DaemonAPIServer(
+        conn,
+        cast(_DaemonClientLike, client),
+        asyncio.Event(),
+        reaction_freshener=make_reaction_freshener(conn, client),
+    )
     server._ready = True
     return server
 

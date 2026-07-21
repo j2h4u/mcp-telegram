@@ -57,6 +57,7 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
 from .activity_cold_backfill import run_cold_backfill_loop
 from .activity_hot_sweep import run_hot_sweep_loop
 from .activity_sync import _ActivityClient, run_activity_sync_loop
+from .config import load_config
 from .daemon_api import DaemonAPIServer, _DaemonClientLike
 from .daemon_ipc import get_daemon_socket_path
 from .delta_sync import DeltaSyncWorker, _DeltaSyncClient, run_access_probe_loop
@@ -71,6 +72,9 @@ from .flood import (
 )
 from .fts import backfill_fts_index
 from .own_only import OwnOnlyContext, ensure_own_only_schema
+from .reactions.refresh import ReactionFreshener
+from .reactions.sqlite_repository import SQLiteReactionSnapshotRepository
+from .reactions.telegram_adapter import TelethonTelegramReactionGateway
 from .read_state import apply_read_cursor
 from .scheduled_messages import run_scheduled_reconciliation_loop
 from .sync_db import (
@@ -652,6 +656,7 @@ def _create_tracked_task(
 
 
 async def _build_sync_main_context() -> _SyncMainContext:
+    config = load_config()
     db_path = get_sync_db_path()
     ensure_sync_schema(db_path)
 
@@ -670,7 +675,20 @@ async def _build_sync_main_context() -> _SyncMainContext:
     shutdown_event = register_shutdown_handler(conn, loop, feedback_conn=feedback_conn)
 
     client = cast(_DaemonClient, create_client(catch_up=True))
-    api_server = DaemonAPIServer(conn, cast(_DaemonClientLike, client), shutdown_event, feedback_conn, db_path)
+    reaction_freshener = ReactionFreshener(
+        SQLiteReactionSnapshotRepository(conn),
+        TelethonTelegramReactionGateway(client),
+        freshness_ttl_seconds=config.reactions.freshness_ttl_seconds,
+        log=logger,
+    )
+    api_server = DaemonAPIServer(
+        conn,
+        cast(_DaemonClientLike, client),
+        shutdown_event,
+        feedback_conn,
+        db_path,
+        reaction_freshener=reaction_freshener,
+    )
     socket_path = get_daemon_socket_path()
     # Ensure the runtime/state dir exists before binding — do not assume a prior
     # get_sync_db_path() call (or a Docker volume mount) already created it.

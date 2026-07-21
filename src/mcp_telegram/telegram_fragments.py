@@ -7,7 +7,9 @@ from collections.abc import AsyncIterator, Sequence
 from dataclasses import asdict
 from typing import Protocol, cast
 
-from .sync_worker import INSERT_MESSAGE_SQL, apply_reactions_delta, extract_message_row
+from .reactions.contracts import ReactionAggregate
+from .reactions.persistence import replace_reaction_aggregates
+from .sync_worker import INSERT_MESSAGE_SQL, extract_message_row
 from .telegram_gateway import CATCHABLE_GATEWAY_FAILURES, translate_gateway_failure
 from .telegram_reading import FragmentFetchResult, TelegramFragmentGateway
 
@@ -41,7 +43,12 @@ class FragmentContextService:
                 [{**asdict(item.message), "reply_count": item.reply_count} for item in result.messages],
             )
             for item in result.messages:
-                apply_reactions_delta(self._conn, dialog_id, item.message.message_id, item.reactions)
+                replace_reaction_aggregates(
+                    self._conn,
+                    dialog_id,
+                    item.message.message_id,
+                    tuple(ReactionAggregate(emoji=reaction.emoji, count=reaction.count) for reaction in item.reactions),
+                )
         return result
 
 
