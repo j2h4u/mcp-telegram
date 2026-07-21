@@ -16,9 +16,10 @@ from telethon.tl.functions.contacts import ResolveUsernameRequest  # type: ignor
 from .activity_peer_resolve import resolve_linked_chat_id
 from .activity_peer_sweep import enroll_activity_dialog
 from .dialog_sync import _ACCESS_LOST_ERRORS
+from .message_contracts import ExtractedMessage
 from .models import DialogType
 from .resolver import Candidates, Resolved, _parse_tme_link, latinize, resolve
-from .sync_worker import ExtractedMessage, extract_message_row, insert_messages_with_fts
+from .sync_worker import extract_message_row, insert_messages_with_fts
 from .telethon_dialog import classify_dialog_type
 
 _TRACE_SCOPE_DIALOG_IDS_LEN = 2

@@ -31,7 +31,7 @@ from mcp_telegram.daemon_account_trace import (
     _TraceCandidateBuildRequest,
 )
 from mcp_telegram.daemon_api import DaemonAPIServer
-from mcp_telegram.sync_worker import (
+from mcp_telegram.message_contracts import (
     EntityRecord,
     ExtractedMessage,
     ForwardRecord,

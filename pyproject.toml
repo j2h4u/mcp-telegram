@@ -124,7 +124,6 @@ select = [
     "PERF",
     "BLE",
     "PLR2004",
-    "C901",
     "PLR0911",
     "PLR0912",
     "PLR0913",
@@ -212,7 +211,11 @@ ignore_missing_imports = true
 # vulture_whitelist.py lists intentionally-retained symbols (text-rendering layer,
 # framework/dotMD false positives) so the advisory scan flags only NEW dead code.
 paths = ["src/mcp_telegram", "scripts", "vulture_whitelist.py"]
-exclude = ["src/mcp_telegram/models.py", "src/mcp_telegram/telegram_reading.py"]
+exclude = [
+  "src/mcp_telegram/message_contracts.py",
+  "src/mcp_telegram/models.py",
+  "src/mcp_telegram/telegram_reading.py",
+]
 min_confidence = 60
 # Entrypoints/callbacks registered via decorators look "unused" to vulture's static
 # scan; Pydantic validators are invoked by Pydantic, not called directly.
@@ -256,7 +259,9 @@ root_package = "mcp_telegram"
 name = "Core shared contracts stay below transport/runtime layers"
 type = "forbidden"
 source_modules = [
+  "mcp_telegram.message_contracts",
   "mcp_telegram.models",
+  "mcp_telegram.telegram_reading",
   "mcp_telegram.resolver",
   "mcp_telegram.formatter",
   "mcp_telegram.pagination",
@@ -449,7 +454,6 @@ source_modules = [
   "mcp_telegram.telegram_reaction_queries",
   "mcp_telegram.telegram_reactions",
   "mcp_telegram.telegram_read_receipts",
-  "mcp_telegram.telegram_reading",
 ]
 forbidden_modules = [
   "mcp_telegram.daemon",

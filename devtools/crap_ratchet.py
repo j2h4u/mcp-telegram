@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -9,6 +10,7 @@ from radon.complexity import cc_visit
 
 DEFAULT_THRESHOLD = 30.0
 DEFAULT_EPSILON = 0.5
+BASELINE_VERSION = 2
 DEFAULT_SOURCE_ROOT = Path("src/mcp_telegram")
 
 
@@ -43,6 +45,15 @@ class _BaselineReport(TypedDict):
     version: int
     source_root: str
     threshold: float
+    functions: dict[str, _BaselineFunctionEntry]
+
+
+@dataclass(frozen=True, slots=True)
+class BaselineData:
+    version: int
+    source_root: str | None
+    threshold: float | None
+    epsilon: float | None
     functions: dict[str, _BaselineFunctionEntry]
 
 
@@ -125,6 +136,11 @@ def _expect_float(value: object, context: str) -> float:
     return float(value)
 
 
+def _is_legacy_entry(entry: _BaselineFunctionEntry, threshold: float) -> bool:
+    crap = entry.get("crap")
+    return isinstance(crap, (int, float)) and float(crap) > threshold
+
+
 def _is_class_block(block: _RadonBlock) -> TypeGuard[_RadonClassBlock]:
     return hasattr(block, "methods") and hasattr(block, "inner_classes")
 
@@ -156,19 +172,98 @@ def _load_coverage_report(path: Path) -> _CoverageReport:
     return cast(_CoverageReport, {"files": files})
 
 
-def _load_baseline(path: Path) -> dict[str, _BaselineFunctionEntry]:
+def _normalized_source_root(source_root: Path, baseline_path: Path) -> str:
+    resolved_source_root = source_root.resolve()
+    project_root = next(
+        (
+            parent
+            for parent in (resolved_source_root, *resolved_source_root.parents)
+            if (parent / "pyproject.toml").is_file()
+        ),
+        None,
+    )
+    if project_root is None:
+        project_root = Path(os.path.commonpath((resolved_source_root, baseline_path.resolve().parent)))
+    return resolved_source_root.relative_to(project_root).as_posix()
+
+
+def _validate_v2_baseline(
+    baseline: BaselineData,
+    path: Path,
+    source_root: Path | None,
+    threshold: float,
+    epsilon: float,
+) -> None:
+    if source_root is None:
+        raise ValueError("v2 baseline validation requires a source root")
+    expected_source_root = _normalized_source_root(source_root, path)
+    if baseline.threshold is None or baseline.threshold != threshold:
+        raise ValueError(f"baseline threshold must match --threshold ({threshold:g})")
+    if baseline.epsilon is None or baseline.epsilon != epsilon:
+        raise ValueError(f"baseline epsilon must match --epsilon ({epsilon:g})")
+    if baseline.source_root != expected_source_root:
+        raise ValueError(f"baseline source_root must match --src ({expected_source_root})")
+    for key, entry in baseline.functions.items():
+        if not isinstance(entry, dict):
+            raise ValueError(f"baseline entry for {key} is invalid")
+        crap = entry.get("crap")
+        if not isinstance(crap, (int, float)) or float(crap) <= threshold:
+            raise ValueError(f"baseline entry for {key} must have crap > threshold ({threshold:g})")
+
+
+def _load_baseline(
+    path: Path,
+    *,
+    threshold: float = DEFAULT_THRESHOLD,
+    epsilon: float = DEFAULT_EPSILON,
+    source_root: Path | None = None,
+) -> BaselineData:
     raw_report = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
     entries = raw_report.get("functions", {})
     if not isinstance(entries, dict):
         raise ValueError("baseline file does not contain an object at 'functions'")
-    return cast(dict[str, _BaselineFunctionEntry], entries)
+    version = raw_report.get("version", 1)
+    if not isinstance(version, int) or version not in (1, 2):
+        raise ValueError("unsupported CRAP baseline version")
+    baseline_source_root = raw_report.get("source_root")
+    if baseline_source_root is not None and not isinstance(baseline_source_root, str):
+        raise ValueError("baseline source_root is invalid")
+    raw_threshold = raw_report.get("threshold")
+    baseline_threshold = float(raw_threshold) if isinstance(raw_threshold, (int, float)) else None
+    raw_epsilon = raw_report.get("epsilon")
+    baseline_epsilon = float(raw_epsilon) if isinstance(raw_epsilon, (int, float)) else None
+    functions = cast(dict[str, _BaselineFunctionEntry], entries)
+    # v1 was a full snapshot. Migration retains only genuine legacy debt.
+    if version == 1:
+        functions = {
+            key: entry
+            for key, entry in functions.items()
+            if isinstance(entry, dict) and _is_legacy_entry(entry, threshold)
+        }
+    baseline = BaselineData(version, baseline_source_root, baseline_threshold, baseline_epsilon, functions)
+    if version == BASELINE_VERSION:
+        _validate_v2_baseline(
+            baseline,
+            path=path,
+            source_root=source_root,
+            threshold=threshold,
+            epsilon=epsilon,
+        )
+    return baseline
 
 
-def _save_baseline(path: Path, source_root: Path, threshold: float, metrics: list[FunctionMetric]) -> None:
+def _save_baseline(
+    path: Path,
+    source_root: Path,
+    threshold: float,
+    epsilon: float,
+    metrics: list[FunctionMetric],
+) -> None:
     payload = {
-        "version": 1,
-        "source_root": source_root.as_posix(),
+        "version": BASELINE_VERSION,
+        "source_root": _normalized_source_root(source_root, path),
         "threshold": threshold,
+        "epsilon": epsilon,
         "functions": {
             metric.key: {
                 "path": metric.path,
@@ -180,7 +275,26 @@ def _save_baseline(path: Path, source_root: Path, threshold: float, metrics: lis
                 "crap": metric.crap,
             }
             for metric in sorted(metrics, key=lambda item: item.key)
+            if metric.crap > threshold
         },
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _save_baseline_entries(
+    path: Path,
+    source_root: Path,
+    threshold: float,
+    epsilon: float,
+    entries: dict[str, _BaselineFunctionEntry],
+) -> None:
+    payload = {
+        "version": BASELINE_VERSION,
+        "source_root": _normalized_source_root(source_root, path),
+        "threshold": threshold,
+        "epsilon": epsilon,
+        "functions": {key: value for key, value in sorted(entries.items()) if _is_legacy_entry(value, threshold)},
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -252,7 +366,7 @@ def _compare_metrics(
     for metric in current:
         baseline_entry = baseline.get(metric.key)
         if baseline_entry is None:
-            if metric.crap > threshold + epsilon:
+            if metric.crap > threshold:
                 issues.append(
                     RatchetIssue(
                         key=metric.key,
@@ -268,8 +382,10 @@ def _compare_metrics(
             baseline_entry.get("crap", 0.0),
             f"baseline entry for {metric.key} has invalid crap",
         )
+        # Epsilon is deliberately a legacy-only allowance. Baseline entries
+        # are debt caps (> threshold); healthy entries must not be baselined.
         delta = metric.crap - baseline_crap
-        if delta > epsilon:
+        if metric.crap > threshold and delta > epsilon:
             issues.append(
                 RatchetIssue(
                     key=metric.key,
@@ -303,7 +419,7 @@ def _tighten_baseline(
     for metric in current:
         baseline_entry = baseline.get(metric.key)
         if baseline_entry is None:
-            if metric.crap > threshold + epsilon:
+            if metric.crap > threshold:
                 issues.append(
                     RatchetIssue(
                         key=metric.key,
@@ -322,7 +438,7 @@ def _tighten_baseline(
             baseline_entry.get("crap", 0.0),
             f"baseline entry for {metric.key} has invalid crap",
         )
-        if metric.crap > baseline_crap + epsilon:
+        if metric.crap > threshold and metric.crap > baseline_crap + epsilon:
             issues.append(
                 RatchetIssue(
                     key=metric.key,
@@ -332,6 +448,10 @@ def _tighten_baseline(
                     delta=metric.crap - baseline_crap,
                 )
             )
+            continue
+
+        if metric.crap <= threshold:
+            # Graduation removes debt from the snapshot entirely.
             continue
 
         if metric.crap < baseline_crap:
@@ -401,7 +521,7 @@ def _build_parser() -> argparse.ArgumentParser:
     modes.add_argument(
         "--write-baseline",
         action="store_true",
-        help="regenerate the baseline from the current report",
+        help="deprecated; full baseline blessing is disabled (use --tighten-baseline)",
     )
     modes.add_argument(
         "--tighten-baseline",
@@ -416,7 +536,7 @@ def _parse_args(argv: list[str] | None) -> _RatchetArgs:
     return cast(_RatchetArgs, parser.parse_args(argv))
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None) -> int:  # noqa: PLR0911
     args = _parse_args(argv)
 
     coverage_report = _load_coverage_report(args.coverage)
@@ -424,12 +544,21 @@ def main(argv: list[str] | None = None) -> int:
     metrics = _function_metrics_from_report(coverage_report, source_root)
 
     if args.write_baseline:
-        _save_baseline(args.baseline, source_root, args.threshold, metrics)
-        print(f"Wrote {len(metrics)} CRAP baseline entries to {args.baseline}")
-        return 0
+        print("--write-baseline is disabled; use --tighten-baseline for monotonic migration")
+        return 2
 
     if args.tighten_baseline:
-        baseline = _load_baseline(args.baseline)
+        try:
+            baseline_data = _load_baseline(
+                args.baseline,
+                threshold=args.threshold,
+                epsilon=args.epsilon,
+                source_root=source_root,
+            )
+        except ValueError as error:
+            print(f"CRAP ratchet failed: {error}")
+            return 1
+        baseline = baseline_data.functions
         tightened_metrics, issues = _tighten_baseline(
             metrics,
             baseline,
@@ -442,11 +571,22 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  {_format_issue(issue)}")
             return 1
 
-        _save_baseline(args.baseline, source_root, args.threshold, tightened_metrics)
-        print(f"Wrote {len(tightened_metrics)} CRAP baseline entries to {args.baseline}")
+        _save_baseline(args.baseline, source_root, args.threshold, args.epsilon, tightened_metrics)
+        legacy_count = sum(metric.crap > args.threshold for metric in tightened_metrics)
+        print(f"Wrote {legacy_count} CRAP baseline entries to {args.baseline}")
         return 0
 
-    baseline = _load_baseline(args.baseline)
+    try:
+        baseline_data = _load_baseline(
+            args.baseline,
+            threshold=args.threshold,
+            epsilon=args.epsilon,
+            source_root=source_root,
+        )
+    except ValueError as error:
+        print(f"CRAP ratchet failed: {error}")
+        return 1
+    baseline = baseline_data.functions
     issues = _compare_metrics(metrics, baseline, args.threshold, args.epsilon)
     if issues:
         print(f"CRAP ratchet failed: {len(issues)} issue(s)")

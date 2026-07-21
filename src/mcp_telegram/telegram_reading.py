@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass
 from enum import StrEnum
 from typing import Protocol
 
-from .sync_worker import ExtractedMessage, ReactionRecord
+from .message_contracts import ExtractedMessage, ReactionRecord
 
 
 class GatewayFailureKind(StrEnum):

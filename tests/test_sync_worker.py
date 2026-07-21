@@ -18,10 +18,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from helpers import MockTotalList, build_mock_message, build_mock_reactions
+from mcp_telegram.message_contracts import StoredMessage
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.sync_worker import (
     FullSyncWorker,
-    StoredMessage,
     _PeerLike,
     extract_message_row,
     insert_messages_with_fts,
@@ -1643,12 +1643,13 @@ def test_extract_fwd_row() -> None:
 
 def test_extract_message_row_returns_dataclass() -> None:
     """extract_message_row returns an ExtractedMessage with expected fields."""
-    from mcp_telegram.sync_worker import ExtractedMessage, extract_message_row
+    from mcp_telegram.message_contracts import ExtractedMessage
+    from mcp_telegram.sync_worker import extract_message_row
 
     msg = build_mock_message(id=123, text="hello")
     result = extract_message_row(1, msg)
 
-    from mcp_telegram.sync_worker import StoredMessage
+    from mcp_telegram.message_contracts import StoredMessage
 
     assert isinstance(result, ExtractedMessage)
     assert isinstance(result.message, StoredMessage)
@@ -1959,7 +1960,8 @@ def _stored(dialog_id: int, message_id: int, text: str = "hello") -> StoredMessa
 
 def test_insert_messages_with_fts_writes_reactions(sync_db: _SQLiteConnection) -> None:
     """insert_messages_with_fts writes reaction rows to message_reactions table."""
-    from mcp_telegram.sync_worker import ExtractedMessage, ReactionRecord, insert_messages_with_fts
+    from mcp_telegram.message_contracts import ExtractedMessage, ReactionRecord
+    from mcp_telegram.sync_worker import insert_messages_with_fts
 
     dialog_id = 9001
     message_id = 1
@@ -1987,7 +1989,8 @@ def test_insert_messages_with_fts_writes_reactions(sync_db: _SQLiteConnection) -
 
 def test_insert_messages_with_fts_writes_forwards(sync_db: _SQLiteConnection) -> None:
     """insert_messages_with_fts writes forward metadata to message_forwards table."""
-    from mcp_telegram.sync_worker import ExtractedMessage, ForwardRecord, insert_messages_with_fts
+    from mcp_telegram.message_contracts import ExtractedMessage, ForwardRecord
+    from mcp_telegram.sync_worker import insert_messages_with_fts
 
     dialog_id = 9002
     message_id = 2
@@ -2020,7 +2023,8 @@ def test_insert_messages_with_fts_writes_forwards(sync_db: _SQLiteConnection) ->
 
 def test_insert_messages_with_fts_edit_idempotency_reactions(sync_db: _SQLiteConnection) -> None:
     """Inserting same message_id twice replaces reactions (DELETE-before-INSERT)."""
-    from mcp_telegram.sync_worker import ExtractedMessage, ReactionRecord, insert_messages_with_fts
+    from mcp_telegram.message_contracts import ExtractedMessage, ReactionRecord
+    from mcp_telegram.sync_worker import insert_messages_with_fts
 
     dialog_id = 9003
     message_id = 3
@@ -2056,7 +2060,8 @@ def test_insert_messages_with_fts_edit_idempotency_reactions(sync_db: _SQLiteCon
 
 def test_insert_messages_with_fts_edit_idempotency_entities(sync_db: _SQLiteConnection) -> None:
     """Inserting same message_id twice replaces entities (DELETE-before-INSERT)."""
-    from mcp_telegram.sync_worker import EntityRecord, ExtractedMessage, insert_messages_with_fts
+    from mcp_telegram.message_contracts import EntityRecord, ExtractedMessage
+    from mcp_telegram.sync_worker import insert_messages_with_fts
 
     dialog_id = 9004
     message_id = 4
@@ -2094,7 +2099,8 @@ def test_insert_messages_with_fts_edit_idempotency_entities(sync_db: _SQLiteConn
 
 def test_insert_messages_with_fts_edit_idempotency_forwards(sync_db: _SQLiteConnection) -> None:
     """Inserting same message_id with no forward clears forward row."""
-    from mcp_telegram.sync_worker import ExtractedMessage, ForwardRecord, insert_messages_with_fts
+    from mcp_telegram.message_contracts import ExtractedMessage, ForwardRecord
+    from mcp_telegram.sync_worker import insert_messages_with_fts
 
     dialog_id = 9005
     message_id = 5

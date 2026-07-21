@@ -9,7 +9,7 @@ default:
     @just --list
 
 # Run all local source checks.
-check: fmt-check lint preview-complexity-lint lock-check typecheck typecheck-pyright typecheck-tests runtime-seams actionlint supply-chain-pins deptry compile deadcode package-smoke
+check: fmt-check lint complexity-ratchet lock-check typecheck typecheck-pyright typecheck-tests runtime-seams actionlint supply-chain-pins deptry compile deadcode package-smoke
 
 # Verify uv.lock is synchronized with pyproject.toml.
 lock-check:
@@ -19,9 +19,9 @@ lock-check:
 lint:
     uv run ruff check --preview src tests deploy scripts
 
-# Check selected complexity/refactor rules from Ruff preview.
-preview-complexity-lint:
-    uv run ruff check --preview --select PLR0914,PLR0916,PLR0917 src tests deploy scripts
+# Canonical complexity gate: Radon CC with policy cutoff A/B=10.
+complexity-ratchet:
+    uv run python -m devtools.radon_ratchet --src src/mcp_telegram --baseline reports/radon-baseline.json
 
 # Check formatting without writing.
 fmt-check:
@@ -103,12 +103,12 @@ crap:
 # CI/regression CRAP gate that checks the tracked baseline.
 crap-check: crap-ratchet
 
-# Regenerate the tracked CRAP baseline from the current coverage state.
+# Migrate/tighten the tracked CRAP baseline from the current coverage state.
 crap-baseline:
     coverage_file="$(mktemp /tmp/mcp-telegram-crap-coverage.XXXXXX.json)"; \
     trap 'rm -f "$coverage_file"' EXIT; \
     uv run pytest --cov=src/mcp_telegram --cov-report=json:"$coverage_file"; \
-    uv run python -m devtools.crap_ratchet --coverage "$coverage_file" --baseline reports/crap-baseline.json --src src/mcp_telegram --threshold 30 --write-baseline
+    uv run python -m devtools.crap_ratchet --coverage "$coverage_file" --baseline reports/crap-baseline.json --src src/mcp_telegram --threshold 30 --tighten-baseline
 
 # Tighten the tracked CRAP baseline by clamping existing entries downward and adding
 # only new entries that are at/below threshold.

@@ -27,8 +27,8 @@ from telethon.errors import (
 
 from .dialog_sync import _ACCESS_LOST_ERRORS, _set_access_lost
 from .flood import flood_seconds, sleep_through_flood
+from .message_contracts import ExtractedMessage
 from .sync_worker import (
-    ExtractedMessage,
     extract_message_row,
     insert_messages_with_fts,
 )

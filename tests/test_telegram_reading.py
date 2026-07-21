@@ -16,8 +16,8 @@ import pytest
 from telethon.errors import ChannelPrivateError, FloodWaitError
 from telethon.tl import types
 
+from mcp_telegram.message_contracts import ReactionRecord
 from mcp_telegram.models import ReadMessage
-from mcp_telegram.sync_worker import ReactionRecord
 from mcp_telegram.telegram_fact_queries import enrich_read_at
 from mcp_telegram.telegram_fragments import FragmentContextService, TelethonTelegramFragmentGateway
 from mcp_telegram.telegram_reaction_queries import persist_reaction_snapshots

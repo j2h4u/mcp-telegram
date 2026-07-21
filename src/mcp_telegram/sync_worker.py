@@ -22,7 +22,7 @@ import logging
 import sqlite3
 import time
 from collections.abc import AsyncIterator, Iterator, Sequence
-from dataclasses import asdict, dataclass, field, fields, replace
+from dataclasses import asdict, fields, replace
 from datetime import datetime
 from typing import Protocol, TypeVar, cast
 
@@ -40,6 +40,7 @@ from telethon.errors import (  # type: ignore[import-untyped]
 )
 from telethon.tl import types  # type: ignore[import-untyped]
 
+from . import message_contracts as _message_contracts
 from .dialog_sync import _ACCESS_LOST_ERRORS, _set_access_lost
 from .flood import flood_seconds, sleep_through_flood
 from .fts import DELETE_FTS_SQL, INSERT_FTS_SQL, stem_text
@@ -52,70 +53,6 @@ logger = logging.getLogger(__name__)
 _BATCH_SIZE = 100
 _UNSUPPORTED_MEDIA_DESCRIPTION = "[неподдерживаемый тип]"
 T = TypeVar("T")
-
-
-# ---------------------------------------------------------------------------
-# ExtractedMessage dataclass
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class StoredMessage:
-    """Row shape for INSERT OR REPLACE INTO messages.
-
-    Field names are the single source of truth for column names and INSERT SQL.
-    is_deleted is always 0 at insert time (hardcoded in INSERT_MESSAGE_SQL).
-    """
-
-    dialog_id: int
-    message_id: int
-    sent_at: int
-    text: str | None
-    sender_id: int | None
-    sender_first_name: str | None
-    media_description: str | None
-    reply_to_msg_id: int | None
-    forum_topic_id: int | None
-    edit_date: int | None
-    grouped_id: int | None
-    reply_to_peer_id: int | None
-    out: int
-    is_service: int
-    post_author: str | None
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class ReactionRecord:
-    """One row in message_reactions."""
-
-    dialog_id: int
-    message_id: int
-    emoji: str
-    count: int
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class EntityRecord:
-    """One row in message_entities."""
-
-    dialog_id: int
-    message_id: int
-    offset: int
-    length: int
-    type: str
-    value: str | None
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class ForwardRecord:
-    """One row in message_forwards."""
-
-    dialog_id: int
-    message_id: int
-    fwd_from_peer_id: int | None
-    fwd_from_name: str | None
-    fwd_date: int | None
-    fwd_channel_post: int | None
 
 
 class _PeerLike(Protocol):
@@ -233,17 +170,6 @@ class _PeerNameClient(Protocol):
 _DialogRow = dict[str, object]
 
 
-@dataclass
-class ExtractedMessage:
-    """Bundle of extracted rows for atomic multi-table insert."""
-
-    message: StoredMessage
-    reply_count: int
-    reactions: list[ReactionRecord] = field(default_factory=list)
-    entities: list[EntityRecord] = field(default_factory=list)
-    forward: ForwardRecord | None = None
-
-
 # ---------------------------------------------------------------------------
 # SQL constants — generated from dataclass field names (single source of truth)
 # ---------------------------------------------------------------------------
@@ -255,15 +181,15 @@ def _insert_sql(table: str, dc_type: type) -> str:
     return f"INSERT OR REPLACE INTO {table} ({', '.join(col_names)}) VALUES ({', '.join(':' + n for n in col_names)})"
 
 
-_SM_FIELDS = tuple(f.name for f in fields(StoredMessage))
+_SM_FIELDS = tuple(f.name for f in fields(_message_contracts.StoredMessage))
 INSERT_MESSAGE_SQL = (
     f"INSERT OR REPLACE INTO messages ({', '.join(_SM_FIELDS)}, reply_count, is_deleted) "
     f"VALUES ({', '.join(':' + n for n in _SM_FIELDS)}, :reply_count, 0)"
 )
 
-INSERT_REACTION_SQL = _insert_sql("message_reactions", ReactionRecord)
-INSERT_ENTITY_SQL = _insert_sql("message_entities", EntityRecord)
-INSERT_FORWARD_SQL = _insert_sql("message_forwards", ForwardRecord)
+INSERT_REACTION_SQL = _insert_sql("message_reactions", _message_contracts.ReactionRecord)
+INSERT_ENTITY_SQL = _insert_sql("message_entities", _message_contracts.EntityRecord)
+INSERT_FORWARD_SQL = _insert_sql("message_forwards", _message_contracts.ForwardRecord)
 
 _DELETE_REACTIONS_SQL = "DELETE FROM message_reactions WHERE dialog_id = ? AND message_id = ?"
 
@@ -272,7 +198,7 @@ def apply_reactions_delta(
     conn: sqlite3.Connection,
     dialog_id: int,
     message_id: int,
-    reaction_rows: list[ReactionRecord],
+    reaction_rows: list[_message_contracts.ReactionRecord],
 ) -> None:
     """Per-message reaction delta primitive.
 
@@ -300,7 +226,7 @@ _DELETE_FORWARD_SQL = "DELETE FROM message_forwards WHERE dialog_id = ? AND mess
 
 def insert_messages_with_fts(
     conn: sqlite3.Connection,
-    extracted: list[ExtractedMessage],
+    extracted: list[_message_contracts.ExtractedMessage],
 ) -> None:
     """Insert message rows and all related tables atomically.
 
@@ -344,8 +270,8 @@ def insert_messages_with_fts(
 
 def _preserve_transcribed_texts(
     conn: sqlite3.Connection,
-    extracted: list[ExtractedMessage],
-) -> list[ExtractedMessage]:
+    extracted: list[_message_contracts.ExtractedMessage],
+) -> list[_message_contracts.ExtractedMessage]:
     preserved_texts = _existing_transcribed_texts(conn, extracted)
     if not preserved_texts:
         return extracted
@@ -354,7 +280,7 @@ def _preserve_transcribed_texts(
 
 def _existing_transcribed_texts(
     conn: sqlite3.Connection,
-    extracted: Sequence[ExtractedMessage],
+    extracted: Sequence[_message_contracts.ExtractedMessage],
 ) -> dict[tuple[int, int], str]:
     preserved_texts: dict[tuple[int, int], str] = {}
     for em in extracted:
@@ -364,7 +290,9 @@ def _existing_transcribed_texts(
     return preserved_texts
 
 
-def _existing_text_for_blank_unsupported(conn: sqlite3.Connection, extracted: ExtractedMessage) -> str | None:
+def _existing_text_for_blank_unsupported(
+    conn: sqlite3.Connection, extracted: _message_contracts.ExtractedMessage
+) -> str | None:
     if extracted.message.text or extracted.message.media_description != _UNSUPPORTED_MEDIA_DESCRIPTION:
         return None
     row = cast(
@@ -378,9 +306,9 @@ def _existing_text_for_blank_unsupported(conn: sqlite3.Connection, extracted: Ex
 
 
 def _with_preserved_text(
-    extracted: ExtractedMessage,
+    extracted: _message_contracts.ExtractedMessage,
     preserved_texts: dict[tuple[int, int], str],
-) -> ExtractedMessage:
+) -> _message_contracts.ExtractedMessage:
     key = (extracted.message.dialog_id, extracted.message.message_id)
     text = preserved_texts.get(key)
     if text is None:
@@ -484,52 +412,6 @@ def _touch_message_fields(msg: _MessageLike) -> None:
         _ = msg.fwd_from
 
 
-def _touch_stored_message_fields(message: StoredMessage) -> None:
-    _ = (
-        message.dialog_id,
-        message.message_id,
-        message.sent_at,
-        message.text,
-        message.sender_id,
-        message.sender_first_name,
-        message.media_description,
-        message.reply_to_msg_id,
-        message.forum_topic_id,
-        message.edit_date,
-        message.grouped_id,
-        message.reply_to_peer_id,
-        message.out,
-        message.is_service,
-        message.post_author,
-    )
-
-
-def _touch_reaction_record_fields(record: ReactionRecord) -> None:
-    _ = (record.dialog_id, record.message_id, record.emoji, record.count)
-
-
-def _touch_entity_record_fields(record: EntityRecord) -> None:
-    _ = (
-        record.dialog_id,
-        record.message_id,
-        record.offset,
-        record.length,
-        record.type,
-        record.value,
-    )
-
-
-def _touch_forward_record_fields(record: ForwardRecord) -> None:
-    _ = (
-        record.dialog_id,
-        record.message_id,
-        record.fwd_from_peer_id,
-        record.fwd_from_name,
-        record.fwd_date,
-        record.fwd_channel_post,
-    )
-
-
 def extract_reply_count(msg: object) -> int:
     """Extract Telegram's aggregate reply/comment count from a message."""
     replies = _attr(msg, "replies", None)
@@ -545,7 +427,7 @@ def extract_reactions_rows(
     dialog_id: int,
     message_id: int,
     reactions: object | None,
-) -> list[ReactionRecord]:
+) -> list[_message_contracts.ReactionRecord]:
     """Extract reaction rows from a Telethon MessageReactions object.
 
     Returns empty list if reactions is None or has no results.
@@ -555,19 +437,18 @@ def extract_reactions_rows(
     results = cast(Sequence[object], _attr(reactions, "results", ()))
     if not results:
         return []
-    rows: list[ReactionRecord] = []
+    rows: list[_message_contracts.ReactionRecord] = []
     for item in results:
         reaction = _attr(item, "reaction", None)
         emoticon = _attr(reaction, "emoticon", None) if reaction is not None else None
         count = _attr(item, "count", 0)
         if emoticon is not None:
-            record = ReactionRecord(
+            record = _message_contracts.ReactionRecord(
                 dialog_id=dialog_id,
                 message_id=message_id,
                 emoji=emoticon,
                 count=int(count),
             )
-            _touch_reaction_record_fields(record)
             rows.append(record)
     return rows
 
@@ -650,7 +531,7 @@ def _extract_entity_value(
     return False, None
 
 
-def extract_entity_rows(dialog_id: int, message_id: int, msg: object) -> list[EntityRecord]:
+def extract_entity_rows(dialog_id: int, message_id: int, msg: object) -> list[_message_contracts.EntityRecord]:
     """Extract analytics-valuable entity rows from a Telethon message.
 
     Captures: mention, mention_name, hashtag, url, text_url.
@@ -680,7 +561,7 @@ def extract_entity_rows(dialog_id: int, message_id: int, msg: object) -> list[En
     if not _ANALYTICS_ENTITY_TYPES:
         return []  # Telethon not available (test env)
     text = _attr(msg, "message", "") or ""
-    rows: list[EntityRecord] = []
+    rows: list[_message_contracts.EntityRecord] = []
     for entity in entities:
         entity_type = _analytics_entity_type(entity)
         if entity_type is None:
@@ -691,7 +572,7 @@ def extract_entity_rows(dialog_id: int, message_id: int, msg: object) -> list[En
         if not should_keep_row:
             continue
         rows.append(
-            EntityRecord(
+            _message_contracts.EntityRecord(
                 dialog_id=dialog_id,
                 message_id=message_id,
                 offset=offset,
@@ -700,7 +581,6 @@ def extract_entity_rows(dialog_id: int, message_id: int, msg: object) -> list[En
                 value=value,
             )
         )
-        _touch_entity_record_fields(rows[-1])
     return rows
 
 
@@ -885,7 +765,7 @@ def extract_fwd_row(
     message_id: int,
     msg: object,
     entity_name_map: dict[int, str] | None = None,
-) -> ForwardRecord | None:
+) -> _message_contracts.ForwardRecord | None:
     """Extract forward metadata from a Telethon message.
 
     entity_name_map is a {peer_id: name} dict built from the batch response
@@ -913,7 +793,7 @@ def extract_fwd_row(
     fwd_channel_post = _attr(fwd, "channel_post", None)
     if fwd_channel_post is not None:
         fwd_channel_post = int(fwd_channel_post)
-    record = ForwardRecord(
+    return _message_contracts.ForwardRecord(
         dialog_id=dialog_id,
         message_id=message_id,
         fwd_from_peer_id=fwd_from_peer_id,
@@ -921,15 +801,13 @@ def extract_fwd_row(
         fwd_date=fwd_date,
         fwd_channel_post=fwd_channel_post,
     )
-    _touch_forward_record_fields(record)
-    return record
 
 
 def extract_message_row(
     dialog_id: int,
     msg: object,
     entity_name_map: dict[int, str] | None = None,
-) -> ExtractedMessage:
+) -> _message_contracts.ExtractedMessage:
     """Extract sync.db row bundle from a Telethon message object.
 
     Returns an ExtractedMessage with a typed StoredMessage plus typed satellite
@@ -940,7 +818,7 @@ def extract_message_row(
 
     reply_to_msg_id, forum_topic_id = extract_reply_and_topic(msg)
 
-    stored = StoredMessage(
+    stored = _message_contracts.StoredMessage(
         dialog_id=dialog_id,
         message_id=message_id,
         sent_at=_extract_sent_at(msg),
@@ -957,13 +835,12 @@ def extract_message_row(
         is_service=1 if is_service_message(msg) else 0,
         post_author=_attr(msg, "post_author", None),
     )
-    _touch_stored_message_fields(stored)
     reply_count = extract_reply_count(msg)
     reactions = extract_reactions_rows(dialog_id, message_id, _attr(msg, "reactions", None))
     entities = extract_entity_rows(dialog_id, message_id, msg)
     forward = extract_fwd_row(dialog_id, message_id, msg, entity_name_map=entity_name_map)
 
-    return ExtractedMessage(
+    return _message_contracts.ExtractedMessage(
         message=stored,
         reply_count=reply_count,
         reactions=reactions,
@@ -1220,11 +1097,6 @@ class FullSyncWorker:
 
 
 _EXPORTED_SYMBOLS = (
-    StoredMessage,
-    ReactionRecord,
-    EntityRecord,
-    ForwardRecord,
-    ExtractedMessage,
     FullSyncWorker,
     FullSyncWorker.bootstrap_dms,
     FullSyncWorker.process_one_batch,

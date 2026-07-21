@@ -19,9 +19,9 @@ from telethon.tl.functions.messages import SearchRequest
 from telethon.tl.types import InputMessagesFilterEmpty, InputPeerEmpty, InputPeerSelf
 
 from .flood import flood_seconds, sleep_through_flood
+from .message_contracts import ExtractedMessage
 from .models import DialogType
 from .sync_worker import (
-    ExtractedMessage,
     extract_message_row,
     insert_messages_with_fts,
 )

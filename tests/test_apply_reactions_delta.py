@@ -14,8 +14,9 @@ from typing import cast
 
 import pytest
 
+from mcp_telegram.message_contracts import ReactionRecord
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
-from mcp_telegram.sync_worker import ReactionRecord, apply_reactions_delta
+from mcp_telegram.sync_worker import apply_reactions_delta
 
 
 @pytest.fixture()

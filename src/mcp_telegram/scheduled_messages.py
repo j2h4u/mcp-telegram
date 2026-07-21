@@ -23,13 +23,14 @@ from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 from .activity_peer_resolve import resolve_linked_chat_id
 from .activity_sync import _ActivityClient
 from .fts import stem_text
+from .message_contracts import ExtractedMessage
 from .own_only import (
     OwnOnlyContext,
     classify_own_only_dialog,
     enroll_own_only_dialog,
     query_own_only_candidates,
 )
-from .sync_worker import ExtractedMessage, extract_message_row
+from .sync_worker import extract_message_row
 
 logger = logging.getLogger(__name__)
 
@@ -330,7 +331,7 @@ class ScheduledMessageReconciler:
         )
         return {_as_int(row[0]) for row in rows}
 
-    async def _own_only_dialog_ids(self) -> set[int] | None:  # noqa: C901, PLR0912
+    async def _own_only_dialog_ids(self) -> set[int] | None:  # noqa: PLR0912
         """Classify accessible local candidates before touching scheduled history."""
         context = self._own_only_context
         if context is None:
