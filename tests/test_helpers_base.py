@@ -316,3 +316,148 @@ async def test_track_tool_telemetry_logs_warning_on_background_send_failure(monk
     call_args = cast(tuple[object, object], warning_mock.call_args.args[:2])
     assert call_args[0] == "telemetry_event_failed error=%s"
     assert "telemetry backend down" in str(call_args[1])
+
+
+# ---------------------------------------------------------------------------
+# _class_name_to_snake
+# ---------------------------------------------------------------------------
+
+
+def test_class_name_to_snake_two_word() -> None:
+    from mcp_telegram.tools._base import _class_name_to_snake
+
+    assert _class_name_to_snake("ListMessages") == "list_messages"
+
+
+def test_class_name_to_snake_single_word() -> None:
+    from mcp_telegram.tools._base import _class_name_to_snake
+
+    assert _class_name_to_snake("Feedback") == "feedback"
+
+
+def test_class_name_to_snake_multi_word() -> None:
+    from mcp_telegram.tools._base import _class_name_to_snake
+
+    assert _class_name_to_snake("GetMyRecentActivity") == "get_my_recent_activity"
+
+
+def test_class_name_to_snake_with_digits() -> None:
+    from mcp_telegram.tools._base import _class_name_to_snake
+
+    assert _class_name_to_snake("Trace2FA") == "trace2_fa"
+
+
+def test_class_name_to_snake_already_snake() -> None:
+    from mcp_telegram.tools._base import _class_name_to_snake
+
+    assert _class_name_to_snake("mark_dialog_for_sync") == "mark_dialog_for_sync"
+
+
+def test_class_name_to_snake_all_caps_prefix() -> None:
+    from mcp_telegram.tools._base import _class_name_to_snake
+
+    assert _class_name_to_snake("APIToken") == "api_token"
+
+
+# ---------------------------------------------------------------------------
+# _sanitize_tool_schema
+# ---------------------------------------------------------------------------
+
+
+def test_sanitize_strips_null_anyof_and_merges() -> None:
+    from mcp_telegram.tools._base import _sanitize_tool_schema
+
+    schema: dict[str, object] = {
+        "anyOf": [{"type": "string"}, {"type": "null"}],
+        "default": None,
+        "title": "Dialog",
+    }
+    result = _sanitize_tool_schema(schema)
+    assert isinstance(result, dict)
+    assert "anyOf" not in result
+    assert "default" not in result
+    assert result["type"] == "string"
+    assert result["title"] == "Dialog"
+
+
+def test_sanitize_preserves_multi_variant_anyof() -> None:
+    from mcp_telegram.tools._base import _sanitize_tool_schema
+
+    schema: dict[str, object] = {
+        "anyOf": [{"type": "string"}, {"type": "integer"}],
+        "default": None,
+    }
+    result = _sanitize_tool_schema(schema)
+    assert isinstance(result, dict)
+    assert "anyOf" in result
+    assert len(result["anyOf"]) == 2  # type: ignore[arg-type]
+    assert "default" not in result
+
+
+def test_sanitize_removes_default_none_for_non_null_type() -> None:
+    from mcp_telegram.tools._base import _sanitize_tool_schema
+
+    schema: dict[str, object] = {
+        "type": "string",
+        "default": None,
+    }
+    result = _sanitize_tool_schema(schema)
+    assert isinstance(result, dict)
+    assert "default" not in result
+    assert result["type"] == "string"
+
+
+def test_sanitize_handles_nested_dicts() -> None:
+    from mcp_telegram.tools._base import _sanitize_tool_schema
+
+    schema: dict[str, object] = {
+        "type": "object",
+        "properties": {
+            "name": {
+                "anyOf": [{"type": "string"}, {"type": "null"}],
+                "default": None,
+            }
+        },
+    }
+    result = _sanitize_tool_schema(schema)
+    assert isinstance(result, dict)
+    properties = result["properties"]
+    assert isinstance(properties, dict)
+    name_schema = properties["name"]
+    assert isinstance(name_schema, dict)
+    assert "anyOf" not in name_schema
+    assert "default" not in name_schema
+    assert name_schema["type"] == "string"
+
+
+def test_sanitize_handles_lists_recursively() -> None:
+    from mcp_telegram.tools._base import _sanitize_tool_schema
+
+    schema: dict[str, object] = {
+        "anyOf": [
+            {
+                "type": "array",
+                "items": {
+                    "anyOf": [{"type": "string"}, {"type": "null"}],
+                    "default": None,
+                },
+            },
+            {"type": "null"},
+        ]
+    }
+    result = _sanitize_tool_schema(schema)
+    assert isinstance(result, dict)
+    assert "anyOf" not in result
+    items = result["items"]
+    assert isinstance(items, dict)
+    assert "anyOf" not in items
+    assert "default" not in items
+    assert items["type"] == "string"
+
+
+def test_sanitize_no_anyof_no_op() -> None:
+    from mcp_telegram.tools._base import _sanitize_tool_schema
+
+    schema: dict[str, object] = {"type": "integer", "minimum": 1}
+    result = _sanitize_tool_schema(schema)
+    assert result == {"type": "integer", "minimum": 1}
