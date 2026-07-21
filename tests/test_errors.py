@@ -13,6 +13,7 @@ from mcp_telegram.errors import (
     ambiguous_entity_text,
     ambiguous_sender_text,
     ambiguous_topic_text,
+    bootstrap_pending_text,
     deleted_topic_text,
     dialog_not_found_text,
     dialog_topics_unavailable_text,
@@ -93,6 +94,12 @@ _ERROR_TEXT_CASES: list[tuple[str, str, list[str]]] = [
     ("no_unread_personal", no_unread_personal_text(), ["personal"]),
     ("no_unread_all", no_unread_all_text(), ["no unread"]),
     ("search_no_hits", search_no_hits_text("ChatName", "hello"), ["hello", "ChatName"]),
+    ("bootstrap_pending", bootstrap_pending_text(), ["sync in progress"]),
+    (
+        "search_no_hits_global",
+        search_no_hits_text(None, "query"),
+        ["across all synced dialogs", "broader query or without navigation"],
+    ),
 ]
 
 
@@ -120,6 +127,12 @@ def test_rpc_error_detail_falls_back_to_str() -> None:
             return "some error"
 
     assert rpc_error_detail(FakeExc()) == "some error"
+
+
+def test_bootstrap_pending_text_returns_sync_message() -> None:
+    result = bootstrap_pending_text()
+    assert "sync in progress" in result
+    assert "dialog list will grow" in result
 
 
 def test_inaccessible_topic_text_branches_on_resolved() -> None:

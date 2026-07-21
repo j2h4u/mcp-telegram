@@ -143,3 +143,8 @@ class TestDecodeValidation:
 
         with pytest.raises(ValueError, match=error):
             decode_navigation_token(_encode_payload(payload))
+
+    def test_invalid_base64_raises_before_signature_check(self):
+        token = "!!!!!!.aaaa1111bbbb2222"
+        with pytest.raises(ValueError, match="Invalid navigation token"):
+            decode_navigation_token(token)
