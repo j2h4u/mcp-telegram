@@ -39,11 +39,7 @@ def find_config_imports(source: str) -> list[int]:
             isinstance(node, ast.ImportFrom)
             and (
                 (node.module == "config" and node.level > 0)
-                or (
-                    node.module is None
-                    and node.level > 0
-                    and any(alias.name == "config" for alias in node.names)
-                )
+                or (node.module is None and node.level > 0 and any(alias.name == "config" for alias in node.names))
                 or node.module == "mcp_telegram.config"
                 or (node.module == "mcp_telegram" and any(alias.name == "config" for alias in node.names))
             )
