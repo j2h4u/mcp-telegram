@@ -20,14 +20,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from mcp_telegram.config import ConfigError
-from mcp_telegram.daemon_api import DaemonAPIServer, _DaemonClientLike, get_daemon_socket_path
+from mcp_telegram.daemon_api import DaemonAPIServer, _DaemonClientLike, _ResolverEntityCache
 from mcp_telegram.daemon_dialog_queries import _compute_sync_coverage
+from mcp_telegram.daemon_ipc import get_daemon_socket_path
 from mcp_telegram.daemon_message import _MessageLike, fetch_reaction_counts, message_to_dict
 from mcp_telegram.daemon_message_queries import _build_list_messages_query, _ListMessagesDbRequest
 from mcp_telegram.fts import MESSAGES_FTS_DDL, stem_text
 from mcp_telegram.models import DialogType
 from mcp_telegram.telethon_dialog import classify_dialog_type
+from tests.daemon_api_policy import make_daemon_api_policy
 from tests.reaction_helpers import make_reaction_freshener
 
 # Track sqlite connections created by module helpers and close them after each test.
@@ -316,6 +317,7 @@ def make_server(
         shutdown_event,
         feedback_conn,
         reaction_freshener=make_reaction_freshener(conn, client),
+        policy=make_daemon_api_policy(),
     )
     server._ready = True
     return server
@@ -332,6 +334,7 @@ def test_daemon_api_server_uses_explicit_sync_db_path(tmp_path: Path) -> None:
         asyncio.Event(),
         sync_db_path=sync_db_path,
         reaction_freshener=make_reaction_freshener(conn, client),
+        policy=make_daemon_api_policy(),
     )
 
     assert server._sync_db_path == sync_db_path
@@ -749,34 +752,17 @@ def _make_db_with_topics() -> sqlite3.Connection:
 # ---------------------------------------------------------------------------
 
 
-def test_get_daemon_socket_path() -> None:
+def test_get_daemon_socket_path(tmp_path: Path) -> None:
     """get_daemon_socket_path returns a path ending in daemon.sock."""
-    path = get_daemon_socket_path()
+    path = get_daemon_socket_path(tmp_path)
     assert path.name == "daemon.sock", f"Expected daemon.sock, got {path.name}"
 
 
-def test_get_daemon_socket_path_missing_config_fails_fast(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """get_daemon_socket_path fails when config.toml is missing."""
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "missing-config"))
-
-    with pytest.raises(ConfigError, match="Missing mcp-telegram config"):
-        get_daemon_socket_path()
-
-
-def test_get_daemon_socket_path_honours_config_state_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Daemon socket path follows config.toml."""
+def test_get_daemon_socket_path_uses_explicit_state_dir(tmp_path: Path) -> None:
+    """The path helper is pure; composition roots provide the state directory."""
     state_dir = tmp_path / "state"
-    config_home = tmp_path / "custom-config"
-    config_dir = config_home / "mcp-telegram"
-    config_dir.mkdir(parents=True)
-    (config_dir / "config.toml").write_text(f'[state]\ndir = "{state_dir}"\n', encoding="utf-8")
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(config_home))
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg"))
 
-    path = get_daemon_socket_path()
-
-    assert path == state_dir / "daemon.sock"
-    assert state_dir.exists()
+    assert get_daemon_socket_path(state_dir) == state_dir / "daemon.sock"
 
 
 # ---------------------------------------------------------------------------
@@ -2830,6 +2816,39 @@ async def test_record_telemetry_returns_ok() -> None:
 
 
 @pytest.mark.asyncio
+async def test_record_telemetry_prunes_only_rows_older_than_retention_boundary() -> None:
+    """The live prune keeps a row exactly at retention TTL and removes an older row."""
+    conn = _make_db_with_entities()
+    now = 2_000_000_000
+    ttl = make_daemon_api_policy().telemetry_retention_ttl_seconds
+    _insert_telemetry(conn, tool_name="AtBoundary", timestamp=now - ttl)
+    _insert_telemetry(conn, tool_name="Expired", timestamp=now - ttl - 1)
+    server = make_server(conn)
+
+    with patch("mcp_telegram.daemon_api.time.time", return_value=now):
+        result = await server._record_telemetry(
+            {
+                "event": {
+                    "tool_name": "Current",
+                    "timestamp": now,
+                    "duration_ms": 50.0,
+                    "result_count": 0,
+                    "has_cursor": False,
+                    "page_depth": 1,
+                    "has_filter": False,
+                    "error_type": None,
+                }
+            }
+        )
+
+    assert result == {"ok": True}
+    assert [row[0] for row in conn.execute("SELECT tool_name FROM telemetry_events ORDER BY tool_name")] == [
+        "AtBoundary",
+        "Current",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_record_telemetry_db_failure() -> None:
     """record_telemetry returns ok=False on DB failure."""
     conn = _make_db_with_entities()
@@ -3011,6 +3030,59 @@ async def test_resolve_entity_exact_name() -> None:
     assert data["result"] == "resolved"
     assert data["entity_id"] == 101
     assert data["display_name"] == "Alice Smith"
+
+
+@pytest.mark.asyncio
+async def test_resolve_entity_directory_entry_at_exact_ttl_age_is_stale() -> None:
+    """Directory names at the exact configured TTL boundary are not candidates."""
+    conn = _make_db_with_entities()
+    now = 2_000_000_000
+    ttl = make_daemon_api_policy().user_directory_ttl_seconds
+    _insert_entity(
+        conn,
+        101,
+        entity_type="User",
+        name="Alice Smith",
+        name_normalized="alice smith",
+        updated_at=now - ttl,
+    )
+
+    with patch("mcp_telegram.daemon_api.time.time", return_value=now):
+        result = await make_server(conn)._dispatch({"method": "resolve_entity", "query": "Alice Smith"})
+
+    assert _response_data(result)["result"] == "not_found"
+
+
+@pytest.mark.asyncio
+async def test_resolve_group_directory_entry_at_exact_ttl_age_is_stale() -> None:
+    """Group names at the exact configured TTL boundary are not candidates."""
+    conn = _make_db_with_entities()
+    now = 2_000_000_000
+    ttl = make_daemon_api_policy().group_directory_ttl_seconds
+    _insert_entity(
+        conn,
+        102,
+        entity_type="Channel",
+        name="Team Chat",
+        name_normalized="team chat",
+        updated_at=now - ttl,
+    )
+
+    with patch("mcp_telegram.daemon_api.time.time", return_value=now):
+        result = await make_server(conn)._dispatch({"method": "resolve_entity", "query": "Team Chat"})
+
+    assert _response_data(result)["result"] == "not_found"
+
+
+def test_resolver_enrichment_entry_at_exact_ttl_age_is_stale() -> None:
+    """Resolver enrichment does not reuse an entity at its exact TTL boundary."""
+    conn = _make_db_with_entities()
+    now = 2_000_000_000
+    ttl = make_daemon_api_policy().resolver_enrichment_ttl_seconds
+    _insert_entity(conn, 101, entity_type="User", username="alice", updated_at=now - ttl)
+
+    with patch("mcp_telegram.daemon_api.time.time", return_value=now):
+        assert _ResolverEntityCache(conn).get(101, ttl) is None
 
 
 @pytest.mark.asyncio

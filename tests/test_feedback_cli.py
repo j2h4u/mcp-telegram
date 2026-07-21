@@ -39,7 +39,7 @@ def feedback_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     target = tmp_path / "feedback.db"
     monkeypatch.setattr(
         "mcp_telegram.feedback_db.get_feedback_db_path",
-        lambda: target,
+        lambda _state_dir: target,
     )
     # Mirror the patched path for the CLI module's local lookup (it imports the same function).
     return target

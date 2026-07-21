@@ -1,5 +1,5 @@
 [state]
 dir = "/srv/mcp-telegram/database"
 
-[reactions]
+[freshness.reactions]
 freshness_ttl_seconds = 600

@@ -1,7 +1,7 @@
 """MCP tool: GetEntityInfo — universal entity inspector (Phase 47).
 
 Universal replacement covering User / Bot / BroadcastChannel / Supergroup /
-LegacyChat. DB-first cache with 5-minute TTL on the daemon side; tool itself
+LegacyChat. DB-first cache with the configured entity-detail TTL on the daemon side; tool itself
 maps daemon data into the structured MCP response.
 """
 

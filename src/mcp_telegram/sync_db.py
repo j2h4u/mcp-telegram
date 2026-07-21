@@ -6,8 +6,6 @@ import sqlite3
 from pathlib import Path
 from typing import cast
 
-from .state import get_state_dir
-
 _CURRENT_SCHEMA_VERSION = 28
 _SCHEMA_VERSION_WITH_FTS = 3
 
@@ -541,9 +539,9 @@ INSERT OR IGNORE INTO scheduled_sync_state (key) VALUES ('account')
 # ---------------------------------------------------------------------------
 
 
-def get_sync_db_path() -> Path:
-    """Return the canonical path for sync.db under configured state."""
-    return get_state_dir() / "sync.db"
+def get_sync_db_path(state_dir: Path) -> Path:
+    """Return the sync database path below an explicit state directory."""
+    return state_dir / "sync.db"
 
 
 # ---------------------------------------------------------------------------
@@ -1326,12 +1324,19 @@ def _migrate_from_legacy_db(
     return rows_copied
 
 
-def migrate_legacy_databases(conn: sqlite3.Connection, state_dir: Path) -> None:
+def migrate_legacy_databases(
+    conn: sqlite3.Connection,
+    state_dir: Path,
+    *,
+    telemetry_retention_ttl_seconds: int,
+) -> None:
     """One-shot migration from entity_cache.db and analytics.db into sync.db.
 
     Called once at daemon startup after ensure_sync_schema(). Idempotent —
     INSERT OR IGNORE skips existing rows. Deletes legacy files after success.
     """
+    if telemetry_retention_ttl_seconds < 1:
+        raise ValueError("telemetry_retention_ttl_seconds must be positive")
     entity_cache_path = state_dir / "entity_cache.db"
     entity_lock_path = state_dir / "entity_cache.db.bootstrap.lock"
     analytics_path = state_dir / "analytics.db"
@@ -1346,15 +1351,19 @@ def migrate_legacy_databases(conn: sqlite3.Connection, state_dir: Path) -> None:
     if copied_entities:
         logger.info("migrated %d entities from entity_cache.db", copied_entities)
 
-    # Migrate telemetry events (30-day retention filter)
+    # Migrate telemetry events using the configured retention boundary.
     telemetry_stmts = [
         "INSERT OR IGNORE INTO telemetry_events "
         "(tool_name, timestamp, duration_ms, result_count, has_cursor, page_depth, has_filter, error_type) "
         "SELECT tool_name, timestamp, duration_ms, result_count, has_cursor, page_depth, has_filter, error_type "
         "FROM legacy.telemetry_events "
-        "WHERE timestamp >= strftime('%s', 'now') - 2592000",
+        f"WHERE timestamp > strftime('%s', 'now') - {telemetry_retention_ttl_seconds}",
     ]
-    copied_telemetry = _migrate_from_legacy_db(conn, analytics_path, telemetry_stmts)
+    copied_telemetry = _migrate_from_legacy_db(
+        conn,
+        analytics_path,
+        telemetry_stmts,
+    )
     if copied_telemetry:
         logger.info("migrated %d telemetry events from analytics.db", copied_telemetry)
 

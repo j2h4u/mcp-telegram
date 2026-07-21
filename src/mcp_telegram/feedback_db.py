@@ -21,8 +21,6 @@ import sqlite3
 from pathlib import Path
 from typing import cast
 
-from .state import get_state_dir
-
 __all__ = [
     "VALID_SEVERITIES",
     "VALID_STATUSES",
@@ -53,9 +51,9 @@ CREATE TABLE IF NOT EXISTS feedback (
 # ---------------------------------------------------------------------------
 
 
-def get_feedback_db_path() -> Path:
-    """Return the canonical path for feedback.db under configured state."""
-    return get_state_dir() / "feedback.db"
+def get_feedback_db_path(state_dir: Path) -> Path:
+    """Return the feedback database path below an explicit state directory."""
+    return state_dir / "feedback.db"
 
 
 # ---------------------------------------------------------------------------

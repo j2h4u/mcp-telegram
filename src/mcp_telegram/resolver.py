@@ -66,9 +66,21 @@ class _BuildMatchesOptions:
 
 
 class _EntityCache(Protocol):
-    def get(self, entity_id: int, _ttl_seconds: int = 300) -> Mapping[str, object] | None: ...
+    def get(self, entity_id: int, ttl_seconds: int) -> Mapping[str, object] | None: ...
 
     def get_by_username(self, username: str) -> tuple[int, str] | None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class ResolverEnrichmentPolicy:
+    """The indivisible cache-and-TTL dependency used for resolver enrichment."""
+
+    entity_cache: _EntityCache
+    ttl_seconds: int
+
+    def __post_init__(self) -> None:
+        if self.ttl_seconds < 1:
+            raise ValueError("Resolver enrichment TTL must be positive")
 
 
 MatchInfo = TypedDict(  # noqa: UP013
@@ -139,7 +151,7 @@ def _build_norm_map(
 def _fuzzy_resolve(
     query: str,
     display_name_map: dict[int, str],
-    entity_cache: _EntityCache | None = None,
+    enrichment: ResolverEnrichmentPolicy | None = None,
     *,
     normalized_name_map: dict[int, str] | None = None,
 ) -> ResolveResult:
@@ -181,7 +193,7 @@ def _fuzzy_resolve(
         matches = _build_matches(
             hits,
             norm_map,
-            entity_cache,
+            enrichment,
             options=_BuildMatchesOptions(exact_first_id=exact_entity_id),
         )
         return Candidates(query=query, matches=matches)
@@ -201,7 +213,7 @@ def _fuzzy_resolve(
             matches = _build_matches(
                 hits,
                 norm_map,
-                entity_cache,
+                enrichment,
                 options=_BuildMatchesOptions(
                     exact_first_id=exact_entity_id,
                     collision_query=query,
@@ -211,14 +223,18 @@ def _fuzzy_resolve(
             return Candidates(query=query, matches=matches)
         return Resolved(entity_id=exact_entity_id, display_name=exact_display_name)
 
-    matches = _build_matches(hits, norm_map, entity_cache)
+    matches = _build_matches(
+        hits,
+        norm_map,
+        enrichment,
+    )
     return Candidates(query=query, matches=matches)
 
 
 def _build_matches(
     hits: list[tuple[str, float, int]],
     norm_map: dict[str, list[tuple[int, str]]],
-    entity_cache: _EntityCache | None,
+    enrichment: ResolverEnrichmentPolicy | None,
     *,
     options: _BuildMatchesOptions | None = None,
 ) -> list[MatchInfo]:
@@ -239,9 +255,22 @@ def _build_matches(
             for entity_id, original_name in norm_map.get(norm_name, []):
                 if entity_id == effective_options.exact_first_id and entity_id not in seen_ids:
                     seen_ids.add(entity_id)
-                    matches.append(_make_match_info(entity_id, original_name, int(score), entity_cache))
+                    matches.append(
+                        _make_match_info(
+                            entity_id,
+                            original_name,
+                            int(score),
+                            enrichment,
+                        )
+                    )
 
-    _append_remaining_matches(matches, seen_ids, hits, norm_map, entity_cache)
+    _append_remaining_matches(
+        matches,
+        seen_ids,
+        hits,
+        norm_map,
+        enrichment,
+    )
     _apply_disambiguation_hint(
         matches,
         collision_query=effective_options.collision_query,
@@ -255,14 +284,21 @@ def _append_remaining_matches(
     seen_ids: set[int],
     hits: list[tuple[str, float, int]],
     norm_map: dict[str, list[tuple[int, str]]],
-    entity_cache: _EntityCache | None,
+    enrichment: ResolverEnrichmentPolicy | None,
 ) -> None:
     for norm_name, score, _idx in hits:
         for entity_id, original_name in norm_map.get(norm_name, []):
             if entity_id in seen_ids:
                 continue
             seen_ids.add(entity_id)
-            matches.append(_make_match_info(entity_id, original_name, int(score), entity_cache))
+            matches.append(
+                _make_match_info(
+                    entity_id,
+                    original_name,
+                    int(score),
+                    enrichment,
+                )
+            )
 
 
 def _apply_disambiguation_hint(
@@ -284,7 +320,12 @@ def _apply_disambiguation_hint(
         match["disambiguation_hint"] = hint
 
 
-def _make_match_info(entity_id: int, display_name: str, score: int, entity_cache: _EntityCache | None) -> MatchInfo:
+def _make_match_info(
+    entity_id: int,
+    display_name: str,
+    score: int,
+    enrichment: ResolverEnrichmentPolicy | None,
+) -> MatchInfo:
     entity_info: MatchInfo = {
         "entity_id": entity_id,
         "display_name": display_name,
@@ -293,9 +334,9 @@ def _make_match_info(entity_id: int, display_name: str, score: int, entity_cache
         "entity_type": None,
         "disambiguation_hint": None,
     }
-    if entity_cache:
+    if enrichment is not None:
         try:
-            entity_cached = entity_cache.get(entity_id, 300)
+            entity_cached = enrichment.entity_cache.get(entity_id, enrichment.ttl_seconds)
             if entity_cached:
                 username = entity_cached.get("username")
                 if isinstance(username, str):
@@ -321,18 +362,19 @@ def _make_match_info(entity_id: int, display_name: str, score: int, entity_cache
 def resolve(
     query: str,
     display_name_map: dict[int, str],
-    entity_cache: _EntityCache | None = None,
+    enrichment: ResolverEnrichmentPolicy | None = None,
     *,
     normalized_name_map: dict[int, str] | None = None,
 ) -> ResolveResult:
     """Resolve query to entity using normalized matching (pure/sync).
 
     Case 1: Numeric ID query → Resolved/NotFound by id
-    Case 2: @username query → lookup in entity_cache, Resolved/NotFound (requires entity_cache)
+    Case 2: @username query → lookup in the optional enrichment cache
     Case 3-5: Fuzzy matching in latinized space with single-word caution
 
-    entity_cache must expose .get(id, ttl_seconds=) and .get_by_username(str).
-    Pass None to skip @username resolution.
+    ``enrichment`` is an atomic cache-and-TTL pair supplied by the composition
+    root. Pass None to skip cache-backed username resolution and metadata
+    enrichment.
     """
     entity_id = _parse_numeric_query(query)
     if entity_id is not None:
@@ -340,10 +382,10 @@ def resolve(
             return Resolved(entity_id=entity_id, display_name=display_name_map[entity_id])
         return NotFound(query=query)
 
-    if query.startswith("@") and entity_cache:
+    if query.startswith("@") and enrichment:
         username_query = query[1:]
         try:
-            result = entity_cache.get_by_username(username_query)
+            result = enrichment.entity_cache.get_by_username(username_query)
             if result:
                 entity_id, name = result
                 return Resolved(entity_id=entity_id, display_name=name)
@@ -356,4 +398,9 @@ def resolve(
     if query.startswith("@"):
         return NotFound(query=query)
 
-    return _fuzzy_resolve(query, display_name_map, entity_cache, normalized_name_map=normalized_name_map)
+    return _fuzzy_resolve(
+        query,
+        display_name_map,
+        enrichment,
+        normalized_name_map=normalized_name_map,
+    )

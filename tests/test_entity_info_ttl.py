@@ -1,6 +1,6 @@
 """Tests for GetEntityInfo TTL gate + auto-resolve write-back.
 
-SPEC Reqs covered: 8 (DB-first 5-min TTL — second call within window
+SPEC Reqs covered: 8 (DB-first configured entity-detail TTL — second call within window
 produces zero new MTProto), 11 (first call on unknown id writes entities
 AND entity_details rows; subsequent in-TTL call serves from DB).
 """
@@ -21,6 +21,7 @@ import pytest
 from telethon.tl.types import User  # type: ignore[import-untyped]
 
 from mcp_telegram.daemon_api import DaemonAPIServer, _DaemonClientLike
+from tests.daemon_api_policy import make_daemon_api_policy
 from tests.reaction_helpers import make_reaction_freshener
 
 _TEST_DBS: list[sqlite3.Connection] = []
@@ -83,6 +84,7 @@ def make_server(conn: sqlite3.Connection | None = None, client: _DaemonClientLik
         cast(_DaemonClientLike, client),
         shutdown_event,
         reaction_freshener=make_reaction_freshener(conn, client),
+        policy=make_daemon_api_policy(),
     )
     server._ready = True
     return server
@@ -132,7 +134,7 @@ def _trio_results() -> tuple[MagicMock, MagicMock, MagicMock]:
 
 @pytest.mark.asyncio
 async def test_get_entity_info_serves_from_db_within_ttl(monkeypatch: pytest.MonkeyPatch) -> None:
-    """SPEC Req 8: two consecutive calls within 5 min → exactly one MTProto round-trip."""
+    """SPEC Req 8: two consecutive calls within configured TTL → one MTProto round-trip."""
     client = AsyncMock()
     get_entity = AsyncMock(return_value=_user(42))
     client.get_entity = get_entity
@@ -167,6 +169,35 @@ async def test_get_entity_info_serves_from_db_within_ttl(monkeypatch: pytest.Mon
         r3 = await server._dispatch({"method": "get_entity_info", "entity_id": 42})
     assert r3["ok"]
     assert get_entity.call_count == first_call_count + 1
+
+
+@pytest.mark.asyncio
+async def test_get_entity_info_at_exact_ttl_age_refetches(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An entity detail exactly at the configured cutoff is stale, not fresh."""
+    client = AsyncMock()
+    get_entity = AsyncMock(return_value=_user(43))
+    client.get_entity = get_entity
+    client.side_effect = _trio_results() + _trio_results()
+    server = make_server(client=client)
+    ttl_seconds = server._policy.entity_detail_ttl_seconds
+    base = 2_000_000
+    monkeypatch.setattr("mcp_telegram.daemon_api.time.time", lambda: base)
+    with (
+        patch("mcp_telegram.daemon_api.GetCommonChatsRequest"),
+        patch("mcp_telegram.daemon_api.GetFullUserRequest"),
+        patch("mcp_telegram.daemon_api.GetUserPhotosRequest"),
+    ):
+        assert (await server._dispatch({"method": "get_entity_info", "entity_id": 43}))["ok"]
+
+    monkeypatch.setattr("mcp_telegram.daemon_api.time.time", lambda: base + ttl_seconds)
+    with (
+        patch("mcp_telegram.daemon_api.GetCommonChatsRequest"),
+        patch("mcp_telegram.daemon_api.GetFullUserRequest"),
+        patch("mcp_telegram.daemon_api.GetUserPhotosRequest"),
+    ):
+        assert (await server._dispatch({"method": "get_entity_info", "entity_id": 43}))["ok"]
+
+    assert get_entity.call_count == 2
 
 
 @pytest.mark.asyncio

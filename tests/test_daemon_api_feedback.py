@@ -15,6 +15,7 @@ import pytest
 
 from mcp_telegram.daemon_api import DaemonAPIServer
 from mcp_telegram.feedback_db import VALID_SEVERITIES, ensure_feedback_schema
+from tests.daemon_api_policy import make_daemon_api_policy
 from tests.reaction_helpers import make_reaction_freshener
 
 
@@ -32,6 +33,7 @@ def _make_feedback_server(tmp_path: Path) -> Iterator[tuple[DaemonAPIServer, sql
         shutdown_event,
         feedback_conn,
         reaction_freshener=make_reaction_freshener(sync_conn, client),
+        policy=make_daemon_api_policy(),
     )
     server._ready = True
     try:
@@ -280,6 +282,7 @@ async def test_submit_feedback_db_error_returns_internal(tmp_path: Path) -> None
             shutdown_event,
             mock_feedback_conn,
             reaction_freshener=make_reaction_freshener(sync_conn, client),
+            policy=make_daemon_api_policy(),
         )
         server._ready = True
 

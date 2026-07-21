@@ -165,6 +165,7 @@ class DaemonReadingDeps:
     history_gateway: TelegramHistoryGateway
     logger: _LoggerLike
     rid: Callable[[], str]
+    read_at_ttl_seconds: int
     read_receipt_gateway: TelegramReadReceiptGateway | None = None
 
 
@@ -737,6 +738,7 @@ class DaemonReadingService:
             dialog_id,
             messages,
             dialog_type=_dialog_type_from_db(self._conn, dialog_id),
+            read_at_ttl_seconds=self._deps.read_at_ttl_seconds,
         )
         if log_rendered:
             _log_rendered_message_stats(self._logger, dialog_id, messages)

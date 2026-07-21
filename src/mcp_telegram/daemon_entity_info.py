@@ -18,7 +18,6 @@ from telethon.tl.types import PeerChannel  # type: ignore[import-untyped]
 from .models import DialogType
 from .telethon_dialog import classify_dialog_type
 
-_ENTITY_DETAIL_TTL_SECONDS = 300
 _ENTITY_DETAIL_SCHEMA_VERSION = 1
 _MEMBERSHIP_THRESHOLD_LARGE = 1000
 _CHANNEL_DIALOG_ID_OFFSET = 1_000_000_000_000
@@ -182,6 +181,7 @@ class EntityInfoDeps:
     rid: Callable[[], str]
     logger: logging.Logger
     now_provider: Callable[[], float]
+    detail_ttl_seconds: int
     get_common_chats_request: Callable[..., object]
     get_dialog_filters_request: Callable[..., object]
     get_full_user_request: Callable[..., object]
@@ -256,7 +256,7 @@ class DaemonEntityInfoService:
 
         if row is not None:
             detail_json, fetched_at = row
-            if now - fetched_at < _ENTITY_DETAIL_TTL_SECONDS:
+            if now - fetched_at < self._deps.detail_ttl_seconds:
                 try:
                     detail = cast(dict[str, object], json.loads(detail_json))
                 except json.JSONDecodeError:

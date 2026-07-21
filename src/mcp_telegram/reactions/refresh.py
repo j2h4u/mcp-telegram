@@ -51,7 +51,7 @@ class ReactionFreshener:
         if state != "active" or not stale_ids:
             return ReactionFreshness(
                 len(message_ids), len(fresh_ids), len(stale_ids), 0, "fresh" if not stale_ids else state
-        )
+            )
         result = await self._gateway.fetch_reactions(entity, stale_ids)
         if result.ok:
             # The use case owns this atomic write. The repository implementation

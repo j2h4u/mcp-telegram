@@ -7,7 +7,6 @@ This module owns:
   - resolve_input_peer: entity-type-aware dialog_id → InputPeer
   - resolve_linked_chat_id: cache-first linked_chat_id resolver
   - LinkedChatResolution: typed result dataclass
-  - _ENTITY_DETAIL_TTL_SECONDS: canonical TTL constant
 """
 
 import json
@@ -24,9 +23,6 @@ from .activity_sync import _ActivityClient
 
 logger = logging.getLogger(__name__)
 
-# Canonical TTL for entity_details cache reads.
-# Owned here as a single source of truth; importable by higher-level layers.
-_ENTITY_DETAIL_TTL_SECONDS: int = 300
 _MIN_LINKED_CHAT_SCHEMA_VERSION = 24
 
 

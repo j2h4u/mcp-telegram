@@ -9,7 +9,6 @@ from typing import cast
 
 import pytest
 
-from mcp_telegram.config import ConfigError
 from mcp_telegram.sync_db import (
     _CURRENT_SCHEMA_VERSION,
     _migrate_from_legacy_db,
@@ -64,35 +63,18 @@ def tmp_sync_db_path(tmp_path: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def test_db_path_is_separate() -> None:
+def test_db_path_is_separate(tmp_path: Path) -> None:
     """get_sync_db_path returns a path ending in sync.db, not entity_cache.db."""
-    path = get_sync_db_path()
+    path = get_sync_db_path(tmp_path)
     assert path.name == "sync.db", f"Expected sync.db, got {path.name}"
     assert "entity_cache" not in str(path), "sync.db must not share name with entity_cache.db"
 
 
-def test_db_path_missing_config_fails_fast(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """get_sync_db_path fails when config.toml is missing."""
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "missing-config"))
-
-    with pytest.raises(ConfigError, match="Missing mcp-telegram config"):
-        get_sync_db_path()
-
-
-def test_db_path_honours_config_state_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """config.toml controls the sync.db state directory."""
+def test_db_path_uses_explicit_state_dir(tmp_path: Path) -> None:
+    """The path helper is pure; composition roots provide the state directory."""
     state_dir = tmp_path / "state"
-    config_home = tmp_path / "custom-config"
-    config_dir = config_home / "mcp-telegram"
-    config_dir.mkdir(parents=True)
-    (config_dir / "config.toml").write_text(f'[state]\ndir = "{state_dir}"\n', encoding="utf-8")
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(config_home))
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg"))
 
-    path = get_sync_db_path()
-
-    assert path == state_dir / "sync.db"
-    assert state_dir.exists()
+    assert get_sync_db_path(state_dir) == state_dir / "sync.db"
 
 
 # ---------------------------------------------------------------------------
@@ -791,15 +773,15 @@ def test_migrate_from_legacy_db_insert_or_ignore_on_pk_conflict(tmp_path: Path) 
         conn.close()
 
 
-def test_migrate_from_legacy_db_telemetry_30day_filter(tmp_path: Path) -> None:
-    """_migrate_from_legacy_db copies only telemetry rows within last 30 days."""
+def test_migrate_legacy_databases_uses_injected_telemetry_retention(tmp_path: Path) -> None:
+    """A custom retention setting controls which analytics rows migrate."""
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     conn = _open_db(db_path)
 
     now = time.time()
-    recent = now - 86400  # 1 day ago — should be copied
-    old = now - 40 * 86400  # 40 days ago — should be excluded
+    recent = now - 40  # retained by the longer custom TTL
+    old = now - 70  # excluded by the longer custom TTL
 
     analytics_path = tmp_path / "analytics.db"
     _make_analytics_db(
@@ -810,20 +792,54 @@ def test_migrate_from_legacy_db_telemetry_30day_filter(tmp_path: Path) -> None:
         ],
     )
 
-    copy_stmts = [
-        "INSERT OR IGNORE INTO telemetry_events "
-        "(tool_name, timestamp, duration_ms, result_count, has_cursor, page_depth, has_filter, error_type) "
-        "SELECT tool_name, timestamp, duration_ms, result_count, has_cursor, page_depth, has_filter, error_type "
-        "FROM legacy.telemetry_events "
-        "WHERE timestamp >= strftime('%s', 'now') - 2592000",
-    ]
     try:
-        count = _migrate_from_legacy_db(conn, analytics_path, copy_stmts)
-        # Only the recent row should be copied (rowcount may report differently per driver)
+        migrate_legacy_databases(conn, tmp_path, telemetry_retention_ttl_seconds=60)
         rows = _fetchall_rows(conn, "SELECT tool_name FROM telemetry_events")
         tool_names = [str(row[0]) for row in rows]
         assert "ListMessages" in tool_names, "Recent event should be migrated"
         assert "ListDialogs" not in tool_names, "Old event should be excluded"
+    finally:
+        conn.close()
+
+
+def test_migrate_legacy_databases_respects_shorter_telemetry_retention(tmp_path: Path) -> None:
+    """A shorter custom TTL excludes rows that a longer policy would retain."""
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = _open_db(db_path)
+    analytics_path = tmp_path / "analytics.db"
+    _make_analytics_db(
+        analytics_path,
+        [("ListMessages", time.time() - 15, 100.0, 10, False, 1, False, None)],
+    )
+    try:
+        migrate_legacy_databases(conn, tmp_path, telemetry_retention_ttl_seconds=10)
+        assert _fetchall_rows(conn, "SELECT tool_name FROM telemetry_events") == []
+    finally:
+        conn.close()
+
+
+def test_migrate_legacy_databases_excludes_telemetry_at_exact_retention_boundary(tmp_path: Path) -> None:
+    """Legacy telemetry exactly at the cutoff is excluded, matching migration's strict predicate."""
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = _open_db(db_path)
+    ttl = 60
+    cutoff = int(time.time()) - ttl
+    analytics_path = tmp_path / "analytics.db"
+    _make_analytics_db(
+        analytics_path,
+        [
+            ("AtBoundary", cutoff, 100.0, 10, False, 1, False, None),
+            ("InsideBoundary", cutoff + 2, 100.0, 10, False, 1, False, None),
+        ],
+    )
+
+    try:
+        migrate_legacy_databases(conn, tmp_path, telemetry_retention_ttl_seconds=ttl)
+        tool_names = [str(row[0]) for row in _fetchall_rows(conn, "SELECT tool_name FROM telemetry_events")]
+        assert "AtBoundary" not in tool_names
+        assert "InsideBoundary" in tool_names
     finally:
         conn.close()
 
@@ -848,7 +864,7 @@ def test_migrate_legacy_databases_deletes_legacy_files(tmp_path: Path) -> None:
     _make_analytics_db(analytics, [])
 
     try:
-        migrate_legacy_databases(conn, tmp_path)
+        migrate_legacy_databases(conn, tmp_path, telemetry_retention_ttl_seconds=60)
         assert not entity_cache.exists(), "entity_cache.db should be deleted"
         assert not lock_file.exists(), "entity_cache.db.bootstrap.lock should be deleted"
         assert not analytics.exists(), "analytics.db should be deleted"
@@ -863,7 +879,7 @@ def test_migrate_legacy_databases_noop_when_files_missing(tmp_path: Path) -> Non
     conn = _open_db(db_path)
     try:
         # No legacy files — must not raise
-        migrate_legacy_databases(conn, tmp_path)
+        migrate_legacy_databases(conn, tmp_path, telemetry_retention_ttl_seconds=60)
     finally:
         conn.close()
 

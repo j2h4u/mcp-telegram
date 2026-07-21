@@ -9,6 +9,7 @@ from mcp_telegram.resolver import (
     Candidates,
     NotFound,
     Resolved,
+    ResolverEnrichmentPolicy,
     _EntityCache,
     _parse_tme_link,
     latinize,
@@ -161,7 +162,7 @@ def test_numeric_id_not_found() -> None:
 
 def test_username_query_resolves_via_cache(mock_cache: _EntityCache) -> None:
     choices = {101: "Иван Петров", 102: "Anna"}
-    result = resolve("@ivan", choices, entity_cache=mock_cache)
+    result = resolve("@ivan", choices, ResolverEnrichmentPolicy(mock_cache, 17))
     assert isinstance(result, Resolved)
     assert result.entity_id == 101
     assert result.display_name == "Иван Петров"
@@ -169,7 +170,7 @@ def test_username_query_resolves_via_cache(mock_cache: _EntityCache) -> None:
 
 def test_username_query_not_found(mock_cache: _EntityCache) -> None:
     choices = {101: "Иван Петров"}
-    result = resolve("@notfound", choices, entity_cache=mock_cache)
+    result = resolve("@notfound", choices, ResolverEnrichmentPolicy(mock_cache, 17))
     assert isinstance(result, NotFound)
     assert result.query == "@notfound"
 
@@ -247,7 +248,11 @@ def test_cyrillic_normalization_prefers_exact_over_fuzzy_candidates() -> None:
 
 def test_candidates_include_metadata_from_cache(mock_cache: _EntityCache) -> None:
     choices = {101: "Иван Петров", 102: "Another User"}
-    result = resolve("иван", choices, entity_cache=mock_cache)
+    result = resolve(
+        "иван",
+        choices,
+        ResolverEnrichmentPolicy(mock_cache, 17),
+    )
     assert isinstance(result, Candidates)
     match_101 = next((m for m in result.matches if m["entity_id"] == 101), None)
     assert match_101 is not None
@@ -260,7 +265,7 @@ def test_candidates_without_cache_derive_type_from_id_sign() -> None:
     convention (positive=User, -100…=Channel, other negative=Group). This keeps the
     disambiguation_hint informative even before entity_cache is populated."""
     choices = {101: "Sergei Khabarov", 102: "Sergei Ivanov", -1001234567: "Sergei Ch"}
-    result = resolve("сергей", choices, entity_cache=None)
+    result = resolve("сергей", choices, None)
     assert isinstance(result, Candidates)
     by_id = {m["entity_id"]: m for m in result.matches}
     assert by_id[101]["username"] is None
@@ -279,13 +284,13 @@ def test_exact_match_among_fuzzy_returns_candidates_single_word() -> None:
 
 def test_resolve_without_cache_still_works() -> None:
     choices = {101: "Иван Петров", 102: "Anna"}
-    result = resolve("101", choices, entity_cache=None)
+    result = resolve("101", choices, None)
     assert isinstance(result, Resolved)
 
-    result = resolve("Иван Петров", choices, entity_cache=None)
+    result = resolve("Иван Петров", choices, None)
     assert isinstance(result, Resolved)
 
-    result = resolve("иван", choices, entity_cache=None)
+    result = resolve("иван", choices, None)
     assert isinstance(result, Candidates)
 
 
@@ -507,7 +512,11 @@ def test_candidates_match_hint_mentions_entity_types() -> None:
     """Hint text mentions both entity types when known."""
     cache = _make_cache_with_types({101: "User", 102: "Channel"})
     choices = {101: "Ivan", 102: "IVAN"}
-    result = resolve("Ivan", choices, entity_cache=cache)
+    result = resolve(
+        "Ivan",
+        choices,
+        ResolverEnrichmentPolicy(cache, 17),
+    )
     assert isinstance(result, Candidates)
     hint = result.matches[0]["disambiguation_hint"]
     assert hint is not None
@@ -592,7 +601,7 @@ def test_collision_log_contains_entity_types(caplog: pytest.LogCaptureFixture) -
     cache = _make_cache_with_types({101: "User", 102: "Channel"})
     choices = {101: "Ivan", 102: "IVAN"}
     with caplog.at_level(logging.DEBUG, logger="mcp_telegram.resolver"):
-        resolve("Ivan", choices, entity_cache=cache)
+        resolve("Ivan", choices, ResolverEnrichmentPolicy(cache, 17))
     collision_records = [r for r in caplog.records if "resolver_collision" in r.getMessage()]
     assert len(collision_records) >= 1
 

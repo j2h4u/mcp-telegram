@@ -257,9 +257,10 @@ def feedback_list(
     Default view shows only `open` and `in_progress` items -- what needs
     attention. Use --all to include `done` and `dismissed` history.
     """
+    from .config import load_config
     from .feedback_db import get_feedback_db_path
 
-    path = get_feedback_db_path()
+    path = get_feedback_db_path(load_config().state.dir)
     if not path.exists():
         print("No feedback recorded yet.")
         return

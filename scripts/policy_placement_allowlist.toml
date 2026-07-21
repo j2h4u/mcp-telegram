@@ -1,0 +1,413 @@
+# Every entry is a reviewed exclusion, not permission for new operator policy.
+# New values must be placed in typed config and injected through a runtime sink.
+
+[reviewed_protocol_domain]
+rationale = "No exclusions use this grouping; every entry below has its own rationale."
+
+[reviewed_request_contracts]
+rationale = "No exclusions use this grouping; every entry below has its own rationale."
+
+[baseline_non_ttl_debt]
+rationale = "No exclusions use this grouping; every entry below has its own rationale."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/__init__.py:_feedback_list_select_rows:order_limit"
+rationale = "The feedback CLI's SQLite query ordering bound is a local presentation contract."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/budget.py:allocate_message_budget_proportional:remaining_budget"
+rationale = "This variable tracks per-response budget arithmetic rather than an operator setting."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/daemon_entity_info.py:<module>:_MEMBERSHIP_THRESHOLD_LARGE"
+rationale = "This entity-info response classification cutoff is an API semantic, not daemon retention policy."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/daemon_reading.py:DaemonReadingService._fetch_telegram_batches:last_batch_size"
+rationale = "This is observed batch-result metadata, not an operator-tuned limit."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/models.py:<module>:FORUM_TOPICS_PAGE_SIZE"
+rationale = "This is the Telegram forum-topics request page size contract."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/reactions/contracts.py:ReactionFreshness:retry_after"
+rationale = "This is a reaction freshness result field, not a configured retry schedule."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/resolver.py:<module>:CANDIDATE_THRESHOLD"
+rationale = "This resolver ambiguity cutoff defines matching behavior exposed to callers."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/telegram_reading.py:GatewayFailure:retry_after"
+rationale = "This gateway failure field communicates a computed recovery time to callers."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/tools/stats.py:<module>:_DEEP_PAGE_DEPTH_THRESHOLD"
+rationale = "This controls when the stats tool changes its response summary shape."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/tools/stats.py:<module>:_USAGE_SUMMARY_TOKEN_LIMIT"
+rationale = "This is a stable MCP usage-summary output bound, not daemon runtime policy."
+
+[[entry]]
+category = "policy_defaults"
+key = "src/mcp_telegram/errors.py:ambiguous_entity_text:retry_tool"
+rationale = "This selects the recovery-tool name included in an API error message."
+
+[[entry]]
+category = "policy_defaults"
+key = "src/mcp_telegram/errors.py:entity_not_found_text:retry_tool"
+rationale = "This selects the recovery-tool name included in an API error message."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/daemon_source_export.py:_SourceExportRequest.parse:limit"
+rationale = "This parsed source-export request limit is part of its public request contract."
+
+[[entry]]
+category = "policy_defaults"
+key = "src/mcp_telegram/__init__.py:feedback_list:limit"
+rationale = "This CLI argument default bounds local feedback listing output."
+
+[[entry]]
+category = "policy_defaults"
+key = "src/mcp_telegram/daemon_api.py:_DaemonClientLike.iter_participants:limit"
+rationale = "This protocol method's participant limit is an interface request contract."
+
+[[entry]]
+category = "policy_defaults"
+key = "src/mcp_telegram/daemon_client.py:DaemonConnection.export_source_changes:limit"
+rationale = "This daemon-client export page limit is a request contract."
+
+[[entry]]
+category = "policy_defaults"
+key = "src/mcp_telegram/daemon_client.py:DaemonConnection.get_sync_alerts:limit"
+rationale = "This daemon-client alert page limit is a request contract."
+
+[[entry]]
+category = "policy_defaults"
+key = "src/mcp_telegram/daemon_client.py:DaemonConnection.get_inbox:limit"
+rationale = "This daemon-client inbox page limit is a request contract."
+
+[[entry]]
+category = "policy_defaults"
+key = "src/mcp_telegram/daemon_client.py:DaemonConnection.get_inbox:group_size_threshold"
+rationale = "This inbox response grouping threshold is an API result-shape contract."
+
+[[entry]]
+category = "policy_defaults"
+key = "src/mcp_telegram/daemon_client.py:DaemonConnection.get_dialog_stats:limit"
+rationale = "This daemon-client statistics page limit is a request contract."
+
+[[entry]]
+category = "policy_defaults"
+key = "src/mcp_telegram/daemon_client.py:DaemonConnection.get_my_recent_activity:limit"
+rationale = "This daemon-client activity page limit is a request contract."
+
+[[entry]]
+category = "policy_defaults"
+key = "src/mcp_telegram/daemon_entity_info.py:_EntityInfoClient.iter_participants:limit"
+rationale = "This entity-info participant limit is a Telegram request contract."
+
+[[entry]]
+category = "environment_reads"
+key = "src/mcp_telegram/__init__.py:_resolve_http_host:os.environ.get"
+rationale = "The HTTP host environment override predates the typed TTL policy migration."
+
+[[entry]]
+category = "environment_reads"
+key = "src/mcp_telegram/__init__.py:_resolve_http_port:os.environ.get"
+rationale = "The HTTP port environment override predates the typed TTL policy migration."
+
+[[entry]]
+category = "environment_reads"
+key = "src/mcp_telegram/__init__.py:sync:os.environ.get"
+rationale = "The sync command's legacy environment input is outside the TTL policy scope."
+
+[[entry]]
+category = "environment_reads"
+key = "src/mcp_telegram/__init__.py:serve:os.environ.get"
+rationale = "The serve command's legacy environment input is outside the TTL policy scope."
+
+[[entry]]
+category = "environment_reads"
+key = "src/mcp_telegram/activity_cold_backfill.py:ColdBackfillHistoryPacing:os.environ.get"
+rationale = "Cold-backfill history pacing retains its existing environment compatibility surface."
+
+[[entry]]
+category = "environment_reads"
+key = "src/mcp_telegram/activity_cold_backfill.py:ColdBackfillPacing:os.environ.get"
+rationale = "Cold-backfill pacing retains its existing environment compatibility surface."
+
+[[entry]]
+category = "environment_reads"
+key = "src/mcp_telegram/activity_hot_sweep.py:<module>:os.environ.get"
+rationale = "Hot-sweep environment controls are legacy behavior, not new TTL policy."
+
+[[entry]]
+category = "environment_reads"
+key = "src/mcp_telegram/daemon.py:_start_followup_background_tasks:os.environ.get"
+rationale = "This daemon background-task environment switch is pre-existing operational behavior."
+
+[[entry]]
+category = "environment_reads"
+key = "src/mcp_telegram/server.py:_split_csv_env:os.environ.get"
+rationale = "This helper parses a legacy comma-separated environment contract."
+
+[[entry]]
+category = "environment_reads"
+key = "src/mcp_telegram/server.py:_unsafe_http_exposure_enabled:os.environ.get"
+rationale = "This explicit unsafe-exposure escape hatch remains an environment-only deployment control."
+
+[[entry]]
+category = "environment_reads"
+key = "src/mcp_telegram/server.py:run_mcp_server:os.environ.get"
+rationale = "The stdio server's existing environment inputs are outside the TTL policy scope."
+
+[[entry]]
+category = "environment_reads"
+key = "src/mcp_telegram/server.py:run_mcp_http_server:os.environ.get"
+rationale = "The HTTP server's existing environment inputs are outside the TTL policy scope."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/activity_cold_backfill.py:<module>:_BACKFILL_BATCH_LIMIT"
+rationale = "This inherited cold-backfill RPC batch cap is not introduced by the TTL migration."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/activity_cold_backfill.py:_finish_cold_backfill_peer:next_retry_at"
+rationale = "This value records a retry time derived from cold-backfill execution."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/activity_hot_sweep.py:<module>:_ACCESS_SKIP_RETRY_S"
+rationale = "This inherited access-loss retry cadence remains separate legacy worker behavior."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/activity_hot_sweep.py:<module>:_BACKFILL_BATCH_LIMIT"
+rationale = "This inherited hot-sweep RPC batch cap is not introduced by the TTL migration."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/activity_hot_sweep.py:_handle_hot_sweep_page_result:next_retry_at"
+rationale = "This value records a retry time derived from a hot-sweep page result."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/activity_hot_sweep.py:_handle_hot_sweep_page_result:transient_retry_at"
+rationale = "This value records a transient retry time derived from a hot-sweep result."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/activity_sync.py:<module>:_BACKFILL_BATCH_LIMIT"
+rationale = "This inherited activity-sync RPC batch cap is not introduced by the TTL migration."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/activity_sync.py:<module>:_DEFAULT_INTERVAL_S"
+rationale = "This pre-existing activity-sync loop cadence remains legacy scheduling behavior."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/activity_sync.py:<module>:_SEARCH_RPC_TIMEOUT_S"
+rationale = "This existing Telegram search RPC deadline is outside the TTL policy scope."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/activity_sync.py:_trim_incremental_batch:in_window"
+rationale = "This boolean is computed batch-window state, not a tunable window duration."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/activity_sync.py:_trim_incremental_batch:past_window"
+rationale = "This boolean is computed batch-window state, not a tunable window duration."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/daemon.py:<module>:GAP_SCAN_INTERVAL_S"
+rationale = "This pre-existing daemon gap-scan schedule is tracked as legacy operational debt."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/daemon.py:<module>:HEARTBEAT_INTERVAL_S"
+rationale = "This pre-existing daemon heartbeat cadence is tracked as legacy operational debt."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/daemon.py:<module>:_BOOTSTRAP_BATCH_SIZE"
+rationale = "This inherited bootstrap work batch cap is unrelated to freshness retention."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/daemon.py:<module>:_UNSUPPORTED_TRANSCRIPTION_BACKFILL_BATCH_SIZE"
+rationale = "This unsupported transcription compatibility batch cap is not new operator policy."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/daemon.py:<module>:_UNSUPPORTED_TRANSCRIPTION_BACKFILL_LIMIT"
+rationale = "This unsupported transcription compatibility limit is not new operator policy."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/daemon.py:_log_heartbeat:interval"
+rationale = "This logging argument reflects the established heartbeat scheduling value."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/daemon_account_trace.py:<module>:_TRACE_ENRICHMENT_CONCURRENCY"
+rationale = "This inherited trace enrichment work cap is not part of the TTL configuration surface."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/daemon_account_trace.py:<module>:_TRACE_ENRICHMENT_DEADLINE_MS"
+rationale = "This inherited trace enrichment request deadline is not part of TTL configuration."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/daemon_account_trace.py:DaemonAccountTraceService._trace_enrich_visible_dialogs:deadline_at"
+rationale = "This is a computed trace request deadline, not a literal daemon policy setting."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/daemon_account_trace.py:_TraceCoverageFragmentUpsertRequest:next_retry_at"
+rationale = "This stores a retry timestamp derived from trace upsert execution."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/daemon_client.py:<module>:DEFAULT_DAEMON_TIMEOUT_SECONDS"
+rationale = "This is the established Unix-socket client request deadline contract."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/daemon_dialog_queries.py:<module>:_SNAPSHOT_STALE_THRESHOLD_S"
+rationale = "This existing dialog-query staleness semantic predates the injected API freshness policy."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/delta_sync.py:<module>:RECENT_SYNC_SKIP_THRESHOLD_S"
+rationale = "This is inherited delta-sync skip behavior, not a newly introduced policy value."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/scheduled_messages.py:<module>:_DEFAULT_RECONCILIATION_INTERVAL_S"
+rationale = "This pre-existing scheduled-message loop cadence is outside the TTL migration."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/scheduled_messages.py:ScheduledMessageReconciler.run_once:retry_at"
+rationale = "This records a retry time computed during scheduled-message reconciliation."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/sync_worker.py:<module>:_BATCH_SIZE"
+rationale = "This inherited sync RPC batch cap is unrelated to retention or freshness configuration."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/tools/_base.py:<module>:_DAEMON_TIMEOUT_TEXT"
+rationale = "This is fixed text for a daemon timeout error response."
+
+[[entry]]
+category = "policy_defaults"
+key = "src/mcp_telegram/dialog_sync.py:run_reconciliation_loop:daily_interval"
+rationale = "This legacy reconciliation-loop default is retained outside the TTL configuration change."
+
+[[entry]]
+category = "policy_defaults"
+key = "src/mcp_telegram/dialog_sync.py:run_reconciliation_loop:hourly_interval"
+rationale = "This legacy reconciliation-loop default is retained outside the TTL configuration change."
+
+# These are local SQLite/API contract values, not daemon operator policy.  Keep
+# each new exclusion individually justified so additions are reviewable.
+[[entry]]
+category = "policy_call_keywords"
+key = "src/mcp_telegram/__init__.py:feedback_list:timeout"
+rationale = "CLI feedback reads use SQLite's local connection timeout contract."
+
+[[entry]]
+category = "policy_call_keywords"
+key = "src/mcp_telegram/feedback_db.py:_open_feedback_db:timeout"
+rationale = "feedback.db uses SQLite's local connection timeout contract."
+
+[[entry]]
+category = "policy_call_keywords"
+key = "src/mcp_telegram/sync_db.py:_open_sync_db:timeout"
+rationale = "sync.db read and write connections share SQLite's local connection timeout contract."
+
+[[entry]]
+category = "policy_dict_values"
+key = "src/mcp_telegram/tools/unread.py:<module>:group_size_threshold"
+rationale = "This is an MCP response field name, not a placement of an operator policy value."
+
+[[entry]]
+category = "policy_call_keywords"
+key = "src/mcp_telegram/activity_sync.py:call_with_timeout:timeout"
+rationale = "This fixed Telethon RPC deadline prevents a single activity search from hanging the worker."
+
+[[entry]]
+category = "policy_defaults"
+key = "src/mcp_telegram/activity_sync.py:run_activity_sync_loop:interval"
+rationale = "This pre-existing worker scheduling default is retained as a compatibility contract."
+
+[[entry]]
+category = "policy_call_keywords"
+key = "src/mcp_telegram/daemon.py:_run_sync_loop:timeout"
+rationale = "This is the daemon heartbeat wait cadence, not a configurable cache or retention policy."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/daemon_account_trace.py:_TraceVisibleEnrichmentRequest:deadline_ms"
+rationale = "This is a bounded internal trace-query request contract."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/daemon_account_trace.py:_TraceVisibleEnrichmentRequest:concurrency"
+rationale = "This is a bounded internal trace-query request contract."
+
+[[entry]]
+category = "policy_call_keywords"
+key = "src/mcp_telegram/daemon_account_trace.py:DaemonAccountTraceService._trace_enrich_visible_dialogs:deadline_at"
+rationale = "This deadline is derived from the trace request contract rather than a new literal policy value."
+
+[[entry]]
+category = "policy_defaults"
+key = "src/mcp_telegram/daemon_client.py:DaemonConnection.__init__:timeout_seconds"
+rationale = "This is the local Unix-socket request timeout contract."
+
+[[entry]]
+category = "policy_defaults"
+key = "src/mcp_telegram/daemon_client.py:daemon_connection:timeout_seconds"
+rationale = "This is the local Unix-socket request timeout contract."
+
+[[entry]]
+category = "policy_call_keywords"
+key = "src/mcp_telegram/daemon_reading.py:DaemonReadingService._fetch_telegram_batches:last_batch_size"
+rationale = "This is internal batch result metadata, not an operator policy placement."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/flood.py:<module>:_ROLLUP_LOG_INTERVAL_S"
+rationale = "This is a process-local diagnostic logging cadence."
+
+[[entry]]
+category = "policy_assignments"
+key = "src/mcp_telegram/flood.py:FloodWaitAccumulator:log_interval_s"
+rationale = "This is a process-local diagnostic logging cadence."
+
+[[entry]]
+category = "policy_defaults"
+key = "src/mcp_telegram/scheduled_messages.py:run_scheduled_reconciliation_loop:interval"
+rationale = "This pre-existing worker scheduling default is retained as a compatibility contract."

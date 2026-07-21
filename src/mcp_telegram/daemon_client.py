@@ -26,6 +26,7 @@ from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from typing import Literal, NotRequired, TypedDict, Unpack, cast
 
+from .config import load_config
 from .correlation import record_correlation_id
 from .daemon_ipc import get_daemon_socket_path
 
@@ -420,8 +421,9 @@ class DaemonConnection:
     async def get_entity_info(self, *, entity_id: int) -> dict:
         """Return type-tagged entity profile (user/bot/channel/supergroup/group).
 
-        DB-first; daemon falls back to Telegram on cache miss/stale (TTL=5 min,
-        per CONTEXT D-01 / SPEC Req 8). Response carries one of five 'type'
+        DB-first; daemon falls back to Telegram on cache miss/stale according to
+        the configured entity-detail TTL (per CONTEXT D-01 / SPEC Req 8).
+        Response carries one of five 'type'
         discriminators in data['type']: 'user' | 'bot' | 'channel' |
         'supergroup' | 'group'.
         """
@@ -577,7 +579,7 @@ async def daemon_connection(
     - The socket file is absent (daemon not started)
     - The connection is refused (socket exists but daemon crashed)
     """
-    socket_path = get_daemon_socket_path()
+    socket_path = get_daemon_socket_path(load_config().state.dir)
     reader: asyncio.StreamReader | None = None
     writer: asyncio.StreamWriter | None = None
     try:

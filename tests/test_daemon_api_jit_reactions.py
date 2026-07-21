@@ -19,6 +19,7 @@ import pytest
 from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
 
 from mcp_telegram.daemon_api import DaemonAPIServer, _DaemonClientLike
+from tests.daemon_api_policy import make_daemon_api_policy
 from tests.reaction_helpers import make_reaction_freshener
 
 # ---------------------------------------------------------------------------
@@ -118,6 +119,7 @@ def make_server(conn: sqlite3.Connection, client: object) -> DaemonAPIServer:
         cast(_DaemonClientLike, client),
         shutdown_event,
         reaction_freshener=make_reaction_freshener(conn, client),
+        policy=make_daemon_api_policy(),
     )
 
 

@@ -95,6 +95,12 @@ def _preserve_transcribed_texts(
     if not preserved_texts:
         return list(extracted)
     return [
-        replace(item, message=replace(item.message, text=preserved_texts.get((item.message.dialog_id, item.message.message_id), item.message.text)))
+        replace(
+            item,
+            message=replace(
+                item.message,
+                text=preserved_texts.get((item.message.dialog_id, item.message.message_id), item.message.text),
+            ),
+        )
         for item in extracted
     ]

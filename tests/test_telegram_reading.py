@@ -23,7 +23,7 @@ from mcp_telegram.reactions.refresh import ReactionFreshener
 from mcp_telegram.reactions.sqlite_repository import SQLiteReactionSnapshotRepository
 from mcp_telegram.reactions.telegram_adapter import TelethonTelegramReactionGateway
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
-from mcp_telegram.telegram_fact_queries import enrich_read_at
+from mcp_telegram.telegram_fact_queries import enrich_read_at, stale_read_at_ids
 from mcp_telegram.telegram_fragments import FragmentContextService, TelethonTelegramFragmentGateway
 from mcp_telegram.telegram_read_receipts import TelethonTelegramReadReceiptGateway
 from mcp_telegram.telegram_reading import (
@@ -194,6 +194,24 @@ async def test_reaction_freshener_refreshes_only_stale_active_window(
     ).fetchall() == [(3, "🔥", 4)]
 
 
+def test_reaction_freshness_at_exact_ttl_age_is_stale(make_synced_db: Callable[[], sqlite3.Connection]) -> None:
+    """A reaction snapshot at exactly the cutoff is refreshed, never reused."""
+    conn = make_synced_db()
+    dialog_id, message_id, now, ttl = 1001, 1, 2_000, 600
+    _seed_synced(conn, dialog_id)
+    conn.execute(
+        "INSERT INTO message_reactions_freshness (dialog_id, message_id, checked_at) VALUES (?, ?, ?)",
+        (dialog_id, message_id, now - ttl),
+    )
+    conn.commit()
+
+    state, fresh_ids, stale_ids = SQLiteReactionSnapshotRepository(conn).stale_reaction_ids(
+        dialog_id, [message_id], now - ttl
+    )
+
+    assert (state, fresh_ids, stale_ids) == ("active", set(), [message_id])
+
+
 @pytest.mark.asyncio
 async def test_reaction_freshener_commits_successful_refresh_to_other_connection(tmp_path: Path) -> None:
     db_path = tmp_path / "sync.db"
@@ -221,9 +239,12 @@ async def test_reaction_freshener_commits_successful_refresh_to_other_connection
         assert reader.execute(
             "SELECT emoji, count FROM message_reactions WHERE dialog_id=? AND message_id=?", (dialog_id, 3)
         ).fetchall() == [("🔥", 4)]
-        assert reader.execute(
-            "SELECT checked_at FROM message_reactions_freshness WHERE dialog_id=? AND message_id=?", (dialog_id, 3)
-        ).fetchone() is not None
+        assert (
+            reader.execute(
+                "SELECT checked_at FROM message_reactions_freshness WHERE dialog_id=? AND message_id=?", (dialog_id, 3)
+            ).fetchone()
+            is not None
+        )
     finally:
         reader.close()
         writer.close()
@@ -435,7 +456,9 @@ async def test_read_at_enrichment_only_probes_outgoing_user_dm_and_never_falls_b
         ReadMessage(message_id=2, sent_at=1_001, dialog_id=42, out=0),
         ReadMessage(message_id=3, sent_at=1_002, dialog_id=99, out=1),
     ]
-    enriched = await enrich_read_at(conn, Gateway(), 42, messages, dialog_type="user", checked_at=2_000)
+    enriched = await enrich_read_at(
+        conn, Gateway(), 42, messages, dialog_type="user", read_at_ttl_seconds=600, checked_at=2_000
+    )
     assert [message.read_at for message in enriched] == [None, None, None]
     assert calls == [1]
     assert conn.execute(
@@ -444,8 +467,23 @@ async def test_read_at_enrichment_only_probes_outgoing_user_dm_and_never_falls_b
 
     # Group-shaped dialogs are outside the private User-DM contract and must
     # not trigger a Telegram RPC even when they contain an outgoing message.
-    await enrich_read_at(conn, Gateway(), 42, messages, dialog_type="supergroup", checked_at=2_001)
+    await enrich_read_at(
+        conn, Gateway(), 42, messages, dialog_type="supergroup", read_at_ttl_seconds=600, checked_at=2_001
+    )
     assert calls == [1]
+
+
+def test_read_receipt_at_exact_ttl_age_is_stale(make_synced_db: Callable[[], sqlite3.Connection]) -> None:
+    """A read-receipt probe at exactly the cutoff is fetched again."""
+    conn = make_synced_db()
+    dialog_id, message_id, now, ttl = 42, 1, 2_000, 600
+    conn.execute(
+        "INSERT INTO message_read_facts (dialog_id, message_id, read_at, checked_at, status) VALUES (?, ?, ?, ?, ?)",
+        (dialog_id, message_id, 1_700_000_000, now - ttl, "complete"),
+    )
+    conn.commit()
+
+    assert stale_read_at_ids(conn, dialog_id, [message_id], now - ttl) == [message_id]
 
 
 @pytest.mark.asyncio
@@ -465,7 +503,9 @@ async def test_read_at_projects_telegram_date_for_own_dm_only(
         ReadMessage(message_id=8, sent_at=1_000, dialog_id=42, out=1),
         ReadMessage(message_id=9, sent_at=1_001, dialog_id=42, out=0),
     ]
-    enriched = await enrich_read_at(conn, Gateway(), 42, messages, dialog_type="user", checked_at=3_100)
+    enriched = await enrich_read_at(
+        conn, Gateway(), 42, messages, dialog_type="user", read_at_ttl_seconds=600, checked_at=3_100
+    )
 
     assert calls == [8]
     assert [message.read_at for message in enriched] == [1_700_000_200, None]
@@ -488,7 +528,9 @@ async def test_read_at_unavailable_is_nullable_but_probe_status_is_persisted(
             return ReadDateFetchResult(status="unavailable")
 
     messages = [ReadMessage(message_id=7, sent_at=1_000, dialog_id=42, out=1)]
-    enriched = await enrich_read_at(conn, Gateway(), 42, messages, dialog_type="user", checked_at=3_000)
+    enriched = await enrich_read_at(
+        conn, Gateway(), 42, messages, dialog_type="user", read_at_ttl_seconds=600, checked_at=3_000
+    )
 
     assert calls == [7]
     assert enriched[0].read_at is None

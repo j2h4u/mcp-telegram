@@ -7,7 +7,16 @@ from pathlib import Path
 
 import pytest
 
-from mcp_telegram.config import ConfigError, ReactionsConfig, StateConfig, load_config
+from mcp_telegram.config import (
+    ConfigError,
+    EntitiesConfig,
+    FreshnessConfig,
+    ReactionsConfig,
+    ReadReceiptsConfig,
+    StateConfig,
+    TelemetryConfig,
+    load_config,
+)
 
 
 def _write_config(tmp_path: Path, contents: str) -> Path:
@@ -17,38 +26,59 @@ def _write_config(tmp_path: Path, contents: str) -> Path:
 
 
 def test_load_config_uses_frozen_typed_defaults(tmp_path: Path) -> None:
-    path = _write_config(tmp_path, '[state]\ndir = "/var/lib/mcp-telegram"\n')
-
-    config = load_config(path)
+    config = load_config(_write_config(tmp_path, '[state]\ndir = "/var/lib/mcp-telegram"\n'))
 
     assert config.state == StateConfig(dir=Path("/var/lib/mcp-telegram"))
-    assert config.reactions == ReactionsConfig(freshness_ttl_seconds=600)
+    assert config.freshness == FreshnessConfig()
+    assert config.telemetry == TelemetryConfig()
     with pytest.raises(FrozenInstanceError):
-        config.reactions.freshness_ttl_seconds = 1  # type: ignore[misc]
+        config.freshness.reactions.freshness_ttl_seconds = 1  # type: ignore[misc]
 
 
-def test_load_config_reads_reaction_freshness_policy(tmp_path: Path) -> None:
+def test_load_config_reads_nested_policy_overrides(tmp_path: Path) -> None:
     path = _write_config(
         tmp_path,
-        '[state]\ndir = "/var/lib/mcp-telegram"\n\n[reactions]\nfreshness_ttl_seconds = 42\n',
+        """[state]
+dir = "/var/lib/mcp-telegram"
+
+[freshness.reactions]
+freshness_ttl_seconds = 40
+
+[freshness.read_receipts]
+read_at_ttl_seconds = 41
+
+[freshness.entities]
+detail_ttl_seconds = 42
+user_directory_ttl_seconds = 43
+group_directory_ttl_seconds = 44
+resolver_enrichment_ttl_seconds = 45
+
+[telemetry]
+retention_ttl_seconds = 46
+""",
     )
 
-    assert load_config(path).reactions.freshness_ttl_seconds == 42
+    config = load_config(path)
+    assert config.freshness.reactions == ReactionsConfig(freshness_ttl_seconds=40)
+    assert config.freshness.read_receipts == ReadReceiptsConfig(read_at_ttl_seconds=41)
+    assert config.freshness.entities == EntitiesConfig(42, 43, 44, 45)
+    assert config.telemetry == TelemetryConfig(retention_ttl_seconds=46)
 
 
 @pytest.mark.parametrize(
     ("contents", "expected"),
     [
-        ('[state]\ndir = "/state"\n\n[reactions]\nfreshness_ttl_seconds = true\n', "freshness_ttl_seconds"),
-        ('[state]\ndir = "/state"\n\n[reactions]\nfreshness_ttl_seconds = 0\n', "freshness_ttl_seconds"),
-        ('reactions = "invalid"\n\n[state]\ndir = "/state"\n', "[reactions]"),
+        ('[state]\ndir = "/state"\n\n[freshness.reactions]\nfreshness_ttl_seconds = true\n', "freshness_ttl_seconds"),
+        ('[state]\ndir = "/state"\n\n[freshness.read_receipts]\nread_at_ttl_seconds = 0\n', "read_at_ttl_seconds"),
+        ('[state]\ndir = "/state"\n\n[freshness.entities]\ndetail_ttl_seconds = "300"\n', "detail_ttl_seconds"),
+        ('[state]\ndir = "/state"\n\n[freshness]\nunknown = 1\n', "freshness"),
+        ('[state]\ndir = "/state"\n\nfreshness = "invalid"\n', "[freshness]"),
+        ('[state]\ndir = "/state"\n\n[reactions]\nfreshness_ttl_seconds = 42\n', "root"),
     ],
 )
-def test_load_config_rejects_invalid_reactions_policy(tmp_path: Path, contents: str, expected: str) -> None:
-    path = _write_config(tmp_path, contents)
-
+def test_load_config_rejects_invalid_policy(tmp_path: Path, contents: str, expected: str) -> None:
     with pytest.raises(ConfigError, match=expected):
-        load_config(path)
+        load_config(_write_config(tmp_path, contents))
 
 
 def test_load_config_reports_malformed_toml_with_path(tmp_path: Path) -> None:

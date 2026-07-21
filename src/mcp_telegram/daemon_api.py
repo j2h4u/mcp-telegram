@@ -10,7 +10,7 @@ DaemonAPIServer listens on a Unix domain socket and handles seventeen methods:
   - mark_dialog_for_sync: add/remove dialog from sync scope
   - get_sync_status: sync status and message statistics for a dialog
   - get_sync_alerts: deleted messages, edit history, access-lost dialogs
-  - get_entity_info: type-tagged entity profile (user/bot/channel/supergroup/group), DB-first with 5-min TTL
+  - get_entity_info: type-tagged entity profile, DB-first with configured entity-detail TTL
   - list_unread_messages: prioritized unread messages across dialogs
   - record_telemetry: write telemetry event to sync.db
   - get_usage_stats: read usage statistics from sync.db
@@ -72,8 +72,6 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
 
 from . import daemon_activity_stats as _activity_stats
 from .daemon_account_trace import (
-    GROUP_TTL,
-    USER_TTL,
     DaemonAccountTraceDeps,
     DaemonAccountTraceService,
 )
@@ -91,7 +89,6 @@ from .daemon_dialog_queries import (
     _compute_sync_coverage,
 )
 from .daemon_entity_info import DaemonEntityInfoService, EntityInfoDeps
-from .daemon_ipc import get_daemon_socket_path as _get_daemon_socket_path
 from .daemon_message_queries import (
     _FETCH_UNREAD_MESSAGES_SQL,
     _read_message_from_row,
@@ -107,16 +104,28 @@ _UPSERT_ENTITY_SQL = (
 _ALL_ENTITY_NAMES_SQL = (
     "SELECT id, name FROM entities "
     "WHERE name IS NOT NULL "
-    "AND ((type IN ('User', 'Bot') AND updated_at >= ?) "  # PascalCase per ListDialogs type vocabulary
-    "OR (type NOT IN ('User', 'Bot') AND updated_at >= ?))"
+    "AND ((type IN ('User', 'Bot') AND updated_at > ?) "  # PascalCase per ListDialogs type vocabulary
+    "OR (type NOT IN ('User', 'Bot') AND updated_at > ?))"
 )
 _ALL_ENTITY_NAMES_NORMALIZED_SQL = (
     "SELECT id, name_normalized FROM entities "
     "WHERE name_normalized IS NOT NULL "
-    "AND ((type IN ('User', 'Bot') AND updated_at >= ?) "  # PascalCase per ListDialogs type vocabulary
-    "OR (type NOT IN ('User', 'Bot') AND updated_at >= ?))"
+    "AND ((type IN ('User', 'Bot') AND updated_at > ?) "  # PascalCase per ListDialogs type vocabulary
+    "OR (type NOT IN ('User', 'Bot') AND updated_at > ?))"
 )
 _ENTITY_BY_USERNAME_SQL = "SELECT id, name, username, name_normalized FROM entities WHERE username = ? COLLATE NOCASE"
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class DaemonApiPolicy:
+    """Operator-controlled cache and retention policy supplied by the daemon root."""
+
+    read_at_ttl_seconds: int
+    entity_detail_ttl_seconds: int
+    user_directory_ttl_seconds: int
+    group_directory_ttl_seconds: int
+    resolver_enrichment_ttl_seconds: int
+    telemetry_retention_ttl_seconds: int
 
 
 def _attr(obj: object, name: str, default: object | None = None) -> object | None:
@@ -131,11 +140,6 @@ def _coerce_int(value: object, default: int) -> int:
         return int(cast(int | str, value))
     except TypeError, ValueError:
         return default
-
-
-def get_daemon_socket_path() -> Path:
-    """Return the canonical path for the daemon Unix socket."""
-    return _get_daemon_socket_path()
 
 
 from .budget import allocate_message_budget_proportional, unread_chat_tier
@@ -286,6 +290,7 @@ class _UpdateFeedbackStatusRequest:
 from .resolver import (
     Candidates,
     Resolved,
+    ResolverEnrichmentPolicy,
     _parse_tme_link,
     latinize,
 )
@@ -299,6 +304,36 @@ _current_request_id: contextvars.ContextVar[str | None] = contextvars.ContextVar
     "_current_request_id",
     default=None,
 )
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _ResolverEntityCache:
+    """SQLite-backed resolver cache used only with an explicit TTL policy."""
+
+    conn: sqlite3.Connection
+
+    def get(self, entity_id: int, ttl_seconds: int) -> Mapping[str, object] | None:
+        row = cast(
+            tuple[str | None, str | None] | None,
+            self.conn.execute(
+                "SELECT username, type FROM entities WHERE id = ? AND updated_at > ?",
+                (entity_id, int(time.time()) - ttl_seconds),
+            ).fetchone(),
+        )
+        if row is None:
+            return None
+        return {"username": row[0], "type": row[1]}
+
+    def get_by_username(self, username: str) -> tuple[int, str] | None:
+        row = cast(
+            tuple[int, str | None] | None,
+            self.conn.execute(_ENTITY_BY_USERNAME_SQL, (username,)).fetchone(),
+        )
+        if row is None:
+            return None
+        return (int(row[0]), str(row[1] or f"@{username}"))
+
+
 _DATABASE_LIST_NAME_INDEX = 1
 _DATABASE_LIST_PATH_INDEX = 2
 
@@ -351,6 +386,7 @@ class DaemonAPIServer:
         sync_db_path: Path | None = None,
         *,
         reaction_freshener: ReactionFreshener,
+        policy: DaemonApiPolicy,
     ) -> None:
         conn.row_factory = sqlite3.Row
         self._conn = conn
@@ -370,6 +406,7 @@ class DaemonAPIServer:
         self.startup_detail: str = "connecting to Telegram"
         self._reading_service: DaemonReadingService | None = None
         self._reaction_freshener = reaction_freshener
+        self._policy = policy
         self._read_receipt_gateway = TelethonTelegramReadReceiptGateway(self._client)
         self._activity_stats_service: _activity_stats.DaemonActivityStatsService | None = None
 
@@ -391,6 +428,7 @@ class DaemonAPIServer:
                     reaction_freshener=self._reaction_freshener,
                     history_gateway=TelethonTelegramHistoryGateway(self._client),
                     read_receipt_gateway=self._read_receipt_gateway,
+                    read_at_ttl_seconds=self._policy.read_at_ttl_seconds,
                     logger=cast(ReadingLoggerLike, logger),
                     rid=_rid,
                 )
@@ -734,6 +772,8 @@ class DaemonAPIServer:
                 self_id=self.self_id,
                 logger=cast(AccountTraceLoggerLike, logger),
                 rid=_rid,
+                user_directory_ttl_seconds=self._policy.user_directory_ttl_seconds,
+                group_directory_ttl_seconds=self._policy.group_directory_ttl_seconds,
             )
         )
 
@@ -1080,6 +1120,7 @@ class DaemonAPIServer:
                 rid=_rid,
                 logger=cast(logging.Logger, logger),
                 now_provider=time.time,
+                detail_ttl_seconds=self._policy.entity_detail_ttl_seconds,
                 get_common_chats_request=GetCommonChatsRequest,
                 get_dialog_filters_request=GetDialogFiltersRequest,
                 get_full_user_request=GetFullUserRequest,
@@ -1280,6 +1321,7 @@ class DaemonAPIServer:
             dialog_id,
             messages,
             dialog_type=_dialog_type_from_db(self._conn, dialog_id),
+            read_at_ttl_seconds=self._policy.read_at_ttl_seconds,
         )
         return messages, freshness
 
@@ -1287,12 +1329,10 @@ class DaemonAPIServer:
     # record_telemetry
     # ------------------------------------------------------------------
 
-    _TELEMETRY_TTL_SECONDS = 30 * 86400  # 30 days
-
     async def _record_telemetry(self, req: dict[str, object]) -> dict:
         """Write a telemetry event row to sync.db telemetry_events table.
 
-        Evicts rows older than 30 days on every write to prevent unbounded growth.
+        Evicts rows older than the configured retention window on every write.
         """
         event_obj = req.get("event")
         if not isinstance(event_obj, dict):
@@ -1318,7 +1358,7 @@ class DaemonAPIServer:
                     event.get("error_type"),
                 ),
             )
-            cutoff = time.time() - self._TELEMETRY_TTL_SECONDS
+            cutoff = time.time() - self._policy.telemetry_retention_ttl_seconds
             self._conn.execute("DELETE FROM telemetry_events WHERE timestamp < ?", (cutoff,))
             self._conn.commit()
             return {"ok": True}
@@ -1532,17 +1572,31 @@ class DaemonAPIServer:
         display_name_map = dict(
             cast(
                 list[tuple[int, str]],
-                self._conn.execute(_ALL_ENTITY_NAMES_SQL, (now - USER_TTL, now - GROUP_TTL)).fetchall(),
+                self._conn.execute(
+                    _ALL_ENTITY_NAMES_SQL,
+                    (now - self._policy.user_directory_ttl_seconds, now - self._policy.group_directory_ttl_seconds),
+                ).fetchall(),
             )
         )
         normalized = dict(
             cast(
                 list[tuple[int, str]],
-                self._conn.execute(_ALL_ENTITY_NAMES_NORMALIZED_SQL, (now - USER_TTL, now - GROUP_TTL)).fetchall(),
+                self._conn.execute(
+                    _ALL_ENTITY_NAMES_NORMALIZED_SQL,
+                    (now - self._policy.user_directory_ttl_seconds, now - self._policy.group_directory_ttl_seconds),
+                ).fetchall(),
             )
         )
 
-        result = resolve_entity_sync(query, display_name_map, None, normalized_name_map=normalized)
+        result = resolve_entity_sync(
+            query,
+            display_name_map,
+            ResolverEnrichmentPolicy(
+                entity_cache=_ResolverEntityCache(self._conn),
+                ttl_seconds=self._policy.resolver_enrichment_ttl_seconds,
+            ),
+            normalized_name_map=normalized,
+        )
 
         if isinstance(result, Resolved):
             return {

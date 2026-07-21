@@ -24,8 +24,6 @@ from .resolver import Candidates, Resolved, _parse_tme_link, latinize, resolve
 from .telethon_dialog import classify_dialog_type
 
 _TRACE_SCOPE_DIALOG_IDS_LEN = 2
-USER_TTL = 2_592_000  # 30 days
-GROUP_TTL = 604_800  # 7 days
 _TRACE_ACRONYM_MIN_LEN = 2
 _TRACE_ACRONYM_MAX_LEN = 4
 _TRACE_FUZZY_MIN_LEN = 4
@@ -79,14 +77,14 @@ _TRACE_ACCOUNT_BY_ID_SQL = "SELECT id, name, username, name_normalized FROM enti
 _TRACE_ACCOUNT_NAMES_SQL = (
     "SELECT id, name FROM entities "
     "WHERE id > 0 AND name IS NOT NULL "
-    "AND ((type IN ('User', 'Bot', 'user', 'bot') AND updated_at >= ?) "
-    "OR (type NOT IN ('User', 'Bot', 'user', 'bot') AND updated_at >= ?))"
+    "AND ((type IN ('User', 'Bot', 'user', 'bot') AND updated_at > ?) "
+    "OR (type NOT IN ('User', 'Bot', 'user', 'bot') AND updated_at > ?))"
 )
 _TRACE_ACCOUNT_NAMES_NORMALIZED_SQL = (
     "SELECT id, name_normalized FROM entities "
     "WHERE id > 0 AND name_normalized IS NOT NULL "
-    "AND ((type IN ('User', 'Bot', 'user', 'bot') AND updated_at >= ?) "
-    "OR (type NOT IN ('User', 'Bot', 'user', 'bot') AND updated_at >= ?))"
+    "AND ((type IN ('User', 'Bot', 'user', 'bot') AND updated_at > ?) "
+    "OR (type NOT IN ('User', 'Bot', 'user', 'bot') AND updated_at > ?))"
 )
 
 
@@ -100,6 +98,8 @@ class DaemonAccountTraceDeps:
     self_id: int | None
     logger: _LoggerLike
     rid: Callable[[], str]
+    user_directory_ttl_seconds: int
+    group_directory_ttl_seconds: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -336,7 +336,12 @@ class DaemonAccountTraceService:
                 return row
             return await self._resolve_trace_username(username)
 
-        return _resolve_trace_account_by_fuzzy(self._deps.conn, str(lookup.query))
+        return _resolve_trace_account_by_fuzzy(
+            self._deps.conn,
+            str(lookup.query),
+            user_directory_ttl_seconds=self._deps.user_directory_ttl_seconds,
+            group_directory_ttl_seconds=self._deps.group_directory_ttl_seconds,
+        )
 
     async def _resolve_trace_username(self, username: str) -> dict:
         """Resolve an explicit username with one daemon-owned Telegram lookup."""
@@ -975,17 +980,34 @@ def _resolve_trace_account_by_username(conn: sqlite3.Connection, username: str) 
     return _trace_account_from_entity_row(cast(Mapping[str, object], row), resolution_source="entities_username")
 
 
-def _resolve_trace_account_by_fuzzy(conn: sqlite3.Connection, query: str) -> dict:
+def _resolve_trace_account_by_fuzzy(
+    conn: sqlite3.Connection,
+    query: str,
+    *,
+    user_directory_ttl_seconds: int,
+    group_directory_ttl_seconds: int,
+) -> dict:
     now = int(time.time())
     display_name_map: dict[int, str] = {}
-    for row in _fetchall_rows(conn.execute(_TRACE_ACCOUNT_NAMES_SQL, (now - USER_TTL, now - GROUP_TTL))):
+    for row in _fetchall_rows(
+        conn.execute(_TRACE_ACCOUNT_NAMES_SQL, (now - user_directory_ttl_seconds, now - group_directory_ttl_seconds))
+    ):
         values = _row_sequence(row)
         display_name_map[_row_int(cast(Mapping[str, object], {"entity_id": values[0]}), "entity_id")] = str(values[1])
     normalized: dict[int, str] = {}
-    for row in _fetchall_rows(conn.execute(_TRACE_ACCOUNT_NAMES_NORMALIZED_SQL, (now - USER_TTL, now - GROUP_TTL))):
+    for row in _fetchall_rows(
+        conn.execute(
+            _TRACE_ACCOUNT_NAMES_NORMALIZED_SQL,
+            (now - user_directory_ttl_seconds, now - group_directory_ttl_seconds),
+        )
+    ):
         values = _row_sequence(row)
         normalized[_row_int(cast(Mapping[str, object], {"entity_id": values[0]}), "entity_id")] = str(values[1])
-    result = resolve(query, display_name_map, None, normalized_name_map=normalized)
+    result = resolve(
+        query,
+        display_name_map,
+        normalized_name_map=normalized,
+    )
     if isinstance(result, Resolved):
         row = _fetchone_row(conn.execute(_TRACE_ACCOUNT_BY_ID_SQL, (result.entity_id,)))
         if row is not None:

@@ -16,8 +16,6 @@ from .models import DialogType, ReadMessage, ReadReactionEvent
 from .telegram_gateway import CATCHABLE_GATEWAY_FAILURES
 from .telegram_reading import ReadDateFetchResult, TelegramReadReceiptGateway
 
-READ_AT_TTL_SECONDS = 600
-
 
 def reaction_event_projection(
     conn: sqlite3.Connection,
@@ -94,6 +92,7 @@ async def enrich_read_at(  # noqa: PLR0913
     messages: Sequence[ReadMessage],
     *,
     dialog_type: str | DialogType | None,
+    read_at_ttl_seconds: int,
     checked_at: int | None = None,
 ) -> list[ReadMessage]:
     """Best-effort enrich own outgoing User-DM messages with Telegram dates.
@@ -103,6 +102,8 @@ async def enrich_read_at(  # noqa: PLR0913
     and are not retried until the bounded TTL expires.
     """
 
+    if isinstance(read_at_ttl_seconds, bool) or not isinstance(read_at_ttl_seconds, int) or read_at_ttl_seconds < 1:
+        raise ValueError("read_at_ttl_seconds must be an integer >= 1")
     if gateway is None or DialogType.parse(dialog_type) != DialogType.USER:
         return list(messages)
     candidates = [message for message in messages if message.out == 1 and message.dialog_id == dialog_id]
@@ -113,7 +114,7 @@ async def enrich_read_at(  # noqa: PLR0913
         conn,
         dialog_id,
         [message.message_id for message in candidates],
-        now - READ_AT_TTL_SECONDS,
+        now - read_at_ttl_seconds,
     )
     for message_id in stale_ids:
         try:

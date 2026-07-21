@@ -5,7 +5,6 @@ from enum import StrEnum
 from typing import Literal, NotRequired, TypedDict
 
 FORUM_TOPICS_PAGE_SIZE = 100
-TOPIC_METADATA_TTL_SECONDS = 600
 GENERAL_TOPIC_ID = 1
 GENERAL_TOPIC_TITLE = "General"
 

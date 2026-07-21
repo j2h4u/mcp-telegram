@@ -528,3 +528,18 @@ forbidden_modules = [
   "mcp_telegram.tools",
   "mcp_telegram.__init__",
 ]
+
+[[tool.importlinter.contracts]]
+name = "Injected runtime policy stays independent of config loading"
+type = "forbidden"
+source_modules = [
+  "mcp_telegram.daemon_api",
+  "mcp_telegram.daemon_account_trace",
+  "mcp_telegram.daemon_entity_info",
+  "mcp_telegram.daemon_reading",
+  "mcp_telegram.resolver",
+  "mcp_telegram.telegram_fact_queries",
+  "mcp_telegram.state",
+]
+forbidden_modules = ["mcp_telegram.config"]
+allow_indirect_imports = false

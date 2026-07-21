@@ -32,6 +32,7 @@ class PeerNameClient(Protocol):
 
     async def get_entity(self, peer: object) -> object: ...
 
+
 class _PeerLike(Protocol):
     channel_id: int | None
     chat_id: int | None
@@ -105,6 +106,7 @@ class _MessageLike(Protocol):
     media: object | None
     rich_message: object | None
     action: object | None
+
 
 def _attr[T](obj: object, name: str, default: T) -> T:
     return cast(T, getattr(obj, name, default))
@@ -613,17 +615,13 @@ def extract_message_row(
     )
 
 
-
-
 async def build_forward_entity_name_map(message: object, client: PeerNameClient) -> dict[int, str]:
     """Resolve the forward-source name for one message, when needed."""
 
     return await _build_fwd_entity_map(message, client)
 
 
-async def resolve_forward_entity_name_map(
-    messages: Sequence[object], client: PeerNameClient
-) -> dict[int, str]:
+async def resolve_forward_entity_name_map(messages: Sequence[object], client: PeerNameClient) -> dict[int, str]:
     """Resolve reusable forward-source names for one fetched Telegram batch."""
 
     peers: dict[int, object] = {}
