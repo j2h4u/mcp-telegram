@@ -4,13 +4,13 @@
 from __future__ import annotations
 
 import json
+import os
 import socket
 import sys
 import tomllib
 from pathlib import Path
 from typing import TypedDict, cast
 
-CONFIG_PATH = Path("/root/.config/mcp-telegram/config.toml")
 TIMEOUT_SECONDS = 5.0
 
 
@@ -20,17 +20,23 @@ class _HealthcheckResponse(TypedDict, total=False):
     detail: str
 
 
+def _config_path() -> Path:
+    config_home = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config")))
+    return config_home / "mcp-telegram" / "config.toml"
+
+
 def _load_socket_path() -> Path:
-    if not CONFIG_PATH.exists():
-        raise RuntimeError(f"missing config: {CONFIG_PATH}")
-    with CONFIG_PATH.open("rb") as config_file:
+    config_path = _config_path()
+    if not config_path.exists():
+        raise RuntimeError(f"missing config: {config_path}")
+    with config_path.open("rb") as config_file:
         config = tomllib.load(config_file)
     state_config = config.get("state")
     if not isinstance(state_config, dict):
-        raise RuntimeError(f"missing [state] in {CONFIG_PATH}")
+        raise RuntimeError(f"missing [state] in {config_path}")
     state_dir = state_config.get("dir")
     if not isinstance(state_dir, str) or state_dir.strip() == "":
-        raise RuntimeError(f"missing state.dir in {CONFIG_PATH}")
+        raise RuntimeError(f"missing state.dir in {config_path}")
     return Path(state_dir).expanduser() / "daemon.sock"
 
 

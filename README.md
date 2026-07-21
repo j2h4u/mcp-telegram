@@ -155,9 +155,12 @@ get_sync_status(dialog_id=<dialog_id>)
 
    ```bash
    mkdir -p /opt/docker/mcp-telegram
-   install -d -m 700 /srv/mcp-telegram/database
+   install -d -m 700 -o 10001 -g 10001 /srv/mcp-telegram/database
    cp deploy/docker-compose.yml deploy/config.toml deploy/AGENTS.md /opt/docker/mcp-telegram/
    ```
+
+   The container runs as UID/GID `10001`, so that user must be able to read and
+   write `/srv/mcp-telegram/database`.
 
 3. Edit `/opt/docker/mcp-telegram/docker-compose.yml` and set
    `build.context` to the absolute path of this repository.
