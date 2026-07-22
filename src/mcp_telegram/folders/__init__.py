@@ -1,0 +1,1 @@
+"""Telegram dialog-folder capability."""

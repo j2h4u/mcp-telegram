@@ -6,7 +6,7 @@ import sqlite3
 from pathlib import Path
 from typing import cast
 
-_CURRENT_SCHEMA_VERSION = 28
+_CURRENT_SCHEMA_VERSION = 29
 _SCHEMA_VERSION_WITH_FTS = 3
 
 logger = logging.getLogger(__name__)
@@ -1197,6 +1197,29 @@ def _apply_migrations_21_to_28(conn: sqlite3.Connection, current: int) -> int:
     )
 
 
+def _apply_migration_29(conn: sqlite3.Connection, current: int) -> int:
+    """Create the minimal many-to-many Telegram custom-folder snapshot."""
+    return _apply_migration(
+        conn,
+        current,
+        29,
+        [
+            """CREATE TABLE IF NOT EXISTS telegram_folders (
+    folder_id INTEGER PRIMARY KEY,
+    title     TEXT NOT NULL
+)""",
+            """CREATE TABLE IF NOT EXISTS telegram_folder_members (
+    folder_id INTEGER NOT NULL,
+    dialog_id INTEGER NOT NULL,
+    PRIMARY KEY (folder_id, dialog_id),
+    FOREIGN KEY (folder_id) REFERENCES telegram_folders(folder_id) ON DELETE CASCADE
+) WITHOUT ROWID""",
+            """CREATE INDEX IF NOT EXISTS idx_telegram_folder_members_dialog
+ON telegram_folder_members(dialog_id, folder_id)""",
+        ],
+    )
+
+
 def _apply_migrations(conn: sqlite3.Connection) -> None:
     """Apply WAL mode and all pending schema migrations in version order."""
     try:
@@ -1222,6 +1245,7 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     current = _apply_migrations_11_to_15(conn, current)
     current = _apply_migrations_16_to_20(conn, current)
     current = _apply_migrations_21_to_28(conn, current)
+    current = _apply_migration_29(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 

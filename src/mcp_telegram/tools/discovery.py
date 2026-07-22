@@ -76,6 +76,8 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
                         "items": {"type": "string"},
                         "description": "Stable own-only classifier basis when this row is in own scope.",
                     },
+                    "folder_ids": {"type": "array", "items": {"type": "integer"}},
+                    "archived": {"type": "boolean"},
                 },
                 "required": [
                     "id",
@@ -98,6 +100,8 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
                     "scheduled_count",
                     "next_scheduled_at",
                     "inclusion_basis",
+                    "folder_ids",
+                    "archived",
                 ],
                 "additionalProperties": False,
             },
@@ -115,8 +119,9 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
                     "description": "Filter dialog summaries by pending scheduled lifecycle state.",
                 },
                 "scope": {"type": "string", "enum": ["all", "own_only"]},
+                "folder_id": {"type": ["integer", "null"]},
             },
-            "required": ["exclude_archived", "ignore_pinned", "filter", "message_state", "scope"],
+            "required": ["exclude_archived", "ignore_pinned", "filter", "message_state", "scope", "folder_id"],
             "additionalProperties": False,
         },
         "snapshot_age_h": {"type": ["integer", "null"]},
@@ -215,6 +220,7 @@ class ListDialogs(ToolArgs):
     filter: str | None = Field(default=None, max_length=200)
     message_state: Literal["sent", "scheduled", "all"] = "all"
     scope: Literal["all", "own_only"] = "all"
+    folder_id: int | None = Field(default=None, ge=0)
 
 
 @mcp_tool(
@@ -238,6 +244,7 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
                 filter=args.filter,
                 message_state=args.message_state,
                 scope=args.scope,
+                folder_id=args.folder_id,
             )
     except DaemonNotRunningError as exc:
         return error_result(_daemon_not_running_text(exc))
@@ -280,6 +287,8 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
                 "unread_mentions_count": int(d.get("unread_mentions_count", 0) or 0),
                 "unread_reactions_count": int(d.get("unread_reactions_count", 0) or 0),
                 **_structured_dialog_lifecycle_fields(d),
+                "folder_ids": list(d.get("folder_ids", [])),
+                "archived": bool(d.get("archived", False)),
             }
         )
     structured_content = {
@@ -291,6 +300,7 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
             "filter": args.filter,
             "message_state": args.message_state,
             "scope": args.scope,
+            "folder_id": args.folder_id,
         },
         "snapshot_age_h": snapshot_age_h,
         "bootstrap_pending": bootstrap_pending,

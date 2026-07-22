@@ -69,6 +69,10 @@ from .flood import (
     maybe_log_flood_wait_rollup,
     sleep_through_flood,
 )
+from .folders.contracts import FolderSourceUnavailableError
+from .folders.refresh import FolderRefresher
+from .folders.sqlite_repository import SQLiteFolderSnapshotRepository
+from .folders.telegram_adapter import FolderClient, TelethonTelegramFolderGateway
 from .fts import backfill_fts_index
 from .messages.sqlite_repository import insert_messages_with_fts
 from .messages.telegram_adapter import extract_message_row
@@ -792,6 +796,18 @@ async def _prime_runtime(ctx: _SyncMainContext) -> None:
     ctx.own_only_context = await _load_own_only_context(ctx.client, ctx.api_server.self_id)
     ensure_own_only_schema(ctx.conn)
     logger.info("daemon self_id cached: %s", ctx.api_server.self_id)
+
+    ctx.api_server.startup_detail = "refreshing Telegram folders"
+    folder_gateway = TelethonTelegramFolderGateway(cast(FolderClient, ctx.client))
+    try:
+        await FolderRefresher(folder_gateway, SQLiteFolderSnapshotRepository(ctx.conn)).refresh()
+    except FolderSourceUnavailableError:
+        logger.warning(
+            "telegram folder snapshot refresh failed — serving preserved local snapshot",
+            exc_info=True,
+        )
+    else:
+        logger.info("telegram folder snapshot refreshed")
 
     # Post-v10 runtime backfill: mark historical outgoing DM rows as out=1
     # using sender_id=self_id (the authoritative signal). Pure-SQL v10

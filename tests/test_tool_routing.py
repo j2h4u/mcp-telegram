@@ -30,6 +30,8 @@ from mcp_telegram.tools import (
     GetSyncAlerts,
     GetSyncStatus,
     ListDialogs,
+    ListFolderMessages,
+    ListFolders,
     ListMessages,
     ListTopics,
     MarkDialogForSync,
@@ -42,6 +44,8 @@ from mcp_telegram.tools import (
     get_sync_alerts,
     get_sync_status,
     list_dialogs,
+    list_folder_messages,
+    list_folders,
     list_messages,
     list_topics,
     mark_dialog_for_sync,
@@ -130,6 +134,8 @@ class _DaemonConnStub:
     list_messages: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
     search_messages: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
     list_dialogs: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
+    list_folders: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
+    list_folder_messages: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
     list_topics: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
     get_me: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
     mark_dialog_for_sync: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
@@ -185,6 +191,32 @@ def assert_structured_text_parity(
 
 
 STRUCTURED_TOOL_CASES = {
+    "list_folder_messages": (
+        list_folder_messages,
+        ListFolderMessages(folder_id=2),
+        {
+            "ok": True,
+            "data": {
+                "messages": [
+                    {
+                        "dialog_id": 123,
+                        "message_id": 5,
+                        "sent_at": 1705312800,
+                        "text": "hello world",
+                        "dialog_name": "Alice",
+                    }
+                ],
+                "partial": True,
+                "incomplete_dialog_ids": [456],
+                "next_navigation": None,
+            },
+        },
+    ),
+    "list_folders": (
+        list_folders,
+        ListFolders(),
+        {"ok": True, "data": {"folders": [{"id": 2, "title": "Work"}]}},
+    ),
     "list_dialogs": (
         list_dialogs,
         ListDialogs(),
@@ -501,6 +533,29 @@ async def test_registered_tools_return_structured_content_and_text(tool_name: st
     assert_structured_success_payload(result)
 
 
+async def test_folder_tools_frame_telegram_labels_without_raw_duplicates():
+    folders_runner, folders_args, folders_response = STRUCTURED_TOOL_CASES["list_folders"]
+    messages_runner, messages_args, messages_response = STRUCTURED_TOOL_CASES["list_folder_messages"]
+
+    with _patch_daemon(_make_daemon_conn(folders_response)):
+        folders_payload = assert_structured_success_payload(await folders_runner(folders_args))
+    with _patch_daemon(_make_daemon_conn(messages_response)):
+        messages_payload = assert_structured_success_payload(await messages_runner(messages_args))
+
+    assert "titles_content" not in folders_payload
+    assert folders_payload["folders"] == [
+        {
+            "id": 2,
+            "title": {"text": "Work", "is_telegram_content": True, "content_kind": "message_text"},
+        }
+    ]
+    assert _field_path_value(messages_payload, "messages.0.dialog_name") == {
+        "text": "Alice",
+        "is_telegram_content": True,
+        "content_kind": "message_text",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Daemon mock helpers
 # ---------------------------------------------------------------------------
@@ -513,6 +568,8 @@ def _make_daemon_conn(response: dict | None = None) -> _DaemonConnStub:
     conn.list_messages = _AsyncMethodMock(return_value=r)
     conn.search_messages = _AsyncMethodMock(return_value=r)
     conn.list_dialogs = _AsyncMethodMock(return_value=r)
+    conn.list_folders = _AsyncMethodMock(return_value=r)
+    conn.list_folder_messages = _AsyncMethodMock(return_value=r)
     conn.list_topics = _AsyncMethodMock(return_value=r)
     conn.get_me = _AsyncMethodMock(return_value=r)
     conn.mark_dialog_for_sync = _AsyncMethodMock(return_value=r)
@@ -554,6 +611,7 @@ class _patch_daemon:
             "mcp_telegram.tools.activity.daemon_connection",  # Phase 999.1 (B4b)
             "mcp_telegram.tools.account_trace.daemon_connection",
             "mcp_telegram.tools.feedback.daemon_connection",
+            "mcp_telegram.tools.folders.daemon_connection",
         ]
         for target in targets:
             p = patch(target, side_effect=lambda c=self._conn: _fake_daemon_cm(c))
@@ -587,6 +645,7 @@ class _patch_daemon_not_running:
             "mcp_telegram.tools.activity.daemon_connection",  # Phase 999.1 (B4b)
             "mcp_telegram.tools.account_trace.daemon_connection",
             "mcp_telegram.tools.feedback.daemon_connection",
+            "mcp_telegram.tools.folders.daemon_connection",
         ]
         for target in targets:
             p = patch(target, return_value=_raise_not_running())
@@ -643,6 +702,7 @@ async def test_list_dialogs_via_daemon():
     assert payload["bootstrap_pending"] is False
     assert payload["filters"] == {
         "exclude_archived": False,
+        "folder_id": None,
         "ignore_pinned": False,
         "filter": None,
         "message_state": "all",

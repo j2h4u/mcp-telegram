@@ -319,7 +319,7 @@ class DaemonConnection:
             payload["navigation"] = navigation
         return await self.request(payload)
 
-    async def list_dialogs(
+    async def list_dialogs(  # noqa: PLR0913
         self,
         *,
         exclude_archived: bool = False,
@@ -327,6 +327,7 @@ class DaemonConnection:
         filter: str | None = None,
         message_state: str = "all",
         scope: str = "all",
+        folder_id: int | None = None,
     ) -> dict:
         """List dialogs with optional archive/pin/name filtering."""
         payload: dict = {
@@ -338,7 +339,17 @@ class DaemonConnection:
             payload["filter"] = filter
         payload["message_state"] = message_state
         payload["scope"] = scope
+        if folder_id is not None:
+            payload["folder_id"] = folder_id
         return await self.request(payload)
+
+    async def list_folders(self) -> dict:
+        """List custom Telegram dialog folders from the daemon snapshot."""
+        return await self.request({"method": "list_folders"})
+
+    async def list_folder_messages(self, *, folder_id: int, limit: int) -> dict:
+        """List locally stored messages for one custom Telegram folder."""
+        return await self.request({"method": "list_folder_messages", "folder_id": folder_id, "limit": limit})
 
     async def list_topics(
         self,

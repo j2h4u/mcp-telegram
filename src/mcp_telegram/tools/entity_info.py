@@ -27,7 +27,13 @@ from ._base import (
     mcp_tool,
     structured_result,
 )
-from .structured import StructuredWarning, TelegramContentKind, structured_warning, telegram_content
+from .structured import (
+    TELEGRAM_CONTENT_OUTPUT_SCHEMA,
+    StructuredWarning,
+    TelegramContentKind,
+    structured_warning,
+    telegram_content,
+)
 
 GET_ENTITY_INFO_OUTPUT_SCHEMA = {
     "type": "object",
@@ -53,6 +59,26 @@ GET_ENTITY_INFO_OUTPUT_SCHEMA = {
         "privacy_or_access": {"type": "object", "additionalProperties": True},
         "warnings": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
         "content_fields": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
+        "dialog_placement": {
+            "type": "object",
+            "properties": {
+                "archived": {"type": "boolean"},
+                "folders": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "integer"},
+                            "title": TELEGRAM_CONTENT_OUTPUT_SCHEMA,
+                        },
+                        "required": ["id", "title"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["archived", "folders"],
+            "additionalProperties": False,
+        },
     },
     "required": [
         "resolved_query",
@@ -66,6 +92,7 @@ GET_ENTITY_INFO_OUTPUT_SCHEMA = {
         "privacy_or_access",
         "warnings",
         "content_fields",
+        "dialog_placement",
     ],
     "additionalProperties": True,
 }
@@ -573,6 +600,24 @@ def _entity_structured_content(
         "privacy_or_access": _privacy_or_access_structured(data),
         "warnings": _entity_warnings(data),
         "content_fields": _content_fields(data),
+        "dialog_placement": _dialog_placement_structured(data.get("dialog_placement")),
+    }
+
+
+def _dialog_placement_structured(value: object) -> dict[str, object]:
+    placement = value if isinstance(value, dict) else {}
+    raw_folders = placement.get("folders")
+    folders = raw_folders if isinstance(raw_folders, list) else []
+    return {
+        "archived": bool(placement.get("archived", False)),
+        "folders": [
+            {
+                "id": int(folder["id"]),
+                "title": telegram_content(str(folder.get("title", "")), "message_text"),
+            }
+            for folder in folders
+            if isinstance(folder, dict) and "id" in folder
+        ],
     }
 
 
