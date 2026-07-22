@@ -53,6 +53,7 @@ GET_ENTITY_INFO_OUTPUT_SCHEMA = {
         "privacy_or_access": {"type": "object", "additionalProperties": True},
         "warnings": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
         "content_fields": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
+        "dialog_placement": {"type": "object", "additionalProperties": True},
     },
     "required": [
         "resolved_query",
@@ -66,6 +67,7 @@ GET_ENTITY_INFO_OUTPUT_SCHEMA = {
         "privacy_or_access",
         "warnings",
         "content_fields",
+        "dialog_placement",
     ],
     "additionalProperties": True,
 }
@@ -573,6 +575,7 @@ def _entity_structured_content(
         "privacy_or_access": _privacy_or_access_structured(data),
         "warnings": _entity_warnings(data),
         "content_fields": _content_fields(data),
+        "dialog_placement": data.get("dialog_placement", {"archived": False, "folders": []}),
     }
 
 

@@ -1,7 +1,7 @@
 {
   "steps": [
     {
-      "_comment": "All 14 tools registered with output schemas",
+      "_comment": "All 15 tools registered with output schemas",
       "action": "list_tools",
       "expect": {
         "tool_names_include": [
@@ -12,6 +12,7 @@
           "get_sync_alerts",
           "get_sync_status",
           "get_usage_stats",
+          "list_folders",
           "list_dialogs",
           "list_messages",
           "list_topics",
@@ -46,6 +47,9 @@
           "list_messages": {
             "inputSchema.properties.limit.default": 50,
             "inputSchema.properties.navigation.type": "string",
+            "outputSchema.type": "object"
+          },
+          "list_folders": {
             "outputSchema.type": "object"
           },
           "search_messages": {

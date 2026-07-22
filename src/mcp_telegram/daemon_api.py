@@ -94,6 +94,8 @@ from .daemon_message_queries import (
     _read_message_from_row,
 )
 from .daemon_read_state_queries import _dialog_type_from_db, _read_state_for_dialog
+from .folder_store import dialog_placement, folder_ids_by_dialog, list_folders
+from .folder_sync import FolderClient, refresh_folder_snapshot
 from .models import DialogType, ReadMessage
 from .telegram_fact_queries import enrich_reaction_events, enrich_read_at
 
@@ -596,6 +598,7 @@ class DaemonAPIServer:
             "search_messages": self._search_messages,
             "trace_account_messages": self._trace_account_messages,
             "list_dialogs": self._list_dialogs,
+            "list_folders": self._list_folders,
             "list_topics": self._list_topics,
             "get_me": self._get_me,
             "mark_dialog_for_sync": self._mark_dialog_for_sync,
@@ -887,7 +890,31 @@ class DaemonAPIServer:
 
     async def _list_dialogs(self, req: dict[str, object]) -> dict:
         """Delegate list_dialogs reads to the reading service."""
-        return await self._get_reading_service()._list_dialogs(cast(dict[str, object], req))
+        result = await self._get_reading_service()._list_dialogs(cast(dict[str, object], req))
+        if not result.get("ok"):
+            return result
+        memberships = folder_ids_by_dialog(self._conn)
+        requested_folder = req.get("folder_id")
+        data = cast(dict[str, object], result.get("data", {}))
+        dialogs = cast(list[dict[str, object]], data.get("dialogs", []))
+        enriched = []
+        for dialog in dialogs:
+            ids = memberships.get(int(cast(int | str, dialog["id"])), [])
+            dialog["folder_ids"] = ids
+            if requested_folder is None or int(cast(int | str, requested_folder)) in ids:
+                enriched.append(dialog)
+        data["dialogs"] = enriched
+        return result
+
+    async def _refresh_folders(self) -> None:
+        try:
+            await refresh_folder_snapshot(self._conn, cast(FolderClient, self._client))
+        except Exception:
+            logger.warning("telegram folder snapshot refresh failed; serving previous snapshot", exc_info=True)
+
+    async def _list_folders(self, _req: dict[str, object]) -> dict:
+        await self._refresh_folders()
+        return {"ok": True, "data": {"folders": list_folders(self._conn)}}
 
     # list_topics
     # ------------------------------------------------------------------
@@ -1139,7 +1166,13 @@ class DaemonAPIServer:
                 chat_type=Chat,
             )
         )
-        return await service.get_entity_info(req)
+        result = await service.get_entity_info(req)
+        if result.get("ok"):
+            data = cast(dict[str, object], result.get("data", {}))
+            entity_id = data.get("id")
+            if isinstance(entity_id, int):
+                data["dialog_placement"] = dialog_placement(self._conn, entity_id)
+        return result
 
     # ------------------------------------------------------------------
     # list_unread_messages

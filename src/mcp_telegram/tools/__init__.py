@@ -20,6 +20,7 @@ from .activity import GetMyRecentActivity, get_my_recent_activity
 from .discovery import ListDialogs, ListTopics, list_dialogs, list_topics
 from .entity_info import GetEntityInfo, get_entity_info
 from .feedback import SubmitFeedback, submit_feedback
+from .folders import ListFolders, list_folders
 from .reading import ListMessages, SearchMessages, list_messages, search_messages
 from .stats import GetDialogStats, GetUsageStats, get_dialog_stats, get_usage_stats
 from .sync import (
@@ -43,6 +44,7 @@ __all__ = [
     "GetSyncStatus",
     "GetUsageStats",
     "ListDialogs",
+    "ListFolders",
     "ListMessages",
     "ListTopics",
     "MarkDialogForSync",
@@ -60,6 +62,7 @@ __all__ = [
     "get_sync_status",
     "get_usage_stats",
     "list_dialogs",
+    "list_folders",
     "list_messages",
     "list_topics",
     "mark_dialog_for_sync",
