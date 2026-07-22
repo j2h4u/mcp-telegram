@@ -7,10 +7,11 @@ from collections.abc import AsyncIterator, Sequence
 from typing import Protocol, cast
 
 from telethon import utils as telethon_utils  # type: ignore[import-untyped]
+from telethon.errors import FloodWaitError, RPCError  # type: ignore[import-untyped]
 from telethon.tl.functions.messages import GetDialogFiltersRequest  # type: ignore[import-untyped]
 from telethon.tl.types import Channel, Chat, DialogFilter, DialogFilterChatlist, User  # type: ignore[import-untyped]
 
-from .contracts import DialogCategory, DialogFacts, FolderRule, FolderSourceSnapshot
+from .contracts import DialogCategory, DialogFacts, FolderRule, FolderSourceSnapshot, FolderSourceUnavailableError
 from .ports import TelegramFolderGateway
 
 
@@ -102,7 +103,12 @@ class TelethonTelegramFolderGateway(TelegramFolderGateway):
         self._client = client
 
     async def fetch_snapshot(self) -> FolderSourceSnapshot:
-        response = await self._client(GetDialogFiltersRequest())
+        try:
+            response = await self._client(GetDialogFiltersRequest())
+            raw_dialogs = [dialog async for dialog in self._client.iter_dialogs()]
+        except (FloodWaitError, RPCError, TimeoutError, OSError) as exc:
+            raise FolderSourceUnavailableError("Telegram folder source is unavailable") from exc
+
         raw_filters = cast(Sequence[object], getattr(response, "filters", ()))
         names = {DialogFilter.__name__, DialogFilterChatlist.__name__}
         folders = tuple(
@@ -110,5 +116,5 @@ class TelethonTelegramFolderGateway(TelegramFolderGateway):
             for item in raw_filters
             if isinstance(item, (DialogFilter, DialogFilterChatlist)) or item.__class__.__name__ in names
         )
-        dialogs = [_dialog_facts(dialog) async for dialog in self._client.iter_dialogs()]
+        dialogs = [_dialog_facts(dialog) for dialog in raw_dialogs]
         return FolderSourceSnapshot(folders=folders, dialogs=tuple(dialogs))

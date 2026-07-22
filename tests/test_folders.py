@@ -7,7 +7,13 @@ from pathlib import Path
 
 import pytest
 
-from mcp_telegram.folders.contracts import DialogCategory, DialogFacts, FolderRule, FolderSourceSnapshot
+from mcp_telegram.folders.contracts import (
+    DialogCategory,
+    DialogFacts,
+    FolderRule,
+    FolderSourceSnapshot,
+    FolderSourceUnavailableError,
+)
 from mcp_telegram.folders.membership import matches
 from mcp_telegram.folders.refresh import FolderRefresher
 from mcp_telegram.folders.sqlite_repository import (
@@ -18,7 +24,7 @@ from mcp_telegram.folders.sqlite_repository import (
     list_folders,
     replace_folder_snapshot,
 )
-from mcp_telegram.folders.telegram_adapter import _dialog_facts
+from mcp_telegram.folders.telegram_adapter import TelethonTelegramFolderGateway, _dialog_facts
 from mcp_telegram.sync_db import ensure_sync_schema
 
 
@@ -157,6 +163,36 @@ def test_telegram_adapter_counts_manual_unread_mark() -> None:
     )()
 
     assert _dialog_facts(dialog).unread is True
+
+
+class _SourceFailureClient:
+    def __init__(self, failure: Exception) -> None:
+        self._failure = failure
+
+    async def __call__(self, request: object) -> object:
+        del request
+        raise self._failure
+
+    async def iter_dialogs(self, **kwargs: object):
+        del kwargs
+        if False:
+            yield None
+
+
+async def test_telegram_adapter_maps_expected_source_failure() -> None:
+    gateway = TelethonTelegramFolderGateway(_SourceFailureClient(TimeoutError("network unavailable")))
+
+    with pytest.raises(FolderSourceUnavailableError) as exc_info:
+        await gateway.fetch_snapshot()
+
+    assert isinstance(exc_info.value.__cause__, TimeoutError)
+
+
+async def test_telegram_adapter_does_not_map_programming_failure() -> None:
+    gateway = TelethonTelegramFolderGateway(_SourceFailureClient(RuntimeError("broken invariant")))
+
+    with pytest.raises(RuntimeError, match="broken invariant"):
+        await gateway.fetch_snapshot()
 
 
 class _Gateway:

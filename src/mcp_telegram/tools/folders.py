@@ -14,18 +14,7 @@ from ._base import (
     mcp_tool,
     structured_result,
 )
-from .structured import telegram_content
-
-TELEGRAM_CONTENT_OUTPUT_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "text": {"type": "string"},
-        "is_telegram_content": {"type": "boolean"},
-        "content_kind": {"type": "string"},
-    },
-    "required": ["text", "is_telegram_content", "content_kind"],
-    "additionalProperties": False,
-}
+from .structured import TELEGRAM_CONTENT_OUTPUT_SCHEMA, telegram_content
 
 LIST_FOLDERS_OUTPUT_SCHEMA = {
     "type": "object",

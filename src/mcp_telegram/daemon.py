@@ -69,6 +69,7 @@ from .flood import (
     maybe_log_flood_wait_rollup,
     sleep_through_flood,
 )
+from .folders.contracts import FolderSourceUnavailableError
 from .folders.refresh import FolderRefresher
 from .folders.sqlite_repository import SQLiteFolderSnapshotRepository
 from .folders.telegram_adapter import FolderClient, TelethonTelegramFolderGateway
@@ -800,7 +801,7 @@ async def _prime_runtime(ctx: _SyncMainContext) -> None:
     folder_gateway = TelethonTelegramFolderGateway(cast(FolderClient, ctx.client))
     try:
         await FolderRefresher(folder_gateway, SQLiteFolderSnapshotRepository(ctx.conn)).refresh()
-    except Exception:
+    except FolderSourceUnavailableError:
         logger.warning(
             "telegram folder snapshot refresh failed — serving preserved local snapshot",
             exc_info=True,

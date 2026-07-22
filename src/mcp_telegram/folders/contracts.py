@@ -15,6 +15,10 @@ class DialogCategory(StrEnum):
     UNKNOWN = "unknown"
 
 
+class FolderSourceUnavailableError(Exception):
+    """An expected transient failure while reading folder state from Telegram."""
+
+
 @dataclass(frozen=True, slots=True)
 class FolderRule:
     folder_id: int
