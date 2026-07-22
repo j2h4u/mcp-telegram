@@ -688,3 +688,76 @@ def test_structured_read_markers_match_formatter_marker_positions() -> None:
     }
 
     assert actual == expected
+
+
+# ---------------------------------------------------------------------------
+# telethon_media.describe_media tests
+# ---------------------------------------------------------------------------
+
+
+def test_describe_media_handles_diverse_types() -> None:
+    from unittest.mock import MagicMock
+
+    import telethon.tl.types as tl
+
+    from mcp_telegram.telethon_media import describe_media
+
+    cases = [
+        (MagicMock(spec=tl.MessageMediaPhoto), "[фото]"),
+        (MagicMock(spec=tl.MessageMediaGeoLive), "[геолокация live]"),
+        (MagicMock(spec=tl.MessageMediaStory), "[история]"),
+        (MagicMock(spec=tl.MessageMediaUnsupported), "[неподдерживаемый тип]"),
+        (MagicMock(spec=tl.MessageMediaEmpty), ""),
+    ]
+
+    for media, expected in cases:
+        assert describe_media(media) == expected
+
+
+def test_describe_media_dice_with_and_without_value() -> None:
+    from unittest.mock import MagicMock
+
+    import telethon.tl.types as tl
+
+    from mcp_telegram.telethon_media import describe_media
+
+    dice_with_value = MagicMock(spec=tl.MessageMediaDice, emoticon="🎲", value=5)
+    assert describe_media(dice_with_value) == "[🎲 5]"
+
+    dice_without_value = MagicMock(spec=tl.MessageMediaDice, emoticon="🎯", value=None)
+    assert describe_media(dice_without_value) == "[🎯]"
+
+    dice_default = MagicMock(spec=tl.MessageMediaDice, emoticon=None, value=None)
+    assert describe_media(dice_default) == "[🎲]"
+
+
+def test_describe_media_contact_formats_name_and_phone() -> None:
+    from unittest.mock import MagicMock
+
+    import telethon.tl.types as tl
+
+    from mcp_telegram.telethon_media import describe_media
+
+    contact_full = MagicMock(
+        spec=tl.MessageMediaContact, first_name="Alice", last_name="Smith", phone_number="+1234"
+    )
+    assert describe_media(contact_full) == "[контакт: Alice Smith, +1234]"
+
+    contact_name_only = MagicMock(spec=tl.MessageMediaContact, first_name="Bob", last_name="", phone_number="")
+    assert describe_media(contact_name_only) == "[контакт: Bob]"
+
+    contact_phone_only = MagicMock(spec=tl.MessageMediaContact, first_name="", last_name="", phone_number="+5678")
+    assert describe_media(contact_phone_only) == "[контакт: +5678]"
+
+    contact_empty = MagicMock(spec=tl.MessageMediaContact, first_name="", last_name="", phone_number="")
+    assert describe_media(contact_empty) == "[контакт]"
+
+
+def test_describe_media_unknown_type_fallback() -> None:
+    from mcp_telegram.telethon_media import describe_media
+
+    class _CustomMedia:
+        pass
+
+    result = describe_media(_CustomMedia())
+    assert result == "[медиа: _CustomMedia]"
