@@ -533,6 +533,29 @@ async def test_registered_tools_return_structured_content_and_text(tool_name: st
     assert_structured_success_payload(result)
 
 
+async def test_folder_tools_frame_telegram_labels_without_raw_duplicates():
+    folders_runner, folders_args, folders_response = STRUCTURED_TOOL_CASES["list_folders"]
+    messages_runner, messages_args, messages_response = STRUCTURED_TOOL_CASES["list_folder_messages"]
+
+    with _patch_daemon(_make_daemon_conn(folders_response)):
+        folders_payload = assert_structured_success_payload(await folders_runner(folders_args))
+    with _patch_daemon(_make_daemon_conn(messages_response)):
+        messages_payload = assert_structured_success_payload(await messages_runner(messages_args))
+
+    assert "titles_content" not in folders_payload
+    assert folders_payload["folders"] == [
+        {
+            "id": 2,
+            "title": {"text": "Work", "is_telegram_content": True, "content_kind": "message_text"},
+        }
+    ]
+    assert _field_path_value(messages_payload, "messages.0.dialog_name") == {
+        "text": "Alice",
+        "is_telegram_content": True,
+        "content_kind": "message_text",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Daemon mock helpers
 # ---------------------------------------------------------------------------

@@ -7,14 +7,17 @@ import json
 import logging
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TypedDict, Unpack
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from mcp_telegram.daemon import _log_heartbeat, sync_main
+from mcp_telegram.daemon import _log_heartbeat, _prime_runtime, sync_main
 from mcp_telegram.daemon_api import DaemonAPIServer
+from mcp_telegram.folders.sqlite_repository import list_folders, replace_folder_snapshot
 from mcp_telegram.state import StatePaths
+from mcp_telegram.sync_db import ensure_sync_schema
 from tests.daemon_api_policy import make_daemon_api_policy
 from tests.reaction_helpers import make_reaction_freshener
 
@@ -119,6 +122,43 @@ def _patch_folder_snapshot_refresh():
     """Keep lifecycle tests focused; folder refresh has dedicated tests."""
     with patch("mcp_telegram.daemon.FolderRefresher.refresh", new=AsyncMock()):
         yield
+
+
+async def test_prime_runtime_keeps_serving_saved_folders_when_refresh_fails(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = sqlite3.connect(db_path)
+    replace_folder_snapshot(conn, [(9, "Saved")], [(9, 999)])
+    me = SimpleNamespace(id=11111)
+    client = MagicMock(get_me=AsyncMock(return_value=me))
+    api_server = SimpleNamespace(startup_detail="", self_id=None, _ready=False)
+    ctx = SimpleNamespace(
+        conn=conn,
+        client=client,
+        api_server=api_server,
+        own_only_context=None,
+        socket_path=tmp_path / "daemon.sock",
+    )
+
+    try:
+        with (
+            patch("mcp_telegram.daemon._load_own_only_context", new=AsyncMock(return_value=None)),
+            patch(
+                "mcp_telegram.daemon.FolderRefresher.refresh",
+                new=AsyncMock(side_effect=RuntimeError("Telegram unavailable")),
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            await _prime_runtime(ctx)  # type: ignore[arg-type]
+
+        assert api_server._ready is True
+        assert list_folders(conn) == [{"id": 9, "title": "Saved"}]
+        assert "serving preserved local snapshot" in caplog.text
+    finally:
+        conn.close()
 
 
 def test_sync_main_connects_and_heartbeats(

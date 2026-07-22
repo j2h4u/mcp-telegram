@@ -82,10 +82,11 @@ def _folder_rule(folder: object) -> FolderRule:
 
 
 def _dialog_facts(dialog: object) -> DialogFacts:
+    raw_dialog = getattr(dialog, "dialog", None)
     unread = bool(
         int(getattr(dialog, "unread_count", 0) or 0)
         or int(getattr(dialog, "unread_mentions_count", 0) or 0)
-        or bool(getattr(dialog, "unread_mark", False))
+        or bool(getattr(raw_dialog, "unread_mark", False))
     )
     return DialogFacts(
         dialog_id=int(dialog.id),  # type: ignore[attr-defined]

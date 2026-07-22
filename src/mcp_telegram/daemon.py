@@ -798,8 +798,15 @@ async def _prime_runtime(ctx: _SyncMainContext) -> None:
 
     ctx.api_server.startup_detail = "refreshing Telegram folders"
     folder_gateway = TelethonTelegramFolderGateway(cast(FolderClient, ctx.client))
-    await FolderRefresher(folder_gateway, SQLiteFolderSnapshotRepository(ctx.conn)).refresh()
-    logger.info("telegram folder snapshot refreshed")
+    try:
+        await FolderRefresher(folder_gateway, SQLiteFolderSnapshotRepository(ctx.conn)).refresh()
+    except Exception:
+        logger.warning(
+            "telegram folder snapshot refresh failed — serving preserved local snapshot",
+            exc_info=True,
+        )
+    else:
+        logger.info("telegram folder snapshot refreshed")
 
     # Post-v10 runtime backfill: mark historical outgoing DM rows as out=1
     # using sender_id=self_id (the authoritative signal). Pure-SQL v10

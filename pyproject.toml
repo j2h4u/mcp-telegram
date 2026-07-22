@@ -526,6 +526,18 @@ forbidden_modules = [
 ]
 
 [[tool.importlinter.contracts]]
+name = "Folder Telegram adapter stays off SQLite repository"
+type = "forbidden"
+source_modules = ["mcp_telegram.folders.telegram_adapter"]
+forbidden_modules = ["mcp_telegram.folders.sqlite_repository"]
+
+[[tool.importlinter.contracts]]
+name = "Folder SQLite repository stays off Telegram adapter"
+type = "forbidden"
+source_modules = ["mcp_telegram.folders.sqlite_repository"]
+forbidden_modules = ["mcp_telegram.folders.telegram_adapter"]
+
+[[tool.importlinter.contracts]]
 name = "Reaction aggregate consumers stay off the private SQLite adapter"
 type = "forbidden"
 source_modules = [

@@ -36,16 +36,15 @@ LIST_FOLDERS_OUTPUT_SCHEMA = {
                 "type": "object",
                 "properties": {
                     "id": {"type": "integer"},
-                    "title": {"type": "string"},
+                    "title": TELEGRAM_CONTENT_OUTPUT_SCHEMA,
                 },
                 "required": ["id", "title"],
                 "additionalProperties": False,
             },
         },
         "count": {"type": "integer"},
-        "titles_content": {"type": "array", "items": TELEGRAM_CONTENT_OUTPUT_SCHEMA},
     },
-    "required": ["folders", "count", "titles_content"],
+    "required": ["folders", "count"],
     "additionalProperties": False,
 }
 
@@ -70,12 +69,17 @@ async def list_folders(args: ListFolders) -> ToolResult:
         return error_result(_daemon_not_running_text(exc))
     if err := _check_daemon_response(response):
         return err
-    folders = response.get("data", {}).get("folders", [])
+    folders = [
+        {
+            "id": int(folder["id"]),
+            "title": telegram_content(str(folder.get("title", "")), "message_text"),
+        }
+        for folder in response.get("data", {}).get("folders", [])
+    ]
     return structured_result(
         {
             "folders": folders,
             "count": len(folders),
-            "titles_content": [telegram_content(str(folder.get("title", "")), "message_text") for folder in folders],
         },
         result_count=len(folders),
     )
@@ -93,7 +97,12 @@ LIST_FOLDER_MESSAGES_OUTPUT_SCHEMA = {
                     "dialog_id": {"type": "integer"},
                     "message_id": {"type": "integer"},
                     "sent_at": {"type": "integer"},
-                    "dialog_name": {"type": ["string", "null"]},
+                    "dialog_name": {
+                        "type": ["object", "null"],
+                        "properties": TELEGRAM_CONTENT_OUTPUT_SCHEMA["properties"],
+                        "required": TELEGRAM_CONTENT_OUTPUT_SCHEMA["required"],
+                        "additionalProperties": False,
+                    },
                     "content": {
                         "type": ["object", "null"],
                         "properties": TELEGRAM_CONTENT_OUTPUT_SCHEMA["properties"],
@@ -142,6 +151,8 @@ async def list_folder_messages(args: ListFolderMessages) -> ToolResult:
     for row in data.get("messages", []):
         item = dict(row)
         text = item.pop("text", None)
+        dialog_name = item.get("dialog_name")
+        item["dialog_name"] = telegram_content(str(dialog_name), "message_text") if dialog_name is not None else None
         item["content"] = telegram_content(str(text), "message_text") if text is not None else None
         messages.append(item)
     payload = {

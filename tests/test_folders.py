@@ -152,8 +152,7 @@ def test_telegram_adapter_counts_manual_unread_mark() -> None:
             "archived": False,
             "unread_count": 0,
             "unread_mentions_count": 0,
-            "unread_mark": True,
-            "dialog": type("Inner", (), {"notify_settings": None})(),
+            "dialog": type("Inner", (), {"notify_settings": None, "unread_mark": True})(),
         },
     )()
 
