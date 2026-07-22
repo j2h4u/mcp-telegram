@@ -114,6 +114,13 @@ def _patch_bootstrap_worker():
         yield
 
 
+@pytest.fixture(autouse=True)
+def _patch_folder_snapshot_refresh():
+    """Keep lifecycle tests focused; folder refresh has dedicated tests."""
+    with patch("mcp_telegram.daemon.FolderRefresher.refresh", new=AsyncMock()):
+        yield
+
+
 def test_sync_main_connects_and_heartbeats(
     mock_client: AsyncMock,
     caplog: pytest.LogCaptureFixture,

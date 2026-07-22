@@ -77,6 +77,7 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
                         "description": "Stable own-only classifier basis when this row is in own scope.",
                     },
                     "folder_ids": {"type": "array", "items": {"type": "integer"}},
+                    "archived": {"type": "boolean"},
                 },
                 "required": [
                     "id",
@@ -100,6 +101,7 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
                     "next_scheduled_at",
                     "inclusion_basis",
                     "folder_ids",
+                    "archived",
                 ],
                 "additionalProperties": False,
             },
@@ -286,6 +288,7 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
                 "unread_reactions_count": int(d.get("unread_reactions_count", 0) or 0),
                 **_structured_dialog_lifecycle_fields(d),
                 "folder_ids": list(d.get("folder_ids", [])),
+                "archived": bool(d.get("archived", False)),
             }
         )
     structured_content = {

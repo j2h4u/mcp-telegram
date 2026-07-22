@@ -347,6 +347,10 @@ class DaemonConnection:
         """List custom Telegram dialog folders from the daemon snapshot."""
         return await self.request({"method": "list_folders"})
 
+    async def list_folder_messages(self, *, folder_id: int, limit: int) -> dict:
+        """List locally stored messages for one custom Telegram folder."""
+        return await self.request({"method": "list_folder_messages", "folder_id": folder_id, "limit": limit})
+
     async def list_topics(
         self,
         *,

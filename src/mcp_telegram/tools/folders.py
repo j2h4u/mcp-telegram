@@ -1,5 +1,7 @@
 """Read-only custom Telegram folder discovery."""
 
+from pydantic import Field
+
 from ._base import (
     DaemonNotRunningError,
     ToolAnnotations,
@@ -12,6 +14,18 @@ from ._base import (
     mcp_tool,
     structured_result,
 )
+from .structured import telegram_content
+
+TELEGRAM_CONTENT_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "text": {"type": "string"},
+        "is_telegram_content": {"type": "boolean"},
+        "content_kind": {"type": "string"},
+    },
+    "required": ["text", "is_telegram_content", "content_kind"],
+    "additionalProperties": False,
+}
 
 LIST_FOLDERS_OUTPUT_SCHEMA = {
     "type": "object",
@@ -20,14 +34,18 @@ LIST_FOLDERS_OUTPUT_SCHEMA = {
             "type": "array",
             "items": {
                 "type": "object",
-                "properties": {"id": {"type": "integer"}, "title": {"type": "string"}},
+                "properties": {
+                    "id": {"type": "integer"},
+                    "title": {"type": "string"},
+                },
                 "required": ["id", "title"],
                 "additionalProperties": False,
             },
         },
         "count": {"type": "integer"},
+        "titles_content": {"type": "array", "items": TELEGRAM_CONTENT_OUTPUT_SCHEMA},
     },
-    "required": ["folders", "count"],
+    "required": ["folders", "count", "titles_content"],
     "additionalProperties": False,
 }
 
@@ -53,4 +71,85 @@ async def list_folders(args: ListFolders) -> ToolResult:
     if err := _check_daemon_response(response):
         return err
     folders = response.get("data", {}).get("folders", [])
-    return structured_result({"folders": folders, "count": len(folders)}, result_count=len(folders))
+    return structured_result(
+        {
+            "folders": folders,
+            "count": len(folders),
+            "titles_content": [telegram_content(str(folder.get("title", "")), "message_text") for folder in folders],
+        },
+        result_count=len(folders),
+    )
+
+
+LIST_FOLDER_MESSAGES_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "folder_id": {"type": "integer"},
+        "messages": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "dialog_id": {"type": "integer"},
+                    "message_id": {"type": "integer"},
+                    "sent_at": {"type": "integer"},
+                    "dialog_name": {"type": ["string", "null"]},
+                    "content": {
+                        "type": ["object", "null"],
+                        "properties": TELEGRAM_CONTENT_OUTPUT_SCHEMA["properties"],
+                        "required": TELEGRAM_CONTENT_OUTPUT_SCHEMA["required"],
+                        "additionalProperties": False,
+                    },
+                },
+                "required": ["dialog_id", "message_id", "sent_at", "dialog_name", "content"],
+                "additionalProperties": False,
+            },
+        },
+        "count": {"type": "integer"},
+        "partial": {"type": "boolean"},
+        "incomplete_dialog_ids": {"type": "array", "items": {"type": "integer"}},
+        "next_navigation": {"type": "null"},
+    },
+    "required": ["folder_id", "messages", "count", "partial", "incomplete_dialog_ids", "next_navigation"],
+    "additionalProperties": False,
+}
+
+
+class ListFolderMessages(ToolArgs):
+    """List locally stored messages across one custom Telegram folder, newest first."""
+
+    folder_id: int
+    limit: int = Field(default=20, ge=1, le=100)
+
+
+@mcp_tool(
+    name="list_folder_messages",
+    title="List Folder Messages",
+    posture="primary",
+    annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False),
+    output_schema=LIST_FOLDER_MESSAGES_OUTPUT_SCHEMA,
+)
+async def list_folder_messages(args: ListFolderMessages) -> ToolResult:
+    try:
+        async with daemon_connection() as conn:
+            response = await conn.list_folder_messages(folder_id=args.folder_id, limit=args.limit)
+    except DaemonNotRunningError as exc:
+        return error_result(_daemon_not_running_text(exc))
+    if err := _check_daemon_response(response):
+        return err
+    data = response.get("data", {})
+    messages = []
+    for row in data.get("messages", []):
+        item = dict(row)
+        text = item.pop("text", None)
+        item["content"] = telegram_content(str(text), "message_text") if text is not None else None
+        messages.append(item)
+    payload = {
+        "folder_id": args.folder_id,
+        "messages": messages,
+        "count": len(messages),
+        "partial": bool(data.get("partial", False)),
+        "incomplete_dialog_ids": list(data.get("incomplete_dialog_ids", [])),
+        "next_navigation": None,
+    }
+    return structured_result(payload, result_count=len(messages))

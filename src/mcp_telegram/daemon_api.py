@@ -94,8 +94,7 @@ from .daemon_message_queries import (
     _read_message_from_row,
 )
 from .daemon_read_state_queries import _dialog_type_from_db, _read_state_for_dialog
-from .folder_store import dialog_placement, folder_ids_by_dialog, list_folders
-from .folder_sync import FolderClient, refresh_folder_snapshot
+from .folders.sqlite_repository import dialog_placement, folder_ids_by_dialog, list_folder_messages, list_folders
 from .models import DialogType, ReadMessage
 from .telegram_fact_queries import enrich_reaction_events, enrich_read_at
 
@@ -599,6 +598,7 @@ class DaemonAPIServer:
             "trace_account_messages": self._trace_account_messages,
             "list_dialogs": self._list_dialogs,
             "list_folders": self._list_folders,
+            "list_folder_messages": self._list_folder_messages,
             "list_topics": self._list_topics,
             "get_me": self._get_me,
             "mark_dialog_for_sync": self._mark_dialog_for_sync,
@@ -906,15 +906,13 @@ class DaemonAPIServer:
         data["dialogs"] = enriched
         return result
 
-    async def _refresh_folders(self) -> None:
-        try:
-            await refresh_folder_snapshot(self._conn, cast(FolderClient, self._client))
-        except Exception:
-            logger.warning("telegram folder snapshot refresh failed; serving previous snapshot", exc_info=True)
-
     async def _list_folders(self, _req: dict[str, object]) -> dict:
-        await self._refresh_folders()
         return {"ok": True, "data": {"folders": list_folders(self._conn)}}
+
+    async def _list_folder_messages(self, req: dict[str, object]) -> dict:
+        folder_id = int(cast(int | str, req.get("folder_id", 0)))
+        limit = max(1, min(int(cast(int | str, req.get("limit", 20))), 100))
+        return {"ok": True, "data": list_folder_messages(self._conn, folder_id, limit)}
 
     # list_topics
     # ------------------------------------------------------------------

@@ -361,6 +361,7 @@ source_modules = [
   "mcp_telegram.tools.discovery",
   "mcp_telegram.tools.entity_info",
   "mcp_telegram.tools.feedback",
+  "mcp_telegram.tools.folders",
   "mcp_telegram.tools.reading",
   "mcp_telegram.tools.stats",
   "mcp_telegram.tools.structured",
@@ -497,6 +498,31 @@ source_modules = ["mcp_telegram.reactions.refresh"]
 forbidden_modules = [
   "mcp_telegram.reactions.sqlite_repository",
   "mcp_telegram.reactions.telegram_adapter",
+]
+
+[[tool.importlinter.contracts]]
+name = "Folder application service stays off concrete adapters"
+type = "forbidden"
+source_modules = ["mcp_telegram.folders.refresh"]
+forbidden_modules = [
+  "mcp_telegram.folders.sqlite_repository",
+  "mcp_telegram.folders.telegram_adapter",
+]
+
+[[tool.importlinter.contracts]]
+name = "Folder domain stays independent of adapters and orchestration"
+type = "forbidden"
+source_modules = [
+  "mcp_telegram.folders.contracts",
+  "mcp_telegram.folders.membership",
+  "mcp_telegram.folders.ports",
+]
+forbidden_modules = [
+  "mcp_telegram.folders.sqlite_repository",
+  "mcp_telegram.folders.telegram_adapter",
+  "mcp_telegram.daemon",
+  "mcp_telegram.daemon_api",
+  "mcp_telegram.tools",
 ]
 
 [[tool.importlinter.contracts]]

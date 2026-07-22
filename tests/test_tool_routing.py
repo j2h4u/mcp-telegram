@@ -30,6 +30,7 @@ from mcp_telegram.tools import (
     GetSyncAlerts,
     GetSyncStatus,
     ListDialogs,
+    ListFolderMessages,
     ListFolders,
     ListMessages,
     ListTopics,
@@ -43,6 +44,7 @@ from mcp_telegram.tools import (
     get_sync_alerts,
     get_sync_status,
     list_dialogs,
+    list_folder_messages,
     list_folders,
     list_messages,
     list_topics,
@@ -133,6 +135,7 @@ class _DaemonConnStub:
     search_messages: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
     list_dialogs: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
     list_folders: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
+    list_folder_messages: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
     list_topics: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
     get_me: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
     mark_dialog_for_sync: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
@@ -188,6 +191,27 @@ def assert_structured_text_parity(
 
 
 STRUCTURED_TOOL_CASES = {
+    "list_folder_messages": (
+        list_folder_messages,
+        ListFolderMessages(folder_id=2),
+        {
+            "ok": True,
+            "data": {
+                "messages": [
+                    {
+                        "dialog_id": 123,
+                        "message_id": 5,
+                        "sent_at": 1705312800,
+                        "text": "hello world",
+                        "dialog_name": "Alice",
+                    }
+                ],
+                "partial": True,
+                "incomplete_dialog_ids": [456],
+                "next_navigation": None,
+            },
+        },
+    ),
     "list_folders": (
         list_folders,
         ListFolders(),
@@ -522,6 +546,7 @@ def _make_daemon_conn(response: dict | None = None) -> _DaemonConnStub:
     conn.search_messages = _AsyncMethodMock(return_value=r)
     conn.list_dialogs = _AsyncMethodMock(return_value=r)
     conn.list_folders = _AsyncMethodMock(return_value=r)
+    conn.list_folder_messages = _AsyncMethodMock(return_value=r)
     conn.list_topics = _AsyncMethodMock(return_value=r)
     conn.get_me = _AsyncMethodMock(return_value=r)
     conn.mark_dialog_for_sync = _AsyncMethodMock(return_value=r)

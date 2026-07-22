@@ -8,10 +8,10 @@ Inventory source command:
 uv run python -c "from mcp_telegram import server; print(len(server.tool_by_name)); print('\n'.join(sorted(server.tool_by_name)))"
 ```
 
-Runtime registry count: 15 tools.
+Runtime registry count: 16 tools.
 
 Current Phase 52 completion status:
-- All 15 registered tools declare `outputSchema` in the live MCP tool descriptors.
+- All 16 registered tools declare `outputSchema` in the live MCP tool descriptors.
 - Every successful tool path returns `structuredContent`; recoverable error paths may stay text-only.
 - The table below is the Plan 52-01 pre-implementation baseline and lossless migration map. Its
   `Baseline` columns intentionally preserve the state observed before later Phase 52 plans ran.
@@ -27,6 +27,7 @@ Current Phase 52 completion status:
 | `get_usage_stats` | Usage Stats | secondary/helper | true | false | no | natural-language summary: most active tools, deep scrolling max_page_depth, error_distribution, filtered query percentage, latency median/p95; no-data state; 30-day window | `window.days`, `total_calls`, `tool_distribution`, `error_distribution`, `max_page_depth`, `filter_count`, `filter_percent`, `latency {median_ms,p95_ms}`, `summary`, `empty_state` | none |
 | `list_dialogs` | List Dialogs | secondary/helper | true | true | yes | type; last_message_at; unread; members/created; sync_status; sync coverage; access_lost_at; DM unread_in/unread_out; diff tokens mentions/reactions/draft_text; snapshot_age_h stale warning; bootstrap_pending/no matches; filter/exclude_archived/ignore_pinned semantics | `dialogs[] {id,name,type,last_message_at,unread_count,unread_in,unread_out,members,created,sync_status,sync_coverage_pct,access_lost_at,diff {mentions,reactions,draft_text},synced}`, `snapshot_age_h`, `bootstrap_pending`, `filters`, `count` | none |
 | `list_folders` | List Folders | secondary/helper | true | n/a | yes | custom Telegram folder id and title; Archive is represented separately on dialog placement | `folders[] {id,title}` | none |
+| `list_folder_messages` | List Folder Messages | primary | true | n/a | yes | local-only merged newest-first folder feed with bounded limit and explicit partial coverage | `folder_id`, `messages[] {dialog_id,message_id,sent_at,dialog_name,content}`, `count`, `partial`, `incomplete_dialog_ids`, `next_navigation:null` | none |
 | `list_messages` | List Messages | primary | true | false | no | archived_warning; source; fragment_coverage header; read_state header; inline_markers; date/session breaks; sender labels; topics; forwards; replies; media; reactions; edit_date; next_navigation; no-results state; navigation/sender/topic/unread/anchor/context limits | `dialog {id,name,type,access}`, `source`, `coverage {state,fragment_coverage,sync_coverage_pct,archived_message_count,last_synced_at,last_event_at,archived_warning}`, `read_state`, `messages[] {msg_id,sent_at,sender,effective_sender_id,out,is_service,text,media,reactions,topic,forward,reply_to,edit_date,inline_markers,untrusted_content:true}`, `next_navigation`, `limits {limit,context_size}`, `filters`, `truncation`, `result_count_semantics` | none |
 | `list_topics` | List Topics | secondary/helper | true | false | no | topic_id/title pairs; no_active_topics text with dialog label; dialog resolution path; filtered result semantics | `dialog {id,selector}`, `topics[] {topic_id,title,untrusted_content:true}`, `count`, `empty_state`, `filters.dialog` | none |
 | `mark_dialog_for_sync` | Mark Sync | primary | false | false | no | dialog_id; action marked/unmarked; enable=true follow-up note that full history will be fetched shortly; idempotent write semantics | `dialog_id`, `enabled`, `status`, `action`, `message`, `side_effects {full_history_fetch_queued}`, `idempotent` | none |
