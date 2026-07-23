@@ -21,6 +21,17 @@ TelegramContentKind = Literal[
 WarningSeverity = Literal["info", "warning", "action_required"]
 NavigationDirection = Literal["older", "newer", "around", "forward", "backward"]
 
+TELEGRAM_CONTENT_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "text": {"type": "string"},
+        "is_telegram_content": {"type": "boolean"},
+        "content_kind": {"type": "string"},
+    },
+    "required": ["text", "is_telegram_content", "content_kind"],
+    "additionalProperties": False,
+}
+
 
 class TelegramContent(TypedDict):
     text: str

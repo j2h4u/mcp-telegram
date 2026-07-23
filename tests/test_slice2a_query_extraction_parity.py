@@ -19,6 +19,7 @@ import pytest
 
 from mcp_telegram.daemon_dialog_queries import _compute_snapshot_age_h, _compute_sync_coverage
 from mcp_telegram.daemon_message_queries import (
+    _EFFECTIVE_SENDER_ID_EXPR,
     _LIST_MESSAGES_BASE_SQL,
     _build_list_messages_query,
     _ListMessagesDbRequest,
@@ -60,7 +61,7 @@ def test_build_list_messages_query_golden_stacked_filters() -> None:
     sql, params = _build_list_messages_query(_req(sender_id=5, topic_id=2, self_id=42, direction="oldest"))
     assert sql == (
         _LIST_MESSAGES_BASE_SQL
-        + " AND m.sender_id = :filter_sender_id"
+        + f" AND {_EFFECTIVE_SENDER_ID_EXPR} = :filter_sender_id"
         + " AND m.forum_topic_id = :topic_id"
         + " ORDER BY m.message_id ASC LIMIT :limit"
     )

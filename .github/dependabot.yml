@@ -10,6 +10,9 @@ updates:
       day: "monday"
       time: "07:00"
       timezone: "Asia/Almaty"
+    # Cooldown applies to version updates only; security updates remain immediate.
+    cooldown:
+      default-days: 14
     open-pull-requests-limit: 10
     labels:
       - "dependencies"
