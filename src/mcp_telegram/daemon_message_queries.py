@@ -89,6 +89,7 @@ EFFECTIVE_SENDER_ID_SQL = _EFFECTIVE_SENDER_ID_EXPR + " AS effective_sender_id"
 # the raw sender_id OR, when sender_id IS NULL, from the effective_sender_id (peer
 # first_name for DM incoming; self name for DM outgoing - though "Я" wins at render).
 _SENDER_FIRST_NAME_SQL = "COALESCE(e_raw.name, e_eff.name, m.sender_first_name) AS sender_first_name"
+_SENDER_NAME_FILTER_SQL = "COALESCE(m.sender_first_name, e_raw.name, e_eff.name)"
 _SENDER_ENTITY_JOINS_SQL = (
     "LEFT JOIN entities e_raw ON e_raw.id = m.sender_id "
     f"LEFT JOIN entities e_eff ON e_eff.id = {_EFFECTIVE_SENDER_ID_EXPR} "
@@ -252,11 +253,12 @@ def _build_list_messages_query(req: _ListMessagesDbRequest) -> tuple[str, dict[s
         params["until_utc"] = until_utc
 
     if sender_id is not None:
-        sql += " AND m.sender_id = :filter_sender_id"
+        sql += f" AND {_EFFECTIVE_SENDER_ID_EXPR} = :filter_sender_id"
         params["filter_sender_id"] = sender_id
     elif sender_name is not None:
-        # Filter uses denormalized column intentionally - historical names remain searchable.
-        sql += " AND m.sender_first_name LIKE :sender_name_pattern ESCAPE '\\' COLLATE NOCASE"
+        # Prefer the stored historical name, but fall back to resolved sender entities for DM rows
+        # whose raw sender fields are intentionally NULL.
+        sql += f" AND {_SENDER_NAME_FILTER_SQL} LIKE :sender_name_pattern ESCAPE '\\' COLLATE NOCASE"
         escaped = sender_name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         params["sender_name_pattern"] = f"%{escaped}%"
 
