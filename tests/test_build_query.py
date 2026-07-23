@@ -13,10 +13,10 @@ from dataclasses import dataclass
 from typing import cast
 
 from mcp_telegram.daemon_message_queries import (
-    _build_list_messages_query,
     _EFFECTIVE_SENDER_ID_EXPR,
-    _ListMessagesDbRequest,
     _SENDER_NAME_FILTER_SQL,
+    _build_list_messages_query,
+    _ListMessagesDbRequest,
 )
 
 

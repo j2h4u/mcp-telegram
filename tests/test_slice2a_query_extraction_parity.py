@@ -19,9 +19,9 @@ import pytest
 
 from mcp_telegram.daemon_dialog_queries import _compute_snapshot_age_h, _compute_sync_coverage
 from mcp_telegram.daemon_message_queries import (
+    _EFFECTIVE_SENDER_ID_EXPR,
     _LIST_MESSAGES_BASE_SQL,
     _build_list_messages_query,
-    _EFFECTIVE_SENDER_ID_EXPR,
     _ListMessagesDbRequest,
 )
 from mcp_telegram.daemon_read_state_queries import _dialog_type_from_db, _read_state_for_dialog
