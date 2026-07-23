@@ -3391,16 +3391,18 @@ def test_build_list_messages_query_direction_oldest() -> None:
 
 
 def test_build_list_messages_query_sender_id_filter() -> None:
-    """_build_list_messages_query with sender_id adds AND m.sender_id = :filter_sender_id clause."""
+    """_build_list_messages_query with sender_id filters on effective sender identity."""
     sql, params = _build_list_messages_query(_build_list_messages_query_req(sender_id=42))
-    assert "sender_id" in sql
+    assert ":filter_sender_id" in sql
+    assert ":self_id" in sql
     assert 42 in params.values()
 
 
 def test_build_list_messages_query_sender_name_filter() -> None:
-    """_build_list_messages_query with sender_name adds LIKE clause."""
+    """_build_list_messages_query with sender_name falls back to resolved DM sender names."""
     sql, params = _build_list_messages_query(_build_list_messages_query_req(sender_name="Alice"))
     assert "LIKE" in sql.upper()
+    assert "e_eff.name" in sql
     assert any("Alice" in str(p) for p in params.values())
 
 
@@ -3587,6 +3589,61 @@ async def test_list_messages_sender_name_filter() -> None:
     messages = _response_messages(result)
     assert len(messages) == 1
     assert messages[0]["message_id"] == 101
+
+
+@pytest.mark.asyncio
+async def test_list_messages_sender_filter_dm_outgoing_effective_sender_id() -> None:
+    """DM sender_id filter matches effective sender identity for outgoing rows."""
+    conn = _make_db()
+    _seed_synced_dialog_p39(conn, dialog_id=268071163)
+    _seed_message_p39(
+        conn,
+        dialog_id=268071163,
+        message_id=101,
+        sender_id=None,
+        sender_first_name=None,
+        out=1,
+        is_service=0,
+    )
+    conn.commit()
+
+    server = make_server(conn)
+    server.self_id = 99999
+
+    result = await server._list_messages({"dialog_id": 268071163, "limit": 10, "sender_id": 99999})
+
+    assert result["ok"] is True, f"Unexpected error: {result}"
+    messages = _response_messages(result)
+    assert [cast(int, message["message_id"]) for message in messages] == [101]
+    assert messages[0]["effective_sender_id"] == 99999
+
+
+@pytest.mark.asyncio
+async def test_list_messages_sender_name_filter_dm_outgoing_effective_sender_name() -> None:
+    """DM sender_name filter matches resolved effective sender name for outgoing rows."""
+    conn = _make_db()
+    _seed_synced_dialog_p39(conn, dialog_id=268071163)
+    _seed_entity_p39(conn, entity_id=99999, name="Me")
+    _seed_message_p39(
+        conn,
+        dialog_id=268071163,
+        message_id=101,
+        sender_id=None,
+        sender_first_name=None,
+        out=1,
+        is_service=0,
+    )
+    conn.commit()
+
+    server = make_server(conn)
+    server.self_id = 99999
+
+    result = await server._list_messages({"dialog_id": 268071163, "limit": 10, "sender_name": "me"})
+
+    assert result["ok"] is True, f"Unexpected error: {result}"
+    messages = _response_messages(result)
+    assert [cast(int, message["message_id"]) for message in messages] == [101]
+    assert messages[0]["sender_first_name"] == "Me"
 
 
 # ---------------------------------------------------------------------------
@@ -5397,12 +5454,12 @@ def test_all_sql_constants_contain_entity_join_and_coalesce() -> None:
 
 
 def test_line_409_filter_has_documenting_comment() -> None:
-    """Documents that sender_name filter intentionally uses the denormalized column."""
+    """Documents that sender_name filter falls back to resolved DM sender names."""
     import pathlib
 
     # _build_list_messages_query owns this filter (Slice 2a: extracted to daemon_message_queries).
     src = pathlib.Path("src/mcp_telegram/daemon_message_queries.py").read_text()
-    assert src.count("Filter uses denormalized column intentionally") == 1
+    assert src.count("fall back to resolved sender entities for DM rows") == 1
 
 
 # --- Task 2: structured log counter tests ---
