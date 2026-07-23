@@ -10,7 +10,6 @@ No scheduling state from Tier B (cold_*) is touched here.
 
 import asyncio
 import logging
-import os
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -24,10 +23,10 @@ from .activity_peer_sweep import (
     sweep_peer_once,
 )
 from .activity_sync import _ActivityClient
+from .config import SchedulingConfig
 
 logger = logging.getLogger(__name__)
 
-_HOT_SWEEP_INTERVAL_S = float(os.environ.get("ACTIVITY_HOT_SWEEP_SECONDS", "3600"))
 _BACKFILL_BATCH_LIMIT = 100
 # Short transient backoff for ACCESS_SKIP (peer unresolved / timeout).
 _ACCESS_SKIP_RETRY_S = 300  # 5 minutes
@@ -335,12 +334,13 @@ async def run_hot_sweep_loop(
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,
     *,
-    interval: float = _HOT_SWEEP_INTERVAL_S,
+    interval: float | None = None,
 ) -> None:
     """Background task: run Tier-A HotSweep hourly, interruptible via shutdown_event.
 
     Mirrors the structure of run_activity_sync_loop.
     """
+    resolved_interval = interval if interval is not None else SchedulingConfig().activity_hot_sweep_seconds
     while not shutdown_event.is_set():
         logger.info("activity_hot_sweep_loop_start")
         try:
@@ -348,9 +348,9 @@ async def run_hot_sweep_loop(
             logger.info("activity_hot_sweep_loop_done total_written=%d", written)
         except Exception:
             logger.warning("activity_hot_sweep_error", exc_info=True)
-        logger.info("activity_hot_sweep_loop_sleeping interval=%.0fs", interval)
+        logger.info("activity_hot_sweep_loop_sleeping interval=%.0fs", resolved_interval)
         try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=interval)
+            await asyncio.wait_for(shutdown_event.wait(), timeout=resolved_interval)
             return
         except TimeoutError:
             pass

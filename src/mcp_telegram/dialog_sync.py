@@ -897,7 +897,7 @@ async def run_reconciliation_loop(
     "Update last_full_pass only on success" (Codex MEDIUM).
 
     UAT support: Plan 03's daemon caller may pass a smaller hourly_interval
-    sourced from RECON_HOURLY_SECONDS env var so an operator can observe a
+    supplied by the daemon scheduling configuration so an operator can observe a
     needs_refresh=1 -> 0 transition without waiting an hour.
     """
     # None (not 0.0) forces the full pass on the first iteration: time.monotonic()
