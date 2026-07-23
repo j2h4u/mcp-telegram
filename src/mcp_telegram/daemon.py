@@ -54,10 +54,10 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
     TypeInputUser,
 )
 
-from .activity_cold_backfill import run_cold_backfill_loop
+from .activity_cold_backfill import ColdBackfillPacing, run_cold_backfill_loop
 from .activity_hot_sweep import run_hot_sweep_loop
 from .activity_sync import _ActivityClient, run_activity_sync_loop
-from .config import load_config
+from .config import SchedulingConfig, load_config, resolve_scheduling_config
 from .daemon_api import DaemonApiPolicy, DaemonAPIServer, _DaemonClientLike
 from .delta_sync import DeltaSyncWorker, _DeltaSyncClient, run_access_probe_loop
 from .dialog_sync import DialogsBootstrapWorker, run_reconciliation_loop
@@ -218,6 +218,7 @@ class _SyncMainContext:
     unix_server: asyncio.AbstractServer | None = None
     handler_manager: EventHandlerManager | None = None
     own_only_context: OwnOnlyContext | None = None
+    scheduling: SchedulingConfig = field(default_factory=SchedulingConfig)
     background_tasks: set[asyncio.Task[object]] = field(default_factory=set)
 
 
@@ -729,6 +730,7 @@ async def _build_sync_main_context() -> _SyncMainContext:
         api_server=api_server,
         socket_path=socket_path,
         unix_server=unix_server,
+        scheduling=resolve_scheduling_config(config.scheduling),
     )
 
 
@@ -897,19 +899,32 @@ async def _start_followup_background_tasks(
         ctx, run_activity_sync_loop(activity_client, ctx.conn, ctx.shutdown_event), name="activity_sync_loop"
     )
     _create_tracked_task(
-        ctx, run_hot_sweep_loop(activity_client, ctx.conn, ctx.shutdown_event), name="activity_hot_sweep"
+        ctx,
+        run_hot_sweep_loop(
+            activity_client,
+            ctx.conn,
+            ctx.shutdown_event,
+            interval=ctx.scheduling.activity_hot_sweep_seconds,
+        ),
+        name="activity_hot_sweep",
     )
     _create_tracked_task(
-        ctx, run_cold_backfill_loop(activity_client, ctx.conn, ctx.shutdown_event), name="activity_cold_backfill"
+        ctx,
+        run_cold_backfill_loop(
+            activity_client,
+            ctx.conn,
+            ctx.shutdown_event,
+            pacing=ColdBackfillPacing.from_scheduling(ctx.scheduling),
+        ),
+        name="activity_cold_backfill",
     )
-    scheduled_interval = float(os.environ.get("SCHEDULED_RECONCILIATION_SECONDS", "900"))
     _create_tracked_task(
         ctx,
         run_scheduled_reconciliation_loop(
             ctx.client,
             ctx.conn,
             ctx.shutdown_event,
-            interval=scheduled_interval,
+            interval=ctx.scheduling.scheduled_reconciliation_seconds,
             own_only_context=ctx.own_only_context,
         ),
         name="scheduled_message_reconciliation",
@@ -919,20 +934,19 @@ async def _start_followup_background_tasks(
     # `dialogs` snapshot fresh; processes needs_refresh=1 rows written by
     # Phase 42 event handlers and soft-deletes left/kicked dialogs once a day.
     #
-    # RECON_HOURLY_SECONDS env var override (43-REVIEWS.md MEDIUM): default is
+    # The scheduling config's RECON_HOURLY_SECONDS override (43-REVIEWS.md MEDIUM): default is
     # 3600s (1h) for production; setting it to a smaller value (e.g. "30") lets
     # an operator observe a needs_refresh=1 -> 0 transition in seconds during
     # UAT. Daily interval stays at the default 86400s — there is no need for a
     # daily override yet, and the first iteration always runs a full pass
     # regardless of last_full_pass anyway.
-    recon_hourly = float(os.environ.get("RECON_HOURLY_SECONDS", "3600"))
     _create_tracked_task(
         ctx,
         run_reconciliation_loop(
             ctx.client,
             ctx.conn,
             ctx.shutdown_event,
-            hourly_interval=recon_hourly,
+            hourly_interval=ctx.scheduling.reconciliation_hourly_seconds,
         ),
         name="reconciliation_loop",
     )

@@ -2,4 +2,39 @@
 dir = "/srv/mcp-telegram/database"
 
 [freshness.reactions]
+# Re-fetch reaction counts after this local snapshot expires.
 freshness_ttl_seconds = 600
+
+[freshness.read_receipts]
+# Refresh Telegram read-at facts after ten minutes.
+read_at_ttl_seconds = 600
+
+[freshness.entities]
+# Entity details and resolver enrichment are short-lived; directory snapshots last longer.
+detail_ttl_seconds = 300
+user_directory_ttl_seconds = 2592000
+group_directory_ttl_seconds = 604800
+resolver_enrichment_ttl_seconds = 300
+
+[telemetry]
+# Retain local tool telemetry for 30 days. This never sends telemetry remotely.
+retention_ttl_seconds = 2592000
+
+[scheduling]
+# Local daemon maintenance intervals. Compose environment variables can override these.
+scheduled_reconciliation_seconds = 900
+reconciliation_hourly_seconds = 3600
+activity_hot_sweep_seconds = 3600
+activity_cold_backfill_seconds = 300
+activity_cold_backfill_batch_pause_seconds = 5
+activity_cold_enroll_seconds = 1800
+activity_cold_access_retry_seconds = 3600
+
+[http]
+# Safe local defaults; Docker Compose overrides the bind host and port for its internal endpoint.
+host = "127.0.0.1"
+port = 3100
+
+[logging]
+# Process log level; LOG_LEVEL in the environment overrides this deployment default.
+level = "INFO"

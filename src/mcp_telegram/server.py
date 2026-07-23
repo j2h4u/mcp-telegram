@@ -8,7 +8,6 @@ runs stdio or Streamable HTTP transport loops.
 import contextlib
 import ipaddress
 import logging
-import os
 import sys
 import time
 import typing as t
@@ -26,34 +25,17 @@ from mcp.types import (
 from starlette.types import Receive, Scope, Send
 
 from . import tools
+from .config import (
+    HTTP_LOOPBACK_ALLOWED_HOSTS,
+    HTTP_LOOPBACK_ALLOWED_ORIGINS,
+    resolve_http_server_config,
+    resolve_logging_config,
+)
 from .correlation import correlation_context, current_correlation_ids
 
 logger = logging.getLogger(__name__)
 app = Server("mcp-telegram")
 _MAX_ERROR_DETAIL_LENGTH = 160
-_HTTP_LOOPBACK_ALLOWED_HOSTS: list[str] = [
-    "127.0.0.1",
-    "127.0.0.1:*",
-    "localhost",
-    "localhost:*",
-    "::1",
-    "[::1]",
-    "[::1]:*",
-]
-_HTTP_LOOPBACK_ALLOWED_ORIGINS: list[str] = [
-    "http://127.0.0.1",
-    "http://127.0.0.1:*",
-    "https://127.0.0.1",
-    "https://127.0.0.1:*",
-    "http://localhost",
-    "http://localhost:*",
-    "https://localhost",
-    "https://localhost:*",
-    "http://[::1]",
-    "http://[::1]:*",
-    "https://[::1]",
-    "https://[::1]:*",
-]
 
 
 @cache
@@ -86,10 +68,6 @@ def _error_call_result(text: str) -> CallToolResult:
     return CallToolResult(content=[TextContent(type="text", text=text)], isError=True)
 
 
-def _split_csv_env(name: str) -> list[str]:
-    return [item.strip() for item in os.environ.get(name, "").split(",") if item.strip()]
-
-
 def _dedupe(values: t.Iterable[str]) -> list[str]:
     return list(dict.fromkeys(values))
 
@@ -112,7 +90,7 @@ def _is_loopback_http_host(host: str) -> bool:
 
 
 def _unsafe_http_exposure_enabled() -> bool:
-    return os.environ.get("MCP_TELEGRAM_HTTP_ALLOW_UNSAFE", "").strip().lower() in {"1", "true", "yes", "on"}
+    return resolve_http_server_config().allow_unsafe
 
 
 def _assert_http_exposure_allowed(host: str) -> None:
@@ -133,19 +111,19 @@ def _assert_http_exposure_allowed(host: str) -> None:
 
 
 def _http_allowed_hosts(*, host: str, port: int) -> list[str]:
-    allowed = list(_HTTP_LOOPBACK_ALLOWED_HOSTS)
+    allowed = list(HTTP_LOOPBACK_ALLOWED_HOSTS)
     normalized = _normalize_bind_host(host)
     if normalized and normalized not in {"0.0.0.0", "::"}:
         if normalized == "::1":
             allowed.extend(["[::1]", f"[::1]:{port}", "[::1]:*"])
         else:
             allowed.extend([normalized, f"{normalized}:{port}", f"{normalized}:*"])
-    allowed.extend(_split_csv_env("MCP_TELEGRAM_HTTP_ALLOWED_HOSTS"))
+    allowed.extend(resolve_http_server_config().allowed_hosts)
     return _dedupe(allowed)
 
 
 def _http_allowed_origins() -> list[str]:
-    return _dedupe([*_HTTP_LOOPBACK_ALLOWED_ORIGINS, *_split_csv_env("MCP_TELEGRAM_HTTP_ALLOWED_ORIGINS")])
+    return _dedupe([*HTTP_LOOPBACK_ALLOWED_ORIGINS, *resolve_http_server_config().allowed_origins])
 
 
 @app.list_prompts()
@@ -288,7 +266,7 @@ async def run_mcp_server() -> None:
     # Deferred: stdio_server touches the event loop at import time in some envs
     from mcp.server.stdio import stdio_server
 
-    log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+    log_level = resolve_logging_config().level
     logging.basicConfig(
         level=getattr(logging, log_level, logging.INFO),
         stream=sys.stderr,
@@ -321,7 +299,7 @@ async def run_mcp_http_server(
     from starlette.responses import JSONResponse
     from starlette.routing import Mount, Route
 
-    log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+    log_level = resolve_logging_config().level
     logging.basicConfig(
         level=getattr(logging, log_level, logging.INFO),
         stream=sys.stderr,

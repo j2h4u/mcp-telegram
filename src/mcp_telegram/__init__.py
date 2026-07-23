@@ -1,39 +1,29 @@
 import asyncio
-import os
 import sqlite3
 from typing import Annotated, cast
 
 from typer import Argument, BadParameter, Context, Option, Typer
 
+from .config import ConfigError, HttpServerConfig, load_config, resolve_http_server_config, resolve_logging_config
+
 app = Typer()
 
-_DEFAULT_HTTP_HOST = "127.0.0.1"
-_DEFAULT_HTTP_PORT = 3100
-_MIN_HTTP_PORT = 1
-_MAX_HTTP_PORT = 65535
+
+def _resolve_http_host(host: str | None, *, base: HttpServerConfig | None = None) -> str:
+    try:
+        # Supplying the model default keeps host validation independent from a
+        # malformed port override, matching the previous CLI behavior.
+        defaults = HttpServerConfig() if base is None else base
+        return resolve_http_server_config(host=host, port=defaults.port, base=defaults).host
+    except ConfigError as exc:
+        raise BadParameter(str(exc)) from exc
 
 
-def _resolve_http_host(host: str | None) -> str:
-    if host is not None:
-        return host
-    return os.environ.get("MCP_TELEGRAM_HTTP_HOST") or _DEFAULT_HTTP_HOST
-
-
-def _resolve_http_port(port: int | None) -> int:
-    if port is not None:
-        resolved = port
-    else:
-        raw_port = os.environ.get("MCP_TELEGRAM_HTTP_PORT")
-        if raw_port is None or raw_port == "":
-            resolved = _DEFAULT_HTTP_PORT
-        elif raw_port.isdecimal():
-            resolved = int(raw_port)
-        else:
-            raise BadParameter("MCP_TELEGRAM_HTTP_PORT must be an integer")
-
-    if not _MIN_HTTP_PORT <= resolved <= _MAX_HTTP_PORT:
-        raise BadParameter("HTTP port must be between 1 and 65535")
-    return resolved
+def _resolve_http_port(port: int | None, *, base: HttpServerConfig | None = None) -> int:
+    try:
+        return resolve_http_server_config(port=port, base=base).port
+    except ConfigError as exc:
+        raise BadParameter(str(exc)) from exc
 
 
 def _row_first_int(row: tuple[object | None, ...] | None) -> int:
@@ -74,12 +64,11 @@ def logout() -> None:
 def sync() -> None:
     """Run the sync daemon (owns TelegramClient exclusively)."""
     import logging
-    import os
     import sys
 
     from .daemon import sync_main
 
-    log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+    log_level = resolve_logging_config().level
     logging.basicConfig(
         level=getattr(logging, log_level, logging.INFO),
         stream=sys.stderr,
@@ -110,15 +99,15 @@ def serve(
 ) -> None:
     """Run the sync daemon and Streamable HTTP MCP endpoint in one process."""
     import logging
-    import os
     import sys
 
     from . import server as _server
     from .daemon import sync_main
 
-    resolved_host = _resolve_http_host(host)
-    resolved_port = _resolve_http_port(port)
-    log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+    operator_config = load_config()
+    resolved_host = _resolve_http_host(host, base=operator_config.http)
+    resolved_port = _resolve_http_port(port, base=operator_config.http)
+    log_level = resolve_logging_config().level
     logging.basicConfig(
         level=getattr(logging, log_level, logging.INFO),
         stream=sys.stderr,
