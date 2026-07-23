@@ -738,9 +738,7 @@ def test_describe_media_contact_formats_name_and_phone() -> None:
 
     from mcp_telegram.telethon_media import describe_media
 
-    contact_full = MagicMock(
-        spec=tl.MessageMediaContact, first_name="Alice", last_name="Smith", phone_number="+1234"
-    )
+    contact_full = MagicMock(spec=tl.MessageMediaContact, first_name="Alice", last_name="Smith", phone_number="+1234")
     assert describe_media(contact_full) == "[контакт: Alice Smith, +1234]"
 
     contact_name_only = MagicMock(spec=tl.MessageMediaContact, first_name="Bob", last_name="", phone_number="")
