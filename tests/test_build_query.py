@@ -12,7 +12,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import cast
 
-from mcp_telegram.daemon_message_queries import _build_list_messages_query, _ListMessagesDbRequest
+from mcp_telegram.daemon_message_queries import (
+    _build_list_messages_query,
+    _EFFECTIVE_SENDER_ID_EXPR,
+    _ListMessagesDbRequest,
+    _SENDER_NAME_FILTER_SQL,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,14 +135,14 @@ def test_timestamp_anchor_newest_breaks_message_id_ties() -> None:
 def test_sender_id_filter() -> None:
     """sender_id adds an exact-match condition."""
     sql, params = _build_list_messages_query(_build_list_messages_query_req(sender_id=42))
-    assert "m.sender_id = :filter_sender_id" in sql
+    assert f"{_EFFECTIVE_SENDER_ID_EXPR} = :filter_sender_id" in sql
     assert params["filter_sender_id"] == 42
 
 
 def test_sender_name_filter() -> None:
     """sender_name adds a LIKE condition with wildcards."""
     sql, params = _build_list_messages_query(_build_list_messages_query_req(sender_name="Alice"))
-    assert "m.sender_first_name LIKE :sender_name_pattern ESCAPE" in sql
+    assert f"{_SENDER_NAME_FILTER_SQL} LIKE :sender_name_pattern ESCAPE '\\' COLLATE NOCASE" in sql
     assert params["sender_name_pattern"] == "%Alice%"
 
 
@@ -151,7 +156,7 @@ def test_sender_name_like_escapes_special_chars() -> None:
 def test_sender_id_takes_precedence_over_name() -> None:
     """When both sender_id and sender_name are provided, sender_id wins."""
     sql, params = _build_list_messages_query(_build_list_messages_query_req(sender_id=42, sender_name="Alice"))
-    assert "m.sender_id = :filter_sender_id" in sql
+    assert f"{_EFFECTIVE_SENDER_ID_EXPR} = :filter_sender_id" in sql
     assert "LIKE" not in sql and "sender_name_pattern" not in params
     assert params["filter_sender_id"] == 42
 

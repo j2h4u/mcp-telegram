@@ -3646,6 +3646,61 @@ async def test_list_messages_sender_name_filter_dm_outgoing_effective_sender_nam
     assert messages[0]["sender_first_name"] == "Me"
 
 
+@pytest.mark.asyncio
+async def test_list_messages_sender_filter_dm_incoming_effective_sender_id() -> None:
+    """DM sender_id filter matches effective sender identity for incoming rows."""
+    conn = _make_db()
+    _seed_synced_dialog_p39(conn, dialog_id=268071163)
+    _seed_message_p39(
+        conn,
+        dialog_id=268071163,
+        message_id=101,
+        sender_id=None,
+        sender_first_name=None,
+        out=0,
+        is_service=0,
+    )
+    conn.commit()
+
+    server = make_server(conn)
+    server.self_id = 99999
+
+    result = await server._list_messages({"dialog_id": 268071163, "limit": 10, "sender_id": 268071163})
+
+    assert result["ok"] is True, f"Unexpected error: {result}"
+    messages = _response_messages(result)
+    assert [cast(int, message["message_id"]) for message in messages] == [101]
+    assert messages[0]["effective_sender_id"] == 268071163
+
+
+@pytest.mark.asyncio
+async def test_list_messages_sender_name_filter_dm_incoming_effective_sender_name() -> None:
+    """DM sender_name filter matches resolved effective sender name for incoming rows."""
+    conn = _make_db()
+    _seed_synced_dialog_p39(conn, dialog_id=268071163)
+    _seed_entity_p39(conn, entity_id=268071163, name="Peer")
+    _seed_message_p39(
+        conn,
+        dialog_id=268071163,
+        message_id=101,
+        sender_id=None,
+        sender_first_name=None,
+        out=0,
+        is_service=0,
+    )
+    conn.commit()
+
+    server = make_server(conn)
+    server.self_id = 99999
+
+    result = await server._list_messages({"dialog_id": 268071163, "limit": 10, "sender_name": "peer"})
+
+    assert result["ok"] is True, f"Unexpected error: {result}"
+    messages = _response_messages(result)
+    assert [cast(int, message["message_id"]) for message in messages] == [101]
+    assert messages[0]["sender_first_name"] == "Peer"
+
+
 # ---------------------------------------------------------------------------
 # Phase 35-01: list_messages — topic filter (sync.db)
 # ---------------------------------------------------------------------------
