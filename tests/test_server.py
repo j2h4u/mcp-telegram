@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import re
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from functools import partial
 from pathlib import Path
@@ -341,6 +342,31 @@ def test_http_transport_security_allows_loopback_and_configured_hosts(
     assert any(item.scheme == "http" and item.hostname == "gateway.local" for item in map(urlparse, origins))
 
 
+def test_http_bearer_authorization_requires_matching_token() -> None:
+    assert server._http_bearer_authorized({"headers": []}, "secret") is False
+    assert (
+        server._http_bearer_authorized(
+            {"headers": [(b"authorization", b"Basic secret")]},
+            "secret",
+        )
+        is False
+    )
+    assert (
+        server._http_bearer_authorized(
+            {"headers": [(b"authorization", b"Bearer wrong")]},
+            "secret",
+        )
+        is False
+    )
+    assert (
+        server._http_bearer_authorized(
+            {"headers": [(b"authorization", b"Bearer secret")]},
+            "secret",
+        )
+        is True
+    )
+
+
 def test_safe_boundary_error_text_validation_uses_sanitized_detail() -> None:
     text = server._safe_boundary_error_text(
         tool_name="list_dialogs",
@@ -494,6 +520,9 @@ class _FakeSessionManager:
         yield
         self._captured["session_manager_exited"] = True
 
+    async def handle_request(self, scope: object, receive: object, send: object) -> None:
+        self._captured["handle_request"] = scope
+
 
 class _FakeRoute:
     def __init__(
@@ -572,6 +601,7 @@ async def test_run_mcp_http_server_normalizes_mount_and_builds_transport(
     monkeypatch.setattr("logging.basicConfig", lambda *args, **kwargs: None)
     monkeypatch.setattr(server, "_http_allowed_hosts", lambda host, port: [f"{host}:{port}"])
     monkeypatch.setattr(server, "_http_allowed_origins", lambda: ["https://example.com"])
+    monkeypatch.setenv("MCP_TELEGRAM_HTTP_AUTH_TOKEN", "test-token")
     monkeypatch.setattr("mcp_telegram.server._build_server_instructions", _fake_build_server_instructions)
     monkeypatch.setattr(server, "_assert_http_exposure_allowed", partial(_fake_assert_exposure_allowed, captured))
 
@@ -590,6 +620,23 @@ async def test_run_mcp_http_server_normalizes_mount_and_builds_transport(
     assert routes[1][0] == "route"
     assert routes[1][1] == "/health"
     assert server.app.instructions == "Built"
+
+    mounted_app = cast(Callable[[dict[str, object], object, object], Awaitable[None]], routes[0][2])
+    sent: list[dict[str, object]] = []
+
+    async def receive() -> dict[str, object]:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message: dict[str, object]) -> None:
+        sent.append(message)
+
+    await mounted_app({"type": "http", "headers": []}, receive, send)
+    assert sent[0]["type"] == "http.response.start"
+    assert sent[0]["status"] == 401
+    assert "handle_request" not in captured
+
+    await mounted_app({"type": "http", "headers": [(b"authorization", b"Bearer test-token")]}, receive, send)
+    assert cast(dict[str, object], captured["handle_request"])["type"] == "http"
 
 
 def test_list_tools_exposes_list_dialogs_output_schema() -> None:

@@ -8,6 +8,7 @@ runs stdio or Streamable HTTP transport loops.
 import contextlib
 import ipaddress
 import logging
+import secrets
 import sys
 import time
 import typing as t
@@ -22,12 +23,14 @@ from mcp.types import (
     TextContent,
     Tool,
 )
+from starlette.responses import JSONResponse
 from starlette.types import Receive, Scope, Send
 
 from . import tools
 from .config import (
     HTTP_LOOPBACK_ALLOWED_HOSTS,
     HTTP_LOOPBACK_ALLOWED_ORIGINS,
+    resolve_http_auth_token,
     resolve_http_server_config,
     resolve_logging_config,
 )
@@ -36,6 +39,7 @@ from .correlation import correlation_context, current_correlation_ids
 logger = logging.getLogger(__name__)
 app = Server("mcp-telegram")
 _MAX_ERROR_DETAIL_LENGTH = 160
+_HTTP_AUTH_CHALLENGE = 'Bearer realm="mcp-telegram"'
 
 
 @cache
@@ -124,6 +128,27 @@ def _http_allowed_hosts(*, host: str, port: int) -> list[str]:
 
 def _http_allowed_origins() -> list[str]:
     return _dedupe([*HTTP_LOOPBACK_ALLOWED_ORIGINS, *resolve_http_server_config().allowed_origins])
+
+
+def _http_bearer_authorized(scope: Scope, expected_token: str) -> bool:
+    for raw_name, raw_value in scope.get("headers", []):
+        if raw_name.lower() != b"authorization":
+            continue
+        try:
+            scheme, token = raw_value.decode("latin1").split(" ", 1)
+        except ValueError:
+            return False
+        return scheme.lower() == "bearer" and secrets.compare_digest(token, expected_token)
+    return False
+
+
+async def _reject_unauthorized_http_mcp(scope: Scope, receive: Receive, send: Send) -> None:
+    response = JSONResponse(
+        {"error": "unauthorized"},
+        status_code=401,
+        headers={"WWW-Authenticate": _HTTP_AUTH_CHALLENGE},
+    )
+    await response(scope, receive, send)
 
 
 @app.list_prompts()
@@ -296,7 +321,6 @@ async def run_mcp_http_server(
     from mcp.server.transport_security import TransportSecuritySettings
     from starlette.applications import Starlette
     from starlette.requests import Request
-    from starlette.responses import JSONResponse
     from starlette.routing import Mount, Route
 
     log_level = resolve_logging_config().level
@@ -308,6 +332,7 @@ async def run_mcp_http_server(
     )
 
     _assert_http_exposure_allowed(host)
+    http_auth_token = resolve_http_auth_token()
     normalized_mount_path = mount_path if mount_path.startswith("/") else f"/{mount_path}"
     logger.info(
         "MCP HTTP server starting on %s:%d%s — routing through daemon API",
@@ -328,6 +353,9 @@ async def run_mcp_http_server(
     )
 
     async def handle_mcp(scope: Scope, receive: Receive, send: Send) -> None:
+        if not _http_bearer_authorized(scope, http_auth_token):
+            await _reject_unauthorized_http_mcp(scope, receive, send)
+            return
         await session_manager.handle_request(scope, receive, send)
 
     async def handle_health(_: Request) -> JSONResponse:

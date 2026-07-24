@@ -18,6 +18,7 @@ from mcp_telegram.config import (
     StateConfig,
     TelemetryConfig,
     load_config,
+    resolve_http_auth_token,
     resolve_http_server_config,
     resolve_logging_config,
     resolve_scheduling_config,
@@ -116,6 +117,18 @@ def test_runtime_environment_overrides_are_parsed_by_config_model() -> None:
         allowed_hosts=("mcp-telegram:3200", "localhost:*"),
         allowed_origins=("http://gateway.local",),
     )
+
+
+def test_http_auth_token_is_required_for_streamable_http() -> None:
+    with pytest.raises(ConfigError, match="MCP_TELEGRAM_HTTP_AUTH_TOKEN"):
+        resolve_http_auth_token({})
+
+    with pytest.raises(ConfigError, match="MCP_TELEGRAM_HTTP_AUTH_TOKEN"):
+        resolve_http_auth_token({"MCP_TELEGRAM_HTTP_AUTH_TOKEN": "   "})
+
+
+def test_http_auth_token_is_stripped_from_environment() -> None:
+    assert resolve_http_auth_token({"MCP_TELEGRAM_HTTP_AUTH_TOKEN": "  local-secret  "}) == "local-secret"
 
 
 @pytest.mark.parametrize(

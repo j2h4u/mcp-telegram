@@ -248,6 +248,17 @@ def resolve_logging_config(environ: Mapping[str, str] | None = None) -> LoggingC
     return LoggingConfig(level=env.get("LOG_LEVEL", LoggingConfig().level).upper())
 
 
+def resolve_http_auth_token(environ: Mapping[str, str] | None = None) -> str:
+    """Return the bearer token required for Streamable HTTP MCP requests."""
+    env = os.environ if environ is None else environ
+    token = env.get("MCP_TELEGRAM_HTTP_AUTH_TOKEN", "").strip()
+    if not token:
+        raise ConfigError(
+            "MCP_TELEGRAM_HTTP_AUTH_TOKEN must be set to a non-empty bearer token when using Streamable HTTP."
+        )
+    return token
+
+
 def resolve_http_server_config(
     *,
     host: str | None = None,
