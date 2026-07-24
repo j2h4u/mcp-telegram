@@ -173,3 +173,214 @@ class TestDecodeValidation:
                 since_utc=2,
                 until_utc=1,
             )
+
+    def test_search_cursor_rejects_topic_id(self) -> None:
+        from mcp_telegram.pagination import _encode_payload
+
+        token = _encode_payload({
+            "kind": "search",
+            "value": 1,
+            "dialog_id": 100,
+            "query": "hello",
+            "message_state": "sent",
+            "topic_id": 42,
+        })
+        with pytest.raises(ValueError, match="search cursor contains history-only state"):
+            decode_navigation_token(token)
+
+    def test_search_cursor_rejects_direction(self) -> None:
+        from mcp_telegram.pagination import _encode_payload
+
+        token = _encode_payload({
+            "kind": "search",
+            "value": 1,
+            "dialog_id": 100,
+            "query": "hello",
+            "message_state": "sent",
+            "direction": "newest",
+        })
+        with pytest.raises(ValueError, match="search cursor contains history-only state"):
+            decode_navigation_token(token)
+
+    def test_search_cursor_rejects_sent_at(self) -> None:
+        from mcp_telegram.pagination import _encode_payload
+
+        token = _encode_payload({
+            "kind": "search",
+            "value": 1,
+            "dialog_id": 100,
+            "query": "hello",
+            "message_state": "sent",
+            "sent_at": 1_700_000_000,
+        })
+        with pytest.raises(ValueError, match="search cursor contains history-only state"):
+            decode_navigation_token(token)
+
+    def test_search_cursor_rejects_history_only_fields_separately(self) -> None:
+        from mcp_telegram.pagination import _encode_payload
+        from mcp_telegram.pagination import encode_search_navigation
+
+        token = encode_search_navigation(offset=20, dialog_id=100, query="hello", message_state="sent")
+        nav = decode_navigation_token(token)
+        assert nav.topic_id is None
+        assert nav.direction is None
+        assert nav.sent_at is None
+
+
+class TestAccountTraceNavigationToken:
+    def test_roundtrip_with_scope_dialog_ids(self) -> None:
+        from mcp_telegram.pagination import (
+            AccountTraceNavigationContext,
+            AccountTraceNavigationRequest,
+            decode_account_trace_navigation,
+            encode_account_trace_navigation,
+        )
+
+        request = AccountTraceNavigationRequest(
+            target_user_id=777000,
+            sent_at=1_700_000_500,
+            dialog_id=-1001234567890,
+            message_id=42,
+            group_by="timeline",
+            exact_dialog_id=-1001234567890,
+            exact_topic_id=None,
+            sent_after="2025-01-01T00:00:00Z",
+            sent_before="2025-02-01T00:00:00Z",
+            scope_dialog_ids=[-1001234567890, -1009876543210],
+        )
+        token = encode_account_trace_navigation(request)
+
+        context = AccountTraceNavigationContext(
+            expected_target_user_id=777000,
+            expected_group_by="timeline",
+            expected_exact_dialog_id=-1001234567890,
+            expected_exact_topic_id=None,
+            expected_sent_after="2025-01-01T00:00:00Z",
+            expected_sent_before="2025-02-01T00:00:00Z",
+        )
+        result = decode_account_trace_navigation(token, context)
+        assert result.target_user_id == 777000
+        assert result.sent_at == 1_700_000_500
+        assert result.dialog_id == -1001234567890
+        assert result.message_id == 42
+        assert result.group_by == "timeline"
+        assert result.exact_dialog_id == -1001234567890
+        assert result.exact_topic_id is None
+        assert result.sent_after == "2025-01-01T00:00:00Z"
+        assert result.sent_before == "2025-02-01T00:00:00Z"
+        assert result.scope_dialog_ids == [-1001234567890, -1009876543210]
+
+    def test_roundtrip_minimal(self) -> None:
+        from mcp_telegram.pagination import (
+            AccountTraceNavigationContext,
+            AccountTraceNavigationRequest,
+            decode_account_trace_navigation,
+            encode_account_trace_navigation,
+        )
+
+        request = AccountTraceNavigationRequest(
+            target_user_id=123,
+            sent_at=500,
+            dialog_id=100,
+            message_id=10,
+            group_by="dialog",
+        )
+        token = encode_account_trace_navigation(request)
+
+        context = AccountTraceNavigationContext(
+            expected_target_user_id=123,
+            expected_group_by="dialog",
+        )
+        result = decode_account_trace_navigation(token, context)
+        assert result.target_user_id == 123
+        assert result.message_id == 10
+        assert result.group_by == "dialog"
+        assert result.scope_dialog_ids is None
+
+    def test_context_mismatch_target_user_id(self) -> None:
+        from mcp_telegram.pagination import (
+            AccountTraceNavigationContext,
+            AccountTraceNavigationRequest,
+            decode_account_trace_navigation,
+            encode_account_trace_navigation,
+        )
+
+        request = AccountTraceNavigationRequest(
+            target_user_id=777000,
+            sent_at=500,
+            dialog_id=100,
+            message_id=10,
+            group_by="dialog",
+        )
+        token = encode_account_trace_navigation(request)
+
+        context = AccountTraceNavigationContext(
+            expected_target_user_id=999999,
+            expected_group_by="dialog",
+        )
+        with pytest.raises(ValueError, match="belongs to account 777000, not 999999"):
+            decode_account_trace_navigation(token, context)
+
+    def test_context_mismatch_group_by(self) -> None:
+        from mcp_telegram.pagination import (
+            AccountTraceNavigationContext,
+            AccountTraceNavigationRequest,
+            decode_account_trace_navigation,
+            encode_account_trace_navigation,
+        )
+
+        request = AccountTraceNavigationRequest(
+            target_user_id=777000,
+            sent_at=500,
+            dialog_id=100,
+            message_id=10,
+            group_by="timeline",
+        )
+        token = encode_account_trace_navigation(request)
+
+        context = AccountTraceNavigationContext(
+            expected_target_user_id=777000,
+            expected_group_by="dialog",
+        )
+        with pytest.raises(ValueError, match="belongs to group_by timeline, not dialog"):
+            decode_account_trace_navigation(token, context)
+
+    def test_wrong_kind_raises(self) -> None:
+        from mcp_telegram.pagination import (
+            AccountTraceNavigationContext,
+            decode_account_trace_navigation,
+            encode_history_navigation,
+        )
+
+        token = encode_history_navigation(1, dialog_id=100, message_state="sent")
+        context = AccountTraceNavigationContext(
+            expected_target_user_id=123,
+            expected_group_by="dialog",
+        )
+        with pytest.raises(ValueError, match="not account_trace"):
+            decode_account_trace_navigation(token, context)
+
+    def test_scope_dialog_ids_empty_list(self) -> None:
+        from mcp_telegram.pagination import (
+            AccountTraceNavigationContext,
+            AccountTraceNavigationRequest,
+            decode_account_trace_navigation,
+            encode_account_trace_navigation,
+        )
+
+        request = AccountTraceNavigationRequest(
+            target_user_id=777000,
+            sent_at=500,
+            dialog_id=100,
+            message_id=10,
+            group_by="dialog",
+            scope_dialog_ids=[],
+        )
+        token = encode_account_trace_navigation(request)
+
+        context = AccountTraceNavigationContext(
+            expected_target_user_id=777000,
+            expected_group_by="dialog",
+        )
+        result = decode_account_trace_navigation(token, context)
+        assert result.scope_dialog_ids == []

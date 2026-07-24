@@ -651,3 +651,26 @@ def test_hint_stable_across_calls() -> None:
     assert isinstance(result2, Candidates)
     for m1, m2 in zip(result1.matches, result2.matches, strict=True):
         assert m1["disambiguation_hint"] == m2["disambiguation_hint"]
+
+
+class TestResolverEnrichmentPolicyValidation:
+    def test_positive_ttl_is_accepted(self) -> None:
+        from mcp_telegram.resolver import _EntityCache
+
+        cache = MagicMock(spec=_EntityCache)
+        policy = ResolverEnrichmentPolicy(entity_cache=cache, ttl_seconds=60)
+        assert policy.ttl_seconds == 60
+
+    def test_zero_ttl_raises(self) -> None:
+        from mcp_telegram.resolver import _EntityCache
+
+        cache = MagicMock(spec=_EntityCache)
+        with pytest.raises(ValueError, match="Resolver enrichment TTL must be positive"):
+            ResolverEnrichmentPolicy(entity_cache=cache, ttl_seconds=0)
+
+    def test_negative_ttl_raises(self) -> None:
+        from mcp_telegram.resolver import _EntityCache
+
+        cache = MagicMock(spec=_EntityCache)
+        with pytest.raises(ValueError, match="Resolver enrichment TTL must be positive"):
+            ResolverEnrichmentPolicy(entity_cache=cache, ttl_seconds=-1)
