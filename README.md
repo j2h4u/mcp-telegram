@@ -63,6 +63,9 @@ The deployed compose template publishes HTTP only on host loopback:
 http://127.0.0.1:3100/mcp
 ```
 
+Set `MCP_TELEGRAM_HTTP_AUTH_TOKEN` before starting Streamable HTTP, and send it
+as `Authorization: Bearer <token>` on every `/mcp` request.
+
 Do not expose the HTTP endpoint or Telegram session volume to an untrusted
 network.
 
@@ -241,6 +244,9 @@ For Streamable HTTP MCP clients, use:
 ```text
 http://127.0.0.1:3100/mcp
 ```
+
+Every `/mcp` request must include `Authorization: Bearer <token>`, where
+`<token>` matches `MCP_TELEGRAM_HTTP_AUTH_TOKEN` in the server environment.
 
 The server instructions returned during MCP initialization include the connected
 Telegram account ID, clarify Telegram-read-only vs local MCP state writes, and
