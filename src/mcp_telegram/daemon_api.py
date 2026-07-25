@@ -47,6 +47,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast
 
 from telethon import utils as telethon_utils  # type: ignore[import-untyped]
+from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
 from telethon.tl.functions.channels import (
     GetFullChannelRequest,  # type: ignore[import-untyped]
     GetParticipantsRequest,  # type: ignore[import-untyped]
@@ -97,6 +98,8 @@ from .daemon_read_state_queries import _dialog_type_from_db, _read_state_for_dia
 from .folders.sqlite_repository import dialog_placement, folder_ids_by_dialog, list_folder_messages, list_folders
 from .models import DialogType, ReadMessage
 from .telegram_fact_queries import enrich_reaction_events, enrich_read_at
+from .topics.contracts import TopicSourceUnavailableError
+from .topics.refresh import TopicRefresher
 
 # Entity / telemetry SQL
 _UPSERT_ENTITY_SQL = (
@@ -387,6 +390,7 @@ class DaemonAPIServer:
         sync_db_path: Path | None = None,
         *,
         reaction_freshener: ReactionFreshener,
+        topic_refresher: TopicRefresher | None = None,
         policy: DaemonApiPolicy,
     ) -> None:
         conn.row_factory = sqlite3.Row
@@ -407,6 +411,7 @@ class DaemonAPIServer:
         self.startup_detail: str = "connecting to Telegram"
         self._reading_service: DaemonReadingService | None = None
         self._reaction_freshener = reaction_freshener
+        self._topic_refresher = topic_refresher
         self._policy = policy
         self._read_receipt_gateway = TelethonTelegramReadReceiptGateway(self._client)
         self._activity_stats_service: _activity_stats.DaemonActivityStatsService | None = None
@@ -918,11 +923,12 @@ class DaemonAPIServer:
     # ------------------------------------------------------------------
 
     async def _list_topics(self, req: dict[str, object]) -> dict:
-        """Return forum topics for a dialog from the topic_metadata snapshot table.
+        """Return topics for a dialog from the canonical topic_metadata snapshot table.
 
-        Zero Telegram API calls. Returns the same response shape as the previous
-        live-API implementation. The topic_metadata table is kept current by
-        Phase 42 event handlers and Phase 43 reconciliation.
+        Normally this is a local read. If the catalog is empty and the daemon has
+        a topic refresher, the daemon may perform a one-shot refresh because the
+        daemon owns TelegramClient and persistence. MCP callers still go through
+        this daemon API boundary and never call Telegram directly.
 
         Request: dialog_id (int) or dialog (str).
         Response data: {"topics": [{"id", "title", "icon_emoji_id", "date"}],
@@ -945,9 +951,11 @@ class DaemonAPIServer:
                 "message": "Either dialog_id or dialog name is required for list_topics",
             }
 
-        rows = cast(
-            list[tuple[object, object, object, object]], self._conn.execute(_LIST_TOPICS_SQL, (dialog_id,)).fetchall()
-        )
+        rows = self._topic_rows(dialog_id)
+        empty_reason = None
+        if not rows and self._topic_refresher is not None:
+            empty_reason = await self._refresh_topic_catalog_for_list_topics(dialog_id)
+            rows = self._topic_rows(dialog_id)
         topics = [
             {
                 "id": int(cast(int | str, row[0])),
@@ -957,7 +965,33 @@ class DaemonAPIServer:
             }
             for row in rows
         ]
-        return {"ok": True, "data": {"topics": topics, "dialog_id": dialog_id}}
+        data = {"topics": topics, "dialog_id": dialog_id}
+        if not topics and empty_reason is not None:
+            data["empty_reason"] = empty_reason
+        return {"ok": True, "data": data}
+
+    def _topic_rows(self, dialog_id: int) -> list[tuple[object, object, object, object]]:
+        return cast(
+            list[tuple[object, object, object, object]], self._conn.execute(_LIST_TOPICS_SQL, (dialog_id,)).fetchall()
+        )
+
+    async def _refresh_topic_catalog_for_list_topics(self, dialog_id: int) -> str:
+        if self._topic_refresher is None:
+            return "topic_catalog_not_refreshed"
+        try:
+            entity = await self._client.get_entity(dialog_id)
+            refreshed = await self._topic_refresher.refresh(dialog_id, entity)
+        except FloodWaitError as exc:
+            logger.info(
+                "list_topics_refresh_deferred_flood_wait dialog_id=%d seconds=%s",
+                dialog_id,
+                getattr(exc, "seconds", None),
+            )
+            return "topic_catalog_deferred_flood_wait"
+        except TopicSourceUnavailableError as exc:
+            logger.info("list_topics_refresh_unavailable dialog_id=%d error=%s", dialog_id, exc)
+            return "topic_catalog_unavailable"
+        return "no_active_topics" if refreshed == 0 else "topic_catalog_refreshed"
 
     # ------------------------------------------------------------------
     # get_me

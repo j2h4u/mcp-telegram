@@ -405,7 +405,7 @@ async def list_topics(args: ListTopics) -> ToolResult:
         "dialog_id": data.get("dialog_id"),
         "topics": structured_topics,
         "count": len(structured_topics),
-        "empty_reason": None if structured_topics else "no_active_topics",
+        "empty_reason": None if structured_topics else data.get("empty_reason", "no_active_topics"),
     }
 
     if not topics:

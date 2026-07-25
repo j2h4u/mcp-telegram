@@ -26,6 +26,9 @@ from mcp_telegram.dialog_sync import (
     run_reconciliation_loop,
 )
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
+from mcp_telegram.topics.refresh import TopicRefresher
+from mcp_telegram.topics.sqlite_repository import SQLiteTopicSnapshotRepository
+from mcp_telegram.topics.telegram_adapter import TelethonTelegramTopicGateway
 
 # --- fixtures ---------------------------------------------------------------
 
@@ -611,12 +614,16 @@ async def test_refresh_forum_topics_upserts(
     mock_result = MagicMock()
     mock_result.topics = [topic]
 
-    # _refresh_forum_topics calls await self._client(GetForumTopicsRequest(...))
-    # Use AsyncMock for the client so the call is awaitable
+    # Use AsyncMock for the Telethon gateway client so the call is awaitable.
     client = AsyncMock()
     client.return_value = mock_result
 
-    worker = DialogReconciliationWorker(client, sync_db, shutdown_event)
+    worker = DialogReconciliationWorker(
+        client,
+        sync_db,
+        shutdown_event,
+        TopicRefresher(TelethonTelegramTopicGateway(client), SQLiteTopicSnapshotRepository(sync_db)),
+    )
     count = await worker._refresh_forum_topics(dialog_id=999, entity=entity)
 
     assert count == 1
@@ -656,7 +663,12 @@ async def test_refresh_forum_topics_topic_without_is_general_defaults_to_id_chec
     client = AsyncMock()
     client.return_value = mock_result
 
-    worker = DialogReconciliationWorker(client, sync_db, shutdown_event)
+    worker = DialogReconciliationWorker(
+        client,
+        sync_db,
+        shutdown_event,
+        TopicRefresher(TelethonTelegramTopicGateway(client), SQLiteTopicSnapshotRepository(sync_db)),
+    )
     count = await worker._refresh_forum_topics(dialog_id=1001, entity=entity)
 
     assert count == 2
@@ -690,13 +702,19 @@ async def test_light_pass_refreshes_forum_topics(
     forum_entity.date = None
     mock_client.get_entity = AsyncMock(return_value=forum_entity)
 
-    # client(GetForumTopicsRequest(...)) returns empty topics
+    # The daemon's injected Telethon topic gateway returns an empty snapshot.
     mock_result = MagicMock()
     mock_result.topics = []
-    mock_client.return_value = mock_result
-    mock_client.side_effect = None
+    topic_client = AsyncMock()
+    topic_client.get_input_entity = AsyncMock(return_value=forum_entity)
+    topic_client.return_value = mock_result
 
-    worker = DialogReconciliationWorker(mock_client, sync_db, shutdown_event)
+    worker = DialogReconciliationWorker(
+        mock_client,
+        sync_db,
+        shutdown_event,
+        TopicRefresher(TelethonTelegramTopicGateway(topic_client), SQLiteTopicSnapshotRepository(sync_db)),
+    )
     with patch.object(worker, "_refresh_forum_topics", wraps=worker._refresh_forum_topics) as spy:
         await worker.run_light_pass()
 

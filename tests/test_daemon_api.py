@@ -28,6 +28,9 @@ from mcp_telegram.daemon_message_queries import _build_list_messages_query, _Lis
 from mcp_telegram.fts import MESSAGES_FTS_DDL, stem_text
 from mcp_telegram.models import DialogType
 from mcp_telegram.telethon_dialog import classify_dialog_type
+from mcp_telegram.topics.contracts import TopicFact
+from mcp_telegram.topics.refresh import TopicRefresher
+from mcp_telegram.topics.sqlite_repository import SQLiteTopicSnapshotRepository
 from tests.daemon_api_policy import make_daemon_api_policy
 from tests.reaction_helpers import make_reaction_freshener
 
@@ -296,6 +299,7 @@ def make_server(
     conn: sqlite3.Connection | None = None,
     client: object | None = None,
     feedback_conn: sqlite3.Connection | None = None,
+    topic_refresher: TopicRefresher | None = None,
 ) -> DaemonAPIServer:
     """Return a DaemonAPIServer wired to in-memory DB and mock client."""
     if conn is None:
@@ -317,6 +321,7 @@ def make_server(
         shutdown_event,
         feedback_conn,
         reaction_freshener=make_reaction_freshener(conn, client),
+        topic_refresher=topic_refresher,
         policy=make_daemon_api_policy(),
     )
     server._ready = True
@@ -1723,6 +1728,43 @@ async def test_list_topics_empty_snapshot() -> None:
     assert result["data"]["topics"] == []
     assert result["data"]["dialog_id"] == 456
     cast(AsyncMock, client.get_entity).assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_list_topics_refreshes_empty_private_bot_catalog() -> None:
+    """Empty local topic catalog is refreshed inside daemon for topic-capable bot DMs."""
+
+    class _Gateway:
+        async def fetch_topics(self, entity: object) -> tuple[TopicFact, ...]:
+            assert getattr(entity, "bot_forum_view", False) is True
+            return (TopicFact(topic_id=306001, title="Topic"),)
+
+    conn = _make_db_with_topics()
+    client = _TestClient()
+    client.get_entity = AsyncMock(return_value=SimpleNamespace(bot=True, bot_forum_view=True))
+    topic_refresher = TopicRefresher(_Gateway(), SQLiteTopicSnapshotRepository(conn))
+    server = make_server(conn, client, topic_refresher=topic_refresher)
+
+    result = await server._list_topics({"dialog_id": 8583106747})
+
+    assert result["ok"] is True
+    assert result["data"]["topics"] == [
+        {
+            "id": 306001,
+            "title": "Topic",
+            "icon_emoji_id": None,
+            "date": None,
+        }
+    ]
+    row = cast(
+        sqlite3.Row | None,
+        conn.execute(
+            "SELECT title FROM topic_metadata WHERE dialog_id = ? AND topic_id = ?",
+            (8583106747, 306001),
+        ).fetchone(),
+    )
+    assert row is not None
+    assert tuple(row) == ("Topic",)
 
 
 @pytest.mark.asyncio

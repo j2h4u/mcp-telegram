@@ -59,16 +59,16 @@ from telethon.errors import (  # type: ignore[import-untyped]
     UserKickedError,
 )
 from telethon.tl import types  # type: ignore[import-untyped]
-from telethon.tl.functions.messages import GetForumTopicsRequest  # type: ignore[import-untyped]
 from telethon.tl.types import (  # type: ignore[import-untyped]
     InputPeerChannel,
     InputPeerChat,
     InputPeerUser,
-    TypeInputPeer,
 )
 
 from .flood import flood_seconds, sleep_through_flood
 from .sync_db import _open_sync_db
+from .topics.contracts import TopicSourceUnavailableError, is_topic_capable
+from .topics.refresh import TopicRefresher
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -241,25 +241,6 @@ def _set_access_lost(conn: sqlite3.Connection, dialog_id: int, now: int) -> None
 
 _SELECT_DIRTY_DIALOGS_SQL = "SELECT dialog_id FROM dialogs WHERE needs_refresh = 1 AND hidden = 0"
 
-_UPSERT_TOPIC_FROM_RECON_SQL = """
-INSERT INTO topic_metadata
-    (dialog_id, topic_id, title, top_message_id,
-     is_general, is_deleted, updated_at,
-     icon_emoji_id, pinned, hidden, snapshot_at, date)
-VALUES
-    (:dialog_id, :topic_id, :title, NULL,
-     :is_general, 0, :updated_at,
-     :icon_emoji_id, 0, 0, :snapshot_at, :date)
-ON CONFLICT(dialog_id, topic_id) DO UPDATE SET
-    title          = COALESCE(excluded.title, topic_metadata.title),
-    icon_emoji_id  = COALESCE(excluded.icon_emoji_id, topic_metadata.icon_emoji_id),
-    is_general     = excluded.is_general,
-    updated_at     = excluded.updated_at,
-    snapshot_at    = excluded.snapshot_at,
-    date           = COALESCE(excluded.date, topic_metadata.date)
-WHERE topic_metadata.snapshot_at IS NULL
-   OR topic_metadata.snapshot_at < excluded.snapshot_at
-"""
 _UPDATE_DIALOG_ENTITY_SQL = (
     "UPDATE dialogs SET name=?, type=?, members=?, created=?, needs_refresh=0, snapshot_at=? WHERE dialog_id=?"
 )
@@ -647,10 +628,12 @@ class DialogReconciliationWorker:
         client: object,
         conn: sqlite3.Connection,
         shutdown_event: asyncio.Event,
+        topic_refresher: TopicRefresher | None = None,
     ) -> None:
         self._client = cast(_DialogSyncClient, client)
         self._conn = conn
         self._shutdown_event = shutdown_event
+        self._topic_refresher = topic_refresher
 
     async def run_light_pass(self) -> int:
         """RECON-02: refresh dialogs flagged with needs_refresh=1.
@@ -697,7 +680,7 @@ class DialogReconciliationWorker:
                         ),
                     )
                 count += 1
-                if _attr(entity, "forum", False):
+                if self._topic_refresher is not None and is_topic_capable(entity):
                     topic_count = await self._refresh_forum_topics(dialog_id, entity)
                     logger.debug(
                         "recon_light_pass_forum_topics dialog_id=%d count=%d",
@@ -778,7 +761,7 @@ class DialogReconciliationWorker:
                     self._conn.execute(_UPSERT_DIALOG_SQL, row)
                 seen_ids.add(int(dialog.id))
                 count += 1
-                if _attr(dialog.entity, "forum", False):
+                if self._topic_refresher is not None and is_topic_capable(dialog.entity):
                     topic_count = await self._refresh_forum_topics(int(dialog.id), dialog.entity)
                     logger.debug(
                         "recon_full_pass_forum_topics dialog_id=%d count=%d",
@@ -813,25 +796,19 @@ class DialogReconciliationWorker:
         dialog_id: int,
         entity: _EntityLike,
     ) -> int:
-        """Fetch topics for a forum supergroup and upsert into topic_metadata.
+        """Refresh a topic-capable dialog's canonical topic_metadata snapshot.
 
         Called from run_light_pass after entity is already fetched. Handles
         FloodWaitError by sleeping (interruptible by shutdown_event) and returning 0.
-        Non-forum entities must not be passed — callers must guard with
-        getattr(entity, 'forum', False).
+        The injected application service identifies both forum supergroups and
+        private bot dialogs with ``bot_forum_view``.
 
         Returns count of topics written.
         """
+        if self._topic_refresher is None:
+            return 0
         try:
-            result = await self._client(
-                GetForumTopicsRequest(
-                    peer=cast(TypeInputPeer, entity),
-                    offset_date=None,
-                    offset_id=0,
-                    offset_topic=0,
-                    limit=100,
-                )
-            )
+            count = await self._topic_refresher.refresh(dialog_id, entity)
         except FloodWaitError as exc:
             wait_s = flood_seconds(exc)
             logger.warning(
@@ -841,7 +818,7 @@ class DialogReconciliationWorker:
             )
             await sleep_through_flood(self._shutdown_event, wait_s)
             return 0
-        except (RPCError, TypeError) as exc:
+        except TopicSourceUnavailableError as exc:
             logger.warning(
                 "recon_forum_topics_fetch_failed dialog_id=%d error=%s",
                 dialog_id,
@@ -849,40 +826,18 @@ class DialogReconciliationWorker:
             )
             return 0
 
-        topics = result.topics or []
-        # NOTE: hard cap of 100 topics per GetForumTopicsRequest (Telegram limit).
-        # Forums with >100 topics will silently drop topics beyond the first 100.
-        # This matches the pre-existing _list_topics limit=100 behaviour.
-        now = int(time.time())
-        rows = [
-            {
-                "dialog_id": dialog_id,
-                "topic_id": int(t.id),
-                "title": t.title or "",
-                "is_general": int(bool(_attr(t, "is_general", False)) or (int(t.id) == 1)),
-                "icon_emoji_id": t.icon_emoji_id,
-                "updated_at": now,
-                "snapshot_at": now,
-                "date": int(t.date.timestamp()) if t.date is not None else None,
-            }
-            for t in topics
-        ]
-        # Batch all upserts in a single transaction for atomicity and performance.
-        with self._conn:
-            for row in rows:
-                self._conn.execute(_UPSERT_TOPIC_FROM_RECON_SQL, row)
-        count = len(rows)
-        logger.info("recon_forum_topics_complete dialog_id=%d count=%d", dialog_id, count)
+        logger.info("recon_topics_complete dialog_id=%d count=%d", dialog_id, count)
         return count
 
 
-async def run_reconciliation_loop(
+async def run_reconciliation_loop(  # noqa: PLR0913
     client: object,
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,
     *,
     hourly_interval: float = 3600.0,
     daily_interval: float = 86400.0,
+    topic_refresher: TopicRefresher | None = None,
 ) -> None:
     """Background loop: light pass every hourly_interval, full pass every daily_interval.
 
@@ -907,7 +862,7 @@ async def run_reconciliation_loop(
     last_full_pass: float | None = None
     while not shutdown_event.is_set():
         now = time.monotonic()
-        worker = DialogReconciliationWorker(client, conn, shutdown_event)
+        worker = DialogReconciliationWorker(client, conn, shutdown_event, topic_refresher)
         try:
             await worker.run_light_pass()
         except Exception:
