@@ -410,6 +410,17 @@ LEFT JOIN dialogs d ON d.dialog_id = s.dialog_id
 WHERE s.status = 'own_only' AND d.dialog_id IS NULL
 """
 
+_OWN_ONLY_DIALOGS_DDL = """
+CREATE TABLE IF NOT EXISTS own_only_dialogs (
+    dialog_id       INTEGER PRIMARY KEY,
+    inclusion_basis TEXT NOT NULL,
+    updated_at      INTEGER NOT NULL
+)
+"""
+
+_SET_ACCESS_LOST_SQL = "UPDATE synced_dialogs SET status = 'access_lost', access_lost_at = ? WHERE dialog_id = ?"
+_SET_DIALOGS_HIDDEN_SQL = "UPDATE dialogs SET hidden = 1, snapshot_at = ? WHERE dialog_id = ?"
+
 # ---------------------------------------------------------------------------
 # v27: scheduled-message mirror
 #
@@ -1279,6 +1290,19 @@ def _ensure_scheduled_messages_fts(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def ensure_own_only_schema(conn: sqlite3.Connection) -> None:
+    """Create the ownership cache table used by scheduled reconciliation and reads."""
+    conn.execute(_OWN_ONLY_DIALOGS_DDL)
+    conn.commit()
+
+
+def set_access_lost(conn: sqlite3.Connection, dialog_id: int, now: int) -> None:
+    """Atomically mark a dialog access-lost in local sync state."""
+    with conn:
+        conn.execute(_SET_ACCESS_LOST_SQL, (now, dialog_id))
+        conn.execute(_SET_DIALOGS_HIDDEN_SQL, (now, dialog_id))
+
+
 def ensure_sync_schema(db_path: Path) -> None:
     """Ensure sync.db exists and has the current schema.
 
@@ -1288,8 +1312,6 @@ def ensure_sync_schema(db_path: Path) -> None:
     probe_conn = _open_sync_db(db_path)
     try:
         if _schema_ready(probe_conn):
-            from .own_only import ensure_own_only_schema
-
             ensure_own_only_schema(probe_conn)
             _ensure_scheduled_messages_fts(probe_conn)
             return
@@ -1304,7 +1326,6 @@ def ensure_sync_schema(db_path: Path) -> None:
             bootstrap_conn = _open_sync_db(db_path)
             if not _schema_ready(bootstrap_conn):
                 _apply_migrations(bootstrap_conn)
-            from .own_only import ensure_own_only_schema
 
             ensure_own_only_schema(bootstrap_conn)
             _ensure_scheduled_messages_fts(bootstrap_conn)

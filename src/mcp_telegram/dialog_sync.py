@@ -60,7 +60,7 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
 )
 
 from .flood import flood_seconds, sleep_through_flood
-from .sync_db import _open_sync_db
+from .sync_db import _open_sync_db, set_access_lost
 from .telegram_access import ACCESS_LOST_ERRORS
 from .topics.contracts import TopicSourceUnavailableError, is_topic_capable
 from .topics.refresh import TopicRefresher
@@ -201,23 +201,10 @@ _PROGRESS_REPORT_EVERY = 50
 
 # ---------------------------------------------------------------------------
 # Access-loss handling (RECON-04). Telegram error classification lives in
-# telegram_access; this module owns only the local atomic status transition.
+# telegram_access; local atomic status transition lives in sync_db.
 # ---------------------------------------------------------------------------
 
-_SET_ACCESS_LOST_SQL = "UPDATE synced_dialogs SET status = 'access_lost', access_lost_at = ? WHERE dialog_id = ?"
-_SET_DIALOGS_HIDDEN_SQL = "UPDATE dialogs SET hidden = 1, snapshot_at = ? WHERE dialog_id = ?"
-
-
-def _set_access_lost(conn: sqlite3.Connection, dialog_id: int, now: int) -> None:
-    """Atomic access-loss transition (RECON-04).
-
-    Writes synced_dialogs.status='access_lost' and dialogs.hidden=1 in a
-    single transaction. UPDATEs against a missing row are no-ops; safe
-    to call even when only one of the two tables has the dialog_id.
-    """
-    with conn:
-        conn.execute(_SET_ACCESS_LOST_SQL, (now, dialog_id))
-        conn.execute(_SET_DIALOGS_HIDDEN_SQL, (now, dialog_id))
+_set_access_lost = set_access_lost
 
 
 # ---------------------------------------------------------------------------
@@ -694,7 +681,7 @@ class DialogReconciliationWorker:
                     dialog_id,
                     type(exc).__name__,
                 )
-                _set_access_lost(self._conn, dialog_id, int(time.time()))
+                set_access_lost(self._conn, dialog_id, int(time.time()))
                 # do not increment count — refresh did not succeed
             except PeerIdInvalidError:
                 # Telethon session does not have access_hash cached for this

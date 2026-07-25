@@ -25,11 +25,11 @@ from telethon.errors import (
     RPCError,  # type: ignore[import-untyped]
 )
 
-from .dialog_sync import _set_access_lost
 from .flood import flood_seconds, sleep_through_flood
 from .message_contracts import ExtractedMessage
 from .messages.sqlite_repository import insert_messages_with_fts
 from .messages.telegram_adapter import extract_message_row
+from .sync_db import set_access_lost
 from .telegram_access import ACCESS_LOST_ERRORS
 
 logger = logging.getLogger(__name__)
@@ -237,7 +237,7 @@ class DeltaSyncWorker:
                 type(exc).__name__,
             )
             now = int(time.time())
-            _set_access_lost(self._conn, dialog_id, now)
+            set_access_lost(self._conn, dialog_id, now)
             return 0
         except RPCError as exc:
             logger.exception(

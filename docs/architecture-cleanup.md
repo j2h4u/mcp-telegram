@@ -131,9 +131,9 @@ just module-boundaries
 
 Current result on `chore/tach-architecture-boundaries`:
 
-- 84 total Tach failures;
-- 82 undeclared dependencies;
-- 2 layer violations;
+- 79 total Tach failures;
+- 79 undeclared dependencies;
+- 0 layer violations;
 - 0 private interface violations.
 
 The Tach-driven cleanup so far removed all initial private-interface failures by:
@@ -150,6 +150,12 @@ It also removed several layer violations by:
 - moving Telethon message-to-dict projection into `telegram_message_projection`;
 - modelling reaction aggregate projection as Telegram-facing projection code
   rather than a pure capability module.
+- moving the `own_only_dialogs` DDL/ensure helper into `sync_db`, while keeping
+  the old `own_only.ensure_own_only_schema` import path as a compatibility
+  re-export.
+- moving the local access-lost status transition into `sync_db.set_access_lost`,
+  while keeping the old `dialog_sync._set_access_lost` import path as a
+  compatibility alias.
 
 The first visible cleanup categories are:
 
@@ -166,13 +172,10 @@ The first visible cleanup categories are:
 4. `daemon_api` reaches directly into persistence and capability implementation
    details (`folders.sqlite_repository`, `feedback_db`, refreshers). The target
    is an application service boundary.
-5. The remaining layer violation is `sync_db -> own_only.ensure_own_only_schema`.
-   The target shape is a persistence-owned schema extension/registry, not a
-   persistence module reaching up into an application worker module.
-6. Telegram gateway modules still have some application/persistence pressure
+5. Telegram gateway modules still have some application/persistence pressure
    around concrete read models. Move shared Telegram error/read-model contracts
    downward or split adapters when those edges become the next cleanup slice.
-7. Capability internals still need public interface refinement. Current public
+6. Capability internals still need public interface refinement. Current public
    interfaces expose contracts/ports/refresh seams, but several callers still
    reach into implementation modules instead of stable application services.
 

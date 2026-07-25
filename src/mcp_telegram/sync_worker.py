@@ -28,11 +28,11 @@ from typing import Protocol, cast
 from telethon.errors import FloodWaitError, RPCError  # type: ignore[import-untyped]
 from telethon.tl import types  # type: ignore[import-untyped]
 
-from .dialog_sync import _set_access_lost
 from .flood import flood_seconds, sleep_through_flood
 from .messages.sqlite_repository import insert_messages_with_fts
 from .messages.telegram_adapter import PeerNameClient, extract_message_row, resolve_forward_entity_name_map
 from .resolver import latinize
+from .sync_db import set_access_lost
 from .telegram_access import ACCESS_LOST_ERRORS
 from .telethon_dialog import classify_dialog_type
 
@@ -280,7 +280,7 @@ class FullSyncWorker:
         except ACCESS_LOST_ERRORS as exc:
             logger.warning("access_lost dialog_id=%d — %s: %s", dialog_id, type(exc).__name__, exc)
             now = int(time.time())
-            _set_access_lost(self._conn, dialog_id, now)
+            set_access_lost(self._conn, dialog_id, now)
             return sync_progress, True
         except RPCError as exc:
             logger.exception(
