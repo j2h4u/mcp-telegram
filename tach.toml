@@ -208,8 +208,10 @@ depends_on = [
     "mcp_telegram.topics.telegram_adapter",
     "mcp_telegram.telegram_fact_queries",
     "mcp_telegram.telegram_fragments",
+    "mcp_telegram.telegram_access",
     "mcp_telegram.telegram_gateway",
     "mcp_telegram.telegram_history",
+    "mcp_telegram.telegram_message_projection",
     "mcp_telegram.telegram_read_receipts",
     "mcp_telegram.sync_db",
     "mcp_telegram.fts",
@@ -245,7 +247,6 @@ depends_on = []
 paths = [
     "mcp_telegram.folders.membership",
     "mcp_telegram.folders.refresh",
-    "mcp_telegram.reactions.projection",
     "mcp_telegram.reactions.refresh",
     "mcp_telegram.topics.refresh",
 ]
@@ -264,12 +265,50 @@ depends_on = [
 # ---------------------------------------------------------------------------
 
 [[modules]]
+path = "mcp_telegram.telegram_access"
+layer = "telegram_gateway"
+depends_on = []
+utility = true
+
+[[modules]]
+path = "mcp_telegram.telegram_gateway"
+layer = "telegram_gateway"
+depends_on = [
+    "mcp_telegram.telegram_access",
+    "mcp_telegram.telegram_reading",
+]
+
+[[modules]]
+path = "mcp_telegram.telegram_message_projection"
+layer = "telegram_gateway"
+depends_on = [
+    "mcp_telegram.formatter",
+    "mcp_telegram.messages.telegram_adapter",
+    "mcp_telegram.telethon_media",
+    "mcp_telegram.telethon_message",
+]
+
+[[modules]]
+path = "mcp_telegram.reactions.projection"
+layer = "telegram_gateway"
+depends_on = [
+    "mcp_telegram.reactions.contracts",
+]
+
+[[modules]]
+path = "mcp_telegram.telegram_history"
+layer = "telegram_gateway"
+depends_on = [
+    "mcp_telegram.telegram_gateway",
+    "mcp_telegram.telegram_message_projection",
+    "mcp_telegram.telegram_reading",
+]
+
+[[modules]]
 paths = [
     "mcp_telegram.telegram",
     "mcp_telegram.telegram_fact_queries",
     "mcp_telegram.telegram_fragments",
-    "mcp_telegram.telegram_gateway",
-    "mcp_telegram.telegram_history",
     "mcp_telegram.telegram_read_receipts",
     "mcp_telegram.telethon_dialog",
     "mcp_telegram.telethon_media",
@@ -285,6 +324,7 @@ depends_on = [
     "mcp_telegram.models",
     "mcp_telegram.message_contracts",
     "mcp_telegram.telegram_reading",
+    "mcp_telegram.telegram_gateway",
     "mcp_telegram.folders.contracts",
     "mcp_telegram.folders.ports",
     "mcp_telegram.reactions.contracts",

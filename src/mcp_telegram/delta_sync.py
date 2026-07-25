@@ -25,11 +25,12 @@ from telethon.errors import (
     RPCError,  # type: ignore[import-untyped]
 )
 
-from .dialog_sync import _ACCESS_LOST_ERRORS, _set_access_lost
+from .dialog_sync import _set_access_lost
 from .flood import flood_seconds, sleep_through_flood
 from .message_contracts import ExtractedMessage
 from .messages.sqlite_repository import insert_messages_with_fts
 from .messages.telegram_adapter import extract_message_row
+from .telegram_access import ACCESS_LOST_ERRORS
 
 logger = logging.getLogger(__name__)
 
@@ -229,7 +230,7 @@ class DeltaSyncWorker:
                 )
             await sleep_through_flood(self._shutdown_event, flood_seconds(exc))
             return len(new_message_rows)
-        except _ACCESS_LOST_ERRORS as exc:
+        except ACCESS_LOST_ERRORS as exc:
             logger.warning(
                 "access_lost delta dialog_id=%d — %s",
                 dialog_id,
@@ -298,7 +299,7 @@ async def _probe_access_lost_dialogs(
                     conn.execute(_UPDATE_TOTAL_MESSAGES_SQL, (total, dialog_id))
             logger.info("access_restored dialog_id=%d total=%s", dialog_id, total)
             restored += 1
-        except _ACCESS_LOST_ERRORS:
+        except ACCESS_LOST_ERRORS:
             logger.debug("access_still_lost dialog_id=%d", dialog_id)
         except FloodWaitError as exc:
             logger.warning("probe_flood_wait dialog_id=%d seconds=%d", dialog_id, exc.seconds)

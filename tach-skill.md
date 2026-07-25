@@ -78,3 +78,18 @@ In `mcp-telegram`, this removed all initial private-interface failures:
   of the Tach interface.
 - `_DaemonClientLike` was used by daemon construction/tests, so it was renamed
   to public `DaemonClientLike`.
+
+## Layer cleanup pattern
+
+When Tach reports an upward edge, first ask whether the imported concept belongs
+to the lower layer or to a neutral seam. Do not immediately whitelist the edge.
+
+Patterns that worked:
+
+- Shared Telethon exception classification belongs beside Telegram gateway code,
+  not in an application worker that happened to need it first.
+- Message projection from Telethon-shaped objects belongs in a Telegram-facing
+  projection module, not in a daemon query module.
+- If one grouped Tach module contains files that need directed internal edges,
+  split those files into explicit modules. Grouping is useful early, but it can
+  create artificial same-layer cycles or hide the real ownership seam.

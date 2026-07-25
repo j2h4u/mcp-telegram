@@ -131,16 +131,25 @@ just module-boundaries
 
 Current result on `chore/tach-architecture-boundaries`:
 
-- 101 total Tach failures;
-- 95 undeclared dependencies;
-- 6 layer violations;
+- 84 total Tach failures;
+- 82 undeclared dependencies;
+- 2 layer violations;
 - 0 private interface violations.
 
-The first Tach-driven cleanup removed all initial private-interface failures by:
+The Tach-driven cleanup so far removed all initial private-interface failures by:
 
 - adding the already-public `daemon_connection` function to the `daemon_client`
   interface;
 - renaming externally used `_DaemonClientLike` to public `DaemonClientLike`.
+
+It also removed several layer violations by:
+
+- moving shared Telegram access-loss classification into `telegram_access`;
+- routing sync/activity/account-trace access-loss handling through that shared
+  classification instead of importing a private `dialog_sync` tuple;
+- moving Telethon message-to-dict projection into `telegram_message_projection`;
+- modelling reaction aggregate projection as Telegram-facing projection code
+  rather than a pure capability module.
 
 The first visible cleanup categories are:
 
@@ -157,11 +166,13 @@ The first visible cleanup categories are:
 4. `daemon_api` reaches directly into persistence and capability implementation
    details (`folders.sqlite_repository`, `feedback_db`, refreshers). The target
    is an application service boundary.
-5. Telegram gateway modules import application/persistence helpers
-   (`dialog_sync`, `daemon_message`, `messages.sqlite_repository`,
-   `telegram_gateway` helper module). Move shared Telegram error/read-model
-   contracts downward or split adapters.
-6. Capability internals still need public interface refinement. Current public
+5. The remaining layer violation is `sync_db -> own_only.ensure_own_only_schema`.
+   The target shape is a persistence-owned schema extension/registry, not a
+   persistence module reaching up into an application worker module.
+6. Telegram gateway modules still have some application/persistence pressure
+   around concrete read models. Move shared Telegram error/read-model contracts
+   downward or split adapters when those edges become the next cleanup slice.
+7. Capability internals still need public interface refinement. Current public
    interfaces expose contracts/ports/refresh seams, but several callers still
    reach into implementation modules instead of stable application services.
 
