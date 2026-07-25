@@ -58,7 +58,7 @@ from .activity_cold_backfill import ColdBackfillPacing, run_cold_backfill_loop
 from .activity_hot_sweep import run_hot_sweep_loop
 from .activity_sync import _ActivityClient, run_activity_sync_loop
 from .config import SchedulingConfig, load_config, resolve_scheduling_config
-from .daemon_api import DaemonApiPolicy, DaemonAPIServer, _DaemonClientLike
+from .daemon_api import DaemonApiPolicy, DaemonAPIServer, DaemonClientLike
 from .delta_sync import DeltaSyncWorker, _DeltaSyncClient, run_access_probe_loop
 from .dialog_sync import DialogsBootstrapWorker, run_reconciliation_loop
 from .event_handlers import EventHandlerManager
@@ -702,7 +702,7 @@ async def _build_sync_main_context() -> _SyncMainContext:
     )
     api_server = DaemonAPIServer(
         conn,
-        cast(_DaemonClientLike, client),
+        cast(DaemonClientLike, client),
         shutdown_event,
         feedback_conn,
         db_path,

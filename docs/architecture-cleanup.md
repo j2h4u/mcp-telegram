@@ -53,6 +53,11 @@ Do not mix the two modes in one step:
 - for target-architecture design, keep bad edges undeclared and document the red
   baseline here.
 
+In this repository, running `tach sync --add` against the target graph does not
+clear the advisory failures: layer violations, private-interface imports, and
+deliberately forbidden edges still require design work. Use `sync` to build or
+refresh a current-state baseline, not to repair the target architecture.
+
 ## Target layers
 
 Highest first:
@@ -124,12 +129,18 @@ Run:
 just module-boundaries
 ```
 
-Initial result on `chore/tach-architecture-boundaries`:
+Current result on `chore/tach-architecture-boundaries`:
 
-- 105 total Tach failures;
+- 101 total Tach failures;
 - 95 undeclared dependencies;
 - 6 layer violations;
-- 4 private interface violations.
+- 0 private interface violations.
+
+The first Tach-driven cleanup removed all initial private-interface failures by:
+
+- adding the already-public `daemon_connection` function to the `daemon_client`
+  interface;
+- renaming externally used `_DaemonClientLike` to public `DaemonClientLike`.
 
 The first visible cleanup categories are:
 
@@ -151,8 +162,8 @@ The first visible cleanup categories are:
    `telegram_gateway` helper module). Move shared Telegram error/read-model
    contracts downward or split adapters.
 6. Capability internals still need public interface refinement. Current public
-   interfaces expose contracts/ports/refresh seams, but callers still use private
-   details such as `daemon_client.daemon_connection` and `_DaemonClientLike`.
+   interfaces expose contracts/ports/refresh seams, but several callers still
+   reach into implementation modules instead of stable application services.
 
 Each cleanup PR should remove one category of failures and tighten `tach.toml`
 only when it reflects the intended graph more accurately.

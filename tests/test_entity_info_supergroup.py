@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from mcp_telegram.daemon_api import DaemonAPIServer, _DaemonClientLike
+from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike
 from tests.daemon_api_policy import make_daemon_api_policy
 from tests.reaction_helpers import make_reaction_freshener
 
@@ -80,7 +80,7 @@ def _make_db() -> sqlite3.Connection:
     return conn
 
 
-def make_server(conn: sqlite3.Connection | None = None, client: _DaemonClientLike | None = None) -> DaemonAPIServer:
+def make_server(conn: sqlite3.Connection | None = None, client: DaemonClientLike | None = None) -> DaemonAPIServer:
     if conn is None:
         conn = _make_db()
     if client is None:
@@ -88,7 +88,7 @@ def make_server(conn: sqlite3.Connection | None = None, client: _DaemonClientLik
     shutdown_event = asyncio.Event()
     server = DaemonAPIServer(
         conn,
-        cast(_DaemonClientLike, client),
+        cast(DaemonClientLike, client),
         shutdown_event,
         reaction_freshener=make_reaction_freshener(conn, client),
         policy=make_daemon_api_policy(),

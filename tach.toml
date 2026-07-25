@@ -380,8 +380,8 @@ expose = [
 
 [[interfaces]]
 from = ["mcp_telegram.daemon_api"]
-expose = ["DaemonAPIServer", "DaemonApiPolicy"]
+expose = ["DaemonAPIServer", "DaemonApiPolicy", "DaemonClientLike"]
 
 [[interfaces]]
 from = ["mcp_telegram.daemon_client"]
-expose = ["DaemonConnection", "DaemonNotRunningError"]
+expose = ["DaemonConnection", "DaemonNotRunningError", "daemon_connection"]
