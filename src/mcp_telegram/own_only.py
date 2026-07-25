@@ -129,6 +129,7 @@ WHERE (
 ORDER BY dialog_id
 """
 
+
 def _as_int(value: object) -> int:
     return int(cast(int | str, value))
 
