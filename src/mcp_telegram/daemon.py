@@ -91,6 +91,9 @@ from .sync_db import (
 )
 from .sync_worker import FullSyncWorker
 from .telegram import create_client
+from .topics.refresh import TopicRefresher
+from .topics.sqlite_repository import SQLiteTopicSnapshotRepository
+from .topics.telegram_adapter import TelethonTelegramTopicGateway, TopicClient
 
 logger = logging.getLogger(__name__)
 
@@ -214,6 +217,7 @@ class _SyncMainContext:
     shutdown_event: asyncio.Event
     client: _DaemonClient
     api_server: DaemonAPIServer
+    topic_refresher: TopicRefresher
     socket_path: Path
     unix_server: asyncio.AbstractServer | None = None
     handler_manager: EventHandlerManager | None = None
@@ -692,6 +696,10 @@ async def _build_sync_main_context() -> _SyncMainContext:
         freshness_ttl_seconds=config.freshness.reactions.freshness_ttl_seconds,
         log=logger,
     )
+    topic_refresher = TopicRefresher(
+        TelethonTelegramTopicGateway(cast(TopicClient, client)),
+        SQLiteTopicSnapshotRepository(conn),
+    )
     api_server = DaemonAPIServer(
         conn,
         cast(_DaemonClientLike, client),
@@ -699,6 +707,7 @@ async def _build_sync_main_context() -> _SyncMainContext:
         feedback_conn,
         db_path,
         reaction_freshener=reaction_freshener,
+        topic_refresher=topic_refresher,
         policy=DaemonApiPolicy(
             read_at_ttl_seconds=config.freshness.read_receipts.read_at_ttl_seconds,
             entity_detail_ttl_seconds=config.freshness.entities.detail_ttl_seconds,
@@ -728,6 +737,7 @@ async def _build_sync_main_context() -> _SyncMainContext:
         shutdown_event=shutdown_event,
         client=client,
         api_server=api_server,
+        topic_refresher=topic_refresher,
         socket_path=socket_path,
         unix_server=unix_server,
         scheduling=resolve_scheduling_config(config.scheduling),
@@ -947,6 +957,7 @@ async def _start_followup_background_tasks(
             ctx.conn,
             ctx.shutdown_event,
             hourly_interval=ctx.scheduling.reconciliation_hourly_seconds,
+            topic_refresher=ctx.topic_refresher,
         ),
         name="reconciliation_loop",
     )

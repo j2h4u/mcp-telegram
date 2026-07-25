@@ -538,6 +538,42 @@ source_modules = ["mcp_telegram.folders.sqlite_repository"]
 forbidden_modules = ["mcp_telegram.folders.telegram_adapter"]
 
 [[tool.importlinter.contracts]]
+name = "Topic application service stays off concrete adapters"
+type = "forbidden"
+source_modules = ["mcp_telegram.topics.refresh"]
+forbidden_modules = [
+  "mcp_telegram.topics.sqlite_repository",
+  "mcp_telegram.topics.telegram_adapter",
+]
+
+[[tool.importlinter.contracts]]
+name = "Topic domain stays independent of adapters and orchestration"
+type = "forbidden"
+source_modules = [
+  "mcp_telegram.topics.contracts",
+  "mcp_telegram.topics.ports",
+]
+forbidden_modules = [
+  "mcp_telegram.topics.sqlite_repository",
+  "mcp_telegram.topics.telegram_adapter",
+  "mcp_telegram.daemon",
+  "mcp_telegram.daemon_api",
+  "mcp_telegram.tools",
+]
+
+[[tool.importlinter.contracts]]
+name = "Topic Telegram adapter stays off SQLite repository"
+type = "forbidden"
+source_modules = ["mcp_telegram.topics.telegram_adapter"]
+forbidden_modules = ["mcp_telegram.topics.sqlite_repository"]
+
+[[tool.importlinter.contracts]]
+name = "Topic SQLite repository stays off Telegram adapter"
+type = "forbidden"
+source_modules = ["mcp_telegram.topics.sqlite_repository"]
+forbidden_modules = ["mcp_telegram.topics.telegram_adapter"]
+
+[[tool.importlinter.contracts]]
 name = "Reaction aggregate consumers stay off the private SQLite adapter"
 type = "forbidden"
 source_modules = [

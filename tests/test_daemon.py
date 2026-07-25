@@ -329,6 +329,7 @@ def test_self_id_cached_at_startup(
             sync_db_path=None,
             *,
             reaction_freshener,
+            topic_refresher,
             policy,
         ):
             self._conn = conn
@@ -337,6 +338,7 @@ def test_self_id_cached_at_startup(
             self._feedback_conn = feedback_conn
             self._sync_db_path = sync_db_path
             self._reaction_freshener = reaction_freshener
+            self._topic_refresher = topic_refresher
             self._policy = policy
             self.self_id = None
             captured["instance"] = self
