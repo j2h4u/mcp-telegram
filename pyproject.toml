@@ -42,6 +42,7 @@ dev = [
     "pytest-crap>=0.3.0",
     "radon>=6.0.1",
     "deptry>=0.25.1",
+    "tach>=0.35",
 ]
 
 [project.scripts]
@@ -177,6 +178,8 @@ asyncio_mode = "auto"
 addopts = [
   "--strict-config",
   "--strict-markers",
+  "-p",
+  "no:tach",
   "-W",
   "error",
 ]

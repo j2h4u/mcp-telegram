@@ -15,12 +15,12 @@ from telethon.tl.functions.contacts import ResolveUsernameRequest  # type: ignor
 
 from .activity_peer_resolve import resolve_linked_chat_id
 from .activity_peer_sweep import enroll_activity_dialog
-from .dialog_sync import _ACCESS_LOST_ERRORS
 from .message_contracts import ExtractedMessage
 from .messages.sqlite_repository import insert_messages_with_fts
 from .messages.telegram_adapter import extract_message_row
 from .models import DialogType
 from .resolver import Candidates, Resolved, _parse_tme_link, latinize, resolve
+from .telegram_access import ACCESS_LOST_ERRORS
 from .telethon_dialog import classify_dialog_type
 
 _TRACE_SCOPE_DIALOG_IDS_LEN = 2
@@ -1359,7 +1359,7 @@ async def _trace_enrich_candidate_messages(
             )
         )
         return fetched, "flood_wait"
-    except _ACCESS_LOST_ERRORS as exc:
+    except ACCESS_LOST_ERRORS as exc:
         _upsert_trace_coverage_fragment(
             _TraceCoverageFragmentUpsertRequest(
                 conn=request.conn,

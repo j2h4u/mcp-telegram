@@ -16,6 +16,7 @@ from enum import StrEnum
 from typing import cast
 
 from .models import DialogType
+from .sync_db import ensure_own_only_schema
 
 
 class OwnOnlyBasis(StrEnum):
@@ -128,23 +129,9 @@ WHERE (
 ORDER BY dialog_id
 """
 
-_OWN_ONLY_DIALOGS_DDL = """
-CREATE TABLE IF NOT EXISTS own_only_dialogs (
-    dialog_id       INTEGER PRIMARY KEY,
-    inclusion_basis TEXT NOT NULL,
-    updated_at      INTEGER NOT NULL
-)
-"""
-
 
 def _as_int(value: object) -> int:
     return int(cast(int | str, value))
-
-
-def ensure_own_only_schema(conn: sqlite3.Connection) -> None:
-    """Create the ownership cache used by scheduled reconciliation and reads."""
-    conn.execute(_OWN_ONLY_DIALOGS_DDL)
-    conn.commit()
 
 
 def enroll_own_only_dialog(

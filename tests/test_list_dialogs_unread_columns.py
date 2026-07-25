@@ -26,7 +26,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from mcp_telegram.daemon_api import DaemonAPIServer, _DaemonClientLike
+from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike
 from tests.daemon_api_policy import make_daemon_api_policy
 from tests.reaction_helpers import make_reaction_freshener
 
@@ -197,7 +197,7 @@ def _insert_message(
 def _make_server(conn: sqlite3.Connection, client: object) -> DaemonAPIServer:
     server = DaemonAPIServer(
         conn,
-        cast(_DaemonClientLike, client),
+        cast(DaemonClientLike, client),
         asyncio.Event(),
         reaction_freshener=make_reaction_freshener(conn, client),
         policy=make_daemon_api_policy(),

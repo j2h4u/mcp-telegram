@@ -43,6 +43,14 @@ typecheck-tests:
 import-contracts:
     uv run lint-imports
 
+# Check the declared ideal module graph. Advisory until docs/architecture-cleanup.md is empty.
+module-boundaries:
+    uv run tach check
+
+# Emit a local dependency map for architecture cleanup work.
+module-map:
+    uv run tach map -o tach-module-map.json
+
 # Check that operator-controlled policy remains in typed config and is injected.
 policy-placement:
     uv run python scripts/check_policy_placement.py

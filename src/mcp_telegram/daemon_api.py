@@ -174,7 +174,7 @@ class _LoggerLike(Protocol):
     def exception(self, msg: str, *_args: object, **_kwargs: object) -> None: ...
 
 
-class _DaemonClientLike(Protocol):
+class DaemonClientLike(Protocol):
     async def get_entity(self, entity_id: str | int) -> object: ...
 
     def iter_dialogs(self) -> AsyncIterator[object]: ...
@@ -384,7 +384,7 @@ class DaemonAPIServer:
     def __init__(  # noqa: PLR0913
         self,
         conn: sqlite3.Connection,
-        client: _DaemonClientLike,
+        client: DaemonClientLike,
         shutdown_event: asyncio.Event,
         feedback_conn: sqlite3.Connection | None = None,
         sync_db_path: Path | None = None,
@@ -1173,7 +1173,7 @@ class DaemonAPIServer:
         service = DaemonEntityInfoService(
             EntityInfoDeps(
                 conn=self._conn,
-                client=cast(_DaemonClientLike, self._client),
+                client=cast(DaemonClientLike, self._client),
                 dm_peer_ids=self._dm_peer_ids,
                 get_peer_id=telethon_utils.get_peer_id,
                 rid=_rid,

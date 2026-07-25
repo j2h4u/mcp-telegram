@@ -82,7 +82,7 @@ rationale = "This CLI argument default bounds local feedback listing output."
 
 [[entry]]
 category = "policy_defaults"
-key = "src/mcp_telegram/daemon_api.py:_DaemonClientLike.iter_participants:limit"
+key = "src/mcp_telegram/daemon_api.py:DaemonClientLike.iter_participants:limit"
 rationale = "This protocol method's participant limit is an interface request contract."
 
 [[entry]]

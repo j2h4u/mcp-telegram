@@ -5,9 +5,8 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Mapping
 from typing import Protocol, cast
 
-from .daemon_message import _MessageLike as _DaemonMessageLike
-from .daemon_message import message_to_dict
 from .telegram_gateway import CATCHABLE_GATEWAY_FAILURES, translate_gateway_failure
+from .telegram_message_projection import MessageLike, message_to_dict
 from .telegram_reading import HistoryFetchResult
 
 
@@ -24,7 +23,7 @@ class TelethonTelegramHistoryGateway:
     ) -> HistoryFetchResult:
         try:
             messages = [
-                message_to_dict(cast(_DaemonMessageLike, message), dialog_id=dialog_id, self_id=self_id)
+                message_to_dict(cast(MessageLike, message), dialog_id=dialog_id, self_id=self_id)
                 async for message in self._client.iter_messages(dialog_id, **dict(kwargs))
             ]
             return HistoryFetchResult(messages=tuple(messages))

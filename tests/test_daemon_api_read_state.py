@@ -21,7 +21,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from mcp_telegram.daemon_api import DaemonAPIServer, _DaemonClientLike
+from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike
 from mcp_telegram.daemon_read_state_queries import _dialog_type_from_db, _read_state_for_dialog
 from mcp_telegram.telethon_dialog import classify_dialog_type
 from tests.daemon_api_policy import make_daemon_api_policy
@@ -244,7 +244,7 @@ def make_server(
     shutdown_event = asyncio.Event()
     return DaemonAPIServer(
         conn,
-        cast(_DaemonClientLike, client),
+        cast(DaemonClientLike, client),
         shutdown_event,
         reaction_freshener=make_reaction_freshener(conn, client),
         policy=make_daemon_api_policy(),

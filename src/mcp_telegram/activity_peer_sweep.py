@@ -31,10 +31,11 @@ from telethon.tl.types import TypeInputPeer
 
 from .activity_peer_resolve import LinkedChatResolution, resolve_input_peer, resolve_linked_chat_id
 from .activity_sync import INSERT_OWN_ONLY_DIALOG_SQL, _ActivityClient, call_with_timeout, extract_dialog_id
-from .dialog_sync import _ACCESS_LOST_ERRORS, _set_access_lost
 from .message_contracts import ExtractedMessage
 from .messages.sqlite_repository import insert_messages_with_fts
 from .messages.telegram_adapter import extract_message_row
+from .sync_db import set_access_lost
+from .telegram_access import ACCESS_LOST_ERRORS
 
 logger = logging.getLogger(__name__)
 
@@ -248,8 +249,8 @@ async def _search_self_messages(request: PeerSweepRequest, peer: TypeInputPeer) 
             rpc_duration_s=_elapsed_s(search_started_at),
             early_result=_access_skip_result(),
         )
-    except _ACCESS_LOST_ERRORS as exc:
-        _set_access_lost(request.conn, request.dialog_id, int(time.time()))
+    except ACCESS_LOST_ERRORS as exc:
+        set_access_lost(request.conn, request.dialog_id, int(time.time()))
         logger.info(
             "sweep_peer_once_access_lost dialog_id=%r error_type=%s rpc_duration_s=%.3f",
             request.dialog_id,

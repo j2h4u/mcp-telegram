@@ -20,7 +20,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from mcp_telegram.daemon_api import DaemonAPIServer, _DaemonClientLike, _ResolverEntityCache
+from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike, _ResolverEntityCache
 from mcp_telegram.daemon_dialog_queries import _compute_sync_coverage
 from mcp_telegram.daemon_ipc import get_daemon_socket_path
 from mcp_telegram.daemon_message import _MessageLike, fetch_reaction_counts, message_to_dict
@@ -317,7 +317,7 @@ def make_server(
     shutdown_event = asyncio.Event()
     server = DaemonAPIServer(
         conn,
-        cast(_DaemonClientLike, client),
+        cast(DaemonClientLike, client),
         shutdown_event,
         feedback_conn,
         reaction_freshener=make_reaction_freshener(conn, client),
@@ -335,7 +335,7 @@ def test_daemon_api_server_uses_explicit_sync_db_path(tmp_path: Path) -> None:
 
     server = DaemonAPIServer(
         conn,
-        cast(_DaemonClientLike, client),
+        cast(DaemonClientLike, client),
         asyncio.Event(),
         sync_db_path=sync_db_path,
         reaction_freshener=make_reaction_freshener(conn, client),
