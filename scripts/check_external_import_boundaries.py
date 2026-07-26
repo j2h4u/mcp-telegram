@@ -21,6 +21,10 @@ SOURCE_ROOT = ROOT / "src" / "mcp_telegram"
 # These exact package-relative paths are the import owners at the time this
 # gate was introduced.  No parent-directory or glob matching is intentional.
 ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
+    # Process spawning and raw socket access have no production owners.  Keep
+    # them explicit so any future use requires an architecture decision.
+    "socket": frozenset(),
+    "subprocess": frozenset(),
     "sqlite3": frozenset(
         {
             "__init__.py",
@@ -99,7 +103,7 @@ class ExternalImport:
 
 
 def find_external_imports(source: str) -> list[ExternalImport]:
-    """Return direct Telethon and sqlite imports, including nested imports."""
+    """Return direct policy-controlled imports, including nested imports."""
     imports: list[ExternalImport] = []
     for node in ast.walk(ast.parse(source)):
         if isinstance(node, ast.Import):

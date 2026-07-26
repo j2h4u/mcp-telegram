@@ -77,7 +77,7 @@ def test_stale_allowlist_entry_is_rejected(tmp_path: Path) -> None:
     ]
 
 
-def test_alias_and_dotted_import_forms_are_detected() -> None:
+def test_alias_and_dotted_import_forms_are_detected_for_all_controlled_dependencies() -> None:
     gate = _load_gate()
 
     imports = gate.find_external_imports(
@@ -86,6 +86,10 @@ def test_alias_and_dotted_import_forms_are_detected() -> None:
         "from telethon.tl import types\n"
         "import sqlite3 as db\n"
         "from sqlite3 import connect\n"
+        "import socket.socket as socket_constructor\n"
+        "from socket import socket\n"
+        "import subprocess.run as run_module\n"
+        "from subprocess import run\n"
     )
 
     assert [(item.dependency, item.line) for item in imports] == [
@@ -94,6 +98,10 @@ def test_alias_and_dotted_import_forms_are_detected() -> None:
         ("telethon", 3),
         ("sqlite3", 4),
         ("sqlite3", 5),
+        ("socket", 6),
+        ("socket", 7),
+        ("subprocess", 8),
+        ("subprocess", 9),
     ]
 
 
@@ -106,9 +114,32 @@ def test_nested_and_type_checking_imports_are_detected() -> None:
         "    from telethon import TelegramClient\n"
         "def open_connection():\n"
         "    import sqlite3\n"
+        "    from socket import create_connection\n"
+        "def spawn_process():\n"
+        "    import subprocess\n"
     )
 
-    assert [(item.dependency, item.line) for item in imports] == [("telethon", 3), ("sqlite3", 5)]
+    assert [(item.dependency, item.line) for item in imports] == [
+        ("telethon", 3),
+        ("sqlite3", 5),
+        ("socket", 6),
+        ("subprocess", 8),
+    ]
+
+
+def test_forbidden_subprocess_and_socket_imports_have_clear_diagnostics() -> None:
+    gate = _load_gate()
+    path = gate.SOURCE_ROOT / "not_an_owner.py"
+
+    assert gate.violations_for(
+        path,
+        "import subprocess\nfrom socket import socket\n",
+        allowed_importer_paths=gate.ALLOWED_IMPORTER_PATHS,
+        source_root=gate.SOURCE_ROOT,
+    ) == [
+        "src/mcp_telegram/not_an_owner.py:1: unexpected subprocess import owner",
+        "src/mcp_telegram/not_an_owner.py:2: unexpected socket import owner",
+    ]
 
 
 def test_comments_and_strings_do_not_trigger_detection() -> None:
@@ -116,7 +147,10 @@ def test_comments_and_strings_do_not_trigger_detection() -> None:
 
     assert (
         gate.find_external_imports(
-            "# import telethon\nexample = \"from sqlite3 import connect\"\ndocument = '''import telethon.tl'''\n"
+            "# import telethon, socket, and subprocess\n"
+            'example = "from sqlite3 import connect; import socket"\n'
+            "document = '''import telethon.tl; from subprocess import run'''\n"
+            "reader, writer = await asyncio.open_unix_connection('/tmp/mcp.sock')\n"
         )
         == []
     )
