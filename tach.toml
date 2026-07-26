@@ -1,9 +1,8 @@
-# Module boundaries, enforced by Tach (https://github.com/tach-org/tach).
+# Enforced module boundaries for the brownfield modular monolith.
 #
-# THIS FILE DECLARES THE IDEAL ARCHITECTURE, NOT TODAY'S REALITY.
-# `just module-boundaries` is expected to be red while the modular-monolith
-# cleanup is in progress. Failures are architecture debt, not edges to
-# normalize into the graph.
+# This is a green current-state ratchet, not an aspirational graph.  Every
+# dependency is explicit; temporary exceptions are named `deprecated` edges
+# with a removal condition in docs/architecture-cleanup.md.
 
 source_roots = ["src"]
 root_module = "forbid"
@@ -12,411 +11,485 @@ layers_explicit_depends_on = true
 forbid_circular_dependencies = true
 ignore_type_checking_imports = false
 
-# Highest first. Higher layers may depend downward only through explicitly
-# declared edges. Same-layer edges are also explicit. Upward edges are wrong.
 layers = [
-    "delivery",          # CLI/MCP/server transports and agent-facing tools
-    "composition",       # process roots; the only layer that wires concretes
-    "application",       # use cases, read facades, background orchestration
-    "capability",        # vertical product/domain behavior
-    "telegram_gateway",  # Telethon anti-corruption adapters and live fact I/O
-    "persistence",       # SQLite schema, repositories, local read models
-    "foundation",        # pure contracts, config, formatting, errors, utilities
+    "delivery",
+    "composition",
+    "application",
+    "capability",
+    "telegram_gateway",
+    "persistence",
+    "foundation",
 ]
 
 [rules]
 unused_ignore_directives = "warn"
 require_ignore_directive_reasons = "error"
 
-# ---------------------------------------------------------------------------
-# delivery — presentation/transports. No TelegramClient and no SQLite.
-# ---------------------------------------------------------------------------
+# delivery — inbound transports only.
+[[modules]]
+path = "mcp_telegram"
+layer = "delivery"
+depends_on = ["mcp_telegram.config", "mcp_telegram.daemon", "mcp_telegram.daemon_client", "mcp_telegram.feedback_db", "mcp_telegram.server", "mcp_telegram.telegram"]
 
 [[modules]]
 path = "mcp_telegram.server"
 layer = "delivery"
-depends_on = [
-    "mcp_telegram.tools",
-    "mcp_telegram.correlation",
-]
+depends_on = ["mcp_telegram.config", "mcp_telegram.correlation", "mcp_telegram.daemon_client", "mcp_telegram.tools"]
 
 [[modules]]
 path = "mcp_telegram.tools"
 layer = "delivery"
-depends_on = [
-    "mcp_telegram.daemon_client",
-    "mcp_telegram.daemon_ipc",
-    "mcp_telegram.models",
-    "mcp_telegram.resolver",
-    "mcp_telegram.formatter",
-    "mcp_telegram.pagination",
-    "mcp_telegram.budget",
-    "mcp_telegram.errors",
-    "mcp_telegram.temporal",
-    "mcp_telegram.correlation",
-]
+depends_on = ["mcp_telegram.daemon_client", "mcp_telegram.errors", "mcp_telegram.formatter", "mcp_telegram.models", "mcp_telegram.pagination", "mcp_telegram.resolver", "mcp_telegram.temporal"]
 cannot_depend_on = [
-    "mcp_telegram.daemon",
-    "mcp_telegram.daemon_api",
-    "mcp_telegram.telegram",
-    "mcp_telegram.sync_db",
-    "mcp_telegram.messages.telegram_adapter",
-    "mcp_telegram.messages.sqlite_repository",
-    "mcp_telegram.folders.telegram_adapter",
-    "mcp_telegram.folders.sqlite_repository",
-    "mcp_telegram.reactions.telegram_adapter",
-    "mcp_telegram.reactions.sqlite_repository",
-    "mcp_telegram.topics.telegram_adapter",
-    "mcp_telegram.topics.sqlite_repository",
+    "mcp_telegram.daemon", "mcp_telegram.daemon_api", "mcp_telegram.feedback_db",
+    "mcp_telegram.folders.sqlite_repository", "mcp_telegram.folders.telegram_adapter",
+    "mcp_telegram.messages.sqlite_repository", "mcp_telegram.messages.telegram_adapter",
+    "mcp_telegram.reactions.sqlite_repository", "mcp_telegram.reactions.telegram_adapter",
+    "mcp_telegram.sync_db", "mcp_telegram.telegram",
+    "mcp_telegram.topics.sqlite_repository", "mcp_telegram.topics.telegram_adapter",
 ]
 
-[[modules]]
-path = "mcp_telegram"
-layer = "delivery"
-depends_on = [
-    "mcp_telegram.config",
-    "mcp_telegram.daemon",
-    "mcp_telegram.server",
-    "mcp_telegram.telegram",
-    "mcp_telegram.state",
-    "mcp_telegram.feedback_db",
-]
-
-# ---------------------------------------------------------------------------
-# composition — process wiring. Concretes meet here and nowhere else.
-# ---------------------------------------------------------------------------
-
+# composition — sole Telegram client, lifecycle, and writable-state owner.
 [[modules]]
 path = "mcp_telegram.daemon"
 layer = "composition"
 depends_on = [
-    "mcp_telegram.config",
-    "mcp_telegram.daemon_api",
-    "mcp_telegram.telegram",
-    "mcp_telegram.state",
-    "mcp_telegram.sync_db",
-    "mcp_telegram.feedback_db",
-    "mcp_telegram.fts",
-    "mcp_telegram.event_handlers",
-    "mcp_telegram.dialog_sync",
-    "mcp_telegram.sync_worker",
-    "mcp_telegram.delta_sync",
-    "mcp_telegram.read_state",
-    "mcp_telegram.scheduled_messages",
-    "mcp_telegram.own_only",
-    "mcp_telegram.activity_sync",
-    "mcp_telegram.activity_hot_sweep",
-    "mcp_telegram.activity_cold_backfill",
-    "mcp_telegram.folders.refresh",
-    "mcp_telegram.folders.sqlite_repository",
-    "mcp_telegram.folders.telegram_adapter",
-    "mcp_telegram.messages.sqlite_repository",
-    "mcp_telegram.messages.telegram_adapter",
-    "mcp_telegram.reactions.refresh",
-    "mcp_telegram.reactions.sqlite_repository",
-    "mcp_telegram.reactions.telegram_adapter",
-    "mcp_telegram.topics.refresh",
-    "mcp_telegram.topics.sqlite_repository",
-    "mcp_telegram.topics.telegram_adapter",
-    "mcp_telegram.telegram_history",
-    "mcp_telegram.telegram_fragments",
-    "mcp_telegram.telegram_read_receipts",
-    "mcp_telegram.flood",
+    "mcp_telegram.activity_cold_backfill", "mcp_telegram.activity_hot_sweep", "mcp_telegram.activity_sync",
+    "mcp_telegram.config", "mcp_telegram.daemon_api", "mcp_telegram.delta_sync", "mcp_telegram.dialog_sync",
+    "mcp_telegram.event_handlers", "mcp_telegram.feedback_db", "mcp_telegram.flood", "mcp_telegram.folders.contracts",
+    "mcp_telegram.folders.refresh", "mcp_telegram.folders.sqlite_repository", "mcp_telegram.folders.telegram_adapter",
+    "mcp_telegram.fts", "mcp_telegram.messages.sqlite_repository", "mcp_telegram.messages.telegram_adapter",
+    "mcp_telegram.own_only", "mcp_telegram.read_state", "mcp_telegram.reactions.refresh",
+    "mcp_telegram.reactions.sqlite_repository", "mcp_telegram.reactions.telegram_adapter", "mcp_telegram.scheduled_messages",
+    "mcp_telegram.state", "mcp_telegram.sync_db", "mcp_telegram.sync_worker", "mcp_telegram.telegram",
+    "mcp_telegram.topics.refresh", "mcp_telegram.topics.sqlite_repository", "mcp_telegram.topics.telegram_adapter",
 ]
 
-# ---------------------------------------------------------------------------
-# application — use cases and read projections.
-# ---------------------------------------------------------------------------
-
+# application — each horizontal worker/facade has its own narrow declaration.
 [[modules]]
 path = "mcp_telegram.daemon_api"
 layer = "application"
 depends_on = [
-    "mcp_telegram.daemon_client",
-    "mcp_telegram.daemon_account_trace",
-    "mcp_telegram.daemon_activity_stats",
-    "mcp_telegram.daemon_dialog_queries",
-    "mcp_telegram.daemon_entity_info",
-    "mcp_telegram.daemon_message",
-    "mcp_telegram.daemon_message_queries",
-    "mcp_telegram.daemon_read_state_queries",
-    "mcp_telegram.daemon_reading",
-    "mcp_telegram.daemon_scheduled_queries",
-    "mcp_telegram.daemon_source_export",
-    "mcp_telegram.folders.contracts",
-    "mcp_telegram.reactions.contracts",
-    "mcp_telegram.topics.contracts",
-    "mcp_telegram.telegram_fact_queries",
-    "mcp_telegram.telegram_fragments",
-    "mcp_telegram.telegram_history",
-    "mcp_telegram.telegram_read_receipts",
-    "mcp_telegram.models",
-    "mcp_telegram.formatter",
-    "mcp_telegram.resolver",
-    "mcp_telegram.errors",
-    "mcp_telegram.correlation",
+    "mcp_telegram.budget", "mcp_telegram.daemon_account_trace", "mcp_telegram.daemon_activity_stats",
+    "mcp_telegram.daemon_dialog_queries", "mcp_telegram.daemon_entity_info", "mcp_telegram.daemon_message",
+    "mcp_telegram.daemon_message_queries", "mcp_telegram.daemon_read_state_queries", "mcp_telegram.daemon_reading",
+    "mcp_telegram.daemon_source_export", "mcp_telegram.formatter",
+    { path = "mcp_telegram.feedback_db", deprecated = true }, "mcp_telegram.models", "mcp_telegram.pagination",
+    "mcp_telegram.reactions.contracts", "mcp_telegram.reactions.refresh", "mcp_telegram.resolver",
+    "mcp_telegram.telegram_fact_queries", "mcp_telegram.telegram_fragments", "mcp_telegram.telegram_history",
+    "mcp_telegram.telegram_read_receipts", "mcp_telegram.topics.contracts", "mcp_telegram.topics.refresh",
+    { path = "mcp_telegram.folders.sqlite_repository", deprecated = true },
+]
+cannot_depend_on = [
+    "mcp_telegram.folders.telegram_adapter", "mcp_telegram.messages.sqlite_repository", "mcp_telegram.messages.telegram_adapter",
+    "mcp_telegram.reactions.sqlite_repository", "mcp_telegram.reactions.telegram_adapter",
+    "mcp_telegram.topics.sqlite_repository", "mcp_telegram.topics.telegram_adapter",
 ]
 
 [[modules]]
-paths = [
-    "mcp_telegram.daemon_account_trace",
-    "mcp_telegram.daemon_activity_stats",
-    "mcp_telegram.daemon_dialog_queries",
-    "mcp_telegram.daemon_entity_info",
-    "mcp_telegram.daemon_message",
-    "mcp_telegram.daemon_message_queries",
-    "mcp_telegram.daemon_read_state_queries",
-    "mcp_telegram.daemon_reading",
-    "mcp_telegram.daemon_scheduled_queries",
-    "mcp_telegram.daemon_source_export",
-    "mcp_telegram.scheduled_messages",
-    "mcp_telegram.own_only",
-    "mcp_telegram.activity_sync",
-    "mcp_telegram.activity_hot_sweep",
-    "mcp_telegram.activity_cold_backfill",
-    "mcp_telegram.activity_peer_sweep",
-    "mcp_telegram.activity_peer_resolve",
-    "mcp_telegram.dialog_sync",
-    "mcp_telegram.sync_worker",
-    "mcp_telegram.delta_sync",
-    "mcp_telegram.event_handlers",
-]
+path = "mcp_telegram.daemon_account_trace"
+layer = "application"
+depends_on = ["mcp_telegram.activity_peer_resolve", "mcp_telegram.activity_peer_sweep", "mcp_telegram.message_contracts", "mcp_telegram.messages.sqlite_repository", "mcp_telegram.messages.telegram_adapter", "mcp_telegram.models", "mcp_telegram.pagination", "mcp_telegram.resolver", "mcp_telegram.telegram_access", "mcp_telegram.telethon_dialog"]
+
+[[modules]]
+path = "mcp_telegram.daemon_activity_stats"
+layer = "application"
+depends_on = []
+cannot_depend_on = ["mcp_telegram.folders.sqlite_repository", "mcp_telegram.messages.sqlite_repository", "mcp_telegram.reactions.sqlite_repository", "mcp_telegram.topics.sqlite_repository"]
+
+[[modules]]
+path = "mcp_telegram.daemon_dialog_queries"
+layer = "application"
+depends_on = []
+cannot_depend_on = ["mcp_telegram.folders.sqlite_repository", "mcp_telegram.messages.sqlite_repository", "mcp_telegram.reactions.sqlite_repository", "mcp_telegram.topics.sqlite_repository"]
+
+[[modules]]
+path = "mcp_telegram.daemon_entity_info"
+layer = "application"
+depends_on = ["mcp_telegram.models", "mcp_telegram.telethon_dialog"]
+
+[[modules]]
+path = "mcp_telegram.daemon_message"
+layer = "application"
+depends_on = ["mcp_telegram.telegram_message_projection"]
+
+[[modules]]
+path = "mcp_telegram.daemon_message_queries"
+layer = "application"
+depends_on = ["mcp_telegram.models"]
+cannot_depend_on = ["mcp_telegram.messages.sqlite_repository", "mcp_telegram.messages.telegram_adapter"]
+
+[[modules]]
+path = "mcp_telegram.daemon_read_state_queries"
+layer = "application"
+depends_on = ["mcp_telegram.models"]
+
+[[modules]]
+path = "mcp_telegram.daemon_reading"
 layer = "application"
 depends_on = [
-    "mcp_telegram.models",
-    "mcp_telegram.message_contracts",
-    "mcp_telegram.telegram_reading",
-    "mcp_telegram.folders.contracts",
-    "mcp_telegram.folders.membership",
-    "mcp_telegram.folders.refresh",
-    "mcp_telegram.folders.ports",
-    "mcp_telegram.folders.sqlite_repository",
-    "mcp_telegram.folders.telegram_adapter",
-    "mcp_telegram.messages.sqlite_repository",
-    "mcp_telegram.messages.telegram_adapter",
-    "mcp_telegram.reactions.contracts",
-    "mcp_telegram.reactions.persistence",
-    "mcp_telegram.reactions.projection",
-    "mcp_telegram.reactions.refresh",
-    "mcp_telegram.reactions.ports",
-    "mcp_telegram.reactions.sqlite_repository",
-    "mcp_telegram.reactions.telegram_adapter",
-    "mcp_telegram.topics.contracts",
-    "mcp_telegram.topics.refresh",
-    "mcp_telegram.topics.ports",
-    "mcp_telegram.topics.sqlite_repository",
-    "mcp_telegram.topics.telegram_adapter",
-    "mcp_telegram.telegram_fact_queries",
-    "mcp_telegram.telegram_fragments",
-    "mcp_telegram.telegram_access",
-    "mcp_telegram.telegram_gateway",
-    "mcp_telegram.telegram_history",
-    "mcp_telegram.telegram_message_projection",
-    "mcp_telegram.telegram_read_receipts",
-    "mcp_telegram.sync_db",
-    "mcp_telegram.fts",
-    "mcp_telegram.read_state",
-    "mcp_telegram.flood",
-    "mcp_telegram.telethon_dialog",
-    "mcp_telegram.telethon_message",
-    "mcp_telegram.telethon_media",
-    "mcp_telegram.resolver",
-    "mcp_telegram.formatter",
-    "mcp_telegram.pagination",
-    "mcp_telegram.budget",
-    "mcp_telegram.errors",
-    "mcp_telegram.temporal",
-    "mcp_telegram.correlation",
+    { path = "mcp_telegram.daemon_account_trace", deprecated = true },
+    { path = "mcp_telegram.daemon_activity_stats", deprecated = true },
+    { path = "mcp_telegram.daemon_dialog_queries", deprecated = true }, "mcp_telegram.daemon_message",
+    { path = "mcp_telegram.daemon_message_queries", deprecated = true },
+    { path = "mcp_telegram.daemon_read_state_queries", deprecated = true }, "mcp_telegram.daemon_scheduled_queries",
+    "mcp_telegram.formatter", "mcp_telegram.fts", "mcp_telegram.models", "mcp_telegram.own_only", "mcp_telegram.pagination",
+    "mcp_telegram.reactions.contracts", "mcp_telegram.reactions.refresh", "mcp_telegram.resolver", "mcp_telegram.sync_db",
+    "mcp_telegram.telegram_fact_queries", "mcp_telegram.telegram_fragments", "mcp_telegram.telegram_reading", "mcp_telegram.temporal",
 ]
-
-# ---------------------------------------------------------------------------
-# capability — vertical product behavior, independent of concrete I/O.
-# ---------------------------------------------------------------------------
+cannot_depend_on = ["mcp_telegram.folders.sqlite_repository", "mcp_telegram.messages.sqlite_repository", "mcp_telegram.reactions.sqlite_repository", "mcp_telegram.topics.sqlite_repository"]
 
 [[modules]]
-paths = [
-    "mcp_telegram.messages",
-    "mcp_telegram.folders",
-    "mcp_telegram.reactions",
-    "mcp_telegram.topics",
+path = "mcp_telegram.daemon_scheduled_queries"
+layer = "application"
+depends_on = [{ path = "mcp_telegram.daemon_message_queries", deprecated = true }]
+
+[[modules]]
+path = "mcp_telegram.daemon_source_export"
+layer = "application"
+depends_on = []
+
+[[modules]]
+path = "mcp_telegram.scheduled_messages"
+layer = "application"
+depends_on = ["mcp_telegram.activity_peer_resolve", { path = "mcp_telegram.activity_sync", deprecated = true }, "mcp_telegram.fts", "mcp_telegram.message_contracts", "mcp_telegram.messages.telegram_adapter", "mcp_telegram.own_only"]
+
+[[modules]]
+path = "mcp_telegram.own_only"
+layer = "application"
+depends_on = ["mcp_telegram.models", "mcp_telegram.sync_db"]
+
+[[modules]]
+path = "mcp_telegram.activity_sync"
+layer = "application"
+depends_on = ["mcp_telegram.flood", "mcp_telegram.message_contracts", "mcp_telegram.messages.sqlite_repository", "mcp_telegram.messages.telegram_adapter", "mcp_telegram.models", "mcp_telegram.telethon_dialog"]
+
+[[modules]]
+path = "mcp_telegram.activity_peer_resolve"
+layer = "application"
+depends_on = [{ path = "mcp_telegram.activity_sync", deprecated = true }]
+
+[[modules]]
+path = "mcp_telegram.activity_peer_sweep"
+layer = "application"
+depends_on = ["mcp_telegram.activity_peer_resolve", { path = "mcp_telegram.activity_sync", deprecated = true }, "mcp_telegram.message_contracts", "mcp_telegram.messages.sqlite_repository", "mcp_telegram.messages.telegram_adapter", "mcp_telegram.sync_db", "mcp_telegram.telegram_access"]
+
+[[modules]]
+path = "mcp_telegram.activity_hot_sweep"
+layer = "application"
+depends_on = ["mcp_telegram.activity_peer_sweep", { path = "mcp_telegram.activity_sync", deprecated = true }]
+
+[[modules]]
+path = "mcp_telegram.activity_cold_backfill"
+layer = "application"
+depends_on = ["mcp_telegram.activity_peer_sweep", { path = "mcp_telegram.activity_sync", deprecated = true }]
+
+[[modules]]
+path = "mcp_telegram.dialog_sync"
+layer = "application"
+depends_on = ["mcp_telegram.flood", "mcp_telegram.sync_db", "mcp_telegram.telegram_access", "mcp_telegram.topics.contracts", "mcp_telegram.topics.refresh"]
+
+[[modules]]
+path = "mcp_telegram.sync_worker"
+layer = "application"
+depends_on = ["mcp_telegram.flood", "mcp_telegram.messages.sqlite_repository", "mcp_telegram.messages.telegram_adapter", "mcp_telegram.resolver", "mcp_telegram.sync_db", "mcp_telegram.telegram_access", "mcp_telegram.telethon_dialog"]
+
+[[modules]]
+path = "mcp_telegram.delta_sync"
+layer = "application"
+depends_on = ["mcp_telegram.flood", "mcp_telegram.message_contracts", "mcp_telegram.messages.sqlite_repository", "mcp_telegram.messages.telegram_adapter", "mcp_telegram.sync_db", "mcp_telegram.telegram_access"]
+
+[[modules]]
+path = "mcp_telegram.event_handlers"
+layer = "application"
+depends_on = [
+    { path = "mcp_telegram.activity_peer_resolve", deprecated = true }, "mcp_telegram.fts", "mcp_telegram.messages.sqlite_repository",
+    "mcp_telegram.messages.telegram_adapter", "mcp_telegram.reactions.persistence", "mcp_telegram.reactions.projection",
+    "mcp_telegram.read_state", "mcp_telegram.resolver", "mcp_telegram.scheduled_messages",
+    { path = "mcp_telegram.sync_worker", deprecated = true }, "mcp_telegram.telethon_dialog",
 ]
+
+# capability — only established product ownership is vertical.
+[[modules]]
+path = "mcp_telegram.messages"
 layer = "capability"
 depends_on = []
 
 [[modules]]
-paths = [
-    "mcp_telegram.folders.membership",
-    "mcp_telegram.folders.refresh",
-    "mcp_telegram.reactions.refresh",
-    "mcp_telegram.topics.refresh",
-]
+path = "mcp_telegram.folders"
 layer = "capability"
-depends_on = [
-    "mcp_telegram.folders.contracts",
-    "mcp_telegram.folders.ports",
-    "mcp_telegram.reactions.contracts",
-    "mcp_telegram.reactions.ports",
-    "mcp_telegram.topics.contracts",
-    "mcp_telegram.topics.ports",
-]
+depends_on = []
 
-# ---------------------------------------------------------------------------
-# telegram_gateway — live Telegram and Telethon-shaped facts.
-# ---------------------------------------------------------------------------
+[[modules]]
+path = "mcp_telegram.folders.membership"
+layer = "capability"
+depends_on = ["mcp_telegram.folders.contracts"]
 
+[[modules]]
+path = "mcp_telegram.folders.refresh"
+layer = "capability"
+depends_on = ["mcp_telegram.folders.membership", "mcp_telegram.folders.ports"]
+
+[[modules]]
+path = "mcp_telegram.reactions"
+layer = "capability"
+depends_on = []
+
+[[modules]]
+path = "mcp_telegram.reactions.refresh"
+layer = "capability"
+depends_on = ["mcp_telegram.reactions.contracts", "mcp_telegram.reactions.ports"]
+
+[[modules]]
+path = "mcp_telegram.topics"
+layer = "capability"
+depends_on = []
+
+[[modules]]
+path = "mcp_telegram.topics.refresh"
+layer = "capability"
+depends_on = ["mcp_telegram.topics.contracts", "mcp_telegram.topics.ports"]
+
+# telegram_gateway — Telethon projection and live fact adapters.
 [[modules]]
 path = "mcp_telegram.telegram_access"
 layer = "telegram_gateway"
 depends_on = []
-utility = true
 
 [[modules]]
 path = "mcp_telegram.telegram_gateway"
 layer = "telegram_gateway"
-depends_on = [
-    "mcp_telegram.telegram_access",
-    "mcp_telegram.telegram_reading",
-]
+depends_on = ["mcp_telegram.telegram_access", "mcp_telegram.telegram_reading"]
 
 [[modules]]
-path = "mcp_telegram.telegram_message_projection"
+path = "mcp_telegram.telegram"
 layer = "telegram_gateway"
-depends_on = [
-    "mcp_telegram.formatter",
-    "mcp_telegram.messages.telegram_adapter",
-    "mcp_telegram.telethon_media",
-    "mcp_telegram.telethon_message",
-]
+depends_on = ["mcp_telegram.config", "mcp_telegram.state"]
 
 [[modules]]
-path = "mcp_telegram.reactions.projection"
+path = "mcp_telegram.telegram_fact_queries"
 layer = "telegram_gateway"
-depends_on = [
-    "mcp_telegram.reactions.contracts",
-]
+depends_on = ["mcp_telegram.models", "mcp_telegram.telegram_gateway", "mcp_telegram.telegram_reading"]
+
+[[modules]]
+path = "mcp_telegram.telegram_fragments"
+layer = "telegram_gateway"
+depends_on = ["mcp_telegram.telegram_gateway", "mcp_telegram.telegram_reading", { path = "mcp_telegram.messages.sqlite_repository", deprecated = true }, "mcp_telegram.messages.telegram_adapter"]
 
 [[modules]]
 path = "mcp_telegram.telegram_history"
 layer = "telegram_gateway"
-depends_on = [
-    "mcp_telegram.telegram_gateway",
-    "mcp_telegram.telegram_message_projection",
-    "mcp_telegram.telegram_reading",
-]
+depends_on = ["mcp_telegram.telegram_gateway", "mcp_telegram.telegram_message_projection", "mcp_telegram.telegram_reading"]
 
 [[modules]]
-paths = [
-    "mcp_telegram.telegram",
-    "mcp_telegram.telegram_fact_queries",
-    "mcp_telegram.telegram_fragments",
-    "mcp_telegram.telegram_read_receipts",
-    "mcp_telegram.telethon_dialog",
-    "mcp_telegram.telethon_media",
-    "mcp_telegram.telethon_message",
-    "mcp_telegram.folders.telegram_adapter",
-    "mcp_telegram.messages.telegram_adapter",
-    "mcp_telegram.reactions.telegram_adapter",
-    "mcp_telegram.topics.telegram_adapter",
-]
+path = "mcp_telegram.telegram_message_projection"
 layer = "telegram_gateway"
-depends_on = [
-    "mcp_telegram.config",
-    "mcp_telegram.models",
-    "mcp_telegram.message_contracts",
-    "mcp_telegram.telegram_reading",
-    "mcp_telegram.telegram_gateway",
-    "mcp_telegram.folders.contracts",
-    "mcp_telegram.folders.ports",
-    "mcp_telegram.reactions.contracts",
-    "mcp_telegram.reactions.ports",
-    "mcp_telegram.reactions.projection",
-    "mcp_telegram.topics.contracts",
-    "mcp_telegram.topics.ports",
-    "mcp_telegram.read_state",
-    "mcp_telegram.flood",
-    "mcp_telegram.errors",
-]
-
-# ---------------------------------------------------------------------------
-# persistence — local state ownership. No delivery imports.
-# ---------------------------------------------------------------------------
+depends_on = ["mcp_telegram.formatter", "mcp_telegram.messages.telegram_adapter", "mcp_telegram.telethon_media", "mcp_telegram.telethon_message"]
 
 [[modules]]
-paths = [
-    "mcp_telegram.sync_db",
-    "mcp_telegram.feedback_db",
-    "mcp_telegram.fts",
-    "mcp_telegram.read_state",
-    "mcp_telegram.folders.sqlite_repository",
-    "mcp_telegram.messages.sqlite_repository",
-    "mcp_telegram.reactions.persistence",
-    "mcp_telegram.reactions.sqlite_repository",
-    "mcp_telegram.topics.sqlite_repository",
-]
+path = "mcp_telegram.telegram_read_receipts"
+layer = "telegram_gateway"
+depends_on = ["mcp_telegram.telegram_gateway", "mcp_telegram.telegram_reading"]
+
+[[modules]]
+path = "mcp_telegram.telethon_dialog"
+layer = "telegram_gateway"
+depends_on = ["mcp_telegram.models"]
+
+[[modules]]
+path = "mcp_telegram.telethon_media"
+layer = "telegram_gateway"
+depends_on = []
+
+[[modules]]
+path = "mcp_telegram.telethon_message"
+layer = "telegram_gateway"
+depends_on = []
+
+[[modules]]
+path = "mcp_telegram.messages.telegram_adapter"
+layer = "telegram_gateway"
+depends_on = ["mcp_telegram.message_contracts", "mcp_telegram.telethon_media", "mcp_telegram.telethon_message"]
+
+[[modules]]
+path = "mcp_telegram.folders.telegram_adapter"
+layer = "telegram_gateway"
+depends_on = ["mcp_telegram.folders.contracts", "mcp_telegram.folders.ports"]
+
+[[modules]]
+path = "mcp_telegram.reactions.projection"
+layer = "telegram_gateway"
+depends_on = ["mcp_telegram.reactions.contracts"]
+
+[[modules]]
+path = "mcp_telegram.reactions.telegram_adapter"
+layer = "telegram_gateway"
+depends_on = ["mcp_telegram.reactions.contracts", "mcp_telegram.reactions.ports", "mcp_telegram.reactions.projection", "mcp_telegram.telegram_gateway"]
+
+[[modules]]
+path = "mcp_telegram.topics.telegram_adapter"
+layer = "telegram_gateway"
+depends_on = ["mcp_telegram.topics.contracts", "mcp_telegram.topics.ports"]
+
+# persistence — SQLite schema and repositories.
+[[modules]]
+path = "mcp_telegram.sync_db"
 layer = "persistence"
-depends_on = [
-    "mcp_telegram.models",
-    "mcp_telegram.message_contracts",
-    "mcp_telegram.state",
-    "mcp_telegram.errors",
-    "mcp_telegram.fts",
-    "mcp_telegram.folders.contracts",
-    "mcp_telegram.folders.ports",
-    "mcp_telegram.reactions.contracts",
-    "mcp_telegram.topics.contracts",
-    "mcp_telegram.topics.ports",
-]
-
-# ---------------------------------------------------------------------------
-# foundation — pure contracts and shared primitives.
-# ---------------------------------------------------------------------------
+depends_on = ["mcp_telegram.fts"]
 
 [[modules]]
-paths = [
-    "mcp_telegram.models",
-    "mcp_telegram.message_contracts",
-    "mcp_telegram.telegram_reading",
-    "mcp_telegram.config",
-    "mcp_telegram.state",
-    "mcp_telegram.errors",
-    "mcp_telegram.temporal",
-    "mcp_telegram.correlation",
-    "mcp_telegram.pagination",
-    "mcp_telegram.budget",
-    "mcp_telegram.formatter",
-    "mcp_telegram.resolver",
-    "mcp_telegram.flood",
-    "mcp_telegram.daemon_client",
-    "mcp_telegram.daemon_ipc",
-    "mcp_telegram.folders.contracts",
-    "mcp_telegram.folders.ports",
-    "mcp_telegram.reactions.contracts",
-    "mcp_telegram.reactions.ports",
-    "mcp_telegram.topics.contracts",
-    "mcp_telegram.topics.ports",
-]
+path = "mcp_telegram.feedback_db"
+layer = "persistence"
+depends_on = []
+
+[[modules]]
+path = "mcp_telegram.fts"
+layer = "persistence"
+depends_on = []
+
+[[modules]]
+path = "mcp_telegram.read_state"
+layer = "persistence"
+depends_on = []
+
+[[modules]]
+path = "mcp_telegram.messages.sqlite_repository"
+layer = "persistence"
+depends_on = ["mcp_telegram.fts", "mcp_telegram.message_contracts", "mcp_telegram.reactions.contracts", "mcp_telegram.reactions.persistence"]
+
+[[modules]]
+path = "mcp_telegram.folders.sqlite_repository"
+layer = "persistence"
+depends_on = ["mcp_telegram.folders.contracts", "mcp_telegram.folders.ports"]
+
+[[modules]]
+path = "mcp_telegram.reactions.persistence"
+layer = "persistence"
+depends_on = ["mcp_telegram.reactions.contracts"]
+
+[[modules]]
+path = "mcp_telegram.reactions.sqlite_repository"
+layer = "persistence"
+depends_on = ["mcp_telegram.reactions.contracts", "mcp_telegram.reactions.persistence"]
+
+[[modules]]
+path = "mcp_telegram.topics.sqlite_repository"
+layer = "persistence"
+depends_on = ["mcp_telegram.topics.contracts", "mcp_telegram.topics.ports"]
+
+# foundation — small neutral contracts, IPC, configuration, and primitives.
+[[modules]]
+path = "mcp_telegram.models"
 layer = "foundation"
 depends_on = []
-utility = true
+
+[[modules]]
+path = "mcp_telegram.message_contracts"
+layer = "foundation"
+depends_on = []
+
+[[modules]]
+path = "mcp_telegram.telegram_reading"
+layer = "foundation"
+depends_on = ["mcp_telegram.message_contracts"]
+
+[[modules]]
+path = "mcp_telegram.config"
+layer = "foundation"
+depends_on = []
+
+[[modules]]
+path = "mcp_telegram.state"
+layer = "foundation"
+depends_on = []
+
+[[modules]]
+path = "mcp_telegram.errors"
+layer = "foundation"
+depends_on = []
+
+[[modules]]
+path = "mcp_telegram.temporal"
+layer = "foundation"
+depends_on = []
+
+[[modules]]
+path = "mcp_telegram.correlation"
+layer = "foundation"
+depends_on = []
+
+[[modules]]
+path = "mcp_telegram.pagination"
+layer = "foundation"
+depends_on = []
+
+[[modules]]
+path = "mcp_telegram.budget"
+layer = "foundation"
+depends_on = ["mcp_telegram.models"]
+
+[[modules]]
+path = "mcp_telegram.formatter"
+layer = "foundation"
+depends_on = ["mcp_telegram.models"]
+
+[[modules]]
+path = "mcp_telegram.resolver"
+layer = "foundation"
+depends_on = ["mcp_telegram.models"]
+
+[[modules]]
+path = "mcp_telegram.flood"
+layer = "foundation"
+depends_on = []
+
+[[modules]]
+path = "mcp_telegram.daemon_ipc"
+layer = "foundation"
+depends_on = []
+
+[[modules]]
+path = "mcp_telegram.daemon_client"
+layer = "foundation"
+depends_on = ["mcp_telegram.config", "mcp_telegram.correlation", "mcp_telegram.daemon_ipc"]
+
+[[modules]]
+path = "mcp_telegram.folders.contracts"
+layer = "foundation"
+depends_on = []
+
+[[modules]]
+path = "mcp_telegram.folders.ports"
+layer = "foundation"
+depends_on = ["mcp_telegram.folders.contracts"]
+
+[[modules]]
+path = "mcp_telegram.reactions.contracts"
+layer = "foundation"
+depends_on = ["mcp_telegram.telegram_reading"]
+
+[[modules]]
+path = "mcp_telegram.reactions.ports"
+layer = "foundation"
+depends_on = ["mcp_telegram.reactions.contracts"]
+
+[[modules]]
+path = "mcp_telegram.topics.contracts"
+layer = "foundation"
+depends_on = []
+
+[[modules]]
+path = "mcp_telegram.topics.ports"
+layer = "foundation"
+depends_on = ["mcp_telegram.topics.contracts"]
 
 [[interfaces]]
-from = [
-    "mcp_telegram.folders",
-    "mcp_telegram.reactions",
-    "mcp_telegram.topics",
-]
-expose = [
-    "contracts\\..*",
-    "ports\\..*",
-    "refresh\\..*",
-]
+from = ["mcp_telegram.folders", "mcp_telegram.reactions", "mcp_telegram.topics"]
+expose = ["contracts\\..*", "ports\\..*", "refresh\\..*"]
 
 [[interfaces]]
 from = ["mcp_telegram.messages"]
-expose = [
-    "telegram_adapter\\..*",
-    "sqlite_repository\\..*",
-]
+expose = ["telegram_adapter\\..*", "sqlite_repository\\..*"]
 
 [[interfaces]]
 from = ["mcp_telegram.daemon_api"]

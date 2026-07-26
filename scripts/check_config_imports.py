@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Ratchet direct config imports to explicit composition roots.
+"""Ratchet direct config imports to explicit runtime entrypoints.
 
 This is deliberately an AST check, not a complete Python import resolver.
 Import-linter owns transitive checks for the policy-facing modules; this gate
@@ -14,12 +14,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE_ROOT = ROOT / "src" / "mcp_telegram"
-ALLOWED_CONFIG_IMPORTERS = frozenset(
+ALLOWED_CONFIG_IMPORTER_PATHS = frozenset(
     {
         "__init__.py",
         "config.py",
         "daemon.py",
         "daemon_client.py",
+        "server.py",
         "telegram.py",
     }
 )
@@ -50,10 +51,15 @@ def find_config_imports(source: str) -> list[int]:
 
 def violations_for(path: Path, source: str) -> list[str]:
     lines = find_config_imports(source)
-    if path.name in ALLOWED_CONFIG_IMPORTERS:
+    try:
+        package_relative_path = path.resolve().relative_to(SOURCE_ROOT.resolve()).as_posix()
+    except ValueError:
+        package_relative_path = None
+    if package_relative_path in ALLOWED_CONFIG_IMPORTER_PATHS:
         return []
     return [
-        f"{path.relative_to(ROOT)}:{line}: direct config import is allowed only in composition roots" for line in lines
+        f"{path.relative_to(ROOT)}:{line}: direct config import is allowed only in runtime entrypoints"
+        for line in lines
     ]
 
 

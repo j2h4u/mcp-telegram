@@ -1,183 +1,54 @@
-# Architecture cleanup: adopting `tach`
+# Architecture cleanup frontier
 
-`tach.toml` declares the target module graph for the clean-architecture migration.
-It is intentionally stricter than the current code. `just module-boundaries`
-is advisory until this document is empty; `just check` and import-linter remain
-the enforced gates during the transition.
+`tach.toml` is an enforced green current-state gate. `just check` runs both
+Tach and the existing 27 import-linter contracts; neither is advisory. Every
+ordinary dependency is an intentional, explicit collaboration. A Tach
+`deprecated = true` edge is the only temporary exception and must remain in
+this table until removed.
 
-When `just module-boundaries` turns green:
+## Current debt
 
-1. add `module-boundaries` to `just check`;
-2. keep `tach` as the primary architecture gate;
-3. delete redundant import-linter contracts from `pyproject.toml`.
+| ID | Deprecated edge(s) | Owner / target | Removal condition |
+|---|---|---|---|
+| `ACT-001` | `activity_cold_backfill`, `activity_hot_sweep`, `activity_peer_{resolve,sweep}`, `scheduled_messages` → `activity_sync` | Sync/activity | Extract the client protocol, timeout helper, and own-only SQL into a neutral activity substrate. |
+| `ACT-002` | `event_handlers` → `activity_peer_resolve` | Sync/activity | Publish a small input-entity resolver contract and inject it into the handler. |
+| `API-001` | `daemon_api` → `folders.sqlite_repository`, `feedback_db` | Daemon API | Route folder reads and feedback validation through application services/contracts. |
+| `READ-001` | `daemon_reading` → `daemon_{account_trace,activity_stats,dialog_queries,message_queries,read_state_queries}` | Reading/query | Stop importing sibling private SQL/constants; make the query facade own its SQL or use explicit public query contracts. |
+| `READ-002` | `daemon_scheduled_queries` → `daemon_message_queries` | Reading/query | Move the private row decoder to a shared public query-record module. |
+| `SYNC-001` | `event_handlers` → `sync_worker` | Sync | Move dialog/entity upsert SQL to `sync_db` or an event-write service. |
+| `TG-001` | `telegram_fragments` → `messages.sqlite_repository` | Telegram/messages | Inject a message-write port at the fragment ingestion seam. |
 
-Do not fix a `tach` failure by approving the edge in `tach.toml` unless the
-edge is part of the target architecture. The default remediation is moving the
-abstraction, exposing a public interface, or inverting the dependency.
+Deprecated diagnostics are warnings so the gate stays green, but they are not
+approval to add more coupling. A new deprecated edge requires a table row in
+the same change with an owner and a concrete removal condition.
 
-## Why `tach`, not only import-linter
+## Next cleanup slices
 
-Import-linter is useful as a ratchet, but it is mostly a list of forbidden
-imports. It does not naturally express the intended module graph, public
-interfaces, ownership seams, or cleanup order.
+1. `READ-001` / `READ-002`: collapse private cross-query SQL into explicit
+   query contracts or one cohesive query implementation.
+2. `ACT-001` / `ACT-002`: extract the shared activity client and peer resolver
+   substrate without inventing a speculative product capability.
+3. `API-001` and `SYNC-001`: replace direct persistence/worker reaches with
+   daemon-wired application services.
+4. `TG-001`: introduce the message write boundary only once the fragment path
+   has a real interchangeable dependency.
 
-`tach` gives us the architecture as data:
+## Rules of the gate
 
-- declared dependencies instead of accidental imports;
-- public interfaces for module seams;
-- layered architecture;
-- cycle checks;
-- dependency maps for cleanup planning;
-- incremental adoption without making the main gate red.
+- No `unchecked = true`, inline Tach ignores, or `tach sync` normalization.
+- `exact = false` is deliberate for this brownfield stage; unused-edge
+  enforcement follows after the graph stabilizes.
+- Circular dependencies and type-checking imports remain strict.
+- No module is marked as a Tach utility. Config, IPC, state, contracts, and
+  primitives are explicit modules, not a foundation allowlist.
+- `tach.domain.toml`, CODEOWNERS, `exact = true`, and import-linter retirement
+  are later work. Do not weaken import-linter meanwhile.
 
-## Adoption mode
-
-The official Tach happy path is:
-
-1. define modules with `tach init` or `tach mod`;
-2. run `tach sync` so `tach.toml` matches current imports;
-3. enforce `tach check` in CI/pre-commit;
-4. tighten dependencies, public interfaces, layers, and deprecations over time.
-
-That is the right mode when the goal is an immediately green ratchet.
-
-This repository is using a different mode on purpose: `tach.toml` describes the
-target architecture first, and the codebase is pulled toward it in later PRs.
-Because that makes `tach check` red by design, `module-boundaries` is not part
-of `just check`, CI, or pre-commit yet.
-
-Do not mix the two modes in one step:
-
-- for an enforced baseline, allow current edges through `tach sync`, `unchecked`,
-  or `deprecated`, then ratchet downward;
-- for target-architecture design, keep bad edges undeclared and document the red
-  baseline here.
-
-In this repository, running `tach sync --add` against the target graph does not
-clear the advisory failures: layer violations, private-interface imports, and
-deliberately forbidden edges still require design work. Use `sync` to build or
-refresh a current-state baseline, not to repair the target architecture.
-
-## Target layers
-
-Highest first:
-
-| Layer | Modules | Rule |
-|---|---|---|
-| `delivery` | `server`, `tools`, CLI entrypoint | Transports and presentation only. No Telegram or SQLite. |
-| `composition` | `daemon` | The only layer that wires concrete adapters together. |
-| `application` | daemon API, read/query services, sync orchestration | Use cases and projections. Depends on ports/contracts, not delivery. |
-| `capability` | `messages`, `folders`, `reactions`, `topics` | Vertical slices with contracts/ports/use cases/adapters. |
-| `telegram_gateway` | Telethon client and Telegram fact adapters | Anti-corruption over Telegram/Telethon. |
-| `persistence` | `sync_db`, `feedback_db`, `fts`, `read_state` | Local state ownership. |
-| `foundation` | config, models, contracts, errors, temporal, pagination, formatting | Pure shared primitives. |
-
-Same-layer edges must be explicit. Higher layers may depend downward only when
-the edge is declared. Upward edges are always wrong unless the target graph
-itself is wrong.
-
-## Product architecture invariants
-
-- The daemon owns Telegram access, TelegramClient lifecycle, and DB writes.
-- MCP tools remain thin inbound adapters.
-- Delivery must not import `telegram`, `sync_db`, capability adapters, or daemon internals.
-- Capability `contracts.py` and `ports.py` are transport- and storage-neutral.
-- Concrete adapters are wired in composition or daemon-owned application services.
-- SQLite schema names can remain legacy while agent-facing contracts become cleaner.
-
-## Adoption rules
-
-- No `deprecated = true` dependency waivers in `tach.toml`.
-- No inline `tach: ignore` comments without adding a named cleanup item here.
-- `ignore_type_checking_imports = false`: type-only imports still count as coupling.
-- `require_ignore_directive_reasons = "error"`: any future inline ignore must
-  carry a reason, matching Tach's own strict configuration style.
-- `exact = false` during adoption: the current brownfield graph still uses grouped
-  modules, so exact unused-edge checks produce noise before the graph is split.
-  Turn `exact` on only after the advisory gate is close to green or after moving
-  capability-owned details into domain configs.
-- Use `just module-map` when planning a cleanup slice; commit the map only if it is
-  intentionally needed for review.
-- `tach.domain.toml` is the target ownership mechanism for mature vertical
-  packages. Keep the root `tach.toml` authoritative until a package has a stable
-  internal contract/ports/adapters split.
-- Do not install the pre-commit hook while the advisory gate is intentionally red.
-  Add it only when `module-boundaries` is promoted into `just check`.
-- Tach ships a pytest plugin. Keep `-p no:tach` in pytest addopts until this
-  project intentionally adopts Tach impact-analysis for test selection.
-
-## Useful Tach commands
+Useful checks:
 
 ```bash
 just module-boundaries
-uv run tach check --output json
-just module-map
-uv run tach map --direction dependents
-uv run tach map --closure src/mcp_telegram/daemon_reading.py
-uv run tach report src/mcp_telegram/daemon_reading.py --dependencies --usages --raw
-uv run tach show --mermaid -o tach-module-graph.mmd
+uv run tach check --interfaces
+uv run lint-imports
+just config-imports
 ```
-
-`tach-module-map.json` and generated graph files are working artifacts. Commit
-them only when a PR review needs the exact snapshot.
-
-## Baseline on adoption
-
-Run:
-
-```bash
-just module-boundaries
-```
-
-Current result on `chore/tach-architecture-boundaries`:
-
-- 79 total Tach failures;
-- 79 undeclared dependencies;
-- 0 layer violations;
-- 0 private interface violations.
-
-The Tach-driven cleanup so far removed all initial private-interface failures by:
-
-- adding the already-public `daemon_connection` function to the `daemon_client`
-  interface;
-- renaming externally used `_DaemonClientLike` to public `DaemonClientLike`.
-
-It also removed several layer violations by:
-
-- moving shared Telegram access-loss classification into `telegram_access`;
-- routing sync/activity/account-trace access-loss handling through that shared
-  classification instead of importing a private `dialog_sync` tuple;
-- moving Telethon message-to-dict projection into `telegram_message_projection`;
-- modelling reaction aggregate projection as Telegram-facing projection code
-  rather than a pure capability module.
-- moving the `own_only_dialogs` DDL/ensure helper into `sync_db`, while keeping
-  the old `own_only.ensure_own_only_schema` import path as a compatibility
-  re-export.
-- moving the local access-lost status transition into `sync_db.set_access_lost`,
-  while keeping the old `dialog_sync._set_access_lost` import path as a
-  compatibility alias.
-
-The first visible cleanup categories are:
-
-1. `daemon_reading` is a god-facade over query helpers; it imports private SQL
-   constants and helper functions from sibling daemon modules. This should become
-   explicit application/query contracts.
-2. Activity and scheduled-message workers share private helpers across modules
-   (`activity_peer_sweep`, `activity_sync`, `activity_peer_resolve`,
-   `scheduled_messages`, `own_only`). Extract neutral ports/contracts or combine
-   cohesive units.
-3. The CLI package root is now modelled as delivery, but it still exposes/imports
-   daemon and Telegram wiring directly. Move CLI wiring out of `mcp_telegram`
-   when the entrypoint becomes too crowded.
-4. `daemon_api` reaches directly into persistence and capability implementation
-   details (`folders.sqlite_repository`, `feedback_db`, refreshers). The target
-   is an application service boundary.
-5. Telegram gateway modules still have some application/persistence pressure
-   around concrete read models. Move shared Telegram error/read-model contracts
-   downward or split adapters when those edges become the next cleanup slice.
-6. Capability internals still need public interface refinement. Current public
-   interfaces expose contracts/ports/refresh seams, but several callers still
-   reach into implementation modules instead of stable application services.
-
-Each cleanup PR should remove one category of failures and tighten `tach.toml`
-only when it reflects the intended graph more accurately.

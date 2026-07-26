@@ -27,7 +27,7 @@ import sqlite3
 import time
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import cast
+from typing import Protocol, cast
 
 from .activity_peer_sweep import (
     SkipReason,
@@ -37,9 +37,25 @@ from .activity_peer_sweep import (
     sweep_peer_once,
 )
 from .activity_sync import _ActivityClient
-from .config import SchedulingConfig
 
 logger = logging.getLogger(__name__)
+
+
+class _ColdBackfillScheduling(Protocol):
+    """Scheduling values injected by the daemon-owned configuration tree."""
+
+    @property
+    def activity_cold_backfill_seconds(self) -> float: ...
+
+    @property
+    def activity_cold_backfill_batch_pause_seconds(self) -> float: ...
+
+    @property
+    def activity_cold_enroll_seconds(self) -> float: ...
+
+    @property
+    def activity_cold_access_retry_seconds(self) -> float: ...
+
 
 # ---------------------------------------------------------------------------
 # Pacing is owned by the frozen runtime configuration model.
@@ -59,7 +75,7 @@ class ColdBackfillPacing:
     history: ColdBackfillHistoryPacing
 
     @classmethod
-    def from_scheduling(cls, scheduling: SchedulingConfig) -> ColdBackfillPacing:
+    def from_scheduling(cls, scheduling: _ColdBackfillScheduling) -> ColdBackfillPacing:
         return cls(
             idle_s=scheduling.activity_cold_backfill_seconds,
             history=ColdBackfillHistoryPacing(
@@ -69,8 +85,6 @@ class ColdBackfillPacing:
             ),
         )
 
-
-_PACING = ColdBackfillPacing.from_scheduling(SchedulingConfig())
 
 _BACKFILL_BATCH_LIMIT = 100
 
@@ -120,7 +134,7 @@ async def _run_cold_backfill_pass_safe(
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,
     *,
-    pacing: ColdBackfillPacing = _PACING,
+    pacing: ColdBackfillPacing,
 ) -> ColdPassResult:
     try:
         return await run_cold_backfill_pass(client, conn, shutdown_event, pacing=pacing)
@@ -131,7 +145,7 @@ async def _run_cold_backfill_pass_safe(
 
 
 def _cold_backfill_sleep_seconds(
-    pass_result: ColdPassResult, idle_interval: float, pacing: ColdBackfillPacing = _PACING
+    pass_result: ColdPassResult, idle_interval: float, pacing: ColdBackfillPacing
 ) -> float:
     if pass_result.outcome is ColdPassOutcome.NO_DUE_PEER:
         logger.debug("activity_cold_backfill_idle next_sleep_s=%.3f", idle_interval)
@@ -150,7 +164,7 @@ async def _maybe_enroll_activity_peers(
     client: _ActivityClient,
     conn: sqlite3.Connection,
     last_enroll_at: float,
-    pacing: ColdBackfillPacing = _PACING,
+    pacing: ColdBackfillPacing,
 ) -> float:
     now_mono = asyncio.get_running_loop().time()
     if now_mono - last_enroll_at < pacing.history.enroll_s:
@@ -164,7 +178,7 @@ async def _maybe_enroll_activity_peers(
     return asyncio.get_running_loop().time()
 
 
-def _finish_cold_backfill_peer(ctx: _ColdPeerFinishContext, pacing: ColdBackfillPacing = _PACING) -> ColdPassResult:
+def _finish_cold_backfill_peer(ctx: _ColdPeerFinishContext, pacing: ColdBackfillPacing) -> ColdPassResult:
     """Apply one peer result and emit the matching telemetry."""
     result = ctx.result
     if result.skip_reason is SkipReason.FLOOD_WAIT:
@@ -246,7 +260,7 @@ async def run_cold_backfill_pass(
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,
     *,
-    pacing: ColdBackfillPacing = _PACING,
+    pacing: ColdBackfillPacing,
 ) -> ColdPassResult:
     """Run one Tier-B ColdBackfill pass.
 
@@ -337,33 +351,32 @@ async def run_cold_backfill_loop(
     shutdown_event: asyncio.Event,
     *,
     idle_interval: float | None = None,
-    pacing: ColdBackfillPacing | None = None,
+    pacing: ColdBackfillPacing,
 ) -> None:
     """Background task: run Tier-B ColdBackfill, low-priority, self-enrolling.
 
     Loop sleep policy (cycle-4 MEDIUM — must NOT idle 300s after zero-write work):
     - outcome == NO_DUE_PEER → sleep idle_interval (long: no work exists)
-    - outcome in {WROTE, ZERO_PERSISTED, FLOOD_WAIT} → sleep _PACING.history.batch_s
+    - outcome in {WROTE, ZERO_PERSISTED, FLOOD_WAIT} → sleep `pacing.history.batch_s`
       (short: a peer was processed, more may be due)
 
     Enrollment: build_working_set is called on entry and then no more often than
-    every _PACING.history.enroll_s so Tier B is self-sufficient for enrollment and
+    every `pacing.history.enroll_s` so Tier B is self-sufficient for enrollment and
     does not depend on Tier A having run (review MEDIUM).
 
     Logs use the activity_cold_backfill_* prefix.
     """
-    resolved_pacing = pacing or _PACING
-    resolved_idle_interval = idle_interval if idle_interval is not None else resolved_pacing.idle_s
+    resolved_idle_interval = idle_interval if idle_interval is not None else pacing.idle_s
     last_enroll_at: float = 0.0  # sentinel: force enroll on first iteration
 
     while not shutdown_event.is_set():
         # Throttled enrollment — call build_working_set no more than once per
-        # _PACING.history.enroll_s so peer set stays current without over-calling.
-        last_enroll_at = await _maybe_enroll_activity_peers(client, conn, last_enroll_at, resolved_pacing)
+        # pacing.history.enroll_s so peer set stays current without over-calling.
+        last_enroll_at = await _maybe_enroll_activity_peers(client, conn, last_enroll_at, pacing)
 
-        pass_result = await _run_cold_backfill_pass_safe(client, conn, shutdown_event, pacing=resolved_pacing)
+        pass_result = await _run_cold_backfill_pass_safe(client, conn, shutdown_event, pacing=pacing)
 
-        sleep_s = _cold_backfill_sleep_seconds(pass_result, resolved_idle_interval, resolved_pacing)
+        sleep_s = _cold_backfill_sleep_seconds(pass_result, resolved_idle_interval, pacing)
 
         try:
             await asyncio.wait_for(shutdown_event.wait(), timeout=sleep_s)
