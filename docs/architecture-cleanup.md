@@ -1,8 +1,8 @@
 # Architecture cleanup frontier
 
-`tach.toml` is an enforced green current-state gate. `just check` runs both
-Tach and the existing 27 import-linter contracts; neither is advisory. Every
-ordinary dependency is an intentional, explicit collaboration. A Tach
+`tach.toml` is the sole enforced import-graph authority and an enforced green
+current-state gate. Every ordinary dependency is an intentional, explicit
+collaboration. A Tach
 `deprecated = true` edge is the only temporary exception and must remain in
 this table until removed.
 
@@ -36,19 +36,16 @@ the same change with an owner and a concrete removal condition.
 ## Rules of the gate
 
 - No `unchecked = true`, inline Tach ignores, or `tach sync` normalization.
-- `exact = false` is deliberate for this brownfield stage; unused-edge
-  enforcement follows after the graph stabilizes.
+- `exact = true` requires every declared ordinary dependency to be used.
 - Circular dependencies and type-checking imports remain strict.
 - No module is marked as a Tach utility. Config, IPC, state, contracts, and
   primitives are explicit modules, not a foundation allowlist.
-- `tach.domain.toml`, CODEOWNERS, `exact = true`, and import-linter retirement
-  are later work. Do not weaken import-linter meanwhile.
+- `tach.domain.toml` and CODEOWNERS are later work.
 
 Useful checks:
 
 ```bash
 just module-boundaries
 uv run tach check --interfaces
-uv run lint-imports
 just config-imports
 ```

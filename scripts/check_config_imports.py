@@ -2,8 +2,8 @@
 """Ratchet direct config imports to explicit runtime entrypoints.
 
 This is deliberately an AST check, not a complete Python import resolver.
-Import-linter owns transitive checks for the policy-facing modules; this gate
-keeps new direct ``config`` imports out of state and capability code.
+Tach owns the package import graph; this focused custom gate keeps new direct
+``config`` imports out of state and capability code.
 """
 
 from __future__ import annotations
