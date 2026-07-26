@@ -9,7 +9,7 @@ default:
     @just --list
 
 # Run all local source checks.
-check: fmt-check lint complexity-ratchet lock-check typecheck typecheck-pyright typecheck-tests import-contracts module-boundaries config-imports policy-placement runtime-seams actionlint supply-chain-pins deptry compile deadcode package-smoke
+check: fmt-check lint complexity-ratchet lock-check typecheck typecheck-pyright typecheck-tests module-boundaries config-imports policy-placement runtime-seams actionlint supply-chain-pins deptry compile deadcode package-smoke
 
 # Verify uv.lock is synchronized with pyproject.toml.
 lock-check:
@@ -39,10 +39,6 @@ typecheck-pyright:
 typecheck-tests:
     uv run basedpyright tests --warnings
 
-# Check import-layer architecture contracts.
-import-contracts:
-    uv run lint-imports
-
 # Enforce the explicit current-state module graph and named cleanup frontier.
 module-boundaries:
     uv run tach check
@@ -60,7 +56,7 @@ policy-placement:
     uv run python scripts/check_policy_placement.py
 
 # Check the public correlation/bootstrap seams and their stdlib import closure.
-runtime-seams: import-contracts
+runtime-seams:
     uv run python scripts/check_runtime_seams.py
 
 # Check GitHub Actions workflow syntax and expressions.
@@ -180,7 +176,7 @@ clean:
     find . \
       \( -path "./.venv" -o -path "./.planning" -o -path "./graphify-out" -o -path "./deploy/database" -o -path "./deploy/backups" \) -prune \
       -o \
-      \( -type d \( -name "__pycache__" -o -name ".pytest_cache" -o -name ".ruff_cache" -o -name ".mypy_cache" -o -name ".import_linter_cache" \) \
+      \( -type d \( -name "__pycache__" -o -name ".pytest_cache" -o -name ".ruff_cache" -o -name ".mypy_cache" \) \
          -o -name ".coverage" -o -name "htmlcov" \) \
       -exec rm -rf {} +
     rm -rf .coverage htmlcov build dist

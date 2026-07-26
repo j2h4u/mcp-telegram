@@ -6,7 +6,7 @@
 
 source_roots = ["src"]
 root_module = "forbid"
-exact = false
+exact = true
 layers_explicit_depends_on = true
 forbid_circular_dependencies = true
 ignore_type_checking_imports = false
