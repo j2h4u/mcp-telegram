@@ -9,7 +9,7 @@ default:
     @just --list
 
 # Run all local source checks.
-check: fmt-check lint complexity-ratchet lock-check typecheck typecheck-pyright typecheck-tests policy-placement runtime-seams actionlint supply-chain-pins deptry compile deadcode package-smoke
+check: fmt-check lint complexity-ratchet lock-check typecheck typecheck-pyright typecheck-tests import-contracts module-boundaries config-imports policy-placement runtime-seams actionlint supply-chain-pins deptry compile deadcode package-smoke
 
 # Verify uv.lock is synchronized with pyproject.toml.
 lock-check:
@@ -43,9 +43,13 @@ typecheck-tests:
 import-contracts:
     uv run lint-imports
 
-# Check the declared ideal module graph. Advisory until docs/architecture-cleanup.md is empty.
+# Enforce the explicit current-state module graph and named cleanup frontier.
 module-boundaries:
     uv run tach check
+
+# Keep direct runtime-config reads at the daemon, CLI, and transport entrypoints.
+config-imports:
+    uv run python scripts/check_config_imports.py
 
 # Emit a local dependency map for architecture cleanup work.
 module-map:
