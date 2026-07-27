@@ -173,3 +173,57 @@ class TestDecodeValidation:
                 since_utc=2,
                 until_utc=1,
             )
+
+
+class TestAccountTraceDecodeValidation:
+    def test_rejects_non_int_scope_dialog_ids_elements(self):
+        from mcp_telegram.pagination import (
+            AccountTraceNavigationContext,
+            _encode_payload,
+            decode_account_trace_navigation,
+        )
+
+        payload: dict[str, object] = {
+            "kind": "account_trace",
+            "target_user_id": 42,
+            "sent_at": 1_700_000_000,
+            "dialog_id": 100,
+            "message_id": 500,
+            "group_by": "timeline",
+            "exact_dialog_id": 100,
+            "scope_dialog_ids": [100, "not_an_int"],
+        }
+        token = _encode_payload(payload)
+        context = AccountTraceNavigationContext(
+            expected_target_user_id=42,
+            expected_group_by="timeline",
+            expected_exact_dialog_id=100,
+        )
+        with pytest.raises(ValueError, match="scope_dialog_ids"):
+            decode_account_trace_navigation(token, context)
+
+    def test_rejects_too_many_scope_dialog_ids(self):
+        from mcp_telegram.pagination import (
+            AccountTraceNavigationContext,
+            _encode_payload,
+            decode_account_trace_navigation,
+        )
+
+        payload: dict[str, object] = {
+            "kind": "account_trace",
+            "target_user_id": 42,
+            "sent_at": 1_700_000_000,
+            "dialog_id": 100,
+            "message_id": 500,
+            "group_by": "timeline",
+            "exact_dialog_id": 100,
+            "scope_dialog_ids": [100, 200, 300],
+        }
+        token = _encode_payload(payload)
+        context = AccountTraceNavigationContext(
+            expected_target_user_id=42,
+            expected_group_by="timeline",
+            expected_exact_dialog_id=100,
+        )
+        with pytest.raises(ValueError, match="scope_dialog_ids"):
+            decode_account_trace_navigation(token, context)
