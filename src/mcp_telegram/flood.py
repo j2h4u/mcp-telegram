@@ -39,6 +39,8 @@ _TELETHON_FLOOD_WAIT_RE: Final[re.Pattern[str]] = re.compile(
     re.IGNORECASE,
 )
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass(frozen=True, slots=True)
 class FloodWaitRollup:
@@ -57,6 +59,44 @@ class FloodWaitRollup:
 
 
 @dataclass(frozen=True, slots=True)
+class FloodWaitKillSwitchPolicy:
+    """Account-level FloodWait storm policy.
+
+    The switch is latch-open: once tripped, the daemon must stop Telegram-facing
+    work and stay unhealthy until an operator restarts it after investigation.
+    """
+
+    enabled: bool
+    window_seconds: int
+    max_events: int
+    max_wait_seconds: int
+    minimum_cooldown_seconds: int
+
+
+@dataclass(frozen=True, slots=True)
+class FloodWaitKillSwitchStatus:
+    """Current account-level FloodWait kill-switch state."""
+
+    open: bool
+    reason: str | None
+    opened_at: int | None
+    events_in_window: int
+    wait_s_in_window: int
+    window_seconds: int
+    minimum_cooldown_seconds: int
+    source: str | None
+
+    def detail(self) -> str:
+        if not self.open:
+            return "flood wait kill switch is closed"
+        return (
+            f"{self.reason or 'FloodWait storm'}; opened_at={self.opened_at}; events={self.events_in_window}; "
+            f"wait_s={self.wait_s_in_window}; window_s={self.window_seconds}; "
+            f"minimum_cooldown_s={self.minimum_cooldown_seconds}; source={self.source or 'unknown'}"
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class _FloodWaitEvent:
     at_mono: float
     seconds: int
@@ -71,12 +111,18 @@ class FloodWaitAccumulator:
     log_interval_s: int = _ROLLUP_LOG_INTERVAL_S
     _events: deque[_FloodWaitEvent] = field(default_factory=deque)
     _last_log_mono: float = field(default_factory=time.monotonic)
+    _kill_switch_policy: FloodWaitKillSwitchPolicy | None = None
+    _kill_switch_event: asyncio.Event | None = None
+    _kill_switch_status: FloodWaitKillSwitchStatus = field(
+        default_factory=lambda: FloodWaitKillSwitchStatus(False, None, None, 0, 0, 0, 0, None)
+    )
 
     def observe(self, *, source: str, seconds: int, now_mono: float | None = None) -> None:
         now = time.monotonic() if now_mono is None else now_mono
         safe_seconds = max(0, int(seconds))
         self._events.append(_FloodWaitEvent(at_mono=now, seconds=safe_seconds, source=source))
         self._prune(now)
+        self._evaluate_kill_switch(now, source)
 
     def snapshot(self, *, now_mono: float | None = None) -> FloodWaitRollup:
         now = time.monotonic() if now_mono is None else now_mono
@@ -111,6 +157,47 @@ class FloodWaitAccumulator:
         )
         return True
 
+    def configure_kill_switch(
+        self,
+        policy: FloodWaitKillSwitchPolicy,
+        *,
+        event: asyncio.Event | None = None,
+    ) -> None:
+        """Install a kill-switch policy for future FloodWait observations."""
+        self._kill_switch_policy = policy
+        self._kill_switch_event = event
+        if not policy.enabled:
+            self._kill_switch_status = FloodWaitKillSwitchStatus(
+                False,
+                None,
+                None,
+                0,
+                0,
+                policy.window_seconds,
+                policy.minimum_cooldown_seconds,
+                None,
+            )
+
+    def kill_switch_status(self, *, now_mono: float | None = None) -> FloodWaitKillSwitchStatus:
+        now = time.monotonic() if now_mono is None else now_mono
+        self._prune(now)
+        status = self._kill_switch_status
+        if status.open:
+            return status
+        policy = self._kill_switch_policy
+        if policy is None:
+            return FloodWaitKillSwitchStatus(False, None, None, 0, 0, 0, 0, None)
+        return FloodWaitKillSwitchStatus(
+            False,
+            None,
+            None,
+            self._count_since(now - policy.window_seconds),
+            self._sum_since(now - policy.window_seconds),
+            policy.window_seconds,
+            policy.minimum_cooldown_seconds,
+            None,
+        )
+
     def _prune(self, now_mono: float) -> None:
         min_at = now_mono - _SECONDS_PER_WEEK
         while self._events and (self._events[0].at_mono < min_at or len(self._events) > self.max_events):
@@ -122,6 +209,36 @@ class FloodWaitAccumulator:
     def _sum_since(self, min_at: float) -> int:
         return sum(event.seconds for event in self._events if event.at_mono >= min_at)
 
+    def _evaluate_kill_switch(self, now_mono: float, source: str) -> None:
+        policy = self._kill_switch_policy
+        if policy is None or not policy.enabled or self._kill_switch_status.open:
+            return
+
+        min_at = now_mono - policy.window_seconds
+        events = self._count_since(min_at)
+        wait_s = self._sum_since(min_at)
+        reason: str | None = None
+        if events >= policy.max_events:
+            reason = "too_many_flood_wait_events"
+        elif wait_s >= policy.max_wait_seconds:
+            reason = "too_much_flood_wait_time"
+        if reason is None:
+            return
+
+        self._kill_switch_status = FloodWaitKillSwitchStatus(
+            open=True,
+            reason=reason,
+            opened_at=int(time.time()),
+            events_in_window=events,
+            wait_s_in_window=wait_s,
+            window_seconds=policy.window_seconds,
+            minimum_cooldown_seconds=policy.minimum_cooldown_seconds,
+            source=source,
+        )
+        logger.critical("flood_wait_kill_switch_open %s", self._kill_switch_status.detail())
+        if self._kill_switch_event is not None:
+            self._kill_switch_event.set()
+
 
 _FLOOD_WAIT_ACCUMULATOR: Final[FloodWaitAccumulator] = FloodWaitAccumulator()
 
@@ -129,6 +246,16 @@ _FLOOD_WAIT_ACCUMULATOR: Final[FloodWaitAccumulator] = FloodWaitAccumulator()
 def observe_flood_wait(*, source: str, seconds: int) -> None:
     """Record a FloodWait event in the process-local accumulator."""
     _FLOOD_WAIT_ACCUMULATOR.observe(source=source, seconds=seconds)
+
+
+def configure_flood_wait_kill_switch(policy: FloodWaitKillSwitchPolicy, *, event: asyncio.Event | None = None) -> None:
+    """Configure the process-local account-level FloodWait kill switch."""
+    _FLOOD_WAIT_ACCUMULATOR.configure_kill_switch(policy, event=event)
+
+
+def flood_wait_kill_switch_status() -> FloodWaitKillSwitchStatus:
+    """Return the process-local account-level FloodWait kill-switch status."""
+    return _FLOOD_WAIT_ACCUMULATOR.kill_switch_status()
 
 
 def maybe_log_flood_wait_rollup(logger: logging.Logger) -> bool:

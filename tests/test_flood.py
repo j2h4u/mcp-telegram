@@ -10,6 +10,7 @@ import pytest
 from mcp_telegram.flood import (
     DEFAULT_FLOOD_WAIT_SECONDS,
     FloodWaitAccumulator,
+    FloodWaitKillSwitchPolicy,
     TelethonFloodWaitMetricsFilter,
     flood_seconds,
     sleep_through_flood,
@@ -89,6 +90,73 @@ def test_flood_wait_accumulator_daily_rollup_logs_only_when_due(caplog: pytest.L
     assert "flood_wait_rollup" in caplog.text
     assert "events_1h=1" in caplog.text
     assert "wait_s_1h=9" in caplog.text
+
+
+def test_flood_wait_kill_switch_opens_on_event_threshold() -> None:
+    accumulator = FloodWaitAccumulator()
+    accumulator.configure_kill_switch(
+        FloodWaitKillSwitchPolicy(
+            enabled=True,
+            window_seconds=60,
+            max_events=3,
+            max_wait_seconds=999,
+            minimum_cooldown_seconds=300,
+        )
+    )
+
+    accumulator.observe(source="test.one", seconds=1, now_mono=100.0)
+    accumulator.observe(source="test.two", seconds=1, now_mono=110.0)
+    assert accumulator.kill_switch_status(now_mono=110.0).open is False
+
+    accumulator.observe(source="test.three", seconds=1, now_mono=120.0)
+    status = accumulator.kill_switch_status(now_mono=120.0)
+
+    assert status.open is True
+    assert status.reason == "too_many_flood_wait_events"
+    assert status.events_in_window == 3
+    assert status.wait_s_in_window == 3
+    assert status.minimum_cooldown_seconds == 300
+    assert "too_many_flood_wait_events" in status.detail()
+
+
+def test_flood_wait_kill_switch_opens_on_wait_threshold() -> None:
+    accumulator = FloodWaitAccumulator()
+    accumulator.configure_kill_switch(
+        FloodWaitKillSwitchPolicy(
+            enabled=True,
+            window_seconds=60,
+            max_events=10,
+            max_wait_seconds=20,
+            minimum_cooldown_seconds=300,
+        )
+    )
+
+    accumulator.observe(source="test.large", seconds=21, now_mono=100.0)
+    status = accumulator.kill_switch_status(now_mono=100.0)
+
+    assert status.open is True
+    assert status.reason == "too_much_flood_wait_time"
+    assert status.events_in_window == 1
+    assert status.wait_s_in_window == 21
+
+
+def test_flood_wait_kill_switch_sets_operator_event() -> None:
+    event = asyncio.Event()
+    accumulator = FloodWaitAccumulator()
+    accumulator.configure_kill_switch(
+        FloodWaitKillSwitchPolicy(
+            enabled=True,
+            window_seconds=60,
+            max_events=1,
+            max_wait_seconds=999,
+            minimum_cooldown_seconds=300,
+        ),
+        event=event,
+    )
+
+    accumulator.observe(source="test", seconds=1, now_mono=100.0)
+
+    assert event.is_set()
 
 
 def test_telethon_flood_wait_filter_observes_auto_sleep(monkeypatch: pytest.MonkeyPatch) -> None:

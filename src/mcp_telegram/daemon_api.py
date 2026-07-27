@@ -192,6 +192,28 @@ class DaemonClientLike(Protocol):
     async def __call__(self, request: object) -> object: ...
 
 
+class DaemonHealthStatus(Protocol):
+    """Daemon-wide operational health gate exposed to the API boundary."""
+
+    @property
+    def open(self) -> bool: ...
+
+    def detail(self) -> str: ...
+
+
+class _HealthyDaemonStatus:
+    @property
+    def open(self) -> bool:
+        return False
+
+    def detail(self) -> str:
+        return "daemon health gate is closed"
+
+
+def _healthy_daemon_status() -> DaemonHealthStatus:
+    return _HealthyDaemonStatus()
+
+
 type _DispatchHandler = Callable[
     [dict[str, object]],
     Awaitable[dict[str, object]] | dict[str, object],
@@ -392,6 +414,7 @@ class DaemonAPIServer:
         reaction_freshener: ReactionFreshener,
         topic_refresher: TopicRefresher | None = None,
         policy: DaemonApiPolicy,
+        health_status: Callable[[], DaemonHealthStatus] = _healthy_daemon_status,
     ) -> None:
         conn.row_factory = sqlite3.Row
         self._conn = conn
@@ -413,6 +436,7 @@ class DaemonAPIServer:
         self._reaction_freshener = reaction_freshener
         self._topic_refresher = topic_refresher
         self._policy = policy
+        self._health_status = health_status
         self._read_receipt_gateway = TelethonTelegramReadReceiptGateway(self._client)
         self._activity_stats_service: _activity_stats.DaemonActivityStatsService | None = None
 
@@ -515,6 +539,18 @@ class DaemonAPIServer:
                     "ok": False,
                     "error": "daemon_not_ready",
                     "detail": self.startup_detail,
+                },
+                method,
+                request_id,
+            )
+
+        health_status = self._health_status()
+        if health_status.open:
+            return (
+                {
+                    "ok": False,
+                    "error": "flood_wait_kill_switch_open",
+                    "detail": health_status.detail(),
                 },
                 method,
                 request_id,

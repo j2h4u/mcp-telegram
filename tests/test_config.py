@@ -10,6 +10,7 @@ import pytest
 from mcp_telegram.config import (
     ConfigError,
     EntitiesConfig,
+    FloodWaitConfig,
     FreshnessConfig,
     HttpServerConfig,
     ReactionsConfig,
@@ -36,6 +37,7 @@ def test_load_config_uses_frozen_typed_defaults(tmp_path: Path) -> None:
     assert config.state == StateConfig(dir=Path("/var/lib/mcp-telegram"))
     assert config.freshness == FreshnessConfig()
     assert config.telemetry == TelemetryConfig()
+    assert config.flood_wait == FloodWaitConfig()
     assert config.scheduling == SchedulingConfig()
     assert config.http == HttpServerConfig()
     with pytest.raises(FrozenInstanceError):
@@ -63,6 +65,13 @@ resolver_enrichment_ttl_seconds = 45
 [telemetry]
 retention_ttl_seconds = 46
 
+[flood_wait]
+kill_switch_enabled = true
+kill_switch_window_seconds = 600
+kill_switch_max_events = 5
+kill_switch_max_wait_seconds = 900
+kill_switch_minimum_cooldown_seconds = 1800
+
 [scheduling]
 scheduled_reconciliation_seconds = 47
 scheduled_flood_sleep_threshold_seconds = 0
@@ -80,6 +89,13 @@ port = 3200
     assert config.freshness.read_receipts == ReadReceiptsConfig(read_at_ttl_seconds=41)
     assert config.freshness.entities == EntitiesConfig(42, 43, 44, 45)
     assert config.telemetry == TelemetryConfig(retention_ttl_seconds=46)
+    assert config.flood_wait == FloodWaitConfig(
+        kill_switch_enabled=True,
+        kill_switch_window_seconds=600,
+        kill_switch_max_events=5,
+        kill_switch_max_wait_seconds=900,
+        kill_switch_minimum_cooldown_seconds=1800,
+    )
     assert config.scheduling == SchedulingConfig(
         47.0,
         48.0,
