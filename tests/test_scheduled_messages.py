@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 from telethon.errors import FloodWaitError
@@ -43,6 +43,37 @@ def _message(message_id: int, text: str = "draft", *, scheduled_at: int = 1_900_
         schedule_repeat_period=None,
         peer_id=PeerUser(user_id=42),
     )
+
+
+class _ScheduledSnapshotClient:
+    def __init__(
+        self,
+        snapshots: dict[int, list[object]] | None = None,
+        *,
+        call_error: Exception | None = None,
+        entities: dict[int, object] | None = None,
+    ) -> None:
+        self.snapshots = snapshots or {}
+        self.call_error = call_error
+        self.entities = entities or {}
+        self.requests: list[tuple[object, dict[str, object]]] = []
+        self.input_entity_calls: list[int] = []
+        self.entity_calls: list[int] = []
+
+    async def get_input_entity(self, _dialog_id: int) -> object:
+        self.input_entity_calls.append(_dialog_id)
+        return _dialog_id
+
+    async def get_entity(self, _dialog_id: int) -> object:
+        self.entity_calls.append(_dialog_id)
+        return self.entities.get(_dialog_id)
+
+    async def __call__(self, _request: object, **_kwargs: object) -> object:
+        self.requests.append((_request, _kwargs))
+        if self.call_error is not None:
+            raise self.call_error
+        dialog_id = int(cast(int, cast(SimpleNamespace, _request).peer))
+        return SimpleNamespace(messages=self.snapshots.get(dialog_id, []), users=[], chats=[])
 
 
 @pytest.fixture()
@@ -112,15 +143,15 @@ async def test_reconciliation_snapshot_marks_disappearance_nonvisible(conn: sqli
     conn.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (42, 'synced')")
     upsert_scheduled_message(conn, 42, _message(11), now=100)
     conn.commit()
-    client = MagicMock()
-    client.get_messages = AsyncMock(return_value=[])
-    worker = ScheduledMessageReconciler(client, conn, asyncio.Event())
+    client = _ScheduledSnapshotClient({42: []})
+    worker = ScheduledMessageReconciler(client, conn, asyncio.Event(), 0)
 
     assert await worker.run_once() == 1
     assert conn.execute(
         "SELECT message_state, unpublished, unseen FROM scheduled_messages WHERE message_id=11"
     ).fetchone() == ("unknown_missing", 1, 1)
-    client.get_messages.assert_awaited_once_with(entity=42, scheduled=True)
+    assert len(client.requests) == 1
+    assert client.requests[0][1]["flood_sleep_threshold"] == 0
 
 
 @pytest.mark.asyncio
@@ -129,10 +160,10 @@ async def test_reconciliation_floodwait_records_retry_and_stops_account_pass(con
         "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')",
         [(42,), (43,)],
     )
+    upsert_scheduled_message(conn, 42, _message(11), now=100)
     conn.commit()
-    client = MagicMock()
-    client.get_messages = AsyncMock(side_effect=FloodWaitError(None, 30))
-    worker = ScheduledMessageReconciler(client, conn, asyncio.Event())
+    client = _ScheduledSnapshotClient(call_error=FloodWaitError(None, 30))
+    worker = ScheduledMessageReconciler(client, conn, asyncio.Event(), 0)
 
     assert await worker.run_once() == 0
     retry_at, error = conn.execute(
@@ -140,7 +171,25 @@ async def test_reconciliation_floodwait_records_retry_and_stops_account_pass(con
     ).fetchone()
     assert retry_at is not None and retry_at >= 30
     assert error == "FloodWaitError"
-    assert client.get_messages.await_count == 1
+    assert len(client.requests) == 1
+    assert client.requests[0][1]["flood_sleep_threshold"] == 0
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_without_own_only_context_does_not_sweep_all_synced_dialogs(
+    conn: sqlite3.Connection,
+) -> None:
+    conn.executemany(
+        "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')",
+        [(42,), (43,)],
+    )
+    conn.commit()
+    client = _ScheduledSnapshotClient()
+    worker = ScheduledMessageReconciler(client, conn, asyncio.Event(), 0)
+
+    assert await worker.run_once() == 0
+    assert client.requests == []
+    assert client.input_entity_calls == []
 
 
 @pytest.mark.asyncio
@@ -166,23 +215,18 @@ async def test_reconciliation_classifies_and_enrolls_own_only_candidates(conn: s
     )
     conn.commit()
 
-    async def get_messages(**kwargs: object) -> list[object]:
-        if kwargs.get("entity") == personal_id:
-            return [_message(99, "personal scheduled")]
-        return []
-
-    client = MagicMock()
-    client.get_messages = AsyncMock(side_effect=get_messages)
-    client.get_entity = AsyncMock(
-        side_effect={
+    client = _ScheduledSnapshotClient(
+        {personal_id: [_message(99, "personal scheduled")]},
+        entities={
             admin_id: SimpleNamespace(creator=False, admin_rights=SimpleNamespace(post_messages=True)),
             unrelated_id: SimpleNamespace(creator=False, admin_rights=SimpleNamespace(post_messages=False)),
-        }.get
+        },
     )
     worker = ScheduledMessageReconciler(
         client,
         conn,
         asyncio.Event(),
+        0,
         OwnOnlyContext(account_id=42, personal_channel_id=9001),
     )
 
@@ -199,8 +243,9 @@ async def test_reconciliation_classifies_and_enrolls_own_only_candidates(conn: s
         "SELECT inclusion_basis FROM own_only_dialogs WHERE dialog_id=?", (discussion_id,)
     ).fetchone() == ('["personal_channel_discussion"]',)
     assert conn.execute("SELECT 1 FROM own_only_dialogs WHERE dialog_id=999").fetchone() is None
-    assert client.get_entity.await_count == 2
-    assert {call.args[0] for call in client.get_entity.await_args_list} == {admin_id, unrelated_id}
+    assert len(client.entity_calls) == 2
+    assert set(client.entity_calls) == {admin_id, unrelated_id}
+    assert all(kwargs["flood_sleep_threshold"] == 0 for _, kwargs in client.requests)
 
 
 @pytest.mark.asyncio

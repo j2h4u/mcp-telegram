@@ -13,7 +13,7 @@ import logging
 import sqlite3
 import time
 from collections.abc import Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Protocol, cast
 
@@ -31,27 +31,27 @@ from .own_only import (
     enroll_own_only_dialog,
     query_own_only_candidates,
 )
+from .telegram_gateway import ScheduledHistoryClient, fetch_scheduled_history_snapshot
 
 logger = logging.getLogger(__name__)
 
 _SCHEDULED_SYNC_KEY = "account"
-_DEFAULT_RECONCILIATION_INTERVAL_S = 900.0
 _DELETE_SCHEDULED_FTS_SQL = "DELETE FROM scheduled_messages_fts WHERE dialog_id=? AND message_id=?"
 _INSERT_SCHEDULED_FTS_SQL = "INSERT INTO scheduled_messages_fts(dialog_id, message_id, stemmed_text) VALUES (?, ?, ?)"
+
+
+@dataclass(frozen=True, slots=True)
+class ScheduledReconciliationPolicy:
+    interval_seconds: float
+    flood_sleep_threshold_seconds: int
 
 
 def _as_int(value: object) -> int:
     return int(cast(int | str, value))
 
 
-class _ScheduledClient(Protocol):
-    async def get_messages(self, **_kwargs: object) -> object: ...
-
+class _ScheduledClient(ScheduledHistoryClient, Protocol):
     async def get_entity(self, _dialog_id: int) -> object: ...
-
-    async def get_input_entity(self, _dialog_id: int) -> object: ...
-
-    async def __call__(self, _request: object) -> object: ...
 
 
 def _unix_timestamp(value: object | None) -> int | None:
@@ -314,22 +314,40 @@ class ScheduledMessageReconciler:
         client: _ScheduledClient,
         conn: sqlite3.Connection,
         shutdown_event: asyncio.Event,
+        scheduled_flood_sleep_threshold_seconds: int,
         own_only_context: OwnOnlyContext | None = None,
     ) -> None:
         self._client = client
         self._conn = conn
         self._shutdown_event = shutdown_event
+        self._scheduled_flood_sleep_threshold_seconds = scheduled_flood_sleep_threshold_seconds
         self._own_only_context = own_only_context
 
     def _legacy_dialog_ids(self) -> set[int]:
+        """Return scheduled rows already known locally.
+
+        Scheduled queues are author-only Telegram state.  Without the own-only
+        classifier context, a broad sweep over every synced dialog is unsafe:
+        it fans out `messages.getScheduledHistory` across hundreds of peers and
+        can trigger account-wide FloodWaits.  Existing scheduled rows still need
+        reconciliation, but discovering new queues belongs to the own-only path
+        where candidate ownership is explicit.
+        """
         rows = cast(
             list[tuple[object]],
             self._conn.execute(
-                "SELECT dialog_id FROM synced_dialogs WHERE status != 'access_lost' "
-                "UNION SELECT dialog_id FROM scheduled_messages WHERE message_state='scheduled'"
+                "SELECT DISTINCT dialog_id FROM scheduled_messages WHERE message_state='scheduled'"
             ).fetchall(),
         )
         return {_as_int(row[0]) for row in rows}
+
+    async def _fetch_scheduled_snapshot(self, dialog_id: int) -> list[object]:
+        """Fetch one scheduled queue snapshot through the Telegram gateway."""
+        return await fetch_scheduled_history_snapshot(
+            self._client,
+            dialog_id,
+            flood_sleep_threshold_seconds=self._scheduled_flood_sleep_threshold_seconds,
+        )
 
     async def _own_only_dialog_ids(self) -> set[int] | None:  # noqa: PLR0912
         """Classify accessible local candidates before touching scheduled history."""
@@ -425,8 +443,7 @@ class ScheduledMessageReconciler:
             if self._shutdown_event.is_set():
                 break
             try:
-                # Telethon translates this to messages.getScheduledHistory.
-                result = await self._client.get_messages(entity=dialog_id, scheduled=True)
+                snapshot = await self._fetch_scheduled_snapshot(dialog_id)
             except FloodWaitError as exc:
                 retry_at = int(time.time()) + max(1, int(exc.seconds))
                 _record_retry(self._conn, retry_at, "FloodWaitError")
@@ -441,7 +458,6 @@ class ScheduledMessageReconciler:
                 logger.warning("scheduled_reconcile_rpc_error dialog_id=%d error=%s", dialog_id, exc)
                 continue
 
-            snapshot = list(cast(Sequence[object], result or ()))
             snapshot_ids = {int(getattr(message, "id", 0)) for message in snapshot if getattr(message, "id", None)}
             active_rows = cast(
                 list[tuple[object]],
@@ -467,25 +483,32 @@ async def run_scheduled_reconciliation_loop(
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,
     *,
-    interval: float = _DEFAULT_RECONCILIATION_INTERVAL_S,
+    policy: ScheduledReconciliationPolicy,
     own_only_context: OwnOnlyContext | None = None,
 ) -> None:
     """Run snapshots until shutdown; FloodWait backoff is persisted, not slept."""
     while not shutdown_event.is_set():
         try:
-            await ScheduledMessageReconciler(client, conn, shutdown_event, own_only_context).run_once()
+            await ScheduledMessageReconciler(
+                client,
+                conn,
+                shutdown_event,
+                policy.flood_sleep_threshold_seconds,
+                own_only_context,
+            ).run_once()
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.warning("scheduled_reconcile_failed", exc_info=True)
         try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=interval)
+            await asyncio.wait_for(shutdown_event.wait(), timeout=policy.interval_seconds)
         except TimeoutError:
             continue
 
 
 __all__ = [
     "ScheduledMessageReconciler",
+    "ScheduledReconciliationPolicy",
     "mark_missing_from_snapshot",
     "mark_scheduled_messages_removed",
     "run_scheduled_reconciliation_loop",

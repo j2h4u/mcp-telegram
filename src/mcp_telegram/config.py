@@ -76,6 +76,7 @@ class SchedulingConfig:
     activity_cold_backfill_batch_pause_seconds: float = 5.0
     activity_cold_enroll_seconds: float = 1_800.0
     activity_cold_access_retry_seconds: float = 3_600.0
+    scheduled_flood_sleep_threshold_seconds: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,6 +181,13 @@ def _positive_float(data: dict[str, object], key: str, section: str, path: Path,
     return float(value)
 
 
+def _non_negative_int(data: dict[str, object], key: str, section: str, path: Path, default: int) -> int:
+    value = data.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ConfigError(f"Invalid {section}.{key} in {path}: expected integer >= 0")
+    return value
+
+
 def _non_empty_str(data: dict[str, object], key: str, section: str, path: Path, default: str) -> str:
     value = data.get(key, default)
     if not isinstance(value, str) or not value.strip():
@@ -210,6 +218,19 @@ def _env_positive_float(environ: Mapping[str, str], name: str, default: float) -
     return value
 
 
+def _env_non_negative_int(environ: Mapping[str, str], name: str, default: int) -> int:
+    raw = environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ConfigError(f"{name} must be an integer >= 0") from exc
+    if value < 0:
+        raise ConfigError(f"{name} must be an integer >= 0")
+    return value
+
+
 def resolve_scheduling_config(
     config: SchedulingConfig,
     environ: Mapping[str, str] | None = None,
@@ -220,6 +241,11 @@ def resolve_scheduling_config(
         config,
         scheduled_reconciliation_seconds=_env_positive_float(
             env, "SCHEDULED_RECONCILIATION_SECONDS", config.scheduled_reconciliation_seconds
+        ),
+        scheduled_flood_sleep_threshold_seconds=_env_non_negative_int(
+            env,
+            "SCHEDULED_FLOOD_SLEEP_THRESHOLD_SECONDS",
+            config.scheduled_flood_sleep_threshold_seconds,
         ),
         reconciliation_hourly_seconds=_env_positive_float(
             env, "RECON_HOURLY_SECONDS", config.reconciliation_hourly_seconds
@@ -391,21 +417,74 @@ def _parse_telemetry(data: dict[str, object], path: Path) -> TelemetryConfig:
 
 def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
     defaults = SchedulingConfig()
-    default_values = {
-        "scheduled_reconciliation_seconds": defaults.scheduled_reconciliation_seconds,
-        "reconciliation_hourly_seconds": defaults.reconciliation_hourly_seconds,
-        "activity_hot_sweep_seconds": defaults.activity_hot_sweep_seconds,
-        "activity_cold_backfill_seconds": defaults.activity_cold_backfill_seconds,
-        "activity_cold_backfill_batch_pause_seconds": defaults.activity_cold_backfill_batch_pause_seconds,
-        "activity_cold_enroll_seconds": defaults.activity_cold_enroll_seconds,
-        "activity_cold_access_retry_seconds": defaults.activity_cold_access_retry_seconds,
+    allowed = {
+        "scheduled_reconciliation_seconds",
+        "scheduled_flood_sleep_threshold_seconds",
+        "reconciliation_hourly_seconds",
+        "activity_hot_sweep_seconds",
+        "activity_cold_backfill_seconds",
+        "activity_cold_backfill_batch_pause_seconds",
+        "activity_cold_enroll_seconds",
+        "activity_cold_access_retry_seconds",
     }
-    scheduling_data = _optional_section(data, "scheduling", set(default_values), path)
+    scheduling_data = _optional_section(data, "scheduling", allowed, path)
     return SchedulingConfig(
-        **{
-            name: _positive_float(scheduling_data, name, "scheduling", path, default)
-            for name, default in default_values.items()
-        }
+        scheduled_reconciliation_seconds=_positive_float(
+            scheduling_data,
+            "scheduled_reconciliation_seconds",
+            "scheduling",
+            path,
+            defaults.scheduled_reconciliation_seconds,
+        ),
+        scheduled_flood_sleep_threshold_seconds=_non_negative_int(
+            scheduling_data,
+            "scheduled_flood_sleep_threshold_seconds",
+            "scheduling",
+            path,
+            defaults.scheduled_flood_sleep_threshold_seconds,
+        ),
+        reconciliation_hourly_seconds=_positive_float(
+            scheduling_data,
+            "reconciliation_hourly_seconds",
+            "scheduling",
+            path,
+            defaults.reconciliation_hourly_seconds,
+        ),
+        activity_hot_sweep_seconds=_positive_float(
+            scheduling_data,
+            "activity_hot_sweep_seconds",
+            "scheduling",
+            path,
+            defaults.activity_hot_sweep_seconds,
+        ),
+        activity_cold_backfill_seconds=_positive_float(
+            scheduling_data,
+            "activity_cold_backfill_seconds",
+            "scheduling",
+            path,
+            defaults.activity_cold_backfill_seconds,
+        ),
+        activity_cold_backfill_batch_pause_seconds=_positive_float(
+            scheduling_data,
+            "activity_cold_backfill_batch_pause_seconds",
+            "scheduling",
+            path,
+            defaults.activity_cold_backfill_batch_pause_seconds,
+        ),
+        activity_cold_enroll_seconds=_positive_float(
+            scheduling_data,
+            "activity_cold_enroll_seconds",
+            "scheduling",
+            path,
+            defaults.activity_cold_enroll_seconds,
+        ),
+        activity_cold_access_retry_seconds=_positive_float(
+            scheduling_data,
+            "activity_cold_access_retry_seconds",
+            "scheduling",
+            path,
+            defaults.activity_cold_access_retry_seconds,
+        ),
     )
 
 
