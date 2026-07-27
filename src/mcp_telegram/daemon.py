@@ -81,7 +81,7 @@ from .reactions.refresh import ReactionFreshener
 from .reactions.sqlite_repository import SQLiteReactionSnapshotRepository
 from .reactions.telegram_adapter import TelethonTelegramReactionGateway
 from .read_state import apply_read_cursor
-from .scheduled_messages import run_scheduled_reconciliation_loop
+from .scheduled_messages import ScheduledReconciliationPolicy, run_scheduled_reconciliation_loop
 from .state import StatePaths, ensure_private_state_dir
 from .sync_db import (
     _open_sync_db,
@@ -117,7 +117,7 @@ class _DaemonClient(Protocol):
 
     async def get_messages(self, *_args: object, **_kwargs: object) -> object: ...
 
-    async def __call__(self, _request: object) -> object: ...
+    async def __call__(self, _request: object, **_kwargs: object) -> object: ...
 
 
 class _ReadPositionDialogLike(Protocol):
@@ -934,7 +934,10 @@ async def _start_followup_background_tasks(
             ctx.client,
             ctx.conn,
             ctx.shutdown_event,
-            interval=ctx.scheduling.scheduled_reconciliation_seconds,
+            policy=ScheduledReconciliationPolicy(
+                interval_seconds=ctx.scheduling.scheduled_reconciliation_seconds,
+                flood_sleep_threshold_seconds=ctx.scheduling.scheduled_flood_sleep_threshold_seconds,
+            ),
             own_only_context=ctx.own_only_context,
         ),
         name="scheduled_message_reconciliation",

@@ -65,6 +65,7 @@ retention_ttl_seconds = 46
 
 [scheduling]
 scheduled_reconciliation_seconds = 47
+scheduled_flood_sleep_threshold_seconds = 0
 reconciliation_hourly_seconds = 48
 activity_hot_sweep_seconds = 49
 
@@ -79,7 +80,12 @@ port = 3200
     assert config.freshness.read_receipts == ReadReceiptsConfig(read_at_ttl_seconds=41)
     assert config.freshness.entities == EntitiesConfig(42, 43, 44, 45)
     assert config.telemetry == TelemetryConfig(retention_ttl_seconds=46)
-    assert config.scheduling == SchedulingConfig(47.0, 48.0, 49.0)
+    assert config.scheduling == SchedulingConfig(
+        47.0,
+        48.0,
+        49.0,
+        scheduled_flood_sleep_threshold_seconds=0,
+    )
     assert config.http == HttpServerConfig(host="localhost", port=3200)
 
 
@@ -88,6 +94,7 @@ def test_runtime_environment_overrides_are_parsed_by_config_model() -> None:
         SchedulingConfig(),
         {
             "SCHEDULED_RECONCILIATION_SECONDS": "47.5",
+            "SCHEDULED_FLOOD_SLEEP_THRESHOLD_SECONDS": "0",
             "RECON_HOURLY_SECONDS": "48",
             "ACTIVITY_HOT_SWEEP_SECONDS": "49",
             "ACTIVITY_COLD_BACKFILL_SECONDS": "50",
@@ -107,7 +114,16 @@ def test_runtime_environment_overrides_are_parsed_by_config_model() -> None:
         }
     )
 
-    assert scheduling == SchedulingConfig(47.5, 48.0, 49.0, 50.0, 51.0, 52.0, 53.0)
+    assert scheduling == SchedulingConfig(
+        47.5,
+        48.0,
+        49.0,
+        50.0,
+        51.0,
+        52.0,
+        53.0,
+        scheduled_flood_sleep_threshold_seconds=0,
+    )
     assert resolve_logging_config({"LOG_LEVEL": "debug"}).level == "DEBUG"
     assert http == HttpServerConfig(
         host="0.0.0.0",
@@ -124,6 +140,10 @@ def test_runtime_environment_overrides_are_parsed_by_config_model() -> None:
         ('[state]\ndir = "/state"\n\n[freshness.reactions]\nfreshness_ttl_seconds = true\n', "freshness_ttl_seconds"),
         ('[state]\ndir = "/state"\n\n[freshness.read_receipts]\nread_at_ttl_seconds = 0\n', "read_at_ttl_seconds"),
         ('[state]\ndir = "/state"\n\n[freshness.entities]\ndetail_ttl_seconds = "300"\n', "detail_ttl_seconds"),
+        (
+            '[state]\ndir = "/state"\n\n[scheduling]\nscheduled_flood_sleep_threshold_seconds = -1\n',
+            "scheduled_flood_sleep_threshold_seconds",
+        ),
         ('[state]\ndir = "/state"\n\n[freshness]\nunknown = 1\n', "freshness"),
         ('[state]\ndir = "/state"\n\nfreshness = "invalid"\n', "[freshness]"),
         ('[state]\ndir = "/state"\n\n[reactions]\nfreshness_ttl_seconds = 42\n', "root"),

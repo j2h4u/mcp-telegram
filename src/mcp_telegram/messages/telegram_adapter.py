@@ -389,7 +389,7 @@ async def _resolve_peer_name(client: PeerNameClient, peer: _PeerLike) -> str | N
     """
     log_id = tl_utils.get_peer_id(peer)
     try:
-        entity = await client.get_entity(peer=peer)
+        entity = await client.get_entity(peer)
         title = _attr(entity, "title", None)
         name = title or _attr(entity, "first_name", None) or ""
         last = _attr(entity, "last_name", None)

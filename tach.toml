@@ -152,7 +152,7 @@ depends_on = []
 [[modules]]
 path = "mcp_telegram.scheduled_messages"
 layer = "application"
-depends_on = ["mcp_telegram.activity_peer_resolve", { path = "mcp_telegram.activity_sync", deprecated = true }, "mcp_telegram.fts", "mcp_telegram.message_contracts", "mcp_telegram.messages.telegram_adapter", "mcp_telegram.own_only"]
+depends_on = ["mcp_telegram.activity_peer_resolve", { path = "mcp_telegram.activity_sync", deprecated = true }, "mcp_telegram.fts", "mcp_telegram.message_contracts", "mcp_telegram.messages.telegram_adapter", "mcp_telegram.own_only", "mcp_telegram.telegram_gateway"]
 
 [[modules]]
 path = "mcp_telegram.own_only"
