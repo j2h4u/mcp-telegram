@@ -23,7 +23,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from helpers import build_mock_message
-from mcp_telegram.delta_sync import DeltaSyncWorker, _DeltaSyncClient
+from mcp_telegram.delta_sync import DeltaCatchUpPolicy, DeltaSyncWorker, _DeltaSyncClient, run_delta_catch_up_loop
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 
 
@@ -1300,3 +1300,71 @@ async def test_checkpoint_skip_emits_log(
     skip_logs = [r for r in caplog.records if "delta_catch_up_skip" in r.getMessage()]
     assert len(skip_logs) == 1, f"Expected 1 skip log, got {len(skip_logs)}: {[r.getMessage() for r in caplog.records]}"
     assert f"dialog_id={dialog_id}" in skip_logs[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_delta_catch_up_respects_probe_budget(
+    mock_client: _MockClient,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    dialog_ids = [7001, 7002, 7003]
+    for dialog_id in dialog_ids:
+        sync_db.execute(
+            "INSERT INTO synced_dialogs (dialog_id, status, last_synced_at) VALUES (?, 'synced', ?)",
+            (dialog_id, 1000),
+        )
+        sync_db.execute(
+            "INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (?, 10, 1704067200)",
+            (dialog_id,),
+        )
+    sync_db.commit()
+
+    calls: list[int] = []
+
+    async def _iter_messages(**kwargs: object):
+        calls.append(cast(int, kwargs["entity"]))
+        return
+        yield
+
+    mock_client.iter_messages = _iter_messages
+
+    worker = make_worker(mock_client, sync_db, shutdown_event)
+    await worker.run_delta_catch_up(
+        policy=DeltaCatchUpPolicy(
+            interval_seconds=300.0,
+            max_probes_per_cycle=2,
+            probe_pause_seconds=0.01,
+        )
+    )
+
+    assert calls == dialog_ids[:2]
+
+
+@pytest.mark.asyncio
+async def test_delta_catch_up_loop_can_be_disabled(
+    mock_client: _MockClient,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    calls: list[object] = []
+
+    async def _iter_messages(**kwargs: object):
+        calls.append(kwargs)
+        return
+        yield
+
+    mock_client.iter_messages = _iter_messages
+
+    worker = make_worker(mock_client, sync_db, shutdown_event)
+    await run_delta_catch_up_loop(
+        worker,
+        shutdown_event,
+        DeltaCatchUpPolicy(
+            interval_seconds=300.0,
+            max_probes_per_cycle=0,
+            probe_pause_seconds=1.0,
+        ),
+    )
+
+    assert calls == []

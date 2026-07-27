@@ -77,11 +77,22 @@ class FloodWaitConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class TelegramRpcConfig:
+    """Account-level Telegram RPC budget."""
+
+    max_calls_per_period: int = 30
+    period_seconds: float = 60.0
+
+
+@dataclass(frozen=True, slots=True)
 class SchedulingConfig:
     """Intervals for local daemon maintenance loops."""
 
     scheduled_reconciliation_seconds: float = 900.0
     reconciliation_hourly_seconds: float = 3_600.0
+    delta_catch_up_interval_seconds: float = 300.0
+    delta_catch_up_max_probes_per_cycle: int = 10
+    delta_catch_up_probe_pause_seconds: float = 1.0
     activity_hot_sweep_seconds: float = 3_600.0
     activity_cold_backfill_seconds: float = 300.0
     activity_cold_backfill_batch_pause_seconds: float = 5.0
@@ -141,6 +152,7 @@ class McpTelegramConfig:
     freshness: FreshnessConfig = field(default_factory=FreshnessConfig)
     telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
     flood_wait: FloodWaitConfig = field(default_factory=FloodWaitConfig)
+    telegram_rpc: TelegramRpcConfig = field(default_factory=TelegramRpcConfig)
     scheduling: SchedulingConfig = field(default_factory=SchedulingConfig)
     http: HttpServerConfig = field(default_factory=HttpServerConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
@@ -268,6 +280,15 @@ def resolve_scheduling_config(
         ),
         reconciliation_hourly_seconds=_env_positive_float(
             env, "RECON_HOURLY_SECONDS", config.reconciliation_hourly_seconds
+        ),
+        delta_catch_up_interval_seconds=_env_positive_float(
+            env, "DELTA_CATCH_UP_INTERVAL_SECONDS", config.delta_catch_up_interval_seconds
+        ),
+        delta_catch_up_max_probes_per_cycle=_env_non_negative_int(
+            env, "DELTA_CATCH_UP_MAX_PROBES_PER_CYCLE", config.delta_catch_up_max_probes_per_cycle
+        ),
+        delta_catch_up_probe_pause_seconds=_env_positive_float(
+            env, "DELTA_CATCH_UP_PROBE_PAUSE_SECONDS", config.delta_catch_up_probe_pause_seconds
         ),
         activity_hot_sweep_seconds=_env_positive_float(
             env, "ACTIVITY_HOT_SWEEP_SECONDS", config.activity_hot_sweep_seconds
@@ -469,12 +490,30 @@ def _parse_flood_wait(data: dict[str, object], path: Path) -> FloodWaitConfig:
     )
 
 
+def _parse_telegram_rpc(data: dict[str, object], path: Path) -> TelegramRpcConfig:
+    rpc_data = _optional_section(data, "telegram_rpc", {"max_calls_per_period", "period_seconds"}, path)
+    defaults = TelegramRpcConfig()
+    return TelegramRpcConfig(
+        max_calls_per_period=_non_negative_int(
+            rpc_data,
+            "max_calls_per_period",
+            "telegram_rpc",
+            path,
+            defaults.max_calls_per_period,
+        ),
+        period_seconds=_positive_float(rpc_data, "period_seconds", "telegram_rpc", path, defaults.period_seconds),
+    )
+
+
 def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
     defaults = SchedulingConfig()
     allowed = {
         "scheduled_reconciliation_seconds",
         "scheduled_flood_sleep_threshold_seconds",
         "reconciliation_hourly_seconds",
+        "delta_catch_up_interval_seconds",
+        "delta_catch_up_max_probes_per_cycle",
+        "delta_catch_up_probe_pause_seconds",
         "activity_hot_sweep_seconds",
         "activity_cold_backfill_seconds",
         "activity_cold_backfill_batch_pause_seconds",
@@ -503,6 +542,27 @@ def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
             "scheduling",
             path,
             defaults.reconciliation_hourly_seconds,
+        ),
+        delta_catch_up_interval_seconds=_positive_float(
+            scheduling_data,
+            "delta_catch_up_interval_seconds",
+            "scheduling",
+            path,
+            defaults.delta_catch_up_interval_seconds,
+        ),
+        delta_catch_up_max_probes_per_cycle=_non_negative_int(
+            scheduling_data,
+            "delta_catch_up_max_probes_per_cycle",
+            "scheduling",
+            path,
+            defaults.delta_catch_up_max_probes_per_cycle,
+        ),
+        delta_catch_up_probe_pause_seconds=_positive_float(
+            scheduling_data,
+            "delta_catch_up_probe_pause_seconds",
+            "scheduling",
+            path,
+            defaults.delta_catch_up_probe_pause_seconds,
         ),
         activity_hot_sweep_seconds=_positive_float(
             scheduling_data,
@@ -563,7 +623,7 @@ def load_config(path: Path | None = None) -> McpTelegramConfig:
     data = _read_config(config_path)
     _reject_unknown_keys(
         data,
-        {"state", "freshness", "telemetry", "flood_wait", "scheduling", "http", "logging"},
+        {"state", "freshness", "telemetry", "flood_wait", "telegram_rpc", "scheduling", "http", "logging"},
         "root",
         config_path,
     )
@@ -572,6 +632,7 @@ def load_config(path: Path | None = None) -> McpTelegramConfig:
         freshness=_parse_freshness(data, config_path),
         telemetry=_parse_telemetry(data, config_path),
         flood_wait=_parse_flood_wait(data, config_path),
+        telegram_rpc=_parse_telegram_rpc(data, config_path),
         scheduling=_parse_scheduling(data, config_path),
         http=_parse_http(data, config_path),
         logging=_parse_logging(data, config_path),
