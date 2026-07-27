@@ -25,6 +25,7 @@ from mcp_telegram.daemon_dialog_queries import _compute_sync_coverage
 from mcp_telegram.daemon_ipc import get_daemon_socket_path
 from mcp_telegram.daemon_message import _MessageLike, fetch_reaction_counts, message_to_dict
 from mcp_telegram.daemon_message_queries import _build_list_messages_query, _ListMessagesDbRequest
+from mcp_telegram.flood import FloodWaitKillSwitchStatus
 from mcp_telegram.fts import MESSAGES_FTS_DDL, stem_text
 from mcp_telegram.models import DialogType
 from mcp_telegram.telethon_dialog import classify_dialog_type
@@ -1855,6 +1856,34 @@ async def test_unknown_method() -> None:
 
     assert result["ok"] is False
     assert result["error"] == "unknown_method"
+
+
+@pytest.mark.asyncio
+async def test_daemon_api_returns_unhealthy_when_flood_wait_kill_switch_is_open() -> None:
+    """Healthcheck method is blocked with a clear kill-switch error."""
+    server = make_server()
+    server._health_status = lambda: FloodWaitKillSwitchStatus(
+        open=True,
+        reason="too_many_flood_wait_events",
+        opened_at=1_700_000_000,
+        events_in_window=5,
+        wait_s_in_window=300,
+        window_seconds=600,
+        minimum_cooldown_seconds=1_800,
+        source="test",
+    )
+
+    response, method, request_id = await server._handle_client_line(
+        b'{"method":"get_sync_status","request_id":"health"}',
+        "",
+        None,
+    )
+
+    assert method == "get_sync_status"
+    assert request_id == "health"
+    assert response["ok"] is False
+    assert response["error"] == "flood_wait_kill_switch_open"
+    assert "too_many_flood_wait_events" in str(response["detail"])
 
 
 # ---------------------------------------------------------------------------

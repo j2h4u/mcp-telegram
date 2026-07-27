@@ -66,6 +66,17 @@ class TelemetryConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class FloodWaitConfig:
+    """Account-level FloodWait storm kill-switch policy."""
+
+    kill_switch_enabled: bool = True
+    kill_switch_window_seconds: int = 600
+    kill_switch_max_events: int = 5
+    kill_switch_max_wait_seconds: int = 900
+    kill_switch_minimum_cooldown_seconds: int = 1_800
+
+
+@dataclass(frozen=True, slots=True)
 class SchedulingConfig:
     """Intervals for local daemon maintenance loops."""
 
@@ -129,6 +140,7 @@ class McpTelegramConfig:
     state: StateConfig
     freshness: FreshnessConfig = field(default_factory=FreshnessConfig)
     telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
+    flood_wait: FloodWaitConfig = field(default_factory=FloodWaitConfig)
     scheduling: SchedulingConfig = field(default_factory=SchedulingConfig)
     http: HttpServerConfig = field(default_factory=HttpServerConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
@@ -185,6 +197,13 @@ def _non_negative_int(data: dict[str, object], key: str, section: str, path: Pat
     value = data.get(key, default)
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ConfigError(f"Invalid {section}.{key} in {path}: expected integer >= 0")
+    return value
+
+
+def _bool(data: dict[str, object], key: str, section: str, path: Path, default: bool) -> bool:
+    value = data.get(key, default)
+    if not isinstance(value, bool):
+        raise ConfigError(f"Invalid {section}.{key} in {path}: expected boolean")
     return value
 
 
@@ -415,6 +434,41 @@ def _parse_telemetry(data: dict[str, object], path: Path) -> TelemetryConfig:
     )
 
 
+def _parse_flood_wait(data: dict[str, object], path: Path) -> FloodWaitConfig:
+    flood_data = _optional_section(
+        data,
+        "flood_wait",
+        {
+            "kill_switch_enabled",
+            "kill_switch_window_seconds",
+            "kill_switch_max_events",
+            "kill_switch_max_wait_seconds",
+            "kill_switch_minimum_cooldown_seconds",
+        },
+        path,
+    )
+    defaults = FloodWaitConfig()
+    return FloodWaitConfig(
+        kill_switch_enabled=_bool(flood_data, "kill_switch_enabled", "flood_wait", path, defaults.kill_switch_enabled),
+        kill_switch_window_seconds=_positive_int(
+            flood_data, "kill_switch_window_seconds", "flood_wait", path, defaults.kill_switch_window_seconds
+        ),
+        kill_switch_max_events=_positive_int(
+            flood_data, "kill_switch_max_events", "flood_wait", path, defaults.kill_switch_max_events
+        ),
+        kill_switch_max_wait_seconds=_positive_int(
+            flood_data, "kill_switch_max_wait_seconds", "flood_wait", path, defaults.kill_switch_max_wait_seconds
+        ),
+        kill_switch_minimum_cooldown_seconds=_positive_int(
+            flood_data,
+            "kill_switch_minimum_cooldown_seconds",
+            "flood_wait",
+            path,
+            defaults.kill_switch_minimum_cooldown_seconds,
+        ),
+    )
+
+
 def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
     defaults = SchedulingConfig()
     allowed = {
@@ -508,12 +562,16 @@ def load_config(path: Path | None = None) -> McpTelegramConfig:
     config_path = path or get_config_path()
     data = _read_config(config_path)
     _reject_unknown_keys(
-        data, {"state", "freshness", "telemetry", "scheduling", "http", "logging"}, "root", config_path
+        data,
+        {"state", "freshness", "telemetry", "flood_wait", "scheduling", "http", "logging"},
+        "root",
+        config_path,
     )
     return McpTelegramConfig(
         state=_parse_state(data, config_path),
         freshness=_parse_freshness(data, config_path),
         telemetry=_parse_telemetry(data, config_path),
+        flood_wait=_parse_flood_wait(data, config_path),
         scheduling=_parse_scheduling(data, config_path),
         http=_parse_http(data, config_path),
         logging=_parse_logging(data, config_path),

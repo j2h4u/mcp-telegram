@@ -57,14 +57,17 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
 from .activity_cold_backfill import ColdBackfillPacing, run_cold_backfill_loop
 from .activity_hot_sweep import run_hot_sweep_loop
 from .activity_sync import _ActivityClient, run_activity_sync_loop
-from .config import SchedulingConfig, load_config, resolve_scheduling_config
+from .config import McpTelegramConfig, SchedulingConfig, load_config, resolve_scheduling_config
 from .daemon_api import DaemonApiPolicy, DaemonAPIServer, DaemonClientLike
 from .delta_sync import DeltaSyncWorker, _DeltaSyncClient, run_access_probe_loop
 from .dialog_sync import DialogsBootstrapWorker, run_reconciliation_loop
 from .event_handlers import EventHandlerManager
 from .feedback_db import ensure_feedback_schema
 from .flood import (
+    FloodWaitKillSwitchPolicy,
+    configure_flood_wait_kill_switch,
     flood_seconds,
+    flood_wait_kill_switch_status,
     install_telethon_flood_wait_metrics_filter,
     maybe_log_flood_wait_rollup,
     sleep_through_flood,
@@ -224,6 +227,7 @@ class _SyncMainContext:
     own_only_context: OwnOnlyContext | None = None
     scheduling: SchedulingConfig = field(default_factory=SchedulingConfig)
     background_tasks: set[asyncio.Task[object]] = field(default_factory=set)
+    flood_wait_kill_switch_event: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 @dataclass(frozen=True, slots=True)
@@ -613,6 +617,15 @@ async def _run_sync_loop(
     )
 
     while not shutdown_event.is_set():
+        kill_switch_status = flood_wait_kill_switch_status()
+        if kill_switch_status.open:
+            logger.critical("sync_loop_paused_flood_wait_kill_switch %s", kill_switch_status.detail())
+            try:
+                await asyncio.wait_for(shutdown_event.wait(), timeout=HEARTBEAT_INTERVAL_S)
+            except TimeoutError:
+                continue
+            break
+
         all_synced = await worker.process_one_batch()
         await asyncio.sleep(0)
 
@@ -665,6 +678,36 @@ def _create_tracked_task(
     return task
 
 
+async def _monitor_flood_wait_kill_switch(ctx: _SyncMainContext) -> None:
+    """Stop Telegram-facing work when the account-level FloodWait breaker opens."""
+    await ctx.flood_wait_kill_switch_event.wait()
+    status = flood_wait_kill_switch_status()
+    if not status.open:
+        return
+
+    logger.critical("flood_wait_kill_switch_stopping_telegram_work %s", status.detail())
+    current_task = asyncio.current_task()
+    for task in list(ctx.background_tasks):
+        if task is not current_task:
+            task.cancel()
+    await ctx.client.disconnect()
+    logger.critical("flood_wait_kill_switch_telegram_disconnected")
+
+
+def _install_flood_wait_kill_switch(config: McpTelegramConfig, event: asyncio.Event) -> None:
+    policy_config = config.flood_wait
+    configure_flood_wait_kill_switch(
+        FloodWaitKillSwitchPolicy(
+            enabled=policy_config.kill_switch_enabled,
+            window_seconds=policy_config.kill_switch_window_seconds,
+            max_events=policy_config.kill_switch_max_events,
+            max_wait_seconds=policy_config.kill_switch_max_wait_seconds,
+            minimum_cooldown_seconds=policy_config.kill_switch_minimum_cooldown_seconds,
+        ),
+        event=event,
+    )
+
+
 async def _build_sync_main_context() -> _SyncMainContext:
     config = load_config()
     state_paths = StatePaths.from_state_dir(ensure_private_state_dir(config.state.dir))
@@ -686,8 +729,9 @@ async def _build_sync_main_context() -> _SyncMainContext:
     feedback_conn = ensure_feedback_schema(feedback_db_path)
     logger.info("feedback.db ready at %s", feedback_db_path)
 
-    loop = asyncio.get_running_loop()
-    shutdown_event = register_shutdown_handler(conn, loop, feedback_conn=feedback_conn)
+    shutdown_event = register_shutdown_handler(conn, asyncio.get_running_loop(), feedback_conn=feedback_conn)
+    flood_wait_kill_switch_event = asyncio.Event()
+    _install_flood_wait_kill_switch(config, flood_wait_kill_switch_event)
 
     client = cast(_DaemonClient, create_client(catch_up=True))
     reaction_freshener = ReactionFreshener(
@@ -716,6 +760,7 @@ async def _build_sync_main_context() -> _SyncMainContext:
             resolver_enrichment_ttl_seconds=config.freshness.entities.resolver_enrichment_ttl_seconds,
             telemetry_retention_ttl_seconds=config.telemetry.retention_ttl_seconds,
         ),
+        health_status=flood_wait_kill_switch_status,
     )
     socket_path = state_paths.daemon_socket_path
     socket_path.unlink(missing_ok=True)
@@ -741,6 +786,7 @@ async def _build_sync_main_context() -> _SyncMainContext:
         socket_path=socket_path,
         unix_server=unix_server,
         scheduling=resolve_scheduling_config(config.scheduling),
+        flood_wait_kill_switch_event=flood_wait_kill_switch_event,
     )
 
 
@@ -895,6 +941,11 @@ async def _start_followup_background_tasks(
 ) -> None:
     activity_client = cast(_ActivityClient, ctx.client)
     delta_client = cast(_DeltaSyncClient, ctx.client)
+    _create_tracked_task(
+        ctx,
+        _monitor_flood_wait_kill_switch(ctx),
+        name="flood_wait_kill_switch_monitor",
+    )
     _create_tracked_task(
         ctx,
         _backfill_blank_unsupported_messages(ctx.client, ctx.conn, ctx.shutdown_event),

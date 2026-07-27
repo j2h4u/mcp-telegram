@@ -331,6 +331,7 @@ def test_self_id_cached_at_startup(
             reaction_freshener,
             topic_refresher,
             policy,
+            health_status,
         ):
             self._conn = conn
             self._client = client
@@ -340,6 +341,7 @@ def test_self_id_cached_at_startup(
             self._reaction_freshener = reaction_freshener
             self._topic_refresher = topic_refresher
             self._policy = policy
+            self._health_status = health_status
             self.self_id = None
             captured["instance"] = self
 
