@@ -85,7 +85,7 @@ compile:
 
 # Build and install the wheel in an isolated environment, then smoke safe CLI help paths.
 package-smoke:
-    uv run python scripts/check_packaging_smoke.py
+    uv run --frozen python scripts/check_packaging_smoke.py
 
 # Run pytest. Extra args are forwarded, e.g. `just test tests/test_daemon_api.py -q`.
 test *args:

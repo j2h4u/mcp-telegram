@@ -43,6 +43,7 @@ dev = [
     "radon>=6.0.1",
     "deptry>=0.25.1",
     "tach>=0.35",
+    "setuptools==83.0.0",
 ]
 
 [project.scripts]
