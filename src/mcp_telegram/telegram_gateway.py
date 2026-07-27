@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from typing import Protocol, cast
 
 from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
@@ -20,6 +21,33 @@ class ScheduledHistoryClient(Protocol):
     async def get_input_entity(self, _dialog_id: int) -> object: ...
 
     async def __call__(self, _request: object, **_kwargs: object) -> object: ...
+
+
+class _FloodSleepThresholdClient(Protocol):
+    flood_sleep_threshold: int
+
+
+@contextmanager
+def _client_flood_sleep_threshold(client: object, threshold: int) -> Iterator[None]:
+    """Temporarily set Telethon's client-level FloodWait sleep threshold.
+
+    Telethon 1.44 accepts a per-call ``flood_sleep_threshold`` kwarg, but its
+    FloodWait exception path still compares against ``self.flood_sleep_threshold``.
+    Scheduled reconciliation needs short FloodWaits to raise immediately so the
+    daemon can persist account-level backoff instead of sleeping inside a
+    fan-out pass.
+    """
+    if not hasattr(client, "flood_sleep_threshold"):
+        yield
+        return
+
+    threshold_client = cast(_FloodSleepThresholdClient, client)
+    original = threshold_client.flood_sleep_threshold
+    threshold_client.flood_sleep_threshold = threshold
+    try:
+        yield
+    finally:
+        threshold_client.flood_sleep_threshold = original
 
 
 def translate_gateway_failure(exc: BaseException) -> GatewayFailure:
@@ -50,10 +78,11 @@ async def fetch_scheduled_history_snapshot(
     of silently sleeping and continuing the fan-out pass.
     """
     input_entity = cast(TypeInputPeer, await client.get_input_entity(dialog_id))
-    result = await client(
-        GetScheduledHistoryRequest(peer=input_entity, hash=0),
-        flood_sleep_threshold=flood_sleep_threshold_seconds,
-    )
+    with _client_flood_sleep_threshold(client, flood_sleep_threshold_seconds):
+        result = await client(
+            GetScheduledHistoryRequest(peer=input_entity, hash=0),
+            flood_sleep_threshold=flood_sleep_threshold_seconds,
+        )
     messages = list(cast(Sequence[object], getattr(result, "messages", ()) or ()))
     entities = {
         get_peer_id(entity): entity

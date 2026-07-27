@@ -59,6 +59,8 @@ class _ScheduledSnapshotClient:
         self.requests: list[tuple[object, dict[str, object]]] = []
         self.input_entity_calls: list[int] = []
         self.entity_calls: list[int] = []
+        self.flood_sleep_threshold = 60
+        self.thresholds_during_call: list[int] = []
 
     async def get_input_entity(self, _dialog_id: int) -> object:
         self.input_entity_calls.append(_dialog_id)
@@ -70,6 +72,7 @@ class _ScheduledSnapshotClient:
 
     async def __call__(self, _request: object, **_kwargs: object) -> object:
         self.requests.append((_request, _kwargs))
+        self.thresholds_during_call.append(self.flood_sleep_threshold)
         if self.call_error is not None:
             raise self.call_error
         dialog_id = int(cast(int, cast(SimpleNamespace, _request).peer))
@@ -152,6 +155,8 @@ async def test_reconciliation_snapshot_marks_disappearance_nonvisible(conn: sqli
     ).fetchone() == ("unknown_missing", 1, 1)
     assert len(client.requests) == 1
     assert client.requests[0][1]["flood_sleep_threshold"] == 0
+    assert client.thresholds_during_call == [0]
+    assert client.flood_sleep_threshold == 60
 
 
 @pytest.mark.asyncio
@@ -173,6 +178,8 @@ async def test_reconciliation_floodwait_records_retry_and_stops_account_pass(con
     assert error == "FloodWaitError"
     assert len(client.requests) == 1
     assert client.requests[0][1]["flood_sleep_threshold"] == 0
+    assert client.thresholds_during_call == [0]
+    assert client.flood_sleep_threshold == 60
 
 
 @pytest.mark.asyncio
