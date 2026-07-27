@@ -1,13 +1,13 @@
 """DeltaSyncWorker — forward gap-fill engine for v1.5 Persistent Sync.
 
-Fetches messages newer than the max known message_id per dialog on every
-daemon startup. Idempotent: dialogs with no gap complete
-instantly when iter_messages returns empty.
+Fetches messages newer than the max known message_id per dialog in bounded
+maintenance cycles. Idempotent: dialogs with no gap complete instantly when
+iter_messages returns empty.
 
 Architecture:
 - Mirrors FullSyncWorker structural pattern (client/conn/shutdown_event).
 - Fetches FORWARD (min_id + reverse=True) vs FullSyncWorker's backward.
-- Runs once at startup, before bootstrap_dms and FullSyncWorker loop.
+- Runs as a paced background maintenance loop, not as a blocking startup sweep.
 - Only processes dialogs with status='synced' — FullSyncWorker handles
   'syncing' and 'not_synced' dialogs.
 """
@@ -47,6 +47,22 @@ class DeltaHistoryPacing:
 @dataclass(frozen=True, slots=True)
 class DeltaSyncPacing:
     history: DeltaHistoryPacing = DeltaHistoryPacing()
+
+
+@dataclass(frozen=True, slots=True)
+class DeltaCatchUpPolicy:
+    """Bounded background policy for forward gap-fill probes."""
+
+    interval_seconds: float
+    max_probes_per_cycle: int
+    probe_pause_seconds: float
+
+    @property
+    def enabled(self) -> bool:
+        return self.max_probes_per_cycle > 0
+
+    def probe_budget_exhausted(self, probed: int) -> bool:
+        return probed >= self.max_probes_per_cycle
 
 
 _PACING = DeltaSyncPacing()
@@ -106,6 +122,32 @@ def _row_first_int(row: tuple[object | None, ...] | None) -> int:
     return 0
 
 
+def _recently_synced(last_synced_at: int | None, now: int) -> bool:
+    return last_synced_at is not None and (now - last_synced_at) < RECENT_SYNC_SKIP_THRESHOLD_S
+
+
+def _remaining_probe_candidates(*, total_rows: int, skipped: int, probed: int) -> int:
+    return max(0, total_rows - skipped - probed)
+
+
+def _log_probe_budget_exhausted(policy: DeltaCatchUpPolicy, *, total_rows: int, skipped: int, probed: int) -> None:
+    logger.info(
+        "delta_catch_up_probe_budget_exhausted max_probes=%d remaining=%d",
+        policy.max_probes_per_cycle,
+        _remaining_probe_candidates(total_rows=total_rows, skipped=skipped, probed=probed),
+    )
+
+
+async def _pause_after_probe(shutdown_event: asyncio.Event, policy: DeltaCatchUpPolicy | None) -> bool:
+    if policy is None or policy.probe_pause_seconds <= 0 or shutdown_event.is_set():
+        return False
+    try:
+        await asyncio.wait_for(shutdown_event.wait(), timeout=policy.probe_pause_seconds)
+        return True
+    except TimeoutError:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # DeltaSyncWorker
 # ---------------------------------------------------------------------------
@@ -135,7 +177,11 @@ class DeltaSyncWorker:
         self._conn = conn
         self._shutdown_event = shutdown_event
 
-    async def run_delta_catch_up(self) -> int:
+    async def run_delta_catch_up(
+        self,
+        *,
+        policy: DeltaCatchUpPolicy | None = None,
+    ) -> int:
         """Fetch messages newer than max known id for all 'synced' dialogs.
 
         Returns:
@@ -157,7 +203,11 @@ class DeltaSyncWorker:
         for dialog_id, last_synced_at in rows:
             if self._shutdown_event.is_set():
                 break
-            if last_synced_at is not None and (now - last_synced_at) < RECENT_SYNC_SKIP_THRESHOLD_S:
+            if policy is not None and policy.probe_budget_exhausted(probed):
+                _log_probe_budget_exhausted(policy, total_rows=len(rows), skipped=skipped, probed=probed)
+                break
+            if _recently_synced(last_synced_at, now):
+                assert last_synced_at is not None
                 age_s = now - last_synced_at
                 # DEBUG, not INFO — with 300+ skipped dialogs this floods the
                 # log and obscures real signal. The aggregate count lives in
@@ -171,6 +221,8 @@ class DeltaSyncWorker:
                 continue
             probed += 1
             total_new += await self.fetch_delta_for_dialog(dialog_id)
+            if await _pause_after_probe(self._shutdown_event, policy):
+                break
         logger.info(
             "delta_catch_up complete — new_messages=%d skipped=%d probed=%d",
             total_new,
@@ -256,6 +308,26 @@ class DeltaSyncWorker:
         with self._conn:
             self._conn.execute(_UPDATE_DELTA_LAST_SYNCED_AT_SQL, (int(time.time()), dialog_id))
         return len(new_message_rows)
+
+
+async def run_delta_catch_up_loop(
+    worker: DeltaSyncWorker,
+    shutdown_event: asyncio.Event,
+    policy: DeltaCatchUpPolicy,
+) -> None:
+    """Run forward gap-fill as a bounded maintenance loop, not startup burst."""
+    if not policy.enabled:
+        logger.info("delta_catch_up_loop disabled — max_probes_per_cycle=%d", policy.max_probes_per_cycle)
+        return
+
+    while not shutdown_event.is_set():
+        total_new = await worker.run_delta_catch_up(policy=policy)
+        logger.info("delta_catch_up_cycle complete — new_messages=%d", total_new)
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=policy.interval_seconds)
+            break
+        except TimeoutError:
+            continue
 
 
 # ---------------------------------------------------------------------------
@@ -350,7 +422,9 @@ async def run_access_probe_loop(
 
 
 _EXPORTED_SYMBOLS = (
+    DeltaCatchUpPolicy,
     DeltaSyncWorker,
     DeltaSyncWorker.run_delta_catch_up,
     run_access_probe_loop,
+    run_delta_catch_up_loop,
 )

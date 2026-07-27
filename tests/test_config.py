@@ -17,6 +17,7 @@ from mcp_telegram.config import (
     ReadReceiptsConfig,
     SchedulingConfig,
     StateConfig,
+    TelegramRpcConfig,
     TelemetryConfig,
     load_config,
     resolve_http_server_config,
@@ -38,6 +39,7 @@ def test_load_config_uses_frozen_typed_defaults(tmp_path: Path) -> None:
     assert config.freshness == FreshnessConfig()
     assert config.telemetry == TelemetryConfig()
     assert config.flood_wait == FloodWaitConfig()
+    assert config.telegram_rpc == TelegramRpcConfig()
     assert config.scheduling == SchedulingConfig()
     assert config.http == HttpServerConfig()
     with pytest.raises(FrozenInstanceError):
@@ -72,10 +74,17 @@ kill_switch_max_events = 5
 kill_switch_max_wait_seconds = 900
 kill_switch_minimum_cooldown_seconds = 1800
 
+[telegram_rpc]
+max_calls_per_period = 12
+period_seconds = 30
+
 [scheduling]
 scheduled_reconciliation_seconds = 47
 scheduled_flood_sleep_threshold_seconds = 0
 reconciliation_hourly_seconds = 48
+delta_catch_up_interval_seconds = 49
+delta_catch_up_max_probes_per_cycle = 7
+delta_catch_up_probe_pause_seconds = 3
 activity_hot_sweep_seconds = 49
 
 [http]
@@ -96,10 +105,14 @@ port = 3200
         kill_switch_max_wait_seconds=900,
         kill_switch_minimum_cooldown_seconds=1800,
     )
+    assert config.telegram_rpc == TelegramRpcConfig(max_calls_per_period=12, period_seconds=30.0)
     assert config.scheduling == SchedulingConfig(
-        47.0,
-        48.0,
-        49.0,
+        scheduled_reconciliation_seconds=47.0,
+        reconciliation_hourly_seconds=48.0,
+        delta_catch_up_interval_seconds=49.0,
+        delta_catch_up_max_probes_per_cycle=7,
+        delta_catch_up_probe_pause_seconds=3.0,
+        activity_hot_sweep_seconds=49.0,
         scheduled_flood_sleep_threshold_seconds=0,
     )
     assert config.http == HttpServerConfig(host="localhost", port=3200)
@@ -112,6 +125,9 @@ def test_runtime_environment_overrides_are_parsed_by_config_model() -> None:
             "SCHEDULED_RECONCILIATION_SECONDS": "47.5",
             "SCHEDULED_FLOOD_SLEEP_THRESHOLD_SECONDS": "0",
             "RECON_HOURLY_SECONDS": "48",
+            "DELTA_CATCH_UP_INTERVAL_SECONDS": "54",
+            "DELTA_CATCH_UP_MAX_PROBES_PER_CYCLE": "8",
+            "DELTA_CATCH_UP_PROBE_PAUSE_SECONDS": "9",
             "ACTIVITY_HOT_SWEEP_SECONDS": "49",
             "ACTIVITY_COLD_BACKFILL_SECONDS": "50",
             "ACTIVITY_COLD_BACKFILL_BATCH_PAUSE": "51",
@@ -131,13 +147,16 @@ def test_runtime_environment_overrides_are_parsed_by_config_model() -> None:
     )
 
     assert scheduling == SchedulingConfig(
-        47.5,
-        48.0,
-        49.0,
-        50.0,
-        51.0,
-        52.0,
-        53.0,
+        scheduled_reconciliation_seconds=47.5,
+        reconciliation_hourly_seconds=48.0,
+        delta_catch_up_interval_seconds=54.0,
+        delta_catch_up_max_probes_per_cycle=8,
+        delta_catch_up_probe_pause_seconds=9.0,
+        activity_hot_sweep_seconds=49.0,
+        activity_cold_backfill_seconds=50.0,
+        activity_cold_backfill_batch_pause_seconds=51.0,
+        activity_cold_enroll_seconds=52.0,
+        activity_cold_access_retry_seconds=53.0,
         scheduled_flood_sleep_threshold_seconds=0,
     )
     assert resolve_logging_config({"LOG_LEVEL": "debug"}).level == "DEBUG"
@@ -159,6 +178,14 @@ def test_runtime_environment_overrides_are_parsed_by_config_model() -> None:
         (
             '[state]\ndir = "/state"\n\n[scheduling]\nscheduled_flood_sleep_threshold_seconds = -1\n',
             "scheduled_flood_sleep_threshold_seconds",
+        ),
+        (
+            '[state]\ndir = "/state"\n\n[scheduling]\ndelta_catch_up_max_probes_per_cycle = true\n',
+            "delta_catch_up_max_probes_per_cycle",
+        ),
+        (
+            '[state]\ndir = "/state"\n\n[telegram_rpc]\nmax_calls_per_period = -1\n',
+            "max_calls_per_period",
         ),
         ('[state]\ndir = "/state"\n\n[freshness]\nunknown = 1\n', "freshness"),
         ('[state]\ndir = "/state"\n\nfreshness = "invalid"\n', "[freshness]"),

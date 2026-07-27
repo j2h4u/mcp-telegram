@@ -59,7 +59,13 @@ from .activity_hot_sweep import run_hot_sweep_loop
 from .activity_sync import _ActivityClient, run_activity_sync_loop
 from .config import McpTelegramConfig, SchedulingConfig, load_config, resolve_scheduling_config
 from .daemon_api import DaemonApiPolicy, DaemonAPIServer, DaemonClientLike
-from .delta_sync import DeltaSyncWorker, _DeltaSyncClient, run_access_probe_loop
+from .delta_sync import (
+    DeltaCatchUpPolicy,
+    DeltaSyncWorker,
+    _DeltaSyncClient,
+    run_access_probe_loop,
+    run_delta_catch_up_loop,
+)
 from .dialog_sync import DialogsBootstrapWorker, run_reconciliation_loop
 from .event_handlers import EventHandlerManager
 from .feedback_db import ensure_feedback_schema
@@ -94,6 +100,7 @@ from .sync_db import (
 )
 from .sync_worker import FullSyncWorker
 from .telegram import create_client
+from .telegram_rpc import GovernedTelegramClient, GovernedTelegramClientTarget, TelegramRpcBudget, TelegramRpcGovernor
 from .topics.refresh import TopicRefresher
 from .topics.sqlite_repository import SQLiteTopicSnapshotRepository
 from .topics.telegram_adapter import TelethonTelegramTopicGateway, TopicClient
@@ -708,6 +715,35 @@ def _install_flood_wait_kill_switch(config: McpTelegramConfig, event: asyncio.Ev
     )
 
 
+def _delta_catch_up_policy_from_scheduling(scheduling: SchedulingConfig) -> DeltaCatchUpPolicy:
+    return DeltaCatchUpPolicy(
+        interval_seconds=scheduling.delta_catch_up_interval_seconds,
+        max_probes_per_cycle=scheduling.delta_catch_up_max_probes_per_cycle,
+        probe_pause_seconds=scheduling.delta_catch_up_probe_pause_seconds,
+    )
+
+
+def _telegram_rpc_budget_from_config(config: McpTelegramConfig) -> TelegramRpcBudget:
+    return TelegramRpcBudget(
+        max_calls_per_period=config.telegram_rpc.max_calls_per_period,
+        period_seconds=config.telegram_rpc.period_seconds,
+    )
+
+
+def _create_governed_telegram_client(config: McpTelegramConfig) -> _DaemonClient:
+    raw_client = create_client(catch_up=True)
+    return cast(
+        _DaemonClient,
+        GovernedTelegramClient(
+            cast(GovernedTelegramClientTarget, raw_client),
+            TelegramRpcGovernor(
+                _telegram_rpc_budget_from_config(config),
+                circuit_status=flood_wait_kill_switch_status,
+            ),
+        ),
+    )
+
+
 async def _build_sync_main_context() -> _SyncMainContext:
     config = load_config()
     state_paths = StatePaths.from_state_dir(ensure_private_state_dir(config.state.dir))
@@ -733,7 +769,7 @@ async def _build_sync_main_context() -> _SyncMainContext:
     flood_wait_kill_switch_event = asyncio.Event()
     _install_flood_wait_kill_switch(config, flood_wait_kill_switch_event)
 
-    client = cast(_DaemonClient, create_client(catch_up=True))
+    client = _create_governed_telegram_client(config)
     reaction_freshener = ReactionFreshener(
         SQLiteReactionSnapshotRepository(conn),
         TelethonTelegramReactionGateway(client),
@@ -893,15 +929,8 @@ async def _prime_runtime(ctx: _SyncMainContext) -> None:
 async def _start_bootstrap_background_tasks(
     ctx: _SyncMainContext,
     worker: FullSyncWorker,
-    delta_worker: DeltaSyncWorker,
 ) -> None:
     assert ctx.handler_manager is not None
-
-    # Keep the worker alive only as long as the sync loop needs it.
-    ctx.api_server.startup_detail = "running delta catch-up"
-    _ = ctx.api_server.startup_detail
-    delta_new = await delta_worker.run_delta_catch_up()
-    logger.info("delta_catch_up=%d new messages from gap-fill", delta_new)
 
     ctx.api_server.startup_detail = "bootstrapping DMs"
     _ = ctx.api_server.startup_detail
@@ -943,13 +972,17 @@ async def _start_followup_background_tasks(
     delta_client = cast(_DeltaSyncClient, ctx.client)
     _create_tracked_task(
         ctx,
-        _monitor_flood_wait_kill_switch(ctx),
-        name="flood_wait_kill_switch_monitor",
+        _backfill_blank_unsupported_messages(ctx.client, ctx.conn, ctx.shutdown_event),
+        name="backfill_blank_unsupported_messages",
     )
     _create_tracked_task(
         ctx,
-        _backfill_blank_unsupported_messages(ctx.client, ctx.conn, ctx.shutdown_event),
-        name="backfill_blank_unsupported_messages",
+        run_delta_catch_up_loop(
+            delta_worker,
+            ctx.shutdown_event,
+            _delta_catch_up_policy_from_scheduling(ctx.scheduling),
+        ),
+        name="delta_catch_up_loop",
     )
     _create_tracked_task(
         ctx,
@@ -1058,6 +1091,11 @@ async def sync_main() -> None:
     install_telethon_flood_wait_metrics_filter()
     ctx = await _build_sync_main_context()
     try:
+        _create_tracked_task(
+            ctx,
+            _monitor_flood_wait_kill_switch(ctx),
+            name="flood_wait_kill_switch_monitor",
+        )
         await _run_fts_backfill(ctx)
 
         if not await _connect_telegram(ctx):
@@ -1071,7 +1109,7 @@ async def sync_main() -> None:
 
         delta_worker = DeltaSyncWorker(cast(_DeltaSyncClient, ctx.client), ctx.conn, ctx.shutdown_event)
         worker = FullSyncWorker(ctx.client, ctx.conn, ctx.shutdown_event)
-        await _start_bootstrap_background_tasks(ctx, worker, delta_worker)
+        await _start_bootstrap_background_tasks(ctx, worker)
         # Must come AFTER handler_manager.register() (startup-ordering invariant):
         # the on_message_read handler must be live before bootstrap starts so no
         # real-time MessageRead events are dropped during the bootstrap window.

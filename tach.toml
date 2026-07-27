@@ -62,7 +62,8 @@ depends_on = [
     "mcp_telegram.own_only", "mcp_telegram.read_state", "mcp_telegram.reactions.refresh",
     "mcp_telegram.reactions.sqlite_repository", "mcp_telegram.reactions.telegram_adapter", "mcp_telegram.scheduled_messages",
     "mcp_telegram.state", "mcp_telegram.sync_db", "mcp_telegram.sync_worker", "mcp_telegram.telegram",
-    "mcp_telegram.topics.refresh", "mcp_telegram.topics.sqlite_repository", "mcp_telegram.topics.telegram_adapter",
+    "mcp_telegram.telegram_rpc", "mcp_telegram.topics.refresh", "mcp_telegram.topics.sqlite_repository",
+    "mcp_telegram.topics.telegram_adapter",
 ]
 
 # application — each horizontal worker/facade has its own narrow declaration.
@@ -265,6 +266,11 @@ depends_on = ["mcp_telegram.telegram_access", "mcp_telegram.telegram_reading"]
 path = "mcp_telegram.telegram"
 layer = "telegram_gateway"
 depends_on = ["mcp_telegram.config", "mcp_telegram.state"]
+
+[[modules]]
+path = "mcp_telegram.telegram_rpc"
+layer = "telegram_gateway"
+depends_on = []
 
 [[modules]]
 path = "mcp_telegram.telegram_fact_queries"
