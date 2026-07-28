@@ -281,3 +281,19 @@ def test_stem_query_mixed_languages():
     parts = result.split()
     for part in parts:
         assert part.startswith('"') and part.endswith('"')
+
+
+def test_stem_text_punctuation_only():
+    """stem_text returns empty string for input with only punctuation and whitespace."""
+    assert stem_text("!!! ??? ...") == ""
+
+
+def test_backfill_fts_index_empty_messages(tmp_sync_db_path: Path) -> None:
+    """backfill_fts_index returns 0 when no non-deleted messages exist."""
+    ensure_sync_schema(tmp_sync_db_path)
+    conn = _open_sync_db(tmp_sync_db_path)
+    try:
+        count = backfill_fts_index(conn)
+        assert count == 0
+    finally:
+        conn.close()
