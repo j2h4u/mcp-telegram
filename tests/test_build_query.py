@@ -32,6 +32,8 @@ class _ListMessagesQueryReq:
     sender_name: str | None
     topic_id: int | None
     unread_after_id: int | None
+    since_utc: int | None = None
+    until_utc: int | None = None
 
 
 def _build_list_messages_query_req(**overrides: object) -> _ListMessagesDbRequest:
@@ -46,6 +48,8 @@ def _build_list_messages_query_req(**overrides: object) -> _ListMessagesDbReques
         "sender_name": None,
         "topic_id": None,
         "unread_after_id": None,
+        "since_utc": None,
+        "until_utc": None,
     }
     data.update(cast(dict[str, object], overrides))
     return cast(
@@ -61,6 +65,8 @@ def _build_list_messages_query_req(**overrides: object) -> _ListMessagesDbReques
             sender_name=data["sender_name"] if data["sender_name"] is None else str(data["sender_name"]),
             topic_id=None if data["topic_id"] is None else int(cast(int | str, data["topic_id"])),
             unread_after_id=None if data["unread_after_id"] is None else int(cast(int | str, data["unread_after_id"])),
+            since_utc=None if data["since_utc"] is None else int(cast(int | str, data["since_utc"])),
+            until_utc=None if data["until_utc"] is None else int(cast(int | str, data["until_utc"])),
         ),
     )
 
@@ -294,3 +300,34 @@ def test_unread_and_anchor_both_add_gt_conditions() -> None:
     assert "m.message_id > :anchor_msg_id" in sql
     assert params["unread_after_id"] == 200
     assert params["anchor_msg_id"] == 300
+
+
+# ---------------------------------------------------------------------------
+# Time boundary filters (since_utc / until_utc)
+# ---------------------------------------------------------------------------
+
+
+def test_since_utc_filter() -> None:
+    """since_utc adds a m.sent_at >= :since_utc condition."""
+    sql, params = _build_list_messages_query(_build_list_messages_query_req(since_utc=1_700_000_000))
+    assert "m.sent_at >= :since_utc" in sql
+    assert params["since_utc"] == 1_700_000_000
+
+
+def test_until_utc_filter() -> None:
+    """until_utc adds a strict m.sent_at < :until_utc condition."""
+    sql, params = _build_list_messages_query(_build_list_messages_query_req(until_utc=1_700_001_000))
+    assert "m.sent_at < :until_utc" in sql
+    assert params["until_utc"] == 1_700_001_000
+
+
+def test_since_and_until_utc_combined() -> None:
+    """Both since_utc and until_utc produce a half-open interval [since_utc, until_utc)."""
+    sql, params = _build_list_messages_query(
+        _build_list_messages_query_req(since_utc=1_700_000_000, until_utc=1_700_001_000)
+    )
+    assert "m.sent_at >= :since_utc" in sql
+    assert "m.sent_at < :until_utc" in sql
+    assert params["since_utc"] == 1_700_000_000
+    assert params["until_utc"] == 1_700_001_000
+    assert sql.index("since_utc") < sql.index("until_utc")
