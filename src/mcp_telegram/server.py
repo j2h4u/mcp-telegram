@@ -36,6 +36,36 @@ from .correlation import correlation_context, current_correlation_ids
 logger = logging.getLogger(__name__)
 app = Server("mcp-telegram")
 _MAX_ERROR_DETAIL_LENGTH = 160
+_MCP_HTTP_LOGGER_NAME = "mcp.server.streamable_http"
+_MCP_HTTP_SSE_ERROR_MESSAGE = "SSE response error"
+_ANYIO_CLOSED_RESOURCE_ERROR = ("anyio", "ClosedResourceError")
+
+
+class _BenignMcpHttpDisconnectFilter(logging.Filter):
+    """Suppress noisy traceback for a closed client SSE stream."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.name != _MCP_HTTP_LOGGER_NAME:
+            return True
+        if record.getMessage() != _MCP_HTTP_SSE_ERROR_MESSAGE:
+            return True
+        exc_info = record.exc_info
+        if not exc_info:
+            return True
+        _, exc, _ = exc_info
+        exc_type = type(exc)
+        is_closed_client_stream = (
+            exc_type.__module__ == _ANYIO_CLOSED_RESOURCE_ERROR[0]
+            and exc_type.__name__ == _ANYIO_CLOSED_RESOURCE_ERROR[1]
+        )
+        return not is_closed_client_stream
+
+
+def _install_mcp_http_disconnect_log_filter() -> None:
+    target_logger = logging.getLogger(_MCP_HTTP_LOGGER_NAME)
+    if any(isinstance(filter_, _BenignMcpHttpDisconnectFilter) for filter_ in target_logger.filters):
+        return
+    target_logger.addFilter(_BenignMcpHttpDisconnectFilter())
 
 
 @cache
@@ -306,6 +336,7 @@ async def run_mcp_http_server(
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
         force=True,
     )
+    _install_mcp_http_disconnect_log_filter()
 
     _assert_http_exposure_allowed(host)
     normalized_mount_path = mount_path if mount_path.startswith("/") else f"/{mount_path}"

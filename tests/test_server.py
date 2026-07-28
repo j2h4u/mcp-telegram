@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import logging
 import re
 from contextlib import asynccontextmanager
 from functools import partial
@@ -53,6 +54,41 @@ def _tool(name: str) -> Tool:
         description=f"{name} test tool",
         inputSchema={"type": "object", "properties": {}},
     )
+
+
+class _AnyioClosedResourceError(Exception):
+    __module__ = "anyio"
+
+
+_AnyioClosedResourceError.__name__ = "ClosedResourceError"
+
+
+def test_benign_mcp_http_disconnect_filter_suppresses_closed_sse_stream() -> None:
+    record = logging.LogRecord(
+        name="mcp.server.streamable_http",
+        level=logging.ERROR,
+        pathname="streamable_http.py",
+        lineno=644,
+        msg="SSE response error",
+        args=(),
+        exc_info=(_AnyioClosedResourceError, _AnyioClosedResourceError(), None),
+    )
+
+    assert server._BenignMcpHttpDisconnectFilter().filter(record) is False
+
+
+def test_benign_mcp_http_disconnect_filter_keeps_other_stream_errors() -> None:
+    record = logging.LogRecord(
+        name="mcp.server.streamable_http",
+        level=logging.ERROR,
+        pathname="streamable_http.py",
+        lineno=644,
+        msg="SSE response error",
+        args=(),
+        exc_info=(RuntimeError, RuntimeError("boom"), None),
+    )
+
+    assert server._BenignMcpHttpDisconnectFilter().filter(record) is True
 
 
 def test_list_messages_reflection_exposes_shared_navigation_schema() -> None:
