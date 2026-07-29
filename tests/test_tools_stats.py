@@ -159,3 +159,135 @@ async def test_get_dialog_stats_daemon_not_running() -> None:
     assert content.is_error is True
     text = cast(_TextContent, content.content[0]).text
     assert "mcp-telegram sync" in text or "not running" in text.lower()
+
+
+# ---------------------------------------------------------------------------
+# format_usage_summary tests
+# ---------------------------------------------------------------------------
+
+
+def test_format_usage_summary_most_active_tool() -> None:
+    from mcp_telegram.tools.stats import format_usage_summary
+
+    stats = {
+        "total_calls": 100,
+        "tool_distribution": {"list_messages": 60, "search_messages": 30, "get_inbox": 10},
+    }
+    result = format_usage_summary(stats)
+
+    assert "Most active: list_messages (60% of calls)" in result
+
+
+def test_format_usage_summary_deep_scrolling() -> None:
+    from mcp_telegram.tools.stats import format_usage_summary
+
+    stats = {
+        "total_calls": 10,
+        "tool_distribution": {"list_messages": 10},
+        "max_page_depth": 7,
+    }
+    result = format_usage_summary(stats)
+
+    assert "Deep scrolling detected" in result
+    assert "max page depth 7" in result
+
+
+def test_format_usage_summary_below_scroll_threshold() -> None:
+    from mcp_telegram.tools.stats import format_usage_summary
+
+    stats = {
+        "total_calls": 10,
+        "tool_distribution": {"list_messages": 10},
+        "max_page_depth": 3,
+    }
+    result = format_usage_summary(stats)
+
+    assert "Deep scrolling detected" not in result
+
+
+def test_format_usage_summary_error_distribution() -> None:
+    from mcp_telegram.tools.stats import format_usage_summary
+
+    stats = {
+        "total_calls": 50,
+        "tool_distribution": {"list_messages": 50},
+        "error_distribution": {"timeout": 3, "not_found": 1},
+    }
+    result = format_usage_summary(stats)
+
+    assert "Errors:" in result
+    assert "timeout" in result
+    assert "(3)" in result
+
+
+def test_format_usage_summary_filter_percentage() -> None:
+    from mcp_telegram.tools.stats import format_usage_summary
+
+    stats = {
+        "total_calls": 200,
+        "tool_distribution": {"list_messages": 200},
+        "filter_count": 50,
+    }
+    result = format_usage_summary(stats)
+
+    assert "Filtered queries:" in result
+    assert "25%" in result
+
+
+def test_format_usage_summary_no_filter_without_filter_count() -> None:
+    from mcp_telegram.tools.stats import format_usage_summary
+
+    stats = {
+        "total_calls": 100,
+        "tool_distribution": {"list_messages": 100},
+        "filter_count": 0,
+    }
+    result = format_usage_summary(stats)
+
+    assert "Filtered queries" not in result
+
+
+def test_format_usage_summary_response_time() -> None:
+    from mcp_telegram.tools.stats import format_usage_summary
+
+    stats = {
+        "total_calls": 10,
+        "tool_distribution": {"list_messages": 10},
+        "latency_median_ms": 150.0,
+        "latency_p95_ms": 450.0,
+    }
+    result = format_usage_summary(stats)
+
+    assert "Response time:" in result
+    assert "150ms median" in result
+    assert "450ms p95" in result
+
+
+def test_format_usage_summary_truncation() -> None:
+    from mcp_telegram.tools.stats import format_usage_summary
+
+    error_distribution: dict[str, int] = {}
+    for i in range(60):
+        error_distribution[f"error_type_{i}"] = 1
+
+    stats = {
+        "total_calls": 200,
+        "tool_distribution": {"list_messages": 200},
+        "max_page_depth": 9,
+        "error_distribution": error_distribution,
+        "filter_count": 100,
+        "latency_median_ms": 100.0,
+        "latency_p95_ms": 500.0,
+    }
+    result = format_usage_summary(stats)
+
+    tokens = result.split()
+    assert len(tokens) <= 100
+
+
+def test_format_usage_summary_empty_stats() -> None:
+    from mcp_telegram.tools.stats import format_usage_summary
+
+    result = format_usage_summary({})
+
+    assert result == ""
