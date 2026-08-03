@@ -41,6 +41,7 @@ dev = [
     "basedpyright>=1.39.9",
     "pytest-crap>=0.3.0",
     "radon>=6.0.1",
+    "setuptools>=83.0.0",
     "deptry>=0.25.1",
     "tach>=0.35",
 ]
