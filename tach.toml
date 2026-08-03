@@ -188,7 +188,7 @@ depends_on = ["mcp_telegram.activity_peer_sweep", { path = "mcp_telegram.activit
 [[modules]]
 path = "mcp_telegram.dialog_sync"
 layer = "application"
-depends_on = ["mcp_telegram.flood", "mcp_telegram.sync_db", "mcp_telegram.telegram_access", "mcp_telegram.topics.contracts", "mcp_telegram.topics.refresh"]
+depends_on = ["mcp_telegram.flood", "mcp_telegram.read_state", "mcp_telegram.sync_db", "mcp_telegram.telegram_access", "mcp_telegram.topics.contracts", "mcp_telegram.topics.refresh"]
 
 [[modules]]
 path = "mcp_telegram.sync_worker"

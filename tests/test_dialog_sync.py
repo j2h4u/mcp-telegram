@@ -61,6 +61,8 @@ class _DialogOptions:
     message_date: object | None = None
     pinned: bool = False
     folder_id: int | None = None
+    read_inbox_max_id: int | None = None
+    read_outbox_max_id: int | None = None
     unread_mentions_count: int = 0
     unread_reactions_count: int = 0
     draft_message: str | None = None
@@ -164,6 +166,8 @@ def _make_dialog(
         message=msg,
         pinned=opts.pinned,
         folder_id=opts.folder_id,
+        read_inbox_max_id=opts.read_inbox_max_id,
+        read_outbox_max_id=opts.read_outbox_max_id,
         unread_mentions_count=opts.unread_mentions_count,
         unread_reactions_count=opts.unread_reactions_count,
         draft=draft,
