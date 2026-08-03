@@ -1,23 +1,47 @@
 import os
 import subprocess
 import tempfile
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from venv import EnvBuilder
+
+BUILD_BACKEND_PACKAGE = "setuptools"
 
 
 def _run(command: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None) -> None:
     subprocess.run(command, cwd=cwd, env=env, check=True)
 
 
+def _assert_locked_build_backend_available() -> None:
+    try:
+        version(BUILD_BACKEND_PACKAGE)
+    except PackageNotFoundError as exc:
+        raise RuntimeError(f"{BUILD_BACKEND_PACKAGE} must be installed in the locked smoke environment") from exc
+
+
+def _build_wheel_command(repo_root: Path, dist_dir: Path) -> list[str]:
+    return [
+        "uv",
+        "build",
+        "--wheel",
+        "--out-dir",
+        str(dist_dir),
+        "--no-build-logs",
+        "--no-build-isolation",
+        str(repo_root),
+    ]
+
+
 def main() -> int:
     repo_root = Path(__file__).resolve().parents[1]
+    _assert_locked_build_backend_available()
 
     with tempfile.TemporaryDirectory(prefix="mcp-telegram-packaging-") as tmp:
         workdir = Path(tmp)
         dist_dir = workdir / "dist"
         venv_dir = workdir / "venv"
 
-        _run(["uv", "build", "--wheel", "--out-dir", str(dist_dir), "--no-build-logs", str(repo_root)])
+        _run(_build_wheel_command(repo_root, dist_dir))
 
         wheel_files = sorted(dist_dir.glob("*.whl"))
         if len(wheel_files) != 1:
