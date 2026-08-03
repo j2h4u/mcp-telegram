@@ -60,6 +60,7 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
 )
 
 from .flood import flood_seconds, sleep_through_flood
+from .read_state import apply_read_cursor
 from .sync_db import _open_sync_db, set_access_lost
 from .telegram_access import ACCESS_LOST_ERRORS
 from .topics.contracts import TopicSourceUnavailableError, is_topic_capable
@@ -101,12 +102,20 @@ class _MessageLike(Protocol):
     date: datetime | None
 
 
+class _ReadCursorDialogLike(Protocol):
+    read_inbox_max_id: int | None
+    read_outbox_max_id: int | None
+
+
 class _DialogLike(Protocol):
     id: int
+    dialog: _ReadCursorDialogLike | None
     entity: _EntityLike
     message: _MessageLike | None
     pinned: bool
     folder_id: int | None
+    read_inbox_max_id: int | None
+    read_outbox_max_id: int | None
     unread_mentions_count: int | None
     unread_reactions_count: int | None
     draft: _DraftLike | None
@@ -381,6 +390,52 @@ def _extract_dialog_row(dialog: _DialogLike, snapshot_at: int) -> _BootstrapRow:
     }
 
 
+def _dialog_read_cursor(dialog: _DialogLike, field: str) -> int | None:
+    """Read a cursor from either a raw TL Dialog or Telethon custom Dialog.
+
+    ``GetPeerDialogsRequest`` returns TL ``Dialog`` objects with direct
+    ``read_*`` fields. ``iter_dialogs()`` returns custom Dialog wrappers where
+    the same TL object is exposed as ``.dialog``. Reconciliation consumes
+    ``iter_dialogs()``, while startup read-position code may use raw TL
+    dialogs, so this helper keeps that shape knowledge in one place.
+    """
+    direct: object = getattr(dialog, field, None)
+    if direct is not None:
+        return cast(int, direct)
+    wrapped: object | None = getattr(dialog, "dialog", None)
+    if wrapped is None:
+        return None
+    value: object = getattr(wrapped, field, None)
+    return cast(int | None, value)
+
+
+def _apply_dialog_read_cursors(conn: sqlite3.Connection, dialog: _DialogLike) -> bool:
+    """Refresh local DM read cursors from an already-fetched Telegram Dialog.
+
+    ``iter_dialogs()`` returns Telegram's current ``read_inbox_max_id`` and
+    ``read_outbox_max_id`` on each Dialog.  Reconciliation already consumes
+    that stream to maintain the local dialog snapshot, so applying the cursors
+    here adds no Telegram RPCs and therefore does not change FloodWait risk.
+
+    ``None`` means Telegram did not provide a cursor for that side; preserve
+    the existing DB value rather than inventing precision.  Non-``None`` values
+    are written through :func:`apply_read_cursor`, which keeps the existing
+    monotonic invariant and never regresses a cursor.
+
+    Returns True when at least one side wrote to an existing ``synced_dialogs``
+    row.  The caller owns the transaction boundary.
+    """
+    dialog_id = int(dialog.id)
+    wrote_any = False
+    inbox_max = _dialog_read_cursor(dialog, "read_inbox_max_id")
+    outbox_max = _dialog_read_cursor(dialog, "read_outbox_max_id")
+    if inbox_max is not None and apply_read_cursor(conn, dialog_id, "inbox", inbox_max) > 0:
+        wrote_any = True
+    if outbox_max is not None and apply_read_cursor(conn, dialog_id, "outbox", outbox_max) > 0:
+        wrote_any = True
+    return wrote_any
+
+
 # ---------------------------------------------------------------------------
 # Worker
 # ---------------------------------------------------------------------------
@@ -501,6 +556,7 @@ class DialogsBootstrapWorker:
                     # inconsistent state.
                     with self._conn:
                         self._conn.execute(_UPSERT_DIALOG_SQL, row)
+                        _apply_dialog_read_cursors(self._conn, dialog)
                         dialog_date = dialog.date
                         _set_state(
                             self._conn,
@@ -731,6 +787,7 @@ class DialogReconciliationWorker:
                 row = _extract_dialog_row(dialog, snapshot_at)
                 with self._conn:
                     self._conn.execute(_UPSERT_DIALOG_SQL, row)
+                    _apply_dialog_read_cursors(self._conn, dialog)
                 seen_ids.add(int(dialog.id))
                 count += 1
                 if self._topic_refresher is not None and is_topic_capable(dialog.entity):

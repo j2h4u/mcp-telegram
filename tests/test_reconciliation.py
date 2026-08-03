@@ -93,11 +93,18 @@ def _seed_dialog_row(
         )
 
 
-def _seed_synced_dialog(conn: sqlite3.Connection, dialog_id: int, status: str = "syncing") -> None:
+def _seed_synced_dialog(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    status: str = "syncing",
+    *,
+    read_inbox_max_id: int | None = None,
+    read_outbox_max_id: int | None = None,
+) -> None:
     with conn:
         conn.execute(
-            "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, ?)",
-            (dialog_id, status),
+            "INSERT INTO synced_dialogs (dialog_id, status, read_inbox_max_id, read_outbox_max_id) VALUES (?, ?, ?, ?)",
+            (dialog_id, status, read_inbox_max_id, read_outbox_max_id),
         )
 
 
@@ -109,30 +116,48 @@ def _make_user_without_forum(uid: int, *, first_name: str = "Alice") -> object:
     return SimpleNamespace(id=uid, access_hash=1, first_name=first_name)
 
 
-def _make_dialog(uid: int, *, name: str = "Alice") -> MagicMock:
+def _make_dialog(
+    uid: int,
+    *,
+    name: str = "Alice",
+    read_inbox_max_id: int | None = None,
+    read_outbox_max_id: int | None = None,
+) -> MagicMock:
     # Minimal Dialog-like object compatible with _extract_dialog_row.
     d = MagicMock()
     d.id = uid
+    d.dialog = None
     d.entity = _make_user(uid, first_name=name)
     d.message = None
     d.draft = None
     d.folder_id = None
     d.pinned = False
+    d.read_inbox_max_id = read_inbox_max_id
+    d.read_outbox_max_id = read_outbox_max_id
     d.unread_mentions_count = 0
     d.unread_reactions_count = 0
     return d
 
 
-def _make_dialog_without_forum(uid: int, *, name: str = "Alice") -> MagicMock:
+def _make_dialog_without_forum(
+    uid: int,
+    *,
+    name: str = "Alice",
+    read_inbox_max_id: int | None = None,
+    read_outbox_max_id: int | None = None,
+) -> MagicMock:
     # Minimal dialog entity without a `.forum` attribute to cover Telethon entity
     # variants surfaced by reconciliation logs.
     d = MagicMock()
     d.id = uid
+    d.dialog = None
     d.entity = _make_user_without_forum(uid, first_name=name)
     d.message = None
     d.draft = None
     d.folder_id = None
     d.pinned = False
+    d.read_inbox_max_id = read_inbox_max_id
+    d.read_outbox_max_id = read_outbox_max_id
     d.unread_mentions_count = 0
     d.unread_reactions_count = 0
     return d
@@ -394,6 +419,95 @@ async def test_recon_full_pass_upserts_returned(
     )
     assert rows[0][1] == "A_new" and rows[0][2] == 0
     assert rows[1][1] == "B_new" and rows[1][2] == 0
+
+
+@pytest.mark.asyncio
+async def test_recon_full_pass_refreshes_read_cursors_from_dialog(
+    sync_db: sqlite3.Connection,
+    mock_client: MagicMock,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """Full dialog reconciliation applies Telegram Dialog read cursors.
+
+    This covers the stale-DM-read-state regression where live MessageRead
+    events were missed and populated local cursors stayed behind real Telegram
+    dialog state until restart/bootstrap.
+    """
+    _seed_dialog_row(sync_db, 100, name="A_old")
+    _seed_synced_dialog(sync_db, 100, status="synced", read_inbox_max_id=10, read_outbox_max_id=20)
+    mock_client.iter_dialogs = MagicMock(
+        return_value=_async_iter([_make_dialog(100, name="A_new", read_inbox_max_id=30, read_outbox_max_id=40)])
+    )
+
+    worker = DialogReconciliationWorker(mock_client, sync_db, shutdown_event)
+    count, completed = await worker.run_full_pass()
+
+    assert count == 1
+    assert completed is True
+    row = cast(
+        tuple[int, int],
+        sync_db.execute(
+            "SELECT read_inbox_max_id, read_outbox_max_id FROM synced_dialogs WHERE dialog_id = ?",
+            (100,),
+        ).fetchone(),
+    )
+    assert row == (30, 40)
+
+
+@pytest.mark.asyncio
+async def test_recon_full_pass_refreshes_read_cursors_from_wrapped_telethon_dialog(
+    sync_db: sqlite3.Connection,
+    mock_client: MagicMock,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """Telethon iter_dialogs exposes read cursors on custom_dialog.dialog."""
+    _seed_dialog_row(sync_db, 100, name="A_old")
+    _seed_synced_dialog(sync_db, 100, status="synced", read_inbox_max_id=10, read_outbox_max_id=20)
+    dialog = _make_dialog(100, name="A_new")
+    dialog.dialog = SimpleNamespace(read_inbox_max_id=31, read_outbox_max_id=41)
+    mock_client.iter_dialogs = MagicMock(return_value=_async_iter([dialog]))
+
+    worker = DialogReconciliationWorker(mock_client, sync_db, shutdown_event)
+    count, completed = await worker.run_full_pass()
+
+    assert count == 1
+    assert completed is True
+    row = cast(
+        tuple[int, int],
+        sync_db.execute(
+            "SELECT read_inbox_max_id, read_outbox_max_id FROM synced_dialogs WHERE dialog_id = ?",
+            (100,),
+        ).fetchone(),
+    )
+    assert row == (31, 41)
+
+
+@pytest.mark.asyncio
+async def test_recon_full_pass_does_not_regress_or_fabricate_read_cursors(
+    sync_db: sqlite3.Connection,
+    mock_client: MagicMock,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """Reconciliation preserves monotonic and NULL-as-unknown read semantics."""
+    _seed_dialog_row(sync_db, 100, name="A_old")
+    _seed_synced_dialog(sync_db, 100, status="synced", read_inbox_max_id=30, read_outbox_max_id=40)
+    mock_client.iter_dialogs = MagicMock(
+        return_value=_async_iter([_make_dialog(100, name="A_new", read_inbox_max_id=20, read_outbox_max_id=None)])
+    )
+
+    worker = DialogReconciliationWorker(mock_client, sync_db, shutdown_event)
+    count, completed = await worker.run_full_pass()
+
+    assert count == 1
+    assert completed is True
+    row = cast(
+        tuple[int, int],
+        sync_db.execute(
+            "SELECT read_inbox_max_id, read_outbox_max_id FROM synced_dialogs WHERE dialog_id = ?",
+            (100,),
+        ).fetchone(),
+    )
+    assert row == (30, 40)
 
 
 @pytest.mark.asyncio
