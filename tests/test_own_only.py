@@ -6,8 +6,10 @@ from types import SimpleNamespace
 from mcp_telegram.models import DialogType
 from mcp_telegram.own_only import (
     OwnOnlyBasis,
+    OwnOnlyClassification,
     OwnOnlyContext,
     classify_own_only_dialog,
+    enroll_own_only_dialog,
     query_own_only_candidates,
 )
 
@@ -96,5 +98,46 @@ def test_candidate_query_keeps_rights_classification_out_of_sql() -> None:
             -1000000008001,
             1,
         ]
+    finally:
+        conn.close()
+
+
+def test_enroll_own_only_dialog_noop_when_not_included() -> None:
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute(
+            "CREATE TABLE own_only_dialogs (dialog_id INTEGER PRIMARY KEY, inclusion_basis TEXT, updated_at INTEGER)"
+        )
+        conn.execute(
+            "CREATE TABLE synced_dialogs (dialog_id INTEGER, status TEXT, "
+            "linked_chat_id INTEGER, linked_chat_resolved_at INTEGER)"
+        )
+        classification = OwnOnlyClassification(included=False, basis=())
+        enroll_own_only_dialog(conn, 42, classification, now=100)
+
+        assert conn.execute("SELECT COUNT(*) FROM own_only_dialogs").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM synced_dialogs").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_enroll_own_only_dialog_persists_when_included() -> None:
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute(
+            "CREATE TABLE own_only_dialogs (dialog_id INTEGER PRIMARY KEY, inclusion_basis TEXT, updated_at INTEGER)"
+        )
+        conn.execute(
+            "CREATE TABLE synced_dialogs (dialog_id INTEGER, status TEXT, "
+            "linked_chat_id INTEGER, linked_chat_resolved_at INTEGER)"
+        )
+        classification = OwnOnlyClassification(included=True, basis=(OwnOnlyBasis.DIRECT_MESSAGE,))
+        enroll_own_only_dialog(conn, 42, classification, now=100)
+
+        assert conn.execute("SELECT dialog_id FROM own_only_dialogs WHERE dialog_id=42").fetchone() == (42,)
+        assert conn.execute("SELECT dialog_id, status FROM synced_dialogs WHERE dialog_id=42").fetchone() == (
+            42,
+            "own_only",
+        )
     finally:
         conn.close()

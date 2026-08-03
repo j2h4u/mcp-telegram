@@ -19,7 +19,9 @@ from mcp_telegram.event_handlers import EventHandlerManager, _NewMessageEvent
 from mcp_telegram.own_only import OwnOnlyContext
 from mcp_telegram.scheduled_messages import (
     ScheduledMessageReconciler,
+    _unix_timestamp,
     mark_scheduled_messages_removed,
+    scheduled_dialog_id,
     upsert_scheduled_message,
     verify_scheduled_publication,
 )
@@ -283,3 +285,43 @@ async def test_publication_reconciliation_runs_before_sync_enrollment(conn: sqli
     assert conn.execute(
         "SELECT message_state, published_message_id FROM scheduled_messages WHERE dialog_id=42 AND message_id=21"
     ).fetchone() == ("published", 901)
+
+
+class TestScheduledDialogId:
+    def test_none_peer(self) -> None:
+        assert scheduled_dialog_id(None) is None
+
+    def test_channel_id_fallback(self) -> None:
+        peer = SimpleNamespace(channel_id=123)
+        result = scheduled_dialog_id(peer)
+        assert result == -1000000000123
+
+    def test_chat_id_fallback(self) -> None:
+        peer = SimpleNamespace(chat_id=456)
+        result = scheduled_dialog_id(peer)
+        assert result == -456
+
+    def test_user_id_fallback(self) -> None:
+        peer = SimpleNamespace(user_id=789)
+        result = scheduled_dialog_id(peer)
+        assert result == 789
+
+    def test_unknown_peer_returns_none(self) -> None:
+        peer = SimpleNamespace()
+        result = scheduled_dialog_id(peer)
+        assert result is None
+
+
+class TestUnixTimestamp:
+    def test_datetime_conversion(self) -> None:
+        dt = datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC)
+        assert _unix_timestamp(dt) == 1767225600
+
+    def test_int_passthrough(self) -> None:
+        assert _unix_timestamp(1_700_000_000) == 1_700_000_000
+
+    def test_none_returns_none(self) -> None:
+        assert _unix_timestamp(None) is None
+
+    def test_bool_is_not_treated_as_int(self) -> None:
+        assert _unix_timestamp(True) is True
