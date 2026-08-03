@@ -25,6 +25,7 @@ from mcp_telegram.reactions.telegram_adapter import TelethonTelegramReactionGate
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.telegram_fact_queries import enrich_read_at, stale_read_at_ids
 from mcp_telegram.telegram_fragments import FragmentContextService, TelethonTelegramFragmentGateway
+from mcp_telegram.telegram_history import TelethonTelegramHistoryGateway
 from mcp_telegram.telegram_read_receipts import TelethonTelegramReadReceiptGateway
 from mcp_telegram.telegram_reading import (
     GatewayFailure,
@@ -55,12 +56,58 @@ def _message(message_id: int, *, reaction: bool = True) -> SimpleNamespace:
     )
 
 
+class _HistoryClient:
+    def __init__(self, messages: list[object], *, error: Exception | None = None) -> None:
+        self.messages = messages
+        self.error = error
+        self.calls: list[tuple[int, dict[str, object]]] = []
+
+    async def iter_messages(self, dialog_id: int, **kwargs: object):
+        self.calls.append((dialog_id, kwargs))
+        for message in self.messages:
+            yield message
+        if self.error is not None:
+            raise self.error
+
+
 def _seed_synced(conn: sqlite3.Connection, dialog_id: int) -> None:
     conn.execute(
         "INSERT INTO synced_dialogs (dialog_id, status, read_inbox_max_id) VALUES (?, 'synced', 0)",
         (dialog_id,),
     )
     conn.commit()
+
+
+@pytest.mark.asyncio
+async def test_history_gateway_projects_ordered_messages_and_preserves_query_options() -> None:
+    client = _HistoryClient([_message(10), _message(12)])
+
+    result = await TelethonTelegramHistoryGateway(client).fetch_history(
+        42,
+        {"limit": 2, "reverse": True},
+        self_id=101,
+    )
+
+    assert client.calls == [(42, {"limit": 2, "reverse": True})]
+    assert result.failure is None
+    assert [message["message_id"] for message in result.messages] == [10, 12]
+    assert [message["dialog_id"] for message in result.messages] == [42, 42]
+    assert [message["effective_sender_id"] for message in result.messages] == [101, 101]
+
+
+@pytest.mark.asyncio
+async def test_history_gateway_returns_structured_failure_without_partial_messages() -> None:
+    client = _HistoryClient([_message(10)], error=ValueError("dialog not available"))
+
+    result = await TelethonTelegramHistoryGateway(client).fetch_history(42, {"limit": 2}, self_id=101)
+
+    assert result.messages == ()
+    assert result.failure == GatewayFailure(
+        kind=GatewayFailureKind.INVALID_TARGET,
+        error_type="ValueError",
+        error_message="dialog not available",
+        retryable=False,
+    )
 
 
 @pytest.mark.parametrize(
