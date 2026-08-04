@@ -679,3 +679,88 @@ def test_read_state_marker_labels_remain_available_in_structured_output_helpers(
         "[unread by peer]",
     ]:
         assert _structured_read_marker(123, label)["label"] == label
+
+
+# ---------------------------------------------------------------------------
+# _format_relative_delta boundary and edge-case tests
+# ---------------------------------------------------------------------------
+
+
+def test_format_relative_delta_zero() -> None:
+    """Zero delta → '0m'."""
+    from mcp_telegram.formatter import _format_relative_delta
+
+    now = _unix(12, 0)
+    assert _format_relative_delta(now, now) == "0m"
+
+
+def test_format_relative_delta_negative_clamped() -> None:
+    """Negative delta (future timestamp) is clamped to 0 and renders as '0m'."""
+    from mcp_telegram.formatter import _format_relative_delta
+
+    now = _unix(12, 0)
+    future = _unix(12, 30)
+    assert _format_relative_delta(now, future) == "0m"
+
+
+def test_format_relative_delta_minutes() -> None:
+    """Delta under 1 hour → 'Xm'."""
+    from mcp_telegram.formatter import _format_relative_delta
+
+    now = _unix(12, 0)
+    then = _unix(11, 13)
+    assert _format_relative_delta(now, then) == "47m"
+
+
+def test_format_relative_delta_exactly_one_hour() -> None:
+    """Exactly 60 minutes → '1h 0m'."""
+    from mcp_telegram.formatter import _format_relative_delta
+
+    now = _unix(12, 0)
+    then = _unix(11, 0)
+    assert _format_relative_delta(now, then) == "1h 0m"
+
+
+def test_format_relative_delta_hours_and_minutes() -> None:
+    """Delta between 1h and 24h → 'Xh Ym'."""
+    from mcp_telegram.formatter import _format_relative_delta
+
+    now = _unix(12, 0)
+    then = _unix(9, 45)
+    assert _format_relative_delta(now, then) == "2h 15m"
+
+
+def test_format_relative_delta_exactly_one_day() -> None:
+    """Exactly 24 hours → '1d'."""
+    from mcp_telegram.formatter import _format_relative_delta
+
+    now = _unix(12, 0)
+    then = _unix(12, 0, d=20)  # 24h earlier
+    assert _format_relative_delta(now, then) == "1d"
+
+
+def test_format_relative_delta_days() -> None:
+    """Delta between 1d and 7d → 'Xd'."""
+    from mcp_telegram.formatter import _format_relative_delta
+
+    now = _unix(12, 0)
+    then = now - 3 * 86400
+    assert _format_relative_delta(now, then) == "3d"
+
+
+def test_format_relative_delta_exactly_one_week() -> None:
+    """Exactly 7 days → '1w'."""
+    from mcp_telegram.formatter import _format_relative_delta
+
+    now = _unix(12, 0)
+    then = now - 7 * 86400
+    assert _format_relative_delta(now, then) == "1w"
+
+
+def test_format_relative_delta_weeks() -> None:
+    """Delta >= 7d → 'Xw'."""
+    from mcp_telegram.formatter import _format_relative_delta
+
+    now = _unix(12, 0)
+    then = now - 14 * 86400
+    assert _format_relative_delta(now, then) == "2w"
