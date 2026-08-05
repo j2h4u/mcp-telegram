@@ -19,7 +19,7 @@ from mcp_telegram.folders.refresh import FolderRefresher
 from mcp_telegram.folders.sqlite_repository import (
     SQLiteFolderSnapshotRepository,
     dialog_placement,
-    folder_ids_by_dialog,
+    folders_by_dialog,
     list_folder_messages,
     list_folders,
     replace_folder_snapshot,
@@ -41,7 +41,9 @@ def test_snapshot_exposes_many_to_many_placement_and_archive_separately(tmp_path
         replace_folder_snapshot(conn, [(1, "Work"), (2, "Unread")], [(1, 10), (2, 10)])
 
         assert list_folders(conn) == [{"id": 1, "title": "Work"}, {"id": 2, "title": "Unread"}]
-        assert folder_ids_by_dialog(conn) == {10: [1, 2]}
+        assert folders_by_dialog(conn) == {
+            10: [{"id": 1, "title": "Work"}, {"id": 2, "title": "Unread"}],
+        }
         assert dialog_placement(conn, 10) == {
             "archived": True,
             "folders": [{"id": 1, "title": "Work"}, {"id": 2, "title": "Unread"}],
@@ -59,7 +61,7 @@ def test_failed_snapshot_replacement_rolls_back_to_previous_snapshot(tmp_path: P
             replace_folder_snapshot(conn, [(2, "Duplicate"), (2, "Duplicate")], [])
 
         assert list_folders(conn) == [{"id": 1, "title": "Existing"}]
-        assert folder_ids_by_dialog(conn) == {10: [1]}
+        assert folders_by_dialog(conn) == {10: [{"id": 1, "title": "Existing"}]}
     finally:
         conn.close()
 
@@ -218,7 +220,7 @@ async def test_refresh_replaces_catalog_and_membership_together(tmp_path: Path) 
         await FolderRefresher(_Gateway(), SQLiteFolderSnapshotRepository(conn)).refresh()
 
         assert list_folders(conn) == [{"id": 2, "title": "Contacts"}]
-        assert folder_ids_by_dialog(conn) == {10: [2]}
+        assert folders_by_dialog(conn) == {10: [{"id": 2, "title": "Contacts"}]}
     finally:
         conn.close()
 
@@ -232,6 +234,6 @@ async def test_refresh_failure_propagates_and_preserves_saved_snapshot(tmp_path:
             await FolderRefresher(_FailingGateway(), SQLiteFolderSnapshotRepository(conn)).refresh()
 
         assert list_folders(conn) == [{"id": 9, "title": "Saved"}]
-        assert folder_ids_by_dialog(conn) == {999: [9]}
+        assert folders_by_dialog(conn) == {999: [{"id": 9, "title": "Saved"}]}
     finally:
         conn.close()

@@ -26,8 +26,10 @@ from mcp_telegram.daemon_ipc import get_daemon_socket_path
 from mcp_telegram.daemon_message import _MessageLike, fetch_reaction_counts, message_to_dict
 from mcp_telegram.daemon_message_queries import _build_list_messages_query, _ListMessagesDbRequest
 from mcp_telegram.flood import FloodWaitKillSwitchStatus
+from mcp_telegram.folders.sqlite_repository import replace_folder_snapshot
 from mcp_telegram.fts import MESSAGES_FTS_DDL, stem_text
 from mcp_telegram.models import DialogType
+from mcp_telegram.sync_db import ensure_sync_schema
 from mcp_telegram.telethon_dialog import classify_dialog_type
 from mcp_telegram.topics.contracts import TopicFact
 from mcp_telegram.topics.refresh import TopicRefresher
@@ -174,6 +176,17 @@ class _TestClient(MagicMock):
     get_input_entity: object
     get_messages: object
     send_message: object
+
+
+class _FakeFolderRefresher:
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+        self.refresh_count = 0
+
+    async def refresh(self) -> bool:
+        self.refresh_count += 1
+        replace_folder_snapshot(self._conn, [(16, "MD")], [(16, 123)])
+        return True
 
 
 class _RenderedListMessagesLogRecord(Protocol):
@@ -1252,6 +1265,30 @@ async def test_list_dialogs_sync_status_via_sql() -> None:
     assert by_id[1]["sync_status"] == "synced"
     assert by_id[2]["sync_status"] == "not_synced"
     cast(MagicMock, client.iter_dialogs).assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_list_dialogs_with_folder_filter_refreshes_snapshot_before_read(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = _register_sqlite_connection(sqlite3.connect(db_path))
+    _seed_dialog_row(conn, 123, name="Oleg Puzanov", type_="User")
+    replace_folder_snapshot(conn, [(3, "Old")], [(3, 123)])
+    server = make_server(conn)
+    refresher = _FakeFolderRefresher(conn)
+    server.set_folder_snapshot_refresh(refresher.refresh)
+
+    result = await server._list_dialogs({"folder_id": 16})
+
+    assert result["ok"] is True
+    assert refresher.refresh_count == 1
+    dialogs = cast(list[dict[str, object]], _response_data(result)["dialogs"])
+    assert len(dialogs) == 1
+    assert dialogs[0]["folder_ids"] == [16]
+    assert dialogs[0]["folders"] == [{"id": 16, "title": "MD"}]
+
+    await server._list_dialogs({"folder_id": 16})
+    assert refresher.refresh_count == 1
 
 
 @pytest.mark.asyncio

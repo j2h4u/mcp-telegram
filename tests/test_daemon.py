@@ -22,6 +22,15 @@ from mcp_telegram.sync_db import ensure_sync_schema
 from tests.daemon_api_policy import make_daemon_api_policy
 from tests.reaction_helpers import make_reaction_freshener
 
+
+class _PrimeRuntimeApiServerStub(SimpleNamespace):
+    def set_folder_snapshot_refresh(self, refresh) -> None:
+        self.folder_snapshot_refresh = refresh
+
+    def mark_folder_snapshot_refreshed(self) -> None:
+        self.folder_snapshot_refreshed = True
+
+
 # ---------------------------------------------------------------------------
 # CLI registration
 # ---------------------------------------------------------------------------
@@ -135,7 +144,7 @@ async def test_prime_runtime_keeps_serving_saved_folders_when_refresh_fails(
     replace_folder_snapshot(conn, [(9, "Saved")], [(9, 999)])
     me = SimpleNamespace(id=11111)
     client = MagicMock(get_me=AsyncMock(return_value=me))
-    api_server = SimpleNamespace(startup_detail="", self_id=None, _ready=False)
+    api_server = _PrimeRuntimeApiServerStub(startup_detail="", self_id=None, _ready=False)
     ctx = SimpleNamespace(
         conn=conn,
         client=client,
@@ -168,7 +177,7 @@ async def test_prime_runtime_propagates_unexpected_folder_refresh_failure(tmp_pa
     conn = sqlite3.connect(db_path)
     me = SimpleNamespace(id=11111)
     client = MagicMock(get_me=AsyncMock(return_value=me))
-    api_server = SimpleNamespace(startup_detail="", self_id=None, _ready=False)
+    api_server = _PrimeRuntimeApiServerStub(startup_detail="", self_id=None, _ready=False)
     ctx = SimpleNamespace(
         conn=conn,
         client=client,
@@ -344,6 +353,12 @@ def test_self_id_cached_at_startup(
             self._health_status = health_status
             self.self_id = None
             captured["instance"] = self
+
+        def set_folder_snapshot_refresh(self, refresh) -> None:
+            self.folder_snapshot_refresh = refresh
+
+        def mark_folder_snapshot_refreshed(self) -> None:
+            self.folder_snapshot_refreshed = True
 
         async def handle_client(self, reader, writer):  # pragma: no cover
             pass

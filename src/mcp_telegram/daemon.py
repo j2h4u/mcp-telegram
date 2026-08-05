@@ -794,6 +794,7 @@ async def _build_sync_main_context() -> _SyncMainContext:
             user_directory_ttl_seconds=config.freshness.entities.user_directory_ttl_seconds,
             group_directory_ttl_seconds=config.freshness.entities.group_directory_ttl_seconds,
             resolver_enrichment_ttl_seconds=config.freshness.entities.resolver_enrichment_ttl_seconds,
+            folder_snapshot_ttl_seconds=config.freshness.folders.snapshot_ttl_seconds,
             telemetry_retention_ttl_seconds=config.telemetry.retention_ttl_seconds,
         ),
         health_status=flood_wait_kill_switch_status,
@@ -893,14 +894,23 @@ async def _prime_runtime(ctx: _SyncMainContext) -> None:
 
     ctx.api_server.startup_detail = "refreshing Telegram folders"
     folder_gateway = TelethonTelegramFolderGateway(cast(FolderClient, ctx.client))
-    try:
-        await FolderRefresher(folder_gateway, SQLiteFolderSnapshotRepository(ctx.conn)).refresh()
-    except FolderSourceUnavailableError:
-        logger.warning(
-            "telegram folder snapshot refresh failed — serving preserved local snapshot",
-            exc_info=True,
-        )
-    else:
+    folder_refresher = FolderRefresher(folder_gateway, SQLiteFolderSnapshotRepository(ctx.conn))
+
+    async def refresh_folder_snapshot() -> bool:
+        try:
+            await folder_refresher.refresh()
+        except FolderSourceUnavailableError:
+            logger.warning(
+                "telegram folder snapshot refresh failed — serving preserved local snapshot",
+                exc_info=True,
+            )
+            return False
+        return True
+
+    ctx.api_server.set_folder_snapshot_refresh(refresh_folder_snapshot)
+    refreshed = await refresh_folder_snapshot()
+    if refreshed:
+        ctx.api_server.mark_folder_snapshot_refreshed()
         logger.info("telegram folder snapshot refreshed")
 
     # Post-v10 runtime backfill: mark historical outgoing DM rows as out=1
