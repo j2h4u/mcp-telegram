@@ -556,6 +556,55 @@ async def test_folder_tools_frame_telegram_labels_without_raw_duplicates():
     }
 
 
+async def test_list_folders_non_utc_timezone_schema_allows_time_context():
+    conn = _make_daemon_conn({"ok": True, "data": {"folders": [{"id": 2, "title": "Work"}]}})
+
+    with _patch_daemon(conn):
+        result = await list_folders(ListFolders(timezone="Asia/Almaty"))
+
+    payload = assert_structured_success_payload(result)
+    assert _json_dict(payload["time_context"])["timezone"] == "Asia/Almaty"
+
+
+async def test_list_dialogs_exposes_folder_names_for_humans():
+    conn = _make_daemon_conn(
+        {
+            "ok": True,
+            "data": {
+                "dialogs": [
+                    {
+                        "id": 123,
+                        "name": "Oleg Puzanov",
+                        "type": "User",
+                        "last_message_at": "2026-08-05T12:00:00+00:00",
+                        "unread_count": 0,
+                        "sync_status": "synced",
+                        "folder_ids": [3, 16],
+                        "folders": [{"id": 3, "title": "People"}, {"id": 16, "title": "MD"}],
+                    }
+                ]
+            },
+        }
+    )
+
+    with _patch_daemon(conn):
+        result = await list_dialogs(ListDialogs())
+
+    payload = assert_structured_success_payload(result)
+    dialog = _json_dict(_json_list(payload["dialogs"])[0])
+    assert dialog["folder_ids"] == [3, 16]
+    assert dialog["folders"] == [
+        {
+            "id": 3,
+            "title": {"text": "People", "is_telegram_content": True, "content_kind": "message_text"},
+        },
+        {
+            "id": 16,
+            "title": {"text": "MD", "is_telegram_content": True, "content_kind": "message_text"},
+        },
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Daemon mock helpers
 # ---------------------------------------------------------------------------

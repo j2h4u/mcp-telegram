@@ -166,15 +166,15 @@ def _normalize_schema_node(node: object) -> bool:
 def normalize_temporal_output_schema(schema: dict[str, object] | None) -> dict[str, object] | None:
     """Align a tool's output schema with the shared temporal response contract.
 
-    Schemas without numeric temporal fields are returned unchanged. This keeps
-    non-temporal tools' descriptors stable while every timestamp-bearing tool
-    advertises rendered strings and the optional ``time_context`` object.
+    Every tool accepts a presentation timezone through ``ToolArgs``. A
+    non-UTC call therefore may include ``time_context`` even when this
+    particular response has no timestamp fields. Timestamp-bearing fields are
+    additionally normalized from Unix seconds to rendered ISO strings.
     """
     if schema is None:
         return None
     normalized = deepcopy(schema)
-    if not _normalize_schema_node(normalized):
-        return schema
+    _normalize_schema_node(normalized)
     properties = normalized.setdefault("properties", {})
     if isinstance(properties, dict):
         properties.setdefault("time_context", deepcopy(_TIME_CONTEXT_SCHEMA))

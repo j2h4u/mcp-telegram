@@ -12,5 +12,6 @@ def make_daemon_api_policy() -> DaemonApiPolicy:
         user_directory_ttl_seconds=freshness.entities.user_directory_ttl_seconds,
         group_directory_ttl_seconds=freshness.entities.group_directory_ttl_seconds,
         resolver_enrichment_ttl_seconds=freshness.entities.resolver_enrichment_ttl_seconds,
+        folder_snapshot_ttl_seconds=freshness.folders.snapshot_ttl_seconds,
         telemetry_retention_ttl_seconds=TelemetryConfig().retention_ttl_seconds,
     )

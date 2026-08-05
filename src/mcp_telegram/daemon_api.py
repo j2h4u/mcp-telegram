@@ -95,7 +95,7 @@ from .daemon_message_queries import (
     _read_message_from_row,
 )
 from .daemon_read_state_queries import _dialog_type_from_db, _read_state_for_dialog
-from .folders.sqlite_repository import dialog_placement, folder_ids_by_dialog, list_folder_messages, list_folders
+from .folders.sqlite_repository import dialog_placement, folders_by_dialog, list_folder_messages, list_folders
 from .models import DialogType, ReadMessage
 from .telegram_fact_queries import enrich_reaction_events, enrich_read_at
 from .topics.contracts import TopicSourceUnavailableError
@@ -129,6 +129,7 @@ class DaemonApiPolicy:
     user_directory_ttl_seconds: int
     group_directory_ttl_seconds: int
     resolver_enrichment_ttl_seconds: int
+    folder_snapshot_ttl_seconds: int
     telemetry_retention_ttl_seconds: int
 
 
@@ -439,6 +440,36 @@ class DaemonAPIServer:
         self._health_status = health_status
         self._read_receipt_gateway = TelethonTelegramReadReceiptGateway(self._client)
         self._activity_stats_service: _activity_stats.DaemonActivityStatsService | None = None
+        self._folder_snapshot_refresh: Callable[[], Awaitable[bool]] | None = None
+        self._folder_refresh_lock = asyncio.Lock()
+        self._folder_snapshot_refreshed_at: float | None = None
+
+    def set_folder_snapshot_refresh(self, refresh: Callable[[], Awaitable[bool]]) -> None:
+        """Attach a daemon-owned Telegram folder snapshot refresh callback."""
+        self._folder_snapshot_refresh = refresh
+
+    def mark_folder_snapshot_refreshed(self) -> None:
+        """Record that the local folder snapshot is fresh enough for TTL reads."""
+        self._folder_snapshot_refreshed_at = time.monotonic()
+
+    async def _refresh_folders_if_stale(self) -> None:
+        refresh = self._folder_snapshot_refresh
+        if refresh is None:
+            return
+        now = time.monotonic()
+        refreshed_at = self._folder_snapshot_refreshed_at
+        if refreshed_at is not None and now - refreshed_at < self._policy.folder_snapshot_ttl_seconds:
+            return
+        async with self._folder_refresh_lock:
+            now = time.monotonic()
+            refreshed_at = self._folder_snapshot_refreshed_at
+            if refreshed_at is not None and now - refreshed_at < self._policy.folder_snapshot_ttl_seconds:
+                return
+            refreshed = await refresh()
+            if not refreshed:
+                return
+            self._folder_snapshot_refreshed_at = time.monotonic()
+            logger.info("telegram folder snapshot refreshed")
 
     def _get_reading_service(self) -> DaemonReadingService:
         """Get memoized reading-service instance with explicit daemon dependencies."""
@@ -931,26 +962,32 @@ class DaemonAPIServer:
 
     async def _list_dialogs(self, req: dict[str, object]) -> dict:
         """Delegate list_dialogs reads to the reading service."""
+        if req.get("folder_id") is not None:
+            await self._refresh_folders_if_stale()
         result = await self._get_reading_service()._list_dialogs(cast(dict[str, object], req))
         if not result.get("ok"):
             return result
-        memberships = folder_ids_by_dialog(self._conn)
+        memberships = folders_by_dialog(self._conn)
         requested_folder = req.get("folder_id")
         data = cast(dict[str, object], result.get("data", {}))
         dialogs = cast(list[dict[str, object]], data.get("dialogs", []))
         enriched = []
         for dialog in dialogs:
-            ids = memberships.get(int(cast(int | str, dialog["id"])), [])
+            folders = memberships.get(int(cast(int | str, dialog["id"])), [])
+            ids = [int(cast(int | str, folder["id"])) for folder in folders]
             dialog["folder_ids"] = ids
+            dialog["folders"] = folders
             if requested_folder is None or int(cast(int | str, requested_folder)) in ids:
                 enriched.append(dialog)
         data["dialogs"] = enriched
         return result
 
     async def _list_folders(self, _req: dict[str, object]) -> dict:
+        await self._refresh_folders_if_stale()
         return {"ok": True, "data": {"folders": list_folders(self._conn)}}
 
     async def _list_folder_messages(self, req: dict[str, object]) -> dict:
+        await self._refresh_folders_if_stale()
         folder_id = int(cast(int | str, req.get("folder_id", 0)))
         limit = max(1, min(int(cast(int | str, req.get("limit", 20))), 100))
         return {"ok": True, "data": list_folder_messages(self._conn, folder_id, limit)}

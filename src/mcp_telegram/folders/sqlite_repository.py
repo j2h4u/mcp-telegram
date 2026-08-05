@@ -93,19 +93,24 @@ def list_folder_messages(conn: sqlite3.Connection, folder_id: int, limit: int) -
     }
 
 
-def folder_ids_by_dialog(conn: sqlite3.Connection) -> dict[int, list[int]]:
-    result: dict[int, list[int]] = {}
+def folders_by_dialog(conn: sqlite3.Connection) -> dict[int, list[dict[str, object]]]:
+    result: dict[int, list[dict[str, object]]] = {}
     try:
         rows = cast(
-            list[tuple[int, int]],
-            conn.execute("SELECT folder_id, dialog_id FROM telegram_folder_members ORDER BY folder_id").fetchall(),
+            list[tuple[int, str, int]],
+            conn.execute(
+                """SELECT f.folder_id, f.title, m.dialog_id
+                   FROM telegram_folders AS f
+                   JOIN telegram_folder_members AS m USING(folder_id)
+                   ORDER BY f.folder_id"""
+            ).fetchall(),
         )
     except sqlite3.OperationalError as exc:
         if not _missing_table(exc):
             raise
         return result
-    for folder_id, dialog_id in rows:
-        result.setdefault(int(dialog_id), []).append(int(folder_id))
+    for folder_id, title, dialog_id in rows:
+        result.setdefault(int(dialog_id), []).append({"id": int(folder_id), "title": str(title)})
     return result
 
 

@@ -50,12 +50,20 @@ class EntitiesConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class FoldersConfig:
+    """Freshness policy for Telegram dialog-folder membership snapshots."""
+
+    snapshot_ttl_seconds: int = 60
+
+
+@dataclass(frozen=True, slots=True)
 class FreshnessConfig:
     """All Telegram-derived fact freshness policies."""
 
     reactions: ReactionsConfig = field(default_factory=ReactionsConfig)
     read_receipts: ReadReceiptsConfig = field(default_factory=ReadReceiptsConfig)
     entities: EntitiesConfig = field(default_factory=EntitiesConfig)
+    folders: FoldersConfig = field(default_factory=FoldersConfig)
 
 
 @dataclass(frozen=True, slots=True)
@@ -373,10 +381,11 @@ def _parse_state(data: dict[str, object], path: Path) -> StateConfig:
 def _parse_freshness(data: dict[str, object], path: Path) -> FreshnessConfig:
     freshness_data = _table(data, "freshness", path, required=False)
     if freshness_data is not None:
-        _reject_unknown_keys(freshness_data, {"reactions", "read_receipts", "entities"}, "freshness", path)
+        _reject_unknown_keys(freshness_data, {"reactions", "read_receipts", "entities", "folders"}, "freshness", path)
     reactions_data = _nested_table(freshness_data, "reactions", "freshness.reactions", path) or {}
     receipts_data = _nested_table(freshness_data, "read_receipts", "freshness.read_receipts", path) or {}
     entities_data = _nested_table(freshness_data, "entities", "freshness.entities", path) or {}
+    folders_data = _nested_table(freshness_data, "folders", "freshness.folders", path) or {}
     _reject_unknown_keys(reactions_data, {"freshness_ttl_seconds"}, "freshness.reactions", path)
     _reject_unknown_keys(receipts_data, {"read_at_ttl_seconds"}, "freshness.read_receipts", path)
     _reject_unknown_keys(
@@ -390,6 +399,7 @@ def _parse_freshness(data: dict[str, object], path: Path) -> FreshnessConfig:
         "freshness.entities",
         path,
     )
+    _reject_unknown_keys(folders_data, {"snapshot_ttl_seconds"}, "freshness.folders", path)
     defaults = FreshnessConfig()
     return FreshnessConfig(
         reactions=ReactionsConfig(
@@ -435,6 +445,15 @@ def _parse_freshness(data: dict[str, object], path: Path) -> FreshnessConfig:
                 path,
                 defaults.entities.resolver_enrichment_ttl_seconds,
             ),
+        ),
+        folders=FoldersConfig(
+            snapshot_ttl_seconds=_positive_int(
+                folders_data,
+                "snapshot_ttl_seconds",
+                "freshness.folders",
+                path,
+                defaults.folders.snapshot_ttl_seconds,
+            )
         ),
     )
 

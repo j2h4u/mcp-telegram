@@ -77,6 +77,18 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
                         "description": "Stable own-only classifier basis when this row is in own scope.",
                     },
                     "folder_ids": {"type": "array", "items": {"type": "integer"}},
+                    "folders": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "integer"},
+                                "title": TELEGRAM_CONTENT_OUTPUT_SCHEMA,
+                            },
+                            "required": ["id", "title"],
+                            "additionalProperties": False,
+                        },
+                    },
                     "archived": {"type": "boolean"},
                 },
                 "required": [
@@ -101,6 +113,7 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
                     "next_scheduled_at",
                     "inclusion_basis",
                     "folder_ids",
+                    "folders",
                     "archived",
                 ],
                 "additionalProperties": False,
@@ -155,6 +168,26 @@ def _structured_dialog_lifecycle_fields(dialog: dict) -> dict[str, object]:
         "scheduled_count": int(dialog.get("scheduled_count", 0) or 0),
         "next_scheduled_at": dialog.get("next_scheduled_at"),
         "inclusion_basis": dialog.get("inclusion_basis"),
+    }
+
+
+def _structured_folder_placement(dialog: dict) -> dict[str, object]:
+    folders: list[dict[str, object]] = []
+    for folder in dialog.get("folders", []):
+        if not isinstance(folder, dict):
+            continue
+        raw_id = folder.get("id")
+        if isinstance(raw_id, bool) or not isinstance(raw_id, int):
+            continue
+        folders.append(
+            {
+                "id": raw_id,
+                "title": telegram_content(str(folder.get("title", "")), "message_text"),
+            }
+        )
+    return {
+        "folder_ids": list(dialog.get("folder_ids", [])),
+        "folders": folders,
     }
 
 
@@ -287,7 +320,7 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
                 "unread_mentions_count": int(d.get("unread_mentions_count", 0) or 0),
                 "unread_reactions_count": int(d.get("unread_reactions_count", 0) or 0),
                 **_structured_dialog_lifecycle_fields(d),
-                "folder_ids": list(d.get("folder_ids", [])),
+                **_structured_folder_placement(d),
                 "archived": bool(d.get("archived", False)),
             }
         )

@@ -11,6 +11,7 @@ from mcp_telegram.config import (
     ConfigError,
     EntitiesConfig,
     FloodWaitConfig,
+    FoldersConfig,
     FreshnessConfig,
     HttpServerConfig,
     ReactionsConfig,
@@ -64,8 +65,11 @@ user_directory_ttl_seconds = 43
 group_directory_ttl_seconds = 44
 resolver_enrichment_ttl_seconds = 45
 
+[freshness.folders]
+snapshot_ttl_seconds = 46
+
 [telemetry]
-retention_ttl_seconds = 46
+retention_ttl_seconds = 47
 
 [flood_wait]
 kill_switch_enabled = true
@@ -79,13 +83,13 @@ max_calls_per_period = 12
 period_seconds = 30
 
 [scheduling]
-scheduled_reconciliation_seconds = 47
+scheduled_reconciliation_seconds = 48
 scheduled_flood_sleep_threshold_seconds = 0
-reconciliation_hourly_seconds = 48
-delta_catch_up_interval_seconds = 49
+reconciliation_hourly_seconds = 49
+delta_catch_up_interval_seconds = 50
 delta_catch_up_max_probes_per_cycle = 7
 delta_catch_up_probe_pause_seconds = 3
-activity_hot_sweep_seconds = 49
+activity_hot_sweep_seconds = 51
 
 [http]
 host = "localhost"
@@ -97,7 +101,8 @@ port = 3200
     assert config.freshness.reactions == ReactionsConfig(freshness_ttl_seconds=40)
     assert config.freshness.read_receipts == ReadReceiptsConfig(read_at_ttl_seconds=41)
     assert config.freshness.entities == EntitiesConfig(42, 43, 44, 45)
-    assert config.telemetry == TelemetryConfig(retention_ttl_seconds=46)
+    assert config.freshness.folders == FoldersConfig(snapshot_ttl_seconds=46)
+    assert config.telemetry == TelemetryConfig(retention_ttl_seconds=47)
     assert config.flood_wait == FloodWaitConfig(
         kill_switch_enabled=True,
         kill_switch_window_seconds=600,
@@ -107,12 +112,12 @@ port = 3200
     )
     assert config.telegram_rpc == TelegramRpcConfig(max_calls_per_period=12, period_seconds=30.0)
     assert config.scheduling == SchedulingConfig(
-        scheduled_reconciliation_seconds=47.0,
-        reconciliation_hourly_seconds=48.0,
-        delta_catch_up_interval_seconds=49.0,
+        scheduled_reconciliation_seconds=48.0,
+        reconciliation_hourly_seconds=49.0,
+        delta_catch_up_interval_seconds=50.0,
         delta_catch_up_max_probes_per_cycle=7,
         delta_catch_up_probe_pause_seconds=3.0,
-        activity_hot_sweep_seconds=49.0,
+        activity_hot_sweep_seconds=51.0,
         scheduled_flood_sleep_threshold_seconds=0,
     )
     assert config.http == HttpServerConfig(host="localhost", port=3200)
@@ -175,6 +180,7 @@ def test_runtime_environment_overrides_are_parsed_by_config_model() -> None:
         ('[state]\ndir = "/state"\n\n[freshness.reactions]\nfreshness_ttl_seconds = true\n', "freshness_ttl_seconds"),
         ('[state]\ndir = "/state"\n\n[freshness.read_receipts]\nread_at_ttl_seconds = 0\n', "read_at_ttl_seconds"),
         ('[state]\ndir = "/state"\n\n[freshness.entities]\ndetail_ttl_seconds = "300"\n', "detail_ttl_seconds"),
+        ('[state]\ndir = "/state"\n\n[freshness.folders]\nsnapshot_ttl_seconds = 0\n', "snapshot_ttl_seconds"),
         (
             '[state]\ndir = "/state"\n\n[scheduling]\nscheduled_flood_sleep_threshold_seconds = -1\n',
             "scheduled_flood_sleep_threshold_seconds",
