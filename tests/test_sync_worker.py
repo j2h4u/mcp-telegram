@@ -1360,15 +1360,15 @@ async def test_last_synced_at_set_on_partial_batch(
 
 
 @pytest.mark.asyncio
-async def test_total_messages_written_on_completion(
+async def test_total_messages_not_overwritten_by_offset_completion(
     mock_client: _MockClient,
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
-    """total_messages is written even on the completion (empty) batch."""
+    """Offset completion totals are page/window metadata, not dialog-level totals."""
     dialog_id = 8004
     sync_db.execute(
-        "INSERT INTO synced_dialogs (dialog_id, status, sync_progress) VALUES (?, 'syncing', 100)",
+        "INSERT INTO synced_dialogs (dialog_id, status, sync_progress, total_messages) VALUES (?, 'syncing', 100, 6000)",
         (dialog_id,),
     )
     sync_db.commit()
@@ -1377,7 +1377,7 @@ async def test_total_messages_written_on_completion(
     await worker.process_one_batch()
     row = sync_db.execute("SELECT total_messages FROM synced_dialogs WHERE dialog_id = ?", (dialog_id,)).fetchone()
     assert row is not None
-    assert row[0] == 5000
+    assert row[0] == 6000
 
 
 # ---------------------------------------------------------------------------

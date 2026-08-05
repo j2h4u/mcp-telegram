@@ -16,6 +16,29 @@ from ._base import (
 )
 
 logger = logging.getLogger(__name__)
+_HISTORY_SCOPE_BY_STATUS = {
+    "synced": "full",
+    "syncing": "full",
+    "own_only": "own_only",
+    "fragment": "fragment",
+    "access_lost": "access_lost",
+}
+_HISTORY_DEPTH_BY_STATUS = {
+    "synced": "complete",
+    "syncing": "partial",
+    "own_only": "partial",
+    "fragment": "partial",
+    "access_lost": "partial",
+    "not_synced": "none",
+}
+_HISTORY_SYNC_BY_STATUS = {
+    "synced": "complete_as_of_last_sync",
+    "syncing": "syncing",
+    "own_only": "own_messages_only",
+    "fragment": "fragment_only",
+    "access_lost": "access_lost_archive",
+    "not_synced": "not_synced",
+}
 
 
 MARK_DIALOG_FOR_SYNC_OUTPUT_SCHEMA = {
@@ -50,6 +73,14 @@ GET_SYNC_STATUS_OUTPUT_SCHEMA = {
         "last_synced_at": {"type": ["integer", "null"]},
         "last_event_at": {"type": ["integer", "null"]},
         "message_count": {"type": ["integer", "null"]},
+        "saved_message_count": {"type": ["integer", "null"]},
+        "history_scope": {"type": "string"},
+        "history_depth_state": {"type": "string"},
+        "history_sync_state": {"type": "string"},
+        "history_complete_at": {"type": ["integer", "null"]},
+        "coverage_state": {"type": "string"},
+        "local_knowledge_at": {"type": ["integer", "null"]},
+        "local_knowledge_age_seconds": {"type": ["integer", "null"]},
         "sync_progress": {"type": ["integer", "null"]},
         "sync_progress_message_id": {"type": ["integer", "null"]},
         "total_messages": {"type": ["integer", "null"]},
@@ -66,6 +97,14 @@ GET_SYNC_STATUS_OUTPUT_SCHEMA = {
         "last_synced_at",
         "last_event_at",
         "message_count",
+        "saved_message_count",
+        "history_scope",
+        "history_depth_state",
+        "history_sync_state",
+        "history_complete_at",
+        "coverage_state",
+        "local_knowledge_at",
+        "local_knowledge_age_seconds",
         "sync_progress",
         "sync_progress_message_id",
         "total_messages",
@@ -299,30 +338,84 @@ async def get_sync_status(args: GetSyncStatus) -> ToolResult:
     status = data.get("status") or "unknown"
     message_count = data.get("message_count")
     total_messages = data.get("total_messages")
+    saved_message_count = data.get("saved_message_count", message_count)
+    coverage_state = data.get("coverage_state", _coverage_state(saved_message_count, total_messages))
+    last_synced_at = data.get("last_synced_at")
+    last_event_at = data.get("last_event_at")
+    local_knowledge_at = data.get("local_knowledge_at", _local_knowledge_at(last_synced_at, last_event_at))
     sync_progress_message_id = data.get("sync_progress_message_id", data.get("sync_progress"))
     structured_content = {
         "dialog_id": data.get("dialog_id"),
         "status": status,
         "raw_status": data.get("raw_status", status),
         "is_syncing": status == "syncing",
-        "last_synced_at": data.get("last_synced_at"),
-        "last_event_at": data.get("last_event_at"),
+        "last_synced_at": last_synced_at,
+        "last_event_at": last_event_at,
         "message_count": message_count,
+        "saved_message_count": saved_message_count,
+        "history_scope": data.get("history_scope", _history_scope(status)),
+        "history_depth_state": data.get("history_depth_state", _history_depth_state(status)),
+        "history_sync_state": data.get("history_sync_state", _history_sync_state(status)),
+        "history_complete_at": data.get("history_complete_at", last_synced_at if status == "synced" else None),
+        "coverage_state": coverage_state,
+        "local_knowledge_at": local_knowledge_at,
+        "local_knowledge_age_seconds": data.get("local_knowledge_age_seconds"),
         "sync_progress": data.get("sync_progress"),
         "sync_progress_message_id": sync_progress_message_id,
         "total_messages": total_messages,
         "delete_detection": data.get("delete_detection"),
         "sync_coverage_pct": data.get("sync_coverage_pct"),
         "access_lost_at": data.get("access_lost_at"),
-        "action": _sync_status_action(message_count, total_messages),
+        "action": _sync_status_action(status, message_count, total_messages, coverage_state),
     }
     return structured_result(structured_content, result_count=1)
 
 
-def _sync_status_action(message_count: object, total_messages: object) -> str:
-    parts = ["sync_progress is a message_id offset, not a count."]
+def _coverage_state(message_count: object, total_messages: object) -> str:
+    if total_messages is None:
+        return "telegram_total_unknown"
+    if not isinstance(total_messages, int) or total_messages < 0:
+        return "telegram_total_invalid"
+    if isinstance(message_count, int) and message_count > total_messages:
+        return "telegram_total_not_comparable"
+    return "telegram_total_comparable"
+
+
+def _local_knowledge_at(last_synced_at: object, last_event_at: object) -> object | None:
+    timestamps = [ts for ts in (last_synced_at, last_event_at) if isinstance(ts, int)]
+    return max(timestamps) if timestamps else None
+
+
+def _history_scope(status: object) -> str:
+    return _HISTORY_SCOPE_BY_STATUS.get(status, "none") if isinstance(status, str) else "none"
+
+
+def _history_depth_state(status: object) -> str:
+    return _HISTORY_DEPTH_BY_STATUS.get(status, "unknown") if isinstance(status, str) else "unknown"
+
+
+def _history_sync_state(status: object) -> str:
+    return _HISTORY_SYNC_BY_STATUS.get(status, "unknown") if isinstance(status, str) else "unknown"
+
+
+def _sync_status_action(status: object, message_count: object, total_messages: object, coverage_state: object) -> str:
+    parts = [_history_action(status), "sync_progress is a message_id offset, not a count."]
     parts.append(_sync_coverage_action(message_count, total_messages))
+    if coverage_state == "telegram_total_not_comparable":
+        parts.append("Stored Telegram total_messages is suspect; percentage coverage is diagnostic-only.")
     return " ".join(parts)
+
+
+def _history_action(status: object) -> str:
+    if status == "synced":
+        return "Full history was fetched as of last_synced_at; ongoing freshness is represented by local_knowledge_at."
+    if status == "own_only":
+        return "Only own-message-related history is stored for this dialog."
+    if status == "not_synced":
+        return "This dialog is not enrolled for history sync."
+    if status == "access_lost":
+        return "This dialog is an access-lost local archive, not a current live mirror."
+    return "History sync state is represented by history_sync_state."
 
 
 def _sync_coverage_action(message_count: object, total_messages: object) -> str:

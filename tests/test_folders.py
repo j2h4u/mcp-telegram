@@ -109,6 +109,26 @@ def test_folder_messages_merge_local_rows_and_report_incomplete_dialogs(tmp_path
         conn.close()
 
 
+def test_folder_messages_do_not_compare_sync_cursor_to_total_count(tmp_path: Path) -> None:
+    conn = _connection(tmp_path / "sync.db")
+    try:
+        conn.execute("INSERT INTO dialogs(dialog_id, name) VALUES (10, 'Alpha')")
+        conn.execute("INSERT INTO messages(dialog_id, message_id, sent_at, text) VALUES (10, 312233, 100, 'older')")
+        conn.execute(
+            "INSERT INTO synced_dialogs(dialog_id, status, sync_progress, total_messages) "
+            "VALUES (10, 'synced', 312233, 1)"
+        )
+        conn.commit()
+        replace_folder_snapshot(conn, [(1, "Work")], [(1, 10)])
+
+        result = list_folder_messages(conn, 1, 20)
+
+        assert result["partial"] is False
+        assert result["incomplete_dialog_ids"] == []
+    finally:
+        conn.close()
+
+
 def test_folder_rules_apply_exclude_then_explicit_include_then_categories() -> None:
     folder = FolderRule(
         folder_id=1,

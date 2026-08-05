@@ -44,9 +44,12 @@ _NEXT_PENDING_SQL = (
     "WHERE status IN ('syncing', 'not_synced') "
     "ORDER BY rowid LIMIT 1"
 )
-_UPDATE_PROGRESS_SQL = "UPDATE synced_dialogs SET sync_progress = ?, status = ?, total_messages = ? WHERE dialog_id = ?"
+_UPDATE_PROGRESS_SQL = (
+    "UPDATE synced_dialogs SET sync_progress = ?, status = ?, "
+    "total_messages = COALESCE(?, total_messages) WHERE dialog_id = ?"
+)
 _UPDATE_PROGRESS_DONE_SQL = (
-    "UPDATE synced_dialogs SET sync_progress = ?, status = ?, total_messages = ?, "
+    "UPDATE synced_dialogs SET sync_progress = ?, status = ?, total_messages = COALESCE(?, total_messages), "
     "last_synced_at = ? WHERE dialog_id = ?"
 )
 
@@ -268,7 +271,10 @@ class FullSyncWorker:
             logger.info("sync_start dialog_id=%d", dialog_id)
         try:
             result = await self._client.get_messages(entity=dialog_id, limit=_BATCH_SIZE, offset_id=sync_progress)
-            total_messages = result.total  # Telegram-side count from TotalList
+            # Telegram-side count from TotalList. Only the unoffset request is
+            # a dialog-level estimate; offset pages can report page/window
+            # totals and must not overwrite the stored dialog total.
+            total_messages = result.total if sync_progress == 0 else None
             batch = list(result)
             # Note: batch size 100 keeps memory bounded; get_messages needed for .total
         except FloodWaitError as exc:
@@ -299,7 +305,7 @@ class FullSyncWorker:
         self,
         dialog_id: int,
         sync_progress: int,
-        total_messages: int,
+        total_messages: int | None,
         batch: Sequence[_MessageLike],
     ) -> tuple[int, bool]:
         """Persist one fetched batch and update sync progress."""
@@ -347,7 +353,7 @@ class FullSyncWorker:
             is_done,
         )
         if is_done:
-            logger.info("sync_done dialog_id=%d status=synced total_messages=%d", dialog_id, total_messages)
+            logger.info("sync_done dialog_id=%d status=synced total_messages=%s", dialog_id, total_messages)
         return new_progress, is_done
 
 

@@ -4392,7 +4392,43 @@ async def test_get_sync_status_includes_coverage():
     result = await server._get_sync_status({"dialog_id": -100001})
     assert result["ok"] is True
     assert result["data"]["sync_coverage_pct"] == 80
+    assert result["data"]["history_scope"] == "full"
+    assert result["data"]["history_depth_state"] == "complete"
+    assert result["data"]["history_sync_state"] == "complete_as_of_last_sync"
+    assert result["data"]["saved_message_count"] == 800
+    assert result["data"]["coverage_state"] == "telegram_total_comparable"
     assert result["data"]["access_lost_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_get_sync_status_keeps_synced_complete_when_total_is_suspect():
+    """A bad Telegram total estimate must not make a completed full sync look incomplete."""
+    conn = _make_db()
+    conn.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, total_messages, last_synced_at, last_event_at) "
+        "VALUES (?, 'synced', 1, 1700000000, 1700001000)",
+        (7110815,),
+    )
+    for i in range(191):
+        conn.execute(
+            "INSERT INTO messages (dialog_id, message_id, sent_at, text, is_deleted) VALUES (?, ?, 1000, 'msg', 0)",
+            (7110815, 312233 + i),
+        )
+    conn.commit()
+
+    server = make_server(conn)
+    result = await server._get_sync_status({"dialog_id": 7110815})
+
+    assert result["ok"] is True
+    data = result["data"]
+    assert data["sync_coverage_pct"] is None
+    assert data["coverage_state"] == "telegram_total_not_comparable"
+    assert data["history_scope"] == "full"
+    assert data["history_depth_state"] == "complete"
+    assert data["history_sync_state"] == "complete_as_of_last_sync"
+    assert data["history_complete_at"] == 1700000000
+    assert data["local_knowledge_at"] == 1700001000
+    assert data["saved_message_count"] == 191
 
 
 @pytest.mark.asyncio
@@ -4468,6 +4504,11 @@ async def test_list_dialogs_includes_coverage():
     dialogs = result["data"]["dialogs"]
     assert len(dialogs) == 1
     assert dialogs[0]["sync_coverage_pct"] == 50
+    assert dialogs[0]["saved_message_count"] == 50
+    assert dialogs[0]["history_scope"] == "full"
+    assert dialogs[0]["history_depth_state"] == "complete"
+    assert dialogs[0]["history_sync_state"] == "complete_as_of_last_sync"
+    assert dialogs[0]["coverage_state"] == "telegram_total_comparable"
     assert dialogs[0]["access_lost_at"] is None
     assert dialogs[0]["type"] == "User"
     cast(MagicMock, mock_client.iter_dialogs).assert_not_called()

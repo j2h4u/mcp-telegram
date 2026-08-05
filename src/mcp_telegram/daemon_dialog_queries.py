@@ -7,6 +7,29 @@ import time
 from typing import cast
 
 _SNAPSHOT_STALE_THRESHOLD_S = 12 * 3600
+_HISTORY_SCOPE_BY_STATUS = {
+    "synced": "full",
+    "syncing": "full",
+    "own_only": "own_only",
+    "fragment": "fragment",
+    "access_lost": "access_lost",
+}
+_HISTORY_DEPTH_BY_STATUS = {
+    "synced": "complete",
+    "syncing": "partial",
+    "own_only": "partial",
+    "fragment": "partial",
+    "access_lost": "partial",
+    "not_synced": "none",
+}
+_HISTORY_SYNC_BY_STATUS = {
+    "synced": "complete_as_of_last_sync",
+    "syncing": "syncing",
+    "own_only": "own_messages_only",
+    "fragment": "fragment_only",
+    "access_lost": "access_lost_archive",
+    "not_synced": "not_synced",
+}
 
 
 def _compute_snapshot_age_h(max_snapshot_at: int | None) -> int | None:
@@ -33,6 +56,54 @@ def _compute_sync_coverage(
 
 def _sync_coverage_unknown(total_messages: int | None, local_count: int) -> bool:
     return total_messages is None or total_messages < 0 or local_count > total_messages
+
+
+def _sync_coverage_state(total_messages: int | None, local_count: int) -> str:
+    """Describe whether Telegram total_messages is usable as a diagnostic denominator."""
+    if total_messages is None:
+        return "telegram_total_unknown"
+    if total_messages < 0:
+        return "telegram_total_invalid"
+    if local_count > total_messages:
+        return "telegram_total_not_comparable"
+    return "telegram_total_comparable"
+
+
+def _history_scope(status: str) -> str:
+    return _HISTORY_SCOPE_BY_STATUS.get(status, "none")
+
+
+def _history_depth_state(status: str) -> str:
+    return _HISTORY_DEPTH_BY_STATUS.get(status, "unknown")
+
+
+def _history_sync_state(status: str) -> str:
+    return _HISTORY_SYNC_BY_STATUS.get(status, "unknown")
+
+
+def build_sync_read_model(
+    *,
+    status: str,
+    last_synced_at: int | None,
+    last_event_at: int | None,
+    local_count: int,
+    total_messages: int | None,
+) -> dict[str, object]:
+    """Build agent-facing sync freshness/depth facts from daemon lifecycle state."""
+    local_knowledge_at = max((ts for ts in (last_synced_at, last_event_at) if ts is not None), default=None)
+    local_knowledge_age_seconds = None
+    if local_knowledge_at is not None:
+        local_knowledge_age_seconds = max(0, int(time.time()) - local_knowledge_at)
+    return {
+        "history_scope": _history_scope(status),
+        "history_depth_state": _history_depth_state(status),
+        "history_sync_state": _history_sync_state(status),
+        "history_complete_at": last_synced_at if status == "synced" else None,
+        "saved_message_count": local_count,
+        "coverage_state": _sync_coverage_state(total_messages, local_count),
+        "local_knowledge_at": local_knowledge_at,
+        "local_knowledge_age_seconds": local_knowledge_age_seconds,
+    }
 
 
 def _build_access_metadata(
@@ -93,6 +164,8 @@ WITH agent_visible_dialogs AS (
         d.draft_text,
         sd.status AS sync_status,
         sd.total_messages,
+        sd.last_synced_at,
+        sd.last_event_at,
         sd.access_lost_at
     FROM dialogs d
     LEFT JOIN synced_dialogs sd USING(dialog_id)
@@ -115,6 +188,8 @@ WITH agent_visible_dialogs AS (
         NULL AS draft_text,
         sd.status AS sync_status,
         sd.total_messages,
+        sd.last_synced_at,
+        sd.last_event_at,
         sd.access_lost_at
     FROM synced_dialogs sd
     LEFT JOIN dialogs d USING(dialog_id)
@@ -124,7 +199,7 @@ SELECT
     dialog_id, name, type, archived, pinned,
     members, created, last_message_at, snapshot_at,
     unread_mentions_count, unread_reactions_count, draft_text,
-    sync_status, total_messages, access_lost_at
+    sync_status, total_messages, last_synced_at, last_event_at, access_lost_at
 FROM agent_visible_dialogs
 WHERE (:archived_filter IS NULL OR archived = :archived_filter)
 AND (:pinned_filter IS NULL OR pinned = :pinned_filter)
