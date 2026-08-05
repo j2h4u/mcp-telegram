@@ -27,6 +27,7 @@ from .daemon_dialog_queries import (
     _build_access_metadata,
     _compute_snapshot_age_h,
     _compute_sync_coverage,
+    build_sync_read_model,
 )
 from .daemon_message import fetch_reaction_counts
 from .daemon_message_queries import (
@@ -1145,6 +1146,8 @@ class DaemonReadingService:
             return None, None
 
         row_data: dict[str, object] = {
+            "last_synced_at": row["last_synced_at"],
+            "last_event_at": row["last_event_at"],
             "id": d_id,
             "name": row["name"],
             "type": row["type"],
@@ -1156,6 +1159,13 @@ class DaemonReadingService:
             "sync_coverage_pct": _compute_sync_coverage(
                 _object_to_int_or_none(row["total_messages"]),
                 local_counts.get(d_id, 0),
+            ),
+            **build_sync_read_model(
+                status=str(row["sync_status"] or "not_synced"),
+                last_synced_at=_object_to_int_or_none(row["last_synced_at"]),
+                last_event_at=_object_to_int_or_none(row["last_event_at"]),
+                local_count=local_counts.get(d_id, 0),
+                total_messages=_object_to_int_or_none(row["total_messages"]),
             ),
             "access_lost_at": row["access_lost_at"],
             "unread_mentions_count": _object_to_int(row["unread_mentions_count"], 0),

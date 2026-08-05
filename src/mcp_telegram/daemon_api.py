@@ -88,6 +88,7 @@ from .daemon_dialog_queries import (
     _MARK_FOR_SYNC_SQL,
     _UNMARK_SYNC_SQL,
     _compute_sync_coverage,
+    build_sync_read_model,
 )
 from .daemon_entity_info import DaemonEntityInfoService, EntityInfoDeps
 from .daemon_message_queries import (
@@ -1170,6 +1171,13 @@ class DaemonAPIServer:
             "delete_detection": delete_detection,
             "sync_coverage_pct": sync_coverage_pct,
             "access_lost_at": access_lost_at,
+            **build_sync_read_model(
+                status=status,
+                last_synced_at=last_synced_at,
+                last_event_at=last_event_at,
+                local_count=message_count,
+                total_messages=total_messages,
+            ),
         }
         if status == "access_lost" and total_messages is None:
             data["archived_message_count"] = message_count

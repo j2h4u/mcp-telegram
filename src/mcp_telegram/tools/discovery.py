@@ -54,6 +54,14 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
                     "sync_status": {"type": ["string", "null"]},
                     "synced": {"type": ["boolean", "null"]},
                     "sync_coverage_pct": {"type": ["integer", "null"]},
+                    "saved_message_count": {"type": "integer"},
+                    "history_scope": {"type": "string"},
+                    "history_depth_state": {"type": "string"},
+                    "history_sync_state": {"type": "string"},
+                    "history_complete_at": {"type": ["integer", "null"]},
+                    "coverage_state": {"type": "string"},
+                    "local_knowledge_at": {"type": ["integer", "null"]},
+                    "local_knowledge_age_seconds": {"type": ["integer", "null"]},
                     "access_lost_at": {"type": ["integer", "null"]},
                     "members": {"type": ["integer", "null"]},
                     "created": {"type": ["integer", "string", "null"]},
@@ -100,6 +108,14 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
                     "sync_status",
                     "synced",
                     "sync_coverage_pct",
+                    "saved_message_count",
+                    "history_scope",
+                    "history_depth_state",
+                    "history_sync_state",
+                    "history_complete_at",
+                    "coverage_state",
+                    "local_knowledge_at",
+                    "local_knowledge_age_seconds",
                     "access_lost_at",
                     "members",
                     "created",
@@ -188,6 +204,19 @@ def _structured_folder_placement(dialog: dict) -> dict[str, object]:
     return {
         "folder_ids": list(dialog.get("folder_ids", [])),
         "folders": folders,
+    }
+
+
+def _structured_sync_read_model(dialog: dict) -> dict[str, object]:
+    return {
+        "saved_message_count": int(dialog.get("saved_message_count", 0) or 0),
+        "history_scope": dialog.get("history_scope", "none"),
+        "history_depth_state": dialog.get("history_depth_state", "unknown"),
+        "history_sync_state": dialog.get("history_sync_state", "unknown"),
+        "history_complete_at": dialog.get("history_complete_at"),
+        "coverage_state": dialog.get("coverage_state", "telegram_total_unknown"),
+        "local_knowledge_at": dialog.get("local_knowledge_at"),
+        "local_knowledge_age_seconds": dialog.get("local_knowledge_age_seconds"),
     }
 
 
@@ -312,6 +341,7 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
                 "sync_status": sync_status,
                 "synced": (sync_status == "synced") if sync_status is not None else None,
                 "sync_coverage_pct": d.get("sync_coverage_pct"),
+                **_structured_sync_read_model(d),
                 "access_lost_at": d.get("access_lost_at"),
                 "members": d.get("members"),
                 "created": d.get("created"),

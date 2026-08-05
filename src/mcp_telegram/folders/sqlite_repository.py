@@ -68,8 +68,7 @@ def list_folder_messages(conn: sqlite3.Connection, folder_id: int, limit: int) -
         conn.execute(
             """SELECT fm.dialog_id FROM telegram_folder_members fm
            LEFT JOIN synced_dialogs sd ON sd.dialog_id = fm.dialog_id
-           WHERE fm.folder_id = ? AND (sd.dialog_id IS NULL OR sd.status != 'synced'
-             OR sd.total_messages IS NULL OR sd.sync_progress IS NULL OR sd.sync_progress < sd.total_messages)
+           WHERE fm.folder_id = ? AND (sd.dialog_id IS NULL OR sd.status != 'synced')
            ORDER BY fm.dialog_id""",
             (folder_id,),
         ).fetchall(),
