@@ -30,6 +30,14 @@ TOOLS = [
     },
 ]
 
+PROMPTS = [
+    {
+        "name": "Guide",
+        "title": "Guide",
+        "description": "Fake workflow prompt",
+    }
+]
+
 
 def send(payload: dict) -> None:
     sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
@@ -53,7 +61,7 @@ def main() -> int:
                     "id": request_id,
                     "result": {
                         "protocolVersion": protocol_version,
-                        "capabilities": {"tools": {}},
+                        "capabilities": {"tools": {}, "prompts": {}},
                         "serverInfo": {"name": "fake-mcp", "version": "1.0"},
                     },
                 }
@@ -69,6 +77,52 @@ def main() -> int:
                     "jsonrpc": "2.0",
                     "id": request_id,
                     "result": {"tools": TOOLS},
+                }
+            )
+            continue
+
+        if method == "prompts/list":
+            send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "result": {"prompts": PROMPTS},
+                }
+            )
+            continue
+
+        if method == "prompts/get":
+            params = cast(dict[str, object], payload.get("params", {}))
+            name = cast(str | None, params.get("name"))
+            if name == "Guide":
+                send(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "result": {
+                            "description": "Fake workflow prompt",
+                            "messages": [
+                                {
+                                    "role": "user",
+                                    "content": {
+                                        "type": "text",
+                                        "text": "Use list_prompts, get_prompt, and call_tool.",
+                                    },
+                                }
+                            ],
+                        },
+                    }
+                )
+                continue
+
+            send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {
+                        "code": -32000,
+                        "message": f"prompt failed: {name}",
+                    },
                 }
             )
             continue

@@ -8,6 +8,16 @@ Usage:
 uv run python -m devtools.mcp_client.cli list-tools -- docker exec -i mcp-telegram mcp-telegram run
 ```
 
+```bash
+uv run python -m devtools.mcp_client.cli list-prompts -- docker exec -i mcp-telegram mcp-telegram run
+```
+
+```bash
+uv run python -m devtools.mcp_client.cli get-prompt \
+  --name telegram_workflows \
+  -- docker exec -i mcp-telegram mcp-telegram run
+```
+
 Streamable HTTP:
 
 ```bash
@@ -47,6 +57,8 @@ Run several actions in one MCP session:
 {
   "steps": [
     {"action": "list_tools"},
+    {"action": "list_prompts"},
+    {"action": "get_prompt", "name": "telegram_workflows"},
     {
       "action": "call_tool",
       "name": "list_dialogs",
@@ -66,7 +78,10 @@ The `script` format supports assertions:
 
 - `expect.tool_names_include`
 - `expect.tool_expectations`
+- `expect.prompt_names_include`
 - `expect.path_equals`
 - `expect.is_error`
 - `expect.content_text_contains`
 - `expect.content_text_not_contains`
+- `expect.prompt_text_contains`
+- `expect.prompt_text_not_contains`
