@@ -526,17 +526,21 @@ def test_sync_main_idles_when_all_synced(
     mock_client: MagicMock,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """When process_one_batch() returns True (all synced), daemon falls back to heartbeat-only
-    wait. Verify heartbeat log appears after idle starts."""
+    """When process_one_batch() returns True (all synced), daemon enters idle mode.
+
+    The heartbeat call itself ends the loop so the test does not depend on
+    scheduler timing between an arbitrary delayed shutdown task and the idle
+    wait path.
+    """
     shutdown_event = asyncio.Event()
 
     def mock_register_shutdown(conn, loop, **kwargs):
-        async def _set_after_delay() -> None:
-            await asyncio.sleep(0.05)
-            shutdown_event.set()
-
-        loop.create_task(_set_after_delay())
         return shutdown_event
+
+    def heartbeat_then_shutdown(*args):
+        result = _log_heartbeat(*args)
+        shutdown_event.set()
+        return result
 
     worker_instance = MagicMock()
     worker_instance.bootstrap_dms = AsyncMock(return_value=0)
@@ -554,12 +558,14 @@ def test_sync_main_idles_when_all_synced(
         patch("mcp_telegram.daemon._open_sync_db"),
         patch("mcp_telegram.daemon.backfill_fts_index", return_value=0),
         patch("mcp_telegram.daemon.HEARTBEAT_INTERVAL_S", 0.0),
+        patch("mcp_telegram.daemon._log_heartbeat", side_effect=heartbeat_then_shutdown) as mock_hb,
         patch("mcp_telegram.daemon.FullSyncWorker", worker_class),
         patch("mcp_telegram.daemon._start_followup_background_tasks", side_effect=_noop_followups),
         caplog.at_level(logging.INFO, logger="mcp_telegram.daemon"),
     ):
         asyncio.run(sync_main())
 
+    mock_hb.assert_called()
     heartbeat_logs = [r.message for r in caplog.records if "heartbeat" in r.message]
     assert heartbeat_logs, "Expected heartbeat log when daemon is in idle mode after all synced"
     assert any("sync_idle" in r.message for r in caplog.records)
