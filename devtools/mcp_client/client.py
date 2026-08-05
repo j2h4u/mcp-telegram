@@ -6,7 +6,7 @@ import re
 from contextlib import AsyncExitStack
 from datetime import timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from mcp import ClientSession, StdioServerParameters, stdio_client
 from mcp.client.streamable_http import streamable_http_client
@@ -17,6 +17,18 @@ _ENV_PLACEHOLDER_RE = re.compile(r"^\$\{([A-Z_][A-Z0-9_]*)\}$")
 
 class McpClientError(RuntimeError):
     """Raised when the external MCP server process or protocol misbehaves."""
+
+
+class McpTestClient(Protocol):
+    """Protocol shared by stdio and HTTP test clients."""
+
+    async def list_tools(self) -> list[dict[str, Any]]: ...
+
+    async def list_prompts(self) -> list[dict[str, Any]]: ...
+
+    async def get_prompt(self, name: str, arguments: dict[str, str] | None = None) -> dict[str, Any]: ...
+
+    async def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]: ...
 
 
 class StdioMcpClient:
@@ -82,6 +94,22 @@ class StdioMcpClient:
         except Exception as exc:
             raise McpClientError(str(exc)) from exc
         return [tool.model_dump(mode="json", by_alias=True, exclude_none=True) for tool in result.tools]
+
+    async def list_prompts(self) -> list[dict[str, Any]]:
+        session = self._require_session()
+        try:
+            result = await session.list_prompts()
+        except Exception as exc:
+            raise McpClientError(str(exc)) from exc
+        return [prompt.model_dump(mode="json", by_alias=True, exclude_none=True) for prompt in result.prompts]
+
+    async def get_prompt(self, name: str, arguments: dict[str, str] | None = None) -> dict[str, Any]:
+        session = self._require_session()
+        try:
+            result = await session.get_prompt(name, arguments)
+        except Exception as exc:
+            raise McpClientError(str(exc)) from exc
+        return result.model_dump(mode="json", by_alias=True, exclude_none=True)
 
     async def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
         session = self._require_session()
@@ -161,6 +189,22 @@ class HttpMcpClient:
             raise McpClientError(str(exc)) from exc
         return [tool.model_dump(mode="json", by_alias=True, exclude_none=True) for tool in result.tools]
 
+    async def list_prompts(self) -> list[dict[str, Any]]:
+        session = self._require_session()
+        try:
+            result = await session.list_prompts()
+        except Exception as exc:
+            raise McpClientError(str(exc)) from exc
+        return [prompt.model_dump(mode="json", by_alias=True, exclude_none=True) for prompt in result.prompts]
+
+    async def get_prompt(self, name: str, arguments: dict[str, str] | None = None) -> dict[str, Any]:
+        session = self._require_session()
+        try:
+            result = await session.get_prompt(name, arguments)
+        except Exception as exc:
+            raise McpClientError(str(exc)) from exc
+        return result.model_dump(mode="json", by_alias=True, exclude_none=True)
+
     async def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
         session = self._require_session()
         try:
@@ -217,7 +261,7 @@ def _expand_script_env(value: Any) -> Any:
     return value
 
 
-async def execute_script_steps(client: StdioMcpClient, steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
+async def execute_script_steps(client: McpTestClient, steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Run one list of client actions inside a single MCP session."""
     results: list[dict[str, Any]] = []
     for index, step in enumerate(steps, start=1):
@@ -234,6 +278,42 @@ async def execute_script_steps(client: StdioMcpClient, steps: list[dict[str, Any
             )
             continue
 
+        if action == "list_prompts":
+            result = await client.list_prompts()
+            _assert_step_expectations(index=index, action=action, result=result, expect=step.get("expect"))
+            results.append(
+                {
+                    "step": index,
+                    "action": action,
+                    "result": result,
+                }
+            )
+            continue
+
+        if action == "get_prompt":
+            name = step.get("name")
+            if not isinstance(name, str) or not name:
+                raise ValueError(f"script step {index} is missing string field 'name'")
+
+            arguments = step.get("arguments")
+            if arguments is not None and (
+                not isinstance(arguments, dict)
+                or not all(isinstance(k, str) and isinstance(v, str) for k, v in arguments.items())
+            ):
+                raise ValueError(f"script step {index} field 'arguments' must be an object with string values")
+
+            prompt_result = await client.get_prompt(name, arguments)
+            _assert_step_expectations(index=index, action=action, result=prompt_result, expect=step.get("expect"))
+            results.append(
+                {
+                    "step": index,
+                    "action": action,
+                    "name": name,
+                    "result": prompt_result,
+                }
+            )
+            continue
+
         if action == "call_tool":
             name = step.get("name")
             if not isinstance(name, str) or not name:
@@ -243,14 +323,14 @@ async def execute_script_steps(client: StdioMcpClient, steps: list[dict[str, Any
             if not isinstance(arguments, dict):
                 raise ValueError(f"script step {index} field 'arguments' must be an object")
 
-            result = await client.call_tool(name, arguments)
-            _assert_step_expectations(index=index, action=action, result=result, expect=step.get("expect"))
+            tool_result = await client.call_tool(name, arguments)
+            _assert_step_expectations(index=index, action=action, result=tool_result, expect=step.get("expect"))
             results.append(
                 {
                     "step": index,
                     "action": action,
                     "name": name,
-                    "result": result,
+                    "result": tool_result,
                 }
             )
             continue
@@ -300,10 +380,30 @@ def _assert_step_expectations(
     _assert_path_exists(index=index, result=result, expected=expect.get("path_not_exists"), should_exist=False)
     _assert_path_nonempty(index=index, result=result, expected=expect.get("path_nonempty"))
 
-    if action == "list_tools":
-        _assert_list_tools_expectations(index=index, result=result, expect=expect)
-    elif action == "call_tool":
-        _assert_call_tool_expectations(index=index, result=result, expect=expect)
+    action_expectations = {
+        "list_tools": _assert_list_tools_expectations,
+        "list_prompts": _assert_list_prompts_expectations,
+        "call_tool": _assert_call_tool_expectations,
+        "get_prompt": _assert_get_prompt_expectations,
+    }
+    checker = action_expectations.get(action)
+    if checker is not None:
+        checker(index=index, result=result, expect=expect)
+
+
+def _assert_list_prompts_expectations(*, index: int, result: Any, expect: dict[str, Any]) -> None:
+    if not isinstance(result, list):
+        raise McpClientError(f"script step {index} list_prompts result is not a list")
+
+    prompt_names_include = expect.get("prompt_names_include")
+    if prompt_names_include is None:
+        return
+    if not isinstance(prompt_names_include, list) or not all(isinstance(item, str) for item in prompt_names_include):
+        raise ValueError(f"script step {index} field 'expect.prompt_names_include' must be a list of strings")
+    prompt_names = {prompt.get("name") for prompt in result if isinstance(prompt, dict)}
+    missing_names = [name for name in prompt_names_include if name not in prompt_names]
+    if missing_names:
+        raise McpClientError(f"script step {index} is missing prompts: {missing_names}")
 
 
 def _assert_list_tools_expectations(*, index: int, result: Any, expect: dict[str, Any]) -> None:
@@ -368,6 +468,27 @@ def _assert_call_tool_expectations(*, index: int, result: Any, expect: dict[str,
         field_name="content_text_not_contains",
         haystack=content_text,
         expected=expect.get("content_text_not_contains"),
+        negate=True,
+    )
+
+
+def _assert_get_prompt_expectations(*, index: int, result: Any, expect: dict[str, Any]) -> None:
+    if not isinstance(result, dict):
+        raise McpClientError(f"script step {index} get_prompt result is not an object")
+
+    prompt_text = _extract_prompt_text(result)
+    _assert_text_membership(
+        index=index,
+        field_name="prompt_text_contains",
+        haystack=prompt_text,
+        expected=expect.get("prompt_text_contains"),
+        negate=False,
+    )
+    _assert_text_membership(
+        index=index,
+        field_name="prompt_text_not_contains",
+        haystack=prompt_text,
+        expected=expect.get("prompt_text_not_contains"),
         negate=True,
     )
 
@@ -446,6 +567,23 @@ def _extract_text_content(result: dict[str, Any]) -> str:
             text = item.get("text")
             if isinstance(text, str):
                 chunks.append(text)
+    return "\n".join(chunks)
+
+
+def _extract_prompt_text(result: dict[str, Any]) -> str:
+    messages = result.get("messages")
+    if not isinstance(messages, list):
+        return ""
+    chunks: list[str] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, dict):
+            continue
+        text = content.get("text")
+        if isinstance(text, str):
+            chunks.append(text)
     return "\n".join(chunks)
 
 

@@ -12,6 +12,7 @@ from devtools.mcp_client.client import (
     McpClientError,
     StdioMcpClient,
     _assert_step_expectations,
+    _extract_prompt_text,
     execute_script_steps,
     load_script_steps,
 )
@@ -43,6 +44,24 @@ async def test_mcp_test_client_lists_tools() -> None:
 
     tool_names = [tool["name"] for tool in tools]
     assert tool_names == ["Echo", "Fail"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_test_client_lists_prompts() -> None:
+    async with StdioMcpClient(_fake_server_command()) as client:
+        prompts = await client.list_prompts()
+
+    prompt_names = [prompt["name"] for prompt in prompts]
+    assert prompt_names == ["Guide"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_test_client_gets_prompt() -> None:
+    async with StdioMcpClient(_fake_server_command()) as client:
+        result = await client.get_prompt("Guide")
+
+    assert result["description"] == "Fake workflow prompt"
+    assert "get_prompt" in _extract_prompt_text(result)
 
 
 @pytest.mark.asyncio
@@ -89,6 +108,23 @@ async def test_mcp_test_client_executes_script_steps() -> None:
                 "content_text_not_contains": ["missing"],
             },
         },
+        {
+            "action": "list_prompts",
+            "expect": {
+                "prompt_names_include": ["Guide"],
+            },
+        },
+        {
+            "action": "get_prompt",
+            "name": "Guide",
+            "expect": {
+                "path_equals": {
+                    "description": "Fake workflow prompt",
+                },
+                "prompt_text_contains": ["list_prompts", "get_prompt"],
+                "prompt_text_not_contains": ["missing"],
+            },
+        },
     ]
 
     async with StdioMcpClient(_fake_server_command()) as client:
@@ -98,6 +134,8 @@ async def test_mcp_test_client_executes_script_steps() -> None:
     assert results[0]["result"][0]["name"] == "Echo"
     assert results[1]["name"] == "Echo"
     assert results[1]["result"]["content"][0]["text"] == '{"value": "script"}'
+    assert results[2]["action"] == "list_prompts"
+    assert results[3]["name"] == "Guide"
 
 
 @pytest.mark.asyncio
@@ -219,6 +257,37 @@ def test_mcp_test_client_redacts_printed_script_output(tmp_path: Path, capsys: p
     assert exit_code == 0
     assert "[REDACTED " in captured.out
     assert "sensitive text" not in captured.out
+
+
+def test_mcp_test_client_cli_lists_prompts(capsys: pytest.CaptureFixture[str]) -> None:
+    exit_code = main(
+        [
+            "list-prompts",
+            "--",
+            *_fake_server_command(),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert '"name": "Guide"' in captured.out
+
+
+def test_mcp_test_client_cli_gets_prompt(capsys: pytest.CaptureFixture[str]) -> None:
+    exit_code = main(
+        [
+            "get-prompt",
+            "--name",
+            "Guide",
+            "--",
+            *_fake_server_command(),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "Fake workflow prompt" in captured.out
+    assert "get_prompt" in captured.out
 
 
 def test_mcp_test_client_redacts_structured_content() -> None:
