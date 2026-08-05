@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock
 from urllib.parse import urlparse
 
 import pytest
-from mcp.types import CallToolResult, TextContent, Tool
+from mcp.types import CallToolResult, Prompt, TextContent, Tool
 
 from mcp_telegram import server
 from mcp_telegram.tools._base import ToolRegistryEntry, ToolResult, tool_description
@@ -479,10 +479,33 @@ def test_list_prompts_resources_tools_and_progress_routes_exist() -> None:
 
     prompts, resources, tools, templates = asyncio.run(runner())
 
-    assert prompts == []
+    prompt_list = cast(list[Prompt], prompts)
+    assert [prompt.name for prompt in prompt_list] == ["telegram_workflows"]
+    assert prompt_list[0].title == "Telegram workflows"
     assert resources == []
     assert isinstance(tools, list)
     assert templates == []
+
+
+@pytest.mark.asyncio
+async def test_get_prompt_returns_telegram_workflows_guide() -> None:
+    result = await server.get_prompt("telegram_workflows", None)
+
+    assert result.description == "Reusable scenarios for navigating Telegram through this MCP server."
+    assert len(result.messages) == 1
+    message = result.messages[0]
+    assert message.role == "user"
+    assert isinstance(message.content, TextContent)
+    text = message.content.text
+    assert "SEARCH THEN READ" in text
+    assert "FOLDERS" in text
+    assert "list_folder_messages(folder_id=N)" in text
+    assert "get_entity_info" in text
+    assert "trace_account_messages" in text
+    assert "exact_topic_id" in text
+    assert "best_effort_visible" in text
+    assert "not_synced" in text
+    assert "own_only" in text
 
 
 @pytest.mark.asyncio
@@ -775,7 +798,7 @@ async def test_call_tool_validation_rejects_trace_topic_without_dialog_scope() -
 
 
 @pytest.mark.asyncio
-async def test_server_instructions_mention_account_trace(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_server_instructions_point_to_workflows_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
     class _Conn:
         async def get_me(self) -> dict:
             return {"ok": False}
@@ -788,9 +811,10 @@ async def test_server_instructions_mention_account_trace(monkeypatch: pytest.Mon
 
     instructions = await server._build_server_instructions()
 
-    assert "trace_account_messages" in instructions
-    assert "exact_topic_id" in instructions
-    assert "best_effort_visible" in instructions
+    assert "telegram_workflows" in instructions
+    assert "Do NOT use WebFetch or web scraping" in instructions
+    assert "trace_account_messages" not in instructions
+    assert "best_effort_visible" not in instructions
 
 
 @pytest.mark.asyncio
