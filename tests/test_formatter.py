@@ -759,3 +759,103 @@ def test_describe_media_unknown_type_fallback() -> None:
 
     result = describe_media(_CustomMedia())
     assert result == "[медиа: _CustomMedia]"
+
+
+# ---------------------------------------------------------------------------
+# build_search_hit_window tests
+# ---------------------------------------------------------------------------
+
+
+def _window_msg(mid: int, text: str = "msg") -> ReadMessage:
+    dt = datetime(2024, 6, 15, 12, 0, 0, tzinfo=UTC)
+    return _make_msg(mid, dt, text=text, first_name="User")
+
+
+def test_build_search_hit_window_centered() -> None:
+    """Hit in the middle of a dense sequence returns hit + radius neighbours on each side."""
+    from mcp_telegram.formatter import build_search_hit_window
+
+    context: dict[int, ReadMessage] = {i: _window_msg(i) for i in range(1, 11)}
+    hit = _window_msg(5)
+    window = build_search_hit_window(hit, context_messages_by_id=context, context_radius=3)
+
+    ids = [m.id for m in window]
+    assert ids == [8, 7, 6, 5, 4, 3, 2], f"expected [8,7,6,5,4,3,2], got {ids}"
+
+
+def test_build_search_hit_window_left_boundary() -> None:
+    """Hit at the left boundary (low id) returns only available messages before the hit."""
+    from mcp_telegram.formatter import build_search_hit_window
+
+    context = {i: _window_msg(i) for i in range(1, 8)}
+    hit = _window_msg(2)
+    window = build_search_hit_window(hit, context_messages_by_id=context, context_radius=3)
+
+    ids = [m.id for m in window]
+    assert ids == [5, 4, 3, 2, 1], f"expected [5,4,3,2,1], got {ids}"
+
+
+def test_build_search_hit_window_right_boundary() -> None:
+    """Hit at the right boundary (high id) returns only available messages after the hit."""
+    from mcp_telegram.formatter import build_search_hit_window
+
+    context = {i: _window_msg(i) for i in range(5, 12)}
+    hit = _window_msg(10)
+    window = build_search_hit_window(hit, context_messages_by_id=context, context_radius=3)
+
+    ids = [m.id for m in window]
+    assert ids == [11, 10, 9, 8, 7], f"expected [11,10,9,8,7], got {ids}"
+
+
+def test_build_search_hit_window_empty_context() -> None:
+    """Hit with no neighbours returns only the hit itself."""
+    from mcp_telegram.formatter import build_search_hit_window
+
+    hit = _window_msg(42)
+    window = build_search_hit_window(hit, context_messages_by_id={}, context_radius=3)
+
+    assert len(window) == 1
+    assert window[0].id == 42
+
+
+def test_build_search_hit_window_respects_radius() -> None:
+    """Custom radius changes the window size."""
+    from mcp_telegram.formatter import build_search_hit_window
+
+    context = {i: _window_msg(i) for i in range(1, 15)}
+    hit = _window_msg(7)
+
+    window_1 = build_search_hit_window(hit, context_messages_by_id=context, context_radius=1)
+    assert [m.id for m in window_1] == [8, 7, 6]
+
+    window_5 = build_search_hit_window(hit, context_messages_by_id=context, context_radius=5)
+    assert [m.id for m in window_5] == [12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2]
+
+
+def test_build_search_hit_window_descending_order() -> None:
+    """Window messages are sorted by id descending, as format_messages expects."""
+    from mcp_telegram.formatter import build_search_hit_window
+
+    context = {i: _window_msg(i) for i in range(1, 11)}
+    hit = _window_msg(5)
+    window = build_search_hit_window(hit, context_messages_by_id=context, context_radius=3)
+
+    ids = [m.id for m in window]
+    assert ids == sorted(ids, reverse=True), f"window must be descending: {ids}"
+
+
+def test_build_search_hit_window_gappy_context() -> None:
+    """Missing message ids in context are skipped — window only returns available messages."""
+    from mcp_telegram.formatter import build_search_hit_window
+
+    context = {
+        1: _window_msg(1),
+        5: _window_msg(5),
+        7: _window_msg(7),
+        10: _window_msg(10),
+    }
+    hit = _window_msg(5)
+    window = build_search_hit_window(hit, context_messages_by_id=context, context_radius=3)
+
+    ids = [m.id for m in window]
+    assert ids == [7, 5], f"expected [7,5], got {ids}"
