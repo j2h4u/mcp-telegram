@@ -1493,6 +1493,69 @@ async def test_delta_catch_up_prioritizes_requested_refresh(
 
 
 @pytest.mark.asyncio
+async def test_delta_catch_up_complete_log_includes_watermark(
+    mock_client: _MockClient,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The cycle summary exposes enough aggregate state to audit multi-day catch-up progress."""
+    import logging
+
+    checked_dialog = 7201
+    never_checked_dialog = 7202
+    requested_dialog = 7203
+    sync_db.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, last_synced_at, last_delta_checked_at) "
+        "VALUES (?, 'synced', ?, ?)",
+        (checked_dialog, 1000, 1000),
+    )
+    sync_db.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, last_synced_at) VALUES (?, 'synced', ?)",
+        (never_checked_dialog, 1000),
+    )
+    sync_db.execute(
+        "INSERT INTO synced_dialogs "
+        "(dialog_id, status, last_synced_at, last_delta_checked_at, delta_refresh_requested_at) "
+        "VALUES (?, 'synced', ?, ?, ?)",
+        (requested_dialog, 1000, 1000, 2000),
+    )
+    for dialog_id in (checked_dialog, never_checked_dialog, requested_dialog):
+        sync_db.execute(
+            "INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (?, 10, 1704067200)",
+            (dialog_id,),
+        )
+    sync_db.commit()
+
+    async def _iter_messages(**kwargs: object):
+        return
+        yield
+
+    mock_client.iter_messages = _iter_messages
+
+    worker = make_worker(mock_client, sync_db, shutdown_event)
+    with caplog.at_level(logging.INFO, logger="mcp_telegram.delta_sync"):
+        await worker.run_delta_catch_up(
+            policy=DeltaCatchUpPolicy(
+                interval_seconds=300.0,
+                max_probes_per_cycle=1,
+                probe_pause_seconds=0.01,
+            )
+        )
+
+    complete_logs = [
+        record.getMessage() for record in caplog.records if "delta_catch_up complete" in record.getMessage()
+    ]
+    assert complete_logs
+    summary = complete_logs[-1]
+    assert "total_synced=3" in summary
+    assert "checked_total=2" in summary
+    assert "never_checked=1" in summary
+    assert "pending_refresh=0" in summary
+    assert "oldest_delta_checked_age_s=" in summary
+
+
+@pytest.mark.asyncio
 async def test_delta_catch_up_loop_can_be_disabled(
     mock_client: _MockClient,
     sync_db: _SQLiteConnection,

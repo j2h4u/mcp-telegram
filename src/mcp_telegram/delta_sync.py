@@ -86,6 +86,17 @@ ORDER BY
 _SELECT_SYNCED_DIALOG_IDS_SQL = _SELECT_SYNCED_DIALOGS_FOR_DELTA_SQL
 
 _SELECT_MAX_MESSAGE_ID_SQL = "SELECT COALESCE(MAX(message_id), 0) FROM messages WHERE dialog_id = ?"
+_SELECT_DELTA_OBSERVABILITY_SQL = """
+SELECT
+    COUNT(*) AS total_synced,
+    SUM(last_delta_checked_at IS NOT NULL) AS checked_total,
+    SUM(last_delta_checked_at IS NULL) AS never_checked,
+    MIN(last_delta_checked_at) AS oldest_delta_checked_at,
+    MAX(last_delta_checked_at) AS newest_delta_checked_at,
+    SUM(delta_refresh_requested_at IS NOT NULL) AS pending_refresh
+FROM synced_dialogs
+WHERE status = 'synced'
+"""
 
 # Stamp delta checkpoint on successful delta completion.
 # Distinct from FullSyncWorker's _UPDATE_PROGRESS_DONE_SQL (different column set).
@@ -137,8 +148,33 @@ def _row_first_int(row: tuple[object | None, ...] | None) -> int:
     return 0
 
 
+def _object_to_int_or_none(value: object | None) -> int | None:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.isdecimal():
+        return int(value)
+    return None
+
+
+def _object_to_int(value: object | None) -> int:
+    parsed = _object_to_int_or_none(value)
+    return parsed if parsed is not None else 0
+
+
 def _recently_synced(last_synced_at: int | None, now: int) -> bool:
     return last_synced_at is not None and (now - last_synced_at) < RECENT_SYNC_SKIP_THRESHOLD_S
+
+
+@dataclass(frozen=True, slots=True)
+class DeltaCatchUpObservability:
+    """Aggregate local progress state for the bounded delta catch-up loop."""
+
+    total_synced: int
+    checked_total: int
+    never_checked: int
+    pending_refresh: int
+    oldest_delta_checked_age_s: int | None
+    newest_delta_checked_age_s: int | None
 
 
 def _delta_skip_anchor(last_synced_at: int | None, last_delta_checked_at: int | None) -> int | None:
@@ -158,6 +194,12 @@ def _log_probe_budget_exhausted(policy: DeltaCatchUpPolicy, *, total_rows: int, 
         policy.max_probes_per_cycle,
         _remaining_probe_candidates(total_rows=total_rows, skipped=skipped, probed=probed),
     )
+
+
+def _delta_checked_age(timestamp: int | None, now: int) -> int | None:
+    if timestamp is None:
+        return None
+    return max(0, now - timestamp)
 
 
 async def _pause_after_probe(shutdown_event: asyncio.Event, policy: DeltaCatchUpPolicy | None) -> bool:
@@ -204,6 +246,31 @@ class DeltaSyncWorker:
 
     def _stamp_delta_checked(self, dialog_id: int, checked_at: int) -> None:
         self._conn.execute(_UPDATE_DELTA_CHECKED_SQL, (checked_at, dialog_id))
+
+    def _delta_observability(self, now: int) -> DeltaCatchUpObservability:
+        row = cast(
+            tuple[object | None, object | None, object | None, object | None, object | None, object | None] | None,
+            self._conn.execute(_SELECT_DELTA_OBSERVABILITY_SQL).fetchone(),
+        )
+        if row is None:
+            return DeltaCatchUpObservability(
+                total_synced=0,
+                checked_total=0,
+                never_checked=0,
+                pending_refresh=0,
+                oldest_delta_checked_age_s=None,
+                newest_delta_checked_age_s=None,
+            )
+        oldest_checked_at = _object_to_int_or_none(row[3])
+        newest_checked_at = _object_to_int_or_none(row[4])
+        return DeltaCatchUpObservability(
+            total_synced=_object_to_int(row[0]),
+            checked_total=_object_to_int(row[1]),
+            never_checked=_object_to_int(row[2]),
+            pending_refresh=_object_to_int(row[5]),
+            oldest_delta_checked_age_s=_delta_checked_age(oldest_checked_at, now),
+            newest_delta_checked_age_s=_delta_checked_age(newest_checked_at, now),
+        )
 
     async def run_delta_catch_up(
         self,
@@ -257,11 +324,20 @@ class DeltaSyncWorker:
             total_new += await self.fetch_delta_for_dialog(dialog_id)
             if await _pause_after_probe(self._shutdown_event, policy):
                 break
+        observability = self._delta_observability(int(time.time()))
         logger.info(
-            "delta_catch_up complete — new_messages=%d skipped=%d probed=%d",
+            "delta_catch_up complete — new_messages=%d skipped=%d probed=%d "
+            "total_synced=%d checked_total=%d never_checked=%d pending_refresh=%d "
+            "oldest_delta_checked_age_s=%s newest_delta_checked_age_s=%s",
             total_new,
             skipped,
             probed,
+            observability.total_synced,
+            observability.checked_total,
+            observability.never_checked,
+            observability.pending_refresh,
+            observability.oldest_delta_checked_age_s,
+            observability.newest_delta_checked_age_s,
         )
         return total_new
 
