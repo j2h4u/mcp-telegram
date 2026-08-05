@@ -92,6 +92,8 @@ def test_synced_dialogs_schema(tmp_sync_db_path: Path) -> None:
             "status",
             "last_synced_at",
             "last_event_at",
+            "last_delta_checked_at",
+            "delta_refresh_requested_at",
             "sync_progress",
             "total_messages",
             "access_lost_at",
@@ -1631,7 +1633,19 @@ def test_schema_version_is_current(tmp_sync_db_path: Path) -> None:
     try:
         version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
         assert version == _CURRENT_SCHEMA_VERSION, f"Expected schema version {_CURRENT_SCHEMA_VERSION}, got {version}"
-        assert _CURRENT_SCHEMA_VERSION == 29, f"_CURRENT_SCHEMA_VERSION must be 29, got {_CURRENT_SCHEMA_VERSION}"
+        assert _CURRENT_SCHEMA_VERSION == 30, f"_CURRENT_SCHEMA_VERSION must be 30, got {_CURRENT_SCHEMA_VERSION}"
+    finally:
+        conn.close()
+
+
+def test_synced_dialogs_has_delta_freshness_columns(tmp_sync_db_path: Path) -> None:
+    """After ensure_sync_schema(), synced_dialogs stores local delta probe state."""
+    ensure_sync_schema(tmp_sync_db_path)
+    conn = _open_db(tmp_sync_db_path)
+    try:
+        cols = {row[1]: row[2] for row in _table_info(conn, "synced_dialogs")}
+        assert cols["last_delta_checked_at"] == "INTEGER"
+        assert cols["delta_refresh_requested_at"] == "INTEGER"
     finally:
         conn.close()
 

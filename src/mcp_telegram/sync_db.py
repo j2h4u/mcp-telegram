@@ -6,7 +6,7 @@ import sqlite3
 from pathlib import Path
 from typing import cast
 
-_CURRENT_SCHEMA_VERSION = 29
+_CURRENT_SCHEMA_VERSION = 30
 _SCHEMA_VERSION_WITH_FTS = 3
 
 logger = logging.getLogger(__name__)
@@ -418,7 +418,11 @@ CREATE TABLE IF NOT EXISTS own_only_dialogs (
 )
 """
 
-_SET_ACCESS_LOST_SQL = "UPDATE synced_dialogs SET status = 'access_lost', access_lost_at = ? WHERE dialog_id = ?"
+_SET_ACCESS_LOST_SQL = (
+    "UPDATE synced_dialogs "
+    "SET status = 'access_lost', access_lost_at = ?, delta_refresh_requested_at = NULL "
+    "WHERE dialog_id = ?"
+)
 _SET_DIALOGS_HIDDEN_SQL = "UPDATE dialogs SET hidden = 1, snapshot_at = ? WHERE dialog_id = ?"
 
 # ---------------------------------------------------------------------------
@@ -1231,6 +1235,31 @@ ON telegram_folder_members(dialog_id, folder_id)""",
     )
 
 
+def _apply_migration_30(conn: sqlite3.Connection, current: int) -> int:
+    """Track local delta-probe recency and explicit refresh requests.
+
+    These are synchronizer timestamps, not Telegram event timestamps. They are
+    used to make bounded catch-up fair and to let mark_dialog_for_sync request a
+    refresh for an already-synced dialog without forcing a full re-sync.
+    """
+    return _apply_migration(
+        conn,
+        current,
+        30,
+        [
+            "ALTER TABLE synced_dialogs ADD COLUMN last_synced_at INTEGER",
+            "ALTER TABLE synced_dialogs ADD COLUMN last_event_at INTEGER",
+            "ALTER TABLE synced_dialogs ADD COLUMN last_delta_checked_at INTEGER",
+            "ALTER TABLE synced_dialogs ADD COLUMN delta_refresh_requested_at INTEGER",
+            (
+                "CREATE INDEX IF NOT EXISTS idx_synced_dialogs_delta_fairness "
+                "ON synced_dialogs(status, delta_refresh_requested_at, last_delta_checked_at, last_synced_at)"
+            ),
+        ],
+        ignore_duplicate_column=True,
+    )
+
+
 def _apply_migrations(conn: sqlite3.Connection) -> None:
     """Apply WAL mode and all pending schema migrations in version order."""
     try:
@@ -1257,6 +1286,7 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     current = _apply_migrations_16_to_20(conn, current)
     current = _apply_migrations_21_to_28(conn, current)
     current = _apply_migration_29(conn, current)
+    current = _apply_migration_30(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 

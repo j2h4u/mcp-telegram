@@ -369,6 +369,8 @@ def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.
             status              TEXT NOT NULL DEFAULT 'not_synced',
             last_synced_at      INTEGER,
             last_event_at       INTEGER,
+            last_delta_checked_at INTEGER,
+            delta_refresh_requested_at INTEGER,
             sync_progress       INTEGER DEFAULT 0,
             total_messages      INTEGER,
             access_lost_at      INTEGER,
@@ -2015,6 +2017,10 @@ async def test_mark_dialog_for_sync_enable() -> None:
     server = make_server(conn)
     result = await server._dispatch({"method": "mark_dialog_for_sync", "dialog_id": 42, "enable": True})
     assert result["ok"] is True
+    data = cast(dict[str, object], result["data"])
+    assert data["action"] == "mark_for_sync"
+    assert data["expected_next_state"] == "syncing"
+    assert data["full_history_will_be_fetched"] is True
     row = cast(
         tuple[object, ...] | None, conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id = 42").fetchone()
     )
@@ -2024,17 +2030,23 @@ async def test_mark_dialog_for_sync_enable() -> None:
 
 @pytest.mark.asyncio
 async def test_mark_dialog_for_sync_ignores_existing() -> None:
-    """mark_dialog_for_sync with enable=True on already-synced dialog does NOT overwrite status."""
+    """mark_dialog_for_sync on already-synced dialog keeps status and requests delta refresh."""
     conn = _make_db()
     _insert_synced_dialog(conn, 42, status="synced")
     server = make_server(conn)
     result = await server._dispatch({"method": "mark_dialog_for_sync", "dialog_id": 42, "enable": True})
     assert result["ok"] is True
+    data = cast(dict[str, object], result["data"])
+    assert data["action"] == "request_delta_refresh"
+    assert data["expected_next_state"] == "synced"
+    assert data["full_history_will_be_fetched"] is False
     row = cast(
-        tuple[object, ...] | None, conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id = 42").fetchone()
+        tuple[object, ...] | None,
+        conn.execute("SELECT status, delta_refresh_requested_at FROM synced_dialogs WHERE dialog_id = 42").fetchone(),
     )
     assert row is not None
     assert row[0] == "synced"  # NOT overwritten
+    assert isinstance(row[1], int)
 
 
 @pytest.mark.asyncio

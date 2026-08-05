@@ -1148,6 +1148,7 @@ class DaemonReadingService:
         row_data: dict[str, object] = {
             "last_synced_at": row["last_synced_at"],
             "last_event_at": row["last_event_at"],
+            "last_delta_checked_at": row["last_delta_checked_at"],
             "id": d_id,
             "name": row["name"],
             "type": row["type"],
@@ -1162,8 +1163,11 @@ class DaemonReadingService:
             ),
             **build_sync_read_model(
                 status=str(row["sync_status"] or "not_synced"),
-                last_synced_at=_object_to_int_or_none(row["last_synced_at"]),
-                last_event_at=_object_to_int_or_none(row["last_event_at"]),
+                timestamps=(
+                    _object_to_int_or_none(row["last_synced_at"]),
+                    _object_to_int_or_none(row["last_event_at"]),
+                    _object_to_int_or_none(row["last_delta_checked_at"]),
+                ),
                 local_count=local_counts.get(d_id, 0),
                 total_messages=_object_to_int_or_none(row["total_messages"]),
             ),

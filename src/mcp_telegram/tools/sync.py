@@ -72,6 +72,8 @@ GET_SYNC_STATUS_OUTPUT_SCHEMA = {
         "is_syncing": {"type": "boolean"},
         "last_synced_at": {"type": ["integer", "null"]},
         "last_event_at": {"type": ["integer", "null"]},
+        "last_delta_checked_at": {"type": ["integer", "null"]},
+        "delta_refresh_requested_at": {"type": ["integer", "null"]},
         "message_count": {"type": ["integer", "null"]},
         "saved_message_count": {"type": ["integer", "null"]},
         "history_scope": {"type": "string"},
@@ -96,6 +98,8 @@ GET_SYNC_STATUS_OUTPUT_SCHEMA = {
         "is_syncing",
         "last_synced_at",
         "last_event_at",
+        "last_delta_checked_at",
+        "delta_refresh_requested_at",
         "message_count",
         "saved_message_count",
         "history_scope",
@@ -291,13 +295,14 @@ async def mark_dialog_for_sync(args: MarkDialogForSync) -> ToolResult:
         return err
 
     logger.info("mark_dialog_for_sync dialog_id=%d enable=%s", args.dialog_id, args.enable)
+    data = response.get("data", {})
     structured_content = {
         "dialog_id": args.dialog_id,
         "enabled": args.enable,
         "status": "accepted",
-        "action": "mark_for_sync" if args.enable else "unmark_from_sync",
-        "expected_next_state": "syncing" if args.enable else "not_synced",
-        "full_history_will_be_fetched": args.enable,
+        "action": data.get("action", "mark_for_sync" if args.enable else "unmark_from_sync"),
+        "expected_next_state": data.get("expected_next_state", "syncing" if args.enable else "not_synced"),
+        "full_history_will_be_fetched": data.get("full_history_will_be_fetched", args.enable),
     }
     return structured_result(structured_content, result_count=1)
 
@@ -342,7 +347,12 @@ async def get_sync_status(args: GetSyncStatus) -> ToolResult:
     coverage_state = data.get("coverage_state", _coverage_state(saved_message_count, total_messages))
     last_synced_at = data.get("last_synced_at")
     last_event_at = data.get("last_event_at")
-    local_knowledge_at = data.get("local_knowledge_at", _local_knowledge_at(last_synced_at, last_event_at))
+    last_delta_checked_at = data.get("last_delta_checked_at")
+    delta_refresh_requested_at = data.get("delta_refresh_requested_at")
+    local_knowledge_at = data.get(
+        "local_knowledge_at",
+        _local_knowledge_at(last_synced_at, last_event_at, last_delta_checked_at),
+    )
     sync_progress_message_id = data.get("sync_progress_message_id", data.get("sync_progress"))
     structured_content = {
         "dialog_id": data.get("dialog_id"),
@@ -351,6 +361,8 @@ async def get_sync_status(args: GetSyncStatus) -> ToolResult:
         "is_syncing": status == "syncing",
         "last_synced_at": last_synced_at,
         "last_event_at": last_event_at,
+        "last_delta_checked_at": last_delta_checked_at,
+        "delta_refresh_requested_at": delta_refresh_requested_at,
         "message_count": message_count,
         "saved_message_count": saved_message_count,
         "history_scope": data.get("history_scope", _history_scope(status)),
@@ -381,8 +393,12 @@ def _coverage_state(message_count: object, total_messages: object) -> str:
     return "telegram_total_comparable"
 
 
-def _local_knowledge_at(last_synced_at: object, last_event_at: object) -> object | None:
-    timestamps = [ts for ts in (last_synced_at, last_event_at) if isinstance(ts, int)]
+def _local_knowledge_at(
+    last_synced_at: object,
+    last_event_at: object,
+    last_delta_checked_at: object = None,
+) -> object | None:
+    timestamps = [ts for ts in (last_synced_at, last_event_at, last_delta_checked_at) if isinstance(ts, int)]
     return max(timestamps) if timestamps else None
 
 

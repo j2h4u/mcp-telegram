@@ -63,6 +63,8 @@ def _make_db() -> Iterator[sqlite3.Connection]:
                 status              TEXT NOT NULL DEFAULT 'not_synced',
                 last_synced_at      INTEGER,
                 last_event_at       INTEGER,
+                last_delta_checked_at INTEGER,
+                delta_refresh_requested_at INTEGER,
                 sync_progress       INTEGER DEFAULT 0,
                 total_messages      INTEGER,
                 access_lost_at      INTEGER,

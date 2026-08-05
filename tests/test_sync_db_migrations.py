@@ -305,7 +305,7 @@ def test_schema_version_records_current_v18(tmp_path: Path) -> None:
     with _sync_db_connection(db_path) as conn:
         max_version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
         assert max_version == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 29  # v29 custom Telegram folder snapshot
+        assert _CURRENT_SCHEMA_VERSION == 30  # v30 local delta catch-up fairness
 
 
 def test_current_schema_repairs_missing_scheduled_fts(tmp_path: Path) -> None:
@@ -1039,12 +1039,26 @@ def _make_v24_db(tmp_path: Path) -> Path:
 
 
 def test_migration_schema_version_is_current(tmp_path: Path) -> None:
-    """After all migrations, MAX(schema_version) == _CURRENT_SCHEMA_VERSION (29)."""
+    """After all migrations, MAX(schema_version) == _CURRENT_SCHEMA_VERSION."""
     db_path = _make_v24_db(tmp_path)
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
         assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 29
+        assert _CURRENT_SCHEMA_VERSION == 30
+
+
+def test_migration_v30_adds_delta_probe_columns(tmp_path: Path) -> None:
+    """v30: existing synced_dialogs rows gain nullable local delta probe state."""
+    db_path = _make_v24_db(tmp_path)
+    ensure_sync_schema(db_path)
+    with _sync_db_connection(db_path) as conn:
+        rows = cast(
+            list[tuple[int, str, str, int, object | None, int]],
+            conn.execute("PRAGMA table_info(synced_dialogs)").fetchall(),
+        )
+        cols = {row[1]: row[2] for row in rows}
+        assert cols["last_delta_checked_at"] == "INTEGER"
+        assert cols["delta_refresh_requested_at"] == "INTEGER"
 
 
 def test_migration_v26_remarks_known_channel_and_chat_forwards(tmp_path: Path) -> None:
