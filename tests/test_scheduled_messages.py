@@ -19,7 +19,9 @@ from mcp_telegram.event_handlers import EventHandlerManager, _NewMessageEvent
 from mcp_telegram.own_only import OwnOnlyContext
 from mcp_telegram.scheduled_messages import (
     ScheduledMessageReconciler,
+    _unix_timestamp,
     mark_scheduled_messages_removed,
+    scheduled_dialog_id,
     upsert_scheduled_message,
     verify_scheduled_publication,
 )
@@ -283,3 +285,52 @@ async def test_publication_reconciliation_runs_before_sync_enrollment(conn: sqli
     assert conn.execute(
         "SELECT message_state, published_message_id FROM scheduled_messages WHERE dialog_id=42 AND message_id=21"
     ).fetchone() == ("published", 901)
+
+
+# ---------------------------------------------------------------------------
+# scheduled_dialog_id fallback path (raw-update peer object support)
+# ---------------------------------------------------------------------------
+
+
+def test_scheduled_dialog_id_fallback_channel_id() -> None:
+    """When get_peer_id raises TypeError, fall back to channel_id attribute."""
+    peer = SimpleNamespace(channel_id=123456)
+    assert scheduled_dialog_id(peer) == -1000000000000 - 123456
+
+
+def test_scheduled_dialog_id_fallback_chat_id() -> None:
+    """When get_peer_id raises TypeError, fall back to chat_id attribute."""
+    peer = SimpleNamespace(chat_id=789)
+    assert scheduled_dialog_id(peer) == -789
+
+
+def test_scheduled_dialog_id_fallback_user_id() -> None:
+    """When get_peer_id raises TypeError and no channel/chat_id, fall back to user_id."""
+    peer = SimpleNamespace(user_id=42)
+    assert scheduled_dialog_id(peer) == 42
+
+
+def test_scheduled_dialog_id_none() -> None:
+    """None peer returns None."""
+    assert scheduled_dialog_id(None) is None
+
+
+# ---------------------------------------------------------------------------
+# _unix_timestamp datetime branch
+# ---------------------------------------------------------------------------
+
+
+def test_unix_timestamp_from_datetime() -> None:
+    """_unix_timestamp converts datetime to int Unix timestamp."""
+    dt = datetime(2025, 6, 15, 12, 30, 0, tzinfo=UTC)
+    assert _unix_timestamp(dt) == int(dt.timestamp())
+
+
+def test_unix_timestamp_from_int() -> None:
+    """_unix_timestamp passes through int values unchanged."""
+    assert _unix_timestamp(1_700_000_000) == 1_700_000_000
+
+
+def test_unix_timestamp_from_none() -> None:
+    """_unix_timestamp returns None for None input."""
+    assert _unix_timestamp(None) is None
