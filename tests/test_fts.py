@@ -14,6 +14,7 @@ import pytest
 
 from mcp_telegram.fts import (
     MESSAGES_FTS_DDL,
+    _row_first_int,
     backfill_fts_index,
     stem_query,
     stem_text,
@@ -297,3 +298,28 @@ def test_backfill_fts_index_empty_messages(tmp_sync_db_path: Path) -> None:
         assert count == 0
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# _row_first_int string-to-int path
+# ---------------------------------------------------------------------------
+
+
+def test_row_first_int_from_string() -> None:
+    """_row_first_int converts a decimal string to int."""
+    assert _row_first_int(("42",)) == 42
+
+
+def test_row_first_int_from_int() -> None:
+    """_row_first_int passes through int values unchanged."""
+    assert _row_first_int((7,)) == 7
+
+
+def test_row_first_int_from_none() -> None:
+    """_row_first_int returns 0 for None input."""
+    assert _row_first_int(None) == 0
+
+
+def test_row_first_int_from_non_decimal_string() -> None:
+    """_row_first_int returns 0 for non-decimal string."""
+    assert _row_first_int(("abc",)) == 0
