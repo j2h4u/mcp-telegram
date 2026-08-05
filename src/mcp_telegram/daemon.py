@@ -12,9 +12,11 @@ Architecture:
   checkpoints WAL and closes the DB connection before the daemon disconnects.
 
 Event handlers:
-- EventHandlerManager is registered BEFORE FullSyncWorker starts so no
-  real-time events are missed during initial bulk fetch.  INSERT OR REPLACE
-  handles any overlap between real-time and bulk paths idempotently.
+- EventHandlerManager is registered BEFORE Telegram connect() so Telethon
+  catch_up=True replays missed updates into live handlers, not an empty handler
+  set.  It also remains registered BEFORE FullSyncWorker starts so no real-time
+  events are missed during initial bulk fetch.  INSERT OR REPLACE handles any
+  overlap between real-time and bulk paths idempotently.
 - synced_dialogs set is refreshed every heartbeat so newly enrolled dialogs
   are picked up within one interval without re-registering handlers.
 - Weekly gap scan detects tombstoned DM messages that MTProto delete events
@@ -22,7 +24,7 @@ Event handlers:
 
 Delta catch-up:
 - connect() called with catch_up=True — Telethon replays missed updates via PTS
-  on reconnect.
+  on reconnect after handlers are already registered.
 - DeltaSyncWorker.run_delta_catch_up() fills forward gaps for all 'synced'
   dialogs before bootstrap_dms() enrolls new ones.
 
@@ -1108,14 +1110,14 @@ async def sync_main() -> None:
         )
         await _run_fts_backfill(ctx)
 
+        ctx.handler_manager = EventHandlerManager(ctx.client, ctx.conn, ctx.shutdown_event)
+        ctx.handler_manager.register()
+        logger.info("event handlers registered")
+
         if not await _connect_telegram(ctx):
             return
 
         await _prime_runtime(ctx)
-
-        ctx.handler_manager = EventHandlerManager(ctx.client, ctx.conn, ctx.shutdown_event)
-        ctx.handler_manager.register()
-        logger.info("event handlers registered")
 
         delta_worker = DeltaSyncWorker(cast(_DeltaSyncClient, ctx.client), ctx.conn, ctx.shutdown_event)
         worker = FullSyncWorker(ctx.client, ctx.conn, ctx.shutdown_event)

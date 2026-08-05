@@ -83,9 +83,11 @@ from .daemon_dialog_queries import (
     _GET_ACCESS_LOST_ALERTS_SQL,
     _GET_DELETED_ALERTS_SQL,
     _GET_EDIT_ALERTS_SQL,
+    _GET_MARK_SYNC_STATUS_SQL,
     _GET_SYNC_STATUS_SQL,
     _LIST_TOPICS_SQL,
     _MARK_FOR_SYNC_SQL,
+    _REQUEST_DELTA_REFRESH_SQL,
     _UNMARK_SYNC_SQL,
     _compute_sync_coverage,
     build_sync_read_model,
@@ -1113,13 +1115,32 @@ class DaemonAPIServer:
         """
         dialog_id = _coerce_int(req.get("dialog_id", 0), 0)
         enable = bool(req.get("enable", True))
+        status_row = cast(
+            tuple[object] | None,
+            self._conn.execute(_GET_MARK_SYNC_STATUS_SQL, (dialog_id,)).fetchone(),
+        )
+        previous_status = str(status_row[0]) if status_row is not None else None
         if enable:
             self._conn.execute(_MARK_FOR_SYNC_SQL, (dialog_id,))
+            self._conn.execute(_REQUEST_DELTA_REFRESH_SQL, (int(time.time()), dialog_id))
+            action = "request_delta_refresh" if previous_status == "synced" else "mark_for_sync"
+            expected_next_state = "synced" if previous_status == "synced" else "syncing"
+            full_history_will_be_fetched = previous_status != "synced"
         else:
             self._conn.execute(_UNMARK_SYNC_SQL, (dialog_id,))
+            action = "unmark_from_sync"
+            expected_next_state = "not_synced"
+            full_history_will_be_fetched = False
         self._conn.commit()
         logger.info("mark_dialog_for_sync dialog_id=%d enable=%s", dialog_id, enable)
-        return {"ok": True}
+        return {
+            "ok": True,
+            "data": {
+                "action": action,
+                "expected_next_state": expected_next_state,
+                "full_history_will_be_fetched": full_history_will_be_fetched,
+            },
+        }
 
     # ------------------------------------------------------------------
     # get_sync_status
@@ -1134,7 +1155,7 @@ class DaemonAPIServer:
         """
         dialog_id = _coerce_int(req.get("dialog_id", 0), 0)
         row = cast(
-            tuple[object, object, object, object, object, object] | None,
+            tuple[object, object, object, object, object, object, object, object] | None,
             self._conn.execute(_GET_SYNC_STATUS_SQL, (dialog_id,)).fetchone(),
         )
 
@@ -1145,6 +1166,8 @@ class DaemonAPIServer:
             sync_progress = cast(int | None, row[3])
             total_messages = cast(int | None, row[4])
             access_lost_at = cast(int | None, row[5])
+            last_delta_checked_at = cast(int | None, row[6])
+            delta_refresh_requested_at = cast(int | None, row[7])
         else:
             status = "not_synced"
             last_synced_at = None
@@ -1152,6 +1175,8 @@ class DaemonAPIServer:
             sync_progress = None
             total_messages = None
             access_lost_at = None
+            last_delta_checked_at = None
+            delta_refresh_requested_at = None
 
         count_row = cast(tuple[object] | None, self._conn.execute(_COUNT_SYNCED_MESSAGES_SQL, (dialog_id,)).fetchone())
         message_count = int(cast(int | str, count_row[0])) if count_row is not None else 0
@@ -1165,6 +1190,8 @@ class DaemonAPIServer:
             "message_count": message_count,
             "last_synced_at": last_synced_at,
             "last_event_at": last_event_at,
+            "last_delta_checked_at": last_delta_checked_at,
+            "delta_refresh_requested_at": delta_refresh_requested_at,
             "sync_progress": sync_progress,
             "sync_progress_message_id": sync_progress,
             "total_messages": total_messages,
@@ -1173,8 +1200,7 @@ class DaemonAPIServer:
             "access_lost_at": access_lost_at,
             **build_sync_read_model(
                 status=status,
-                last_synced_at=last_synced_at,
-                last_event_at=last_event_at,
+                timestamps=(last_synced_at, last_event_at, last_delta_checked_at),
                 local_count=message_count,
                 total_messages=total_messages,
             ),

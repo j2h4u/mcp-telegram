@@ -188,6 +188,7 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
                 "access_lost_at": {"type": ["integer", "null"]},
                 "last_synced_at": {"type": ["integer", "null"]},
                 "last_event_at": {"type": ["integer", "null"]},
+                "last_delta_checked_at": {"type": ["integer", "null"]},
                 "sync_coverage_pct": {"type": ["integer", "null"]},
                 "archived_message_count": {"type": ["integer", "null"]},
             },
@@ -199,6 +200,7 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
                 "access_lost_at",
                 "last_synced_at",
                 "last_event_at",
+                "last_delta_checked_at",
                 "sync_coverage_pct",
                 "archived_message_count",
             ],
@@ -448,6 +450,7 @@ def _list_messages_coverage(data: dict) -> dict[str, object]:
         "access_lost_at": data.get("access_lost_at"),
         "last_synced_at": data.get("last_synced_at"),
         "last_event_at": data.get("last_event_at"),
+        "last_delta_checked_at": data.get("last_delta_checked_at"),
         "sync_coverage_pct": data.get("sync_coverage_pct"),
         "archived_message_count": data.get("archived_message_count"),
     }

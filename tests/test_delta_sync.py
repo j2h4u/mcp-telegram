@@ -217,6 +217,49 @@ async def test_delta_no_baseline_skips(
 
 
 @pytest.mark.asyncio
+async def test_delta_no_baseline_clears_refresh_without_faking_history_sync(
+    mock_client: _MockClient,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """A malformed synced row with no local baseline must not keep a permanent refresh request."""
+    dialog_id = 10031
+
+    sync_db.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, last_synced_at, delta_refresh_requested_at) "
+        "VALUES (?, 'synced', NULL, 1000)",
+        (dialog_id,),
+    )
+    sync_db.commit()
+
+    calls: list[object] = []
+
+    async def _iter_messages(**kwargs: object):
+        calls.append(kwargs)
+        return
+        yield
+
+    mock_client.iter_messages = _iter_messages
+
+    worker = make_worker(mock_client, sync_db, shutdown_event)
+    await worker.fetch_delta_for_dialog(dialog_id)
+
+    row = cast(
+        tuple[int | None, int | None, int | None] | None,
+        sync_db.execute(
+            "SELECT last_synced_at, last_delta_checked_at, delta_refresh_requested_at "
+            "FROM synced_dialogs WHERE dialog_id = ?",
+            (dialog_id,),
+        ).fetchone(),
+    )
+    assert calls == []
+    assert row is not None
+    assert row[0] is None
+    assert isinstance(row[1], int)
+    assert row[2] is None
+
+
+@pytest.mark.asyncio
 async def test_delta_uses_min_id_and_reverse(
     mock_client: _MockClient,
     sync_db: _SQLiteConnection,
@@ -1146,14 +1189,15 @@ async def test_fetch_delta_stamps_last_synced_at_on_success(
     after = int(_time.time())
 
     row = cast(
-        tuple[int | None] | None,
+        tuple[int | None, int | None] | None,
         sync_db.execute(
-            "SELECT last_synced_at FROM synced_dialogs WHERE dialog_id = ?",
+            "SELECT last_synced_at, last_delta_checked_at FROM synced_dialogs WHERE dialog_id = ?",
             (dialog_id,),
         ).fetchone(),
     )
     assert row is not None
     assert row[0] is not None, "last_synced_at must be set on success"
+    assert row[1] == row[0], "last_delta_checked_at must be stamped with the delta checkpoint"
     assert before <= row[0] <= after + 2, f"last_synced_at={row[0]} not in [{before}, {after + 2}]"
 
 
@@ -1191,14 +1235,15 @@ async def test_fetch_delta_stamps_last_synced_at_on_gap_filled(
 
     assert result == 1
     row = cast(
-        tuple[int | None] | None,
+        tuple[int | None, int | None] | None,
         sync_db.execute(
-            "SELECT last_synced_at FROM synced_dialogs WHERE dialog_id = ?",
+            "SELECT last_synced_at, last_delta_checked_at FROM synced_dialogs WHERE dialog_id = ?",
             (dialog_id,),
         ).fetchone(),
     )
     assert row is not None
     assert row[0] is not None, "last_synced_at must be set after gap fill"
+    assert row[1] == row[0], "last_delta_checked_at must be stamped with the delta checkpoint"
     assert before <= row[0] <= after + 2
 
 
@@ -1249,9 +1294,9 @@ async def test_fetch_delta_stamps_on_floodwait(
     after = int(_time.time())
 
     row = cast(
-        tuple[int | None] | None,
+        tuple[int | None, int | None] | None,
         sync_db.execute(
-            "SELECT last_synced_at FROM synced_dialogs WHERE dialog_id = ?",
+            "SELECT last_synced_at, last_delta_checked_at FROM synced_dialogs WHERE dialog_id = ?",
             (dialog_id,),
         ).fetchone(),
     )
@@ -1260,6 +1305,7 @@ async def test_fetch_delta_stamps_on_floodwait(
         f"last_synced_at must be stamped to ~now on FloodWait; got {row[0]} "
         f"(window {before}..{after}), original was {original_ts}"
     )
+    assert row[1] == row[0], "FloodWait checkpoint must also update last_delta_checked_at"
 
 
 @pytest.mark.asyncio
@@ -1339,6 +1385,111 @@ async def test_delta_catch_up_respects_probe_budget(
     )
 
     assert calls == dialog_ids[:2]
+
+
+@pytest.mark.asyncio
+async def test_delta_catch_up_orders_by_oldest_delta_check(
+    mock_client: _MockClient,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """Bounded cycles probe the stalest delta-check rows first instead of stable table order."""
+    rows = [
+        (7001, 3000),
+        (7002, 2000),
+        (7003, 1000),
+    ]
+    for dialog_id, last_delta_checked_at in rows:
+        sync_db.execute(
+            "INSERT INTO synced_dialogs (dialog_id, status, last_synced_at, last_delta_checked_at) "
+            "VALUES (?, 'synced', ?, ?)",
+            (dialog_id, 1000, last_delta_checked_at),
+        )
+        sync_db.execute(
+            "INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (?, 10, 1704067200)",
+            (dialog_id,),
+        )
+    sync_db.commit()
+
+    calls: list[int] = []
+
+    async def _iter_messages(**kwargs: object):
+        calls.append(cast(int, kwargs["entity"]))
+        return
+        yield
+
+    mock_client.iter_messages = _iter_messages
+
+    worker = make_worker(mock_client, sync_db, shutdown_event)
+    await worker.run_delta_catch_up(
+        policy=DeltaCatchUpPolicy(
+            interval_seconds=300.0,
+            max_probes_per_cycle=2,
+            probe_pause_seconds=0.01,
+        )
+    )
+
+    assert calls == [7003, 7002]
+
+
+@pytest.mark.asyncio
+async def test_delta_catch_up_prioritizes_requested_refresh(
+    mock_client: _MockClient,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """Explicit refresh requests bypass recent-skip once and are selected before stale background work."""
+    import time as _time
+
+    now = int(_time.time())
+    requested_dialog = 7101
+    stale_dialog = 7102
+    sync_db.execute(
+        "INSERT INTO synced_dialogs "
+        "(dialog_id, status, last_synced_at, last_delta_checked_at, delta_refresh_requested_at) "
+        "VALUES (?, 'synced', ?, ?, ?)",
+        (requested_dialog, now - 60, now - 60, now - 30),
+    )
+    sync_db.execute(
+        "INSERT INTO synced_dialogs (dialog_id, status, last_synced_at, last_delta_checked_at) "
+        "VALUES (?, 'synced', ?, ?)",
+        (stale_dialog, 1000, 1000),
+    )
+    for dialog_id in (requested_dialog, stale_dialog):
+        sync_db.execute(
+            "INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (?, 10, 1704067200)",
+            (dialog_id,),
+        )
+    sync_db.commit()
+
+    calls: list[int] = []
+
+    async def _iter_messages(**kwargs: object):
+        calls.append(cast(int, kwargs["entity"]))
+        return
+        yield
+
+    mock_client.iter_messages = _iter_messages
+
+    worker = make_worker(mock_client, sync_db, shutdown_event)
+    await worker.run_delta_catch_up(
+        policy=DeltaCatchUpPolicy(
+            interval_seconds=300.0,
+            max_probes_per_cycle=1,
+            probe_pause_seconds=0.01,
+        )
+    )
+
+    row = cast(
+        tuple[int | None] | None,
+        sync_db.execute(
+            "SELECT delta_refresh_requested_at FROM synced_dialogs WHERE dialog_id = ?",
+            (requested_dialog,),
+        ).fetchone(),
+    )
+    assert calls == [requested_dialog]
+    assert row is not None
+    assert row[0] is None
 
 
 @pytest.mark.asyncio

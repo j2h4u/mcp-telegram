@@ -1644,6 +1644,32 @@ async def test_mark_dialog_for_sync_via_daemon():
     conn.mark_dialog_for_sync.assert_called_once_with(dialog_id=42, enable=True)
 
 
+async def test_mark_dialog_for_sync_synced_dialog_reports_delta_refresh():
+    """MarkDialogForSync reports targeted refresh when daemon says dialog is already synced."""
+    conn = _make_daemon_conn(
+        {
+            "ok": True,
+            "data": {
+                "action": "request_delta_refresh",
+                "expected_next_state": "synced",
+                "full_history_will_be_fetched": False,
+            },
+        }
+    )
+    with _patch_daemon(conn):
+        result = await mark_dialog_for_sync(MarkDialogForSync(dialog_id=42, enable=True))
+    assert result.content == ()
+    assert result.structured_content == {
+        "dialog_id": 42,
+        "enabled": True,
+        "status": "accepted",
+        "action": "request_delta_refresh",
+        "expected_next_state": "synced",
+        "full_history_will_be_fetched": False,
+    }
+    conn.mark_dialog_for_sync.assert_called_once_with(dialog_id=42, enable=True)
+
+
 async def test_mark_dialog_for_sync_disable():
     """MarkDialogForSync with enable=False returns unmarked text."""
     conn = _make_daemon_conn({"ok": True})
@@ -1702,6 +1728,8 @@ async def test_get_sync_status_via_daemon():
         "is_syncing": False,
         "last_synced_at": "2023-11-14T22:13:20+00:00",
         "last_event_at": "2023-11-14T22:30:00+00:00",
+        "last_delta_checked_at": None,
+        "delta_refresh_requested_at": None,
         "message_count": 100,
         "saved_message_count": 100,
         "history_scope": "full",

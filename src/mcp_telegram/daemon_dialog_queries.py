@@ -84,13 +84,15 @@ def _history_sync_state(status: str) -> str:
 def build_sync_read_model(
     *,
     status: str,
-    last_synced_at: int | None,
-    last_event_at: int | None,
+    timestamps: tuple[int | None, int | None, int | None],
     local_count: int,
     total_messages: int | None,
 ) -> dict[str, object]:
     """Build agent-facing sync freshness/depth facts from daemon lifecycle state."""
-    local_knowledge_at = max((ts for ts in (last_synced_at, last_event_at) if ts is not None), default=None)
+    local_knowledge_at = max(
+        (ts for ts in timestamps if ts is not None),
+        default=None,
+    )
     local_knowledge_age_seconds = None
     if local_knowledge_at is not None:
         local_knowledge_age_seconds = max(0, int(time.time()) - local_knowledge_at)
@@ -98,7 +100,7 @@ def build_sync_read_model(
         "history_scope": _history_scope(status),
         "history_depth_state": _history_depth_state(status),
         "history_sync_state": _history_sync_state(status),
-        "history_complete_at": last_synced_at if status == "synced" else None,
+        "history_complete_at": timestamps[0] if status == "synced" else None,
         "saved_message_count": local_count,
         "coverage_state": _sync_coverage_state(total_messages, local_count),
         "local_knowledge_at": local_knowledge_at,
@@ -166,6 +168,7 @@ WITH agent_visible_dialogs AS (
         sd.total_messages,
         sd.last_synced_at,
         sd.last_event_at,
+        sd.last_delta_checked_at,
         sd.access_lost_at
     FROM dialogs d
     LEFT JOIN synced_dialogs sd USING(dialog_id)
@@ -190,6 +193,7 @@ WITH agent_visible_dialogs AS (
         sd.total_messages,
         sd.last_synced_at,
         sd.last_event_at,
+        sd.last_delta_checked_at,
         sd.access_lost_at
     FROM synced_dialogs sd
     LEFT JOIN dialogs d USING(dialog_id)
@@ -199,7 +203,7 @@ SELECT
     dialog_id, name, type, archived, pinned,
     members, created, last_message_at, snapshot_at,
     unread_mentions_count, unread_reactions_count, draft_text,
-    sync_status, total_messages, last_synced_at, last_event_at, access_lost_at
+    sync_status, total_messages, last_synced_at, last_event_at, last_delta_checked_at, access_lost_at
 FROM agent_visible_dialogs
 WHERE (:archived_filter IS NULL OR archived = :archived_filter)
 AND (:pinned_filter IS NULL OR pinned = :pinned_filter)
@@ -220,10 +224,15 @@ _BATCHED_UNREAD_COUNTS_SQL = (
 )
 
 _MARK_FOR_SYNC_SQL = "INSERT OR IGNORE INTO synced_dialogs (dialog_id, status) VALUES (?, 'not_synced')"
+_GET_MARK_SYNC_STATUS_SQL = "SELECT status FROM synced_dialogs WHERE dialog_id = ?"
+_REQUEST_DELTA_REFRESH_SQL = (
+    "UPDATE synced_dialogs SET delta_refresh_requested_at = ? WHERE dialog_id = ? AND status = 'synced'"
+)
 _UNMARK_SYNC_SQL = "UPDATE synced_dialogs SET status = 'not_synced', sync_progress = NULL WHERE dialog_id = ?"
 
 _GET_SYNC_STATUS_SQL = (
-    "SELECT status, last_synced_at, last_event_at, sync_progress, total_messages, access_lost_at "
+    "SELECT status, last_synced_at, last_event_at, sync_progress, total_messages, access_lost_at, "
+    "last_delta_checked_at, delta_refresh_requested_at "
     "FROM synced_dialogs WHERE dialog_id = ?"
 )
 _COUNT_SYNCED_MESSAGES_SQL = "SELECT COUNT(*) FROM messages WHERE dialog_id = ? AND is_deleted = 0"

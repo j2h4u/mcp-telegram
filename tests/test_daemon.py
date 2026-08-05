@@ -653,6 +653,40 @@ def test_handlers_registered_before_worker(
     )
 
 
+def test_handlers_registered_before_telegram_connect(
+    mock_client: MagicMock,
+    instant_shutdown_event: asyncio.Event,
+) -> None:
+    """Handlers must be registered before connect() so Telethon catch_up replay
+    cannot dispatch missed updates into an empty handler set."""
+    call_order: list[str] = []
+
+    mock_client.connect = AsyncMock(side_effect=lambda: call_order.append("connect"))
+
+    worker_instance = MagicMock()
+    worker_instance.bootstrap_dms = AsyncMock(return_value=0)
+    worker_instance.process_one_batch = AsyncMock(return_value=True)
+
+    handler_instance = MagicMock()
+    handler_instance.register = MagicMock(side_effect=lambda: call_order.append("register"))
+    handler_instance.unregister = MagicMock()
+    handler_instance.refresh_synced_dialogs = MagicMock()
+    handler_instance.run_dm_gap_scan = AsyncMock(return_value=0)
+
+    with (
+        patch("mcp_telegram.daemon.create_client", return_value=mock_client),
+        patch("mcp_telegram.daemon.ensure_sync_schema"),
+        patch("mcp_telegram.daemon.register_shutdown_handler", return_value=instant_shutdown_event),
+        patch("mcp_telegram.daemon._open_sync_db"),
+        patch("mcp_telegram.daemon.backfill_fts_index", return_value=0),
+        patch("mcp_telegram.daemon.FullSyncWorker", return_value=worker_instance),
+        patch("mcp_telegram.daemon.EventHandlerManager", return_value=handler_instance),
+    ):
+        asyncio.run(sync_main())
+
+    assert call_order[:2] == ["register", "connect"]
+
+
 def test_heartbeat_refreshes_synced_dialogs(
     mock_client: MagicMock,
 ) -> None:

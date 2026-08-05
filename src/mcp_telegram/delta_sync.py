@@ -73,15 +73,30 @@ _PACING = DeltaSyncPacing()
 # the user's account hasn't received meaningful new traffic worth probing.
 RECENT_SYNC_SKIP_THRESHOLD_S: int = 3600
 
-_SELECT_SYNCED_DIALOGS_FOR_DELTA_SQL = "SELECT dialog_id, last_synced_at FROM synced_dialogs WHERE status = 'synced'"
+_SELECT_SYNCED_DIALOGS_FOR_DELTA_SQL = """
+SELECT dialog_id, last_synced_at, last_delta_checked_at, delta_refresh_requested_at
+FROM synced_dialogs
+WHERE status = 'synced'
+ORDER BY
+    CASE WHEN delta_refresh_requested_at IS NULL THEN 1 ELSE 0 END,
+    COALESCE(delta_refresh_requested_at, last_delta_checked_at, last_synced_at, 0),
+    dialog_id
+"""
 # Backward-compat alias (no external importers, kept for safety)
 _SELECT_SYNCED_DIALOG_IDS_SQL = _SELECT_SYNCED_DIALOGS_FOR_DELTA_SQL
 
 _SELECT_MAX_MESSAGE_ID_SQL = "SELECT COALESCE(MAX(message_id), 0) FROM messages WHERE dialog_id = ?"
 
-# Stamp last_synced_at on successful delta completion.
+# Stamp delta checkpoint on successful delta completion.
 # Distinct from FullSyncWorker's _UPDATE_PROGRESS_DONE_SQL (different column set).
-_UPDATE_DELTA_LAST_SYNCED_AT_SQL = "UPDATE synced_dialogs SET last_synced_at = ? WHERE dialog_id = ?"
+_UPDATE_DELTA_CHECKPOINT_SQL = (
+    "UPDATE synced_dialogs "
+    "SET last_synced_at = ?, last_delta_checked_at = ?, delta_refresh_requested_at = NULL "
+    "WHERE dialog_id = ?"
+)
+_UPDATE_DELTA_CHECKED_SQL = (
+    "UPDATE synced_dialogs SET last_delta_checked_at = ?, delta_refresh_requested_at = NULL WHERE dialog_id = ?"
+)
 
 _SELECT_ACCESS_LOST_SQL = "SELECT dialog_id FROM synced_dialogs WHERE status = 'access_lost'"
 
@@ -124,6 +139,13 @@ def _row_first_int(row: tuple[object | None, ...] | None) -> int:
 
 def _recently_synced(last_synced_at: int | None, now: int) -> bool:
     return last_synced_at is not None and (now - last_synced_at) < RECENT_SYNC_SKIP_THRESHOLD_S
+
+
+def _delta_skip_anchor(last_synced_at: int | None, last_delta_checked_at: int | None) -> int | None:
+    """Return the local recency anchor used by the delta quick-restart guard."""
+    if last_delta_checked_at is not None:
+        return last_delta_checked_at
+    return last_synced_at
 
 
 def _remaining_probe_candidates(*, total_rows: int, skipped: int, probed: int) -> int:
@@ -177,6 +199,12 @@ class DeltaSyncWorker:
         self._conn = conn
         self._shutdown_event = shutdown_event
 
+    def _stamp_delta_checkpoint(self, dialog_id: int, checked_at: int) -> None:
+        self._conn.execute(_UPDATE_DELTA_CHECKPOINT_SQL, (checked_at, checked_at, dialog_id))
+
+    def _stamp_delta_checked(self, dialog_id: int, checked_at: int) -> None:
+        self._conn.execute(_UPDATE_DELTA_CHECKED_SQL, (checked_at, dialog_id))
+
     async def run_delta_catch_up(
         self,
         *,
@@ -191,24 +219,30 @@ class DeltaSyncWorker:
         batch from iter_messages). Skips dialogs with no baseline
         (max_known_id=0) — FullSyncWorker handles those.
 
-        Quick-restart guard: dialogs whose last_synced_at is within
-        RECENT_SYNC_SKIP_THRESHOLD_S are skipped to prevent a
-        GetHistoryRequest storm after a rapid daemon restart (D-01).
+        Quick-restart guard: dialogs whose last delta check or completed sync
+        is within RECENT_SYNC_SKIP_THRESHOLD_S are skipped to prevent a
+        GetHistoryRequest storm after a rapid daemon restart (D-01). Explicit
+        refresh requests bypass this skip once, but still consume the same
+        bounded probe budget.
         """
-        rows = cast(list[tuple[int, int | None]], self._conn.execute(_SELECT_SYNCED_DIALOGS_FOR_DELTA_SQL).fetchall())
+        rows = cast(
+            list[tuple[int, int | None, int | None, int | None]],
+            self._conn.execute(_SELECT_SYNCED_DIALOGS_FOR_DELTA_SQL).fetchall(),
+        )
         now = int(time.time())
         total_new = 0
         skipped = 0
         probed = 0
-        for dialog_id, last_synced_at in rows:
+        for dialog_id, last_synced_at, last_delta_checked_at, refresh_requested_at in rows:
             if self._shutdown_event.is_set():
                 break
             if policy is not None and policy.probe_budget_exhausted(probed):
                 _log_probe_budget_exhausted(policy, total_rows=len(rows), skipped=skipped, probed=probed)
                 break
-            if _recently_synced(last_synced_at, now):
-                assert last_synced_at is not None
-                age_s = now - last_synced_at
+            skip_anchor = _delta_skip_anchor(last_synced_at, last_delta_checked_at)
+            if refresh_requested_at is None and _recently_synced(skip_anchor, now):
+                assert skip_anchor is not None
+                age_s = now - skip_anchor
                 # DEBUG, not INFO — with 300+ skipped dialogs this floods the
                 # log and obscures real signal. The aggregate count lives in
                 # the delta_catch_up complete summary at the end of this loop.
@@ -248,6 +282,8 @@ class DeltaSyncWorker:
         max_known_id = _row_first_int(row)
         if max_known_id == 0:
             # No baseline yet — FullSyncWorker handles this dialog
+            with self._conn:
+                self._stamp_delta_checked(dialog_id, int(time.time()))
             return 0
 
         new_message_rows: list[ExtractedMessage] = []
@@ -273,7 +309,7 @@ class DeltaSyncWorker:
             with self._conn:
                 if new_message_rows:
                     insert_messages_with_fts(self._conn, new_message_rows)
-                self._conn.execute(_UPDATE_DELTA_LAST_SYNCED_AT_SQL, (now, dialog_id))
+                self._stamp_delta_checkpoint(dialog_id, now)
             if new_message_rows:
                 logger.info(
                     "delta dialog_id=%d preserved_messages=%d before FloodWait",
@@ -306,7 +342,8 @@ class DeltaSyncWorker:
         # Stamp last_synced_at unconditionally on the success path so that
         # run_delta_catch_up's quick-restart skip check has a fresh anchor.
         with self._conn:
-            self._conn.execute(_UPDATE_DELTA_LAST_SYNCED_AT_SQL, (int(time.time()), dialog_id))
+            now = int(time.time())
+            self._stamp_delta_checkpoint(dialog_id, now)
         return len(new_message_rows)
 
 
