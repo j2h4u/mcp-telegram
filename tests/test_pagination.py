@@ -164,6 +164,29 @@ class TestDecodeValidation:
         with pytest.raises(ValueError, match="Invalid navigation token"):
             decode_navigation_token(token)
 
+    @pytest.mark.parametrize(
+        "extra_field, extra_value",
+        [
+            ("topic_id", 42),
+            ("direction", "newest"),
+            ("sent_at", 1700000000),
+        ],
+    )
+    def test_search_cursor_rejects_history_fields(self, extra_field: str, extra_value: object):
+        from mcp_telegram.pagination import _encode_payload
+
+        payload: dict[str, object] = {
+            "kind": "search",
+            "value": 1,
+            "dialog_id": 100,
+            "query": "needle",
+            "message_state": "sent",
+        }
+        payload[extra_field] = extra_value
+        token = _encode_payload(payload)
+        with pytest.raises(ValueError, match="search cursor contains history-only state"):
+            decode_navigation_token(token)
+
     def test_reversed_utc_bounds_are_rejected(self):
         with pytest.raises(ValueError, match="since_utc must be earlier"):
             encode_history_navigation(
@@ -226,4 +249,56 @@ class TestAccountTraceDecodeValidation:
             expected_exact_dialog_id=100,
         )
         with pytest.raises(ValueError, match="scope_dialog_ids"):
+            decode_account_trace_navigation(token, context)
+
+    def test_rejects_sent_after_mismatch(self):
+        from mcp_telegram.pagination import (
+            AccountTraceNavigationContext,
+            _encode_payload,
+            decode_account_trace_navigation,
+        )
+
+        payload: dict[str, object] = {
+            "kind": "account_trace",
+            "target_user_id": 42,
+            "sent_at": 1_700_000_000,
+            "dialog_id": 100,
+            "message_id": 500,
+            "group_by": "timeline",
+            "exact_dialog_id": 100,
+            "sent_after": "2026-01-01T00:00:00Z",
+        }
+        token = _encode_payload(payload)
+        context = AccountTraceNavigationContext(
+            expected_target_user_id=42,
+            expected_group_by="timeline",
+            expected_exact_dialog_id=100,
+        )
+        with pytest.raises(ValueError, match="sent_after"):
+            decode_account_trace_navigation(token, context)
+
+    def test_rejects_sent_before_mismatch(self):
+        from mcp_telegram.pagination import (
+            AccountTraceNavigationContext,
+            _encode_payload,
+            decode_account_trace_navigation,
+        )
+
+        payload: dict[str, object] = {
+            "kind": "account_trace",
+            "target_user_id": 42,
+            "sent_at": 1_700_000_000,
+            "dialog_id": 100,
+            "message_id": 500,
+            "group_by": "timeline",
+            "exact_dialog_id": 100,
+            "sent_before": "2026-06-01T00:00:00Z",
+        }
+        token = _encode_payload(payload)
+        context = AccountTraceNavigationContext(
+            expected_target_user_id=42,
+            expected_group_by="timeline",
+            expected_exact_dialog_id=100,
+        )
+        with pytest.raises(ValueError, match="sent_before"):
             decode_account_trace_navigation(token, context)
