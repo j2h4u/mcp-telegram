@@ -965,8 +965,7 @@ class DaemonAPIServer:
 
     async def _list_dialogs(self, req: dict[str, object]) -> dict:
         """Delegate list_dialogs reads to the reading service."""
-        if req.get("folder_id") is not None:
-            await self._refresh_folders_if_stale()
+        await self._refresh_folders_if_stale()
         result = await self._get_reading_service()._list_dialogs(cast(dict[str, object], req))
         if not result.get("ok"):
             return result

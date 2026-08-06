@@ -1153,6 +1153,7 @@ class DaemonReadingService:
             "name": row["name"],
             "type": row["type"],
             "last_message_at": row["last_message_at"],
+            "archived": bool(row["archived"]),
             "unread_count": 0,
             "members": row["members"],
             "created": row["created"],
