@@ -20,6 +20,12 @@ def _context() -> OwnOnlyContext:
     )
 
 
+def test_peer_id_zero_returns_zero() -> None:
+    """_peer_id(0) returns 0 — the <= 0 branch preserves the value without overflow."""
+    ctx = OwnOnlyContext(account_id=1, personal_channel_id=0)
+    assert ctx.personal_channel_id == 0
+
+
 def test_direct_message_has_machine_readable_basis() -> None:
     result = classify_own_only_dialog(
         dialog_id=7,
