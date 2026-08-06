@@ -125,6 +125,7 @@ class HttpServerConfig:
     allow_unsafe: bool = False
     allowed_hosts: tuple[str, ...] = ()
     allowed_origins: tuple[str, ...] = ()
+    bearer_token: str | None = None
 
 
 HTTP_LOOPBACK_ALLOWED_HOSTS: tuple[str, ...] = (
@@ -232,6 +233,16 @@ def _non_empty_str(data: dict[str, object], key: str, section: str, path: Path, 
     if not isinstance(value, str) or not value.strip():
         raise ConfigError(f"Invalid {section}.{key} in {path}: expected non-empty string")
     return value
+
+
+def _optional_stripped_str(data: dict[str, object], key: str, section: str, path: Path) -> str | None:
+    value = data.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ConfigError(f"Invalid {section}.{key} in {path}: expected string")
+    stripped = value.strip()
+    return stripped or None
 
 
 def _http_port(value: object, *, error_type: type[Exception] = ConfigError) -> int:
@@ -349,6 +360,7 @@ def resolve_http_server_config(
         allow_unsafe=env.get("MCP_TELEGRAM_HTTP_ALLOW_UNSAFE", "").strip().lower() in {"1", "true", "yes", "on"},
         allowed_hosts=_csv(env.get("MCP_TELEGRAM_HTTP_ALLOWED_HOSTS")),
         allowed_origins=_csv(env.get("MCP_TELEGRAM_HTTP_ALLOWED_ORIGINS")),
+        bearer_token=(env.get("MCP_TELEGRAM_HTTP_BEARER_TOKEN") or "").strip() or defaults.bearer_token,
     )
 
 
@@ -622,11 +634,12 @@ def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
 
 
 def _parse_http(data: dict[str, object], path: Path) -> HttpServerConfig:
-    http_data = _optional_section(data, "http", {"host", "port"}, path)
+    http_data = _optional_section(data, "http", {"host", "port", "bearer_token"}, path)
     defaults = HttpServerConfig()
     return HttpServerConfig(
         host=_non_empty_str(http_data, "host", "http", path, defaults.host),
         port=_http_port(http_data.get("port", defaults.port)),
+        bearer_token=_optional_stripped_str(http_data, "bearer_token", "http", path),
     )
 
 

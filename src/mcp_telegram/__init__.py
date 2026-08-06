@@ -9,19 +9,14 @@ from .config import ConfigError, HttpServerConfig, load_config, resolve_http_ser
 app = Typer()
 
 
-def _resolve_http_host(host: str | None, *, base: HttpServerConfig | None = None) -> str:
+def _resolve_http_config(
+    *,
+    host: str | None,
+    port: int | None,
+    base: HttpServerConfig | None = None,
+) -> HttpServerConfig:
     try:
-        # Supplying the model default keeps host validation independent from a
-        # malformed port override, matching the previous CLI behavior.
-        defaults = HttpServerConfig() if base is None else base
-        return resolve_http_server_config(host=host, port=defaults.port, base=defaults).host
-    except ConfigError as exc:
-        raise BadParameter(str(exc)) from exc
-
-
-def _resolve_http_port(port: int | None, *, base: HttpServerConfig | None = None) -> int:
-    try:
-        return resolve_http_server_config(port=port, base=base).port
+        return resolve_http_server_config(host=host, port=port, base=base)
     except ConfigError as exc:
         raise BadParameter(str(exc)) from exc
 
@@ -105,8 +100,7 @@ def serve(
     from .daemon import sync_main
 
     operator_config = load_config()
-    resolved_host = _resolve_http_host(host, base=operator_config.http)
-    resolved_port = _resolve_http_port(port, base=operator_config.http)
+    resolved_http = _resolve_http_config(host=host, port=port, base=operator_config.http)
     log_level = resolve_logging_config().level
     logging.basicConfig(
         level=getattr(logging, log_level, logging.INFO),
@@ -118,7 +112,11 @@ def serve(
     async def _run() -> None:
         sync_task = asyncio.create_task(sync_main(), name="sync-daemon")
         http_task = asyncio.create_task(
-            _server.run_mcp_http_server(host=resolved_host, port=resolved_port),
+            _server.run_mcp_http_server(
+                host=resolved_http.host,
+                port=resolved_http.port,
+                bearer_token=resolved_http.bearer_token,
+            ),
             name="mcp-http",
         )
         tasks = {sync_task, http_task}

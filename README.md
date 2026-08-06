@@ -64,7 +64,9 @@ http://127.0.0.1:3100/mcp
 ```
 
 Do not expose the HTTP endpoint or Telegram session volume to an untrusted
-network.
+network. If you intentionally enable unsafe non-loopback binding, configure
+`MCP_TELEGRAM_HTTP_BEARER_TOKEN` and send it as `Authorization: Bearer <token>`
+on `/mcp` requests.
 
 ## MCP Tools
 
@@ -241,6 +243,9 @@ For Streamable HTTP MCP clients, use:
 ```text
 http://127.0.0.1:3100/mcp
 ```
+
+Unsafe non-loopback HTTP binding requires `MCP_TELEGRAM_HTTP_BEARER_TOKEN`;
+HTTP clients must send `Authorization: Bearer <token>` to `/mcp`.
 
 The server instructions returned during MCP initialization include the connected
 Telegram account ID, clarify Telegram-read-only vs local MCP state writes, and
