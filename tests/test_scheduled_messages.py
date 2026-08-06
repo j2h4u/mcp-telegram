@@ -12,7 +12,7 @@ from typing import cast
 from unittest.mock import MagicMock
 
 import pytest
-from telethon.errors import FloodWaitError
+from telethon.errors import ChannelPrivateError, FloodWaitError
 from telethon.tl.types import PeerUser
 
 from mcp_telegram.event_handlers import EventHandlerManager, _NewMessageEvent
@@ -70,7 +70,10 @@ class _ScheduledSnapshotClient:
 
     async def get_entity(self, _dialog_id: int) -> object:
         self.entity_calls.append(_dialog_id)
-        return self.entities.get(_dialog_id)
+        entity = self.entities.get(_dialog_id)
+        if isinstance(entity, Exception):
+            raise entity
+        return entity
 
     async def __call__(self, _request: object, **_kwargs: object) -> object:
         self.requests.append((_request, _kwargs))
@@ -255,6 +258,45 @@ async def test_reconciliation_classifies_and_enrolls_own_only_candidates(conn: s
     assert len(client.entity_calls) == 2
     assert set(client.entity_calls) == {admin_id, unrelated_id}
     assert all(kwargs["flood_sleep_threshold"] == 0 for _, kwargs in client.requests)
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_access_lost_candidate_log_has_dialog_context(
+    conn: sqlite3.Connection,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    private_channel_id = -1000000009004
+    channel_name = "Archived Fixture Channel"
+    conn.execute(
+        "INSERT INTO dialogs (dialog_id, name, type, hidden, archived) VALUES (?, ?, ?, ?, ?)",
+        (private_channel_id, channel_name, "channel", 1, 1),
+    )
+    conn.commit()
+    client = _ScheduledSnapshotClient(
+        entities={
+            private_channel_id: ChannelPrivateError(request=None),
+        },
+    )
+    worker = ScheduledMessageReconciler(
+        client,
+        conn,
+        asyncio.Event(),
+        0,
+        OwnOnlyContext(account_id=42, personal_channel_id=9001),
+    )
+
+    with caplog.at_level("WARNING", logger="mcp_telegram.scheduled_messages"):
+        assert await worker.run_once() == 0
+
+    records = [record for record in caplog.records if "scheduled_own_only_access_lost" in record.message]
+    assert len(records) == 1
+    assert f"dialog_id={private_channel_id}" in records[0].message
+    assert f"name='{channel_name}'" in records[0].message
+    assert "type=channel" in records[0].message
+    assert "archived=True" in records[0].message
+    assert "hidden=True" in records[0].message
+    assert "reason=ChannelPrivateError" in records[0].message
+    assert records[0].exc_info is None
 
 
 @pytest.mark.asyncio

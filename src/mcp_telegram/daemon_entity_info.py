@@ -15,7 +15,9 @@ from typing import Protocol, cast, runtime_checkable
 from telethon.errors import ChatAdminRequiredError, RPCError  # type: ignore[import-untyped]
 from telethon.tl.types import PeerChannel  # type: ignore[import-untyped]
 
+from .daemon_log_context import dialog_log_context
 from .models import DialogType
+from .telegram_access import ACCESS_LOST_ERRORS
 from .telethon_dialog import classify_dialog_type
 
 _ENTITY_DETAIL_SCHEMA_VERSION = 1
@@ -283,6 +285,20 @@ class DaemonEntityInfoService:
             )
             return None, self._error("entity_not_found", str(exc))
         except (RPCError, RuntimeError, TypeError, AttributeError) as exc:
+            if isinstance(exc, ACCESS_LOST_ERRORS):
+                log_context = dialog_log_context(self._deps.conn, entity_id)
+                self._deps.logger.warning(
+                    "entity_info_access_lost entity_id=%r name=%r type=%s archived=%s hidden=%s reason=%s error=%s%s",
+                    entity_id,
+                    log_context.name,
+                    log_context.type,
+                    log_context.archived,
+                    log_context.hidden,
+                    type(exc).__name__,
+                    exc,
+                    self._deps.rid(),
+                )
+                return None, self._error("telegram_api_error", str(exc))
             self._deps.logger.warning(
                 "entity_info get_entity_failed entity_id=%r error=%s%s",
                 entity_id,

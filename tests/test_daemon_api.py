@@ -1276,7 +1276,7 @@ async def test_list_dialogs_refreshes_folder_snapshot_before_read(tmp_path: Path
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     conn = _register_sqlite_connection(sqlite3.connect(db_path))
-    _seed_dialog_row(conn, 123, name="Oleg Puzanov", type_="User")
+    _seed_dialog_row(conn, 123, name="Fixture Person", type_="User")
     replace_folder_snapshot(conn, [(3, "Old")], [(3, 123)])
     server = make_server(conn)
     refresher = _FakeFolderRefresher(conn)
@@ -1300,7 +1300,7 @@ async def test_list_dialogs_with_folder_filter_uses_refreshed_snapshot(tmp_path:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     conn = _register_sqlite_connection(sqlite3.connect(db_path))
-    _seed_dialog_row(conn, 123, name="Oleg Puzanov", type_="User")
+    _seed_dialog_row(conn, 123, name="Fixture Person", type_="User")
     replace_folder_snapshot(conn, [(3, "Old")], [(3, 123)])
     server = make_server(conn)
     refresher = _FakeFolderRefresher(conn)

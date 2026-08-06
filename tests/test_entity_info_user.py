@@ -15,6 +15,7 @@ from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from telethon.errors import ChannelPrivateError
 
 # HIGH-1 from 47-REVIEWS.md cycle 3 (codex 2026-04-25): User/Bot fixtures
 # MUST construct mocks with spec=User so `isinstance(entity, User)` inside
@@ -579,6 +580,47 @@ async def test_get_entity_info_entity_not_found() -> None:
     assert r["ok"] is False
     assert r["error"] == "entity_not_found"
     assert r["data"] is None
+
+
+@pytest.mark.asyncio
+async def test_get_entity_info_access_lost_log_has_dialog_context(caplog: pytest.LogCaptureFixture) -> None:
+    entity_id = -1000000009101
+    channel_name = "Archived Fixture Channel"
+    conn = _make_db()
+    conn.execute(
+        """
+        CREATE TABLE dialogs (
+            dialog_id INTEGER PRIMARY KEY,
+            name TEXT,
+            type TEXT,
+            archived INTEGER,
+            hidden INTEGER
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO dialogs (dialog_id, name, type, archived, hidden) VALUES (?, ?, ?, ?, ?)",
+        (entity_id, channel_name, "channel", 1, 1),
+    )
+    conn.commit()
+    client = AsyncMock()
+    client.get_entity = AsyncMock(side_effect=ChannelPrivateError(request=None))
+    server = make_server(conn=conn, client=client)
+
+    with caplog.at_level("WARNING", logger="mcp_telegram.daemon_api"):
+        r = await server._dispatch({"method": "get_entity_info", "entity_id": entity_id})
+
+    assert r["ok"] is False
+    assert r["error"] == "telegram_api_error"
+    records = [record for record in caplog.records if "entity_info_access_lost" in record.message]
+    assert len(records) == 1
+    assert f"entity_id={entity_id}" in records[0].message
+    assert f"name='{channel_name}'" in records[0].message
+    assert "type=channel" in records[0].message
+    assert "archived=True" in records[0].message
+    assert "hidden=True" in records[0].message
+    assert "reason=ChannelPrivateError" in records[0].message
+    assert records[0].exc_info is None
 
 
 @pytest.mark.asyncio

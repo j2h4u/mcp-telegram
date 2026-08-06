@@ -107,7 +107,12 @@ cannot_depend_on = ["mcp_telegram.folders.sqlite_repository", "mcp_telegram.mess
 [[modules]]
 path = "mcp_telegram.daemon_entity_info"
 layer = "application"
-depends_on = ["mcp_telegram.models", "mcp_telegram.telethon_dialog"]
+depends_on = ["mcp_telegram.daemon_log_context", "mcp_telegram.models", "mcp_telegram.telegram_access", "mcp_telegram.telethon_dialog"]
+
+[[modules]]
+path = "mcp_telegram.daemon_log_context"
+layer = "application"
+depends_on = []
 
 [[modules]]
 path = "mcp_telegram.daemon_message"
@@ -153,7 +158,7 @@ depends_on = []
 [[modules]]
 path = "mcp_telegram.scheduled_messages"
 layer = "application"
-depends_on = ["mcp_telegram.activity_peer_resolve", { path = "mcp_telegram.activity_sync", deprecated = true }, "mcp_telegram.fts", "mcp_telegram.message_contracts", "mcp_telegram.messages.telegram_adapter", "mcp_telegram.own_only", "mcp_telegram.telegram_gateway"]
+depends_on = ["mcp_telegram.activity_peer_resolve", { path = "mcp_telegram.activity_sync", deprecated = true }, "mcp_telegram.daemon_log_context", "mcp_telegram.fts", "mcp_telegram.message_contracts", "mcp_telegram.messages.telegram_adapter", "mcp_telegram.own_only", "mcp_telegram.telegram_access", "mcp_telegram.telegram_gateway"]
 
 [[modules]]
 path = "mcp_telegram.own_only"

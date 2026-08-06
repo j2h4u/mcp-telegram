@@ -574,7 +574,7 @@ async def test_list_dialogs_exposes_folder_names_for_humans():
                 "dialogs": [
                     {
                         "id": 123,
-                        "name": "Oleg Puzanov",
+                        "name": "Fixture Person",
                         "type": "User",
                         "last_message_at": "2026-08-05T12:00:00+00:00",
                         "unread_count": 0,
