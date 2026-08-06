@@ -1248,7 +1248,7 @@ def test_classify_dialog_type_none() -> None:
 async def test_list_dialogs_sync_status_via_sql() -> None:
     """list_dialogs returns correct sync_status for each dialog via SQL path."""
     conn = _make_db_with_dialogs()
-    _seed_dialog_row(conn, 1, name="Chat One", type_="User")
+    _seed_dialog_row(conn, 1, name="Chat One", type_="User", archived=True)
     _seed_dialog_row(conn, 2, name="Chat Two", type_="Channel")
     _insert_synced_dialog(conn, 1, status="synced")
     # dialog_id=2 not in synced_dialogs — should default to "not_synced"
@@ -1265,12 +1265,38 @@ async def test_list_dialogs_sync_status_via_sql() -> None:
 
     by_id = {d["id"]: d for d in dialogs}
     assert by_id[1]["sync_status"] == "synced"
+    assert by_id[1]["archived"] is True
     assert by_id[2]["sync_status"] == "not_synced"
+    assert by_id[2]["archived"] is False
     cast(MagicMock, client.iter_dialogs).assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_list_dialogs_with_folder_filter_refreshes_snapshot_before_read(tmp_path: Path) -> None:
+async def test_list_dialogs_refreshes_folder_snapshot_before_read(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = _register_sqlite_connection(sqlite3.connect(db_path))
+    _seed_dialog_row(conn, 123, name="Oleg Puzanov", type_="User")
+    replace_folder_snapshot(conn, [(3, "Old")], [(3, 123)])
+    server = make_server(conn)
+    refresher = _FakeFolderRefresher(conn)
+    server.set_folder_snapshot_refresh(refresher.refresh)
+
+    result = await server._list_dialogs({})
+
+    assert result["ok"] is True
+    assert refresher.refresh_count == 1
+    dialogs = cast(list[dict[str, object]], _response_data(result)["dialogs"])
+    assert len(dialogs) == 1
+    assert dialogs[0]["folder_ids"] == [16]
+    assert dialogs[0]["folders"] == [{"id": 16, "title": "MD"}]
+
+    await server._list_dialogs({})
+    assert refresher.refresh_count == 1
+
+
+@pytest.mark.asyncio
+async def test_list_dialogs_with_folder_filter_uses_refreshed_snapshot(tmp_path: Path) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     conn = _register_sqlite_connection(sqlite3.connect(db_path))
@@ -1288,9 +1314,6 @@ async def test_list_dialogs_with_folder_filter_refreshes_snapshot_before_read(tm
     assert len(dialogs) == 1
     assert dialogs[0]["folder_ids"] == [16]
     assert dialogs[0]["folders"] == [{"id": 16, "title": "MD"}]
-
-    await server._list_dialogs({"folder_id": 16})
-    assert refresher.refresh_count == 1
 
 
 @pytest.mark.asyncio
