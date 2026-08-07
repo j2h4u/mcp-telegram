@@ -75,7 +75,7 @@ depends_on = [
     "mcp_telegram.budget", "mcp_telegram.daemon_account_trace", "mcp_telegram.daemon_activity_stats",
     "mcp_telegram.daemon_dialog_queries", "mcp_telegram.daemon_entity_info", "mcp_telegram.daemon_message",
     "mcp_telegram.daemon_message_queries", "mcp_telegram.daemon_read_state_queries", "mcp_telegram.daemon_reading",
-    "mcp_telegram.daemon_source_export",
+    "mcp_telegram.daemon_source_export", "mcp_telegram.important_events",
     { path = "mcp_telegram.feedback_db", deprecated = true }, "mcp_telegram.models", "mcp_telegram.pagination",
     "mcp_telegram.reactions.contracts", "mcp_telegram.reactions.refresh", "mcp_telegram.resolver",
     "mcp_telegram.telegram_fragments", "mcp_telegram.telegram_history",
@@ -249,6 +249,11 @@ depends_on = ["mcp_telegram.folders.membership", "mcp_telegram.folders.ports"]
 path = "mcp_telegram.folders.read_model"
 layer = "capability"
 depends_on = ["mcp_telegram.folders.sqlite_repository"]
+
+[[modules]]
+path = "mcp_telegram.important_events"
+layer = "capability"
+depends_on = ["mcp_telegram.temporal"]
 
 [[modules]]
 path = "mcp_telegram.reactions"

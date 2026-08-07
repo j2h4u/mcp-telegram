@@ -240,6 +240,7 @@ def test_list_tools_exposes_snake_case_names_titles_and_annotations() -> None:
     expected_titles = {
         "list_dialogs": "List Dialogs",
         "list_topics": "List Topics",
+        "list_important_events": "Important Events",
         "list_messages": "List Messages",
         "search_messages": "Search Messages",
         "get_usage_stats": "Usage Stats",
