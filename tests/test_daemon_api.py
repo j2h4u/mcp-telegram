@@ -1274,6 +1274,23 @@ async def test_list_dialogs_sync_status_via_sql() -> None:
 
 
 @pytest.mark.asyncio
+async def test_list_dialogs_respects_limit_after_projection() -> None:
+    """list_dialogs applies limit to the final agent-visible projection."""
+    conn = _make_db_with_dialogs()
+    _seed_dialog_row(conn, 1, name="Chat One", type_="User", last_message_at=300)
+    _seed_dialog_row(conn, 2, name="Chat Two", type_="User", last_message_at=200)
+    _seed_dialog_row(conn, 3, name="Chat Three", type_="User", last_message_at=100)
+    server = make_server(conn)
+
+    result = await server._list_dialogs({"limit": 1})
+
+    assert result["ok"] is True
+    dialogs = result["data"]["dialogs"]
+    assert len(dialogs) == 1
+    assert dialogs[0]["id"] == 1
+
+
+@pytest.mark.asyncio
 async def test_list_dialogs_refreshes_folder_snapshot_before_read(tmp_path: Path) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)

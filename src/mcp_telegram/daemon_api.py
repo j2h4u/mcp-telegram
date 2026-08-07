@@ -966,6 +966,8 @@ class DaemonAPIServer:
             return result
         memberships = folders_by_dialog(self._conn)
         requested_folder = req.get("folder_id")
+        raw_limit = req.get("limit")
+        limit = None if raw_limit is None else _clamp(_coerce_int(raw_limit, 100), 1, 500)
         data = cast(dict[str, object], result.get("data", {}))
         dialogs = cast(list[dict[str, object]], data.get("dialogs", []))
         enriched = []
@@ -976,6 +978,8 @@ class DaemonAPIServer:
             dialog["folders"] = folders
             if requested_folder is None or int(cast(int | str, requested_folder)) in ids:
                 enriched.append(dialog)
+                if limit is not None and len(enriched) >= limit:
+                    break
         data["dialogs"] = enriched
         return result
 
