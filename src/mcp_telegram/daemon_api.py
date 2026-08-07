@@ -102,7 +102,7 @@ from .daemon_message_queries import (
     _read_message_from_row,
 )
 from .daemon_read_state_queries import _dialog_type_from_db, _read_state_for_dialog
-from .folders.sqlite_repository import dialog_placement, folders_by_dialog, list_folder_messages, list_folders
+from .folders.read_model import dialog_placement, folders_by_dialog, list_folder_messages, list_folders
 from .models import DialogType, ReadMessage
 from .topics.contracts import TopicSourceUnavailableError
 from .topics.refresh import TopicRefresher
