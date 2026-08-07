@@ -255,6 +255,17 @@ def _csv(value: str | None) -> tuple[str, ...]:
     return tuple(item.strip() for item in (value or "").split(",") if item.strip())
 
 
+def _resolve_http_port(port: int | None, env: Mapping[str, str], default: int) -> int:
+    if port is not None:
+        return _http_port(port)
+    raw_port = env.get("MCP_TELEGRAM_HTTP_PORT")
+    if raw_port is None or not raw_port.strip():
+        return default
+    if raw_port.isdecimal():
+        return _http_port(int(raw_port))
+    raise ConfigError("MCP_TELEGRAM_HTTP_PORT must be an integer")
+
+
 def _env_positive_float(environ: Mapping[str, str], name: str, default: float) -> float:
     raw = environ.get(name)
     if raw is None or not raw.strip():
@@ -344,19 +355,9 @@ def resolve_http_server_config(
     env = os.environ if environ is None else environ
     defaults = HttpServerConfig() if base is None else base
     resolved_host = host if host is not None else env.get("MCP_TELEGRAM_HTTP_HOST") or defaults.host
-    if port is not None:
-        resolved_port = _http_port(port)
-    else:
-        raw_port = env.get("MCP_TELEGRAM_HTTP_PORT")
-        if raw_port is None or not raw_port.strip():
-            resolved_port = defaults.port
-        elif raw_port.isdecimal():
-            resolved_port = _http_port(int(raw_port))
-        else:
-            raise ConfigError("MCP_TELEGRAM_HTTP_PORT must be an integer")
     return HttpServerConfig(
         host=resolved_host,
-        port=resolved_port,
+        port=_resolve_http_port(port, env, defaults.port),
         allow_unsafe=env.get("MCP_TELEGRAM_HTTP_ALLOW_UNSAFE", "").strip().lower() in {"1", "true", "yes", "on"},
         allowed_hosts=_csv(env.get("MCP_TELEGRAM_HTTP_ALLOWED_HOSTS")),
         allowed_origins=_csv(env.get("MCP_TELEGRAM_HTTP_ALLOWED_ORIGINS")),

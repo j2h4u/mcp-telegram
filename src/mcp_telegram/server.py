@@ -179,9 +179,10 @@ def _assert_http_exposure_allowed(host: str, *, bearer_token: str | None = None)
 
 
 def _authorization_header(scope: Scope) -> str | None:
-    headers = scope.get("headers", [])
-    if not isinstance(headers, list):
+    raw_headers = t.cast(object, scope.get("headers", ()))
+    if not isinstance(raw_headers, list):
         return None
+    headers = t.cast(list[tuple[bytes, bytes]], raw_headers)
     for name, value in headers:
         if name.lower() == b"authorization":
             return value.decode("latin-1")
