@@ -795,16 +795,18 @@ class EventHandlerManager:
 
         event.chat_id may be None for PM read events on some Telethon versions
         (UpdateReadHistoryInbox normalization differs). We log a WARNING so PM
-        read-position staleness is observable; actual state will be re-resolved
-        on next daemon restart via _initialize_read_positions.
+        read-position staleness is observable; regular dialog reconciliation
+        also refreshes read cursors from Telegram Dialog state, so this is not
+        the only source of read-state truth.
         """
         dialog_id = event.chat_id
 
         if dialog_id is None:
             logger.warning(
-                "event_read_null_chat_id max_id=%s — PM read position not tracked "
-                "in real-time (MTProto/Telethon normalization); bootstrap on next "
-                "daemon restart will reconcile",
+                "event_read_null_chat_id max_id=%s — PM read position could not "
+                "be updated from this real-time event because Telethon did not "
+                "provide chat_id; dialog reconciliation will refresh cursors from "
+                "Telegram Dialog state",
                 event.max_id,
             )
             return
@@ -853,7 +855,8 @@ class EventHandlerManager:
         - Monotonic via shared :func:`apply_read_cursor` primitive — a smaller
           ``max_id`` is absorbed by ``MAX(COALESCE(existing, 0), ?)``.
         - ``event.chat_id`` may be None for PM read events on some Telethon
-          versions (mirror of the inbox handler's quirk). Log warning, bail.
+          versions (mirror of the inbox handler's quirk). Log warning, bail;
+          dialog reconciliation remains the fallback source of cursor truth.
         - Exceptions wrapped in ``try/except Exception`` (not bare ``except``,
           not swallowing ``asyncio.CancelledError``); observable via the
           ``event_outbox_read_failed`` log.
@@ -863,8 +866,9 @@ class EventHandlerManager:
         if dialog_id is None:
             logger.warning(
                 "event_outbox_read_null_chat_id max_id=%s — PM outbox read "
-                "position not tracked in real-time; bootstrap on next daemon "
-                "restart will reconcile",
+                "position could not be updated from this real-time event because "
+                "Telethon did not provide chat_id; dialog reconciliation will "
+                "refresh cursors from Telegram Dialog state",
                 event.max_id,
             )
             return
