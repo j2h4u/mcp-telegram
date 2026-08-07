@@ -102,8 +102,8 @@ async def submit_feedback(args: SubmitFeedback) -> ToolResult:
                 model=args.model,
                 harness=args.harness,
             )
-    except DaemonNotRunningError:
-        return error_result(_daemon_not_running_text())
+    except DaemonNotRunningError as exc:
+        return error_result(_daemon_not_running_text(exc))
 
     if err := _check_daemon_response(response):
         return err

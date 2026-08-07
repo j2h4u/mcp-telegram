@@ -288,8 +288,8 @@ async def mark_dialog_for_sync(args: MarkDialogForSync) -> ToolResult:
                 dialog_id=args.dialog_id,
                 enable=args.enable,
             )
-    except DaemonNotRunningError:
-        return error_result(_daemon_not_running_text())
+    except DaemonNotRunningError as exc:
+        return error_result(_daemon_not_running_text(exc))
 
     if err := _check_daemon_response(response):
         return err
@@ -333,8 +333,8 @@ async def get_sync_status(args: GetSyncStatus) -> ToolResult:
     try:
         async with daemon_connection() as conn:
             response = await conn.get_sync_status(dialog_id=args.dialog_id)
-    except DaemonNotRunningError:
-        return error_result(_daemon_not_running_text())
+    except DaemonNotRunningError as exc:
+        return error_result(_daemon_not_running_text(exc))
 
     if err := _check_daemon_response(response):
         return err
@@ -499,8 +499,8 @@ async def get_sync_alerts(args: GetSyncAlerts) -> ToolResult:
     try:
         async with daemon_connection() as conn:
             response = await conn.get_sync_alerts(since=args.since, limit=args.limit)
-    except DaemonNotRunningError:
-        return error_result(_daemon_not_running_text())
+    except DaemonNotRunningError as exc:
+        return error_result(_daemon_not_running_text(exc))
 
     if err := _check_daemon_response(response):
         return err

@@ -432,8 +432,8 @@ async def list_topics(args: ListTopics) -> ToolResult:
                 response = await conn.list_topics(dialog_id=dialog_id)
             else:
                 response = await conn.list_topics(dialog=dialog_name)
-    except DaemonNotRunningError:
-        return error_result(_daemon_not_running_text(), has_filter=True)
+    except DaemonNotRunningError as exc:
+        return error_result(_daemon_not_running_text(exc), has_filter=True)
 
     if not response.get("ok"):
         error_code = response.get("error", "")

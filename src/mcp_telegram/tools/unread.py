@@ -472,8 +472,8 @@ async def get_inbox(args: GetInbox) -> ToolResult:
                 limit=args.limit,
                 group_size_threshold=args.group_size_threshold,
             )
-    except DaemonNotRunningError:
-        return error_result(_daemon_not_running_text())
+    except DaemonNotRunningError as exc:
+        return error_result(_daemon_not_running_text(exc))
 
     if err := _check_daemon_response(response):
         return err

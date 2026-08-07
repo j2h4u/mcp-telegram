@@ -52,6 +52,7 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "folders/sqlite_repository.py",
             "fts.py",
             "messages/sqlite_repository.py",
+            "message_fact_refresh.py",
             "own_only.py",
             "reactions/persistence.py",
             "reactions/sqlite_repository.py",

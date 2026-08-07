@@ -5,11 +5,11 @@ from __future__ import annotations
 import ast
 import sqlite3
 import time
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Protocol, cast
 from unittest.mock import AsyncMock
 
 import pytest
@@ -32,6 +32,10 @@ from mcp_telegram.telegram_reading import (
     GatewayFailureKind,
     ReadDateFetchResult,
 )
+
+
+class _RequestWithPeer(Protocol):
+    peer: object
 
 
 def _message(message_id: int, *, reaction: bool = True) -> SimpleNamespace:
@@ -62,7 +66,7 @@ class _HistoryClient:
         self.error = error
         self.calls: list[tuple[int, dict[str, object]]] = []
 
-    async def iter_messages(self, dialog_id: int, **kwargs: object):
+    async def iter_messages(self, dialog_id: int, **kwargs: object) -> AsyncIterator[object]:
         self.calls.append((dialog_id, kwargs))
         for message in self.messages:
             yield message
@@ -477,12 +481,22 @@ async def test_reaction_gateway_persists_individual_dates_without_affecting_aggr
 @pytest.mark.asyncio
 async def test_read_receipt_gateway_keeps_telegram_date_nullable() -> None:
     class Client:
+        def __init__(self) -> None:
+            self.resolved: list[object] = []
+
+        async def get_input_entity(self, entity: object) -> object:
+            self.resolved.append(entity)
+            return SimpleNamespace(peer_id=entity)
+
         async def __call__(self, request: object) -> object:
             assert request.__class__.__name__ == "GetOutboxReadDateRequest"
+            assert cast(_RequestWithPeer, request).peer == SimpleNamespace(peer_id=42)
             return SimpleNamespace(date=datetime.fromtimestamp(1_700_000_200, tz=UTC))
 
-    result = await TelethonTelegramReadReceiptGateway(Client()).fetch_outbox_read_date(42, 10)
+    client = Client()
+    result = await TelethonTelegramReadReceiptGateway(client).fetch_outbox_read_date(42, 10)
     assert result == ReadDateFetchResult(read_at=1_700_000_200, status="complete")
+    assert client.resolved == [42]
 
 
 @pytest.mark.asyncio

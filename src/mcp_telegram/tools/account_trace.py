@@ -400,8 +400,8 @@ async def trace_account_messages(args: TraceAccountMessages) -> ToolResult:
                 navigation=args.navigation,
                 coverage_goal=args.coverage_goal,
             )
-    except DaemonNotRunningError:
-        return error_result(_daemon_not_running_text(), has_filter=True, has_cursor=args.navigation is not None)
+    except DaemonNotRunningError as exc:
+        return error_result(_daemon_not_running_text(exc), has_filter=True, has_cursor=args.navigation is not None)
 
     if err := _check_daemon_response(
         response,

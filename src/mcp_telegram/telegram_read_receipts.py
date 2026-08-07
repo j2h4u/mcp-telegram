@@ -13,6 +13,8 @@ from .telegram_reading import ReadDateFetchResult, TelegramReadReceiptGateway
 
 
 class _TelegramClientLike(Protocol):
+    async def get_input_entity(self, entity: object) -> object: ...
+
     async def __call__(self, request: object) -> object: ...
 
 
@@ -24,7 +26,8 @@ class TelethonTelegramReadReceiptGateway:
 
     async def fetch_outbox_read_date(self, entity: object, message_id: int) -> ReadDateFetchResult:
         try:
-            response = await self._client(GetOutboxReadDateRequest(peer=cast(TypeInputPeer, entity), msg_id=message_id))
+            peer = await self._client.get_input_entity(entity) if isinstance(entity, int) else entity
+            response = await self._client(GetOutboxReadDateRequest(peer=cast(TypeInputPeer, peer), msg_id=message_id))
             value = getattr(response, "date", None)
             if not isinstance(value, datetime):
                 # Telegram can return an empty/permission-limited response. It

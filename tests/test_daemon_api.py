@@ -924,7 +924,7 @@ async def test_reading_service_injects_fragment_failure() -> None:
 
 @pytest.mark.asyncio
 async def test_list_messages_context_window_own_only_uses_fragment_fetch() -> None:
-    """own_only dialogs should use bounded fragment fetch for anchor context."""
+    """own_only dialogs should only use bounded fragment fetch for anchor context."""
     DIALOG_ID = 7005
 
     conn = _make_db_for_fragment_context()
@@ -946,7 +946,7 @@ async def test_list_messages_context_window_own_only_uses_fragment_fetch() -> No
     assert result["data"]["coverage"] == "fragment"
     assert [m["message_id"] for m in _response_messages(result)] == [10, 11]
     client.get_input_entity.assert_awaited_once_with(DIALOG_ID)
-    assert _call_count(client.get_messages) == 2
+    assert _call_count(client.get_messages) == 1
     client.get_messages.assert_any_await(entity, ids=[10, 11, 12, 13, 14, 15])
 
 

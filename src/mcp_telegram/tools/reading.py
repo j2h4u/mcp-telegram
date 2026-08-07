@@ -1420,8 +1420,8 @@ async def _resolve_topic_id(
                 dialog_id=dialog_id,
                 dialog=dialog_name,
             )
-    except DaemonNotRunningError:
-        return error_result(_daemon_not_running_text())
+    except DaemonNotRunningError as exc:
+        return error_result(_daemon_not_running_text(exc))
 
     if not response.get("ok"):
         error = response.get("error", "unknown")
@@ -1608,8 +1608,8 @@ async def list_messages(args: ListMessages) -> ToolResult:
                 since_utc=args.since_utc,
                 until_utc=args.until_utc,
             )
-    except DaemonNotRunningError:
-        return error_result(_daemon_not_running_text())
+    except DaemonNotRunningError as exc:
+        return error_result(_daemon_not_running_text(exc))
 
     if not response.get("ok"):
         return _list_messages_error_result(
@@ -1755,8 +1755,8 @@ async def search_messages(args: SearchMessages) -> ToolResult:
                 since_utc=args.since_utc,
                 until_utc=args.until_utc,
             )
-    except DaemonNotRunningError:
-        return error_result(_daemon_not_running_text())
+    except DaemonNotRunningError as exc:
+        return error_result(_daemon_not_running_text(exc))
 
     if not response.get("ok"):
         return _search_messages_error_result(

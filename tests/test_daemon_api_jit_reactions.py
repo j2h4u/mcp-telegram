@@ -1,8 +1,9 @@
-"""JIT reactions freshen-on-read tests (Phase 39.2 Plan 02).
+"""Reaction refresh and cached read-path projection tests.
 
-Covers AC-3, AC-4, AC-4-PAGED, AC-5, AC-6, AC-6-PARTIAL plus per-path wiring
-for _list_messages, _list_messages_context_window, scoped _search_messages,
-and _list_unread_messages.
+Low-level ReactionFreshener tests still cover Telegram refresh semantics.  The
+daemon read-path tests assert a stricter invariant: user-facing read tools
+project cached facts only and never perform Telegram RPC for optional
+enrichment.
 """
 
 from __future__ import annotations
@@ -144,9 +145,9 @@ async def test_jit_cold_fetch_updates_state(make_synced_db: Callable[[], sqlite3
 
     client = _TestClient()
     client.get_messages = AsyncMock(return_value=[_msg_with_reactions(mid) for mid in ids])
-    server = make_server(conn, client)
+    freshener = make_reaction_freshener(conn, client)
 
-    await server._reaction_freshener.refresh(dialog_id, dialog_id, ids)
+    await freshener.refresh(dialog_id, dialog_id, ids)
 
     assert cast(AsyncMock, client.get_messages).call_count == 1
     assert cast(list[int], _call_kwargs(client.get_messages)["ids"]) == ids
@@ -176,9 +177,9 @@ async def test_jit_all_fresh_no_api_call(make_synced_db: Callable[[], sqlite3.Co
 
     client = _TestClient()
     client.get_messages = AsyncMock()
-    server = make_server(conn, client)
+    freshener = make_reaction_freshener(conn, client)
 
-    await server._reaction_freshener.refresh(dialog_id, dialog_id, ids)
+    await freshener.refresh(dialog_id, dialog_id, ids)
 
     assert cast(AsyncMock, client.get_messages).call_count == 0
     rxn = _fetchone_tuple(conn, "SELECT COUNT(*) FROM message_reactions WHERE dialog_id=?", (dialog_id,))[0]
@@ -199,9 +200,9 @@ async def test_jit_page1_fresh_page2_cold_partial_fetch(make_synced_db: Callable
 
     client = _TestClient()
     client.get_messages = AsyncMock(return_value=[_msg_with_reactions(mid) for mid in range(31, 61)])
-    server = make_server(conn, client)
+    freshener = make_reaction_freshener(conn, client)
 
-    await server._reaction_freshener.refresh(dialog_id, dialog_id, ids_all)
+    await freshener.refresh(dialog_id, dialog_id, ids_all)
 
     assert cast(AsyncMock, client.get_messages).call_count == 1
     call_ids = cast(list[int], _call_kwargs(client.get_messages)["ids"])
@@ -241,9 +242,9 @@ async def test_jit_partial_stale_subset_fetch(make_synced_db: Callable[[], sqlit
 
     client = _TestClient()
     client.get_messages = AsyncMock(return_value=[_msg_with_reactions(mid) for mid in stale_ids])
-    server = make_server(conn, client)
+    freshener = make_reaction_freshener(conn, client)
 
-    await server._reaction_freshener.refresh(dialog_id, dialog_id, ids)
+    await freshener.refresh(dialog_id, dialog_id, ids)
 
     call_ids = cast(list[int], _call_kwargs(client.get_messages)["ids"])
     assert call_ids == stale_ids
@@ -272,9 +273,9 @@ async def test_jit_ttl_expired_refreshes_no_duplicates(make_synced_db: Callable[
 
     client = _TestClient()
     client.get_messages = AsyncMock(return_value=[_msg_with_reactions(mid, emoji="❤", count=1) for mid in ids])
-    server = make_server(conn, client)
+    freshener = make_reaction_freshener(conn, client)
 
-    await server._reaction_freshener.refresh(dialog_id, dialog_id, ids)
+    await freshener.refresh(dialog_id, dialog_id, ids)
 
     assert cast(AsyncMock, client.get_messages).call_count == 1
     rxn_rows = _fetchall_tuples(
@@ -311,9 +312,9 @@ async def test_jit_floodwait_preserves_stale(make_synced_db: Callable[[], sqlite
     err = FloodWaitError(request=None)
     err.seconds = 30
     client.get_messages = AsyncMock(side_effect=err)
-    server = make_server(conn, client)
+    freshener = make_reaction_freshener(conn, client)
 
-    freshness = await server._reaction_freshener.refresh(dialog_id, dialog_id, ids)
+    freshness = await freshener.refresh(dialog_id, dialog_id, ids)
 
     # reactions untouched
     rxn_rows = _fetchall_tuples(conn, "SELECT count FROM message_reactions WHERE dialog_id=?", (dialog_id,))
@@ -347,9 +348,9 @@ async def test_jit_partial_none_results_skip_freshness_upsert(make_synced_db: Ca
             _msg_with_reactions(5),
         ]
     )
-    server = make_server(conn, client)
+    freshener = make_reaction_freshener(conn, client)
 
-    await server._reaction_freshener.refresh(dialog_id, dialog_id, ids)
+    await freshener.refresh(dialog_id, dialog_id, ids)
 
     fr_ids = sorted(
         cast(int, r[0])
@@ -378,9 +379,9 @@ async def test_jit_empty_message_ids_early_returns(make_synced_db: Callable[[], 
     _seed_synced(conn, 1001)
     client = _TestClient()
     client.get_messages = AsyncMock()
-    server = make_server(conn, client)
+    freshener = make_reaction_freshener(conn, client)
 
-    await server._reaction_freshener.refresh(1001, 1001, [])
+    await freshener.refresh(1001, 1001, [])
 
     assert cast(AsyncMock, client.get_messages).call_count == 0
 
@@ -391,9 +392,9 @@ async def test_jit_unsynced_dialog_early_returns(make_synced_db: Callable[[], sq
     # No synced_dialogs row
     client = _TestClient()
     client.get_messages = AsyncMock()
-    server = make_server(conn, client)
+    freshener = make_reaction_freshener(conn, client)
 
-    await server._reaction_freshener.refresh(1001, 1001, [1, 2, 3])
+    await freshener.refresh(1001, 1001, [1, 2, 3])
 
     assert cast(AsyncMock, client.get_messages).call_count == 0
 
@@ -411,9 +412,9 @@ async def test_jit_fetch_window_never_expanded(make_synced_db: Callable[[], sqli
 
     client = _TestClient()
     client.get_messages = AsyncMock(return_value=[_msg_with_reactions(mid) for mid in ask_ids])
-    server = make_server(conn, client)
+    freshener = make_reaction_freshener(conn, client)
 
-    await server._reaction_freshener.refresh(dialog_id, dialog_id, ask_ids)
+    await freshener.refresh(dialog_id, dialog_id, ask_ids)
 
     assert cast(AsyncMock, client.get_messages).call_count == 1
     assert cast(list[int], _call_kwargs(client.get_messages)["ids"]) == ask_ids
@@ -430,9 +431,9 @@ async def test_jit_reactions_cleared_when_telegram_has_none(make_synced_db: Call
 
     client = _TestClient()
     client.get_messages = AsyncMock(return_value=[_msg_no_reactions(1)])
-    server = make_server(conn, client)
+    freshener = make_reaction_freshener(conn, client)
 
-    await server._reaction_freshener.refresh(dialog_id, dialog_id, [1])
+    await freshener.refresh(dialog_id, dialog_id, [1])
 
     rxn = _fetchone_tuple(
         conn, "SELECT COUNT(*) FROM message_reactions WHERE dialog_id=? AND message_id=1", (dialog_id,)
@@ -454,13 +455,16 @@ async def test_jit_reactions_cleared_when_telegram_has_none(make_synced_db: Call
 
 
 @pytest.mark.asyncio
-async def test_list_messages_triggers_jit_on_cold_read(make_synced_db: Callable[[], sqlite3.Connection]) -> None:
-    """AC-3 end-to-end through _list_messages: one get_messages, reactions in response."""
+async def test_list_messages_uses_cached_reactions_without_jit(
+    make_synced_db: Callable[[], sqlite3.Connection],
+) -> None:
+    """list_messages projects stored reactions and never calls Telegram."""
     conn = make_synced_db()
     dialog_id = 1001
     _seed_synced(conn, dialog_id)
     for mid in range(1, 6):
         _seed_message(conn, dialog_id, mid)
+        _seed_reaction(conn, dialog_id, mid, "❤", 2)
 
     client = _TestClient()
     client.get_messages = AsyncMock(return_value=[_msg_with_reactions(mid, "❤", 2) for mid in range(1, 6)])
@@ -470,10 +474,12 @@ async def test_list_messages_triggers_jit_on_cold_read(make_synced_db: Callable[
     result = await server._dispatch({"method": "list_messages", "dialog_id": dialog_id, "limit": 10})
 
     assert result["ok"] is True
-    assert cast(AsyncMock, client.get_messages).call_count == 1
+    assert cast(AsyncMock, client.get_messages).call_count == 0
     msgs = cast(list[dict[str, object]], cast(dict[str, object], result["data"])["messages"])
     assert msgs
     assert any(m.get("reactions_display") for m in msgs)
+    freshness = cast(dict[str, object], cast(dict[str, object], result["data"])["reaction_freshness"])
+    assert freshness["status"] == "cached_only"
 
 
 @pytest.mark.asyncio
@@ -499,8 +505,8 @@ async def test_list_messages_skips_jit_when_all_fresh(make_synced_db: Callable[[
 
 
 @pytest.mark.asyncio
-async def test_list_messages_page1_fresh_page2_cold(make_synced_db: Callable[[], sqlite3.Connection]) -> None:
-    """AC-4-PAGED end-to-end: simulate by pre-seeding freshness for half ids."""
+async def test_list_messages_ignores_reaction_freshness_ttl(make_synced_db: Callable[[], sqlite3.Connection]) -> None:
+    """Read-path freshness TTL never triggers Telegram RPC."""
     conn = make_synced_db()
     dialog_id = 1001
     _seed_synced(conn, dialog_id)
@@ -517,15 +523,12 @@ async def test_list_messages_page1_fresh_page2_cold(make_synced_db: Callable[[],
     result = await server._dispatch({"method": "list_messages", "dialog_id": dialog_id, "limit": 10})
 
     assert result["ok"] is True
-    assert cast(AsyncMock, client.get_messages).call_count == 1
-    # Only the 5 cold ids fetched
-    fetched_ids = sorted(cast(list[int], _call_kwargs(client.get_messages)["ids"]))
-    assert fetched_ids == [6, 7, 8, 9, 10]
+    assert cast(AsyncMock, client.get_messages).call_count == 0
 
 
 @pytest.mark.asyncio
 async def test_list_messages_context_window_wiring(make_synced_db: Callable[[], sqlite3.Connection]) -> None:
-    """Context-window path triggers JIT for the surrounding slice."""
+    """Context-window path also stays local-only."""
     conn = make_synced_db()
     dialog_id = 1001
     _seed_synced(conn, dialog_id)
@@ -547,12 +550,12 @@ async def test_list_messages_context_window_wiring(make_synced_db: Callable[[], 
     )
 
     assert result["ok"] is True
-    assert cast(AsyncMock, client.get_messages).call_count == 1
+    assert cast(AsyncMock, client.get_messages).call_count == 0
 
 
 @pytest.mark.asyncio
-async def test_search_messages_scoped_triggers_jit(make_synced_db: Callable[[], sqlite3.Connection]) -> None:
-    """Scoped search (dialog_id provided) triggers JIT freshen."""
+async def test_search_messages_scoped_skips_jit(make_synced_db: Callable[[], sqlite3.Connection]) -> None:
+    """Scoped search does not call Telegram for optional reaction refresh."""
     conn = make_synced_db()
     dialog_id = 1001
     _seed_synced(conn, dialog_id)
@@ -580,8 +583,7 @@ async def test_search_messages_scoped_triggers_jit(make_synced_db: Callable[[], 
     )
 
     assert result["ok"] is True
-    # JIT fired exactly once for the scoped search
-    assert cast(AsyncMock, client.get_messages).call_count == 1
+    assert cast(AsyncMock, client.get_messages).call_count == 0
 
 
 @pytest.mark.asyncio
@@ -629,7 +631,7 @@ async def test_list_unread_messages_injects_reactions(make_synced_db: Callable[[
     for mid in [11, 12, 13]:
         _seed_message(conn, dialog_id, mid)
         _seed_reaction(conn, dialog_id, mid, "🔥", 3)
-    # Pre-mark fresh so JIT does not fire (we just want to test reaction injection)
+    # Freshness rows are irrelevant to read-path projection; stored reactions are enough.
     _seed_freshness(conn, dialog_id, [11, 12, 13], int(time.time()) - 50)
     conn.commit()
 
@@ -650,10 +652,10 @@ async def test_list_unread_messages_injects_reactions(make_synced_db: Callable[[
     freshness = cast(dict[str, object], groups[0]["reaction_freshness"])
     assert freshness == {
         "requested_count": 3,
-        "fresh_count": 3,
+        "fresh_count": 0,
         "stale_count": 0,
         "refreshed_count": 0,
-        "status": "fresh",
+        "status": "cached_only",
         "retry_after": None,
     }
 
@@ -693,8 +695,8 @@ async def test_unread_group_without_stored_messages_omits_freshness(
 
 
 @pytest.mark.asyncio
-async def test_list_unread_messages_triggers_jit_on_cold_read(make_synced_db: Callable[[], sqlite3.Connection]) -> None:
-    """Unread path JIT wiring: cold read fires get_messages."""
+async def test_list_unread_messages_skips_jit_on_cold_read(make_synced_db: Callable[[], sqlite3.Connection]) -> None:
+    """Unread path remains local-only even when reaction freshness is cold."""
     conn = make_synced_db()
     dialog_id = 1001
     _seed_synced(conn, dialog_id)
@@ -714,7 +716,7 @@ async def test_list_unread_messages_triggers_jit_on_cold_read(make_synced_db: Ca
     result = await server._dispatch({"method": "get_inbox", "scope": "personal", "limit": 100})
 
     assert result["ok"] is True
-    assert cast(AsyncMock, client.get_messages).call_count == 1
+    assert cast(AsyncMock, client.get_messages).call_count == 0
 
 
 @pytest.mark.asyncio

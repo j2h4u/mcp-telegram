@@ -89,6 +89,10 @@ reconciliation_hourly_seconds = 49
 delta_catch_up_interval_seconds = 50
 delta_catch_up_max_probes_per_cycle = 7
 delta_catch_up_probe_pause_seconds = 3
+message_fact_refresh_seconds = 52
+message_fact_refresh_reaction_max_messages_per_cycle = 6
+message_fact_refresh_read_at_max_messages_per_cycle = 7
+message_fact_refresh_pause_seconds = 4
 activity_hot_sweep_seconds = 51
 
 [http]
@@ -117,6 +121,10 @@ port = 3200
         delta_catch_up_interval_seconds=50.0,
         delta_catch_up_max_probes_per_cycle=7,
         delta_catch_up_probe_pause_seconds=3.0,
+        message_fact_refresh_seconds=52.0,
+        message_fact_refresh_reaction_max_messages_per_cycle=6,
+        message_fact_refresh_read_at_max_messages_per_cycle=7,
+        message_fact_refresh_pause_seconds=4.0,
         activity_hot_sweep_seconds=51.0,
         scheduled_flood_sleep_threshold_seconds=0,
     )
@@ -133,6 +141,10 @@ def test_runtime_environment_overrides_are_parsed_by_config_model() -> None:
             "DELTA_CATCH_UP_INTERVAL_SECONDS": "54",
             "DELTA_CATCH_UP_MAX_PROBES_PER_CYCLE": "8",
             "DELTA_CATCH_UP_PROBE_PAUSE_SECONDS": "9",
+            "MESSAGE_FACT_REFRESH_SECONDS": "55",
+            "MESSAGE_FACT_REFRESH_REACTION_MAX_MESSAGES_PER_CYCLE": "6",
+            "MESSAGE_FACT_REFRESH_READ_AT_MAX_MESSAGES_PER_CYCLE": "7",
+            "MESSAGE_FACT_REFRESH_PAUSE_SECONDS": "7",
             "ACTIVITY_HOT_SWEEP_SECONDS": "49",
             "ACTIVITY_COLD_BACKFILL_SECONDS": "50",
             "ACTIVITY_COLD_BACKFILL_BATCH_PAUSE": "51",
@@ -157,6 +169,10 @@ def test_runtime_environment_overrides_are_parsed_by_config_model() -> None:
         delta_catch_up_interval_seconds=54.0,
         delta_catch_up_max_probes_per_cycle=8,
         delta_catch_up_probe_pause_seconds=9.0,
+        message_fact_refresh_seconds=55.0,
+        message_fact_refresh_reaction_max_messages_per_cycle=6,
+        message_fact_refresh_read_at_max_messages_per_cycle=7,
+        message_fact_refresh_pause_seconds=7.0,
         activity_hot_sweep_seconds=49.0,
         activity_cold_backfill_seconds=50.0,
         activity_cold_backfill_batch_pause_seconds=51.0,
