@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from pathlib import Path
 from typing import Protocol, cast
@@ -23,7 +24,13 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from helpers import build_mock_message
-from mcp_telegram.delta_sync import DeltaCatchUpPolicy, DeltaSyncWorker, _DeltaSyncClient, run_delta_catch_up_loop
+from mcp_telegram.delta_sync import (
+    AccessProbePolicy,
+    DeltaCatchUpPolicy,
+    DeltaSyncWorker,
+    _DeltaSyncClient,
+    run_delta_catch_up_loop,
+)
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 
 
@@ -35,6 +42,8 @@ class _SQLiteCursor(Protocol):
 
 class _SQLiteConnection(Protocol):
     def execute(self, sql: str, parameters: tuple[object, ...] = ()) -> _SQLiteCursor: ...
+
+    def executemany(self, sql: str, seq_of_parameters: list[tuple[object, ...]]) -> _SQLiteCursor: ...
 
     def commit(self) -> None: ...
 
@@ -55,6 +64,21 @@ class _MockClient:
         self.is_connected = MagicMock(return_value=True)
         self.get_messages = MagicMock()
         self.iter_messages = _empty_async_iter
+
+
+def _access_probe_policy(
+    *,
+    interval_seconds: float = 86_400.0,
+    max_dialogs_per_cycle: int = 3,
+    cooldown_seconds: int = 604_800,
+    probe_pause_seconds: float = 0.0,
+) -> AccessProbePolicy:
+    return AccessProbePolicy(
+        interval_seconds=interval_seconds,
+        max_dialogs_per_cycle=max_dialogs_per_cycle,
+        cooldown_seconds=cooldown_seconds,
+        probe_pause_seconds=probe_pause_seconds,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -382,6 +406,11 @@ async def test_delta_access_lost_handled(
     assert row is not None
     assert row[0] == "access_lost"
     assert row[1] is not None
+    event = sync_db.execute(
+        "SELECT kind, dialog_id FROM daemon_events WHERE dialog_id=?",
+        (dialog_id,),
+    ).fetchone()
+    assert event == ("access_lost", dialog_id)
 
 
 @pytest.mark.asyncio
@@ -601,6 +630,7 @@ async def test_probe_restores_access_after_gap_fill(
         cast(sqlite3.Connection, sync_db),
         shutdown_event,
         delta_worker,
+        _access_probe_policy(),
     )
 
     assert restored == 1
@@ -626,6 +656,11 @@ async def test_probe_restores_access_after_gap_fill(
     assert dialog_row[0] == 0  # visible again after access recovery
     assert dialog_row[1] == 1  # queued for reconciliation refresh
     assert dialog_row[2] != 1000
+    event = sync_db.execute(
+        "SELECT kind, dialog_id FROM daemon_events WHERE dialog_id=?",
+        (dialog_id,),
+    ).fetchone()
+    assert event == ("access_restored", dialog_id)
 
 
 @pytest.mark.asyncio
@@ -671,28 +706,33 @@ async def test_probe_gap_fill_failure_keeps_access_lost(
         cast(sqlite3.Connection, sync_db),
         shutdown_event,
         delta_worker,
+        _access_probe_policy(),
     )
 
     assert restored == 0  # not restored because gap-fill failed
     row = cast(
         tuple[object | None, ...] | None,
         sync_db.execute(
-            "SELECT status, access_lost_at FROM synced_dialogs WHERE dialog_id = ?",
+            "SELECT status, access_lost_at, access_last_revalidated_at, access_next_revalidate_at "
+            "FROM synced_dialogs WHERE dialog_id = ?",
             (dialog_id,),
         ).fetchone(),
     )
     assert row is not None
     assert row[0] == "access_lost"  # status unchanged
     assert row[1] == 1000  # access_lost_at unchanged
+    assert isinstance(row[2], int)
+    assert isinstance(row[3], int)
+    assert row[3] >= row[2]
 
 
 @pytest.mark.asyncio
-async def test_probe_still_lost_unchanged(
+async def test_probe_still_lost_stamps_next_revalidation(
     sync_db: _SQLiteConnection,
     mock_client: _MockClient,
     shutdown_event: asyncio.Event,
 ) -> None:
-    """Probe leaves status unchanged when access is still lost."""
+    """Probe leaves status unchanged and schedules a cold retry."""
     from unittest.mock import AsyncMock
 
     from telethon.errors import ChannelPrivateError
@@ -718,16 +758,21 @@ async def test_probe_still_lost_unchanged(
         cast(sqlite3.Connection, sync_db),
         shutdown_event,
         delta_worker,
+        _access_probe_policy(),
     )
 
     assert restored == 0
     row = sync_db.execute(
-        "SELECT status, access_lost_at FROM synced_dialogs WHERE dialog_id = ?",
+        "SELECT status, access_lost_at, access_last_revalidated_at, access_next_revalidate_at "
+        "FROM synced_dialogs WHERE dialog_id = ?",
         (dialog_id,),
     ).fetchone()
     assert row is not None
     assert row[0] == "access_lost"
     assert row[1] == 1000  # unchanged
+    assert isinstance(row[2], int)
+    assert isinstance(row[3], int)
+    assert row[3] == row[2] + 604_800
 
 
 @pytest.mark.asyncio
@@ -770,6 +815,7 @@ async def test_probe_restores_access_creates_missing_dialog_row(
         cast(sqlite3.Connection, sync_db),
         shutdown_event,
         delta_worker,
+        _access_probe_policy(),
     )
 
     row = cast(
@@ -816,44 +862,105 @@ async def test_probe_loop_runs_immediately_then_shutdown(shutdown_event: asyncio
             cast(sqlite3.Connection, conn),
             shutdown_event,
             delta_worker,
+            _access_probe_policy(),
             initial_delay=0.0,
-            interval=86400.0,
         )
         # Probe was called exactly once (immediate run, then shutdown)
         mock_probe.assert_called_once()
 
 
 @pytest.mark.asyncio
-async def test_probe_access_lost_uses_named_probe_pacing(shutdown_event: asyncio.Event) -> None:
-    """Access-loss probes sleep via the module pacing config after each dialog."""
+async def test_probe_selects_only_due_access_lost_with_cycle_budget(
+    sync_db: _SQLiteConnection,
+    mock_client: _MockClient,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """Cold access revalidation must not probe every lost dialog in one pass."""
+    from unittest.mock import AsyncMock
+
+    from telethon.errors import ChannelPrivateError
+
+    from mcp_telegram.delta_sync import DeltaSyncWorker, _probe_access_lost_dialogs
+
+    due_first = 9101
+    due_second = 9102
+    not_due = 9103
+    future = int(time.time()) + 86_400
+    sync_db.executemany(
+        "INSERT INTO synced_dialogs (dialog_id, status, access_lost_at, access_next_revalidate_at) "
+        "VALUES (?, 'access_lost', ?, ?)",
+        [
+            (due_first, 1000, None),
+            (due_second, 1001, None),
+            (not_due, 1002, future),
+        ],
+    )
+    sync_db.commit()
+    mock_client.get_messages = AsyncMock(side_effect=ChannelPrivateError(request=None))
+    delta_worker = DeltaSyncWorker(
+        cast(_DeltaSyncClient, mock_client), cast(sqlite3.Connection, sync_db), shutdown_event
+    )
+
+    restored = await _probe_access_lost_dialogs(
+        cast(_DeltaSyncClient, mock_client),
+        cast(sqlite3.Connection, sync_db),
+        shutdown_event,
+        delta_worker,
+        _access_probe_policy(max_dialogs_per_cycle=1),
+    )
+
+    assert restored == 0
+    cast(AsyncMock, mock_client.get_messages).assert_called_once()
+    assert cast(AsyncMock, mock_client.get_messages).call_args.kwargs["entity"] == due_first
+    rows = dict(
+        cast(
+            list[tuple[int, int | None]],
+            sync_db.execute(
+                "SELECT dialog_id, access_last_revalidated_at FROM synced_dialogs ORDER BY dialog_id"
+            ).fetchall(),
+        )
+    )
+    assert rows[due_first] is not None
+    assert rows[due_second] is None
+    assert rows[not_due] is None
+
+
+@pytest.mark.asyncio
+async def test_probe_flood_wait_stops_account_pass(
+    sync_db: _SQLiteConnection,
+    mock_client: _MockClient,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """FloodWait is account-global: do not continue to the next lost dialog."""
     from unittest.mock import AsyncMock, patch
 
-    from mcp_telegram.delta_sync import _PACING, DeltaSyncWorker, _probe_access_lost_dialogs
+    from telethon.errors import FloodWaitError
 
-    class _ProbeClient:
-        def __init__(self) -> None:
-            self.get_messages = AsyncMock(side_effect=OSError("temporary failure"))
-            self.iter_messages = _empty_async_iter
+    from mcp_telegram.delta_sync import DeltaSyncWorker, _probe_access_lost_dialogs
 
-    client = _ProbeClient()
-    conn = MagicMock()
-    conn.execute = MagicMock(return_value=MagicMock(fetchall=MagicMock(return_value=[(9101,)])))
-    delta_worker = MagicMock(spec=DeltaSyncWorker)
-    sleep_calls: list[float] = []
+    sync_db.executemany(
+        "INSERT INTO synced_dialogs (dialog_id, status, access_lost_at) VALUES (?, 'access_lost', ?)",
+        [(9201, 1000), (9202, 1001)],
+    )
+    sync_db.commit()
+    err = FloodWaitError(request=None)
+    err.seconds = 30
+    mock_client.get_messages = AsyncMock(side_effect=err)
+    delta_worker = DeltaSyncWorker(
+        cast(_DeltaSyncClient, mock_client), cast(sqlite3.Connection, sync_db), shutdown_event
+    )
 
-    async def _fake_sleep(seconds: float) -> None:
-        sleep_calls.append(seconds)
-
-    with patch("mcp_telegram.delta_sync.asyncio.sleep", side_effect=_fake_sleep):
+    with patch("mcp_telegram.delta_sync.sleep_through_flood", new=AsyncMock(return_value=False)):
         restored = await _probe_access_lost_dialogs(
-            cast(_DeltaSyncClient, client),
-            cast(sqlite3.Connection, conn),
+            cast(_DeltaSyncClient, mock_client),
+            cast(sqlite3.Connection, sync_db),
             shutdown_event,
             delta_worker,
+            _access_probe_policy(max_dialogs_per_cycle=2),
         )
 
     assert restored == 0
-    assert sleep_calls == [_PACING.history.probe_s]
+    cast(AsyncMock, mock_client.get_messages).assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -879,8 +986,8 @@ async def test_probe_loop_shutdown_during_initial_delay(shutdown_event: asyncio.
         cast(sqlite3.Connection, conn),
         shutdown_event,
         delta_worker,
+        _access_probe_policy(),
         initial_delay=10.0,
-        interval=86400.0,
     )
     # Should return without error — no probes performed
     client.get_messages.assert_not_called()

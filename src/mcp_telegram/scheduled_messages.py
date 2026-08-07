@@ -32,6 +32,7 @@ from .own_only import (
     enroll_own_only_dialog,
     query_own_only_candidates,
 )
+from .sync_db import set_access_lost
 from .telegram_access import ACCESS_LOST_ERRORS
 from .telegram_gateway import ScheduledHistoryClient, fetch_scheduled_history_snapshot
 
@@ -295,6 +296,8 @@ def _record_retry(conn: sqlite3.Connection, retry_at: int, error: str) -> None:
 def _log_own_only_entity_rpc_error(conn: sqlite3.Connection, dialog_id: int, exc: RPCError) -> None:
     log_context = dialog_log_context(conn, dialog_id)
     if isinstance(exc, ACCESS_LOST_ERRORS):
+        now = int(time.time())
+        set_access_lost(conn, dialog_id, now, reason=type(exc).__name__)
         logger.warning(
             "scheduled_own_only_access_lost dialog_id=%d name=%r type=%s archived=%s hidden=%s reason=%s error=%s",
             dialog_id,
