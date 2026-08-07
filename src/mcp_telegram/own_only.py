@@ -115,18 +115,20 @@ def classify_own_only_dialog(
 
 
 _OWN_ONLY_CANDIDATE_SQL = """
-SELECT dialog_id, name, type, linked_chat_id, last_message_at
-FROM dialogs
+SELECT d.dialog_id, d.name, d.type, d.linked_chat_id, d.last_message_at
+FROM dialogs d
+LEFT JOIN synced_dialogs sd ON sd.dialog_id = d.dialog_id
 WHERE (
-      type IN ('user', 'bot')
-      OR type = 'channel'
-      OR dialog_id IN (
+      d.type IN ('user', 'bot')
+      OR d.type = 'channel'
+      OR d.dialog_id IN (
           SELECT linked_chat_id
           FROM dialogs
           WHERE dialog_id = ? AND linked_chat_id IS NOT NULL
       )
   )
-ORDER BY dialog_id
+  AND COALESCE(sd.status, '') != 'access_lost'
+ORDER BY d.dialog_id
 """
 
 

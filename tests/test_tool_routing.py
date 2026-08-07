@@ -1761,6 +1761,8 @@ async def test_get_sync_status_via_daemon():
         "delete_detection": "reliable (channel)",
         "sync_coverage_pct": None,
         "access_lost_at": None,
+        "access_last_revalidated_at": None,
+        "access_next_revalidate_at": None,
         "action": "Full history was fetched as of last_synced_at; ongoing freshness is represented by local_knowledge_at. sync_progress is a message_id offset, not a count. Treat sync_coverage_pct as an approximate local-vs-Telegram ratio.",
         "time_context": {
             "timezone": "UTC",

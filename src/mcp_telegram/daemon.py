@@ -62,6 +62,7 @@ from .activity_sync import _ActivityClient, run_activity_sync_loop
 from .config import McpTelegramConfig, SchedulingConfig, load_config, resolve_scheduling_config
 from .daemon_api import DaemonApiPolicy, DaemonAPIServer, DaemonClientLike
 from .delta_sync import (
+    AccessProbePolicy,
     DeltaCatchUpPolicy,
     DeltaSyncWorker,
     _DeltaSyncClient,
@@ -732,6 +733,15 @@ def _delta_catch_up_policy_from_scheduling(scheduling: SchedulingConfig) -> Delt
     )
 
 
+def _access_probe_policy_from_scheduling(scheduling: SchedulingConfig) -> AccessProbePolicy:
+    return AccessProbePolicy(
+        interval_seconds=scheduling.access_probe_interval_seconds,
+        max_dialogs_per_cycle=scheduling.access_probe_max_dialogs_per_cycle,
+        cooldown_seconds=scheduling.access_probe_cooldown_seconds,
+        probe_pause_seconds=scheduling.access_probe_pause_seconds,
+    )
+
+
 def _telegram_rpc_budget_from_config(config: McpTelegramConfig) -> TelegramRpcBudget:
     return TelegramRpcBudget(
         max_calls_per_period=config.telegram_rpc.max_calls_per_period,
@@ -1029,7 +1039,13 @@ async def _start_followup_background_tasks(
     )
     _create_tracked_task(
         ctx,
-        run_access_probe_loop(delta_client, ctx.conn, ctx.shutdown_event, delta_worker),
+        run_access_probe_loop(
+            delta_client,
+            ctx.conn,
+            ctx.shutdown_event,
+            delta_worker,
+            _access_probe_policy_from_scheduling(ctx.scheduling),
+        ),
         name="access_probe_loop",
     )
     _create_tracked_task(

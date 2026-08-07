@@ -89,6 +89,8 @@ GET_SYNC_STATUS_OUTPUT_SCHEMA = {
         "delete_detection": {"type": ["string", "null"]},
         "sync_coverage_pct": {"type": ["integer", "null"]},
         "access_lost_at": {"type": ["integer", "null"]},
+        "access_last_revalidated_at": {"type": ["integer", "null"]},
+        "access_next_revalidate_at": {"type": ["integer", "null"]},
         "action": {"type": ["string", "null"]},
     },
     "required": [
@@ -115,6 +117,8 @@ GET_SYNC_STATUS_OUTPUT_SCHEMA = {
         "delete_detection",
         "sync_coverage_pct",
         "access_lost_at",
+        "access_last_revalidated_at",
+        "access_next_revalidate_at",
         "action",
     ],
     "additionalProperties": False,
@@ -378,6 +382,8 @@ async def get_sync_status(args: GetSyncStatus) -> ToolResult:
         "delete_detection": data.get("delete_detection"),
         "sync_coverage_pct": data.get("sync_coverage_pct"),
         "access_lost_at": data.get("access_lost_at"),
+        "access_last_revalidated_at": data.get("access_last_revalidated_at"),
+        "access_next_revalidate_at": data.get("access_next_revalidate_at"),
         "action": _sync_status_action(status, message_count, total_messages, coverage_state),
     }
     return structured_result(structured_content, result_count=1)

@@ -374,6 +374,8 @@ def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.
             sync_progress       INTEGER DEFAULT 0,
             total_messages      INTEGER,
             access_lost_at      INTEGER,
+            access_last_revalidated_at INTEGER,
+            access_next_revalidate_at INTEGER,
             read_inbox_max_id   INTEGER,
             read_outbox_max_id  INTEGER
         )

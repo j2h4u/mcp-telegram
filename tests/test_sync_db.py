@@ -94,6 +94,8 @@ def test_synced_dialogs_schema(tmp_sync_db_path: Path) -> None:
             "last_event_at",
             "last_delta_checked_at",
             "delta_refresh_requested_at",
+            "access_last_revalidated_at",
+            "access_next_revalidate_at",
             "sync_progress",
             "total_messages",
             "access_lost_at",
@@ -108,6 +110,19 @@ def test_synced_dialogs_schema(tmp_sync_db_path: Path) -> None:
         assert default_val is not None and "not_synced" in str(default_val), (
             f"status default should be 'not_synced', got {default_val!r}"
         )
+    finally:
+        conn.close()
+
+
+def test_schema_v31_adds_access_revalidation_and_daemon_events(tmp_sync_db_path: Path) -> None:
+    ensure_sync_schema(tmp_sync_db_path)
+    conn = _open_db(tmp_sync_db_path)
+    try:
+        synced_columns = {row[1] for row in _table_info(conn, "synced_dialogs")}
+        assert "access_last_revalidated_at" in synced_columns
+        assert "access_next_revalidate_at" in synced_columns
+        event_columns = {row[1] for row in _table_info(conn, "daemon_events")}
+        assert {"id", "kind", "dialog_id", "occurred_at", "payload_json"} <= event_columns
     finally:
         conn.close()
 
@@ -1633,7 +1648,7 @@ def test_schema_version_is_current(tmp_sync_db_path: Path) -> None:
     try:
         version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
         assert version == _CURRENT_SCHEMA_VERSION, f"Expected schema version {_CURRENT_SCHEMA_VERSION}, got {version}"
-        assert _CURRENT_SCHEMA_VERSION == 30, f"_CURRENT_SCHEMA_VERSION must be 30, got {_CURRENT_SCHEMA_VERSION}"
+        assert _CURRENT_SCHEMA_VERSION == 31, f"_CURRENT_SCHEMA_VERSION must be 31, got {_CURRENT_SCHEMA_VERSION}"
     finally:
         conn.close()
 

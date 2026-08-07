@@ -1148,10 +1148,7 @@ class DaemonAPIServer:
         - Positive → DM/small group → "best-effort weekly (DM)"
         """
         dialog_id = _coerce_int(req.get("dialog_id", 0), 0)
-        row = cast(
-            tuple[object, object, object, object, object, object, object, object] | None,
-            self._conn.execute(_GET_SYNC_STATUS_SQL, (dialog_id,)).fetchone(),
-        )
+        row = cast(tuple[object, ...] | None, self._conn.execute(_GET_SYNC_STATUS_SQL, (dialog_id,)).fetchone())
 
         if row is not None:
             status = str(row[0])
@@ -1162,6 +1159,7 @@ class DaemonAPIServer:
             access_lost_at = cast(int | None, row[5])
             last_delta_checked_at = cast(int | None, row[6])
             delta_refresh_requested_at = cast(int | None, row[7])
+            access_revalidation = (cast(int | None, row[8]), cast(int | None, row[9]))
         else:
             status = "not_synced"
             last_synced_at = None
@@ -1171,12 +1169,10 @@ class DaemonAPIServer:
             access_lost_at = None
             last_delta_checked_at = None
             delta_refresh_requested_at = None
+            access_revalidation = (None, None)
 
         count_row = cast(tuple[object] | None, self._conn.execute(_COUNT_SYNCED_MESSAGES_SQL, (dialog_id,)).fetchone())
         message_count = int(cast(int | str, count_row[0])) if count_row is not None else 0
-
-        sync_coverage_pct = _compute_sync_coverage(total_messages, message_count)
-        delete_detection = "reliable (channel)" if dialog_id < 0 else "best-effort weekly (DM)"
 
         data: dict = {
             "dialog_id": dialog_id,
@@ -1189,9 +1185,11 @@ class DaemonAPIServer:
             "sync_progress": sync_progress,
             "sync_progress_message_id": sync_progress,
             "total_messages": total_messages,
-            "delete_detection": delete_detection,
-            "sync_coverage_pct": sync_coverage_pct,
+            "delete_detection": "reliable (channel)" if dialog_id < 0 else "best-effort weekly (DM)",
+            "sync_coverage_pct": _compute_sync_coverage(total_messages, message_count),
             "access_lost_at": access_lost_at,
+            "access_last_revalidated_at": access_revalidation[0],
+            "access_next_revalidate_at": access_revalidation[1],
             **build_sync_read_model(
                 status=status,
                 timestamps=(last_synced_at, last_event_at, last_delta_checked_at),
