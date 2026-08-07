@@ -4,7 +4,6 @@ import json
 import os
 import re
 from contextlib import AsyncExitStack
-from datetime import timedelta
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -117,7 +116,7 @@ class StdioMcpClient:
             result = await session.call_tool(
                 name,
                 arguments or {},
-                read_timeout_seconds=timedelta(seconds=self._timeout_seconds),
+                read_timeout_seconds=self._timeout_seconds,
             )
         except Exception as exc:
             raise McpClientError(str(exc)) from exc
@@ -162,9 +161,7 @@ class HttpMcpClient:
 
         exit_stack = AsyncExitStack()
         try:
-            read_stream, write_stream, _get_session_id = await exit_stack.enter_async_context(
-                streamable_http_client(self._url)
-            )
+            read_stream, write_stream = await exit_stack.enter_async_context(streamable_http_client(self._url))
             session = await exit_stack.enter_async_context(ClientSession(read_stream, write_stream))
             await session.initialize()
         except Exception as exc:
@@ -211,7 +208,7 @@ class HttpMcpClient:
             result = await session.call_tool(
                 name,
                 arguments or {},
-                read_timeout_seconds=timedelta(seconds=self._timeout_seconds),
+                read_timeout_seconds=self._timeout_seconds,
             )
         except Exception as exc:
             raise McpClientError(str(exc)) from exc

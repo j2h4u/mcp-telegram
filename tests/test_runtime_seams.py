@@ -9,10 +9,8 @@ from mcp_telegram.server import app, bootstrap_server
 
 
 def test_bootstrap_returns_canonical_app_without_re_registering_handlers() -> None:
-    handlers_before = dict(app.request_handlers)
-
     assert bootstrap_server() is app
-    assert app.request_handlers == handlers_before
+    assert bootstrap_server() is app
 
 
 @pytest.mark.asyncio

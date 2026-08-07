@@ -278,10 +278,10 @@ class MarkDialogForSync(ToolArgs):
     name="mark_dialog_for_sync",
     title="Mark Sync",
     annotations=ToolAnnotations(
-        readOnlyHint=False,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=True,
+        read_only_hint=False,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=True,
     ),
     output_schema=MARK_DIALOG_FOR_SYNC_OUTPUT_SCHEMA,
 )
@@ -326,10 +326,10 @@ class GetSyncStatus(ToolArgs):
     title="Sync Status",
     posture="secondary/helper",
     annotations=ToolAnnotations(
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=False,
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=False,
     ),
     output_schema=GET_SYNC_STATUS_OUTPUT_SCHEMA,
 )
@@ -494,10 +494,10 @@ def _alert_timestamp(alert: dict[str, object]) -> tuple[int, int, int, str]:
     title="Sync Alerts",
     posture="secondary/helper",
     annotations=ToolAnnotations(
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=False,
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=False,
     ),
     output_schema=GET_SYNC_ALERTS_OUTPUT_SCHEMA,
 )

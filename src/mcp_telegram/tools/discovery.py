@@ -300,10 +300,10 @@ class ListDialogs(ToolArgs):
     title="List Dialogs",
     posture="secondary/helper",
     annotations=ToolAnnotations(
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=False,
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=False,
     ),
     output_schema=LIST_DIALOGS_OUTPUT_SCHEMA,
 )
@@ -423,10 +423,10 @@ class ListTopics(ToolArgs):
     title="List Topics",
     posture="secondary/helper",
     annotations=ToolAnnotations(
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=False,
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=False,
     ),
     output_schema=LIST_TOPICS_OUTPUT_SCHEMA,
 )

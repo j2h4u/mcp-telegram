@@ -213,10 +213,10 @@ def _usage_structured_content(stats: dict, *, summary: str, empty: bool) -> dict
     title="Usage Stats",
     posture="secondary/helper",
     annotations=ToolAnnotations(
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=False,
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=False,
     ),
     output_schema=GET_USAGE_STATS_OUTPUT_SCHEMA,
 )
@@ -264,10 +264,10 @@ class GetDialogStats(ToolArgs):
     title="Dialog Stats",
     posture="secondary/helper",
     annotations=ToolAnnotations(
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=False,
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=False,
     ),
     output_schema=GET_DIALOG_STATS_OUTPUT_SCHEMA,
 )

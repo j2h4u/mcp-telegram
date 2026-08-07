@@ -457,10 +457,10 @@ def _structured_messages(
     name="get_inbox",
     title="Inbox",
     annotations=ToolAnnotations(
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=False,
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=False,
     ),
     output_schema=GET_INBOX_OUTPUT_SCHEMA,
 )

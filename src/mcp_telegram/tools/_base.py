@@ -281,7 +281,7 @@ def mcp_tool(
     Usage:
         class MyTool(ToolArgs): ...
 
-        @mcp_tool(name="my_tool", title="My Tool", annotations=ToolAnnotations(readOnlyHint=True))
+        @mcp_tool(name="my_tool", title="My Tool", annotations=ToolAnnotations(read_only_hint=True))
         async def my_tool(args: MyTool) -> ToolResult: ...
     """
 
@@ -323,8 +323,8 @@ def tool_description(exported_name: str, cls: type[ToolArgs], entry: ToolRegistr
         name=exported_name,
         title=entry.title,
         description=cls.__doc__,
-        inputSchema=schema,
-        outputSchema=entry.output_schema,
+        input_schema=schema,
+        output_schema=entry.output_schema,
         annotations=entry.annotations,
     )
 
