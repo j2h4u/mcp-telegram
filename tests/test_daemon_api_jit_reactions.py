@@ -145,9 +145,9 @@ async def test_jit_cold_fetch_updates_state(make_synced_db: Callable[[], sqlite3
 
     client = _TestClient()
     client.get_messages = AsyncMock(return_value=[_msg_with_reactions(mid) for mid in ids])
-    server = make_server(conn, client)
+    freshener = make_reaction_freshener(conn, client)
 
-    await server._reaction_freshener.refresh(dialog_id, dialog_id, ids)
+    await freshener.refresh(dialog_id, dialog_id, ids)
 
     assert cast(AsyncMock, client.get_messages).call_count == 1
     assert cast(list[int], _call_kwargs(client.get_messages)["ids"]) == ids
@@ -177,9 +177,9 @@ async def test_jit_all_fresh_no_api_call(make_synced_db: Callable[[], sqlite3.Co
 
     client = _TestClient()
     client.get_messages = AsyncMock()
-    server = make_server(conn, client)
+    freshener = make_reaction_freshener(conn, client)
 
-    await server._reaction_freshener.refresh(dialog_id, dialog_id, ids)
+    await freshener.refresh(dialog_id, dialog_id, ids)
 
     assert cast(AsyncMock, client.get_messages).call_count == 0
     rxn = _fetchone_tuple(conn, "SELECT COUNT(*) FROM message_reactions WHERE dialog_id=?", (dialog_id,))[0]
@@ -200,9 +200,9 @@ async def test_jit_page1_fresh_page2_cold_partial_fetch(make_synced_db: Callable
 
     client = _TestClient()
     client.get_messages = AsyncMock(return_value=[_msg_with_reactions(mid) for mid in range(31, 61)])
-    server = make_server(conn, client)
+    freshener = make_reaction_freshener(conn, client)
 
-    await server._reaction_freshener.refresh(dialog_id, dialog_id, ids_all)
+    await freshener.refresh(dialog_id, dialog_id, ids_all)
 
     assert cast(AsyncMock, client.get_messages).call_count == 1
     call_ids = cast(list[int], _call_kwargs(client.get_messages)["ids"])
@@ -242,9 +242,9 @@ async def test_jit_partial_stale_subset_fetch(make_synced_db: Callable[[], sqlit
 
     client = _TestClient()
     client.get_messages = AsyncMock(return_value=[_msg_with_reactions(mid) for mid in stale_ids])
-    server = make_server(conn, client)
+    freshener = make_reaction_freshener(conn, client)
 
-    await server._reaction_freshener.refresh(dialog_id, dialog_id, ids)
+    await freshener.refresh(dialog_id, dialog_id, ids)
 
     call_ids = cast(list[int], _call_kwargs(client.get_messages)["ids"])
     assert call_ids == stale_ids
@@ -273,9 +273,9 @@ async def test_jit_ttl_expired_refreshes_no_duplicates(make_synced_db: Callable[
 
     client = _TestClient()
     client.get_messages = AsyncMock(return_value=[_msg_with_reactions(mid, emoji="❤", count=1) for mid in ids])
-    server = make_server(conn, client)
+    freshener = make_reaction_freshener(conn, client)
 
-    await server._reaction_freshener.refresh(dialog_id, dialog_id, ids)
+    await freshener.refresh(dialog_id, dialog_id, ids)
 
     assert cast(AsyncMock, client.get_messages).call_count == 1
     rxn_rows = _fetchall_tuples(
@@ -312,9 +312,9 @@ async def test_jit_floodwait_preserves_stale(make_synced_db: Callable[[], sqlite
     err = FloodWaitError(request=None)
     err.seconds = 30
     client.get_messages = AsyncMock(side_effect=err)
-    server = make_server(conn, client)
+    freshener = make_reaction_freshener(conn, client)
 
-    freshness = await server._reaction_freshener.refresh(dialog_id, dialog_id, ids)
+    freshness = await freshener.refresh(dialog_id, dialog_id, ids)
 
     # reactions untouched
     rxn_rows = _fetchall_tuples(conn, "SELECT count FROM message_reactions WHERE dialog_id=?", (dialog_id,))
@@ -348,9 +348,9 @@ async def test_jit_partial_none_results_skip_freshness_upsert(make_synced_db: Ca
             _msg_with_reactions(5),
         ]
     )
-    server = make_server(conn, client)
+    freshener = make_reaction_freshener(conn, client)
 
-    await server._reaction_freshener.refresh(dialog_id, dialog_id, ids)
+    await freshener.refresh(dialog_id, dialog_id, ids)
 
     fr_ids = sorted(
         cast(int, r[0])
@@ -379,9 +379,9 @@ async def test_jit_empty_message_ids_early_returns(make_synced_db: Callable[[], 
     _seed_synced(conn, 1001)
     client = _TestClient()
     client.get_messages = AsyncMock()
-    server = make_server(conn, client)
+    freshener = make_reaction_freshener(conn, client)
 
-    await server._reaction_freshener.refresh(1001, 1001, [])
+    await freshener.refresh(1001, 1001, [])
 
     assert cast(AsyncMock, client.get_messages).call_count == 0
 
@@ -392,9 +392,9 @@ async def test_jit_unsynced_dialog_early_returns(make_synced_db: Callable[[], sq
     # No synced_dialogs row
     client = _TestClient()
     client.get_messages = AsyncMock()
-    server = make_server(conn, client)
+    freshener = make_reaction_freshener(conn, client)
 
-    await server._reaction_freshener.refresh(1001, 1001, [1, 2, 3])
+    await freshener.refresh(1001, 1001, [1, 2, 3])
 
     assert cast(AsyncMock, client.get_messages).call_count == 0
 
@@ -412,9 +412,9 @@ async def test_jit_fetch_window_never_expanded(make_synced_db: Callable[[], sqli
 
     client = _TestClient()
     client.get_messages = AsyncMock(return_value=[_msg_with_reactions(mid) for mid in ask_ids])
-    server = make_server(conn, client)
+    freshener = make_reaction_freshener(conn, client)
 
-    await server._reaction_freshener.refresh(dialog_id, dialog_id, ask_ids)
+    await freshener.refresh(dialog_id, dialog_id, ask_ids)
 
     assert cast(AsyncMock, client.get_messages).call_count == 1
     assert cast(list[int], _call_kwargs(client.get_messages)["ids"]) == ask_ids
@@ -431,9 +431,9 @@ async def test_jit_reactions_cleared_when_telegram_has_none(make_synced_db: Call
 
     client = _TestClient()
     client.get_messages = AsyncMock(return_value=[_msg_no_reactions(1)])
-    server = make_server(conn, client)
+    freshener = make_reaction_freshener(conn, client)
 
-    await server._reaction_freshener.refresh(dialog_id, dialog_id, [1])
+    await freshener.refresh(dialog_id, dialog_id, [1])
 
     rxn = _fetchone_tuple(
         conn, "SELECT COUNT(*) FROM message_reactions WHERE dialog_id=? AND message_id=1", (dialog_id,)

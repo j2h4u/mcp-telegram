@@ -437,7 +437,6 @@ class DaemonAPIServer:
         self._ready: bool = False
         self.startup_detail: str = "connecting to Telegram"
         self._reading_service: DaemonReadingService | None = None
-        self._reaction_freshener = reaction_freshener
         self._topic_refresher = topic_refresher
         self._policy = policy
         self._health_status = health_status
