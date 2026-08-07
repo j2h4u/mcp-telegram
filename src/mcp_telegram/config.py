@@ -102,7 +102,8 @@ class SchedulingConfig:
     delta_catch_up_max_probes_per_cycle: int = 10
     delta_catch_up_probe_pause_seconds: float = 1.0
     message_fact_refresh_seconds: float = 600.0
-    message_fact_refresh_max_messages_per_cycle: int = 10
+    message_fact_refresh_reaction_max_messages_per_cycle: int = 5
+    message_fact_refresh_read_at_max_messages_per_cycle: int = 5
     message_fact_refresh_pause_seconds: float = 1.0
     activity_hot_sweep_seconds: float = 3_600.0
     activity_cold_backfill_seconds: float = 300.0
@@ -304,10 +305,15 @@ def resolve_scheduling_config(
         message_fact_refresh_seconds=_env_positive_float(
             env, "MESSAGE_FACT_REFRESH_SECONDS", config.message_fact_refresh_seconds
         ),
-        message_fact_refresh_max_messages_per_cycle=_env_non_negative_int(
+        message_fact_refresh_reaction_max_messages_per_cycle=_env_non_negative_int(
             env,
-            "MESSAGE_FACT_REFRESH_MAX_MESSAGES_PER_CYCLE",
-            config.message_fact_refresh_max_messages_per_cycle,
+            "MESSAGE_FACT_REFRESH_REACTION_MAX_MESSAGES_PER_CYCLE",
+            config.message_fact_refresh_reaction_max_messages_per_cycle,
+        ),
+        message_fact_refresh_read_at_max_messages_per_cycle=_env_non_negative_int(
+            env,
+            "MESSAGE_FACT_REFRESH_READ_AT_MAX_MESSAGES_PER_CYCLE",
+            config.message_fact_refresh_read_at_max_messages_per_cycle,
         ),
         message_fact_refresh_pause_seconds=_env_positive_float(
             env,
@@ -550,7 +556,8 @@ def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
         "delta_catch_up_max_probes_per_cycle",
         "delta_catch_up_probe_pause_seconds",
         "message_fact_refresh_seconds",
-        "message_fact_refresh_max_messages_per_cycle",
+        "message_fact_refresh_reaction_max_messages_per_cycle",
+        "message_fact_refresh_read_at_max_messages_per_cycle",
         "message_fact_refresh_pause_seconds",
         "activity_hot_sweep_seconds",
         "activity_cold_backfill_seconds",
@@ -609,12 +616,19 @@ def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
             path,
             defaults.message_fact_refresh_seconds,
         ),
-        message_fact_refresh_max_messages_per_cycle=_non_negative_int(
+        message_fact_refresh_reaction_max_messages_per_cycle=_non_negative_int(
             scheduling_data,
-            "message_fact_refresh_max_messages_per_cycle",
+            "message_fact_refresh_reaction_max_messages_per_cycle",
             "scheduling",
             path,
-            defaults.message_fact_refresh_max_messages_per_cycle,
+            defaults.message_fact_refresh_reaction_max_messages_per_cycle,
+        ),
+        message_fact_refresh_read_at_max_messages_per_cycle=_non_negative_int(
+            scheduling_data,
+            "message_fact_refresh_read_at_max_messages_per_cycle",
+            "scheduling",
+            path,
+            defaults.message_fact_refresh_read_at_max_messages_per_cycle,
         ),
         message_fact_refresh_pause_seconds=_positive_float(
             scheduling_data,

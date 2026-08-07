@@ -71,7 +71,8 @@ class MessageFactRefreshPolicy:
     """Bounded daemon-side policy for optional Telegram fact acquisition."""
 
     interval_seconds: float
-    max_messages_per_cycle: int
+    reaction_max_messages_per_cycle: int
+    read_at_max_messages_per_cycle: int
     pause_seconds: float
     reaction_ttl_seconds: int
     read_at_ttl_seconds: int
@@ -157,14 +158,14 @@ async def refresh_message_facts_once(
     shutdown_event: asyncio.Event | None = None,
 ) -> MessageFactRefreshResult:
     """Refresh a bounded batch of optional message facts into SQLite."""
-    if policy.max_messages_per_cycle <= 0:
+    if policy.reaction_max_messages_per_cycle <= 0 and policy.read_at_max_messages_per_cycle <= 0:
         return MessageFactRefreshResult(0, 0, 0)
 
     checked_at = int(time.time() if now is None else now)
     reaction_rows = _reaction_candidates(
         deps.conn,
         stale_before_utc=checked_at - policy.reaction_ttl_seconds,
-        limit=policy.max_messages_per_cycle,
+        limit=policy.reaction_max_messages_per_cycle,
     )
     reaction_refreshed = 0
     reaction_groups = _group_message_ids(reaction_rows)
@@ -174,11 +175,10 @@ async def refresh_message_facts_once(
         if shutdown_event is not None and index < len(reaction_groups) - 1:
             await _interruptible_pause(shutdown_event, policy.pause_seconds)
 
-    read_at_limit = max(0, policy.max_messages_per_cycle - len(reaction_rows))
     read_at_messages = _read_at_candidates(
         deps.conn,
         stale_before_utc=checked_at - policy.read_at_ttl_seconds,
-        limit=read_at_limit,
+        limit=policy.read_at_max_messages_per_cycle,
     )
     read_at_groups = _group_messages(read_at_messages)
     for index, (dialog_id, messages) in enumerate(read_at_groups.items()):
@@ -209,8 +209,13 @@ async def run_message_fact_refresh_loop(
     policy: MessageFactRefreshPolicy,
 ) -> None:
     """Run low-priority optional fact acquisition until shutdown."""
-    if policy.max_messages_per_cycle <= 0:
-        logger.info("message_fact_refresh_loop disabled — max_messages_per_cycle=%d", policy.max_messages_per_cycle)
+    if policy.reaction_max_messages_per_cycle <= 0 and policy.read_at_max_messages_per_cycle <= 0:
+        logger.info(
+            "message_fact_refresh_loop disabled — reaction_max_messages_per_cycle=%d "
+            "read_at_max_messages_per_cycle=%d",
+            policy.reaction_max_messages_per_cycle,
+            policy.read_at_max_messages_per_cycle,
+        )
         return
 
     while not shutdown_event.is_set():

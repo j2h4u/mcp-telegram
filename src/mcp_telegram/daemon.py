@@ -742,7 +742,8 @@ def _telegram_rpc_budget_from_config(config: McpTelegramConfig) -> TelegramRpcBu
 def _message_fact_refresh_policy_from_config(config: McpTelegramConfig) -> MessageFactRefreshPolicy:
     return MessageFactRefreshPolicy(
         interval_seconds=config.scheduling.message_fact_refresh_seconds,
-        max_messages_per_cycle=config.scheduling.message_fact_refresh_max_messages_per_cycle,
+        reaction_max_messages_per_cycle=config.scheduling.message_fact_refresh_reaction_max_messages_per_cycle,
+        read_at_max_messages_per_cycle=config.scheduling.message_fact_refresh_read_at_max_messages_per_cycle,
         pause_seconds=config.scheduling.message_fact_refresh_pause_seconds,
         reaction_ttl_seconds=config.freshness.reactions.freshness_ttl_seconds,
         read_at_ttl_seconds=config.freshness.read_receipts.read_at_ttl_seconds,

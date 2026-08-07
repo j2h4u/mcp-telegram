@@ -59,10 +59,11 @@ def _make_db() -> sqlite3.Connection:
     return conn
 
 
-def _policy(*, max_messages: int = 10) -> MessageFactRefreshPolicy:
+def _policy(*, reaction_max: int = 10, read_at_max: int = 10) -> MessageFactRefreshPolicy:
     return MessageFactRefreshPolicy(
         interval_seconds=600.0,
-        max_messages_per_cycle=max_messages,
+        reaction_max_messages_per_cycle=reaction_max,
+        read_at_max_messages_per_cycle=read_at_max,
         pause_seconds=0.01,
         reaction_ttl_seconds=600,
         read_at_ttl_seconds=600,
@@ -145,7 +146,7 @@ async def test_refresh_message_facts_once_respects_zero_budget() -> None:
                 cast(ReactionFreshener, reactions),
                 cast(TelegramReadReceiptGateway, read_receipts),
             ),
-            _policy(max_messages=0),
+            _policy(reaction_max=0, read_at_max=0),
             now=2_000,
             shutdown_event=asyncio.Event(),
         )
