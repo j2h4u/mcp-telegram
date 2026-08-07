@@ -85,6 +85,10 @@ from .folders.refresh import FolderRefresher
 from .folders.sqlite_repository import SQLiteFolderSnapshotRepository
 from .folders.telegram_adapter import FolderClient, TelethonTelegramFolderGateway
 from .fts import backfill_fts_index
+from .message_fact_refresh import (
+    MessageFactRefreshPolicy,
+    run_message_fact_refresh_loop,
+)
 from .messages.sqlite_repository import insert_messages_with_fts
 from .messages.telegram_adapter import extract_message_row
 from .own_only import OwnOnlyContext, ensure_own_only_schema
@@ -102,6 +106,7 @@ from .sync_db import (
 )
 from .sync_worker import FullSyncWorker
 from .telegram import create_client
+from .telegram_read_receipts import TelethonTelegramReadReceiptGateway
 from .telegram_rpc import GovernedTelegramClient, GovernedTelegramClientTarget, TelegramRpcBudget, TelegramRpcGovernor
 from .topics.refresh import TopicRefresher
 from .topics.sqlite_repository import SQLiteTopicSnapshotRepository
@@ -228,6 +233,8 @@ class _SyncMainContext:
     feedback_conn: sqlite3.Connection
     shutdown_event: asyncio.Event
     client: _DaemonClient
+    reaction_freshener: ReactionFreshener
+    message_fact_refresh_policy: MessageFactRefreshPolicy
     api_server: DaemonAPIServer
     topic_refresher: TopicRefresher
     socket_path: Path
@@ -732,6 +739,16 @@ def _telegram_rpc_budget_from_config(config: McpTelegramConfig) -> TelegramRpcBu
     )
 
 
+def _message_fact_refresh_policy_from_config(config: McpTelegramConfig) -> MessageFactRefreshPolicy:
+    return MessageFactRefreshPolicy(
+        interval_seconds=config.scheduling.message_fact_refresh_seconds,
+        max_messages_per_cycle=config.scheduling.message_fact_refresh_max_messages_per_cycle,
+        pause_seconds=config.scheduling.message_fact_refresh_pause_seconds,
+        reaction_ttl_seconds=config.freshness.reactions.freshness_ttl_seconds,
+        read_at_ttl_seconds=config.freshness.read_receipts.read_at_ttl_seconds,
+    )
+
+
 def _create_governed_telegram_client(config: McpTelegramConfig) -> _DaemonClient:
     raw_client = create_client(catch_up=True)
     return cast(
@@ -820,6 +837,8 @@ async def _build_sync_main_context() -> _SyncMainContext:
         feedback_conn=feedback_conn,
         shutdown_event=shutdown_event,
         client=client,
+        reaction_freshener=reaction_freshener,
+        message_fact_refresh_policy=_message_fact_refresh_policy_from_config(config),
         api_server=api_server,
         topic_refresher=topic_refresher,
         socket_path=socket_path,
@@ -995,6 +1014,17 @@ async def _start_followup_background_tasks(
             _delta_catch_up_policy_from_scheduling(ctx.scheduling),
         ),
         name="delta_catch_up_loop",
+    )
+    _create_tracked_task(
+        ctx,
+        run_message_fact_refresh_loop(
+            ctx.conn,
+            ctx.reaction_freshener,
+            TelethonTelegramReadReceiptGateway(ctx.client),
+            ctx.shutdown_event,
+            ctx.message_fact_refresh_policy,
+        ),
+        name="message_fact_refresh_loop",
     )
     _create_tracked_task(
         ctx,
