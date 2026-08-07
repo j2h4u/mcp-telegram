@@ -151,8 +151,9 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
                 },
                 "scope": {"type": "string", "enum": ["all", "own_only"]},
                 "folder_id": {"type": ["integer", "null"]},
+                "limit": {"type": ["integer", "null"]},
             },
-            "required": ["exclude_archived", "ignore_pinned", "filter", "message_state", "scope", "folder_id"],
+            "required": ["exclude_archived", "ignore_pinned", "filter", "message_state", "scope", "folder_id", "limit"],
             "additionalProperties": False,
         },
         "snapshot_age_h": {"type": ["integer", "null"]},
@@ -286,6 +287,12 @@ class ListDialogs(ToolArgs):
     message_state: Literal["sent", "scheduled", "all"] = "all"
     scope: Literal["all", "own_only"] = "all"
     folder_id: int | None = Field(default=None, ge=0)
+    limit: int | None = Field(
+        default=None,
+        ge=1,
+        le=500,
+        description="Optional maximum number of dialogs to return after all filters are applied.",
+    )
 
 
 @mcp_tool(
@@ -310,6 +317,7 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
                 message_state=args.message_state,
                 scope=args.scope,
                 folder_id=args.folder_id,
+                limit=args.limit,
             )
     except DaemonNotRunningError as exc:
         return error_result(_daemon_not_running_text(exc))
@@ -367,6 +375,7 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
             "message_state": args.message_state,
             "scope": args.scope,
             "folder_id": args.folder_id,
+            "limit": args.limit,
         },
         "snapshot_age_h": snapshot_age_h,
         "bootstrap_pending": bootstrap_pending,

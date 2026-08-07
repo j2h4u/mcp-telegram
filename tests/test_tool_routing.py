@@ -756,6 +756,7 @@ async def test_list_dialogs_via_daemon():
         "filter": None,
         "message_state": "all",
         "scope": "all",
+        "limit": None,
     }
     first_dialog = _json_dict(dialogs[0])
     assert first_dialog["id"] == 123
@@ -769,6 +770,19 @@ async def test_list_dialogs_via_daemon():
     assert "access_lost_at" in first_dialog
     assert _json_dict(dialogs[1])["synced"] is False
     conn.list_dialogs.assert_called_once()
+
+
+async def test_list_dialogs_passes_limit_to_daemon():
+    """ListDialogs preserves optional limit instead of letting Pydantic drop it as an unknown field."""
+    conn = _make_daemon_conn({"ok": True, "data": {"dialogs": []}})
+    with _patch_daemon(conn):
+        result = await list_dialogs(ListDialogs(limit=1))
+
+    assert result.content == ()
+    payload = _json_dict(result.structured_content)
+    assert _json_dict(payload["filters"])["limit"] == 1
+    conn.list_dialogs.assert_called_once()
+    assert _call_kwargs(conn.list_dialogs)["limit"] == 1
 
 
 async def test_list_dialogs_structured_output_allows_null_name():
