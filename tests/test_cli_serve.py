@@ -11,9 +11,10 @@ def _patch_serve_tasks(monkeypatch: pytest.MonkeyPatch, captured: dict[str, obje
     async def fake_sync_main() -> None:
         await asyncio.Event().wait()
 
-    async def fake_run_mcp_http_server(*, host: str, port: int) -> None:
+    async def fake_run_mcp_http_server(*, host: str, port: int, bearer_token: str | None = None) -> None:
         captured["host"] = host
         captured["port"] = port
+        captured["bearer_token"] = bearer_token
 
     monkeypatch.setattr("mcp_telegram.daemon.sync_main", fake_sync_main)
     monkeypatch.setattr("mcp_telegram.server.run_mcp_http_server", fake_run_mcp_http_server)
@@ -32,7 +33,7 @@ def test_serve_reads_http_bind_from_environment(monkeypatch: pytest.MonkeyPatch)
 
     mcp_telegram.serve()
 
-    assert captured == {"host": "0.0.0.0", "port": 3101}
+    assert captured == {"host": "0.0.0.0", "port": 3101, "bearer_token": None}
 
 
 def test_serve_options_override_environment(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -43,7 +44,7 @@ def test_serve_options_override_environment(monkeypatch: pytest.MonkeyPatch) -> 
 
     mcp_telegram.serve(host="127.0.0.1", port=3200)
 
-    assert captured == {"host": "127.0.0.1", "port": 3200}
+    assert captured == {"host": "127.0.0.1", "port": 3200, "bearer_token": None}
 
 
 def test_serve_uses_operator_http_config_when_no_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -56,10 +57,10 @@ def test_serve_uses_operator_http_config_when_no_overrides(monkeypatch: pytest.M
         "load_config",
         lambda: McpTelegramConfig(
             state=StateConfig(dir=Path("/tmp/mcp-telegram-test")),
-            http=HttpServerConfig(host="localhost", port=3201),
+            http=HttpServerConfig(host="localhost", port=3201, bearer_token="from-config"),
         ),
     )
 
     mcp_telegram.serve()
 
-    assert captured == {"host": "localhost", "port": 3201}
+    assert captured == {"host": "localhost", "port": 3201, "bearer_token": "from-config"}

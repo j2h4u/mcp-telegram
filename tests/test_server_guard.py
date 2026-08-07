@@ -83,3 +83,38 @@ def test_base_has_no_session_disabled_flag() -> None:
     import mcp_telegram.tools._base as _base_mod
 
     assert not hasattr(_base_mod, "_session_disabled"), "_session_disabled was removed — it should not exist in _base"
+
+
+def test_unsafe_http_bind_requires_bearer_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    from mcp_telegram.server import _assert_http_exposure_allowed
+
+    monkeypatch.setenv("MCP_TELEGRAM_HTTP_ALLOW_UNSAFE", "1")
+    monkeypatch.delenv("MCP_TELEGRAM_HTTP_BEARER_TOKEN", raising=False)
+
+    with pytest.raises(RuntimeError, match="MCP_TELEGRAM_HTTP_BEARER_TOKEN"):
+        _assert_http_exposure_allowed("0.0.0.0")
+
+
+def test_unsafe_http_bind_allows_configured_bearer_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    from mcp_telegram.server import _assert_http_exposure_allowed
+
+    monkeypatch.setenv("MCP_TELEGRAM_HTTP_ALLOW_UNSAFE", "1")
+    monkeypatch.setenv("MCP_TELEGRAM_HTTP_BEARER_TOKEN", "secret-token")
+
+    _assert_http_exposure_allowed("0.0.0.0")
+
+
+def test_mcp_http_bearer_authorization() -> None:
+    from mcp_telegram.server import _is_mcp_http_request_authorized
+
+    token = "secret-token"
+    assert _is_mcp_http_request_authorized({"type": "http", "headers": []}, None)
+    assert not _is_mcp_http_request_authorized({"type": "http", "headers": []}, token)
+    assert not _is_mcp_http_request_authorized(
+        {"type": "http", "headers": [(b"authorization", b"Bearer wrong-token")]},
+        token,
+    )
+    assert _is_mcp_http_request_authorized(
+        {"type": "http", "headers": [(b"authorization", b"Bearer secret-token")]},
+        token,
+    )

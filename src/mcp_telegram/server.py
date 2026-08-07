@@ -6,6 +6,7 @@ runs stdio or Streamable HTTP transport loops.
 """
 
 import contextlib
+import hmac
 import ipaddress
 import logging
 import sys
@@ -44,6 +45,7 @@ _ANYIO_CLOSED_RESOURCE_ERROR = ("anyio", "ClosedResourceError")
 _WORKFLOWS_PROMPT_NAME = "telegram_workflows"
 _WORKFLOWS_PROMPT_TITLE = "Telegram workflows"
 _WORKFLOWS_PROMPT_DESCRIPTION = "Reusable scenarios for navigating Telegram through this MCP server."
+_HTTP_AUTHENTICATE_HEADER = b'Bearer realm="mcp-telegram"'
 _WORKFLOWS_PROMPT_TEXT = """Use this guide to choose the right Telegram MCP workflow.
 
 Core contract:
@@ -151,25 +153,64 @@ def _is_loopback_http_host(host: str) -> bool:
         return False
 
 
-def _unsafe_http_exposure_enabled() -> bool:
-    return resolve_http_server_config().allow_unsafe
-
-
-def _assert_http_exposure_allowed(host: str) -> None:
+def _assert_http_exposure_allowed(host: str, *, bearer_token: str | None = None) -> None:
+    http_config = resolve_http_server_config()
+    effective_bearer_token = bearer_token if bearer_token is not None else http_config.bearer_token
     if _is_loopback_http_host(host):
         return
-    if _unsafe_http_exposure_enabled():
+    if http_config.allow_unsafe and effective_bearer_token:
         logger.warning(
             "MCP HTTP server binding to non-loopback host %s with explicit unsafe exposure opt-in",
             host,
         )
         return
+    if http_config.allow_unsafe:
+        raise RuntimeError(
+            "Refusing to bind MCP HTTP transport to non-loopback host "
+            f"{host!r} without bearer-token authentication. Action: set "
+            "MCP_TELEGRAM_HTTP_BEARER_TOKEN before enabling MCP_TELEGRAM_HTTP_ALLOW_UNSAFE."
+        )
     raise RuntimeError(
         "Refusing to bind MCP HTTP transport to non-loopback host "
         f"{host!r}. Action: use --host 127.0.0.1, or set "
         "MCP_TELEGRAM_HTTP_ALLOW_UNSAFE=1 only after restricting network exposure "
-        "and configuring MCP_TELEGRAM_HTTP_ALLOWED_HOSTS."
+        "and configuring MCP_TELEGRAM_HTTP_ALLOWED_HOSTS and MCP_TELEGRAM_HTTP_BEARER_TOKEN."
     )
+
+
+def _authorization_header(scope: Scope) -> str | None:
+    raw_headers = t.cast(object, scope.get("headers", ()))
+    if not isinstance(raw_headers, list):
+        return None
+    headers = t.cast(list[tuple[bytes, bytes]], raw_headers)
+    for name, value in headers:
+        if name.lower() == b"authorization":
+            return value.decode("latin-1")
+    return None
+
+
+def _is_mcp_http_request_authorized(scope: Scope, bearer_token: str | None) -> bool:
+    if bearer_token is None:
+        return True
+    authorization = _authorization_header(scope)
+    if authorization is None:
+        return False
+    scheme, separator, supplied_token = authorization.partition(" ")
+    return bool(separator and scheme.lower() == "bearer" and hmac.compare_digest(supplied_token, bearer_token))
+
+
+async def _send_unauthorized_mcp_http_response(send: Send) -> None:
+    await send(
+        {
+            "type": "http.response.start",
+            "status": 401,
+            "headers": [
+                (b"www-authenticate", _HTTP_AUTHENTICATE_HEADER),
+                (b"content-length", b"0"),
+            ],
+        }
+    )
+    await send({"type": "http.response.body", "body": b""})
 
 
 def _http_allowed_hosts(*, host: str, port: int) -> list[str]:
@@ -354,6 +395,7 @@ async def run_mcp_http_server(
     host: str = "127.0.0.1",
     port: int = 3100,
     mount_path: str = "/mcp",
+    bearer_token: str | None = None,
 ) -> None:
     """Run the MCP server over Streamable HTTP."""
 
@@ -374,7 +416,8 @@ async def run_mcp_http_server(
     )
     _install_mcp_http_disconnect_log_filter()
 
-    _assert_http_exposure_allowed(host)
+    http_bearer_token = bearer_token if bearer_token is not None else resolve_http_server_config().bearer_token
+    _assert_http_exposure_allowed(host, bearer_token=http_bearer_token)
     normalized_mount_path = mount_path if mount_path.startswith("/") else f"/{mount_path}"
     logger.info(
         "MCP HTTP server starting on %s:%d%s — routing through daemon API",
@@ -395,6 +438,9 @@ async def run_mcp_http_server(
     )
 
     async def handle_mcp(scope: Scope, receive: Receive, send: Send) -> None:
+        if not _is_mcp_http_request_authorized(scope, http_bearer_token):
+            await _send_unauthorized_mcp_http_response(send)
+            return
         await session_manager.handle_request(scope, receive, send)
 
     async def handle_health(_: Request) -> JSONResponse:

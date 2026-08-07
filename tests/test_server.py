@@ -353,10 +353,11 @@ def test_http_server_rejects_non_loopback_bind_without_explicit_opt_in(
         server._assert_http_exposure_allowed("0.0.0.0")
 
 
-def test_http_server_allows_non_loopback_bind_with_explicit_opt_in(
+def test_http_server_allows_non_loopback_bind_with_explicit_opt_in_and_bearer_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("MCP_TELEGRAM_HTTP_ALLOW_UNSAFE", "1")
+    monkeypatch.setenv("MCP_TELEGRAM_HTTP_BEARER_TOKEN", "test-token")
 
     server._assert_http_exposure_allowed("0.0.0.0")
 
@@ -608,8 +609,8 @@ async def _fake_build_server_instructions() -> str:
     return "Built"
 
 
-def _fake_assert_exposure_allowed(captured: dict[str, object], host: str) -> None:
-    captured["assert"] = host
+def _fake_assert_exposure_allowed(captured: dict[str, object], host: str, *, bearer_token: str | None = None) -> None:
+    captured["assert"] = {"host": host, "bearer_token": bearer_token}
 
 
 @pytest.mark.asyncio
@@ -636,7 +637,7 @@ async def test_run_mcp_http_server_normalizes_mount_and_builds_transport(
 
     await server.run_mcp_http_server(host="127.0.0.1", port=4100, mount_path="mcp")
 
-    assert captured["assert"] == "127.0.0.1"
+    assert captured["assert"] == {"host": "127.0.0.1", "bearer_token": None}
     assert captured["security"] == {
         "enable_dns_rebinding_protection": True,
         "allowed_hosts": ["127.0.0.1:4100"],

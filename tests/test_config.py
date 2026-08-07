@@ -91,10 +91,11 @@ delta_catch_up_max_probes_per_cycle = 7
 delta_catch_up_probe_pause_seconds = 3
 activity_hot_sweep_seconds = 51
 
-[http]
-host = "localhost"
-port = 3200
-""",
+    [http]
+    host = "localhost"
+    port = 3200
+    bearer_token = "from-config"
+    """,
     )
 
     config = load_config(path)
@@ -120,7 +121,7 @@ port = 3200
         activity_hot_sweep_seconds=51.0,
         scheduled_flood_sleep_threshold_seconds=0,
     )
-    assert config.http == HttpServerConfig(host="localhost", port=3200)
+    assert config.http == HttpServerConfig(host="localhost", port=3200, bearer_token="from-config")
 
 
 def test_runtime_environment_overrides_are_parsed_by_config_model() -> None:
@@ -148,6 +149,7 @@ def test_runtime_environment_overrides_are_parsed_by_config_model() -> None:
             "MCP_TELEGRAM_HTTP_ALLOW_UNSAFE": "yes",
             "MCP_TELEGRAM_HTTP_ALLOWED_HOSTS": "mcp-telegram:3200, localhost:*",
             "MCP_TELEGRAM_HTTP_ALLOWED_ORIGINS": "http://gateway.local",
+            "MCP_TELEGRAM_HTTP_BEARER_TOKEN": "from-env",
         }
     )
 
@@ -171,6 +173,7 @@ def test_runtime_environment_overrides_are_parsed_by_config_model() -> None:
         allow_unsafe=True,
         allowed_hosts=("mcp-telegram:3200", "localhost:*"),
         allowed_origins=("http://gateway.local",),
+        bearer_token="from-env",
     )
 
 
