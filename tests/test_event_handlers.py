@@ -1314,8 +1314,11 @@ async def test_on_message_read_logs_warning_on_null_chat_id(
     shutdown_event: asyncio.Event,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Review-mandated: NULL chat_id (PM read events on some Telethon versions)
-    must log WARNING so ops can see PM read staleness — NOT silently swallowed.
+    """NULL chat_id is observable without falsely implying restart is required.
+
+    Some Telethon PM read events do not expose chat_id. The real-time handler
+    cannot apply those events directly, but regular dialog reconciliation also
+    refreshes cursors from Telegram Dialog state.
     """
     import logging
 
@@ -1326,9 +1329,10 @@ async def test_on_message_read_logs_warning_on_null_chat_id(
     with caplog.at_level(logging.WARNING, logger="mcp_telegram.event_handlers"):
         await manager.on_message_read(event)  # must not raise
 
-    assert any("event_read_null_chat_id" in rec.message for rec in caplog.records), (
-        f"Expected WARNING log; got {[r.message for r in caplog.records]}"
-    )
+    messages = [rec.message for rec in caplog.records]
+    assert any("event_read_null_chat_id" in message for message in messages), f"Expected WARNING log; got {messages}"
+    assert any("dialog reconciliation will refresh cursors" in message for message in messages)
+    assert not any("restart" in message for message in messages)
 
 
 def test_register_adds_message_read_handler(
