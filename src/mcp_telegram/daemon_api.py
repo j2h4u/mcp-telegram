@@ -93,6 +93,10 @@ from .daemon_dialog_queries import (
     build_sync_read_model,
 )
 from .daemon_entity_info import DaemonEntityInfoService, EntityInfoDeps
+from .daemon_message import (
+    cached_reaction_freshness,
+    project_cached_message_facts,
+)
 from .daemon_message_queries import (
     _FETCH_UNREAD_MESSAGES_SQL,
     _read_message_from_row,
@@ -100,7 +104,6 @@ from .daemon_message_queries import (
 from .daemon_read_state_queries import _dialog_type_from_db, _read_state_for_dialog
 from .folders.sqlite_repository import dialog_placement, folders_by_dialog, list_folder_messages, list_folders
 from .models import DialogType, ReadMessage
-from .telegram_fact_queries import enrich_reaction_events, enrich_read_at
 from .topics.contracts import TopicSourceUnavailableError
 from .topics.refresh import TopicRefresher
 
@@ -151,19 +154,16 @@ def _coerce_int(value: object, default: int) -> int:
 
 
 from .budget import allocate_message_budget_proportional, unread_chat_tier
-from .daemon_message import fetch_reaction_counts
 from .daemon_source_export import (
     _describe_source,
     _export_source_changes,
     _read_source_unit_window,
 )
 from .feedback_db import VALID_SEVERITIES, VALID_STATUSES
-from .formatter import format_reaction_counts
 from .reactions.contracts import ReactionFreshness
 from .reactions.refresh import ReactionFreshener
 from .telegram_fragments import FragmentContextService, TelethonTelegramFragmentGateway
 from .telegram_history import TelethonTelegramHistoryGateway
-from .telegram_read_receipts import TelethonTelegramReadReceiptGateway
 
 
 class _LoggerLike(Protocol):
@@ -441,7 +441,6 @@ class DaemonAPIServer:
         self._topic_refresher = topic_refresher
         self._policy = policy
         self._health_status = health_status
-        self._read_receipt_gateway = TelethonTelegramReadReceiptGateway(self._client)
         self._activity_stats_service: _activity_stats.DaemonActivityStatsService | None = None
         self._folder_snapshot_refresh: Callable[[], Awaitable[bool]] | None = None
         self._folder_refresh_lock = asyncio.Lock()
@@ -489,10 +488,7 @@ class DaemonAPIServer:
                         self._conn,
                         TelethonTelegramFragmentGateway(self._client),
                     ),
-                    reaction_freshener=self._reaction_freshener,
                     history_gateway=TelethonTelegramHistoryGateway(self._client),
-                    read_receipt_gateway=self._read_receipt_gateway,
-                    read_at_ttl_seconds=self._policy.read_at_ttl_seconds,
                     logger=cast(ReadingLoggerLike, logger),
                     rid=_rid,
                 )
@@ -1471,29 +1467,16 @@ class DaemonAPIServer:
         dialog_id: int,
         rows: list[Mapping[str, object]],
     ) -> tuple[list[ReadMessage], ReactionFreshness | None]:
-        """Freshen and render reactions for one unread group."""
-        message_ids = [int(cast(int | str, row["message_id"])) for row in rows]
-        if not message_ids:
+        """Render cached optional facts for one unread group without Telegram RPC."""
+        if not rows:
             return [_read_message_from_row(row) for row in rows], None
 
-        freshness = await self._reaction_freshener.refresh(dialog_id, dialog_id, message_ids)
-        reaction_map = fetch_reaction_counts(self._conn, dialog_id, message_ids)
-        messages = [
-            _read_message_from_row(
-                row,
-                reactions_display=format_reaction_counts(reaction_map.get(int(cast(int | str, row["message_id"])), [])),
-            )
-            for row in rows
-        ]
-        messages = enrich_reaction_events(self._conn, dialog_id, messages)
-        messages = await enrich_read_at(
+        messages = project_cached_message_facts(
             self._conn,
-            self._read_receipt_gateway,
             dialog_id,
-            messages,
-            dialog_type=_dialog_type_from_db(self._conn, dialog_id),
-            read_at_ttl_seconds=self._policy.read_at_ttl_seconds,
+            [_read_message_from_row(row) for row in rows],
         )
+        freshness = cached_reaction_freshness(len(messages))
         return messages, freshness
 
     # ------------------------------------------------------------------

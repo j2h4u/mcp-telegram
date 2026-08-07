@@ -1,12 +1,36 @@
 """Message serialization helpers for daemon API responses."""
 
+import dataclasses
 import sqlite3
+from collections.abc import Sequence
 from typing import cast
 
+from .formatter import format_reaction_counts
+from .models import ReadMessage
+from .reactions.contracts import ReactionFreshness
+from .telegram_fact_queries import enrich_reaction_events, read_at_map
 from .telegram_message_projection import MessageLike as _MessageLike
 from .telegram_message_projection import message_to_dict
 
-__all__ = ["_MessageLike", "fetch_reaction_counts", "message_to_dict"]
+__all__ = [
+    "_MessageLike",
+    "cached_reaction_freshness",
+    "fetch_reaction_counts",
+    "message_to_dict",
+    "project_cached_message_facts",
+    "project_cached_message_facts_by_dialog",
+]
+
+
+def cached_reaction_freshness(message_count: int) -> ReactionFreshness:
+    """Return a local-only freshness marker for a projected message page."""
+    return ReactionFreshness(
+        requested_count=message_count,
+        fresh_count=0,
+        stale_count=0,
+        refreshed_count=0,
+        status="cached_only",
+    )
 
 
 def fetch_reaction_counts(
@@ -31,3 +55,43 @@ def fetch_reaction_counts(
     for msg_id, emoji, count in rows:
         result.setdefault(int(msg_id), []).append((str(emoji), int(count)))
     return result
+
+
+def project_cached_message_facts(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    messages: Sequence[ReadMessage],
+) -> list[ReadMessage]:
+    """Attach cached reactions, reaction events, and read dates to messages."""
+    if not messages:
+        return list(messages)
+    message_ids = [message.message_id for message in messages]
+    reaction_map = fetch_reaction_counts(conn, dialog_id, message_ids)
+    read_dates = read_at_map(conn, dialog_id, message_ids)
+    with_reactions = [
+        dataclasses.replace(
+            message,
+            reactions_display=format_reaction_counts(reaction_map.get(message.message_id, [])),
+        )
+        for message in messages
+    ]
+    with_events = enrich_reaction_events(conn, dialog_id, with_reactions)
+    return [dataclasses.replace(message, read_at=read_dates.get(message.message_id)) for message in with_events]
+
+
+def project_cached_message_facts_by_dialog(
+    conn: sqlite3.Connection,
+    messages: Sequence[ReadMessage],
+) -> list[ReadMessage]:
+    """Attach cached facts to a cross-dialog message list while preserving order."""
+    grouped: dict[int, list[tuple[int, ReadMessage]]] = {}
+    for index, message in enumerate(messages):
+        grouped.setdefault(message.dialog_id, []).append((index, message))
+
+    enriched: dict[int, ReadMessage] = {}
+    for dialog_id, indexed_messages in grouped.items():
+        dialog_messages = [message for _, message in indexed_messages]
+        facts = project_cached_message_facts(conn, dialog_id, dialog_messages)
+        for (index, _), message in zip(indexed_messages, facts, strict=True):
+            enriched[index] = message
+    return [enriched[index] for index in range(len(messages))]

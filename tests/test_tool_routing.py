@@ -1576,6 +1576,22 @@ async def test_list_messages_daemon_not_running():
     assert "not running" in text.lower() or "mcp-telegram sync" in text.lower()
 
 
+async def test_list_messages_daemon_response_timeout_is_not_reported_as_not_running():
+    """ListMessages distinguishes daemon IPC stalls from a stopped daemon."""
+
+    @asynccontextmanager
+    async def raising_dc():
+        raise DaemonNotRunningError("Sync daemon timed out waiting for response.", kind="response_timeout")
+        yield  # pragma: no cover
+
+    with patch("mcp_telegram.tools.reading.daemon_connection", raising_dc):
+        result = await list_messages(ListMessages(exact_dialog_id=123))
+
+    text = _result_text(result)
+    assert "did not respond" in text
+    assert "Start it with: mcp-telegram sync" not in text
+
+
 async def test_search_messages_daemon_not_running():
     """SearchMessages returns actionable error when daemon is not running."""
     with _patch_daemon_not_running():

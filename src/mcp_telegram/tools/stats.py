@@ -224,8 +224,8 @@ async def get_usage_stats(args: GetUsageStats) -> ToolResult:
     try:
         async with daemon_connection() as conn:
             response = await conn.get_usage_stats()
-    except DaemonNotRunningError:
-        return error_result(_daemon_not_running_text())
+    except DaemonNotRunningError as exc:
+        return error_result(_daemon_not_running_text(exc))
 
     if not response.get("ok"):
         error_msg = response.get("error", "Unknown error")
@@ -281,8 +281,8 @@ async def get_dialog_stats(args: GetDialogStats) -> ToolResult:
                 dialog=dialog_name,
                 limit=args.top_n,
             )
-    except DaemonNotRunningError:
-        return error_result(_daemon_not_running_text())
+    except DaemonNotRunningError as exc:
+        return error_result(_daemon_not_running_text(exc))
 
     if not response.get("ok"):
         error = response.get("error", "")

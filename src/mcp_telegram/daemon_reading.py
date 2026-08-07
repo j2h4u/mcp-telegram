@@ -29,7 +29,11 @@ from .daemon_dialog_queries import (
     _compute_sync_coverage,
     build_sync_read_model,
 )
-from .daemon_message import fetch_reaction_counts
+from .daemon_message import (
+    cached_reaction_freshness,
+    project_cached_message_facts,
+    project_cached_message_facts_by_dialog,
+)
 from .daemon_message_queries import (
     _LIST_MESSAGES_BASE_SQL,
     _SELECT_FTS_ALL_SQL,
@@ -45,7 +49,6 @@ from .daemon_scheduled_queries import (
     scheduled_row_to_wire,
     scheduled_summary_by_dialog,
 )
-from .formatter import format_reaction_counts
 from .fts import stem_query
 from .models import DialogType, ReadMessage, ReadState
 from .own_only import own_only_basis_by_dialog
@@ -57,15 +60,12 @@ from .pagination import (
     encode_search_navigation,
 )
 from .reactions.contracts import ReactionFreshness
-from .reactions.refresh import ReactionFreshener
 from .resolver import latinize
 from .sync_db import open_sync_db_reader
-from .telegram_fact_queries import enrich_reaction_events, enrich_read_at, read_at_map
 from .telegram_fragments import FragmentContextService
 from .telegram_reading import (
     GatewayFailure,
     TelegramHistoryGateway,
-    TelegramReadReceiptGateway,
 )
 from .temporal import parse_utc_boundary
 
@@ -85,20 +85,6 @@ def _safe_exception_message(exc: BaseException) -> str:
     if not message:
         return type(exc).__name__
     return message
-
-
-def _apply_reaction_displays(
-    messages: Sequence[ReadMessage],
-    reaction_map: Mapping[int, list[tuple[str, int]]],
-) -> list[ReadMessage]:
-    """Attach aggregate reaction displays to a rendered message page."""
-    return [
-        dataclasses.replace(
-            message,
-            reactions_display=format_reaction_counts(reaction_map.get(message.message_id, [])),
-        )
-        for message in messages
-    ]
 
 
 def _log_rendered_message_stats(logger: _LoggerLike, dialog_id: int, messages: Sequence[ReadMessage]) -> None:
@@ -162,12 +148,9 @@ class DaemonReadingDeps:
     self_id: int | None
     resolve_dialog_id: Callable[[int, str | None], Awaitable[int | dict]]
     fragment_context: FragmentContextService
-    reaction_freshener: ReactionFreshener
     history_gateway: TelegramHistoryGateway
     logger: _LoggerLike
     rid: Callable[[], str]
-    read_at_ttl_seconds: int
-    read_receipt_gateway: TelegramReadReceiptGateway | None = None
 
 
 @dataclass(frozen=True)
@@ -728,19 +711,12 @@ class DaemonReadingService:
         *,
         log_rendered: bool,
     ) -> tuple[list[ReadMessage], ReactionFreshness]:
-        msg_ids = [_message_id_from_item(r) for r in rows]
-        freshness = await self._deps.reaction_freshener.refresh(dialog_id, dialog_id, msg_ids)
-        reaction_map = fetch_reaction_counts(self._conn, dialog_id, msg_ids)
-        messages = _apply_reaction_displays([_read_message_from_row(r) for r in rows], reaction_map)
-        messages = enrich_reaction_events(self._conn, dialog_id, messages)
-        messages = await enrich_read_at(
+        messages = project_cached_message_facts(
             self._conn,
-            self._deps.read_receipt_gateway,
             dialog_id,
-            messages,
-            dialog_type=_dialog_type_from_db(self._conn, dialog_id),
-            read_at_ttl_seconds=self._deps.read_at_ttl_seconds,
+            [_read_message_from_row(r) for r in rows],
         )
+        freshness = cached_reaction_freshness(len(messages))
         if log_rendered:
             _log_rendered_message_stats(self._logger, dialog_id, messages)
         return messages, freshness
@@ -754,22 +730,7 @@ class DaemonReadingService:
         Missing fact tables/rows are intentionally represented by the helpers'
         nullable/unavailable defaults.
         """
-        grouped: dict[int, list[tuple[int, ReadMessage]]] = {}
-        for index, message in enumerate(messages):
-            grouped.setdefault(message.dialog_id, []).append((index, message))
-
-        enriched: dict[int, ReadMessage] = {}
-        for dialog_id, indexed_messages in grouped.items():
-            dialog_messages = [message for _, message in indexed_messages]
-            message_ids = [message.message_id for message in dialog_messages]
-            reaction_map = fetch_reaction_counts(self._conn, dialog_id, message_ids)
-            facts = _apply_reaction_displays(dialog_messages, reaction_map)
-            facts = enrich_reaction_events(self._conn, dialog_id, facts)
-            read_dates = read_at_map(self._conn, dialog_id, message_ids)
-            facts = [dataclasses.replace(message, read_at=read_dates.get(message.message_id)) for message in facts]
-            for (index, _), message in zip(indexed_messages, facts, strict=True):
-                enriched[index] = message
-        return [enriched[index] for index in range(len(messages))]
+        return project_cached_message_facts_by_dialog(self._conn, messages)
 
     def _read_state_per_dialog(self, messages: list[ReadMessage]) -> dict[int, ReadState]:
         read_state_per_dialog: dict[int, ReadState] = {}

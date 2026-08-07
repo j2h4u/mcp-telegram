@@ -270,8 +270,8 @@ async def get_my_recent_activity(args: GetMyRecentActivity) -> ToolResult:
                 sent_before=args.sent_before,
                 text_query=args.text_query,
             )
-    except DaemonNotRunningError:
-        return error_result(_daemon_not_running_text())
+    except DaemonNotRunningError as exc:
+        return error_result(_daemon_not_running_text(exc))
 
     if err := _check_daemon_response(response):
         return err
