@@ -39,6 +39,7 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "daemon_api.py",
             "daemon_dialog_queries.py",
             "daemon_entity_info.py",
+            "daemon_log_context.py",
             "daemon_message.py",
             "daemon_read_state_queries.py",
             "daemon_reading.py",

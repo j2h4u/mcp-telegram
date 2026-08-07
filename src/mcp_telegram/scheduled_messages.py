@@ -22,6 +22,7 @@ from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
 from .activity_peer_resolve import resolve_linked_chat_id
 from .activity_sync import _ActivityClient
+from .daemon_log_context import dialog_log_context
 from .fts import stem_text
 from .message_contracts import ExtractedMessage
 from .messages.telegram_adapter import extract_message_row
@@ -31,6 +32,7 @@ from .own_only import (
     enroll_own_only_dialog,
     query_own_only_candidates,
 )
+from .telegram_access import ACCESS_LOST_ERRORS
 from .telegram_gateway import ScheduledHistoryClient, fetch_scheduled_history_snapshot
 
 logger = logging.getLogger(__name__)
@@ -290,6 +292,30 @@ def _record_retry(conn: sqlite3.Connection, retry_at: int, error: str) -> None:
     conn.commit()
 
 
+def _log_own_only_entity_rpc_error(conn: sqlite3.Connection, dialog_id: int, exc: RPCError) -> None:
+    log_context = dialog_log_context(conn, dialog_id)
+    if isinstance(exc, ACCESS_LOST_ERRORS):
+        logger.warning(
+            "scheduled_own_only_access_lost dialog_id=%d name=%r type=%s archived=%s hidden=%s reason=%s error=%s",
+            dialog_id,
+            log_context.name,
+            log_context.type,
+            log_context.archived,
+            log_context.hidden,
+            type(exc).__name__,
+            exc,
+        )
+        return
+    logger.warning(
+        "scheduled_own_only_entity_error dialog_id=%d name=%r type=%s error_type=%s error=%s",
+        dialog_id,
+        log_context.name,
+        log_context.type,
+        type(exc).__name__,
+        exc,
+    )
+
+
 def _clear_retry(conn: sqlite3.Connection, now: int) -> None:
     conn.execute(
         "UPDATE scheduled_sync_state SET next_retry_at=NULL, last_snapshot_at=?, last_error=NULL WHERE key=?",
@@ -401,7 +427,7 @@ class ScheduledMessageReconciler:
                     _record_retry(self._conn, int(time.time()) + max(1, int(exc.seconds)), "FloodWaitError")
                     break
                 except RPCError as exc:
-                    logger.warning("scheduled_own_only_entity_error dialog_id=%d error=%s", dialog_id, exc)
+                    _log_own_only_entity_rpc_error(self._conn, dialog_id, exc)
                     continue
             classification = classify_own_only_dialog(
                 dialog_id=dialog_id,

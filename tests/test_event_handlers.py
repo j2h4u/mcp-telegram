@@ -310,7 +310,7 @@ async def test_auto_enroll_writes_entity_when_sender_available(
 ) -> None:
     """Auto-enroll writes an entities row when get_sender() returns a User."""
     dialog_id = 7010
-    sender = SimpleNamespace(first_name="Ivan", last_name="Zakazov", username="ivan_z")
+    sender = SimpleNamespace(first_name="Fixture", last_name="Person", username="fixture_person")
 
     msg = build_mock_message(id=1, text="hey")
     event = cast(
@@ -333,9 +333,9 @@ async def test_auto_enroll_writes_entity_when_sender_available(
     ).fetchone()
     assert row is not None, "entity must be written when sender is available"
     assert row[1] == "user"
-    assert row[2] == "Ivan Zakazov"
-    assert row[3] == "ivan_z"
-    assert row[4] == "ivan zakazov"
+    assert row[2] == "Fixture Person"
+    assert row[3] == "fixture_person"
+    assert row[4] == "fixture person"
 
 
 @pytest.mark.asyncio

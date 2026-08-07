@@ -607,9 +607,9 @@ async def test_dm_bootstrap_populates_entities(
     from telethon.tl import types  # type: ignore[import-untyped]
 
     user = MagicMock(spec=types.User)
-    user.first_name = "Ivan"
-    user.last_name = "Zakazov"
-    user.username = "ivan_z"
+    user.first_name = "Fixture"
+    user.last_name = "Person"
+    user.username = "fixture_person"
     dialog = SimpleNamespace(entity=user, id=40001)
 
     async def _iter_dialogs():
@@ -626,9 +626,9 @@ async def test_dm_bootstrap_populates_entities(
     ).fetchone()
     assert row is not None, "entities row must be written for the enrolled user"
     assert row[1] == "user"
-    assert row[2] == "Ivan Zakazov"
-    assert row[3] == "ivan_z"
-    assert row[4] == "ivan zakazov"  # latinize("Ivan Zakazov")
+    assert row[2] == "Fixture Person"
+    assert row[3] == "fixture_person"
+    assert row[4] == "fixture person"
 
 
 @pytest.mark.asyncio
