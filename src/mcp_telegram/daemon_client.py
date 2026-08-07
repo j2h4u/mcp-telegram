@@ -464,6 +464,10 @@ class DaemonConnection:
         """Write a telemetry event to sync.db."""
         return await self.request({"method": "record_telemetry", "event": event})
 
+    async def list_important_events(self, *, last_hours: int = 24, timezone: str = "UTC") -> dict:
+        """Return recent daemon-observed important events."""
+        return await self.request({"method": "list_important_events", "last_hours": last_hours, "timezone": timezone})
+
     async def get_usage_stats(self, *, since: int | None = None) -> dict:
         """Return usage statistics from sync.db."""
         payload: dict = {"method": "get_usage_stats"}

@@ -32,6 +32,7 @@ from mcp_telegram.tools import (
     ListDialogs,
     ListFolderMessages,
     ListFolders,
+    ListImportantEvents,
     ListMessages,
     ListTopics,
     MarkDialogForSync,
@@ -46,6 +47,7 @@ from mcp_telegram.tools import (
     list_dialogs,
     list_folder_messages,
     list_folders,
+    list_important_events,
     list_messages,
     list_topics,
     mark_dialog_for_sync,
@@ -136,6 +138,7 @@ class _DaemonConnStub:
     list_dialogs: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
     list_folders: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
     list_folder_messages: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
+    list_important_events: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
     list_topics: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
     get_me: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
     mark_dialog_for_sync: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
@@ -216,6 +219,28 @@ STRUCTURED_TOOL_CASES = {
         list_folders,
         ListFolders(),
         {"ok": True, "data": {"folders": [{"id": 2, "title": "Work"}]}},
+    ),
+    "list_important_events": (
+        list_important_events,
+        ListImportantEvents(last_hours=6, timezone="Asia/Almaty"),
+        {
+            "ok": True,
+            "data": {
+                "timezone": "Asia/Almaty",
+                "last_hours": 6,
+                "events": [
+                    {
+                        "time": "2026-08-08T12:00:00+05:00",
+                        "time_basis": "observed",
+                        "type": "access_lost",
+                        "summary": "Access lost",
+                        "dialog_id": 123,
+                        "dialog_title": "Work Chat",
+                        "message_id": None,
+                    }
+                ],
+            },
+        },
     ),
     "list_dialogs": (
         list_dialogs,
@@ -619,6 +644,7 @@ def _make_daemon_conn(response: dict | None = None) -> _DaemonConnStub:
     conn.list_dialogs = _AsyncMethodMock(return_value=r)
     conn.list_folders = _AsyncMethodMock(return_value=r)
     conn.list_folder_messages = _AsyncMethodMock(return_value=r)
+    conn.list_important_events = _AsyncMethodMock(return_value=r)
     conn.list_topics = _AsyncMethodMock(return_value=r)
     conn.get_me = _AsyncMethodMock(return_value=r)
     conn.mark_dialog_for_sync = _AsyncMethodMock(return_value=r)
@@ -661,6 +687,7 @@ class _patch_daemon:
             "mcp_telegram.tools.account_trace.daemon_connection",
             "mcp_telegram.tools.feedback.daemon_connection",
             "mcp_telegram.tools.folders.daemon_connection",
+            "mcp_telegram.tools.important_events.daemon_connection",
         ]
         for target in targets:
             p = patch(target, side_effect=lambda c=self._conn: _fake_daemon_cm(c))
@@ -695,6 +722,7 @@ class _patch_daemon_not_running:
             "mcp_telegram.tools.account_trace.daemon_connection",
             "mcp_telegram.tools.feedback.daemon_connection",
             "mcp_telegram.tools.folders.daemon_connection",
+            "mcp_telegram.tools.important_events.daemon_connection",
         ]
         for target in targets:
             p = patch(target, return_value=_raise_not_running())

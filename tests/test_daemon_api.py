@@ -29,7 +29,7 @@ from mcp_telegram.flood import FloodWaitKillSwitchStatus
 from mcp_telegram.folders.sqlite_repository import replace_folder_snapshot
 from mcp_telegram.fts import MESSAGES_FTS_DDL, stem_text
 from mcp_telegram.models import DialogType
-from mcp_telegram.sync_db import ensure_sync_schema
+from mcp_telegram.sync_db import ensure_sync_schema, record_daemon_event
 from mcp_telegram.telethon_dialog import classify_dialog_type
 from mcp_telegram.topics.contracts import TopicFact
 from mcp_telegram.topics.refresh import TopicRefresher
@@ -1937,6 +1937,44 @@ async def test_unknown_method() -> None:
 
     assert result["ok"] is False
     assert result["error"] == "unknown_method"
+
+
+@pytest.mark.asyncio
+async def test_list_important_events_dispatch_returns_recent_access_events(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = _register_sqlite_connection(sqlite3.connect(db_path))
+    conn.execute(
+        "INSERT INTO entities (id, type, name, updated_at) VALUES (?, ?, ?, ?)",
+        (123, "Channel", "Work Chat", 1_700_000_000),
+    )
+    record_daemon_event(conn, kind="access_lost", dialog_id=123, occurred_at=int(time.time()))
+    conn.commit()
+
+    result = await make_server(conn)._dispatch(
+        {"method": "list_important_events", "last_hours": 24 * 30, "timezone": "Asia/Almaty"}
+    )
+
+    assert result["ok"] is True
+    data = cast(dict[str, object], result["data"])
+    assert data["timezone"] == "Asia/Almaty"
+    assert data["last_hours"] == 24 * 30
+    events = cast(list[dict[str, object]], data["events"])
+    assert len(events) == 1
+    assert events[0]["time_basis"] == "observed"
+    assert events[0]["type"] == "access_lost"
+    assert events[0]["summary"] == "Access lost"
+    assert events[0]["dialog_id"] == 123
+    assert events[0]["dialog_title"] == "Work Chat"
+    assert events[0]["message_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_list_important_events_dispatch_rejects_bad_timezone() -> None:
+    result = await make_server()._dispatch({"method": "list_important_events", "timezone": 123})
+
+    assert result["ok"] is False
+    assert result["error"] == "invalid_input"
 
 
 @pytest.mark.asyncio

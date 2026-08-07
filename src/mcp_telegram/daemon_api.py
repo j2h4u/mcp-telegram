@@ -103,6 +103,7 @@ from .daemon_message_queries import (
 )
 from .daemon_read_state_queries import _dialog_type_from_db, _read_state_for_dialog
 from .folders.read_model import dialog_placement, folders_by_dialog, list_folder_messages, list_folders
+from .important_events.read_model import list_important_events as read_important_events
 from .models import DialogType, ReadMessage
 from .topics.contracts import TopicSourceUnavailableError
 from .topics.refresh import TopicRefresher
@@ -674,6 +675,7 @@ class DaemonAPIServer:
             "mark_dialog_for_sync": self._mark_dialog_for_sync,
             "get_sync_status": self._get_sync_status,
             "get_sync_alerts": self._get_sync_alerts,
+            "list_important_events": self._list_important_events,
             "get_entity_info": self._get_entity_info,
             "get_inbox": self._list_unread_messages,
             "record_telemetry": self._record_telemetry,
@@ -1270,6 +1272,18 @@ class DaemonAPIServer:
     # ------------------------------------------------------------------
     # get_entity_info
     # ------------------------------------------------------------------
+
+    def _list_important_events(self, req: dict[str, object]) -> dict:
+        """Return recent daemon-observed important events."""
+        last_hours = _clamp(_coerce_int(req.get("last_hours", 24), 24), 1, 24 * 30)
+        timezone = req.get("timezone", "UTC")
+        if not isinstance(timezone, str):
+            return {"ok": False, "error": "invalid_input", "message": "timezone must be a string"}
+        try:
+            events = read_important_events(self._conn, last_hours=last_hours, timezone=timezone)
+        except ValueError, TypeError:
+            return {"ok": False, "error": "invalid_input", "message": "timezone must be a valid IANA timezone"}
+        return {"ok": True, "data": {"timezone": timezone, "last_hours": last_hours, "events": events}}
 
     async def _get_entity_info(self, req: dict[str, object]) -> dict:
         """Type-tagged entity inspector covering 5 Telegram entity kinds."""
