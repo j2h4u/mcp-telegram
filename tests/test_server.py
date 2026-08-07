@@ -21,12 +21,12 @@ INVENTORY_PATH = Path(__file__).parent / "fixtures" / "52-TOOL-OUTPUT-INVENTORY.
 
 
 def _tool_input_schema(tool: Tool) -> dict[str, object]:
-    return cast(dict[str, object], tool.inputSchema)
+    return cast(dict[str, object], tool.input_schema)
 
 
 def _tool_output_schema(tool: Tool) -> dict[str, object]:
-    assert tool.outputSchema is not None
-    return cast(dict[str, object], tool.outputSchema)
+    assert tool.output_schema is not None
+    return cast(dict[str, object], tool.output_schema)
 
 
 class _HasContent(Protocol):
@@ -43,7 +43,7 @@ def _call_tool_text(result: object) -> str:
 
 def _call_tool_result(result: object) -> CallToolResult:
     assert hasattr(result, "content")
-    assert hasattr(result, "isError")
+    assert hasattr(result, "is_error")
     return cast(CallToolResult, result)
 
 
@@ -52,7 +52,7 @@ def _tool(name: str) -> Tool:
         name=name,
         title=name.replace("_", " ").title(),
         description=f"{name} test tool",
-        inputSchema={"type": "object", "properties": {}},
+        input_schema={"type": "object", "properties": {}},
     )
 
 
@@ -121,7 +121,7 @@ def test_list_messages_reflection_exposes_shared_navigation_schema() -> None:
 async def test_call_tool_validation_rejects_conflicting_list_messages_selectors() -> None:
     result = _call_tool_result(await server.call_tool("list_messages", {"dialog": "Backend", "exact_dialog_id": 701}))
 
-    assert result.isError is True
+    assert result.is_error is True
     message = _call_tool_text(result)
     assert "validation" in message.lower()
     assert "mutually exclusive" in message.lower()
@@ -158,7 +158,7 @@ async def test_call_tool_validation_failure_escaped_error_includes_actionable_gu
 
     result = _call_tool_result(await server.call_tool("list_dialogs", {"dialog": 123}))
 
-    assert result.isError is True
+    assert result.is_error is True
     message = _call_tool_text(result)
     assert "validation" in message.lower() or "argument" in message.lower()
     assert "dialog" in message.lower()
@@ -179,7 +179,7 @@ async def test_call_tool_runtime_failure_escaped_error_includes_actionable_guida
 
     result = _call_tool_result(await server.call_tool("list_dialogs", {}))
 
-    assert result.isError is True
+    assert result.is_error is True
     message = _call_tool_text(result)
     assert "runtime" in message.lower() or "execution" in message.lower()
     assert "timed out" in message.lower() or "timeout" in message.lower()
@@ -209,7 +209,7 @@ async def test_call_tool_passthrough_recoverable_error_text_contract(
     result = _call_tool_result(await server.call_tool("get_entity_info", {"entity": "Iris"}))
 
     assert result.content == expected
-    assert result.isError is True
+    assert result.is_error is True
     assert _call_tool_text(result) == expected[0].text
     assert "Action:" in _call_tool_text(result)
     assert "failed" not in _call_tool_text(result)
@@ -224,7 +224,7 @@ async def test_call_tool_unknown_tool_control_contract() -> None:
 @pytest.mark.asyncio
 async def test_call_tool_non_dict_arguments_control_contract() -> None:
     with pytest.raises(TypeError, match="arguments must be dictionary"):
-        await server.call_tool("list_dialogs", [])
+        await server.call_tool("list_dialogs", cast(dict[str, object], []))
 
 
 def test_posture_tags_are_not_reflected_in_descriptions() -> None:
@@ -263,10 +263,10 @@ def test_list_tools_exposes_snake_case_names_titles_and_annotations() -> None:
         assert 1 <= len(title.split()) <= 3
         annotations = tool.annotations
         assert annotations is not None
-        assert annotations.readOnlyHint is not None
-        assert annotations.destructiveHint is not None
-        assert annotations.idempotentHint is not None
-        assert annotations.openWorldHint is not None
+        assert annotations.read_only_hint is not None
+        assert annotations.destructive_hint is not None
+        assert annotations.idempotent_hint is not None
+        assert annotations.open_world_hint is not None
     for name, title in expected_titles.items():
         assert server.tool_by_name[name].title == title
 
@@ -278,14 +278,14 @@ def test_list_tools_exposes_snake_case_names_titles_and_annotations() -> None:
     assert mark_annotations is not None
     assert submit_annotations is not None
     assert trace_annotations is not None
-    assert list_messages_annotations.readOnlyHint is True
-    assert mark_annotations.readOnlyHint is False
-    assert mark_annotations.idempotentHint is True
-    assert submit_annotations.readOnlyHint is False
-    assert submit_annotations.destructiveHint is False
-    assert trace_annotations.readOnlyHint is False
-    assert trace_annotations.destructiveHint is False
-    assert trace_annotations.idempotentHint is True
+    assert list_messages_annotations.read_only_hint is True
+    assert mark_annotations.read_only_hint is False
+    assert mark_annotations.idempotent_hint is True
+    assert submit_annotations.read_only_hint is False
+    assert submit_annotations.destructive_hint is False
+    assert trace_annotations.read_only_hint is False
+    assert trace_annotations.destructive_hint is False
+    assert trace_annotations.idempotent_hint is True
     assert all(not any(part[:1].isupper() for part in name.split("_")) for name in server.tool_by_name)
 
 
@@ -332,8 +332,8 @@ def test_tool_descriptor_preserves_registry_output_schema() -> None:
 
     tool = tool_description("list_dialogs", ListDialogs, entry)
 
-    assert cast(dict[str, object], tool.inputSchema)["type"] == "object"
-    assert tool.outputSchema == output_schema
+    assert cast(dict[str, object], tool.input_schema)["type"] == "object"
+    assert tool.output_schema == output_schema
     assert tool.title == "List Dialogs"
 
 
@@ -461,7 +461,7 @@ def test_http_allowed_hosts_includes_ipv6_bind_host_and_port_variant() -> None:
     assert "[::1]:*" in hosts
 
 
-def test_list_prompts_resources_tools_and_progress_routes_exist() -> None:
+def test_list_prompts_resources_tools_routes_exist() -> None:
     import asyncio
     from collections.abc import Awaitable, Callable
 
@@ -474,7 +474,6 @@ def test_list_prompts_resources_tools_and_progress_routes_exist() -> None:
         resources = await list_resources()
         tools = await list_tools()
         templates = await list_resource_templates()
-        await server.progress_notification(0, 0.0, None, None)
         return prompts, resources, tools, templates
 
     prompts, resources, tools, templates = asyncio.run(runner())
@@ -543,8 +542,8 @@ class _FakeTransportSecuritySettings:
 
 
 class _FakeSessionManager:
-    def __init__(self, captured: dict[str, object], app: object, security_settings: object) -> None:
-        captured["session_manager"] = {"app": app, "security_settings": security_settings}
+    def __init__(self, captured: dict[str, object], app: object, **kwargs: object) -> None:
+        captured["session_manager"] = {"app": app, **kwargs}
         self._captured = captured
 
     @asynccontextmanager
@@ -642,6 +641,9 @@ async def test_run_mcp_http_server_normalizes_mount_and_builds_transport(
         "allowed_hosts": ["127.0.0.1:4100"],
         "allowed_origins": ["https://example.com"],
     }
+    session_manager = cast(dict[str, object], captured["session_manager"])
+    assert session_manager["stateless"] is True
+    assert session_manager["json_response"] is True
     assert captured["server"]
     routes = cast(list[tuple[str, str]], captured.get("routes", []))
     assert routes[0][0] == "mount"
@@ -654,14 +656,14 @@ async def test_run_mcp_http_server_normalizes_mount_and_builds_transport(
 def test_list_tools_exposes_list_dialogs_output_schema() -> None:
     tool = server.tool_by_name["list_dialogs"]
 
-    assert tool.outputSchema is not None
+    assert tool.output_schema is not None
     properties = cast(dict[str, object], _tool_output_schema(tool)["properties"])
     assert "dialogs" in properties
-    assert "count" in cast(list[str], cast(dict[str, object], tool.outputSchema)["required"])
+    assert "count" in cast(list[str], cast(dict[str, object], tool.output_schema)["required"])
 
 
 def test_all_registered_tools_declare_output_schema() -> None:
-    schema_tools = {name for name, tool in server.tool_by_name.items() if tool.outputSchema is not None}
+    schema_tools = {name for name, tool in server.tool_by_name.items() if tool.output_schema is not None}
 
     assert schema_tools == set(server.tool_by_name)
 
@@ -686,7 +688,7 @@ def test_phase_52_agent_metadata_fields_are_in_output_schemas() -> None:
         for field in property_fields:
             assert field in item_properties
 
-    list_messages_schema = server.tool_by_name["list_messages"].outputSchema
+    list_messages_schema = server.tool_by_name["list_messages"].output_schema
     assert list_messages_schema is not None
     list_messages_dict = cast(dict[str, object], list_messages_schema)
     assert "presentation" in cast(list[str], list_messages_dict["required"])
@@ -697,7 +699,7 @@ def test_phase_52_agent_metadata_fields_are_in_output_schemas() -> None:
         property_fields=("reply_context_ref",),
     )
 
-    list_dialogs_schema = server.tool_by_name["list_dialogs"].outputSchema
+    list_dialogs_schema = server.tool_by_name["list_dialogs"].output_schema
     assert list_dialogs_schema is not None
     assert_nested_item_fields(
         list_dialogs_schema,
@@ -706,7 +708,7 @@ def test_phase_52_agent_metadata_fields_are_in_output_schemas() -> None:
         property_fields=("draft_content",),
     )
 
-    list_topics_schema = server.tool_by_name["list_topics"].outputSchema
+    list_topics_schema = server.tool_by_name["list_topics"].output_schema
     assert list_topics_schema is not None
     assert_nested_item_fields(
         list_topics_schema,
@@ -715,7 +717,7 @@ def test_phase_52_agent_metadata_fields_are_in_output_schemas() -> None:
         property_fields=("title_content",),
     )
 
-    sync_alerts_schema = server.tool_by_name["get_sync_alerts"].outputSchema
+    sync_alerts_schema = server.tool_by_name["get_sync_alerts"].output_schema
     assert sync_alerts_schema is not None
     assert_nested_item_fields(
         sync_alerts_schema,
@@ -728,7 +730,7 @@ def test_list_tools_exposes_account_trace_schema_and_title() -> None:
     tool = server.tool_by_name["trace_account_messages"]
 
     assert tool.title == "Account Trace"
-    assert tool.outputSchema is not None
+    assert tool.output_schema is not None
     output_schema = _tool_output_schema(tool)
     assert "coverage" in cast(list[str], output_schema["required"])
     assert "result_count_semantics" in cast(list[str], output_schema["required"])
@@ -755,9 +757,9 @@ def test_list_tools_exposes_feedback_and_entity_info_output_schemas() -> None:
     feedback_tool = server.tool_by_name["submit_feedback"]
     entity_tool = server.tool_by_name["get_entity_info"]
 
-    assert feedback_tool.outputSchema is not None
-    feedback_schema = cast(dict[str, object], feedback_tool.outputSchema)
-    entity_schema = cast(dict[str, object], entity_tool.outputSchema)
+    assert feedback_tool.output_schema is not None
+    feedback_schema = cast(dict[str, object], feedback_tool.output_schema)
+    entity_schema = cast(dict[str, object], entity_tool.output_schema)
     assert "accepted" in cast(list[str], feedback_schema["required"])
     assert "tracking_id" in cast(list[str], feedback_schema["required"])
     assert "type_specific" in cast(list[str], entity_schema["required"])
@@ -782,8 +784,9 @@ async def test_call_tool_returns_structuredContent_with_empty_success_content(
 
     result = _call_tool_result(await server.call_tool("list_dialogs", {}))
 
-    assert result.isError is False
-    assert result.structuredContent == {"dialogs": [{"id": 1, "name": "Alice"}], "count": 1}
+    assert result.is_error is False
+    structured_content = cast(dict[str, object], result.structured_content)
+    assert structured_content == {"dialogs": [{"id": 1, "name": "Alice"}], "count": 1}
     assert result.content == []
 
 
@@ -793,7 +796,7 @@ async def test_call_tool_validation_rejects_trace_topic_without_dialog_scope() -
         await server.call_tool("trace_account_messages", {"account": "@alice", "exact_topic_id": 7})
     )
 
-    assert result.isError is True
+    assert result.is_error is True
     assert "exact_topic_id requires" in _call_tool_text(result)
 
 
@@ -1019,7 +1022,7 @@ async def test_list_messages_tool_archived_warning_with_coverage(monkeypatch: py
 
     result = _call_tool_result(await server.call_tool("list_messages", {"exact_dialog_id": 123}))
     assert result.content == []
-    payload = cast(dict[str, object], result.structuredContent)
+    payload = cast(dict[str, object], result.structured_content)
     warning = cast(dict[str, object], cast(list[object], payload["warnings"])[0])
     message = cast(str, warning["message"])
     assert warning["kind"] == "archived_dialog"
@@ -1051,7 +1054,7 @@ async def test_list_messages_tool_archived_warning_unknown_coverage(monkeypatch:
 
     result = _call_tool_result(await server.call_tool("list_messages", {"exact_dialog_id": 123}))
     assert result.content == []
-    payload = cast(dict[str, object], result.structuredContent)
+    payload = cast(dict[str, object], result.structured_content)
     warning = cast(dict[str, object], cast(list[object], payload["warnings"])[0])
     message = cast(str, warning["message"])
     assert "150 messages archived locally" in message
@@ -1080,7 +1083,7 @@ async def test_list_messages_tool_uses_last_synced_at_not_access_lost_at(
     monkeypatch.setattr("mcp_telegram.tools.reading.daemon_connection", lambda: mock_conn)
 
     result = _call_tool_result(await server.call_tool("list_messages", {"exact_dialog_id": 123}))
-    payload = cast(dict[str, object], result.structuredContent)
+    payload = cast(dict[str, object], result.structured_content)
     warning = cast(dict[str, object], cast(list[object], payload["warnings"])[0])
     # Must show 2023-11-14 (last_synced_at), NOT 2024-01-01 (access_lost_at)
     message = cast(str, warning["message"])

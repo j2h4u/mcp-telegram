@@ -377,10 +377,10 @@ def _trace_structured_content(data: dict, args: TraceAccountMessages) -> dict[st
     name="trace_account_messages",
     title="Account Trace",
     annotations=ToolAnnotations(
-        readOnlyHint=False,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=True,
+        read_only_hint=False,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=True,
     ),
     output_schema=TRACE_ACCOUNT_MESSAGES_OUTPUT_SCHEMA,
 )

@@ -15,8 +15,14 @@ from functools import cache
 
 from mcp.server import Server
 from mcp.types import (
+    CallToolRequestParams,
     CallToolResult,
+    GetPromptRequestParams,
     GetPromptResult,
+    ListPromptsResult,
+    ListResourcesResult,
+    ListResourceTemplatesResult,
+    ListToolsResult,
     Prompt,
     PromptMessage,
     Resource,
@@ -36,7 +42,6 @@ from .config import (
 from .correlation import correlation_context, current_correlation_ids
 
 logger = logging.getLogger(__name__)
-app = Server("mcp-telegram")
 _MAX_ERROR_DETAIL_LENGTH = 160
 _MCP_HTTP_LOGGER_NAME = "mcp.server.streamable_http"
 _MCP_HTTP_SSE_ERROR_MESSAGE = "SSE response error"
@@ -127,7 +132,7 @@ def _safe_boundary_error_text(*, tool_name: str, stage: str, exc: Exception) -> 
 
 
 def _error_call_result(text: str) -> CallToolResult:
-    return CallToolResult(content=[TextContent(type="text", text=text)], isError=True)
+    return CallToolResult(content=[TextContent(type="text", text=text)], is_error=True)
 
 
 def _dedupe(values: t.Iterable[str]) -> list[str]:
@@ -188,7 +193,6 @@ def _http_allowed_origins() -> list[str]:
     return _dedupe([*HTTP_LOOPBACK_ALLOWED_ORIGINS, *resolve_http_server_config().allowed_origins])
 
 
-@app.list_prompts()
 async def list_prompts() -> list[Prompt]:
     return [
         Prompt(
@@ -199,7 +203,6 @@ async def list_prompts() -> list[Prompt]:
     ]
 
 
-@app.get_prompt()
 async def get_prompt(name: str, arguments: dict[str, str] | None) -> GetPromptResult:
     _ = arguments
     if name != _WORKFLOWS_PROMPT_NAME:
@@ -215,29 +218,19 @@ async def get_prompt(name: str, arguments: dict[str, str] | None) -> GetPromptRe
     )
 
 
-@app.list_resources()
 async def list_resources() -> list[Resource]:
     return []
 
 
-@app.list_tools()
 async def list_tools() -> list[Tool]:
     """List available tools."""
     return list(tool_by_name.values())
 
 
-@app.list_resource_templates()
 async def list_resource_templates() -> list[ResourceTemplate]:
     return []
 
 
-@app.progress_notification()
-async def progress_notification(progress: str | int, p: float, s: float | None, message: str | None = None) -> None:
-    """No-op handler required by MCP protocol."""
-    _ = (progress, p, s, message)
-
-
-@app.call_tool()
 async def call_tool(name: str, arguments: dict[str, object]) -> CallToolResult:
     """Handle tool calls for command line run."""
 
@@ -269,9 +262,48 @@ async def call_tool(name: str, arguments: dict[str, object]) -> CallToolResult:
         logger.info("call_tool[%s] completed in %.3fs rids=%s", name, elapsed, rid_str)
         return CallToolResult(
             content=list(result.content) if result.is_error else [],
-            structuredContent=result.structured_content,
-            isError=result.is_error,
+            structured_content=result.structured_content,
+            is_error=result.is_error,
         )
+
+
+async def _on_list_prompts(_context: object, _params: object) -> ListPromptsResult:
+    return ListPromptsResult(prompts=await list_prompts())
+
+
+async def _on_get_prompt(_context: object, params: GetPromptRequestParams) -> GetPromptResult:
+    name = str(params.name)
+    arguments = getattr(params, "arguments", None)
+    return await get_prompt(name, arguments)
+
+
+async def _on_list_resources(_context: object, _params: object) -> ListResourcesResult:
+    return ListResourcesResult(resources=await list_resources())
+
+
+async def _on_list_tools(_context: object, _params: object) -> ListToolsResult:
+    return ListToolsResult(tools=await list_tools())
+
+
+async def _on_list_resource_templates(_context: object, _params: object) -> ListResourceTemplatesResult:
+    return ListResourceTemplatesResult(resource_templates=await list_resource_templates())
+
+
+async def _on_call_tool(_context: object, params: CallToolRequestParams) -> CallToolResult:
+    raw_arguments = getattr(params, "arguments", None)
+    arguments = raw_arguments if isinstance(raw_arguments, dict) else {}
+    return await call_tool(str(params.name), arguments)
+
+
+app = Server(
+    "mcp-telegram",
+    on_list_prompts=_on_list_prompts,
+    on_get_prompt=_on_get_prompt,
+    on_list_resources=_on_list_resources,
+    on_list_tools=_on_list_tools,
+    on_list_resource_templates=_on_list_resource_templates,
+    on_call_tool=_on_call_tool,
+)
 
 
 def bootstrap_server() -> Server:
@@ -387,6 +419,8 @@ async def run_mcp_http_server(
     mcp_server.instructions = await _build_server_instructions()
     session_manager = StreamableHTTPSessionManager(
         app=mcp_server,
+        stateless=True,
+        json_response=True,
         security_settings=TransportSecuritySettings(
             enable_dns_rebinding_protection=True,
             allowed_hosts=_http_allowed_hosts(host=host, port=port),

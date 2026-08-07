@@ -1561,10 +1561,10 @@ def _list_messages_structured_error_content(response: dict) -> dict[str, object]
     name="list_messages",
     title="List Messages",
     annotations=ToolAnnotations(
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=True,
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=True,
     ),
     output_schema=LIST_MESSAGES_OUTPUT_SCHEMA,
 )
@@ -1725,10 +1725,10 @@ class SearchMessages(ToolArgs):
     name="search_messages",
     title="Search Messages",
     annotations=ToolAnnotations(
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=False,
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=False,
     ),
     output_schema=SEARCH_MESSAGES_OUTPUT_SCHEMA,
 )

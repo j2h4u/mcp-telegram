@@ -116,13 +116,13 @@ def _call_kwargs(mock: _AsyncMethodMock) -> dict[str, object]:
 def _structured_payload(result: StructuredResult) -> dict[str, object] | None:
     if isinstance(result, ToolResult):
         return result.structured_content
-    return result.structuredContent
+    return cast(dict[str, object] | None, result.structured_content)
 
 
 def _is_error(result: StructuredResult) -> bool | None:
     if isinstance(result, ToolResult):
         return result.is_error
-    return result.isError
+    return result.is_error
 
 
 def _text_content(result: StructuredResult) -> str:
