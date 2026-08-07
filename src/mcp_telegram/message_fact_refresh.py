@@ -211,8 +211,7 @@ async def run_message_fact_refresh_loop(
     """Run low-priority optional fact acquisition until shutdown."""
     if policy.reaction_max_messages_per_cycle <= 0 and policy.read_at_max_messages_per_cycle <= 0:
         logger.info(
-            "message_fact_refresh_loop disabled — reaction_max_messages_per_cycle=%d "
-            "read_at_max_messages_per_cycle=%d",
+            "message_fact_refresh_loop disabled — reaction_max_messages_per_cycle=%d read_at_max_messages_per_cycle=%d",
             policy.reaction_max_messages_per_cycle,
             policy.read_at_max_messages_per_cycle,
         )

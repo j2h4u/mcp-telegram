@@ -455,7 +455,9 @@ async def test_jit_reactions_cleared_when_telegram_has_none(make_synced_db: Call
 
 
 @pytest.mark.asyncio
-async def test_list_messages_uses_cached_reactions_without_jit(make_synced_db: Callable[[], sqlite3.Connection]) -> None:
+async def test_list_messages_uses_cached_reactions_without_jit(
+    make_synced_db: Callable[[], sqlite3.Connection],
+) -> None:
     """list_messages projects stored reactions and never calls Telegram."""
     conn = make_synced_db()
     dialog_id = 1001
