@@ -29,7 +29,7 @@ from .flood import flood_seconds, sleep_through_flood
 from .message_contracts import ExtractedMessage
 from .messages.sqlite_repository import insert_messages_with_fts
 from .messages.telegram_adapter import extract_message_row
-from .sync_db import set_access_lost
+from .sync_db import restore_access_after_revalidation, set_access_lost
 from .telegram_access import ACCESS_LOST_ERRORS
 
 logger = logging.getLogger(__name__)
@@ -37,16 +37,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # SQL constants
 # ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True, slots=True)
-class DeltaHistoryPacing:
-    probe_s: float = 1.0
-
-
-@dataclass(frozen=True, slots=True)
-class DeltaSyncPacing:
-    history: DeltaHistoryPacing = DeltaHistoryPacing()
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,7 +55,19 @@ class DeltaCatchUpPolicy:
         return probed >= self.max_probes_per_cycle
 
 
-_PACING = DeltaSyncPacing()
+@dataclass(frozen=True, slots=True)
+class AccessProbePolicy:
+    """Budgeted cold policy for access-lost archive revalidation."""
+
+    interval_seconds: float
+    max_dialogs_per_cycle: int
+    cooldown_seconds: int
+    probe_pause_seconds: float
+
+    @property
+    def enabled(self) -> bool:
+        return self.max_dialogs_per_cycle > 0
+
 
 # Skip delta probe for dialogs fully synced within this window — prevents
 # GetHistoryRequest storm on quick restarts (D-01 expert panel).
@@ -109,26 +111,22 @@ _UPDATE_DELTA_CHECKED_SQL = (
     "UPDATE synced_dialogs SET last_delta_checked_at = ?, delta_refresh_requested_at = NULL WHERE dialog_id = ?"
 )
 
-_SELECT_ACCESS_LOST_SQL = "SELECT dialog_id FROM synced_dialogs WHERE status = 'access_lost'"
-
-_RESTORE_ACCESS_SQL = "UPDATE synced_dialogs SET status = 'syncing', access_lost_at = NULL WHERE dialog_id = ?"
-_UPSERT_RESTORED_DIALOG_SQL = """
-INSERT INTO dialogs (
-    dialog_id, hidden, needs_refresh, snapshot_at,
-    archived, pinned, unread_mentions_count, unread_reactions_count
-) VALUES (?, 0, 1, ?, 0, 0, 0, 0)
-ON CONFLICT(dialog_id) DO UPDATE SET
-    hidden = 0,
-    needs_refresh = 1,
-    snapshot_at = excluded.snapshot_at
+_SELECT_DUE_ACCESS_LOST_SQL = """
+SELECT dialog_id
+FROM synced_dialogs
+WHERE status = 'access_lost'
+  AND COALESCE(access_next_revalidate_at, COALESCE(access_lost_at, 0) + ?) <= ?
+ORDER BY COALESCE(access_next_revalidate_at, COALESCE(access_lost_at, 0) + ?), dialog_id
+LIMIT ?
 """
 
-_UPDATE_TOTAL_MESSAGES_SQL = "UPDATE synced_dialogs SET total_messages = ? WHERE dialog_id = ?"
+_UPDATE_ACCESS_REVALIDATION_SQL = (
+    "UPDATE synced_dialogs SET access_last_revalidated_at = ?, access_next_revalidate_at = ? WHERE dialog_id = ?"
+)
 
 
 class AccessProbeLoopOptions(TypedDict, total=False):
     initial_delay: float
-    interval: float
 
 
 class _DeltaSyncClient(Protocol):
@@ -401,7 +399,7 @@ class DeltaSyncWorker:
                 type(exc).__name__,
             )
             now = int(time.time())
-            set_access_lost(self._conn, dialog_id, now)
+            set_access_lost(self._conn, dialog_id, now, reason=type(exc).__name__)
             return 0
         except RPCError as exc:
             logger.exception(
@@ -453,18 +451,31 @@ async def _probe_access_lost_dialogs(
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,
     delta_worker: DeltaSyncWorker,
+    policy: AccessProbePolicy,
 ) -> int:
-    """Probe all access_lost dialogs. Returns count of restored dialogs.
+    """Probe due access_lost dialogs under a tiny cold budget.
 
     Recovery sequence: probe -> gap-fill -> THEN reset status.
     If gap-fill fails, status stays access_lost (safe rollback).
     """
-    rows = cast(list[tuple[int]], conn.execute(_SELECT_ACCESS_LOST_SQL).fetchall())
-    if not rows:
-        return 0
+    now = int(time.time())
+    rows = cast(
+        list[tuple[int]],
+        conn.execute(
+            _SELECT_DUE_ACCESS_LOST_SQL,
+            (policy.cooldown_seconds, now, policy.cooldown_seconds, policy.max_dialogs_per_cycle),
+        ).fetchall(),
+    )
 
     restored = 0
+    checked = 0
+    still_lost = 0
+    errors = 0
+    flood_wait_hit = False
     for (dialog_id,) in rows:
+        if shutdown_event.is_set():
+            break
+        checked += 1
         try:
             result = await client.get_messages(entity=dialog_id, limit=1)
             # Success — access restored. Capture total before gap-fill.
@@ -476,30 +487,57 @@ async def _probe_access_lost_dialogs(
             logger.info("access_restored_gap_fill dialog_id=%d new=%d", dialog_id, new_msgs)
 
             # Gap-fill succeeded — NOW reset status to syncing.
-            with conn:
-                now = int(time.time())
-                conn.execute(_RESTORE_ACCESS_SQL, (dialog_id,))
-                conn.execute(_UPSERT_RESTORED_DIALOG_SQL, (dialog_id, now))
-                if total is not None:
-                    conn.execute(_UPDATE_TOTAL_MESSAGES_SQL, (total, dialog_id))
+            restore_access_after_revalidation(conn, dialog_id, int(time.time()), total_messages=total)
             logger.info("access_restored dialog_id=%d total=%s", dialog_id, total)
             restored += 1
         except ACCESS_LOST_ERRORS:
             logger.debug("access_still_lost dialog_id=%d", dialog_id)
+            still_lost += 1
+            _stamp_access_revalidation(conn, dialog_id, int(time.time()), policy.cooldown_seconds)
         except FloodWaitError as exc:
             logger.warning("probe_flood_wait dialog_id=%d seconds=%d", dialog_id, exc.seconds)
-            if await sleep_through_flood(shutdown_event, flood_seconds(exc)):
-                return restored  # shutdown during flood wait
-            # flood wait elapsed normally — continue to next probe
+            flood_wait_hit = True
+            _stamp_access_revalidation(
+                conn,
+                dialog_id,
+                int(time.time()),
+                max(policy.cooldown_seconds, flood_seconds(exc)),
+            )
+            await sleep_through_flood(shutdown_event, flood_seconds(exc))
+            break
         except RPCError as exc:
             logger.warning("probe_rpc_error dialog_id=%d error=%s", dialog_id, exc)
+            errors += 1
+            _stamp_access_revalidation(conn, dialog_id, int(time.time()), policy.cooldown_seconds)
         except (TimeoutError, OSError) as exc:
             logger.warning("probe_network_error dialog_id=%d error=%s", dialog_id, exc)
+            errors += 1
+            _stamp_access_revalidation(conn, dialog_id, int(time.time()), policy.cooldown_seconds)
 
-        await asyncio.sleep(_PACING.history.probe_s)
+        if policy.probe_pause_seconds > 0 and not shutdown_event.is_set():
+            try:
+                await asyncio.wait_for(shutdown_event.wait(), timeout=policy.probe_pause_seconds)
+                break
+            except TimeoutError:
+                pass
 
-    logger.info("access_probe complete — checked=%d restored=%d", len(rows), restored)
+    logger.info(
+        "access_probe complete — selected=%d checked=%d restored=%d still_lost=%d errors=%d flood_wait_hit=%s",
+        len(rows),
+        checked,
+        restored,
+        still_lost,
+        errors,
+        flood_wait_hit,
+    )
     return restored
+
+
+def _stamp_access_revalidation(
+    conn: sqlite3.Connection, dialog_id: int, checked_at: int, cooldown_seconds: int
+) -> None:
+    with conn:
+        conn.execute(_UPDATE_ACCESS_REVALIDATION_SQL, (checked_at, checked_at + cooldown_seconds, dialog_id))
 
 
 async def run_access_probe_loop(
@@ -507,14 +545,19 @@ async def run_access_probe_loop(
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,
     delta_worker: DeltaSyncWorker,
+    policy: AccessProbePolicy,
     **options: Unpack[AccessProbeLoopOptions],
 ) -> None:
-    """Daily probe of access_lost dialogs. Restores access and triggers gap-fill.
+    """Cold probe of due access_lost dialogs. Restores access and triggers gap-fill.
 
-    Runs immediately at startup (initial_delay=0), then every 24h.
+    The loop may run daily, but each dialog is paced by a durable cooldown and
+    each cycle has a small global budget.
     """
+    if not policy.enabled:
+        logger.info("access_probe_loop disabled — max_dialogs_per_cycle=%d", policy.max_dialogs_per_cycle)
+        return
+
     initial_delay = options.get("initial_delay", 0.0)
-    interval = options.get("interval", 86400.0)
     if initial_delay > 0:
         try:
             await asyncio.wait_for(shutdown_event.wait(), timeout=initial_delay)
@@ -524,17 +567,18 @@ async def run_access_probe_loop(
 
     while not shutdown_event.is_set():
         try:
-            await _probe_access_lost_dialogs(client, conn, shutdown_event, delta_worker)
+            await _probe_access_lost_dialogs(client, conn, shutdown_event, delta_worker, policy)
         except Exception:
             logger.warning("access_probe_error", exc_info=True)
         try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=interval)
+            await asyncio.wait_for(shutdown_event.wait(), timeout=policy.interval_seconds)
             return  # shutdown during sleep
         except TimeoutError:
             pass  # interval elapsed, run again
 
 
 _EXPORTED_SYMBOLS = (
+    AccessProbePolicy,
     DeltaCatchUpPolicy,
     DeltaSyncWorker,
     DeltaSyncWorker.run_delta_catch_up,

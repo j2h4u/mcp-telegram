@@ -1420,8 +1420,8 @@ async def _resolve_topic_id(
                 dialog_id=dialog_id,
                 dialog=dialog_name,
             )
-    except DaemonNotRunningError:
-        return error_result(_daemon_not_running_text())
+    except DaemonNotRunningError as exc:
+        return error_result(_daemon_not_running_text(exc))
 
     if not response.get("ok"):
         error = response.get("error", "unknown")
@@ -1561,10 +1561,10 @@ def _list_messages_structured_error_content(response: dict) -> dict[str, object]
     name="list_messages",
     title="List Messages",
     annotations=ToolAnnotations(
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=True,
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=True,
     ),
     output_schema=LIST_MESSAGES_OUTPUT_SCHEMA,
 )
@@ -1608,8 +1608,8 @@ async def list_messages(args: ListMessages) -> ToolResult:
                 since_utc=args.since_utc,
                 until_utc=args.until_utc,
             )
-    except DaemonNotRunningError:
-        return error_result(_daemon_not_running_text())
+    except DaemonNotRunningError as exc:
+        return error_result(_daemon_not_running_text(exc))
 
     if not response.get("ok"):
         return _list_messages_error_result(
@@ -1725,10 +1725,10 @@ class SearchMessages(ToolArgs):
     name="search_messages",
     title="Search Messages",
     annotations=ToolAnnotations(
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=False,
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=False,
     ),
     output_schema=SEARCH_MESSAGES_OUTPUT_SCHEMA,
 )
@@ -1755,8 +1755,8 @@ async def search_messages(args: SearchMessages) -> ToolResult:
                 since_utc=args.since_utc,
                 until_utc=args.until_utc,
             )
-    except DaemonNotRunningError:
-        return error_result(_daemon_not_running_text())
+    except DaemonNotRunningError as exc:
+        return error_result(_daemon_not_running_text(exc))
 
     if not response.get("ok"):
         return _search_messages_error_result(

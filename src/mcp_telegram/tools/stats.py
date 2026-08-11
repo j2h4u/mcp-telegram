@@ -213,10 +213,10 @@ def _usage_structured_content(stats: dict, *, summary: str, empty: bool) -> dict
     title="Usage Stats",
     posture="secondary/helper",
     annotations=ToolAnnotations(
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=False,
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=False,
     ),
     output_schema=GET_USAGE_STATS_OUTPUT_SCHEMA,
 )
@@ -224,8 +224,8 @@ async def get_usage_stats(args: GetUsageStats) -> ToolResult:
     try:
         async with daemon_connection() as conn:
             response = await conn.get_usage_stats()
-    except DaemonNotRunningError:
-        return error_result(_daemon_not_running_text())
+    except DaemonNotRunningError as exc:
+        return error_result(_daemon_not_running_text(exc))
 
     if not response.get("ok"):
         error_msg = response.get("error", "Unknown error")
@@ -264,10 +264,10 @@ class GetDialogStats(ToolArgs):
     title="Dialog Stats",
     posture="secondary/helper",
     annotations=ToolAnnotations(
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=False,
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=False,
     ),
     output_schema=GET_DIALOG_STATS_OUTPUT_SCHEMA,
 )
@@ -281,8 +281,8 @@ async def get_dialog_stats(args: GetDialogStats) -> ToolResult:
                 dialog=dialog_name,
                 limit=args.top_n,
             )
-    except DaemonNotRunningError:
-        return error_result(_daemon_not_running_text())
+    except DaemonNotRunningError as exc:
+        return error_result(_daemon_not_running_text(exc))
 
     if not response.get("ok"):
         error = response.get("error", "")

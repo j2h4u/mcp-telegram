@@ -41,6 +41,41 @@ Ports are introduced only at a genuine variable boundary. Keeping a cohesive
 SQLite primitive or Telethon projection as an ordinary module is preferable to
 creating a placeholder service/repository layer.
 
+## Minimal domain/use-case map
+
+The product model is a local Telegram mirror with two deliberately separate
+directions:
+
+- **Acquire Telegram facts** — daemon-owned use cases contact Telegram and
+  materialize facts into SQLite.
+- **Serve agent reads** — MCP/daemon read use cases project SQLite state only;
+  they do not contact Telegram.
+
+This is the minimum DDD vocabulary for the current codebase:
+
+| Domain concept | Use case | Telegram access | Local output |
+| --- | --- | --- | --- |
+| Dialog | `dialog_sync` reconciliation | Dialog metadata, folders, topics | `dialogs`, folder/topic snapshots |
+| Message history | `FullSyncWorker` | Backward history batches | `messages`, FTS, aggregate reactions present on message objects |
+| Recent gaps | `DeltaSyncWorker` | Forward messages newer than local max id | New `messages`, FTS, aggregate reactions present on message objects |
+| Live events | `EventHandlerManager` | Telethon updates while daemon is online | New/edit/delete/read cursor rows; aggregate reaction updates |
+| Optional message facts | `message_fact_refresh` | Bounded per-message fact probes | Detailed reaction events/timestamps and exact outgoing-DM `read_at` facts |
+| Agent reading | `DaemonReadingService`, `DaemonAPIServer` read handlers | None | Structured MCP responses from local projections |
+
+The important distinction is not "one worker per entity"; it is whether a use
+case is acquiring Telegram facts or serving a deterministic local projection.
+For example, `DeltaSyncWorker` stores reactions that arrive on newly fetched
+message objects, but it does not chase reaction details for older messages:
+that is an optional fact refresh job with a separate RPC budget. A reaction can
+change on an old message without any new message id appearing, so it is not a
+message-gap concern.
+
+The long-term shape may become one acquisition scheduler with multiple job
+types (`fetch_new_messages`, `refresh_reaction_details`, `refresh_read_at`).
+Until that abstraction is real, separate small use cases are preferred over a
+large "Telegram worker" that mixes freshness, history, read-state, and optional
+fact semantics.
+
 ## Horizontal layers that remain
 
 Delivery transports, daemon composition, sync/delta/event workers, activity

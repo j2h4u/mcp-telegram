@@ -648,8 +648,8 @@ async def _resolve_entity_lookup(entity: str) -> ToolResult | _EntityLookup:
     try:
         async with daemon_connection() as conn:
             resolve_response = await conn.resolve_entity(query=entity)
-    except DaemonNotRunningError:
-        return error_result(_daemon_not_running_text())
+    except DaemonNotRunningError as exc:
+        return error_result(_daemon_not_running_text(exc))
 
     if not resolve_response.get("ok"):
         return error_result(entity_not_found_text(entity, retry_tool="GetEntityInfo"))
@@ -779,10 +779,10 @@ async def _get_entity_lookup(args: GetEntityInfo) -> ToolResult | _EntityLookup:
     name="get_entity_info",
     title="Entity Info",
     annotations=ToolAnnotations(
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=True,
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=True,
     ),
     output_schema=GET_ENTITY_INFO_OUTPUT_SCHEMA,
 )
@@ -795,8 +795,8 @@ async def get_entity_info(args: GetEntityInfo) -> ToolResult:
     try:
         async with daemon_connection() as conn:
             response = await conn.get_entity_info(entity_id=lookup.entity_id)
-    except DaemonNotRunningError:
-        return error_result(_daemon_not_running_text())
+    except DaemonNotRunningError as exc:
+        return error_result(_daemon_not_running_text(exc))
 
     if err := _entity_info_fetch_error(args, response):
         return err

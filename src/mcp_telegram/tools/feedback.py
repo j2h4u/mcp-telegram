@@ -85,10 +85,10 @@ class SubmitFeedback(ToolArgs):
     name="submit_feedback",
     title="Submit Feedback",
     annotations=ToolAnnotations(
-        readOnlyHint=False,
-        destructiveHint=False,
-        idempotentHint=False,
-        openWorldHint=False,
+        read_only_hint=False,
+        destructive_hint=False,
+        idempotent_hint=False,
+        open_world_hint=False,
     ),
     output_schema=SUBMIT_FEEDBACK_OUTPUT_SCHEMA,
 )
@@ -102,8 +102,8 @@ async def submit_feedback(args: SubmitFeedback) -> ToolResult:
                 model=args.model,
                 harness=args.harness,
             )
-    except DaemonNotRunningError:
-        return error_result(_daemon_not_running_text())
+    except DaemonNotRunningError as exc:
+        return error_result(_daemon_not_running_text(exc))
 
     if err := _check_daemon_response(response):
         return err

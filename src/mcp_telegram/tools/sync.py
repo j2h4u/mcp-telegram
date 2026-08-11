@@ -89,6 +89,8 @@ GET_SYNC_STATUS_OUTPUT_SCHEMA = {
         "delete_detection": {"type": ["string", "null"]},
         "sync_coverage_pct": {"type": ["integer", "null"]},
         "access_lost_at": {"type": ["integer", "null"]},
+        "access_last_revalidated_at": {"type": ["integer", "null"]},
+        "access_next_revalidate_at": {"type": ["integer", "null"]},
         "action": {"type": ["string", "null"]},
     },
     "required": [
@@ -115,6 +117,8 @@ GET_SYNC_STATUS_OUTPUT_SCHEMA = {
         "delete_detection",
         "sync_coverage_pct",
         "access_lost_at",
+        "access_last_revalidated_at",
+        "access_next_revalidate_at",
         "action",
     ],
     "additionalProperties": False,
@@ -274,10 +278,10 @@ class MarkDialogForSync(ToolArgs):
     name="mark_dialog_for_sync",
     title="Mark Sync",
     annotations=ToolAnnotations(
-        readOnlyHint=False,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=True,
+        read_only_hint=False,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=True,
     ),
     output_schema=MARK_DIALOG_FOR_SYNC_OUTPUT_SCHEMA,
 )
@@ -288,8 +292,8 @@ async def mark_dialog_for_sync(args: MarkDialogForSync) -> ToolResult:
                 dialog_id=args.dialog_id,
                 enable=args.enable,
             )
-    except DaemonNotRunningError:
-        return error_result(_daemon_not_running_text())
+    except DaemonNotRunningError as exc:
+        return error_result(_daemon_not_running_text(exc))
 
     if err := _check_daemon_response(response):
         return err
@@ -322,10 +326,10 @@ class GetSyncStatus(ToolArgs):
     title="Sync Status",
     posture="secondary/helper",
     annotations=ToolAnnotations(
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=False,
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=False,
     ),
     output_schema=GET_SYNC_STATUS_OUTPUT_SCHEMA,
 )
@@ -333,8 +337,8 @@ async def get_sync_status(args: GetSyncStatus) -> ToolResult:
     try:
         async with daemon_connection() as conn:
             response = await conn.get_sync_status(dialog_id=args.dialog_id)
-    except DaemonNotRunningError:
-        return error_result(_daemon_not_running_text())
+    except DaemonNotRunningError as exc:
+        return error_result(_daemon_not_running_text(exc))
 
     if err := _check_daemon_response(response):
         return err
@@ -378,6 +382,8 @@ async def get_sync_status(args: GetSyncStatus) -> ToolResult:
         "delete_detection": data.get("delete_detection"),
         "sync_coverage_pct": data.get("sync_coverage_pct"),
         "access_lost_at": data.get("access_lost_at"),
+        "access_last_revalidated_at": data.get("access_last_revalidated_at"),
+        "access_next_revalidate_at": data.get("access_next_revalidate_at"),
         "action": _sync_status_action(status, message_count, total_messages, coverage_state),
     }
     return structured_result(structured_content, result_count=1)
@@ -488,10 +494,10 @@ def _alert_timestamp(alert: dict[str, object]) -> tuple[int, int, int, str]:
     title="Sync Alerts",
     posture="secondary/helper",
     annotations=ToolAnnotations(
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=False,
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=False,
     ),
     output_schema=GET_SYNC_ALERTS_OUTPUT_SCHEMA,
 )
@@ -499,8 +505,8 @@ async def get_sync_alerts(args: GetSyncAlerts) -> ToolResult:
     try:
         async with daemon_connection() as conn:
             response = await conn.get_sync_alerts(since=args.since, limit=args.limit)
-    except DaemonNotRunningError:
-        return error_result(_daemon_not_running_text())
+    except DaemonNotRunningError as exc:
+        return error_result(_daemon_not_running_text(exc))
 
     if err := _check_daemon_response(response):
         return err

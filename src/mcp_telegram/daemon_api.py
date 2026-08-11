@@ -93,14 +93,18 @@ from .daemon_dialog_queries import (
     build_sync_read_model,
 )
 from .daemon_entity_info import DaemonEntityInfoService, EntityInfoDeps
+from .daemon_message import (
+    cached_reaction_freshness,
+    project_cached_message_facts,
+)
 from .daemon_message_queries import (
     _FETCH_UNREAD_MESSAGES_SQL,
     _read_message_from_row,
 )
 from .daemon_read_state_queries import _dialog_type_from_db, _read_state_for_dialog
-from .folders.sqlite_repository import dialog_placement, folders_by_dialog, list_folder_messages, list_folders
+from .folders.read_model import dialog_placement, folders_by_dialog, list_folder_messages, list_folders
+from .important_events.read_model import list_important_events as read_important_events
 from .models import DialogType, ReadMessage
-from .telegram_fact_queries import enrich_reaction_events, enrich_read_at
 from .topics.contracts import TopicSourceUnavailableError
 from .topics.refresh import TopicRefresher
 
@@ -151,19 +155,16 @@ def _coerce_int(value: object, default: int) -> int:
 
 
 from .budget import allocate_message_budget_proportional, unread_chat_tier
-from .daemon_message import fetch_reaction_counts
 from .daemon_source_export import (
     _describe_source,
     _export_source_changes,
     _read_source_unit_window,
 )
 from .feedback_db import VALID_SEVERITIES, VALID_STATUSES
-from .formatter import format_reaction_counts
 from .reactions.contracts import ReactionFreshness
 from .reactions.refresh import ReactionFreshener
 from .telegram_fragments import FragmentContextService, TelethonTelegramFragmentGateway
 from .telegram_history import TelethonTelegramHistoryGateway
-from .telegram_read_receipts import TelethonTelegramReadReceiptGateway
 
 
 class _LoggerLike(Protocol):
@@ -437,11 +438,9 @@ class DaemonAPIServer:
         self._ready: bool = False
         self.startup_detail: str = "connecting to Telegram"
         self._reading_service: DaemonReadingService | None = None
-        self._reaction_freshener = reaction_freshener
         self._topic_refresher = topic_refresher
         self._policy = policy
         self._health_status = health_status
-        self._read_receipt_gateway = TelethonTelegramReadReceiptGateway(self._client)
         self._activity_stats_service: _activity_stats.DaemonActivityStatsService | None = None
         self._folder_snapshot_refresh: Callable[[], Awaitable[bool]] | None = None
         self._folder_refresh_lock = asyncio.Lock()
@@ -489,10 +488,7 @@ class DaemonAPIServer:
                         self._conn,
                         TelethonTelegramFragmentGateway(self._client),
                     ),
-                    reaction_freshener=self._reaction_freshener,
                     history_gateway=TelethonTelegramHistoryGateway(self._client),
-                    read_receipt_gateway=self._read_receipt_gateway,
-                    read_at_ttl_seconds=self._policy.read_at_ttl_seconds,
                     logger=cast(ReadingLoggerLike, logger),
                     rid=_rid,
                 )
@@ -679,6 +675,7 @@ class DaemonAPIServer:
             "mark_dialog_for_sync": self._mark_dialog_for_sync,
             "get_sync_status": self._get_sync_status,
             "get_sync_alerts": self._get_sync_alerts,
+            "list_important_events": self._list_important_events,
             "get_entity_info": self._get_entity_info,
             "get_inbox": self._list_unread_messages,
             "record_telemetry": self._record_telemetry,
@@ -971,6 +968,8 @@ class DaemonAPIServer:
             return result
         memberships = folders_by_dialog(self._conn)
         requested_folder = req.get("folder_id")
+        raw_limit = req.get("limit")
+        limit = None if raw_limit is None else _clamp(_coerce_int(raw_limit, 100), 1, 500)
         data = cast(dict[str, object], result.get("data", {}))
         dialogs = cast(list[dict[str, object]], data.get("dialogs", []))
         enriched = []
@@ -981,6 +980,8 @@ class DaemonAPIServer:
             dialog["folders"] = folders
             if requested_folder is None or int(cast(int | str, requested_folder)) in ids:
                 enriched.append(dialog)
+                if limit is not None and len(enriched) >= limit:
+                    break
         data["dialogs"] = enriched
         return result
 
@@ -1153,10 +1154,7 @@ class DaemonAPIServer:
         - Positive → DM/small group → "best-effort weekly (DM)"
         """
         dialog_id = _coerce_int(req.get("dialog_id", 0), 0)
-        row = cast(
-            tuple[object, object, object, object, object, object, object, object] | None,
-            self._conn.execute(_GET_SYNC_STATUS_SQL, (dialog_id,)).fetchone(),
-        )
+        row = cast(tuple[object, ...] | None, self._conn.execute(_GET_SYNC_STATUS_SQL, (dialog_id,)).fetchone())
 
         if row is not None:
             status = str(row[0])
@@ -1167,6 +1165,7 @@ class DaemonAPIServer:
             access_lost_at = cast(int | None, row[5])
             last_delta_checked_at = cast(int | None, row[6])
             delta_refresh_requested_at = cast(int | None, row[7])
+            access_revalidation = (cast(int | None, row[8]), cast(int | None, row[9]))
         else:
             status = "not_synced"
             last_synced_at = None
@@ -1176,12 +1175,10 @@ class DaemonAPIServer:
             access_lost_at = None
             last_delta_checked_at = None
             delta_refresh_requested_at = None
+            access_revalidation = (None, None)
 
         count_row = cast(tuple[object] | None, self._conn.execute(_COUNT_SYNCED_MESSAGES_SQL, (dialog_id,)).fetchone())
         message_count = int(cast(int | str, count_row[0])) if count_row is not None else 0
-
-        sync_coverage_pct = _compute_sync_coverage(total_messages, message_count)
-        delete_detection = "reliable (channel)" if dialog_id < 0 else "best-effort weekly (DM)"
 
         data: dict = {
             "dialog_id": dialog_id,
@@ -1194,9 +1191,11 @@ class DaemonAPIServer:
             "sync_progress": sync_progress,
             "sync_progress_message_id": sync_progress,
             "total_messages": total_messages,
-            "delete_detection": delete_detection,
-            "sync_coverage_pct": sync_coverage_pct,
+            "delete_detection": "reliable (channel)" if dialog_id < 0 else "best-effort weekly (DM)",
+            "sync_coverage_pct": _compute_sync_coverage(total_messages, message_count),
             "access_lost_at": access_lost_at,
+            "access_last_revalidated_at": access_revalidation[0],
+            "access_next_revalidate_at": access_revalidation[1],
             **build_sync_read_model(
                 status=status,
                 timestamps=(last_synced_at, last_event_at, last_delta_checked_at),
@@ -1273,6 +1272,18 @@ class DaemonAPIServer:
     # ------------------------------------------------------------------
     # get_entity_info
     # ------------------------------------------------------------------
+
+    def _list_important_events(self, req: dict[str, object]) -> dict:
+        """Return recent daemon-observed important events."""
+        last_hours = _clamp(_coerce_int(req.get("last_hours", 24), 24), 1, 24 * 30)
+        timezone = req.get("timezone", "UTC")
+        if not isinstance(timezone, str):
+            return {"ok": False, "error": "invalid_input", "message": "timezone must be a string"}
+        try:
+            events = read_important_events(self._conn, last_hours=last_hours, timezone=timezone)
+        except ValueError, TypeError:
+            return {"ok": False, "error": "invalid_input", "message": "timezone must be a valid IANA timezone"}
+        return {"ok": True, "data": {"timezone": timezone, "last_hours": last_hours, "events": events}}
 
     async def _get_entity_info(self, req: dict[str, object]) -> dict:
         """Type-tagged entity inspector covering 5 Telegram entity kinds."""
@@ -1471,29 +1482,16 @@ class DaemonAPIServer:
         dialog_id: int,
         rows: list[Mapping[str, object]],
     ) -> tuple[list[ReadMessage], ReactionFreshness | None]:
-        """Freshen and render reactions for one unread group."""
-        message_ids = [int(cast(int | str, row["message_id"])) for row in rows]
-        if not message_ids:
+        """Render cached optional facts for one unread group without Telegram RPC."""
+        if not rows:
             return [_read_message_from_row(row) for row in rows], None
 
-        freshness = await self._reaction_freshener.refresh(dialog_id, dialog_id, message_ids)
-        reaction_map = fetch_reaction_counts(self._conn, dialog_id, message_ids)
-        messages = [
-            _read_message_from_row(
-                row,
-                reactions_display=format_reaction_counts(reaction_map.get(int(cast(int | str, row["message_id"])), [])),
-            )
-            for row in rows
-        ]
-        messages = enrich_reaction_events(self._conn, dialog_id, messages)
-        messages = await enrich_read_at(
+        messages = project_cached_message_facts(
             self._conn,
-            self._read_receipt_gateway,
             dialog_id,
-            messages,
-            dialog_type=_dialog_type_from_db(self._conn, dialog_id),
-            read_at_ttl_seconds=self._policy.read_at_ttl_seconds,
+            [_read_message_from_row(row) for row in rows],
         )
+        freshness = cached_reaction_freshness(len(messages))
         return messages, freshness
 
     # ------------------------------------------------------------------

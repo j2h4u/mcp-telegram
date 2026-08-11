@@ -504,6 +504,27 @@ async def test_list_topics_convenience() -> None:
     assert req["dialog_id"] == 123
 
 
+@pytest.mark.asyncio
+async def test_list_important_events_convenience() -> None:
+    """list_important_events sends the compact recent-window request."""
+    reader = MagicMock(spec=asyncio.StreamReader)
+    writer = MagicMock(spec=asyncio.StreamWriter)
+    conn = DaemonConnection(reader, writer)
+
+    captured: list[dict] = []
+
+    async def _mock_request(payload: dict) -> dict:
+        captured.append(payload)
+        return {"ok": True, "data": {"timezone": "Asia/Almaty", "last_hours": 6, "events": []}}
+
+    conn.request = _mock_request  # type: ignore[method-assign]
+
+    await conn.list_important_events(last_hours=6, timezone="Asia/Almaty")
+
+    req = captured[0]
+    assert req == {"method": "list_important_events", "last_hours": 6, "timezone": "Asia/Almaty"}
+
+
 # ---------------------------------------------------------------------------
 # Convenience method: get_me
 # ---------------------------------------------------------------------------

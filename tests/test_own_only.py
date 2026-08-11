@@ -88,6 +88,7 @@ def test_candidate_query_keeps_rights_classification_out_of_sql() -> None:
         conn.execute(
             "CREATE TABLE dialogs (dialog_id INTEGER, name TEXT, type TEXT, linked_chat_id INTEGER, last_message_at INTEGER, hidden INTEGER)"
         )
+        conn.execute("CREATE TABLE synced_dialogs (dialog_id INTEGER PRIMARY KEY, status TEXT)")
         conn.executemany(
             "INSERT INTO dialogs VALUES (?, ?, ?, ?, ?, ?)",
             [
@@ -95,7 +96,12 @@ def test_candidate_query_keeps_rights_classification_out_of_sql() -> None:
                 (-1000000009001, "channel", "channel", -1000000008001, 20, 0),
                 (-1000000008001, "discussion", "forum", None, 30, 0),
                 (-1000000007001, "other", "supergroup", None, 40, 0),
+                (-1000000006001, "lost", "channel", None, 50, 1),
             ],
+        )
+        conn.execute(
+            "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'access_lost')",
+            (-1000000006001,),
         )
         assert [row["dialog_id"] for row in query_own_only_candidates(conn, personal_channel_id=9001)] == [
             -1000000009001,

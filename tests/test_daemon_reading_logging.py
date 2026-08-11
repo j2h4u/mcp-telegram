@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Mapping, Sequence
 from typing import cast
 
 import pytest
@@ -27,9 +27,6 @@ from mcp_telegram.daemon_reading import (
 from mcp_telegram.models import ReadMessage
 from mcp_telegram.pagination import HistoryDirection, decode_navigation_token
 from mcp_telegram.reactions.contracts import ReactionFreshness
-from mcp_telegram.reactions.refresh import ReactionFreshener
-from mcp_telegram.reactions.sqlite_repository import SQLiteReactionSnapshotRepository
-from mcp_telegram.reactions.telegram_adapter import TelethonTelegramReactionGateway
 from mcp_telegram.telegram_fragments import FragmentContextService, TelethonTelegramFragmentGateway
 from mcp_telegram.telegram_history import TelethonTelegramHistoryGateway
 from mcp_telegram.telegram_reading import HistoryFetchResult, TelegramHistoryGateway
@@ -84,12 +81,6 @@ class _PagedHistoryGateway:
         return HistoryFetchResult(messages=page)
 
 
-class _NoopReactionFreshener:
-    async def refresh(self, dialog_id: int, peer_id: int, message_ids: list[int]) -> object:
-        _ = (dialog_id, peer_id, message_ids)
-        return object()
-
-
 @pytest.mark.parametrize(
     ("value", "default", "expected"),
     [(17, 0, 17), ("18", 0, 18), (None, 0, 0), (None, 9, 9)],
@@ -141,10 +132,8 @@ def test_read_state_per_dialog_skips_non_dm_and_zero_dialogs() -> None:
             conn=conn,
             sync_db_path=None,
             self_id=1,
-            read_at_ttl_seconds=600,
             resolve_dialog_id=lambda _dialog_id, _dialog: asyncio.sleep(0, result=0),
             fragment_context=cast(FragmentContextService, object()),
-            reaction_freshener=cast(ReactionFreshener, object()),
             history_gateway=cast(TelegramHistoryGateway, object()),
             logger=_TestLogger(),
             rid=lambda: "",
@@ -252,10 +241,8 @@ def _telegram_service(gateway: _PagedHistoryGateway, conn: sqlite3.Connection | 
             conn=conn or sqlite3.connect(":memory:"),
             sync_db_path=None,
             self_id=1,
-            read_at_ttl_seconds=600,
             resolve_dialog_id=lambda _dialog_id, _dialog: asyncio.sleep(0, result=0),
             fragment_context=cast(FragmentContextService, object()),
-            reaction_freshener=cast(ReactionFreshener, object()),
             history_gateway=gateway,
             logger=_TestLogger(),
             rid=lambda: "",
@@ -335,7 +322,7 @@ async def test_search_scoped_result_applies_time_bounds_and_keeps_cursor_context
 
     async def fake_build(
         dialog_id: int,
-        rows: list[object],
+        rows: Sequence[object],
         *,
         log_rendered: bool,
     ) -> tuple[list[ReadMessage], ReactionFreshness]:
@@ -351,7 +338,14 @@ async def test_search_scoped_result_applies_time_bounds_and_keeps_cursor_context
         )
 
     service._build_read_messages_from_rows = fake_build  # type: ignore[method-assign]
-    service._read_state_per_dialog = lambda _messages: {123: {"inbox_unread_count": 0}}  # type: ignore[method-assign]
+    service._read_state_per_dialog = lambda _messages: {  # type: ignore[assignment]
+        123: {
+            "inbox_unread_count": 0,
+            "outbox_unread_count": 0,
+            "inbox_cursor_state": "populated",
+            "outbox_cursor_state": "populated",
+        }
+    }
     monkeypatch.setattr("mcp_telegram.daemon_reading._build_access_metadata", lambda *_args: {"dialog_access": "live"})
     request = _SearchMessagesRequest(
         dialog_id=123,
@@ -388,14 +382,8 @@ async def test_list_messages_telegram_entity_miss_logs_structured_warning_withou
             conn=conn,
             sync_db_path=None,
             self_id=1,
-            read_at_ttl_seconds=600,
             resolve_dialog_id=lambda _dialog_id, _dialog: asyncio.sleep(0, result=0),
             fragment_context=FragmentContextService(conn, TelethonTelegramFragmentGateway(_EntityMissingClient())),
-            reaction_freshener=ReactionFreshener(
-                SQLiteReactionSnapshotRepository(conn),
-                TelethonTelegramReactionGateway(_EntityMissingClient()),
-                freshness_ttl_seconds=600,
-            ),
             history_gateway=TelethonTelegramHistoryGateway(_EntityMissingClient()),
             logger=logger,
             rid=lambda: " request_id=test-rid",
@@ -476,10 +464,8 @@ async def test_build_read_messages_projects_persisted_reaction_events() -> None:
             conn=conn,
             sync_db_path=None,
             self_id=1,
-            read_at_ttl_seconds=600,
             resolve_dialog_id=lambda _dialog_id, _dialog: asyncio.sleep(0, result=0),
             fragment_context=cast(FragmentContextService, object()),
-            reaction_freshener=cast(ReactionFreshener, _NoopReactionFreshener()),
             history_gateway=cast(TelegramHistoryGateway, object()),
             logger=logger,
             rid=lambda: "",

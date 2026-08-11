@@ -32,6 +32,7 @@ from mcp_telegram.tools import (
     ListDialogs,
     ListFolderMessages,
     ListFolders,
+    ListImportantEvents,
     ListMessages,
     ListTopics,
     MarkDialogForSync,
@@ -46,6 +47,7 @@ from mcp_telegram.tools import (
     list_dialogs,
     list_folder_messages,
     list_folders,
+    list_important_events,
     list_messages,
     list_topics,
     mark_dialog_for_sync,
@@ -116,13 +118,13 @@ def _call_kwargs(mock: _AsyncMethodMock) -> dict[str, object]:
 def _structured_payload(result: StructuredResult) -> dict[str, object] | None:
     if isinstance(result, ToolResult):
         return result.structured_content
-    return result.structuredContent
+    return cast(dict[str, object] | None, result.structured_content)
 
 
 def _is_error(result: StructuredResult) -> bool | None:
     if isinstance(result, ToolResult):
         return result.is_error
-    return result.isError
+    return result.is_error
 
 
 def _text_content(result: StructuredResult) -> str:
@@ -136,6 +138,7 @@ class _DaemonConnStub:
     list_dialogs: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
     list_folders: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
     list_folder_messages: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
+    list_important_events: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
     list_topics: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
     get_me: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
     mark_dialog_for_sync: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
@@ -216,6 +219,28 @@ STRUCTURED_TOOL_CASES = {
         list_folders,
         ListFolders(),
         {"ok": True, "data": {"folders": [{"id": 2, "title": "Work"}]}},
+    ),
+    "list_important_events": (
+        list_important_events,
+        ListImportantEvents(last_hours=6, timezone="Asia/Almaty"),
+        {
+            "ok": True,
+            "data": {
+                "timezone": "Asia/Almaty",
+                "last_hours": 6,
+                "events": [
+                    {
+                        "time": "2026-08-08T12:00:00+05:00",
+                        "time_basis": "observed",
+                        "type": "access_lost",
+                        "summary": "Access lost",
+                        "dialog_id": 123,
+                        "dialog_title": "Work Chat",
+                        "message_id": None,
+                    }
+                ],
+            },
+        },
     ),
     "list_dialogs": (
         list_dialogs,
@@ -619,6 +644,7 @@ def _make_daemon_conn(response: dict | None = None) -> _DaemonConnStub:
     conn.list_dialogs = _AsyncMethodMock(return_value=r)
     conn.list_folders = _AsyncMethodMock(return_value=r)
     conn.list_folder_messages = _AsyncMethodMock(return_value=r)
+    conn.list_important_events = _AsyncMethodMock(return_value=r)
     conn.list_topics = _AsyncMethodMock(return_value=r)
     conn.get_me = _AsyncMethodMock(return_value=r)
     conn.mark_dialog_for_sync = _AsyncMethodMock(return_value=r)
@@ -661,6 +687,7 @@ class _patch_daemon:
             "mcp_telegram.tools.account_trace.daemon_connection",
             "mcp_telegram.tools.feedback.daemon_connection",
             "mcp_telegram.tools.folders.daemon_connection",
+            "mcp_telegram.tools.important_events.daemon_connection",
         ]
         for target in targets:
             p = patch(target, side_effect=lambda c=self._conn: _fake_daemon_cm(c))
@@ -695,6 +722,7 @@ class _patch_daemon_not_running:
             "mcp_telegram.tools.account_trace.daemon_connection",
             "mcp_telegram.tools.feedback.daemon_connection",
             "mcp_telegram.tools.folders.daemon_connection",
+            "mcp_telegram.tools.important_events.daemon_connection",
         ]
         for target in targets:
             p = patch(target, return_value=_raise_not_running())
@@ -756,6 +784,7 @@ async def test_list_dialogs_via_daemon():
         "filter": None,
         "message_state": "all",
         "scope": "all",
+        "limit": None,
     }
     first_dialog = _json_dict(dialogs[0])
     assert first_dialog["id"] == 123
@@ -769,6 +798,19 @@ async def test_list_dialogs_via_daemon():
     assert "access_lost_at" in first_dialog
     assert _json_dict(dialogs[1])["synced"] is False
     conn.list_dialogs.assert_called_once()
+
+
+async def test_list_dialogs_passes_limit_to_daemon():
+    """ListDialogs preserves optional limit instead of letting Pydantic drop it as an unknown field."""
+    conn = _make_daemon_conn({"ok": True, "data": {"dialogs": []}})
+    with _patch_daemon(conn):
+        result = await list_dialogs(ListDialogs(limit=1))
+
+    assert result.content == ()
+    payload = _json_dict(result.structured_content)
+    assert _json_dict(payload["filters"])["limit"] == 1
+    conn.list_dialogs.assert_called_once()
+    assert _call_kwargs(conn.list_dialogs)["limit"] == 1
 
 
 async def test_list_dialogs_structured_output_allows_null_name():
@@ -1576,6 +1618,22 @@ async def test_list_messages_daemon_not_running():
     assert "not running" in text.lower() or "mcp-telegram sync" in text.lower()
 
 
+async def test_list_messages_daemon_response_timeout_is_not_reported_as_not_running():
+    """ListMessages distinguishes daemon IPC stalls from a stopped daemon."""
+
+    @asynccontextmanager
+    async def raising_dc():
+        raise DaemonNotRunningError("Sync daemon timed out waiting for response.", kind="response_timeout")
+        yield  # pragma: no cover
+
+    with patch("mcp_telegram.tools.reading.daemon_connection", raising_dc):
+        result = await list_messages(ListMessages(exact_dialog_id=123))
+
+    text = _result_text(result)
+    assert "did not respond" in text
+    assert "Start it with: mcp-telegram sync" not in text
+
+
 async def test_search_messages_daemon_not_running():
     """SearchMessages returns actionable error when daemon is not running."""
     with _patch_daemon_not_running():
@@ -1745,6 +1803,8 @@ async def test_get_sync_status_via_daemon():
         "delete_detection": "reliable (channel)",
         "sync_coverage_pct": None,
         "access_lost_at": None,
+        "access_last_revalidated_at": None,
+        "access_next_revalidate_at": None,
         "action": "Full history was fetched as of last_synced_at; ongoing freshness is represented by local_knowledge_at. sync_progress is a message_id offset, not a count. Treat sync_coverage_pct as an approximate local-vs-Telegram ratio.",
         "time_context": {
             "timezone": "UTC",

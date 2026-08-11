@@ -328,6 +328,7 @@ class DaemonConnection:
         message_state: str = "all",
         scope: str = "all",
         folder_id: int | None = None,
+        limit: int | None = None,
     ) -> dict:
         """List dialogs with optional archive/pin/name filtering."""
         payload: dict = {
@@ -341,6 +342,8 @@ class DaemonConnection:
         payload["scope"] = scope
         if folder_id is not None:
             payload["folder_id"] = folder_id
+        if limit is not None:
+            payload["limit"] = limit
         return await self.request(payload)
 
     async def list_folders(self) -> dict:
@@ -460,6 +463,10 @@ class DaemonConnection:
     async def record_telemetry(self, *, event: dict) -> dict:
         """Write a telemetry event to sync.db."""
         return await self.request({"method": "record_telemetry", "event": event})
+
+    async def list_important_events(self, *, last_hours: int = 24, timezone: str = "UTC") -> dict:
+        """Return recent daemon-observed important events."""
+        return await self.request({"method": "list_important_events", "last_hours": last_hours, "timezone": timezone})
 
     async def get_usage_stats(self, *, since: int | None = None) -> dict:
         """Return usage statistics from sync.db."""

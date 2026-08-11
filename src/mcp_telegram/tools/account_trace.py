@@ -377,10 +377,10 @@ def _trace_structured_content(data: dict, args: TraceAccountMessages) -> dict[st
     name="trace_account_messages",
     title="Account Trace",
     annotations=ToolAnnotations(
-        readOnlyHint=False,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=True,
+        read_only_hint=False,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=True,
     ),
     output_schema=TRACE_ACCOUNT_MESSAGES_OUTPUT_SCHEMA,
 )
@@ -400,8 +400,8 @@ async def trace_account_messages(args: TraceAccountMessages) -> ToolResult:
                 navigation=args.navigation,
                 coverage_goal=args.coverage_goal,
             )
-    except DaemonNotRunningError:
-        return error_result(_daemon_not_running_text(), has_filter=True, has_cursor=args.navigation is not None)
+    except DaemonNotRunningError as exc:
+        return error_result(_daemon_not_running_text(exc), has_filter=True, has_cursor=args.navigation is not None)
 
     if err := _check_daemon_response(
         response,

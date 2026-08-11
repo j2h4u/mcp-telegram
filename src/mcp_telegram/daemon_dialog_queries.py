@@ -232,7 +232,7 @@ _UNMARK_SYNC_SQL = "UPDATE synced_dialogs SET status = 'not_synced', sync_progre
 
 _GET_SYNC_STATUS_SQL = (
     "SELECT status, last_synced_at, last_event_at, sync_progress, total_messages, access_lost_at, "
-    "last_delta_checked_at, delta_refresh_requested_at "
+    "last_delta_checked_at, delta_refresh_requested_at, access_last_revalidated_at, access_next_revalidate_at "
     "FROM synced_dialogs WHERE dialog_id = ?"
 )
 _COUNT_SYNCED_MESSAGES_SQL = "SELECT COUNT(*) FROM messages WHERE dialog_id = ? AND is_deleted = 0"

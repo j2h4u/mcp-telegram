@@ -305,7 +305,7 @@ def test_schema_version_records_current_v18(tmp_path: Path) -> None:
     with _sync_db_connection(db_path) as conn:
         max_version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
         assert max_version == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 30  # v30 local delta catch-up fairness
+        assert _CURRENT_SCHEMA_VERSION == 31  # v31 access-lost cold revalidation
 
 
 def test_current_schema_repairs_missing_scheduled_fts(tmp_path: Path) -> None:
@@ -1044,7 +1044,7 @@ def test_migration_schema_version_is_current(tmp_path: Path) -> None:
     ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
         assert _fetchone_int(conn, "SELECT MAX(version) FROM schema_version") == _CURRENT_SCHEMA_VERSION
-        assert _CURRENT_SCHEMA_VERSION == 30
+        assert _CURRENT_SCHEMA_VERSION == 31
 
 
 def test_migration_v30_adds_delta_probe_columns(tmp_path: Path) -> None:

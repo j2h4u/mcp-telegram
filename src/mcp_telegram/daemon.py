@@ -62,6 +62,7 @@ from .activity_sync import _ActivityClient, run_activity_sync_loop
 from .config import McpTelegramConfig, SchedulingConfig, load_config, resolve_scheduling_config
 from .daemon_api import DaemonApiPolicy, DaemonAPIServer, DaemonClientLike
 from .delta_sync import (
+    AccessProbePolicy,
     DeltaCatchUpPolicy,
     DeltaSyncWorker,
     _DeltaSyncClient,
@@ -85,6 +86,10 @@ from .folders.refresh import FolderRefresher
 from .folders.sqlite_repository import SQLiteFolderSnapshotRepository
 from .folders.telegram_adapter import FolderClient, TelethonTelegramFolderGateway
 from .fts import backfill_fts_index
+from .message_fact_refresh import (
+    MessageFactRefreshPolicy,
+    run_message_fact_refresh_loop,
+)
 from .messages.sqlite_repository import insert_messages_with_fts
 from .messages.telegram_adapter import extract_message_row
 from .own_only import OwnOnlyContext, ensure_own_only_schema
@@ -102,6 +107,7 @@ from .sync_db import (
 )
 from .sync_worker import FullSyncWorker
 from .telegram import create_client
+from .telegram_read_receipts import TelethonTelegramReadReceiptGateway
 from .telegram_rpc import GovernedTelegramClient, GovernedTelegramClientTarget, TelegramRpcBudget, TelegramRpcGovernor
 from .topics.refresh import TopicRefresher
 from .topics.sqlite_repository import SQLiteTopicSnapshotRepository
@@ -228,6 +234,8 @@ class _SyncMainContext:
     feedback_conn: sqlite3.Connection
     shutdown_event: asyncio.Event
     client: _DaemonClient
+    reaction_freshener: ReactionFreshener
+    message_fact_refresh_policy: MessageFactRefreshPolicy
     api_server: DaemonAPIServer
     topic_refresher: TopicRefresher
     socket_path: Path
@@ -725,10 +733,30 @@ def _delta_catch_up_policy_from_scheduling(scheduling: SchedulingConfig) -> Delt
     )
 
 
+def _access_probe_policy_from_scheduling(scheduling: SchedulingConfig) -> AccessProbePolicy:
+    return AccessProbePolicy(
+        interval_seconds=scheduling.access_probe_interval_seconds,
+        max_dialogs_per_cycle=scheduling.access_probe_max_dialogs_per_cycle,
+        cooldown_seconds=scheduling.access_probe_cooldown_seconds,
+        probe_pause_seconds=scheduling.access_probe_pause_seconds,
+    )
+
+
 def _telegram_rpc_budget_from_config(config: McpTelegramConfig) -> TelegramRpcBudget:
     return TelegramRpcBudget(
         max_calls_per_period=config.telegram_rpc.max_calls_per_period,
         period_seconds=config.telegram_rpc.period_seconds,
+    )
+
+
+def _message_fact_refresh_policy_from_config(config: McpTelegramConfig) -> MessageFactRefreshPolicy:
+    return MessageFactRefreshPolicy(
+        interval_seconds=config.scheduling.message_fact_refresh_seconds,
+        reaction_max_messages_per_cycle=config.scheduling.message_fact_refresh_reaction_max_messages_per_cycle,
+        read_at_max_messages_per_cycle=config.scheduling.message_fact_refresh_read_at_max_messages_per_cycle,
+        pause_seconds=config.scheduling.message_fact_refresh_pause_seconds,
+        reaction_ttl_seconds=config.freshness.reactions.freshness_ttl_seconds,
+        read_at_ttl_seconds=config.freshness.read_receipts.read_at_ttl_seconds,
     )
 
 
@@ -820,6 +848,8 @@ async def _build_sync_main_context() -> _SyncMainContext:
         feedback_conn=feedback_conn,
         shutdown_event=shutdown_event,
         client=client,
+        reaction_freshener=reaction_freshener,
+        message_fact_refresh_policy=_message_fact_refresh_policy_from_config(config),
         api_server=api_server,
         topic_refresher=topic_refresher,
         socket_path=socket_path,
@@ -998,7 +1028,24 @@ async def _start_followup_background_tasks(
     )
     _create_tracked_task(
         ctx,
-        run_access_probe_loop(delta_client, ctx.conn, ctx.shutdown_event, delta_worker),
+        run_message_fact_refresh_loop(
+            ctx.conn,
+            ctx.reaction_freshener,
+            TelethonTelegramReadReceiptGateway(ctx.client),
+            ctx.shutdown_event,
+            ctx.message_fact_refresh_policy,
+        ),
+        name="message_fact_refresh_loop",
+    )
+    _create_tracked_task(
+        ctx,
+        run_access_probe_loop(
+            delta_client,
+            ctx.conn,
+            ctx.shutdown_event,
+            delta_worker,
+            _access_probe_policy_from_scheduling(ctx.scheduling),
+        ),
         name="access_probe_loop",
     )
     _create_tracked_task(

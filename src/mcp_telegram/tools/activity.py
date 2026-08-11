@@ -252,10 +252,10 @@ def _chronological_comments(comments: list[Mapping[str, object]]) -> list[Mappin
     name="get_my_recent_activity",
     title="Recent Activity",
     annotations=ToolAnnotations(
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=False,
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=False,
     ),
     output_schema=GET_MY_RECENT_ACTIVITY_OUTPUT_SCHEMA,
 )
@@ -270,8 +270,8 @@ async def get_my_recent_activity(args: GetMyRecentActivity) -> ToolResult:
                 sent_before=args.sent_before,
                 text_query=args.text_query,
             )
-    except DaemonNotRunningError:
-        return error_result(_daemon_not_running_text())
+    except DaemonNotRunningError as exc:
+        return error_result(_daemon_not_running_text(exc))
 
     if err := _check_daemon_response(response):
         return err

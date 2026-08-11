@@ -4,10 +4,24 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Iterable
-from typing import cast
+from typing import Protocol, cast, overload
 
 from .contracts import FolderSourceSnapshot
 from .ports import FolderSnapshotRepository
+
+
+class FolderReadCursor(Protocol):
+    def fetchall(self) -> object: ...
+
+    def fetchone(self) -> object | None: ...
+
+
+class FolderReadConnection(Protocol):
+    @overload
+    def execute(self, sql: str, /) -> FolderReadCursor: ...
+
+    @overload
+    def execute(self, sql: str, _: tuple[int, ...], /) -> FolderReadCursor: ...
 
 
 def _missing_table(exc: sqlite3.OperationalError) -> bool:
@@ -38,7 +52,7 @@ class SQLiteFolderSnapshotRepository(FolderSnapshotRepository):
         )
 
 
-def list_folders(conn: sqlite3.Connection) -> list[dict[str, object]]:
+def list_folders(conn: FolderReadConnection) -> list[dict[str, object]]:
     try:
         rows = cast(
             list[tuple[int, str]],
@@ -51,7 +65,7 @@ def list_folders(conn: sqlite3.Connection) -> list[dict[str, object]]:
     return [{"id": int(row[0]), "title": str(row[1])} for row in rows]
 
 
-def list_folder_messages(conn: sqlite3.Connection, folder_id: int, limit: int) -> dict[str, object]:
+def list_folder_messages(conn: FolderReadConnection, folder_id: int, limit: int) -> dict[str, object]:
     rows = cast(
         list[tuple[int, int, int, str | None, str | None]],
         conn.execute(
@@ -92,7 +106,7 @@ def list_folder_messages(conn: sqlite3.Connection, folder_id: int, limit: int) -
     }
 
 
-def folders_by_dialog(conn: sqlite3.Connection) -> dict[int, list[dict[str, object]]]:
+def folders_by_dialog(conn: FolderReadConnection) -> dict[int, list[dict[str, object]]]:
     result: dict[int, list[dict[str, object]]] = {}
     try:
         rows = cast(
@@ -113,7 +127,7 @@ def folders_by_dialog(conn: sqlite3.Connection) -> dict[int, list[dict[str, obje
     return result
 
 
-def dialog_placement(conn: sqlite3.Connection, dialog_id: int) -> dict[str, object]:
+def dialog_placement(conn: FolderReadConnection, dialog_id: int) -> dict[str, object]:
     try:
         archived_row = cast(
             tuple[int] | None, conn.execute("SELECT archived FROM dialogs WHERE dialog_id = ?", (dialog_id,)).fetchone()

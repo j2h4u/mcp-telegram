@@ -29,7 +29,7 @@ from mcp_telegram.flood import FloodWaitKillSwitchStatus
 from mcp_telegram.folders.sqlite_repository import replace_folder_snapshot
 from mcp_telegram.fts import MESSAGES_FTS_DDL, stem_text
 from mcp_telegram.models import DialogType
-from mcp_telegram.sync_db import ensure_sync_schema
+from mcp_telegram.sync_db import ensure_sync_schema, record_daemon_event
 from mcp_telegram.telethon_dialog import classify_dialog_type
 from mcp_telegram.topics.contracts import TopicFact
 from mcp_telegram.topics.refresh import TopicRefresher
@@ -374,6 +374,8 @@ def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.
             sync_progress       INTEGER DEFAULT 0,
             total_messages      INTEGER,
             access_lost_at      INTEGER,
+            access_last_revalidated_at INTEGER,
+            access_next_revalidate_at INTEGER,
             read_inbox_max_id   INTEGER,
             read_outbox_max_id  INTEGER
         )
@@ -924,7 +926,7 @@ async def test_reading_service_injects_fragment_failure() -> None:
 
 @pytest.mark.asyncio
 async def test_list_messages_context_window_own_only_uses_fragment_fetch() -> None:
-    """own_only dialogs should use bounded fragment fetch for anchor context."""
+    """own_only dialogs should only use bounded fragment fetch for anchor context."""
     DIALOG_ID = 7005
 
     conn = _make_db_for_fragment_context()
@@ -946,7 +948,7 @@ async def test_list_messages_context_window_own_only_uses_fragment_fetch() -> No
     assert result["data"]["coverage"] == "fragment"
     assert [m["message_id"] for m in _response_messages(result)] == [10, 11]
     client.get_input_entity.assert_awaited_once_with(DIALOG_ID)
-    assert _call_count(client.get_messages) == 2
+    assert _call_count(client.get_messages) == 1
     client.get_messages.assert_any_await(entity, ids=[10, 11, 12, 13, 14, 15])
 
 
@@ -1269,6 +1271,23 @@ async def test_list_dialogs_sync_status_via_sql() -> None:
     assert by_id[2]["sync_status"] == "not_synced"
     assert by_id[2]["archived"] is False
     cast(MagicMock, client.iter_dialogs).assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_list_dialogs_respects_limit_after_projection() -> None:
+    """list_dialogs applies limit to the final agent-visible projection."""
+    conn = _make_db_with_dialogs()
+    _seed_dialog_row(conn, 1, name="Chat One", type_="User", last_message_at=300)
+    _seed_dialog_row(conn, 2, name="Chat Two", type_="User", last_message_at=200)
+    _seed_dialog_row(conn, 3, name="Chat Three", type_="User", last_message_at=100)
+    server = make_server(conn)
+
+    result = await server._list_dialogs({"limit": 1})
+
+    assert result["ok"] is True
+    dialogs = result["data"]["dialogs"]
+    assert len(dialogs) == 1
+    assert dialogs[0]["id"] == 1
 
 
 @pytest.mark.asyncio
@@ -1918,6 +1937,44 @@ async def test_unknown_method() -> None:
 
     assert result["ok"] is False
     assert result["error"] == "unknown_method"
+
+
+@pytest.mark.asyncio
+async def test_list_important_events_dispatch_returns_recent_access_events(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = _register_sqlite_connection(sqlite3.connect(db_path))
+    conn.execute(
+        "INSERT INTO entities (id, type, name, updated_at) VALUES (?, ?, ?, ?)",
+        (123, "Channel", "Work Chat", 1_700_000_000),
+    )
+    record_daemon_event(conn, kind="access_lost", dialog_id=123, occurred_at=int(time.time()))
+    conn.commit()
+
+    result = await make_server(conn)._dispatch(
+        {"method": "list_important_events", "last_hours": 24 * 30, "timezone": "Asia/Almaty"}
+    )
+
+    assert result["ok"] is True
+    data = cast(dict[str, object], result["data"])
+    assert data["timezone"] == "Asia/Almaty"
+    assert data["last_hours"] == 24 * 30
+    events = cast(list[dict[str, object]], data["events"])
+    assert len(events) == 1
+    assert events[0]["time_basis"] == "observed"
+    assert events[0]["type"] == "access_lost"
+    assert events[0]["summary"] == "Access lost"
+    assert events[0]["dialog_id"] == 123
+    assert events[0]["dialog_title"] == "Work Chat"
+    assert events[0]["message_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_list_important_events_dispatch_rejects_bad_timezone() -> None:
+    result = await make_server()._dispatch({"method": "list_important_events", "timezone": 123})
+
+    assert result["ok"] is False
+    assert result["error"] == "invalid_input"
 
 
 @pytest.mark.asyncio

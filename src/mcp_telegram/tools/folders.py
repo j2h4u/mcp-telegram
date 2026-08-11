@@ -46,7 +46,9 @@ class ListFolders(ToolArgs):
     name="list_folders",
     title="List Telegram Folders",
     posture="secondary/helper",
-    annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False),
+    annotations=ToolAnnotations(
+        read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False
+    ),
     output_schema=LIST_FOLDERS_OUTPUT_SCHEMA,
 )
 async def list_folders(args: ListFolders) -> ToolResult:
@@ -124,7 +126,9 @@ class ListFolderMessages(ToolArgs):
     name="list_folder_messages",
     title="List Folder Messages",
     posture="primary",
-    annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False),
+    annotations=ToolAnnotations(
+        read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False
+    ),
     output_schema=LIST_FOLDER_MESSAGES_OUTPUT_SCHEMA,
 )
 async def list_folder_messages(args: ListFolderMessages) -> ToolResult:

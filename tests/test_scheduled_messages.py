@@ -16,7 +16,7 @@ from telethon.errors import ChannelPrivateError, FloodWaitError
 from telethon.tl.types import PeerUser
 
 from mcp_telegram.event_handlers import EventHandlerManager, _NewMessageEvent
-from mcp_telegram.own_only import OwnOnlyContext
+from mcp_telegram.own_only import OwnOnlyContext, query_own_only_candidates
 from mcp_telegram.scheduled_messages import (
     ScheduledMessageReconciler,
     _unix_timestamp,
@@ -297,6 +297,19 @@ async def test_reconciliation_access_lost_candidate_log_has_dialog_context(
     assert "hidden=True" in records[0].message
     assert "reason=ChannelPrivateError" in records[0].message
     assert records[0].exc_info is None
+    status_row = conn.execute(
+        "SELECT status, access_lost_at FROM synced_dialogs WHERE dialog_id = ?",
+        (private_channel_id,),
+    ).fetchone()
+    assert status_row is not None
+    assert status_row[0] == "access_lost"
+    assert status_row[1] is not None
+    event_row = conn.execute(
+        "SELECT kind, dialog_id FROM daemon_events WHERE dialog_id = ?",
+        (private_channel_id,),
+    ).fetchone()
+    assert event_row == ("access_lost", private_channel_id)
+    assert [row["dialog_id"] for row in query_own_only_candidates(conn, personal_channel_id=9001)] == []
 
 
 @pytest.mark.asyncio
