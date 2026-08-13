@@ -135,6 +135,32 @@ def _msg(msg_id: int, user_id: int, ts: int, **kwargs: Unpack[_MsgKwargs]) -> Fa
     )
 
 
+def test_trim_incremental_batch_keeps_message_at_min_date() -> None:
+    """The incremental window includes a message at its lower timestamp boundary."""
+    min_date = 1_700_000_000
+
+    in_window, past_window = activity_sync._trim_incremental_batch(
+        [_msg(2, 42, min_date + 1), _msg(1, 42, min_date)],
+        min_date,
+    )
+
+    assert [message.id for message in in_window] == [2, 1]
+    assert past_window is False
+
+
+def test_trim_incremental_batch_stops_at_first_message_before_window() -> None:
+    """An older message ends the newest-first batch without retaining its tail."""
+    min_date = 1_700_000_000
+
+    in_window, past_window = activity_sync._trim_incremental_batch(
+        [_msg(3, 42, min_date + 2), _msg(2, 42, min_date - 1), _msg(1, 42, min_date + 1)],
+        min_date,
+    )
+
+    assert [message.id for message in in_window] == [3]
+    assert past_window is True
+
+
 @pytest.fixture
 def conn(tmp_path: Path) -> Iterator[sqlite3.Connection]:
     connection = _make_db(tmp_path)
