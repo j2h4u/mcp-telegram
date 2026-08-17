@@ -13,6 +13,7 @@ from mcp_telegram.flood import (
     FloodWaitKillSwitchPolicy,
     TelethonFloodWaitMetricsFilter,
     flood_seconds,
+    install_telethon_flood_wait_metrics_filter,
     sleep_through_flood,
 )
 
@@ -184,6 +185,53 @@ def test_telethon_flood_wait_filter_observes_auto_sleep(monkeypatch: pytest.Monk
     rollup = accumulator.snapshot(now_mono=100.0)
     assert rollup.events_1h == 1
     assert rollup.wait_s_1h == 23
+
+
+def test_telethon_flood_wait_filter_ignores_unrelated_log_records(monkeypatch: pytest.MonkeyPatch) -> None:
+    observed: list[tuple[str, int]] = []
+    record = logging.LogRecord(
+        name="telethon.client.users",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg="Connected to Telegram data center",
+        args=(),
+        exc_info=None,
+    )
+
+    from mcp_telegram import flood as flood_module
+
+    monkeypatch.setattr(
+        flood_module,
+        "observe_flood_wait",
+        lambda *, source, seconds: observed.append((source, seconds)),
+    )
+
+    assert TelethonFloodWaitMetricsFilter().filter(record) is True
+    assert observed == []
+
+
+def test_install_telethon_flood_wait_metrics_filter_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
+    logger = logging.getLogger("telethon.client.users")
+    marker = "_mcp_telegram_flood_wait_metrics_installed"
+    original_filters = tuple(logger.filters)
+    monkeypatch.delattr(logger, marker, raising=False)
+
+    try:
+        install_telethon_flood_wait_metrics_filter()
+        added_filters = [flood_filter for flood_filter in logger.filters if flood_filter not in original_filters]
+
+        install_telethon_flood_wait_metrics_filter()
+
+        assert len(added_filters) == 1
+        assert isinstance(added_filters[0], TelethonFloodWaitMetricsFilter)
+        assert [
+            flood_filter for flood_filter in logger.filters if flood_filter not in original_filters
+        ] == added_filters
+    finally:
+        for flood_filter in logger.filters:
+            if flood_filter not in original_filters:
+                logger.removeFilter(flood_filter)
 
 
 # ---------------------------------------------------------------------------
