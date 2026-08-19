@@ -1576,6 +1576,105 @@ async def test_trace_account_messages_routes_flat_arguments_and_counts_evidence_
     assert call_kwargs["exact_topic_id"] == 7
 
 
+async def test_trace_account_messages_overwrites_wrappers_without_reprojecting_evidence() -> None:
+    """Trace replaces daemon wrappers but preserves already-projected raw evidence."""
+    evidence = _trace_evidence_group()
+    evidence["evidence"][1].update(
+        {
+            "text": "[site](https://example.test)",
+            "media_description": "photo attachment",
+            "content": {"text": "stale", "is_telegram_content": True, "content_kind": "note"},
+            "media_content": {"text": "stale media", "is_telegram_content": True, "content_kind": "note"},
+            "untrusted_content": True,
+        }
+    )
+    conn = _make_daemon_conn(_trace_daemon_payload(groups=[evidence]))
+
+    with _patch_daemon(conn):
+        result = await trace_account_messages(TraceAccountMessages(exact_account_id=101))
+
+    groups = _json_list(_json_dict(result.structured_content)["groups"])
+    items = _json_list(_json_dict(groups[0])["evidence"])
+    item = next(
+        _json_dict(candidate)
+        for candidate in items
+        if _json_dict(candidate).get("text") == "[site](https://example.test)"
+    )
+    assert item["text"] == "[site](https://example.test)"
+    assert item["media_description"] == "photo attachment"
+    assert item["content"] == {
+        "text": "[site](https://example.test)",
+        "is_telegram_content": True,
+        "content_kind": "message_text",
+    }
+    assert item["media_content"] == {
+        "text": "photo attachment",
+        "is_telegram_content": True,
+        "content_kind": "media_description",
+    }
+    assert item["untrusted_content"] is True
+
+
+@pytest.mark.parametrize(
+    ("text", "media_description", "expected_content", "expected_media_content"),
+    [
+        (
+            "caption",
+            None,
+            {"text": "caption", "is_telegram_content": True, "content_kind": "message_text"},
+            None,
+        ),
+        (
+            None,
+            "photo attachment",
+            {"text": "photo attachment", "is_telegram_content": True, "content_kind": "media_description"},
+            {"text": "photo attachment", "is_telegram_content": True, "content_kind": "media_description"},
+        ),
+        (
+            "caption",
+            "photo attachment",
+            {"text": "caption", "is_telegram_content": True, "content_kind": "message_text"},
+            {"text": "photo attachment", "is_telegram_content": True, "content_kind": "media_description"},
+        ),
+        (None, None, None, None),
+    ],
+)
+async def test_trace_content_schema_matches_canonical_body_presence(
+    text: str | None,
+    media_description: str | None,
+    expected_content: dict[str, object] | None,
+    expected_media_content: dict[str, object] | None,
+) -> None:
+    """Trace output validates for all body combinations and removes stale wrappers."""
+    evidence = dict(_trace_evidence_group()["evidence"][0])
+    evidence.update(
+        {
+            "text": text,
+            "media_description": media_description,
+            "content": {"text": "stale", "is_telegram_content": True, "content_kind": "note"},
+            "media_content": {"text": "stale media", "is_telegram_content": True, "content_kind": "note"},
+            "untrusted_content": True,
+        }
+    )
+    group = {"group_key": "dialog:-100123:topic:7", "group_label": "Forum / Topic", "evidence": [evidence]}
+    conn = _make_daemon_conn(_trace_daemon_payload(groups=[group]))
+
+    with _patch_daemon(conn):
+        result = await trace_account_messages(TraceAccountMessages(exact_account_id=101))
+
+    payload = _json_dict(result.structured_content)
+    validate(payload, cast(dict[str, object], TOOL_REGISTRY["trace_account_messages"].output_schema))
+    item = _json_dict(_json_list(_json_dict(_json_list(payload["groups"])[0])["evidence"])[0])
+    if expected_content is None:
+        assert "content" not in item
+    else:
+        assert item["content"] == expected_content
+    if expected_media_content is None:
+        assert "media_content" not in item
+    else:
+        assert item["media_content"] == expected_media_content
+
+
 async def test_trace_account_messages_unresolved_is_structured_non_error() -> None:
     response = _trace_daemon_payload(
         confidence="unresolved",
@@ -3294,6 +3393,41 @@ async def test_get_my_recent_activity_routes_primary():
         sent_before=None,
         text_query=None,
     )
+
+
+async def test_get_my_recent_activity_serializes_media_only_and_empty_body() -> None:
+    """Activity keeps its required content envelope for media and empty bodies."""
+    conn = _make_daemon_conn(
+        {
+            "ok": True,
+            "data": {
+                "comments": [
+                    {"dialog_id": 42, "message_id": 1, "sent_at": 1, "media_description": "[photo]"},
+                    {"dialog_id": 42, "message_id": 2, "sent_at": 2, "text": None, "media_description": None},
+                ],
+                "scan_status": "complete",
+                "scanned_at": 3,
+            },
+        }
+    )
+    with _patch_daemon(conn):
+        result = await get_my_recent_activity(GetMyRecentActivity(dialog_kinds=["all"]))
+
+    comments = _json_list(_json_dict(result.structured_content)["comments"])
+    media_comment = _json_dict(comments[0])
+    assert media_comment["text"] == "[photo]"
+    assert media_comment["content"] == {
+        "text": "[photo]",
+        "is_telegram_content": True,
+        "content_kind": "media_description",
+    }
+    empty_comment = _json_dict(comments[1])
+    assert empty_comment["text"] == ""
+    assert empty_comment["content"] == {
+        "text": "",
+        "is_telegram_content": True,
+        "content_kind": "message_text",
+    }
 
 
 async def test_get_my_recent_activity_passes_filter_args():

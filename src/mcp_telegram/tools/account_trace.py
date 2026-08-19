@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, cast
 
 from pydantic import Field, model_validator
 
-from ..message_content import MessageSnapshot, project_message_content
+from ..models import ContentKind
 from ._base import (
     DaemonNotRunningError,
     ToolAnnotations,
@@ -17,7 +17,12 @@ from ._base import (
     mcp_tool,
     structured_result,
 )
-from .structured import StructuredWarning, navigation_metadata, structured_warning, telegram_content
+from .structured import (
+    StructuredWarning,
+    navigation_metadata,
+    serialize_message_content,
+    structured_warning,
+)
 
 TRACE_ACCOUNT_MESSAGES_OUTPUT_SCHEMA = {
     "type": "object",
@@ -316,22 +321,37 @@ def _attach_trace_content_metadata(data: dict) -> None:
         for item in evidence_items:
             if not isinstance(item, dict):
                 continue
-            content = project_message_content(
-                MessageSnapshot(
-                    text=item.get("text") if isinstance(item.get("text"), str) else None,
-                    media_description=(
-                        item.get("media_description") if isinstance(item.get("media_description"), str) else None
-                    ),
+            text = item.get("text") if isinstance(item.get("text"), str) else None
+            media_description = (
+                item.get("media_description") if isinstance(item.get("media_description"), str) else None
+            )
+            content_kind = cast(
+                ContentKind,
+                {
+                    (False, False): "none",
+                    (False, True): "media_description",
+                    (True, False): "message_text",
+                    (True, True): "message_text",
+                }[(bool(text), bool(media_description))],
+            )
+            serialized = serialize_message_content(text, media_description, content_kind)
+            # These assignments intentionally overwrite daemon-provided
+            # wrappers.  The daemon owns projection; this tool owns only the
+            # canonical delivery envelope and must not re-project text.
+            item.pop("content", None)
+            item.pop("media_content", None)
+            item.update(
+                dict(
+                    filter(
+                        lambda entry: entry[1] is not None,
+                        (
+                            ("content", serialized["content"]),
+                            ("media_content", serialized["media"]),
+                        ),
+                    )
                 )
             )
-            if content.text:
-                item["text"] = content.text
-                item.setdefault("content", telegram_content(content.text, "message_text"))
-                item.setdefault("untrusted_content", True)
-            if content.media_description:
-                item["media_description"] = content.media_description
-                item.setdefault("media_content", telegram_content(content.media_description, "media_description"))
-                item.setdefault("untrusted_content", True)
+            _ = bool(text or media_description) and item.setdefault("untrusted_content", True)
 
 
 def _trace_evidence_key(item: dict) -> tuple[int, int, int]:
