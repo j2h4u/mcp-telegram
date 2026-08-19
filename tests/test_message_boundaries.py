@@ -229,6 +229,112 @@ def test_projection_imports_have_single_owner() -> None:
     assert any("canonical owner" in finding.message for finding in findings)
 
 
+def test_scheduled_mapper_must_use_canonical_read_projector() -> None:
+    gate = _gate()
+    path = gate.SOURCE_ROOT / "daemon_scheduled_queries.py"
+    source = "def scheduled_row_to_wire(row):\n    return dict(row)\n"
+    findings = gate.violations_for(path, source)
+    assert any("must call project_read_message_content directly" in finding.message for finding in findings)
+
+
+def test_scheduled_mapper_rejects_a_private_content_renderer_or_serializer() -> None:
+    gate = _gate()
+    path = gate.SOURCE_ROOT / "daemon_scheduled_queries.py"
+    source = (
+        "from .tools.structured import serialize_message_content\n"
+        "def scheduled_row_to_wire(row):\n"
+        "    project_read_message_content(row)\n"
+        "    return serialize_message_content(row.text, row.media_description, 'message_text')\n"
+    )
+    findings = gate.violations_for(path, source)
+    assert any("must not import private renderer/serializer symbols" in finding.message for finding in findings)
+
+
+def test_scheduled_mapper_rejects_aliased_private_serializer() -> None:
+    gate = _gate()
+    path = gate.SOURCE_ROOT / "daemon_scheduled_queries.py"
+    source = (
+        "from .tools.structured import serialize_message_content as encode_content\n"
+        "def scheduled_row_to_wire(row):\n"
+        "    project_read_message_content(row)\n"
+        "    return encode_content(row.text, row.media_description, 'message_text')\n"
+    )
+    findings = gate.violations_for(path, source)
+    assert any("must not import private renderer/serializer symbols" in finding.message for finding in findings)
+
+
+def test_scheduled_mapper_requires_exact_projector_provenance_and_rejects_shadowing() -> None:
+    gate = _gate()
+    path = gate.SOURCE_ROOT / "daemon_scheduled_queries.py"
+    wrong_import = (
+        "from .message_content import project_read_message_content\n"
+        "def scheduled_row_to_wire(row):\n"
+        "    message = project_read_message_content(row)\n"
+        "    return dataclasses.asdict(message)\n"
+    )
+    findings = gate.violations_for(path, wrong_import)
+    assert any("imported exactly from .daemon_message" in finding.message for finding in findings)
+
+    shadowed = (
+        "from .daemon_message import project_read_message_content\n"
+        "project_read_message_content = object()\n"
+        "def scheduled_row_to_wire(row):\n"
+        "    message = project_read_message_content(row)\n"
+        "    return dataclasses.asdict(message)\n"
+    )
+    findings = gate.violations_for(path, shadowed)
+    assert any("binding is shadowed locally" in finding.message for finding in findings)
+
+    shadowed_definition = (
+        "from .daemon_message import project_read_message_content\n"
+        "def project_read_message_content(row):\n"
+        "    return row\n"
+        "def scheduled_row_to_wire(row):\n"
+        "    message = project_read_message_content(row)\n"
+        "    return dataclasses.asdict(message)\n"
+    )
+    findings = gate.violations_for(path, shadowed_definition)
+    assert any("binding is shadowed locally" in finding.message for finding in findings)
+
+
+def test_scheduled_mapper_requires_exactly_one_module_entrypoint() -> None:
+    gate = _gate()
+    path = gate.SOURCE_ROOT / "daemon_scheduled_queries.py"
+    missing = "from .daemon_message import project_read_message_content\n"
+    findings = gate.violations_for(path, missing)
+    assert any("exactly one module-level scheduled_row_to_wire" in finding.message for finding in findings)
+    duplicate = (
+        "from .daemon_message import project_read_message_content\n"
+        "def scheduled_row_to_wire(row):\n"
+        "    return project_read_message_content(row)\n"
+        "def scheduled_row_to_wire(row):\n"
+        "    return project_read_message_content(row)\n"
+    )
+    findings = gate.violations_for(path, duplicate)
+    assert any("exactly one module-level scheduled_row_to_wire" in finding.message for finding in findings)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import mcp_telegram.message_content as content\n"
+        "def rogue(value):\n"
+        "    return content.MessageContent(text=value, media_description=None, kind='message_text')\n",
+        "import mcp_telegram.message_content\n"
+        "def rogue(value):\n"
+        "    return mcp_telegram.message_content.MessageContent(text=value, media_description=None, kind='message_text')\n",
+        "from .message_content import TelegramContent as Ctor\n"
+        "Alias = Ctor\n"
+        "def rogue(value):\n"
+        "    return Alias(text=value, media_description=None, kind='message_text')\n",
+    ],
+)
+def test_manual_content_constructors_reject_module_and_assignment_aliases(source: str) -> None:
+    gate = _gate()
+    findings = gate.violations_for(gate.SOURCE_ROOT / "rogue.py", source)
+    assert any("MessageContent must be produced" in finding.message for finding in findings)
+
+
 def test_baseline_has_no_message_boundary_violations() -> None:
     gate = _gate()
     assert gate.boundary_violations(gate.SOURCE_ROOT) == []

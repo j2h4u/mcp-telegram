@@ -58,6 +58,9 @@ MESSAGE_SQL_LEGACY_EXCEPTION_PATHS = frozenset(
 CONTENT_WRAPPER_PATH = "tools/structured.py"
 CONTENT_PROJECTOR_PATH = "message_content.py"
 RAW_PROJECTOR_PATH = "telegram_message_projection.py"
+SCHEDULED_CONTENT_PATH = "daemon_scheduled_queries.py"
+SCHEDULED_CONTENT_ENTRYPOINT = "scheduled_row_to_wire"
+SCHEDULED_PROJECTOR_NAME = "project_read_message_content"
 TEXT_PROJECTOR_PATH = "text_projection.py"
 TEXT_PROJECTOR_IMPORTERS = frozenset({"daemon_message.py", "message_content.py", RAW_PROJECTOR_PATH})
 RAW_PROJECTOR_IMPORTERS = frozenset({"daemon_message.py", "telegram_history.py"})
@@ -255,12 +258,78 @@ def _is_content_wrapper_call(node: ast.Call) -> bool:
     return _is_true(keywords.get("is_telegram_content")) and "content_kind" in keywords
 
 
-def _is_manual_content_constructor(node: ast.Call) -> bool:
-    return isinstance(node.func, ast.Name) and node.func.id in {"MessageContent", "TelegramContent"}
+_MANUAL_CONTENT_CONSTRUCTORS = frozenset({"MessageContent", "TelegramContent"})
+
+
+def _manual_content_bindings(tree: ast.AST) -> tuple[set[str], set[str]]:  # noqa: PLR0912
+    """Resolve local aliases for MessageContent/TelegramContent constructors."""
+    aliases = set(_MANUAL_CONTENT_CONSTRUCTORS)
+    module_aliases: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for imported in node.names:
+                if imported.name.endswith(".message_content"):
+                    module_aliases.add(imported.name)
+                    module_aliases.add(imported.asname or imported.name.rsplit(".", 1)[-1])
+        elif isinstance(node, ast.ImportFrom):
+            module = _import_module(node)
+            if module.endswith("message_content"):
+                for imported in node.names:
+                    if imported.name in _MANUAL_CONTENT_CONSTRUCTORS:
+                        aliases.add(imported.asname or imported.name)
+
+    for _ in range(len(aliases) + 1):
+        changed = False
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            value = node.value
+            source_name: str | None = None
+            if isinstance(value, ast.Name) and value.id in aliases:
+                source_name = value.id
+            elif isinstance(value, ast.Attribute) and value.attr in _MANUAL_CONTENT_CONSTRUCTORS:
+                dotted = _dotted_name(value.value)
+                if dotted in module_aliases:
+                    source_name = value.attr
+            if source_name is None:
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Name) and target.id not in aliases:
+                    aliases.add(target.id)
+                    changed = True
+        if not changed:
+            break
+    return aliases, module_aliases
+
+
+def _is_manual_content_constructor(
+    node: ast.Call,
+    *,
+    aliases: set[str],
+    module_aliases: set[str],
+) -> bool:
+    if isinstance(node.func, ast.Name):
+        return node.func.id in aliases
+    return (
+        isinstance(node.func, ast.Attribute)
+        and node.func.attr in _MANUAL_CONTENT_CONSTRUCTORS
+        and _dotted_name(node.func.value) in module_aliases
+    )
+
+
+def _dotted_name(node: ast.expr) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        prefix = _dotted_name(node.value)
+        return f"{prefix}.{node.attr}" if prefix is not None else None
+    return None
 
 
 def _content_violations(path: str, tree: ast.AST) -> list[Finding]:
     findings: list[Finding] = []
+    constructor_aliases, constructor_modules = _manual_content_bindings(tree)
     for node in ast.walk(tree):
         if isinstance(node, ast.Dict):
             keys = _dict_string_keys(node)
@@ -274,7 +343,11 @@ def _content_violations(path: str, tree: ast.AST) -> list[Finding]:
             findings.append(
                 Finding(path, node.lineno, "Telegram content dictionaries must use tools.structured.telegram_content")
             )
-        elif isinstance(node, ast.Call) and _is_manual_content_constructor(node) and path != CONTENT_PROJECTOR_PATH:
+        elif (
+            isinstance(node, ast.Call)
+            and _is_manual_content_constructor(node, aliases=constructor_aliases, module_aliases=constructor_modules)
+            and path != CONTENT_PROJECTOR_PATH
+        ):
             findings.append(
                 Finding(path, node.lineno, "MessageContent must be produced by message_content.project_message_content")
             )
@@ -308,6 +381,76 @@ def _projection_import_violations(path: str, tree: ast.AST) -> list[Finding]:
             and path not in RAW_PROJECTOR_IMPORTERS
         ):
             findings.append(Finding(path, _line(node), "raw Telegram message projection has a canonical owner"))
+    return findings
+
+
+def _scheduled_import_violations(path: str, tree: ast.AST) -> tuple[list[Finding], bool]:
+    findings: list[Finding] = []
+    canonical_import = False
+    private_symbols = {"project_message_content", "render_text_links", "serialize_message_content", "telegram_content"}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        imported_names = {alias.name for alias in node.names}
+        if imported_names & private_symbols:
+            findings.append(
+                Finding(path, node.lineno, "scheduled content must not import private renderer/serializer symbols")
+            )
+        if SCHEDULED_PROJECTOR_NAME not in imported_names:
+            continue
+        if _import_module(node) != ".daemon_message":
+            findings.append(Finding(path, node.lineno, "scheduled projector must come directly from .daemon_message"))
+        elif any(alias.name == SCHEDULED_PROJECTOR_NAME and alias.asname is None for alias in node.names):
+            canonical_import = True
+    return findings, canonical_import
+
+
+def _scheduled_shadow_violations(path: str, tree: ast.AST) -> list[Finding]:
+    findings: list[Finding] = []
+    for node in ast.walk(tree):
+        is_definition = isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        if is_definition and node.name == SCHEDULED_PROJECTOR_NAME:
+            findings.append(Finding(path, node.lineno, "canonical projector binding is shadowed locally"))
+            continue
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        if any(isinstance(target, ast.Name) and target.id == SCHEDULED_PROJECTOR_NAME for target in targets):
+            findings.append(Finding(path, _line(node), "canonical projector binding is shadowed locally"))
+    return findings
+
+
+def _scheduled_content_violations(path: str, tree: ast.AST) -> list[Finding]:
+    """Keep scheduled rows on the canonical projection seam."""
+    if path != SCHEDULED_CONTENT_PATH:
+        return []
+
+    findings, canonical_import = _scheduled_import_violations(path, tree)
+    findings.extend(_scheduled_shadow_violations(path, tree))
+    module_body = tree.body if isinstance(tree, ast.Module) else ()
+    mapper_nodes = [
+        node
+        for node in module_body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == SCHEDULED_CONTENT_ENTRYPOINT
+    ]
+
+    if not canonical_import:
+        findings.append(Finding(path, 1, "scheduled projector must be imported exactly from .daemon_message"))
+    if len(mapper_nodes) != 1:
+        findings.append(
+            Finding(path, 1, "scheduled content must have exactly one module-level scheduled_row_to_wire entrypoint")
+        )
+    if mapper_nodes and not any(
+        isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == SCHEDULED_PROJECTOR_NAME
+        for node in ast.walk(mapper_nodes[0])
+    ):
+        findings.append(
+            Finding(
+                path,
+                mapper_nodes[0].lineno,
+                "scheduled message content must call project_read_message_content directly",
+            )
+        )
     return findings
 
 
@@ -418,6 +561,7 @@ def violations_for(path: Path, source: str) -> list[Finding]:
     constants = _static_constants(tree)
     findings = _content_violations(relative, tree)
     findings.extend(_projection_import_violations(relative, tree))
+    findings.extend(_scheduled_content_violations(relative, tree))
     findings.extend(_raw_message_content_violations(relative, tree))
 
     sql_hits = [snippet for snippet in _sql_snippets(tree, constants) if _has_messages_from_or_join(snippet.text)]
