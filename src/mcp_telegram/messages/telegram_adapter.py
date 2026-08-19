@@ -504,7 +504,7 @@ def _extract_rich_text(value: object) -> str:
     return "".join(parts)
 
 
-def _extract_message_text(msg: object) -> str | None:
+def extract_message_text(msg: object) -> str | None:
     text = _attr(msg, "message", None)
     if isinstance(text, str) and text != "":
         return text
@@ -606,7 +606,7 @@ def extract_message_row(
         dialog_id=dialog_id,
         message_id=message_id,
         sent_at=_extract_sent_at(msg),
-        text=_extract_message_text(msg),
+        text=extract_message_text(msg),
         sender_id=_attr(msg, "sender_id", None),
         sender_first_name=_extract_sender_first_name(msg),
         media_description=_extract_media_description(msg),

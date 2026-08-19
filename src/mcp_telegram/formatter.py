@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 from typing import TypedDict, Unpack
 from zoneinfo import ZoneInfo
 
+from .message_content import MessageSnapshot, project_message_content
 from .models import DialogType, LinePrefixGetter, ReadMessage, ReadState, TopicNameGetter
 
 logger = logging.getLogger(__name__)
@@ -262,7 +263,9 @@ def _resolve_message_format_options(kwargs: _FormatMessagesKwargs) -> _MessageFo
 
 
 def _format_message_body(msg: ReadMessage, effective_tz: ZoneInfo) -> str:
-    text = frame_telegram_content(msg.text) if msg.text else _render_text(msg)
+    content = project_message_content(MessageSnapshot(text=msg.text, media_description=msg.media_description))
+    primary_text = content.primary_text
+    text = frame_telegram_content(primary_text) if primary_text is not None else ""
     if msg.edit_date is not None:
         ed_dt = datetime.fromtimestamp(msg.edit_date, tz=UTC).astimezone(effective_tz)
         text = f"{text} [edited {ed_dt.strftime('%H:%M')}]"
@@ -502,13 +505,6 @@ def resolve_sender_label(msg_or_row: object) -> str:
 
 def _resolve_sender_name(msg: ReadMessage) -> str:
     return resolve_sender_label(msg)
-
-
-def _render_text(msg: ReadMessage) -> str:
-    """Return message text, or a pre-formatted media placeholder."""
-    if msg.text:
-        return msg.text
-    return msg.media_description or ""
 
 
 def _format_reactions(msg: ReadMessage) -> str:

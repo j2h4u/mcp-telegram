@@ -7,6 +7,7 @@ from typing import cast
 from telethon.tl.types import MessageEntityTextUrl
 
 from mcp_telegram.daemon_message import project_cached_message_facts
+from mcp_telegram.message_content import MessageSnapshot, project_message_content
 from mcp_telegram.models import ReadMessage
 from mcp_telegram.telegram_message_projection import MessageLike, message_to_dict
 from mcp_telegram.text_projection import render_text_links
@@ -26,6 +27,26 @@ def test_render_text_links_escapes_markdown_label_syntax() -> None:
     assert render_text_links("read [this]", [(5, 6, "https://example.com")]) == (
         "read [\\[this\\]](https://example.com)"
     )
+
+
+def test_message_content_projector_preserves_text_and_media() -> None:
+    content = project_message_content(MessageSnapshot(text="caption", media_description="[photo]"))
+
+    assert content.text == "caption"
+    assert content.media_description == "[photo]"
+    assert content.kind == "message_text"
+    assert content.primary_text == "caption"
+
+
+def test_message_content_projector_distinguishes_media_only_and_none() -> None:
+    media = project_message_content(MessageSnapshot(text="", media_description="[photo]"))
+    empty = project_message_content(MessageSnapshot(text=None, media_description=None))
+
+    assert media.kind == "media_description"
+    assert media.text is None
+    assert media.primary_text == "[photo]"
+    assert empty.kind == "none"
+    assert empty.primary_text is None
 
 
 def test_cached_message_projection_renders_persisted_hidden_link() -> None:
@@ -75,3 +96,23 @@ def test_uncached_telegram_projection_renders_hidden_link() -> None:
     )
 
     assert message_to_dict(cast(MessageLike, message), dialog_id=10)["text"] == "[сайт](https://example.com)"
+
+
+def test_uncached_telegram_projection_uses_rich_message_text_fallback() -> None:
+    message = SimpleNamespace(
+        id=21,
+        date=None,
+        edit_date=None,
+        message=None,
+        rich_message=SimpleNamespace(text="rich caption"),
+        media=None,
+        out=False,
+        sender_id=10,
+        sender=None,
+        reactions=None,
+        reply_to=None,
+        entities=None,
+        action=None,
+    )
+
+    assert message_to_dict(cast(MessageLike, message), dialog_id=10)["text"] == "rich caption"
