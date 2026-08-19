@@ -1,7 +1,10 @@
 """Read-only custom Telegram folder discovery."""
 
+from typing import cast
+
 from pydantic import Field
 
+from ..message_content import ContentKind
 from ._base import (
     DaemonNotRunningError,
     ToolAnnotations,
@@ -14,7 +17,7 @@ from ._base import (
     mcp_tool,
     structured_result,
 )
-from .structured import TELEGRAM_CONTENT_OUTPUT_SCHEMA, telegram_content
+from .structured import TELEGRAM_CONTENT_OUTPUT_SCHEMA, serialize_message_content, telegram_content
 
 LIST_FOLDERS_OUTPUT_SCHEMA = {
     "type": "object",
@@ -100,8 +103,14 @@ LIST_FOLDER_MESSAGES_OUTPUT_SCHEMA = {
                         "required": TELEGRAM_CONTENT_OUTPUT_SCHEMA["required"],
                         "additionalProperties": False,
                     },
+                    "media": {
+                        "type": ["object", "null"],
+                        "properties": TELEGRAM_CONTENT_OUTPUT_SCHEMA["properties"],
+                        "required": TELEGRAM_CONTENT_OUTPUT_SCHEMA["required"],
+                        "additionalProperties": False,
+                    },
                 },
-                "required": ["dialog_id", "message_id", "sent_at", "dialog_name", "content"],
+                "required": ["dialog_id", "message_id", "sent_at", "dialog_name", "content", "media"],
                 "additionalProperties": False,
             },
         },
@@ -142,11 +151,17 @@ async def list_folder_messages(args: ListFolderMessages) -> ToolResult:
     data = response.get("data", {})
     messages = []
     for row in data.get("messages", []):
-        item = dict(row)
-        text = item.pop("text", None)
+        item = {key: value for key, value in row.items() if key not in {"text", "media_description"}}
+        text = row.get("text")
+        media_description = row.get("media_description")
         dialog_name = item.get("dialog_name")
         item["dialog_name"] = telegram_content(str(dialog_name), "message_text") if dialog_name is not None else None
-        item["content"] = telegram_content(str(text), "message_text") if text is not None else None
+        projected = serialize_message_content(
+            str(text) if text is not None else None,
+            str(media_description) if media_description is not None else None,
+            cast(ContentKind, row.get("content_kind", "none")),
+        )
+        item.update(projected)
         messages.append(item)
     payload = {
         "folder_id": args.folder_id,

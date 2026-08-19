@@ -30,7 +30,12 @@ from ._base import (
     mcp_tool,
     structured_result,
 )
-from .structured import StructuredWarning, TelegramContent, TelegramContentKind, structured_warning, telegram_content
+from .structured import (
+    StructuredWarning,
+    serialize_message_content,
+    structured_warning,
+    telegram_content,
+)
 
 # Archive coverage values are expressed as percentages.
 _ARCHIVE_COVERAGE_COMPLETE_PERCENT = 100
@@ -502,12 +507,6 @@ _READ_MARKER_METADATA = {
 }
 
 
-def _content_or_none(text: str | None, kind: TelegramContentKind) -> TelegramContent | None:
-    if not text:
-        return None
-    return telegram_content(text, kind)
-
-
 def _topic_candidate_payload(topic: dict) -> dict[str, object]:
     title = topic.get("title") or ""
     return {
@@ -557,12 +556,6 @@ def _structured_forward(from_name: str | None) -> dict[str, object] | None:
     return {
         "from_name": from_name,
     }
-
-
-def _structured_media(description: str | None) -> TelegramContent | None:
-    if not description:
-        return None
-    return telegram_content(description, "media_description")
 
 
 def _structured_reactions(display: str | None) -> dict[str, object] | None:
@@ -643,8 +636,9 @@ def _list_message_structured_item(
         item["is_service"] = True
 
     _maybe_add(item, "topic", _structured_topic(message))
-    _maybe_add(item, "content", _content_or_none(message.text, "message_text"))
-    _maybe_add(item, "media", _structured_media(message.media_description))
+    projected = serialize_message_content(message.text, message.media_description, message.content_kind)
+    _maybe_add(item, "content", projected["content"])
+    _maybe_add(item, "media", projected["media"])
     _maybe_add(
         item,
         "reply_context_ref",

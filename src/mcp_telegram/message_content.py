@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
 
+from .models import ContentKind
 from .text_projection import TextLink, render_text_links
-
-ContentKind = Literal["message_text", "media_description", "none"]
 
 
 @dataclass(frozen=True, slots=True)

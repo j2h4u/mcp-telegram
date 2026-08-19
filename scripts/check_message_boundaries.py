@@ -61,6 +61,20 @@ RAW_PROJECTOR_PATH = "telegram_message_projection.py"
 TEXT_PROJECTOR_PATH = "text_projection.py"
 TEXT_PROJECTOR_IMPORTERS = frozenset({"daemon_message.py", "message_content.py", RAW_PROJECTOR_PATH})
 RAW_PROJECTOR_IMPORTERS = frozenset({"daemon_message.py", "telegram_history.py"})
+MESSAGE_BODY_SERIALIZER_PATHS = frozenset({"tools/reading.py", "tools/unread.py", "tools/folders.py"})
+MESSAGE_BODY_ENTRYPOINTS = {
+    "tools/reading.py": frozenset({"_list_message_structured_item"}),
+    "tools/unread.py": frozenset({"_structured_messages"}),
+    "tools/folders.py": frozenset({"list_folder_messages"}),
+}
+MESSAGE_METADATA_FUNCTIONS = {
+    "tools/folders.py": frozenset({"list_folders", "list_folder_messages"}),
+    "tools/reading.py": frozenset({"_topic_candidate_payload", "_search_result_structured_rows"}),
+    "tools/unread.py": frozenset({"_structured_reactions"}),
+}
+MESSAGE_BODY_SURFACE_FUNCTION_NAMES = frozenset(
+    {"get_inbox", "list_messages", "list_folder_messages", "_structured_messages"}
+)
 
 _EXECUTE_METHODS = frozenset({"execute", "executemany", "executescript"})
 _SQL_NAME = re.compile(r"(?:^|_)(?:SQL|DDL|QUERY)(?:$|_)", re.IGNORECASE)
@@ -297,12 +311,114 @@ def _projection_import_violations(path: str, tree: ast.AST) -> list[Finding]:
     return findings
 
 
+def _raw_message_content_violations(path: str, tree: ast.AST) -> list[Finding]:
+    """Reject message-body wrapper bypasses and require the shared serializer."""
+    findings: list[Finding] = []
+
+    class Visitor(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.function: str | None = None
+            self.tainted: set[str] = set()
+            self.serializer_seen: set[str] = set()
+            self.content_aliases = {"telegram_content"}
+
+        def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+            if _import_module(node).endswith(("tools.structured", ".structured")):
+                for alias in node.names:
+                    if alias.name == "telegram_content":
+                        self.content_aliases.add(alias.asname or alias.name)
+            self.generic_visit(node)
+
+        def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+            previous, old_tainted = self.function, self.tainted
+            self.function, self.tainted = node.name, set()
+            self.generic_visit(node)
+            if node.name in MESSAGE_BODY_ENTRYPOINTS.get(path, frozenset()) and node.name not in self.serializer_seen:
+                findings.append(Finding(path, node.lineno, "message delivery path must call serialize_message_content"))
+            self.function, self.tainted = previous, old_tainted
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            self._visit_function(node)
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            self._visit_function(node)
+
+        def visit_Assign(self, node: ast.Assign) -> None:
+            if isinstance(node.value, ast.Name) and node.value.id in self.content_aliases:
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        self.content_aliases.add(target.id)
+            value = node.value
+            tainted = self._message_tainted(value)
+            if tainted:
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        self.tainted.add(target.id)
+            self.generic_visit(node)
+
+        def _message_tainted(self, node: ast.expr) -> bool:  # noqa: PLR0911
+            """Conservatively track body values through common row adapters."""
+            if isinstance(node, ast.Name):
+                return node.id in self.tainted
+            if isinstance(node, ast.Attribute):
+                return node.attr in {"text", "media_description"} or self._message_tainted(node.value)
+            if isinstance(node, ast.Subscript):
+                return self._message_tainted(node.value) or self._message_tainted(node.slice)
+            if isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Name) and node.func.id in {"str", "cast"}:
+                    return any(self._message_tainted(arg) for arg in node.args)
+                if isinstance(node.func, ast.Attribute) and node.func.attr in {"get", "__getitem__"}:
+                    if (
+                        node.func.attr == "get"
+                        and node.args
+                        and isinstance(node.args[0], ast.Constant)
+                        and node.args[0].value in {"text", "media_description"}
+                    ):
+                        return True
+                    return any(self._message_tainted(arg) for arg in node.args) or self._message_tainted(
+                        node.func.value
+                    )
+                return False
+            return False
+
+        def visit_Call(self, node: ast.Call) -> None:
+            if isinstance(node.func, ast.Name) and node.func.id == "serialize_message_content":
+                self.serializer_seen.add(self.function or "")
+            is_content_call = isinstance(node.func, ast.Name) and node.func.id in self.content_aliases
+            is_content_call = is_content_call or (
+                isinstance(node.func, ast.Attribute) and node.func.attr == "telegram_content"
+            )
+            if is_content_call:
+                if (
+                    path not in MESSAGE_BODY_SERIALIZER_PATHS
+                    and self.function not in MESSAGE_BODY_SURFACE_FUNCTION_NAMES
+                ):
+                    self.generic_visit(node)
+                    return
+                allowed = self.function in MESSAGE_METADATA_FUNCTIONS.get(path, frozenset())
+                arg = node.args[0] if node.args else None
+                message_arg = isinstance(arg, ast.expr) and self._message_tainted(arg)
+                # Delivery entrypoints may only use the shared serializer; a
+                # no-op serializer call must not excuse a second raw wrapper.
+                if self.function in MESSAGE_BODY_ENTRYPOINTS.get(path, frozenset()) and not allowed:
+                    message_arg = True
+                kind = node.args[1].value if len(node.args) > 1 and isinstance(node.args[1], ast.Constant) else None
+                metadata_call = allowed and kind in {"snippet", "reaction", "message_text"}
+                if message_arg or (not allowed and not metadata_call):
+                    findings.append(Finding(path, node.lineno, "message bodies must use serialize_message_content"))
+            self.generic_visit(node)
+
+    Visitor().visit(tree)
+    return findings
+
+
 def violations_for(path: Path, source: str) -> list[Finding]:
     relative = _relative(path)
     tree = ast.parse(source, filename=str(path))
     constants = _static_constants(tree)
     findings = _content_violations(relative, tree)
     findings.extend(_projection_import_violations(relative, tree))
+    findings.extend(_raw_message_content_violations(relative, tree))
 
     sql_hits = [snippet for snippet in _sql_snippets(tree, constants) if _has_messages_from_or_join(snippet.text)]
     if sql_hits and relative not in MESSAGE_SQL_OWNER_PATHS and relative not in MESSAGE_SQL_LEGACY_EXCEPTION_PATHS:

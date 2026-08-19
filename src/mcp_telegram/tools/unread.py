@@ -22,7 +22,12 @@ from ._base import (
     mcp_tool,
     structured_result,
 )
-from .structured import StructuredWarning, TelegramContent, TelegramContentKind, structured_warning, telegram_content
+from .structured import (
+    StructuredWarning,
+    serialize_message_content,
+    structured_warning,
+    telegram_content,
+)
 
 GET_INBOX_OUTPUT_SCHEMA = {
     "type": "object",
@@ -134,9 +139,7 @@ GET_INBOX_OUTPUT_SCHEMA = {
                                 # the shared temporal presentation layer can render
                                 # the requested timezone in the MCP response.
                                 "date": {"type": ["integer", "null"]},
-                                "text": {"type": "string"},
                                 "content": {"type": ["object", "null"]},
-                                "media_description": {"type": ["string", "null"]},
                                 "media": {"type": ["object", "null"]},
                                 "reply_to_msg_id": {"type": ["integer", "null"]},
                                 "edit_date": {"type": ["integer", "null"]},
@@ -166,9 +169,7 @@ GET_INBOX_OUTPUT_SCHEMA = {
                                 "effective_sender_id",
                                 "out",
                                 "date",
-                                "text",
                                 "content",
-                                "media_description",
                                 "media",
                                 "reply_to_msg_id",
                                 "edit_date",
@@ -286,27 +287,12 @@ _READ_MARKER_METADATA = {
 }
 
 
-def _content_or_none(text: str | None, kind: TelegramContentKind) -> TelegramContent | None:
-    if not text:
-        return None
-    return telegram_content(text, kind)
-
-
-def _structured_media(description: str | None) -> dict[str, object] | None:
-    if not description:
-        return None
-    return {
-        "description": description,
-        "content": _content_or_none(description, "media_description"),
-    }
-
-
 def _structured_reactions(display: str | None) -> dict[str, object] | None:
     if not display:
         return None
     return {
         "display": display,
-        "content": _content_or_none(display, "reaction"),
+        "content": telegram_content(display, "reaction"),
     }
 
 
@@ -427,7 +413,7 @@ def _structured_messages(
     for row, message in zip(ordered_rows, messages, strict=False):
         marker_label = marker_by_message.get(message.id)
         read_markers = [_structured_read_marker(message.id, marker_label)] if marker_label else []
-        text = message.text or ""
+        projected = serialize_message_content(message.text, message.media_description, message.content_kind)
         structured.append(
             {
                 "msg_id": message.id,
@@ -436,10 +422,8 @@ def _structured_messages(
                 "effective_sender_id": message.effective_sender_id,
                 "out": bool(message.out),
                 "date": _message_date(message.sent_at),
-                "text": text,
-                "content": _content_or_none(text, "message_text"),
-                "media_description": message.media_description,
-                "media": _structured_media(message.media_description),
+                "content": projected["content"],
+                "media": projected["media"],
                 "reply_to_msg_id": message.reply_to_msg_id,
                 "edit_date": message.edit_date,
                 "reactions": _structured_reactions(message.reactions_display),

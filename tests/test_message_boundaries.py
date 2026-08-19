@@ -100,6 +100,105 @@ def test_content_marker_dict_is_rejected_outside_wrapper() -> None:
     assert any("Telegram content dictionaries" in finding.message for finding in findings)
 
 
+def test_raw_message_body_wrapper_is_rejected_in_delivery_tools() -> None:
+    gate = _gate()
+    path = gate.SOURCE_ROOT / "tools" / "folders.py"
+    findings = gate.violations_for(path, 'telegram_content(message.text, "message_text")')
+    assert any("message bodies must use serialize_message_content" in finding.message for finding in findings)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "from .structured import telegram_content as tc\n"
+        "def _structured_messages(message):\n"
+        "    return tc(message.text, 'message_text')\n",
+        "from .structured import telegram_content\n"
+        "def _structured_messages(message):\n"
+        "    body = message.media_description\n"
+        "    return telegram_content(body, 'media_description')\n",
+        "from .structured import telegram_content\n"
+        "def _structured_messages(message):\n"
+        "    def wrap(value):\n"
+        "        return telegram_content(value, 'message_text')\n"
+        "    return wrap(message.text)\n",
+        "from .structured import telegram_content\n"
+        "def _structured_messages(message):\n"
+        "    make = telegram_content\n"
+        "    return make(message.text, 'message_text')\n",
+    ],
+)
+def test_message_body_wrapper_aliases_and_helpers_are_rejected(source: str) -> None:
+    gate = _gate()
+    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "unread.py", source)
+    assert any("message bodies must use serialize_message_content" in finding.message for finding in findings)
+
+
+def test_message_entrypoint_must_call_shared_serializer() -> None:
+    gate = _gate()
+    source = "def _structured_messages(message):\n    return {'text': message.text}\n"
+    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "unread.py", source)
+    assert any("must call serialize_message_content" in finding.message for finding in findings)
+
+
+def test_metadata_wrapper_allowlist_does_not_hide_message_body_bypass() -> None:
+    gate = _gate()
+    source = (
+        "from .structured import telegram_content\n"
+        "def _structured_reactions(message):\n"
+        "    return telegram_content(message.text, 'reaction')\n"
+    )
+    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "unread.py", source)
+    assert any("message bodies must use serialize_message_content" in finding.message for finding in findings)
+
+
+def test_legitimate_metadata_call_remains_allowed_with_serializer_entrypoint() -> None:
+    gate = _gate()
+    source = (
+        "from .structured import telegram_content, serialize_message_content\n"
+        "def _structured_messages(message):\n"
+        "    return serialize_message_content(message.text, message.media_description)\n"
+        "def _structured_reactions(display):\n"
+        "    return telegram_content(display, 'reaction')\n"
+    )
+    assert gate.violations_for(gate.SOURCE_ROOT / "tools" / "unread.py", source) == []
+
+
+def test_serializer_call_does_not_excuse_second_raw_wrapper() -> None:
+    gate = _gate()
+    source = (
+        "from .structured import serialize_message_content, telegram_content\n"
+        "def _structured_messages(row):\n"
+        "    serialize_message_content(row.get('text'), row.get('media_description'))\n"
+        "    return telegram_content(str(row.get('text')), 'message_text')\n"
+    )
+    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "unread.py", source)
+    assert any("message bodies must use serialize_message_content" in finding.message for finding in findings)
+
+
+def test_module_alias_and_row_subscript_body_bypass_is_rejected() -> None:
+    gate = _gate()
+    source = (
+        "import mcp_telegram.tools.structured as structured\n"
+        "def _structured_messages(row):\n"
+        "    body = str(row['text'])\n"
+        "    return structured.telegram_content(body, 'message_text')\n"
+    )
+    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "unread.py", source)
+    assert any("message bodies must use serialize_message_content" in finding.message for finding in findings)
+
+
+def test_new_surface_entrypoint_cannot_bypass_owner() -> None:
+    gate = _gate()
+    source = (
+        "from .structured import telegram_content\n"
+        "def get_inbox(row):\n"
+        "    return telegram_content(row.get('text'), 'message_text')\n"
+    )
+    findings = gate.violations_for(gate.SOURCE_ROOT / "tools" / "new_surface.py", source)
+    assert any("message bodies must use serialize_message_content" in finding.message for finding in findings)
+
+
 def test_manual_content_constructor_is_rejected_outside_projector() -> None:
     gate = _gate()
     rogue = gate.SOURCE_ROOT / "rogue.py"

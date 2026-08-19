@@ -7,7 +7,7 @@ import re
 from collections.abc import Mapping
 from typing import Protocol, cast
 
-from .models import ReadMessage
+from .models import ContentKind, ReadMessage
 
 logger = logging.getLogger("mcp_telegram.daemon_api")
 
@@ -50,6 +50,7 @@ def _read_message_from_row(row: Mapping[str, object], *, reactions_display: str 
         sender_id=cast(int | None, _row_value(row, "sender_id")),
         sender_first_name=cast(str | None, _row_value(row, "sender_first_name")),
         media_description=cast(str | None, _row_value(row, "media_description")),
+        content_kind=cast(ContentKind, _row_value(row, "content_kind", "none")),
         reply_to_msg_id=cast(int | None, _row_value(row, "reply_to_msg_id")),
         forum_topic_id=cast(int | None, _row_value(row, "forum_topic_id")),
         is_deleted=_coerce_int(cast(object, _row_value(row, "is_deleted", 0)), 0),
@@ -98,7 +99,7 @@ _SENDER_ENTITY_JOINS_SQL = (
 _SELECT_MESSAGES_SQL = (
     f"SELECT m.message_id, m.sent_at, m.text, m.sender_id, "
     f"{_SENDER_FIRST_NAME_SQL}, "
-    f"m.media_description, m.reply_to_msg_id, m.forum_topic_id, "
+    f"m.media_description, NULL AS content_kind, m.reply_to_msg_id, m.forum_topic_id, "
     f"m.is_deleted, m.deleted_at, "
     f"{EFFECTIVE_SENDER_ID_SQL}, m.is_service, m.out, m.dialog_id "
     f"FROM messages m "
@@ -110,7 +111,7 @@ _SELECT_MESSAGES_SQL = (
 _SELECT_FTS_SQL = (
     f"SELECT f.message_id, m.text, "
     f"{_SENDER_FIRST_NAME_SQL}, "
-    f"m.sent_at, m.media_description, m.reply_to_msg_id, m.sender_id, m.forum_topic_id, "
+    f"m.sent_at, m.media_description, NULL AS content_kind, m.reply_to_msg_id, m.sender_id, m.forum_topic_id, "
     f"{EFFECTIVE_SENDER_ID_SQL}, m.is_service, m.out, m.dialog_id "
     f"FROM messages_fts f "
     f"JOIN messages m ON m.dialog_id = f.dialog_id AND m.message_id = f.message_id "
@@ -126,7 +127,7 @@ _SELECT_FTS_SQL = (
 _SELECT_FTS_ALL_SQL = (
     f"SELECT f.message_id, m.text, "
     f"{_SENDER_FIRST_NAME_SQL}, "
-    f"m.sent_at, m.media_description, m.reply_to_msg_id, m.sender_id, m.forum_topic_id, "
+    f"m.sent_at, m.media_description, NULL AS content_kind, m.reply_to_msg_id, m.sender_id, m.forum_topic_id, "
     f"f.dialog_id, COALESCE(de.name, CAST(f.dialog_id AS TEXT)) AS dialog_name, "
     f"{EFFECTIVE_SENDER_ID_SQL}, m.is_service, m.out "
     f"FROM messages_fts f "
@@ -141,7 +142,7 @@ _SELECT_FTS_ALL_SQL = (
 
 _FETCH_UNREAD_MESSAGES_SQL = (
     f"SELECT m.message_id, m.sent_at, m.text, m.sender_id, "
-    f"{_SENDER_FIRST_NAME_SQL}, "
+    f"{_SENDER_FIRST_NAME_SQL}, NULL AS content_kind, "
     f"{EFFECTIVE_SENDER_ID_SQL}, m.is_service, m.out, m.dialog_id "
     f"FROM messages m "
     f"{_SENDER_ENTITY_JOINS_SQL}"
@@ -157,7 +158,7 @@ _FETCH_UNREAD_MESSAGES_SQL = (
 _LIST_MESSAGES_BASE_SQL = (
     f"SELECT m.message_id, m.sent_at, m.text, m.sender_id, "
     f"{_SENDER_FIRST_NAME_SQL}, "
-    f"m.media_description, m.reply_to_msg_id, m.forum_topic_id, "
+    f"m.media_description, NULL AS content_kind, m.reply_to_msg_id, m.forum_topic_id, "
     f"m.is_deleted, m.deleted_at, "
     f"COALESCE("
     f"  (SELECT MAX(mv.edit_date) FROM message_versions mv "

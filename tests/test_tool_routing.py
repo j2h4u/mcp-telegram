@@ -2217,6 +2217,7 @@ async def test_get_inbox_via_daemon():
                                 "sent_at": 1700000000,
                                 "dialog_id": 123,
                                 "text": "Hello there",
+                                "content_kind": "message_text",
                                 "sender_id": 123,
                                 "sender_first_name": "Alice",
                             },
@@ -2262,7 +2263,6 @@ async def test_get_inbox_via_daemon():
     messages = _json_list(dialog["messages"])
     first_message = _json_dict(messages[0])
     assert first_message["msg_id"] == 1
-    assert first_message["text"] == "Hello there"
     assert _json_dict(first_message["content"])["is_telegram_content"] is True
     assert _json_dict(first_message["content"])["content_kind"] == "message_text"
     conn.get_inbox.assert_called_once()
@@ -2361,6 +2361,7 @@ async def test_get_inbox_frames_adversarial_body_without_framing_group_header():
                                 "sent_at": 1700000000,
                                 "dialog_id": 123,
                                 "text": adversarial,
+                                "content_kind": "message_text",
                                 "sender_id": 123,
                                 "sender_first_name": "Alice",
                             },

@@ -119,7 +119,7 @@ depends_on = []
 path = "mcp_telegram.daemon_message"
 layer = "application"
 depends_on = [
-    "mcp_telegram.daemon_message_queries", "mcp_telegram.formatter", "mcp_telegram.message_content", "mcp_telegram.models", "mcp_telegram.reactions.contracts",
+    "mcp_telegram.formatter", "mcp_telegram.message_content", "mcp_telegram.models", "mcp_telegram.reactions.contracts",
     "mcp_telegram.telegram_fact_queries", "mcp_telegram.telegram_message_projection",
 ]
 
@@ -152,7 +152,10 @@ cannot_depend_on = ["mcp_telegram.folders.sqlite_repository", "mcp_telegram.mess
 [[modules]]
 path = "mcp_telegram.daemon_scheduled_queries"
 layer = "application"
-depends_on = [{ path = "mcp_telegram.daemon_message_queries", deprecated = true }]
+depends_on = [
+    { path = "mcp_telegram.daemon_message_queries", deprecated = true },
+    "mcp_telegram.daemon_message",
+]
 
 [[modules]]
 path = "mcp_telegram.daemon_source_export"
@@ -471,7 +474,7 @@ depends_on = []
 [[modules]]
 path = "mcp_telegram.message_content"
 layer = "foundation"
-depends_on = ["mcp_telegram.text_projection"]
+depends_on = ["mcp_telegram.models", "mcp_telegram.text_projection"]
 
 [[modules]]
 path = "mcp_telegram.resolver"

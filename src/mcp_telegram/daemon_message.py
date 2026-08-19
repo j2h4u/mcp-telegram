@@ -12,7 +12,6 @@ from .reactions.contracts import ReactionFreshness
 from .telegram_fact_queries import enrich_reaction_events, read_at_map
 from .telegram_message_projection import MessageLike as _MessageLike
 from .telegram_message_projection import message_to_dict
-from .text_projection import TextLink
 
 __all__ = [
     "_MessageLike",
@@ -22,6 +21,7 @@ __all__ = [
     "message_to_dict",
     "project_cached_message_facts",
     "project_cached_message_facts_by_dialog",
+    "project_read_message_content",
 ]
 
 
@@ -40,7 +40,7 @@ def fetch_text_links(
     conn: sqlite3.Connection,
     dialog_id: int,
     message_ids: list[int],
-) -> dict[int, list[TextLink]]:
+) -> dict[int, list[tuple[int, int, str]]]:
     """Return persisted Telegram hidden links for one message page."""
     if not message_ids:
         return {}
@@ -57,7 +57,7 @@ def fetch_text_links(
         )
     except sqlite3.OperationalError:
         return {}
-    result: dict[int, list[TextLink]] = {}
+    result: dict[int, list[tuple[int, int, str]]] = {}
     for message_id, offset, length, value in rows:
         result.setdefault(int(message_id), []).append((int(offset), int(length), str(value)))
     return result
@@ -117,6 +117,16 @@ def _project_cached_message(
     text_links: list[tuple[int, int, str]],
     reactions_display: str,
 ) -> ReadMessage:
+    projected = project_read_message_content(message, text_links=text_links)
+    return dataclasses.replace(projected, reactions_display=reactions_display)
+
+
+def project_read_message_content(
+    message: ReadMessage,
+    *,
+    text_links: Sequence[tuple[int, int, str]] = (),
+) -> ReadMessage:
+    """Project one read-model message through canonical content semantics."""
     content = project_message_content(
         MessageSnapshot(
             text=message.text,
@@ -124,7 +134,12 @@ def _project_cached_message(
             text_links=tuple(text_links),
         )
     )
-    return dataclasses.replace(message, text=content.text, reactions_display=reactions_display)
+    return dataclasses.replace(
+        message,
+        text=content.text,
+        media_description=content.media_description,
+        content_kind=content.kind,
+    )
 
 
 def project_cached_message_facts_by_dialog(
