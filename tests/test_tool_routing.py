@@ -19,6 +19,7 @@ from typing import cast
 from unittest.mock import patch
 
 import pytest
+from jsonschema import validate
 from mcp.types import CallToolResult
 
 from mcp_telegram import server
@@ -579,6 +580,45 @@ async def test_folder_tools_frame_telegram_labels_without_raw_duplicates():
         "is_telegram_content": True,
         "content_kind": "message_text",
     }
+
+
+async def test_list_folder_messages_consumes_internal_content_kind_at_schema_boundary():
+    response = {
+        "ok": True,
+        "data": {
+            "messages": [
+                {
+                    "dialog_id": 123,
+                    "message_id": 5,
+                    "sent_at": 1705312800,
+                    "text": "[hidden](https://example.test)",
+                    "media_description": "photo",
+                    "content_kind": "message_text",
+                    "dialog_name": "Synthetic",
+                }
+            ],
+            "partial": True,
+            "incomplete_dialog_ids": [456],
+            "next_navigation": None,
+        },
+    }
+
+    arguments: dict[str, object] = {"folder_id": 5, "limit": 50}
+    with _patch_daemon(_make_daemon_conn(response)):
+        result = await server.call_tool("list_folder_messages", arguments)
+
+    assert isinstance(result, CallToolResult)
+    assert result.is_error is not True
+    payload = cast(dict[str, object], result.structured_content)
+    validate(payload, cast(dict[str, object], TOOL_REGISTRY["list_folder_messages"].output_schema))
+    message = _json_dict(_json_list(payload["messages"])[0])
+    assert "content_kind" not in message
+    assert "text" not in message
+    assert "media_description" not in message
+    assert _json_dict(message["content"])["text"] == "[hidden](https://example.test)"
+    assert _json_dict(message["media"])["text"] == "photo"
+    assert payload["partial"] is True
+    assert payload["incomplete_dialog_ids"] == [456]
 
 
 async def test_list_folders_non_utc_timezone_schema_allows_time_context():
