@@ -6,7 +6,7 @@ from typing import cast
 
 from telethon.tl.types import MessageEntityTextUrl
 
-from mcp_telegram.daemon_message import project_cached_message_facts, project_message_rows_by_dialog
+from mcp_telegram.daemon_message import project_cached_message_facts, project_cached_message_facts_by_dialog
 from mcp_telegram.message_content import MessageSnapshot, project_message_content
 from mcp_telegram.models import ReadMessage
 from mcp_telegram.telegram_message_projection import MessageLike, message_to_dict
@@ -51,9 +51,13 @@ def test_message_content_projector_distinguishes_media_only_and_none() -> None:
 
 
 def test_delivery_serializer_uses_explicit_text_media_semantics() -> None:
-    assert serialize_message_content("caption", "[photo]")["content"]["content_kind"] == "message_text"
-    assert serialize_message_content(None, "[photo]")["content"]["content_kind"] == "media_description"
-    assert serialize_message_content("", None)["content"] is None
+    text_result = serialize_message_content("caption", "[photo]", "message_text")["content"]
+    assert text_result is not None
+    assert text_result["content_kind"] == "message_text"
+    media_result = serialize_message_content(None, "[photo]", "media_description")["content"]
+    assert media_result is not None
+    assert media_result["content_kind"] == "media_description"
+    assert serialize_message_content("caption", "[photo]", "none")["content"] is None
 
 
 def test_cached_message_projection_renders_persisted_hidden_link() -> None:
@@ -95,25 +99,31 @@ def test_cross_dialog_folder_projection_preserves_media_and_hidden_links() -> No
                 dialog_id INTEGER, message_id INTEGER, offset INTEGER,
                 length INTEGER, type TEXT, value TEXT
             );
+            CREATE TABLE message_reactions (
+                dialog_id INTEGER, message_id INTEGER, emoji TEXT, count INTEGER
+            );
             """
         )
         conn.execute(
             "INSERT INTO message_entities VALUES (?, ?, ?, ?, 'text_url', ?)",
             (10, 20, 3, 4, "https://example.com"),
         )
-        rows = project_message_rows_by_dialog(
+        rows = project_cached_message_facts_by_dialog(
             conn,
             [
-                {"dialog_id": 10, "message_id": 20, "text": "go site", "media_description": "[photo]"},
-                {"dialog_id": 11, "message_id": 21, "text": None, "media_description": "[video]"},
-                {"dialog_id": 12, "message_id": 22, "text": "", "media_description": None},
+                ReadMessage(message_id=20, sent_at=1, dialog_id=10, text="go site", media_description="[photo]"),
+                ReadMessage(message_id=21, sent_at=1, dialog_id=11, text=None, media_description="[video]"),
+                ReadMessage(message_id=22, sent_at=1, dialog_id=12, text="", media_description=None),
             ],
         )
-        assert rows[0]["text"] == "go [site](https://example.com)"
-        assert rows[0]["media_description"] == "[photo]"
-        assert rows[1]["text"] is None
-        assert rows[1]["media_description"] == "[video]"
-        assert rows[2]["text"] is None
+        assert rows[0].text == "go [site](https://example.com)"
+        assert rows[0].media_description == "[photo]"
+        assert rows[0].content_kind == "message_text"
+        assert rows[1].text is None
+        assert rows[1].media_description == "[video]"
+        assert rows[1].content_kind == "media_description"
+        assert rows[2].text is None
+        assert rows[2].content_kind == "none"
     finally:
         conn.close()
 
@@ -134,7 +144,33 @@ def test_uncached_telegram_projection_renders_hidden_link() -> None:
         action=None,
     )
 
-    assert message_to_dict(cast(MessageLike, message), dialog_id=10)["text"] == "[сайт](https://example.com)"
+    projected = message_to_dict(cast(MessageLike, message), dialog_id=10)
+    assert projected["text"] == "[сайт](https://example.com)"
+    assert projected["content_kind"] == "message_text"
+
+
+def test_uncached_telegram_projection_sets_media_and_empty_content_kinds() -> None:
+    media = SimpleNamespace(
+        id=21,
+        date=None,
+        edit_date=None,
+        message=None,
+        media=object(),
+        out=False,
+        sender_id=10,
+        sender=None,
+        reactions=None,
+        reply_to=None,
+        entities=None,
+        action=None,
+    )
+    projected_media = message_to_dict(cast(MessageLike, media), dialog_id=10)
+    assert projected_media["content_kind"] == "media_description"
+    assert projected_media["text"] is None
+
+    empty = SimpleNamespace(**{**media.__dict__, "id": 22, "media": None})
+    projected_empty = message_to_dict(cast(MessageLike, empty), dialog_id=10)
+    assert projected_empty["content_kind"] == "none"
 
 
 def test_uncached_telegram_projection_uses_rich_message_text_fallback() -> None:

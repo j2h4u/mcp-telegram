@@ -1,7 +1,10 @@
 """Read-only custom Telegram folder discovery."""
 
+from typing import cast
+
 from pydantic import Field
 
+from ..message_content import ContentKind
 from ._base import (
     DaemonNotRunningError,
     ToolAnnotations,
@@ -154,8 +157,9 @@ async def list_folder_messages(args: ListFolderMessages) -> ToolResult:
         dialog_name = item.get("dialog_name")
         item["dialog_name"] = telegram_content(str(dialog_name), "message_text") if dialog_name is not None else None
         projected = serialize_message_content(
-            str(text) if text else None,
-            str(media_description) if media_description else None,
+            str(text) if text is not None else None,
+            str(media_description) if media_description is not None else None,
+            cast(ContentKind, row.get("content_kind", "none")),
         )
         item.update(projected)
         messages.append(item)

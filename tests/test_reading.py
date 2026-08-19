@@ -364,6 +364,7 @@ def test_list_messages_structured_messages_include_content_metadata_and_all_read
             "sender_id": 11,
             "effective_sender_id": 11,
             "out": 0,
+            "content_kind": "message_text",
         },
         {
             "message_id": 2,
@@ -374,6 +375,7 @@ def test_list_messages_structured_messages_include_content_metadata_and_all_read
             "sender_id": 11,
             "effective_sender_id": 11,
             "out": 0,
+            "content_kind": "message_text",
         },
         {
             "message_id": 10,
@@ -384,6 +386,7 @@ def test_list_messages_structured_messages_include_content_metadata_and_all_read
             "sender_id": None,
             "effective_sender_id": 999,
             "out": 1,
+            "content_kind": "message_text",
         },
         {
             "message_id": 11,
@@ -394,6 +397,7 @@ def test_list_messages_structured_messages_include_content_metadata_and_all_read
             "sender_id": None,
             "effective_sender_id": 999,
             "out": 1,
+            "content_kind": "message_text",
         },
     ]
     read_state = {

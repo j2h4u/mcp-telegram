@@ -1,5 +1,7 @@
 from typing import Literal, NotRequired, TypedDict
 
+from ..message_content import ContentKind
+
 TelegramContentKind = Literal[
     "message_text",
     "snippet",
@@ -70,18 +72,16 @@ def telegram_content(text: str, content_kind: TelegramContentKind) -> TelegramCo
 def serialize_message_content(
     text: str | None,
     media_description: str | None,
+    kind: ContentKind,
 ) -> dict[str, TelegramContent | None]:
     """Serialize already-projected message facts for delivery surfaces.
 
     Projection (including hidden-link rendering) belongs to ``MessageContent``;
     this helper only applies the shared wire wrapper and primary-content rule.
     """
-    text = text or None
-    media_description = media_description or None
-    primary = text if text is not None else media_description
-    content_kind: TelegramContentKind = "message_text" if text is not None else "media_description"
+    primary = text if kind == "message_text" else media_description
     return {
-        "content": telegram_content(primary, content_kind) if primary is not None else None,
+        "content": telegram_content(primary, kind) if primary is not None and kind != "none" else None,
         "media": telegram_content(media_description, "media_description") if media_description is not None else None,
     }
 

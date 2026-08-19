@@ -636,7 +636,7 @@ def _list_message_structured_item(
         item["is_service"] = True
 
     _maybe_add(item, "topic", _structured_topic(message))
-    projected = serialize_message_content(message.text, message.media_description)
+    projected = serialize_message_content(message.text, message.media_description, message.content_kind)
     _maybe_add(item, "content", projected["content"])
     _maybe_add(item, "media", projected["media"])
     _maybe_add(

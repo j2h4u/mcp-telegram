@@ -96,7 +96,7 @@ from .daemon_entity_info import DaemonEntityInfoService, EntityInfoDeps
 from .daemon_message import (
     cached_reaction_freshness,
     project_cached_message_facts,
-    project_message_rows_by_dialog,
+    project_cached_message_facts_by_dialog,
 )
 from .daemon_message_queries import (
     _FETCH_UNREAD_MESSAGES_SQL,
@@ -1024,10 +1024,28 @@ class DaemonAPIServer:
         folder_id = int(cast(int | str, req.get("folder_id", 0)))
         limit = max(1, min(int(cast(int | str, req.get("limit", 20))), 100))
         data = list_folder_messages(self._conn, folder_id, limit)
-        data["messages"] = project_message_rows_by_dialog(
-            self._conn,
-            cast(Sequence[Mapping[str, object]], data["messages"]),
-        )
+        raw_messages = cast(list[dict[str, object]], data["messages"])
+        messages = [
+            ReadMessage(
+                message_id=int(cast(int | str, row["message_id"])),
+                sent_at=int(cast(int | str, row["sent_at"])),
+                dialog_id=int(cast(int | str, row["dialog_id"])),
+                text=cast(str | None, row.get("text")),
+                media_description=cast(str | None, row.get("media_description")),
+                dialog_name=cast(str | None, row.get("dialog_name")),
+            )
+            for row in raw_messages
+        ]
+        projected = project_cached_message_facts_by_dialog(self._conn, messages)
+        data["messages"] = [
+            {
+                **{key: value for key, value in row.items() if key not in {"text", "media_description"}},
+                "text": message.text,
+                "media_description": message.media_description,
+                "content_kind": message.content_kind,
+            }
+            for row, message in zip(raw_messages, projected, strict=True)
+        ]
         return {"ok": True, "data": data}
 
     # list_topics

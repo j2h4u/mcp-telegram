@@ -8,6 +8,8 @@ FORUM_TOPICS_PAGE_SIZE = 100
 GENERAL_TOPIC_ID = 1
 GENERAL_TOPIC_TITLE = "General"
 
+ContentKind = Literal["message_text", "media_description", "none"]
+
 
 class DialogType(StrEnum):
     """Canonical dialog/entity type — the single vocabulary for this project.
@@ -168,6 +170,7 @@ class ReadMessage:
     sender_id: int | None = None
     sender_first_name: str | None = None
     media_description: str | None = None
+    content_kind: ContentKind = "none"
     reply_to_msg_id: int | None = None
     forum_topic_id: int | None = None
     is_deleted: int = 0

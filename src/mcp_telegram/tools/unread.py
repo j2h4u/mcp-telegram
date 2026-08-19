@@ -139,9 +139,7 @@ GET_INBOX_OUTPUT_SCHEMA = {
                                 # the shared temporal presentation layer can render
                                 # the requested timezone in the MCP response.
                                 "date": {"type": ["integer", "null"]},
-                                "text": {"type": "string"},
                                 "content": {"type": ["object", "null"]},
-                                "media_description": {"type": ["string", "null"]},
                                 "media": {"type": ["object", "null"]},
                                 "reply_to_msg_id": {"type": ["integer", "null"]},
                                 "edit_date": {"type": ["integer", "null"]},
@@ -171,9 +169,7 @@ GET_INBOX_OUTPUT_SCHEMA = {
                                 "effective_sender_id",
                                 "out",
                                 "date",
-                                "text",
                                 "content",
-                                "media_description",
                                 "media",
                                 "reply_to_msg_id",
                                 "edit_date",
@@ -242,8 +238,9 @@ class GetInbox(ToolArgs):
         default=100,
         ge=10,
         description=(
-            "Group member count above which to exclude the dialog (scope=personal only). "
-            "scope=all includes all groups and channels."
+            "Group member count above which to hide messages (scope=personal only). "
+            "NOTE: currently has no effect — participants_count is not stored locally. "
+            "All groups are included regardless of size."
         ),
     )
 
@@ -416,9 +413,7 @@ def _structured_messages(
     for row, message in zip(ordered_rows, messages, strict=False):
         marker_label = marker_by_message.get(message.id)
         read_markers = [_structured_read_marker(message.id, marker_label)] if marker_label else []
-        text = message.text or ""
-        projected = serialize_message_content(message.text, message.media_description)
-        media = projected["media"]
+        projected = serialize_message_content(message.text, message.media_description, message.content_kind)
         structured.append(
             {
                 "msg_id": message.id,
@@ -427,15 +422,8 @@ def _structured_messages(
                 "effective_sender_id": message.effective_sender_id,
                 "out": bool(message.out),
                 "date": _message_date(message.sent_at),
-                "text": text,
                 "content": projected["content"],
-                "media_description": message.media_description,
-                "media": {
-                    "description": message.media_description,
-                    "content": media,
-                }
-                if media is not None
-                else None,
+                "media": projected["media"],
                 "reply_to_msg_id": message.reply_to_msg_id,
                 "edit_date": message.edit_date,
                 "reactions": _structured_reactions(message.reactions_display),

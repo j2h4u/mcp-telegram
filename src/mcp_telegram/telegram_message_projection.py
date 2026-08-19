@@ -171,6 +171,7 @@ def message_to_dict(
         "sender_id": raw_sender_id,
         "sender_first_name": sender_first_name,
         "media_description": content.media_description,
+        "content_kind": content.kind,
         "reply_to_msg_id": reply_to_msg_id,
         "forum_topic_id": forum_topic_id,
         "reactions_display": reactions_display,

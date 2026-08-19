@@ -104,6 +104,8 @@ async def test_list_messages_scheduled_is_pending_only_and_local() -> None:
     _create_scheduled_table(conn)
     _insert_scheduled(conn, 11, FUTURE_BASE + 200, "later")
     _insert_scheduled(conn, 10, FUTURE_BASE + 100, "sooner")
+    conn.execute("UPDATE scheduled_messages SET text = NULL, media_description = '[photo]' WHERE message_id = 10")
+    conn.commit()
     _insert_scheduled(conn, 12, FUTURE_BASE + 300, "cancelled", state="cancelled")
 
     result = await server._list_messages({"dialog_id": 1, "message_state": "scheduled", "direction": "oldest"})
@@ -113,6 +115,10 @@ async def test_list_messages_scheduled_is_pending_only_and_local() -> None:
     assert [row["message_id"] for row in rows] == [10, 11]
     assert all(row["message_state"] == "scheduled" for row in rows)
     assert all(row["scheduled_at"] == row["sent_at"] for row in rows)
+    assert rows[0]["content_kind"] == "media_description"
+    assert rows[0]["text"] is None
+    assert rows[0]["media_description"] == "[photo]"
+    assert rows[1]["content_kind"] == "message_text"
     assert result["data"]["source"] == "scheduled_messages"
 
 

@@ -2,7 +2,7 @@
 
 import dataclasses
 import sqlite3
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from typing import cast
 
 from .formatter import format_reaction_counts
@@ -21,7 +21,7 @@ __all__ = [
     "message_to_dict",
     "project_cached_message_facts",
     "project_cached_message_facts_by_dialog",
-    "project_message_rows_by_dialog",
+    "project_read_message_content",
 ]
 
 
@@ -117,6 +117,16 @@ def _project_cached_message(
     text_links: list[tuple[int, int, str]],
     reactions_display: str,
 ) -> ReadMessage:
+    projected = project_read_message_content(message, text_links=text_links)
+    return dataclasses.replace(projected, reactions_display=reactions_display)
+
+
+def project_read_message_content(
+    message: ReadMessage,
+    *,
+    text_links: Sequence[tuple[int, int, str]] = (),
+) -> ReadMessage:
+    """Project one read-model message through canonical content semantics."""
     content = project_message_content(
         MessageSnapshot(
             text=message.text,
@@ -124,7 +134,12 @@ def _project_cached_message(
             text_links=tuple(text_links),
         )
     )
-    return dataclasses.replace(message, text=content.text, reactions_display=reactions_display)
+    return dataclasses.replace(
+        message,
+        text=content.text,
+        media_description=content.media_description,
+        content_kind=content.kind,
+    )
 
 
 def project_cached_message_facts_by_dialog(
@@ -143,36 +158,3 @@ def project_cached_message_facts_by_dialog(
         for (index, _), message in zip(indexed_messages, facts, strict=True):
             enriched[index] = message
     return [enriched[index] for index in range(len(messages))]
-
-
-def project_message_rows_by_dialog(
-    conn: sqlite3.Connection,
-    rows: Sequence[Mapping[str, object]],
-) -> list[dict[str, object]]:
-    """Project raw cross-dialog message rows through canonical content facts."""
-    grouped: dict[int, list[int]] = {}
-    for row in rows:
-        grouped.setdefault(int(cast(int | str, row["dialog_id"])), []).append(
-            int(cast(int | str, row["message_id"]))
-        )
-    links: dict[tuple[int, int], list[tuple[int, int, str]]] = {}
-    for dialog_id, message_ids in grouped.items():
-        for message_id, text_links in fetch_text_links(conn, dialog_id, message_ids).items():
-            links[(dialog_id, message_id)] = text_links
-
-    projected: list[dict[str, object]] = []
-    for row in rows:
-        dialog_id = int(cast(int | str, row["dialog_id"]))
-        message_id = int(cast(int | str, row["message_id"]))
-        content = project_message_content(
-            MessageSnapshot(
-                text=cast(str | None, row.get("text")),
-                media_description=cast(str | None, row.get("media_description")),
-                text_links=tuple(links.get((dialog_id, message_id), [])),
-            )
-        )
-        item = dict(row)
-        item["text"] = content.text
-        item["media_description"] = content.media_description
-        projected.append(item)
-    return projected
