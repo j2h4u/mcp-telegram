@@ -338,3 +338,48 @@ def test_manual_content_constructors_reject_module_and_assignment_aliases(source
 def test_baseline_has_no_message_boundary_violations() -> None:
     gate = _gate()
     assert gate.boundary_violations(gate.SOURCE_ROOT) == []
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "entrypoint"),
+    [
+        ("tools/activity.py", "_structured_comment"),
+        ("tools/account_trace.py", "_attach_trace_content_metadata"),
+    ],
+)
+def test_activity_trace_delivery_entrypoints_require_one_canonical_serializer(
+    relative_path: str, entrypoint: str
+) -> None:
+    gate = _gate()
+    path = gate.SOURCE_ROOT / relative_path
+    missing = f"def {entrypoint}(value):\n    return value\n"
+    assert any(
+        "must call serialize_message_content" in finding.message for finding in gate.violations_for(path, missing)
+    )
+
+    duplicate = (
+        f"def {entrypoint}(value):\n"
+        "    serialize_message_content(None, None, 'none')\n"
+        "    return serialize_message_content(None, None, 'none')\n"
+    )
+    assert any("exactly once" in finding.message for finding in gate.violations_for(path, duplicate))
+
+
+@pytest.mark.parametrize("relative_path", ["tools/activity.py", "tools/account_trace.py"])
+def test_activity_trace_delivery_forbids_projector_imports_and_calls(relative_path: str) -> None:
+    gate = _gate()
+    path = gate.SOURCE_ROOT / relative_path
+    imported = "from ..message_content import MessageSnapshot, project_message_content\n"
+    called = "def _structured_comment(value):\n    return project_message_content(value)\n"
+    findings = gate.violations_for(path, imported + called)
+    assert any("must not import message_content projectors" in finding.message for finding in findings)
+    assert any("must not call message_content projectors" in finding.message for finding in findings)
+
+    module_alias = (
+        "import mcp_telegram.message_content as mc\n"
+        "def _structured_comment(value):\n"
+        "    return mc.project_message_content(value)\n"
+    )
+    alias_findings = gate.violations_for(path, module_alias)
+    assert any("must not import message_content projectors" in finding.message for finding in alias_findings)
+    assert any("must not call message_content projectors" in finding.message for finding in alias_findings)

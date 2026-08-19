@@ -1,11 +1,12 @@
 """GetMyRecentActivity MCP tool — Phase 999.1."""
 
 from collections.abc import Mapping
+from typing import cast
 
 from mcp.types import ToolAnnotations
 from pydantic import Field, field_validator
 
-from ..message_content import MessageSnapshot, project_message_content
+from ..models import ContentKind
 from ._base import (
     DaemonNotRunningError,
     ToolArgs,
@@ -17,7 +18,7 @@ from ._base import (
     mcp_tool,
     structured_result,
 )
-from .structured import telegram_content
+from .structured import serialize_message_content
 
 DEFAULT_ACTIVITY_DIALOG_KINDS = ("group", "forum")
 _ALLOWED_ACTIVITY_DIALOG_KINDS = {"all", "user", "bot", "group", "forum", "channel", "unknown"}
@@ -216,14 +217,24 @@ def _structured_comment(comment: Mapping[str, object]) -> dict[str, object]:
     message_id = _comment_int(comment, "message_id")
     raw_text = comment.get("text")
     raw_media_description = comment.get("media_description")
-    content = project_message_content(
-        MessageSnapshot(
-            text=raw_text if isinstance(raw_text, str) else None,
-            media_description=raw_media_description if isinstance(raw_media_description, str) else None,
-        )
+    text_value = raw_text if isinstance(raw_text, str) and raw_text else None
+    media_value = raw_media_description if isinstance(raw_media_description, str) and raw_media_description else None
+    # The public activity envelope requires a content object even for an
+    # empty-body message.  An empty message-text wrapper preserves that
+    # long-standing compatibility shape through the canonical serializer.
+    text_value = {True: "", False: text_value}[text_value is None and media_value is None]
+    content_kind = cast(
+        ContentKind,
+        {
+            (False, False): "message_text",
+            (False, True): "media_description",
+            (True, False): "message_text",
+            (True, True): "message_text",
+        }[(bool(text_value), bool(media_value))],
     )
-    text = content.primary_text or ""
-    content_kind = content.kind if content.kind != "none" else "message_text"
+    serialized = serialize_message_content(text_value, media_value, content_kind)
+    serialized_content = serialized["content"]
+    text = cast(str, (serialized_content or cast(dict[str, object], {})).get("text", ""))
     return {
         "dialog_id": dialog_id,
         "dialog_name": comment.get("dialog_name"),
@@ -232,7 +243,7 @@ def _structured_comment(comment: Mapping[str, object]) -> dict[str, object]:
         "message_id": message_id,
         "sent_at": comment.get("sent_at"),
         "text": text,
-        "content": telegram_content(text, content_kind),
+        "content": serialized_content,
         "sync_status": comment.get("sync_status"),
         "reply_count": _comment_int(comment, "reply_count"),
         "reactions": comment.get("reactions") or [],

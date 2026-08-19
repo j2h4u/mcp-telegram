@@ -64,12 +64,23 @@ SCHEDULED_PROJECTOR_NAME = "project_read_message_content"
 TEXT_PROJECTOR_PATH = "text_projection.py"
 TEXT_PROJECTOR_IMPORTERS = frozenset({"daemon_message.py", "message_content.py", RAW_PROJECTOR_PATH})
 RAW_PROJECTOR_IMPORTERS = frozenset({"daemon_message.py", "telegram_history.py"})
-MESSAGE_BODY_SERIALIZER_PATHS = frozenset({"tools/reading.py", "tools/unread.py", "tools/folders.py"})
+MESSAGE_BODY_SERIALIZER_PATHS = frozenset(
+    {
+        "tools/reading.py",
+        "tools/unread.py",
+        "tools/folders.py",
+        "tools/activity.py",
+        "tools/account_trace.py",
+    }
+)
 MESSAGE_BODY_ENTRYPOINTS = {
     "tools/reading.py": frozenset({"_list_message_structured_item"}),
     "tools/unread.py": frozenset({"_structured_messages"}),
     "tools/folders.py": frozenset({"list_folder_messages"}),
+    "tools/activity.py": frozenset({"_structured_comment"}),
+    "tools/account_trace.py": frozenset({"_attach_trace_content_metadata"}),
 }
+TOOL_MESSAGE_PROJECTOR_PATHS = frozenset({"tools/activity.py", "tools/account_trace.py"})
 MESSAGE_METADATA_FUNCTIONS = {
     "tools/folders.py": frozenset({"list_folders", "list_folder_messages"}),
     "tools/reading.py": frozenset({"_topic_candidate_payload", "_search_result_structured_rows"}),
@@ -381,6 +392,20 @@ def _projection_import_violations(path: str, tree: ast.AST) -> list[Finding]:
             and path not in RAW_PROJECTOR_IMPORTERS
         ):
             findings.append(Finding(path, _line(node), "raw Telegram message projection has a canonical owner"))
+        if path in TOOL_MESSAGE_PROJECTOR_PATHS and (
+            any(name.endswith("message_content") for name in module_names) or "message_content" in imported_names
+        ):
+            findings.append(
+                Finding(path, _line(node), "tool delivery paths must not import message_content projectors")
+            )
+        if path in TOOL_MESSAGE_PROJECTOR_PATHS and isinstance(node, ast.Call):
+            called_name = _dotted_name(node.func)
+            if called_name == "project_message_content" or (
+                isinstance(node.func, ast.Attribute) and node.func.attr == "project_message_content"
+            ):
+                findings.append(
+                    Finding(path, _line(node), "tool delivery paths must not call message_content projectors")
+                )
     return findings
 
 
@@ -462,7 +487,7 @@ def _raw_message_content_violations(path: str, tree: ast.AST) -> list[Finding]:
         def __init__(self) -> None:
             self.function: str | None = None
             self.tainted: set[str] = set()
-            self.serializer_seen: set[str] = set()
+            self.serializer_counts: dict[str, int] = {}
             self.content_aliases = {"telegram_content"}
 
         def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
@@ -476,8 +501,20 @@ def _raw_message_content_violations(path: str, tree: ast.AST) -> list[Finding]:
             previous, old_tainted = self.function, self.tainted
             self.function, self.tainted = node.name, set()
             self.generic_visit(node)
-            if node.name in MESSAGE_BODY_ENTRYPOINTS.get(path, frozenset()) and node.name not in self.serializer_seen:
-                findings.append(Finding(path, node.lineno, "message delivery path must call serialize_message_content"))
+            if node.name in MESSAGE_BODY_ENTRYPOINTS.get(path, frozenset()):
+                serializer_count = self.serializer_counts.get(node.name, 0)
+                if serializer_count == 0:
+                    findings.append(
+                        Finding(path, node.lineno, "message delivery path must call serialize_message_content")
+                    )
+                elif path in TOOL_MESSAGE_PROJECTOR_PATHS and serializer_count != 1:
+                    findings.append(
+                        Finding(
+                            path,
+                            node.lineno,
+                            "canonical message delivery path must call serialize_message_content exactly once",
+                        )
+                    )
             self.function, self.tainted = previous, old_tainted
 
         def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
@@ -526,7 +563,8 @@ def _raw_message_content_violations(path: str, tree: ast.AST) -> list[Finding]:
 
         def visit_Call(self, node: ast.Call) -> None:
             if isinstance(node.func, ast.Name) and node.func.id == "serialize_message_content":
-                self.serializer_seen.add(self.function or "")
+                function = self.function or ""
+                self.serializer_counts[function] = self.serializer_counts.get(function, 0) + 1
             is_content_call = isinstance(node.func, ast.Name) and node.func.id in self.content_aliases
             is_content_call = is_content_call or (
                 isinstance(node.func, ast.Attribute) and node.func.attr == "telegram_content"
