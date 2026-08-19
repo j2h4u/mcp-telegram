@@ -907,7 +907,7 @@ class DaemonReadingService:
                 },
             )
         )
-        messages = self._enrich_cached_facts([_read_message_from_row(r) for r in rows])
+        messages = self._enrich_search_messages(rows)
         next_nav = self._search_next_navigation(request, messages, global_mode=True)
         return {
             "ok": True,
@@ -939,6 +939,7 @@ class DaemonReadingService:
             )
         )
         messages, freshness = await self._build_read_messages_from_rows(request.dialog_id, rows, log_rendered=False)
+        messages = self._restore_search_plain_text(rows, messages)
         next_nav = self._search_next_navigation(request, messages, global_mode=False)
         row = _fetchone_row(self._conn.execute(_SELECT_SYNC_STATUS_SQL, (request.dialog_id,)))
         scoped_status = _status_from_row(row)
@@ -954,6 +955,35 @@ class DaemonReadingService:
                 **access_meta,
             },
         }
+
+    def _enrich_search_messages(self, rows: Sequence[object]) -> list[ReadMessage]:
+        """Enrich search hits while retaining raw text for plain snippets.
+
+        ``project_cached_message_facts`` remains the sole content projector.  A
+        search hit needs the source text that existed before that projection so
+        its bounded snippet cannot expose a hidden-link destination.  Keep that
+        source value only for this response; list/full-body reads continue to
+        return the canonical projected message.
+        """
+        raw_messages = [_read_message_from_row(row) for row in rows]
+        projected = self._enrich_cached_facts(raw_messages)
+        return self._restore_search_plain_text(rows, projected, raw_messages=raw_messages)
+
+    @staticmethod
+    def _restore_search_plain_text(
+        rows: Sequence[object],
+        messages: Sequence[ReadMessage],
+        *,
+        raw_messages: Sequence[ReadMessage] | None = None,
+    ) -> list[ReadMessage]:
+        """Put raw persisted text back on enriched search rows only.
+
+        The row order is the SQL result order, so pairing by position preserves
+        all canonical reaction/read/lifecycle facts without another enrichment
+        or projection pass.
+        """
+        raw = list(raw_messages) if raw_messages is not None else [_read_message_from_row(row) for row in rows]
+        return [dataclasses.replace(message, text=source.text) for message, source in zip(messages, raw, strict=True)]
 
     def _search_next_navigation(
         self,
