@@ -603,7 +603,7 @@ async def test_list_folder_messages_consumes_internal_content_kind_at_schema_bou
         },
     }
 
-    arguments = {"folder_id": 5, "limit": 50}
+    arguments: dict[str, object] = {"folder_id": 5, "limit": 50}
     with _patch_daemon(_make_daemon_conn(response)):
         result = await server.call_tool("list_folder_messages", arguments)
 
