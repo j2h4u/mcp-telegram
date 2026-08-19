@@ -7,6 +7,7 @@ from typing import Literal
 import pytest
 
 from mcp_telegram.daemon_reading import DaemonReadingService
+from mcp_telegram.daemon_scheduled_queries import scheduled_row_to_wire
 from mcp_telegram.pagination import decode_navigation_token, encode_history_navigation, encode_search_navigation
 from mcp_telegram.tools.reading import (
     SearchMessages,
@@ -23,6 +24,67 @@ from tests.test_daemon_api import (
 )
 
 FUTURE_BASE = int(time.time()) + 86_400
+
+
+@pytest.mark.parametrize(
+    ("text", "media_description", "content_kind", "expected_text", "expected_media"),
+    [
+        ("plain text", None, "message_text", "plain text", None),
+        ("caption", "[photo]", "message_text", "caption", "[photo]"),
+        (None, "[photo]", "media_description", None, "[photo]"),
+        ("", "", "none", None, None),
+    ],
+    ids=["plain-text", "caption-and-media", "media-only", "empty"],
+)
+def test_scheduled_row_mapper_preserves_canonical_content_shape(
+    text: str | None,
+    media_description: str | None,
+    content_kind: str,
+    expected_text: str | None,
+    expected_media: str | None,
+) -> None:
+    item = scheduled_row_to_wire(
+        {
+            "message_id": 11,
+            "sent_at": FUTURE_BASE + 200,
+            "dialog_id": 1,
+            "text": text,
+            "media_description": media_description,
+        },
+        inclusion_basis=(),
+    )
+
+    assert item["content_kind"] == content_kind
+    assert item["text"] == expected_text
+    assert item["media_description"] == expected_media
+    assert item["scheduled_at"] == FUTURE_BASE + 200
+
+
+def test_scheduled_caption_and_media_use_public_structured_delivery_shape() -> None:
+    structured = _list_messages_structured_messages(
+        [
+            {
+                "message_id": 11,
+                "sent_at": FUTURE_BASE + 200,
+                "dialog_id": 1,
+                "text": "caption",
+                "media_description": "[photo]",
+                "content_kind": "message_text",
+            }
+        ],
+        dialog_type="User",
+    )[0]
+
+    assert structured["content"] == {
+        "text": "caption",
+        "is_telegram_content": True,
+        "content_kind": "message_text",
+    }
+    assert structured["media"] == {
+        "text": "[photo]",
+        "is_telegram_content": True,
+        "content_kind": "media_description",
+    }
 
 
 def _create_scheduled_table(conn: sqlite3.Connection) -> None:
