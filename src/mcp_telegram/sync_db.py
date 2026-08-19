@@ -113,6 +113,13 @@ CREATE TABLE IF NOT EXISTS topic_metadata (
     inaccessible_error TEXT,
     inaccessible_at INTEGER,
     updated_at     INTEGER NOT NULL,
+    icon_emoji_id  INTEGER,
+    icon_emoji     TEXT,
+    icon_color     INTEGER,
+    pinned         INTEGER NOT NULL DEFAULT 0,
+    hidden         INTEGER NOT NULL DEFAULT 0,
+    snapshot_at    INTEGER,
+    date           INTEGER,
     PRIMARY KEY (dialog_id, topic_id)
 )
 """
@@ -1328,6 +1335,7 @@ def _apply_migration_32(conn: sqlite3.Connection, current: int) -> int:
         current,
         32,
         [
+            _TOPIC_TABLE_DDL,
             "ALTER TABLE topic_metadata ADD COLUMN icon_emoji TEXT",
             "ALTER TABLE topic_metadata ADD COLUMN icon_color INTEGER",
         ],
