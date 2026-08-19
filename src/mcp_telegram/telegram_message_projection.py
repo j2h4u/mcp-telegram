@@ -6,9 +6,10 @@ import logging
 from typing import Protocol
 
 from .formatter import format_reaction_counts
-from .messages.telegram_adapter import extract_reply_and_topic
+from .messages.telegram_adapter import extract_entity_rows, extract_reply_and_topic
 from .telethon_media import describe_media
 from .telethon_message import is_service_message
+from .text_projection import render_text_links
 
 logger = logging.getLogger(__name__)
 
@@ -151,10 +152,15 @@ def message_to_dict(
         out_flag=out_flag,
     )
 
+    text_links = [
+        (entity.offset, entity.length, entity.value)
+        for entity in extract_entity_rows(dialog_id or 0, msg.id, msg)
+        if entity.type == "text_url" and entity.value is not None
+    ]
     return {
         "message_id": msg.id,
         "sent_at": sent_at,
-        "text": msg.message,
+        "text": render_text_links(msg.message if isinstance(msg.message, str) else None, text_links),
         "sender_id": raw_sender_id,
         "sender_first_name": sender_first_name,
         "media_description": media_description,

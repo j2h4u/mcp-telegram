@@ -120,7 +120,7 @@ path = "mcp_telegram.daemon_message"
 layer = "application"
 depends_on = [
     "mcp_telegram.formatter", "mcp_telegram.models", "mcp_telegram.reactions.contracts",
-    "mcp_telegram.telegram_fact_queries", "mcp_telegram.telegram_message_projection",
+    "mcp_telegram.telegram_fact_queries", "mcp_telegram.telegram_message_projection", "mcp_telegram.text_projection",
 ]
 
 [[modules]]
@@ -314,7 +314,7 @@ depends_on = ["mcp_telegram.telegram_gateway", "mcp_telegram.telegram_message_pr
 [[modules]]
 path = "mcp_telegram.telegram_message_projection"
 layer = "telegram_gateway"
-depends_on = ["mcp_telegram.formatter", "mcp_telegram.messages.telegram_adapter", "mcp_telegram.telethon_media", "mcp_telegram.telethon_message"]
+depends_on = ["mcp_telegram.formatter", "mcp_telegram.messages.telegram_adapter", "mcp_telegram.telethon_media", "mcp_telegram.telethon_message", "mcp_telegram.text_projection"]
 
 [[modules]]
 path = "mcp_telegram.telegram_read_receipts"
@@ -462,6 +462,11 @@ depends_on = ["mcp_telegram.models"]
 path = "mcp_telegram.formatter"
 layer = "foundation"
 depends_on = ["mcp_telegram.models"]
+
+[[modules]]
+path = "mcp_telegram.text_projection"
+layer = "foundation"
+depends_on = []
 
 [[modules]]
 path = "mcp_telegram.resolver"
