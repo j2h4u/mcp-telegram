@@ -161,22 +161,30 @@ def test_raw_message_body_wrapper_is_rejected_in_delivery_tools() -> None:
 @pytest.mark.parametrize(
     "source",
     [
-        "from .structured import telegram_content as tc\n"
-        "def _structured_messages(message):\n"
-        "    return tc(message.text, 'message_text')\n",
-        "from .structured import telegram_content\n"
-        "def _structured_messages(message):\n"
-        "    body = message.media_description\n"
-        "    return telegram_content(body, 'media_description')\n",
-        "from .structured import telegram_content\n"
-        "def _structured_messages(message):\n"
-        "    def wrap(value):\n"
-        "        return telegram_content(value, 'message_text')\n"
-        "    return wrap(message.text)\n",
-        "from .structured import telegram_content\n"
-        "def _structured_messages(message):\n"
-        "    make = telegram_content\n"
-        "    return make(message.text, 'message_text')\n",
+        (
+            "from .structured import telegram_content as tc\n"
+            "def _structured_messages(message):\n"
+            "    return tc(message.text, 'message_text')\n"
+        ),
+        (
+            "from .structured import telegram_content\n"
+            "def _structured_messages(message):\n"
+            "    body = message.media_description\n"
+            "    return telegram_content(body, 'media_description')\n"
+        ),
+        (
+            "from .structured import telegram_content\n"
+            "def _structured_messages(message):\n"
+            "    def wrap(value):\n"
+            "        return telegram_content(value, 'message_text')\n"
+            "    return wrap(message.text)\n"
+        ),
+        (
+            "from .structured import telegram_content\n"
+            "def _structured_messages(message):\n"
+            "    make = telegram_content\n"
+            "    return make(message.text, 'message_text')\n"
+        ),
     ],
 )
 def test_message_body_wrapper_aliases_and_helpers_are_rejected(source: str) -> None:
@@ -368,16 +376,22 @@ def test_scheduled_mapper_requires_exactly_one_module_entrypoint() -> None:
 @pytest.mark.parametrize(
     "source",
     [
-        "import mcp_telegram.message_content as content\n"
-        "def rogue(value):\n"
-        "    return content.MessageContent(text=value, media_description=None, kind='message_text')\n",
-        "import mcp_telegram.message_content\n"
-        "def rogue(value):\n"
-        "    return mcp_telegram.message_content.MessageContent(text=value, media_description=None, kind='message_text')\n",
-        "from .message_content import TelegramContent as Ctor\n"
-        "Alias = Ctor\n"
-        "def rogue(value):\n"
-        "    return Alias(text=value, media_description=None, kind='message_text')\n",
+        (
+            "import mcp_telegram.message_content as content\n"
+            "def rogue(value):\n"
+            "    return content.MessageContent(text=value, media_description=None, kind='message_text')\n"
+        ),
+        (
+            "import mcp_telegram.message_content\n"
+            "def rogue(value):\n"
+            "    return mcp_telegram.message_content.MessageContent(text=value, media_description=None, kind='message_text')\n"
+        ),
+        (
+            "from .message_content import TelegramContent as Ctor\n"
+            "Alias = Ctor\n"
+            "def rogue(value):\n"
+            "    return Alias(text=value, media_description=None, kind='message_text')\n"
+        ),
     ],
 )
 def test_manual_content_constructors_reject_module_and_assignment_aliases(source: str) -> None:

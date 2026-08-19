@@ -819,8 +819,10 @@ def _apply_migrations_6_to_10(conn: sqlite3.Connection, current: int) -> int:
         8,
         [
             "ALTER TABLE synced_dialogs ADD COLUMN read_inbox_max_id INTEGER",
-            "CREATE INDEX IF NOT EXISTS idx_synced_dialogs_status_read_position "
-            "ON synced_dialogs(status, read_inbox_max_id)",
+            (
+                "CREATE INDEX IF NOT EXISTS idx_synced_dialogs_status_read_position "
+                "ON synced_dialogs(status, read_inbox_max_id)"
+            ),
         ],
     )
 
@@ -866,12 +868,14 @@ def _apply_migrations_11_to_15(conn: sqlite3.Connection, current: int) -> int:
         current,
         11,
         [
-            "CREATE TABLE IF NOT EXISTS message_reactions_freshness ("
-            "    dialog_id INTEGER NOT NULL, "
-            "    message_id INTEGER NOT NULL, "
-            "    checked_at INTEGER NOT NULL, "
-            "    PRIMARY KEY (dialog_id, message_id)"
-            ") WITHOUT ROWID",
+            (
+                "CREATE TABLE IF NOT EXISTS message_reactions_freshness ("
+                "    dialog_id INTEGER NOT NULL, "
+                "    message_id INTEGER NOT NULL, "
+                "    checked_at INTEGER NOT NULL, "
+                "    PRIMARY KEY (dialog_id, message_id)"
+                ") WITHOUT ROWID"
+            ),
         ],
     )
 
@@ -1207,13 +1211,17 @@ def _apply_migrations_21_to_28(conn: sqlite3.Connection, current: int) -> int:
     PRIMARY KEY (dialog_id, message_id)
 ) WITHOUT ROWID""",
             # channel/supergroup: bare -> -1000000000000 - bare when that marked id is a known dialog
-            "UPDATE message_forwards SET fwd_from_peer_id = -1000000000000 - fwd_from_peer_id "
-            "WHERE fwd_from_peer_id > 0 AND EXISTS (SELECT 1 FROM dialogs d "
-            "WHERE d.dialog_id = -1000000000000 - message_forwards.fwd_from_peer_id)",
+            (
+                "UPDATE message_forwards SET fwd_from_peer_id = -1000000000000 - fwd_from_peer_id "
+                "WHERE fwd_from_peer_id > 0 AND EXISTS (SELECT 1 FROM dialogs d "
+                "WHERE d.dialog_id = -1000000000000 - message_forwards.fwd_from_peer_id)"
+            ),
             # legacy chat: bare -> -bare when -bare is a known dialog
-            "UPDATE message_forwards SET fwd_from_peer_id = -fwd_from_peer_id "
-            "WHERE fwd_from_peer_id > 0 AND EXISTS (SELECT 1 FROM dialogs d "
-            "WHERE d.dialog_id = -message_forwards.fwd_from_peer_id)",
+            (
+                "UPDATE message_forwards SET fwd_from_peer_id = -fwd_from_peer_id "
+                "WHERE fwd_from_peer_id > 0 AND EXISTS (SELECT 1 FROM dialogs d "
+                "WHERE d.dialog_id = -message_forwards.fwd_from_peer_id)"
+            ),
         ],
     )
 
@@ -1569,8 +1577,10 @@ def migrate_legacy_databases(
     # Migrate entities (only entities table — reaction_metadata, topic_metadata,
     # message_cache are cache-layer data with TTL, not worth migrating)
     entity_stmts = [
-        "INSERT OR IGNORE INTO entities (id, type, name, username, updated_at) "
-        "SELECT id, type, name, username, updated_at FROM legacy.entities",
+        (
+            "INSERT OR IGNORE INTO entities (id, type, name, username, updated_at) "
+            "SELECT id, type, name, username, updated_at FROM legacy.entities"
+        ),
     ]
     copied_entities = _migrate_from_legacy_db(conn, entity_cache_path, entity_stmts)
     if copied_entities:
@@ -1578,11 +1588,13 @@ def migrate_legacy_databases(
 
     # Migrate telemetry events using the configured retention boundary.
     telemetry_stmts = [
-        "INSERT OR IGNORE INTO telemetry_events "
-        "(tool_name, timestamp, duration_ms, result_count, has_cursor, page_depth, has_filter, error_type) "
-        "SELECT tool_name, timestamp, duration_ms, result_count, has_cursor, page_depth, has_filter, error_type "
-        "FROM legacy.telemetry_events "
-        f"WHERE timestamp > strftime('%s', 'now') - {telemetry_retention_ttl_seconds}",
+        (
+            "INSERT OR IGNORE INTO telemetry_events "
+            "(tool_name, timestamp, duration_ms, result_count, has_cursor, page_depth, has_filter, error_type) "
+            "SELECT tool_name, timestamp, duration_ms, result_count, has_cursor, page_depth, has_filter, error_type "
+            "FROM legacy.telemetry_events "
+            f"WHERE timestamp > strftime('%s', 'now') - {telemetry_retention_ttl_seconds}"
+        ),
     ]
     copied_telemetry = _migrate_from_legacy_db(
         conn,

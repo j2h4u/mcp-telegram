@@ -197,7 +197,7 @@ def _track_tool_telemetry(tool_name: str) -> t.Callable[[ToolRunnerFunc[ToolArgT
             timezone_token = response_timezone.set(args.timezone)
             try:
                 tool_result = await fn(args)
-                return tool_result  # noqa: RET504
+                return tool_result
             except Exception as exc:
                 error_type = type(exc).__name__
                 raise

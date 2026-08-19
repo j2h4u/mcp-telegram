@@ -50,6 +50,7 @@ class _EntityMissingClient:
 class _TestLogger:
     def __init__(self) -> None:
         self.warning_calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+        self.error_calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
         self.exception_calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
 
     def debug(self, msg: str, *args: object, **kwargs: object) -> None:
@@ -62,6 +63,9 @@ class _TestLogger:
 
     def warning(self, msg: str, *args: object, **kwargs: object) -> None:
         self.warning_calls.append((msg, args, kwargs))
+
+    def error(self, msg: str, *args: object, **kwargs: object) -> None:
+        self.error_calls.append((msg, args, kwargs))
 
     def exception(self, msg: str, *args: object, **kwargs: object) -> None:
         self.exception_calls.append((msg, args, kwargs))
