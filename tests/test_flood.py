@@ -186,6 +186,72 @@ def test_telethon_flood_wait_filter_observes_auto_sleep(monkeypatch: pytest.Monk
     assert rollup.wait_s_1h == 23
 
 
+def test_telethon_flood_wait_filter_ignores_unrelated_log_records(monkeypatch: pytest.MonkeyPatch) -> None:
+    observed: list[tuple[str, int]] = []
+    record = logging.LogRecord(
+        name="telethon.client.users",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg="Connected to Telegram data center",
+        args=(),
+        exc_info=None,
+    )
+
+    from mcp_telegram import flood as flood_module
+
+    monkeypatch.setattr(
+        flood_module,
+        "observe_flood_wait",
+        lambda *, source, seconds: observed.append((source, seconds)),
+    )
+
+    assert TelethonFloodWaitMetricsFilter().filter(record) is True
+    assert observed == []
+
+
+def test_install_telethon_flood_wait_metrics_filter_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
+    from mcp_telegram import flood as flood_module
+
+    logger = logging.getLogger("telethon.client.users")
+    original_filters = tuple(logger.filters)
+    marker = "_mcp_telegram_flood_wait_metrics_installed"
+    original_marker = getattr(logger, marker, None)
+    for installed_filter in original_filters:
+        logger.removeFilter(installed_filter)
+    monkeypatch.delattr(logger, marker, raising=False)
+    observed: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        flood_module,
+        "observe_flood_wait",
+        lambda *, source, seconds: observed.append((source, seconds)),
+    )
+    try:
+        flood_module.install_telethon_flood_wait_metrics_filter()
+        flood_module.install_telethon_flood_wait_metrics_filter()
+        logger.filter(
+            logging.LogRecord(
+                name=logger.name,
+                level=logging.INFO,
+                pathname=__file__,
+                lineno=1,
+                msg="Sleeping for 11s (0:00:11) on GetHistoryRequest flood wait",
+                args=(),
+                exc_info=None,
+            )
+        )
+        assert observed == [("telethon.client.users.auto_sleep", 11)]
+    finally:
+        for installed_filter in tuple(logger.filters):
+            logger.removeFilter(installed_filter)
+        for existing_filter in original_filters:
+            logger.addFilter(existing_filter)
+        if original_marker is None:
+            monkeypatch.delattr(logger, marker, raising=False)
+        else:
+            setattr(logger, marker, original_marker)
+
+
 # ---------------------------------------------------------------------------
 # sleep_through_flood
 # ---------------------------------------------------------------------------

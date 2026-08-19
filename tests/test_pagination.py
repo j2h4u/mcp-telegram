@@ -197,6 +197,17 @@ class TestDecodeValidation:
                 until_utc=1,
             )
 
+    def test_equal_utc_bounds_are_rejected(self):
+        with pytest.raises(ValueError, match="since_utc must be earlier"):
+            encode_search_navigation(
+                offset=0,
+                dialog_id=100,
+                query="needle",
+                message_state="sent",
+                since_utc=1,
+                until_utc=1,
+            )
+
 
 class TestAccountTraceDecodeValidation:
     def test_rejects_non_int_scope_dialog_ids_elements(self):

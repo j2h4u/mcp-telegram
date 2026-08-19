@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from mcp_telegram.tools._base import DaemonNotRunningError
-from mcp_telegram.tools.stats import GetDialogStats, get_dialog_stats
+from mcp_telegram.tools.stats import GetDialogStats, GetUsageStats, get_dialog_stats, get_usage_stats
 
 
 class _TextContent(Protocol):
@@ -21,6 +21,7 @@ class _TextContent(Protocol):
 @dataclass
 class _StatsConn:
     get_dialog_stats: AsyncMock
+    get_usage_stats: AsyncMock
 
 
 # ---------------------------------------------------------------------------
@@ -30,7 +31,10 @@ class _StatsConn:
 
 def _make_conn(response: dict) -> _StatsConn:
     """Return a mock DaemonConnection whose get_dialog_stats returns response."""
-    return _StatsConn(get_dialog_stats=AsyncMock(return_value=response))
+    return _StatsConn(
+        get_dialog_stats=AsyncMock(return_value=response),
+        get_usage_stats=AsyncMock(return_value=response),
+    )
 
 
 @asynccontextmanager
@@ -159,3 +163,49 @@ async def test_get_dialog_stats_daemon_not_running() -> None:
     assert content.is_error is True
     text = cast(_TextContent, content.content[0]).text
     assert "mcp-telegram sync" in text or "not running" in text.lower()
+
+
+@pytest.mark.asyncio
+async def test_get_usage_stats_returns_summary_for_populated_telemetry() -> None:
+    conn = _make_conn(
+        {
+            "ok": True,
+            "data": {
+                "tool_distribution": {"list_messages": 8, "list_dialogs": 2},
+                "error_distribution": {"timeout": 3},
+                "total_calls": 10,
+                "max_page_depth": 6,
+                "filter_count": 4,
+                "latency_median_ms": 125,
+                "latency_p95_ms": 480,
+            },
+        }
+    )
+
+    with _patch_daemon(conn):
+        content = await get_usage_stats(GetUsageStats())
+
+    assert content.content == ()
+    structured = cast(dict[str, object], content.structured_content)
+    assert structured["empty"] is False
+    assert structured["total_calls"] == 10
+    assert structured["tool_distribution"] == {"list_messages": 8, "list_dialogs": 2}
+    assert structured["filter_count"] == 4
+    assert structured["latency_p95_ms"] == 480
+    assert structured["summary"] == (
+        "Most active: list_messages (80% of calls) Deep scrolling detected: max page depth 6 "
+        "Errors: timeout (3) Filtered queries: 40% Response time: 125ms median, 480ms p95"
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_usage_stats_returns_actionable_error_for_daemon_failure() -> None:
+    conn = _make_conn({"ok": False, "error": "database_locked"})
+
+    with _patch_daemon(conn):
+        content = await get_usage_stats(GetUsageStats())
+
+    assert content.is_error is True
+    text = cast(_TextContent, content.content[0]).text
+    assert "database_locked" in text
+    assert "Retry GetUsageStats later." in text

@@ -191,3 +191,31 @@ def test_uncached_telegram_projection_uses_rich_message_text_fallback() -> None:
     )
 
     assert message_to_dict(cast(MessageLike, message), dialog_id=10)["text"] == "rich caption"
+
+
+def test_uncached_telegram_projection_derives_sender_and_reaction_display() -> None:
+    message = SimpleNamespace(
+        id=23,
+        date=None,
+        edit_date=None,
+        message="hello",
+        media=None,
+        out=True,
+        sender_id=None,
+        sender=None,
+        reactions=SimpleNamespace(
+            results=[
+                SimpleNamespace(reaction=SimpleNamespace(emoticon="👍"), count=2),
+                SimpleNamespace(reaction=SimpleNamespace(emoticon=None, document_id=123), count=1),
+                SimpleNamespace(reaction=None, count=9),
+            ]
+        ),
+        reply_to=None,
+        entities=None,
+        action=None,
+    )
+
+    projected = message_to_dict(cast(MessageLike, message), dialog_id=7, self_id=100)
+
+    assert projected["effective_sender_id"] == 100
+    assert projected["reactions_display"] == "[👍×2]"
