@@ -155,6 +155,11 @@ def _coerce_int(value: object, default: int) -> int:
         return default
 
 
+def _topic_icons_need_refresh(rows: list[tuple[object, object, object, object, object, object]]) -> bool:
+    """Whether a cached custom topic icon still lacks its Unicode fallback."""
+    return any(row[2] is not None and row[4] is None for row in rows)
+
+
 from .budget import allocate_message_budget_proportional, unread_chat_tier
 from .daemon_source_export import (
     _describe_source,
@@ -1031,7 +1036,7 @@ class DaemonAPIServer:
         this daemon API boundary and never call Telegram directly.
 
         Request: dialog_id (int) or dialog (str).
-        Response data: {"topics": [{"id", "title", "icon_emoji_id", "date"}],
+        Response data: {"topics": [{"id", "title", "icon_emoji_id", "icon_emoji", "icon_color", "date"}],
         "dialog_id": int}.
         Errors: missing_dialog, dialog_not_found (from _resolve_dialog_id).
         """
@@ -1053,7 +1058,7 @@ class DaemonAPIServer:
 
         rows = self._topic_rows(dialog_id)
         empty_reason = None
-        if not rows and self._topic_refresher is not None:
+        if (not rows or _topic_icons_need_refresh(rows)) and self._topic_refresher is not None:
             empty_reason = await self._refresh_topic_catalog_for_list_topics(dialog_id)
             rows = self._topic_rows(dialog_id)
         topics = [
@@ -1062,6 +1067,8 @@ class DaemonAPIServer:
                 "title": row[1],
                 "icon_emoji_id": row[2],
                 "date": row[3],
+                "icon_emoji": row[4],
+                "icon_color": row[5],
             }
             for row in rows
         ]
@@ -1070,9 +1077,10 @@ class DaemonAPIServer:
             data["empty_reason"] = empty_reason
         return {"ok": True, "data": data}
 
-    def _topic_rows(self, dialog_id: int) -> list[tuple[object, object, object, object]]:
+    def _topic_rows(self, dialog_id: int) -> list[tuple[object, object, object, object, object, object]]:
         return cast(
-            list[tuple[object, object, object, object]], self._conn.execute(_LIST_TOPICS_SQL, (dialog_id,)).fetchall()
+            list[tuple[object, object, object, object, object, object]],
+            self._conn.execute(_LIST_TOPICS_SQL, (dialog_id,)).fetchall(),
         )
 
     async def _refresh_topic_catalog_for_list_topics(self, dialog_id: int) -> str:

@@ -14,6 +14,8 @@ class TopicFact:
     topic_id: int
     title: str
     icon_emoji_id: int | None = None
+    icon_emoji: str | None = None
+    icon_color: int | None = None
     date: int | None = None
     is_general: bool = False
 

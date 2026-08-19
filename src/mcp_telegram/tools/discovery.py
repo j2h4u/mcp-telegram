@@ -238,6 +238,15 @@ LIST_TOPICS_OUTPUT_SCHEMA = {
                     "topic_id": {"type": "integer"},
                     "title": {"type": "string"},
                     "title_content": TELEGRAM_CONTENT_OUTPUT_SCHEMA,
+                    "icon": {
+                        "type": "object",
+                        "properties": {
+                            "emoji": {"type": ["string", "null"]},
+                            "color": {"type": ["string", "null"]},
+                        },
+                        "required": ["emoji", "color"],
+                        "additionalProperties": False,
+                    },
                     "pinned": {"type": ["boolean", "null"]},
                     "hidden": {"type": ["boolean", "null"]},
                     "snapshot_at": {"type": ["integer", "null"]},
@@ -495,10 +504,23 @@ def _structured_topic(topic: dict[str, object]) -> dict[str, object]:
         "title": title,
         "title_content": telegram_content(str(title), "message_text"),
     }
+    if icon := _structured_topic_icon(topic):
+        structured_topic["icon"] = icon
     for field in ("pinned", "hidden", "snapshot_at"):
         if field in topic:
             structured_topic[field] = topic.get(field)
     return structured_topic
+
+
+def _structured_topic_icon(topic: dict[str, object]) -> dict[str, object] | None:
+    emoji = topic.get("icon_emoji")
+    color_value = topic.get("icon_color")
+    color = f"#{color_value:06X}" if isinstance(color_value, int) else None
+    if not isinstance(emoji, str) or not emoji:
+        emoji = None
+    if emoji is None and color is None:
+        return None
+    return {"emoji": emoji, "color": None if emoji is not None else color}
 
 
 def _list_topics_payload(args: ListTopics, data: dict[str, object]) -> dict[str, object]:

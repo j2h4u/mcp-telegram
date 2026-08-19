@@ -7,7 +7,8 @@ from types import SimpleNamespace
 
 import pytest
 from telethon.errors import FloodWaitError
-from telethon.tl.functions.messages import GetForumTopicsRequest
+from telethon.tl.functions.messages import GetCustomEmojiDocumentsRequest, GetForumTopicsRequest
+from telethon.tl.types import DocumentAttributeCustomEmoji, InputStickerSetEmpty
 
 from mcp_telegram.topics.contracts import TopicFact, is_topic_capable
 from mcp_telegram.topics.refresh import TopicRefresher
@@ -95,6 +96,55 @@ async def test_telethon_gateway_uses_input_peer_before_fetching_topics() -> None
     assert len(client.requests) == 1
     assert isinstance(client.requests[0], GetForumTopicsRequest)
     assert topics == (TopicFact(topic_id=306001, title="Topic"),)
+
+
+@pytest.mark.asyncio
+async def test_telethon_gateway_resolves_custom_topic_icon_to_unicode_emoji() -> None:
+    class Client:
+        def __init__(self) -> None:
+            self.requests: list[object] = []
+
+        async def get_input_entity(self, entity: object) -> object:
+            return entity
+
+        async def __call__(self, request: object) -> object:
+            self.requests.append(request)
+            if isinstance(request, GetForumTopicsRequest):
+                topic = SimpleNamespace(
+                    id=306001,
+                    title=".",
+                    icon_emoji_id=987,
+                    icon_color=0x6FB9F0,
+                    date=None,
+                )
+                return SimpleNamespace(topics=[topic])
+            assert isinstance(request, GetCustomEmojiDocumentsRequest)
+            attribute = DocumentAttributeCustomEmoji(alt="📊", stickerset=InputStickerSetEmpty())
+            return [SimpleNamespace(id=987, attributes=[attribute])]
+
+    client = Client()
+    gateway = TelethonTelegramTopicGateway(client)
+
+    first = await gateway.fetch_topics(object())
+    second = await gateway.fetch_topics(object())
+
+    assert (
+        first
+        == second
+        == (
+            TopicFact(
+                topic_id=306001,
+                title=".",
+                icon_emoji_id=987,
+                icon_emoji="📊",
+                icon_color=0x6FB9F0,
+            ),
+        )
+    )
+    custom_emoji_requests = [
+        request for request in client.requests if isinstance(request, GetCustomEmojiDocumentsRequest)
+    ]
+    assert len(custom_emoji_requests) == 1
 
 
 @pytest.mark.asyncio

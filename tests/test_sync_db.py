@@ -531,6 +531,7 @@ def test_schema_v4_topic_metadata_table(tmp_sync_db_path: Path) -> None:
         # v19 columns must also be present:
         v19_cols = {"icon_emoji_id", "pinned", "hidden", "snapshot_at", "date"}
         assert v19_cols.issubset(columns), f"v19 columns missing after migration. Got: {columns}"
+        assert {"icon_emoji", "icon_color"}.issubset(columns), f"v32 icon columns missing. Got: {columns}"
     finally:
         conn.close()
 
@@ -1648,7 +1649,7 @@ def test_schema_version_is_current(tmp_sync_db_path: Path) -> None:
     try:
         version = _fetchone_int(conn, "SELECT MAX(version) FROM schema_version")
         assert version == _CURRENT_SCHEMA_VERSION, f"Expected schema version {_CURRENT_SCHEMA_VERSION}, got {version}"
-        assert _CURRENT_SCHEMA_VERSION == 31, f"_CURRENT_SCHEMA_VERSION must be 31, got {_CURRENT_SCHEMA_VERSION}"
+        assert _CURRENT_SCHEMA_VERSION == 32, f"_CURRENT_SCHEMA_VERSION must be 32, got {_CURRENT_SCHEMA_VERSION}"
     finally:
         conn.close()
 
