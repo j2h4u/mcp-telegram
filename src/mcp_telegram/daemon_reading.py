@@ -460,6 +460,21 @@ def _telegram_history_kwargs(req: _ListMessagesTelegramRequest) -> dict[str, obj
     }
 
 
+def _telegram_request_from_db_request(req: _ListMessagesDbRequest) -> _ListMessagesTelegramRequest:
+    return _ListMessagesTelegramRequest(
+        dialog_id=req.dialog_id,
+        limit=req.limit,
+        direction=req.direction,
+        direction_enum=req.direction_enum,
+        anchor_msg_id=req.anchor_msg_id,
+        sender_id=req.sender_id,
+        topic_id=req.topic_id,
+        unread_after_id=req.unread_after_id,
+        since_utc=req.since_utc,
+        until_utc=req.until_utc,
+    )
+
+
 def _read_message_from_row(row: object) -> ReadMessage:
     return ReadMessage(
         message_id=_object_to_int(cast(object | None, _row_value(row, "message_id"))),
@@ -825,26 +840,33 @@ class DaemonReadingService:
         read_state = _read_state_for_dialog(self._conn, dialog_id, dialog_type)
 
         if status in ("synced", "syncing", "access_lost"):
-            result = await self._list_messages_from_db(
-                _ListMessagesDbRequest(
-                    dialog_id=dialog_id,
-                    limit=request.limit,
-                    self_id=self._deps.self_id,
-                    direction=direction,
-                    direction_enum=direction_enum,
-                    anchor_msg_id=anchor_msg_id,
-                    anchor_sent_at=None,
-                    sender_id=request.sender_id,
-                    sender_name=request.sender_name,
-                    topic_id=request.topic_id,
-                    unread_after_id=unread_after_id,
-                    since_utc=request.since_utc,
-                    until_utc=request.until_utc,
-                )
+            db_request = _ListMessagesDbRequest(
+                dialog_id=dialog_id,
+                limit=request.limit,
+                self_id=self._deps.self_id,
+                direction=direction,
+                direction_enum=direction_enum,
+                anchor_msg_id=anchor_msg_id,
+                anchor_sent_at=None,
+                sender_id=request.sender_id,
+                sender_name=request.sender_name,
+                topic_id=request.topic_id,
+                unread_after_id=unread_after_id,
+                since_utc=request.since_utc,
+                until_utc=request.until_utc,
             )
+            result = await self._list_messages_from_db(db_request)
             result["data"].update(_build_access_metadata(self._conn, dialog_id, status))
             result["data"]["dialog_type"] = dialog_type
             result["data"]["read_state"] = read_state
+            if request.topic_id is not None and not result["data"]["messages"]:
+                telegram_result = await self._list_messages_from_telegram(_telegram_request_from_db_request(db_request))
+                if telegram_result.get("ok") and telegram_result["data"]["messages"]:
+                    telegram_result["data"]["source"] = "telegram_topic_fallback"
+                    telegram_result["data"].update(_build_access_metadata(self._conn, dialog_id, status))
+                    telegram_result["data"]["dialog_type"] = dialog_type
+                    telegram_result["data"]["read_state"] = read_state
+                    return telegram_result
             return result
 
         telegram_result = await self._list_messages_from_telegram(

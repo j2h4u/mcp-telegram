@@ -1227,7 +1227,7 @@ def test_extract_reply_and_topic_simple_reply():
     reply_to = SimpleNamespace(
         reply_to_msg_id=42,
         forum_topic=False,
-        reply_to_reply_top_id=None,
+        reply_to_top_id=None,
     )
     msg = SimpleNamespace(reply_to=reply_to)
     reply_id, topic_id = extract_reply_and_topic(msg)
@@ -1241,7 +1241,7 @@ def test_extract_reply_and_topic_forum_with_top_id():
     reply_to = SimpleNamespace(
         reply_to_msg_id=100,
         forum_topic=True,
-        reply_to_reply_top_id=7,
+        reply_to_top_id=7,
     )
     msg = SimpleNamespace(reply_to=reply_to)
     reply_id, topic_id = extract_reply_and_topic(msg)
@@ -1250,18 +1250,46 @@ def test_extract_reply_and_topic_forum_with_top_id():
 
 
 def test_extract_reply_and_topic_forum_general():
-    """forum_topic=True with no reply_to_reply_top_id → General topic (id=1)."""
+    """forum_topic=True with no reply_to_top_id → General topic (id=1)."""
     from mcp_telegram.messages.telegram_adapter import extract_reply_and_topic
 
     reply_to = SimpleNamespace(
         reply_to_msg_id=200,
         forum_topic=True,
-        reply_to_reply_top_id=None,
+        reply_to_top_id=None,
     )
     msg = SimpleNamespace(reply_to=reply_to)
     reply_id, topic_id = extract_reply_and_topic(msg)
     assert reply_id == 200
     assert topic_id == 1
+
+
+def test_extract_reply_and_topic_bot_dm_topic_with_top_id_without_forum_flag() -> None:
+    """Bot-DM topics may expose Telethon's top id without the forum-supergroup flag."""
+    from mcp_telegram.messages.telegram_adapter import extract_reply_and_topic
+
+    reply_to = SimpleNamespace(
+        reply_to_msg_id=300,
+        forum_topic=False,
+        reply_to_top_id=306001,
+    )
+    msg = SimpleNamespace(reply_to=reply_to)
+
+    assert extract_reply_and_topic(msg) == (300, 306001)
+
+
+def test_extract_reply_and_topic_keeps_legacy_reply_top_id_fallback() -> None:
+    """Legacy test doubles still map top ids while fixtures migrate to Telethon's field."""
+    from mcp_telegram.messages.telegram_adapter import extract_reply_and_topic
+
+    reply_to = SimpleNamespace(
+        reply_to_msg_id=400,
+        forum_topic=True,
+        reply_to_reply_top_id=320601,
+    )
+    msg = SimpleNamespace(reply_to=reply_to)
+
+    assert extract_reply_and_topic(msg) == (400, 320601)
 
 
 def test_extract_reply_and_topic_uses_message_thread_id_when_reply_to_missing() -> None:
