@@ -187,7 +187,11 @@ def _remaining_probe_candidates(*, total_rows: int, skipped: int, probed: int) -
 
 
 def _log_probe_budget_exhausted(policy: DeltaCatchUpPolicy, *, total_rows: int, skipped: int, probed: int) -> None:
-    logger.info(
+    # A bounded cycle reaching its probe budget is normal while backlog is
+    # being drained. The complete-cycle INFO summary below retains aggregate
+    # coverage/backlog evidence; keep this per-cycle detail available at DEBUG
+    # without emitting an INFO line forever.
+    logger.debug(
         "delta_catch_up_probe_budget_exhausted max_probes=%d remaining=%d",
         policy.max_probes_per_cycle,
         _remaining_probe_candidates(total_rows=total_rows, skipped=skipped, probed=probed),

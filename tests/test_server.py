@@ -148,6 +148,7 @@ def test_search_messages_reflection_exposes_shared_navigation_schema() -> None:
 @pytest.mark.asyncio
 async def test_call_tool_validation_failure_escaped_error_includes_actionable_guidance(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     monkeypatch.setitem(server.tool_by_name, "list_dialogs", _tool("list_dialogs"))
 
@@ -156,7 +157,8 @@ async def test_call_tool_validation_failure_escaped_error_includes_actionable_gu
 
     monkeypatch.setattr("mcp_telegram.server.tools.tool_args", _raise_validation_error)
 
-    result = _call_tool_result(await server.call_tool("list_dialogs", {"dialog": 123}))
+    with caplog.at_level(logging.INFO, logger="mcp_telegram.server"):
+        result = _call_tool_result(await server.call_tool("list_dialogs", {"dialog": 123}))
 
     assert result.is_error is True
     message = _call_tool_text(result)
@@ -164,6 +166,9 @@ async def test_call_tool_validation_failure_escaped_error_includes_actionable_gu
     assert "dialog" in message.lower()
     assert "action:" in message.lower() or "retry" in message.lower() or "check" in message.lower()
     assert message != "Tool list_dialogs failed"
+    validation_logs = [record for record in caplog.records if "validation_failed" in record.getMessage()]
+    assert validation_logs
+    assert all(record.exc_info is None for record in validation_logs)
 
 
 @pytest.mark.asyncio

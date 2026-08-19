@@ -29,6 +29,7 @@ from mcp_telegram.delta_sync import (
     DeltaCatchUpPolicy,
     DeltaSyncWorker,
     _DeltaSyncClient,
+    _log_probe_budget_exhausted,
     run_delta_catch_up_loop,
 )
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
@@ -1492,6 +1493,24 @@ async def test_delta_catch_up_respects_probe_budget(
     )
 
     assert calls == dialog_ids[:2]
+
+
+def test_delta_catch_up_probe_budget_exhausted_is_debug(caplog: pytest.LogCaptureFixture) -> None:
+    """Expected bounded-cycle exhaustion remains observable without INFO noise."""
+    import logging
+
+    with caplog.at_level(logging.DEBUG, logger="mcp_telegram.delta_sync"):
+        _log_probe_budget_exhausted(
+            DeltaCatchUpPolicy(interval_seconds=300.0, max_probes_per_cycle=2, probe_pause_seconds=0.0),
+            total_rows=10,
+            skipped=3,
+            probed=2,
+        )
+
+    records = [record for record in caplog.records if "delta_catch_up_probe_budget_exhausted" in record.getMessage()]
+    assert len(records) == 1
+    assert records[0].levelno == logging.DEBUG
+    assert "remaining=5" in records[0].getMessage()
 
 
 @pytest.mark.asyncio
