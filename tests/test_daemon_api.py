@@ -3926,6 +3926,51 @@ async def test_list_messages_topic_filter() -> None:
     assert messages[0]["forum_topic_id"] == 5
 
 
+@pytest.mark.asyncio
+async def test_list_messages_topic_filter_falls_back_to_telegram_when_synced_db_has_no_topic_rows() -> None:
+    """Bot-DM topic rows may be missing locally until old messages are re-extracted."""
+    dialog_id = 9031
+    topic_id = 306001
+    conn = _make_db()
+    _insert_synced_dialog(conn, dialog_id, status="synced")
+    _insert_topic_metadata(conn, dialog_id, topic_id=topic_id, title="Bot topic")
+    _insert_message(conn, dialog_id, 100, text="stored without topic", forum_topic_id=None)
+
+    captured_kwargs: dict[str, object] = {}
+    mock_msg = MagicMock()
+    mock_msg.id = 301
+    mock_msg.date = SimpleNamespace(timestamp=lambda: 1700000301.0)
+    mock_msg.message = "topic message"
+    mock_msg.sender_id = 42
+    mock_msg.sender = SimpleNamespace(first_name="Bot")
+    mock_msg.media = None
+    mock_msg.reply_to = SimpleNamespace(reply_to_msg_id=300, forum_topic=False, reply_to_top_id=topic_id)
+    mock_msg.reactions = None
+    mock_msg.replies = None
+    mock_msg.message_thread_id = None
+    mock_msg.is_topic_message = False
+    mock_msg.out = False
+    mock_msg.post_author = None
+
+    async def _fake_iter_messages(*args: object, **kwargs: object):  # type: ignore[misc]
+        captured_kwargs.update(kwargs)
+        yield mock_msg
+
+    client = _TestClient()
+    client.iter_messages = _fake_iter_messages
+    server = make_server(conn, client)
+
+    result = await server._list_messages({"dialog_id": dialog_id, "limit": 10, "topic_id": topic_id})
+
+    assert result["ok"] is True, f"Unexpected error: {result}"
+    assert result["data"]["source"] == "telegram_topic_fallback"
+    assert captured_kwargs["reply_to"] == topic_id
+    messages = _response_messages(result)
+    assert len(messages) == 1
+    assert messages[0]["message_id"] == 301
+    assert messages[0]["forum_topic_id"] == topic_id
+
+
 # ---------------------------------------------------------------------------
 # Phase 35-01: list_messages — unread filter (sync.db)
 # ---------------------------------------------------------------------------

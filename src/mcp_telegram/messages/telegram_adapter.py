@@ -55,6 +55,7 @@ class _ReactionsLike(Protocol):
 class _ReplyToLike(Protocol):
     reply_to_msg_id: int | None
     forum_topic: bool
+    reply_to_top_id: int | None
     reply_to_reply_top_id: int | None
     reply_to_peer_id: _PeerLike | None
 
@@ -123,7 +124,7 @@ def extract_reply_and_topic(msg: object) -> tuple[int | None, int | None]:
     """Extract reply_to_msg_id and forum_topic_id from a Telethon message.
 
     Shared between extract_message_row (sync path) and _msg_to_dict (API path)
-    to avoid duplicating the forum_topic / reply_to_reply_top_id branching.
+    to avoid duplicating the forum_topic / reply_to_top_id branching.
 
     Returns (reply_to_msg_id, forum_topic_id).
     """
@@ -140,10 +141,25 @@ def _reply_message_id(reply_to: object | None) -> int | None:
 
 
 def _reply_forum_topic_id(reply_to: object | None) -> int | None:
-    if reply_to is None or not _attr(reply_to, "forum_topic", False):
+    if reply_to is None:
         return None
-    reply_top_id = _attr(reply_to, "reply_to_reply_top_id", None)
-    return int(reply_top_id) if reply_top_id is not None else 1
+
+    reply_top_id = _reply_top_id(reply_to)
+    if reply_top_id is not None:
+        return reply_top_id
+
+    if _attr(reply_to, "forum_topic", False):
+        return 1
+
+    return None
+
+
+def _reply_top_id(reply_to: object) -> int | None:
+    reply_top_id = _attr(reply_to, "reply_to_top_id", None)
+    if reply_top_id is None:
+        # Compatibility with old test doubles and older Telethon-like shims.
+        reply_top_id = _attr(reply_to, "reply_to_reply_top_id", None)
+    return int(reply_top_id) if reply_top_id is not None else None
 
 
 def _message_thread_topic_id(msg: object) -> int | None:
@@ -160,6 +176,8 @@ def _message_thread_topic_id(msg: object) -> int | None:
 def _touch_reply_to_fields(reply_to: _ReplyToLike) -> None:
     if hasattr(reply_to, "forum_topic"):
         _ = reply_to.forum_topic
+    if hasattr(reply_to, "reply_to_top_id"):
+        _ = reply_to.reply_to_top_id
     if hasattr(reply_to, "reply_to_reply_top_id"):
         _ = reply_to.reply_to_reply_top_id
 

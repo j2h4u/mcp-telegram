@@ -46,7 +46,7 @@ def build_mock_message(
         reply_to_obj = SimpleNamespace(
             reply_to_msg_id=reply_to_msg_id,
             forum_topic=forum_topic,
-            reply_to_reply_top_id=reply_to_top_id,
+            reply_to_top_id=reply_to_top_id,
         )
 
     return SimpleNamespace(
