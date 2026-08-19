@@ -102,6 +102,10 @@ activity_hot_sweep_seconds = 51
 [http]
 host = "localhost"
 port = 3200
+
+[logging]
+level = "warning"
+daemon_api_slow_request_seconds = 2.5
 """,
     )
 
@@ -137,6 +141,8 @@ port = 3200
         scheduled_flood_sleep_threshold_seconds=0,
     )
     assert config.http == HttpServerConfig(host="localhost", port=3200)
+    assert config.logging.level == "WARNING"
+    assert config.logging.daemon_api_slow_request_seconds == 2.5
 
 
 def test_runtime_environment_overrides_are_parsed_by_config_model() -> None:
@@ -162,7 +168,6 @@ def test_runtime_environment_overrides_are_parsed_by_config_model() -> None:
             "ACCESS_PROBE_MAX_DIALOGS_PER_CYCLE": "4",
             "ACCESS_PROBE_COOLDOWN_SECONDS": "604802",
             "ACCESS_PROBE_PAUSE_SECONDS": "6",
-            "LOG_LEVEL": "debug",
         },
     )
     http = resolve_http_server_config(
@@ -196,7 +201,9 @@ def test_runtime_environment_overrides_are_parsed_by_config_model() -> None:
         activity_cold_access_retry_seconds=53.0,
         scheduled_flood_sleep_threshold_seconds=0,
     )
-    assert resolve_logging_config({"LOG_LEVEL": "debug"}).level == "DEBUG"
+    logging = resolve_logging_config({"LOG_LEVEL": "debug", "DAEMON_API_SLOW_REQUEST_SECONDS": "1.5"})
+    assert logging.level == "DEBUG"
+    assert logging.daemon_api_slow_request_seconds == 1.5
     assert http == HttpServerConfig(
         host="0.0.0.0",
         port=3200,
@@ -224,6 +231,10 @@ def test_runtime_environment_overrides_are_parsed_by_config_model() -> None:
         (
             '[state]\ndir = "/state"\n\n[telegram_rpc]\nmax_calls_per_period = -1\n',
             "max_calls_per_period",
+        ),
+        (
+            '[state]\ndir = "/state"\n\n[logging]\ndaemon_api_slow_request_seconds = 0\n',
+            "daemon_api_slow_request_seconds",
         ),
         ('[state]\ndir = "/state"\n\n[freshness]\nunknown = 1\n', "freshness"),
         ('[state]\ndir = "/state"\n\nfreshness = "invalid"\n', "[freshness]"),

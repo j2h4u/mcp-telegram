@@ -138,6 +138,7 @@ class DaemonApiPolicy:
     resolver_enrichment_ttl_seconds: int
     folder_snapshot_ttl_seconds: int
     telemetry_retention_ttl_seconds: int
+    slow_request_seconds: float
 
 
 def _attr(obj: object, name: str, default: object | None = None) -> object | None:
@@ -433,6 +434,7 @@ class DaemonAPIServer:
         # to collapse DM direction (`out`) into an effective sender id without
         # calling Telethon on every read.
         self.self_id: int | None = None
+        self.self_profile: dict[str, object] | None = None
         # Set to True once Telegram is connected and all startup steps complete.
         # While False, handle_client returns daemon_not_ready with startup_detail.
         self._ready: bool = False
@@ -594,6 +596,7 @@ class DaemonAPIServer:
             )
 
         token = _current_request_id.set(request_id)
+        started_at = time.perf_counter()
         try:
             response = await self._dispatch(req)
         except Exception:
@@ -610,9 +613,30 @@ class DaemonAPIServer:
         finally:
             _current_request_id.reset(token)
 
+        self._log_request_completion(method, request_id, response, time.perf_counter() - started_at)
+
         if request_id:
             response = {**response, "request_id": request_id}
         return response, method, request_id
+
+    def _log_request_completion(
+        self,
+        method: str,
+        request_id: str | None,
+        response: Mapping[str, object],
+        duration_s: float,
+    ) -> None:
+        ok = bool(response.get("ok"))
+        if ok and duration_s < self._policy.slow_request_seconds:
+            return
+        logger.info(
+            "daemon_api_request_complete method=%s ok=%s duration_s=%.3f request_id=%s error=%s",
+            method,
+            ok,
+            duration_s,
+            request_id,
+            response.get("error"),
+        )
 
     async def handle_client(
         self,
@@ -1292,11 +1316,14 @@ class DaemonAPIServer:
                 conn=self._conn,
                 client=cast(DaemonClientLike, self._client),
                 dm_peer_ids=self._dm_peer_ids,
+                self_id=self.self_id,
+                self_profile=self.self_profile,
                 get_peer_id=telethon_utils.get_peer_id,
                 rid=_rid,
                 logger=cast(logging.Logger, logger),
                 now_provider=time.time,
                 detail_ttl_seconds=self._policy.entity_detail_ttl_seconds,
+                slow_stage_seconds=self._policy.slow_request_seconds,
                 get_common_chats_request=GetCommonChatsRequest,
                 get_dialog_filters_request=GetDialogFiltersRequest,
                 get_full_user_request=GetFullUserRequest,
