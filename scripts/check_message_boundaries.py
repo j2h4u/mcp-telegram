@@ -43,17 +43,18 @@ MESSAGE_SQL_OWNER_PATHS = frozenset(
     }
 )
 
-# Existing lifecycle/migration SQL is named separately instead of silently
-# becoming a general-purpose owner.  These are a ratchet frontier for a later
-# cleanup slice; new files may not join this set accidentally.
+# Existing lifecycle SQL is named separately instead of silently becoming a
+# general-purpose owner. These are a ratchet frontier for a later cleanup
+# slice; new files may not join this set accidentally.
 MESSAGE_SQL_LEGACY_EXCEPTION_PATHS = frozenset(
     {
         "daemon.py",
         "delta_sync.py",
-        "event_handlers.py",
-        "sync_db.py",
     }
 )
+
+# Schema/migration DDL has a distinct owner from runtime message persistence.
+MESSAGE_SQL_SCHEMA_OWNER_PATHS = frozenset({"sync_db.py"})
 
 CONTENT_WRAPPER_PATH = "tools/structured.py"
 CONTENT_PROJECTOR_PATH = "message_content.py"
@@ -200,20 +201,35 @@ def _identifier(token: str) -> str:
     return token
 
 
-def _has_messages_from_or_join(sql: str) -> bool:
+_MESSAGE_SQL_TABLES = frozenset({"messages", "message_versions"})
+_MESSAGE_SQL_TABLE_PRECEDERS = frozenset({"from", "join", "update", "into"})
+_SQLITE_UPDATE_CONFLICTS = frozenset({"rollback", "abort", "fail", "ignore", "replace"})
+
+
+def _has_message_table_sql(sql: str) -> bool:
+    """Return whether DML in *sql* addresses a message-owned table.
+
+    The gate intentionally recognizes the table positions for SELECT/JOIN,
+    UPDATE, INSERT, and DELETE. ``messages_fts`` is a separate FTS owner and
+    is not conflated with the canonical message tables here.
+    """
     tokens = _sql_tokens(sql)
-    for index, token in enumerate(tokens[:-1]):
-        if token.casefold() not in {"from", "join"}:
+    for index, token in enumerate(tokens):
+        if token.casefold() not in _MESSAGE_SQL_TABLE_PRECEDERS or index + 1 >= len(tokens):
             continue
         next_index = index + 1
+        if token.casefold() == "update" and tokens[next_index].casefold() == "or":
+            if next_index + 2 >= len(tokens) or tokens[next_index + 1].casefold() not in _SQLITE_UPDATE_CONFLICTS:
+                continue
+            next_index += 2
         table = _identifier(tokens[next_index]).casefold()
-        if table == "messages":
+        if table in _MESSAGE_SQL_TABLES:
             return True
         # Permit a qualified SQLite table name such as main.messages.
         if (
             next_index + 2 < len(tokens)
             and tokens[next_index + 1] == "."
-            and _identifier(tokens[next_index + 2]).casefold() == "messages"
+            and _identifier(tokens[next_index + 2]).casefold() in _MESSAGE_SQL_TABLES
         ):
             return True
     return False
@@ -602,10 +618,19 @@ def violations_for(path: Path, source: str) -> list[Finding]:
     findings.extend(_scheduled_content_violations(relative, tree))
     findings.extend(_raw_message_content_violations(relative, tree))
 
-    sql_hits = [snippet for snippet in _sql_snippets(tree, constants) if _has_messages_from_or_join(snippet.text)]
-    if sql_hits and relative not in MESSAGE_SQL_OWNER_PATHS and relative not in MESSAGE_SQL_LEGACY_EXCEPTION_PATHS:
+    sql_hits = [snippet for snippet in _sql_snippets(tree, constants) if _has_message_table_sql(snippet.text)]
+    if (
+        sql_hits
+        and relative not in MESSAGE_SQL_OWNER_PATHS
+        and relative not in MESSAGE_SQL_LEGACY_EXCEPTION_PATHS
+        and relative not in MESSAGE_SQL_SCHEMA_OWNER_PATHS
+    ):
         findings.extend(
-            Finding(relative, snippet.line, "direct FROM/JOIN messages SQL is outside a reviewed owner")
+            Finding(
+                relative,
+                snippet.line,
+                "direct FROM/JOIN messages or UPDATE/INSERT/DELETE messages/message_versions SQL is outside a reviewed owner",
+            )
             for snippet in sql_hits
         )
     return findings
@@ -619,13 +644,16 @@ def boundary_violations(source_root: Path = SOURCE_ROOT) -> list[Finding]:
         relative = _relative(path, source_root)
         tree = ast.parse(source, filename=str(path))
         constants = _static_constants(tree)
-        if any(_has_messages_from_or_join(snippet.text) for snippet in _sql_snippets(tree, constants)):
+        if any(_has_message_table_sql(snippet.text) for snippet in _sql_snippets(tree, constants)):
             observed_sql_paths.add(relative)
         findings.extend(violations_for(path, source))
 
     findings.extend(
         Finding(path, 1, "stale message SQL owner/legacy exception entry")
-        for path in stale_sql_allowlist_entries(observed_sql_paths)
+        for path in stale_sql_allowlist_entries(
+            observed_sql_paths,
+            schema_paths=MESSAGE_SQL_SCHEMA_OWNER_PATHS,
+        )
     )
     return findings
 
@@ -635,9 +663,10 @@ def stale_sql_allowlist_entries(
     *,
     owner_paths: Iterable[str] = MESSAGE_SQL_OWNER_PATHS,
     legacy_paths: Iterable[str] = MESSAGE_SQL_LEGACY_EXCEPTION_PATHS,
+    schema_paths: Iterable[str] = (),
 ) -> list[str]:
     """Return reviewed owner/exception paths that no longer contain message SQL."""
-    allowed_paths = set(owner_paths) | set(legacy_paths)
+    allowed_paths = set(owner_paths) | set(legacy_paths) | set(schema_paths)
     return sorted(allowed_paths - set(observed_paths))
 
 
