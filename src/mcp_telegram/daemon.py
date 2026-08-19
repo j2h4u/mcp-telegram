@@ -826,6 +826,7 @@ async def _build_sync_main_context() -> _SyncMainContext:
             resolver_enrichment_ttl_seconds=config.freshness.entities.resolver_enrichment_ttl_seconds,
             folder_snapshot_ttl_seconds=config.freshness.folders.snapshot_ttl_seconds,
             telemetry_retention_ttl_seconds=config.telemetry.retention_ttl_seconds,
+            slow_request_seconds=config.logging.daemon_api_slow_request_seconds,
         ),
         health_status=flood_wait_kill_switch_status,
     )
@@ -920,6 +921,12 @@ async def _prime_runtime(ctx: _SyncMainContext) -> None:
     _ = ctx.api_server.startup_detail
     me = cast(_MeLike, await ctx.client.get_me())
     ctx.api_server.self_id = int(me.id)
+    ctx.api_server.self_profile = {
+        "id": ctx.api_server.self_id,
+        "first_name": getattr(me, "first_name", None),
+        "last_name": getattr(me, "last_name", None),
+        "username": getattr(me, "username", None),
+    }
     ctx.own_only_context = await _load_own_only_context(ctx.client, ctx.api_server.self_id)
     ensure_own_only_schema(ctx.conn)
     logger.info("daemon self_id cached: %s", ctx.api_server.self_id)

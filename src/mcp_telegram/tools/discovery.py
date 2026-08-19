@@ -1,12 +1,13 @@
 import logging
-from typing import Literal
+from typing import Literal, cast
 
-from pydantic import Field
+from pydantic import ConfigDict, Field, model_validator
 
 logger = logging.getLogger(__name__)
 
 from ..resolver import parse_exact_dialog_id
 from ._base import (
+    DaemonConnection,
     DaemonNotRunningError,
     ToolAnnotations,
     ToolArgs,
@@ -409,13 +410,107 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
 
 class ListTopics(ToolArgs):
     """
-    List forum topics for one dialog.
+    List topics/threads for one topic-capable dialog.
 
-    Use this before topic= when working with forum supergroups so you can choose an exact topic
-    name or numeric topic_id instead of guessing via fuzzy match.
+    Provide dialog= for a name, username, link, or numeric dialog id, or exact_dialog_id=
+    when the dialog id is already known. Do not pass message sender_id values here:
+    sender_id identifies a message author, while dialog_id identifies the chat/bot/channel
+    whose topics should be listed.
+
+    Use this before topic= when working with forum supergroups or bot DM topics so you
+    can choose an exact topic name or numeric topic_id instead of guessing via fuzzy match.
     """
 
-    dialog: str = Field(max_length=500)
+    model_config = ConfigDict(
+        json_schema_extra={
+            "oneOf": [
+                {"required": ["dialog"]},
+                {"required": ["exact_dialog_id"]},
+            ]
+        }
+    )
+
+    dialog: str | None = Field(default=None, max_length=500)
+    exact_dialog_id: int | None = Field(
+        default=None,
+        description=(
+            "Known numeric dialog id. Prefer this when available; do not pass sender_id values from messages."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def validate_dialog_selector(self) -> ListTopics:
+        if self.dialog is None and self.exact_dialog_id is None:
+            raise ValueError("Provide either dialog or exact_dialog_id.")
+        if self.dialog is not None and self.exact_dialog_id is not None:
+            raise ValueError("dialog and exact_dialog_id are mutually exclusive.")
+        return self
+
+
+def _list_topics_input_label(args: ListTopics) -> str:
+    if args.exact_dialog_id is not None:
+        return str(args.exact_dialog_id)
+    return args.dialog or ""
+
+
+def _list_topics_target(args: ListTopics) -> tuple[int | None, str | None]:
+    dialog_id = args.exact_dialog_id
+    if dialog_id is None and args.dialog is not None:
+        dialog_id = parse_exact_dialog_id(args.dialog)
+    dialog_name = None if dialog_id is not None else args.dialog
+    return dialog_id, dialog_name
+
+
+async def _fetch_topics_response(
+    conn: DaemonConnection,
+    dialog_id: int | None,
+    dialog_name: str | None,
+) -> dict[str, object]:
+    if dialog_id is not None and dialog_id != 0:
+        return await conn.list_topics(dialog_id=dialog_id)
+    return await conn.list_topics(dialog=dialog_name)
+
+
+def _list_topics_error_result(args: ListTopics, response: dict[str, object]) -> ToolResult:
+    error_code = response.get("error", "")
+    error_msg = response.get("message", "Request failed.")
+    if error_code == "dialog_not_found":
+        from ..errors import dialog_not_found_text
+
+        return error_result(
+            dialog_not_found_text(_list_topics_input_label(args), retry_tool="ListTopics"), has_filter=True
+        )
+    error_prefix = f"{error_code}: " if error_code else ""
+    return error_result(
+        f"Error: {error_prefix}{error_msg}\n"
+        "Action: Retry ListTopics with a corrected dialog id/name, or call ListDialogs first.",
+        has_filter=True,
+    )
+
+
+def _structured_topic(topic: dict[str, object]) -> dict[str, object]:
+    title = topic.get("title") or ""
+    structured_topic: dict[str, object] = {
+        "topic_id": topic.get("topic_id", topic.get("id")),
+        "title": title,
+        "title_content": telegram_content(str(title), "message_text"),
+    }
+    for field in ("pinned", "hidden", "snapshot_at"):
+        if field in topic:
+            structured_topic[field] = topic.get(field)
+    return structured_topic
+
+
+def _list_topics_payload(args: ListTopics, data: dict[str, object]) -> dict[str, object]:
+    raw_topics = data.get("topics", [])
+    topics = [_structured_topic(topic) for topic in cast(list[dict[str, object]], raw_topics)]
+    return {
+        "dialog": _list_topics_input_label(args),
+        "dialog_id": data.get("dialog_id"),
+        "topics": topics,
+        "count": len(topics),
+        "empty_reason": None if topics else data.get("empty_reason", "no_active_topics"),
+    }
 
 
 @mcp_tool(
@@ -431,59 +526,22 @@ class ListTopics(ToolArgs):
     output_schema=LIST_TOPICS_OUTPUT_SCHEMA,
 )
 async def list_topics(args: ListTopics) -> ToolResult:
-    # Try to resolve dialog_id from parsing as numeric/username first
-    dialog_id: int | None = parse_exact_dialog_id(args.dialog)
-    dialog_name: str | None = None if dialog_id is not None else args.dialog
+    dialog_id, dialog_name = _list_topics_target(args)
 
     try:
         async with daemon_connection() as conn:
-            if dialog_id is not None and dialog_id != 0:
-                response = await conn.list_topics(dialog_id=dialog_id)
-            else:
-                response = await conn.list_topics(dialog=dialog_name)
+            response = await _fetch_topics_response(conn, dialog_id, dialog_name)
     except DaemonNotRunningError as exc:
         return error_result(_daemon_not_running_text(exc), has_filter=True)
 
     if not response.get("ok"):
-        error_code = response.get("error", "")
-        error_msg = response.get("message", "Request failed.")
-        if error_code == "dialog_not_found":
-            from ..errors import dialog_not_found_text
-
-            return error_result(dialog_not_found_text(args.dialog, retry_tool="ListTopics"), has_filter=True)
-        error_prefix = f"{error_code}: " if error_code else ""
-        return error_result(
-            f"Error: {error_prefix}{error_msg}\n"
-            "Action: Retry ListTopics with a corrected dialog id/name, or call ListDialogs first.",
-            has_filter=True,
-        )
+        return _list_topics_error_result(args, response)
 
     data = response.get("data", {})
-    topics = data.get("topics", [])
-    structured_topics: list[dict[str, object]] = []
-    for topic in topics:
-        title = topic.get("title") or ""
-        structured_topic: dict[str, object] = {
-            "topic_id": topic.get("topic_id", topic.get("id")),
-            "title": title,
-            "title_content": telegram_content(str(title), "message_text"),
-        }
-        if "pinned" in topic:
-            structured_topic["pinned"] = topic.get("pinned")
-        if "hidden" in topic:
-            structured_topic["hidden"] = topic.get("hidden")
-        if "snapshot_at" in topic:
-            structured_topic["snapshot_at"] = topic.get("snapshot_at")
-        structured_topics.append(structured_topic)
-    structured_content = {
-        "dialog": args.dialog,
-        "dialog_id": data.get("dialog_id"),
-        "topics": structured_topics,
-        "count": len(structured_topics),
-        "empty_reason": None if structured_topics else data.get("empty_reason", "no_active_topics"),
-    }
+    structured_content = _list_topics_payload(args, data if isinstance(data, dict) else {})
+    structured_topics = cast(list[dict[str, object]], structured_content["topics"])
 
-    if not topics:
+    if not structured_topics:
         return structured_result(structured_content, has_filter=True)
 
     return structured_result(

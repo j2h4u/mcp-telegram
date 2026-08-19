@@ -359,6 +359,50 @@ def test_daemon_api_server_uses_explicit_sync_db_path(tmp_path: Path) -> None:
     assert server._sync_db_path == sync_db_path
 
 
+@pytest.mark.asyncio
+async def test_get_entity_info_uses_startup_snapshot_for_self_id() -> None:
+    conn = _make_db_with_dialogs()
+    conn.execute(
+        """
+        CREATE TABLE entity_details (
+            entity_id INTEGER PRIMARY KEY,
+            detail_json TEXT NOT NULL,
+            fetched_at INTEGER NOT NULL
+        ) WITHOUT ROWID
+        """
+    )
+    client = _TestClient()
+    client.get_me = AsyncMock()
+    client.get_entity = AsyncMock(side_effect=AssertionError("self id must not use get_entity"))
+    server = make_server(conn, client)
+    server.self_id = 591994976
+    server.self_profile = {"id": 591994976, "first_name": "Self", "last_name": None, "username": "self"}
+
+    result = await server._get_entity_info({"entity_id": 591994976})
+
+    assert result["ok"] is True
+    cast(AsyncMock, client.get_me).assert_not_awaited()
+    cast(AsyncMock, client.get_entity).assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_daemon_api_logs_request_completion_for_errors(caplog: pytest.LogCaptureFixture) -> None:
+    server = make_server()
+    line = json.dumps({"method": "unknown_method", "request_id": "req123"}).encode()
+
+    with caplog.at_level("INFO", logger="mcp_telegram.daemon_api"):
+        response, method, request_id = await server._handle_client_line(line, "", None)
+
+    assert response["ok"] is False
+    assert method == "unknown_method"
+    assert request_id == "req123"
+    records = [r for r in caplog.records if r.message.startswith("daemon_api_request_complete")]
+    assert len(records) == 1
+    assert "method=unknown_method" in records[0].message
+    assert "ok=False" in records[0].message
+    assert "error=unknown_method" in records[0].message
+
+
 def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.Connection:
     """Return an in-memory SQLite connection with the required schema."""
     conn = _register_sqlite_connection(sqlite3.connect(":memory:"))

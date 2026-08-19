@@ -113,6 +113,10 @@ def _bool_attr(obj: object, name: str) -> bool:
     return bool(_attr(obj, name, False))
 
 
+def _value_or_none[T](value: object, expected_type: type[T]) -> T | None:
+    return value if isinstance(value, expected_type) else None
+
+
 def _isoformat_or_none(value: object | None) -> str | None:
     if value is None:
         return None
@@ -179,11 +183,14 @@ class EntityInfoDeps:
     conn: sqlite3.Connection
     client: _EntityInfoClient
     dm_peer_ids: Callable[[], set[int]]
+    self_id: int | None
+    self_profile: Mapping[str, object] | None
     get_peer_id: Callable[[object], int]
     rid: Callable[[], str]
     logger: logging.Logger
     now_provider: Callable[[], float]
     detail_ttl_seconds: int
+    slow_stage_seconds: float
     get_common_chats_request: Callable[..., object]
     get_dialog_filters_request: Callable[..., object]
     get_full_user_request: Callable[..., object]
@@ -210,6 +217,7 @@ class DaemonEntityInfoService:
 
     async def get_entity_info(self, req: Mapping[str, object]) -> dict[str, object]:
         """Type-tagged entity inspector covering 5 Telegram entity kinds."""
+        started_at = self._deps.now_provider()
         entity_id = self._extract_entity_id(req)
         if entity_id is None:
             return self._error("telegram_api_error", "entity_id missing or not an integer")
@@ -219,18 +227,99 @@ class DaemonEntityInfoService:
         if cached is not None:
             return cached
 
+        if self._deps.self_id == entity_id and self._deps.self_profile is not None:
+            self_detail = self._build_self_detail()
+            self._log_stage(entity_id, "self_snapshot", started_at, detail_type=self_detail.get("type"))
+            return {"ok": True, "data": self_detail}
+
+        self._log_stage(entity_id, "cache_miss", started_at)
+        stage_started_at = self._deps.now_provider()
         entity, resolve_error = await self._resolve_entity(entity_id)
+        self._log_stage(entity_id, "resolve_entity", stage_started_at)
         if resolve_error is not None:
             return resolve_error
 
+        stage_started_at = self._deps.now_provider()
         detail, detail_error = await self._build_detail_by_type(entity)
-        if detail_error is not None:
-            return detail_error
-        if detail is None:
-            return self._error("telegram_api_error", "per-type helper returned no detail")
+        detail_type = detail.get("type") if detail is not None else None
+        self._log_stage(entity_id, "build_detail", stage_started_at, detail_type=detail_type)
+        if detail_error is not None or detail is None:
+            return detail_error or self._error("telegram_api_error", "per-type helper returned no detail")
 
+        stage_started_at = self._deps.now_provider()
         self._writeback(entity_id, detail, now)
+        self._log_stage(entity_id, "writeback", stage_started_at, detail_type=detail.get("type"))
+        self._log_stage(entity_id, "complete", started_at, detail_type=detail.get("type"))
         return {"ok": True, "data": detail}
+
+    def _build_self_detail(self) -> dict[str, object]:
+        profile = self._deps.self_profile or {}
+        first_name = _value_or_none(profile.get("first_name"), str)
+        last_name = _value_or_none(profile.get("last_name"), str)
+        name = " ".join(part for part in (first_name, last_name) if part) or None
+        return {
+            "id": self._deps.self_id,
+            "type": "user",
+            "name": name,
+            "username": _value_or_none(profile.get("username"), str),
+            "about": None,
+            "my_membership": {"role": "self"},
+            "avatar_history": [],
+            "avatar_count": 0,
+            "first_name": first_name,
+            "last_name": last_name,
+            "extra_usernames": [],
+            "emoji_status_id": None,
+            "status": None,
+            "phone": None,
+            "lang_code": None,
+            "contact": False,
+            "mutual_contact": False,
+            "close_friend": False,
+            "send_paid_messages_stars": None,
+            "personal_channel_id": None,
+            "personal_channel": None,
+            "personal_channel_unavailable_reason": None,
+            "birthday": None,
+            "verified": False,
+            "premium": False,
+            "bot": False,
+            "scam": False,
+            "fake": False,
+            "restricted": False,
+            "restriction_reason": [],
+            "blocked": False,
+            "ttl_period": None,
+            "private_forward_name": None,
+            "bot_info": None,
+            "business_location": None,
+            "business_intro": None,
+            "business_work_hours": None,
+            "note": None,
+            "folder_id": None,
+            "folder_name": None,
+            "common_chats": [],
+            "_full_fetch_ok": False,
+        }
+
+    def _log_stage(
+        self,
+        entity_id: int,
+        stage: str,
+        started_at: float,
+        *,
+        detail_type: object | None = None,
+    ) -> None:
+        duration_s = self._deps.now_provider() - started_at
+        if stage in {"cache_miss", "self_snapshot", "complete"} or duration_s >= self._deps.slow_stage_seconds:
+            self._deps.logger.info(
+                "entity_info_stage entity_id=%r stage=%s duration_s=%.3f detail_type=%s%s",
+                entity_id,
+                stage,
+                duration_s,
+                detail_type,
+                self._deps.rid(),
+            )
 
     def _extract_entity_id(self, req: Mapping[str, object]) -> int | None:
         entity_id = req.get("entity_id")

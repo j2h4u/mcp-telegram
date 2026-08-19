@@ -990,6 +990,33 @@ async def test_list_topics_passes_dialog_name():
     assert call_kwargs.get("dialog") == "Some Group"
 
 
+async def test_list_topics_passes_exact_dialog_id():
+    """ListTopics accepts the same exact dialog id selector style as ListMessages."""
+    conn = _make_daemon_conn({"ok": True, "data": {"topics": [], "dialog_id": 8583106747}})
+    with _patch_daemon(conn):
+        result = await list_topics(ListTopics(exact_dialog_id=8583106747))
+
+    call_kwargs = _call_kwargs(conn.list_topics)
+    assert call_kwargs.get("dialog_id") == 8583106747
+    assert "dialog" not in call_kwargs
+    assert result.structured_content is not None
+    assert _json_dict(result.structured_content)["dialog"] == "8583106747"
+
+
+def test_list_topics_rejects_missing_or_conflicting_dialog_selectors() -> None:
+    with pytest.raises(ValueError, match="Provide either dialog or exact_dialog_id"):
+        ListTopics()
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        ListTopics(dialog="Some Group", exact_dialog_id=8583106747)
+
+
+def test_list_topics_schema_exposes_one_dialog_selector() -> None:
+    schema = ListTopics.model_json_schema()
+
+    assert {"required": ["dialog"]} in schema["oneOf"]
+    assert {"required": ["exact_dialog_id"]} in schema["oneOf"]
+
+
 async def test_list_topics_empty_is_structured_non_error():
     """ListTopics empty state is a structured successful response."""
     conn = _make_daemon_conn({"ok": True, "data": {"topics": [], "dialog_id": 123}})

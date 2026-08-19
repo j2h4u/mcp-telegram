@@ -122,6 +122,7 @@ class LoggingConfig:
     """Process logging policy."""
 
     level: str = "INFO"
+    daemon_api_slow_request_seconds: float = 5.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -357,7 +358,15 @@ def resolve_scheduling_config(
 def resolve_logging_config(environ: Mapping[str, str] | None = None) -> LoggingConfig:
     """Return the normalized process log level from its environment override."""
     env = os.environ if environ is None else environ
-    return LoggingConfig(level=env.get("LOG_LEVEL", LoggingConfig().level).upper())
+    defaults = LoggingConfig()
+    return LoggingConfig(
+        level=env.get("LOG_LEVEL", defaults.level).upper(),
+        daemon_api_slow_request_seconds=_env_positive_float(
+            env,
+            "DAEMON_API_SLOW_REQUEST_SECONDS",
+            defaults.daemon_api_slow_request_seconds,
+        ),
+    )
 
 
 def resolve_http_server_config(
@@ -733,9 +742,18 @@ def _parse_http(data: dict[str, object], path: Path) -> HttpServerConfig:
 
 
 def _parse_logging(data: dict[str, object], path: Path) -> LoggingConfig:
-    logging_data = _optional_section(data, "logging", {"level"}, path)
+    logging_data = _optional_section(data, "logging", {"level", "daemon_api_slow_request_seconds"}, path)
     defaults = LoggingConfig()
-    return LoggingConfig(level=_non_empty_str(logging_data, "level", "logging", path, defaults.level).upper())
+    return LoggingConfig(
+        level=_non_empty_str(logging_data, "level", "logging", path, defaults.level).upper(),
+        daemon_api_slow_request_seconds=_positive_float(
+            logging_data,
+            "daemon_api_slow_request_seconds",
+            "logging",
+            path,
+            defaults.daemon_api_slow_request_seconds,
+        ),
+    )
 
 
 def load_config(path: Path | None = None) -> McpTelegramConfig:
