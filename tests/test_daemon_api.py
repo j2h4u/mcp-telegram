@@ -1102,6 +1102,47 @@ async def test_search_messages_fts() -> None:
     assert messages[0]["message_id"] == 100
 
 
+@pytest.mark.asyncio
+async def test_search_messages_keeps_raw_text_while_list_projects_hidden_links() -> None:
+    """Search rows stay plain while the authoritative list body renders links."""
+    conn = _make_db(with_fts=True)
+    conn.execute(
+        """
+        CREATE TABLE message_entities (
+            dialog_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL,
+            offset INTEGER NOT NULL,
+            length INTEGER NOT NULL,
+            type TEXT NOT NULL,
+            value TEXT
+        )
+        """
+    )
+    _insert_synced_dialog(conn, 1, status="synced")
+    raw_text = ("prefix " * 18) + "needle" + (" tail" * 24)
+    _insert_message(conn, 1, 100, text=raw_text)
+    link_offset = raw_text.index("needle")
+    conn.execute(
+        "INSERT INTO message_entities VALUES (?, ?, ?, ?, 'text_url', ?)",
+        (1, 100, link_offset, len("needle"), "https://example.test/hidden"),
+    )
+    conn.execute(
+        "INSERT INTO messages_fts(dialog_id, message_id, stemmed_text) VALUES (?, ?, ?)",
+        (1, 100, stem_text(raw_text)),
+    )
+    conn.commit()
+
+    server = make_server(conn)
+    search_result = await server._search_messages({"dialog_id": 1, "query": "needle", "limit": 10})
+    search_message = _response_messages(search_result)[0]
+    assert search_message["text"] == raw_text
+
+    list_result = await server._list_messages({"dialog_id": 1, "limit": 10})
+    list_message = _response_messages(list_result)[0]
+    expected_text = ("prefix " * 18) + "[needle](https://example.test/hidden)" + (" tail" * 24)
+    assert list_message["text"] == expected_text
+
+
 # ---------------------------------------------------------------------------
 # search_messages — empty query
 # ---------------------------------------------------------------------------
