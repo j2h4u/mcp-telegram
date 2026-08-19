@@ -135,6 +135,44 @@ def _msg(msg_id: int, user_id: int, ts: int, **kwargs: Unpack[_MsgKwargs]) -> Fa
     )
 
 
+@dataclass
+class _TrimMessage:
+    id: int
+    date: datetime | None
+    peer_id: object | None = None
+
+
+def test_trim_incremental_batch_keeps_message_at_min_date() -> None:
+    min_date = 1_700_000_000
+
+    in_window, past_window = activity_sync._trim_incremental_batch(
+        [
+            _TrimMessage(2, datetime.fromtimestamp(min_date + 1, tz=UTC)),
+            _TrimMessage(1, datetime.fromtimestamp(min_date, tz=UTC)),
+        ],
+        min_date,
+    )
+
+    assert [message.id for message in in_window] == [2, 1]
+    assert past_window is False
+
+
+def test_trim_incremental_batch_stops_at_first_message_before_window() -> None:
+    min_date = 1_700_000_000
+
+    in_window, past_window = activity_sync._trim_incremental_batch(
+        [
+            _TrimMessage(3, datetime.fromtimestamp(min_date + 2, tz=UTC)),
+            _TrimMessage(2, datetime.fromtimestamp(min_date - 1, tz=UTC)),
+            _TrimMessage(1, datetime.fromtimestamp(min_date + 1, tz=UTC)),
+        ],
+        min_date,
+    )
+
+    assert [message.id for message in in_window] == [3]
+    assert past_window is True
+
+
 @pytest.fixture
 def conn(tmp_path: Path) -> Iterator[sqlite3.Connection]:
     connection = _make_db(tmp_path)

@@ -77,6 +77,12 @@ def test_project_temporal_response_keeps_date_when_sent_at_is_null() -> None:
     assert projected["sent_at"] is None
 
 
+def test_project_temporal_response_keeps_boolean_temporal_values_unrendered() -> None:
+    projected = project_temporal_response({"date": True, "sent_at": False}, "UTC")
+
+    assert projected == {"date": True, "sent_at": False}
+
+
 def test_project_temporal_response_discloses_non_utc_zone_without_rows() -> None:
     projected = project_temporal_response({"messages": []}, "Asia/Almaty")
 
