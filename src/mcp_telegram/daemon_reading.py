@@ -77,6 +77,8 @@ class _LoggerLike(Protocol):
 
     def warning(self, msg: str, *args: object, **kwargs: object) -> None: ...
 
+    def error(self, msg: str, *args: object, **kwargs: object) -> None: ...
+
     def exception(self, msg: str, *args: object, **kwargs: object) -> None: ...
 
 
@@ -1405,7 +1407,7 @@ class DaemonReadingService:
                 "detail": detail,
             }
 
-        self._logger.exception(
+        self._logger.error(
             "list_messages_telegram_unexpected dialog_id=%d%s",
             req.dialog_id,
             self._deps.rid(),

@@ -705,8 +705,10 @@ def test_migrate_from_legacy_db_copies_entities(tmp_path: Path) -> None:
     )
 
     copy_stmts = [
-        "INSERT OR IGNORE INTO entities (id, type, name, username, updated_at) "
-        "SELECT id, type, name, username, updated_at FROM legacy.entities",
+        (
+            "INSERT OR IGNORE INTO entities (id, type, name, username, updated_at) "
+            "SELECT id, type, name, username, updated_at FROM legacy.entities"
+        ),
     ]
     try:
         count = _migrate_from_legacy_db(conn, legacy_path, copy_stmts)
@@ -758,8 +760,10 @@ def test_migrate_from_legacy_db_insert_or_ignore_on_pk_conflict(tmp_path: Path) 
     )
 
     copy_stmts = [
-        "INSERT OR IGNORE INTO entities (id, type, name, username, updated_at) "
-        "SELECT id, type, name, username, updated_at FROM legacy.entities",
+        (
+            "INSERT OR IGNORE INTO entities (id, type, name, username, updated_at) "
+            "SELECT id, type, name, username, updated_at FROM legacy.entities"
+        ),
     ]
     try:
         _migrate_from_legacy_db(conn, legacy_path, copy_stmts)

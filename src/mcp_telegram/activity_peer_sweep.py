@@ -427,7 +427,7 @@ _DIALOG_STATE_COLUMNS = frozenset(
 _DialogStateRow = tuple[int | None, int | None, int | None, str | None, int | None, str | None, int | None, str | None]
 
 
-def _load_dialog_state(conn: sqlite3.Connection, dialog_id: int) -> dict[str, int | None | str]:
+def _load_dialog_state(conn: sqlite3.Connection, dialog_id: int) -> dict[str, int | str | None]:
     """Return the per-tier cursor/retry fields for a peer, or {} if absent."""
     row = cast(
         _DialogStateRow | None,
