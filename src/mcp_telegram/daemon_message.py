@@ -11,6 +11,7 @@ from .reactions.contracts import ReactionFreshness
 from .telegram_fact_queries import enrich_reaction_events, read_at_map
 from .telegram_message_projection import MessageLike as _MessageLike
 from .telegram_message_projection import message_to_dict
+from .text_projection import TextLink, render_text_links
 
 __all__ = [
     "_MessageLike",
@@ -57,6 +58,33 @@ def fetch_reaction_counts(
     return result
 
 
+def fetch_text_links(
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    message_ids: list[int],
+) -> dict[int, list[TextLink]]:
+    """Return persisted Telegram hidden links for one message page."""
+    if not message_ids:
+        return {}
+    placeholders = ",".join("?" * len(message_ids))
+    try:
+        rows = cast(
+            list[tuple[int | str, int | str, int | str, object]],
+            conn.execute(
+                f"SELECT message_id, offset, length, value FROM message_entities "
+                f"WHERE dialog_id = ? AND message_id IN ({placeholders}) "
+                "AND type = 'text_url' AND value IS NOT NULL ORDER BY message_id, offset",
+                [dialog_id, *message_ids],
+            ).fetchall(),
+        )
+    except sqlite3.OperationalError:
+        return {}
+    result: dict[int, list[TextLink]] = {}
+    for message_id, offset, length, value in rows:
+        result.setdefault(int(message_id), []).append((int(offset), int(length), str(value)))
+    return result
+
+
 def project_cached_message_facts(
     conn: sqlite3.Connection,
     dialog_id: int,
@@ -67,10 +95,12 @@ def project_cached_message_facts(
         return list(messages)
     message_ids = [message.message_id for message in messages]
     reaction_map = fetch_reaction_counts(conn, dialog_id, message_ids)
+    text_link_map = fetch_text_links(conn, dialog_id, message_ids)
     read_dates = read_at_map(conn, dialog_id, message_ids)
     with_reactions = [
         dataclasses.replace(
             message,
+            text=render_text_links(message.text, text_link_map.get(message.message_id, [])),
             reactions_display=format_reaction_counts(reaction_map.get(message.message_id, [])),
         )
         for message in messages
