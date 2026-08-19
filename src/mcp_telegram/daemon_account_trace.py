@@ -15,6 +15,8 @@ from telethon.tl.functions.contacts import ResolveUsernameRequest  # type: ignor
 
 from .activity_peer_resolve import resolve_linked_chat_id
 from .activity_peer_sweep import enroll_activity_dialog
+from .daemon_message import fetch_text_links
+from .message_content import MessageSnapshot, project_message_content
 from .message_contracts import ExtractedMessage
 from .messages.sqlite_repository import insert_messages_with_fts
 from .messages.telegram_adapter import extract_message_row
@@ -440,7 +442,7 @@ class DaemonAccountTraceService:
             )
         )
         rows = _fetchall_mapping_rows(conn.execute(sql, params))
-        selected_rows = rows[:limit]
+        selected_rows = _project_trace_content_rows(conn, rows[:limit])
         evidence = [DaemonAccountTraceService._trace_row_to_evidence(row) for row in selected_rows]
         next_navigation: str | None = None
         if len(rows) > limit and selected_rows:
@@ -867,6 +869,38 @@ class DaemonAccountTraceService:
                 post_author_aliases=post_author_aliases,
             )
         )
+
+
+def _project_trace_content_rows(
+    conn: sqlite3.Connection,
+    rows: Sequence[Mapping[str, object] | sqlite3.Row],
+) -> list[Mapping[str, object]]:
+    """Render persisted hidden links while retaining trace-specific row fields."""
+    ids_by_dialog: dict[int, list[int]] = {}
+    for row in rows:
+        dialog_id = _row_int(row, "dialog_id")
+        ids_by_dialog.setdefault(dialog_id, []).append(_row_int(row, "message_id"))
+    links_by_message: dict[tuple[int, int], list[tuple[int, int, str]]] = {}
+    for dialog_id, message_ids in ids_by_dialog.items():
+        for message_id, links in fetch_text_links(conn, dialog_id, message_ids).items():
+            links_by_message[(dialog_id, message_id)] = links
+
+    projected: list[Mapping[str, object]] = []
+    for row in rows:
+        dialog_id = _row_int(row, "dialog_id")
+        message_id = _row_int(row, "message_id")
+        content = project_message_content(
+            MessageSnapshot(
+                text=cast(str | None, _row_value(row, "text")),
+                media_description=cast(str | None, _row_value(row, "media_description")),
+                text_links=tuple(links_by_message.get((dialog_id, message_id), [])),
+            )
+        )
+        projected_row = _row_dict(row)
+        projected_row["text"] = content.text
+        projected_row["media_description"] = content.media_description
+        projected.append(projected_row)
+    return projected
 
 
 def _resolve_trace_visible_enrichment_request(
@@ -1734,6 +1768,8 @@ def _row_int(row: Mapping[str, object] | Sequence[object], key: str) -> int:
 
 
 def _row_dict(row: object) -> dict[str, object]:
+    if isinstance(row, sqlite3.Row):
+        return dict(zip(row.keys(), row, strict=True))
     return dict(_row_mapping(row))
 
 

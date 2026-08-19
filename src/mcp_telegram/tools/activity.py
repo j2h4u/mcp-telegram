@@ -5,6 +5,7 @@ from collections.abc import Mapping
 from mcp.types import ToolAnnotations
 from pydantic import Field, field_validator
 
+from ..message_content import MessageSnapshot, project_message_content
 from ._base import (
     DaemonNotRunningError,
     ToolArgs,
@@ -213,7 +214,16 @@ def _comment_int(comment: Mapping[str, object], key: str) -> int:
 def _structured_comment(comment: Mapping[str, object]) -> dict[str, object]:
     dialog_id = _comment_int(comment, "dialog_id")
     message_id = _comment_int(comment, "message_id")
-    text = str(comment.get("text") or "")
+    raw_text = comment.get("text")
+    raw_media_description = comment.get("media_description")
+    content = project_message_content(
+        MessageSnapshot(
+            text=raw_text if isinstance(raw_text, str) else None,
+            media_description=raw_media_description if isinstance(raw_media_description, str) else None,
+        )
+    )
+    text = content.primary_text or ""
+    content_kind = content.kind if content.kind != "none" else "message_text"
     return {
         "dialog_id": dialog_id,
         "dialog_name": comment.get("dialog_name"),
@@ -222,7 +232,7 @@ def _structured_comment(comment: Mapping[str, object]) -> dict[str, object]:
         "message_id": message_id,
         "sent_at": comment.get("sent_at"),
         "text": text,
-        "content": telegram_content(text, "message_text"),
+        "content": telegram_content(text, content_kind),
         "sync_status": comment.get("sync_status"),
         "reply_count": _comment_int(comment, "reply_count"),
         "reactions": comment.get("reactions") or [],

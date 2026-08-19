@@ -2,10 +2,13 @@
 
 import sqlite3
 import time
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol, cast
+
+from .daemon_message import fetch_text_links
+from .message_content import MessageSnapshot, project_message_content
 
 
 class _LoggerLike(Protocol):
@@ -353,7 +356,7 @@ def _build_recent_activity_rows_query(typed_activity_filter_sql: str, kinded_act
     return (
         "WITH typed_activity AS ("
         "SELECT m.dialog_id AS dialog_id, m.message_id AS message_id, "
-        "       m.sent_at AS sent_at, m.text AS text, "
+        "       m.sent_at AS sent_at, m.text AS text, m.media_description AS media_description, "
         "       COALESCE(e.name, d.name, CAST(m.dialog_id AS TEXT)) AS dialog_name, "
         "       CASE "
         "         WHEN lower(COALESCE(e.type, '')) = 'bot' THEN 'bot' "
@@ -406,6 +409,55 @@ def _build_recent_activity_rows_query(typed_activity_filter_sql: str, kinded_act
         "LIMIT ?"
         ") ORDER BY sent_at ASC, dialog_id ASC, message_id ASC"
     )
+
+
+def _activity_text_links(
+    conn: sqlite3.Connection,
+    rows: Sequence[tuple[object, ...]],
+) -> dict[tuple[int, int], list[tuple[int, int, str]]]:
+    links_by_msg: dict[tuple[int, int], list[tuple[int, int, str]]] = {}
+    dialog_message_ids: dict[int, list[int]] = {}
+    for row in rows:
+        dialog_id = int(cast(int | str, row[0]))
+        dialog_message_ids.setdefault(dialog_id, []).append(int(cast(int | str, row[1])))
+    for dialog_id, message_ids in dialog_message_ids.items():
+        for message_id, links in fetch_text_links(conn, dialog_id, message_ids).items():
+            links_by_msg[(dialog_id, message_id)] = links
+    return links_by_msg
+
+
+def _project_activity_comments(
+    rows: Sequence[tuple[object, ...]],
+    links_by_msg: dict[tuple[int, int], list[tuple[int, int, str]]],
+    reactions_by_msg: dict[tuple[int, int], list[dict]],
+) -> list[dict[str, object]]:
+    comments: list[dict[str, object]] = []
+    for row in rows:
+        dialog_id = int(cast(int | str, row[0]))
+        message_id = int(cast(int | str, row[1]))
+        content = project_message_content(
+            MessageSnapshot(
+                text=cast(str | None, row[3]),
+                media_description=cast(str | None, row[4]),
+                text_links=tuple(links_by_msg.get((dialog_id, message_id), [])),
+            )
+        )
+        comments.append(
+            {
+                "dialog_id": dialog_id,
+                "message_id": message_id,
+                "sent_at": int(cast(int | str, row[2])),
+                "text": content.text,
+                "media_description": content.media_description,
+                "dialog_name": row[5] or str(row[0]),
+                "dialog_type": row[6],
+                "dialog_category": row[9],
+                "reply_count": int(cast(int | str, row[7])),
+                "sync_status": row[8],
+                "reactions": reactions_by_msg.get((dialog_id, message_id), []),
+            }
+        )
+    return comments
 
 
 class DaemonActivityStatsService:
@@ -493,7 +545,7 @@ class DaemonActivityStatsService:
             return error or {"ok": False, "error": "internal", "message": "internal error"}
 
         rows = cast(
-            list[tuple[object, object, object, object, object, object, object, object, object]],
+            list[tuple[object, object, object, object, object, object, object, object, object, object]],
             self._deps.conn.execute(
                 _build_recent_activity_rows_query(
                     parsed.typed_activity_filter_sql,
@@ -520,6 +572,8 @@ class DaemonActivityStatsService:
         else:
             scan_status = "never_run"
 
+        links_by_msg = _activity_text_links(self._deps.conn, rows)
+
         reactions_by_msg: dict[tuple[int, int], list[dict]] = {}
         if rows:
             rx_params: list[int] = []
@@ -539,21 +593,7 @@ class DaemonActivityStatsService:
                     {"emoji": rx[2], "count": int(cast(int | str, rx[3]))}
                 )
 
-        comments = [
-            {
-                "dialog_id": int(cast(int | str, row[0])),
-                "message_id": int(cast(int | str, row[1])),
-                "sent_at": int(cast(int | str, row[2])),
-                "text": row[3],
-                "dialog_name": row[4] or str(row[0]),
-                "dialog_type": row[5],
-                "dialog_category": row[8],
-                "reply_count": int(cast(int | str, row[6])),
-                "sync_status": row[7],
-                "reactions": reactions_by_msg.get((int(cast(int | str, row[0])), int(cast(int | str, row[1]))), []),
-            }
-            for row in rows
-        ]
+        comments = _project_activity_comments(rows, links_by_msg, reactions_by_msg)
 
         return {
             "ok": True,

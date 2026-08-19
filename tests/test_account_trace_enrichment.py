@@ -26,6 +26,7 @@ from mcp_telegram.daemon_account_trace import (
     DaemonAccountTraceService,
     _LoggerLike,
     _messages_row_equal,
+    _project_trace_content_rows,
     _trace_candidate_dialogs,
     _trace_existing_message_bundle,
     _TraceCandidateBuildRequest,
@@ -40,6 +41,27 @@ from mcp_telegram.message_contracts import (
 )
 from tests.daemon_api_policy import make_daemon_api_policy
 from tests.reaction_helpers import make_reaction_freshener
+
+
+def test_trace_content_projection_renders_persisted_hidden_link() -> None:
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            "CREATE TABLE message_entities (dialog_id INTEGER, message_id INTEGER, offset INTEGER, length INTEGER, type TEXT, value TEXT)"
+        )
+        conn.execute("INSERT INTO message_entities VALUES (42, 7, 0, 4, 'text_url', 'https://example.com')")
+        conn.execute(
+            "CREATE TABLE trace_rows (dialog_id INTEGER, message_id INTEGER, text TEXT, media_description TEXT)"
+        )
+        conn.execute("INSERT INTO trace_rows VALUES (42, 7, 'site', NULL)")
+        rows_from_db = conn.execute("SELECT * FROM trace_rows").fetchall()
+
+        rows = _project_trace_content_rows(conn, rows_from_db)
+
+        assert rows[0]["text"] == "[site](https://example.com)"
+    finally:
+        conn.close()
 
 
 class FakeTraceClient:

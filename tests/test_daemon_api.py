@@ -6155,6 +6155,39 @@ async def test_get_my_recent_activity_filters_by_since_hours() -> None:
 
 
 @pytest.mark.asyncio
+async def test_get_my_recent_activity_projects_media_only_content() -> None:
+    """Media-only own messages retain a usable primary content value."""
+    server = make_server(_make_db_with_activity())
+    now = int(time.time())
+    with server._conn:
+        server._conn.execute(
+            "CREATE TABLE message_entities ("
+            "dialog_id INTEGER, message_id INTEGER, offset INTEGER, length INTEGER, type TEXT, value TEXT)"
+        )
+        server._conn.execute(
+            "INSERT INTO messages "
+            "(dialog_id, message_id, sent_at, text, media_description, out, is_service, is_deleted) "
+            "VALUES (42, 1, ?, NULL, '[photo]', 1, 0, 0)",
+            (now - 60,),
+        )
+        server._conn.execute(
+            "INSERT INTO messages "
+            "(dialog_id, message_id, sent_at, text, out, is_service, is_deleted) "
+            "VALUES (42, 2, ?, 'site', 1, 0, 0)",
+            (now - 30,),
+        )
+        server._conn.execute("INSERT INTO message_entities VALUES (42, 2, 0, 4, 'text_url', 'https://example.com')")
+        server._conn.execute("UPDATE activity_sync_state SET value='1' WHERE key='backfill_complete'")
+        server._conn.execute(f"UPDATE activity_sync_state SET value='{now}' WHERE key='last_sync_at'")
+
+    resp = await server._dispatch({"method": "get_my_recent_activity", "dialog_kinds": ["all"]})
+    comments = cast(list[dict[str, object]], _activity_data(resp)["comments"])
+    assert comments[0]["text"] is None
+    assert comments[0]["media_description"] == "[photo]"
+    assert comments[1]["text"] == "[site](https://example.com)"
+
+
+@pytest.mark.asyncio
 async def test_get_my_recent_activity_returns_latest_page_chronologically() -> None:
     """The daemon selects the latest N own messages but presents them oldest-to-newest."""
     server = make_server(_make_db_with_activity())

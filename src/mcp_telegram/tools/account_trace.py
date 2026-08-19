@@ -4,6 +4,7 @@ from typing import Literal
 
 from pydantic import Field, model_validator
 
+from ..message_content import MessageSnapshot, project_message_content
 from ._base import (
     DaemonNotRunningError,
     ToolAnnotations,
@@ -315,13 +316,21 @@ def _attach_trace_content_metadata(data: dict) -> None:
         for item in evidence_items:
             if not isinstance(item, dict):
                 continue
-            text = item.get("text")
-            if text:
-                item.setdefault("content", telegram_content(str(text), "message_text"))
+            content = project_message_content(
+                MessageSnapshot(
+                    text=item.get("text") if isinstance(item.get("text"), str) else None,
+                    media_description=(
+                        item.get("media_description") if isinstance(item.get("media_description"), str) else None
+                    ),
+                )
+            )
+            if content.text:
+                item["text"] = content.text
+                item.setdefault("content", telegram_content(content.text, "message_text"))
                 item.setdefault("untrusted_content", True)
-            media_description = item.get("media_description")
-            if media_description:
-                item.setdefault("media_content", telegram_content(str(media_description), "media_description"))
+            if content.media_description:
+                item["media_description"] = content.media_description
+                item.setdefault("media_content", telegram_content(content.media_description, "media_description"))
                 item.setdefault("untrusted_content", True)
 
 
