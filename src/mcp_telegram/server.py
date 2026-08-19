@@ -30,6 +30,7 @@ from mcp.types import (
     TextContent,
     Tool,
 )
+from pydantic import ValidationError
 from starlette.types import Receive, Scope, Send
 
 from . import tools
@@ -245,9 +246,17 @@ async def call_tool(name: str, arguments: dict[str, object]) -> CallToolResult:
     with correlation_context():
         try:
             args = tools.tool_args(tool, **arguments)
-        except Exception as exc:
+        except (ValueError, ValidationError) as exc:
             elapsed = time.monotonic() - t0
-            logger.exception("call_tool[%s] validation_failed after %.3fs", name, elapsed)
+            # Invalid user arguments are an expected boundary error. Keep the
+            # response unchanged, but do not make routine validation failures
+            # look like server incidents by attaching a traceback.
+            logger.info(
+                "call_tool[%s] validation_failed after %.3fs (%s)",
+                name,
+                elapsed,
+                type(exc).__name__,
+            )
             return _error_call_result(_safe_boundary_error_text(tool_name=name, stage="validation", exc=exc))
 
         try:
