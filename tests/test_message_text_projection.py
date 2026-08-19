@@ -6,11 +6,12 @@ from typing import cast
 
 from telethon.tl.types import MessageEntityTextUrl
 
-from mcp_telegram.daemon_message import project_cached_message_facts
+from mcp_telegram.daemon_message import project_cached_message_facts, project_message_rows_by_dialog
 from mcp_telegram.message_content import MessageSnapshot, project_message_content
 from mcp_telegram.models import ReadMessage
 from mcp_telegram.telegram_message_projection import MessageLike, message_to_dict
 from mcp_telegram.text_projection import render_text_links
+from mcp_telegram.tools.structured import serialize_message_content
 
 
 def test_render_text_links_uses_telegram_utf16_offsets() -> None:
@@ -49,6 +50,12 @@ def test_message_content_projector_distinguishes_media_only_and_none() -> None:
     assert empty.primary_text is None
 
 
+def test_delivery_serializer_uses_explicit_text_media_semantics() -> None:
+    assert serialize_message_content("caption", "[photo]")["content"]["content_kind"] == "message_text"
+    assert serialize_message_content(None, "[photo]")["content"]["content_kind"] == "media_description"
+    assert serialize_message_content("", None)["content"] is None
+
+
 def test_cached_message_projection_renders_persisted_hidden_link() -> None:
     conn = sqlite3.connect(":memory:")
     try:
@@ -75,6 +82,38 @@ def test_cached_message_projection_renders_persisted_hidden_link() -> None:
         )
 
         assert projected[0].text == "[сайт](https://example.com)"
+    finally:
+        conn.close()
+
+
+def test_cross_dialog_folder_projection_preserves_media_and_hidden_links() -> None:
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE message_entities (
+                dialog_id INTEGER, message_id INTEGER, offset INTEGER,
+                length INTEGER, type TEXT, value TEXT
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO message_entities VALUES (?, ?, ?, ?, 'text_url', ?)",
+            (10, 20, 3, 4, "https://example.com"),
+        )
+        rows = project_message_rows_by_dialog(
+            conn,
+            [
+                {"dialog_id": 10, "message_id": 20, "text": "go site", "media_description": "[photo]"},
+                {"dialog_id": 11, "message_id": 21, "text": None, "media_description": "[video]"},
+                {"dialog_id": 12, "message_id": 22, "text": "", "media_description": None},
+            ],
+        )
+        assert rows[0]["text"] == "go [site](https://example.com)"
+        assert rows[0]["media_description"] == "[photo]"
+        assert rows[1]["text"] is None
+        assert rows[1]["media_description"] == "[video]"
+        assert rows[2]["text"] is None
     finally:
         conn.close()
 

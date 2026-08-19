@@ -91,6 +91,7 @@ def test_folder_messages_merge_local_rows_and_report_incomplete_dialogs(tmp_path
                     "message_id": 2,
                     "sent_at": 200,
                     "text": "newer",
+                    "media_description": None,
                     "dialog_name": "Beta",
                 },
                 {
@@ -98,6 +99,7 @@ def test_folder_messages_merge_local_rows_and_report_incomplete_dialogs(tmp_path
                     "message_id": 1,
                     "sent_at": 100,
                     "text": "older",
+                    "media_description": None,
                     "dialog_name": "Alpha",
                 },
             ],

@@ -22,7 +22,12 @@ from ._base import (
     mcp_tool,
     structured_result,
 )
-from .structured import StructuredWarning, TelegramContent, TelegramContentKind, structured_warning, telegram_content
+from .structured import (
+    StructuredWarning,
+    serialize_message_content,
+    structured_warning,
+    telegram_content,
+)
 
 GET_INBOX_OUTPUT_SCHEMA = {
     "type": "object",
@@ -237,9 +242,8 @@ class GetInbox(ToolArgs):
         default=100,
         ge=10,
         description=(
-            "Group member count above which to hide messages (scope=personal only). "
-            "NOTE: currently has no effect — participants_count is not stored locally. "
-            "All groups are included regardless of size."
+            "Group member count above which to exclude the dialog (scope=personal only). "
+            "scope=all includes all groups and channels."
         ),
     )
 
@@ -286,27 +290,12 @@ _READ_MARKER_METADATA = {
 }
 
 
-def _content_or_none(text: str | None, kind: TelegramContentKind) -> TelegramContent | None:
-    if not text:
-        return None
-    return telegram_content(text, kind)
-
-
-def _structured_media(description: str | None) -> dict[str, object] | None:
-    if not description:
-        return None
-    return {
-        "description": description,
-        "content": _content_or_none(description, "media_description"),
-    }
-
-
 def _structured_reactions(display: str | None) -> dict[str, object] | None:
     if not display:
         return None
     return {
         "display": display,
-        "content": _content_or_none(display, "reaction"),
+        "content": telegram_content(display, "reaction"),
     }
 
 
@@ -428,6 +417,8 @@ def _structured_messages(
         marker_label = marker_by_message.get(message.id)
         read_markers = [_structured_read_marker(message.id, marker_label)] if marker_label else []
         text = message.text or ""
+        projected = serialize_message_content(message.text, message.media_description)
+        media = projected["media"]
         structured.append(
             {
                 "msg_id": message.id,
@@ -437,9 +428,14 @@ def _structured_messages(
                 "out": bool(message.out),
                 "date": _message_date(message.sent_at),
                 "text": text,
-                "content": _content_or_none(text, "message_text"),
+                "content": projected["content"],
                 "media_description": message.media_description,
-                "media": _structured_media(message.media_description),
+                "media": {
+                    "description": message.media_description,
+                    "content": media,
+                }
+                if media is not None
+                else None,
                 "reply_to_msg_id": message.reply_to_msg_id,
                 "edit_date": message.edit_date,
                 "reactions": _structured_reactions(message.reactions_display),

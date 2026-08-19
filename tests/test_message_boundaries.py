@@ -100,6 +100,13 @@ def test_content_marker_dict_is_rejected_outside_wrapper() -> None:
     assert any("Telegram content dictionaries" in finding.message for finding in findings)
 
 
+def test_raw_message_body_wrapper_is_rejected_in_delivery_tools() -> None:
+    gate = _gate()
+    path = gate.SOURCE_ROOT / "tools" / "folders.py"
+    findings = gate.violations_for(path, 'telegram_content(message.text, "message_text")')
+    assert any("raw message fields" in finding.message for finding in findings)
+
+
 def test_manual_content_constructor_is_rejected_outside_projector() -> None:
     gate = _gate()
     rogue = gate.SOURCE_ROOT / "rogue.py"

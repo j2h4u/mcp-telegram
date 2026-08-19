@@ -61,6 +61,9 @@ RAW_PROJECTOR_PATH = "telegram_message_projection.py"
 TEXT_PROJECTOR_PATH = "text_projection.py"
 TEXT_PROJECTOR_IMPORTERS = frozenset({"daemon_message.py", "message_content.py", RAW_PROJECTOR_PATH})
 RAW_PROJECTOR_IMPORTERS = frozenset({"daemon_message.py", "telegram_history.py"})
+MESSAGE_BODY_SERIALIZER_PATHS = frozenset(
+    {"tools/reading.py", "tools/unread.py", "tools/folders.py"}
+)
 
 _EXECUTE_METHODS = frozenset({"execute", "executemany", "executescript"})
 _SQL_NAME = re.compile(r"(?:^|_)(?:SQL|DDL|QUERY)(?:$|_)", re.IGNORECASE)
@@ -297,12 +300,29 @@ def _projection_import_violations(path: str, tree: ast.AST) -> list[Finding]:
     return findings
 
 
+def _raw_message_content_violations(path: str, tree: ast.AST) -> list[Finding]:
+    """Reject delivery code wrapping raw message fields directly."""
+    if path not in MESSAGE_BODY_SERIALIZER_PATHS:
+        return []
+    findings: list[Finding] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name) or node.func.id != "telegram_content":
+            continue
+        if not node.args:
+            continue
+        value = node.args[0]
+        if isinstance(value, ast.Attribute) and value.attr in {"text", "media_description"}:
+            findings.append(Finding(path, node.lineno, "raw message fields must use serialize_message_content"))
+    return findings
+
+
 def violations_for(path: Path, source: str) -> list[Finding]:
     relative = _relative(path)
     tree = ast.parse(source, filename=str(path))
     constants = _static_constants(tree)
     findings = _content_violations(relative, tree)
     findings.extend(_projection_import_violations(relative, tree))
+    findings.extend(_raw_message_content_violations(relative, tree))
 
     sql_hits = [snippet for snippet in _sql_snippets(tree, constants) if _has_messages_from_or_join(snippet.text)]
     if sql_hits and relative not in MESSAGE_SQL_OWNER_PATHS and relative not in MESSAGE_SQL_LEGACY_EXCEPTION_PATHS:

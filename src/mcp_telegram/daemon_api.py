@@ -96,6 +96,7 @@ from .daemon_entity_info import DaemonEntityInfoService, EntityInfoDeps
 from .daemon_message import (
     cached_reaction_freshness,
     project_cached_message_facts,
+    project_message_rows_by_dialog,
 )
 from .daemon_message_queries import (
     _FETCH_UNREAD_MESSAGES_SQL,
@@ -1022,7 +1023,12 @@ class DaemonAPIServer:
         await self._refresh_folders_if_stale()
         folder_id = int(cast(int | str, req.get("folder_id", 0)))
         limit = max(1, min(int(cast(int | str, req.get("limit", 20))), 100))
-        return {"ok": True, "data": list_folder_messages(self._conn, folder_id, limit)}
+        data = list_folder_messages(self._conn, folder_id, limit)
+        data["messages"] = project_message_rows_by_dialog(
+            self._conn,
+            cast(Sequence[Mapping[str, object]], data["messages"]),
+        )
+        return {"ok": True, "data": data}
 
     # list_topics
     # ------------------------------------------------------------------

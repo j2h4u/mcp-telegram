@@ -2,7 +2,7 @@
 
 import dataclasses
 import sqlite3
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import cast
 
 from .formatter import format_reaction_counts
@@ -12,7 +12,6 @@ from .reactions.contracts import ReactionFreshness
 from .telegram_fact_queries import enrich_reaction_events, read_at_map
 from .telegram_message_projection import MessageLike as _MessageLike
 from .telegram_message_projection import message_to_dict
-from .text_projection import TextLink
 
 __all__ = [
     "_MessageLike",
@@ -22,6 +21,7 @@ __all__ = [
     "message_to_dict",
     "project_cached_message_facts",
     "project_cached_message_facts_by_dialog",
+    "project_message_rows_by_dialog",
 ]
 
 
@@ -40,7 +40,7 @@ def fetch_text_links(
     conn: sqlite3.Connection,
     dialog_id: int,
     message_ids: list[int],
-) -> dict[int, list[TextLink]]:
+) -> dict[int, list[tuple[int, int, str]]]:
     """Return persisted Telegram hidden links for one message page."""
     if not message_ids:
         return {}
@@ -57,7 +57,7 @@ def fetch_text_links(
         )
     except sqlite3.OperationalError:
         return {}
-    result: dict[int, list[TextLink]] = {}
+    result: dict[int, list[tuple[int, int, str]]] = {}
     for message_id, offset, length, value in rows:
         result.setdefault(int(message_id), []).append((int(offset), int(length), str(value)))
     return result
@@ -143,3 +143,36 @@ def project_cached_message_facts_by_dialog(
         for (index, _), message in zip(indexed_messages, facts, strict=True):
             enriched[index] = message
     return [enriched[index] for index in range(len(messages))]
+
+
+def project_message_rows_by_dialog(
+    conn: sqlite3.Connection,
+    rows: Sequence[Mapping[str, object]],
+) -> list[dict[str, object]]:
+    """Project raw cross-dialog message rows through canonical content facts."""
+    grouped: dict[int, list[int]] = {}
+    for row in rows:
+        grouped.setdefault(int(cast(int | str, row["dialog_id"])), []).append(
+            int(cast(int | str, row["message_id"]))
+        )
+    links: dict[tuple[int, int], list[tuple[int, int, str]]] = {}
+    for dialog_id, message_ids in grouped.items():
+        for message_id, text_links in fetch_text_links(conn, dialog_id, message_ids).items():
+            links[(dialog_id, message_id)] = text_links
+
+    projected: list[dict[str, object]] = []
+    for row in rows:
+        dialog_id = int(cast(int | str, row["dialog_id"]))
+        message_id = int(cast(int | str, row["message_id"]))
+        content = project_message_content(
+            MessageSnapshot(
+                text=cast(str | None, row.get("text")),
+                media_description=cast(str | None, row.get("media_description")),
+                text_links=tuple(links.get((dialog_id, message_id), [])),
+            )
+        )
+        item = dict(row)
+        item["text"] = content.text
+        item["media_description"] = content.media_description
+        projected.append(item)
+    return projected
