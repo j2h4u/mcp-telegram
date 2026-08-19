@@ -1046,6 +1046,8 @@ async def test_list_topics_structures_optional_topic_metadata():
                         "pinned": True,
                         "hidden": False,
                         "snapshot_at": 1700000000,
+                        "icon_emoji": "📊",
+                        "icon_color": 0x6FB9F0,
                     },
                 ],
                 "dialog_id": -100,
@@ -1065,6 +1067,7 @@ async def test_list_topics_structures_optional_topic_metadata():
             "is_telegram_content": True,
             "content_kind": "message_text",
         },
+        "icon": {"emoji": "📊", "color": None},
         "pinned": True,
         "hidden": False,
         "snapshot_at": "2023-11-14T22:13:20+00:00",
@@ -1076,6 +1079,24 @@ async def test_list_topics_structures_optional_topic_metadata():
         "telegram_event_timestamps": "source_provided_only",
         "technical_timestamps": "not_telegram_events",
     }
+
+
+async def test_list_topics_uses_fallback_color_when_custom_emoji_is_absent():
+    conn = _make_daemon_conn(
+        {
+            "ok": True,
+            "data": {
+                "topics": [{"id": 11, "title": "Default", "icon_color": 0x6FB9F0}],
+                "dialog_id": -100,
+            },
+        }
+    )
+    with _patch_daemon(conn):
+        result = await list_topics(ListTopics(exact_dialog_id=-100))
+
+    assert result.structured_content is not None
+    topic = _json_dict(_json_list(_json_dict(result.structured_content)["topics"])[0])
+    assert topic["icon"] == {"emoji": None, "color": "#6FB9F0"}
 
 
 async def test_list_topics_dialog_not_found():

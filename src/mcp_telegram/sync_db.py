@@ -7,7 +7,7 @@ import sqlite3
 from pathlib import Path
 from typing import cast
 
-_CURRENT_SCHEMA_VERSION = 31
+_CURRENT_SCHEMA_VERSION = 32
 _SCHEMA_VERSION_WITH_FTS = 3
 
 logger = logging.getLogger(__name__)
@@ -113,6 +113,13 @@ CREATE TABLE IF NOT EXISTS topic_metadata (
     inaccessible_error TEXT,
     inaccessible_at INTEGER,
     updated_at     INTEGER NOT NULL,
+    icon_emoji_id  INTEGER,
+    icon_emoji     TEXT,
+    icon_color     INTEGER,
+    pinned         INTEGER NOT NULL DEFAULT 0,
+    hidden         INTEGER NOT NULL DEFAULT 0,
+    snapshot_at    INTEGER,
+    date           INTEGER,
     PRIMARY KEY (dialog_id, topic_id)
 )
 """
@@ -1321,6 +1328,21 @@ def _apply_migration_31(conn: sqlite3.Connection, current: int) -> int:
     )
 
 
+def _apply_migration_32(conn: sqlite3.Connection, current: int) -> int:
+    """Persist agent-readable topic icon facts from Telegram."""
+    return _apply_migration(
+        conn,
+        current,
+        32,
+        [
+            _TOPIC_TABLE_DDL,
+            "ALTER TABLE topic_metadata ADD COLUMN icon_emoji TEXT",
+            "ALTER TABLE topic_metadata ADD COLUMN icon_color INTEGER",
+        ],
+        ignore_duplicate_column=True,
+    )
+
+
 def _apply_migrations(conn: sqlite3.Connection) -> None:
     """Apply WAL mode and all pending schema migrations in version order."""
     try:
@@ -1349,6 +1371,7 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     current = _apply_migration_29(conn, current)
     current = _apply_migration_30(conn, current)
     current = _apply_migration_31(conn, current)
+    current = _apply_migration_32(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 

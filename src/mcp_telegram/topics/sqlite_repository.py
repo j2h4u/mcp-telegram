@@ -12,14 +12,18 @@ _UPSERT_TOPIC_SQL = """
 INSERT INTO topic_metadata
     (dialog_id, topic_id, title, top_message_id,
      is_general, is_deleted, updated_at,
-     icon_emoji_id, pinned, hidden, snapshot_at, date)
+     icon_emoji_id, icon_emoji, icon_color,
+     pinned, hidden, snapshot_at, date)
 VALUES
     (:dialog_id, :topic_id, :title, NULL,
      :is_general, 0, :updated_at,
-     :icon_emoji_id, 0, 0, :snapshot_at, :date)
+     :icon_emoji_id, :icon_emoji, :icon_color,
+     0, 0, :snapshot_at, :date)
 ON CONFLICT(dialog_id, topic_id) DO UPDATE SET
     title          = COALESCE(excluded.title, topic_metadata.title),
     icon_emoji_id  = COALESCE(excluded.icon_emoji_id, topic_metadata.icon_emoji_id),
+    icon_emoji     = COALESCE(excluded.icon_emoji, topic_metadata.icon_emoji),
+    icon_color     = COALESCE(excluded.icon_color, topic_metadata.icon_color),
     is_general     = excluded.is_general,
     updated_at     = excluded.updated_at,
     snapshot_at    = excluded.snapshot_at,
@@ -42,6 +46,8 @@ class SQLiteTopicSnapshotRepository(TopicSnapshotRepository):
                 "title": topic.title,
                 "is_general": int(topic.is_general),
                 "icon_emoji_id": topic.icon_emoji_id,
+                "icon_emoji": topic.icon_emoji,
+                "icon_color": topic.icon_color,
                 "updated_at": now,
                 "snapshot_at": now,
                 "date": topic.date,

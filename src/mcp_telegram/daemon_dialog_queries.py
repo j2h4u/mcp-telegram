@@ -283,7 +283,7 @@ _COUNT_BOOTSTRAP_PENDING_SQL = (
 
 # list_topics - read from topic_metadata snapshot.
 _LIST_TOPICS_SQL = (
-    "SELECT topic_id, title, icon_emoji_id, date "
+    "SELECT topic_id, title, icon_emoji_id, date, icon_emoji, icon_color "
     "FROM topic_metadata "
     "WHERE dialog_id = ? AND is_deleted = 0 AND hidden = 0 "
     "ORDER BY topic_id ASC"

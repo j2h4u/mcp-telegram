@@ -802,6 +802,8 @@ def _make_db_with_topics() -> sqlite3.Connection:
             inaccessible_at    INTEGER,
             updated_at     INTEGER NOT NULL DEFAULT 0,
             icon_emoji_id  INTEGER,
+            icon_emoji     TEXT,
+            icon_color     INTEGER,
             pinned         INTEGER NOT NULL DEFAULT 0,
             hidden         INTEGER NOT NULL DEFAULT 0,
             snapshot_at    INTEGER,
@@ -1880,6 +1882,8 @@ async def test_list_topics_refreshes_empty_private_bot_catalog() -> None:
             "title": "Topic",
             "icon_emoji_id": None,
             "date": None,
+            "icon_emoji": None,
+            "icon_color": None,
         }
     ]
     row = cast(
