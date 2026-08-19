@@ -57,6 +57,43 @@ def test_qualified_message_join_is_found_after_another_qualified_table() -> None
     assert any("FROM/JOIN messages" in finding.message for finding in findings)
 
 
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "UPDATE messages SET text = ? WHERE dialog_id = ?",
+        "INSERT INTO message_versions (dialog_id, message_id) VALUES (?, ?)",
+        "DELETE FROM messages WHERE dialog_id = ?",
+        "SELECT old_text FROM message_versions WHERE dialog_id = ?",
+    ],
+)
+def test_message_table_dml_is_rejected_outside_owner(sql: str) -> None:
+    gate = _gate()
+    findings = gate.violations_for(gate.SOURCE_ROOT / "rogue.py", f'conn.execute("{sql}")')
+    assert any("messages/message_versions SQL" in finding.message for finding in findings)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "UPDATE OR IGNORE messages SET text = ?",
+        "UPDATE OR REPLACE main.message_versions SET old_text = ?",
+    ],
+)
+def test_sqlite_update_conflict_forms_are_rejected_for_message_tables(sql: str) -> None:
+    gate = _gate()
+    findings = gate.violations_for(gate.SOURCE_ROOT / "rogue.py", f'conn.execute("{sql}")')
+    assert any("messages/message_versions SQL" in finding.message for finding in findings)
+
+
+def test_sqlite_update_conflict_form_for_other_table_is_not_a_message_match() -> None:
+    gate = _gate()
+    findings = gate.violations_for(
+        gate.SOURCE_ROOT / "rogue.py",
+        'conn.execute("UPDATE OR REPLACE main.dialogs SET pinned = ?")',
+    )
+    assert not any("messages/message_versions SQL" in finding.message for finding in findings)
+
+
 def test_current_query_owner_is_allowed() -> None:
     gate = _gate()
     path = gate.SOURCE_ROOT / "daemon_message_queries.py"
@@ -79,6 +116,20 @@ def test_current_legacy_exception_is_named_but_new_path_is_rejected() -> None:
         "FROM/JOIN messages" in finding.message
         for finding in gate.violations_for(rogue, 'SQL = "SELECT 1 FROM messages"')
     )
+
+    event_handlers = gate.SOURCE_ROOT / "event_handlers.py"
+    assert any(
+        "messages/message_versions SQL" in finding.message
+        for finding in gate.violations_for(event_handlers, 'SQL = "UPDATE messages SET text = ?"')
+    )
+
+
+def test_schema_owner_is_separate_from_runtime_legacy_exceptions() -> None:
+    gate = _gate()
+    assert "event_handlers.py" not in gate.MESSAGE_SQL_LEGACY_EXCEPTION_PATHS
+    assert "sync_db.py" not in gate.MESSAGE_SQL_LEGACY_EXCEPTION_PATHS
+    assert "sync_db.py" in gate.MESSAGE_SQL_SCHEMA_OWNER_PATHS
+    assert gate.violations_for(gate.SOURCE_ROOT / "sync_db.py", 'SQL = "UPDATE messages SET text = ?"') == []
 
 
 def test_stale_sql_allowlist_entries_are_reported() -> None:

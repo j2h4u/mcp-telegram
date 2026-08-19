@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Sequence
-from dataclasses import asdict, fields, replace
+from dataclasses import asdict, dataclass, fields, replace
 from typing import cast
 
 from .. import message_contracts as _message_contracts
@@ -32,6 +32,103 @@ _INSERT_ENTITY_SQL = _insert_sql("message_entities", _message_contracts.EntityRe
 _INSERT_FORWARD_SQL = _insert_sql("message_forwards", _message_contracts.ForwardRecord)
 _DELETE_ENTITIES_SQL = "DELETE FROM message_entities WHERE dialog_id = ? AND message_id = ?"
 _DELETE_FORWARD_SQL = "DELETE FROM message_forwards WHERE dialog_id = ? AND message_id = ?"
+_SELECT_MESSAGE_TEXT_SQL = "SELECT text FROM messages WHERE dialog_id = ? AND message_id = ?"
+_NEXT_VERSION_SQL = "SELECT COALESCE(MAX(version), 0) + 1 FROM message_versions WHERE dialog_id = ? AND message_id = ?"
+_INSERT_VERSION_SQL = (
+    "INSERT INTO message_versions (dialog_id, message_id, version, old_text, edit_date) VALUES (?, ?, ?, ?, ?)"
+)
+_UPDATE_MESSAGE_TEXT_SQL = "UPDATE messages SET text = ? WHERE dialog_id = ? AND message_id = ?"
+_MARK_DELETED_SQL = (
+    "UPDATE messages SET is_deleted = 1, deleted_at = ? WHERE dialog_id = ? AND message_id = ? AND is_deleted = 0"
+)
+_SELECT_UNDELETED_MESSAGES_SQL = (
+    "SELECT message_id FROM messages WHERE dialog_id = ? AND is_deleted = 0 AND sent_at < ?"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class MessageTextLookup:
+    """Result of reading a message text, retaining missing vs SQL NULL."""
+
+    found: bool
+    text: str | None
+
+
+def read_message_text(conn: sqlite3.Connection, dialog_id: int, message_id: int) -> MessageTextLookup:
+    """Read one message text without opening or committing a transaction."""
+    row = cast(
+        tuple[str | None] | None,
+        conn.execute(_SELECT_MESSAGE_TEXT_SQL, (dialog_id, message_id)).fetchone(),
+    )
+    return MessageTextLookup(found=row is not None, text=None if row is None else row[0])
+
+
+def persist_edited_message(
+    conn: sqlite3.Connection,
+    extracted: _message_contracts.ExtractedMessage,
+    *,
+    old_text: str | None,
+    edit_date: int,
+) -> int | None:
+    """Version and persist a changed message in the caller's transaction.
+
+    Returns the new version number, or ``None`` when the text is unchanged.
+    The canonical bundle writer owns the message row, FTS, reactions, entities,
+    forwards, and transcription-preservation behavior.
+    """
+    if old_text == extracted.message.text:
+        return None
+
+    dialog_id = extracted.message.dialog_id
+    message_id = extracted.message.message_id
+    version_row = cast(tuple[int], conn.execute(_NEXT_VERSION_SQL, (dialog_id, message_id)).fetchone())
+    next_version = int(version_row[0])
+    conn.execute(
+        _INSERT_VERSION_SQL,
+        (dialog_id, message_id, next_version, old_text, edit_date),
+    )
+    insert_messages_with_fts(conn, [extracted])
+    return next_version
+
+
+def persist_transcribed_text(  # noqa: PLR0913
+    conn: sqlite3.Connection,
+    dialog_id: int,
+    message_id: int,
+    *,
+    old_text: str | None,
+    transcribed_text: str,
+    transcribed_at: int,
+) -> int | None:
+    """Persist a changed transcription, preserving all other message projections."""
+    if old_text == transcribed_text:
+        return None
+
+    version_row = cast(tuple[int], conn.execute(_NEXT_VERSION_SQL, (dialog_id, message_id)).fetchone())
+    next_version = int(version_row[0])
+    conn.execute(
+        _INSERT_VERSION_SQL,
+        (dialog_id, message_id, next_version, old_text, transcribed_at),
+    )
+    conn.execute(_UPDATE_MESSAGE_TEXT_SQL, (transcribed_text, dialog_id, message_id))
+    conn.execute(DELETE_FTS_SQL, (dialog_id, message_id))
+    conn.execute(INSERT_FTS_SQL, (dialog_id, message_id, stem_text(transcribed_text)))
+    return next_version
+
+
+def mark_message_deleted(conn: sqlite3.Connection, dialog_id: int, message_id: int, deleted_at: int) -> bool:
+    """Tombstone one message and report whether this call changed its state."""
+    cursor = conn.execute(_MARK_DELETED_SQL, (deleted_at, dialog_id, message_id))
+    return cursor.rowcount > 0
+
+
+def list_undeleted_message_ids(conn: sqlite3.Connection, dialog_id: int, sent_before: int) -> tuple[int, ...]:
+    """List undeleted message IDs sent strictly before the caller's cutoff."""
+    rows = cast(
+        Sequence[tuple[int]],
+        conn.execute(_SELECT_UNDELETED_MESSAGES_SQL, (dialog_id, sent_before)).fetchall(),
+    )
+    return tuple(int(message_id) for (message_id,) in rows)
 
 
 def insert_messages_with_fts(

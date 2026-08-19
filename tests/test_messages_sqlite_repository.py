@@ -1,0 +1,180 @@
+"""Focused tests for transaction-neutral event message persistence."""
+
+from __future__ import annotations
+
+import sqlite3
+from pathlib import Path
+
+import pytest
+
+from mcp_telegram.fts import stem_text
+from mcp_telegram.message_contracts import ExtractedMessage, StoredMessage
+from mcp_telegram.messages.sqlite_repository import (
+    insert_messages_with_fts,
+    list_undeleted_message_ids,
+    mark_message_deleted,
+    persist_edited_message,
+    persist_transcribed_text,
+    read_message_text,
+)
+from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
+
+
+def _message(
+    message_id: int,
+    *,
+    text: str | None,
+    sent_at: int = 100,
+    media_description: str | None = None,
+) -> ExtractedMessage:
+    return ExtractedMessage(
+        message=StoredMessage(
+            dialog_id=42,
+            message_id=message_id,
+            sent_at=sent_at,
+            text=text,
+            sender_id=7,
+            sender_first_name="Test",
+            media_description=media_description,
+            reply_to_msg_id=None,
+            forum_topic_id=None,
+            edit_date=None,
+            grouped_id=None,
+            reply_to_peer_id=None,
+            out=0,
+            is_service=0,
+            post_author=None,
+        ),
+        reply_count=0,
+    )
+
+
+@pytest.fixture()
+def conn(tmp_path: Path):
+    path = tmp_path / "sync.db"
+    ensure_sync_schema(path)
+    connection = _open_sync_db(path)
+    try:
+        yield connection
+    finally:
+        connection.close()
+
+
+def test_read_message_text_distinguishes_missing_from_null(conn: sqlite3.Connection) -> None:
+    missing = read_message_text(conn, 42, 1)
+    assert missing.found is False
+    assert missing.text is None
+
+    with conn:
+        insert_messages_with_fts(conn, [_message(1, text=None)])
+    null_text = read_message_text(conn, 42, 1)
+    assert null_text.found is True
+    assert null_text.text is None
+
+
+def test_persist_edited_message_versions_sequentially_and_refreshes_fts(conn: sqlite3.Connection) -> None:
+    with conn:
+        insert_messages_with_fts(conn, [_message(10, text="first")])
+    with conn:
+        assert persist_edited_message(conn, _message(10, text="second"), old_text="first", edit_date=200) == 1
+    with conn:
+        assert persist_edited_message(conn, _message(10, text="third"), old_text="second", edit_date=300) == 2
+
+    assert conn.execute(
+        "SELECT version, old_text FROM message_versions WHERE dialog_id=42 AND message_id=10 ORDER BY version"
+    ).fetchall() == [(1, "first"), (2, "second")]
+    assert conn.execute("SELECT text FROM messages WHERE dialog_id=42 AND message_id=10").fetchone() == ("third",)
+    assert conn.execute("SELECT stemmed_text FROM messages_fts WHERE dialog_id=42 AND message_id=10").fetchone() == (
+        stem_text("third"),
+    )
+
+
+def test_persist_edited_message_unchanged_is_noop(conn: sqlite3.Connection) -> None:
+    with conn:
+        insert_messages_with_fts(conn, [_message(11, text="same")])
+    with conn:
+        assert persist_edited_message(conn, _message(11, text="same"), old_text="same", edit_date=200) is None
+    assert conn.execute("SELECT COUNT(*) FROM message_versions").fetchone() == (0,)
+
+
+def test_persist_transcribed_text_versions_and_refreshes_fts(conn: sqlite3.Connection) -> None:
+    with conn:
+        insert_messages_with_fts(conn, [_message(12, text=None)])
+    with conn:
+        assert (
+            persist_transcribed_text(
+                conn,
+                42,
+                12,
+                old_text=None,
+                transcribed_text="voice words",
+                transcribed_at=400,
+            )
+            == 1
+        )
+    assert conn.execute("SELECT text FROM messages WHERE dialog_id=42 AND message_id=12").fetchone() == ("voice words",)
+    assert conn.execute(
+        "SELECT old_text, version FROM message_versions WHERE dialog_id=42 AND message_id=12"
+    ).fetchone() == (
+        None,
+        1,
+    )
+    assert conn.execute("SELECT stemmed_text FROM messages_fts WHERE dialog_id=42 AND message_id=12").fetchone() == (
+        stem_text("voice words"),
+    )
+    with conn:
+        assert (
+            persist_transcribed_text(
+                conn,
+                42,
+                12,
+                old_text="voice words",
+                transcribed_text="voice words",
+                transcribed_at=401,
+            )
+            is None
+        )
+    assert conn.execute("SELECT COUNT(*) FROM message_versions WHERE dialog_id=42 AND message_id=12").fetchone() == (1,)
+
+
+def test_mark_message_deleted_is_idempotent_and_retains_text_and_fts(conn: sqlite3.Connection) -> None:
+    with conn:
+        insert_messages_with_fts(conn, [_message(13, text="retain me")])
+    with conn:
+        assert mark_message_deleted(conn, 42, 13, 500) is True
+    with conn:
+        assert mark_message_deleted(conn, 42, 13, 600) is False
+    assert conn.execute(
+        "SELECT text, is_deleted, deleted_at FROM messages WHERE dialog_id=42 AND message_id=13"
+    ).fetchone() == (
+        "retain me",
+        1,
+        500,
+    )
+    assert conn.execute("SELECT COUNT(*) FROM messages_fts WHERE dialog_id=42 AND message_id=13").fetchone() == (1,)
+
+
+def test_list_undeleted_message_ids_uses_strict_cutoff(conn: sqlite3.Connection) -> None:
+    with conn:
+        insert_messages_with_fts(
+            conn,
+            [
+                _message(20, text="before", sent_at=99),
+                _message(21, text="at cutoff", sent_at=100),
+                _message(22, text="after", sent_at=101),
+                _message(23, text="deleted", sent_at=98),
+            ],
+        )
+        assert mark_message_deleted(conn, 42, 23, 600) is True
+    assert list_undeleted_message_ids(conn, 42, 100) == (20,)
+
+
+def test_repository_writes_rollback_with_caller_transaction(conn: sqlite3.Connection) -> None:
+    with conn:
+        insert_messages_with_fts(conn, [_message(30, text="before")])
+    with pytest.raises(RuntimeError, match="abort"):
+        with conn:
+            assert persist_edited_message(conn, _message(30, text="after"), old_text="before", edit_date=700) == 1
+            raise RuntimeError("abort")
+    assert conn.execute("SELECT text FROM messages WHERE dialog_id=42 AND message_id=30").fetchone() == ("before",)
+    assert conn.execute("SELECT COUNT(*) FROM message_versions WHERE dialog_id=42 AND message_id=30").fetchone() == (0,)

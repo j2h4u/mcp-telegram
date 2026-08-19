@@ -51,8 +51,14 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
 from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
 from .activity_peer_resolve import _InputEntityResolverClient
-from .fts import DELETE_FTS_SQL, INSERT_FTS_SQL, stem_text
-from .messages.sqlite_repository import insert_messages_with_fts
+from .messages.sqlite_repository import (
+    insert_messages_with_fts,
+    list_undeleted_message_ids,
+    mark_message_deleted,
+    persist_edited_message,
+    persist_transcribed_text,
+    read_message_text,
+)
 from .messages.telegram_adapter import (
     PeerNameClient as _PeerNameClient,
 )
@@ -194,25 +200,11 @@ def _first_non_empty_str(*values: object) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-_SELECT_MESSAGE_TEXT_SQL = "SELECT text FROM messages WHERE dialog_id=? AND message_id=?"
-
-_NEXT_VERSION_SQL = "SELECT COALESCE(MAX(version), 0) + 1 FROM message_versions WHERE dialog_id=? AND message_id=?"
-
-_INSERT_VERSION_SQL = (
-    "INSERT INTO message_versions (dialog_id, message_id, version, old_text, edit_date) VALUES (?, ?, ?, ?, ?)"
-)
-
-_UPDATE_MESSAGE_TEXT_SQL = "UPDATE messages SET text=? WHERE dialog_id=? AND message_id=?"
-
-_MARK_DELETED_SQL = "UPDATE messages SET is_deleted=1, deleted_at=? WHERE dialog_id=? AND message_id=? AND is_deleted=0"
-
 _UPDATE_LAST_EVENT_SQL = "UPDATE synced_dialogs SET last_event_at=? WHERE dialog_id=?"
 
 _SELECT_SYNCED_DIALOGS_SQL = "SELECT dialog_id FROM synced_dialogs WHERE status != 'access_lost'"
 
 _SELECT_SYNCED_ONLY_SQL = "SELECT dialog_id FROM synced_dialogs WHERE status = 'synced'"
-
-_SELECT_UNDELETED_MESSAGES_SQL = "SELECT message_id FROM messages WHERE dialog_id=? AND is_deleted=0 AND sent_at < ?"
 
 # ---------------------------------------------------------------------------
 # Phase 42 SQL — dialogs event writes (UPDATE-only; bootstrap is the sole
@@ -649,12 +641,9 @@ class EventHandlerManager:
             # Resolve async data BEFORE opening transaction — SQLite's synchronous
             # driver cannot safely suspend inside a `with self._conn:` block while
             # another coroutine may call into the same connection.
-            existing = cast(
-                tuple[str | None] | None,
-                self._conn.execute(_SELECT_MESSAGE_TEXT_SQL, (dialog_id, message_id)).fetchone(),
-            )
+            existing = read_message_text(self._conn, dialog_id, message_id)
 
-            if existing is None:
+            if not existing.found:
                 # Message not yet in sync.db: resolve entity map then insert.
                 entity_name_map = await _build_fwd_entity_map(msg, cast(_PeerNameClient, self._client))
                 extracted = extract_message_row(dialog_id, msg, entity_name_map=entity_name_map)
@@ -668,7 +657,7 @@ class EventHandlerManager:
                 )
                 return
 
-            old_text = existing[0]
+            old_text = existing.text
             if old_text == new_text:
                 # No text change. Two sub-cases:
                 # 1. msg.reactions present -> reactions-only edit; apply delta
@@ -697,17 +686,14 @@ class EventHandlerManager:
             extracted = extract_message_row(dialog_id, msg, entity_name_map=entity_name_map)
 
             with self._conn:
-                version_row = cast(
-                    tuple[int], self._conn.execute(_NEXT_VERSION_SQL, (dialog_id, message_id)).fetchone()
+                # This versions the prior text and delegates the message row,
+                # FTS, and child projections to the canonical bundle writer.
+                next_ver = persist_edited_message(
+                    self._conn,
+                    extracted,
+                    old_text=old_text,
+                    edit_date=edit_date_unix,
                 )
-                next_ver = int(version_row[0])
-                self._conn.execute(
-                    _INSERT_VERSION_SQL,
-                    (dialog_id, message_id, next_ver, old_text, edit_date_unix),
-                )
-                # Re-insert via insert_messages_with_fts: updates messages row,
-                # refreshes FTS, and replaces child rows (edit idempotency).
-                insert_messages_with_fts(self._conn, [extracted])
                 self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
 
             logger.info(
@@ -744,7 +730,7 @@ class EventHandlerManager:
 
             with self._conn:
                 for msg_id in event.deleted_ids:
-                    self._conn.execute(_MARK_DELETED_SQL, (now, dialog_id, msg_id))
+                    mark_message_deleted(self._conn, dialog_id, msg_id, now)
                 self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
 
             logger.info("event_delete dialog_id=%d count=%d", dialog_id, len(event.deleted_ids))
@@ -1033,13 +1019,10 @@ class EventHandlerManager:
             return
 
         try:
-            row = cast(
-                tuple[str | None] | None,
-                self._conn.execute(_SELECT_MESSAGE_TEXT_SQL, (dialog_id, int(msg_id))).fetchone(),
-            )
+            row = read_message_text(self._conn, dialog_id, int(msg_id))
             new_text = text_value.strip()
             now = int(time.time())
-            if row is None:
+            if not row.found:
                 logger.debug(
                     "raw_transcribed_audio_missing_message dialog_id=%d message_id=%d",
                     dialog_id,
@@ -1048,26 +1031,19 @@ class EventHandlerManager:
                 await self._insert_missing_transcribed_audio(dialog_id, int(msg_id), new_text, now)
                 return
 
-            old_text = row[0]
+            old_text = row.text
             if old_text == new_text:
                 return
 
             with self._conn:
-                version_row = cast(
-                    tuple[int],
-                    self._conn.execute(_NEXT_VERSION_SQL, (dialog_id, int(msg_id))).fetchone(),
+                persist_transcribed_text(
+                    self._conn,
+                    dialog_id,
+                    int(msg_id),
+                    old_text=old_text,
+                    transcribed_text=new_text,
+                    transcribed_at=now,
                 )
-                next_ver = int(version_row[0])
-                self._conn.execute(
-                    _INSERT_VERSION_SQL,
-                    (dialog_id, int(msg_id), next_ver, old_text, now),
-                )
-                self._conn.execute(
-                    _UPDATE_MESSAGE_TEXT_SQL,
-                    (new_text, dialog_id, int(msg_id)),
-                )
-                self._conn.execute(DELETE_FTS_SQL, (dialog_id, int(msg_id)))
-                self._conn.execute(INSERT_FTS_SQL, (dialog_id, int(msg_id), stem_text(new_text)))
                 self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
             logger.info(
                 "event_raw_transcribed_audio dialog_id=%d message_id=%d",
@@ -1432,14 +1408,7 @@ class EventHandlerManager:
         return total_marked
 
     async def _scan_dm_gap_dialog(self, dialog_id: int, scan_started_at: int) -> int:
-        message_rows = cast(
-            list[tuple[int]],
-            self._conn.execute(
-                _SELECT_UNDELETED_MESSAGES_SQL,
-                (dialog_id, scan_started_at),
-            ).fetchall(),
-        )
-        message_ids = [int(message_id) for (message_id,) in message_rows]
+        message_ids = list(list_undeleted_message_ids(self._conn, dialog_id, scan_started_at))
         if not message_ids:
             return 0
 
@@ -1455,8 +1424,7 @@ class EventHandlerManager:
             now = int(time.time())
             with self._conn:  # atomic per-dialog batch
                 for queried_id, returned_msg in zip(batch, results, strict=False):
-                    if returned_msg is None:
-                        self._conn.execute(_MARK_DELETED_SQL, (now, dialog_id, queried_id))
+                    if returned_msg is None and mark_message_deleted(self._conn, dialog_id, queried_id, now):
                         marked += 1
         return marked
 
