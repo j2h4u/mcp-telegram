@@ -24,6 +24,7 @@ from .daemon_dialog_queries import (
     _COUNT_MESSAGES_BY_DIALOG_SQL,
     _GET_READ_POSITION_SQL,
     _LIST_DIALOGS_SQL,
+    _UNREAD_SUMMARY_SQL,
     _build_access_metadata,
     _compute_snapshot_age_h,
     _compute_sync_coverage,
@@ -1782,6 +1783,96 @@ class DaemonReadingService:
                 elapsed_ms = (time.monotonic() - started) * 1000
                 self._logger.info("list_dialogs_sql_reader completed in %.3fms%s", elapsed_ms, self._deps.rid())
         return self._list_dialogs_sync(self._conn, req)
+
+    async def _get_unread_summary(self, req: dict) -> dict:
+        """Return the bounded unread overview from the Dialog projection.
+
+        This path deliberately does not inspect messages, read cursors, or
+        Telegram. The persisted ``dialogs`` row is the source of truth for
+        this overview, including unsynced and own-only rows; the lifecycle
+        join only excludes access-lost rows.
+        """
+        db_path = self._deps.sync_db_path
+        if db_path is not None:
+            started = time.monotonic()
+            try:
+                return await asyncio.to_thread(self._get_unread_summary_from_reader, db_path, req)
+            finally:
+                elapsed_ms = (time.monotonic() - started) * 1000
+                self._logger.info("get_unread_summary_sql_reader completed in %.3fms%s", elapsed_ms, self._deps.rid())
+        return self._get_unread_summary_sync(self._conn, req)
+
+    def _get_unread_summary_from_reader(self, db_path: Path, req: dict) -> dict:
+        conn = open_sync_db_reader(db_path)
+        try:
+            conn.row_factory = sqlite3.Row
+            return self._get_unread_summary_sync(conn, req)
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _get_unread_summary_sync(conn: sqlite3.Connection, req: dict) -> dict:
+        raw_limit = req.get("limit", 50)
+        if isinstance(raw_limit, bool) or not isinstance(raw_limit, int):
+            return {"ok": False, "error": "invalid_input", "message": "limit must be an integer"}
+        limit = _clamp(raw_limit, 1, 200)
+        began_transaction = not conn.in_transaction
+        if began_transaction:
+            conn.execute("BEGIN")
+        try:
+            rows = _fetchall_rows(conn.execute(_UNREAD_SUMMARY_SQL, {"limit": limit}))
+            total_matching = _object_to_int(_row_value(rows[0], "total_matching")) if rows else 0
+
+            dialogs: list[dict[str, object]] = []
+            for row in rows:
+                unread_mark_raw = _row_value(row, "unread_mark")
+                dialogs.append(
+                    {
+                        "dialog_id": _object_to_int(_row_value(row, "dialog_id")),
+                        "name": _object_to_str_or_none(_row_value(row, "name")),
+                        "dialog_type": _object_to_str_or_none(_row_value(row, "type")),
+                        "unread_count": _object_to_int_or_none(_row_value(row, "unread_count")),
+                        "unread_mark": (None if unread_mark_raw is None else bool(_object_to_int(unread_mark_raw, 0))),
+                        "unread_mentions_count": _object_to_int(_row_value(row, "unread_mentions_count"), 0),
+                        "unread_reactions_count": _object_to_int(_row_value(row, "unread_reactions_count"), 0),
+                        "archived": bool(_object_to_int(_row_value(row, "archived"), 0)),
+                        "last_message_at": _object_to_int_or_none(_row_value(row, "last_message_at")),
+                    }
+                )
+
+            def state_value(key: str) -> str | None:
+                state_row = _fetchone_row(conn.execute("SELECT value FROM daemon_state WHERE key = ?", (key,)))
+                value = _row_sequence(state_row)[0] if state_row is not None and _row_sequence(state_row) else None
+                return value if isinstance(value, str) else None
+
+            def state_int(key: str) -> int | None:
+                value = state_value(key)
+                if value is None:
+                    return None
+                try:
+                    return int(value)
+                except ValueError:
+                    return None
+
+            observation = {
+                "status": state_value("dialog_unread_sweep_status"),
+                "completed_at": state_int("dialog_unread_sweep_completed_at"),
+                "observed_count": state_int("dialog_unread_sweep_observed_count"),
+                "visible_count": state_int("dialog_unread_sweep_last_visible_count"),
+            }
+            return {
+                "ok": True,
+                "data": {
+                    "dialogs": dialogs,
+                    "count": len(dialogs),
+                    "total_matching": total_matching,
+                    "truncated": total_matching > len(dialogs),
+                    "source_observation": observation,
+                },
+            }
+        finally:
+            if began_transaction:
+                conn.rollback()
 
     def _list_dialogs_from_reader(self, db_path: Path, req: dict) -> dict:
         conn = open_sync_db_reader(db_path)

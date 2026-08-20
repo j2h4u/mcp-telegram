@@ -32,7 +32,7 @@ from .sync import (
     get_sync_status,
     mark_dialog_for_sync,
 )
-from .unread import GetInbox, get_inbox
+from .unread import GetInbox, GetUnreadSummary, get_inbox, get_unread_summary
 
 __all__ = [
     "TOOL_REGISTRY",
@@ -43,6 +43,7 @@ __all__ = [
     "GetMyRecentActivity",
     "GetSyncAlerts",
     "GetSyncStatus",
+    "GetUnreadSummary",
     "GetUsageStats",
     "ListDialogs",
     "ListFolderMessages",
@@ -63,6 +64,7 @@ __all__ = [
     "get_my_recent_activity",
     "get_sync_alerts",
     "get_sync_status",
+    "get_unread_summary",
     "get_usage_stats",
     "list_dialogs",
     "list_folder_messages",

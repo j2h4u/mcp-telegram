@@ -30,6 +30,7 @@ from mcp_telegram.tools import (
     GetMyRecentActivity,
     GetSyncAlerts,
     GetSyncStatus,
+    GetUnreadSummary,
     ListDialogs,
     ListFolderMessages,
     ListFolders,
@@ -45,6 +46,7 @@ from mcp_telegram.tools import (
     get_my_recent_activity,
     get_sync_alerts,
     get_sync_status,
+    get_unread_summary,
     list_dialogs,
     list_folder_messages,
     list_folders,
@@ -147,6 +149,7 @@ class _DaemonConnStub:
     get_sync_alerts: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
     get_entity_info: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
     get_inbox: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
+    get_unread_summary: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
     record_telemetry: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
     get_usage_stats: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
     get_dialog_stats: _AsyncMethodMock = field(default_factory=_AsyncMethodMock)
@@ -370,6 +373,37 @@ STRUCTURED_TOOL_CASES = {
                         ],
                     }
                 ]
+            },
+        },
+    ),
+    "get_unread_summary": (
+        get_unread_summary,
+        GetUnreadSummary(),
+        {
+            "ok": True,
+            "data": {
+                "dialogs": [
+                    {
+                        "dialog_id": 123,
+                        "name": "Alice",
+                        "dialog_type": "User",
+                        "unread_count": 1,
+                        "unread_mark": False,
+                        "unread_mentions_count": 0,
+                        "unread_reactions_count": 0,
+                        "archived": False,
+                        "last_message_at": 1_700_000_000,
+                    }
+                ],
+                "count": 1,
+                "total_matching": 1,
+                "truncated": False,
+                "source_observation": {
+                    "status": "complete",
+                    "completed_at": 1_700_000_100,
+                    "observed_count": 1,
+                    "visible_count": 1,
+                },
             },
         },
     ),
@@ -692,6 +726,7 @@ def _make_daemon_conn(response: dict | None = None) -> _DaemonConnStub:
     conn.get_sync_alerts = _AsyncMethodMock(return_value=r)
     conn.get_entity_info = _AsyncMethodMock(return_value=r)
     conn.get_inbox = _AsyncMethodMock(return_value=r)
+    conn.get_unread_summary = _AsyncMethodMock(return_value=r)
     conn.record_telemetry = _AsyncMethodMock(return_value={"ok": True})
     conn.get_usage_stats = _AsyncMethodMock(return_value=r)
     conn.get_dialog_stats = _AsyncMethodMock(return_value=r)
@@ -2427,6 +2462,7 @@ async def test_get_inbox_via_daemon():
     assert schema is not None
     schema_dict = cast(dict[str, object], schema)
     properties = cast(dict[str, object], schema_dict["properties"])
+    assert "scope" not in properties
     dialogs = cast(dict[str, object], cast(dict[str, object], properties["dialogs"])["items"])
     assert "bootstrap_pending" in properties
     assert "read_state" in cast(dict[str, object], dialogs["properties"])
@@ -2434,7 +2470,6 @@ async def test_get_inbox_via_daemon():
     coverage = _json_dict(payload["coverage"])
     budget = _json_dict(payload["budget"])
     dialogs = _json_list(payload["dialogs"])
-    assert payload["scope"] == "personal"
     assert payload["limit"] == 100
     assert payload["group_size_threshold"] == 100
     assert payload["bootstrap_pending"] == 0
@@ -2600,15 +2635,19 @@ async def test_get_inbox_daemon_not_running():
 
 
 async def test_get_inbox_passes_params():
-    """GetInbox passes scope, limit, group_size_threshold to daemon."""
+    """GetInbox passes personal-inbox limit and grouping params to daemon."""
     conn = _make_daemon_conn({"ok": True, "data": {"groups": []}})
     with _patch_daemon(conn):
-        await get_inbox(GetInbox(scope="all", limit=200, group_size_threshold=50))
+        await get_inbox(GetInbox(limit=200, group_size_threshold=50))
 
     call_kwargs = _call_kwargs(conn.get_inbox)
-    assert call_kwargs["scope"] == "all"
     assert call_kwargs["limit"] == 200
     assert call_kwargs["group_size_threshold"] == 50
+
+
+def test_get_inbox_rejects_removed_scope_argument() -> None:
+    with pytest.raises(ValueError):
+        GetInbox.model_validate({"scope": "all"})
 
 
 async def test_get_inbox_passes_only_canonical_since_filter_and_reports_it():

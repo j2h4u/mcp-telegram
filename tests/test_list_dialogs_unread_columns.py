@@ -149,6 +149,7 @@ def _make_db() -> Iterator[sqlite3.Connection]:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_dialogs_type ON dialogs(type)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_dialogs_snapshot_at ON dialogs(snapshot_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_dialogs_needs_refresh_hidden ON dialogs(needs_refresh, hidden)")
+        conn.execute("CREATE TABLE daemon_state (key TEXT PRIMARY KEY, value TEXT)")
         conn.commit()
         yield conn
     finally:
@@ -473,6 +474,91 @@ async def test_list_dialogs_unread_columns_scales_to_200_dialogs() -> None:
 
         # iter_dialogs is never called in the SQL path
         cast(MagicMock, client.iter_dialogs).assert_not_called()
+
+
+async def test_unread_summary_uses_dialog_projection_for_unsynced_and_own_only() -> None:
+    with _make_db() as conn:
+        _insert_dialog(conn, 1, name="Unsynced", type_="User")
+        _insert_dialog(conn, 2, name="Own only", type_="Group")
+        conn.execute("UPDATE dialogs SET unread_count=3, last_message_at=100 WHERE dialog_id=1")
+        conn.execute("UPDATE dialogs SET unread_mark=1, last_message_at=200 WHERE dialog_id=2")
+        _insert_synced_dialog(conn, 2, status="own_only")
+        conn.commit()
+
+        result = await _make_server(conn, _TestClient())._get_unread_summary({})
+
+        assert result["ok"] is True
+        rows = cast(dict[str, object], result["data"])["dialogs"]
+        assert [row["dialog_id"] for row in cast(list[dict[str, object]], rows)] == [2, 1]
+
+
+async def test_unread_summary_never_derives_unread_from_message_rows() -> None:
+    with _make_db() as conn:
+        _insert_dialog(conn, 1, name="Only messages", type_="User")
+        _insert_message(conn, 1, 999)
+        conn.commit()
+
+        result = await _make_server(conn, _TestClient())._get_unread_summary({})
+
+        data = cast(dict[str, object], result["data"])
+        assert data["dialogs"] == []
+        assert data["total_matching"] == 0
+
+
+async def test_unread_summary_includes_mention_only_and_reaction_only_rows() -> None:
+    with _make_db() as conn:
+        _insert_dialog(conn, 1, name="Mention", type_="User")
+        _insert_dialog(conn, 2, name="Reaction", type_="User")
+        conn.execute(
+            "UPDATE dialogs SET unread_count=NULL, unread_mark=NULL, unread_mentions_count=2 WHERE dialog_id=1"
+        )
+        conn.execute("UPDATE dialogs SET unread_count=NULL, unread_mark=0, unread_reactions_count=3 WHERE dialog_id=2")
+        conn.commit()
+
+        result = await _make_server(conn, _TestClient())._get_unread_summary({})
+
+        rows = cast(list[dict[str, object]], cast(dict[str, object], result["data"])["dialogs"])
+        by_id = {row["dialog_id"]: row for row in rows}
+        assert by_id[1]["unread_mentions_count"] == 2
+        assert by_id[1]["unread_mark"] is None
+        assert by_id[2]["unread_reactions_count"] == 3
+        assert by_id[2]["unread_mark"] is False
+
+
+async def test_unread_summary_excludes_hidden_access_lost_and_zero_rows() -> None:
+    with _make_db() as conn:
+        _insert_dialog(conn, 1, name="Hidden", type_="User")
+        _insert_dialog(conn, 2, name="Access lost", type_="User")
+        _insert_dialog(conn, 3, name="Zero", type_="User")
+        conn.execute("UPDATE dialogs SET hidden=1, unread_count=1 WHERE dialog_id=1")
+        conn.execute("UPDATE dialogs SET unread_count=1 WHERE dialog_id=2")
+        conn.execute(
+            "UPDATE dialogs SET unread_count=0, unread_mark=0, unread_mentions_count=0, unread_reactions_count=0 WHERE dialog_id=3"
+        )
+        _insert_synced_dialog(conn, 2, status="access_lost")
+        conn.commit()
+
+        result = await _make_server(conn, _TestClient())._get_unread_summary({})
+
+        data = cast(dict[str, object], result["data"])
+        assert data["dialogs"] == []
+        assert data["total_matching"] == 0
+
+
+async def test_unread_summary_limit_is_deterministic_and_reports_truncation() -> None:
+    with _make_db() as conn:
+        for dialog_id in (3, 1, 2):
+            _insert_dialog(conn, dialog_id, name=f"Peer {dialog_id}", type_="User")
+            conn.execute("UPDATE dialogs SET unread_count=1, last_message_at=100 WHERE dialog_id=?", (dialog_id,))
+        conn.commit()
+
+        result = await _make_server(conn, _TestClient())._get_unread_summary({"limit": 2})
+
+        data = cast(dict[str, object], result["data"])
+        assert [row["dialog_id"] for row in cast(list[dict[str, object]], data["dialogs"])] == [1, 2]
+        assert data["count"] == 2
+        assert data["total_matching"] == 3
+        assert data["truncated"] is True
 
 
 # ---------------------------------------------------------------------------

@@ -446,7 +446,6 @@ class DaemonConnection:
     async def get_inbox(
         self,
         *,
-        scope: str = "personal",
         limit: int = 100,
         group_size_threshold: int = 100,
         since_utc: str | None = None,
@@ -454,13 +453,16 @@ class DaemonConnection:
         """Return prioritized unread messages across dialogs."""
         payload: dict[str, object] = {
             "method": "get_inbox",
-            "scope": scope,
             "limit": limit,
             "group_size_threshold": group_size_threshold,
         }
         if since_utc is not None:
             payload["since_utc"] = since_utc
         return await self.request(payload)
+
+    async def get_unread_summary(self, *, limit: int = 50) -> dict:
+        """Return the bounded unread overview from persisted dialog facts."""
+        return await self.request({"method": "get_unread_summary", "limit": limit})
 
     async def record_telemetry(self, *, event: dict) -> dict:
         """Write a telemetry event to sync.db."""

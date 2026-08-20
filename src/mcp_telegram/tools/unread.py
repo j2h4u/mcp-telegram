@@ -1,10 +1,9 @@
 import math
 import time
-import typing as t
 from collections.abc import Mapping
 from datetime import UTC, datetime
 
-from pydantic import Field, StrictInt, model_validator
+from pydantic import ConfigDict, Field, StrictInt, model_validator
 
 from ..formatter import (
     _compute_inline_markers,
@@ -35,7 +34,6 @@ from .structured import (
 GET_INBOX_OUTPUT_SCHEMA = {
     "type": "object",
     "properties": {
-        "scope": {"type": "string"},
         "limit": {"type": "integer"},
         "group_size_threshold": {"type": "integer"},
         "applied_since_utc": {"type": ["string", "null"]},
@@ -209,7 +207,6 @@ GET_INBOX_OUTPUT_SCHEMA = {
         "result_count_semantics": {"type": "string"},
     },
     "required": [
-        "scope",
         "limit",
         "group_size_threshold",
         "applied_since_utc",
@@ -226,28 +223,83 @@ GET_INBOX_OUTPUT_SCHEMA = {
 
 _MAX_INBOX_LAST_HOURS = 720
 
+GET_UNREAD_SUMMARY_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "dialogs": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "dialog_id": {"type": "integer"},
+                    "name": {"type": ["string", "null"]},
+                    "dialog_type": {"type": ["string", "null"]},
+                    "unread_count": {"type": ["integer", "null"]},
+                    "unread_mark": {"type": ["boolean", "null"]},
+                    "unread_mentions_count": {"type": "integer"},
+                    "unread_reactions_count": {"type": "integer"},
+                    "archived": {"type": "boolean"},
+                    "last_message_at": {"type": ["integer", "string", "null"]},
+                },
+                "required": [
+                    "dialog_id",
+                    "name",
+                    "dialog_type",
+                    "unread_count",
+                    "unread_mark",
+                    "unread_mentions_count",
+                    "unread_reactions_count",
+                    "archived",
+                    "last_message_at",
+                ],
+                "additionalProperties": False,
+            },
+        },
+        "count": {"type": "integer"},
+        "total_matching": {"type": "integer"},
+        "truncated": {"type": "boolean"},
+        "source_observation": {
+            "type": "object",
+            "properties": {
+                "status": {"type": ["string", "null"]},
+                "completed_at": {"type": ["integer", "string", "null"]},
+                "observed_count": {"type": ["integer", "null"]},
+                "visible_count": {"type": ["integer", "null"]},
+            },
+            "required": ["status", "completed_at", "observed_count", "visible_count"],
+            "additionalProperties": False,
+        },
+    },
+    "required": ["dialogs", "count", "total_matching", "truncated", "source_observation"],
+    "additionalProperties": False,
+}
+
+
+class GetUnreadSummary(ToolArgs):
+    """Return a compact unread overview from persisted Telegram dialog facts."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    limit: StrictInt = Field(default=50, ge=1, le=200, description="Maximum number of unread dialogs to return.")
+
 
 class GetInbox(ToolArgs):
     """Fetch unread messages from personal chats and small groups, prioritized by tier.
 
-    Reads local sync.db only. Prioritizes mentions, DMs, bots, groups, and
-    channels; messages inside each chat are chronological. scope="personal"
-    shows DMs and small groups; scope="all" includes counts for large groups
-    and channels. Check bootstrap_pending to detect incomplete read-position
-    coverage instead of treating an empty result as final.
+    Reads local sync.db only. Prioritizes mentions, DMs, bots, and groups;
+    channel dialogs are excluded. Messages inside each chat are chronological.
+    Check bootstrap_pending to detect incomplete read-position coverage instead
+    of treating an empty result as final.
     """
 
-    scope: t.Literal["personal", "all"] = Field(
-        default="personal", description="'personal' (DMs + small groups) or 'all' (everything)"
-    )
+    model_config = ConfigDict(extra="forbid")
+
     limit: int = Field(default=100, ge=50, le=500, description="Total message budget across all chats (50-500)")
     group_size_threshold: int = Field(
         default=100,
         ge=10,
         description=(
-            "Group member count above which to hide messages (scope=personal only). "
-            "NOTE: currently has no effect — participants_count is not stored locally. "
-            "All groups are included regardless of size."
+            "Group member count above which to hide messages. Dialogs with unknown member counts remain visible."
         ),
     )
     since_utc: str | None = Field(
@@ -534,7 +586,6 @@ async def get_inbox(args: GetInbox) -> ToolResult:
     try:
         async with daemon_connection() as conn:
             response = await conn.get_inbox(
-                scope=args.scope,
                 limit=args.limit,
                 group_size_threshold=args.group_size_threshold,
                 since_utc=applied_since_utc,
@@ -554,7 +605,6 @@ async def get_inbox(args: GetInbox) -> ToolResult:
     warnings = _bootstrap_pending_warnings(bootstrap_pending)
     structured_dialogs, hidden_count_by_dialog, result_message_count = _structured_inbox_groups(groups)
     structured_content = {
-        "scope": args.scope,
         "limit": args.limit,
         "group_size_threshold": args.group_size_threshold,
         "applied_since_utc": applied_since_utc,
@@ -586,3 +636,47 @@ async def get_inbox(args: GetInbox) -> ToolResult:
         result_count=result_message_count,
         has_filter=applied_since_utc is not None,
     )
+
+
+@mcp_tool(
+    name="get_unread_summary",
+    title="Unread Summary",
+    annotations=ToolAnnotations(
+        read_only_hint=True,
+        destructive_hint=False,
+        idempotent_hint=True,
+        open_world_hint=False,
+    ),
+    output_schema=GET_UNREAD_SUMMARY_OUTPUT_SCHEMA,
+)
+async def get_unread_summary(args: GetUnreadSummary) -> ToolResult:
+    """Return unread dialog facts without reading message history or cursors."""
+    try:
+        async with daemon_connection() as conn:
+            response = await conn.get_unread_summary(limit=args.limit)
+    except DaemonNotRunningError as exc:
+        return error_result(_daemon_not_running_text(exc))
+
+    if err := _check_daemon_response(response):
+        return err
+
+    raw_data = response.get("data")
+    data = raw_data if isinstance(raw_data, Mapping) else {}
+    raw_dialogs = data.get("dialogs", [])
+    dialogs = [dict(row) for row in raw_dialogs if isinstance(row, Mapping)] if isinstance(raw_dialogs, list) else []
+    raw_observation = data.get("source_observation")
+    observation = dict(raw_observation) if isinstance(raw_observation, Mapping) else {}
+    source_observation = {
+        "status": observation.get("status"),
+        "completed_at": observation.get("completed_at"),
+        "observed_count": observation.get("observed_count"),
+        "visible_count": observation.get("visible_count"),
+    }
+    structured_content = {
+        "dialogs": dialogs,
+        "count": len(dialogs),
+        "total_matching": int(data.get("total_matching", len(dialogs)) or 0),
+        "truncated": bool(data.get("truncated", False)),
+        "source_observation": source_observation,
+    }
+    return structured_result(structured_content, result_count=len(dialogs))

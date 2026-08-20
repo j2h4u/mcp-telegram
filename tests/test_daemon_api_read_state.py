@@ -535,7 +535,7 @@ async def test_list_unread_messages_response_includes_per_group_read_state() -> 
         server = make_server(conn)
         server.self_id = 999
 
-        result = await server._list_unread_messages({"scope": "personal", "limit": 100})
+        result = await server._list_unread_messages({"limit": 100})
         assert result["ok"] is True
         groups = result["data"]["groups"]
         assert len(groups) >= 2

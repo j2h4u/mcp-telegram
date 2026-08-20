@@ -665,12 +665,11 @@ async def test_get_inbox_convenience_explicit() -> None:
 
     conn.request = _mock_request  # type: ignore[method-assign]
 
-    await conn.get_inbox(scope="all", limit=200, group_size_threshold=50)
+    await conn.get_inbox(limit=200, group_size_threshold=50)
 
     assert len(captured) == 1
     req = captured[0]
     assert req["method"] == "get_inbox"
-    assert req["scope"] == "all"
     assert req["limit"] == 200
     assert req["group_size_threshold"] == 50
 
@@ -682,7 +681,7 @@ async def test_get_inbox_convenience_explicit() -> None:
 
 @pytest.mark.asyncio
 async def test_get_inbox_convenience_defaults() -> None:
-    """get_inbox sends scope='personal', limit=100, group_size_threshold=100 by default."""
+    """get_inbox sends limit=100 and group_size_threshold=100 by default."""
     reader = MagicMock(spec=asyncio.StreamReader)
     writer = MagicMock(spec=asyncio.StreamWriter)
     conn = DaemonConnection(reader, writer)
@@ -700,7 +699,6 @@ async def test_get_inbox_convenience_defaults() -> None:
     assert len(captured) == 1
     req = captured[0]
     assert req["method"] == "get_inbox"
-    assert req["scope"] == "personal"
     assert req["limit"] == 100
     assert req["group_size_threshold"] == 100
 

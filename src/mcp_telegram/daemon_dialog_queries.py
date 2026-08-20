@@ -213,6 +213,47 @@ AND (:name_pat IS NULL OR LOWER(name) LIKE :name_pat ESCAPE '\\')
 ORDER BY pinned DESC, last_message_at DESC
 """
 
+# Unread summary is intentionally sourced only from the persisted Telegram
+# Dialog projection plus the dialog lifecycle visibility join.  The
+# ``synced_dialogs`` join exists solely to exclude access-lost dialogs; it does
+# not enroll dialogs, provide unread facts, or supply message bodies.
+_UNREAD_SUMMARY_SQL = """
+WITH matching AS (
+    SELECT
+        d.dialog_id,
+        d.name,
+        d.type,
+        d.archived,
+        d.last_message_at,
+        d.unread_count,
+        d.unread_mark,
+        d.unread_mentions_count,
+        d.unread_reactions_count
+    FROM dialogs d
+    LEFT JOIN synced_dialogs sd USING(dialog_id)
+    WHERE d.hidden = 0
+      AND (sd.status IS NULL OR sd.status <> 'access_lost')
+      AND (
+          COALESCE(d.unread_count, 0) > 0
+          OR COALESCE(d.unread_mark, 0) <> 0
+          OR COALESCE(d.unread_mentions_count, 0) > 0
+          OR COALESCE(d.unread_reactions_count, 0) > 0
+      )
+)
+SELECT
+    matching.*,
+    COUNT(*) OVER () AS total_matching
+FROM matching
+ORDER BY
+    CASE WHEN COALESCE(unread_mark, 0) <> 0 THEN 1 ELSE 0 END DESC,
+    COALESCE(unread_mentions_count, 0) DESC,
+    COALESCE(unread_reactions_count, 0) DESC,
+    COALESCE(unread_count, 0) DESC,
+    last_message_at DESC,
+    dialog_id ASC
+LIMIT :limit
+"""
+
 # Contract note (WR-06): results are emitted as unread_in / unread_out only for DMs.
 _BATCHED_UNREAD_COUNTS_SQL = (
     "SELECT m.dialog_id, "
