@@ -268,7 +268,8 @@ _COLLECT_UNREAD_DIALOGS_WITH_COUNTS_SQL = (
     "   AND m.message_id > sd.read_inbox_max_id "
     "   AND m.is_deleted = 0"
     '   AND m."out" = 0'
-    "   AND m.is_service = 0) AS unread_count "
+    "   AND m.is_service = 0"
+    "   AND (:since_utc IS NULL OR m.sent_at >= :since_utc)) AS unread_count "
     "FROM synced_dialogs sd "
     "LEFT JOIN entities e ON e.id = sd.dialog_id "
     "LEFT JOIN dialogs d ON d.dialog_id = sd.dialog_id "

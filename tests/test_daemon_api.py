@@ -2587,6 +2587,39 @@ async def test_list_unread_messages_basic() -> None:
 
 
 @pytest.mark.asyncio
+async def test_list_unread_messages_since_filter_keeps_counts_bodies_and_budget_in_sync() -> None:
+    """The inclusive cutoff drives dialog selection, counts, bodies, and allocation."""
+    conn = _make_db()
+    _seed_unread_state(conn, 1001, read_inbox_max_id=0, entity_type="User", entity_name="Alice")
+    _seed_message(conn, 1001, message_id=1, sent_at=100, text="before")
+    _seed_message(conn, 1001, message_id=2, sent_at=200, text="boundary")
+    _seed_message(conn, 1001, message_id=3, sent_at=300, text="after")
+    _seed_unread_state(conn, 1002, read_inbox_max_id=0, entity_type="User", entity_name="Empty")
+    _seed_message(conn, 1002, message_id=1, sent_at=100, text="too old")
+
+    server = make_server(conn, _TestClient())
+    result = await server._dispatch({"method": "get_inbox", "since_utc": "1970-01-01T00:03:20Z", "limit": 1})
+
+    assert result["ok"] is True
+    groups = _response_groups(result)
+    assert [group["dialog_id"] for group in groups] == [1001]
+    group = groups[0]
+    assert group["unread_count"] == 2
+    assert [message["message_id"] for message in _group_messages(group)] == [2]
+
+
+@pytest.mark.asyncio
+async def test_list_unread_messages_since_filter_rejects_invalid_bound() -> None:
+    server = make_server(_make_db(), _TestClient())
+    result = await server._dispatch({"method": "get_inbox", "since_utc": "2026-08-20T10:00:00"})
+    assert result == {
+        "ok": False,
+        "error": "invalid_input",
+        "message": "since_utc must include the UTC offset Z or +00:00",
+    }
+
+
+@pytest.mark.asyncio
 async def test_list_unread_messages_empty() -> None:
     """list_unread_messages returns empty groups when synced_dialogs is empty."""
     conn = _make_db()

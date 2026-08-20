@@ -2611,6 +2611,27 @@ async def test_get_inbox_passes_params():
     assert call_kwargs["group_size_threshold"] == 50
 
 
+async def test_get_inbox_passes_only_canonical_since_filter_and_reports_it():
+    conn = _make_daemon_conn({"ok": True, "data": {"groups": []}})
+    with _patch_daemon(conn):
+        result = await get_inbox(GetInbox(since_utc="2026-08-20T10:00:00.1+00:00"))
+
+    call_kwargs = _call_kwargs(conn.get_inbox)
+    assert call_kwargs["since_utc"] == "2026-08-20T10:00:01Z"
+    assert "last_hours" not in call_kwargs
+    payload = _json_dict(result.structured_content)
+    assert payload["applied_since_utc"] == "2026-08-20T10:00:01Z"
+    assert result.has_filter is True
+
+
+def test_get_inbox_output_schema_declares_applied_since_utc():
+    schema = TOOL_REGISTRY["get_inbox"].output_schema
+    assert schema is not None
+    properties = _json_dict(schema["properties"])
+    assert properties["applied_since_utc"] == {"type": ["string", "null"]}
+    assert "applied_since_utc" in _json_list(schema["required"])
+
+
 async def test_get_inbox_empty_with_bootstrap_pending():
     """UAT gap 1: when groups=[] AND bootstrap_pending>0 the tool MUST NOT return the
     misleading 'No unread messages' canned text — it must surface the pending count

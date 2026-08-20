@@ -1,8 +1,10 @@
+import math
 import time
 import typing as t
 from collections.abc import Mapping
+from datetime import UTC, datetime
 
-from pydantic import Field
+from pydantic import Field, StrictInt, model_validator
 
 from ..formatter import (
     _compute_inline_markers,
@@ -10,6 +12,7 @@ from ..formatter import (
     resolve_sender_label,
 )
 from ..models import DialogType, ReadMessage, ReadState
+from ..temporal import parse_utc_boundary
 from ._base import (
     DaemonNotRunningError,
     ToolAnnotations,
@@ -35,6 +38,7 @@ GET_INBOX_OUTPUT_SCHEMA = {
         "scope": {"type": "string"},
         "limit": {"type": "integer"},
         "group_size_threshold": {"type": "integer"},
+        "applied_since_utc": {"type": ["string", "null"]},
         "bootstrap_pending": {"type": "integer"},
         "coverage": {
             "type": "object",
@@ -208,6 +212,7 @@ GET_INBOX_OUTPUT_SCHEMA = {
         "scope",
         "limit",
         "group_size_threshold",
+        "applied_since_utc",
         "bootstrap_pending",
         "coverage",
         "warnings",
@@ -218,6 +223,8 @@ GET_INBOX_OUTPUT_SCHEMA = {
     ],
     "additionalProperties": False,
 }
+
+_MAX_INBOX_LAST_HOURS = 720
 
 
 class GetInbox(ToolArgs):
@@ -243,6 +250,76 @@ class GetInbox(ToolArgs):
             "All groups are included regardless of size."
         ),
     )
+    since_utc: str | None = Field(
+        default=None,
+        description="Inclusive RFC3339 UTC lower bound (Z or +00:00); mutually exclusive with last_hours.",
+    )
+    last_hours: StrictInt | None = Field(
+        default=None,
+        ge=1,
+        le=_MAX_INBOX_LAST_HOURS,
+        description="Return unread messages from the last 1-720 hours, evaluated at request time; mutually exclusive with since_utc.",
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_last_hours_range(cls, value: object) -> object:
+        if isinstance(value, dict):
+            hours = value.get("last_hours")
+            if isinstance(hours, int) and not isinstance(hours, bool) and not 1 <= hours <= _MAX_INBOX_LAST_HOURS:
+                raise ValueError(f"last_hours must be between 1 and {_MAX_INBOX_LAST_HOURS} hours.")
+        return value
+
+    @model_validator(mode="after")
+    def validate_time_filter(self) -> GetInbox:
+        if self.since_utc is not None and self.last_hours is not None:
+            raise ValueError("since_utc and last_hours are mutually exclusive; provide only one.")
+        parse_utc_boundary(self.since_utc, field="since_utc")
+        return self
+
+
+def _canonical_utc_seconds(epoch_seconds: int) -> str:
+    return datetime.fromtimestamp(epoch_seconds, tz=UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _parse_inbox_since(since_utc: str) -> int:
+    """Parse a UTC lower bound, ceiled for integer-second message storage."""
+    parsed = parse_utc_boundary(since_utc, field="since_utc")
+    assert parsed is not None
+    normalized = since_utc[:-1] + "+00:00" if since_utc.endswith("Z") else since_utc
+    return math.ceil(datetime.fromisoformat(normalized).timestamp())
+
+
+def _validate_inbox_last_hours(last_hours: int) -> None:
+    if isinstance(last_hours, bool) or not isinstance(last_hours, int):
+        raise ValueError("last_hours must be an integer between 1 and 720 hours.")
+    if not 1 <= last_hours <= _MAX_INBOX_LAST_HOURS:
+        raise ValueError(f"last_hours must be between 1 and {_MAX_INBOX_LAST_HOURS} hours.")
+
+
+def _resolve_inbox_relative(last_hours: int, now: datetime | None) -> str:
+    _validate_inbox_last_hours(last_hours)
+    reference = now if now is not None else datetime.now(tz=UTC)
+    if reference.tzinfo is None or reference.utcoffset() != UTC.utcoffset(reference):
+        raise ValueError("now must be an aware UTC datetime.")
+    cutoff = int(reference.timestamp()) - (last_hours * 60 * 60)
+    return _canonical_utc_seconds(cutoff)
+
+
+def _resolve_inbox_since(
+    since_utc: str | None,
+    last_hours: int | None,
+    *,
+    now: datetime | None = None,
+) -> str | None:
+    """Resolve the inbox's optional time selector to one canonical UTC bound."""
+    if since_utc is not None and last_hours is not None:
+        raise ValueError("since_utc and last_hours are mutually exclusive; provide only one.")
+    if since_utc is not None:
+        return _canonical_utc_seconds(_parse_inbox_since(since_utc))
+    if last_hours is None:
+        return None
+    return _resolve_inbox_relative(last_hours, now)
 
 
 def _message_date(sent_at: object) -> int | None:
@@ -450,16 +527,23 @@ def _structured_messages(
 )
 async def get_inbox(args: GetInbox) -> ToolResult:
     try:
+        applied_since_utc = _resolve_inbox_since(args.since_utc, args.last_hours)
+    except ValueError as exc:
+        return error_result(f"Error: invalid time filter: {exc}", has_filter=True)
+
+    try:
         async with daemon_connection() as conn:
             response = await conn.get_inbox(
                 scope=args.scope,
                 limit=args.limit,
                 group_size_threshold=args.group_size_threshold,
+                since_utc=applied_since_utc,
             )
     except DaemonNotRunningError as exc:
-        return error_result(_daemon_not_running_text(exc))
+        return error_result(_daemon_not_running_text(exc), has_filter=applied_since_utc is not None)
 
     if err := _check_daemon_response(response):
+        err.has_filter = applied_since_utc is not None
         return err
 
     data = response.get("data", {})
@@ -473,6 +557,7 @@ async def get_inbox(args: GetInbox) -> ToolResult:
         "scope": args.scope,
         "limit": args.limit,
         "group_size_threshold": args.group_size_threshold,
+        "applied_since_utc": applied_since_utc,
         "bootstrap_pending": bootstrap_pending,
         "coverage": {
             "complete": bootstrap_pending == 0,
@@ -494,6 +579,10 @@ async def get_inbox(args: GetInbox) -> ToolResult:
     }
 
     if not groups:
-        return structured_result(structured_content, result_count=0)
+        return structured_result(structured_content, result_count=0, has_filter=applied_since_utc is not None)
 
-    return structured_result(structured_content, result_count=result_message_count)
+    return structured_result(
+        structured_content,
+        result_count=result_message_count,
+        has_filter=applied_since_utc is not None,
+    )

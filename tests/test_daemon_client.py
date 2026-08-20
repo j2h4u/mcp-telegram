@@ -976,3 +976,31 @@ async def test_update_feedback_status_omits_optional_reason() -> None:
     assert req["id"] == 77
     assert req["status"] == "done"
     assert "reason" not in req
+
+
+@pytest.mark.asyncio
+async def test_get_inbox_omits_absent_since_filter() -> None:
+    conn = DaemonConnection(MagicMock(), MagicMock())
+    captured: list[dict] = []
+
+    async def _mock_request(payload: dict) -> dict:
+        captured.append(payload)
+        return {"ok": True}
+
+    conn.request = _mock_request  # type: ignore[method-assign]
+    await conn.get_inbox()
+    assert "since_utc" not in captured[0]
+
+
+@pytest.mark.asyncio
+async def test_get_inbox_includes_absolute_since_filter() -> None:
+    conn = DaemonConnection(MagicMock(), MagicMock())
+    captured: list[dict] = []
+
+    async def _mock_request(payload: dict) -> dict:
+        captured.append(payload)
+        return {"ok": True}
+
+    conn.request = _mock_request  # type: ignore[method-assign]
+    await conn.get_inbox(since_utc="2026-08-20T10:00:00Z")
+    assert captured[0]["since_utc"] == "2026-08-20T10:00:00Z"
