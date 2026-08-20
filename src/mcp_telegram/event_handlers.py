@@ -57,6 +57,7 @@ from .messages.sqlite_repository import (
     mark_message_deleted,
     persist_edited_message,
     persist_transcribed_text,
+    read_message_out,
     read_message_text,
 )
 from .messages.telegram_adapter import (
@@ -68,9 +69,18 @@ from .messages.telegram_adapter import (
 from .messages.telegram_adapter import (
     extract_message_row,
 )
+from .reactions.contracts import ReactionAggregate
 from .reactions.persistence import replace_reaction_aggregates
 from .reactions.projection import project_reaction_aggregates
 from .read_state import apply_read_cursor
+from .realtime_history_policy import (
+    RealtimeBodyEvent,
+    RealtimeHistoryCoverage,
+    allows_existing_body_update,
+    allows_missing_body_insert,
+    allows_new_message,
+    realtime_history_coverage,
+)
 from .resolver import latinize
 from .scheduled_messages import (
     mark_scheduled_messages_removed,
@@ -180,6 +190,31 @@ class _EventHandlerClient(Protocol):
     async def get_input_entity(self, _dialog_id: int) -> object: ...
 
     async def __call__(self, _request: object) -> object: ...
+
+
+class _RealtimeHistoryStatusReader(Protocol):
+    """Narrow SQLite capability used by body-event orchestration."""
+
+    def read_status(self, dialog_id: int) -> str | None: ...
+
+
+class _SQLiteRealtimeHistoryStatusReader:
+    """Read only the sync status needed by the realtime history policy."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def read_status(self, dialog_id: int) -> str | None:
+        row = cast(
+            tuple[str | None] | None,
+            self._conn.execute(
+                "SELECT status FROM synced_dialogs WHERE dialog_id = ?",
+                (dialog_id,),
+            ).fetchone(),
+        )
+        if row is None:
+            return None
+        return cast(str | None, row[0])
 
 
 _DM_AUTO_ENROLL_SENDER_EXCEPTIONS: tuple[type[BaseException], ...] = (
@@ -299,6 +334,7 @@ class EventHandlerManager:
         self._shutdown_event = shutdown_event
         self._shutdown_event.is_set()
         self._synced_dialog_ids: set[int] = set()
+        self._realtime_history_status: _RealtimeHistoryStatusReader = _SQLiteRealtimeHistoryStatusReader(conn)
 
     # ------------------------------------------------------------------
     # Registration
@@ -393,7 +429,16 @@ class EventHandlerManager:
         rows = cast(list[tuple[int]], self._conn.execute(_SELECT_SYNCED_DIALOGS_SQL).fetchall())
         self._synced_dialog_ids = {int(dialog_id) for (dialog_id,) in rows}
 
-    def _auto_enroll_dm(self, dialog_id: int, sender: _SenderLike | None = None) -> None:
+    def _realtime_coverage(self, dialog_id: int) -> RealtimeHistoryCoverage:
+        """Resolve current DB status before a message-body event."""
+        return realtime_history_coverage(self._realtime_history_status.read_status(dialog_id))
+
+    @staticmethod
+    def _metadata_realtime_allowed(coverage: RealtimeHistoryCoverage) -> bool:
+        """Metadata follows an admitted realtime coverage, not raw status text."""
+        return coverage is not RealtimeHistoryCoverage.NO_REALTIME_HISTORY
+
+    def _auto_enroll_dm(self, dialog_id: int, sender: _SenderLike | None = None) -> bool:
         """Enroll a new DM dialog into synced_dialogs on first incoming message.
 
         Called from on_new_message when a private message arrives from a dialog
@@ -420,10 +465,10 @@ class EventHandlerManager:
                 logger.info("dm_auto_enroll dialog_id=%d", dialog_id)
         except Exception:
             logger.exception("dm_auto_enroll_failed dialog_id=%d", dialog_id)
-            return
+            return False
 
         if sender is None:
-            return
+            return True
         try:
             first = _first_non_empty_str(getattr(sender, "first_name", None)) or ""
             last = _first_non_empty_str(getattr(sender, "last_name", None)) or ""
@@ -445,6 +490,7 @@ class EventHandlerManager:
             logger.info("dm_auto_enroll_entity dialog_id=%d name=%r", dialog_id, name)
         except Exception:
             logger.exception("dm_auto_enroll_entity_failed dialog_id=%d", dialog_id)
+        return True
 
     # ------------------------------------------------------------------
     # Event handlers
@@ -477,21 +523,23 @@ class EventHandlerManager:
         dialog_id = event.chat_id
         if dialog_id is None:
             return
-        if dialog_id not in self._synced_dialog_ids:
-            self._verify_scheduled_publication_if_needed(self._conn, dialog_id, event.message)
-            if event.is_private:
-                sender = None
-                try:
-                    sender = await event.get_sender()
-                except _DM_AUTO_ENROLL_SENDER_EXCEPTIONS:
-                    logger.debug("dm_auto_enroll_sender_fetch_failed dialog_id=%d", dialog_id)
-                self._auto_enroll_dm(dialog_id, sender=sender)
+        msg = event.message
+        coverage = await self._new_message_coverage(dialog_id, event)
+        if coverage is RealtimeHistoryCoverage.NO_REALTIME_HISTORY:
+            return
+        if not allows_new_message(coverage, outgoing=bool(getattr(msg, "out", False))):
+            self._project_denied_new_message_metadata(dialog_id, msg, coverage)
             return
 
         try:
-            msg = event.message
             entity_name_map = await _build_fwd_entity_map(msg, cast(_PeerNameClient, self._client))
             extracted = extract_message_row(dialog_id, msg, entity_name_map=entity_name_map)
+            # Forward enrichment suspends the handler; status may have changed
+            # while Telegram was queried, so gate the mutation again.
+            coverage = self._realtime_coverage(dialog_id)
+            if not allows_new_message(coverage, outgoing=bool(getattr(msg, "out", False))):
+                self._project_denied_new_message_metadata(dialog_id, msg, coverage)
+                return
             now = int(time.time())
 
             with self._conn:
@@ -504,12 +552,43 @@ class EventHandlerManager:
                 # MAX(COALESCE(..., 0), new_ts) ensures no regression on out-of-order
                 # events. UPDATE matches 0 rows when the dialog is not yet bootstrapped
                 # (no dialogs row) — silent no-op; bootstrap is the sole row creator.
-                self._update_last_message_timestamp(dialog_id, now, msg.date)
-                self._handle_topic_message_action(dialog_id, msg, now)
+                self._project_new_message_metadata(dialog_id, msg, now)
+                self._record_body_event(dialog_id, now)
 
             logger.info("event_new dialog_id=%d message_id=%d", dialog_id, msg.id)
         except Exception:
             logger.exception("event_new_failed dialog_id=%s", dialog_id)
+
+    async def _new_message_coverage(
+        self,
+        dialog_id: int,
+        event: _NewMessageEvent,
+    ) -> RealtimeHistoryCoverage:
+        coverage = self._realtime_coverage(dialog_id)
+        if coverage is not RealtimeHistoryCoverage.NO_REALTIME_HISTORY:
+            return coverage
+        self._verify_scheduled_publication_if_needed(self._conn, dialog_id, event.message)
+        if event.is_private and self._realtime_history_status.read_status(dialog_id) is None:
+            sender = None
+            try:
+                sender = await event.get_sender()
+            except _DM_AUTO_ENROLL_SENDER_EXCEPTIONS:
+                logger.debug("dm_auto_enroll_sender_fetch_failed dialog_id=%d", dialog_id)
+            self._auto_enroll_dm(dialog_id, sender=sender)
+            coverage = self._realtime_coverage(dialog_id)
+        return coverage
+
+    def _project_denied_new_message_metadata(
+        self,
+        dialog_id: int,
+        msg: _MessageLike,
+        coverage: RealtimeHistoryCoverage,
+    ) -> None:
+        if not self._metadata_realtime_allowed(coverage):
+            return
+        now = int(time.time())
+        with self._conn:
+            self._project_new_message_metadata(dialog_id, msg, now)
 
     def _update_last_message_timestamp(self, dialog_id: int, now: int, msg_date: datetime | None) -> None:
         if msg_date is not None:
@@ -517,7 +596,14 @@ class EventHandlerManager:
                 _UPDATE_DIALOG_LAST_MESSAGE_AT_SQL,
                 (int(msg_date.timestamp()), now, dialog_id),
             )
+
+    def _record_body_event(self, dialog_id: int, now: int) -> None:
         self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
+
+    def _project_new_message_metadata(self, dialog_id: int, msg: _MessageLike, now: int) -> None:
+        """Project dialog/topic metadata independently of message-body scope."""
+        self._update_last_message_timestamp(dialog_id, now, msg.date)
+        self._handle_topic_message_action(dialog_id, msg, now)
 
     def _handle_topic_message_action(
         self,
@@ -629,7 +715,7 @@ class EventHandlerManager:
         All operations in a single transaction.
         """
         dialog_id = event.chat_id
-        if dialog_id is None or dialog_id not in self._synced_dialog_ids:
+        if dialog_id is None:
             return
 
         try:
@@ -637,24 +723,23 @@ class EventHandlerManager:
             message_id = int(msg.id)
             new_text = msg.message
             now = int(time.time())
+            coverage = self._realtime_coverage(dialog_id)
+            if coverage is RealtimeHistoryCoverage.NO_REALTIME_HISTORY:
+                return
 
             # Resolve async data BEFORE opening transaction — SQLite's synchronous
             # driver cannot safely suspend inside a `with self._conn:` block while
             # another coroutine may call into the same connection.
             existing = read_message_text(self._conn, dialog_id, message_id)
+            existing_out = read_message_out(self._conn, dialog_id, message_id)
 
             if not existing.found:
-                # Message not yet in sync.db: resolve entity map then insert.
-                entity_name_map = await _build_fwd_entity_map(msg, cast(_PeerNameClient, self._client))
-                extracted = extract_message_row(dialog_id, msg, entity_name_map=entity_name_map)
-                with self._conn:
-                    insert_messages_with_fts(self._conn, [extracted])
-                    self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
-                logger.info(
-                    "event_edit_new dialog_id=%d message_id=%d (not in sync.db, inserted)",
-                    dialog_id,
-                    message_id,
-                )
+                if await self._insert_missing_edited_message(dialog_id, msg, coverage, now):
+                    logger.info(
+                        "event_edit_new dialog_id=%d message_id=%d (not in sync.db, inserted)",
+                        dialog_id,
+                        message_id,
+                    )
                 return
 
             old_text = existing.text
@@ -664,37 +749,19 @@ class EventHandlerManager:
                 #    (Phase 39.2-01 AC-1 via edited path, AC-2 removal via empty results).
                 # 2. msg.reactions is None -> service edit / media caption etc.; no-op
                 #    (regression guard AC-8).
-                reactions_obj = msg.reactions
-                if reactions_obj is not None:
-                    aggregates = project_reaction_aggregates(reactions_obj)
-                    with self._conn:
-                        replace_reaction_aggregates(self._conn, dialog_id, message_id, aggregates)
-                        self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
-                    logger.info(
-                        "event_edit_reactions dialog_id=%d message_id=%d count=%d",
-                        dialog_id,
-                        message_id,
-                        len(aggregates),
-                    )
+                self._apply_reaction_only_edit(dialog_id, message_id, msg, coverage, existing_out.outgoing, now)
                 return
 
-            edit_date_raw = msg.edit_date
-            edit_date_unix = int(edit_date_raw.timestamp()) if edit_date_raw is not None else now
-
-            # Resolve entity map before the transaction (no await inside with).
-            entity_name_map = await _build_fwd_entity_map(msg, cast(_PeerNameClient, self._client))
-            extracted = extract_message_row(dialog_id, msg, entity_name_map=entity_name_map)
-
-            with self._conn:
-                # This versions the prior text and delegates the message row,
-                # FTS, and child projections to the canonical bundle writer.
-                next_ver = persist_edited_message(
-                    self._conn,
-                    extracted,
-                    old_text=old_text,
-                    edit_date=edit_date_unix,
-                )
-                self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
+            next_ver = await self._persist_changed_edit(
+                dialog_id,
+                msg,
+                coverage,
+                existing_out.outgoing,
+                old_text,
+                now,
+            )
+            if next_ver is None:
+                return
 
             logger.info(
                 "event_edit dialog_id=%d message_id=%d version=%d",
@@ -704,6 +771,83 @@ class EventHandlerManager:
             )
         except Exception:
             logger.exception("event_edit_failed dialog_id=%s", dialog_id)
+
+    async def _insert_missing_edited_message(
+        self,
+        dialog_id: int,
+        msg: _MessageLike,
+        coverage: RealtimeHistoryCoverage,
+        now: int,
+    ) -> bool:
+        outgoing = bool(getattr(msg, "out", False))
+        if not allows_missing_body_insert(coverage, RealtimeBodyEvent.EDIT, outgoing=outgoing):
+            return False
+        entity_name_map = await _build_fwd_entity_map(msg, cast(_PeerNameClient, self._client))
+        extracted = extract_message_row(dialog_id, msg, entity_name_map=entity_name_map)
+        coverage = self._realtime_coverage(dialog_id)
+        if not allows_missing_body_insert(coverage, RealtimeBodyEvent.EDIT, outgoing=outgoing):
+            return False
+        with self._conn:
+            insert_messages_with_fts(self._conn, [extracted])
+            self._record_body_event(dialog_id, now)
+        return True
+
+    def _apply_reaction_only_edit(  # noqa: PLR0913, PLR0917
+        self,
+        dialog_id: int,
+        message_id: int,
+        msg: _MessageLike,
+        coverage: RealtimeHistoryCoverage,
+        outgoing: bool,
+        now: int,
+    ) -> None:
+        reactions_obj = msg.reactions
+        if reactions_obj is None or not allows_existing_body_update(
+            coverage,
+            RealtimeBodyEvent.REACTION,
+            outgoing=outgoing,
+        ):
+            return
+        aggregates = project_reaction_aggregates(reactions_obj)
+        with self._conn:
+            replace_reaction_aggregates(self._conn, dialog_id, message_id, aggregates)
+            self._record_body_event(dialog_id, now)
+        logger.info(
+            "event_edit_reactions dialog_id=%d message_id=%d count=%d",
+            dialog_id,
+            message_id,
+            len(aggregates),
+        )
+
+    async def _persist_changed_edit(  # noqa: PLR0913, PLR0917
+        self,
+        dialog_id: int,
+        msg: _MessageLike,
+        coverage: RealtimeHistoryCoverage,
+        outgoing: bool,
+        old_text: str | None,
+        now: int,
+    ) -> int | None:
+        edit_date_raw = msg.edit_date
+        edit_date_unix = int(edit_date_raw.timestamp()) if edit_date_raw is not None else now
+        entity_name_map = await _build_fwd_entity_map(msg, cast(_PeerNameClient, self._client))
+        extracted = extract_message_row(dialog_id, msg, entity_name_map=entity_name_map)
+        coverage = self._realtime_coverage(dialog_id)
+        if not allows_existing_body_update(coverage, RealtimeBodyEvent.EDIT, outgoing=outgoing):
+            return None
+        if coverage is RealtimeHistoryCoverage.OWN_OUTGOING:
+            # The incoming edit object may omit Telethon's ``out`` flag;
+            # preserve the canonical outgoing classification of the row.
+            extracted = replace(extracted, message=replace(extracted.message, out=1))
+        with self._conn:
+            next_ver = persist_edited_message(
+                self._conn,
+                extracted,
+                old_text=old_text,
+                edit_date=edit_date_unix,
+            )
+            self._record_body_event(dialog_id, now)
+        return next_ver
 
     async def on_message_deleted(self, event: _DeletedMessagesEvent) -> None:
         """Handle a MessageDeleted event: mark channel messages as is_deleted=1.
@@ -722,14 +866,22 @@ class EventHandlerManager:
             )
             return
 
-        if dialog_id not in self._synced_dialog_ids:
+        coverage = self._realtime_coverage(dialog_id)
+        if coverage is RealtimeHistoryCoverage.NO_REALTIME_HISTORY:
             return
 
         try:
             now = int(time.time())
+            allowed_ids = list(event.deleted_ids)
+            if coverage is RealtimeHistoryCoverage.OWN_OUTGOING:
+                allowed_ids = [
+                    msg_id for msg_id in allowed_ids if read_message_out(self._conn, dialog_id, int(msg_id)).outgoing
+                ]
+            if not allowed_ids:
+                return
 
             with self._conn:
-                for msg_id in event.deleted_ids:
+                for msg_id in allowed_ids:
                     mark_message_deleted(self._conn, dialog_id, msg_id, now)
                 self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
 
@@ -918,17 +1070,13 @@ class EventHandlerManager:
         delta. FloodWait is logged + dropped (next JIT read repairs).
         Phase 39.2-01: AC-1 / AC-2 / AC-2-RAW / AC-UPD-USER / AC-UPD-CHANNEL.
         """
-        peer = update.peer
-        msg_id = update.msg_id
-        if peer is None or msg_id is None:
+        event_ids = self._reaction_event_ids(update)
+        if event_ids is None:
             return
-        try:
-            dialog_id = int(cast(int, get_peer_id(peer)))
-        except TypeError, ValueError:
-            logger.debug("raw_reaction_update_unparseable_peer peer=%r", peer)
-            return
+        dialog_id, msg_id = event_ids
 
-        if dialog_id not in self._synced_dialog_ids:
+        coverage = self._realtime_coverage(dialog_id)
+        if coverage is RealtimeHistoryCoverage.NO_REALTIME_HISTORY:
             logger.debug(
                 "raw_reaction_update_skipped_unsynced dialog_id=%d message_id=%d",
                 dialog_id,
@@ -936,26 +1084,15 @@ class EventHandlerManager:
             )
             return
 
-        try:
-            result = cast(Sequence[_MessageLike | None], await self._client.get_messages(dialog_id, ids=[msg_id]))
-        except FloodWaitError as exc:
-            wait = int(exc.seconds)
-            logger.warning(
-                "raw_reaction_floodwait dialog_id=%d message_id=%d seconds=%d",
-                dialog_id,
-                msg_id,
-                wait,
-            )
-            return
-        except RPCError, RuntimeError:
-            logger.exception(
-                "event_raw_reaction_failed dialog_id=%d message_id=%d",
-                dialog_id,
-                msg_id,
-            )
+        existing_out = read_message_out(self._conn, dialog_id, int(msg_id))
+        if coverage is RealtimeHistoryCoverage.OWN_OUTGOING and not allows_existing_body_update(
+            coverage,
+            RealtimeBodyEvent.REACTION,
+            outgoing=existing_out.outgoing,
+        ):
             return
 
-        msg = result[0] if result else None
+        msg = await self._fetch_reaction_message(dialog_id, msg_id)
         if msg is None:
             logger.debug(
                 "raw_reaction_update_missing_message dialog_id=%d message_id=%d",
@@ -966,10 +1103,8 @@ class EventHandlerManager:
 
         try:
             aggregates = project_reaction_aggregates(msg.reactions)
-            now = int(time.time())
-            with self._conn:
-                replace_reaction_aggregates(self._conn, dialog_id, msg_id, aggregates)
-                self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
+            if not self._apply_reaction_event(dialog_id, msg_id, aggregates):
+                return
             logger.info(
                 "event_raw_reaction dialog_id=%d message_id=%d count=%d",
                 dialog_id,
@@ -983,6 +1118,56 @@ class EventHandlerManager:
                 msg_id,
             )
 
+    @staticmethod
+    def _reaction_event_ids(update: _RawReactionUpdate) -> tuple[int, int] | None:
+        peer = update.peer
+        msg_id = update.msg_id
+        if peer is None or msg_id is None:
+            return None
+        try:
+            return int(cast(int, get_peer_id(peer))), int(msg_id)
+        except TypeError, ValueError:
+            logger.debug("raw_reaction_update_unparseable_peer peer=%r", peer)
+            return None
+
+    async def _fetch_reaction_message(self, dialog_id: int, msg_id: int) -> _MessageLike | None:
+        try:
+            result = cast(Sequence[_MessageLike | None], await self._client.get_messages(dialog_id, ids=[msg_id]))
+        except FloodWaitError as exc:
+            logger.warning(
+                "raw_reaction_floodwait dialog_id=%d message_id=%d seconds=%d",
+                dialog_id,
+                msg_id,
+                int(exc.seconds),
+            )
+            return None
+        except RPCError, RuntimeError:
+            logger.exception(
+                "event_raw_reaction_failed dialog_id=%d message_id=%d",
+                dialog_id,
+                msg_id,
+            )
+            return None
+        return result[0] if result else None
+
+    def _apply_reaction_event(
+        self,
+        dialog_id: int,
+        msg_id: int,
+        aggregates: Sequence[ReactionAggregate],
+    ) -> bool:
+        coverage = self._realtime_coverage(dialog_id)
+        existing_out = read_message_out(self._conn, dialog_id, msg_id)
+        if not allows_existing_body_update(coverage, RealtimeBodyEvent.REACTION, outgoing=existing_out.outgoing):
+            return False
+        if coverage is not RealtimeHistoryCoverage.FULL_HISTORY and not existing_out.found:
+            return False
+        now = int(time.time())
+        with self._conn:
+            replace_reaction_aggregates(self._conn, dialog_id, msg_id, aggregates)
+            self._record_body_event(dialog_id, now)
+        return True
+
     async def on_raw_transcribed_audio(self, update: UpdateTranscribedAudio) -> None:
         """Handle transcribed voice updates by materializing the new text.
 
@@ -992,25 +1177,13 @@ class EventHandlerManager:
         If the message row has not been inserted yet, we fetch the current
         message and upsert it so the transcription is not dropped on the floor.
         """
-        peer: object = getattr(update, "peer", None)
-        msg_id_value: object = getattr(update, "msg_id", None)
-        text_value: object = getattr(update, "text", None)
-        if (
-            peer is None
-            or not isinstance(msg_id_value, int)
-            or not isinstance(text_value, str)
-            or not text_value.strip()
-        ):
+        event_fields = self._transcription_event_fields(update)
+        if event_fields is None:
             return
-        try:
-            peer_id: object = get_peer_id(peer)
-            dialog_id = int(cast(int, peer_id))
-        except TypeError, ValueError:
-            logger.debug("raw_transcribed_audio_unparseable_peer peer=%r", peer)
-            return
-        msg_id = msg_id_value
+        dialog_id, msg_id, new_text = event_fields
 
-        if dialog_id not in self._synced_dialog_ids:
+        coverage = self._realtime_coverage(dialog_id)
+        if coverage is RealtimeHistoryCoverage.NO_REALTIME_HISTORY:
             logger.debug(
                 "raw_transcribed_audio_skipped_unsynced dialog_id=%d message_id=%d",
                 dialog_id,
@@ -1019,19 +1192,20 @@ class EventHandlerManager:
             return
 
         try:
-            row = read_message_text(self._conn, dialog_id, int(msg_id))
-            new_text = text_value.strip()
+            row = read_message_text(self._conn, dialog_id, msg_id)
+            existing_out = read_message_out(self._conn, dialog_id, msg_id)
             now = int(time.time())
             if not row.found:
-                logger.debug(
-                    "raw_transcribed_audio_missing_message dialog_id=%d message_id=%d",
-                    dialog_id,
-                    msg_id,
-                )
-                await self._insert_missing_transcribed_audio(dialog_id, int(msg_id), new_text, now)
+                await self._handle_missing_transcription(update, dialog_id, msg_id, new_text, coverage, now)
                 return
 
             old_text = row.text
+            if not allows_existing_body_update(
+                coverage,
+                RealtimeBodyEvent.TRANSCRIPTION,
+                outgoing=existing_out.outgoing,
+            ):
+                return
             if old_text == new_text:
                 return
 
@@ -1039,7 +1213,7 @@ class EventHandlerManager:
                 persist_transcribed_text(
                     self._conn,
                     dialog_id,
-                    int(msg_id),
+                    msg_id,
                     old_text=old_text,
                     transcribed_text=new_text,
                     transcribed_at=now,
@@ -1057,16 +1231,76 @@ class EventHandlerManager:
                 msg_id,
             )
 
+    @staticmethod
+    def _transcription_event_fields(update: UpdateTranscribedAudio) -> tuple[int, int, str] | None:
+        peer: object = getattr(update, "peer", None)
+        msg_id: object = getattr(update, "msg_id", None)
+        text_value: object = getattr(update, "text", None)
+        if peer is None or not isinstance(msg_id, int) or not isinstance(text_value, str) or not text_value.strip():
+            return None
+        try:
+            dialog_id = int(cast(int, get_peer_id(peer)))
+        except TypeError, ValueError:
+            logger.debug("raw_transcribed_audio_unparseable_peer peer=%r", peer)
+            return None
+        return dialog_id, msg_id, text_value.strip()
+
+    async def _handle_missing_transcription(  # noqa: PLR0913, PLR0917
+        self,
+        update: UpdateTranscribedAudio,
+        dialog_id: int,
+        msg_id: int,
+        new_text: str,
+        coverage: RealtimeHistoryCoverage,
+        now: int,
+    ) -> None:
+        outgoing = bool(getattr(update, "out", False))
+        if allows_missing_body_insert(coverage, RealtimeBodyEvent.TRANSCRIPTION, outgoing=outgoing):
+            logger.debug(
+                "raw_transcribed_audio_missing_message dialog_id=%d message_id=%d",
+                dialog_id,
+                msg_id,
+            )
+            await self._insert_missing_transcribed_audio(dialog_id, msg_id, new_text, now)
+            return
+        if coverage is not RealtimeHistoryCoverage.OWN_OUTGOING:
+            return
+        fetched = cast(Sequence[object], await self._client.get_messages(dialog_id, ids=[msg_id]))
+        fetched_msg = fetched[0] if fetched else None
+        if fetched_msg is None or not bool(getattr(fetched_msg, "out", False)):
+            return
+        coverage = self._realtime_coverage(dialog_id)
+        if not allows_missing_body_insert(coverage, RealtimeBodyEvent.TRANSCRIPTION, outgoing=True):
+            return
+        await self._insert_missing_transcribed_audio(
+            dialog_id,
+            msg_id,
+            new_text,
+            now,
+            fetched_msg=fetched_msg,
+        )
+
     async def _insert_missing_transcribed_audio(
         self,
         dialog_id: int,
         msg_id: int,
         new_text: str,
         now: int,
+        *,
+        fetched_msg: object | None = None,
     ) -> None:
-        fetched = cast(Sequence[object], await self._client.get_messages(dialog_id, ids=[msg_id]))
-        msg = fetched[0] if fetched else None
+        if fetched_msg is None:
+            fetched = cast(Sequence[object], await self._client.get_messages(dialog_id, ids=[msg_id]))
+            fetched_msg = fetched[0] if fetched else None
+        msg = fetched_msg
         if msg is None:
+            return
+        coverage = self._realtime_coverage(dialog_id)
+        if not allows_missing_body_insert(
+            coverage,
+            RealtimeBodyEvent.TRANSCRIPTION,
+            outgoing=bool(getattr(msg, "out", False)),
+        ):
             return
         extracted = extract_message_row(dialog_id, msg, entity_name_map={})
         extracted = replace(extracted, message=replace(extracted.message, text=new_text))
