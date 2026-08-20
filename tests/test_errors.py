@@ -23,8 +23,6 @@ from mcp_telegram.errors import (
     invalid_navigation_text,
     no_active_topics_text,
     no_dialogs_text,
-    no_unread_all_text,
-    no_unread_personal_text,
     no_usage_data_text,
     not_authenticated_text,
     rpc_error_detail,
@@ -91,8 +89,6 @@ _ERROR_TEXT_CASES: list[tuple[str, str, list[str]]] = [
     ("usage_stats_db_missing", usage_stats_db_missing_text(), ["database"]),
     ("usage_stats_query_error", usage_stats_query_error_text("OperationalError"), ["OperationalError"]),
     ("no_dialogs", no_dialogs_text(), ["no dialogs"]),
-    ("no_unread_personal", no_unread_personal_text(), ["personal"]),
-    ("no_unread_all", no_unread_all_text(), ["no unread"]),
     ("search_no_hits", search_no_hits_text("ChatName", "hello"), ["hello", "ChatName"]),
     ("bootstrap_pending", bootstrap_pending_text(), ["sync in progress"]),
     (

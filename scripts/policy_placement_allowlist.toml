@@ -102,6 +102,11 @@ rationale = "This daemon-client inbox page limit is a request contract."
 
 [[entry]]
 category = "policy_defaults"
+key = "src/mcp_telegram/daemon_client.py:DaemonConnection.get_unread_summary:limit"
+rationale = "This daemon-client unread-summary bound is a request contract."
+
+[[entry]]
+category = "policy_defaults"
 key = "src/mcp_telegram/daemon_client.py:DaemonConnection.get_inbox:group_size_threshold"
 rationale = "This inbox response grouping threshold is an API result-shape contract."
 

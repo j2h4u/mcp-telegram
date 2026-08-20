@@ -698,6 +698,7 @@ class DaemonAPIServer:
             "search_messages": self._search_messages,
             "trace_account_messages": self._trace_account_messages,
             "list_dialogs": self._list_dialogs,
+            "get_unread_summary": self._get_unread_summary,
             "list_folders": self._list_folders,
             "list_folder_messages": self._list_folder_messages,
             "list_topics": self._list_topics,
@@ -1014,6 +1015,10 @@ class DaemonAPIServer:
                     break
         data["dialogs"] = enriched
         return result
+
+    async def _get_unread_summary(self, req: dict[str, object]) -> dict:
+        """Delegate the Dialog-projection unread overview to the read service."""
+        return await self._get_reading_service()._get_unread_summary(cast(dict[str, object], req))
 
     async def _list_folders(self, _req: dict[str, object]) -> dict:
         await self._refresh_folders_if_stale()
@@ -1389,16 +1394,19 @@ class DaemonAPIServer:
     async def _list_unread_messages(self, req: dict[str, object]) -> dict:
         """Return prioritized unread messages across dialogs.
 
-        Request: scope ("personal"|"all"), limit (int, 1-500),
-        group_size_threshold (int).
+        Request: limit (int, 1-500), group_size_threshold (int).
         Response data: {"groups": [{"dialog_id", "display_name", "tier",
         "category", "unread_count", "unread_mentions_count",
         "messages": [{"message_id", "sent_at", "text", ...}]}]}.
         """
         from .daemon_reading import _parse_request_boundary
 
-        scope_obj = req.get("scope", "personal")
-        scope = scope_obj if isinstance(scope_obj, str) else "personal"
+        if "scope" in req:
+            return {
+                "ok": False,
+                "error": "invalid_input",
+                "message": "scope is not supported by get_inbox; use get_unread_summary for an overview",
+            }
         limit = _clamp(_coerce_int(req.get("limit", 100), 100), 1, 500)
         group_size_threshold = _coerce_int(req.get("group_size_threshold", 100), 100)
         try:
@@ -1406,7 +1414,7 @@ class DaemonAPIServer:
         except ValueError as exc:
             return {"ok": False, "error": "invalid_input", "message": str(exc)}
 
-        unread_dialogs, unread_counts = await self._collect_unread_dialogs(scope, group_size_threshold, since_utc)
+        unread_dialogs, unread_counts = await self._collect_unread_dialogs(group_size_threshold, since_utc)
         self._rank_unread_entries(unread_dialogs)
         allocation = allocate_message_budget_proportional(unread_counts, limit)
         groups = await self._fetch_unread_groups(unread_dialogs, allocation, since_utc)
@@ -1418,13 +1426,10 @@ class DaemonAPIServer:
     @staticmethod
     def _should_include_unread_dialog(
         category: str,
-        scope: str,
         participants_count: int | None,
         group_size_threshold: int,
     ) -> bool:
         """Decide whether a dialog should be included in unread results."""
-        if scope != "personal":
-            return True
         dt = DialogType.parse(category)
         if dt == DialogType.CHANNEL:
             return False
@@ -1436,7 +1441,6 @@ class DaemonAPIServer:
 
     async def _collect_unread_dialogs(
         self,
-        scope: str,
         group_size_threshold: int,
         since_utc: int | None = None,
     ) -> tuple[list[dict], dict[int, int]]:
@@ -1468,7 +1472,6 @@ class DaemonAPIServer:
 
             if not self._should_include_unread_dialog(
                 category,
-                scope,
                 cast(int | None, participants_count),
                 group_size_threshold,
             ):

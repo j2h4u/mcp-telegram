@@ -1,13 +1,14 @@
 {
   "steps": [
     {
-      "_comment": "All 17 tools registered with output schemas",
+      "_comment": "All 18 tools registered with output schemas",
       "action": "list_tools",
       "expect": {
         "tool_names_include": [
           "get_dialog_stats",
           "get_entity_info",
           "get_inbox",
+          "get_unread_summary",
           "get_my_recent_activity",
           "get_sync_alerts",
           "get_sync_status",
@@ -31,6 +32,10 @@
             "outputSchema.type": "object"
           },
           "get_inbox": {
+            "outputSchema.type": "object"
+          },
+          "get_unread_summary": {
+            "inputSchema.properties.limit.default": 50,
             "outputSchema.type": "object"
           },
           "get_my_recent_activity": {

@@ -195,19 +195,6 @@ def bootstrap_pending_text() -> str:
     return "[sync in progress — dialog list will grow as sync completes]"
 
 
-def no_unread_personal_text() -> str:
-    """Return text for empty unread in personal scope."""
-    return action_text(
-        "No unread messages (scope=personal).",
-        'Try scope="all" for a full overview.',
-    )
-
-
-def no_unread_all_text() -> str:
-    """Return text for empty unread in all scope."""
-    return "No unread messages."
-
-
 def search_no_hits_text(dialog_name: str | None, query: str) -> str:
     """Return an action-oriented response when search finds no hits.
 

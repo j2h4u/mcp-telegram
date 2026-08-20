@@ -2569,7 +2569,6 @@ async def test_list_unread_messages_basic() -> None:
     result = await server._dispatch(
         {
             "method": "get_inbox",
-            "scope": "personal",
             "limit": 100,
             "group_size_threshold": 100,
         }
@@ -2588,6 +2587,16 @@ async def test_list_unread_messages_basic() -> None:
 
     cast(AsyncMock, client.get_input_entity).assert_not_called()
     cast(MagicMock, client).assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_list_unread_messages_rejects_removed_scope_parameter() -> None:
+    server = make_server(_make_db(), _TestClient())
+
+    result = await server._dispatch({"method": "get_inbox", "scope": "all"})
+
+    assert result["ok"] is False
+    assert result["error"] == "invalid_input"
 
 
 @pytest.mark.asyncio
@@ -2633,7 +2642,6 @@ async def test_list_unread_messages_empty() -> None:
     result = await server._dispatch(
         {
             "method": "get_inbox",
-            "scope": "personal",
             "limit": 100,
             "group_size_threshold": 100,
         }
@@ -2646,8 +2654,8 @@ async def test_list_unread_messages_empty() -> None:
 
 
 @pytest.mark.asyncio
-async def test_list_unread_messages_filters_channels_in_personal_scope() -> None:
-    """scope=personal excludes channels; includes users."""
+async def test_list_unread_messages_filters_channels() -> None:
+    """Personal inbox semantics exclude channels and include users."""
     conn = _make_db()
     _seed_unread_state(conn, 200, read_inbox_max_id=0, entity_type="Channel", entity_name="News")
     _seed_message(conn, 200, message_id=1)
@@ -2660,7 +2668,6 @@ async def test_list_unread_messages_filters_channels_in_personal_scope() -> None
     result = await server._dispatch(
         {
             "method": "get_inbox",
-            "scope": "personal",
             "limit": 100,
             "group_size_threshold": 100,
         }
@@ -2668,14 +2675,14 @@ async def test_list_unread_messages_filters_channels_in_personal_scope() -> None
 
     assert result["ok"] is True
     ids = [g["dialog_id"] for g in _response_groups(result)]
-    assert 200 not in ids, "Channel should be filtered in personal scope"
+    assert 200 not in ids, "Channel should be filtered by personal inbox semantics"
     assert 201 in ids
     cast(MagicMock, client).assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_list_unread_messages_includes_groups_with_unknown_members_in_personal_scope() -> None:
-    """Unknown member counts stay permissive in personal scope."""
+async def test_list_unread_messages_includes_groups_with_unknown_members() -> None:
+    """Unknown member counts stay permissive in the personal inbox."""
     conn = _make_db()
     _seed_unread_state(conn, 1001, read_inbox_max_id=10, entity_type="Group", entity_name="BigGroup")
     _seed_message(conn, 1001, message_id=11)
@@ -2686,7 +2693,6 @@ async def test_list_unread_messages_includes_groups_with_unknown_members_in_pers
     result = await server._dispatch(
         {
             "method": "get_inbox",
-            "scope": "personal",
             "limit": 100,
             "group_size_threshold": 100,
         }
@@ -2696,15 +2702,15 @@ async def test_list_unread_messages_includes_groups_with_unknown_members_in_pers
     groups = _response_groups(result)
     assert len(groups) == 1
     # Seeded entity_type "Group" (capitalized) is the legacy megagroup marker, which
-    # parses to the canonical SUPERGROUP. Still group-tier, still included in personal
-    # scope — only the category label sharpened from the old flat "group".
+    # parses to the canonical SUPERGROUP. Still group-tier, still included in the personal
+    # inbox — only the category label sharpened from the old flat "group".
     assert groups[0]["category"] == "supergroup"
     cast(MagicMock, client).assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_list_unread_messages_includes_groups_below_threshold_in_personal_scope() -> None:
-    """Groups at or below the threshold stay visible in personal scope."""
+async def test_list_unread_messages_includes_groups_below_threshold() -> None:
+    """Groups at or below the threshold stay visible in the personal inbox."""
     conn = _make_db()
     _seed_unread_state(conn, 1002, read_inbox_max_id=10, entity_type="Group", entity_name="SmallGroup")
     _seed_unread_dialog(conn, 1002, name="SmallGroup", type_="Group", members=99)
@@ -2716,7 +2722,6 @@ async def test_list_unread_messages_includes_groups_below_threshold_in_personal_
     result = await server._dispatch(
         {
             "method": "get_inbox",
-            "scope": "personal",
             "limit": 100,
             "group_size_threshold": 100,
         }
@@ -2731,8 +2736,8 @@ async def test_list_unread_messages_includes_groups_below_threshold_in_personal_
 
 
 @pytest.mark.asyncio
-async def test_list_unread_messages_excludes_groups_above_threshold_in_personal_scope() -> None:
-    """Large groups are excluded from personal scope when members are known."""
+async def test_list_unread_messages_excludes_groups_above_threshold() -> None:
+    """Large groups are excluded from the personal inbox when members are known."""
     conn = _make_db()
     _seed_unread_state(conn, 1003, read_inbox_max_id=10, entity_type="Group", entity_name="LargeGroup")
     _seed_unread_dialog(conn, 1003, name="LargeGroup", type_="Group", members=101)
@@ -2744,7 +2749,6 @@ async def test_list_unread_messages_excludes_groups_above_threshold_in_personal_
     result = await server._dispatch(
         {
             "method": "get_inbox",
-            "scope": "personal",
             "limit": 100,
             "group_size_threshold": 100,
         }
@@ -2771,7 +2775,6 @@ async def test_list_unread_messages_budget_limits_messages() -> None:
     result = await server._dispatch(
         {
             "method": "get_inbox",
-            "scope": "personal",
             "limit": 10,
             "group_size_threshold": 100,
         }
@@ -2813,7 +2816,6 @@ async def test_list_unread_messages_skips_non_synced_or_null() -> None:
     result = await server._dispatch(
         {
             "method": "get_inbox",
-            "scope": "personal",
             "limit": 100,
             "group_size_threshold": 100,
         }
@@ -2842,7 +2844,6 @@ async def test_list_unread_messages_read_inbox_max_id_zero_returns_all() -> None
     result = await server._dispatch(
         {
             "method": "get_inbox",
-            "scope": "personal",
             "limit": 100,
             "group_size_threshold": 100,
         }
@@ -2872,7 +2873,6 @@ async def test_list_unread_messages_excludes_deleted_messages() -> None:
     result = await server._dispatch(
         {
             "method": "get_inbox",
-            "scope": "personal",
             "limit": 100,
             "group_size_threshold": 100,
         }
@@ -2903,7 +2903,6 @@ async def test_list_unread_messages_filter_excludes_ids_below_read_position() ->
     result = await server._dispatch(
         {
             "method": "get_inbox",
-            "scope": "personal",
             "limit": 100,
             "group_size_threshold": 100,
         }
@@ -2933,7 +2932,6 @@ async def test_list_unread_messages_response_reports_bootstrap_pending() -> None
     result = await server._dispatch(
         {
             "method": "get_inbox",
-            "scope": "personal",
             "limit": 100,
             "group_size_threshold": 100,
         }
@@ -2986,7 +2984,6 @@ async def test_list_unread_messages_excludes_outgoing_and_service_messages() -> 
     result = await server._dispatch(
         {
             "method": "get_inbox",
-            "scope": "personal",
             "limit": 100,
             "group_size_threshold": 100,
         }
@@ -5861,7 +5858,6 @@ async def test_list_unread_messages_uses_entity_name() -> None:
     result = await server._dispatch(
         {
             "method": "get_inbox",
-            "scope": "personal",
             "limit": 100,
             "group_size_threshold": 100,
         }
@@ -5895,7 +5891,6 @@ async def test_list_unread_messages_preserves_media_only_content_and_filters_ser
     result = await server._dispatch(
         {
             "method": "get_inbox",
-            "scope": "personal",
             "limit": 100,
             "group_size_threshold": 100,
         }

@@ -97,7 +97,7 @@
       }
     },
     {
-      "_comment": "get_inbox — personal scope",
+      "_comment": "get_inbox — personal body-rich unread notifications",
       "action": "call_tool",
       "name": "get_inbox",
       "arguments": {},
