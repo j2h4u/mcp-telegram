@@ -28,6 +28,7 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
     "sqlite3": frozenset(
         {
             "__init__.py",
+            "access_lifecycle/__init__.py",
             "activity_cold_backfill.py",
             "activity_hot_sweep.py",
             "activity_peer_resolve.py",

@@ -747,13 +747,13 @@ class TestClearCursor:
 
 
 # ---------------------------------------------------------------------------
-# _set_access_lost — RECON-04
+# access_lifecycle.set_access_lost — RECON-04
 # ---------------------------------------------------------------------------
 
 
 def test_set_access_lost_atomic(db_path: Path) -> None:
-    """RECON-04: _set_access_lost writes synced_dialogs and dialogs in one txn."""
-    from mcp_telegram.dialog_sync import _set_access_lost
+    """RECON-04: access_lifecycle writes synced_dialogs and dialogs in one txn."""
+    from mcp_telegram.access_lifecycle import set_access_lost
 
     dialog_id = 12345
     now = 1700000000
@@ -773,7 +773,7 @@ def test_set_access_lost_atomic(db_path: Path) -> None:
                 (dialog_id, now - 1000),
             )
 
-        _set_access_lost(conn, dialog_id, now)
+        set_access_lost(conn, dialog_id, now)
 
         row = conn.execute(
             "SELECT status, access_lost_at FROM synced_dialogs WHERE dialog_id=?",
@@ -794,11 +794,11 @@ def test_set_access_lost_atomic(db_path: Path) -> None:
 
 def test_set_access_lost_no_op_on_missing_rows(db_path: Path) -> None:
     """Helper does not raise when one or both rows are missing."""
-    from mcp_telegram.dialog_sync import _set_access_lost
+    from mcp_telegram.access_lifecycle import set_access_lost
 
     conn = _open_sync_db(db_path)
     try:
         # Neither table has dialog_id=99999 — must not raise.
-        _set_access_lost(conn, 99999, 1700000000)
+        set_access_lost(conn, 99999, 1700000000)
     finally:
         conn.close()

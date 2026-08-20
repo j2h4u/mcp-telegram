@@ -445,30 +445,6 @@ CREATE TABLE IF NOT EXISTS own_only_dialogs (
 )
 """
 
-_SET_ACCESS_LOST_SQL = (
-    "UPDATE synced_dialogs "
-    "SET status = 'access_lost', access_lost_at = ?, delta_refresh_requested_at = NULL "
-    "WHERE dialog_id = ?"
-)
-_SET_DIALOGS_HIDDEN_SQL = "UPDATE dialogs SET hidden = 1, snapshot_at = ? WHERE dialog_id = ?"
-_RESTORE_ACCESS_SQL = (
-    "UPDATE synced_dialogs "
-    "SET status = 'syncing', access_lost_at = NULL, "
-    "access_last_revalidated_at = ?, access_next_revalidate_at = NULL "
-    "WHERE dialog_id = ?"
-)
-_UPSERT_RESTORED_DIALOG_SQL = """
-INSERT INTO dialogs (
-    dialog_id, hidden, needs_refresh, snapshot_at,
-    archived, pinned, unread_mentions_count, unread_reactions_count
-) VALUES (?, 0, 1, ?, 0, 0, 0, 0)
-ON CONFLICT(dialog_id) DO UPDATE SET
-    hidden = 0,
-    needs_refresh = 1,
-    snapshot_at = excluded.snapshot_at
-"""
-_UPDATE_TOTAL_MESSAGES_SQL = "UPDATE synced_dialogs SET total_messages = ? WHERE dialog_id = ?"
-
 # ---------------------------------------------------------------------------
 # v27: scheduled-message mirror
 #
@@ -1449,12 +1425,7 @@ def record_daemon_event(
     dialog_id: int | None = None,
     payload: dict[str, object] | None = None,
 ) -> None:
-    """Append one local daemon event.
-
-    This records important daemon-observed state changes for future agent-facing
-    notification surfaces. Payloads must stay compact and must not include
-    Telegram message text.
-    """
+    """Append a compact local daemon event for non-lifecycle callers."""
     conn.execute(
         "INSERT INTO daemon_events (kind, dialog_id, occurred_at, payload_json) VALUES (?, ?, ?, ?)",
         (
@@ -1464,63 +1435,6 @@ def record_daemon_event(
             json.dumps(payload or {}, ensure_ascii=False, separators=(",", ":")),
         ),
     )
-
-
-def set_access_lost(conn: sqlite3.Connection, dialog_id: int, now: int, *, reason: str | None = None) -> None:
-    """Atomically mark a dialog access-lost in local sync state."""
-    with conn:
-        row = cast(
-            tuple[str | None, int | None] | None,
-            conn.execute(
-                "SELECT status, access_lost_at FROM synced_dialogs WHERE dialog_id = ?",
-                (dialog_id,),
-            ).fetchone(),
-        )
-        previous_status = row[0] if row is not None else None
-        was_access_lost = previous_status == "access_lost"
-        if row is None:
-            conn.execute(
-                "INSERT INTO synced_dialogs (dialog_id, status, access_lost_at) VALUES (?, 'access_lost', ?)",
-                (dialog_id, now),
-            )
-        else:
-            conn.execute(_SET_ACCESS_LOST_SQL, (now, dialog_id))
-        conn.execute(_SET_DIALOGS_HIDDEN_SQL, (now, dialog_id))
-        if not was_access_lost:
-            payload: dict[str, object] = {}
-            if previous_status is not None:
-                payload["previous_status"] = previous_status
-            if reason is not None:
-                payload["reason"] = reason
-            record_daemon_event(
-                conn,
-                kind="access_lost",
-                dialog_id=dialog_id,
-                occurred_at=now,
-                payload=payload,
-            )
-
-
-def restore_access_after_revalidation(
-    conn: sqlite3.Connection,
-    dialog_id: int,
-    now: int,
-    *,
-    total_messages: int | None = None,
-) -> None:
-    """Atomically restore an access-lost archive to normal sync recovery."""
-    with conn:
-        conn.execute(_RESTORE_ACCESS_SQL, (now, dialog_id))
-        conn.execute(_UPSERT_RESTORED_DIALOG_SQL, (dialog_id, now))
-        if total_messages is not None:
-            conn.execute(_UPDATE_TOTAL_MESSAGES_SQL, (total_messages, dialog_id))
-        record_daemon_event(
-            conn,
-            kind="access_restored",
-            dialog_id=dialog_id,
-            occurred_at=now,
-            payload={},
-        )
 
 
 def ensure_sync_schema(db_path: Path) -> None:
