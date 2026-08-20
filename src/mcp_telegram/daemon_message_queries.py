@@ -142,7 +142,7 @@ _SELECT_FTS_ALL_SQL = (
 
 _FETCH_UNREAD_MESSAGES_SQL = (
     f"SELECT m.message_id, m.sent_at, m.text, m.sender_id, "
-    f"{_SENDER_FIRST_NAME_SQL}, NULL AS content_kind, "
+    f"{_SENDER_FIRST_NAME_SQL}, m.media_description, NULL AS content_kind, "
     f"{EFFECTIVE_SENDER_ID_SQL}, m.is_service, m.out, m.dialog_id "
     f"FROM messages m "
     f"{_SENDER_ENTITY_JOINS_SQL}"

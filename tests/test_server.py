@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import logging
 import re
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from functools import partial
 from pathlib import Path
@@ -11,6 +12,7 @@ from unittest.mock import AsyncMock
 from urllib.parse import urlparse
 
 import pytest
+from jsonschema import validate
 from mcp.types import CallToolResult, Prompt, TextContent, Tool
 
 from mcp_telegram import server
@@ -794,6 +796,97 @@ async def test_call_tool_returns_structuredContent_with_empty_success_content(
     structured_content = cast(dict[str, object], result.structured_content)
     assert structured_content == {"dialogs": [{"id": 1, "name": "Alice"}], "count": 1}
     assert result.content == []
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        (
+            "caption",
+            None,
+            "message_text",
+            {"text": "caption", "is_telegram_content": True, "content_kind": "message_text"},
+            None,
+        ),
+        (
+            "caption",
+            "[photo]",
+            "message_text",
+            {"text": "caption", "is_telegram_content": True, "content_kind": "message_text"},
+            {"text": "[photo]", "is_telegram_content": True, "content_kind": "media_description"},
+        ),
+        (
+            None,
+            "[photo]",
+            "media_description",
+            {"text": "[photo]", "is_telegram_content": True, "content_kind": "media_description"},
+            {"text": "[photo]", "is_telegram_content": True, "content_kind": "media_description"},
+        ),
+        (None, None, "none", None, None),
+    ],
+    ids=["text-only", "caption-and-media", "media-only", "empty"],
+)
+@pytest.mark.asyncio
+async def test_public_get_inbox_call_tool_preserves_canonical_content_schema(
+    monkeypatch: pytest.MonkeyPatch,
+    case: tuple[
+        str | None,
+        str | None,
+        str,
+        dict[str, object] | None,
+        dict[str, object] | None,
+    ],
+) -> None:
+    """The public server entrypoint keeps one canonical content/media projection."""
+    text, media_description, content_kind, expected_content, expected_media = case
+
+    class _InboxConnection:
+        async def get_inbox(self, **_kwargs: object) -> dict[str, object]:
+            return {
+                "ok": True,
+                "data": {
+                    "groups": [
+                        {
+                            "dialog_id": 123,
+                            "display_name": "Alice",
+                            "category": "user",
+                            "dialog_type": "User",
+                            "unread_count": 1,
+                            "messages": [
+                                {
+                                    "message_id": 1,
+                                    "sent_at": 1_700_000_000,
+                                    "dialog_id": 123,
+                                    "text": text,
+                                    "media_description": media_description,
+                                    "content_kind": content_kind,
+                                }
+                            ],
+                        }
+                    ]
+                },
+            }
+
+    @asynccontextmanager
+    async def _connection() -> AsyncIterator[_InboxConnection]:
+        yield _InboxConnection()
+
+    monkeypatch.setattr("mcp_telegram.tools.unread.daemon_connection", _connection)
+
+    result = _call_tool_result(await server.call_tool("get_inbox", {}))
+
+    assert result.is_error is False
+    assert result.content == []
+    payload = cast(dict[str, object], result.structured_content)
+    schema = server.tool_by_name["get_inbox"].output_schema
+    assert schema is not None
+    validate(instance=payload, schema=schema)
+    dialog = cast(dict[str, object], cast(list[object], payload["dialogs"])[0])
+    message = cast(dict[str, object], cast(list[object], dialog["messages"])[0])
+    assert message["content"] == expected_content
+    assert message["media"] == expected_media
+    assert "text" not in message
+    assert "media_description" not in message
 
 
 @pytest.mark.asyncio
