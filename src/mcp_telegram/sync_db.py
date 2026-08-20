@@ -7,7 +7,7 @@ import sqlite3
 from pathlib import Path
 from typing import cast
 
-_CURRENT_SCHEMA_VERSION = 32
+_CURRENT_SCHEMA_VERSION = 33
 _SCHEMA_VERSION_WITH_FTS = 3
 
 logger = logging.getLogger(__name__)
@@ -212,6 +212,10 @@ CREATE TABLE IF NOT EXISTS dialogs (
     needs_refresh           INTEGER NOT NULL DEFAULT 0,
     unread_mentions_count   INTEGER NOT NULL DEFAULT 0,
     unread_reactions_count  INTEGER NOT NULL DEFAULT 0,
+    unread_count            INTEGER,
+    unread_mark             INTEGER,
+    unread_count_observed_at INTEGER,
+    unread_mark_observed_at INTEGER,
     draft_text              TEXT
 )
 """
@@ -1041,8 +1045,9 @@ def _apply_migrations_16_to_20(conn: sqlite3.Connection, current: int) -> int:
 
     # v17 (Phase 40): dialogs snapshot table for v1.6 Local Mirror milestone.
     # Separate from synced_dialogs (sync machinery) and entities (sender data) — MIRROR-03.
-    # unread_count is intentionally absent — computed from local read cursor (MIRROR-05).
-    # Phase 41 bootstrap populates rows; Phase 42 event handlers update them in real time.
+    # Telegram-authoritative unread facts are added by v33; Phase 41 bootstrap
+    # and Phase 43 reconciliation populate them, while raw event handlers keep
+    # them current. NULL remains the unknown state.
     current = _apply_migration(
         conn,
         current,
@@ -1351,6 +1356,22 @@ def _apply_migration_32(conn: sqlite3.Connection, current: int) -> int:
     )
 
 
+def _apply_migration_33(conn: sqlite3.Connection, current: int) -> int:
+    """Persist nullable, Telegram-authoritative unread facts on dialog snapshots."""
+    return _apply_migration(
+        conn,
+        current,
+        33,
+        [
+            "ALTER TABLE dialogs ADD COLUMN unread_count INTEGER",
+            "ALTER TABLE dialogs ADD COLUMN unread_mark INTEGER",
+            "ALTER TABLE dialogs ADD COLUMN unread_count_observed_at INTEGER",
+            "ALTER TABLE dialogs ADD COLUMN unread_mark_observed_at INTEGER",
+        ],
+        ignore_duplicate_column=True,
+    )
+
+
 def _apply_migrations(conn: sqlite3.Connection) -> None:
     """Apply WAL mode and all pending schema migrations in version order."""
     try:
@@ -1380,6 +1401,7 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     current = _apply_migration_30(conn, current)
     current = _apply_migration_31(conn, current)
     current = _apply_migration_32(conn, current)
+    current = _apply_migration_33(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 

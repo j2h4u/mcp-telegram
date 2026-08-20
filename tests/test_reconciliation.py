@@ -419,6 +419,14 @@ async def test_recon_full_pass_upserts_returned(
     )
     assert rows[0][1] == "A_new" and rows[0][2] == 0
     assert rows[1][1] == "B_new" and rows[1][2] == 0
+    sweep_state = dict(
+        sync_db.execute("SELECT key, value FROM daemon_state WHERE key LIKE 'dialog_unread_sweep_%'").fetchall()
+    )
+    assert sweep_state["dialog_unread_sweep_status"] == "complete"
+    assert sweep_state["dialog_unread_sweep_observed_count"] == "2"
+    assert sweep_state["dialog_unread_sweep_last_visible_count"] == "2"
+    assert sweep_state["dialog_unread_sweep_attempted_at"].isdigit()
+    assert sweep_state["dialog_unread_sweep_completed_at"].isdigit()
 
 
 @pytest.mark.asyncio
@@ -480,6 +488,31 @@ async def test_recon_full_pass_refreshes_read_cursors_from_wrapped_telethon_dial
         ).fetchone(),
     )
     assert row == (31, 41)
+
+
+@pytest.mark.asyncio
+async def test_recon_full_pass_projects_exact_unread_facts_without_sync_row(
+    sync_db: sqlite3.Connection,
+    mock_client: MagicMock,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """Telegram unread facts project for visible dialogs regardless of sync status."""
+    dialog = _make_dialog(100, name="A_new")
+    dialog.unread_count = 0
+    dialog.dialog = SimpleNamespace(unread_mark=False)
+    mock_client.iter_dialogs = MagicMock(return_value=_async_iter([dialog]))
+
+    worker = DialogReconciliationWorker(mock_client, sync_db, shutdown_event)
+    count, completed = await worker.run_full_pass()
+
+    assert (count, completed) == (1, True)
+    row = sync_db.execute(
+        "SELECT unread_count, unread_mark, unread_count_observed_at, unread_mark_observed_at "
+        "FROM dialogs WHERE dialog_id=100"
+    ).fetchone()
+    assert row[0:2] == (0, 0)
+    assert row[2] is not None and row[3] is not None
+    assert sync_db.execute("SELECT COUNT(*) FROM synced_dialogs WHERE dialog_id=100").fetchone() == (0,)
 
 
 @pytest.mark.asyncio
@@ -595,6 +628,96 @@ async def test_recon_full_pass_flood_wait_skips_soft_delete(
         for row in cast(list[tuple[int, int]], sync_db.execute("SELECT dialog_id, hidden FROM dialogs").fetchall())
     }
     assert hidden[200] == 0  # NOT hidden — soft-delete branch never ran
+    sweep_state = dict(
+        sync_db.execute("SELECT key, value FROM daemon_state WHERE key LIKE 'dialog_unread_sweep_%'").fetchall()
+    )
+    assert sweep_state["dialog_unread_sweep_status"] == "partial"
+    assert sweep_state["dialog_unread_sweep_observed_count"] == "1"
+    assert sweep_state["dialog_unread_sweep_last_visible_count"] == "2"
+
+
+@pytest.mark.asyncio
+async def test_recon_full_pass_source_unavailable_without_source_does_not_hide(
+    sync_db: sqlite3.Connection,
+    mock_client: MagicMock,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """An access error before the first item means Telegram never established a source."""
+    _seed_dialog_row(sync_db, 100)
+    _seed_dialog_row(sync_db, 200)
+
+    async def _gen():
+        raise ChannelPrivateError(request=None)
+        yield  # pragma: no cover - keeps this an async generator
+
+    mock_client.iter_dialogs = MagicMock(return_value=_gen())
+    worker = DialogReconciliationWorker(mock_client, sync_db, shutdown_event)
+
+    count, completed = await worker.run_full_pass()
+
+    assert (count, completed) == (0, False)
+    assert sync_db.execute("SELECT hidden FROM dialogs WHERE dialog_id=200").fetchone() == (0,)
+    state = dict(
+        sync_db.execute("SELECT key, value FROM daemon_state WHERE key LIKE 'dialog_unread_sweep_%'").fetchall()
+    )
+    assert state["dialog_unread_sweep_status"] == "source_unavailable"
+    assert state["dialog_unread_sweep_observed_count"] == "0"
+
+
+@pytest.mark.asyncio
+async def test_recon_full_pass_access_error_after_items_is_partial_and_does_not_hide(
+    sync_db: sqlite3.Connection,
+    mock_client: MagicMock,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """An access error after enumeration began is partial, never source_unavailable."""
+    _seed_dialog_row(sync_db, 100)
+    _seed_dialog_row(sync_db, 200)
+
+    async def _gen():
+        yield _make_dialog(100)
+        raise ChannelPrivateError(request=None)
+
+    mock_client.iter_dialogs = MagicMock(return_value=_gen())
+    worker = DialogReconciliationWorker(mock_client, sync_db, shutdown_event)
+
+    count, completed = await worker.run_full_pass()
+
+    assert (count, completed) == (1, False)
+    assert sync_db.execute("SELECT hidden FROM dialogs WHERE dialog_id=200").fetchone() == (0,)
+    state = dict(
+        sync_db.execute("SELECT key, value FROM daemon_state WHERE key LIKE 'dialog_unread_sweep_%'").fetchall()
+    )
+    assert state["dialog_unread_sweep_status"] == "partial"
+    assert state["dialog_unread_sweep_observed_count"] == "1"
+
+
+@pytest.mark.asyncio
+async def test_recon_full_pass_unexpected_error_is_partial_and_propagates(
+    sync_db: sqlite3.Connection,
+    mock_client: MagicMock,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """Programming errors keep durable partial progress but are not swallowed."""
+    _seed_dialog_row(sync_db, 100)
+    _seed_dialog_row(sync_db, 200)
+
+    async def _gen():
+        yield _make_dialog(100)
+        raise ValueError("broken dialog source")
+
+    mock_client.iter_dialogs = MagicMock(return_value=_gen())
+    worker = DialogReconciliationWorker(mock_client, sync_db, shutdown_event)
+
+    with pytest.raises(ValueError, match="broken dialog source"):
+        await worker.run_full_pass()
+
+    assert sync_db.execute("SELECT hidden FROM dialogs WHERE dialog_id=200").fetchone() == (0,)
+    state = dict(
+        sync_db.execute("SELECT key, value FROM daemon_state WHERE key LIKE 'dialog_unread_sweep_%'").fetchall()
+    )
+    assert state["dialog_unread_sweep_status"] == "partial"
+    assert state["dialog_unread_sweep_observed_count"] == "1"
 
 
 # --- loop tests -------------------------------------------------------------

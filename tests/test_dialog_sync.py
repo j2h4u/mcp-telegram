@@ -32,6 +32,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from mcp_telegram.dialog_sync import (
+    _UPSERT_DIALOG_SQL,
     DialogsBootstrapWorker,
     _clear_cursor,
     _decode_offset_peer,
@@ -41,6 +42,7 @@ from mcp_telegram.dialog_sync import (
     _set_state,
 )
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
+from mcp_telegram.unread_state import apply_unread_facts
 
 # ---------------------------------------------------------------------------
 # Entity + dialog factories
@@ -65,6 +67,8 @@ class _DialogOptions:
     read_outbox_max_id: int | None = None
     unread_mentions_count: int = 0
     unread_reactions_count: int = 0
+    unread_count: int | None = None
+    unread_mark: bool | None = None
     draft_message: str | None = None
     draft_text: str | None = None
 
@@ -170,6 +174,9 @@ def _make_dialog(
         read_outbox_max_id=opts.read_outbox_max_id,
         unread_mentions_count=opts.unread_mentions_count,
         unread_reactions_count=opts.unread_reactions_count,
+        unread_count=opts.unread_count,
+        unread_mark=opts.unread_mark,
+        dialog=SimpleNamespace(unread_mark=opts.unread_mark),
         draft=draft,
     )
 
@@ -238,6 +245,9 @@ class TestDialogsBootstrapWorker:
         conn = _open_sync_db(db_path)
         try:
             assert _get_state(conn, "bootstrap_sweep_status") == "complete"
+            assert conn.execute(
+                "SELECT COUNT(*) FROM daemon_state WHERE key LIKE 'dialog_unread_sweep_%'"
+            ).fetchone() == (0,)
             rows = list(conn.execute("SELECT dialog_id, name, type FROM dialogs ORDER BY dialog_id"))
             assert len(rows) == 3
             typed_rows = cast(list[tuple[int, str, str]], rows)
@@ -399,8 +409,7 @@ class TestDialogsBootstrapWorker:
 
     @pytest.mark.asyncio
     async def test_upsert_recency_guard_preserves_newer_row(self, db_path: Path) -> None:
-        # D-12: UPSERT WHERE dialogs.snapshot_at < excluded.snapshot_at —
-        # bootstrap data must NOT clobber a row with a fresher snapshot_at.
+        # D-12: bootstrap data must NOT clobber a row with a fresher snapshot_at.
         seed_conn = _open_sync_db(db_path)
         try:
             future_ts = int(time.time()) + 10_000
@@ -422,6 +431,87 @@ class TestDialogsBootstrapWorker:
         try:
             row = cast(tuple[str], conn.execute("SELECT name FROM dialogs WHERE dialog_id = ?", (555,)).fetchone())
             assert row[0] == "FromEvent"  # not overwritten
+        finally:
+            conn.close()
+
+    @pytest.mark.asyncio
+    async def test_upsert_accepts_null_snapshot_and_keeps_newer_unread_facts(self, db_path: Path) -> None:
+        """Thin rows and raw events must not be blocked by the body snapshot guard."""
+        conn = _open_sync_db(db_path)
+        try:
+            with conn:
+                conn.execute(
+                    "INSERT INTO dialogs (dialog_id, name, type, snapshot_at, needs_refresh) "
+                    "VALUES (555, 'Thin', 'user', NULL, 1)",
+                )
+            captured = _extract_dialog_row(
+                _make_dialog(555, _make_user_entity(555), unread_count=3, unread_mark=True),
+                101,
+            )
+            with conn:
+                conn.execute(_UPSERT_DIALOG_SQL, captured)
+            row = conn.execute("SELECT name, snapshot_at, needs_refresh FROM dialogs WHERE dialog_id=555").fetchone()
+            assert row == ("Test", 101, 1)
+        finally:
+            conn.close()
+
+    @pytest.mark.asyncio
+    async def test_upsert_unread_fields_are_independent_of_stale_snapshot(self, db_path: Path) -> None:
+        """A snapshot captured at t101 cannot overwrite raw facts observed at t102."""
+        conn = _open_sync_db(db_path)
+        try:
+            with conn:
+                conn.execute(
+                    "INSERT INTO dialogs (dialog_id, name, type, snapshot_at) VALUES (555, 'Old', 'user', 100)"
+                )
+                initial = _extract_dialog_row(
+                    _make_dialog(555, _make_user_entity(555), unread_count=1, unread_mark=True),
+                    100,
+                )
+                conn.execute(_UPSERT_DIALOG_SQL, initial)
+                apply_unread_facts(conn, 555, observed_at=102, unread_count=9, unread_mark=False)
+                stale_snapshot = _extract_dialog_row(
+                    _make_dialog(555, _make_user_entity(555), unread_count=3, unread_mark=True),
+                    101,
+                )
+                conn.execute(_UPSERT_DIALOG_SQL, stale_snapshot)
+            row = conn.execute(
+                "SELECT snapshot_at, unread_count, unread_mark, unread_count_observed_at, unread_mark_observed_at "
+                "FROM dialogs WHERE dialog_id=555"
+            ).fetchone()
+            assert row == (101, 9, 0, 102, 102)
+        finally:
+            conn.close()
+
+    @pytest.mark.asyncio
+    async def test_upsert_same_second_snapshot_keeps_raw_unread_facts(self, db_path: Path) -> None:
+        """Equal observations retain the raw event already stored for that second."""
+        conn = _open_sync_db(db_path)
+        try:
+            with conn:
+                conn.execute(
+                    "INSERT INTO dialogs (dialog_id, name, type, snapshot_at) VALUES (556, 'Old', 'user', 100)"
+                )
+                conn.execute(
+                    _UPSERT_DIALOG_SQL,
+                    _extract_dialog_row(
+                        _make_dialog(556, _make_user_entity(556), unread_count=1, unread_mark=True),
+                        100,
+                    ),
+                )
+                apply_unread_facts(conn, 556, observed_at=101, unread_count=9, unread_mark=False)
+                conn.execute(
+                    _UPSERT_DIALOG_SQL,
+                    _extract_dialog_row(
+                        _make_dialog(556, _make_user_entity(556), unread_count=3, unread_mark=True),
+                        101,
+                    ),
+                )
+            row = conn.execute(
+                "SELECT unread_count, unread_mark, unread_count_observed_at, unread_mark_observed_at "
+                "FROM dialogs WHERE dialog_id=556"
+            ).fetchone()
+            assert row == (9, 0, 101, 101)
         finally:
             conn.close()
 

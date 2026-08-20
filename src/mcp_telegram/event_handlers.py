@@ -94,6 +94,7 @@ from .sync_worker import (
     UPSERT_ENTITY_SQL,
 )
 from .telethon_dialog import classify_dialog_type
+from .unread_state import apply_unread_facts
 
 logger = logging.getLogger(__name__)
 
@@ -242,9 +243,9 @@ _SELECT_SYNCED_DIALOGS_SQL = "SELECT dialog_id FROM synced_dialogs WHERE status 
 _SELECT_SYNCED_ONLY_SQL = "SELECT dialog_id FROM synced_dialogs WHERE status = 'synced'"
 
 # ---------------------------------------------------------------------------
-# Phase 42 SQL — dialogs event writes (UPDATE-only; bootstrap is the sole
-# row creator. snapshot_at always bound to int(time.time()) — never NULL —
-# per inter-phase contract documented in dialog_sync.py:23-27.)
+# Phase 42 SQL — dialogs event writes. Body metadata remains UPDATE-only;
+# unread metadata uses the shared seam below, which may create a thin row with
+# snapshot_at=NULL and needs_refresh=1 without unhiding an existing row.
 # ---------------------------------------------------------------------------
 
 _UPDATE_DIALOG_PINNED_SQL = "UPDATE dialogs SET pinned=?, snapshot_at=? WHERE dialog_id=?"
@@ -1386,16 +1387,22 @@ class EventHandlerManager:
 
     def _update_dialog_unread_mark(self, update: UpdateDialogUnreadMark, now: int) -> None:
         dialog_id = self._dialog_id_from_peer(update.peer)
-        if dialog_id is None or dialog_id not in self._synced_dialog_ids:
+        if dialog_id is None:
             return
         with self._conn:
-            self._conn.execute(
-                _UPDATE_DIALOG_NEEDS_REFRESH_SQL,
-                (now, dialog_id),
+            rowcount = apply_unread_facts(
+                self._conn,
+                dialog_id,
+                unread_mark=getattr(update, "unread", None),
+                observed_at=now,
+                mark_needs_refresh=True,
+                create_missing=True,
             )
         logger.info(
-            "event_dialog_unread_mark dialog_id=%d needs_refresh=1",
+            "event_dialog_unread_mark dialog_id=%d unread=%s updated=%d",
             dialog_id,
+            getattr(update, "unread", None),
+            rowcount,
         )
 
     async def on_raw_dialog_pinned(self, update: object) -> None:
@@ -1408,8 +1415,8 @@ class EventHandlerManager:
             order=None → no actionable data, skip.
             order=[] → unpin everything via _CLEAR_ALL_PINS_SQL (NOT IN () is
             invalid SQLite).
-          - UpdateDialogUnreadMark: no dedicated column today; signal via
-            needs_refresh=1 so reconciliation re-fetches the dialog (Phase 43).
+          - UpdateDialogUnreadMark: persist Telegram's exact unread boolean,
+            including False, and retain the existing needs_refresh signal.
         """
         try:
             now = int(time.time())
@@ -1533,12 +1540,10 @@ class EventHandlerManager:
     async def on_raw_inbox_read(self, update: _InboxReadUpdateLike | _ChannelInboxReadUpdateLike) -> None:
         """Phase 42 EVENTS-02: UpdateReadHistoryInbox / UpdateReadChannelInbox.
 
-        Captures still_unread_count via structured log (the high-level
-        events.MessageRead wrapper drops this field). No dialogs.unread_count
-        column is added in this milestone — capture-via-log is the explicit
-        satisfaction strategy for EVENTS-02 (see plan revision_notes).
-
-        Gated on _synced_dialog_ids; observability-only — no dialogs UPDATE.
+        Captures still_unread_count via the raw update (the high-level
+        events.MessageRead wrapper drops this field) and stores the exact
+        Telegram fact, including zero. Metadata facts are intentionally not
+        gated on sync coverage; body-event gates remain unchanged.
         Updates synced_dialogs.last_event_at via the existing _UPDATE_LAST_EVENT_SQL
         so the last_event_at observability stays intact.
         """
@@ -1549,18 +1554,25 @@ class EventHandlerManager:
                 dialog_id = int(get_peer_id(PeerChannel(update.channel_id)))
             else:
                 return
-            if dialog_id not in self._synced_dialog_ids:
-                return
-            still_unread = int(update.still_unread_count or 0)
+            still_unread_raw = getattr(update, "still_unread_count", None)
+            still_unread = int(cast(int, still_unread_raw)) if still_unread_raw is not None else None
             max_id = int(update.max_id or 0)
             now = int(time.time())
             with self._conn:
+                rowcount = apply_unread_facts(
+                    self._conn,
+                    dialog_id,
+                    unread_count=still_unread,
+                    observed_at=now,
+                    create_missing=True,
+                )
                 self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
             logger.info(
-                "event_raw_inbox_read dialog_id=%d max_id=%d still_unread_count=%d",
+                "event_raw_inbox_read dialog_id=%d max_id=%d still_unread_count=%s updated=%d",
                 dialog_id,
                 max_id,
                 still_unread,
+                rowcount,
             )
         except Exception:
             logger.exception(

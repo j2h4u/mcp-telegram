@@ -64,6 +64,7 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "telegram_fact_queries.py",
             "telegram_fragments.py",
             "topics/sqlite_repository.py",
+            "unread_state.py",
         }
     ),
     "telethon": frozenset(
