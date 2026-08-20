@@ -5838,6 +5838,42 @@ async def test_list_unread_messages_uses_entity_name() -> None:
     assert messages[0]["sender_first_name"] == "Konstantin"
 
 
+@pytest.mark.asyncio
+async def test_list_unread_messages_preserves_media_only_content_and_filters_service() -> None:
+    """Unread rows retain media-only content while service rows stay excluded."""
+    conn = _make_db()
+    _seed_unread_state(conn, dialog_id=556, read_inbox_max_id=0, entity_type="User", entity_name="Media sender")
+    conn.executemany(
+        "INSERT INTO messages "
+        "(dialog_id, message_id, sent_at, text, sender_id, sender_first_name, media_description, out, is_service) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            (556, 10, 1_700_000_010, None, 123, "Media sender", "[photo]", 0, 0),
+            (556, 11, 1_700_000_011, None, 123, "Media sender", "[service photo]", 0, 1),
+        ],
+    )
+    conn.commit()
+
+    server = make_server(conn)
+    result = await server._dispatch(
+        {
+            "method": "get_inbox",
+            "scope": "personal",
+            "limit": 100,
+            "group_size_threshold": 100,
+        }
+    )
+
+    assert result["ok"] is True
+    groups = _response_groups(result)
+    assert len(groups) == 1
+    messages = _group_messages(groups[0])
+    assert [message["message_id"] for message in messages] == [10]
+    assert messages[0]["text"] is None
+    assert messages[0]["media_description"] == "[photo]"
+    assert messages[0]["content_kind"] == "media_description"
+
+
 # --- Task 1: SQL invariant tests (MANDATORY, no skip) ---
 
 
