@@ -449,16 +449,18 @@ class DaemonConnection:
         scope: str = "personal",
         limit: int = 100,
         group_size_threshold: int = 100,
+        since_utc: str | None = None,
     ) -> dict:
         """Return prioritized unread messages across dialogs."""
-        return await self.request(
-            {
-                "method": "get_inbox",
-                "scope": scope,
-                "limit": limit,
-                "group_size_threshold": group_size_threshold,
-            }
-        )
+        payload: dict[str, object] = {
+            "method": "get_inbox",
+            "scope": scope,
+            "limit": limit,
+            "group_size_threshold": group_size_threshold,
+        }
+        if since_utc is not None:
+            payload["since_utc"] = since_utc
+        return await self.request(payload)
 
     async def record_telemetry(self, *, event: dict) -> dict:
         """Write a telemetry event to sync.db."""

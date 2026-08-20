@@ -1395,15 +1395,21 @@ class DaemonAPIServer:
         "category", "unread_count", "unread_mentions_count",
         "messages": [{"message_id", "sent_at", "text", ...}]}]}.
         """
+        from .daemon_reading import _parse_request_boundary
+
         scope_obj = req.get("scope", "personal")
         scope = scope_obj if isinstance(scope_obj, str) else "personal"
         limit = _clamp(_coerce_int(req.get("limit", 100), 100), 1, 500)
         group_size_threshold = _coerce_int(req.get("group_size_threshold", 100), 100)
+        try:
+            since_utc = _parse_request_boundary(req, "since_utc")
+        except ValueError as exc:
+            return {"ok": False, "error": "invalid_input", "message": str(exc)}
 
-        unread_dialogs, unread_counts = await self._collect_unread_dialogs(scope, group_size_threshold)
+        unread_dialogs, unread_counts = await self._collect_unread_dialogs(scope, group_size_threshold, since_utc)
         self._rank_unread_entries(unread_dialogs)
         allocation = allocate_message_budget_proportional(unread_counts, limit)
-        groups = await self._fetch_unread_groups(unread_dialogs, allocation)
+        groups = await self._fetch_unread_groups(unread_dialogs, allocation, since_utc)
 
         pending_row = cast(tuple[object] | None, self._conn.execute(_COUNT_BOOTSTRAP_PENDING_SQL).fetchone())
         bootstrap_pending = int(cast(int | str, pending_row[0])) if pending_row else 0
@@ -1428,7 +1434,12 @@ class DaemonAPIServer:
             and participants_count > group_size_threshold
         )
 
-    async def _collect_unread_dialogs(self, scope: str, group_size_threshold: int) -> tuple[list[dict], dict[int, int]]:
+    async def _collect_unread_dialogs(
+        self,
+        scope: str,
+        group_size_threshold: int,
+        since_utc: int | None = None,
+    ) -> tuple[list[dict], dict[int, int]]:
         """Return unread dialog entries from sync.db. Zero Telegram API calls.
 
         Uses a single grouped query (_COLLECT_UNREAD_DIALOGS_WITH_COUNTS_SQL)
@@ -1438,7 +1449,7 @@ class DaemonAPIServer:
         """
         rows = cast(
             list[tuple[object, object, object, object, object, object, object]],
-            self._conn.execute(_COLLECT_UNREAD_DIALOGS_WITH_COUNTS_SQL).fetchall(),
+            self._conn.execute(_COLLECT_UNREAD_DIALOGS_WITH_COUNTS_SQL, {"since_utc": since_utc}).fetchall(),
         )
 
         unread_dialogs: list[dict] = []
@@ -1491,7 +1502,12 @@ class DaemonAPIServer:
         # date is last_event_at (int unix timestamp) after Plan 38-02 rewrite — not datetime
         entries.sort(key=lambda e: (e["tier"], -(e["date"] or 0)))
 
-    async def _fetch_unread_groups(self, entries: list[dict], allocation: dict[int, int]) -> list[dict]:
+    async def _fetch_unread_groups(
+        self,
+        entries: list[dict],
+        allocation: dict[int, int],
+        since_utc: int | None = None,
+    ) -> list[dict]:
         """Fetch unread message bodies from sync.db. Zero Telegram API calls."""
         groups: list[dict] = []
         for entry in entries:
@@ -1525,6 +1541,7 @@ class DaemonAPIServer:
                         "after_msg_id": entry["read_inbox_max_id"],
                         "limit": budget,
                         "self_id": self.self_id,
+                        "since_utc": since_utc,
                     },
                 ).fetchall(),
             )

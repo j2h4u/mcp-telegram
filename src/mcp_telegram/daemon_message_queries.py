@@ -148,6 +148,7 @@ _FETCH_UNREAD_MESSAGES_SQL = (
     f"{_SENDER_ENTITY_JOINS_SQL}"
     f"WHERE m.dialog_id = :dialog_id AND m.message_id > :after_msg_id AND m.is_deleted = 0 "
     f'AND m."out" = 0 AND m.is_service = 0 '
+    f"AND (:since_utc IS NULL OR m.sent_at >= :since_utc) "
     f"ORDER BY m.message_id ASC LIMIT :limit"
 )
 
