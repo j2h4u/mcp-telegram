@@ -223,7 +223,7 @@ layer = "application"
 depends_on = [
     { path = "mcp_telegram.activity_peer_resolve", deprecated = true }, "mcp_telegram.messages.sqlite_repository",
     "mcp_telegram.messages.telegram_adapter", "mcp_telegram.reactions.persistence", "mcp_telegram.reactions.projection",
-    "mcp_telegram.read_state", "mcp_telegram.resolver", "mcp_telegram.scheduled_messages",
+    "mcp_telegram.read_state", "mcp_telegram.realtime_history_policy", "mcp_telegram.resolver", "mcp_telegram.scheduled_messages",
     { path = "mcp_telegram.sync_worker", deprecated = true }, "mcp_telegram.telethon_dialog",
 ]
 
@@ -418,6 +418,11 @@ depends_on = []
 
 [[modules]]
 path = "mcp_telegram.message_contracts"
+layer = "foundation"
+depends_on = []
+
+[[modules]]
+path = "mcp_telegram.realtime_history_policy"
 layer = "foundation"
 depends_on = []
 

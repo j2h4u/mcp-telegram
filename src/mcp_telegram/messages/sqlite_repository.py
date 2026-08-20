@@ -33,6 +33,7 @@ _INSERT_FORWARD_SQL = _insert_sql("message_forwards", _message_contracts.Forward
 _DELETE_ENTITIES_SQL = "DELETE FROM message_entities WHERE dialog_id = ? AND message_id = ?"
 _DELETE_FORWARD_SQL = "DELETE FROM message_forwards WHERE dialog_id = ? AND message_id = ?"
 _SELECT_MESSAGE_TEXT_SQL = "SELECT text FROM messages WHERE dialog_id = ? AND message_id = ?"
+_SELECT_MESSAGE_OUT_SQL = "SELECT out FROM messages WHERE dialog_id = ? AND message_id = ?"
 _NEXT_VERSION_SQL = "SELECT COALESCE(MAX(version), 0) + 1 FROM message_versions WHERE dialog_id = ? AND message_id = ?"
 _INSERT_VERSION_SQL = (
     "INSERT INTO message_versions (dialog_id, message_id, version, old_text, edit_date) VALUES (?, ?, ?, ?, ?)"
@@ -54,6 +55,14 @@ class MessageTextLookup:
     text: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class MessageOutLookup:
+    """Result of reading the canonical outgoing marker for one message."""
+
+    found: bool
+    outgoing: bool
+
+
 def read_message_text(conn: sqlite3.Connection, dialog_id: int, message_id: int) -> MessageTextLookup:
     """Read one message text without opening or committing a transaction."""
     row = cast(
@@ -61,6 +70,12 @@ def read_message_text(conn: sqlite3.Connection, dialog_id: int, message_id: int)
         conn.execute(_SELECT_MESSAGE_TEXT_SQL, (dialog_id, message_id)).fetchone(),
     )
     return MessageTextLookup(found=row is not None, text=None if row is None else row[0])
+
+
+def read_message_out(conn: sqlite3.Connection, dialog_id: int, message_id: int) -> MessageOutLookup:
+    """Read the canonical outgoing marker without opening a transaction."""
+    row = cast(tuple[int] | None, conn.execute(_SELECT_MESSAGE_OUT_SQL, (dialog_id, message_id)).fetchone())
+    return MessageOutLookup(found=row is not None, outgoing=bool(row[0]) if row is not None else False)
 
 
 def persist_edited_message(
