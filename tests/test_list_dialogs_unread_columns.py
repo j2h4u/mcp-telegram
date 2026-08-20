@@ -137,6 +137,10 @@ def _make_db() -> Iterator[sqlite3.Connection]:
                 needs_refresh           INTEGER NOT NULL DEFAULT 0,
                 unread_mentions_count   INTEGER NOT NULL DEFAULT 0,
                 unread_reactions_count  INTEGER NOT NULL DEFAULT 0,
+                unread_count            INTEGER,
+                unread_mark             INTEGER,
+                unread_count_observed_at INTEGER,
+                unread_mark_observed_at INTEGER,
                 draft_text              TEXT
             )
             """
@@ -247,6 +251,18 @@ async def test_list_dialogs_dm_row_has_unread_in_and_unread_out() -> None:
         row = _dialog_rows(result)[0]
         assert row["unread_in"] == 2
         assert row["unread_out"] == 1
+
+
+async def test_list_dialogs_unread_count_is_nullable_telegram_fact() -> None:
+    with _make_db() as conn:
+        _insert_dialog(conn, 11, name="Peer11", type_="User")
+        conn.execute("UPDATE dialogs SET unread_count=7 WHERE dialog_id=11")
+        _insert_synced_dialog(conn, 11, read_inbox_max_id=100, read_outbox_max_id=100)
+        _insert_message(conn, 11, 101, out=0)
+        conn.commit()
+
+        row = _dialog_rows(await _make_server(conn, _TestClient())._list_dialogs({}))[0]
+        assert row["unread_count"] == 7
 
 
 async def test_list_dialogs_dm_row_unread_zero_when_caught_up() -> None:

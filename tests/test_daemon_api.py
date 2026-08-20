@@ -558,6 +558,10 @@ def _make_db_with_dialogs(*, with_fts: bool = False, with_entities: bool = False
             needs_refresh           INTEGER NOT NULL DEFAULT 0,
             unread_mentions_count   INTEGER NOT NULL DEFAULT 0,
             unread_reactions_count  INTEGER NOT NULL DEFAULT 0,
+            unread_count            INTEGER,
+            unread_mark             INTEGER,
+            unread_count_observed_at INTEGER,
+            unread_mark_observed_at INTEGER,
             draft_text              TEXT
         )
         """

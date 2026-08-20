@@ -222,9 +222,9 @@ path = "mcp_telegram.event_handlers"
 layer = "application"
 depends_on = [
     { path = "mcp_telegram.activity_peer_resolve", deprecated = true }, "mcp_telegram.messages.sqlite_repository",
-    "mcp_telegram.messages.telegram_adapter", "mcp_telegram.reactions.persistence", "mcp_telegram.reactions.projection",
+    "mcp_telegram.messages.telegram_adapter", "mcp_telegram.reactions.contracts", "mcp_telegram.reactions.persistence", "mcp_telegram.reactions.projection",
     "mcp_telegram.read_state", "mcp_telegram.realtime_history_policy", "mcp_telegram.resolver", "mcp_telegram.scheduled_messages",
-    { path = "mcp_telegram.sync_worker", deprecated = true }, "mcp_telegram.telethon_dialog",
+    { path = "mcp_telegram.sync_worker", deprecated = true }, "mcp_telegram.telethon_dialog", "mcp_telegram.unread_state",
 ]
 
 # capability — only established product ownership is vertical.
@@ -382,6 +382,11 @@ depends_on = []
 
 [[modules]]
 path = "mcp_telegram.read_state"
+layer = "persistence"
+depends_on = []
+
+[[modules]]
+path = "mcp_telegram.unread_state"
 layer = "persistence"
 depends_on = []
 

@@ -17,22 +17,14 @@ init, total-message backfill) write through their own paths, and SQLite WAL +
 busy_timeout=10000 (configured by _open_sync_db) handles cross-connection
 serialization safely. This isolation was added per Phase 41 review HIGH finding.
 
-Phase 42 inter-phase contract (CRITICAL)
-----------------------------------------
-The recency guard `WHERE dialogs.snapshot_at < excluded.snapshot_at` evaluates
-to NULL (false) when the existing row has snapshot_at = NULL — the UPDATE
-silently SKIPS those rows. Phase 42 event handlers MUST always write non-NULL
-snapshot_at on every insert/update path. The dialogs DDL declares snapshot_at
-as INTEGER NOT NULL, but downstream code must not bypass that with explicit
-NULL writes. See _UPSERT_DIALOG_SQL comment block.
-
 BOOTSTRAP requirements coverage
 -------------------------------
 - BOOTSTRAP-01: iter_dialogs() sweep populates `dialogs`.
 - BOOTSTRAP-03: FloodWait → interruptible sleep, no crash (D-13).
 - BOOTSTRAP-04: cursor checkpoint enables mid-sweep resume.
-- BOOTSTRAP-06: INSERT ... ON CONFLICT ... DO UPDATE ... WHERE ... < excluded.snapshot_at —
-  bootstrap never clobbers fresher event-handler writes (D-12).
+- BOOTSTRAP-06: INSERT ... ON CONFLICT ... DO UPDATE ... uses a NULL-aware
+  body snapshot guard and per-fact unread observation guards, so bootstrap
+  never clobbers fresher event-handler writes (D-12).
 """
 
 from __future__ import annotations
@@ -118,6 +110,8 @@ class _DialogLike(Protocol):
     read_outbox_max_id: int | None
     unread_mentions_count: int | None
     unread_reactions_count: int | None
+    unread_count: int | None
+    unread_mark: bool | None
     draft: _DraftLike | None
     date: datetime | None
 
@@ -157,42 +151,70 @@ _GET_STATE_SQL = "SELECT value FROM daemon_state WHERE key = ?"
 _SET_STATE_SQL = "INSERT OR REPLACE INTO daemon_state (key, value) VALUES (?, ?)"
 _DELETE_STATE_SQL = "DELETE FROM daemon_state WHERE key = ?"
 
-# D-12: UPSERT carries `WHERE dialogs.snapshot_at < excluded.snapshot_at` so
-# bootstrap data only overwrites rows where its `snapshot_at` is newer —
-# event-handler-written rows (Phase 42) with a fresher timestamp are never
-# clobbered. `hidden` and `needs_refresh` (D-11) are deliberately excluded
-# from the UPDATE clause.
-#
-# CRITICAL inter-phase contract for Phase 42:
-#   `dialogs.snapshot_at < excluded.snapshot_at` evaluates to NULL (false)
-#   when the existing row has snapshot_at = NULL — the UPDATE silently
-#   SKIPS those rows. Phase 42 event handlers MUST always write non-NULL
-#   snapshot_at on every insert/update. The DDL declares snapshot_at as
-#   INTEGER NOT NULL, but downstream code must not bypass that with
-#   explicit NULL writes.
+# D-12: bootstrap/reconciliation body fields only overwrite rows whose
+# snapshot is older (or unknown), while unread facts use their own observed
+# timestamps. This allows a raw event observed at t102 to survive a Dialog
+# snapshot captured at t101 that commits later. `hidden` and `needs_refresh`
+# remain deliberately excluded from the update clause.
 _UPSERT_DIALOG_SQL = """
 INSERT INTO dialogs (
     dialog_id, name, type, archived, pinned, members, created,
     last_message_at, snapshot_at, hidden, needs_refresh,
-    unread_mentions_count, unread_reactions_count, draft_text
+    unread_mentions_count, unread_reactions_count, draft_text,
+    unread_count, unread_mark, unread_count_observed_at, unread_mark_observed_at
 ) VALUES (
     :dialog_id, :name, :type, :archived, :pinned, :members, :created,
     :last_message_at, :snapshot_at, 0, 0,
-    :unread_mentions_count, :unread_reactions_count, :draft_text
+    :unread_mentions_count, :unread_reactions_count, :draft_text,
+    :unread_count, :unread_mark, :unread_count_observed_at, :unread_mark_observed_at
 )
 ON CONFLICT(dialog_id) DO UPDATE SET
-    name = excluded.name,
-    type = excluded.type,
-    archived = excluded.archived,
-    pinned = excluded.pinned,
-    members = excluded.members,
-    created = excluded.created,
-    last_message_at = excluded.last_message_at,
-    snapshot_at = excluded.snapshot_at,
-    unread_mentions_count = excluded.unread_mentions_count,
-    unread_reactions_count = excluded.unread_reactions_count,
-    draft_text = excluded.draft_text
-WHERE dialogs.snapshot_at < excluded.snapshot_at
+    name = CASE WHEN dialogs.snapshot_at IS NULL OR dialogs.snapshot_at < excluded.snapshot_at
+                THEN excluded.name ELSE dialogs.name END,
+    type = CASE WHEN dialogs.snapshot_at IS NULL OR dialogs.snapshot_at < excluded.snapshot_at
+                THEN excluded.type ELSE dialogs.type END,
+    archived = CASE WHEN dialogs.snapshot_at IS NULL OR dialogs.snapshot_at < excluded.snapshot_at
+                    THEN excluded.archived ELSE dialogs.archived END,
+    pinned = CASE WHEN dialogs.snapshot_at IS NULL OR dialogs.snapshot_at < excluded.snapshot_at
+                  THEN excluded.pinned ELSE dialogs.pinned END,
+    members = CASE WHEN dialogs.snapshot_at IS NULL OR dialogs.snapshot_at < excluded.snapshot_at
+                   THEN excluded.members ELSE dialogs.members END,
+    created = CASE WHEN dialogs.snapshot_at IS NULL OR dialogs.snapshot_at < excluded.snapshot_at
+                   THEN excluded.created ELSE dialogs.created END,
+    last_message_at = CASE WHEN dialogs.snapshot_at IS NULL OR dialogs.snapshot_at < excluded.snapshot_at
+                           THEN excluded.last_message_at ELSE dialogs.last_message_at END,
+    snapshot_at = CASE WHEN dialogs.snapshot_at IS NULL OR dialogs.snapshot_at < excluded.snapshot_at
+                       THEN excluded.snapshot_at ELSE dialogs.snapshot_at END,
+    unread_mentions_count = CASE WHEN dialogs.snapshot_at IS NULL OR dialogs.snapshot_at < excluded.snapshot_at
+                                 THEN excluded.unread_mentions_count ELSE dialogs.unread_mentions_count END,
+    unread_reactions_count = CASE WHEN dialogs.snapshot_at IS NULL OR dialogs.snapshot_at < excluded.snapshot_at
+                                  THEN excluded.unread_reactions_count ELSE dialogs.unread_reactions_count END,
+    draft_text = CASE WHEN dialogs.snapshot_at IS NULL OR dialogs.snapshot_at < excluded.snapshot_at
+                      THEN excluded.draft_text ELSE dialogs.draft_text END,
+    unread_count = CASE
+        WHEN excluded.unread_count IS NOT NULL
+         AND excluded.unread_count_observed_at IS NOT NULL
+         AND (dialogs.unread_count_observed_at IS NULL
+              OR excluded.unread_count_observed_at > dialogs.unread_count_observed_at)
+        THEN excluded.unread_count ELSE dialogs.unread_count END,
+    unread_count_observed_at = CASE
+        WHEN excluded.unread_count IS NOT NULL
+         AND excluded.unread_count_observed_at IS NOT NULL
+         AND (dialogs.unread_count_observed_at IS NULL
+              OR excluded.unread_count_observed_at > dialogs.unread_count_observed_at)
+        THEN excluded.unread_count_observed_at ELSE dialogs.unread_count_observed_at END,
+    unread_mark = CASE
+        WHEN excluded.unread_mark IS NOT NULL
+         AND excluded.unread_mark_observed_at IS NOT NULL
+         AND (dialogs.unread_mark_observed_at IS NULL
+              OR excluded.unread_mark_observed_at > dialogs.unread_mark_observed_at)
+        THEN excluded.unread_mark ELSE dialogs.unread_mark END,
+    unread_mark_observed_at = CASE
+        WHEN excluded.unread_mark IS NOT NULL
+         AND excluded.unread_mark_observed_at IS NOT NULL
+         AND (dialogs.unread_mark_observed_at IS NULL
+              OR excluded.unread_mark_observed_at > dialogs.unread_mark_observed_at)
+        THEN excluded.unread_mark_observed_at ELSE dialogs.unread_mark_observed_at END
 """
 
 # daemon_state keys (D-02, D-03)
@@ -204,6 +226,14 @@ _CURSOR_KEYS = (_KEY_OFFSET_DATE, _KEY_OFFSET_ID, _KEY_OFFSET_PEER)
 
 _STATUS_IN_PROGRESS = "in_progress"
 _STATUS_COMPLETE = "complete"
+
+# Honest state for the latest full dialog enumeration.  The count is the
+# number of Dialog wrappers observed, not a percentage or message estimate.
+_KEY_UNREAD_SWEEP_ATTEMPTED_AT = "dialog_unread_sweep_attempted_at"
+_KEY_UNREAD_SWEEP_COMPLETED_AT = "dialog_unread_sweep_completed_at"
+_KEY_UNREAD_SWEEP_STATUS = "dialog_unread_sweep_status"
+_KEY_UNREAD_SWEEP_OBSERVED_COUNT = "dialog_unread_sweep_observed_count"
+_KEY_UNREAD_SWEEP_LAST_VISIBLE_COUNT = "dialog_unread_sweep_last_visible_count"
 
 # Progress-reporting cadence (every Nth dialog updates startup_detail)
 _PROGRESS_REPORT_EVERY = 50
@@ -246,6 +276,35 @@ def _clear_cursor(conn: sqlite3.Connection) -> None:
     """Delete all cursor rows (used after a corrupt-state recovery)."""
     for k in _CURSOR_KEYS:
         conn.execute(_DELETE_STATE_SQL, (k,))
+
+
+def _begin_unread_sweep(conn: sqlite3.Connection, *, visible_count: int) -> None:
+    """Record an honest partial attempt before opening iter_dialogs()."""
+    prior = _get_state(conn, _KEY_UNREAD_SWEEP_LAST_VISIBLE_COUNT)
+    last_visible = int(prior) if prior is not None and prior.isdecimal() else visible_count
+    now = int(time.time())
+    _set_state(conn, _KEY_UNREAD_SWEEP_ATTEMPTED_AT, str(now))
+    _set_state(conn, _KEY_UNREAD_SWEEP_STATUS, "partial")
+    _set_state(conn, _KEY_UNREAD_SWEEP_OBSERVED_COUNT, "0")
+    _set_state(conn, _KEY_UNREAD_SWEEP_LAST_VISIBLE_COUNT, str(last_visible))
+
+
+def _finish_unread_sweep(
+    conn: sqlite3.Connection,
+    *,
+    status: str,
+    observed_count: int,
+    completed: bool,
+    visible_count: int | None = None,
+) -> None:
+    if status not in {"complete", "partial", "source_unavailable"}:
+        raise ValueError(f"invalid unread sweep status: {status!r}")
+    _set_state(conn, _KEY_UNREAD_SWEEP_STATUS, status)
+    _set_state(conn, _KEY_UNREAD_SWEEP_OBSERVED_COUNT, str(observed_count))
+    if completed:
+        _set_state(conn, _KEY_UNREAD_SWEEP_COMPLETED_AT, str(int(time.time())))
+        if visible_count is not None:
+            _set_state(conn, _KEY_UNREAD_SWEEP_LAST_VISIBLE_COUNT, str(visible_count))
 
 
 # ---------------------------------------------------------------------------
@@ -342,6 +401,23 @@ def _extract_name(entity: _EntityLike) -> str | None:
     return name or None
 
 
+def _extract_unread_facts(dialog: _DialogLike, snapshot_at: int) -> dict[str, object]:
+    """Extract Telegram unread facts and their snapshot observation times."""
+    unread_count_raw = getattr(dialog, "unread_count", None)
+    unread_count = int(unread_count_raw) if isinstance(unread_count_raw, int) else None
+    raw_dialog: object | None = getattr(dialog, "dialog", None)
+    unread_mark_raw = getattr(raw_dialog, "unread_mark", None) if raw_dialog is not None else None
+    if not isinstance(unread_mark_raw, bool):
+        direct_mark = getattr(dialog, "unread_mark", None)
+        unread_mark_raw = direct_mark if isinstance(direct_mark, bool) else None
+    return {
+        "unread_count": unread_count,
+        "unread_mark": unread_mark_raw,
+        "unread_count_observed_at": snapshot_at if unread_count is not None else None,
+        "unread_mark_observed_at": snapshot_at if unread_mark_raw is not None else None,
+    }
+
+
 def _extract_dialog_row(dialog: _DialogLike, snapshot_at: int) -> _BootstrapRow:
     """Build the dict bound to _UPSERT_DIALOG_SQL for one Dialog object.
 
@@ -370,6 +446,11 @@ def _extract_dialog_row(dialog: _DialogLike, snapshot_at: int) -> _BootstrapRow:
     unread_mentions = int(dialog.unread_mentions_count or 0)
     unread_reactions = int(dialog.unread_reactions_count or 0)
 
+    # Telegram's unread_count is authoritative and nullable.  ``iter_dialogs``
+    # returns a custom wrapper with this field directly; raw TL Dialogs expose
+    # unread_mark only on the nested ``dialog`` object.
+    unread_facts = _extract_unread_facts(dialog, snapshot_at)
+
     # D-10: draft_text = best available draft text truncated to 80 chars.
     draft_text = _extract_draft_text(dialog.draft)  # DIFF-03
 
@@ -386,6 +467,7 @@ def _extract_dialog_row(dialog: _DialogLike, snapshot_at: int) -> _BootstrapRow:
         "snapshot_at": snapshot_at,
         "unread_mentions_count": unread_mentions,
         "unread_reactions_count": unread_reactions,
+        **unread_facts,
         "draft_text": draft_text,
     }
 
@@ -758,31 +840,21 @@ class DialogReconciliationWorker:
         logger.info("recon_light_pass_complete count=%d", count)
         return count
 
-    async def run_full_pass(self) -> tuple[int, bool]:
-        """RECON-03: full iter_dialogs() sweep with soft-delete of missing rows.
-
-        Returns (count, completed) where count is the number of dialogs UPSERTed
-        and completed is True only when the sweep finished normally (soft-delete
-        phase ran). Dialogs visible before the sweep but not returned by
-        iter_dialogs() get hidden=1 when completed=True.
-
-        FloodWait behavior: iter_dialogs is a generator — it cannot be
-        resumed mid-stream. On FloodWaitError we sleep (interruptible by
-        shutdown_event) and return (count, False). Soft-deletes are NOT
-        applied (we cannot tell which dialogs are truly missing vs simply
-        not yet streamed). The caller (run_reconciliation_loop) only advances
-        last_full_pass when completed=True, so the next hourly tick retries
-        the full pass instead of waiting a full day.
-        """
-        pre_pass_ids = {
-            row[0] for row in cast(list[tuple[int]], self._conn.execute(_SELECT_VISIBLE_DIALOG_IDS_SQL).fetchall())
-        }
+    async def _enumerate_full_pass(self) -> tuple[set[int], int, bool]:
+        """Enumerate dialogs and persist interrupted sweep state."""
         seen_ids: set[int] = set()
         count = 0
         try:
             async for dialog in self._client.iter_dialogs():
                 if self._shutdown_event.is_set():
-                    return count, False
+                    with self._conn:
+                        _finish_unread_sweep(
+                            self._conn,
+                            status="partial",
+                            observed_count=count,
+                            completed=False,
+                        )
+                    return seen_ids, count, False
                 snapshot_at = int(time.time())  # fresh per dialog — avoids stale recency guard
                 row = _extract_dialog_row(dialog, snapshot_at)
                 with self._conn:
@@ -805,7 +877,66 @@ class DialogReconciliationWorker:
                 count,
             )
             await sleep_through_flood(self._shutdown_event, wait_s)
-            return count, False  # cannot resume mid-stream; next cycle retries
+            with self._conn:
+                _finish_unread_sweep(
+                    self._conn,
+                    status="partial",
+                    observed_count=count,
+                    completed=False,
+                )
+            return seen_ids, count, False
+        except ACCESS_LOST_ERRORS as exc:
+            status = "source_unavailable" if count == 0 else "partial"
+            logger.warning(
+                "recon_full_%s error=%s processed=%d",
+                status,
+                type(exc).__name__,
+                count,
+            )
+            with self._conn:
+                _finish_unread_sweep(
+                    self._conn,
+                    status=status,
+                    observed_count=count,
+                    completed=False,
+                )
+            return seen_ids, count, False
+        except Exception:
+            with self._conn:
+                _finish_unread_sweep(
+                    self._conn,
+                    status="partial",
+                    observed_count=count,
+                    completed=False,
+                )
+            logger.exception("recon_full_pass_unexpected_error processed=%d", count)
+            raise
+        return seen_ids, count, True
+
+    async def run_full_pass(self) -> tuple[int, bool]:
+        """RECON-03: full iter_dialogs() sweep with soft-delete of missing rows.
+
+        Returns (count, completed) where count is the number of dialogs UPSERTed
+        and completed is True only when the sweep finished normally (soft-delete
+        phase ran). Dialogs visible before the sweep but not returned by
+        iter_dialogs() get hidden=1 when completed=True.
+
+        FloodWait behavior: iter_dialogs is a generator — it cannot be
+        resumed mid-stream. On FloodWaitError we sleep (interruptible by
+        shutdown_event) and return (count, False). Soft-deletes are NOT
+        applied (we cannot tell which dialogs are truly missing vs simply
+        not yet streamed). The caller (run_reconciliation_loop) only advances
+        last_full_pass when completed=True, so the next hourly tick retries
+        the full pass instead of waiting a full day.
+        """
+        pre_pass_ids = {
+            row[0] for row in cast(list[tuple[int]], self._conn.execute(_SELECT_VISIBLE_DIALOG_IDS_SQL).fetchall())
+        }
+        with self._conn:
+            _begin_unread_sweep(self._conn, visible_count=len(pre_pass_ids))
+        seen_ids, count, completed = await self._enumerate_full_pass()
+        if not completed:
+            return count, False
 
         # Soft-delete dialogs visible pre-pass but not returned by iter_dialogs.
         now = int(time.time())
@@ -813,6 +944,14 @@ class DialogReconciliationWorker:
         for dialog_id in missing:
             with self._conn:
                 self._conn.execute(_HIDE_DIALOG_SQL, (now, dialog_id))
+        with self._conn:
+            _finish_unread_sweep(
+                self._conn,
+                status="complete",
+                observed_count=count,
+                completed=True,
+                visible_count=len(seen_ids),
+            )
         logger.info(
             "recon_full_pass_complete count=%d hidden=%d",
             count,

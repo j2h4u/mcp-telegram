@@ -1169,7 +1169,9 @@ class DaemonReadingService:
             "type": row["type"],
             "last_message_at": row["last_message_at"],
             "archived": bool(row["archived"]),
-            "unread_count": 0,
+            # Telegram-authoritative dialog fact. NULL means this snapshot has
+            # not observed a count; never infer it from local message rows.
+            "unread_count": _object_to_int_or_none(row["unread_count"]),
             "members": row["members"],
             "created": row["created"],
             "sync_status": row["sync_status"] if row["sync_status"] is not None else "not_synced",

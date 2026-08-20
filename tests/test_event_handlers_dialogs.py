@@ -2,11 +2,11 @@
 
 Covers EVENTS-01 (pin handlers), EVENTS-02 (inbox-read logging), EVENTS-03
 (dirty-flag), EVENTS-04 (last_message_at writeback), registration symmetry,
-and the UPDATE-only contract (no INSERT into dialogs).
+and the UPDATE-only contract for non-unread metadata handlers.
 
-All handlers gate on _synced_dialog_ids membership before writing — same
-invariant as the five existing handlers (event_handlers.py:214, 249, 337,
-376, 441, 502).
+Body handlers retain their coverage gates. Raw unread metadata handlers are
+intentionally independent of sync enrollment because Telegram's update is
+authoritative for the dialog snapshot.
 """
 
 # pyright: reportAny=false, reportArgumentType=false, reportOptionalSubscript=false, reportOperatorIssue=false, reportUndefinedVariable=false, reportMissingParameterType=false, reportReturnType=false, reportInvalidTypeForm=false, reportGeneralTypeIssues=false
@@ -384,15 +384,38 @@ async def test_update_dialog_unread_mark_sets_needs_refresh(
 
     row = _dialog_row(sync_db, dialog_id)
     assert row["needs_refresh"] == 1
+    assert sync_db.execute("SELECT unread_mark FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (1,)
+
+
+@pytest.mark.asyncio
+async def test_update_dialog_unread_mark_false_is_exact_and_does_not_unhide(
+    mock_client: MagicMock,
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    user_id = 54321
+    dialog_id = get_peer_id(PeerUser(user_id=user_id))
+    _enroll_synced(sync_db, dialog_id)
+    _insert_dialog(sync_db, dialog_id, needs_refresh=0, snapshot_at=1)
+    sync_db.execute("UPDATE dialogs SET hidden=1, unread_mark=1 WHERE dialog_id=?", (dialog_id,))
+    sync_db.commit()
+
+    upd = UpdateDialogUnreadMark(
+        peer=DialogPeer(peer=PeerUser(user_id=user_id)),
+        unread=False,
+    )
+    mgr = _make_manager(mock_client, sync_db, shutdown_event)
+    await mgr.on_raw_dialog_pinned(upd)
+
+    row = sync_db.execute(
+        "SELECT hidden, unread_mark, unread_mark_observed_at FROM dialogs WHERE dialog_id=?", (dialog_id,)
+    ).fetchone()
+    assert row[0:2] == (1, 0)
+    assert row[2] is not None
 
 
 # ---------------------------------------------------------------------------
-# EVENTS-02: still_unread_count captured via structured log
-#
-# Satisfaction strategy: capture-via-log only. No dialogs.unread_count column
-# added in this milestone. The requirement is that the field is not silently
-# dropped — structured logging at the daemon's observability boundary satisfies
-# this.
+# EVENTS-02: still_unread_count persisted as an exact Telegram fact
 # ---------------------------------------------------------------------------
 
 
@@ -423,6 +446,13 @@ async def test_update_read_history_inbox_logs_still_unread_count(
         await mgr.on_raw_inbox_read(cast(_InboxReadUpdateLike, upd))
 
     assert any("still_unread_count=7" in r.message for r in caplog.records)
+    row = cast(
+        tuple[int, int],
+        sync_db.execute(
+            "SELECT unread_count, unread_count_observed_at FROM dialogs WHERE dialog_id=?", (dialog_id,)
+        ).fetchone(),
+    )
+    assert row[0] == 7 and row[1] is not None
     # last_event_at should be advanced
     assert _last_event_at(sync_db, dialog_id) is not None
 
@@ -461,13 +491,13 @@ async def test_update_read_channel_inbox_extracts_dialog_id_via_peer_channel(
 
 
 @pytest.mark.asyncio
-async def test_update_read_history_inbox_skips_unenrolled_dialog(
+async def test_update_read_history_inbox_persists_unenrolled_dialog(
     mock_client: MagicMock,
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """EVENTS-02: unenrolled dialog — handler returns early, no log line emitted."""
+    """Raw unread facts persist even when the dialog is not sync-enrolled."""
     dialog_id = get_peer_id(PeerChannel(channel_id=88888))
     # NOT enrolled
 
@@ -484,7 +514,12 @@ async def test_update_read_history_inbox_skips_unenrolled_dialog(
     with caplog.at_level(logging.INFO, logger="mcp_telegram.event_handlers"):
         await mgr.on_raw_inbox_read(cast(_InboxReadUpdateLike, upd))
 
-    assert not any("still_unread_count" in r.message for r in caplog.records)
+    assert any("still_unread_count=0" in r.message for r in caplog.records)
+    row = cast(
+        tuple[int, int],
+        sync_db.execute("SELECT unread_count, needs_refresh FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone(),
+    )
+    assert row == (0, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -722,17 +757,17 @@ def test_unregister_detaches_all_new_handlers(
 
 
 @pytest.mark.asyncio
-async def test_no_handler_inserts_into_dialogs_table(
+async def test_non_unread_handlers_do_not_insert_into_dialogs_table(
     mock_client: MagicMock,
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
-    """Across all dialog-handler calls for non-bootstrapped dialog_ids, count never increases.
+    """Non-unread handlers remain UPDATE-only; raw unread metadata may create a thin row.
 
     This test covers:
     - UpdateDialogPinned on missing rows (unenrolled)
     - UpdateChannel on missing rows (unenrolled)
-    - UpdateReadHistoryInbox on missing rows (unenrolled)
+    - UpdateReadHistoryInbox on missing rows (unenrolled, thin-row creation)
     - on_new_message on missing dialogs row (enrolled in synced_dialogs only)
     """
     assert _dialogs_count(sync_db) == 0
@@ -765,7 +800,10 @@ async def test_no_handler_inserts_into_dialogs_table(
         folder_id=None,
     )
     await mgr.on_raw_inbox_read(cast(_InboxReadUpdateLike, upd_read))
-    assert _dialogs_count(sync_db) == 0
+    assert _dialogs_count(sync_db) == 1
+    assert sync_db.execute(
+        "SELECT hidden, needs_refresh, snapshot_at, unread_count FROM dialogs WHERE dialog_id=?", (dialog_id,)
+    ).fetchone() == (0, 1, None, 0)
 
     # Test 4: on_new_message — enrolled in synced_dialogs but NO dialogs row
     _enroll_synced(sync_db, dialog_id)
@@ -784,4 +822,4 @@ async def test_no_handler_inserts_into_dialogs_table(
     ):
         await mgr.on_new_message(event)
 
-    assert _dialogs_count(sync_db) == 0  # bootstrap is the sole dialogs-row creator
+    assert _dialogs_count(sync_db) == 1  # raw metadata may create a thin row
