@@ -20,6 +20,7 @@ from typing import Protocol, cast
 from telethon.errors import FloodWaitError, RPCError  # type: ignore[import-untyped]
 from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
+from .access_lifecycle import set_access_lost
 from .activity_peer_resolve import resolve_linked_chat_id
 from .activity_sync import _ActivityClient
 from .daemon_log_context import dialog_log_context
@@ -32,7 +33,6 @@ from .own_only import (
     enroll_own_only_dialog,
     query_own_only_candidates,
 )
-from .sync_db import set_access_lost
 from .telegram_access import ACCESS_LOST_ERRORS
 from .telegram_gateway import ScheduledHistoryClient, fetch_scheduled_history_snapshot
 

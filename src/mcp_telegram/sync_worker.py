@@ -28,11 +28,11 @@ from typing import Protocol, cast
 from telethon.errors import FloodWaitError, RPCError  # type: ignore[import-untyped]
 from telethon.tl import types  # type: ignore[import-untyped]
 
+from .access_lifecycle import set_access_lost
 from .flood import flood_seconds, sleep_through_flood
 from .messages.sqlite_repository import insert_messages_with_fts
 from .messages.telegram_adapter import PeerNameClient, extract_message_row, resolve_forward_entity_name_map
 from .resolver import latinize
-from .sync_db import set_access_lost
 from .telegram_access import ACCESS_LOST_ERRORS
 from .telethon_dialog import classify_dialog_type
 

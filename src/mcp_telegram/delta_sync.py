@@ -25,11 +25,16 @@ from telethon.errors import (
     RPCError,  # type: ignore[import-untyped]
 )
 
+from .access_lifecycle import (
+    due_access_revalidations,
+    restore_access_after_revalidation,
+    set_access_lost,
+    stamp_access_revalidation,
+)
 from .flood import flood_seconds, sleep_through_flood
 from .message_contracts import ExtractedMessage
 from .messages.sqlite_repository import insert_messages_with_fts
 from .messages.telegram_adapter import extract_message_row
-from .sync_db import restore_access_after_revalidation, set_access_lost
 from .telegram_access import ACCESS_LOST_ERRORS
 
 logger = logging.getLogger(__name__)
@@ -111,19 +116,6 @@ _UPDATE_DELTA_CHECKED_SQL = (
     "UPDATE synced_dialogs SET last_delta_checked_at = ?, delta_refresh_requested_at = NULL WHERE dialog_id = ?"
 )
 
-_SELECT_DUE_ACCESS_LOST_SQL = """
-SELECT dialog_id
-FROM synced_dialogs
-WHERE status = 'access_lost'
-  AND COALESCE(access_next_revalidate_at, COALESCE(access_lost_at, 0) + ?) <= ?
-ORDER BY COALESCE(access_next_revalidate_at, COALESCE(access_lost_at, 0) + ?), dialog_id
-LIMIT ?
-"""
-
-_UPDATE_ACCESS_REVALIDATION_SQL = (
-    "UPDATE synced_dialogs SET access_last_revalidated_at = ?, access_next_revalidate_at = ? WHERE dialog_id = ?"
-)
-
 
 class AccessProbeLoopOptions(TypedDict, total=False):
     initial_delay: float
@@ -133,6 +125,18 @@ class _DeltaSyncClient(Protocol):
     def iter_messages(self, **_kwargs: object) -> AsyncIterator[object]: ...
 
     async def get_messages(self, **_kwargs: object) -> object: ...
+
+
+def _access_probe_rows(conn: sqlite3.Connection, policy: AccessProbePolicy, now: int) -> list[tuple[int]]:
+    return [
+        (dialog_id,)
+        for dialog_id in due_access_revalidations(
+            conn,
+            now=now,
+            cooldown_seconds=policy.cooldown_seconds,
+            limit=policy.max_dialogs_per_cycle,
+        )
+    ]
 
 
 def _row_first_int(row: tuple[object | None, ...] | None) -> int:
@@ -463,13 +467,7 @@ async def _probe_access_lost_dialogs(
     If gap-fill fails, status stays access_lost (safe rollback).
     """
     now = int(time.time())
-    rows = cast(
-        list[tuple[int]],
-        conn.execute(
-            _SELECT_DUE_ACCESS_LOST_SQL,
-            (policy.cooldown_seconds, now, policy.cooldown_seconds, policy.max_dialogs_per_cycle),
-        ).fetchall(),
-    )
+    rows = _access_probe_rows(conn, policy, now)
 
     restored = 0
     checked = 0
@@ -497,11 +495,11 @@ async def _probe_access_lost_dialogs(
         except ACCESS_LOST_ERRORS:
             logger.debug("access_still_lost dialog_id=%d", dialog_id)
             still_lost += 1
-            _stamp_access_revalidation(conn, dialog_id, int(time.time()), policy.cooldown_seconds)
+            stamp_access_revalidation(conn, dialog_id, int(time.time()), policy.cooldown_seconds)
         except FloodWaitError as exc:
             logger.warning("probe_flood_wait dialog_id=%d seconds=%d", dialog_id, exc.seconds)
             flood_wait_hit = True
-            _stamp_access_revalidation(
+            stamp_access_revalidation(
                 conn,
                 dialog_id,
                 int(time.time()),
@@ -512,11 +510,11 @@ async def _probe_access_lost_dialogs(
         except RPCError as exc:
             logger.warning("probe_rpc_error dialog_id=%d error=%s", dialog_id, exc)
             errors += 1
-            _stamp_access_revalidation(conn, dialog_id, int(time.time()), policy.cooldown_seconds)
+            stamp_access_revalidation(conn, dialog_id, int(time.time()), policy.cooldown_seconds)
         except (TimeoutError, OSError) as exc:
             logger.warning("probe_network_error dialog_id=%d error=%s", dialog_id, exc)
             errors += 1
-            _stamp_access_revalidation(conn, dialog_id, int(time.time()), policy.cooldown_seconds)
+            stamp_access_revalidation(conn, dialog_id, int(time.time()), policy.cooldown_seconds)
 
         if policy.probe_pause_seconds > 0 and not shutdown_event.is_set():
             try:
@@ -535,13 +533,6 @@ async def _probe_access_lost_dialogs(
         flood_wait_hit,
     )
     return restored
-
-
-def _stamp_access_revalidation(
-    conn: sqlite3.Connection, dialog_id: int, checked_at: int, cooldown_seconds: int
-) -> None:
-    with conn:
-        conn.execute(_UPDATE_ACCESS_REVALIDATION_SQL, (checked_at, checked_at + cooldown_seconds, dialog_id))
 
 
 async def run_access_probe_loop(

@@ -29,12 +29,12 @@ from typing import Protocol, cast
 
 from telethon.tl.types import TypeInputPeer
 
+from .access_lifecycle import set_access_lost
 from .activity_peer_resolve import LinkedChatResolution, resolve_input_peer, resolve_linked_chat_id
 from .activity_sync import INSERT_OWN_ONLY_DIALOG_SQL, _ActivityClient, call_with_timeout, extract_dialog_id
 from .message_contracts import ExtractedMessage
 from .messages.sqlite_repository import insert_messages_with_fts
 from .messages.telegram_adapter import extract_message_row
-from .sync_db import set_access_lost
 from .telegram_access import ACCESS_LOST_ERRORS
 
 logger = logging.getLogger(__name__)

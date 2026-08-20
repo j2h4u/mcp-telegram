@@ -51,9 +51,10 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
     InputPeerUser,
 )
 
+from .access_lifecycle import set_access_lost
 from .flood import flood_seconds, sleep_through_flood
 from .read_state import apply_read_cursor
-from .sync_db import _open_sync_db, set_access_lost
+from .sync_db import _open_sync_db
 from .telegram_access import ACCESS_LOST_ERRORS
 from .topics.contracts import TopicSourceUnavailableError, is_topic_capable
 from .topics.refresh import TopicRefresher
@@ -242,9 +243,6 @@ _PROGRESS_REPORT_EVERY = 50
 # Access-loss handling (RECON-04). Telegram error classification lives in
 # telegram_access; local atomic status transition lives in sync_db.
 # ---------------------------------------------------------------------------
-
-_set_access_lost = set_access_lost
-
 
 # ---------------------------------------------------------------------------
 # Reconciliation SQL (Phase 43)
@@ -713,8 +711,8 @@ class DialogReconciliationWorker:
       daemon's MAIN `conn` directly because:
         (1) Each UPSERT in run_full_pass uses its own `with self._conn:`
             block — no transaction spans an await.
-        (2) The RECON-04 helper `_set_access_lost` already operates on the
-            same main `conn` from sync_worker.py and delta_sync.py — keeping
+        (2) The access_lifecycle operation already operates on the same main
+        `conn` from sync_worker.py and delta_sync.py — keeping
             reconciliation on that connection avoids cross-connection
             coordination for the atomic synced_dialogs+dialogs transition.
         (3) The light pass writes are short-lived and low-volume (a few
