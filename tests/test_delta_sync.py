@@ -10,6 +10,7 @@ Covers DAEMON-12 (forward gap-fill on reconnect) behaviors:
 - Iterates all 'synced' dialogs; skips 'syncing'
 - Respects shutdown_event
 """
+# pyright: reportArgumentType=false
 
 from __future__ import annotations
 
@@ -32,7 +33,9 @@ from mcp_telegram.delta_sync import (
     _log_probe_budget_exhausted,
     run_delta_catch_up_loop,
 )
+from mcp_telegram.history_enrollment import disable_history
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
+from tests.history_enrollment_helpers import seed_full_history_enrollment
 
 
 class _SQLiteCursor(Protocol):
@@ -121,6 +124,74 @@ def make_worker(
     )
 
 
+@pytest.mark.asyncio
+async def test_delta_disable_race_discards_fetched_body_and_checkpoint(tmp_path: Path) -> None:
+    db_path = tmp_path / "race.db"
+    ensure_sync_schema(db_path)
+    first = cast(sqlite3.Connection, _open_sync_db(db_path))
+    second = cast(sqlite3.Connection, _open_sync_db(db_path))
+    first.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (78, 'synced')")
+    first.execute("INSERT INTO messages(dialog_id, message_id, sent_at) VALUES (78, 1, 1)")
+    first.execute("INSERT INTO full_history_enrollment VALUES (78, 1, 'explicit', 1)")
+    first.commit()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fetch(**_kwargs: object):
+        entered.set()
+        await release.wait()
+        yield build_mock_message(id=2, text="stale")
+
+    client = _MockClient()
+    client.iter_messages = fetch
+    worker = make_worker(client, first, asyncio.Event())
+    task = asyncio.create_task(worker.fetch_delta_for_dialog(78))
+    await entered.wait()
+    disable_history(second, 78, now=2)
+    second.commit()
+    release.set()
+    assert await task == 0
+    assert first.execute("SELECT COUNT(*) FROM messages WHERE dialog_id=78").fetchone() == (1,)
+    assert first.execute("SELECT status FROM synced_dialogs WHERE dialog_id=78").fetchone() == ("synced",)
+    first.close()
+    second.close()
+
+
+@pytest.mark.asyncio
+async def test_delta_stale_access_error_after_disable_does_not_mark_lost(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "access-race.db"
+    ensure_sync_schema(db_path)
+    first = cast(sqlite3.Connection, _open_sync_db(db_path))
+    second = cast(sqlite3.Connection, _open_sync_db(db_path))
+    first.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (80, 'synced')")
+    first.execute("INSERT INTO messages(dialog_id, message_id, sent_at) VALUES (80, 1, 1)")
+    first.execute("INSERT INTO full_history_enrollment VALUES (80, 1, 'explicit', 1)")
+    first.commit()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fail(**_kwargs: object):
+        entered.set()
+        await release.wait()
+        raise RuntimeError("stale access error")
+        yield
+
+    monkeypatch.setattr("mcp_telegram.delta_sync.ACCESS_LOST_ERRORS", (RuntimeError,))
+    client = _MockClient()
+    client.iter_messages = fail
+    task = asyncio.create_task(make_worker(client, first, asyncio.Event()).fetch_delta_for_dialog(80))
+    await entered.wait()
+    disable_history(second, 80, now=2)
+    second.commit()
+    release.set()
+    assert await task == 0
+    assert first.execute("SELECT status FROM synced_dialogs WHERE dialog_id=80").fetchone() == ("synced",)
+    first.close()
+    second.close()
+
+
 # ---------------------------------------------------------------------------
 # DAEMON-12: Forward gap-fill
 # ---------------------------------------------------------------------------
@@ -140,6 +211,7 @@ async def test_delta_fills_gap(
         "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')",
         (dialog_id,),
     )
+    seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
     sync_db.execute(
         "INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (?, 100, 1704067200)",
         (dialog_id,),
@@ -184,6 +256,7 @@ async def test_delta_no_gap_returns_zero(
         "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')",
         (dialog_id,),
     )
+    seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
     sync_db.execute(
         "INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (?, 50, 1704067200)",
         (dialog_id,),
@@ -222,6 +295,7 @@ async def test_delta_no_baseline_skips(
         "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')",
         (dialog_id,),
     )
+    seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
     sync_db.commit()
 
     # iter_messages should NOT be called for a dialog with no baseline
@@ -255,6 +329,7 @@ async def test_delta_no_baseline_clears_refresh_without_faking_history_sync(
         "VALUES (?, 'synced', NULL, 1000)",
         (dialog_id,),
     )
+    seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
     sync_db.commit()
 
     calls: list[object] = []
@@ -297,6 +372,7 @@ async def test_delta_uses_min_id_and_reverse(
         "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')",
         (dialog_id,),
     )
+    seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
     sync_db.execute(
         "INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (?, 200, 1704067200)",
         (dialog_id,),
@@ -334,6 +410,7 @@ async def test_delta_floodwait_handled(
         "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')",
         (dialog_id,),
     )
+    seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
     sync_db.execute(
         "INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (?, 10, 1704067200)",
         (dialog_id,),
@@ -381,6 +458,7 @@ async def test_delta_access_lost_handled(
         "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')",
         (dialog_id,),
     )
+    seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
     sync_db.execute(
         "INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (?, 10, 1704067200)",
         (dialog_id,),
@@ -428,6 +506,7 @@ async def test_delta_iterates_all_synced_dialogs(
             "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')",
             (dialog_id,),
         )
+        seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
         sync_db.execute(
             "INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (?, 50, 1704067200)",
             (dialog_id,),
@@ -460,6 +539,7 @@ async def test_delta_skips_syncing_dialogs(
     sync_db.execute(
         "INSERT INTO synced_dialogs (dialog_id, status) VALUES (3001, 'synced')",
     )
+    seed_full_history_enrollment(sync_db, 3001, enabled=True)
     sync_db.execute(
         "INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (3001, 10, 1704067200)",
     )
@@ -467,6 +547,7 @@ async def test_delta_skips_syncing_dialogs(
     sync_db.execute(
         "INSERT INTO synced_dialogs (dialog_id, status) VALUES (3002, 'syncing')",
     )
+    seed_full_history_enrollment(sync_db, 3002, enabled=True)
     sync_db.execute(
         "INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (3002, 20, 1704067200)",
     )
@@ -504,6 +585,7 @@ async def test_delta_respects_shutdown(
             "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')",
             (dialog_id,),
         )
+        seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
         sync_db.execute(
             "INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (?, 10, 1704067200)",
             (dialog_id,),
@@ -548,6 +630,7 @@ async def test_delta_catch_up_populates_fts(
         "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')",
         (dialog_id,),
     )
+    seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
     sync_db.execute(
         "INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (?, 100, 1704067200)",
         (dialog_id,),
@@ -599,6 +682,11 @@ async def test_probe_restores_access_after_gap_fill(
     dialog_id = 9001
     sync_db.execute(
         "INSERT INTO synced_dialogs (dialog_id, status, access_lost_at) VALUES (?, 'access_lost', 1000)",
+        (dialog_id,),
+    )
+    seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
+    sync_db.execute(
+        "UPDATE full_history_enrollment SET enabled = 1, source = 'explicit', updated_at = 1 WHERE dialog_id = ?",
         (dialog_id,),
     )
     sync_db.execute(
@@ -681,6 +769,11 @@ async def test_probe_gap_fill_failure_keeps_access_lost(
         "INSERT INTO synced_dialogs (dialog_id, status, access_lost_at) VALUES (?, 'access_lost', 1000)",
         (dialog_id,),
     )
+    seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
+    sync_db.execute(
+        "UPDATE full_history_enrollment SET enabled = 1, source = 'explicit', updated_at = 1 WHERE dialog_id = ?",
+        (dialog_id,),
+    )
     sync_db.execute(
         "INSERT INTO messages (dialog_id, message_id, sent_at, text) VALUES (?, 100, 1000, 'old')",
         (dialog_id,),
@@ -745,6 +838,7 @@ async def test_probe_still_lost_stamps_next_revalidation(
         "INSERT INTO synced_dialogs (dialog_id, status, access_lost_at) VALUES (?, 'access_lost', 1000)",
         (dialog_id,),
     )
+    seed_full_history_enrollment(sync_db, dialog_id, enabled=False)
     sync_db.commit()
 
     mock_client.get_messages = AsyncMock(side_effect=ChannelPrivateError(request=None))
@@ -791,6 +885,11 @@ async def test_probe_restores_access_creates_missing_dialog_row(
     dialog_id = 9011
     sync_db.execute(
         "INSERT INTO synced_dialogs (dialog_id, status, access_lost_at) VALUES (?, 'access_lost', 1000)",
+        (dialog_id,),
+    )
+    seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
+    sync_db.execute(
+        "UPDATE full_history_enrollment SET enabled = 1, source = 'explicit', updated_at = 1 WHERE dialog_id = ?",
         (dialog_id,),
     )
     sync_db.execute(
@@ -896,6 +995,8 @@ async def test_probe_selects_only_due_access_lost_with_cycle_budget(
             (not_due, 1002, future),
         ],
     )
+    for dialog_id in (due_first, due_second, not_due):
+        seed_full_history_enrollment(sync_db, dialog_id, enabled=False)
     sync_db.commit()
     mock_client.get_messages = AsyncMock(side_effect=ChannelPrivateError(request=None))
     delta_worker = DeltaSyncWorker(
@@ -943,6 +1044,8 @@ async def test_probe_flood_wait_stops_account_pass(
         "INSERT INTO synced_dialogs (dialog_id, status, access_lost_at) VALUES (?, 'access_lost', ?)",
         [(9201, 1000), (9202, 1001)],
     )
+    seed_full_history_enrollment(sync_db, 9201, enabled=False)
+    seed_full_history_enrollment(sync_db, 9202, enabled=False)
     sync_db.commit()
     err = FloodWaitError(request=None)
     err.seconds = 30
@@ -1021,11 +1124,13 @@ async def test_backfill_total_messages_fills_null_rows(
         "INSERT INTO synced_dialogs (dialog_id, status, total_messages) VALUES (?, 'synced', NULL)",
         (8001,),
     )
+    seed_full_history_enrollment(sync_db, 8001, enabled=True)
     sync_db.execute(
         "INSERT INTO synced_dialogs (dialog_id, status, total_messages) "
         "VALUES (?, 'syncing', 500)",  # already has total — should be skipped
         (8002,),
     )
+    seed_full_history_enrollment(sync_db, 8002, enabled=True)
     sync_db.commit()
 
     mock_client.get_messages = AsyncMock(return_value=MockTotalList([], total=999))
@@ -1068,6 +1173,7 @@ async def test_backfill_skips_on_error(
         "INSERT INTO synced_dialogs (dialog_id, status, total_messages) VALUES (?, 'synced', NULL)",
         (8003,),
     )
+    seed_full_history_enrollment(sync_db, 8003, enabled=True)
     sync_db.commit()
 
     mock_client.get_messages = AsyncMock(side_effect=Exception("network error"))
@@ -1103,6 +1209,7 @@ async def test_backfill_respects_shutdown(
             "INSERT INTO synced_dialogs (dialog_id, status, total_messages) VALUES (?, 'synced', NULL)",
             (8010 + i,),
         )
+        seed_full_history_enrollment(sync_db, 8010 + i, enabled=True)
     sync_db.commit()
 
     shutdown_event.set()  # immediate shutdown
@@ -1132,6 +1239,7 @@ async def test_checkpoint_skip_recent_dialog(
         "INSERT INTO synced_dialogs (dialog_id, status, last_synced_at) VALUES (?, 'synced', ?)",
         (dialog_id, now - 60),  # 60s ago — well within 300s threshold
     )
+    seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
     sync_db.execute(
         "INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (?, 10, 1704067200)",
         (dialog_id,),
@@ -1167,6 +1275,7 @@ async def test_checkpoint_skip_null_last_synced_at(
         "INSERT INTO synced_dialogs (dialog_id, status, last_synced_at) VALUES (?, 'synced', NULL)",
         (dialog_id,),
     )
+    seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
     sync_db.execute(
         "INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (?, 10, 1704067200)",
         (dialog_id,),
@@ -1204,6 +1313,7 @@ async def test_checkpoint_skip_stale_last_synced_at(
         "INSERT INTO synced_dialogs (dialog_id, status, last_synced_at) VALUES (?, 'synced', ?)",
         (dialog_id, now - 7200),  # 2 hours ago — well beyond skip threshold
     )
+    seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
     sync_db.execute(
         "INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (?, 10, 1704067200)",
         (dialog_id,),
@@ -1242,6 +1352,7 @@ async def test_checkpoint_skip_access_lost_not_selected(
         "INSERT INTO synced_dialogs (dialog_id, status, last_synced_at) VALUES (?, 'access_lost', ?)",
         (dialog_id, now - 9999),
     )
+    seed_full_history_enrollment(sync_db, dialog_id, enabled=False)
     sync_db.execute(
         "INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (?, 10, 1704067200)",
         (dialog_id,),
@@ -1278,6 +1389,7 @@ async def test_fetch_delta_stamps_last_synced_at_on_success(
         "INSERT INTO synced_dialogs (dialog_id, status, last_synced_at) VALUES (?, 'synced', NULL)",
         (dialog_id,),
     )
+    seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
     sync_db.execute(
         "INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (?, 10, 1704067200)",
         (dialog_id,),
@@ -1324,6 +1436,7 @@ async def test_fetch_delta_stamps_last_synced_at_on_gap_filled(
         "INSERT INTO synced_dialogs (dialog_id, status, last_synced_at) VALUES (?, 'synced', NULL)",
         (dialog_id,),
     )
+    seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
     sync_db.execute(
         "INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (?, 10, 1704067200)",
         (dialog_id,),
@@ -1375,6 +1488,7 @@ async def test_fetch_delta_stamps_on_floodwait(
         "INSERT INTO synced_dialogs (dialog_id, status, last_synced_at) VALUES (?, 'synced', ?)",
         (dialog_id, original_ts),
     )
+    seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
     sync_db.execute(
         "INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (?, 10, 1704067200)",
         (dialog_id,),
@@ -1433,6 +1547,7 @@ async def test_checkpoint_skip_emits_log(
         "INSERT INTO synced_dialogs (dialog_id, status, last_synced_at) VALUES (?, 'synced', ?)",
         (dialog_id, now - 30),
     )
+    seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
     sync_db.execute(
         "INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (?, 10, 1704067200)",
         (dialog_id,),
@@ -1468,6 +1583,7 @@ async def test_delta_catch_up_respects_probe_budget(
             "INSERT INTO synced_dialogs (dialog_id, status, last_synced_at) VALUES (?, 'synced', ?)",
             (dialog_id, 1000),
         )
+        seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
         sync_db.execute(
             "INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (?, 10, 1704067200)",
             (dialog_id,),
@@ -1531,6 +1647,7 @@ async def test_delta_catch_up_orders_by_oldest_delta_check(
             "VALUES (?, 'synced', ?, ?)",
             (dialog_id, 1000, last_delta_checked_at),
         )
+        seed_full_history_enrollment(sync_db, dialog_id, enabled=True)
         sync_db.execute(
             "INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (?, 10, 1704067200)",
             (dialog_id,),
@@ -1576,11 +1693,13 @@ async def test_delta_catch_up_prioritizes_requested_refresh(
         "VALUES (?, 'synced', ?, ?, ?)",
         (requested_dialog, now - 60, now - 60, now - 30),
     )
+    seed_full_history_enrollment(sync_db, requested_dialog, enabled=True)
     sync_db.execute(
         "INSERT INTO synced_dialogs (dialog_id, status, last_synced_at, last_delta_checked_at) "
         "VALUES (?, 'synced', ?, ?)",
         (stale_dialog, 1000, 1000),
     )
+    seed_full_history_enrollment(sync_db, stale_dialog, enabled=True)
     for dialog_id in (requested_dialog, stale_dialog):
         sync_db.execute(
             "INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (?, 10, 1704067200)",
@@ -1636,16 +1755,19 @@ async def test_delta_catch_up_complete_log_includes_watermark(
         "VALUES (?, 'synced', ?, ?)",
         (checked_dialog, 1000, 1000),
     )
+    seed_full_history_enrollment(sync_db, checked_dialog, enabled=True)
     sync_db.execute(
         "INSERT INTO synced_dialogs (dialog_id, status, last_synced_at) VALUES (?, 'synced', ?)",
         (never_checked_dialog, 1000),
     )
+    seed_full_history_enrollment(sync_db, never_checked_dialog, enabled=True)
     sync_db.execute(
         "INSERT INTO synced_dialogs "
         "(dialog_id, status, last_synced_at, last_delta_checked_at, delta_refresh_requested_at) "
         "VALUES (?, 'synced', ?, ?, ?)",
         (requested_dialog, 1000, 1000, 2000),
     )
+    seed_full_history_enrollment(sync_db, requested_dialog, enabled=True)
     for dialog_id in (checked_dialog, never_checked_dialog, requested_dialog):
         sync_db.execute(
             "INSERT INTO messages (dialog_id, message_id, sent_at) VALUES (?, 10, 1704067200)",

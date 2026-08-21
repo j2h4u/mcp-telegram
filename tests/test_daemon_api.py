@@ -3,6 +3,7 @@
 Uses in-memory SQLite for DB connections, MagicMock/AsyncMock for the
 Telegram client.  No real Telegram API calls are made.
 """
+# pyright: reportAny=false
 
 from __future__ import annotations
 
@@ -35,6 +36,7 @@ from mcp_telegram.topics.contracts import TopicFact
 from mcp_telegram.topics.refresh import TopicRefresher
 from mcp_telegram.topics.sqlite_repository import SQLiteTopicSnapshotRepository
 from tests.daemon_api_policy import make_daemon_api_policy
+from tests.history_enrollment_helpers import seed_full_history_enrollment
 from tests.reaction_helpers import make_reaction_freshener
 
 # Track sqlite connections created by module helpers and close them after each test.
@@ -81,6 +83,7 @@ def _patch_get_peer_id():
 
 class _InsertSyncedDialogKwargs(TypedDict, total=False):
     status: str
+    enrollment_enabled: bool
     last_synced_at: int | None
     last_event_at: int | None
     sync_progress: int | None
@@ -427,6 +430,16 @@ def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.
     )
     conn.execute(
         """
+        CREATE TABLE full_history_enrollment (
+            dialog_id INTEGER PRIMARY KEY,
+            enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
+            source TEXT NOT NULL CHECK(source IN ('explicit', 'automatic', 'migration')),
+            updated_at INTEGER NOT NULL
+        ) WITHOUT ROWID
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE messages (
             dialog_id           INTEGER NOT NULL,
             message_id          INTEGER NOT NULL,
@@ -681,6 +694,7 @@ def _insert_synced_dialog(
     **kwargs: Unpack[_InsertSyncedDialogKwargs],
 ) -> None:
     status = kwargs.get("status", "synced")
+    enrollment_enabled = kwargs.get("enrollment_enabled", False)
     last_synced_at = kwargs.get("last_synced_at")
     last_event_at = kwargs.get("last_event_at")
     sync_progress = kwargs.get("sync_progress")
@@ -692,6 +706,7 @@ def _insert_synced_dialog(
         "VALUES (?, ?, ?, ?, ?, ?, ?)",
         (dialog_id, status, last_synced_at, last_event_at, sync_progress, total_messages, access_lost_at),
     )
+    seed_full_history_enrollment(conn, dialog_id, enabled=enrollment_enabled)
     conn.commit()
 
 
@@ -1777,6 +1792,7 @@ async def test_list_dialogs_dm_unread_in_out_preserved() -> None:
         "INSERT INTO synced_dialogs (dialog_id, status, read_inbox_max_id, read_outbox_max_id) "
         "VALUES (10, 'synced', 10, 10)"
     )
+    seed_full_history_enrollment(conn, 10, enabled=True)
     conn.commit()
     conn.execute(
         "INSERT INTO messages (dialog_id, message_id, sent_at, out, is_deleted) VALUES (10, 11, 1700000001, 0, 0)"
@@ -2185,14 +2201,13 @@ async def test_handle_client_round_trip() -> None:
 
 @pytest.mark.asyncio
 async def test_mark_dialog_for_sync_enable() -> None:
-    """mark_dialog_for_sync with enable=True inserts row with status='not_synced'."""
+    """mark_dialog_for_sync with enable=True queues full-history enrollment."""
     conn = _make_db()
     server = make_server(conn)
     result = await server._dispatch({"method": "mark_dialog_for_sync", "dialog_id": 42, "enable": True})
     assert result["ok"] is True
     data = cast(dict[str, object], result["data"])
-    assert data["action"] == "mark_for_sync"
-    assert data["expected_next_state"] == "syncing"
+    assert data["action"] == "queue_full_history"
     assert data["full_history_will_be_fetched"] is True
     row = cast(
         tuple[object, ...] | None, conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id = 42").fetchone()
@@ -2211,7 +2226,6 @@ async def test_mark_dialog_for_sync_ignores_existing() -> None:
     assert result["ok"] is True
     data = cast(dict[str, object], result["data"])
     assert data["action"] == "request_delta_refresh"
-    assert data["expected_next_state"] == "synced"
     assert data["full_history_will_be_fetched"] is False
     row = cast(
         tuple[object, ...] | None,
@@ -2224,7 +2238,7 @@ async def test_mark_dialog_for_sync_ignores_existing() -> None:
 
 @pytest.mark.asyncio
 async def test_mark_dialog_for_sync_disable() -> None:
-    """mark_dialog_for_sync with enable=False resets status to 'not_synced'."""
+    """mark_dialog_for_sync with enable=False preserves factual synced coverage."""
     conn = _make_db()
     _insert_synced_dialog(conn, 42, status="synced")
     server = make_server(conn)
@@ -2234,7 +2248,10 @@ async def test_mark_dialog_for_sync_disable() -> None:
         tuple[object, ...] | None, conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id = 42").fetchone()
     )
     assert row is not None
-    assert row[0] == "not_synced"
+    assert row[0] == "synced"
+    enrollment = conn.execute("SELECT enabled, source FROM full_history_enrollment WHERE dialog_id = 42").fetchone()
+    assert enrollment is not None
+    assert tuple(enrollment) == (0, "explicit")
 
 
 # ---------------------------------------------------------------------------
@@ -2261,7 +2278,7 @@ async def test_get_sync_status_synced_dialog() -> None:
     result = await server._dispatch({"method": "get_sync_status", "dialog_id": -1001234567890})
     assert result["ok"] is True
     data = cast(dict[str, object], result["data"])
-    assert data["status"] == "synced"
+    assert data["coverage_status"] == "synced"
     assert data["message_count"] == 2
     assert data["last_synced_at"] == 1700000000
     assert data["last_event_at"] == 1700001000
@@ -2307,13 +2324,13 @@ async def test_get_sync_status_dm_delete_detection() -> None:
 
 @pytest.mark.asyncio
 async def test_get_sync_status_non_synced() -> None:
-    """get_sync_status for non-synced dialog returns status='not_synced' and zero counts."""
+    """get_sync_status for non-synced dialog returns coverage_status='not_synced'."""
     conn = _make_db()
     server = make_server(conn)
     result = await server._dispatch({"method": "get_sync_status", "dialog_id": 99999})
     assert result["ok"] is True
     data = cast(dict[str, object], result["data"])
-    assert data["status"] == "not_synced"
+    assert data["coverage_status"] == "not_synced"
     assert data["message_count"] == 0
 
 
@@ -4642,6 +4659,7 @@ async def test_get_sync_status_includes_coverage():
         "INSERT INTO synced_dialogs (dialog_id, status, total_messages) VALUES (?, 'synced', 1000)",
         (-100001,),
     )
+    seed_full_history_enrollment(conn, -100001, enabled=True)
     for i in range(800):
         conn.execute(
             "INSERT INTO messages (dialog_id, message_id, sent_at, text, is_deleted) VALUES (?, ?, 1000, 'msg', 0)",
@@ -4669,6 +4687,7 @@ async def test_get_sync_status_keeps_synced_complete_when_total_is_suspect():
         "VALUES (?, 'synced', 1, 1700000000, 1700001000)",
         (7110815,),
     )
+    seed_full_history_enrollment(conn, 7110815, enabled=True)
     for i in range(191):
         conn.execute(
             "INSERT INTO messages (dialog_id, message_id, sent_at, text, is_deleted) VALUES (?, ?, 1000, 'msg', 0)",
@@ -4700,6 +4719,7 @@ async def test_get_sync_status_access_lost_with_coverage():
         "VALUES (?, 'access_lost', 500, 1700000000)",
         (-100002,),
     )
+    seed_full_history_enrollment(conn, -100002, enabled=False)
     for i in range(400):
         conn.execute(
             "INSERT INTO messages (dialog_id, message_id, sent_at, text, is_deleted) VALUES (?, ?, 1000, 'msg', 0)",
@@ -4721,6 +4741,7 @@ async def test_get_sync_status_access_lost_null_total_has_archived_count():
         "VALUES (?, 'access_lost', NULL, 1700000000)",
         (-100009,),
     )
+    seed_full_history_enrollment(conn, -100009, enabled=False)
     for i in range(150):
         conn.execute(
             "INSERT INTO messages (dialog_id, message_id, sent_at, text, is_deleted) VALUES (?, ?, 1000, 'msg', 0)",
@@ -4748,6 +4769,7 @@ async def test_list_dialogs_includes_coverage():
         "INSERT INTO synced_dialogs (dialog_id, status, total_messages) VALUES (?, 'synced', 100)",
         (5001,),
     )
+    seed_full_history_enrollment(conn, 5001, enabled=True)
     for i in range(50):
         conn.execute(
             "INSERT INTO messages (dialog_id, message_id, sent_at, text, is_deleted) VALUES (?, ?, 1000, 'msg', 0)",
@@ -4808,6 +4830,7 @@ async def test_list_messages_access_lost_returns_archived():
         "VALUES (?, 'access_lost', 1700000000, 500, 1699990000, 1699999000)",
         (6001,),
     )
+    seed_full_history_enrollment(conn, 6001, enabled=False)
     conn.execute(
         "INSERT INTO messages (dialog_id, message_id, sent_at, text, sender_id, "
         "sender_first_name, is_deleted) VALUES (?, 1, 1000, 'archived msg', 42, 'Alice', 0)",
@@ -4835,6 +4858,7 @@ async def test_list_messages_access_lost_null_total_has_archived_count():
         "VALUES (?, 'access_lost', 1700000000, NULL)",
         (6010,),
     )
+    seed_full_history_enrollment(conn, 6010, enabled=False)
     for i in range(75):
         conn.execute(
             "INSERT INTO messages (dialog_id, message_id, sent_at, text, sender_id, "
@@ -4860,6 +4884,7 @@ async def test_list_messages_access_lost_sync_coverage_pct() -> None:
         "last_synced_at, last_event_at) VALUES (?, 'access_lost', 1700000000, 100, 1699990000, 1699999000)",
         (6020,),
     )
+    seed_full_history_enrollment(conn, 6020, enabled=False)
     for i in range(25):
         conn.execute(
             "INSERT INTO messages (dialog_id, message_id, sent_at, text, sender_id, "
@@ -4887,6 +4912,7 @@ async def test_list_messages_synced_returns_live():
         "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')",
         (6002,),
     )
+    seed_full_history_enrollment(conn, 6002, enabled=True)
     conn.execute(
         "INSERT INTO messages (dialog_id, message_id, sent_at, text, sender_id, "
         "sender_first_name, is_deleted) VALUES (?, 1, 1000, 'live msg', 42, 'Alice', 0)",
@@ -4915,6 +4941,7 @@ async def test_search_messages_access_lost_returns_full_metadata():
         "VALUES (?, 'access_lost', 1700000000, 500, 1699990000, 1699999000)",
         (-100003,),
     )
+    seed_full_history_enrollment(conn, -100003, enabled=False)
     conn.execute(
         "INSERT INTO messages (dialog_id, message_id, sent_at, text, sender_id, "
         "sender_first_name, is_deleted) VALUES (?, 1, 1000, 'test content', 42, 'Alice', 0)",
@@ -4944,6 +4971,7 @@ async def test_search_messages_access_lost_null_total_has_archived_count():
         "VALUES (?, 'access_lost', 1700000000, NULL)",
         (-100011,),
     )
+    seed_full_history_enrollment(conn, -100011, enabled=False)
     conn.execute(
         "INSERT INTO messages (dialog_id, message_id, sent_at, text, sender_id, "
         "sender_first_name, is_deleted) VALUES (?, 1, 1000, 'test content', 42, 'Alice', 0)",
@@ -4970,6 +4998,7 @@ async def test_search_messages_global_omits_dialog_access():
         "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')",
         (-100004,),
     )
+    seed_full_history_enrollment(conn, -100004, enabled=True)
     conn.execute(
         "INSERT INTO messages (dialog_id, message_id, sent_at, text, sender_id, "
         "sender_first_name, is_deleted) VALUES (?, 1, 1000, 'global test', 42, 'Alice', 0)",
@@ -6976,7 +7005,12 @@ def _make_trace_db() -> sqlite3.Connection:
             read_inbox_max_id   INTEGER,
             read_outbox_max_id  INTEGER
         );
-
+        CREATE TABLE full_history_enrollment (
+            dialog_id INTEGER PRIMARY KEY,
+            enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
+            source TEXT NOT NULL CHECK(source IN ('explicit', 'automatic', 'migration')),
+            updated_at INTEGER NOT NULL
+        ) WITHOUT ROWID;
         CREATE TABLE messages (
             dialog_id       INTEGER NOT NULL,
             message_id      INTEGER NOT NULL,
@@ -7131,6 +7165,7 @@ def _seed_channel_with_linked_chat(conn: sqlite3.Connection) -> None:
         "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')",
         (_CHANNEL_ID,),
     )
+    seed_full_history_enrollment(conn, _CHANNEL_ID, enabled=True)
     # Linked discussion group type so _trace_strategy_for_dialog returns author_search.
     conn.execute(
         "INSERT INTO dialogs (dialog_id, name, type, hidden) VALUES (?, ?, ?, 0)",
@@ -7140,6 +7175,7 @@ def _seed_channel_with_linked_chat(conn: sqlite3.Connection) -> None:
         "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')",
         (_LINKED_CHAT_ID,),
     )
+    seed_full_history_enrollment(conn, _LINKED_CHAT_ID, enabled=True)
     conn.commit()
 
 
@@ -7517,6 +7553,7 @@ def test_trace_candidate_no_discussion_group_stays_signature_only() -> None:
         "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'synced')",
         (_CHANNEL_ID,),
     )
+    seed_full_history_enrollment(conn, _CHANNEL_ID, enabled=True)
     conn.commit()
 
     # Pass an EMPTY linked_chat_map (no discussion group resolved).

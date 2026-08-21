@@ -58,6 +58,8 @@ class ReactionFreshener:
             # scopes it with a savepoint so an unrelated outer transaction is not
             # committed as a side effect of refreshing a read result.
             with self._repository.transaction():
+                if not self._repository.history_enabled(dialog_id):
+                    return ReactionFreshness(len(message_ids), len(fresh_ids), len(stale_ids), 0, "disabled")
                 refreshed = self._repository.persist_reaction_snapshots(dialog_id, result.messages, now)
             return ReactionFreshness(len(message_ids), len(fresh_ids), len(stale_ids), refreshed, "refreshed")
         failure = result.failure

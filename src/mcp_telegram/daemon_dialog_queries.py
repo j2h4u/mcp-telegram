@@ -266,17 +266,11 @@ _BATCHED_UNREAD_COUNTS_SQL = (
     "GROUP BY m.dialog_id"
 )
 
-_MARK_FOR_SYNC_SQL = "INSERT OR IGNORE INTO synced_dialogs (dialog_id, status) VALUES (?, 'not_synced')"
-_GET_MARK_SYNC_STATUS_SQL = "SELECT status FROM synced_dialogs WHERE dialog_id = ?"
-_REQUEST_DELTA_REFRESH_SQL = (
-    "UPDATE synced_dialogs SET delta_refresh_requested_at = ? WHERE dialog_id = ? AND status = 'synced'"
-)
-_UNMARK_SYNC_SQL = "UPDATE synced_dialogs SET status = 'not_synced', sync_progress = NULL WHERE dialog_id = ?"
-
 _GET_SYNC_STATUS_SQL = (
-    "SELECT status, last_synced_at, last_event_at, sync_progress, total_messages, access_lost_at, "
-    "last_delta_checked_at, delta_refresh_requested_at, access_last_revalidated_at, access_next_revalidate_at "
-    "FROM synced_dialogs WHERE dialog_id = ?"
+    "SELECT sd.status, sd.last_synced_at, sd.last_event_at, sd.sync_progress, sd.total_messages, sd.access_lost_at, "
+    "last_delta_checked_at, delta_refresh_requested_at, access_last_revalidated_at, access_next_revalidate_at, "
+    "fhe.enabled, fhe.source "
+    "FROM synced_dialogs sd LEFT JOIN full_history_enrollment fhe USING(dialog_id) WHERE sd.dialog_id = ?"
 )
 _COUNT_SYNCED_MESSAGES_SQL = "SELECT COUNT(*) FROM messages WHERE dialog_id = ? AND is_deleted = 0"
 _COUNT_MESSAGES_BY_DIALOG_SQL = "SELECT dialog_id, COUNT(*) FROM messages WHERE is_deleted = 0 GROUP BY dialog_id"

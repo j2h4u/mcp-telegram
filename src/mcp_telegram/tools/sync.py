@@ -46,17 +46,19 @@ MARK_DIALOG_FOR_SYNC_OUTPUT_SCHEMA = {
     "properties": {
         "dialog_id": {"type": "integer"},
         "enabled": {"type": "boolean"},
-        "status": {"type": "string"},
+        "enrollment_source": {"type": "string"},
+        "coverage_status": {"type": ["string", "null"]},
         "action": {"type": "string"},
-        "expected_next_state": {"type": "string"},
+        "blocked_reason": {"type": ["string", "null"]},
         "full_history_will_be_fetched": {"type": "boolean"},
     },
     "required": [
         "dialog_id",
         "enabled",
-        "status",
+        "enrollment_source",
+        "coverage_status",
         "action",
-        "expected_next_state",
+        "blocked_reason",
         "full_history_will_be_fetched",
     ],
     "additionalProperties": False,
@@ -67,8 +69,10 @@ GET_SYNC_STATUS_OUTPUT_SCHEMA = {
     "type": "object",
     "properties": {
         "dialog_id": {"type": ["integer", "null"]},
-        "status": {"type": "string"},
-        "raw_status": {"type": "string"},
+        "coverage_status": {"type": "string"},
+        "enrollment_enabled": {"type": ["boolean", "null"]},
+        "enrollment_source": {"type": ["string", "null"]},
+        "realtime_history": {"type": "string"},
         "is_syncing": {"type": "boolean"},
         "last_synced_at": {"type": ["integer", "null"]},
         "last_event_at": {"type": ["integer", "null"]},
@@ -95,8 +99,10 @@ GET_SYNC_STATUS_OUTPUT_SCHEMA = {
     },
     "required": [
         "dialog_id",
-        "status",
-        "raw_status",
+        "coverage_status",
+        "enrollment_enabled",
+        "enrollment_source",
+        "realtime_history",
         "is_syncing",
         "last_synced_at",
         "last_event_at",
@@ -303,10 +309,11 @@ async def mark_dialog_for_sync(args: MarkDialogForSync) -> ToolResult:
     structured_content = {
         "dialog_id": args.dialog_id,
         "enabled": args.enable,
-        "status": "accepted",
-        "action": data.get("action", "mark_for_sync" if args.enable else "unmark_from_sync"),
-        "expected_next_state": data.get("expected_next_state", "syncing" if args.enable else "not_synced"),
-        "full_history_will_be_fetched": data.get("full_history_will_be_fetched", args.enable),
+        "enrollment_source": data["enrollment_source"],
+        "coverage_status": data["coverage_status"],
+        "action": data["action"],
+        "blocked_reason": data["blocked_reason"],
+        "full_history_will_be_fetched": data["full_history_will_be_fetched"],
     }
     return structured_result(structured_content, result_count=1)
 
@@ -344,7 +351,7 @@ async def get_sync_status(args: GetSyncStatus) -> ToolResult:
         return err
 
     data = response.get("data", {})
-    status = data.get("status") or "unknown"
+    status = data["coverage_status"]
     message_count = data.get("message_count")
     total_messages = data.get("total_messages")
     saved_message_count = data.get("saved_message_count", message_count)
@@ -360,8 +367,10 @@ async def get_sync_status(args: GetSyncStatus) -> ToolResult:
     sync_progress_message_id = data.get("sync_progress_message_id", data.get("sync_progress"))
     structured_content = {
         "dialog_id": data.get("dialog_id"),
-        "status": status,
-        "raw_status": data.get("raw_status", status),
+        "coverage_status": data["coverage_status"],
+        "enrollment_enabled": data["enrollment_enabled"],
+        "enrollment_source": data["enrollment_source"],
+        "realtime_history": data["realtime_history"],
         "is_syncing": status == "syncing",
         "last_synced_at": last_synced_at,
         "last_event_at": last_event_at,
@@ -369,10 +378,10 @@ async def get_sync_status(args: GetSyncStatus) -> ToolResult:
         "delta_refresh_requested_at": delta_refresh_requested_at,
         "message_count": message_count,
         "saved_message_count": saved_message_count,
-        "history_scope": data.get("history_scope", _history_scope(status)),
-        "history_depth_state": data.get("history_depth_state", _history_depth_state(status)),
-        "history_sync_state": data.get("history_sync_state", _history_sync_state(status)),
-        "history_complete_at": data.get("history_complete_at", last_synced_at if status == "synced" else None),
+        "history_scope": data["history_scope"],
+        "history_depth_state": data["history_depth_state"],
+        "history_sync_state": data["history_sync_state"],
+        "history_complete_at": data["history_complete_at"],
         "coverage_state": coverage_state,
         "local_knowledge_at": local_knowledge_at,
         "local_knowledge_age_seconds": data.get("local_knowledge_age_seconds"),

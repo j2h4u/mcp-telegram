@@ -30,6 +30,15 @@ class SQLiteReactionSnapshotRepository:
         else:
             self._conn.execute("RELEASE SAVEPOINT reaction_refresh")
 
+    def history_enabled(self, dialog_id: int) -> bool:
+        row = cast(
+            tuple[object, ...] | None,
+            self._conn.execute(
+                "SELECT enabled FROM full_history_enrollment WHERE dialog_id = ?", (dialog_id,)
+            ).fetchone(),
+        )
+        return row is not None and bool(row[0])
+
     def stale_reaction_ids(
         self, dialog_id: int, message_ids: Sequence[int], threshold: int
     ) -> tuple[str, set[int], list[int]]:

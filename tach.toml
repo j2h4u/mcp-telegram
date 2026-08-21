@@ -75,7 +75,7 @@ depends_on = [
     "mcp_telegram.budget", "mcp_telegram.daemon_account_trace", "mcp_telegram.daemon_activity_stats",
     "mcp_telegram.daemon_dialog_queries", "mcp_telegram.daemon_entity_info", "mcp_telegram.daemon_message",
     "mcp_telegram.daemon_message_queries", "mcp_telegram.daemon_read_state_queries", "mcp_telegram.daemon_reading",
-    "mcp_telegram.daemon_source_export", "mcp_telegram.important_events",
+    "mcp_telegram.daemon_source_export", "mcp_telegram.history_enrollment", "mcp_telegram.important_events",
     { path = "mcp_telegram.feedback_db", deprecated = true }, "mcp_telegram.models", "mcp_telegram.pagination",
     "mcp_telegram.reactions.contracts", "mcp_telegram.reactions.refresh", "mcp_telegram.resolver",
     "mcp_telegram.telegram_fragments", "mcp_telegram.telegram_history",
@@ -210,18 +210,18 @@ depends_on = ["mcp_telegram.access_lifecycle", "mcp_telegram.flood", "mcp_telegr
 [[modules]]
 path = "mcp_telegram.sync_worker"
 layer = "application"
-depends_on = ["mcp_telegram.access_lifecycle", "mcp_telegram.flood", "mcp_telegram.messages.sqlite_repository", "mcp_telegram.messages.telegram_adapter", "mcp_telegram.resolver", "mcp_telegram.telegram_access", "mcp_telegram.telethon_dialog"]
+depends_on = ["mcp_telegram.access_lifecycle", "mcp_telegram.flood", "mcp_telegram.history_enrollment", "mcp_telegram.messages.sqlite_repository", "mcp_telegram.messages.telegram_adapter", "mcp_telegram.resolver", "mcp_telegram.telegram_access", "mcp_telegram.telethon_dialog"]
 
 [[modules]]
 path = "mcp_telegram.delta_sync"
 layer = "application"
-depends_on = ["mcp_telegram.access_lifecycle", "mcp_telegram.flood", "mcp_telegram.message_contracts", "mcp_telegram.messages.sqlite_repository", "mcp_telegram.messages.telegram_adapter", "mcp_telegram.telegram_access"]
+depends_on = ["mcp_telegram.access_lifecycle", "mcp_telegram.flood", "mcp_telegram.history_enrollment", "mcp_telegram.message_contracts", "mcp_telegram.messages.sqlite_repository", "mcp_telegram.messages.telegram_adapter", "mcp_telegram.telegram_access"]
 
 [[modules]]
 path = "mcp_telegram.event_handlers"
 layer = "application"
 depends_on = [
-    { path = "mcp_telegram.activity_peer_resolve", deprecated = true }, "mcp_telegram.messages.sqlite_repository",
+    { path = "mcp_telegram.activity_peer_resolve", deprecated = true }, "mcp_telegram.history_enrollment", "mcp_telegram.messages.sqlite_repository",
     "mcp_telegram.messages.telegram_adapter", "mcp_telegram.reactions.contracts", "mcp_telegram.reactions.persistence", "mcp_telegram.reactions.projection",
     "mcp_telegram.read_state", "mcp_telegram.realtime_history_policy", "mcp_telegram.resolver", "mcp_telegram.scheduled_messages",
     { path = "mcp_telegram.sync_worker", deprecated = true }, "mcp_telegram.telethon_dialog", "mcp_telegram.unread_state",
@@ -235,6 +235,11 @@ depends_on = []
 
 [[modules]]
 path = "mcp_telegram.access_lifecycle"
+layer = "capability"
+depends_on = ["mcp_telegram.history_enrollment"]
+
+[[modules]]
+path = "mcp_telegram.history_enrollment"
 layer = "capability"
 depends_on = []
 
@@ -311,7 +316,7 @@ depends_on = ["mcp_telegram.models", "mcp_telegram.telegram_gateway", "mcp_teleg
 
 [[modules]]
 path = "mcp_telegram.telegram_fragments"
-layer = "telegram_gateway"
+layer = "application"
 depends_on = ["mcp_telegram.telegram_gateway", "mcp_telegram.telegram_reading", { path = "mcp_telegram.messages.sqlite_repository", deprecated = true }, "mcp_telegram.messages.telegram_adapter"]
 
 [[modules]]
@@ -556,3 +561,7 @@ expose = ["DaemonAPIServer", "DaemonApiPolicy", "DaemonClientLike"]
 [[interfaces]]
 from = ["mcp_telegram.daemon_client"]
 expose = ["DaemonConnection", "DaemonNotRunningError", "daemon_connection"]
+
+[[interfaces]]
+from = ["mcp_telegram.history_enrollment"]
+expose = ["EnrollmentIntent", "EnrollmentOutcome", "EnrollmentSource", "disable_history", "enable_history", "ensure_automatic_dm_enrollment", "full_history_enabled", "read_intent", "restore_access_status"]

@@ -20,6 +20,7 @@ from mcp_telegram.folders.sqlite_repository import list_folders, replace_folder_
 from mcp_telegram.state import StatePaths
 from mcp_telegram.sync_db import ensure_sync_schema
 from tests.daemon_api_policy import make_daemon_api_policy
+from tests.history_enrollment_helpers import seed_full_history_enrollment
 from tests.reaction_helpers import make_reaction_freshener
 
 
@@ -1142,6 +1143,7 @@ async def test_backfill_blank_unsupported_messages_materializes_text_and_fts() -
             "VALUES (?, ?, ?, '', 'MessageMediaUnsupported')",
             (1001, 77, 1704067200),
         )
+        seed_full_history_enrollment(conn, 1001, enabled=True)
         conn.commit()
 
         client = MagicMock()
@@ -1178,6 +1180,7 @@ async def test_backfill_blank_unsupported_messages_floodwait_skips_small_pause()
             "VALUES (?, ?, ?, '', 'MessageMediaUnsupported')",
             (1002, 78, 1704067200),
         )
+        seed_full_history_enrollment(conn, 1002, enabled=True)
         conn.commit()
 
         err = FloodWaitError(request=None)
@@ -1221,6 +1224,7 @@ async def test_backfill_total_messages_returns_early_when_shutdown_during_flood_
             "INSERT INTO synced_dialogs (dialog_id, status, total_messages) VALUES (?, 'synced', NULL)",
             (1001,),
         )
+        seed_full_history_enrollment(conn, 1001, enabled=True)
         conn.commit()
 
         shutdown_event = asyncio.Event()
@@ -1265,6 +1269,7 @@ async def test_backfill_total_messages_uses_named_skip_pacing(monkeypatch: pytes
             "INSERT INTO synced_dialogs (dialog_id, status, total_messages) VALUES (?, 'synced', NULL)",
             (2001,),
         )
+        seed_full_history_enrollment(conn, 2001, enabled=True)
         conn.commit()
 
         shutdown_event = asyncio.Event()
@@ -1306,6 +1311,7 @@ async def test_backfill_total_messages_floodwait_elapsed_skips_small_pause(monke
             "INSERT INTO synced_dialogs (dialog_id, status, total_messages) VALUES (?, 'synced', NULL)",
             (2002,),
         )
+        seed_full_history_enrollment(conn, 2002, enabled=True)
         conn.commit()
 
         shutdown_event = asyncio.Event()
@@ -1376,6 +1382,7 @@ async def test_initialize_read_positions_fills_null_rows(tmp_path):
             "INSERT INTO synced_dialogs (dialog_id, status, read_inbox_max_id) VALUES (?, 'synced', NULL)",
             (1001,),
         )
+        seed_full_history_enrollment(conn, 1001, enabled=True)
         conn.commit()
 
         shutdown_event = asyncio.Event()
@@ -1418,6 +1425,7 @@ async def test_initialize_read_positions_is_monotonic_vs_live_event(tmp_path):
             "INSERT INTO synced_dialogs (dialog_id, status, read_inbox_max_id) VALUES (?, 'synced', ?)",
             (1001, 100),
         )
+        seed_full_history_enrollment(conn, 1001, enabled=True)
         conn.commit()
 
         # Invoke the shared primitive that bootstrap uses, with a lower value (42 < 100).
@@ -1454,6 +1462,7 @@ async def test_initialize_read_positions_skips_when_no_null_rows(tmp_path):
             "VALUES (?, 'synced', ?, ?)",
             (1001, 5, 7),
         )
+        seed_full_history_enrollment(conn, 1001, enabled=True)
         conn.commit()
 
         shutdown_event = asyncio.Event()
@@ -1486,6 +1495,7 @@ async def test_initialize_read_positions_returns_early_when_shutdown_during_floo
             "INSERT INTO synced_dialogs (dialog_id, status, read_inbox_max_id) VALUES (?, 'synced', NULL)",
             (1001,),
         )
+        seed_full_history_enrollment(conn, 1001, enabled=True)
         conn.commit()
 
         shutdown_event = asyncio.Event()
@@ -1551,6 +1561,7 @@ async def test_initialize_read_positions_uses_named_batch_pacing(tmp_path):
                 "INSERT INTO synced_dialogs (dialog_id, status, read_inbox_max_id) VALUES (?, 'synced', NULL)",
                 (dialog_id,),
             )
+            seed_full_history_enrollment(conn, dialog_id, enabled=True)
         conn.commit()
 
         shutdown_event = asyncio.Event()
@@ -1604,6 +1615,9 @@ async def test_initialize_read_positions_excludes_non_synced_status(tmp_path):
                 (1003, "not_synced"),
             ],
         )
+        seed_full_history_enrollment(conn, 1001, enabled=True)
+        seed_full_history_enrollment(conn, 1002, enabled=False)
+        seed_full_history_enrollment(conn, 1003, enabled=False)
         conn.commit()
 
         shutdown_event = asyncio.Event()

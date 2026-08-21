@@ -51,6 +51,7 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
 from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
 from .activity_peer_resolve import _InputEntityResolverClient
+from .history_enrollment import ensure_automatic_dm_enrollment
 from .messages.sqlite_repository import (
     insert_messages_with_fts,
     list_undeleted_message_ids,
@@ -89,10 +90,7 @@ from .scheduled_messages import (
     upsert_scheduled_message,
     verify_scheduled_publication,
 )
-from .sync_worker import (
-    INSERT_DIALOG_SQL,
-    UPSERT_ENTITY_SQL,
-)
+from .sync_worker import UPSERT_ENTITY_SQL
 from .telethon_dialog import classify_dialog_type
 from .unread_state import apply_unread_facts
 
@@ -196,7 +194,7 @@ class _EventHandlerClient(Protocol):
 class _RealtimeHistoryStatusReader(Protocol):
     """Narrow SQLite capability used by body-event orchestration."""
 
-    def read_status(self, dialog_id: int) -> str | None: ...
+    def read_status(self, dialog_id: int) -> tuple[str | None, bool]: ...
 
 
 class _SQLiteRealtimeHistoryStatusReader:
@@ -205,17 +203,20 @@ class _SQLiteRealtimeHistoryStatusReader:
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
 
-    def read_status(self, dialog_id: int) -> str | None:
+    def read_status(self, dialog_id: int) -> tuple[str | None, bool]:
         row = cast(
-            tuple[str | None] | None,
+            tuple[str | None, int | None] | None,
             self._conn.execute(
-                "SELECT status FROM synced_dialogs WHERE dialog_id = ?",
+                """SELECT sd.status, fhe.enabled
+                   FROM synced_dialogs sd
+                   LEFT JOIN full_history_enrollment fhe USING(dialog_id)
+                   WHERE sd.dialog_id = ?""",
                 (dialog_id,),
             ).fetchone(),
         )
         if row is None:
-            return None
-        return cast(str | None, row[0])
+            return None, False
+        return cast(str | None, row[0]), bool(row[1])
 
 
 _DM_AUTO_ENROLL_SENDER_EXCEPTIONS: tuple[type[BaseException], ...] = (
@@ -238,9 +239,17 @@ def _first_non_empty_str(*values: object) -> str | None:
 
 _UPDATE_LAST_EVENT_SQL = "UPDATE synced_dialogs SET last_event_at=? WHERE dialog_id=?"
 
-_SELECT_SYNCED_DIALOGS_SQL = "SELECT dialog_id FROM synced_dialogs WHERE status != 'access_lost'"
+_SELECT_SYNCED_DIALOGS_SQL = (
+    "SELECT sd.dialog_id FROM synced_dialogs sd "
+    "LEFT JOIN full_history_enrollment fhe USING(dialog_id) "
+    "WHERE sd.status != 'access_lost' AND (fhe.enabled = 1 OR sd.status = 'own_only')"
+)
 
-_SELECT_SYNCED_ONLY_SQL = "SELECT dialog_id FROM synced_dialogs WHERE status = 'synced'"
+_SELECT_SYNCED_ONLY_SQL = (
+    "SELECT sd.dialog_id FROM synced_dialogs sd "
+    "JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1 "
+    "WHERE sd.status = 'synced'"
+)
 
 # ---------------------------------------------------------------------------
 # Phase 42 SQL — dialogs event writes. Body metadata remains UPDATE-only;
@@ -432,7 +441,8 @@ class EventHandlerManager:
 
     def _realtime_coverage(self, dialog_id: int) -> RealtimeHistoryCoverage:
         """Resolve current DB status before a message-body event."""
-        return realtime_history_coverage(self._realtime_history_status.read_status(dialog_id))
+        status, enabled = self._realtime_history_status.read_status(dialog_id)
+        return realtime_history_coverage(status, enabled)
 
     @staticmethod
     def _metadata_realtime_allowed(coverage: RealtimeHistoryCoverage) -> bool:
@@ -453,9 +463,9 @@ class EventHandlerManager:
         failure does not prevent enrollment.
         """
         try:
-            cursor = self._conn.execute(INSERT_DIALOG_SQL, (dialog_id,))
+            outcome = ensure_automatic_dm_enrollment(self._conn, dialog_id)
             self._conn.commit()
-            if cursor.rowcount > 0:
+            if outcome.enabled and outcome.action in {"queue_full_history", "preserved_enabled_intent"}:
                 # status='syncing' is stable once inserted — FullSyncWorker only
                 # advances it to 'synced', never back to 'not_synced'. Adding to
                 # _synced_dialog_ids here is safe: the real-time handler path only
@@ -544,6 +554,10 @@ class EventHandlerManager:
             now = int(time.time())
 
             with self._conn:
+                if not allows_new_message(
+                    self._realtime_coverage(dialog_id), outgoing=bool(getattr(msg, "out", False))
+                ):
+                    return
                 insert_messages_with_fts(self._conn, [extracted])
                 # A normal message carrying from_scheduled is the verification
                 # point for the untrusted sent_messages hint retained by the
@@ -569,7 +583,8 @@ class EventHandlerManager:
         if coverage is not RealtimeHistoryCoverage.NO_REALTIME_HISTORY:
             return coverage
         self._verify_scheduled_publication_if_needed(self._conn, dialog_id, event.message)
-        if event.is_private and self._realtime_history_status.read_status(dialog_id) is None:
+        status, _ = self._realtime_history_status.read_status(dialog_id)
+        if event.is_private and status is None:
             sender = None
             try:
                 sender = await event.get_sender()
@@ -789,6 +804,10 @@ class EventHandlerManager:
         if not allows_missing_body_insert(coverage, RealtimeBodyEvent.EDIT, outgoing=outgoing):
             return False
         with self._conn:
+            if not allows_missing_body_insert(
+                self._realtime_coverage(dialog_id), RealtimeBodyEvent.EDIT, outgoing=outgoing
+            ):
+                return False
             insert_messages_with_fts(self._conn, [extracted])
             self._record_body_event(dialog_id, now)
         return True
@@ -841,6 +860,10 @@ class EventHandlerManager:
             # preserve the canonical outgoing classification of the row.
             extracted = replace(extracted, message=replace(extracted.message, out=1))
         with self._conn:
+            if not allows_existing_body_update(
+                self._realtime_coverage(dialog_id), RealtimeBodyEvent.EDIT, outgoing=outgoing
+            ):
+                return None
             next_ver = persist_edited_message(
                 self._conn,
                 extracted,
@@ -1211,6 +1234,12 @@ class EventHandlerManager:
                 return
 
             with self._conn:
+                if not allows_existing_body_update(
+                    self._realtime_coverage(dialog_id),
+                    RealtimeBodyEvent.TRANSCRIPTION,
+                    outgoing=existing_out.outgoing,
+                ):
+                    return
                 persist_transcribed_text(
                     self._conn,
                     dialog_id,
@@ -1306,6 +1335,12 @@ class EventHandlerManager:
         extracted = extract_message_row(dialog_id, msg, entity_name_map={})
         extracted = replace(extracted, message=replace(extracted.message, text=new_text))
         with self._conn:
+            if not allows_missing_body_insert(
+                self._realtime_coverage(dialog_id),
+                RealtimeBodyEvent.TRANSCRIPTION,
+                outgoing=bool(getattr(msg, "out", False)),
+            ):
+                return
             insert_messages_with_fts(self._conn, [extracted])
             self._conn.execute(_UPDATE_LAST_EVENT_SQL, (now, dialog_id))
         logger.info(

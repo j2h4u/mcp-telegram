@@ -32,6 +32,8 @@ from unittest.mock import patch
 
 import pytest
 
+from tests.history_enrollment_helpers import seed_full_history_enrollment
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -56,6 +58,7 @@ def _seed(conn: sqlite3.Connection, rows: Iterable[tuple[int, int | None, int | 
             "INSERT INTO synced_dialogs (dialog_id, status, read_inbox_max_id, read_outbox_max_id) VALUES (?, ?, ?, ?)",
             (dialog_id, status, inbox_max, outbox_max),
         )
+        seed_full_history_enrollment(conn, dialog_id, enabled=True)
     conn.commit()
 
 

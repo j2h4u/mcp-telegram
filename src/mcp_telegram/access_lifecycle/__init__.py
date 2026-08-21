@@ -9,6 +9,8 @@ from contextlib import contextmanager
 from itertools import count
 from typing import cast
 
+from ..history_enrollment import restore_access_status
+
 _SAVEPOINTS = count()
 
 
@@ -70,9 +72,10 @@ def restore_access_after_revalidation(
     """Restore access while preserving snapshot metadata and requesting refresh."""
     with _lifecycle_savepoint(conn):
         conn.execute(
-            "UPDATE synced_dialogs SET status = 'syncing', access_lost_at = NULL, access_last_revalidated_at = ?, access_next_revalidate_at = NULL WHERE dialog_id = ?",
+            "UPDATE synced_dialogs SET access_lost_at = NULL, access_last_revalidated_at = ?, access_next_revalidate_at = NULL WHERE dialog_id = ?",
             (now, dialog_id),
         )
+        restore_access_status(conn, dialog_id)
         conn.execute(
             """INSERT INTO dialogs (dialog_id, hidden, needs_refresh, snapshot_at, archived, pinned,
                unread_mentions_count, unread_reactions_count)

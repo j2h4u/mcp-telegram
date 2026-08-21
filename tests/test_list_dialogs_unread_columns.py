@@ -28,6 +28,7 @@ import pytest
 
 from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike
 from tests.daemon_api_policy import make_daemon_api_policy
+from tests.history_enrollment_helpers import seed_full_history_enrollment
 from tests.reaction_helpers import make_reaction_freshener
 
 # ---------------------------------------------------------------------------
@@ -71,6 +72,16 @@ def _make_db() -> Iterator[sqlite3.Connection]:
                 read_inbox_max_id   INTEGER,
                 read_outbox_max_id  INTEGER
             )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE full_history_enrollment (
+                dialog_id INTEGER PRIMARY KEY,
+                enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
+                source TEXT NOT NULL CHECK(source IN ('explicit', 'automatic', 'migration')),
+                updated_at INTEGER NOT NULL
+            ) WITHOUT ROWID
             """
         )
         conn.execute(
@@ -156,11 +167,12 @@ def _make_db() -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
-def _insert_synced_dialog(
+def _insert_synced_dialog(  # noqa: PLR0913
     conn: sqlite3.Connection,
     dialog_id: int,
     *,
     status: str = "synced",
+    enrollment_enabled: bool = False,
     read_inbox_max_id: int | None = None,
     read_outbox_max_id: int | None = None,
 ) -> None:
@@ -168,6 +180,7 @@ def _insert_synced_dialog(
         "INSERT INTO synced_dialogs (dialog_id, status, read_inbox_max_id, read_outbox_max_id) VALUES (?, ?, ?, ?)",
         (dialog_id, status, read_inbox_max_id, read_outbox_max_id),
     )
+    seed_full_history_enrollment(conn, dialog_id, enabled=enrollment_enabled)
     conn.commit()
 
 

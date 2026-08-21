@@ -30,6 +30,7 @@ from telethon.tl import types  # type: ignore[import-untyped]
 
 from .access_lifecycle import set_access_lost
 from .flood import flood_seconds, sleep_through_flood
+from .history_enrollment import ensure_automatic_dm_enrollment, full_history_enabled
 from .messages.sqlite_repository import insert_messages_with_fts
 from .messages.telegram_adapter import PeerNameClient, extract_message_row, resolve_forward_entity_name_map
 from .resolver import latinize
@@ -40,20 +41,22 @@ logger = logging.getLogger(__name__)
 _BATCH_SIZE = 100
 
 _NEXT_PENDING_SQL = (
-    "SELECT dialog_id, sync_progress FROM synced_dialogs "
-    "WHERE status IN ('syncing', 'not_synced') "
+    "SELECT sd.dialog_id, sd.sync_progress FROM synced_dialogs sd "
+    "JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1 "
+    "WHERE sd.status IN ('syncing', 'not_synced') "
     "ORDER BY rowid LIMIT 1"
 )
 _UPDATE_PROGRESS_SQL = (
     "UPDATE synced_dialogs SET sync_progress = ?, status = ?, "
-    "total_messages = COALESCE(?, total_messages) WHERE dialog_id = ?"
+    "total_messages = COALESCE(?, total_messages) WHERE dialog_id = ? "
+    "AND EXISTS (SELECT 1 FROM full_history_enrollment WHERE dialog_id = ? AND enabled = 1)"
 )
 _UPDATE_PROGRESS_DONE_SQL = (
     "UPDATE synced_dialogs SET sync_progress = ?, status = ?, total_messages = COALESCE(?, total_messages), "
-    "last_synced_at = ? WHERE dialog_id = ?"
+    "last_synced_at = ? WHERE dialog_id = ? "
+    "AND EXISTS (SELECT 1 FROM full_history_enrollment WHERE dialog_id = ? AND enabled = 1)"
 )
 
-INSERT_DIALOG_SQL = "INSERT OR IGNORE INTO synced_dialogs (dialog_id, status) VALUES (?, 'syncing')"
 UPSERT_ENTITY_SQL = (
     "INSERT OR REPLACE INTO entities (id, type, name, username, name_normalized, updated_at) VALUES (?, ?, ?, ?, ?, ?)"
 )
@@ -173,8 +176,8 @@ class FullSyncWorker:
             async for dialog in self._client.iter_dialogs():
                 if not isinstance(dialog.entity, types.User):
                     continue
-                cursor = self._conn.execute(INSERT_DIALOG_SQL, (dialog.id,))
-                if cursor.rowcount > 0:
+                outcome = ensure_automatic_dm_enrollment(self._conn, dialog.id, now=now)
+                if outcome.action == "queue_full_history":
                     enrolled += 1
                 entity = dialog.entity
                 first = getattr(entity, "first_name", None) or ""
@@ -267,6 +270,8 @@ class FullSyncWorker:
         Returns:
             (new_progress, is_done)
         """
+        if not full_history_enabled(self._conn, dialog_id):
+            return sync_progress, True
         if sync_progress == 0:
             logger.info("sync_start dialog_id=%d", dialog_id)
         try:
@@ -286,7 +291,8 @@ class FullSyncWorker:
         except ACCESS_LOST_ERRORS as exc:
             logger.warning("access_lost dialog_id=%d — %s: %s", dialog_id, type(exc).__name__, exc)
             now = int(time.time())
-            set_access_lost(self._conn, dialog_id, now)
+            if full_history_enabled(self._conn, dialog_id):
+                set_access_lost(self._conn, dialog_id, now)
             return sync_progress, True
         except RPCError as exc:
             logger.exception(
@@ -314,7 +320,7 @@ class FullSyncWorker:
             with self._conn:
                 self._conn.execute(
                     _UPDATE_PROGRESS_DONE_SQL,
-                    (sync_progress, "synced", total_messages, now, dialog_id),
+                    (sync_progress, "synced", total_messages, now, dialog_id, dialog_id),
                 )
             logger.info("sync_done dialog_id=%d status=synced (empty batch)", dialog_id)
             return sync_progress, True
@@ -332,17 +338,20 @@ class FullSyncWorker:
 
         # Single atomic transaction: messages + FTS + progress update
         with self._conn:
+            if not full_history_enabled(self._conn, dialog_id):
+                logger.info("sync_batch_discarded_disabled dialog_id=%d fetched=%d", dialog_id, len(rows))
+                return sync_progress, True
             insert_messages_with_fts(self._conn, rows)
             if is_done:
                 now = int(time.time())
                 self._conn.execute(
                     _UPDATE_PROGRESS_DONE_SQL,
-                    (new_progress, new_status, total_messages, now, dialog_id),
+                    (new_progress, new_status, total_messages, now, dialog_id, dialog_id),
                 )
             else:
                 self._conn.execute(
                     _UPDATE_PROGRESS_SQL,
-                    (new_progress, new_status, total_messages, dialog_id),
+                    (new_progress, new_status, total_messages, dialog_id, dialog_id),
                 )
 
         logger.debug(

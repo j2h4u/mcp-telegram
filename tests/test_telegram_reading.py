@@ -32,6 +32,7 @@ from mcp_telegram.telegram_reading import (
     GatewayFailureKind,
     ReadDateFetchResult,
 )
+from tests.history_enrollment_helpers import seed_full_history_enrollment
 
 
 class _RequestWithPeer(Protocol):
@@ -79,6 +80,13 @@ def _seed_synced(conn: sqlite3.Connection, dialog_id: int) -> None:
         "INSERT INTO synced_dialogs (dialog_id, status, read_inbox_max_id) VALUES (?, 'synced', 0)",
         (dialog_id,),
     )
+    seed_full_history_enrollment(conn, dialog_id, enabled=True)
+    conn.commit()
+
+
+def _seed_enrollment(conn: sqlite3.Connection, dialog_id: int, *, enabled: bool = True) -> None:
+    """Seed the v34 durable authorization for direct fact-persistence tests."""
+    seed_full_history_enrollment(conn, dialog_id, enabled=enabled)
     conn.commit()
 
 
@@ -504,6 +512,7 @@ async def test_read_at_enrichment_only_probes_outgoing_user_dm_and_never_falls_b
     make_synced_db: Callable[[], sqlite3.Connection],
 ) -> None:
     conn = make_synced_db()
+    _seed_enrollment(conn, 42)
     calls: list[int] = []
 
     class Gateway:
@@ -540,6 +549,7 @@ async def test_read_at_preserves_duplicate_eligible_ids_in_source_order(
 ) -> None:
     """Each eligible source row is probed and projected in its original order."""
     conn = make_synced_db()
+    _seed_enrollment(conn, 42)
     calls: list[int] = []
 
     class Gateway:
@@ -611,6 +621,7 @@ async def test_read_at_projects_telegram_date_for_own_dm_only(
     make_synced_db: Callable[[], sqlite3.Connection],
 ) -> None:
     conn = make_synced_db()
+    _seed_enrollment(conn, 42)
     calls: list[int] = []
 
     class Gateway:
@@ -639,6 +650,7 @@ async def test_read_at_unavailable_is_nullable_but_probe_status_is_persisted(
     make_synced_db: Callable[[], sqlite3.Connection],
 ) -> None:
     conn = make_synced_db()
+    _seed_enrollment(conn, 42)
     calls: list[int] = []
 
     class Gateway:
@@ -668,6 +680,7 @@ async def test_read_at_stops_after_persistence_operational_error_with_prior_comm
     import mcp_telegram.telegram_fact_queries as fact_queries
 
     conn = make_synced_db()
+    _seed_enrollment(conn, 42)
     calls: list[int] = []
 
     class Gateway:

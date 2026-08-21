@@ -32,6 +32,7 @@ from .access_lifecycle import (
     stamp_access_revalidation,
 )
 from .flood import flood_seconds, sleep_through_flood
+from .history_enrollment import full_history_enabled
 from .message_contracts import ExtractedMessage
 from .messages.sqlite_repository import insert_messages_with_fts
 from .messages.telegram_adapter import extract_message_row
@@ -81,17 +82,15 @@ class AccessProbePolicy:
 RECENT_SYNC_SKIP_THRESHOLD_S: int = 3600
 
 _SELECT_SYNCED_DIALOGS_FOR_DELTA_SQL = """
-SELECT dialog_id, last_synced_at, last_delta_checked_at, delta_refresh_requested_at
-FROM synced_dialogs
-WHERE status = 'synced'
+SELECT sd.dialog_id, sd.last_synced_at, sd.last_delta_checked_at, sd.delta_refresh_requested_at
+FROM synced_dialogs sd
+JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1
+WHERE sd.status = 'synced'
 ORDER BY
-    CASE WHEN delta_refresh_requested_at IS NULL THEN 1 ELSE 0 END,
-    COALESCE(delta_refresh_requested_at, last_delta_checked_at, last_synced_at, 0),
-    dialog_id
+    CASE WHEN sd.delta_refresh_requested_at IS NULL THEN 1 ELSE 0 END,
+    COALESCE(sd.delta_refresh_requested_at, sd.last_delta_checked_at, sd.last_synced_at, 0),
+    sd.dialog_id
 """
-# Backward-compat alias (no external importers, kept for safety)
-_SELECT_SYNCED_DIALOG_IDS_SQL = _SELECT_SYNCED_DIALOGS_FOR_DELTA_SQL
-
 _SELECT_MAX_MESSAGE_ID_SQL = "SELECT COALESCE(MAX(message_id), 0) FROM messages WHERE dialog_id = ?"
 _SELECT_DELTA_OBSERVABILITY_SQL = """
 SELECT
@@ -101,8 +100,9 @@ SELECT
     MIN(last_delta_checked_at) AS oldest_delta_checked_at,
     MAX(last_delta_checked_at) AS newest_delta_checked_at,
     SUM(delta_refresh_requested_at IS NOT NULL) AS pending_refresh
-FROM synced_dialogs
-WHERE status = 'synced'
+FROM synced_dialogs sd
+JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1
+WHERE sd.status = 'synced'
 """
 
 # Stamp delta checkpoint on successful delta completion.
@@ -110,10 +110,11 @@ WHERE status = 'synced'
 _UPDATE_DELTA_CHECKPOINT_SQL = (
     "UPDATE synced_dialogs "
     "SET last_synced_at = ?, last_delta_checked_at = ?, delta_refresh_requested_at = NULL "
-    "WHERE dialog_id = ?"
+    "WHERE dialog_id = ? AND EXISTS (SELECT 1 FROM full_history_enrollment WHERE dialog_id = ? AND enabled = 1)"
 )
 _UPDATE_DELTA_CHECKED_SQL = (
-    "UPDATE synced_dialogs SET last_delta_checked_at = ?, delta_refresh_requested_at = NULL WHERE dialog_id = ?"
+    "UPDATE synced_dialogs SET last_delta_checked_at = ?, delta_refresh_requested_at = NULL WHERE dialog_id = ? "
+    "AND EXISTS (SELECT 1 FROM full_history_enrollment WHERE dialog_id = ? AND enabled = 1)"
 )
 
 
@@ -248,10 +249,10 @@ class DeltaSyncWorker:
         self._shutdown_event = shutdown_event
 
     def _stamp_delta_checkpoint(self, dialog_id: int, checked_at: int) -> None:
-        self._conn.execute(_UPDATE_DELTA_CHECKPOINT_SQL, (checked_at, checked_at, dialog_id))
+        self._conn.execute(_UPDATE_DELTA_CHECKPOINT_SQL, (checked_at, checked_at, dialog_id, dialog_id))
 
     def _stamp_delta_checked(self, dialog_id: int, checked_at: int) -> None:
-        self._conn.execute(_UPDATE_DELTA_CHECKED_SQL, (checked_at, dialog_id))
+        self._conn.execute(_UPDATE_DELTA_CHECKED_SQL, (checked_at, dialog_id, dialog_id))
 
     def _delta_observability(self, now: int) -> DeltaCatchUpObservability:
         row = cast(
@@ -347,7 +348,7 @@ class DeltaSyncWorker:
         )
         return total_new
 
-    async def fetch_delta_for_dialog(self, dialog_id: int) -> int:
+    async def fetch_delta_for_dialog(self, dialog_id: int) -> int:  # noqa: PLR0911, PLR0912
         """Fetch all messages newer than max known message_id for one dialog.
 
         Public API: used by probe-worker for gap-fill after access recovery.
@@ -358,6 +359,8 @@ class DeltaSyncWorker:
         Returns:
             Count of new messages stored. 0 if no gap, no baseline, or error.
         """
+        if not full_history_enabled(self._conn, dialog_id):
+            return 0
         row = cast(
             tuple[object | None, ...] | None, self._conn.execute(_SELECT_MAX_MESSAGE_ID_SQL, (dialog_id,)).fetchone()
         )
@@ -389,6 +392,9 @@ class DeltaSyncWorker:
             # dialog is deferred until the skip threshold expires (~1h).
             now = int(time.time())
             with self._conn:
+                if not full_history_enabled(self._conn, dialog_id):
+                    logger.info("delta_discarded_disabled dialog_id=%d fetched=%d", dialog_id, len(new_message_rows))
+                    return 0
                 if new_message_rows:
                     insert_messages_with_fts(self._conn, new_message_rows)
                 self._stamp_delta_checkpoint(dialog_id, now)
@@ -407,7 +413,8 @@ class DeltaSyncWorker:
                 type(exc).__name__,
             )
             now = int(time.time())
-            set_access_lost(self._conn, dialog_id, now, reason=type(exc).__name__)
+            if full_history_enabled(self._conn, dialog_id):
+                set_access_lost(self._conn, dialog_id, now, reason=type(exc).__name__)
             return 0
         except RPCError as exc:
             logger.exception(
@@ -419,12 +426,17 @@ class DeltaSyncWorker:
 
         if new_message_rows:
             with self._conn:
+                if not full_history_enabled(self._conn, dialog_id):
+                    logger.info("delta_discarded_disabled dialog_id=%d fetched=%d", dialog_id, len(new_message_rows))
+                    return 0
                 insert_messages_with_fts(self._conn, new_message_rows)
             logger.info("delta dialog_id=%d new_messages=%d", dialog_id, len(new_message_rows))
         # Stamp last_synced_at unconditionally on the success path so that
         # run_delta_catch_up's quick-restart skip check has a fresh anchor.
         with self._conn:
             now = int(time.time())
+            if not full_history_enabled(self._conn, dialog_id):
+                return 0
             self._stamp_delta_checkpoint(dialog_id, now)
         return len(new_message_rows)
 
@@ -454,7 +466,7 @@ async def run_delta_catch_up_loop(
 # ---------------------------------------------------------------------------
 
 
-async def _probe_access_lost_dialogs(
+async def _probe_access_lost_dialogs(  # noqa: PLR0915
     client: _DeltaSyncClient,
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,
@@ -483,6 +495,12 @@ async def _probe_access_lost_dialogs(
             # Success — access restored. Capture total before gap-fill.
             total = cast(int | None, getattr(result, "total", None))
 
+            if not full_history_enabled(conn, dialog_id):
+                logger.info("access_restored_disabled dialog_id=%d", dialog_id)
+                restore_access_after_revalidation(conn, dialog_id, int(time.time()), total_messages=total)
+                conn.commit()
+                continue
+
             # Gap-fill FIRST, while status is still access_lost.
             # If this fails, we skip the dialog — status stays access_lost.
             new_msgs = await delta_worker.fetch_delta_for_dialog(dialog_id)
@@ -490,6 +508,7 @@ async def _probe_access_lost_dialogs(
 
             # Gap-fill succeeded — NOW reset status to syncing.
             restore_access_after_revalidation(conn, dialog_id, int(time.time()), total_messages=total)
+            conn.commit()
             logger.info("access_restored dialog_id=%d total=%s", dialog_id, total)
             restored += 1
         except ACCESS_LOST_ERRORS:

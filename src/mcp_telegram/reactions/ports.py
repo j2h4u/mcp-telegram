@@ -14,6 +14,7 @@ class TelegramReactionGateway(Protocol):
 
 
 class ReactionSnapshotRepository(Protocol):
+    def history_enabled(self, dialog_id: int) -> bool: ...
     def transaction(self) -> AbstractContextManager[None]: ...
 
     def stale_reaction_ids(

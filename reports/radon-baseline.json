@@ -18,6 +18,8 @@
     "daemon_activity_stats.py::get_my_recent_activity": 13,
     "daemon_api.py::DaemonAPIServer._resolve_dialog_name": 14,
     "daemon_api.py::_SubmitFeedbackRequest.parse": 12,
+    "daemon_api.py::DaemonAPIServer._get_sync_status": 11,
+    "daemon_api.py::_get_sync_status": 11,
     "daemon_api.py::_resolve_dialog_name": 14,
     "daemon_entity_info.py::DaemonEntityInfoService._search_chat_photo_history": 17,
     "daemon_entity_info.py::_search_chat_photo_history": 17,
@@ -28,6 +30,9 @@
     "daemon_reading.py::DaemonReadingService._list_messages_context_result": 12,
     "daemon_reading.py::DaemonReadingService._list_messages_local_state_result": 11,
     "daemon_reading.py::_dialog_row_matches_filter": 13,
+    "delta_sync.py::DeltaSyncWorker.fetch_delta_for_dialog": 15,
+    "delta_sync.py::_probe_access_lost_dialogs": 11,
+    "delta_sync.py::fetch_delta_for_dialog": 15,
     "daemon_reading.py::_list_dialogs_sync": 23,
     "daemon_reading.py::_list_messages_context_result": 12,
     "daemon_reading.py::_list_messages_local_state_result": 11,
@@ -55,6 +60,8 @@
     "tools/reading.py::_list_messages_request_context": 13,
     "tools/reading.py::_resolve_topic_id": 13,
     "tools/reading.py::list_messages": 12,
-    "tools/stats.py::format_usage_summary": 12
+    "tools/stats.py::format_usage_summary": 12,
+    "reactions/refresh.py::ReactionFreshener.refresh": 11,
+    "reactions/refresh.py::refresh": 11
   }
 }

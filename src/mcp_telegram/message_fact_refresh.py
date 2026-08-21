@@ -27,6 +27,7 @@ _REACTION_CANDIDATES_SQL = """
 SELECT m.dialog_id, m.message_id
 FROM messages m
 JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id
+JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1
 WHERE sd.status = 'synced'
   AND EXISTS (
       SELECT 1
@@ -50,6 +51,7 @@ _READ_AT_CANDIDATES_SQL = """
 SELECT m.dialog_id, m.message_id, m.sent_at
 FROM messages m
 JOIN synced_dialogs sd ON sd.dialog_id = m.dialog_id
+JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1
 JOIN entities e ON e.id = m.dialog_id
 WHERE sd.status = 'synced'
   AND lower(e.type) = 'user'

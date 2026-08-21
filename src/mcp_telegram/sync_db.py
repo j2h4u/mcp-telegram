@@ -7,7 +7,7 @@ import sqlite3
 from pathlib import Path
 from typing import cast
 
-_CURRENT_SCHEMA_VERSION = 33
+_CURRENT_SCHEMA_VERSION = 34
 _SCHEMA_VERSION_WITH_FTS = 3
 
 logger = logging.getLogger(__name__)
@@ -191,6 +191,22 @@ CREATE TABLE IF NOT EXISTS daemon_state (
     key   TEXT PRIMARY KEY,
     value TEXT
 )
+"""
+
+# v34: durable authorization for full-history work.  Coverage/work status
+# remains in synced_dialogs; absence here means no operator decision.
+_FULL_HISTORY_ENROLLMENT_DDL = """
+CREATE TABLE IF NOT EXISTS full_history_enrollment (
+    dialog_id  INTEGER PRIMARY KEY,
+    enabled    INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+    source     TEXT NOT NULL CHECK (source IN ('explicit', 'automatic', 'migration')),
+    updated_at INTEGER NOT NULL
+) WITHOUT ROWID
+"""
+
+_FULL_HISTORY_ENROLLMENT_ENABLED_INDEX_DDL = """
+CREATE INDEX IF NOT EXISTS idx_full_history_enrollment_enabled
+ON full_history_enrollment(enabled, updated_at)
 """
 
 # ---------------------------------------------------------------------------
@@ -1348,6 +1364,27 @@ def _apply_migration_33(conn: sqlite3.Connection, current: int) -> int:
     )
 
 
+def _apply_migration_34(conn: sqlite3.Connection, current: int) -> int:
+    """Separate durable full-history intent from observed coverage status."""
+    return _apply_migration(
+        conn,
+        current,
+        34,
+        [
+            _FULL_HISTORY_ENROLLMENT_DDL,
+            _FULL_HISTORY_ENROLLMENT_ENABLED_INDEX_DDL,
+            """INSERT INTO full_history_enrollment(dialog_id, enabled, source, updated_at)
+               SELECT dialog_id,
+                      CASE WHEN status IN ('syncing', 'synced') THEN 1 ELSE 0 END,
+                      'migration',
+                      strftime('%s', 'now')
+               FROM synced_dialogs
+               WHERE status IN ('not_synced', 'own_only', 'fragment', 'syncing', 'synced', 'access_lost')
+               ON CONFLICT(dialog_id) DO NOTHING""",
+        ],
+    )
+
+
 def _apply_migrations(conn: sqlite3.Connection) -> None:
     """Apply WAL mode and all pending schema migrations in version order."""
     try:
@@ -1378,6 +1415,7 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     current = _apply_migration_31(conn, current)
     current = _apply_migration_32(conn, current)
     current = _apply_migration_33(conn, current)
+    current = _apply_migration_34(conn, current)
 
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 
