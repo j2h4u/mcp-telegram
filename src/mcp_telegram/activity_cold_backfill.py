@@ -36,7 +36,7 @@ from .activity_peer_sweep import (
     build_working_set,
     sweep_peer_once,
 )
-from .activity_sync import _ActivityClient
+from .activity_substrate import ActivityClient
 
 logger = logging.getLogger(__name__)
 
@@ -130,7 +130,7 @@ class _ColdPeerFinishContext:
 
 
 async def _run_cold_backfill_pass_safe(
-    client: _ActivityClient,
+    client: ActivityClient,
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,
     *,
@@ -161,7 +161,7 @@ def _cold_backfill_sleep_seconds(
 
 
 async def _maybe_enroll_activity_peers(
-    client: _ActivityClient,
+    client: ActivityClient,
     conn: sqlite3.Connection,
     last_enroll_at: float,
     pacing: ColdBackfillPacing,
@@ -256,7 +256,7 @@ def _finish_cold_backfill_peer(ctx: _ColdPeerFinishContext, pacing: ColdBackfill
 
 
 async def run_cold_backfill_pass(
-    client: _ActivityClient,
+    client: ActivityClient,
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,
     *,
@@ -346,7 +346,7 @@ async def run_cold_backfill_pass(
 
 
 async def run_cold_backfill_loop(
-    client: _ActivityClient,
+    client: ActivityClient,
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,
     *,

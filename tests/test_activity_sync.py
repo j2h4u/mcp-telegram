@@ -567,7 +567,7 @@ async def test_run_incremental_search_request_timeout(
     shutdown = asyncio.Event()
 
     # Patch timeout to 0.05s so the test is fast
-    with patch("mcp_telegram.activity_sync._SEARCH_RPC_TIMEOUT_S", 0.05):
+    with patch("mcp_telegram.activity_substrate.ACTIVITY_RPC_TIMEOUT_S", 0.05):
         with caplog.at_level(logging.WARNING, logger="mcp_telegram.activity_sync"):
             # Safety net: the whole call must finish well under 2s
             await asyncio.wait_for(
@@ -610,7 +610,7 @@ async def test_run_backfill_search_request_timeout(
     client = _HangingClient()
     shutdown = asyncio.Event()
 
-    with patch("mcp_telegram.activity_sync._SEARCH_RPC_TIMEOUT_S", 0.05):
+    with patch("mcp_telegram.activity_substrate.ACTIVITY_RPC_TIMEOUT_S", 0.05):
         with caplog.at_level(logging.WARNING, logger="mcp_telegram.activity_sync"):
             await asyncio.wait_for(
                 _run_backfill(client, conn, shutdown),

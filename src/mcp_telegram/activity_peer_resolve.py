@@ -19,7 +19,7 @@ from typing import Protocol, cast
 
 from telethon.tl.types import TypeInputChannel, TypeInputPeer
 
-from .activity_sync import _ActivityClient
+from .activity_substrate import ActivityClient
 
 logger = logging.getLogger(__name__)
 
@@ -227,7 +227,7 @@ def _write_linked_chat_resolution(payload: _LinkedChatCacheWrite) -> None:
 
 
 async def _resolve_linked_chat_live(
-    client: _ActivityClient,
+    client: ActivityClient,
     conn: sqlite3.Connection,
     channel_id: int,
     now: int,
@@ -261,7 +261,7 @@ async def _resolve_linked_chat_live(
 
 
 async def resolve_linked_chat_id(
-    client: _ActivityClient,
+    client: ActivityClient,
     conn: sqlite3.Connection,
     channel_id: int,
 ) -> LinkedChatResolution:

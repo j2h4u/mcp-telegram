@@ -1,9 +1,8 @@
 """Classification substrate for the account's own-message coverage.
 
-This module deliberately does not enroll dialogs or change message storage.  It
-provides the reusable decision and the local candidate query that future sync
-and read paths can consume.  Telegram entity fields are treated as untrusted
-input; only the presence of creator/admin rights is used for ownership.
+This module owns the reusable own-only decision and narrow local enrollment
+operations. Telegram entity fields are treated as untrusted input; only the
+presence of creator/admin rights is used for ownership.
 """
 
 from __future__ import annotations
@@ -165,6 +164,19 @@ def enroll_own_only_dialog(
         )
 
 
+def enroll_own_only_sync_dialog(conn: sqlite3.Connection, dialog_id: int) -> None:
+    """Enroll a dialog for own-message sync without changing coverage status.
+
+    ``INSERT OR IGNORE`` is intentional: an existing ``syncing``, ``synced``
+    or ``active`` row must never be downgraded to ``own_only``.
+    """
+    with conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO synced_dialogs (dialog_id, status) VALUES (?, 'own_only')",
+            (int(dialog_id),),
+        )
+
+
 def own_only_basis_by_dialog(conn: sqlite3.Connection) -> dict[int, tuple[str, ...]]:
     """Return persisted ownership bases, tolerating pre-cache test databases."""
     try:
@@ -219,6 +231,7 @@ __all__ = [
     "OwnOnlyContext",
     "classify_own_only_dialog",
     "enroll_own_only_dialog",
+    "enroll_own_only_sync_dialog",
     "ensure_own_only_schema",
     "own_only_basis_by_dialog",
     "query_own_only_candidates",

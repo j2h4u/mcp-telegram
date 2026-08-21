@@ -31,10 +31,11 @@ from telethon.tl.types import TypeInputPeer
 
 from .access_lifecycle import set_access_lost
 from .activity_peer_resolve import LinkedChatResolution, resolve_input_peer, resolve_linked_chat_id
-from .activity_sync import INSERT_OWN_ONLY_DIALOG_SQL, _ActivityClient, call_with_timeout, extract_dialog_id
+from .activity_substrate import ActivityClient, call_with_timeout
 from .message_contracts import ExtractedMessage
 from .messages.sqlite_repository import insert_messages_with_fts
-from .messages.telegram_adapter import extract_message_row
+from .messages.telegram_adapter import extract_dialog_id, extract_message_row
+from .own_only import enroll_own_only_sync_dialog
 from .telegram_access import ACCESS_LOST_ERRORS
 
 logger = logging.getLogger(__name__)
@@ -116,7 +117,7 @@ class SweepResult:
 class PeerSweepRequest:
     """Request context for a single per-peer self-search sweep."""
 
-    client: _ActivityClient
+    client: ActivityClient
     conn: sqlite3.Connection
     dialog_id: int
     offset_id: int
@@ -158,9 +159,9 @@ def _coerce_peer_sweep_request(*args: object, **kwargs: object) -> PeerSweepRequ
         return args[0]
 
     if len(args) == _LEGACY_PEER_SWEEP_POSITIONAL_ARGS:
-        client, conn, dialog_id = cast(tuple[_ActivityClient, sqlite3.Connection, int], args)
+        client, conn, dialog_id = cast(tuple[ActivityClient, sqlite3.Connection, int], args)
     else:
-        client = cast(_ActivityClient, kwargs.pop("client"))
+        client = cast(ActivityClient, kwargs.pop("client"))
         conn = cast(sqlite3.Connection, kwargs.pop("conn"))
         dialog_id = cast(int, kwargs.pop("dialog_id"))
 
@@ -402,7 +403,7 @@ def enroll_activity_dialog(
             """,
             (dialog_id, source, last_activity_at, now, now),
         )
-        conn.execute(INSERT_OWN_ONLY_DIALOG_SQL, (dialog_id,))
+        enroll_own_only_sync_dialog(conn, dialog_id)
         conn.execute(_INSERT_THIN_DIALOG_SQL, (dialog_id, now))
 
 
@@ -487,7 +488,7 @@ def _save_dialog_state(
 # ---------------------------------------------------------------------------
 
 
-async def build_working_set(client: _ActivityClient, conn: sqlite3.Connection) -> int:
+async def build_working_set(client: ActivityClient, conn: sqlite3.Connection) -> int:
     """Build the per-peer self-search working set and enroll peers.
 
     Source: dialogs.type='supergroup' (megagroups) and dialogs.type='channel'

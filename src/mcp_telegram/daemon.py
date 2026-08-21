@@ -58,7 +58,8 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
 
 from .activity_cold_backfill import ColdBackfillPacing, run_cold_backfill_loop
 from .activity_hot_sweep import run_hot_sweep_loop
-from .activity_sync import _ActivityClient, run_activity_sync_loop
+from .activity_substrate import ActivityClient
+from .activity_sync import run_activity_sync_loop
 from .config import McpTelegramConfig, SchedulingConfig, load_config, resolve_scheduling_config
 from .daemon_api import DaemonApiPolicy, DaemonAPIServer, DaemonClientLike
 from .delta_sync import (
@@ -1047,7 +1048,7 @@ async def _start_followup_background_tasks(
     ctx: _SyncMainContext,
     delta_worker: DeltaSyncWorker,
 ) -> None:
-    activity_client = cast(_ActivityClient, ctx.client)
+    activity_client = cast(ActivityClient, ctx.client)
     delta_client = cast(_DeltaSyncClient, ctx.client)
     _create_tracked_task(
         ctx,

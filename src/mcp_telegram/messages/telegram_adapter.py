@@ -18,6 +18,7 @@ from telethon.errors import (  # type: ignore[import-untyped]
     UserDeactivatedError,
     UserPrivacyRestrictedError,
 )
+from telethon.tl.types import TypePeer  # type: ignore[import-untyped]
 
 from .. import message_contracts as _message_contracts
 from ..telethon_media import describe_media
@@ -107,6 +108,18 @@ class _MessageLike(Protocol):
     media: object | None
     rich_message: object | None
     action: object | None
+
+
+def extract_dialog_id(message: object) -> int | None:
+    """Project a Telethon message/peer into the canonical dialog id."""
+    peer = getattr(message, "peer_id", None)
+    if peer is None:
+        return None
+    try:
+        return int(cast(int | str, tl_utils.get_peer_id(cast(TypePeer, peer))))
+    except Exception:
+        logger.warning("activity_sync_peer_id_unresolvable", exc_info=True)
+        return None
 
 
 def _attr[T](obj: object, name: str, default: T) -> T:

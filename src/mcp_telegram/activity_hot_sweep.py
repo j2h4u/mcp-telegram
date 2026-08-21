@@ -22,7 +22,7 @@ from .activity_peer_sweep import (
     build_working_set,
     sweep_peer_once,
 )
-from .activity_sync import _ActivityClient
+from .activity_substrate import ActivityClient
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +43,7 @@ class _HotSweepPeerOutcome:
 class _HotSweepPeerContext:
     """Context for processing a single peer in HotSweep."""
 
-    client: _ActivityClient
+    client: ActivityClient
     conn: sqlite3.Connection
     dialog_id: int
     old_hot_cursor: int | None
@@ -249,7 +249,7 @@ async def _run_hot_sweep_peer(ctx: _HotSweepPeerContext) -> _HotSweepPeerOutcome
 
 
 async def run_hot_sweep_pass(
-    client: _ActivityClient,
+    client: ActivityClient,
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,
 ) -> int:
@@ -329,7 +329,7 @@ async def run_hot_sweep_pass(
 
 
 async def run_hot_sweep_loop(
-    client: _ActivityClient,
+    client: ActivityClient,
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,
     *,

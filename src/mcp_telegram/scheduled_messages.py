@@ -22,7 +22,7 @@ from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
 from .access_lifecycle import set_access_lost
 from .activity_peer_resolve import resolve_linked_chat_id
-from .activity_sync import _ActivityClient
+from .activity_substrate import ActivityClient
 from .daemon_log_context import dialog_log_context
 from .fts import stem_text
 from .message_contracts import ExtractedMessage
@@ -387,7 +387,7 @@ class ScheduledMessageReconciler:
         personal_linked_chat_id = context.personal_channel_linked_chat_id
         if context.personal_channel_id is not None:
             resolution = await resolve_linked_chat_id(
-                cast(_ActivityClient, self._client), self._conn, context.personal_channel_id
+                cast(ActivityClient, self._client), self._conn, context.personal_channel_id
             )
             if resolution.flood_wait_seconds is not None:
                 _record_retry(
