@@ -64,6 +64,7 @@ capture_signals  # override of uvicorn.Server.capture_signals, called by uvicorn
 describe_source         # daemon_client.py:293
 export_source_changes   # daemon_client.py:297
 read_source_unit_window # daemon_client.py:317
+upsert_entities       # retained daemon-client API for external entity projection callers
 
 # Used in production but missed by vulture's call-graph (re-imports / dynamic use):
 open_sync_db_reader   # MCP read-path DB opener (sync_db.py:447)
