@@ -23,6 +23,39 @@ _FEEDBACK_MODEL_MAX_LEN = 200
 _FEEDBACK_HARNESS_MAX_LEN = 200
 
 
+def _parse_feedback_message(req: Mapping[str, object]) -> str:
+    message = req.get("message", "")
+    if not isinstance(message, str):
+        raise ValueError("message must be a string")
+
+    stripped = message.strip()
+    if not stripped:
+        raise ValueError("message is required")
+    if len(message) > _FEEDBACK_MESSAGE_MAX_LEN:
+        raise ValueError("message too long (max 10000 chars)")
+    return stripped
+
+
+def _parse_feedback_metadata(
+    req: Mapping[str, object],
+) -> tuple[str | None, object | None, object | None, object | None]:
+    severity = req.get("severity")
+    if severity is not None and severity not in VALID_SEVERITIES:
+        valid_list = ", ".join(sorted(VALID_SEVERITIES))
+        raise ValueError(f"severity must be one of: {valid_list}")
+
+    context = req.get("context")
+    model = req.get("model")
+    harness = req.get("harness")
+    if context is not None and len(str(context)) > _FEEDBACK_CONTEXT_MAX_LEN:
+        raise ValueError("context too long (max 2000 chars)")
+    if model is not None and len(str(model)) > _FEEDBACK_MODEL_MAX_LEN:
+        raise ValueError("model too long (max 200 chars)")
+    if harness is not None and len(str(harness)) > _FEEDBACK_HARNESS_MAX_LEN:
+        raise ValueError("harness too long (max 200 chars)")
+    return cast(str | None, severity), context, model, harness
+
+
 class FeedbackStore(Protocol):
     """Persistence port required by :class:`FeedbackApplicationService`."""
 
@@ -65,34 +98,12 @@ class _SubmitFeedbackRequest:
 
     @classmethod
     def parse(cls, req: Mapping[str, object]) -> _SubmitFeedbackRequest:
-        message = req.get("message", "")
-        if not isinstance(message, str):
-            raise ValueError("message must be a string")
-
-        stripped = message.strip()
-        if not stripped:
-            raise ValueError("message is required")
-        if len(message) > _FEEDBACK_MESSAGE_MAX_LEN:
-            raise ValueError("message too long (max 10000 chars)")
-
-        severity = req.get("severity")
-        if severity is not None and severity not in VALID_SEVERITIES:
-            valid_list = ", ".join(sorted(VALID_SEVERITIES))
-            raise ValueError(f"severity must be one of: {valid_list}")
-
-        context = req.get("context")
-        model = req.get("model")
-        harness = req.get("harness")
-        if context is not None and len(str(context)) > _FEEDBACK_CONTEXT_MAX_LEN:
-            raise ValueError("context too long (max 2000 chars)")
-        if model is not None and len(str(model)) > _FEEDBACK_MODEL_MAX_LEN:
-            raise ValueError("model too long (max 200 chars)")
-        if harness is not None and len(str(harness)) > _FEEDBACK_HARNESS_MAX_LEN:
-            raise ValueError("harness too long (max 200 chars)")
+        message = _parse_feedback_message(req)
+        severity, context, model, harness = _parse_feedback_metadata(req)
 
         return cls(
-            message=stripped,
-            severity=cast(str | None, severity),
+            message=message,
+            severity=severity,
             context=context,
             model=model,
             harness=harness,
