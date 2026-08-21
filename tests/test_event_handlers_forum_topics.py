@@ -181,7 +181,7 @@ def _topic_count(conn: _SQLiteConnection) -> int:
 
 
 def _make_manager(client: MagicMock, conn: _SQLiteConnection, ev: asyncio.Event) -> EventHandlerManager:
-    m = EventHandlerManager(client, conn, ev)
+    m = EventHandlerManager(client, conn, ev, client.get_input_entity)
     m.register()
     return m
 
@@ -788,7 +788,7 @@ def test_register_attaches_forum_topic_pinned_handler(
     shutdown_event: asyncio.Event,
 ) -> None:
     """register() adds on_raw_forum_topic_pinned as an event handler."""
-    mgr = EventHandlerManager(mock_client, sync_db, shutdown_event)
+    mgr = EventHandlerManager(mock_client, sync_db, shutdown_event, mock_client.get_input_entity)
     mgr.register()
 
     add_calls = mock_client.add_event_handler.call_args_list
@@ -802,7 +802,7 @@ def test_unregister_detaches_forum_topic_pinned_handler(
     shutdown_event: asyncio.Event,
 ) -> None:
     """unregister() removes on_raw_forum_topic_pinned."""
-    mgr = EventHandlerManager(mock_client, sync_db, shutdown_event)
+    mgr = EventHandlerManager(mock_client, sync_db, shutdown_event, mock_client.get_input_entity)
     mgr.register()
     mgr.unregister()
 

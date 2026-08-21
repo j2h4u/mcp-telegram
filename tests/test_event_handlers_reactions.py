@@ -153,7 +153,7 @@ def _count(conn: _SQLiteConnection, sql: str, parameters: tuple[object, ...] = (
 
 
 def _make_manager(client: MagicMock, conn: _SQLiteConnection, ev: asyncio.Event) -> EventHandlerManager:
-    m = EventHandlerManager(client, conn, ev)
+    m = EventHandlerManager(client, conn, ev, client.get_input_entity)
     m.register()
     return m
 
@@ -414,7 +414,7 @@ def test_register_unregister_register_no_double_handler(
     shutdown_event: asyncio.Event,
 ) -> None:
     """AC-REG-IDEMPOTENT: register -> unregister -> register; raw handler net 1 active."""
-    mgr = EventHandlerManager(mock_client, sync_db, shutdown_event)
+    mgr = EventHandlerManager(mock_client, sync_db, shutdown_event, mock_client.get_input_entity)
 
     mgr.register()
     mgr.unregister()

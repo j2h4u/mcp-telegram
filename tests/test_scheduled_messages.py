@@ -329,7 +329,8 @@ async def test_reconciliation_access_lost_candidate_log_has_dialog_context(
 
 @pytest.mark.asyncio
 async def test_raw_scheduled_updates_ingest_without_messages_row(conn: sqlite3.Connection) -> None:
-    manager = EventHandlerManager(MagicMock(), conn, asyncio.Event())
+    client = MagicMock()
+    manager = EventHandlerManager(client, conn, asyncio.Event(), client.get_input_entity)
     scheduled = _message(21, "created", scheduled_at=1_900_000_021)
     await manager.on_raw_new_scheduled_message(SimpleNamespace(message=scheduled))
     await manager.on_raw_delete_scheduled_messages(
@@ -346,7 +347,8 @@ async def test_raw_scheduled_updates_ingest_without_messages_row(conn: sqlite3.C
 async def test_publication_reconciliation_runs_before_sync_enrollment(conn: sqlite3.Connection) -> None:
     upsert_scheduled_message(conn, 42, _message(21), now=100)
     mark_scheduled_messages_removed(conn, 42, [21], [901], now=200)
-    manager = EventHandlerManager(MagicMock(), conn, asyncio.Event())
+    client = MagicMock()
+    manager = EventHandlerManager(client, conn, asyncio.Event(), client.get_input_entity)
     message = _message(901, "published")
     message.from_scheduled = True
 

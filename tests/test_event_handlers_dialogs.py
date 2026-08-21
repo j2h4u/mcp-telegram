@@ -168,7 +168,7 @@ def _last_event_at(conn: _SQLiteConnection, dialog_id: int) -> int | None:
 
 
 def _make_manager(client: MagicMock, conn: _SQLiteConnection, ev: asyncio.Event) -> EventHandlerManager:
-    m = EventHandlerManager(client, conn, ev)
+    m = EventHandlerManager(client, conn, ev, client.get_input_entity)
     m.register()
     return m
 
@@ -733,7 +733,7 @@ def test_register_attaches_three_new_handlers(
     shutdown_event: asyncio.Event,
 ) -> None:
     """Three new Phase 42 Plan 01 handlers (+ one Plan 02 handler) bring total to 11."""
-    mgr = EventHandlerManager(mock_client, sync_db, shutdown_event)
+    mgr = EventHandlerManager(mock_client, sync_db, shutdown_event, mock_client.get_input_entity)
     mgr.register()
     assert mock_client.add_event_handler.call_count == 13
 
@@ -744,7 +744,7 @@ def test_unregister_detaches_all_new_handlers(
     shutdown_event: asyncio.Event,
 ) -> None:
     """Every handler attached by register() is detached by unregister()."""
-    mgr = EventHandlerManager(mock_client, sync_db, shutdown_event)
+    mgr = EventHandlerManager(mock_client, sync_db, shutdown_event, mock_client.get_input_entity)
     mgr.register()
     mgr.unregister()
 

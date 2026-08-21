@@ -97,7 +97,7 @@ def make_manager(
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> EventHandlerManager:
-    return EventHandlerManager(mock_client, sync_db, shutdown_event)
+    return EventHandlerManager(mock_client, sync_db, shutdown_event, mock_client.get_input_entity)
 
 
 def insert_synced_dialog(conn: _SQLiteConnection, dialog_id: int) -> None:
@@ -1397,11 +1397,13 @@ class _LinkedChatFakeClient:
         # Attributes expected by EventHandlerManager constructor
         self.add_event_handler = MagicMock()
         self.remove_event_handler = MagicMock()
+        self.input_entity_calls: list[int] = []
         self.call_args_list: list[object] = []
 
     async def get_input_entity(self, dialog_id: object) -> object:
         if self._forbid_call:
             raise AssertionError("get_input_entity must not be called")
+        self.input_entity_calls.append(int(dialog_id))
         return self._input_entity
 
     async def __call__(self, request: object) -> object:
@@ -1466,6 +1468,7 @@ async def test_linked_chat_refresh_updates_dialogs(
     after = int(time.time())
 
     # Exactly one GetFullChannelRequest was issued
+    assert client.input_entity_calls == [dialog_id]
     assert len(client.call_args_list) == 1
     assert isinstance(client.call_args_list[0], GetFullChannelRequest)
 
@@ -1528,6 +1531,81 @@ async def test_linked_chat_refresh_skips_never_resolved(
     assert row[0] is None, "linked_chat_id must remain NULL for never-resolved channel"
     assert row[1] is None, "linked_chat_resolved_at must remain NULL for never-resolved channel"
     assert row[2] == 1, "needs_refresh must be set by the original branch"
+
+
+@pytest.mark.asyncio
+async def test_linked_chat_refresh_skips_input_peer_cache_miss(
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """An injected resolver miss leaves the previously cached dialog unchanged."""
+    from telethon.tl.types import UpdateChannel  # type: ignore[import-untyped]
+
+    dialog_id = -1008887776665
+    channel_id = 8887776665
+    sync_db.execute(
+        "INSERT INTO dialogs (dialog_id, type, linked_chat_id, linked_chat_resolved_at, hidden) "
+        "VALUES (?, 'channel', -1001234567890, 1700000000, 0)",
+        (dialog_id,),
+    )
+    sync_db.commit()
+    insert_synced_dialog(sync_db, dialog_id)
+
+    client = _LinkedChatFakeClient(forbid_call=True)
+    resolver = AsyncMock(return_value=None)
+    manager = EventHandlerManager(
+        client,
+        sync_db,
+        shutdown_event,
+        resolver,
+    )
+    manager.register()
+
+    await manager.on_raw_channel_chat_update(UpdateChannel(channel_id=channel_id))
+
+    row = sync_db.execute(
+        "SELECT linked_chat_id, linked_chat_resolved_at, needs_refresh FROM dialogs WHERE dialog_id = ?",
+        (dialog_id,),
+    ).fetchone()
+    assert row == (-1001234567890, 1700000000, 1)
+    assert client.call_args_list == []
+    resolver.assert_awaited_once_with(dialog_id)
+
+
+@pytest.mark.asyncio
+async def test_linked_chat_refresh_exception_leaves_dialogs_unchanged(
+    sync_db: _SQLiteConnection,
+    shutdown_event: asyncio.Event,
+) -> None:
+    """A non-FloodWait RPC error is logged and leaves linked-chat state unchanged."""
+    from types import SimpleNamespace
+
+    from telethon.tl.types import UpdateChannel  # type: ignore[import-untyped]
+
+    dialog_id = -1002223334445
+    channel_id = 2223334445
+    sync_db.execute(
+        "INSERT INTO dialogs (dialog_id, type, linked_chat_id, linked_chat_resolved_at, hidden) "
+        "VALUES (?, 'channel', -1001111111111, 1700000000, 0)",
+        (dialog_id,),
+    )
+    sync_db.commit()
+    insert_synced_dialog(sync_db, dialog_id)
+
+    client = _LinkedChatFakeClient(
+        input_entity=SimpleNamespace(channel_id=channel_id),
+        full_channel_error=RuntimeError("temporary RPC failure"),
+    )
+    manager = make_manager(client, sync_db, shutdown_event)
+    manager.register()
+
+    await manager.on_raw_channel_chat_update(UpdateChannel(channel_id=channel_id))
+
+    row = sync_db.execute(
+        "SELECT linked_chat_id, linked_chat_resolved_at, needs_refresh FROM dialogs WHERE dialog_id = ?",
+        (dialog_id,),
+    ).fetchone()
+    assert row == (-1001111111111, 1700000000, 1)
 
 
 @pytest.mark.asyncio

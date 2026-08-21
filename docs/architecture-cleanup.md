@@ -10,7 +10,6 @@ this table until removed.
 
 | ID | Deprecated edge(s) | Owner / target | Removal condition |
 |---|---|---|---|
-| `ACT-002` | `event_handlers` → `activity_peer_resolve` | Sync/activity | Publish a small input-entity resolver contract and inject it into the handler. |
 | `SYNC-001` | `event_handlers` → `sync_worker` | Sync | Move dialog/entity upsert SQL to `sync_db` or an event-write service. |
 | `TG-001` | `telegram_fragments` → `messages.sqlite_repository` | Telegram/messages | Inject a message-write port at the fragment ingestion seam. |
 
@@ -20,11 +19,9 @@ the same change with an owner and a concrete removal condition.
 
 ## Next cleanup slices
 
-1. `ACT-002`: extract the shared peer resolver contract without inventing a
-   speculative product capability.
-2. `SYNC-001`: replace the direct worker reach with a daemon-wired application
+1. `SYNC-001`: replace the direct worker reach with a daemon-wired application
    service.
-3. `TG-001`: introduce the message write boundary only once the fragment path
+2. `TG-001`: introduce the message write boundary only once the fragment path
    has a real interchangeable dependency.
 
 The READ-001/READ-002 frontier is closed. Reading orchestration and SQLite
