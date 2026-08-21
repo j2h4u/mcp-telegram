@@ -58,7 +58,12 @@ from mcp_telegram.tools import (
     submit_feedback,
     trace_account_messages,
 )
-from mcp_telegram.tools._base import DaemonNotRunningError, ToolResult, _daemon_not_running_text
+from mcp_telegram.tools._base import (
+    DaemonNotRunningError,
+    ToolResult,
+    _daemon_not_running_text,
+    omit_none_mapping_values,
+)
 from mcp_telegram.tools.stats import GetDialogStats, GetUsageStats, get_dialog_stats, get_usage_stats
 
 StructuredResult = ToolResult | CallToolResult
@@ -920,7 +925,7 @@ async def test_list_dialogs_passes_limit_to_daemon():
     assert _call_kwargs(conn.list_dialogs)["limit"] == 1
 
 
-async def test_list_dialogs_structured_output_allows_null_name():
+async def test_list_dialogs_output_schema_omits_nullable_name():
     conn = _make_daemon_conn(
         {
             "ok": True,
@@ -948,8 +953,9 @@ async def test_list_dialogs_structured_output_allows_null_name():
     dialogs_schema = cast(dict[str, object], properties["dialogs"])
     items_schema = cast(dict[str, object], dialogs_schema["items"])
     name_schema = cast(dict[str, object], cast(dict[str, object], items_schema["properties"])["name"])
-    assert name_schema == {"type": ["string", "null"]}
+    assert name_schema == {"type": "string"}
     assert result.structured_content is not None
+    # Direct tool calls are pre-boundary internals; the MCP server compacts this.
     assert _json_dict(_json_list(_json_dict(result.structured_content)["dialogs"])[0])["name"] is None
 
 
@@ -959,7 +965,7 @@ def test_search_messages_schema_exposes_rendered_date() -> None:
     results = cast(dict[str, object], properties["results"])
     items = cast(dict[str, object], results["items"])
     item_properties = cast(dict[str, object], items["properties"])
-    assert item_properties["date"] == {"type": ["string", "null"]}
+    assert item_properties["date"] == {"type": "string"}
 
 
 def test_search_message_schema_accepts_topic_and_topic_absence() -> None:
@@ -986,6 +992,7 @@ def test_search_message_schema_accepts_topic_and_topic_absence() -> None:
     )[0]
     titled["date"] = None
     titled["published_at"] = None
+    titled = cast(dict[str, object], omit_none_mapping_values(titled))
     validate(titled, item_schema)
     assert titled["topic"] == {"title": "Reports"}
 
@@ -1004,6 +1011,7 @@ def test_search_message_schema_accepts_topic_and_topic_absence() -> None:
     )[0]
     without_topic["date"] = None
     without_topic["published_at"] = None
+    without_topic = cast(dict[str, object], omit_none_mapping_values(without_topic))
     validate(without_topic, item_schema)
     assert "topic" not in without_topic
 
@@ -1758,6 +1766,7 @@ async def test_trace_content_schema_matches_canonical_body_presence(
         result = await trace_account_messages(TraceAccountMessages(exact_account_id=101))
 
     payload = _json_dict(result.structured_content)
+    payload = cast(dict[str, object], omit_none_mapping_values(payload))
     validate(payload, cast(dict[str, object], TOOL_REGISTRY["trace_account_messages"].output_schema))
     item = _json_dict(_json_list(_json_dict(_json_list(payload["groups"])[0])["evidence"])[0])
     if expected_content is None:
@@ -2776,8 +2785,8 @@ def test_get_inbox_output_schema_declares_applied_since_utc():
     schema = TOOL_REGISTRY["get_inbox"].output_schema
     assert schema is not None
     properties = _json_dict(schema["properties"])
-    assert properties["applied_since_utc"] == {"type": ["string", "null"]}
-    assert "applied_since_utc" in _json_list(schema["required"])
+    assert properties["applied_since_utc"] == {"type": "string"}
+    assert "applied_since_utc" not in _json_list(schema["required"])
 
 
 async def test_get_inbox_empty_with_bootstrap_pending():
