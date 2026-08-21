@@ -166,13 +166,14 @@ async def _maybe_enroll_activity_peers(
     conn: sqlite3.Connection,
     last_enroll_at: float,
     pacing: ColdBackfillPacing,
+    timeout_s: float,
 ) -> float:
     now_mono = asyncio.get_running_loop().time()
     if now_mono - last_enroll_at < pacing.history.enroll_s:
         return last_enroll_at
 
     try:
-        enrolled = await build_working_set(client, conn)
+        enrolled = await build_working_set(client, conn, timeout_s=timeout_s)
         logger.debug("activity_cold_backfill_enroll enrolled=%d", enrolled)
     except Exception:
         logger.warning("activity_cold_backfill_enroll_error", exc_info=True)
@@ -376,7 +377,7 @@ async def run_cold_backfill_loop(  # noqa: PLR0913 - explicit worker state and i
     while not shutdown_event.is_set():
         # Throttled enrollment — call build_working_set no more than once per
         # pacing.history.enroll_s so peer set stays current without over-calling.
-        last_enroll_at = await _maybe_enroll_activity_peers(client, conn, last_enroll_at, pacing)
+        last_enroll_at = await _maybe_enroll_activity_peers(client, conn, last_enroll_at, pacing, timeout_s)
 
         pass_result = await _run_cold_backfill_pass_safe(
             client, conn, shutdown_event, pacing=pacing, timeout_s=timeout_s

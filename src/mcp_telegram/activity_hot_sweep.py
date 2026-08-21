@@ -271,7 +271,7 @@ async def run_hot_sweep_pass(
     now = int(time.time())
 
     # Step 1: cheap working-set refresh — also refreshes last_activity_at
-    await build_working_set(client, conn)
+    await build_working_set(client, conn, timeout_s=timeout_s)
 
     # Step 2: select hot, due peers — recency-bounded to 30 days
     cutoff = now - 30 * 86400

@@ -30,6 +30,7 @@ from mcp_telegram.activity_cold_backfill import (
     ColdPassOutcome,
     ColdPassResult,
     _cold_backfill_sleep_seconds,
+    _maybe_enroll_activity_peers,
     _run_cold_backfill_pass_safe,
     run_cold_backfill_pass,
 )
@@ -182,15 +183,26 @@ def _patch_sweep(
     return call_log
 
 
-def _patch_build_working_set(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def _noop(client: object, conn: sqlite3.Connection) -> int:
+def _patch_build_working_set(monkeypatch: pytest.MonkeyPatch, timeout_calls: list[float] | None = None) -> None:
+    async def _noop(client: object, conn: sqlite3.Connection, *, timeout_s: float) -> int:
         del client, conn
+        if timeout_calls is not None:
+            timeout_calls.append(timeout_s)
         return 0
 
     monkeypatch.setattr(
         "mcp_telegram.activity_cold_backfill.build_working_set",
         _noop,
     )
+
+
+@pytest.mark.asyncio
+async def test_cold_enrollment_forwards_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    timeout_calls: list[float] = []
+    _patch_build_working_set(monkeypatch, timeout_calls)
+    with _make_db() as conn:
+        await _maybe_enroll_activity_peers(_FakeClient(), conn, 0.0, _PACING, _TEST_TIMEOUT_S)
+    assert timeout_calls == [_TEST_TIMEOUT_S]
 
 
 # ---------------------------------------------------------------------------

@@ -171,11 +171,17 @@ def _patch_sweep(
     return call_log
 
 
-def _patch_build_working_set(monkeypatch: pytest.MonkeyPatch, enrolled_count: int = 0) -> None:
+def _patch_build_working_set(
+    monkeypatch: pytest.MonkeyPatch,
+    enrolled_count: int = 0,
+    timeout_calls: list[float] | None = None,
+) -> None:
     """Patch build_working_set to a no-op (enrollment already done in test)."""
 
-    async def _noop(client: object, conn: sqlite3.Connection) -> int:
+    async def _noop(client: object, conn: sqlite3.Connection, *, timeout_s: float) -> int:
         del client, conn
+        if timeout_calls is not None:
+            timeout_calls.append(timeout_s)
         return enrolled_count
 
     monkeypatch.setattr(
@@ -197,7 +203,8 @@ async def test_stale_peer_not_selected(monkeypatch: pytest.MonkeyPatch) -> None:
         stale_ts = int(time.time()) - (31 * 86400)  # 31 days ago
         _enroll(conn, stale_dialog_id, last_activity_at=stale_ts)
 
-        _patch_build_working_set(monkeypatch)
+        timeout_calls: list[float] = []
+        _patch_build_working_set(monkeypatch, timeout_calls=timeout_calls)
         call_log = _patch_sweep(monkeypatch, {stale_dialog_id: []})
 
         shutdown = asyncio.Event()
@@ -205,6 +212,7 @@ async def test_stale_peer_not_selected(monkeypatch: pytest.MonkeyPatch) -> None:
 
         assert written == 0
         assert stale_dialog_id not in call_log, "Stale peer must not be swept — it is outside the 30-day window"
+        assert timeout_calls == [_TEST_TIMEOUT_S]
 
 
 @pytest.mark.asyncio

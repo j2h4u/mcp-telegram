@@ -492,7 +492,7 @@ def _save_dialog_state(
 # ---------------------------------------------------------------------------
 
 
-async def build_working_set(client: ActivityClient, conn: sqlite3.Connection) -> int:
+async def build_working_set(client: ActivityClient, conn: sqlite3.Connection, *, timeout_s: float) -> int:
     """Build the per-peer self-search working set and enroll peers.
 
     Source: dialogs.type='supergroup' (megagroups) and dialogs.type='channel'
@@ -525,7 +525,7 @@ async def build_working_set(client: ActivityClient, conn: sqlite3.Connection) ->
 
     # Step 3: resolve broadcast channels to their discussion groups
     for channel_id, channel_last_message_at in channel_rows:
-        res: LinkedChatResolution = await resolve_linked_chat_id(client, conn, channel_id)
+        res: LinkedChatResolution = await resolve_linked_chat_id(client, conn, channel_id, timeout_s=timeout_s)
 
         if res.flood_wait_seconds is not None:
             logger.warning(

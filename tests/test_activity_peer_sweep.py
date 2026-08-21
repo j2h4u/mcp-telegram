@@ -119,11 +119,15 @@ class _FakeResolver:
         self._mapping = mapping
         self.call_count = 0
         self.called_with: list[int] = []
+        self.timeouts: list[float] = []
 
-    async def __call__(self, client: object, conn: sqlite3.Connection, channel_id: int) -> LinkedChatResolution:
+    async def __call__(
+        self, client: object, conn: sqlite3.Connection, channel_id: int, *, timeout_s: float
+    ) -> LinkedChatResolution:
         del client, conn
         self.call_count += 1
         self.called_with.append(channel_id)
+        self.timeouts.append(timeout_s)
         return self._mapping.get(channel_id, LinkedChatResolution(linked_chat_id=None, flood_wait_seconds=None))
 
 
@@ -158,7 +162,7 @@ def test_supergroup_type_selected_not_group(monkeypatch: pytest.MonkeyPatch) -> 
             resolver,
         )
 
-        count = asyncio.run(build_working_set(_FakeClient(), conn))
+        count = asyncio.run(build_working_set(_FakeClient(), conn, timeout_s=120.0))
 
         assert count == 1, f"Expected 1 peer (only supergroup), got {count}"
         row = _get_activity_row(conn, supergroup_id)
@@ -184,7 +188,7 @@ def test_last_activity_at_from_dialogs(monkeypatch: pytest.MonkeyPatch) -> None:
             resolver,
         )
 
-        asyncio.run(build_working_set(_FakeClient(), conn))
+        asyncio.run(build_working_set(_FakeClient(), conn, timeout_s=120.0))
 
         row = _get_activity_row(conn, peer_id)
         assert row is not None
@@ -218,9 +222,10 @@ def test_channel_no_discussion_group_not_enrolled(monkeypatch: pytest.MonkeyPatc
             resolver,
         )
 
-        count = asyncio.run(build_working_set(_FakeClient(), conn))
+        count = asyncio.run(build_working_set(_FakeClient(), conn, timeout_s=120.0))
 
         assert count == 0, f"Expected 0 peers enrolled, got {count}"
+        assert resolver.timeouts == [120.0]
         assert _get_activity_row(conn, channel_id) is None, "Channel with no discussion group must NOT be enrolled"
 
 
@@ -248,7 +253,7 @@ def test_dedup_supergroup_and_linked_chat(monkeypatch: pytest.MonkeyPatch) -> No
             resolver,
         )
 
-        count = asyncio.run(build_working_set(_FakeClient(), conn))
+        count = asyncio.run(build_working_set(_FakeClient(), conn, timeout_s=120.0))
 
         assert count == 1, f"Expected 1 peer (dedup), got {count}"
         row = _get_activity_row(conn, supergroup_id)
@@ -286,8 +291,11 @@ def test_build_working_set_floodwait_halts_pass(monkeypatch: pytest.MonkeyPatch)
         all_channel_ids = {channel_a, channel_b, channel_c}
         call_log: list[int] = []
 
-        async def mock_resolver(client: object, conn: sqlite3.Connection, channel_id: int) -> LinkedChatResolution:
+        async def mock_resolver(
+            client: object, conn: sqlite3.Connection, channel_id: int, *, timeout_s: float
+        ) -> LinkedChatResolution:
             del client, conn
+            assert timeout_s == 120.0
             call_log.append(channel_id)
             if len(call_log) == 1:
                 # First channel visited → clean resolution with a linked chat
@@ -303,7 +311,7 @@ def test_build_working_set_floodwait_halts_pass(monkeypatch: pytest.MonkeyPatch)
             mock_resolver,
         )
 
-        asyncio.run(build_working_set(_FakeClient(), conn))
+        asyncio.run(build_working_set(_FakeClient(), conn, timeout_s=120.0))
 
         # Resolver called exactly twice: first (ok) + second (flood) → break
         assert len(call_log) == 2, f"Expected exactly 2 resolver calls, got {len(call_log)}: {call_log}"
