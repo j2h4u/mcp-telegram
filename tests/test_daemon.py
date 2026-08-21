@@ -231,6 +231,10 @@ def test_sync_main_runs_fts_backfill_before_connect(
     instant_shutdown_event: asyncio.Event,
 ) -> None:
     """Startup order keeps FTS backfill ahead of Telegram connect."""
+    from functools import partial
+
+    from mcp_telegram.activity_peer_resolve import resolve_input_peer
+
     call_order: list[str] = []
 
     async def _fake_fts_backfill(ctx) -> None:
@@ -256,7 +260,7 @@ def test_sync_main_runs_fts_backfill_before_connect(
         patch("mcp_telegram.daemon._run_fts_backfill", side_effect=_fake_fts_backfill),
         patch("mcp_telegram.daemon._connect_telegram", side_effect=_fake_connect_telegram),
         patch("mcp_telegram.daemon._prime_runtime", side_effect=_noop),
-        patch("mcp_telegram.daemon.EventHandlerManager", return_value=mock_handler_manager),
+        patch("mcp_telegram.daemon.EventHandlerManager", return_value=mock_handler_manager) as mock_handler_class,
         patch("mcp_telegram.daemon._start_bootstrap_background_tasks", side_effect=_noop),
         patch("mcp_telegram.daemon._start_followup_background_tasks", side_effect=_noop),
         patch("mcp_telegram.daemon._run_sync_loop", side_effect=_noop),
@@ -264,6 +268,13 @@ def test_sync_main_runs_fts_backfill_before_connect(
         asyncio.run(sync_main())
 
     assert call_order == ["fts", "connect"], call_order
+    mock_handler_class.assert_called_once()
+    handler_args = mock_handler_class.call_args.args
+    assert handler_args[2] is instant_shutdown_event
+    assert len(handler_args) == 4
+    assert isinstance(handler_args[3], partial)
+    assert handler_args[3].func is resolve_input_peer
+    assert handler_args[3].args == (handler_args[0],)
 
 
 def test_sync_main_ensures_schema(

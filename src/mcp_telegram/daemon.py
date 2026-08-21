@@ -42,6 +42,7 @@ import sqlite3
 import time
 from collections.abc import Coroutine, Iterator, Sequence
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Protocol, cast
 
@@ -57,7 +58,9 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
 )
 
 from .activity_cold_backfill import ColdBackfillPacing, run_cold_backfill_loop
+from .activity_contracts import InputPeerResolver
 from .activity_hot_sweep import run_hot_sweep_loop
+from .activity_peer_resolve import resolve_input_peer
 from .activity_substrate import ActivityClient
 from .activity_sync import run_activity_sync_loop
 from .config import McpTelegramConfig, SchedulingConfig, load_config, resolve_scheduling_config
@@ -1211,7 +1214,8 @@ async def sync_main() -> None:
         )
         await _run_fts_backfill(ctx)
 
-        ctx.handler_manager = EventHandlerManager(ctx.client, ctx.conn, ctx.shutdown_event)
+        input_peer_resolver = cast(InputPeerResolver, partial(resolve_input_peer, cast(ActivityClient, ctx.client)))
+        ctx.handler_manager = EventHandlerManager(ctx.client, ctx.conn, ctx.shutdown_event, input_peer_resolver)
         ctx.handler_manager.register()
         logger.info("event handlers registered")
 

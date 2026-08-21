@@ -50,7 +50,7 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
 )
 from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
-from .activity_peer_resolve import _InputEntityResolverClient
+from .activity_contracts import InputPeerResolver
 from .history_enrollment import ensure_automatic_dm_enrollment
 from .messages.sqlite_repository import (
     insert_messages_with_fts,
@@ -185,8 +185,6 @@ class _EventHandlerClient(Protocol):
     def remove_event_handler(self, _callback: object) -> None: ...
 
     async def get_messages(self, *_args: object, **_kwargs: object) -> object: ...
-
-    async def get_input_entity(self, _dialog_id: int) -> object: ...
 
     async def __call__(self, _request: object) -> object: ...
 
@@ -338,10 +336,12 @@ class EventHandlerManager:
         client: _EventHandlerClient,
         conn: sqlite3.Connection,
         shutdown_event: asyncio.Event,
+        input_peer_resolver: InputPeerResolver,
     ) -> None:
         self._client = client
         self._conn = conn
         self._shutdown_event = shutdown_event
+        self._input_peer_resolver = input_peer_resolver
         self._shutdown_event.is_set()
         self._synced_dialog_ids: set[int] = set()
         self._realtime_history_status: _RealtimeHistoryStatusReader = _SQLiteRealtimeHistoryStatusReader(conn)
@@ -1524,11 +1524,9 @@ class EventHandlerManager:
         from telethon.tl.types import PeerChannel as _PeerChannel  # type: ignore[import-untyped]
         from telethon.utils import get_peer_id as _get_peer_id  # type: ignore[import-untyped]
 
-        from .activity_peer_resolve import resolve_input_peer
-
         input_channel = cast(
             TypeInputChannel | None,
-            await resolve_input_peer(cast(_InputEntityResolverClient, self._client), dialog_id),
+            await self._input_peer_resolver(dialog_id),
         )
         if input_channel is None:
             logger.debug("event_linked_chat_refresh_no_input_peer dialog_id=%d", dialog_id)
@@ -1715,6 +1713,5 @@ _EXPORTED_SYMBOLS = (
     EventHandlerManager.register,
     EventHandlerManager.unregister,
     EventHandlerManager.refresh_synced_dialogs,
-    _EventHandlerClient.get_input_entity,
     EventHandlerManager.run_dm_gap_scan,
 )

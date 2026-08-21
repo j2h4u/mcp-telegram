@@ -107,7 +107,7 @@ def _make_event(chat_id: int | None, max_id: int) -> _OutboxReadEvent:
 
 
 def _make_manager(client: MagicMock, conn: _SQLiteConnection, ev: asyncio.Event) -> EventHandlerManager:
-    return EventHandlerManager(client, conn, ev)
+    return EventHandlerManager(client, conn, ev, client.get_input_entity)
 
 
 # ---------------------------------------------------------------------------

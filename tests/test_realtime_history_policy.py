@@ -69,7 +69,7 @@ def sync_db(tmp_path: Path) -> Iterator[sqlite3.Connection]:
 def _manager(conn: sqlite3.Connection, client: MagicMock) -> EventHandlerManager:
     conn.execute("INSERT INTO synced_dialogs(dialog_id, status) VALUES (42, 'own_only')")
     conn.commit()
-    manager = EventHandlerManager(client, conn, asyncio.Event())
+    manager = EventHandlerManager(client, conn, asyncio.Event(), client.get_input_entity)
     manager.register()
     return manager
 
@@ -196,7 +196,7 @@ async def test_new_message_status_race_fails_closed_after_fetch(
         return {}
 
     monkeypatch.setattr("mcp_telegram.event_handlers._build_fwd_entity_map", fetch_forward)
-    manager = EventHandlerManager(client, sync_db, asyncio.Event())
+    manager = EventHandlerManager(client, sync_db, asyncio.Event(), client.get_input_entity)
     manager.register()
     await manager.on_new_message(SimpleNamespace(chat_id=42, is_private=False, message=build_mock_message(id=4)))
     assert sync_db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 0
