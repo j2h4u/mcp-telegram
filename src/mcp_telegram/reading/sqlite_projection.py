@@ -276,6 +276,7 @@ EFFECTIVE_SENDER_ID_SQL = _EFFECTIVE_SENDER_ID_EXPR + " AS effective_sender_id"
 # the raw sender_id OR, when sender_id IS NULL, from the effective_sender_id (peer
 # first_name for DM incoming; self name for DM outgoing - though "Я" wins at render).
 _SENDER_FIRST_NAME_SQL = "COALESCE(e_raw.name, e_eff.name, m.sender_first_name) AS sender_first_name"
+_SENDER_USERNAME_SQL = "COALESCE(e_raw.username, e_eff.username) AS sender_username"
 _SENDER_NAME_FILTER_SQL = "COALESCE(m.sender_first_name, e_raw.name, e_eff.name)"
 _SENDER_ENTITY_JOINS_SQL = (
     "LEFT JOIN entities e_raw ON e_raw.id = m.sender_id "
@@ -328,7 +329,7 @@ _SELECT_FTS_ALL_SQL = (
 
 _FETCH_UNREAD_MESSAGES_SQL = (
     f"SELECT m.message_id, m.sent_at, m.text, m.sender_id, "
-    f"{_SENDER_FIRST_NAME_SQL}, m.media_description, NULL AS content_kind, "
+    f"{_SENDER_FIRST_NAME_SQL}, {_SENDER_USERNAME_SQL}, m.media_description, NULL AS content_kind, "
     f"{EFFECTIVE_SENDER_ID_SQL}, m.is_service, m.out, m.dialog_id "
     f"FROM messages m "
     f"{_SENDER_ENTITY_JOINS_SQL}"
@@ -371,7 +372,17 @@ def _assert_select_columns_match_read_message() -> None:
     expected = frozenset(
         f.name
         for f in dc_fields(ReadMessage)
-        if f.name not in {"reactions_display", "dialog_name", "read_at", "reaction_events", "reaction_events_status"}
+        if f.name
+        not in {
+            "reactions_display",
+            "dialog_name",
+            "read_at",
+            "reaction_events",
+            "reaction_events_status",
+            # Username is an inbox-only enrichment; other read surfaces keep
+            # their existing SQL contract during this vertical slice.
+            "sender_username",
+        }
     )
     aliases = frozenset(re.findall(r"\bAS\s+(\w+)", _LIST_MESSAGES_BASE_SQL))
     bare = frozenset(re.findall(r"\b(?:m|mf)\.(\w+)\b", _LIST_MESSAGES_BASE_SQL))

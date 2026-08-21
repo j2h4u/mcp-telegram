@@ -672,6 +672,7 @@ async def test_list_unread_messages_carries_username_source_fact(
     _seed_synced(conn, dialog_id)
     conn.execute("UPDATE entities SET username = 'alice' WHERE id = ?", (dialog_id,))
     _seed_message(conn, dialog_id, 11)
+    conn.execute("UPDATE messages SET sender_id = NULL WHERE dialog_id = ? AND message_id = ?", (dialog_id, 11))
     conn.commit()
 
     server = make_server(conn, _TestClient())
@@ -680,6 +681,8 @@ async def test_list_unread_messages_carries_username_source_fact(
     assert result["ok"] is True
     groups = cast(list[dict[str, object]], cast(dict[str, object], result["data"])["groups"])
     assert groups[0]["username"] == "alice"
+    messages = cast(list[dict[str, object]], groups[0]["messages"])
+    assert messages[0]["sender_username"] == "alice"
 
 
 @pytest.mark.asyncio

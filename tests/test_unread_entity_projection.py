@@ -6,11 +6,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from mcp_telegram.models import ReadMessage
 from mcp_telegram.tools.unread import (
     GetInbox,
     GetUnreadSummary,
+    _project_message_sender,
     _project_unread_summary_dialog,
     _project_unread_summary_dialogs,
+    _structured_messages,
     get_inbox,
     get_unread_summary,
 )
@@ -65,6 +68,92 @@ def test_unread_summary_projection_helper_keeps_identity_contract_and_skips_bad_
             "last_message_at": None,
         }
     ]
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        (
+            ReadMessage(
+                message_id=1,
+                sent_at=1,
+                dialog_id=1001,
+                effective_sender_id=1001,
+                sender_first_name="Alice",
+                sender_username="alice",
+            ),
+            {"display_name": "Alice", "username": "@alice"},
+        ),
+        (
+            ReadMessage(
+                message_id=2,
+                sent_at=1,
+                dialog_id=1001,
+                effective_sender_id=777,
+                sender_first_name="Me",
+                sender_username="me",
+                out=1,
+            ),
+            {"display_name": "Me", "username": "@me"},
+        ),
+        (
+            ReadMessage(
+                message_id=3,
+                sent_at=1,
+                dialog_id=-1001,
+                sender_id=55,
+                effective_sender_id=55,
+                sender_first_name="Group member",
+                sender_username="member",
+            ),
+            {"display_name": "Group member", "username": "@member"},
+        ),
+        (
+            ReadMessage(
+                message_id=4,
+                sent_at=1,
+                dialog_id=-1001,
+                sender_id=56,
+                effective_sender_id=56,
+                sender_first_name="No Username",
+            ),
+            {"display_name": "No Username", "telegram_id": 56},
+        ),
+        (
+            ReadMessage(message_id=5, sent_at=1, dialog_id=-1001, is_service=1),
+            {"kind": "system"},
+        ),
+        (
+            ReadMessage(message_id=6, sent_at=1, dialog_id=-1001),
+            {"kind": "unknown"},
+        ),
+    ],
+    ids=["dm-incoming", "dm-outgoing-self", "group-username", "group-no-username", "system", "unknown"],
+)
+def test_inbox_sender_projection_uses_identity_contract_or_explicit_non_entity(
+    message: ReadMessage, expected: dict[str, object]
+) -> None:
+    assert _project_message_sender(message) == expected
+
+
+def test_structured_inbox_messages_remove_legacy_sender_identity_fields() -> None:
+    rows = [
+        {
+            "message_id": 1,
+            "sent_at": 1,
+            "dialog_id": 1001,
+            "effective_sender_id": 1001,
+            "sender_first_name": "Alice",
+            "sender_username": "@alice",
+            "out": 0,
+        }
+    ]
+
+    message = _structured_messages(rows, read_state=None, dialog_type="user")[0]
+
+    assert message["sender"] == {"display_name": "Alice", "username": "@alice"}
+    assert "sender_id" not in message
+    assert "effective_sender_id" not in message
 
 
 @pytest.mark.asyncio
