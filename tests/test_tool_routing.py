@@ -962,6 +962,52 @@ def test_search_messages_schema_exposes_rendered_date() -> None:
     assert item_properties["date"] == {"type": ["string", "null"]}
 
 
+def test_search_message_schema_accepts_topic_and_topic_absence() -> None:
+    from mcp_telegram.tools.reading import _search_result_structured_rows
+
+    schema = cast(dict[str, object], TOOL_REGISTRY["search_messages"].output_schema)
+    properties = cast(dict[str, object], schema["properties"])
+    results = cast(dict[str, object], properties["results"])
+    items = cast(dict[str, object], results["items"])
+    item_schema = cast(dict[str, object], items)
+
+    titled = _search_result_structured_rows(
+        [
+            {
+                "message_id": 1,
+                "dialog_id": -100,
+                "sent_at": 1_700_000_000,
+                "text": "Reports topic",
+                "forum_topic_id": 7,
+                "topic_title": "Reports",
+            }
+        ],
+        "topic",
+    )[0]
+    titled["date"] = None
+    titled["published_at"] = None
+    validate(titled, item_schema)
+    assert titled["topic"] == {"title": "Reports"}
+
+    without_topic = _search_result_structured_rows(
+        [
+            {
+                "message_id": 2,
+                "dialog_id": -100,
+                "sent_at": 1_700_000_001,
+                "text": "ordinary message",
+                "forum_topic_id": None,
+                "topic_title": None,
+            }
+        ],
+        "message",
+    )[0]
+    without_topic["date"] = None
+    without_topic["published_at"] = None
+    validate(without_topic, item_schema)
+    assert "topic" not in without_topic
+
+
 async def test_list_dialogs_sync_status_in_output():
     """ListDialogs output includes sync_status field for every dialog."""
     conn = _make_daemon_conn(

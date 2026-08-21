@@ -863,6 +863,7 @@ SEARCH_MESSAGES_OUTPUT_SCHEMA = {
                     # projection renders this as ISO-8601 in the requested timezone.
                     "date": {"type": ["integer", "null"]},
                     "sender": {"type": ["string", "null"]},
+                    "topic": TOPIC_IDENTITY_SCHEMA,
                     "content": {"type": "object"},
                     "anchor_call": {"type": "object"},
                     "message_state": {"type": "string", "enum": ["sent", "scheduled"]},
