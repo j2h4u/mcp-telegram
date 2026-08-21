@@ -117,7 +117,7 @@
       }
     },
     {
-      "_comment": "get_sync_status — returns structured status (synced or not_synced)",
+      "_comment": "get_sync_status — returns structured coverage and enrollment status",
       "action": "call_tool",
       "name": "get_sync_status",
       "arguments": {"dialog_id": 12345},
@@ -128,12 +128,12 @@
         },
         "path_exists": [
           "structuredContent.dialog_id",
-          "structuredContent.status",
+          "structuredContent.coverage_status",
           "structuredContent.delete_detection"
         ],
         "path_nonempty": [
           "structuredContent",
-          "structuredContent.status"
+          "structuredContent.coverage_status"
         ]
       }
     },
