@@ -5,9 +5,12 @@ from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from jsonschema import validate
 
 from mcp_telegram.models import ReadMessage
+from mcp_telegram.temporal import normalize_temporal_output_schema
 from mcp_telegram.tools.unread import (
+    GET_INBOX_OUTPUT_SCHEMA,
     GetInbox,
     GetUnreadSummary,
     _project_message_sender,
@@ -154,6 +157,52 @@ def test_structured_inbox_messages_remove_legacy_sender_identity_fields() -> Non
     assert message["sender"] == {"display_name": "Alice", "username": "@alice"}
     assert "sender_id" not in message
     assert "effective_sender_id" not in message
+
+
+@pytest.mark.asyncio
+async def test_get_inbox_concrete_message_sender_validates_against_output_schema() -> None:
+    connection = _connection(
+        inbox={
+            "ok": True,
+            "data": {
+                "groups": [
+                    {
+                        "dialog_id": -1001,
+                        "display_name": "Small Group",
+                        "category": "group",
+                        "dialog_type": "group",
+                        "unread_count": 1,
+                        "messages": [
+                            {
+                                "message_id": 7,
+                                "sent_at": 1_700_000_000,
+                                "dialog_id": -1001,
+                                "sender_id": 55,
+                                "effective_sender_id": 55,
+                                "sender_first_name": "Alice",
+                                "sender_username": "alice",
+                            }
+                        ],
+                    }
+                ]
+            },
+        }
+    )
+
+    @asynccontextmanager
+    async def fake_connection():
+        yield connection
+
+    with patch("mcp_telegram.tools.unread.daemon_connection", fake_connection):
+        result = await get_inbox(GetInbox())
+
+    payload = cast(dict[str, object], result.structured_content)
+    output_schema = normalize_temporal_output_schema(GET_INBOX_OUTPUT_SCHEMA)
+    assert output_schema is not None
+    validate(instance=payload, schema=output_schema)
+    dialogs = cast(list[dict[str, object]], payload["dialogs"])
+    messages = cast(list[dict[str, object]], dialogs[0]["messages"])
+    assert messages[0]["sender"] == {"display_name": "Alice", "username": "@alice"}
 
 
 @pytest.mark.asyncio
