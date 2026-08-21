@@ -663,6 +663,26 @@ async def test_list_unread_messages_injects_reactions(make_synced_db: Callable[[
 
 
 @pytest.mark.asyncio
+async def test_list_unread_messages_carries_username_source_fact(
+    make_synced_db: Callable[[], sqlite3.Connection],
+) -> None:
+    """Every collected unread entry carries the cached username into its group."""
+    conn = make_synced_db()
+    dialog_id = 1001
+    _seed_synced(conn, dialog_id)
+    conn.execute("UPDATE entities SET username = 'alice' WHERE id = ?", (dialog_id,))
+    _seed_message(conn, dialog_id, 11)
+    conn.commit()
+
+    server = make_server(conn, _TestClient())
+    result = await server._dispatch({"method": "get_inbox", "limit": 100})
+
+    assert result["ok"] is True
+    groups = cast(list[dict[str, object]], cast(dict[str, object], result["data"])["groups"])
+    assert groups[0]["username"] == "alice"
+
+
+@pytest.mark.asyncio
 async def test_unread_group_without_stored_messages_omits_freshness(
     make_synced_db: Callable[[], sqlite3.Connection],
 ) -> None:
@@ -681,6 +701,7 @@ async def test_unread_group_without_stored_messages_omits_freshness(
             {
                 "chat_id": dialog_id,
                 "display_name": "Alice",
+                "username": None,
                 "tier": 1,
                 "category": "personal",
                 "unread_count": 1,

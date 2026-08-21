@@ -174,6 +174,7 @@ WITH matching AS (
     SELECT
         d.dialog_id,
         d.name,
+        e.username,
         d.type,
         d.archived,
         d.last_message_at,
@@ -182,6 +183,7 @@ WITH matching AS (
         d.unread_mentions_count,
         d.unread_reactions_count
     FROM dialogs d
+    LEFT JOIN entities e ON e.id = d.dialog_id
     LEFT JOIN synced_dialogs sd USING(dialog_id)
     WHERE d.hidden = 0
       AND (sd.status IS NULL OR sd.status <> 'access_lost')
@@ -229,7 +231,7 @@ _SELECT_DIALOG_ACCESS_META_SQL = (
 # Unread SQL - zero Telegram API calls.
 _COLLECT_UNREAD_DIALOGS_WITH_COUNTS_SQL = (
     "SELECT sd.dialog_id, sd.read_inbox_max_id, sd.last_event_at, "
-    "COALESCE(e.name, CAST(sd.dialog_id AS TEXT)) AS display_name, "
+    "e.name AS display_name, e.username, "
     "COALESCE(e.type, d.type, 'Unknown') AS entity_type, "
     "d.members AS participants_count, "
     "(SELECT COUNT(*) FROM messages m "

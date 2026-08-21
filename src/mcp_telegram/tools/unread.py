@@ -2,9 +2,11 @@ import math
 import time
 from collections.abc import Mapping
 from datetime import UTC, datetime
+from typing import cast
 
 from pydantic import ConfigDict, Field, StrictInt, model_validator
 
+from ..entity_identity import ENTITY_IDENTITY_SCHEMA, project_entity_identity
 from ..formatter import (
     _compute_inline_markers,
     _render_read_state_header,
@@ -74,10 +76,10 @@ GET_INBOX_OUTPUT_SCHEMA = {
                     "items": {
                         "type": "object",
                         "properties": {
-                            "dialog_id": {"type": "integer"},
+                            "entity": ENTITY_IDENTITY_SCHEMA,
                             "hidden_count": {"type": "integer"},
                         },
-                        "required": ["dialog_id", "hidden_count"],
+                        "required": ["entity", "hidden_count"],
                         "additionalProperties": False,
                     },
                 },
@@ -98,8 +100,7 @@ GET_INBOX_OUTPUT_SCHEMA = {
             "items": {
                 "type": "object",
                 "properties": {
-                    "dialog_id": {"type": "integer"},
-                    "name": {"type": "string"},
+                    "entity": ENTITY_IDENTITY_SCHEMA,
                     "category": {"type": ["string", "null"]},
                     "dialog_type": {"type": ["string", "null"]},
                     "unread_count": {"type": "integer"},
@@ -187,8 +188,7 @@ GET_INBOX_OUTPUT_SCHEMA = {
                     },
                 },
                 "required": [
-                    "dialog_id",
-                    "name",
+                    "entity",
                     "category",
                     "dialog_type",
                     "unread_count",
@@ -231,8 +231,7 @@ GET_UNREAD_SUMMARY_OUTPUT_SCHEMA = {
             "items": {
                 "type": "object",
                 "properties": {
-                    "dialog_id": {"type": "integer"},
-                    "name": {"type": ["string", "null"]},
+                    "entity": ENTITY_IDENTITY_SCHEMA,
                     "dialog_type": {"type": ["string", "null"]},
                     "unread_count": {"type": ["integer", "null"]},
                     "unread_mark": {"type": ["boolean", "null"]},
@@ -242,8 +241,7 @@ GET_UNREAD_SUMMARY_OUTPUT_SCHEMA = {
                     "last_message_at": {"type": ["integer", "string", "null"]},
                 },
                 "required": [
-                    "dialog_id",
-                    "name",
+                    "entity",
                     "dialog_type",
                     "unread_count",
                     "unread_mark",
@@ -475,15 +473,20 @@ def _bootstrap_pending_warnings(bootstrap_pending: int) -> list[StructuredWarnin
     ]
 
 
-def _structured_inbox_group(group: dict) -> tuple[dict[str, object], dict[str, int] | None, int]:
+def _structured_inbox_group(group: dict) -> tuple[dict[str, object], dict[str, object] | None, int]:
     message_rows = group.get("messages", [])
     total_in_chat = int(group.get("total_in_chat", group.get("unread_count", 0)) or 0)
     hidden_count = max(0, total_in_chat - len(message_rows))
     read_state = group.get("read_state")
     read_state_payload = read_state if isinstance(read_state, dict) else None
+    telegram_id = int(group.get("dialog_id", 0) or 0)
+    entity = project_entity_identity(
+        display_name=group.get("display_name"),
+        username=group.get("username"),
+        telegram_id=telegram_id,
+    )
     dialog = {
-        "dialog_id": group.get("dialog_id", 0),
-        "name": group.get("display_name", ""),
+        "entity": entity,
         "category": group.get("category"),
         "dialog_type": group.get("dialog_type"),
         "unread_count": group.get("unread_count", 0),
@@ -503,15 +506,17 @@ def _structured_inbox_group(group: dict) -> tuple[dict[str, object], dict[str, i
             dialog_type=group.get("dialog_type"),
         ),
     }
-    hidden_entry = (
-        {"dialog_id": int(group.get("dialog_id", 0) or 0), "hidden_count": hidden_count} if hidden_count else None
-    )
+    hidden_entry: dict[str, object] | None = None
+    if hidden_count:
+        hidden_entry = {"entity": entity, "hidden_count": hidden_count}
     return dialog, hidden_entry, len(message_rows)
 
 
-def _structured_inbox_groups(groups: list[dict]) -> tuple[list[dict[str, object]], list[dict[str, int]], int]:
+def _structured_inbox_groups(
+    groups: list[dict],
+) -> tuple[list[dict[str, object]], list[dict[str, object]], int]:
     structured_dialogs: list[dict[str, object]] = []
-    hidden_count_by_dialog: list[dict[str, int]] = []
+    hidden_count_by_dialog: list[dict[str, object]] = []
     result_message_count = 0
     for group in groups:
         dialog, hidden_entry, message_count = _structured_inbox_group(group)
@@ -564,6 +569,44 @@ def _structured_messages(
             }
         )
     return structured
+
+
+def _identity_text_fact(value: object) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def _project_unread_summary_dialog(raw_row: Mapping[str, object]) -> dict[str, object] | None:
+    dialog_id = raw_row.get("dialog_id")
+    if isinstance(dialog_id, bool) or not isinstance(dialog_id, int):
+        return None
+    entity = project_entity_identity(
+        display_name=_identity_text_fact(raw_row.get("name")),
+        username=_identity_text_fact(raw_row.get("username")),
+        telegram_id=dialog_id,
+    )
+    return {
+        "entity": entity,
+        "dialog_type": raw_row.get("dialog_type"),
+        "unread_count": raw_row.get("unread_count"),
+        "unread_mark": raw_row.get("unread_mark"),
+        "unread_mentions_count": raw_row.get("unread_mentions_count", 0),
+        "unread_reactions_count": raw_row.get("unread_reactions_count", 0),
+        "archived": raw_row.get("archived", False),
+        "last_message_at": raw_row.get("last_message_at"),
+    }
+
+
+def _project_unread_summary_dialogs(raw_dialogs: object) -> list[dict[str, object]]:
+    if not isinstance(raw_dialogs, list):
+        return []
+    dialogs: list[dict[str, object]] = []
+    for raw_row in raw_dialogs:
+        if not isinstance(raw_row, Mapping):
+            continue
+        dialog = _project_unread_summary_dialog(raw_row)
+        if dialog is not None:
+            dialogs.append(dialog)
+    return dialogs
 
 
 @mcp_tool(
@@ -619,7 +662,7 @@ async def get_inbox(args: GetInbox) -> ToolResult:
             "requested_limit": args.limit,
             "result_message_count": result_message_count,
             "dialog_count": len(structured_dialogs),
-            "hidden_count": sum(item["hidden_count"] for item in hidden_count_by_dialog),
+            "hidden_count": sum(cast(int, item["hidden_count"]) for item in hidden_count_by_dialog),
             "hidden_count_by_dialog": hidden_count_by_dialog,
             "allocation_policy": "daemon allocates the requested unread message budget across dialogs",
         },
@@ -663,7 +706,7 @@ async def get_unread_summary(args: GetUnreadSummary) -> ToolResult:
     raw_data = response.get("data")
     data = raw_data if isinstance(raw_data, Mapping) else {}
     raw_dialogs = data.get("dialogs", [])
-    dialogs = [dict(row) for row in raw_dialogs if isinstance(row, Mapping)] if isinstance(raw_dialogs, list) else []
+    dialogs = _project_unread_summary_dialogs(raw_dialogs)
     raw_observation = data.get("source_observation")
     observation = dict(raw_observation) if isinstance(raw_observation, Mapping) else {}
     source_observation = {

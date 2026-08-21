@@ -1840,13 +1840,22 @@ class ReadingService:
         self, group_size_threshold: int, since_utc: int | None = None
     ) -> tuple[list[dict], dict[int, int]]:
         rows = cast(
-            list[tuple[object, object, object, object, object, object, object]],
+            list[tuple[object, object, object, object, object, object, object, object]],
             self._conn.execute(_COLLECT_UNREAD_DIALOGS_WITH_COUNTS_SQL, {"since_utc": since_utc}).fetchall(),
         )
         entries: list[dict] = []
         counts: dict[int, int] = {}
         for row in rows:
-            dialog_id, read_max, last_event_at, display_name, entity_type, participants_count, unread_count = row
+            (
+                dialog_id,
+                read_max,
+                last_event_at,
+                display_name,
+                username,
+                entity_type,
+                participants_count,
+                unread_count,
+            ) = row
             dialog_id_i = int(cast(int | str, dialog_id))
             unread_count_i = int(cast(int | str, unread_count))
             if unread_count_i == 0:
@@ -1860,6 +1869,7 @@ class ReadingService:
                 {
                     "chat_id": dialog_id_i,
                     "display_name": display_name,
+                    "username": username,
                     "unread_count": unread_count_i,
                     "unread_mentions_count": 0,
                     "category": category,
@@ -1889,6 +1899,7 @@ class ReadingService:
             group: dict = {
                 "dialog_id": chat_id,
                 "display_name": entry["display_name"],
+                "username": entry["username"],
                 "tier": entry["tier"],
                 "category": entry["category"],
                 "unread_count": entry["unread_count"],
@@ -2018,6 +2029,7 @@ class ReadingService:
                     {
                         "dialog_id": _object_to_int(_row_value(row, "dialog_id")),
                         "name": _object_to_str_or_none(_row_value(row, "name")),
+                        "username": _object_to_str_or_none(_row_value(row, "username")),
                         "dialog_type": _object_to_str_or_none(_row_value(row, "type")),
                         "unread_count": _object_to_int_or_none(_row_value(row, "unread_count")),
                         "unread_mark": (None if unread_mark_raw is None else bool(_object_to_int(unread_mark_raw, 0))),

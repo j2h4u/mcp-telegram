@@ -39,7 +39,7 @@ depends_on = ["mcp_telegram.config", "mcp_telegram.correlation", "mcp_telegram.d
 [[modules]]
 path = "mcp_telegram.tools"
 layer = "delivery"
-depends_on = ["mcp_telegram.daemon_client", "mcp_telegram.errors", "mcp_telegram.formatter", "mcp_telegram.message_content", "mcp_telegram.models", "mcp_telegram.pagination", "mcp_telegram.resolver", "mcp_telegram.temporal"]
+depends_on = ["mcp_telegram.daemon_client", "mcp_telegram.entity_identity", "mcp_telegram.errors", "mcp_telegram.formatter", "mcp_telegram.message_content", "mcp_telegram.models", "mcp_telegram.pagination", "mcp_telegram.resolver", "mcp_telegram.temporal"]
 cannot_depend_on = [
     "mcp_telegram.daemon", "mcp_telegram.daemon_api", "mcp_telegram.feedback_db",
     "mcp_telegram.folders.sqlite_repository", "mcp_telegram.folders.telegram_adapter",
@@ -472,6 +472,11 @@ depends_on = []
 
 [[modules]]
 path = "mcp_telegram.errors"
+layer = "foundation"
+depends_on = []
+
+[[modules]]
+path = "mcp_telegram.entity_identity"
 layer = "foundation"
 depends_on = []
 
