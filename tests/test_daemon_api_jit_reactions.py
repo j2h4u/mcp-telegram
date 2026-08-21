@@ -20,6 +20,9 @@ import pytest
 from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
 
 from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike
+from mcp_telegram.reading.query_records import read_message_from_row
+from mcp_telegram.reading.sqlite_projection import _FETCH_UNREAD_MESSAGES_SQL
+from mcp_telegram.tools.unread import _project_message_sender
 from tests.daemon_api_policy import make_daemon_api_policy
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 from tests.reaction_helpers import make_reaction_freshener
@@ -672,6 +675,7 @@ async def test_list_unread_messages_carries_username_source_fact(
     _seed_synced(conn, dialog_id)
     conn.execute("UPDATE entities SET username = 'alice' WHERE id = ?", (dialog_id,))
     _seed_message(conn, dialog_id, 11)
+    conn.execute("UPDATE messages SET sender_id = NULL WHERE dialog_id = ? AND message_id = ?", (dialog_id, 11))
     conn.commit()
 
     server = make_server(conn, _TestClient())
@@ -680,6 +684,47 @@ async def test_list_unread_messages_carries_username_source_fact(
     assert result["ok"] is True
     groups = cast(list[dict[str, object]], cast(dict[str, object], result["data"])["groups"])
     assert groups[0]["username"] == "alice"
+    messages = cast(list[dict[str, object]], groups[0]["messages"])
+    assert messages[0]["sender_username"] == "alice"
+
+
+def test_fetch_unread_group_sender_carries_raw_entity_username_to_projector(
+    make_synced_db: Callable[[], sqlite3.Connection],
+) -> None:
+    conn = make_synced_db()
+    dialog_id = -1001
+    _seed_synced(conn, dialog_id)
+    conn.execute("UPDATE entities SET type = 'Group' WHERE id = ?", (dialog_id,))
+    conn.execute(
+        "INSERT INTO entities (id, type, name, username, name_normalized, updated_at) "
+        "VALUES (?, 'User', 'Group Member', 'group_member', NULL, ?)",
+        (99, int(time.time())),
+    )
+    _seed_message(conn, dialog_id, 11)
+    conn.row_factory = sqlite3.Row
+
+    row = cast(
+        sqlite3.Row | None,
+        conn.execute(
+            _FETCH_UNREAD_MESSAGES_SQL,
+            {
+                "dialog_id": dialog_id,
+                "after_msg_id": 0,
+                "limit": 10,
+                "self_id": 777,
+                "since_utc": None,
+            },
+        ).fetchone(),
+    )
+
+    assert row is not None
+    assert row["sender_username"] == "group_member"
+    message = read_message_from_row(row)
+    assert message.sender_id == 99
+    assert _project_message_sender(message) == {
+        "display_name": "Group Member",
+        "username": "@group_member",
+    }
 
 
 @pytest.mark.asyncio

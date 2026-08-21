@@ -169,6 +169,7 @@ class ReadMessage:
     text: str | None = None
     sender_id: int | None = None
     sender_first_name: str | None = None
+    sender_username: str | None = None
     media_description: str | None = None
     content_kind: ContentKind = "none"
     reply_to_msg_id: int | None = None

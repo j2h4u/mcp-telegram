@@ -6,11 +6,10 @@ from typing import cast
 
 from pydantic import ConfigDict, Field, StrictInt, model_validator
 
-from ..entity_identity import ENTITY_IDENTITY_SCHEMA, project_entity_identity
+from ..entity_identity import ENTITY_IDENTITY_SCHEMA, EntityIdentity, project_entity_identity
 from ..formatter import (
     _compute_inline_markers,
     _render_read_state_header,
-    resolve_sender_label,
 )
 from ..models import DialogType, ReadMessage, ReadState
 from ..temporal import parse_utc_boundary
@@ -134,9 +133,17 @@ GET_INBOX_OUTPUT_SCHEMA = {
                             "type": "object",
                             "properties": {
                                 "msg_id": {"type": "integer"},
-                                "sender": {"type": ["string", "null"]},
-                                "sender_id": {"type": ["integer", "null"]},
-                                "effective_sender_id": {"type": ["integer", "null"]},
+                                "sender": {
+                                    "oneOf": [
+                                        ENTITY_IDENTITY_SCHEMA,
+                                        {
+                                            "type": "object",
+                                            "properties": {"kind": {"type": "string", "enum": ["system", "unknown"]}},
+                                            "required": ["kind"],
+                                            "additionalProperties": False,
+                                        },
+                                    ]
+                                },
                                 "out": {"type": "boolean"},
                                 # Keep Unix seconds at the internal tool boundary so
                                 # the shared temporal presentation layer can render
@@ -168,8 +175,6 @@ GET_INBOX_OUTPUT_SCHEMA = {
                             "required": [
                                 "msg_id",
                                 "sender",
-                                "sender_id",
-                                "effective_sender_id",
                                 "out",
                                 "date",
                                 "content",
@@ -383,11 +388,27 @@ def _message_date(sent_at: object) -> int | None:
         return None
 
 
-def _message_sender(row: dict) -> str | None:
-    first = row.get("sender_first_name")
-    last = row.get("sender_last_name")
-    name = " ".join(str(part) for part in (first, last) if part)
-    return name or None
+def _project_message_sender(message: ReadMessage) -> EntityIdentity | dict[str, object]:
+    """Project one inbox message author without inventing an identity.
+
+    ``effective_sender_id`` carries the concrete actor for ordinary senders,
+    including the peer/self sides of direct messages.  Service messages and
+    group rows with no sender id intentionally remain explicit non-entities.
+    """
+    if message.is_service:
+        return {"kind": "system"}
+
+    actor_id = message.effective_sender_id
+    if actor_id is None:
+        actor_id = message.sender_id
+    if isinstance(actor_id, bool) or not isinstance(actor_id, int) or actor_id == 0:
+        return {"kind": "unknown"}
+
+    return project_entity_identity(
+        display_name=message.sender_first_name,
+        username=message.sender_username,
+        telegram_id=actor_id,
+    )
 
 
 _READ_MARKER_METADATA = {
@@ -544,16 +565,14 @@ def _structured_messages(
         _compute_inline_markers(messages, read_state) if DialogType.parse(dialog_type) == DialogType.USER else {}
     )
     structured: list[dict[str, object]] = []
-    for row, message in zip(ordered_rows, messages, strict=False):
+    for _row, message in zip(ordered_rows, messages, strict=False):
         marker_label = marker_by_message.get(message.id)
         read_markers = [_structured_read_marker(message.id, marker_label)] if marker_label else []
         projected = serialize_message_content(message.text, message.media_description, message.content_kind)
         structured.append(
             {
                 "msg_id": message.id,
-                "sender": _message_sender(row) or resolve_sender_label(row),
-                "sender_id": message.sender_id,
-                "effective_sender_id": message.effective_sender_id,
+                "sender": _project_message_sender(message),
                 "out": bool(message.out),
                 "date": _message_date(message.sent_at),
                 "content": projected["content"],

@@ -39,6 +39,7 @@ def read_message_from_row(row: Mapping[str, object] | object, *, reactions_displ
         text=cast(str | None, _row_value(row, "text")),
         sender_id=_coerce_optional_int(_row_value(row, "sender_id")),
         sender_first_name=cast(str | None, _row_value(row, "sender_first_name")),
+        sender_username=cast(str | None, _row_value(row, "sender_username")),
         media_description=cast(str | None, _row_value(row, "media_description")),
         content_kind=cast(ContentKind, _row_value(row, "content_kind") or "none"),
         reply_to_msg_id=_coerce_optional_int(_row_value(row, "reply_to_msg_id")),
