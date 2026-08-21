@@ -2538,7 +2538,9 @@ async def test_get_inbox_via_daemon():
     assert budget["result_message_count"] == 1
     assert payload["count"] == 1
     dialog = _json_dict(dialogs[0])
-    assert dialog["dialog_id"] == 123
+    assert dialog["entity"] == {"display_name": "Alice", "telegram_id": 123}
+    assert "dialog_id" not in dialog
+    assert "name" not in dialog
     assert dialog["category"] == "user"
     assert dialog["dialog_type"] == "User"
     assert dialog["unread_mentions_count"] == 0
