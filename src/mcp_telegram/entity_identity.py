@@ -66,9 +66,7 @@ def _normalise_display_name(display_name: str | None, username: str | None, tele
     return username or str(telegram_id)
 
 
-def project_entity_identity(
-    *, display_name: str | None, username: str | None, telegram_id: int
-) -> EntityIdentity:
+def project_entity_identity(*, display_name: str | None, username: str | None, telegram_id: int) -> EntityIdentity:
     """Project raw identity facts to one of the two legal agent-facing arms.
 
     A non-empty Telegram username is canonicalised with exactly one leading
