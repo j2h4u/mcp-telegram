@@ -69,6 +69,7 @@ read_source_unit_window # daemon_client.py:317
 open_sync_db_reader   # MCP read-path DB opener (sync_db.py:447)
 result_count_semantics  # tools/structured.py:97 — referenced across tool modules
 record_daemon_event  # public test/operator event-seeding helper
+replace_folder_snapshot  # public test/operator folder-fixture helper
 
 # Symmetric test-support accessor: _save_dialog_state is production; _load_dialog_state
 # reads it back in the activity sweep tests (tools never read state via it directly).

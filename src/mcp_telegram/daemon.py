@@ -81,10 +81,10 @@ from .flood import (
     maybe_log_flood_wait_rollup,
     sleep_through_flood,
 )
-from .folders.contracts import FolderSourceUnavailableError
 from .folders.refresh import FolderRefresher
 from .folders.sqlite_repository import SQLiteFolderSnapshotRepository
 from .folders.telegram_adapter import FolderClient, TelethonTelegramFolderGateway
+from .folders.worker import FolderProjectionWorker
 from .fts import backfill_fts_index
 from .message_fact_refresh import (
     MessageFactRefreshPolicy,
@@ -244,6 +244,7 @@ class _SyncMainContext:
     message_fact_refresh_policy: MessageFactRefreshPolicy
     api_server: DaemonAPIServer
     topic_refresher: TopicRefresher
+    folder_projection_worker: FolderProjectionWorker
     socket_path: Path
     unix_server: asyncio.AbstractServer | None = None
     handler_manager: EventHandlerManager | None = None
@@ -707,6 +708,7 @@ def _create_tracked_task(
     coro: Coroutine[object, object, object],
     *,
     name: str | None = None,
+    critical: bool = False,
 ) -> asyncio.Task[object]:
     """Create an asyncio task and track it for shutdown cancellation."""
     task = asyncio.create_task(coro, name=name)
@@ -716,7 +718,13 @@ def _create_tracked_task(
         ctx.background_tasks.discard(t)
         exc = t.exception() if not t.cancelled() else None
         if exc is not None:
-            logger.error("background_task_failed name=%s error=%s", t.get_name(), exc, exc_info=exc)
+            if critical:
+                ctx.api_server._ready = False
+                ctx.api_server.startup_detail = f"critical background task failed: {t.get_name()}"
+                ctx.shutdown_event.set()
+                logger.critical("critical_background_task_failed name=%s error=%s", t.get_name(), exc, exc_info=exc)
+            else:
+                logger.error("background_task_failed name=%s error=%s", t.get_name(), exc, exc_info=exc)
 
     task.add_done_callback(_on_done)
     return task
@@ -801,7 +809,7 @@ def _create_governed_telegram_client(config: McpTelegramConfig) -> _DaemonClient
     )
 
 
-async def _build_sync_main_context() -> _SyncMainContext:
+async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914 - composition root wires all daemon-owned services
     config = load_config()
     state_paths = StatePaths.from_state_dir(ensure_private_state_dir(config.state.dir))
     db_path = state_paths.sync_db_path
@@ -837,6 +845,11 @@ async def _build_sync_main_context() -> _SyncMainContext:
         TelethonTelegramTopicGateway(cast(TopicClient, client)),
         SQLiteTopicSnapshotRepository(conn),
     )
+    folder_repository = SQLiteFolderSnapshotRepository(conn)
+    folder_refresher = FolderRefresher(
+        TelethonTelegramFolderGateway(cast(FolderClient, client)),
+        folder_repository,
+    )
     api_server = DaemonAPIServer(
         conn,
         cast(DaemonClientLike, client),
@@ -851,7 +864,7 @@ async def _build_sync_main_context() -> _SyncMainContext:
             user_directory_ttl_seconds=config.freshness.entities.user_directory_ttl_seconds,
             group_directory_ttl_seconds=config.freshness.entities.group_directory_ttl_seconds,
             resolver_enrichment_ttl_seconds=config.freshness.entities.resolver_enrichment_ttl_seconds,
-            folder_snapshot_ttl_seconds=config.freshness.folders.snapshot_ttl_seconds,
+            folder_snapshot_stale_after_seconds=config.scheduling.folder_projection.stale_threshold_seconds,
             telemetry_retention_ttl_seconds=config.telemetry.retention_ttl_seconds,
             slow_request_seconds=config.logging.daemon_api_slow_request_seconds,
         ),
@@ -880,6 +893,12 @@ async def _build_sync_main_context() -> _SyncMainContext:
         message_fact_refresh_policy=_message_fact_refresh_policy_from_config(config),
         api_server=api_server,
         topic_refresher=topic_refresher,
+        folder_projection_worker=FolderProjectionWorker(
+            folder_refresher,
+            folder_repository,
+            shutdown_event,
+            config.scheduling.folder_projection,
+        ),
         socket_path=socket_path,
         unix_server=unix_server,
         scheduling=resolve_scheduling_config(config.scheduling),
@@ -959,25 +978,7 @@ async def _prime_runtime(ctx: _SyncMainContext) -> None:
     logger.info("daemon self_id cached: %s", ctx.api_server.self_id)
 
     ctx.api_server.startup_detail = "refreshing Telegram folders"
-    folder_gateway = TelethonTelegramFolderGateway(cast(FolderClient, ctx.client))
-    folder_refresher = FolderRefresher(folder_gateway, SQLiteFolderSnapshotRepository(ctx.conn))
-
-    async def refresh_folder_snapshot() -> bool:
-        try:
-            await folder_refresher.refresh()
-        except FolderSourceUnavailableError:
-            logger.warning(
-                "telegram folder snapshot refresh failed — serving preserved local snapshot",
-                exc_info=True,
-            )
-            return False
-        return True
-
-    ctx.api_server.set_folder_snapshot_refresh(refresh_folder_snapshot)
-    refreshed = await refresh_folder_snapshot()
-    if refreshed:
-        ctx.api_server.mark_folder_snapshot_refreshed()
-        logger.info("telegram folder snapshot refreshed")
+    await ctx.folder_projection_worker.prime()
 
     # Post-v10 runtime backfill: mark historical outgoing DM rows as out=1
     # using sender_id=self_id (the authoritative signal). Pure-SQL v10
@@ -1046,6 +1047,12 @@ async def _start_followup_background_tasks(
 ) -> None:
     activity_client = cast(_ActivityClient, ctx.client)
     delta_client = cast(_DeltaSyncClient, ctx.client)
+    _create_tracked_task(
+        ctx,
+        ctx.folder_projection_worker.run(),
+        name="folder_projection_worker",
+        critical=True,
+    )
     _create_tracked_task(
         ctx,
         _backfill_blank_unsupported_messages(ctx.client, ctx.conn, ctx.shutdown_event),

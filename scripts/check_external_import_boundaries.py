@@ -50,6 +50,7 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "event_handlers.py",
             "feedback_db.py",
             "folders/sqlite_repository.py",
+            "folders/read_repository.py",
             "fts.py",
             "history_enrollment.py",
             "messages/sqlite_repository.py",

@@ -8,15 +8,15 @@ import logging
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TypedDict, Unpack
+from typing import TypedDict, Unpack, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from mcp_telegram.daemon import _log_heartbeat, _prime_runtime, sync_main
+from mcp_telegram.daemon import _create_tracked_task, _log_heartbeat, _prime_runtime, sync_main
 from mcp_telegram.daemon_api import DaemonAPIServer
-from mcp_telegram.folders.contracts import FolderSourceUnavailableError
-from mcp_telegram.folders.sqlite_repository import list_folders, replace_folder_snapshot
+from mcp_telegram.folders.read_repository import list_folders
+from mcp_telegram.folders.sqlite_repository import replace_folder_snapshot
 from mcp_telegram.state import StatePaths
 from mcp_telegram.sync_db import ensure_sync_schema
 from tests.daemon_api_policy import make_daemon_api_policy
@@ -25,11 +25,7 @@ from tests.reaction_helpers import make_reaction_freshener
 
 
 class _PrimeRuntimeApiServerStub(SimpleNamespace):
-    def set_folder_snapshot_refresh(self, refresh) -> None:
-        self.folder_snapshot_refresh = refresh
-
-    def mark_folder_snapshot_refreshed(self) -> None:
-        self.folder_snapshot_refreshed = True
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -129,15 +125,17 @@ def _patch_bootstrap_worker():
 
 
 @pytest.fixture(autouse=True)
-def _patch_folder_snapshot_refresh():
-    """Keep lifecycle tests focused; folder refresh has dedicated tests."""
-    with patch("mcp_telegram.daemon.FolderRefresher.refresh", new=AsyncMock()):
+def _patch_folder_projection_worker():
+    """Keep daemon lifecycle tests independent from Telegram folder acquisition."""
+    projection_worker = MagicMock()
+    projection_worker.prime = AsyncMock(return_value=None)
+    projection_worker.run = AsyncMock(return_value=None)
+    with patch("mcp_telegram.daemon.FolderProjectionWorker", return_value=projection_worker):
         yield
 
 
 async def test_prime_runtime_keeps_serving_saved_folders_when_refresh_fails(
     tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
@@ -152,27 +150,21 @@ async def test_prime_runtime_keeps_serving_saved_folders_when_refresh_fails(
         api_server=api_server,
         own_only_context=None,
         socket_path=tmp_path / "daemon.sock",
+        folder_projection_worker=SimpleNamespace(prime=AsyncMock()),
     )
 
     try:
-        with (
-            patch("mcp_telegram.daemon._load_own_only_context", new=AsyncMock(return_value=None)),
-            patch(
-                "mcp_telegram.daemon.FolderRefresher.refresh",
-                new=AsyncMock(side_effect=FolderSourceUnavailableError("Telegram unavailable")),
-            ),
-            caplog.at_level(logging.WARNING),
-        ):
+        with patch("mcp_telegram.daemon._load_own_only_context", new=AsyncMock(return_value=None)):
             await _prime_runtime(ctx)  # type: ignore[arg-type]
 
         assert api_server._ready is True
         assert list_folders(conn) == [{"id": 9, "title": "Saved"}]
-        assert "serving preserved local snapshot" in caplog.text
+        cast(AsyncMock, ctx.folder_projection_worker.prime).assert_awaited_once()
     finally:
         conn.close()
 
 
-async def test_prime_runtime_propagates_unexpected_folder_refresh_failure(tmp_path: Path) -> None:
+async def test_prime_runtime_propagates_unexpected_worker_failure(tmp_path: Path) -> None:
     db_path = tmp_path / "sync.db"
     ensure_sync_schema(db_path)
     conn = sqlite3.connect(db_path)
@@ -185,15 +177,14 @@ async def test_prime_runtime_propagates_unexpected_folder_refresh_failure(tmp_pa
         api_server=api_server,
         own_only_context=None,
         socket_path=tmp_path / "daemon.sock",
+        folder_projection_worker=SimpleNamespace(
+            prime=AsyncMock(side_effect=RuntimeError("broken repository invariant"))
+        ),
     )
 
     try:
         with (
             patch("mcp_telegram.daemon._load_own_only_context", new=AsyncMock(return_value=None)),
-            patch(
-                "mcp_telegram.daemon.FolderRefresher.refresh",
-                new=AsyncMock(side_effect=RuntimeError("broken repository invariant")),
-            ),
             pytest.raises(RuntimeError, match="broken repository invariant"),
         ):
             await _prime_runtime(ctx)  # type: ignore[arg-type]
@@ -354,12 +345,6 @@ def test_self_id_cached_at_startup(
             self._health_status = health_status
             self.self_id = None
             captured["instance"] = self
-
-        def set_folder_snapshot_refresh(self, refresh) -> None:
-            self.folder_snapshot_refresh = refresh
-
-        def mark_folder_snapshot_refreshed(self) -> None:
-            self.folder_snapshot_refreshed = True
 
         async def handle_client(self, reader, writer):  # pragma: no cover
             pass
@@ -978,6 +963,29 @@ def test_delta_catch_up_loop_is_started_as_background_task(
     delta_loop.assert_called_once()
     policy = delta_loop.call_args.args[2]
     assert policy.max_probes_per_cycle == 10
+
+
+@pytest.mark.asyncio
+async def test_critical_folder_worker_failure_closes_health_and_requests_shutdown() -> None:
+    shutdown_event = asyncio.Event()
+    api_server = SimpleNamespace(_ready=True, startup_detail="ready")
+    ctx = SimpleNamespace(api_server=api_server, shutdown_event=shutdown_event, background_tasks=set())
+
+    async def _unexpected() -> None:
+        raise RuntimeError("folder invariant broken")
+
+    _create_tracked_task(
+        cast(object, ctx),
+        _unexpected(),
+        name="folder_projection_worker",
+        critical=True,
+    )  # type: ignore[arg-type]
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert shutdown_event.is_set()
+    assert api_server._ready is False
+    assert "folder_projection_worker" in api_server.startup_detail
 
 
 # ---------------------------------------------------------------------------

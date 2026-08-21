@@ -1002,9 +1002,8 @@ async def test_list_dialogs_empty_via_daemon():
     assert payload["count"] == 0
 
 
-async def test_list_dialogs_upserts_entities_via_daemon():
-    """ListDialogs upserts dialog entries into daemon entity store via upsert_entities."""
-    upsert_conn = _make_daemon_conn({"ok": True, "upserted": 1})
+async def test_list_dialogs_does_not_upsert_entities_after_read():
+    """ListDialogs is a pure read projection and never performs a follow-up write."""
     list_conn = _make_daemon_conn(
         {
             "ok": True,
@@ -1023,26 +1022,9 @@ async def test_list_dialogs_upserts_entities_via_daemon():
         }
     )
 
-    call_count = 0
-
-    @asynccontextmanager
-    async def _multi_conn_cm():
-        nonlocal call_count
-        call_count += 1
-        if call_count == 1:
-            yield list_conn
-        else:
-            yield upsert_conn
-
-    with patch("mcp_telegram.tools.discovery.daemon_connection", side_effect=_multi_conn_cm):
+    with _patch_daemon(list_conn):
         await list_dialogs(ListDialogs())
-
-    upsert_conn.upsert_entities.assert_called_once()
-    entities = cast(list[dict[str, object]], _call_kwargs(upsert_conn.upsert_entities)["entities"])
-    assert len(entities) == 1
-    assert entities[0]["id"] == 100
-    assert entities[0]["name"] == "TestChat"
-    assert entities[0]["type"] == "Group"
+    list_conn.upsert_entities.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

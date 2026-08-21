@@ -88,7 +88,7 @@ from .daemon_entity_info import DaemonEntityInfoService, EntityInfoDeps
 from .daemon_message import (
     project_cached_message_facts_by_dialog,
 )
-from .folders.read_model import dialog_placement, folders_by_dialog, list_folder_messages, list_folders
+from .folders.read_model import dialog_placement, folder_snapshot, folders_by_dialog, list_folder_messages, list_folders
 from .history_enrollment import disable_history, enable_history, read_intent
 from .important_events.read_model import list_important_events as read_important_events
 from .models import ReadMessage
@@ -125,7 +125,7 @@ class DaemonApiPolicy:
     user_directory_ttl_seconds: int
     group_directory_ttl_seconds: int
     resolver_enrichment_ttl_seconds: int
-    folder_snapshot_ttl_seconds: int
+    folder_snapshot_stale_after_seconds: int
     telemetry_retention_ttl_seconds: int
     slow_request_seconds: float
 
@@ -429,36 +429,6 @@ class DaemonAPIServer:
         self._policy = policy
         self._health_status = health_status
         self._activity_stats_service: _activity_stats.DaemonActivityStatsService | None = None
-        self._folder_snapshot_refresh: Callable[[], Awaitable[bool]] | None = None
-        self._folder_refresh_lock = asyncio.Lock()
-        self._folder_snapshot_refreshed_at: float | None = None
-
-    def set_folder_snapshot_refresh(self, refresh: Callable[[], Awaitable[bool]]) -> None:
-        """Attach a daemon-owned Telegram folder snapshot refresh callback."""
-        self._folder_snapshot_refresh = refresh
-
-    def mark_folder_snapshot_refreshed(self) -> None:
-        """Record that the local folder snapshot is fresh enough for TTL reads."""
-        self._folder_snapshot_refreshed_at = time.monotonic()
-
-    async def _refresh_folders_if_stale(self) -> None:
-        refresh = self._folder_snapshot_refresh
-        if refresh is None:
-            return
-        now = time.monotonic()
-        refreshed_at = self._folder_snapshot_refreshed_at
-        if refreshed_at is not None and now - refreshed_at < self._policy.folder_snapshot_ttl_seconds:
-            return
-        async with self._folder_refresh_lock:
-            now = time.monotonic()
-            refreshed_at = self._folder_snapshot_refreshed_at
-            if refreshed_at is not None and now - refreshed_at < self._policy.folder_snapshot_ttl_seconds:
-                return
-            refreshed = await refresh()
-            if not refreshed:
-                return
-            self._folder_snapshot_refreshed_at = time.monotonic()
-            logger.info("telegram folder snapshot refreshed")
 
     def _get_reading_service(self) -> ReadingService:
         """Get memoized reading-service instance with explicit daemon dependencies."""
@@ -962,7 +932,6 @@ class DaemonAPIServer:
 
     async def _list_dialogs(self, req: dict[str, object]) -> dict:
         """Delegate list_dialogs reads to the reading service."""
-        await self._refresh_folders_if_stale()
         result = await self._get_reading_service().list_dialogs(cast(dict[str, object], req))
         if not result.get("ok"):
             return result
@@ -983,6 +952,10 @@ class DaemonAPIServer:
                 if limit is not None and len(enriched) >= limit:
                     break
         data["dialogs"] = enriched
+        data["folder_snapshot"] = folder_snapshot(
+            self._conn,
+            stale_after_seconds=self._policy.folder_snapshot_stale_after_seconds,
+        )
         return result
 
     async def _get_unread_summary(self, req: dict[str, object]) -> dict:
@@ -990,11 +963,18 @@ class DaemonAPIServer:
         return await self._get_reading_service().get_unread_summary(cast(dict[str, object], req))
 
     async def _list_folders(self, _req: dict[str, object]) -> dict:
-        await self._refresh_folders_if_stale()
-        return {"ok": True, "data": {"folders": list_folders(self._conn)}}
+        return {
+            "ok": True,
+            "data": {
+                "folders": list_folders(self._conn),
+                "folder_snapshot": folder_snapshot(
+                    self._conn,
+                    stale_after_seconds=self._policy.folder_snapshot_stale_after_seconds,
+                ),
+            },
+        }
 
     async def _list_folder_messages(self, req: dict[str, object]) -> dict:
-        await self._refresh_folders_if_stale()
         folder_id = int(cast(int | str, req.get("folder_id", 0)))
         limit = max(1, min(int(cast(int | str, req.get("limit", 20))), 100))
         data = list_folder_messages(self._conn, folder_id, limit)
@@ -1020,6 +1000,10 @@ class DaemonAPIServer:
             }
             for row, message in zip(raw_messages, projected, strict=True)
         ]
+        data["folder_snapshot"] = folder_snapshot(
+            self._conn,
+            stale_after_seconds=self._policy.folder_snapshot_stale_after_seconds,
+        )
         return {"ok": True, "data": data}
 
     # list_topics

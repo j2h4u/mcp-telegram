@@ -34,6 +34,19 @@ TELEGRAM_CONTENT_OUTPUT_SCHEMA = {
     "additionalProperties": False,
 }
 
+FOLDER_SNAPSHOT_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "generation": {"type": ["integer", "null"]},
+        "status": {"type": "string", "enum": ["fresh", "stale", "unavailable"]},
+        "completed_at": {"type": ["integer", "null"]},
+        "age_seconds": {"type": ["integer", "null"]},
+        "complete": {"type": "boolean"},
+    },
+    "required": ["generation", "status", "completed_at", "age_seconds", "complete"],
+    "additionalProperties": False,
+}
+
 
 class TelegramContent(TypedDict):
     text: str
@@ -66,6 +79,16 @@ def telegram_content(text: str, content_kind: TelegramContentKind) -> TelegramCo
         "text": text,
         "is_telegram_content": True,
         "content_kind": content_kind,
+    }
+
+
+def unavailable_folder_snapshot() -> dict[str, object]:
+    return {
+        "generation": None,
+        "status": "unavailable",
+        "completed_at": None,
+        "age_seconds": None,
+        "complete": False,
     }
 
 

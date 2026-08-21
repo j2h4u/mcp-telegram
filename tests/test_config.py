@@ -11,7 +11,7 @@ from mcp_telegram.config import (
     ConfigError,
     EntitiesConfig,
     FloodWaitConfig,
-    FoldersConfig,
+    FolderProjectionConfig,
     FreshnessConfig,
     HttpServerConfig,
     ReactionsConfig,
@@ -65,8 +65,13 @@ user_directory_ttl_seconds = 43
 group_directory_ttl_seconds = 44
 resolver_enrichment_ttl_seconds = 45
 
-[freshness.folders]
-snapshot_ttl_seconds = 46
+[scheduling.folder_projection]
+refresh_interval_seconds = 900
+jitter_ratio = 0.1
+retry_delays_seconds = [60, 120, 240, 480]
+retry_cap_seconds = 900
+warning_failure_threshold = 3
+stale_after_seconds = 46
 
 [telemetry]
 retention_ttl_seconds = 47
@@ -113,7 +118,7 @@ daemon_api_slow_request_seconds = 2.5
     assert config.freshness.reactions == ReactionsConfig(freshness_ttl_seconds=40)
     assert config.freshness.read_receipts == ReadReceiptsConfig(read_at_ttl_seconds=41)
     assert config.freshness.entities == EntitiesConfig(42, 43, 44, 45)
-    assert config.freshness.folders == FoldersConfig(snapshot_ttl_seconds=46)
+    assert config.scheduling.folder_projection == FolderProjectionConfig(stale_after_seconds=46)
     assert config.telemetry == TelemetryConfig(retention_ttl_seconds=47)
     assert config.flood_wait == FloodWaitConfig(
         kill_switch_enabled=True,
@@ -139,6 +144,7 @@ daemon_api_slow_request_seconds = 2.5
         message_fact_refresh_pause_seconds=4.0,
         activity_hot_sweep_seconds=51.0,
         scheduled_flood_sleep_threshold_seconds=0,
+        folder_projection=FolderProjectionConfig(stale_after_seconds=46),
     )
     assert config.http == HttpServerConfig(host="localhost", port=3200)
     assert config.logging.level == "WARNING"
@@ -219,7 +225,14 @@ def test_runtime_environment_overrides_are_parsed_by_config_model() -> None:
         ('[state]\ndir = "/state"\n\n[freshness.reactions]\nfreshness_ttl_seconds = true\n', "freshness_ttl_seconds"),
         ('[state]\ndir = "/state"\n\n[freshness.read_receipts]\nread_at_ttl_seconds = 0\n', "read_at_ttl_seconds"),
         ('[state]\ndir = "/state"\n\n[freshness.entities]\ndetail_ttl_seconds = "300"\n', "detail_ttl_seconds"),
-        ('[state]\ndir = "/state"\n\n[freshness.folders]\nsnapshot_ttl_seconds = 0\n', "snapshot_ttl_seconds"),
+        (
+            '[state]\ndir = "/state"\n\n[scheduling.folder_projection]\nstale_after_seconds = 0\n',
+            "stale_after_seconds",
+        ),
+        (
+            '[state]\ndir = "/state"\n\n[scheduling.folder_projection]\nrefresh_interval_seconds = 0.5\n',
+            "refresh_interval_seconds",
+        ),
         (
             '[state]\ndir = "/state"\n\n[scheduling]\nscheduled_flood_sleep_threshold_seconds = -1\n',
             "scheduled_flood_sleep_threshold_seconds",

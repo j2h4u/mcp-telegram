@@ -30,6 +30,15 @@ activity_cold_backfill_batch_pause_seconds = 5
 activity_cold_enroll_seconds = 1800
 activity_cold_access_retry_seconds = 3600
 
+[scheduling.folder_projection]
+# Folder membership acquisition runs in the daemon and never from read requests.
+refresh_interval_seconds = 900
+jitter_ratio = 0.10
+retry_delays_seconds = [60, 120, 240, 480]
+retry_cap_seconds = 900
+warning_failure_threshold = 3
+# Omit stale_after_seconds to derive it from refresh interval plus retry cap.
+
 [http]
 # Safe local defaults; Docker Compose overrides the bind host and port for its internal endpoint.
 host = "127.0.0.1"

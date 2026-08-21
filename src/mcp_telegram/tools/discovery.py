@@ -19,7 +19,13 @@ from ._base import (
     mcp_tool,
     structured_result,
 )
-from .structured import StructuredWarning, structured_warning, telegram_content
+from .structured import (
+    FOLDER_SNAPSHOT_OUTPUT_SCHEMA,
+    StructuredWarning,
+    structured_warning,
+    telegram_content,
+    unavailable_folder_snapshot,
+)
 
 TELEGRAM_CONTENT_OUTPUT_SCHEMA = {
     "type": "object",
@@ -160,6 +166,7 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
         "snapshot_age_h": {"type": ["integer", "null"]},
         "bootstrap_pending": {"type": "boolean"},
         "scope": {"type": "string", "enum": ["all", "own_only"]},
+        "folder_snapshot": FOLDER_SNAPSHOT_OUTPUT_SCHEMA,
         "warnings": {
             "type": "array",
             "items": {
@@ -175,7 +182,16 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
             },
         },
     },
-    "required": ["dialogs", "count", "filters", "snapshot_age_h", "bootstrap_pending", "scope", "warnings"],
+    "required": [
+        "dialogs",
+        "count",
+        "filters",
+        "snapshot_age_h",
+        "bootstrap_pending",
+        "scope",
+        "folder_snapshot",
+        "warnings",
+    ],
     "additionalProperties": False,
 }
 
@@ -390,29 +406,12 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
         "snapshot_age_h": snapshot_age_h,
         "bootstrap_pending": bootstrap_pending,
         "scope": data.get("scope", args.scope),
+        "folder_snapshot": data.get("folder_snapshot") or unavailable_folder_snapshot(),
         "warnings": warnings,
     }
 
     if not dialogs:
         return structured_result(structured_content, result_count=0)
-
-    entity_dicts: list[dict] = []
-
-    for structured_dialog in structured_dialogs:
-        dialog_id = structured_dialog.get("id")
-        dialog_name = structured_dialog["name"]
-        dialog_type = structured_dialog["type"] or "unknown"
-
-        # Upsert entities into daemon for future name resolution
-        if isinstance(dialog_id, int) and isinstance(dialog_name, str):
-            entity_dicts.append({"id": dialog_id, "type": dialog_type, "name": dialog_name, "username": None})
-
-    if entity_dicts:
-        try:
-            async with daemon_connection() as upsert_conn:
-                await upsert_conn.upsert_entities(entities=entity_dicts)
-        except Exception:
-            logger.debug("entity_upsert_skipped", exc_info=True)
 
     return structured_result(structured_content, result_count=len(structured_dialogs))
 

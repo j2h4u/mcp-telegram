@@ -17,7 +17,13 @@ from ._base import (
     mcp_tool,
     structured_result,
 )
-from .structured import TELEGRAM_CONTENT_OUTPUT_SCHEMA, serialize_message_content, telegram_content
+from .structured import (
+    FOLDER_SNAPSHOT_OUTPUT_SCHEMA,
+    TELEGRAM_CONTENT_OUTPUT_SCHEMA,
+    serialize_message_content,
+    telegram_content,
+    unavailable_folder_snapshot,
+)
 
 LIST_FOLDERS_OUTPUT_SCHEMA = {
     "type": "object",
@@ -35,8 +41,9 @@ LIST_FOLDERS_OUTPUT_SCHEMA = {
             },
         },
         "count": {"type": "integer"},
+        "folder_snapshot": FOLDER_SNAPSHOT_OUTPUT_SCHEMA,
     },
-    "required": ["folders", "count"],
+    "required": ["folders", "count", "folder_snapshot"],
     "additionalProperties": False,
 }
 
@@ -74,6 +81,7 @@ async def list_folders(args: ListFolders) -> ToolResult:
         {
             "folders": folders,
             "count": len(folders),
+            "folder_snapshot": response.get("data", {}).get("folder_snapshot") or unavailable_folder_snapshot(),
         },
         result_count=len(folders),
     )
@@ -118,8 +126,17 @@ LIST_FOLDER_MESSAGES_OUTPUT_SCHEMA = {
         "partial": {"type": "boolean"},
         "incomplete_dialog_ids": {"type": "array", "items": {"type": "integer"}},
         "next_navigation": {"type": "null"},
+        "folder_snapshot": FOLDER_SNAPSHOT_OUTPUT_SCHEMA,
     },
-    "required": ["folder_id", "messages", "count", "partial", "incomplete_dialog_ids", "next_navigation"],
+    "required": [
+        "folder_id",
+        "messages",
+        "count",
+        "partial",
+        "incomplete_dialog_ids",
+        "next_navigation",
+        "folder_snapshot",
+    ],
     "additionalProperties": False,
 }
 
@@ -170,5 +187,6 @@ async def list_folder_messages(args: ListFolderMessages) -> ToolResult:
         "partial": bool(data.get("partial", False)),
         "incomplete_dialog_ids": list(data.get("incomplete_dialog_ids", [])),
         "next_navigation": None,
+        "folder_snapshot": data.get("folder_snapshot") or unavailable_folder_snapshot(),
     }
     return structured_result(payload, result_count=len(messages))
