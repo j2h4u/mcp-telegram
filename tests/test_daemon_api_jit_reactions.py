@@ -23,6 +23,7 @@ from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike
 from mcp_telegram.reading.query_records import read_message_from_row
 from mcp_telegram.reading.sqlite_projection import _FETCH_UNREAD_MESSAGES_SQL
 from mcp_telegram.tools.unread import _project_message_sender
+from mcp_telegram.topic_identity import project_topic
 from tests.daemon_api_policy import make_daemon_api_policy
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 from tests.reaction_helpers import make_reaction_freshener
@@ -724,6 +725,63 @@ def test_fetch_unread_group_sender_carries_raw_entity_username_to_projector(
     assert _project_message_sender(message) == {
         "display_name": "Group Member",
         "username": "@group_member",
+    }
+
+
+def test_fetch_unread_group_carries_persisted_topic_title_or_id(
+    make_synced_db: Callable[[], sqlite3.Connection],
+) -> None:
+    conn = make_synced_db()
+    dialog_id = -1001
+    _seed_synced(conn, dialog_id)
+    _seed_message(conn, dialog_id, 11)
+    conn.execute("UPDATE messages SET forum_topic_id = 7 WHERE dialog_id = ? AND message_id = ?", (dialog_id, 11))
+    conn.execute(
+        "INSERT INTO topic_metadata (dialog_id, topic_id, title, is_general, is_deleted, updated_at) "
+        "VALUES (?, ?, ?, 0, 0, ?)",
+        (dialog_id, 7, "Reports", int(time.time())),
+    )
+    conn.commit()
+    conn.row_factory = sqlite3.Row
+
+    row = cast(
+        sqlite3.Row | None,
+        conn.execute(
+            _FETCH_UNREAD_MESSAGES_SQL,
+            {
+                "dialog_id": dialog_id,
+                "after_msg_id": 0,
+                "limit": 10,
+                "self_id": 777,
+                "since_utc": None,
+            },
+        ).fetchone(),
+    )
+
+    assert row is not None
+    message = read_message_from_row(row)
+    assert message.topic_title == "Reports"
+    assert project_topic(topic_id=message.forum_topic_id, title=message.topic_title) == {"title": "Reports"}
+
+    conn.execute("UPDATE messages SET forum_topic_id = 8 WHERE dialog_id = ? AND message_id = ?", (dialog_id, 11))
+    conn.commit()
+    row_without_title = cast(
+        sqlite3.Row,
+        conn.execute(
+            _FETCH_UNREAD_MESSAGES_SQL,
+            {
+                "dialog_id": dialog_id,
+                "after_msg_id": 0,
+                "limit": 10,
+                "self_id": 777,
+                "since_utc": None,
+            },
+        ).fetchone(),
+    )
+    fallback_message = read_message_from_row(row_without_title)
+    assert fallback_message.topic_title is None
+    assert project_topic(topic_id=fallback_message.forum_topic_id, title=fallback_message.topic_title) == {
+        "topic_id": 8
     }
 
 

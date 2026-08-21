@@ -334,6 +334,14 @@ async def test_search_scoped_result_applies_time_bounds_and_keeps_cursor_context
             out INTEGER NOT NULL,
             is_deleted INTEGER NOT NULL DEFAULT 0
         );
+        -- Keep this hand-built search fixture compatible with the canonical
+        -- read projection's persisted-topic join.
+        CREATE TABLE topic_metadata (
+            dialog_id INTEGER NOT NULL,
+            topic_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            PRIMARY KEY (dialog_id, topic_id)
+        );
         CREATE VIRTUAL TABLE messages_fts USING fts5(dialog_id UNINDEXED, message_id UNINDEXED, text);
         CREATE TABLE synced_dialogs (dialog_id INTEGER PRIMARY KEY, status TEXT NOT NULL);
         CREATE TABLE full_history_enrollment (
