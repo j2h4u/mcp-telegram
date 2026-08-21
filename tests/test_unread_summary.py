@@ -74,7 +74,7 @@ def test_unread_summary_input_has_bounded_limit_and_no_scope() -> None:
         GetUnreadSummary.model_validate({"scope": "all"})
 
 
-def test_unread_summary_output_preserves_nullable_mark_and_shared_timezone_context() -> None:
+def test_unread_summary_output_omits_nullable_mark_and_shared_timezone_context() -> None:
     schema = TOOL_REGISTRY["get_unread_summary"].output_schema
     assert schema is not None
     properties = cast(dict[str, object], schema["properties"])
@@ -82,4 +82,4 @@ def test_unread_summary_output_preserves_nullable_mark_and_shared_timezone_conte
     dialogs = cast(dict[str, object], properties["dialogs"])
     item = cast(dict[str, object], dialogs["items"])
     mark = cast(dict[str, object], cast(dict[str, object], item["properties"])["unread_mark"])
-    assert mark["type"] == ["boolean", "null"]
+    assert mark["type"] == "boolean"

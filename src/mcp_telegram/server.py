@@ -272,7 +272,11 @@ async def call_tool(name: str, arguments: dict[str, object]) -> CallToolResult:
         logger.info("call_tool[%s] completed in %.3fs rids=%s", name, elapsed, rid_str)
         return CallToolResult(
             content=list(result.content) if result.is_error else [],
-            structured_content=result.structured_content,
+            structured_content=(
+                t.cast(dict[str, object], tools.omit_none_mapping_values(result.structured_content))
+                if result.structured_content is not None
+                else None
+            ),
             is_error=result.is_error,
         )
 

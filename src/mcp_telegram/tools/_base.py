@@ -5,6 +5,7 @@ import re
 import time
 import typing as t
 from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import dataclass
 from functools import singledispatch
 from typing import TypedDict, Unpack
@@ -46,6 +47,174 @@ _DAEMON_NOT_RUNNING_TEXT_BY_KIND = {
     **dict.fromkeys(("connection_broken", "malformed_response"), _DAEMON_CONNECTION_FAILURE_TEXT),
     _DAEMON_NOT_RUNNING_KIND: _DAEMON_NOT_RUNNING_TEXT,
 }
+
+_PURE_NULL_SCHEMA = object()
+
+
+def omit_none_mapping_values(value: object) -> object:
+    """Omit ``None``-valued mapping properties from an MCP response.
+
+    This is deliberately a mapping-only operation: ``None`` elements in lists
+    and tuples are data and remain present.  Nested mappings are handled at the
+    final MCP boundary so both normal structured results and direct
+    ``ToolResult`` paths share one wire contract.
+    """
+    if isinstance(value, Mapping):
+        return {key: omit_none_mapping_values(item) for key, item in value.items() if item is not None}
+    if isinstance(value, list):
+        return [omit_none_mapping_values(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(omit_none_mapping_values(item) for item in value)
+    return value
+
+
+def _schema_is_null(value: object) -> bool:
+    if value is _PURE_NULL_SCHEMA:
+        return True
+    if not isinstance(value, dict):
+        return False
+    schema_type = value.get("type")
+    if schema_type == "null" or schema_type == ["null"]:
+        return True
+    if "const" in value and value["const"] is None:
+        return True
+    enum = value.get("enum")
+    return bool(isinstance(enum, list) and enum and all(item is None for item in enum))
+
+
+def _schema_has_null(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    schema_type = value.get("type")
+    if isinstance(schema_type, list) and "null" in schema_type:
+        return True
+    for union_key in ("anyOf", "oneOf"):
+        variants = value.get(union_key)
+        if isinstance(variants, list) and any(_schema_has_null(item) for item in variants):
+            return True
+    return _schema_is_null(value)
+
+
+def _normalize_schema_properties(child: dict[object, object]) -> dict[object, object]:
+    properties: dict[object, object] = {}
+    for property_name, property_schema in child.items():
+        normalized_property = _normalize_output_schema_node(property_schema, nullable_property=True)
+        if normalized_property is not _PURE_NULL_SCHEMA:
+            properties[property_name] = normalized_property
+    return properties
+
+
+def _merge_nullable_union_variant(normalized: dict[str, object], variants: list[object]) -> dict[str, object] | object:
+    replacement = variants[0]
+    if not isinstance(replacement, dict):
+        return replacement
+    metadata = {key: item for key, item in normalized.items() if key not in {"anyOf", "oneOf"}}
+    return {**replacement, **metadata}
+
+
+def _normalize_nullable_union(normalized: dict[str, object], union_key: str) -> dict[str, object] | object:
+    variants = normalized.get(union_key)
+    if not isinstance(variants, list):
+        return normalized
+    non_null_variants = [variant for variant in variants if not _schema_is_null(variant)]
+    if len(non_null_variants) == 0:
+        return _PURE_NULL_SCHEMA
+    if len(non_null_variants) == len(variants):
+        return normalized
+    if len(non_null_variants) == 1:
+        return _merge_nullable_union_variant(normalized, non_null_variants)
+    normalized[union_key] = non_null_variants
+    return normalized
+
+
+def _normalize_nullable_type(normalized: dict[str, object]) -> dict[str, object] | object:
+    schema_type = normalized.get("type")
+    if isinstance(schema_type, list) and "null" in schema_type:
+        non_null_types = [item for item in schema_type if item != "null"]
+        if not non_null_types:
+            return _PURE_NULL_SCHEMA
+        normalized["type"] = non_null_types[0] if len(non_null_types) == 1 else non_null_types
+    elif schema_type == "null" or ("const" in normalized and normalized["const"] is None):
+        return _PURE_NULL_SCHEMA
+    return normalized
+
+
+def _remove_null_enum(normalized: dict[str, object]) -> None:
+    enum = normalized.get("enum")
+    if isinstance(enum, list) and None in enum:
+        normalized["enum"] = [item for item in enum if item is not None]
+
+
+def _normalize_nullable_schema(normalized: dict[str, object]) -> dict[str, object] | object:
+    normalized_type = _normalize_nullable_type(normalized)
+    if normalized_type is _PURE_NULL_SCHEMA or not isinstance(normalized_type, dict):
+        return normalized_type
+    normalized = normalized_type
+
+    for union_key in ("anyOf", "oneOf"):
+        normalized_union = _normalize_nullable_union(normalized, union_key)
+        if normalized_union is _PURE_NULL_SCHEMA or not isinstance(normalized_union, dict):
+            return normalized_union
+        normalized = normalized_union
+
+    _remove_null_enum(normalized)
+    return normalized
+
+
+def _normalize_required_properties(normalized: dict[str, object], original: dict[str, object]) -> None:
+    properties = normalized.get("properties")
+    required = normalized.get("required")
+    original_properties = original.get("properties")
+    if not isinstance(properties, dict) or not isinstance(required, list) or not isinstance(original_properties, dict):
+        return
+    nullable_names = {
+        name for name, original_schema in original_properties.items() if _schema_has_null(original_schema)
+    }
+    normalized["required"] = [name for name in required if name in properties and name not in nullable_names]
+
+
+def _normalize_schema_child(key: str, child: object, *, nullable_property: bool) -> object:
+    if key == "properties" and isinstance(child, dict):
+        return _normalize_schema_properties(child)
+    child_nullable_property = nullable_property and key in {"anyOf", "oneOf"}
+    return _normalize_output_schema_node(child, nullable_property=child_nullable_property)
+
+
+def _normalize_output_schema_node(value: object, *, nullable_property: bool = False) -> object:
+    """Normalize the small JSON Schema subset used by MCP output schemas.
+
+    Nullability is removed only for object properties, where a null value is
+    omitted from the wire object.  Array item schemas intentionally retain
+    null so ``[None]`` remains a valid and lossless response.
+    """
+    if isinstance(value, list):
+        return [_normalize_output_schema_node(item, nullable_property=nullable_property) for item in value]
+    if not isinstance(value, dict):
+        return value
+
+    normalized: dict[str, object] = {}
+    for key, child in value.items():
+        normalized[key] = _normalize_schema_child(key, child, nullable_property=nullable_property)
+
+    if nullable_property:
+        normalized_nullable = _normalize_nullable_schema(normalized)
+        if normalized_nullable is _PURE_NULL_SCHEMA or not isinstance(normalized_nullable, dict):
+            return normalized_nullable
+        normalized = normalized_nullable
+
+    _normalize_required_properties(normalized, value)
+    return normalized
+
+
+def normalize_output_schema(schema: dict[str, object] | None) -> dict[str, object] | None:
+    """Return the advertised output schema for the None-omitting wire contract."""
+    if schema is None:
+        return None
+    normalized_value = _normalize_output_schema_node(deepcopy(schema))
+    normalized = t.cast(dict[str, object], normalized_value)
+    if normalized is _PURE_NULL_SCHEMA or not isinstance(normalized, dict):
+        raise ValueError("Output schema root must remain an object schema")
+    return normalized
 
 
 class ToolArgs(BaseModel):
@@ -309,7 +478,7 @@ def mcp_tool(
             annotations=annotations,
             exported_name=exported_name,
             title=exported_title or cls.__name__,
-            output_schema=normalize_temporal_output_schema(output_schema),
+            output_schema=normalize_output_schema(normalize_temporal_output_schema(output_schema)),
         )
         return wrapped
 

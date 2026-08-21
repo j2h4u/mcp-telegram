@@ -712,7 +712,7 @@ def test_phase_52_agent_metadata_fields_are_in_output_schemas() -> None:
     assert_nested_item_fields(
         list_dialogs_schema,
         collection_name="dialogs",
-        required_fields=("draft_content",),
+        required_fields=(),
         property_fields=("draft_content",),
     )
 
@@ -730,7 +730,8 @@ def test_phase_52_agent_metadata_fields_are_in_output_schemas() -> None:
     assert_nested_item_fields(
         sync_alerts_schema,
         collection_name="alerts",
-        required_fields=("kind", "message_id", "deleted_at", "version", "edit_date", "access_lost_at"),
+        required_fields=("kind",),
+        property_fields=("message_id", "deleted_at", "version", "edit_date", "access_lost_at"),
     )
 
 
@@ -769,7 +770,7 @@ def test_list_tools_exposes_feedback_and_entity_info_output_schemas() -> None:
     feedback_schema = cast(dict[str, object], feedback_tool.output_schema)
     entity_schema = cast(dict[str, object], entity_tool.output_schema)
     assert "accepted" in cast(list[str], feedback_schema["required"])
-    assert "tracking_id" in cast(list[str], feedback_schema["required"])
+    assert "tracking_id" not in cast(dict[str, object], feedback_schema["properties"])
     assert "type_specific" in cast(list[str], entity_schema["required"])
     assert "content_fields" in cast(list[str], entity_schema["required"])
 
@@ -883,8 +884,14 @@ async def test_public_get_inbox_call_tool_preserves_canonical_content_schema(
     validate(instance=payload, schema=schema)
     dialog = cast(dict[str, object], cast(list[object], payload["dialogs"])[0])
     message = cast(dict[str, object], cast(list[object], dialog["messages"])[0])
-    assert message["content"] == expected_content
-    assert message["media"] == expected_media
+    if expected_content is None:
+        assert "content" not in message
+    else:
+        assert message["content"] == expected_content
+    if expected_media is None:
+        assert "media" not in message
+    else:
+        assert message["media"] == expected_media
     assert "text" not in message
     assert "media_description" not in message
 
