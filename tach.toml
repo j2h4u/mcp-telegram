@@ -56,8 +56,8 @@ layer = "composition"
 depends_on = [
     "mcp_telegram.activity_cold_backfill", "mcp_telegram.activity_hot_sweep", "mcp_telegram.activity_sync",
     "mcp_telegram.config", "mcp_telegram.daemon_api", "mcp_telegram.delta_sync", "mcp_telegram.dialog_sync",
-    "mcp_telegram.event_handlers", "mcp_telegram.feedback_db", "mcp_telegram.flood", "mcp_telegram.folders.contracts",
-    "mcp_telegram.folders.refresh", "mcp_telegram.folders.sqlite_repository", "mcp_telegram.folders.telegram_adapter",
+    "mcp_telegram.event_handlers", "mcp_telegram.feedback_db", "mcp_telegram.flood",
+    "mcp_telegram.folders.refresh", "mcp_telegram.folders.sqlite_repository", "mcp_telegram.folders.telegram_adapter", "mcp_telegram.folders.worker",
     "mcp_telegram.fts", "mcp_telegram.message_fact_refresh", "mcp_telegram.messages.sqlite_repository",
     "mcp_telegram.messages.telegram_adapter",
     "mcp_telegram.own_only", "mcp_telegram.read_state", "mcp_telegram.reactions.refresh",
@@ -265,7 +265,17 @@ depends_on = ["mcp_telegram.folders.membership", "mcp_telegram.folders.ports"]
 [[modules]]
 path = "mcp_telegram.folders.read_model"
 layer = "capability"
-depends_on = ["mcp_telegram.folders.sqlite_repository"]
+depends_on = ["mcp_telegram.folders.read_repository"]
+
+[[modules]]
+path = "mcp_telegram.folders.read_repository"
+layer = "persistence"
+depends_on = []
+
+[[modules]]
+path = "mcp_telegram.folders.worker"
+layer = "application"
+depends_on = ["mcp_telegram.flood", "mcp_telegram.folders.contracts", "mcp_telegram.folders.ports", "mcp_telegram.folders.refresh", "mcp_telegram.telegram_rpc"]
 
 [[modules]]
 path = "mcp_telegram.important_events"
@@ -552,7 +562,7 @@ depends_on = ["mcp_telegram.topics.contracts"]
 
 [[interfaces]]
 from = ["mcp_telegram.folders", "mcp_telegram.reactions", "mcp_telegram.topics"]
-expose = ["contracts\\..*", "ports\\..*", "refresh\\..*", "read_model\\..*"]
+expose = ["contracts\\..*", "ports\\..*", "refresh\\..*", "read_model\\..*", "worker\\..*"]
 
 [[interfaces]]
 from = ["mcp_telegram.messages"]

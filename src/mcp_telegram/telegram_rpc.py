@@ -33,6 +33,12 @@ class GovernedTelegramClientTarget(Protocol):
 
     def iter_dialogs(self, *args: object, **kwargs: object) -> AsyncIterator[object]: ...
 
+    def iter_participants(self, *args: object, **kwargs: object) -> AsyncIterator[object]: ...
+
+
+class _ClientBoundIterator(Protocol):
+    client: object
+
 
 @dataclass(frozen=True, slots=True)
 class TelegramRpcBudget:
@@ -101,12 +107,23 @@ class GovernedTelegramClient:
     def iter_dialogs(self, *args: object, **kwargs: object) -> AsyncIterator[object]:
         return self._governed_iterator("iter_dialogs", *args, **kwargs)
 
+    def iter_participants(self, *args: object, **kwargs: object) -> AsyncIterator[object]:
+        return self._governed_iterator("iter_participants", *args, **kwargs)
+
     async def _governed_iterator(self, method_name: str, *args: object, **kwargs: object) -> AsyncIterator[object]:
-        await self._governor.acquire(source=method_name)
-        iterator = (
-            self._client.iter_messages(*args, **kwargs)
-            if method_name == "iter_messages"
-            else self._client.iter_dialogs(*args, **kwargs)
-        )
+        if method_name == "iter_messages":
+            iterator = self._client.iter_messages(*args, **kwargs)
+        elif method_name == "iter_dialogs":
+            iterator = self._client.iter_dialogs(*args, **kwargs)
+        else:
+            iterator = self._client.iter_participants(*args, **kwargs)
+        if hasattr(cast(object, iterator), "client"):
+            # Telethon RequestIter routes each page through ``client(request)``.
+            # Bind this proxy at that seam so every page is governed exactly once.
+            cast(_ClientBoundIterator, iterator).client = self
+        else:
+            # Preserve governance for third-party async iterators without a
+            # RequestIter client seam; they expose no page-level request hook.
+            await self._governor.acquire(source=method_name)
         async for item in iterator:
             yield item

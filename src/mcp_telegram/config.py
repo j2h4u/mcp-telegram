@@ -50,10 +50,22 @@ class EntitiesConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class FoldersConfig:
-    """Freshness policy for Telegram dialog-folder membership snapshots."""
+class FolderProjectionConfig:
+    """Daemon-owned schedule and health policy for folder projections."""
 
-    snapshot_ttl_seconds: int = 60
+    refresh_interval_seconds: float = 900.0
+    jitter_ratio: float = 0.10
+    retry_delays_seconds: tuple[int, ...] = (60, 120, 240, 480)
+    retry_cap_seconds: int = 900
+    warning_failure_threshold: int = 3
+    stale_after_seconds: int | None = None
+
+    @property
+    def stale_threshold_seconds(self) -> int:
+        """Derive the stale boundary unless the operator configured one."""
+        if self.stale_after_seconds is not None:
+            return self.stale_after_seconds
+        return int(self.refresh_interval_seconds + self.retry_cap_seconds)
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,7 +75,6 @@ class FreshnessConfig:
     reactions: ReactionsConfig = field(default_factory=ReactionsConfig)
     read_receipts: ReadReceiptsConfig = field(default_factory=ReadReceiptsConfig)
     entities: EntitiesConfig = field(default_factory=EntitiesConfig)
-    folders: FoldersConfig = field(default_factory=FoldersConfig)
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +126,7 @@ class SchedulingConfig:
     activity_cold_enroll_seconds: float = 1_800.0
     activity_cold_access_retry_seconds: float = 3_600.0
     scheduled_flood_sleep_threshold_seconds: int = 0
+    folder_projection: FolderProjectionConfig = field(default_factory=FolderProjectionConfig)
 
 
 @dataclass(frozen=True, slots=True)
@@ -241,6 +253,19 @@ def _non_empty_str(data: dict[str, object], key: str, section: str, path: Path, 
     if not isinstance(value, str) or not value.strip():
         raise ConfigError(f"Invalid {section}.{key} in {path}: expected non-empty string")
     return value
+
+
+def _retry_schedule(
+    data: dict[str, object], key: str, section: str, path: Path, default: tuple[int, ...]
+) -> tuple[int, ...]:
+    value = data.get(key, default)
+    if (
+        not isinstance(value, (list, tuple))
+        or not value
+        or any(isinstance(item, bool) or not isinstance(item, int) or item < 1 for item in value)
+    ):
+        raise ConfigError(f"Invalid {section}.{key} in {path}: expected a non-empty array of integers >= 1")
+    return tuple(value)
 
 
 def _http_port(value: object, *, error_type: type[Exception] = ConfigError) -> int:
@@ -428,11 +453,10 @@ def _parse_state(data: dict[str, object], path: Path) -> StateConfig:
 def _parse_freshness(data: dict[str, object], path: Path) -> FreshnessConfig:
     freshness_data = _table(data, "freshness", path, required=False)
     if freshness_data is not None:
-        _reject_unknown_keys(freshness_data, {"reactions", "read_receipts", "entities", "folders"}, "freshness", path)
+        _reject_unknown_keys(freshness_data, {"reactions", "read_receipts", "entities"}, "freshness", path)
     reactions_data = _nested_table(freshness_data, "reactions", "freshness.reactions", path) or {}
     receipts_data = _nested_table(freshness_data, "read_receipts", "freshness.read_receipts", path) or {}
     entities_data = _nested_table(freshness_data, "entities", "freshness.entities", path) or {}
-    folders_data = _nested_table(freshness_data, "folders", "freshness.folders", path) or {}
     _reject_unknown_keys(reactions_data, {"freshness_ttl_seconds"}, "freshness.reactions", path)
     _reject_unknown_keys(receipts_data, {"read_at_ttl_seconds"}, "freshness.read_receipts", path)
     _reject_unknown_keys(
@@ -446,7 +470,6 @@ def _parse_freshness(data: dict[str, object], path: Path) -> FreshnessConfig:
         "freshness.entities",
         path,
     )
-    _reject_unknown_keys(folders_data, {"snapshot_ttl_seconds"}, "freshness.folders", path)
     defaults = FreshnessConfig()
     return FreshnessConfig(
         reactions=ReactionsConfig(
@@ -492,15 +515,6 @@ def _parse_freshness(data: dict[str, object], path: Path) -> FreshnessConfig:
                 path,
                 defaults.entities.resolver_enrichment_ttl_seconds,
             ),
-        ),
-        folders=FoldersConfig(
-            snapshot_ttl_seconds=_positive_int(
-                folders_data,
-                "snapshot_ttl_seconds",
-                "freshness.folders",
-                path,
-                defaults.folders.snapshot_ttl_seconds,
-            )
         ),
     )
 
@@ -593,8 +607,67 @@ def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
         "activity_cold_backfill_batch_pause_seconds",
         "activity_cold_enroll_seconds",
         "activity_cold_access_retry_seconds",
+        "folder_projection",
     }
     scheduling_data = _optional_section(data, "scheduling", allowed, path)
+    folder_data = _nested_table(scheduling_data, "folder_projection", "scheduling.folder_projection", path) or {}
+    _reject_unknown_keys(
+        folder_data,
+        {
+            "refresh_interval_seconds",
+            "jitter_ratio",
+            "retry_delays_seconds",
+            "retry_cap_seconds",
+            "warning_failure_threshold",
+            "stale_after_seconds",
+        },
+        "scheduling.folder_projection",
+        path,
+    )
+    folder_defaults = defaults.folder_projection
+    stale_value = folder_data.get("stale_after_seconds", folder_defaults.stale_after_seconds)
+    if stale_value is not None and (
+        isinstance(stale_value, bool) or not isinstance(stale_value, int) or stale_value < 1
+    ):
+        raise ConfigError(f"Invalid scheduling.folder_projection.stale_after_seconds in {path}: expected integer >= 1")
+    jitter = folder_data.get("jitter_ratio", folder_defaults.jitter_ratio)
+    if isinstance(jitter, bool) or not isinstance(jitter, (int, float)) or not 0 <= float(jitter) <= 1:
+        raise ConfigError(
+            f"Invalid scheduling.folder_projection.jitter_ratio in {path}: expected number between 0 and 1"
+        )
+    refresh_interval_seconds = _positive_float(
+        folder_data,
+        "refresh_interval_seconds",
+        "scheduling.folder_projection",
+        path,
+        folder_defaults.refresh_interval_seconds,
+    )
+    if refresh_interval_seconds < 1:
+        raise ConfigError(
+            f"Invalid scheduling.folder_projection.refresh_interval_seconds in {path}: expected number >= 1"
+        )
+    folder_projection = FolderProjectionConfig(
+        refresh_interval_seconds=refresh_interval_seconds,
+        jitter_ratio=float(jitter),
+        retry_delays_seconds=_retry_schedule(
+            folder_data,
+            "retry_delays_seconds",
+            "scheduling.folder_projection",
+            path,
+            folder_defaults.retry_delays_seconds,
+        ),
+        retry_cap_seconds=_positive_int(
+            folder_data, "retry_cap_seconds", "scheduling.folder_projection", path, folder_defaults.retry_cap_seconds
+        ),
+        warning_failure_threshold=_positive_int(
+            folder_data,
+            "warning_failure_threshold",
+            "scheduling.folder_projection",
+            path,
+            folder_defaults.warning_failure_threshold,
+        ),
+        stale_after_seconds=stale_value,
+    )
     return SchedulingConfig(
         scheduled_reconciliation_seconds=_positive_float(
             scheduling_data,
@@ -729,6 +802,7 @@ def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
             path,
             defaults.activity_cold_access_retry_seconds,
         ),
+        folder_projection=folder_projection,
     )
 
 

@@ -35,7 +35,7 @@ MESSAGE_SQL_OWNER_PATHS = frozenset(
         "daemon_entity_info.py",
         "daemon_source_export.py",
         "reading/sqlite_projection.py",
-        "folders/sqlite_repository.py",
+        "folders/read_repository.py",
         "fts.py",
         "message_fact_refresh.py",
         "messages/sqlite_repository.py",

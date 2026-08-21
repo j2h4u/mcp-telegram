@@ -15,14 +15,16 @@ from mcp_telegram.folders.contracts import (
     FolderSourceUnavailableError,
 )
 from mcp_telegram.folders.membership import matches
-from mcp_telegram.folders.refresh import FolderRefresher
-from mcp_telegram.folders.sqlite_repository import (
-    SQLiteFolderSnapshotRepository,
+from mcp_telegram.folders.read_repository import (
     dialog_placement,
+    folder_snapshot,
     folders_by_dialog,
     list_folder_messages,
     list_folders,
-    replace_folder_snapshot,
+)
+from mcp_telegram.folders.refresh import FolderRefresher
+from mcp_telegram.folders.sqlite_repository import (
+    SQLiteFolderSnapshotRepository,
 )
 from mcp_telegram.folders.telegram_adapter import TelethonTelegramFolderGateway, _dialog_facts
 from mcp_telegram.sync_db import ensure_sync_schema
@@ -33,12 +35,22 @@ def _connection(path: Path) -> sqlite3.Connection:
     return sqlite3.connect(path)
 
 
+def _replace_folder_snapshot(
+    conn: sqlite3.Connection, folders: list[tuple[int, str]], memberships: list[tuple[int, int]]
+) -> None:
+    with conn:
+        conn.execute("DELETE FROM telegram_folder_members")
+        conn.execute("DELETE FROM telegram_folders")
+        conn.executemany("INSERT INTO telegram_folders(folder_id, title) VALUES (?, ?)", folders)
+        conn.executemany("INSERT INTO telegram_folder_members(folder_id, dialog_id) VALUES (?, ?)", memberships)
+
+
 def test_snapshot_exposes_many_to_many_placement_and_archive_separately(tmp_path: Path) -> None:
     conn = _connection(tmp_path / "sync.db")
     try:
         conn.execute("INSERT INTO dialogs(dialog_id, archived) VALUES (10, 1)")
         conn.commit()
-        replace_folder_snapshot(conn, [(1, "Work"), (2, "Unread")], [(1, 10), (2, 10)])
+        _replace_folder_snapshot(conn, [(1, "Work"), (2, "Unread")], [(1, 10), (2, 10)])
 
         assert list_folders(conn) == [{"id": 1, "title": "Work"}, {"id": 2, "title": "Unread"}]
         assert folders_by_dialog(conn) == {
@@ -55,13 +67,42 @@ def test_snapshot_exposes_many_to_many_placement_and_archive_separately(tmp_path
 def test_failed_snapshot_replacement_rolls_back_to_previous_snapshot(tmp_path: Path) -> None:
     conn = _connection(tmp_path / "sync.db")
     try:
-        replace_folder_snapshot(conn, [(1, "Existing")], [(1, 10)])
+        _replace_folder_snapshot(conn, [(1, "Existing")], [(1, 10)])
 
         with pytest.raises(sqlite3.IntegrityError):
-            replace_folder_snapshot(conn, [(2, "Duplicate"), (2, "Duplicate")], [])
+            _replace_folder_snapshot(conn, [(2, "Duplicate"), (2, "Duplicate")], [])
 
         assert list_folders(conn) == [{"id": 1, "title": "Existing"}]
         assert folders_by_dialog(conn) == {10: [{"id": 1, "title": "Existing"}]}
+    finally:
+        conn.close()
+
+
+def test_folder_snapshot_requires_generation_and_success_timestamp(tmp_path: Path) -> None:
+    conn = _connection(tmp_path / "sync.db")
+    try:
+        conn.execute("INSERT INTO daemon_state(key, value) VALUES ('folder_snapshot_generation', '4')")
+        conn.commit()
+        assert folder_snapshot(conn, stale_after_seconds=10, now=100) == {
+            "generation": 4,
+            "status": "unavailable",
+            "completed_at": None,
+            "age_seconds": None,
+            "complete": False,
+        }
+    finally:
+        conn.close()
+
+
+def test_folder_snapshot_is_stale_at_threshold(tmp_path: Path) -> None:
+    conn = _connection(tmp_path / "sync.db")
+    try:
+        conn.executemany(
+            "INSERT INTO daemon_state(key, value) VALUES (?, ?)",
+            [("folder_snapshot_generation", "4"), ("folder_snapshot_last_success_at", "90")],
+        )
+        conn.commit()
+        assert folder_snapshot(conn, stale_after_seconds=10, now=100)["status"] == "stale"
     finally:
         conn.close()
 
@@ -81,7 +122,7 @@ def test_folder_messages_merge_local_rows_and_report_incomplete_dialogs(tmp_path
             "INSERT INTO synced_dialogs(dialog_id, status, sync_progress, total_messages) VALUES (10, 'synced', 10, 10)"
         )
         conn.commit()
-        replace_folder_snapshot(conn, [(1, "Work")], [(1, 10), (1, 20)])
+        _replace_folder_snapshot(conn, [(1, "Work")], [(1, 10), (1, 20)])
 
         assert list_folder_messages(conn, 1, 20) == {
             "folder_id": 1,
@@ -121,7 +162,7 @@ def test_folder_messages_do_not_compare_sync_cursor_to_total_count(tmp_path: Pat
             "VALUES (10, 'synced', 312233, 1)"
         )
         conn.commit()
-        replace_folder_snapshot(conn, [(1, "Work")], [(1, 10)])
+        _replace_folder_snapshot(conn, [(1, "Work")], [(1, 10)])
 
         result = list_folder_messages(conn, 1, 20)
 
@@ -238,7 +279,7 @@ class _FailingGateway:
 async def test_refresh_replaces_catalog_and_membership_together(tmp_path: Path) -> None:
     conn = _connection(tmp_path / "sync.db")
     try:
-        replace_folder_snapshot(conn, [(9, "Stale")], [(9, 999)])
+        _replace_folder_snapshot(conn, [(9, "Stale")], [(9, 999)])
         await FolderRefresher(_Gateway(), SQLiteFolderSnapshotRepository(conn)).refresh()
 
         assert list_folders(conn) == [{"id": 2, "title": "Contacts"}]
@@ -250,7 +291,7 @@ async def test_refresh_replaces_catalog_and_membership_together(tmp_path: Path) 
 async def test_refresh_failure_propagates_and_preserves_saved_snapshot(tmp_path: Path) -> None:
     conn = _connection(tmp_path / "sync.db")
     try:
-        replace_folder_snapshot(conn, [(9, "Saved")], [(9, 999)])
+        _replace_folder_snapshot(conn, [(9, "Saved")], [(9, 999)])
 
         with pytest.raises(RuntimeError, match="Telegram unavailable"):
             await FolderRefresher(_FailingGateway(), SQLiteFolderSnapshotRepository(conn)).refresh()

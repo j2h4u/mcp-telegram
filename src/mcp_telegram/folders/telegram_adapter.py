@@ -106,7 +106,9 @@ class TelethonTelegramFolderGateway(TelegramFolderGateway):
         try:
             response = await self._client(GetDialogFiltersRequest())
             raw_dialogs = [dialog async for dialog in self._client.iter_dialogs()]
-        except (FloodWaitError, RPCError, TimeoutError, OSError) as exc:
+        except FloodWaitError:
+            raise
+        except (RPCError, TimeoutError, OSError) as exc:
             raise FolderSourceUnavailableError("Telegram folder source is unavailable") from exc
 
         raw_filters = cast(Sequence[object], getattr(response, "filters", ()))

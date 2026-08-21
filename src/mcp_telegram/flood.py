@@ -305,6 +305,11 @@ def flood_seconds(
     return wait_s
 
 
+def is_flood_wait(exc: BaseException) -> bool:
+    """Identify Telethon flood exceptions without widening import ownership."""
+    return exc.__class__.__name__ in {"FloodWaitError", "FloodTestPhoneWaitError"}
+
+
 async def sleep_through_flood(shutdown_event: asyncio.Event, seconds: float) -> bool:
     """Sleep ``seconds``, waking early if ``shutdown_event`` is set.
 

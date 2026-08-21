@@ -64,11 +64,13 @@ capture_signals  # override of uvicorn.Server.capture_signals, called by uvicorn
 describe_source         # daemon_client.py:293
 export_source_changes   # daemon_client.py:297
 read_source_unit_window # daemon_client.py:317
+upsert_entities       # retained daemon-client API for external entity projection callers
 
 # Used in production but missed by vulture's call-graph (re-imports / dynamic use):
 open_sync_db_reader   # MCP read-path DB opener (sync_db.py:447)
 result_count_semantics  # tools/structured.py:97 — referenced across tool modules
 record_daemon_event  # public test/operator event-seeding helper
+replace_folder_snapshot  # public test/operator folder-fixture helper
 
 # Symmetric test-support accessor: _save_dialog_state is production; _load_dialog_state
 # reads it back in the activity sweep tests (tools never read state via it directly).
