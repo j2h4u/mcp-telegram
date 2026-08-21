@@ -41,7 +41,7 @@ typecheck-tests:
 
 # Enforce the explicit current-state module graph and named cleanup frontier.
 module-boundaries:
-    uv run tach check --interfaces
+    uv run tach check --dependencies --interfaces --exact
 
 # Keep Telethon and sqlite imports restricted to their explicit current owners.
 semantic-boundaries:

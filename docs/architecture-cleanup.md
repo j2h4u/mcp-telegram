@@ -50,6 +50,6 @@ Useful checks:
 
 ```bash
 just module-boundaries
-uv run tach check --interfaces
+uv run tach check --dependencies --interfaces --exact
 just config-imports
 ```
