@@ -14,7 +14,9 @@ from unittest.mock import MagicMock
 import pytest
 
 from mcp_telegram.daemon_api import DaemonAPIServer
-from mcp_telegram.feedback_db import VALID_SEVERITIES, ensure_feedback_schema
+from mcp_telegram.feedback_contracts import VALID_SEVERITIES
+from mcp_telegram.feedback_db import SQLiteFeedbackStore, ensure_feedback_schema
+from mcp_telegram.feedback_service import FeedbackApplicationService
 from tests.daemon_api_policy import make_daemon_api_policy
 from tests.reaction_helpers import make_reaction_freshener
 
@@ -31,7 +33,7 @@ def _make_feedback_server(tmp_path: Path) -> Iterator[tuple[DaemonAPIServer, sql
         sync_conn,
         client,
         shutdown_event,
-        feedback_conn,
+        FeedbackApplicationService(SQLiteFeedbackStore(feedback_conn)),
         reaction_freshener=make_reaction_freshener(sync_conn, client),
         policy=make_daemon_api_policy(),
     )
@@ -280,7 +282,7 @@ async def test_submit_feedback_db_error_returns_internal(tmp_path: Path) -> None
             sync_conn,
             client,
             shutdown_event,
-            mock_feedback_conn,
+            FeedbackApplicationService(SQLiteFeedbackStore(mock_feedback_conn)),
             reaction_freshener=make_reaction_freshener(sync_conn, client),
             policy=make_daemon_api_policy(),
         )

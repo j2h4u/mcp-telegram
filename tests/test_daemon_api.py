@@ -24,6 +24,8 @@ import pytest
 from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike, _ResolverEntityCache
 from mcp_telegram.daemon_ipc import get_daemon_socket_path
 from mcp_telegram.daemon_message import _MessageLike, fetch_reaction_counts, message_to_dict
+from mcp_telegram.feedback_db import SQLiteFeedbackStore
+from mcp_telegram.feedback_service import FeedbackApplicationService
 from mcp_telegram.flood import FloodWaitKillSwitchStatus
 from mcp_telegram.folders.sqlite_repository import replace_folder_snapshot
 from mcp_telegram.fts import MESSAGES_FTS_DDL, stem_text
@@ -328,7 +330,7 @@ def make_server(
         conn,
         cast(DaemonClientLike, client),
         shutdown_event,
-        feedback_conn,
+        FeedbackApplicationService(SQLiteFeedbackStore(feedback_conn)),
         reaction_freshener=make_reaction_freshener(conn, client),
         topic_refresher=topic_refresher,
         policy=make_daemon_api_policy(),

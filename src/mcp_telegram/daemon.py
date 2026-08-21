@@ -71,7 +71,8 @@ from .delta_sync import (
 )
 from .dialog_sync import DialogsBootstrapWorker, run_reconciliation_loop
 from .event_handlers import EventHandlerManager
-from .feedback_db import ensure_feedback_schema
+from .feedback_db import SQLiteFeedbackStore, ensure_feedback_schema
+from .feedback_service import FeedbackApplicationService
 from .flood import (
     FloodWaitKillSwitchPolicy,
     configure_flood_wait_kill_switch,
@@ -828,6 +829,7 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914 - com
     # loop.add_signal_handler — so no cross-thread SQLite sharing occurs.
     feedback_db_path = state_paths.feedback_db_path
     feedback_conn = ensure_feedback_schema(feedback_db_path)
+    feedback_service = FeedbackApplicationService(SQLiteFeedbackStore(feedback_conn))
     logger.info("feedback.db ready at %s", feedback_db_path)
 
     shutdown_event = register_shutdown_handler(conn, asyncio.get_running_loop(), feedback_conn=feedback_conn)
@@ -854,7 +856,7 @@ async def _build_sync_main_context() -> _SyncMainContext:  # noqa: PLR0914 - com
         conn,
         cast(DaemonClientLike, client),
         shutdown_event,
-        feedback_conn,
+        feedback_service,
         db_path,
         reaction_freshener=reaction_freshener,
         topic_refresher=topic_refresher,

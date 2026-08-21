@@ -8,6 +8,7 @@ Public API:
   ensure_feedback_schema(path)  -> sqlite3.Connection  (caller owns lifecycle)
   VALID_SEVERITIES              frozenset[str]
   VALID_STATUSES                frozenset[str]
+  SQLiteFeedbackStore           SQLite persistence adapter for the application port
   _FEEDBACK_SCHEMA_VERSION      int
 
 The daemon is the sole writer. The CLI reads rows with
@@ -21,18 +22,18 @@ import sqlite3
 from pathlib import Path
 from typing import cast
 
+from .feedback_contracts import VALID_SEVERITIES, VALID_STATUSES
+
 __all__ = [
     "VALID_SEVERITIES",
     "VALID_STATUSES",
     "_FEEDBACK_SCHEMA_VERSION",
+    "SQLiteFeedbackStore",
     "ensure_feedback_schema",
     "get_feedback_db_path",
 ]
 
 _FEEDBACK_SCHEMA_VERSION: int = 2
-
-VALID_SEVERITIES: frozenset[str] = frozenset({"bug", "suggestion", "question"})
-VALID_STATUSES: frozenset[str] = frozenset({"open", "in_progress", "done", "dismissed"})
 
 _FEEDBACK_DDL = """
 CREATE TABLE IF NOT EXISTS feedback (
@@ -111,3 +112,44 @@ def ensure_feedback_schema(db_path: Path) -> sqlite3.Connection:
         conn.execute("INSERT INTO schema_version VALUES (?, strftime('%s', 'now'))", (_FEEDBACK_SCHEMA_VERSION,))
         conn.commit()
     return conn
+
+
+class SQLiteFeedbackStore:
+    """SQLite adapter implementing the feedback application store port."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def insert_feedback(  # noqa: PLR0913
+        self,
+        *,
+        submitted_at: int,
+        message: str,
+        severity: str | None,
+        context: object | None,
+        model: object | None,
+        harness: object | None,
+    ) -> int | None:
+        cur = self._conn.execute(
+            "INSERT INTO feedback (submitted_at, message, severity, context, model, harness) VALUES (?, ?, ?, ?, ?, ?)",
+            (submitted_at, message, severity, context, model, harness),
+        )
+        self._conn.commit()
+        return cast(int | None, cur.lastrowid)
+
+    def update_feedback_status(
+        self,
+        *,
+        feedback_id: int,
+        status: str,
+        status_changed_at: int,
+        reason: str | None,
+    ) -> bool:
+        cur = self._conn.execute(
+            "UPDATE feedback SET status = ?, status_changed_at = ?, status_comment = ? WHERE id = ?",
+            (status, status_changed_at, reason, feedback_id),
+        )
+        if cur.rowcount == 0:
+            return False
+        self._conn.commit()
+        return True
