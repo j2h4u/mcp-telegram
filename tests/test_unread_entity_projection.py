@@ -43,6 +43,16 @@ def test_unread_summary_projection_helper_keeps_identity_contract_and_skips_bad_
     assert row["entity"] == {"display_name": "Alice", "username": "@alice"}
     assert "dialog_id" not in row
     assert _project_unread_summary_dialog({"dialog_id": "42"}) is None
+    assert _project_unread_summary_dialog({"dialog_id": 42, "name": 123, "username": False}) == {
+        "entity": {"display_name": "42", "telegram_id": 42},
+        "dialog_type": None,
+        "unread_count": None,
+        "unread_mark": None,
+        "unread_mentions_count": 0,
+        "unread_reactions_count": 0,
+        "archived": False,
+        "last_message_at": None,
+    }
     assert _project_unread_summary_dialogs([{"dialog_id": 42, "name": "Alice"}, "bad"]) == [
         {
             "entity": {"display_name": "Alice", "telegram_id": 42},

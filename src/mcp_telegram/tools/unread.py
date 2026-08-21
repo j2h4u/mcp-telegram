@@ -571,13 +571,17 @@ def _structured_messages(
     return structured
 
 
+def _identity_text_fact(value: object) -> str | None:
+    return value if isinstance(value, str) else None
+
+
 def _project_unread_summary_dialog(raw_row: Mapping[str, object]) -> dict[str, object] | None:
     dialog_id = raw_row.get("dialog_id")
     if isinstance(dialog_id, bool) or not isinstance(dialog_id, int):
         return None
     entity = project_entity_identity(
-        display_name=raw_row.get("name"),
-        username=raw_row.get("username"),
+        display_name=_identity_text_fact(raw_row.get("name")),
+        username=_identity_text_fact(raw_row.get("username")),
         telegram_id=dialog_id,
     )
     return {
