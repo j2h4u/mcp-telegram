@@ -154,7 +154,7 @@ from .daemon_source_export import (
     _export_source_changes,
     _read_source_unit_window,
 )
-from .feedback_db import VALID_SEVERITIES, VALID_STATUSES
+from .feedback_service import FeedbackService
 from .reactions.refresh import ReactionFreshener
 from .telegram_fragments import FragmentContextService, TelethonTelegramFragmentGateway
 from .telegram_history import TelethonTelegramHistoryGateway
@@ -229,79 +229,7 @@ else:
 # Phase 39.2 §Key technical decisions: per-message TTL for JIT reactions freshen-on-read.
 # Amortizes rapid paginated reads on the same ids; live events catch most mutations.
 _TELEMETRY_TOOL_NAME_MAX_LEN = 200
-_FEEDBACK_MESSAGE_MAX_LEN = 10000
-_FEEDBACK_CONTEXT_MAX_LEN = 2000
-_FEEDBACK_MODEL_MAX_LEN = 200
-_FEEDBACK_HARNESS_MAX_LEN = 200
 _UPSERT_ENTITIES_MAX_LEN = 10000
-
-
-@dataclasses.dataclass(frozen=True)
-class _SubmitFeedbackRequest:
-    message: str
-    severity: str | None
-    context: str | None
-    model: str | None
-    harness: str | None
-
-    @classmethod
-    def parse(cls, req: dict) -> _SubmitFeedbackRequest:
-        message = req.get("message", "")
-        if not isinstance(message, str):
-            raise ValueError("message must be a string")
-
-        stripped = message.strip()
-        if not stripped:
-            raise ValueError("message is required")
-        if len(message) > _FEEDBACK_MESSAGE_MAX_LEN:
-            raise ValueError("message too long (max 10000 chars)")
-
-        severity = req.get("severity")
-        if severity is not None and severity not in VALID_SEVERITIES:
-            valid_list = ", ".join(sorted(VALID_SEVERITIES))
-            raise ValueError(f"severity must be one of: {valid_list}")
-
-        context = req.get("context")
-        model = req.get("model")
-        harness = req.get("harness")
-        if context is not None and len(str(context)) > _FEEDBACK_CONTEXT_MAX_LEN:
-            raise ValueError("context too long (max 2000 chars)")
-        if model is not None and len(str(model)) > _FEEDBACK_MODEL_MAX_LEN:
-            raise ValueError("model too long (max 200 chars)")
-        if harness is not None and len(str(harness)) > _FEEDBACK_HARNESS_MAX_LEN:
-            raise ValueError("harness too long (max 200 chars)")
-
-        return cls(
-            message=stripped,
-            severity=severity,
-            context=context,
-            model=model,
-            harness=harness,
-        )
-
-
-@dataclasses.dataclass(frozen=True)
-class _UpdateFeedbackStatusRequest:
-    feedback_id: int
-    status: str
-    reason: str | None
-
-    @classmethod
-    def parse(cls, req: dict) -> _UpdateFeedbackStatusRequest:
-        feedback_id = req.get("id")
-        if not isinstance(feedback_id, int) or feedback_id <= 0:
-            raise ValueError("id must be a positive integer")
-
-        status = req.get("status")
-        if status not in VALID_STATUSES:
-            valid_list = ", ".join(sorted(VALID_STATUSES))
-            raise ValueError(f"status must be one of: {valid_list}")
-
-        reason = req.get("reason")
-        if reason is not None and not isinstance(reason, str):
-            raise ValueError("reason must be a string or null")
-
-        return cls(feedback_id=feedback_id, status=status, reason=reason)
 
 
 from .resolver import (
@@ -399,7 +327,7 @@ class DaemonAPIServer:
         conn: sqlite3.Connection,
         client: DaemonClientLike,
         shutdown_event: asyncio.Event,
-        feedback_conn: sqlite3.Connection | None = None,
+        feedback_service: FeedbackService | None = None,
         sync_db_path: Path | None = None,
         *,
         reaction_freshener: ReactionFreshener,
@@ -410,7 +338,7 @@ class DaemonAPIServer:
         conn.row_factory = sqlite3.Row
         self._conn = conn
         self._sync_db_path = _resolve_sync_db_path(conn, sync_db_path)
-        self._feedback_conn = feedback_conn  # feedback.db — daemon is sole writer
+        self._feedback_service = feedback_service
         self._client = client
         self._shutdown_event = shutdown_event
         # Phase 39.1: cached authenticated user id, populated once by
@@ -1439,99 +1367,20 @@ class DaemonAPIServer:
     # ------------------------------------------------------------------
 
     async def _submit_feedback(self, req: dict) -> dict:
-        """Persist a feedback row in feedback.db.
-
-        Validates message (required, non-empty after strip, ≤10000 chars) and
-        optional severity (must be in VALID_SEVERITIES).  Optional context,
-        model, harness fields are length-capped at the daemon layer as
-        defense-in-depth — direct socket callers bypass the Pydantic tool layer.
-
-        NOTE: the user-supplied message text is intentionally NOT logged at any
-        level to avoid accidental disclosure of sensitive context.
-        """
-        try:
-            request = _SubmitFeedbackRequest.parse(req)
-        except ValueError as exc:
-            return {"ok": False, "error": "invalid_input", "message": str(exc)}
-
-        if self._feedback_conn is None:
+        """Delegate feedback submission to the daemon-wired application service."""
+        if self._feedback_service is None:
             return {"ok": False, "error": "internal", "message": "feedback database not initialised"}
-
-        try:
-            cur = self._feedback_conn.execute(
-                "INSERT INTO feedback (submitted_at, message, severity, context, model, harness) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    int(time.time()),
-                    request.message,
-                    request.severity,
-                    request.context,
-                    request.model,
-                    request.harness,
-                ),
-            )
-            self._feedback_conn.commit()
-            return {"ok": True, "data": {"message": "Feedback recorded. Thank you!", "id": cur.lastrowid}}
-        except Exception as exc:
-            logger.exception("submit_feedback failed: %s", exc)
-            return {"ok": False, "error": "internal", "message": "internal error"}
+        return self._feedback_service.submit_feedback(req)
 
     # ------------------------------------------------------------------
     # update_feedback_status
     # ------------------------------------------------------------------
 
     async def _update_feedback_status(self, req: dict) -> dict:
-        """Update the status of a feedback row in feedback.db.
-
-        Sole-writer contract: every status change for feedback rows arrives
-        through this handler. The CLI never writes feedback.db directly.
-
-        Validates id (positive int), status (must be in VALID_STATUSES),
-        and reason (must be None or a str — direct socket callers could
-        send arbitrary JSON, so we type-check before binding into SQL).
-
-        Optional `reason` is stored verbatim in the status_comment column;
-        omitted reason writes NULL.
-
-        Commit ordering: the UPDATE runs first, then we inspect rowcount.
-        If rowcount == 0 (row not found) we return without committing — no
-        observable DB change. Only successful updates reach `commit()`.
-
-        NOTE: row contents (message text, reason text) are never logged.
-        """
-        try:
-            request = _UpdateFeedbackStatusRequest.parse(req)
-        except ValueError as exc:
-            return {"ok": False, "error": "invalid_input", "message": str(exc)}
-
-        # T-49-11: no length cap on status_comment by design (single-operator
-        # low-volume queue; SQLite handles multi-MB TEXT comfortably).
-
-        if self._feedback_conn is None:
+        """Delegate feedback status changes to the daemon-wired application service."""
+        if self._feedback_service is None:
             return {"ok": False, "error": "internal", "message": "feedback database not initialised"}
-
-        try:
-            cur = self._feedback_conn.execute(
-                "UPDATE feedback SET status = ?, status_changed_at = ?, status_comment = ? WHERE id = ?",
-                (request.status, int(time.time()), request.reason, request.feedback_id),
-            )
-            if cur.rowcount == 0:
-                # No row matched — do NOT commit (nothing to persist anyway,
-                # but explicit ordering keeps the success/no-op paths clean).
-                return {"ok": False, "error": "not_found", "message": f"Feedback id {request.feedback_id} not found."}
-            self._feedback_conn.commit()
-            # NOTE: response intentionally returns only a confirmation message,
-            # not the full updated row. CLI prints the message string. Both
-            # reviewers (opencode, codex) flagged this as LOW; accepted for
-            # this phase to keep the surface minimal — revisit if `feedback
-            # status` UX needs to echo the canonical row state.
-            return {
-                "ok": True,
-                "data": {"message": f"Feedback {request.feedback_id} status set to '{request.status}'."},
-            }
-        except Exception as exc:
-            logger.exception("update_feedback_status failed: %s", exc)
-            return {"ok": False, "error": "internal", "message": "internal error"}
+        return self._feedback_service.update_feedback_status(req)
 
     # ------------------------------------------------------------------
     # get_usage_stats
