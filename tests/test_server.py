@@ -108,15 +108,37 @@ def test_list_messages_reflection_exposes_shared_navigation_schema() -> None:
     navigation = cast(dict[str, object], properties["navigation"])
     exact_dialog_id = cast(dict[str, object], properties["exact_dialog_id"])
     exact_topic_id = cast(dict[str, object], properties["exact_topic_id"])
+    anchor_message_id = cast(dict[str, object], properties["anchor_message_id"])
     assert navigation["type"] == "string"
     assert exact_dialog_id["type"] == "integer"
     assert exact_topic_id["type"] == "integer"
+    assert anchor_message_id["type"] == "integer"
+    assert anchor_message_id["minimum"] == 1
+    assert anchor_message_id["maximum"] == 2_147_483_647
     assert '"latest"' in cast(str, navigation["description"])
     assert '"start"' in cast(str, navigation["description"])
     assert "already known" in cast(str, exact_dialog_id["description"])
     assert "Mutually exclusive with dialog" in cast(str, exact_dialog_id["description"])
     assert "full topic catalog" in cast(str, exact_topic_id["description"])
     assert "dialog" not in required
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("anchor_message_id", [0, -1, 2_147_483_648])
+async def test_call_tool_rejects_out_of_range_anchor_before_runner_or_daemon(
+    monkeypatch: pytest.MonkeyPatch,
+    anchor_message_id: int,
+) -> None:
+    runner = AsyncMock()
+    daemon_connection = AsyncMock()
+    monkeypatch.setattr(server.tools, "tool_runner", runner)
+    monkeypatch.setattr("mcp_telegram.tools.reading.daemon_connection", daemon_connection)
+
+    result = _call_tool_result(await server.call_tool("list_messages", {"anchor_message_id": anchor_message_id}))
+
+    assert result.is_error is True
+    runner.assert_not_awaited()
+    daemon_connection.assert_not_called()
 
 
 @pytest.mark.asyncio

@@ -22,6 +22,19 @@ from mcp_telegram.tools.reading import (
 )
 
 
+@pytest.mark.parametrize("anchor_message_id", [1, 2_147_483_647])
+def test_list_messages_accepts_telegram_signed_32_bit_anchor_boundaries(anchor_message_id: int) -> None:
+    args = ListMessages(exact_dialog_id=1, anchor_message_id=anchor_message_id)
+
+    assert args.anchor_message_id == anchor_message_id
+
+
+@pytest.mark.parametrize("anchor_message_id", [0, -1, 2_147_483_648])
+def test_list_messages_rejects_out_of_range_anchor_message_id(anchor_message_id: int) -> None:
+    with pytest.raises(ValidationError):
+        ListMessages(exact_dialog_id=1, anchor_message_id=anchor_message_id)
+
+
 @dataclass(frozen=True)
 class _RowOptions:
     message_id: int = 1
