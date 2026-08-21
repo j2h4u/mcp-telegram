@@ -13,6 +13,7 @@ from ..formatter import (
 )
 from ..models import DialogType, ReadMessage, ReadState
 from ..temporal import parse_utc_boundary
+from ..topic_identity import TOPIC_IDENTITY_SCHEMA, project_topic
 from ._base import (
     DaemonNotRunningError,
     ToolAnnotations,
@@ -134,22 +135,7 @@ GET_INBOX_OUTPUT_SCHEMA = {
                             "properties": {
                                 "msg_id": {"type": "integer"},
                                 "sender": ENTITY_IDENTITY_SCHEMA,
-                                "topic": {
-                                    "oneOf": [
-                                        {
-                                            "type": "object",
-                                            "properties": {"title": {"type": "string", "minLength": 1}},
-                                            "required": ["title"],
-                                            "additionalProperties": False,
-                                        },
-                                        {
-                                            "type": "object",
-                                            "properties": {"topic_id": {"type": "integer"}},
-                                            "required": ["topic_id"],
-                                            "additionalProperties": False,
-                                        },
-                                    ]
-                                },
+                                "topic": TOPIC_IDENTITY_SCHEMA,
                                 "out": {"type": "boolean"},
                                 # Keep Unix seconds at the internal tool boundary so
                                 # the shared temporal presentation layer can render
@@ -413,16 +399,6 @@ def _project_message_sender(message: ReadMessage) -> EntityIdentity | None:
     )
 
 
-def _project_message_topic(message: ReadMessage) -> dict[str, object] | None:
-    """Project one persisted topic into the universal Inbox contract."""
-    if isinstance(message.topic_title, str) and message.topic_title.strip():
-        return {"title": message.topic_title}
-    topic_id = message.forum_topic_id
-    if isinstance(topic_id, int) and not isinstance(topic_id, bool) and topic_id > 0:
-        return {"topic_id": topic_id}
-    return None
-
-
 _READ_MARKER_METADATA = {
     "[I read up to here]": {
         "kind": "i_read_up_to_here",
@@ -599,7 +575,7 @@ def _structured_messages(
         }
         if sender is not None:
             structured_message["sender"] = sender
-        topic = _project_message_topic(message)
+        topic = project_topic(topic_id=message.forum_topic_id, title=message.topic_title)
         if topic is not None:
             structured_message["topic"] = topic
         structured.append(structured_message)

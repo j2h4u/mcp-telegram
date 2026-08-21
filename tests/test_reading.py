@@ -461,7 +461,7 @@ def test_list_messages_structured_messages_cover_media_reply_forward_reaction_to
     messages = _list_messages_structured_messages(rows, dialog_type="Forum")
     second = messages[1]
 
-    assert second["topic"] == {"id": 7, "title": "General"}
+    assert second["topic"] == {"title": "General"}
     assert second["media"] == {
         "text": "[фото]",
         "is_telegram_content": True,
@@ -475,6 +475,29 @@ def test_list_messages_structured_messages_cover_media_reply_forward_reaction_to
     assert cast(dict[str, object], second["reactions"])["display"] == "[👍×2]"
     assert "content" not in cast(dict[str, object], second["reactions"])
     assert "read_markers" not in second
+
+
+def test_list_and_search_message_topics_share_title_id_fallback_contract() -> None:
+    titled_row = {
+        "message_id": 1,
+        "sent_at": 1_700_000_000,
+        "dialog_id": -100,
+        "text": "topic message",
+        "forum_topic_id": 7,
+        "topic_title": "  Reports  ",
+    }
+    listed = _list_messages_structured_messages([titled_row], dialog_type="Forum")[0]
+    searched = _search_result_structured_rows([titled_row], "topic")[0]
+    assert listed["topic"] == searched["topic"] == {"title": "Reports"}
+
+    fallback_row = {**titled_row, "message_id": 2, "forum_topic_id": 8, "topic_title": ""}
+    listed_fallback = _list_messages_structured_messages([fallback_row], dialog_type="Forum")[0]
+    searched_fallback = _search_result_structured_rows([fallback_row], "topic")[0]
+    assert listed_fallback["topic"] == searched_fallback["topic"] == {"topic_id": 8}
+
+    absent_row = {**titled_row, "message_id": 3, "forum_topic_id": None, "topic_title": None}
+    assert "topic" not in _list_messages_structured_messages([absent_row], dialog_type="Forum")[0]
+    assert "topic" not in _search_result_structured_rows([absent_row], "topic")[0]
 
 
 def test_structured_read_surfaces_preserve_nullable_reaction_events_and_read_at():

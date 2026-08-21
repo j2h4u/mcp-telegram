@@ -18,6 +18,7 @@ from ..models import DialogType, ReadMessage, ReadReactionEvent
 from ..pagination import NavigationToken
 from ..resolver import parse_exact_dialog_id
 from ..temporal import parse_utc_boundary
+from ..topic_identity import TOPIC_IDENTITY_SCHEMA, project_topic
 from ._base import (
     DaemonNotRunningError,
     ToolAnnotations,
@@ -330,7 +331,7 @@ LIST_MESSAGES_OUTPUT_SCHEMA = {
                     "effective_sender_id": {"type": "integer"},
                     "out": {"type": "boolean"},
                     "is_service": {"type": "boolean"},
-                    "topic": {"type": "object"},
+                    "topic": TOPIC_IDENTITY_SCHEMA,
                     "content": {"type": "object"},
                     "media": {"type": "object"},
                     "reply_context_ref": {"type": "object"},
@@ -585,19 +586,6 @@ def _structured_reaction_events(message: ReadMessage) -> list[dict[str, object]]
     return [_reaction_event_payload(event) for event in message.reaction_events]
 
 
-def _structured_topic(message: ReadMessage) -> dict[str, object] | None:
-    if message.forum_topic_id is None and not message.topic_title:
-        return None
-    return {
-        key: value
-        for key, value in {
-            "id": message.forum_topic_id,
-            "title": message.topic_title,
-        }.items()
-        if value is not None
-    }
-
-
 def _maybe_add(item: dict[str, object], key: str, value: object | None) -> None:
     if value is not None:
         item[key] = value
@@ -635,7 +623,7 @@ def _list_message_structured_item(
     if message.is_service:
         item["is_service"] = True
 
-    _maybe_add(item, "topic", _structured_topic(message))
+    _maybe_add(item, "topic", project_topic(topic_id=message.forum_topic_id, title=message.topic_title))
     projected = serialize_message_content(message.text, message.media_description, message.content_kind)
     _maybe_add(item, "content", projected["content"])
     _maybe_add(item, "media", projected["media"])
@@ -1027,22 +1015,28 @@ def _search_result_structured_rows(rows: list[dict], query: str) -> list[dict[st
     for row in rows:
         snippet = _extract_snippet(row.get("text"), query)
         dialog_id = int(row.get("dialog_id") or 0)
-        results.append(
-            {
-                "dialog_id": dialog_id,
-                "dialog_name": row.get("dialog_name"),
-                "msg_id": row["message_id"],
-                # Leave the canonical epoch untouched until structured_result applies
-                # the request's timezone to every temporal field consistently.
-                "date": _search_result_date(row),
-                "sender": resolve_sender_label(row),
-                "content": telegram_content(snippet, "snippet"),
-                **_search_result_render_fields(row, dialog_id),
-                "reaction_events": _search_result_reaction_events(row),
-                "reaction_events_status": row.get("reaction_events_status", "unavailable"),
-                "read_at": row.get("read_at"),
-            }
+        result: dict[str, object] = {
+            "dialog_id": dialog_id,
+            "dialog_name": row.get("dialog_name"),
+            "msg_id": row["message_id"],
+            # Leave the canonical epoch untouched until structured_result applies
+            # the request's timezone to every temporal field consistently.
+            "date": _search_result_date(row),
+            "sender": resolve_sender_label(row),
+            "content": telegram_content(snippet, "snippet"),
+            **_search_result_render_fields(row, dialog_id),
+            "reaction_events": _search_result_reaction_events(row),
+            "reaction_events_status": row.get("reaction_events_status", "unavailable"),
+            "read_at": row.get("read_at"),
+        }
+        topic_id = row.get("forum_topic_id")
+        title = row.get("topic_title")
+        topic = project_topic(
+            topic_id=topic_id if isinstance(topic_id, int) and not isinstance(topic_id, bool) else None,
+            title=title if isinstance(title, str) else None,
         )
+        _maybe_add(result, "topic", topic)
+        results.append(result)
     return results
 
 

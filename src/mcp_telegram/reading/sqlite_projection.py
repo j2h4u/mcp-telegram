@@ -257,7 +257,7 @@ _COUNT_BOOTSTRAP_PENDING_SQL = (
 # Phase 39.1-02: effective_sender_id collapses DM direction into a concrete user id.
 # For DM outgoing rows (sender_id IS NULL, out=1) -> self_id (from :self_id parameter).
 # For DM incoming rows (sender_id IS NULL, out=0) -> dialog_id (the peer).
-# For service messages (is_service=1) or group unknown senders -> NULL (render as System/unknown).
+# For service messages (is_service=1) or group unknown senders -> NULL.
 # Interpolated into every read-path SELECT; every caller MUST bind :self_id.
 _EFFECTIVE_SENDER_ID_EXPR = (
     "COALESCE("
@@ -299,9 +299,12 @@ _SELECT_FTS_SQL = (
     f"SELECT f.message_id, m.text, "
     f"{_SENDER_FIRST_NAME_SQL}, "
     f"m.sent_at, m.media_description, NULL AS content_kind, m.reply_to_msg_id, m.sender_id, m.forum_topic_id, "
+    f"COALESCE(tm.title, CASE WHEN m.forum_topic_id = 1 THEN 'General' END) AS topic_title, "
     f"{EFFECTIVE_SENDER_ID_SQL}, m.is_service, m.out, m.dialog_id "
     f"FROM messages_fts f "
     f"JOIN messages m ON m.dialog_id = f.dialog_id AND m.message_id = f.message_id "
+    f"LEFT JOIN topic_metadata tm "
+    f"  ON tm.dialog_id = m.dialog_id AND tm.topic_id = m.forum_topic_id "
     f"{_SENDER_ENTITY_JOINS_SQL}"
     f"WHERE messages_fts MATCH :query AND f.dialog_id = :dialog_id "
     f"AND (:since_utc IS NULL OR m.sent_at >= :since_utc) "
@@ -315,10 +318,13 @@ _SELECT_FTS_ALL_SQL = (
     f"SELECT f.message_id, m.text, "
     f"{_SENDER_FIRST_NAME_SQL}, "
     f"m.sent_at, m.media_description, NULL AS content_kind, m.reply_to_msg_id, m.sender_id, m.forum_topic_id, "
+    f"COALESCE(tm.title, CASE WHEN m.forum_topic_id = 1 THEN 'General' END) AS topic_title, "
     f"f.dialog_id, COALESCE(de.name, CAST(f.dialog_id AS TEXT)) AS dialog_name, "
     f"{EFFECTIVE_SENDER_ID_SQL}, m.is_service, m.out "
     f"FROM messages_fts f "
     f"JOIN messages m ON m.dialog_id = f.dialog_id AND m.message_id = f.message_id "
+    f"LEFT JOIN topic_metadata tm "
+    f"  ON tm.dialog_id = m.dialog_id AND tm.topic_id = m.forum_topic_id "
     f"LEFT JOIN entities de ON de.id = f.dialog_id "
     f"{_SENDER_ENTITY_JOINS_SQL}"
     f"WHERE messages_fts MATCH :query "

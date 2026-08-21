@@ -22,7 +22,8 @@ from telethon.errors import FloodWaitError  # type: ignore[import-untyped]
 from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike
 from mcp_telegram.reading.query_records import read_message_from_row
 from mcp_telegram.reading.sqlite_projection import _FETCH_UNREAD_MESSAGES_SQL
-from mcp_telegram.tools.unread import _project_message_sender, _project_message_topic
+from mcp_telegram.tools.unread import _project_message_sender
+from mcp_telegram.topic_identity import project_topic
 from tests.daemon_api_policy import make_daemon_api_policy
 from tests.history_enrollment_helpers import seed_full_history_enrollment
 from tests.reaction_helpers import make_reaction_freshener
@@ -760,7 +761,7 @@ def test_fetch_unread_group_carries_persisted_topic_title_or_id(
     assert row is not None
     message = read_message_from_row(row)
     assert message.topic_title == "Reports"
-    assert _project_message_topic(message) == {"title": "Reports"}
+    assert project_topic(topic_id=message.forum_topic_id, title=message.topic_title) == {"title": "Reports"}
 
     conn.execute("UPDATE messages SET forum_topic_id = 8 WHERE dialog_id = ? AND message_id = ?", (dialog_id, 11))
     conn.commit()
@@ -779,7 +780,9 @@ def test_fetch_unread_group_carries_persisted_topic_title_or_id(
     )
     fallback_message = read_message_from_row(row_without_title)
     assert fallback_message.topic_title is None
-    assert _project_message_topic(fallback_message) == {"topic_id": 8}
+    assert project_topic(topic_id=fallback_message.forum_topic_id, title=fallback_message.topic_title) == {
+        "topic_id": 8
+    }
 
 
 @pytest.mark.asyncio

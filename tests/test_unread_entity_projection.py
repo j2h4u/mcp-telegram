@@ -14,13 +14,13 @@ from mcp_telegram.tools.unread import (
     GetInbox,
     GetUnreadSummary,
     _project_message_sender,
-    _project_message_topic,
     _project_unread_summary_dialog,
     _project_unread_summary_dialogs,
     _structured_messages,
     get_inbox,
     get_unread_summary,
 )
+from mcp_telegram.topic_identity import project_topic
 
 
 def _connection(*, inbox: dict[str, object] | None = None, summary: dict[str, object] | None = None) -> MagicMock:
@@ -174,7 +174,7 @@ def test_inbox_output_schema_keeps_sender_and_topic_optional() -> None:
 def test_inbox_topic_projection_is_universal_and_never_leaks_both_fields(
     message: ReadMessage, expected: dict[str, object] | None
 ) -> None:
-    assert _project_message_topic(message) == expected
+    assert project_topic(topic_id=message.forum_topic_id, title=message.topic_title) == expected
 
 
 def test_structured_inbox_messages_remove_legacy_sender_identity_fields() -> None:
