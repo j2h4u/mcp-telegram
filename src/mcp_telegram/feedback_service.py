@@ -126,7 +126,7 @@ class _UpdateFeedbackStatusRequest:
 class FeedbackApplicationService:
     """Validate and execute feedback operations through an injected store."""
 
-    def __init__(self, store: FeedbackStore | None) -> None:
+    def __init__(self, store: FeedbackStore) -> None:
         self._store = store
 
     def submit_feedback(self, req: Mapping[str, object]) -> dict[str, object]:
@@ -134,9 +134,6 @@ class FeedbackApplicationService:
             request = _SubmitFeedbackRequest.parse(req)
         except ValueError as exc:
             return {"ok": False, "error": "invalid_input", "message": str(exc)}
-
-        if self._store is None:
-            return {"ok": False, "error": "internal", "message": "feedback database not initialised"}
 
         try:
             feedback_id = self._store.insert_feedback(
@@ -160,9 +157,6 @@ class FeedbackApplicationService:
 
         # T-49-11: no length cap on status_comment by design (single-operator
         # low-volume queue; SQLite handles multi-MB TEXT comfortably).
-        if self._store is None:
-            return {"ok": False, "error": "internal", "message": "feedback database not initialised"}
-
         try:
             updated = self._store.update_feedback_status(
                 feedback_id=request.feedback_id,

@@ -8,7 +8,7 @@ Public API:
   ensure_feedback_schema(path)  -> sqlite3.Connection  (caller owns lifecycle)
   VALID_SEVERITIES              frozenset[str]
   VALID_STATUSES                frozenset[str]
-  SQLiteFeedbackStore           SQLite persistence adapter for the application port
+  SQLiteFeedbackStore(conn)     SQLite adapter implementing the FeedbackStore port
   _FEEDBACK_SCHEMA_VERSION      int
 
 The daemon is the sole writer. The CLI reads rows with

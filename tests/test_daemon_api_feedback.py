@@ -300,6 +300,29 @@ async def test_submit_feedback_db_error_returns_internal(tmp_path: Path) -> None
         sync_conn.close()
 
 
+@pytest.mark.asyncio
+async def test_feedback_without_wired_service_returns_not_initialised() -> None:
+    """The daemon API owns the uninitialised-service response boundary."""
+    sync_conn = sqlite3.connect(":memory:")
+    client = MagicMock()
+    server = DaemonAPIServer(
+        sync_conn,
+        client,
+        asyncio.Event(),
+        reaction_freshener=make_reaction_freshener(sync_conn, client),
+        policy=make_daemon_api_policy(),
+    )
+    try:
+        submit_response = await server._submit_feedback({"message": "not wired"})
+        status_response = await server._update_feedback_status({"id": 1, "status": "done"})
+    finally:
+        sync_conn.close()
+
+    expected = {"ok": False, "error": "internal", "message": "feedback database not initialised"}
+    assert submit_response == expected
+    assert status_response == expected
+
+
 # ---------------------------------------------------------------------------
 # _update_feedback_status — happy path, validation, comment lifecycle, dispatch
 # ---------------------------------------------------------------------------
