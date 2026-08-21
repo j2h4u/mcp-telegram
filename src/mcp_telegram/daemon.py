@@ -58,7 +58,8 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
 
 from .activity_cold_backfill import ColdBackfillPacing, run_cold_backfill_loop
 from .activity_hot_sweep import run_hot_sweep_loop
-from .activity_sync import _ActivityClient, run_activity_sync_loop
+from .activity_substrate import ActivityClient
+from .activity_sync import run_activity_sync_loop
 from .config import McpTelegramConfig, SchedulingConfig, load_config, resolve_scheduling_config
 from .daemon_api import DaemonApiPolicy, DaemonAPIServer, DaemonClientLike
 from .delta_sync import (
@@ -1047,7 +1048,7 @@ async def _start_followup_background_tasks(
     ctx: _SyncMainContext,
     delta_worker: DeltaSyncWorker,
 ) -> None:
-    activity_client = cast(_ActivityClient, ctx.client)
+    activity_client = cast(ActivityClient, ctx.client)
     delta_client = cast(_DeltaSyncClient, ctx.client)
     _create_tracked_task(
         ctx,
@@ -1092,7 +1093,14 @@ async def _start_followup_background_tasks(
         name="access_probe_loop",
     )
     _create_tracked_task(
-        ctx, run_activity_sync_loop(activity_client, ctx.conn, ctx.shutdown_event), name="activity_sync_loop"
+        ctx,
+        run_activity_sync_loop(
+            activity_client,
+            ctx.conn,
+            ctx.shutdown_event,
+            timeout_s=ctx.scheduling.activity_rpc_timeout_seconds,
+        ),
+        name="activity_sync_loop",
     )
     _create_tracked_task(
         ctx,
@@ -1101,6 +1109,7 @@ async def _start_followup_background_tasks(
             ctx.conn,
             ctx.shutdown_event,
             interval=ctx.scheduling.activity_hot_sweep_seconds,
+            timeout_s=ctx.scheduling.activity_rpc_timeout_seconds,
         ),
         name="activity_hot_sweep",
     )
@@ -1111,6 +1120,7 @@ async def _start_followup_background_tasks(
             ctx.conn,
             ctx.shutdown_event,
             pacing=ColdBackfillPacing.from_scheduling(ctx.scheduling),
+            timeout_s=ctx.scheduling.activity_rpc_timeout_seconds,
         ),
         name="activity_cold_backfill",
     )
@@ -1123,6 +1133,7 @@ async def _start_followup_background_tasks(
             policy=ScheduledReconciliationPolicy(
                 interval_seconds=ctx.scheduling.scheduled_reconciliation_seconds,
                 flood_sleep_threshold_seconds=ctx.scheduling.scheduled_flood_sleep_threshold_seconds,
+                activity_rpc_timeout_seconds=ctx.scheduling.activity_rpc_timeout_seconds,
             ),
             own_only_context=ctx.own_only_context,
         ),

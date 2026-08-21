@@ -54,7 +54,7 @@ cannot_depend_on = [
 path = "mcp_telegram.daemon"
 layer = "composition"
 depends_on = [
-    "mcp_telegram.activity_cold_backfill", "mcp_telegram.activity_hot_sweep", "mcp_telegram.activity_sync",
+    "mcp_telegram.activity_cold_backfill", "mcp_telegram.activity_hot_sweep", "mcp_telegram.activity_substrate", "mcp_telegram.activity_sync",
     "mcp_telegram.config", "mcp_telegram.daemon_api", "mcp_telegram.delta_sync", "mcp_telegram.dialog_sync",
     "mcp_telegram.event_handlers", "mcp_telegram.feedback_db", "mcp_telegram.feedback_service", "mcp_telegram.flood",
     "mcp_telegram.folders.refresh", "mcp_telegram.folders.sqlite_repository", "mcp_telegram.folders.telegram_adapter", "mcp_telegram.folders.worker",
@@ -175,7 +175,7 @@ depends_on = []
 [[modules]]
 path = "mcp_telegram.scheduled_messages"
 layer = "application"
-depends_on = ["mcp_telegram.access_lifecycle", "mcp_telegram.activity_peer_resolve", { path = "mcp_telegram.activity_sync", deprecated = true }, "mcp_telegram.daemon_log_context", "mcp_telegram.fts", "mcp_telegram.message_contracts", "mcp_telegram.messages.telegram_adapter", "mcp_telegram.own_only", "mcp_telegram.telegram_access", "mcp_telegram.telegram_gateway"]
+depends_on = ["mcp_telegram.access_lifecycle", "mcp_telegram.activity_peer_resolve", "mcp_telegram.activity_substrate", "mcp_telegram.daemon_log_context", "mcp_telegram.fts", "mcp_telegram.message_contracts", "mcp_telegram.messages.telegram_adapter", "mcp_telegram.own_only", "mcp_telegram.telegram_access", "mcp_telegram.telegram_gateway"]
 
 [[modules]]
 path = "mcp_telegram.message_fact_refresh"
@@ -188,29 +188,34 @@ layer = "application"
 depends_on = ["mcp_telegram.models", "mcp_telegram.sync_db"]
 
 [[modules]]
+path = "mcp_telegram.activity_substrate"
+layer = "application"
+depends_on = []
+
+[[modules]]
 path = "mcp_telegram.activity_sync"
 layer = "application"
-depends_on = ["mcp_telegram.flood", "mcp_telegram.message_contracts", "mcp_telegram.messages.sqlite_repository", "mcp_telegram.messages.telegram_adapter", "mcp_telegram.models", "mcp_telegram.telethon_dialog"]
+depends_on = ["mcp_telegram.activity_substrate", "mcp_telegram.flood", "mcp_telegram.message_contracts", "mcp_telegram.messages.sqlite_repository", "mcp_telegram.messages.telegram_adapter", "mcp_telegram.models", "mcp_telegram.own_only", "mcp_telegram.telethon_dialog"]
 
 [[modules]]
 path = "mcp_telegram.activity_peer_resolve"
 layer = "application"
-depends_on = [{ path = "mcp_telegram.activity_sync", deprecated = true }]
+depends_on = ["mcp_telegram.activity_substrate"]
 
 [[modules]]
 path = "mcp_telegram.activity_peer_sweep"
 layer = "application"
-depends_on = ["mcp_telegram.access_lifecycle", "mcp_telegram.activity_peer_resolve", { path = "mcp_telegram.activity_sync", deprecated = true }, "mcp_telegram.message_contracts", "mcp_telegram.messages.sqlite_repository", "mcp_telegram.messages.telegram_adapter", "mcp_telegram.telegram_access"]
+depends_on = ["mcp_telegram.access_lifecycle", "mcp_telegram.activity_peer_resolve", "mcp_telegram.activity_substrate", "mcp_telegram.message_contracts", "mcp_telegram.messages.sqlite_repository", "mcp_telegram.messages.telegram_adapter", "mcp_telegram.own_only", "mcp_telegram.telegram_access"]
 
 [[modules]]
 path = "mcp_telegram.activity_hot_sweep"
 layer = "application"
-depends_on = ["mcp_telegram.activity_peer_sweep", { path = "mcp_telegram.activity_sync", deprecated = true }]
+depends_on = ["mcp_telegram.activity_peer_sweep", "mcp_telegram.activity_substrate"]
 
 [[modules]]
 path = "mcp_telegram.activity_cold_backfill"
 layer = "application"
-depends_on = ["mcp_telegram.activity_peer_sweep", { path = "mcp_telegram.activity_sync", deprecated = true }]
+depends_on = ["mcp_telegram.activity_peer_sweep", "mcp_telegram.activity_substrate"]
 
 [[modules]]
 path = "mcp_telegram.dialog_sync"

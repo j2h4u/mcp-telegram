@@ -22,7 +22,7 @@ from .activity_peer_sweep import (
     build_working_set,
     sweep_peer_once,
 )
-from .activity_sync import _ActivityClient
+from .activity_substrate import ActivityClient
 
 logger = logging.getLogger(__name__)
 
@@ -43,12 +43,13 @@ class _HotSweepPeerOutcome:
 class _HotSweepPeerContext:
     """Context for processing a single peer in HotSweep."""
 
-    client: _ActivityClient
+    client: ActivityClient
     conn: sqlite3.Connection
     dialog_id: int
     old_hot_cursor: int | None
     now: int
     shutdown_event: asyncio.Event
+    timeout_s: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,6 +223,7 @@ async def _run_hot_sweep_peer(ctx: _HotSweepPeerContext) -> _HotSweepPeerOutcome
             offset_id=page_offset,
             min_id=pass_min_id,
             limit=_BACKFILL_BATCH_LIMIT,
+            timeout_s=ctx.timeout_s,
         )
         pages_fetched += 1
         outcome, next_offset, max_seen, total_written = _handle_hot_sweep_page_result(
@@ -249,9 +251,11 @@ async def _run_hot_sweep_peer(ctx: _HotSweepPeerContext) -> _HotSweepPeerOutcome
 
 
 async def run_hot_sweep_pass(
-    client: _ActivityClient,
+    client: ActivityClient,
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,
+    *,
+    timeout_s: float,
 ) -> int:
     """Run one Tier-A HotSweep pass.
 
@@ -267,7 +271,7 @@ async def run_hot_sweep_pass(
     now = int(time.time())
 
     # Step 1: cheap working-set refresh — also refreshes last_activity_at
-    await build_working_set(client, conn)
+    await build_working_set(client, conn, timeout_s=timeout_s)
 
     # Step 2: select hot, due peers — recency-bounded to 30 days
     cutoff = now - 30 * 86400
@@ -306,6 +310,7 @@ async def run_hot_sweep_pass(
                 old_hot_cursor=old_hot_cursor,
                 now=now,
                 shutdown_event=shutdown_event,
+                timeout_s=timeout_s,
             )
         )
         peers_processed += 1
@@ -329,11 +334,12 @@ async def run_hot_sweep_pass(
 
 
 async def run_hot_sweep_loop(
-    client: _ActivityClient,
+    client: ActivityClient,
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,
     *,
     interval: float,
+    timeout_s: float,
 ) -> None:
     """Background task: run Tier-A HotSweep hourly, interruptible via shutdown_event.
 
@@ -342,7 +348,7 @@ async def run_hot_sweep_loop(
     while not shutdown_event.is_set():
         logger.info("activity_hot_sweep_loop_start")
         try:
-            written = await run_hot_sweep_pass(client, conn, shutdown_event)
+            written = await run_hot_sweep_pass(client, conn, shutdown_event, timeout_s=timeout_s)
             logger.info("activity_hot_sweep_loop_done total_written=%d", written)
         except Exception:
             logger.warning("activity_hot_sweep_error", exc_info=True)

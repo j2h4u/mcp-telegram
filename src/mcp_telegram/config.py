@@ -121,6 +121,7 @@ class SchedulingConfig:
     message_fact_refresh_read_at_max_messages_per_cycle: int = 5
     message_fact_refresh_pause_seconds: float = 1.0
     activity_hot_sweep_seconds: float = 3_600.0
+    activity_rpc_timeout_seconds: float = 120.0
     activity_cold_backfill_seconds: float = 300.0
     activity_cold_backfill_batch_pause_seconds: float = 5.0
     activity_cold_enroll_seconds: float = 1_800.0
@@ -365,6 +366,9 @@ def resolve_scheduling_config(
         activity_hot_sweep_seconds=_env_positive_float(
             env, "ACTIVITY_HOT_SWEEP_SECONDS", config.activity_hot_sweep_seconds
         ),
+        activity_rpc_timeout_seconds=_env_positive_float(
+            env, "ACTIVITY_RPC_TIMEOUT_SECONDS", config.activity_rpc_timeout_seconds
+        ),
         activity_cold_backfill_seconds=_env_positive_float(
             env, "ACTIVITY_COLD_BACKFILL_SECONDS", config.activity_cold_backfill_seconds
         ),
@@ -603,6 +607,7 @@ def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
         "message_fact_refresh_read_at_max_messages_per_cycle",
         "message_fact_refresh_pause_seconds",
         "activity_hot_sweep_seconds",
+        "activity_rpc_timeout_seconds",
         "activity_cold_backfill_seconds",
         "activity_cold_backfill_batch_pause_seconds",
         "activity_cold_enroll_seconds",
@@ -773,6 +778,13 @@ def _parse_scheduling(data: dict[str, object], path: Path) -> SchedulingConfig:
             "scheduling",
             path,
             defaults.activity_hot_sweep_seconds,
+        ),
+        activity_rpc_timeout_seconds=_positive_float(
+            scheduling_data,
+            "activity_rpc_timeout_seconds",
+            "scheduling",
+            path,
+            defaults.activity_rpc_timeout_seconds,
         ),
         activity_cold_backfill_seconds=_positive_float(
             scheduling_data,

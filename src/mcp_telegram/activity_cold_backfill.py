@@ -36,7 +36,7 @@ from .activity_peer_sweep import (
     build_working_set,
     sweep_peer_once,
 )
-from .activity_sync import _ActivityClient
+from .activity_substrate import ActivityClient
 
 logger = logging.getLogger(__name__)
 
@@ -130,14 +130,15 @@ class _ColdPeerFinishContext:
 
 
 async def _run_cold_backfill_pass_safe(
-    client: _ActivityClient,
+    client: ActivityClient,
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,
     *,
     pacing: ColdBackfillPacing,
+    timeout_s: float,
 ) -> ColdPassResult:
     try:
-        return await run_cold_backfill_pass(client, conn, shutdown_event, pacing=pacing)
+        return await run_cold_backfill_pass(client, conn, shutdown_event, pacing=pacing, timeout_s=timeout_s)
     except Exception:
         logger.warning("activity_cold_backfill_error", exc_info=True)
         # Treat as NO_DUE_PEER for sleep purposes to avoid tight error loops.
@@ -161,17 +162,18 @@ def _cold_backfill_sleep_seconds(
 
 
 async def _maybe_enroll_activity_peers(
-    client: _ActivityClient,
+    client: ActivityClient,
     conn: sqlite3.Connection,
     last_enroll_at: float,
     pacing: ColdBackfillPacing,
+    timeout_s: float,
 ) -> float:
     now_mono = asyncio.get_running_loop().time()
     if now_mono - last_enroll_at < pacing.history.enroll_s:
         return last_enroll_at
 
     try:
-        enrolled = await build_working_set(client, conn)
+        enrolled = await build_working_set(client, conn, timeout_s=timeout_s)
         logger.debug("activity_cold_backfill_enroll enrolled=%d", enrolled)
     except Exception:
         logger.warning("activity_cold_backfill_enroll_error", exc_info=True)
@@ -256,11 +258,12 @@ def _finish_cold_backfill_peer(ctx: _ColdPeerFinishContext, pacing: ColdBackfill
 
 
 async def run_cold_backfill_pass(
-    client: _ActivityClient,
+    client: ActivityClient,
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,
     *,
     pacing: ColdBackfillPacing,
+    timeout_s: float,
 ) -> ColdPassResult:
     """Run one Tier-B ColdBackfill pass.
 
@@ -325,6 +328,7 @@ async def run_cold_backfill_pass(
         offset_id=offset_id,
         min_id=0,  # no time/id ceiling — full history walk
         limit=_BACKFILL_BATCH_LIMIT,
+        timeout_s=timeout_s,
     )
 
     return _finish_cold_backfill_peer(
@@ -345,13 +349,14 @@ async def run_cold_backfill_pass(
 # ---------------------------------------------------------------------------
 
 
-async def run_cold_backfill_loop(
-    client: _ActivityClient,
+async def run_cold_backfill_loop(  # noqa: PLR0913 - explicit worker state and injected transport policy
+    client: ActivityClient,
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,
     *,
     idle_interval: float | None = None,
     pacing: ColdBackfillPacing,
+    timeout_s: float,
 ) -> None:
     """Background task: run Tier-B ColdBackfill, low-priority, self-enrolling.
 
@@ -372,9 +377,11 @@ async def run_cold_backfill_loop(
     while not shutdown_event.is_set():
         # Throttled enrollment — call build_working_set no more than once per
         # pacing.history.enroll_s so peer set stays current without over-calling.
-        last_enroll_at = await _maybe_enroll_activity_peers(client, conn, last_enroll_at, pacing)
+        last_enroll_at = await _maybe_enroll_activity_peers(client, conn, last_enroll_at, pacing, timeout_s)
 
-        pass_result = await _run_cold_backfill_pass_safe(client, conn, shutdown_event, pacing=pacing)
+        pass_result = await _run_cold_backfill_pass_safe(
+            client, conn, shutdown_event, pacing=pacing, timeout_s=timeout_s
+        )
 
         sleep_s = _cold_backfill_sleep_seconds(pass_result, resolved_idle_interval, pacing)
 

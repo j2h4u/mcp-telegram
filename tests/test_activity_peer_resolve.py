@@ -334,6 +334,23 @@ async def test_resolve_linked_chat_id_cache_miss_calls_once_and_merges() -> None
 
 
 @pytest.mark.asyncio
+async def test_resolve_linked_chat_id_forwards_timeout_to_live_rpc(monkeypatch: pytest.MonkeyPatch) -> None:
+    channel_id = -100200000009
+    captured: dict[str, float] = {}
+
+    async def fake_call_with_timeout(client: object, request: object, *, timeout_s: float) -> object:
+        captured["timeout_s"] = timeout_s
+        return await client(request)  # type: ignore[operator]
+
+    monkeypatch.setattr("mcp_telegram.activity_peer_resolve.call_with_timeout", fake_call_with_timeout)
+    with _make_db() as conn:
+        client = _FakeClient(input_entity=object(), full_channel_result=_fake_full_channel_result(linked_chat_id=None))
+        await resolve_linked_chat_id(client, conn, channel_id, timeout_s=37.0)
+
+    assert captured == {"timeout_s": 37.0}
+
+
+@pytest.mark.asyncio
 async def test_resolve_linked_chat_id_preserves_existing_keys():
     """Blob merge must not clobber keys NOT returned by GetFullChannel."""
     channel_id = -100200000003

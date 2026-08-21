@@ -9,7 +9,7 @@ import asyncio
 import logging
 import sqlite3
 import time
-from collections.abc import Coroutine, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol, cast
@@ -18,11 +18,13 @@ from telethon.errors import FloodWaitError
 from telethon.tl.functions.messages import SearchRequest
 from telethon.tl.types import InputMessagesFilterEmpty, InputPeerEmpty, InputPeerSelf
 
+from .activity_substrate import ActivityClient, call_with_timeout
 from .flood import flood_seconds, sleep_through_flood
 from .message_contracts import ExtractedMessage
 from .messages.sqlite_repository import insert_messages_with_fts
-from .messages.telegram_adapter import extract_message_row
+from .messages.telegram_adapter import extract_dialog_id, extract_message_row
 from .models import DialogType
+from .own_only import enroll_own_only_sync_dialog
 from .telethon_dialog import classify_dialog_type
 
 logger = logging.getLogger(__name__)
@@ -46,22 +48,11 @@ class ActivitySyncPacing:
 _PACING = ActivitySyncPacing()
 
 
-# Upper bound on a single SearchRequest await. Prevents a wedged MTProto
-# socket after startup FloodWait from hanging the incremental loop
-# indefinitely (D-02 expert panel).
-_SEARCH_RPC_TIMEOUT_S: float = 120.0
-
 # Mirrors sync_worker.UPSERT_ENTITY_SQL (verified line 239).
 # NOTE: `type` and `updated_at` are NOT NULL with no DEFAULT — both MUST be supplied.
 UPSERT_ENTITY_SQL = (
     "INSERT OR REPLACE INTO entities (id, type, name, username, name_normalized, updated_at) VALUES (?, ?, ?, ?, ?, ?)"
 )
-
-# Activity-sync dialog enrollment: 'own_only' is the lowest non-empty
-# coverage status (D-2). INSERT OR IGNORE preserves higher-status rows
-# already enrolled by FullSyncWorker (syncing/synced) or probe loops
-# (fragment/access_lost). Status only escalates.
-INSERT_OWN_ONLY_DIALOG_SQL = "INSERT OR IGNORE INTO synced_dialogs (dialog_id, status) VALUES (?, 'own_only')"
 
 
 @dataclass
@@ -102,16 +93,6 @@ _SEARCH_BATCH_RETRY = object()
 _SEARCH_BATCH_STOP = object()
 
 
-class _ActivityClient(Protocol):
-    def __call__(self, request: object) -> Coroutine[object, object, object]: ...
-
-    def get_input_entity(self, dialog_id: int) -> Coroutine[object, object, object]: ...
-
-
-class _HasPeerIdLike(Protocol):
-    peer_id: object | None
-
-
 class _SearchEntityLike(Protocol):
     id: int
     first_name: str | None
@@ -120,7 +101,7 @@ class _SearchEntityLike(Protocol):
     username: str | None
 
 
-class _SearchMessageLike(_HasPeerIdLike, Protocol):
+class _SearchMessageLike(Protocol):
     id: int
     date: datetime | None
 
@@ -152,29 +133,6 @@ def _set_state(conn: sqlite3.Connection, key: str, value: str | None) -> None:
 def _stamp_last_sync_at(conn: sqlite3.Connection) -> None:
     """Record the sync completion timestamp in activity_sync_state."""
     _set_state(conn, "last_sync_at", str(int(time.time())))
-
-
-def extract_dialog_id(msg: _HasPeerIdLike) -> int | None:
-    """Resolve dialog_id from a Telethon message's peer_id field.
-
-    Public name so activity_peer_sweep can import it without relying on the
-    module-private underscore convention.
-    """
-    peer = msg.peer_id
-    if peer is None:
-        return None
-    # telethon.utils.get_peer_id handles User/Chat/Channel variants
-    from telethon.utils import get_peer_id
-
-    try:
-        return int(cast(int | str, get_peer_id(peer)))
-    except Exception:
-        logger.warning("activity_sync_peer_id_unresolvable", exc_info=True)
-        return None
-
-
-# Backward-compat alias for callers that used the private name.
-_extract_dialog_id = extract_dialog_id
 
 
 def _normalize(text: str | None) -> str | None:
@@ -261,7 +219,7 @@ def _extract_own_message_rows(batch: Sequence[_SearchMessageLike]) -> list[Extra
     """Extract canonical own-message rows from a Telegram batch."""
     extracted: list[ExtractedMessage] = []
     for m in batch:
-        dialog_id = _extract_dialog_id(m)
+        dialog_id = extract_dialog_id(m)
         if dialog_id is None:
             continue
         extracted.append(extract_message_row(dialog_id, m))
@@ -275,22 +233,21 @@ def _persist_own_message_rows(conn: sqlite3.Connection, extracted: list[Extracte
     with conn:
         insert_messages_with_fts(conn, extracted)
         dialog_ids = {em.message.dialog_id for em in extracted}
-        conn.executemany(
-            INSERT_OWN_ONLY_DIALOG_SQL,
-            [(did,) for did in dialog_ids],
-        )
+        for dialog_id in dialog_ids:
+            enroll_own_only_sync_dialog(conn, dialog_id)
 
 
 async def _search_backfill_batch(
-    client: _ActivityClient,
+    client: ActivityClient,
     checkpoint: int,
     shutdown_event: asyncio.Event,
     *,
     total_fetched: int,
+    timeout_s: float,
 ) -> object:
     """Run the backfill SearchRequest and translate control-flow exceptions."""
     try:
-        return await _call_with_timeout(
+        return await call_with_timeout(
             client,
             SearchRequest(
                 peer=InputPeerEmpty(),
@@ -306,6 +263,7 @@ async def _search_backfill_batch(
                 hash=0,
                 from_id=InputPeerSelf(),
             ),
+            timeout_s=timeout_s,
         )
     except FloodWaitError as exc:
         logger.warning(
@@ -325,17 +283,18 @@ async def _search_backfill_batch(
         return _SEARCH_BATCH_STOP
 
 
-async def _search_incremental_batch(
-    client: _ActivityClient,
+async def _search_incremental_batch(  # noqa: PLR0913 - explicit worker state and injected transport policy
+    client: ActivityClient,
     min_date: int,
     offset_id: int,
     shutdown_event: asyncio.Event,
     *,
     inserted: int,
+    timeout_s: float,
 ) -> object:
     """Run the incremental SearchRequest and translate control-flow exceptions."""
     try:
-        return await _call_with_timeout(
+        return await call_with_timeout(
             client,
             SearchRequest(
                 peer=InputPeerEmpty(),
@@ -351,6 +310,7 @@ async def _search_incremental_batch(
                 hash=0,
                 from_id=InputPeerSelf(),
             ),
+            timeout_s=timeout_s,
         )
     except FloodWaitError as exc:
         logger.warning("activity_sync_incremental_floodwait seconds=%d", exc.seconds)
@@ -436,40 +396,12 @@ def _log_incremental_batch(
     )
 
 
-async def call_with_timeout(client: _ActivityClient, request: object) -> object:
-    """Invoke a Telethon RPC with a hard timeout and abandon on overrun.
-
-    asyncio.wait_for awaits the wrapped task to actually finish after
-    cancellation. Telethon's MTProto futures sometimes never resolve
-    (post-startup flood wait corridor), causing wait_for to hang
-    indefinitely past the requested deadline.
-
-    asyncio.wait + explicit cancel returns immediately on timeout;
-    the abandoned task is left to complete (or be GC'd) in the background
-    rather than blocking our control flow.
-
-    Raises TimeoutError on overrun. Re-raises FloodWaitError and other
-    exceptions surfaced by the RPC call.
-
-    Public name so activity_peer_sweep can import it without relying on the
-    module-private underscore convention.
-    """
-    task = asyncio.create_task(client(request))
-    done, _pending = await asyncio.wait({task}, timeout=_SEARCH_RPC_TIMEOUT_S)
-    if not done:
-        task.cancel()
-        raise TimeoutError(f"RPC exceeded {_SEARCH_RPC_TIMEOUT_S}s deadline")
-    return task.result()
-
-
-# Backward-compat alias for callers that used the private name.
-_call_with_timeout = call_with_timeout
-
-
 async def _run_backfill(
-    client: _ActivityClient,
+    client: ActivityClient,
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,
+    *,
+    timeout_s: float,
 ) -> None:
     state = _load_state(conn)
     if state.get("backfill_complete") == "1":
@@ -498,6 +430,7 @@ async def _run_backfill(
             progress.checkpoint,
             shutdown_event,
             total_fetched=progress.total_fetched,
+            timeout_s=timeout_s,
         )
         if result is _SEARCH_BATCH_STOP:
             return
@@ -538,9 +471,11 @@ async def _run_backfill(
 
 
 async def _run_incremental(
-    client: _ActivityClient,
+    client: ActivityClient,
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,
+    *,
+    timeout_s: float,
 ) -> None:
     state = _load_state(conn)
     if state.get("backfill_complete") != "1":
@@ -572,6 +507,7 @@ async def _run_incremental(
             progress.offset_id,
             shutdown_event,
             inserted=progress.inserted,
+            timeout_s=timeout_s,
         )
         if result is _SEARCH_BATCH_STOP:
             _stamp_last_sync_at(conn)
@@ -633,11 +569,12 @@ async def _run_incremental(
 
 
 async def run_activity_sync_loop(
-    client: _ActivityClient,
+    client: ActivityClient,
     conn: sqlite3.Connection,
     shutdown_event: asyncio.Event,
     *,
     interval: float = _DEFAULT_INTERVAL_S,
+    timeout_s: float,
 ) -> None:
     """Background task: keep own-message rows (out=1) in messages up-to-date.
 
@@ -647,8 +584,8 @@ async def run_activity_sync_loop(
     while not shutdown_event.is_set():
         logger.info("activity_sync_loop_start")
         try:
-            await _run_backfill(client, conn, shutdown_event)
-            await _run_incremental(client, conn, shutdown_event)
+            await _run_backfill(client, conn, shutdown_event, timeout_s=timeout_s)
+            await _run_incremental(client, conn, shutdown_event, timeout_s=timeout_s)
         except Exception:
             logger.warning("activity_sync_error", exc_info=True)
         logger.info("activity_sync_loop_sleeping interval=%.0fs", interval)
