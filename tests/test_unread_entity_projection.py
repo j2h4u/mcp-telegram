@@ -6,7 +6,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from mcp_telegram.tools.unread import GetInbox, GetUnreadSummary, get_inbox, get_unread_summary
+from mcp_telegram.tools.unread import (
+    GetInbox,
+    GetUnreadSummary,
+    _project_unread_summary_dialog,
+    _project_unread_summary_dialogs,
+    get_inbox,
+    get_unread_summary,
+)
 
 
 def _connection(*, inbox: dict[str, object] | None = None, summary: dict[str, object] | None = None) -> MagicMock:
@@ -14,6 +21,40 @@ def _connection(*, inbox: dict[str, object] | None = None, summary: dict[str, ob
     connection.get_inbox = AsyncMock(return_value=inbox or {"ok": True, "data": {"groups": []}})
     connection.get_unread_summary = AsyncMock(return_value=summary or {"ok": True, "data": {"dialogs": []}})
     return connection
+
+
+def test_unread_summary_projection_helper_keeps_identity_contract_and_skips_bad_rows() -> None:
+    row = _project_unread_summary_dialog(
+        {
+            "dialog_id": 42,
+            "name": "Alice",
+            "username": "alice",
+            "dialog_type": "User",
+            "unread_count": 1,
+            "unread_mark": False,
+            "unread_mentions_count": 0,
+            "unread_reactions_count": 0,
+            "archived": False,
+            "last_message_at": None,
+        }
+    )
+
+    assert row is not None
+    assert row["entity"] == {"display_name": "Alice", "username": "@alice"}
+    assert "dialog_id" not in row
+    assert _project_unread_summary_dialog({"dialog_id": "42"}) is None
+    assert _project_unread_summary_dialogs([{"dialog_id": 42, "name": "Alice"}, "bad"]) == [
+        {
+            "entity": {"display_name": "Alice", "telegram_id": 42},
+            "dialog_type": None,
+            "unread_count": None,
+            "unread_mark": None,
+            "unread_mentions_count": 0,
+            "unread_reactions_count": 0,
+            "archived": False,
+            "last_message_at": None,
+        }
+    ]
 
 
 @pytest.mark.asyncio

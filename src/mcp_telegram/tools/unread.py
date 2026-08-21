@@ -571,6 +571,40 @@ def _structured_messages(
     return structured
 
 
+def _project_unread_summary_dialog(raw_row: Mapping[str, object]) -> dict[str, object] | None:
+    dialog_id = raw_row.get("dialog_id")
+    if isinstance(dialog_id, bool) or not isinstance(dialog_id, int):
+        return None
+    entity = project_entity_identity(
+        display_name=raw_row.get("name"),
+        username=raw_row.get("username"),
+        telegram_id=dialog_id,
+    )
+    return {
+        "entity": entity,
+        "dialog_type": raw_row.get("dialog_type"),
+        "unread_count": raw_row.get("unread_count"),
+        "unread_mark": raw_row.get("unread_mark"),
+        "unread_mentions_count": raw_row.get("unread_mentions_count", 0),
+        "unread_reactions_count": raw_row.get("unread_reactions_count", 0),
+        "archived": raw_row.get("archived", False),
+        "last_message_at": raw_row.get("last_message_at"),
+    }
+
+
+def _project_unread_summary_dialogs(raw_dialogs: object) -> list[dict[str, object]]:
+    if not isinstance(raw_dialogs, list):
+        return []
+    dialogs: list[dict[str, object]] = []
+    for raw_row in raw_dialogs:
+        if not isinstance(raw_row, Mapping):
+            continue
+        dialog = _project_unread_summary_dialog(raw_row)
+        if dialog is not None:
+            dialogs.append(dialog)
+    return dialogs
+
+
 @mcp_tool(
     name="get_inbox",
     title="Inbox",
@@ -668,31 +702,7 @@ async def get_unread_summary(args: GetUnreadSummary) -> ToolResult:
     raw_data = response.get("data")
     data = raw_data if isinstance(raw_data, Mapping) else {}
     raw_dialogs = data.get("dialogs", [])
-    dialogs = []
-    if isinstance(raw_dialogs, list):
-        for raw_row in raw_dialogs:
-            if not isinstance(raw_row, Mapping):
-                continue
-            dialog_id = raw_row.get("dialog_id")
-            if isinstance(dialog_id, bool) or not isinstance(dialog_id, int):
-                continue
-            entity = project_entity_identity(
-                display_name=raw_row.get("name"),
-                username=raw_row.get("username"),
-                telegram_id=dialog_id,
-            )
-            dialogs.append(
-                {
-                    "entity": entity,
-                    "dialog_type": raw_row.get("dialog_type"),
-                    "unread_count": raw_row.get("unread_count"),
-                    "unread_mark": raw_row.get("unread_mark"),
-                    "unread_mentions_count": raw_row.get("unread_mentions_count", 0),
-                    "unread_reactions_count": raw_row.get("unread_reactions_count", 0),
-                    "archived": raw_row.get("archived", False),
-                    "last_message_at": raw_row.get("last_message_at"),
-                }
-            )
+    dialogs = _project_unread_summary_dialogs(raw_dialogs)
     raw_observation = data.get("source_observation")
     observation = dict(raw_observation) if isinstance(raw_observation, Mapping) else {}
     source_observation = {
