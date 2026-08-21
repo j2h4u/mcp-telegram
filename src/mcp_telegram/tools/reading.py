@@ -1329,6 +1329,8 @@ class ListMessages(ToolArgs):
     unread: bool = False
     anchor_message_id: int | None = Field(
         default=None,
+        ge=1,
+        le=2_147_483_647,
         description=(
             "Optional message id to centre the response on. Returns context_size messages "
             "around this message (half before, half after). Requires the dialog to be synced. "

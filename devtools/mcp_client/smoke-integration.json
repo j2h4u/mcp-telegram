@@ -219,7 +219,9 @@
         },
         "path_exists": [
           "structuredContent.accepted",
-          "structuredContent.status",
+          "structuredContent.status"
+        ],
+        "path_not_exists": [
           "structuredContent.tracking_id"
         ],
         "path_nonempty": [
