@@ -330,8 +330,11 @@ _SELECT_FTS_ALL_SQL = (
 _FETCH_UNREAD_MESSAGES_SQL = (
     f"SELECT m.message_id, m.sent_at, m.text, m.sender_id, "
     f"{_SENDER_FIRST_NAME_SQL}, {_SENDER_USERNAME_SQL}, m.media_description, NULL AS content_kind, "
+    f"m.forum_topic_id, COALESCE(tm.title, CASE WHEN m.forum_topic_id = 1 THEN 'General' END) AS topic_title, "
     f"{EFFECTIVE_SENDER_ID_SQL}, m.is_service, m.out, m.dialog_id "
     f"FROM messages m "
+    f"LEFT JOIN topic_metadata tm "
+    f"  ON tm.dialog_id = m.dialog_id AND tm.topic_id = m.forum_topic_id "
     f"{_SENDER_ENTITY_JOINS_SQL}"
     f"WHERE m.dialog_id = :dialog_id AND m.message_id > :after_msg_id AND m.is_deleted = 0 "
     f'AND m."out" = 0 AND m.is_service = 0 '

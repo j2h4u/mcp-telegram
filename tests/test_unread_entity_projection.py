@@ -14,6 +14,7 @@ from mcp_telegram.tools.unread import (
     GetInbox,
     GetUnreadSummary,
     _project_message_sender,
+    _project_message_topic,
     _project_unread_summary_dialog,
     _project_unread_summary_dialogs,
     _structured_messages,
@@ -122,21 +123,58 @@ def test_unread_summary_projection_helper_keeps_identity_contract_and_skips_bad_
             ),
             {"display_name": "No Username", "telegram_id": 56},
         ),
-        (
-            ReadMessage(message_id=5, sent_at=1, dialog_id=-1001, is_service=1),
-            {"kind": "system"},
-        ),
-        (
-            ReadMessage(message_id=6, sent_at=1, dialog_id=-1001),
-            {"kind": "unknown"},
-        ),
     ],
-    ids=["dm-incoming", "dm-outgoing-self", "group-username", "group-no-username", "system", "unknown"],
+    ids=["dm-incoming", "dm-outgoing-self", "group-username", "group-no-username"],
 )
-def test_inbox_sender_projection_uses_identity_contract_or_explicit_non_entity(
+def test_inbox_sender_projection_uses_identity_contract_or_null(
     message: ReadMessage, expected: dict[str, object]
 ) -> None:
     assert _project_message_sender(message) == expected
+
+
+def test_inbox_sender_projection_returns_null_without_actor_id() -> None:
+    assert _project_message_sender(ReadMessage(message_id=5, sent_at=1, dialog_id=-1001)) is None
+
+
+def test_structured_inbox_message_omits_sender_without_actor_id() -> None:
+    message = _structured_messages(
+        [{"message_id": 5, "sent_at": 1, "dialog_id": -1001, "forum_topic_id": 7}],
+        read_state=None,
+        dialog_type="group",
+    )[0]
+    assert "sender" not in message
+    assert message["topic"] == {"topic_id": 7}
+
+    message_schema = GET_INBOX_OUTPUT_SCHEMA["properties"]["dialogs"]["items"]["properties"]["messages"]["items"]
+    validate(instance=message, schema=message_schema)
+
+
+def test_inbox_output_schema_keeps_sender_and_topic_optional() -> None:
+    message_schema = GET_INBOX_OUTPUT_SCHEMA["properties"]["dialogs"]["items"]["properties"]["messages"]["items"]
+    assert "sender" not in message_schema["required"]
+    assert "topic" not in message_schema["required"]
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        (ReadMessage(message_id=1, sent_at=1, dialog_id=1001), None),
+        (ReadMessage(message_id=2, sent_at=1, dialog_id=1001, forum_topic_id=7), {"topic_id": 7}),
+        (
+            ReadMessage(message_id=3, sent_at=1, dialog_id=1001, forum_topic_id=7, topic_title="Reports"),
+            {"title": "Reports"},
+        ),
+        (
+            ReadMessage(message_id=4, sent_at=1, dialog_id=1001, forum_topic_id=7, topic_title=" "),
+            {"topic_id": 7},
+        ),
+    ],
+    ids=["missing", "id-fallback", "title", "blank-title-falls-back"],
+)
+def test_inbox_topic_projection_is_universal_and_never_leaks_both_fields(
+    message: ReadMessage, expected: dict[str, object] | None
+) -> None:
+    assert _project_message_topic(message) == expected
 
 
 def test_structured_inbox_messages_remove_legacy_sender_identity_fields() -> None:
@@ -155,6 +193,7 @@ def test_structured_inbox_messages_remove_legacy_sender_identity_fields() -> Non
     message = _structured_messages(rows, read_state=None, dialog_type="user")[0]
 
     assert message["sender"] == {"display_name": "Alice", "username": "@alice"}
+    assert "topic" not in message
     assert "sender_id" not in message
     assert "effective_sender_id" not in message
 
@@ -203,6 +242,7 @@ async def test_get_inbox_concrete_message_sender_validates_against_output_schema
     dialogs = cast(list[dict[str, object]], payload["dialogs"])
     messages = cast(list[dict[str, object]], dialogs[0]["messages"])
     assert messages[0]["sender"] == {"display_name": "Alice", "username": "@alice"}
+    assert "topic" not in messages[0]
 
 
 @pytest.mark.asyncio

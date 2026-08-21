@@ -133,13 +133,19 @@ GET_INBOX_OUTPUT_SCHEMA = {
                             "type": "object",
                             "properties": {
                                 "msg_id": {"type": "integer"},
-                                "sender": {
+                                "sender": ENTITY_IDENTITY_SCHEMA,
+                                "topic": {
                                     "oneOf": [
-                                        ENTITY_IDENTITY_SCHEMA,
                                         {
                                             "type": "object",
-                                            "properties": {"kind": {"type": "string", "enum": ["system", "unknown"]}},
-                                            "required": ["kind"],
+                                            "properties": {"title": {"type": "string", "minLength": 1}},
+                                            "required": ["title"],
+                                            "additionalProperties": False,
+                                        },
+                                        {
+                                            "type": "object",
+                                            "properties": {"topic_id": {"type": "integer"}},
+                                            "required": ["topic_id"],
                                             "additionalProperties": False,
                                         },
                                     ]
@@ -174,7 +180,6 @@ GET_INBOX_OUTPUT_SCHEMA = {
                             },
                             "required": [
                                 "msg_id",
-                                "sender",
                                 "out",
                                 "date",
                                 "content",
@@ -388,27 +393,34 @@ def _message_date(sent_at: object) -> int | None:
         return None
 
 
-def _project_message_sender(message: ReadMessage) -> EntityIdentity | dict[str, object]:
+def _project_message_sender(message: ReadMessage) -> EntityIdentity | None:
     """Project one inbox message author without inventing an identity.
 
     ``effective_sender_id`` carries the concrete actor for ordinary senders,
-    including the peer/self sides of direct messages.  Service messages and
-    group rows with no sender id intentionally remain explicit non-entities.
+    including the peer/self sides of direct messages.  Rows with no actor id
+    remain null because Inbox already excludes service messages.
     """
-    if message.is_service:
-        return {"kind": "system"}
-
     actor_id = message.effective_sender_id
     if actor_id is None:
         actor_id = message.sender_id
     if isinstance(actor_id, bool) or not isinstance(actor_id, int) or actor_id == 0:
-        return {"kind": "unknown"}
+        return None
 
     return project_entity_identity(
         display_name=message.sender_first_name,
         username=message.sender_username,
         telegram_id=actor_id,
     )
+
+
+def _project_message_topic(message: ReadMessage) -> dict[str, object] | None:
+    """Project one persisted topic into the universal Inbox contract."""
+    if isinstance(message.topic_title, str) and message.topic_title.strip():
+        return {"title": message.topic_title}
+    topic_id = message.forum_topic_id
+    if isinstance(topic_id, int) and not isinstance(topic_id, bool) and topic_id > 0:
+        return {"topic_id": topic_id}
+    return None
 
 
 _READ_MARKER_METADATA = {
@@ -569,24 +581,28 @@ def _structured_messages(
         marker_label = marker_by_message.get(message.id)
         read_markers = [_structured_read_marker(message.id, marker_label)] if marker_label else []
         projected = serialize_message_content(message.text, message.media_description, message.content_kind)
-        structured.append(
-            {
-                "msg_id": message.id,
-                "sender": _project_message_sender(message),
-                "out": bool(message.out),
-                "date": _message_date(message.sent_at),
-                "content": projected["content"],
-                "media": projected["media"],
-                "reply_to_msg_id": message.reply_to_msg_id,
-                "edit_date": message.edit_date,
-                "reactions": _structured_reactions(message.reactions_display),
-                "reaction_events": _structured_reaction_events(message),
-                "reaction_events_status": message.reaction_events_status,
-                "read_at": message.read_at,
-                "read_markers": read_markers,
-                "inline_markers": read_markers,
-            }
-        )
+        sender = _project_message_sender(message)
+        structured_message: dict[str, object] = {
+            "msg_id": message.id,
+            "out": bool(message.out),
+            "date": _message_date(message.sent_at),
+            "content": projected["content"],
+            "media": projected["media"],
+            "reply_to_msg_id": message.reply_to_msg_id,
+            "edit_date": message.edit_date,
+            "reactions": _structured_reactions(message.reactions_display),
+            "reaction_events": _structured_reaction_events(message),
+            "reaction_events_status": message.reaction_events_status,
+            "read_at": message.read_at,
+            "read_markers": read_markers,
+            "inline_markers": read_markers,
+        }
+        if sender is not None:
+            structured_message["sender"] = sender
+        topic = _project_message_topic(message)
+        if topic is not None:
+            structured_message["topic"] = topic
+        structured.append(structured_message)
     return structured
 
 
