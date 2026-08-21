@@ -1,6 +1,7 @@
 from typing import cast
 
 import pytest
+from jsonschema import validate
 from mcp.types import CallToolResult
 
 from mcp_telegram import server, tools
@@ -61,6 +62,24 @@ def test_output_schema_normalizer_makes_nullable_properties_optional() -> None:
         {"type": "string"},
     ]
     assert schema["required"] == ["items", "tuple_items"]
+
+
+def test_mixed_null_enum_is_optional_but_keeps_non_null_values() -> None:
+    schema = normalize_output_schema(
+        {
+            "type": "object",
+            "properties": {"value": {"type": "string", "enum": [None, "x"]}},
+            "required": ["value"],
+        }
+    )
+
+    assert schema is not None
+    properties = cast(dict[str, object], schema["properties"])
+    assert properties["value"] == {"type": "string", "enum": ["x"]}
+    assert schema["required"] == []
+    assert omit_none_mapping_values({"value": None}) == {}
+    validate(instance={}, schema=schema)
+    validate(instance={"value": "x"}, schema=schema)
 
 
 def test_registered_output_schemas_have_no_nullable_object_properties() -> None:

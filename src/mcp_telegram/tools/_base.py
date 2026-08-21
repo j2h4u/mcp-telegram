@@ -82,6 +82,11 @@ def _schema_is_null(value: object) -> bool:
     return bool(isinstance(enum, list) and enum and all(item is None for item in enum))
 
 
+def _schema_enum_has_null(value: dict[object, object]) -> bool:
+    enum = value.get("enum")
+    return isinstance(enum, list) and any(item is None for item in enum)
+
+
 def _schema_has_null(value: object) -> bool:
     if not isinstance(value, dict):
         return False
@@ -92,6 +97,8 @@ def _schema_has_null(value: object) -> bool:
         variants = value.get(union_key)
         if isinstance(variants, list) and any(_schema_has_null(item) for item in variants):
             return True
+    if _schema_enum_has_null(value):
+        return True
     return _schema_is_null(value)
 
 
