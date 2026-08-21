@@ -69,10 +69,10 @@ def test_composition_root_config_import_spellings_are_allowed(path_name: str, so
 
 def test_non_entrypoint_direct_config_import_is_rejected() -> None:
     gate = _load_gate()
-    path = Path(__file__).parents[1] / "src/mcp_telegram/daemon_reading.py"
+    path = Path(__file__).parents[1] / "src/mcp_telegram/reading/service.py"
 
     assert gate.violations_for(path, "from mcp_telegram import config\n") == [
-        "src/mcp_telegram/daemon_reading.py:1: direct config import is allowed only in runtime entrypoints"
+        "src/mcp_telegram/reading/service.py:1: direct config import is allowed only in runtime entrypoints"
     ]
 
 

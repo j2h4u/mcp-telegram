@@ -7,8 +7,8 @@ import sqlite3
 from collections.abc import Mapping, Sequence
 from typing import Protocol, cast
 
-from .daemon_message import project_read_message_content
-from .daemon_message_queries import _read_message_from_row
+from ..daemon_message import project_read_message_content
+from .query_records import read_message_from_row
 
 SCHEDULED_MESSAGES_TABLE_SQL = "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'scheduled_messages'"
 SCHEDULED_MESSAGES_FTS_TABLE_SQL = (
@@ -226,7 +226,7 @@ def scheduled_row_to_wire(
     inclusion_basis: Sequence[str],
 ) -> dict[str, object]:
     """Normalize a scheduled DB row to the common message/lifecycle wire shape."""
-    message = _read_message_from_row(cast(Mapping[str, object], row))
+    message = read_message_from_row(cast(Mapping[str, object], row))
     message = project_read_message_content(message)
     item = dataclasses.asdict(message)
     item.update(

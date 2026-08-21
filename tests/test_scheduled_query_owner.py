@@ -4,7 +4,7 @@ import ast
 from dataclasses import dataclass
 from pathlib import Path
 
-from mcp_telegram.daemon_scheduled_queries import (
+from mcp_telegram.reading.scheduled_projection import (
     build_scheduled_list_query,
     build_scheduled_search_query,
     scheduled_row_to_wire,
@@ -111,7 +111,7 @@ def test_scheduled_row_mapper_is_the_lifecycle_wire_shape() -> None:
 
 
 def test_scheduled_query_owner_has_no_fragile_sql_mutation() -> None:
-    path = Path("src/mcp_telegram/daemon_scheduled_queries.py")
+    path = Path("src/mcp_telegram/reading/scheduled_projection.py")
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
 
     fragile_calls = [

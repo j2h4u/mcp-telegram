@@ -96,7 +96,7 @@ def test_sqlite_update_conflict_form_for_other_table_is_not_a_message_match() ->
 
 def test_current_query_owner_is_allowed() -> None:
     gate = _gate()
-    path = gate.SOURCE_ROOT / "daemon_message_queries.py"
+    path = gate.SOURCE_ROOT / "reading/sqlite_projection.py"
     assert not any(
         "FROM/JOIN messages" in finding.message
         for finding in gate.violations_for(path, 'SQL = "SELECT 1 FROM messages"')
@@ -290,7 +290,7 @@ def test_projection_imports_have_single_owner() -> None:
 
 def test_scheduled_mapper_must_use_canonical_read_projector() -> None:
     gate = _gate()
-    path = gate.SOURCE_ROOT / "daemon_scheduled_queries.py"
+    path = gate.SOURCE_ROOT / "reading/scheduled_projection.py"
     source = "def scheduled_row_to_wire(row):\n    return dict(row)\n"
     findings = gate.violations_for(path, source)
     assert any("must call project_read_message_content directly" in finding.message for finding in findings)
@@ -298,7 +298,7 @@ def test_scheduled_mapper_must_use_canonical_read_projector() -> None:
 
 def test_scheduled_mapper_rejects_a_private_content_renderer_or_serializer() -> None:
     gate = _gate()
-    path = gate.SOURCE_ROOT / "daemon_scheduled_queries.py"
+    path = gate.SOURCE_ROOT / "reading/scheduled_projection.py"
     source = (
         "from .tools.structured import serialize_message_content\n"
         "def scheduled_row_to_wire(row):\n"
@@ -311,7 +311,7 @@ def test_scheduled_mapper_rejects_a_private_content_renderer_or_serializer() -> 
 
 def test_scheduled_mapper_rejects_aliased_private_serializer() -> None:
     gate = _gate()
-    path = gate.SOURCE_ROOT / "daemon_scheduled_queries.py"
+    path = gate.SOURCE_ROOT / "reading/scheduled_projection.py"
     source = (
         "from .tools.structured import serialize_message_content as encode_content\n"
         "def scheduled_row_to_wire(row):\n"
@@ -324,7 +324,7 @@ def test_scheduled_mapper_rejects_aliased_private_serializer() -> None:
 
 def test_scheduled_mapper_requires_exact_projector_provenance_and_rejects_shadowing() -> None:
     gate = _gate()
-    path = gate.SOURCE_ROOT / "daemon_scheduled_queries.py"
+    path = gate.SOURCE_ROOT / "reading/scheduled_projection.py"
     wrong_import = (
         "from .message_content import project_read_message_content\n"
         "def scheduled_row_to_wire(row):\n"
@@ -332,7 +332,7 @@ def test_scheduled_mapper_requires_exact_projector_provenance_and_rejects_shadow
         "    return dataclasses.asdict(message)\n"
     )
     findings = gate.violations_for(path, wrong_import)
-    assert any("imported exactly from .daemon_message" in finding.message for finding in findings)
+    assert any("imported exactly from ..daemon_message" in finding.message for finding in findings)
 
     shadowed = (
         "from .daemon_message import project_read_message_content\n"
@@ -358,7 +358,7 @@ def test_scheduled_mapper_requires_exact_projector_provenance_and_rejects_shadow
 
 def test_scheduled_mapper_requires_exactly_one_module_entrypoint() -> None:
     gate = _gate()
-    path = gate.SOURCE_ROOT / "daemon_scheduled_queries.py"
+    path = gate.SOURCE_ROOT / "reading/scheduled_projection.py"
     missing = "from .daemon_message import project_read_message_content\n"
     findings = gate.violations_for(path, missing)
     assert any("exactly one module-level scheduled_row_to_wire" in finding.message for finding in findings)

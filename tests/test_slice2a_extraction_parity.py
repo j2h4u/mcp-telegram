@@ -1,8 +1,7 @@
 """Slice 2a extraction parity for direct owner modules.
 
 Slice 2a moved SQL constants, row mappers, and read-query helpers out of
-``daemon_api`` into three owner modules (``daemon_message_queries``,
-``daemon_read_state_queries``, ``daemon_dialog_queries``). Representative SQL
+``daemon_api`` into the reading projection and query-record modules. Representative SQL
 params, row mapping, sync-coverage, access-metadata, dialog-type, and read-state
 results are exercised through those exact owners.
 """
@@ -16,14 +15,16 @@ from typing import cast
 
 import pytest
 
-from mcp_telegram.daemon_dialog_queries import _build_access_metadata, _compute_sync_coverage
-from mcp_telegram.daemon_message_queries import (
-    _build_list_messages_query,
-    _ListMessagesDbRequest,
-    _read_message_from_row,
-)
-from mcp_telegram.daemon_read_state_queries import _dialog_type_from_db, _read_state_for_dialog
 from mcp_telegram.models import DialogType
+from mcp_telegram.reading.query_records import read_message_from_row
+from mcp_telegram.reading.sqlite_projection import (
+    _build_access_metadata,
+    _build_list_messages_query,
+    _dialog_type_from_db,
+    _ListMessagesDbRequest,
+    _read_state_for_dialog,
+)
+from mcp_telegram.sync_read_model import compute_sync_coverage as _compute_sync_coverage
 
 # ---------------------------------------------------------------------------
 # Behavior parity — driven through the exact owner modules.
@@ -98,7 +99,7 @@ def test_read_message_from_row_maps_fields() -> None:
         "is_service": 0,
         "is_deleted": 0,
     }
-    msg = _read_message_from_row(row, reactions_display="👍1")
+    msg = read_message_from_row(row, reactions_display="👍1")
     assert msg.message_id == 9
     assert msg.dialog_id == 100
     assert msg.text == "hello"

@@ -33,9 +33,8 @@ MESSAGE_SQL_OWNER_PATHS = frozenset(
         "daemon_activity_stats.py",
         "daemon_dialog_queries.py",
         "daemon_entity_info.py",
-        "daemon_message_queries.py",
-        "daemon_read_state_queries.py",
         "daemon_source_export.py",
+        "reading/sqlite_projection.py",
         "folders/sqlite_repository.py",
         "fts.py",
         "message_fact_refresh.py",
@@ -59,7 +58,7 @@ MESSAGE_SQL_SCHEMA_OWNER_PATHS = frozenset({"sync_db.py"})
 CONTENT_WRAPPER_PATH = "tools/structured.py"
 CONTENT_PROJECTOR_PATH = "message_content.py"
 RAW_PROJECTOR_PATH = "telegram_message_projection.py"
-SCHEDULED_CONTENT_PATH = "daemon_scheduled_queries.py"
+SCHEDULED_CONTENT_PATH = "reading/scheduled_projection.py"
 SCHEDULED_CONTENT_ENTRYPOINT = "scheduled_row_to_wire"
 SCHEDULED_PROJECTOR_NAME = "project_read_message_content"
 TEXT_PROJECTOR_PATH = "text_projection.py"
@@ -439,8 +438,8 @@ def _scheduled_import_violations(path: str, tree: ast.AST) -> tuple[list[Finding
             )
         if SCHEDULED_PROJECTOR_NAME not in imported_names:
             continue
-        if _import_module(node) != ".daemon_message":
-            findings.append(Finding(path, node.lineno, "scheduled projector must come directly from .daemon_message"))
+        if _import_module(node) != "..daemon_message":
+            findings.append(Finding(path, node.lineno, "scheduled projector must come directly from ..daemon_message"))
         elif any(alias.name == SCHEDULED_PROJECTOR_NAME and alias.asname is None for alias in node.names):
             canonical_import = True
     return findings, canonical_import
@@ -476,7 +475,7 @@ def _scheduled_content_violations(path: str, tree: ast.AST) -> list[Finding]:
     ]
 
     if not canonical_import:
-        findings.append(Finding(path, 1, "scheduled projector must be imported exactly from .daemon_message"))
+        findings.append(Finding(path, 1, "scheduled projector must be imported exactly from ..daemon_message"))
     if len(mapper_nodes) != 1:
         findings.append(
             Finding(path, 1, "scheduled content must have exactly one module-level scheduled_row_to_wire entrypoint")

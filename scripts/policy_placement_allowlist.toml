@@ -27,7 +27,7 @@ rationale = "This entity-info response classification cutoff is an API semantic,
 
 [[entry]]
 category = "policy_assignments"
-key = "src/mcp_telegram/daemon_reading.py:DaemonReadingService._fetch_telegram_batches:last_batch_size"
+key = "src/mcp_telegram/reading/service.py:ReadingService._fetch_telegram_batches:last_batch_size"
 rationale = "This is observed batch-result metadata, not an operator-tuned limit."
 
 [[entry]]
@@ -297,7 +297,7 @@ rationale = "This is the established Unix-socket client request deadline contrac
 
 [[entry]]
 category = "policy_assignments"
-key = "src/mcp_telegram/daemon_dialog_queries.py:<module>:_SNAPSHOT_STALE_THRESHOLD_S"
+key = "src/mcp_telegram/reading/sqlite_projection.py:<module>:_SNAPSHOT_STALE_THRESHOLD_S"
 rationale = "This existing dialog-query staleness semantic predates the injected API freshness policy."
 
 [[entry]]
@@ -399,7 +399,7 @@ rationale = "This is the local Unix-socket request timeout contract."
 
 [[entry]]
 category = "policy_call_keywords"
-key = "src/mcp_telegram/daemon_reading.py:DaemonReadingService._fetch_telegram_batches:last_batch_size"
+key = "src/mcp_telegram/reading/service.py:ReadingService._fetch_telegram_batches:last_batch_size"
 rationale = "This is internal batch result metadata, not an operator policy placement."
 
 [[entry]]
